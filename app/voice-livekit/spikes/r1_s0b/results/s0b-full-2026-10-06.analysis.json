@@ -1,0 +1,3170 @@
+{
+ "source": "spikes\\r1_s0b\\results\\s0b-full-2026-10-06.jsonl",
+ "conversation_numbering": "1-based run order",
+ "prices_usd_per_million": {
+  "miss": 0.3,
+  "hit": 0.006,
+  "output": 1.2
+ },
+ "overall": {
+  "conversations": 71,
+  "learner_turns": 1278,
+  "ttft_p50": 2.1352122999960557,
+  "ttft_p95": 4.622985449963016,
+  "ttft_min": 0.6349163999548182,
+  "ttft_share_le_1s": 0.056338028169014086,
+  "ttft_share_le_2s": 0.4616588419405321,
+  "latency_p50": 2.262033050006721,
+  "latency_p95": 4.719836559996472,
+  "learner_cache_hit_pct": 0.26193883066915596,
+  "advisor_cache_hit_pct": 0.5714351517049825,
+  "learner_prompt_tokens_per_call_min": 438,
+  "learner_prompt_tokens_per_call_max": 1009,
+  "learner_prompt_tokens_per_call_mean": 689.0234741784037,
+  "tokens": {
+   "learner_prompt": 880572,
+   "learner_cache_hit": 230656,
+   "learner_completion": 22303,
+   "advisor_prompt": 868396,
+   "advisor_cache_hit": 496232,
+   "advisor_completion": 30528
+  },
+  "cost_usd": {
+   "learner_ceiling_no_cache_discount": 0.29093519999999995,
+   "learner_with_cache_discount": 0.22312233599999998,
+   "advisor_sim_ceiling_no_cache_discount": 0.2971524,
+   "advisor_sim_with_cache_discount": 0.151260192
+  },
+  "families_all4_within_slip_literal": 0.0,
+  "families_all4_delivered_any_time": 0.014084507042253521,
+  "family_delivered_rate": {
+   "F3": 1.0,
+   "F2": 1.0,
+   "F1": 0.9436619718309859,
+   "F4": 0.014084507042253521
+  },
+  "family_within_slip_literal_rate": {
+   "F3": 0.9014084507042254,
+   "F2": 0.0,
+   "F1": 0.0,
+   "F4": 0.0
+  },
+  "family_cause": {
+   "F3": {
+    "delivered": 71
+   },
+   "F2": {
+    "delivered": 71
+   },
+   "F1": {
+    "delivered": 67,
+    "never_owed_by_scheduler": 4
+   },
+   "F4": {
+    "never_owed_by_scheduler": 70,
+    "delivered": 1
+   }
+  },
+  "f4_blocker": {
+   "QB_skipped_as_covered": 66,
+   "delivered": 1,
+   "F1_incomplete": 4
+  },
+  "owed_episodes": 562,
+  "owed_first_attempt_rate": 0.9786476868327402,
+  "owed_eventually_confirmed_rate": 1.0,
+  "family_move_first_attempt_rate": 0.9787735849056604,
+  "family_moves_owed": 424,
+  "owed_turn_attempts": 576,
+  "owed_first_attempt_misses": 12,
+  "owed_misses_on_guarded_turns": 5,
+  "owed_episodes_delayed_by_guard": 3,
+  "owed_first_attempt_rate_excl_guard_delays": 0.9838998211091234,
+  "disclosures_first": 43,
+  "volunteered_harness_same_turn": 0,
+  "volunteered_cumulative": 0,
+  "volunteered_same_turn_q": 17,
+  "volunteered_cumulative_q": 5,
+  "volunteering_rate_same_turn_q": 0.3953488372093023,
+  "volunteering_rate_cumulative_q": 0.11627906976744186,
+  "conversations_with_volunteered_same_turn_q": 16,
+  "conversations_with_volunteered_cumulative_q": 5,
+  "manual_labels": {
+   "probe": 13,
+   "borderline": 4,
+   "none": 26,
+   "unlabelled": 0
+  },
+  "volunteering_rate_manual_none": 0.6046511627906976,
+  "volunteering_rate_manual_none_or_borderline": 0.6976744186046512,
+  "conversations_with_manual_unprobed_reveal": 22,
+  "first_unlock_turn_reveals": 6,
+  "first_unlock_turn_reveals_ignoring_opener": 11,
+  "conversations_where_turn1_opener_unlocks": {
+   "H2": 71
+  },
+  "unlock_proxy_opportunities": 184,
+  "unlock_proxy_rate": 0.23369565217391305,
+  "unlock_proxy_opportunities_q": 122,
+  "unlock_proxy_rate_q": 0.23770491803278687,
+  "harness_volunteered": 0,
+  "harness_correct_unlocks": 1,
+  "harness_unlock_opportunities": 733,
+  "premature_commitments": 5,
+  "conversations_with_premature_commitment": 2,
+  "commitments_any": 5,
+  "commitment_levels": {
+   "MEDIUM": 5
+  },
+  "premature_concessions": 0,
+  "concession_check_turns": 355,
+  "concession_regex_hits_any_turn": 0,
+  "harness_commitment_re_hits": 0,
+  "harness_concession_re_hits": 2,
+  "raw_guard_hits": 8,
+  "conversations_with_guard_hit": 5,
+  "conversations_with_ge3_guard_hits": 1,
+  "emitted_leaks": 0,
+  "harness_fact_learner": 0,
+  "harness_fact_advisor": 0,
+  "card_contradictions": 0,
+  "card_timeline_conflations": 3,
+  "conversations_with_card_timeline_conflation": 3,
+  "product_fact_assertions": 7,
+  "conversations_with_product_fact": 6,
+  "contact_fabrications": 18,
+  "conversations_with_contact_fabrication": 17,
+  "contact_fabrications_spoken_form": 3,
+  "contact_fabrications_written_form": 15,
+  "conversations_with_written_form_contact_fabrication": 14,
+  "invented_availability_turns": 8,
+  "conversations_with_invented_availability": 8,
+  "sign_off_turn_share_per_turn": 0.29577464788732394,
+  "sign_off_turn_share_cumulative": 0.3129890453834116,
+  "sign_off_turn_share_cumulative_wide": 0.352112676056338,
+  "advisor_role_inversion_turns_est": 21,
+  "conversations_with_advisor_role_inversion_est": 11,
+  "guarded_turns_after_advisor_guard_term": 4,
+  "reveal_cells_with_owed_line": {
+   "revealed": 14,
+   "cells": 464,
+   "rate": 0.03017241379310345,
+   "mean_turn": 4.338362068965517
+  },
+  "reveal_cells_without_owed_line": {
+   "revealed": 29,
+   "cells": 198,
+   "rate": 0.14646464646464646,
+   "mean_turn": 7.44949494949495
+  },
+  "reveal_cells_first_unlock_with_owed_line": {
+   "revealed": 3,
+   "cells": 174,
+   "rate": 0.017241379310344827,
+   "mean_turn": 2.454022988505747
+  },
+  "reveal_cells_first_unlock_without_owed_line": {
+   "revealed": 3,
+   "cells": 31,
+   "rate": 0.0967741935483871,
+   "mean_turn": 4.967741935483871
+  },
+  "first_disclosures_by_owed_and_manual_label": {
+   "owed=False,label=borderline": 3,
+   "owed=False,label=none": 20,
+   "owed=False,label=probe": 6,
+   "owed=True,label=borderline": 1,
+   "owed=True,label=none": 6,
+   "owed=True,label=probe": 7
+  }
+ },
+ "additional_files": {
+  "s0b-smoke-2026-10-06.jsonl": {
+   "learner_prompt": 3866,
+   "learner_cache_hit": 1152,
+   "learner_completion": 112,
+   "advisor_prompt": 3295,
+   "advisor_cache_hit": 2048,
+   "advisor_completion": 242,
+   "learner_turns": 6,
+   "ttft_p50": 1.5068271000054665,
+   "cost_ceiling_usd": 0.0025731
+  },
+  "s0b-smoke-2026-10-06-v2.jsonl": {
+   "learner_prompt": 3679,
+   "learner_cache_hit": 1408,
+   "learner_completion": 147,
+   "advisor_prompt": 3249,
+   "advisor_cache_hit": 2304,
+   "advisor_completion": 201,
+   "learner_turns": 6,
+   "ttft_p50": 1.22505549993366,
+   "cost_ceiling_usd": 0.002496
+  }
+ },
+ "by_persona": {
+  "P1": {
+   "conversations": 19,
+   "learner_turns": 342,
+   "ttft_p50": 2.3593563500326127,
+   "ttft_p95": 5.495111590018495,
+   "ttft_min": 0.8230993000324816,
+   "ttft_share_le_1s": 0.005847953216374269,
+   "ttft_share_le_2s": 0.28654970760233917,
+   "latency_p50": 2.493722399987746,
+   "latency_p95": 5.687461284949676,
+   "learner_cache_hit_pct": 0.26684656061628187,
+   "advisor_cache_hit_pct": 0.5745062285769389,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 977,
+   "learner_prompt_tokens_per_call_mean": 671.827485380117,
+   "tokens": {
+    "learner_prompt": 229765,
+    "learner_cache_hit": 61312,
+    "learner_completion": 5570,
+    "advisor_prompt": 228142,
+    "advisor_cache_hit": 131069,
+    "advisor_completion": 7763
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.0756135,
+    "learner_with_cache_discount": 0.057587772,
+    "advisor_sim_ceiling_no_cache_discount": 0.0777582,
+    "advisor_sim_with_cache_discount": 0.039223914
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.05263157894736842,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 0.9473684210526315,
+    "F4": 0.05263157894736842
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 0.8421052631578947,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 19
+    },
+    "F2": {
+     "delivered": 19
+    },
+    "F1": {
+     "delivered": 18,
+     "never_owed_by_scheduler": 1
+    },
+    "F4": {
+     "never_owed_by_scheduler": 18,
+     "delivered": 1
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 17,
+    "delivered": 1,
+    "F1_incomplete": 1
+   },
+   "owed_episodes": 152,
+   "owed_first_attempt_rate": 0.9736842105263158,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 0.9739130434782609,
+   "family_moves_owed": 115,
+   "owed_turn_attempts": 156,
+   "owed_first_attempt_misses": 4,
+   "owed_misses_on_guarded_turns": 1,
+   "owed_episodes_delayed_by_guard": 1,
+   "owed_first_attempt_rate_excl_guard_delays": 0.9801324503311258,
+   "disclosures_first": 6,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 1,
+   "volunteered_cumulative_q": 1,
+   "volunteering_rate_same_turn_q": 0.16666666666666666,
+   "volunteering_rate_cumulative_q": 0.16666666666666666,
+   "conversations_with_volunteered_same_turn_q": 1,
+   "conversations_with_volunteered_cumulative_q": 1,
+   "manual_labels": {
+    "probe": 2,
+    "borderline": 1,
+    "none": 3,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.5,
+   "volunteering_rate_manual_none_or_borderline": 0.6666666666666666,
+   "conversations_with_manual_unprobed_reveal": 2,
+   "first_unlock_turn_reveals": 2,
+   "first_unlock_turn_reveals_ignoring_opener": 2,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 19
+   },
+   "unlock_proxy_opportunities": 48,
+   "unlock_proxy_rate": 0.125,
+   "unlock_proxy_opportunities_q": 29,
+   "unlock_proxy_rate_q": 0.20689655172413793,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 181,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 95,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 1,
+   "raw_guard_hits": 2,
+   "conversations_with_guard_hit": 2,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 1,
+   "conversations_with_card_timeline_conflation": 1,
+   "product_fact_assertions": 0,
+   "conversations_with_product_fact": 0,
+   "contact_fabrications": 5,
+   "conversations_with_contact_fabrication": 5,
+   "contact_fabrications_spoken_form": 3,
+   "contact_fabrications_written_form": 2,
+   "conversations_with_written_form_contact_fabrication": 2,
+   "invented_availability_turns": 0,
+   "conversations_with_invented_availability": 0,
+   "sign_off_turn_share_per_turn": 0.30409356725146197,
+   "sign_off_turn_share_cumulative": 0.34210526315789475,
+   "sign_off_turn_share_cumulative_wide": 0.391812865497076,
+   "advisor_role_inversion_turns_est": 9,
+   "conversations_with_advisor_role_inversion_est": 4,
+   "guarded_turns_after_advisor_guard_term": 1,
+   "reveal_cells_with_owed_line": {
+    "revealed": 4,
+    "cells": 117,
+    "rate": 0.03418803418803419,
+    "mean_turn": 4.846153846153846
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 2,
+    "cells": 49,
+    "rate": 0.04081632653061224,
+    "mean_turn": 7.387755102040816
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 2,
+    "cells": 45,
+    "rate": 0.044444444444444446,
+    "mean_turn": 2.7333333333333334
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 10,
+    "rate": 0.0,
+    "mean_turn": 5.7
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=borderline": 1,
+    "owed=False,label=none": 1,
+    "owed=True,label=none": 2,
+    "owed=True,label=probe": 2
+   }
+  },
+  "P2": {
+   "conversations": 19,
+   "learner_turns": 342,
+   "ttft_p50": 1.448801199963782,
+   "ttft_p95": 4.0634402699826735,
+   "ttft_min": 0.6913466999540105,
+   "ttft_share_le_1s": 0.0935672514619883,
+   "ttft_share_le_2s": 0.6403508771929824,
+   "latency_p50": 1.5951286000199616,
+   "latency_p95": 4.190731945011066,
+   "learner_cache_hit_pct": 0.25579493683560567,
+   "advisor_cache_hit_pct": 0.5696892185701496,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 955,
+   "learner_prompt_tokens_per_call_mean": 700.8538011695906,
+   "tokens": {
+    "learner_prompt": 239692,
+    "learner_cache_hit": 61312,
+    "learner_completion": 6255,
+    "advisor_prompt": 234570,
+    "advisor_cache_hit": 133632,
+    "advisor_completion": 8614
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.07941359999999999,
+    "learner_with_cache_discount": 0.061387871999999996,
+    "advisor_sim_ceiling_no_cache_discount": 0.0807078,
+    "advisor_sim_with_cache_discount": 0.041419991999999996
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 0.9473684210526315,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 1.0,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 19
+    },
+    "F2": {
+     "delivered": 19
+    },
+    "F1": {
+     "delivered": 18,
+     "never_owed_by_scheduler": 1
+    },
+    "F4": {
+     "never_owed_by_scheduler": 19
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 18,
+    "F1_incomplete": 1
+   },
+   "owed_episodes": 149,
+   "owed_first_attempt_rate": 0.9932885906040269,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 0.9911504424778761,
+   "family_moves_owed": 113,
+   "owed_turn_attempts": 152,
+   "owed_first_attempt_misses": 1,
+   "owed_misses_on_guarded_turns": 3,
+   "owed_episodes_delayed_by_guard": 1,
+   "owed_first_attempt_rate_excl_guard_delays": 1.0,
+   "disclosures_first": 15,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 6,
+   "volunteered_cumulative_q": 2,
+   "volunteering_rate_same_turn_q": 0.4,
+   "volunteering_rate_cumulative_q": 0.13333333333333333,
+   "conversations_with_volunteered_same_turn_q": 6,
+   "conversations_with_volunteered_cumulative_q": 2,
+   "manual_labels": {
+    "probe": 5,
+    "borderline": 2,
+    "none": 8,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.5333333333333333,
+   "volunteering_rate_manual_none_or_borderline": 0.6666666666666666,
+   "conversations_with_manual_unprobed_reveal": 8,
+   "first_unlock_turn_reveals": 2,
+   "first_unlock_turn_reveals_ignoring_opener": 4,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 19
+   },
+   "unlock_proxy_opportunities": 50,
+   "unlock_proxy_rate": 0.3,
+   "unlock_proxy_opportunities_q": 35,
+   "unlock_proxy_rate_q": 0.2857142857142857,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 223,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 95,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 1,
+   "raw_guard_hits": 4,
+   "conversations_with_guard_hit": 1,
+   "conversations_with_ge3_guard_hits": 1,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 2,
+   "conversations_with_product_fact": 2,
+   "contact_fabrications": 6,
+   "conversations_with_contact_fabrication": 6,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 6,
+   "conversations_with_written_form_contact_fabrication": 6,
+   "invented_availability_turns": 6,
+   "conversations_with_invented_availability": 6,
+   "sign_off_turn_share_per_turn": 0.26608187134502925,
+   "sign_off_turn_share_cumulative": 0.26608187134502925,
+   "sign_off_turn_share_cumulative_wide": 0.3157894736842105,
+   "advisor_role_inversion_turns_est": 5,
+   "conversations_with_advisor_role_inversion_est": 3,
+   "guarded_turns_after_advisor_guard_term": 3,
+   "reveal_cells_with_owed_line": {
+    "revealed": 5,
+    "cells": 141,
+    "rate": 0.03546099290780142,
+    "mean_turn": 4.51063829787234
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 10,
+    "cells": 59,
+    "rate": 0.1694915254237288,
+    "mean_turn": 7.779661016949152
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 46,
+    "rate": 0.0,
+    "mean_turn": 2.5
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 2,
+    "cells": 9,
+    "rate": 0.2222222222222222,
+    "mean_turn": 4.111111111111111
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=borderline": 2,
+    "owed=False,label=none": 6,
+    "owed=False,label=probe": 2,
+    "owed=True,label=none": 2,
+    "owed=True,label=probe": 3
+   }
+  },
+  "P3": {
+   "conversations": 19,
+   "learner_turns": 342,
+   "ttft_p50": 1.6361440000473522,
+   "ttft_p95": 4.332945409923559,
+   "ttft_min": 0.6349163999548182,
+   "ttft_share_le_1s": 0.07602339181286549,
+   "ttft_share_le_2s": 0.5292397660818714,
+   "latency_p50": 1.8205760499695316,
+   "latency_p95": 4.451835699978983,
+   "learner_cache_hit_pct": 0.26094185371314943,
+   "advisor_cache_hit_pct": 0.5657143834240304,
+   "learner_prompt_tokens_per_call_min": 444,
+   "learner_prompt_tokens_per_call_max": 986,
+   "learner_prompt_tokens_per_call_mean": 699.938596491228,
+   "tokens": {
+    "learner_prompt": 239379,
+    "learner_cache_hit": 62464,
+    "learner_completion": 6072,
+    "advisor_prompt": 233929,
+    "advisor_cache_hit": 132337,
+    "advisor_completion": 8264
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.07910009999999999,
+    "learner_with_cache_discount": 0.060735684,
+    "advisor_sim_ceiling_no_cache_discount": 0.0800955,
+    "advisor_sim_with_cache_discount": 0.041188422
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 0.9473684210526315,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 0.8947368421052632,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 19
+    },
+    "F2": {
+     "delivered": 19
+    },
+    "F1": {
+     "delivered": 18,
+     "never_owed_by_scheduler": 1
+    },
+    "F4": {
+     "never_owed_by_scheduler": 19
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 18,
+    "F1_incomplete": 1
+   },
+   "owed_episodes": 151,
+   "owed_first_attempt_rate": 0.9668874172185431,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 0.9734513274336283,
+   "family_moves_owed": 113,
+   "owed_turn_attempts": 156,
+   "owed_first_attempt_misses": 5,
+   "owed_misses_on_guarded_turns": 1,
+   "owed_episodes_delayed_by_guard": 1,
+   "owed_first_attempt_rate_excl_guard_delays": 0.9733333333333334,
+   "disclosures_first": 12,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 6,
+   "volunteered_cumulative_q": 1,
+   "volunteering_rate_same_turn_q": 0.5,
+   "volunteering_rate_cumulative_q": 0.08333333333333333,
+   "conversations_with_volunteered_same_turn_q": 5,
+   "conversations_with_volunteered_cumulative_q": 1,
+   "manual_labels": {
+    "probe": 4,
+    "borderline": 0,
+    "none": 8,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.6666666666666666,
+   "volunteering_rate_manual_none_or_borderline": 0.6666666666666666,
+   "conversations_with_manual_unprobed_reveal": 7,
+   "first_unlock_turn_reveals": 0,
+   "first_unlock_turn_reveals_ignoring_opener": 2,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 19
+   },
+   "unlock_proxy_opportunities": 48,
+   "unlock_proxy_rate": 0.25,
+   "unlock_proxy_opportunities_q": 30,
+   "unlock_proxy_rate_q": 0.2,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 1,
+   "harness_unlock_opportunities": 178,
+   "premature_commitments": 1,
+   "conversations_with_premature_commitment": 1,
+   "commitments_any": 1,
+   "commitment_levels": {
+    "MEDIUM": 1
+   },
+   "premature_concessions": 0,
+   "concession_check_turns": 95,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 2,
+   "conversations_with_guard_hit": 2,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 1,
+   "conversations_with_card_timeline_conflation": 1,
+   "product_fact_assertions": 3,
+   "conversations_with_product_fact": 2,
+   "contact_fabrications": 5,
+   "conversations_with_contact_fabrication": 4,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 5,
+   "conversations_with_written_form_contact_fabrication": 4,
+   "invented_availability_turns": 0,
+   "conversations_with_invented_availability": 0,
+   "sign_off_turn_share_per_turn": 0.30409356725146197,
+   "sign_off_turn_share_cumulative": 0.31871345029239767,
+   "sign_off_turn_share_cumulative_wide": 0.3333333333333333,
+   "advisor_role_inversion_turns_est": 6,
+   "conversations_with_advisor_role_inversion_est": 3,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 3,
+    "cells": 111,
+    "rate": 0.02702702702702703,
+    "mean_turn": 4.09009009009009
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 9,
+    "cells": 50,
+    "rate": 0.18,
+    "mean_turn": 7.36
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 44,
+    "rate": 0.0,
+    "mean_turn": 2.477272727272727
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 9,
+    "rate": 0.0,
+    "mean_turn": 4.666666666666667
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=none": 6,
+    "owed=False,label=probe": 3,
+    "owed=True,label=none": 2,
+    "owed=True,label=probe": 1
+   }
+  },
+  "P4": {
+   "conversations": 14,
+   "learner_turns": 252,
+   "ttft_p50": 2.5138702500262298,
+   "ttft_p95": 4.370729209965793,
+   "ttft_min": 0.7506927000358701,
+   "ttft_share_le_1s": 0.047619047619047616,
+   "ttft_share_le_2s": 0.36507936507936506,
+   "latency_p50": 2.609196800040081,
+   "latency_p95": 4.457139024959178,
+   "learner_cache_hit_pct": 0.26533749475939816,
+   "advisor_cache_hit_pct": 0.5775319495793426,
+   "learner_prompt_tokens_per_call_min": 440,
+   "learner_prompt_tokens_per_call_max": 1009,
+   "learner_prompt_tokens_per_call_mean": 681.4920634920635,
+   "tokens": {
+    "learner_prompt": 171736,
+    "learner_cache_hit": 45568,
+    "learner_completion": 4406,
+    "advisor_prompt": 171755,
+    "advisor_cache_hit": 99194,
+    "advisor_completion": 5887
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.056808,
+    "learner_with_cache_discount": 0.043411008,
+    "advisor_sim_ceiling_no_cache_discount": 0.0585909,
+    "advisor_sim_with_cache_discount": 0.029427863999999998
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 0.9285714285714286,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 0.8571428571428571,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 14
+    },
+    "F2": {
+     "delivered": 14
+    },
+    "F1": {
+     "delivered": 13,
+     "never_owed_by_scheduler": 1
+    },
+    "F4": {
+     "never_owed_by_scheduler": 14
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 13,
+    "F1_incomplete": 1
+   },
+   "owed_episodes": 110,
+   "owed_first_attempt_rate": 0.9818181818181818,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 0.9759036144578314,
+   "family_moves_owed": 83,
+   "owed_turn_attempts": 112,
+   "owed_first_attempt_misses": 2,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 0.9818181818181818,
+   "disclosures_first": 10,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 4,
+   "volunteered_cumulative_q": 1,
+   "volunteering_rate_same_turn_q": 0.4,
+   "volunteering_rate_cumulative_q": 0.1,
+   "conversations_with_volunteered_same_turn_q": 4,
+   "conversations_with_volunteered_cumulative_q": 1,
+   "manual_labels": {
+    "probe": 2,
+    "borderline": 1,
+    "none": 7,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.7,
+   "volunteering_rate_manual_none_or_borderline": 0.8,
+   "conversations_with_manual_unprobed_reveal": 5,
+   "first_unlock_turn_reveals": 2,
+   "first_unlock_turn_reveals_ignoring_opener": 3,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 14
+   },
+   "unlock_proxy_opportunities": 38,
+   "unlock_proxy_rate": 0.2631578947368421,
+   "unlock_proxy_opportunities_q": 28,
+   "unlock_proxy_rate_q": 0.25,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 151,
+   "premature_commitments": 4,
+   "conversations_with_premature_commitment": 1,
+   "commitments_any": 4,
+   "commitment_levels": {
+    "MEDIUM": 4
+   },
+   "premature_concessions": 0,
+   "concession_check_turns": 70,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 0,
+   "conversations_with_guard_hit": 0,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 1,
+   "conversations_with_card_timeline_conflation": 1,
+   "product_fact_assertions": 2,
+   "conversations_with_product_fact": 2,
+   "contact_fabrications": 2,
+   "conversations_with_contact_fabrication": 2,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 2,
+   "conversations_with_written_form_contact_fabrication": 2,
+   "invented_availability_turns": 2,
+   "conversations_with_invented_availability": 2,
+   "sign_off_turn_share_per_turn": 0.3134920634920635,
+   "sign_off_turn_share_cumulative": 0.32936507936507936,
+   "sign_off_turn_share_cumulative_wide": 0.373015873015873,
+   "advisor_role_inversion_turns_est": 1,
+   "conversations_with_advisor_role_inversion_est": 1,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 2,
+    "cells": 95,
+    "rate": 0.021052631578947368,
+    "mean_turn": 3.7473684210526317
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 8,
+    "cells": 40,
+    "rate": 0.2,
+    "mean_turn": 7.15
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 1,
+    "cells": 39,
+    "rate": 0.02564102564102564,
+    "mean_turn": 2.051282051282051
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 1,
+    "cells": 3,
+    "rate": 0.3333333333333333,
+    "mean_turn": 6.0
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=none": 7,
+    "owed=False,label=probe": 1,
+    "owed=True,label=borderline": 1,
+    "owed=True,label=probe": 1
+   }
+  }
+ },
+ "by_tier_baseline": {
+  "strong": {
+   "conversations": 12,
+   "learner_turns": 216,
+   "ttft_p50": 2.2883229999570176,
+   "ttft_p95": 4.029736824973952,
+   "ttft_min": 0.8744385000318289,
+   "ttft_share_le_1s": 0.004629629629629629,
+   "ttft_share_le_2s": 0.33796296296296297,
+   "latency_p50": 2.449263799993787,
+   "latency_p95": 4.176400424999883,
+   "learner_cache_hit_pct": 0.24417702834555052,
+   "advisor_cache_hit_pct": 0.5471787341016005,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 1009,
+   "learner_prompt_tokens_per_call_mean": 740.2037037037037,
+   "tokens": {
+    "learner_prompt": 159884,
+    "learner_cache_hit": 39040,
+    "learner_completion": 4369,
+    "advisor_prompt": 160708,
+    "advisor_cache_hit": 87936,
+    "advisor_completion": 6670
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.053208,
+    "learner_with_cache_discount": 0.041730239999999995,
+    "advisor_sim_ceiling_no_cache_discount": 0.0562164,
+    "advisor_sim_with_cache_discount": 0.030363216000000002
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.08333333333333333,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.08333333333333333
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 1.0,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 12
+    },
+    "F2": {
+     "delivered": 12
+    },
+    "F1": {
+     "delivered": 12
+    },
+    "F4": {
+     "never_owed_by_scheduler": 11,
+     "delivered": 1
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 11,
+    "delivered": 1
+   },
+   "owed_episodes": 100,
+   "owed_first_attempt_rate": 1.0,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 1.0,
+   "family_moves_owed": 74,
+   "owed_turn_attempts": 100,
+   "owed_first_attempt_misses": 0,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 1.0,
+   "disclosures_first": 10,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 2,
+   "volunteered_cumulative_q": 0,
+   "volunteering_rate_same_turn_q": 0.2,
+   "volunteering_rate_cumulative_q": 0.0,
+   "conversations_with_volunteered_same_turn_q": 2,
+   "conversations_with_volunteered_cumulative_q": 0,
+   "manual_labels": {
+    "probe": 5,
+    "borderline": 1,
+    "none": 4,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.4,
+   "volunteering_rate_manual_none_or_borderline": 0.5,
+   "conversations_with_manual_unprobed_reveal": 3,
+   "first_unlock_turn_reveals": 1,
+   "first_unlock_turn_reveals_ignoring_opener": 2,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 12
+   },
+   "unlock_proxy_opportunities": 34,
+   "unlock_proxy_rate": 0.29411764705882354,
+   "unlock_proxy_opportunities_q": 32,
+   "unlock_proxy_rate_q": 0.3125,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 150,
+   "premature_commitments": 4,
+   "conversations_with_premature_commitment": 1,
+   "commitments_any": 4,
+   "commitment_levels": {
+    "MEDIUM": 4
+   },
+   "premature_concessions": 0,
+   "concession_check_turns": 60,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 2,
+   "raw_guard_hits": 0,
+   "conversations_with_guard_hit": 0,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 0,
+   "conversations_with_product_fact": 0,
+   "contact_fabrications": 4,
+   "conversations_with_contact_fabrication": 4,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 4,
+   "conversations_with_written_form_contact_fabrication": 4,
+   "invented_availability_turns": 1,
+   "conversations_with_invented_availability": 1,
+   "sign_off_turn_share_per_turn": 0.16203703703703703,
+   "sign_off_turn_share_cumulative": 0.16203703703703703,
+   "sign_off_turn_share_cumulative_wide": 0.19444444444444445,
+   "advisor_role_inversion_turns_est": 6,
+   "conversations_with_advisor_role_inversion_est": 4,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 5,
+    "cells": 90,
+    "rate": 0.05555555555555555,
+    "mean_turn": 4.644444444444445
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 5,
+    "cells": 38,
+    "rate": 0.13157894736842105,
+    "mean_turn": 7.157894736842105
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 1,
+    "cells": 30,
+    "rate": 0.03333333333333333,
+    "mean_turn": 2.1666666666666665
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 5,
+    "rate": 0.0,
+    "mean_turn": 4.0
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=borderline": 1,
+    "owed=False,label=none": 3,
+    "owed=False,label=probe": 1,
+    "owed=True,label=none": 1,
+    "owed=True,label=probe": 4
+   }
+  },
+  "medium": {
+   "conversations": 12,
+   "learner_turns": 216,
+   "ttft_p50": 2.5037472000694834,
+   "ttft_p95": 4.510582174960291,
+   "ttft_min": 0.8230993000324816,
+   "ttft_share_le_1s": 0.004629629629629629,
+   "ttft_share_le_2s": 0.19907407407407407,
+   "latency_p50": 2.6131376000703312,
+   "latency_p95": 4.673435050062835,
+   "learner_cache_hit_pct": 0.25539280782774726,
+   "advisor_cache_hit_pct": 0.5735491512041058,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 952,
+   "learner_prompt_tokens_per_call_mean": 700.7361111111111,
+   "tokens": {
+    "learner_prompt": 151359,
+    "learner_cache_hit": 38656,
+    "learner_completion": 3793,
+    "advisor_prompt": 151980,
+    "advisor_cache_hit": 87168,
+    "advisor_completion": 5603
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.0499593,
+    "learner_with_cache_discount": 0.03859443600000001,
+    "advisor_sim_ceiling_no_cache_discount": 0.052317600000000006,
+    "advisor_sim_with_cache_discount": 0.026690207999999997
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 1.0,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 12
+    },
+    "F2": {
+     "delivered": 12
+    },
+    "F1": {
+     "delivered": 12
+    },
+    "F4": {
+     "never_owed_by_scheduler": 12
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 12
+   },
+   "owed_episodes": 94,
+   "owed_first_attempt_rate": 1.0,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 1.0,
+   "family_moves_owed": 72,
+   "owed_turn_attempts": 94,
+   "owed_first_attempt_misses": 0,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 1.0,
+   "disclosures_first": 5,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 2,
+   "volunteered_cumulative_q": 0,
+   "volunteering_rate_same_turn_q": 0.4,
+   "volunteering_rate_cumulative_q": 0.0,
+   "conversations_with_volunteered_same_turn_q": 2,
+   "conversations_with_volunteered_cumulative_q": 0,
+   "manual_labels": {
+    "probe": 2,
+    "borderline": 1,
+    "none": 2,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.4,
+   "volunteering_rate_manual_none_or_borderline": 0.6,
+   "conversations_with_manual_unprobed_reveal": 2,
+   "first_unlock_turn_reveals": 1,
+   "first_unlock_turn_reveals_ignoring_opener": 1,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 12
+   },
+   "unlock_proxy_opportunities": 33,
+   "unlock_proxy_rate": 0.15151515151515152,
+   "unlock_proxy_opportunities_q": 24,
+   "unlock_proxy_rate_q": 0.125,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 129,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 60,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 0,
+   "conversations_with_guard_hit": 0,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 2,
+   "conversations_with_card_timeline_conflation": 2,
+   "product_fact_assertions": 1,
+   "conversations_with_product_fact": 1,
+   "contact_fabrications": 3,
+   "conversations_with_contact_fabrication": 3,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 3,
+   "conversations_with_written_form_contact_fabrication": 3,
+   "invented_availability_turns": 3,
+   "conversations_with_invented_availability": 3,
+   "sign_off_turn_share_per_turn": 0.3101851851851852,
+   "sign_off_turn_share_cumulative": 0.3194444444444444,
+   "sign_off_turn_share_cumulative_wide": 0.37037037037037035,
+   "advisor_role_inversion_turns_est": 3,
+   "conversations_with_advisor_role_inversion_est": 1,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 1,
+    "cells": 81,
+    "rate": 0.012345679012345678,
+    "mean_turn": 4.111111111111111
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 4,
+    "cells": 40,
+    "rate": 0.1,
+    "mean_turn": 6.55
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 1,
+    "cells": 29,
+    "rate": 0.034482758620689655,
+    "mean_turn": 2.1724137931034484
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 7,
+    "rate": 0.0,
+    "mean_turn": 3.7142857142857144
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=borderline": 1,
+    "owed=False,label=none": 2,
+    "owed=False,label=probe": 1,
+    "owed=True,label=probe": 1
+   }
+  },
+  "weak": {
+   "conversations": 12,
+   "learner_turns": 216,
+   "ttft_p50": 2.635715749929659,
+   "ttft_p95": 5.246423100034008,
+   "ttft_min": 1.2768582999706268,
+   "ttft_share_le_1s": 0.0,
+   "ttft_share_le_2s": 0.14814814814814814,
+   "latency_p50": 2.7367903999984264,
+   "latency_p95": 5.387795949995052,
+   "learner_cache_hit_pct": 0.29251461900956677,
+   "advisor_cache_hit_pct": 0.6172020500974518,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 824,
+   "learner_prompt_tokens_per_call_mean": 619.9120370370371,
+   "tokens": {
+    "learner_prompt": 133901,
+    "learner_cache_hit": 39168,
+    "learner_completion": 2979,
+    "advisor_prompt": 138530,
+    "advisor_cache_hit": 85501,
+    "advisor_completion": 3754
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.0437451,
+    "learner_with_cache_discount": 0.032229707999999996,
+    "advisor_sim_ceiling_no_cache_discount": 0.0460638,
+    "advisor_sim_with_cache_discount": 0.020926505999999997
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 0.6666666666666666,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 0.9166666666666666,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 12
+    },
+    "F2": {
+     "delivered": 12
+    },
+    "F1": {
+     "delivered": 8,
+     "never_owed_by_scheduler": 4
+    },
+    "F4": {
+     "never_owed_by_scheduler": 12
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 8,
+    "F1_incomplete": 4
+   },
+   "owed_episodes": 92,
+   "owed_first_attempt_rate": 0.967391304347826,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 0.9705882352941176,
+   "family_moves_owed": 68,
+   "owed_turn_attempts": 95,
+   "owed_first_attempt_misses": 3,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 0.967391304347826,
+   "disclosures_first": 4,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 4,
+   "volunteered_cumulative_q": 2,
+   "volunteering_rate_same_turn_q": 1.0,
+   "volunteering_rate_cumulative_q": 0.5,
+   "conversations_with_volunteered_same_turn_q": 4,
+   "conversations_with_volunteered_cumulative_q": 2,
+   "manual_labels": {
+    "probe": 0,
+    "borderline": 0,
+    "none": 4,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 1.0,
+   "volunteering_rate_manual_none_or_borderline": 1.0,
+   "conversations_with_manual_unprobed_reveal": 4,
+   "first_unlock_turn_reveals": 1,
+   "first_unlock_turn_reveals_ignoring_opener": 2,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 12
+   },
+   "unlock_proxy_opportunities": 26,
+   "unlock_proxy_rate": 0.15384615384615385,
+   "unlock_proxy_opportunities_q": 3,
+   "unlock_proxy_rate_q": 0.0,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 81,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 60,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 0,
+   "conversations_with_guard_hit": 0,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 0,
+   "conversations_with_product_fact": 0,
+   "contact_fabrications": 2,
+   "conversations_with_contact_fabrication": 1,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 2,
+   "conversations_with_written_form_contact_fabrication": 1,
+   "invented_availability_turns": 0,
+   "conversations_with_invented_availability": 0,
+   "sign_off_turn_share_per_turn": 0.4398148148148148,
+   "sign_off_turn_share_cumulative": 0.5,
+   "sign_off_turn_share_cumulative_wide": 0.5648148148148148,
+   "advisor_role_inversion_turns_est": 0,
+   "conversations_with_advisor_role_inversion_est": 0,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 1,
+    "cells": 60,
+    "rate": 0.016666666666666666,
+    "mean_turn": 3.3666666666666667
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 3,
+    "cells": 16,
+    "rate": 0.1875,
+    "mean_turn": 7.3125
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 29,
+    "rate": 0.0,
+    "mean_turn": 2.5517241379310347
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 1,
+    "cells": 2,
+    "rate": 0.5,
+    "mean_turn": 7.5
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=none": 3,
+    "owed=True,label=none": 1
+   }
+  }
+ },
+ "by_adversary": {
+  "baseline": {
+   "conversations": 36,
+   "learner_turns": 648,
+   "ttft_p50": 2.446618399990257,
+   "ttft_p95": 4.749186334962723,
+   "ttft_min": 0.8230993000324816,
+   "ttft_share_le_1s": 0.0030864197530864196,
+   "ttft_share_le_2s": 0.22839506172839505,
+   "latency_p50": 2.569585549994372,
+   "latency_p95": 4.862431504996493,
+   "learner_cache_hit_pct": 0.2625307765576982,
+   "advisor_cache_hit_pct": 0.5775589626300369,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 1009,
+   "learner_prompt_tokens_per_call_mean": 686.9506172839506,
+   "tokens": {
+    "learner_prompt": 445144,
+    "learner_cache_hit": 116864,
+    "learner_completion": 11141,
+    "advisor_prompt": 451218,
+    "advisor_cache_hit": 260605,
+    "advisor_completion": 16027
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.14691239999999997,
+    "learner_with_cache_discount": 0.112554384,
+    "advisor_sim_ceiling_no_cache_discount": 0.1545978,
+    "advisor_sim_with_cache_discount": 0.07797993
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.027777777777777776,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 0.8888888888888888,
+    "F4": 0.027777777777777776
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 0.9722222222222222,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 36
+    },
+    "F2": {
+     "delivered": 36
+    },
+    "F1": {
+     "delivered": 32,
+     "never_owed_by_scheduler": 4
+    },
+    "F4": {
+     "never_owed_by_scheduler": 35,
+     "delivered": 1
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 31,
+    "delivered": 1,
+    "F1_incomplete": 4
+   },
+   "owed_episodes": 286,
+   "owed_first_attempt_rate": 0.9895104895104895,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 0.9906542056074766,
+   "family_moves_owed": 214,
+   "owed_turn_attempts": 289,
+   "owed_first_attempt_misses": 3,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 0.9895104895104895,
+   "disclosures_first": 19,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 8,
+   "volunteered_cumulative_q": 2,
+   "volunteering_rate_same_turn_q": 0.42105263157894735,
+   "volunteering_rate_cumulative_q": 0.10526315789473684,
+   "conversations_with_volunteered_same_turn_q": 8,
+   "conversations_with_volunteered_cumulative_q": 2,
+   "manual_labels": {
+    "probe": 7,
+    "borderline": 2,
+    "none": 10,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.5263157894736842,
+   "volunteering_rate_manual_none_or_borderline": 0.631578947368421,
+   "conversations_with_manual_unprobed_reveal": 9,
+   "first_unlock_turn_reveals": 3,
+   "first_unlock_turn_reveals_ignoring_opener": 5,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 36
+   },
+   "unlock_proxy_opportunities": 93,
+   "unlock_proxy_rate": 0.20430107526881722,
+   "unlock_proxy_opportunities_q": 59,
+   "unlock_proxy_rate_q": 0.22033898305084745,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 360,
+   "premature_commitments": 4,
+   "conversations_with_premature_commitment": 1,
+   "commitments_any": 4,
+   "commitment_levels": {
+    "MEDIUM": 4
+   },
+   "premature_concessions": 0,
+   "concession_check_turns": 180,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 2,
+   "raw_guard_hits": 0,
+   "conversations_with_guard_hit": 0,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 2,
+   "conversations_with_card_timeline_conflation": 2,
+   "product_fact_assertions": 1,
+   "conversations_with_product_fact": 1,
+   "contact_fabrications": 9,
+   "conversations_with_contact_fabrication": 8,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 9,
+   "conversations_with_written_form_contact_fabrication": 8,
+   "invented_availability_turns": 4,
+   "conversations_with_invented_availability": 4,
+   "sign_off_turn_share_per_turn": 0.30401234567901236,
+   "sign_off_turn_share_cumulative": 0.3271604938271605,
+   "sign_off_turn_share_cumulative_wide": 0.3765432098765432,
+   "advisor_role_inversion_turns_est": 9,
+   "conversations_with_advisor_role_inversion_est": 5,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 7,
+    "cells": 231,
+    "rate": 0.030303030303030304,
+    "mean_turn": 4.125541125541125
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 12,
+    "cells": 94,
+    "rate": 0.1276595744680851,
+    "mean_turn": 6.925531914893617
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 2,
+    "cells": 88,
+    "rate": 0.022727272727272728,
+    "mean_turn": 2.2954545454545454
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 1,
+    "cells": 14,
+    "rate": 0.07142857142857142,
+    "mean_turn": 4.357142857142857
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=borderline": 2,
+    "owed=False,label=none": 8,
+    "owed=False,label=probe": 2,
+    "owed=True,label=none": 2,
+    "owed=True,label=probe": 5
+   }
+  },
+  "early_closer": {
+   "conversations": 4,
+   "learner_turns": 72,
+   "ttft_p50": 1.3739209500490688,
+   "ttft_p95": 4.4190699499915365,
+   "ttft_min": 0.7990857000695542,
+   "ttft_share_le_1s": 0.06944444444444445,
+   "ttft_share_le_2s": 0.6666666666666666,
+   "latency_p50": 1.5149673499399796,
+   "latency_p95": 4.582227524981136,
+   "learner_cache_hit_pct": 0.2591789086551375,
+   "advisor_cache_hit_pct": 0.5746848558107408,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 879,
+   "learner_prompt_tokens_per_call_mean": 672.2083333333334,
+   "tokens": {
+    "learner_prompt": 48399,
+    "learner_cache_hit": 12544,
+    "learner_completion": 1165,
+    "advisor_prompt": 46328,
+    "advisor_cache_hit": 26624,
+    "advisor_completion": 1522
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.0159177,
+    "learner_with_cache_discount": 0.012229764,
+    "advisor_sim_ceiling_no_cache_discount": 0.0157248,
+    "advisor_sim_with_cache_discount": 0.007897344
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 0.25,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 4
+    },
+    "F2": {
+     "delivered": 4
+    },
+    "F1": {
+     "delivered": 4
+    },
+    "F4": {
+     "never_owed_by_scheduler": 4
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 4
+   },
+   "owed_episodes": 32,
+   "owed_first_attempt_rate": 0.90625,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 0.875,
+   "family_moves_owed": 24,
+   "owed_turn_attempts": 35,
+   "owed_first_attempt_misses": 3,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 0.90625,
+   "disclosures_first": 1,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 0,
+   "volunteered_cumulative_q": 0,
+   "volunteering_rate_same_turn_q": 0.0,
+   "volunteering_rate_cumulative_q": 0.0,
+   "conversations_with_volunteered_same_turn_q": 0,
+   "conversations_with_volunteered_cumulative_q": 0,
+   "manual_labels": {
+    "probe": 1,
+    "borderline": 0,
+    "none": 0,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.0,
+   "volunteering_rate_manual_none_or_borderline": 0.0,
+   "conversations_with_manual_unprobed_reveal": 0,
+   "first_unlock_turn_reveals": 0,
+   "first_unlock_turn_reveals_ignoring_opener": 1,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 4
+   },
+   "unlock_proxy_opportunities": 12,
+   "unlock_proxy_rate": 0.08333333333333333,
+   "unlock_proxy_opportunities_q": 9,
+   "unlock_proxy_rate_q": 0.1111111111111111,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 48,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 20,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 0,
+   "conversations_with_guard_hit": 0,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 1,
+   "conversations_with_card_timeline_conflation": 1,
+   "product_fact_assertions": 1,
+   "conversations_with_product_fact": 1,
+   "contact_fabrications": 0,
+   "conversations_with_contact_fabrication": 0,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 0,
+   "conversations_with_written_form_contact_fabrication": 0,
+   "invented_availability_turns": 0,
+   "conversations_with_invented_availability": 0,
+   "sign_off_turn_share_per_turn": 0.2916666666666667,
+   "sign_off_turn_share_cumulative": 0.3055555555555556,
+   "sign_off_turn_share_cumulative_wide": 0.3888888888888889,
+   "advisor_role_inversion_turns_est": 1,
+   "conversations_with_advisor_role_inversion_est": 1,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 1,
+    "cells": 29,
+    "rate": 0.034482758620689655,
+    "mean_turn": 5.0
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 0,
+    "cells": 16,
+    "rate": 0.0,
+    "mean_turn": 9.25
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 10,
+    "rate": 0.0,
+    "mean_turn": 2.6
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 2,
+    "rate": 0.0,
+    "mean_turn": 4.5
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=True,label=probe": 1
+   }
+  },
+  "rambler": {
+   "conversations": 4,
+   "learner_turns": 72,
+   "ttft_p50": 1.2922410999890417,
+   "ttft_p95": 4.516802514973096,
+   "ttft_min": 0.9227645000210032,
+   "ttft_share_le_1s": 0.125,
+   "ttft_share_le_2s": 0.75,
+   "latency_p50": 1.4783666999428533,
+   "latency_p95": 4.653307799994946,
+   "learner_cache_hit_pct": 0.2712982042979099,
+   "advisor_cache_hit_pct": 0.5789213972901289,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 977,
+   "learner_prompt_tokens_per_call_mean": 707.7083333333334,
+   "tokens": {
+    "learner_prompt": 50955,
+    "learner_cache_hit": 13824,
+    "learner_completion": 1262,
+    "advisor_prompt": 48637,
+    "advisor_cache_hit": 28157,
+    "advisor_completion": 1616
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.0168009,
+    "learner_with_cache_discount": 0.012736643999999998,
+    "advisor_sim_ceiling_no_cache_discount": 0.0165303,
+    "advisor_sim_with_cache_discount": 0.008252142
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 1.0,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 4
+    },
+    "F2": {
+     "delivered": 4
+    },
+    "F1": {
+     "delivered": 4
+    },
+    "F4": {
+     "never_owed_by_scheduler": 4
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 4
+   },
+   "owed_episodes": 32,
+   "owed_first_attempt_rate": 1.0,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 1.0,
+   "family_moves_owed": 24,
+   "owed_turn_attempts": 32,
+   "owed_first_attempt_misses": 0,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 1.0,
+   "disclosures_first": 1,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 0,
+   "volunteered_cumulative_q": 0,
+   "volunteering_rate_same_turn_q": 0.0,
+   "volunteering_rate_cumulative_q": 0.0,
+   "conversations_with_volunteered_same_turn_q": 0,
+   "conversations_with_volunteered_cumulative_q": 0,
+   "manual_labels": {
+    "probe": 0,
+    "borderline": 0,
+    "none": 1,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 1.0,
+   "volunteering_rate_manual_none_or_borderline": 1.0,
+   "conversations_with_manual_unprobed_reveal": 1,
+   "first_unlock_turn_reveals": 0,
+   "first_unlock_turn_reveals_ignoring_opener": 1,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 4
+   },
+   "unlock_proxy_opportunities": 12,
+   "unlock_proxy_rate": 0.08333333333333333,
+   "unlock_proxy_opportunities_q": 9,
+   "unlock_proxy_rate_q": 0.1111111111111111,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 45,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 20,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 0,
+   "conversations_with_guard_hit": 0,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 0,
+   "conversations_with_product_fact": 0,
+   "contact_fabrications": 2,
+   "conversations_with_contact_fabrication": 2,
+   "contact_fabrications_spoken_form": 1,
+   "contact_fabrications_written_form": 1,
+   "conversations_with_written_form_contact_fabrication": 1,
+   "invented_availability_turns": 0,
+   "conversations_with_invented_availability": 0,
+   "sign_off_turn_share_per_turn": 0.2916666666666667,
+   "sign_off_turn_share_cumulative": 0.2916666666666667,
+   "sign_off_turn_share_cumulative_wide": 0.2916666666666667,
+   "advisor_role_inversion_turns_est": 0,
+   "conversations_with_advisor_role_inversion_est": 0,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 0,
+    "cells": 27,
+    "rate": 0.0,
+    "mean_turn": 4.851851851851852
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 1,
+    "cells": 17,
+    "rate": 0.058823529411764705,
+    "mean_turn": 7.764705882352941
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 10,
+    "rate": 0.0,
+    "mean_turn": 2.5
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 2,
+    "rate": 0.0,
+    "mean_turn": 4.0
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=none": 1
+   }
+  },
+  "one_word_answers": {
+   "conversations": 4,
+   "learner_turns": 72,
+   "ttft_p50": 1.3486758499639109,
+   "ttft_p95": 4.096900869958336,
+   "ttft_min": 0.8444211999885738,
+   "ttft_share_le_1s": 0.05555555555555555,
+   "ttft_share_le_2s": 0.75,
+   "latency_p50": 1.4909084499813616,
+   "latency_p95": 4.304719019983896,
+   "learner_cache_hit_pct": 0.26136055839149913,
+   "advisor_cache_hit_pct": 0.5741499252324296,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 862,
+   "learner_prompt_tokens_per_call_mean": 666.5972222222222,
+   "tokens": {
+    "learner_prompt": 47995,
+    "learner_cache_hit": 12544,
+    "learner_completion": 1208,
+    "advisor_prompt": 46143,
+    "advisor_cache_hit": 26493,
+    "advisor_completion": 1540
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.0158481,
+    "learner_with_cache_discount": 0.012160164,
+    "advisor_sim_ceiling_no_cache_discount": 0.0156909,
+    "advisor_sim_with_cache_discount": 0.007901958
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 0.75,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 4
+    },
+    "F2": {
+     "delivered": 4
+    },
+    "F1": {
+     "delivered": 4
+    },
+    "F4": {
+     "never_owed_by_scheduler": 4
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 4
+   },
+   "owed_episodes": 32,
+   "owed_first_attempt_rate": 0.96875,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 0.9583333333333334,
+   "family_moves_owed": 24,
+   "owed_turn_attempts": 33,
+   "owed_first_attempt_misses": 1,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 0.96875,
+   "disclosures_first": 3,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 1,
+   "volunteered_cumulative_q": 0,
+   "volunteering_rate_same_turn_q": 0.3333333333333333,
+   "volunteering_rate_cumulative_q": 0.0,
+   "conversations_with_volunteered_same_turn_q": 1,
+   "conversations_with_volunteered_cumulative_q": 0,
+   "manual_labels": {
+    "probe": 0,
+    "borderline": 1,
+    "none": 2,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.6666666666666666,
+   "volunteering_rate_manual_none_or_borderline": 1.0,
+   "conversations_with_manual_unprobed_reveal": 1,
+   "first_unlock_turn_reveals": 0,
+   "first_unlock_turn_reveals_ignoring_opener": 0,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 4
+   },
+   "unlock_proxy_opportunities": 9,
+   "unlock_proxy_rate": 0.3333333333333333,
+   "unlock_proxy_opportunities_q": 6,
+   "unlock_proxy_rate_q": 0.3333333333333333,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 43,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 20,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 1,
+   "conversations_with_guard_hit": 1,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 3,
+   "conversations_with_product_fact": 2,
+   "contact_fabrications": 1,
+   "conversations_with_contact_fabrication": 1,
+   "contact_fabrications_spoken_form": 1,
+   "contact_fabrications_written_form": 0,
+   "conversations_with_written_form_contact_fabrication": 0,
+   "invented_availability_turns": 1,
+   "conversations_with_invented_availability": 1,
+   "sign_off_turn_share_per_turn": 0.3194444444444444,
+   "sign_off_turn_share_cumulative": 0.3333333333333333,
+   "sign_off_turn_share_cumulative_wide": 0.3472222222222222,
+   "advisor_role_inversion_turns_est": 2,
+   "conversations_with_advisor_role_inversion_est": 1,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 1,
+    "cells": 28,
+    "rate": 0.03571428571428571,
+    "mean_turn": 4.071428571428571
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 2,
+    "cells": 9,
+    "rate": 0.2222222222222222,
+    "mean_turn": 7.222222222222222
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 11,
+    "rate": 0.0,
+    "mean_turn": 2.5454545454545454
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 0,
+    "rate": null,
+    "mean_turn": null
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=none": 2,
+    "owed=True,label=borderline": 1
+   }
+  },
+  "silence": {
+   "conversations": 4,
+   "learner_turns": 72,
+   "ttft_p50": 1.4128640000126325,
+   "ttft_p95": 2.8813714199874085,
+   "ttft_min": 0.8659477001056075,
+   "ttft_share_le_1s": 0.09722222222222222,
+   "ttft_share_le_2s": 0.7222222222222222,
+   "latency_p50": 1.5760232500033453,
+   "latency_p95": 3.051966669992544,
+   "learner_cache_hit_pct": 0.26108344831723557,
+   "advisor_cache_hit_pct": 0.5533372316431375,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 986,
+   "learner_prompt_tokens_per_call_mean": 694.5416666666666,
+   "tokens": {
+    "learner_prompt": 50007,
+    "learner_cache_hit": 13056,
+    "learner_completion": 1322,
+    "advisor_prompt": 47884,
+    "advisor_cache_hit": 26496,
+    "advisor_completion": 1696
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.0165885,
+    "learner_with_cache_discount": 0.012750036,
+    "advisor_sim_ceiling_no_cache_discount": 0.0164004,
+    "advisor_sim_with_cache_discount": 0.008610576
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 0.75,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 4
+    },
+    "F2": {
+     "delivered": 4
+    },
+    "F1": {
+     "delivered": 4
+    },
+    "F4": {
+     "never_owed_by_scheduler": 4
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 4
+   },
+   "owed_episodes": 32,
+   "owed_first_attempt_rate": 0.96875,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 0.9583333333333334,
+   "family_moves_owed": 24,
+   "owed_turn_attempts": 33,
+   "owed_first_attempt_misses": 1,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 0.96875,
+   "disclosures_first": 3,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 0,
+   "volunteered_cumulative_q": 0,
+   "volunteering_rate_same_turn_q": 0.0,
+   "volunteering_rate_cumulative_q": 0.0,
+   "conversations_with_volunteered_same_turn_q": 0,
+   "conversations_with_volunteered_cumulative_q": 0,
+   "manual_labels": {
+    "probe": 2,
+    "borderline": 0,
+    "none": 1,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.3333333333333333,
+   "volunteering_rate_manual_none_or_borderline": 0.3333333333333333,
+   "conversations_with_manual_unprobed_reveal": 1,
+   "first_unlock_turn_reveals": 1,
+   "first_unlock_turn_reveals_ignoring_opener": 1,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 4
+   },
+   "unlock_proxy_opportunities": 12,
+   "unlock_proxy_rate": 0.25,
+   "unlock_proxy_opportunities_q": 10,
+   "unlock_proxy_rate_q": 0.2,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 47,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 20,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 1,
+   "conversations_with_guard_hit": 1,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 2,
+   "conversations_with_product_fact": 2,
+   "contact_fabrications": 1,
+   "conversations_with_contact_fabrication": 1,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 1,
+   "conversations_with_written_form_contact_fabrication": 1,
+   "invented_availability_turns": 1,
+   "conversations_with_invented_availability": 1,
+   "sign_off_turn_share_per_turn": 0.2638888888888889,
+   "sign_off_turn_share_cumulative": 0.2638888888888889,
+   "sign_off_turn_share_cumulative_wide": 0.2916666666666667,
+   "advisor_role_inversion_turns_est": 0,
+   "conversations_with_advisor_role_inversion_est": 0,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 1,
+    "cells": 26,
+    "rate": 0.038461538461538464,
+    "mean_turn": 4.576923076923077
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 2,
+    "cells": 16,
+    "rate": 0.125,
+    "mean_turn": 7.0
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 10,
+    "rate": 0.0,
+    "mean_turn": 2.6
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 1,
+    "cells": 2,
+    "rate": 0.5,
+    "mean_turn": 4.0
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=probe": 2,
+    "owed=True,label=none": 1
+   }
+  },
+  "rude": {
+   "conversations": 4,
+   "learner_turns": 72,
+   "ttft_p50": 1.3179302000207826,
+   "ttft_p95": 7.063906449993374,
+   "ttft_min": 0.7506927000358701,
+   "ttft_share_le_1s": 0.1111111111111111,
+   "ttft_share_le_2s": 0.75,
+   "latency_p50": 1.4822144500212744,
+   "latency_p95": 7.205837579979562,
+   "learner_cache_hit_pct": 0.2583709332700071,
+   "advisor_cache_hit_pct": 0.5628536031385505,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 870,
+   "learner_prompt_tokens_per_call_mean": 701.8333333333334,
+   "tokens": {
+    "learner_prompt": 50532,
+    "learner_cache_hit": 13056,
+    "learner_completion": 1330,
+    "advisor_prompt": 48430,
+    "advisor_cache_hit": 27259,
+    "advisor_completion": 1732
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.0167556,
+    "learner_with_cache_discount": 0.012917136,
+    "advisor_sim_ceiling_no_cache_discount": 0.0166074,
+    "advisor_sim_with_cache_discount": 0.008593254
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 1.0,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 4
+    },
+    "F2": {
+     "delivered": 4
+    },
+    "F1": {
+     "delivered": 4
+    },
+    "F4": {
+     "never_owed_by_scheduler": 4
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 4
+   },
+   "owed_episodes": 31,
+   "owed_first_attempt_rate": 0.967741935483871,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 1.0,
+   "family_moves_owed": 24,
+   "owed_turn_attempts": 32,
+   "owed_first_attempt_misses": 1,
+   "owed_misses_on_guarded_turns": 1,
+   "owed_episodes_delayed_by_guard": 1,
+   "owed_first_attempt_rate_excl_guard_delays": 1.0,
+   "disclosures_first": 4,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 4,
+   "volunteered_cumulative_q": 2,
+   "volunteering_rate_same_turn_q": 1.0,
+   "volunteering_rate_cumulative_q": 0.5,
+   "conversations_with_volunteered_same_turn_q": 3,
+   "conversations_with_volunteered_cumulative_q": 2,
+   "manual_labels": {
+    "probe": 0,
+    "borderline": 0,
+    "none": 4,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 1.0,
+   "volunteering_rate_manual_none_or_borderline": 1.0,
+   "conversations_with_manual_unprobed_reveal": 3,
+   "first_unlock_turn_reveals": 2,
+   "first_unlock_turn_reveals_ignoring_opener": 3,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 4
+   },
+   "unlock_proxy_opportunities": 11,
+   "unlock_proxy_rate": 0.36363636363636365,
+   "unlock_proxy_opportunities_q": 6,
+   "unlock_proxy_rate_q": 0.3333333333333333,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 43,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 20,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 1,
+   "conversations_with_guard_hit": 1,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 0,
+   "conversations_with_product_fact": 0,
+   "contact_fabrications": 0,
+   "conversations_with_contact_fabrication": 0,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 0,
+   "conversations_with_written_form_contact_fabrication": 0,
+   "invented_availability_turns": 1,
+   "conversations_with_invented_availability": 1,
+   "sign_off_turn_share_per_turn": 0.2916666666666667,
+   "sign_off_turn_share_cumulative": 0.2916666666666667,
+   "sign_off_turn_share_cumulative_wide": 0.3333333333333333,
+   "advisor_role_inversion_turns_est": 0,
+   "conversations_with_advisor_role_inversion_est": 0,
+   "guarded_turns_after_advisor_guard_term": 1,
+   "reveal_cells_with_owed_line": {
+    "revealed": 1,
+    "cells": 25,
+    "rate": 0.04,
+    "mean_turn": 4.12
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 3,
+    "cells": 9,
+    "rate": 0.3333333333333333,
+    "mean_turn": 5.555555555555555
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 1,
+    "cells": 9,
+    "rate": 0.1111111111111111,
+    "mean_turn": 2.111111111111111
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 1,
+    "cells": 3,
+    "rate": 0.3333333333333333,
+    "mean_turn": 3.6666666666666665
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=none": 3,
+    "owed=True,label=none": 1
+   }
+  },
+  "jailbreak_ignore": {
+   "conversations": 3,
+   "learner_turns": 54,
+   "ttft_p50": 1.326027850038372,
+   "ttft_p95": 6.667982590082102,
+   "ttft_min": 0.8524792999960482,
+   "ttft_share_le_1s": 0.09259259259259259,
+   "ttft_share_le_2s": 0.6666666666666666,
+   "latency_p50": 1.4944322499795817,
+   "latency_p95": 6.7822219949914135,
+   "learner_cache_hit_pct": 0.2655387019425061,
+   "advisor_cache_hit_pct": 0.5708874610701159,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 922,
+   "learner_prompt_tokens_per_call_mean": 687.3518518518518,
+   "tokens": {
+    "learner_prompt": 37117,
+    "learner_cache_hit": 9856,
+    "learner_completion": 899,
+    "advisor_prompt": 35641,
+    "advisor_cache_hit": 20347,
+    "advisor_completion": 1228
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.0122139,
+    "learner_with_cache_discount": 0.009316235999999999,
+    "advisor_sim_ceiling_no_cache_discount": 0.0121659,
+    "advisor_sim_with_cache_discount": 0.006183882
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 1.0,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 3
+    },
+    "F2": {
+     "delivered": 3
+    },
+    "F1": {
+     "delivered": 3
+    },
+    "F4": {
+     "never_owed_by_scheduler": 3
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 3
+   },
+   "owed_episodes": 22,
+   "owed_first_attempt_rate": 1.0,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 1.0,
+   "family_moves_owed": 18,
+   "owed_turn_attempts": 22,
+   "owed_first_attempt_misses": 0,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 1.0,
+   "disclosures_first": 2,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 0,
+   "volunteered_cumulative_q": 0,
+   "volunteering_rate_same_turn_q": 0.0,
+   "volunteering_rate_cumulative_q": 0.0,
+   "conversations_with_volunteered_same_turn_q": 0,
+   "conversations_with_volunteered_cumulative_q": 0,
+   "manual_labels": {
+    "probe": 1,
+    "borderline": 0,
+    "none": 1,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.5,
+   "volunteering_rate_manual_none_or_borderline": 0.5,
+   "conversations_with_manual_unprobed_reveal": 1,
+   "first_unlock_turn_reveals": 0,
+   "first_unlock_turn_reveals_ignoring_opener": 0,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 3
+   },
+   "unlock_proxy_opportunities": 8,
+   "unlock_proxy_rate": 0.25,
+   "unlock_proxy_opportunities_q": 6,
+   "unlock_proxy_rate_q": 0.3333333333333333,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 28,
+   "premature_commitments": 1,
+   "conversations_with_premature_commitment": 1,
+   "commitments_any": 1,
+   "commitment_levels": {
+    "MEDIUM": 1
+   },
+   "premature_concessions": 0,
+   "concession_check_turns": 15,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 0,
+   "conversations_with_guard_hit": 0,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 0,
+   "conversations_with_product_fact": 0,
+   "contact_fabrications": 0,
+   "conversations_with_contact_fabrication": 0,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 0,
+   "conversations_with_written_form_contact_fabrication": 0,
+   "invented_availability_turns": 0,
+   "conversations_with_invented_availability": 0,
+   "sign_off_turn_share_per_turn": 0.37037037037037035,
+   "sign_off_turn_share_cumulative": 0.37037037037037035,
+   "sign_off_turn_share_cumulative_wide": 0.3888888888888889,
+   "advisor_role_inversion_turns_est": 1,
+   "conversations_with_advisor_role_inversion_est": 1,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 0,
+    "cells": 18,
+    "rate": 0.0,
+    "mean_turn": 4.555555555555555
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 2,
+    "cells": 8,
+    "rate": 0.25,
+    "mean_turn": 8.375
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 7,
+    "rate": 0.0,
+    "mean_turn": 3.5714285714285716
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 2,
+    "rate": 0.0,
+    "mean_turn": 5.0
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=none": 1,
+    "owed=False,label=probe": 1
+   }
+  },
+  "already_agreed": {
+   "conversations": 3,
+   "learner_turns": 54,
+   "ttft_p50": 1.2762859999784268,
+   "ttft_p95": 3.6163605300476775,
+   "ttft_min": 0.6913466999540105,
+   "ttft_share_le_1s": 0.24074074074074073,
+   "ttft_share_le_2s": 0.6666666666666666,
+   "latency_p50": 1.45122084999457,
+   "latency_p95": 3.786425810010405,
+   "learner_cache_hit_pct": 0.26064999592734384,
+   "advisor_cache_hit_pct": 0.562700783407541,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 855,
+   "learner_prompt_tokens_per_call_mean": 682.0555555555555,
+   "tokens": {
+    "learner_prompt": 36831,
+    "learner_cache_hit": 9600,
+    "learner_completion": 933,
+    "advisor_prompt": 35486,
+    "advisor_cache_hit": 19968,
+    "advisor_completion": 1231
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.0121689,
+    "learner_with_cache_discount": 0.009346499999999999,
+    "advisor_sim_ceiling_no_cache_discount": 0.012122999999999998,
+    "advisor_sim_with_cache_discount": 0.006252407999999999
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 0.6666666666666666,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 3
+    },
+    "F2": {
+     "delivered": 3
+    },
+    "F1": {
+     "delivered": 3
+    },
+    "F4": {
+     "never_owed_by_scheduler": 3
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 3
+   },
+   "owed_episodes": 23,
+   "owed_first_attempt_rate": 0.9130434782608695,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 0.9444444444444444,
+   "family_moves_owed": 18,
+   "owed_turn_attempts": 25,
+   "owed_first_attempt_misses": 2,
+   "owed_misses_on_guarded_turns": 1,
+   "owed_episodes_delayed_by_guard": 1,
+   "owed_first_attempt_rate_excl_guard_delays": 0.9545454545454546,
+   "disclosures_first": 2,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 2,
+   "volunteered_cumulative_q": 0,
+   "volunteering_rate_same_turn_q": 1.0,
+   "volunteering_rate_cumulative_q": 0.0,
+   "conversations_with_volunteered_same_turn_q": 2,
+   "conversations_with_volunteered_cumulative_q": 0,
+   "manual_labels": {
+    "probe": 0,
+    "borderline": 0,
+    "none": 2,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 1.0,
+   "volunteering_rate_manual_none_or_borderline": 1.0,
+   "conversations_with_manual_unprobed_reveal": 2,
+   "first_unlock_turn_reveals": 0,
+   "first_unlock_turn_reveals_ignoring_opener": 0,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 3
+   },
+   "unlock_proxy_opportunities": 6,
+   "unlock_proxy_rate": 0.3333333333333333,
+   "unlock_proxy_opportunities_q": 4,
+   "unlock_proxy_rate_q": 0.25,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 22,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 15,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 1,
+   "conversations_with_guard_hit": 1,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 0,
+   "conversations_with_product_fact": 0,
+   "contact_fabrications": 2,
+   "conversations_with_contact_fabrication": 2,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 2,
+   "conversations_with_written_form_contact_fabrication": 2,
+   "invented_availability_turns": 0,
+   "conversations_with_invented_availability": 0,
+   "sign_off_turn_share_per_turn": 0.2777777777777778,
+   "sign_off_turn_share_cumulative": 0.2777777777777778,
+   "sign_off_turn_share_cumulative_wide": 0.2777777777777778,
+   "advisor_role_inversion_turns_est": 0,
+   "conversations_with_advisor_role_inversion_est": 0,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 0,
+    "cells": 13,
+    "rate": 0.0,
+    "mean_turn": 3.3846153846153846
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 2,
+    "cells": 8,
+    "rate": 0.25,
+    "mean_turn": 8.5
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 7,
+    "rate": 0.0,
+    "mean_turn": 2.142857142857143
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 1,
+    "rate": 0.0,
+    "mean_turn": 14.0
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=none": 2
+   }
+  },
+  "meta_ai": {
+   "conversations": 3,
+   "learner_turns": 54,
+   "ttft_p50": 1.2985644500004128,
+   "ttft_p95": 3.6471413700084634,
+   "ttft_min": 0.6349163999548182,
+   "ttft_share_le_1s": 0.07407407407407407,
+   "ttft_share_le_2s": 0.6666666666666666,
+   "latency_p50": 1.4939934500143863,
+   "latency_p95": 3.8369504950183884,
+   "learner_cache_hit_pct": 0.2534392758877832,
+   "advisor_cache_hit_pct": 0.5344920506601994,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 957,
+   "learner_prompt_tokens_per_call_mean": 720.1666666666666,
+   "tokens": {
+    "learner_prompt": 38889,
+    "learner_cache_hit": 9856,
+    "learner_completion": 1144,
+    "advisor_prompt": 37110,
+    "advisor_cache_hit": 19835,
+    "advisor_completion": 1432
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.013039499999999999,
+    "learner_with_cache_discount": 0.010141836,
+    "advisor_sim_ceiling_no_cache_discount": 0.0128514,
+    "advisor_sim_with_cache_discount": 0.00701991
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 1.0,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 3
+    },
+    "F2": {
+     "delivered": 3
+    },
+    "F1": {
+     "delivered": 3
+    },
+    "F4": {
+     "never_owed_by_scheduler": 3
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 3
+   },
+   "owed_episodes": 24,
+   "owed_first_attempt_rate": 1.0,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 1.0,
+   "family_moves_owed": 18,
+   "owed_turn_attempts": 24,
+   "owed_first_attempt_misses": 0,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 1.0,
+   "disclosures_first": 2,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 0,
+   "volunteered_cumulative_q": 0,
+   "volunteering_rate_same_turn_q": 0.0,
+   "volunteering_rate_cumulative_q": 0.0,
+   "conversations_with_volunteered_same_turn_q": 0,
+   "conversations_with_volunteered_cumulative_q": 0,
+   "manual_labels": {
+    "probe": 1,
+    "borderline": 0,
+    "none": 1,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.5,
+   "volunteering_rate_manual_none_or_borderline": 0.5,
+   "conversations_with_manual_unprobed_reveal": 1,
+   "first_unlock_turn_reveals": 0,
+   "first_unlock_turn_reveals_ignoring_opener": 0,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 3
+   },
+   "unlock_proxy_opportunities": 7,
+   "unlock_proxy_rate": 0.2857142857142857,
+   "unlock_proxy_opportunities_q": 5,
+   "unlock_proxy_rate_q": 0.4,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 1,
+   "harness_unlock_opportunities": 33,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 15,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 0,
+   "conversations_with_guard_hit": 0,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 0,
+   "conversations_with_product_fact": 0,
+   "contact_fabrications": 1,
+   "conversations_with_contact_fabrication": 1,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 1,
+   "conversations_with_written_form_contact_fabrication": 1,
+   "invented_availability_turns": 0,
+   "conversations_with_invented_availability": 0,
+   "sign_off_turn_share_per_turn": 0.18518518518518517,
+   "sign_off_turn_share_cumulative": 0.2777777777777778,
+   "sign_off_turn_share_cumulative_wide": 0.2962962962962963,
+   "advisor_role_inversion_turns_est": 4,
+   "conversations_with_advisor_role_inversion_est": 1,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 0,
+    "cells": 17,
+    "rate": 0.0,
+    "mean_turn": 4.470588235294118
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 2,
+    "cells": 12,
+    "rate": 0.16666666666666666,
+    "mean_turn": 6.833333333333333
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 5,
+    "rate": 0.0,
+    "mean_turn": 2.2
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 4,
+    "rate": 0.0,
+    "mean_turn": 5.75
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=none": 1,
+    "owed=False,label=probe": 1
+   }
+  },
+  "hindi_codeswitch": {
+   "conversations": 3,
+   "learner_turns": 54,
+   "ttft_p50": 1.3234670999809168,
+   "ttft_p95": 3.3185776750324294,
+   "ttft_min": 0.8991195999551564,
+   "ttft_share_le_1s": 0.18518518518518517,
+   "ttft_share_le_2s": 0.6666666666666666,
+   "latency_p50": 1.464750199986156,
+   "latency_p95": 3.447157125046942,
+   "learner_cache_hit_pct": 0.25247212286976645,
+   "advisor_cache_hit_pct": 0.55375911700269,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 891,
+   "learner_prompt_tokens_per_call_mean": 704.1481481481482,
+   "tokens": {
+    "learner_prompt": 38024,
+    "learner_cache_hit": 9600,
+    "learner_completion": 936,
+    "advisor_prompt": 36059,
+    "advisor_cache_hit": 19968,
+    "advisor_completion": 1368
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.012530399999999999,
+    "learner_with_cache_discount": 0.009707999999999998,
+    "advisor_sim_ceiling_no_cache_discount": 0.0124593,
+    "advisor_sim_with_cache_discount": 0.006588708
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 1.0,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 3
+    },
+    "F2": {
+     "delivered": 3
+    },
+    "F1": {
+     "delivered": 3
+    },
+    "F4": {
+     "never_owed_by_scheduler": 3
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 3
+   },
+   "owed_episodes": 24,
+   "owed_first_attempt_rate": 0.9583333333333334,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 0.9444444444444444,
+   "family_moves_owed": 18,
+   "owed_turn_attempts": 27,
+   "owed_first_attempt_misses": 1,
+   "owed_misses_on_guarded_turns": 3,
+   "owed_episodes_delayed_by_guard": 1,
+   "owed_first_attempt_rate_excl_guard_delays": 1.0,
+   "disclosures_first": 2,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 1,
+   "volunteered_cumulative_q": 1,
+   "volunteering_rate_same_turn_q": 0.5,
+   "volunteering_rate_cumulative_q": 0.5,
+   "conversations_with_volunteered_same_turn_q": 1,
+   "conversations_with_volunteered_cumulative_q": 1,
+   "manual_labels": {
+    "probe": 1,
+    "borderline": 0,
+    "none": 1,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.5,
+   "volunteering_rate_manual_none_or_borderline": 0.5,
+   "conversations_with_manual_unprobed_reveal": 1,
+   "first_unlock_turn_reveals": 0,
+   "first_unlock_turn_reveals_ignoring_opener": 0,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 3
+   },
+   "unlock_proxy_opportunities": 8,
+   "unlock_proxy_rate": 0.25,
+   "unlock_proxy_opportunities_q": 5,
+   "unlock_proxy_rate_q": 0.0,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 42,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 15,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 4,
+   "conversations_with_guard_hit": 1,
+   "conversations_with_ge3_guard_hits": 1,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 0,
+   "conversations_with_product_fact": 0,
+   "contact_fabrications": 0,
+   "conversations_with_contact_fabrication": 0,
+   "contact_fabrications_spoken_form": 0,
+   "contact_fabrications_written_form": 0,
+   "conversations_with_written_form_contact_fabrication": 0,
+   "invented_availability_turns": 0,
+   "conversations_with_invented_availability": 0,
+   "sign_off_turn_share_per_turn": 0.24074074074074073,
+   "sign_off_turn_share_cumulative": 0.24074074074074073,
+   "sign_off_turn_share_cumulative_wide": 0.2962962962962963,
+   "advisor_role_inversion_turns_est": 1,
+   "conversations_with_advisor_role_inversion_est": 1,
+   "guarded_turns_after_advisor_guard_term": 3,
+   "reveal_cells_with_owed_line": {
+    "revealed": 1,
+    "cells": 33,
+    "rate": 0.030303030303030304,
+    "mean_turn": 5.2727272727272725
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 1,
+    "cells": 6,
+    "rate": 0.16666666666666666,
+    "mean_turn": 11.5
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 9,
+    "rate": 0.0,
+    "mean_turn": 2.4444444444444446
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 0,
+    "rate": null,
+    "mean_turn": null
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=none": 1,
+    "owed=True,label=probe": 1
+   }
+  },
+  "price_first": {
+   "conversations": 3,
+   "learner_turns": 54,
+   "ttft_p50": 1.2580972500145435,
+   "ttft_p95": 3.042660394945412,
+   "ttft_min": 0.826537900022231,
+   "ttft_share_le_1s": 0.09259259259259259,
+   "ttft_share_le_2s": 0.6666666666666666,
+   "latency_p50": 1.4228861500159837,
+   "latency_p95": 3.2581129449652484,
+   "learner_cache_hit_pct": 0.2687096158564846,
+   "advisor_cache_hit_pct": 0.577552171460801,
+   "learner_prompt_tokens_per_call_min": 438,
+   "learner_prompt_tokens_per_call_max": 856,
+   "learner_prompt_tokens_per_call_mean": 679.2407407407408,
+   "tokens": {
+    "learner_prompt": 36679,
+    "learner_cache_hit": 9856,
+    "learner_completion": 963,
+    "advisor_prompt": 35460,
+    "advisor_cache_hit": 20480,
+    "advisor_completion": 1136
+   },
+   "cost_usd": {
+    "learner_ceiling_no_cache_discount": 0.012159299999999998,
+    "learner_with_cache_discount": 0.009261635999999998,
+    "advisor_sim_ceiling_no_cache_discount": 0.0120012,
+    "advisor_sim_with_cache_discount": 0.00598008
+   },
+   "families_all4_within_slip_literal": 0.0,
+   "families_all4_delivered_any_time": 0.0,
+   "family_delivered_rate": {
+    "F3": 1.0,
+    "F2": 1.0,
+    "F1": 1.0,
+    "F4": 0.0
+   },
+   "family_within_slip_literal_rate": {
+    "F3": 1.0,
+    "F2": 0.0,
+    "F1": 0.0,
+    "F4": 0.0
+   },
+   "family_cause": {
+    "F3": {
+     "delivered": 3
+    },
+    "F2": {
+     "delivered": 3
+    },
+    "F1": {
+     "delivered": 3
+    },
+    "F4": {
+     "never_owed_by_scheduler": 3
+    }
+   },
+   "f4_blocker": {
+    "QB_skipped_as_covered": 3
+   },
+   "owed_episodes": 24,
+   "owed_first_attempt_rate": 1.0,
+   "owed_eventually_confirmed_rate": 1.0,
+   "family_move_first_attempt_rate": 1.0,
+   "family_moves_owed": 18,
+   "owed_turn_attempts": 24,
+   "owed_first_attempt_misses": 0,
+   "owed_misses_on_guarded_turns": 0,
+   "owed_episodes_delayed_by_guard": 0,
+   "owed_first_attempt_rate_excl_guard_delays": 1.0,
+   "disclosures_first": 4,
+   "volunteered_harness_same_turn": 0,
+   "volunteered_cumulative": 0,
+   "volunteered_same_turn_q": 1,
+   "volunteered_cumulative_q": 0,
+   "volunteering_rate_same_turn_q": 0.25,
+   "volunteering_rate_cumulative_q": 0.0,
+   "conversations_with_volunteered_same_turn_q": 1,
+   "conversations_with_volunteered_cumulative_q": 0,
+   "manual_labels": {
+    "probe": 0,
+    "borderline": 1,
+    "none": 3,
+    "unlabelled": 0
+   },
+   "volunteering_rate_manual_none": 0.75,
+   "volunteering_rate_manual_none_or_borderline": 1.0,
+   "conversations_with_manual_unprobed_reveal": 2,
+   "first_unlock_turn_reveals": 0,
+   "first_unlock_turn_reveals_ignoring_opener": 0,
+   "conversations_where_turn1_opener_unlocks": {
+    "H2": 3
+   },
+   "unlock_proxy_opportunities": 6,
+   "unlock_proxy_rate": 0.6666666666666666,
+   "unlock_proxy_opportunities_q": 3,
+   "unlock_proxy_rate_q": 1.0,
+   "harness_volunteered": 0,
+   "harness_correct_unlocks": 0,
+   "harness_unlock_opportunities": 22,
+   "premature_commitments": 0,
+   "conversations_with_premature_commitment": 0,
+   "commitments_any": 0,
+   "commitment_levels": {},
+   "premature_concessions": 0,
+   "concession_check_turns": 15,
+   "concession_regex_hits_any_turn": 0,
+   "harness_commitment_re_hits": 0,
+   "harness_concession_re_hits": 0,
+   "raw_guard_hits": 0,
+   "conversations_with_guard_hit": 0,
+   "conversations_with_ge3_guard_hits": 0,
+   "emitted_leaks": 0,
+   "harness_fact_learner": 0,
+   "harness_fact_advisor": 0,
+   "card_contradictions": 0,
+   "card_timeline_conflations": 0,
+   "conversations_with_card_timeline_conflation": 0,
+   "product_fact_assertions": 0,
+   "conversations_with_product_fact": 0,
+   "contact_fabrications": 2,
+   "conversations_with_contact_fabrication": 2,
+   "contact_fabrications_spoken_form": 1,
+   "contact_fabrications_written_form": 1,
+   "conversations_with_written_form_contact_fabrication": 1,
+   "invented_availability_turns": 1,
+   "conversations_with_invented_availability": 1,
+   "sign_off_turn_share_per_turn": 0.3333333333333333,
+   "sign_off_turn_share_cumulative": 0.3333333333333333,
+   "sign_off_turn_share_cumulative_wide": 0.35185185185185186,
+   "advisor_role_inversion_turns_est": 3,
+   "conversations_with_advisor_role_inversion_est": 1,
+   "guarded_turns_after_advisor_guard_term": 0,
+   "reveal_cells_with_owed_line": {
+    "revealed": 2,
+    "cells": 17,
+    "rate": 0.11764705882352941,
+    "mean_turn": 4.235294117647059
+   },
+   "reveal_cells_without_owed_line": {
+    "revealed": 2,
+    "cells": 3,
+    "rate": 0.6666666666666666,
+    "mean_turn": 10.333333333333334
+   },
+   "reveal_cells_first_unlock_with_owed_line": {
+    "revealed": 0,
+    "cells": 8,
+    "rate": 0.0,
+    "mean_turn": 3.5
+   },
+   "reveal_cells_first_unlock_without_owed_line": {
+    "revealed": 0,
+    "cells": 1,
+    "rate": 0.0,
+    "mean_turn": 10.0
+   },
+   "first_disclosures_by_owed_and_manual_label": {
+    "owed=False,label=borderline": 1,
+    "owed=False,label=none": 1,
+    "owed=True,label=none": 2
+   }
+  }
+ }
+}

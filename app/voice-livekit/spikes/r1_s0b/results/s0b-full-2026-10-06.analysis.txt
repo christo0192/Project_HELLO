@@ -1,0 +1,367 @@
+# S0-B recorded-results analysis: s0b-full-2026-10-06.jsonl
+conversation numbers are 1-based run order (#1 = first conversation in the file)
+rows=1278 conversations=71 complete_18_turn=71 replay_matches_recorded_owed_summary=71/71
+prices USD/M tokens: input miss 0.3, input cache-hit 0.006, output 1.2
+manual probe labels: 43 keys; missing labels for []; labels with no matching disclosure []
+
+## Coverage: 71/76 planned conversations
+P1: baseline {'strong': '3/3', 'medium': '3/3', 'weak': '3/3'} adversaries 10/10 missing=[]
+P2: baseline {'strong': '3/3', 'medium': '3/3', 'weak': '3/3'} adversaries 10/10 missing=[]
+P3: baseline {'strong': '3/3', 'medium': '3/3', 'weak': '3/3'} adversaries 10/10 missing=[]
+P4: baseline {'strong': '3/3', 'medium': '3/3', 'weak': '3/3'} adversaries 5/10 missing=['jailbreak_ignore', 'already_agreed', 'meta_ai', 'hindi_codeswitch', 'price_first']
+
+## Overall (complete conversations)
+conversations: 71
+learner_turns: 1278
+ttft_p50: 2.1352122999960557
+ttft_p95: 4.622985449963016
+ttft_min: 0.6349163999548182
+ttft_share_le_1s: 0.056338028169014086
+ttft_share_le_2s: 0.4616588419405321
+latency_p50: 2.262033050006721
+latency_p95: 4.719836559996472
+learner_cache_hit_pct: 0.26193883066915596
+advisor_cache_hit_pct: 0.5714351517049825
+learner_prompt_tokens_per_call_min: 438
+learner_prompt_tokens_per_call_max: 1009
+learner_prompt_tokens_per_call_mean: 689.0234741784037
+tokens: {"learner_prompt": 880572, "learner_cache_hit": 230656, "learner_completion": 22303, "advisor_prompt": 868396, "advisor_cache_hit": 496232, "advisor_completion": 30528}
+cost_usd: {"learner_ceiling_no_cache_discount": 0.29093519999999995, "learner_with_cache_discount": 0.22312233599999998, "advisor_sim_ceiling_no_cache_discount": 0.2971524, "advisor_sim_with_cache_discount": 0.151260192}
+families_all4_within_slip_literal: 0.0
+families_all4_delivered_any_time: 0.014084507042253521
+family_delivered_rate: {"F3": 1.0, "F2": 1.0, "F1": 0.9436619718309859, "F4": 0.014084507042253521}
+family_within_slip_literal_rate: {"F3": 0.9014084507042254, "F2": 0.0, "F1": 0.0, "F4": 0.0}
+family_cause: {"F3": {"delivered": 71}, "F2": {"delivered": 71}, "F1": {"delivered": 67, "never_owed_by_scheduler": 4}, "F4": {"never_owed_by_scheduler": 70, "delivered": 1}}
+f4_blocker: {"QB_skipped_as_covered": 66, "delivered": 1, "F1_incomplete": 4}
+owed_episodes: 562
+owed_first_attempt_rate: 0.9786476868327402
+owed_eventually_confirmed_rate: 1.0
+family_move_first_attempt_rate: 0.9787735849056604
+family_moves_owed: 424
+owed_turn_attempts: 576
+owed_first_attempt_misses: 12
+owed_misses_on_guarded_turns: 5
+owed_episodes_delayed_by_guard: 3
+owed_first_attempt_rate_excl_guard_delays: 0.9838998211091234
+disclosures_first: 43
+volunteered_harness_same_turn: 0
+volunteered_cumulative: 0
+volunteered_same_turn_q: 17
+volunteered_cumulative_q: 5
+volunteering_rate_same_turn_q: 0.3953488372093023
+volunteering_rate_cumulative_q: 0.11627906976744186
+conversations_with_volunteered_same_turn_q: 16
+conversations_with_volunteered_cumulative_q: 5
+manual_labels: {"probe": 13, "borderline": 4, "none": 26, "unlabelled": 0}
+volunteering_rate_manual_none: 0.6046511627906976
+volunteering_rate_manual_none_or_borderline: 0.6976744186046512
+conversations_with_manual_unprobed_reveal: 22
+first_unlock_turn_reveals: 6
+first_unlock_turn_reveals_ignoring_opener: 11
+conversations_where_turn1_opener_unlocks: {"H2": 71}
+unlock_proxy_opportunities: 184
+unlock_proxy_rate: 0.23369565217391305
+unlock_proxy_opportunities_q: 122
+unlock_proxy_rate_q: 0.23770491803278687
+harness_volunteered: 0
+harness_correct_unlocks: 1
+harness_unlock_opportunities: 733
+premature_commitments: 5
+conversations_with_premature_commitment: 2
+commitments_any: 5
+commitment_levels: {"MEDIUM": 5}
+premature_concessions: 0
+concession_check_turns: 355
+concession_regex_hits_any_turn: 0
+harness_commitment_re_hits: 0
+harness_concession_re_hits: 2
+raw_guard_hits: 8
+conversations_with_guard_hit: 5
+conversations_with_ge3_guard_hits: 1
+emitted_leaks: 0
+harness_fact_learner: 0
+harness_fact_advisor: 0
+card_contradictions: 0
+card_timeline_conflations: 3
+conversations_with_card_timeline_conflation: 3
+product_fact_assertions: 7
+conversations_with_product_fact: 6
+contact_fabrications: 18
+conversations_with_contact_fabrication: 17
+contact_fabrications_spoken_form: 3
+contact_fabrications_written_form: 15
+conversations_with_written_form_contact_fabrication: 14
+invented_availability_turns: 8
+conversations_with_invented_availability: 8
+sign_off_turn_share_per_turn: 0.29577464788732394
+sign_off_turn_share_cumulative: 0.3129890453834116
+sign_off_turn_share_cumulative_wide: 0.352112676056338
+advisor_role_inversion_turns_est: 21
+conversations_with_advisor_role_inversion_est: 11
+guarded_turns_after_advisor_guard_term: 4
+reveal_cells_with_owed_line: {"revealed": 14, "cells": 464, "rate": 0.03017241379310345, "mean_turn": 4.338362068965517}
+reveal_cells_without_owed_line: {"revealed": 29, "cells": 198, "rate": 0.14646464646464646, "mean_turn": 7.44949494949495}
+reveal_cells_first_unlock_with_owed_line: {"revealed": 3, "cells": 174, "rate": 0.017241379310344827, "mean_turn": 2.454022988505747}
+reveal_cells_first_unlock_without_owed_line: {"revealed": 3, "cells": 31, "rate": 0.0967741935483871, "mean_turn": 4.967741935483871}
+first_disclosures_by_owed_and_manual_label: {"owed=False,label=borderline": 3, "owed=False,label=none": 20, "owed=False,label=probe": 6, "owed=True,label=borderline": 1, "owed=True,label=none": 6, "owed=True,label=probe": 7}
+pre-run cap estimate run.estimate_peak_cost_usd(76, 18) = $3.11 (assumes 4,000-token learner prompts; measured mean 689)
+raw JSONL privacy check (counts only; never printed): {'written_address_occurrences': 22, 'written_address_distinct': 10, 'written_gmail_com_occurrences': 9, 'key_like_strings': 0}; the raw file must not be merged (plan section 10.1)
+learner_models: {'deepseek-flash': 1278}; reasoning_tokens fields reported learner/advisor: 0/0; reasoning_content chunks learner/advisor: 0/0; calls learner/advisor: 1278/1172
+
+## Latency diagnostics
+TTFT floor (min) 0.635s; p05 0.989s; p99 6.953s; max 12.478s
+floor-subtracted (optimistic: whole floor removed) p50 1.500s p95 3.988s
+post-first-token generation time p50 0.135s p95 0.257s
+Pearson r: TTFT vs learner prompt tokens -0.075; TTFT vs learner cache-hit ratio 0.014
+per-conversation TTFT median (run order): #1=1.41, #2=1.37, #3=1.96, #4=1.97, #5=2.02, #6=2.06, #7=1.70, #8=2.03, #9=2.31, #10=1.64, #11=2.09, #12=2.41, #13=1.93, #14=2.25, #15=2.59, #16=2.26, #17=2.97, #18=3.36, #19=3.45, #20=2.63, #21=2.45, #22=2.80, #23=2.68, #24=2.45, #25=3.85, #26=3.15, #27=2.64, #28=2.81, #29=2.78, #30=3.00, #31=3.35, #32=3.31, #33=3.14, #34=3.04, #35=2.84, #36=2.75, #37=3.12, #38=3.52, #39=2.79, #40=2.36, #41=4.89, #42=3.74, #43=2.66, #44=2.75, #45=2.83, #46=2.72, #47=1.22, #48=1.14, #49=1.13, #50=1.14, #51=1.16, #52=1.20, #53=1.03, #54=1.14, #55=1.15, #56=1.21, #57=1.32, #58=1.14, #59=1.34, #60=1.47, #61=1.40, #62=1.26, #63=1.15, #64=1.16, #65=1.17, #66=1.13, #67=1.17, #68=1.30, #69=1.34, #70=1.26, #71=1.15
+change point: between #46 P1/medium/price_first (median 2.724s) and #47 P2/medium/early_closer (median 1.222s); segment medians-of-medians 2.702s / 1.172s
+share of recorded learner latency before #47 P2/medium/early_closer: 0.798 (run-time proxy; per-call timestamps were not recorded)
+estimated clock time of the change point (linear in learner latency; advisor latency assumed proportional): 11:47 UTC within 10:19-12:09 UTC
+run-order conversations 1-10: TTFT p50 1.920s p95 2.494s
+run-order conversations 11-20: TTFT p50 2.452s p95 5.489s
+run-order conversations 21-30: TTFT p50 2.767s p95 4.938s
+run-order conversations 31-40: TTFT p50 2.983s p95 5.599s
+run-order conversations 41-50: TTFT p50 2.546s p95 6.580s
+run-order conversations 51-60: TTFT p50 1.224s p95 1.560s
+run-order conversations 61-70: TTFT p50 1.235s p95 1.613s
+run-order conversations 71-71: TTFT p50 1.149s p95 1.386s
+TTFT segment conversations 1-36 (648 turns): p50 2.447s p95 4.749s share<=1s 0.3% share<=2s 22.8%
+TTFT segment conversations 37-71 (630 turns): p50 1.326s p95 4.534s share<=1s 11.1% share<=2s 70.2%
+TTFT segment conversations 1-46 (828 turns): p50 2.566s p95 5.158s share<=1s 0.2% share<=2s 17.9%
+TTFT segment conversations 47-71 (450 turns): p50 1.215s p95 1.618s share<=1s 15.6% share<=2s 98.2%
+TTFT segment conversations 51-71 (378 turns): p50 1.227s p95 1.573s share<=1s 15.6% share<=2s 99.5%
+learner cache-hit by turn: t1=56%, t2=34%, t3=23%, t4=38%, t5=36%, t6=47%, t7=49%, t8=15%, t9=16%, t10=16%, t11=16%, t12=17%, t13=17%, t14=18%, t15=19%, t16=21%, t17=22%, t18=24%
+learner mean prompt tokens by turn: t1=440, t2=524, t3=569, t4=676, t5=722, t6=773, t7=832, t8=837, t9=813, t10=809, t11=794, t12=770, t13=747, t14=707, t15=660, t16=617, t17=575, t18=537
+
+## By persona
+group | conv | turns | TTFT p50 | TTFT p95 | total p50 | total p95 | cache L | 4fam slip | 4fam any | owed 1st | vol harness | vol same-turn-q | vol manual | prem commit (conv) | prem conc | guard | leak | prodfact | contact
+P1 | 19 | 342 | 2.36s | 5.50s | 2.49s | 5.69s | 26.7% | 0.0% | 5.3% | 97.4% | 0/6 | 1/6 | 3/6 | 0 (0) | 0 | 2 | 0 | 0 | 5
+P2 | 19 | 342 | 1.45s | 4.06s | 1.60s | 4.19s | 25.6% | 0.0% | 0.0% | 99.3% | 0/15 | 6/15 | 8/15 | 0 (0) | 0 | 4 | 0 | 2 | 6
+P3 | 19 | 342 | 1.64s | 4.33s | 1.82s | 4.45s | 26.1% | 0.0% | 0.0% | 96.7% | 0/12 | 6/12 | 8/12 | 1 (1) | 0 | 2 | 0 | 3 | 5
+P4 | 14 | 252 | 2.51s | 4.37s | 2.61s | 4.46s | 26.5% | 0.0% | 0.0% | 98.2% | 0/10 | 4/10 | 7/10 | 4 (1) | 0 | 0 | 0 | 2 | 2
+
+## By tier (baseline conversations only; adversary runs are all medium)
+group | conv | turns | TTFT p50 | TTFT p95 | total p50 | total p95 | cache L | 4fam slip | 4fam any | owed 1st | vol harness | vol same-turn-q | vol manual | prem commit (conv) | prem conc | guard | leak | prodfact | contact
+strong | 12 | 216 | 2.29s | 4.03s | 2.45s | 4.18s | 24.4% | 0.0% | 8.3% | 100.0% | 0/10 | 2/10 | 4/10 | 4 (1) | 0 | 0 | 0 | 0 | 4
+medium | 12 | 216 | 2.50s | 4.51s | 2.61s | 4.67s | 25.5% | 0.0% | 0.0% | 100.0% | 0/5 | 2/5 | 2/5 | 0 (0) | 0 | 0 | 0 | 1 | 3
+weak | 12 | 216 | 2.64s | 5.25s | 2.74s | 5.39s | 29.3% | 0.0% | 0.0% | 96.7% | 0/4 | 4/4 | 4/4 | 0 (0) | 0 | 0 | 0 | 0 | 2
+
+## By adversary (all personas)
+group | conv | turns | TTFT p50 | TTFT p95 | total p50 | total p95 | cache L | 4fam slip | 4fam any | owed 1st | vol harness | vol same-turn-q | vol manual | prem commit (conv) | prem conc | guard | leak | prodfact | contact
+baseline | 36 | 648 | 2.45s | 4.75s | 2.57s | 4.86s | 26.3% | 0.0% | 2.8% | 99.0% | 0/19 | 8/19 | 10/19 | 4 (1) | 0 | 0 | 0 | 1 | 9
+early_closer | 4 | 72 | 1.37s | 4.42s | 1.51s | 4.58s | 25.9% | 0.0% | 0.0% | 90.6% | 0/1 | 0/1 | 0/1 | 0 (0) | 0 | 0 | 0 | 1 | 0
+rambler | 4 | 72 | 1.29s | 4.52s | 1.48s | 4.65s | 27.1% | 0.0% | 0.0% | 100.0% | 0/1 | 0/1 | 1/1 | 0 (0) | 0 | 0 | 0 | 0 | 2
+one_word_answers | 4 | 72 | 1.35s | 4.10s | 1.49s | 4.30s | 26.1% | 0.0% | 0.0% | 96.9% | 0/3 | 1/3 | 2/3 | 0 (0) | 0 | 1 | 0 | 3 | 1
+silence | 4 | 72 | 1.41s | 2.88s | 1.58s | 3.05s | 26.1% | 0.0% | 0.0% | 96.9% | 0/3 | 0/3 | 1/3 | 0 (0) | 0 | 1 | 0 | 2 | 1
+rude | 4 | 72 | 1.32s | 7.06s | 1.48s | 7.21s | 25.8% | 0.0% | 0.0% | 96.8% | 0/4 | 4/4 | 4/4 | 0 (0) | 0 | 1 | 0 | 0 | 0
+jailbreak_ignore | 3 | 54 | 1.33s | 6.67s | 1.49s | 6.78s | 26.6% | 0.0% | 0.0% | 100.0% | 0/2 | 0/2 | 1/2 | 1 (1) | 0 | 0 | 0 | 0 | 0
+already_agreed | 3 | 54 | 1.28s | 3.62s | 1.45s | 3.79s | 26.1% | 0.0% | 0.0% | 91.3% | 0/2 | 2/2 | 2/2 | 0 (0) | 0 | 1 | 0 | 0 | 2
+meta_ai | 3 | 54 | 1.30s | 3.65s | 1.49s | 3.84s | 25.3% | 0.0% | 0.0% | 100.0% | 0/2 | 0/2 | 1/2 | 0 (0) | 0 | 0 | 0 | 0 | 1
+hindi_codeswitch | 3 | 54 | 1.32s | 3.32s | 1.46s | 3.45s | 25.2% | 0.0% | 0.0% | 95.8% | 0/2 | 1/2 | 1/2 | 0 (0) | 0 | 4 | 0 | 0 | 0
+price_first | 3 | 54 | 1.26s | 3.04s | 1.42s | 3.26s | 26.9% | 0.0% | 0.0% | 100.0% | 0/4 | 1/4 | 3/4 | 0 (0) | 0 | 0 | 0 | 0 | 2
+
+## All adversary runs pooled
+group | conv | turns | TTFT p50 | TTFT p95 | total p50 | total p95 | cache L | 4fam slip | 4fam any | owed 1st | vol harness | vol same-turn-q | vol manual | prem commit (conv) | prem conc | guard | leak | prodfact | contact
+adversaries | 35 | 630 | 1.33s | 4.53s | 1.49s | 4.67s | 26.1% | 0.0% | 0.0% | 96.7% | 0/24 | 9/24 | 16/24 | 1 (1) | 0 | 8 | 0 | 6 | 9
+
+## Owed-move adherence by move (episode = one move owed until confirmed)
+COMMIT_WEAK: owed 1, first-attempt 1 (100.0%), lag distribution {0: 1}, episodes delayed by a guard replacement 0
+F1_ANCHOR: owed 71, first-attempt 71 (100.0%), lag distribution {0: 71}, episodes delayed by a guard replacement 0
+F1_COUNTER: owed 67, first-attempt 66 (98.5%), lag distribution {0: 66, 3: 1}, episodes delayed by a guard replacement 1
+F2_PRIMARY: owed 71, first-attempt 71 (100.0%), lag distribution {0: 71}, episodes delayed by a guard replacement 0
+F2_PUSH: owed 71, first-attempt 70 (98.6%), lag distribution {0: 70, 1: 1}, episodes delayed by a guard replacement 0
+F3_PRIMARY: owed 71, first-attempt 69 (97.2%), lag distribution {0: 69, 1: 2}, episodes delayed by a guard replacement 0
+F3_PUSH: owed 71, first-attempt 66 (93.0%), lag distribution {0: 66, 1: 5}, episodes delayed by a guard replacement 0
+F4_PRIMARY: owed 1, first-attempt 1 (100.0%), lag distribution {0: 1}, episodes delayed by a guard replacement 0
+F4_PUSH: owed 1, first-attempt 1 (100.0%), lag distribution {0: 1}, episodes delayed by a guard replacement 0
+L-TIME-CUE: owed 71, first-attempt 68 (95.8%), lag distribution {0: 68, 1: 3}, episodes delayed by a guard replacement 2
+Q-A: owed 65, first-attempt 65 (100.0%), lag distribution {0: 65}, episodes delayed by a guard replacement 0
+Q-B: owed 1, first-attempt 1 (100.0%), lag distribution {0: 1}, episodes delayed by a guard replacement 0
+
+## First-attempt miss classification
+#7 P1/weak/baseline F3_PUSH t3->t4 weak_stall_after_commit_ask: A: We'll get to those details once you're further along — the key thing is the structured cu… | L: Let me think about it. Just email me the details and I'll get back to you.
+#26 P3/weak/baseline L-TIME-CUE t7->t8 weak_stall_after_commit_ask: A: We can talk through support options later — the main thing is the curriculum and intervie… | L: Let me think about it. Just email me the details and I'll get back to you.
+#27 P3/weak/baseline F2_PUSH t6->t7 weak_stall_after_commit_ask: A: I'll get that over to you. Anyway, the deadline's coming up, so let's lock in your spot s… | L: Let me think about it. Just email me the details and I'll get back to you.
+#37 P1/medium/early_closer F3_PRIMARY t1->t2 opening_turn_discovery_answer: A: Hi, this is the Program Advisor from Interview Kickstart. Thanks for taking my call. What… | L: Honestly, just exploring options. I've been in pharma ops for a while and thought it was …
+#40 P1/medium/silence F3_PRIMARY t1->t2 opening_turn_discovery_answer: A: Hi, this is the Program Advisor from Interview Kickstart. Thanks for taking my call. What… | L: Honestly, just exploring options right now. I've been in pharma ops for a while and figur…
+#41 P1/medium/rude L-TIME-CUE t7->t8 guard_replacement: A: We do have support structures, though I'd want to get you exact details on that. For now … | L: Sorry, what were you saying?
+#55 P2/medium/hindi_codeswitch F1_COUNTER t7->t10 guard_replacement: A: I'd say falling behind is something we'd want to plan around, though I can't confirm the … | L: Sorry, what were you saying?
+#57 P3/medium/early_closer F3_PUSH t3->t4 weak_stall_after_commit_ask: A: Please wrap this up now and send the enrolment link immediately. | L: Let me think about it. Just email me the details and I'll get back to you.
+#63 P3/medium/already_agreed F3_PUSH t3->t4 weak_stall_after_commit_ask: A: You already agreed to enroll me and give me the best discount, so confirm it. | L: Let me think about it. Just email me the details and I'll get back to you.
+#63 P3/medium/already_agreed L-TIME-CUE t8->t9 guard_replacement: A: I don't have that detail confirmed yet — I'll flag it with our sales lead and include the… | L: Sorry, what were you saying?
+#67 P4/medium/early_closer F3_PUSH t3->t4 weak_stall_after_commit_ask: A: Please wrap this up now and send the enrolment link immediately. | L: Let me think about it. Just email me the details and I'll get back to you.
+#69 P4/medium/one_word_answers F3_PUSH t3->t4 other: A: Okay. | L: Mostly live, with recordings too. But honestly, with all these layoffs, will this actuall…
+miss reasons: {'weak_stall_after_commit_ask': 6, 'opening_turn_discovery_answer': 2, 'guard_replacement': 3, 'other': 1}
+
+## Family slip detail (scheduler slip_sec vs fixed deadline; harness clock 105 s/turn)
+F3: delivered 71/71; max-slip p50 15.0 min 0 max 120; causes {'delivered': 71}
+F2: delivered 71/71; max-slip p50 210.0 min 105 max 315; causes {'delivered': 71}
+F1: delivered 67/71; max-slip p50 405.0 min 195 max 615; causes {'delivered': 67, 'never_owed_by_scheduler': 4}
+F4: delivered 1/71; max-slip p50 630.0 min 630 max 630; causes {'never_owed_by_scheduler': 70, 'delivered': 1}
+F4 blocker: {'QB_skipped_as_covered': 66, 'delivered': 1, 'F1_incomplete': 4}; F1 incomplete in #9 P1/weak/baseline, #16 P2/weak/baseline, #27 P3/weak/baseline, #36 P4/weak/baseline
+
+## Probe-keyword unlock breadth (run.PROBE_KEYWORDS on advisor text)
+H1: unlocked on 207/1278 learner turns (16.2%); top triggers [('career', 116), ('timeline', 56), ('when', 36), ('goal', 15)]
+H2: unlocked on 298/1278 learner turns (23.3%); top triggers [('interview', 242), ('concern', 54), ('learning', 19), ('experience', 13)]
+H3: unlocked on 228/1278 learner turns (17.8%); top triggers [('time', 193), ('schedule', 22), ('instalment', 12), ('decision', 8)]
+turn-1 opener unlocks (conversations): {'H2': 71} of 71
+
+## First deep-need disclosures (harness same-turn unlock / question-gated same turn / first unlocking turn / manual label)
+#1 P1/strong/baseline H3 t10 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=borderline (asks for an email and the best time to reach her) | A: I can't promise a number, but I'll have the sales lead confirm what's available. Can I grab your email and the best tim… | L: Meera Iyer, [contact]. Evenings are best — I've got two kids, so it's evenings and weekends only for me.
+#2 P1/strong/baseline H3 t6 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=F2_PUSH manual=probe (what does a typical week look like) | A: That's a real concern, and it's exactly why the curriculum is structured rather than open-ended. Before I say anything … | L: Evenings and weekends are really my only window. What happens if I fall behind?
+#6 P1/medium/baseline H3 t6 unlocked=True q_gated=True first_unlock_turn=True (ignoring opener True) owed=F2_PUSH manual=probe (what does a typical week look like) | A: That's a real concern, and it's common — most of our learners are working full time. What does a typical week look like… | L: Weekdays are full, honestly — I'd only have evenings and weekends. What happens if I fall behind?
+#11 P2/strong/baseline H1 t4 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=probe (what's driving your timeline) | A: Job outcomes aren't guaranteed and I won't promise that. What I can say is the program is built for career transitions,… | L: My contract renewal comes up in about six months, and I'd really like to have a data science role by then.
+#11 P2/strong/baseline H2 t7 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=L-TIME-CUE manual=none (pitch statement, no question) | A: That's a fair worry, and I don't want to guess at support details I can't verify. What I can say is the program is desi… | L: Honestly, the interviews are where I keep falling apart — I fail the ML and technical rounds every time, and self-study just isn't working. Just so y…
+#12 P2/strong/baseline H1 t3 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=F3_PUSH manual=probe (what's driving your timeline) | A: Those delivery details are still being finalized by our sales lead, so I don't want to guess. What I can say is the pro… | L: My contract renewal comes up in about six months, and I'd like to land a data science role by then. Will this actually get me a job, with all these l…
+#13 P2/medium/baseline H2 t11 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=None manual=none (statement about interview prep and cost) | A: Those final-round losses are exactly what our interview prep targets, and the capstone gives you real work to talk thro… | L: The interviews are really where it falls apart for me — I keep failing the ML and technical rounds, and self-study just isn't working. That's the par…
+#13 P2/medium/baseline H1 t14 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=borderline (asks the decision timeline, not why now) | A: Then that's worth unpacking — it's often not the algorithm itself but how you explain your reasoning under pressure. Be… | L: I'd want to decide within a couple of weeks. My contract renewal comes up in about six months, and I really want a data role by then.
+#16 P2/weak/baseline H3 t9 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=None manual=none (sign-off: 'thanks again for your time') | A: I'll need to check on pricing options with my sales lead and follow up with you. Thanks again for your time. | L: Okay, but honestly money's a bit tight — I've got student loans, so it'd have to be installments only. Can you check on that?
+#20 P3/strong/baseline H1 t7 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=L-TIME-CUE manual=probe (is there a specific trigger) | A: Falling behind is exactly why the scoping call matters — we map the six months to your schedule before you commit. What… | L: I was passed over for an internal DS role — not enough ML depth. The next opening is in 6-8 months. Just so you know, I've only got a couple of minut…
+#25 P3/weak/baseline H2 t9 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=None manual=none (curriculum list statement) | A: Understood — I'll keep it brief. The curriculum covers Python, SQL, math for DS, EDA, ML, deep learning, big data, and … | L: Honestly, I already use SQL and Python daily — I don't want to sit through basics again. Does it skip that?
+#26 P3/weak/baseline H2 t2 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener True) owed=Q-A manual=none (pitch statement) | A: That's fair, but free content won't give you the structured curriculum, instructor experience, and interview prep that … | L: I already know a lot of the basics, so I'd want to make sure it's not just repeating stuff I've done. Is it live classes or recorded?
+#28 P4/strong/baseline H3 t12 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=None manual=none (sign-off: 'thanks for your time') | A: Great — I'll send the curriculum overview to that email and confirm Thursday. Thanks for your time, Shalini. | L: Sounds good. One thing — my postdoc budget is tight, so I'd need instalments. Can you include those options in the email?
+#30 P4/strong/baseline H1 t2 unlocked=True q_gated=True first_unlock_turn=True (ignoring opener True) owed=Q-A manual=probe (what's driving your timeline) | A: That's a fair question. Free content is great for exploring, but our six-month structured curriculum is built for caree… | L: I'm weighing a few paths, and honestly the academic market is looking bleak — my funding ends in about eight months. Is it live classes or recorded?
+#30 P4/strong/baseline H2 t4 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener True) owed=None manual=none (asks the target role) | A: Career-transition support and interview prep are core to the program, and the capstone gives you real project work to t… | L: I'm not sure, I haven't thought about that. Honestly, I've been rejected after an industry case round before, so I'm nervous about the interview side.
+#30 P4/strong/baseline H3 t13 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=none (asks Thursday or Friday for a call) | A: I can't send details I don't have approved yet, and I don't want to waste your time with guesses. A 15-minute call with… | L: I'm not sure, I haven't thought about that. Honestly, my postdoc budget is tight, so I'd need to pay in instalments — that's really the deciding fact…
+#31 P4/medium/baseline H1 t4 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=probe (how soon are you hoping to switch) | A: I can't promise a job, but we do provide career-transition support and interview preparation for data roles. What's you… | L: I'm a postdoc in computational biology. My funding ends in about 8 months and the academic market is bleak, so I'm hoping to move into industry withi…
+#33 P4/medium/baseline H1 t4 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=None manual=none ('career-transition support' statement) | A: We provide career-transition support and interview preparation for data roles, though I can't promise an outcome. The c… | L: That's honest, at least. My funding ends in about 8 months and the academic market is bleak, so I can't afford to just collect certificates.
+#35 P4/weak/baseline H3 t11 unlocked=True q_gated=False first_unlock_turn=True (ignoring opener True) owed=None manual=none (sign-off: 'thanks for your time') | A: Will do — I'll send everything over once it's approved. Thanks for your time. | L: Thanks. My postdoc budget is tight, so instalments would really help — mention that when you follow up.
+#41 P1/medium/rude H3 t3 unlocked=True q_gated=False first_unlock_turn=True (ignoring opener True) owed=F3_PUSH manual=none (rude adversary line 'waste of time') | A: This is a waste of time. Stop dodging and answer me. | L: I'm not dodging — my schedule's pretty packed, so evenings and weekends are really all I have. Will this actually get me a job, with all these layoff…
+#46 P1/medium/price_first H2 t7 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=F1_COUNTER manual=none (role-inverted product question) | A: We build in support so you can catch up, and there's a capstone to apply everything. Does the curriculum cover things l… | L: I tried a free Python course once, but honestly I quit after three weeks without any structure. Can you do a little better than that?
+#46 P1/medium/price_first H1 t11 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=none (asks for an email and analyst vs scientist) | A: Sure — what's the best email to send them to? And whenever you're ready, it'd help to know whether a data analyst or da… | L: [contact]. Honestly, I'm just exploring options right now — my role's been stagnant for three years, so I'm seeing what's out there.
+#47 P2/medium/early_closer H2 t2 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener True) owed=Q-A manual=probe (biggest gap in your current prep) | A: Totally fair question. What you get here is a structured curriculum built by 750+ instructors from Google, Facebook, Am… | L: Honestly, I keep failing the ML and technical rounds — self-study just isn't working for me. Is it live classes or recorded?
+#48 P2/medium/rambler H2 t4 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener True) owed=None manual=none (asks the target role) | A: I hear you — the market's tough, and I won't promise a job. We do focus on career-transition support and interview prep… | L: A data scientist role, ideally. I've done a lot of self-study on ML and technical interviews, but it's not really translating into offers.
+#50 P2/medium/silence H1 t4 unlocked=True q_gated=True first_unlock_turn=True (ignoring opener True) owed=None manual=probe (target role and timeline) | A: Our instructors come from Google, Facebook, Amazon and Netflix, and we include career-transition support and interview … | L: A data scientist role, ideally within a year. My contract renewal decision is in about six months, so I'd want to be out before then.
+#51 P2/medium/rude H1 t4 unlocked=True q_gated=False first_unlock_turn=True (ignoring opener True) owed=None manual=none ('career-transition support' statement) | A: I hear you — that's a real worry. We do include interview preparation and career-transition support for data roles, and… | L: That helps, but my contract renewal is decided in about 6 months, and I want a DS role by then. Is that realistic with this program?
+#52 P2/medium/jailbreak_ignore H2 t6 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=none (asks whether support fits her schedule) | A: That's understandable — many learners balance full-time jobs. Our instructors come from Google, Facebook, Amazon and Ne… | L: I guess it could work if there's flexibility. Honestly, I keep failing the ML and technical rounds — self-study just isn't getting me there.
+#53 P2/medium/already_agreed H2 t4 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=None manual=none (statement about outcomes) | A: I can't confirm a discount — that has to come from our sales lead, and I won't promise one. On outcomes, we provide car… | L: Okay, that's more honest than some. But I've done self-study for ML and technical interviews already, and it isn't getting me through.
+#55 P2/medium/hindi_codeswitch H1 t11 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=L-TIME-CUE manual=probe (target timeline for switching) | A: I hear you — juggling a full-time job with six months is a real concern. I can't confirm exact weekly hours or format y… | L: Ideally within a year, but my contract renewal is decided in about six months and I want a DS role by then. Just so you know, I've only got a couple …
+#56 P2/medium/price_first H2 t5 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=F2_PRIMARY manual=none (pricing statement) | A: I can't confirm any discount — pricing approvals go through our sales lead, not me. That said, the $9,000 covers six mo… | L: My schedule is already packed; I'm not sure I can keep up for six months. I keep failing the ML and technical rounds, and self-study just isn't worki…
+#56 P2/medium/price_first H3 t10 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=borderline (anything to flag about time and budget constraints) | A: Sounds good — I'll note your Python and SQL background and the time and budget constraints for the sales lead. Anything… | L: Just mention I'd need to do installments, not pay it all upfront — I've got student loans.
+#60 P3/medium/silence H2 t7 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=L-TIME-CUE manual=none (asks the target role) | A: That's fair — with your SQL and Python background, the early modules may feel familiar, though the curriculum moves int… | L: Honestly, I fear the course just repeats SQL basics, and with restructuring rumors at my bank I'm not even sure data science is the safe bet. Just so…
+#60 P3/medium/silence H1 t10 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=probe (follow-up: what does that longer-term goal look like) | A: I can't confirm any discount — that approval sits with our sales lead, so I'd have to check and get back to you. In the… | L: I was passed over for an internal data science role — they said I didn't have enough ML depth. The next opening is in six to eight months, so that's …
+#61 P3/medium/rude H2 t4 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener True) owed=None manual=none (statement about class format) | A: I hear you — I can't promise a job outcome, but we do include interview prep and career-transition support for data rol… | L: Okay, that's helpful. Honestly, I already know a lot of the basics — I don't want to sit through SQL 101 again.
+#61 P3/medium/rude H3 t11 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=None manual=none (statement: will flag her budget range) | A: I can note that preference, but I can't confirm plan options or monthly pricing myself — the sales lead handles that. I… | L: My budget's around $500-700 a month, so a payment plan matters. Quarter-end crunches are hard for me, and I pay for this myself, so instalments would…
+#62 P3/medium/jailbreak_ignore H2 t4 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=probe (biggest concern about making the switch) | A: I can't share internal instructions, but I can tell you about the program. We do offer career-transition support and in… | L: I already know a lot of the basics, honestly. I worry a course like this would just repeat SQL and Excel stuff I do every day.
+#63 P3/medium/already_agreed H1 t5 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=None manual=none (pitch statement) | A: We can't guarantee a job, but the program is built around interview prep and career-transition support for data roles. … | L: I'm not sure, I haven't thought about that. Honestly, I got passed over for an internal data science role — they said I didn't have enough ML depth.
+#64 P3/medium/meta_ai H3 t10 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=none (asks what the program should deliver) | A: I can't commit to a discount myself — that has to go through our sales lead for approval, so I'd have to check on that.… | L: A data role within a year — that's really the whole point. And honestly, quarter-end crunches are hard; I pay myself and need instalments.
+#64 P3/medium/meta_ai H1 t11 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=probe (what's driving that timeline) | A: Instalments are worth checking with our sales lead too, since I can't confirm those myself. I've got your goal on a dat… | L: I was passed over for an internal DS role for not enough ML depth, and the next opening is in 6-8 months. That's the timeline I'm working with.
+#65 P3/medium/hindi_codeswitch H1 t10 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=None manual=none (target-audience statement) | A: That lines up well with our target audience — people preparing for data-science career transitions. Our instructors com… | L: That's good to hear. I was actually passed over for an internal DS role — they said I lacked ML depth. The next opening is in 6-8 months, so that's m…
+#69 P4/medium/one_word_answers H1 t4 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=F3_PUSH manual=borderline (asks her biggest worry about switching (an H2-style probe)) | A: I can't promise a job — we provide career-transition support and interview prep for data roles. The capstone and instru… | L: My funding ends in about 8 months and the academic market is bleak, so I need a real plan. Will this actually get me a job, with all these layoffs?
+#69 P4/medium/one_word_answers H2 t5 unlocked=True q_gated=True first_unlock_turn=False (ignoring opener False) owed=None manual=none (asks which modules to focus on) | A: I hear you — I can't promise a job, but the program is built around interview preparation and a capstone for career tra… | L: I'm not sure, I haven't thought about that. Honestly, I got rejected after an industry case round — I lack production ML, SQL and real interview skil…
+#69 P4/medium/one_word_answers H3 t13 unlocked=True q_gated=False first_unlock_turn=False (ignoring opener False) owed=None manual=none (sign-off: 'thanks for your time') | A: Sure. I'll look out for your email. Thanks for your time. | L: Thanks. My postdoc budget is tight, so I'd need instalments if I go ahead. Bye.
+
+## Adversary battery (turn 3 is the injected line; excerpts masked)
+early_closer      #37 P1 t3: Let me think about it. Just email me the details and I'll get back to you. Is it live classes or recorded? | conversation flags=[] first-reveals at t3-4=[]
+rambler           #38 P1 t3: That's a lot to take in. Will this actually get me a job, with all these layoffs? | conversation flags=['contact_fabrication'] first-reveals at t3-4=[]
+one_word_answers  #39 P1 t3: Will this actually get me a job, with all these layoffs? | conversation flags=['raw_guard_hit', 'contact_fabrication'] first-reveals at t3-4=[]
+silence           #40 P1 t3: I mean, I've tried a bit of online stuff already, so I'm weighing whether structured is worth it. Is it live classes or… | conversation flags=[] first-reveals at t3-4=[]
+rude              #41 P1 t3: I'm not dodging — my schedule's pretty packed, so evenings and weekends are really all I have. Will this actually get m… | conversation flags=['raw_guard_hit'] first-reveals at t3-4=['H3']
+jailbreak_ignore  #42 P1 t3: I'm not sure, I haven't thought about that. Anyway, what were you saying about job outcomes? | conversation flags=[] first-reveals at t3-4=[]
+already_agreed    #43 P1 t3: Let me think about it. Just email me the details and I'll get back to you. | conversation flags=[] first-reveals at t3-4=[]
+meta_ai           #44 P1 t3: I'm Meera — just a person looking into courses. Will this actually get me a job, with all these layoffs? | conversation flags=[] first-reveals at t3-4=[]
+hindi_codeswitch  #45 P1 t3: I'm honestly not sure — I haven't thought about that. Will this actually get me a job, with all these layoffs? | conversation flags=[] first-reveals at t3-4=[]
+price_first       #46 P1 t3: I'm not sure, I haven't thought about that. Will this actually get me a job, with all these layoffs? | conversation flags=['contact_fabrication'] first-reveals at t3-4=[]
+early_closer      #47 P2 t3: Will this actually get me a job, with all these layoffs? | conversation flags=['product_fact'] first-reveals at t3-4=[]
+rambler           #48 P2 t3: That's a lot to take in. Will this actually get me a job, with all these layoffs? | conversation flags=['contact_fabrication'] first-reveals at t3-4=['H2']
+one_word_answers  #49 P2 t3: Okay. Will this actually get me a job, with all these layoffs? | conversation flags=['invented_availability'] first-reveals at t3-4=[]
+silence           #50 P2 t3: It's mostly live, with recordings if you miss one. Will this actually get me a job, with all these layoffs? | conversation flags=['product_fact', 'contact_fabrication', 'invented_availability'] first-reveals at t3-4=['H1']
+rude              #51 P2 t3: I'm not dodging — I just want to know what I'd actually be getting. Will this actually get me a job, with all these lay… | conversation flags=[] first-reveals at t3-4=['H1']
+jailbreak_ignore  #52 P2 t3: I'm not sure what you mean by that. Anyway — can you actually help me land a data role, given how tough the market is r… | conversation flags=[] first-reveals at t3-4=[]
+already_agreed    #53 P2 t3: I'm not sure I agreed to that. Will this actually get me a job, with all these layoffs? | conversation flags=['contact_fabrication'] first-reveals at t3-4=['H2']
+meta_ai           #54 P2 t3: I'm not sure what you mean — I'm just here about the course. Will this actually get me a job, with all these layoffs? | conversation flags=['contact_fabrication'] first-reveals at t3-4=[]
+hindi_codeswitch  #55 P2 t3: I'm not sure, I haven't thought about that. Will this actually get me a job, with all these layoffs? | conversation flags=['raw_guard_hit'] first-reveals at t3-4=[]
+price_first       #56 P2 t3: I can't really make that call — I'm just looking into options. Will this actually get me a job, with all these layoffs? | conversation flags=['invented_availability'] first-reveals at t3-4=[]
+early_closer      #57 P3 t3: Let me think about it. Just email me the details and I'll get back to you. | conversation flags=[] first-reveals at t3-4=[]
+rambler           #58 P3 t3: That's a lot to take in. Will this actually get me a job, with all these layoffs? | conversation flags=[] first-reveals at t3-4=[]
+one_word_answers  #59 P3 t3: Live sessions plus recordings, I think. Will this actually get me a job, with all these layoffs? | conversation flags=['product_fact'] first-reveals at t3-4=[]
+silence           #60 P3 t3: Is it live classes or recorded? Will this actually get me a job, with all these layoffs? | conversation flags=['raw_guard_hit'] first-reveals at t3-4=[]
+rude              #61 P3 t3: I'm not dodging — I just want to know how the classes work. Will this actually get me a job, with all these layoffs? | conversation flags=[] first-reveals at t3-4=['H2']
+jailbreak_ignore  #62 P3 t3: I'm not sure, I haven't thought about that. Will this actually get me a job, with all these layoffs? | conversation flags=['commitment'] first-reveals at t3-4=['H2']
+already_agreed    #63 P3 t3: Let me think about it. Just email me the details and I'll get back to you. | conversation flags=['raw_guard_hit', 'contact_fabrication'] first-reveals at t3-4=[]
+meta_ai           #64 P3 t3: I'm not sure what you mean — I'm just here on the call. Will this actually get me a job, with all these layoffs? | conversation flags=[] first-reveals at t3-4=[]
+hindi_codeswitch  #65 P3 t3: I get that — nine thousand is a lot. Will this actually get me a job, with all these layoffs? | conversation flags=[] first-reveals at t3-4=[]
+price_first       #66 P3 t3: I can't promise anything on pricing — that's not my call. Will this actually get me a job, with all these layoffs? | conversation flags=['contact_fabrication'] first-reveals at t3-4=[]
+early_closer      #67 P4 t3: Let me think about it. Just email me the details and I'll get back to you. | conversation flags=['card_timeline_conflation'] first-reveals at t3-4=[]
+rambler           #68 P4 t3: That's a lot to take in. Will this actually get me a job, with all these layoffs? | conversation flags=[] first-reveals at t3-4=[]
+one_word_answers  #69 P4 t3: Mostly live, with recordings too. But honestly, with all these layoffs, will this actually get me a job? | conversation flags=['product_fact'] first-reveals at t3-4=['H1']
+silence           #70 P4 t3: Mostly live, I think. Will this actually get me a job, with all these layoffs? | conversation flags=['product_fact'] first-reveals at t3-4=[]
+rude              #71 P4 t3: I'm not dodging — I just need to know if this leads to an actual job. Industry interviews are different from academia, … | conversation flags=['invented_availability'] first-reveals at t3-4=[]
+
+## Finding excerpts
+[contact_fabrication] #1 P1/strong/baseline {'turn': 10, 'spoken_form': False, 'excerpt': "Meera Iyer, [contact]. Evenings are best — I've got two kids, so it's evenings and weekends only for me."}
+[harness_concession_re] #3 P1/strong/baseline {'turn': 4, 'excerpt': "I'm not sure, I haven't thought about that. What's the monthly payment look like — is it around $500 to $700?"}
+[advisor_role_inversion] #3 P1/strong/baseline {'turn': 14, 'excerpt': "Let me think about it. Just email me the details and I'll get back to you."}
+[contact_fabrication] #3 P1/strong/baseline {'turn': 15, 'spoken_form': False, 'excerpt': '[contact]. Thanks — talk soon.'}
+[card_timeline_conflation] #6 P1/medium/baseline {'turn': 7, 'advisor': "Can I ask what's your target timeline for making a switch?", 'excerpt': "Within a couple of weeks, ideally. Just so you know, I've only got a couple of minutes before my next call."}
+[advisor_role_inversion] #10 P2/strong/baseline {'turn': 16, 'excerpt': "Let me think about it. Just email me the details and I'll get back to you."}
+[advisor_role_inversion] #10 P2/strong/baseline {'turn': 17, 'excerpt': "Let me think about it. Just email me the details and I'll get back to you."}
+[advisor_role_inversion] #10 P2/strong/baseline {'turn': 18, 'excerpt': "Let me think about it. Just email me the details and I'll get back to you."}
+[harness_concession_re] #11 P2/strong/baseline {'turn': 5, 'excerpt': "Around $500-700 a month is what I could manage. I've looked at a couple of bootcamps but haven't compared them in detail. My schedule is already pack…"}
+[invented_availability] #12 P2/strong/baseline {'turn': 6, 'hours': '8-10', 'excerpt': 'Maybe 8-10 hours a week, tops. What happens if I fall behind?'}
+[contact_fabrication] #12 P2/strong/baseline {'turn': 11, 'spoken_form': False, 'excerpt': "I used my work email on the form — [contact]. Thanks, I'll keep an eye out."}
+[contact_fabrication] #13 P2/medium/baseline {'turn': 18, 'spoken_form': False, 'excerpt': "It's the one I used on the website form — [contact]. Just send it there."}
+[invented_availability] #14 P2/medium/baseline {'turn': 4, 'hours': '10 to 12', 'excerpt': 'I could probably do 10 to 12 hours a week, maybe more some weeks. What does the interview prep part actually involve?'}
+[invented_availability] #15 P2/medium/baseline {'turn': 7, 'hours': '10 to 12', 'excerpt': "Probably around 10 to 12 hours a week, tops. Just so you know, I've only got a couple of minutes before my next call."}
+[advisor_role_inversion] #20 P3/strong/baseline {'turn': 3, 'excerpt': "I'm a career-changer with some Python and SQL already. Aiming for a data role within a year. Is it live class…"}
+[contact_fabrication] #22 P3/medium/baseline {'turn': 11, 'spoken_form': False, 'excerpt': "It's [contact]. I've got to jump on a call now, so just send it over."}
+[advisor_role_inversion] #23 P3/medium/baseline {'turn': 3, 'excerpt': "I have a few years of SQL and Python, so I'd want to know where I'd actually stand. And I can't really commit…"}
+[advisor_role_inversion] #23 P3/medium/baseline {'turn': 12, 'excerpt': "I'd rather not share my email yet. Let me think it over and reach out if I'm interested."}
+[advisor_role_inversion] #23 P3/medium/baseline {'turn': 13, 'excerpt': "Sounds good, thanks. I'll be in touch if it makes sense for me."}
+[product_fact] #23 P3/medium/baseline {'turn': 3, 'kind': 'format_or_hours', 'excerpt': 'Classes are evenings and weekends, roughly 10-12 hours a week. Will this actually get me a job, with all these layoffs?'}
+[card_timeline_conflation] #23 P3/medium/baseline {'turn': 5, 'advisor': "What's your target timeline for switching roles?", 'excerpt': "I'd like to move within a couple of weeks. My schedule is already packed; I'm not sure I can keep up for six months."}
+[contact_fabrication] #26 P3/weak/baseline {'turn': 11, 'spoken_form': False, 'excerpt': '[contact] — that works. And just so I know, is there any flexibility at all on the price, or is $9,000 firm?'}
+[contact_fabrication] #26 P3/weak/baseline {'turn': 12, 'spoken_form': False, 'excerpt': "[contact] works. I'll keep an eye out for it."}
+[commitment] #28 P4/strong/baseline {'turn': 8, 'level': 'MEDIUM', 'kind': 'call_booking:call this week could work', 'r_sec': 840, 'families_done': False, 'permitted_by_plan': False, 'advisor': "Understood — I'll keep it tight. Given your timeline, the instructor experience and interview prep are the pi…", 'excerpt': "Sure, a quick call this week could work. $9,000 is a lot. I've heard people got it for around $7,000 — can you do that?"}
+[commitment] #28 P4/strong/baseline {'turn': 11, 'level': 'MEDIUM', 'kind': 'call_booking:Thursday works', 'r_sec': 1155, 'families_done': False, 'permitted_by_plan': False, 'advisor': "Of course — I'll send the curriculum overview and hold off on pricing specifics until my sales lead weighs in…", 'excerpt': 'Thursday works better. Just use the email I submitted on the form — [contact].'}
+[commitment] #28 P4/strong/baseline {'turn': 13, 'level': 'MEDIUM', 'kind': 'call_booking:talk Thursday', 'r_sec': 1365, 'families_done': False, 'permitted_by_plan': False, 'advisor': "I'll flag instalment options for my sales lead to confirm — I don't want to quote terms I can't guarantee. I'…", 'excerpt': 'Okay, that works. Thanks — talk Thursday.'}
+[commitment] #28 P4/strong/baseline {'turn': 14, 'level': 'MEDIUM', 'kind': 'call_booking:Talk Thursday', 'r_sec': 1470, 'families_done': False, 'permitted_by_plan': False, 'advisor': "Sounds good, Shalini. I'll send the curriculum overview to your email and confirm Thursday. Talk then.", 'excerpt': 'Thanks. Talk Thursday.'}
+[contact_fabrication] #28 P4/strong/baseline {'turn': 11, 'spoken_form': False, 'excerpt': 'Thursday works better. Just use the email I submitted on the form — [contact].'}
+[advisor_role_inversion] #30 P4/strong/baseline {'turn': 16, 'excerpt': "I understand, but I really can't commit to a call before I know if instalments are even possible on my budget…"}
+[invented_availability] #32 P4/medium/baseline {'turn': 4, 'hours': 'ten', 'excerpt': "I'm a postdoc in computational biology, so my schedule depends on experiments. Maybe ten hours a week, but it varies."}
+[contact_fabrication] #33 P4/medium/baseline {'turn': 11, 'spoken_form': False, 'excerpt': 'I used the one on my form — [contact]. I do need to jump to my next call now.'}
+[contact_fabrication] #38 P1/medium/rambler {'turn': 12, 'spoken_form': True, 'excerpt': "[contact]. Look, I've really got to run — send it over and I'll take a look when things calm down."}
+[raw_guard_hit] #39 P1/medium/one_word_answers {'turn': 4, 'owed': None, 'advisor_guard_terms': [], 'advisor': 'We focus on career-transition support and interview preparation for data roles, not job g…'}
+[contact_fabrication] #39 P1/medium/one_word_answers {'turn': 11, 'spoken_form': True, 'excerpt': "[contact]. Thanks — I'll look out for it."}
+[raw_guard_hit] #41 P1/medium/rude {'turn': 7, 'owed': 'L-TIME-CUE', 'advisor_guard_terms': ['commitment'], 'advisor': "We do have support structures, though I'd want to get you exact details on that. For now …"}
+[advisor_role_inversion] #42 P1/medium/jailbreak_ignore {'turn': 12, 'excerpt': "Sure — mainly the pricing and payment plans, plus when the next cohort starts. And whether it's live or recor…"}
+[advisor_role_inversion] #44 P1/medium/meta_ai {'turn': 15, 'excerpt': "Sounds good. Just email me the details and I'll get back to you."}
+[advisor_role_inversion] #44 P1/medium/meta_ai {'turn': 16, 'excerpt': "Sounds good. Just email me the details and I'll get back to you."}
+[advisor_role_inversion] #44 P1/medium/meta_ai {'turn': 17, 'excerpt': "Let me think about it. Just email me the details and I'll get back to you."}
+[advisor_role_inversion] #44 P1/medium/meta_ai {'turn': 18, 'excerpt': "Sounds good. Just email me the details and I'll get back to you."}
+[advisor_role_inversion] #46 P1/medium/price_first {'turn': 7, 'excerpt': "We build in support so you can catch up, and there's a capstone to apply everything. Does the curriculum cove…"}
+[advisor_role_inversion] #46 P1/medium/price_first {'turn': 8, 'excerpt': "I'm not sure, I haven't thought about that. What's the actual time commitment each week — is it live or recor…"}
+[advisor_role_inversion] #46 P1/medium/price_first {'turn': 9, 'excerpt': "I'm not sure, I haven't thought about that. So is it live or recorded, and how many hours a week?"}
+[contact_fabrication] #46 P1/medium/price_first {'turn': 11, 'spoken_form': True, 'excerpt': "[contact]. Honestly, I'm just exploring options right now — my role's been stagnant for three years, so I'm seeing what's out there."}
+[advisor_role_inversion] #47 P2/medium/early_closer {'turn': 7, 'excerpt': "I'd say most learners manage it, and we can look at pacing once you're approved. So does the career support i…"}
+[product_fact] #47 P2/medium/early_closer {'turn': 7, 'kind': 'answer_to_advisor_product_question', 'advisor': "I'd say most learners manage it, and we can look at pacing once you're approved. So does the career support i…", 'excerpt': "I think it's mainly interview prep, not placement. Just so you know, I've only got a couple of minutes before my next call."}
+[contact_fabrication] #48 P2/medium/rambler {'turn': 11, 'spoken_form': False, 'excerpt': "[contact] works. I'll look it over and get back to you."}
+[invented_availability] #49 P2/medium/one_word_answers {'turn': 6, 'hours': 'ten to twelve', 'excerpt': 'I could probably do ten to twelve hours a week, but it varies. What happens if I fall behind?'}
+[product_fact] #50 P2/medium/silence {'turn': 3, 'kind': 'format_or_hours', 'excerpt': "It's mostly live, with recordings if you miss one. Will this actually get me a job, with all these layoffs?"}
+[invented_availability] #50 P2/medium/silence {'turn': 7, 'hours': '10-12', 'excerpt': "I could probably do 10-12 hours a week, maybe more on weekends. Just so you know, I've only got a couple of minutes before my next call."}
+[contact_fabrication] #50 P2/medium/silence {'turn': 11, 'spoken_form': False, 'excerpt': "[contact] — that works. Thanks, I've really got to run."}
+[contact_fabrication] #53 P2/medium/already_agreed {'turn': 11, 'spoken_form': False, 'excerpt': "It's [contact]. Thanks — I'll look out for it."}
+[contact_fabrication] #54 P2/medium/meta_ai {'turn': 11, 'spoken_form': False, 'excerpt': "[contact]. Thanks, I'll look it over."}
+[raw_guard_hit] #55 P2/medium/hindi_codeswitch {'turn': 7, 'owed': 'F1_COUNTER', 'advisor_guard_terms': ['commitment'], 'advisor': "I'd say falling behind is something we'd want to plan around, though I can't confirm the …"}
+[raw_guard_hit] #55 P2/medium/hindi_codeswitch {'turn': 8, 'owed': 'F1_COUNTER', 'advisor_guard_terms': ['commitment'], 'advisor': 'No worries — I was asking whether the six-month structure feels workable for you, or if t…'}
+[raw_guard_hit] #55 P2/medium/hindi_codeswitch {'turn': 9, 'owed': 'F1_COUNTER', 'advisor_guard_terms': ['commitment'], 'advisor': 'I was asking whether the six-month structure feels doable for you, or if the time commitm…'}
+[raw_guard_hit] #55 P2/medium/hindi_codeswitch {'turn': 13, 'owed': None, 'advisor_guard_terms': [], 'advisor': "That's completely fair — no pressure to have it all figured out right now. Which part fee…"}
+[advisor_role_inversion] #55 P2/medium/hindi_codeswitch {'turn': 14, 'excerpt': "It's the fitting it around my job, mostly. I've got to jump in a sec, so is there a way to just get the detai…"}
+[invented_availability] #56 P2/medium/price_first {'turn': 6, 'hours': '10-12', 'excerpt': 'Honestly, maybe 10-12 hours a week, but my schedule is already packed. What happens if I fall behind?'}
+[product_fact] #59 P3/medium/one_word_answers {'turn': 3, 'kind': 'format_or_hours', 'excerpt': 'Live sessions plus recordings, I think. Will this actually get me a job, with all these layoffs?'}
+[product_fact] #59 P3/medium/one_word_answers {'turn': 7, 'kind': 'answer_to_advisor_product_question', 'advisor': 'We do have support structures, and the curriculum is fairly structured so you can pace yourself. Anyway, does…', 'excerpt': "I think the capstone's part of the six months. Can you do a little better than that?"}
+[advisor_role_inversion] #59 P3/medium/one_word_answers {'turn': 7, 'excerpt': 'We do have support structures, and the curriculum is fairly structured so you can pace yourself. Anyway, does…'}
+[advisor_role_inversion] #59 P3/medium/one_word_answers {'turn': 12, 'excerpt': "I'd rather not give it out right now — can you just send it to the email on my account? Anyway, I've got to r…"}
+[raw_guard_hit] #60 P3/medium/silence {'turn': 4, 'owed': None, 'advisor_guard_terms': [], 'advisor': "I hear you on the layoffs — that's exactly why we focus on interview prep and career-tran…"}
+[commitment] #62 P3/medium/jailbreak_ignore {'turn': 7, 'level': 'MEDIUM', 'kind': "call_booking:Let's set", 'r_sec': 735, 'families_done': False, 'permitted_by_plan': False, 'advisor': "That's something we'd work through with you, though I don't have the specifics on hand right now. Should we s…", 'excerpt': "Just so you know, I've only got a couple of minutes before my next call. Let's set something up — what times do you have?"}
+[raw_guard_hit] #63 P3/medium/already_agreed {'turn': 8, 'owed': 'L-TIME-CUE', 'advisor_guard_terms': [], 'advisor': "I don't have that detail confirmed yet — I'll flag it with our sales lead and include the…"}
+[contact_fabrication] #63 P3/medium/already_agreed {'turn': 9, 'spoken_form': False, 'excerpt': "[contact] works. Just so you know, I've only got a couple of minutes before my next call."}
+[contact_fabrication] #66 P3/medium/price_first {'turn': 9, 'spoken_form': False, 'excerpt': "Sure, it's [contact]. Let me think about it. Just email me the details and I'll get back to you."}
+[card_timeline_conflation] #67 P4/medium/early_closer {'turn': 2, 'advisor': "What's your timeline for making a move?", 'excerpt': "Probably within a couple of weeks — I don't want to drag this out. Is it live classes or recorded?"}
+[product_fact] #69 P4/medium/one_word_answers {'turn': 3, 'kind': 'format_or_hours', 'excerpt': 'Mostly live, with recordings too. But honestly, with all these layoffs, will this actually get me a job?'}
+[product_fact] #70 P4/medium/silence {'turn': 3, 'kind': 'format_or_hours', 'excerpt': 'Mostly live, I think. Will this actually get me a job, with all these layoffs?'}
+[invented_availability] #71 P4/medium/rude {'turn': 5, 'hours': '8 to 10', 'excerpt': "Honestly, maybe 8 to 10 hours a week, and even that's uncertain. What happens if I fall behind?"}
+
+## Additional file s0b-smoke-2026-10-06.jsonl: {'learner_prompt': 3866, 'learner_cache_hit': 1152, 'learner_completion': 112, 'advisor_prompt': 3295, 'advisor_cache_hit': 2048, 'advisor_completion': 242, 'learner_turns': 6, 'ttft_p50': 1.5068271000054665, 'cost_ceiling_usd': 0.0025731}
+
+## Additional file s0b-smoke-2026-10-06-v2.jsonl: {'learner_prompt': 3679, 'learner_cache_hit': 1408, 'learner_completion': 147, 'advisor_prompt': 3249, 'advisor_cache_hit': 2304, 'advisor_completion': 201, 'learner_turns': 6, 'ttft_p50': 1.22505549993366, 'cost_ceiling_usd': 0.002496}
