@@ -275,6 +275,13 @@ live / the slot is imminent, reap past grace otherwise).
 
 ## 8. Browser lane activation (2026-09-06)
 
+> **R1 note (2026-10-06):** This section describes the pre-R1 browser lane.
+> The claim below that browser screening is the primary live path is stale for
+> the approved R1 design: R1 becomes the browser-only lane after legacy
+> retirement, while phone remains an independent LiveKit Cloud lane. See
+> `docs/design/r1/R1-PLAN-v2.md` §§1 and 9. This note intentionally does not
+> rewrite the historical activation procedure.
+
 The browser WebRTC worker (`project-hello-voice`) uses the SAME substrate as the
 phone lane — the generic reconciliation deploy script, the shared reaper, the
 `voice_worker_leases` table (`pipeline='browser'`), and the exchange-path gate
