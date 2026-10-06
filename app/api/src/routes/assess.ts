@@ -47,6 +47,7 @@ workerAssessRouter.post(
       const assessment = await runAssessment(req.params.sessionId);
       res.json(assessment);
     } catch (error) {
+      if (error instanceof Error && error.message === 'r1_session') return res.status(409).json({ error: 'r1_session' });
       if (error instanceof Error && error.message === ERR_SESSION_NOT_COMPLETED) {
         return res.status(409).json({
           error: { type: 'session_not_completed', message: 'Session is not eligible for assessment' },
@@ -78,6 +79,7 @@ assessRouter.post(
       }
       res.json(assessment);
     } catch (error) {
+      if (error instanceof Error && error.message === 'r1_session') return res.status(409).json({ error: 'r1_session' });
       // VOI-08: ineligible sessions → stable non-retryable 409.
       // All other errors flow to the global error handler (500).
       if (error instanceof Error && error.message === ERR_SESSION_NOT_COMPLETED) {
@@ -133,6 +135,7 @@ assessRouter.post(
       }
       res.json(assessment);
     } catch (error) {
+      if (error instanceof Error && error.message === 'r1_session') return res.status(409).json({ error: 'r1_session' });
       // A rescore on a session that never completed → the same non-retryable 409.
       if (error instanceof Error && error.message === ERR_SESSION_NOT_COMPLETED) {
         return res.status(409).json({

@@ -164,14 +164,17 @@ begin
   res := screening_v2.r1_admit_attempt(round_a, repeat('e', 64));
   sid := (res->>'session_id')::uuid;
   perform _r1_tests.assert('counted retake receives a different persona', res->>'status' = 'ok' and
-    (select persona_id from screening_v2.interview_round_attempts where session_id = sid) <> first_persona);
+    (select persona_id from screening_v2.interview_round_attempts where session_id = sid) <> first_persona and
+    (select hold_month = date_trunc('month',now())::date from screening_v2.interview_rounds where id=round_a));
 
   update screening_v2.r1_settings set paused = true;
   perform _r1_tests.assert('pause refuses admission',
     (screening_v2.r1_admit_attempt(round_i, repeat('a', 64))->>'status') = 'paused');
   update screening_v2.r1_settings set paused = false, monthly_cap_minutes = 55, pause_line_minutes = 55;
-  perform _r1_tests.assert('55 minute hold enforces cap',
-    (screening_v2.r1_admit_attempt(round_i, repeat('a', 64))->>'status') = 'capacity_exhausted');
+  -- 0117 evaluates the one-live-R1 rule BEFORE capacity: the counted retake above
+  -- is still live, so a full cap must not mask the in-flight refusal.
+  perform _r1_tests.assert('a live R1 session is refused before the cap is evaluated',
+    (screening_v2.r1_admit_attempt(round_i, repeat('a', 64))->>'status') = 'r1_in_flight');
   update screening_v2.r1_settings set monthly_cap_minutes = 1000, pause_line_minutes = 1000;
 
   -- Valid lifecycle transitions are required before a terminal completion.
@@ -181,6 +184,12 @@ begin
   select count(*) into job_count from screening_v2.job_queue
    where name = 'r1.assessment' and dedup_key = 'r1.assessment:' || sid::text and max_attempts = 5;
   perform _r1_tests.assert('R1 completion enqueues exactly one deduped job', job_count = 1, job_count::text);
+
+  -- No R1 session is live any more, so this isolates the 55-minute capacity hold.
+  update screening_v2.r1_settings set monthly_cap_minutes = 55, pause_line_minutes = 55;
+  perform _r1_tests.assert('55 minute hold enforces cap',
+    (screening_v2.r1_admit_attempt(round_i, repeat('a', 64))->>'status') = 'capacity_exhausted');
+  update screening_v2.r1_settings set monthly_cap_minutes = 1000, pause_line_minutes = 1000;
   insert into screening_v2.call_sessions
     (candidate_id, role_id, mode, provider, external_call_id, status, owner_id)
     values (candidate_a, role_phone, 'live', 'livekit', 'r1-foundation-phone', 'created', owner)
@@ -307,6 +316,126 @@ begin
   update screening_v2.call_sessions set status = 'waiting' where id = self_hosted_sid;
   update screening_v2.call_sessions set status = 'in_progress' where id = self_hosted_sid;
   update screening_v2.call_sessions set status = 'completed', terminal_reason = 'conversation_complete' where id = self_hosted_sid;
+end;
+$$;
+
+-- 0117: Send itself reserves capacity atomically; cancel/expiry release the
+-- round-owned hold.  These are SQL assertions over the applied functions, not
+-- route mocks.
+do $$
+declare
+  owner constant uuid := '10000000-0000-4000-8000-000000000001';
+  role_r1 constant uuid := '10000000-0000-4000-8000-000000000002';
+  candidate constant uuid := '10000000-0000-4000-8000-000000000081';
+  sent jsonb; rid uuid; before_reserved numeric; after_reserved numeric;
+begin
+  insert into screening_v2.candidates(id,role_id,name) values(candidate,role_r1,'hold assertion');
+  update screening_v2.r1_settings set enabled=true,paused=false,livekit_target='r1',monthly_cap_minutes=10000,pause_line_minutes=10000,dashboard_minutes=0,dashboard_read_at=now();
+  select minutes_reserved into before_reserved from screening_v2.r1_budget_month where month_start=date_trunc('month',now())::date;
+  sent := screening_v2.r1_send_round(candidate,role_r1,owner,repeat('8',64),null,now()+interval '1 hour');
+  rid := (sent->>'id')::uuid;
+  select minutes_reserved into after_reserved from screening_v2.r1_budget_month where month_start=date_trunc('month',now())::date;
+  perform _r1_tests.assert('Send R1 atomically inserts a round and reserves exactly its hold', sent->>'status'='ok' and (select held_minutes=55 from screening_v2.interview_rounds where id=rid) and after_reserved=before_reserved+55, sent::text);
+  perform screening_v2.r1_transition_round(rid,'cancel',1,null,null);
+  perform _r1_tests.assert('cancel releases the round hold', (select held_minutes=0 from screening_v2.interview_rounds where id=rid) and (select minutes_reserved=after_reserved-55 from screening_v2.r1_budget_month where month_start=date_trunc('month',now())::date));
+  -- The view must include sessions with no usage row (session-timestamp fallback).
+  perform _r1_tests.assert('estimate has session timestamp fallback', exists(select 1 from screening_v2.v_webrtc_minutes_estimate where month_start=date_trunc('month',now())::date));
+  perform _r1_tests.assert('ledger has required idempotency and upper-bound constraints', exists(select 1 from pg_constraint where conrelid='screening_v2.r1_usage_ledger'::regclass and conname='chk_r1_usage_event_bounds') and exists(select 1 from pg_indexes where schemaname='screening_v2' and indexname='uq_r1_usage_ledger_session_event_key'));
+end;
+$$;
+
+-- Outstanding holds are FUTURE minutes the estimate cannot contain (plan section
+-- 3.3), so they count ON TOP of an estimate that already exceeds admitted plus
+-- reserved minutes. The pre-fix rule, greatest(used + reserved, guard) + hold,
+-- silently dropped every reservation once phone usage dominated the estimate.
+do $$
+declare
+  owner constant uuid := '10000000-0000-4000-8000-000000000001';
+  role_r1 constant uuid := '10000000-0000-4000-8000-000000000002';
+  first_candidate constant uuid := '10000000-0000-4000-8000-000000000083';
+  second_candidate constant uuid := '10000000-0000-4000-8000-000000000084';
+  first_sent jsonb; second_sent jsonb; guard numeric; used numeric; reserved numeric;
+begin
+  insert into screening_v2.candidates(id, role_id, name) values
+    (first_candidate, role_r1, 'reservation one'),
+    (second_candidate, role_r1, 'reservation two');
+  update screening_v2.r1_settings
+     set enabled = true, paused = false, livekit_target = 'r1',
+         monthly_cap_minutes = 100000, pause_line_minutes = 100000,
+         dashboard_minutes = 5000, dashboard_read_at = now();
+  first_sent := screening_v2.r1_send_round(first_candidate, role_r1, owner,
+    encode(sha256('r1-reservation-one'::bytea), 'hex'), null, now() + interval '1 hour');
+  select greatest(5000, coalesce((select e.r1_minutes + e.phone_minutes + e.legacy_browser_minutes
+           from screening_v2.v_webrtc_minutes_estimate e
+          where e.month_start = date_trunc('month', now())::date), 0)) * 1.15
+    into guard;
+  select minutes_used, minutes_reserved into used, reserved
+    from screening_v2.r1_budget_month where month_start = date_trunc('month', now())::date;
+  -- One minute short of fitting another hold once reservations are counted.
+  update screening_v2.r1_settings
+     set monthly_cap_minutes = ceil(greatest(used, guard) + reserved) + 54,
+         pause_line_minutes = ceil(greatest(used, guard) + reserved) + 54;
+  second_sent := screening_v2.r1_send_round(second_candidate, role_r1, owner,
+    encode(sha256('r1-reservation-two'::bytea), 'hex'), null, now() + interval '1 hour');
+  perform _r1_tests.assert('outstanding holds count on top of a dominant estimate',
+    first_sent->>'status' = 'ok' and reserved >= 55 and guard > used + reserved
+      and second_sent->>'status' = 'capacity_exhausted',
+    second_sent::text);
+  perform screening_v2.r1_transition_round((first_sent->>'id')::uuid, 'cancel', 1, null, null);
+  update screening_v2.r1_settings
+     set monthly_cap_minutes = 10000, pause_line_minutes = 10000,
+         dashboard_minutes = 0, dashboard_read_at = now();
+end;
+$$;
+
+-- A hold belongs to its originating budget month.  A February cancellation of
+-- a January Send must release January and must not create or touch February.
+do $$
+declare
+  owner constant uuid := '10000000-0000-4000-8000-000000000001';
+  role_r1 constant uuid := '10000000-0000-4000-8000-000000000002';
+  candidate constant uuid := '10000000-0000-4000-8000-000000000082';
+  month_m constant date := '2030-01-01';
+  month_next constant date := '2030-02-01';
+  sent jsonb; rid uuid; version_before integer;
+begin
+  insert into screening_v2.candidates(id,role_id,name) values(candidate,role_r1,'cross-month hold assertion');
+  update screening_v2.r1_settings set enabled=true,paused=false,livekit_target='r1',monthly_cap_minutes=10000,pause_line_minutes=10000,dashboard_minutes=0,dashboard_read_at='2030-01-01T00:00:00Z';
+  sent := screening_v2.r1_send_round(candidate,role_r1,owner,repeat('9',64),null,'2030-01-20T00:00:00Z','2030-01-15T00:00:00Z');
+  rid := (sent->>'id')::uuid;
+  select version into version_before from screening_v2.interview_rounds where id=rid;
+  perform _r1_tests.assert('Send persists the hold originating month',
+    sent->>'status'='ok' and (select held_minutes=55 and hold_month=month_m from screening_v2.interview_rounds where id=rid), sent::text);
+  perform screening_v2.r1_transition_round(rid,'cancel',version_before,null,null,'2030-02-02T00:00:00Z');
+  perform _r1_tests.assert('cross-month cancel releases only the originating month',
+    (select held_minutes=0 from screening_v2.interview_rounds where id=rid)
+    and (select minutes_reserved=0 from screening_v2.r1_budget_month where month_start=month_m)
+    and not exists(select 1 from screening_v2.r1_budget_month where month_start=month_next));
+end;
+$$;
+
+-- M2: worker-only append tables remain RLS-protected, while capacity views
+-- execute as the caller and cannot be used as a write path into phone/legacy
+-- sources. These are catalog assertions against the applied full chain, not
+-- regex checks of the migration text.
+do $$
+begin
+  perform _r1_tests.assert('M2 ledger and administration log have RLS with no caller grants',
+    (select relrowsecurity from pg_class where oid = 'screening_v2.r1_usage_ledger'::regclass)
+    and (select relrowsecurity from pg_class where oid = 'screening_v2.r1_admin_log'::regclass)
+    and not has_table_privilege('anon', 'screening_v2.r1_usage_ledger', 'select')
+    and not has_table_privilege('authenticated', 'screening_v2.r1_usage_ledger', 'insert')
+    and not has_table_privilege('anon', 'screening_v2.r1_admin_log', 'select')
+    and not has_table_privilege('authenticated', 'screening_v2.r1_admin_log', 'insert')
+    and has_table_privilege('service_role', 'screening_v2.r1_usage_ledger', 'insert')
+    and has_table_privilege('service_role', 'screening_v2.r1_admin_log', 'insert'));
+  perform _r1_tests.assert('M2 estimate views use security_invoker and are read-only',
+    (select reloptions @> array['security_invoker=true'] from pg_class where oid = 'screening_v2.v_webrtc_minutes_estimate'::regclass)
+    and (select reloptions @> array['security_invoker=true'] from pg_class where oid = 'screening_v2.v_r1_budget_month'::regclass)
+    and not has_table_privilege('service_role', 'screening_v2.v_webrtc_minutes_estimate', 'insert')
+    and not has_table_privilege('service_role', 'screening_v2.v_r1_budget_month', 'update')
+    and pg_relation_is_updatable('screening_v2.v_webrtc_minutes_estimate'::regclass, true) = 0
+    and pg_relation_is_updatable('screening_v2.v_r1_budget_month'::regclass, true) = 0);
 end;
 $$;
 

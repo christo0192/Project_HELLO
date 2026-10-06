@@ -1666,6 +1666,7 @@ describe('POST /api/livekit/grant/recording (route-shadow fixed)', () => {
 
   it('denies mint (409) for a quarantined recording', async () => {
     configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
       call_sessions: {
         id: VALID_SESSION,
         recording_object_key: OBJECT_KEY,
@@ -1684,6 +1685,7 @@ describe('POST /api/livekit/grant/recording (route-shadow fixed)', () => {
 
   it('denies mint (404) for a deleted recording', async () => {
     configureTables({
+      candidate_access_grants: GRANT_PAYLOAD,
       call_sessions: {
         id: VALID_SESSION,
         recording_object_key: OBJECT_KEY,

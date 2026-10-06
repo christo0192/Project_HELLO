@@ -27,7 +27,7 @@ import { extractBearerToken, resolveFullAuth } from '../lib/auth.js';
 import type { AuthUser } from '../lib/auth.js';
 import { createSession, transitionSession } from '../lib/session-lifecycle.js';
 import { getCorrelationId } from '../lib/correlation.js';
-import { handleRecordingGrant } from './invites.js';
+import { handleRecordingGrant, validateRecordingGrant } from './invites.js';
 import { runAssessment } from '../services/assessment.js';
 import { resolveWorkerContext, ERR_DB_FAILED } from '../lib/worker-context.js';
 import {
@@ -53,6 +53,18 @@ import {
 const recordingLogger = createLogger('recording-finalize');
 
 export const livekitRouter = Router();
+
+/** Additive R1 fence: legacy browser recording/completion paths must never
+ * operate on an R1-bound session. Phone rows have NULL interview_round_id.
+ * The discriminator travels in the route's existing session read so legacy
+ * request ordering and error responses remain unchanged. */
+function rejectR1Session(
+  session: { interview_round_id?: unknown } | null,
+  res: import('express').Response,
+): boolean {
+  if (session?.interview_round_id) { res.status(409).json({ error: 'r1_session' }); return true; }
+  return false;
+}
 
 /**
  * REC-03 (C-3, PROPOSED): reduced bounded browser audio-upload cap.
@@ -351,13 +363,12 @@ livekitRouter.post(
   async (req, res, next) => {
     try {
       const { grant_token, session_id } = req.body as { grant_token: string; session_id: string };
-
       // ── Revocation/quarantine/deleted gate (REC-05, invariant 7) ──
       // Denies NEW mints within the (short) TTL; existing URLs expire
       // naturally. Never logs object keys/URLs/tokens.
       const { data: session } = await supabase
         .from('call_sessions')
-        .select('recording_deleted_at, recording_quarantined, recording_revoked_at')
+        .select('recording_deleted_at, recording_quarantined, recording_revoked_at, interview_round_id')
         .eq('id', session_id)
         .single();
       if (!session) {
@@ -376,6 +387,14 @@ livekitRouter.post(
         return res.status(403).json({ error: 'access_denied' });
       }
 
+      // Keep the legacy terminal-state gate above intact.  A valid grant is
+      // required before consulting the R1 discriminator, while the existing
+      // session read avoids an additional fence query for legacy requests.
+      await validateRecordingGrant(grant_token, session_id);
+      if (rejectR1Session(session, res)) return;
+
+      // Repeating pure validation in the mint helper is harmless and keeps its
+      // standalone API contract unchanged.
       const result = await handleRecordingGrant(grant_token, session_id);
       res.json(result);
     } catch (error: any) {
@@ -438,15 +457,15 @@ livekitRouter.post(
       if (!validation.ok || validation.payload.session_id !== sessionId) {
         return res.status(403).json({ error: 'access_denied' });
       }
-
       const { data: session, error: sessionErr } = await supabase
         .from('call_sessions')
-        .select('status, started_at')
+        .select('status, started_at, interview_round_id')
         .eq('id', sessionId)
         .single();
       if (sessionErr || !session) {
         return res.status(404).json({ error: 'not_found' });
       }
+      if (rejectR1Session(session, res)) return;
 
       if (session.status === 'completed') {
         const recordingStatus = await finalizeRecordingForCompletion(sessionId);
@@ -559,12 +578,16 @@ livekitRouter.post(
       // ── Fetch session for preflight gates in one query (F-D repair) ─
       const { data: session, error: sessionErr } = await supabase
         .from('call_sessions')
-        .select('owner_id, recording_object_key, recording_egress_id, recording_egress_status, recording_deleted_at, recording_revoked_at, recording_quarantined')
+        .select('owner_id, recording_object_key, recording_egress_id, recording_egress_status, recording_deleted_at, recording_revoked_at, recording_quarantined, interview_round_id')
         .eq('id', sessionId)
         .single();
       if (sessionErr || !session) {
         return res.status(404).json({ error: 'not_found' });
       }
+      // Authentication (candidate grant or recruiter bearer) has completed;
+      // the existing session read now enforces the R1 boundary without adding
+      // a second lookup that could alter legacy timing or response ordering.
+      if (rejectR1Session(session, res)) return;
 
       // Recruiter-owner shape (admin/viewer any; interviewer must own).
       if (!grantOk) {

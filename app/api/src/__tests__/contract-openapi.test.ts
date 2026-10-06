@@ -1142,7 +1142,9 @@ describe('OpenAPI document integrity', () => {
     // release-duplicate-hold, which lifts a same-role duplicate-application
     // hold. Its bodies are documented inline, so the schema count below is
     // unchanged. 143 + 1 = 144.
-    expect(Object.keys(paths).length).toBe(144);
+    // PR-2 adds eight R1 path keys: candidate round list/send; cancel,
+    // reissue and retake; settings; and the three worker-only R1 endpoints.
+    expect(Object.keys(paths).length).toBe(152);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1497,6 +1499,12 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/livekit/preflight',
     'POST /api/livekit/worker-context',
     'POST /api/internal/assess/{sessionId}',
+    // R1 worker routes are mounted before recruiter auth and carry their own
+    // bearer/session fence, so their unauthenticated response is not the
+    // recruiter middleware envelope checked below.
+    'POST /api/internal/r1/context',
+    'POST /api/internal/r1/usage',
+    'POST /api/internal/r1/admin-log',
     // P4 internal phone-worker surface. Mounted pre-auth for exactly the same
     // reason as the scoring callback beside it: the trust boundary is the
     // constant-time WORKER_CONTEXT_SECRET comparison, not a recruiter session.

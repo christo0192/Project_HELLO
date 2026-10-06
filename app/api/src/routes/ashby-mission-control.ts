@@ -524,6 +524,16 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     if (typeof roleId !== 'string' || !UUID_RE.test(roleId)) {
       res.status(400).json({ ok: false, error: 'invalid_role_id' }); return;
     }
+    // The database trigger is authoritative; this early check gives the admin
+    // a stable, useful 400 instead of surfacing a constraint violation.
+    let mappedRole: Awaited<ReturnType<MissionControlStore['roleInterviewKind']>>;
+    try {
+      mappedRole = await store().roleInterviewKind(roleId);
+    } catch {
+      res.status(400).json({ ok: false, error: 'invalid_role_id' }); return;
+    }
+    if (!mappedRole) { res.status(400).json({ ok: false, error: 'invalid_role_id' }); return; }
+    if (mappedRole.interviewKind) { res.status(400).json({ ok: false, error: 'r1_role_not_mappable' }); return; }
     const ownerId = typeof body.owner_id === 'string' && UUID_RE.test(body.owner_id)
       ? body.owner_id
       : actorId;

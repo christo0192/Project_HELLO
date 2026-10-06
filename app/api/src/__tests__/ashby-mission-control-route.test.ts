@@ -20,6 +20,7 @@ const ROLE_UUID = '66666666-6666-4666-8666-666666666666';
 
 function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore {
   return {
+    roleInterviewKind: async () => ({ interviewKind: null }),
     listMappings: async () => [
       { id: UUID, externalJobId: 'job_1', status: 'drift', statusReason: 'stage_id_invalid', deliveryMode: 'both', hasAiStage: true, hasTaStage: false, label: null, roleId: ROLE_UUID, updatedAt: '2026-08-13T00:00:00Z' },
     ],

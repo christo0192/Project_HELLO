@@ -42,6 +42,8 @@ const assessmentLog = createLogger('assessment');
  * the authoritative `conversation_complete` terminal reason.
  */
 export const ERR_SESSION_NOT_COMPLETED = 'ERR_SESSION_NOT_COMPLETED';
+/** The R1 isolation read is unavailable; callers must fail closed before any
+ * legacy scoring work. */
 
 /**
  * Phase 4: a RESCORE was requested for a session whose role has no active v2
@@ -116,7 +118,6 @@ export interface AssessmentRunner {
  * Override in tests via injectAssessmentRunner() to avoid network/CLI calls.
  */
 let _runAssessment: AssessmentRunner = runAssessmentImpl;
-
 export function injectAssessmentRunner(fn: AssessmentRunner | null): void {
   _runAssessment = fn ?? runAssessmentImpl;
 }
@@ -150,10 +151,13 @@ async function runAssessmentImpl(
 ): Promise<Assessment & { id: string }> {
   const { data: session, error: sErr } = await supabase
     .from('call_sessions')
-    .select('id,candidate_id,owner_id,role_id,status,terminal_reason,external_call_id,started_at')
+    .select('id,candidate_id,owner_id,role_id,status,terminal_reason,external_call_id,started_at,interview_round_id')
     .eq('id', sessionId)
     .single();
+  // Preserve the legacy failure exactly.  It still fails closed: without a
+  // resolved session no legacy scorer work can run.
   if (sErr || !session) throw new Error(`session not found: ${sErr?.message}`);
+  if (session.interview_round_id) throw new Error('r1_session');
 
   // ── THE SOURCE IS DERIVED, NOT TRUSTED ──────────────────────────────
   // Four callers reach this function — the phone completion endpoint, the
