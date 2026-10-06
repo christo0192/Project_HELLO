@@ -1,0 +1,50 @@
+{
+  "check": "S0-F3 Config B dispatch diagnosis",
+  "cycleCount": 1,
+  "cycleTimeoutMs": 10000,
+  "loadThresholdOverride": "default",
+  "workerLogSignals": [
+    "S0F_DISPATCH_RECEIVED",
+    "S0F_AVAILABILITY_ACCEPTED",
+    "S0F_AGENT_CONNECTED",
+    "S0F_AUDIO_PUBLISHED"
+  ],
+  "workerLoadStatusUpdates": [
+    {
+      "message": "worker is at full capacity, marking as unavailable",
+      "load": 1,
+      "threshold": 0.7,
+      "timestamp": "2026-10-06T09:35:11.782121+00:00"
+    },
+    {
+      "message": "worker is below capacity, marking as available",
+      "load": 0.6616000000000002,
+      "threshold": 0.7,
+      "timestamp": "2026-10-06T09:35:34.593134+00:00"
+    }
+  ],
+  "cycles": [
+    {
+      "cycle": 1,
+      "coldStart": true,
+      "dispatchCreated": true,
+      "workerRegisteredBeforeDispatch": true,
+      "workerReceivedJob": false,
+      "availabilityAccepted": false,
+      "workerAgentConnected": false,
+      "workerAudioPublished": false,
+      "agentJoinedByParticipantList": false,
+      "audioReceived": false,
+      "participantListObserved": true,
+      "candidateJoinMs": 1991,
+      "dispatchToWorkerReceivedMs": null,
+      "dispatchToAvailabilityAcceptedMs": null,
+      "dispatchToAgentJoinMs": null,
+      "dispatchToAudioMs": null,
+      "maxParticipantCount": 1,
+      "maxInboundAudioBytes": 0,
+      "failureStage": "worker did not receive dispatched job",
+      "workerStartToDispatchMs": 13466
+    }
+  ]
+}

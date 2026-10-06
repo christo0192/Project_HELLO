@@ -1,0 +1,15 @@
+{
+  "check": "S0-F3 Config B cold dispatch diagnosis",
+  "dispatchCreated": true,
+  "workerStartToDispatchMs": 517,
+  "workerRegisteredBeforeDispatch": false,
+  "workerReceivedJob": false,
+  "agentJoinedByParticipantList": false,
+  "audioReceived": false,
+  "maxParticipantCount": 1,
+  "maxInboundAudioBytes": 0,
+  "dispatchToWorkerReceivedMs": null,
+  "dispatchToAgentJoinMs": null,
+  "dispatchToAudioMs": null,
+  "failureStage": "worker did not receive dispatched job"
+}

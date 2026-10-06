@@ -109,9 +109,10 @@ least-privilege candidate JWT. Open `spike/index.html` from an HTTPS preview (or
 localhost), paste the candidate URL/token, and use headphones: the echo worker
 returns microphone audio and speakers can create acoustic feedback.
 
-Both helpers refuse LiveKit Cloud, the production SFU host, and any host other
-than `*-r1-rtc-spike.fly.dev`. For an intentionally different disposable host,
-set `R1_SPIKE_ALLOWED_HOST` to that exact hostname in both commands.
+Both helpers accept only `wss://project-hello-r1-rtc-spike.fly.dev` or its HTTPS
+equivalent. They refuse LiveKit Cloud, the production SFU host, userinfo, ports,
+and every other host. An intentionally different disposable host requires a
+code change to the shared spike-host helper.
 
 The `lk` CLI can mint equivalent manual tokens when needed:
 

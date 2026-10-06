@@ -1,0 +1,53 @@
+{
+  "check": "S0-E live SDK behaviour",
+  "workerRegisteredBeforeDispatch": true,
+  "room": "r1-spike-1791280713777",
+  "attributeKeysExact": true,
+  "video": {
+    "simulcast": false,
+    "requestedQuality": false,
+    "simulcastRequired": true,
+    "outboundBeforeCycle": [
+      {
+        "frameWidth": null,
+        "frameHeight": null,
+        "framesPerSecond": null,
+        "bytesSent": 0
+      }
+    ],
+    "outboundAfterCycle": [
+      {
+        "frameWidth": 640,
+        "frameHeight": 360,
+        "framesPerSecond": null,
+        "bytesSent": 87951
+      },
+      {
+        "frameWidth": null,
+        "frameHeight": null,
+        "framesPerSecond": null,
+        "bytesSent": 0
+      }
+    ]
+  },
+  "textInput": {
+    "tokenCanPublishDataFalse": true,
+    "publishAttempt": "resolved",
+    "workerReceivedNoData": true,
+    "sessionStartedTextDisabled": true
+  },
+  "record": {
+    "sessionStartedRecordFalse": true,
+    "workerLogHasNoObservabilityUpload": true
+  },
+  "mute": {
+    "muted": true,
+    "unmuted": true
+  },
+  "camera": {
+    "unpublished": true,
+    "published": true,
+    "subscribed": true
+  },
+  "errors": []
+}

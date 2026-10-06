@@ -1,0 +1,56 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>S0-E browser probe</title>
+<pre id="state">{"status":"booting"}</pre>
+<script type="module">
+  import { Room, RoomEvent, createLocalAudioTrack, createLocalVideoTrack } from "https://cdn.jsdelivr.net/npm/livekit-client@2.21.0/+esm";
+  import { assertSpikeUrl } from "./spike-host.mjs";
+
+  const state = { status: "booting", attributes: [], dataAttempt: null, outboundVideo: [], errors: [] };
+  const write = () => document.querySelector('#state').textContent = JSON.stringify(state);
+  let room, mic, camera;
+
+  const videoStats = async () => {
+    const report = await room?.engine?.pcManager?.publisher?.getStats?.();
+    if (!report) return [];
+    return [...report.values()]
+      .filter((row) => row.type === 'outbound-rtp' && (row.kind === 'video' || row.mediaType === 'video'))
+      .map((row) => ({ frameWidth: row.frameWidth ?? null, frameHeight: row.frameHeight ?? null,
+                       framesPerSecond: row.framesPerSecond ?? null, bytesSent: row.bytesSent ?? null }));
+  };
+
+  window.s0e = {
+    async connect(url, token) {
+      try { url = assertSpikeUrl(url, 'LiveKit URL').href; }
+      catch (error) { state.status = 'error'; state.errors.push(String(error)); write(); throw error; }
+      room = new Room({ adaptiveStream: false, dynacast: false });
+      room.on(RoomEvent.ParticipantAttributesChanged, (changed, participant) => {
+        state.attributes.push({ identity: participant.identity, changed }); write();
+      });
+      room.on(RoomEvent.Disconnected, () => { state.status = 'disconnected'; write(); });
+      await room.connect(url, token);
+      mic = await createLocalAudioTrack();
+      camera = await createLocalVideoTrack({ resolution: { width: 640, height: 360, frameRate: 15 }, videoEncoding: { maxBitrate: 500000, maxFramerate: 15 } });
+      await room.localParticipant.publishTrack(mic);
+      await room.localParticipant.publishTrack(camera, { simulcast: false, videoEncoding: { maxBitrate: 500000, maxFramerate: 15 } });
+      state.status = 'connected'; state.outboundVideo = await videoStats(); write();
+    },
+    async chat() {
+      try {
+        await room.localParticipant.publishData(new TextEncoder().encode('S0-E lk.chat permission probe'), { reliable: true, topic: 'lk.chat' });
+        state.dataAttempt = 'resolved';
+      } catch (error) { state.dataAttempt = `rejected:${String(error)}`; }
+      write();
+    },
+    async muteCycle() { await mic.mute(); await new Promise((ok) => setTimeout(ok, 1000)); await mic.unmute(); write(); },
+    async cameraCycle() {
+      await room.localParticipant.unpublishTrack(camera);
+      await new Promise((ok) => setTimeout(ok, 1000));
+      await room.localParticipant.publishTrack(camera, { simulcast: false, videoEncoding: { maxBitrate: 500000, maxFramerate: 15 } });
+      await new Promise((ok) => setTimeout(ok, 1000));
+      state.outboundVideo = await videoStats(); write();
+    },
+    leave() { mic?.stop(); camera?.stop(); room?.disconnect(); },
+  };
+  state.status = 'ready'; write();
+</script>
