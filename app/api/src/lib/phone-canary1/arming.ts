@@ -35,17 +35,35 @@
  */
 
 /**
- * `false` on `main`, always — INCLUDING while a canary window is open. The
- * activation artifact `canary1/arm` flips it and flips the pin test with it,
- * and is never merged; `scripts/check-main-disarmed.mjs` fails the default
- * branch if it ever is.
+ * **`true` HERE, AND ONLY HERE.** This file is on `canary1/arm`, the reviewed,
+ * CI-green **activation artifact that is NEVER MERGED**. It exists so the owner
+ * can run the Canary-1 CLI from an isolated worktree of this branch for the
+ * length of one supervised window, and for nothing else. Delete the branch when
+ * the window closes.
  *
- * Typed as `boolean` rather than inferred as the literal `false`, so the
- * arming check downstream is a real branch the compiler does not fold away —
- * an `if (false)` narrowed to `never` would delete the armed path from the
- * emitted program and make every test of it unreachable.
+ * On `main` this constant is the literal `false`, always — INCLUDING while a
+ * canary window is open — and `scripts/check-main-disarmed.mjs` fails the
+ * default branch if it is ever anything else. That gate lives on `main` and
+ * this branch never edits it, which is why flipping the in-suite pin (§9 of
+ * `phone-canary1-structural.test.ts`) alongside this line makes this branch's
+ * own pull request green without buying the branch any route onto `main`. A
+ * test the artifact can rewrite is not a gate against the artifact; the gate
+ * that is, does not travel here. There is no prepared revert, because nothing
+ * is merged to revert.
+ *
+ * **The pre-merge control is that this branch's pull request is a DRAFT.**
+ * GitHub refuses to merge a draft outright, and that is the only pre-merge
+ * control this repository actually holds: it has **no branch protection** and
+ * `quality` is **not** a required status check (observed), so a red check
+ * reports an accidental merge rather than preventing one. Never mark the pull
+ * request ready for review — there is nothing to review it into.
+ *
+ * Typed as `boolean` rather than inferred as the literal `true`, so the arming
+ * check downstream stays a real branch the compiler does not fold away — the
+ * annotation is load-bearing in both directions, and is what keeps arming and
+ * disarming a one-token change to this line.
  */
-export const CANARY1_ARMED: boolean = false;
+export const CANARY1_ARMED: boolean = true;
 
 /** The stable refusal code emitted when the constant is `false`. */
 export const CANARY1_NOT_ARMED = 'canary1_not_armed';
