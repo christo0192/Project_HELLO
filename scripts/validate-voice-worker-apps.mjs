@@ -293,7 +293,12 @@ export function checkR1DrainBudget({ killTimeout, drain, shutdown }) {
     problems.push("fly.toml R1_DRAIN_TIMEOUT_SEC and R1_SHUTDOWN_PROCESS_TIMEOUT_SEC must be whole seconds");
     return problems;
   }
-  const need = Number.parseInt(drain, 10) + 2 * Number.parseInt(shutdown, 10) + PHONE_DRAIN_BUDGET_MARGIN_SEC;
+  const d = Number.parseInt(drain, 10), s = Number.parseInt(shutdown, 10);
+  if (d < 30 || d > 60 || s < 30 || s > 90) {
+    problems.push("fly.toml R1 drain settings must be within worker bounds (drain 30..60, shutdown 30..90)");
+    return problems;
+  }
+  const need = d + 2 * s + PHONE_DRAIN_BUDGET_MARGIN_SEC;
   if (need > Number.parseInt(killTimeout, 10)) {
     problems.push(`fly.toml R1 drain budget exceeds kill_timeout: R1_DRAIN_TIMEOUT_SEC ${drain} + 2 x R1_SHUTDOWN_PROCESS_TIMEOUT_SEC ${shutdown} + ${PHONE_DRAIN_BUDGET_MARGIN_SEC} = ${need} > kill_timeout ${killTimeout}`);
   }

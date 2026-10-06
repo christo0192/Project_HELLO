@@ -178,7 +178,7 @@ def _bounded_float_env(name: str, default: float, lo: float, hi: float) -> float
     """Read a float env var and CLAMP it — a residency bound that an operator
     can set to zero (or to a week) is not a bound."""
     value = _float_env(name, default)
-    if value != value:  # NaN
+    if not math.isfinite(value):
         return default
     return lo if value < lo else hi if value > hi else value
 
@@ -2172,11 +2172,9 @@ def build_worker_options() -> WorkerOptions:
     # Do not add either key to the legacy browser/phone WorkerOptions shape.
     if os.getenv("R1_LANE_MODE") == "r1_only":
         if _worker_options_accepts("drain_timeout"):
-            options["drain_timeout"] = int(os.getenv("R1_DRAIN_TIMEOUT_SEC") or "60")
+            options["drain_timeout"] = int(_bounded_float_env("R1_DRAIN_TIMEOUT_SEC", 60.0, 30.0, 60.0))
         if _worker_options_accepts("shutdown_process_timeout"):
-            options["shutdown_process_timeout"] = int(
-                os.getenv("R1_SHUTDOWN_PROCESS_TIMEOUT_SEC") or "90"
-            )
+            options["shutdown_process_timeout"] = int(_bounded_float_env("R1_SHUTDOWN_PROCESS_TIMEOUT_SEC", 90.0, 30.0, 90.0))
     if browser_named:
         # The browser worker becomes NAMED + explicit-dispatch. Its prewarm
         # posts machine-level readiness (ready-before-dispatch). The API
