@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 DEFAULT_MODEL = "deepseek-flash"
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 TURN_DEADLINE_SEC = 12.0
+ALLOWED_MODELS = frozenset({DEFAULT_MODEL})
 
 
 class R1LLMConfigurationError(RuntimeError):
@@ -31,8 +32,19 @@ def r1_llm_config(environ: dict[str, str] | None = None) -> dict[str, Any]:
         model = environ.get("R1_LLM_MODEL") or DEFAULT_MODEL
         base_url = environ.get("R1_LLM_BASE_URL") or DEFAULT_BASE_URL
         api_key = environ.get("DEEPSEEK_API_KEY")
-    host = (urlparse(base_url).hostname or "").lower()
-    if host != "api.deepseek.com" or not model.startswith("deepseek"):
+    parsed = urlparse(base_url)
+    valid_url = (
+        parsed.scheme == "https"
+        and parsed.hostname == "api.deepseek.com"
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.port is None
+        and parsed.path in ("", "/v1")
+        and not parsed.params
+        and not parsed.query
+        and not parsed.fragment
+    )
+    if not valid_url or model not in ALLOWED_MODELS:
         raise R1LLMConfigurationError("r1_llm_not_deepseek")
     if not api_key:
         raise R1LLMConfigurationError("r1_llm_key_missing")

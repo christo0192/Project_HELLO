@@ -178,7 +178,7 @@ def _bounded_float_env(name: str, default: float, lo: float, hi: float) -> float
     """Read a float env var and CLAMP it — a residency bound that an operator
     can set to zero (or to a week) is not a bound."""
     value = _float_env(name, default)
-    if not math.isfinite(value):
+    if value != value:  # NaN
         return default
     return lo if value < lo else hi if value > hi else value
 
@@ -2168,9 +2168,9 @@ def build_worker_options() -> WorkerOptions:
     # byte-identical options, and this key is about the phone teardown budget.
     if _phone_agent_name() and _worker_options_accepts("shutdown_process_timeout"):
         options["shutdown_process_timeout"] = _phone_shutdown_process_timeout()
-    # R1's longer bounded finish runs only in the explicitly enabled R1 lane.
+    # R1's longer bounded finish runs only in the non-phone R1 deployment.
     # Do not add either key to the legacy browser/phone WorkerOptions shape.
-    if os.getenv("R1_LANE_MODE") == "r1_only":
+    if not _phone_agent_name() and os.getenv("R1_LANE_MODE") == "r1_only":
         if _worker_options_accepts("drain_timeout"):
             options["drain_timeout"] = int(_bounded_float_env("R1_DRAIN_TIMEOUT_SEC", 60.0, 30.0, 60.0))
         if _worker_options_accepts("shutdown_process_timeout"):
@@ -11958,9 +11958,27 @@ async def entrypoint(ctx: JobContext) -> None:
         await _run_phone_entrypoint(ctx, room_identity)
         return
 
+    # R1's marker is room metadata written only by the API room creator.  The
+    # mode gate and marker must agree: never fall a marked R1 room through to
+    # legacy, and never run R1 for an unmarked browser room.
+    from r1_routing import room_is_r1, routing_decision  # noqa: PLC0415
+
+    r1_decision = routing_decision(os.getenv("R1_LANE_MODE"), room_is_r1(room_metadata))
+    if r1_decision == "refuse":
+        _log.warning(
+            "r1_room_routing_refused",
+            room_name=room_identity,
+            r1_marked=room_is_r1(room_metadata),
+        )
+        close_room = getattr(ctx, "close_room", None)
+        if callable(close_room):
+            result = close_room()
+            if inspect.isawaitable(result):
+                await result
+        return
     # R1 is a separate browser-only lane. Keep this import after the phone
     # return: the phone worker must neither import nor initialise R1 code.
-    if os.getenv("R1_LANE_MODE") == "r1_only":
+    if r1_decision == "r1":
         import r1_session  # noqa: PLC0415 - deliberate phone isolation
         await r1_session.run_r1_session(ctx, started_at=started_at)
         return

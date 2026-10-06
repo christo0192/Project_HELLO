@@ -47,6 +47,7 @@ _ENV_KEYS = (
     "PHONE_AGENT_NAME", "BROWSER_AGENT_NAME", "WORKER_ORCHESTRATION",
     "PHONE_PER_MACHINE_AGENT_NAME", "FLY_MACHINE_ID",
     "PHONE_DRAIN_TIMEOUT_SEC", "PHONE_SHUTDOWN_PROCESS_TIMEOUT",
+    "R1_LANE_MODE", "R1_DRAIN_TIMEOUT_SEC", "R1_SHUTDOWN_PROCESS_TIMEOUT_SEC",
     *_JUDGE_ENV.keys(),
 )
 
@@ -87,6 +88,19 @@ _PHONE = {"PHONE_AGENT_NAME": "phone-screener", **_JUDGE_ENV}
 # ── C9-1: drain_timeout on the named phone worker only ─────────────────────
 
 class TestPhoneDrainTimeoutOption(unittest.TestCase):
+    def test_phone_options_are_identical_for_every_r1_mode(self):
+        """R1 drain knobs are browser-only, including garbage and disabled mode values."""
+        baseline = _build(_PHONE)
+        for mode in ("", "off", "r1_only", "garbage"):
+            with self.subTest(mode=mode):
+                candidate = _build({
+                    **_PHONE,
+                    "R1_LANE_MODE": mode,
+                    "R1_DRAIN_TIMEOUT_SEC": "30",
+                    "R1_SHUTDOWN_PROCESS_TIMEOUT_SEC": "30",
+                })
+                self.assertEqual(candidate, baseline)
+
     def test_named_phone_worker_sets_drain_timeout_90_as_int(self):
         options = _build(_PHONE)
         self.assertEqual(options["drain_timeout"], 90)

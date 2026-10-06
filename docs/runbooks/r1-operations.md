@@ -566,6 +566,16 @@ metric keys or weights differ from the rubric (see "Wrong scorecard").
 
 ## SFU operations and fallback
 
+## Room-routing contract
+
+R1 selection requires both `R1_LANE_MODE=r1_only` on the browser worker and
+the API-authored room metadata JSON marker `{"lane":"r1"}`. The marker is set
+only when API provisioning selects the R1 endpoint; browser clients cannot set
+room metadata. A marked room with mode `off` or an unknown mode is refused and
+closed. In `r1_only`, an unmarked room is likewise refused. Unmarked rooms
+with mode `off` or an unknown value retain the legacy browser path. Never use
+dispatch metadata as the authorization marker.
+
 Self-hosted operation is allowed only after S0-F passes. The R1 SFU is one
 Fly `sin` Machine, dedicated IPv4, LiveKit v1.13.7 digest, WSS 443, ICE/TCP
 7881, and UDP 7882. It has no Redis, Egress, SIP, Ingress, webhook, or

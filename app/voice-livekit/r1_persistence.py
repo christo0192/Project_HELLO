@@ -54,13 +54,15 @@ class R1TurnWriter:
 
     def __init__(
         self,
-        session_id: str,
+        session_id: str | None,
         room: str,
         *,
+        attempt_id: str | None = None,
         requester: Callable[..., dict[str, Any]] = _request_json,
     ) -> None:
         self.session_id = session_id
         self.room = room
+        self.attempt_id = attempt_id
         self._requester = requester
 
     async def save_turn(
@@ -77,6 +79,9 @@ class R1TurnWriter:
             return
 
         def write_turn() -> None:
+            if not self.session_id:
+                _LOG.warning("r1 transcript skipped: room has no session id")
+                return
             table = persistence._table("transcript_turns")
             if not table:
                 raise persistence.LifecycleError("r1_persistence_disabled")
@@ -97,6 +102,9 @@ class R1TurnWriter:
 
     async def usage_disconnect(self, seconds: float, *, participant_kind: str = "agent") -> None:
         """Write the R1 usage-ledger disconnect before terminal settlement."""
+        if not self.session_id:
+            _LOG.warning("r1 usage disconnect skipped: room has no session id")
+            return
         payload = {
             "room": self.room,
             "participant_kind": participant_kind,
@@ -109,6 +117,9 @@ class R1TurnWriter:
 
     async def terminal(self, outcome: str, duration_sec: int) -> Any:
         """Map every R1 outcome to a pre-existing state-compatible terminal reason."""
+        if not self.session_id:
+            _LOG.warning("r1 terminal skipped: room has no session id")
+            return None
         disposition = OUTCOME_DISPOSITIONS[outcome]
         if disposition.completed:
             return await persistence.complete_session(
@@ -124,7 +135,10 @@ class R1TurnWriter:
 
     async def attempt_outcome(self, outcome: str) -> None:
         """Best-effort PR-3 outcome write, intentionally after the durable terminal transition."""
-        payload = {"attempt_id": self.session_id, "outcome": outcome}
+        if not self.attempt_id:
+            _LOG.info("r1 attempt outcome skipped: no attempt id")
+            return
+        payload = {"attempt_id": self.attempt_id, "outcome": outcome}
         try:
             await asyncio.to_thread(
                 self._requester,

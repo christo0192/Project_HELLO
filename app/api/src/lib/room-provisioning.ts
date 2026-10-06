@@ -51,6 +51,9 @@ import {
 export const ROOM_EMPTY_TIMEOUT_SEC = 10 * 60;
 /** Candidate + agent + head-room. */
 export const ROOM_MAX_PARTICIPANTS = 4;
+/** Server-authored R1 marker; a worker refuses a marked room without its mode gate. */
+export const R1_ROOM_METADATA_LANE_KEY = 'lane';
+export const R1_ROOM_METADATA_LANE_VALUE = 'r1';
 
 export function requireLiveKitConfigured(): void {
   requireLiveKitEndpointConfigured(cloudLiveKitEndpoint());
@@ -66,12 +69,20 @@ export function roomNameForSession(sessionId: string): string {
  * phone, resume facts, JD/role focus, template, transcript/scoring context,
  * provider secrets, access tokens) are structurally absent.
  */
-export function buildMinimalRoomMetadata(sessionId: string, roomName: string): string {
-  return JSON.stringify({
+export function buildMinimalRoomMetadata(
+  sessionId: string,
+  roomName: string,
+  target: LiveKitEndpoint['target'] = 'cloud',
+): string {
+  const metadata = {
     session_id: sessionId,
     room_name: roomName,
     correlation_id: getCorrelationId() ?? undefined,
-  });
+    ...(target === 'r1'
+      ? { [R1_ROOM_METADATA_LANE_KEY]: R1_ROOM_METADATA_LANE_VALUE }
+      : {}),
+  };
+  return JSON.stringify(metadata);
 }
 
 export interface RoomServiceClientLike {
@@ -164,7 +175,7 @@ export async function provisionRoomForCreatedSession(
   requireLiveKitEndpointConfigured(endpoint);
 
   const roomName = roomNameForSession(sessionId);
-  const metadata = buildMinimalRoomMetadata(sessionId, roomName);
+  const metadata = buildMinimalRoomMetadata(sessionId, roomName, endpoint.target);
   const rooms = deps.rooms ?? roomClient(endpoint);
   const db = deps.db ?? supabase;
   const startRecording = deps.startRecording ?? startAuthoritativeRecording;

@@ -16,11 +16,14 @@ if str(HERE) not in sys.path:
 
 try:
     from livekit import rtc
-    from livekit.agents import Agent, AgentSession, JobContext, StopResponse
+    from livekit.agents import APIConnectOptions, Agent, AgentSession, JobContext, StopResponse
+    from livekit.agents.voice.agent_session import SessionConnectOptions
+    from livekit.agents.voice.events import ErrorEvent
     from livekit.agents.voice.room_io import RoomOptions
 except ImportError:
     rtc = None
-    Agent = AgentSession = JobContext = StopResponse = RoomOptions = None
+    APIConnectOptions = Agent = AgentSession = ErrorEvent = JobContext = None
+    SessionConnectOptions = StopResponse = RoomOptions = None
 
 
 @unittest.skipUnless(AgentSession is not None, "livekit-agents is not installed (bare CI)")
@@ -32,6 +35,7 @@ class TestR1SdkContract(unittest.TestCase):
         self.assertIn("room_options", start)
         self.assertIn("record", start)
         self.assertIn("user_away_timeout", inspect.signature(AgentSession).parameters)
+        self.assertIn("conn_options", inspect.signature(AgentSession).parameters)
         self.assertIn("allow_interruptions", inspect.signature(AgentSession.say).parameters)
         self.assertIn("user_input", inspect.signature(AgentSession.generate_reply).parameters)
         self.assertIn("force", inspect.signature(AgentSession.interrupt).parameters)
@@ -41,6 +45,8 @@ class TestR1SdkContract(unittest.TestCase):
             "user_input_transcribed",
             "user_state_changed",
             "agent_state_changed",
+            "conversation_item_added",
+            "error",
             "close",
         ):
             self.assertIn(event_name, source)
@@ -73,3 +79,18 @@ class TestR1SdkContract(unittest.TestCase):
         options = RoomOptions(text_input=False, close_on_disconnect=False)
         self.assertFalse(options.text_input)
         self.assertFalse(options.close_on_disconnect)
+
+    def test_r1_connection_and_error_contracts_exist(self) -> None:
+        """Pin retry construction and ErrorEvent's nested provider-error shape."""
+        api_options = APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=10.0)
+        session_options = SessionConnectOptions(llm_conn_options=api_options)
+        self.assertEqual(session_options.llm_conn_options, api_options)
+        self.assertIn("error", ErrorEvent.model_fields)
+        self.assertIn("source", ErrorEvent.model_fields)
+
+    def test_room_metadata_and_local_attributes_contracts_exist(self) -> None:
+        """Pin the room metadata property and lower-level participant attributes API."""
+        self.assertIsInstance(inspect.getattr_static(rtc.Room, "metadata"), property)
+        self.assertTrue(callable(getattr(rtc.LocalParticipant, "set_attributes")))
+        attributes = inspect.signature(rtc.LocalParticipant.set_attributes).parameters
+        self.assertIn("attributes", attributes)

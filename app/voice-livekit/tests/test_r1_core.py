@@ -21,6 +21,7 @@ if str(HERE) not in sys.path:
 import r1_context
 import r1_llm
 import r1_persistence
+import r1_routing
 import r1_session
 from r1_lines import INTERVIEWER_NAME, line, safe_first_name
 from r1_persistence import OUTCOME_DISPOSITIONS, R1TurnWriter
@@ -131,6 +132,12 @@ class FakeRoom(Emitter):
         super().__init__()
         self.name = "screening-00000000-0000-0000-0000-000000000000"
         self.remote_participants: dict[str, FakeParticipant] = {}
+        self.local_participant = type("LocalParticipant", (), {"attributes": []})()
+
+        async def set_attributes(attributes):
+            self.local_participant.attributes.append(attributes)
+
+        self.local_participant.set_attributes = set_attributes
 
 
 class FakeContext:
@@ -220,6 +227,22 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         self.assertEqual(NORMAL_PATH_MAX_SEC, 22 * 60 + 27)
         self.assertEqual(MAX_AGENT_RESIDENCY_SEC, 27 * 60 + 45)
 
+    def test_manual_clock_exposes_hard_phase_budgets(self) -> None:
+        clock = Clock()
+        machine = R1PhaseMachine(clock)
+        machine.transition(R1Phase.OPENING)
+        machine.transition(R1Phase.ICEBREAKER)
+        clock.advance(270)
+        self.assertEqual(machine.remaining_icebreaker_seconds(), 0)
+        machine.transition(R1Phase.TRANSITION)
+        machine.transition(R1Phase.ROLEPLAY)
+        clock.advance(840)
+        self.assertEqual(machine.remaining_roleplay_seconds(), 0)
+        machine.transition(R1Phase.ROLEPLAY_EXIT)
+        machine.transition(R1Phase.WRAPUP)
+        clock.advance(120)
+        self.assertEqual(machine.remaining_wrapup_seconds(), 0)
+
     def test_duration_readers_reject_invalid_environment_values(self) -> None:
         prior = dict(os.environ)
         try:
@@ -243,6 +266,28 @@ class TestPhaseAndConfiguration(unittest.TestCase):
             r1_llm.r1_llm_config({"DEEPSEEK_API_KEY": "x"})["reasoning_effort"],
             "none",
         )
+        for base_url in (
+            "http://api.deepseek.com",
+            "https://api.deepseek.com:443/v1",
+            "https://user@api.deepseek.com/v1",
+            "https://api.deepseek.com/v1?x=1",
+        ):
+            with self.assertRaises(r1_llm.R1LLMConfigurationError):
+                r1_llm.r1_llm_config({"DEEPSEEK_API_KEY": "x", "R1_LLM_BASE_URL": base_url})
+        with self.assertRaises(r1_llm.R1LLMConfigurationError):
+            r1_llm.r1_llm_config({"DEEPSEEK_API_KEY": "x", "R1_LLM_MODEL": "deepseek-v4"})
+
+    def test_r1_routing_requires_mode_and_server_marker(self) -> None:
+        marked = '{"lane":"r1"}'
+        self.assertTrue(r1_routing.room_is_r1(marked))
+        self.assertFalse(r1_routing.room_is_r1('{"lane":"R1"}'))
+        self.assertFalse(r1_routing.room_is_r1("not-json"))
+        self.assertEqual(r1_routing.routing_decision("r1_only", True), "r1")
+        self.assertEqual(r1_routing.routing_decision("r1_only", False), "refuse")
+        self.assertEqual(r1_routing.routing_decision("off", True), "refuse")
+        self.assertEqual(r1_routing.routing_decision("garbage", True), "refuse")
+        self.assertEqual(r1_routing.routing_decision("off", False), "legacy")
+        self.assertEqual(r1_routing.routing_decision("garbage", False), "legacy")
 
     def test_terminal_mapping_uses_only_existing_terminal_reason_sets(self) -> None:
         # Source: app/api/src/lib/session-lifecycle.ts:60-93 and migration 0006 CHECK.
@@ -349,6 +394,12 @@ class TestCandidateAndStopEvents(R1TestCase):
         self.session.emit("close", event)
         self.assertEqual(await self.interview._handle_attention(), "provider_error")
 
+    async def test_nested_provider_402_aborts_from_error_event(self) -> None:
+        api_error = type("APIError", (), {"status_code": 402})()
+        llm_error = type("LLMError", (), {"error": api_error})()
+        self.session.emit("error", type("ErrorEvent", (), {"error": llm_error})())
+        self.assertEqual(await self.interview._handle_attention(), "provider_error")
+
     async def test_speaking_resets_consecutive_generation_failures(self) -> None:
         self.interview._record_generation_failure()
         self.interview._record_generation_failure()
@@ -374,6 +425,7 @@ class TestExitInvariant(R1TestCase):
         await self.interview._exit("provider_error")
         self.assertEqual(self.order, ["recording", "ledger", "terminal", "outcome"])
         self.assertEqual(self.ctx.closed, 1)
+        self.assertEqual(self.ctx.room.local_participant.attributes, [{"phase": "ended"}])
 
     async def test_cancellation_mid_roleplay_runs_exit_once(self) -> None:
         # Skip the bounded icebreaker clock so the real driver enters its
@@ -484,6 +536,28 @@ class TestExitInvariant(R1TestCase):
     async def test_await_turn_reports_real_silence(self) -> None:
         self.assertEqual(await self.interview._await_turn(0.01), (SILENCE, None))
 
+    async def test_transition_ready_matching_and_pickup_are_driver_owned(self) -> None:
+        self.assertFalse(self.interview.is_ready("I am already prepared"))
+        self.assertTrue(self.interview.is_ready("yes"))
+        self.assertTrue(self.interview.is_ready("go ahead"))
+        await self.interview._speak_pickup_once()
+        await self.interview._speak_pickup_once()
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-PICKUP")), 1)
+
+    async def test_rp2_enters_aside_and_stays_there_on_terminal_silence(self) -> None:
+        self.enter_roleplay()
+        outcome = await self.interview._silence_ladder([("L-SIL-RP2", 0.01)])
+        self.assertEqual(outcome, "candidate_left")
+        self.assertIs(self.interview.machine.phase, R1Phase.ASIDE)
+
+    async def test_delivered_bot_and_candidate_turns_share_monotonic_indices(self) -> None:
+        await self.interview.say("L-SIL-IB")
+        await self.interview._persist_turn("I am here")
+        await self.interview.say("L-TRANSITION-NUDGE")
+        self.assertEqual([turn[0] for turn in self.interview.writer.saved], [1, 2, 3])
+        speakers = [turn[1] for turn in self.interview.writer.saved]
+        self.assertEqual(speakers, ["bot", "candidate", "bot"])
+
     async def test_cancellation_before_join_stays_a_cancellation(self) -> None:
         context = FakeContext()
         interview = R1Interview(
@@ -550,7 +624,9 @@ class TestPhoneIsolation(unittest.TestCase):
 
     def test_r1_worker_drain_values_are_bounded_without_changing_phone_options(self) -> None:
         source = (HERE / "agent.py").read_text(encoding="utf-8")
-        r1_branch = source.index('if os.getenv("R1_LANE_MODE") == "r1_only":')
+        r1_branch = source.index(
+            'if not _phone_agent_name() and os.getenv("R1_LANE_MODE") == "r1_only":'
+        )
         browser_name_branch = source.index("if browser_named:", r1_branch)
         r1_options = source[r1_branch:browser_name_branch]
         self.assertIn('_bounded_float_env("R1_DRAIN_TIMEOUT_SEC", 60.0, 30.0, 60.0)', r1_options)

@@ -31,6 +31,7 @@ LINES = {
         "pause the role-play here.' When you're ready, just say 'ready' and she'll pick up."
     ),
     "L-PICKUP": "Hello? Yes, this is Meera speaking.",
+    "L-TRANSITION-NUDGE": "Whenever you're ready, just say ready.",
     "L-TIME-CUE": "Just so you know, I've only got a couple of minutes before my next call.",
     "L-EXIT": (
         "Let's pause the role-play here. I'm stepping out of the learner's role now; this "

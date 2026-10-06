@@ -11,6 +11,7 @@ import inspect
 import logging
 import math
 import os
+import re
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -23,6 +24,14 @@ R1_RECORD = False
 NO_SHOW_SECONDS = 120.0
 TURN_DEADLINE_SECONDS = 12.0
 EXIT_TOTAL_SECONDS = 90.0
+TRANSITION_DEADLINE_SECONDS = 20.0
+_SESSION_ID_FROM_ROOM = re.compile(
+    r"^screening-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+    re.IGNORECASE,
+)
+_READY_RE = re.compile(r"\bready\b", re.IGNORECASE)
+# These are intentionally narrow equivalents of an explicit ready response.
+_READY_ALLOWLIST = {"let's start", "lets start", "go ahead", "yes"}
 
 # Results of ``R1Interview._await_turn``.
 TURN = "turn"
@@ -55,6 +64,12 @@ def rejoin_grace_seconds() -> float:
 def _room_name(ctx: Any) -> str:
     room = getattr(ctx, "room", None)
     return str(getattr(room, "name", "") or getattr(getattr(ctx, "job", None), "room", ""))
+
+
+def session_id_from_room_name(room: str) -> str | None:
+    """Derive the only accepted session identifier from a server-created room name."""
+    match = _SESSION_ID_FROM_ROOM.fullmatch(room)
+    return match.group(1) if match else None
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -116,15 +131,12 @@ class R1Agent(Agent):
         await self.interview.say("L-OPEN")
 
     async def on_user_turn_completed(self, turn_ctx: Any, new_message: Any) -> None:
-        """Consume deterministic READY so the LLM cannot invent the role-play pickup."""
+        """Keep the transition driver-owned; no LLM reply may race its pickup."""
         text = str(getattr(new_message, "text_content", "") or "").strip()
         add_message = getattr(turn_ctx, "add_message", None)
         if callable(add_message):
             add_message(role="system", content="R1 per-turn phase reminder placeholder.")
-        scripted = self.interview.take_scripted_line(text)
-        if scripted is not None:
-            await self.interview.say(scripted)
-            self.interview.mark_scripted(scripted)
+        if self.interview.machine.phase is R1Phase.TRANSITION:
             raise StopResponse()
 
     def llm_node(self, chat_ctx: Any, tools: list[Any], model_settings: Any) -> Any:
@@ -138,7 +150,8 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
     Browser sessions pass neither VAD nor turn detection, so R1 does the same.
     Adding either here would make browser R1 turn taking silently diverge.
     """
-    from livekit.agents import AgentSession
+    from livekit.agents import APIConnectOptions, AgentSession
+    from livekit.agents.voice.agent_session import SessionConnectOptions
     from livekit.plugins import sarvam
     from r1_llm import build_r1_llm
 
@@ -154,7 +167,14 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
             temperature=0.8,
         ),
         llm=build_r1_llm(),
-        user_away_timeout=15.0,
+        conn_options=SessionConnectOptions(
+            llm_conn_options=APIConnectOptions(
+                max_retry=1,
+                retry_interval=0.5,
+                timeout=10.0,
+            )
+        ),
+        user_away_timeout=None,
     )
 
 
@@ -197,11 +217,15 @@ class R1Interview:
         self._mute_announced = False
         self._reply_active = False
         self._pickup_spoken = False
+        self._transition_nudged = False
         self._failures = 0
         self._turn_index = 0
         self._closed = False
         self._exited = False
-        self._watchdogs: set[asyncio.Task[Any]] = set()
+        self._watchdogs: dict[int, asyncio.Task[Any]] = {}
+        self._generation_id = 0
+        self._active_generation_id: int | None = None
+        self._bot_writes: set[asyncio.Task[Any]] = set()
         self._residency_handle: asyncio.TimerHandle | None = None
 
     def _context_candidate_identity(self) -> str | None:
@@ -217,6 +241,13 @@ class R1Interview:
         if self._closed:
             return
         self._closed = True
+        local_participant = getattr(getattr(self.ctx, "room", None), "local_participant", None)
+        set_attributes = getattr(local_participant, "set_attributes", None)
+        if callable(set_attributes):
+            try:
+                await asyncio.wait_for(_maybe_await(set_attributes({"phase": "ended"})), 5.0)
+            except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+                _LOG.warning("r1 phase-ended attribute failed: %s", type(exc).__name__)
         close_room = getattr(self.ctx, "close_room", None)
         if callable(close_room):
             await _maybe_await(close_room())
@@ -286,6 +317,7 @@ class R1Interview:
         wait_for_playout = getattr(handle, "wait_for_playout", None)
         if callable(wait_for_playout):
             await _maybe_await(wait_for_playout())
+        await self._persist_bot_turn(text)
 
     async def say(self, line_id: str, *, interruptible: bool = False) -> None:
         """Speak one reviewed R1 line; callers choose whether it may be interrupted."""
@@ -295,27 +327,43 @@ class R1Interview:
             marker=line_id,
         )
 
+    async def _persist_bot_turn(self, text: str) -> None:
+        """Persist exactly each delivered scripted turn in the shared transcript order."""
+        if not text.strip():
+            return
+        self._turn_index += 1
+        await self.writer.save_turn(
+            self._turn_index,
+            "bot",
+            text,
+            self.machine.phase.value,
+            interrupted=False,
+        )
+
     def note_turn(self, text: str) -> None:
         """Queue a final candidate transcript for the deterministic phase driver."""
         if text:
             self._turns.put_nowait(text)
 
-    def take_scripted_line(self, text: str) -> str | None:
-        """Recognise only the deterministic READY response during transition."""
-        if self.machine.phase is R1Phase.TRANSITION and "ready" in text.lower():
-            return "L-PICKUP"
-        return None
+    @staticmethod
+    def is_ready(text: str) -> bool:
+        """Accept a deliberate READY, not a substring such as ``already`` or ``unready``."""
+        normalized = " ".join(text.lower().split())
+        return bool(_READY_RE.search(normalized)) or normalized in _READY_ALLOWLIST
 
-    def mark_scripted(self, line_id: str) -> None:
-        """Record a one-shot scripted move so the driver never repeats it."""
-        if line_id == "L-PICKUP":
-            self._pickup_spoken = True
+    async def _speak_pickup_once(self) -> None:
+        """Claim the pickup before scheduling speech so only the driver can deliver it once."""
+        if self._pickup_spoken:
+            return
+        self._pickup_spoken = True
+        await self.say("L-PICKUP")
 
     async def guard_llm_stream(self, stream: Any) -> AsyncIterator[Any]:
         """Abort generation after 12 seconds even if DeepSeek sends SSE keepalives."""
         from r1_llm import assert_thinking_disabled
 
-        self._reply_active = True
+        generation_id = self._active_generation_id
+        self._reply_active = generation_id is not None
         try:
             async with asyncio.timeout(TURN_DEADLINE_SECONDS):
                 async for item in stream:
@@ -325,8 +373,10 @@ class R1Interview:
                     yield item
         except TimeoutError:
             await self._interrupt_session()
-            self._record_generation_failure()
+            self._record_generation_failure(generation_id)
             raise
+        finally:
+            self._cancel_watchdog(generation_id)
 
     async def _interrupt_session(self) -> None:
         interrupt = getattr(self.session, "interrupt", None)
@@ -336,39 +386,69 @@ class R1Interview:
             except Exception as exc:  # noqa: BLE001
                 _LOG.warning("r1 generation interrupt failed: %s", type(exc).__name__)
 
-    def _record_generation_failure(self) -> None:
+    def _record_generation_failure(self, generation_id: int | None = None) -> None:
+        """Count only the generation which owns the currently active watchdog."""
+        if generation_id is not None and generation_id != self._active_generation_id:
+            return
         self._reply_active = False
+        self._cancel_watchdog(generation_id)
         self._failures += 1
         self._attention.set()
 
     def _start_watchdog(self) -> None:
-        """Start the 4-second filler / 12-second abort watchdog for an active reply."""
+        """Start a uniquely-owned 4/12-second watchdog for one generation."""
+        self._generation_id += 1
+        generation_id = self._generation_id
+        self._active_generation_id = generation_id
         self._reply_active = True
-        task = asyncio.create_task(self._watch_turn())
-        self._watchdogs.add(task)
-        task.add_done_callback(self._watchdogs.discard)
+        task = asyncio.create_task(self._watch_turn(generation_id))
+        self._watchdogs[generation_id] = task
+        task.add_done_callback(lambda completed: self._watchdogs.pop(generation_id, None))
 
-    async def _watch_turn(self) -> None:
+    def _cancel_watchdog(self, generation_id: int | None = None) -> None:
+        """Cancel only the matching generation watchdog; stale tasks may not affect a new turn."""
+        if generation_id is None:
+            generation_id = self._active_generation_id
+        if generation_id is None:
+            return
+        task = self._watchdogs.pop(generation_id, None)
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+        if generation_id == self._active_generation_id:
+            self._active_generation_id = None
+
+    async def _watch_turn(self, generation_id: int | None = None) -> None:
         """Speak a filler only before a reply begins, then interrupt a 12-second overrun."""
+        if generation_id is None:
+            generation_id = self._active_generation_id
+        if generation_id is None:
+            # Direct unit seams may exercise the watchdog without a transcript.
+            generation_id = 0
+            self._active_generation_id = generation_id
         await asyncio.sleep(4.0)
-        if self._reply_active and self._candidate_present:
+        if (
+            generation_id == self._active_generation_id
+            and self._reply_active
+            and self._candidate_present
+        ):
             # Re-check immediately before speech: a reply may have begun as this timer woke.
-            if self._reply_active:
+            if generation_id == self._active_generation_id and self._reply_active:
                 try:
                     await self.say("L-FILLER", interruptible=True)
                 except Exception as exc:  # noqa: BLE001
                     _LOG.warning("r1 filler failed: %s", type(exc).__name__)
         await asyncio.sleep(8.0)
-        if self._reply_active:
+        if generation_id == self._active_generation_id and self._reply_active:
             await self._interrupt_session()
-            self._record_generation_failure()
+            self._record_generation_failure(generation_id)
 
     def wire_events(self) -> None:
         """Attach named handlers; an AgentSession close is not a worker drain signal."""
         session_on = getattr(self.session, "on", None)
         if callable(session_on):
             session_on("user_input_transcribed", self._on_user_input_transcribed)
-            session_on("user_state_changed", self._on_user_state_changed)
+            session_on("conversation_item_added", self._on_conversation_item_added)
+            session_on("error", self._on_provider_error)
             # AgentSession 1.6.4 exposes fatal provider errors on its ``close``
             # event.  This is deliberately not a drain signal: our own exit
             # must not re-enter the phase machine when the SDK closes.
@@ -389,18 +469,38 @@ class R1Interview:
             self.note_turn(str(getattr(event, "transcript", "")))
             self._start_watchdog()
 
-    def _on_user_state_changed(self, event: Any) -> None:
-        if getattr(event, "new_state", None) == "away":
-            self._turns.put_nowait("")
+    def _on_conversation_item_added(self, event: Any) -> None:
+        """Persist delivered LLM assistant items; scripted speech is persisted by ``say``."""
+        item = getattr(event, "item", event)
+        role = str(getattr(item, "role", "")).lower()
+        text = str(getattr(item, "text_content", "") or getattr(item, "content", "") or "")
+        if role not in {"assistant", "ChatRole.ASSISTANT".lower()} or not text.strip():
+            return
+        task = asyncio.create_task(self._persist_bot_turn(text))
+        self._bot_writes.add(task)
+        task.add_done_callback(self._bot_writes.discard)
 
     def _on_agent_state_changed(self, event: Any) -> None:
         if getattr(event, "new_state", None) == "speaking":
             self._reply_active = False
+            self._cancel_watchdog()
             self._failures = 0
 
+    @staticmethod
+    def _provider_status(value: Any) -> int | None:
+        """Unwrap 1.6.4 ErrorEvent → LLMError/STTError/TTSError → API error status."""
+        seen: set[int] = set()
+        current = value
+        while current is not None and id(current) not in seen:
+            seen.add(id(current))
+            status = getattr(current, "status_code", getattr(current, "status", None))
+            if isinstance(status, int):
+                return status
+            current = getattr(current, "error", None)
+        return None
+
     def _on_provider_error(self, event: Any) -> None:
-        error = getattr(event, "error", event)
-        status = getattr(error, "status_code", getattr(error, "status", None))
+        status = self._provider_status(event)
         if status in (401, 402):
             self._provider_abort = True
         else:
@@ -446,11 +546,20 @@ class R1Interview:
     def _on_track_muted(self, participant: Any, publication: Any) -> None:
         if _is_candidate_microphone(participant, publication, self._candidate_identity):
             self._muted = True
+            # Enter ASIDE synchronously so the role-play clock pauses at the
+            # room event, not after a scheduling delay before the spoken aside.
+            if self.machine.phase is R1Phase.ROLEPLAY:
+                self._mute_resume_phase = R1Phase.ROLEPLAY
+                self.machine.transition(R1Phase.ASIDE)
             self._attention.set()
 
     def _on_track_unmuted(self, participant: Any, publication: Any) -> None:
         if _is_candidate_microphone(participant, publication, self._candidate_identity):
             self._muted = False
+            # Mute asides resume on unmute; silence-RP2's separate ASIDE state
+            # has no ``_mute_resume_phase`` and therefore remains paused.
+            if self._mute_announced:
+                self._restore_after_unmute()
             self._attention.set()
 
     def _seed_candidate_from_room(self) -> None:
@@ -475,8 +584,7 @@ class R1Interview:
     ) -> tuple[str, str | None]:
         """Wait for one queued transcript or an attention signal.
 
-        Returns ``("turn", text)``, ``("away", None)`` when the SDK marked the
-        user away, ``("attention", None)`` or ``("timeout", None)``. A transcript
+        Returns ``("turn", text)``, ``("attention", None)`` or ``("timeout", None)``. A transcript
         that lands in the same tick as an attention signal wins, and the
         attention event stays set for the next wait, so neither is lost.
         """
@@ -493,7 +601,7 @@ class R1Interview:
             await asyncio.gather(*pending, return_exceptions=True)
         if turn_task in done:
             text = turn_task.result()
-            return ("turn", text) if text else ("away", None)
+            return ("turn", text)
         if attention_task in done:
             self._attention.clear()
             return ("attention", None)
@@ -524,7 +632,7 @@ class R1Interview:
         Returns one of:
         - ``(TURN, text)``: a final transcript, already persisted;
         - ``(SILENCE, None)``: ``timeout`` seconds passed without speech, or the
-          SDK reported the user away;
+          driver's explicit deadline elapsed without speech;
         - ``(STOP, outcome)``: drain, deadline, provider abort, or a departure
           that outlived the rejoin grace.
 
@@ -554,7 +662,7 @@ class R1Interview:
             if kind == "turn" and text:
                 await self._persist_turn(text)
                 return (TURN, text)
-            if kind == "away" or (kind == "timeout" and not self._muted):
+            if kind == "timeout" and not self._muted:
                 return (SILENCE, None)
             # "attention": loop, so _needs_attention() resolves it. A non-terminal
             # generation failure also lands here and simply keeps waiting.
@@ -633,18 +741,42 @@ class R1Interview:
         fires, or ``candidate_left`` once the final L-SIL-END has been spoken.
         """
         for line_id, wait_seconds in prompts:
+            if self.machine.phase is R1Phase.ICEBREAKER:
+                wait_seconds = min(wait_seconds, self.machine.remaining_icebreaker_seconds())
+            elif self.machine.phase is R1Phase.ROLEPLAY:
+                wait_seconds = min(wait_seconds, self.machine.remaining_roleplay_seconds())
+            if wait_seconds <= 0:
+                return "phase_deadline"
+            if line_id == "L-SIL-RP2" and self.machine.phase is R1Phase.ROLEPLAY:
+                # The interviewer speaks this aside, so role-play time pauses before it.
+                self.machine.transition(R1Phase.ASIDE)
             await self.say(line_id)
             kind, value = await self._await_turn(wait_seconds)
             if kind == TURN:
+                if self.machine.phase is R1Phase.ASIDE:
+                    self.machine.transition(R1Phase.ROLEPLAY)
                 return None
             if kind == STOP:
                 return value
+            if (
+                self.machine.phase is R1Phase.ICEBREAKER
+                and self.machine.remaining_icebreaker_seconds() <= 0
+            ):
+                return "phase_deadline"
+            if (
+                self.machine.phase is R1Phase.ROLEPLAY
+                and self.machine.remaining_roleplay_seconds() <= 0
+            ):
+                return "phase_deadline"
         await self.say("L-SIL-END")
         return "candidate_left"
 
     async def _roleplay_turn(self) -> str | None:
         """Wait for one role-play turn; return a terminal outcome, or None to continue."""
-        kind, value = await self._await_turn(20.0)
+        remaining = self.machine.remaining_roleplay_seconds()
+        if remaining <= 0:
+            return "phase_deadline"
+        kind, value = await self._await_turn(min(20.0, remaining))
         if kind == STOP:
             return value
         if kind == SILENCE:
@@ -703,9 +835,14 @@ class R1Interview:
             await self._start()
             self.machine.transition(R1Phase.ICEBREAKER)
             while not self.machine.icebreaker_should_end():
-                kind, value = await self._await_turn(30.0)
+                remaining = self.machine.remaining_icebreaker_seconds()
+                if remaining <= 0:
+                    break
+                kind, value = await self._await_turn(min(30.0, remaining))
                 if kind == SILENCE:
                     value = await self._silence_ladder([("L-SIL-IB", 20.0)])
+                    if value == "phase_deadline":
+                        break
                     kind = STOP if value is not None else TURN
                 if kind == STOP:
                     outcome = await self._finish(value, system=value != "candidate_left")
@@ -713,15 +850,29 @@ class R1Interview:
                 self.machine.candidate_turns += 1
             self.machine.transition(R1Phase.TRANSITION)
             await self.say("L-TRANSITION")
-            kind, value = await self._await_turn(20.0)
-            if kind == STOP:
-                outcome = await self._finish(value, system=value != "candidate_left")
-                return outcome
-            if not self._pickup_spoken and self._candidate_present:
-                await self.say("L-PICKUP")
+            transition_deadline = asyncio.get_running_loop().time() + TRANSITION_DEADLINE_SECONDS
+            while True:
+                remaining = transition_deadline - asyncio.get_running_loop().time()
+                if remaining <= 0:
+                    break
+                kind, value = await self._await_turn(remaining)
+                if kind == STOP:
+                    outcome = await self._finish(value, system=value != "candidate_left")
+                    return outcome
+                if kind == SILENCE:
+                    break
+                if self.is_ready(value or ""):
+                    break
+                if not self._transition_nudged:
+                    self._transition_nudged = True
+                    await self.say("L-TRANSITION-NUDGE")
+            if self._candidate_present:
+                await self._speak_pickup_once()
             self.machine.transition(R1Phase.ROLEPLAY)
             while not self.machine.roleplay_should_end():
                 stop = await self._roleplay_turn()
+                if stop == "phase_deadline":
+                    break
                 if stop is not None:
                     outcome = await self._finish(stop, system=stop != "candidate_left")
                     return outcome
@@ -729,14 +880,20 @@ class R1Interview:
             await self.say("L-EXIT")
             self.machine.transition(R1Phase.WRAPUP)
             await self.say("L-WRAP")
-            kind, value = await self._await_turn(20.0)
+            remaining = self.machine.remaining_wrapup_seconds()
+            if remaining:
+                kind, value = await self._await_turn(min(20.0, remaining))
+            else:
+                kind, value = SILENCE, None
             if kind == STOP:
                 outcome = await self._finish(value, system=value != "candidate_left")
                 return outcome
             outcome = await self._finish("complete")
             return outcome
         except asyncio.CancelledError:
-            outcome = "shutdown_forced" if self._draining else "provider_error"
+            # Agents 1.6.4 cancels the entrypoint before its shutdown callbacks.
+            # The callback is only an early wake-up; cancellation itself is shutdown.
+            outcome = "shutdown_forced"
             await self._finish(outcome, system=True)
             raise
         except Exception as exc:  # noqa: BLE001
@@ -745,9 +902,10 @@ class R1Interview:
             return outcome
         finally:
             self._cancel_residency_deadline()
-            for watchdog in self._watchdogs:
+            for watchdog in self._watchdogs.values():
                 watchdog.cancel()
-            await asyncio.gather(*self._watchdogs, return_exceptions=True)
+            await asyncio.gather(*self._watchdogs.values(), return_exceptions=True)
+            await asyncio.gather(*self._bot_writes, return_exceptions=True)
             try:
                 await asyncio.wait_for(asyncio.shield(self._exit(outcome)), EXIT_TOTAL_SECONDS)
             except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
@@ -769,16 +927,35 @@ async def run_r1_session(
 ) -> str:
     """Resolve R1-only context and run one session without importing phone-lane helpers."""
     del started_at
-    if callable(getattr(ctx, "connect", None)):
-        await _maybe_await(ctx.connect())
     room = _room_name(ctx)
+    session_id = session_id_from_room_name(room)
+    writer = R1TurnWriter(session_id, room)
+
+    async def settle_without_context(outcome: str) -> None:
+        """Use the exit funnel even when connect or context resolution cannot start a session."""
+        interview = R1Interview(ctx, {}, _NoopSession(), writer)
+        await interview._exit(outcome)
+
+    try:
+        if callable(getattr(ctx, "connect", None)):
+            await _maybe_await(ctx.connect())
+    except asyncio.CancelledError:
+        await settle_without_context("shutdown_forced")
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning("r1 connect failed: %s", type(exc).__name__)
+        await settle_without_context("provider_error")
+        return "provider_error"
     try:
         context = await fetch_context(room)
-    except R1ContextError:
-        if callable(getattr(ctx, "close_room", None)):
-            await _maybe_await(ctx.close_room())
+    except asyncio.CancelledError:
+        await settle_without_context("shutdown_forced")
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _LOG.warning("r1 context fetch failed: %s", type(exc).__name__)
+        await settle_without_context("context_failed")
         return "context_failed"
-    writer = R1TurnWriter(str(context["attempt_id"]), room)
+    writer = R1TurnWriter(session_id, room, attempt_id=str(context.get("attempt_id") or "") or None)
     try:
         session = await _maybe_await(session_factory(ctx, context))
     except Exception as exc:  # noqa: BLE001

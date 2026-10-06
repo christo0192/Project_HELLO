@@ -109,6 +109,7 @@ class R1PhaseMachine:
         self._roleplay_paused_at: float | None = None
         self._roleplay_pause_total = 0.0
         self._resume_phase: R1Phase | None = None
+        self._phase_entered: dict[R1Phase, float] = {R1Phase.PRE_JOIN: self.started_at}
         self.candidate_turns = 0
 
     def transition(self, target: R1Phase) -> None:
@@ -126,6 +127,8 @@ class R1PhaseMachine:
             self._roleplay_paused_at = None
             self._resume_phase = None
         self.phase = target
+        self._phase_entered.setdefault(target, now)
+        self._phase_entered[target] = now
         if target is R1Phase.ROLEPLAY and self._roleplay_started is None:
             self._roleplay_started = now
         if target is R1Phase.ROLEPLAY and self._roleplay_paused_at is not None:
@@ -176,6 +179,23 @@ class R1PhaseMachine:
         return self.session_elapsed >= 270 or (
             self.session_elapsed >= 210 and self.candidate_turns >= 4
         )
+
+    def remaining_icebreaker_seconds(self) -> float:
+        """Return the hard icebreaker budget; driver waits may never exceed it."""
+        return max(0.0, 270.0 - self.session_elapsed)
+
+    def remaining_roleplay_seconds(self) -> float:
+        """Return the active role-play budget, excluding deliberate pause states."""
+        return max(0.0, 840.0 - self.roleplay_elapsed)
+
+    def remaining_wrapup_seconds(self) -> float:
+        """Return wrap-up's fixed hard budget from its phase entry."""
+        return max(0.0, 120.0 - self.phase_elapsed(R1Phase.WRAPUP))
+
+    def phase_elapsed(self, phase: R1Phase) -> float:
+        """Return elapsed wall time in the current phase, or zero before entry."""
+        entered = getattr(self, "_phase_entered", {}).get(phase)
+        return 0.0 if entered is None else max(0.0, self._clock() - entered)
 
     def roleplay_should_end(self, commitment_resolved: bool = False) -> bool:
         """Apply role-play's soft, earned-early, and hard phase exits."""
