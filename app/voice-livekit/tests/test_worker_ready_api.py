@@ -214,6 +214,14 @@ class TestPostWorkerReadyMachine(unittest.TestCase):
             _run(api.post_worker_ready_machine(app="b-app", machine_id="mX", post=post))
             self.assertEqual(cap["body"], {"app": "b-app", "machine_id": "mX"})
 
+    def test_livekit_host_is_sent_only_when_given(self):
+        with _EnvGuard():
+            _arm()
+            cap = {}
+            self.assertTrue(_run(api.post_worker_ready_machine(
+                livekit_host="r1.example.test", post=_poster({"ok": True}, captured=cap))))
+            self.assertEqual(cap["body"]["livekit_host"], "r1.example.test")
+
     def test_fail_open_on_errors(self):
         with _EnvGuard():
             _arm()

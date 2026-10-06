@@ -61,7 +61,9 @@ export interface BrowserAgentDispatchClientLike {
     roomName: string,
     agentName: string,
     options?: { metadata?: string },
-  ): Promise<unknown>;
+  ): Promise<{ id?: string } | unknown>;
+  listDispatch?(roomName: string): Promise<Array<{ id?: string; state?: { jobs?: unknown[] } }>>;
+  deleteDispatch?(dispatchId: string, roomName: string): Promise<void>;
 }
 
 export interface BrowserWorkerGate {
@@ -96,6 +98,39 @@ export interface BrowserWorkerGateDeps {
   readonly service?: WorkerOrchestrationService;
   /** The LiveKit agent-dispatch client (tests inject a fake; absent = lazy real). */
   readonly dispatchClient?: BrowserAgentDispatchClientLike;
+  /** Test seams; production uses bounded values below and never sleeps in tests. */
+  readonly dispatchVerifyMs?: number;
+  readonly dispatchPollMs?: number;
+  readonly sleep?: (ms: number) => Promise<void>;
+  readonly now?: () => number;
+}
+
+function boundedDispatchVerifyMs(): number {
+  const parsed = Number(process.env.BROWSER_DISPATCH_VERIFY_SEC ?? '8');
+  if (!Number.isFinite(parsed)) return 8_000;
+  return Math.max(1_000, Math.min(8_000, Math.round(parsed * 1_000)));
+}
+
+function liveKitHostname(url: string): string | null {
+  try {
+    return new URL(url).hostname.toLowerCase() || null;
+  } catch {
+    return null;
+  }
+}
+
+function browserReadyHostMatches(input: {
+  reportedHost: string | null | undefined;
+  target: 'cloud' | 'r1';
+  expectedHost: string | null;
+}): boolean {
+  // Cloud remains compatible with workers that predate the host field. R1
+  // requires a durable, exact report: no endpoint means no admission.
+  if (input.target === 'cloud') {
+    return input.reportedHost === null || input.reportedHost === undefined
+      || (input.expectedHost !== null && input.reportedHost === input.expectedHost);
+  }
+  return input.expectedHost !== null && input.reportedHost === input.expectedHost;
 }
 
 /**
@@ -130,6 +165,10 @@ export function browserOrchestrationGate(
 
   const service = deps.service ?? createBrowserWorkerOrchestrationService();
   const app = BROWSER_FLY_APP;
+  const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const now = deps.now ?? Date.now;
+  const dispatchVerifyMs = deps.dispatchVerifyMs ?? boundedDispatchVerifyMs();
+  const dispatchPollMs = Math.max(1, deps.dispatchPollMs ?? 1_000);
 
   let dispatchClient = deps.dispatchClient ?? null;
   const dispatchClientFor = async (): Promise<BrowserAgentDispatchClientLike> => {
@@ -141,25 +180,84 @@ export function browserOrchestrationGate(
     return dispatchClient;
   };
 
+  const dispatchAccepted = async (
+    client: BrowserAgentDispatchClientLike,
+    roomName: string,
+    dispatchId: string | undefined,
+  ): Promise<'assigned' | 'dropped' | 'unknown'> => {
+    // The SDK returns AgentDispatch.id. If an older/mock client cannot identify
+    // its dispatch, do not guess and risk double-dispatching an active agent.
+    if (!dispatchId || !client.listDispatch) return 'unknown';
+    const deadline = now() + dispatchVerifyMs;
+    for (;;) {
+      try {
+        const dispatches = await client.listDispatch(roomName);
+        const current = dispatches.find((item) => item.id === dispatchId);
+        if (!current) return 'unknown';
+        if ((current.state?.jobs?.length ?? 0) > 0) return 'assigned';
+      } catch {
+        return 'unknown';
+      }
+      if (now() >= deadline) return 'dropped';
+      await sleep(Math.min(dispatchPollMs, Math.max(0, deadline - now())));
+    }
+  };
+
   return {
     app,
     agentName,
     async ensureReadyWorker(input) {
-      return service.ensureReadyWorker({
+      const ready = await service.ensureReadyWorker({
         app,
         pipeline: 'browser',
         sessionId: input.sessionId,
       });
+      if (ready.status !== 'ready') return ready;
+      const endpoint = browserLiveKitEndpoint();
+      if (browserReadyHostMatches({
+        reportedHost: ready.livekitHost,
+        target: endpoint.target,
+        expectedHost: liveKitHostname(endpoint.url),
+      })) return ready;
+      // Do not disclose either hostname; a fixed event category is enough to
+      // diagnose a cutover ordering/configuration fault without endpoint data.
+      log.error('unknown_event', { error_category: 'browser_ready_host_mismatch' });
+      try {
+        await service.releaseWorker({ app, machineId: ready.machineId, sessionId: input.sessionId });
+      } catch {
+        /* the reaper remains the cost backstop */
+      }
+      return { status: 'timeout' };
     },
     async dispatch(input) {
       try {
         const client = await dispatchClientFor();
         // The browser dispatch carries only the session id (opaque), mirroring
         // the room metadata already minted by room-provisioning. No PII.
-        await client.createDispatch(input.roomName, agentName, {
+        const first = await client.createDispatch(input.roomName, agentName, {
           metadata: JSON.stringify({ session_id: input.sessionId, channel: 'browser' }),
         });
-        return true;
+        const firstRecord = typeof first === 'object' && first !== null
+          ? first as { id?: unknown }
+          : null;
+        const firstId = typeof firstRecord?.id === 'string' ? firstRecord.id : undefined;
+        const firstVerdict = await dispatchAccepted(client, input.roomName, firstId);
+        if (firstVerdict === 'assigned' || firstVerdict === 'unknown') return true;
+        // A known dispatch that remained job-less through the bounded window is
+        // the OSS drop observed in S0-F3. Delete it before one fresh attempt.
+        if (!client.deleteDispatch) return true;
+        await client.deleteDispatch(firstId!, input.roomName);
+        const retry = await client.createDispatch(input.roomName, agentName, {
+          metadata: JSON.stringify({ session_id: input.sessionId, channel: 'browser' }),
+        });
+        const retryRecord = typeof retry === 'object' && retry !== null
+          ? retry as { id?: unknown }
+          : null;
+        const retryId = typeof retryRecord?.id === 'string' ? retryRecord.id : undefined;
+        const retryVerdict = await dispatchAccepted(client, input.roomName, retryId);
+        if (retryVerdict === 'assigned' || retryVerdict === 'unknown') return true;
+        log.error('unknown_event', { error_category: 'browser_agent_dispatch_dropped' });
+        return false;
       } catch {
         // A room with no agent must not receive a candidate token. The caller
         // treats false as "not ready" and returns a preparing status.

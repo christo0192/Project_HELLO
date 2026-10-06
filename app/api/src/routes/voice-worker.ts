@@ -42,6 +42,9 @@ const log = createLogger('voice-worker');
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Fly app slugs are [a-z0-9-]; machine ids are hex. Bounded and structural. */
 const FLY_ID_RE = /^[A-Za-z0-9_.-]{1,256}$/;
+// DNS hostnames only: no scheme, port, path, whitespace, or credentials.
+// IPv4 literals are valid hostname labels and intentionally accepted.
+const LIVEKIT_HOST_RE = /^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?))*$/;
 
 const readySchema = z
   .object({
@@ -76,6 +79,7 @@ const readyMachineSchema = z
     app: z.string().regex(FLY_ID_RE),
     machine_id: z.string().regex(FLY_ID_RE),
     agent_name: z.string().regex(AGENT_NAME_RE).optional(),
+    livekit_host: z.string().regex(LIVEKIT_HOST_RE).transform((value) => value.toLowerCase()).optional(),
   })
   .strict();
 
@@ -214,6 +218,33 @@ export function createVoiceWorkerRouter(deps: VoiceWorkerRouterDeps = {}): Route
       // gets exactly the legacy path's answer for a non-ready claim — 200
       // {ok:false, status:'stale'} — and STILL never calls mark_ready, so the
       // ordering guarantee above is unchanged.
+      // Host readiness is browser-only. Persist it before mark-ready so the
+      // gate reads the host from the same durable lease row as `ready`, even
+      // after an API restart. Unlike the per-machine phone name, this signal
+      // stays fail-open: a host write fault must not turn the worker's
+      // best-effort registration ping into a readiness outage. The R1 gate
+      // later fails closed unless its durable host exactly matches its chosen
+      // endpoint. Passing null deliberately clears a host-less reboot's old
+      // value.
+      if (parsed.data.app === 'project-hello-voice') {
+        try {
+          const hosted = await rpc('set_voice_worker_livekit_host', {
+            p_app: parsed.data.app,
+            p_machine_id: parsed.data.machine_id,
+            p_livekit_host: parsed.data.livekit_host ?? null,
+            p_now: now().toISOString(),
+          });
+          const hostStatus = (!hosted.error && hosted.data && typeof hosted.data === 'object'
+            && !Array.isArray(hosted.data)
+            ? (hosted.data as Record<string, unknown>).status
+            : undefined);
+          if (hostStatus !== 'ok') {
+            log.info('unknown_event', { error_category: 'browser_ready_host_record_rejected' });
+          }
+        } catch {
+          log.info('unknown_event', { error_category: 'browser_ready_host_record_error' });
+        }
+      }
       if (parsed.data.agent_name !== undefined) {
         const named = await rpc('set_voice_worker_agent_name', {
           p_app: parsed.data.app,

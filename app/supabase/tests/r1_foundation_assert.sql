@@ -2032,4 +2032,83 @@ begin
 end;
 $$;
 
+-- 0118: durable browser worker host. These use a distinct app, machine ids,
+-- and claim ids so they cannot collide with the admission/concurrency fixtures.
+do $$
+declare
+  browser_app constant text := 'r1-host-browser-0118';
+  phone_app constant text := 'r1-host-phone-0118';
+  browser_machine constant text := 'r1hostbrowser0118';
+  phone_machine constant text := 'r1hostphone0118';
+  browser_session constant uuid := '30000000-0000-4000-8000-000000000181';
+  phone_session constant uuid := '30000000-0000-4000-8000-000000000182';
+  res jsonb;
+begin
+  insert into screening_v2.voice_worker_leases
+    (app, machine_id, pipeline, state, claimed_session_id, epoch, livekit_host) values
+    (browser_app, browser_machine, 'browser', 'starting', browser_session, 1, null),
+    (phone_app, phone_machine, 'phone', 'ready', phone_session, 1, 'phone.example.test');
+
+  perform _r1_tests.assert('0118 livekit_host column and validated hostname check exist',
+    exists (
+      select 1 from pg_catalog.pg_attribute
+       where attrelid = 'screening_v2.voice_worker_leases'::regclass
+         and attname = 'livekit_host' and not attisdropped
+    ) and exists (
+      select 1 from pg_catalog.pg_constraint
+       where conrelid = 'screening_v2.voice_worker_leases'::regclass
+         and conname = 'voice_worker_leases_livekit_host_format' and convalidated
+    ));
+  perform _r1_tests.assert('0118 host RPC is security-definer, search-path-pinned, service-role-only',
+    exists (
+      select 1 from pg_catalog.pg_proc p
+       where p.oid = 'screening_v2.set_voice_worker_livekit_host(text,text,text,timestamptz)'::regprocedure
+         and p.prosecdef
+         and p.proconfig @> array['search_path=pg_catalog, screening_v2']
+    ) and has_function_privilege('service_role',
+      'screening_v2.set_voice_worker_livekit_host(text,text,text,timestamptz)', 'execute')
+      and not has_function_privilege('anon',
+        'screening_v2.set_voice_worker_livekit_host(text,text,text,timestamptz)', 'execute')
+      and not has_function_privilege('authenticated',
+        'screening_v2.set_voice_worker_livekit_host(text,text,text,timestamptz)', 'execute')
+      and not has_function_privilege('public',
+        'screening_v2.set_voice_worker_livekit_host(text,text,text,timestamptz)', 'execute'));
+
+  res := screening_v2.set_voice_worker_livekit_host(
+    browser_app, browser_machine, 'r1.example.test', '2026-10-06 00:00:00+00');
+  perform _r1_tests.assert('0118 RPC sets a valid lowercase browser host',
+    res->>'status' = 'ok' and (select livekit_host = 'r1.example.test'
+      from screening_v2.voice_worker_leases where app = browser_app and machine_id = browser_machine));
+  res := screening_v2.set_voice_worker_livekit_host(
+    browser_app, browser_machine, null, '2026-10-06 00:00:01+00');
+  perform _r1_tests.assert('0118 RPC null explicitly clears a prior host',
+    res->>'status' = 'ok' and (select livekit_host is null
+      from screening_v2.voice_worker_leases where app = browser_app and machine_id = browser_machine));
+  begin
+    update screening_v2.voice_worker_leases set livekit_host = 'R1.EXAMPLE.TEST'
+     where app = browser_app and machine_id = browser_machine;
+    raise exception '0118 hostname check unexpectedly accepted uppercase host';
+  exception when check_violation then null;
+  end;
+  perform _r1_tests.assert('0118 hostname check rejects uppercase direct writes',
+    (select livekit_host is null
+      from screening_v2.voice_worker_leases where app = browser_app and machine_id = browser_machine));
+  res := screening_v2.set_voice_worker_livekit_host(
+    browser_app, browser_machine, 'WSS://invalid.example.test', '2026-10-06 00:00:02+00');
+  perform _r1_tests.assert('0118 RPC rejects invalid hostname syntax without a write',
+    res->>'status' = 'invalid_request' and (select livekit_host is null
+      from screening_v2.voice_worker_leases where app = browser_app and machine_id = browser_machine));
+  res := screening_v2.set_voice_worker_livekit_host(
+    'r1-host-absent-0118', browser_machine, 'r1.example.test', '2026-10-06 00:00:03+00');
+  perform _r1_tests.assert('0118 RPC refuses absent rows as stale', res->>'status' = 'stale');
+  update screening_v2.voice_worker_leases set state = 'busy' where app = browser_app and machine_id = browser_machine;
+  res := screening_v2.set_voice_worker_livekit_host(
+    browser_app, browser_machine, 'r1.example.test', '2026-10-06 00:00:04+00');
+  perform _r1_tests.assert('0118 RPC refuses non-starting-ready rows as stale', res->>'status' = 'stale');
+  perform _r1_tests.assert('0118 browser RPC call leaves phone lease host untouched',
+    (select livekit_host = 'phone.example.test'
+      from screening_v2.voice_worker_leases where app = phone_app and machine_id = phone_machine));
+end;
+$$;
+
 drop schema _r1_tests cascade;

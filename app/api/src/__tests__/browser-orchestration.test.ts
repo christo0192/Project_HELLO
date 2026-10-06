@@ -161,6 +161,112 @@ describe('browserOrchestrationGate — the naming+dispatch pairing gate', () => 
     }
   });
 
+  it('rejects an absent or mismatched durable lease host on R1 before dispatch, and releases the claim', async () => {
+    process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+    process.env.R1_LIVEKIT_URL = 'wss://r1.example.test:7880';
+    try {
+      const service = fakeService({ status: 'ready', machineId: 'm1', livekitHost: null });
+      const gate = browserOrchestrationGate({
+        enabled: true,
+        agentName: 'browser-screener',
+        service,
+        dispatchClient: { createDispatch: vi.fn() },
+      })!;
+      await expect(gate.ensureReadyWorker({ sessionId: 'sess-1' })).resolves.toEqual({ status: 'timeout' });
+      expect(service.releaseCalls).toEqual([
+        { app: BROWSER_FLY_APP, machineId: 'm1', sessionId: 'sess-1' },
+      ]);
+      const mismatched = fakeService({
+        status: 'ready', machineId: 'm1', livekitHost: 'wrong.example.test',
+      });
+      const mismatchGate = browserOrchestrationGate({
+        enabled: true,
+        agentName: 'browser-screener',
+        service: mismatched,
+        dispatchClient: { createDispatch: vi.fn() },
+      })!;
+      await expect(mismatchGate.ensureReadyWorker({ sessionId: 'sess-1' })).resolves.toEqual({ status: 'timeout' });
+      expect(mismatched.releaseCalls).toEqual([
+        { app: BROWSER_FLY_APP, machineId: 'm1', sessionId: 'sess-1' },
+      ]);
+    } finally {
+      delete process.env.BROWSER_LIVEKIT_TARGET;
+      delete process.env.R1_LIVEKIT_URL;
+    }
+  });
+
+  it('accepts an absent host for Cloud rollout compatibility', async () => {
+    const gate = browserOrchestrationGate({
+      enabled: true,
+      agentName: 'browser-screener',
+      service: fakeService({ status: 'ready', machineId: 'm1' }),
+      dispatchClient: { createDispatch: vi.fn() },
+    })!;
+    await expect(gate.ensureReadyWorker({ sessionId: 'sess-1' })).resolves.toMatchObject({
+      status: 'ready', machineId: 'm1',
+    });
+  });
+
+  it('accepts only the exact durable lease host for R1', async () => {
+    process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+    process.env.R1_LIVEKIT_URL = 'wss://r1.example.test:7880';
+    try {
+      const gate = browserOrchestrationGate({
+        enabled: true,
+        agentName: 'browser-screener',
+        service: fakeService({ status: 'ready', machineId: 'm1', livekitHost: 'r1.example.test' }),
+        dispatchClient: { createDispatch: vi.fn() },
+      })!;
+      await expect(gate.ensureReadyWorker({ sessionId: 'sess-1' })).resolves.toMatchObject({
+        status: 'ready', machineId: 'm1', livekitHost: 'r1.example.test',
+      });
+    } finally {
+      delete process.env.BROWSER_LIVEKIT_TARGET;
+      delete process.env.R1_LIVEKIT_URL;
+    }
+  });
+
+  it('deletes one known job-less dispatch and retries it once with no wall-clock sleep', async () => {
+    let clock = 0;
+    const createDispatch = vi.fn().mockResolvedValueOnce({ id: 'first' }).mockResolvedValueOnce({ id: 'retry' });
+    const deleteDispatch = vi.fn().mockResolvedValue(undefined);
+    const listDispatch = vi.fn(async () => [
+      { id: createDispatch.mock.calls.length === 1 ? 'first' : 'retry', state: { jobs: [] } },
+    ]);
+    const gate = browserOrchestrationGate({
+      enabled: true,
+      agentName: 'browser-screener',
+      service: fakeService({ status: 'ready', machineId: 'm1' }),
+      dispatchClient: { createDispatch, deleteDispatch, listDispatch },
+      dispatchVerifyMs: 1,
+      dispatchPollMs: 1,
+      now: () => clock,
+      sleep: async (ms) => { clock += ms; },
+    })!;
+    await expect(gate.dispatch({ sessionId: 'sess-1', roomName: 'screening-sess-1' })).resolves.toBe(false);
+    expect(deleteDispatch).toHaveBeenCalledTimes(1);
+    expect(createDispatch).toHaveBeenCalledTimes(2);
+  });
+
+  it('never re-dispatches once the dispatch owns a job', async () => {
+    const createDispatch = vi.fn().mockResolvedValue({ id: 'assigned' });
+    const deleteDispatch = vi.fn();
+    const gate = browserOrchestrationGate({
+      enabled: true,
+      agentName: 'browser-screener',
+      service: fakeService({ status: 'ready', machineId: 'm1' }),
+      dispatchClient: {
+        createDispatch,
+        deleteDispatch,
+        listDispatch: vi.fn().mockResolvedValue([{ id: 'assigned', state: { jobs: [{}] } }]),
+      },
+      dispatchVerifyMs: 1,
+    })!;
+    await expect(gate.dispatch({ sessionId: 'sess-1', roomName: 'screening-sess-1' })).resolves.toBe(true);
+    expect(createDispatch).toHaveBeenCalledTimes(1);
+    expect(deleteDispatch).not.toHaveBeenCalled();
+  });
+
   it('releaseWorker delegates to the service (fail-open, never throws)', async () => {
     const service = fakeService({ status: 'ready', machineId: 'm1' });
     const gate = browserOrchestrationGate({

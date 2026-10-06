@@ -164,18 +164,29 @@ beforeEach(() => {
 });
 
 describe('createDefaultWorkerOrchestrationService — production lease reader (M009 E2)', () => {
-  it('(a) selects registered_agent_name from voice_worker_leases, keyed by (app, machine_id)', async () => {
-    h.row = readyRow({ registered_agent_name: PER_MACHINE });
+  it('(a) selects registered_agent_name and livekit_host from voice_worker_leases, keyed by (app, machine_id)', async () => {
+    h.row = readyRow({ registered_agent_name: PER_MACHINE, livekit_host: 'r1.example.test' });
     await gate();
     expect(h.tables).toContain('voice_worker_leases');
     expect(h.selects.length).toBeGreaterThan(0);
     for (const cols of h.selects) {
       const names = cols.split(',').map((c) => c.trim());
       expect(names).toEqual(
-        expect.arrayContaining(['state', 'claimed_session_id', 'epoch', 'registered_agent_name']),
+        expect.arrayContaining(['state', 'claimed_session_id', 'epoch', 'registered_agent_name', 'livekit_host']),
       );
     }
     expect(h.filters).toEqual(expect.arrayContaining([`app=${APP}`, `machine_id=${MACHINE}`]));
+  });
+
+  it('(d) a reported lease host reaches the readiness verdict, while non-strings become null', async () => {
+    h.row = readyRow({ registered_agent_name: PER_MACHINE, livekit_host: 'r1.example.test' });
+    await expect(createDefaultWorkerOrchestrationService().ensureReadyWorker({
+      app: APP, pipeline: 'browser', sessionId: SESSION, epoch: 1, readyTimeoutSec: 30,
+    })).resolves.toMatchObject({ livekitHost: 'r1.example.test' });
+    h.row = readyRow({ registered_agent_name: PER_MACHINE, livekit_host: { host: 'r1.example.test' } });
+    await expect(createDefaultWorkerOrchestrationService().ensureReadyWorker({
+      app: APP, pipeline: 'browser', sessionId: SESSION, epoch: 1, readyTimeoutSec: 30,
+    })).resolves.toMatchObject({ livekitHost: null });
   });
 
   it('(b) a reported per-machine name reaches the gate verdict as agentName, with the LEASE epoch', async () => {

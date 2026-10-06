@@ -781,19 +781,19 @@ fi
 log '0096: PASS — a connected call inside the grace is spared and one past it is not; a never-answered leg gets no grace; the orphan session is expired/idle_timeout while young, dialled and engaged rows are untouched.'
 
 # =====================================================================
-# 0115/0116 R1 foundation — runs only after this script's `db reset` has
+# 0115/0116/0118 R1 foundation — runs only after this script's `db reset` has
 # applied the complete production migration chain. The helper deliberately
 # reuses this local Supabase database; it does not build permissive stubs.
 # =====================================================================
-log '0115/0116: R1 full-chain admission, privacy, Ashby and capacity assertions...'
+log '0115/0116/0118: R1 full-chain admission, privacy, Ashby, capacity and durable worker-host assertions...'
 # SUPABASE_DB_CONTAINER is readonly in this script, so a `VAR=value cmd` prefix
 # is rejected; `env` passes it to the child process instead.
 env SUPABASE_DB_CONTAINER="$SUPABASE_DB_CONTAINER" bash scripts/test-r1-foundation.sh 2>&1 | tee -a "$RESULTS_FILE"
 if [ "${PIPESTATUS[0]}" -ne 0 ]; then
-  log 'ERROR: 0115/0116 R1 full-chain assertions FAILED.'
+  log 'ERROR: 0115/0116/0118 R1 full-chain assertions FAILED.'
   exit 1
 fi
-log '0115/0116: PASS — R1 assertions ran against migrations 0001..0116 in supabase-check.'
+log '0115/0116/0118: PASS — R1 assertions ran against migrations 0001..0118 in supabase-check.'
 
 # =====================================================================
 # 0122 R1 scorer — status CAS, 24 h pending reject, override monitor, attach

@@ -14,6 +14,8 @@ import inspect
 import logging
 import math
 import statistics
+import tempfile
+from urllib.parse import urlparse
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -1691,6 +1693,11 @@ def _browser_worker_named() -> bool:
     )
 
 
+def _browser_worker_one_job() -> bool:
+    """Exact opt-in for the browser worker's one-job availability gate."""
+    return os.getenv("BROWSER_WORKER_ONE_JOB") == "on"
+
+
 def _phone_worker_orchestrated() -> bool:
     """True iff THIS process is the NAMED phone worker AND on-demand
     orchestration is on (design §2.3, PR B phone-path retrofit). The phone
@@ -1874,6 +1881,72 @@ async def _publish_phone_agent_name(room: Any, dispatched_agent_name: Any = None
         _log.warn("unknown_event", error_type="phone_agent_name_published", error_category=outcome)
     return outcome
 
+_BROWSER_READY_MARKER_ENV = "_BROWSER_WORKER_READY_MARKER_DIR"
+
+
+def _browser_ready_marker_path() -> str | None:
+    directory = os.getenv(_BROWSER_READY_MARKER_ENV)
+    return os.path.join(directory, "registered") if directory else None
+
+
+def _browser_has_registered() -> bool:
+    marker = _browser_ready_marker_path()
+    return bool(marker and os.path.isfile(marker))
+
+
+def _mark_browser_registered() -> None:
+    """Atomically make main-process registration visible to job subprocesses."""
+    marker = _browser_ready_marker_path()
+    if marker is None:
+        return
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return
+    except OSError:
+        return
+    else:
+        os.close(fd)
+
+
+def _browser_livekit_host() -> str | None:
+    """Configured LiveKit URL's hostname, never a URL/port/credential string."""
+    try:
+        host = urlparse(os.getenv("LIVEKIT_URL") or "").hostname
+    except ValueError:
+        host = None
+    return host.lower() if host else None
+
+
+async def _post_browser_machine_ready_after_registration() -> None:
+    host = _browser_livekit_host()
+    if host is None:
+        _log.info(
+            "unknown_event",
+            error_type="voice_worker_ready_machine",
+            error_category="livekit_host_missing",
+        )
+        return
+    try:
+        await worker_ready_api.post_worker_ready_machine(livekit_host=host)
+    except Exception:  # noqa: BLE001 - readiness remains fail-open
+        _log.info(
+            "unknown_event",
+            error_type="voice_worker_ready_machine",
+            error_category="registration_post_failed",
+        )
+
+
+def _prepare_browser_registration_marker() -> None:
+    """Create the private, per-boot marker directory before job children spawn."""
+    directory = tempfile.mkdtemp(prefix="hello-browser-worker-ready-")
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+    os.environ[_BROWSER_READY_MARKER_ENV] = directory
+
+
 def _prewarm_post_machine_ready(_proc: Any) -> None:
     """WorkerOptions.prewarm_fnc for a NAMED worker under on-demand
     orchestration: post MACHINE-level readiness (design §2.3b B-i for browser,
@@ -1896,7 +1969,9 @@ def _prewarm_post_machine_ready(_proc: Any) -> None:
     is driven on a private event loop here. FAIL-OPEN and best-effort: any
     failure degrades to the API's start-wait budget + reaper and must never
     raise out of process init (which would fail the warmup)."""
-    if not (_browser_worker_named() or _phone_worker_orchestrated()):
+    browser_named = _browser_worker_named()
+    phone_orchestrated = _phone_worker_orchestrated()
+    if not (browser_named or phone_orchestrated):
         return
     # E2: report the per-machine registration name ONLY when it differs from
     # the base — flag off (PR-A as deployed), the browser worker, and the
@@ -1904,7 +1979,16 @@ def _prewarm_post_machine_ready(_proc: Any) -> None:
     # body the pre-E2 strict /ready-machine schema accepts is unchanged. The
     # API stores a reported name on the lease and dispatches to it.
     ready_kwargs: dict[str, Any] = {}
-    if _phone_worker_orchestrated():
+    if browser_named:
+        # Idle job processes can start before the parent has completed the
+        # websocket registration. They must never win the boot-readiness race.
+        if not _browser_has_registered():
+            return
+        host = _browser_livekit_host()
+        if host is None:
+            return
+        ready_kwargs["livekit_host"] = host
+    if phone_orchestrated:
         registered = phone_registered_agent_name()
         if registered != _phone_agent_name():
             ready_kwargs["agent_name"] = registered
@@ -2011,6 +2095,14 @@ def build_worker_options() -> WorkerOptions:
         # dispatches to this EXACT name (env.browserAgentName) — names_agree.
         options["agent_name"] = _browser_agent_name()
         options["prewarm_fnc"] = _prewarm_post_machine_ready
+        # The self-hosted OSS scheduler must see a deterministic availability
+        # signal, not the SDK's default CPU average. Exact opt-in keeps Cloud
+        # browser behaviour byte-identical until R1 cutover.
+        if _browser_worker_one_job():
+            if _worker_options_accepts("load_fnc"):
+                options["load_fnc"] = _browser_one_job_per_machine_load
+            if _worker_options_accepts("load_threshold"):
+                options["load_threshold"] = 0.75
         return WorkerOptions(**options)
     agent_name = _phone_agent_name()
     if agent_name:
@@ -2145,6 +2237,11 @@ def _phone_one_call_per_machine_load(server: Any) -> float:
     except Exception:  # pragma: no cover - defensive; the SDK owns this
         return 1.0
     return 1.0 if active >= PHONE_JOBS_PER_MACHINE else 0.0
+
+
+def _browser_one_job_per_machine_load(server: Any) -> float:
+    """Browser alias of the proven parent-process one-job availability gate."""
+    return _phone_one_call_per_machine_load(server)
 
 
 async def _wait_for_sip_participant(ctx: JobContext, timeout_sec: float) -> Any:
@@ -12233,5 +12330,30 @@ async def _run_session(
                 session_span.end()
 
 
+def run_worker_app() -> None:
+    """Run the named browser worker with registration-derived readiness only."""
+    options = build_worker_options()
+    if not _browser_worker_named():
+        # Phone and unnamed-browser invocation stay exactly on the historical
+        # WorkerOptions path. Only the named browser worker owns this seam.
+        cli.run_app(options)
+        return
+
+    # AgentServer emits worker_registered only after the server accepted this
+    # worker's websocket registration. The callback remains in the main process
+    # and fires again on reconnect, unlike a job-process prewarm callback.
+    from livekit.agents import AgentServer  # noqa: PLC0415 - named browser only
+
+    _prepare_browser_registration_marker()
+    server = AgentServer.from_server_options(options)
+
+    def _on_worker_registered(*_args: Any) -> None:
+        _mark_browser_registered()
+        asyncio.get_running_loop().create_task(_post_browser_machine_ready_after_registration())
+
+    server.on("worker_registered", _on_worker_registered)
+    cli.run_app(server)
+
+
 if __name__ == "__main__":
-    cli.run_app(build_worker_options())
+    run_worker_app()

@@ -124,6 +124,12 @@ export interface LeaseStateSnapshot {
    * type-check; absent reads exactly like null (dispatch the shared name).
    */
   readonly registeredAgentName?: string | null;
+  /**
+   * 0118: durable lowercase LiveKit hostname reported by the browser worker,
+   * or null when the worker explicitly reported no host. Optional so older
+   * hand-built readers still type-check; absent is treated as null.
+   */
+  readonly livekitHost?: string | null;
 }
 
 /**
@@ -221,6 +227,8 @@ export type EnsureReadyResult =
        * same fake-compatibility reason; absent means null.
        */
       agentName?: string | null;
+      /** 0118: durable browser worker endpoint host from the ready lease. */
+      livekitHost?: string | null;
     }
   | { status: 'no_capacity' }
   | { status: 'timeout' }
@@ -606,8 +614,15 @@ export function createWorkerOrchestrationService(
     const agentName = typeof readySnap?.registeredAgentName === 'string'
       ? readySnap.registeredAgentName
       : null;
+    const livekitHost = typeof readySnap?.livekitHost === 'string'
+      ? readySnap.livekitHost
+      : null;
     event('ready', { app });
-    return { status: 'ready', machineId, epoch: leaseEpoch, agentName };
+    // Keep phone gate results byte-for-byte unchanged. `livekit_host` belongs
+    // exclusively to the browser/R1 contract and is only surfaced there.
+    return pipeline === 'browser'
+      ? { status: 'ready', machineId, epoch: leaseEpoch, agentName, livekitHost }
+      : { status: 'ready', machineId, epoch: leaseEpoch, agentName };
   }
 
   async function releaseWorker(input: {
@@ -1013,7 +1028,7 @@ export function createDefaultWorkerOrchestrationService(
   const readLeaseState: LeaseStateReader = async ({ app, machineId }) => {
     const { data, error } = await client
       .from('voice_worker_leases')
-      .select('state, claimed_session_id, epoch, registered_agent_name')
+      .select('state, claimed_session_id, epoch, registered_agent_name, livekit_host')
       .eq('app', app)
       .eq('machine_id', machineId)
       .maybeSingle();
@@ -1023,6 +1038,7 @@ export function createDefaultWorkerOrchestrationService(
       claimed_session_id?: unknown;
       epoch?: unknown;
       registered_agent_name?: unknown;
+      livekit_host?: unknown;
     } | null;
     return {
       state: typeof row?.state === 'string' ? row.state : null,
@@ -1044,6 +1060,8 @@ export function createDefaultWorkerOrchestrationService(
       // defers), which is fail-closed, never a dispatch to a guessed name.
       registeredAgentName:
         typeof row?.registered_agent_name === 'string' ? row.registered_agent_name : null,
+      livekitHost:
+        typeof row?.livekit_host === 'string' ? row.livekit_host : null,
     };
   };
 

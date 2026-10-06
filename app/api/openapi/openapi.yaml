@@ -9409,6 +9409,11 @@ components:
           type: string
           pattern: '^[A-Za-z0-9_-]{1,64}-[0-9a-z]{8,32}$'
           description: "M009 E2, optional. The per-machine LiveKit agent name (<base>-<flyMachineId>) a phone worker registered under when per-machine naming is on. When present the API records it on the lease (set_voice_worker_agent_name) BEFORE marking the row ready, and dispatches that machine's session to exactly this name; if recording it fails or is stale the response is 500 and the row is NOT marked ready (the dial gate then times out and defers rather than dispatching to an unrecorded name). Absent (browser workers, phone workers with per-machine naming off) the behaviour is unchanged."
+        livekit_host:
+          type: string
+          maxLength: 253
+          pattern: '^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?))*$'
+          description: Optional browser worker LiveKit hostname, lowercased by the API and persisted on the worker lease. Omission explicitly clears a prior host; R1 admission requires an exact durable host match. Intentionally absent from phone readiness bodies.
       additionalProperties: false
 
     VoiceWorkerReadyResponse:

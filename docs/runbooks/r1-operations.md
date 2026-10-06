@@ -451,11 +451,22 @@ Fallback flip procedure:
 
 1. Pause R1 and drain all `waiting` and `in_progress` R1 sessions.
 2. Confirm zero R1 rooms and worker jobs; do not make an API-only flip.
-3. Put the worker `LIVEKIT_*` triple on the selected endpoint, deploy and
-   verify worker registration there.
-4. Set `BROWSER_LIVEKIT_TARGET` to the same target, deploy the API, and verify
+3. Make sure the host-aware readiness API (PR-LK-liveness) is already deployed;
+   it must be live BEFORE the worker reports `livekit_host`.
+4. Put the worker `LIVEKIT_*` triple on the selected endpoint. For the
+   self-hosted SFU, also set `BROWSER_WORKER_ONE_JOB=on` (one job per machine;
+   an idle worker is always available, a busy one never is). Deploy, then
+   verify the worker registered there: its post-registration ready record
+   carries that endpoint's `livekit_host`.
+5. Set `BROWSER_LIVEKIT_TARGET` to the same target, deploy the API, and verify
    returned endpoint, candidate token, room creation, dispatch, and reaper.
-5. Apply the Cloud cap before admitting new sessions when the target is Cloud.
+   With target `r1`, a ready record with a different or missing host is not
+   ready, and no candidate token or dispatch is issued.
+6. Apply the Cloud cap before admitting new sessions when the target is Cloud.
+
+Rollback to Cloud reverses steps 4-5: return the worker to its Cloud `LIVEKIT_*`
+triple and remove `BROWSER_WORKER_ONE_JOB` (or set anything other than `on`),
+then select Cloud on the API.
 
 (implemented in PR-LK-seam and PR-LK-liveness)
 

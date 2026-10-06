@@ -112,6 +112,7 @@ describe('POST /internal/voice-worker/ready', () => {
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ ok: false, error: 'voice_worker_ready_error' });
   });
+
 });
 
 // ── Browser (§2.3b B-i): the MACHINE-level, session-less readiness ping ──
@@ -119,10 +120,76 @@ const BROWSER_APP = 'project-hello-voice';
 const machineBody = { app: BROWSER_APP, machine_id: MACHINE };
 
 describe('POST /internal/voice-worker/ready-machine', () => {
+  it('browser livekit_host is lowercased and durably recorded before mark_ready', async () => {
+    const { rpc, calls } = scriptedRpc({
+      set_voice_worker_livekit_host: { data: { status: 'ok', updated: 1 }, error: null },
+    });
+    const res = await request(appWith(rpc))
+      .post('/internal/voice-worker/ready-machine')
+      .set('authorization', `Bearer ${SECRET}`)
+      .send({ ...machineBody, livekit_host: 'R1.Example.Test' });
+    expect(res.status).toBe(200);
+    expect(calls.map((call) => call.name)).toEqual([
+      'set_voice_worker_livekit_host', 'mark_voice_worker_ready_machine',
+    ]);
+    expect(calls[0].args).toMatchObject({
+      p_app: BROWSER_APP, p_machine_id: MACHINE, p_livekit_host: 'r1.example.test',
+    });
+  });
+
+  it('browser host-less ready post explicitly clears the durable lease host', async () => {
+    const { rpc, calls } = scriptedRpc({
+      set_voice_worker_livekit_host: { data: { status: 'ok', updated: 1 }, error: null },
+    });
+    const res = await request(appWith(rpc))
+      .post('/internal/voice-worker/ready-machine')
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(machineBody);
+    expect(res.status).toBe(200);
+    expect(calls[0]).toMatchObject({
+      name: 'set_voice_worker_livekit_host',
+      args: { p_livekit_host: null },
+    });
+  });
+
+  it('host RPC failures are sanitized and fail-open to the existing ready RPC', async () => {
+    const { rpc, calls } = scriptedRpc({
+      set_voice_worker_livekit_host: { data: null, error: { message: 'host row detail' } },
+    });
+    const res = await request(appWith(rpc))
+      .post('/internal/voice-worker/ready-machine')
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(machineBody);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'ready' });
+    expect(calls.map((call) => call.name)).toEqual([
+      'set_voice_worker_livekit_host', 'mark_voice_worker_ready_machine',
+    ]);
+  });
+
+  it('phone ready posts never call the browser host RPC', async () => {
+    const { rpc, calls } = scriptedRpc({});
+    const res = await request(appWith(rpc))
+      .post('/internal/voice-worker/ready-machine')
+      .set('authorization', `Bearer ${SECRET}`)
+      .send(phoneMachineBody);
+    expect(res.status).toBe(200);
+    expect(calls.map((call) => call.name)).toEqual(['mark_voice_worker_ready_machine']);
+  });
+
+  it('rejects a livekit_host with URL syntax before any RPC', async () => {
+    const { rpc, calls } = scriptedRpc({});
+    const res = await request(appWith(rpc))
+      .post('/internal/voice-worker/ready-machine')
+      .set('authorization', `Bearer ${SECRET}`)
+      .send({ ...machineBody, livekit_host: 'wss://r1.example.test:7880' });
+    expect(res.status).toBe(400);
+    expect(calls).toEqual([]);
+  });
   it('marks ready via the session-less RPC (no session_id/epoch sent)', async () => {
-    let seen: { name: string; args: Record<string, unknown> } | null = null;
+    const seen: Array<{ name: string; args: Record<string, unknown> }> = [];
     const rpc: VoiceWorkerRpcCaller = async (name, args) => {
-      seen = { name, args };
+      seen.push({ name, args });
       return { data: { status: 'ready', machine_id: MACHINE, epoch: 7 }, error: null };
     };
     const res = await request(appWith(rpc))
@@ -131,11 +198,14 @@ describe('POST /internal/voice-worker/ready-machine', () => {
       .send(machineBody);
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true, status: 'ready' });
-    expect(seen!.name).toBe('mark_voice_worker_ready_machine');
+    expect(seen.map((call) => call.name)).toEqual([
+      'set_voice_worker_livekit_host', 'mark_voice_worker_ready_machine',
+    ]);
     // Only app + machine + now — NEVER a session id or epoch.
-    expect(seen!.args).toMatchObject({ p_app: BROWSER_APP, p_machine_id: MACHINE });
-    expect(seen!.args).not.toHaveProperty('p_session_id');
-    expect(seen!.args).not.toHaveProperty('p_epoch');
+    const ready = seen[1]!.args;
+    expect(ready).toMatchObject({ p_app: BROWSER_APP, p_machine_id: MACHINE });
+    expect(ready).not.toHaveProperty('p_session_id');
+    expect(ready).not.toHaveProperty('p_epoch');
   });
 
   it('stale on no claim: ok:false status:stale', async () => {

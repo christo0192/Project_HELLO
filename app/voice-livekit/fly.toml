@@ -50,6 +50,8 @@ primary_region = "sin"
   # UP first (runbook docs/runbooks/phone-worker-orchestration-activation.md §5).
   BROWSER_AGENT_NAME = "browser-screener"
   WORKER_ORCHESTRATION = "worker"
+  # BROWSER_WORKER_ONE_JOB is deliberately ABSENT: exact `on` is set only at
+  # the R1 self-hosted cutover, after the host-aware API readiness deploy.
 
 # X1/VM PIN (2026-08-29 CPU-starvation incident): on `shared` CPU the worker's
 # VAD/EOU compute backed up (VAD backlog 67 s), the Sarvam STT websocket died

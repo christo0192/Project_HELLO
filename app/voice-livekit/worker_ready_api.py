@@ -168,6 +168,7 @@ async def post_worker_ready_machine(
     app: Optional[str] = None,
     machine_id: Optional[str] = None,
     agent_name: Optional[str] = None,
+    livekit_host: Optional[str] = None,
     post: PostFn = _default_post,
 ) -> bool:
     """Tell the API this MACHINE's worker process is up and registered.
@@ -206,6 +207,8 @@ async def post_worker_ready_machine(
     body: dict[str, Any] = {"app": resolved_app, "machine_id": resolved_machine}
     if agent_name is not None:
         body["agent_name"] = agent_name
+    if livekit_host is not None:
+        body["livekit_host"] = livekit_host
     try:
         resp = await post("POST", f"{API_BASE}{_READY_MACHINE_URL}", headers, body)
         data = getattr(resp, "json", lambda: {})()
