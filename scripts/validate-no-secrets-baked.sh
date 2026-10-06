@@ -74,12 +74,6 @@ done); then
     value=${rest#*:}
     value=${value#*=}
     value=$(printf '%s' "$value" | sed 's/[[:space:]]*$//')
-    # Documentation often quotes a placeholder. Strip one matching outer pair
-    # before deciding whether this is a real baked credential value.
-    case "$value" in
-      \"*\") value=${value#\"}; value=${value%\"} ;;
-      \'*\') value=${value#\'}; value=${value%\'} ;;
-    esac
     case "$value" in
       "" | "replace_me" | "<"*">" | "YOUR_"* | "your-"*)
         : # documented placeholder — allowed

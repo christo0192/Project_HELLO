@@ -34,7 +34,7 @@ fly apps create project-hello-r1-rtc-spike
 fly ips allocate-v4 -a project-hello-r1-rtc-spike
 fly secrets set -a project-hello-r1-rtc-spike \
   LIVEKIT_KEYS="r1-spike:$(openssl rand -base64 48)" \
-  NODE_IP="<the allocated dedicated IPv4>"
+  NODE_IP=replace_me   # the dedicated IPv4 printed by `fly ips allocate-v4`
 fly deploy --ha=false --config infra/livekit-r1/fly.toml
 ```
 

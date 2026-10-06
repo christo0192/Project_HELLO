@@ -48,7 +48,7 @@ fi
 # A mapping line is accepted, rather than arbitrary YAML, so a malformed or
 # newline-containing secret cannot alter the rendered configuration.
 case "$LIVEKIT_KEYS" in
-  *[!A-Za-z0-9_./+:-]* | *:*:* | :* | *:) 
+  *[!A-Za-z0-9_./+:-]* | *:*:* | :* | *:)
     die "LIVEKIT_KEYS must be one key:secret mapping with a base64/url-safe secret" ;;
 esac
 KEY_NAME=${LIVEKIT_KEYS%%:*}
