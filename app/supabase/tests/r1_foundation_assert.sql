@@ -171,8 +171,10 @@ begin
   perform _r1_tests.assert('pause refuses admission',
     (screening_v2.r1_admit_attempt(round_i, repeat('a', 64))->>'status') = 'paused');
   update screening_v2.r1_settings set paused = false, monthly_cap_minutes = 55, pause_line_minutes = 55;
-  perform _r1_tests.assert('55 minute hold enforces cap',
-    (screening_v2.r1_admit_attempt(round_i, repeat('a', 64))->>'status') = 'capacity_exhausted');
+  -- 0117 evaluates the one-live-R1 rule BEFORE capacity: the counted retake above
+  -- is still live, so a full cap must not mask the in-flight refusal.
+  perform _r1_tests.assert('a live R1 session is refused before the cap is evaluated',
+    (screening_v2.r1_admit_attempt(round_i, repeat('a', 64))->>'status') = 'r1_in_flight');
   update screening_v2.r1_settings set monthly_cap_minutes = 1000, pause_line_minutes = 1000;
 
   -- Valid lifecycle transitions are required before a terminal completion.
@@ -182,6 +184,12 @@ begin
   select count(*) into job_count from screening_v2.job_queue
    where name = 'r1.assessment' and dedup_key = 'r1.assessment:' || sid::text and max_attempts = 5;
   perform _r1_tests.assert('R1 completion enqueues exactly one deduped job', job_count = 1, job_count::text);
+
+  -- No R1 session is live any more, so this isolates the 55-minute capacity hold.
+  update screening_v2.r1_settings set monthly_cap_minutes = 55, pause_line_minutes = 55;
+  perform _r1_tests.assert('55 minute hold enforces cap',
+    (screening_v2.r1_admit_attempt(round_i, repeat('a', 64))->>'status') = 'capacity_exhausted');
+  update screening_v2.r1_settings set monthly_cap_minutes = 1000, pause_line_minutes = 1000;
   insert into screening_v2.call_sessions
     (candidate_id, role_id, mode, provider, external_call_id, status, owner_id)
     values (candidate_a, role_phone, 'live', 'livekit', 'r1-foundation-phone', 'created', owner)
