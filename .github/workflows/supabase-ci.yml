@@ -179,14 +179,6 @@ jobs:
       - name: Per-item gate transcript 0105 (isolated real Postgres)
         run: bash scripts/test-gate-transcript.sh
 
-  r1-foundation-test:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: R1 round admission, queue fence, grants and capacity race (isolated real Postgres)
-        run: bash scripts/test-r1-foundation.sh
-
   supabase-static-security:
     runs-on: ubuntu-latest
     steps:

@@ -126,8 +126,17 @@ create table if not exists screening_v2.r1_budget_month (
 );
 
 alter table screening_v2.roles
-  add column if not exists interview_kind text null
-  check (interview_kind is null or interview_kind in ('sales_r1'));
+  add column if not exists interview_kind text null;
+
+-- NOT VALID avoids the initial table scan while immediately protecting new
+-- writes. Validation in this migration is acceptable: the 2026-10-06
+-- production table is small and VALIDATE permits normal DML (repo precedent:
+-- 0008, 0014, 0021 and 0044).
+alter table screening_v2.roles
+  add constraint chk_roles_interview_kind
+    check (interview_kind is null or interview_kind in ('sales_r1')) not valid;
+alter table screening_v2.roles
+  validate constraint chk_roles_interview_kind;
 
 create or replace function screening_v2.reject_ashby_r1_role_mapping()
 returns trigger
@@ -149,6 +158,31 @@ drop trigger if exists trg_ashby_mapping_reject_r1_role on screening_v2.ashby_jo
 create trigger trg_ashby_mapping_reject_r1_role
   before insert or update of role_id on screening_v2.ashby_job_mappings
   for each row execute function screening_v2.reject_ashby_r1_role_mapping();
+
+-- A mapping can predate the R1 designation, so guard the reverse direction
+-- too. INSERT is not relevant: a mapping cannot refer to a role before that
+-- role exists, and the mapping trigger above handles the later mapping INSERT.
+create or replace function screening_v2.reject_ashby_r1_role_kind_update()
+returns trigger
+language plpgsql
+security invoker
+set search_path = pg_catalog
+as $$
+begin
+  if new.interview_kind is not null and exists (
+    select 1 from screening_v2.ashby_job_mappings m where m.role_id = new.id
+  ) then
+    raise exception 'Ashby mappings are not allowed for interview_kind roles'
+      using errcode = '23514';
+  end if;
+  return new;
+end;
+$$;
+
+drop trigger if exists trg_roles_reject_ashby_r1_kind on screening_v2.roles;
+create trigger trg_roles_reject_ashby_r1_kind
+  before update of interview_kind on screening_v2.roles
+  for each row execute function screening_v2.reject_ashby_r1_role_kind_update();
 
 create or replace function screening_v2.audit_r1_settings_change()
 returns trigger
@@ -223,6 +257,14 @@ begin
       from screening_v2.interview_round_consents c
       join screening_v2.interview_round_consent_templates t on t.id = c.template_id
      where c.round_id = v_round.id and c.withdrawn_at is null and c.granted_at <= p_now
+       and t.is_active
+       -- "Active" is deterministic: among active templates, the greatest
+       -- version by PostgreSQL text ordering is authoritative.
+       and t.version = (
+         select max(active_template.version)
+           from screening_v2.interview_round_consent_templates active_template
+          where active_template.is_active
+       )
        and t.required_consents <@ c.consents
   ) then return jsonb_build_object('status', 'consent_missing'); end if;
 
@@ -235,8 +277,10 @@ begin
    where s.interview_round_id is not null and s.status in ('created', 'waiting', 'in_progress');
   if v_live_r1 >= 1 then return jsonb_build_object('status', 'r1_in_flight'); end if;
   if v_settings.livekit_target = 'cloud' then
-    select count(*) into v_live_phone from screening_v2.call_sessions s
-     where s.mode = 'live' and s.status in ('created', 'waiting', 'in_progress');
+    -- R1-side check; phone admission is intentionally not gated; irrelevant when livekit_target='r1' (self-hosted SFU).
+    select count(*) into v_live_phone from screening_v2.phone_call_attempts p
+     where p.state in ('admitted','ringing','answered_unclassified','human','machine')
+       and p.lease_expires_at > now();
     if v_live_r1 + v_live_phone >= 4 then return jsonb_build_object('status', 'cloud_capacity_exhausted'); end if;
   end if;
 
@@ -293,5 +337,6 @@ grant all privileges on screening_v2.interview_rounds, screening_v2.interview_ro
 revoke all on function screening_v2.r1_admit_attempt(uuid, text, timestamptz) from public, anon, authenticated;
 grant execute on function screening_v2.r1_admit_attempt(uuid, text, timestamptz) to service_role;
 revoke all on function screening_v2.reject_ashby_r1_role_mapping() from public, anon, authenticated;
+revoke all on function screening_v2.reject_ashby_r1_role_kind_update() from public, anon, authenticated;
 revoke all on function screening_v2.audit_r1_settings_change() from public, anon, authenticated;
 revoke all on function screening_v2.prevent_interview_round_consent_template_mutation() from public, anon, authenticated;
