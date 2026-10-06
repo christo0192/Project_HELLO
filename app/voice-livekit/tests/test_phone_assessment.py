@@ -297,7 +297,10 @@ class TestGateCopyIsNotATurn(unittest.TestCase):
     def test_every_fixed_line_the_bot_speaks_is_recognised(self):
         for text in (
             phone.PHONE_DISCLOSURE_TEXT,
-            phone.PHONE_REASK_TEXT,
+            phone.PHONE_CONSENT_REASK_UNCLEAR_TEXT,
+            phone.PHONE_CONSENT_REASK_SILENCE_TEXT,
+            phone.PHONE_CONSENT_REASK_QUESTION_TEXT,
+            phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT,
             phone.PHONE_REFUSED_TEXT,
             phone.PHONE_OPT_OUT_TEXT,
             phone.PHONE_WRONG_NUMBER_TEXT,

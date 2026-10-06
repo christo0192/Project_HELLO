@@ -13,7 +13,9 @@ gate MUST do on a call and that the code does not do yet.
   which still reproduces production to the millisecond: with no VAD timing
   the gate falls back to the SDK's speech start, i.e. origin/main.
 * ``TestReplay32757295Busy.test_silence_at_consent_after_a_spoken_identity_reply_is_not_machine``
-  — flipped by T02 (never "machine" after a person spoke).
+  — FLIPPED by T02 (never "machine" after a person spoke). Its origin/main
+  characterisation (identity "Hello", silent consent, re-ask, MACHINE) is
+  deleted; the flipped test asserts the deferral that replaced it.
 
 The task that makes a marker pass removes its decorator and deletes the matching
 ``test_origin_main_reproduces_*`` characterisation, which pins today's failure
@@ -189,6 +191,11 @@ class TestReplayGlueMatchesAgent(unittest.TestCase):
         self.assertIn("phone.phone_identity_answer_timeout_sec(),", block)
         self.assertIn('speaking=lambda: bool(candidate_speaking.get("value")),', block)
         self.assertIn("hard_timeout_sec=phone.phone_classify_answer_timeout_sec(),", block)
+        # T02: one "a person spoke" latch per call, shared by every reader.
+        self.assertIn("gate_spoke = gate_judge.HumanSpeechLatch()", self.src)
+        self.assertIn("spoke=gate_spoke,", block)
+        classify = self.src[self.src.index("async def classify() -> str:"):]
+        self.assertIn("spoke=gate_spoke,", classify[:700])
 
     def test_the_speaking_latch_follows_the_vad_stream(self):
         vad = self.src[self.src.index("def _on_phone_vad_event"):]
@@ -240,7 +247,8 @@ class TestHarnessDrivesTheRealCode(unittest.TestCase):
         self.assertNotIn("reask", result.spoken_kinds())
 
     def test_MUTATION_the_real_classifier_is_in_the_path(self):
-        with patch.object(agent_mod, "classify_answer_text", lambda _t: phone.CLASSIFY_REFUSED):
+        with patch.object(agent_mod, "classify_answer_text",
+                          lambda _t, **_kw: phone.CLASSIFY_REFUSED):
             result = gr.replay("32757295")
         self.assertEqual(result.decision, phone.CLASSIFY_REFUSED)
 
@@ -444,20 +452,36 @@ class TestReplay32757295Busy(unittest.TestCase):
         finals_before_verdict = [f.t_ms for f in self.fixture.stt_finals if f.t_ms < verdict_at]
         self.assertEqual(len(finals_before_verdict), 2)
 
-    def test_origin_main_reproduces_machine_after_a_spoken_identity_reply(self):
-        """Today's failure. T02 deletes this when it flips the marker below."""
+    def test_silence_at_consent_after_a_spoken_identity_reply_is_not_machine(self):
+        """FLIPPED by T02. A person answered the identity question: never voicemail.
+
+        origin/main read "Hello" at identity, heard nothing at consent, re-asked
+        "I just need a yes or a no", heard nothing again and ended the call as
+        MACHINE in silence. Now the identity reply latches "a person spoke",
+        the re-ask is worded for silence, and the reader returns the deferral
+        (the gate then speaks the goodbye and posts
+        `candidate.deferred_pre_disclosure`; see test_phone_gate_no_machine).
+        """
         r = self.silent
         self.assertEqual(r.identity_reply, "Hello")
-        self.assertEqual(r.decision, phone.CLASSIFY_MACHINE)
-        self.assertEqual(len(r.logs_of("phone_classify_fallback_machine", "no_speech")), 1)
-        self.assertEqual(r.spoken_kinds(), ["identity", "consent", "reask"])
-
-    @unittest.expectedFailure
-    def test_silence_at_consent_after_a_spoken_identity_reply_is_not_machine(self):
-        """RED until T02. A person answered the identity question: never voicemail."""
-        r = self.silent
+        self.assertTrue(r.glue.spoke.spoke)
+        self.assertEqual(r.glue.spoke.source, gate_judge.SPOKE_SOURCE_IDENTITY)
         self.assertNotEqual(r.decision, phone.CLASSIFY_MACHINE)
+        self.assertEqual(r.decision, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
         self.assertEqual(r.logs_of("phone_classify_fallback_machine"), [])
+        deferrals = r.logs_of("phone_classify_fallback_deferral", "no_speech_after_spoke")
+        self.assertEqual(len(deferrals), 1)
+        self.assertEqual(deferrals[0].fields["phase"], gate_judge.SPOKE_SOURCE_IDENTITY)
+        self.assertEqual(r.spoken_kinds(), ["identity", "consent", "reask"])
+        self.assertEqual(r.spoken[-1].text, phone.PHONE_CONSENT_REASK_SILENCE_TEXT)
+
+    def test_the_busy_reply_is_never_a_reask_and_never_machine(self):
+        """T02 acceptance (legacy mode): busy goes to the callback flow."""
+        r = self.result
+        self.assertEqual(r.decision, phone.CLASSIFY_CALLBACK_REQUESTED)
+        self.assertNotIn("reask", r.spoken_kinds())
+        self.assertEqual(r.logs_of("phone_classify_fallback_machine"), [])
+        self.assertEqual(r.logs_of("phone_consent_reask"), [])
 
 
 def _vad(start_ms: int, end_ms: int) -> tuple:
@@ -620,15 +644,18 @@ class TestShapeReplays(unittest.TestCase):
         self.assertEqual(moved.committed_turns[0], fixture.committed_turns[0])
         self.assertEqual(moved.committed_turns[1].started_speaking_at_ms, okay_commit + 240)
 
-    def test_8b7df64a_is_a_legacy_false_grant(self):
-        """origin/main grants on the leading "yes" (an offline-bank false grant).
+    def test_8b7df64a_is_no_longer_a_legacy_false_grant(self):
+        """origin/main granted on the leading "yes" (an offline-bank false grant).
 
-        T05 (llm mode) must refuse it. The legacy regex is allowed to keep it as
-        the judge-unavailable fallback (owner decision 1), so this pins today's
-        legacy behaviour rather than marking it red.
+        T02's busy group ("some other time", "busy right now") is checked
+        before the anchored affirmative, so even the legacy regex now routes
+        this turn to the callback flow instead of recording on "Uh, yes". T05
+        (llm mode) must refuse it too.
         """
         result = gr.replay("8b7df64a_shape")
-        self.assertEqual(result.decision, phone.CLASSIFY_HUMAN)
+        self.assertNotEqual(result.decision, phone.CLASSIFY_HUMAN)
+        self.assertEqual(result.decision, phone.CLASSIFY_CALLBACK_REQUESTED)
+        self.assertNotIn("reask", result.spoken_kinds())
 
 
 if __name__ == "__main__":

@@ -72,7 +72,10 @@ class ConversationGateTests(unittest.IsolatedAsyncioTestCase):
                 client.confirm_callback.assert_awaited_once()
                 self.assertTrue(phases["terminal_posted"])
                 self.assertEqual(events, ["call.answered"])
-                self.assertNotIn(phone.PHONE_REASK_TEXT, spoken)
+                for reask in (phone.PHONE_CONSENT_REASK_UNCLEAR_TEXT,
+                              phone.PHONE_CONSENT_REASK_SILENCE_TEXT,
+                              phone.PHONE_CONSENT_REASK_QUESTION_TEXT):
+                    self.assertNotIn(reask, spoken)
 
     async def test_busy_at_identity_also_books_without_reading_consent(self):
         result, client, spoken, _, _ = await self.gate(["I'm driving", "tomorrow at 3 pm"], identity=True)

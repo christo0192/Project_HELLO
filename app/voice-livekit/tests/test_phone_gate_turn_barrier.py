@@ -311,8 +311,7 @@ class TestClassifyPhoneAnswerSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision, phone.CLASSIFY_HUMAN)
         self.assertNotIn("...how can I help?", consumed)
         self.assertEqual(consumed, ["Yes, that's fine."])
-        self.assertNotIn(phone.PHONE_REASK_TEXT, said,
-                         "a stale turn burned the single re-ask")
+        self.assertEqual(said, [], "a stale turn burned the single re-ask")
 
     async def test_a_genuine_answer_after_the_question_is_read(self):
         decision, _, consumed = await self._classify(
@@ -356,8 +355,11 @@ class TestClassifyPhoneAnswerSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
         skips = sink.of("phone_gate_turn_barrier", "consent_turn_not_grant_evidence")
         self.assertEqual(len(skips), 1)
         self.assertEqual(skips[0]["phase"], gate_judge.TAG_NO_SEGMENT)
-        # It was heard, so the re-ask says "unmatched", not "no_speech".
-        self.assertIn(phone.PHONE_REASK_TEXT, said)
+        # It was heard, so the re-ask says "unmatched", not "no_speech", and
+        # is worded for an unclear reply rather than for silence (T02).
+        self.assertIn(phone.PHONE_CONSENT_REASK_UNCLEAR_TEXT, said)
+        # A person spoke after the question: never "machine" (T02).
+        self.assertEqual(decision, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
         self.assertEqual(
             [f["error_category"] for f in sink.of("phone_consent_reask")], ["unmatched"])
 
@@ -1303,7 +1305,7 @@ class TestConsumedOnce(unittest.IsolatedAsyncioTestCase):
         decision = await agent_mod._classify_phone_answer(
             turns, _say, answer_timeout_sec=0.2, consumed=consumed,
             question_anchor=(lambda: _T0 + 4_000))
-        self.assertEqual(said, [phone.PHONE_REASK_TEXT])
+        self.assertEqual(said, [phone.PHONE_CONSENT_REASK_UNCLEAR_TEXT])
         self.assertEqual(consumed, ["Hmm", "Yes, go ahead."])
         self.assertEqual(decision, phone.CLASSIFY_HUMAN)
 

@@ -1426,19 +1426,29 @@ class TestPhoneGate(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("assessment.completed", client.event_types)
         self.assertNotIn("disclosure.delivered", client.event_types)
 
-    async def test_classifier_timeout_is_a_machine(self):
+    async def test_classifier_timeout_is_a_spoken_deferral_not_a_machine(self):
+        # M013 S01 T02: the backstop firing means OUR side hung, not that a
+        # voicemail answered. A person may be on the line: goodbye + deferral.
         result, client, recorder = await self._gate("__hang__")
-        self.assertEqual(result.outcome, phone.CLASSIFY_MACHINE)
-        self.assertEqual(client.event_types, ["classify.machine"])
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertEqual(client.event_types, ["candidate.deferred_pre_disclosure"])
+        self.assertEqual(recorder.spoken[-1], phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+        self.assertFalse(result.assessment_allowed)
         self.assertEqual(recorder.recording_calls, 0)
 
-    async def test_broken_or_unknown_classifier_is_a_machine(self):
-        for decision in (RuntimeError("boom"), "definitely-not-a-verdict", None):
+    async def test_broken_or_unknown_classifier_is_a_spoken_deferral_never_consent(self):
+        for decision in (RuntimeError("boom"), "definitely-not-a-verdict", None,
+                         phone.CLASSIFY_CALLBACK_REQUESTED):
             with self.subTest(decision=decision):
                 result, client, recorder = await self._gate(decision)
-                self.assertEqual(result.outcome, phone.CLASSIFY_MACHINE)
-                self.assertEqual(client.event_types, ["classify.machine"])
+                self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+                self.assertEqual(client.event_types, ["candidate.deferred_pre_disclosure"])
+                self.assertEqual(recorder.spoken[-1], phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+                self.assertFalse(result.assessment_allowed)
+                self.assertFalse(result.recording_allowed)
                 self.assertEqual(recorder.recording_calls, 0)
+                self.assertNotIn("classify.human", client.event_types)
+                self.assertNotIn("disclosure.delivered", client.event_types)
 
     async def test_human_affirmative_orders_events_then_recording(self):
         result, client, recorder = await self._gate(phone.CLASSIFY_HUMAN)
@@ -2210,9 +2220,10 @@ class TestPhoneParity2Gate(unittest.IsolatedAsyncioTestCase):
                 say=recorder.say, classify_timeout_sec=0.02,
                 session_id=_SESSION_ID, epoch=_EPOCH, post_call_answered=True,
             )
-        # A classify timeout fails closed to machine — the diagnostic log is the
-        # point, and the machine verdict proves the timeout path was taken.
-        self.assertEqual(result.outcome, phone.CLASSIFY_MACHINE)
+        # A classify timeout is a spoken deferral (M013 S01 T02), never a
+        # machine — the diagnostic log is the point, and the deferral proves
+        # the timeout path was taken.
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
 
     # ── F2: durable consent on re-dispatch never re-asks ─────────────────
     # A worker deploy/crash mid-call re-dispatches the leg into a conversation
@@ -3267,7 +3278,7 @@ class TestAnswerClassifier(unittest.TestCase):
 
         The classifier is fully deterministic — pure regex, no model — so an
         unmatched phrasing re-asks EVERY time for that candidate, and
-        `PHONE_REASK_TEXT` ("Sorry, I just need a yes or a no") is what they
+        the old fixed re-ask (retired by M013 S01 T02 for worded re-asks) is what they
         hear. Fourteen of forty-eight natural ways to say yes returned None.
 
         These are complete, unambiguous answers to "is it okay to continue?".
@@ -3447,7 +3458,7 @@ class TestAnswerClassifier(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(agent_mod.classify_answer_text(text))
 
-    def test_reask_once_then_fail_closed_to_machine(self):
+    def test_reask_once_then_DEFER_a_person_who_spoke(self):
         async def _test():
             turns: asyncio.Queue = asyncio.Queue()
             turns.put_nowait("Hmm, who is this exactly?")
@@ -3461,8 +3472,10 @@ class TestAnswerClassifier(unittest.TestCase):
             return decision, spoken
 
         decision, spoken = _run(_test())
-        self.assertEqual(decision, phone.CLASSIFY_MACHINE)
-        self.assertEqual(spoken, [phone.PHONE_REASK_TEXT])
+        # M013 S01 T02: the person spoke, so this is never "machine".
+        self.assertEqual(decision, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        # A question back gets the re-ask worded for a question.
+        self.assertEqual(spoken, [phone.PHONE_CONSENT_REASK_QUESTION_TEXT])
 
     def test_reask_recovers_a_late_affirmative(self):
         async def _test():
@@ -3495,9 +3508,11 @@ class TestAnswerClassifier(unittest.TestCase):
             return decision, spoken
 
         decision, spoken = _run(_test())
+        # Nobody was heard at all: the one exit that is still MACHINE.
         self.assertEqual(decision, phone.CLASSIFY_MACHINE)
-        # exactly one re-ask between the two independently-bounded attempts
-        self.assertEqual(spoken, [phone.PHONE_REASK_TEXT])
+        # exactly one re-ask between the two independently-bounded attempts,
+        # worded for silence (M013 S01 T02)
+        self.assertEqual(spoken, [phone.PHONE_CONSENT_REASK_SILENCE_TEXT])
 
     def test_reask_second_answer_gets_its_own_window(self):
         # The affirmative arrives only AFTER the re-ask, partway into the second
@@ -3539,14 +3554,22 @@ class TestAnswerClassifier(unittest.TestCase):
             return _run(_test())
 
         decision, log = _run_case("who is this exactly?", "still not sure what you want")
-        self.assertEqual(decision, phone.CLASSIFY_MACHINE)
+        # M013 S01 T02: a responsive line is a person, so it DEFERS; the
+        # category still says why.
+        self.assertEqual(decision, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
         log.warn.assert_called_once()
+        self.assertEqual(
+            log.warn.call_args.kwargs.get("error_type"), "phone_classify_fallback_deferral"
+        )
         self.assertEqual(
             log.warn.call_args.kwargs.get("error_category"), "responsive_unmatched"
         )
 
         decision, log = _run_case("", "   ")
         self.assertEqual(decision, phone.CLASSIFY_MACHINE)
+        self.assertEqual(
+            log.warn.call_args.kwargs.get("error_type"), "phone_classify_fallback_machine"
+        )
         self.assertEqual(
             log.warn.call_args.kwargs.get("error_category"), "no_speech"
         )
@@ -8110,7 +8133,10 @@ class TestNumberNeverCarried(unittest.IsolatedAsyncioTestCase):
         digits = phone._DIGIT_RUN_RE
         for text in (
             phone.PHONE_DISCLOSURE_TEXT,
-            phone.PHONE_REASK_TEXT,
+            phone.PHONE_CONSENT_REASK_UNCLEAR_TEXT,
+            phone.PHONE_CONSENT_REASK_SILENCE_TEXT,
+            phone.PHONE_CONSENT_REASK_QUESTION_TEXT,
+            phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT,
             phone.PHONE_REFUSED_TEXT,
             phone.PHONE_OPT_OUT_TEXT,
             phone.PHONE_WRONG_NUMBER_TEXT,

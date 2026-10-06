@@ -53,6 +53,7 @@ from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
+import gate_judge
 from observability import StructuredLogger, get_correlation_id
 from provider_resilience import (
     BusinessError,
@@ -464,12 +465,60 @@ PHONE_WITHDRAWAL_CONFIRM_REASK_TEXT = (
     "Sorry, just so I get this right: should I stop here, or carry on with "
     "the questions?"
 )
-# Asked once when the first response cannot be read as any of the five outcomes.
-# Consent must be affirmative, so an unreadable answer is re-asked rather than
-# assumed either way.
-PHONE_REASK_TEXT = (
-    "Sorry, I just need a yes or a no — is it okay if we carry on with this "
+# ── The consent re-ask, worded by WHY it is asked (M013 S01 T02) ──────────
+# Asked at most once when the first reply cannot be read as an outcome. Consent
+# must be affirmative, so an unreadable answer is re-asked rather than assumed
+# either way. The old single line demanded "a yes or a no", which is the wrong
+# thing to say to somebody who just said they are busy (that is a callback now,
+# never a re-ask), who asked a question, or who said nothing at all. These are
+# gate copy, not the AI disclosure, and they are never spoken after a grant or
+# a busy verdict. Every one is registered in `gate_copy_texts`.
+CONSENT_REASK_UNCLEAR = "unclear"
+CONSENT_REASK_SILENCE = "silence"
+CONSENT_REASK_QUESTION = "question"
+#: The reply was heard but did not answer the question.
+PHONE_CONSENT_REASK_UNCLEAR_TEXT = (
+    "Sorry, I didn't quite catch that. Is it okay if we carry on with this "
     "recorded call?"
+)
+#: Nothing usable was heard in the answer window.
+PHONE_CONSENT_REASK_SILENCE_TEXT = (
+    "Sorry, I couldn't hear a reply. Is it okay if we carry on with this "
+    "recorded call?"
+)
+#: The reply was a question back ("who is this?", "what is this about?"). It
+#: restates the purpose and repeats the recording sentence VERBATIM, then asks
+#: again. It says nothing about being an AI (owner constraint: no new AI
+#: wording); T05 adds the fixed FAQ answers on top of this.
+PHONE_CONSENT_REASK_QUESTION_TEXT = (
+    "Sure. It's a short screening call about your job application. "
+    "This call is recorded so the hiring team can review it. "
+    "Is it okay if we carry on?"
+)
+_CONSENT_REASK_TEXTS: dict[str, str] = {
+    CONSENT_REASK_UNCLEAR: PHONE_CONSENT_REASK_UNCLEAR_TEXT,
+    CONSENT_REASK_SILENCE: PHONE_CONSENT_REASK_SILENCE_TEXT,
+    CONSENT_REASK_QUESTION: PHONE_CONSENT_REASK_QUESTION_TEXT,
+}
+
+
+def phone_consent_reask_text(reason: Any) -> str:
+    """The consent re-ask for ``reason``; an unknown reason is ``unclear``."""
+    return _CONSENT_REASK_TEXTS.get(
+        reason if isinstance(reason, str) else "", PHONE_CONSENT_REASK_UNCLEAR_TEXT,
+    )
+
+
+#: The goodbye spoken on every pre-consent DEFERRAL that has no more specific
+#: line of its own: silence or an unreadable reply after a person spoke, a
+#: classifier timeout, exception or unknown verdict, and the gate wall-clock
+#: overrun. A person who spoke is never hung up on in silence as "voicemail"
+#: (S01 T02). It promises only what `candidate.deferred_pre_disclosure` does:
+#: the attempt ends uncharged and the team tries again another day. Kept SHORT
+#: (about 4 s of audio): on a wall-clock overrun it must play inside the 4 s
+#: goodbye bound before the room is torn down.
+PHONE_GATE_DEFERRAL_GOODBYE_TEXT = (
+    "Sorry, I'll let you go for now. Our team will call you another time. Bye!"
 )
 PHONE_WRONG_NUMBER_TEXT = (
     "Sorry about that, I've reached the wrong person. I'll have this number "
@@ -833,7 +882,11 @@ def gate_copy_texts() -> frozenset[str]:
         # skip, binding the candidate's first answer to the disclosure text
         # instead of Q1.
         PHONE_DISCLOSURE_CONTINUATION_TEXT,
-        PHONE_REASK_TEXT,
+        # M013 S01 T02: the reason-specific consent re-asks and the deferral
+        # goodbye. Unregistered, any of them would reach `latest_assistant[0]`
+        # and break the Q1 priming guard exactly as described above.
+        *_CONSENT_REASK_TEXTS.values(),
+        PHONE_GATE_DEFERRAL_GOODBYE_TEXT,
         PHONE_REFUSED_TEXT,
         PHONE_OPT_OUT_TEXT,
         # M009 PR-C (C7): the mid-call withdrawal confirmation and its single
@@ -1331,8 +1384,44 @@ def phone_classify_timeout_sec() -> float:
     beat late — or answered the wrong (identity) question and needed the re-ask —
     was torn down to MACHINE before they could answer. This outer bound is now
     only a hung-classifier backstop, sized above the per-attempt budget.
+
+    M013 S01 T02: DERIVED, and an explicit value can only RAISE it. The fixed
+    40 s wrapped 2 x 15 s answer windows plus one re-ask playout with almost no
+    room; one judge round-trip per attempt, or a slower re-ask, overflowed it
+    and the expiry used to be "machine". The effective backstop is now
+    ``max(configured, phone_classify_backstop_floor_sec())``, so
+    fly.phone.toml's ``PHONE_CLASSIFY_TIMEOUT_SEC = "40"`` can no longer cut a
+    consent read short. Its expiry is a spoken deferral, never "machine".
     """
-    return _bounded_float(os.getenv("PHONE_CLASSIFY_TIMEOUT_SEC"), 40.0, 1.0, 120.0)
+    configured = _bounded_float(
+        os.getenv("PHONE_CLASSIFY_TIMEOUT_SEC"), 40.0, 1.0, 120.0)
+    return max(configured, phone_classify_backstop_floor_sec())
+
+
+#: How many answers the consent reader takes: the first, and one re-ask.
+PHONE_CONSENT_ATTEMPTS = 2
+#: A conservative playout estimate for one consent-phase line (the re-ask).
+_CONSENT_LINE_ESTIMATE_SEC = 6.0
+#: Slack on top of the derived consent budget.
+_CONSENT_BACKSTOP_MARGIN_SEC = 5.0
+
+
+def phone_classify_backstop_floor_sec() -> float:
+    """The smallest consent backstop that cannot cut off a real answer.
+
+    attempts x (answer window + line + judge timeout) + margin. With the
+    defaults that is 2 x (15 + 6 + 2.5) + 5 = 52 s. The judge timeout is
+    counted even in legacy mode: a backstop that is a few seconds generous
+    costs nothing, one that is short ends a call a person is answering.
+    """
+    return (
+        PHONE_CONSENT_ATTEMPTS * (
+            phone_classify_answer_timeout_sec()
+            + _CONSENT_LINE_ESTIMATE_SEC
+            + gate_judge.judge_timeout_sec()
+        )
+        + _CONSENT_BACKSTOP_MARGIN_SEC
+    )
 
 
 def phone_classify_answer_timeout_sec() -> float:
@@ -7302,6 +7391,27 @@ async def run_phone_gate(
         await _say(PHONE_CANDIDATE_END_TEXT)
         return result
 
+    async def _defer_with_goodbye(schema: str) -> PhoneGateResult:
+        """M013 S01 T02: the deferral every "a person may be here" exit ends in.
+
+        Posts `candidate.deferred_pre_disclosure` (uncharged, next IST-day
+        window, per 0114) FIRST, like every terminal here, then says the
+        goodbye. A hang-up during the goodbye is the expected ending: the
+        terminal is already posted, so it is swallowed rather than allowed to
+        reach the call site's participant-gone handler and post a second one.
+        """
+        result = await _terminal_outcome(
+            CLASSIFY_DEFERRED_PRE_DISCLOSURE, schema=schema,
+        )
+        try:
+            await _say(PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+        except PhoneParticipantGone:
+            _log.info(
+                "unknown_event", error_type="phone_gate_outcome",
+                error_category="deferral_goodbye_unheard_participant_gone",
+            )
+        return result
+
     async def _schedule_before_consent(first_reply: str) -> PhoneGateResult:
         """Use the existing calendar pipeline without authorizing screening."""
         await _await_answered_post()
@@ -7345,7 +7455,8 @@ async def run_phone_gate(
             await _say(decision.spoken)
             reader = next_callback_turn or next_candidate_turn
             reply = await reader() if reader else ""
-        return await _terminal_outcome(CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        # Out of turns: still a goodbye, never a silent hang-up (S01 T02).
+        return await _defer_with_goodbye("callback_turns_exhausted")
 
     identity_reply = ""
     if identity_ran:
@@ -7566,6 +7677,9 @@ async def run_phone_gate(
                 "unknown_event", error_type="phone_consent_endpointing",
                 schema="tightened", duration_sec=consent_max,
             )
+    # M013 S01 T02: why a consent read ended in a deferral, as a fixed category
+    # for the outcome log. Never text.
+    deferral_schema = "consent_deferred"
     try:
         decision = await asyncio.wait_for(classify(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -7576,10 +7690,22 @@ async def run_phone_gate(
             "unknown_event", error_type="phone_gate_timeout",
             error_category="classify",
         )
-        decision = CLASSIFY_MACHINE
+        # A DEFERRAL, not "machine" (S01 T02). The backstop is sized above the
+        # reader's own budget, so reaching it means our side hung, not that a
+        # voicemail answered; the person who may be on the line hears a
+        # goodbye and is tried again another day, uncharged.
+        decision = CLASSIFY_DEFERRED_PRE_DISCLOSURE
+        deferral_schema = "consent_classify_timeout"
     except Exception:  # noqa: BLE001
-        # A broken classifier must not become consent.
-        decision = CLASSIFY_MACHINE
+        # A broken classifier must not become consent — nor "machine" for a
+        # person who may be on the line. Deferral is the one verdict that is
+        # neither.
+        _log.warn(
+            "unknown_event", error_type="phone_gate_classify",
+            error_category="classify_failed",
+        )
+        decision = CLASSIFY_DEFERRED_PRE_DISCLOSURE
+        deferral_schema = "consent_classify_failed"
     finally:
         if tightened_endpointing:
             try:
@@ -7601,7 +7727,20 @@ async def run_phone_gate(
     if decision == CLASSIFY_CALLBACK_REQUESTED and consent_reply_out:
         return await _schedule_before_consent(consent_reply_out[-1])
     if decision not in PHONE_CLASSIFICATIONS:
-        decision = CLASSIFY_MACHINE
+        # The reader's own deferral (a person spoke, then nothing readable),
+        # an unknown or coerced verdict (including a callback request with no
+        # reply to schedule from), a timeout or a classifier error: a spoken
+        # goodbye and `candidate.deferred_pre_disclosure`. Never "machine" —
+        # that verdict is reserved for a line on which no person was heard.
+        # Still fail-closed for consent: none of these is in the consent
+        # vocabulary, so none can reach the HUMAN branch below.
+        if decision != CLASSIFY_DEFERRED_PRE_DISCLOSURE:
+            _log.warn(
+                "unknown_event", error_type="phone_gate_outcome",
+                error_category="consent_verdict_unknown",
+            )
+            deferral_schema = "consent_verdict_unknown"
+        return await _defer_with_goodbye(deferral_schema)
 
     if decision != CLASSIFY_HUMAN:
         return await _terminal_outcome(decision)

@@ -468,6 +468,85 @@ def _phone_gate_wall_clock_seconds() -> float:
     return pre_answer + PHONE_GATE_MAX_SECONDS
 
 
+#: The whole budget for the goodbye spoken when the gate overruns its wall
+#: clock: interrupting what is playing, then the line itself.
+_GATE_GOODBYE_BOUND_SEC = 4.0
+#: How long the interrupted gate line may take to drain before the goodbye.
+#: A line still playing after a FORCED interrupt is a wedged playout, and a
+#: goodbye queued behind it would wedge too: it is skipped, not awaited.
+_GATE_GOODBYE_DRAIN_SEC = 1.0
+
+
+async def _speak_gate_goodbye_bounded(
+    session: Any,
+    say: "Callable[[str], Awaitable[Any]]",
+    text: str,
+    *,
+    pending_speech: Any = None,
+    timeout_sec: float = _GATE_GOODBYE_BOUND_SEC,
+    drain_sec: float = _GATE_GOODBYE_DRAIN_SEC,
+) -> str:
+    """Interrupt whatever is playing, then speak ``text``; bounded, never raises.
+
+    M013 S01 T02. Used only when the gate overruns `PHONE_GATE_MAX_SECONDS`
+    after the answer and BEFORE durable consent: the person on the line hears
+    a goodbye instead of the call simply going dead. The gate's own lines are
+    non-interruptible, so the in-flight one (``pending_speech``, the likely
+    wedge) is force-interrupted first and given ``drain_sec`` to stop.
+
+    Returns a fixed outcome category (`spoken`, `timeout`, `failed`,
+    `skipped_wedged`), which is also logged. Swallows every error: teardown
+    must still run after it. A cancellation of the caller is NOT swallowed.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, float(timeout_sec))
+    interrupted = "none"
+    interrupt = getattr(session, "interrupt", None)
+    if callable(interrupt):
+        try:
+            pending = interrupt(force=True)
+            if inspect.isawaitable(pending):
+                await asyncio.wait_for(pending, timeout=max(
+                    0.0, min(float(drain_sec), deadline - loop.time())))
+            interrupted = "ok"
+        except Exception:  # noqa: BLE001 — still try to say goodbye
+            interrupted = "failed"
+    if pending_speech is not None:
+        try:
+            speech_interrupt = getattr(pending_speech, "interrupt", None)
+            if callable(speech_interrupt):
+                speech_interrupt(force=True)
+        except Exception:  # noqa: BLE001
+            pass
+        drain = getattr(pending_speech, "wait_for_playout", None)
+        if callable(drain):
+            try:
+                await asyncio.wait_for(drain(), timeout=max(
+                    0.0, min(float(drain_sec), deadline - loop.time())))
+            except asyncio.TimeoutError:
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_overrun_goodbye",
+                    error_category="skipped_wedged",
+                    phase=f"interrupt_{interrupted}",
+                )
+                return "skipped_wedged"
+            except Exception:  # noqa: BLE001 — an ended playout is drained
+                pass
+    try:
+        await asyncio.wait_for(
+            say(text), timeout=max(0.0, deadline - loop.time()))
+        outcome = "spoken"
+    except asyncio.TimeoutError:
+        outcome = "timeout"
+    except Exception:  # noqa: BLE001 — a goodbye must never break teardown
+        outcome = "failed"
+    _log.info(
+        "unknown_event", error_type="phone_gate_overrun_goodbye",
+        error_category=outcome, phase=f"interrupt_{interrupted}",
+    )
+    return outcome
+
+
 def _int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw in (None, ""):
@@ -1280,6 +1359,8 @@ async def _read_fresh_turn(
     *,
     speaking: "Callable[[], bool] | None" = None,
     hard_timeout_sec: float | None = None,
+    spoke: "gate_judge.HumanSpeechLatch | None" = None,
+    spoke_source: str = gate_judge.SPOKE_SOURCE_IDENTITY,
 ) -> str:
     """Pop the first utterance that began AFTER the question, within one budget.
 
@@ -1295,6 +1376,10 @@ async def _read_fresh_turn(
     Stale utterances are skipped WITHIN the same budget: one must not buy the
     candidate extra time, nor spend theirs. Returns "" when the budget runs out,
     which the caller reads as "nothing usable" rather than as an answer.
+
+    M013 S01 T02: the reply it returns sets the call's ``spoke`` latch unless it
+    is machine wording, so a person who answered the identity question can
+    never later be hung up on as a voicemail. A stale reply never sets it.
     """
     deadline = time.monotonic() + timeout_sec
     # NEVER WAIT LONGER THAN THE CALLER'S OLD BUDGET, however much the candidate
@@ -1340,6 +1425,10 @@ async def _read_fresh_turn(
             _log_gate_turn_skip(
                 "pre_question_turn_skipped", item, anchor_ms, question_ms)
             continue
+        if spoke is not None and isinstance(text, str):
+            spoke.note_reply(
+                text, machine_match=_is_machine_text(text), source=spoke_source,
+            )
         return text
 
 
@@ -2846,12 +2935,64 @@ async def _wait_for_sip_answer(
 #: it is the bound that makes the filler alternation safe against a hum.
 _REPEATED_RUN_RE = re.compile(r"(.)\1{3,}", re.DOTALL)
 
+#: Unmistakable answering-machine / carrier / IVR wording. A match is "machine"
+#: only while no human-directed speech has been heard on the call (see
+#: `classify_answer_text(candidate_spoke=...)`, M013 S01 T02).
+#:
+#: Indian carrier and IVR prompts are here because a carrier message heard at
+#: the identity turn must NOT read as a person: it would set the "a person
+#: spoke" latch, and the call could then never end as machine. Romanised and
+#: Devanagari, as Sarvam transcribes them.
 _MACHINE_RE = re.compile(
     r"leave (?:a )?(?:your )?message|after the (?:tone|beep)|voice\s?mail|"
-    r"not available (?:right now|at the moment)|record your message|"
-    r"press \d|unable to take your call",
+    r"record your message|press \d|"
+    # Carrier: "The number you are calling is not reachable / switched off",
+    # "the subscriber you have dialled cannot be reached".
+    r"\b(?:number|subscriber|person|customer)\s+you\s+(?:are|have)\s+"
+    r"(?:calling|called|dialled|dialed|trying\s+to\s+reach)\b|"
+    r"\baap\s+jis\s+(?:number|vyakti)\b|\bjis\s+number\s+(?:par|pe|ko)\s+aap\b|"
+    r"\bsandesh\s+chhod|"
+    # Devanagari, spelled as escapes so the nukta form cannot drift: STT emits
+    # both the precomposed U+095C and U+0921 U+093C for the same letter.
+    #   आप जिस नंबर / नम्बर / व्यक्ति   ("the number / person you …")
+    "आप\\s*जिस\\s*(?:नंबर|"
+    "नम्बर|व्यक्ति)|"
+    #   संदेश छोड़   ("leave a message")
+    "संदेश\\s*छो(?:ड़|ड़)|"
+    #   पहुंच / पहुँच से बाहर   ("out of reach")
+    "पहु(?:ं|ँ)च\\s*से\\s*"
+    "बाहर",
     re.IGNORECASE,
 )
+#: Availability wording a voicemail greeting uses — and a PERSON uses too.
+#: "The number you have dialled is not available right now" is a machine;
+#: "Sorry, I'm not available right now" is a human telling us it is a bad time.
+#: These count as machine only when the utterance has no first-person subject
+#: (nor a "he"/"she": a relative saying the candidate is unavailable is a
+#: person too; carrier prompts say "the person you are calling", never "she").
+_MACHINE_AVAILABILITY_RE = re.compile(
+    r"not available (?:right now|at the moment)|unable to take your call|"
+    r"\b(?:is|are)\s+(?:currently\s+)?(?:not\s+reachable|unreachable|"
+    r"switched\s+off|out\s+of\s+(?:service|coverage))\b",
+    re.IGNORECASE,
+)
+_FIRST_PERSON_RE = re.compile(
+    r"\b(?:i|i'?m|im|i\s+am|me|my|main|mai|he|she|he'?s|she'?s)\b|"
+    "मैं|मुझे",  # मैं, मुझे
+    re.IGNORECASE,
+)
+
+
+def _is_machine_text(value: str) -> bool:
+    """True when ``value`` reads as an answering machine, carrier or IVR."""
+    if not value:
+        return False
+    if _MACHINE_RE.search(value):
+        return True
+    return bool(
+        _MACHINE_AVAILABILITY_RE.search(value)
+        and not _FIRST_PERSON_RE.search(value.replace("’", "'"))
+    )
 _WRONG_NUMBER_RE = re.compile(
     r"wrong number|no one (?:by|with) that name|nobody (?:by|with) that name|"
     r"you(?:'ve| have) got the wrong",
@@ -3047,7 +3188,7 @@ _AFFIRMATIVE_RE = re.compile(
     r"uh[\s-]*huh|mm[\s-]*hmm|mhm|"
     # ── ADDED 2026-09-15 after a live double-ask ────────────────────────
     # Fourteen of forty-eight natural ways to say yes returned None and
-    # produced the re-ask ("Sorry, I just need a yes or a no"). The candidate
+    # produced the consent re-ask (since retired for worded re-asks). The candidate
     # had consented; the vocabulary simply did not contain their word. These
     # are the misses, each a complete answer to "is it okay to continue?".
     # `right`, `correct`, `good`, `great`, `cool`, `understood` were here and
@@ -3097,14 +3238,61 @@ _AFFIRMATIVE_RE = re.compile(
 #: "Right, can I call you back?" and "Alright, let me call you back" were read
 #: as consent on the strength of their first word.
 _AMBIGUOUS_RE = re.compile(
-    r"\bcall\s+(?:you|me)\s+back\b|\bcall\s+back\b|"
     r"\bhold\s+on\b|\bone\s+(?:second|sec|minute|min)\b|\bhang\s+on\b|"
     r"\bwho\s+is\s+this\b|\bwho'?s\s+this\b|"
     r"\bwhat\s+is\s+this\s+(?:about|regarding|for)\b|"
     r"\bwhat'?s\s+this\s+(?:about|regarding|for)\b|"
-    r"\bleave\s+me\s+alone\b|\bnot\s+a\s+good\s+time\b|"
-    r"\bi'?m\s+(?:busy|driving)\b|\bi\s+am\s+(?:busy|driving)\b|"
-    r"\bin\s+a\s+meeting\b|\bmaybe\s+later\b|\bnot\s+now\b",
+    r"\bleave\s+me\s+alone\b",
+    re.IGNORECASE,
+)
+
+#: BUSY / CALL ME BACK — never a yes/no re-ask (M013 S01 T02, roadmap 3).
+#:
+#: These used to live in `_AMBIGUOUS_RE` and therefore re-asked "Sorry, I just
+#: need a yes or a no" of somebody who had just said they were driving, then
+#: hung up on them as "machine" when they did not answer it. Each is a request
+#: for another time, so it goes to the pre-consent callback flow (#334's
+#: `_schedule_before_consent`), exactly like the bare "I'm busy" that
+#: `phone.phone_preconsent_callback_requested` already routes there.
+#:
+#: Checked where `_AMBIGUOUS_RE` was: AFTER every refusal branch, so "no
+#: thanks, not now" still refuses, and BEFORE the affirmative, so "Sure, but
+#: I'm driving" is a callback and never consent.
+_BUSY_RE = re.compile(
+    r"\bcall\s+(?:you|me)\s+back\b|\bcall\s+back\b|"
+    r"\b(?:call|ring|phone|talk|speak)\s+(?:me\s+|to\s+me\s+)?later\b|"
+    r"\bmaybe\s+later\b|\blater\s+(?:please|pls|plz)\b|"
+    r"\b(?:some\s*other|another|a\s+better|a\s+different)\s+time\b|"
+    r"\bnot\s+(?:a\s+)?(?:good|right|great|convenient)\s+time\b|"
+    r"\bbad\s+time\b|\bnot\s+now\b|\bnot\s+right\s+now\b|"
+    r"\b(?:i'?m|i\s+am|im)\s+(?:(?:really|very|currently|a\s+bit|kind\s+of|"
+    r"little|a\s+little)\s+)?(?:busy|driving|occupied|travel+ing|in\s+a\s+meeting|"
+    r"in\s+the\s+middle\s+of|out\s+somewhere)\b|"
+    r"\bin\s+a\s+meeting\b|\b(?:can'?t|cannot|can\s+not)\s+(?:talk|speak)\b|"
+    r"\breschedule\b|"
+    r"\b(?:i'?m|i\s+am|im)\s+(?:(?:currently|really|just)\s+)?not\s+"
+    r"(?:available|free)\b|"
+    r"\babhi\s+(?:nahi|nahin|busy)\b|\bbaad\s+(?:mein|me|main)\b",
+    re.IGNORECASE,
+)
+#: …unless the same turn says the opposite about NOW: "I am busy in the
+#: mornings but free now" is not a request for another time (#334's own
+#: negative case). It falls through to the re-ask instead.
+_BUSY_VETO_RE = re.compile(
+    # The lookbehind keeps "I'm not available right now" — the busy phrase
+    # itself — from vetoing its own match.
+    r"(?<!not\s)\b(?:free|available)\s+(?:right\s+)?now\b|"
+    r"\bnow\s+is\s+(?:fine|good|okay|ok)\b",
+    re.IGNORECASE,
+)
+
+#: A question back at the consent line: worded re-ask "question", not
+#: "unclear". Legacy only; the judge (T05) answers from a fixed FAQ instead.
+_CONSENT_QUESTION_RE = re.compile(
+    r"\?\s*$|^\s*(?:(?:um+|uh+|sorry|hello|hi|yes|yeah|ok|okay)[\s,.]*)*"
+    r"(?:who|what|why|how|which|when|where)\b|"
+    r"\bwho\s+is\s+this\b|\bwho'?s\s+this\b|\bwhat\s+is\s+this\b|"
+    r"\bwhat'?s\s+this\b",
     re.IGNORECASE,
 )
 
@@ -3159,12 +3347,17 @@ _RECORDING_CONFLICT_RE = re.compile(
 )
 
 
-def classify_answer_text(text: str) -> str | None:
+def classify_answer_text(text: str, *, candidate_spoke: bool = False) -> str | None:
     """Map one spoken response to a gate outcome, or None if unreadable.
 
     Order matters: opt-out and wrong-number are checked before refusal, because
     "don't call me again" is both, and the stronger, more suppressive reading is
     the one the candidate meant.
+
+    ``candidate_spoke`` (M013 S01 T02): once human-directed speech has been
+    heard on this call, machine wording never decides — "press 1" or "voice
+    mail" in a person's mouth is not an answering machine. The rest of the
+    turn is classified as if the machine branch did not exist.
     """
     value = (text or "").strip()
     if not value:
@@ -3185,7 +3378,7 @@ def classify_answer_text(text: str) -> str | None:
     # their meaning. Linear, and it runs before every branch, so the
     # machine/refusal patterns are protected too.
     value = _REPEATED_RUN_RE.sub(r"\1\1\1", value)
-    if _MACHINE_RE.search(value):
+    if not candidate_spoke and _is_machine_text(value):
         return phone.CLASSIFY_MACHINE
     if _WRONG_NUMBER_RE.search(value):
         return phone.CLASSIFY_WRONG_NUMBER
@@ -3201,6 +3394,13 @@ def classify_answer_text(text: str) -> str | None:
         return phone.CLASSIFY_REFUSED
     # Before the affirmative, deliberately: an `^`-anchored affirmative would
     # otherwise accept "Right, can I call you back?" on its first word.
+    if _BUSY_RE.search(value) and not _BUSY_VETO_RE.search(value):
+        # Busy / call me back is a callback, never a yes/no re-ask (T02). A
+        # recording objection in the same turn is not something to schedule
+        # around, so it keeps the re-ask, as the callback branch above does.
+        if _RECORDING_CONFLICT_RE.search(value):
+            return None
+        return phone.CLASSIFY_CALLBACK_REQUESTED
     if _AMBIGUOUS_RE.search(value):
         return None
     if _AFFIRMATIVE_RE.search(value):
@@ -3253,15 +3453,31 @@ async def _phone_recording_permitted() -> None:
     _log.info("unknown_event", error_type="phone_recording_permitted")
 
 
+def _consent_reask_reason(text: Any, *, heard: bool) -> str:
+    """Why the consent question is being asked again: a fixed category.
+
+    ``silence`` when nothing usable was heard, ``question`` when the reply was a
+    question back, ``unclear`` for everything else. Busy and grant verdicts
+    never reach a re-ask (they are decisions), so neither has a reason here.
+    """
+    value = text.strip() if isinstance(text, str) else ""
+    if not value:
+        return phone.CONSENT_REASK_UNCLEAR if heard else phone.CONSENT_REASK_SILENCE
+    if _CONSENT_QUESTION_RE.search(value):
+        return phone.CONSENT_REASK_QUESTION
+    return phone.CONSENT_REASK_UNCLEAR
+
+
 async def _classify_phone_answer(
     turns: "asyncio.Queue[str]",
     say: Callable[[str], Any],
     *,
-    attempts: int = 2,
+    attempts: int = phone.PHONE_CONSENT_ATTEMPTS,
     consumed: "list[str] | None" = None,
     answer_timeout_sec: float | None = None,
     question_anchor: "Callable[[], int | None] | None" = None,
     on_grant_evidence: "Callable[[Any], Any] | None" = None,
+    spoke: "gate_judge.HumanSpeechLatch | None" = None,
 ) -> str:
     """Read the response to the disclosure, re-asking at most once.
 
@@ -3286,9 +3502,20 @@ async def _classify_phone_answer(
     it never grants: a would-be grant on it is logged and the reader keeps
     waiting in the same window. ``on_grant_evidence`` receives the queued
     item a HUMAN decision rests on, so the session can persist it once.
+
+    M013 S01 T02 — NEVER "MACHINE" AFTER A PERSON SPOKE. ``spoke`` is the
+    call's `gate_judge.HumanSpeechLatch`, shared with the identity reader. A
+    non-stale reply that is not itself machine wording sets it. Once set:
+    machine wording no longer decides, and the fallthrough (an unreadable
+    reply, or silence, after the re-ask) returns
+    ``CLASSIFY_DEFERRED_PRE_DISCLOSURE`` — the gate speaks a goodbye and the
+    attempt is deferred, uncharged. "Machine" remains only for a line on which
+    nobody was heard at all, or whose first words were machine wording. The
+    re-ask is worded by its reason (`phone.phone_consent_reask_text`).
     """
     if answer_timeout_sec is None:
         answer_timeout_sec = phone.phone_classify_answer_timeout_sec()
+    latch = spoke if spoke is not None else gate_judge.HumanSpeechLatch()
     responsive = 0
     for attempt in range(max(1, attempts)):
         # Skip utterances that began before THIS question, inside the SAME
@@ -3323,12 +3550,19 @@ async def _classify_phone_answer(
                 continue
             if (
                 not gate_judge.turn_is_grant_evidence(item)
-                and classify_answer_text(candidate_text) == phone.CLASSIFY_HUMAN
+                and classify_answer_text(
+                    candidate_text, candidate_spoke=latch.spoke,
+                ) == phone.CLASSIFY_HUMAN
             ):
                 # Words with no speech timing cannot be shown to answer THIS
                 # question, so they never become consent. Kept waiting in the
-                # same window, exactly like a stale skip.
+                # same window, exactly like a stale skip. They are still a
+                # person speaking after the question.
                 heard_ineligible = True
+                latch.note_reply(
+                    candidate_text, machine_match=False,
+                    source=gate_judge.SPOKE_SOURCE_CONSENT,
+                )
                 _log_gate_turn_skip(
                     "consent_turn_not_grant_evidence", item, anchor_ms, question_ms)
                 continue
@@ -3341,7 +3575,14 @@ async def _classify_phone_answer(
                 consumed.append(text)
         elif heard_ineligible:
             responsive += 1
-        decision = classify_answer_text(text)
+        # Classified against the latch as it stood BEFORE this reply: a reply
+        # is judged machine or not on its own words, then (if it is not) it
+        # sets the latch for everything after it.
+        decision = classify_answer_text(text, candidate_spoke=latch.spoke)
+        if decision != phone.CLASSIFY_MACHINE:
+            latch.note_reply(
+                text, machine_match=False, source=gate_judge.SPOKE_SOURCE_CONSENT,
+            )
         if decision == phone.CLASSIFY_HUMAN and on_grant_evidence is not None:
             try:
                 on_grant_evidence(chosen)
@@ -3359,16 +3600,31 @@ async def _classify_phone_answer(
             # appear nowhere. Without this line there is no way to measure how
             # often a consenting candidate is asked twice. Counts and a fixed
             # category only, never the utterance (PII).
+            reason = _consent_reask_reason(text, heard=bool(responsive))
             _log.info(
                 "unknown_event", error_type="phone_consent_reask",
                 error_category="unmatched" if responsive else "no_speech",
+                phase=reason,
             )
-            await say(phone.PHONE_REASK_TEXT)
-    # Fail closed to MACHINE — but make WHY visible. A line that WAS responsive
-    # (the human spoke) yet still defaulted here is the 2026-09-02 signature: a
-    # cooperating candidate whose phrasing missed every classifier branch, which
-    # then tore the room down. Distinguishing it from genuine silence is the
-    # difference between "widen the classifier" and "it really was a machine".
+            await say(phone.phone_consent_reask_text(reason))
+    if latch.spoke:
+        # A PERSON SPOKE on this call (here or at the identity turn), so this
+        # is not a voicemail, whatever happened after. RCA: session 32757295
+        # answered "Hello" at identity, went quiet at consent, and was hung up
+        # on in silence as "machine". The gate now speaks the deferral goodbye
+        # and posts `candidate.deferred_pre_disclosure` (uncharged).
+        _log.warn(
+            "unknown_event",
+            error_type="phone_classify_fallback_deferral",
+            error_category=(
+                "responsive_unmatched" if responsive else "no_speech_after_spoke"
+            ),
+            phase=latch.source,
+        )
+        return phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE
+    # Fail closed to MACHINE — only for a line on which NOBODY was heard. A
+    # line that was responsive cannot reach here any more (it set the latch);
+    # the category is kept so the two exits stay distinguishable in the logs.
     # Counts and a fixed category only — never the utterance text (PII).
     _log.warn(
         "unknown_event",
@@ -9918,10 +10174,16 @@ async def _run_phone_session(
                 delta_ms / 1000.0, {"channel": "phone"},
             )
 
+    # M013 S01 T02: the handle of the gate line most recently handed to the
+    # SDK, so a wall-clock overrun can interrupt it and check its playout
+    # drained before saying goodbye (`_speak_gate_goodbye_bounded`).
+    gate_speech_holder: list[Any] = [None]
+
     async def say(text: str) -> None:
         started_ms = int(round(time.time() * 1000))
         try:
             speech = session.say(text, allow_interruptions=False)
+            gate_speech_holder[0] = speech
         except RuntimeError as exc:
             # The leg dropped while the gate was mid-await. Translate the SDK's
             # generic RuntimeError into the typed signal the gate call site
@@ -10197,6 +10459,10 @@ async def _run_phone_session(
     # The raw consent utterance the classifier consumed, threaded out so the
     # gate can commit it as the candidate half of the gate transcript.
     consent_reply_out: list[str] = []
+    # M013 S01 T02: the call's "a person spoke" latch, shared by the identity,
+    # callback and consent readers. Once set, the gate can no longer end as
+    # "machine" (see `_classify_phone_answer`).
+    gate_spoke = gate_judge.HumanSpeechLatch()
 
     async def classify() -> str:
         if classifier is not None:
@@ -10205,6 +10471,7 @@ async def _run_phone_session(
             user_turns, say, consumed=consent_reply_out,
             question_anchor=lambda: gate_question_anchor[0],
             on_grant_evidence=_record_gate_grant_evidence,
+            spoke=gate_spoke,
         )
 
     # Arm the gate-window leak veto with the RÉSUMÉ FACTS — the text that must
@@ -10730,6 +10997,7 @@ async def _run_phone_session(
             phone.phone_identity_answer_timeout_sec(),
             speaking=lambda: bool(candidate_speaking.get("value")),
             hard_timeout_sec=phone.phone_classify_answer_timeout_sec(),
+            spoke=gate_spoke,
         )
 
     async def _next_callback_turn() -> str:
@@ -10737,6 +11005,7 @@ async def _run_phone_session(
         return await _read_fresh_turn(
             user_turns, lambda: gate_question_anchor[0],
             phone.phone_classify_answer_timeout_sec(),
+            spoke=gate_spoke, spoke_source=gate_judge.SPOKE_SOURCE_CALLBACK,
         )
 
     recording_finish_lock = asyncio.Lock()
@@ -11634,6 +11903,24 @@ async def _run_phone_session(
             schema=phone.GATE_TIMED_OUT,
             duration_sec=_gate_wall_clock,
         )
+        # M013 S01 T02: a goodbye, not dead air — but ONLY before durable
+        # consent (after it, nothing is spoken here: the R4 posture), and not
+        # after a terminal already spoke its own closing. Teardown still maps
+        # this outcome to `candidate.deferred_pre_disclosure`.
+        # Never before the call was answered either: nobody is listening, and
+        # pre-answer audio is exactly what M009 E6 removed.
+        if (
+            not gate_lifecycle.get("consent_durable")
+            and "terminal_posted" not in gate_lifecycle
+            and not (
+                gate_lifecycle.get("answer_seam")
+                and not gate_lifecycle.get("answer_observed")
+            )
+        ):
+            await _speak_gate_goodbye_bounded(
+                session, say, phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT,
+                pending_speech=gate_speech_holder[0],
+            )
         result = phone.PhoneGateResult(phone.GATE_TIMED_OUT, events=[], spoken=[])
     except phone.PhoneParticipantGone:
         _log.info(

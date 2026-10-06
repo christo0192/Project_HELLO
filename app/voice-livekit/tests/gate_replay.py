@@ -68,6 +68,7 @@ from unittest.mock import patch
 from tests import test_phone_gate as _sdk_stub_bootstrap  # noqa: F401
 
 import agent as agent_mod  # noqa: E402
+import gate_judge  # noqa: E402
 import phone  # noqa: E402
 
 FIXTURE_DIR = pathlib.Path(__file__).resolve().parent / "fixtures" / "gate_replays"
@@ -536,6 +537,8 @@ class SessionGlue:
         # longer reads the SDK's speech start when VAD timing exists.
         self.clear_user_turn_calls = 0
         self.capture = agent_mod._new_gate_turn_capture(self._emit_gate_turn)
+        # agent.py `gate_spoke` (T02): one latch shared by every gate reader.
+        self.spoke = gate_judge.HumanSpeechLatch()
 
     # agent.py `_emit_gate_turn`
     def _emit_gate_turn(self, turn: Any) -> None:
@@ -904,6 +907,7 @@ async def drive_identity_then_consent(rt: GateReplay) -> GateReplayResult:
             phone.phone_identity_answer_timeout_sec(),
             speaking=glue.is_candidate_speaking,
             hard_timeout_sec=phone.phone_classify_answer_timeout_sec(),
+            spoke=getattr(glue, "spoke", None),
         )
         result.identity_reply = reply
         result.identity_verdict = await phone.phone_classify_identity(
@@ -924,6 +928,7 @@ async def drive_identity_then_consent(rt: GateReplay) -> GateReplayResult:
         consumed=result.consumed,
         question_anchor=glue.question_anchor,
         on_grant_evidence=getattr(glue, "on_grant_evidence", None),
+        spoke=getattr(glue, "spoke", None),
     )
     result.decision_at_ms = rt.now_ms
     return result

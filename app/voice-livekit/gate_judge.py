@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import os
 import unicodedata
 from collections import deque
 from dataclasses import dataclass, replace
@@ -63,11 +64,13 @@ __all__ = [
     "GateTurnCapture",
     "GateUtterance",
     "GateUtteranceLog",
+    "HumanSpeechLatch",
     "TAG_DURING_QUESTION",
     "TAG_NO_SEGMENT",
     "TAG_POST_QUESTION",
     "TAG_PRE_QUESTION",
     "delta_schema",
+    "judge_timeout_sec",
     "normalize_gate_text",
     "question_tag",
     "turn_is_grant_evidence",
@@ -334,6 +337,76 @@ def turn_is_grant_evidence(item: Any) -> bool:
     if isinstance(item, GateTurn):
         return item.grant_eligible
     return True
+
+
+# ── "a person spoke" (T02) ────────────────────────────────────────────────
+
+#: Where a latch was first set. Logging categories only.
+SPOKE_SOURCE_IDENTITY = "identity"
+SPOKE_SOURCE_CONSENT = "consent"
+SPOKE_SOURCE_CALLBACK = "callback"
+SPOKE_SOURCE_JUDGE = "judge"
+
+
+class HumanSpeechLatch:
+    """The gate-level ``candidate_spoke`` latch: human-directed speech was heard.
+
+    One per call, shared by every gate reader (identity, consent, callback).
+    It is set by a NON-STALE closed reply that is not itself a machine match
+    (legacy: the machine rule did not match it; judge, from T04: the verdict
+    was not ``voicemail_machine``). A voicemail greeting is speech too: if any
+    final set the latch, a voicemail could never be classified as machine.
+
+    Once set, the call can no longer end as "machine": every exit that would
+    have been a machine verdict becomes the spoken deferral instead. It never
+    unsets, and it carries no text.
+    """
+
+    __slots__ = ("_source",)
+
+    def __init__(self) -> None:
+        self._source: Optional[str] = None
+
+    @property
+    def spoke(self) -> bool:
+        return self._source is not None
+
+    @property
+    def source(self) -> Optional[str]:
+        return self._source
+
+    def mark(self, source: str) -> bool:
+        """Latch it. True only for the call that set it (the first one)."""
+        if self._source is not None:
+            return False
+        self._source = str(source or "unknown")
+        return True
+
+    def note_reply(self, text: Any, *, machine_match: bool, source: str) -> bool:
+        """Latch on a non-empty, non-machine reply. Returns ``spoke`` after."""
+        if isinstance(text, str) and text.strip() and not machine_match:
+            self.mark(source)
+        return self.spoke
+
+
+#: The judge timeout default and bounds (S01-PLAN T04). Read here so the
+#: consent backstop (phone.py, T02) can size itself for a judge round-trip
+#: before the judge exists; T04 reuses this reader rather than adding another.
+GATE_JUDGE_TIMEOUT_DEFAULT_SEC = 2.5
+GATE_JUDGE_TIMEOUT_MIN_SEC = 1.0
+GATE_JUDGE_TIMEOUT_MAX_SEC = 4.0
+
+
+def judge_timeout_sec() -> float:
+    """``PHONE_GATE_JUDGE_TIMEOUT_SEC``, bounded to 1.0-4.0 (default 2.5)."""
+    raw = os.getenv("PHONE_GATE_JUDGE_TIMEOUT_SEC")
+    try:
+        value = float(raw) if raw not in (None, "") else GATE_JUDGE_TIMEOUT_DEFAULT_SEC
+    except (TypeError, ValueError):
+        value = GATE_JUDGE_TIMEOUT_DEFAULT_SEC
+    if not math.isfinite(value):
+        value = GATE_JUDGE_TIMEOUT_DEFAULT_SEC
+    return max(GATE_JUDGE_TIMEOUT_MIN_SEC, min(GATE_JUDGE_TIMEOUT_MAX_SEC, value))
 
 
 @dataclass
