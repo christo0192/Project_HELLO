@@ -1460,5 +1460,539 @@ class TestAudioHealthHeartbeat(unittest.TestCase):
         self.assertIn("answered_to_begin_ms", fmt)
 
 
+# ── M013 S02: TAIL FLUSH (fakes; the real-SDK replay is test_recorder_flush) ──
+# A STRUCTURAL fake of the livekit-agents 1.6.4 RecorderIO internals the flush
+# touches: `_started`, `_in_record`/`_out_record`, `_in_q`/`_out_q`,
+# `_write_cb`, and the name-mangled `__acc_frames` lists (the fake classes are
+# NAMED RecorderAudioInput / RecorderAudioOutput so the mangled attribute names
+# match the SDK's exactly). Frames are duration-only stand-ins.
+import queue as _queue  # noqa: E402
+
+
+class _Frame:
+    def __init__(self, duration, tag="f"):
+        self.duration = duration
+        self.tag = tag
+
+
+def _fake_split(frame, position):
+    position = max(0.0, min(position, frame.duration))
+    return _Frame(position, frame.tag), _Frame(frame.duration - position, frame.tag)
+
+
+def _frames(total_sec, tag, frame_sec=0.02):
+    n = int(round(total_sec / frame_sec))
+    return [_Frame(frame_sec, tag) for _ in range(n)]
+
+
+def _dur(frames):
+    return round(sum(f.duration for f in frames), 6)
+
+
+class RecorderAudioInput:
+    def __init__(self, io):
+        self.__io = io
+        self.__acc_frames = []
+        self.label = "TAP_IN"
+
+    def push(self, frame):
+        # Mirrors RecorderAudioInput.__anext__: accumulate only while recording.
+        if self.__io.recording:
+            self.__acc_frames.append(frame)
+
+    def take_buf(self, pad_since=None):
+        frames = self.__acc_frames
+        self.__acc_frames = []
+        return frames
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+class RecorderAudioOutput:
+    def __init__(self, io, write):
+        self.__io = io
+        self.__write = write
+        self.__acc_frames = []
+        self._last_speech_end_time = None
+        self._last_speech_start_time = None
+        self.label = "TAP_OUT"
+
+    @property
+    def has_pending_data(self):
+        return len(self.__acc_frames) > 0
+
+    def capture(self, frame, now):
+        # Mirrors RecorderAudioOutput.capture_frame's recording bookkeeping.
+        if self.__io.recording:
+            self.__acc_frames.append(frame)
+        if self._last_speech_start_time is None:
+            self._last_speech_start_time = now
+
+    async def capture_frame(self, frame):
+        self.capture(frame, 0.0)
+
+    def on_playback_finished(self, *, playback_position, now):
+        # Mirrors the SDK's write-relevant branch of on_playback_finished.
+        if not self.__io.recording:
+            return
+        if not self.__acc_frames:
+            self._last_speech_end_time = now
+            self._last_speech_start_time = None
+            return
+        buf, acc = [], 0.0
+        for f in self.__acc_frames:
+            if acc + f.duration > playback_position:
+                head, _ = _fake_split(f, playback_position - acc)
+                buf.append(head)
+                break
+            buf.append(f)
+            acc += f.duration
+        buf = [f for f in buf if f.duration > 0]
+        if buf:
+            self.__write(buf)
+        self.__acc_frames = []
+        self._last_speech_end_time = now
+        self._last_speech_start_time = None
+
+
+class _FakeSdkRecorderIO:
+    def __init__(self, *, agent_session=None, sample_rate=48000):
+        self._session = agent_session
+        self._sample_rate = sample_rate
+        self._started = False
+        self._in_record = None
+        self._out_record = None
+        self._in_q = _queue.Queue()
+        self._out_q = _queue.Queue()
+        self.recording_started_at = None
+
+    @property
+    def recording(self):
+        return self._started
+
+    def record_input(self, audio_input):
+        self._in_record = RecorderAudioInput(self)
+        return self._in_record
+
+    def record_output(self, audio_output):
+        self._out_record = RecorderAudioOutput(self, self._write_cb)
+        return self._out_record
+
+    def _write_cb(self, buf):
+        input_buf = self._in_record.take_buf(
+            pad_since=self._out_record._last_speech_end_time,
+        )
+        self._in_q.put_nowait(input_buf)
+        self._out_q.put_nowait(buf)
+
+    async def start(self, *, output_path):
+        self._started = True
+        Path(output_path).write_bytes(b"OggS\x00fake-ogg-container-bytes")
+
+    async def aclose(self):
+        if not self._started:
+            return
+        self._in_q.put_nowait(None)
+        self._out_q.put_nowait(None)
+        self._started = False
+
+    def drain(self):
+        """Every (input, output) chunk the encode thread would consume, in
+        FIFO order, including the None sentinel pair."""
+        pairs = []
+        while not self._in_q.empty():
+            pairs.append((self._in_q.get_nowait(), self._out_q.get_nowait()))
+        return pairs
+
+
+def _flushing_cls(split=_fake_split):
+    return rec.build_flushing_recorder_cls(_FakeSdkRecorderIO, split)
+
+
+class _FakeRoom:
+    def __init__(self):
+        self.handlers = {}
+
+    def on(self, event, handler):
+        self.handlers.setdefault(event, []).append(handler)
+        return handler
+
+    def off(self, event, handler):
+        self.handlers.get(event, []).remove(handler)
+
+    def emit(self, event, participant):
+        for h in list(self.handlers.get(event, [])):
+            h(participant)
+
+
+class _Participant:
+    def __init__(self, identity):
+        self.identity = identity
+
+
+class _EmittingSession(_FakeSession):
+    def __init__(self):
+        super().__init__()
+        self.handlers = {}
+
+    def on(self, event, handler):
+        self.handlers.setdefault(event, []).append(handler)
+        return handler
+
+    def off(self, event, handler):
+        self.handlers.get(event, []).remove(handler)
+
+    def emit(self, event, payload=None):
+        for h in list(self.handlers.get(event, [])):
+            h(payload)
+
+
+SIP_IDENTITY = "phone-attempt-under-test"
+
+
+def _make_flushing(*, split=_fake_split, room=None, session=None, uploaded=None):
+    session = session or _EmittingSession()
+    holder = {}
+    cls = _flushing_cls(split)
+
+    def factory(sess, sr):
+        r = cls(agent_session=sess, sample_rate=sr)
+        holder["recorder"] = r
+        return r
+
+    sink = uploaded if uploaded is not None else {}
+
+    async def upload(url, body, content_type="audio/mpeg"):
+        sink["body"] = body
+        sink["content_type"] = content_type
+
+    async def transcode(ogg, mp3):
+        Path(mp3).write_bytes(b"ID3fake-mp3-bytes")
+
+    r = rec.InWorkerRecorder(
+        session, recorder_factory=factory, transcode_fn=transcode, upload_fn=upload,
+        room=room, sip_identity=SIP_IDENTITY if room is not None else None,
+    )
+    return r, session, holder, sink
+
+
+class TestTailFlushFakes(unittest.TestCase):
+    """M013 S02-1 with fakes (bare python in CI)."""
+
+    def _started(self, **kw):
+        r, session, holder, sink = _make_flushing(**kw)
+        self.assertTrue(r.wire())
+        self.assertTrue(_begin(r))
+        return r, session, holder["recorder"], sink
+
+    def test_flush_writes_played_part_before_the_end_sentinels(self):
+        r, _s, io, _sink = self._started()
+        t0 = 1000.0
+        for f in _frames(2.0, "cand"):
+            io._in_record.push(f)
+        for f in _frames(3.0, "bot"):  # 3 s captured, faster than real time
+            io._out_record.capture(f, t0)
+        io.mark_leg_end(t0 + 1.25)  # the hang-up 1.25 s into the utterance
+        _run(io.aclose())
+        pairs = io.drain()
+        self.assertEqual(len(pairs), 2, pairs)
+        (inp, out), sentinel = pairs
+        self.assertEqual(sentinel, (None, None))  # flush strictly BEFORE sentinels
+        self.assertAlmostEqual(_dur(out), 1.25, places=3)  # played part only
+        self.assertTrue(all(f.tag == "bot" for f in out))
+        self.assertAlmostEqual(_dur(inp), 2.0, places=3)  # held-back input too
+        self.assertTrue(io.tail_flushed)
+        self.assertEqual(io.tail_flush_result, {"out_ms": 1250, "in_ms": 2000})
+
+    def test_no_pending_output_flushes_input_only(self):
+        r, _s, io, _sink = self._started()
+        for f in _frames(1.2, "cand"):
+            io._in_record.push(f)
+        io.mark_leg_end(2000.0)
+        _run(io.aclose())
+        pairs = io.drain()
+        self.assertEqual(len(pairs), 2)
+        self.assertAlmostEqual(_dur(pairs[0][0]), 1.2, places=3)
+        self.assertEqual(pairs[0][1], [])  # paired with an empty output chunk
+        self.assertEqual(pairs[1], (None, None))
+
+    def test_zero_position_writes_no_bot_audio_but_flushes_input(self):
+        # The utterance began AFTER the leg end: position clamps to 0.
+        r, _s, io, _sink = self._started()
+        for f in _frames(0.6, "cand"):
+            io._in_record.push(f)
+        for f in _frames(1.0, "bot"):
+            io._out_record.capture(f, 500.0)
+        io.flush_tail(499.0)
+        pairs = io.drain()
+        self.assertEqual(len(pairs), 1)
+        self.assertAlmostEqual(_dur(pairs[0][0]), 0.6, places=3)
+        self.assertEqual(pairs[0][1], [])
+        self.assertFalse(io._out_record.has_pending_data)  # accumulator cleared
+
+    def test_playback_finished_after_flush_writes_nothing_twice(self):
+        r, _s, io, _sink = self._started()
+        for f in _frames(2.0, "bot"):
+            io._out_record.capture(f, 10.0)
+        io.flush_tail(11.0)
+        first = io.drain()
+        self.assertEqual(len(first), 1)
+        # A late playback_finished for the same segment must not re-write it.
+        io._out_record.on_playback_finished(playback_position=2.0, now=12.0)
+        self.assertEqual(io.drain(), [])
+
+    def test_leg_end_closes_capture_so_late_audio_is_never_written(self):
+        # The cut-off follows the hang-up, not the close: after the mark the
+        # taps accumulate nothing, and the session-close interrupt's
+        # playback_finished cannot write bot audio the candidate never heard.
+        r, _s, io, _sink = self._started()
+        for f in _frames(1.0, "bot"):
+            io._out_record.capture(f, 100.0)
+        io.mark_leg_end(100.5)
+        self.assertFalse(io.recording)
+        for f in _frames(2.5, "late"):
+            io._out_record.capture(f, 100.0)
+            io._in_record.push(_Frame(0.02, "late-in"))
+        io._out_record.on_playback_finished(playback_position=3.0, now=103.0)
+        self.assertEqual(io.drain(), [])  # nothing written by the interrupt
+        _run(io.aclose())
+        pairs = io.drain()
+        out = pairs[0][1]
+        self.assertAlmostEqual(_dur(out), 0.5, places=3)
+        self.assertFalse(any(f.tag == "late" for f in out))
+        self.assertFalse(any(f.tag == "late-in" for f in pairs[0][0]))
+
+    def test_reopen_capture_undoes_a_spurious_mark(self):
+        r, _s, io, _sink = self._started()
+        io.mark_leg_end(5.0)
+        self.assertFalse(io.recording)
+        io.reopen_capture()
+        self.assertTrue(io.recording)
+        self.assertIsNone(io.leg_end)
+
+    def test_flush_exception_is_fail_open_and_the_recording_still_uploads(self):
+        def boom_split(frame, position):
+            raise RuntimeError("sdk_internals_moved")
+
+        import logging as _logging
+
+        msgs = []
+
+        class _Cap(_logging.Handler):
+            def emit(self, rec_):
+                msgs.append(rec_.getMessage())
+
+        r, _s, holder, sink = _make_flushing(split=boom_split)
+        r.wire()
+        _begin(r)
+        io = holder["recorder"]
+        for f in _frames(1.0, "bot"):
+            io._out_record.capture(f, 1.0)
+        r.mark_leg_end(1.5, source="sip_left")  # mid-frame cut → split runs
+        cap = _Cap()
+        rec.logger.addHandler(cap)
+        try:
+            manifest = _finish(r)
+        finally:
+            rec.logger.removeHandler(cap)
+        self.assertIsNotNone(manifest)  # still uploaded
+        self.assertEqual(sink["content_type"], "audio/mpeg")
+        self.assertIn("in_worker_recording_tail_flush_skipped category=RuntimeError", msgs)
+        self.assertFalse(r.tail_flushed)
+        # The close itself still ran: the sentinels were enqueued.
+        self.assertIn((None, None), io.drain())
+
+    def test_missing_sdk_internal_is_fail_open(self):
+        r, _s, io, _sink = self._started()
+        del io._out_record._RecorderAudioOutput__acc_frames  # an SDK refactor
+        _run(io.aclose())
+        self.assertEqual(io.drain(), [(None, None)])
+        self.assertFalse(io.tail_flushed)
+
+    def test_flush_is_noop_before_begin(self):
+        io = _flushing_cls()(agent_session=None, sample_rate=48000)
+        io.record_input(None)
+        io.record_output(None)
+        self.assertEqual(io.flush_tail(1.0), {"out_ms": 0, "in_ms": 0})
+        self.assertEqual(io.drain(), [])
+
+    def test_discard_skips_the_flush(self):
+        r, _s, io, sink = self._started()
+        for f in _frames(1.0, "cand"):
+            io._in_record.push(f)
+        _run(r.discard())
+        self.assertEqual(io.drain(), [(None, None)])  # sentinels only
+        self.assertFalse(io.tail_flushed)
+        self.assertNotIn("body", sink)
+
+    def test_finish_flushes_and_reports_tail_flushed(self):
+        r, _s, io, _sink = self._started()
+        for f in _frames(1.0, "cand"):
+            io._in_record.push(f)
+        self.assertIsNotNone(_finish(r))
+        self.assertTrue(r.tail_flushed)
+        self.assertEqual(r.leg_end_source, "finish")  # last-resort mark
+
+
+class TestLegEndMarks(unittest.TestCase):
+    def test_sip_leave_beats_a_later_session_close(self):
+        room = _FakeRoom()
+        r, session, holder, _sink = _make_flushing(room=room)
+        r.wire()
+        _begin(r)
+        with unittest.mock.patch.object(rec.time, "time", return_value=1000.0):
+            room.emit("participant_disconnected", _Participant(SIP_IDENTITY))
+        with unittest.mock.patch.object(rec.time, "time", return_value=1002.5):
+            session.emit("close")
+        self.assertEqual(r.leg_ended_at, 1000.0)
+        self.assertEqual(r.leg_end_source, "sip_left")
+        self.assertEqual(holder["recorder"].leg_end, 1000.0)
+        # finish() stamps later still; the earliest mark survives.
+        _finish(r)
+        self.assertEqual(r.leg_ended_at, 1000.0)
+        self.assertEqual(r.leg_end_source, "sip_left")
+
+    def test_other_identity_is_ignored(self):
+        room = _FakeRoom()
+        r, session, holder, _sink = _make_flushing(room=room)
+        r.wire()
+        _begin(r)
+        room.emit("participant_disconnected", _Participant("phone-some-other-attempt"))
+        room.emit("participant_disconnected", _Participant("agent-x"))
+        self.assertIsNone(r.leg_ended_at)
+        self.assertTrue(holder["recorder"].recording)
+        with unittest.mock.patch.object(rec.time, "time", return_value=50.0):
+            session.emit("close")
+        self.assertEqual(r.leg_ended_at, 50.0)
+        self.assertEqual(r.leg_end_source, "session_close")
+
+    def test_same_identity_reconnecting_reopens_capture(self):
+        room = _FakeRoom()
+        r, _session, holder, _sink = _make_flushing(room=room)
+        r.wire()
+        _begin(r)
+        room.emit("participant_disconnected", _Participant(SIP_IDENTITY))
+        self.assertFalse(holder["recorder"].recording)
+        room.emit("participant_connected", _Participant(SIP_IDENTITY))
+        self.assertTrue(holder["recorder"].recording)
+        self.assertIsNone(r.leg_ended_at)
+
+    def test_listeners_unregistered_on_finish(self):
+        room = _FakeRoom()
+        r, session, _holder, _sink = _make_flushing(room=room)
+        r.wire()
+        _begin(r)
+        self.assertEqual(len(room.handlers["participant_disconnected"]), 1)
+        self.assertEqual(len(session.handlers["close"]), 1)
+        _finish(r)
+        self.assertEqual(room.handlers["participant_disconnected"], [])
+        self.assertEqual(room.handlers["participant_connected"], [])
+        self.assertEqual(session.handlers["close"], [])
+
+    def test_listeners_unregistered_on_discard(self):
+        room = _FakeRoom()
+        r, session, _holder, _sink = _make_flushing(room=room)
+        r.wire()
+        _begin(r)
+        _run(r.discard())
+        self.assertEqual(room.handlers["participant_disconnected"], [])
+        self.assertEqual(session.handlers["close"], [])
+
+    def test_watch_leg_end_after_construction_registers_once_wired(self):
+        room = _FakeRoom()
+        r, _session, _holder, _sink = _make_flushing()
+        r.watch_leg_end(room, SIP_IDENTITY)
+        self.assertEqual(room.handlers, {})  # nothing until wired
+        r.wire()
+        self.assertEqual(len(room.handlers["participant_disconnected"]), 1)
+        _begin(r)  # begin re-checks; still exactly one listener
+        self.assertEqual(len(room.handlers["participant_disconnected"]), 1)
+
+    def test_no_identity_registers_no_room_listener(self):
+        room = _FakeRoom()
+        r, _session, _holder, _sink = _make_flushing()
+        r.watch_leg_end(room, None)
+        r.wire()
+        self.assertEqual(room.handlers, {})
+
+    def test_mark_before_wire_is_kept_and_harmless(self):
+        r, _session, _holder, _sink = _make_flushing()
+        r.mark_leg_end(7.0, source="sip_left")
+        self.assertEqual(r.leg_ended_at, 7.0)
+
+
+class TestTailFlushKillSwitch(unittest.TestCase):
+    """`_default_recorder_factory` against a fake livekit module tree."""
+
+    def _fake_livekit(self, version="1.6.4"):
+        import sys
+        import types
+
+        rio_mod = types.ModuleType("livekit.agents.voice.recorder_io.recorder_io")
+        rio_mod.RecorderIO = _FakeSdkRecorderIO
+        rio_mod._split_frame = _fake_split
+        pkg = types.ModuleType("livekit.agents.voice.recorder_io")
+        pkg.RecorderIO = _FakeSdkRecorderIO
+        pkg.recorder_io = rio_mod
+        voice = types.ModuleType("livekit.agents.voice")
+        voice.recorder_io = pkg
+        agents = types.ModuleType("livekit.agents")
+        agents.__version__ = version
+        agents.voice = voice
+        lk = types.ModuleType("livekit")
+        lk.agents = agents
+        return unittest.mock.patch.dict(sys.modules, {
+            "livekit": lk,
+            "livekit.agents": agents,
+            "livekit.agents.voice": voice,
+            "livekit.agents.voice.recorder_io": pkg,
+            "livekit.agents.voice.recorder_io.recorder_io": rio_mod,
+        })
+
+    def _factory_type(self, env_value):
+        env = {} if env_value is None else {"PHONE_RECORDING_TAIL_FLUSH": env_value}
+        with self._fake_livekit(), unittest.mock.patch.dict(os.environ, env, clear=False):
+            if env_value is None:
+                os.environ.pop("PHONE_RECORDING_TAIL_FLUSH", None)
+            return type(rec._default_recorder_factory(None, 48000))
+
+    def test_default_is_the_flushing_recorder(self):
+        t = self._factory_type(None)
+        self.assertIsNot(t, _FakeSdkRecorderIO)
+        self.assertTrue(issubclass(t, _FakeSdkRecorderIO))
+        self.assertEqual(t.__name__, "_FlushingRecorderIO")
+        self.assertTrue(issubclass(self._factory_type("on"), _FakeSdkRecorderIO))
+
+    def test_off_returns_the_plain_recorder(self):
+        for v in ("off", "OFF", "false", "0"):
+            with self.subTest(v):
+                self.assertIs(self._factory_type(v), _FakeSdkRecorderIO)
+
+    def test_off_is_byte_identical_plain_close(self):
+        # Kill switch: the plain recorder never flushes — only the sentinels.
+        io = _FakeSdkRecorderIO()
+        io.record_input(None)
+        io.record_output(None)
+        with tempfile.TemporaryDirectory() as d:
+            _run(io.start(output_path=Path(d) / "killswitch.ogg"))
+            io._in_record.push(_Frame(0.5, "cand"))
+            _run(io.aclose())
+        self.assertEqual(io.drain(), [(None, None)])
+
+    def test_unverified_sdk_version_warns_and_still_flushes(self):
+        with self._fake_livekit(version="9.9.9"), \
+             unittest.mock.patch.object(rec.logger, "warning") as warn:
+            os.environ.pop("PHONE_RECORDING_TAIL_FLUSH", None)
+            t = type(rec._default_recorder_factory(None, 48000))
+        self.assertIsNot(t, _FakeSdkRecorderIO)
+        self.assertTrue(any(
+            "tail_flush_sdk_unverified" in str(c.args[0]) for c in warn.call_args_list
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9745,6 +9745,14 @@ async def _run_phone_session(
                 room_meta = _room_metadata_from_context(ctx)
                 if not phone.is_canary_room(room_meta) and not phone.is_preflight_room(room_meta):
                     rec = recording.InWorkerRecorder(session)
+                    # M013 S02: the recorder's OWN leg-end listener (the
+                    # tail-flush cut-off) for exactly this attempt's SIP leg.
+                    _watch_leg_end = getattr(rec, "watch_leg_end", None)
+                    if callable(_watch_leg_end):
+                        _watch_leg_end(
+                            getattr(ctx, "room", None),
+                            _phone_participant_identity(attempt_id),
+                        )
                     if rec.wire():
                         recorder_holder[0] = rec
         except Exception:  # noqa: BLE001 — recording is strictly secondary

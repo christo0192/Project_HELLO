@@ -8,15 +8,26 @@ at the moment it is actually played), mixes both onto one synchronized stereo
 timeline (candidate = left, agent = right), resamples, and stream-encodes to
 OGG/Opus with constant memory. No second AudioStream, no hand-rolled mixer.
 
-── CONSENT POSTURE: RECORD FROM ANSWER, KEEP ONLY IF CONSENT ────────────────
-This matches the egress posture since migration 0067 (PR160): recording begins
-at ``call.answered`` so the greeting + consent exchange itself is captured, and
-the recording is KEPT only if consent is delivered. If consent is refused (a
-machine pickup, an explicit refusal, or a pre-disclosure deferral), the audio
-must be destroyed — the caller invokes :meth:`discard` instead of :meth:`finish`
-so the local file is deleted and NOTHING is uploaded (there is therefore no
-object for the server-side purge to race against). The upload in :meth:`finish`
-is thus gated by the CALLER on the consent outcome, never performed blindly.
+── CONSENT POSTURE: RECORD FROM ANSWER, KEEP EVERY CANDIDATE LEG ──────────
+Recording begins at ``call.answered`` so the greeting + consent exchange itself
+is captured. Since migration 0105 the recording is KEPT whatever the consent
+outcome (declined, revoked, deferred and pre-consent legs are retained and
+flagged server-side). The ONLY discard is the wrong-number / wrong-person
+privacy path — a third party's voice — where the caller invokes
+:meth:`discard` instead of :meth:`finish`, so the local file is deleted and
+NOTHING is uploaded (there is therefore no object for a server-side purge to
+race against).
+
+── TAIL FLUSH (M013 S02) ────────────────────────────────────────────────────
+RecorderIO 1.6.4 writes a bot utterance only when its playback finishes, and
+holds back the candidate audio while bot audio is pending. A leg that ends
+mid-utterance therefore lost that utterance and everything after it (live
+session 9f60523d: leg 1 lost its last ~7 s, including Q1). The default factory
+now returns :class:`_FlushingRecorderIO`, which writes the PLAYED part of the
+pending utterance plus the held-back candidate audio before the recorder's end
+sentinels. The cut-off is the leg end (the SIP participant leaving), not the
+session close, so bot audio the candidate never heard is not written. Kill
+switch: ``PHONE_RECORDING_TAIL_FLUSH=off`` restores the plain RecorderIO.
 
 The taps are wired immediately AFTER ``session.start()`` (which is when RoomIO
 attaches the live ``session.input.audio`` / ``session.output.audio`` the taps must
@@ -160,10 +171,204 @@ UploadFn = Callable[[str, bytes, str], Awaitable[None]]
 
 def _default_recorder_factory(session: Any, sample_rate: int) -> Any:
     """Construct the real RecorderIO. Imported lazily so this module (and its
-    unit tests) load without livekit-agents installed."""
+    unit tests) load without livekit-agents installed.
+
+    M013 S02: returns the tail-flushing subclass unless the kill switch
+    ``PHONE_RECORDING_TAIL_FLUSH=off`` is set. Building the subclass is itself
+    fail-open: any failure falls back to the plain RecorderIO."""
     from livekit.agents.voice.recorder_io import RecorderIO  # noqa: PLC0415
 
-    return RecorderIO(agent_session=session, sample_rate=sample_rate)
+    if not tail_flush_enabled():
+        logger.info("in_worker_recording_tail_flush_disabled")
+        return RecorderIO(agent_session=session, sample_rate=sample_rate)
+    try:
+        cls = _real_flushing_recorder_cls()
+    except Exception as exc:  # noqa: BLE001 — fail-open to the plain recorder
+        logger.warning(
+            "in_worker_recording_tail_flush_skipped category=%s",
+            f"build_{type(exc).__name__}",
+        )
+        return RecorderIO(agent_session=session, sample_rate=sample_rate)
+    return cls(agent_session=session, sample_rate=sample_rate)
+
+
+# ── TAIL FLUSH (M013 S02-1) ──────────────────────────────────────────────────
+# The SDK version the flush was verified against (recorder_io.py internals:
+# `_in_record`, `_out_record`, `_in_q`/`_out_q`, `_write_cb`, the name-mangled
+# `__acc_frames` lists and `_split_frame`). Another version still TRIES the
+# flush — it is fail-open — but logs a warning so a silent drift is visible.
+_TAIL_FLUSH_SDK_VERSION = "1.6.4"
+
+
+def tail_flush_enabled() -> bool:
+    """Kill switch. Default ON; ``PHONE_RECORDING_TAIL_FLUSH=off`` (or
+    false/0/no/disabled) returns the plain RecorderIO, byte-identical to the
+    pre-S02 behaviour."""
+    raw = (os.getenv("PHONE_RECORDING_TAIL_FLUSH") or "").strip().lower()
+    return raw not in ("off", "false", "0", "no", "disabled")
+
+
+_FLUSHING_CLS_CACHE: dict[Any, type] = {}
+
+
+def _real_flushing_recorder_cls() -> type:
+    from livekit.agents.voice.recorder_io import recorder_io as _rio  # noqa: PLC0415
+
+    try:
+        from livekit.agents import __version__ as sdk_version  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        sdk_version = "unknown"
+    if sdk_version != _TAIL_FLUSH_SDK_VERSION:
+        logger.warning(
+            "in_worker_recording_tail_flush_sdk_unverified version=%s verified=%s",
+            sdk_version, _TAIL_FLUSH_SDK_VERSION,
+        )
+    return build_flushing_recorder_cls(_rio.RecorderIO, _rio._split_frame)
+
+
+def build_flushing_recorder_cls(base: type, split_frame: Callable[[Any, float], Any]) -> type:
+    """Return ``_FlushingRecorderIO``, a subclass of ``base`` (the SDK's
+    RecorderIO in production; a structural fake in the bare-python tests).
+
+    ``split_frame(frame, position) -> (head, tail)`` is the SDK's
+    ``_split_frame``. Cached per base class."""
+    key = (base, split_frame)
+    cached = _FLUSHING_CLS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    class _FlushingRecorderIO(base):  # type: ignore[misc, valid-type]
+        """RecorderIO that writes the recording TAIL on close.
+
+        WHY: RecorderIO 1.6.4 writes a bot utterance only from
+        ``on_playback_finished`` and, while bot audio is pending, also holds
+        back the candidate audio its ``_forward_task`` would otherwise flush
+        every 2.5 s. Closed mid-utterance, the stock recorder drops that
+        utterance AND the held-back candidate audio.
+
+        ``flush_tail(until)`` (synchronous, loop thread) writes, before the
+        end sentinels ``aclose`` enqueues:
+          * pending bot audio: only the PLAYED part, i.e.
+            ``min(sum(frame.duration), until - _last_speech_start_time)``
+            (clamped at 0), split with the SDK ``_split_frame`` and passed to
+            ``_write_cb``, which also takes the held-back input buffer — so
+            both channels land in ONE FIFO pair and stay aligned. A position
+            that clamps to 0 (the utterance began after the leg end) writes
+            ``_write_cb([])`` so the input is still flushed. The output
+            accumulator is then cleared, so a later ``on_playback_finished``
+            writes nothing twice. The AudioOutput base ``on_playback_finished``
+            (segment counting) is NEVER called here.
+          * no pending bot audio: the input-only write ``_forward_task``
+            would have made.
+        Pause intervals (``__pause_wall_times``) are IGNORED by the flush;
+        acceptable for a tail of at most one utterance.
+
+        ``mark_leg_end(ts)`` (earliest wins) records the cut-off and CLOSES
+        capture: ``recording`` reads False from then on, so neither tap
+        accumulates audio after the leg ended and an ``on_playback_finished``
+        fired by the session's own close (its ``interrupt``) cannot write bot
+        audio the candidate never heard. ``reopen_capture()`` undoes a mark
+        when the SIP participant is seen again (a spurious departure).
+
+        Fail-open: any exception skips the flush (logged
+        ``in_worker_recording_tail_flush_skipped``) and the normal close
+        proceeds, so the recording is still written and uploaded."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._s02_leg_end: Optional[float] = None
+            self._s02_capture_closed = False
+            self._s02_skip_flush = False
+            self.tail_flushed = False
+            self.tail_flush_result: Optional[dict] = None
+
+        @property
+        def recording(self) -> bool:  # type: ignore[override]
+            return bool(self._started) and not self._s02_capture_closed
+
+        @property
+        def leg_end(self) -> Optional[float]:
+            return self._s02_leg_end
+
+        def mark_leg_end(self, ts: float) -> None:
+            if self._s02_leg_end is None or ts < self._s02_leg_end:
+                self._s02_leg_end = ts
+            self._s02_capture_closed = True
+
+        def reopen_capture(self) -> None:
+            self._s02_leg_end = None
+            self._s02_capture_closed = False
+
+        def skip_tail_flush(self) -> None:
+            """The wrong-number discard path: the audio is about to be
+            deleted, so spend no encode time on it."""
+            self._s02_skip_flush = True
+
+        def flush_tail(self, until: Optional[float] = None) -> dict:
+            """Write the played part of any pending bot utterance plus the
+            held-back candidate audio. Returns ``{out_ms, in_ms}`` (counts
+            only). A no-op when begin never ran or the flush is skipped."""
+            if not self._started or self._s02_skip_flush:
+                return {"out_ms": 0, "in_ms": 0}
+            out = self._out_record
+            inp = self._in_record
+            if out is None or inp is None:
+                return {"out_ms": 0, "in_ms": 0}
+            cut = until if until is not None else time.time()
+            pending = list(out._RecorderAudioOutput__acc_frames)
+            held_in = getattr(inp, "_RecorderAudioInput__acc_frames", None) or []
+            in_ms = int(round(sum(f.duration for f in held_in) * 1000))
+            if not pending:
+                # Mirror `_forward_task`: input only, paired with an empty
+                # output chunk so the two FIFOs stay in lock-step.
+                input_buf = inp.take_buf(pad_since=out._last_speech_end_time)
+                self._in_q.put_nowait(input_buf)
+                self._out_q.put_nowait([])
+                return {"out_ms": 0, "in_ms": in_ms}
+
+            total = sum(f.duration for f in pending)
+            started = out._last_speech_start_time
+            played = total if started is None else min(total, cut - started)
+            played = max(0.0, played)
+            buf: list[Any] = []
+            acc = 0.0
+            if played > 0.0:
+                for frame in pending:
+                    if acc + frame.duration > played:
+                        head, _tail = split_frame(frame, played - acc)
+                        if head.duration > 0.0:
+                            buf.append(head)
+                            acc += head.duration
+                        break
+                    buf.append(frame)
+                    acc += frame.duration
+            # `_write_cb` takes the held-back INPUT buffer too (padded from the
+            # last speech end, exactly as the SDK's own playback write does).
+            self._write_cb(buf)
+            out._RecorderAudioOutput__acc_frames = []
+            out._last_speech_end_time = cut
+            out._last_speech_start_time = None
+            return {"out_ms": int(round(acc * 1000)), "in_ms": in_ms}
+
+        async def aclose(self) -> None:
+            if self._started and not self._s02_skip_flush:
+                try:
+                    result = self.flush_tail(self._s02_leg_end)
+                    self.tail_flushed = True
+                    self.tail_flush_result = result
+                    logger.info(
+                        "in_worker_recording_tail_flush out_ms=%d in_ms=%d",
+                        result["out_ms"], result["in_ms"],
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail-open by contract
+                    logger.warning(
+                        "in_worker_recording_tail_flush_skipped category=%s",
+                        type(exc).__name__,
+                    )
+            await super().aclose()
+
+    _FLUSHING_CLS_CACHE[key] = _FlushingRecorderIO
+    return _FlushingRecorderIO
 
 
 async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
@@ -460,6 +665,9 @@ class _CountingAudioInput:
     async def __anext__(self) -> Any:
         frame = await self.__inner.__anext__()
         self.__counter.input += 1
+        # M013 S02: wall clock of the latest input frame — logged next to the
+        # leg end as a cross-check only (a time, never audio).
+        self.__counter.last_input_at = time.time()
         return frame
 
     def __getattr__(self, name: str) -> Any:
@@ -490,11 +698,12 @@ class _FrameCounter:
     """A tiny mutable counter shared by the two proxies. Booleans/ints only —
     never touches audio bytes."""
 
-    __slots__ = ("input", "output")
+    __slots__ = ("input", "output", "last_input_at")
 
     def __init__(self) -> None:
         self.input = 0
         self.output = 0
+        self.last_input_at: Optional[float] = None
 
 
 class InWorkerRecorder:
@@ -509,6 +718,8 @@ class InWorkerRecorder:
         recorder_factory: RecorderFactory = _default_recorder_factory,
         transcode_fn: TranscodeFn = _default_transcode,
         upload_fn: UploadFn = _default_upload,
+        room: Any = None,
+        sip_identity: Optional[str] = None,
     ) -> None:
         self._session = session
         # object_key + upload_url arrive from the API /recording/prepare call at
@@ -542,6 +753,19 @@ class InWorkerRecorder:
         # once at recorder start. None → the offset line is skipped.
         self._answered_epoch_ms: Optional[int] = None
 
+        # M013 S02: the LEG END — the cut-off for the tail flush. Earliest
+        # mark wins. Sources, in priority order: this recorder's OWN
+        # `participant_disconnected` listener for exactly this attempt's SIP
+        # identity (the hang-up), the session `close` event (an upper bound —
+        # the SDK emits it at the END of `_aclose_impl`, seconds late), and
+        # finally `finish()` stamping its own time before the close.
+        self._room: Any = room
+        self._sip_identity: Optional[str] = sip_identity
+        self._leg_end_ts: Optional[float] = None
+        self._leg_end_source: Optional[str] = None
+        self._room_listeners: list[tuple[str, Callable[..., None]]] = []
+        self._session_listeners: list[tuple[str, Callable[..., None]]] = []
+
     @property
     def active(self) -> bool:
         """True once recording has actually begun and has not failed."""
@@ -569,6 +793,126 @@ class InWorkerRecorder:
     def output_frames(self) -> int:
         """Total OUTPUT (worker TTS → candidate) frames the tap has seen. FIX 4."""
         return self._counter.output
+
+    # ── M013 S02: leg end + tail flush ───────────────────────────────────────
+    @property
+    def leg_ended_at(self) -> Optional[float]:
+        """Epoch seconds of the earliest leg-end mark, else ``None``."""
+        return self._leg_end_ts
+
+    @property
+    def leg_end_source(self) -> Optional[str]:
+        """``sip_left`` | ``session_close`` | ``finish`` (the earliest mark)."""
+        return self._leg_end_source
+
+    @property
+    def tail_flushed(self) -> bool:
+        """True only when the recorder's tail flush actually ran successfully
+        (the flush is fail-open, so this is reported, never inferred)."""
+        return getattr(self._recorder, "tail_flushed", False) is True
+
+    def watch_leg_end(self, room: Any, sip_identity: Optional[str]) -> None:
+        """Attach the room and this attempt's SIP identity after construction
+        (the agent call site; equivalent to the constructor kwargs). The
+        listener is registered once wired. Never raises."""
+        try:
+            if room is not None:
+                self._room = room
+            if sip_identity:
+                self._sip_identity = sip_identity
+            if self._wired:
+                self._register_leg_listeners()
+        except Exception:  # noqa: BLE001 — recording is strictly secondary
+            pass
+
+    def mark_leg_end(self, ts: float, *, source: str) -> None:
+        """Record the leg end (earliest wins) and forward it to the recorder,
+        which closes capture and uses it as the tail-flush cut-off. Never
+        raises."""
+        try:
+            if self._leg_end_ts is None or ts < self._leg_end_ts:
+                self._leg_end_ts = ts
+                self._leg_end_source = source
+            mark = getattr(self._recorder, "mark_leg_end", None)
+            if callable(mark):
+                mark(self._leg_end_ts)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_room_participant_disconnected(self, participant: Any = None, *_: Any) -> None:
+        # Our OWN listener (S01's `_on_phone_participant_disconnected` is
+        # untouched). Exactly this attempt's SIP identity; anyone else leaving
+        # the room is ignored. Never raises into the room's emitter.
+        try:
+            if self._sip_identity and getattr(participant, "identity", None) == self._sip_identity:
+                self.mark_leg_end(time.time(), source="sip_left")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_room_participant_connected(self, participant: Any = None, *_: Any) -> None:
+        # A departure followed by the SAME identity re-appearing was not a
+        # leg end (e.g. a room-level resync): reopen capture. A later real
+        # departure, the session close or finish() marks the end again.
+        try:
+            if (
+                self._sip_identity
+                and getattr(participant, "identity", None) == self._sip_identity
+                and self._leg_end_source == "sip_left"
+            ):
+                self._leg_end_ts = None
+                self._leg_end_source = None
+                reopen = getattr(self._recorder, "reopen_capture", None)
+                if callable(reopen):
+                    reopen()
+                logger.info("in_worker_recording_leg_end_reopened")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_session_close(self, *_: Any) -> None:
+        # Upper bound only: `close` is emitted at the END of the SDK's
+        # `_aclose_impl`, after interrupt/drain/transcript commit.
+        try:
+            self.mark_leg_end(time.time(), source="session_close")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _register_leg_listeners(self) -> None:
+        """Idempotent; fail-open. Room listeners only when a SIP identity is
+        known, so a listener can never match an unrelated participant."""
+        if not self._room_listeners and self._room is not None and self._sip_identity:
+            on = getattr(self._room, "on", None)
+            if callable(on):
+                for event, handler in (
+                    ("participant_disconnected", self._on_room_participant_disconnected),
+                    ("participant_connected", self._on_room_participant_connected),
+                ):
+                    try:
+                        on(event, handler)
+                        self._room_listeners.append((event, handler))
+                    except Exception:  # noqa: BLE001
+                        pass
+        if not self._session_listeners:
+            on = getattr(self._session, "on", None)
+            if callable(on):
+                try:
+                    on("close", self._on_session_close)
+                    self._session_listeners.append(("close", self._on_session_close))
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _unregister_leg_listeners(self) -> None:
+        for target, listeners in (
+            (self._room, self._room_listeners),
+            (self._session, self._session_listeners),
+        ):
+            off = getattr(target, "off", None)
+            for event, handler in listeners:
+                try:
+                    if callable(off):
+                        off(event, handler)
+                except Exception:  # noqa: BLE001
+                    pass
+            listeners.clear()
 
     def wire(self) -> bool:
         """Install the input/output taps around the session's LIVE audio I/O.
@@ -623,6 +967,7 @@ class InWorkerRecorder:
                 bool(getattr(self._recorder, "recording", False)),
                 self._wired_at_ms,
             )
+            self._register_leg_listeners()
             return True
         except Exception:  # noqa: BLE001 — fail-open by contract
             logger.warning("in_worker_recording_wire_failed", exc_info=True)
@@ -648,6 +993,11 @@ class InWorkerRecorder:
             self._answered_epoch_ms = answered_epoch_ms
         if self._begun:
             return True
+        try:
+            # M013 S02: the room may have been attached after wire().
+            self._register_leg_listeners()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self._object_key = object_key
             base = self._work_dir or Path(tempfile.gettempdir()) / "inworker-recordings"
@@ -760,9 +1110,34 @@ class InWorkerRecorder:
         the API minted, and return the manifest. Returns None (fail-open) if
         recording never began or any step fails — the call is already over, so
         nothing here can harm the screening."""
+        self._unregister_leg_listeners()
         if not self._begun or self._failed or self._recorder is None or self._ogg_path is None:
             return None
-        recording_at_close = bool(getattr(self._recorder, "recording", False))
+        # The STARTED flag: after a leg-end mark the tail-flushing recorder's
+        # `recording` reads False by design (capture closed), which is not the
+        # zero-capture signal this diagnostic exists for.
+        recording_at_close = bool(
+            getattr(self._recorder, "_started", None)
+            if isinstance(getattr(self._recorder, "_started", None), bool)
+            else getattr(self._recorder, "recording", False)
+        )
+        # M013 S02: last-resort leg end (earliest mark wins, so a SIP-leave or
+        # session-close mark already recorded is kept), then a content-free
+        # line pairing it with the last input frame's wall clock.
+        self.mark_leg_end(time.time(), source="finish")
+        try:
+            last_in = self._counter.last_input_at
+            logger.info(
+                "in_worker_recording_leg_end source=%s leg_end_ms=%d "
+                "last_input_frame_ms=%s begun_at_ms=%s",
+                self._leg_end_source,
+                int((self._leg_end_ts or 0) * 1000),
+                int(last_in * 1000) if last_in is not None else -1,
+                self._begun_at_ms if self._begun_at_ms is not None else -1,
+                extra={"object_key": self._object_key},
+            )
+        except Exception:  # noqa: BLE001
+            pass
         close_completed = True
         try:
             close_task = asyncio.create_task(self._recorder.aclose())
@@ -1001,7 +1376,16 @@ class InWorkerRecorder:
         """Wrong-number/identity-mismatch privacy path: stop recording and
         delete the local file without uploading. Other gate exits retain audio
         under the recorded-from-answer policy. Fail-open and idempotent."""
+        self._unregister_leg_listeners()
         if self._recorder is not None and self._begun and not self._failed:
+            # M013 S02: the audio is about to be deleted — skip the tail flush
+            # so a discarded call spends no encode time on it.
+            try:
+                skip = getattr(self._recorder, "skip_tail_flush", None)
+                if callable(skip):
+                    skip()
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 close_task = asyncio.create_task(self._recorder.aclose())
                 done, pending = await asyncio.wait(
