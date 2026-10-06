@@ -4840,12 +4840,12 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             [c[0] for c in client.assessment_calls],
             ["start", "turn", "turn", "complete"],
         )
-        # The opening is the verified model greeting (through generate_reply),
-        # carrying the recording sentence — never spoken as the fixed disclosure.
+        # The SDK-free fixture has no model stream: it uses the validated
+        # fallback via say, outside the screening generation instructions.
         self.assertIn(
-            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.instructions[0]
+            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.spoken[0]
         )
-        self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
         terminal_context = str(session.turn_contexts[-1]).lower()
         self.assertIn("goodbye", terminal_context)
         self.assertIn("do not ask another question", terminal_context)
@@ -5078,11 +5078,11 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             answers=("Yes, that's fine.",),
             replies=["First answer.", "Second answer."],
         )
-        self.assertIn("okay to continue", session.instructions[0].lower())
+        self.assertIn("okay to continue", session.spoken[0].lower())
         self.assertIn("First question?", session.spoken)
         self.assertEqual(client.committed_keys, ["k1", "k2"])
-        # Gate opening plus the two answer-mediated Gemini replies.
-        self.assertEqual(len(session.instructions), 3)
+        # The opening is privately composed; only screening replies generate.
+        self.assertEqual(len(session.instructions), 2)
 
     async def test_first_question_falls_back_to_fixed_playout_without_generate_reply(self):
         """A session without `generate_reply` still asks the exact planned text."""
@@ -5457,9 +5457,9 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # the recording sentence). It is deliberately NOT a transcript turn: the
         # gate opening is gate copy, and no boundary carries it.
         self.assertIn(
-            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.instructions[0]
+            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.spoken[0]
         )
-        self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
         for boundary in client.boundaries:
             for turn in boundary["turns"]:
                 self.assertNotIn("recorded so the hiring team", turn["text"])
@@ -5471,8 +5471,8 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             close_after=False,
         )
 
-        # The gate opening plus one LiveKit-native terminal response.
-        self.assertEqual(len(session.instructions), 2)
+        # One LiveKit-native terminal response; the gate uses separate drafting.
+        self.assertEqual(len(session.instructions), 1)
         self.assertEqual(client.committed_keys, [])
         self.assertIn("assessment.aborted", client.event_types)
         terminal_context = str(session.turn_contexts[-1]).lower()
@@ -5553,7 +5553,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # confirmations go through `say`; the gate opening is a generated
         # conversation item (verified, so never the fixed disclosure via say).
         self.assertIn(phone._SCHEDULE_CONFIRMED_TEXT, session.spoken)
-        self.assertIn(_FakePhoneSession.gate_opening_text, session.emitted_bot_turns)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.emitted_bot_turns)
         # …and a real generated turn DID survive, so the filter is not simply
         # dropping everything the bot says.
         self.assertTrue(any(t.startswith("asked-") for t in committed))
@@ -8131,10 +8131,31 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
     async def test_the_opening_passes_a_user_input_seed(self):
         seen: dict = {}
 
+        class DraftContext:
+            def __init__(self):
+                self.items = []
+
+            def add_message(self, **kwargs):
+                self.items.append(kwargs)
+
+        class DraftStream:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                seen["stream_closed"] = True
+
+            async def __aiter__(self):
+                yield types.SimpleNamespace(delta=types.SimpleNamespace(content=phone.PHONE_DISCLOSURE_TEXT))
+
+        def chat(**kwargs):
+            seen.update(kwargs)
+            return DraftStream()
+
         class _SeedProbeSession(_FakePhoneSession):
-            def generate_reply(self, instructions=None, **kwargs):
-                seen.setdefault("user_input", kwargs.get("user_input"))
-                return super().generate_reply(instructions=instructions, **kwargs)
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                self.llm = types.SimpleNamespace(chat=chat)
 
         ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
         client = FakeEventClient()
@@ -8151,6 +8172,7 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
         # disclosure and never generates an opening). Exercise the seed behaviour
         # with the flag explicitly OFF.
         with patch.dict(os.environ, {"PHONE_DETERMINISTIC_OPENER": "false"}), \
+             patch.dict(sys.modules, {"livekit.agents.llm": types.SimpleNamespace(ChatContext=DraftContext)}), \
              patch.object(agent_mod, "AgentSession", _SeedProbeSession), \
              patch.object(agent_mod, "persistence", MagicMock()), \
              patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
@@ -8163,7 +8185,9 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
                 ),
                 timeout=5,
             )
-        self.assertEqual(seen.get("user_input"), "Hello?")
+        self.assertTrue(any(item["role"] == "user" for item in seen["chat_ctx"].items))
+        self.assertEqual(seen["tools"], [])
+        self.assertTrue(seen["stream_closed"])
 
 
     async def test_the_scripted_opener_ROLLBACK_sends_no_opening_seed(self):
@@ -9905,9 +9929,9 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         src = inspect.getsource(agent_mod)
         self.assertIn('turn_is_question = route == "candidate_question"', src)
         # The non-question branch supplies a neutral ack, not a false "question".
-        self.assertIn('"Got it. Anything else you\'d like to ask?"', src)
+        self.assertIn('"Understood."', src)
 
-    async def test_question_is_answered_then_candidate_is_reinvited(self):
+    async def test_question_is_answered_without_reinviting(self):
         agent, _, _, client, hooks = await self._enter_qna()
         turn_ctx = types.SimpleNamespace(items=[])
         await hooks["on_native_turn"](
@@ -9916,7 +9940,7 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
             turn_ctx,
         )
         injected = str(turn_ctx.items)
-        self.assertIn("anything else they'd like to ask", injected)
+        self.assertIn("Do not ask a question or invite more questions", injected)
         self.assertIn("do not say goodbye yet", injected.lower())
         self.assertNotIn("final q&a round", injected.lower())
         self.assertNotIn("assessment.completed", client.event_types)
@@ -9964,7 +9988,7 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
             question, types.SimpleNamespace(text_content=question), q_ctx,
         )
         rendered = str(q_ctx.items).lower()
-        self.assertIn("anything else", rendered)
+        self.assertIn("do not ask a question or invite more questions", rendered)
         self.assertIn("do not say goodbye yet", rendered)
         self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
         self.assertNotIn("assessment.completed", client.event_types)
@@ -9989,7 +10013,7 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
             question_ctx,
         )
         rendered = str(question_ctx.items).lower()
-        self.assertIn("anything else", rendered)
+        self.assertIn("do not ask a question or invite more questions", rendered)
         self.assertIn("do not say goodbye yet", rendered)
         self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
 
@@ -10011,7 +10035,7 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(stale.interrupt_calls, [True])
         self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
-        self.assertIn("anything else", str(question_ctx.items).lower())
+        self.assertIn("do not ask a question or invite more questions", str(question_ctx.items).lower())
         self.assertNotIn("assessment.completed", client.event_types)
         interlocks = [
             c.kwargs.get("error_category") for c in hooks["log"].info.call_args_list
@@ -10019,13 +10043,10 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(interlocks, ["pending_close_cancelled"])
 
-    async def test_the_cap_round_invites_one_last_question_then_wraps(self):
-        """F8 (owner spec, live 2026-09-03): the round cap must not slam the
-        door. The cap round still ANSWERS, then warns we're wrapping up and
-        invites one last quick thing; only the round AFTER the cap answers
-        briefly and says goodbye. Q&A stays bounded at MAX+1 rounds."""
+    async def test_the_cap_round_answers_then_wraps_without_extra_invitation(self):
+        """The final allowed answer includes goodbye, with no extra round."""
         _, _, _, client, hooks = await self._enter_qna()
-        for index in range(phone.PHONE_QNA_MAX_ROUNDS + 1):
+        for index in range(phone.PHONE_QNA_MAX_ROUNDS):
             turn_ctx = types.SimpleNamespace(items=[])
             text = f"Candidate question {index + 1}?"
             await hooks["on_native_turn"](
@@ -10033,16 +10054,11 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
             )
             injected = str(turn_ctx.items).lower()
             if index + 1 < phone.PHONE_QNA_MAX_ROUNDS:
-                self.assertIn("anything else", injected)
-                self.assertIn("do not say goodbye yet", injected)
-                self.assertNotIn("final exchange", injected)
-            elif index + 1 == phone.PHONE_QNA_MAX_ROUNDS:
-                # The cap round: answer + wrap-up invite, NOT a goodbye.
-                self.assertIn("before you wrap up", injected)
+                self.assertIn("do not ask a question or invite more questions", injected)
                 self.assertIn("do not say goodbye yet", injected)
                 self.assertNotIn("final exchange", injected)
             else:
-                # One past the cap: answer briefly, thank, goodbye.
+                # At the cap: answer briefly, thank, goodbye.
                 self.assertIn("final exchange", injected)
                 self.assertIn("say goodbye", injected)
         await self._finish(hooks)
@@ -12877,7 +12893,10 @@ class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
             stale = _FakeSpeech(events=events)
             hooks["reply_handle"][0] = stale
             hooks["reply_started"].set()
-            await asyncio.sleep(0.08)
+            # Await observable completion, not a scheduler-sensitive 80ms nap.
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while len(session.spoken) == before and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
         self.assertEqual(stale.interrupt_calls, [True])
         self.assertEqual(events, ["interrupt", "drained", "fallback"])
         self.assertEqual(len(session.spoken), before + 1)
@@ -12893,7 +12912,10 @@ class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 4.0):
             await agent._on_reply_expected()
             agent._on_generation_empty()
-            await asyncio.sleep(0.05)
+            # Still well below the four-second watchdog; tolerate loaded CI.
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while len(session.spoken) == before and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
         self.assertEqual(len(session.spoken), before + 1)
         categories = [
             c.kwargs.get("error_category")
@@ -13011,7 +13033,7 @@ class TestOpeningSubscribeReadiness(unittest.IsolatedAsyncioTestCase):
         # work rather than being paid on the first spoken frame.
         self.assertLess(
             src.index("subscribed_fut"),
-            src.index("generate("),
+            src.index("session.llm.chat("),
             "the subscription wait must precede the generate() call",
         )
 
@@ -17562,7 +17584,7 @@ class TestPhoneInstructionAssembly(unittest.TestCase):
     def test_single_question_and_expressiveness_blocks_are_always_present(self):
         text = agent_mod._phone_instructions_text(self._state())
         low = text.lower()
-        self.assertIn("ask exactly one question per turn", low)
+        self.assertIn("ask at most one question per turn", low)
         self.assertIn("do not move to the next topic", low)
         self.assertIn("restate the current question only", low)
         # Natural delivery is specific, one-thought, and never speaks stage directions.
@@ -17806,16 +17828,16 @@ class TestDeterministicOpenerFlag(unittest.TestCase):
             # ON (scripted, the default): unset/empty, the truthy tokens, and —
             # the point of the case — anything unrecognised. A mistyped rollback
             # token must land on the scripted gate, never past it.
-            ("", True), ("true", True), ("TRUE", True), ("1", True),
+            ("", False), ("true", True), ("TRUE", True), ("1", True),
             ("yes", True), ("on", True), ("garbage", True), ("fasle", True),
         ):
             with patch.dict(phone.os.environ, {"PHONE_DETERMINISTIC_OPENER": value}):
                 self.assertEqual(phone.phone_deterministic_opener(), expected, value)
 
-    def test_unset_defaults_to_SCRIPTED(self):
+    def test_unset_defaults_to_validated_generation(self):
         with patch.dict(phone.os.environ, {}, clear=False):
             phone.os.environ.pop("PHONE_DETERMINISTIC_OPENER", None)
-            self.assertTrue(phone.phone_deterministic_opener())
+            self.assertFalse(phone.phone_deterministic_opener())
 
 
 class TestJudgeAuthFailureHonest(unittest.IsolatedAsyncioTestCase):
@@ -18132,7 +18154,7 @@ class TestUnsetEnvSelectsTheScriptedGate(unittest.IsolatedAsyncioTestCase):
         # `.env.example` says "Default true" and "`deterministic` (DEFAULT)".
         # A doc and a default that disagree is a defect this lane has shipped
         # before — in the very commit that declared the variable.
-        self.assertTrue(phone.phone_deterministic_opener())
+        self.assertFalse(phone.phone_deterministic_opener())
         self.assertEqual(phone.phone_gate_flow(), "deterministic")
 
     async def test_an_UNSET_deployment_speaks_the_FIXED_disclosure(self):

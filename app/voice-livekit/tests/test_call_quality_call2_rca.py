@@ -230,14 +230,14 @@ class TestQnaRoundsPerCoalescedTurn(_Call2Harness):
         with patch.object(phone, "PHONE_QNA_MAX_ROUNDS", 2):
             agent, _, _, client, hooks = await self._enter_qna()
             ctx1 = await self._turn(hooks, "What are the work timings for this role?")
-            self.assertIn("anything else", str(ctx1.items).lower())
+            self.assertIn("do not ask a question or invite more questions", str(ctx1.items).lower())
             # Model the round-1 reply streaming with no first audio yet.
             hooks["reply_started"].set()
             hooks["speech_first_audio"].clear()
             ctx2 = await self._turn(hooks, "And does that also include the weekend shifts?")
             injected = str(ctx2.items).lower()
             self.assertNotIn("before you wrap up", injected)
-            self.assertIn("anything else", injected)
+            self.assertIn("do not ask a question or invite more questions", injected)
             self.assertTrue(self._logs(
                 hooks, "phone_turn_fragment", "qna_round_fragment_coalesced",
             ))
@@ -253,7 +253,7 @@ class TestQnaRoundsPerCoalescedTurn(_Call2Harness):
             hooks["reply_started"].set()
             hooks["speech_first_audio"].set()
             ctx2 = await self._turn(hooks, "And does that also include the weekend shifts?")
-            self.assertIn("before you wrap up", str(ctx2.items).lower())
+            self.assertIn("final exchange", str(ctx2.items).lower())
             self.assertFalse(self._logs(
                 hooks, "phone_turn_fragment", "qna_round_fragment_coalesced",
             ))

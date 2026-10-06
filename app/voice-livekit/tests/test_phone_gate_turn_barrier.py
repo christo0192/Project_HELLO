@@ -511,7 +511,7 @@ class TestPatienceGateDoesNotSWALLOW_an_interrupted_turn(unittest.TestCase):
             if "not prior_interrupted" in line and not line.lstrip().startswith("#")
         )
         self.assertEqual(
-            code.count("not prior_interrupted"), 2,
+            code.count("not prior_interrupted"), 3,
             f"a patience suppression still swallows an interrupted turn:\n{code}",
         )
         # And the sibling coalesce guard still reads the raw signals.
