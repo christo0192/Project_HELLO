@@ -17,12 +17,13 @@
  * Invariants:
  *  1. Room metadata is minimal and carries no candidate PII (session id, room
  *     name, correlation id only) — mirrors invites.ts invariant 4.
- *  2. Authoritative egress is started BEFORE the session is published as
- *     joinable. When egress is enabled, a start failure aborts provisioning;
- *     when it is disabled (and not required) the documented browser-fallback
- *     rule applies unchanged — `startAuthoritativeRecording` owns that policy
- *     and `authoritativeRecordingEnabled()` already throws when a required
- *     egress is disabled.
+ *  2. Cloud authoritative egress is started BEFORE the session is published as
+ *     joinable. R1 records in-worker and explicitly skips egress because its
+ *     SFU has none. For Cloud, an enabled egress start failure aborts
+ *     provisioning; when disabled (and not required), the documented
+ *     browser-fallback rule applies unchanged — `startAuthoritativeRecording`
+ *     owns that policy and `authoritativeRecordingEnabled()` already throws
+ *     when a required egress is disabled.
  *  3. Egress is never started twice for one session:
  *     `startAuthoritativeRecording` short-circuits on a linked
  *     recording_egress_id and links its own id with an `is null` CAS.
@@ -182,11 +183,17 @@ export async function provisionRoomForCreatedSession(
       await rooms.updateRoomMetadata(roomName, metadata);
     }
 
-    // Server-authoritative capture starts before anyone can join. In required
-    // mode a storage/egress failure aborts rather than silently producing an
-    // unrecorded room.
-    const recording = await startRecording(roomName, sessionId);
-    if (recording.status === 'started' && !recording.egressId) {
+    // R1 records in its worker. It has no LiveKit Egress service, so never
+    // construct the Cloud egress client for an R1 room. Cloud retains the
+    // existing authoritative-egress gate, including required-egress failures.
+    const recording = endpoint.target === 'r1'
+      ? { kind: 'no_egress' as const }
+      : { kind: 'egress' as const, result: await startRecording(roomName, sessionId) };
+    if (
+      recording.kind === 'egress'
+      && recording.result.status === 'started'
+      && !recording.result.egressId
+    ) {
       throw new Error('authoritative recording returned no identifier');
     }
   } catch (raw) {

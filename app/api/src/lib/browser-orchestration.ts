@@ -46,6 +46,7 @@ import { roomNameForSession } from './room-provisioning.js';
 import { createLogger } from './logger.js';
 import {
   agentDispatchClientFor,
+  browserLiveKitEndpoint,
   requireBrowserLiveKitConfigured,
 } from './livekit-endpoints.js';
 
@@ -185,5 +186,8 @@ export function browserOrchestrationGate(
  * reaper ever shares it.
  */
 export function createBrowserWorkerOrchestrationService(): WorkerOrchestrationService {
-  return createDefaultWorkerOrchestrationService({ roomNameForSession });
+  return createDefaultWorkerOrchestrationService({
+    roomNameForSession,
+    liveKitEndpoint: browserLiveKitEndpoint(),
+  });
 }

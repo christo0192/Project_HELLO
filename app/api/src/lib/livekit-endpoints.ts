@@ -4,6 +4,11 @@
  * Cloud credentials remain the permanent default. R1 is selected only by the
  * exact `BROWSER_LIVEKIT_TARGET=r1` opt-in, and is intentionally read when a
  * browser operation starts rather than while this module is imported.
+ *
+ * `BROWSER_LIVEKIT_TARGET=r1` must only be set as part of the R1 cutover
+ * (plan v2 §8.2): first drain R1 sessions and point project-hello-voice
+ * LIVEKIT_* at the R1 SFU; worker readiness host-binding lands in
+ * PR-LK-liveness.
  */
 
 import { AccessToken, AgentDispatchClient, RoomServiceClient } from 'livekit-server-sdk';

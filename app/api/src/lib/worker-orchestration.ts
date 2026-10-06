@@ -50,6 +50,7 @@ import { phoneRoomName } from '../integrations/livekit-phone-dial/phone-room.js'
 import { createLogger } from './logger.js';
 import { env } from './env.js';
 import { supabase } from './supabase.js';
+import { cloudLiveKitEndpoint, type LiveKitEndpoint } from './livekit-endpoints.js';
 
 const log = createLogger('worker-orchestration');
 
@@ -990,6 +991,11 @@ export function createDefaultWorkerOrchestrationService(
      * room. Only the reaper reads this; ensure/release never derive a room name.
      */
     roomNameForSession?: (sessionId: string) => string;
+    /**
+     * LiveKit endpoint used only by the reaper's liveness check. Omitted keeps
+     * the phone/default orchestration on the permanent Cloud endpoint.
+     */
+    liveKitEndpoint?: LiveKitEndpoint;
   } = {},
 ): WorkerOrchestrationService {
   const client = supabase as unknown as SupabaseClient;
@@ -997,6 +1003,7 @@ export function createDefaultWorkerOrchestrationService(
     token: env.flyApiToken,
     baseUrl: env.flyApiBaseUrl,
   });
+  const liveKitEndpoint = overrides.liveKitEndpoint ?? cloudLiveKitEndpoint();
 
   const rpc: RpcCaller = async (name, args) => {
     const { data, error } = await client.rpc(name, args);
@@ -1056,9 +1063,9 @@ export function createDefaultWorkerOrchestrationService(
     if (!roomClient) {
       const { RoomServiceClient } = await import('livekit-server-sdk');
       roomClient = new RoomServiceClient(
-        env.livekitUrl,
-        env.livekitApiKey,
-        env.livekitApiSecret,
+        liveKitEndpoint.url,
+        liveKitEndpoint.apiKey,
+        liveKitEndpoint.apiSecret,
       ) as unknown as { listParticipants(room: string): Promise<Array<unknown>> };
     }
     const participants = await roomClient.listParticipants(roomName);

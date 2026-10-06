@@ -119,6 +119,9 @@ describe('browserOrchestrationGate — the naming+dispatch pairing gate', () => 
     const [roomName, name] = createDispatch.mock.calls[0];
     expect(roomName).toBe('screening-sess-1');
     expect(name).toBe('browser-screener'); // names_agree: dispatch to the exact name
+    expect(createDispatch.mock.calls[0][2]).toEqual({
+      metadata: JSON.stringify({ session_id: 'sess-1', channel: 'browser' }),
+    });
   });
 
   it('dispatch returns false (never throws) when createDispatch fails — no agent-less token', async () => {
