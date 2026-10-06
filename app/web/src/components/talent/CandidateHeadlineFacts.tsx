@@ -22,12 +22,24 @@ export interface CandidateHeadlineFactsProps {
    * Length of the screening CALL, in seconds.
    *
    * NOT "how long the candidate spoke" — no per-speaker talk-time metric
-   * exists anywhere in this system. `sessions.duration_sec` is wall clock:
-   * the bot's speech, the candidate's, the ring and every silence. It is
-   * labelled for what it measures, because a figure captioned "candidate
-   * spoke for 7m 14s" would be read as engagement and is not that.
+   * exists anywhere in this system. It is wall clock: the bot's speech, the
+   * candidate's, the ring and every silence. It is labelled for what it
+   * measures, because a figure captioned "candidate spoke for 7m 14s" would
+   * be read as engagement and is not that.
+   *
+   * For a PHONE session the caller passes it only when every leg's end is
+   * known (M013 S02 `connected_complete`); a dropped leg nobody saw end has
+   * no honest call length, so the figure is absent rather than guessed.
    */
   callSeconds?: number | null;
+  /**
+   * Phone sessions (M013 S02): audio actually RECORDED across the session's
+   * calls, in seconds. Shown as "Recorded 1m 11s across 2 calls": the figure
+   * the recordings on the Review tab add up to.
+   */
+  recordedSeconds?: number | null;
+  /** How many calls (legs) `recordedSeconds` spans. */
+  recordedCalls?: number | null;
   /**
    * Words the candidate said on that same call, or null when no transcript
    * was read. Shown BESIDE the call length because the pair is the point: a
@@ -47,13 +59,17 @@ function Fact({
   attr,
   value,
   caption,
+  lead,
 }: {
   attr: string;
   value: string;
   caption?: string;
+  /** Words BEFORE the figure ("Recorded"), in the caption's ink. */
+  lead?: string;
 }) {
   return (
     <span {...{ [attr]: '' }} className="whitespace-nowrap">
+      {lead && <span className="text-ink-secondary">{lead} </span>}
       <span className="font-semibold tabular-nums text-ink">{value}</span>
       {caption && <span className="text-ink-secondary"> {caption}</span>}
     </span>
@@ -69,14 +85,21 @@ function Sep() {
   );
 }
 
+function isPositive(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0;
+}
+
 export function CandidateHeadlineFacts({
   roleTitle,
   callSeconds,
+  recordedSeconds,
+  recordedCalls,
   candidateWords,
 }: CandidateHeadlineFactsProps) {
-  const hasCall = typeof callSeconds === 'number' && Number.isFinite(callSeconds) && callSeconds > 0;
+  const hasCall = isPositive(callSeconds);
+  const hasRecorded = isPositive(recordedSeconds);
   const hasWords = typeof candidateWords === 'number' && Number.isFinite(candidateWords);
-  if (!roleTitle && !hasCall && !hasWords) return null;
+  if (!roleTitle && !hasCall && !hasRecorded && !hasWords) return null;
 
   const facts: ReactNode[] = [];
   if (roleTitle) {
@@ -90,12 +113,24 @@ export function CandidateHeadlineFacts({
       </span>,
     );
   }
+  if (hasRecorded) {
+    const calls = isPositive(recordedCalls) ? Math.floor(recordedCalls) : 0;
+    facts.push(
+      <Fact
+        key="recorded"
+        attr="data-candidate-recorded-length"
+        lead="Recorded"
+        value={formatDurationSec(recordedSeconds)}
+        caption={calls > 1 ? `across ${calls} calls` : undefined}
+      />,
+    );
+  }
   if (hasCall) {
     facts.push(
       <Fact
         key="call"
         attr="data-candidate-call-length"
-        value={formatDurationSec(callSeconds as number)}
+        value={formatDurationSec(callSeconds)}
         // Says WHAT was measured. There is no per-speaker talk time in this
         // system, so "on the call" is the honest caption.
         caption="on the call"

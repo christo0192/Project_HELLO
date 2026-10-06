@@ -634,6 +634,20 @@ function addSession(candidate: Candidate, n: number, over: Partial<Session> & { 
     done: true,
     ...rest,
   };
+  // M013 S02: the candidate read's per-session roll-up. A one-leg phone call
+  // whose end was observed: connected = the call, recorded about a second
+  // shorter (the worker starts recording after the answer). A call that has
+  // not ended yet has no figures.
+  const length = session.duration_sec;
+  if (session.mode === 'live' && typeof length === 'number' && length > 0) {
+    Object.assign(session, {
+      duration_unobserved_legs: 0,
+      recorded_total_sec: Math.max(1, length - 1),
+      recorded_legs: 1,
+      connected_complete: true,
+      connected_total_sec: length,
+    } satisfies Partial<Session>);
+  }
   sessions.push(session);
   const transcript = session.status === 'created' || session.status === 'waiting' ? [] : transcriptFor(role, gateOnly || session.status === 'in_progress');
   sessionDetails[session.id] = { session, transcript, assessment };

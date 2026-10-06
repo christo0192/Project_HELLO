@@ -339,6 +339,141 @@ describe('PhoneAttemptHistory', () => {
   });
 });
 
+/*
+ * M013 S02: per-leg connected and recorded figures with the truthful notes,
+ * and the two new consent tags. Anonymised session shapes, synthetic times.
+ */
+describe('PhoneAttemptHistory per-leg truth (M013 S02)', () => {
+  const T0 = Date.parse('2026-10-05T03:30:00.000Z');
+  const iso = (ms: number) => new Date(ms).toISOString();
+  const LEG = {
+    ...ATTEMPT,
+    state: 'completed',
+    outcome_class: 'disconnected',
+    recording: { state: 'ready' },
+    consent_stage: 'after_consent',
+    transcript: null,
+  };
+
+  it('the 9f60523d shape: a ledger leg with an estimated recording, and a leg whose end nobody observed', async () => {
+    const legA = {
+      ...LEG,
+      id: '00000000-0000-4000-8000-000000000031',
+      attempt_seq: 1,
+      admitted_at: iso(T0),
+      answered_at: iso(T0 + 10_000),
+      ended_at: iso(T0 + 85_000),
+      duration_sec: 75,
+      connected_from: iso(T0 + 10_000),
+      connected_to: iso(T0 + 85_000),
+      connected_to_source: 'ledger',
+      connected_sec: 75,
+      recorded_sec: 53.2,
+      recorded_sec_estimated: true,
+      tail_may_be_missing: true,
+    };
+    const legB = {
+      ...LEG,
+      id: '00000000-0000-4000-8000-000000000032',
+      attempt_seq: 2,
+      state: 'abandoned',
+      abandon_reason: null,
+      outcome_class: null,
+      admitted_at: iso(T0 + 240_000),
+      answered_at: iso(T0 + 250_000),
+      // The lease reclaim DETECTED the drop 6m 8s after the answer.
+      ended_at: iso(T0 + 618_000),
+      duration_sec: null,
+      connected_from: iso(T0 + 250_000),
+      connected_to: iso(T0 + 618_000),
+      connected_to_source: 'unobserved',
+      connected_sec: null,
+      recorded_sec: 17.6,
+      recorded_sec_estimated: false,
+      tail_may_be_missing: false,
+    };
+    getCandidatePhoneAttempts.mockResolvedValue({ attempts: [legB, legA], next_cursor: null });
+    const { container } = renderHistory();
+    await screen.findByText('Attempt 2');
+    const rows = Array.from(container.querySelectorAll('li'));
+    const [rowB, rowA] = rows;
+
+    expect(rowA.textContent).toContain('Connected 1m 15s · Recorded ≈53s (estimated)');
+    expect(rowA.querySelector('[data-attempt-note="tail"]')?.textContent).toBe(
+      'This recording may end a few seconds before the call did.',
+    );
+    expect(rowA.querySelector('[data-attempt-note="unobserved"]')).toBeNull();
+
+    expect(rowB.textContent).toContain('Connected, end not observed · Recorded 18s');
+    expect(rowB.querySelector('[data-attempt-note="unobserved"]')?.textContent).toMatch(
+      /^Line dropped; end not observed \(detected \d\d:\d\d IST by timeout\)\.$/,
+    );
+    expect(rowB.querySelector('[data-attempt-note="tail"]')).toBeNull();
+    // No reclaim span is presented as a call length anywhere.
+    expect(container.textContent).not.toMatch(/6m 8s|6m 7s|7m 23s/);
+    // An ordinary consented leg carries no consent tag.
+    expect(container.querySelector('[data-attempt-consent]')).toBeNull();
+  });
+
+  it('the 32757295 shape: before consent, recorded and connected within 3 s, no truncation note', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [{
+        ...LEG,
+        outcome_class: 'voicemail',
+        consent_stage: 'before_consent',
+        duration_sec: 34.6,
+        connected_from: iso(T0),
+        connected_to: iso(T0 + 34_600),
+        connected_to_source: 'observed',
+        connected_sec: 34.6,
+        recorded_sec: 32.7,
+        recorded_sec_estimated: false,
+        tail_may_be_missing: false,
+      }],
+      next_cursor: null,
+    });
+    const { container } = renderHistory();
+    // The outcome shows AS RECORDED (D10: S02 does not relabel it).
+    expect(await screen.findByText('Voicemail')).toBeInTheDocument();
+    expect(container.textContent).toContain('Connected 35s · Recorded 33s');
+    expect(screen.getByText('Recorded before consent')).toBeInTheDocument();
+    expect(container.querySelector('[data-attempt-note]')).toBeNull();
+  });
+
+  it('a payload without the per-leg fields keeps its duration as the connected length', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({ attempts: [{ ...LEG, duration_sec: 84 }], next_cursor: null });
+    const { container } = renderHistory();
+    await screen.findByText('Attempt 1');
+    expect(container.textContent).toContain('Connected 1m 24s');
+    expect(container.textContent).not.toContain('Recorded ');
+  });
+
+  it('tags a withdrawn consent and an in-call callback request, each with its own retention note', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [
+        { ...LEG, id: '00000000-0000-4000-8000-000000000041', attempt_seq: 2, consent_stage: 'deferred_after_consent' },
+        { ...LEG, id: '00000000-0000-4000-8000-000000000042', attempt_seq: 1, consent_stage: 'consent_withdrawn' },
+        // No audio: no tag, whatever the stage.
+        { ...LEG, id: '00000000-0000-4000-8000-000000000043', attempt_seq: 3, consent_stage: 'consent_withdrawn',
+          recording: { state: 'unavailable', reason: 'no_recording' } },
+      ],
+      next_cursor: null,
+    });
+    getAttemptRecordingDownloadUrl.mockResolvedValue({ url: 'https://storage.invalid/signed' });
+    renderHistory();
+    expect(await screen.findAllByText('Consent withdrawn – recording kept')).toHaveLength(1);
+    expect(screen.getAllByText('Callback requested after consent – recording kept')).toHaveLength(1);
+    // A deferral is never worded as a withdrawal.
+    expect(screen.queryByText(/Callback requested.*withdr/i)).toBeNull();
+
+    const [deferredPlay, withdrawnPlay] = screen.getAllByRole('button', { name: 'Play recording' });
+    fireEvent.click(withdrawnPlay);
+    expect(await screen.findByText(/withdrew consent on this call.*2026-09-26 retention decision/)).toBeInTheDocument();
+    fireEvent.click(deferredPlay);
+    expect(await screen.findByText(/asked to be called back later.*2026-09-26 retention decision/)).toBeInTheDocument();
+  });
+});
+
 describe('usePhoneAttemptHistory', () => {
   it("drops the previous candidate's attempts as soon as the candidate changes", async () => {
     const forA = { attempts: [{ ...ATTEMPT, id: 'a-1' }], next_cursor: 'cursor-a' };

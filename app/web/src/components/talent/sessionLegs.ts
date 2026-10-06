@@ -20,6 +20,7 @@
  */
 
 import type { CandidatePhoneAttempt, Session, TranscriptLine } from '../../types';
+import { formatIstTime, formatIstTimeRange } from '../../lib/ist-datetime';
 import { formatDurationSec } from './status';
 
 /** Legacy legs: the worker began recording about this long after the answer. */
@@ -205,6 +206,76 @@ export function legNoAudioLabel(reason: CandidatePhoneAttempt['recording']['reas
   }
 }
 
+/*
+ * One leg's figures and notes, in the words every surface uses (the Review
+ * tab's leg rows and the Overview's call-attempt list), so the same leg never
+ * reads two ways on one page.
+ */
+
+/** "Connected 09:00–09:02 IST (1m 15s)", "Connected from 09:04 IST", or "Not answered". */
+export function legConnectedWords(leg: CandidatePhoneAttempt): string {
+  const from = leg.connected_from ?? leg.answered_at;
+  if (!from) return 'Not answered';
+  const to = leg.connected_to;
+  if (!to || leg.connected_to_source === 'unobserved') return `Connected from ${formatIstTime(from)}`;
+  const length = leg.connected_sec != null ? ` (${formatDurationSec(leg.connected_sec)})` : '';
+  return `Connected ${formatIstTimeRange(from, to)}${length}`;
+}
+
+/** "Recorded 53s", "Recorded ≈53s (estimated)", or null when unknown. */
+export function legRecordedWords(leg: CandidatePhoneAttempt): string | null {
+  if (leg.recorded_sec == null || !Number.isFinite(leg.recorded_sec)) return null;
+  return leg.recorded_sec_estimated
+    ? `Recorded ≈${formatDurationSec(leg.recorded_sec)} (estimated)`
+    : `Recorded ${formatDurationSec(leg.recorded_sec)}`;
+}
+
+/**
+ * The note for a leg only the lease reclaim ended (`unobserved`), or null.
+ * Its `connected_to` is when the timeout DETECTED the drop, never the real
+ * end, so it is named as such rather than shown as a call length.
+ */
+export function legUnobservedNote(leg: CandidatePhoneAttempt): string | null {
+  if (leg.connected_to_source !== 'unobserved') return null;
+  return leg.connected_to
+    ? `Line dropped; end not observed (detected ${formatIstTime(leg.connected_to)} by timeout).`
+    : 'Line dropped; end not observed.';
+}
+
+/** The note for a leg whose recording may stop before the call did. */
+export const LEG_TAIL_NOTE = 'This recording may end a few seconds before the call did.';
+
+/**
+ * The consent tag for a leg's recording (0105 retention, M013 D8), or null
+ * for an ordinary consented leg. Every recording is kept; the tag says under
+ * what consent it was captured or what the candidate did about it on THIS
+ * leg. `note` is the line shown with the open player.
+ */
+export function legConsentTag(
+  stage: CandidatePhoneAttempt['consent_stage'],
+): { label: string; note: string } | null {
+  const kept = 'kept under the 2026-09-26 retention decision. Every playback is logged.';
+  switch (stage) {
+    case 'before_consent':
+      return {
+        label: 'Recorded before consent',
+        note: `Recorded before the candidate consented and ${kept}`,
+      };
+    case 'consent_withdrawn':
+      return {
+        label: 'Consent withdrawn – recording kept',
+        note: `The candidate withdrew consent on this call. The recording up to that point is ${kept}`,
+      };
+    case 'deferred_after_consent':
+      return {
+        label: 'Callback requested after consent – recording kept',
+        note: `The candidate consented, then asked to be called back later. The recording is ${kept}`,
+      };
+    default:
+      return null;
+  }
+}
+
 /**
  * The session picker's length words. A phone session shows what was
  * RECORDED across its legs, never `duration_sec`: that figure excludes a
@@ -219,6 +290,67 @@ export function sessionLengthLabel(session: Session): string | null {
     return `Recorded ${formatDurationSec(total)}${calls > 1 ? ` across ${calls} calls` : ''}`;
   }
   return session.duration_sec ? formatDurationSec(session.duration_sec) : null;
+}
+
+function positiveOrNull(value: number | null | undefined): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/** The call figures the candidate header shows, all from ONE session. */
+export interface HeadlineCallFacts {
+  sessionId: string;
+  /**
+   * Time on the call. For a phone session only when every leg's end is known
+   * (`connected_complete`), never `duration_sec`; null otherwise.
+   */
+  callSeconds: number | null;
+  /** Phone sessions: audio recorded across the session's legs; else null. */
+  recordedSeconds: number | null;
+  /** How many legs that recorded total spans. */
+  recordedCalls: number | null;
+  candidateWords: number | null;
+}
+
+/**
+ * The session the header describes, and its figures: the LONGEST one by what
+ * is actually known about it, not the latest (a nine-second consent-gate
+ * drop must not stand for a seven-minute screen). A phone session's length
+ * is its connected total when complete, else what was recorded across its
+ * legs; `duration_sec` is never used for it, because it leaves out a dropped
+ * leg whose end was never observed and so contradicts the recordings. Other
+ * modes keep `duration_sec`. null when no session has a known positive
+ * length, so the header shows no figure rather than a zero.
+ */
+export function headlineCallFacts(sessions: readonly Session[]): HeadlineCallFacts | null {
+  let best: HeadlineCallFacts | null = null;
+  let bestLength = 0;
+  for (const session of sessions) {
+    let facts: HeadlineCallFacts;
+    if (session.mode === 'live') {
+      const recorded = positiveOrNull(session.recorded_total_sec);
+      facts = {
+        sessionId: session.id,
+        callSeconds: session.connected_complete === true ? positiveOrNull(session.connected_total_sec) : null,
+        recordedSeconds: recorded,
+        recordedCalls: recorded !== null ? positiveOrNull(session.recorded_legs) : null,
+        candidateWords: session.candidate_words ?? null,
+      };
+    } else {
+      facts = {
+        sessionId: session.id,
+        callSeconds: positiveOrNull(session.duration_sec),
+        recordedSeconds: null,
+        recordedCalls: null,
+        candidateWords: session.candidate_words ?? null,
+      };
+    }
+    const length = Math.max(facts.callSeconds ?? 0, facts.recordedSeconds ?? 0);
+    if (length > bestLength) {
+      best = facts;
+      bestLength = length;
+    }
+  }
+  return best;
 }
 
 /** The latest turn at or before the playhead, within one group. */

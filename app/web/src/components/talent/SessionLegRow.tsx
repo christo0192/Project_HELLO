@@ -11,11 +11,21 @@
 
 import { forwardRef } from 'react';
 import type { CandidatePhoneAttempt } from '../../types';
-import { formatIstTime, formatIstTimeRange } from '../../lib/ist-datetime';
+import { Tag } from '../design/candidate';
 import { RecordingPlayer } from './RecordingPlayer';
 import type { RecordingPlayerHandle } from './RecordingPlayer';
-import { legNoAudioLabel, legName, legPlayable, legTitle } from './sessionLegs';
-import { attemptOutcomeLabel, attemptRawStatus, formatDurationSec } from './status';
+import {
+  LEG_TAIL_NOTE,
+  legConnectedWords,
+  legConsentTag,
+  legName,
+  legNoAudioLabel,
+  legPlayable,
+  legRecordedWords,
+  legTitle,
+  legUnobservedNote,
+} from './sessionLegs';
+import { attemptOutcomeLabel, attemptRawStatus } from './status';
 
 export interface SessionLegRowProps {
   leg: CandidatePhoneAttempt;
@@ -26,28 +36,13 @@ export interface SessionLegRowProps {
   onPlayState?: (playing: boolean) => void;
 }
 
-/** "Connected 09:00–09:02 IST (1m 15s)", "Connected from 09:04 IST", or "Not answered". */
-function connectedWords(leg: CandidatePhoneAttempt): string {
-  const from = leg.connected_from ?? leg.answered_at;
-  if (!from) return 'Not answered';
-  const to = leg.connected_to;
-  if (!to || leg.connected_to_source === 'unobserved') return `Connected from ${formatIstTime(from)}`;
-  const length = leg.connected_sec != null ? ` (${formatDurationSec(leg.connected_sec)})` : '';
-  return `Connected ${formatIstTimeRange(from, to)}${length}`;
-}
-
-function recordedWords(leg: CandidatePhoneAttempt): string | null {
-  if (leg.recorded_sec == null || !Number.isFinite(leg.recorded_sec)) return null;
-  return leg.recorded_sec_estimated
-    ? `Recorded ≈${formatDurationSec(leg.recorded_sec)} (estimated)`
-    : `Recorded ${formatDurationSec(leg.recorded_sec)}`;
-}
-
 export const SessionLegRow = forwardRef<RecordingPlayerHandle, SessionLegRowProps>(
   function SessionLegRow({ leg, index, total, sessionId, onTimeUpdate, onPlayState }, ref) {
-    const unobserved = leg.connected_to_source === 'unobserved';
-    const recorded = recordedWords(leg);
+    const unobservedNote = legUnobservedNote(leg);
+    const recorded = legRecordedWords(leg);
     const playable = legPlayable(leg);
+    // Only a leg that has audio carries a consent tag: it describes the file.
+    const consentTag = leg.recording.state !== 'unavailable' ? legConsentTag(leg.consent_stage) : null;
     return (
       <li className="py-3 first:pt-0 last:pb-0" data-leg-row="">
         <p className="text-sm text-[var(--c-ink)]">
@@ -61,19 +56,22 @@ export const SessionLegRow = forwardRef<RecordingPlayerHandle, SessionLegRowProp
           </span>
         </p>
         <p className="text-xs tabular-nums text-[var(--c-ink-secondary)]">
-          {[connectedWords(leg), recorded].filter(Boolean).join(' · ')}
+          {[legConnectedWords(leg), recorded].filter(Boolean).join(' · ')}
         </p>
+        {consentTag && (
+          <p className="mt-1" data-leg-consent={leg.consent_stage ?? ''}>
+            <Tag tone="caution">{consentTag.label}</Tag>
+          </p>
+        )}
         {/* Notes are words, never colour alone. */}
-        {unobserved && (
+        {unobservedNote && (
           <p className="mt-1 text-xs text-[var(--c-ink-secondary)]" data-leg-note="unobserved">
-            {leg.connected_to
-              ? `Line dropped; end not observed (detected ${formatIstTime(leg.connected_to)} by timeout).`
-              : 'Line dropped; end not observed.'}
+            {unobservedNote}
           </p>
         )}
         {leg.tail_may_be_missing && (
           <p className="mt-1 text-xs text-[var(--c-ink-secondary)]" data-leg-note="tail">
-            This recording may end a few seconds before the call did.
+            {LEG_TAIL_NOTE}
           </p>
         )}
         <div className="mt-2">

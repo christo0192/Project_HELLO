@@ -321,6 +321,28 @@ describe('DashboardPage', () => {
       expect(await screen.findByText(/1 of 6 decided/i)).toBeInTheDocument();
       expect(screen.getByText('17% complete')).toBeInTheDocument();
     });
+
+    it('M013 S02: a dropped-before-screening cycle leaves "In screening", is its own stage, and stays considered', async () => {
+      getMe.mockResolvedValue(VIEWER_ME);
+      listCandidates.mockResolvedValue([
+        // Newest first (the list API's order), so she is in the recent list.
+        // The 0115 relabel leaves the candidate `screening`, never `queued`.
+        { ...CANDIDATES[0], id: 'p5', name: 'Dropped Dora', status: 'screening', dial_count: 2, phone_state: 'failed', phone_state_reason: 'screening_abandoned' },
+        ...PHONE_CANDIDATES,
+      ]);
+      renderDashboard();
+      const hero = await screen.findByRole('group', { name: 'Pipeline' });
+      // Still Alice + Dee: Dora's cycle is over, so she is not "In screening".
+      expect(within(hero).getByRole('link', { name: 'In screening: 2' })).toBeInTheDocument();
+      const link = screen.getByRole('link', {
+        name: /^Abandoned: dropped before screening: 1 .*View these candidates/,
+      });
+      expect(link).toHaveAttribute('href', candidatesHref({ statuses: ['screening_abandoned'] }));
+      const recent = screen.getByRole('list', { name: 'Recent candidates, newest first' });
+      expect(within(recent).getByText('Abandoned: dropped before screening')).toBeInTheDocument();
+      // Like a failed cycle, it can be rescreened: 9 loaded − Abe − Otto = 7.
+      expect(screen.getByText(/1 of 7 decided/i)).toBeInTheDocument();
+    });
   });
 
   it('renders the average score linking to the assessed cohort', async () => {

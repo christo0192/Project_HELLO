@@ -25,6 +25,14 @@ import { SurfaceCard, Tag } from '../design/candidate';
 import { usePhoneAttemptHistory } from './usePhoneAttemptHistory';
 import type { PhoneAttemptHistorySource } from './usePhoneAttemptHistory';
 import {
+  LEG_TAIL_NOTE,
+  legConsentTag,
+  legNoAudioLabel,
+  legRecordedWords,
+  legUnobservedNote,
+  sessionLengthLabel,
+} from './sessionLegs';
+import {
   attemptOutcomeLabel,
   attemptRawStatus,
   candidateDisplayStatus,
@@ -94,22 +102,26 @@ function attemptAudioError(cause: unknown): { message: string; retryable: boolea
   return { message: "Couldn't load the recording.", retryable: true };
 }
 
-/** Why a listed recording cannot be played. */
-function unavailableRecordingLabel(reason: CandidatePhoneAttempt['recording']['reason']): string {
-  switch (reason) {
-    case 'access_unavailable':
-      return 'Recording access unavailable';
-    case 'recording_failed':
-      return 'Recording unavailable (capture failed)';
-    case 'quarantined':
-      return 'Recording withheld (failed integrity check)';
-    case 'deleted':
-      return 'Recording deleted';
-    case 'revoked':
-      return 'Recording withdrawn';
-    default:
-      return 'No recording available';
+/**
+ * One attempt's figures for its meta line: how long it was CONNECTED and how
+ * much was RECORDED (M013 S02). A leg only the lease reclaim ended has no
+ * connected length (its "end" is when the timeout noticed), so it says
+ * "end not observed" instead of a minutes-long figure nobody was on the line
+ * for. A payload without the per-leg fields keeps the old `duration_sec`.
+ */
+function attemptFigures(attempt: CandidatePhoneAttempt): string[] {
+  const figures: string[] = [];
+  if (attempt.connected_to_source === 'unobserved') {
+    figures.push('Connected, end not observed');
+  } else {
+    const connected = attempt.connected_sec === undefined ? attempt.duration_sec : attempt.connected_sec;
+    if (connected != null && connected > 0) figures.push(`Connected ${formatDurationSec(connected)}`);
   }
+  if (attempt.recording.state !== 'unavailable') {
+    const recorded = legRecordedWords(attempt);
+    if (recorded) figures.push(recorded);
+  }
+  return figures;
 }
 
 /**
@@ -266,8 +278,13 @@ export function PhoneAttemptHistory({
             const open = audio?.attemptId === attempt.id ? audio : null;
             const playerId = `${playerBaseId}-player-${attempt.id}`;
             const recorded = attempt.recording.state !== 'unavailable';
-            const preConsent = recorded && attempt.consent_stage === 'before_consent';
+            // Before consent, consent withdrawn, or a callback asked for after
+            // consent: every one is KEPT (0105, M013 D8), and says so. Only a
+            // leg with audio is tagged; the tag describes the file.
+            const consentTag = recorded ? legConsentTag(attempt.consent_stage) : null;
             const recordingName = `Attempt ${attempt.attempt_seq} recording`;
+            const figures = attemptFigures(attempt);
+            const unobservedNote = legUnobservedNote(attempt);
             return (
               <li key={attempt.id} className="py-3 text-sm">
                 <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1">
@@ -287,14 +304,22 @@ export function PhoneAttemptHistory({
                       </span>
                     </p>
                     <p className="text-meta tabular-nums text-ink-tertiary">
-                      {formatDateTime(attempt.admitted_at)}
-                      {attempt.duration_sec != null && attempt.duration_sec > 0
-                        ? ` · ${formatDurationSec(attempt.duration_sec)}`
-                        : ''}
+                      {[formatDateTime(attempt.admitted_at), ...figures].join(' · ')}
                     </p>
-                    {preConsent && (
-                      <p className="mt-1">
-                        <Tag tone="caution">Recorded before consent</Tag>
+                    {/* Notes are words, never colour alone. */}
+                    {unobservedNote && (
+                      <p className="mt-1 text-meta text-ink-secondary" data-attempt-note="unobserved">
+                        {unobservedNote}
+                      </p>
+                    )}
+                    {recorded && attempt.tail_may_be_missing && (
+                      <p className="mt-1 text-meta text-ink-secondary" data-attempt-note="tail">
+                        {LEG_TAIL_NOTE}
+                      </p>
+                    )}
+                    {consentTag && (
+                      <p className="mt-1" data-attempt-consent={attempt.consent_stage ?? ''}>
+                        <Tag tone="caution">{consentTag.label}</Tag>
                       </p>
                     )}
                   </div>
@@ -321,7 +346,7 @@ export function PhoneAttemptHistory({
                       </button>
                     ) : attempt.recording.state !== 'unavailable' ? null : (
                       <span className="text-xs text-ink-tertiary">
-                        {unavailableRecordingLabel(attempt.recording.reason)}
+                        {legNoAudioLabel(attempt.recording.reason)}
                       </span>
                     )}
                     {attempt.transcript && (
@@ -372,11 +397,8 @@ export function PhoneAttemptHistory({
                         </div>
                       </>
                     )}
-                    {preConsent && (
-                      <p className="text-meta text-ink-tertiary">
-                        Recorded before the candidate consented and kept under the
-                        2026-09-26 retention decision. Every playback is logged.
-                      </p>
+                    {consentTag && (
+                      <p className="text-meta text-ink-tertiary">{consentTag.note}</p>
                     )}
                   </div>
                 )}
@@ -608,7 +630,10 @@ export function SessionsSummary({
                   </p>
                   <p className="text-meta text-ink-tertiary">
                     {formatDateTime(s.created_at)}
-                    {s.duration_sec ? ` · ${formatDurationSec(s.duration_sec)}` : ''}
+                    {/* A phone session says what was RECORDED across its
+                        calls, never `duration_sec` (it leaves out a call
+                        whose end was never observed). */}
+                    {sessionLengthLabel(s) ? ` · ${sessionLengthLabel(s)}` : ''}
                   </p>
                 </div>
                 <div className="ml-auto flex shrink-0 items-center gap-2">

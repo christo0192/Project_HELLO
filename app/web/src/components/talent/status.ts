@@ -20,11 +20,12 @@ import { engagementStateTerm } from '../phone-calendar/phoneVocabulary';
 /**
  * Human label for a candidate status KEY (fallback: the raw value).
  *
- * Besides the stored `candidates.status` vocabulary this names the five
+ * Besides the stored `candidates.status` vocabulary this names the six
  * DISPLAY keys `candidateDisplayStatus` derives from a finished phone cycle
- * (`abandoned_no_answer`, `phone_failed`, `wrong_number`, `opted_out`,
- * `phone_cancelled`). Those are never stored on the candidate; they exist so
- * the list, its filters and its counts can name what actually happened.
+ * (`abandoned_no_answer`, `phone_failed`, `screening_abandoned`,
+ * `wrong_number`, `opted_out`, `phone_cancelled`). Those are never stored on
+ * the candidate; they exist so the list, its filters and its counts can name
+ * what actually happened.
  */
 export function candidateStatusLabel(status: string | null | undefined): string {
   if (typeof status !== 'string' && status != null) return 'New';
@@ -47,6 +48,10 @@ export function candidateStatusLabel(status: string | null | undefined): string 
       return 'Abandoned: no answer';
     case 'phone_failed':
       return 'Phone screen failed';
+    case 'screening_abandoned':
+      // 0115 (M013 D1). Neutral on WHO dropped: the evidence reason (no
+      // question answered / cut off on our side) is the detail line.
+      return 'Abandoned: dropped before screening';
     case 'wrong_number':
       return 'Wrong number';
     case 'opted_out':
@@ -69,6 +74,7 @@ export function candidateStatusTone(status: string | null | undefined): StatusTo
     case 'rejected':
     case 'abandoned_no_answer':
     case 'phone_failed':
+    case 'screening_abandoned':
     case 'wrong_number':
       return 'danger';
     case 'new':
@@ -116,9 +122,53 @@ const PHONE_TERMINAL_DISPLAY_KEY: Readonly<Record<string, string>> = {
   cancelled: 'phone_cancelled',
 };
 
+/**
+ * `failed` is split by its reason. 0115 (M013 D1) relabels a cycle that
+ * ended before the candidate answered any planned question as
+ * `failed/screening_abandoned`; it is not "the phone screen failed", and its
+ * candidate is left `screening` (never `queued`), so without its own key the
+ * badge would read "Screening" for a cycle that is over. Every other failure
+ * reason stays `phone_failed`.
+ */
+const PHONE_FAILED_REASON_DISPLAY_KEY: Readonly<Record<string, string>> = {
+  screening_abandoned: 'screening_abandoned',
+};
+
+function phoneTerminalDisplayKey(state: string, reason: unknown): string | undefined {
+  if (!Object.prototype.hasOwnProperty.call(PHONE_TERMINAL_DISPLAY_KEY, state)) return undefined;
+  if (state === 'failed' && typeof reason === 'string'
+    && Object.prototype.hasOwnProperty.call(PHONE_FAILED_REASON_DISPLAY_KEY, reason)) {
+    return PHONE_FAILED_REASON_DISPLAY_KEY[reason];
+  }
+  return PHONE_TERMINAL_DISPLAY_KEY[state];
+}
+
 export type CandidateDisplayInput = { status: string | null | undefined } & Partial<
   Pick<Candidate, 'dial_count' | 'phone_state' | 'phone_state_reason' | 'last_dialed_at'>
->;
+> & {
+  /**
+   * The latest assessment's evidence reason (C3), when the caller has it
+   * (the detail page does; the list does not). Only read for
+   * `screening_abandoned`, whose detail line then says WHY in words.
+   */
+  evidence_reason?: string | null;
+};
+
+/**
+ * Why a cycle was abandoned before screening, in words: the C3 evidence
+ * reason of the assessment that triggered the 0115 relabel. Neutral on
+ * blame beyond what the evidence states. '' when unknown.
+ */
+export function screeningAbandonedEvidenceWords(reason: string | null | undefined): string {
+  switch (reason) {
+    case 'no_candidate_speech':
+      return 'No screening question was answered';
+    case 'infra_interrupted':
+      return 'The call was cut off on our side before screening began';
+    default:
+      return '';
+  }
+}
 
 export interface CandidateDisplayStatus {
   /** Filter / count / next-action key (a stored status or a display key). */
@@ -182,7 +232,8 @@ function knownDialCount(value: unknown): number | null {
  *    consent_declined) wins unchanged.
  * 2. Otherwise a terminal phone state other than `completed` becomes its own
  *    key ("Abandoned: no answer", "Phone screen failed", "Wrong number",
- *    "Opted out", "Phone screen cancelled").
+ *    "Opted out", "Phone screen cancelled"). `failed` with the 0115 reason
+ *    `screening_abandoned` is "Abandoned: dropped before screening".
  * 3. Otherwise the stored status.
  * 4. A stored, unsettled key ("Queued", "Screening", ...) gains "(dialed N)"
  *    when N > 0 calls reached the phone. A terminal phone key keeps its own
@@ -196,7 +247,9 @@ export function candidateDisplayStatus(c: CandidateDisplayInput): CandidateDispl
   const raw = rawStatusKey(c.status);
   const phoneState = typeof c.phone_state === 'string' ? c.phone_state : null;
   const settled = SETTLED_CANDIDATE_STATUSES.has(raw);
-  const phoneKey = !settled && phoneState ? PHONE_TERMINAL_DISPLAY_KEY[phoneState] : undefined;
+  const phoneKey = !settled && phoneState
+    ? phoneTerminalDisplayKey(phoneState, c.phone_state_reason)
+    : undefined;
   const key = phoneKey ?? raw;
 
   const dials = knownDialCount(c.dial_count);
@@ -204,7 +257,13 @@ export function candidateDisplayStatus(c: CandidateDisplayInput): CandidateDispl
   const label = !settled && !phoneKey && dials !== null && dials > 0 ? `${base} (dialed ${dials})` : base;
   const phoneUnknown = !settled && c.dial_count === null;
 
-  const reason = engagementReasonLabel(c.phone_state_reason);
+  const abandoned = phoneKey === 'screening_abandoned';
+  // The reason's words, unless the badge already says them (the
+  // `screening_abandoned` badge IS its reason); that key says the evidence
+  // reason instead, when the caller has it.
+  const reason = abandoned
+    ? screeningAbandonedEvidenceWords(c.evidence_reason)
+    : engagementReasonLabel(c.phone_state_reason);
   // The phone cycle's own words, unless the badge already says them.
   const phoneStateWords = phoneState && !phoneKey
     ? PHONE_IN_PROGRESS_DETAIL[phoneState] ?? `Phone cycle – ${engagementStateTerm(phoneState).label}`

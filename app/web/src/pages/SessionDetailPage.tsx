@@ -57,6 +57,12 @@ import { sessionModeLabel } from '../lib/session-mode';
 interface SessionContext {
   candidateName: string | null;
   roleTitle: string | null;
+  /**
+   * M013 S02: this session's recorded roll-up, from the candidate read (the
+   * session payload does not carry it). null = unknown.
+   */
+  recordedSeconds: number | null;
+  recordedCalls: number | null;
 }
 
 function nonBlank(value: unknown): string | null {
@@ -77,10 +83,31 @@ async function readContext(session: Session): Promise<SessionContext> {
       ? Promise.resolve().then(() => api.getRole(session.role_id as string))
       : Promise.resolve(null),
   ]);
+  const rolled = candidate.status === 'fulfilled'
+    ? candidate.value?.sessions?.find((s) => s?.id === session.id) ?? null
+    : null;
+  const recordedSeconds = positiveOrNull(rolled?.recorded_total_sec);
   return {
     candidateName: candidate.status === 'fulfilled' ? nonBlank(candidate.value?.candidate?.name) : null,
     roleTitle: role.status === 'fulfilled' ? nonBlank(role.value?.title) : null,
+    recordedSeconds,
+    recordedCalls: recordedSeconds !== null ? positiveOrNull(rolled?.recorded_legs) : null,
   };
+}
+
+function positiveOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
+}
+
+/** Answered legs left out of `duration_sec` because nobody saw them end (0115). */
+function unobservedLegs(session: Session): number {
+  const n = session.duration_unobserved_legs;
+  return typeof n === 'number' && Number.isInteger(n) && n > 0 ? n : 0;
+}
+
+/** "(1 call's end not observed)" / "(2 calls' ends not observed)". */
+function unobservedNote(count: number): string {
+  return count === 1 ? "(1 call's end not observed)" : `(${count} calls' ends not observed)`;
 }
 
 /** "Meera Iyer’s screening", else the role, else the mode. Never an id. */
@@ -143,6 +170,8 @@ export function SessionDetailPage() {
   const gateOnlyTranscript = transcript.length > 0 && transcript.every((line) => line.is_gate === true);
   const meta = pageMeta(session, context);
   const words = typeof session.candidate_words === 'number' ? session.candidate_words : null;
+  const phone = session.mode === 'live';
+  const unobserved = unobservedLegs(session);
 
   return (
     <div className="space-y-6">
@@ -189,8 +218,37 @@ export function SessionDetailPage() {
                   {sessionStatusLabel(session.status)}
                 </StatusBadge>
               </DetailRow>
-              {session.duration_sec != null && (
-                <DetailRow label="Duration">{formatDurationSec(session.duration_sec)}</DetailRow>
+              {phone ? (
+                <>
+                  {/* A phone session's `duration_sec` is CONNECTED time
+                      summed over the calls whose end was seen (0115). A call
+                      only the timeout closed is left out and said so, never
+                      counted as minutes nobody was on the line for. */}
+                  {(session.duration_sec != null || unobserved > 0) && (
+                    <DetailRow label="Connected time">
+                      <span data-session-connected="">
+                        {session.duration_sec != null ? formatDurationSec(session.duration_sec) : 'Not known'}
+                        {unobserved > 0 && (
+                          <span className="text-ink-secondary"> {unobservedNote(unobserved)}</span>
+                        )}
+                      </span>
+                    </DetailRow>
+                  )}
+                  {context.recordedSeconds !== null && (
+                    <DetailRow label="Recorded">
+                      <span data-session-recorded="">
+                        {formatDurationSec(context.recordedSeconds)}
+                        {context.recordedCalls !== null && context.recordedCalls > 1
+                          ? ` across ${context.recordedCalls} calls`
+                          : ''}
+                      </span>
+                    </DetailRow>
+                  )}
+                </>
+              ) : (
+                session.duration_sec != null && (
+                  <DetailRow label="Duration">{formatDurationSec(session.duration_sec)}</DetailRow>
+                )
               )}
               {words != null && (
                 <DetailRow label="Candidate words">{words.toLocaleString('en-IN')}</DetailRow>

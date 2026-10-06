@@ -525,8 +525,31 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
     expect(row).toHaveTextContent('Connected 10:30–10:30 IST (35s)');
     expect(row).toHaveTextContent('Recorded 33s');
     expect(row).not.toHaveTextContent(/may end a few seconds|end not observed/);
+    // T08b: the same consent tag as the call-attempt list.
+    expect(within(row).getByText('Recorded before consent')).toBeInTheDocument();
     expect(screen.getByRole('option')).toHaveTextContent('Recorded 33s');
     expect(screen.getByRole('option')).not.toHaveTextContent('across');
+  });
+
+  it('T08b: tags a withdrawn consent and an in-call callback request on their legs only', async () => {
+    renderPhone({
+      legs: [
+        { ...LEG_A, consent_stage: 'deferred_after_consent' },
+        { ...LEG_B, consent_stage: 'consent_withdrawn' },
+      ],
+    });
+    const list = await screen.findByRole('list', { name: 'Calls in this session' });
+    const [rowA, rowB] = within(list).getAllByRole('listitem');
+    expect(within(rowA).getByText('Callback requested after consent – recording kept')).toBeInTheDocument();
+    expect(within(rowA).queryByText(/Consent withdrawn/)).toBeNull();
+    expect(within(rowB).getByText('Consent withdrawn – recording kept')).toBeInTheDocument();
+    expect(within(rowB).queryByText(/Callback requested/)).toBeNull();
+  });
+
+  it('T08b: an ordinary consented leg carries no consent tag', async () => {
+    renderPhone();
+    const list = await screen.findByRole('list', { name: 'Calls in this session' });
+    expect(list.querySelector('[data-leg-consent]')).toBeNull();
   });
 
   it('when no leg can be played, the session player stays and turns seek it with the session offsets', async () => {

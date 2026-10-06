@@ -7,8 +7,14 @@ import { describe, it, expect } from 'vitest';
 import type { CandidatePhoneAttempt, Session, TranscriptLine } from '../../../types';
 import {
   LEGACY_RECORDING_LAG_MS,
+  LEG_TAIL_NOTE,
   activeTurnIn,
   groupTurnsByLeg,
+  headlineCallFacts,
+  legConnectedWords,
+  legConsentTag,
+  legRecordedWords,
+  legUnobservedNote,
   legNoAudioLabel,
   legPlayable,
   legRecordingAnchor,
@@ -151,5 +157,82 @@ describe('sessionLegs', () => {
     expect(sessionLengthLabel({ ...base, mode: 'live', duration_sec: 443, recorded_total_sec: null })).toBeNull();
     expect(sessionLengthLabel({ ...base, mode: 'browser', duration_sec: 125 })).toBe('2m 5s');
     expect(sessionLengthLabel({ ...base, mode: 'browser', duration_sec: null })).toBeNull();
+  });
+
+  it('words a leg the same everywhere: connected, recorded, unobserved', () => {
+    // The 9f60523d shape, anonymised: leg A ended by the ledger with an
+    // estimated recording; leg B only ended by the lease reclaim ~6 min on.
+    const legA = leg({
+      id: 'a', attempt_seq: 1, admitted_at: iso(T0), answered_at: iso(T0 + 10_000),
+      connected_from: iso(T0 + 10_000), connected_to: iso(T0 + 85_000), connected_to_source: 'ledger',
+      connected_sec: 75, recorded_sec: 53.2, recorded_sec_estimated: true, tail_may_be_missing: true,
+    });
+    const legB = leg({
+      id: 'b', attempt_seq: 2, admitted_at: iso(T0 + 240_000), answered_at: iso(T0 + 250_000),
+      connected_from: iso(T0 + 250_000), connected_to: iso(T0 + 618_000), connected_to_source: 'unobserved',
+      connected_sec: null, recorded_sec: 17.6,
+    });
+    expect(legConnectedWords(legA)).toMatch(/^Connected \d\d:\d\d.*IST \(1m 15s\)$/);
+    expect(legRecordedWords(legA)).toBe('Recorded ≈53s (estimated)');
+    expect(legUnobservedNote(legA)).toBeNull();
+    // The reclaim span is never a length: "from", and a note naming the timeout.
+    expect(legConnectedWords(legB)).toMatch(/^Connected from \d\d:\d\d IST$/);
+    expect(legConnectedWords(legB)).not.toMatch(/6m/);
+    expect(legRecordedWords(legB)).toBe('Recorded 18s');
+    expect(legUnobservedNote(legB)).toMatch(/^Line dropped; end not observed \(detected \d\d:\d\d IST by timeout\)\.$/);
+    expect(legUnobservedNote({ ...legB, connected_to: null })).toBe('Line dropped; end not observed.');
+    expect(legRecordedWords({ ...legB, recorded_sec: null })).toBeNull();
+    expect(legConnectedWords({ ...legB, answered_at: null, connected_from: null })).toBe('Not answered');
+    expect(LEG_TAIL_NOTE).toBe('This recording may end a few seconds before the call did.');
+  });
+
+  it('tags every kept recording by its consent, and an ordinary consented leg not at all', () => {
+    expect(legConsentTag('before_consent')?.label).toBe('Recorded before consent');
+    expect(legConsentTag('consent_withdrawn')?.label).toBe('Consent withdrawn – recording kept');
+    expect(legConsentTag('deferred_after_consent')?.label).toBe('Callback requested after consent – recording kept');
+    for (const stage of ['before_consent', 'consent_withdrawn', 'deferred_after_consent'] as const) {
+      // The 2026-09-26 retention note, reused: kept, and every playback logged.
+      expect(legConsentTag(stage)?.note, stage).toMatch(/2026-09-26 retention decision\. Every playback is logged\.$/);
+    }
+    // A deferral is not a withdrawal: its words never say "withdr".
+    expect(legConsentTag('deferred_after_consent')?.note).not.toMatch(/withdr/i);
+    expect(legConsentTag('after_consent')).toBeNull();
+    expect(legConsentTag(null)).toBeNull();
+    expect(legConsentTag(undefined)).toBeNull();
+  });
+
+  describe('headlineCallFacts', () => {
+    const base: Session = { id: 's', candidate_id: 'c', role_id: null, status: 'completed', created_at: null };
+
+    it('a phone session with an unobserved leg: recorded across its calls, no call length', () => {
+      // 0115 stored duration_sec 75 for the 9f60523d shape; it must not show.
+      const facts = headlineCallFacts([
+        { ...base, mode: 'live', duration_sec: 75, recorded_total_sec: 70.8, recorded_legs: 2,
+          connected_complete: false, connected_total_sec: null, candidate_words: 4 },
+      ]);
+      expect(facts).toEqual({ sessionId: 's', callSeconds: null, recordedSeconds: 70.8, recordedCalls: 2, candidateWords: 4 });
+    });
+
+    it('a phone session whose every end is known also gets its connected total', () => {
+      const facts = headlineCallFacts([
+        { ...base, mode: 'live', duration_sec: 999, recorded_total_sec: 32.7, recorded_legs: 1,
+          connected_complete: true, connected_total_sec: 34.6 },
+      ]);
+      expect(facts).toMatchObject({ callSeconds: 34.6, recordedSeconds: 32.7, recordedCalls: 1 });
+    });
+
+    it('never uses a phone session duration_sec, even when nothing else is known', () => {
+      expect(headlineCallFacts([{ ...base, mode: 'live', duration_sec: 443, recorded_total_sec: null }])).toBeNull();
+    });
+
+    it('a browser session keeps duration_sec; the longest session wins, words from the same one', () => {
+      const facts = headlineCallFacts([
+        { ...base, id: 'gate', mode: 'live', recorded_total_sec: 9, recorded_legs: 1, candidate_words: 3 },
+        { ...base, id: 'web', mode: 'browser', duration_sec: 434, candidate_words: 450 },
+        { ...base, id: 'zero', mode: 'browser', duration_sec: 0, candidate_words: 0 },
+      ]);
+      expect(facts).toEqual({ sessionId: 'web', callSeconds: 434, recordedSeconds: null, recordedCalls: null, candidateWords: 450 });
+      expect(headlineCallFacts([])).toBeNull();
+    });
   });
 });

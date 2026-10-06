@@ -133,6 +133,67 @@ describe('SessionDetailPage', () => {
     expect(screen.queryByPlaceholderText(/candidate's answer/i)).not.toBeInTheDocument();
   });
 
+  describe('M013 S02: a phone session reads its connected time, never a reclaim span', () => {
+    const SID = '550e8400-e29b-41d4-a716-446655440000';
+    const phone = {
+      ...completedSessionDetail,
+      session: {
+        ...completedSessionDetail.session,
+        mode: 'live',
+        // The 9f60523d shape after 0115: leg A only; leg B's end unobserved.
+        duration_sec: 75,
+        duration_unobserved_legs: 1,
+      },
+    };
+
+    it('says "Connected time" with how many calls were left out, and the recorded total', async () => {
+      getSession.mockResolvedValue(phone);
+      getCandidate.mockResolvedValue({
+        candidate: { id: 'candidate-1', name: 'Jane Doe' },
+        sessions: [{ id: SID, recorded_total_sec: 70.8, recorded_legs: 2 }],
+        assessments: [],
+      });
+      renderPage();
+      await screen.findByText('Connected time');
+      expect(screen.queryByText('Duration')).toBeNull();
+      expect(document.querySelector('[data-session-connected]')?.textContent).toBe(
+        "1m 15s (1 call's end not observed)",
+      );
+      expect(document.querySelector('[data-session-recorded]')?.textContent).toBe('1m 11s across 2 calls');
+    });
+
+    it('says "Not known" when no call end was observed, and pluralises the note', async () => {
+      getSession.mockResolvedValue({
+        ...phone,
+        session: { ...phone.session, duration_sec: null, duration_unobserved_legs: 2 },
+      });
+      renderPage();
+      await screen.findByText('Connected time');
+      expect(document.querySelector('[data-session-connected]')?.textContent).toBe(
+        "Not known (2 calls' ends not observed)",
+      );
+      // The candidate read had no roll-up for this session: no recorded row.
+      expect(document.querySelector('[data-session-recorded]')).toBeNull();
+    });
+
+    it('shows no note when every end was observed, and a browser session keeps "Duration"', async () => {
+      getSession.mockResolvedValue({ ...phone, session: { ...phone.session, duration_unobserved_legs: 0 } });
+      const { unmount } = renderPage();
+      await screen.findByText('Connected time');
+      expect(document.querySelector('[data-session-connected]')?.textContent).toBe('1m 15s');
+      unmount();
+
+      getSession.mockResolvedValue({
+        ...completedSessionDetail,
+        session: { ...completedSessionDetail.session, mode: 'browser', duration_unobserved_legs: 1 },
+      });
+      renderPage();
+      await screen.findByText('Duration');
+      expect(screen.queryByText('Connected time')).toBeNull();
+      expect(screen.getByText('6m 0s')).toBeInTheDocument();
+    });
+  });
+
   it('names the page by the candidate and role, never by the session UUID', async () => {
     getSession.mockResolvedValue(completedSessionDetail);
     renderPage();

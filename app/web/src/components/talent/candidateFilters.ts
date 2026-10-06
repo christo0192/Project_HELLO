@@ -9,9 +9,9 @@
  * - `status` is a comma-separated subset of the candidate DISPLAY status
  *   vocabulary: the stored statuses (DB CHECK 0001/0006/notes) new | queued |
  *   screening | screened | advanced | rejected | consent_declined, then the
- *   five keys `candidateDisplayStatus` derives from a finished phone cycle:
- *   abandoned_no_answer | phone_failed | wrong_number | opted_out |
- *   phone_cancelled. Applied client-side (the list API only filters by role)
+ *   six keys `candidateDisplayStatus` derives from a finished phone cycle:
+ *   abandoned_no_answer | phone_failed | screening_abandoned | wrong_number |
+ *   opted_out | phone_cancelled. Applied client-side (the list API only filters by role)
  *   against `candidateStatusKey`, so a filter, its count and the row badge
  *   always agree.
  * - `resume` is a comma-separated subset of the sanitized resume-review enum
@@ -48,6 +48,8 @@ export const CANDIDATE_STATUS_ORDER = [
   'consent_declined',
   'abandoned_no_answer',
   'phone_failed',
+  // 0115 (M013 D1): `failed/screening_abandoned`, its own key.
+  'screening_abandoned',
   'wrong_number',
   'opted_out',
   'phone_cancelled',
@@ -60,6 +62,7 @@ export const CANDIDATE_STATUS_ORDER = [
 export const PHONE_OUTCOME_STATUS_KEYS: ReadonlySet<string> = new Set([
   'abandoned_no_answer',
   'phone_failed',
+  'screening_abandoned',
   'wrong_number',
   'opted_out',
   'phone_cancelled',
@@ -283,6 +286,10 @@ export function candidateNextAction(status: string | null | undefined): {
       return { label: 'No answer after every attempt', emphasis: false };
     case 'phone_failed':
       return { label: 'Phone screen failed', emphasis: false };
+    case 'screening_abandoned':
+      // Never requeued (owner decision): a rescreen is an interviewer action
+      // on the profile, which recommends one for this evidence.
+      return { label: 'Dropped before screening', emphasis: false };
     case 'wrong_number':
       return { label: 'Wrong number', emphasis: false };
     case 'opted_out':
