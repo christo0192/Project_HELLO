@@ -41,6 +41,11 @@ export interface CandidateHeadlineFactsProps {
   /** How many calls (legs) `recordedSeconds` spans. */
   recordedCalls?: number | null;
   /**
+   * Calls whose audio exists but whose length is unknown: left out of
+   * `recordedSeconds`, so it is a lower bound and the caption says so.
+   */
+  recordedUnknownCalls?: number | null;
+  /**
    * Words the candidate said on that same call, or null when no transcript
    * was read. Shown BESIDE the call length because the pair is the point: a
    * long call with very few candidate words is a call where they could not
@@ -94,6 +99,7 @@ export function CandidateHeadlineFacts({
   callSeconds,
   recordedSeconds,
   recordedCalls,
+  recordedUnknownCalls,
   candidateWords,
 }: CandidateHeadlineFactsProps) {
   const hasCall = isPositive(callSeconds);
@@ -115,13 +121,19 @@ export function CandidateHeadlineFacts({
   }
   if (hasRecorded) {
     const calls = isPositive(recordedCalls) ? Math.floor(recordedCalls) : 0;
+    const unknown = isPositive(recordedUnknownCalls) ? Math.floor(recordedUnknownCalls) : 0;
+    const captions = [
+      calls > 1 ? `across ${calls} calls` : null,
+      unknown > 0 ? `+ ${unknown} ${unknown === 1 ? 'call' : 'calls'} of unknown length` : null,
+    ].filter(Boolean);
     facts.push(
       <Fact
         key="recorded"
         attr="data-candidate-recorded-length"
-        lead="Recorded"
+        // A partial sum is never presented as the total.
+        lead={unknown > 0 ? 'Recorded at least' : 'Recorded'}
         value={formatDurationSec(recordedSeconds)}
-        caption={calls > 1 ? `across ${calls} calls` : undefined}
+        caption={captions.length > 0 ? captions.join(' ') : undefined}
       />,
     );
   }

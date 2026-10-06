@@ -8773,12 +8773,12 @@ components:
         duration_sec:
           type: integer
           nullable: true
-          description: Phone sessions (0115) - connected seconds summed over the answered legs whose end was observed or ledger-recorded; legs ended only by the lease reclaim are excluded and counted in duration_unobserved_legs (null when no leg end was observed). Not talk time, and not shown as call length for phone sessions - use recorded_total_sec / connected_total_sec.
+          description: Phone sessions (0118) - connected seconds summed over the answered legs whose end was observed or ledger-recorded; legs ended only by the lease reclaim are excluded and counted in duration_unobserved_legs (null when no leg end was observed). Not talk time, and not shown as call length for phone sessions - use recorded_total_sec / connected_total_sec.
         duration_unobserved_legs:
           type: integer
           minimum: 0
           nullable: true
-          description: M013 S02 (0115). Answered phone legs excluded from duration_sec because their end was never observed. null when not computed by the 0115 rule.
+          description: M013 S02 (0118). Answered phone legs excluded from duration_sec because their end was never observed. null when not computed by the 0118 rule.
         recorded_total_sec:
           type: number
           nullable: true
@@ -8788,10 +8788,15 @@ components:
           minimum: 0
           nullable: true
           description: M013 S02. GET /api/candidates/{id} only. How many of this session's legs have a known recording length. null as for recorded_total_sec.
+        recorded_unknown_legs:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: M013 S02. GET /api/candidates/{id} only. How many of this session's legs HAVE playable audio whose length is unknown (an OGG fallback or legacy OGG row). recorded_total_sec leaves them out, so it is a lower bound when this is greater than 0. Legs whose audio was erased, revoked, quarantined or failed count in neither. null as for recorded_total_sec.
         connected_complete:
           type: boolean
           nullable: true
-          description: M013 S02. GET /api/candidates/{id} only. true when every answered leg's end was observed or ledger-recorded; false when any answered leg's end was not observed (lease reclaim) or it has not ended. null when no leg was answered or the legs could not be read.
+          description: M013 S02. GET /api/candidates/{id} only. true when every answered leg's end was observed or ledger-recorded; false when any answered leg's end was not observed (lease reclaim), was only detected by our reconciler sweep (an upper bound), or it has not ended. null when no leg was answered or the legs could not be read.
         connected_total_sec:
           type: number
           nullable: true
@@ -9432,7 +9437,12 @@ components:
         leg_ended_at_ms:
           type: integer
           nullable: true
-          description: M013 S02. Epoch ms the worker observed the leg end (SIP participant left, else the session close). Stamped on the attempt as observed_ended_at = min(this, ended_at); the earliest report wins, so a retry cannot move it. Same sanity window; never a state transition or ledger event.
+          description: M013 S02. Epoch ms of the worker's earliest leg-end mark (see leg_end_source). Stamped on the attempt as observed_ended_at = min(this, ended_at) ONLY when leg_end_source is sip_left; the earliest report wins, so a retry cannot move it. Same sanity window; never a state transition or ledger event.
+        leg_end_source:
+          type: string
+          nullable: true
+          enum: [sip_left, session_close, finish]
+          description: M013 S02. Which mark leg_ended_at_ms is - sip_left (the SIP participant left, an observed end), session_close (an upper bound) or finish (the last-resort teardown time). Only sip_left is recorded as the observed end; the others are dropped with a log line.
         tail_flushed:
           type: boolean
           nullable: true
@@ -10294,7 +10304,7 @@ components:
         duration_sec:
           type: number
           nullable: true
-          description: Same value as connected_sec (kept for existing clients). null for a leg whose end was never observed (lease reclaim), never the span up to the reclaim.
+          description: Same value as connected_sec (kept for existing clients). null for a leg whose end was never observed (lease reclaim) or only detected by our reconciler sweep, never the span up to the reclaim or the detection.
         connected_from:
           type: string
           format: date-time
@@ -10304,20 +10314,20 @@ components:
           type: string
           format: date-time
           nullable: true
-          description: M013 S02. The leg end per connected_to_source. For unobserved it is the time the lease timeout DETECTED the dropped leg, not when the call ended. null while live or never answered.
+          description: M013 S02. The leg end per connected_to_source. For unobserved it is the time the lease timeout DETECTED the dropped leg, and for detected the time our reconciler sweep noticed the empty room - neither is when the call ended. null while live or never answered.
         connected_to_source:
           type: string
-          enum: [observed, ledger, unobserved]
+          enum: [observed, ledger, detected, unobserved]
           nullable: true
-          description: M013 S02. observed = the SIP leave the worker observed (0115 observed_ended_at); ledger = the ledger end (provider, reconciler or worker event); unobserved = ended only by the lease reclaim with no observed end, so the call's real end is unknown.
+          description: M013 S02. observed = the SIP leave the worker observed (0118 observed_ended_at, unless an earlier ledger end exists); ledger = the ledger end (provider or worker event); detected = the only end is the one our reconciler sweep recorded, i.e. when it noticed the leg was gone (an upper bound, up to a reconcile interval after the hang-up); unobserved = ended only by the lease reclaim with no observed end, so the call's real end is unknown.
         connected_sec:
           type: number
           nullable: true
-          description: M013 S02. Seconds from connected_from to connected_to. null when unobserved, live or never answered.
+          description: M013 S02. Seconds from connected_from to connected_to. null when detected, unobserved, live or never answered.
         recorded_sec:
           type: number
           nullable: true
-          description: M013 S02. Length of this leg's recording in seconds - the worker's true audio length (0115 recording_duration_ms), or for a legacy worker MP3 an estimate from its size at 64 kbps (recorded_sec_estimated). null when unknown, when the capture failed, or when the caller may not read the session.
+          description: M013 S02. Length of this leg's recording in seconds - the worker's true audio length (0118 recording_duration_ms), or for a legacy worker MP3 an estimate from its size at 64 kbps (recorded_sec_estimated). null when unknown, when the recording is unavailable (recording.state unavailable - failed, erased, revoked, quarantined, not uploaded), or when the caller may not read the session.
         recorded_sec_estimated:
           type: boolean
           description: M013 S02. recorded_sec is a size-based estimate (show it as approximate).

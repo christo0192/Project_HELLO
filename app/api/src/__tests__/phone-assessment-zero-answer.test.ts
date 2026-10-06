@@ -1,5 +1,5 @@
 /**
- * 0115 (M013 S02, T06) — the phone assessment handler and the zero-answer
+ * 0118 (M013 S02, T06) — the phone assessment handler and the zero-answer
  * relabel.
  *
  * After the completion post, a session whose latest phone assessment is a
@@ -10,7 +10,7 @@
  * relabel and never scores twice.
  *
  * The RPC itself (the predicate, the candidate move, idempotency) is proven on
- * real Postgres: app/supabase/tests/phone_0115_relabel.sql.
+ * real Postgres: app/supabase/tests/phone_0118_relabel.sql.
  */
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
@@ -121,7 +121,7 @@ function handlerFor(client: unknown, scored: string[]) {
   });
 }
 
-describe('0115 — after the completion post, a measured 0-answer session is relabelled', () => {
+describe('0118 — after the completion post, a measured 0-answer session is relabelled', () => {
   it.each([
     ['partial (stranded post)', PARTIAL],
     ['clean (attempt post)', CLEAN],
@@ -184,7 +184,7 @@ describe('0115 — after the completion post, a measured 0-answer session is rel
   });
 });
 
-describe('0115 — retry safety: a failed relabel never costs a second score', () => {
+describe('0118 — retry safety: a failed relabel never costs a second score', () => {
   it('an RPC error throws phone_assessment_relabel_failed; the retry relabels WITHOUT scoring or posting', async () => {
     const scored: string[] = [];
     const first = makeClient({ relabel: { data: null, error: { message: 'boom', code: 'PGRST000' } } });
@@ -258,7 +258,7 @@ describe('0115 — retry safety: a failed relabel never costs a second score', (
   });
 });
 
-describe('0115 — handler source', () => {
+describe('0118 — handler source', () => {
   const src = readFileSync(
     fileURLToPath(new URL('../lib/phone-runtime/assessment-handler.ts', import.meta.url)),
     'utf8',

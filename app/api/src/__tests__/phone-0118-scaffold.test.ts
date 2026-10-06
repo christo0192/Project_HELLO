@@ -1,15 +1,15 @@
 /**
- * 0115 (M013 S02, PR-2) scaffold — T03: frame, registration, §1 columns,
+ * 0118 (M013 S02, PR-2) scaffold — T03: frame, registration, §1 columns,
  * §2 room_name stamp, §3 truthful duration, and the real-Postgres wiring.
  *
  * Asserted against the migration TEXT. Behaviour (the triggers, both
  * backfills over rows written under the old 0076 rule, idempotency on a
  * second apply, the CHECKs) is proven by execution in
- * scripts/test-phone-0115.sh; text is not execution.
+ * scripts/test-phone-0118.sh; text is not execution.
  *
  * The migration number lives in ONE constant (N). If S01 or anything else
- * merges a 0115 first, S02 renumbers: change N, the file name, the head of
- * PHONE_MIGRATIONS and MIGRATION in scripts/test-phone-0115.sh.
+ * merges a 0118 first, S02 renumbers: change N, the file name, the head of
+ * PHONE_MIGRATIONS and MIGRATION in scripts/test-phone-0118.sh.
  */
 import { describe, it, expect } from 'vitest';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
@@ -19,13 +19,13 @@ import { fileURLToPath } from 'node:url';
 import { phoneRoomName } from '../integrations/livekit-phone-dial/phone-room.js';
 import {
   MIGRATION_0042,
-  MIGRATION_0115,
-  MIGRATION_0115_PATH,
+  MIGRATION_0118,
+  MIGRATION_0118_PATH,
   PHONE_MIGRATIONS,
   functionBody,
 } from './support/phone-migration.js';
 
-const N = '0115';
+const N = '0118';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '../../../..');
@@ -37,7 +37,7 @@ const read = (rel: string) => lf(readFileSync(path.join(REPO, rel), 'utf8'));
 const stripComments = (s: string) => s.replace(/--[^\n]*/g, '');
 const squash = (s: string) => stripComments(s).replace(/\s+/g, ' ').trim();
 
-const SQL = lf(MIGRATION_0115);
+const SQL = lf(MIGRATION_0118);
 const CLOCK = /\bnow\s*\(|clock_timestamp|current_timestamp|statement_timestamp|transaction_timestamp|localtimestamp/;
 
 /** Section numbers present, in file order, each with its BEGIN/END pair. */
@@ -62,11 +62,11 @@ describe(`${N} registration`, () => {
     expect(names[0]).toBe(N);
     expect(names[1]).toBe('0114');
     expect(names.filter((n) => n === N)).toHaveLength(1);
-    expect(PHONE_MIGRATIONS[0].sql).toBe(MIGRATION_0115);
+    expect(PHONE_MIGRATIONS[0].sql).toBe(MIGRATION_0118);
   });
 
-  it('is the one CI-legal 0115 file and the newest migration file', () => {
-    const base = path.basename(MIGRATION_0115_PATH);
+  it('is the one CI-legal 0118 file and the newest migration file', () => {
+    const base = path.basename(MIGRATION_0118_PATH);
     expect(base).toMatch(new RegExp(`^${N}_[a-z0-9_]+\\.sql$`));
     const files = readdirSync(MIGRATIONS).filter((f) => /^\d{4}_.*\.sql$/.test(f)).sort();
     expect(files.filter((f) => f.startsWith(`${N}_`))).toEqual([base]);
@@ -219,7 +219,7 @@ describe(`${N} §2 — room_name stamp`, () => {
   it('leaves EXACTLY two triggers on phone_call_attempts across all migrations (0055 + this)', () => {
     // The backfill updates room_name only, so it fires neither trigger. A
     // later attempt-immutability trigger would break that premise silently,
-    // so the set is pinned here and by execution in test-phone-0115.sh.
+    // so the set is pinned here and by execution in test-phone-0118.sh.
     const triggers = new Set<string>();
     for (const f of readdirSync(MIGRATIONS).filter((x) => x.endsWith('.sql')).sort()) {
       const sql = squash(readFileSync(path.join(MIGRATIONS, f), 'utf8'));
@@ -239,8 +239,8 @@ describe(`${N} §3 — truthful duration`, () => {
 
   it('re-declares set_phone_session_duration with the 0076 guards byte-for-byte', () => {
     // functionBody resolves newest-first; 0076 is not registered, so this
-    // must be the 0115 body.
-    expect(MIGRATION_0115).toContain('create or replace function screening_v2.set_phone_session_duration()');
+    // must be the 0118 body.
+    expect(MIGRATION_0118).toContain('create or replace function screening_v2.set_phone_session_duration()');
     const guards = /( {2}if new\.status <> 'completed'\n[\s\S]*?then\n {4}return new;\n {2}end if;)/.exec(SQL_0076);
     expect(guards).not.toBeNull();
     expect(SQL).toContain(guards![1]);
@@ -259,10 +259,8 @@ describe(`${N} §3 — truthful duration`, () => {
     );
   });
 
-  it('prefers the observed leg end and keeps 0076\'s session-end bound and 86400 cap', () => {
-    expect(helper).toContain(
-      'least(coalesce(a.observed_ended_at, a.ended_at, p_session_ended_at), p_session_ended_at) as leg_end',
-    );
+  it('takes the earlier of the observed and ledger ends, and keeps 0076\'s session-end bound and 86400 cap', () => {
+    expect(helper).toContain('least(a.observed_ended_at, a.ended_at, p_session_ended_at) as leg_end');
     expect(helper).toContain('and a.answered_at <= p_session_ended_at');
     expect(helper).toContain('least( 86400,');
     expect(helper).toContain('greatest(0, extract(epoch from (l.leg_end - l.answered_at)))');
@@ -271,12 +269,13 @@ describe(`${N} §3 — truthful duration`, () => {
     expect(helper).toContain('case when t.observed_sec > 0 then t.observed_sec end');
   });
 
-  it('excludes exactly the reclaim signature with no observed end', () => {
+  it('excludes exactly the reclaim signature with no observed end, whatever the session end', () => {
     expect(helper).toContain(
       "( a.observed_ended_at is null and a.state = 'abandoned' and a.outcome_class is null " +
-        'and a.abandon_reason is null and a.ended_at is not null ' +
-        'and a.ended_at <= p_session_ended_at) as unobserved',
+        'and a.abandon_reason is null and a.ended_at is not null) as unobserved',
     );
+    // The API's per-leg rule has no session-end clause either (review, S02).
+    expect(helper).not.toContain('a.ended_at <= p_session_ended_at');
   });
 
   it('the signature matches what reclaim_phone_attempt_leases actually writes', () => {
@@ -336,11 +335,11 @@ describe(`${N} §3 — truthful duration`, () => {
 });
 
 describe(`${N} real-Postgres harness wiring`, () => {
-  const script = read('scripts/test-phone-0115.sh');
+  const script = read('scripts/test-phone-0118.sh');
 
   it('targets this migration number and runs the three fixture files in order', () => {
     expect(script).toContain(`readonly MIGRATION="${N}"`);
-    const files = ['phone_0115_setup.sql', 'phone_0115_backfill_assert.sql', 'phone_0115_assert.sql'];
+    const files = ['phone_0118_setup.sql', 'phone_0118_backfill_assert.sql', 'phone_0118_assert.sql'];
     let last = -1;
     for (const f of files) {
       expect(existsSync(path.join(TESTS, f)), f).toBe(true);
@@ -349,18 +348,18 @@ describe(`${N} real-Postgres harness wiring`, () => {
       last = at;
     }
     // History is seeded BEFORE the migration, and it is applied twice.
-    expect(script.indexOf('run_sql phone_0115_setup.sql')).toBeLessThan(script.indexOf('apply "$TARGET"'));
+    expect(script.indexOf('run_sql phone_0118_setup.sql')).toBeLessThan(script.indexOf('apply "$TARGET"'));
     expect(script.split('apply "$TARGET"').length - 1).toBe(2);
   });
 
   it('is a job in supabase-ci.yml and in both path filters', () => {
     const ci = read('.github/workflows/supabase-ci.yml');
-    expect(ci).toContain('run: bash scripts/test-phone-0115.sh');
-    expect(ci.split("- 'scripts/test-phone-0115.sh'").length - 1).toBe(2);
+    expect(ci).toContain('run: bash scripts/test-phone-0118.sh');
+    expect(ci.split("- 'scripts/test-phone-0118.sh'").length - 1).toBe(2);
   });
 
   it('fixtures are synthetic: example.test emails only, no full session uuid of a real case', () => {
-    for (const f of ['phone_0115_setup.sql', 'phone_0115_backfill_assert.sql', 'phone_0115_assert.sql']) {
+    for (const f of ['phone_0118_setup.sql', 'phone_0118_backfill_assert.sql', 'phone_0118_assert.sql']) {
       const sql = lf(readFileSync(path.join(TESTS, f), 'utf8'));
       for (const m of sql.matchAll(/[\w.+-]+@[\w.-]+/g)) expect(m[0], f).toMatch(/@example\.test$/);
       expect(sql, f).not.toMatch(/9f60523d-|32757295-/);

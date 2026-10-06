@@ -331,6 +331,7 @@ describe('planAttemptLegTimingStamp — sanity window, earliest end, first write
   const report: WorkerLegTimingReport = {
     recordingStartedAtMs: REC_START,
     legEndedAtMs: LEG_END,
+    legEndSource: 'sip_left',
     durationMs: 17_650,
     tailFlushed: true,
   };
@@ -366,6 +367,7 @@ describe('planAttemptLegTimingStamp — sanity window, earliest end, first write
     const later = planAttemptLegTimingStamp(stamped, {
       recordingStartedAtMs: REC_START + 900,
       legEndedAtMs: LEG_END + 2_500,
+      legEndSource: 'sip_left',
       durationMs: 20_000,
       tailFlushed: false,
     }, AT);
@@ -404,6 +406,7 @@ describe('planAttemptLegTimingStamp — sanity window, earliest end, first write
     const answeredMs = Date.parse(ANSWERED);
     const edge = planAttemptLegTimingStamp(row(), {
       recordingStartedAtMs: answeredMs - 30_000, legEndedAtMs: AT.getTime() + 60_000,
+      legEndSource: 'sip_left',
     }, AT);
     expect(edge.dropped).toEqual([]);
     expect(edge.patch.recording_started_at_ms).toBe(answeredMs - 30_000);
@@ -420,7 +423,7 @@ describe('planAttemptLegTimingStamp — sanity window, earliest end, first write
     expect(noAnchor.patch).toEqual({ recording_duration_ms: 17_650, recording_tail_flushed: true });
   });
 
-  it('keeps the duration inside the 0115 CHECK (1 ms .. 24 h)', () => {
+  it('keeps the duration inside the 0118 CHECK (1 ms .. 24 h)', () => {
     for (const bad of [0, -5, LEG_TIMING_MAX_DURATION_MS + 1]) {
       const plan = planAttemptLegTimingStamp(row(), { durationMs: bad }, AT);
       expect(plan.patch).toEqual({});
@@ -428,6 +431,23 @@ describe('planAttemptLegTimingStamp — sanity window, earliest end, first write
     }
     expect(planAttemptLegTimingStamp(row(), { durationMs: LEG_TIMING_MAX_DURATION_MS }, AT).patch)
       .toEqual({ recording_duration_ms: LEG_TIMING_MAX_DURATION_MS });
+  });
+
+  it('stamps observed_ended_at ONLY for an observed SIP leave; a teardown mark is dropped', () => {
+    // session_close is an upper bound and finish the last-resort teardown
+    // time: neither is an observation, so neither may pass for one (it would
+    // over-count the leg and count as SIP-leave evidence in the 0118 label).
+    for (const legEndSource of ['session_close', 'finish', null, undefined] as const) {
+      const plan = planAttemptLegTimingStamp(row(), { ...report, legEndSource }, AT);
+      expect(plan.patch.observed_ended_at, String(legEndSource)).toBeUndefined();
+      expect(plan.dropped, String(legEndSource)).toEqual(['leg_end_not_observed']);
+      // The rest of the report is still stamped.
+      expect(plan.patch.recording_started_at_ms).toBe(REC_START);
+      expect(plan.patch.recording_tail_flushed).toBe(true);
+    }
+    // ...and a later sip_left report still stamps it.
+    expect(planAttemptLegTimingStamp(row(), report, AT).patch.observed_ended_at)
+      .toBe('2026-10-05T03:35:08.300Z');
   });
 
   it('an empty or all-null report plans nothing', () => {

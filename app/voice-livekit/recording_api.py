@@ -221,6 +221,7 @@ async def complete_recording(
     recording_started_at_ms: Optional[int] = None,
     leg_ended_at_ms: Optional[int] = None,
     tail_flushed: Optional[bool] = None,
+    leg_end_source: Optional[str] = None,
     post: PostFn = _default_post,
 ) -> bool:
     """Tell the finalizer the object was uploaded. Returns True iff the server
@@ -230,6 +231,9 @@ async def complete_recording(
     ``leg_ended_at_ms``, ``tail_flushed``) rides along as DATA — the API stamps
     it on the attempt and never transitions anything on it (R4: the worker
     posts no ledger events after consent). ``None`` values are omitted.
+    ``leg_end_source`` (``sip_left`` | ``session_close`` | ``finish``) says
+    which mark ``leg_ended_at_ms`` is; the API records it as the OBSERVED leg
+    end only for ``sip_left``.
 
     COMPAT RETRY: an API older than this worker (a rollback) rejects the new
     fields with ``400 {status: "invalid_request"}`` (its schema is
@@ -249,6 +253,7 @@ async def complete_recording(
     for key, value in (
         ("recording_started_at_ms", recording_started_at_ms),
         ("leg_ended_at_ms", leg_ended_at_ms),
+        ("leg_end_source", leg_end_source),
         ("tail_flushed", tail_flushed),
     ):
         if value is not None:

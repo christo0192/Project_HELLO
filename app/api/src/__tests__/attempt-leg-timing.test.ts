@@ -9,6 +9,7 @@ import {
   attemptLegTiming,
   isUnobservedReclaim,
   sessionRecordedFacts,
+  withoutRecordingFacts,
   TAIL_NOTE_TOLERANCE_SEC,
   WORKER_INBAND_EGRESS_ID_PREFIX,
   WORKER_MP3_BITRATE_BPS,
@@ -64,12 +65,51 @@ describe('attemptLegTiming', () => {
       recorded_sec_estimated: true,
       recording_started_at_ms: null,
       tail_may_be_missing: true,
+      has_recording: true,
     });
   });
 
   it('prefers the observed end over the ledger end', () => {
     const t = attemptLegTiming(row({ observed_ended_at: '2026-10-06T03:31:48.296Z' }));
     expect(t).toMatchObject({ connected_to: '2026-10-06T03:31:48.296Z', connected_to_source: 'observed', connected_sec: 61.474 });
+  });
+
+  it('an EARLIER ledger end beats the observed end (0118 least(observed, ended)), unless it is a sweep detection', () => {
+    const skewed = attemptLegTiming(row({ observed_ended_at: '2026-10-06T03:32:05.000Z' }));
+    expect(skewed).toMatchObject({ connected_to: '2026-10-06T03:32:02.356Z', connected_to_source: 'ledger', connected_sec: 75.534 });
+    const swept = attemptLegTiming(row({ observed_ended_at: '2026-10-06T03:32:05.000Z', end_detected_by_sweep: true }));
+    expect(swept).toMatchObject({ connected_to: '2026-10-06T03:32:05.000Z', connected_to_source: 'observed' });
+  });
+
+  it('a reconciler-detected end is an upper bound: detected, detection time kept, no exact length', () => {
+    // 9f60523d leg A: the sweep saw the empty room at 03:32:02, ~14 s after
+    // the SIP leave. Not "Connected 03:30-03:32 (1m 16s)".
+    const t = attemptLegTiming(row({ end_detected_by_sweep: true }));
+    expect(t).toMatchObject({
+      connected_from: '2026-10-06T03:30:46.822Z',
+      connected_to: '2026-10-06T03:32:02.356Z',
+      connected_to_source: 'detected',
+      connected_sec: null,
+      recorded_sec: 53.2,
+    });
+    // An observed SIP leave on the same leg is the real end.
+    expect(attemptLegTiming(row({ end_detected_by_sweep: true, observed_ended_at: '2026-10-06T03:31:48.296Z' })))
+      .toMatchObject({ connected_to_source: 'observed', connected_sec: 61.474 });
+    // A reclaim stays unobserved whatever the sweep flag says.
+    expect(attemptLegTiming(reclaimed({ end_detected_by_sweep: true })).connected_to_source).toBe('unobserved');
+  });
+
+  it('withoutRecordingFacts withholds the audio facts and keeps the call facts', () => {
+    const t = withoutRecordingFacts(attemptLegTiming(row({ recording_started_at_ms: 1_791_345_611_050 })));
+    expect(t).toMatchObject({
+      connected_to_source: 'ledger',
+      connected_sec: 75.534,
+      recorded_sec: null,
+      recorded_sec_estimated: false,
+      recording_started_at_ms: null,
+      tail_may_be_missing: false,
+      has_recording: false,
+    });
   });
 
   it('a lease reclaim with no observed end is unobserved: detection time kept, no length', () => {
@@ -86,7 +126,7 @@ describe('attemptLegTiming', () => {
       .toMatchObject({ connected_to_source: 'observed', connected_sec: 18.718 });
   });
 
-  it('matches the 0115 §3a reclaim signature exactly', () => {
+  it('matches the 0118 §3a reclaim signature exactly', () => {
     expect(isUnobservedReclaim(reclaimed())).toBe(true);
     // 0083 infra defer is not a reclaim.
     expect(isUnobservedReclaim(reclaimed({ abandon_reason: 'infra_deferred' }))).toBe(false);
@@ -97,7 +137,7 @@ describe('attemptLegTiming', () => {
     expect(isUnobservedReclaim(reclaimed({ observed_ended_at: '2026-10-06T03:35:08.330Z' }))).toBe(false);
     // The SQL body states the same predicate.
     const sql = readFileSync(
-      fileURLToPath(new URL('../../../supabase/migrations/0115_phone_recording_integrity.sql', import.meta.url)),
+      fileURLToPath(new URL('../../../supabase/migrations/0118_phone_recording_integrity.sql', import.meta.url)),
       'utf8',
     );
     const body = sql.slice(sql.indexOf('create or replace function screening_v2.phone_session_leg_duration('));
@@ -172,6 +212,7 @@ describe('sessionRecordedFacts', () => {
     expect(sessionRecordedFacts([attemptLegTiming(row()), attemptLegTiming(reclaimed())])).toEqual({
       recorded_total_sec: 70.8,
       recorded_legs: 2,
+      recorded_unknown_legs: 0,
       connected_complete: false,
       connected_total_sec: null,
     });
@@ -179,11 +220,35 @@ describe('sessionRecordedFacts', () => {
 
   it('no legs: all null; legs but nothing answered: connected facts null', () => {
     expect(sessionRecordedFacts([])).toEqual({
-      recorded_total_sec: null, recorded_legs: null, connected_complete: null, connected_total_sec: null,
+      recorded_total_sec: null,
+      recorded_legs: null,
+      recorded_unknown_legs: null,
+      connected_complete: null,
+      connected_total_sec: null,
     });
     expect(sessionRecordedFacts([attemptLegTiming(row({ answered_at: null, recording_object_key: null }))])).toEqual({
-      recorded_total_sec: null, recorded_legs: 0, connected_complete: null, connected_total_sec: null,
+      recorded_total_sec: null, recorded_legs: 0, recorded_unknown_legs: 0, connected_complete: null, connected_total_sec: null,
     });
+  });
+
+  it('a leg WITH audio of unknown length is counted, so the total reads as a lower bound', () => {
+    // A 53 s OGG fallback (close-timeout manifest: duration None) beside an
+    // 18 s MP3: the total is 17.6 s of KNOWN length plus 1 unknown leg.
+    const facts = sessionRecordedFacts([
+      attemptLegTiming(row({ recording_content_type: 'audio/ogg', recording_object_key: `phone-${ID}-worker.ogg` })),
+      attemptLegTiming(reclaimed()),
+    ]);
+    expect(facts).toMatchObject({ recorded_total_sec: 17.6, recorded_legs: 1, recorded_unknown_legs: 1 });
+    // A withheld (erased / revoked) leg counts in neither.
+    expect(sessionRecordedFacts([
+      withoutRecordingFacts(attemptLegTiming(row())),
+      attemptLegTiming(reclaimed()),
+    ])).toMatchObject({ recorded_total_sec: 17.6, recorded_legs: 1, recorded_unknown_legs: 0 });
+  });
+
+  it('a reconciler-detected leg makes connected incomplete (no "on the call" figure)', () => {
+    expect(sessionRecordedFacts([attemptLegTiming(row({ end_detected_by_sweep: true }))]))
+      .toMatchObject({ connected_complete: false, connected_total_sec: null });
   });
 
   it('a live answered leg makes connected incomplete', () => {

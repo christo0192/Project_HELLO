@@ -2149,9 +2149,11 @@ class TestTruthfulManifest(unittest.TestCase):
         self.assertEqual(manifest.leg_ended_at_ms, 1_003_500)
         self.assertEqual(manifest.recording_started_at_ms, 1_000_000)
         self.assertIs(manifest.tail_flushed, True)
+        self.assertEqual(manifest.leg_end_source, "sip_left")
         self.assertEqual(manifest.timing_kwargs(), {
             "recording_started_at_ms": 1_000_000,
             "leg_ended_at_ms": 1_003_500,
+            "leg_end_source": "sip_left",
             "tail_flushed": True,
         })
 
@@ -2164,8 +2166,11 @@ class TestTruthfulManifest(unittest.TestCase):
             clock.t = 2_012.25
             manifest = _finish(r)
         self.assertIs(manifest.tail_flushed, False)
-        # finish() is the last-resort leg end.
+        # finish() is the last-resort leg end, and says so: the API must not
+        # record a teardown time as an observed SIP leave.
         self.assertEqual(manifest.leg_ended_at_ms, 2_012_250)
+        self.assertEqual(manifest.leg_end_source, "finish")
+        self.assertEqual(manifest.timing_kwargs()["leg_end_source"], "finish")
         self.assertEqual(manifest.recording_started_at_ms, 2_000_000)
 
     def test_close_timeout_is_not_reported_flushed(self):
@@ -2253,8 +2258,13 @@ class TestTruthfulManifest(unittest.TestCase):
 
         m = rec.RecordingManifest(sha256="a" * 64, size_bytes=1, duration_ms=None)
         self.assertEqual(m.timing_kwargs(), {
-            "recording_started_at_ms": None, "leg_ended_at_ms": None, "tail_flushed": None,
+            "recording_started_at_ms": None, "leg_ended_at_ms": None,
+            "leg_end_source": None, "tail_flushed": None,
         })
+        # A source without a leg end is never sent.
+        m2 = rec.RecordingManifest(sha256="a" * 64, size_bytes=1, duration_ms=None,
+                                   leg_end_source="sip_left")
+        self.assertIsNone(m2.timing_kwargs()["leg_end_source"])
         self.assertEqual(rec.manifest_timing_kwargs(m), m.timing_kwargs())
         # A test double / older shape: the legacy body, never a raise.
         legacy = types.SimpleNamespace(sha256="s", size_bytes=1, duration_ms=2)

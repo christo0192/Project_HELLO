@@ -49,7 +49,7 @@ export function candidateStatusLabel(status: string | null | undefined): string 
     case 'phone_failed':
       return 'Phone screen failed';
     case 'screening_abandoned':
-      // 0115 (M013 D1). Neutral on WHO dropped: the evidence reason (no
+      // 0118 (M013 D1). Neutral on WHO dropped: the evidence reason (no
       // question answered / cut off on our side) is the detail line.
       return 'Abandoned: dropped before screening';
     case 'wrong_number':
@@ -123,7 +123,7 @@ const PHONE_TERMINAL_DISPLAY_KEY: Readonly<Record<string, string>> = {
 };
 
 /**
- * `failed` is split by its reason. 0115 (M013 D1) relabels a cycle that
+ * `failed` is split by its reason. 0118 (M013 D1) relabels a cycle that
  * ended before the candidate answered any planned question as
  * `failed/screening_abandoned`; it is not "the phone screen failed", and its
  * candidate is left `screening` (never `queued`), so without its own key the
@@ -156,7 +156,7 @@ export type CandidateDisplayInput = { status: string | null | undefined } & Part
 
 /**
  * Why a cycle was abandoned before screening, in words: the C3 evidence
- * reason of the assessment that triggered the 0115 relabel. Neutral on
+ * reason of the assessment that triggered the 0118 relabel. Neutral on
  * blame beyond what the evidence states. '' when unknown.
  */
 export function screeningAbandonedEvidenceWords(reason: string | null | undefined): string {
@@ -232,7 +232,7 @@ function knownDialCount(value: unknown): number | null {
  *    consent_declined) wins unchanged.
  * 2. Otherwise a terminal phone state other than `completed` becomes its own
  *    key ("Abandoned: no answer", "Phone screen failed", "Wrong number",
- *    "Opted out", "Phone screen cancelled"). `failed` with the 0115 reason
+ *    "Opted out", "Phone screen cancelled"). `failed` with the 0118 reason
  *    `screening_abandoned` is "Abandoned: dropped before screening".
  * 3. Otherwise the stored status.
  * 4. A stored, unsettled key ("Queued", "Screening", ...) gains "(dialed N)"
@@ -457,7 +457,7 @@ const ENGAGEMENT_REASON_LABELS: Readonly<Record<string, string>> = {
   // 0114 (C2): the interview was marked aborted by the stranded sweep, then
   // its score landed. Completed late, with the original end time kept.
   late_score_after_stranded_abort: 'Completed (score arrived late)',
-  // 0115 (M013 D1): the call ended before the candidate answered any planned
+  // 0118 (M013 D1): the call ended before the candidate answered any planned
   // question. Neutral on who dropped; the evidence reason is the detail line.
   screening_abandoned: 'Abandoned: dropped before screening',
 };

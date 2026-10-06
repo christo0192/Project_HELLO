@@ -14,6 +14,7 @@ import {
   legConnectedWords,
   legConsentTag,
   legRecordedWords,
+  legRecordingShown,
   legUnobservedNote,
   legNoAudioLabel,
   legPlayable,
@@ -22,6 +23,7 @@ import {
   sessionLengthLabel,
   sortLegs,
   turnStartMs,
+  unknownLengthWords,
 } from '../sessionLegs';
 
 const T0 = Date.parse('2026-10-05T03:30:00.000Z');
@@ -155,6 +157,14 @@ describe('sessionLegs', () => {
     );
     expect(sessionLengthLabel({ ...base, mode: 'live', duration_sec: 75, recorded_total_sec: 32.7, recorded_legs: 1 })).toBe('Recorded 33s');
     expect(sessionLengthLabel({ ...base, mode: 'live', duration_sec: 443, recorded_total_sec: null })).toBeNull();
+    // Audio of unknown length is never silently left out of the total.
+    expect(sessionLengthLabel({ ...base, mode: 'live', recorded_total_sec: 17.6, recorded_legs: 1, recorded_unknown_legs: 1 }))
+      .toBe('Recorded 18s + 1 call of unknown length');
+    expect(sessionLengthLabel({ ...base, mode: 'live', recorded_total_sec: null, recorded_legs: 0, recorded_unknown_legs: 2 }))
+      .toBe('Recorded, length unknown');
+    expect(unknownLengthWords(2)).toBe(' + 2 calls of unknown length');
+    expect(unknownLengthWords(0)).toBe('');
+    expect(unknownLengthWords(null)).toBe('');
     expect(sessionLengthLabel({ ...base, mode: 'browser', duration_sec: 125 })).toBe('2m 5s');
     expect(sessionLengthLabel({ ...base, mode: 'browser', duration_sec: null })).toBeNull();
   });
@@ -186,6 +196,26 @@ describe('sessionLegs', () => {
     expect(LEG_TAIL_NOTE).toBe('This recording may end a few seconds before the call did.');
   });
 
+  it('a reconciler-detected end is approximate: "from", and a note naming our check, never a length', () => {
+    // 9f60523d leg A: the sweep saw the empty room ~14 s after the SIP leave.
+    const detected = leg({
+      id: 'a', attempt_seq: 1, admitted_at: iso(T0), answered_at: iso(T0 + 10_000),
+      connected_from: iso(T0 + 10_000), connected_to: iso(T0 + 85_000), connected_to_source: 'detected',
+      connected_sec: null, recorded_sec: 53.2, recorded_sec_estimated: true,
+    });
+    expect(legConnectedWords(detected)).toMatch(/^Connected from \d\d:\d\d IST$/);
+    expect(legConnectedWords(detected)).not.toMatch(/1m 15s/);
+    expect(legUnobservedNote(detected)).toMatch(/^End time approximate: our check found the call over by \d\d:\d\d IST\.$/);
+    expect(legUnobservedNote({ ...detected, connected_to: null })).toBe('End time approximate.');
+  });
+
+  it('shows recording facts only for a recording that can be played', () => {
+    const base = leg({ id: 'a', attempt_seq: 1, admitted_at: iso(T0) });
+    expect(legRecordingShown(base)).toBe(true);
+    expect(legRecordingShown({ ...base, recording: { state: 'processing' } })).toBe(true);
+    expect(legRecordingShown({ ...base, recording: { state: 'unavailable', reason: 'deleted' } })).toBe(false);
+  });
+
   it('tags every kept recording by its consent, and an ordinary consented leg not at all', () => {
     expect(legConsentTag('before_consent')?.label).toBe('Recorded before consent');
     expect(legConsentTag('consent_withdrawn')?.label).toBe('Consent withdrawn – recording kept');
@@ -205,12 +235,14 @@ describe('sessionLegs', () => {
     const base: Session = { id: 's', candidate_id: 'c', role_id: null, status: 'completed', created_at: null };
 
     it('a phone session with an unobserved leg: recorded across its calls, no call length', () => {
-      // 0115 stored duration_sec 75 for the 9f60523d shape; it must not show.
+      // 0118 stored duration_sec 75 for the 9f60523d shape; it must not show.
       const facts = headlineCallFacts([
         { ...base, mode: 'live', duration_sec: 75, recorded_total_sec: 70.8, recorded_legs: 2,
           connected_complete: false, connected_total_sec: null, candidate_words: 4 },
       ]);
-      expect(facts).toEqual({ sessionId: 's', callSeconds: null, recordedSeconds: 70.8, recordedCalls: 2, candidateWords: 4 });
+      expect(facts).toEqual({
+        sessionId: 's', callSeconds: null, recordedSeconds: 70.8, recordedCalls: 2, recordedUnknownCalls: null, candidateWords: 4,
+      });
     });
 
     it('a phone session whose every end is known also gets its connected total', () => {
@@ -219,6 +251,13 @@ describe('sessionLegs', () => {
           connected_complete: true, connected_total_sec: 34.6 },
       ]);
       expect(facts).toMatchObject({ callSeconds: 34.6, recordedSeconds: 32.7, recordedCalls: 1 });
+    });
+
+    it('carries the calls of unknown length with the recorded total', () => {
+      const facts = headlineCallFacts([
+        { ...base, mode: 'live', recorded_total_sec: 17.6, recorded_legs: 1, recorded_unknown_legs: 1 },
+      ]);
+      expect(facts).toMatchObject({ recordedSeconds: 17.6, recordedCalls: 1, recordedUnknownCalls: 1 });
     });
 
     it('never uses a phone session duration_sec, even when nothing else is known', () => {
@@ -231,7 +270,9 @@ describe('sessionLegs', () => {
         { ...base, id: 'web', mode: 'browser', duration_sec: 434, candidate_words: 450 },
         { ...base, id: 'zero', mode: 'browser', duration_sec: 0, candidate_words: 0 },
       ]);
-      expect(facts).toEqual({ sessionId: 'web', callSeconds: 434, recordedSeconds: null, recordedCalls: null, candidateWords: 450 });
+      expect(facts).toEqual({
+        sessionId: 'web', callSeconds: 434, recordedSeconds: null, recordedCalls: null, recordedUnknownCalls: null, candidateWords: 450,
+      });
       expect(headlineCallFacts([])).toBeNull();
     });
   });

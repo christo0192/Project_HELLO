@@ -1,9 +1,9 @@
 -- =====================================================================
--- 0115 §4 (T05) — the partial-finalize reconnect guard and the truthful
+-- 0118 §4 (T05) — the partial-finalize reconnect guard and the truthful
 -- disconnect label, on real Postgres.
 --
--- scripts/test-phone-0115.sh runs this AFTER phone_0115_assert.sql, so every
--- migration (0115 applied twice) is in place. Each case builds its own
+-- scripts/test-phone-0118.sh runs this AFTER phone_0118_assert.sql, so every
+-- migration (0118 applied twice) is in place. Each case builds its own
 -- engagement chain under the synthetic `p115f` namespace and calls
 -- finalize_phone_partial_sessions at a frozen instant. The sweep is
 -- fleet-wide, so every assertion looks its session up by id and the cases
@@ -65,7 +65,7 @@ begin
   select id into v_role from screening_v2.roles where title = 'p115f role';
   if v_role is null then
     insert into screening_v2.roles (title, jd, required_skills, screening_template, owner_id)
-    values ('p115f role', 'Synthetic role for the 0115 finalize harness.', '[]'::jsonb,
+    values ('p115f role', 'Synthetic role for the 0118 finalize harness.', '[]'::jsonb,
             jsonb_build_array(jsonb_build_object('id','q1','question','Tell me about yourself?','weight',1)),
             v_owner)
     returning id into v_role;
@@ -295,7 +295,7 @@ end $$;
 -- ─────────────────────────────────────────────────────────────────────
 do $$
 declare
-  v_obs uuid[]; v_egr uuid[]; v_fin jsonb; v_o jsonb; v_g jsonb;
+  v_obs uuid[]; v_egr uuid[]; v_crash uuid[]; v_fin jsonb; v_o jsonb; v_g jsonb; v_c jsonb;
 begin
   -- A live leg whose lease lapsed, with the worker's observed SIP leave.
   v_obs := _p115.fin_chain('label-observed', 3, 'in_call', 0, 0, '2026-10-05T08:00:10Z');
@@ -312,10 +312,27 @@ begin
   values (v_egr[1], 1, 0, 'initial', 'abandoned', null, '2026-10-05', 'eligible', v_egr[2],
           '2026-10-05T08:00:00Z', '2026-10-05T08:00:30Z', '2026-10-05T08:02:00Z',
           'EG_p115flabel', 'complete');
+  -- A genuinely crashed leg with NO evidence of its own: the SESSION's egress
+  -- completed, and 0062's projection copied it onto the attempt. That is not
+  -- this leg's teardown evidence: it must stay worker_crash.
+  v_crash := _p115.fin_chain('label-crash', 9, 'in_call', 0, 0, '2026-10-05T08:00:10Z');
+  insert into screening_v2.phone_call_attempts
+    (engagement_id, attempt_seq, epoch, kind, state, outcome_class, ist_date,
+     prior_engagement_state, session_id, admitted_at, answered_at, ended_at)
+  values (v_crash[1], 1, 0, 'initial', 'abandoned', null, '2026-10-05', 'eligible', v_crash[2],
+          '2026-10-05T08:00:00Z', '2026-10-05T08:00:30Z', '2026-10-05T08:02:00Z');
+  update screening_v2.call_sessions
+     set recording_egress_id = 'EG_p115fsession', recording_egress_status = 'complete'
+   where id = v_crash[2];
+  if (select egress_status from screening_v2.phone_call_attempts where session_id = v_crash[2])
+     is distinct from 'complete' then
+    raise exception 'p115f label: the 0062 projection did not copy the session egress (fixture premise)';
+  end if;
 
   v_fin := screening_v2.finalize_phone_partial_sessions(200, 180, '2026-10-05T08:06:00Z');
   v_o := _p115.fin_entry(v_fin, v_obs[2]);
   v_g := _p115.fin_entry(v_fin, v_egr[2]);
+  v_c := _p115.fin_entry(v_fin, v_crash[2]);
   if v_o is null or v_o->>'disconnect_reason' <> 'unobserved_disconnect'
      or (v_o->>'transitioned')::boolean is not true then
     raise exception 'p115f label: lease-lapsed leg with observed_ended_at: entry=%', v_o;
@@ -323,8 +340,11 @@ begin
   if v_g is null or v_g->>'disconnect_reason' <> 'unobserved_disconnect' then
     raise exception 'p115f label: reclaimed leg with egress complete: entry=%', v_g;
   end if;
+  if v_c is null or v_c->>'disconnect_reason' <> 'worker_crash' then
+    raise exception 'p115f label: a leg whose only egress evidence is the session''s must stay worker_crash: entry=%', v_c;
+  end if;
 
-  raise notice 'p115f label: PASS (observed leave and completed egress -> unobserved_disconnect)';
+  raise notice 'p115f label: PASS (observed leave and the leg''s own egress -> unobserved_disconnect; session egress alone -> worker_crash)';
 end $$;
 
 -- ─────────────────────────────────────────────────────────────────────
@@ -354,7 +374,7 @@ begin
       'the expired-arm session; entry=%', _p115.fin_entry(v_fin, v_sess);
   end if;
 
-  -- +31 min: the bound has passed -> selected exactly as before 0115.
+  -- +31 min: the bound has passed -> selected exactly as before 0118.
   v_fin := screening_v2.finalize_phone_partial_sessions(200, 180, '2026-10-05T09:36:00Z');
   v_e := _p115.fin_entry(v_fin, v_sess);
   select status into v_status from screening_v2.call_sessions where id = v_sess;

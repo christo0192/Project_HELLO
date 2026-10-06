@@ -68,18 +68,30 @@ export function workerRecordingEgressId(attemptId: string): string {
  */
 export const LEG_TIMING_BEFORE_ANSWER_SLACK_MS = 30_000;
 export const LEG_TIMING_AFTER_NOW_SLACK_MS = 60_000;
-/** 0115 `recording_duration_ms` CHECK: 1 ms to 24 h. */
+/** 0118 `recording_duration_ms` CHECK: 1 ms to 24 h. */
 export const LEG_TIMING_MAX_DURATION_MS = 86_400_000;
-/** 0115 `observed_ended_at` CHECK floor: `admitted_at − 5 min`. */
+/** 0118 `observed_ended_at` CHECK floor: `admitted_at − 5 min`. */
 const OBSERVED_END_ADMITTED_FLOOR_MS = 5 * 60_000;
-/** 0115 `recording_started_at_ms` CHECK: [2020-01-01, 2100-01-01). */
+/** 0118 `recording_started_at_ms` CHECK: [2020-01-01, 2100-01-01). */
 const EPOCH_MS_CHECK_MIN = 1_577_836_800_000;
 const EPOCH_MS_CHECK_MAX = 4_102_444_800_000;
+
+/** The worker's leg-end marks (recording.py `mark_leg_end` sources). */
+export const WORKER_LEG_END_SOURCES = ['sip_left', 'session_close', 'finish'] as const;
+export type WorkerLegEndSource = (typeof WORKER_LEG_END_SOURCES)[number];
 
 /** The optional timing fields of a `/recording/complete` body (T02 worker). */
 export interface WorkerLegTimingReport {
   readonly recordingStartedAtMs?: number | null;
   readonly legEndedAtMs?: number | null;
+  /**
+   * Which worker mark `legEndedAtMs` is: `sip_left` (the SIP participant
+   * left: an OBSERVED end), `session_close` (an upper bound, possibly
+   * seconds late) or `finish` (the last-resort teardown time). Only
+   * `sip_left` is stamped as `observed_ended_at`; anything else (or absent)
+   * is a teardown time, dropped as `leg_end_not_observed`.
+   */
+  readonly legEndSource?: WorkerLegEndSource | null;
   /** The TRUE audio length the worker encoded (T02), not a wall-clock span. */
   readonly durationMs?: number | null;
   readonly tailFlushed?: boolean | null;
@@ -107,6 +119,7 @@ export interface AttemptLegTimingPatch {
 export type LegTimingDropReason =
   | 'recording_started_at_out_of_window'
   | 'leg_ended_at_out_of_window'
+  | 'leg_end_not_observed'
   | 'duration_out_of_range'
   | 'no_answer_anchor';
 
@@ -130,7 +143,7 @@ function isoMs(value: string | null): number | null {
  *     by the ledger's `ended_at` when the attempt has ended
  *     (`least(coalesce(existing, new), new)` with `new = min(leg_end, ended_at)`);
  *   - every other column is first-write-wins (`coalesce(existing, new)`).
- * A value outside the sanity window or the 0115 CHECK ranges is dropped and
+ * A value outside the sanity window or the 0118 CHECK ranges is dropped and
  * reported, never written.
  */
 export function planAttemptLegTimingStamp(
@@ -164,8 +177,13 @@ export function planAttemptLegTimingStamp(
     else if (row.recordingStartedAtMs === null) patch.recording_started_at_ms = started;
   }
 
-  // observed_ended_at — earliest wins, bounded by the ledger end.
-  if (epochReported(report.legEndedAtMs) && lowerMs !== null) {
+  // observed_ended_at — earliest wins, bounded by the ledger end. ONLY an
+  // observed SIP leave: a `session_close` / `finish` mark (or a body with no
+  // source) is a teardown time, possibly seconds or minutes late, and
+  // stamping it would over-count the leg and pass for SIP-leave evidence.
+  if (epochReported(report.legEndedAtMs) && lowerMs !== null && report.legEndSource !== 'sip_left') {
+    dropped.push('leg_end_not_observed');
+  } else if (epochReported(report.legEndedAtMs) && lowerMs !== null) {
     const legEnd = Math.trunc(report.legEndedAtMs);
     if (!inWindow(legEnd)) {
       dropped.push('leg_ended_at_out_of_window');
@@ -179,7 +197,7 @@ export function planAttemptLegTimingStamp(
     }
   }
 
-  // recording_duration_ms — first write wins, within the 0115 CHECK.
+  // recording_duration_ms — first write wins, within the 0118 CHECK.
   if (typeof report.durationMs === 'number' && Number.isFinite(report.durationMs)) {
     const duration = Math.trunc(report.durationMs);
     if (duration < 1 || duration > LEG_TIMING_MAX_DURATION_MS) dropped.push('duration_out_of_range');

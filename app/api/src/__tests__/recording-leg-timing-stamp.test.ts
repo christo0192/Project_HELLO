@@ -87,6 +87,7 @@ function fakeDb(opts: FakeOpts) {
 const REPORT = {
   recordingStartedAtMs: REC_START,
   legEndedAtMs: LEG_END,
+  legEndSource: 'sip_left' as const,
   durationMs: 17_650,
   tailFlushed: true,
 };

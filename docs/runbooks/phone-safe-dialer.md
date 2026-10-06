@@ -617,7 +617,7 @@ saying so would be the same class of error as claiming a repair I had not made.
 
 ---
 
-## 13. Recording integrity (M013 S02, migration `0115`)
+## 13. Recording integrity (M013 S02, migration `0118`)
 
 This section covers what changed so that a phone call's recording, its length and its
 label match what happened on the line. The case that prompted it was live session
@@ -632,10 +632,10 @@ missing its last ~7 s, including Q1.
 | Tail flush | `app/voice-livekit/recording.py` (`_FlushingRecorderIO`, `InWorkerRecorder`) | Writes the recording tail when a leg closes. |
 | Leg-timing report | `recording.py` (`RecordingManifest`), `recording_api.py` | Sends the true audio length and the leg timing on `/recording/complete`. |
 | Leg-timing stamp | `routes/phone-worker.ts`, `lib/recording-egress.ts` (`stampWorkerAttemptLegTiming`) | Stores those facts on the attempt row. |
-| Reconciler room fallback | `integrations/livekit-phone/reconciliation.ts`, 0115 §2 | Lets the reconciler see reconnect legs. |
-| Truthful `duration_sec` | 0115 §3 | Builds a session's length from observed leg ends only (see `session-lifecycle.md`). |
-| Finalize guard and `unobserved_disconnect` | 0115 §4 | Stops a session being scored while a reconnect is pending, and labels an unobserved drop truthfully. |
-| Zero-answer relabel | 0115 §5, `assessment-handler.ts` | Labels a session with 0 answers "Abandoned: dropped before screening", never "Screened" (see `session-lifecycle.md`). |
+| Reconciler room fallback | `integrations/livekit-phone/reconciliation.ts`, 0118 §2 | Lets the reconciler see reconnect legs. |
+| Truthful `duration_sec` | 0118 §3 | Builds a session's length from observed leg ends only (see `session-lifecycle.md`). |
+| Finalize guard and `unobserved_disconnect` | 0118 §4 | Stops a session being scored while a reconnect is pending, and labels an unobserved drop truthfully. |
+| Zero-answer relabel | 0118 §5, `assessment-handler.ts` | Labels a session with 0 answers "Abandoned: dropped before screening", never "Screened" (see `session-lifecycle.md`). |
 | Per-leg display | `routes/candidates.ts`, `lib/attempt-leg-timing.ts`, web `TranscriptionSyncWorkspace.tsx` and the candidate pages | Shows every leg with its own length, player and notes. |
 
 ### 13b. `PHONE_RECORDING_TAIL_FLUSH`: the tail flush and its kill switch
@@ -701,7 +701,8 @@ older worker's body is unchanged.
 |---|---|---|
 | `duration_ms` | `recording_duration_ms` | The **true audio length** (samples encoded divided by the rate). It is no longer a wall-clock span. Unknown is sent as null, never 0. |
 | `recording_started_at_ms` | `recording_started_at_ms` | Epoch ms of t = 0 in the file, used to place transcript turns on that leg's audio. |
-| `leg_ended_at_ms` | `observed_ended_at` | The observed leg end (§13b). |
+| `leg_ended_at_ms` | `observed_ended_at` | The worker's earliest leg-end mark (§13b). Stored **only** when `leg_end_source` is `sip_left`. |
+| `leg_end_source` | (not stored) | Which mark `leg_ended_at_ms` is: `sip_left` (the SIP participant left, an observed end), `session_close` (an upper bound, possibly seconds late) or `finish` (the last-resort teardown time). A non-`sip_left` mark is dropped with the log line `dropped:leg_end_not_observed`, so a teardown time never passes for an observed end. |
 | `tail_flushed` | `recording_tail_flushed` | True only when the flush ran **and** the recorder closed cleanly. |
 
 **How the API stores them:**
@@ -715,7 +716,7 @@ older worker's body is unchanged.
   only, never `call_sessions`.
 - A legacy body, with none of the new fields, stamps nothing. Its `duration_ms` is a
   wall-clock span and is not stored as an audio length.
-- A value outside `[answered_at − 30 s, now + 60 s]`, or outside the 0115 column limits,
+- A value outside `[answered_at − 30 s, now + 60 s]`, or outside the 0118 column limits,
   is **dropped and logged**. The request is never rejected, so the recording is kept.
   - Log: `schema=recording_complete_timing`, `error_category=dropped:<code>`. The codes
     are `recording_started_at_out_of_window`, `leg_ended_at_out_of_window`,
@@ -743,7 +744,7 @@ with no outcome (9f60523d leg 2).
 
 **The fix:**
 
-- 0115 §2 stamps `room_name = 'phone-' || session_id` whenever a leg is bound to a
+- 0118 §2 stamps `room_name = 'phone-' || session_id` whenever a leg is bound to a
   session and has no room name. Existing rows were backfilled.
 - The reconciler falls back to `phone-<session_id>` for a **bound** attempt with no room
   name. An unbound attempt still counts as `no_room`.
@@ -772,7 +773,7 @@ empty-room timeout.
 session while the engagement was still `dialing` its next reconnect. The score was 0 of
 5, and the candidate read "Screened".
 
-**The fix.** 0115 §4 puts a guard in the sweep's WHERE clause, so a held session is not
+**The fix.** 0118 §4 puts a guard in the sweep's WHERE clause, so a held session is not
 selected and cannot crowd others out of the window. A session is held while its
 engagement is either:
 - `reconnecting` or `dialing`; or
@@ -786,7 +787,7 @@ The normal exit is the engagement leaving those states: a failed reconnect goes
 
 **Known residue (owner follow-up).** A drop outside the IST window sends the engagement
 to `scheduled / window_closed`, a next-day reconnect. The guard does not cover that
-state, so such a session still finalizes before the reconnect, as it did before 0115.
+state, so such a session still finalizes before the reconnect, as it did before 0118.
 
 ### 13f. The `unobserved_disconnect` label
 
@@ -794,8 +795,10 @@ Partial finalize used to label every reclaimed or lease-lapsed leg `worker_crash
 meaning our side died. It now uses `unobserved_disconnect` when the leg shows **teardown
 evidence**, meaning the worker was alive at the end:
 - a verified recording upload (`recording_ready`);
-- a completed egress; or
-- an observed SIP leave (`observed_ended_at`).
+- a completed egress **of this leg** (the worker's `EG_worker_<attempt>` id, or any
+  egress id that is not the session's). The session's own egress, which 0062 copies onto
+  every bound attempt, is not evidence about one leg; or
+- an observed SIP leave (`observed_ended_at`, stamped only from a `sip_left` mark).
 
 `worker_crash` is kept only when there is no such evidence.
 
@@ -836,6 +839,6 @@ reason in `error_type`. Compare `unobserved_disconnect` against `worker_crash`. 
 - **Worker:** the §13b secret. No code redeploy is needed.
 - **API:** redeploy the previous image. The worker's compatibility retry covers an older
   API.
-- **0115 is forward-only.** The columns are additive and harmless. A DB rollback
+- **0118 is forward-only.** The columns are additive and harmless. A DB rollback
   re-declares the 0114 or 0076 bodies of `finalize_phone_partial_sessions`,
   `enforce_phone_engagement_transition` and `set_phone_session_duration`.

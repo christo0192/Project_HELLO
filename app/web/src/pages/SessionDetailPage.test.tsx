@@ -140,7 +140,7 @@ describe('SessionDetailPage', () => {
       session: {
         ...completedSessionDetail.session,
         mode: 'live',
-        // The 9f60523d shape after 0115: leg A only; leg B's end unobserved.
+        // The 9f60523d shape after 0118: leg A only; leg B's end unobserved.
         duration_sec: 75,
         duration_unobserved_legs: 1,
       },

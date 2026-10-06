@@ -93,6 +93,12 @@ describe('CandidateHeadlineFacts', () => {
     expect(document.querySelector('[data-candidate-call-length]')).toBeNull();
   });
 
+  it('a total that leaves out a call of unknown length reads "at least", and names that call', () => {
+    render(<CandidateHeadlineFacts recordedSeconds={17.6} recordedCalls={1} recordedUnknownCalls={1} />);
+    expect(document.querySelector('[data-candidate-recorded-length]')?.textContent)
+      .toBe('Recorded at least 18s + 1 call of unknown length');
+  });
+
   it('says nothing about calls for a single recorded call, and shows both figures when both are known', () => {
     render(<CandidateHeadlineFacts recordedSeconds={32.7} recordedCalls={1} callSeconds={34.6} />);
     expect(document.querySelector('[data-candidate-recorded-length]')?.textContent).toBe('Recorded 33s');

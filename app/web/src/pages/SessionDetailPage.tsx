@@ -47,6 +47,7 @@ import {
   sessionStatusLabel,
   sessionStatusTone,
 } from '../components/talent';
+import { unknownLengthWords } from '../components/talent/sessionLegs';
 import { Scorecard } from '../components/Scorecard';
 import { BackIcon } from '../components/session/BackIcon';
 import { formatSessionWhen } from '../components/session/format';
@@ -63,6 +64,8 @@ interface SessionContext {
    */
   recordedSeconds: number | null;
   recordedCalls: number | null;
+  /** Calls with audio of unknown length, left out of `recordedSeconds`. */
+  recordedUnknownCalls: number | null;
 }
 
 function nonBlank(value: unknown): string | null {
@@ -92,6 +95,7 @@ async function readContext(session: Session): Promise<SessionContext> {
     roleTitle: role.status === 'fulfilled' ? nonBlank(role.value?.title) : null,
     recordedSeconds,
     recordedCalls: recordedSeconds !== null ? positiveOrNull(rolled?.recorded_legs) : null,
+    recordedUnknownCalls: recordedSeconds !== null ? positiveOrNull(rolled?.recorded_unknown_legs) : null,
   };
 }
 
@@ -99,7 +103,7 @@ function positiveOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 }
 
-/** Answered legs left out of `duration_sec` because nobody saw them end (0115). */
+/** Answered legs left out of `duration_sec` because nobody saw them end (0118). */
 function unobservedLegs(session: Session): number {
   const n = session.duration_unobserved_legs;
   return typeof n === 'number' && Number.isInteger(n) && n > 0 ? n : 0;
@@ -221,7 +225,7 @@ export function SessionDetailPage() {
               {phone ? (
                 <>
                   {/* A phone session's `duration_sec` is CONNECTED time
-                      summed over the calls whose end was seen (0115). A call
+                      summed over the calls whose end was seen (0118). A call
                       only the timeout closed is left out and said so, never
                       counted as minutes nobody was on the line for. */}
                   {(session.duration_sec != null || unobserved > 0) && (
@@ -237,10 +241,12 @@ export function SessionDetailPage() {
                   {context.recordedSeconds !== null && (
                     <DetailRow label="Recorded">
                       <span data-session-recorded="">
+                        {context.recordedUnknownCalls !== null ? 'At least ' : ''}
                         {formatDurationSec(context.recordedSeconds)}
                         {context.recordedCalls !== null && context.recordedCalls > 1
                           ? ` across ${context.recordedCalls} calls`
                           : ''}
+                        {unknownLengthWords(context.recordedUnknownCalls)}
                       </span>
                     </DetailRow>
                   )}

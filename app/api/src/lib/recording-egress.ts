@@ -769,7 +769,7 @@ function durationOrNull(value: unknown): number | null {
  * M013 S02 (T04) — stamp the worker's leg timing on the ATTEMPT row.
  *
  * Data only: it writes `observed_ended_at`, `recording_started_at_ms`,
- * `recording_duration_ms` and `recording_tail_flushed` (0115 §1) on
+ * `recording_duration_ms` and `recording_tail_flushed` (0118 §1) on
  * `phone_call_attempts`, posts no ledger event (R4: the worker posts none
  * after consent) and never touches `call_sessions`. The rule — sanity window,
  * earliest-end-wins, first-write-wins — is `planAttemptLegTimingStamp`; this

@@ -158,7 +158,7 @@ export function reconcileProviderEventId(
  * The attempt's own `room_name` wins. A RECONNECT leg was historically
  * admitted with `room_name` NULL although it joins the session's room
  * (9f60523d leg 2: answered, dropped, and invisible to this sweep, so the
- * lease reclaim ended it ~6 minutes later with no outcome). 0115 now stamps
+ * lease reclaim ended it ~6 minutes later with no outcome). 0118 now stamps
  * `room_name` whenever `session_id` is bound; this fallback covers a row the
  * stamp has not reached. It applies ONLY to a BOUND attempt: an unbound
  * attempt never reached a session room and stays `no_room`.

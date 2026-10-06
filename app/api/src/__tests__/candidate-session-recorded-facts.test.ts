@@ -36,6 +36,8 @@ let legsError: unknown;
 let legFilters: string[];
 let legLimits: number[];
 let legSelects: string[];
+/** phone_call_events rows the leg facts read (reconciler-detected ends). */
+let events: Array<Record<string, unknown>>;
 
 function chain(table: string): any {
   const self: any = {
@@ -65,7 +67,9 @@ function chain(table: string): any {
         ? { data: sessions, error: null }
         : table === 'phone_call_attempts'
           ? (legsError ? { data: null, error: legsError } : { data: legs, error: null })
-          : { data: [], error: null };
+          : table === 'phone_call_events'
+            ? { data: events, error: null }
+            : { data: [], error: null };
       return Promise.resolve(result).then(res, rej);
     },
   };
@@ -128,6 +132,7 @@ beforeEach(() => {
   legFilters = [];
   legLimits = [];
   legSelects = [];
+  events = [];
   vi.mocked(supabase.from).mockImplementation((t: string) => chain(t) as never);
 });
 afterEach(() => vi.restoreAllMocks());
@@ -146,7 +151,7 @@ describe('candidate detail: per-session recorded facts (M013 S02 T07)', () => {
       connected_complete: false,
       connected_total_sec: null,
     });
-    // duration_sec is passed through untouched (0115 recomputes it); the new
+    // duration_sec is passed through untouched (0118 recomputes it); the new
     // facts never repeat it as a call length.
     for (const key of ['recorded_total_sec', 'connected_total_sec']) {
       expect(session[key]).not.toBe(443);
@@ -280,6 +285,51 @@ describe('candidate detail: per-session recorded facts (M013 S02 T07)', () => {
     sessions = [{ id: S_PHONE, owner_id: 'user-1', status: 'completed' }];
     const own = await get('interviewer', 'user-1');
     expect(own.body.sessions[0]).toMatchObject({ recorded_total_sec: 70.8, recorded_legs: 2 });
+  });
+
+  it('a session whose recording was erased, revoked or quarantined counts no recorded audio (review, S02)', async () => {
+    for (const lifecycle of [
+      { recording_deleted_at: '2026-10-07T00:00:00.000Z' },
+      { recording_revoked_at: '2026-10-07T00:00:00.000Z' },
+      { recording_quarantined: true },
+    ]) {
+      sessions = [{ id: S_PHONE, owner_id: null, status: 'completed', ...lifecycle }];
+      const res = await get();
+      expect(res.body.sessions[0]).toMatchObject({
+        recorded_total_sec: null,
+        recorded_legs: 0,
+        recorded_unknown_legs: 0,
+        // Call facts are not audio facts: they stay.
+        connected_complete: false,
+      });
+    }
+    // An erased or quarantined LEG on a live session drops only that leg.
+    sessions = [{ id: S_PHONE, owner_id: null, status: 'completed' }];
+    legs = zeroAnswerLegs().map((l, i) => (i === 0 ? { ...l, recording_deleted_at: '2026-10-07T00:00:00.000Z' } : l));
+    const res = await get();
+    expect(res.body.sessions[0]).toMatchObject({ recorded_total_sec: 17.6, recorded_legs: 1 });
+  });
+
+  it('a leg with audio of unknown length is reported, so the total is not presented as complete', async () => {
+    legs = zeroAnswerLegs().map((l, i) => (i === 0
+      ? { ...l, recording_content_type: 'audio/ogg', recording_object_key: `phone-${LEG_A}-worker.ogg` }
+      : l));
+    const res = await get();
+    expect(res.body.sessions[0]).toMatchObject({ recorded_total_sec: 17.6, recorded_legs: 1, recorded_unknown_legs: 1 });
+  });
+
+  it('a reconciler-detected leg end leaves connected incomplete: no "on the call" figure', async () => {
+    legs = [leg(LEG_A, {
+      admitted_at: '2026-10-07T04:00:00.000Z',
+      answered_at: '2026-10-07T04:00:10.000Z',
+      ended_at: '2026-10-07T04:01:24.000Z',
+      state: 'ended',
+      outcome_class: 'disconnected',
+      recording_size_bytes: 480_000,
+    })];
+    events = [{ attempt_id: LEG_A, event_type: 'sip.participant_left', source: 'reconciliation', applied: true }];
+    const res = await get();
+    expect(res.body.sessions[0]).toMatchObject({ connected_complete: false, connected_total_sec: null });
   });
 
   it('never returns a storage key or provider id through the new facts', async () => {

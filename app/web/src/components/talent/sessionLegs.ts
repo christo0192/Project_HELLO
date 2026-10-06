@@ -217,7 +217,9 @@ export function legConnectedWords(leg: CandidatePhoneAttempt): string {
   const from = leg.connected_from ?? leg.answered_at;
   if (!from) return 'Not answered';
   const to = leg.connected_to;
-  if (!to || leg.connected_to_source === 'unobserved') return `Connected from ${formatIstTime(from)}`;
+  if (!to || leg.connected_to_source === 'unobserved' || leg.connected_to_source === 'detected') {
+    return `Connected from ${formatIstTime(from)}`;
+  }
   const length = leg.connected_sec != null ? ` (${formatDurationSec(leg.connected_sec)})` : '';
   return `Connected ${formatIstTimeRange(from, to)}${length}`;
 }
@@ -231,15 +233,38 @@ export function legRecordedWords(leg: CandidatePhoneAttempt): string | null {
 }
 
 /**
- * The note for a leg only the lease reclaim ended (`unobserved`), or null.
- * Its `connected_to` is when the timeout DETECTED the drop, never the real
- * end, so it is named as such rather than shown as a call length.
+ * The note for a leg whose end is not exactly known, or null: only the lease
+ * reclaim ended it (`unobserved`), or only our reconciler check saw it end
+ * (`detected`). Either `connected_to` is when the end was DETECTED, never the
+ * real end, so it is named as such rather than shown as a call length.
  */
 export function legUnobservedNote(leg: CandidatePhoneAttempt): string | null {
+  if (leg.connected_to_source === 'detected') {
+    return leg.connected_to
+      ? `End time approximate: our check found the call over by ${formatIstTime(leg.connected_to)}.`
+      : 'End time approximate.';
+  }
   if (leg.connected_to_source !== 'unobserved') return null;
   return leg.connected_to
     ? `Line dropped; end not observed (detected ${formatIstTime(leg.connected_to)} by timeout).`
     : 'Line dropped; end not observed.';
+}
+
+/**
+ * Whether a leg's recording facts (length, tail note) may be shown: never for
+ * a recording that cannot be played (deleted, withdrawn, quarantined, failed
+ * or not readable). Every surface uses this, so one leg never reads
+ * "Recorded 53s" next to "Recording deleted".
+ */
+export function legRecordingShown(leg: CandidatePhoneAttempt): boolean {
+  return leg.recording.state !== 'unavailable';
+}
+
+/** " + 1 call of unknown length" / " + 2 calls of unknown length", or "". */
+export function unknownLengthWords(count: number | null | undefined): string {
+  if (typeof count !== 'number' || !Number.isFinite(count) || count < 1) return '';
+  const n = Math.floor(count);
+  return ` + ${n} ${n === 1 ? 'call' : 'calls'} of unknown length`;
 }
 
 /** The note for a leg whose recording may stop before the call did. */
@@ -285,9 +310,14 @@ export function legConsentTag(
 export function sessionLengthLabel(session: Session): string | null {
   if (session.mode === 'live') {
     const total = session.recorded_total_sec;
-    if (total == null || !Number.isFinite(total) || total <= 0) return null;
+    const unknown = unknownLengthWords(session.recorded_unknown_legs);
+    if (total == null || !Number.isFinite(total) || total <= 0) {
+      // Audio exists but no length is known: say so, never "0s".
+      return unknown ? 'Recorded, length unknown' : null;
+    }
     const calls = session.recorded_legs ?? 0;
-    return `Recorded ${formatDurationSec(total)}${calls > 1 ? ` across ${calls} calls` : ''}`;
+    // A partial sum is never presented as the total.
+    return `Recorded ${formatDurationSec(total)}${calls > 1 ? ` across ${calls} calls` : ''}${unknown}`;
   }
   return session.duration_sec ? formatDurationSec(session.duration_sec) : null;
 }
@@ -308,6 +338,8 @@ export interface HeadlineCallFacts {
   recordedSeconds: number | null;
   /** How many legs that recorded total spans. */
   recordedCalls: number | null;
+  /** Legs with audio of unknown length, left out of `recordedSeconds`. */
+  recordedUnknownCalls: number | null;
   candidateWords: number | null;
 }
 
@@ -333,6 +365,7 @@ export function headlineCallFacts(sessions: readonly Session[]): HeadlineCallFac
         callSeconds: session.connected_complete === true ? positiveOrNull(session.connected_total_sec) : null,
         recordedSeconds: recorded,
         recordedCalls: recorded !== null ? positiveOrNull(session.recorded_legs) : null,
+        recordedUnknownCalls: recorded !== null ? positiveOrNull(session.recorded_unknown_legs) : null,
         candidateWords: session.candidate_words ?? null,
       };
     } else {
@@ -341,6 +374,7 @@ export function headlineCallFacts(sessions: readonly Session[]): HeadlineCallFac
         callSeconds: positiveOrNull(session.duration_sec),
         recordedSeconds: null,
         recordedCalls: null,
+        recordedUnknownCalls: null,
         candidateWords: session.candidate_words ?? null,
       };
     }

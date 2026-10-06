@@ -70,14 +70,14 @@ Transitions are enforced at the DB level by `trg_session_lifecycle` (BEFORE UPDA
 The following lifecycle fields remain mutable even after terminal state is reached:
 - `ended_at` (set during terminalization; can be adjusted if needed)
 - `duration_sec` (can be updated post-hoc)
-- `duration_unobserved_legs` (0115; phone sessions only, see below)
+- `duration_unobserved_legs` (0118; phone sessions only, see below)
 - `recording_object_key` (uploaded async by LiveKit; stored as object key, not signed URL)
 - `recording_url` 🟡 **DEPRECATED** — legacy column, present in schema but never written
   by active code; all recording references use `recording_object_key`.
 
 `status` and `terminal_reason` are immutable once set to a terminal value.
 
-### Phone `duration_sec` (0115)
+### Phone `duration_sec` (0118)
 
 For a phone session (`external_call_id = phone-<uuid>`), `duration_sec` is the sum of the
 connected time of its answered legs (`phone_call_attempts`), computed once on first
@@ -94,11 +94,11 @@ completion by `set_phone_session_duration` through `phone_session_leg_duration`:
 - If no answered leg has a known end, `duration_sec` is **NULL** (unknown), never 0 and
   never the reclaim span. Every reader tolerates NULL (funnel sums, DSAR export, the web
   pages).
-- `duration_unobserved_legs`: NULL = not computed by the 0115 rule (a session completed
-  before 0115 with no reclaimed leg, or not a phone session); 0 = every leg's end is known;
+- `duration_unobserved_legs`: NULL = not computed by the 0118 rule (a session completed
+  before 0118 with no reclaimed leg, or not a phone session); 0 = every leg's end is known;
   N > 0 = `duration_sec` is a lower bound (or NULL).
 
-0115 §3c backfilled completed phone sessions that already had a reclaimed leg. That
+0118 §3c backfilled completed phone sessions that already had a reclaimed leg. That
 backfill is a `duration_sec` / `duration_unobserved_legs`-only UPDATE on terminal rows,
 which this table allows: neither lifecycle trigger fires, because `status` and
 `terminal_reason` do not change. It is idempotent (a backfilled row has
@@ -129,7 +129,7 @@ Only the no-session console path (`session_id = None`) permits silent no-op, bec
 
 Terminal rows are truly immutable for lifecycle fields. If a reopened session is needed (REL-09 reconciler), it must create a NEW row and link back. No SECURITY DEFINER function exists to un-terminate a session.
 
-## Phone engagement terminal relabels (0114, 0115)
+## Phone engagement terminal relabels (0114, 0118)
 
 A phone screening also has a **phone engagement** (`screening_v2.phone_engagements`), the
 dialing cycle that owns the session. Its own trigger,
@@ -143,10 +143,10 @@ row, which stays `completed` with its `terminal_reason`.
 | Migration | From | To | Interlock |
 |---|---|---|---|
 | 0114 C2 | `failed / assessment_aborted` | `completed / late_score_after_stranded_abort` | A `source='phone'` assessment exists for the bound session, and the abort was the stranded sweep's own applied ledger row. |
-| 0115 §5 | `completed` | `failed / screening_abandoned` | The bound session's **latest** assessment (by `created_at`, `revision`, `id`) is a `source='phone'` row graded `insufficient` with a **measured** `evidence_answered = 0`. NULL (unmeasured) never qualifies, nor does a browser row, a `decision` grade or one answered question. The transaction-local GUC `screening_v2.zero_answer_relabel` must name the engagement. |
+| 0118 §5 | `completed` | `failed / screening_abandoned` | The bound session's **latest** assessment (by `created_at`, `revision`, `id`) is a `source='phone'` row graded `insufficient` with a **measured** `evidence_answered = 0`. NULL (unmeasured) never qualifies, nor does a browser row, a `decision` grade or one answered question. The transaction-local GUC `screening_v2.zero_answer_relabel` must name the engagement. |
 
 The GUC is defence in depth that keeps an accidental UPDATE out. It is **not** a security
-boundary, because any writer can call `set_config`. Judge the 0115 exception on its data
+boundary, because any writer can call `set_config`. Judge the 0118 exception on its data
 predicate alone.
 
 A relabel cannot be flipped back. The 0114 exception matches only
@@ -155,7 +155,7 @@ A relabel cannot be flipped back. The 0114 exception matches only
 
 ### `relabel_zero_answer_phone_engagement(p_engagement_id, p_actor_id, p_now)`
 
-This RPC is the only writer of the 0115 relabel. It is SECURITY DEFINER and callable by
+This RPC is the only writer of the 0118 relabel. It is SECURITY DEFINER and callable by
 `service_role` only. Under the engagement row lock it re-checks the whole predicate, then:
 
 1. Relabels the engagement `completed -> failed / screening_abandoned` (version + 1,
@@ -168,7 +168,7 @@ This RPC is the only writer of the 0115 relabel. It is SECURITY DEFINER and call
    `screening` is left alone and not audited.
 3. Writes audit rows with **existing** actions: `screening_failed` on the
    `phone_engagement`, and `candidate_status_changed` on the candidate when it moved. Both
-   carry `metadata {from, to, reason: 'screening_abandoned', migration: '0115'}` and no
+   carry `metadata {from, to, reason: 'screening_abandoned', migration: '0118'}` and no
    PII. The all-zero system actor audits as `system`; any other id audits as `recruiter`.
 
 It **never** requeues, rescreens, or creates an attempt, a ledger row or a queue job, and
@@ -185,12 +185,17 @@ evidence review). Nothing redials, because `ensure_ashby_phone_engagement` answe
 **Callers.** The phone assessment handler (`lib/phone-runtime/assessment-handler.ts`)
 calls it as the system actor after the completion post whenever the session's phone
 assessment has a measured `evidence_answered = 0`. An RPC error throws, so the job
-retries, and the retry calls only the RPC and never re-scores. An operator calls it for a
-historical correction with `docs/runbooks/sql/m013-relabel-zero-answer.sql`. Relabelling
+retries, and the retry calls only the RPC and never re-scores. The handler only helps
+when the engagement is already `completed`; when `sweep_phone_stranded_sessions`
+completes it later (the stranded `assessment.completed`, or the 0114 C2-P5 late
+completion after a stranded abort), the sweep calls the same RPC in the same pass (0118
+§5c). A relabel failure there is caught and counted as `zero_answer_relabel_errors`
+(the API logs `phone_zero_answer_relabel_failed`); it never rolls back the stranded
+resolution. An operator calls it for a historical correction with `docs/runbooks/sql/m013-relabel-zero-answer.sql`. Relabelling
 historical sessions other than the one the owner approved needs the owner's approval
 first.
 
-Since 0115 the API no longer sets `screened` for a phone assessment with a measured
+Since 0118 the API no longer sets `screened` for a phone assessment with a measured
 `evidence_answered = 0`, so new cases never pass through `screened`. Browser rows and
 unmeasured phone rows keep the old rule, where `insufficient` still sets `screened`.
 

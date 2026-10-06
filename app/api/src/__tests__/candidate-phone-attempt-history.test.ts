@@ -29,6 +29,8 @@ let sessionRows: Array<Record<string, unknown>>;
 /** phone_call_events rows (M013 S02 D8 per-leg facts). */
 let events: Array<Record<string, unknown>>;
 let eventsError: unknown;
+/** phone_appointments rows (0113 E4 booked-callback marker). */
+let appointments: Array<Record<string, unknown>>;
 /** Every `.in(column, values)` on phone_call_events, and every order on attempts. */
 let eventIns: Array<[string, unknown[]]>;
 let attemptOrders: Array<[string, unknown]>;
@@ -76,7 +78,9 @@ function chain(table: string, result: unknown): any {
               ? { data: sessionRows, error: null }
               : table === 'phone_call_events'
                 ? (eventsError ? { data: null, error: eventsError } : { data: events, error: null })
-                : { data: [], error: null },
+                : table === 'phone_appointments'
+                  ? { data: appointments, error: null }
+                  : { data: [], error: null },
     ).then(resolve),
   };
   return self;
@@ -121,6 +125,7 @@ beforeEach(() => {
   sessionRows = [];
   events = [];
   eventsError = null;
+  appointments = [];
   eventIns = [];
   attemptOrders = [];
   vi.mocked(supabase.from).mockImplementation((table: string) => {
@@ -353,7 +358,7 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
     };
   }
 
-  /** A legacy (pre-T01/T02) worker MP3 leg: size only, no 0115 facts. */
+  /** A legacy (pre-T01/T02) worker MP3 leg: size only, no 0118 facts. */
   function workerLeg(id: string, fields: Record<string, unknown>) {
     return {
       id,
@@ -479,7 +484,7 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
     expect(body).not.toContain('worker.mp3');
   });
 
-  it('a 0115 leg: observed end, true audio length, anchor and a flushed tail', async () => {
+  it('a 0118 leg: observed end, true audio length, anchor and a flushed tail', async () => {
     sessionRows = [parentSession()];
     attempts = [workerLeg(LEG_A, {
       admitted_at: '2026-10-07T04:00:00.000Z',
@@ -506,7 +511,56 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
     });
   });
 
-  it('a 0115 leg whose fail-open flush was skipped still says the tail may be missing', async () => {
+  it('a leg the RECONCILER ended reads detected: detection time kept, no exact length, not "ledger"', async () => {
+    sessionRows = [parentSession()];
+    attempts = zeroAnswerShape();
+    events = [
+      { attempt_id: LEG_A, event_type: 'sip.participant_left', source: 'reconciliation', applied: true },
+      // A webhook post, or a reconciler post that did not apply, says nothing.
+      { attempt_id: LEG_B, event_type: 'sip.participant_left', source: 'livekit', applied: true },
+    ];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    const a = res.body.attempts.find((x: { id: string }) => x.id === LEG_A);
+    expect(a).toMatchObject({
+      connected_from: '2026-10-06T03:30:46.822Z',
+      connected_to: '2026-10-06T03:32:02.356Z',
+      connected_to_source: 'detected',
+      connected_sec: null,
+      duration_sec: null,
+      recorded_sec: 53.2,
+    });
+    const b = res.body.attempts.find((x: { id: string }) => x.id === LEG_B);
+    expect(b.connected_to_source).toBe('unobserved');
+  });
+
+  it('a reconciler post that did NOT apply leaves the ledger end as it was', async () => {
+    sessionRows = [parentSession()];
+    attempts = zeroAnswerShape();
+    events = [{ attempt_id: LEG_A, event_type: 'sip.participant_left', source: 'reconciliation', applied: false }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    const a = res.body.attempts.find((x: { id: string }) => x.id === LEG_A);
+    expect(a).toMatchObject({ connected_to_source: 'ledger', connected_sec: 75.534 });
+  });
+
+  it('a leg whose recording is unavailable (erased, revoked, quarantined) states no recorded length or tail note', async () => {
+    for (const lifecycle of [
+      { recording_deleted_at: '2026-10-07T00:00:00.000Z' },
+      { recording_revoked_at: '2026-10-07T00:00:00.000Z' },
+      { recording_quarantined: true },
+    ]) {
+      sessionRows = [parentSession(lifecycle)];
+      attempts = zeroAnswerShape();
+      const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+      for (const attempt of res.body.attempts) {
+        expect(attempt.recording.state).toBe('unavailable');
+        expect(attempt).toMatchObject({ recorded_sec: null, recorded_sec_estimated: false, tail_may_be_missing: false });
+      }
+      // The connected window is a call fact and stays.
+      expect(res.body.attempts.find((x: { id: string }) => x.id === LEG_A).connected_sec).toBe(75.534);
+    }
+  });
+
+  it('a 0118 leg whose fail-open flush was skipped still says the tail may be missing', async () => {
     sessionRows = [parentSession()];
     attempts = [workerLeg(LEG_A, {
       admitted_at: '2026-10-07T04:00:00.000Z',
@@ -615,6 +669,18 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
       .toEqual(['deferred_after_consent', 'deferred_after_consent']);
   });
 
+  it('deferred: a consented leg on which the candidate BOOKED a voice callback (0113 E4) is deferred_after_consent', async () => {
+    sessionRows = [parentSession({ status: 'in_progress' })];
+    attempts = [
+      { ...row(IDS[0], TIED, true), outcome_class: 'disconnected' },
+      { ...row(IDS[1], TIED, true), outcome_class: 'disconnected' },
+    ];
+    appointments = [{ confirmed_from_attempt_id: IDS[0] }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts.map((a: { consent_stage: unknown }) => a.consent_stage))
+      .toEqual(['deferred_after_consent', 'after_consent']);
+  });
+
   it('an EARLIER consented leg of an engagement that later opted out on another leg stays after_consent', async () => {
     sessionRows = [parentSession({ status: 'cancelled' })];
     attempts = [
@@ -634,7 +700,7 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
     expect(res.body.attempts[0].consent_stage).toBe('before_consent');
   });
 
-  it('loads the leg facts in ONE batched query over the consent-bound legs only', async () => {
+  it('loads the leg facts in ONE batched events query over every shown leg (+ one appointments query)', async () => {
     sessionRows = [parentSession()];
     attempts = [
       row(IDS[0], TIED, true),
@@ -649,9 +715,11 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
     const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
     expect(res.status).toBe(200);
     expect(tables.filter((t) => t === 'phone_call_events')).toHaveLength(1);
+    expect(tables.filter((t) => t === 'phone_appointments')).toHaveLength(1);
+    // Every leg: an unbound reconnect leg can still have a reconciler-detected end.
     expect(eventIns).toEqual([
-      ['attempt_id', [IDS[0], IDS[1]]],
-      ['event_type', ['candidate.opt_out', 'callback.deferred_in_call']],
+      ['attempt_id', [IDS[0], IDS[1], IDS[2]]],
+      ['event_type', ['candidate.opt_out', 'callback.deferred_in_call', 'sip.participant_left']],
     ]);
   });
 

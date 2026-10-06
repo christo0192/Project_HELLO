@@ -130,6 +130,7 @@ class _SeqPoster:
 _TIMING = {
     "recording_started_at_ms": 1_790_000_000_000,
     "leg_ended_at_ms": 1_790_000_060_430,
+    "leg_end_source": "sip_left",
     "tail_flushed": True,
 }
 
@@ -290,6 +291,7 @@ class TestDefaultPostCompatRetry(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("leg_ended_at_ms", t1.bodies[0])
         self.assertNotIn("leg_ended_at_ms", t2.bodies[0])
+        self.assertNotIn("leg_end_source", t2.bodies[0])
         self.assertNotIn("recording_started_at_ms", t2.bodies[0])
         self.assertNotIn("tail_flushed", t2.bodies[0])
 

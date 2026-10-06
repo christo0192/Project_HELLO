@@ -2,7 +2,7 @@
 -- screening" (engagement failed / screening_abandoned), never "Screened".
 --
 -- OWNER-RUN, through the sanctioned production SQL path only. Requires
--- migration 0115 to be applied. Background and rules:
+-- migration 0118 to be applied. Background and rules:
 -- docs/runbooks/session-lifecycle.md ("Phone engagement terminal relabels")
 -- and docs/runbooks/phone-safe-dialer.md §13.
 --
@@ -28,7 +28,7 @@
 --     status since. NEVER `queued`. Already `screening`: left as is;
 --   * audit rows: `screening_failed` (phone_engagement) and, when the
 --     candidate moved, `candidate_status_changed`, with metadata
---     {from, to, reason: 'screening_abandoned', migration: '0115'}.
+--     {from, to, reason: 'screening_abandoned', migration: '0118'}.
 -- It NEVER requeues, rescreens, creates an attempt, a ledger row or a queue
 -- job, and never touches the Ashby link (it stays parked). Nothing redials.
 --

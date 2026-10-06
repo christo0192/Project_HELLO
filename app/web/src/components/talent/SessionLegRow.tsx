@@ -22,6 +22,7 @@ import {
   legNoAudioLabel,
   legPlayable,
   legRecordedWords,
+  legRecordingShown,
   legTitle,
   legUnobservedNote,
 } from './sessionLegs';
@@ -39,7 +40,10 @@ export interface SessionLegRowProps {
 export const SessionLegRow = forwardRef<RecordingPlayerHandle, SessionLegRowProps>(
   function SessionLegRow({ leg, index, total, sessionId, onTimeUpdate, onPlayState }, ref) {
     const unobservedNote = legUnobservedNote(leg);
-    const recorded = legRecordedWords(leg);
+    // A deleted, withdrawn or blocked recording states no length and no tail
+    // note, exactly as the Overview list (legRecordingShown).
+    const recordingShown = legRecordingShown(leg);
+    const recorded = recordingShown ? legRecordedWords(leg) : null;
     const playable = legPlayable(leg);
     // Only a leg that has audio carries a consent tag: it describes the file.
     const consentTag = leg.recording.state !== 'unavailable' ? legConsentTag(leg.consent_stage) : null;
@@ -69,7 +73,7 @@ export const SessionLegRow = forwardRef<RecordingPlayerHandle, SessionLegRowProp
             {unobservedNote}
           </p>
         )}
-        {leg.tail_may_be_missing && (
+        {recordingShown && leg.tail_may_be_missing && (
           <p className="mt-1 text-xs text-[var(--c-ink-secondary)]" data-leg-note="tail">
             {LEG_TAIL_NOTE}
           </p>

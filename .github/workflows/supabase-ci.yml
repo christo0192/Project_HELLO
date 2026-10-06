@@ -14,7 +14,7 @@ on:
       - 'scripts/test-candidate-questions.sh'
       - 'scripts/test-gate-transcript.sh'
       - 'scripts/test-r1-foundation.sh'
-      - 'scripts/test-phone-0115.sh'
+      - 'scripts/test-phone-0118.sh'
       - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
@@ -40,7 +40,7 @@ on:
       - 'scripts/test-candidate-questions.sh'
       - 'scripts/test-gate-transcript.sh'
       - 'scripts/test-r1-foundation.sh'
-      - 'scripts/test-phone-0115.sh'
+      - 'scripts/test-phone-0118.sh'
       - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
@@ -181,21 +181,21 @@ jobs:
       - name: Per-item gate transcript 0105 (isolated real Postgres)
         run: bash scripts/test-gate-transcript.sh
 
-  phone-0115-test:
+  phone-0118-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      # 0115 re-declares the phone duration trigger, adds a room_name stamp
+      # 0118 re-declares the phone duration trigger, adds a room_name stamp
       # trigger on phone_call_attempts, and BACKFILLS both over production
       # history. Every vitest suite mocks Supabase, so only a real Postgres
       # that has seen rows written under the old 0076 rule proves the
       # backfills (and their idempotency) before `supabase db push` does.
-      # It also replays the 9f60523d sequence against 0115 §4, the
+      # It also replays the 9f60523d sequence against 0118 §4, the
       # partial-finalize reconnect guard and the unobserved_disconnect label,
       # then into §5's zero-answer relabel and every shape it must refuse.
-      - name: Recording and call-record integrity 0115 (isolated real Postgres)
-        run: bash scripts/test-phone-0115.sh
+      - name: Recording and call-record integrity 0118 (isolated real Postgres)
+        run: bash scripts/test-phone-0118.sh
 
   supabase-static-security:
     runs-on: ubuntu-latest

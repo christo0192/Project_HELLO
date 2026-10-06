@@ -163,6 +163,11 @@ class RecordingManifest:
       * ``recording_started_at_ms`` — epoch ms of the file's t = 0, never
         earlier than the moment :meth:`InWorkerRecorder.begin` ran.
       * ``leg_ended_at_ms`` — epoch ms of the earliest leg-end mark.
+      * ``leg_end_source`` — which mark that was: ``sip_left`` (the SIP
+        participant actually left: an OBSERVED end), ``session_close`` (an
+        upper bound, possibly seconds late) or ``finish`` (the last-resort
+        teardown time). The API stamps ``observed_ended_at`` only for
+        ``sip_left``; the other two are teardown times, not observations.
       * ``tail_flushed`` — True only when the tail flush actually ran and the
         recorder closed cleanly (the flush is fail-open, so the API must not
         infer it)."""
@@ -174,6 +179,7 @@ class RecordingManifest:
     recording_started_at_ms: Optional[int] = None
     leg_ended_at_ms: Optional[int] = None
     tail_flushed: Optional[bool] = None
+    leg_end_source: Optional[str] = None
 
     def timing_kwargs(self) -> dict[str, Any]:
         """The keyword arguments :func:`recording_api.complete_recording`
@@ -182,6 +188,7 @@ class RecordingManifest:
         return {
             "recording_started_at_ms": self.recording_started_at_ms,
             "leg_ended_at_ms": self.leg_ended_at_ms,
+            "leg_end_source": self.leg_end_source if self.leg_ended_at_ms is not None else None,
             "tail_flushed": self.tail_flushed,
         }
 
@@ -1589,6 +1596,7 @@ class InWorkerRecorder:
             recording_started_at_ms=self.recording_started_at_ms,
             leg_ended_at_ms=self.leg_ended_at_ms,
             tail_flushed=bool(close_completed and self.tail_flushed),
+            leg_end_source=self.leg_end_source,
         )
 
     def _cleanup(self) -> None:

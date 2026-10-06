@@ -1,8 +1,8 @@
 -- =====================================================================
--- 0115 §5 (T06) — the zero-answer relabel, on real Postgres.
+-- 0118 §5 (T06) — the zero-answer relabel, on real Postgres.
 --
--- scripts/test-phone-0115.sh runs this AFTER phone_0115_finalize.sql, so
--- every migration (0115 applied twice) is in place and the `replay` chain
+-- scripts/test-phone-0118.sh runs this AFTER phone_0118_finalize.sql, so
+-- every migration (0118 applied twice) is in place and the `replay` chain
 -- that file built (the 9f60523d sequence, finalized as an
 -- unobserved_disconnect) is in _p115.fin_ids. Synthetic `p115r` namespace.
 --
@@ -32,6 +32,8 @@
 --             not audited); `rejected` / `advanced` (left); decision-blocked;
 --             a human status change since the assessment; a newer assessment
 --             on another session; an operator actor audits as `recruiter`.
+--   converge  §5c: sweep_phone_stranded_sessions relabels right after its
+--             stranded completion and its C2-P5 late completion.
 --   acl       service_role only.
 --
 -- Synthetic identifiers only; no real candidate, email, number or document.
@@ -156,7 +158,7 @@ declare
 begin
   select ids into v_ids from _p115.fin_ids where slug = 'replay';
   if v_ids is null then
-    raise exception 'p115r replay: phone_0115_finalize.sql must run first (no replay chain)';
+    raise exception 'p115r replay: phone_0118_finalize.sql must run first (no replay chain)';
   end if;
   v_eng := v_ids[1]; v_sess := v_ids[2];
   select candidate_id into v_cand from screening_v2.call_sessions where id = v_sess;
@@ -210,7 +212,7 @@ begin
    where action = 'screening_failed' and target_type = 'phone_engagement'
      and target_id = v_eng::text and actor_type = 'system';
   if v_meta is null
-     or v_meta - 'session_id' <> '{"from":"completed","to":"failed","reason":"screening_abandoned","migration":"0115"}'::jsonb
+     or v_meta - 'session_id' <> '{"from":"completed","to":"failed","reason":"screening_abandoned","migration":"0118"}'::jsonb
      or (v_meta->>'session_id')::uuid <> v_sess then
     raise exception 'p115r replay: engagement audit missing or wrong: %', v_meta;
   end if;
@@ -218,7 +220,7 @@ begin
    where action = 'candidate_status_changed' and target_type = 'candidate'
      and target_id = v_cand::text and actor_type = 'system';
   if v_meta is distinct from
-     '{"from":"screened","to":"screening","reason":"screening_abandoned","migration":"0115"}'::jsonb then
+     '{"from":"screened","to":"screening","reason":"screening_abandoned","migration":"0118"}'::jsonb then
     raise exception 'p115r replay: candidate audit missing or wrong: %', v_meta;
   end if;
 
@@ -511,6 +513,111 @@ begin
   end if;
 
   raise notice 'p115r cand: PASS (screening/rejected/advanced/blocked/human/newer left; operator audited)';
+end $$;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- converge — §5c: the relabel also runs when sweep_phone_stranded_sessions
+-- completes the engagement AFTER the handler ran (adversarial review, S02).
+--   stranded  The handler scored a measured 0-answer row while the
+--             engagement was not yet completed (dialing/in_call), so its
+--             relabel answered not_eligible. Later the engagement is
+--             `eligible` with a terminal session and the stranded sweep posts
+--             assessment.completed: it must end failed/screening_abandoned in
+--             the same pass, the candidate left at `screening` (the C3 rule
+--             no longer moved it), one system screening_failed audit.
+--   answered  Control: the same shape with 2 answers stays completed.
+--   late      The sweep aborts first (no score yet: failed/
+--             assessment_aborted), then the 0-answer score lands late. The
+--             C2-P5 late completion and the relabel run in the same pass:
+--             failed/screening_abandoned, terminal_at the abort's, never
+--             selected again.
+-- p_now is far in the future so the 900 s stillness grace holds whatever the
+-- container clock wrote into updated_at; the limit is the maximum (200) so
+-- earlier fixtures cannot crowd these out.
+-- ─────────────────────────────────────────────────────────────────────
+do $$
+declare
+  v_z uuid[]; v_a uuid[]; v_l uuid[]; v_res jsonb; v_e screening_v2.phone_engagements%rowtype;
+  v_terminal timestamptz;
+  v_p1 constant timestamptz := '2030-01-01T00:00:00Z';
+  v_p2 constant timestamptz := '2030-01-01T01:00:00Z';
+  v_p3 constant timestamptz := '2030-01-01T02:00:00Z';
+begin
+  -- Three eligible engagements bound to a COMPLETED session.
+  v_z := _p115.fin_chain('cv-stranded', 90, 'eligible', 1, 0, '2026-10-06T03:00:00Z');
+  v_a := _p115.fin_chain('cv-answered', 91, 'eligible', 1, 0, '2026-10-06T03:00:00Z');
+  v_l := _p115.fin_chain('cv-late',     92, 'eligible', 1, 0, '2026-10-06T03:00:00Z');
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete',
+         ended_at = '2026-10-06T03:05:00Z', updated_at = '2026-10-06T03:05:00Z'
+   where id in (v_z[2], v_a[2], v_l[2]);
+  update screening_v2.candidates set status = 'screening' where id in (v_z[3], v_a[3], v_l[3]);
+  perform _p115.rl_assess(v_z[2], v_z[3], 'phone', 'insufficient', 'no_candidate_speech', 0, 5,
+                          '2026-10-06T03:06:00Z');
+  perform _p115.rl_assess(v_a[2], v_a[3], 'phone', 'insufficient', 'partial_thin', 2, 5,
+                          '2026-10-06T03:06:00Z');
+
+  v_res := screening_v2.sweep_phone_stranded_sessions(200, v_p1);
+  if v_res->>'status' <> 'ok'
+     or coalesce((v_res->>'zero_answer_relabelled')::integer, 0) < 1
+     or coalesce((v_res->>'zero_answer_relabel_errors')::integer, -1) <> 0 then
+    raise exception 'p115r converge stranded: expected ok, >= 1 relabelled, 0 errors; got %', v_res;
+  end if;
+
+  select * into v_e from screening_v2.phone_engagements where id = v_z[1];
+  if v_e.state <> 'failed' or v_e.state_reason <> 'screening_abandoned' or v_e.terminal_at <> v_p1
+     or v_e.session_id <> v_z[2] then
+    raise exception 'p115r converge stranded: expected failed/screening_abandoned at the completion instant; got %/% %',
+      v_e.state, v_e.state_reason, v_e.terminal_at;
+  end if;
+  if (select status from screening_v2.candidates where id = v_z[3]) <> 'screening'
+     or (select count(*) from screening_v2.audit_events
+          where action = 'screening_failed' and target_type = 'phone_engagement'
+            and target_id = v_z[1]::text and actor_type = 'system'
+            and metadata->>'reason' = 'screening_abandoned') <> 1
+     or exists (select 1 from screening_v2.audit_events
+                 where action = 'candidate_status_changed' and target_id = v_z[3]::text) then
+    raise exception 'p115r converge stranded: candidate must stay screening (not audited), one engagement audit';
+  end if;
+
+  select * into v_e from screening_v2.phone_engagements where id = v_a[1];
+  if v_e.state <> 'completed' then
+    raise exception 'p115r converge answered: a screening with answers must stay completed; got %/%',
+      v_e.state, v_e.state_reason;
+  end if;
+
+  select * into v_e from screening_v2.phone_engagements where id = v_l[1];
+  if v_e.state <> 'failed' or v_e.state_reason <> 'assessment_aborted' then
+    raise exception 'p115r converge late: the unscored session must abort first; got %/%',
+      v_e.state, v_e.state_reason;
+  end if;
+  v_terminal := v_e.terminal_at;
+
+  -- The 0-answer score lands late (a DLQ replay).
+  perform _p115.rl_assess(v_l[2], v_l[3], 'phone', 'insufficient', 'no_candidate_speech', 0, 5,
+                          '2030-01-01T00:30:00Z');
+  v_res := screening_v2.sweep_phone_stranded_sessions(200, v_p2);
+  select * into v_e from screening_v2.phone_engagements where id = v_l[1];
+  if v_e.state <> 'failed' or v_e.state_reason <> 'screening_abandoned' or v_e.terminal_at <> v_terminal
+     or coalesce((v_res->>'late_completed')::integer, 0) < 1
+     or coalesce((v_res->>'zero_answer_relabelled')::integer, 0) < 1
+     or coalesce((v_res->>'zero_answer_relabel_errors')::integer, -1) <> 0 then
+    raise exception 'p115r converge late: expected late completion then failed/screening_abandoned, terminal_at kept; '
+      'got %/% %, sweep %', v_e.state, v_e.state_reason, v_e.terminal_at, v_res;
+  end if;
+  if (select status from screening_v2.candidates where id = v_l[3]) <> 'screening' then
+    raise exception 'p115r converge late: the candidate must stay at screening (never queued)';
+  end if;
+
+  -- A third pass changes nothing on any of the three.
+  v_res := screening_v2.sweep_phone_stranded_sessions(200, v_p3);
+  if (select version from screening_v2.phone_engagements where id = v_l[1]) <> v_e.version
+     or (select state_reason from screening_v2.phone_engagements where id = v_z[1]) <> 'screening_abandoned'
+     or (select state from screening_v2.phone_engagements where id = v_a[1]) <> 'completed' then
+    raise exception 'p115r converge: a later pass must change nothing; got %', v_res;
+  end if;
+
+  raise notice 'p115r converge: PASS (stranded and late completions relabelled in the same pass; answered kept)';
 end $$;
 
 -- ─────────────────────────────────────────────────────────────────────

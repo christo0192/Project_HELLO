@@ -1,17 +1,18 @@
 -- =====================================================================
--- 0115 assertions, part 2 — the BACKFILLS, run right after the FIRST apply
--- of 0115 over the history phone_0115_setup.sql seeded under 0076.
+-- 0118 assertions, part 2 — the BACKFILLS, run right after the FIRST apply
+-- of 0118 over the history phone_0118_setup.sql seeded under 0076.
 --
 -- Proves by execution:
 --   * §2: the reconnect leg bound with room_name NULL now carries
 --     'phone-<session_id>', and the backfill changed nothing else on the row
 --     (0055's answered_at trigger did not fire);
 --   * §3: two_legs 443 -> 75 s with 1 unobserved leg; only 360 -> NULL with 1
---     unobserved leg; clean and late untouched (duration_unobserved_legs
---     stays NULL) — and every one of those UPDATEs landed on a TERMINAL
+--     unobserved leg; late (reclaimed after the session ended) 120 -> NULL
+--     with 1 unobserved leg; clean untouched (duration_unobserved_legs stays
+--     NULL) — and every one of those UPDATEs landed on a TERMINAL
 --     (`completed`) session row.
--- Then it snapshots updated_at so phone_0115_assert.sql can prove the SECOND
--- apply of 0115 changed no row (idempotent backfills).
+-- Then it snapshots updated_at so phone_0118_assert.sql can prove the SECOND
+-- apply of 0118 changed no row (idempotent backfills).
 -- =====================================================================
 \set ON_ERROR_STOP on
 
@@ -31,7 +32,7 @@ begin
        'two_legs', jsonb_build_array('completed', 75, 1),
        'only',     jsonb_build_array('completed', null, 1),
        'clean',    jsonb_build_array('completed', 90, null),
-       'late',     jsonb_build_array('completed', 120, null)) then
+       'late',     jsonb_build_array('completed', null, 1)) then
     raise exception 'p115 backfill: unexpected (status, duration_sec, unobserved) per session: %', v_got;
   end if;
 

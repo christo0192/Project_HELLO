@@ -80,6 +80,7 @@ import { createPlivoBounceStore } from '../integrations/plivo-phone/stores.js';
 import { startPhoneAttemptRecording } from '../integrations/livekit-phone-dial/recording.js';
 import {
   prepareWorkerRecording,
+  WORKER_LEG_END_SOURCES,
   type WorkerLegTimingReport,
   type WorkerRecordingUploadSigner,
 } from '../integrations/livekit-phone-dial/worker-recording.js';
@@ -510,6 +511,9 @@ const recordingCompleteSchema = z
     // line, not rejected here, so the recording is still kept.
     recording_started_at_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
     leg_ended_at_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
+    // Which worker mark leg_ended_at_ms is; only `sip_left` is stamped as the
+    // OBSERVED end (adversarial review, S02).
+    leg_end_source: z.enum(WORKER_LEG_END_SOURCES).nullable().optional(),
     tail_flushed: z.boolean().nullable().optional(),
   })
   .strict();
@@ -2078,6 +2082,7 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       const body = parsed.data;
       const carriesLegTiming = body.recording_started_at_ms != null
         || body.leg_ended_at_ms != null
+        || body.leg_end_source != null
         || typeof body.tail_flushed === 'boolean';
       if (carriesLegTiming && deps.stampAttemptLegTiming) {
         try {
@@ -2087,6 +2092,7 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
             report: {
               recordingStartedAtMs: body.recording_started_at_ms ?? null,
               legEndedAtMs: body.leg_ended_at_ms ?? null,
+              legEndSource: body.leg_end_source ?? null,
               durationMs: body.duration_ms ?? null,
               tailFlushed: body.tail_flushed ?? null,
             },

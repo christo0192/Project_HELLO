@@ -95,7 +95,7 @@ begin
   -- the one branch the stranded/crash fixtures do NOT exercise. 0072 MUST
   -- select it, drive it to completed/conversation_complete, and report
   -- disconnect_reason='worker_crash' (a lapsed lease in a live state).
-  -- HELD (slug 'held', 0115 §4): the STRANDED shape, but the engagement is
+  -- HELD (slug 'held', 0118 §4): the STRANDED shape, but the engagement is
   -- `reconnecting` — a reconnect was granted and is still pending. The
   -- attempt ended 600s ago (past the 180s grace, inside the 30-minute hold),
   -- so it MUST NOT be selected and the session stays `in_progress`.

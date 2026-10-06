@@ -96,7 +96,7 @@ export interface RunAssessmentOptions {
   /**
    * 0072: the partial-finalize disconnect token, one of
    * `PHONE_DISCONNECT_REASONS` (`candidate_hangup` | `worker_crash` |
-   * `unobserved_disconnect` (0115) | `disconnected`). Stored verbatim in
+   * `unobserved_disconnect` (0118) | `disconnected`). Stored verbatim in
    * `raw.partial.disconnect_reason`; only `worker_crash` grades as an
    * infrastructure fault (evidence.ts). No PII.
    */
@@ -715,13 +715,16 @@ async function runAssessmentImpl(
     //     reject — a PROVISIONAL incomplete_evidence reject never qualifies —
     //     and, on the phone, a MEASURED answered*2 >= planned); otherwise
     //     `screened`, so a human confirms before the candidate is rejected.
-    //   * 0115 (M013 D1/D3): a PHONE row whose candidate answered NONE of
+    //   * 0118 (M013 D1/D3): a PHONE row whose candidate answered NONE of
     //     the planned questions — a MEASURED `evidence.answered === 0`, never
     //     an unmeasured null — was not screened at all. The status is left
     //     where it is (`screening`, set when the call started), and the
     //     phone assessment handler relabels the engagement
     //     failed/screening_abandoned through
-    //     `relabel_zero_answer_phone_engagement`. Browser rows (answered is
+    //     `relabel_zero_answer_phone_engagement`; when the engagement is
+    //     completed LATER (the stranded sweep, or the C2-P5 late
+    //     completion), 0118 §5c runs the same relabel inside that sweep, so
+    //     every path converges on Abandoned. Browser rows (answered is
     //     always null) and unmeasured phone rows keep the rule above
     //     unchanged.
     if (evidence.grade === 'insufficient') {

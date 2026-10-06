@@ -9,22 +9,29 @@
  * the candidate hung up: 9f60523d read "7m 23s on the call" for 53 s + 18 s of
  * audio. The surfaces now read per-leg facts instead, each with its source:
  *
- * - connected window: `answered_at` -> the observed SIP leave (0115
- *   `observed_ended_at`, `observed`), else the ledger end (`ledger`). A leg
- *   ended only by the lease reclaim with no observed end is `unobserved`: its
- *   `connected_to` is the time the timeout DETECTED it, and it has no
- *   `connected_sec`, because that span is not call time.
- * - recorded length: the worker's true audio length (0115
+ * - connected window: `answered_at` -> the observed SIP leave (0118
+ *   `observed_ended_at`, `observed`; the ledger end instead when that is
+ *   earlier), else the ledger end (`ledger`). A leg ended only by the lease
+ *   reclaim with no observed end is `unobserved`: its `connected_to` is the
+ *   time the timeout DETECTED it, and it has no `connected_sec`, because that
+ *   span is not call time. A leg whose only end is the one our reconciler
+ *   sweep recorded (`sip.participant_left` posted by `source =
+ *   'reconciliation'`) is `detected`: that time is when the sweep NOTICED the
+ *   empty room, up to a reconcile interval after the hang-up, so it is an
+ *   upper bound with no exact `connected_sec` either.
+ * - recorded length: the worker's true audio length (0118
  *   `recording_duration_ms`), else, for a legacy worker MP3, an estimate from
  *   the file size at the worker's fixed 64 kbps CBR, flagged as estimated.
  * - `tail_may_be_missing`: a worker recording whose tail flush is not known to
  *   have run (legacy rows, and fail-open skips) — unless the connected span
  *   and the recorded length already agree within a few seconds.
  *
- * The unobserved rule is the SQL one (0115 §3a `phone_session_leg_duration`):
+ * The unobserved rule is the SQL one (0118 §3a `phone_session_leg_duration`):
  * state `abandoned`, `outcome_class` NULL, `abandon_reason` NULL, an
- * `ended_at`, and no `observed_ended_at`. Pure functions: no clock, no I/O.
- * Nothing here returns a storage key, a provider id or a URL.
+ * `ended_at`, and no `observed_ended_at` — whatever the session's end, in
+ * both places. (`detected` is API-only: the SQL duration keeps a reconciler
+ * end as a ledger end.) Pure functions: no clock, no I/O. Nothing here
+ * returns a storage key, a provider id or a URL.
  */
 
 /**
@@ -44,10 +51,17 @@ export const WORKER_MP3_BITRATE_BPS = 64_000;
  */
 export const TAIL_NOTE_TOLERANCE_SEC = 3;
 
-export type ConnectedToSource = 'observed' | 'ledger' | 'unobserved';
+export type ConnectedToSource = 'observed' | 'ledger' | 'detected' | 'unobserved';
 
 /** The attempt columns the timing needs. Extra columns are ignored. */
 export interface AttemptLegTimingRow {
+  /**
+   * Not a column: true when the leg's `ended_at` was written by our
+   * reconciler sweep (an applied `sip.participant_left` from `source =
+   * 'reconciliation'`), i.e. it is the sweep's DETECTION time. Loaded by
+   * `loadSweepDetectedLegEnds`.
+   */
+  end_detected_by_sweep?: boolean;
   answered_at: string | null;
   ended_at: string | null;
   state: string | null;
@@ -80,6 +94,12 @@ export interface AttemptLegTiming {
   recording_started_at_ms: number | null;
   /** The recording may end a few seconds before the call did. */
   tail_may_be_missing: boolean;
+  /**
+   * The leg has usable audio (an uploaded object or a known length, and no
+   * latched failure). Internal: lets the roll-up count legs whose audio
+   * exists but whose length is unknown. Never returned by a route.
+   */
+  has_recording: boolean;
 }
 
 export interface SessionRecordedFacts {
@@ -88,8 +108,15 @@ export interface SessionRecordedFacts {
   /** How many legs have a known recorded length; null for a session with no legs. */
   recorded_legs: number | null;
   /**
+   * Legs that HAVE audio whose length is unknown (an OGG fallback, a legacy
+   * OGG row): `recorded_total_sec` leaves them out, so it is a lower bound
+   * whenever this is > 0. null for a session with no legs.
+   */
+  recorded_unknown_legs: number | null;
+  /**
    * Every answered leg has an observed or ledger end. false when any answered
-   * leg is `unobserved` or has not ended; null when no leg was answered.
+   * leg is `unobserved` or `detected` or has not ended; null when no leg was
+   * answered.
    */
   connected_complete: boolean | null;
   /** Sum of the answered legs' `connected_sec`, only when `connected_complete`. */
@@ -119,8 +146,11 @@ export function isWorkerInbandAttempt(row: Pick<AttemptLegTimingRow, 'egress_id'
 }
 
 /**
- * The lease-reclaim signature with no observed end (0115 §3a): the leg's
- * `ended_at` is the sweep's time, not the call's end.
+ * The lease-reclaim signature with no observed end (0118 §3a): the leg's
+ * `ended_at` is the sweep's time, not the call's end. The SAME predicate as
+ * the SQL rule, with no session-end clause in either (a leg reclaimed after
+ * its session ended is unobserved too), so the session header and
+ * `duration_sec` agree.
  */
 export function isUnobservedReclaim(
   row: Pick<AttemptLegTimingRow, 'observed_ended_at' | 'state' | 'outcome_class' | 'abandon_reason' | 'ended_at'>,
@@ -141,9 +171,13 @@ export function attemptLegTiming(row: AttemptLegTimingRow): AttemptLegTiming {
   let connectedTo: string | null = null;
   let source: ConnectedToSource | null = null;
   let connectedSec: number | null = null;
+  const sweptEnd = row.end_detected_by_sweep === true;
   if (answeredMs !== null) {
     let toMs: number | null = null;
-    if (observedMs !== null) {
+    if (observedMs !== null && !(endedMs !== null && !sweptEnd && endedMs < observedMs)) {
+      // The observed SIP leave, unless a non-sweep ledger end is EARLIER
+      // (the 0118 §3a `least(observed, ended)`): a skewed worker clock never
+      // stretches a leg past the ledger.
       connectedTo = row.observed_ended_at as string;
       source = 'observed';
       toMs = observedMs;
@@ -153,6 +187,10 @@ export function attemptLegTiming(row: AttemptLegTimingRow): AttemptLegTiming {
         // The detection time, kept so the UI can say when the timeout saw it;
         // the span up to it is NOT call time.
         source = 'unobserved';
+      } else if (sweptEnd && observedMs === null) {
+        // Our reconciler's detection time: an upper bound, up to a reconcile
+        // interval after the hang-up. Kept for the UI to name; not call time.
+        source = 'detected';
       } else {
         source = 'ledger';
         toMs = endedMs;
@@ -196,6 +234,24 @@ export function attemptLegTiming(row: AttemptLegTimingRow): AttemptLegTiming {
     recorded_sec_estimated: recordedSec !== null && estimated,
     recording_started_at_ms: startedAt !== null ? Math.trunc(startedAt) : null,
     tail_may_be_missing: tailMayBeMissing,
+    has_recording: hasRecording,
+  };
+}
+
+/**
+ * The same leg with its RECORDING facts withheld: the audio was erased,
+ * revoked, quarantined or latched failed, or the caller may not read it. A
+ * withheld leg contributes nothing to a recorded total and raises no tail
+ * note; its connected window (a call fact) is unchanged.
+ */
+export function withoutRecordingFacts(leg: AttemptLegTiming): AttemptLegTiming {
+  return {
+    ...leg,
+    recorded_sec: null,
+    recorded_sec_estimated: false,
+    recording_started_at_ms: null,
+    tail_may_be_missing: false,
+    has_recording: false,
   };
 }
 
@@ -207,9 +263,16 @@ export function attemptLegTiming(row: AttemptLegTimingRow): AttemptLegTiming {
  */
 export function sessionRecordedFacts(legs: readonly AttemptLegTiming[]): SessionRecordedFacts {
   if (legs.length === 0) {
-    return { recorded_total_sec: null, recorded_legs: null, connected_complete: null, connected_total_sec: null };
+    return {
+      recorded_total_sec: null,
+      recorded_legs: null,
+      recorded_unknown_legs: null,
+      connected_complete: null,
+      connected_total_sec: null,
+    };
   }
   const recorded = legs.filter((leg) => leg.recorded_sec !== null);
+  const unknownLength = legs.filter((leg) => leg.has_recording && leg.recorded_sec === null);
   const answered = legs.filter((leg) => leg.connected_from !== null);
   const complete = answered.length === 0
     ? null
@@ -220,6 +283,7 @@ export function sessionRecordedFacts(legs: readonly AttemptLegTiming[]): Session
       ? roundMs(recorded.reduce((sum, leg) => sum + (leg.recorded_sec as number), 0))
       : null,
     recorded_legs: recorded.length,
+    recorded_unknown_legs: unknownLength.length,
     connected_complete: complete,
     connected_total_sec: complete
       ? roundMs(answered.reduce((sum, leg) => sum + (leg.connected_sec as number), 0))

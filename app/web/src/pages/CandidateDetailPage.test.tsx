@@ -521,7 +521,7 @@ describe('CandidateDetailPage', () => {
   });
 
   it('M013 S02: names a failed/screening_abandoned cycle "Abandoned: dropped before screening", never "Screening"', async () => {
-    // The 0115 relabel leaves the candidate `screening` (never `queued`).
+    // The 0118 relabel leaves the candidate `screening` (never `queued`).
     mockApi.getCandidate.mockResolvedValue({
       ...mockCandidateDetail,
       candidate: {
@@ -556,7 +556,7 @@ describe('CandidateDetailPage', () => {
       sessions: [{
         ...mockCandidateDetail.sessions[0],
         mode: 'live',
-        // 0115's stored figure for the 9f60523d shape; never shown as a length.
+        // 0118's stored figure for the 9f60523d shape; never shown as a length.
         duration_sec: 75,
         duration_unobserved_legs: 1,
         recorded_total_sec: 70.8,

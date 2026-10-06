@@ -403,7 +403,7 @@ describe('phone-outcome display keys', () => {
   });
 });
 
-describe('screening_abandoned display key (M013 S02, 0115)', () => {
+describe('screening_abandoned display key (M013 S02, 0118)', () => {
   const abandoned = cand({ status: 'screening', dial_count: 2, phone_state: 'failed', phone_state_reason: 'screening_abandoned' });
 
   it('is a filter key with its own deep link, and Screening no longer includes it', () => {

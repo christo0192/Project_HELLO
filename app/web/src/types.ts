@@ -372,7 +372,7 @@ export interface Session {
    */
   candidate_words?: number | null;
   /**
-   * M013 S02 (0115). Answered phone legs left out of `duration_sec` because
+   * M013 S02 (0118). Answered phone legs left out of `duration_sec` because
    * their end was never observed (lease reclaim). null when not computed.
    */
   duration_unobserved_legs?: number | null;
@@ -384,6 +384,11 @@ export interface Session {
    */
   recorded_total_sec?: number | null;
   recorded_legs?: number | null;
+  /**
+   * Legs that HAVE playable audio of unknown length: `recorded_total_sec`
+   * leaves them out, so it is a lower bound when this is > 0.
+   */
+  recorded_unknown_legs?: number | null;
   /** true when every answered leg's end is known; false when any is not. */
   connected_complete?: boolean | null;
   /** Only when `connected_complete` is true. */
@@ -848,10 +853,12 @@ export type PhoneAttemptRecordingReason =
 export type PhoneAttemptTranscriptKind = 'gate_only' | 'session';
 /**
  * M013 S02. Where a leg's end came from: `observed` = the SIP leave the
- * worker saw; `ledger` = the ledger end; `unobserved` = only the lease
- * reclaim ended it, so the real end is unknown.
+ * worker saw; `ledger` = the ledger end; `detected` = only our reconciler
+ * sweep recorded it, i.e. when it NOTICED the call was over (an upper bound,
+ * up to about a minute late); `unobserved` = only the lease reclaim ended it,
+ * so the real end is unknown.
  */
-export type PhoneLegEndSource = 'observed' | 'ledger' | 'unobserved';
+export type PhoneLegEndSource = 'observed' | 'ledger' | 'detected' | 'unobserved';
 export type PhoneAttemptConsentStage =
   | 'before_consent'
   | 'after_consent'
@@ -881,10 +888,13 @@ export interface CandidatePhoneAttempt {
    */
   /** When the leg was answered; null if never answered. */
   connected_from?: string | null;
-  /** The leg end per `connected_to_source`. For `unobserved` it is when the timeout DETECTED the drop. */
+  /**
+   * The leg end per `connected_to_source`. For `unobserved` it is when the
+   * timeout DETECTED the drop; for `detected`, when our check noticed it.
+   */
   connected_to?: string | null;
   connected_to_source?: PhoneLegEndSource | null;
-  /** null when unobserved, live or never answered. */
+  /** null when detected, unobserved, live or never answered. */
   connected_sec?: number | null;
   /** This leg's recording length; null when unknown. */
   recorded_sec?: number | null;

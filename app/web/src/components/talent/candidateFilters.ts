@@ -48,7 +48,7 @@ export const CANDIDATE_STATUS_ORDER = [
   'consent_declined',
   'abandoned_no_answer',
   'phone_failed',
-  // 0115 (M013 D1): `failed/screening_abandoned`, its own key.
+  // 0118 (M013 D1): `failed/screening_abandoned`, its own key.
   'screening_abandoned',
   'wrong_number',
   'opted_out',

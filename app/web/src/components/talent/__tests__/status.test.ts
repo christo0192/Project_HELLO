@@ -240,7 +240,7 @@ describe('engagementReasonLabel', () => {
     }
   });
 
-  it('names the 0115 zero-answer relabel neutrally (never Queued, never Screened)', () => {
+  it('names the 0118 zero-answer relabel neutrally (never Queued, never Screened)', () => {
     const label = engagementReasonLabel('screening_abandoned');
     expect(label).toBe('Abandoned: dropped before screening');
     expect(label).not.toMatch(/queued|screened/i);
@@ -458,7 +458,7 @@ describe('candidateDisplayStatus (stored status + phone progress)', () => {
 });
 
 /*
- * M013 S02 (0115, D1): a cycle that ended before the candidate answered any
+ * M013 S02 (0118, D1): a cycle that ended before the candidate answered any
  * planned question is relabelled `failed/screening_abandoned`, and its
  * candidate is left `screening` (never `queued`). Without its own display key
  * the badge would read "Screening" for a cycle that is over.

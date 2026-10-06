@@ -43,6 +43,17 @@ export const PRE_CONSENT_ATTEMPT_OUTCOMES: ReadonlySet<string> = new Set([
 export const LEG_CONSENT_EVENT_TYPES = ['candidate.opt_out', 'callback.deferred_in_call'] as const;
 
 /**
+ * The SIP leave event. When OUR reconciler posted it (`source =
+ * 'reconciliation'`) and it applied, the leg's `ended_at` is the sweep's
+ * DETECTION time, not the hang-up (M013 S02 review): the leg timing reads it
+ * as `detected`, an upper bound.
+ */
+export const LEG_END_EVENT_TYPE = 'sip.participant_left';
+
+/** Every event type the per-leg facts read, in ONE query. */
+export const LEG_FACT_EVENT_TYPES = [...LEG_CONSENT_EVENT_TYPES, LEG_END_EVENT_TYPE] as const;
+
+/**
  * PostgREST `max_rows` (app/supabase/config.toml). A read returning this many
  * rows may be silently truncated, so it is reported as unknown.
  */
@@ -55,15 +66,31 @@ export type AttemptConsentStage =
   | 'deferred_after_consent'
   | null;
 
-/** What THIS leg's own ledger events say about consent. */
+/** What THIS leg's own ledger facts say about consent and how it ended. */
 export interface LegConsentFacts {
   /** A `candidate.opt_out` event names this attempt (incl. the 0114 C7-a lost race). */
   optOut: boolean;
-  /** A `callback.deferred_in_call` event names this attempt. */
+  /**
+   * A `callback.deferred_in_call` event names this attempt, OR the candidate
+   * confirmed a voice callback on it (0113 E4: a `phone_appointments` row
+   * whose `confirmed_from_attempt_id` is this attempt; the leg ends
+   * `disconnected`). Both are "call me later" after consent.
+   */
   deferredInCall: boolean;
+  /**
+   * The leg's end was recorded by our reconciler sweep (an applied
+   * `sip.participant_left` with `source = 'reconciliation'`), so its
+   * `ended_at` is a detection time. Not a consent fact; loaded here so the
+   * history reads one batch of the leg's events.
+   */
+  endDetectedBySweep: boolean;
 }
 
-export const NO_LEG_CONSENT_FACTS: LegConsentFacts = Object.freeze({ optOut: false, deferredInCall: false });
+export const NO_LEG_CONSENT_FACTS: LegConsentFacts = Object.freeze({
+  optOut: false,
+  deferredInCall: false,
+  endDetectedBySweep: false,
+});
 
 /**
  * Whether a leg's audio was captured before the candidate consented, and on
@@ -73,9 +100,10 @@ export const NO_LEG_CONSENT_FACTS: LegConsentFacts = Object.freeze({ optOut: fal
  *   - `consent_withdrawn` when the leg ended `opt_out` or a `candidate.opt_out`
  *     event names it (the C7-a post that lost the race to the drop keeps the
  *     outcome `disconnected` but names the attempt);
- *   - `deferred_after_consent` when it ended `callback_deferred` or a
- *     `callback.deferred_in_call` event names it — a busy "call me later" is
- *     a deferral, not a withdrawal of consent;
+ *   - `deferred_after_consent` when it ended `callback_deferred`, a
+ *     `callback.deferred_in_call` event names it, or the candidate confirmed
+ *     a voice callback on it (0113 E4) — a busy "call me later" is a
+ *     deferral, not a withdrawal of consent;
  *   - otherwise `after_consent`, but only when the leg's events were read
  *     (`legFacts` non-null). Unread facts make it unknown (null) rather than
  *     a confident "nothing happened".
@@ -117,11 +145,13 @@ export function preConsentFlag(stage: AttemptConsentStage): boolean | null {
 }
 
 /**
- * Load the per-leg consent facts for a set of attempts in ONE query (the
- * history page batches every consent-bound leg it shows; the download route
- * passes one id). Every id asked for gets an entry. Returns null when the read
+ * Load the per-leg facts for a set of attempts: ONE `phone_call_events` query
+ * (the history page batches every leg it shows; the download route passes
+ * one id) and ONE `phone_appointments` query for the 0113 E4 booked-callback
+ * marker. Every id asked for gets an entry. Returns null when either read
  * failed or may be truncated: the caller then reports the stage as unknown or
- * fails, never "nothing happened". Reads event type and attempt id only.
+ * fails, never "nothing happened". Reads ids, event type, source and the
+ * applied flag only.
  */
 export async function loadLegConsentFacts(
   attemptIds: readonly string[],
@@ -130,22 +160,44 @@ export async function loadLegConsentFacts(
   const ids = [...new Set(attemptIds.filter((id) => typeof id === 'string' && id !== ''))];
   if (ids.length === 0) return facts;
   try {
-    const { data, error } = await supabase
-      .from('phone_call_events')
-      .select('attempt_id,event_type')
-      .in('attempt_id', ids)
-      .in('event_type', [...LEG_CONSENT_EVENT_TYPES])
-      .limit(LEG_CONSENT_EVENT_ROW_CAP);
-    if (error) return null;
-    const rows = Array.isArray(data) ? data as Array<{ attempt_id?: unknown; event_type?: unknown }> : [];
-    if (rows.length >= LEG_CONSENT_EVENT_ROW_CAP) return null;
-    for (const id of ids) facts.set(id, { optOut: false, deferredInCall: false });
+    const [events, appointments] = await Promise.all([
+      supabase
+        .from('phone_call_events')
+        .select('attempt_id,event_type,source,applied')
+        .in('attempt_id', ids)
+        .in('event_type', [...LEG_FACT_EVENT_TYPES])
+        .limit(LEG_CONSENT_EVENT_ROW_CAP),
+      supabase
+        .from('phone_appointments')
+        .select('confirmed_from_attempt_id')
+        .in('confirmed_from_attempt_id', ids)
+        .limit(LEG_CONSENT_EVENT_ROW_CAP),
+    ]);
+    if (events.error || appointments.error) return null;
+    const rows = Array.isArray(events.data)
+      ? events.data as Array<{ attempt_id?: unknown; event_type?: unknown; source?: unknown; applied?: unknown }>
+      : [];
+    const booked = Array.isArray(appointments.data)
+      ? appointments.data as Array<{ confirmed_from_attempt_id?: unknown }>
+      : [];
+    if (rows.length >= LEG_CONSENT_EVENT_ROW_CAP || booked.length >= LEG_CONSENT_EVENT_ROW_CAP) return null;
+    for (const id of ids) facts.set(id, { optOut: false, deferredInCall: false, endDetectedBySweep: false });
     for (const row of rows) {
       if (typeof row.attempt_id !== 'string') continue;
       const entry = facts.get(row.attempt_id);
       if (!entry) continue;
       if (row.event_type === 'candidate.opt_out') entry.optOut = true;
       else if (row.event_type === 'callback.deferred_in_call') entry.deferredInCall = true;
+      else if (row.event_type === LEG_END_EVENT_TYPE && row.source === 'reconciliation' && row.applied === true) {
+        entry.endDetectedBySweep = true;
+      }
+    }
+    // 0113 E4: a callback the candidate confirmed on this leg is a deferral
+    // after consent, exactly like the in-call deferral event.
+    for (const row of booked) {
+      if (typeof row.confirmed_from_attempt_id !== 'string') continue;
+      const entry = facts.get(row.confirmed_from_attempt_id);
+      if (entry) entry.deferredInCall = true;
     }
     return facts;
   } catch {

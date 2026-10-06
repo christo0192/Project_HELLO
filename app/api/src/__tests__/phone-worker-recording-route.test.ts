@@ -319,6 +319,7 @@ describe('M013 S02 (T04) complete — the leg timing is stamped on the attempt',
     duration_ms: 17_970,
     recording_started_at_ms: Date.parse('2026-10-05T03:34:50.650Z'),
     leg_ended_at_ms: Date.parse('2026-10-05T03:35:08.300Z'),
+    leg_end_source: 'sip_left',
     tail_flushed: true,
   };
 
@@ -348,6 +349,7 @@ describe('M013 S02 (T04) complete — the leg timing is stamped on the attempt',
       report: {
         recordingStartedAtMs: TIMED_BODY.recording_started_at_ms,
         legEndedAtMs: TIMED_BODY.leg_ended_at_ms,
+        legEndSource: 'sip_left',
         durationMs: 17_970,
         tailFlushed: true,
       },
@@ -371,7 +373,7 @@ describe('M013 S02 (T04) complete — the leg timing is stamped on the attempt',
     await authed(h.app, COMPLETE, { ...COMPLETE_BODY, tail_flushed: false });
     expect(stamp).toHaveBeenCalledTimes(1);
     expect(stamp.mock.calls[0][0].report).toEqual({
-      recordingStartedAtMs: null, legEndedAtMs: null, durationMs: 60000, tailFlushed: false,
+      recordingStartedAtMs: null, legEndedAtMs: null, legEndSource: null, durationMs: 60000, tailFlushed: false,
     });
   });
 
@@ -379,7 +381,7 @@ describe('M013 S02 (T04) complete — the leg timing is stamped on the attempt',
     const stamp = stampSpy();
     const h = build({ recordingProvider: 'worker', stampAttemptLegTiming: stamp });
     const res = await authed(h.app, COMPLETE, {
-      ...COMPLETE_BODY, recording_started_at_ms: null, leg_ended_at_ms: null, tail_flushed: null,
+      ...COMPLETE_BODY, recording_started_at_ms: null, leg_ended_at_ms: null, leg_end_source: null, tail_flushed: null,
     });
     expect(res.status).toBe(200);
     expect(stamp).not.toHaveBeenCalled();
@@ -457,7 +459,8 @@ describe('M013 S02 (T04) complete — the leg timing is stamped on the attempt',
       { ...TIMED_BODY, leg_ended_at_ms: 1.5 },
       { ...TIMED_BODY, recording_started_at_ms: -1 },
       { ...TIMED_BODY, leg_ended_at_ms: 4_102_444_800_000 },
-      { ...TIMED_BODY, leg_end_source: 'sip_left' },
+      { ...TIMED_BODY, leg_end_source: 'observed' },
+      { ...TIMED_BODY, leg_end_source: 1 },
     ]) {
       const res = await authed(h.app, COMPLETE, bad);
       expect(res.status).toBe(400);

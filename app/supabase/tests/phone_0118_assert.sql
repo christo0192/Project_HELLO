@@ -1,12 +1,12 @@
 -- =====================================================================
--- 0115 assertions, part 3 — after the SECOND apply of 0115.
+-- 0118 assertions, part 3 — after the SECOND apply of 0118.
 --
 -- Proves by execution, against the real functions and triggers:
 --   * idempotency: the second apply re-ran both backfills and changed no row;
 --   * §1: the columns exist with their types, and each CHECK refuses the
 --     garbage it exists for (0 ms, a seconds-for-ms slip, an end long before
 --     admission, a negative count);
---   * §2: phone_call_attempts carries EXACTLY two triggers (0055 + 0115), the
+--   * §2: phone_call_attempts carries EXACTLY two triggers (0055 + 0118), the
 --     stamp fills room_name on INSERT and on UPDATE OF session_id, never
 --     overwrites an explicit room_name, and leaves it when session_id is
 --     cleared;
@@ -74,7 +74,7 @@ begin
     from _p115.snap p join screening_v2.call_sessions s on s.id = p.session_id
    where s.updated_at is distinct from p.updated_at;
   if v_bad is not null then
-    raise exception 'p115 idempotency: the second apply of 0115 re-updated: %', v_bad;
+    raise exception 'p115 idempotency: the second apply of 0118 re-updated: %', v_bad;
   end if;
   if (select duration_sec from screening_v2.call_sessions s join _p115.snap p
         on p.session_id = s.id where p.slug = 'two_legs') <> 75 then
@@ -173,7 +173,7 @@ begin
    where t.tgrelid = 'screening_v2.phone_call_attempts'::regclass
      and not t.tgisinternal;
   if v_trg <> array['trg_phone_attempt_answered_at', 'trg_phone_attempt_room_name'] then
-    raise exception 'p115 §2: phone_call_attempts triggers are %, expected exactly the 0055 and 0115 pair', v_trg;
+    raise exception 'p115 §2: phone_call_attempts triggers are %, expected exactly the 0055 and 0118 pair', v_trg;
   end if;
 
   select eng, sess into v_eng, v_sess from _p115.chain('room');

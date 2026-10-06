@@ -113,6 +113,8 @@ function attemptFigures(attempt: CandidatePhoneAttempt): string[] {
   const figures: string[] = [];
   if (attempt.connected_to_source === 'unobserved') {
     figures.push('Connected, end not observed');
+  } else if (attempt.connected_to_source === 'detected') {
+    figures.push('Connected, end time approximate');
   } else {
     const connected = attempt.connected_sec === undefined ? attempt.duration_sec : attempt.connected_sec;
     if (connected != null && connected > 0) figures.push(`Connected ${formatDurationSec(connected)}`);
