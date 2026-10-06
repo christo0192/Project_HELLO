@@ -35,10 +35,10 @@ begin
   insert into screening_v2.candidates(id,role_id,name) values
     ('20000000-0000-4000-8000-000000000091',role_r1,'admission cancel race'),
     ('20000000-0000-4000-8000-000000000092',role_r1,'admission expiry race');
-  sent := screening_v2.r1_send_round('20000000-0000-4000-8000-000000000091',role_r1,owner,repeat('c',64),null,now()+interval '1 hour');
+  sent := screening_v2.r1_send_round('20000000-0000-4000-8000-000000000091',role_r1,owner,encode(sha256('r1-transition-race-cancel'::bytea),'hex'),null,now()+interval '1 hour');
   if sent->>'status' <> 'ok' then raise exception 'cancel race Send failed: %', sent; end if;
   insert into _r1_race.fixtures(label,round_id) values('cancel',(sent->>'id')::uuid);
-  sent := screening_v2.r1_send_round('20000000-0000-4000-8000-000000000092',role_r1,owner,repeat('d',64),null,now()+interval '1 hour');
+  sent := screening_v2.r1_send_round('20000000-0000-4000-8000-000000000092',role_r1,owner,encode(sha256('r1-transition-race-expiry'::bytea),'hex'),null,now()+interval '1 hour');
   if sent->>'status' <> 'ok' then raise exception 'expiry race Send failed: %', sent; end if;
   insert into _r1_race.fixtures(label,round_id) values('expiry',(sent->>'id')::uuid);
   insert into screening_v2.interview_round_consents(round_id,template_id)

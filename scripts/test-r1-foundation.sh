@@ -36,7 +36,7 @@ done
 for n in 3 4; do
   docker exec -e "PGAPPNAME=r1-race-$n" "$SUPABASE_DB_CONTAINER" \
     psql -U postgres -d postgres -t -A -c \
-    "select screening_v2.r1_send_round('20000000-0000-4000-8000-00000000000$((n-2))'::uuid, '10000000-0000-4000-8000-000000000002'::uuid, '10000000-0000-4000-8000-000000000001'::uuid, repeat('${n}',64), null, now() + interval '1 day')->>'status'" >> "$R1_OUT" 2>&1 &
+    "select screening_v2.r1_send_round('20000000-0000-4000-8000-00000000000$((n-2))'::uuid, '10000000-0000-4000-8000-000000000002'::uuid, '10000000-0000-4000-8000-000000000001'::uuid, encode(sha256('r1-first-of-month-race-${n}'::bytea),'hex'), null, now() + interval '1 day')->>'status'" >> "$R1_OUT" 2>&1 &
 done
 for _ in $(seq 1 100); do
   [ "$(docker exec "$SUPABASE_DB_CONTAINER" psql -U postgres -d postgres -t -A -c "select count(*) from pg_stat_activity where application_name like 'r1-race-%' and wait_event_type='Lock'")" = 2 ] && break
