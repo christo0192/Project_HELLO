@@ -1,0 +1,74 @@
+{
+  "schema": "gate_replay/v1",
+  "session_prefix": "32757295",
+  "provenance": "real_timing_anonymised",
+  "summary": "Busy at consent: the candidate says 'I am busy right now' and later asks for a callback tomorrow. Production (7bf036f) re-asked for a yes or no and then hung up silently as a machine (responsive_unmatched -> classify.machine).",
+  "time_origin": "call.answered",
+  "candidate_first_name": "Ravi",
+  "bot_lines": [
+    {"kind": "identity", "ask_ms": 0, "first_audio_ms": 1850, "playout_end_ms": 6730},
+    {"kind": "consent", "ask_ms": 10927, "first_audio_ms": 12211, "playout_end_ms": 17639},
+    {"kind": "reask", "ask_ms": 21955, "first_audio_ms": 23063, "playout_end_ms": 27730}
+  ],
+  "vad_events": [
+    {"t_ms": 800, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 1555, "type": "end_of_speech", "speech_duration_ms": 559, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 2248, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 2744, "type": "end_of_speech", "speech_duration_ms": 300, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 4261, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 4757, "type": "end_of_speech", "speech_duration_ms": 300, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 5560, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 6056, "type": "end_of_speech", "speech_duration_ms": 300, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 7790, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 9212, "type": "end_of_speech", "speech_duration_ms": 1226, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 9551, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 10353, "type": "end_of_speech", "speech_duration_ms": 606, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 12290, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 12757, "type": "end_of_speech", "speech_duration_ms": 271, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 19440, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 21057, "type": "end_of_speech", "speech_duration_ms": 1421, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 30340, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 33812, "type": "end_of_speech", "speech_duration_ms": 3276, "silence_duration_ms": 256, "inference_duration_ms": 0}
+  ],
+  "stt_finals": [
+    {"t_ms": 2349, "text": "Okay"},
+    {"t_ms": 9963, "text": "Hello"},
+    {"t_ms": 21648, "text": "I am busy right now"},
+    {"t_ms": 34536, "text": "I am busy right now, can you call me back tomorrow?"}
+  ],
+  "committed_turns": [
+    {"t_ms": 9480, "text": "Okay", "started_speaking_at_ms": 740, "created_at_ms": 9480},
+    {"t_ms": 9970, "text": "Hello", "started_speaking_at_ms": 9491, "created_at_ms": 9970},
+    {"t_ms": 21650, "text": "I am busy right now", "started_speaking_at_ms": 19380, "created_at_ms": 21650},
+    {"t_ms": 34540, "text": "I am busy right now, can you call me back tomorrow?", "started_speaking_at_ms": 30280, "created_at_ms": 34540}
+  ],
+  "judge_responses": {
+    "identity": [
+      {"raw": "unclear", "latency_ms": 956}
+    ]
+  },
+  "observed_production": {
+    "build": "7bf036f",
+    "events": [
+      {"t_ms": 2349, "what": "voice_phone_boundary/stt_final_arrived (during the identity line)"},
+      {"t_ms": 9481, "what": "phone_gate_turn_barrier/pre_question_turn_skipped"},
+      {"t_ms": 9963, "what": "voice_phone_boundary/stt_final_arrived"},
+      {"t_ms": 10926, "what": "phone_identity_verdict/unclear"},
+      {"t_ms": 17639, "what": "phone_consent_endpointing/tightened (consent line playout end, answer window opens)"},
+      {"t_ms": 21648, "what": "voice_phone_boundary/stt_final_arrived"},
+      {"t_ms": 21955, "what": "phone_consent_reask/unmatched"},
+      {"t_ms": 34536, "what": "voice_phone_boundary/stt_final_arrived"},
+      {"t_ms": 34546, "what": "phone_classify_fallback_machine/responsive_unmatched"},
+      {"t_ms": 34735, "what": "classify.machine applied"}
+    ]
+  },
+  "notes": [
+    "All times are integer milliseconds after call.answered. The first name is synthetic.",
+    "Sources: worker log of the call (VAD end_of_speech arrivals, stt_final_arrived, the barrier skip, the identity verdict, the reask and the machine fallback), the persisted turn speech-start stamps, and an energy/Whisper timeline of the stereo recording.",
+    "Segment 740-1299 is the pickup sound, before the identity line's first audio at 1850. The worker logged only TWO STT finals in the identity window: 2349 (during the identity line, 0.5 s after the pickup segment) and 9963. The barrier skip at 9481 happened before the 9963 final existed, so the skipped turn 'Okay' is the 2349 final: its commit was held until after the bot line and the next VAD end (9212). That makes the skip of 'Okay' a CORRECT pre-question skip, not a dropped answer (resolves critique item C7 against the S01-PLAN T01b expectation).",
+    "Segments 2188-2488, 4201-4501 and 5500-5800 are quiet sounds during the identity line (the recording shows a -19..-28 dB burst that may be echo); their start times are reconstructed (300 ms each) from the logged VAD end arrivals. None produced a final.",
+    "The real identity reply is segment 7730-8956 ('Hello'; final 9963). Segment 9491-10097 is a second short burst with no final. The SDK stamped the 'Hello' turn with 9491, the start of that second burst, because the 'Okay' commit at 9480 reset its speech start just before it.",
+    "Segment 12230-12501 is a short sound right after the consent line's first audio with no final.",
+    "Consent replies: 'I am busy right now' (segment 19380-20801, final 21648) and, after the re-ask, the callback request (segment 30280-33556, final 34536). The second utterance is counterfactual for any build that does not re-ask at 21955, because the candidate was answering the re-ask."
+  ]
+}

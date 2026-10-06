@@ -1,0 +1,57 @@
+{
+  "schema": "gate_replay/v1",
+  "session_prefix": "9f60523d",
+  "provenance": "real_timing_anonymised",
+  "summary": "Dropped first yes: a VAD blip during the identity line leaves the SDK speech start carried over, so the consent reply 'Yes, we can continue.' is stamped before the consent question, skipped silently, and the candidate is re-asked after 15 s of dead air.",
+  "time_origin": "call.answered",
+  "candidate_first_name": "Asha",
+  "bot_lines": [
+    {"kind": "identity", "ask_ms": 400, "first_audio_ms": 1404, "playout_end_ms": 7300},
+    {"kind": "consent", "ask_ms": 11560, "first_audio_ms": 13093, "playout_end_ms": 20807},
+    {"kind": "reask", "ask_ms": 35808, "first_audio_ms": 36042, "playout_end_ms": 40348}
+  ],
+  "vad_events": [
+    {"t_ms": 2034, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 2430, "type": "end_of_speech", "speech_duration_ms": 200, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 8210, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 9788, "type": "end_of_speech", "speech_duration_ms": 1382, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 22438, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 23589, "type": "end_of_speech", "speech_duration_ms": 955, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 23760, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 24988, "type": "end_of_speech", "speech_duration_ms": 1032, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 41960, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 42841, "type": "end_of_speech", "speech_duration_ms": 685, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 43010, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 43897, "type": "end_of_speech", "speech_duration_ms": 691, "silence_duration_ms": 256, "inference_duration_ms": 0}
+  ],
+  "stt_finals": [
+    {"t_ms": 25618, "text": "Yes, we can continue."},
+    {"t_ms": 44364, "text": "Yes. Yes."}
+  ],
+  "committed_turns": [
+    {"t_ms": 25625, "text": "Yes, we can continue.", "started_speaking_at_ms": 1974, "created_at_ms": 25625},
+    {"t_ms": 44370, "text": "Yes. Yes.", "started_speaking_at_ms": 41900, "created_at_ms": 44370}
+  ],
+  "judge_responses": {
+    "identity": []
+  },
+  "observed_production": {
+    "build": "7bf036f",
+    "events": [
+      {"t_ms": 11560, "what": "phone_identity_verdict/unclear (empty identity reply, no model call)"},
+      {"t_ms": 20807, "what": "phone_consent_endpointing/tightened (consent line playout end, answer window opens)"},
+      {"t_ms": 25618, "what": "voice_phone_boundary/stt_final_arrived"},
+      {"t_ms": 35808, "what": "phone_consent_reask/no_speech"},
+      {"t_ms": 44364, "what": "voice_phone_boundary/stt_final_arrived"},
+      {"t_ms": 44467, "what": "classify.human applied"}
+    ]
+  },
+  "notes": [
+    "All times are integer milliseconds after call.answered. The first name is synthetic.",
+    "Sources: worker log of the call (VAD end_of_speech arrivals, stt_final_arrived, reask), the persisted turn speech-start stamps, and an energy/Whisper timeline of the stereo recording (candidate and bot channels are separate).",
+    "VAD events are SDK-shaped: a segment starts at t - speech_duration - inference_duration (the SDK formula) and ends at t - silence_duration for end_of_speech.",
+    "Segment 1974-2174 is a 0.2 s blip during the identity line with no STT final. Segment 8150-9532 is the real identity reply; STT never produced a final for it, so the identity reader timed out empty.",
+    "The first consent reply is two VAD segments (22378-23333, 23700-24732) and ONE final at 25618. The SDK still carried the blip's speech start, so the committed turn reports started_speaking_at 1974, which is before the consent line's first audio at 13093.",
+    "The second reply 'Yes. Yes.' started after the earlier commit reset the SDK speech start, so its stamp is its own (41900)."
+  ]
+}
