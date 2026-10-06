@@ -54,9 +54,13 @@ const updateRoomMetadata = vi.fn();
 const deleteRoom = vi.fn();
 const addGrant = vi.fn();
 const toJwt = vi.fn();
+const roomClientCtor = vi.fn();
 
 vi.mock('livekit-server-sdk', () => {
   class FakeRoomServiceClient {
+    constructor(...args: unknown[]) {
+      roomClientCtor(...args);
+    }
     createRoom = (...a: unknown[]) => createRoom(...a);
     updateRoomMetadata = (...a: unknown[]) => updateRoomMetadata(...a);
     deleteRoom = (...a: unknown[]) => deleteRoom(...a);
@@ -216,6 +220,7 @@ beforeEach(() => {
   deleteRoom.mockResolvedValue({});
   addGrant.mockReturnValue(undefined);
   toJwt.mockResolvedValue('synthetic-livekit-jwt');
+  roomClientCtor.mockClear();
   startAuthoritativeRecording.mockResolvedValue({ status: 'started', egressId: EGRESS_ID });
 });
 
@@ -243,6 +248,17 @@ describe('JIT provisioning on a created (Ashby-materialized) session', () => {
 
     // Exactly one room and one egress.
     expect(createRoom).toHaveBeenCalledTimes(1);
+    expect(createRoom).toHaveBeenCalledWith(expect.objectContaining({
+      name: ROOM,
+      emptyTimeout: 10 * 60,
+      maxParticipants: 4,
+      metadata: expect.any(String),
+    }));
+    expect(JSON.parse((createRoom.mock.calls[0][0] as { metadata: string }).metadata)).toEqual({
+      session_id: SESSION_ID,
+      room_name: ROOM,
+      correlation_id: expect.stringMatching(/^[0-9a-f-]{36}$/),
+    });
     expect(updateRoomMetadata).not.toHaveBeenCalled();
     expect(startAuthoritativeRecording).toHaveBeenCalledTimes(1);
     expect(startAuthoritativeRecording).toHaveBeenCalledWith(ROOM, SESSION_ID);
@@ -306,6 +322,35 @@ describe('JIT provisioning on a created (Ashby-materialized) session', () => {
     expect(grant.roomJoin).toBe(true);
     expect(grant.roomAdmin).toBeUndefined();
     expect(grant.roomCreate).toBeUndefined();
+  });
+
+  it('creates the browser room on the selected R1 endpoint', async () => {
+    process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+    process.env.R1_LIVEKIT_URL = 'wss://r1.example.test';
+    process.env.R1_LIVEKIT_API_KEY = 'r1-key';
+    process.env.R1_LIVEKIT_API_SECRET = 'r1-secret';
+    try {
+      const app = exchangeApp({
+        candidate_invites: invites(true),
+        call_sessions: sessionsSequence([
+          ok({ id: SESSION_ID, external_call_id: null, status: 'created' }),
+          ok([{ id: SESSION_ID }]),
+        ]),
+      });
+
+      const res = await exchange(app);
+      expect(res.status).toBe(200);
+      expect(res.body.url).toBe('wss://r1.example.test');
+      expect(roomClientCtor).toHaveBeenLastCalledWith(
+        'wss://r1.example.test', 'r1-key', 'r1-secret',
+      );
+      expect(startAuthoritativeRecording).not.toHaveBeenCalled();
+    } finally {
+      delete process.env.BROWSER_LIVEKIT_TARGET;
+      delete process.env.R1_LIVEKIT_URL;
+      delete process.env.R1_LIVEKIT_API_KEY;
+      delete process.env.R1_LIVEKIT_API_SECRET;
+    }
   });
 });
 
@@ -417,6 +462,7 @@ describe('provider failures during JIT provisioning', () => {
     const res = await exchange(failingApp());
 
     expect(res.status).toBe(503);
+    expect(startAuthoritativeRecording).toHaveBeenCalledWith(ROOM, SESSION_ID);
     expect(res.body.error).toBe('screening_room_unavailable');
     expect(callsFor('candidate_invites', 'update')).toHaveLength(0);
     expect(toJwt).not.toHaveBeenCalled();

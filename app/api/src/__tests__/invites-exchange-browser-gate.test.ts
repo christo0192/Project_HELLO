@@ -23,12 +23,22 @@ import request from 'supertest';
 // ── Collaborator mocks ────────────────────────────────────────────────
 const consumeUpdate = vi.fn();
 const mockFrom = vi.fn();
+const accessTokenCtor = vi.fn();
+const accessTokenGrant = vi.fn();
+const roomClientCtor = vi.fn();
+const roomCreate = vi.fn();
+const roomDelete = vi.fn();
+const mockedEnv = {
+  livekitUrl: 'wss://lk.example',
+  livekitApiKey: 'k',
+  livekitApiSecret: 's',
+};
 
 vi.mock('../lib/supabase.js', () => ({
   supabase: { from: (...a: unknown[]) => mockFrom(...a) },
 }));
 vi.mock('../lib/env.js', () => ({
-  env: { livekitUrl: 'wss://lk.example', livekitApiKey: 'k', livekitApiSecret: 's' },
+  env: mockedEnv,
 }));
 vi.mock('../lib/correlation.js', () => ({ getCorrelationId: () => null }));
 vi.mock('../lib/invite-validation.js', () => ({
@@ -50,10 +60,17 @@ vi.mock('../lib/room-provisioning.js', () => ({
   requireLiveKitConfigured: vi.fn(),
 }));
 vi.mock('livekit-server-sdk', () => {
-  const AccessToken = vi.fn() as unknown as { prototype: Record<string, unknown> };
-  (AccessToken as any).prototype.addGrant = vi.fn();
-  (AccessToken as any).prototype.toJwt = vi.fn().mockResolvedValue('jwt-token');
-  return { AccessToken, RoomServiceClient: vi.fn(), TrackSource: { MICROPHONE: 1 } };
+  class AccessToken {
+    constructor(...args: unknown[]) { accessTokenCtor(...args); }
+    addGrant(...args: unknown[]) { return accessTokenGrant(...args); }
+    async toJwt(): Promise<string> { return 'jwt-token'; }
+  }
+  class RoomServiceClient {
+    constructor(...args: unknown[]) { roomClientCtor(...args); }
+    async createRoom(...args: unknown[]): Promise<void> { await roomCreate(...args); }
+    async deleteRoom(...args: unknown[]): Promise<void> { await roomDelete(...args); }
+  }
+  return { AccessToken, RoomServiceClient, TrackSource: { MICROPHONE: 1 } };
 });
 vi.mock('../lib/validation.js', () => ({
   validateBody: () => (_req: unknown, _res: unknown, next: () => void) => next(),
@@ -117,12 +134,18 @@ beforeEach(async () => {
 afterEach(() => {
   // Reset the resolver to the real (env-gated) default so tests don't leak.
   setGate(() => null);
+  Object.assign(mockedEnv, {
+    livekitUrl: 'wss://lk.example', livekitApiKey: 'k', livekitApiSecret: 's',
+  });
 });
 
 function appWithGate(gate: unknown) {
   setGate(() => gate);
   const app = express();
   app.use('/api/livekit', express.json(), invitesRouter);
+  app.use((_err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    res.status(500).json({ error: { type: 'internal_error', message: 'Internal server error' } });
+  });
   return app;
 }
 
@@ -134,9 +157,104 @@ describe('exchange browser gate — OFF is byte-identical', () => {
   it('mints the join token with no gate consulted', async () => {
     const res = await exchange(appWithGate(null));
     expect(res.status).toBe(200);
-    expect(res.body).toMatchObject({ session_id: SESSION, room_name: ROOM, livekit_token: 'jwt-token' });
+    expect(res.body).toEqual({
+      grant_token: 'a'.repeat(64),
+      url: 'wss://lk.example',
+      room_name: ROOM,
+      session_id: SESSION,
+      expires_at: '2030-01-01T00:00:00.000Z',
+      livekit_token: 'jwt-token',
+    });
+    expect(accessTokenCtor).toHaveBeenLastCalledWith('k', 's', {
+      identity: 'candidate-00000000-00000000', ttl: '5m',
+    });
+    expect(accessTokenGrant).toHaveBeenLastCalledWith({
+      room: ROOM, roomJoin: true, canPublish: true, canSubscribe: true, canPublishData: true,
+    });
     // Invite WAS consumed on the happy path.
     expect(consumeUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the origin/main Cloud preflight room, credentials, TTL and every grant', async () => {
+    const res = await request(appWithGate(null))
+      .post('/api/livekit/preflight').send({ invite_token: TOKEN });
+
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe('wss://lk.example');
+    expect(roomClientCtor).toHaveBeenLastCalledWith('wss://lk.example', 'k', 's');
+    expect(roomCreate).toHaveBeenLastCalledWith(expect.objectContaining({
+      name: expect.stringMatching(/^preflight-/),
+      emptyTimeout: 45,
+      departureTimeout: 15,
+      maxParticipants: 1,
+      metadata: JSON.stringify({ channel: 'preflight', schema: 1 }),
+    }));
+    expect(accessTokenCtor).toHaveBeenLastCalledWith('k', 's', {
+      identity: expect.stringMatching(/^preflight-/), ttl: '2m',
+    });
+    expect(accessTokenGrant).toHaveBeenLastCalledWith({
+      room: expect.stringMatching(/^preflight-/),
+      roomJoin: true,
+      canPublish: true,
+      canPublishSources: [1],
+      canSubscribe: false,
+      canPublishData: false,
+    });
+  });
+
+  it('keeps the origin/main missing-Cloud-config error status and body', async () => {
+    mockedEnv.livekitUrl = '';
+    const res = await exchange(appWithGate(null));
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({
+      error: { type: 'internal_error', message: 'Internal server error' },
+    });
+  });
+
+  it('selects the R1 URL and R1 signing pair only for the exact r1 target', async () => {
+    process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+    process.env.R1_LIVEKIT_URL = 'wss://r1.example.test';
+    process.env.R1_LIVEKIT_API_KEY = 'r1-key';
+    process.env.R1_LIVEKIT_API_SECRET = 'r1-secret';
+    try {
+      const res = await exchange(appWithGate(null));
+      expect(res.status).toBe(200);
+      expect(res.body.url).toBe('wss://r1.example.test');
+
+      expect(accessTokenCtor.mock.calls.at(-1)).toEqual([
+        'r1-key',
+        'r1-secret',
+        expect.objectContaining({ identity: expect.stringMatching(/^candidate-/), ttl: '5m' }),
+      ]);
+    } finally {
+      delete process.env.BROWSER_LIVEKIT_TARGET;
+      delete process.env.R1_LIVEKIT_URL;
+      delete process.env.R1_LIVEKIT_API_KEY;
+      delete process.env.R1_LIVEKIT_API_SECRET;
+    }
+  });
+
+  it('returns the selected R1 URL from preflight', async () => {
+    process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+    process.env.R1_LIVEKIT_URL = 'wss://r1.example.test';
+    process.env.R1_LIVEKIT_API_KEY = 'r1-key';
+    process.env.R1_LIVEKIT_API_SECRET = 'r1-secret';
+    try {
+      const app = appWithGate(null);
+      const res = await request(app).post('/api/livekit/preflight').send({ invite_token: TOKEN });
+      expect(res.status).toBe(200);
+      expect(res.body.url).toBe('wss://r1.example.test');
+      expect(accessTokenCtor.mock.calls.at(-1)).toEqual([
+        'r1-key',
+        'r1-secret',
+        expect.objectContaining({ identity: expect.stringMatching(/^preflight-/), ttl: '2m' }),
+      ]);
+    } finally {
+      delete process.env.BROWSER_LIVEKIT_TARGET;
+      delete process.env.R1_LIVEKIT_URL;
+      delete process.env.R1_LIVEKIT_API_KEY;
+      delete process.env.R1_LIVEKIT_API_SECRET;
+    }
   });
 });
 

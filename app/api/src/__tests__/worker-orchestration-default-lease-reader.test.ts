@@ -28,6 +28,14 @@ const h = vi.hoisted(() => ({
   tables: [] as string[],
   /** Every `.eq(col, val)` filter, as 'col=val'. */
   filters: [] as string[],
+  /** Candidates returned to the real production reaper. */
+  reapRows: [] as Array<{ machine_id: string; claimed_session_id: string | null; state: string }>,
+  /** Endpoint and room requested by the lazy LiveKit liveness client. */
+  roomLookups: [] as Array<{ url: string; room: string }>,
+  /** Fly stop calls made by the real production reaper. */
+  stops: [] as string[],
+  /** Per-endpoint liveness behavior for the fake LiveKit SDK. */
+  listParticipants: new Map<string, (room: string) => Promise<Array<unknown>>>(),
 }));
 
 vi.mock('../lib/env.js', () => ({
@@ -65,6 +73,12 @@ vi.mock('../lib/supabase.js', () => {
         if (name === 'claim_voice_worker') {
           return { data: { status: 'claimed', machine_id: 'd895472c499e38', epoch: 23 }, error: null };
         }
+        if (name === 'list_reapable_voice_workers') {
+          return { data: h.reapRows, error: null };
+        }
+        if (name === 'list_orphaned_voice_worker_leases') {
+          return { data: [], error: null };
+        }
         return { data: { status: 'ok' }, error: null };
       },
     },
@@ -78,10 +92,27 @@ vi.mock('../lib/fly-machines.js', async (importOriginal) => {
     createFlyMachinesClient: () => ({
       async startMachine() { return {}; },
       async waitForState() { return {}; },
-      async stopMachine() { return {}; },
+      async stopMachine(app: string, machineId: string) { h.stops.push(`${app}:${machineId}`); return {}; },
       async listMachines() { return []; },
       async getMachine(_app: string, id: string) { return { id, state: 'started', raw: {} }; },
     }),
+  };
+});
+
+vi.mock('livekit-server-sdk', () => {
+  class RoomServiceClient {
+    constructor(private readonly url: string) {}
+    async listParticipants(room: string): Promise<Array<unknown>> {
+      h.roomLookups.push({ url: this.url, room });
+      const handler = h.listParticipants.get(this.url);
+      if (!handler) throw new Error(`unexpected endpoint ${this.url}`);
+      return handler(room);
+    }
+  }
+  return {
+    RoomServiceClient,
+    AccessToken: class {},
+    AgentDispatchClient: class {},
   };
 });
 
@@ -96,6 +127,7 @@ import {
   MAX_READY_TIMEOUT_MS,
   createDefaultWorkerOrchestrationService,
 } from '../lib/worker-orchestration.js';
+import { createBrowserWorkerOrchestrationService } from '../lib/browser-orchestration.js';
 import {
   PHONE_WORKER_GATE_CEILING_SEC,
   PHONE_WORKER_READY_CEILING_SEC,
@@ -121,6 +153,14 @@ beforeEach(() => {
   h.selects.length = 0;
   h.tables.length = 0;
   h.filters.length = 0;
+  h.reapRows.length = 0;
+  h.roomLookups.length = 0;
+  h.stops.length = 0;
+  h.listParticipants.clear();
+  delete process.env.BROWSER_LIVEKIT_TARGET;
+  delete process.env.R1_LIVEKIT_URL;
+  delete process.env.R1_LIVEKIT_API_KEY;
+  delete process.env.R1_LIVEKIT_API_SECRET;
 });
 
 describe('createDefaultWorkerOrchestrationService — production lease reader (M009 E2)', () => {
@@ -163,6 +203,50 @@ describe('createDefaultWorkerOrchestrationService — production lease reader (M
       expect((res as { agentName?: unknown }).agentName).toBeNull();
     });
   }
+});
+
+describe('production reaper endpoint isolation', () => {
+  const BROWSER_APP = 'project-hello-voice';
+  const BROWSER_MACHINE = 'browser-machine';
+
+  function reapCandidate(sessionId: string) {
+    h.reapRows.push({ machine_id: BROWSER_MACHINE, claimed_session_id: sessionId, state: 'busy' });
+  }
+
+  it('spares a browser worker whose room is live on selected R1 even though Cloud lacks it', async () => {
+    process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+    process.env.R1_LIVEKIT_URL = 'wss://r1.invalid';
+    process.env.R1_LIVEKIT_API_KEY = 'r1-key';
+    process.env.R1_LIVEKIT_API_SECRET = 'r1-secret';
+    reapCandidate(SESSION);
+    h.listParticipants.set('wss://r1.invalid', async () => [{ identity: 'candidate' }]);
+    h.listParticipants.set('wss://livekit.invalid', async () => {
+      throw Object.assign(new Error('requested room does not exist'), { code: 'not_found' });
+    });
+
+    const result = await createBrowserWorkerOrchestrationService().reapWorkers({ app: BROWSER_APP });
+
+    expect(result.stopped).toBe(0);
+    expect(h.stops).toEqual([]);
+    expect(h.roomLookups).toEqual([{ url: 'wss://r1.invalid', room: `screening-${SESSION}` }]);
+  });
+
+  it('keeps the phone reaper on Cloud and stops a Cloud-absent phone room', async () => {
+    process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+    process.env.R1_LIVEKIT_URL = 'wss://r1.invalid';
+    process.env.R1_LIVEKIT_API_KEY = 'r1-key';
+    process.env.R1_LIVEKIT_API_SECRET = 'r1-secret';
+    reapCandidate(SESSION);
+    h.listParticipants.set('wss://livekit.invalid', async () => {
+      throw Object.assign(new Error('requested room does not exist'), { code: 'not_found' });
+    });
+
+    const result = await createDefaultWorkerOrchestrationService().reapWorkers({ app: APP });
+
+    expect(result.stopped).toBe(1);
+    expect(h.stops).toEqual([`${APP}:${BROWSER_MACHINE}`]);
+    expect(h.roomLookups).toEqual([{ url: 'wss://livekit.invalid', room: `phone-${SESSION}` }]);
+  });
 });
 
 // dial.ts sizes the agent-join budget against copies of the service's private

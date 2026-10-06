@@ -17,12 +17,13 @@
  * Invariants:
  *  1. Room metadata is minimal and carries no candidate PII (session id, room
  *     name, correlation id only) — mirrors invites.ts invariant 4.
- *  2. Authoritative egress is started BEFORE the session is published as
- *     joinable. When egress is enabled, a start failure aborts provisioning;
- *     when it is disabled (and not required) the documented browser-fallback
- *     rule applies unchanged — `startAuthoritativeRecording` owns that policy
- *     and `authoritativeRecordingEnabled()` already throws when a required
- *     egress is disabled.
+ *  2. Cloud authoritative egress is started BEFORE the session is published as
+ *     joinable. R1 records in-worker and explicitly skips egress because its
+ *     SFU has none. For Cloud, an enabled egress start failure aborts
+ *     provisioning; when disabled (and not required), the documented
+ *     browser-fallback rule applies unchanged — `startAuthoritativeRecording`
+ *     owns that policy and `authoritativeRecordingEnabled()` already throws
+ *     when a required egress is disabled.
  *  3. Egress is never started twice for one session:
  *     `startAuthoritativeRecording` short-circuits on a linked
  *     recording_egress_id and links its own id with an `is null` CAS.
@@ -35,12 +36,16 @@
  *     ROOM_EMPTY_TIMEOUT_SEC and no token was ever minted for it.
  */
 
-import { RoomServiceClient } from 'livekit-server-sdk';
-import { env } from './env.js';
 import { supabase } from './supabase.js';
 import { getCorrelationId } from './correlation.js';
 import { startAuthoritativeRecording } from './recording-egress.js';
 import { transitionSession } from './session-lifecycle.js';
+import {
+  cloudLiveKitEndpoint,
+  requireLiveKitEndpointConfigured,
+  roomServiceClientFor,
+  type LiveKitEndpoint,
+} from './livekit-endpoints.js';
 
 /** Room lifetime with nobody connected, in seconds. */
 export const ROOM_EMPTY_TIMEOUT_SEC = 10 * 60;
@@ -48,11 +53,7 @@ export const ROOM_EMPTY_TIMEOUT_SEC = 10 * 60;
 export const ROOM_MAX_PARTICIPANTS = 4;
 
 export function requireLiveKitConfigured(): void {
-  if (!env.livekitUrl || !env.livekitApiKey || !env.livekitApiSecret) {
-    throw new Error(
-      'LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET must be set in app/api/.env',
-    );
-  }
+  requireLiveKitEndpointConfigured(cloudLiveKitEndpoint());
 }
 
 /** Deterministic room name — derived from the session id, never stored state. */
@@ -86,6 +87,11 @@ export interface RoomServiceClientLike {
 
 export interface ProvisionRoomDeps {
   rooms?: RoomServiceClientLike;
+  /**
+   * Browser-only endpoint override. Omitted means the permanent Cloud default,
+   * preserving callers such as the phone room path exactly as before.
+   */
+  endpoint?: LiveKitEndpoint;
   /**
    * Used ONLY by the `existing_session` adopt re-read. Room creation and the
    * `created` → `waiting` CAS go through `transitionSession`, which holds its
@@ -121,12 +127,8 @@ export type ProvisionRoomResult =
    *  concurrent actor moved it somewhere other than our room). */
   | { ok: false; code: 'not_joinable'; roomName: string };
 
-function roomClient(): RoomServiceClientLike {
-  return new RoomServiceClient(
-    env.livekitUrl,
-    env.livekitApiKey,
-    env.livekitApiSecret,
-  ) as unknown as RoomServiceClientLike;
+function roomClient(endpoint: LiveKitEndpoint): RoomServiceClientLike {
+  return roomServiceClientFor(endpoint) as unknown as RoomServiceClientLike;
 }
 
 /**
@@ -158,11 +160,12 @@ export async function provisionRoomForCreatedSession(
   mode: ProvisionRoomMode,
   deps: ProvisionRoomDeps = {},
 ): Promise<ProvisionRoomResult> {
-  requireLiveKitConfigured();
+  const endpoint = deps.endpoint ?? cloudLiveKitEndpoint();
+  requireLiveKitEndpointConfigured(endpoint);
 
   const roomName = roomNameForSession(sessionId);
   const metadata = buildMinimalRoomMetadata(sessionId, roomName);
-  const rooms = deps.rooms ?? roomClient();
+  const rooms = deps.rooms ?? roomClient(endpoint);
   const db = deps.db ?? supabase;
   const startRecording = deps.startRecording ?? startAuthoritativeRecording;
 
@@ -180,11 +183,17 @@ export async function provisionRoomForCreatedSession(
       await rooms.updateRoomMetadata(roomName, metadata);
     }
 
-    // Server-authoritative capture starts before anyone can join. In required
-    // mode a storage/egress failure aborts rather than silently producing an
-    // unrecorded room.
-    const recording = await startRecording(roomName, sessionId);
-    if (recording.status === 'started' && !recording.egressId) {
+    // R1 records in its worker. It has no LiveKit Egress service, so never
+    // construct the Cloud egress client for an R1 room. Cloud retains the
+    // existing authoritative-egress gate, including required-egress failures.
+    const recording = endpoint.target === 'r1'
+      ? { kind: 'no_egress' as const }
+      : { kind: 'egress' as const, result: await startRecording(roomName, sessionId) };
+    if (
+      recording.kind === 'egress'
+      && recording.result.status === 'started'
+      && !recording.result.egressId
+    ) {
       throw new Error('authoritative recording returned no identifier');
     }
   } catch (raw) {
