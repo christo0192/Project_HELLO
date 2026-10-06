@@ -9390,7 +9390,19 @@ components:
         duration_ms:
           type: integer
           nullable: true
-          description: Optional duration in milliseconds.
+          description: Optional duration in milliseconds. From an M013 worker it is the TRUE encoded audio length, and it is stamped on the attempt (recording_duration_ms) only when the body also carries a leg-timing field below.
+        recording_started_at_ms:
+          type: integer
+          nullable: true
+          description: M013 S02. Epoch ms of the recording's t=0 (the file anchor). Display-only data stamped on the attempt, first write wins. Outside [answered_at - 30 s, now + 60 s] it is dropped with a log line, never rejected.
+        leg_ended_at_ms:
+          type: integer
+          nullable: true
+          description: M013 S02. Epoch ms the worker observed the leg end (SIP participant left, else the session close). Stamped on the attempt as observed_ended_at = min(this, ended_at); the earliest report wins, so a retry cannot move it. Same sanity window; never a state transition or ledger event.
+        tail_flushed:
+          type: boolean
+          nullable: true
+          description: M013 S02. True only when the recorder flushed its pending tail and closed cleanly. Stamped on the attempt, first write wins.
       additionalProperties: false
 
     PhoneRecordingCompleteResponse:

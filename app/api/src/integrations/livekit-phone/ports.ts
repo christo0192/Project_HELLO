@@ -41,6 +41,12 @@ export interface DuePhoneAttempt {
   readonly epoch: number;
   /** LiveKit room, or null when the attempt never reached a room. */
   readonly roomName: string | null;
+  /**
+   * M013 S02: the bound consent session, or null when unbound. Lets the sweep
+   * derive the session room for a bound attempt whose `room_name` is NULL (a
+   * reconnect leg). Optional so an older reader stays type-compatible.
+   */
+  readonly sessionId?: string | null;
   readonly attemptState: string;
   readonly engagementState: string;
 }

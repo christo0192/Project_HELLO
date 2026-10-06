@@ -997,8 +997,12 @@ async function leaseOutlivesOriginate(
  * reaper's classifier in worker-orchestration.ts (not imported: that module
  * pulls env and Fly wiring into this one). A Twirp `not_found`, an HTTP 404,
  * or the server's literal "requested room does not exist".
+ *
+ * Exported for one reason: the dropped-webhook sweep
+ * (livekit-phone/reconciliation.ts `isReconcileRoomNotFound`) mirrors it, and
+ * a test pins the two classifiers equal.
  */
-function isRoomNotFound(err: unknown): boolean {
+export function isRoomNotFound(err: unknown): boolean {
   if (err === null || typeof err !== 'object') return false;
   const e = err as { code?: unknown; status?: unknown; statusCode?: unknown; message?: unknown };
   if (typeof e.code === 'string' && e.code.toLowerCase() === 'not_found') return true;

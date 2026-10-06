@@ -57,6 +57,143 @@ export function workerRecordingEgressId(attemptId: string): string {
   return `EG_worker_${attemptId}`;
 }
 
+// ── M013 S02 (T04): the leg timing the worker reports on /recording/complete ──
+
+/**
+ * Sanity window for the worker's epoch-ms leg timing. A value earlier than
+ * `answered_at − 30 s` or later than `now + 60 s` is DROPPED (logged by the
+ * caller), never rejected: the values are display-only and the recording must
+ * still be kept. The 30 s allows worker/API clock skew and a late
+ * `call.answered` post.
+ */
+export const LEG_TIMING_BEFORE_ANSWER_SLACK_MS = 30_000;
+export const LEG_TIMING_AFTER_NOW_SLACK_MS = 60_000;
+/** 0115 `recording_duration_ms` CHECK: 1 ms to 24 h. */
+export const LEG_TIMING_MAX_DURATION_MS = 86_400_000;
+/** 0115 `observed_ended_at` CHECK floor: `admitted_at − 5 min`. */
+const OBSERVED_END_ADMITTED_FLOOR_MS = 5 * 60_000;
+/** 0115 `recording_started_at_ms` CHECK: [2020-01-01, 2100-01-01). */
+const EPOCH_MS_CHECK_MIN = 1_577_836_800_000;
+const EPOCH_MS_CHECK_MAX = 4_102_444_800_000;
+
+/** The optional timing fields of a `/recording/complete` body (T02 worker). */
+export interface WorkerLegTimingReport {
+  readonly recordingStartedAtMs?: number | null;
+  readonly legEndedAtMs?: number | null;
+  /** The TRUE audio length the worker encoded (T02), not a wall-clock span. */
+  readonly durationMs?: number | null;
+  readonly tailFlushed?: boolean | null;
+}
+
+/** The attempt columns the stamp reads. Timestamps as ISO strings. */
+export interface AttemptLegTimingRow {
+  readonly answeredAt: string | null;
+  readonly admittedAt: string | null;
+  readonly endedAt: string | null;
+  readonly observedEndedAt: string | null;
+  readonly recordingStartedAtMs: number | null;
+  readonly recordingDurationMs: number | null;
+  readonly recordingTailFlushed: boolean | null;
+}
+
+/** Column patch for `phone_call_attempts`. Only changed columns are present. */
+export interface AttemptLegTimingPatch {
+  observed_ended_at?: string;
+  recording_started_at_ms?: number;
+  recording_duration_ms?: number;
+  recording_tail_flushed?: boolean;
+}
+
+export type LegTimingDropReason =
+  | 'recording_started_at_out_of_window'
+  | 'leg_ended_at_out_of_window'
+  | 'duration_out_of_range'
+  | 'no_answer_anchor';
+
+export interface AttemptLegTimingPlan {
+  readonly patch: AttemptLegTimingPatch;
+  readonly dropped: ReadonlyArray<LegTimingDropReason>;
+}
+
+function isoMs(value: string | null): number | null {
+  if (value === null) return null;
+  const ms = Date.parse(value);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Decide what (if anything) to stamp on the attempt. PURE: no clock, no I/O.
+ *
+ * Idempotent by construction, so a worker retry or the late reporter can
+ * never move a stamped value:
+ *   - `observed_ended_at` = the EARLIEST observed end ever reported, bounded
+ *     by the ledger's `ended_at` when the attempt has ended
+ *     (`least(coalesce(existing, new), new)` with `new = min(leg_end, ended_at)`);
+ *   - every other column is first-write-wins (`coalesce(existing, new)`).
+ * A value outside the sanity window or the 0115 CHECK ranges is dropped and
+ * reported, never written.
+ */
+export function planAttemptLegTimingStamp(
+  row: AttemptLegTimingRow,
+  report: WorkerLegTimingReport,
+  now: Date,
+): AttemptLegTimingPlan {
+  const patch: AttemptLegTimingPatch = {};
+  const dropped: LegTimingDropReason[] = [];
+
+  const admittedMs = isoMs(row.admittedAt);
+  const anchorMs = isoMs(row.answeredAt) ?? admittedMs;
+  const upperMs = now.getTime() + LEG_TIMING_AFTER_NOW_SLACK_MS;
+  let lowerMs: number | null = anchorMs === null ? null : anchorMs - LEG_TIMING_BEFORE_ANSWER_SLACK_MS;
+  if (lowerMs !== null && admittedMs !== null) {
+    lowerMs = Math.max(lowerMs, admittedMs - OBSERVED_END_ADMITTED_FLOOR_MS);
+  }
+  const inWindow = (ms: number): boolean => lowerMs !== null
+    && ms >= lowerMs && ms <= upperMs
+    && ms >= EPOCH_MS_CHECK_MIN && ms < EPOCH_MS_CHECK_MAX;
+  const epochReported = (v: number | null | undefined): v is number =>
+    typeof v === 'number' && Number.isFinite(v);
+
+  const epochValues = [report.recordingStartedAtMs, report.legEndedAtMs].filter(epochReported);
+  if (epochValues.length > 0 && lowerMs === null) dropped.push('no_answer_anchor');
+
+  // recording_started_at_ms — first write wins.
+  if (epochReported(report.recordingStartedAtMs) && lowerMs !== null) {
+    const started = Math.trunc(report.recordingStartedAtMs);
+    if (!inWindow(started)) dropped.push('recording_started_at_out_of_window');
+    else if (row.recordingStartedAtMs === null) patch.recording_started_at_ms = started;
+  }
+
+  // observed_ended_at — earliest wins, bounded by the ledger end.
+  if (epochReported(report.legEndedAtMs) && lowerMs !== null) {
+    const legEnd = Math.trunc(report.legEndedAtMs);
+    if (!inWindow(legEnd)) {
+      dropped.push('leg_ended_at_out_of_window');
+    } else {
+      const endedMs = isoMs(row.endedAt);
+      const candidate = endedMs === null ? legEnd : Math.min(legEnd, endedMs);
+      const existing = isoMs(row.observedEndedAt);
+      if (existing === null || candidate < existing) {
+        patch.observed_ended_at = new Date(candidate).toISOString();
+      }
+    }
+  }
+
+  // recording_duration_ms — first write wins, within the 0115 CHECK.
+  if (typeof report.durationMs === 'number' && Number.isFinite(report.durationMs)) {
+    const duration = Math.trunc(report.durationMs);
+    if (duration < 1 || duration > LEG_TIMING_MAX_DURATION_MS) dropped.push('duration_out_of_range');
+    else if (row.recordingDurationMs === null) patch.recording_duration_ms = duration;
+  }
+
+  // recording_tail_flushed — first write wins.
+  if (typeof report.tailFlushed === 'boolean' && row.recordingTailFlushed === null) {
+    patch.recording_tail_flushed = report.tailFlushed;
+  }
+
+  return { patch, dropped };
+}
+
 /** The narrow storage slice this module needs — a single presigned-PUT mint. */
 export interface WorkerRecordingUploadSigner {
   /**

@@ -18,9 +18,15 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
+  LEG_TIMING_AFTER_NOW_SLACK_MS,
+  LEG_TIMING_BEFORE_ANSWER_SLACK_MS,
+  LEG_TIMING_MAX_DURATION_MS,
+  planAttemptLegTimingStamp,
   prepareWorkerRecording,
   workerRecordingEgressId,
+  type AttemptLegTimingRow,
   type PrepareWorkerRecordingDeps,
+  type WorkerLegTimingReport,
 } from '../integrations/livekit-phone-dial/worker-recording.js';
 import {
   phoneAttemptRecordingManifestKey,
@@ -295,5 +301,145 @@ describe('0105 — prepare before consent binds the attempt but leaves the SESSI
     expect(result.status).toBe('already_prepared');
     expect(h.attach.mock.calls[0][0].role).toBe('authoritative');
     expect(h.stamp).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── M013 S02 (T04): the leg-timing stamp rule ─────────────────────────────
+//
+// Synthetic timings shaped like 9f60523d leg 2 (answered, dropped ~19 s later,
+// reclaimed ~6 min after that). No real call data.
+
+describe('planAttemptLegTimingStamp — sanity window, earliest end, first write', () => {
+  const ANSWERED = '2026-10-05T03:34:49.600Z';
+  const ADMITTED = '2026-10-05T03:34:30.000Z';
+  const REC_START = Date.parse('2026-10-05T03:34:50.650Z');
+  const LEG_END = Date.parse('2026-10-05T03:35:08.300Z');
+  const AT = new Date('2026-10-05T03:35:10.000Z');
+
+  function row(over: Partial<AttemptLegTimingRow> = {}): AttemptLegTimingRow {
+    return {
+      answeredAt: ANSWERED,
+      admittedAt: ADMITTED,
+      endedAt: null,
+      observedEndedAt: null,
+      recordingStartedAtMs: null,
+      recordingDurationMs: null,
+      recordingTailFlushed: null,
+      ...over,
+    };
+  }
+  const report: WorkerLegTimingReport = {
+    recordingStartedAtMs: REC_START,
+    legEndedAtMs: LEG_END,
+    durationMs: 17_650,
+    tailFlushed: true,
+  };
+
+  it('stamps every column on a fresh attempt', () => {
+    expect(planAttemptLegTimingStamp(row(), report, AT)).toEqual({
+      patch: {
+        observed_ended_at: '2026-10-05T03:35:08.300Z',
+        recording_started_at_ms: REC_START,
+        recording_duration_ms: 17_650,
+        recording_tail_flushed: true,
+      },
+      dropped: [],
+    });
+  });
+
+  it('bounds the observed end by the ledger end: observed = min(leg end, ended_at)', () => {
+    // Reconciled earlier than the worker's report (clock skew): the ledger wins.
+    const earlier = planAttemptLegTimingStamp(row({ endedAt: '2026-10-05T03:35:07.000Z' }), report, AT);
+    expect(earlier.patch.observed_ended_at).toBe('2026-10-05T03:35:07.000Z');
+    // Reclaimed 6 min later: the worker's observed end wins.
+    const reclaimed = planAttemptLegTimingStamp(row({ endedAt: '2026-10-05T03:40:57.500Z' }), report, AT);
+    expect(reclaimed.patch.observed_ended_at).toBe('2026-10-05T03:35:08.300Z');
+  });
+
+  it('is idempotent: a second report with a LATER leg end does not move observed_ended_at', () => {
+    const stamped = row({
+      observedEndedAt: '2026-10-05T03:35:08.300Z',
+      recordingStartedAtMs: REC_START,
+      recordingDurationMs: 17_650,
+      recordingTailFlushed: true,
+    });
+    const later = planAttemptLegTimingStamp(stamped, {
+      recordingStartedAtMs: REC_START + 900,
+      legEndedAtMs: LEG_END + 2_500,
+      durationMs: 20_000,
+      tailFlushed: false,
+    }, AT);
+    expect(later).toEqual({ patch: {}, dropped: [] });
+  });
+
+  it('an EARLIER observed end replaces a later one (earliest wins); the rest stays first-write', () => {
+    const stamped = row({
+      observedEndedAt: '2026-10-05T03:35:10.000Z',
+      recordingStartedAtMs: REC_START,
+      recordingDurationMs: 17_650,
+      recordingTailFlushed: false,
+    });
+    expect(planAttemptLegTimingStamp(stamped, report, AT)).toEqual({
+      patch: { observed_ended_at: '2026-10-05T03:35:08.300Z' },
+      dropped: [],
+    });
+  });
+
+  it('drops (never rejects) epoch values outside [answered_at − 30 s, now + 60 s]', () => {
+    const answeredMs = Date.parse(ANSWERED);
+    const tooEarly = planAttemptLegTimingStamp(row(), {
+      ...report, recordingStartedAtMs: answeredMs - 30_001, legEndedAtMs: answeredMs - 31_000,
+    }, AT);
+    expect(tooEarly.patch).toEqual({ recording_duration_ms: 17_650, recording_tail_flushed: true });
+    expect(tooEarly.dropped).toEqual(['recording_started_at_out_of_window', 'leg_ended_at_out_of_window']);
+
+    const tooLate = planAttemptLegTimingStamp(row(), {
+      ...report, legEndedAtMs: AT.getTime() + 60_001,
+    }, AT);
+    expect(tooLate.patch.observed_ended_at).toBeUndefined();
+    expect(tooLate.dropped).toEqual(['leg_ended_at_out_of_window']);
+  });
+
+  it('accepts the exact window edges (30 s skew before answer, 60 s after now)', () => {
+    const answeredMs = Date.parse(ANSWERED);
+    const edge = planAttemptLegTimingStamp(row(), {
+      recordingStartedAtMs: answeredMs - 30_000, legEndedAtMs: AT.getTime() + 60_000,
+    }, AT);
+    expect(edge.dropped).toEqual([]);
+    expect(edge.patch.recording_started_at_ms).toBe(answeredMs - 30_000);
+    expect(edge.patch.observed_ended_at).toBe(new Date(AT.getTime() + 60_000).toISOString());
+  });
+
+  it('falls back to admitted_at when the leg has no answered_at, and drops epochs with no anchor at all', () => {
+    const viaAdmitted = planAttemptLegTimingStamp(row({ answeredAt: null }), report, AT);
+    expect(viaAdmitted.dropped).toEqual([]);
+    expect(viaAdmitted.patch.observed_ended_at).toBe('2026-10-05T03:35:08.300Z');
+
+    const noAnchor = planAttemptLegTimingStamp(row({ answeredAt: null, admittedAt: null }), report, AT);
+    expect(noAnchor.dropped).toEqual(['no_answer_anchor']);
+    expect(noAnchor.patch).toEqual({ recording_duration_ms: 17_650, recording_tail_flushed: true });
+  });
+
+  it('keeps the duration inside the 0115 CHECK (1 ms .. 24 h)', () => {
+    for (const bad of [0, -5, LEG_TIMING_MAX_DURATION_MS + 1]) {
+      const plan = planAttemptLegTimingStamp(row(), { durationMs: bad }, AT);
+      expect(plan.patch).toEqual({});
+      expect(plan.dropped).toEqual(['duration_out_of_range']);
+    }
+    expect(planAttemptLegTimingStamp(row(), { durationMs: LEG_TIMING_MAX_DURATION_MS }, AT).patch)
+      .toEqual({ recording_duration_ms: LEG_TIMING_MAX_DURATION_MS });
+  });
+
+  it('an empty or all-null report plans nothing', () => {
+    expect(planAttemptLegTimingStamp(row(), {}, AT)).toEqual({ patch: {}, dropped: [] });
+    expect(planAttemptLegTimingStamp(row(), {
+      recordingStartedAtMs: null, legEndedAtMs: null, durationMs: null, tailFlushed: null,
+    }, AT)).toEqual({ patch: {}, dropped: [] });
+  });
+
+  it('pins the window constants the route documents', () => {
+    expect(LEG_TIMING_BEFORE_ANSWER_SLACK_MS).toBe(30_000);
+    expect(LEG_TIMING_AFTER_NOW_SLACK_MS).toBe(60_000);
+    expect(LEG_TIMING_MAX_DURATION_MS).toBe(86_400_000);
   });
 });

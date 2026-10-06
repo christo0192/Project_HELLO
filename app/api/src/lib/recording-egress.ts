@@ -11,6 +11,11 @@ import { env } from './env.js';
 import { supabase } from './supabase.js';
 import { createLogger } from './logger.js';
 import { phoneAttemptRecordingObjectKey } from './phone-screening/index.js';
+import {
+  planAttemptLegTimingStamp,
+  type LegTimingDropReason,
+  type WorkerLegTimingReport,
+} from '../integrations/livekit-phone-dial/worker-recording.js';
 
 export type RecordingFinalizeStatus = 'ready' | 'fallback_required' | 'pending';
 export type AttemptRecordingFinalizeStatus = RecordingFinalizeStatus;
@@ -733,6 +738,110 @@ export async function finalizeWorkerInbandAttemptRecording(
 }
 
 const recordingEgressLog = createLogger('recording-egress');
+
+export type AttemptLegTimingStampStatus =
+  | 'stamped'
+  | 'unchanged'
+  | 'attempt_not_found'
+  | 'attempt_mismatch'
+  | 'conflict'
+  | 'store_error';
+
+export interface AttemptLegTimingStampResult {
+  readonly status: AttemptLegTimingStampStatus;
+  readonly dropped: ReadonlyArray<LegTimingDropReason>;
+}
+
+const LEG_TIMING_COLUMNS = 'session_id,recording_session_id,admitted_at,answered_at,ended_at,'
+  + 'observed_ended_at,recording_started_at_ms,recording_duration_ms,recording_tail_flushed';
+
+function isoOrNull(value: unknown): string | null {
+  return typeof value === 'string' && value.length > 0 ? value : null;
+}
+
+function durationOrNull(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isSafeInteger(value)) return value;
+  if (typeof value === 'string' && /^[1-9]\d{0,9}$/.test(value)) return Number(value);
+  return null;
+}
+
+/**
+ * M013 S02 (T04) — stamp the worker's leg timing on the ATTEMPT row.
+ *
+ * Data only: it writes `observed_ended_at`, `recording_started_at_ms`,
+ * `recording_duration_ms` and `recording_tail_flushed` (0115 §1) on
+ * `phone_call_attempts`, posts no ledger event (R4: the worker posts none
+ * after consent) and never touches `call_sessions`. The rule — sanity window,
+ * earliest-end-wins, first-write-wins — is `planAttemptLegTimingStamp`; this
+ * adapter reads the row, applies the plan under a compare-and-set on every
+ * column it writes, and re-plans once on a lost race, so concurrent reports
+ * (a worker retry racing the late reporter) still converge on the same value.
+ *
+ * The attempt must be bound to the reported session (`recording_session_id`,
+ * or the legacy `session_id`), so a mismatched body cannot stamp another
+ * call's leg. Never throws.
+ */
+export async function stampWorkerAttemptLegTiming(
+  input: {
+    readonly attemptId: string;
+    readonly sessionId: string;
+    readonly report: WorkerLegTimingReport;
+    readonly now: Date;
+  },
+  deps: RecordingEgressDeps = {},
+): Promise<AttemptLegTimingStampResult> {
+  const db = deps.db ?? supabase;
+  let dropped: ReadonlyArray<LegTimingDropReason> = [];
+  try {
+    for (let round = 0; round < 2; round += 1) {
+      const { data: row, error } = await db
+        .from('phone_call_attempts')
+        .select(LEG_TIMING_COLUMNS)
+        .eq('id', input.attemptId)
+        .maybeSingle();
+      if (error) return { status: 'store_error', dropped };
+      if (!row) return { status: 'attempt_not_found', dropped };
+      const attempt = row as unknown as Record<string, unknown>;
+      if (attempt.recording_session_id !== input.sessionId && attempt.session_id !== input.sessionId) {
+        return { status: 'attempt_mismatch', dropped };
+      }
+      const current = {
+        answeredAt: isoOrNull(attempt.answered_at),
+        admittedAt: isoOrNull(attempt.admitted_at),
+        endedAt: isoOrNull(attempt.ended_at),
+        observedEndedAt: isoOrNull(attempt.observed_ended_at),
+        recordingStartedAtMs: validateEpochMsAnchor(attempt.recording_started_at_ms),
+        recordingDurationMs: durationOrNull(attempt.recording_duration_ms),
+        recordingTailFlushed: typeof attempt.recording_tail_flushed === 'boolean'
+          ? attempt.recording_tail_flushed
+          : null,
+      };
+      const plan = planAttemptLegTimingStamp(current, input.report, input.now);
+      dropped = plan.dropped;
+      if (Object.keys(plan.patch).length === 0) return { status: 'unchanged', dropped };
+
+      // Compare-and-set on exactly the columns being written: a first-write
+      // column must still be NULL, and the earliest-end column must still hold
+      // the value the plan was computed against.
+      let update = db.from('phone_call_attempts').update(plan.patch).eq('id', input.attemptId);
+      if (plan.patch.observed_ended_at !== undefined) {
+        update = current.observedEndedAt === null
+          ? update.is('observed_ended_at', null)
+          : update.eq('observed_ended_at', current.observedEndedAt);
+      }
+      if (plan.patch.recording_started_at_ms !== undefined) update = update.is('recording_started_at_ms', null);
+      if (plan.patch.recording_duration_ms !== undefined) update = update.is('recording_duration_ms', null);
+      if (plan.patch.recording_tail_flushed !== undefined) update = update.is('recording_tail_flushed', null);
+      const { data: written, error: writeError } = await update.select('id');
+      if (writeError) return { status: 'store_error', dropped };
+      if (Array.isArray(written) && written.length > 0) return { status: 'stamped', dropped };
+      // Lost a race: re-read and re-plan once against the winner's values.
+    }
+    return { status: 'conflict', dropped };
+  } catch {
+    return { status: 'store_error', dropped };
+  }
+}
 
 /**
  * M009 C9-2 (PR-C) — link the session's WORKER-INBAND attempt row to the same
