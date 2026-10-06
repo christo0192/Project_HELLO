@@ -1,18 +1,20 @@
 /**
- * THE RESULT-SINK GUARANTEE, as an executable gate.
+ * WHAT MAY REACH ASHBY, as an executable gate.
  *
- * With no tenant-verified Ashby result sink, a completed screening must park
- * durably as `writeback_pending` and NOTHING may be published:
- *   - zero `applicationFeedback.submit` calls,
+ * The scorecard IS published now that a tenant-verified form binding exists
+ * (#275). The STAGE MOVE is not, and nothing auto-rejects a candidate. So a
+ * completed screening may submit `applicationFeedback.submit` and NOTHING
+ * else:
  *   - zero `application.changeStage` calls,
  *   - zero `applicationFeedbackRequest.create` calls,
- *   - no `scorecard_write` or `stage_move` operation ever claimed or succeeded,
+ *   - no `stage_move` operation ever claimed or succeeded,
  *   - no auto-reject anywhere.
  *
- * The guarantee rests on four independent locks, each asserted here:
- *   L1 the runtime's operation worker claims `invite_delivery` and nothing else;
- *   L2 `bindFeedbackForm` fails closed without a VERIFIED binding, and nothing
- *      in the codebase produces one;
+ * Asserted here:
+ *   L1 the operation worker claims `invite_delivery` + `scorecard_write`, and
+ *      `stage_move` is the only refused type;
+ *   L2 `bindFeedbackForm` still fails closed without a VERIFIED binding, so an
+ *      unverified form can never receive a card;
  *   L3 the 0029 dependency trigger blocks a stage_move before its scorecard
  *      succeeds (asserted at the DB level in policy_tests.sql; asserted here at
  *      the orchestration level);
