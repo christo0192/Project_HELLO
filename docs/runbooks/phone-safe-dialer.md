@@ -614,3 +614,228 @@ currently *incomplete*, not that it is *unsafe*: no audio is captured without co
 machine is scored, no budget is mis-charged. But a phone screening that records the
 candidate and then scores nothing is not a finished feature, and calling P4 done without
 saying so would be the same class of error as claiming a repair I had not made.
+
+---
+
+## 13. Recording integrity (M013 S02, migration `0115`)
+
+This section covers what changed so that a phone call's recording, its length and its
+label match what happened on the line. The case that prompted it was live session
+9f60523d. The candidate answered two legs and none of the five questions. The page read
+**"Screened"** and **7m 23s on the call**. The real audio was 53 s + 18 s, and leg 1 was
+missing its last ~7 s, including Q1.
+
+### 13a. The pieces
+
+| Piece | Where | What it does |
+|---|---|---|
+| Tail flush | `app/voice-livekit/recording.py` (`_FlushingRecorderIO`, `InWorkerRecorder`) | Writes the recording tail when a leg closes. |
+| Leg-timing report | `recording.py` (`RecordingManifest`), `recording_api.py` | Sends the true audio length and the leg timing on `/recording/complete`. |
+| Leg-timing stamp | `routes/phone-worker.ts`, `lib/recording-egress.ts` (`stampWorkerAttemptLegTiming`) | Stores those facts on the attempt row. |
+| Reconciler room fallback | `integrations/livekit-phone/reconciliation.ts`, 0115 §2 | Lets the reconciler see reconnect legs. |
+| Truthful `duration_sec` | 0115 §3 | Builds a session's length from observed leg ends only (see `session-lifecycle.md`). |
+| Finalize guard and `unobserved_disconnect` | 0115 §4 | Stops a session being scored while a reconnect is pending, and labels an unobserved drop truthfully. |
+| Zero-answer relabel | 0115 §5, `assessment-handler.ts` | Labels a session with 0 answers "Abandoned: dropped before screening", never "Screened" (see `session-lifecycle.md`). |
+| Per-leg display | `routes/candidates.ts`, `lib/attempt-leg-timing.ts`, web `TranscriptionSyncWorkspace.tsx` and the candidate pages | Shows every leg with its own length, player and notes. |
+
+### 13b. `PHONE_RECORDING_TAIL_FLUSH`: the tail flush and its kill switch
+
+**The problem.** RecorderIO (livekit-agents 1.6.4) writes a bot utterance only when its
+playback finishes, and holds back the candidate's audio while bot audio is pending. When
+the candidate hangs up mid-utterance, that utterance and everything held back after it
+were never written.
+
+**The fix.** On close, the recorder writes the **played** part of the pending utterance
+and the held-back candidate audio. Then it closes as before. The cut-off is the **leg
+end**, not the session close, so bot audio the candidate never heard is not written. The
+leg end comes from these sources; the earliest one wins:
+
+1. The recorder's own `participant_disconnected` listener for this attempt's SIP
+   identity (`source=sip_left`). This is the primary source. It is a separate listener
+   from the gate's own disconnect handling.
+2. The SDK session `close` event (`source=session_close`). This is only an upper bound,
+   because the SDK emits it after its drain and transcript commit, which can be seconds
+   after the hang-up.
+3. The moment `finish()` runs (`source=finish`), as a last resort.
+
+| Value | Effect |
+|---|---|
+| unset or `on` (default) | Tail flush on. |
+| `off`, `false`, `0`, `no` or `disabled` | The plain RecorderIO, byte-for-byte the pre-S02 behaviour. |
+
+The switch lives in code (default `on`) and in `.env.example`. It is not in
+`fly.phone.toml`. The flush is **fail-open**: any error skips it, and the recording is
+still uploaded. Recording stays strictly secondary to the screening.
+
+**Rollback (no deploy needed):**
+
+```
+fly secrets set PHONE_RECORDING_TAIL_FLUSH=off --app project-hello-phone-voice
+```
+
+This restarts the phone worker machines. Remove the secret, or set it to `on`, to restore
+the flush.
+
+**Worker log lines.** They carry counts, times and categories only, never audio or
+candidate text.
+
+| Line | Meaning |
+|---|---|
+| `in_worker_recording_tail_flush out_ms= in_ms=` | The flush ran, with the bot and candidate milliseconds it wrote. |
+| `in_worker_recording_tail_flush_skipped category=` | The flush failed open. Expect about 0 of these. A steady rate means the SDK internals moved. |
+| `in_worker_recording_tail_flush_disabled` | The kill switch is off. |
+| `in_worker_recording_tail_flush_sdk_unverified version= verified=1.6.4` | The SDK is not the verified version. The flush is still attempted. Re-verify it before trusting it. |
+| `in_worker_recording_leg_end source= leg_end_ms= last_input_frame_ms= begun_at_ms=` | Which leg-end source won, as a cross-check against the last candidate audio frame. |
+| `in_worker_recording_leg_end_reopened` | The same SIP identity rejoined after a departure, so capture reopened. |
+
+The flush relies on SDK internals, which are pinned to 1.6.4. The CI step that runs
+`tests.test_recorder_flush` against the real SDK fails if those tests are skipped. **Any
+livekit-agents upgrade must re-run it.**
+
+### 13c. The leg-timing fields
+
+The worker now adds these fields to `/recording/complete`. Every one is optional, so an
+older worker's body is unchanged.
+
+| Body field | Stored on `phone_call_attempts` | Meaning |
+|---|---|---|
+| `duration_ms` | `recording_duration_ms` | The **true audio length** (samples encoded divided by the rate). It is no longer a wall-clock span. Unknown is sent as null, never 0. |
+| `recording_started_at_ms` | `recording_started_at_ms` | Epoch ms of t = 0 in the file, used to place transcript turns on that leg's audio. |
+| `leg_ended_at_ms` | `observed_ended_at` | The observed leg end (§13b). |
+| `tail_flushed` | `recording_tail_flushed` | True only when the flush ran **and** the recorder closed cleanly. |
+
+**How the API stores them:**
+
+- The stamp runs **before and independently of** the recording finalize. A `pending` or
+  `fallback_required` finalize, or the 503 `session_recording_pending` path, still keeps
+  the timing.
+- It is idempotent. `observed_ended_at` keeps the earliest value, and the other fields
+  keep the first value written. A worker retry or the late reporter cannot move them.
+- It is data only: no ledger event, no state transition, and it writes the attempt row
+  only, never `call_sessions`.
+- A legacy body, with none of the new fields, stamps nothing. Its `duration_ms` is a
+  wall-clock span and is not stored as an audio length.
+- A value outside `[answered_at − 30 s, now + 60 s]`, or outside the 0115 column limits,
+  is **dropped and logged**. The request is never rejected, so the recording is kept.
+  - Log: `schema=recording_complete_timing`, `error_category=dropped:<code>`. The codes
+    are `recording_started_at_out_of_window`, `leg_ended_at_out_of_window`,
+    `duration_out_of_range` and `no_answer_anchor`.
+  - A failed stamp logs `stamp:<status>` (`store_error`, `attempt_not_found`,
+    `attempt_mismatch`, `conflict`) or `stamp:error`. It never blocks the completion.
+- The stamp runs on the worker recording provider only.
+
+**Compatibility retry (worker side).** If an older API answers **400** with `status:
+'invalid_request'` to a body carrying the new fields, the worker re-posts the legacy body
+**once**. A rolled-back API therefore never loses a completion. The worker does not retry
+on any other status.
+
+**Display.** A leg whose `recording_tail_flushed` is not `true` shows "This recording may
+end a few seconds before the call did". The note is not shown when the connected and
+recorded lengths agree within 3 s. An older MP3 with no `recording_duration_ms` shows an
+estimated length (from the file size at 64 kbps), marked "≈".
+
+### 13d. Reconciler room fallback
+
+**The problem.** The reconciler reads LiveKit room participants by `room_name`. A
+reconnect leg was bound to its session but admitted with `room_name` NULL. The reconciler
+therefore skipped it as `no_room`, and the lease reclaim ended it about 6 minutes later
+with no outcome (9f60523d leg 2).
+
+**The fix:**
+
+- 0115 §2 stamps `room_name = 'phone-' || session_id` whenever a leg is bound to a
+  session and has no room name. Existing rows were backfilled.
+- The reconciler falls back to `phone-<session_id>` for a **bound** attempt with no room
+  name. An unbound attempt still counts as `no_room`.
+- A room LiveKit does not know:
+  - On an **answered** leg, it counts as "our participant is gone", and the reconciler
+    posts `sip.participant_left`.
+  - On a **pre-answer** leg (ringing or admitted), the room may not exist yet. The
+    reconciler skips it as `room_not_found_pre_answer` and posts nothing.
+  - Any other read error stays `room_read_failed`.
+
+**Limit.** The due-attempt reader returns only attempts whose lease is still **held**
+(240 s after the last heartbeat by default). This fix therefore works only inside the lease, and a
+lapsed lease remains the reclaim's job. `PHONE_RUNTIME_RECONCILE_MS` (default 60 000)
+must stay small enough that a tick lands inside the lease and inside LiveKit's 120 s
+empty-room timeout.
+
+**What to check.** The reconcile tick does not log its `skipped` counts today.
+- A reconnect leg that drops should end `disconnected` within about 2 reconcile ticks,
+  with `room_name` set.
+- A leg ending `abandoned` by the reclaim with no `observed_ended_at` means the fallback
+  did not catch it.
+
+### 13e. The finalize guard
+
+**The problem.** `finalize_phone_partial_sessions` completed and scored the 9f60523d
+session while the engagement was still `dialing` its next reconnect. The score was 0 of
+5, and the candidate read "Screened".
+
+**The fix.** 0115 §4 puts a guard in the sweep's WHERE clause, so a held session is not
+selected and cannot crowd others out of the window. A session is held while its
+engagement is either:
+- `reconnecting` or `dialing`; or
+- has a newer live leg that is not yet bound to the session.
+
+**The hold is bounded.** It lapses **30 minutes** (`v_reconnect_hold`) after the end, or
+the lapsed lease, of the session's latest bound leg. An engagement stuck in
+`reconnecting` cannot hold a session out of scoring and the MP3 transition indefinitely.
+The normal exit is the engagement leaving those states: a failed reconnect goes
+`eligible` within about a minute.
+
+**Known residue (owner follow-up).** A drop outside the IST window sends the engagement
+to `scheduled / window_closed`, a next-day reconnect. The guard does not cover that
+state, so such a session still finalizes before the reconnect, as it did before 0115.
+
+### 13f. The `unobserved_disconnect` label
+
+Partial finalize used to label every reclaimed or lease-lapsed leg `worker_crash`,
+meaning our side died. It now uses `unobserved_disconnect` when the leg shows **teardown
+evidence**, meaning the worker was alive at the end:
+- a verified recording upload (`recording_ready`);
+- a completed egress; or
+- an observed SIP leave (`observed_ended_at`).
+
+`worker_crash` is kept only when there is no such evidence.
+
+`unobserved_disconnect` is **not** an infrastructure fault. It grades like any other
+disconnect (`no_candidate_speech` / `partial_thin`), never `infra_interrupted`. The token
+is carried as a free string end to end, and an older API treats any value other than
+`worker_crash` as not our fault, so the two are compatible during a deploy.
+
+**What to watch:** the runtime's `phone_partial_finalize` log line carries the disconnect
+reason in `error_type`. Compare `unobserved_disconnect` against `worker_crash`. A rise in
+`worker_crash` alone is a real worker problem.
+
+### 13g. What did NOT change
+
+- **The wrong-number / wrong-person discard.** A third party's voice is still deleted
+  locally and never uploaded. Every other leg's recording is kept, whatever the consent
+  outcome, and is flagged on the server.
+- **No consent decisions.** The AI-disclosure wording, the gate and the judge belong to
+  the gate work (S01), not here.
+- **The duplicate-application hold.** It still matches only `completed` or live
+  engagements. A fresh re-application after a `failed / screening_abandoned` screen is
+  screened, following the 0114 policy that "a failed screen never blocks".
+- **Historical seed rows and session 32757295** (stuck in `waiting`, with a leg where the
+  person spoke recorded as `voicemail`). These are owner follow-ups, not handled here.
+
+### 13h. 48-hour watch after a deploy
+
+| Signal | Expect |
+|---|---|
+| `in_worker_recording_tail_flush_skipped` | About 0. |
+| `in_worker_recording_tail_flush` with `in_ms`/`out_ms` > 0 | Present on calls that ended mid-utterance. |
+| `recording_complete_timing` `dropped:*` | Rare. A burst of `leg_ended_at_out_of_window` points to worker clock skew. |
+| Reconnect legs ending `abandoned` by the reclaim with no `observed_ended_at` | About 0 inside the lease window. |
+| Finalize `examined` / `skipped` | Skips rise only while reconnects are pending, and never pin the window (no starvation). |
+| `unobserved_disconnect` vs `worker_crash` | Most reclaimed legs now read `unobserved_disconnect`. |
+
+**Rollback:**
+- **Worker:** the §13b secret. No code redeploy is needed.
+- **API:** redeploy the previous image. The worker's compatibility retry covers an older
+  API.
+- **0115 is forward-only.** The columns are additive and harmless. A DB rollback
+  re-declares the 0114 or 0076 bodies of `finalize_phone_partial_sessions`,
+  `enforce_phone_engagement_transition` and `set_phone_session_duration`.
