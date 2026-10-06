@@ -2168,6 +2168,15 @@ def build_worker_options() -> WorkerOptions:
     # byte-identical options, and this key is about the phone teardown budget.
     if _phone_agent_name() and _worker_options_accepts("shutdown_process_timeout"):
         options["shutdown_process_timeout"] = _phone_shutdown_process_timeout()
+    # R1's longer bounded finish runs only in the explicitly enabled R1 lane.
+    # Do not add either key to the legacy browser/phone WorkerOptions shape.
+    if os.getenv("R1_LANE_MODE") == "r1_only":
+        if _worker_options_accepts("drain_timeout"):
+            options["drain_timeout"] = int(os.getenv("R1_DRAIN_TIMEOUT_SEC") or "60")
+        if _worker_options_accepts("shutdown_process_timeout"):
+            options["shutdown_process_timeout"] = int(
+                os.getenv("R1_SHUTDOWN_PROCESS_TIMEOUT_SEC") or "90"
+            )
     if browser_named:
         # The browser worker becomes NAMED + explicit-dispatch. Its prewarm
         # posts machine-level readiness (ready-before-dispatch). The API
@@ -11949,6 +11958,13 @@ async def entrypoint(ctx: JobContext) -> None:
         # recorded would be invisible to the process that answers the next
         # dispatch.
         await _run_phone_entrypoint(ctx, room_identity)
+        return
+
+    # R1 is a separate browser-only lane. Keep this import after the phone
+    # return: the phone worker must neither import nor initialise R1 code.
+    if os.getenv("R1_LANE_MODE") == "r1_only":
+        import r1_session  # noqa: PLC0415 - deliberate phone isolation
+        await r1_session.run_r1_session(ctx, started_at=started_at)
         return
 
     await ctx.connect()

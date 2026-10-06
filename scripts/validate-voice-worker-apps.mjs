@@ -281,6 +281,25 @@ export function checkPhoneDrainBudget({ killTimeout, drain, shutdown }) {
   return problems;
 }
 
+/** R1 has its own shutdown budget and is never valid on the phone app. */
+export function checkR1DrainBudget({ killTimeout, drain, shutdown }) {
+  const problems = [];
+  if (drain === undefined && shutdown === undefined) return problems;
+  if (killTimeout === undefined) {
+    problems.push("fly.toml must declare kill_timeout when R1 drain settings are present");
+    return problems;
+  }
+  if (!BARE_INT_STR.test(String(drain ?? "")) || !BARE_INT_STR.test(String(shutdown ?? ""))) {
+    problems.push("fly.toml R1_DRAIN_TIMEOUT_SEC and R1_SHUTDOWN_PROCESS_TIMEOUT_SEC must be whole seconds");
+    return problems;
+  }
+  const need = Number.parseInt(drain, 10) + 2 * Number.parseInt(shutdown, 10) + PHONE_DRAIN_BUDGET_MARGIN_SEC;
+  if (need > Number.parseInt(killTimeout, 10)) {
+    problems.push(`fly.toml R1 drain budget exceeds kill_timeout: R1_DRAIN_TIMEOUT_SEC ${drain} + 2 x R1_SHUTDOWN_PROCESS_TIMEOUT_SEC ${shutdown} + ${PHONE_DRAIN_BUDGET_MARGIN_SEC} = ${need} > kill_timeout ${killTimeout}`);
+  }
+  return problems;
+}
+
 if (isMain) {
 const browser = read("fly.toml");
 const phoneCfg = read("fly.phone.toml");
@@ -300,6 +319,9 @@ ok(!hasEnvKey(browser, "BROWSER_WORKER_ONE_JOB"), "fly.toml must leave BROWSER_W
 ok(!hasEnvKey(phoneCfg, "BROWSER_WORKER_ONE_JOB"), "fly.phone.toml must NOT set BROWSER_WORKER_ONE_JOB — the one-job browser gate is never a phone setting");
 ok(!hasEnvKey(browser, "R1_READINESS_HOST"), "fly.toml must leave R1_READINESS_HOST absent: the live Cloud browser worker is already named and orchestrated, and this opt-in (post-registration readiness + the livekit_host report) is set only at the reviewed R1 cutover, after the host-aware API is deployed — shipping it in fly.toml would change the live Cloud lane and break it against an older API's strict /ready-machine schema");
 ok(!hasEnvKey(phoneCfg, "R1_READINESS_HOST"), "fly.phone.toml must NOT set R1_READINESS_HOST — the R1 readiness contract is browser-only and never a phone setting");
+for (const key of envKeys(phoneCfg)) {
+  ok(!key.startsWith("R1_"), `fly.phone.toml must NOT set ${key}; R1 belongs only to the browser worker`);
+}
 const phoneName = envValue(phoneCfg, "PHONE_AGENT_NAME");
 ok(typeof phoneName === "string" && phoneName.trim().length > 0, "fly.phone.toml must set a NON-EMPTY PHONE_AGENT_NAME (named worker)");
 
@@ -315,6 +337,7 @@ for (const [label, text] of [["fly.toml", browser], ["fly.phone.toml", phoneCfg]
 // ── 5. No secret values or trunk baked into either config ─────────────────
 const FORBIDDEN_SECRET_KEYS = [
   "GEMINI_API_KEY", "SARVAM_API_KEY",
+  "DEEPSEEK_API_KEY",
   "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
   "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "WORKER_CONTEXT_SECRET",
   // L-1: the SIP trunk is an API-side runtime secret and must never be baked
@@ -408,6 +431,16 @@ for (const [label, text, isPhone] of [["fly.toml", browser, false], ["fly.phone.
   }
   const drainNote = envValue(phoneCfg, "PHONE_DRAIN_TIMEOUT_SEC");
   notes.push(`phone_drain_timeout_sec=${drainNote === undefined ? "absent" : drainNote}`);
+}
+
+{
+  const declared = topLevelRawAll(browser, "kill_timeout");
+  const killTimeout = declared.length === 1 && /^[0-9]+$/.test(declared[0]) ? declared[0] : undefined;
+  for (const problem of checkR1DrainBudget({
+    killTimeout,
+    drain: envValue(browser, "R1_DRAIN_TIMEOUT_SEC"),
+    shutdown: envValue(browser, "R1_SHUTDOWN_PROCESS_TIMEOUT_SEC"),
+  })) ok(false, problem);
 }
 
 // ── 5c. Deployment region contract (PR104) ───────────────────────────────

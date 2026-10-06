@@ -1,4 +1,5 @@
 app = "project-hello-voice"
+kill_timeout = 300
 # Region: `sin` — where this app's machine already runs. The value said `bom`
 # until PR104, which was stale rather than harmless: primary_region is read when
 # a resource is CREATED, so a scale-up or machine re-creation would have tried a
@@ -22,6 +23,14 @@ primary_region = "sin"
   SARVAM_TTS_MODEL = "bulbul:v3"
   SARVAM_TTS_VOICE = "simran"
   LIVEKIT_WORKER_DRAIN_SEC = "10"
+  # R1 is shipped dormant until legacy browser retirement and staged secrets.
+  R1_LANE_MODE = "off"
+  R1_LLM_MODEL = "deepseek-flash"
+  R1_LLM_BASE_URL = "https://api.deepseek.com/v1"
+  R1_SESSION_MAX_RESIDENCY_SEC = "1800"
+  R1_REJOIN_GRACE_SEC = "90"
+  R1_DRAIN_TIMEOUT_SEC = "60"
+  R1_SHUTDOWN_PROCESS_TIMEOUT_SEC = "90"
   CANDIDATE_SILENCE_PROMPT_SEC = "30"
   CANDIDATE_SILENCE_END_SEC = "20"
   PHONE_TERMINAL_REPLY_TIMEOUT_SEC = "10"

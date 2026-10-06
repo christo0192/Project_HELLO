@@ -148,7 +148,7 @@ jobs:
           path: sbom-artifacts/*.cdx.json
           retention-days: 90
       - name: Compile LiveKit worker
-        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/noise_suppression.py app/voice-livekit/phone.py app/voice-livekit/phone_canary.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py
+        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/noise_suppression.py app/voice-livekit/phone.py app/voice-livekit/phone_canary.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py app/voice-livekit/r1_context.py app/voice-livekit/r1_lines.py app/voice-livekit/r1_llm.py app/voice-livekit/r1_persistence.py app/voice-livekit/r1_phases.py app/voice-livekit/r1_session.py
       - name: Test LiveKit worker
         run: cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v
       # Phone RNNoise (noise_suppression.py): the bare-python step above SKIPS
