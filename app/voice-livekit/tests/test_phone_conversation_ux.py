@@ -150,6 +150,26 @@ class ConversationGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spoken.count(draft), 1)
         self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, spoken)
 
+    async def test_a_consent_draft_composed_during_identity_is_never_spoken_on_a_callback(self):
+        # M013 S01 T08a: the consent line is composed while the identity reply
+        # is judged; a busy reply takes the calendar route and the draft is
+        # discarded unheard.
+        draft = ("Before we start, one quick note. " + phone.PHONE_DISCLOSURE_RECORDING_SENTENCE
+                 + " Is it okay to continue?")
+        self.assertTrue(phone.phone_opening_draft_verified(draft, identity_done=True))
+        result, _, spoken, _, _ = await self.gate(
+            ["I'm driving", "tomorrow at 3 pm"], draft=draft, identity=True)
+        self.assertEqual(result.outcome, phone.HALT_CALLBACK_SCHEDULED)
+        self.assertNotIn(draft, spoken)
+        self.assertFalse(any(phone.PHONE_DISCLOSURE_RECORDING_SENTENCE in s for s in spoken))
+
+    async def test_a_consent_draft_composed_during_identity_is_spoken_once_on_consent(self):
+        draft = ("Before we start, one quick note. " + phone.PHONE_DISCLOSURE_RECORDING_SENTENCE
+                 + " Is it okay to continue?")
+        _, _, spoken, _, _ = await self.gate(["Yes, speaking", "No thanks"], draft=draft, identity=True)
+        self.assertEqual(spoken.count(draft), 1)
+        self.assertNotIn(phone.PHONE_DISCLOSURE_CONTINUATION_TEXT, spoken)
+
     async def test_playout_failure_does_not_replay_an_opener(self):
         with self.assertRaisesRegex(RuntimeError, "playout"):
             await self.gate(["No thanks"], say_error=True)

@@ -13198,12 +13198,23 @@ class TestOpeningSubscribeReadiness(unittest.IsolatedAsyncioTestCase):
         # future so a timeout here cannot cancel the SDK's own subscription.
         self.assertIn("asyncio.wait_for", src)
         self.assertIn("asyncio.shield(subscribed_fut)", src)
-        # And it happens BEFORE the generation, so it overlaps the pre-opening
-        # work rather than being paid on the first spoken frame.
+        # M013 S01 T08a: the compose no longer waits for it; it runs
+        # ALONGSIDE it (`_compose_alongside_subscription`), which still awaits
+        # the wait before handing the draft to the gate, so nothing is spoken
+        # before the subscription settles. The behaviour is pinned in
+        # tests/test_phone_opening_latency.py (TestComposeTimeout).
+        self.assertIn("_compose_alongside_subscription(", src)
+        self.assertIn("_await_output_subscription,", src)
+        helper = inspect.getsource(agent_mod._compose_alongside_subscription)
         self.assertLess(
-            src.index("subscribed_fut"),
-            src.index("session.llm.chat("),
-            "the subscription wait must precede the generate() call",
+            helper.index("ensure_future(compose())"),
+            helper.index("await await_subscription()"),
+            "the compose must start before the subscription wait",
+        )
+        self.assertLess(
+            helper.index("await await_subscription()"),
+            helper.index("return await task"),
+            "the draft is returned only after the subscription wait",
         )
 
     async def test_opening_subscription_wait_is_fail_open(self):

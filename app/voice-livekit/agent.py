@@ -1736,6 +1736,126 @@ _GATE_QUIESCENCE_WAIT_MAX_SEC = 6.0
 #: T14 and expects it far below this).
 _RECORDING_ANCHOR_RAISE_MAX_MS = 3000
 
+#: A composed gate line longer than this is abandoned mid-stream (the gate's
+#: validators reject anything longer anyway).
+_GATE_COMPOSE_MAX_CHARS = 650
+
+
+async def _compose_gate_draft(
+    llm: Any, instructions: str, *, timeout_sec: float,
+    chat_context_factory: Callable[[], Any] | None = None,
+    schema: str = "gate",
+) -> str | None:
+    """Buffer ONE gate line from the session's model: no tools, no records.
+
+    M013 S01 T08a. The gate validates the draft before `say`, so no generated
+    token reaches TTS here; cancellation (or the cap) closes the provider
+    stream. Bounded by ``timeout_sec`` (`PHONE_GATE_COMPOSE_TIMEOUT_SEC`,
+    formerly a fixed 4 s). Returns the draft, "" for an over-long one, or None
+    when nothing usable arrived; every outcome is logged as
+    `phone_gate_compose` (`composed_ok`, `timeout`, `rejected_too_long`,
+    `unavailable`) with its duration and never the text.
+    """
+    started = time.monotonic()
+    overflowed = [False]
+
+    def _log_compose(category: str) -> None:
+        _log.info(
+            "unknown_event", error_type="phone_gate_compose",
+            error_category=category, schema=schema,
+            duration_ms=int(round((time.monotonic() - started) * 1000)),
+        )
+
+    try:
+        if chat_context_factory is None:
+            from livekit.agents.llm import ChatContext
+
+            chat_context_factory = ChatContext
+        chat = chat_context_factory()
+        chat.add_message(role="system", content=instructions)
+        chat.add_message(role="user", content="Write only the short spoken line.")
+
+        async def collect() -> str:
+            parts: list[str] = []
+            async with llm.chat(chat_ctx=chat, tools=[]) as stream:
+                async for chunk in stream:
+                    delta = getattr(chunk, "delta", None)
+                    content = getattr(delta, "content", None)
+                    if isinstance(content, str):
+                        parts.append(content)
+                        if sum(map(len, parts)) > _GATE_COMPOSE_MAX_CHARS:
+                            overflowed[0] = True
+                            return ""
+            return "".join(parts).strip()
+
+        draft = await asyncio.wait_for(collect(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        _log_compose("timeout")
+        _log.info("unknown_event", error_type="phone_opening_fallback",
+                  error_category="draft_unavailable")
+        return None
+    except Exception:  # noqa: BLE001 — every miss is the fixed line
+        _log_compose("unavailable")
+        _log.info("unknown_event", error_type="phone_opening_fallback",
+                  error_category="draft_unavailable")
+        return None
+    _log_compose(
+        "composed_ok" if draft
+        else "rejected_too_long" if overflowed[0]
+        else "rejected_empty"
+    )
+    return draft
+
+
+async def _compose_alongside_subscription(
+    compose: Callable[[], Awaitable[str | None]],
+    await_subscription: Callable[[], Awaitable[None]],
+) -> str | None:
+    """Compose a gate line WHILE the SIP output subscription settles.
+
+    M013 S01 T08a (roadmap 10). The compose used to start only after the
+    (bounded) subscription wait, so the first line of the call paid both in
+    series. Neither needs the other: the draft is private text and the wait
+    only guards the first spoken frame. Run together, the line is ready after
+    the longer of the two, never their sum. The draft is still returned only
+    after the wait, so nothing is spoken before the subscription settles.
+    """
+    task = asyncio.ensure_future(compose())
+    try:
+        await await_subscription()
+        return await task
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+def _consent_line_starts(draft: Any) -> set[str]:
+    """The first audible piece(s) of a COMPOSED consent line, for the metric.
+
+    T08a: the gate speaks a validated composed line split at the recording
+    sentence (`phone_split_consent_line`), so its first piece is part A, or
+    the whole line when the sentence opens it. Empty for anything else.
+    """
+    if not isinstance(draft, str) or not draft.strip():
+        return set()
+    part_a, _ = phone.phone_split_consent_line(draft.strip())
+    starts = {draft.strip()}
+    if part_a.strip():
+        starts.add(part_a.strip())
+    return starts
+
+
+def _is_disclosure_line_start(text: Any, composed_starts: set[str]) -> bool:
+    """Is ``text`` the first audible piece of the consent (disclosure) line?
+
+    The fixed lines (`phone.phone_disclosure_line_start`) or, since T08a, a
+    composed consent line, so `voice_phone_participant_to_disclosure_sec`
+    stops missing every call that speaks a composed line.
+    """
+    if phone.phone_disclosure_line_start(text):
+        return True
+    return isinstance(text, str) and text.strip() in composed_starts
+
 
 class _GateRecordingAnchor:
     """When the recording sentence of the consent line was heard (ms).
@@ -11474,6 +11594,11 @@ async def _run_phone_session(
     # SDK, so a wall-clock overrun can interrupt it and check its playout
     # drained before saying goodbye (`_speak_gate_goodbye_bounded`).
     gate_speech_holder: list[Any] = [None]
+    # M013 S01 T08a: the first audible pieces of every COMPOSED consent line
+    # (filled by `speak_opening`), so the disclosure-latency metric covers a
+    # composed line, not only the two fixed ones; and its once-per-call latch.
+    composed_consent_starts: set[str] = set()
+    disclosure_metric_emitted: list[bool] = [False]
 
     async def say(text: str) -> None:
         started_ms = int(round(time.time() * 1000))
@@ -11508,9 +11633,13 @@ async def _run_phone_session(
         _note_first_gate_audio(started_ms)
         # T05: the gate now speaks the fixed disclosure in two halves; its
         # first half starts the line, so it carries the metric.
-        if phone.phone_disclosure_line_start(text) and participant_present_anchor[0] is not None:
+        # T08a: so does a composed consent line's first piece; once per call.
+        if (not disclosure_metric_emitted[0]
+                and _is_disclosure_line_start(text, composed_consent_starts)
+                and participant_present_anchor[0] is not None):
             delta_ms = started_ms - participant_present_anchor[0]
             if delta_ms >= 0:
+                disclosure_metric_emitted[0] = True
                 _safe_emit(histogram_metric, "voice_phone_participant_to_disclosure_sec", delta_ms / 1000.0, {"channel": "phone"})
 
     def on_candidate_turn(text: str, message: Any = None, turn_ctx: Any = None) -> None:
@@ -11941,39 +12070,29 @@ async def _run_phone_session(
         gate_capture.stop()
         gate_judge_wiring.stop()
 
-    async def _compose_gate_line(instructions: str) -> str | None:
+    async def _compose_gate_line(instructions: str, *, schema: str = "identity") -> str | None:
         """Buffer the session's own model, with no tools or candidate records.
 
         The gate validates the draft before calling say. No generated tokens
         enter TTS here, and cancellation closes the provider stream.
+
+        M013 S01 T08a: capped by `PHONE_GATE_COMPOSE_TIMEOUT_SEC` (was a fixed
+        4 s) and composed CONCURRENTLY with the output-subscription wait, so
+        the first line of the call waits for the longer of the two, not both.
         """
-        await _await_output_subscription()
         if phone.phone_deterministic_opener():
+            await _await_output_subscription()
             return None
-        try:
-            from livekit.agents.llm import ChatContext
-
-            chat = ChatContext()
-            chat.add_message(role="system", content=instructions)
-            chat.add_message(role="user", content="Write only the short spoken line.")
-
-            async def collect() -> str:
-                parts: list[str] = []
-                async with session.llm.chat(chat_ctx=chat, tools=[]) as stream:
-                    async for chunk in stream:
-                        delta = getattr(chunk, "delta", None)
-                        content = getattr(delta, "content", None)
-                        if isinstance(content, str):
-                            parts.append(content)
-                            if sum(map(len, parts)) > 650:
-                                return ""
-                return "".join(parts).strip()
-
-            return await asyncio.wait_for(collect(), timeout=4.0)
-        except Exception:
-            _log.info("unknown_event", error_type="phone_opening_fallback",
-                      error_category="draft_unavailable")
-            return None
+        return await _compose_alongside_subscription(
+            lambda: _compose_gate_draft(
+                # No LLM on the session is a compose miss (the fixed line),
+                # inside the helper's own error handling, as before.
+                getattr(session, "llm", None), instructions,
+                timeout_sec=phone.phone_gate_compose_timeout_sec(),
+                schema=schema,
+            ),
+            _await_output_subscription,
+        )
 
     async def speak_opening() -> str | None:
         """Compose a private opening draft; the gate validates and speaks it.
@@ -11987,12 +12106,19 @@ async def _run_phone_session(
         # them and said who we are, so this turn must not do it again — the
         # #279 "double-Hi", one turn earlier. The fixed fallback handles the
         # same case via `PHONE_DISCLOSURE_CONTINUATION_TEXT`.
+        #
+        # M013 S01 T08a: VERDICT-NEUTRAL. This line is now composed while the
+        # identity reply is still being judged, so the model must not react to
+        # that reply: no acknowledgement, no "thanks for confirming". The same
+        # line then fits every route that reaches consent.
         if phone.phone_gate_flow() == "conversational":
             greeting_clause = (
                 "You have ALREADY greeted this candidate and told them who you "
                 "are on the previous turn, so do NOT introduce yourself again "
-                "and do NOT say hello again. Continue naturally from their "
-                "answer. You MUST include this exact sentence "
+                "and do NOT say hello again. Do NOT acknowledge, thank, or "
+                "react to what they just said (no \"thanks for confirming\", "
+                "no \"great\"): go straight to the point. You MUST include "
+                "this exact sentence "
             )
         else:
             greeting_clause = (
@@ -12011,12 +12137,16 @@ async def _run_phone_session(
             "MUST END with the consent question (for example, \"Is it okay to "
             "continue?\") so a simple yes or no answers it."
         )
-        # Warm the output track for both model-composed and rollback openings.
-        # The gate validates the private draft before any audio is emitted.
-        await _await_output_subscription()
-        if phone.phone_deterministic_opener():
-            return None
-        return await _compose_gate_line(opening_instructions)
+        # Warm the output track for both model-composed and rollback openings
+        # (`_compose_gate_line` awaits it on both paths; T08a runs the compose
+        # alongside it rather than after it, which matters when this is the
+        # first line of the call). The gate validates the private draft before
+        # any audio is emitted.
+        draft = await _compose_gate_line(opening_instructions, schema="consent")
+        # T08a: a composed consent line's first audible piece also carries the
+        # disclosure-latency metric (see `say`).
+        composed_consent_starts.update(_consent_line_starts(draft))
+        return draft
 
     async def speak_role_opening(role_title: str) -> str | None:
         """Author the role-opening OUT OF BAND, validate it, then speak it.

@@ -1526,6 +1526,19 @@ def phone_output_subscribe_timeout_sec() -> float:
     return _bounded_float(os.getenv("PHONE_OUTPUT_SUBSCRIBE_TIMEOUT_SEC"), 8.0, 0.5, 30.0)
 
 
+def phone_gate_compose_timeout_sec() -> float:
+    """Cap on composing ONE gate line (identity ask, consent line) privately.
+
+    M013 S01 T08a (roadmap 10). The compose is a buffered, tool-less draft the
+    gate validates before speaking, and every miss already falls back to a
+    fixed line, so waiting longer only ever buys silence on the call. The old
+    hard-coded 4 s cap could hold the first word of the call for 4 s on a slow
+    provider. Default 1.5 s; clamped to 0.5–4.0 (4.0 is the old cap); garbage
+    is the default.
+    """
+    return _bounded_float(os.getenv("PHONE_GATE_COMPOSE_TIMEOUT_SEC"), 1.5, 0.5, 4.0)
+
+
 def phone_classify_timeout_sec() -> float:
     """Bounded wall clock BACKSTOP for the whole human/machine decision.
 
@@ -7560,35 +7573,89 @@ def _opening_is_verified(text: Any) -> bool:
     return True
 
 
-def phone_opening_draft_verified(text: Any, *, identity_done: bool = False) -> bool:
-    """Check an UNSPOKEN draft; no model text reaches TTS before this passes."""
+def phone_opening_draft_rejection(
+    text: Any, *, identity_done: bool = False,
+) -> Optional[str]:
+    """Why an UNSPOKEN consent draft is rejected, or None when it passes.
+
+    M013 S01 T08a: the checks of `phone_opening_draft_verified`, unchanged and
+    in the same order, returning a fixed reason so a rejected draft is logged
+    with it (`phone_gate_compose/rejected_<reason>`). The AI checks are the
+    same expressions as before (owner constraint 2).
+    """
+    if not isinstance(text, str) or not text.strip():
+        return "empty"
     if not _opening_is_verified(text):
-        return False
+        return "unverified"
     clean = text.strip()
-    if len(clean) > 650 or clean.count("?") != 1:
-        return False
+    if len(clean) > 650:
+        return "too_long"
+    if clean.count("?") != 1:
+        return "question_count"
     # Keep the disclosure contract while allowing the introduction and question
     # to be naturally authored. A mention of 'record' alone is not disclosure.
     if PHONE_DISCLOSURE_RECORDING_SENTENCE not in clean:
-        return False
+        return "no_recording_sentence"
     # M013 S01 T05: the notice must be heard BEFORE the question. A "yes" to
     # a question asked ahead of the recording sentence was not informed, and
     # the grant guards (which time evidence against the sentence) would
     # re-ask it. Both fixed lines already put the sentence first.
     if clean.find("?") < clean.find(PHONE_DISCLOSURE_RECORDING_SENTENCE):
-        _log.info(
-            "unknown_event", error_type="phone_gate_compose",
-            error_category="rejected_order",
-        )
-        return False
+        return "order"
     if _OPENING_IDENTITY_CUE_RE.search(clean):
-        return False
+        return "identity_question"
     if not identity_done and not (
         "christy" in clean.lower() and "ai" in clean.lower().split()
         and _COMPANY.lower() in clean.lower()
     ):
-        return False
-    return not any(token in clean for token in ("```", "**", "<", ">"))
+        return "no_ai_introduction"
+    if any(token in clean for token in ("```", "**", "<", ">")):
+        return "markup"
+    return None
+
+
+def phone_opening_draft_verified(text: Any, *, identity_done: bool = False) -> bool:
+    """Check an UNSPOKEN draft; no model text reaches TTS before this passes.
+
+    A draft that was composed (a non-empty string) and fails is logged as
+    `phone_gate_compose/rejected_<reason>` (T05's `rejected_order` is one of
+    them); a missing draft is the compose's own `timeout`/`unavailable` and
+    is not logged twice.
+    """
+    reason = phone_opening_draft_rejection(text, identity_done=identity_done)
+    if reason is None:
+        return True
+    if reason != "empty":
+        _log.info(
+            "unknown_event", error_type="phone_gate_compose",
+            error_category=f"rejected_{reason}", schema="consent",
+        )
+    return False
+
+
+def phone_identity_draft_rejection(text: Any, *, introduced: bool) -> Optional[str]:
+    """Why an UNSPOKEN identity-ask draft is rejected, or None when it passes.
+
+    M013 S01 T08a: the exact checks `run_phone_gate` applied inline, in the
+    same order, returning a fixed reason for the log. ``introduced`` is True
+    when the call already heard the bot introduce itself (an earlier gate
+    line), which waives the introduction check exactly as before.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return "empty"
+    if len(text) > 650:
+        return "too_long"
+    if text.count("?") != 1:
+        return "question_count"
+    if not _identity_line_asks_identity(text):
+        return "no_identity_ask"
+    if not introduced and not (
+        "christy" in text.lower()
+        and re.search(r"\bAI\b", text, re.IGNORECASE)
+        and _COMPANY.lower() in text.lower()
+    ):
+        return "no_ai_introduction"
+    return None
 
 
 async def run_phone_gate(
@@ -7829,6 +7896,52 @@ async def run_phone_gate(
         if gate_phase_out is not None:
             gate_phase_out[name] = True
 
+    # ── M013 S01 T08a: the consent line, composed ahead ───────────────────
+    # The consent draft is composed the moment the identity reply's turn
+    # closes, CONCURRENTLY with the identity verdict (the judge round trip),
+    # instead of after it. It is composed verdict-neutrally (see the agent's
+    # `speak_opening`), so it fits whatever the verdict is, and it is
+    # DISCARDED (cancelled, never spoken) on every route that does not reach
+    # the consent question. It is private text: nothing is spoken or sent to
+    # the candidate before the gate validates it, exactly as before.
+    consent_draft: list[Optional["asyncio.Future[Optional[str]]"]] = [None]
+
+    def _discard_consent_draft(reason: str) -> None:
+        task = consent_draft[0]
+        consent_draft[0] = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        elif not task.cancelled():
+            task.exception()  # retrieved: a failed draft is never an unhandled error
+        _log.info(
+            "unknown_event", error_type="phone_gate_compose",
+            error_category="consent_draft_discarded", schema=reason,
+        )
+
+    def _start_consent_draft() -> None:
+        _discard_consent_draft("superseded")
+        if compose_opening is None:
+            return
+        try:
+            consent_draft[0] = asyncio.ensure_future(compose_opening())
+        except Exception:  # noqa: BLE001 — no head start; the consent turn composes inline
+            consent_draft[0] = None
+
+    async def _take_consent_draft() -> Optional[str]:
+        """The consent draft: the one composed ahead, else composed now."""
+        task = consent_draft[0]
+        consent_draft[0] = None
+        if task is None:
+            return await compose_opening()  # type: ignore[misc]
+        try:
+            return await task
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a failed draft is the fixed line
+            return None
+
     # M009 E6: the backgrounded `call.answered` lives here. Empty on every path
     # that awaits it inline (presence, bounce), so `_await_answered_post` is a
     # no-suspension no-op there.
@@ -7858,6 +7971,8 @@ async def run_phone_gate(
         outcomes have never done so, and a caller that needs to commit does it
         explicitly before calling here.
         """
+        # T08a: a terminal never reaches the consent question.
+        _discard_consent_draft("terminal")
         # Privacy disposition is content-free and must be latched before any
         # terminal API call or courtesy speech can raise/cancel. The worker
         # must discard even if the terminal post never returns a result.
@@ -8519,17 +8634,16 @@ async def run_phone_gate(
         _ask_barrier()
         if compose_gate_line is not None:
             draft = await compose_gate_line(instruction)
-            valid = (
-                isinstance(draft, str) and len(draft) <= 650
-                and draft.count("?") == 1
-                and _identity_line_asks_identity(draft)
-                and (gate_turns or (
-                    "christy" in draft.lower()
-                    and re.search(r"\bAI\b", draft, re.IGNORECASE)
-                    and _COMPANY.lower() in draft.lower()
-                ))
-            )
-            line = draft.strip() if valid else fixed_line
+            # T08a: the same checks, now with a reason for the log. A missing
+            # draft (None, "") is the compose's own timeout/unavailable log.
+            rejection = phone_identity_draft_rejection(
+                draft, introduced=bool(gate_turns))
+            if rejection is not None and rejection != "empty":
+                _log.info(
+                    "unknown_event", error_type="phone_gate_compose",
+                    error_category=f"rejected_{rejection}", schema="identity",
+                )
+            line = draft.strip() if rejection is None else fixed_line  # type: ignore[union-attr]
             await _say(line)
             gate_turns.append({"speaker": "bot", "text": line})
             reply = await next_candidate_turn()
@@ -8622,6 +8736,7 @@ async def run_phone_gate(
         M013 S01 T06: the conversation itself is
         `converse_callback_before_consent`; this posts and speaks its end.
         """
+        _discard_consent_draft("callback")  # T08a: no consent question follows
         await _await_answered_post()
         end = await converse_callback_before_consent(
             first_reply,
@@ -8737,11 +8852,22 @@ async def run_phone_gate(
             phone_identity_text(candidate_name),
         )
         identity_reply = first_reply
-        routed = await _identity_route(first_reply, stage="first")
+        # T08a: the reply's turn has closed; compose the consent line while
+        # the identity verdict is worked out.
+        _start_consent_draft()
+        try:
+            routed = await _identity_route(first_reply, stage="first")
+        except BaseException:
+            _discard_consent_draft("gate_error")
+            raise
         if isinstance(routed, PhoneGateResult):
+            _discard_consent_draft("terminal")
             return routed
         identity_verdict = routed
         if identity_verdict == PHONE_IDENTITY_OTHER:
+            # T08a: the re-ask is not the consent question; its own reply
+            # starts a fresh draft.
+            _discard_consent_draft("identity_reask")
             # ONE confirming re-ask, never more. The person who says "no, this
             # is her father" may equally be the candidate correcting a mangled
             # name, so the first verdict alone may not end a call.
@@ -8754,8 +8880,14 @@ async def run_phone_gate(
                 phone_identity_reask_text(candidate_name),
             )
             identity_reply = second_reply
-            routed = await _identity_route(second_reply, stage="reask")
+            _start_consent_draft()
+            try:
+                routed = await _identity_route(second_reply, stage="reask")
+            except BaseException:
+                _discard_consent_draft("gate_error")
+                raise
             if isinstance(routed, PhoneGateResult):
+                _discard_consent_draft("terminal")
                 return routed
             identity_verdict = routed
             # The re-ask verdict stands on its own, and DELIBERATELY is not
@@ -8765,6 +8897,10 @@ async def run_phone_gate(
             # proceeded to read the recording disclosure to the father instead
             # of taking the callback path. Fail-open is already provided by the
             # verdict vocabulary itself: only `other_person` ends the call.
+
+    if identity_verdict in (PHONE_IDENTITY_UNAVAILABLE, PHONE_IDENTITY_OTHER):
+        # T08a: neither route asks the consent question.
+        _discard_consent_draft(f"identity_{identity_verdict}")
 
     if identity_verdict == PHONE_IDENTITY_UNAVAILABLE:
         if classify_gate_reply is not None:
@@ -8883,7 +9019,8 @@ async def run_phone_gate(
 
     # ── The opening: model-generated-and-verified, or the fixed disclosure ─
     if compose_opening is not None:
-        draft = await compose_opening()
+        # T08a: usually composed already, during the identity verdict.
+        draft = await _take_consent_draft()
         line = (
             draft.strip() if phone_opening_draft_verified(draft, identity_done=identity_ran)
             else _fixed_disclosure_text()
@@ -10429,6 +10566,52 @@ async def _default_phone_interviewer_text(instruction: str) -> str | None:
         return None
 
 
+def phone_prefix_warm_request_body(system_prefix: str) -> dict[str, Any]:
+    """The prefix-cache warm-up request: the prompt as the SYSTEM message.
+
+    M013 S01 T08a. The session's LLM requests open with the screening prompt
+    as their system message, and DeepSeek caches by rendered-prompt prefix, so
+    only a request that also opens with it as the system message can seed
+    their cache. A one-character user turn makes the request valid; one
+    output token, discarded, keeps the cost to the prefill.
+    """
+    body: dict[str, Any] = {
+        "model": phone_primary_model(),
+        "temperature": 0,
+        "max_tokens": 1,
+        "messages": [
+            {"role": "system", "content": system_prefix},
+            {"role": "user", "content": "."},
+        ],
+    }
+    effort = phone_llm_reasoning_effort()
+    if effort is not None:
+        body["reasoning_effort"] = effort
+    return body
+
+
+async def _warm_phone_system_prefix(system_prefix: str) -> None:
+    """POST `phone_prefix_warm_request_body` to the interviewer. Never raises."""
+    api_key = phone_llm_api_key()
+    if not api_key:
+        return
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "Cache-Control": "no-store",
+    }
+    try:
+        await call_with_breaker(
+            "POST", _phone_interviewer_chat_url(),
+            breaker=_PHONE_COVERAGE_BREAKER,
+            transport=_phone_coverage_transport(),
+            headers=headers, json_body=phone_prefix_warm_request_body(system_prefix),
+            endpoint_hint="unknown", log_failures=False,
+        )
+    except Exception:  # noqa: BLE001 — a warm-up never surfaces on the call
+        return
+
+
 #: Bound on the Gemini connection warm-up. It runs off the speech path and is
 #: discarded, so the only cost of expiry is the cold turn it was avoiding.
 PHONE_GOOGLE_WARMUP_TIMEOUT_SEC = 6.0
@@ -10554,7 +10737,14 @@ async def phone_warm_prefix_cache(
     prefix = str(system_prefix or "").strip()
     if not prefix:
         return
-    infer_fn = infer or _default_phone_interviewer_text
+    # M013 S01 T08a: the default sends the prefix as the SYSTEM message, the
+    # role the session's own requests give it. Sent as a USER message (the
+    # pre-T08a default) the chat template puts a user-role marker before the
+    # prompt, so the rendered request did not share the real requests' prefix
+    # and could not seed their cache. That gap was hidden while every
+    # pre-consent turn ran a real (discarded) generation on the main prompt;
+    # T08a removed those calls, so this warm-up is now the only one.
+    infer_fn = infer or _warm_phone_system_prefix
     try:
         # We only need DeepSeek to READ (and cache) the prefix; the generated
         # continuation is irrelevant, so discard whatever comes back.
@@ -15279,6 +15469,27 @@ def phone_agent_class(agent_base: Any) -> Any:
                     return content
                 return chunk if isinstance(chunk, str) else ""
 
+            # ── M013 S01 T08a: no stray pre-consent generation (roadmap 11) ──
+            # Before consent the SDK still schedules a reply for every
+            # committed candidate turn ("Hello?", the identity answer, the
+            # consent reply). Its output was always discarded unheard, yet the
+            # model call ran in full: a wasted generation per gate turn, and a
+            # speech that held the SDK's queue while it streamed, so the next
+            # gate line could wait behind it. Return BEFORE `super().llm_node`
+            # so no request is made at all. An empty async generator is a
+            # normal empty reply to the SDK: nothing is spoken, the empty
+            # assistant item is never persisted (`_on_phone_item` drops empty
+            # text), and the user turn is still committed and buffered as a
+            # gate row, which `StopResponse` from the turn hook would not do.
+            # The main prompt's DeepSeek prefix cache is warmed on its own
+            # (`phone_warm_prefix_cache`), not as a side effect of this call.
+            if not self._screening_authorized and not self._gate_opening:
+                _log.info(
+                    "unknown_event", error_type="phone_llm_node",
+                    error_category="preconsent_generation_skipped",
+                )
+                return
+
             generation_ctx = bounded_phone_chat_context(chat_ctx)
             # F-B: the phone OpenAI-compat lane (DeepSeek/Sarvam etc.) rejects the
             # `developer` role with a non-retryable 400. Rewrite it to `system`
@@ -15630,14 +15841,11 @@ def phone_agent_class(agent_base: Any) -> Any:
             result = super().llm_node(generation_ctx, tools, model_settings)
             if inspect.isawaitable(result):
                 result = await result
-            if not self._screening_authorized:
-                # Gemini still participates in the consent-response turn, but
-                # its speculative output is structurally unschedulable and is
-                # discarded before playout/recording. The deterministic
-                # classifier remains the sole authorization authority.
-                async for _ in result:
-                    pass
-                return
+            # (T08a) The pre-consent speculative generation that used to be
+            # drained and discarded here no longer runs: `llm_node` returns at
+            # its top before consent, so this point is reached only after
+            # `authorize_screening`. The deterministic gate remains the sole
+            # consent authority.
 
             objective = self._generation_objective
             if (
