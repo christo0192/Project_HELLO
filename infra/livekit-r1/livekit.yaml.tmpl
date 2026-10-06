@@ -8,11 +8,8 @@ rtc:
   use_external_ip: false
   node_ip: "__NODE_IP__"
   allow_tcp_fallback: true
-  # S0-F1 / memo §3.3: LiveKit enumerates only this address, so its UDP mux
-  # receives and replies through Fly's fly-global-services address.
-  ips:
-    includes:
-      - "__FLY_GLOBAL_SERVICES__/32"
+  # Config B only: entrypoint replaces the marker with rtc.ips.includes.
+__RTC_IPS__
 
 room:
   auto_create: false

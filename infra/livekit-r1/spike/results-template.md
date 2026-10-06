@@ -17,7 +17,7 @@ remote host/port, join latency, and a link to the sanitized stats JSON.
 
 | Step | Required evidence | Result |
 |---|---|---|
-| S0-F1 | `ss -ulpn` shows `<fly-global-services>:7882`; selected pair is UDP to dedicated-IP:7882 | |
+| S0-F1 | Config A first: selected pair is UDP to dedicated-IP:7882. If A fails (including forced TCP), record why before Config B; Config-B only: `ss -ulpn` shows `<fly-global-services>:7882` | |
 | S0-F2 | Laptop + forced TCP join; 20 stop→start cycles; UDP first join 20/20; wake p95 ≤5s | |
 | S0-F3 | 20 cold + 20 warm dispatches; agent joins 40/40; worker-to-SFU RTT p95 <5ms | |
 | S0-F4 | Matrix above, at least 15 joins/cell and 150 total, matched Cloud baseline | |
@@ -31,4 +31,4 @@ remote host/port, join latency, and a link to the sanitized stats JSON.
 - Blind A/B ≥4/5 and within 0.5 of Cloud; video ≥12fps in ≥95% samples, no >2s freeze, bandwidth limitation <10%, PLI <1/min.
 - Handover/short airplane resume ≥9/10; no >2s gap in long sessions; CPU throttle zero at three sessions; Cloud switch/back <15 minutes.
 
-Any S0-F1 failure is NO-GO. A corporate failure requires tested external TURN (T3) or NO-GO.
+Any run without a selected UDP pair is NO-GO. Config B is allowed only after a documented Config-A failure, including forced TCP. A corporate failure requires tested external TURN (T3) or NO-GO.

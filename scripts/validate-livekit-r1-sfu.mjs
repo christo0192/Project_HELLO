@@ -32,7 +32,7 @@ function oneTopLevel(text, key) {
   return values[0] ?? null;
 }
 function serviceBlocks(text) {
-  const marks = [...text.matchAll(/^\[\[services\]\]\s*$/gm)].map((m) => m.index);
+  const marks = [...text.matchAll(/^[ \t]*\[\[services\]\][ \t]*(?:#.*)?$/gm)].map((m) => m.index);
   return marks.map((start, index) => text.slice(start, marks[index + 1] ?? text.length));
 }
 function serviceShape(block) {
@@ -70,13 +70,33 @@ ok(/\[metrics\][\s\S]*?port\s*=\s*6789/.test(toml), "Prometheus metrics must be 
 ok(/http_checks[\s\S]*?method\s*=\s*"get"[\s\S]*?path\s*=\s*"\/"/.test(toml), "signaling service must health-check GET / on 7880");
 
 ok(!/livekit\.cloud/i.test(toml), "SFU TOML must not reference a LiveKit Cloud host");
-const nonCommentAssignments = toml.split(/\r?\n/).filter((line) => !line.trimStart().startsWith("#"));
-ok(!nonCommentAssignments.some((line) => /(?:LIVEKIT_KEYS|API_SECRET|API_KEY)\s*=/.test(line)), "SFU TOML must not bake LiveKit keys or secrets");
+const envAllowlist = new Set(); // NODE_IP and all runtime credentials are Fly secrets, never [env].
+let table = "";
+for (const rawLine of toml.split(/\r?\n/)) {
+  const line = rawLine.replace(/\s+#.*$/, "");
+  const header = line.match(/^\s*(?:\[\[([^\]]+)\]\]|\[([^\]]+)\])\s*$/);
+  if (header) { table = header[1] ?? header[2]; continue; }
+  if (line.trimStart().startsWith("#")) continue;
+  const assignment = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
+  if (!assignment) continue;
+  const [, name, value] = assignment;
+  if (table === "env" && !envAllowlist.has(name)) {
+    failures.push(`[env] assignment ${name} is not allowlisted; runtime values must come from Fly secrets`);
+  }
+  if (/(?:_KEYS?|_SECRET|_PASSWORD|_TOKEN)$/i.test(name)) {
+    failures.push(`SFU TOML must not assign secret-shaped variable ${name}`);
+  }
+  const credentialUrl = /[a-z][a-z0-9+.-]*:\/\/[^\s/@:]+:[^\s/@]+@/i.test(value);
+  if (/postgresql:\/\//i.test(value) || /https?:\/\/[^\s/@:]+:[^\s/@]+@/i.test(value) || (/_URL$/i.test(name) && credentialUrl)) {
+    failures.push(`SFU TOML must not contain credential-bearing URL value for ${name}`);
+  }
+}
 ok(!/^[ \t]*keys:/m.test(toml), "SFU TOML must not contain inline LiveKit YAML keys");
 
 const digest = "sha256:5d3dcc475d064536d9948ebe4eeab8e3b24d6f07a46f6d71a3415a2901bbdc52";
 ok(new RegExp(`^FROM livekit/livekit-server:v1\\.13\\.7@${digest}$`, "m").test(dockerfile), "Dockerfile must pin livekit/livekit-server:v1.13.7 to the approved amd64 digest");
-ok(/getent hosts fly-global-services/.test(entrypoint) && /LIVEKIT_R1_FGS_IP_OVERRIDE/.test(entrypoint) && /ips:[\s\S]*includes:/.test(template), "entrypoint/template must resolve fly-global-services into rtc.ips.includes and allow only an explicit local smoke-test override (S0-F1)");
+ok(/LIVEKIT_R1_CONFIG:-A/.test(entrypoint) && /if \[ "\$R1_CONFIG" = "B" \]/.test(entrypoint) && /__RTC_IPS__/.test(template) && !/^\s*ips:/m.test(template), "Config A must default to no rtc.ips filter; Config B alone may render the FGS filter");
+ok(/FLY_APP_NAME/.test(entrypoint) && /FLY_MACHINE_ID/.test(entrypoint) && /forbidden on Fly/.test(entrypoint), "the local FGS override must fail closed on Fly");
 ok(/udp_port:\s*7882/.test(template) && /tcp_port:\s*7881/.test(template) && /use_external_ip:\s*false/.test(template), "LiveKit template must pin the reviewed ICE ports and explicit node-IP mode");
 ok(/node_ip:\s*"__NODE_IP__"/.test(template) && /auto_create:\s*false/.test(template) && /prometheus:\s*\{ port: 6789 \}/.test(template), "LiveKit template must use NODE_IP, API-created rooms, and private Prometheus");
 

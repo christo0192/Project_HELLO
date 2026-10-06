@@ -29,41 +29,48 @@
   const query = new URLSearchParams(location.search);
   $("url").value = query.get("url") || "";
   $("token").value = query.get("token") || "";
-  const state = { startedAt: null, samples: [], errors: [] };
+  const state = { startedAt: null, samples: [], errors: [], result: "PENDING: no selected UDP candidate pair sampled yet." };
   let room, tracks = [], timer;
   const setStatus = (text) => { $("status").textContent = text; };
   const write = () => { $("summary").textContent = JSON.stringify({ ...state, samples: state.samples.slice(-24) }, null, 2); };
 
   function peerConnections() {
     const engine = room?.engine;
-    // pcManager is intentionally reached defensively: livekit-client keeps the
-    // browser's native RTCPeerConnections behind this implementation seam, and
-    // its path has varied between 2.x releases. Every candidate is still a
-    // real RTCPeerConnection and is sampled through the standard getStats().
-    const manager = engine?.pcManager || engine?.client?.pcManager;
-    const candidates = [manager?.publisherPc, manager?.subscriberPc, manager?.publisherPeerConnection, manager?.subscriberPeerConnection, engine?.publisherPc, engine?.subscriberPc];
-    return [...new Set(candidates.filter((pc) => pc && typeof pc.getStats === "function"))];
+    // livekit-client 2.21 exposes PCTransport instances here. Their public
+    // getStats() API returns native RTC stats without relying on private PC fields.
+    const manager = engine?.pcManager;
+    return [["publisher", manager?.publisher], ["subscriber", manager?.subscriber]]
+      .filter(([, transport]) => transport && typeof transport.getStats === "function");
   }
 
   async function sampleStats() {
     const sample = { at: new Date().toISOString(), pairs: [], outbound: [], inbound: [] };
     const connections = peerConnections();
     if (!connections.length) sample.diagnostic = "No native RTCPeerConnection was exposed by this livekit-client build.";
-    for (const pc of connections) {
-      const report = await pc.getStats();
+    for (const [role, transport] of connections) {
+      const report = await transport.getStats();
       const byId = new Map();
       report.forEach((v) => byId.set(v.id, v));
+      const selectedPairIds = new Set();
       report.forEach((v) => {
-        if (v.type === "candidate-pair" && (v.selected || v.nominated) && v.state === "succeeded") {
+        if (v.type === "transport" && v.selectedCandidatePairId) selectedPairIds.add(v.selectedCandidatePairId);
+      });
+      report.forEach((v) => {
+        if (v.type === "candidate-pair" && (v.selected || selectedPairIds.has(v.id)) && v.state === "succeeded") {
           const local = byId.get(v.localCandidateId), remote = byId.get(v.remoteCandidateId);
-          sample.pairs.push({ protocol: local?.protocol || remote?.protocol || "unknown", remote: remote?.address ? `${remote.address}:${remote.port}` : undefined, rttMs: v.currentRoundTripTime == null ? null : Math.round(v.currentRoundTripTime * 1000), availableOutgoingBitrate: v.availableOutgoingBitrate ?? null });
+          sample.pairs.push({ role, protocol: local?.protocol || remote?.protocol || "unknown", remote: remote?.address ? `${remote.address}:${remote.port}` : undefined, rttMs: v.currentRoundTripTime == null ? null : Math.round(v.currentRoundTripTime * 1000), availableOutgoingBitrate: v.availableOutgoingBitrate ?? null });
         }
         if (v.type === "outbound-rtp" && (v.kind === "video" || v.mediaType === "video")) sample.outbound.push({ fps: v.framesPerSecond ?? null, packetsLost: v.packetsLost ?? null, qualityLimitationReason: v.qualityLimitationReason ?? null, bandwidthLimitedSeconds: v.qualityLimitationDurations?.bandwidth ?? null });
         if (v.type === "inbound-rtp" && (v.kind === "audio" || v.mediaType === "audio")) sample.inbound.push({ jitterMs: v.jitter == null ? null : Math.round(v.jitter * 1000), packetsLost: v.packetsLost ?? null });
       });
     }
+    sample.udpSelected = sample.pairs.some((pair) => pair.protocol.toLowerCase() === "udp");
+    state.result = sample.udpSelected
+      ? "GO: selected UDP candidate pair sampled."
+      : "NO-GO: no selected UDP candidate pair was sampled.";
     state.samples.push(sample);
     write();
+    if (!sample.udpSelected) setStatus("NO-GO: no selected UDP candidate pair sampled.");
   }
 
   $("join-form").addEventListener("submit", async (event) => {

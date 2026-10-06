@@ -22,14 +22,27 @@ const apiKey = required("R1_SPIKE_API_KEY");
 const apiSecret = required("R1_SPIKE_API_SECRET");
 const room = process.env.R1_SPIKE_ROOM || `r1-spike-${Date.now()}`;
 
-function token(identity, name) {
-  const accessToken = new AccessToken(apiKey, apiSecret, { identity, name, ttl: "15m" });
+function assertSpikeUrl(value) {
+  let host;
+  try { host = new URL(value).hostname.toLowerCase(); }
+  catch { throw new Error("R1_SPIKE_URL must be an absolute URL"); }
+  const allowed = process.env.R1_SPIKE_ALLOWED_HOST?.toLowerCase();
+  const isFlySpike = /^[a-z0-9-]+-r1-rtc-spike\.fly\.dev$/.test(host);
+  if (host.endsWith(".livekit.cloud") || host === "project-hello-r1-rtc.fly.dev" || (!isFlySpike && host !== allowed)) {
+    throw new Error(`R1_SPIKE_URL host is not an approved disposable spike host: ${host}`);
+  }
+}
+assertSpikeUrl(url);
+
+function candidateToken() {
+  const accessToken = new AccessToken(apiKey, apiSecret, { identity: "r1-spike-candidate", name: "S0-F candidate", ttl: "15m" });
   accessToken.addGrant({
     roomJoin: true,
     room,
     canPublish: true,
+    canPublishSources: ["camera", "microphone"],
     canSubscribe: true,
-    canPublishData: true,
+    canPublishData: false,
   });
   return accessToken.toJwt();
 }
@@ -44,6 +57,5 @@ await dispatch.createDispatch(room, "r1-spike", JSON.stringify({ purpose: "S0-F 
 console.log(JSON.stringify({
   url,
   room,
-  candidate: { identity: "r1-spike-candidate", token: await token("r1-spike-candidate", "S0-F candidate") },
-  agent: { identity: "r1-spike-agent", token: await token("r1-spike-agent", "S0-F test agent") },
+  candidate: { identity: "r1-spike-candidate", token: await candidateToken() },
 }, null, 2));

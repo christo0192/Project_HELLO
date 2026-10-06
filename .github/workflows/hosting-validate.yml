@@ -17,10 +17,12 @@ on:
       - 'docs/adr/0007-production-deployment-and-region.md'
       - 'docs/adr/README.md'
       - 'infra/hosting/**'
+      - 'infra/livekit-r1/**'
       - 'scripts/validate-container.sh'
       - 'scripts/docker_import_closure.py'
       - 'scripts/validate-no-secrets-baked.sh'
       - 'scripts/validate-hosting-foundation.test.mjs'
+      - 'scripts/validate-livekit-r1-sfu*.mjs'
       - 'scripts/__fixtures__/hosting-synthetic-forbidden-secret.txt'
       - '.github/workflows/hosting-validate.yml'
   push:
@@ -32,10 +34,12 @@ on:
       - 'docs/adr/0007-production-deployment-and-region.md'
       - 'docs/adr/README.md'
       - 'infra/hosting/**'
+      - 'infra/livekit-r1/**'
       - 'scripts/validate-container.sh'
       - 'scripts/docker_import_closure.py'
       - 'scripts/validate-no-secrets-baked.sh'
       - 'scripts/validate-hosting-foundation.test.mjs'
+      - 'scripts/validate-livekit-r1-sfu*.mjs'
       - 'scripts/__fixtures__/hosting-synthetic-forbidden-secret.txt'
       - '.github/workflows/hosting-validate.yml'
   workflow_dispatch:
@@ -62,11 +66,17 @@ jobs:
       - name: Secret-bake validator (normal pass; synthetic sentinel negative control)
         run: |
           bash scripts/validate-no-secrets-baked.sh app/voice-livekit
+          bash scripts/validate-no-secrets-baked.sh infra/livekit-r1
           if bash scripts/validate-no-secrets-baked.sh scripts/__fixtures__/hosting-synthetic-forbidden-secret.txt; then
             echo "negative control must fail" >&2
             exit 1
           fi
           echo "synthetic sentinel correctly rejected"
+      - name: LiveKit R1 SFU static and preflight tests
+        run: |
+          node scripts/validate-livekit-r1-sfu.mjs
+          node scripts/validate-livekit-r1-sfu.test.mjs
+          node infra/livekit-r1/preflight.test.mjs
       - name: Container contract (static subset; Docker builds are local-only)
         run: bash scripts/validate-container.sh
       - name: Validate architecture decision records

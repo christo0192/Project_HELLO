@@ -40,24 +40,29 @@ const results = readFileSync(path.join(source, "spike/results-template.md"), "ut
 ok(/fly apps create/.test(readme) && /fly ips allocate-v4/.test(readme) && /openssl rand/.test(readme) && /fly deploy --ha=false --config infra\/livekit-r1\/fly\.toml/.test(readme), "runbook must cover spike app, dedicated IPv4, generated keys, and single-Machine deploy");
 ok(/ss -ulpn/.test(readme) && /lk token create/.test(readme) && /fly ips release/.test(readme), "runbook must cover S0-F1 socket proof, lk tokens, and IPv4 teardown");
 const entrypoint = readFileSync(path.join(source, "entrypoint.sh"), "utf8");
-ok(/LIVEKIT_R1_FGS_IP_OVERRIDE/.test(entrypoint) && /set LIVEKIT_R1_FGS_IP_OVERRIDE only for a local smoke test/.test(entrypoint), "entrypoint must retain an explicit, local-only Fly-global-services override and otherwise fail closed");
+ok(/LIVEKIT_R1_CONFIG:-A/.test(entrypoint) && /LIVEKIT_R1_FGS_IP_OVERRIDE/.test(entrypoint) && /forbidden on Fly/.test(entrypoint), "entrypoint must default to Config A and fail closed when a local FGS override appears on Fly");
 ok(/Local Docker smoke test/.test(readme) && /LIVEKIT_R1_FGS_IP_OVERRIDE=127\.0\.0\.1/.test(readme), "runbook must document the local Docker smoke-test override");
+ok(/Config A first/.test(readme) && /Config B only if Config A fails/.test(readme) && /forced-TCP/.test(readme), "runbook must require Config A before opt-in Config B, including forced TCP");
 ok(/cdn\.jsdelivr\.net\/npm\/livekit-client/.test(page) && /URLSearchParams/.test(page) && /createLocalAudioTrack/.test(page) && /createLocalVideoTrack/.test(page), "spike page must use CDN LiveKit client, query/form inputs, microphone, and camera");
 ok(/width: 640, height: 360, frameRate: 15/.test(page) && /simulcast: false/.test(page) && /maxBitrate: 500_000/.test(page), "spike page must publish the prescribed 640x360/15fps, no-simulcast, 500k video");
-ok(/getStats\(\)/.test(page) && /setInterval\(.*5_000/.test(page) && /currentRoundTripTime/.test(page) && /jitter/.test(page) && /packetsLost/.test(page) && /framesPerSecond/.test(page) && /qualityLimitation/.test(page), "spike page must sample the required selected-pair and media stats every five seconds");
-ok(/RoomServiceClient/.test(mint) && /AgentDispatchClient/.test(mint) && /createRoom/.test(mint) && /createDispatch/.test(mint) && /candidate/.test(mint) && /agent/.test(mint), "mint helper must create a room, dispatch r1-spike, and mint both test identities");
-ok(/agent_name="r1-spike"/.test(echo) && /AudioStream/.test(echo) && /capture_frame/.test(echo), "echo worker must use only r1-spike and return subscribed audio");
+ok(/manager\?\.publisher/.test(page) && /manager\?\.subscriber/.test(page) && /getStats\(\)/.test(page) && /NO-GO: no selected UDP/.test(page) && /setInterval\(.*5_000/.test(page) && /currentRoundTripTime/.test(page) && /jitter/.test(page) && /packetsLost/.test(page) && /framesPerSecond/.test(page) && /qualityLimitation/.test(page), "spike page must sample public PCTransport stats and mark a missing selected UDP pair NO-GO");
+ok(/RoomServiceClient/.test(mint) && /AgentDispatchClient/.test(mint) && /createRoom/.test(mint) && /createDispatch/.test(mint) && /canPublishSources/.test(mint) && /canPublishData: false/.test(mint) && !/r1-spike-agent/.test(mint), "mint helper must create a room, dispatch r1-spike, and mint only a least-privilege candidate token");
+ok(/agent_name="r1-spike"/.test(echo) && /AudioStream/.test(echo) && /capture_frame/.test(echo) && /participant_disconnected/.test(echo) && /await candidate_left/.test(echo) && /await source\.aclose\(\)/.test(echo), "echo worker must return subscribed audio until the candidate disconnects, then close its source");
+ok(/R1_SPIKE_ALLOWED_HOST/.test(mint) && /livekit\.cloud/.test(mint) && /R1_SPIKE_ALLOWED_HOST/.test(echo) && /livekit\.cloud/.test(echo), "spike helpers must hard-fence disposable hosts and refuse Cloud");
 ok(!/(?:browser-screener|phone-screener)/.test(echo), "echo worker must never use a production agent name");
 ok(/≥98%/.test(results) && /≥90%/.test(results) && /≤200ms/.test(results) && /≥12fps/.test(results) && /NO-GO/.test(results), "results template must preserve v2 S0-F pass thresholds and kill switch");
 const cases = [
   ["wrong region", { "fly.toml": goodToml.replace('primary_region = "sin"', 'primary_region = "bom"') }, /DEPRECATED/],
   ["Cloud host", { "fly.toml": `${goodToml}\n# test-v87uzexo.livekit.cloud\n` }, /LiveKit Cloud/],
-  ["baked secret", { "fly.toml": goodToml.replace("  # LIVEKIT_KEYS", '  LIVEKIT_KEYS = "not-a-secret"\n  # LIVEKIT_KEYS') }, /must not bake/],
+  ["baked secret", { "fly.toml": goodToml.replace("  # LIVEKIT_KEYS", '  LIVEKIT_KEYS = "not-a-secret"\n  # LIVEKIT_KEYS') }, /secret-shaped/],
   ["UDP port drift", { "fly.toml": goodToml.replace('port = 7882', 'port = 7883') }, /7882/],
   ["raw TCP handler drift", { "fly.toml": goodToml.replace('handlers = []', 'handlers = ["tls"]') }, /raw TCP/],
   ["memory drift", { "fly.toml": goodToml.replace("memory_mb = 2048", "memory_mb = 1024") }, /2 GB/],
   ["unpinned image", { Dockerfile: goodDockerfile.replace("@sha256:5d3dcc475d064536d9948ebe4eeab8e3b24d6f07a46f6d71a3415a2901bbdc52", "") }, /pin livekit/],
-  ["missing FGS filter", { "livekit.yaml.tmpl": goodTemplate.replace("  ips:\n    includes:\n      - \"__FLY_GLOBAL_SERVICES__/32\"\n", "") }, /fly-global-services/],
+  ["trailing-comment service bypass", { "fly.toml": `${goodToml}\n[[services]] # a fourth service must still count\n` }, /exactly three service/],
+  ["generic password", { "fly.toml": `${goodToml}\nTURN_PASSWORD = \"not-a-secret\"\n` }, /secret-shaped/],
+  ["credential URL", { "fly.toml": `${goodToml}\nSUPABASE_DB_URL = \"postgresql:\/\/user:pass@example.test\/db\"\n` }, /credential-bearing URL/],
+  ["env NODE_IP bypass", { "fly.toml": goodToml.replace("  # NODE_IP", "  NODE_IP = \"1.2.3.4\"\n  # NODE_IP") }, /not allowlisted/],
 ];
 for (const [label, mutation, expected] of cases) {
   const dir = fixture(mutation);
