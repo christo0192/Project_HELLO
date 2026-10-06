@@ -23,7 +23,10 @@ import { resolve } from 'node:path';
 import {
   AUTO_REJECT_MIN,
   EVIDENCE_REASONS,
+  INFRA_DISCONNECT_REASON,
   PARTIAL_DECISION,
+  PHONE_DISCONNECT_REASONS,
+  UNOBSERVED_DISCONNECT_REASON,
   canAutoReject,
   gradeEvidence,
   readAssessmentEvidenceGrade,
@@ -103,6 +106,29 @@ describe('gradeEvidence — the rule table', () => {
       .toEqual({ grade: 'insufficient', reason: 'partial_thin', answered: 3, planned: 5 });
     expect(gradeEvidence(phone({ disconnectReason: 'worker_crash', measurement: measured(5, 3, 4) })).reason)
       .toBe('infra_interrupted');
+  });
+
+  it('0115 unobserved_disconnect is NOT an infrastructure fault (only worker_crash is)', () => {
+    // A reclaimed leg with teardown evidence: the line dropped unobserved, our
+    // side was alive. 0 answers grades no_candidate_speech, never
+    // infra_interrupted; a thin partial grades partial_thin.
+    expect(UNOBSERVED_DISCONNECT_REASON).toBe('unobserved_disconnect');
+    expect(gradeEvidence(phone({ candidateTurns: 0, disconnectReason: UNOBSERVED_DISCONNECT_REASON })))
+      .toMatchObject({ grade: 'insufficient', reason: 'no_candidate_speech' });
+    expect(gradeEvidence(phone({ disconnectReason: UNOBSERVED_DISCONNECT_REASON, measurement: measured(5, 3, 4) })))
+      .toEqual({ grade: 'insufficient', reason: 'partial_thin', answered: 3, planned: 5 });
+    // The 9f60523d shape: 0 of 5 answered, measured — insufficient, answered 0.
+    expect(gradeEvidence(phone({
+      candidateTurns: 0, disconnectReason: UNOBSERVED_DISCONNECT_REASON, measurement: measured(5, 0, 0),
+    }))).toEqual({ grade: 'insufficient', reason: 'no_candidate_speech', answered: 0, planned: 5 });
+    // Every token but worker_crash grades the same way.
+    for (const reason of PHONE_DISCONNECT_REASONS) {
+      const r = gradeEvidence(phone({ candidateTurns: 0, disconnectReason: reason })).reason;
+      expect(r, reason).toBe(reason === INFRA_DISCONNECT_REASON ? 'infra_interrupted' : 'no_candidate_speech');
+    }
+    expect(PHONE_DISCONNECT_REASONS).toEqual([
+      'candidate_hangup', 'worker_crash', 'unobserved_disconnect', 'disconnected',
+    ]);
   });
 
   it('NULL dispositions grade on the ROW count but leave answered unmeasured', () => {

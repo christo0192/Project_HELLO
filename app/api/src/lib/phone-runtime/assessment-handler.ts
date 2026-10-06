@@ -34,6 +34,11 @@ function payloadAttemptId(payload: unknown): string | null {
  * coverage/reason detail. A clean-hangup job (phone-worker.ts) carries none of
  * these, so absence means a COMPLETE screening. Read defensively — a malformed
  * field degrades to the complete-screening shape, never throws.
+ *
+ * `disconnect_reason` is passed through as a free string (any of
+ * `PHONE_DISCONNECT_REASONS`, including 0115's `unobserved_disconnect`): the
+ * grade, not this reader, decides what a token means, so a token newer than
+ * this build is still forwarded rather than dropped.
  */
 interface PhonePartialFields {
   readonly partial: boolean;

@@ -23,15 +23,22 @@
 --       answered leg is unobserved, duration_sec stays NULL (unknown), never
 --       the reclaim span. A guarded, idempotent backfill applies the same
 --       rule to completed phone sessions that already carry a reclaimed leg.
+--   §4  Finalize guard and truthful disconnect label (T05).
+--       finalize_phone_partial_sessions (0114) is lifted in full: it no
+--       longer completes and scores a session while a reconnect is pending
+--       (engagement reconnecting/dialing, or a newer live leg), for at most
+--       30 minutes after the latest bound leg ended; and a reclaimed leg that
+--       shows teardown evidence is labelled `unobserved_disconnect`, not
+--       `worker_crash`.
 --
--- Later S02 tasks APPEND their own sections after §3 (T05: finalize guard and
--- the unobserved_disconnect label; T06: the zero-answer relabel). S01, if it
--- needs a migration, takes 0116 and must not re-declare the functions this
--- file owns.
+-- Later S02 tasks APPEND their own sections after §4 (T06: the zero-answer
+-- relabel). S01, if it needs a migration, takes 0116 and must not re-declare
+-- the functions this file owns.
 --
 -- Function ownership (checked on origin/main 6fec38a with
 -- `grep -lE "function screening_v2\.<fn>\b" migrations/*.sql | tail -1`):
 --   set_phone_session_duration ...................... 0076 (lifted here, §3)
+--   finalize_phone_partial_sessions ................. 0114 (lifted here, §4)
 --   stamp_phone_attempt_room_name, phone_session_leg_duration ... new (§2/§3)
 --
 -- Conventions: `$$` bodies; no machine-clock reads in any function body;
@@ -392,6 +399,494 @@ update screening_v2.call_sessions s
   ) t
  where s.id = t.id;
 -- ==== 0115 §3 END ====
+
+
+-- ==== 0115 §4 BEGIN ====
+-- ─────────────────────────────────────────────────────────────────────
+-- §4 — finalize_phone_partial_sessions: the reconnect guard and the
+-- truthful disconnect label (T05, S02-4). Lifted IN FULL from 0114 §3 (the
+-- newest declaration: 0113's E4 callback flag and 0114's C2/C7 hunks live
+-- there). Every 0114 line is kept byte-for-byte; 0115 only ADDS four marked
+-- hunks (`-- ▼ 0115 <id>` … `-- ▲ 0115 <id>`), and phone-0115-finalize.test.ts
+-- proves that stripping them restores the 0114 body exactly.
+--
+--   S02-4 declare        the named hold bound, v_reconnect_hold = 30 min;
+--   S02-4 label columns  the attempt's teardown evidence, selected into v_row;
+--   S02-4 reconnect guard  WHERE-clause skip while a reconnect is pending
+--                        (engagement reconnecting/dialing, or a newer live
+--                        unbound leg), bounded by v_reconnect_hold;
+--   S02-4 label          worker_crash -> unobserved_disconnect when the leg
+--                        shows teardown evidence.
+--
+-- The session transition, the scoring keys, the C2 suppression and the C7
+-- withdrawn path are unchanged. Behaviour is proven on real Postgres by
+-- app/supabase/tests/phone_0115_finalize.sql (scripts/test-phone-0115.sh)
+-- and phone_partial_finalize_{setup,assert}.sql (scripts/supabase-test.sh).
+-- ─────────────────────────────────────────────────────────────────────
+create or replace function screening_v2.finalize_phone_partial_sessions(
+  p_limit         integer     default 25,
+  p_grace_seconds integer     default 180,
+  p_now           timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_limit    integer := greatest(1, least(coalesce(p_limit, 25), 200));
+  v_grace    integer := greatest(30, least(coalesce(p_grace_seconds, 180), 7200));
+  v_row      record;
+  v_att      screening_v2.phone_call_attempts%rowtype;
+  v_updated  integer;
+  v_examined integer := 0;
+  v_finalized integer := 0;
+  v_skipped  integer := 0;
+  v_total    integer;
+  v_reason   text;
+  v_has_assessment boolean;
+  v_never_started  boolean;
+  v_recording_present boolean;
+  -- 0113 / E4: this leg ended because the candidate booked a callback.
+  v_callback_booked boolean;
+  -- ▼ 0114 C2/C7 declare
+  -- C7: the candidate withdrew (opted_out / wrong_number engagement, or a
+  -- recorded candidate.opt_out on this leg). C2: why this leg is withheld
+  -- from scoring (phone_attempt_score_suppression), or null.
+  v_withdrawn         boolean;
+  v_withdrawn_state   text;
+  v_withdrawn_skipped integer := 0;
+  v_suppress          text;
+  -- ▲ 0114 C2/C7 declare
+  -- ▼ 0115 S02-4 declare
+  -- S02-4: how long a PENDING RECONNECT may hold a session out of this sweep,
+  -- measured from the end (or lapsed lease) of the session's latest bound
+  -- leg. A named bound, not an open-ended wait: see the reconnect guard.
+  v_reconnect_hold constant interval := interval '30 minutes';
+  -- ▲ 0115 S02-4 declare
+  v_sessions jsonb := '[]'::jsonb;
+begin
+  for v_row in
+    select s.id as session_id,
+           s.current_question_index as covered,
+           s.recording_object_key,
+           a.id            as attempt_id,
+           -- 0095: reported so an operator reading the sweep's output can tie
+           -- a finalized session to its engagement without a second query.
+           -- Nothing ACTS on it — the draft that posted an engagement event
+           -- from the caller is gone with edge #31.
+           a.engagement_id as engagement_id,
+           a.state         as attempt_state,
+           a.outcome_class as attempt_outcome,
+           a.ended_at      as attempt_ended_at,
+           a.lease_expires_at
+           -- ▼ 0115 S02-4 label columns
+           -- S02-4: the leg's TEARDOWN EVIDENCE, read by the disconnect label
+           -- below. Each is written only by a worker or egress that saw the
+           -- leg end: a verified recording upload (0107 recording_ready), a
+           -- completed egress, or the worker's observed SIP leave (0115 §1,
+           -- stamped from /recording/complete).
+           , a.recording_ready   as attempt_recording_ready
+           , a.egress_status     as attempt_egress_status
+           , a.observed_ended_at as attempt_observed_ended_at
+           -- ▲ 0115 S02-4 label columns
+      from screening_v2.call_sessions s
+      -- The LATEST attempt on this session decides whether the call is over.
+      -- A session is adopted across a no-answer ladder, so join the newest by
+      -- admitted_at rather than any row.
+      join lateral (
+        select att.*
+          from screening_v2.phone_call_attempts att
+         where att.session_id = s.id
+         order by att.admitted_at desc
+         limit 1
+      ) a on true
+     where s.mode = 'live'
+       and s.started_at is not null
+       -- Idempotency + no-re-score, in one predicate: a session that already
+       -- carries a phone assessment is NEVER re-selected. This self-terminates
+       -- the sweep for a scored session and makes a redundant enqueue
+       -- impossible from the SQL side (belt to the dedup-key braces).
+       and not exists (
+         select 1 from screening_v2.assessments a2
+          where a2.session_id = s.id and a2.source = 'phone'
+       )
+       -- The session must be ENDABLE-but-unscored. Either it is still
+       -- `in_progress` (hangup / network drop / crash before 0071's reclaim),
+       -- or it is the crash residue 0071 already terminalized to
+       -- `expired`/`grace_timeout` (MP3 finalized, scoring never enqueued).
+       and (
+         s.status = 'in_progress'
+         -- 0113 / E4: a callback leg is NEVER scored, so on this arm (which
+         -- only an assessment row ever drains) it would be re-selected for
+         -- ever and starve real partials out of the window. The in_progress
+         -- arm keeps it: that transition is what promotes its MP3.
+         or (s.status = 'expired' and s.terminal_reason = 'grace_timeout'
+             -- ▼ 0114 C2/C7 expired arm
+             -- C2: PR-B's callback_booked NOT EXISTS is generalised to the
+             -- suppression (callback_booked is still its first answer): a
+             -- deferred or worker-aborted leg is never scored either, so on
+             -- this arm it too would be re-selected for ever.
+             and screening_v2.phone_attempt_score_suppression(a.id) is null
+             -- C7: a withdrawn leg is never scored; it is not selected here
+             -- (the in_progress arm cancels it in the loop below).
+             and not exists (
+               select 1 from screening_v2.phone_engagements we
+                where we.id = a.engagement_id
+                  and we.state in ('opted_out','wrong_number'))
+             and not exists (
+               select 1 from screening_v2.phone_call_events ev
+                where ev.attempt_id = a.id
+                  and ev.event_type = 'candidate.opt_out')
+             -- ▲ 0114 C2/C7 expired arm
+             )
+       )
+       -- The call is genuinely over, not merely briefly quiet: the attempt is
+       -- terminal with an ended_at, OR its lease lapsed in a live state (crash
+       -- before reclaim), OR it is `abandoned` (reclaim's crash terminal) with
+       -- an ended_at/lease past. In EVERY case the deciding instant must be
+       -- older than the grace so a live leg that touched a moment ago is never
+       -- taken.
+       and (
+         (a.state in ('ended','human','machine')
+            and a.ended_at is not null
+            and a.ended_at <= p_now - (v_grace * interval '1 second'))
+         or
+         (a.lease_expires_at is not null
+            and a.lease_expires_at <= p_now - (v_grace * interval '1 second')
+            and a.state in ('admitted','ringing','answered_unclassified','human','machine'))
+         or
+         (a.state = 'abandoned'
+            and coalesce(a.ended_at, a.lease_expires_at) is not null
+            and coalesce(a.ended_at, a.lease_expires_at)
+                  <= p_now - (v_grace * interval '1 second'))
+       )
+       -- ▼ 0115 S02-4 reconnect guard
+       -- A RECONNECT IS STILL PENDING, so the call is not over. 9f60523d: the
+       -- reconnect leg was reclaimed, the engagement was `dialing` the next
+       -- reconnect, and this sweep completed and scored the session in the
+       -- meantime ("Screened" on 0 of 5 answers). Skip the session while
+       -- EITHER holds for the engagement bound to it:
+       --   (a) it is `reconnecting` (a reconnect was granted) or `dialing`
+       --       (one is being placed); or
+       --   (b) it has a live attempt admitted AFTER the session's latest
+       --       bound leg: a reconnect leg not yet bound to the session (0114
+       --       C1-d binds only at consent.resumed or the drop race).
+       -- Keyed on `session_id = s.id`, so an engagement that DETACHED this
+       -- session (the C2-a callback deferral) never holds it.
+       --
+       -- WHY THE WHERE CLAUSE (0095's reasoning, 0114 above): a session this
+       -- sweep selects but does not finish is re-selected on every pass, and
+       -- with `limit` + `order by started_at asc` a handful of such rows
+       -- starve every real partial out of the window. A held session is
+       -- simply NOT SELECTED, so it costs no slot and cannot starve anyone.
+       --
+       -- TIME-BOUNDED, on BOTH arms (in_progress and expired/grace_timeout).
+       -- The hold lapses v_reconnect_hold after the latest bound leg's end
+       -- (or its lapsed lease). An engagement wedged in `reconnecting` or
+       -- `dialing` therefore cannot keep a session out of scoring and the
+       -- MP3 transition for ever: once the bound passes, the session is
+       -- selected exactly as before 0115. The normal exit is the engagement
+       -- leaving those states (a failed reconnect goes `eligible` within a
+       -- minute); a consent.resumed reconnect binds its leg, which then
+       -- becomes the latest bound leg and is live, so nothing is selected.
+       --
+       -- Known residue, NOT covered: a drop outside the IST window parks the
+       -- engagement in `scheduled`/window_closed (a next-day reconnect).
+       -- That is not a guarded state, so such a session still finalizes
+       -- before the reconnect, as it did before 0115 (owner follow-up).
+       and not (
+         coalesce(a.ended_at, a.lease_expires_at) is not null
+         and p_now < coalesce(a.ended_at, a.lease_expires_at) + v_reconnect_hold
+         and exists (
+           select 1 from screening_v2.phone_engagements re
+            where re.session_id = s.id
+              and (re.state in ('reconnecting','dialing')
+                   or exists (
+                     select 1 from screening_v2.phone_call_attempts na
+                      where na.engagement_id = re.id
+                        and na.id <> a.id
+                        and na.admitted_at > a.admitted_at
+                        and na.ended_at is null
+                        and na.state in ('admitted','ringing','answered_unclassified',
+                                         'human','machine'))))
+       )
+       -- ▲ 0115 S02-4 reconnect guard
+     order by s.started_at asc
+     limit v_limit
+     for update of s skip locked
+  loop
+    v_examined := v_examined + 1;
+    -- ▼ 0114 C7 withdrawn
+    -- CHECKED FIRST (R9). A candidate who withdrew mid-call (or whose line
+    -- was a wrong number) must never be completed and scored: the session
+    -- is CANCELLED with the truthful reason, exactly as apply_phone_event's
+    -- C7-b tail does, and it is not returned to the caller (no enqueue, no
+    -- scorecard). Withdrawn = the engagement is opted_out / wrong_number, OR
+    -- a `candidate.opt_out` was recorded on this leg (applied OR ignored:
+    -- an opt-out that lost a race to the drop or the budget is still the
+    -- candidate's word). Only an in_progress session moves; the expired arm
+    -- never selects a withdrawn leg.
+    select we.state into v_withdrawn_state
+      from screening_v2.phone_engagements we
+     where we.id = v_row.engagement_id;
+    v_withdrawn := coalesce(v_withdrawn_state in ('opted_out','wrong_number'), false)
+      or exists (
+        select 1 from screening_v2.phone_call_events ev
+         where ev.attempt_id = v_row.attempt_id
+           and ev.event_type = 'candidate.opt_out');
+    if v_withdrawn then
+      update screening_v2.call_sessions s
+         set status          = 'cancelled',
+             terminal_reason = case when v_withdrawn_state = 'wrong_number'
+                                    then 'wrong_number' else 'candidate_opt_out' end,
+             ended_at        = coalesce(s.ended_at, p_now),
+             updated_at      = p_now
+       where s.id = v_row.session_id
+         and s.status = 'in_progress';
+      v_withdrawn_skipped := v_withdrawn_skipped + 1;
+      v_withdrawn_state := null;
+      continue;
+    end if;
+    v_withdrawn_state := null;
+    -- ▲ 0114 C7 withdrawn
+
+    -- Coverage: the cursor is the count of questions covered; the plan's
+    -- question_count is the total. A session with no plan row yet (should not
+    -- happen for a screening that started, but must not abort the sweep)
+    -- reports total=null and is still scored.
+    select p.question_count into v_total
+      from screening_v2.phone_session_plans p
+     where p.session_id = v_row.session_id;
+
+    -- disconnect_reason (no PII, one of three fixed tokens):
+    --   * 'candidate_hangup' — the attempt ended with outcome 'disconnected'
+    --     (the deliberate-hangup path);
+    --   * 'worker_crash' — the residue 0071's reclaim produced: the attempt is
+    --     `abandoned` (reclaim nulls its outcome_class) or its lease expired in
+    --     a live state without a terminal outcome. This is the mode where the
+    --     session is already `expired`/`grace_timeout` (or was, before this
+    --     sweep saw it) and the MP3 was finalized by reclaim, not by us;
+    --   * 'disconnected' — any other genuine end (e.g. an `ended` attempt with
+    --     a non-'disconnected' outcome).
+    v_reason := case
+      when v_row.attempt_outcome = 'disconnected' then 'candidate_hangup'
+      when v_row.attempt_state = 'abandoned'
+        or (v_row.lease_expires_at is not null
+            and v_row.attempt_state in
+                ('admitted','ringing','answered_unclassified','human','machine'))
+        then 'worker_crash'
+      else 'disconnected'
+    end;
+    -- ▼ 0115 S02-4 label
+    -- A FOURTH token, 'unobserved_disconnect'. `worker_crash` claimed our
+    -- side died, but the lease reclaim (or a lapsed lease) is also how a leg
+    -- ends when the CANDIDATE hung up and nothing reported it (the reconnect
+    -- leg's room was invisible to the reconciler before 0115 §2). When the
+    -- leg shows teardown evidence (a verified recording upload, a completed
+    -- egress, or an observed SIP leave), the worker was alive at the end, so
+    -- the truthful label is "the line dropped and we did not observe it".
+    -- It is NOT an infrastructure fault: the API grades it like any other
+    -- non-crash disconnect (evidence.ts compares to worker_crash only, as
+    -- does the 0114 §4 SQL grade mirror), so a 0-answer leg grades
+    -- no_candidate_speech rather than infra_interrupted. worker_crash is
+    -- kept only when there is no such evidence. No PII.
+    if v_reason = 'worker_crash'
+       and (coalesce(v_row.attempt_recording_ready, false)
+            or v_row.attempt_egress_status = 'complete'
+            or v_row.attempt_observed_ended_at is not null) then
+      v_reason := 'unobserved_disconnect';
+    end if;
+    -- ▲ 0115 S02-4 label
+
+    -- ── 0095 / issue #286: DID A SCREENING ACTUALLY HAPPEN? ───────────
+    -- The sweep already knew — it selects `covered` and reads the plan's
+    -- `question_count` — and used neither to decide the terminal state, so
+    -- "crashed after eight answers" and "hung up before asking anything"
+    -- both landed on `completed` / `conversation_complete`.
+    --
+    -- The test is DIRECT evidence, not a coverage threshold: did the
+    -- CANDIDATE ever say anything outside the gate?
+    --
+    -- Gate turns (identity, consent) are excluded because they are exactly
+    -- what a never-started call DOES have. And the speaker filter is
+    -- load-bearing: `commit_phone_item_turn` (0071:179) writes BOTH 'bot'
+    -- and 'candidate' turns with is_gate = false, so testing for any
+    -- non-gate turn would count the bot ASKING question one as evidence the
+    -- candidate answered it. A call that died the instant Q1 was asked would
+    -- then be a completed screening — the precise defect this migration
+    -- exists to remove, reintroduced one turn later.
+    --
+    -- Keyed on the candidate it is also the SAFE direction for scoring: if
+    -- the candidate contributed no non-gate turn there is, by construction,
+    -- nothing to score, so skipping the enqueue can never cost a real
+    -- scorecard. Any candidate answer at all — even one — takes the
+    -- `completed` branch and scores exactly as it did before 0095.
+    select not exists (
+      select 1 from screening_v2.transcript_turns t
+       where t.session_id = v_row.session_id
+         and t.is_gate = false
+         and t.speaker = 'candidate'
+    ) into v_never_started;
+
+    -- Already-present signals — reported, never gating. The caller's dedup key
+    -- makes a redundant enqueue a no-op; the recording flag is for the log.
+    select exists (
+      select 1 from screening_v2.assessments a
+       where a.session_id = v_row.session_id and a.source = 'phone'
+    ) into v_has_assessment;
+    v_recording_present := v_row.recording_object_key is not null;
+
+    -- 0113 / E4: did this leg end because the candidate CONFIRMED a voice
+    -- callback? An EXACT match on the attempt that booked it (unique index),
+    -- any appointment status, and deliberately no engagement-level fallback:
+    -- an unrelated appointment on the same engagement must never suppress a
+    -- real screening's scorecard. The caller skips the scoring enqueue on it.
+    select exists (
+      select 1 from screening_v2.phone_appointments ap
+       where ap.confirmed_from_attempt_id = v_row.attempt_id
+    ) into v_callback_booked;
+    -- ▼ 0114 C2 suppression
+    -- C2: is this leg withheld from scoring? callback_booked (the E4 fact
+    -- above), callback_deferred (the in-call deferral outcome) or
+    -- worker_aborted (an applied internal assessment.aborted carrying this
+    -- attempt id; the stranded sweep's abort carries none, so a DLQ replay
+    -- of a stranded session still scores). The session transition below is
+    -- UNCHANGED for a suppressed leg, so its MP3 still finalizes; the caller
+    -- skips the scoring enqueue on `score_suppressed`.
+    v_suppress := screening_v2.phone_attempt_score_suppression(v_row.attempt_id);
+    -- ▲ 0114 C2 suppression
+
+    -- Drive the session terminal, RE-VERIFYING under the lock that it is still
+    -- in_progress (the unlocked-ish scan may have raced a live completion).
+    -- The SAME transition the worker's happy path uses: completed /
+    -- conversation_complete. It fires trg_enqueue_recording_finalize (0038) in
+    -- THIS transaction and makes the session eligible for scoring. A row that
+    -- is no longer in_progress is left untouched — this covers BOTH the
+    -- idempotent re-run (a session already completed) AND the worker-crash
+    -- residue this sweep also selects (`expired`/`grace_timeout`, MP3 already
+    -- finalized by 0071's reclaim): re-transitioning `expired -> completed` is
+    -- not a legal 0006 edge, so we deliberately leave it terminal and report
+    -- `transitioned=false`. Its scoring is still owed and still returned below.
+    -- ── THE SESSION TRANSITION IS UNCHANGED BY 0095 ───────────────────
+    --
+    -- An earlier draft drove a never-started session to `failed` /
+    -- `screening_never_started`. Three reviews and the repo's own
+    -- `phone_partial_finalize_assert.sql` all rejected it, and they were
+    -- right. `never_started` is now REPORTED and never acted on here.
+    --
+    -- Why the status must not move:
+    --   * THE SWEEP STARVES ITSELF. The selection admits
+    --     `expired`/`grace_timeout` as well as `in_progress`, but this UPDATE
+    --     is guarded `status = 'in_progress'`, so that arm is never
+    --     re-stamped. It leaves the set only once an assessment row exists.
+    --     Skipping the scoring enqueue for these sessions meant no row was
+    --     ever written, so they were re-selected for ever — and with
+    --     `limit 25` and `order by started_at asc`, 25 of them displace every
+    --     REAL partial screening from the window. Those lose both the
+    --     scorecard and the terminal transition that drives the MP3.
+    --   * THE MP3 LOSES A RECOVERY PATH. The 0038 trigger and the sweeper do
+    --     treat `failed` like `completed`, but the download route's
+    --     on-demand finalize backstop is `status = 'completed'` only.
+    --   * SCORING CHANGES FOR A CLASS THAT HAD IT. The crash-partial pair
+    --     (`expired` + `grace_timeout`) is admitted by the eligibility gate,
+    --     so such a session was scored before; withholding the enqueue takes
+    --     that away without touching the gate, which is what made the change
+    --     invisible.
+    --   * THE EVIDENCE IS NOT SAFE TO ACT ON. The per-item transcript writer
+    --     is fire-and-forget (`agent.py`, `asyncio.create_task`, never
+    --     awaited, failures swallowed) and the boundary writer SUPPRESSES its
+    --     own insert when any per-item row exists (0086). If the bot's write
+    --     lands and the candidate's does not, a real screening reads as
+    --     never-started. Good enough to REPORT; not good enough to withhold a
+    --     scorecard or redirect a call on.
+    --
+    -- So the transition below is byte-for-byte what 0072 shipped: the SAME
+    -- transition the worker's happy path uses. MP3 and scorecard generation
+    -- are therefore untouched by this migration, which is the owner's
+    -- explicit constraint.
+    update screening_v2.call_sessions s
+       set status          = 'completed',
+           terminal_reason = 'conversation_complete',
+           ended_at        = coalesce(s.ended_at, p_now),
+           updated_at      = p_now
+     where s.id = v_row.session_id
+       and s.status = 'in_progress';
+    get diagnostics v_updated = row_count;
+    if v_updated = 1 then
+      v_finalized := v_finalized + 1;
+    else
+      v_skipped := v_skipped + 1;
+    end if;
+
+    -- The selection is returned WHETHER OR NOT the transition landed on this
+    -- pass, so the caller enqueues scoring independently of the transition.
+    v_sessions := v_sessions || jsonb_build_object(
+      'session_id',         v_row.session_id,
+      'attempt_id',         v_row.attempt_id,
+      'engagement_id',      v_row.engagement_id,
+      'covered',            v_row.covered,
+      'total',              v_total,
+      'disconnect_reason',  v_reason,
+      -- The caller reads this to decide whether to enqueue scoring at all.
+      -- A never-started session has no non-gate turns; enqueuing it would DLQ
+      -- against the eligibility guard and look like a scoring failure rather
+      -- than a call that never happened.
+      'never_started',      v_never_started,
+      'transitioned',       v_updated = 1,
+      'assessment_present', v_has_assessment,
+      'recording_present',  v_recording_present,
+      -- ▼ 0114 C2 suppression keys
+      -- true = never scored (see suppress_reason); finalized for its MP3
+      -- and transcript only. callback_booked below is kept verbatim.
+      'score_suppressed',   v_suppress is not null,
+      'suppress_reason',    v_suppress,
+      -- ▲ 0114 C2 suppression keys
+      -- 0113 / E4: true = a callback leg; finalized for its MP3 and
+      -- transcript, but never scored, published or used to end the engagement.
+      'callback_booked',    v_callback_booked);
+
+    v_total := null;
+  end loop;
+
+  return jsonb_build_object(
+    'status',        'ok',
+    'examined',      v_examined,
+    'finalized',     v_finalized,
+    'skipped',       v_skipped,
+    'limit',         v_limit,
+    'grace_seconds', v_grace,
+    -- ▼ 0114 C7 withdrawn key
+    'withdrawn_skipped', v_withdrawn_skipped,
+    -- ▲ 0114 C7 withdrawn key
+    'sessions',      v_sessions);
+end;
+$$;
+
+revoke all on function screening_v2.finalize_phone_partial_sessions(integer, integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.finalize_phone_partial_sessions(integer, integer, timestamptz)
+  to service_role;
+
+comment on function screening_v2.finalize_phone_partial_sessions is
+  'Partial-finalize sweeper (0072): finds phone sessions left in_progress '
+  'whose call is genuinely over (latest attempt terminal or lease-expired) '
+  'past a short reconnect grace, drives each to completed/conversation_complete '
+  'so the 0038 finalize trigger promotes the attempt MP3, and returns the '
+  'coverage/attempt facts so the caller can enqueue PARTIAL scoring '
+  'independently. Selection is on session-ended, not egress state, so the '
+  'scorecard lands even when egress produced nothing. Idempotent and '
+  'self-limiting; charges no budget. 0113: callback_booked per session. '
+  '0114: a withdrawn leg (opted_out/wrong_number engagement, or a recorded '
+  'candidate.opt_out on the leg) is cancelled, never completed or returned '
+  '(withdrawn_skipped); a leg phone_attempt_score_suppression withholds is '
+  'still completed for its MP3 and reported score_suppressed/suppress_reason '
+  'so the caller never scores it. 0115: a session whose bound engagement is '
+  'reconnecting/dialing, or has a live leg newer than the session''s latest '
+  'bound leg, is not selected for up to 30 minutes after that leg ended; '
+  'disconnect_reason is unobserved_disconnect (not worker_crash) when a '
+  'reclaimed or lease-lapsed leg shows teardown evidence. Service-role-only.';
+-- ==== 0115 §4 END ====
 
 
 notify pgrst, 'reload schema';

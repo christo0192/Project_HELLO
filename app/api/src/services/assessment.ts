@@ -93,7 +93,13 @@ export interface RunAssessmentOptions {
   readonly covered?: number | null;
   /** 0072: plan length; null when unresolvable (still scored). */
   readonly total?: number | null;
-  /** 0072: `candidate_hangup` | `disconnected`. No PII. */
+  /**
+   * 0072: the partial-finalize disconnect token, one of
+   * `PHONE_DISCONNECT_REASONS` (`candidate_hangup` | `worker_crash` |
+   * `unobserved_disconnect` (0115) | `disconnected`). Stored verbatim in
+   * `raw.partial.disconnect_reason`; only `worker_crash` grades as an
+   * infrastructure fault (evidence.ts). No PII.
+   */
   readonly disconnectReason?: string;
   /**
    * Phase 4: EXPLICIT IMMUTABLE RESCORE. When present, this re-scores an

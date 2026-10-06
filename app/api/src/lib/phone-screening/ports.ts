@@ -258,6 +258,13 @@ export interface PhonePartialFinalizeSession {
   readonly covered: number | null;
   /** Plan length; `null` when the plan row is unresolvable (still score). */
   readonly total: number | null;
+  /**
+   * The RPC's `disconnect_reason`, one of `PHONE_DISCONNECT_REASONS`
+   * (scorecards/evidence.ts): `candidate_hangup`, `worker_crash`,
+   * `unobserved_disconnect` (0115 §4: reclaimed or lease-lapsed, but the leg
+   * shows teardown evidence) or `disconnected`. Kept a free string so a newer
+   * SQL token never fails an older API; forwarded verbatim to scoring.
+   */
   readonly disconnectReason: string;
   /** Whether THIS pass drove the session `in_progress -> completed`. */
   readonly transitioned: boolean;

@@ -1497,7 +1497,10 @@ export function createPhoneRuntime(
           // the two already-present signals are encoded into a single bounded,
           // SAFE_IDENT-shaped composite category (max 64 chars, no PII): e.g.
           // `phone_partial_finalize:c3:t5:mp3.1:sc.0`. `error_type` carries the
-          // disconnect reason. No transcript, no candidate data, no session id.
+          // disconnect reason token (PHONE_DISCONNECT_REASONS; 0115 adds
+          // `unobserved_disconnect`, so the `unobserved_disconnect` vs
+          // `worker_crash` split is countable from this line). No transcript,
+          // no candidate data, no session id.
           const cov = boundedCount(s.covered);
           const tot = boundedCount(s.total);
           logger.info('unknown_event', {

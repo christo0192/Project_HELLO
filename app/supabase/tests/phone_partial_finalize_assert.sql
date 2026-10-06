@@ -20,7 +20,9 @@
 --     transitioned this pass), and the sweep does NOT error on the crash
 --     residue's illegal re-transition;
 --   * idempotency / no-re-score: once an assessment row exists for the crash
---     session, a re-run no longer selects it.
+--     session, a re-run no longer selects it;
+--   * 0115 §4: the HELD session (engagement `reconnecting`) is not selected
+--     and stays in_progress while the reconnect is pending.
 --
 -- Raises (and therefore fails the suite) on any violation.
 --
@@ -37,6 +39,8 @@ declare
   v_control  uuid;
   v_crash    uuid;
   v_lease    uuid;
+  v_held     uuid;
+  v_held_status text;
   v_lease_status text;
   v_lease_reason text;
   v_lease_entry  jsonb;
@@ -62,7 +66,10 @@ begin
    where external_call_id = 'phone-pf72-crash';
   select id into v_lease    from screening_v2.call_sessions
    where external_call_id = 'phone-pf72-lease';
-  if v_stranded is null or v_control is null or v_crash is null or v_lease is null then
+  select id into v_held     from screening_v2.call_sessions
+   where external_call_id = 'phone-pf72-held';
+  if v_stranded is null or v_control is null or v_crash is null or v_lease is null
+     or v_held is null then
     raise exception 'pf72: fixture sessions missing — run the setup first';
   end if;
 
@@ -127,8 +134,22 @@ begin
     raise exception 'pf72: control session status = %, expected in_progress (still within grace)', v_ctrl_status;
   end if;
 
+  -- 0115 §4: the HELD session (engagement `reconnecting`, a reconnect still
+  -- pending) was NOT selected although its attempt ended past the grace: it
+  -- stays in_progress so the reconnect can continue it.
+  select status into v_held_status
+    from screening_v2.call_sessions where id = v_held;
+  if v_held_status <> 'in_progress' then
+    raise exception 'pf72: held session status = %, expected in_progress (a pending reconnect must hold it)', v_held_status;
+  end if;
+  if exists (select 1 from jsonb_array_elements(v_res->'sessions') e
+              where (e->>'session_id')::uuid = v_held) then
+    raise exception 'pf72: the held session (reconnect pending) was returned for scoring';
+  end if;
+
   -- The returned sessions array names the stranded, crash AND lease-lapsed
-  -- sessions (the control is inside the grace and absent).
+  -- sessions (the control is inside the grace and absent, and so is the held
+  -- one).
   if jsonb_array_length(v_res->'sessions') <> 3 then
     raise exception 'pf72: expected 3 returned sessions (stranded + crash + lease), got %',
       jsonb_array_length(v_res->'sessions');
@@ -185,6 +206,8 @@ begin
   end if;
 
   -- ── CRASH entry: transitioned=false, worker_crash. ──
+  -- 0115 §4 keeps worker_crash here: the abandoned attempt shows no teardown
+  -- evidence (no verified upload, no completed egress, no observed leave).
   if (v_crash_entry->>'transitioned')::boolean is not false then
     raise exception 'pf72: expected transitioned=false for the crash residue (already terminal)';
   end if;

@@ -18,7 +18,9 @@
 #   4. apply 0115 a SECOND time (idempotency), then any later migration;
 #   5. assert no row changed on the second apply, the column CHECKs, the
 #      exact attempt-trigger set, the room_name stamp and the new duration
-#      rule on first completion (phone_0115_assert.sql).
+#      rule on first completion (phone_0115_assert.sql);
+#   6. replay the 9f60523d sequence against §4's partial-finalize reconnect
+#      guard and the unobserved_disconnect label (phone_0115_finalize.sql).
 #
 # If S01 (or anything else) merges a migration numbered 0115 first, this
 # migration is renumbered; MIGRATION below is the one place to change.
@@ -150,5 +152,8 @@ done
 
 log 'asserting idempotency, CHECKs, the trigger set, the stamp and the duration rule...'
 run_sql phone_0115_assert.sql
+
+log 'replaying the partial-finalize reconnect guard and the disconnect label (§4)...'
+run_sql phone_0115_finalize.sql
 
 log 'PASS'

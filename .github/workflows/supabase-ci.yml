@@ -191,6 +191,8 @@ jobs:
       # history. Every vitest suite mocks Supabase, so only a real Postgres
       # that has seen rows written under the old 0076 rule proves the
       # backfills (and their idempotency) before `supabase db push` does.
+      # It also replays the 9f60523d sequence against 0115 §4, the
+      # partial-finalize reconnect guard and the unobserved_disconnect label.
       - name: Recording and call-record integrity 0115 (isolated real Postgres)
         run: bash scripts/test-phone-0115.sh
 

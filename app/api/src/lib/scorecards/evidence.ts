@@ -40,7 +40,8 @@ export type EvidenceGradeValue = (typeof EVIDENCE_GRADES)[number];
  *   partial_sufficient   — partial phone call, answered*4 >= planned*3;
  *   no_candidate_speech  — the candidate said nothing in the scored section;
  *   infra_interrupted    — insufficient, and the call was killed by our side
- *                          (`worker_crash`), not by the candidate;
+ *                          (`worker_crash`), not by the candidate. An
+ *                          `unobserved_disconnect` (0115) is NOT our side;
  *   partial_thin         — insufficient partial, any other disconnect;
  *   no_plan              — partial, and the session has no question plan;
  *   evidence_read_failed — the coverage read failed twice (fail closed).
@@ -79,6 +80,30 @@ export const ANSWERED_DISPOSITIONS: readonly string[] = [
 export const INFRA_DISCONNECT_REASON = 'worker_crash';
 
 /**
+ * 0115 §4: a leg ended by the lease reclaim (or a lapsed lease) that still
+ * shows TEARDOWN EVIDENCE — a verified recording upload, a completed egress or
+ * the worker's observed SIP leave — so the worker was alive at the end and the
+ * line simply dropped unobserved. NOT an infrastructure fault: it grades like
+ * every other non-crash disconnect (`no_candidate_speech` / `partial_thin`).
+ */
+export const UNOBSERVED_DISCONNECT_REASON = 'unobserved_disconnect';
+
+/**
+ * Every `disconnect_reason` partial-finalize can report (0072 → 0115 §4), in
+ * the order its CASE decides them. Carried as a free string end to end (job
+ * payload, `raw.partial.disconnect_reason`, the runtime log's `error_type`),
+ * so an older API reading a newer token degrades safely: only
+ * {@link INFRA_DISCONNECT_REASON} is ever treated as our side's fault. No PII.
+ */
+export const PHONE_DISCONNECT_REASONS = [
+  'candidate_hangup',
+  INFRA_DISCONNECT_REASON,
+  UNOBSERVED_DISCONNECT_REASON,
+  'disconnected',
+] as const;
+export type PhoneDisconnectReason = (typeof PHONE_DISCONNECT_REASONS)[number];
+
+/**
  * The coverage of one phone session, read from `phone_session_plans` and
  * `phone_session_progress`.
  *
@@ -100,7 +125,10 @@ export interface GradeEvidenceInput {
   readonly partial: boolean;
   /** Candidate (non-bot) turns in the SCORED (non-gate) transcript. */
   readonly candidateTurns: number;
-  /** `raw.partial.disconnect_reason` (`candidate_hangup|disconnected|worker_crash`). */
+  /**
+   * `raw.partial.disconnect_reason`, one of {@link PHONE_DISCONNECT_REASONS}
+   * (`candidate_hangup|worker_crash|unobserved_disconnect|disconnected`).
+   */
   readonly disconnectReason: string | null;
   /**
    * The coverage read. `null` when it was not attempted (browser), the string

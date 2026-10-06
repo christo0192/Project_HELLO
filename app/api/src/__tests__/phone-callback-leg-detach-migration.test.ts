@@ -25,6 +25,7 @@ import {
   MIGRATION_0095,
   MIGRATION_0113,
   MIGRATION_0114,
+  MIGRATION_0115,
   functionBody,
   functionParameters,
 } from './support/phone-migration.js';
@@ -33,6 +34,7 @@ const lf = (s: string): string => s.replace(/\r\n/g, '\n');
 
 const M0113 = lf(MIGRATION_0113);
 const M0114 = lf(MIGRATION_0114);
+const M0115 = lf(MIGRATION_0115);
 const POLICY_TESTS = lf(
   readFileSync(
     fileURLToPath(new URL('../../../supabase/tests/policy_tests.sql', import.meta.url)),
@@ -122,13 +124,14 @@ describe('0113 E4 — every lifted body is its source plus additions only', () =
       for (const line of lift.rewritten) expect(target.split('\n')).not.toContain(line);
     });
 
-    it(`${lift.name}: is the body the drift extractors resolve (0113, or 0114 when PR-C re-lifts it)`, () => {
+    it(`${lift.name}: is the body the drift extractors resolve (0113, or the newest re-lift)`, () => {
       // 0114 (M009 PR-C) re-lifts apply_phone_event, finalize and sweep from
-      // 0113 (its own structural tests pin those diffs); everything else
-      // 0113 owns must still resolve to 0113.
-      const newest = M0114.includes(`create or replace function screening_v2.${lift.name}(`)
-        ? M0114
-        : M0113;
+      // 0113, and 0115 (M013 S02 §4) re-lifts finalize from 0114 (their own
+      // structural tests pin those diffs); everything else 0113 owns must
+      // still resolve to 0113.
+      const declares = (sql: string) =>
+        sql.includes(`create or replace function screening_v2.${lift.name}(`);
+      const newest = declares(M0115) ? M0115 : declares(M0114) ? M0114 : M0113;
       expect(lf(functionBody(lift.name))).toBe(bodyIn(newest, lift.name).slice(0, -'\n$$;'.length));
     });
   }
