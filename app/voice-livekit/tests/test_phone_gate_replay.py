@@ -193,9 +193,41 @@ class TestReplayGlueMatchesAgent(unittest.TestCase):
         self.assertIn("hard_timeout_sec=phone.phone_classify_answer_timeout_sec(),", block)
         # T02: one "a person spoke" latch per call, shared by every reader.
         self.assertIn("gate_spoke = gate_judge.HumanSpeechLatch()", self.src)
-        self.assertIn("spoke=gate_spoke,", block)
+        # T05: in llm mode the identity judge latches instead of the reader.
+        self.assertIn("spoke=None if gate_judge_wiring.acting else gate_spoke,", block)
         classify = self.src[self.src.index("async def classify() -> str:"):]
         self.assertIn("spoke=gate_spoke,", classify[:700])
+        # T05: the consent reader is handed the call's judge wiring.
+        self.assertIn("judge=gate_judge_wiring,", classify[:900])
+        self.assertIn("bot_line=lambda: gate_last_line[0],", classify[:900])
+
+    def test_the_judge_wiring_and_recording_anchor_use_the_module_seams(self):
+        # T05: built from the call's own capture, latch, anchors and budget.
+        wiring = self.src[self.src.index("gate_judge_wiring = _GateJudgeWiring("):]
+        for line in (
+            "capture=gate_capture, latch=gate_spoke,",
+            "question_anchor=lambda: gate_question_anchor[0],",
+            "recording_anchor=lambda: gate_recording_anchor.value,",
+            "budget=gate_budget,",
+        ):
+            self.assertIn(line, wiring[:600])
+        self.assertIn("gate_recording_anchor = _GateRecordingAnchor()", self.src)
+        mark = self.src[self.src.index("def _mark_question_asked()"):]
+        self.assertIn("gate_recording_anchor.reset()", mark[:2200])
+        record = self.src[self.src.index("def _mark_recording_sentence()"):]
+        self.assertIn(
+            "gate_recording_anchor.mark(int(round(time.time() * 1000)))", record[:300])
+        speaking = self.src[self.src.index("def _on_phone_agent_state_changed"):]
+        self.assertIn(
+            "gate_recording_anchor.on_first_audio(int(round(first_audio_wall * 1000)))",
+            speaking[:3000])
+        clear = self.src[self.src.index("def _clear_question_anchor()"):]
+        self.assertIn("gate_judge_wiring.stop()", clear[:500])
+        say = self.src[self.src.index("    async def say(text: str) -> None:"):]
+        self.assertIn("gate_last_line[0] = text", say[:400])
+        gate = self.src[self.src.index("return await phone.run_phone_gate("):]
+        self.assertIn("judge_identity=_judge_identity,", gate)
+        self.assertIn("mark_recording_sentence=_mark_recording_sentence,", gate)
 
     def test_the_speaking_latch_follows_the_vad_stream(self):
         vad = self.src[self.src.index("def _on_phone_vad_event"):]

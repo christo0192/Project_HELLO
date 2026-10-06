@@ -509,6 +509,114 @@ def phone_consent_reask_text(reason: Any) -> str:
     )
 
 
+# ── Fixed answers to a question asked at the consent turn (M013 S01 T05) ─────
+# When the gate judge reads the consent reply as a QUESTION, the bot answers
+# from fixed copy only and then asks again. Owner constraints: the answers
+# state only facts the worker holds (the role title from the server
+# projection; "the hiring team"), never an invented duration or number; and
+# no new sentence about being an AI is written: "is this an AI?" is answered
+# with the VERBATIM first sentence of `phone_identity_text`. Every line is
+# registered in `gate_copy_texts` (the role answer by its fixed frame in
+# `is_gate_copy`).
+CONSENT_FAQ_HOW_LONG = "how_long"
+CONSENT_FAQ_WHO_REVIEWS = "who_reviews"
+CONSENT_FAQ_WHAT_ROLE = "what_role"
+CONSENT_FAQ_IS_AI = "is_ai"
+#: No factual duration source exists on the worker, so no number is given.
+PHONE_CONSENT_FAQ_HOW_LONG_TEXT = "It's a short call, just a few questions."
+PHONE_CONSENT_FAQ_WHO_REVIEWS_TEXT = "The hiring team reviews it."
+PHONE_CONSENT_FAQ_ROLE_UNKNOWN_TEXT = "It's about your job application."
+_CONSENT_FAQ_ROLE_PREFIX = "It's about the "
+_CONSENT_FAQ_ROLE_SUFFIX = " role you applied for."
+_CONSENT_FAQ_ROLE_MAX_CHARS = 80
+#: Asked right after a fixed answer. The recording sentence VERBATIM, then the
+#: question, so the reply to it is informed consent on its own.
+PHONE_CONSENT_REASK_AFTER_ANSWER_TEXT = (
+    "This call is recorded so the hiring team can review it. "
+    "Is it okay if we carry on?"
+)
+
+
+def phone_ai_identity_sentence() -> str:
+    """The VERBATIM first sentence of `phone_identity_text`.
+
+    "Hi, this is Christy, an AI voice assistant calling from <company>." It is
+    derived from the identity line itself, never re-typed, so the answer to
+    "is this an AI?" can only ever be words the owner already approved.
+    """
+    line = phone_identity_text(None)
+    end = line.find(f"{_COMPANY}.")
+    if end < 0:  # pragma: no cover — pinned by a test
+        return line
+    return line[: end + len(_COMPANY) + 1]
+
+
+def _consent_faq_role_text(role_title: Any) -> str:
+    role = " ".join(str(role_title or "").split())
+    if not role or len(role) > _CONSENT_FAQ_ROLE_MAX_CHARS:
+        return PHONE_CONSENT_FAQ_ROLE_UNKNOWN_TEXT
+    return f"{_CONSENT_FAQ_ROLE_PREFIX}{role}{_CONSENT_FAQ_ROLE_SUFFIX}"
+
+
+def phone_consent_faq_text(kind: Any, *, role_title: Any = None) -> Optional[str]:
+    """The fixed answer to a consent-turn question of ``kind``, or None.
+
+    ``None`` (an ``other`` question, or anything unknown) means no fixed
+    answer exists: the caller speaks the question re-ask
+    (`PHONE_CONSENT_REASK_QUESTION_TEXT`) alone.
+    """
+    if kind == CONSENT_FAQ_HOW_LONG:
+        return PHONE_CONSENT_FAQ_HOW_LONG_TEXT
+    if kind == CONSENT_FAQ_WHO_REVIEWS:
+        return PHONE_CONSENT_FAQ_WHO_REVIEWS_TEXT
+    if kind == CONSENT_FAQ_WHAT_ROLE:
+        return _consent_faq_role_text(role_title)
+    if kind == CONSENT_FAQ_IS_AI:
+        return phone_ai_identity_sentence()
+    return None
+
+
+# ── The consent line, split at the recording sentence (M013 S01 T05) ────────
+def phone_split_consent_line(line: Any) -> tuple[str, str]:
+    """``(part_a, part_b)`` with ``part_a + part_b == line``.
+
+    Part B starts at the VERBATIM recording sentence and runs to the end (the
+    sentence and the consent question); part A is everything before it, and
+    may be empty. A line without the verbatim sentence is ``("", line)``. The
+    gate speaks the two parts back to back so it can tell WHEN the recording
+    notice was heard: a consent grant must rest on speech that began after it.
+    The wording is unchanged, character for character.
+    """
+    text = line if isinstance(line, str) else ""
+    index = text.find(PHONE_DISCLOSURE_RECORDING_SENTENCE)
+    if index <= 0:
+        return "", text
+    return text[:index], text[index:]
+
+
+def _split_parts_of(*lines: str) -> list[str]:
+    parts: list[str] = []
+    for line in lines:
+        part_a, part_b = phone_split_consent_line(line)
+        if part_a.strip():
+            parts.extend([part_a.strip(), part_b.strip()])
+    return parts
+
+
+def phone_disclosure_line_start(text: Any) -> bool:
+    """True when ``text`` is the FIRST audible piece of a fixed disclosure line
+    (the whole line, or its part A when the gate splits it)."""
+    if not isinstance(text, str):
+        return False
+    clean = text.strip()
+    starts = {PHONE_DISCLOSURE_TEXT, PHONE_DISCLOSURE_CONTINUATION_TEXT}
+    for line in (PHONE_DISCLOSURE_TEXT, PHONE_DISCLOSURE_CONTINUATION_TEXT):
+        part_a, _ = phone_split_consent_line(line)
+        if part_a.strip():
+            starts.add(part_a.strip())
+    return clean in starts
+
+
 #: The goodbye spoken on every pre-consent DEFERRAL that has no more specific
 #: line of its own: silence or an unreadable reply after a person spoke, a
 #: classifier timeout, exception or unknown verdict, and the gate wall-clock
@@ -887,6 +995,17 @@ def gate_copy_texts() -> frozenset[str]:
         # and break the Q1 priming guard exactly as described above.
         *_CONSENT_REASK_TEXTS.values(),
         PHONE_GATE_DEFERRAL_GOODBYE_TEXT,
+        # M013 S01 T05: the fixed answers to a consent-turn question, the
+        # re-ask spoken after one, and the two halves of each fixed
+        # disclosure line as the gate now speaks them (split at the recording
+        # sentence). The role answer carries a runtime value and is matched by
+        # its fixed frame in `is_gate_copy`.
+        PHONE_CONSENT_FAQ_HOW_LONG_TEXT,
+        PHONE_CONSENT_FAQ_WHO_REVIEWS_TEXT,
+        PHONE_CONSENT_FAQ_ROLE_UNKNOWN_TEXT,
+        phone_ai_identity_sentence(),
+        PHONE_CONSENT_REASK_AFTER_ANSWER_TEXT,
+        *_split_parts_of(PHONE_DISCLOSURE_TEXT, PHONE_DISCLOSURE_CONTINUATION_TEXT),
         PHONE_REFUSED_TEXT,
         PHONE_OPT_OUT_TEXT,
         # M009 PR-C (C7): the mid-call withdrawal confirmation and its single
@@ -921,6 +1040,10 @@ def is_gate_copy(text: Any) -> bool:
         # M009 PR-C (C5): the booked line names its time, so it is composed at
         # runtime and matched by its fixed prefix (`_callback_booked_text`).
         clean.startswith(_CALLBACK_BOOKED_PREFIX)
+    ) or (
+        # M013 S01 T05: the consent-turn "what role?" answer names the role.
+        clean.startswith(_CONSENT_FAQ_ROLE_PREFIX)
+        and clean.endswith(_CONSENT_FAQ_ROLE_SUFFIX)
     )
 
 
@@ -6400,6 +6523,28 @@ PHONE_IDENTITY_VERDICTS: frozenset[str] = frozenset([
     PHONE_IDENTITY_UNCLEAR,
 ])
 
+#: M013 S01 T05: a gate-judge intent at the identity turn → the existing
+#: verdict (S01-PLAN, fixed table). `opt_out`, `end_call` and
+#: `consent_declined` are terminal routes, handled before this lookup.
+#: `voicemail_machine` takes no action at identity (as today) and is never a
+#: reason to hang up here; `question` and `unclear` proceed (fail open).
+_IDENTITY_VERDICT_FOR_INTENT: dict[str, str] = {
+    gate_judge.INTENT_IDENTITY_CONFIRMED: PHONE_IDENTITY_SELF,
+    gate_judge.INTENT_CONSENT_GRANTED: PHONE_IDENTITY_SELF,
+    gate_judge.INTENT_WRONG_PERSON: PHONE_IDENTITY_OTHER,
+    gate_judge.INTENT_NOT_NOW_BUSY: PHONE_IDENTITY_UNAVAILABLE,
+    gate_judge.INTENT_QUESTION: PHONE_IDENTITY_UNCLEAR,
+    gate_judge.INTENT_UNCLEAR: PHONE_IDENTITY_UNCLEAR,
+    gate_judge.INTENT_VOICEMAIL: PHONE_IDENTITY_UNCLEAR,
+}
+#: The reverse view, for a shadow judge's agreement log only.
+_INTENT_FOR_IDENTITY_VERDICT: dict[str, str] = {
+    PHONE_IDENTITY_SELF: gate_judge.INTENT_IDENTITY_CONFIRMED,
+    PHONE_IDENTITY_OTHER: gate_judge.INTENT_WRONG_PERSON,
+    PHONE_IDENTITY_UNAVAILABLE: gate_judge.INTENT_NOT_NOW_BUSY,
+    PHONE_IDENTITY_UNCLEAR: gate_judge.INTENT_UNCLEAR,
+}
+
 #: The verdict words as WHOLE words. The `\b` on each side is load-bearing:
 #: without it `self` matches inside himself / herself / myself / yourself /
 #: itself — see `phone_classify_identity` for the misreads that produced.
@@ -6548,19 +6693,32 @@ async def phone_classify_identity(
     # would downgrade EVERY other_person verdict to self, screening whoever
     # answered. The backstop may only overrule the model when the record has a
     # name to overrule it WITH.
-    record_first = phone_safe_first_name(candidate_name)
-    introduced = phone_extract_introduced_name(reply)
-    if (
-        len(record_first) > 2
-        and introduced
-        and phone_name_mismatch(reply, candidate_name) is None
-    ):
+    if _identity_reply_names_the_record(reply, candidate_name):
         _log.info(
             "unknown_event", error_type="phone_identity_verdict",
             error_category="other_downgraded_record_name_spoken",
         )
         return PHONE_IDENTITY_SELF
     return PHONE_IDENTITY_OTHER
+
+
+def _identity_reply_names_the_record(reply: Any, candidate_name: Any) -> bool:
+    """The one-way record-name backstop (property 2 of `phone_classify_identity`).
+
+    True only when the reply CARRIES AN EXTRACTABLE NAME and that name is the
+    record's own; then an `other_person` verdict (from the identity model or,
+    since M013 S01 T05, from the gate judge) is downgraded to `self`. It only
+    ever moves a verdict toward continuing.
+    """
+    if not isinstance(reply, str):
+        return False
+    record_first = phone_safe_first_name(candidate_name)
+    introduced = phone_extract_introduced_name(reply)
+    return bool(
+        len(record_first) > 2
+        and introduced
+        and phone_name_mismatch(reply, candidate_name) is None
+    )
 
 
 def _opening_is_verified(text: Any) -> bool:
@@ -6608,6 +6766,16 @@ def phone_opening_draft_verified(text: Any, *, identity_done: bool = False) -> b
     # Keep the disclosure contract while allowing the introduction and question
     # to be naturally authored. A mention of 'record' alone is not disclosure.
     if PHONE_DISCLOSURE_RECORDING_SENTENCE not in clean:
+        return False
+    # M013 S01 T05: the notice must be heard BEFORE the question. A "yes" to
+    # a question asked ahead of the recording sentence was not informed, and
+    # the grant guards (which time evidence against the sentence) would
+    # re-ask it. Both fixed lines already put the sentence first.
+    if clean.find("?") < clean.find(PHONE_DISCLOSURE_RECORDING_SENTENCE):
+        _log.info(
+            "unknown_event", error_type="phone_gate_compose",
+            error_category="rejected_order",
+        )
         return False
     if _OPENING_IDENTITY_CUE_RE.search(clean):
         return False
@@ -6755,6 +6923,21 @@ async def run_phone_gate(
     # `rebase_lease_on_answer`. False (no session id or epoch to fence with)
     # keeps the re-base and caps the budget to the lease known to remain.
     start_lease_heartbeat: Optional[Callable[[], bool]] = None,
+    # ── M013 S01 T05 (all optional; absent ⇒ today's behaviour) ──────────
+    # The gate judge at the identity turn. Given the reply text, returns the
+    # judge's intent when a VALID verdict should act (`PHONE_GATE_JUDGE=llm`),
+    # or None: legacy mode, shadow mode, or the judge unavailable — then the
+    # legacy regex pre-checks and `phone_classify_identity` decide as today.
+    judge_identity: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
+    # Told the route the LEGACY identity path took, as a judge intent, so a
+    # shadow judge can log whether it agreed. Never changes the route.
+    note_identity_route: Optional[Callable[[str], Any]] = None,
+    # Stamp the moment the recording sentence is heard. With it, the consent
+    # line is spoken as two back-to-back lines split at the verbatim recording
+    # sentence (`phone_split_consent_line`); the stamp is taken between them
+    # (or just before the line when the sentence opens it). Absent ⇒ the line
+    # is spoken whole, byte-identical.
+    mark_recording_sentence: Optional[Callable[[], Any]] = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
@@ -7687,6 +7870,76 @@ async def run_phone_gate(
         # Out of turns: still a goodbye, never a silent hang-up (S01 T02).
         return await _defer_with_goodbye("callback_turns_exhausted")
 
+    async def _judge_identity_reply(reply: str) -> Optional[str]:
+        """T05: the judge's acting intent for one identity reply, or None."""
+        if judge_identity is None or not isinstance(reply, str) or not reply.strip():
+            return None
+        try:
+            intent = await judge_identity(reply)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a broken judge seam is "no verdict"
+            return None
+        return intent if isinstance(intent, str) and intent in gate_judge.INTENTS else None
+
+    def _note_identity_route(intent: str) -> None:
+        if note_identity_route is None:
+            return
+        try:
+            note_identity_route(intent)
+        except Exception:  # noqa: BLE001 — shadow bookkeeping never fails the gate
+            pass
+
+    async def _identity_route(reply: str, *, stage: str) -> "PhoneGateResult | str":
+        """Route ONE identity reply: a terminal result, or an identity verdict.
+
+        T05: in llm mode a valid judge verdict decides through the fixed
+        intent → verdict table (`_IDENTITY_VERDICT_FOR_INTENT`); the regex
+        pre-checks and `phone_classify_identity` run only in legacy/shadow
+        mode or when the judge was unavailable. The record-name backstop still
+        applies to a judged `wrong_person`, and only ever moves toward
+        continuing.
+        """
+        judged = await _judge_identity_reply(reply)
+        if judged is not None:
+            if judged == gate_judge.INTENT_OPT_OUT:
+                return await _terminal_outcome(CLASSIFY_OPT_OUT)
+            if judged in (gate_judge.INTENT_END_CALL, gate_judge.INTENT_CONSENT_DECLINED):
+                return await _end_before_consent()
+            verdict = _IDENTITY_VERDICT_FOR_INTENT.get(judged, PHONE_IDENTITY_UNCLEAR)
+            if verdict == PHONE_IDENTITY_OTHER and _identity_reply_names_the_record(
+                    reply, candidate_name):
+                _log.info(
+                    "unknown_event", error_type="phone_identity_verdict",
+                    error_category="other_downgraded_record_name_spoken",
+                )
+                verdict = PHONE_IDENTITY_SELF
+            _log.info(
+                "unknown_event", error_type="phone_identity_verdict",
+                error_category=verdict, schema=f"{stage}_judge",
+            )
+            return verdict
+        gate_verdict = classify_gate_reply(reply) if classify_gate_reply else None
+        if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
+            _note_identity_route(
+                gate_judge.INTENT_OPT_OUT if gate_verdict == CLASSIFY_OPT_OUT
+                else gate_judge.INTENT_WRONG_PERSON)
+            return await _terminal_outcome(gate_verdict)
+        if phone_preconsent_end_requested(reply):
+            _note_identity_route(gate_judge.INTENT_END_CALL)
+            return await _end_before_consent()
+        if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
+            _note_identity_route(gate_judge.INTENT_NOT_NOW_BUSY)
+            return await _schedule_before_consent(reply)
+        verdict = await phone_classify_identity(reply, candidate_name)
+        _log.info(
+            "unknown_event", error_type="phone_identity_verdict",
+            error_category=verdict, schema=stage,
+        )
+        _note_identity_route(
+            _INTENT_FOR_IDENTITY_VERDICT.get(verdict, gate_judge.INTENT_UNCLEAR))
+        return verdict
+
     identity_reply = ""
     if identity_ran:
         first_reply = await _ask_identity(
@@ -7694,18 +7947,10 @@ async def run_phone_gate(
             phone_identity_text(candidate_name),
         )
         identity_reply = first_reply
-        gate_verdict = classify_gate_reply(first_reply) if classify_gate_reply else None
-        if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
-            return await _terminal_outcome(gate_verdict)
-        if phone_preconsent_end_requested(first_reply):
-            return await _end_before_consent()
-        if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
-            return await _schedule_before_consent(first_reply)
-        identity_verdict = await phone_classify_identity(first_reply, candidate_name)
-        _log.info(
-            "unknown_event", error_type="phone_identity_verdict",
-            error_category=identity_verdict, schema="first",
-        )
+        routed = await _identity_route(first_reply, stage="first")
+        if isinstance(routed, PhoneGateResult):
+            return routed
+        identity_verdict = routed
         if identity_verdict == PHONE_IDENTITY_OTHER:
             # ONE confirming re-ask, never more. The person who says "no, this
             # is her father" may equally be the candidate correcting a mangled
@@ -7719,20 +7964,10 @@ async def run_phone_gate(
                 phone_identity_reask_text(candidate_name),
             )
             identity_reply = second_reply
-            gate_verdict = classify_gate_reply(second_reply) if classify_gate_reply else None
-            if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
-                return await _terminal_outcome(gate_verdict)
-            if phone_preconsent_end_requested(second_reply):
-                return await _end_before_consent()
-            if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
-                return await _schedule_before_consent(second_reply)
-            identity_verdict = await phone_classify_identity(
-                second_reply, candidate_name,
-            )
-            _log.info(
-                "unknown_event", error_type="phone_identity_verdict",
-                error_category=identity_verdict, schema="reask",
-            )
+            routed = await _identity_route(second_reply, stage="reask")
+            if isinstance(routed, PhoneGateResult):
+                return routed
+            identity_verdict = routed
             # The re-ask verdict stands on its own, and DELIBERATELY is not
             # coerced. An earlier draft forced everything-but-`other_person` to
             # `self` here as a fail-open; that also swallowed `unavailable`, so
@@ -7821,6 +8056,41 @@ async def run_phone_gate(
     if identity_ran:
         _ask_barrier()
 
+    def _mark_recording_heard() -> None:
+        if mark_recording_sentence is None:
+            return
+        try:
+            mark_recording_sentence()
+        except Exception:  # noqa: BLE001 — a missed stamp leaves the question anchor
+            _log.warn(
+                "unknown_event", error_type="phone_gate_recording_anchor",
+                error_category="mark_failed",
+            )
+
+    async def _say_consent_line(line: str) -> None:
+        """T05: speak the consent line split at the verbatim recording sentence.
+
+        Part A (the text before the sentence) and part B (the sentence and
+        the question) are two back-to-back lines; their concatenation is the
+        line, character for character. The recording anchor is stamped
+        between them, after part A's playout (the agent raises it to part B's
+        first audio when the SDK reports one). When the sentence opens the
+        line there is no part A: the stamp is taken before the line and
+        raised to its first audio. Without the seam the line is spoken whole.
+        """
+        part_a, part_b = phone_split_consent_line(line)
+        if (mark_recording_sentence is None
+                or PHONE_DISCLOSURE_RECORDING_SENTENCE not in part_b):
+            await _say(line)
+            return
+        if not part_a.strip():
+            _mark_recording_heard()
+            await _say(line)
+            return
+        await _say(part_a.rstrip())
+        _mark_recording_heard()
+        await _say(part_b)
+
     # ── The opening: model-generated-and-verified, or the fixed disclosure ─
     if compose_opening is not None:
         draft = await compose_opening()
@@ -7830,7 +8100,7 @@ async def run_phone_gate(
         )
         # Playout errors propagate. Replaying a fallback after audio may have
         # started would recreate the duplicate opening this path removes.
-        await _say(line)
+        await _say_consent_line(line)
         opening_spoken.append(line)
     elif speak_opening is not None:
         try:
@@ -7877,10 +8147,10 @@ async def run_phone_gate(
                 PHONE_DISCLOSURE_CONTINUATION_TEXT if heard
                 else _fixed_disclosure_text()
             )
-            await _say(fallback)
+            await _say_consent_line(fallback)
             opening_spoken.append(fallback)
     else:
-        await _say(_fixed_disclosure_text())
+        await _say_consent_line(_fixed_disclosure_text())
         opening_spoken.append(_fixed_disclosure_text())
 
     timeout = (

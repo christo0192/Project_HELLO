@@ -171,6 +171,18 @@ import phone  # noqa: E402
 import prompting  # noqa: E402
 
 
+def _disclosure_as_spoken(text=None) -> list:
+    """M013 S01 T05: how the session speaks a fixed disclosure line.
+
+    The gate splits the consent line at the verbatim recording sentence and
+    speaks the halves back to back (`phone.phone_split_consent_line`), so the
+    recording anchor is known. Same words, character for character.
+    """
+    line = phone.PHONE_DISCLOSURE_TEXT if text is None else text
+    part_a, part_b = phone.phone_split_consent_line(line)
+    return [part_a.rstrip(), part_b] if part_a.strip() else [line]
+
+
 def _timed_ms(fn, *args) -> float:
     """Wall-clock milliseconds for one call — used for ReDoS bound assertions."""
     import time as _time  # local import; the module has no top-level `time`
@@ -4991,10 +5003,11 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         )
         # The SDK-free fixture has no model stream: it uses the validated
         # fallback via say, outside the screening generation instructions.
+        # (T05: spoken as two halves split at the recording sentence.)
+        self.assertEqual(session.spoken[:2], _disclosure_as_spoken())
         self.assertIn(
-            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.spoken[0]
+            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.spoken[1]
         )
-        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
         terminal_context = str(session.turn_contexts[-1]).lower()
         self.assertIn("goodbye", terminal_context)
         self.assertIn("do not ask another question", terminal_context)
@@ -5227,7 +5240,8 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             answers=("Yes, that's fine.",),
             replies=["First answer.", "Second answer."],
         )
-        self.assertIn("okay to continue", session.spoken[0].lower())
+        # T05: the consent line is spoken as two halves; the question ends it.
+        self.assertIn("okay to continue", " ".join(session.spoken[:2]).lower())
         self.assertIn("First question?", session.spoken)
         self.assertEqual(client.committed_keys, ["k1", "k2"])
         # The opening is privately composed; only screening replies generate.
@@ -5605,10 +5619,11 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # different person — through the verified model opening (which MUST carry
         # the recording sentence). It is deliberately NOT a transcript turn: the
         # gate opening is gate copy, and no boundary carries it.
+        # (T05: spoken as two halves split at the recording sentence.)
+        self.assertEqual(session.spoken[:2], _disclosure_as_spoken())
         self.assertIn(
-            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.spoken[0]
+            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.spoken[1]
         )
-        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
         for boundary in client.boundaries:
             for turn in boundary["turns"]:
                 self.assertNotIn("recorded so the hiring team", turn["text"])
@@ -5702,7 +5717,9 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # confirmations go through `say`; the gate opening is a generated
         # conversation item (verified, so never the fixed disclosure via say).
         self.assertIn(phone._SCHEDULE_CONFIRMED_TEXT, session.spoken)
-        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.emitted_bot_turns)
+        # T05: the disclosure is emitted as its two halves.
+        for half in _disclosure_as_spoken():
+            self.assertIn(half, session.emitted_bot_turns)
         # …and a real generated turn DID survive, so the filter is not simply
         # dropping everything the bot says.
         self.assertTrue(any(t.startswith("asked-") for t in committed))
@@ -18340,8 +18357,13 @@ class TestUnsetEnvSelectsTheScriptedGate(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(session)
         spoken = " ".join(session.spoken)
-        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken,
+        # T05: the fixed disclosure is spoken as its two halves, back to back.
+        halves = _disclosure_as_spoken()
+        self.assertIn(halves[0], session.spoken,
                       f"the fixed disclosure was not spoken: {session.spoken!r}")
+        start = session.spoken.index(halves[0])
+        self.assertEqual(session.spoken[start:start + len(halves)], halves,
+                         f"the fixed disclosure was not spoken: {session.spoken!r}")
         # The identity turn is the conversational flow's, and must not appear.
         self.assertNotIn("Am I speaking", spoken,
                          f"an identity turn ran with nothing configured: {spoken!r}")

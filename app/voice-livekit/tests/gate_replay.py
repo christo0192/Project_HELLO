@@ -39,9 +39,11 @@ is modelled in ``GateReplay`` itself:
   ``agent_state_changed`` -> ``speaking`` handler) and returns at playout end.
 
 T01b replaced the origin/main producer (committed turns stamped with the
-SDK's speech start) with the per-final capture; T04/T05 add judge phases to
-``judge_responses`` and a driver for the real ``run_phone_gate``. Extend this
-module; do not fork it.
+SDK's speech start) with the per-final capture. T05 adds ``drive_with_judge``:
+the session's judge wiring (``agent._GateJudgeWiring``) on a recorded,
+virtual-clock judge transport (``ReplayJudgeTransport``), the consent line
+split at the recording sentence (``GateReplay.say_split``) and the recording
+anchor (``agent._GateRecordingAnchor``). Extend this module; do not fork it.
 
 PRIVACY. Fixture files are named by session prefix only, hold a synthetic first
 name, relative times and short non-identifying utterances. ``load_fixture``
@@ -539,6 +541,25 @@ class SessionGlue:
         self.capture = agent_mod._new_gate_turn_capture(self._emit_gate_turn)
         # agent.py `gate_spoke` (T02): one latch shared by every gate reader.
         self.spoke = gate_judge.HumanSpeechLatch()
+        # agent.py `gate_recording_anchor` and `gate_last_line` (T05).
+        self.recording_anchor = agent_mod._GateRecordingAnchor()
+        self.last_line: list[str] = [""]
+        # agent.py `gate_judge_wiring` (T05); built by `attach_judge`.
+        self.judge: Any = None
+
+    # agent.py `gate_judge_wiring = _GateJudgeWiring(...)`
+    def attach_judge(self, **kwargs: Any) -> Any:
+        self.judge = agent_mod._GateJudgeWiring(
+            capture=self.capture, latch=self.spoke,
+            question_anchor=self.question_anchor,
+            recording_anchor=lambda: self.recording_anchor.value,
+            **kwargs,
+        )
+        return self.judge
+
+    # agent.py `_mark_recording_sentence`
+    def mark_recording_sentence(self) -> None:
+        self.recording_anchor.mark(int(round(agent_mod.time.time() * 1000)))
 
     # agent.py `_emit_gate_turn`
     def _emit_gate_turn(self, turn: Any) -> None:
@@ -560,19 +581,23 @@ class SessionGlue:
     # agent.py `_mark_question_asked`
     def mark_question_asked(self) -> None:
         self.gate_question_anchor[0] = int(round(agent_mod.time.time() * 1000))
+        self.recording_anchor.reset()
         self.clear_user_turn_calls += 1
 
     # agent.py `_clear_question_anchor`
     def clear_question_anchor(self) -> None:
         self.gate_question_anchor[0] = None
         self.capture.stop()
+        if self.judge is not None:
+            self.judge.stop()
 
     # agent.py `_on_phone_agent_state_changed`, new_state == "speaking"
     def on_agent_speaking(self) -> None:
+        first_audio_ms = int(round(agent_mod.time.time() * 1000))
         if self.gate_question_anchor[0] is not None:
-            first_audio_ms = int(round(agent_mod.time.time() * 1000))
             if first_audio_ms > self.gate_question_anchor[0]:
                 self.gate_question_anchor[0] = first_audio_ms
+        self.recording_anchor.on_first_audio(first_audio_ms)
 
     # agent.py `_on_phone_vad_event`
     def on_vad_event(self, event: Any) -> None:
@@ -648,6 +673,11 @@ class GateReplayResult:
     gate_turns: list[Any] = field(default_factory=list)
     end_call_requested: bool = False
     glue: Any = None
+    # T05 (`drive_with_judge`): the wiring, its recorded transport, and the
+    # split consent line's (part A end, part B first audio), relative ms.
+    judge: Any = None
+    judge_transport: Any = None
+    split_times: tuple[int, int] | None = None
 
     def candidate_rows(self) -> list[tuple]:
         """The candidate `gate_pending` rows the session would have buffered."""
@@ -744,12 +774,66 @@ class GateReplay:
             first_audio = start + _DEFAULT_FIRST_AUDIO_DELAY_MS
             end = first_audio + max(_DEFAULT_MIN_PLAYOUT_MS, _DEFAULT_PLAYOUT_MS_PER_CHAR * len(text))
         await self.wait_until(start)
+        last_line = getattr(self.glue, "last_line", None)
+        if last_line is not None:
+            last_line[0] = text  # agent.py `say`: `gate_last_line[0] = text`
         self._bot_playing_until_ms = end
         await self.wait_until(first_audio)
         self.glue.on_agent_speaking()
         await self.wait_until(end)
         self._bot_playing_until_ms = None
         self.result.spoken.append(SpokenLine(kind, text, start, first_audio, end))
+
+    async def say_split(
+        self, line: str, *, kind: str, gap_ms: int = 120, state_toggles: bool = True,
+    ) -> tuple[int, int]:
+        """The gate's split consent line (T05), as two back-to-back ``say``s.
+
+        Timed on the n-th recorded line of ``kind`` (or the defaults): part A
+        starts at its first audio and takes its share of the playout by
+        length; part B's first audio follows ``gap_ms`` after part A ends.
+        Between them the session stamps the recording anchor
+        (`_mark_recording_sentence`). ``state_toggles`` models the SDK
+        reporting ``speaking`` again for part B (which raises the anchor to
+        its first audio); without it the anchor stays at part A's end.
+        Returns ``(part_a_end_ms, part_b_first_audio_ms)`` (relative).
+        """
+        part_a, part_b = phone.phone_split_consent_line(line)
+        if not part_a.strip():
+            raise ReplayError("say_split needs a line with text before the sentence")
+        index = self._line_cursor.get(kind, 0)
+        self._line_cursor[kind] = index + 1
+        recorded = self.fixture.lines_of(kind)
+        start = self.now_ms
+        if index < len(recorded):
+            rec = recorded[index]
+            start = max(start, rec.ask_ms)
+            first_audio = start + (rec.first_audio_ms - rec.ask_ms)
+            end = start + (rec.playout_end_ms - rec.ask_ms)
+        else:
+            first_audio = start + _DEFAULT_FIRST_AUDIO_DELAY_MS
+            end = first_audio + max(_DEFAULT_MIN_PLAYOUT_MS, _DEFAULT_PLAYOUT_MS_PER_CHAR * len(line))
+        share = len(part_a) / max(1, len(line))
+        a_end = first_audio + int(round((end - first_audio) * share))
+        b_first = a_end + max(0, int(gap_ms))
+        b_end = end + max(0, int(gap_ms))
+        await self.wait_until(start)
+        self.glue.last_line[0] = part_a.rstrip()
+        self._bot_playing_until_ms = a_end
+        await self.wait_until(first_audio)
+        self.glue.on_agent_speaking()
+        await self.wait_until(a_end)
+        self.result.spoken.append(SpokenLine(f"{kind}_a", part_a.rstrip(), start, first_audio, a_end))
+        self.glue.mark_recording_sentence()
+        self.glue.last_line[0] = part_b
+        self._bot_playing_until_ms = b_end
+        await self.wait_until(b_first)
+        if state_toggles:
+            self.glue.on_agent_speaking()
+        await self.wait_until(b_end)
+        self._bot_playing_until_ms = None
+        self.result.spoken.append(SpokenLine(kind, part_b, a_end, b_first, b_end))
+        return a_end, b_first
 
     # recorded model responses ----------------------------------------------
 
@@ -932,6 +1016,189 @@ async def drive_identity_then_consent(rt: GateReplay) -> GateReplayResult:
     )
     result.decision_at_ms = rt.now_ms
     return result
+
+
+# ── the gate judge (T05) ─────────────────────────────────────────────────
+
+#: An enabled DeepSeek judge config for replays (no network: the transport
+#: below answers from recorded responses).
+JUDGE_CONFIG = gate_judge.JudgeConfig(
+    enabled=True, url="https://api.deepseek.com/v1/chat/completions",
+    model="deepseek-v4-flash", api_key="replay-key",
+)
+
+#: A recorded response that never arrives (the judge times out).
+JUDGE_TIMEOUT = "__timeout__"
+
+
+def judge_json(intent: str, evidence: str = "", **extra: Any) -> str:
+    """A recorded judge answer in the minimal output schema."""
+    return json.dumps({"intent": intent, "evidence": evidence, "confidence": 0.9, **extra})
+
+
+class _JudgeResponse:
+    def __init__(self, content: str) -> None:
+        self.status_code = 200
+        self._content = content
+
+    def json(self) -> Any:
+        return {"choices": [{"message": {"content": self._content}}]}
+
+
+class ReplayJudgeTransport:
+    """Answers judge requests from recorded ``(raw, latency_ms)`` per phase.
+
+    Runs on the replay's virtual clock. Asking for more responses than were
+    recorded is a replay error (a different call), like ``recorded_infer``.
+    ``calls`` keeps ``(phase, t_ms, payload)`` for every request.
+    """
+
+    def __init__(self, rt: "GateReplay", responses: dict[str, list[tuple[str, int]]]) -> None:
+        self.rt = rt
+        self.responses = {phase: list(items) for phase, items in responses.items()}
+        self.calls: list[tuple[str, int, dict]] = []
+
+    async def request(self, *, method: str, url: str, json: Any = None,  # noqa: A002
+                      headers: Any = None, timeout: Any = None) -> Any:
+        content = json["messages"][1]["content"]
+        payload = _json_loads(content[len("DATA "):])
+        phase = payload.get("phase")
+        self.calls.append((phase, self.rt.now_ms, payload))
+        queue = self.responses.get(phase) or []
+        if not queue:
+            error = ReplayError(
+                f"{self.rt.fixture.name}: no recorded judge {phase} response "
+                f"#{sum(1 for c in self.calls if c[0] == phase)}")
+            self.rt._replay_errors.append(error)
+            raise error
+        raw, latency_ms = queue.pop(0)
+        if raw == JUDGE_TIMEOUT:
+            await asyncio.sleep(3600)
+        await asyncio.sleep(latency_ms / 1000.0)
+        return _JudgeResponse(raw)
+
+
+def _json_loads(text: str) -> Any:
+    return json.loads(text)
+
+
+def replay_breaker() -> Any:
+    from provider_resilience import CircuitBreaker, CircuitBreakerConfig
+
+    return CircuitBreaker(CircuitBreakerConfig(
+        failure_threshold=50, cooldown_sec=30.0, timeout_sec=0))
+
+
+def drive_with_judge(
+    *,
+    mode: str,
+    responses: dict[str, list[tuple[str, int]]] | None = None,
+    split: bool = True,
+    gap_ms: int = 120,
+    state_toggles: bool = True,
+    anchor_consent: bool = True,
+    budget_seconds: float | None = 180.0,
+    role_title: str | None = None,
+    shadow_settle_ms: int = 5000,
+) -> Callable[["GateReplay"], Awaitable[Any]]:
+    """A driver like ``drive_identity_then_consent``, with the T05 judge.
+
+    The judge wiring is the session's (`agent._GateJudgeWiring`, via
+    ``SessionGlue.attach_judge``) with a recorded transport. Identity, in
+    llm mode, is judged the way `agent._judge_identity` does it (the reader
+    does not latch; a valid verdict maps through the gate's table; an
+    unavailable judge falls back to the recorded legacy classifier). The
+    consent line is spoken split at the recording sentence (``split``), and
+    the consent read is the real `_classify_phone_answer` with the wiring.
+    ``anchor_consent=False`` models the deterministic flow, which sets no
+    question anchor before the consent line.
+    """
+    async def _driver(rt: "GateReplay") -> GateReplayResult:
+        result = rt.result
+        glue = rt.glue
+        transport = ReplayJudgeTransport(rt, responses or {})
+        result.judge_transport = transport
+        budget = None
+        if budget_seconds is not None:
+            budget = phone.GateBudget(budget_seconds, clock=rt.clock.monotonic)
+            budget.start()
+        wiring = glue.attach_judge(
+            mode=mode, config=JUDGE_CONFIG, transport=transport,
+            breaker=replay_breaker(), budget=budget,
+            first_name=rt.fixture.candidate_first_name,
+            log=lambda **fields: result.logs.append(
+                LogRecord("gate_judge", "info", "unknown_event", dict(fields), rt.now_ms)),
+            clock=rt.clock.monotonic,
+        )
+        result.judge = wiring
+        first_name = rt.fixture.candidate_first_name
+        if rt.fixture.has_line("identity"):
+            await rt.wait_until(rt.fixture.lines_of("identity")[0].ask_ms)
+            glue.mark_question_asked()
+            await rt.say(phone.phone_identity_text(first_name), kind="identity")
+            reply = await agent_mod._read_fresh_turn(
+                glue.user_turns, glue.question_anchor,
+                phone.phone_identity_answer_timeout_sec(),
+                speaking=glue.is_candidate_speaking,
+                hard_timeout_sec=phone.phone_classify_answer_timeout_sec(),
+                spoke=None if wiring.acting else glue.spoke,
+            )
+            result.identity_reply = reply
+            verdict = None
+            if reply and wiring.acting:
+                decision = await wiring.decide(
+                    gate_judge.PHASE_IDENTITY, glue.last_line[0], legacy=lambda: None)
+                if decision.source == gate_judge.SOURCE_LLM and decision.intent:
+                    verdict = phone._IDENTITY_VERDICT_FOR_INTENT.get(
+                        decision.intent, phone.PHONE_IDENTITY_UNCLEAR)
+                else:
+                    glue.spoke.note_reply(
+                        reply, machine_match=agent_mod._is_machine_text(reply),
+                        source=gate_judge.SPOKE_SOURCE_IDENTITY)
+            elif reply and wiring.shadowing:
+                wiring.shadow_identity(glue.last_line[0])
+            if verdict is None:
+                verdict = await phone.phone_classify_identity(
+                    reply, first_name, infer=rt.recorded_infer("identity"))
+                if wiring.shadowing:
+                    wiring.note_identity_route(
+                        phone._INTENT_FOR_IDENTITY_VERDICT.get(verdict, "unclear"))
+            result.identity_verdict = verdict
+            result.identity_decided_at_ms = rt.now_ms
+            consent_text = phone.PHONE_DISCLOSURE_CONTINUATION_TEXT
+        else:
+            consent_text = phone.PHONE_DISCLOSURE_TEXT
+        await rt.wait_until(rt.fixture.lines_of("consent")[0].ask_ms)
+        if anchor_consent:
+            glue.mark_question_asked()
+        if split:
+            result.split_times = await rt.say_split(
+                consent_text, kind="consent", gap_ms=gap_ms, state_toggles=state_toggles)
+        else:
+            await rt.say(consent_text, kind="consent")
+
+        async def _reader_say(text: str) -> None:
+            await rt.say(text, kind="reask")
+
+        result.decision = await agent_mod._classify_phone_answer(
+            glue.user_turns, _reader_say,
+            consumed=result.consumed,
+            question_anchor=glue.question_anchor,
+            on_grant_evidence=glue.on_grant_evidence,
+            spoke=glue.spoke,
+            budget=budget,
+            judge=wiring,
+            bot_line=lambda: glue.last_line[0],
+            role_title=role_title,
+        )
+        result.decision_at_ms = rt.now_ms
+        if wiring.shadowing and shadow_settle_ms:
+            # Let in-flight shadow calls finish so their logs can be read; the
+            # decision time above was taken BEFORE this wait.
+            await asyncio.sleep(shadow_settle_ms / 1000.0)
+        return result
+
+    return _driver
 
 
 def replay(

@@ -1683,6 +1683,322 @@ def _gate_user_row_is_evidence_echo(
     return bool(idxs) and f"final-{idxs[0]}" in evidence_keys
 
 
+# ── M013 S01 T05: the gate judge, wired into the readers ──────────────────
+#
+# `PHONE_GATE_JUDGE` (gate_judge.judge_mode):
+#
+# * ``legacy`` (the code default): today's readers, unchanged;
+# * ``shadow``: the judge runs concurrently on the same window, fire-and-
+#   forget, and its decision is logged with whether it agreed; the legacy
+#   result acts and its timing is unchanged;
+# * ``llm``: a VALID judge verdict acts. When the judge is unavailable the
+#   legacy regex decides (it may grant, but only on speech that began after
+#   the recording sentence was heard). A valid non-grant verdict is never
+#   overridden by the regex, and a judge grant that fails a deterministic
+#   guard is `unclear` (gate_judge.judge_gate), never a regex fallback.
+
+#: A consent-phase judge intent → the gate's existing classification. `None`
+#: means "not a decision": the reader re-asks (or, out of attempts, defers).
+_CONSENT_CLASSIFICATION_FOR_INTENT: dict[str, str | None] = {
+    gate_judge.INTENT_CONSENT_GRANTED: phone.CLASSIFY_HUMAN,
+    gate_judge.INTENT_CONSENT_DECLINED: phone.CLASSIFY_REFUSED,
+    gate_judge.INTENT_OPT_OUT: phone.CLASSIFY_OPT_OUT,
+    gate_judge.INTENT_NOT_NOW_BUSY: phone.CLASSIFY_CALLBACK_REQUESTED,
+    gate_judge.INTENT_END_CALL: phone.CLASSIFY_END_REQUESTED,
+    gate_judge.INTENT_WRONG_PERSON: phone.CLASSIFY_WRONG_NUMBER,
+    gate_judge.INTENT_VOICEMAIL: phone.CLASSIFY_MACHINE,
+    gate_judge.INTENT_QUESTION: None,
+    gate_judge.INTENT_UNCLEAR: None,
+    gate_judge.INTENT_IDENTITY_CONFIRMED: None,
+}
+#: The reverse view: a legacy classification as a judge intent (for the
+#: fallback's audit line and the shadow agreement log).
+_INTENT_FOR_CLASSIFICATION: dict[str | None, str] = {
+    phone.CLASSIFY_HUMAN: gate_judge.INTENT_CONSENT_GRANTED,
+    phone.CLASSIFY_REFUSED: gate_judge.INTENT_CONSENT_DECLINED,
+    phone.CLASSIFY_OPT_OUT: gate_judge.INTENT_OPT_OUT,
+    phone.CLASSIFY_CALLBACK_REQUESTED: gate_judge.INTENT_NOT_NOW_BUSY,
+    phone.CLASSIFY_END_REQUESTED: gate_judge.INTENT_END_CALL,
+    phone.CLASSIFY_WRONG_NUMBER: gate_judge.INTENT_WRONG_PERSON,
+    phone.CLASSIFY_MACHINE: gate_judge.INTENT_VOICEMAIL,
+    None: gate_judge.INTENT_UNCLEAR,
+}
+
+#: How long the consent reader waits for a turn that is still being spoken
+#: (or still awaiting its STT final) before a judge grant may be applied. The
+#: pairing window plus a settle, with headroom; always also bounded by the
+#: gate budget. A wait that expires re-checks quiescence (an expired blip is
+#: quiet again); at most `GATE_JUDGE_MAX_REJUDGES` waits, then `unclear`.
+_GATE_QUIESCENCE_WAIT_MAX_SEC = 6.0
+
+#: How far after part A's end part B's first audio may still raise the
+#: recording anchor (synthesis of part B; S01-PLAN measures the live gap on
+#: T14 and expects it far below this).
+_RECORDING_ANCHOR_RAISE_MAX_MS = 3000
+
+
+class _GateRecordingAnchor:
+    """When the recording sentence of the consent line was heard (ms).
+
+    ``mark`` stamps it between the two halves of the split consent line (part
+    A's playout end) and ARMS a one-shot raise: the next first audio the SDK
+    reports (part B's, when the agent state toggles between the halves) lifts
+    it, never lowers it. ``reset`` at each new gate question. Pure; the
+    session and the replay harness call the same methods.
+    """
+
+    __slots__ = ("value", "_armed")
+
+    def __init__(self) -> None:
+        self.value: int | None = None
+        self._armed = False
+
+    def reset(self) -> None:
+        self.value = None
+        self._armed = False
+
+    def mark(self, now_ms: int) -> None:
+        self.value = int(now_ms)
+        self._armed = True
+
+    def on_first_audio(self, first_audio_ms: int) -> None:
+        if not self._armed or self.value is None:
+            return
+        self._armed = False
+        # Only part B's own first audio may raise it: it follows part A's
+        # end within synthesis time. A later "speaking" (when the SDK never
+        # toggled between the halves, the next line's first audio) leaves the
+        # anchor at part A's end.
+        if self.value < first_audio_ms <= self.value + _RECORDING_ANCHOR_RAISE_MAX_MS:
+            self.value = int(first_audio_ms)
+
+
+class _GateJudgeWiring:
+    """One call's gate judge: mode, inputs, and the decision/shadow calls.
+
+    Built by `_run_phone_session` (and by the replay harness) from the call's
+    `gate_judge.GateTurnCapture`, its `HumanSpeechLatch`, the question anchor,
+    the recording anchor and the gate budget. The transport, config, breaker,
+    clock and log sink are injectable so tests replay recorded responses.
+    Never raises to a reader.
+    """
+
+    def __init__(
+        self,
+        *,
+        capture: "gate_judge.GateTurnCapture",
+        latch: "gate_judge.HumanSpeechLatch",
+        question_anchor: "Callable[[], int | None]",
+        recording_anchor: "Callable[[], int | None] | None" = None,
+        budget: "phone.GateBudget | None" = None,
+        first_name: Any = "",
+        mode: str | None = None,
+        config: Any = None,
+        transport: Any = None,
+        breaker: Any = None,
+        log: "Callable[..., None] | None" = None,
+        clock: "Callable[[], float] | None" = None,
+    ) -> None:
+        self.capture = capture
+        self.latch = latch
+        self._question_anchor = question_anchor
+        self._recording_anchor = recording_anchor
+        self.budget = budget
+        self.first_name = gate_judge.first_name_only(first_name)
+        self.mode = mode if mode in gate_judge.GATE_JUDGE_MODES else gate_judge.judge_mode()
+        self.config = config
+        self.transport = transport
+        self.breaker = breaker
+        self.log = log if log is not None else _gate_judge_log
+        self.clock = clock if clock is not None else (lambda: time.monotonic())
+        self._shadow_tasks: "set[asyncio.Task[Any]]" = set()
+        self._identity_shadow: "asyncio.Task[Any] | None" = None
+        self.stopped = False
+
+    # ── mode ─────────────────────────────────────────────────────────────
+    @property
+    def acting(self) -> bool:
+        return self.mode == gate_judge.GATE_JUDGE_MODE_LLM and not self.stopped
+
+    @property
+    def shadowing(self) -> bool:
+        return self.mode == gate_judge.GATE_JUDGE_MODE_SHADOW and not self.stopped
+
+    # ── inputs ───────────────────────────────────────────────────────────
+    def recording_anchor_ms(self) -> int | None:
+        if self._recording_anchor is None:
+            return None
+        try:
+            value = self._recording_anchor()
+        except Exception:  # noqa: BLE001
+            return None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    def tag_anchor_ms(self) -> int | None:
+        """The anchor utterances are tagged against: the question's; else
+        (the deterministic flow sets none) the recording sentence's."""
+        try:
+            value = self._question_anchor()
+        except Exception:  # noqa: BLE001
+            value = None
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return self.recording_anchor_ms()
+
+    def window(self) -> "tuple[gate_judge.GateUtterance, ...]":
+        return self.capture.utterances.tagged(self.tag_anchor_ms())
+
+    def pending_speech(self, after_idx: int | None) -> str | None:
+        """Quiescence for a grant: the capture's own probe, plus a final the
+        judge saw whose turn has not closed yet (the reader has not consumed
+        it, so the grant could not cite it as evidence)."""
+        why = self.capture.pending_speech(after_idx)
+        if why is None and self.capture.active and self.capture.has_open_finals:
+            return "open_turn"
+        return why
+
+    def timeout_sec(self) -> float:
+        if self.budget is not None:
+            return self.budget.judge_timeout_sec()
+        return gate_judge.judge_timeout_sec()
+
+    def request(self, phase: str, bot_line: Any) -> "gate_judge.GateJudgeRequest":
+        consent = phase in (gate_judge.PHASE_CONSENT, gate_judge.PHASE_CONSENT_RETRY)
+        return gate_judge.GateJudgeRequest(
+            phase=phase, bot_line=str(bot_line or ""), utterances=self.window(),
+            first_name=self.first_name,
+            recording_anchor_ms=self.recording_anchor_ms() if consent else None,
+        )
+
+    # ── decisions ────────────────────────────────────────────────────────
+    async def decide(
+        self,
+        phase: str,
+        bot_line: Any,
+        *,
+        legacy: "Callable[[], Any] | None",
+        wait_for_more: "Callable[[str], Awaitable[Any]] | None" = None,
+    ) -> "gate_judge.GateDecision":
+        """The acting decision (llm mode). Latches `candidate_spoke` on a
+        valid verdict that is not voicemail; never raises."""
+        decision = await gate_judge.judge_gate(
+            self.request(phase, bot_line),
+            timeout_sec=self.timeout_sec, legacy=legacy,
+            pending=self.pending_speech, wait_for_more=wait_for_more,
+            config=self.config, transport=self.transport, breaker=self.breaker,
+            log=self.log, clock=self.clock,
+        )
+        if decision.source == gate_judge.SOURCE_LLM and decision.intent is not None:
+            self.latch.note_judge_intent(decision.intent)
+        return decision
+
+    def shadow(self, phase: str, bot_line: Any, legacy_intent: str | None) -> "asyncio.Task[Any] | None":
+        """Shadow mode: judge the same window concurrently and log agreement.
+
+        Fire-and-forget: the caller never awaits it, so the acting (legacy)
+        decision time is unchanged. No legacy reader, no quiescence wait, no
+        latch. Cancelled when the gate ends.
+        """
+        if not self.shadowing:
+            return None
+        request = self.request(phase, bot_line)
+
+        def _shadow_log(**fields: Any) -> None:
+            # A shadow decision is audited on its own line, so the acting
+            # `phone_gate_decision` counts stay the decisions that acted.
+            if fields.get("error_type") == "phone_gate_decision":
+                fields = {**fields, "error_type": "phone_gate_shadow_decision"}
+            self.log(**fields)
+
+        async def _run() -> "gate_judge.GateDecision":
+            decision = await gate_judge.judge_gate(
+                request, timeout_sec=self.timeout_sec, legacy=None,
+                config=self.config, transport=self.transport, breaker=self.breaker,
+                log=_shadow_log, clock=self.clock,
+            )
+            if legacy_intent is not None:
+                self._log_agreement(phase, decision, legacy_intent)
+            return decision
+
+        try:
+            task = asyncio.get_running_loop().create_task(_run())
+        except RuntimeError:
+            return None
+        self._shadow_tasks.add(task)
+        task.add_done_callback(self._shadow_done)
+        return task
+
+    def shadow_identity(self, bot_line: Any) -> None:
+        """Start the identity shadow; `note_identity_route` logs agreement."""
+        self._identity_shadow = self.shadow(gate_judge.PHASE_IDENTITY, bot_line, None)
+
+    def note_identity_route(self, legacy_intent: str) -> None:
+        task = self._identity_shadow
+        self._identity_shadow = None
+        if task is None:
+            return
+
+        def _compare(done: "asyncio.Task[Any]") -> None:
+            if done.cancelled() or done.exception() is not None:
+                return
+            self._log_agreement(gate_judge.PHASE_IDENTITY, done.result(), legacy_intent)
+
+        if task.done():
+            _compare(task)
+        else:
+            task.add_done_callback(_compare)
+
+    def _shadow_done(self, task: "asyncio.Task[Any]") -> None:
+        self._shadow_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()  # consume; judge_gate never raises, this is belt and braces
+
+    def _log_agreement(
+        self, phase: str, decision: "gate_judge.GateDecision", legacy_intent: str,
+    ) -> None:
+        judged = decision.intent
+        if judged is None:
+            category = "judge_unavailable"
+        else:
+            category = "agree" if judged == legacy_intent else "disagree"
+        try:
+            self.log(
+                error_type="phone_gate_shadow", error_category=category,
+                phase=phase if phase in gate_judge.PHASES else "unknown",
+                schema=f"judge:{judged or 'none'}_legacy:{legacy_intent}"[:64],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def stop(self) -> None:
+        """The gate is over: cancel any shadow call still in flight."""
+        self.stopped = True
+        for task in list(self._shadow_tasks):
+            if not task.done():
+                task.cancel()
+        self._identity_shadow = None
+
+
+def _gate_judge_log(**fields: Any) -> None:
+    """The gate judge's log sink: categories, counts and durations only."""
+    _log.info("unknown_event", **fields)
+
+
+def _turn_started_after(item: Any, anchor_ms: int | None) -> bool:
+    """Did the speech behind ``item`` begin at or after ``anchor_ms``?
+
+    The legacy fallback's informed-consent guard (T05): with no anchor, or an
+    item the gate cannot time but already accepted as grant evidence (a bare
+    string from a direct test), it holds.
+    """
+    if anchor_ms is None:
+        return True
+    _, started = _queued_turn(item)
+    if started is None:
+        return not isinstance(item, gate_judge.GateTurn)
+    return started >= anchor_ms
+
+
 def _native_turn_predates_question(message: Any, question_anchor_ms: int | None) -> bool:
     """True only when both real anchors prove the final belongs before this ask."""
     started_ms = _turn_anchor_ms(message)
@@ -3492,6 +3808,167 @@ def _consent_reask_reason(text: Any, *, heard: bool) -> str:
     return phone.CONSENT_REASK_UNCLEAR
 
 
+#: The consent read's attempts when a judged question buys one more round
+#: (T05): the first ask plus at most two re-asks.
+_CONSENT_MAX_ATTEMPTS_WITH_QUESTION = 3
+
+
+def _gate_bot_line(bot_line: "Callable[[], Any] | None") -> str:
+    """The gate line the candidate just heard, for the judge prompt."""
+    if bot_line is None:
+        return ""
+    try:
+        value = bot_line()
+    except Exception:  # noqa: BLE001
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+class _ConsentJudgement:
+    """What one judged consent reply decided (T05). No text leaves it but
+    the reply the reader consumed."""
+
+    __slots__ = (
+        "text", "decision", "judged_valid", "reask_reason", "faq_kind",
+        "evidence_item",
+    )
+
+    def __init__(self, *, text: str, decision: str | None, judged_valid: bool,
+                 reask_reason: str | None, faq_kind: str | None,
+                 evidence_item: Any) -> None:
+        self.text = text
+        self.decision = decision
+        self.judged_valid = judged_valid
+        self.reask_reason = reask_reason
+        self.faq_kind = faq_kind
+        self.evidence_item = evidence_item
+
+
+def _judged_reply_text(judge: "_GateJudgeWiring", items: list[Any], default: str) -> str:
+    """The text of every final from the first read item on, in order."""
+    idxs = [
+        idx for item in items if isinstance(item, gate_judge.GateTurn)
+        for idx in item.utterance_idxs
+    ]
+    if not idxs:
+        return default
+    first = min(idxs)
+    texts = [
+        u.text for u in judge.capture.utterances.all()
+        if u.idx >= first and u.text.strip()
+    ]
+    return " ".join(texts).strip() or default
+
+
+async def _judge_consent_reply(
+    judge: "_GateJudgeWiring",
+    phase: str,
+    bot_line: str,
+    *,
+    text: str,
+    chosen: Any,
+    turns: "asyncio.Queue",
+    question_anchor: "Callable[[], int | None] | None",
+    budget: "phone.GateBudget | None",
+    spoke_before: bool,
+) -> _ConsentJudgement:
+    """llm mode: judge ONE closed consent reply and map it to the gate's vocabulary.
+
+    * A judge grant waits for quiescence: while the candidate may still be
+      talking, the next closed turn is read from the SAME queue (bounded by
+      `_GATE_QUIESCENCE_WAIT_MAX_SEC` and the budget; stale turns skipped and
+      logged), joined to the reply, and the fuller window is re-judged. So
+      "Okay." then "can we reschedule, I'm out somewhere" is ONE reply.
+    * Judge unavailable: the legacy regex decides on the reply as read (it may
+      grant, but only on speech that began at or after the recording
+      sentence; `legacy_grant_before_recording_anchor` otherwise).
+    * Valid verdicts map through `_CONSENT_CLASSIFICATION_FOR_INTENT`; a
+      judged voicemail after a person was heard is not machine (T02 rule b).
+    """
+    state: dict[str, Any] = {"text": text, "items": [chosen]}
+    fallback: dict[str, Any] = {}
+
+    def _legacy() -> str:
+        verdict = classify_answer_text(state["text"], candidate_spoke=spoke_before)
+        if verdict == phone.CLASSIFY_HUMAN and not _turn_started_after(
+                chosen, judge.recording_anchor_ms()):
+            _log.info(
+                "unknown_event", error_type="phone_gate_turn_barrier",
+                error_category="legacy_grant_before_recording_anchor",
+            )
+            verdict = None
+        fallback["verdict"] = verdict
+        return _INTENT_FOR_CLASSIFICATION.get(verdict, gate_judge.INTENT_UNCLEAR)
+
+    async def _wait_for_more(reason: str) -> Any:
+        _log.info(
+            "unknown_event", error_type="phone_gate_quiescence",
+            error_category=str(reason)[:32],
+        )
+        bound = _GATE_QUIESCENCE_WAIT_MAX_SEC
+        if budget is not None:
+            bound = budget.bound(bound)
+        end = time.monotonic() + max(0.0, bound)
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                item = await asyncio.wait_for(turns.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return None
+            more_text, more_anchor = _queued_turn(item)
+            question_ms = question_anchor() if question_anchor is not None else None
+            if question_anchor is not None and _queued_turn_is_stale(more_anchor, question_ms):
+                _log_gate_turn_skip("consent_turn_skipped", item, more_anchor, question_ms)
+                continue
+            state["items"].append(item)
+            if isinstance(more_text, str) and more_text.strip():
+                state["text"] = f"{state['text']} {more_text.strip()}".strip()
+            return judge.window()
+
+    decision = await judge.decide(
+        phase, bot_line, legacy=_legacy, wait_for_more=_wait_for_more,
+    )
+    joined = state["text"]
+    if decision.source == gate_judge.SOURCE_LEGACY_FALLBACK:
+        return _ConsentJudgement(
+            text=joined, decision=fallback.get("verdict"), judged_valid=False,
+            reask_reason=None, faq_kind=None, evidence_item=chosen,
+        )
+    if decision.intent is None:
+        return _ConsentJudgement(
+            text=joined, decision=None, judged_valid=False, reask_reason=None,
+            faq_kind=None, evidence_item=chosen,
+        )
+    # The reply the verdict read: every final from this reply on, including
+    # one whose turn has not closed yet (the judge saw it), in spoken order.
+    joined = _judged_reply_text(judge, state["items"], joined)
+    verdict = _CONSENT_CLASSIFICATION_FOR_INTENT.get(decision.intent)
+    if verdict == phone.CLASSIFY_MACHINE and spoke_before:
+        # A person was heard earlier on this call: never machine (T02).
+        verdict = None
+    reask_reason: str | None = None
+    faq_kind: str | None = None
+    if verdict is None:
+        if decision.intent == gate_judge.INTENT_QUESTION:
+            reask_reason = phone.CONSENT_REASK_QUESTION
+            faq_kind = decision.question
+        else:
+            reask_reason = phone.CONSENT_REASK_UNCLEAR
+    evidence_item = chosen
+    if verdict == phone.CLASSIFY_HUMAN and decision.evidence_idx is not None:
+        for item in state["items"]:
+            if isinstance(item, gate_judge.GateTurn) and (
+                    decision.evidence_idx in item.utterance_idxs):
+                evidence_item = item
+                break
+    return _ConsentJudgement(
+        text=joined, decision=verdict, judged_valid=True, reask_reason=reask_reason,
+        faq_kind=faq_kind, evidence_item=evidence_item,
+    )
+
+
 async def _classify_phone_answer(
     turns: "asyncio.Queue[str]",
     say: Callable[[str], Any],
@@ -3503,6 +3980,9 @@ async def _classify_phone_answer(
     on_grant_evidence: "Callable[[Any], Any] | None" = None,
     spoke: "gate_judge.HumanSpeechLatch | None" = None,
     budget: "phone.GateBudget | None" = None,
+    judge: "_GateJudgeWiring | None" = None,
+    bot_line: "Callable[[], Any] | None" = None,
+    role_title: Any = None,
 ) -> str:
     """Read the response to the disclosure, re-asking at most once.
 
@@ -3543,12 +4023,33 @@ async def _classify_phone_answer(
     otherwise this returns ``CLASSIFY_DEFERRED_PRE_DISCLOSURE`` (the gate
     then speaks the deferral goodbye) rather than starting a round the wall
     clock would cut off.
+
+    M013 S01 T05 — THE GATE JUDGE. With a ``judge`` (`_GateJudgeWiring`):
+
+    * llm mode: each closed reply is judged (phase ``consent``, then
+      ``consent_retry``) on the tagged utterance window, with the bot line
+      just spoken (``bot_line``). A valid verdict decides
+      (`_CONSENT_CLASSIFICATION_FOR_INTENT`); a grant must pass the judge's
+      guards and quiescence, waiting (bounded) for a turn still being spoken
+      and re-judging the fuller window. When the judge is unavailable the
+      legacy regex decides, and a legacy grant also needs speech that began
+      at or after the recording sentence. A judged ``question`` is answered
+      from fixed copy (`phone.phone_consent_faq_text`, ``role_title`` for
+      "what role") before the re-ask, and may buy ONE extra re-ask (at most
+      two in all). A judged ``voicemail_machine`` is machine only when nobody
+      was heard before it.
+    * shadow mode: the legacy result acts; the judge runs concurrently on the
+      same window and only logs whether it agreed.
     """
     if answer_timeout_sec is None:
         answer_timeout_sec = phone.phone_classify_answer_timeout_sec()
     latch = spoke if spoke is not None else gate_judge.HumanSpeechLatch()
     responsive = 0
-    for attempt in range(max(1, attempts)):
+    limit = max(1, attempts)
+    question_extension_used = False
+    attempt = -1
+    while attempt + 1 < limit:
+        attempt += 1
         # Skip utterances that began before THIS question, inside the SAME
         # per-attempt budget. The consent turn shares one FIFO with the identity
         # reader, so a trailing fragment of the identity answer is sitting in it,
@@ -3602,21 +4103,53 @@ async def _classify_phone_answer(
             break
         if isinstance(text, str) and text.strip():
             responsive += 1
-            if consumed is not None:
-                consumed.append(text)
         elif heard_ineligible:
             responsive += 1
         # Classified against the latch as it stood BEFORE this reply: a reply
         # is judged machine or not on its own words, then (if it is not) it
         # sets the latch for everything after it.
-        decision = classify_answer_text(text, candidate_spoke=latch.spoke)
-        if decision != phone.CLASSIFY_MACHINE:
+        spoke_before = latch.spoke
+        legacy_decision = classify_answer_text(text, candidate_spoke=spoke_before)
+        decision = legacy_decision
+        judged_valid = False
+        reask_reason: str | None = None
+        faq_kind: str | None = None
+        evidence_item: Any = chosen
+        if judge is not None and isinstance(text, str) and text.strip():
+            phase = (
+                gate_judge.PHASE_CONSENT if attempt == 0
+                else gate_judge.PHASE_CONSENT_RETRY
+            )
+            line = _gate_bot_line(bot_line)
+            if judge.acting:
+                outcome = await _judge_consent_reply(
+                    judge, phase, line, text=text, chosen=chosen, turns=turns,
+                    question_anchor=question_anchor, budget=budget,
+                    spoke_before=spoke_before,
+                )
+                text = outcome.text
+                decision = outcome.decision
+                judged_valid = outcome.judged_valid
+                reask_reason = outcome.reask_reason
+                faq_kind = outcome.faq_kind
+                evidence_item = outcome.evidence_item
+            elif judge.shadowing:
+                judge.shadow(
+                    phase, line,
+                    _INTENT_FOR_CLASSIFICATION.get(
+                        legacy_decision, gate_judge.INTENT_UNCLEAR),
+                )
+        if isinstance(text, str) and text.strip() and consumed is not None:
+            consumed.append(text)
+        # A valid judge verdict has latched (or, for voicemail, not latched)
+        # in `_GateJudgeWiring.decide`; the legacy readers latch here.
+        if not judged_valid and decision != phone.CLASSIFY_MACHINE:
             latch.note_reply(
                 text, machine_match=False, source=gate_judge.SPOKE_SOURCE_CONSENT,
             )
         if decision == phone.CLASSIFY_HUMAN and on_grant_evidence is not None:
             try:
-                on_grant_evidence(chosen)
+                on_grant_evidence(evidence_item)
             except Exception:  # noqa: BLE001 — persistence never blocks consent
                 _log.warn(
                     "unknown_event", error_type="phone_gate_turn_barrier",
@@ -3624,7 +4157,18 @@ async def _classify_phone_answer(
                 )
         if decision is not None:
             return decision
-        if attempt + 1 < attempts:
+        if (
+            attempt + 1 >= limit
+            and judged_valid
+            and reask_reason == phone.CONSENT_REASK_QUESTION
+            and not question_extension_used
+            and limit < _CONSENT_MAX_ATTEMPTS_WITH_QUESTION
+        ):
+            # A question back is not an answer: it buys ONE more round (at
+            # most two re-asks in all), still inside the budget check below.
+            question_extension_used = True
+            limit += 1
+        if attempt + 1 < limit:
             # THE RE-ASK IS OTHERWISE INVISIBLE. The gate transcript commits
             # exactly two rows — the LAST bot line and the LAST answer — so a
             # first answer that failed to classify, and this re-ask itself,
@@ -3635,13 +4179,23 @@ async def _classify_phone_answer(
                 # T03: no time for another round. A deferral, never "machine":
                 # the budget ran out, which says nothing about who answered.
                 return phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE
-            reason = _consent_reask_reason(text, heard=bool(responsive))
+            reason = reask_reason or _consent_reask_reason(text, heard=bool(responsive))
             _log.info(
                 "unknown_event", error_type="phone_consent_reask",
                 error_category="unmatched" if responsive else "no_speech",
                 phase=reason,
             )
-            await say(phone.phone_consent_reask_text(reason))
+            answer = (
+                phone.phone_consent_faq_text(faq_kind, role_title=role_title)
+                if reason == phone.CONSENT_REASK_QUESTION and faq_kind else None
+            )
+            if answer:
+                # T05: a fixed answer, then the recording sentence and the
+                # question again. Never a new sentence about being an AI.
+                await say(answer)
+                await say(phone.PHONE_CONSENT_REASK_AFTER_ANSWER_TEXT)
+            else:
+                await say(phone.phone_consent_reask_text(reason))
     if latch.spoke:
         # A PERSON SPOKE on this call (here or at the identity turn), so this
         # is not a voicemail, whatever happened after. RCA: session 32757295
@@ -9365,6 +9919,12 @@ async def _run_phone_session(
     # `on_candidate_turn`. `None` outside the gate, so the screening loop's own
     # `latest_assistant_anchor` machinery is untouched.
     gate_question_anchor: list[int | None] = [None]
+    # M013 S01 T05: when the consent line's recording sentence was heard
+    # (stamped between the two halves of the split line, raised to part B's
+    # first audio), and the gate line the candidate heard last (for the judge
+    # prompt). Defined here, before any handler that reads them can fire.
+    gate_recording_anchor = _GateRecordingAnchor()
+    gate_last_line: list[str] = [""]
     candidate_activity = asyncio.Event()
     agent_listening = asyncio.Event()
     agent_listening.set()
@@ -9989,6 +10549,9 @@ async def _run_phone_session(
                 _first_audio_ms = int(round(first_audio_wall * 1000))
                 if _first_audio_ms > gate_question_anchor[0]:
                     gate_question_anchor[0] = _first_audio_ms
+            # T05: the recording anchor, armed between the halves of the split
+            # consent line, rises once to part B's first audio (one way only).
+            gate_recording_anchor.on_first_audio(int(round(first_audio_wall * 1000)))
             created_mono = latency_state.get("speech_created_mono")
             if created_mono is not None:
                 _emit_phone_latency_segment(
@@ -10216,6 +10779,8 @@ async def _run_phone_session(
 
     async def say(text: str) -> None:
         started_ms = int(round(time.time() * 1000))
+        # T05: the line the candidate is hearing, for the gate judge prompt.
+        gate_last_line[0] = text if isinstance(text, str) else ""
         try:
             speech = session.say(text, allow_interruptions=False)
             gate_speech_holder[0] = speech
@@ -10243,9 +10808,9 @@ async def _run_phone_session(
         # the moment the conversational flow is enabled (that flow speaks
         # `PHONE_DISCLOSURE_CONTINUATION_TEXT` and never the other one).
         _note_first_gate_audio(started_ms)
-        if text in (
-            phone.PHONE_DISCLOSURE_TEXT, phone.PHONE_DISCLOSURE_CONTINUATION_TEXT,
-        ) and participant_present_anchor[0] is not None:
+        # T05: the gate now speaks the fixed disclosure in two halves; its
+        # first half starts the line, so it carries the metric.
+        if phone.phone_disclosure_line_start(text) and participant_present_anchor[0] is not None:
             delta_ms = started_ms - participant_present_anchor[0]
             if delta_ms >= 0:
                 _safe_emit(histogram_metric, "voice_phone_participant_to_disclosure_sec", delta_ms / 1000.0, {"channel": "phone"})
@@ -10501,6 +11066,15 @@ async def _run_phone_session(
     # M013 S01 T03: the gate's post-answer time budget, started by the gate at
     # the answer and checked before every new ask (here: the consent re-ask).
     gate_budget = phone.GateBudget(PHONE_GATE_MAX_SECONDS)
+    # M013 S01 T05: the gate judge (`PHONE_GATE_JUDGE` = legacy | shadow |
+    # llm), reading the call's own capture, latch, anchors and budget.
+    gate_judge_wiring = _GateJudgeWiring(
+        capture=gate_capture, latch=gate_spoke,
+        question_anchor=lambda: gate_question_anchor[0],
+        recording_anchor=lambda: gate_recording_anchor.value,
+        budget=gate_budget,
+        first_name=getattr(instruction_state, "candidate_name", None),
+    )
 
     async def classify() -> str:
         if classifier is not None:
@@ -10511,7 +11085,40 @@ async def _run_phone_session(
             on_grant_evidence=_record_gate_grant_evidence,
             spoke=gate_spoke,
             budget=gate_budget,
+            judge=gate_judge_wiring,
+            bot_line=lambda: gate_last_line[0],
+            role_title=getattr(instruction_state, "role_title", None),
         )
+
+    def _mark_recording_sentence() -> None:
+        """T05: the recording sentence is about to be heard (split consent line)."""
+        gate_recording_anchor.mark(int(round(time.time() * 1000)))
+
+    async def _judge_identity(reply: str) -> str | None:
+        """T05: the acting identity intent (llm mode), or None for legacy.
+
+        Shadow mode starts the identity shadow and returns None, so the legacy
+        path decides; `_note_identity_route` then logs the agreement. When the
+        judge is unavailable (llm mode) the legacy path decides too, and the
+        latch is set the legacy way (the identity reader does not set it in
+        llm mode, so a judged voicemail greeting never sets it).
+        """
+        line = gate_last_line[0]
+        if gate_judge_wiring.shadowing:
+            gate_judge_wiring.shadow_identity(line)
+            return None
+        if not gate_judge_wiring.acting:
+            return None
+        decision = await gate_judge_wiring.decide(
+            gate_judge.PHASE_IDENTITY, line, legacy=lambda: None,
+        )
+        if decision.source == gate_judge.SOURCE_LLM and decision.intent is not None:
+            return decision.intent
+        gate_spoke.note_reply(
+            reply, machine_match=_is_machine_text(reply),
+            source=gate_judge.SPOKE_SOURCE_IDENTITY,
+        )
+        return None
 
     # Arm the gate-window leak veto with the RÉSUMÉ FACTS — the text that must
     # not reach a pre-consent listener, and that the bot is never meant to say.
@@ -10591,6 +11198,7 @@ async def _run_phone_session(
         own capture still holds every final, so nothing heard is lost.
         """
         gate_question_anchor[0] = int(round(time.time() * 1000))
+        gate_recording_anchor.reset()
         _clear_sdk_user_turn()
 
     clear_user_turn_unavailable_logged: list[bool] = [False]
@@ -10622,6 +11230,7 @@ async def _run_phone_session(
         """
         gate_question_anchor[0] = None
         gate_capture.stop()
+        gate_judge_wiring.stop()
 
     async def _compose_gate_line(instructions: str) -> str | None:
         """Buffer the session's own model, with no tools or candidate records.
@@ -11036,7 +11645,10 @@ async def _run_phone_session(
             phone.phone_identity_answer_timeout_sec(),
             speaking=lambda: bool(candidate_speaking.get("value")),
             hard_timeout_sec=phone.phone_classify_answer_timeout_sec(),
-            spoke=gate_spoke,
+            # T05: in llm mode the identity JUDGE latches (a judged voicemail
+            # greeting must not); `_judge_identity` latches the legacy way when
+            # the judge is unavailable.
+            spoke=None if gate_judge_wiring.acting else gate_spoke,
         )
 
     async def _next_callback_turn() -> str:
@@ -11870,6 +12482,12 @@ async def _run_phone_session(
             # heartbeat started at the answer.
             gate_budget=gate_budget,
             start_lease_heartbeat=_start_gate_heartbeat,
+            # M013 S01 T05: the gate judge at the identity turn, the shadow
+            # agreement hook, and the recording-sentence anchor of the split
+            # consent line.
+            judge_identity=_judge_identity,
+            note_identity_route=gate_judge_wiring.note_identity_route,
+            mark_recording_sentence=_mark_recording_sentence,
         )
 
     # Boolean phase marks from the gate, plus E3's `sip_left_reason` (a fixed

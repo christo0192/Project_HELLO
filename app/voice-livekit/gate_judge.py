@@ -768,6 +768,12 @@ class GateTurnCapture:
                 return idxs
         return None
 
+    @property
+    def has_open_finals(self) -> bool:
+        """True while a final the gate heard is not yet closed into a turn
+        (its commit, or the silence close, is still to come)."""
+        return bool(self._open_idxs)
+
     def is_committed(self, idxs: Iterable[int]) -> bool:
         """True when every utterance in ``idxs`` has since been committed by the SDK."""
         items = [self.utterances.get(i) for i in idxs]
