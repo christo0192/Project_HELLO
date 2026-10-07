@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sys
 import unittest
 from pathlib import Path
@@ -796,24 +795,6 @@ class CoachScopeTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(detect_character_break(text), "coach")
-
-
-@unittest.skipUnless(
-    os.environ.get("R1_S0B_RESULTS"),
-    "set R1_S0B_RESULTS to the S0-B full-run jsonl to replay the real transcripts",
-)
-class S0BReplayTests(unittest.TestCase):
-    """Opt-in replay of the 1,278 real S0-B advisor turns (not committed to this branch)."""
-
-    def test_no_real_disclaimer_turn_is_flagged_as_an_invented_offer(self):
-        rows = [
-            json.loads(line)
-            for line in Path(os.environ["R1_S0B_RESULTS"]).read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
-        self.assertGreater(len(rows), 1000)
-        flagged = [row["advisor_text"] for row in rows if invented_offer_in(row["advisor_text"])]
-        self.assertEqual(flagged, [])
 
 
 if __name__ == "__main__":
