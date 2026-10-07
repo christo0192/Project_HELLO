@@ -1420,6 +1420,12 @@ describe('live handler shapes match documented schemas', () => {
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
     expect(validateNamed(res.body[0], 'CandidateListItem', spec)).toEqual([]);
+    // ashby_job_status is OPTIONAL (omitted when the status could not be computed) and nullable.
+    expect(res.body[0].ashby_job_status).toBeNull();
+    const { ashby_job_status: _status, ...withoutStatus } = res.body[0];
+    expect(validateNamed(withoutStatus, 'CandidateListItem', spec)).toEqual([]);
+    expect(validateNamed({ ...res.body[0], ashby_job_status: 'paused' }, 'CandidateListItem', spec)).toEqual([]);
+    expect(validateNamed({ ...res.body[0], ashby_job_status: 'bogus' }, 'CandidateListItem', spec)).not.toEqual([]);
   });
 
   it('GET /api/candidates → CandidateListItem[] with phone progress (dialled, never engaged, unknown)', async () => {

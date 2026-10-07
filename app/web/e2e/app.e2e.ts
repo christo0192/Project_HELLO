@@ -275,12 +275,30 @@ test.describe('key states', () => {
 
     await scope.getByRole('button', { name: /^Active/ }).click();
     await expect(page).toHaveURL(/ashby=active/);
-    await expect(roleFilter.locator('option')).toHaveText(['All roles', 'Senior Backend Engineer']);
+    // The role control keeps listing every mapped role: the scope and the
+    // role intersect, the scope never narrows the dropdown.
+    const allMapped = ['All roles', 'Data Analyst', 'Frontend Engineer', 'Senior Backend Engineer'];
+    await expect(roleFilter.locator('option')).toHaveText(allMapped);
     await expect(page.getByText('Ashby jobs: Active').first()).toBeVisible();
 
     await scope.getByRole('button', { name: /^Paused/ }).click();
     await expect(page).toHaveURL(/ashby=paused/);
-    await expect(roleFilter.locator('option')).toHaveText(['All roles', 'Data Analyst']);
+    await expect(roleFilter.locator('option')).toHaveText(allMapped);
+    // The router commits the URL a beat before React re-renders; act on the
+    // settled UI, as a person would.
+    await expect(scope.getByRole('button', { name: /^Paused/ })).toHaveAttribute('aria-pressed', 'true');
+
+    // A role is kept when a segment is chosen, and the URL carries both.
+    await roleFilter.selectOption({ label: 'Data Analyst' });
+    await expect(page).toHaveURL(/role=/);
+    await expect(page).toHaveURL(/ashby=paused/);
+    await scope.getByRole('button', { name: /^Active/ }).click();
+    await expect(page).toHaveURL(/role=/);
+    await expect(page).toHaveURL(/ashby=active/);
+    await expect(page.getByText('No candidates match these filters')).toBeVisible();
+    await page.getByRole('button', { name: 'Clear filters' }).click();
+    await expect(page).not.toHaveURL(/role=|ashby=/);
+    await scope.getByRole('button', { name: /^Paused/ }).click();
 
     await scope.getByRole('button', { name: /^All/ }).click();
     await expect(page).not.toHaveURL(/ashby=/);

@@ -60,6 +60,38 @@ export function roleMatchesJobState(role: FilterableRole, state: AshbyJobState |
   return statuses.includes(state === 'active' ? 'enabled' : 'paused');
 }
 
+/** The slice of a candidate the per-candidate Ashby job scope reads. */
+export type JobStatusCandidate = {
+  role_id: string | null;
+  ashby_job_status?: 'enabled' | 'paused' | 'drift' | null;
+};
+
+/**
+ * True when the loaded candidates carry the server's per-candidate
+ * `ashby_job_status` (an older API omits it). Needs at least one row: an
+ * empty set cannot say, and has nothing to scope anyway.
+ */
+export function candidatesCarryJobStatus(candidates: readonly JobStatusCandidate[]): boolean {
+  return candidates.length > 0 && candidates.every((c) => c.ashby_job_status !== undefined);
+}
+
+/**
+ * Does the candidate belong to the Ashby job state? Per CANDIDATE: the status
+ * of the job its own application link points at (enabled = Active, paused =
+ * Paused; drift and no link are in neither). Falls back to the role-level
+ * rule when the API predates `ashby_job_status`.
+ */
+export function candidateMatchesJobState(
+  candidate: JobStatusCandidate,
+  state: AshbyJobState,
+  perCandidate: boolean,
+  roleById: ReadonlyMap<string, FilterableRole>,
+): boolean {
+  if (perCandidate) return candidate.ashby_job_status === (state === 'active' ? 'enabled' : 'paused');
+  const role = candidate.role_id != null ? roleById.get(candidate.role_id) : undefined;
+  return role ? roleMatchesJobState(role, state) : false;
+}
+
 /**
  * True when the payload carries the server's mapping flag — every row has a
  * boolean `has_ashby_mapping`. False means an older API: list every role.

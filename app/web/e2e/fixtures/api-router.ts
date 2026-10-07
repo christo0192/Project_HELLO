@@ -236,7 +236,14 @@ const ROUTES: Array<[string, string, Handler]> = [
   ['GET', '/api/candidates/summary', (_r, db) => ok(summaryOf(db))],
   ['GET', '/api/candidates', ({ query }, db) => {
     const roleId = query.get('role_id');
-    return ok(roleId ? db.candidates.filter((c) => c.role_id === roleId) : db.candidates);
+    const rows = roleId ? db.candidates.filter((c) => c.role_id === roleId) : db.candidates;
+    // `ashby_job_status`: the status of the Ashby job mapping the candidate's
+    // application link points at. The fixture has one mapping per mapped role
+    // and links each candidate to their role's mapping; unmapped roles (and
+    // role-less candidates) have no link, so null.
+    const statusOf = (roleKey: string | null) =>
+      db.ashby.mappings.find((m) => m.roleId === roleKey)?.status ?? null;
+    return ok(rows.map((c) => ({ ...c, ashby_job_status: c.role_id ? statusOf(c.role_id) : null })));
   }],
   ['GET', '/api/candidates/:id', ({ params }, db) => {
     const detail = db.candidateDetail(params.id);

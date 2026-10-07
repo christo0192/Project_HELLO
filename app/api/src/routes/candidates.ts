@@ -372,6 +372,7 @@ export function projectResumeReview(state: unknown): ResumeReview | null {
 interface RawLinkRow {
   candidate_id?: unknown;
   updated_at?: unknown;
+  job_mapping_id?: unknown;
   ashby_resume_ingestions?: Array<{ state?: unknown }> | { state?: unknown } | null;
 }
 
@@ -389,6 +390,36 @@ function resumeReviewByCandidate(rows: RawLinkRow[] | null): Map<string, ResumeR
     const embedded = row.ashby_resume_ingestions;
     const ingestion = Array.isArray(embedded) ? embedded[0] : embedded ?? undefined;
     map.set(id, projectResumeReview(ingestion?.state));
+  }
+  return map;
+}
+
+/** The Ashby job state the list reports per candidate (`ashby_job_mappings.status`). */
+export type AshbyJobStatus = 'enabled' | 'paused' | 'drift';
+
+/** Mapping ids per `ashby_job_mappings` read on the list route. */
+const JOB_MAPPING_BATCH = 100;
+
+/** PostgREST caps a response at 1,000 rows; the links read pages through it. */
+const LINK_PAGE_SIZE = 1000;
+/** Hard ceiling on link pages per list request (10,000 links). */
+const LINK_MAX_PAGES = 10;
+
+/**
+ * The job-mapping id of each candidate's MOST RECENT application link (rows
+ * arrive `updated_at` DESC, first seen wins — the same rule as resume_review).
+ */
+function jobMappingByCandidate(rows: RawLinkRow[] | null): Map<string, string> {
+  const map = new Map<string, string>();
+  const seen = new Set<string>();
+  for (const row of rows ?? []) {
+    const id = row.candidate_id;
+    if (typeof id !== 'string' || seen.has(id)) continue;
+    // The NEWEST link decides, whatever its mapping: a null job_mapping_id
+    // (mapping deleted, FK ON DELETE SET NULL) must not fall through to an
+    // older link's mapping.
+    seen.add(id);
+    if (typeof row.job_mapping_id === 'string') map.set(id, row.job_mapping_id);
   }
   return map;
 }
@@ -442,17 +473,65 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
   // candidate list must not stop working because the Ashby tables are
   // unavailable.
   let resumeReview = new Map<string, ResumeReview | null>();
+  // Per-candidate Ashby job status: the status of the NON-archived
+  // `ashby_job_mappings` row the candidate's application link points at, or
+  // null (no link / archived / missing / unreadable). Same additive contract
+  // as resume_review: a failure degrades to null, never fails the list.
+  const jobStatus = new Map<string, AshbyJobStatus>();
+  // False when the per-candidate status could not be computed completely (a
+  // failed or truncated links/mappings read). The field is then OMITTED from
+  // every row so the web falls back to the role-level rule instead of showing
+  // confidently wrong Active/Paused counts.
+  let jobStatusKnown = false;
   const loadResumeReview = async (): Promise<void> => {
     if (ids.length === 0) return;
     try {
-      const { data: links, error: linkErr } = await supabase
-        .from('ashby_application_links')
-        .select('candidate_id, updated_at, ashby_resume_ingestions ( state )')
-        .eq('provider', 'ashby')
-        .in('candidate_id', ids)
-        .order('updated_at', { ascending: false })
-        .limit(1, { foreignTable: 'ashby_resume_ingestions' });
-      if (!linkErr) resumeReview = resumeReviewByCandidate(links as RawLinkRow[] | null);
+      // Page through the links so the PostgREST row cap cannot silently
+      // truncate the read. Rows stay `updated_at` DESC across pages.
+      const links: RawLinkRow[] = [];
+      let linkFailed = false;
+      let complete = false;
+      for (let page = 0; page < LINK_MAX_PAGES; page += 1) {
+        const from = page * LINK_PAGE_SIZE;
+        const { data: batch, error: linkErr } = await supabase
+          .from('ashby_application_links')
+          .select('candidate_id, updated_at, job_mapping_id, ashby_resume_ingestions ( state )')
+          .eq('provider', 'ashby')
+          .in('candidate_id', ids)
+          .order('updated_at', { ascending: false })
+          .order('candidate_id', { ascending: true })
+          .limit(1, { foreignTable: 'ashby_resume_ingestions' })
+          .range(from, from + LINK_PAGE_SIZE - 1);
+        if (linkErr) { linkFailed = true; break; }
+        const got = (batch ?? []) as RawLinkRow[];
+        links.push(...got);
+        if (got.length < LINK_PAGE_SIZE) { complete = true; break; }
+      }
+      if (linkFailed && links.length === 0) return;
+      resumeReview = resumeReviewByCandidate(links);
+      if (linkFailed || !complete) return;
+      const byCandidate = jobMappingByCandidate(links);
+      const mappingIds = [...new Set(byCandidate.values())];
+      const statusByMapping = new Map<string, AshbyJobStatus>();
+      for (let start = 0; start < mappingIds.length; start += JOB_MAPPING_BATCH) {
+        const { data: mappings, error: mappingErr } = await supabase
+          .from('ashby_job_mappings')
+          .select('id, status')
+          .is('archived_at', null)
+          .in('id', mappingIds.slice(start, start + JOB_MAPPING_BATCH));
+        if (mappingErr) return;
+        for (const m of (mappings ?? []) as Array<{ id?: unknown; status?: unknown }>) {
+          if (typeof m.id !== 'string') continue;
+          if (m.status === 'enabled' || m.status === 'paused' || m.status === 'drift') {
+            statusByMapping.set(m.id, m.status);
+          }
+        }
+      }
+      for (const [candidateId, mappingId] of byCandidate) {
+        const status = statusByMapping.get(mappingId);
+        if (status) jobStatus.set(candidateId, status);
+      }
+      jobStatusKnown = true;
     } catch { /* additive only — never fails the list */ }
   };
 
@@ -484,6 +563,10 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
       // import has null `name`/`email` and this is the only field that says
       // anything about it at all.
       resume_review: resumeReview.get(row.id) ?? null,
+      // enabled (Live) | paused | drift (Out of sync) of the Ashby job this
+      // candidate applied through; null when there is none to report.
+      // Omitted entirely (not null) when the status could not be computed.
+      ...(jobStatusKnown || ids.length === 0 ? { ashby_job_status: jobStatus.get(row.id) ?? null } : {}),
       // dial_count / phone_state / phone_state_reason / last_dialed_at.
       // null dial_count = unknown; 0 = never dialled. The reason is
       // interviewer+ only (same floor as /:id/phone-cycles).

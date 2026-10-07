@@ -299,6 +299,14 @@ export interface Candidate {
    */
   resume_review?: ResumeReview | null;
   /**
+   * Status of the (non-archived) Ashby job mapping the candidate's own
+   * application link points at: enabled = Live, paused = Paused, drift = Out
+   * of sync. null = no Ashby link / archived / unreadable. ABSENT on an API
+   * older than the field, in which case the Candidates Active / Paused scope
+   * falls back to the role-level rule.
+   */
+  ashby_job_status?: 'enabled' | 'paused' | 'drift' | null;
+  /**
    * Phone-screen progress (list and detail endpoints). Optional: payloads
    * that predate the fields, and the Ashby scoped review, omit them.
    *

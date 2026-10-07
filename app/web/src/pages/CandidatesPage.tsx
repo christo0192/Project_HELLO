@@ -47,6 +47,8 @@ import type { RefObject } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import {
+  candidateMatchesJobState,
+  candidatesCarryJobStatus,
   hasMappingStatuses,
   roleFilterOptions,
   roleMatchesJobState,
@@ -357,6 +359,8 @@ export function CandidatesPage() {
   const [roles, setRoles] = useState<Role[]>([]);
   const [rawCandidates, setCandidates] = useState<Candidate[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** True once a candidate load has succeeded; keeps the list panel header mounted across reloads. */
+  const [everLoaded, setEverLoaded] = useState(false);
 
   const uploadPanelId = useId();
   /**
@@ -409,7 +413,11 @@ export function CandidatesPage() {
     setCandidates(null);
     api
       .listCandidates(role || undefined)
-      .then((rows) => { if (gen === loadGen.current) setCandidates(rows); })
+      .then((rows) => {
+        if (gen !== loadGen.current) return;
+        setCandidates(rows);
+        setEverLoaded(true);
+      })
       .catch((e: ApiError) => { if (gen === loadGen.current) setError(e.message); });
   }, []);
 
@@ -500,38 +508,64 @@ export function CandidatesPage() {
   // loaded: REPLACING the history entry, so Back does not return to a filter
   // the control cannot show. No listed roles hides the control, as on the
   // Dashboard.
-  // ACTIVE / PAUSED. Only offered when every role carries the server's
-  // `ashby_mapping_statuses` (an older API does not), so the control can
-  // never filter everything away. `jobState` is the EFFECTIVE scope.
-  const statusesAvailable = rolesLoaded && hasMappingStatuses(roles);
+  //
+  // ACTIVE / PAUSED is attributed PER CANDIDATE: the status of the Ashby job
+  // the candidate's own application link points at (`ashby_job_status`). An
+  // API that predates the field falls back to the role-level rule (needs the
+  // roles' `ashby_mapping_statuses`). The scope never touches the role
+  // filter: the two intersect, and an empty intersection is a calm empty
+  // state with a clear-filter action.
+  const roleById = useMemo(() => {
+    const byId = new Map<string, Role>();
+    for (const r of roles) byId.set(r.id, r);
+    return byId;
+  }, [roles]);
+  const perCandidate = useMemo(
+    () => (rawCandidates ? candidatesCarryJobStatus(rawCandidates) : false),
+    [rawCandidates],
+  );
+  const roleStatusesAvailable = rolesLoaded && hasMappingStatuses(roles);
+  const statusesAvailable = perCandidate || roleStatusesAvailable;
+  /** The EFFECTIVE scope: what the URL asked for, if this API can answer it. */
   const jobState = statusesAvailable ? filters.jobState : null;
-  // A deep link with `?ashby=` waits for the roles before showing any figure,
-  // rather than flashing the unscoped set.
-  const awaitingRoles = filters.jobState !== null && !rolesSettled;
+  // A deep link with `?ashby=` waits for the roles only when it needs them
+  // (the role-level fallback), rather than flashing the unscoped set.
+  const awaitingRoles = filters.jobState !== null && !!rawCandidates && !perCandidate && !rolesSettled;
+  // A scope this API cannot answer is dropped from the URL once that is known,
+  // instead of leaving a chip-less "Active filters / Clear all" row over
+  // unscoped data.
+  const dropUnusableScope =
+    filters.jobState !== null && rolesSettled && rawCandidates !== null && rawCandidates.length > 0 && !statusesAvailable;
+  useEffect(() => {
+    if (!dropUnusableScope) return;
+    setSearchParams(buildCandidateSearch({ ...filters, jobState: null }), { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dropUnusableScope, filterKey, setSearchParams]);
+  /** Roles in the scope: feeds the Pipeline-by-role panel (a role-level funnel). */
   const scopedRoles = useMemo(
-    () => (jobState ? roles.filter((r) => roleMatchesJobState(r, jobState)) : roles),
-    [roles, jobState],
+    () => (jobState && roleStatusesAvailable ? roles.filter((r) => roleMatchesJobState(r, jobState)) : roles),
+    [roles, jobState, roleStatusesAvailable],
   );
   /** Candidates inside the Ashby job scope; the rest of the page reads this. */
   const candidates = useMemo(() => {
     if (!rawCandidates || awaitingRoles) return null;
     if (!jobState) return rawCandidates;
-    const ids = new Set(scopedRoles.map((r) => r.id));
-    // A candidate with no role has no Ashby job, so it is in neither state.
-    return rawCandidates.filter((c) => c.role_id != null && ids.has(c.role_id));
-  }, [rawCandidates, awaitingRoles, jobState, scopedRoles]);
-  /** Per-segment counts for the Active / Paused control, over the role-scoped load. */
+    return rawCandidates.filter((c) => candidateMatchesJobState(c, jobState, perCandidate, roleById));
+  }, [rawCandidates, awaitingRoles, jobState, perCandidate, roleById]);
+  /**
+   * Per-segment counts for the Active / Paused control. Computed over the SAME
+   * loaded set the rows come from (the role-scoped load) with the SAME
+   * predicate, so a segment's number is exactly the rows it shows.
+   */
   const jobStateCounts = useMemo(() => {
-    const count = (state: "active" | "paused") => {
-      const ids = new Set(roles.filter((r) => roleMatchesJobState(r, state)).map((r) => r.id));
-      return (rawCandidates ?? []).filter((c) => c.role_id != null && ids.has(c.role_id)).length;
-    };
-    return rawCandidates && statusesAvailable
-      ? { all: rawCandidates.length, active: count("active"), paused: count("paused") }
-      : null;
-  }, [rawCandidates, roles, statusesAvailable]);
-  const allRoleOptions = useMemo(() => roleFilterOptions(roles), [roles]);
-  const roleOptions = useMemo(() => roleFilterOptions(roles, jobState), [roles, jobState]);
+    if (!rawCandidates || !statusesAvailable) return null;
+    const count = (state: "active" | "paused") =>
+      rawCandidates.filter((c) => candidateMatchesJobState(c, state, perCandidate, roleById)).length;
+    return { all: rawCandidates.length, active: count("active"), paused: count("paused") };
+  }, [rawCandidates, statusesAvailable, perCandidate, roleById]);
+  // The dropdown lists ALL mapped roles whatever the scope; the scope and the
+  // role intersect.
+  const roleOptions = useMemo(() => roleFilterOptions(roles), [roles]);
   const resetRole = shouldResetRoleFilter(roleId, rolesLoaded, roleOptions);
   useEffect(() => {
     if (!resetRole) return;
@@ -596,7 +630,8 @@ export function CandidatesPage() {
 
   const page = usePagination(visible, 10, filterKey);
 
-  const active = hasActiveFilters(filters);
+  // From the EFFECTIVE scope, so an unusable `?ashby=` never leaves a chip-less row.
+  const active = hasActiveFilters({ ...filters, jobState });
   /** Active filters other than the Ashby scope, which re-bases the figures instead of narrowing them. */
   const narrowed = hasActiveFilters({ ...filters, jobState: null });
   const jobStateLabel = jobState === "active" ? "Active" : jobState === "paused" ? "Paused" : null;
@@ -657,17 +692,20 @@ export function CandidatesPage() {
     [candidates],
   );
 
-  /** Role by id, for the table's Agent and Role columns. */
-  const roleById = useMemo(() => {
-    const byId = new Map<string, Role>();
-    for (const r of roles) byId.set(r.id, r);
-    return byId;
-  }, [roles]);
-
   // The facet is only meaningful where the signal exists. A deep link keeps
   // it visible so its own toggles stay reachable and removable.
   const showResumeFacet =
     resumeReviewCounts.size > 0 || filters.resumeReview.length > 0;
+
+  /**
+   * The list panel (search box + live region + rows) stays mounted across
+   * reloads once a list has loaded, and when a role-scoped load is empty but
+   * a `?q=` is set, so the box can always be cleared and the live region is
+   * never torn down.
+   */
+  const showListPanel =
+    !error &&
+    (rawCandidates !== null ? rawCandidates.length > 0 || filters.query !== "" : everLoaded);
 
   return (
     <CandidateShell variant="inset">
@@ -730,7 +768,7 @@ export function CandidatesPage() {
                 ]}
               />
             )}
-            {allRoleOptions.length > 0 && (
+            {roleOptions.length > 0 && (
               <div className="w-full sm:w-56">
                 <label htmlFor="role-filter" className="sr-only">
                   Filter by role
@@ -962,10 +1000,12 @@ export function CandidatesPage() {
             onRetry={() => loadCandidates(roleId)}
           />
         )}
-        {!error && candidates === null && (
+        {/* While the list panel is mounted it carries its own loading state, so
+            its header (search + live region) is not torn down by a reload. */}
+        {!error && candidates === null && !showListPanel && (
           <LoadingPanel label="Loading candidates…" />
         )}
-        {!error && rawCandidates !== null && rawCandidates.length === 0 && (
+        {!error && candidates !== null && rawCandidates !== null && rawCandidates.length === 0 && !filters.query && (
           <EmptyPanel
             title="No candidates yet"
             // The upload form is collapsed by default now, so prose telling a
@@ -994,7 +1034,7 @@ export function CandidatesPage() {
             filters. The box stays mounted whenever the loaded set has
             candidates, even when a search matches none, so it can always be
             cleared. */}
-        {!error && candidates !== null && rawCandidates !== null && rawCandidates.length > 0 && (
+        {showListPanel && (
           <GlassPanel as="section" aria-label="Candidate list" padding="sm">
             <div className="flex flex-wrap items-center justify-between gap-3">
               {/* SEARCH. Not a <form>: Enter submits nothing, the list follows the
@@ -1049,12 +1089,16 @@ export function CandidatesPage() {
 
           {/* The list API stops at PostgREST's 1,000-row cap; a search over a
               capped list would silently miss the older rows. */}
-          {filters.query && candidates && candidates.length >= 1000 && (
+          {(filters.query || jobState) && rawCandidates && rawCandidates.length >= 1000 && (
             <InlineNotice tone="warning" className="mt-3">
-              Showing the newest {candidates.length.toLocaleString()} candidates; search covers only
-              these.
+              Showing the newest {rawCandidates.length.toLocaleString()} candidates; search and the
+              Active / Paused counts cover only these.
             </InlineNotice>
           )}
+
+            {candidates === null && (
+              <div className="mt-3"><LoadingPanel label="Loading candidates…" /></div>
+            )}
 
             {visible.length > 0 && (
               <div className="-mx-4 mt-3">
@@ -1204,7 +1248,7 @@ export function CandidatesPage() {
         {!error &&
           candidates !== null &&
           rawCandidates !== null &&
-          rawCandidates.length > 0 &&
+          (rawCandidates.length > 0 || filters.query !== "") &&
           visible.length === 0 &&
           (filters.query && !hasActiveFilters({ ...filters, query: "" }) ? (
             <EmptyPanel

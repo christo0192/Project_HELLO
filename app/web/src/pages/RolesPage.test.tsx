@@ -815,6 +815,17 @@ describe('The status filter — All / Active / Inactive', () => {
     expect(search()).toBe('');
   });
 
+  it('counts and filters with ONE predicate, even for a non-boolean is_active', async () => {
+    // Typed boolean, but nothing checks it at runtime: null must land in
+    // Inactive in the count AND in the list, never in the count alone.
+    const odd = [role(1), role(2, { is_active: null as unknown as boolean }), role(3, { is_active: false })];
+    mockApi.listRoles.mockResolvedValue(odd);
+    initialUrl = '/roles?status=inactive';
+    render(<RolesPage />);
+    expect(await titles()).toEqual(['Role number 2', 'Role number 3']);
+    expect(screen.getByRole('button', { name: /^Inactive\s*2$/ })).toBeInTheDocument();
+  });
+
   it('says so when no agent is active', async () => {
     initialUrl = '/roles?status=active';
     mockApi.listRoles.mockResolvedValue([role(1, { is_active: false })]);

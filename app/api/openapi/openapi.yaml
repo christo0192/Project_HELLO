@@ -9154,6 +9154,11 @@ components:
           description: Sanitized resume-ingestion status for an Ashby-sourced candidate; null for every non-Ashby candidate and whenever the ingestion state cannot be read. needs_review deliberately says only that a human must look - never why, since the underlying scan/guard/parse codes are operator information behind the admin-gated Mission Control. An Ashby candidate whose resume has not been parsed yet is a PII-minimal shell, so name and email are legitimately null alongside a non-null value here.
           enum: [ready, processing, needs_review, cancelled]
           nullable: true
+        ashby_job_status:
+          type: string
+          description: Status of the non-archived Ashby job mapping that the candidate's NEWEST application link points at (enabled = Live, paused = Paused, drift = Out of sync); an older link is never consulted. null when the candidate has no Ashby link or that link's mapping is archived or missing. The field is OMITTED from every row of a response when the links or mappings read failed or was truncated, so clients fall back to the role-level rule. Drives the Candidates Active / Paused filter per candidate rather than per role.
+          enum: [enabled, paused, drift]
+          nullable: true
         dial_count:
           $ref: '#/components/schemas/CandidateDialCount'
         phone_state:

@@ -222,13 +222,14 @@ export function RolesPage() {
 
   const statusCounts = useMemo(() => {
     const all = roles ?? [];
-    const active = all.filter((role) => role.is_active).length;
+    const active = all.filter((role) => Boolean(role.is_active)).length;
     return { all: all.length, active, inactive: all.length - active };
   }, [roles]);
   const visibleRoles = useMemo(() => {
     const all = roles ?? [];
     if (statusFilter === "all") return all;
-    return all.filter((role) => role.is_active === (statusFilter === "active"));
+    // Same coercion as the counts and the row badge: anything not truthy is inactive.
+    return all.filter((role) => Boolean(role.is_active) === (statusFilter === "active"));
   }, [roles, statusFilter]);
 
   // Changing the filter returns to page 1.
