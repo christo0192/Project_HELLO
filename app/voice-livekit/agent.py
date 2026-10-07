@@ -11442,8 +11442,11 @@ async def _run_phone_session(
         # writes then raced, and the server assigns `turn_index` by arrival —
         # so the stored gate transcript came back SHUFFLED. The 2026-09-27
         # owner test is the proof: eight turns written inside 15 ms, with the
-        # candidate's "Hello?" stored above the greeting that prompted it and
-        # the yes/no re-ask above the disclosure it was re-asking.
+        # yes/no re-ask stored above the disclosure it was re-asking. (The
+        # "Hello?" filed as the candidate's above the greeting on that call
+        # was not the candidate: it was the opening-generation seed, which the
+        # SDK records as a user turn. #334 removed the seed; M013 S01 T10 pins
+        # that no candidate gate row comes from anything but an STT final.)
         #
         # That matters more here than anywhere else in the transcript. These
         # rows exist to evidence WHAT WAS DISCLOSED AND WHEN THE CANDIDATE
@@ -12241,8 +12244,9 @@ async def _run_phone_session(
     # 0095: this condition is DELIBERATELY unchanged by the conversational gate.
     # An earlier draft widened it to fire on Gemini deployments too, because that
     # draft composed the identity line on the OpenAI-compat one-shot endpoint and
-    # wanted its transport warm. The rebuilt gate speaks every line through
-    # `session.generate_reply` on the SESSION LLM, so on a Gemini deployment the
+    # wanted its transport warm. The rebuilt gate composes every line on the
+    # SESSION LLM (since #334 a private-context draft, `_compose_gate_draft`,
+    # spoken with `say`), so on a Gemini deployment the
     # first spoken line depends on nothing this warm-up touches — widening it
     # would POST the full system prompt, résumé facts included, to a second
     # provider that previously received nothing from this call. Reverted.

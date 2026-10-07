@@ -5051,9 +5051,10 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
 
         These rows used to be written as concurrent tasks, so eight writes
         raced and the server — which assigns `turn_index` by arrival — stored
-        them shuffled. The 2026-09-27 owner test is the evidence: the
-        candidate's "Hello?" was stored ABOVE the greeting that prompted it,
-        and the yes/no re-ask above the disclosure it was re-asking.
+        them shuffled. The 2026-09-27 owner test is the evidence: the yes/no
+        re-ask was stored above the disclosure it was re-asking. (The "Hello?"
+        filed above the greeting on that call was the opening-generation seed,
+        not the candidate; see `TestOpeningGenerationSeed`.)
 
         Order is the substance of what these rows are FOR. They exist to
         evidence what was disclosed and when the candidate agreed, and every
@@ -8288,16 +8289,175 @@ class TestNumberNeverCarried(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(digits.search(text))
 
 
-class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
-    """The opening generation must never reach the model with empty contents.
+class _SttDrivenGateSession(_FakePhoneSession):
+    """A fake session that delivers the candidate's gate replies the SDK way.
 
-    Live 2026-08-29: the first generation of a call ran against an empty chat
-    context and Gemini refused it (400 contents-not-specified), so the natural
-    opening fell back to fixed copy on EVERY call. The seed is one synthetic
-    user turn ("Hello?") passed through `generate_reply(user_input=...)`.
+    M013 S01 T10. Each reply to a gate question arrives as local VAD speech
+    (start/end), then an STT final (`user_input_transcribed`), then the SDK
+    commit (`on_user_turn_completed`, then a `conversation_item_added` user
+    item). Every final is recorded in `stt_finals`: a candidate gate row whose
+    text is not one of them did not come from the candidate.
+
+    `generate_reply(user_input=...)` is modelled as the SDK does it
+    (agent_activity.py, livekit-agents 1.6.4): the text is added to the chat
+    context as a USER message and emitted as a `conversation_item_added` user
+    item. That is exactly how the old "Hello?" seed reached the transcript as
+    the candidate's words, so a regression that brings it back shows up here.
     """
 
-    async def test_the_opening_passes_a_user_input_seed(self):
+    #: One reply per gate QUESTION line (a spoken gate line ending in "?").
+    gate_replies: list = []
+    #: The `vad_event_callback` the session handed `_build_phone_vad`.
+    vad_callback = None
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.replies = list(type(self).gate_replies)
+        self.stt_finals: list[str] = []
+        self.seeds: list = []
+        self.compose_calls = 0
+        session = self
+
+        def chat(**kwargs):
+            session.compose_calls += 1
+            items = getattr(kwargs.get("chat_ctx"), "items", [])
+            system = " ".join(
+                str(item.get("content", "")) for item in items
+                if isinstance(item, dict) and item.get("role") == "system")
+            draft = (
+                "Before we start, one quick note. "
+                + phone.PHONE_DISCLOSURE_RECORDING_SENTENCE
+                + " Is it okay to continue?"
+                if phone.PHONE_DISCLOSURE_RECORDING_SENTENCE in system
+                else phone.phone_identity_text(None)
+            )
+
+            class _Draft:
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_a):
+                    return None
+
+                async def __aiter__(self):
+                    yield types.SimpleNamespace(delta=types.SimpleNamespace(content=draft))
+
+            return _Draft()
+
+        # `session` is reachable from the LLM so a test can model a compose
+        # that (wrongly) goes through the session instead of a private context.
+        self.llm = types.SimpleNamespace(chat=chat, session=self)
+
+    def generate_reply(self, instructions=None, **kwargs):
+        if "user_input" in kwargs:
+            seed = kwargs.pop("user_input")
+            self.seeds.append(seed)
+            if seed:
+                self._emit("user", seed)
+            if not getattr(self.agent, "_screening_authorized", False):
+                return _FakeSpeech()
+        return super().generate_reply(instructions=instructions, **kwargs)
+
+    def say(self, text, **kwargs):
+        if getattr(self.agent, "_screening_authorized", False):
+            return super().say(text, **kwargs)
+        speech = super().say(text, **kwargs)
+        if str(text).rstrip().endswith("?") and self.replies:
+            reply = self.replies.pop(0)
+            asyncio.get_running_loop().call_later(
+                0.03, lambda: asyncio.ensure_future(self._candidate_speaks(reply)))
+        return speech
+
+    def _vad(self, kind, **durations):
+        callback = type(self).vad_callback
+        if callback is not None:
+            callback(types.SimpleNamespace(type=kind, **durations))
+
+    async def _candidate_speaks(self, text):
+        self._vad("start_of_speech", speech_duration=0.0, inference_duration=0.0)
+        await asyncio.sleep(0.02)
+        self._vad("end_of_speech", speech_duration=0.9, inference_duration=0.0,
+                  silence_duration=0.0)
+        await asyncio.sleep(0.01)
+        self.stt_finals.append(text)
+        self.handlers["user_input_transcribed"](
+            types.SimpleNamespace(transcript=text, is_final=True))
+        message = types.SimpleNamespace(text_content=text, metrics=None, created_at=None)
+        try:
+            await self.agent.on_user_turn_completed(types.SimpleNamespace(items=[]), message)
+        except sys.modules["livekit.agents"].StopResponse:
+            return
+        # The kept commit is added to the chat context right after the hook.
+        # Before consent `llm_node` generates nothing (T08a), so no reply.
+        self._emit("user", text)
+
+
+class _SeedTestJudgeTransport:
+    """The gate judge's HTTP seam, answering from the candidate's own words.
+
+    identity -> `identity_confirmed`, consent -> `consent_granted` (evidence
+    quoted from the scripted replies), anything else -> `unclear`. Keeps every
+    request payload so a test can see what the judge was shown.
+    """
+
+    def __init__(self):
+        self.payloads: list[dict] = []
+
+    async def request(self, *, method, url, json=None, headers=None, timeout=None):  # noqa: A002
+        import json as _json
+
+        content = json["messages"][1]["content"]
+        payload = _json.loads(content[len("DATA "):])
+        self.payloads.append(payload)
+        phase = payload.get("phase")
+        if phase == "identity":
+            verdict = {"intent": "identity_confirmed", "evidence": "this is me"}
+        elif phase in ("consent", "consent_retry"):
+            verdict = {"intent": "consent_granted", "evidence": "we can continue"}
+        else:
+            verdict = {"intent": "unclear", "evidence": ""}
+        verdict["confidence"] = 0.9
+        body = _json.dumps(verdict)
+
+        class _Response:
+            status_code = 200
+
+            def json(self_inner):
+                return {"choices": [{"message": {"content": body}}]}
+
+        return _Response()
+
+
+class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
+    """The "Hello?" seed: what it was, why it is gone, and that it stays gone.
+
+    History (M013 S01 T10, re-verified against the code and git history):
+
+    * 0ced27d (#161, 2026-08-29) added `generate_reply(user_input="Hello?")`
+      to the gate's spoken generations. Its own commit message and docstring
+      give the reason: the first generation of a call ran against an EMPTY
+      chat context and Gemini refused it (400 contents-not-specified), so the
+      opening fell back to fixed copy on every call. The seed only made that
+      request non-empty. It was NOT a warm-up.
+    * The SDK adds `user_input` to the chat context as a USER message and
+      emits it as a conversation item, so the gate transcript filed it as the
+      CANDIDATE's words: turn 0 = "Hello?" on 46 of 46 sessions, 69 rows in
+      all, including voicemail calls.
+    * fd40050 (#334) removed it: a gate line is now composed from a PRIVATE
+      `ChatContext` (`_compose_gate_draft`, its own system + user message,
+      never added to the session history) and spoken with `say`.
+    * The real warm-ups are separate and unchanged: the Gemini connection,
+      the judge connection and the DeepSeek prefix cache (fired during the
+      ring), and the bounded SIP output-subscription wait.
+
+    These tests keep the private-context compose, prove no session-level run
+    stores a candidate gate row that did not come from an STT final (legacy
+    and llm judge, composed and fixed lines), and prove the warm-ups still
+    fire during the ring. Historical seed rows already stored stay as they
+    are (S02 / owner follow-up).
+    """
+
+    async def test_the_opening_draft_is_composed_from_a_private_context(self):
         seen: dict = {}
 
         class DraftContext:
@@ -8336,10 +8496,11 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
         async def recording_seam():
             return None
 
-        # The `Hello?` seed belongs to the LLM-AUTHORED opening path, which is
-        # now behind PHONE_DETERMINISTIC_OPENER (default ON speaks the fixed
-        # disclosure and never generates an opening). Exercise the seed behaviour
-        # with the flag explicitly OFF.
+        # The model-authored opening is behind PHONE_DETERMINISTIC_OPENER (ON
+        # speaks the fixed disclosure and composes nothing), so the flag is
+        # explicitly OFF here. The draft's request carries its own user message
+        # (Gemini refuses an empty one: the reason the old seed existed), in a
+        # private context the session never sees.
         with patch.dict(os.environ, {"PHONE_DETERMINISTIC_OPENER": "false"}), \
              patch.dict(sys.modules, {"livekit.agents.llm": types.SimpleNamespace(ChatContext=DraftContext)}), \
              patch.object(agent_mod, "AgentSession", _SeedProbeSession), \
@@ -8357,6 +8518,15 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(item["role"] == "user" for item in seen["chat_ctx"].items))
         self.assertEqual(seen["tools"], [])
         self.assertTrue(seen["stream_closed"])
+        # Private: not the agent's (session's) history.
+        session = _FakePhoneSession.instances[-1]
+        self.assertIsNot(seen["chat_ctx"], getattr(session.agent, "chat_ctx", None))
+        # And the draft's user message never became a transcript row.
+        private_user = [item["content"] for item in seen["chat_ctx"].items
+                        if item["role"] == "user"]
+        rows = [row["text"] for row in client.item_turns]
+        for text in private_user:
+            self.assertNotIn(text, rows)
 
 
     async def test_the_scripted_opener_ROLLBACK_sends_no_opening_seed(self):
@@ -8402,6 +8572,180 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
                 timeout=5,
             )
         self.assertNotIn("Hello?", seeds)
+
+    # ── M013 S01 T10: no candidate gate row that the candidate did not say ──
+
+    async def _run_conversational_gate(
+        self, *, judge_mode: str, opener: str, compose=None,
+    ) -> tuple[Any, Any, "_SttDrivenGateSession", "_SeedTestJudgeTransport", list]:
+        """One full `_run_phone_session` on the conversational gate.
+
+        No injected classifier: the identity reply and the consent reply go
+        through the REAL readers, the real `_classify_phone_answer` and (llm
+        mode) the real judge wiring, with an HTTP seam that answers from the
+        candidate's own words. Returns the result, the client (its
+        `item_turns` are the stored rows), the session, the judge transport,
+        and an ordered log of warm-ups and the answer.
+        """
+        _FakePhoneSession.instances = []
+        _FakePhoneSession.default_answers = ["First answer."]
+        _FakePhoneSession.default_gate_user_turns = []
+        _FakePhoneSession.default_interruptions = []
+        _FakePhoneSession.default_silence_reply = None
+        _SttDrivenGateSession.gate_replies = ["Yes, this is me.", "Yes, we can continue."]
+        _SttDrivenGateSession.vad_callback = None
+        self.addCleanup(setattr, _SttDrivenGateSession, "vad_callback", None)
+        ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
+        client = FakeEventClient()
+        transport = _SeedTestJudgeTransport()
+        order: list[str] = []
+
+        def build_vad(callback):
+            _SttDrivenGateSession.vad_callback = callback
+            return None
+
+        def warm(name):
+            async def _warm(*_a, **_k):
+                order.append(name)
+            return _warm
+
+        real_wait = agent_mod._wait_for_sip_participant
+
+        async def wait_for_participant(*args, **kwargs):
+            participant = await real_wait(*args, **kwargs)
+            order.append("answered")
+            return participant
+
+        async def recording_seam():
+            return None
+
+        import gate_judge
+
+        judge_config = gate_judge.JudgeConfig(
+            enabled=True, url="https://api.deepseek.com/v1/chat/completions",
+            model="deepseek-v4-flash", api_key="test-key",
+        )
+
+        class _Ctx:
+            def __init__(self):
+                self.items = []
+
+            def add_message(self, **kwargs):
+                self.items.append(kwargs)
+
+        extra = []
+        if compose is not None:
+            extra.append(patch.object(agent_mod, "_compose_gate_draft", compose))
+        with patch.dict(os.environ, {
+                "PHONE_GATE_FLOW": "conversational",
+                "PHONE_DETERMINISTIC_OPENER": opener,
+                "PHONE_GATE_JUDGE": judge_mode,
+             }), \
+             patch.dict(sys.modules, {"livekit.agents.llm": types.SimpleNamespace(ChatContext=_Ctx)}), \
+             patch.object(agent_mod, "_build_phone_vad", build_vad), \
+             patch.object(agent_mod, "AgentSession", _SttDrivenGateSession), \
+             patch.object(agent_mod, "persistence", MagicMock()), \
+             patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
+             patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
+             patch.object(agent_mod, "_wait_for_sip_participant", wait_for_participant), \
+             patch.object(phone, "phone_warm_google_connection", warm("google_connection")), \
+             patch.object(phone, "phone_warm_judge_connection", warm("judge_connection")), \
+             patch.object(phone, "phone_warm_prefix_cache", warm("prefix_cache")), \
+             patch.object(gate_judge, "resolve_judge_config", lambda: judge_config), \
+             patch.object(gate_judge, "_default_transport", lambda: transport), \
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
+            for patcher in extra:
+                patcher.start()
+            try:
+                result = await asyncio.wait_for(
+                    agent_mod._run_phone_session(
+                        ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH, client=client),
+                    timeout=20,
+                )
+            finally:
+                for patcher in extra:
+                    patcher.stop()
+        return result, client, _FakePhoneSession.instances[-1], transport, order
+
+    def _unsourced_candidate_gate_rows(self, client, session) -> list[str]:
+        return [
+            row["text"] for row in client.item_turns
+            if row["is_gate"] and row["speaker"] == "candidate"
+            and row["text"] not in session.stt_finals
+        ]
+
+    async def test_a_full_conversational_gate_stores_only_candidate_rows_from_stt(self):
+        # Acceptance (T10): legacy and llm, model-composed and fixed lines.
+        for judge_mode in ("legacy", "llm"):
+            for opener in ("false", "true"):
+                with self.subTest(judge=judge_mode, deterministic_opener=opener):
+                    result, client, session, transport, _ = (
+                        await self._run_conversational_gate(
+                            judge_mode=judge_mode, opener=opener))
+                    # The gate really ran to consent on the candidate's words.
+                    self.assertEqual(result.outcome, phone.CLASSIFY_HUMAN)
+                    self.assertTrue(result.assessment_allowed)
+                    self.assertEqual(
+                        session.stt_finals, ["Yes, this is me.", "Yes, we can continue."])
+                    candidate_rows = [
+                        row["text"] for row in client.item_turns
+                        if row["is_gate"] and row["speaker"] == "candidate"]
+                    self.assertEqual(
+                        sorted(set(candidate_rows)), sorted(set(session.stt_finals)),
+                        "each candidate reply is on record")
+                    self.assertEqual(
+                        self._unsourced_candidate_gate_rows(client, session), [],
+                        "a candidate gate row did not come from an STT final")
+                    self.assertNotIn("Hello?", [row["text"] for row in client.item_turns])
+                    self.assertEqual(session.seeds, [], "no generation seed was sent")
+                    if opener == "false":
+                        # Non-vacuous: the gate lines were model-composed.
+                        self.assertGreaterEqual(session.compose_calls, 2)
+                    else:
+                        self.assertEqual(session.compose_calls, 0)
+                    if judge_mode == "llm":
+                        phases = [p["phase"] for p in transport.payloads]
+                        self.assertIn("identity", phases)
+                        self.assertIn("consent", phases)
+                        # The gate judge, too, was shown only what the
+                        # candidate said. (`post_consent` reads the scored
+                        # answer, which this fake commits without a final.)
+                        shown = {u["text"] for p in transport.payloads
+                                 if p["phase"] in ("identity", "consent", "consent_retry")
+                                 for u in p.get("utterances", [])}
+                        self.assertTrue(shown)
+                        self.assertLessEqual(shown, set(session.stt_finals))
+                    else:
+                        self.assertEqual(transport.payloads, [])
+
+    async def test_a_reintroduced_seed_IS_caught_as_an_unsourced_candidate_row(self):
+        # The control for the test above: a compose that goes back through the
+        # session with a `user_input` seed (the pre-#334 shape) leaves a
+        # "Hello?" candidate gate row that no STT final produced.
+        async def seeded_compose(llm, instructions, **_kwargs):
+            llm.session.generate_reply(user_input="Hello?", instructions=instructions)
+            return None
+
+        result, client, session, _t, _o = await self._run_conversational_gate(
+            judge_mode="legacy", opener="false", compose=seeded_compose)
+        self.assertEqual(result.outcome, phone.CLASSIFY_HUMAN)
+        self.assertIn("Hello?", session.seeds)
+        self.assertIn("Hello?", self._unsourced_candidate_gate_rows(client, session))
+
+    async def test_the_warm_ups_still_fire_during_the_ring(self):
+        # The seed was not a warm-up, and removing it removed none: the judge
+        # connection is warmed on every lane, and either the Gemini connection
+        # or the DeepSeek prefix cache, all before the call is answered.
+        for google in (False, True):
+            with self.subTest(native_gemini=google):
+                with patch.object(phone, "phone_use_google_llm", lambda g=google: g):
+                    _r, _c, _s, _t, order = await self._run_conversational_gate(
+                        judge_mode="legacy", opener="false")
+                self.assertIn("answered", order)
+                ring = order[:order.index("answered")]
+                expected = {"judge_connection",
+                            "google_connection" if google else "prefix_cache"}
+                self.assertEqual(set(ring), expected, order)
 
 
 class TestDisclosureSentencePin(unittest.TestCase):
