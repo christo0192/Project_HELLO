@@ -103,6 +103,9 @@ ok(/LIVEKIT_R1_6PN_IP_OVERRIDE is forbidden on Fly/.test(entrypoint) && /LIVEKIT
 ok(/getent hosts fly-local-6pn/.test(entrypoint) && /^is_6pn_ipv6\(\) \{/m.test(entrypoint) && /\[Ff\]\[Dd\]\[Aa\]\[Aa\]:/.test(entrypoint) && /is_6pn_ipv6 "\$V6" \|\| die/.test(entrypoint), "Config C must read fly-local-6pn and validate it as an fdaa: IPv6 literal before rendering");
 ok(/if \(r1_config == "C"\) print "      - \\"" v6 "\/128\\""/.test(entrypoint) && /Config C requires the Machine's fly-local-6pn IPv6/.test(entrypoint), "Config C must render the 6PN address as a /128 include and fail closed when it is missing");
 ok(/Config C; advertising \$\{NODE_IP\}:7882 and 6PN \$\{V6\}/.test(entrypoint), "Config C must log its advertised addresses at startup");
+// LiveKit applies rtc.ips as an allow-list of local interface addresses: a well-formed /128 that is on no interface opens no socket and logs nothing.
+ok(/^v6_is_configured\(\) \{/m.test(entrypoint) && /\/proc\/net\/if_inet6/.test(entrypoint) && /v6_is_configured "\$V6" "\$IF_INET6_FILE" \|\| die "Config C: 6PN address/.test(entrypoint), "Config C must fail closed when the 6PN address is configured on no interface (checked against /proc/net/if_inet6)");
+ok(/LIVEKIT_R1_IF_INET6_FILE is forbidden on Fly/.test(entrypoint) && /LIVEKIT_R1_IF_INET6_FILE:-/.test(entrypoint), "the interface-table test seam must exist and fail closed on Fly");
 // LiveKit's port-range mode bypasses the single UDP mux (verified in mediatransportutil), which would silently drop the 6PN socket.
 ok(!/port_range_(?:start|end)/.test(template) && !/port_range/.test(entrypoint), "the SFU must never set rtc.port_range_*: it bypasses the single-port UDP mux");
 ok(/udp_port:\s*7882/.test(template) && /tcp_port:\s*7881/.test(template) && /use_external_ip:\s*false/.test(template), "LiveKit template must pin the reviewed ICE ports and explicit node-IP mode");

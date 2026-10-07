@@ -85,6 +85,8 @@ const cases = [
   ["6PN override allowed on Fly", { "entrypoint.sh": entrypoint.replace('die "LIVEKIT_R1_6PN_IP_OVERRIDE is forbidden on Fly"', "true") }, /6PN override/],
   ["Config C drops the 6PN /128", { "entrypoint.sh": entrypoint.replace('if (r1_config == "C") print', 'if (0) print') }, /6PN address as a \/128/],
   ["Config C skips 6PN validation", { "entrypoint.sh": entrypoint.replace('is_6pn_ipv6 "$V6" || die', 'true || die') }, /validate it as an fdaa: IPv6/],
+  ["Config C skips the interface check", { "entrypoint.sh": entrypoint.replace('v6_is_configured "$V6" "$IF_INET6_FILE" || die', "true || die") }, /configured on no interface/],
+  ["interface-table seam allowed on Fly", { "entrypoint.sh": entrypoint.replace('die "LIVEKIT_R1_IF_INET6_FILE is forbidden on Fly"', "true") }, /interface-table test seam/],
   ["Config C accepts any selector", { "entrypoint.sh": entrypoint.replace("A | B | C) ;;", "A | B | C | D) ;;") }, /exactly A, B and C/],
   ["port range bypasses the UDP mux", { "livekit.yaml.tmpl": goodTemplate.replace("  udp_port: 7882", "  udp_port: 7882\n  port_range_start: 50000") }, /port_range/],
 ];

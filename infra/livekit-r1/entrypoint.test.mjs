@@ -2,7 +2,9 @@
 // Render the startup template without an image or a LiveKit binary. This makes
 // the three reviewed rtc.ips modes (A, B, C) regression-testable on every
 // platform. Config C is also driven through a `getent` test double on PATH, so
-// the exact production lookup path (`getent hosts fly-local-6pn | awk`) runs.
+// the exact production lookup path (`getent hosts fly-local-6pn | awk`) runs, and
+// against a fixture of the kernel's /proc/net/if_inet6 table, so "the 6PN address
+// is really on an interface" is checked end to end as well.
 // Every case is a real entrypoint.sh invocation. `bash` runs the full set and
 // POSIX `sh` (dash on Linux CI; production is Alpine's /bin/sh) runs the core set.
 import { spawn, spawnSync } from "node:child_process";
@@ -66,7 +68,9 @@ function exec(command, args, options) {
 // arbitrary Windows environment variables, so every fixed, non-secret fixture
 // value goes into the Bash command itself. `shell` is the interpreter that runs
 // entrypoint.sh.
-function run({ shell = "bash", config = "A", env = {}, getent = null } = {}) {
+// `ifInet6` names a fixture written with scratchWrite; it becomes
+// LIVEKIT_R1_IF_INET6_FILE, translated to the interpreter's own path syntax.
+function run({ shell = "bash", config = "A", env = {}, getent = null, ifInet6 = null } = {}) {
   const variables = {
     NODE_IP: "203.0.113.10",
     LIVEKIT_KEYS: `r1-test:${secret}`,
@@ -77,11 +81,14 @@ function run({ shell = "bash", config = "A", env = {}, getent = null } = {}) {
     FLY_APP_NAME: "",
     FLY_MACHINE_ID: "",
     FLY_PRIVATE_IP: "",
+    LIVEKIT_R1_IF_INET6_FILE: "",
     ...(getent ? { FAKE_GETENT_FGS: getent.fgs ?? "", FAKE_GETENT_6PN: getent.sixpn ?? "" } : {}),
     ...env,
   };
-  const assignments = Object.entries(variables).map(([name, value]) => `${name}=${shQuote(value)}`).join(" ");
-  const prefix = getent ? `${scratchOnPath} PATH=$F:$PATH ` : "";
+  if (ifInet6) delete variables.LIVEKIT_R1_IF_INET6_FILE;
+  const assignments = Object.entries(variables).map(([name, value]) => `${name}=${shQuote(value)}`).join(" ")
+    + (ifInet6 ? ` LIVEKIT_R1_IF_INET6_FILE="$F/${ifInet6}"` : "");
+  const prefix = getent || ifInet6 ? `${scratchOnPath} ${getent ? "PATH=$F:$PATH " : ""}` : "";
   return exec("bash", ["-c", `${prefix}${assignments} ${shell} entrypoint.sh`], { cwd: directory });
 }
 
@@ -245,10 +252,68 @@ scratchWrite(
   ].join("\n"),
 );
 
+// Kernel interface-table fixtures (/proc/net/if_inet6 layout: address as 32 hex
+// digits, ifindex, prefix length, scope, flags, device; all in hex). The 32-digit
+// forms below are written out by hand, not derived with the code under test.
+const hex = {
+  sixpn: "fdaa000008630a7b01b3abcdef010002", // fdaa:0:863:a7b:1b3:abcd:ef01:2
+  compressed: "fdaa000008630a7b0000000000000002", // fdaa:0:863:a7b::2
+  fallback: "fdaa000008630a7b01b3abcdef010009", // fdaa:0:863:a7b:1b3:abcd:ef01:9
+  shortest: "fdaa0000000000000000000000000001", // fdaa::1
+  trailing: "fdaa0001000200030004000500060000", // fdaa:1:2:3:4:5:6::
+  longer: "fdaa000008630a7b01b3abcdef010020", // fdaa:0:863:a7b:1b3:abcd:ef01:20
+  other: "fdaa000008630a7b01b3abcdef01000f", // fdaa:0:863:a7b:1b3:abcd:ef01:f
+};
+const tableLine = (address, device = "eth0", prefix = "70") => `${address} 05 ${prefix} 00 80 ${device.padStart(8)}`;
+const tableLo = tableLine("00000000000000000000000000000001", "lo", "80");
+const tableLinkLocal = tableLine("fe80000000000000d4a2d0fffe123456", "eth0", "40");
+const writeTable = (name, ...addresses) => scratchWrite(name, [tableLo, tableLinkLocal, ...addresses.map((a) => tableLine(a)), ""].join("\n"));
+// Everything the happy paths below can ask for is on the interface.
+writeTable("inet6-all.txt", hex.sixpn, hex.compressed, hex.fallback);
+// The interface carries a different, well-formed 6PN address than the one asked for.
+writeTable("inet6-other.txt", hex.other, hex.longer);
+writeTable("inet6-trailing.txt", hex.trailing);
+writeTable("inet6-shortest.txt", hex.shortest);
+scratchWrite("inet6-empty.txt", "");
+
+// v6_is_configured, extracted verbatim like is_6pn_ipv6, against the fixtures
+// (relative paths: the script runs with the scratch directory as cwd).
+const configuredCases = [
+  ["ACCEPT", "full address on the interface", sixpn, "inet6-all.txt"],
+  ["ACCEPT", "upper-case input", "FDAA:0:863:A7B:1B3:ABCD:EF01:2", "inet6-all.txt"],
+  ["ACCEPT", "compressed input, zero run in the middle", "fdaa:0:863:a7b::2", "inet6-all.txt"],
+  ["ACCEPT", "fallback address among several", "fdaa:0:863:a7b:1b3:abcd:ef01:9", "inet6-all.txt"],
+  ["ACCEPT", "shortest compressed input", "fdaa::1", "inet6-shortest.txt"],
+  ["ACCEPT", "trailing :: expands to the last group", "fdaa:1:2:3:4:5:6::", "inet6-trailing.txt"],
+  ["ACCEPT", "a near-miss entry (...:20) does not hide the real one", "fdaa:0:863:a7b:1b3:abcd:ef01:20", "inet6-other.txt"],
+  ["REJECT", "well-formed address on no interface", sixpn, "inet6-other.txt"],
+  ["REJECT", "...:20 must not be satisfied by the ...:2 entry", "fdaa:0:863:a7b:1b3:abcd:ef01:20", "inet6-all.txt"],
+  ["REJECT", "...:200 matches neither ...:2 nor ...:20", "fdaa:0:863:a7b:1b3:abcd:ef01:200", "inet6-other.txt"],
+  ["REJECT", "compressed form of an absent address", "fdaa:0:863:a7b::2", "inet6-other.txt"],
+  ["REJECT", "shortest form absent", "fdaa::1", "inet6-trailing.txt"],
+  ["REJECT", "empty table", sixpn, "inet6-empty.txt"],
+  ["REJECT", "missing table", sixpn, "inet6-does-not-exist.txt"],
+  ["REJECT", "nine groups cannot expand to 32 digits", "fdaa:0:1:2:3:4:5:6:7", "inet6-all.txt"],
+];
+const configuredFn = entrypointSource.match(/^v6_is_configured\(\) \{\n[\s\S]*?\n\}\n/m);
+ok(Boolean(configuredFn), "entrypoint.sh must define v6_is_configured() so the interface check is testable");
+scratchWrite(
+  "configured.sh",
+  [
+    configuredFn?.[0] ?? "v6_is_configured() { return 1; }",
+    ...configuredCases.map(([, , address, table]) => `if v6_is_configured ${shQuote(address)} ${shQuote(table)}; then echo ACCEPT; else echo REJECT; fi`),
+    "",
+  ].join("\n"),
+);
+
 const shells = ["bash"];
 if (spawnSync("bash", ["-c", "command -v sh"], { encoding: "utf8" }).status === 0) shells.push("sh");
 
 const flyEnv = { FLY_APP_NAME: "project-hello-r1-rtc-spike", FLY_MACHINE_ID: "148e2d3b5c0948" };
+// The interface-table seam (LIVEKIT_R1_IF_INET6_FILE) is forbidden on Fly, so the
+// runs that feed the entrypoint a fixture table carry no Fly markers. They take the
+// same code path as flyEnv: the markers are read only by the forbid guards.
+const tableEnv = {};
 const fgsLine = "172.19.66.154   fly-global-services";
 const flyBothAddresses = { fgs: fgsLine, sixpn: `${sixpn}  fly-local-6pn` };
 
@@ -262,6 +327,14 @@ for (const shell of shells) {
     ok(lines.length === matrixCases.length, `${tag} 6PN shape matrix must run every case, got ${lines.length} of ${matrixCases.length}:\n${result.error}`);
     matrixCases.forEach(([expected, value], index) => {
       ok(lines[index] === expected, `${tag} 6PN address ${JSON.stringify(value)} must be ${expected}ED, got ${lines[index]}`);
+    });
+  }));
+
+  pending.push(exec(shell, ["configured.sh"], { cwd: scratch }).then((result) => {
+    const lines = result.output.split(/\r?\n/).filter(Boolean);
+    ok(lines.length === configuredCases.length, `${tag} interface-table matrix must run every case, got ${lines.length} of ${configuredCases.length}:\n${result.error}`);
+    configuredCases.forEach(([expected, label], index) => {
+      ok(lines[index] === expected, `${tag} interface check (${label}) must be ${expected}ED, got ${lines[index]}`);
     });
   }));
 
@@ -324,9 +397,9 @@ for (const shell of shells) {
     );
   });
 
-  // ---- Config C on a Fly-shaped environment: no overrides, addresses from getent ----
+  // ---- Config C with no overrides: addresses from getent, 6PN checked against the interface table ----
   // The first field containing ":" wins, so an IPv4 line ahead of it is ignored.
-  expectRun({ shell, config: "C", env: flyEnv, getent: { fgs: fgsLine, sixpn: `10.0.0.5 fly-local-6pn\n${sixpn}  fly-local-6pn` } }, (result) => {
+  expectRun({ shell, config: "C", env: tableEnv, ifInet6: "inet6-all.txt", getent: { fgs: fgsLine, sixpn: `10.0.0.5 fly-local-6pn\n${sixpn}  fly-local-6pn` } }, (result) => {
     ok(result.code === 0, `${tag} Config C via getent must exit 0:\n${result.error}`);
     const document = parseOrReport(result.output, `${tag} Config C via getent`);
     ok(
@@ -345,6 +418,26 @@ for (const shell of shells) {
   expectRun({ shell, config: "C", env: flyEnv, getent: { fgs: fgsLine, sixpn: "::1 fly-local-6pn" } }, (result) => {
     ok(result.code !== 0 && result.output === "" && /must be an fdaa: 6PN IPv6 address/.test(result.error), `${tag} getent returning a non-6PN IPv6 address must be rejected, got: ${result.error}`);
   });
+  // A well-formed fdaa: address that no interface carries (stale /etc/hosts, mismatched
+  // FLY_PRIVATE_IP): LiveKit would open no 6PN socket and log nothing, i.e. silently be
+  // Config B. The entrypoint must refuse, before rendering, and say why.
+  expectRun({ shell, config: "C", env: tableEnv, ifInet6: "inet6-other.txt", getent: flyBothAddresses }, (result) => {
+    ok(result.code !== 0, `${tag} Config C must exit non-zero when the 6PN address is on no interface`);
+    ok(result.output === "", `${tag} Config C must render nothing when the 6PN address is on no interface`);
+    ok(
+      result.error.includes(`Config C: 6PN address ${sixpn} is not configured on any interface`),
+      `${tag} Config C must name the unconfigured 6PN address, got: ${result.error}`,
+    );
+  });
+  // On Fly (markers set, no seam) the kernel's own table is read. No test host has
+  // this address, so a Fly-shaped start must refuse and say which table it read.
+  expectRun({ shell, config: "C", env: flyEnv, getent: flyBothAddresses }, (result) => {
+    ok(
+      result.code !== 0 && result.output === ""
+        && result.error.includes(`Config C: 6PN address ${sixpn} is not configured on any interface (not in /proc/net/if_inet6)`),
+      `${tag} Config C on Fly must check /proc/net/if_inet6 by default, got: ${result.error}`,
+    );
+  });
 
   // ---- Local-only override seams are forbidden on Fly ----
   const forbid = (variable, value, marker, config) => expectRun({ shell, config, env: { [variable]: value, [marker]: "set-by-fly" } }, (result) => {
@@ -354,12 +447,13 @@ for (const shell of shells) {
   });
   forbid("LIVEKIT_R1_6PN_IP_OVERRIDE", sixpn, "FLY_APP_NAME", "C");
   forbid("LIVEKIT_R1_FGS_IP_OVERRIDE", "127.0.0.1", "FLY_APP_NAME", "C");
+  forbid("LIVEKIT_R1_IF_INET6_FILE", "/tmp/fake-if_inet6", "FLY_APP_NAME", "C");
 
   if (!full) continue;
 
   // ---- Remaining Config C edge cases (bash only; same code paths as above) ----
   // getent may print a compressed form.
-  expectRun({ shell, config: "C", env: flyEnv, getent: { fgs: fgsLine, sixpn: "fdaa:0:863:a7b::2 fly-local-6pn" } }, (result) => {
+  expectRun({ shell, config: "C", env: tableEnv, ifInet6: "inet6-all.txt", getent: { fgs: fgsLine, sixpn: "fdaa:0:863:a7b::2 fly-local-6pn" } }, (result) => {
     ok(result.code === 0 && result.output.includes('      - "fdaa:0:863:a7b::2/128"'), `${tag} Config C must accept a compressed 6PN address from getent:\n${result.error}`);
   });
   expectRun({ shell, config: "C", env: flyEnv, getent: { fgs: fgsLine, sixpn: "10.0.0.5 fly-local-6pn" } }, (result) => {
@@ -370,11 +464,11 @@ for (const shell of shells) {
   });
   // FLY_PRIVATE_IP is only a fallback for an fly-local-6pn alias that does not resolve.
   const otherSixpn = "fdaa:0:863:a7b:1b3:abcd:ef01:9";
-  expectRun({ shell, config: "C", env: { ...flyEnv, FLY_PRIVATE_IP: otherSixpn }, getent: { fgs: fgsLine, sixpn: "" } }, (result) => {
+  expectRun({ shell, config: "C", env: { ...tableEnv, FLY_PRIVATE_IP: otherSixpn }, ifInet6: "inet6-all.txt", getent: { fgs: fgsLine, sixpn: "" } }, (result) => {
     ok(result.code === 0 && result.output.includes(`      - "${otherSixpn}/128"`) && result.error.includes("using FLY_PRIVATE_IP"), `${tag} Config C must fall back to FLY_PRIVATE_IP when fly-local-6pn does not resolve:
 ${result.error}`);
   });
-  expectRun({ shell, config: "C", env: { ...flyEnv, FLY_PRIVATE_IP: otherSixpn }, getent: flyBothAddresses }, (result) => {
+  expectRun({ shell, config: "C", env: { ...tableEnv, FLY_PRIVATE_IP: otherSixpn }, ifInet6: "inet6-all.txt", getent: flyBothAddresses }, (result) => {
     ok(result.code === 0 && result.output.includes(`      - "${sixpn}/128"`) && !result.output.includes(otherSixpn) && !result.error.includes("FLY_PRIVATE_IP"), `${tag} fly-local-6pn must win over FLY_PRIVATE_IP:
 ${result.error}`);
   });
@@ -394,11 +488,41 @@ ${result.error}`);
     ok(result.code === 0 && !result.output.includes("/128") && result.output.includes('      - "172.19.66.154/32"'), `${tag} Config B must not require 6PN:\n${result.error}`);
   });
 
-  // Both Fly markers count, for both seams, and for every config.
+  // ---- Config C refuses an address that is not on any interface ----
+  const notConfigured = (label, options) => expectRun({ shell, config: "C", getent: flyBothAddresses, ...options }, (result) => {
+    ok(
+      result.code !== 0 && result.output === "" && /Config C: 6PN address fdaa:\S+ is not configured on any interface/.test(result.error),
+      `${tag} ${label} must fail closed with the not-configured message, got: ${result.error}`,
+    );
+  });
+  // An unreadable or empty kernel table cannot vouch for the address either.
+  notConfigured("a missing interface table", { env: tableEnv, ifInet6: "inet6-does-not-exist.txt" });
+  notConfigured("an empty interface table", { env: tableEnv, ifInet6: "inet6-empty.txt" });
+  // The FLY_PRIVATE_IP fallback is held to the same standard as fly-local-6pn.
+  notConfigured("a FLY_PRIVATE_IP fallback on no interface", {
+    env: { ...tableEnv, FLY_PRIVATE_IP: "fdaa:0:863:a7b:1b3:abcd:ef01:9" },
+    getent: { fgs: fgsLine, sixpn: "" },
+    ifInet6: "inet6-other.txt",
+  });
+  // A near-miss entry on the interface (...:20 for ...:2) is not the address.
+  notConfigured("a near-miss interface entry", { env: tableEnv, ifInet6: "inet6-other.txt" });
+  // The local override seam is a non-Fly smoke test, where a made-up address is on no interface.
+  expectRun({ shell, config: "C", env: { LIVEKIT_R1_FGS_IP_OVERRIDE: "127.0.0.1", LIVEKIT_R1_6PN_IP_OVERRIDE: sixpn }, ifInet6: "inet6-other.txt" }, (result) => {
+    ok(result.code === 0 && result.output.includes(`      - "${sixpn}/128"`), `${tag} the local 6PN override must skip the interface check:\n${result.error}`);
+  });
+  // Configs A and B never consult the interface table.
+  expectRun({ shell, config: "B", env: tableEnv, ifInet6: "inet6-does-not-exist.txt", getent: { fgs: fgsLine, sixpn: "" } }, (result) => {
+    ok(result.code === 0 && !result.output.includes("/128"), `${tag} Config B must not consult the interface table:\n${result.error}`);
+  });
+
+  // Both Fly markers count, for every seam, and for every config.
   forbid("LIVEKIT_R1_6PN_IP_OVERRIDE", sixpn, "FLY_MACHINE_ID", "C");
   forbid("LIVEKIT_R1_FGS_IP_OVERRIDE", "127.0.0.1", "FLY_MACHINE_ID", "C");
+  forbid("LIVEKIT_R1_IF_INET6_FILE", "/tmp/fake-if_inet6", "FLY_MACHINE_ID", "C");
   forbid("LIVEKIT_R1_6PN_IP_OVERRIDE", sixpn, "FLY_APP_NAME", "A");
   forbid("LIVEKIT_R1_6PN_IP_OVERRIDE", sixpn, "FLY_APP_NAME", "B");
+  forbid("LIVEKIT_R1_IF_INET6_FILE", "/tmp/fake-if_inet6", "FLY_APP_NAME", "A");
+  forbid("LIVEKIT_R1_IF_INET6_FILE", "/tmp/fake-if_inet6", "FLY_APP_NAME", "B");
 
   // ---- The selector accepts exactly A, B and C ----
   // (An empty LIVEKIT_R1_CONFIG falls back to A, the documented default.)

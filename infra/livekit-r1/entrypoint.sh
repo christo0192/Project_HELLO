@@ -31,6 +31,11 @@ fi
 if [ -n "${LIVEKIT_R1_6PN_IP_OVERRIDE:-}" ] && { [ -n "${FLY_APP_NAME:-}" ] || [ -n "${FLY_MACHINE_ID:-}" ]; }; then
   die "LIVEKIT_R1_6PN_IP_OVERRIDE is forbidden on Fly"
 fi
+# Test seam for the Config C interface check below. On Fly it would let a fake
+# table vouch for an address the kernel does not have, so it is rejected there.
+if [ -n "${LIVEKIT_R1_IF_INET6_FILE:-}" ] && { [ -n "${FLY_APP_NAME:-}" ] || [ -n "${FLY_MACHINE_ID:-}" ]; }; then
+  die "LIVEKIT_R1_IF_INET6_FILE is forbidden on Fly"
+fi
 
 case "$NODE_IP" in
   *[!0-9.]* | .* | *..* | '') die "NODE_IP must be an IPv4 address" ;;
@@ -79,6 +84,45 @@ is_6pn_ipv6() {
   '
 }
 
+# Succeeds only when the IPv6 literal $1 (already accepted by is_6pn_ipv6) is
+# assigned to a local interface, according to the kernel table $2 (/proc/net/if_inet6:
+# one line per address, field 1 = the address as 32 lowercase hex digits). LiveKit
+# applies rtc.ips as an allow-list of local interface addresses, so a well-formed
+# /128 that matches no interface opens no socket, gathers no candidate and logs
+# nothing: Config C would silently behave like Config B. The literal is expanded
+# to 32 digits here, without `ip`, so it needs nothing beyond awk. An unreadable
+# table counts as a miss (fail closed).
+v6_is_configured() {
+  [ -r "$2" ] || return 1
+  v6_hex="$(printf '%s\n' "$1" | awk '
+    function pad(group) { return substr("0000", 1, 4 - length(group)) tolower(group) }
+    {
+      at = index($0, "::")
+      if (at == 0) {
+        n = split($0, parts, ":")
+        out = ""
+        for (i = 1; i <= n; i++) out = out pad(parts[i])
+        print out
+        exit
+      }
+      left = substr($0, 1, at - 1)
+      right = substr($0, at + 2)
+      nl = (left == "") ? 0 : split(left, lparts, ":")
+      nr = (right == "") ? 0 : split(right, rparts, ":")
+      out = ""
+      for (i = 1; i <= nl; i++) out = out pad(lparts[i])
+      for (i = nl + nr; i < 8; i++) out = out "0000"
+      for (i = 1; i <= nr; i++) out = out pad(rparts[i])
+      print out
+    }
+  ')"
+  [ "${#v6_hex}" -eq 32 ] || return 1
+  awk -v want="$v6_hex" '
+    tolower($1) == want { found = 1; exit }
+    END { exit (found ? 0 : 1) }
+  ' "$2"
+}
+
 FGS=""
 if [ "$R1_CONFIG" = "B" ] || [ "$R1_CONFIG" = "C" ]; then
   # `getent hosts` resolves Fly's per-Machine reply-source address, not public
@@ -100,7 +144,9 @@ fi
 # not resolve here). It is not static (it can change on a reboot or host
 # migration), so it is read at every boot and never stored in fly.toml or a
 # secret. Fail closed: without it Config C would silently degrade to Config B,
-# the broken worker path.
+# the broken worker path. The same is true of a well-formed address that no
+# interface carries (a stale /etc/hosts or a mismatched FLY_PRIVATE_IP), so it
+# must also be present in the kernel's address table before anything is rendered.
 V6=""
 if [ "$R1_CONFIG" = "C" ]; then
   if [ -n "${LIVEKIT_R1_6PN_IP_OVERRIDE:-}" ]; then
@@ -115,6 +161,12 @@ if [ "$R1_CONFIG" = "C" ]; then
     [ -n "$V6" ] || die "Config C requires the Machine's fly-local-6pn IPv6 (Fly private network); set LIVEKIT_R1_6PN_IP_OVERRIDE only for a local smoke test"
   fi
   is_6pn_ipv6 "$V6" || die "fly-local-6pn must be an fdaa: 6PN IPv6 address made of hex groups"
+  # The local override is a non-Fly smoke test (forbidden on Fly), where a made-up
+  # address cannot be on an interface; every real Fly start is checked.
+  if [ -z "${LIVEKIT_R1_6PN_IP_OVERRIDE:-}" ]; then
+    IF_INET6_FILE="${LIVEKIT_R1_IF_INET6_FILE:-/proc/net/if_inet6}"
+    v6_is_configured "$V6" "$IF_INET6_FILE" || die "Config C: 6PN address ${V6} is not configured on any interface (not in ${IF_INET6_FILE}); LiveKit would open no 6PN socket and behave like Config B"
+  fi
 fi
 
 # A mapping line is accepted, rather than arbitrary YAML, so a malformed or

@@ -111,7 +111,12 @@ address is not static, so it is never stored in `fly.toml` or a secret;
 `$FLY_PRIVATE_IP` is only a fallback when the alias does not resolve). It must be
 an `fdaa:` address made of hex groups, or the entrypoint exits with an error. A
 Config C start without a 6PN address fails closed instead of quietly behaving
-like Config B.
+like Config B. So does a well-formed address that no interface carries (a stale
+`/etc/hosts` entry or a mismatched `FLY_PRIVATE_IP`): LiveKit treats `rtc.ips`
+as an allow-list of local interface addresses, so it would open no `[fdaa:...]:7882`
+socket and log nothing. Before rendering anything, the entrypoint looks the
+address up in the kernel's `/proc/net/if_inet6` and exits with
+`Config C: 6PN address <addr> is not configured on any interface` on a miss.
 
 How it works, from the pinned LiveKit v1.13.7 / pion sources:
 
@@ -167,7 +172,9 @@ Roll back with `fly secrets set -a project-hello-r1-rtc-spike LIVEKIT_R1_CONFIG=
 
 To check the rendering locally without Docker (render-only mode redacts the key
 and never starts LiveKit; `LIVEKIT_R1_6PN_IP_OVERRIDE` is rejected whenever
-`FLY_APP_NAME` or `FLY_MACHINE_ID` is set, exactly like the FGS override):
+`FLY_APP_NAME` or `FLY_MACHINE_ID` is set, exactly like the FGS override; a
+made-up override address is on no local interface, so the interface check above is
+skipped for the override, and only for the override):
 
 ```sh
 NODE_IP=203.0.113.10 LIVEKIT_KEYS="r1-local:$(printf 'a%.0s' $(seq 40))" LIVEKIT_R1_RENDER_ONLY=1 \
@@ -184,8 +191,11 @@ NODE_IP=203.0.113.10 LIVEKIT_KEYS="r1-local:$(printf 'a%.0s' $(seq 40))" LIVEKIT
    # livekit-r1-entrypoint: Config C; advertising 37.16.23.137:7882 and 6PN fdaa:...
    ```
 
-2. Both UDP sockets exist. If only the IPv4 one is listed, the `/128` matched no
-   interface and LiveKit logs nothing, so this check is mandatory:
+2. Both UDP sockets exist. The entrypoint already refuses to start when the
+   address is on no interface, but that is a pre-flight guard: this `ss` check is
+   the proof that LiveKit really bound the 6PN socket, and it stays a hard gate
+   for the rollout. If only the IPv4 one is listed, the `/128` matched no
+   interface and LiveKit logs nothing:
 
    ```sh
    fly ssh console -a project-hello-r1-rtc-spike -C 'ss -ulpn | grep :7882; ss -tlnp | grep :7881'
