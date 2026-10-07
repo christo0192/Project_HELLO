@@ -520,6 +520,36 @@ for (const [label, phone, apiEnv, apiFly] of AGREE_NEG) {
     `the shipped configs must SURFACE both lanes on WORKER, got:\n${out}`);
 }
 
+// R1 owns a separate worker drain budget. It is enabled only on the browser
+// app, but its declared values must still fit Fly's kill budget before launch.
+{
+  const mod = await import(pathToFileURL(validator).href);
+  const R = mod.checkR1DrainBudget;
+  ok(typeof R === "function", "validator must export checkR1DrainBudget");
+  if (typeof R === "function") {
+    ok(R({ killTimeout: "300", drain: "60", shutdown: "90" }).length === 0,
+      "R1 60 + 2 x 90 + 30 = 270 fits kill_timeout 300");
+    ok(R({ killTimeout: "240", drain: "60", shutdown: "90" }).some((p) => /exceeds kill_timeout/.test(p)),
+      "R1 budget overflow must fail");
+    ok(R({ killTimeout: "300", drain: undefined, shutdown: undefined }).length === 0,
+      "absent R1 settings keep the dormant browser lane valid");
+    ok(R({ killTimeout: undefined, drain: undefined, shutdown: undefined, mode: "off" }).length === 0,
+      "a dormant browser app declares no kill_timeout and no R1 drain settings");
+    for (const mode of ["r1_only", " r1_only "]) {
+      ok(R({ killTimeout: undefined, drain: undefined, shutdown: undefined, mode })
+        .some((p) => /requires kill_timeout/.test(p)),
+      `mode ${JSON.stringify(mode)} must require kill_timeout plus both drain settings`);
+      ok(R({ killTimeout: "300", drain: "60", shutdown: undefined, mode })
+        .some((p) => /requires kill_timeout/.test(p)),
+      `mode ${JSON.stringify(mode)} must require BOTH drain settings`);
+      ok(R({ killTimeout: "300", drain: "60", shutdown: "90", mode }).length === 0,
+        `mode ${JSON.stringify(mode)} with the full budget is valid`);
+    }
+    ok(R({ killTimeout: undefined, drain: undefined, shutdown: undefined, mode: "garbage" }).length === 0,
+      "an unknown mode is not R1, so it demands nothing");
+  }
+}
+
 if (failures.length) {
   console.error(`validate-voice-worker-apps.test FAILED (${failures.length}):`);
   for (const f of failures) console.error(" - " + f);

@@ -99,7 +99,7 @@ COPY --from=builder /opt/venv /opt/venv
 # dynamic imports (importlib.import_module("x")/__import__("x")); a first-party
 # module pulled in only via a computed/non-literal import name cannot be seen
 # statically and must be added here by hand.
-COPY agent.py closing.py noise_suppression.py observability.py persistence.py phone.py phone_canary.py prompting.py provenance.py provider_resilience.py recording.py recording_api.py worker_ready_api.py ./
+COPY agent.py closing.py noise_suppression.py observability.py persistence.py phone.py phone_canary.py prompting.py provenance.py provider_resilience.py recording.py recording_api.py worker_ready_api.py r1_context.py r1_lines.py r1_llm.py r1_persistence.py r1_phases.py r1_routing.py r1_session.py ./
 
 USER 1000:1000
 

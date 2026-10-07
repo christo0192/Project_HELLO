@@ -218,6 +218,14 @@ describe('candidate access grant', () => {
 // ── 5. Metadata minimization verification ────────────────────────────
 
 describe('metadata minimization — nested payload integrity', () => {
+  it('adds the R1 marker only for API-selected R1 rooms', async () => {
+    const { buildMinimalRoomMetadata } = await import('../lib/room-provisioning.js');
+    const cloud = JSON.parse(buildMinimalRoomMetadata(SESSION_ID, ROOM_NAME, 'cloud'));
+    const r1 = JSON.parse(buildMinimalRoomMetadata(SESSION_ID, ROOM_NAME, 'r1'));
+    expect(cloud.lane).toBeUndefined();
+    expect(r1.lane).toBe('r1');
+  });
+
   it('buildMinimalRoomMetadata contains no PII fields', async () => {
     // Inline the function logic to verify
     const metadata = {

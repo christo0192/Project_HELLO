@@ -5,7 +5,7 @@
 // to Fly). These tests lock its security-relevant contract so a future edit
 // cannot silently weaken it. Dependency-free: text + per-job assertions only.
 
-import { readFileSync, writeFileSync, mkdtempSync, rmSync, chmodSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdtempSync, mkdirSync, rmSync, chmodSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
@@ -539,6 +539,98 @@ ok(!/FLY_API_TOKEN_API/.test(phone) && !/FLY_API_TOKEN_VOICE\b/.test(phone),
     const newJq = spawnSync("jq", ["-r", 'map(select(.state=="stopped")) | .[0].id // empty'], { input: json, encoding: "utf8" });
     ok((newJq.stdout || "").trim() === "287d073f569398",
       "the NEW jq parse must pick the stopped machine id from --json");
+  }
+}
+
+// ── 9. A merge that touches app/voice-livekit is ALSO a phone release ──
+// The two voice apps share that source, so ANY such merge redeploys the phone worker from
+// main HEAD. Round-5 review of PR #343 (the R1 worker core): the merge would have shipped
+// the not-yet-deployed phone changes of #334 (fd40050c) without saying so. (a) Run the REAL
+// push-path decision on a throwaway commit and prove the premise, and that the decision is
+// not constant. (b) Pin the runbook procedure for that consequence: the PR body cannot be
+// tested, the runbook it points at can.
+{
+  const decide = (stepScript(detect, "Decide which services changed") || "").replace(/\r/g, "");
+  ok(/git diff --name-only "\$\{sha\}\^" "\$\{sha\}"/.test(decide),
+    "the push-path decision must diff the merge commit alone (that is what makes #334 ride along)");
+
+  const select = (changedPaths) => {
+    const repo = mkdtempSync(path.join(tmpdir(), "detect-repo-"));
+    const scratch = mkdtempSync(path.join(tmpdir(), "detect-out-"));
+    try {
+      const git = (...args) => spawnSync(
+        "git",
+        ["-c", "user.name=t", "-c", "user.email=t@example.test", "-c", "commit.gpgsign=false", ...args],
+        { cwd: repo, encoding: "utf8" },
+      );
+      git("init", "-q");
+      writeFileSync(path.join(repo, "README.md"), "base\n");
+      git("add", "-A");
+      git("commit", "-q", "-m", "base");
+      for (const changed of changedPaths) {
+        mkdirSync(path.dirname(path.join(repo, changed)), { recursive: true });
+        writeFileSync(path.join(repo, changed), "changed\n");
+      }
+      git("add", "-A");
+      git("commit", "-q", "-m", "change");
+      const sha = (git("rev-parse", "HEAD").stdout || "").trim();
+      const scriptPath = path.join(scratch, "decide.sh").replace(/\\/g, "/");
+      const outPath = path.join(scratch, "github_output").replace(/\\/g, "/");
+      writeFileSync(scriptPath, decide.split("${{ steps.sha.outputs.sha }}").join(sha));
+      writeFileSync(outPath, "");
+      const run = spawnSync("bash", [scriptPath], {
+        cwd: repo,
+        encoding: "utf8",
+        env: { ...process.env, SVC: "", EVENT: "push", GITHUB_OUTPUT: outPath },
+      });
+      if (run.status !== 0) return null;
+      const outputs = {};
+      for (const row of readFileSync(outPath, "utf8").split("\n")) {
+        const eq = row.indexOf("=");
+        if (eq > 0) outputs[row.slice(0, eq)] = row.slice(eq + 1).trim();
+      }
+      return outputs;
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  };
+
+  const r1Only = select(["app/voice-livekit/r1_session.py"]);
+  ok(r1Only !== null && r1Only.voice === "true" && r1Only.phone === "true" && r1Only.api === "false",
+    "a merge that changes only an R1 module under app/voice-livekit must select BOTH voice apps (and not the api): it is a phone release");
+  const apiOnly = select(["app/api/src/app.ts"]);
+  ok(apiOnly !== null && apiOnly.api === "true" && apiOnly.voice === "false" && apiOnly.phone === "false",
+    "an api-only merge must NOT select the voice apps (the decision is not constant)");
+  const docsOnly = select(["docs/runbooks/r1-operations.md"]);
+  ok(docsOnly !== null && docsOnly.api === "false" && docsOnly.voice === "false" && docsOnly.phone === "false",
+    "a docs-only merge must select no app");
+
+  const runbook = readFileSync(path.join(root, "docs/runbooks/r1-operations.md"), "utf8").replace(/\r/g, "");
+  const heading = "### PR-4a (#343) is also the production release of #334";
+  const at = runbook.indexOf(heading);
+  ok(at !== -1, "the R1 runbook must carry the section that treats the PR-4a merge as a phone release");
+  if (at !== -1) {
+    const after = runbook.slice(at + heading.length);
+    const next = after.search(/^#{2,3} /m);
+    const section = (next === -1 ? after : after.slice(0, next)).replace(/\s+/g, " ");
+    const required = [
+      [/fd40050c/, "name the undeployed commit"],
+      [/#334/, "name the PR whose phone changes ride along"],
+      [/BOTH voice apps/, "say that both voice apps redeploy"],
+      [/git diff <sha>\^ <sha>/, "say why: the deploy decision diffs the merge commit alone"],
+      [/never attributed to R1/, "say a phone regression is not charged to R1"],
+      [/service=phone-voice/, "give the release-#334-first path as a dispatch"],
+      [/explicitly accepts/, "give the owner-accepts path"],
+      [/phone-impact section/, "require the choice in the PR body's phone-impact section"],
+      [/zero-live-call/, "require the zero-live-call window"],
+      [/current-registration proof for BOTH voice apps/, "require the registration proof"],
+      [/Canary-1 dry run/, "require the phone Canary-1 dry run"],
+      [/phone-worker-deployment\.md/, "point at the phone rollback"],
+    ];
+    for (const [pattern, what] of required) {
+      ok(pattern.test(section), `the PR-4a phone-release section must ${what}`);
+    }
   }
 }
 

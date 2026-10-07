@@ -34,6 +34,14 @@
  *     from outside a transaction (see reapUnownedRoom's removal below), so
  *     the mode simply never deletes; an orphan room self-reaps at
  *     ROOM_EMPTY_TIMEOUT_SEC and no token was ever minted for it.
+ *  5. The R1 lane marker (`lane:r1` room metadata, which authorizes a worker to
+ *     run R1) is derived from the SESSION (an R1 round: `interviewRoundId`), and
+ *     must agree with the selected endpoint. A disagreement either way fails
+ *     closed (`r1_lane_mismatch`) before any provider call, so a legacy session
+ *     is never marked just because the endpoint is R1, and an R1 round is never
+ *     left unmarked on the Cloud endpoint. Cloud room args stay byte-identical.
+ *     The same predicate (`r1LaneMismatch`) guards the exchange route for a session
+ *     whose room already exists, so no token is ever minted across a lane mismatch.
  */
 
 import { supabase } from './supabase.js';
@@ -42,6 +50,8 @@ import { startAuthoritativeRecording } from './recording-egress.js';
 import { transitionSession } from './session-lifecycle.js';
 import {
   cloudLiveKitEndpoint,
+  R1_LANE_MISMATCH_ERROR,
+  r1LaneMismatch,
   requireLiveKitEndpointConfigured,
   roomServiceClientFor,
   type LiveKitEndpoint,
@@ -51,6 +61,15 @@ import {
 export const ROOM_EMPTY_TIMEOUT_SEC = 10 * 60;
 /** Candidate + agent + head-room. */
 export const ROOM_MAX_PARTICIPANTS = 4;
+/** Server-authored R1 marker; a worker refuses a marked room without its mode gate. */
+export const R1_ROOM_METADATA_LANE_KEY = 'lane';
+export const R1_ROOM_METADATA_LANE_VALUE = 'r1';
+/**
+ * R1 rooms outlive the candidate's departure by the worker's 90 s rejoin grace plus a
+ * 30 s margin. LiveKit's server default (20 s) would close the room, and cancel the
+ * agent job, before the reconnect window ends. Cloud/legacy rooms never set it.
+ */
+export const R1_ROOM_DEPARTURE_TIMEOUT_SEC = 120;
 
 export function requireLiveKitConfigured(): void {
   requireLiveKitEndpointConfigured(cloudLiveKitEndpoint());
@@ -66,12 +85,20 @@ export function roomNameForSession(sessionId: string): string {
  * phone, resume facts, JD/role focus, template, transcript/scoring context,
  * provider secrets, access tokens) are structurally absent.
  */
-export function buildMinimalRoomMetadata(sessionId: string, roomName: string): string {
-  return JSON.stringify({
+export function buildMinimalRoomMetadata(
+  sessionId: string,
+  roomName: string,
+  lane: LiveKitEndpoint['target'] = 'cloud',
+): string {
+  const metadata = {
     session_id: sessionId,
     room_name: roomName,
     correlation_id: getCorrelationId() ?? undefined,
-  });
+    ...(lane === 'r1'
+      ? { [R1_ROOM_METADATA_LANE_KEY]: R1_ROOM_METADATA_LANE_VALUE }
+      : {}),
+  };
+  return JSON.stringify(metadata);
 }
 
 export interface RoomServiceClientLike {
@@ -80,6 +107,8 @@ export interface RoomServiceClientLike {
     emptyTimeout: number;
     maxParticipants: number;
     metadata: string;
+    /** R1 rooms only; omitted (not undefined) for Cloud so legacy args stay byte-identical. */
+    departureTimeout?: number;
   }): Promise<unknown>;
   updateRoomMetadata(room: string, metadata: string): Promise<unknown>;
   deleteRoom(room: string): Promise<unknown>;
@@ -100,6 +129,14 @@ export interface ProvisionRoomDeps {
    */
   db?: typeof supabase;
   startRecording?: typeof startAuthoritativeRecording;
+  /**
+   * `call_sessions.interview_round_id` of the session being provisioned. A non-empty
+   * value marks an R1 round session. The room is marked `lane:r1` only when that
+   * agrees with the selected endpoint; a disagreement in either direction (an R1
+   * round on a non-R1 endpoint, or a legacy session on the R1 endpoint) fails
+   * provisioning closed as `r1_lane_mismatch`, before any provider call.
+   */
+  interviewRoundId?: string | null;
 }
 
 export type ProvisionRoomMode = 'new_session' | 'existing_session';
@@ -164,18 +201,30 @@ export async function provisionRoomForCreatedSession(
   requireLiveKitEndpointConfigured(endpoint);
 
   const roomName = roomNameForSession(sessionId);
-  const metadata = buildMinimalRoomMetadata(sessionId, roomName);
+  const r1Round = typeof deps.interviewRoundId === 'string' && deps.interviewRoundId.length > 0;
+  const r1Endpoint = endpoint.target === 'r1';
+  const metadata = buildMinimalRoomMetadata(
+    sessionId,
+    roomName,
+    r1Round && r1Endpoint ? 'r1' : 'cloud',
+  );
   const rooms = deps.rooms ?? roomClient(endpoint);
   const db = deps.db ?? supabase;
   const startRecording = deps.startRecording ?? startAuthoritativeRecording;
 
   try {
+    // The R1 marker authorizes a worker to run R1, so it must come from the session
+    // (an R1 round), never from the endpoint alone. Checked before any provider call.
+    if (r1LaneMismatch(deps.interviewRoundId, endpoint)) {
+      throw new Error(R1_LANE_MISMATCH_ERROR);
+    }
     try {
       await rooms.createRoom({
         name: roomName,
         emptyTimeout: ROOM_EMPTY_TIMEOUT_SEC,
         maxParticipants: ROOM_MAX_PARTICIPANTS,
         metadata,
+        ...(r1Endpoint ? { departureTimeout: R1_ROOM_DEPARTURE_TIMEOUT_SEC } : {}),
       });
     } catch {
       // Room already exists (retry, or a concurrent provisioner) — converge
@@ -186,7 +235,7 @@ export async function provisionRoomForCreatedSession(
     // R1 records in its worker. It has no LiveKit Egress service, so never
     // construct the Cloud egress client for an R1 room. Cloud retains the
     // existing authoritative-egress gate, including required-egress failures.
-    const recording = endpoint.target === 'r1'
+    const recording = r1Endpoint
       ? { kind: 'no_egress' as const }
       : { kind: 'egress' as const, result: await startRecording(roomName, sessionId) };
     if (
@@ -199,7 +248,11 @@ export async function provisionRoomForCreatedSession(
   } catch (raw) {
     const error = raw instanceof Error ? raw : new Error('LiveKit room provisioning failed');
     if (mode === 'new_session') {
-      await rooms.deleteRoom(roomName).catch(() => undefined);
+      // A lane mismatch is refused before any provider call, so there is no room of ours
+      // to clean up (and no delete should be sent to an endpoint that never saw it).
+      if (error.message !== R1_LANE_MISMATCH_ERROR) {
+        await rooms.deleteRoom(roomName).catch(() => undefined);
+      }
       const term = await transitionSession(sessionId, 'created', 'failed', 'room_create_error');
       return {
         ok: false,

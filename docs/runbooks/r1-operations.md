@@ -189,6 +189,40 @@ Three departures from section 9, each justified:
 Phone tests that stay green and unmodified: `test_phone_gate`,
 `test_phone_agent_name`, `test_phone_drain` and `test_agent`. `test_worker_ready_api`
 gains additive `livekit_host` cases only.
+### PR-4a (#343) is also the production release of #334
+
+`Deploy (Fly)` decides what to deploy from the merge commit alone
+(`git diff <sha>^ <sha>`), and any change under `app/voice-livekit/` redeploys BOTH
+voice apps, browser and phone, from `main` HEAD, because they share that source
+(`scripts/deploy-fly-workflow.test.mjs` runs that decision against a real commit). The
+newest commit on `main` that changed `app/voice-livekit/` before PR-4a is `fd40050c`
+(#334, "natural opening, pre-consent scheduling, and Q&A closing": 271 changed lines in
+`agent.py` and 213 in `phone.py`), and it has not been confirmed live. Merging PR-4a
+therefore ships #334's phone changes to live calls together with the R1 core. The R1 code
+is inert for phone (the phone worker options are identical and the phone entrypoint never
+imports `r1_*`; `tests/test_r1_routing.py` pins both), so a phone regression after this
+merge comes from #334 until shown otherwise and is never attributed to R1. If the
+`Deploy (Fly)` runs and `fly releases` already show a live release of both voice apps
+that carries `fd40050c`, this section reduces to the ordinary gate above.
+
+Choose one path BEFORE the merge, and state it in the PR body's phone-impact section:
+
+1. Release #334 on its own first. Inside the merge window, with the zero-live-call
+   queries above passing, dispatch `Deploy (Fly)` with `service=phone-voice` from `main`
+   as it stands before PR-4a (a dispatch deploys the ref it is dispatched from), and pass
+   the phone checks below. The PR-4a merge then redeploys an already verified phone
+   worker.
+2. The owner explicitly accepts that the PR-4a merge itself ships #334. Merge only in
+   the window, with the zero-live-call queries above passing, and run the phone checks
+   below straight after the deploy.
+
+Phone checks after the deploy, on either path: the deploy job's own current-registration
+proof for BOTH voice apps (a missing current registration is a failed deploy, never a
+warning), the unchanged phone role-row snapshot, and a phone Canary-1 dry run
+(`docs/runbooks/phone-canary1.md`). The opening line, scheduling before consent and the
+Q&A closing are #334's behaviour, so the dry run is the signal for it. If any check
+fails, keep `r1_settings.paused = true` and roll the phone worker back
+(`docs/runbooks/phone-worker-deployment.md` section 5) before touching R1.
 
 ## Budget, cap, and reconciliation
 
@@ -563,6 +597,69 @@ prep-guide urgency lever (application deadline, seasonal discount)", the plan 6.
 wording; the deck lists both levers. The owner's confirmation of that wording is
 pending. Re-run the seed after a rubric change: the scorer refuses a scorecard whose
 metric keys or weights differ from the rubric (see "Wrong scorecard").
+
+## SFU operations and fallback
+
+## Room-routing contract
+
+R1 selection requires both `R1_LANE_MODE=r1_only` on the browser worker and
+the API-authored room metadata JSON marker `{"lane":"r1"}`. The marker is set
+only when the session being provisioned is an R1 round (`interview_round_id`
+is not null) AND API provisioning selected the R1 endpoint; browser clients
+cannot set room metadata. A session and an endpoint that disagree (an R1 round
+on the Cloud endpoint, or a legacy session while `BROWSER_LIVEKIT_TARGET=r1`)
+fail provisioning closed with `r1_lane_mismatch` before any provider call (no room
+is created, updated or deleted, in either provisioning mode).
+
+The same fence runs in `/api/livekit/exchange` for a session whose room already
+exists (`waiting` or `in_progress`, for example a recruiter `/start` before a flip),
+and before the browser worker gate, the invite consume and any token: it answers 503
+`screening_room_unavailable`, leaves the invite unconsumed and mints nothing. Both
+places use one predicate, `r1LaneMismatch` in `lib/livekit-endpoints.ts`. Terminal
+sessions keep the stable 404.
+
+A marked room with mode `off` or an unknown mode is refused. In `r1_only`, an
+unmarked room is likewise refused. A refusal logs `r1_room_routing_refused`,
+deletes the room (`JobContext.delete_room`) and ends the job
+(`JobContext.shutdown`); livekit-agents 1.6.4 has no `close_room`, and a job
+that never connected is otherwise never released. Unmarked rooms with mode
+`off` or an unknown value retain the legacy browser path. The mode value is
+compared trimmed everywhere (one predicate, `r1_routing.r1_mode_allows`). Never
+use dispatch metadata as the authorization marker.
+
+R1 rooms are created with `departureTimeout` of 120 s (rejoin grace 90 s plus
+30 s): the LiveKit server default of 20 s would close the room before the
+candidate's 90 s reconnect window ends.
+
+Flip ordering. A worker and an endpoint that disagree refuse and delete every new
+room (worker `r1_only` with legacy rooms, or API target `r1` with a worker in mode
+`off`), which is a candidate-visible outage. So the mode and the endpoint change
+TOGETHER, inside a drained, maintenance-mode window with no `created`, `waiting` or
+`in_progress` session on either lane: follow the fallback flip procedure below, and
+set `R1_LANE_MODE` and `BROWSER_LIVEKIT_TARGET` in the same window. Never flip only
+one of them.
+
+Teardown budget. A drain never wakes a running interview by itself: livekit-agents 1.6.4
+`Worker.drain` only waits for the running jobs (up to `R1_DRAIN_TIMEOUT_SEC`, 60 s), and
+`add_shutdown_callback` callbacks run only after the entrypoint has ended, so R1 registers
+none (`tests/test_r1_sdk_contract.py` pins that order). An interview therefore keeps going
+for up to the drain timeout, and learns of the drain only when the SDK cancels the
+entrypoint 15 s after the job's shutdown request; the process is killed at
+`shutdown_process_timeout` (production 90 s). The R1 cancel path is therefore sized
+to `shutdown - 15 s` = 75 s in total: closing line 15 s, `phase=ended` 5 s,
+transcript drain 10 s, the ordered exit steps (recording, ledger, terminal, attempt
+outcome) 30 s together, session close 5 s and room delete 10 s. The room close is
+not part of the shared 30 s, so a hung database write never leaves the agent in the
+room. A smaller `R1_SHUTDOWN_PROCESS_TIMEOUT_SEC` scales every bound down in
+proportion (`r1_session.teardown_scale`); the tests pin the sum for every allowed
+value.
+
+Browser worker drain budget: `kill_timeout`, `R1_DRAIN_TIMEOUT_SEC` and
+`R1_SHUTDOWN_PROCESS_TIMEOUT_SEC` are NOT in `app/voice-livekit/fly.toml` while
+R1 is dormant, because `kill_timeout = 300` would change how the live legacy
+browser lane stops (Fly default 5 s). The PR that sets `R1_LANE_MODE = "r1_only"`
+must add all three together; `scripts/validate-voice-worker-apps.mjs` requires
+them in that case and checks `drain + 2 x shutdown + 30 <= kill_timeout`.
 
 ## SFU operations and fallback
 
