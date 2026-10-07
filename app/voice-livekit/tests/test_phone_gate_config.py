@@ -1,8 +1,10 @@
 """M013 S01 T12: gate-judge config, env contract and browser isolation.
 
-* fly.phone.toml ships the T11 rollout decision (`PHONE_GATE_JUDGE=shadow`,
-  the owner's DeepSeek V4 Flash id, the measured timeouts) and no longer pins
-  the consent backstop below its derived floor;
+* fly.phone.toml ships the owner's rollout decision (`PHONE_GATE_JUDGE=llm`,
+  2026-10-06: the judge decides, the regex only when the judge is
+  unavailable), the owner's DeepSeek V4 Flash id, the measured timeouts, and
+  no longer pins the consent backstop below its derived floor; the code
+  default (env unset) stays legacy;
 * the browser app (fly.toml) gets none of it;
 * every gate variable is declared in config/environment.schema.json and in
   .env.example (`scripts/check-env-contract.mjs` enforces the general rule;
@@ -63,10 +65,16 @@ class TestPhoneAppConfig(unittest.TestCase):
     def setUp(self):
         self.env = _toml("fly.phone.toml")
 
-    def test_rollout_mode_is_the_t11_decision(self):
-        # T11's real bank failed the recall rule, so the plan ships shadow.
-        self.assertEqual(self.env.get("PHONE_GATE_JUDGE"), "shadow")
+    def test_rollout_mode_is_the_owner_decision(self):
+        # Owner decision 2026-10-06: the LLM judge decides (T11's 16/17 vs
+        # 17/17 recall trade-off accepted for 0 real false grants vs 2).
+        self.assertEqual(self.env.get("PHONE_GATE_JUDGE"), "llm")
+        self.assertEqual(self.env["PHONE_GATE_JUDGE"], gate_judge.GATE_JUDGE_MODE_LLM)
         self.assertIn(self.env["PHONE_GATE_JUDGE"], gate_judge.GATE_JUDGE_MODES)
+
+    def test_toml_comment_names_the_legacy_rollback(self):
+        text = (_WORKER / "fly.phone.toml").read_text(encoding="utf-8")
+        self.assertIn("fly secrets set PHONE_GATE_JUDGE=legacy", text)
 
     def test_owner_model_and_endpoint(self):
         self.assertEqual(self.env.get("PHONE_GATE_JUDGE_MODEL"), "deepseek-v4-flash")
@@ -85,7 +93,7 @@ class TestPhoneAppConfig(unittest.TestCase):
             for k in ("PHONE_CLASSIFY_TIMEOUT_SEC", "PHONE_GATE_GRANT_MIN_SPEECH_MS",
                       "PHONE_GATE_COMPOSE_TIMEOUT_SEC", "PHONE_Q1_PRERENDER"):
                 os.environ.pop(k, None)
-            self.assertEqual(gate_judge.judge_mode(), "shadow")
+            self.assertEqual(gate_judge.judge_mode(), "llm")
             self.assertEqual(gate_judge.judge_model(), "deepseek-v4-flash")
             self.assertEqual(gate_judge.judge_timeout_sec(), 1.7)
             self.assertEqual(gate_judge.qna_judge_timeout_sec(), 1.6)
@@ -94,8 +102,9 @@ class TestPhoneAppConfig(unittest.TestCase):
                              gate_judge.GATE_JUDGE_TIMEOUT_DEFAULT_SEC)
             self.assertEqual(gate_judge.qna_judge_timeout_sec(),
                              gate_judge.QNA_JUDGE_TIMEOUT_DEFAULT_SEC)
-            # The consent backstop is the derived floor (2 x (15 + 6 + 1.7) + 5).
-            self.assertAlmostEqual(phone.phone_classify_timeout_sec(), 50.4)
+            # The consent backstop is the derived llm-mode floor
+            # (3 x (15 + 2 x 6 + 3 x 1.7 + 2 x 6) + 5).
+            self.assertAlmostEqual(phone.phone_classify_timeout_sec(), 137.3)
             self.assertAlmostEqual(phone.phone_classify_timeout_sec(),
                                    phone.phone_classify_backstop_floor_sec())
 
@@ -146,6 +155,82 @@ class TestEnvContract(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("PHONE_GATE_JUDGE", None)
             self.assertEqual(gate_judge.judge_mode(), gate_judge.GATE_JUDGE_MODE_LEGACY)
+
+
+# ── the runbook's "logs to watch" fields are really emitted ──────────────────
+
+#: The S01 log types docs/runbooks/phone-safe-dialer.md §2x tells operators to
+#: watch during the 48 h window.
+_WATCHED_LOG_TYPES = frozenset({
+    "phone_gate_decision", "phone_gate_shadow_decision", "phone_gate_shadow",
+    "gate_judge_fallback_legacy", "gate_judge_disabled", "phone_gate_compose",
+    "phone_gate_budget", "phone_gate_heartbeat", "phone_gate_turn_barrier",
+    "phone_gate_quiescence", "phone_gate_final", "phone_callback_judge",
+    "phone_callback_turn", "phone_qna_close", "phone_silence",
+    "phone_q1_prefetch",
+})
+
+
+def _log_calls(path: Path):
+    """``(lineno, error_type, keyword names)`` for each structured-log call
+    (``_log.info/warn/...``, gate_judge's ``_emit`` or ``self._log``) with a literal
+    ``error_type``."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        is_log = (isinstance(func, ast.Attribute)
+                  and func.attr in ("info", "warn", "warning", "error", "debug")
+                  and isinstance(func.value, ast.Name) and func.value.id == "_log")
+        is_emit = isinstance(func, ast.Name) and func.id == "_emit"
+        # gate_judge's turn tracker logs through its own `self._log(...)`.
+        is_self_log = isinstance(func, ast.Attribute) and func.attr == "_log"
+        if not (is_log or is_emit or is_self_log):
+            continue
+        kinds = {k.arg: k.value for k in node.keywords if k.arg}
+        et = kinds.get("error_type")
+        if isinstance(et, ast.Constant) and isinstance(et.value, str):
+            yield node.lineno, et.value, set(kinds) - {"log"}
+
+
+class TestWatchedLogFieldsAreAllowlisted(unittest.TestCase):
+    """The structured logger silently DROPS any key outside its allowlist, so
+    a field the runbook names (or a call site passes) that is not allowlisted
+    never reaches Fly logs. Round-1 found `phone_qna_close` `source=` and the
+    compose / Q1-prefetch `duration_ms=` vanishing this way."""
+
+    def test_every_watched_log_call_uses_only_allowlisted_keys(self):
+        import observability
+
+        allowed = set(observability._ALLOWED_META_KEYS) | {"error_type"}
+        seen: set[str] = set()
+        bad = []
+        for name in ("agent.py", "gate_judge.py"):
+            for lineno, et, keys in _log_calls(_WORKER / name):
+                if et not in _WATCHED_LOG_TYPES:
+                    continue
+                seen.add(et)
+                extra = sorted(keys - allowed)
+                if extra:
+                    bad.append((name, lineno, et, extra))
+        self.assertEqual(bad, [])
+        # Not vacuous: most watched types are found as literal call sites
+        # (the rest are emitted through helpers with a computed error_type).
+        self.assertTrue({"phone_gate_compose", "phone_qna_close", "phone_q1_prefetch",
+                         "phone_gate_final", "phone_gate_turn_barrier"} <= seen, seen)
+
+    def test_the_runbook_names_the_real_decision_keys(self):
+        text = (_REPO / "docs" / "runbooks" / "phone-safe-dialer.md").read_text(
+            encoding="utf-8")
+        section = text.split("### 2x.", 1)[1].split("### 2y.", 1)[0]
+        for key in ("error_category", "duration_sec", "rejection_reason", "schema",
+                    "turn_index", "option_count", "phase", "model"):
+            with self.subTest(key=key):
+                self.assertIn(f"`{key}`", section)
+        # The internal names a Fly query would find nothing under are only
+        # mentioned as "not these".
+        self.assertIn("Query `rejection_reason`, not `guard_rejected_reason`", section)
 
 
 # ── browser isolation on the agent.py call graph ─────────────────────────────

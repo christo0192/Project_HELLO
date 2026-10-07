@@ -1779,7 +1779,7 @@ async def _compose_gate_draft(
         _log.info(
             "unknown_event", error_type="phone_gate_compose",
             error_category=category, schema=schema,
-            duration_ms=int(round((time.monotonic() - started) * 1000)),
+            duration_sec=round(time.monotonic() - started, 3),
         )
 
     try:
@@ -4868,7 +4868,7 @@ async def _classify_phone_answer(
                 and not _turn_started_after(item, recording_anchor_ms())
             ):
                 # REVIEW FIX (blocker): the regex acts in legacy and shadow
-                # mode (shadow is what production runs), so the informed-
+                # mode (both are the documented rollbacks), so the informed-
                 # consent rule applies here too, not only in the llm-mode
                 # fallback: a "yes" that began before the recording sentence
                 # (spoken over part A, its commit dropped by the SDK and
@@ -7353,7 +7353,9 @@ async def _run_native_phone_screening(
         """One `phone_qna_close` line: the routing category, never the text."""
         _log.info(
             "unknown_event", error_type="phone_qna_close", error_category=category,
-            source=("judge" if qna_window.acting else "fallback"),
+            # `phase` (allowlisted; a `source=` key was silently dropped by
+            # the structured logger): who decided this turn.
+            phase=("judge" if qna_window.acting else "fallback"),
         )
 
     async def _qna_kind(text: str, route: str | None) -> str:
@@ -10689,7 +10691,7 @@ async def _run_native_phone_screening(
         _log.info(
             "unknown_event", error_type="phone_q1_prefetch",
             error_category=q1_outcome,
-            duration_ms=int(round((_monotonic() - q1_wait_started) * 1000)),
+            duration_sec=round(_monotonic() - q1_wait_started, 3),
         )
         if revocation["confirm_pending"] or revocation["withdrawal_latched"]:
             # M013 S01 T07: a turn committed during the rephrase was judged a

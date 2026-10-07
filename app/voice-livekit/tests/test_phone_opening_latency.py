@@ -166,7 +166,7 @@ class TestComposeTimeout(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.sink.categories("phone_gate_compose", "identity"),
                          ["composed_ok"])
         row = [r for r in self.sink.rows if r.get("error_type") == "phone_gate_compose"][0]
-        self.assertIn("duration_ms", row)
+        self.assertIn("duration_sec", row)
         self.assertNotIn("Hi", repr(row), "no draft text in the log")
 
     async def test_an_over_long_line_is_abandoned_and_logged(self):

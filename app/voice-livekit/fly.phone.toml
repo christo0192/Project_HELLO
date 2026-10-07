@@ -281,22 +281,27 @@ kill_timeout = 300
   # (a valid judge verdict decides; judge unavailable -> regex, which may grant
   # only on speech after the recording sentence; a judge error never grants).
   #
-  # SHADOW, per the T11 rollout gate (.gsd/milestones/M013/slices/S01/
-  # S01-BANK.md): on the live bank the judge made 0 false grants (regex: 2 real,
-  # 9 synthetic) but granted 16/17 real consenting replies against the regex's
-  # 17/17, so it fails the "recall >= legacy" rule. Moving to llm is the
-  # owner's call. No deploy is needed for either direction (a secret of the same
-  # name shadows this line; unset it again afterwards):
-  #   fly secrets set PHONE_GATE_JUDGE=llm    -a project-hello-phone-voice
+  # LLM, by the owner's explicit decision (2026-10-06): the judge DECIDES
+  # consent and the other gate turns; the regex decides only when the judge is
+  # unavailable (error / timeout / disabled), and a judge error never grants by
+  # itself. The T11 bank (.gsd/milestones/M013/slices/S01/S01-BANK.md) is the
+  # trade-off: on the real bank the judge made 0 false grants (regex: 2 real,
+  # 9 synthetic), at a recall of 16/17 real consenting replies against the
+  # regex's 17/17. The one miss is unstable (granted 4 times in 5 repeat calls)
+  # and is a reply to the retired "yes or no" re-ask; its cost is one extra
+  # re-ask. The code default (env unset) stays legacy. ROLLBACK, no deploy
+  # needed (a secret of the same name shadows this line; unset it again
+  # afterwards so the repo shows the live value):
   #   fly secrets set PHONE_GATE_JUDGE=legacy -a project-hello-phone-voice  # rollback
-  PHONE_GATE_JUDGE = "shadow"
+  #   fly secrets set PHONE_GATE_JUDGE=shadow -a project-hello-phone-voice  # regex decides, judge logs
+  PHONE_GATE_JUDGE = "llm"
   # Config so a retired alias can be swapped without a deploy. If the provider
   # retires it, every judge call fails and legacy decides: watch
   # `gate_judge_fallback_legacy`.
   PHONE_GATE_JUDGE_MODEL = "deepseek-v4-flash"
   # Live p95 + 0.5 s (T11 bank, 2026-10-07): gate phases 1.7 s, post-consent
   # and Q&A close 1.6 s. Same as the code defaults; pinned so the deploy shows
-  # them. Confirm from live `phone_gate_decision` latency_ms (T14).
+  # them. Confirm from live `phone_gate_decision` duration_sec (T14).
   PHONE_GATE_JUDGE_TIMEOUT_SEC = "1.7"
   PHONE_QNA_JUDGE_TIMEOUT_SEC = "1.6"
   # Controller selects the objective; Gemini authors one natural bridge and
@@ -473,11 +478,13 @@ kill_timeout = 300
   # name shadows this line, so unset it again after the incident.
   PHONE_ANSWER_SIGNAL = "sip_status"
   # PHONE_CLASSIFY_TIMEOUT_SEC (the consent BACKSTOP) is deliberately NOT set
-  # here any more (M013 S01). It is derived in code as
-  #   2 x (PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC + 6 + PHONE_GATE_JUDGE_TIMEOUT_SEC) + 5
-  # = 50.4 s with the values in this file (legacy/shadow; in llm mode the judge's
-  # re-judges, quiescence waits and the question round raise it to 137.3 s),
-  # and an explicit value can only RAISE
+  # here any more (M013 S01). It is derived in code. In llm mode (shipped
+  # above) the judge's re-judges, quiescence waits and the question round
+  # make it
+  #   3 x (PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC + 2 x 6 + 3 x PHONE_GATE_JUDGE_TIMEOUT_SEC + 2 x 6) + 5
+  # = 137.3 s with the values in this file; after a rollback to legacy/shadow
+  # it is 2 x (PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC + 6 + PHONE_GATE_JUDGE_TIMEOUT_SEC) + 5
+  # = 50.4 s. An explicit value can only RAISE
   # it. The old "40" here could no longer do anything, so it only misled.
   # Its expiry is a spoken deferral, never "machine".
   # Per-answer window for ONE consent reply (each classify attempt gets its own).

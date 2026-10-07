@@ -92,7 +92,7 @@ secret again afterwards so the repo shows the live value.
 
 | Variable | Shipped (fly.phone.toml / code default) | What it does | Rollback |
 |---|---|---|---|
-| `PHONE_GATE_JUDGE` | `shadow` / `legacy` | `legacy`: the regex rules decide and the judge is never called. `shadow`: the regex rules decide; the judge runs on the same reply and only logs. `llm`: a valid judge verdict decides | `PHONE_GATE_JUDGE=legacy` |
+| `PHONE_GATE_JUDGE` | `llm` / `legacy` | `legacy`: the regex rules decide and the judge is never called. `shadow`: the regex rules decide; the judge runs on the same reply and only logs. `llm`: a valid judge verdict decides; the regex decides only when the judge is unavailable | `PHONE_GATE_JUDGE=legacy` |
 | `PHONE_GATE_JUDGE_MODEL` | `deepseek-v4-flash` | The judge model id. A non-DeepSeek id disables the judge (legacy decides) | Swap the id, e.g. `deepseek-flash` |
 | `PHONE_GATE_JUDGE_TIMEOUT_SEC` | `1.7` (clamp 1.0–4.0) | Judge wall clock for identity, consent and callback time | Raise it |
 | `PHONE_QNA_JUDGE_TIMEOUT_SEC` | `1.6` (clamp 0.8–3.0) | Judge wall clock after consent (revocation window, Q&A close) | Raise it |
@@ -101,13 +101,28 @@ secret again afterwards so the repo shows the live value.
 | `PHONE_Q1_PRERENDER` | default `true` | Q1 audio is pre-rendered under the role line | `false` |
 | `PHONE_DETERMINISTIC_OPENER` | default `false` (composed openings) | `true` speaks the fixed scripted lines | `PHONE_DETERMINISTIC_OPENER=true` |
 | `PHONE_GATE_MAX_SECONDS` | default `180` | Gate wall clock; the lease heartbeat now runs from the answer and a budget is checked before every new ask | `116` (the old value) |
-| `PHONE_CLASSIFY_TIMEOUT_SEC` | not set; derived 50.4 s (137.3 s in `llm` mode) | Consent backstop = 2 × (answer window + 6 + judge timeout) + 5; in `llm` mode 3 × (answer window + 2 × 6 + 3 × judge timeout + 2 × 6 s quiescence) + 5; an explicit value can only raise it | Set a higher value |
+| `PHONE_CLASSIFY_TIMEOUT_SEC` | not set; derived 137.3 s as shipped (`llm`), 50.4 s in `legacy`/`shadow` | Consent backstop: in `llm` mode 3 × (answer window + 2 × 6 + 3 × judge timeout + 2 × 6 s quiescence) + 5; in `legacy`/`shadow` 2 × (answer window + 6 + judge timeout) + 5; an explicit value can only raise it. The gate budget (`PHONE_GATE_MAX_SECONDS`) still caps it | Set a higher value |
 
-**Why `shadow` and not `llm`.** The T11 bank (`.gsd/milestones/M013/slices/S01/S01-BANK.md`)
-gave the judge 0 false grants where the regex gave 2 real and 9 synthetic ones.
-But the judge granted 16 of 17 real consenting replies against the regex's 17,
-which fails the plan's "recall ≥ legacy" rule. Turning on `llm` is the owner's
-call: `fly secrets set PHONE_GATE_JUDGE=llm -a project-hello-phone-voice`.
+**Why `llm` is the default.** `llm` ships by the owner's explicit decision of
+2026-10-06: the LLM judge decides consent and the other gate turns, and the
+regex rules decide only when the judge is unavailable (error, timeout, bad
+JSON, breaker open, judge disabled). A judge error never grants by itself. The
+code default (variable unset) stays `legacy`. The trade-off, from the T11 bank
+(`.gsd/milestones/M013/slices/S01/S01-BANK.md`), recorded as measured:
+- **False grants:** the judge made **0** on the 32 real consent items; the regex
+  made **2** (and 9 on the synthetic bank).
+- **Recall:** the judge granted **16 of 17** real consenting replies; the regex
+  granted **17 of 17**. So `llm` fails the plan's "recall ≥ legacy" rule, and
+  the owner accepted that.
+- **The one miss** (13921f1f:11) is unstable (the judge granted it 4 times in 5
+  repeat calls) and is a reply to the retired "I just need a yes or a no"
+  re-ask, which this release no longer speaks. Its cost is one extra re-ask, not
+  a lost call.
+
+Rollback, no deploy: `fly secrets set PHONE_GATE_JUDGE=legacy -a project-hello-phone-voice`
+(the regex decides and the judge is never called). `PHONE_GATE_JUDGE=shadow`
+is the halfway step: the regex decides and the judge only logs. Unset the
+secret again once the repo shows the value you want.
 
 **Consent rules (owner constraints):**
 - In every mode (`legacy`, `shadow`, `llm`) a regex grant needs speech that
@@ -145,7 +160,9 @@ flag), not this section's.
 
 **Logs to watch (categories, lengths and timings only; never text).** The
 structured logger only accepts its allowlisted keys, so the fields are:
-- `phone_gate_decision`: one per decision that acted. `error_category` =
+- `phone_gate_decision`: one per decision that acted. `phase` = the gate
+  phase (`identity`, `consent`, `post_consent`, ...); `model` = the judge
+  model id; `error_category` =
   `<source>.<intent>` (source `llm` / `legacy_fallback` / `legacy`, e.g.
   `llm.consent_granted`); `duration_sec` = judge latency; `rejection_reason` =
   the guard that turned a judge verdict into `unclear` (`before_recording_anchor`,
@@ -156,12 +173,15 @@ structured logger only accepts its allowlisted keys, so the fields are:
   Query `rejection_reason`, not `guard_rejected_reason` or `latency_ms`
   (those names are internal and never logged).
 - `phone_gate_shadow_decision` and `phone_gate_shadow` (`agree` / `disagree` /
-  `judge_unavailable`): what the judge would have done in `shadow`.
+  `judge_unavailable`): what the judge would have done in `shadow` (only after
+  a rollback to `shadow`; `llm` logs `phone_gate_decision` instead).
 - `gate_judge_fallback_legacy` (with the reason) and `gate_judge_disabled`
   (once per process). **Alias-retirement risk:** if the provider retires
   `deepseek-v4-flash`, every call falls back to legacy. A rising
   `gate_judge_fallback_legacy` rate is the signal; swap `PHONE_GATE_JUDGE_MODEL`.
-- `phone_gate_compose` (`composed` / `timeout` / `rejected_<reason>`),
+- `phone_gate_compose` (`composed_ok` / `timeout` / `rejected_<reason>` /
+  `unavailable`; `schema` = the line, `duration_sec` = compose time),
+  `phone_q1_prefetch` (`duration_sec` = the wait for Q1 after the role line),
   `phone_gate_budget`, `phone_gate_heartbeat`, the `gate_lease_halted` outcome,
   and `consent_turn_skipped` (a reply read as belonging to an earlier question).
 - `phone_gate_turn_barrier`: `consent_turn_skipped`, `consent_turn_not_grant_evidence`
@@ -178,7 +198,7 @@ structured logger only accepts its allowlisted keys, so the fields are:
   `post_consent`).
 - The Q&A close: `phone_qna_close` (`judged_<kind>`, `judge_unavailable`,
   `fallback_other_answered`, `go_ahead`, `non_question_acknowledged`,
-  `non_question_close`, `filler_cap_close`; `source` = `judge` or `fallback`),
+  `non_question_close`, `filler_cap_close`; `phase` = `judge` or `fallback`),
   `phone_qna_close_judge` (the `qna_close` judge's own lines) and
   `phone_silence` (`qna_silence_nudge`, `qna_silence_close`). A bare "yes"
   gets "Sure, go ahead."; a decline closes on the first one; silence after the
@@ -256,7 +276,7 @@ Since #334 unsetting `PHONE_DETERMINISTIC_OPENER` is **not** a rollback: its
 default is now `false` (composed openings). Set it to `true` explicitly. With
 `PHONE_GATE_FLOW` unset and the opener `true`, the gate returns to the fixed
 disclosure with no identity turn and no pre-consent generation by the main
-model. The gate judge (`PHONE_GATE_JUDGE=shadow`, as shipped, or `llm`) still
+model. The gate judge (`PHONE_GATE_JUDGE=llm`, as shipped, or `shadow`) still
 sends the pre-consent identity and consent replies (first name only) to
 DeepSeek; set `PHONE_GATE_JUDGE=legacy` as well to stop that. Secrets-only, so
 it needs no deploy and no revert, and it works even if later code has shipped.
