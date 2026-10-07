@@ -40,7 +40,7 @@ describe('phone scorer byte-identity fence (PR-5)', () => {
     'lib/scorecards/prompt.ts': '93df1c703a2469deabf47fcb3943cfd9abd1c0bc3b5a394d2adaea5516880c6d',
     'lib/scorecards/scorer.ts': '173d62ed3d4fcb5c07c43766d6cc906005a6309e30090bada93b8f70ff10f887',
     'lib/scorecards/domain.ts': 'da506d335f9050d403d942ca7190a7f60b447e3a211e5aa33d51bdd902cefe94',
-    'lib/scorecards/evidence.ts': 'b00860aa671659acf206e9edb8eaff19b69094dc91c890b086435492aa0ead77',
+    'lib/scorecards/evidence.ts': 'f60697bcb4921363404aa824b17ceb5ea630cf7a9c719afb1c65cabe5b7873f8',
     'lib/scorecards/integrity.ts': '4c2460cd8e90f7b1a0dfc5898fd256defd7da3b2e0bb8ed884218ebf27d9a6c3',
     'lib/prompts.ts': '4e8ea472b2c3657b0845362ff1edecebe533ef3e36b2230f8d2d3a7ce55b82fd',
   };
