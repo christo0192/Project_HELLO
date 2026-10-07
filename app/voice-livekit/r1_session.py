@@ -25,6 +25,22 @@ Five livekit-agents 1.6.4 facts shape this module (verified in the installed whe
   ``add_shutdown_callback``.  A callback therefore cannot run while ``run`` is alive, so R1
   registers none: an interview keeps going for the drain timeout plus the 15 s grace and
   learns of the drain solely through the cancellation ``run`` handles.
+
+The PR-4b content (persona, owed-move scheduler, tracker, commitment path, output guard) is
+wired through three seams and nothing else; the phase driver stays the only thing that moves
+a phase, and no candidate or model text can:
+
+* ``prepare_turn`` (from ``R1Agent.on_user_turn_completed``) runs the role-play engine ONCE per
+  SDK turn and fixes what the reply must be: suppressed, scripted, an acknowledgement then the
+  owed line verbatim, or a free reply.  Preemptive generation is off for this agent so no
+  generation can start before that decision.
+* ``llm_node_stream`` (from ``R1Agent.llm_node``) builds the model's whole context from the
+  interview's own history (``r1_replies.llm_messages``: the context filter, no tools) and passes
+  its text through ``r1_guard`` sentence by sentence in EVERY phase, before the transcription
+  and TTS split.
+* ``_queue_fidelity`` posts the persona and content pins, the moves delivered with their
+  transcript turn and the guard trips to the existing admin-log route at exit, inside the
+  transcript drain's bound and before the terminal write.
 """
 from __future__ import annotations
 
@@ -40,10 +56,23 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from observability import StructuredLogger
+from r1_content import CONTENT_SHA256
 from r1_context import fetch_context
-from r1_lines import INTERVIEWER_NAME, line
+from r1_guard import FALLBACK_REPLY, StreamGuard
 from r1_persistence import R1TurnWriter
 from r1_phases import R1Phase, R1PhaseMachine
+from r1_replies import (
+    PersonaChoice,
+    Reply,
+    choose_persona,
+    delta_text,
+    fidelity_events,
+    fidelity_pins,
+    llm_messages,
+)
+from r1_prompts import ROLEPLAY_PHASE
+from r1_roleplay import RolePlayEngine, TurnMode, TurnPlan
+from r1_script import INTERVIEWER_NAME, line
 
 R1_RECORD = False
 NO_SHOW_SECONDS = 120.0
@@ -91,6 +120,18 @@ WRAPUP_SILENCE_SECONDS = 20.0
 # believed after this much candidate silence, counted from the final that carried it.
 WRAPUP_SETTLE_SECONDS = 1.5
 WRAPUP_QUESTION_LIMIT = 2
+# Plan 5.1: role-play may end early once R >= 10:00 and the commitment is resolved.  The
+# phase machine only knows the hard caps, so the session applies the early rule itself.
+EARLY_EXIT_R_SEC = 600.0
+# The learner's one-line acknowledgement (plan 5.6 escalation step 1) is optional, the owed
+# line after it is not: an acknowledgement that is not done in time is dropped.
+ACK_DEADLINE_SECONDS = 5.0
+# The shadow judge runs off the speech path with its own deadline (plan 5.9).
+JUDGE_DEADLINE_SECONDS = 4.0
+# Scripted lines the LEARNER speaks; every other line is the interviewer's.  The voice decides
+# which model call may later see the line (``r1_prompts.select_context``).
+_LEARNER_LINES = frozenset({"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE"})
+_REPLIES_KEPT = 8
 _SESSION_ID_FROM_ROOM = re.compile(
     r"^screening-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
     re.IGNORECASE,
@@ -266,8 +307,31 @@ def is_no_questions(text: str) -> bool:
     return all(word in _COURTESY_WORDS for word in _WORD_BREAK_RE.split(rest) if word)
 
 
+def _agent_turn_handling() -> dict[str, Any]:
+    """Agent-level turn handling: ONLY preemptive generation is overridden (turned off).
+
+    The learner's per-turn reminder and the owed move are decided in
+    ``on_user_turn_completed``, after the final transcript.  A preemptive generation starts
+    BEFORE that hook, from the transcript so far, so it could answer without the reminder (and
+    would have to be discarded whenever it differed).  Every other turn setting keeps the
+    session value, so browser R1 turn taking stays what the browser lane uses.  Measuring what
+    this costs, and whether it can be bought back, is the PR-4c latency item (plan 5.15).
+    """
+    return {"preemptive_generation": {"enabled": False}}
+
+
+def _chat_context_from(messages: list[dict[str, str]]) -> Any:
+    """Build the SDK chat context for the filtered ``messages`` (system, user, assistant only)."""
+    from livekit.agents import llm as agents_llm
+
+    chat_ctx = agents_llm.ChatContext.empty()
+    for message in messages:
+        chat_ctx.add_message(role=message["role"], content=message["content"])
+    return chat_ctx
+
+
 class R1Agent(Agent):
-    """SDK adapter whose instructions name the R1 persona from content, not a literal."""
+    """SDK adapter: the interview decides each reply, the SDK only runs the pipeline."""
 
     def __init__(self, interview: "R1Interview") -> None:
         instructions = (
@@ -276,29 +340,36 @@ class R1Agent(Agent):
         if Agent is object:
             super().__init__()
         else:
-            super().__init__(instructions=instructions)
+            super().__init__(instructions=instructions, turn_handling=_agent_turn_handling())
         self.interview = interview
 
     async def on_user_turn_completed(self, turn_ctx: Any, new_message: Any) -> None:
-        """Suppress the LLM reply to any transcript the driver owns or that ends a phase.
+        """Decide this turn's reply (or its suppression) before the SDK generates anything.
 
         The opening line is spoken by the driver, never from ``on_enter``: the
         driver must know when it has finished before the icebreaker clock starts.
 
-        ``turn_ctx`` is deliberately NOT touched.  Preemptive generation (on by default
-        in 1.6.4) starts the reply from the chat context as it was BEFORE this hook and
-        keeps it only while the context is still equivalent afterwards
-        (``AgentActivity._user_turn_completed_task``); appending anything here (the old
-        per-turn placeholder message) made every preemptive reply be discarded and
-        generated a second time, doubling the LLM calls for no latency gain.
+        ``turn_ctx`` is deliberately NOT touched.  The learner's reminder is not appended
+        to it: ``llm_node`` builds the model's whole context from the interview's own
+        history (the context filter), so nothing the SDK accumulated can reach the model.
+        ``StopResponse`` ends the turn without a reply: for a transcript the driver owns, one
+        that ends a phase, an out-of-role aside and an early close.
         """
         text = str(getattr(new_message, "text_content", "") or "").strip()
-        if self.interview.reply_suppressed(text):
-            raise StopResponse()
+        self.interview.prepare_turn(text, getattr(new_message, "id", None))
 
     def llm_node(self, chat_ctx: Any, tools: list[Any], model_settings: Any) -> Any:
-        """Keep provider generation behind R1's independent wall-clock deadline."""
-        return self.interview.guard_llm_stream(super().llm_node(chat_ctx, tools, model_settings))
+        """Filter the context, guard the output and keep the wall-clock deadline.
+
+        The model gets NO tools and none of the SDK's accumulated context: only what
+        ``llm_messages`` selects for this reply.  Candidate text cannot reach a tool, a phase
+        or a grade because there is none of them in this call.
+        """
+
+        def provider(messages: list[dict[str, str]]) -> Any:
+            return Agent.llm_node(self, _chat_context_from(messages), [], model_settings)
+
+        return self.interview.llm_node_stream(chat_ctx, provider)
 
 
 async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
@@ -348,6 +419,7 @@ class _SpeechSlot:
     index: int | None = None
     phase: str | None = None
     used: bool = False
+    reply: Any = None  # the Reply the hook prepared for this generation (role-play only)
 
 
 class R1Interview:
@@ -368,11 +440,13 @@ class R1Interview:
         clock: Callable[[], float] = time.monotonic,
         close_room: Callable[[], Awaitable[Any]] | None = None,
         recorder_finish: Callable[[], Awaitable[Any]] | None = None,
+        judge_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
     ) -> None:
         self.ctx = ctx
         self.context = context
         self.session = session
         self.writer = writer
+        self._clock = clock
         self.machine = R1PhaseMachine(clock)
         self._close_room = close_room or self._close_room_once
         self._recorder_finish = recorder_finish or self._recording_finish_stub
@@ -412,6 +486,23 @@ class R1Interview:
         self._background: set[asyncio.Future[Any]] = set()
         self._residency_handle: asyncio.TimerHandle | None = None
         self._forced_close_handle: asyncio.TimerHandle | None = None
+        # Content wiring (PR-4b).  The persona and the role-play engine are built on first
+        # use, so an interview that only settles an outcome never loads them.
+        self._choice: PersonaChoice | None = None
+        self._engine: RolePlayEngine | None = None
+        self._history: list[dict[str, Any]] = []
+        self._latest_candidate_index: int | None = None
+        self._user_turn_started: float | None = None
+        self._replies: dict[str, Reply] = {}
+        self._latest_reply: Reply | None = None  # prepared, not yet bound to a speech
+        self._last_reply: Reply | None = None  # the newest prepared reply (lookup fallback)
+        self._voices: dict[str, str] = {}
+        self._guard_trips: list[dict[str, Any]] = []
+        self._logged_moves: set[str] = set()
+        self._skip_failure_reset = False
+        self._fidelity_queued = False
+        self._judge_runner = judge_runner
+        self._judge_llm: Any = None
 
     def _context_candidate_identity(self) -> str | None:
         """Read only server context identity, never participant metadata supplied by a client."""
@@ -425,6 +516,64 @@ class R1Interview:
 
     async def _recording_finish_stub(self) -> None:
         """Keep recording optional until the dedicated R1 recorder is introduced."""
+
+    # --------------------------------------------------------------- content
+
+    def _seed(self) -> str:
+        """The session's own id, which every deterministic choice is seeded from."""
+        attempt_id = self.context.get("attempt_id")
+        if attempt_id:
+            return str(attempt_id)
+        return session_id_from_room_name(_room_name(self.ctx)) or "r1"
+
+    @property
+    def persona_choice(self) -> PersonaChoice:
+        """The persona card this session plays, chosen once (plan 5.5)."""
+        if self._choice is None:
+            self._choice = choose_persona(
+                self.context,
+                seed=self._seed(),
+                candidate_first_name=str(self.context.get("first_name") or ""),
+            )
+        return self._choice
+
+    @property
+    def persona(self) -> Any:
+        return self.persona_choice.persona
+
+    @property
+    def engine(self) -> RolePlayEngine:
+        """The role-play engine: scheduler, tracker, commitment logic and output guard."""
+        if self._engine is None:
+            self._engine = RolePlayEngine(
+                self.persona,
+                candidate_first_name=str(self.context.get("first_name") or ""),
+                seed=self._seed(),
+            )
+        return self._engine
+
+    def render_line(self, line_id: str) -> str:
+        """Render one pinned line; the persona supplies the lead name, city and pickup."""
+        return line(
+            line_id,
+            first_name=self.context.get("first_name"),
+            **self.persona.line_values,
+        )
+
+    def _record_pins(self) -> None:
+        """Log which persona and which pinned content this session plays (labels only)."""
+        choice = self.persona_choice
+        _log.info(
+            "unknown_event",
+            error_type="r1_fidelity_persona",
+            error_category=choice.label,
+            option_count=choice.persona.version,
+        )
+        _log.info(
+            "unknown_event",
+            error_type="r1_fidelity_content",
+            error_category=CONTENT_SHA256[:12],
+        )
 
     # ------------------------------------------------------------------ exit
 
@@ -555,6 +704,90 @@ class R1Interview:
         if leftovers:
             await asyncio.gather(*leftovers, return_exceptions=True)
 
+    def _queue_fidelity(self) -> None:
+        """Queue the trusted administration rows; they ride the transcript drain's bound.
+
+        Posted before the terminal write (the exit funnel runs after the drain), so the
+        scorer job that the completion enqueues finds them.  Every value is a turn index, a
+        count, a label or a pin: no utterance, and no commitment outcome (plan 5.8 keeps it
+        out of anything the scorer reads; it is logged below instead).
+        """
+        if self._fidelity_queued:
+            return
+        self._fidelity_queued = True
+        engine = self._engine
+        if engine is None or (engine.turn == 0 and not self._guard_trips):
+            return
+        try:
+            admin = engine.admin_log(final=True, r_end=self.machine.roleplay_elapsed)
+            self._log_fidelity(admin)
+            events = fidelity_events(admin, fidelity_pins(self.persona_choice), self._guard_trips)
+        except Exception as exc:  # noqa: BLE001 - the record must never block the exit
+            _log.error(
+                "unknown_event",
+                error_type="r1_fidelity_failed",
+                error_category=_error_type_of(exc),
+            )
+            return
+        poster = getattr(self.writer, "admin_log", None)
+        if not callable(poster) or not events:
+            return
+        task = asyncio.ensure_future(self._post_fidelity(poster, events))
+        self._turn_writes.add(task)
+        task.add_done_callback(self._turn_writes.discard)
+
+    async def _post_fidelity(
+        self, poster: Callable[..., Awaitable[Any]], events: list[dict[str, Any]]
+    ) -> None:
+        """Post each row on its own bound; a failed row is logged by type and skipped."""
+        for event in events:
+            try:
+                await asyncio.wait_for(
+                    poster(
+                        event["event_type"],
+                        turn_index=event["turn_index"],
+                        family_id=event["family_id"],
+                        payload=event["payload"],
+                    ),
+                    TURN_WRITE_SECONDS,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                _log.warn(
+                    "unknown_event",
+                    error_type="r1_admin_log_failed",
+                    error_category=_error_type_of(exc),
+                )
+
+    def _log_fidelity(self, admin: dict[str, Any]) -> None:
+        """Log the session's fidelity facts that have no durable home (labels and counts only)."""
+        commitment = admin["commitment"]
+        level = commitment["level"] or "none"
+        transcript_turns = {
+            item["roleplay_turn"]: item["transcript_turn"] for item in admin["turn_map"]
+        }
+        turn = transcript_turns.get(commitment["turn"])
+        _log.info(
+            "unknown_event",
+            error_type="r1_fidelity_commitment",
+            error_category=level,
+            turn_index=turn,
+            option_count=len(commitment["asks"]),
+        )
+        for reason in admin["exclusion_reasons"]:
+            _log.warn("unknown_event", error_type="r1_fidelity_excluded", error_category=reason)
+        checks = admin["fidelity"]["checks"]
+        failed = [name for name, passed in checks.items() if not passed]
+        for name in failed:
+            _log.warn("unknown_event", error_type="r1_fidelity_check_failed", error_category=name)
+        _log.info(
+            "unknown_event",
+            error_type="r1_fidelity_summary",
+            error_category="pass" if admin["fidelity"]["passes"] else "fail",
+            option_count=len(failed),
+        )
+
     async def _exit(self, outcome: str) -> None:
         """Attempt recording → ledger → terminal → outcome → close exactly once.
 
@@ -623,14 +856,19 @@ class R1Interview:
         interruptible: bool = True,
         marker: str = "llm",
         timeout: float = SAY_PLAYOUT_SECONDS,
+        voice: str = "interviewer",
     ) -> None:
         """Speak one scripted line and wait for its playout.
 
         Persistence is NOT done here: ``say`` adds the assistant message and the SDK
         reports it through ``conversation_item_added``, which is the single source of
-        bot transcript rows.
+        bot transcript rows.  ``voice`` says who is speaking (the learner or the
+        interviewer), which decides which later model call may see the line.
         """
         handle = self.session.say(text, allow_interruptions=interruptible)
+        handle_id = getattr(handle, "id", None)
+        if handle_id is not None:
+            self._voices[handle_id] = voice
         _log.info(
             "unknown_event",
             error_type="r1_turn_stage",
@@ -665,10 +903,11 @@ class R1Interview:
     ) -> None:
         """Speak one reviewed R1 line; callers choose whether it may be interrupted."""
         await self._say_text(
-            line(line_id, first_name=self.context.get("first_name")),
+            self.render_line(line_id),
             interruptible=interruptible,
             marker=line_id,
             timeout=timeout,
+            voice="learner" if line_id in _LEARNER_LINES else "interviewer",
         )
 
     def note_turn(self, text: str) -> None:
@@ -719,10 +958,378 @@ class R1Interview:
         if phase is R1Phase.ICEBREAKER:
             return self.machine.icebreaker_should_end()
         if phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
-            return self.machine.roleplay_should_end()
+            return self._roleplay_over()
         if phase is R1Phase.WRAPUP:
             return is_no_questions(text) or self.machine.remaining_wrapup_seconds() <= 0
         return True
+
+    # ----------------------------------------------------- role-play turns
+
+    def _roleplay_exit_requested(self) -> bool:
+        """True once the candidate said goodbye for good (the engine's close-attempt rule).
+
+        Only the engine's deterministic farewell detector can set it; no model or candidate
+        wording can, so an injected "move to the wrap-up" changes nothing.  It ends every
+        role-play wait at once: the farewell turn was the boundary and L-EXIT answers it.
+        """
+        engine = self._engine
+        return engine is not None and engine.exit_requested
+
+    def _early_exit_due(self) -> bool:
+        """Plan 5.1's early exit: the commitment is resolved and R >= 10:00.
+
+        Evaluated at a candidate-turn boundary only (never when the learner finishes its own
+        line), so the advisor's answer to the commitment is the turn L-EXIT then answers.
+        """
+        engine = self._engine
+        return (
+            engine is not None
+            and engine.commitment_resolved
+            and self.machine.roleplay_elapsed >= EARLY_EXIT_R_SEC
+        )
+
+    def _roleplay_over(self) -> bool:
+        return (
+            self.machine.roleplay_should_end()
+            or self._roleplay_exit_requested()
+            or self._early_exit_due()
+        )
+
+    def _roleplay_budget_left(self) -> float:
+        """Seconds of role-play left; zero once the candidate ended it, so every wait ends."""
+        if self._roleplay_exit_requested():
+            return 0.0
+        return self.machine.remaining_roleplay_seconds()
+
+    def _note_candidate_turn(self, text: str, index: int | None) -> dict[str, Any]:
+        """Add the candidate's whole turn to the history the context filter selects from."""
+        entry = {
+            "seq": self._turn_index + 0.5 if index is None else index,
+            "role": "candidate",
+            "text": text,
+            "phase": self.machine.transcript_phase(),
+            "voice": "candidate",
+        }
+        self._history.append(entry)
+        return entry
+
+    def _take_user_turn_seconds(self) -> float | None:
+        """How long the candidate talked since the turn began (the monologue length)."""
+        started, self._user_turn_started = self._user_turn_started, None
+        return None if started is None else max(0.0, self._clock() - started)
+
+    def prepare_turn(self, text: str, message_id: str | None = None) -> None:
+        """Decide one candidate turn: suppress the SDK reply, or fix what the reply must be.
+
+        The ONE call per SDK turn.  Raises ``StopResponse`` when the SDK must not generate
+        (the driver owns the phase, the phase ends with this turn, an aside or an early
+        close follows).  Otherwise it remembers a ``Reply`` that ``llm_node`` finds again,
+        so the plan is computed exactly once and before any generation (preemptive
+        generation is off for this agent).
+        """
+        index = self._latest_candidate_index
+        self._latest_candidate_index = None
+        seconds = self._take_user_turn_seconds()
+        entry = self._note_candidate_turn(text, index) if text else None
+        if self.reply_suppressed(text) or not text:
+            raise StopResponse()
+        if self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
+            reply = self._plan_learner_reply(text, entry, index, seconds)
+        else:
+            reply = Reply(
+                phase=self.machine.transcript_phase(),
+                candidate_text=text,
+                entry=entry,
+                candidate_index=index,
+            )
+        self._last_reply = self._latest_reply = reply
+        if message_id:
+            self._replies[str(message_id)] = reply
+            while len(self._replies) > _REPLIES_KEPT:
+                self._replies.pop(next(iter(self._replies)))
+
+    def _plan_learner_reply(
+        self,
+        text: str,
+        entry: dict[str, Any] | None,
+        index: int | None,
+        seconds: float | None,
+    ) -> Reply:
+        """Run the scheduler, tracker, ask detector and guard setup for one role-play turn."""
+        r_sec = self.machine.roleplay_elapsed
+        try:
+            plan = self.engine.plan_turn(
+                text, r_sec, turn_index=index, candidate_seconds=seconds
+            )
+        except Exception as exc:  # noqa: BLE001 - a planning bug must not speak for the learner
+            _log.error(
+                "unknown_event",
+                error_type="r1_plan_failed",
+                error_category=_error_type_of(exc),
+                phase=self.machine.transcript_phase(),
+            )
+            raise StopResponse()
+        _log.info(
+            "unknown_event",
+            error_type="r1_turn_plan",
+            error_category=plan.mode.value,
+            phase=self.machine.transcript_phase(),
+            turn_index=index,
+        )
+        if plan.aside:
+            if entry is not None:
+                entry["phase"] = "aside"  # excluded from the learner's context (plan 5.10)
+            self._spawn(self._play_aside(plan))
+            raise StopResponse()
+        if plan.exit_roleplay:
+            self._wake()  # the driver's role-play waits re-read the exit and end now
+            raise StopResponse()
+        self._spawn_judge(text, plan)
+        return Reply(
+            phase=ROLEPLAY_PHASE,
+            candidate_text=text,
+            entry=entry,
+            candidate_index=index,
+            plan=plan,
+            r_sec=r_sec,
+        )
+
+    async def _play_aside(self, plan: TurnPlan) -> None:
+        """Speak L-ASIDE-COACH as the interviewer: ASIDE pauses R, then role-play resumes."""
+        resume = self.machine.phase is R1Phase.ROLEPLAY
+        if resume:
+            self.machine.transition(R1Phase.ASIDE)
+        try:
+            await self._say_text(
+                plan.scripted_text,
+                interruptible=False,
+                marker="L-ASIDE-COACH",
+                voice="interviewer",
+            )
+        finally:
+            if resume and self.machine.phase is R1Phase.ASIDE and not self._muted:
+                self.machine.transition(R1Phase.ROLEPLAY)
+                self._restart_silence_window()
+
+    def _spawn_judge(self, text: str, plan: TurnPlan) -> None:
+        """Start the shadow judge for this turn, off the speech path (plan 5.9)."""
+        runner = self._judge_runner
+        if runner is None and getattr(self.session, "llm", None) is not None:
+            runner = self._default_judge
+        if runner is None:
+            return
+        learner_last = next(
+            (
+                item["text"]
+                for item in reversed(self._history)
+                if item["role"] == "bot" and item.get("voice") == "learner"
+            ),
+            "",
+        )
+        messages = self.engine.judge_messages(text, learner_last, turn=plan.turn)
+        self._spawn(self._run_judge(runner, messages, plan.turn))
+
+    async def _default_judge(self, messages: list[dict[str, str]]) -> str:
+        """Ask the judge model on R1's OWN client, so its failures never reach the session.
+
+        The session's LLM reports every error to ``_on_provider_error``, where three of them
+        end the interview; an advisory judge must not be able to do that.
+        """
+        from r1_llm import build_r1_llm
+
+        if self._judge_llm is None:
+            self._judge_llm = build_r1_llm()
+        parts: list[str] = []
+        async with self._judge_llm.chat(chat_ctx=_chat_context_from(messages)) as stream:
+            async for chunk in stream:
+                parts.append(delta_text(chunk))
+        return "".join(parts)
+
+    async def _run_judge(
+        self,
+        runner: Callable[[list[dict[str, str]]], Awaitable[Any]],
+        messages: list[dict[str, str]],
+        turn: int,
+    ) -> None:
+        """Apply the judge's verdict to ``turn``; any failure leaves the tracker unchanged."""
+        try:
+            raw = await asyncio.wait_for(runner(messages), JUDGE_DEADLINE_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - fail closed: no state change
+            _log.warn(
+                "unknown_event",
+                error_type="r1_judge_failed",
+                error_category=_error_type_of(exc),
+            )
+            raw = None
+        self.engine.apply_judge(raw, turn)
+
+    # --------------------------------------------------------------- llm_node
+
+    def _reply_for(self, chat_ctx: Any) -> Reply | None:
+        """Find the prepared reply of the generation: by its user message, else the newest."""
+        items = getattr(chat_ctx, "items", None) or ()
+        for item in reversed(list(items)):
+            if str(getattr(item, "role", "")) == "user":
+                found = self._replies.get(str(getattr(item, "id", "")))
+                if found is not None:
+                    return found
+                break
+        return self._last_reply
+
+    @staticmethod
+    async def _single(text: str) -> AsyncIterator[str]:
+        yield text
+
+    def llm_node_stream(
+        self,
+        chat_ctx: Any,
+        provider: Callable[[list[dict[str, str]]], Any],
+    ) -> AsyncIterator[Any]:
+        """The body of ``R1Agent.llm_node``: context filter, output guard, deadline.
+
+        ``provider(messages)`` starts the model call for exactly ``messages`` (the SDK
+        stream in production, a fake in tests).  A scripted turn (a commitment line, the
+        WEAK stall, an "Oh wait") never calls the model.  A turn nobody prepared (a
+        generation the hook did not decide) speaks the safe fallback rather than guess.
+        """
+        reply = self._reply_for(chat_ctx)
+        if reply is None:
+            _log.warn(
+                "unknown_event",
+                error_type="r1_llm_without_plan",
+                phase=self.machine.transcript_phase(),
+            )
+            return self._single(FALLBACK_REPLY)
+        plan = reply.plan
+        if plan is not None and plan.mode is TurnMode.SAY_ONLY:
+            return self._single(plan.scripted_text)
+        if plan is not None:
+            ctx = plan.guard_ctx
+        else:
+            ctx = self.engine.guard_context(reply.phase, mode="reply", turn=reply.candidate_index)
+        guard = StreamGuard(ctx)
+        messages = llm_messages(reply, self.persona, self._history)
+        if plan is not None and plan.mode is TurnMode.ACK_THEN_SAY:
+            source = self._ack_then_say(lambda: provider(messages), guard, reply)
+        else:
+            source = self._screened(lambda: provider(messages), guard, reply)
+        return self.guard_llm_stream(source)
+
+    async def _screened(
+        self,
+        factory: Callable[[], Any],
+        guard: StreamGuard,
+        reply: Reply,
+    ) -> AsyncIterator[str]:
+        """Pass the model's text through the output guard, one vetted sentence at a time.
+
+        This sits before the SDK's transcription/TTS split, so captions, stored turns and
+        scorer input are filtered as well as speech.  A sentence that trips is replaced or
+        dropped; a reply with nothing left becomes the safe fallback (``flush``).
+        """
+        from r1_llm import assert_thinking_disabled
+
+        iterator: Any = None
+        try:
+            stream = await _maybe_await(factory())
+            iterator = stream.__aiter__()
+            async for item in iterator:
+                usage = getattr(item, "usage", None)
+                if usage is not None:
+                    assert_thinking_disabled(usage)
+                text = delta_text(item)
+                if text:
+                    for sentence in guard.feed(text):
+                        yield sentence + " "
+            for sentence in guard.flush():
+                yield sentence + " "
+        finally:
+            self._after_guard(reply, guard)
+            aclose = getattr(iterator, "aclose", None)
+            if callable(aclose):
+                with contextlib.suppress(Exception):
+                    await aclose()
+
+    async def _ack_then_say(
+        self,
+        factory: Callable[[], Any],
+        guard: StreamGuard,
+        reply: Reply,
+    ) -> AsyncIterator[str]:
+        """A short guarded acknowledgement, then the owed line VERBATIM (plan 5.6 step 1).
+
+        The acknowledgement is optional and bounded: if the model is slow or fails, the owed
+        line is still spoken, so a move is never lost to the provider.
+        """
+        from r1_llm import assert_thinking_disabled
+
+        plan = reply.plan
+        assert plan is not None
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + ACK_DEADLINE_SECONDS
+        iterator: Any = None
+        try:
+            stream = await _maybe_await(factory())
+            iterator = stream.__aiter__()
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError()
+                try:
+                    item = await asyncio.wait_for(iterator.__anext__(), remaining)
+                except StopAsyncIteration:
+                    break
+                usage = getattr(item, "usage", None)
+                if usage is not None:
+                    assert_thinking_disabled(usage)
+                text = delta_text(item)
+                if text:
+                    for sentence in guard.feed(text):
+                        yield sentence + " "
+            for sentence in guard.flush():
+                yield sentence + " "
+        except Exception as exc:  # noqa: BLE001 - the acknowledgement is optional
+            _log.warn(
+                "unknown_event",
+                error_type="r1_ack_failed",
+                error_category=_error_type_of(exc),
+            )
+            self._record_generation_failure()
+            self._skip_failure_reset = True  # the scripted line below is not a model reply
+        finally:
+            self._after_guard(reply, guard)
+            aclose = getattr(iterator, "aclose", None)
+            if callable(aclose):
+                with contextlib.suppress(Exception):
+                    await aclose()
+        yield plan.scripted_text
+
+    def _after_guard(self, reply: Reply, guard: StreamGuard) -> None:
+        """Count the guard's hits once per reply: ledger, trip record and an ``r1_guard_*`` log."""
+        if reply.guard_recorded:
+            return
+        reply.guard_recorded = True
+        result = guard.result
+        self.engine.record_guard(result)
+        for hit in result.hits:
+            self._guard_trips.append(
+                {
+                    "turn_index": reply.candidate_index,
+                    "phase": reply.phase,
+                    "category": hit.category,
+                    "rule": hit.rule,
+                    "digest": hit.digest,
+                }
+            )
+            _log.warn(
+                "unknown_event",
+                error_type=hit.log_key,
+                error_category=hit.rule,
+                phase=reply.phase,
+                turn_index=reply.candidate_index,
+            )
 
     # ------------------------------------------------------------ LLM guard
 
@@ -730,7 +1337,7 @@ class R1Interview:
         """Return the thinking filler for the current voice (learner in role-play)."""
         in_roleplay = self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE)
         line_id = "L-FILLER-LEARNER" if in_roleplay else "L-FILLER-INTERVIEWER"
-        return line(line_id, first_name=self.context.get("first_name")) + " "
+        return self.render_line(line_id) + " "
 
     async def guard_llm_stream(self, stream: Any) -> AsyncIterator[Any]:
         """Own one reply's deadlines: a 4 s filler and a 12 s wall clock (plan section 5.11).
@@ -798,7 +1405,14 @@ class R1Interview:
                     await aclose()
 
     def _on_reply_started(self) -> None:
-        """An LLM reply began: the provider answered, so consecutive failures reset."""
+        """An LLM reply began: the provider answered, so consecutive failures reset.
+
+        Not when the first chunk was only the owed line spoken after a failed
+        acknowledgement: that turn did not get an answer from the provider.
+        """
+        if self._skip_failure_reset:
+            self._skip_failure_reset = False
+            return
         self._failures = 0
 
     def _spawn(self, awaitable: Awaitable[Any]) -> None:
@@ -925,9 +1539,9 @@ class R1Interview:
         if self.machine.phase in (R1Phase.OPENING, R1Phase.ICEBREAKER):
             # An early answer spoken over the opening line is still an icebreaker turn.
             self.machine.candidate_turns += 1
-        self._write_turn(
-            self._reserve_turn_index(), "candidate", text, self.machine.transcript_phase()
-        )
+        index = self._reserve_turn_index()
+        self._latest_candidate_index = index  # the SDK turn that follows is judged at this row
+        self._write_turn(index, "candidate", text, self.machine.transcript_phase())
         self.note_turn(text)
 
     def _on_speech_created(self, event: Any) -> None:
@@ -936,7 +1550,11 @@ class R1Interview:
         speech_id = getattr(handle, "id", None)
         if self._exiting or handle is None or speech_id is None:
             return
-        self._speeches[speech_id] = _SpeechSlot(handle)
+        slot = _SpeechSlot(handle)
+        if getattr(event, "source", None) == "generate_reply" and self._latest_reply is not None:
+            # The SDK creates this speech right after the hook that prepared the reply.
+            slot.reply, self._latest_reply = self._latest_reply, None
+        self._speeches[speech_id] = slot
         if getattr(event, "source", None) == "generate_reply":
             self._open_replies.add(speech_id)
             self._wake()
@@ -1030,9 +1648,54 @@ class R1Interview:
             self._claim_slot(slot)  # a speech that never reported speaking claims it now
             slot.used = True
             index, phase = slot.index, slot.phase
-        self._write_turn(
-            index, "bot", text, phase, interrupted=bool(getattr(item, "interrupted", False))
+        interrupted = bool(getattr(item, "interrupted", False))
+        self._remember_bot_turn(index, phase, text, slot)
+        self._write_turn(index, "bot", text, phase, interrupted=interrupted)
+        self._record_learner_speech(slot, text, interrupted)
+
+    def _remember_bot_turn(
+        self, index: int, phase: str, text: str, slot: _SpeechSlot | None
+    ) -> None:
+        """Add a delivered bot line, with its voice, to the history the context filter reads."""
+        handle_id = None if slot is None else getattr(slot.handle, "id", None)
+        voice = self._voices.pop(handle_id, None) if handle_id is not None else None
+        if voice is None:
+            # A speech nobody tagged is an LLM reply: the learner's in role-play, else Christy's.
+            voice = "learner" if phase == ROLEPLAY_PHASE else "interviewer"
+        self._history.append(
+            {"seq": index, "role": "bot", "text": text, "phase": phase, "voice": voice}
         )
+
+    def _record_learner_speech(
+        self, slot: _SpeechSlot | None, text: str, interrupted: bool
+    ) -> None:
+        """Tell the engine what the learner actually said, so deliveries and reveals are exact."""
+        reply = None if slot is None else slot.reply
+        if reply is None or reply.plan is None or reply.recorded:
+            return
+        reply.recorded = True
+        try:
+            self.engine.record_spoken(
+                reply.plan, text, r_sec=reply.r_sec, interrupted=interrupted
+            )
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must not stall the interview
+            _log.warn(
+                "unknown_event",
+                error_type="r1_record_spoken_failed",
+                error_category=_error_type_of(exc),
+            )
+            return
+        move_id = reply.plan.move_id
+        delivery = None if move_id is None else self.engine.scheduler.deliveries_by_id().get(move_id)
+        if delivery is not None and move_id not in self._logged_moves:
+            self._logged_moves.add(move_id)
+            _log.info(
+                "unknown_event",
+                error_type="r1_fidelity_move",
+                error_category=move_id,
+                turn_index=reply.candidate_index,
+                duration_sec=int(delivery.delivered_sec),
+            )
 
     def _on_agent_state_changed(self, event: Any) -> None:
         self._agent_state = str(getattr(event, "new_state", "") or "")
@@ -1042,6 +1705,8 @@ class R1Interview:
 
     def _on_user_state_changed(self, event: Any) -> None:
         self._user_state = str(getattr(event, "new_state", "") or "")
+        if self._user_state == "speaking" and self._user_turn_started is None:
+            self._user_turn_started = self._clock()
         self._refresh_quiet()
 
     def _refresh_quiet(self) -> None:
@@ -1427,6 +2092,8 @@ class R1Interview:
             self._mute_announced = False
         self._restart_silence_window()
         await self.say("L-REJOIN")
+        if self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
+            await self.say("L-REJOIN-RP")  # plan 5.2: "The learner is back on the line."
         return None
 
     async def _handle_mute(self) -> None:
@@ -1461,7 +2128,7 @@ class R1Interview:
             if phase is R1Phase.ICEBREAKER:
                 budget_left = self.machine.remaining_icebreaker_seconds
             elif phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
-                budget_left = self.machine.remaining_roleplay_seconds
+                budget_left = self._roleplay_budget_left
             if budget_left is not None:
                 budget = budget_left()
                 if budget <= 0 or (not aside and budget <= wait_seconds):
@@ -1487,10 +2154,10 @@ class R1Interview:
 
     async def _roleplay_turn(self) -> str | None:
         """Wait for one role-play turn; return a terminal outcome, or None to continue."""
-        if self.machine.remaining_roleplay_seconds() <= 0:
+        if self._roleplay_budget_left() <= 0:
             return "phase_deadline"
         kind, value = await self._await_turn(
-            ROLEPLAY_PROMPT_SECONDS, hard=self.machine.remaining_roleplay_seconds
+            ROLEPLAY_PROMPT_SECONDS, hard=self._roleplay_budget_left
         )
         if kind == STOP:
             return value
@@ -1635,7 +2302,7 @@ class R1Interview:
 
     async def _run_roleplay(self) -> str | None:
         """Run the learner role-play until R=14:00, S=20:00, or a terminal outcome."""
-        while not self.machine.roleplay_should_end():
+        while not self._roleplay_over():
             stop = await self._roleplay_turn()
             if stop == "phase_deadline":
                 break
@@ -1710,6 +2377,7 @@ class R1Interview:
             if not await self._activate():
                 outcome = "configuration_failed"
                 return await self._finish(outcome)
+            self._record_pins()
             self.machine.transition(R1Phase.OPENING)
             self._schedule_forced_close()
             await self._start()
@@ -1761,6 +2429,7 @@ class R1Interview:
             return outcome
         finally:
             self._begin_exit()
+            self._queue_fidelity()
             await self._drain_background()
             try:
                 await asyncio.wait_for(

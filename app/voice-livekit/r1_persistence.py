@@ -122,6 +122,36 @@ class R1TurnWriter:
         }
         await asyncio.to_thread(self._requester, "/api/internal/r1/usage", payload, 10.0)
 
+    async def admin_log(
+        self,
+        event_type: str,
+        *,
+        turn_index: int | None = None,
+        family_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Post one trusted administration row to the existing ``/api/internal/r1/admin-log``.
+
+        The route validates ``event_type`` against ``r1_admin_log``'s CHECK set and stores
+        ``payload`` as JSON, so the fidelity record (persona and content pins, moves delivered
+        with their transcript turn, guard trips) needs no new column.  Rows hold turn indices,
+        labels and counts, never an utterance.  The caller bounds and isolates failures: a
+        failed row is logged by type and never stops the interview or its terminal write.
+        """
+        if not self.session_id:
+            _log.warn("unknown_event", error_type="r1_admin_log_skipped_no_session")
+            return
+        body: dict[str, Any] = {
+            "room": self.room,
+            "event_type": event_type,
+            "payload": payload or {},
+        }
+        if turn_index is not None:
+            body["turn_index"] = turn_index
+        if family_id:
+            body["family_id"] = family_id
+        await asyncio.to_thread(self._requester, "/api/internal/r1/admin-log", body, 10.0)
+
     async def activate(self) -> Any:
         """CAS ``waiting`` to ``in_progress``; the caller must fail closed unless ``.ok``.
 

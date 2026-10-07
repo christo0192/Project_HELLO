@@ -94,6 +94,19 @@ class TestR1TestsShipAndRun(unittest.TestCase):
                     f"{module}.py is not in the py_compile step of quality.yml",
                 )
 
+    def test_the_dockerfile_ships_every_r1_module_on_the_one_hosting_contract_line(self) -> None:
+        # ``validate-hosting-foundation`` matches /^COPY agent\.py .*\.\/$/m, so the worker COPY
+        # must stay ONE line.  A module the worker imports but this line lacks crashes the
+        # image at the first R1 room, and a module nothing imports yet would never be noticed.
+        dockerfile = (HERE / "Dockerfile").read_text(encoding="utf-8").replace("\r\n", "\n")
+        copy_lines = re.findall(r"^COPY agent\.py .*\./$", dockerfile, flags=re.M)
+        self.assertEqual(len(copy_lines), 1, copy_lines)
+        shipped = set(copy_lines[0].split()[1:-1])
+        self.assertLessEqual({"r1_session.py", "r1_replies.py", "r1_roleplay.py"}, shipped)
+        for module in R1_MODULES:
+            with self.subTest(module=module):
+                self.assertIn(f"{module}.py", shipped)
+
     def test_no_r1_module_or_test_is_left_untracked(self) -> None:
         git = shutil.which("git")
         if git is None:
