@@ -95,7 +95,7 @@ paths:
       tags: [r1]
       operationId: getR1Availability
       summary: Coarse Send R1 availability for the HR card (interviewer+; no figures)
-      description: "capacity_exhausted applies the capacity RPC's own shared-pool test: max(minutes_used, guard) + minutes_reserved + hold > least(cap, pause line), where guard = max(dashboard + ledger since the reading, r1 + phone + legacy) x 1.15. not_deployed means R1_ENABLED is off on the API process; disabled means the database switch is off."
+      description: "capacity_exhausted is returned exactly when the 0119 capacity snapshot (screening_v2.r1_capacity_snapshot), asked with the 55-minute Send hold, does not admit; it is the same test r1_send_round applies, never a second formula. The R1 allocation (monthly_cap_minutes) is checked against R1's own committed minutes in both LiveKit targets; the Cloud pause line (pause_line_minutes) is checked against the whole shared pool only when livekit_target is cloud, so on the self-hosted r1 target phone, legacy-browser and dashboard minutes never gate a Send. A snapshot error is a 5xx, never ready. Earlier states keep their precedence: config_invalid, not_deployed, disabled, paused, role_not_configured, then capacity. not_deployed means R1_ENABLED is off on the API process; disabled means the database switch is off."
       responses:
         '200':
           description: One of ready, not_deployed, disabled, paused, capacity_exhausted, role_not_configured, config_invalid
@@ -115,6 +115,7 @@ paths:
       tags: [r1]
       operationId: getR1Usage
       summary: Current-month R1 budget and WebRTC minute estimate for Mission Control (admin)
+      description: "Capacity figures are the 0119 snapshot's own (screening_v2.r1_capacity_snapshot with no extra hold). committed_minutes, r1_headroom_minutes and sends_left are R1's allocation (monthly_cap_minutes); the pool figures (guard_minutes, pool_committed_minutes, pool_headroom_minutes) gate a Send only while pool_check_applies, that is on the cloud target, and are informational on the r1 target."
       responses:
         '200':
           description: Read-only monthly figures; no secrets
@@ -141,6 +142,11 @@ paths:
                   - guard_minutes
                   - committed_minutes
                   - sends_left
+                  - livekit_target
+                  - pool_check_applies
+                  - r1_headroom_minutes
+                  - pool_committed_minutes
+                  - pool_headroom_minutes
                   - runtime
                 properties:
                   month_start: { type: string }
@@ -156,10 +162,15 @@ paths:
                   phone_minutes: { type: number }
                   legacy_browser_minutes: { type: number }
                   estimated_minutes: { type: number }
-                  ledger_since_minutes: { type: number, description: R1 ledger minutes recorded at or after dashboard_read_at }
-                  guard_minutes: { type: number, description: "max(dashboard_minutes + ledger_since_minutes, r1 + phone + legacy) x 1.15, as r1_send_round computes it" }
-                  committed_minutes: { type: number, description: "max(minutes_used, guard_minutes) + minutes_reserved" }
-                  sends_left: { type: integer, minimum: 0, description: "Whole sends that still fit under least(cap, pause line)" }
+                  ledger_since_minutes: { type: number, description: "R1 ledger minutes recorded at or after dashboard_read_at. Informational since 0119: it is no longer a guard term" }
+                  guard_minutes: { type: number, description: "The shared Cloud pool as the snapshot guards it (pool_guard). Gates a Send only while pool_check_applies; informational on the r1 target" }
+                  committed_minutes: { type: number, description: "R1's committed minutes against the R1 allocation (monthly_cap_minutes): the snapshot's r1_committed = max(minutes_used, R1 estimate) + outstanding holds" }
+                  sends_left: { type: integer, minimum: 0, description: "Whole sends that fit now: floor(headroom / hold) with the R1 allocation's headroom, and on the cloud target also the pool's, whichever is smaller" }
+                  livekit_target: { type: string, enum: [cloud, r1], description: "cloud is Mode B (the pause line gates the shared pool); r1 is Mode A (self-hosted, the pool is informational)" }
+                  pool_check_applies: { type: boolean, description: "True only on the cloud target" }
+                  r1_headroom_minutes: { type: number, description: "monthly_cap_minutes less committed_minutes; negative when over the allocation" }
+                  pool_committed_minutes: { type: number, description: "The snapshot's pool_committed: pool guard + R1 minutes above its estimate + outstanding holds" }
+                  pool_headroom_minutes: { type: number, description: "pause_line_minutes less pool_committed_minutes; gates a Send only while pool_check_applies" }
                   runtime:
                     type: object
                     required: [enabled, status]

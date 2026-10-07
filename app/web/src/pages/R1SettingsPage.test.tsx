@@ -116,28 +116,113 @@ describe('what the form shows', () => {
     expect(screen.getByText(/Last saved/)).toBeInTheDocument();
   });
 
-  it('summarises the ceiling from the lower limit, as shared with phone', async () => {
-    api.getR1Settings.mockResolvedValue({
-      ...SAVED,
-      monthly_cap_minutes: 5000,
-      pause_line_minutes: 550,
-    });
-    renderPage();
-    await loaded();
-    expect(screen.getByText('550 min ceiling, shared with phone')).toBeInTheDocument();
-  });
+  describe('the monthly cap is R1’s allocation (0119), not a combined ceiling (P2)', () => {
+    it.each(['cloud', 'r1'] as const)(
+      'summarises the cap alone, whatever the pause line, on the %s target',
+      async (target) => {
+        api.getR1Settings.mockResolvedValue({
+          ...SAVED,
+          livekit_target: target,
+          monthly_cap_minutes: 5000,
+          pause_line_minutes: 550,
+        });
+        renderPage();
+        await loaded();
+        // The old summary showed min(cap, pause line) = 550, "shared with phone".
+        expect(screen.getByText('5,000 min R1 allocation')).toBeInTheDocument();
+        expect(screen.queryByText(/min ceiling/)).not.toBeInTheDocument();
+        expect(screen.queryByText(/lower of the two limits/)).not.toBeInTheDocument();
+      },
+    );
 
-  it('does not promise R1 a number of sends the shared pool may not allow (P2)', async () => {
-    renderPage();
-    await loaded();
-    // The old summary claimed "about N sends a month" as if the cap were R1's alone.
-    expect(screen.queryByText(/sends a month/)).not.toBeInTheDocument();
-    // The cap's hint says what it really bounds.
-    expect(
-      screen.getByText(/shared WebRTC minutes \(R1, phone and legacy browser/),
-    ).toBeInTheDocument();
-    expect(screen.getByText(/Phone use counts against it/)).toBeInTheDocument();
-    expect(screen.queryByText('Most minutes R1 may commit in a month.')).not.toBeInTheDocument();
+    it('describes the cap as R1’s own allocation that phone use does not count against', async () => {
+      renderPage();
+      await loaded();
+      expect(screen.queryByText(/sends a month/)).not.toBeInTheDocument();
+      expect(
+        screen.getByText(/R1’s own allocation for the month \(sessions × 55 minutes\)/),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(/Phone and legacy browser use do not count against it/),
+      ).toBeInTheDocument();
+      // The old hint said the opposite.
+      expect(screen.queryByText(/Phone use counts against it/)).not.toBeInTheDocument();
+      expect(screen.queryByText(/Ceiling on the month/)).not.toBeInTheDocument();
+    });
+
+    it('uses the hold the API reports in the cap hint and the section description', async () => {
+      api.getR1Settings.mockResolvedValue({ ...SAVED, admission_hold_minutes: 60 });
+      renderPage();
+      await loaded();
+      expect(screen.getByText(/\(sessions × 60 minutes\)/)).toBeInTheDocument();
+      expect(
+        screen.getByText(/Each send reserves 60 minutes of R1’s allocation/),
+      ).toBeInTheDocument();
+    });
+
+    it('tracks the cap being typed, and drops the summary when it is not a number', async () => {
+      const user = userEvent.setup();
+      renderPage();
+      await loaded();
+      expect(screen.getByText('4,000 min R1 allocation')).toBeInTheDocument();
+      await user.clear(field('Monthly cap (minutes)'));
+      await user.type(field('Monthly cap (minutes)'), '1100');
+      expect(screen.getByText('1,100 min R1 allocation')).toBeInTheDocument();
+      await user.clear(field('Monthly cap (minutes)'));
+      expect(screen.queryByText(/min R1 allocation/)).not.toBeInTheDocument();
+    });
+
+    it('says on LiveKit Cloud that BOTH the allocation and the pause line must have room', async () => {
+      renderPage(); // SAVED is on the cloud target
+      await loaded();
+      expect(
+        screen.getByText(
+          /Both limits must have room: R1’s allocation and the Cloud pool’s pause line\./,
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(/The Cloud pool’s line: R1, phone and legacy browser together/),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(/R1 stops taking sends when the month’s pool use reaches it/),
+      ).toBeInTheDocument();
+    });
+
+    it('says on the dedicated R1 server that only the allocation applies', async () => {
+      api.getR1Settings.mockResolvedValue({ ...SAVED, livekit_target: 'r1' });
+      renderPage();
+      await loaded();
+      expect(
+        screen.getByText(
+          /Only R1’s allocation applies; the Cloud pool’s pause line gates nothing here\./,
+        ),
+      ).toBeInTheDocument();
+      expect(
+        screen.getByText(/gates nothing now; it applies again only if R1 moves back to LiveKit Cloud/),
+      ).toBeInTheDocument();
+      expect(screen.queryByText(/Both limits must have room/)).not.toBeInTheDocument();
+      expect(
+        screen.queryByText(/R1 stops taking sends when the month’s pool use reaches it/),
+      ).not.toBeInTheDocument();
+    });
+
+    it('still lets the pause line be edited on the r1 target, for if R1 moves back', async () => {
+      api.getR1Settings.mockResolvedValue({ ...SAVED, livekit_target: 'r1' });
+      const user = userEvent.setup();
+      renderPage();
+      await loaded();
+      await user.clear(field('Pause line (minutes)'));
+      await user.type(field('Pause line (minutes)'), '3500');
+      await user.click(save());
+      expect(api.updateR1Settings).toHaveBeenCalledWith({ pause_line_minutes: 3500 });
+    });
+
+    it('reads an unknown target as gating, the cautious reading', async () => {
+      api.getR1Settings.mockResolvedValue({ ...SAVED, livekit_target: 'elsewhere' });
+      renderPage();
+      await loaded();
+      expect(screen.getByText(/Both limits must have room/)).toBeInTheDocument();
+    });
   });
 
   it('says R1 is off, and why the switch alone is not enough when the API disagrees', async () => {
@@ -454,6 +539,19 @@ describe('the dashboard reading', () => {
       expect(notice).toHaveTextContent(/the capacity guard still counts it this month/);
       expect(notice).toHaveTextContent('Record this month’s reading.');
       expect(notice.closest('[role="status"]')).not.toBeNull();
+    });
+
+    it('is not flagged on the r1 target, where the Cloud pool gates no send', async () => {
+      api.getR1Settings.mockResolvedValue({
+        ...SAVED,
+        livekit_target: 'r1',
+        dashboard_minutes: 3900,
+        dashboard_read_at: '2020-09-30T20:00:00.000Z',
+      });
+      renderPage();
+      await loaded();
+      expect(screen.getByText(/Current reading: 3,900 min, read/)).toBeInTheDocument();
+      expect(screen.queryByText(/This reading is from/)).not.toBeInTheDocument();
     });
 
     it('is no longer flagged once this month’s reading is recorded', async () => {
