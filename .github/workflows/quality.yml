@@ -166,3 +166,14 @@ jobs:
           /tmp/ns-venv/bin/python -m unittest tests.test_noise_suppression -v > /tmp/ns-test.log 2>&1 || { cat /tmp/ns-test.log; exit 1; }
           cat /tmp/ns-test.log
           if grep -q "skipped" /tmp/ns-test.log; then echo "::error::RNNoise DSP tests skipped"; exit 1; fi
+      # M013 S02 recording tail flush (recording.py `_FlushingRecorderIO`): it
+      # reaches into livekit-agents 1.6.4 RecorderIO internals, so the bare-python
+      # step above can only exercise it against fakes. Replay the real SDK
+      # recorder (encode + decode with PyAV) in the venv the previous step built
+      # from requirements.txt, and fail if any case skipped.
+      - name: Test recording tail flush (real SDK)
+        run: |
+          cd app/voice-livekit
+          /tmp/ns-venv/bin/python -m unittest tests.test_recorder_flush -v > /tmp/rf-test.log 2>&1 || { cat /tmp/rf-test.log; exit 1; }
+          cat /tmp/rf-test.log
+          if grep -q "skipped" /tmp/rf-test.log; then echo "::error::recording tail-flush SDK tests skipped"; exit 1; fi

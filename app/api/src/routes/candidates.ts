@@ -18,7 +18,15 @@ import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import { redactCandidatePhone } from '../lib/candidate-phone.js';
 import { loadCandidatePhoneProgress, phoneProgressFields } from '../lib/candidate-phone-progress.js';
-import { attemptConsentStage } from '../lib/attempt-consent-stage.js';
+import { attemptConsentStage, loadLegConsentFacts, NO_LEG_CONSENT_FACTS } from '../lib/attempt-consent-stage.js';
+import {
+  attemptLegTiming,
+  sessionRecordedFacts,
+  withoutRecordingFacts,
+  type AttemptLegTiming,
+  type AttemptLegTimingRow,
+  type SessionRecordedFacts,
+} from '../lib/attempt-leg-timing.js';
 import { createLogger } from '../lib/logger.js';
 
 const candidateLogger = createLogger('candidates');
@@ -93,10 +101,117 @@ function decodeAttemptHistoryCursor(value: string | undefined): AttemptHistoryCu
   }
 }
 
-function attemptDurationSeconds(answeredAt: string | null, endedAt: string | null): number | null {
-  if (!answeredAt || !endedAt) return null;
-  const duration = (Date.parse(endedAt) - Date.parse(answeredAt)) / 1000;
-  return Number.isFinite(duration) && duration >= 0 ? duration : null;
+/**
+ * The attempt columns the per-leg timing reads (0125). Selected by the history
+ * and by the candidate detail's session roll-up so both state the same facts.
+ * `egress_id` only tells a worker recording apart, and `lease_expires_at` only
+ * whether a completed session's end bounds a later-reclaimed leg; neither is
+ * ever returned.
+ */
+const ATTEMPT_LEG_TIMING_COLUMNS =
+  'observed_ended_at,recording_started_at_ms,recording_duration_ms,recording_tail_flushed,egress_id,lease_expires_at';
+
+/**
+ * At most this many legs are read for one candidate's session roll-up. A read
+ * that returns more may be truncated, so the roll-up is reported as unknown
+ * (null) rather than a confident short total.
+ */
+const SESSION_LEG_READ_CAP = 500;
+
+const NULL_SESSION_RECORDED_FACTS: SessionRecordedFacts = Object.freeze({
+  recorded_total_sec: null,
+  recorded_legs: null,
+  recorded_unknown_legs: null,
+  connected_complete: null,
+  connected_total_sec: null,
+  connected_unobserved_legs: null,
+  connected_detected_legs: null,
+  connected_open_legs: null,
+});
+
+/**
+ * M013 S02 (T07): the per-session header facts, from the session's phone legs
+ * (`session_id` or `recording_session_id` = the session). ONE bounded read for
+ * every session of the candidate, plus the legs' ledger facts (a reconciler-
+ * detected end is not an exact end) and the sessions' recording lifecycle.
+ * A leg whose audio was erased, revoked, quarantined or latched failed adds
+ * nothing to the recorded total (review, S02): the header must never count
+ * audio the Review tab cannot play. Never rejects: a failed or possibly
+ * truncated read returns null, and every session then reports the facts as
+ * unknown rather than a confident short total. A session with no legs (a
+ * browser session) gets all-null facts.
+ */
+async function loadSessionRecordedFacts(sessionIds: readonly string[]): Promise<Map<string, SessionRecordedFacts> | null> {
+  const ids = sessionIds.filter((id) => uuidSchema.safeParse(id).success);
+  const facts = new Map<string, SessionRecordedFacts>();
+  if (ids.length === 0) return facts;
+  try {
+    const list = ids.join(',');
+    const { data, error } = await supabase
+      .from('phone_call_attempts')
+      .select(`id,session_id,recording_session_id,admitted_at,answered_at,ended_at,state,abandon_reason,outcome_class,recording_object_key,recording_ready,recording_size_bytes,recording_content_type,recording_quarantined,recording_deleted_at,egress_status,${ATTEMPT_LEG_TIMING_COLUMNS}`)
+      .or(`session_id.in.(${list}),recording_session_id.in.(${list})`)
+      .order('admitted_at', { ascending: true })
+      .order('id', { ascending: true })
+      .limit(SESSION_LEG_READ_CAP + 1);
+    if (error || !Array.isArray(data) || data.length > SESSION_LEG_READ_CAP) return null;
+    const rows = data as Array<AttemptLegTimingRow & {
+      id?: string;
+      session_id?: string | null;
+      recording_session_id?: string | null;
+      recording_quarantined?: boolean | null;
+      recording_deleted_at?: string | null;
+    }>;
+    const legFacts = await loadLegConsentFacts(
+      rows.map((raw) => raw.id).filter((id): id is string => typeof id === 'string'),
+    );
+    if (!legFacts) return null;
+    // The sessions' recording lifecycle: erased, revoked or quarantined audio
+    // is not counted. A failed read is unknown, never a confident total.
+    const blockedSessions = new Set<string>();
+    // A completed session's end bounds its legs (0125 §3a): every leg end is
+    // capped at it, a leg answered after it is left out, and a leg the reclaim
+    // ended only after it counts up to it when the worker completed the
+    // session (see attempt-leg-timing.ts for the one stricter case).
+    const completedSessionEnd = new Map<string, string>();
+    const lifecycle = await supabase
+      .from('call_sessions')
+      .select('id,status,ended_at,recording_revoked_at,recording_quarantined,recording_deleted_at')
+      .in('id', ids)
+      .limit(ids.length);
+    if (lifecycle.error) return null;
+    for (const raw of (Array.isArray(lifecycle.data) ? lifecycle.data : []) as Array<Record<string, unknown>>) {
+      if (typeof raw.id !== 'string') continue;
+      if (typeof raw.recording_revoked_at === 'string'
+        || typeof raw.recording_deleted_at === 'string'
+        || raw.recording_quarantined === true) {
+        blockedSessions.add(raw.id);
+      }
+      if (raw.status === 'completed' && typeof raw.ended_at === 'string') {
+        completedSessionEnd.set(raw.id, raw.ended_at);
+      }
+    }
+    const legsBySession = new Map<string, AttemptLegTiming[]>();
+    for (const raw of rows) {
+      const ref = raw.session_id ?? raw.recording_session_id;
+      if (typeof ref !== 'string') continue;
+      const legs = legsBySession.get(ref) ?? [];
+      const timing = attemptLegTiming({
+        ...raw,
+        end_detected_by_sweep: typeof raw.id === 'string' && legFacts.get(raw.id)?.endDetectedBySweep === true,
+        session_ended_at: completedSessionEnd.get(ref) ?? null,
+      });
+      const audioWithheld = blockedSessions.has(ref)
+        || raw.recording_quarantined === true
+        || typeof raw.recording_deleted_at === 'string';
+      legs.push(audioWithheld ? withoutRecordingFacts(timing) : timing);
+      legsBySession.set(ref, legs);
+    }
+    for (const id of ids) facts.set(id, sessionRecordedFacts(legsBySession.get(id) ?? []));
+    return facts;
+  } catch {
+    return null;
+  }
 }
 
 export const candidatesRouter = Router();
@@ -427,12 +542,23 @@ candidatesRouter.get(
     if (!user || !(await candidateVisibleToRecruiter(candidateId, user))) {
       return res.status(404).json({ error: 'Candidate not found' });
     }
-    const query = req.query as unknown as { limit: number; before?: string };
+    const query = req.query as unknown as { limit: number; before?: string; session_id?: string };
     const limit = Math.min(Math.max(Number(query.limit) || 25, 1), PHONE_ATTEMPT_HISTORY_MAX);
     const cursor = decodeAttemptHistoryCursor(query.before);
     if (query.before && !cursor) {
       return res.status(400).json({ error: 'Invalid attempt history cursor' });
     }
+    // M013 S02 (T07): the legs of ONE session, oldest first ("Call 1 of 2").
+    // Validated as a uuid by the query schema; re-checked here because it is
+    // interpolated into a PostgREST filter. The candidate scope below still
+    // applies, so another candidate's session lists nothing.
+    const sessionFilter = typeof query.session_id === 'string' && uuidSchema.safeParse(query.session_id).success
+      ? query.session_id
+      : null;
+    if (query.session_id !== undefined && !sessionFilter) {
+      return res.status(400).json({ error: 'Invalid session filter' });
+    }
+    const ascending = sessionFilter !== null;
 
     try {
       // Fetch engagement ids in stable pages. A candidate can have more than
@@ -457,19 +583,29 @@ candidatesRouter.get(
 
       let attemptQuery = supabase
         .from('phone_call_attempts')
-        .select('id,attempt_seq,admitted_at,answered_at,ended_at,state,abandon_reason,outcome_class,session_id,recording_session_id,recording_object_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_status')
+        .select(`id,attempt_seq,admitted_at,answered_at,ended_at,state,abandon_reason,outcome_class,session_id,recording_session_id,recording_object_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_status,${ATTEMPT_LEG_TIMING_COLUMNS}`)
         .in('engagement_id', engagementIds)
-        .order('admitted_at', { ascending: false })
-        .order('id', { ascending: false })
+        .order('admitted_at', { ascending })
+        .order('id', { ascending })
         .limit(limit + 1);
-      if (cursor) {
-        attemptQuery = attemptQuery.or(
-          `admitted_at.lt.${cursor.admitted_at},and(admitted_at.eq.${cursor.admitted_at},id.lt.${cursor.id})`,
-        );
+      // ONE `or` filter: the keyset cursor (direction follows the order) and
+      // the session filter are combined into a single logic tree rather than
+      // two `or` parameters.
+      const op = ascending ? 'gt' : 'lt';
+      const cursorFilter = cursor
+        ? `admitted_at.${op}.${cursor.admitted_at},and(admitted_at.eq.${cursor.admitted_at},id.${op}.${cursor.id})`
+        : null;
+      const sessionFilterTree = sessionFilter
+        ? `session_id.eq.${sessionFilter},recording_session_id.eq.${sessionFilter}`
+        : null;
+      if (cursorFilter && sessionFilterTree) {
+        attemptQuery = attemptQuery.or(`and(or(${sessionFilterTree}),or(${cursorFilter}))`);
+      } else if (cursorFilter ?? sessionFilterTree) {
+        attemptQuery = attemptQuery.or((cursorFilter ?? sessionFilterTree) as string);
       }
       const { data: rows, error: attemptError } = await attemptQuery;
       if (attemptError) return res.status(503).json({ error: 'Phone attempt history unavailable' });
-      const allRows = (rows ?? []) as Array<{
+      const allRows = (rows ?? []) as Array<AttemptLegTimingRow & {
         id: string;
         attempt_seq: number;
         admitted_at: string;
@@ -491,10 +627,19 @@ candidatesRouter.get(
       }>;
       const hasNext = allRows.length > limit;
       const shown = hasNext ? allRows.slice(0, limit) : allRows;
+
+      // D8: what each leg's own ledger facts say (opt-out / in-call deferral
+      // / booked callback on a CONSENTED leg; a reconciler-detected end on
+      // any leg). ONE batched read for the page, keyed by attempt id — never
+      // one query per row, never the engagement's state. The download audit
+      // loads the same facts through the same helper.
+      const legConsentFacts = await loadLegConsentFacts(shown.map((row) => row.id));
+      if (!legConsentFacts) return res.status(503).json({ error: 'Phone attempt history unavailable' });
       const sessionIds = [...new Set(shown.map((row) => row.session_id ?? row.recording_session_id).filter((id): id is string => !!id))];
       const sessionLifecycle = new Map<string, {
         ownerId: string | null;
         status: string | null;
+        endedAt: string | null;
         revokedAt: string | null;
         quarantined: boolean;
         deletedAt: string | null;
@@ -502,7 +647,7 @@ candidatesRouter.get(
       if (sessionIds.length > 0) {
         const { data: sessionRows, error: sessionError } = await supabase
           .from('call_sessions')
-          .select('id,owner_id,status,recording_revoked_at,recording_quarantined,recording_deleted_at')
+          .select('id,owner_id,status,ended_at,recording_revoked_at,recording_quarantined,recording_deleted_at')
           .in('id', sessionIds)
           .limit(sessionIds.length);
         if (sessionError) return res.status(503).json({ error: 'Phone attempt history unavailable' });
@@ -511,6 +656,7 @@ candidatesRouter.get(
             id?: unknown;
             owner_id?: unknown;
             status?: unknown;
+            ended_at?: unknown;
             recording_revoked_at?: unknown;
             recording_quarantined?: unknown;
             recording_deleted_at?: unknown;
@@ -519,6 +665,7 @@ candidatesRouter.get(
             sessionLifecycle.set(row.id, {
               ownerId: typeof row.owner_id === 'string' ? row.owner_id : null,
               status: typeof row.status === 'string' ? row.status : null,
+              endedAt: typeof row.ended_at === 'string' ? row.ended_at : null,
               revokedAt: typeof row.recording_revoked_at === 'string' ? row.recording_revoked_at : null,
               quarantined: row.recording_quarantined === true,
               deletedAt: typeof row.recording_deleted_at === 'string' ? row.recording_deleted_at : null,
@@ -576,6 +723,34 @@ candidatesRouter.get(
               : row.recording_object_key
                 ? 'processing'
                 : 'unavailable';
+          // M013 S02 (T07): the leg's connected window and recording facts.
+          // The recording facts follow the `recording.reason` rule: a caller
+          // who may not read the session learns nothing about its audio.
+          // A reconciler-detected end is the sweep's detection time (`detected`),
+          // not an exact end. A leg whose audio cannot be played (erased,
+          // revoked, quarantined, failed, or not yet uploaded) states no
+          // recorded length or tail note, as the Overview list does.
+          // A completed session's end bounds the leg (0125 §3a): its end is
+          // capped there, and a leg the reclaim ended only after it counts up
+          // to it when the worker completed the session.
+          const timing: AttemptLegTiming = attemptLegTiming({
+            ...row,
+            end_detected_by_sweep: legConsentFacts.get(row.id)?.endDetectedBySweep === true,
+            session_ended_at: parent?.status === 'completed' ? parent.endedAt : null,
+          });
+          const recordingFacts = interviewerCanReadSession && recordingState !== 'unavailable'
+            ? {
+                recorded_sec: timing.recorded_sec,
+                recorded_sec_estimated: timing.recorded_sec_estimated,
+                recording_started_at_ms: timing.recording_started_at_ms,
+                tail_may_be_missing: timing.tail_may_be_missing,
+              }
+            : {
+                recorded_sec: null,
+                recorded_sec_estimated: false,
+                recording_started_at_ms: null,
+                tail_may_be_missing: false,
+              };
           return {
             id: row.id,
             attempt_seq: row.attempt_seq,
@@ -590,7 +765,19 @@ candidatesRouter.get(
             // allowlist so nothing else can ever be echoed.
             abandon_reason: row.abandon_reason === 'infra_deferred' ? 'infra_deferred' : null,
             outcome_class: row.outcome_class,
-            duration_sec: attemptDurationSeconds(row.answered_at, row.ended_at),
+            // Kept for existing clients, and now the SAME figure as
+            // `connected_sec`: the observed end is preferred, and a leg ended
+            // only by the lease reclaim has no length (null), never the
+            // minutes between the hang-up and the sweep.
+            duration_sec: timing.connected_sec,
+            connected_from: timing.connected_from,
+            connected_to: timing.connected_to,
+            connected_to_source: timing.connected_to_source,
+            connected_sec: timing.connected_sec,
+            ...recordingFacts,
+            // The session this leg belongs to: the consent binding, else the
+            // evidence-only binding (0107). Reconnect legs share it.
+            session_ref: evidenceSessionId ?? null,
             recording: {
               state: recordingState,
               // access_unavailable first: a caller who may not read the
@@ -615,6 +802,7 @@ candidatesRouter.get(
               ? attemptConsentStage(
                   row,
                   evidenceSessionId ? (parent ? parent.status : undefined) : undefined,
+                  row.session_id ? (legConsentFacts.get(row.id) ?? NO_LEG_CONSENT_FACTS) : null,
                 )
               : null,
             transcript: user.appRole === 'admin' && evidenceSessionId && kind !== 'none'
@@ -1527,6 +1715,14 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
     .eq('candidate_id', req.params.id)
     .order('created_at', { ascending: false });
 
+  // M013 S02 (T07): recorded / connected facts per session, from its legs.
+  // These replace `duration_sec` as the header's call length: for a phone
+  // session that column summed every leg up to the lease reclaim (9f60523d:
+  // 443 s for 53 s + 18 s of audio).
+  const recordedFacts = await loadSessionRecordedFacts(sessionIds);
+  const viewerRole = req.authUser?.appRole;
+  const viewerId = req.authUser?.id;
+
   // `select('*')` returns `phone_raw`, `phone_e164` AND the `parsed` blob, all
   // three of which carry the same number. One helper covers all three so a
   // future column cannot be redacted in one route and forgotten in another.
@@ -1544,7 +1740,24 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
       // session that has a transcript, read in full.
       const words =
         wordCountsUsable && transcribedSessions.has(id) ? (wordsBySession.get(id) ?? 0) : null;
-      return { ...row, candidate_words: words };
+      const sessionFacts = recordedFacts?.get(id) ?? NULL_SESSION_RECORDED_FACTS;
+      // The recording rule of the attempt history: an interviewer who does
+      // not own the session learns nothing about its audio. The connected
+      // facts are call facts, like duration_sec, and stay.
+      const mayReadRecording = viewerRole !== 'interviewer'
+        || (typeof row.owner_id === 'string' && row.owner_id === viewerId);
+      return {
+        ...row,
+        candidate_words: words,
+        recorded_total_sec: mayReadRecording ? sessionFacts.recorded_total_sec : null,
+        recorded_legs: mayReadRecording ? sessionFacts.recorded_legs : null,
+        recorded_unknown_legs: mayReadRecording ? sessionFacts.recorded_unknown_legs : null,
+        connected_complete: sessionFacts.connected_complete,
+        connected_total_sec: sessionFacts.connected_total_sec,
+        connected_unobserved_legs: sessionFacts.connected_unobserved_legs,
+        connected_detected_legs: sessionFacts.connected_detected_legs,
+        connected_open_legs: sessionFacts.connected_open_legs,
+      };
     }),
     assessments: assessments ?? [],
   });

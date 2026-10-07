@@ -634,6 +634,20 @@ function addSession(candidate: Candidate, n: number, over: Partial<Session> & { 
     done: true,
     ...rest,
   };
+  // M013 S02: the candidate read's per-session roll-up. A one-leg phone call
+  // whose end was observed: connected = the call, recorded about a second
+  // shorter (the worker starts recording after the answer). A call that has
+  // not ended yet has no figures.
+  const length = session.duration_sec;
+  if (session.mode === 'live' && typeof length === 'number' && length > 0) {
+    Object.assign(session, {
+      duration_unobserved_legs: 0,
+      recorded_total_sec: Math.max(1, length - 1),
+      recorded_legs: 1,
+      connected_complete: true,
+      connected_total_sec: length,
+    } satisfies Partial<Session>);
+  }
   sessions.push(session);
   const transcript = session.status === 'created' || session.status === 'waiting' ? [] : transcriptFor(role, gateOnly || session.status === 'in_progress');
   sessionDetails[session.id] = { session, transcript, assessment };
@@ -675,6 +689,75 @@ CANDIDATES.forEach((c, i) => {
 export const LEGACY_SESSION_ID = sessions.find((s) => s.candidate_id === LEGACY_CANDIDATE_ID)!.id;
 /** The star candidate's full, v2-scored session. */
 export const V2_SESSION_ID = sessions.filter((s) => s.candidate_id === STAR_CANDIDATE_ID)[1].id;
+
+/*
+ * M013 S02 (T08a): the legacy candidate's screening spans TWO phone legs.
+ * The first call dropped (its end is on the ledger; a legacy worker MP3, so
+ * its length is an estimate and its tail may be missing), and the reconnect
+ * then dropped with NO observed end (closed only by the lease reclaim about
+ * six minutes later). Its turns carry their own start, so the Review tab can
+ * place each on its leg and seek within that leg's file. Synthetic timings.
+ */
+const legacySession = sessions.find((s) => s.id === LEGACY_SESSION_ID)!;
+const legacyTurns = sessionDetails[LEGACY_SESSION_ID].transcript;
+const LEGACY_A_ANSWERED_MS = Date.parse(legacySession.started_at!);
+/** Session offsets past this were spoken on the reconnect. */
+const LEGACY_SPLIT_SEC = (legacyTurns[Math.floor(legacyTurns.length / 2)].start_offset_sec ?? 0) - 0.5;
+const LEGACY_LAST_SEC = legacyTurns[legacyTurns.length - 1].start_offset_sec ?? 0;
+const LEGACY_A_CONNECTED_SEC = Math.round(LEGACY_SPLIT_SEC + 8);
+const LEGACY_B_ADMITTED_MS = LEGACY_A_ANSWERED_MS + (LEGACY_A_CONNECTED_SEC + 40) * 1000;
+const LEGACY_B_ANSWERED_MS = LEGACY_B_ADMITTED_MS + 12_000;
+const LEGACY_B_RECORDING_MS = LEGACY_B_ANSWERED_MS + 900;
+const LEGACY_A_RECORDED_SEC = Math.round((LEGACY_SPLIT_SEC + 2) * 10) / 10;
+const LEGACY_B_RECORDED_SEC = Math.round((LEGACY_LAST_SEC - LEGACY_SPLIT_SEC + 12) * 10) / 10;
+sessionDetails[LEGACY_SESSION_ID].transcript = legacyTurns.map((t) => {
+  const offset = t.start_offset_sec ?? 0;
+  const startedAt = offset <= LEGACY_SPLIT_SEC
+    ? LEGACY_A_ANSWERED_MS + 1000 + offset * 1000
+    : LEGACY_B_RECORDING_MS + 2000 + (offset - LEGACY_SPLIT_SEC) * 1000;
+  // No session egress anchor on a worker in-band session: no session offset.
+  return { ...t, start_offset_sec: null, started_at_ms: Math.round(startedAt) };
+});
+Object.assign(legacySession, {
+  // 0125: the unobserved reconnect is left out of duration_sec.
+  duration_sec: LEGACY_A_CONNECTED_SEC,
+  duration_unobserved_legs: 1,
+  recorded_total_sec: Math.round((LEGACY_A_RECORDED_SEC + LEGACY_B_RECORDED_SEC) * 10) / 10,
+  recorded_legs: 2,
+  connected_complete: false,
+  connected_total_sec: null,
+  recording_egress_started_at_ms: null,
+} satisfies Partial<Session>);
+
+function legacyTwoLegAttempts(): CandidatePhoneAttempt[] {
+  const legA: CandidatePhoneAttempt = {
+    id: uid('7', 31), attempt_seq: 1,
+    admitted_at: iso(LEGACY_A_ANSWERED_MS - 14_000), answered_at: iso(LEGACY_A_ANSWERED_MS),
+    ended_at: iso(LEGACY_A_ANSWERED_MS + LEGACY_A_CONNECTED_SEC * 1000),
+    state: 'completed', abandon_reason: null, outcome_class: 'disconnected', duration_sec: LEGACY_A_CONNECTED_SEC,
+    connected_from: iso(LEGACY_A_ANSWERED_MS), connected_to: iso(LEGACY_A_ANSWERED_MS + LEGACY_A_CONNECTED_SEC * 1000),
+    connected_to_source: 'ledger', connected_sec: LEGACY_A_CONNECTED_SEC,
+    recorded_sec: LEGACY_A_RECORDED_SEC, recorded_sec_estimated: true, recording_started_at_ms: null,
+    tail_may_be_missing: true, session_ref: LEGACY_SESSION_ID,
+    recording: { state: 'ready' }, consent_stage: 'after_consent',
+    transcript: { href: `/sessions/${LEGACY_SESSION_ID}`, scope: 'session', kind: 'session', shared_session: true },
+  };
+  const legB: CandidatePhoneAttempt = {
+    id: uid('7', 32), attempt_seq: 2,
+    admitted_at: iso(LEGACY_B_ADMITTED_MS), answered_at: iso(LEGACY_B_ANSWERED_MS),
+    // The lease reclaim DETECTED the drop about six minutes later.
+    ended_at: iso(LEGACY_B_ANSWERED_MS + 6 * MIN),
+    state: 'abandoned', abandon_reason: null, outcome_class: null, duration_sec: null,
+    connected_from: iso(LEGACY_B_ANSWERED_MS), connected_to: iso(LEGACY_B_ANSWERED_MS + 6 * MIN),
+    connected_to_source: 'unobserved', connected_sec: null,
+    recorded_sec: LEGACY_B_RECORDED_SEC, recorded_sec_estimated: false, recording_started_at_ms: LEGACY_B_RECORDING_MS,
+    tail_may_be_missing: false, session_ref: LEGACY_SESSION_ID,
+    recording: { state: 'ready' }, consent_stage: 'after_consent',
+    transcript: { href: `/sessions/${LEGACY_SESSION_ID}`, scope: 'session', kind: 'session', shared_session: true },
+  };
+  // Newest first, as the unfiltered history route lists them.
+  return [legB, legA];
+}
 
 const PARSED: CandidateResumeFacts = {
   current_role: 'Staff Engineer, Payments Platform',
@@ -809,6 +892,7 @@ function phoneAttempts(c: Candidate): CandidatePhoneAttempt[] {
       { id: uid('7', 11), attempt_seq: 1, admitted_at: ago(20 * HOUR), answered_at: null, ended_at: ago(20 * HOUR - 38_000), state: 'completed', abandon_reason: null, outcome_class: 'no_answer', duration_sec: null, recording: { state: 'unavailable', reason: 'no_recording' }, consent_stage: null, transcript: null },
     ];
   }
+  if (c.id === LEGACY_CANDIDATE_ID) return legacyTwoLegAttempts();
   if (c.id === ABANDONED_CANDIDATE_ID) {
     // The whole no-answer budget: three rings, nobody picked up.
     return [3, 2, 1].map((seq) => {

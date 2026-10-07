@@ -65,6 +65,8 @@ export const candidateIdParamSchema = idParamSchema;
 export const candidatePhoneAttemptsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(50).default(25),
   before: z.string().max(256).optional(),
+  /** M013 S02: only the legs of this session (`session_id` or `recording_session_id`), oldest first. */
+  session_id: uuidSchema.optional(),
 }).strict();
 
 export type CandidatePhoneAttemptsQuery = z.infer<typeof candidatePhoneAttemptsQuerySchema>;

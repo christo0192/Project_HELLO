@@ -215,6 +215,18 @@ export interface SweepPhoneStrandedSessionsResult {
    * Absent from an older RPC.
    */
   readonly lateSuperseded?: number;
+  /**
+   * 0125 §5c (M013 S02) — engagements this pass relabelled
+   * completed -> failed/screening_abandoned right after its own stranded or
+   * late completion (a measured 0-answer phone score). Absent from an older RPC.
+   */
+  readonly zeroAnswerRelabelled?: number;
+  /**
+   * 0125 §5c — relabel attempts that raised and were caught (the stranded
+   * resolution itself still committed). Non-zero is operator attention.
+   * Absent from an older RPC.
+   */
+  readonly zeroAnswerRelabelErrors?: number;
 }
 
 /** 0071 / X5b — the crashed-session recording-finalization backstop sweep. */
@@ -258,6 +270,13 @@ export interface PhonePartialFinalizeSession {
   readonly covered: number | null;
   /** Plan length; `null` when the plan row is unresolvable (still score). */
   readonly total: number | null;
+  /**
+   * The RPC's `disconnect_reason`, one of `PHONE_DISCONNECT_REASONS`
+   * (scorecards/evidence.ts): `candidate_hangup`, `worker_crash`,
+   * `unobserved_disconnect` (0125 §4: reclaimed or lease-lapsed, but the leg
+   * shows teardown evidence) or `disconnected`. Kept a free string so a newer
+   * SQL token never fails an older API; forwarded verbatim to scoring.
+   */
   readonly disconnectReason: string;
   /** Whether THIS pass drove the session `in_progress -> completed`. */
   readonly transitioned: boolean;

@@ -128,8 +128,19 @@ export function deriveStartOffsetSec(
  *
  * The max(0, …) clamp guards against clock skew where the agent clock
  * momentarily precedes the LiveKit server clock (NTP correction).
+ *
+ * M013 S02 (T08a): `withTurnStart` adds `started_at_ms`, the turn's own
+ * validated epoch-ms start (worker clock), so the Review tab can place each
+ * turn on the right LEG's recording (`recording_started_at_ms`). A worker
+ * in-band phone session has no session-level egress anchor, so its
+ * `start_offset_sec` is always null; without the absolute start no phone
+ * turn could seek. Only the read route asks for it: the simulation `/turn`
+ * path feeds this array to the model and keeps the exact old shape.
  */
-async function getTranscript(sessionId: string): Promise<TranscriptTurn[]> {
+async function getTranscript(
+  sessionId: string,
+  { withTurnStart = false }: { withTurnStart?: boolean } = {},
+): Promise<TranscriptTurn[]> {
   const [turnsResult, sessionResult] = await Promise.all([
     supabase
       .from('transcript_turns')
@@ -157,7 +168,7 @@ async function getTranscript(sessionId: string): Promise<TranscriptTurn[]> {
       t.turn_started_at_ms,
       egressStartMs,
     );
-    return {
+    const turn: TranscriptTurn = {
       speaker: t.speaker as 'bot' | 'candidate',
       text: t.text as string,
       start_offset_sec,
@@ -165,6 +176,8 @@ async function getTranscript(sessionId: string): Promise<TranscriptTurn[]> {
       // turns from the scored assessment turns. Absent/legacy rows read false.
       is_gate: t.is_gate === true,
     };
+    if (withTurnStart) turn.started_at_ms = validateEpochMsAnchor(t.turn_started_at_ms);
+    return turn;
   });
 }
 
@@ -410,7 +423,7 @@ screeningRouter.get('/:id', validateParams(screeningSessionIdParamSchema), async
     .eq('id', sessionId)
     .single();
   if (error) return res.status(404).json({ error: 'Screening session not found' });
-  const transcript = await getTranscript(sessionId);
+  const transcript = await getTranscript(sessionId, { withTurnStart: true });
   const { data: assessment } = await supabase
     .from('assessments')
     .select('*')

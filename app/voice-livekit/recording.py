@@ -8,15 +8,26 @@ at the moment it is actually played), mixes both onto one synchronized stereo
 timeline (candidate = left, agent = right), resamples, and stream-encodes to
 OGG/Opus with constant memory. No second AudioStream, no hand-rolled mixer.
 
-── CONSENT POSTURE: RECORD FROM ANSWER, KEEP ONLY IF CONSENT ────────────────
-This matches the egress posture since migration 0067 (PR160): recording begins
-at ``call.answered`` so the greeting + consent exchange itself is captured, and
-the recording is KEPT only if consent is delivered. If consent is refused (a
-machine pickup, an explicit refusal, or a pre-disclosure deferral), the audio
-must be destroyed — the caller invokes :meth:`discard` instead of :meth:`finish`
-so the local file is deleted and NOTHING is uploaded (there is therefore no
-object for the server-side purge to race against). The upload in :meth:`finish`
-is thus gated by the CALLER on the consent outcome, never performed blindly.
+── CONSENT POSTURE: RECORD FROM ANSWER, KEEP EVERY CANDIDATE LEG ──────────
+Recording begins at ``call.answered`` so the greeting + consent exchange itself
+is captured. Since migration 0105 the recording is KEPT whatever the consent
+outcome (declined, revoked, deferred and pre-consent legs are retained and
+flagged server-side). The ONLY discard is the wrong-number / wrong-person
+privacy path — a third party's voice — where the caller invokes
+:meth:`discard` instead of :meth:`finish`, so the local file is deleted and
+NOTHING is uploaded (there is therefore no object for a server-side purge to
+race against).
+
+── TAIL FLUSH (M013 S02) ────────────────────────────────────────────────────
+RecorderIO 1.6.4 writes a bot utterance only when its playback finishes, and
+holds back the candidate audio while bot audio is pending. A leg that ends
+mid-utterance therefore lost that utterance and everything after it (live
+session 9f60523d: leg 1 lost its last ~7 s, including Q1). The default factory
+now returns :class:`_FlushingRecorderIO`, which writes the PLAYED part of the
+pending utterance plus the held-back candidate audio before the recorder's end
+sentinels. The cut-off is the leg end (the SIP participant leaving), not the
+session close, so bot audio the candidate never heard is not written. Kill
+switch: ``PHONE_RECORDING_TAIL_FLUSH=off`` restores the plain RecorderIO.
 
 The taps are wired immediately AFTER ``session.start()`` (which is when RoomIO
 attaches the live ``session.input.audio`` / ``session.output.audio`` the taps must
@@ -39,7 +50,9 @@ The downstream finalizer/download/integrity pipeline expects an **MP3** at the
 attempt-scoped object key. RecorderIO emits OGG/Opus, so :meth:`finish`
 transcodes OGG→MP3 once at call end (off the hot path) and PUTs the MP3 to the
 presigned URL the API minted. It returns a manifest (sha256, size, duration_ms)
-for the API to persist and finalize.
+for the API to persist and finalize. Since M013 S02 the manifest also carries
+the leg timing (recording anchor, leg end, whether the tail was flushed), and
+``duration_ms`` is the true audio length rather than a wall-clock span.
 """
 
 from __future__ import annotations
@@ -140,18 +153,81 @@ class RecordingManifest:
     is advisory to the worker's own logging — the server sniffs the object's
     real container bytes at finalize time — but carrying it here keeps the
     worker's report honest and lets a caller tell the two apart without a
-    re-download."""
+    re-download.
+
+    M013 S02 (T02) — truthful timing, reported as data only:
+      * ``duration_ms`` is the TRUE audio length (samples encoded / rate, or the
+        OGG container's own length on the fallback), never a wall-clock span.
+        ``None`` when unknown or not positive: the API schema is
+        ``.int().positive()``, so a 0 would 400 the completion.
+      * ``recording_started_at_ms`` — epoch ms of the file's t = 0, never
+        earlier than the moment :meth:`InWorkerRecorder.begin` ran.
+      * ``leg_ended_at_ms`` — epoch ms of the earliest leg-end mark.
+      * ``leg_end_source`` — which mark that was: ``sip_left`` (the SIP
+        participant actually left: an OBSERVED end), ``session_close`` (an
+        upper bound, possibly seconds late) or ``finish`` (the last-resort
+        teardown time). The API stamps ``observed_ended_at`` only for
+        ``sip_left``; the other two are teardown times, not observations.
+      * ``tail_flushed`` — True only when the tail flush actually ran and the
+        recorder closed cleanly (the flush is fail-open, so the API must not
+        infer it)."""
 
     sha256: str
     size_bytes: int
     duration_ms: Optional[int]
     content_type: str = "audio/mpeg"
+    recording_started_at_ms: Optional[int] = None
+    leg_ended_at_ms: Optional[int] = None
+    tail_flushed: Optional[bool] = None
+    leg_end_source: Optional[str] = None
+
+    def timing_kwargs(self) -> dict[str, Any]:
+        """The keyword arguments :func:`recording_api.complete_recording`
+        takes for the leg timing (``None`` values are omitted from the body
+        there, so an unknown value is simply not sent)."""
+        return {
+            "recording_started_at_ms": self.recording_started_at_ms,
+            "leg_ended_at_ms": self.leg_ended_at_ms,
+            "leg_end_source": self.leg_end_source if self.leg_ended_at_ms is not None else None,
+            "tail_flushed": self.tail_flushed,
+        }
+
+
+def manifest_timing_kwargs(manifest: Any) -> dict[str, Any]:
+    """``manifest.timing_kwargs()`` when the manifest has it, else ``{}``.
+
+    The agent's completion call sites use this so a manifest that is not a
+    :class:`RecordingManifest` (a test double, or an older shape) still posts
+    the legacy body instead of raising inside the teardown. Never raises."""
+    try:
+        fn = getattr(manifest, "timing_kwargs", None)
+        if callable(fn):
+            out = fn()
+            if isinstance(out, dict):
+                return out
+    except Exception:  # noqa: BLE001 — the completion itself matters more
+        pass
+    return {}
+
+
+def _positive_ms(value: Any) -> Optional[int]:
+    """An int > 0, else ``None`` (bools and non-numbers are ``None``)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        ms = int(round(value))
+    except (OverflowError, ValueError):
+        return None
+    return ms if ms > 0 else None
 
 
 # Injected seams (real defaults below) so the lifecycle is unit-testable with no
 # livekit/PyAV/ffmpeg/network present.
 RecorderFactory = Callable[[Any, int], Any]
-TranscodeFn = Callable[[Path, Path], Awaitable[None]]
+# (ogg_path, mp3_path) -> the ENCODED audio length in ms (samples fed to the
+# MP3 encoder / its rate), or None when the transcoder cannot tell. A value
+# that is not a positive int is treated as unknown (M013 S02 T02).
+TranscodeFn = Callable[[Path, Path], Awaitable[Optional[int]]]
 # (upload_url, body, content_type) — content_type is "audio/mpeg" for the normal
 # MP3 and "audio/ogg" for the v114 raw-OGG fallback, so the PUT declares the
 # real Content-Type of whichever body survived.
@@ -160,14 +236,214 @@ UploadFn = Callable[[str, bytes, str], Awaitable[None]]
 
 def _default_recorder_factory(session: Any, sample_rate: int) -> Any:
     """Construct the real RecorderIO. Imported lazily so this module (and its
-    unit tests) load without livekit-agents installed."""
+    unit tests) load without livekit-agents installed.
+
+    M013 S02: returns the tail-flushing subclass unless the kill switch
+    ``PHONE_RECORDING_TAIL_FLUSH=off`` is set. Building the subclass is itself
+    fail-open: any failure falls back to the plain RecorderIO."""
     from livekit.agents.voice.recorder_io import RecorderIO  # noqa: PLC0415
 
-    return RecorderIO(agent_session=session, sample_rate=sample_rate)
+    if not tail_flush_enabled():
+        logger.info("in_worker_recording_tail_flush_disabled")
+        return RecorderIO(agent_session=session, sample_rate=sample_rate)
+    try:
+        cls = _real_flushing_recorder_cls()
+    except Exception as exc:  # noqa: BLE001 — fail-open to the plain recorder
+        logger.warning(
+            "in_worker_recording_tail_flush_skipped category=%s",
+            f"build_{type(exc).__name__}",
+        )
+        return RecorderIO(agent_session=session, sample_rate=sample_rate)
+    return cls(agent_session=session, sample_rate=sample_rate)
 
 
-async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
+# ── TAIL FLUSH (M013 S02-1) ──────────────────────────────────────────────────
+# The SDK version the flush was verified against (recorder_io.py internals:
+# `_in_record`, `_out_record`, `_in_q`/`_out_q`, `_write_cb`, the name-mangled
+# `__acc_frames` lists and `_split_frame`). Another version still TRIES the
+# flush — it is fail-open — but logs a warning so a silent drift is visible.
+_TAIL_FLUSH_SDK_VERSION = "1.6.4"
+
+
+def tail_flush_enabled() -> bool:
+    """Kill switch. Default ON; ``PHONE_RECORDING_TAIL_FLUSH=off`` (or
+    false/0/no/disabled) returns the plain RecorderIO, byte-identical to the
+    pre-S02 behaviour."""
+    raw = (os.getenv("PHONE_RECORDING_TAIL_FLUSH") or "").strip().lower()
+    return raw not in ("off", "false", "0", "no", "disabled")
+
+
+_FLUSHING_CLS_CACHE: dict[Any, type] = {}
+
+
+def _real_flushing_recorder_cls() -> type:
+    from livekit.agents.voice.recorder_io import recorder_io as _rio  # noqa: PLC0415
+
+    try:
+        from livekit.agents import __version__ as sdk_version  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        sdk_version = "unknown"
+    if sdk_version != _TAIL_FLUSH_SDK_VERSION:
+        logger.warning(
+            "in_worker_recording_tail_flush_sdk_unverified version=%s verified=%s",
+            sdk_version, _TAIL_FLUSH_SDK_VERSION,
+        )
+    return build_flushing_recorder_cls(_rio.RecorderIO, _rio._split_frame)
+
+
+def build_flushing_recorder_cls(base: type, split_frame: Callable[[Any, float], Any]) -> type:
+    """Return ``_FlushingRecorderIO``, a subclass of ``base`` (the SDK's
+    RecorderIO in production; a structural fake in the bare-python tests).
+
+    ``split_frame(frame, position) -> (head, tail)`` is the SDK's
+    ``_split_frame``. Cached per base class."""
+    key = (base, split_frame)
+    cached = _FLUSHING_CLS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    class _FlushingRecorderIO(base):  # type: ignore[misc, valid-type]
+        """RecorderIO that writes the recording TAIL on close.
+
+        WHY: RecorderIO 1.6.4 writes a bot utterance only from
+        ``on_playback_finished`` and, while bot audio is pending, also holds
+        back the candidate audio its ``_forward_task`` would otherwise flush
+        every 2.5 s. Closed mid-utterance, the stock recorder drops that
+        utterance AND the held-back candidate audio.
+
+        ``flush_tail(until)`` (synchronous, loop thread) writes, before the
+        end sentinels ``aclose`` enqueues:
+          * pending bot audio: only the PLAYED part, i.e.
+            ``min(sum(frame.duration), until - _last_speech_start_time)``
+            (clamped at 0), split with the SDK ``_split_frame`` and passed to
+            ``_write_cb``, which also takes the held-back input buffer — so
+            both channels land in ONE FIFO pair and stay aligned. A position
+            that clamps to 0 (the utterance began after the leg end) writes
+            ``_write_cb([])`` so the input is still flushed. The output
+            accumulator is then cleared, so a later ``on_playback_finished``
+            writes nothing twice. The AudioOutput base ``on_playback_finished``
+            (segment counting) is NEVER called here.
+          * no pending bot audio: the input-only write ``_forward_task``
+            would have made.
+        Pause intervals (``__pause_wall_times``) are IGNORED by the flush;
+        acceptable for a tail of at most one utterance.
+
+        ``mark_leg_end(ts)`` (earliest wins) records the cut-off and CLOSES
+        capture: ``recording`` reads False from then on, so neither tap
+        accumulates audio after the leg ended and an ``on_playback_finished``
+        fired by the session's own close (its ``interrupt``) cannot write bot
+        audio the candidate never heard. ``reopen_capture()`` undoes a mark
+        when the SIP participant is seen again (a spurious departure).
+
+        Fail-open: any exception skips the flush (logged
+        ``in_worker_recording_tail_flush_skipped``) and the normal close
+        proceeds, so the recording is still written and uploaded."""
+
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            self._s02_leg_end: Optional[float] = None
+            self._s02_capture_closed = False
+            self._s02_skip_flush = False
+            self.tail_flushed = False
+            self.tail_flush_result: Optional[dict] = None
+
+        @property
+        def recording(self) -> bool:  # type: ignore[override]
+            return bool(self._started) and not self._s02_capture_closed
+
+        @property
+        def leg_end(self) -> Optional[float]:
+            return self._s02_leg_end
+
+        def mark_leg_end(self, ts: float) -> None:
+            if self._s02_leg_end is None or ts < self._s02_leg_end:
+                self._s02_leg_end = ts
+            self._s02_capture_closed = True
+
+        def reopen_capture(self) -> None:
+            self._s02_leg_end = None
+            self._s02_capture_closed = False
+
+        def skip_tail_flush(self) -> None:
+            """The wrong-number discard path: the audio is about to be
+            deleted, so spend no encode time on it."""
+            self._s02_skip_flush = True
+
+        def flush_tail(self, until: Optional[float] = None) -> dict:
+            """Write the played part of any pending bot utterance plus the
+            held-back candidate audio. Returns ``{out_ms, in_ms}`` (counts
+            only). A no-op when begin never ran or the flush is skipped."""
+            if not self._started or self._s02_skip_flush:
+                return {"out_ms": 0, "in_ms": 0}
+            out = self._out_record
+            inp = self._in_record
+            if out is None or inp is None:
+                return {"out_ms": 0, "in_ms": 0}
+            cut = until if until is not None else time.time()
+            pending = list(out._RecorderAudioOutput__acc_frames)
+            held_in = getattr(inp, "_RecorderAudioInput__acc_frames", None) or []
+            in_ms = int(round(sum(f.duration for f in held_in) * 1000))
+            if not pending:
+                # Mirror `_forward_task`: input only, paired with an empty
+                # output chunk so the two FIFOs stay in lock-step.
+                input_buf = inp.take_buf(pad_since=out._last_speech_end_time)
+                self._in_q.put_nowait(input_buf)
+                self._out_q.put_nowait([])
+                return {"out_ms": 0, "in_ms": in_ms}
+
+            total = sum(f.duration for f in pending)
+            started = out._last_speech_start_time
+            played = total if started is None else min(total, cut - started)
+            played = max(0.0, played)
+            buf: list[Any] = []
+            acc = 0.0
+            if played > 0.0:
+                for frame in pending:
+                    if acc + frame.duration > played:
+                        head, _tail = split_frame(frame, played - acc)
+                        if head.duration > 0.0:
+                            buf.append(head)
+                            acc += head.duration
+                        break
+                    buf.append(frame)
+                    acc += frame.duration
+            # `_write_cb` takes the held-back INPUT buffer too (padded from the
+            # last speech end, exactly as the SDK's own playback write does).
+            self._write_cb(buf)
+            out._RecorderAudioOutput__acc_frames = []
+            out._last_speech_end_time = cut
+            out._last_speech_start_time = None
+            return {"out_ms": int(round(acc * 1000)), "in_ms": in_ms}
+
+        async def aclose(self) -> None:
+            if self._started and not self._s02_skip_flush:
+                try:
+                    result = self.flush_tail(self._s02_leg_end)
+                    self.tail_flushed = True
+                    self.tail_flush_result = result
+                    logger.info(
+                        "in_worker_recording_tail_flush out_ms=%d in_ms=%d",
+                        result["out_ms"], result["in_ms"],
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail-open by contract
+                    logger.warning(
+                        "in_worker_recording_tail_flush_skipped category=%s",
+                        type(exc).__name__,
+                    )
+            await super().aclose()
+
+    _FLUSHING_CLS_CACHE[key] = _FlushingRecorderIO
+    return _FlushingRecorderIO
+
+
+async def _default_transcode(ogg_path: Path, mp3_path: Path) -> Optional[int]:
     """One-shot OGG→MP3 transcode, off the hot path, IN-PROCESS via PyAV.
+
+    Returns the ENCODED audio length in ms: every sample handed to the MP3
+    encoder (the FIFO chunks plus the final short frame) divided by the output
+    rate. That is the true length of the recording (M013 S02 T02 — the old
+    wall-clock "duration" counted from the recorder's start to the upload).
+    ``None`` when nothing was counted.
 
     Deliberately NOT an ``ffmpeg`` subprocess: the worker image is
     ``python:3.12-slim`` with no ffmpeg BINARY, so shelling out silently failed
@@ -208,7 +484,7 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
          that preserves the raw bytes), but a normal desynced call now yields a
          complete MP3 with zero skipped frames.
     """
-    def _run() -> None:
+    def _run() -> Optional[int]:
         import av  # noqa: PLC0415
         from av.audio.fifo import AudioFifo  # noqa: PLC0415
         from av.audio.resampler import AudioResampler  # noqa: PLC0415
@@ -218,6 +494,10 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
         decoded_frames = 0
         encoded_frames = 0
         skipped_frames = 0
+        # M013 S02 T02: samples actually handed to the MP3 encoder — the
+        # recording's TRUE length once divided by the output rate.
+        encoded_samples = 0
+        out_rate = _SAMPLE_RATE
         try:
             in_stream = in_container.streams.audio[0]
             out_rate = in_stream.rate or _SAMPLE_RATE
@@ -275,6 +555,7 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
                 # dropped), THEN encode the final short remainder as the one
                 # legitimately-undersized last frame. `fifo.read` returns None
                 # when fewer than the requested samples remain.
+                nonlocal encoded_samples
                 while fifo.samples >= frame_size:
                     chunk = fifo.read(frame_size)
                     if chunk is None:
@@ -282,6 +563,7 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
                     chunk.pts = None
                     for packet in out_stream.encode(chunk):
                         out_container.mux(packet)
+                    encoded_samples += chunk.samples
                 if final:
                     # The true last frame: everything still buffered (< frame_size).
                     tail = fifo.read()
@@ -289,6 +571,7 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
                         tail.pts = None
                         for packet in out_stream.encode(tail):
                             out_container.mux(packet)
+                        encoded_samples += tail.samples
 
             for frame in in_container.decode(in_stream):
                 decoded_frames += 1
@@ -380,8 +663,46 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
                     _TRANSCODE_MAX_SKIPPED_FRACTION,
                 )
                 raise RuntimeError("transcode_truncated_below_floor")
+        if encoded_samples <= 0 or not out_rate:
+            return None
+        return _positive_ms(encoded_samples * 1000.0 / out_rate)
 
-    await asyncio.to_thread(_run)
+    return await asyncio.to_thread(_run)
+
+
+def _ogg_duration_ms(ogg_path: Optional[Path]) -> Optional[int]:
+    """The OGG container's own audio length in ms, read with PyAV by demuxing
+    packets (no decode, so it is cheap even for a long call). Used for the
+    raw-OGG manifests, where no MP3 encode counted the samples.
+
+    Sums the packet durations (the Opus demuxer gives each packet its real
+    duration, and the end trim lives in the last packet's duration); falls
+    back to the container's own duration when the packets carry none.
+    ``None`` when PyAV is absent, the file is unreadable or the length is not
+    positive. Never raises."""
+    if ogg_path is None:
+        return None
+    try:
+        import av  # noqa: PLC0415
+
+        container = av.open(str(ogg_path))
+        try:
+            stream = container.streams.audio[0]
+            time_base = stream.time_base
+            total = 0
+            for packet in container.demux(stream):
+                if packet.duration:
+                    total += int(packet.duration)
+            if total > 0 and time_base is not None:
+                return _positive_ms(float(total * time_base) * 1000.0)
+            if container.duration:
+                # Container duration is in AV_TIME_BASE (microseconds).
+                return _positive_ms(container.duration / 1000.0)
+            return None
+        finally:
+            container.close()
+    except Exception:  # noqa: BLE001 — a missing duration is acceptable
+        return None
 
 
 async def _default_upload(
@@ -460,6 +781,9 @@ class _CountingAudioInput:
     async def __anext__(self) -> Any:
         frame = await self.__inner.__anext__()
         self.__counter.input += 1
+        # M013 S02: wall clock of the latest input frame — logged next to the
+        # leg end as a cross-check only (a time, never audio).
+        self.__counter.last_input_at = time.time()
         return frame
 
     def __getattr__(self, name: str) -> Any:
@@ -490,11 +814,12 @@ class _FrameCounter:
     """A tiny mutable counter shared by the two proxies. Booleans/ints only —
     never touches audio bytes."""
 
-    __slots__ = ("input", "output")
+    __slots__ = ("input", "output", "last_input_at")
 
     def __init__(self) -> None:
         self.input = 0
         self.output = 0
+        self.last_input_at: Optional[float] = None
 
 
 class InWorkerRecorder:
@@ -509,6 +834,8 @@ class InWorkerRecorder:
         recorder_factory: RecorderFactory = _default_recorder_factory,
         transcode_fn: TranscodeFn = _default_transcode,
         upload_fn: UploadFn = _default_upload,
+        room: Any = None,
+        sip_identity: Optional[str] = None,
     ) -> None:
         self._session = session
         # object_key + upload_url arrive from the API /recording/prepare call at
@@ -537,10 +864,26 @@ class InWorkerRecorder:
         self._counter = _FrameCounter()
         self._wired_at_ms: Optional[int] = None
         self._begun_at_ms: Optional[int] = None
+        # M013 S02 T02: epoch seconds stamped just BEFORE the recorder's
+        # start() — the floor for the reported recording anchor.
+        self._begin_called_at: Optional[float] = None
         # FIX 4: the call.answered wall-clock (epoch ms), passed to begin() so the
         # recording START offset vs answer (the observed ~28s head-gap) is logged
         # once at recorder start. None → the offset line is skipped.
         self._answered_epoch_ms: Optional[int] = None
+
+        # M013 S02: the LEG END — the cut-off for the tail flush. Earliest
+        # mark wins. Sources, in priority order: this recorder's OWN
+        # `participant_disconnected` listener for exactly this attempt's SIP
+        # identity (the hang-up), the session `close` event (an upper bound —
+        # the SDK emits it at the END of `_aclose_impl`, seconds late), and
+        # finally `finish()` stamping its own time before the close.
+        self._room: Any = room
+        self._sip_identity: Optional[str] = sip_identity
+        self._leg_end_ts: Optional[float] = None
+        self._leg_end_source: Optional[str] = None
+        self._room_listeners: list[tuple[str, Callable[..., None]]] = []
+        self._session_listeners: list[tuple[str, Callable[..., None]]] = []
 
     @property
     def active(self) -> bool:
@@ -569,6 +912,175 @@ class InWorkerRecorder:
     def output_frames(self) -> int:
         """Total OUTPUT (worker TTS → candidate) frames the tap has seen. FIX 4."""
         return self._counter.output
+
+    # ── M013 S02: leg end + tail flush ───────────────────────────────────────
+    @property
+    def leg_ended_at(self) -> Optional[float]:
+        """Epoch seconds of the earliest leg-end mark, else ``None``."""
+        return self._leg_end_ts
+
+    @property
+    def leg_end_source(self) -> Optional[str]:
+        """``sip_left`` | ``session_close`` | ``finish`` (the earliest mark)."""
+        return self._leg_end_source
+
+    @property
+    def leg_ended_at_ms(self) -> Optional[int]:
+        """:attr:`leg_ended_at` as epoch ms, else ``None``."""
+        ts = self._leg_end_ts
+        if ts is None:
+            return None
+        try:
+            return _positive_ms(ts * 1000.0)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @property
+    def recording_started_at_ms(self) -> Optional[int]:
+        """Epoch ms of the recording file's t = 0, or ``None`` before begin.
+
+        The SDK's ``RecorderIO.recording_started_at`` is the earliest of the
+        two taps' ``started_wall_time``, but the OUTPUT tap stamps its start on
+        the first ``capture_frame`` EVEN WHEN NOT RECORDING (1.6.4
+        ``recorder_io.py:547-548``) — so a bot frame spoken before
+        :meth:`begin` would pull the anchor before the file's t = 0. Only tap
+        starts at or after the moment begin() started the recorder count; the
+        earliest of those is the anchor, and begin's own stamp is the floor
+        (equivalently ``max(recording_started_at, begun_at)`` when the SDK
+        exposes only the combined value, as the test doubles do). Never
+        raises."""
+        floor = self._begin_called_at
+        if floor is None:
+            return None
+        try:
+            rec = self._recorder
+            starts: list[float] = []
+            for tap_name in ("_in_record", "_out_record"):
+                tap = getattr(rec, tap_name, None)
+                t = getattr(tap, "started_wall_time", None) if tap is not None else None
+                if isinstance(t, (int, float)) and not isinstance(t, bool):
+                    starts.append(float(t))
+            if starts:
+                valid = [t for t in starts if t >= floor]
+                anchor = min(valid) if valid else floor
+            else:
+                sdk = getattr(rec, "recording_started_at", None)
+                if isinstance(sdk, (int, float)) and not isinstance(sdk, bool):
+                    anchor = max(float(sdk), floor)
+                else:
+                    anchor = floor
+            return _positive_ms(anchor * 1000.0)
+        except Exception:  # noqa: BLE001
+            return _positive_ms(floor * 1000.0)
+
+    @property
+    def tail_flushed(self) -> bool:
+        """True only when the recorder's tail flush actually ran successfully
+        (the flush is fail-open, so this is reported, never inferred)."""
+        return getattr(self._recorder, "tail_flushed", False) is True
+
+    def watch_leg_end(self, room: Any, sip_identity: Optional[str]) -> None:
+        """Attach the room and this attempt's SIP identity after construction
+        (the agent call site; equivalent to the constructor kwargs). The
+        listener is registered once wired. Never raises."""
+        try:
+            if room is not None:
+                self._room = room
+            if sip_identity:
+                self._sip_identity = sip_identity
+            if self._wired:
+                self._register_leg_listeners()
+        except Exception:  # noqa: BLE001 — recording is strictly secondary
+            pass
+
+    def mark_leg_end(self, ts: float, *, source: str) -> None:
+        """Record the leg end (earliest wins) and forward it to the recorder,
+        which closes capture and uses it as the tail-flush cut-off. Never
+        raises."""
+        try:
+            if self._leg_end_ts is None or ts < self._leg_end_ts:
+                self._leg_end_ts = ts
+                self._leg_end_source = source
+            mark = getattr(self._recorder, "mark_leg_end", None)
+            if callable(mark):
+                mark(self._leg_end_ts)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_room_participant_disconnected(self, participant: Any = None, *_: Any) -> None:
+        # Our OWN listener (S01's `_on_phone_participant_disconnected` is
+        # untouched). Exactly this attempt's SIP identity; anyone else leaving
+        # the room is ignored. Never raises into the room's emitter.
+        try:
+            if self._sip_identity and getattr(participant, "identity", None) == self._sip_identity:
+                self.mark_leg_end(time.time(), source="sip_left")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_room_participant_connected(self, participant: Any = None, *_: Any) -> None:
+        # A departure followed by the SAME identity re-appearing was not a
+        # leg end (e.g. a room-level resync): reopen capture. A later real
+        # departure, the session close or finish() marks the end again.
+        try:
+            if (
+                self._sip_identity
+                and getattr(participant, "identity", None) == self._sip_identity
+                and self._leg_end_source == "sip_left"
+            ):
+                self._leg_end_ts = None
+                self._leg_end_source = None
+                reopen = getattr(self._recorder, "reopen_capture", None)
+                if callable(reopen):
+                    reopen()
+                logger.info("in_worker_recording_leg_end_reopened")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_session_close(self, *_: Any) -> None:
+        # Upper bound only: `close` is emitted at the END of the SDK's
+        # `_aclose_impl`, after interrupt/drain/transcript commit.
+        try:
+            self.mark_leg_end(time.time(), source="session_close")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _register_leg_listeners(self) -> None:
+        """Idempotent; fail-open. Room listeners only when a SIP identity is
+        known, so a listener can never match an unrelated participant."""
+        if not self._room_listeners and self._room is not None and self._sip_identity:
+            on = getattr(self._room, "on", None)
+            if callable(on):
+                for event, handler in (
+                    ("participant_disconnected", self._on_room_participant_disconnected),
+                    ("participant_connected", self._on_room_participant_connected),
+                ):
+                    try:
+                        on(event, handler)
+                        self._room_listeners.append((event, handler))
+                    except Exception:  # noqa: BLE001
+                        pass
+        if not self._session_listeners:
+            on = getattr(self._session, "on", None)
+            if callable(on):
+                try:
+                    on("close", self._on_session_close)
+                    self._session_listeners.append(("close", self._on_session_close))
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _unregister_leg_listeners(self) -> None:
+        for target, listeners in (
+            (self._room, self._room_listeners),
+            (self._session, self._session_listeners),
+        ):
+            off = getattr(target, "off", None)
+            for event, handler in listeners:
+                try:
+                    if callable(off):
+                        off(event, handler)
+                except Exception:  # noqa: BLE001
+                    pass
+            listeners.clear()
 
     def wire(self) -> bool:
         """Install the input/output taps around the session's LIVE audio I/O.
@@ -623,6 +1135,7 @@ class InWorkerRecorder:
                 bool(getattr(self._recorder, "recording", False)),
                 self._wired_at_ms,
             )
+            self._register_leg_listeners()
             return True
         except Exception:  # noqa: BLE001 — fail-open by contract
             logger.warning("in_worker_recording_wire_failed", exc_info=True)
@@ -649,10 +1162,16 @@ class InWorkerRecorder:
         if self._begun:
             return True
         try:
+            # M013 S02: the room may have been attached after wire().
+            self._register_leg_listeners()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
             self._object_key = object_key
             base = self._work_dir or Path(tempfile.gettempdir()) / "inworker-recordings"
             base.mkdir(parents=True, exist_ok=True)
             self._ogg_path = base / (Path(object_key).name + ".ogg")
+            self._begin_called_at = time.time()
             await self._recorder.start(output_path=self._ogg_path)
             self._begun = True
             self._begun_at_ms = int(time.time() * 1000)
@@ -760,9 +1279,34 @@ class InWorkerRecorder:
         the API minted, and return the manifest. Returns None (fail-open) if
         recording never began or any step fails — the call is already over, so
         nothing here can harm the screening."""
+        self._unregister_leg_listeners()
         if not self._begun or self._failed or self._recorder is None or self._ogg_path is None:
             return None
-        recording_at_close = bool(getattr(self._recorder, "recording", False))
+        # The STARTED flag: after a leg-end mark the tail-flushing recorder's
+        # `recording` reads False by design (capture closed), which is not the
+        # zero-capture signal this diagnostic exists for.
+        recording_at_close = bool(
+            getattr(self._recorder, "_started", None)
+            if isinstance(getattr(self._recorder, "_started", None), bool)
+            else getattr(self._recorder, "recording", False)
+        )
+        # M013 S02: last-resort leg end (earliest mark wins, so a SIP-leave or
+        # session-close mark already recorded is kept), then a content-free
+        # line pairing it with the last input frame's wall clock.
+        self.mark_leg_end(time.time(), source="finish")
+        try:
+            last_in = self._counter.last_input_at
+            logger.info(
+                "in_worker_recording_leg_end source=%s leg_end_ms=%d "
+                "last_input_frame_ms=%s begun_at_ms=%s",
+                self._leg_end_source,
+                int((self._leg_end_ts or 0) * 1000),
+                int(last_in * 1000) if last_in is not None else -1,
+                self._begun_at_ms if self._begun_at_ms is not None else -1,
+                extra={"object_key": self._object_key},
+            )
+        except Exception:  # noqa: BLE001
+            pass
         close_completed = True
         try:
             close_task = asyncio.create_task(self._recorder.aclose())
@@ -828,6 +1372,8 @@ class InWorkerRecorder:
         mp3_path = self._ogg_path.with_suffix(".mp3")
         body: Optional[bytes] = None
         content_type = "audio/ogg"
+        # M013 S02 T02: the true audio length in ms (None until known).
+        encoded_ms: Optional[int] = None
         try:
             # ── NO-AUDIO GUARD (RCA 2026-09-04, STEP 4): the OGG is MISSING or
             # EMPTY. This is the ACTUAL live failure on every phone call — zero
@@ -889,12 +1435,11 @@ class InWorkerRecorder:
                 # retain the raw evidence, but do not run transcode or invent a
                 # duration for bytes that may still be missing tail packets.
                 self._cleanup()
-                sha256 = hashlib.sha256(body).hexdigest()
-                return RecordingManifest(
-                    sha256=sha256,
-                    size_bytes=len(body),
-                    duration_ms=None,
-                    content_type=content_type,
+                # No duration, and the tail is NOT reported flushed: the
+                # encoder never acknowledged the close, so tail packets may be
+                # missing from the file whatever the flush did.
+                return self._build_manifest(
+                    body, content_type, None, close_completed=False,
                 )
 
             # ── BEST-EFFORT MP3 UPGRADE ─────────────────────────────────────
@@ -912,7 +1457,9 @@ class InWorkerRecorder:
             # realistically lands on the OGG PUT await above (the first slow
             # network await), not here; either way the OGG is already durable.
             try:
-                await self._transcode_fn(self._ogg_path, mp3_path)
+                encoded_ms = _positive_ms(
+                    await self._transcode_fn(self._ogg_path, mp3_path),
+                )
                 mp3_body = mp3_path.read_bytes()
                 if not mp3_body:
                     raise RuntimeError("empty_mp3")
@@ -945,6 +1492,12 @@ class InWorkerRecorder:
                     extra={"object_key": self._object_key},
                     exc_info=True,
                 )
+            # M013 S02 T02: the TRUE audio length. The MP3 encode counted its
+            # samples; otherwise (raw-OGG manifest, or a transcoder that could
+            # not tell) read the OGG container's own length. Off the loop: a
+            # long call's OGG has tens of thousands of packets.
+            if encoded_ms is None:
+                encoded_ms = await asyncio.to_thread(_ogg_duration_ms, self._ogg_path)
         except asyncio.CancelledError:
             # Cancellation propagated from the upgrade block AFTER the durable
             # OGG PUT succeeded (body/content_type are the OGG). Build the OGG
@@ -953,17 +1506,15 @@ class InWorkerRecorder:
             # and falls through to the fail-open None return below via the outer
             # structure — but that PUT is the first slow await, so in practice
             # the OGG is durable well before any transcode-window cancel.)
-            self._cleanup()
             if body is None:
+                self._cleanup()
                 raise
-            sha256 = hashlib.sha256(body).hexdigest()
-            duration_ms = self._probe_duration_ms()
-            return RecordingManifest(
-                sha256=sha256,
-                size_bytes=len(body),
-                duration_ms=duration_ms,
-                content_type=content_type,
-            )
+            # Read the OGG's length BEFORE the cleanup deletes it (a rare
+            # shutdown path, so the short synchronous demux is acceptable).
+            if encoded_ms is None:
+                encoded_ms = _ogg_duration_ms(self._ogg_path)
+            self._cleanup()
+            return self._build_manifest(body, content_type, encoded_ms)
         except Exception:  # noqa: BLE001 — fail-open, the call is already over
             logger.warning(
                 "in_worker_recording_finish_failed %s",
@@ -988,20 +1539,22 @@ class InWorkerRecorder:
 
         self._cleanup()
         assert body is not None
-        sha256 = hashlib.sha256(body).hexdigest()
-        duration_ms = self._probe_duration_ms()
-        return RecordingManifest(
-            sha256=sha256,
-            size_bytes=len(body),
-            duration_ms=duration_ms,
-            content_type=content_type,
-        )
+        return self._build_manifest(body, content_type, encoded_ms)
 
     async def discard(self) -> None:
         """Wrong-number/identity-mismatch privacy path: stop recording and
         delete the local file without uploading. Other gate exits retain audio
         under the recorded-from-answer policy. Fail-open and idempotent."""
+        self._unregister_leg_listeners()
         if self._recorder is not None and self._begun and not self._failed:
+            # M013 S02: the audio is about to be deleted — skip the tail flush
+            # so a discarded call spends no encode time on it.
+            try:
+                skip = getattr(self._recorder, "skip_tail_flush", None)
+                if callable(skip):
+                    skip()
+            except Exception:  # noqa: BLE001
+                pass
             try:
                 close_task = asyncio.create_task(self._recorder.aclose())
                 done, pending = await asyncio.wait(
@@ -1022,18 +1575,29 @@ class InWorkerRecorder:
         self._cleanup()
         logger.info("in_worker_recording_discarded", extra={"object_key": self._object_key})
 
-    def _probe_duration_ms(self) -> Optional[int]:
-        """Best-effort duration from the recorder's started-at anchor. Never
-        raises — a missing duration is acceptable to the finalizer."""
-        try:
-            started = getattr(self._recorder, "recording_started_at", None)
-            if started is None:
-                return None
-            import time  # noqa: PLC0415
-
-            return max(0, int((time.time() - started) * 1000))
-        except Exception:  # noqa: BLE001
-            return None
+    def _build_manifest(
+        self,
+        body: bytes,
+        content_type: str,
+        duration_ms: Optional[int],
+        *,
+        close_completed: bool = True,
+    ) -> RecordingManifest:
+        """The manifest for whichever body landed, with the M013 S02 timing
+        (data only: the API stamps it on the attempt, it never drives a state
+        transition). ``duration_ms`` is the TRUE audio length or ``None`` —
+        never 0 and never a wall-clock span (the old ``_probe_duration_ms``
+        measured recorder start → upload)."""
+        return RecordingManifest(
+            sha256=hashlib.sha256(body).hexdigest(),
+            size_bytes=len(body),
+            duration_ms=_positive_ms(duration_ms),
+            content_type=content_type,
+            recording_started_at_ms=self.recording_started_at_ms,
+            leg_ended_at_ms=self.leg_ended_at_ms,
+            tail_flushed=bool(close_completed and self.tail_flushed),
+            leg_end_source=self.leg_end_source,
+        )
 
     def _cleanup(self) -> None:
         for p in (self._ogg_path, self._ogg_path.with_suffix(".mp3") if self._ogg_path else None):

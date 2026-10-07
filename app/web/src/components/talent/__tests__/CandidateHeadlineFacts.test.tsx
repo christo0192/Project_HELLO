@@ -85,4 +85,31 @@ describe('CandidateHeadlineFacts', () => {
     const { container } = render(<CandidateHeadlineFacts />);
     expect(container.firstChild).toBeNull();
   });
+
+  // M013 S02: a phone session's length is what was RECORDED across its calls.
+  it('shows the recorded total across calls, and no call length when it is not passed', () => {
+    render(<CandidateHeadlineFacts recordedSeconds={70.8} recordedCalls={2} candidateWords={4} />);
+    expect(document.querySelector('[data-candidate-recorded-length]')?.textContent).toBe('Recorded 1m 11s across 2 calls');
+    expect(document.querySelector('[data-candidate-call-length]')).toBeNull();
+  });
+
+  it('a total that leaves out a call of unknown length reads "at least", and names that call', () => {
+    render(<CandidateHeadlineFacts recordedSeconds={17.6} recordedCalls={1} recordedUnknownCalls={1} />);
+    expect(document.querySelector('[data-candidate-recorded-length]')?.textContent)
+      .toBe('Recorded at least 18s + 1 call of unknown length');
+  });
+
+  it('says nothing about calls for a single recorded call, and shows both figures when both are known', () => {
+    render(<CandidateHeadlineFacts recordedSeconds={32.7} recordedCalls={1} callSeconds={34.6} />);
+    expect(document.querySelector('[data-candidate-recorded-length]')?.textContent).toBe('Recorded 33s');
+    expect(document.querySelector('[data-candidate-call-length]')?.textContent).toBe('35s on the call');
+  });
+
+  it('shows NO recorded figure for zero, negative or non-finite seconds', () => {
+    for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      const { unmount } = render(<CandidateHeadlineFacts recordedSeconds={value} recordedCalls={2} />);
+      expect(document.querySelector('[data-candidate-recorded-length]'), String(value)).toBeNull();
+      unmount();
+    }
+  });
 });

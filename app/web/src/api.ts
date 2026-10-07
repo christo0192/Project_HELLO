@@ -421,10 +421,24 @@ export const api = {
     request<RecordingDownloadResponse>(`/api/recordings/${sessionId}/download`),
   getAttemptRecordingDownloadUrl: (attemptId: string) =>
     request<RecordingDownloadResponse>(`/api/recordings/attempts/${attemptId}/download`),
-  getCandidatePhoneAttempts: (candidateId: string, before?: string) =>
-    request<CandidatePhoneAttemptsResponse>(
-      `/api/candidates/${candidateId}/phone-attempts${before ? `?before=${encodeURIComponent(before)}` : ''}`,
-    ),
+  /**
+   * `opts.sessionId` (M013 S02): only that session's legs (bound by consent
+   * or by recording evidence), OLDEST first, as the Review tab lists them.
+   */
+  getCandidatePhoneAttempts: (
+    candidateId: string,
+    before?: string,
+    opts?: { sessionId?: string; limit?: number },
+  ) => {
+    const query = new URLSearchParams();
+    if (opts?.limit != null) query.set('limit', String(opts.limit));
+    if (before) query.set('before', before);
+    if (opts?.sessionId) query.set('session_id', opts.sessionId);
+    const qs = query.toString();
+    return request<CandidatePhoneAttemptsResponse>(
+      `/api/candidates/${candidateId}/phone-attempts${qs ? `?${qs}` : ''}`,
+    );
+  },
 
   // ── Consent routes (GOV-03/GOV-08/GOV-09/GOV-10) ─────────────────
 

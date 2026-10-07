@@ -1459,7 +1459,7 @@ describe('OpenAPI document integrity', () => {
       recording: { state: 'ready' },
       transcript: null,
     };
-    for (const stage of ['before_consent', 'after_consent', null]) {
+    for (const stage of ['before_consent', 'after_consent', 'consent_withdrawn', 'deferred_after_consent', null]) {
       expect(validateNamed({ ...base, consent_stage: stage }, 'CandidatePhoneAttempt', spec)).toEqual([]);
     }
     expect(validateNamed({ ...base, consent_stage: 'maybe' }, 'CandidatePhoneAttempt', spec).length)
@@ -1472,6 +1472,70 @@ describe('OpenAPI document integrity', () => {
     // The list never carries a signed URL or a storage key.
     expect(validateNamed({ state: 'ready', url: 'https://x.invalid/a' }, 'CandidatePhoneAttemptRecording', spec).length)
       .toBeGreaterThan(0);
+  });
+
+  it('CandidatePhoneAttempt documents the M013 S02 per-leg facts and CallSession the header facts', () => {
+    const attempt = {
+      id: '00000000-0000-4000-8000-000000000111',
+      attempt_seq: 9,
+      admitted_at: '2026-10-06T03:34:30.000Z',
+      answered_at: '2026-10-06T03:34:49.612Z',
+      ended_at: '2026-10-06T03:40:57.456Z',
+      state: 'abandoned',
+      abandon_reason: null,
+      outcome_class: null,
+      duration_sec: null,
+      connected_from: '2026-10-06T03:34:49.612Z',
+      connected_to: '2026-10-06T03:40:57.456Z',
+      connected_to_source: 'unobserved',
+      connected_sec: null,
+      recorded_sec: 17.6,
+      recorded_sec_estimated: true,
+      recording_started_at_ms: null,
+      tail_may_be_missing: true,
+      session_ref: '00000000-0000-4000-8000-000000000103',
+      recording: { state: 'ready' },
+      consent_stage: 'consent_withdrawn',
+      transcript: null,
+    };
+    expect(validateNamed(attempt, 'CandidatePhoneAttempt', spec)).toEqual([]);
+    for (const source of ['observed', 'ledger', 'unobserved', null]) {
+      expect(validateNamed({ ...attempt, connected_to_source: source }, 'CandidatePhoneAttempt', spec)).toEqual([]);
+    }
+    // `reclaimed` is the research's word; the contract's is `unobserved`.
+    expect(validateNamed({ ...attempt, connected_to_source: 'reclaimed' }, 'CandidatePhoneAttempt', spec).length)
+      .toBeGreaterThan(0);
+    // additionalProperties: false still holds — no storage/provider field.
+    expect(validateNamed({ ...attempt, egress_id: 'EG_worker_x' }, 'CandidatePhoneAttempt', spec).length)
+      .toBeGreaterThan(0);
+
+    const session = {
+      id: '00000000-0000-4000-8000-000000000103',
+      candidate_id: '00000000-0000-4000-8000-000000000101',
+      role_id: null,
+      mode: 'live',
+      provider: 'livekit',
+      status: 'completed',
+      started_at: '2026-10-06T03:30:00.000Z',
+      duration_sec: 75,
+      duration_unobserved_legs: 1,
+      recorded_total_sec: 70.8,
+      recorded_legs: 2,
+      connected_complete: false,
+      connected_total_sec: null,
+      connected_unobserved_legs: 1,
+      connected_detected_legs: 1,
+      connected_open_legs: 0,
+    };
+    expect(validateNamed(session, 'CallSession', spec)).toEqual([]);
+    expect(validateNamed({ ...session, connected_complete: 'no' }, 'CallSession', spec).length).toBeGreaterThan(0);
+    expect(validateNamed({ ...session, connected_open_legs: '1' }, 'CallSession', spec).length).toBeGreaterThan(0);
+    expect(validateNamed({ ...session, recorded_legs: '2' }, 'CallSession', spec).length).toBeGreaterThan(0);
+
+    // The session filter on the history route is documented.
+    const params = (((spec.paths as YMap)['/api/candidates/{id}/phone-attempts'] as YMap).parameters as YMap[])
+      .map((p) => p.name);
+    expect(params).toContain('session_id');
   });
 
   it('documents every route the app registers and nothing else', () => {
@@ -1999,6 +2063,33 @@ describe('live handler shapes match documented schemas', () => {
     const res = await request(app).get(`/api/screening/${UUID_1}`).set('Authorization', AUTH_HEADER);
     expect(res.status).toBe(200);
     expect(validateResponseBody(res.body, 'ScreeningSessionDetail', spec)).toEqual([]);
+  });
+
+  it('GET /api/screening/{id} carries each turn\'s own start (M013 S02 T08a), validated', async () => {
+    // A worker in-band phone session: no session egress anchor, so every
+    // start_offset_sec is null, but the turns still carry their own start
+    // so the Review tab can place them on a leg's recording.
+    configureTables({
+      call_sessions: ok({ ...mockSessionRow, recording_egress_started_at_ms: null }),
+      transcript_turns: ok([
+        { speaker: 'bot', text: 'Hello.', turn_started_at_ms: 1700000005000, is_gate: true },
+        { speaker: 'candidate', text: 'Hi.', turn_started_at_ms: '1700000007250', is_gate: false },
+        { speaker: 'bot', text: 'Legacy row.', turn_started_at_ms: null, is_gate: false },
+        { speaker: 'bot', text: 'Bad row.', turn_started_at_ms: 1.5, is_gate: false },
+      ]),
+      assessments: ok(mockAssessmentRecord),
+    });
+    const app = createContractApp();
+    const res = await request(app).get(`/api/screening/${UUID_1}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'ScreeningSessionDetail', spec)).toEqual([]);
+    expect(res.body.transcript.map((t: { started_at_ms: unknown }) => t.started_at_ms)).toEqual([
+      1700000005000,
+      1700000007250,
+      null,
+      null,
+    ]);
+    expect(res.body.transcript.every((t: { start_offset_sec: unknown }) => t.start_offset_sec === null)).toBe(true);
   });
 
   it('POST /api/assess/{sessionId} → Assessment (injected runner)', async () => {

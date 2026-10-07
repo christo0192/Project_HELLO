@@ -249,6 +249,38 @@ describe('CandidatesPage phone status', () => {
     );
   });
 
+  it('M013 S02: names a dropped-before-screening cycle, never "Screening", with its own filter', async () => {
+    mockApi.listCandidates.mockResolvedValue([
+      ...CANDIDATES,
+      {
+        ...mockCandidate,
+        id: 'c-dropped',
+        name: 'Dropped Dora',
+        // The 0125 relabel leaves the stored status `screening`, never `queued`.
+        status: 'screening',
+        dial_count: 2,
+        phone_state: 'failed',
+        phone_state_reason: 'screening_abandoned',
+      },
+    ]);
+    renderPage();
+    await screen.findByText('Dropped Dora');
+    const row = rowFor('Dropped Dora');
+    expect(
+      within(row).getByText('Abandoned: dropped before screening', { selector: 'span[title^="Status:"]' }),
+    ).toBeInTheDocument();
+    expect(within(row).queryByText(/^Screening/)).toBeNull();
+    expect(within(row).queryByText('Screening in progress')).toBeNull();
+    expect(within(row).queryByText(/Phone screen failed/)).toBeNull();
+    const group = statusGroup();
+    expect(group.querySelector('[data-segment-value="screening_abandoned"]')?.textContent).toBe('1');
+    // Dora is not counted as Screening: nobody else here is either.
+    expect(group.querySelector('[data-segment-value="screening"]')?.textContent).toBe('0');
+    fireEvent.click(within(group).getByRole('button', { name: /^Abandoned: dropped before screening/ }));
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('?status=screening_abandoned'));
+    expect(rowNames()).toEqual(['Dropped Dora']);
+  });
+
   it('has no axe violations with phone outcomes', async () => {
     const { container } = renderPage();
     await screen.findByText('Abandoned Abe');

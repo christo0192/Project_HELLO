@@ -144,10 +144,11 @@ const STATUS_BAR_TONE: Record<string, PipelineTone> = {
   rejected: "negative",
   consent_declined: "negative",
   // The phone-cycle outcomes, in CANDIDATE_STATUS_ORDER order. Five tones
-  // cannot be injective over twelve keys, so the most this can promise is
+  // cannot be injective over thirteen keys, so the most this can promise is
   // that neighbours in that order differ; the legend text names each one.
   abandoned_no_answer: "caution",
   phone_failed: "negative",
+  screening_abandoned: "caution",
   wrong_number: "neutral",
   opted_out: "accent",
   phone_cancelled: "neutral",
@@ -779,9 +780,9 @@ export function CandidatesPage() {
             onToggle={toggleStatus}
             selectedKeys={filters.statuses}
             // "Abandoned: no answer" is always offered: it is the phone
-            // outcome recruiters asked to find. The other four phone outcomes
+            // outcome recruiters asked to find. The other five phone outcomes
             // appear only when some loaded candidate has one (or a deep link
-            // selected it) — four permanently-zero toggles would be noise.
+            // selected it) — five permanently-zero toggles would be noise.
             // A hidden key has a zero count, so the bar still partitions the
             // whole loaded set.
             segments={CANDIDATE_STATUS_ORDER.filter(

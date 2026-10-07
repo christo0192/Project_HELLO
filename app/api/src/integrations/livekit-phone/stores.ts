@@ -26,6 +26,7 @@ interface AttemptRow {
   engagement_id?: unknown;
   epoch?: unknown;
   room_name?: unknown;
+  session_id?: unknown;
   state?: unknown;
   phone_engagements?: { state?: unknown } | Array<{ state?: unknown }> | null;
 }
@@ -53,6 +54,7 @@ function toDueAttempt(row: AttemptRow): DuePhoneAttempt | null {
     engagementId,
     epoch,
     roomName: typeof row.room_name === 'string' && row.room_name.length > 0 ? row.room_name : null,
+    sessionId: typeof row.session_id === 'string' && row.session_id.length > 0 ? row.session_id : null,
     attemptState,
     engagementState,
   };
@@ -67,7 +69,9 @@ export function createDuePhoneAttemptReader(client: SupabaseClient): DuePhoneAtt
     async listDueAttempts({ admittedBefore, admittedAfter, leaseHeldAt, limit }) {
       const { data, error } = await client
         .from('phone_call_attempts')
-        .select('id, engagement_id, epoch, room_name, state, phone_engagements!inner(state)')
+        // `session_id` (M013 S02): a bound reconnect leg with no `room_name`
+        // is checked in its session's room (see `reconcileRoomName`).
+        .select('id, engagement_id, epoch, room_name, session_id, state, phone_engagements!inner(state)')
         .in('state', [...PHONE_LIVE_ATTEMPT_STATES])
         .lte('admitted_at', admittedBefore.toISOString())
         .gte('admitted_at', admittedAfter.toISOString())

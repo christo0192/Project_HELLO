@@ -68,22 +68,27 @@ function section(n: number): string {
 }
 
 describe('0114 registration', () => {
-  it('is the FIRST (newest) entry of PHONE_MIGRATIONS, ahead of 0113 and 0112', () => {
+  it('is the newest PHONE_MIGRATIONS entry after 0125 (M013 S02), ahead of 0113 and 0112', () => {
+    // 0125 lifts finalize and the engagement transition trigger FROM 0114,
+    // so it sits first; 0114 stays directly behind it.
     const names = PHONE_MIGRATIONS.map((m) => m.name);
-    expect(names[0]).toBe('0114');
+    expect(names[0]).toBe('0125');
+    expect(names[1]).toBe('0114');
     expect(names.indexOf('0114')).toBeLessThan(names.indexOf('0113'));
     expect(names.indexOf('0113')).toBeLessThan(names.indexOf('0112'));
     expect(names.filter((n) => n === '0114')).toHaveLength(1);
   });
 
-  it('points at 0114_phone_outcome_integrity.sql and is the newest phone migration file', () => {
+  it('points at 0114_phone_outcome_integrity.sql; only R1 migrations and the phone recording-integrity one follow it', () => {
     expect(path.basename(MIGRATION_0114_PATH)).toBe('0114_phone_outcome_integrity.sql');
     const files = readdirSync(MIGRATIONS).filter((f) => /^\d{4}_.*\.sql$/.test(f)).sort();
     expect(files.filter((f) => f.startsWith('0114_'))).toEqual(['0114_phone_outcome_integrity.sql']);
-    // Same relaxation #329 applied to 0113. 0114 stays the newest PHONE migration,
-    // and only R1-lane migrations (0115+, `_r1_` in the name) may follow it.
+    // Same relaxation #329 applied to 0113. After 0114 only R1-lane migrations
+    // (`_r1_` in the name) and the M013 S02 phone recording-integrity migration
+    // may follow, and the phone recording-integrity one is the newest file.
     const after = files.slice(files.indexOf('0114_phone_outcome_integrity.sql') + 1);
-    expect(after.every((f) => /_r1_/.test(f))).toBe(true);
+    expect(after.every((f) => /_r1_|_phone_recording_integrity\.sql$/.test(f))).toBe(true);
+    expect(files[files.length - 1]).toMatch(/_phone_recording_integrity\.sql$/);
   });
 });
 

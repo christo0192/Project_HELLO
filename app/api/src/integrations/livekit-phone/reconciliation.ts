@@ -152,11 +152,54 @@ export function reconcileProviderEventId(
   return `recon:${attemptId}:${eventType}:${epoch}`;
 }
 
+/**
+ * M013 S02 (T04): the room a due attempt's leg lives in.
+ *
+ * The attempt's own `room_name` wins. A RECONNECT leg was historically
+ * admitted with `room_name` NULL although it joins the session's room
+ * (9f60523d leg 2: answered, dropped, and invisible to this sweep, so the
+ * lease reclaim ended it ~6 minutes later with no outcome). 0125 now stamps
+ * `room_name` whenever `session_id` is bound; this fallback covers a row the
+ * stamp has not reached. It applies ONLY to a BOUND attempt: an unbound
+ * attempt never reached a session room and stays `no_room`.
+ *
+ * The name mirrors `phoneRoomName` (livekit-phone-dial/phone-room.ts), which
+ * is not imported: that module pulls room provisioning — and with it a static
+ * LiveKit SDK import plus the env and Supabase client — into this module's
+ * graph, which the P3 structural suite forbids. A test pins the two equal.
+ */
+export function reconcileRoomName(
+  attempt: Pick<DuePhoneAttempt, 'roomName' | 'sessionId'>,
+): string | null {
+  if (attempt.roomName !== null && attempt.roomName.length > 0) return attempt.roomName;
+  const sessionId = attempt.sessionId;
+  if (typeof sessionId === 'string' && sessionId.length > 0) return `phone-${sessionId}`;
+  return null;
+}
+
+/**
+ * True iff LiveKit's rejection says the ROOM does not exist: a Twirp
+ * `not_found`, an HTTP 404, or the server's literal "requested room does not
+ * exist". Mirrors `isRoomNotFound` in livekit-phone-dial/dial.ts (not
+ * imported, for the module-graph reason above); a test pins them equal.
+ */
+export function isReconcileRoomNotFound(err: unknown): boolean {
+  if (err === null || typeof err !== 'object') return false;
+  const e = err as { code?: unknown; status?: unknown; statusCode?: unknown; message?: unknown };
+  if (typeof e.code === 'string' && e.code.toLowerCase() === 'not_found') return true;
+  if (e.status === 404 || e.statusCode === 404) return true;
+  return typeof e.message === 'string' && /requested room does not exist/i.test(e.message);
+}
+
 export type PhoneReconcileSkip =
   | 'no_room'
   | 'participant_present'
   | 'state_not_recoverable'
-  | 'room_read_failed';
+  | 'room_read_failed'
+  // M013 S02: a PRE-ANSWER leg whose room LiveKit does not know. The room
+  // may simply not exist yet (provisioning races the ring), so a missing
+  // room is no evidence the call ended — say nothing.
+  | 'room_not_found_pre_answer';
 
 export interface PhoneReconcileResult {
   readonly status: 'disabled' | 'ok';
@@ -232,18 +275,31 @@ export async function runPhoneReconciliation(
       skip('state_not_recoverable');
       continue;
     }
-    if (attempt.roomName === null || attempt.roomName.length === 0) {
+    const roomName = reconcileRoomName(attempt);
+    if (roomName === null) {
       skip('no_room');
       continue;
     }
 
     let participants: ReadonlyArray<{ identity: string }>;
     try {
-      participants = await deps.rooms.listParticipants(attempt.roomName);
-    } catch {
-      // Unknown is not absent. Say nothing rather than manufacture an ending.
-      skip('room_read_failed');
-      continue;
+      participants = await deps.rooms.listParticipants(roomName);
+    } catch (err) {
+      if (!isReconcileRoomNotFound(err)) {
+        // Unknown is not absent. Say nothing rather than manufacture an ending.
+        skip('room_read_failed');
+        continue;
+      }
+      // M013 S02: the room is GONE. For an ANSWERED leg that is proof the leg
+      // ended (LiveKit deletes an emptied room after its empty timeout), so it
+      // is treated exactly like "our participant is not in the room". For a
+      // pre-answer leg it proves nothing — the room may not exist yet — so the
+      // sweep stays silent rather than post a false `sip.originate_timeout`.
+      if (eventType !== 'sip.participant_left') {
+        skip('room_not_found_pre_answer');
+        continue;
+      }
+      participants = [];
     }
 
     const stillPresent = participants.some((p) => p.identity === `phone-${attempt.attemptId}`);

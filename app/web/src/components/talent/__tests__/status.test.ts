@@ -232,12 +232,18 @@ describe('engagementReasonLabel', () => {
       'window_closed', 'assessment_aborted', 'wrong_number', 'disclosure_refused',
       'candidate_opt_out', 'hr_cancelled', 'emergency_stop', 'ashby_stage_left', 'prereq_lost',
       'abandoned_pre_disclosure', 'consent_gate_failed', 'callback_deferred_in_call',
-      'callback_deferral_limit', 'late_score_after_stranded_abort',
+      'callback_deferral_limit', 'late_score_after_stranded_abort', 'screening_abandoned',
     ]) {
       const label = engagementReasonLabel(reason);
       expect(label, reason).not.toMatch(/_/);
       expect(label.charAt(0), reason).toBe(label.charAt(0).toUpperCase());
     }
+  });
+
+  it('names the 0125 zero-answer relabel neutrally (never Queued, never Screened)', () => {
+    const label = engagementReasonLabel('screening_abandoned');
+    expect(label).toBe('Abandoned: dropped before screening');
+    expect(label).not.toMatch(/queued|screened/i);
   });
 
   it('keeps the late completion apart from the abort it replaced', () => {
@@ -447,6 +453,93 @@ describe('candidateDisplayStatus (stored status + phone progress)', () => {
     ).toEqual([
       { label: 'Queued', value: 2 },
       { label: 'Abandoned: no answer', value: 1 },
+    ]);
+  });
+});
+
+/*
+ * M013 S02 (0125, D1): a cycle that ended before the candidate answered any
+ * planned question is relabelled `failed/screening_abandoned`, and its
+ * candidate is left `screening` (never `queued`). Without its own display key
+ * the badge would read "Screening" for a cycle that is over.
+ */
+describe('candidateDisplayStatus: failed/screening_abandoned', () => {
+  const abandoned = {
+    dial_count: 2,
+    phone_state: 'failed' as const,
+    phone_state_reason: 'screening_abandoned',
+  };
+
+  it('shows "Abandoned: dropped before screening" for a stored screening or queued candidate', () => {
+    for (const status of ['screening', 'queued']) {
+      const ds = candidateDisplayStatus({ status, ...abandoned });
+      expect(ds.key, status).toBe('screening_abandoned');
+      expect(ds.label, status).toBe('Abandoned: dropped before screening');
+      expect(ds.tone, status).toBe('danger');
+      // Never the stored words, never a dial suffix on a terminal key.
+      expect(ds.label, status).not.toMatch(/Queued|Screening\b|dialed/);
+      expect(candidateStatusKey({ status, ...abandoned }), status).toBe('screening_abandoned');
+    }
+  });
+
+  it('keeps "Phone screen failed" for every other failure reason, and for no reason', () => {
+    for (const reason of ['assessment_aborted', 'reconnect_budget_exhausted', 'consent_gate_failed', null, undefined, '']) {
+      const ds = candidateDisplayStatus({ status: 'queued', phone_state: 'failed', phone_state_reason: reason });
+      expect(ds.key, String(reason)).toBe('phone_failed');
+      expect(ds.label, String(reason)).toBe('Phone screen failed');
+    }
+    // The reason only splits `failed`: another terminal state is unchanged.
+    expect(
+      candidateDisplayStatus({ status: 'queued', phone_state: 'cancelled', phone_state_reason: 'screening_abandoned' }).key,
+    ).toBe('phone_cancelled');
+    // A prototype key is not a reason.
+    expect(
+      candidateDisplayStatus({ status: 'queued', phone_state: 'failed', phone_state_reason: 'constructor' }).key,
+    ).toBe('phone_failed');
+  });
+
+  it('never overrides a decided stored status (the relabel moves screened -> screening first)', () => {
+    expect(candidateDisplayStatus({ status: 'screened', ...abandoned }).key).toBe('screened');
+    expect(candidateDisplayStatus({ status: 'advanced', ...abandoned }).label).toBe('Advanced');
+  });
+
+  it('does not repeat the badge in the detail line, and says the evidence reason when known', () => {
+    const plain = candidateDisplayStatus({ status: 'screening', ...abandoned });
+    expect(plain.detail).not.toContain('Abandoned');
+    expect(plain.detail).toContain('Phone reached 2 times');
+
+    const silent = candidateDisplayStatus({ status: 'screening', ...abandoned, evidence_reason: 'no_candidate_speech' });
+    expect(silent.detail).toMatch(/^No screening question was answered · Phone reached 2 times/);
+    expect(silent.title).toContain('No screening question was answered');
+
+    const ours = candidateDisplayStatus({ status: 'screening', ...abandoned, evidence_reason: 'infra_interrupted' });
+    expect(ours.detail).toContain('The call was cut off on our side before screening began');
+
+    // The evidence reason is read for this key only.
+    expect(
+      candidateDisplayStatus({
+        status: 'queued', phone_state: 'abandoned_no_answer', phone_state_reason: 'no_answer_budget_exhausted',
+        evidence_reason: 'no_candidate_speech',
+      }).detail,
+    ).not.toContain('No screening question');
+    // An unknown evidence reason adds nothing rather than a raw code.
+    expect(
+      candidateDisplayStatus({ status: 'screening', ...abandoned, evidence_reason: 'partial_thin' }).detail,
+    ).not.toMatch(/partial|_/);
+  });
+
+  it('counts it under its own label, in plain words', () => {
+    expect(candidateStatusLabel('screening_abandoned')).toBe('Abandoned: dropped before screening');
+    expect(candidateStatusTone('screening_abandoned')).toBe('danger');
+    expect(
+      candidateStatusCounts([
+        { status: 'screening', ...abandoned },
+        { status: 'queued', ...abandoned },
+        { status: 'queued', phone_state: 'failed', phone_state_reason: 'assessment_aborted' },
+      ]),
+    ).toEqual([
+      { label: 'Abandoned: dropped before screening', value: 2 },
+      { label: 'Phone screen failed', value: 1 },
     ]);
   });
 });

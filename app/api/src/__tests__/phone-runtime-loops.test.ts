@@ -1982,6 +1982,43 @@ describe('the day-roll and stranded sweeps run, and the claim gates them', () =>
     }
   });
 
+  it('0125 §5c: the relabel-failure warn fires once per change of count, not on every tick', async () => {
+    // The heal pass retries a failing relabel on every pass, so a permanent
+    // failure is re-counted every 2 minutes; warn only when the count moves.
+    const counts = [1, 1, 1, 2, 0, 1, 1];
+    let i = 0;
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        sweepStrandedSessions: async () => {
+          const n = counts[Math.min(i, counts.length - 1)];
+          i += 1;
+          return {
+            status: 'ok' as const, examined: 0, completed: 0, failed: 0, skipped: 0,
+            lateCompleted: 0, lateSuperseded: 0, zeroAnswerRelabelErrors: n,
+          };
+        },
+      }),
+      queue: makeEmptyQueue(c),
+      config: FAST,
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      runtime.scheduler.start();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(i).toBeGreaterThanOrEqual(counts.length);
+      const lines = warn.mock.calls.map((a) => String(a[0]))
+        .filter((l) => l.includes('phone_zero_answer_relabel_failed'));
+      // 1 (first), 2 (changed), then 0 re-arms and 1 warns again: exactly three.
+      expect(lines.map((l) => /relabel_errors\.(\d+)/.exec(l)?.[1])).toEqual(['1', '2', '1']);
+      for (const line of lines) {
+        expect(line).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+      }
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('0114: an older RPC with no late_* keys keeps today\'s count and never warns', async () => {
     const c = counters();
     const runtime = buildRuntime({

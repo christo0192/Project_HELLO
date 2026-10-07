@@ -28,6 +28,16 @@ export interface SeekableTranscriptProps {
   error?: string | null;
   onRetry?: () => void;
   className?: string;
+  /**
+   * M013 S02: the offsets are an ESTIMATE (a legacy leg placed from its
+   * answer time). Each timestamp reads "≈0:12" and "At about 0:12".
+   */
+  approximateTiming?: boolean;
+  /**
+   * M013 S02: the session-wide turn number of each row, when this list is
+   * one leg's slice of the transcript. Defaults to the row position + 1.
+   */
+  turnNumbers?: readonly number[];
 }
 
 const prefersReducedMotion = (): boolean =>
@@ -54,7 +64,11 @@ export function SeekableTranscript({
   error = null,
   onRetry,
   className,
+  approximateTiming = false,
+  turnNumbers,
 }: SeekableTranscriptProps) {
+  const numberOf = (index: number) => turnNumbers?.[index] ?? index + 1;
+  const approx = approximateTiming ? '≈' : '';
   const activeRef = useRef<HTMLButtonElement>(null);
   const [announcement, setAnnouncement] = useState('');
 
@@ -75,9 +89,9 @@ export function SeekableTranscript({
     if (activeTurnIndex != null && transcript[activeTurnIndex]) {
       const t = transcript[activeTurnIndex];
       const presented = presentTranscriptTurn(t.speaker, t.text);
-      setAnnouncement(`Now playing turn ${activeTurnIndex + 1}: ${presented.label}`);
+      setAnnouncement(`Now playing turn ${turnNumbers?.[activeTurnIndex] ?? activeTurnIndex + 1}: ${presented.label}`);
     }
-  }, [activeTurnIndex, transcript]);
+  }, [activeTurnIndex, transcript, turnNumbers]);
 
   const anyTimed = useMemo(() => transcript.some(hasTiming), [transcript]);
   const anyUntimed = useMemo(() => transcript.some((t) => !hasTiming(t)), [transcript]);
@@ -154,7 +168,7 @@ export function SeekableTranscript({
                     ref={active ? activeRef : undefined}
                     onClick={() => onSeek(turn.start_offset_sec!)}
                     aria-current={active ? 'true' : undefined}
-                    aria-label={`Turn ${index + 1}: ${speaker}. At ${formatOffset(turn.start_offset_sec!)}. Click to play from here.`}
+                    aria-label={`Turn ${numberOf(index)}: ${speaker}. At ${approximateTiming ? 'about ' : ''}${formatOffset(turn.start_offset_sec!)}. Click to play from here.`}
                     className={cx(
                       'w-full min-h-[44px] rounded-md px-3 py-2.5 text-left transition-colors duration-150 ease-out',
                       'focus:outline-none focus:ring-2 focus:ring-[var(--c-accent)] focus:ring-inset',
@@ -184,6 +198,7 @@ export function SeekableTranscript({
                             : 'text-[var(--c-ink-secondary)]',
                         )}
                       >
+                        {approx}
                         {formatOffset(turn.start_offset_sec!)}
                       </span>
                     </span>
@@ -199,7 +214,7 @@ export function SeekableTranscript({
               <li key={index}>
                 <div
                   className={cx('min-h-[44px] rounded-md px-3 py-2.5', speakerTint)}
-                  aria-label={`Turn ${index + 1}: ${speaker}. Timing data not available.`}
+                  aria-label={`Turn ${numberOf(index)}: ${speaker}. Timing data not available.`}
                 >
                   <span className="flex items-baseline justify-between gap-2">
                     <span className="text-xs font-medium text-[var(--c-ink-secondary)]">

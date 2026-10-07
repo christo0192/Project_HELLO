@@ -29,6 +29,7 @@ const ATTEMPT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const ENGAGEMENT = '11111111-2222-4333-8444-555555555555';
 const SESSION = '99999999-8888-4777-8666-555555555555';
 const SECRET = 'phone-worker-secret-0123456789abcdefghij';
+const NOW = new Date('2026-10-05T03:36:00.000Z');
 
 let savedSecret: string | undefined;
 beforeEach(() => {
@@ -62,6 +63,8 @@ interface BuildOpts {
     sessionId?: string;
   } | null>) | undefined;
   resolveAttemptRecordingSession?: ((attemptId: string) => Promise<string | null>) | undefined;
+  /** M013 S02 (T04): the leg-timing stamp seam. */
+  stampAttemptLegTiming?: ReturnType<typeof vi.fn>;
 }
 
 function build(opts: BuildOpts = {}) {
@@ -114,6 +117,8 @@ function build(opts: BuildOpts = {}) {
       markRecordingFailed,
       resolveEngagement: opts.resolveEngagement,
       resolveAttemptRecordingSession: opts.resolveAttemptRecordingSession,
+      stampAttemptLegTiming: opts.stampAttemptLegTiming as never,
+      now: () => NOW,
     }),
   );
 
@@ -304,6 +309,173 @@ describe('provider=worker complete — drives the finalizer worker branch', () =
     const res = await authed(h.app, COMPLETE, { ...COMPLETE_BODY, sha256: 'tooshort' });
     expect(res.status).toBe(400);
     expect(h.finalizeRecording).not.toHaveBeenCalled();
+  });
+});
+
+describe('M013 S02 (T04) complete — the leg timing is stamped on the attempt', () => {
+  // Synthetic timings shaped like 9f60523d leg 2 (no real call data).
+  const TIMED_BODY = {
+    ...COMPLETE_BODY,
+    duration_ms: 17_970,
+    recording_started_at_ms: Date.parse('2026-10-05T03:34:50.650Z'),
+    leg_ended_at_ms: Date.parse('2026-10-05T03:35:08.300Z'),
+    leg_end_source: 'sip_left',
+    tail_flushed: true,
+  };
+
+  function stampSpy(order?: string[], result: { status: string; dropped: string[] } = { status: 'stamped', dropped: [] }) {
+    return vi.fn(async (_input: { report: Record<string, unknown> }) => {
+      order?.push('stamp');
+      return result;
+    });
+  }
+
+  it('accepts the T02 body and stamps it BEFORE the finalize, with the report mapped field by field', async () => {
+    const order: string[] = [];
+    const stamp = stampSpy(order);
+    const h = build({ recordingProvider: 'worker', stampAttemptLegTiming: stamp });
+    h.finalizeAttemptRecording.mockImplementation(async () => {
+      order.push('finalize_attempt');
+      return 'ready';
+    });
+    const res = await authed(h.app, COMPLETE, TIMED_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'ready', session_status: 'ready' });
+    expect(order).toEqual(['stamp', 'finalize_attempt']);
+    expect(stamp).toHaveBeenCalledTimes(1);
+    expect(stamp).toHaveBeenCalledWith({
+      attemptId: ATTEMPT,
+      sessionId: SESSION,
+      report: {
+        recordingStartedAtMs: TIMED_BODY.recording_started_at_ms,
+        legEndedAtMs: TIMED_BODY.leg_ended_at_ms,
+        legEndSource: 'sip_left',
+        durationMs: 17_970,
+        tailFlushed: true,
+      },
+      now: NOW,
+    });
+  });
+
+  it('a LEGACY body (no new field) still works and stamps nothing', async () => {
+    const stamp = stampSpy();
+    const h = build({ recordingProvider: 'worker', stampAttemptLegTiming: stamp });
+    const res = await authed(h.app, COMPLETE, COMPLETE_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'ready', session_status: 'ready' });
+    // A legacy worker's duration_ms is a wall-clock span, not the audio length.
+    expect(stamp).not.toHaveBeenCalled();
+  });
+
+  it('tail_flushed=false alone marks a T02 body and is stamped', async () => {
+    const stamp = stampSpy();
+    const h = build({ recordingProvider: 'worker', stampAttemptLegTiming: stamp });
+    await authed(h.app, COMPLETE, { ...COMPLETE_BODY, tail_flushed: false });
+    expect(stamp).toHaveBeenCalledTimes(1);
+    expect(stamp.mock.calls[0][0].report).toEqual({
+      recordingStartedAtMs: null, legEndedAtMs: null, legEndSource: null, durationMs: 60000, tailFlushed: false,
+    });
+  });
+
+  it('nulls for every new field are accepted and stamp nothing', async () => {
+    const stamp = stampSpy();
+    const h = build({ recordingProvider: 'worker', stampAttemptLegTiming: stamp });
+    const res = await authed(h.app, COMPLETE, {
+      ...COMPLETE_BODY, recording_started_at_ms: null, leg_ended_at_ms: null, leg_end_source: null, tail_flushed: null,
+    });
+    expect(res.status).toBe(200);
+    expect(stamp).not.toHaveBeenCalled();
+  });
+
+  for (const status of ['pending', 'fallback_required'] as const) {
+    it(`the timing is still stamped when the attempt finalize returns ${status}`, async () => {
+      const stamp = stampSpy();
+      const h = build({ recordingProvider: 'worker', finalizeAttemptStatus: status, stampAttemptLegTiming: stamp });
+      const res = await authed(h.app, COMPLETE, TIMED_BODY);
+      expect(res.body).toEqual({ ok: false, status });
+      expect(stamp).toHaveBeenCalledTimes(1);
+    });
+  }
+
+  it('the timing is still stamped on the 503 session_recording_pending path', async () => {
+    const stamp = stampSpy();
+    const h = build({
+      recordingProvider: 'worker', finalizeAttemptStatus: 'ready', finalizeStatus: 'pending',
+      stampAttemptLegTiming: stamp,
+    });
+    const res = await authed(h.app, COMPLETE, TIMED_BODY);
+    expect(res.status).toBe(503);
+    expect(res.body.status).toBe('session_recording_pending');
+    expect(stamp).toHaveBeenCalledTimes(1);
+  });
+
+  it('a stamp that THROWS never blocks the completion, and logs only a bounded code', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const stamp = vi.fn(async () => { throw new Error(`boom ${ATTEMPT}`); });
+      const h = build({ recordingProvider: 'worker', stampAttemptLegTiming: stamp });
+      const res = await authed(h.app, COMPLETE, TIMED_BODY);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ ok: true, status: 'ready', session_status: 'ready' });
+      expect(h.finalizeAttemptRecording).toHaveBeenCalledTimes(1);
+      const lines = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('recording_complete_timing'));
+      expect(lines).toHaveLength(1);
+      expect(JSON.parse(lines[0]).error_category).toBe('stamp:error');
+      expect(lines[0]).not.toContain(ATTEMPT);
+      expect(lines[0]).not.toContain(SESSION);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('a dropped value and a non-stamped status are logged as bounded codes, never values', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const out = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      const stamp = stampSpy(undefined, { status: 'attempt_mismatch', dropped: ['leg_ended_at_out_of_window'] });
+      const h = build({ recordingProvider: 'worker', stampAttemptLegTiming: stamp });
+      const res = await authed(h.app, COMPLETE, TIMED_BODY);
+      const info = out.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('recording_complete_timing'));
+      out.mockRestore();
+      expect(res.status).toBe(200);
+      const warned = warn.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('recording_complete_timing'));
+      expect(info.map((l) => JSON.parse(l).error_category)).toEqual(['dropped:leg_ended_at_out_of_window']);
+      expect(warned.map((l) => JSON.parse(l).error_category)).toEqual(['stamp:attempt_mismatch']);
+      for (const line of [...info, ...warned]) {
+        expect(line).not.toContain(String(TIMED_BODY.leg_ended_at_ms));
+        expect(line).not.toContain(ATTEMPT);
+      }
+    } finally {
+      out.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it('keeps the schema strict: a wrong type or an unknown field is a 400 and nothing is stamped', async () => {
+    const stamp = stampSpy();
+    const h = build({ recordingProvider: 'worker', stampAttemptLegTiming: stamp });
+    for (const bad of [
+      { ...TIMED_BODY, tail_flushed: 'yes' },
+      { ...TIMED_BODY, leg_ended_at_ms: 1.5 },
+      { ...TIMED_BODY, recording_started_at_ms: -1 },
+      { ...TIMED_BODY, leg_ended_at_ms: 4_102_444_800_000 },
+      { ...TIMED_BODY, leg_end_source: 'observed' },
+      { ...TIMED_BODY, leg_end_source: 1 },
+    ]) {
+      const res = await authed(h.app, COMPLETE, bad);
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({ ok: false, status: 'invalid_request' });
+    }
+    expect(stamp).not.toHaveBeenCalled();
+    expect(h.finalizeAttemptRecording).not.toHaveBeenCalled();
+  });
+
+  it('on the egress provider the route 404s and stamps nothing', async () => {
+    const stamp = stampSpy();
+    const h = build({ recordingProvider: 'egress', stampAttemptLegTiming: stamp });
+    const res = await authed(h.app, COMPLETE, TIMED_BODY);
+    expect(res.status).toBe(404);
+    expect(stamp).not.toHaveBeenCalled();
   });
 });
 

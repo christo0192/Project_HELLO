@@ -11,6 +11,8 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type { QueueJob } from '../queue/types.js';
 import type { QueueHandler } from '../queue/runner.js';
 import { runAssessment, type RunAssessmentOptions } from '../../services/assessment.js';
+import { SCREENING_ABANDONED_REASON } from '../phone-screening/rpc-contract.js';
+import { PHONE_SYSTEM_ACTOR } from '../phone-screening/stores.js';
 import { PHONE_ASSESSMENT_QUEUE, phoneAssessmentDedupKey } from './config.js';
 
 export { PHONE_ASSESSMENT_QUEUE, phoneAssessmentDedupKey };
@@ -34,6 +36,11 @@ function payloadAttemptId(payload: unknown): string | null {
  * coverage/reason detail. A clean-hangup job (phone-worker.ts) carries none of
  * these, so absence means a COMPLETE screening. Read defensively — a malformed
  * field degrades to the complete-screening shape, never throws.
+ *
+ * `disconnect_reason` is passed through as a free string (any of
+ * `PHONE_DISCONNECT_REASONS`, including 0125's `unobserved_disconnect`): the
+ * grade, not this reader, decides what a token means, so a token newer than
+ * this build is still forwarded rather than dropped.
  */
 interface PhonePartialFields {
   readonly partial: boolean;
@@ -123,6 +130,27 @@ export function createPhoneAssessmentHandler(
       return;
     }
 
+    // 0125 (M013 S02, T06) — ZERO-ANSWER RETRY SAFETY, after both guards and
+    // before ANY score() call. The relabel below runs AFTER the completion
+    // post; if it failed (the job threw), the retry must not score again. So
+    // when this session's latest phone assessment is already a measured
+    // 0-answer row and the engagement is `completed` (or already relabelled),
+    // the only work left is the idempotent relabel: call it and return.
+    // A read error THROWS (bounded queue retry), like the guards above.
+    const prior = await latestPhoneEvidence(options.client, sessionId);
+    if (isZeroAnswer(prior)) {
+      const engagement = await engagementOfAttempt(options.client, attemptId);
+      if (
+        engagement !== null
+        && engagement.sessionId === sessionId
+        && (engagement.state === 'completed'
+          || (engagement.state === 'failed' && engagement.stateReason === SCREENING_ABANDONED_REASON))
+      ) {
+        await relabelZeroAnswer(options.client, engagement.id);
+        return;
+      }
+    }
+
     // A scoring failure must fail the queue claim so the existing bounded retry
     // policy can retry it. No terminal event is posted until scoring succeeds.
     // The interlock is preserved: the assessment ROW is written HERE, before
@@ -175,6 +203,7 @@ export function createPhoneAssessmentHandler(
     if (error) throw new Error('phone_assessment_completion_event_failed');
     const status = (data as { status?: unknown } | null)?.status;
     if (status === 'applied' || status === 'duplicate') {
+      await relabelIfZeroAnswer(options.client, sessionId, attemptId);
       return;
     }
 
@@ -193,10 +222,134 @@ export function createPhoneAssessmentHandler(
     // can recover.
     const scored = await phoneAssessmentExists(options.client, sessionId);
     if (scored) {
+      // The relabel is self-guarding: it answers not_eligible unless the
+      // engagement is `completed`, so a completion that did not apply simply
+      // leaves nothing to relabel.
+      await relabelIfZeroAnswer(options.client, sessionId, attemptId);
       return;
     }
     throw new Error('phone_assessment_completion_not_applied');
   };
+}
+
+// ── 0125 (M013 S02, T06) — the zero-answer relabel ──────────────────────
+//
+// A phone screening in which the candidate answered NONE of the planned
+// questions — the assessment's MEASURED `evidence_answered = 0` on an
+// `insufficient` grade, never an unmeasured NULL — was not a screening. After
+// the completion post (which keeps the 0044 interlock, the MP3 finalize and
+// the download backstop exactly as before), the engagement is relabelled
+// failed/screening_abandoned by `relabel_zero_answer_phone_engagement` (0125
+// §5b), which also restores a `screened` candidate to `screening`. It never
+// requeues or redials. The RPC re-checks everything under the engagement
+// lock; the checks here only avoid a pointless call.
+//
+// Every read error and an RPC error THROW a bare code: the job retries, and
+// the retry takes the early-return path at the top (no second score). Each of
+// the RPC's three answers (applied | already | not_eligible) is a success.
+
+interface PhoneEvidence {
+  readonly grade: unknown;
+  readonly answered: unknown;
+}
+
+interface EngagementFacts {
+  readonly id: string;
+  readonly state: string | null;
+  readonly stateReason: string | null;
+  readonly sessionId: string | null;
+}
+
+/** A MEASURED zero: `insufficient` with `evidence_answered === 0` (NULL never). */
+function isZeroAnswer(evidence: PhoneEvidence | null): boolean {
+  return evidence !== null && evidence.grade === 'insufficient' && evidence.answered === 0;
+}
+
+/**
+ * The session's LATEST phone assessment's evidence columns (created_at, then
+ * revision — the order the 0125 interlock reads), or null when none exists.
+ * A read error throws.
+ */
+async function latestPhoneEvidence(
+  client: SupabaseClient,
+  sessionId: string,
+): Promise<PhoneEvidence | null> {
+  const { data, error } = await client
+    .from('assessments')
+    .select('evidence_grade, evidence_answered')
+    .eq('session_id', sessionId)
+    .eq('source', 'phone')
+    .order('created_at', { ascending: false })
+    .order('revision', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error) throw new Error('phone_assessment_evidence_read_failed');
+  if (data === null || data === undefined) return null;
+  const row = data as { evidence_grade?: unknown; evidence_answered?: unknown };
+  return { grade: row.evidence_grade, answered: row.evidence_answered };
+}
+
+/**
+ * The engagement behind the job's attempt: its id, state, reason and bound
+ * session. Null when the attempt or engagement row is absent. A read error
+ * throws.
+ */
+async function engagementOfAttempt(
+  client: SupabaseClient,
+  attemptId: string,
+): Promise<EngagementFacts | null> {
+  const attempt = await client
+    .from('phone_call_attempts')
+    .select('engagement_id')
+    .eq('id', attemptId)
+    .maybeSingle();
+  if (attempt.error) throw new Error('phone_assessment_engagement_read_failed');
+  const engagementId = (attempt.data as { engagement_id?: unknown } | null)?.engagement_id;
+  if (typeof engagementId !== 'string' || !UUID_RE.test(engagementId)) return null;
+
+  const engagement = await client
+    .from('phone_engagements')
+    .select('id, state, state_reason, session_id')
+    .eq('id', engagementId)
+    .maybeSingle();
+  if (engagement.error) throw new Error('phone_assessment_engagement_read_failed');
+  const row = engagement.data as {
+    id?: unknown; state?: unknown; state_reason?: unknown; session_id?: unknown;
+  } | null;
+  if (row === null || row === undefined || typeof row.id !== 'string') return null;
+  return {
+    id: row.id,
+    state: typeof row.state === 'string' ? row.state : null,
+    stateReason: typeof row.state_reason === 'string' ? row.state_reason : null,
+    sessionId: typeof row.session_id === 'string' ? row.session_id : null,
+  };
+}
+
+/** Call the relabel RPC as the system actor. Its error throws; every answer is a success. */
+async function relabelZeroAnswer(client: SupabaseClient, engagementId: string): Promise<void> {
+  const { error } = await client.rpc('relabel_zero_answer_phone_engagement', {
+    p_engagement_id: engagementId,
+    p_actor_id: PHONE_SYSTEM_ACTOR,
+    p_now: new Date().toISOString(),
+  });
+  if (error) throw new Error('phone_assessment_relabel_failed');
+}
+
+/**
+ * After the completion post: relabel when this session's latest phone
+ * assessment is a measured 0-answer row and the attempt's engagement is bound
+ * to THIS session (a detached or re-bound engagement belongs to another
+ * session's truth).
+ */
+async function relabelIfZeroAnswer(
+  client: SupabaseClient,
+  sessionId: string,
+  attemptId: string,
+): Promise<void> {
+  if (!isZeroAnswer(await latestPhoneEvidence(client, sessionId))) return;
+  const engagement = await engagementOfAttempt(client, attemptId);
+  if (engagement === null || engagement.sessionId !== sessionId) return;
+  await relabelZeroAnswer(client, engagement.id);
 }
 
 /**

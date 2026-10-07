@@ -59,9 +59,10 @@ const NOW = new Date('2026-10-03T08:30:00.000Z');
 // ── 1. registry ─────────────────────────────────────────────────────────
 
 describe('the migration registry', () => {
-  it('lists 0114 FIRST (newest-first), ahead of 0113 and 0112', () => {
-    expect(PHONE_MIGRATIONS[0].name).toBe('0114');
-    expect(PHONE_MIGRATIONS[0].sql).toBe(MIGRATION_0114);
+  it('lists 0114 newest-first directly after 0125 (M013 S02), ahead of 0113 and 0112', () => {
+    expect(PHONE_MIGRATIONS[0].name).toBe('0125');
+    expect(PHONE_MIGRATIONS[1].name).toBe('0114');
+    expect(PHONE_MIGRATIONS[1].sql).toBe(MIGRATION_0114);
     const names = PHONE_MIGRATIONS.map((m) => m.name);
     expect(names.indexOf('0114')).toBeLessThan(names.indexOf('0113'));
     expect(names.indexOf('0114')).toBeLessThan(names.indexOf('0112'));

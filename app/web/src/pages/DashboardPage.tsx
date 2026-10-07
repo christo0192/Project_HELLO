@@ -83,9 +83,11 @@ import type { PhoneCalendarResponse } from '../types';
  * the completion figure down for people no recruiter can act on, exactly the
  * reason consent refusals were already excluded.
  *
- * `phone_failed` and `phone_cancelled` STAY in the denominator on purpose: a
- * failed cycle (e.g. the interview ended early) or one cancelled by HR is
- * recoverable with a rescreen, so that candidate is still in consideration.
+ * `phone_failed`, `screening_abandoned` and `phone_cancelled` STAY in the
+ * denominator on purpose: a failed cycle (e.g. the interview ended early, or
+ * the call dropped before any question was answered) or one cancelled by HR
+ * is recoverable with a rescreen, so that candidate is still in
+ * consideration. They do leave "In screening": that cycle is over.
  */
 const COMPLETION_EXCLUDED: ReadonlySet<string> = new Set([
   'consent_declined',

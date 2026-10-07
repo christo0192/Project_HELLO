@@ -3,6 +3,7 @@
 import asyncio
 import os
 import unittest
+import unittest.mock
 
 import recording_api as api
 from provider_resilience import BusinessError, ProviderError
@@ -103,6 +104,205 @@ class TestCompleteRecording(unittest.TestCase):
     def test_complete_fail_open_on_error(self):
         post = _poster(raise_exc=ProviderError("x"))
         self.assertFalse(_run(api.complete_recording("a", "s", "d" * 64, 1, 2, post=post)))
+
+
+def _business_400(status):
+    exc = BusinessError(status_code=400)
+    exc.body = {"ok": False, "status": status}
+    return exc
+
+
+class _SeqPoster:
+    """Replies in order; each reply is a payload dict or an exception."""
+
+    def __init__(self, *replies):
+        self.replies = list(replies)
+        self.bodies = []
+
+    async def __call__(self, method, url, headers, json_body):
+        self.bodies.append(dict(json_body))
+        reply = self.replies.pop(0)
+        if isinstance(reply, BaseException):
+            raise reply
+        return _Resp(reply)
+
+
+_TIMING = {
+    "recording_started_at_ms": 1_790_000_000_000,
+    "leg_ended_at_ms": 1_790_000_060_430,
+    "leg_end_source": "sip_left",
+    "tail_flushed": True,
+}
+
+
+class TestCompleteRecordingTiming(unittest.TestCase):
+    """M013 S02 T02: the leg timing rides on /recording/complete as data, and
+    an older API (a rollback) never loses the completion."""
+
+    def setUp(self):
+        os.environ["WORKER_CONTEXT_SECRET"] = "s3cr3t"
+
+    def tearDown(self):
+        os.environ.pop("WORKER_CONTEXT_SECRET", None)
+
+    def test_body_carries_the_new_fields(self):
+        post = _SeqPoster({"ok": True, "status": "ready"})
+        ok = _run(api.complete_recording("att1", "sess1", "a" * 64, 10, 60_400,
+                                         post=post, **_TIMING))
+        self.assertTrue(ok)
+        self.assertEqual(post.bodies, [{
+            "attempt_id": "att1", "session_id": "sess1", "sha256": "a" * 64,
+            "size_bytes": 10, "duration_ms": 60_400, **_TIMING,
+        }])
+
+    def test_none_fields_are_omitted(self):
+        post = _SeqPoster({"ok": True})
+        _run(api.complete_recording("a", "s", "b" * 64, 10, None, post=post,
+                                    recording_started_at_ms=None,
+                                    leg_ended_at_ms=5, tail_flushed=None))
+        self.assertEqual(post.bodies[0], {
+            "attempt_id": "a", "session_id": "s", "sha256": "b" * 64,
+            "size_bytes": 10, "leg_ended_at_ms": 5,
+        })
+
+    def test_tail_flushed_false_is_sent_not_dropped(self):
+        post = _SeqPoster({"ok": True})
+        _run(api.complete_recording("a", "s", "b" * 64, 10, 7, post=post,
+                                    tail_flushed=False))
+        self.assertIs(post.bodies[0]["tail_flushed"], False)
+
+    def test_400_invalid_request_retries_the_legacy_body_exactly_once(self):
+        post = _SeqPoster(_business_400("invalid_request"), {"ok": True, "status": "ready"})
+        ok = _run(api.complete_recording("a", "s", "c" * 64, 10, 7, post=post, **_TIMING))
+        self.assertTrue(ok)
+        self.assertEqual(len(post.bodies), 2)
+        self.assertEqual(post.bodies[0]["tail_flushed"], True)
+        self.assertEqual(post.bodies[1], {
+            "attempt_id": "a", "session_id": "s", "sha256": "c" * 64,
+            "size_bytes": 10, "duration_ms": 7,
+        })
+
+    def test_legacy_retry_is_not_repeated_when_it_also_fails(self):
+        post = _SeqPoster(_business_400("invalid_request"), _business_400("invalid_request"))
+        ok = _run(api.complete_recording("a", "s", "c" * 64, 10, 7, post=post, **_TIMING))
+        self.assertFalse(ok)
+        self.assertEqual(len(post.bodies), 2)
+
+    def test_400_with_another_status_does_not_retry(self):
+        for exc in (_business_400("invalid_body"), _business_400(None),
+                    BusinessError(status_code=400)):
+            post = _SeqPoster(exc, {"ok": True})
+            self.assertFalse(_run(api.complete_recording(
+                "a", "s", "c" * 64, 10, 7, post=post, **_TIMING)))
+            self.assertEqual(len(post.bodies), 1)
+
+    def test_other_4xx_with_the_token_does_not_retry(self):
+        exc = BusinessError(status_code=409)
+        exc.body = {"ok": False, "status": "invalid_request"}
+        post = _SeqPoster(exc, {"ok": True})
+        self.assertFalse(_run(api.complete_recording(
+            "a", "s", "c" * 64, 10, 7, post=post, **_TIMING)))
+        self.assertEqual(len(post.bodies), 1)
+
+    def test_5xx_and_transport_errors_do_not_retry(self):
+        for exc in (ProviderError("protocol"), ProviderError("timeout"), RuntimeError("x")):
+            post = _SeqPoster(exc, {"ok": True})
+            self.assertFalse(_run(api.complete_recording(
+                "a", "s", "c" * 64, 10, 7, post=post, **_TIMING)))
+            self.assertEqual(len(post.bodies), 1)
+
+    def test_legacy_shaped_call_never_retries(self):
+        # No new fields were sent, so the legacy body is identical: no retry.
+        post = _SeqPoster(_business_400("invalid_request"), {"ok": True})
+        self.assertFalse(_run(api.complete_recording("a", "s", "c" * 64, 10, 7, post=post)))
+        self.assertEqual(len(post.bodies), 1)
+
+    def test_logs_carry_categories_only(self):
+        seen = []
+        post = _SeqPoster(_business_400("invalid_request"), ProviderError("protocol"))
+        with unittest.mock.patch.object(api._log, "info",
+                                        lambda *a, **k: seen.append((a, k))):
+            _run(api.complete_recording("att-secret", "sess-secret", "c" * 64, 10, 7,
+                                        post=post, **_TIMING))
+        self.assertEqual([k["error_category"] for _a, k in seen],
+                         ["legacy_body_retry", "api_error"])
+        flat = repr(seen)
+        for value in ("att-secret", "sess-secret", "c" * 64):
+            self.assertNotIn(value, flat)
+
+
+class _HttpResp:
+    def __init__(self, status_code, payload):
+        self.status_code = status_code
+        self._payload = payload
+
+    def json(self):
+        if isinstance(self._payload, Exception):
+            raise self._payload
+        return self._payload
+
+
+class _ScriptedTransport:
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.bodies = []
+
+    async def request(self, method, url, *, json=None, timeout=None, headers=None):
+        self.bodies.append(json)
+        return self.responses.pop(0)
+
+    async def close(self):
+        pass
+
+
+class TestDefaultPostCompatRetry(unittest.TestCase):
+    """The REAL `_default_post` (breaker + status classification) must expose
+    the 400 body so the compat retry can see the route's token."""
+
+    def setUp(self):
+        os.environ["WORKER_CONTEXT_SECRET"] = "s3cr3t"
+        api._RECORDING_BREAKER.reset()
+
+    def tearDown(self):
+        os.environ.pop("WORKER_CONTEXT_SECRET", None)
+        api._RECORDING_BREAKER.reset()
+
+    def test_400_body_is_attached_to_the_business_error(self):
+        t = _ScriptedTransport(_HttpResp(400, {"ok": False, "status": "invalid_request"}))
+        with unittest.mock.patch.object(api, "_get_transport", lambda: t):
+            with self.assertRaises(BusinessError) as ctx:
+                _run(api._default_post("POST", "http://x/complete", {}, {"a": 1}))
+        self.assertEqual(ctx.exception.status_code, 400)
+        self.assertEqual(ctx.exception.body, {"ok": False, "status": "invalid_request"})
+
+    def test_non_json_400_body_is_unknown(self):
+        t = _ScriptedTransport(_HttpResp(400, ValueError("not json")))
+        with unittest.mock.patch.object(api, "_get_transport", lambda: t):
+            with self.assertRaises(BusinessError) as ctx:
+                _run(api._default_post("POST", "http://x/complete", {}, {"a": 1}))
+        self.assertIsNone(ctx.exception.body)
+
+    def test_end_to_end_old_api_gets_the_legacy_body(self):
+        t1 = _ScriptedTransport(_HttpResp(400, {"ok": False, "status": "invalid_request"}))
+        t2 = _ScriptedTransport(_HttpResp(200, {"ok": True, "status": "ready"}))
+        transports = [t1, t2]
+        with unittest.mock.patch.object(api, "_get_transport", lambda: transports.pop(0)):
+            ok = _run(api.complete_recording("a", "s", "e" * 64, 10, 7, **_TIMING))
+        self.assertTrue(ok)
+        self.assertIn("leg_ended_at_ms", t1.bodies[0])
+        self.assertNotIn("leg_ended_at_ms", t2.bodies[0])
+        self.assertNotIn("leg_end_source", t2.bodies[0])
+        self.assertNotIn("recording_started_at_ms", t2.bodies[0])
+        self.assertNotIn("tail_flushed", t2.bodies[0])
+
+    def test_end_to_end_500_is_not_retried(self):
+        t1 = _ScriptedTransport(_HttpResp(500, {"ok": False}))
+        transports = [t1]
+        with unittest.mock.patch.object(api, "_get_transport", lambda: transports.pop(0)):
+            ok = _run(api.complete_recording("a", "s", "e" * 64, 10, 7, **_TIMING))
+        self.assertFalse(ok)
+        self.assertEqual(transports, [])
+        self.assertEqual(len(t1.bodies), 1)
 
 
 class TestFailRecording(unittest.TestCase):

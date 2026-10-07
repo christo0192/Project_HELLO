@@ -51,6 +51,7 @@ import {
   isAppealPending,
 } from "../components/talent/status";
 import { CandidateHeadlineFacts } from "../components/talent/CandidateHeadlineFacts";
+import { headlineCallFacts } from "../components/talent/sessionLegs";
 import { evidenceHoldReason, isEvidenceInsufficient } from "../lib/evidence-hold";
 import {
   DUPLICATE_HOLD_NOTICE,
@@ -264,33 +265,29 @@ export function CandidateDetailPage() {
   const decisionBlocked = candidate.decision_use_blocked_at != null;
   // The list's derivation (stored status + phone progress from GET /:id), so
   // the header, the Overview field and the list row say the same words.
-  const displayStatus = candidateDisplayStatus(candidate);
   // C3: the NEWEST assessment (the API orders by created_at desc) was graded
   // `insufficient` — held from Ashby and from the status, so the phone card
   // recommends a re-screen. Never while an appeal blocks decision use.
   const latestAssessment = assessments[0] ?? null;
   const rescreenRecommended = !decisionBlocked && isEvidenceInsufficient(latestAssessment);
+  // An "Abandoned: dropped before screening" cycle (0125) says WHY in its
+  // detail line: the held assessment's evidence reason, in words.
+  const displayStatus = candidateDisplayStatus({
+    ...candidate,
+    evidence_reason: isEvidenceInsufficient(latestAssessment) ? latestAssessment?.evidence_reason ?? null : null,
+  });
 
   /**
-   * The LONGEST call that RECORDED A DURATION, not the latest — and not
-   * "completed", which is what this line used to say. The reducer below
-   * filters on `duration_sec > 0` and never reads `status`, so a call that
-   * died at the consent gate (a documented production class) can be the
-   * session both this figure and the word count describe. Saying "completed"
-   * claimed a filter that is not there.
-   *
-   * A candidate can have several sessions — a cycle-2 rescreen, a call that
-   * died at the consent gate after nine seconds. Showing the most recent would
-   * report "0m 9s on the call" for someone who actually completed a seven
-   * minute screen; the longest is the one the scorecard was built from.
-   * `null` (never 0) when nothing completed, so the badge is absent rather
-   * than claiming a zero-length call.
+   * The header's call figures, all from ONE session: the LONGEST by what is
+   * known about it, not the latest (a call that died at the consent gate
+   * after nine seconds must not stand for a seven-minute screen). A phone
+   * session reads "Recorded 1m 11s across 2 calls", with "on the call" only
+   * when every leg's end is known; `duration_sec` is never shown for it,
+   * because it leaves out a dropped leg whose end nobody observed and so
+   * contradicts the recordings (M013 S02). `null` when nothing has a known
+   * length, so no badge claims a zero-length call.
    */
-  const longestSession = sessions.reduce<(typeof sessions)[number] | null>((best, session) => {
-    const secs = session.duration_sec;
-    if (typeof secs !== "number" || !Number.isFinite(secs) || secs <= 0) return best;
-    return secs > (best?.duration_sec ?? -1) ? session : best;
-  }, null);
+  const headline = headlineCallFacts(sessions);
 
   /**
    * Something to review: a completed session (its transcript and recording)
@@ -364,10 +361,13 @@ export function CandidateDetailPage() {
             )}
             <CandidateHeadlineFacts
               roleTitle={roleTitle}
-              callSeconds={longestSession?.duration_sec ?? null}
+              callSeconds={headline?.callSeconds ?? null}
+              recordedSeconds={headline?.recordedSeconds ?? null}
+              recordedCalls={headline?.recordedCalls ?? null}
+              recordedUnknownCalls={headline?.recordedUnknownCalls ?? null}
               // From THE SAME session as the length, or the two figures
               // describe different calls while sitting side by side.
-              candidateWords={longestSession?.candidate_words ?? null}
+              candidateWords={headline?.candidateWords ?? null}
             />
           </div>
         }
@@ -415,6 +415,8 @@ export function CandidateDetailPage() {
                   sessions={sessions}
                   assessments={assessments}
                   blocked={decisionBlocked}
+                  // M013 S02: a phone session lists every leg with its own player.
+                  candidateId={candidate.id}
                   // Mounted only while Review is the open tab (and the Overview
                   // copy only while Overview is): one player on the page at a
                   // time, and switching tabs unmounts the <audio>, so nothing

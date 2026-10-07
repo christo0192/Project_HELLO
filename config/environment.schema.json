@@ -219,6 +219,7 @@
         "PHONE_SARVAM_NEGATIVE_FRAMES_COUNT": { "requiredInProduction": false, "secret": false },
         "PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW": { "requiredInProduction": false, "secret": false },
         "PHONE_NOISE_SUPPRESSION": { "requiredInProduction": false, "secret": false },
+        "PHONE_RECORDING_TAIL_FLUSH": { "requiredInProduction": false, "secret": false },
         "PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC": { "requiredInProduction": false, "secret": false },

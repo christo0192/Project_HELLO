@@ -10,11 +10,15 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   PHONE_RECONCILE_BOUNDS,
+  isReconcileRoomNotFound,
   reconcileMinAgeSeconds,
   reconcileProviderEventId,
+  reconcileRoomName,
   recoveredEventType,
   runPhoneReconciliation,
 } from '../integrations/livekit-phone/reconciliation.js';
+import { phoneRoomName } from '../integrations/livekit-phone-dial/phone-room.js';
+import { isRoomNotFound } from '../integrations/livekit-phone-dial/dial.js';
 import { createPhoneIngressHealth } from '../integrations/livekit-phone/ingress.js';
 import { loadLiveKitPhoneConfig } from '../integrations/livekit-phone/config.js';
 import { PHONE_BOUNDS } from '../lib/phone-screening/index.js';
@@ -315,6 +319,122 @@ describe('P3 reconciliation — what it concludes, and when it says nothing', ()
   });
 });
 
+describe('M013 S02 (T04) — reconnect legs are visible, and a missing room is read truthfully', () => {
+  const SESSION = 'cccccccc-3333-4333-8333-333333333333';
+  const notFound = (): Error => Object.assign(new Error('requested room does not exist'), {
+    code: 'not_found', status: 404,
+  });
+
+  it('derives the room as phoneRoomName(session) for a BOUND attempt with no room_name', () => {
+    expect(reconcileRoomName({ roomName: null, sessionId: SESSION })).toBe(phoneRoomName(SESSION));
+    expect(reconcileRoomName({ roomName: '', sessionId: SESSION })).toBe(phoneRoomName(SESSION));
+  });
+
+  it("the attempt's own room_name wins over the derived name", () => {
+    expect(reconcileRoomName({ roomName: 'phone-room-1', sessionId: SESSION })).toBe('phone-room-1');
+  });
+
+  it('an UNBOUND attempt with no room_name has no room', () => {
+    expect(reconcileRoomName({ roomName: null, sessionId: null })).toBeNull();
+    expect(reconcileRoomName({ roomName: null })).toBeNull();
+    expect(reconcileRoomName({ roomName: null, sessionId: '' })).toBeNull();
+  });
+
+  it('replay of 9f60523d leg 2: room_name NULL, session bound, in_call, room gone ⇒ posts sip.participant_left', async () => {
+    const listParticipants = vi.fn().mockRejectedValue(notFound());
+    const d = deps({
+      due: [attempt({ roomName: null, sessionId: SESSION, attemptState: 'human', engagementState: 'in_call' })],
+      listParticipants,
+    });
+    const result = await runPhoneReconciliation(d.deps, { now: NOW });
+    expect(listParticipants).toHaveBeenCalledWith(phoneRoomName(SESSION));
+    expect(result.posted).toBe(1);
+    expect(result.skipped).toEqual({});
+    expect(d.applyEvent).toHaveBeenCalledTimes(1);
+    const posted = d.applyEvent.mock.calls[0][0];
+    expect(posted.eventType).toBe('sip.participant_left');
+    expect(posted.source).toBe('reconciliation');
+    expect(posted.epoch).toBe(5);
+    expect(posted.providerEventId).toBe(reconcileProviderEventId(A1, 'sip.participant_left', 5));
+  });
+
+  it('a bound reconnect leg whose session room still exists but without our SIP leg ⇒ posts', async () => {
+    const d = deps({
+      due: [attempt({ roomName: null, sessionId: SESSION })],
+      participants: [{ identity: 'agent-1' }],
+    });
+    const result = await runPhoneReconciliation(d.deps, { now: NOW });
+    expect(d.listParticipants).toHaveBeenCalledWith(phoneRoomName(SESSION));
+    expect(result.posted).toBe(1);
+  });
+
+  it('a bound reconnect leg still present in the session room ⇒ says nothing', async () => {
+    const d = deps({
+      due: [attempt({ roomName: null, sessionId: SESSION })],
+      participants: [{ identity: `phone-${A1}` }],
+    });
+    const result = await runPhoneReconciliation(d.deps, { now: NOW });
+    expect(result.skipped).toEqual({ participant_present: 1 });
+    expect(d.applyEvent).not.toHaveBeenCalled();
+  });
+
+  it('an ANSWERED dialing leg whose room is gone ⇒ posts sip.participant_left (the ledger decides)', async () => {
+    const d = deps({
+      due: [attempt({ engagementState: 'dialing', attemptState: 'answered_unclassified' })],
+      listParticipants: vi.fn().mockRejectedValue(notFound()),
+    });
+    const result = await runPhoneReconciliation(d.deps, { now: NOW });
+    expect(result.posted).toBe(1);
+    expect(d.applyEvent.mock.calls[0][0].eventType).toBe('sip.participant_left');
+  });
+
+  for (const attemptState of ['admitted', 'ringing']) {
+    it(`a PRE-ANSWER (${attemptState}) leg whose room is not found posts NOTHING (room_not_found_pre_answer)`, async () => {
+      const d = deps({
+        due: [attempt({ engagementState: 'dialing', attemptState, roomName: null, sessionId: SESSION })],
+        listParticipants: vi.fn().mockRejectedValue(notFound()),
+      });
+      const result = await runPhoneReconciliation(d.deps, { now: NOW });
+      expect(result.posted).toBe(0);
+      expect(result.skipped).toEqual({ room_not_found_pre_answer: 1 });
+      expect(d.applyEvent).not.toHaveBeenCalled();
+    });
+  }
+
+  it('every OTHER room error stays room_read_failed, for answered legs too', async () => {
+    for (const err of [new Error('connect ECONNREFUSED'), { code: 'unavailable', status: 503 }, null]) {
+      const d = deps({
+        due: [attempt({ roomName: null, sessionId: SESSION })],
+        listParticipants: vi.fn().mockRejectedValue(err),
+      });
+      const result = await runPhoneReconciliation(d.deps, { now: NOW });
+      expect(result.skipped).toEqual({ room_read_failed: 1 });
+      expect(d.applyEvent).not.toHaveBeenCalled();
+    }
+  });
+
+  it('an UNBOUND attempt with no room_name stays no_room and is never listed', async () => {
+    const d = deps({ due: [attempt({ roomName: null, sessionId: null })] });
+    const result = await runPhoneReconciliation(d.deps, { now: NOW });
+    expect(result.skipped).toEqual({ no_room: 1 });
+    expect(d.listParticipants).not.toHaveBeenCalled();
+    expect(d.applyEvent).not.toHaveBeenCalled();
+  });
+
+  it('the not-found classifier is the SAME as the dialer barrier\'s', () => {
+    const cases: unknown[] = [
+      { code: 'not_found' }, { code: 'NOT_FOUND' }, { status: 404 }, { statusCode: 404 },
+      new Error('twirp error: requested room does not exist'),
+      { code: 'unavailable' }, { status: 503 }, new Error('connect ECONNREFUSED'),
+      null, undefined, 'not_found', 404, {},
+    ];
+    for (const err of cases) {
+      expect(isReconcileRoomNotFound(err), JSON.stringify(err ?? null)).toBe(isRoomNotFound(err));
+    }
+    expect(cases.filter((err) => isReconcileRoomNotFound(err))).toHaveLength(5);
+  });
+});
+
 describe('P3 reconciliation — idempotent and epoch-fenced', () => {
   it('mints the SAME id on a repeat sweep, so the ledger dedups', async () => {
     const d = deps({ participants: [] });
@@ -452,9 +572,25 @@ describe('P3 stores — the due-attempt reader', () => {
       engagementId: 'eeeeeeee-0000-4000-8000-000000000000',
       epoch: 4,
       roomName: 'phone-room-1',
+      sessionId: null,
       attemptState: 'human',
       engagementState: 'in_call',
     }]);
+  });
+
+  it('M013 S02: selects session_id and maps a bound reconnect leg with no room_name', async () => {
+    const SESSION = 'cccccccc-3333-4333-8333-333333333333';
+    const { client, calls } = stubClient({
+      data: [{ ...row, room_name: null, session_id: SESSION }, { ...row, session_id: '' }],
+      error: null,
+    });
+    const out = await createDuePhoneAttemptReader(client as never)
+      .listDueAttempts({ admittedBefore: NOW, admittedAfter: NOW, leaseHeldAt: NOW, limit: 2 });
+    expect(String(calls.select?.[0])).toContain('session_id');
+    expect(out[0]).toMatchObject({ roomName: null, sessionId: SESSION });
+    expect(out[1]).toMatchObject({ roomName: 'phone-room-1', sessionId: null });
+    // The lease-held filter is unchanged: the reader is NOT widened.
+    expect(calls.gt).toEqual(['lease_expires_at', NOW.toISOString()]);
   });
 
   it('accepts the embedded engagement as an object OR a one-element array', async () => {

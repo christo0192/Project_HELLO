@@ -95,7 +95,11 @@ begin
   -- the one branch the stranded/crash fixtures do NOT exercise. 0072 MUST
   -- select it, drive it to completed/conversation_complete, and report
   -- disconnect_reason='worker_crash' (a lapsed lease in a live state).
-  for v_s in select unnest(array['stranded','control','crash','lease']) loop
+  -- HELD (slug 'held', 0125 §4): the STRANDED shape, but the engagement is
+  -- `reconnecting` — a reconnect was granted and is still pending. The
+  -- attempt ended 600s ago (past the 180s grace, inside the 30-minute hold),
+  -- so it MUST NOT be selected and the session stays `in_progress`.
+  for v_s in select unnest(array['stranded','control','crash','lease','held']) loop
     insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
     values (v_role, 'pf72 ' || v_s, 'pf72-' || v_s || '@example.test',
             '+9199988' || lpad((abs(hashtext(v_s)) % 100000)::text, 5, '0'), true)
@@ -124,7 +128,8 @@ begin
 
     insert into screening_v2.phone_engagements
       (application_link_id, candidate_id, role_id, state)
-    values (v_link, v_cand, v_role, 'in_call')
+    values (v_link, v_cand, v_role,
+            case when v_s = 'held' then 'reconnecting' else 'in_call' end)
     returning id into v_eng;
 
     -- A live phone session, still in_progress, with an ACTIVE recording egress

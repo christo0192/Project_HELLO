@@ -520,6 +520,82 @@ describe('CandidateDetailPage', () => {
     expect(screen.queryByText('Queued')).toBeNull();
   });
 
+  it('M013 S02: names a failed/screening_abandoned cycle "Abandoned: dropped before screening", never "Screening"', async () => {
+    // The 0125 relabel leaves the candidate `screening` (never `queued`).
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: {
+        ...mockCandidateDetail.candidate,
+        status: 'screening',
+        dial_count: 2,
+        phone_state: 'failed',
+        phone_state_reason: 'screening_abandoned',
+      },
+      assessments: [{
+        ...mockCandidateDetail.assessments[0],
+        evidence_grade: 'insufficient',
+        evidence_reason: 'no_candidate_speech',
+        evidence_answered: 0,
+        evidence_planned: 5,
+      }],
+    });
+    renderDetailPage();
+    await screen.findByText('Jane Doe');
+    expect(screen.getAllByText('Abandoned: dropped before screening').length).toBeGreaterThanOrEqual(2);
+    expect(screen.queryByText('Screening')).toBeNull();
+    expect(screen.queryByText('Queued')).toBeNull();
+    expect(screen.queryByText('Phone screen failed')).toBeNull();
+    // The detail line says WHY, from the held assessment's evidence reason.
+    const detail = document.querySelector('[data-phone-status-detail]');
+    expect(detail?.textContent).toMatch(/^No screening question was answered · Phone reached 2 times/);
+  });
+
+  it('M013 S02: a phone session header says what was recorded, and no call length while an end is unknown', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{
+        ...mockCandidateDetail.sessions[0],
+        mode: 'live',
+        // 0125's stored figure for the 9f60523d shape; never shown as a length.
+        duration_sec: 75,
+        duration_unobserved_legs: 1,
+        recorded_total_sec: 70.8,
+        recorded_legs: 2,
+        connected_complete: false,
+        connected_total_sec: null,
+        candidate_words: 4,
+      }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    expect(document.querySelector('[data-candidate-recorded-length]')?.textContent).toBe(
+      'Recorded 1m 11s across 2 calls',
+    );
+    expect(document.querySelector('[data-candidate-call-length]')).toBeNull();
+    expect(document.querySelector('[data-candidate-words]')?.textContent).toContain('4');
+    expect(screen.queryByText(/1m 15s/)).toBeNull();
+  });
+
+  it('M013 S02: a phone session whose every end is known shows "on the call" from the connected total', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{
+        ...mockCandidateDetail.sessions[0],
+        mode: 'live',
+        duration_sec: 999,
+        recorded_total_sec: 32.7,
+        recorded_legs: 1,
+        connected_complete: true,
+        connected_total_sec: 34.6,
+      }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    expect(document.querySelector('[data-candidate-recorded-length]')?.textContent).toBe('Recorded 33s');
+    expect(document.querySelector('[data-candidate-call-length]')?.textContent).toBe('35s on the call');
+    expect(screen.queryByText(/16m 39s/)).toBeNull();
+  });
+
   it('keeps a decided status even when a later cycle failed', async () => {
     mockApi.getCandidate.mockResolvedValue({
       ...mockCandidateDetail,

@@ -402,3 +402,31 @@ describe('phone-outcome display keys', () => {
     }
   });
 });
+
+describe('screening_abandoned display key (M013 S02, 0125)', () => {
+  const abandoned = cand({ status: 'screening', dial_count: 2, phone_state: 'failed', phone_state_reason: 'screening_abandoned' });
+
+  it('is a filter key with its own deep link, and Screening no longer includes it', () => {
+    const parsed = parseCandidateFilters(new URLSearchParams('status=screening_abandoned'));
+    expect(parsed.statuses).toEqual(['screening_abandoned']);
+    expect(candidatesHref({ statuses: ['screening_abandoned'] })).toBe('/candidates?status=screening_abandoned');
+    expect(matchesCandidateStatus(abandoned, f({ statuses: ['screening_abandoned'] }))).toBe(true);
+    expect(matchesCandidateStatus(abandoned, f({ statuses: ['screening'] }))).toBe(false);
+    expect(matchesCandidateStatus(abandoned, f({ statuses: ['phone_failed'] }))).toBe(false);
+  });
+
+  it('sits in the funnel after phone_failed, with a plain next action', () => {
+    expect(
+      candidateFunnel([
+        abandoned,
+        cand({ status: 'queued', phone_state: 'failed', phone_state_reason: 'assessment_aborted' }),
+        cand({ status: 'queued', phone_state: 'wrong_number' }),
+      ]),
+    ).toEqual([
+      { status: 'phone_failed', label: 'Phone screen failed', value: 1 },
+      { status: 'screening_abandoned', label: 'Abandoned: dropped before screening', value: 1 },
+      { status: 'wrong_number', label: 'Wrong number', value: 1 },
+    ]);
+    expect(candidateNextAction('screening_abandoned')).toEqual({ label: 'Dropped before screening', emphasis: false });
+  });
+});

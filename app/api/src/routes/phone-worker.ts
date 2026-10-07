@@ -80,12 +80,15 @@ import { createPlivoBounceStore } from '../integrations/plivo-phone/stores.js';
 import { startPhoneAttemptRecording } from '../integrations/livekit-phone-dial/recording.js';
 import {
   prepareWorkerRecording,
+  WORKER_LEG_END_SOURCES,
+  type WorkerLegTimingReport,
   type WorkerRecordingUploadSigner,
 } from '../integrations/livekit-phone-dial/worker-recording.js';
 import {
   finalizeAuthoritativeRecording,
   finalizeWorkerInbandAttemptRecording,
   markWorkerRecordingFailed,
+  stampWorkerAttemptLegTiming,
 } from '../lib/recording-egress.js';
 import { purgePhoneEngagementRecordings } from '../integrations/livekit-phone-dial/recording-purge.js';
 import { supabaseStorageRecordingStorage } from '../lib/retention.js';
@@ -501,6 +504,17 @@ const recordingCompleteSchema = z
     sha256: z.string().regex(/^[a-f0-9]{64}$/),
     size_bytes: z.number().int().positive().max(52_428_800),
     duration_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
+    // M013 S02 (T04): the leg timing the T02 worker reports. All optional, so a
+    // legacy body is unchanged. Display-only DATA stamped on the attempt
+    // (`stampAttemptLegTiming`): never a state transition, never a ledger
+    // event. A value outside the sanity window is DROPPED there with a log
+    // line, not rejected here, so the recording is still kept.
+    recording_started_at_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
+    leg_ended_at_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
+    // Which worker mark leg_ended_at_ms is; only `sip_left` is stamped as the
+    // OBSERVED end (adversarial review, S02).
+    leg_end_source: z.enum(WORKER_LEG_END_SOURCES).nullable().optional(),
+    tail_flushed: z.boolean().nullable().optional(),
   })
   .strict();
 
@@ -619,6 +633,20 @@ export interface PhoneWorkerRouterDeps {
   readonly finalizeRecording?: (sessionId: string) => Promise<'ready' | 'fallback_required' | 'pending'>;
   /** 0107: finalizes attempt evidence without requiring a session slot. */
   readonly finalizeAttemptRecording?: (attemptId: string, sessionId: string) => Promise<'ready' | 'fallback_required' | 'pending'>;
+  /**
+   * M013 S02 (T04): stamps the worker's leg timing (observed end, recording
+   * anchor, true audio length, tail-flush flag) on the ATTEMPT row. Runs
+   * BEFORE and independently of the finalize, so a `pending` /
+   * `fallback_required` finalize or a 503 still keeps the timing. Idempotent
+   * and data-only. Absent ⇒ nothing is stamped. Production:
+   * `stampWorkerAttemptLegTiming`.
+   */
+  readonly stampAttemptLegTiming?: (input: {
+    attemptId: string;
+    sessionId: string;
+    report: WorkerLegTimingReport;
+    now: Date;
+  }) => Promise<{ status: string; dropped: ReadonlyArray<string> }>;
   /**
    * PR A — latches a worker-inband recording the worker reported PERMANENTLY
    * lost (`recording_egress_status='failed'`), so the finalizer stops retrying
@@ -2045,6 +2073,50 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       if (!parsed.success) {
         return res.status(400).json({ ok: false, status: 'invalid_request' });
       }
+      // M013 S02 (T04): stamp the leg timing FIRST and independently of the
+      // finalize result. Only a T02 worker body (one carrying a new field)
+      // stamps anything: a legacy worker's `duration_ms` is a wall-clock span,
+      // not the audio length, and must not be recorded as one. Best-effort —
+      // a failure is logged (bounded codes, no ids) and never blocks the
+      // completion.
+      const body = parsed.data;
+      const carriesLegTiming = body.recording_started_at_ms != null
+        || body.leg_ended_at_ms != null
+        || body.leg_end_source != null
+        || typeof body.tail_flushed === 'boolean';
+      if (carriesLegTiming && deps.stampAttemptLegTiming) {
+        try {
+          const stamped = await deps.stampAttemptLegTiming({
+            attemptId: body.attempt_id,
+            sessionId: body.session_id,
+            report: {
+              recordingStartedAtMs: body.recording_started_at_ms ?? null,
+              legEndedAtMs: body.leg_ended_at_ms ?? null,
+              legEndSource: body.leg_end_source ?? null,
+              durationMs: body.duration_ms ?? null,
+              tailFlushed: body.tail_flushed ?? null,
+            },
+            now: now(),
+          });
+          for (const reason of stamped.dropped) {
+            phoneWorkerLog.info('unknown_event', {
+              schema: 'recording_complete_timing',
+              error_category: `dropped:${reason}`,
+            });
+          }
+          if (stamped.status !== 'stamped' && stamped.status !== 'unchanged') {
+            phoneWorkerLog.warn('unknown_event', {
+              schema: 'recording_complete_timing',
+              error_category: `stamp:${stamped.status}`,
+            });
+          }
+        } catch {
+          phoneWorkerLog.warn('unknown_event', {
+            schema: 'recording_complete_timing',
+            error_category: 'stamp:error',
+          });
+        }
+      }
       const finalize = deps.finalizeRecording ?? finalizeAuthoritativeRecording;
       let status: 'ready' | 'fallback_required' | 'pending';
       if (deps.finalizeAttemptRecording) {
@@ -2422,6 +2494,11 @@ export const phoneWorkerRouter = createPhoneWorkerRouter({
     : undefined,
   finalizeAttemptRecording: env.recordingProvider === 'worker'
     ? async (attemptId, sessionId) => finalizeWorkerInbandAttemptRecording(attemptId, {}, sessionId)
+    : undefined,
+  // M013 S02 (T04): the leg-timing stamp. Worker provider only — on egress the
+  // `/recording/complete` route 404s regardless.
+  stampAttemptLegTiming: env.recordingProvider === 'worker'
+    ? async (input) => stampWorkerAttemptLegTiming(input)
     : undefined,
   // PR A. The presigned-PUT signer is supplied ONLY on the worker provider with
   // a configured storage destination; otherwise `/recording/prepare` refuses

@@ -9745,6 +9745,14 @@ async def _run_phone_session(
                 room_meta = _room_metadata_from_context(ctx)
                 if not phone.is_canary_room(room_meta) and not phone.is_preflight_room(room_meta):
                     rec = recording.InWorkerRecorder(session)
+                    # M013 S02: the recorder's OWN leg-end listener (the
+                    # tail-flush cut-off) for exactly this attempt's SIP leg.
+                    _watch_leg_end = getattr(rec, "watch_leg_end", None)
+                    if callable(_watch_leg_end):
+                        _watch_leg_end(
+                            getattr(ctx, "room", None),
+                            _phone_participant_identity(attempt_id),
+                        )
                     if rec.wire():
                         recorder_holder[0] = rec
         except Exception:  # noqa: BLE001 — recording is strictly secondary
@@ -10322,6 +10330,7 @@ async def _run_phone_session(
                 await recording_api.complete_recording(
                     attempt_id, sid, manifest.sha256, manifest.size_bytes,
                     manifest.duration_ms,
+                    **recording.manifest_timing_kwargs(manifest),
                 )
                 _log.info(
                     "unknown_event", error_type="phone_teardown",
@@ -10426,6 +10435,7 @@ async def _run_phone_session(
                     recording_api.complete_recording(
                         attempt_id, sid, manifest.sha256, manifest.size_bytes,
                         manifest.duration_ms,
+                        **recording.manifest_timing_kwargs(manifest),
                     ),
                     _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
                     category="recording_completion", deadline=deadline,

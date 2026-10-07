@@ -1094,6 +1094,42 @@ export type CompletePhoneEngagementAfterLateScoreStatus =
   (typeof COMPLETE_PHONE_ENGAGEMENT_AFTER_LATE_SCORE_STATUSES)[number];
 
 // ═══════════════════════════════════════════════════════════════════════
+// 0125 §5 (M013 S02, T06) — the zero-answer relabel, OUTSIDE the store-layer
+// contract
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Registered here for the same reason as the 0114 blocks: it has no
+// `phone-screening/stores.ts` adapter, so adding it to `PHONE_RPC_NAMES` would
+// break the store bijection. It is called directly by the phone assessment
+// handler (`phone-runtime/assessment-handler.ts`) with the system actor, and
+// once by an operator for the historical 9f60523d correction.
+// `phone-0125-relabel.test.ts` asserts every entry below against the 0125
+// signature and body.
+
+/** 0125 §5 RPC with no store adapter, with its exact parameter names. */
+export const PHONE_RELABEL_RPC_PARAMETERS = Object.freeze({
+  relabel_zero_answer_phone_engagement: ['p_engagement_id', 'p_actor_id', 'p_now'],
+} as const satisfies Record<string, readonly string[]>);
+
+/**
+ * `relabel_zero_answer_phone_engagement` — `applied` relabelled the engagement
+ * failed/screening_abandoned (and maybe moved the candidate screened ->
+ * screening); `already` it was relabelled before (nothing written);
+ * `not_eligible` anything else (a stable `reason` code rides along). All
+ * three are benign for the handler: only a transport error is retried.
+ */
+export const RELABEL_ZERO_ANSWER_PHONE_ENGAGEMENT_STATUSES = [
+  'applied',
+  'already',
+  'not_eligible',
+] as const;
+export type RelabelZeroAnswerPhoneEngagementStatus =
+  (typeof RELABEL_ZERO_ANSWER_PHONE_ENGAGEMENT_STATUSES)[number];
+
+/** The engagement `state_reason` the relabel writes (0125 §5). */
+export const SCREENING_ABANDONED_REASON = 'screening_abandoned' as const;
+
+// ═══════════════════════════════════════════════════════════════════════
 // 0114 §6 (C8) — person-identity guards, OUTSIDE the store-layer contract
 // ═══════════════════════════════════════════════════════════════════════
 //

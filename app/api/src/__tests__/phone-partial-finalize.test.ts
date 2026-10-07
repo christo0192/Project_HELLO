@@ -514,6 +514,48 @@ describe('the partial-finalize tick delivers the scorecard on a disconnect', () 
     expect(enqueues[0].options?.dedupKey).toBe(phoneAssessmentDedupKey(SESSION_A));
   });
 
+  it('0125 §4: an unobserved_disconnect is enqueued like any partial and logged as its own error_type', async () => {
+    // The RPC now reports a reclaimed leg WITH teardown evidence as
+    // `unobserved_disconnect` instead of `worker_crash`. The tick forwards the
+    // token verbatim (the grade decides what it means) and the log line keeps
+    // the two countable apart.
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      const enqueues: EnqueueCall[] = [];
+      const stores = makeStores({
+        onFinalize: () => ({
+          status: 'ok',
+          finalized: 1,
+          sessions: [partialSession({ disconnectReason: 'unobserved_disconnect', covered: 0, neverStarted: true })],
+        }),
+      });
+      const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
+      runtime.scheduler.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await drainMicrotasks(() => enqueues.length > 0 && partialFinalizeCategories(write).length > 0);
+
+      expect(enqueues).toHaveLength(1);
+      expect(enqueues[0].payload).toEqual({
+        session_id: SESSION_A,
+        attempt_id: ATTEMPT_A,
+        partial: true,
+        covered: 0,
+        total: 5,
+        disconnect_reason: 'unobserved_disconnect',
+      });
+      const types: string[] = [];
+      for (const [chunk] of write.mock.calls) {
+        const line = String(chunk);
+        if (!line.includes('"error_category":"phone_partial_finalize:')) continue;
+        const m = /"error_type":"([^"]*)"/.exec(line);
+        if (m) types.push(m[1]);
+      }
+      expect(types[0]).toBe('unobserved_disconnect');
+    } finally {
+      write.mockRestore();
+    }
+  });
+
   it('REPAIR A: a session that already carries an assessment is NOT re-selected, so nothing is enqueued', async () => {
     // The RPC self-terminates on the `not exists (phone assessment)` guard: once
     // the scorecard has landed the session is never returned again. The tick can
@@ -863,6 +905,9 @@ function makeAssessmentClient(opts: {
     from(table: string) {
       const builder = {
         select() { return builder; },
+        // 0125 (T06): the latest-phone-evidence read orders and limits.
+        order() { return builder; },
+        limit() { return builder; },
         eq(column: string, value: unknown) {
           if (table === 'phone_appointments') appointmentFilters.push([column, value]);
           return builder;
@@ -920,6 +965,26 @@ describe('the scorer plumbing forwards the partial fields', () => {
       covered: 3,
       total: 5,
       disconnectReason: 'candidate_hangup',
+    });
+  });
+
+  it('0125: an unobserved_disconnect job scores with that reason, verbatim', async () => {
+    const seen: Array<{ options: unknown }> = [];
+    const { client } = makeAssessmentClient({ engagementId: ENGAGEMENT_A });
+    const handler = createPhoneAssessmentHandler({
+      client: client as never,
+      score: async (_sessionId, options) => { seen.push({ options }); },
+    });
+    await handler({
+      payload: {
+        session_id: SESSION_A, attempt_id: ATTEMPT_A,
+        partial: true, covered: 0, total: 5,
+        disconnect_reason: 'unobserved_disconnect',
+      },
+    } as never);
+    expect(seen[0].options).toEqual({
+      source: 'phone', partial: true, covered: 0, total: 5,
+      disconnectReason: 'unobserved_disconnect',
     });
   });
 
@@ -1299,8 +1364,12 @@ describe('0114 (C2) — the handler never scores a score-suppressed leg', () => 
     expect(order).toEqual([
       'from:phone_appointments',
       'rpc:phone_attempt_score_suppression',
+      // 0125 (T06): the zero-answer retry check, then (after the post) the
+      // relabel check. Not a 0-answer row here, so no relabel call.
+      'from:assessments',
       'score',
       'rpc:apply_phone_event',
+      'from:assessments',
     ]);
   });
 

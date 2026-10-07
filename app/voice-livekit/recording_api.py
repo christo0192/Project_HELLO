@@ -60,17 +60,53 @@ def _get_transport():
     )
 
 
+class _ResponseCapturingTransport:
+    """Pass-through transport that remembers the last response, so a 4xx the
+    breaker turns into a bare ``BusinessError`` can still expose its JSON body
+    (M013 S02 T02: the compat retry must see ``status == "invalid_request"``)."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.last_response: Any = None
+
+    async def request(self, method: str, url: str, **kwargs: Any) -> Any:
+        self.last_response = None
+        response = await self._inner.request(method, url, **kwargs)
+        self.last_response = response
+        return response
+
+    async def close(self) -> None:
+        close = getattr(self._inner, "close", None)
+        if callable(close):
+            await close()
+
+
+def _response_json(response: Any) -> Any:
+    try:
+        return response.json()
+    except Exception:  # noqa: BLE001 — a non-JSON error body is simply unknown
+        return None
+
+
 async def _default_post(method: str, url: str, headers: dict, json_body: dict) -> Any:
-    return await call_with_breaker(
-        method,
-        url,
-        breaker=_RECORDING_BREAKER,
-        transport=_get_transport(),
-        headers=headers,
-        json_body=json_body,
-        endpoint_hint="recording",
-        log_failures=False,
-    )
+    transport = _ResponseCapturingTransport(_get_transport())
+    try:
+        return await call_with_breaker(
+            method,
+            url,
+            breaker=_RECORDING_BREAKER,
+            transport=transport,
+            headers=headers,
+            json_body=json_body,
+            endpoint_hint="recording",
+            log_failures=False,
+        )
+    except BusinessError as exc:
+        # Attach the 4xx body (bounded: only a 400 is ever inspected).
+        resp = transport.last_response
+        if getattr(exc, "status_code", None) == 400 and resp is not None:
+            exc.body = _response_json(resp)  # type: ignore[attr-defined]
+        raise
 
 
 def _headers() -> Optional[dict]:
@@ -165,6 +201,16 @@ async def fail_recording(
     return bool(isinstance(data, dict) and data.get("ok"))
 
 
+def _is_schema_miss(exc: BaseException) -> bool:
+    """True only for the route's own schema-miss reply: HTTP 400 whose body
+    has ``status == "invalid_request"`` (``phone-worker.ts``
+    ``/recording/complete``). Anything else is NOT a reason to retry."""
+    if not isinstance(exc, BusinessError) or getattr(exc, "status_code", None) != 400:
+        return False
+    body = getattr(exc, "body", None)
+    return isinstance(body, dict) and body.get("status") == "invalid_request"
+
+
 async def complete_recording(
     attempt_id: str,
     session_id: str,
@@ -172,21 +218,57 @@ async def complete_recording(
     size_bytes: int,
     duration_ms: Optional[int],
     *,
+    recording_started_at_ms: Optional[int] = None,
+    leg_ended_at_ms: Optional[int] = None,
+    tail_flushed: Optional[bool] = None,
+    leg_end_source: Optional[str] = None,
     post: PostFn = _default_post,
 ) -> bool:
     """Tell the finalizer the object was uploaded. Returns True iff the server
-    reported the recording ready. Fail-open (False on any error)."""
+    reported the recording ready. Fail-open (False on any error).
+
+    M013 S02 T02: the leg timing (``recording_started_at_ms``,
+    ``leg_ended_at_ms``, ``tail_flushed``) rides along as DATA — the API stamps
+    it on the attempt and never transitions anything on it (R4: the worker
+    posts no ledger events after consent). ``None`` values are omitted.
+    ``leg_end_source`` (``sip_left`` | ``session_close`` | ``finish``) says
+    which mark ``leg_ended_at_ms`` is; the API records it as the OBSERVED leg
+    end only for ``sip_left``.
+
+    COMPAT RETRY: an API older than this worker (a rollback) rejects the new
+    fields with ``400 {status: "invalid_request"}`` (its schema is
+    ``.strict()``). On exactly that reply — and only when the body actually
+    carried new fields — the LEGACY body is re-posted ONCE, so a rollback never
+    loses a recording completion. No other status is retried."""
     headers = _headers()
     if headers is None:
         return False
-    body: dict[str, Any] = {
+    legacy: dict[str, Any] = {
         "attempt_id": attempt_id, "session_id": session_id,
         "sha256": sha256, "size_bytes": size_bytes,
     }
     if duration_ms is not None:
-        body["duration_ms"] = duration_ms
+        legacy["duration_ms"] = duration_ms
+    body = dict(legacy)
+    for key, value in (
+        ("recording_started_at_ms", recording_started_at_ms),
+        ("leg_ended_at_ms", leg_ended_at_ms),
+        ("leg_end_source", leg_end_source),
+        ("tail_flushed", tail_flushed),
+    ):
+        if value is not None:
+            body[key] = value
+    url = f"{API_BASE}{_RECORDING_BASE}/complete"
     try:
-        resp = await post("POST", f"{API_BASE}{_RECORDING_BASE}/complete", headers, body)
+        try:
+            resp = await post("POST", url, headers, body)
+        except BusinessError as exc:
+            if body == legacy or not _is_schema_miss(exc):
+                raise
+            # Counts/categories only — never ids or candidate data.
+            _log.info("unknown_event", error_type="phone_recording_complete",
+                      error_category="legacy_body_retry")
+            resp = await post("POST", url, headers, legacy)
         data = getattr(resp, "json", lambda: {})()
     except (ProviderError, BusinessError):
         _log.info("unknown_event", error_type="phone_recording_complete",
