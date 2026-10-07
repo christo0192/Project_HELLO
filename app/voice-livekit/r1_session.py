@@ -54,6 +54,13 @@ Three more facts shape the driver:
   apostrophes removed), never on the raw transcript, so "No, thank you." is a refusal.
 * An ending that falls after the role-play (the candidate leaves, or the clock runs out, in
   the exit line or the wrap-up) is ``complete``: the session is completed, scored and counted.
+
+PR-4c (plan 5.15) adds speed and measurement, never a decision.  ``tts_node_stream`` flushes
+the first speakable fragment of a reply early (``r1_tts``); ``r1_latency`` stamps each turn and
+this module logs the stages as ``r1_latency`` lines; ``r1_linecache`` keeps the audio of
+scripted lines behind ``say`` and counts Sarvam 429s by lane; the session is built with R1's
+turn handling.  None of them can change what is said, a phase, a grade or a guard verdict:
+a stage that fails to measure is skipped, and a line that is not cached is spoken live.
 """
 from __future__ import annotations
 
@@ -66,6 +73,7 @@ import re
 import time
 import unicodedata
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -73,6 +81,15 @@ from observability import StructuredLogger
 from r1_content import CONTENT_SHA256
 from r1_context import fetch_context
 from r1_guard import FALLBACK_REPLY, StreamGuard
+from r1_latency import LatencyTracker, r1_turn_handling
+from r1_linecache import (
+    LANE_R1,
+    RATE_LIMITS,
+    LineCache,
+    LineSpec,
+    RateLimitCounter,
+    build_line_cache,
+)
 from r1_persistence import R1TurnWriter
 from r1_phases import R1Phase, R1PhaseMachine
 from r1_replies import (
@@ -87,7 +104,8 @@ from r1_replies import (
 )
 from r1_prompts import ROLEPLAY_PHASE
 from r1_roleplay import RolePlayEngine, TurnMode, TurnPlan
-from r1_script import INTERVIEWER_NAME, line
+from r1_script import INTERVIEWER_NAME, is_candidate_free, line
+from r1_tts import flush_min_chars, flush_tts, r1_tts_kwargs
 
 R1_RECORD = False
 NO_SHOW_SECONDS = 120.0
@@ -295,6 +313,52 @@ _LIVE_PHASES = frozenset(
     }
 )
 
+# The scripted lines worth warming, in the order an interview first needs them (L-OPEN is spoken
+# at once and L-FILLER* travel inside a reply stream, so neither can use cached audio).
+_WARM_ORDER = (
+    "L-TRANSITION",
+    "L-TRANSITION-NUDGE",
+    "L-PICKUP",
+    "L-TIME-CUE",
+    "L-EXIT",
+    "L-WRAP",
+    "L-CLOSE",
+    "L-ASIDE-COACH",
+    "L-MUTE",
+    "L-SIL-IB",
+    "L-SIL-RP1",
+    "L-SIL-RP2",
+    "L-REJOIN",
+    "L-REJOIN-RP",
+    "L-FAQ-DEFER",
+    "L-NO-FEEDBACK",
+    "L-SIL-END",
+    "L-SYSTEM-STOP",
+)
+# Line-cache events that mean something went wrong (logged as warnings).
+_LINE_CACHE_WARNINGS = frozenset(
+    {
+        "disk_corrupt",
+        "disk_write_failed",
+        "disk_full",
+        "synth_failed",
+        "rate_limited",
+        "gave_up",
+        "clip_rejected",
+        "warm_aborted",
+    }
+)
+# The SDK's per-turn timings (``MetricsReport``), logged beside R1's own stamps.
+_SDK_METRICS = (
+    ("transcription_delay", "sdk_transcription"),
+    ("end_of_turn_delay", "sdk_end_of_turn"),
+    ("on_user_turn_completed_delay", "sdk_turn_hook"),
+    ("llm_node_ttft", "sdk_llm_first_token"),
+    ("tts_node_ttfb", "sdk_tts_first_audio"),
+    ("playback_latency", "sdk_playback"),
+    ("e2e_latency", "sdk_e2e"),
+)
+
 # Results of ``R1Interview._await_turn``.
 TURN = "turn"
 SILENCE = "silence"
@@ -453,11 +517,28 @@ def _agent_turn_handling() -> dict[str, Any]:
     """Agent-level turn handling: ONLY preemptive generation is overridden (turned off).
 
     The learner's per-turn reminder and the owed move are decided in
-    ``on_user_turn_completed``, after the final transcript.  A preemptive generation starts
-    BEFORE that hook, from the transcript so far, so it could answer without the reminder (and
-    would have to be discarded whenever it differed).  Every other turn setting keeps the
-    session value, so browser R1 turn taking stays what the browser lane uses.  Measuring what
-    this costs, and whether it can be bought back, is the PR-4c latency item (plan 5.15).
+    ``on_user_turn_completed``, after the final transcript.  Every other turn setting is the
+    session's (``r1_latency.r1_turn_handling``, given to the ``AgentSession``).
+
+    PR-4c (plan 5.15 item 3) looked at buying preemptive generation back and it STAYS OFF,
+    because livekit-agents 1.6.4 gives no safe way to make the per-turn decision apply to it
+    (every fact below is read from the installed source and pinned in ``test_r1_sdk_contract``):
+
+    * ``AgentActivity.on_preemptive_generation`` starts the model call from the transcript so far
+      (``_generate_reply(..., schedule_speech=False)``) BEFORE ``on_user_turn_completed`` runs;
+    * the SDK keeps that generation when the final text is identical and the chat context is
+      equivalent.  R1 never edits ``turn_ctx`` (the context filter builds the model's context in
+      ``llm_node``), so the SDK cannot see that the decision differs and would keep a generation
+      made without it;
+    * the decision is not idempotent: ``RolePlayEngine.plan_turn`` advances the turn counter, the
+      owed-move scheduler, the disclosure gate, the reveal offers, the ask stalls and the close
+      attempts, and it has no dry-run form to compare against afterwards, so it cannot be run for
+      a transcript that may still change;
+    * a speculative ``llm_node`` would also feed ``_after_guard`` (guard hits become admin-log
+      rows), the failure counter and the speech slots with a generation the SDK may discard.
+
+    What it would buy is measured instead: ``r1_latency`` reports ``eou_to_turn_hook``, the
+    endpointing window a preemptive generation could overlap.
     """
     return {"preemptive_generation": {"enabled": False}}
 
@@ -513,12 +594,26 @@ class R1Agent(Agent):
 
         return self.interview.llm_node_stream(chat_ctx, provider)
 
+    def tts_node(self, text: Any, model_settings: Any) -> Any:
+        """Flush the first speakable fragment early; the SDK's default node does the rest.
+
+        ``Agent.tts_node`` is the downstream call (the SDK default).  A reply is split into at
+        most two calls of it, a scripted ``say`` line is passed through whole.
+        """
+
+        def synth(stream: Any) -> Any:
+            return Agent.tts_node(self, stream, model_settings)
+
+        return self.interview.tts_node_stream(text, synth)
+
 
 async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
     """Build R1 providers with the browser lane's env variables and exact defaults.
 
-    Browser sessions pass neither VAD nor turn detection, so R1 does the same.
-    Adding either here would make browser R1 turn taking silently diverge.
+    Browser sessions pass neither VAD nor turn detection, so R1 does the same: both stay the
+    session's defaults.  PR-4c changes only the TIMINGS around them (``r1_turn_handling``:
+    endpointing, interruption length and words; preemptive generation stays off), which the
+    SDK reads from the session, and nothing else about turn taking.
     """
     from livekit.agents import APIConnectOptions, AgentSession
     from livekit.agents.voice.agent_session import SessionConnectOptions
@@ -530,12 +625,7 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
             model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
             language=os.getenv("SARVAM_LANGUAGE", "en-IN"),
         ),
-        tts=sarvam.TTS(
-            model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
-            speaker=os.getenv("SARVAM_TTS_VOICE", "simran"),
-            pace=1.0,
-            temperature=0.8,
-        ),
+        tts=sarvam.TTS(**r1_tts_kwargs()),
         llm=build_r1_llm(),
         conn_options=SessionConnectOptions(
             llm_conn_options=APIConnectOptions(
@@ -544,6 +634,7 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
                 timeout=10.0,
             )
         ),
+        turn_handling=r1_turn_handling(),
         user_away_timeout=None,
     )
 
@@ -562,6 +653,7 @@ class _SpeechSlot:
     phase: str | None = None
     used: bool = False
     reply: Any = None  # the Reply the hook prepared for this generation (role-play only)
+    source: str | None = None  # the SDK's speech source: "say" for a scripted line
 
 
 class R1Interview:
@@ -583,6 +675,8 @@ class R1Interview:
         close_room: Callable[[], Awaitable[Any]] | None = None,
         recorder_finish: Callable[[], Awaitable[Any]] | None = None,
         judge_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
+        line_cache: LineCache | None = None,
+        rate_limits: RateLimitCounter | None = None,
     ) -> None:
         self.ctx = ctx
         self.context = context
@@ -659,6 +753,13 @@ class R1Interview:
         self._fidelity_queued = False
         self._judge_runner = judge_runner
         self._judge_llm: Any = None
+        # Latency (PR-4c): the stage stamps of the open turn, reported as ``r1_latency`` lines.
+        self._latency = LatencyTracker(clock, self._emit_latency)
+        # The audio of scripted lines (None: every line is spoken live) and the 429 counter.
+        self._line_cache = line_cache
+        self._rate_limits = RATE_LIMITS if rate_limits is None else rate_limits
+        if line_cache is not None:
+            line_cache.listen(self._on_line_cache_event)
 
     def _context_candidate_identity(self) -> str | None:
         """Read only server context identity, never participant metadata supplied by a client."""
@@ -952,6 +1053,21 @@ class R1Interview:
         leftovers = [*self._turn_writes, *self._background]
         if leftovers:
             await asyncio.gather(*leftovers, return_exceptions=True)
+        await self._close_line_cache()
+
+    async def _close_line_cache(self) -> None:
+        """Release the cache's own TTS client; the warm-up task was cancelled just above."""
+        cache, self._line_cache = self._line_cache, None
+        if cache is None:
+            return
+        try:
+            await asyncio.wait_for(cache.aclose(), _scaled(SESSION_CLOSE_SECONDS))
+        except Exception as exc:  # noqa: BLE001 - never block the exit funnel
+            _log.warn(
+                "unknown_event",
+                error_type="r1_line_cache_close_failed",
+                error_category=_error_type_of(exc),
+            )
 
     def _queue_fidelity(self) -> None:
         """Queue the trusted administration rows; they ride the transcript drain's bound.
@@ -1161,17 +1277,19 @@ class R1Interview:
         reports it through ``conversation_item_added``, which is the single source of
         bot transcript rows.  ``voice`` says who is speaking (the learner or the
         interviewer), which decides which later model call may see the line.
+
+        A line the cache holds is played from its stored audio (``say(audio=...)``): same
+        text, same transcript row, no TTS round trip.  Anything else is spoken live.
         """
-        handle = self.session.say(text, allow_interruptions=interruptible)
+        audio = self._cached_audio(text, marker)
+        if audio is None:
+            handle = self.session.say(text, allow_interruptions=interruptible)
+        else:
+            handle = self.session.say(text, audio=audio, allow_interruptions=interruptible)
         handle_id = getattr(handle, "id", None)
         if handle_id is not None:
             self._voices[handle_id] = voice
-        _log.info(
-            "unknown_event",
-            error_type="r1_turn_stage",
-            error_category="tts_first_frame",
-            phase=self.machine.phase.value,
-        )
+            self._latency.say_created(str(handle_id), marker, self.machine.transcript_phase())
         wait_for_playout = getattr(handle, "wait_for_playout", None)
         if not callable(wait_for_playout):
             return
@@ -1205,6 +1323,163 @@ class R1Interview:
             marker=line_id,
             timeout=timeout,
             voice="learner" if line_id in _LEARNER_LINES else "interviewer",
+        )
+
+    # ------------------------------------------------------------ line cache
+
+    def _cached_audio(self, text: str, marker: str) -> Any:
+        """The stored audio of ``text`` as SDK frames, or None when it must be spoken live."""
+        cache = self._line_cache
+        if cache is None:
+            return None
+        clip = cache.lookup(text)
+        _log.info(
+            "unknown_event",
+            error_type="r1_line_cache_play",
+            error_category="live" if clip is None else "cached",
+            schema=marker,
+        )
+        return None if clip is None else clip.frames()
+
+    def _warm_specs(self, *, candidate_free: bool) -> list[LineSpec]:
+        """The scripted lines to warm, in the order the interview first needs them.
+
+        Only a candidate-free line may be kept on disk (``is_candidate_free``); a line that
+        carries the first name is synthesised for this session and stays in memory.  L-OPEN is
+        left out: it is spoken the moment the candidate is here, before it could be warmed.
+        ``candidate_free`` picks one group, so the two can be warmed at different times.
+        """
+        specs: list[LineSpec] = []
+        for line_id in _WARM_ORDER:
+            if is_candidate_free(line_id) is not candidate_free:
+                continue
+            try:
+                text = self.render_line(line_id)
+            except Exception:  # noqa: BLE001 - a line that cannot be rendered is just not warmed
+                continue
+            specs.append(LineSpec(line_id, text, persist=candidate_free))
+        return specs
+
+    def _start_line_warmup(self, *, candidate_free: bool) -> None:
+        """Warm one group of lines in the background.
+
+        The candidate-free lines are warmed in PRE_JOIN, from the moment the job starts: they
+        are kept on disk for every later interview on this machine, so a session whose
+        candidate never arrives wastes nothing.  The lines with the candidate's first name wait
+        for the activated session (``run``): they are synthesised for this session alone.
+        """
+        if self._line_cache is not None:
+            self._spawn(self._warm_line_cache(candidate_free=candidate_free))
+
+    async def _warm_line_cache(self, *, candidate_free: bool) -> None:
+        cache = self._line_cache
+        if cache is None:
+            return
+        try:
+            await cache.warm(self._warm_specs(candidate_free=candidate_free))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the cache is an optimisation, never a failure
+            _log.warn(
+                "unknown_event",
+                error_type="r1_line_cache_failed",
+                error_category=_error_type_of(exc),
+            )
+
+    def _on_line_cache_event(self, kind: str, line_id: str, **detail: Any) -> None:
+        """One ``r1`` line per cache event: a label, a line id, a duration or a count."""
+        seconds = detail.get("seconds")
+        if kind in _LINE_CACHE_WARNINGS:
+            _log.warn(
+                "unknown_event",
+                error_type=f"r1_line_cache_{kind}",
+                error_category=detail.get("error"),
+                schema=line_id or None,
+                duration_sec=None if seconds is None else round(float(seconds), 3),
+                option_count=detail.get("count"),
+            )
+        else:
+            _log.info(
+                "unknown_event",
+                error_type=f"r1_line_cache_{kind}",
+                error_category=detail.get("error"),
+                schema=line_id or None,
+                duration_sec=None if seconds is None else round(float(seconds), 3),
+                option_count=detail.get("count"),
+            )
+
+    # --------------------------------------------------------------- latency
+
+    def _emit_latency(
+        self,
+        schema: str,
+        seconds: float,
+        *,
+        category: str,
+        phase: str,
+        turn_index: int | None,
+    ) -> None:
+        """One ``r1_latency`` line: a stage name, a duration, a phase and a turn index.
+
+        Never an utterance: the stage names, categories and phases are fixed labels, and the
+        index is a transcript row number.
+        """
+        _log.info(
+            "unknown_event",
+            error_type="r1_latency",
+            schema=schema,
+            error_category=category,
+            phase=phase,
+            turn_index=turn_index,
+            duration_sec=round(seconds, 3),
+        )
+
+    def _log_sdk_metrics(self, item: Any) -> None:
+        """Log the SDK's own per-turn timings for a chat item, beside R1's stamps.
+
+        They cross-check the stamps (``sdk_e2e`` is the SDK's end of speech to first audio) and
+        carry two the stamps cannot see (``sdk_transcription``, ``sdk_end_of_turn``).
+        """
+        metrics = getattr(item, "metrics", None)
+        if not isinstance(metrics, Mapping):
+            return
+        role = str(getattr(item, "role", "")).lower()
+        if role not in ("user", "assistant"):
+            return
+        for field_name, schema in _SDK_METRICS:
+            value = metrics.get(field_name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            self._emit_latency(
+                schema,
+                max(0.0, float(value)),
+                category=role,
+                phase=self.machine.transcript_phase(),
+                turn_index=None,
+            )
+
+    def _speaking_scripted_line(self) -> bool:
+        """True while the speech being voiced is a ``say`` line (the whole text is known)."""
+        handle = getattr(self.session, "current_speech", None)
+        slot = self._speeches.get(getattr(handle, "id", None))
+        return slot is not None and slot.source == "say"
+
+    def tts_node_stream(self, text: Any, synth: Callable[[Any], Any]) -> AsyncIterator[Any]:
+        """The body of ``R1Agent.tts_node``: early-flush a reply, pass a scripted line whole.
+
+        A reply arrives sentence by sentence, so its first fragment is sent on at once (see
+        ``r1_tts``).  A ``say`` line arrives complete, where splitting would only cost a
+        prosody reset, so it goes to the downstream node in one call, as the SDK does.  Only a
+        reply's stages feed the turn's latency record.
+        """
+        if self._speaking_scripted_line():
+            return flush_tts(text, synth, min_chars=0)
+        return flush_tts(
+            text,
+            synth,
+            min_chars=flush_min_chars(),
+            on_first_text=lambda: self._latency.mark("tts_first_text"),
+            on_first_frame=lambda: self._latency.mark("tts_first_frame"),
         )
 
     def note_turn(self, text: str) -> None:
@@ -1340,6 +1615,8 @@ class R1Interview:
         self._latest_candidate_index = None
         seconds = self._take_user_turn_seconds()
         entry = self._note_candidate_turn(text, index) if text else None
+        if text:
+            self._latency.begin_turn(index, self.machine.transcript_phase())
         suppressed = self.reply_suppressed(text)
         if suppressed or not text:
             if self.machine.phase in (R1Phase.ICEBREAKER, R1Phase.ROLEPLAY, R1Phase.ASIDE):
@@ -1362,6 +1639,8 @@ class R1Interview:
             raise StopResponse()
         if self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
             reply = self._plan_learner_reply(text, entry, index, seconds)
+            if reply.plan is not None:
+                self._latency.set_kind(reply.plan.mode.value)
         else:
             reply = Reply(
                 phase=self.machine.transcript_phase(),
@@ -1585,6 +1864,7 @@ class R1Interview:
         recover = False
         iterator: Any = None
         try:
+            self._latency.mark("llm_start")
             stream = await _maybe_await(factory())
             iterator = stream.__aiter__()
             async for item in iterator:
@@ -1593,11 +1873,14 @@ class R1Interview:
                     assert_thinking_disabled(usage)
                 text = delta_text(item)
                 if text:
+                    self._latency.mark("llm_first_token")
                     for sentence in guard.feed(text):
                         spoke = True
+                        self._latency.mark("guard_release")
                         yield sentence + " "
             for sentence in guard.flush():
                 spoke = True
+                self._latency.mark("guard_release")
                 yield sentence + " "
         except Exception as exc:  # noqa: BLE001 - a failed model reply must not leave silence
             if spoke:
@@ -1658,6 +1941,7 @@ class R1Interview:
         spoke = False  # a sentence of the acknowledgement already reached the consumer
         iterator: Any = None
         try:
+            self._latency.mark("llm_start")
             stream = await _maybe_await(factory())
             iterator = stream.__aiter__()
             while True:
@@ -1675,13 +1959,18 @@ class R1Interview:
                     assert_thinking_disabled(usage)
                 text = delta_text(item)
                 if text:
+                    self._latency.mark("llm_first_token")
                     for sentence in guard.feed(text):
                         spoke = True
+                        self._latency.mark("guard_release")
                         yield sentence + " "
             for sentence in guard.flush():
                 spoke = True
+                self._latency.mark("guard_release")
                 yield sentence + " "
+            self._latency.mark("ack", "done")
         except Exception as exc:  # noqa: BLE001 - the acknowledgement is optional
+            self._latency.mark("ack", "cutoff" if isinstance(exc, AckCutoff) else "failed")
             _log.warn(
                 "unknown_event",
                 error_type="r1_ack_failed",
@@ -1977,6 +2266,7 @@ class R1Interview:
         text = str(getattr(event, "transcript", "") or "").strip()
         if not text:
             return
+        self._latency.note_final()
         if self.machine.phase in (R1Phase.OPENING, R1Phase.ICEBREAKER):
             # An early answer spoken over the opening line is still an icebreaker turn.
             self.machine.candidate_turns += 1
@@ -1991,7 +2281,7 @@ class R1Interview:
         speech_id = getattr(handle, "id", None)
         if self._exiting or handle is None or speech_id is None:
             return
-        slot = _SpeechSlot(handle)
+        slot = _SpeechSlot(handle, source=getattr(event, "source", None))
         if getattr(event, "source", None) == "generate_reply" and self._latest_reply is not None:
             # The SDK creates this speech right after the hook that prepared the reply.
             slot.reply, self._latest_reply = self._latest_reply, None
@@ -2023,6 +2313,8 @@ class R1Interview:
     def _on_speech_done(self, handle: Any) -> None:
         speech_id = getattr(handle, "id", None)
         self._speeches.pop(speech_id, None)
+        if speech_id is not None:
+            self._latency.say_done(str(speech_id))
         if speech_id in self._open_replies:
             self._open_replies.discard(speech_id)
             self._wake()
@@ -2077,7 +2369,10 @@ class R1Interview:
         SDK actually forwarded and ``interrupted`` when a barge-in cut them short.
         """
         item = getattr(event, "item", event)
-        if self._exiting or str(getattr(item, "role", "")).lower() != "assistant":
+        if self._exiting:
+            return
+        self._log_sdk_metrics(item)
+        if str(getattr(item, "role", "")).lower() != "assistant":
             return
         text = self._item_text(item)
         if not text.strip():
@@ -2142,10 +2437,20 @@ class R1Interview:
         self._agent_state = str(getattr(event, "new_state", "") or "")
         if self._agent_state == "speaking":
             self._claim_current_speech_slot()
+            self._note_audio_started()
         self._refresh_quiet()
+
+    def _note_audio_started(self) -> None:
+        """The agent's audio began: a scripted line reports its own delay, a reply the turn's."""
+        handle = getattr(self.session, "current_speech", None)
+        speech_id = getattr(handle, "id", None)
+        if speech_id is not None and self._latency.say_audio(str(speech_id)):
+            return
+        self._latency.first_audio()
 
     def _on_user_state_changed(self, event: Any) -> None:
         self._user_state = str(getattr(event, "new_state", "") or "")
+        self._latency.note_user_state(self._user_state)
         if self._user_state == "speaking" and self._user_turn_started is None:
             self._user_turn_started = self._clock()
         self._refresh_quiet()
@@ -2191,6 +2496,27 @@ class R1Interview:
             current = getattr(current, "error", None)
         return None
 
+    def _note_rate_limited(self, error: Any) -> None:
+        """Count a provider 429 for this lane (``r1``) and component, and log the running total.
+
+        Every 429 counts, recoverable or not: the SDK retries a 429, and a retried 429 is still
+        a request Sarvam (or the LLM) refused.  Sarvam's limits are per account and shared with
+        the phone lane, so this is how an R1 burst is told apart from a phone one.
+        """
+        kind = str(getattr(error, "type", ""))
+        component = kind[: -len("_error")] if kind.endswith("_error") else ""
+        if component not in ("llm", "tts", "stt"):
+            component = "provider"
+        count = self._rate_limits.record(LANE_R1, component)
+        _log.warn(
+            "unknown_event",
+            error_type="r1_provider_429",
+            error_category=component,
+            schema=LANE_R1,
+            phase=self.machine.transcript_phase(),
+            option_count=count,
+        )
+
     def _on_provider_error(self, event: Any) -> None:
         """Count unrecoverable LLM/TTS failures; recoverable ones are retried by the SDK."""
         if self._exiting:
@@ -2200,7 +2526,10 @@ class R1Interview:
             error, "recoverable", False
         ):
             self._llm_errors_reported += 1  # see ``_ack_then_say``: one failure, one count
-        if self._provider_status(event) in (401, 402):
+        status = self._provider_status(event)
+        if status == 429:
+            self._note_rate_limited(error)
+        if status in (401, 402):
             self._provider_abort = True
             self._wake()
             return
@@ -2859,6 +3188,7 @@ class R1Interview:
         outcome = "provider_error"
         self.wire_events()
         self._schedule_residency_deadline()
+        self._start_line_warmup(candidate_free=True)
         try:
             self._seed_candidate_from_room()
             if not await self._wait_for_candidate(NO_SHOW_SECONDS):
@@ -2868,6 +3198,7 @@ class R1Interview:
                 outcome = "configuration_failed"
                 return await self._finish(outcome)
             self._record_pins()
+            self._start_line_warmup(candidate_free=False)
             self._enter(R1Phase.OPENING)
             self._schedule_forced_close()
             await self._start()
@@ -3002,4 +3333,13 @@ async def run_r1_session(
         interview = R1Interview(ctx, context, _NoopSession(), writer)
         await interview._exit("configuration_failed")
         return "configuration_failed"
-    return await R1Interview(ctx, context, session, writer).run()
+    line_cache: LineCache | None = None
+    try:
+        line_cache = build_line_cache(session)
+    except Exception as exc:  # noqa: BLE001 - the cache is an optimisation: speak every line live
+        _log.warn(
+            "unknown_event",
+            error_type="r1_line_cache_unavailable",
+            error_category=_error_type_of(exc),
+        )
+    return await R1Interview(ctx, context, session, writer, line_cache=line_cache).run()

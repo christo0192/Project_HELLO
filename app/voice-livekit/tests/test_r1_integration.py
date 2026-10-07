@@ -12,8 +12,10 @@ then ``on_user_turn_completed``, then ``speech_created``, then ``llm_node``, the
 from __future__ import annotations
 
 import asyncio
+import inspect
 import itertools
 import json
+import os
 import sys
 import types
 import unittest
@@ -30,6 +32,14 @@ import r1_session
 from r1_commitment import Level, commitment_line, stall_line
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
 from r1_guard import FALLBACK_REPLY, NO_FEEDBACK_LINE
+from r1_linecache import (
+    LANE_R1,
+    LineCache,
+    LineSpec,
+    RateLimitCounter,
+    SynthesisBucket,
+    build_line_cache,
+)
 from r1_persistence import R1TurnWriter
 from r1_personas import PERSONA_IDS, PERSONAS, resolve_persona
 from r1_phases import R1Phase, R1PhaseMachine
@@ -69,6 +79,7 @@ from tests.test_r1_core import (
     tearDownModule,  # noqa: F401
 )
 from tests.test_r1_roleplay import ASK, FOLLOWUP, H1_PROBE, OPENER, PITCH, cooperative_script
+from tests.test_r1_linecache import FakeSynthesizer, FakeTime, RateLimited, clip
 
 P1_CONTEXT = {
     "first_name": "Asha",
@@ -196,7 +207,9 @@ def judge_returning(payload) -> object:
 class Rig:
     """One interview on the core fakes, driven the way the SDK drives it."""
 
-    def __init__(self, context=None, *, judge=None, provider: FakeProvider | None = None) -> None:
+    def __init__(
+        self, context=None, *, judge=None, provider: FakeProvider | None = None, **interview_kwargs
+    ) -> None:
         self.clock = Clock()
         self.order: list = []
         self.ctx = FakeContext(self.order)
@@ -210,6 +223,7 @@ class Rig:
             self.writer,
             clock=self.clock,
             judge_runner=judge,
+            **interview_kwargs,
         )
         self.interview.wire_events()
         self.ctx.room.emit("participant_connected", FakeParticipant("candidate"))
@@ -1872,6 +1886,570 @@ class TestEndToEnd(R1TestCase):
             self.assertEqual(event["payload"]["pins"]["content_sha256"], CONTENT_SHA256)
         self.assertEqual(self.writer.terminals, [("complete", {"activated": True})])
         self.assertEqual(self.ctx.shutdowns, ["r1_exit"])
+
+
+# ------------------------------------------------------------ PR-4c: latency, TTS seam, cache
+
+
+def state(name: str) -> SimpleNamespace:
+    return SimpleNamespace(old_state="x", new_state=name)
+
+
+class TimedProvider(FakeProvider):
+    """A model whose tokens take (manual-clock) time: ``first`` to the first, ``gap`` between."""
+
+    def __init__(self, clock, *replies: str, first: float = 0.5, gap: float = 0.1) -> None:
+        super().__init__(*replies)
+        self.clock, self.first, self.gap = clock, first, gap
+
+    async def _stream(self, text: str):
+        self.clock.advance(self.first)
+        for word in text.split(" "):
+            yield SimpleNamespace(delta=SimpleNamespace(content=word + " "), usage=None)
+            self.clock.advance(self.gap)
+
+
+def latency_lines(lines: list[dict]) -> list[dict]:
+    return [line_ for line_ in lines if line_.get("error_type") == "r1_latency"]
+
+
+def our_stages(lines: list[dict]) -> list[tuple[str, float]]:
+    """R1's own stamps (not the SDK's ``sdk_*`` timings) as (schema, seconds)."""
+    return [
+        (line_["schema"], line_["duration_sec"])
+        for line_ in latency_lines(lines)
+        if not line_["schema"].startswith("sdk_")
+    ]
+
+
+async def drive_reply(
+    rig: Rig,
+    text: str,
+    provider,
+    *,
+    endpoint: float = 0.7,
+    tts_delay: float = 0.25,
+    audio_delay: float = 0.1,
+) -> list:
+    """One role-play reply the way the SDK runs it, with every stage timed on the manual clock.
+
+    The candidate talks for 2 s; the SDK declares the turn ``endpoint`` s later; the model's
+    guarded text flows into the TTS node, whose downstream call takes ``tts_delay`` before its
+    first frame; the agent starts speaking ``audio_delay`` s after that frame.
+    """
+    rig.session.emit("user_state_changed", state("speaking"))
+    rig.clock.advance(2.0)
+    rig.session.emit("user_state_changed", state("listening"))
+    rig.final(text)
+    await rig.settle()
+    rig.clock.advance(endpoint)
+    await rig.agent.on_user_turn_completed(None, SimpleNamespace(text_content=text, id="m1"))
+    handle = FakeSpeechHandle("reply")
+    rig.session.emit(
+        "speech_created",
+        SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=True),
+    )
+    rig.session.current_speech = handle
+    guarded = rig.interview.llm_node_stream(
+        SimpleNamespace(items=[SimpleNamespace(role="user", id="m1")]), provider
+    )
+
+    def synth(stream):
+        async def frames():
+            async for _chunk in stream:
+                pass
+            rig.clock.advance(tts_delay)
+            yield "frame"
+
+        return frames()
+
+    frames: list = []
+    async for frame in rig.interview.tts_node_stream(guarded, synth):
+        if not frames:
+            rig.clock.advance(audio_delay)
+            rig.session.emit("agent_state_changed", state("speaking"))
+        frames.append(frame)
+    return frames
+
+
+async def owed_rig(provider: FakeProvider) -> Rig:
+    """A role-play at 190 s, where the next turn forces an owed move (acknowledgement + line)."""
+    rig = Rig(provider=provider)
+    await rig.start_roleplay()
+    await rig.converse(OPENER, advance=20)
+    await rig.converse("What do you do these days?", advance=120)
+    return rig
+
+
+class TestLatencyLines(unittest.IsolatedAsyncioTestCase):
+    async def test_a_role_play_reply_reports_every_stage_from_the_end_of_speech(self) -> None:
+        rig = Rig()
+        provider = TimedProvider(rig.clock, "Okay, that makes sense. Tell me more.")
+        await rig.start_roleplay()
+        with capture_r1_logs() as lines:
+            frames = await drive_reply(rig, OPENER, provider)
+        self.assertEqual(frames, ["frame", "frame"])  # the first fragment, then the remainder
+        self.assertEqual(
+            our_stages(lines),
+            [
+                ("eou_to_turn_hook", 0.7),
+                ("eou_to_llm_first_token", 1.2),
+                ("llm_ttft", 0.5),
+                ("eou_to_guard_release", 1.6),
+                ("guard_hold", 0.4),
+                ("eou_to_tts_first_frame", 1.85),
+                ("tts_ttfb", 0.25),
+                ("eou_to_first_audio", 1.95),
+            ],
+        )
+        reply = rig.interview._last_reply
+        for line_ in latency_lines(lines):
+            self.assertEqual(line_["phase"], "roleplay")
+            self.assertEqual(line_["turn_index"], reply.candidate_index)
+            self.assertEqual(line_["component"], "r1")
+        self.assertEqual(latency_lines(lines)[0]["error_category"], "vad")  # the anchor kind
+        kinds = {line_["error_category"] for line_ in latency_lines(lines)[1:]}
+        self.assertEqual(kinds, {reply.plan.mode.value})
+
+    async def test_the_headline_is_reported_once_per_turn(self) -> None:
+        rig = Rig()
+        provider = TimedProvider(rig.clock, "Okay, that makes sense. Tell me more.")
+        await rig.start_roleplay()
+        with capture_r1_logs() as lines:
+            await drive_reply(rig, OPENER, provider)
+            rig.session.emit("agent_state_changed", state("speaking"))  # a later speaking event
+        headlines = [s for s, _ in our_stages(lines) if s == "eou_to_first_audio"]
+        self.assertEqual(headlines, ["eou_to_first_audio"])
+
+    async def test_a_scripted_line_reports_the_delay_to_its_audio(self) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        original = rig.session._play
+
+        async def delayed(handle, text):
+            rig.clock.advance(0.4)  # the audio output takes 0.4 s to start
+            await original(handle, text)
+
+        rig.session._play = delayed
+        with capture_r1_logs() as lines:
+            await rig.interview.say("L-EXIT")
+        (line_,) = [l for l in latency_lines(lines) if l["schema"] == "say_to_first_audio"]
+        self.assertEqual((line_["duration_sec"], line_["error_category"]), (0.4, "L-EXIT"))
+        self.assertNotIn("turn_index", line_)
+        # A scripted line is not a candidate turn: no headline, no stage of any turn.
+        self.assertEqual([s for s, _ in our_stages(lines)], ["say_to_first_audio"])
+
+    async def test_a_turn_the_driver_owns_reports_only_the_hook_delay(self) -> None:
+        rig = Rig()
+        for phase in (R1Phase.TRANSITION, R1Phase.ROLEPLAY, R1Phase.ROLEPLAY_EXIT, R1Phase.WRAPUP):
+            rig.machine.transition(phase)
+        with capture_r1_logs() as lines:
+            rig.session.emit("user_state_changed", state("speaking"))
+            rig.clock.advance(1.0)
+            rig.session.emit("user_state_changed", state("listening"))
+            rig.final("No questions, thanks")
+            await rig.settle()
+            rig.clock.advance(0.6)
+            with self.assertRaises(r1_session.StopResponse):
+                await rig.agent.on_user_turn_completed(
+                    None, SimpleNamespace(text_content="No questions, thanks", id="m1")
+                )
+        self.assertEqual(our_stages(lines), [("eou_to_turn_hook", 0.6)])
+        self.assertEqual(latency_lines(lines)[0]["phase"], "wrapup")
+
+    async def test_the_sdks_own_timings_are_logged_beside_ours(self) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        user = SimpleNamespace(
+            role="user",
+            id="u1",
+            metrics={
+                "transcription_delay": 0.3,
+                "end_of_turn_delay": 0.8,
+                "on_user_turn_completed_delay": 0.01,
+                "stopped_speaking_at": 1234.5,  # not a duration: never logged
+                "end_of_something_else": 9.0,
+            },
+        )
+        reply = FakeChatMessage("Okay")
+        reply.metrics = {"llm_node_ttft": 0.9, "tts_node_ttfb": 0.2, "e2e_latency": 1.9,
+                         "playback_latency": True}  # a bool is not a duration
+        bare = FakeChatMessage("Hmm")  # no metrics at all
+        with capture_r1_logs() as lines:
+            for item in (user, reply, bare):
+                rig.session.emit("conversation_item_added", SimpleNamespace(item=item))
+        sdk = {
+            (l["schema"], l["error_category"]): l["duration_sec"]
+            for l in latency_lines(lines)
+            if l["schema"].startswith("sdk_")
+        }
+        self.assertEqual(
+            sdk,
+            {
+                ("sdk_transcription", "user"): 0.3,
+                ("sdk_end_of_turn", "user"): 0.8,
+                ("sdk_turn_hook", "user"): 0.01,
+                ("sdk_llm_first_token", "assistant"): 0.9,
+                ("sdk_tts_first_audio", "assistant"): 0.2,
+                ("sdk_e2e", "assistant"): 1.9,
+            },
+        )
+
+    async def test_the_acknowledgement_reports_how_it_ended(self) -> None:
+        cases = (
+            ("done", FakeProvider("Okay, that makes sense.")),
+            ("failed", FakeProvider(error=RuntimeError(POISON))),
+            ("cutoff", SlowAcknowledgements()),
+        )
+        for outcome, provider in cases:
+            with self.subTest(outcome=outcome):
+                rig = await owed_rig(FakeProvider("ok"))
+                with mock.patch.object(r1_session, "ACK_DEADLINE_SECONDS", 0.05):
+                    with capture_r1_logs() as lines:
+                        await rig.converse(
+                            "Our curriculum covers python modules.", advance=50, provider=provider
+                        )
+                self.assertEqual(rig.plan().mode, TurnMode.ACK_THEN_SAY)
+                acks = [l for l in latency_lines(lines) if l["schema"] == "ack"]
+                self.assertEqual([l["error_category"] for l in acks], [outcome])
+                self.assertNotIn(POISON, json.dumps(lines))
+
+    async def test_a_scripted_owed_move_without_a_model_call_still_reports_its_headline(self) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        with capture_r1_logs() as lines:
+            # A candidate who asks to commit before the window gets a scripted stall: no LLM.
+            provider = TimedProvider(rig.clock, "unused")
+            await drive_reply(rig, ASK, provider)
+        stages = [s for s, _ in our_stages(lines)]
+        self.assertEqual(rig.plan().mode, TurnMode.SAY_ONLY)
+        self.assertIn("eou_to_first_audio", stages)
+        self.assertNotIn("eou_to_llm_first_token", stages)  # no model call, so no model stage
+        self.assertEqual(provider.calls, [])
+
+    async def test_no_latency_line_carries_text_or_an_unexpected_field(self) -> None:
+        rig = Rig()
+        provider = TimedProvider(rig.clock, "Okay, that makes sense. Tell me more.")
+        await rig.start_roleplay()
+        with capture_r1_logs() as lines:
+            await drive_reply(rig, POISON + " is my name", provider)
+        self.assertTrue(latency_lines(lines))
+        self.assertNotIn(POISON, json.dumps(lines))
+        allowed = {
+            "timestamp", "level", "component", "event", "correlationId",
+            "error_type", "schema", "error_category", "phase", "turn_index", "duration_sec",
+        }
+        for line_ in latency_lines(lines):
+            self.assertLessEqual(set(line_), allowed)
+            self.assertEqual(line_["event"], "unknown_event")
+
+
+class TestTtsNodeSeam(unittest.IsolatedAsyncioTestCase):
+    class Downstream:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def __call__(self, stream):
+            async def frames():
+                self.calls.append("".join([chunk async for chunk in stream]))
+                yield "frame"
+
+            return frames()
+
+    @staticmethod
+    async def text():
+        for chunk in ("Hello there. ", "How are you today? ", "Fine."):
+            await asyncio.sleep(0)
+            yield chunk
+
+    def make_speech(self, rig: Rig, source: str) -> None:
+        handle = FakeSpeechHandle("speech")
+        rig.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source=source, user_initiated=True),
+        )
+        rig.session.current_speech = handle
+
+    async def test_a_reply_is_flushed_early_in_two_downstream_calls(self) -> None:
+        rig = Rig()
+        self.make_speech(rig, "generate_reply")
+        node = self.Downstream()
+        _ = [f async for f in rig.interview.tts_node_stream(self.text(), node)]
+        self.assertEqual(node.calls, ["Hello there.", " How are you today? Fine."])
+
+    async def test_a_scripted_line_goes_to_the_downstream_node_whole(self) -> None:
+        rig = Rig()
+        self.make_speech(rig, "say")
+        node = self.Downstream()
+        with capture_r1_logs() as lines:
+            _ = [f async for f in rig.interview.tts_node_stream(self.text(), node)]
+        self.assertEqual(node.calls, ["Hello there. How are you today? Fine."])
+        self.assertEqual(our_stages(lines), [])  # a scripted line feeds no turn's stages
+
+    async def test_an_unknown_speech_is_treated_as_a_reply(self) -> None:
+        rig = Rig()
+        rig.session.current_speech = None
+        node = self.Downstream()
+        _ = [f async for f in rig.interview.tts_node_stream(self.text(), node)]
+        self.assertEqual(len(node.calls), 2)
+
+    async def test_the_cap_of_zero_is_the_rollback(self) -> None:
+        rig = Rig()
+        self.make_speech(rig, "generate_reply")
+        node = self.Downstream()
+        with mock.patch.dict(os.environ, {"R1_TTS_FLUSH_MIN_CHARS": "0"}):
+            _ = [f async for f in rig.interview.tts_node_stream(self.text(), node)]
+        self.assertEqual(node.calls, ["Hello there. How are you today? Fine."])
+
+
+class TestProviderRateLimits(unittest.IsolatedAsyncioTestCase):
+    def rig(self) -> Rig:
+        rig = Rig()
+        rig.interview._rate_limits = RateLimitCounter()
+        return rig
+
+    @staticmethod
+    def report(rig: Rig, kind: str, status: int | None, *, recoverable: bool = True) -> None:
+        inner = SimpleNamespace(status_code=status) if status is not None else RuntimeError("x")
+        error = SimpleNamespace(type=kind, recoverable=recoverable, error=inner)
+        rig.session.emit("error", SimpleNamespace(error=error, source=kind))
+
+    async def test_every_429_is_counted_by_lane_and_component(self) -> None:
+        rig = self.rig()
+        with capture_r1_logs() as lines:
+            self.report(rig, "tts_error", 429)
+            self.report(rig, "tts_error", 429, recoverable=False)
+            self.report(rig, "llm_error", 429)
+            self.report(rig, "stt_error", 429)
+            self.report(rig, "tts_error", 503)  # another status: not a 429
+            self.report(rig, "tts_error", None)
+        counter = rig.interview._rate_limits
+        self.assertEqual(counter.snapshot(), {LANE_R1: {"llm": 1, "stt": 1, "tts": 2}})
+        warned = [l for l in lines if l.get("error_type") == "r1_provider_429"]
+        self.assertEqual(
+            [(l["error_category"], l["option_count"], l["schema"]) for l in warned],
+            [("tts", 1, "r1"), ("tts", 2, "r1"), ("llm", 1, "r1"), ("stt", 1, "r1")],
+        )
+        self.assertTrue(all(l["level"] == "warn" for l in warned))
+
+    async def test_an_unknown_component_is_counted_as_provider(self) -> None:
+        rig = self.rig()
+        self.report(rig, "weird_error", 429)
+        self.report(rig, "", 429)
+        self.assertEqual(rig.interview._rate_limits.snapshot(), {LANE_R1: {"provider": 2}})
+
+    async def test_counting_a_429_changes_nothing_about_how_the_error_is_handled(self) -> None:
+        rig = self.rig()
+        before = rig.interview._failures
+        self.report(rig, "tts_error", 429, recoverable=True)  # the SDK retries it: no failure
+        self.assertEqual(rig.interview._failures, before)
+        self.report(rig, "tts_error", 429, recoverable=False)  # unrecoverable: one failure
+        self.assertEqual(rig.interview._failures, before + 1)
+        self.assertFalse(rig.interview._provider_abort)
+
+    async def test_the_default_counter_is_the_process_wide_r1_lane_one(self) -> None:
+        from r1_linecache import RATE_LIMITS
+
+        rig = Rig()
+        self.assertIs(rig.interview._rate_limits, RATE_LIMITS)
+        self.assertEqual(set(RATE_LIMITS.snapshot()) - {LANE_R1}, set())  # the phone lane is never here
+
+
+class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
+    def build(self, synthesizer=None) -> tuple[Rig, LineCache, FakeSynthesizer]:
+        source = FakeTime()
+        synth = synthesizer or FakeSynthesizer()
+        cache = LineCache(
+            synth,
+            voice={"model": "bulbul:v3"},
+            sample_rate=22050,
+            bucket=SynthesisBucket(600, burst=100, clock=source, sleep=source.sleep),
+            counter=RateLimitCounter(),
+            clock=source,
+            jitter=lambda: 0.5,
+        )
+        rig = Rig(line_cache=cache)
+        return rig, cache, synth
+
+    @staticmethod
+    def spy(rig: Rig) -> list:
+        calls: list = []
+        original = rig.session.say
+
+        def say(text, **kwargs):
+            calls.append((text, kwargs))
+            return original(text, **kwargs)
+
+        rig.session.say = say
+        return calls
+
+    async def test_a_warmed_line_is_played_from_its_cached_audio(self) -> None:
+        rig, cache, _ = self.build()
+        text = rig.interview.render_line("L-EXIT")
+        await cache.warm([LineSpec("L-EXIT", text, True)])
+        calls = self.spy(rig)
+        with capture_r1_logs() as lines:
+            await rig.interview.say("L-EXIT")
+        await rig.flush()
+        (spoken, kwargs), = calls
+        self.assertEqual(spoken, text)  # the text is still passed: transcript and chat context
+        self.assertFalse(kwargs["allow_interruptions"])
+        audio = kwargs["audio"]
+        self.assertTrue(inspect.isasyncgen(audio))
+        await audio.aclose()
+        # The transcript row is the same as for a live line.
+        self.assertEqual([r["text"] for r in rig.writer.saved if r["speaker"] == "bot"], [text])
+        played = [l for l in lines if l.get("error_type") == "r1_line_cache_play"]
+        self.assertEqual([(l["error_category"], l["schema"]) for l in played], [("cached", "L-EXIT")])
+
+    async def test_a_line_that_was_not_warmed_is_spoken_live(self) -> None:
+        rig, _cache, _ = self.build()
+        calls = self.spy(rig)
+        with capture_r1_logs() as lines:
+            await rig.interview.say("L-WRAP")
+        (_text, kwargs), = calls
+        self.assertNotIn("audio", kwargs)
+        played = [l for l in lines if l.get("error_type") == "r1_line_cache_play"]
+        self.assertEqual([l["error_category"] for l in played], ["live"])
+
+    async def test_without_a_cache_say_is_exactly_what_it_was_before_pr_4c(self) -> None:
+        rig = Rig()
+        calls = self.spy(rig)
+        with capture_r1_logs() as lines:
+            await rig.interview.say("L-WRAP")
+        self.assertEqual(calls, [(rig.interview.render_line("L-WRAP"), {"allow_interruptions": False})])
+        self.assertFalse([l for l in lines if str(l.get("error_type")).startswith("r1_line_cache")])
+
+    async def test_the_lines_to_warm_are_grouped_by_whether_they_carry_the_name(self) -> None:
+        rig, _cache, _ = self.build()
+        free = rig.interview._warm_specs(candidate_free=True)
+        named = rig.interview._warm_specs(candidate_free=False)
+        self.assertTrue(all(spec.persist for spec in free))
+        self.assertFalse(any(spec.persist for spec in named))
+        self.assertEqual(
+            {spec.line_id for spec in free} | {spec.line_id for spec in named},
+            set(r1_session._WARM_ORDER),
+        )
+        self.assertNotIn("L-OPEN", {spec.line_id for spec in free + named})
+        self.assertEqual(
+            [spec.line_id for spec in named],
+            ["L-TRANSITION", "L-CLOSE", "L-SIL-IB", "L-REJOIN", "L-SYSTEM-STOP"],
+        )
+        for spec in free:
+            self.assertNotIn("Asha", spec.text)  # nothing about the candidate reaches the disk
+            self.assertEqual(spec.text, rig.interview.render_line(spec.line_id))
+        for spec in named:
+            self.assertIn("Asha", spec.text)
+
+    async def test_the_background_warm_up_fills_the_cache_and_is_released_at_exit(self) -> None:
+        rig, cache, synth = self.build()
+        rig.interview._start_line_warmup(candidate_free=True)
+        rig.interview._start_line_warmup(candidate_free=False)
+        await rig.until(lambda: cache.size == len(r1_session._WARM_ORDER))
+        self.assertEqual(len(synth.texts), len(r1_session._WARM_ORDER))
+        await rig.interview._drain_background()
+        self.assertEqual(synth.closed, 1)
+        self.assertIsNone(rig.interview._line_cache)
+
+    async def test_a_warm_up_still_running_at_exit_is_cancelled_not_awaited(self) -> None:
+        gate = asyncio.Event()
+
+        async def hangs() -> object:
+            await gate.wait()
+
+        rig, cache, synth = self.build(FakeSynthesizer(hangs))
+        rig.interview._start_line_warmup(candidate_free=True)
+        await rig.until(lambda: len(synth.texts) == 1)
+        await asyncio.wait_for(rig.interview._drain_background(), 5.0)
+        self.assertEqual(synth.closed, 1)
+
+    async def test_cache_events_become_r1_log_lines(self) -> None:
+        rig, cache, _ = self.build(FakeSynthesizer(RateLimited(), clip()))
+        text = rig.interview.render_line("L-WRAP")
+        with capture_r1_logs() as lines:
+            await cache.warm([LineSpec("L-WRAP", text, False)])
+        by_type = {l["error_type"]: l for l in lines if l["error_type"].startswith("r1_line_cache")}
+        limited = by_type["r1_line_cache_rate_limited"]
+        self.assertEqual((limited["level"], limited["option_count"], limited["schema"]), ("warn", 1, "L-WRAP"))
+        self.assertEqual(by_type["r1_line_cache_synth_ok"]["level"], "info")
+        self.assertIn("duration_sec", by_type["r1_line_cache_synth_ok"])
+        self.assertEqual(by_type["r1_line_cache_warm_done"]["option_count"], 1)
+
+    async def test_a_synthesis_failure_never_reaches_the_interview(self) -> None:
+        rig, cache, _ = self.build(FakeSynthesizer(*[RuntimeError(POISON)] * 30))
+        with capture_r1_logs() as lines:
+            rig.interview._start_line_warmup(candidate_free=True)
+            rig.interview._start_line_warmup(candidate_free=False)
+            await rig.until(lambda: any(l["error_type"] == "r1_line_cache_warm_aborted" for l in lines))
+            await rig.settle()
+        self.assertEqual(rig.interview._failures, 0)
+        self.assertIsNone(rig.interview._stop_outcome())
+        self.assertNotIn(POISON, json.dumps(lines))
+        failed = [l for l in lines if l["error_type"] == "r1_line_cache_synth_failed"]
+        self.assertTrue(failed and all(l["error_category"] == "RuntimeError" for l in failed))
+
+
+class TestLineCacheBuiltByTheRunner(unittest.IsolatedAsyncioTestCase):
+    def test_a_session_without_a_real_tts_gets_no_cache(self) -> None:
+        self.assertIsNone(build_line_cache(FakeSession()))
+
+    async def test_a_failure_building_the_cache_degrades_to_live_speech(self) -> None:
+        order: list = []
+        ctx = FakeContext(order)
+        ctx.room.remote_participants["candidate"] = FakeParticipant("candidate")
+        writer = FakeWriter(order, activate_ok=False)  # ends the run at once: nothing else is tested
+        session = FakeSession(log=order)
+
+        async def fetch(_room):
+            return {"first_name": "Asha", "candidate_identity": "candidate", "attempt": {}, "settings": {}}
+
+        async def factory(_ctx, _context):
+            return session
+
+        def broken(_session):
+            raise RuntimeError(POISON)
+
+        with mock.patch.object(r1_session, "fetch_context", fetch), mock.patch.object(
+            r1_session, "R1TurnWriter", lambda *_a, **_k: writer
+        ), mock.patch.object(r1_session, "build_line_cache", broken):
+            with capture_r1_logs() as lines:
+                outcome = await asyncio.wait_for(
+                    run_r1_session(ctx, session_factory=factory), 10.0
+                )
+        self.assertEqual(outcome, "configuration_failed")
+        self.assertIn("r1_line_cache_unavailable", [l["error_type"] for l in lines])
+        self.assertNotIn(POISON, json.dumps(lines))
+
+    async def test_the_runner_hands_the_built_cache_to_the_interview(self) -> None:
+        order: list = []
+        ctx = FakeContext(order)
+        ctx.room.remote_participants["candidate"] = FakeParticipant("candidate")
+        writer = FakeWriter(order, activate_ok=False)
+        session = FakeSession(log=order)
+        sentinel = LineCache(
+            FakeSynthesizer(), voice={}, sample_rate=22050, counter=RateLimitCounter()
+        )
+        seen: list = []
+        original = r1_session.R1Interview.__init__
+
+        def spy(self, *args, **kwargs):
+            seen.append(kwargs.get("line_cache"))
+            original(self, *args, **kwargs)
+
+        async def fetch(_room):
+            return {"first_name": "Asha", "candidate_identity": "candidate", "attempt": {}, "settings": {}}
+
+        async def factory(_ctx, _context):
+            return session
+
+        with mock.patch.object(r1_session, "fetch_context", fetch), mock.patch.object(
+            r1_session, "R1TurnWriter", lambda *_a, **_k: writer
+        ), mock.patch.object(r1_session, "build_line_cache", lambda _s: sentinel), mock.patch.object(
+            r1_session.R1Interview, "__init__", spy
+        ):
+            await asyncio.wait_for(run_r1_session(ctx, session_factory=factory), 10.0)
+        self.assertIn(sentinel, seen)
 
 
 if __name__ == "__main__":

@@ -382,18 +382,25 @@ class TestR1SessionFactory(unittest.IsolatedAsyncioTestCase):
         import livekit.agents as agents
         from livekit.plugins import sarvam
 
+        import r1_latency
         import r1_llm
         import r1_session
+        import r1_tts
 
         captured: dict = {}
+        tts_kwargs: dict = {}
 
         class RecordingSession:
             def __init__(self, **kwargs) -> None:
                 captured.update(kwargs)
 
+        def recording_tts(**kwargs):
+            tts_kwargs.update(kwargs)
+            return "tts"
+
         with mock.patch.object(agents, "AgentSession", RecordingSession), mock.patch.object(
             sarvam, "STT", lambda **_kwargs: "stt"
-        ), mock.patch.object(sarvam, "TTS", lambda **_kwargs: "tts"), mock.patch.object(
+        ), mock.patch.object(sarvam, "TTS", recording_tts), mock.patch.object(
             r1_llm, "build_r1_llm", lambda: "llm"
         ):
             await r1_session._default_session_factory(None, {})
@@ -408,9 +415,13 @@ class TestR1SessionFactory(unittest.IsolatedAsyncioTestCase):
             options.llm_conn_options,
             APIConnectOptions(max_retry=1, retry_interval=0.5, timeout=10.0),
         )
-        # Browser parity: no VAD and no turn handling override.
+        # Browser parity: no VAD and no turn DETECTOR override.  PR-4c gives the session R1's
+        # turn timings (endpointing, interruption, preemptive generation off) and nothing else.
         self.assertNotIn("vad", captured)
-        self.assertNotIn("turn_handling", captured)
+        self.assertEqual(captured["turn_handling"], r1_latency.r1_turn_handling())
+        self.assertNotIn("turn_detection", captured["turn_handling"])
+        # The session's voice is the one the line cache synthesises with.
+        self.assertEqual(tts_kwargs, r1_tts.r1_tts_kwargs())
 
     async def test_r1_agent_builds_on_the_real_agent_and_routes_its_llm_node(self) -> None:
         import r1_session
@@ -563,3 +574,485 @@ class TestR1LlmNodeOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual("".join(chunks).strip(), "Sorry, what were you saying?")
         self.assertTrue(interview._guard_trips)
+
+
+@unittest.skipUnless(AgentSession is not None, "livekit-agents is not installed (bare CI)")
+class TestR1LatencyOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
+    """PR-4c (plan 5.15): turn handling, preemptive generation, the early-flush node, cached
+    audio and the SDK's own timings, against the installed livekit-agents 1.6.4."""
+
+    async def test_the_session_accepts_r1_turn_handling_and_resolves_it(self) -> None:
+        import r1_latency
+
+        # turn_detection is pinned here only so the test does not build the cloud detector.
+        handling = {**r1_latency.r1_turn_handling(), "turn_detection": "stt"}
+        options = AgentSession(vad=None, turn_handling=handling).options
+        self.assertEqual(options.endpointing["min_delay"], 0.7)
+        self.assertEqual(options.endpointing["max_delay"], 3.5)
+        self.assertEqual(options.interruption["min_duration"], 0.7)
+        self.assertEqual(options.interruption["min_words"], 2)
+        self.assertFalse(options.preemptive_generation["enabled"])
+
+    def test_the_sdk_reads_interruption_options_from_the_session_not_the_agent(self) -> None:
+        # So R1's interruption numbers must be on the AgentSession (r1_latency.r1_turn_handling),
+        # and an agent-level "interruption" would silently do nothing for them.
+        self.assertIn(
+            'self._session.options.interruption["min_duration"]',
+            inspect.getsource(AgentActivity.on_vad_inference_done),
+        )
+        self.assertIn(
+            "interruption_options = self._session.options.interruption",
+            inspect.getsource(AgentActivity._interrupt_by_audio_activity),
+        )
+        agent_init = inspect.getsource(Agent.__init__)
+        self.assertNotIn("min_duration", agent_init)
+        self.assertNotIn("min_words", agent_init)
+
+    def test_preemptive_generation_stays_off_because_the_sdk_cannot_see_the_decision(self) -> None:
+        # The facts r1_session._agent_turn_handling gives for leaving it off.  If the SDK
+        # changes any of them the decision is worth taking again, so this fails loudly.
+        starter = inspect.getsource(AgentActivity.on_preemptive_generation)
+        self.assertIn("_generate_reply(", starter)
+        self.assertIn("schedule_speech=False", starter)  # the model call starts, speech waits
+        completed = inspect.getsource(AgentActivity._user_turn_completed_task)
+        hook = completed.index("await self._agent.on_user_turn_completed(")
+        keep = completed.index("if preemptive := self._preemptive_generation:")
+        self.assertLess(hook, keep)  # the hook runs AFTER the generation has begun
+        # The SDK keeps a preemptive generation when the TEXT, the chat context and the tools
+        # match.  R1 leaves turn_ctx alone, so nothing the engine decided can make them differ.
+        self.assertIn("preemptive.info.new_transcript == user_message.text_content", completed)
+        self.assertIn("preemptive.chat_ctx.is_equivalent(temp_mutable_chat_ctx)", completed)
+
+    async def test_the_engines_decision_is_not_idempotent_so_it_cannot_be_run_twice(self) -> None:
+        from r1_personas import resolve_persona
+        from r1_roleplay import RolePlayEngine
+
+        engine = RolePlayEngine(resolve_persona("p1_career_switcher", variant="v1"), seed="s")
+        first = engine.plan_turn("Tell me about your goals for this course", 30.0, turn_index=1)
+        second = engine.plan_turn("Tell me about your goals for this course", 30.0, turn_index=2)
+        self.assertEqual((first.turn, second.turn), (1, 2))  # each call advances the engine
+
+    def test_r1_agent_routes_its_tts_node_through_the_interview(self) -> None:
+        import r1_session
+
+        interview = mock.Mock()
+        marker = object()
+        interview.tts_node_stream.return_value = marker
+        agent = r1_session.R1Agent(interview)
+        seen: dict = {}
+
+        def inner(_self, text, model_settings):
+            seen.update(text=text, settings=model_settings)
+            return "inner"
+
+        with mock.patch.object(Agent, "tts_node", inner):
+            text = object()
+            self.assertIs(agent.tts_node(text, "settings"), marker)
+            args = interview.tts_node_stream.call_args.args
+            self.assertIs(args[0], text)
+            self.assertEqual(args[1]("stream"), "inner")  # the downstream call is the SDK default
+        self.assertEqual(seen["settings"], "settings")
+        self.assertFalse(inspect.iscoroutinefunction(r1_session.R1Agent.tts_node))
+
+    async def test_the_early_flush_node_runs_inside_the_sdks_tts_inference(self) -> None:
+        from livekit.agents.voice.agent import ModelSettings
+        from livekit.agents.voice.generation import perform_tts_inference
+
+        import r1_session
+        from tests.test_r1_core import FakeContext, FakeSession, FakeWriter
+
+        order: list = []
+        interview = r1_session.R1Interview(
+            FakeContext(order),
+            {"first_name": "Asha", "candidate_identity": "candidate"},
+            FakeSession(log=order),
+            FakeWriter(order),
+        )
+        agent = r1_session.R1Agent(interview)
+        calls: list[str] = []
+
+        def inner(_self, text, model_settings):
+            async def frames():
+                calls.append("".join([chunk async for chunk in text]))
+                yield rtc.AudioFrame(b"\x01\x00" * 441, 22050, 1, 441)
+
+            return frames()
+
+        async def text():
+            for chunk in ("Hello there. ", "How are you today? ", "Fine."):
+                await asyncio.sleep(0.005)  # the guard releases a sentence at a time
+                yield chunk
+
+        with mock.patch.object(Agent, "tts_node", inner):
+            task, data = perform_tts_inference(
+                node=agent.tts_node, input=text(), model_settings=ModelSettings(), text_transforms=None
+            )
+            frames = [frame async for frame in data.audio_ch]
+            self.assertTrue(await task)
+        self.assertEqual(calls, ["Hello there.", " How are you today? Fine."])
+        self.assertEqual(len(frames), 2)
+        self.assertTrue(all(isinstance(frame, rtc.AudioFrame) for frame in frames))
+        self.assertIsNotNone(data.ttfb)
+
+    def test_say_plays_provided_audio_and_still_forwards_the_text(self) -> None:
+        # The line cache plays a stored clip with session.say(text, audio=frames).
+        self.assertIn("audio", inspect.signature(AgentSession.say).parameters)
+        self.assertIn("audio", inspect.signature(AgentActivity.say).parameters)
+        impl = inspect.getsource(AgentActivity._tts_task_impl)
+        # Provided audio goes straight to the audio output, no TTS is run for it ...
+        self.assertIn("audio_output=audio_output, tts_output=audio", impl)
+        # ... and the text still becomes the transcript row (conversation_item_added).
+        self.assertIn("self._agent.transcription_node(text_source", impl)
+        self.assertIn("self._session._conversation_item_added(msg)", impl)
+
+    async def test_cached_clip_frames_are_real_audio_frames(self) -> None:
+        from r1_linecache import PcmClip
+
+        clip = PcmClip(b"\x01\x00" * 4410, 22050, 1)
+        frames = [frame async for frame in clip.frames()]
+        self.assertTrue(all(isinstance(frame, rtc.AudioFrame) for frame in frames))
+        self.assertEqual(sum(frame.samples_per_channel for frame in frames), 4410)
+        self.assertEqual(b"".join(bytes(frame.data) for frame in frames), clip.pcm)
+        self.assertEqual({(f.sample_rate, f.num_channels) for f in frames}, {(22050, 1)})
+
+    def test_the_synthesis_surface_the_line_cache_relies_on_exists(self) -> None:
+        from livekit.agents import APIStatusError
+        from livekit.agents.tts import ChunkedStream
+
+        import r1_linecache
+
+        self.assertTrue(inspect.iscoroutinefunction(ChunkedStream.collect))
+        self.assertTrue(inspect.iscoroutinefunction(ChunkedStream.aclose))
+        self.assertEqual(
+            {"max_retry", "timeout"} - set(APIConnectOptions.__dataclass_fields__), set()
+        )
+        # The phone fixtures (test_phone_gate) shadow the plugin with a file-less stub module when
+        # a mixed run collects them first; only the REAL plugin has a __file__.  CI's SDK step
+        # does not collect them, so there this always runs.
+        if getattr(_sarvam_plugin, "__file__", None) is not None:
+            self.assertIn("conn_options", inspect.signature(_sarvam_plugin.TTS.synthesize).parameters)
+        frame = rtc.AudioFrame(b"\x01\x00" * 10, 22050, 1, 10)
+        self.assertEqual(bytes(frame.data), b"\x01\x00" * 10)  # what the synthesizer stores
+        error = APIStatusError("limited", status_code=429)
+        self.assertEqual(r1_linecache.status_of(error), 429)
+        self.assertTrue(error.retryable)  # the SDK retries a 429, so each one is in an error event
+
+    def test_the_sdk_timings_r1_logs_are_fields_of_its_metrics_report(self) -> None:
+        from livekit.agents.llm.chat_context import MetricsReport
+
+        import r1_session
+
+        fields = set(MetricsReport.__annotations__)
+        for sdk_name, _schema in r1_session._SDK_METRICS:
+            self.assertIn(sdk_name, fields)
+
+    async def test_the_session_error_event_carries_the_429_status_the_counter_reads(self) -> None:
+        from livekit.agents import APIStatusError
+        from livekit.agents.tts import TTSError
+
+        import r1_session
+
+        error = TTSError(
+            timestamp=0.0,
+            label="sarvam",
+            error=APIStatusError("limited", status_code=429),
+            recoverable=True,
+        )
+        event = ErrorEvent(error=error, source=None)
+        self.assertEqual(r1_session.R1Interview._provider_status(event), 429)
+        self.assertEqual(error.type, "tts_error")
+
+
+def _pipeline_kit():
+    """Fakes for the providers and the audio output of a REAL ``AgentSession`` (offline).
+
+    The same shapes ``test_gate_sdk_contract`` uses for its audio output; the streaming TTS
+    records the text of every ``SynthesizeStream`` it is given, so a test can see exactly how
+    many downstream calls R1 made and with what text.
+    """
+    import time
+
+    from livekit.agents import llm as agents_llm
+    from livekit.agents import tts as agents_tts
+    from livekit.agents.voice import io as vio
+
+    class Output(vio.AudioOutput):
+        def __init__(self) -> None:
+            super().__init__(
+                label="r1-pipeline",
+                capabilities=vio.AudioOutputCapabilities(pause=False),
+                sample_rate=24000,
+            )
+            self.frames: list = []
+            self.finished = 0
+            self._pending = 0.0
+            self._started = False
+            self._tasks: set = set()
+
+        async def capture_frame(self, frame) -> None:
+            await super().capture_frame(frame)
+            if not self._started:
+                self._started = True
+                self.on_playback_started(created_at=time.time())
+            self._pending += frame.duration
+            self.frames.append(frame)
+
+        def flush(self) -> None:
+            super().flush()
+            duration, self._pending, self._started = self._pending, 0.0, False
+
+            async def finish() -> None:
+                await asyncio.sleep(min(duration, 0.05))
+                self.finished += 1
+                self.on_playback_finished(playback_position=duration, interrupted=False)
+
+            task = asyncio.ensure_future(finish())
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+        def clear_buffer(self) -> None:
+            self._pending = 0.0
+
+    class Stream(agents_tts.SynthesizeStream):
+        async def _run(self, output_emitter) -> None:
+            output_emitter.initialize(
+                request_id="fake", sample_rate=24000, num_channels=1,
+                mime_type="audio/pcm", stream=True,
+            )
+            output_emitter.start_segment(segment_id="segment")
+            text = ""
+            async for item in self._input_ch:
+                if isinstance(item, self._FlushSentinel):
+                    break
+                text += item
+            self._tts.texts.append(text)
+            output_emitter.push(b"\x00\x00" * (480 * max(1, len(text) // 8)))
+            output_emitter.end_segment()
+
+    class Tts(agents_tts.TTS):
+        def __init__(self) -> None:
+            super().__init__(
+                capabilities=agents_tts.TTSCapabilities(streaming=True),
+                sample_rate=24000,
+                num_channels=1,
+            )
+            self.texts: list[str] = []
+
+        def synthesize(self, text, *, conn_options=None):
+            raise NotImplementedError
+
+        def stream(self, *, conn_options=None):
+            return Stream(tts=self, conn_options=conn_options)
+
+    class LlmStream:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def __aiter__(self):
+            return self._chunks()
+
+        async def _chunks(self):
+            # OpenAI-compatible streams (DeepSeek too) carry the space BEFORE a word.
+            for index, word in enumerate(self.text.split(" ")):
+                await asyncio.sleep(0.005)
+                yield agents_llm.ChatChunk(
+                    id="chunk",
+                    delta=agents_llm.ChoiceDelta(
+                        role="assistant", content=(" " if index else "") + word
+                    ),
+                )
+
+    class Llm(agents_llm.LLM):
+        def __init__(self, reply: str) -> None:
+            super().__init__()
+            self.reply = reply
+
+        def chat(self, *, chat_ctx, tools=None, **kwargs):
+            return LlmStream(self.reply)
+
+    return Output, Tts, Llm
+
+
+@unittest.skipUnless(AgentSession is not None, "livekit-agents is not installed (bare CI)")
+class TestR1PipelineOnARealSession(unittest.IsolatedAsyncioTestCase):
+    """PR-4c end to end on a REAL ``AgentSession``: a fake LLM, a fake streaming TTS and a fake
+    audio output, with the SDK's own scheduling, pipelines and events in between.
+
+    The turn is handed over through ``AgentActivity.on_end_of_turn`` (what audio recognition
+    calls), so the SDK runs ``on_user_turn_completed``, the reply and the playout itself.
+    """
+
+    REPLY = "Okay, that makes sense. Tell me more about that."
+
+    async def asyncSetUp(self) -> None:
+        import r1_latency
+        import r1_session
+        from tests.test_r1_core import FakeContext, FakeWriter
+
+        output_cls, tts_cls, llm_cls = _pipeline_kit()
+        self.r1_session = r1_session
+        self.order: list = []
+        self.writer = FakeWriter(self.order)
+        self.out = output_cls()
+        self.tts = tts_cls()
+        self.session = AgentSession(
+            llm=llm_cls(self.REPLY),
+            tts=self.tts,
+            vad=None,
+            # "manual" only so the test does not build the cloud turn detector.
+            turn_handling={**r1_latency.r1_turn_handling(), "turn_detection": "manual"},
+        )
+        self.session.output.audio = self.out
+        self.ctx = FakeContext(self.order)
+        self.addAsyncCleanup(self.session.aclose)
+
+    def build(self, **kwargs):
+        interview = self.r1_session.R1Interview(
+            self.ctx,
+            {"first_name": "Asha", "candidate_identity": "candidate"},
+            self.session,
+            self.writer,
+            **kwargs,
+        )
+        interview.wire_events()
+        interview.machine.transition(self.r1_session.R1Phase.OPENING)
+        interview.machine.transition(self.r1_session.R1Phase.ICEBREAKER)
+        return interview
+
+    async def until(self, predicate, timeout: float = 10.0) -> None:
+        deadline = asyncio.get_running_loop().time() + timeout
+        while not predicate():
+            if asyncio.get_running_loop().time() > deadline:
+                self.fail("condition not reached in time")
+            await asyncio.sleep(0.01)
+
+    def bot_rows(self) -> list[dict]:
+        return [row for row in self.writer.saved if row["speaker"] == "bot"]
+
+    async def candidate_turn(self, text: str) -> None:
+        import time
+
+        from livekit.agents.voice import audio_recognition
+
+        self.session.emit(
+            "user_input_transcribed", UserInputTranscribedEvent(transcript=text, is_final=True)
+        )
+        now = time.time()
+        info = audio_recognition._EndOfTurnInfo(
+            skip_reply=False,
+            new_transcript=text,
+            transcript_confidence=1.0,
+            metrics=audio_recognition._EndOfTurnMetrics(
+                started_speaking_at=now - 1.0,
+                stopped_speaking_at=now - 0.4,
+                transcription_delay=0.1,
+                end_of_turn_delay=0.3,
+            ),
+        )
+        self.assertTrue(self.session._activity.on_end_of_turn(info))
+
+    async def test_a_reply_is_flushed_early_spoken_whole_and_timed(self) -> None:
+        from tests.test_r1_core import capture_r1_logs
+
+        interview = self.build()
+        await self.session.start(self.r1_session.R1Agent(interview))
+        with capture_r1_logs() as lines:
+            await self.candidate_turn("I sold courses")
+            await self.until(lambda: self.out.finished >= 1 and self.bot_rows())
+            await interview._drain_background()
+        # The first sentence went to the TTS alone, the rest in ONE further call.
+        self.assertEqual(self.tts.texts[0], "Okay, that makes sense.")
+        self.assertEqual(len(self.tts.texts), 2)
+        self.assertEqual("".join(self.tts.texts).strip(), self.REPLY)
+        # The audio of both calls reached the output, and the row is the whole reply.
+        self.assertTrue(self.out.frames)
+        self.assertEqual([row["text"].strip() for row in self.bot_rows()], [self.REPLY])
+        # Every stage was stamped once, and R1's TTS stamp agrees with the SDK's own.
+        stages = [
+            (l["schema"], l["duration_sec"])
+            for l in lines
+            if l.get("error_type") == "r1_latency"
+        ]
+        names = [name for name, _ in stages]
+        for stage in (
+            "eou_to_turn_hook", "eou_to_llm_first_token", "llm_ttft", "eou_to_guard_release",
+            "guard_hold", "eou_to_tts_first_frame", "tts_ttfb", "eou_to_first_audio",
+            "sdk_tts_first_audio", "sdk_e2e", "sdk_end_of_turn",
+        ):
+            self.assertEqual(names.count(stage), 1, (stage, names))
+        timings = dict(stages)
+        self.assertLess(abs(timings["tts_ttfb"] - timings["sdk_tts_first_audio"]), 0.25)
+        self.assertLessEqual(timings["eou_to_tts_first_frame"], timings["eou_to_first_audio"])
+
+    async def test_a_barge_in_after_the_first_fragment_leaves_the_pipeline_usable(self) -> None:
+        interview = self.build()
+        errors: list = []
+        self.session.on("error", errors.append)
+        await self.session.start(self.r1_session.R1Agent(interview))
+        await self.candidate_turn("I sold courses")
+        await self.until(lambda: self.tts.texts)  # the first fragment has been synthesised
+        await self.session.interrupt(force=True)  # the candidate cuts in
+        await asyncio.sleep(0.2)
+        before = len(self.tts.texts)
+        await self.candidate_turn("As I was saying")
+        await self.until(lambda: len(self.tts.texts) > before and self.out.finished >= 1)
+        await self.until(lambda: len(self.bot_rows()) >= 2)
+        self.assertEqual(errors, [])  # no provider error, no cancelled-generator noise
+        self.assertEqual(interview._failures, 0)
+        self.assertIsNone(interview._stop_outcome())
+
+    async def test_the_rollback_switch_sends_a_reply_to_the_tts_in_one_call(self) -> None:
+        interview = self.build()
+        await self.session.start(self.r1_session.R1Agent(interview))
+        with mock.patch.dict("os.environ", {"R1_TTS_FLUSH_MIN_CHARS": "0"}):
+            await self.candidate_turn("I sold courses")
+            await self.until(lambda: self.out.finished >= 1 and self.bot_rows())
+        self.assertEqual(len(self.tts.texts), 1)
+        self.assertEqual(self.tts.texts[0].strip(), self.REPLY)
+
+    async def test_a_scripted_line_without_a_cache_reaches_the_tts_whole(self) -> None:
+        from tests.test_r1_core import capture_r1_logs
+
+        interview = self.build()
+        await self.session.start(self.r1_session.R1Agent(interview))
+        text = interview.render_line("L-WRAP")
+        with capture_r1_logs() as lines:
+            await asyncio.wait_for(interview.say("L-WRAP"), 15.0)
+            await interview._drain_background()
+        self.assertEqual(self.tts.texts, [text])  # one call, not split into two
+        self.assertEqual([row["text"] for row in self.bot_rows()], [text])
+        said = [l for l in lines if l.get("schema") == "say_to_first_audio"]
+        self.assertEqual([l["error_category"] for l in said], ["L-WRAP"])
+
+    async def test_a_cached_scripted_line_plays_without_touching_the_tts(self) -> None:
+        from r1_linecache import LineCache, LineSpec, PcmClip, RateLimitCounter
+        from tests.test_r1_core import capture_r1_logs
+        from tests.test_r1_linecache import FakeSynthesizer
+
+        one_second = PcmClip(b"\x01\x00" * 24000, 24000, 1)
+        cache = LineCache(
+            FakeSynthesizer(one_second),
+            voice={"model": "bulbul:v3"},
+            sample_rate=24000,
+            counter=RateLimitCounter(),
+        )
+        interview = self.build(line_cache=cache)
+        await self.session.start(self.r1_session.R1Agent(interview))
+        text = interview.render_line("L-WRAP")
+        await cache.warm([LineSpec("L-WRAP", text, False)])
+        with capture_r1_logs() as lines:
+            await asyncio.wait_for(interview.say("L-WRAP"), 15.0)
+            await interview._drain_background()
+        self.assertEqual(self.tts.texts, [])  # the TTS was never asked
+        self.assertAlmostEqual(sum(frame.duration for frame in self.out.frames), 1.0, places=2)
+        self.assertEqual([row["text"] for row in self.bot_rows()], [text])
+        played = [l for l in lines if l.get("error_type") == "r1_line_cache_play"]
+        self.assertEqual([l["error_category"] for l in played], ["cached"])
+        said = [l for l in lines if l.get("schema") == "say_to_first_audio"]
+        self.assertEqual([l["error_category"] for l in said], ["L-WRAP"])

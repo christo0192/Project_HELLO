@@ -798,18 +798,23 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         }
         self.assertEqual(set(OUTCOME_DISPOSITIONS), expected)
 
-    def test_session_factory_keeps_browser_provider_defaults_without_turn_overrides(self) -> None:
+    def test_session_factory_keeps_browser_provider_defaults_and_only_r1s_turn_timings(self) -> None:
         source = (HERE / "r1_session.py").read_text(encoding="utf-8")
         factory_start = source.index("async def _default_session_factory")
         factory_end = source.index("class _SpeechSlot")
         factory = source[factory_start:factory_end]
         self.assertIn('os.getenv("SARVAM_STT_MODEL", "saaras:v3")', factory)
         self.assertIn('os.getenv("SARVAM_LANGUAGE", "en-IN")', factory)
-        self.assertIn('os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")', factory)
-        self.assertIn('os.getenv("SARVAM_TTS_VOICE", "simran")', factory)
-        self.assertIn("pace=1.0", factory)
-        self.assertIn("temperature=0.8", factory)
-        self.assertNotIn("turn_handling", factory)
+        # The voice is the browser lane's, defined once in r1_tts and shared with the line cache.
+        self.assertIn("sarvam.TTS(**r1_tts_kwargs())", factory)
+        voice = (HERE / "r1_tts.py").read_text(encoding="utf-8")
+        self.assertIn('os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")', voice)
+        self.assertIn('os.getenv("SARVAM_TTS_VOICE", "simran")', voice)
+        self.assertIn('"pace": 1.0', voice)
+        self.assertIn('"temperature": 0.8', voice)
+        # PR-4c: R1's turn TIMINGS, never the detector or the VAD (those stay the session's).
+        self.assertIn("turn_handling=r1_turn_handling()", factory)
+        self.assertNotIn("turn_detection", factory)
         self.assertNotIn("vad=", factory)
 
     def test_session_factory_pins_llm_retry_options_and_disables_user_away(self) -> None:

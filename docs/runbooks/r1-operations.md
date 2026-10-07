@@ -1173,6 +1173,56 @@ PR-L has no migration and writes no data, so there is nothing to restore.
 - Do not roll back by editing any R1 or phone setting. Neither depends on this
   switch, and `fly.phone.toml` must stay untouched.
 
+## Latency: what R1 logs, how to read it, and the switches (PR-4c, plan 5.15)
+
+Measure first: the metric sink is a no-op, so every R1 turn writes one structured log
+line per stage (component `r1`, event `unknown_event`, `error_type=r1_latency`). Each line
+carries `schema` (the stage), `duration_sec`, `phase`, `turn_index` (the transcript row of the
+candidate turn) and `error_category`. No line holds an utterance or a name.
+
+| `schema` | Meaning (seconds) |
+|---|---|
+| `eou_to_turn_hook` | Candidate end of speech to `on_user_turn_completed` (endpointing plus the transcript wait); `error_category` says which anchor was used (`vad`, `final`, `hook`). This is the window a preemptive generation could overlap |
+| `eou_to_llm_first_token`, `llm_ttft` | To the model's first text; and from the model call to it |
+| `eou_to_guard_release`, `guard_hold` | To the first vetted sentence leaving the output guard; and how long the guard held it after the first token (it releases a sentence only once the next has begun) |
+| `ack` | The acknowledgement before an owed line, with `error_category` `done`, `cutoff` or `failed` |
+| `eou_to_tts_first_frame`, `tts_ttfb` | To the first audio frame the TTS node produced; and its time from the first text |
+| `eou_to_first_audio` | The headline: end of speech to the agent's audio starting; `error_category` is the turn kind (`llm_reply`, `ack_then_say`, `say_only`, `reply`) |
+| `say_to_first_audio` | A scripted line, `error_category` the line id |
+| `sdk_*` | The SDK's own per-turn timings (`sdk_e2e`, `sdk_end_of_turn`, `sdk_transcription`, ...), to cross-check the stamps above |
+
+Stage A targets (plan 5.15): `eou_to_first_audio` p50 <= 1.8 s and p95 <= 3.0 s, scripted lines
+(`say_to_first_audio`) within 0.5 s. `fly logs --json | python app/voice-livekit/r1_latency.py`
+reads a smoke session's lines (plain JSON lines work too) and prints the verdict against those
+targets; its exit code is 0 for a pass, 1 for a miss and 2 when nothing was measured. Then
+`eou_to_turn_hook` and `guard_hold` say where the time went.
+
+Related lines: `r1_line_cache_play` (`cached` or `live`, with the line id as `schema`) and
+`r1_line_cache_*` (warm-up events: `synth_ok`, `disk_hit`, `rate_limited`, `gave_up`, ...), and
+`r1_provider_429` (a provider 429 on lane `r1`, `error_category` the component, `option_count`
+the running total for this worker). Sarvam's limits are per account and shared with the phone
+lane, so a phone TTS 429 burst that lines up with `r1_line_cache_rate_limited` lines is R1's.
+
+Switches (all read at use, so a restart is enough; every one is optional):
+
+| Variable | Default | Effect and rollback |
+|---|---|---|
+| `R1_ENDPOINT_MIN_DELAY_SEC` / `R1_ENDPOINT_MAX_DELAY_SEC` | 0.7 / 3.5 | Endpointing waits (SDK default 0.3 / 2.5 s). Lower the minimum for speed, raise it if candidates are cut off |
+| `R1_INTERRUPT_MIN_DURATION_SEC` / `R1_INTERRUPT_MIN_WORDS` | 0.7 / 2 | How long and how many words an interruption needs (SDK default 0.5 s / 0) |
+| `R1_TTS_FLUSH_MIN_CHARS` | 60 | Early-flush length cap; `0` turns the early-flush `tts_node` off |
+| `R1_LINE_CACHE` | on | `off` speaks every scripted line live, as before PR-4c |
+| `R1_SYNTH_PER_MIN` | 5 | Background Sarvam syntheses started per minute (1-30); raise only after the Sarvam tier is confirmed (D13) |
+
+Preemptive generation stays off: livekit-agents 1.6.4 starts it before the per-turn decision and
+cannot be told the decision differs (see `_agent_turn_handling` in `r1_session.py` and
+`tests/test_r1_sdk_contract.py`). Buying it back is a separate change that needs the engine's
+decision to be repeatable first.
+
+The line cache keeps candidate-free lines on this machine's disk (`r1-line-cache` under the temp
+directory, keyed by the text and the voice) and the lines that carry the candidate's first name in
+memory only. It is rebuilt after a restart. Listen to one cached and one live line at the first
+smoke: a clip that sounds wrong is removed with `R1_LINE_CACHE=off`.
+
 ## Incident handling and rollback
 
 For any active R1 incident, set `r1_settings.paused = true` first. Preserve
