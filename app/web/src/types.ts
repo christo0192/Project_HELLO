@@ -385,14 +385,23 @@ export interface Session {
   recorded_total_sec?: number | null;
   recorded_legs?: number | null;
   /**
-   * Legs that HAVE playable audio of unknown length: `recorded_total_sec`
-   * leaves them out, so it is a lower bound when this is > 0.
+   * Legs that HAVE uploaded audio of unknown length (a key bound but never
+   * uploaded does not count): `recorded_total_sec` leaves them out, so it is a
+   * lower bound when this is > 0.
    */
   recorded_unknown_legs?: number | null;
   /** true when every answered leg's end is known; false when any is not. */
   connected_complete?: boolean | null;
   /** Only when `connected_complete` is true. */
   connected_total_sec?: number | null;
+  /**
+   * WHY `connected_complete` is false, from the same roll-up: answered calls
+   * whose end nobody observed, whose end only our reconciler detected
+   * (approximate), and that have not ended yet (in progress). null = unknown.
+   */
+  connected_unobserved_legs?: number | null;
+  connected_detected_legs?: number | null;
+  connected_open_legs?: number | null;
   /**
    * 0026 session-level recording anchor (epoch ms), on `GET /api/screening/:id`
    * (`select *`). null for a worker in-band phone session.
@@ -853,10 +862,11 @@ export type PhoneAttemptRecordingReason =
 export type PhoneAttemptTranscriptKind = 'gate_only' | 'session';
 /**
  * M013 S02. Where a leg's end came from: `observed` = the SIP leave the
- * worker saw; `ledger` = the ledger end; `detected` = only our reconciler
- * sweep recorded it, i.e. when it NOTICED the call was over (an upper bound,
- * up to about a minute late); `unobserved` = only the lease reclaim ended it,
- * so the real end is unknown.
+ * worker saw; `ledger` = the ledger end (or, for a leg the lease reclaim
+ * ended only after its completed session ended, that session's end);
+ * `detected` = only our reconciler sweep recorded it, i.e. when it NOTICED
+ * the call was over (an upper bound, up to about a minute late);
+ * `unobserved` = only the lease reclaim ended it, so the real end is unknown.
  */
 export type PhoneLegEndSource = 'observed' | 'ledger' | 'detected' | 'unobserved';
 export type PhoneAttemptConsentStage =

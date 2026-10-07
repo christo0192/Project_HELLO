@@ -95,6 +95,7 @@ function leg(id: string, fields: Record<string, unknown>) {
     recording_session_id: S_PHONE,
     abandon_reason: null,
     recording_object_key: `phone-${id}-worker.mp3`,
+    recording_ready: true,
     recording_content_type: 'audio/mpeg',
     egress_id: `EG_worker_${id}`,
     egress_status: 'complete',
@@ -142,6 +143,10 @@ const get = (role?: 'admin' | 'viewer' | 'interviewer', id?: string) =>
 
 describe('candidate detail: per-session recorded facts (M013 S02 T07)', () => {
   it('9f60523d shape: recorded 70.8 s across 2 legs, connected NOT complete, no 443-based length', async () => {
+    // Leg A was ended by our reconciler (its detection time), leg B by the
+    // lease reclaim before the session ended: neither end is exact.
+    events = [{ attempt_id: LEG_A, event_type: 'sip.participant_left', source: 'reconciliation', applied: true }];
+    sessions = [{ id: S_PHONE, owner_id: null, status: 'completed', duration_sec: 443, ended_at: '2026-10-06T03:43:59.622Z' }];
     const res = await get();
     expect(res.status).toBe(200);
     const session = res.body.sessions[0];
@@ -150,6 +155,11 @@ describe('candidate detail: per-session recorded facts (M013 S02 T07)', () => {
       recorded_legs: 2,
       connected_complete: false,
       connected_total_sec: null,
+      // WHY, from the same roll-up: leg B's end was never observed, leg A's
+      // end is our reconciler's detection time (approximate).
+      connected_unobserved_legs: 1,
+      connected_detected_legs: 1,
+      connected_open_legs: 0,
     });
     // duration_sec is passed through untouched (0125 recomputes it); the new
     // facts never repeat it as a call length.
@@ -170,7 +180,7 @@ describe('candidate detail: per-session recorded facts (M013 S02 T07)', () => {
     expect(legLimits).toEqual([501]);
     // The columns the per-leg rule needs; nothing that would leak.
     const columns = legSelects[0].split(',');
-    for (const c of ['observed_ended_at', 'recording_duration_ms', 'recording_tail_flushed', 'egress_id', 'abandon_reason']) {
+    for (const c of ['observed_ended_at', 'recording_duration_ms', 'recording_tail_flushed', 'egress_id', 'abandon_reason', 'lease_expires_at']) {
       expect(columns).toContain(c);
     }
   });
@@ -318,6 +328,85 @@ describe('candidate detail: per-session recorded facts (M013 S02 T07)', () => {
     expect(res.body.sessions[0]).toMatchObject({ recorded_total_sec: 17.6, recorded_legs: 1, recorded_unknown_legs: 1 });
   });
 
+  it('a key bound at prepare but never uploaded is not counted as audio of unknown length (review round 2)', async () => {
+    legs = zeroAnswerLegs().map((l, i) => (i === 1
+      ? { ...l, recording_ready: false, recording_size_bytes: null, recording_content_type: null, egress_status: 'active' }
+      : l));
+    const res = await get();
+    expect(res.body.sessions[0]).toMatchObject({ recorded_total_sec: 53.2, recorded_legs: 1, recorded_unknown_legs: 0 });
+  });
+
+  it('a leg reclaimed after its completed session ended counts to the session end, as duration_sec does', async () => {
+    // Live when the session completed at 04:02:00 (the agent finished while
+    // its heartbeat still held the lease, to 04:02:05; the attempt's terminal
+    // post was lost); the reclaim landed at 04:04:10.
+    sessions = [{ id: S_PHONE, owner_id: null, status: 'completed', ended_at: '2026-10-07T04:02:00.000Z' }];
+    legs = [leg(LEG_A, {
+      admitted_at: '2026-10-07T04:00:00.000Z',
+      answered_at: '2026-10-07T04:00:10.000Z',
+      ended_at: '2026-10-07T04:04:10.000Z',
+      lease_expires_at: '2026-10-07T04:02:05.000Z',
+      state: 'abandoned',
+      outcome_class: null,
+      recording_size_bytes: 480_000,
+    })];
+    let res = await get();
+    expect(res.body.sessions[0]).toMatchObject({ connected_complete: true, connected_total_sec: 110 });
+    // Reclaimed BEFORE the session ended: unobserved, as in SQL.
+    sessions = [{ id: S_PHONE, owner_id: null, status: 'completed', ended_at: '2026-10-07T04:06:00.000Z' }];
+    res = await get();
+    expect(res.body.sessions[0]).toMatchObject({
+      connected_complete: false, connected_total_sec: null, connected_unobserved_legs: 1,
+    });
+  });
+
+  it('finalize-before-reclaim: a session completed after the lease lapsed does NOT bound the leg (review round 3)', async () => {
+    // The worker stopped renewing at 04:00:40. finalize_phone_partial_sessions'
+    // lapsed-lease arm completed the session at 04:03:41 (lease + 181 s,
+    // past its 180 s grace) before the delayed reclaim ran at 04:04:10. The
+    // session end is the sweep's clock, not the call's end: crediting the
+    // leg to it would state ~3 minutes of possible dead air as connected.
+    sessions = [{ id: S_PHONE, owner_id: null, status: 'completed', ended_at: '2026-10-07T04:03:41.000Z' }];
+    legs = [leg(LEG_A, {
+      admitted_at: '2026-10-07T04:00:00.000Z',
+      answered_at: '2026-10-07T04:00:10.000Z',
+      ended_at: '2026-10-07T04:04:10.000Z',
+      lease_expires_at: '2026-10-07T04:00:40.000Z',
+      state: 'abandoned',
+      outcome_class: null,
+      recording_size_bytes: 480_000,
+    })];
+    const res = await get();
+    expect(res.body.sessions[0]).toMatchObject({
+      connected_complete: false,
+      connected_total_sec: null,
+      connected_unobserved_legs: 1,
+      connected_detected_legs: 0,
+      connected_open_legs: 0,
+    });
+  });
+
+  it('a live answered leg is reported as open (a call in progress), not as an unknown end', async () => {
+    sessions = [{ id: S_PHONE, owner_id: null, status: 'in_progress', ended_at: null }];
+    legs = [leg(LEG_A, {
+      admitted_at: '2026-10-07T04:00:00.000Z',
+      answered_at: '2026-10-07T04:00:10.000Z',
+      ended_at: null,
+      lease_expires_at: '2026-10-07T04:01:40.000Z',
+      state: 'human',
+      outcome_class: null,
+      recording_ready: false,
+      recording_size_bytes: null,
+    })];
+    const res = await get();
+    expect(res.body.sessions[0]).toMatchObject({
+      connected_complete: false,
+      connected_unobserved_legs: 0,
+      connected_detected_legs: 0,
+      connected_open_legs: 1,
+    });
+  });
+
   it('a reconciler-detected leg end leaves connected incomplete: no "on the call" figure', async () => {
     legs = [leg(LEG_A, {
       admitted_at: '2026-10-07T04:00:00.000Z',
@@ -337,5 +426,6 @@ describe('candidate detail: per-session recorded facts (M013 S02 T07)', () => {
     const body = JSON.stringify(res.body);
     expect(body).not.toContain('EG_worker_');
     expect(body).not.toContain('worker.mp3');
+    expect(body).not.toContain('lease_expires_at');
   });
 });

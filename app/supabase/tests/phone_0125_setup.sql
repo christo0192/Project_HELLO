@@ -25,10 +25,12 @@
 --   clean     One leg ended by the reconciler. 0076: 90 s. 0125 must leave
 --             it untouched (nothing unobserved).
 --   late      One leg still live when the session completed (0076 bounds it
---             by the session end: 120 s), reclaimed AFTERWARDS. Its end was
---             never observed either (the session end is no observation of
---             the leg), so 0125 makes it NULL (unknown) with 1 unobserved
---             leg, the same rule as the API's per-leg read.
+--             by the session end: 120 s), reclaimed AFTERWARDS. 0125 §3a
+--             counts it to the session end too (a reclaim after the session
+--             ended is not unobserved), so the backfill leaves it at 120 s
+--             with duration_unobserved_legs NULL: the value the 0125 trigger
+--             gives the same shape completing after the deploy, and the
+--             API's per-leg read (connected until the session end).
 --
 -- Synthetic identifiers only; no real candidate, email, number or document.
 -- =====================================================================
@@ -170,7 +172,8 @@ begin
 end $$;
 
 -- The 0076 baseline these rows carry into 0125: the numbers the backfill
--- must change (two_legs, only) or must leave alone (clean, late).
+-- must change (two_legs, only) or must leave alone (clean; late, whose leg was
+-- reclaimed only after the session ended).
 do $$
 declare
   v_got jsonb;

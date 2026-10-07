@@ -133,54 +133,165 @@ describe('SessionDetailPage', () => {
     expect(screen.queryByPlaceholderText(/candidate's answer/i)).not.toBeInTheDocument();
   });
 
-  describe('M013 S02: a phone session reads its connected time, never a reclaim span', () => {
+  describe('M013 S02: a phone session reads its connected time from the per-call roll-up, never duration_sec', () => {
     const SID = '550e8400-e29b-41d4-a716-446655440000';
     const phone = {
       ...completedSessionDetail,
       session: {
         ...completedSessionDetail.session,
         mode: 'live',
-        // The 9f60523d shape after 0125: leg A only; leg B's end unobserved.
+        // The 9f60523d shape after 0125: SQL counted leg A to our
+        // reconciler's DETECTION time (75 s) and left leg B (reclaimed) out.
         duration_sec: 75,
         duration_unobserved_legs: 1,
       },
     };
+    const candidateWith = (session: Record<string, unknown>) => ({
+      candidate: { id: 'candidate-1', name: 'Jane Doe' },
+      sessions: [{ id: SID, ...session }],
+      assessments: [],
+    });
 
-    it('says "Connected time" with how many calls were left out, and the recorded total', async () => {
+    it('9f60523d: leg A only detected, leg B unobserved -> "Not known", never the 75 s detection lag', async () => {
       getSession.mockResolvedValue(phone);
-      getCandidate.mockResolvedValue({
-        candidate: { id: 'candidate-1', name: 'Jane Doe' },
-        sessions: [{ id: SID, recorded_total_sec: 70.8, recorded_legs: 2 }],
-        assessments: [],
-      });
+      // The roll-up the candidate header reads: leg A `detected`, leg B
+      // `unobserved`, so connected is not complete and has no total.
+      getCandidate.mockResolvedValue(candidateWith({
+        recorded_total_sec: 70.8, recorded_legs: 2, connected_complete: false, connected_total_sec: null,
+        connected_unobserved_legs: 1, connected_detected_legs: 1, connected_open_legs: 0,
+      }));
       renderPage();
       await screen.findByText('Connected time');
       expect(screen.queryByText('Duration')).toBeNull();
+      // Both reasons, from the roll-up (review round 3): leg B unobserved,
+      // leg A's end only approximate.
       expect(document.querySelector('[data-session-connected]')?.textContent).toBe(
-        "1m 15s (1 call's end not observed)",
+        "Not known (1 call's end not observed; 1 call's end time approximate)",
       );
+      expect(document.body.textContent).not.toContain('1m 15s');
       expect(document.querySelector('[data-session-recorded]')?.textContent).toBe('1m 11s across 2 calls');
     });
 
-    it('says "Not known" when no call end was observed, and pluralises the note', async () => {
+    it('a call end only our reconciler detected reads approximate; the reason never comes from SQL duration_unobserved_legs', async () => {
+      // SQL says 3 unobserved legs; the roll-up (the truth the page shows)
+      // says one detected end. The page follows the roll-up.
+      getSession.mockResolvedValue({ ...phone, session: { ...phone.session, duration_unobserved_legs: 3 } });
+      getCandidate.mockResolvedValue(candidateWith({
+        connected_complete: false, connected_total_sec: null,
+        connected_unobserved_legs: 0, connected_detected_legs: 1, connected_open_legs: 0,
+      }));
+      renderPage();
+      await screen.findByText('Connected time');
+      expect(document.querySelector('[data-session-connected]')?.textContent).toBe(
+        "Not known (1 call's end time approximate)",
+      );
+    });
+
+    it('pluralises the unobserved note', async () => {
       getSession.mockResolvedValue({
         ...phone,
         session: { ...phone.session, duration_sec: null, duration_unobserved_legs: 2 },
       });
+      getCandidate.mockResolvedValue(candidateWith({
+        connected_complete: false, connected_total_sec: null,
+        connected_unobserved_legs: 2, connected_detected_legs: 0, connected_open_legs: 0,
+      }));
       renderPage();
       await screen.findByText('Connected time');
       expect(document.querySelector('[data-session-connected]')?.textContent).toBe(
         "Not known (2 calls' ends not observed)",
       );
-      // The candidate read had no roll-up for this session: no recorded row.
+      // The roll-up has no recorded total for this session: no recorded row.
       expect(document.querySelector('[data-session-recorded]')).toBeNull();
     });
 
-    it('shows no note when every end was observed, and a browser session keeps "Duration"', async () => {
-      getSession.mockResolvedValue({ ...phone, session: { ...phone.session, duration_unobserved_legs: 0 } });
+    it('a LIVE call reads "Call in progress", never "Not known" or "approximate" (review round 3)', async () => {
+      getSession.mockResolvedValue({
+        ...phone,
+        session: { ...phone.session, status: 'in_progress', duration_sec: null, duration_unobserved_legs: null },
+      });
+      getCandidate.mockResolvedValue(candidateWith({
+        connected_complete: false, connected_total_sec: null,
+        connected_unobserved_legs: 0, connected_detected_legs: 0, connected_open_legs: 1,
+      }));
+      renderPage();
+      await screen.findByText('Connected time');
+      const text = document.querySelector('[data-session-connected]')?.textContent;
+      expect(text).toBe('Call in progress');
+      expect(text).not.toMatch(/not known|approximate/i);
+    });
+
+    it('an open call on an ENDED session is not "in progress": its end was not observed', async () => {
+      getSession.mockResolvedValue({
+        ...phone,
+        session: { ...phone.session, status: 'completed', duration_sec: null, duration_unobserved_legs: null },
+      });
+      getCandidate.mockResolvedValue(candidateWith({
+        connected_complete: false, connected_total_sec: null,
+        connected_unobserved_legs: 0, connected_detected_legs: 0, connected_open_legs: 1,
+      }));
+      renderPage();
+      await screen.findByText('Connected time');
+      const text = document.querySelector('[data-session-connected]')?.textContent;
+      expect(text).toBe("Not known (1 call's end not observed)");
+      expect(text).not.toMatch(/in progress/i);
+    });
+
+    it('a failed session with a reclaimed call says its end was not observed (SQL count is null there)', async () => {
+      getSession.mockResolvedValue({
+        ...phone,
+        session: { ...phone.session, status: 'failed', duration_sec: null, duration_unobserved_legs: null },
+      });
+      getCandidate.mockResolvedValue(candidateWith({
+        connected_complete: false, connected_total_sec: null,
+        connected_unobserved_legs: 1, connected_detected_legs: 0, connected_open_legs: 0,
+      }));
+      renderPage();
+      await screen.findByText('Connected time');
+      expect(document.querySelector('[data-session-connected]')?.textContent).toBe(
+        "Not known (1 call's end not observed)",
+      );
+    });
+
+    it('never a bare "Not known": a roll-up without reason counts still names a reason', async () => {
+      getSession.mockResolvedValue(phone);
+      getCandidate.mockResolvedValue(candidateWith({ connected_complete: false, connected_total_sec: null }));
+      renderPage();
+      await screen.findByText('Connected time');
+      expect(document.querySelector('[data-session-connected]')?.textContent).toBe(
+        "Not known (a call's end time is uncertain)",
+      );
+    });
+
+    it('a complete roll-up with a 0 s total reads "Under 1s"; with no total the row is omitted', async () => {
+      getSession.mockResolvedValue(phone);
+      getCandidate.mockResolvedValue(candidateWith({ connected_complete: true, connected_total_sec: 0 }));
       const { unmount } = renderPage();
       await screen.findByText('Connected time');
-      expect(document.querySelector('[data-session-connected]')?.textContent).toBe('1m 15s');
+      expect(document.querySelector('[data-session-connected]')?.textContent).toBe('Under 1s');
+      unmount();
+
+      getCandidate.mockResolvedValue(candidateWith({ connected_complete: true, connected_total_sec: null }));
+      renderPage();
+      await screen.findByText('Details');
+      expect(screen.queryByText('Connected time')).toBeNull();
+      expect(document.body.textContent).not.toMatch(/Not known/);
+    });
+
+    it('no roll-up for the session (read failed / nothing answered): no connected row, never duration_sec', async () => {
+      getSession.mockResolvedValue(phone);
+      renderPage();
+      await screen.findByText('Details');
+      expect(screen.queryByText('Connected time')).toBeNull();
+      expect(document.body.textContent).not.toContain('1m 15s');
+    });
+
+    it('every end known exactly: the roll-up total with no note; a browser session keeps "Duration"', async () => {
+      getSession.mockResolvedValue({ ...phone, session: { ...phone.session, duration_unobserved_legs: 0 } });
+      getCandidate.mockResolvedValue(candidateWith({ connected_complete: true, connected_total_sec: 61.474 }));
+      const { unmount } = renderPage();
+      await screen.findByText('Connected time');
+      expect(document.querySelector('[data-session-connected]')?.textContent).toBe('1m 1s');
       unmount();
 
       getSession.mockResolvedValue({

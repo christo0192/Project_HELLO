@@ -37,11 +37,24 @@
 --       one writer (engagement relabel, candidate screened -> screening,
 --       audits; never requeues or redials). sweep_phone_stranded_sessions
 --       (0114) is lifted in full so the relabel also converges when that
---       sweep completes the engagement after the handler ran.
+--       sweep completes the engagement after the handler ran, and every pass
+--       self-heals a post-0125 engagement still completed on 0 answers
+--       that became terminal in the last 7 days (a caught relabel failure,
+--       a handler job in the DLQ, the reclaim's scored branch).
 --
 -- Numbered 0125: origin/main took 0115-0117 for the R1 lane (_r1_ files,
--- which touch no phone function, trigger or table this file reads). No other
--- migration may re-declare the functions this file owns.
+-- which touch no phone function, trigger or table this file reads), and R1
+-- owns 0118-0124. No other migration may re-declare the functions this file
+-- owns.
+--
+-- APPLY ORDER. If this merges before R1 0119-0124, production applies 0125
+-- first and those R1 files later (`db push --include-all`), an order the
+-- harness never runs (it applies in numeric order). That is safe only while
+-- R1 0119-0124 touch none of: phone_call_attempts or call_sessions triggers,
+-- finalize_phone_partial_sessions, sweep_phone_stranded_sessions,
+-- enforce_phone_engagement_transition, chk_audit_action, or the
+-- system_config key phone_zero_answer_relabel_heal. If one does, re-run
+-- scripts/test-phone-0125.sh on main after both land.
 --
 -- Function ownership (checked on origin/main e05a804 with
 -- `grep -lE "function screening_v2\.<fn>\b" migrations/*.sql | tail -1`):
@@ -147,10 +160,12 @@ comment on column screening_v2.phone_call_attempts.recording_tail_flushed is
 -- §1b — call_sessions.duration_unobserved_legs.
 --
 -- How many answered legs §3 EXCLUDED from duration_sec because their only end
--- was the lease-reclaim time. NULL = never computed by the 0125 rule (a
--- session completed before 0125 and untouched by the §3 backfill, or not a
--- phone session); 0 = every answered leg's end was observed or bounded by the
--- session's own end.
+-- was a lease-reclaim time at or before the session's own end (§3a). NULL =
+-- never computed by the 0125 rule (a session completed before 0125 and
+-- untouched by the §3 backfill, or not a phone session); 0 = every answered
+-- leg's end was observed, a ledger end, or bounded by the session's own end
+-- (a leg still live when the session completed, including one the reclaim
+-- ended only afterwards).
 -- ─────────────────────────────────────────────────────────────────────
 alter table screening_v2.call_sessions
   add column if not exists duration_unobserved_legs smallint;
@@ -164,8 +179,10 @@ alter table screening_v2.call_sessions
 
 comment on column screening_v2.call_sessions.duration_unobserved_legs is
   '0125: answered phone legs excluded from duration_sec because their end was never '
-  'observed (lease reclaim, no observed_ended_at). NULL = not computed by the 0125 rule. '
-  'When > 0, duration_sec is a lower bound, or NULL if no leg end was observed.';
+  'observed (lease reclaim at or before the session end, no observed_ended_at). 0 = every '
+  'answered leg ended by an observed or ledger end or by the session end. NULL = not '
+  'computed by the 0125 rule. When > 0, duration_sec is a lower bound, or NULL if no leg '
+  'end was observed.';
 -- ==== 0125 §1 END ====
 
 
@@ -253,17 +270,35 @@ update screening_v2.phone_call_attempts
 -- cannot cancel another.
 --
 -- A leg is UNOBSERVED, and excluded, when its end came from the lease
--- reclaim and nothing better is known. The reclaim's exact signature
--- (0112 reclaim_phone_attempt_leases, :506-512; 0042/0056/0071 identical):
+-- reclaim, AT OR BEFORE the session's end, and nothing better is known. The
+-- reclaim's exact signature (0112 reclaim_phone_attempt_leases, :506-512;
+-- 0042/0056/0071 identical):
 --   state = 'abandoned', outcome_class NULL, ended_at = the sweep's p_now.
 -- abandon_reason NULL separates it from 0083's pre-originate infra defer
--- (`abandon_reason = 'infra_deferred'`, never answered anyway). This holds
--- WHATEVER the session's end: a leg reclaimed after its session ended is
--- unobserved too, because that session end is no observation of the leg
--- either (finalize's lapsed-lease arm ends a session at lease expiry plus
--- the grace, minutes nobody was on the line). The API's per-leg rule
--- (attempt-leg-timing.ts isUnobservedReclaim) is the same predicate, so the
--- session header and this figure agree (adversarial review, S02).
+-- (`abandon_reason = 'infra_deferred'`, never answered anyway).
+--
+-- A leg reclaimed AFTER its session ended is NOT unobserved: it was still
+-- live when the session completed, so it counts up to the session end (the
+-- 0076 bound, a real lower bound of connected time). This is the only rule
+-- the first-completion trigger (§3b) can apply: at that moment the leg is
+-- still live (ended_at NULL), so the trigger cannot know a reclaim will come
+-- later and nothing recomputes afterwards. The backfill (§3c) applies the
+-- SAME rule to history, so a session of that shape reads the same whether it
+-- completed before or after this migration. The common source of the shape
+-- is a session the agent or finalize genuinely completed whose attempt
+-- terminal post was lost (the answered-leg reclaim grace, 120 s, is shorter
+-- than the 180 s partial-finalize grace), and for it the session end is a
+-- real bound (adversarial review round 2, S02). The API's per-leg rule
+-- (attempt-leg-timing.ts) applies the same caps for a completed session:
+-- every leg end at most the session end, legs answered after it left out,
+-- and this unobserved predicate (isUnobservedReclaim). It is deliberately
+-- STRICTER in two cases, where it reports the end as not exact and this
+-- function states a number: a reconciler-detected end, and a leg reclaimed
+-- after a session that finalize's lapsed-lease arm completed only after the
+-- leg's lease had lapsed (that session end is the sweep's clock, lease
+-- expiry + 180 s or more, not a bound on the call; adversarial review round
+-- 3). Phone pages never display duration_sec, so the two never appear side
+-- by side; this figure keeps the 0076 session-end bound for those rows.
 --
 -- Result: duration_sec = the capped (86400) floor of the observed sum, or
 -- NULL when it is not positive — which includes "every answered leg is
@@ -289,7 +324,8 @@ as $$
             and a.state = 'abandoned'
             and a.outcome_class is null
             and a.abandon_reason is null
-            and a.ended_at is not null) as unobserved
+            and a.ended_at is not null
+            and a.ended_at <= p_session_ended_at) as unobserved
       from screening_v2.phone_call_attempts a
      where a.session_id = p_session_id
        and a.answered_at is not null
@@ -317,8 +353,9 @@ grant execute on function screening_v2.phone_session_leg_duration(uuid, timestam
 
 comment on function screening_v2.phone_session_leg_duration(uuid, timestamptz) is
   '0125: connected seconds of a phone session summed over its answered legs, each ending at '
-  'its observed end when known; a leg ended only by the lease reclaim is excluded and '
-  'counted. duration_sec NULL = unknown. Shared by set_phone_session_duration and the 0125 '
+  'its observed end when known and never past the session end; a leg ended only by the '
+  'lease reclaim at or before the session end is excluded and counted (one reclaimed '
+  'after the session ended counts to the session end). duration_sec NULL = unknown. Shared by set_phone_session_duration and the 0125 '
   'backfill. Reads no clock; service-role-only.';
 
 -- ─────────────────────────────────────────────────────────────────────
@@ -397,10 +434,45 @@ comment on function screening_v2.set_phone_session_duration() is
 --
 -- Intended effect (9f60523d shape): 443 s, built from a reclaim span, becomes
 -- 75 s with 1 unobserved leg. A session whose ONLY answered leg was reclaimed
--- becomes NULL (unknown). Every duration_sec consumer tolerates NULL: the
--- funnel sums (0090, NULL ignored), the DSAR export passes it through, and the
--- web pages render nothing for a null/zero duration.
+-- (before the session ended) becomes NULL (unknown). A leg reclaimed AFTER
+-- the session ended is not unobserved (§3a), so such a session keeps its
+-- session-end-bounded 0076 value and is not selected. Every duration_sec
+-- consumer tolerates NULL: the funnel sums (0090, NULL ignored), the DSAR
+-- export passes it through, and the web pages render nothing for a null/zero
+-- duration.
+--
+-- RESTORABLE. Before the UPDATE, one audit row per corrected session records
+-- the value it overwrites: action `session_updated` (an EXISTING action, see
+-- §5's note on chk_audit_action), target the call_session, actor the system
+-- sentinel, metadata {field: 'duration_sec', from: <prior duration_sec>, to:
+-- <new duration_sec>, unobserved_legs, reason:
+-- 'duration_unobserved_leg_excluded', migration: '0125'} — numbers and
+-- stable codes only, no PII. So every production value this backfill changes
+-- can be compared or restored from audit_events. The INSERT and the UPDATE
+-- select with the SAME predicate in the same transaction (§1's ACCESS
+-- EXCLUSIVE lock on call_sessions is held until COMMIT, so no row can move
+-- in between), and a second apply selects nothing for either, so no
+-- duplicate audit row is written. Two plain statements rather than one
+-- data-modifying CTE, so TST-15's analyzer classifies both.
 -- ─────────────────────────────────────────────────────────────────────
+insert into screening_v2.audit_events
+  (actor_id, actor_type, action, target_type, target_id, result, metadata)
+select '00000000-0000-0000-0000-000000000000'::uuid, 'system', 'session_updated',
+       'call_session', c.id::text, 'success',
+       jsonb_build_object('field', 'duration_sec',
+                          'from', c.duration_sec,
+                          'to', d.duration_sec,
+                          'unobserved_legs', d.unobserved_legs,
+                          'reason', 'duration_unobserved_leg_excluded',
+                          'migration', '0125')
+  from screening_v2.call_sessions c
+  cross join lateral screening_v2.phone_session_leg_duration(c.id, c.ended_at) d
+ where c.status = 'completed'
+   and c.ended_at is not null
+   and c.external_call_id ~ '^phone-[0-9a-fA-F-]{36}$'
+   and c.duration_unobserved_legs is null
+   and d.unobserved_legs > 0;
+
 update screening_v2.call_sessions s
    set duration_sec             = t.duration_sec,
        duration_unobserved_legs = t.unobserved_legs
@@ -955,8 +1027,9 @@ comment on function screening_v2.finalize_phone_partial_sessions is
 -- Callers: the phone assessment handler, after the completion post
 -- (app/api/src/lib/phone-runtime/assessment-handler.ts, system actor);
 -- sweep_phone_stranded_sessions (§5c), right after it completes an
--- engagement the handler could not relabel (system actor); and an operator
--- once for the historical 9f60523d correction.
+-- engagement the handler could not relabel, and in its self-healing pass
+-- over post-0125 engagements (system actor); and an operator once for the
+-- historical 9f60523d correction (the heal never selects history).
 -- ─────────────────────────────────────────────────────────────────────
 
 -- §5a ── the transition trigger ────────────────────────────────────────
@@ -1328,9 +1401,11 @@ comment on function screening_v2.relabel_zero_answer_phone_engagement is
 -- §5c ── sweep_phone_stranded_sessions: the relabel converges in SQL ────
 -- LIFTED IN FULL from 0114 §3 (the newest declaration: 0113's E4 callback
 -- guard and 0114's C2-P4/C2-P5 hunks live there). Every 0114 line is kept
--- byte-for-byte; 0125 only ADDS four marked hunks (`-- ▼ 0125 <id>` …
--- `-- ▲ 0125 <id>`), and phone-0125-relabel.test.ts proves that stripping
--- them restores the 0114 body exactly.
+-- byte-for-byte; 0125 only ADDS five marked hunks (`-- ▼ 0125 <id>` …
+-- `-- ▲ 0125 <id>`): converge declare, converge stranded, converge late,
+-- converge heal (the self-healing pass below) and converge keys. And
+-- phone-0125-relabel.test.ts proves that stripping them restores the 0114
+-- body exactly.
 --
 -- WHY (adversarial review, S02). The C3 rule no longer moves a measured
 -- 0-answer phone candidate to `screened`, and the handler relabels the
@@ -1350,6 +1425,46 @@ comment on function screening_v2.relabel_zero_answer_phone_engagement is
 -- self-guarding (not_eligible unless the latest assessment is a measured
 -- 0-answer phone row), and a failure is caught and counted
 -- (zero_answer_relabel_errors) so it can never undo a stranded resolution.
+--
+-- SELF-HEALING PASS (adversarial review round 2, S02). Those inline calls
+-- are the fast path only. Once an engagement is terminal, neither loop above
+-- selects it again, so three cases would keep "completed on 0 answers" for
+-- ever: (a) an inline relabel that failed and was caught (a deadlock, a
+-- serialization failure); (b) the assessment handler's relabel that kept
+-- throwing until its phone.assessment job reached the DLQ; (c)
+-- reclaim_phone_attempt_leases' scored branch (0112), which completes a
+-- stranded-shaped engagement via `reclaim:assessment.completed` and never
+-- calls the relabel. So every pass ALSO selects, oldest first and bounded by
+-- v_limit, completed engagements whose bound session's LATEST assessment is a
+-- measured 0-answer phone row (the runbook's step-0 discovery predicate) and
+-- calls the same idempotent, self-guarding RPC (system actor), each in its
+-- own caught subtransaction, counted in the same two keys.
+--
+-- HISTORY IS NOT TOUCHED. The pass takes only engagements that became
+-- terminal at or after the moment 0125 was applied (the
+-- `phone_zero_answer_relabel_heal` row in system_config below, stamped once
+-- at apply time and never moved). Relabelling an engagement completed
+-- BEFORE this migration stays an owner-approved, operator-run correction
+-- (docs/runbooks/sql/m013-relabel-zero-answer.sql), e.g. 9f60523d. If that
+-- row is missing or unreadable, the pass selects nothing (fails closed).
+--
+-- BOUNDED WINDOW (adversarial review round 3). The pass also looks back only
+-- 7 days from p_now (`terminal_at >= greatest(boundary, p_now - 7 days)`).
+-- Cases (a)-(c) surface within hours, and without the window the scan (one
+-- correlated latest-assessment probe per completed engagement) would grow
+-- with every engagement completed since 0125, on every 2-minute pass, while
+-- this sweep holds its engagement row locks. An engagement still completed
+-- on 0 answers after 7 days is left to the operator runbook, like history
+-- (its step-0 discovery query finds it).
+-- A row whose relabel fails on every pass stays at the head of the oldest-
+-- first order; it is retried each pass (until it leaves the window) and
+-- counted, and starves the rest only if v_limit (max 200) such rows exist
+-- at once.
+insert into screening_v2.system_config (key, value)
+values ('phone_zero_answer_relabel_heal',
+        jsonb_build_object('since', now(), 'migration', '0125'))
+on conflict (key) do nothing;
+
 create or replace function screening_v2.sweep_phone_stranded_sessions(
   p_limit         integer     default 25,
   p_now           timestamptz default now(),
@@ -1403,6 +1518,8 @@ declare
   v_relabel              jsonb;
   v_zero_relabelled      integer := 0;
   v_zero_relabel_errors  integer := 0;
+  v_heal_since           timestamptz;
+  v_heal_row             record;
   -- ▲ 0125 S02-4 converge declare
 begin
   for v_row in
@@ -1585,6 +1702,56 @@ begin
        limit v_limit
     ) superseded;
   -- ▲ 0114 C2-P5 late completion
+  -- ▼ 0125 S02-4 converge heal
+  -- The self-healing pass (see the header above): every completed
+  -- engagement that became terminal since 0125 was applied, and within the
+  -- last 7 days, and is still "completed on 0 answers", whatever path
+  -- completed it and however its inline relabel fared. The RPC re-checks
+  -- everything under the row lock; a row the loops above just relabelled is
+  -- no longer `completed`. The 7-day window keeps the scan bounded: it no
+  -- longer grows with every engagement completed since 0125, on every pass,
+  -- inside this sweep's transaction (adversarial review round 3).
+  begin
+    select (c.value ->> 'since')::timestamptz
+      into v_heal_since
+      from screening_v2.system_config c
+     where c.key in ('phone_zero_answer_relabel_heal');
+  exception when others then
+    v_heal_since := null;
+  end;
+  if v_heal_since is not null then
+    for v_heal_row in
+      select e.id
+        from screening_v2.phone_engagements e
+       where e.state = 'completed'
+         and e.terminal_at is not null
+         and e.terminal_at >= greatest(v_heal_since, p_now - interval '7 days')
+         and e.session_id is not null
+         and exists (
+           select 1
+             from (select a.source, a.evidence_grade, a.evidence_answered
+                     from screening_v2.assessments a
+                    where a.session_id = e.session_id
+                    order by a.created_at desc, a.revision desc, a.id desc
+                    limit 1) l
+            where l.source = 'phone'
+              and l.evidence_grade = 'insufficient'
+              and l.evidence_answered = 0)
+       order by e.terminal_at asc, e.id asc
+       limit v_limit
+    loop
+      begin
+        v_relabel := screening_v2.relabel_zero_answer_phone_engagement(
+          v_heal_row.id, '00000000-0000-0000-0000-000000000000'::uuid, p_now);
+        if (v_relabel ->> 'status') is not distinct from 'applied' then
+          v_zero_relabelled := v_zero_relabelled + 1;
+        end if;
+      exception when others then
+        v_zero_relabel_errors := v_zero_relabel_errors + 1;
+      end;
+    end loop;
+  end if;
+  -- ▲ 0125 S02-4 converge heal
 
   return jsonb_build_object(
     'status',    'ok',
@@ -1628,7 +1795,11 @@ comment on function screening_v2.sweep_phone_stranded_sessions is
   'session''s latest assessment is a measured 0-answer phone row is relabelled '
   'failed/screening_abandoned by relabel_zero_answer_phone_engagement '
   '(zero_answer_relabelled; a caught failure counts zero_answer_relabel_errors '
-  'and never rolls back the resolution). Service-role-only.';
+  'and never rolls back the resolution); and every pass self-heals, bounded by '
+  'p_limit and oldest first, any engagement that became terminal since 0125 was '
+  'applied (system_config phone_zero_answer_relabel_heal), within the last 7 days, and is still completed '
+  'on a measured 0-answer phone assessment, whatever completed it. Engagements '
+  'completed before 0125 are left to the operator runbook. Service-role-only.';
 -- ==== 0125 §5 END ====
 
 

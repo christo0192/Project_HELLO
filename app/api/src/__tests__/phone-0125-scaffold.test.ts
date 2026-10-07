@@ -269,13 +269,42 @@ describe(`${N} §3 — truthful duration`, () => {
     expect(helper).toContain('case when t.observed_sec > 0 then t.observed_sec end');
   });
 
-  it('excludes exactly the reclaim signature with no observed end, whatever the session end', () => {
+  it('excludes exactly the reclaim signature with no observed end, at or before the session end', () => {
+    // The session-end clause is what lets the first-completion trigger (the
+    // leg is still live then) and the backfill (it sees the later reclaim)
+    // give one answer for the same leg shape (review round 2, S02). The API's
+    // isUnobservedReclaim takes the session end for the same reason.
     expect(helper).toContain(
       "( a.observed_ended_at is null and a.state = 'abandoned' and a.outcome_class is null " +
-        'and a.abandon_reason is null and a.ended_at is not null) as unobserved',
+        'and a.abandon_reason is null and a.ended_at is not null ' +
+        'and a.ended_at <= p_session_ended_at) as unobserved',
     );
-    // The API's per-leg rule has no session-end clause either (review, S02).
-    expect(helper).not.toContain('a.ended_at <= p_session_ended_at');
+  });
+
+  it('snapshots every duration_sec the backfill overwrites in an audit row, before the UPDATE', () => {
+    const insertAt = s3.indexOf('insert into screening_v2.audit_events');
+    const updateAt = s3.indexOf('update screening_v2.call_sessions s set');
+    expect(insertAt).toBeGreaterThan(-1);
+    expect(insertAt).toBeLessThan(updateAt);
+    const insert = s3.slice(insertAt, s3.indexOf(';', insertAt) + 1);
+    const update = s3.slice(updateAt, s3.indexOf(';', updateAt) + 1);
+    // An EXISTING audit action (chk_audit_action is not re-created), the
+    // system sentinel, and the prior value read before it is overwritten.
+    expect(insert).toContain(
+      "select '00000000-0000-0000-0000-000000000000'::uuid, 'system', 'session_updated', " +
+        "'call_session', c.id::text, 'success',",
+    );
+    expect(insert).toContain("'from', c.duration_sec,");
+    expect(insert).toContain("'to', d.duration_sec,");
+    expect(insert).toContain("'migration', '0125'");
+    expect(insert).not.toMatch(CLOCK);
+    // The SAME row predicate as the UPDATE, so exactly the corrected rows are
+    // snapshotted and a second apply writes no duplicate.
+    const predicate = (sql: string) => sql.slice(sql.indexOf("where c.status = 'completed'"), sql.indexOf('d.unobserved_legs > 0'));
+    expect(predicate(insert).length).toBeGreaterThan(0);
+    expect(predicate(insert)).toBe(predicate(update));
+    expect(insert).toContain('cross join lateral screening_v2.phone_session_leg_duration(c.id, c.ended_at) d');
+    expect(s3.split('insert into screening_v2.audit_events').length - 1).toBe(1);
   });
 
   it('the signature matches what reclaim_phone_attempt_leases actually writes', () => {

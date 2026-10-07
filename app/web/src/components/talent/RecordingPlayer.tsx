@@ -19,6 +19,18 @@ import { api, ApiError } from '../../api';
 import { CandidateButton } from '../design/candidate';
 import { cx } from '../design/cx';
 
+/**
+ * A distinct accessible name for a leg player's control (WCAG 2.4.6): several
+ * leg players render on one page, and "Load recording" N times tells a
+ * screen-reader user nothing. The visible text comes FIRST, so the name still
+ * contains what is on screen (WCAG 2.5.3, label in name): "Load recording,
+ * Call 1 of 2". The single session player (no label) keeps its visible text
+ * as its name.
+ */
+function labelledAction(visible: string, label: string | undefined): string | undefined {
+  return label ? `${visible}, ${label}` : undefined;
+}
+
 export interface RecordingPlayerHandle {
   /** Mint the signed URL if not already loaded. Resolves when src is set. */
   load(): Promise<void>;
@@ -287,6 +299,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
             variant="secondary"
             className="shrink-0"
             onClick={fetchUrl}
+            aria-label={labelledAction('Load recording', label)}
           >
             Load recording
           </CandidateButton>
@@ -314,6 +327,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
             variant="secondary"
             className="shrink-0"
             onClick={fetchUrl}
+            aria-label={labelledAction('Try again', label)}
           >
             Try again
           </CandidateButton>
@@ -345,12 +359,14 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
             href={url!}
             download
             className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline"
+            aria-label={labelledAction('Download file', label)}
           >
             Download file
           </a>
           <button
             type="button"
             onClick={refreshUrl}
+            aria-label={labelledAction('Refresh link', label)}
             className="text-xs font-medium text-[var(--c-ink-secondary)] underline-offset-2 hover:text-[var(--c-ink)] hover:underline"
           >
             Refresh link

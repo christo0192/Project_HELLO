@@ -304,8 +304,47 @@ describe('0125 §5c — the stranded sweep converges the relabel in SQL', () => 
       'S02-4 converge declare',
       'S02-4 converge stranded',
       'S02-4 converge late',
+      'S02-4 converge heal',
       'S02-4 converge keys',
     ]);
+  });
+
+  it('self-heals post-0125 engagements still completed on 0 answers, bounded, history excluded (review round 2)', () => {
+    const h = squash(S.hunks['S02-4 converge heal'] ?? '');
+    // Placed after the C2-P5 block, before the result is built.
+    const at = SWP_0125.indexOf('-- ▼ 0125 S02-4 converge heal');
+    expect(at).toBeGreaterThan(SWP_0125.indexOf('-- ▲ 0114 C2-P5 late completion'));
+    expect(at).toBeLessThan(SWP_0125.indexOf('return jsonb_build_object('));
+    // The boundary: stamped once at apply time, read here, fail closed.
+    expect(h).toContain(
+      "select (c.value ->> 'since')::timestamptz into v_heal_since from screening_v2.system_config c " +
+        "where c.key in ('phone_zero_answer_relabel_heal');",
+    );
+    expect(h).toContain('if v_heal_since is not null then');
+    // The runbook's step-0 predicate, plus the post-0125 boundary and the
+    // 7-day window that keeps the scan bounded (review round 3).
+    for (const clause of [
+      "where e.state = 'completed' and e.terminal_at is not null " +
+        "and e.terminal_at >= greatest(v_heal_since, p_now - interval '7 days') " +
+        'and e.session_id is not null',
+      'from (select a.source, a.evidence_grade, a.evidence_answered from screening_v2.assessments a ' +
+        'where a.session_id = e.session_id order by a.created_at desc, a.revision desc, a.id desc limit 1) l',
+      "where l.source = 'phone' and l.evidence_grade = 'insufficient' and l.evidence_answered = 0)",
+      'order by e.terminal_at asc, e.id asc limit v_limit',
+      "v_relabel := screening_v2.relabel_zero_answer_phone_engagement( v_heal_row.id, " +
+        "'00000000-0000-0000-0000-000000000000'::uuid, p_now);",
+      'exception when others then v_zero_relabel_errors := v_zero_relabel_errors + 1;',
+    ]) {
+      expect(h, clause).toContain(clause);
+    }
+    // The boundary row: written once, never moved by a re-apply.
+    expect(squash(S5)).toContain(
+      "insert into screening_v2.system_config (key, value) values ('phone_zero_answer_relabel_heal', " +
+        "jsonb_build_object('since', now(), 'migration', '0125')) on conflict (key) do nothing;",
+    );
+    // The runbook keeps history operator-run.
+    const runbook = read('docs/runbooks/sql/m013-relabel-zero-answer.sql');
+    expect(runbook).toContain("and l.evidence_answered = 0");
   });
 
   it('is byte-identical to the 0114 body once the 0125 hunks are removed', () => {
@@ -356,6 +395,8 @@ describe('0125 §5c — the stranded sweep converges the relabel in SQL', () => 
       'p115r converge stranded',
       'p115r converge answered',
       'p115r converge late',
+      'p115r converge heal',
+      'p115r converge history',
     ]) {
       expect(sql, marker).toContain(marker);
     }

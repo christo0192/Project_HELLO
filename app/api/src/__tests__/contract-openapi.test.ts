@@ -1523,9 +1523,13 @@ describe('OpenAPI document integrity', () => {
       recorded_legs: 2,
       connected_complete: false,
       connected_total_sec: null,
+      connected_unobserved_legs: 1,
+      connected_detected_legs: 1,
+      connected_open_legs: 0,
     };
     expect(validateNamed(session, 'CallSession', spec)).toEqual([]);
     expect(validateNamed({ ...session, connected_complete: 'no' }, 'CallSession', spec).length).toBeGreaterThan(0);
+    expect(validateNamed({ ...session, connected_open_legs: '1' }, 'CallSession', spec).length).toBeGreaterThan(0);
     expect(validateNamed({ ...session, recorded_legs: '2' }, 'CallSession', spec).length).toBeGreaterThan(0);
 
     // The session filter on the history route is documented.

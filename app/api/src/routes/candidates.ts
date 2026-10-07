@@ -104,10 +104,12 @@ function decodeAttemptHistoryCursor(value: string | undefined): AttemptHistoryCu
 /**
  * The attempt columns the per-leg timing reads (0125). Selected by the history
  * and by the candidate detail's session roll-up so both state the same facts.
- * `egress_id` only tells a worker recording apart; it is never returned.
+ * `egress_id` only tells a worker recording apart, and `lease_expires_at` only
+ * whether a completed session's end bounds a later-reclaimed leg; neither is
+ * ever returned.
  */
 const ATTEMPT_LEG_TIMING_COLUMNS =
-  'observed_ended_at,recording_started_at_ms,recording_duration_ms,recording_tail_flushed,egress_id';
+  'observed_ended_at,recording_started_at_ms,recording_duration_ms,recording_tail_flushed,egress_id,lease_expires_at';
 
 /**
  * At most this many legs are read for one candidate's session roll-up. A read
@@ -122,6 +124,9 @@ const NULL_SESSION_RECORDED_FACTS: SessionRecordedFacts = Object.freeze({
   recorded_unknown_legs: null,
   connected_complete: null,
   connected_total_sec: null,
+  connected_unobserved_legs: null,
+  connected_detected_legs: null,
+  connected_open_legs: null,
 });
 
 /**
@@ -144,7 +149,7 @@ async function loadSessionRecordedFacts(sessionIds: readonly string[]): Promise<
     const list = ids.join(',');
     const { data, error } = await supabase
       .from('phone_call_attempts')
-      .select(`id,session_id,recording_session_id,admitted_at,answered_at,ended_at,state,abandon_reason,outcome_class,recording_object_key,recording_size_bytes,recording_content_type,recording_quarantined,recording_deleted_at,egress_status,${ATTEMPT_LEG_TIMING_COLUMNS}`)
+      .select(`id,session_id,recording_session_id,admitted_at,answered_at,ended_at,state,abandon_reason,outcome_class,recording_object_key,recording_ready,recording_size_bytes,recording_content_type,recording_quarantined,recording_deleted_at,egress_status,${ATTEMPT_LEG_TIMING_COLUMNS}`)
       .or(`session_id.in.(${list}),recording_session_id.in.(${list})`)
       .order('admitted_at', { ascending: true })
       .order('id', { ascending: true })
@@ -164,18 +169,26 @@ async function loadSessionRecordedFacts(sessionIds: readonly string[]): Promise<
     // The sessions' recording lifecycle: erased, revoked or quarantined audio
     // is not counted. A failed read is unknown, never a confident total.
     const blockedSessions = new Set<string>();
+    // A completed session's end bounds its legs (0125 §3a): every leg end is
+    // capped at it, a leg answered after it is left out, and a leg the reclaim
+    // ended only after it counts up to it when the worker completed the
+    // session (see attempt-leg-timing.ts for the one stricter case).
+    const completedSessionEnd = new Map<string, string>();
     const lifecycle = await supabase
       .from('call_sessions')
-      .select('id,recording_revoked_at,recording_quarantined,recording_deleted_at')
+      .select('id,status,ended_at,recording_revoked_at,recording_quarantined,recording_deleted_at')
       .in('id', ids)
       .limit(ids.length);
     if (lifecycle.error) return null;
     for (const raw of (Array.isArray(lifecycle.data) ? lifecycle.data : []) as Array<Record<string, unknown>>) {
-      if (typeof raw.id === 'string'
-        && (typeof raw.recording_revoked_at === 'string'
-          || typeof raw.recording_deleted_at === 'string'
-          || raw.recording_quarantined === true)) {
+      if (typeof raw.id !== 'string') continue;
+      if (typeof raw.recording_revoked_at === 'string'
+        || typeof raw.recording_deleted_at === 'string'
+        || raw.recording_quarantined === true) {
         blockedSessions.add(raw.id);
+      }
+      if (raw.status === 'completed' && typeof raw.ended_at === 'string') {
+        completedSessionEnd.set(raw.id, raw.ended_at);
       }
     }
     const legsBySession = new Map<string, AttemptLegTiming[]>();
@@ -186,6 +199,7 @@ async function loadSessionRecordedFacts(sessionIds: readonly string[]): Promise<
       const timing = attemptLegTiming({
         ...raw,
         end_detected_by_sweep: typeof raw.id === 'string' && legFacts.get(raw.id)?.endDetectedBySweep === true,
+        session_ended_at: completedSessionEnd.get(ref) ?? null,
       });
       const audioWithheld = blockedSessions.has(ref)
         || raw.recording_quarantined === true
@@ -625,6 +639,7 @@ candidatesRouter.get(
       const sessionLifecycle = new Map<string, {
         ownerId: string | null;
         status: string | null;
+        endedAt: string | null;
         revokedAt: string | null;
         quarantined: boolean;
         deletedAt: string | null;
@@ -632,7 +647,7 @@ candidatesRouter.get(
       if (sessionIds.length > 0) {
         const { data: sessionRows, error: sessionError } = await supabase
           .from('call_sessions')
-          .select('id,owner_id,status,recording_revoked_at,recording_quarantined,recording_deleted_at')
+          .select('id,owner_id,status,ended_at,recording_revoked_at,recording_quarantined,recording_deleted_at')
           .in('id', sessionIds)
           .limit(sessionIds.length);
         if (sessionError) return res.status(503).json({ error: 'Phone attempt history unavailable' });
@@ -641,6 +656,7 @@ candidatesRouter.get(
             id?: unknown;
             owner_id?: unknown;
             status?: unknown;
+            ended_at?: unknown;
             recording_revoked_at?: unknown;
             recording_quarantined?: unknown;
             recording_deleted_at?: unknown;
@@ -649,6 +665,7 @@ candidatesRouter.get(
             sessionLifecycle.set(row.id, {
               ownerId: typeof row.owner_id === 'string' ? row.owner_id : null,
               status: typeof row.status === 'string' ? row.status : null,
+              endedAt: typeof row.ended_at === 'string' ? row.ended_at : null,
               revokedAt: typeof row.recording_revoked_at === 'string' ? row.recording_revoked_at : null,
               quarantined: row.recording_quarantined === true,
               deletedAt: typeof row.recording_deleted_at === 'string' ? row.recording_deleted_at : null,
@@ -713,9 +730,13 @@ candidatesRouter.get(
           // not an exact end. A leg whose audio cannot be played (erased,
           // revoked, quarantined, failed, or not yet uploaded) states no
           // recorded length or tail note, as the Overview list does.
+          // A completed session's end bounds the leg (0125 §3a): its end is
+          // capped there, and a leg the reclaim ended only after it counts up
+          // to it when the worker completed the session.
           const timing: AttemptLegTiming = attemptLegTiming({
             ...row,
             end_detected_by_sweep: legConsentFacts.get(row.id)?.endDetectedBySweep === true,
+            session_ended_at: parent?.status === 'completed' ? parent.endedAt : null,
           });
           const recordingFacts = interviewerCanReadSession && recordingState !== 'unavailable'
             ? {
@@ -1733,6 +1754,9 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
         recorded_unknown_legs: mayReadRecording ? sessionFacts.recorded_unknown_legs : null,
         connected_complete: sessionFacts.connected_complete,
         connected_total_sec: sessionFacts.connected_total_sec,
+        connected_unobserved_legs: sessionFacts.connected_unobserved_legs,
+        connected_detected_legs: sessionFacts.connected_detected_legs,
+        connected_open_legs: sessionFacts.connected_open_legs,
       };
     }),
     assessments: assessments ?? [],

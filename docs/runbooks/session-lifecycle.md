@@ -90,7 +90,16 @@ completion by `set_phone_session_duration` through `phone_session_leg_duration`:
   and `abandon_reason` NULL, no `observed_ended_at`, ended no later than the session) is
   **excluded** and counted in `duration_unobserved_legs`. The reclaim time is when our
   sweep noticed, not when the call ended (live session 9f60523d: a 6 min reclaim span on
-  an 18 s leg).
+  an 18 s leg). A leg the reclaim ended only **after** the session completed was still
+  live at the session's end, so it counts up to that end, as in 0076. The trigger cannot
+  know about a later reclaim, and the backfill applies the same rule, so one leg shape
+  gives one `duration_sec` whenever the session completed.
+- The API's per-leg read (`connected_*` on the candidate and attempt-history routes)
+  applies the same caps, but it is **stricter** in two cases and reports the call's end
+  as not exact where `duration_sec` states a number: an end only our reconciler detected,
+  and a leg reclaimed after a session that the partial-finalize sweep completed only
+  after the leg's lease had lapsed (that session end is the sweep's clock, at least lease
+  expiry + 180 s, not a bound on the call). Phone pages never display `duration_sec`.
 - If no answered leg has a known end, `duration_sec` is **NULL** (unknown), never 0 and
   never the reclaim span. Every reader tolerates NULL (funnel sums, DSAR export, the web
   pages).
@@ -103,6 +112,45 @@ backfill is a `duration_sec` / `duration_unobserved_legs`-only UPDATE on termina
 which this table allows: neither lifecycle trigger fires, because `status` and
 `terminal_reason` do not change. It is idempotent (a backfilled row has
 `duration_unobserved_legs >= 1` and is not selected again).
+
+Every value the backfill overwrote is recorded first, one `audit_events` row per session:
+action `session_updated`, `target_type = 'call_session'`, system actor, metadata
+`{field: 'duration_sec', from, to, unobserved_legs, reason:
+'duration_unobserved_leg_excluded', migration: '0125'}`. To compare:
+
+```sql
+select target_id as session_id, metadata->'from' as prior_duration_sec,
+       metadata->'to' as new_duration_sec, created_at
+  from screening_v2.audit_events
+ where action = 'session_updated'
+   and metadata->>'migration' = '0125'
+   and metadata->>'reason' = 'duration_unobserved_leg_excluded';
+```
+
+To restore the pre-0125 values (owner decision only: they include the reclaim spans the
+backfill removed). The restore also resets `duration_unobserved_legs` to NULL, so a
+restored row no longer claims the 0125 rule computed it. Run it in one transaction and
+check the row count against the SELECT above before committing:
+
+```sql
+begin;
+update screening_v2.call_sessions s
+   set duration_sec             = (e.metadata->>'from')::integer,
+       duration_unobserved_legs = null
+  from screening_v2.audit_events e
+ where e.action = 'session_updated'
+   and e.target_type = 'call_session'
+   and e.metadata->>'migration' = '0125'
+   and e.metadata->>'reason' = 'duration_unobserved_leg_excluded'
+   and s.id = e.target_id::uuid
+   and s.status = 'completed';
+-- row count must equal the SELECT above; then:
+commit;
+```
+
+Note the restored rows are selected again by the 0125 backfill predicate
+(`duration_unobserved_legs IS NULL` with an unobserved leg) only if 0125 is re-applied,
+which `supabase db push` never does.
 
 The web app never presents a phone session's `duration_sec` as time "on the call". It
 shows the recorded total across the legs, and the connected total only when every leg's
@@ -191,7 +239,13 @@ completes it later (the stranded `assessment.completed`, or the 0114 C2-P5 late
 completion after a stranded abort), the sweep calls the same RPC in the same pass (0125
 §5c). A relabel failure there is caught and counted as `zero_answer_relabel_errors`
 (the API logs `phone_zero_answer_relabel_failed`); it never rolls back the stranded
-resolution. An operator calls it for a historical correction with `docs/runbooks/sql/m013-relabel-zero-answer.sql`. Relabelling
+resolution. Every sweep pass also **self-heals**: bounded by its limit and oldest first,
+it calls the RPC for every engagement that became terminal at or after 0125 was applied
+(`system_config` key `phone_zero_answer_relabel_heal`, stamped once at apply time) and is
+still `completed` on a measured 0-answer phone assessment. That covers a caught relabel
+failure, a handler job that reached the DLQ, and the lease reclaim's scored branch,
+which completes an engagement without calling the relabel. Engagements completed
+before 0125 are never selected. An operator calls it for a historical correction with `docs/runbooks/sql/m013-relabel-zero-answer.sql`. Relabelling
 historical sessions other than the one the owner approved needs the owner's approval
 first.
 

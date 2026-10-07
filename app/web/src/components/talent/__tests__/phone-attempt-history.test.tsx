@@ -355,7 +355,10 @@ describe('PhoneAttemptHistory per-leg truth (M013 S02)', () => {
     transcript: null,
   };
 
-  it('the 9f60523d shape: a ledger leg with an estimated recording, and a leg whose end nobody observed', async () => {
+  it('the 9f60523d shape: a reconciler-detected leg with an estimated recording, and a leg whose end nobody observed', async () => {
+    // Leg A was ended by our reconciler's sip.participant_left (its
+    // DETECTION time, ~14 s after the hang-up), so the API reads it
+    // `detected`, with no length (review round 2 nit).
     const legA = {
       ...LEG,
       id: '00000000-0000-4000-8000-000000000031',
@@ -363,11 +366,11 @@ describe('PhoneAttemptHistory per-leg truth (M013 S02)', () => {
       admitted_at: iso(T0),
       answered_at: iso(T0 + 10_000),
       ended_at: iso(T0 + 85_000),
-      duration_sec: 75,
+      duration_sec: null,
       connected_from: iso(T0 + 10_000),
       connected_to: iso(T0 + 85_000),
-      connected_to_source: 'ledger',
-      connected_sec: 75,
+      connected_to_source: 'detected',
+      connected_sec: null,
       recorded_sec: 53.2,
       recorded_sec_estimated: true,
       tail_may_be_missing: true,
@@ -398,11 +401,14 @@ describe('PhoneAttemptHistory per-leg truth (M013 S02)', () => {
     const rows = Array.from(container.querySelectorAll('li'));
     const [rowB, rowA] = rows;
 
-    expect(rowA.textContent).toContain('Connected 1m 15s · Recorded ≈53s (estimated)');
+    expect(rowA.textContent).toContain('Connected, end time approximate · Recorded ≈53s (estimated)');
+    expect(rowA.textContent).not.toContain('1m 15s');
     expect(rowA.querySelector('[data-attempt-note="tail"]')?.textContent).toBe(
       'This recording may end a few seconds before the call did.',
     );
-    expect(rowA.querySelector('[data-attempt-note="unobserved"]')).toBeNull();
+    expect(rowA.querySelector('[data-attempt-note="unobserved"]')?.textContent).toMatch(
+      /^End time approximate: our check found the call over by \d\d:\d\d IST\.$/,
+    );
 
     expect(rowB.textContent).toContain('Connected, end not observed · Recorded 18s');
     expect(rowB.querySelector('[data-attempt-note="unobserved"]')?.textContent).toMatch(
@@ -410,7 +416,7 @@ describe('PhoneAttemptHistory per-leg truth (M013 S02)', () => {
     );
     expect(rowB.querySelector('[data-attempt-note="tail"]')).toBeNull();
     // No reclaim span is presented as a call length anywhere.
-    expect(container.textContent).not.toMatch(/6m 8s|6m 7s|7m 23s/);
+    expect(container.textContent).not.toMatch(/6m 8s|6m 7s|7m 23s|1m 15s/);
     // An ordinary consented leg carries no consent tag.
     expect(container.querySelector('[data-attempt-consent]')).toBeNull();
   });

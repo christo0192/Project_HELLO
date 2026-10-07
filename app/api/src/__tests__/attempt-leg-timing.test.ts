@@ -30,6 +30,7 @@ function row(fields: Partial<AttemptLegTimingRow> = {}): AttemptLegTimingRow {
     recording_duration_ms: null,
     recording_tail_flushed: null,
     recording_object_key: `phone-${ID}-worker.mp3`,
+    recording_ready: true,
     recording_size_bytes: 425_708,
     recording_content_type: 'audio/mpeg',
     egress_id: `EG_worker_${ID}`,
@@ -66,6 +67,7 @@ describe('attemptLegTiming', () => {
       recording_started_at_ms: null,
       tail_may_be_missing: true,
       has_recording: true,
+      answered_after_session_end: false,
     });
   });
 
@@ -126,8 +128,114 @@ describe('attemptLegTiming', () => {
       .toMatchObject({ connected_to_source: 'observed', connected_sec: 18.718 });
   });
 
+  it('a leg reclaimed AFTER its completed session ended is bounded by the session end (0125 §3a)', () => {
+    // Still live when the worker completed the session at 03:38:00 (its
+    // heartbeat held the lease to 03:38:30); the reclaim landed at 03:40:57.
+    // duration_sec (trigger and backfill alike) counts it to the session end,
+    // so the per-leg read does too: a ledger-style bound.
+    const held = { lease_expires_at: '2026-10-06T03:38:30.000Z' };
+    const t = attemptLegTiming(reclaimed({ ...held, session_ended_at: '2026-10-06T03:38:00.000Z' }));
+    expect(t).toMatchObject({
+      connected_from: '2026-10-06T03:34:49.612Z',
+      connected_to: '2026-10-06T03:38:00.000Z',
+      connected_to_source: 'ledger',
+      connected_sec: 190.388,
+    });
+    expect(sessionRecordedFacts([t])).toMatchObject({ connected_complete: true, connected_total_sec: 190.388 });
+    // Reclaimed at or before the session end: unobserved, as in SQL.
+    expect(attemptLegTiming(reclaimed({ session_ended_at: '2026-10-06T03:43:59.622Z' })).connected_to_source).toBe('unobserved');
+    expect(attemptLegTiming(reclaimed({ session_ended_at: '2026-10-06T03:40:57.456Z' })).connected_to_source).toBe('unobserved');
+    // No completed session end known (live or not completed): unobserved.
+    expect(attemptLegTiming(reclaimed({ session_ended_at: null })).connected_to_source).toBe('unobserved');
+    // An observed end still wins over the session-end bound.
+    expect(attemptLegTiming(reclaimed({
+      ...held,
+      session_ended_at: '2026-10-06T03:38:00.000Z',
+      observed_ended_at: '2026-10-06T03:35:08.330Z',
+    }))).toMatchObject({ connected_to_source: 'observed', connected_sec: 18.718 });
+  });
+
+  it('finalize-before-reclaim: a session completed after the lease LAPSED does not bound the leg (review round 3)', () => {
+    // The worker stopped renewing at 03:35:20. finalize's lapsed-lease arm
+    // completed the session at 03:38:21 (lease + 181 s), and the delayed
+    // reclaim ran at 03:40:57. That session end is the sweep's clock: the
+    // leg's end is unknown, never ~3 minutes of dead air as connected time.
+    const lapsed = attemptLegTiming(reclaimed({
+      lease_expires_at: '2026-10-06T03:35:20.000Z',
+      session_ended_at: '2026-10-06T03:38:21.000Z',
+    }));
+    expect(lapsed).toMatchObject({
+      connected_to: '2026-10-06T03:40:57.456Z',
+      connected_to_source: 'unobserved',
+      connected_sec: null,
+    });
+    expect(sessionRecordedFacts([lapsed])).toMatchObject({
+      connected_complete: false, connected_total_sec: null, connected_unobserved_legs: 1,
+    });
+    // An unknown lease expiry is not evidence the worker was alive: unobserved.
+    expect(attemptLegTiming(reclaimed({ session_ended_at: '2026-10-06T03:38:00.000Z' })).connected_to_source)
+      .toBe('unobserved');
+    // The SQL predicate itself is unchanged (duration_sec keeps the bound).
+    expect(isUnobservedReclaim(reclaimed({
+      lease_expires_at: '2026-10-06T03:35:20.000Z',
+      session_ended_at: '2026-10-06T03:38:21.000Z',
+    }))).toBe(false);
+  });
+
+  it('caps every leg end at the completed session end, as 0125 §3a least(..., session end) does', () => {
+    const sessionEnd = '2026-10-06T03:32:00.000Z';
+    // The agent completed the session at 03:32:00; the SIP leave arrived 3 s
+    // later. SQL stores answered -> session end; so does the per-leg read.
+    const observedLate = attemptLegTiming(row({
+      ended_at: '2026-10-06T03:32:04.000Z',
+      observed_ended_at: '2026-10-06T03:32:03.000Z',
+      session_ended_at: sessionEnd,
+    }));
+    expect(observedLate).toMatchObject({ connected_to: sessionEnd, connected_to_source: 'ledger', connected_sec: 73.178 });
+    // A ledger end past the session end: capped the same way.
+    const ledgerLate = attemptLegTiming(row({ session_ended_at: sessionEnd }));
+    expect(ledgerLate).toMatchObject({ connected_to: sessionEnd, connected_to_source: 'ledger', connected_sec: 73.178 });
+    // An end before the session end is untouched.
+    expect(attemptLegTiming(row({ session_ended_at: '2026-10-06T03:35:00.000Z' })))
+      .toMatchObject({ connected_to: '2026-10-06T03:32:02.356Z', connected_to_source: 'ledger', connected_sec: 75.534 });
+  });
+
+  it('a leg answered AFTER the completed session ended is left out of the connected roll-up, as SQL does', () => {
+    const sessionEnd = '2026-10-06T03:33:00.000Z';
+    const inSession = attemptLegTiming(row({ session_ended_at: sessionEnd }));
+    // Answered at 03:34:49, after the session ended at 03:33:00, then
+    // reclaimed: its own window is reported (unobserved), unbounded by a
+    // session it is not part of, and it does not make the session's
+    // connected time unknown.
+    const after = attemptLegTiming(reclaimed({ session_ended_at: sessionEnd }));
+    expect(after).toMatchObject({
+      answered_after_session_end: true,
+      connected_from: '2026-10-06T03:34:49.612Z',
+      connected_to: '2026-10-06T03:40:57.456Z',
+      connected_to_source: 'unobserved',
+      connected_sec: null,
+    });
+    expect(sessionRecordedFacts([inSession, after])).toMatchObject({
+      connected_complete: true,
+      connected_total_sec: 75.534,
+      connected_unobserved_legs: 0,
+      // Its recording still counts: audio is audio.
+      recorded_legs: 2,
+    });
+    // An after-the-end leg with an exact end is not capped into a negative span.
+    expect(attemptLegTiming(reclaimed({
+      session_ended_at: sessionEnd,
+      observed_ended_at: '2026-10-06T03:35:08.330Z',
+    }))).toMatchObject({ connected_to_source: 'observed', connected_sec: 18.718, answered_after_session_end: true });
+  });
+
   it('matches the 0125 §3a reclaim signature exactly', () => {
     expect(isUnobservedReclaim(reclaimed())).toBe(true);
+    // The session-end clause: a reclaim after the completed session ended is
+    // not unobserved; at or before it, it is.
+    expect(isUnobservedReclaim(reclaimed({ session_ended_at: '2026-10-06T03:38:00.000Z' }))).toBe(false);
+    expect(isUnobservedReclaim(reclaimed({ session_ended_at: '2026-10-06T03:40:57.456Z' }))).toBe(true);
+    expect(isUnobservedReclaim(reclaimed({ session_ended_at: '2026-10-06T03:43:59.622Z' }))).toBe(true);
     // 0083 infra defer is not a reclaim.
     expect(isUnobservedReclaim(reclaimed({ abandon_reason: 'infra_deferred' }))).toBe(false);
     // An abandoned row WITH an outcome was ended by an event, not the sweep.
@@ -147,6 +255,7 @@ describe('attemptLegTiming', () => {
       'a.outcome_class is null',
       'a.abandon_reason is null',
       'a.ended_at is not null',
+      'a.ended_at <= p_session_ended_at',
     ]) expect(body).toContain(clause);
   });
 
@@ -215,6 +324,9 @@ describe('sessionRecordedFacts', () => {
       recorded_unknown_legs: 0,
       connected_complete: false,
       connected_total_sec: null,
+      connected_unobserved_legs: 1,
+      connected_detected_legs: 0,
+      connected_open_legs: 0,
     });
   });
 
@@ -225,9 +337,13 @@ describe('sessionRecordedFacts', () => {
       recorded_unknown_legs: null,
       connected_complete: null,
       connected_total_sec: null,
+      connected_unobserved_legs: null,
+      connected_detected_legs: null,
+      connected_open_legs: null,
     });
     expect(sessionRecordedFacts([attemptLegTiming(row({ answered_at: null, recording_object_key: null }))])).toEqual({
       recorded_total_sec: null, recorded_legs: 0, recorded_unknown_legs: 0, connected_complete: null, connected_total_sec: null,
+      connected_unobserved_legs: 0, connected_detected_legs: 0, connected_open_legs: 0,
     });
   });
 
@@ -246,14 +362,31 @@ describe('sessionRecordedFacts', () => {
     ])).toMatchObject({ recorded_total_sec: 17.6, recorded_legs: 1, recorded_unknown_legs: 0 });
   });
 
+  it('a key bound at prepare but never uploaded is NOT audio of unknown length', () => {
+    // The worker died before /recording/complete and nothing latched
+    // `failed`: the key exists, no object, no stamped length.
+    const unuploaded = attemptLegTiming(reclaimed({
+      recording_ready: false,
+      recording_size_bytes: null,
+      recording_content_type: null,
+      egress_status: 'active',
+    }));
+    expect(unuploaded).toMatchObject({ has_recording: false, recorded_sec: null, tail_may_be_missing: false });
+    expect(sessionRecordedFacts([attemptLegTiming(row({ recording_duration_ms: 53_180 })), unuploaded]))
+      .toMatchObject({ recorded_total_sec: 53.18, recorded_legs: 1, recorded_unknown_legs: 0 });
+    // A stamped length (only /recording/complete writes it, after the
+    // upload) is audio even before the ready flag is read.
+    expect(attemptLegTiming(row({ recording_ready: false, recording_duration_ms: 12_000 })).has_recording).toBe(true);
+  });
+
   it('a reconciler-detected leg makes connected incomplete (no "on the call" figure)', () => {
     expect(sessionRecordedFacts([attemptLegTiming(row({ end_detected_by_sweep: true }))]))
-      .toMatchObject({ connected_complete: false, connected_total_sec: null });
+      .toMatchObject({ connected_complete: false, connected_total_sec: null, connected_detected_legs: 1, connected_unobserved_legs: 0 });
   });
 
   it('a live answered leg makes connected incomplete', () => {
     expect(sessionRecordedFacts([attemptLegTiming(row()), attemptLegTiming(row({ ended_at: null }))]))
-      .toMatchObject({ connected_complete: false, connected_total_sec: null });
+      .toMatchObject({ connected_complete: false, connected_total_sec: null, connected_open_legs: 1, connected_unobserved_legs: 0 });
   });
 
   it('all ends known: the connected sum', () => {

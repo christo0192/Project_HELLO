@@ -7,10 +7,13 @@
 --     'phone-<session_id>', and the backfill changed nothing else on the row
 --     (0055's answered_at trigger did not fire);
 --   * §3: two_legs 443 -> 75 s with 1 unobserved leg; only 360 -> NULL with 1
---     unobserved leg; late (reclaimed after the session ended) 120 -> NULL
---     with 1 unobserved leg; clean untouched (duration_unobserved_legs stays
---     NULL) — and every one of those UPDATEs landed on a TERMINAL
---     (`completed`) session row.
+--     unobserved leg; late (reclaimed only after the session ended, so
+--     bounded by the session end) and clean untouched at 120 s / 90 s
+--     (duration_unobserved_legs stays NULL) — and every one of those UPDATEs
+--     landed on a TERMINAL (`completed`) session row;
+--   * §3 restorable: exactly one `session_updated` audit row per corrected
+--     session (two_legs, only), carrying the overwritten prior duration_sec
+--     (443, 360) and the new value, and none for late or clean.
 -- Then it snapshots updated_at so phone_0125_assert.sql can prove the SECOND
 -- apply of 0125 changed no row (idempotent backfills).
 -- =====================================================================
@@ -32,8 +35,26 @@ begin
        'two_legs', jsonb_build_array('completed', 75, 1),
        'only',     jsonb_build_array('completed', null, 1),
        'clean',    jsonb_build_array('completed', 90, null),
-       'late',     jsonb_build_array('completed', null, 1)) then
+       'late',     jsonb_build_array('completed', 120, null)) then
     raise exception 'p115 backfill: unexpected (status, duration_sec, unobserved) per session: %', v_got;
+  end if;
+
+  -- ── §3 backfill: every overwritten prior value is in the audit trail ─
+  select jsonb_object_agg(p.slug, jsonb_build_array(
+           ae.actor_type, ae.target_type, ae.result,
+           ae.metadata -> 'from', ae.metadata -> 'to', ae.metadata -> 'unobserved_legs'))
+    into v_got
+    from _p115.snap p
+    join screening_v2.audit_events ae
+      on ae.target_id = p.session_id::text
+     and ae.action = 'session_updated'
+     and ae.metadata ->> 'migration' = '0125'
+     and ae.metadata ->> 'reason' = 'duration_unobserved_leg_excluded'
+     and ae.metadata ->> 'field' = 'duration_sec';
+  if v_got is distinct from jsonb_build_object(
+       'two_legs', jsonb_build_array('system', 'call_session', 'success', 443, 75, 1),
+       'only',     jsonb_build_array('system', 'call_session', 'success', 360, null, 1)) then
+    raise exception 'p115 backfill: unexpected duration audit rows (prior -> new): %', v_got;
   end if;
 
   -- ── §2 backfill: the reconnect leg's room name ─────────────────────

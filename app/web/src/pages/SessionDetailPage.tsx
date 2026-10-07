@@ -66,6 +66,24 @@ interface SessionContext {
   recordedCalls: number | null;
   /** Calls with audio of unknown length, left out of `recordedSeconds`. */
   recordedUnknownCalls: number | null;
+  /**
+   * M013 S02: the SAME connected facts as the candidate header, from the same
+   * roll-up: true when every answered call's end is known exactly, false when
+   * any call's end was not observed or was only detected by our reconciler
+   * (approximate), null when unknown (no answered call, or the read failed).
+   */
+  connectedComplete: boolean | null;
+  /** Connected seconds (>= 0), only when `connectedComplete` is true. */
+  connectedSeconds: number | null;
+  /**
+   * WHY connected time is not known, from the SAME roll-up (never from SQL
+   * `duration_unobserved_legs`, which is computed only when a session first
+   * completes): calls whose end nobody observed, calls whose end only our
+   * reconciler detected (approximate), calls still in progress.
+   */
+  connectedUnobservedCalls: number;
+  connectedDetectedCalls: number;
+  connectedOpenCalls: number;
 }
 
 function nonBlank(value: unknown): string | null {
@@ -90,12 +108,18 @@ async function readContext(session: Session): Promise<SessionContext> {
     ? candidate.value?.sessions?.find((s) => s?.id === session.id) ?? null
     : null;
   const recordedSeconds = positiveOrNull(rolled?.recorded_total_sec);
+  const connectedComplete = typeof rolled?.connected_complete === 'boolean' ? rolled.connected_complete : null;
   return {
     candidateName: candidate.status === 'fulfilled' ? nonBlank(candidate.value?.candidate?.name) : null,
     roleTitle: role.status === 'fulfilled' ? nonBlank(role.value?.title) : null,
     recordedSeconds,
     recordedCalls: recordedSeconds !== null ? positiveOrNull(rolled?.recorded_legs) : null,
     recordedUnknownCalls: recordedSeconds !== null ? positiveOrNull(rolled?.recorded_unknown_legs) : null,
+    connectedComplete,
+    connectedSeconds: connectedComplete === true ? nonNegativeOrNull(rolled?.connected_total_sec) : null,
+    connectedUnobservedCalls: countOrZero(rolled?.connected_unobserved_legs),
+    connectedDetectedCalls: countOrZero(rolled?.connected_detected_legs),
+    connectedOpenCalls: countOrZero(rolled?.connected_open_legs),
   };
 }
 
@@ -103,15 +127,62 @@ function positiveOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 }
 
-/** Answered legs left out of `duration_sec` because nobody saw them end (0125). */
-function unobservedLegs(session: Session): number {
-  const n = session.duration_unobserved_legs;
-  return typeof n === 'number' && Number.isInteger(n) && n > 0 ? n : 0;
+function nonNegativeOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-/** "(1 call's end not observed)" / "(2 calls' ends not observed)". */
-function unobservedNote(count: number): string {
-  return count === 1 ? "(1 call's end not observed)" : `(${count} calls' ends not observed)`;
+function countOrZero(value: unknown): number {
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : 0;
+}
+
+/** Session statuses after which no call can still be in progress. */
+const SESSION_ENDED_STATUSES = new Set(['completed', 'failed', 'expired', 'cancelled', 'abandoned', 'deleted']);
+
+/** "5m 3s"; a complete total under a second reads "Under 1s", never a bare 0s. */
+function connectedTimeText(seconds: number): string {
+  return seconds < 1 ? 'Under 1s' : formatDurationSec(seconds);
+}
+
+/**
+ * The value shown when connected time is NOT complete, with its reason taken
+ * from the roll-up's counts. Calls still in progress (and nothing else
+ * unknown) read "Call in progress", not "Not known": the call simply has not
+ * ended. Otherwise "Not known (…)" names every reason that applies, e.g.
+ * 9f60523d: "Not known (1 call's end not observed; 1 call's end time
+ * approximate)".
+ */
+function incompleteConnectedText(
+  context: SessionContext,
+  sessionEnded: boolean,
+): { value: string; note: string | null } {
+  const unobserved = context.connectedUnobservedCalls;
+  const detected = context.connectedDetectedCalls;
+  const open = context.connectedOpenCalls;
+  // A leg with no end on a session that has already ended is not "in
+  // progress": its end was simply never recorded.
+  if (sessionEnded && open > 0) {
+    const reasons: string[] = [];
+    const notRecorded = unobserved + open;
+    reasons.push(notRecorded === 1 ? "1 call's end not observed" : `${notRecorded} calls' ends not observed`);
+    if (detected > 0) {
+      reasons.push(detected === 1 ? "1 call's end time approximate" : `${detected} calls' end times approximate`);
+    }
+    return { value: 'Not known', note: `(${reasons.join('; ')})` };
+  }
+  if (open > 0 && unobserved === 0 && detected === 0) {
+    return { value: open === 1 ? 'Call in progress' : `${open} calls in progress`, note: null };
+  }
+  const reasons: string[] = [];
+  if (unobserved > 0) {
+    reasons.push(unobserved === 1 ? "1 call's end not observed" : `${unobserved} calls' ends not observed`);
+  }
+  if (detected > 0) {
+    reasons.push(detected === 1 ? "1 call's end time approximate" : `${detected} calls' end times approximate`);
+  }
+  if (open > 0) {
+    reasons.push(open === 1 ? '1 call in progress' : `${open} calls in progress`);
+  }
+  return { value: 'Not known', note: `(${reasons.length > 0 ? reasons.join('; ') : "a call's end time is uncertain"})` };
 }
 
 /** "Meera Iyer’s screening", else the role, else the mode. Never an id. */
@@ -175,7 +246,13 @@ export function SessionDetailPage() {
   const meta = pageMeta(session, context);
   const words = typeof session.candidate_words === 'number' ? session.candidate_words : null;
   const phone = session.mode === 'live';
-  const unobserved = unobservedLegs(session);
+  // null = no "Connected time" row (no answered call, an unreadable roll-up,
+  // or a complete roll-up with no total).
+  const connected = context.connectedComplete === true
+    ? (context.connectedSeconds !== null ? { value: connectedTimeText(context.connectedSeconds), note: null } : null)
+    : context.connectedComplete === false
+      ? incompleteConnectedText(context, SESSION_ENDED_STATUSES.has(session.status))
+      : null;
 
   return (
     <div className="space-y-6">
@@ -224,16 +301,25 @@ export function SessionDetailPage() {
               </DetailRow>
               {phone ? (
                 <>
-                  {/* A phone session's `duration_sec` is CONNECTED time
-                      summed over the calls whose end was seen (0125). A call
-                      only the timeout closed is left out and said so, never
-                      counted as minutes nobody was on the line for. */}
-                  {(session.duration_sec != null || unobserved > 0) && (
+                  {/* Connected time comes from the SAME per-call roll-up as
+                      the candidate header, never from `duration_sec`: SQL
+                      counts a call end our reconciler only DETECTED (up to a
+                      reconcile interval after the hang-up) as exact, and
+                      would state that lag as call time (review round 2). A
+                      call whose end is not known exactly makes it "Not
+                      known", with the reason from the same roll-up (review
+                      round 3); a call that has not ended reads "Call in
+                      progress"; a call only the timeout closed is never
+                      counted as minutes nobody was on the line. */}
+                  {connected !== null && (
                     <DetailRow label="Connected time">
                       <span data-session-connected="">
-                        {session.duration_sec != null ? formatDurationSec(session.duration_sec) : 'Not known'}
-                        {unobserved > 0 && (
-                          <span className="text-ink-secondary"> {unobservedNote(unobserved)}</span>
+                        {connected.value}
+                        {connected.note && (
+                          <span className="text-ink-secondary">
+                            {' '}
+                            {connected.note}
+                          </span>
                         )}
                       </span>
                     </DetailRow>

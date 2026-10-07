@@ -621,6 +621,130 @@ begin
 end $$;
 
 -- ─────────────────────────────────────────────────────────────────────
+-- converge heal — §5c's self-healing pass (adversarial review round 2).
+--   heal     An engagement completed AFTER 0125 was applied on a measured
+--            0-answer row whose inline relabel never landed (a caught
+--            failure, a handler job in the DLQ, or the reclaim's scored
+--            branch, which never calls it). The next sweep pass relabels
+--            it: failed/screening_abandoned, terminal_at kept, the
+--            candidate screened -> screening, one system audit each.
+--   history  The same data on an engagement completed BEFORE the boundary
+--            is left completed: history stays an owner-approved operator
+--            correction (docs/runbooks/sql/m013-relabel-zero-answer.sql).
+-- Times are relative to the stamped boundary, so the fixture holds whatever
+-- the container clock read when 0125 was applied.
+-- ─────────────────────────────────────────────────────────────────────
+do $$
+declare
+  v_since timestamptz;
+  v_h uuid[]; v_old uuid[]; v_res jsonb; v_e screening_v2.phone_engagements%rowtype;
+begin
+  select (value->>'since')::timestamptz into v_since
+    from screening_v2.system_config where key in ('phone_zero_answer_relabel_heal');
+  if v_since is null or (select value->>'migration' from screening_v2.system_config
+                          where key in ('phone_zero_answer_relabel_heal')) <> '0125' then
+    raise exception 'p115r converge heal: 0125 must stamp the heal boundary in system_config';
+  end if;
+
+  v_h := _p115.rl_chain('heal', 55, 'screened', v_since + interval '1 hour');
+  perform _p115.rl_assess(v_h[2], v_h[3], 'phone', 'insufficient', 'no_candidate_speech', 0, 5,
+                          v_since + interval '62 minutes');
+  v_old := _p115.rl_chain('history', 56, 'screened', v_since - interval '1 day');
+  perform _p115.rl_assess(v_old[2], v_old[3], 'phone', 'insufficient', 'no_candidate_speech', 0, 5,
+                          v_since - interval '1 day' + interval '2 minutes');
+
+  v_res := screening_v2.sweep_phone_stranded_sessions(200, v_since + interval '2 hours');
+  if v_res->>'status' <> 'ok'
+     or coalesce((v_res->>'zero_answer_relabelled')::integer, 0) < 1
+     or coalesce((v_res->>'zero_answer_relabel_errors')::integer, -1) <> 0 then
+    raise exception 'p115r converge heal: expected ok, >= 1 relabelled, 0 errors; got %', v_res;
+  end if;
+
+  select * into v_e from screening_v2.phone_engagements where id = v_h[1];
+  if v_e.state <> 'failed' or v_e.state_reason <> 'screening_abandoned'
+     or v_e.terminal_at <> v_since + interval '1 hour' + interval '90 seconds' then
+    raise exception 'p115r converge heal: expected failed/screening_abandoned with terminal_at kept; got %/% %',
+      v_e.state, v_e.state_reason, v_e.terminal_at;
+  end if;
+  if (select status from screening_v2.candidates where id = v_h[3]) <> 'screening'
+     or (select count(*) from screening_v2.audit_events
+          where action = 'screening_failed' and target_type = 'phone_engagement'
+            and target_id = v_h[1]::text and actor_type = 'system'
+            and metadata->>'reason' = 'screening_abandoned') <> 1
+     or (select count(*) from screening_v2.audit_events
+          where action = 'candidate_status_changed' and target_id = v_h[3]::text
+            and actor_type = 'system' and metadata->>'reason' = 'screening_abandoned') <> 1 then
+    raise exception 'p115r converge heal: candidate must move screened -> screening with one audit each';
+  end if;
+
+  select * into v_e from screening_v2.phone_engagements where id = v_old[1];
+  if v_e.state <> 'completed'
+     or (select status from screening_v2.candidates where id = v_old[3]) <> 'screened'
+     or exists (select 1 from screening_v2.audit_events
+                 where target_id in (v_old[1]::text, v_old[3]::text)
+                   and metadata->>'reason' = 'screening_abandoned') then
+    raise exception 'p115r converge history: an engagement completed before 0125 must be left to the operator; got %/%',
+      v_e.state, v_e.state_reason;
+  end if;
+
+  -- A second pass writes nothing more.
+  select * into v_e from screening_v2.phone_engagements where id = v_h[1];
+  v_res := screening_v2.sweep_phone_stranded_sessions(200, v_since + interval '3 hours');
+  if (select version from screening_v2.phone_engagements where id = v_h[1]) <> v_e.version
+     or (select count(*) from screening_v2.audit_events
+          where target_id = v_h[1]::text and metadata->>'reason' = 'screening_abandoned') <> 1
+     or (select state from screening_v2.phone_engagements where id = v_old[1]) <> 'completed' then
+    raise exception 'p115r converge heal: a later pass must change nothing; got %', v_res;
+  end if;
+
+  raise notice 'p115r converge heal: PASS (post-0125 engagement healed; history left to the operator)';
+end $$;
+
+-- ─────────────────────────────────────────────────────────────────────
+-- converge heal window — the self-healing scan is BOUNDED to engagements
+-- that became terminal in the last 7 days (adversarial review round 3: an
+-- unbounded scan grew with every completed engagement since 0125, on every
+-- 2-minute pass). The cases it heals appear within hours; an older one is
+-- left to the operator runbook, exactly like history.
+--   stale    A post-0125 engagement completed on a measured 0-answer row is
+--            NOT touched by a pass more than 7 days after it became
+--            terminal, and IS healed by a pass inside the window.
+-- ─────────────────────────────────────────────────────────────────────
+do $$
+declare
+  v_since timestamptz;
+  v_s uuid[]; v_e screening_v2.phone_engagements%rowtype;
+begin
+  select (value->>'since')::timestamptz into v_since
+    from screening_v2.system_config where key in ('phone_zero_answer_relabel_heal');
+
+  v_s := _p115.rl_chain('stale', 57, 'screened', v_since + interval '1 day');
+  perform _p115.rl_assess(v_s[2], v_s[3], 'phone', 'insufficient', 'no_candidate_speech', 0, 5,
+                          v_since + interval '1 day' + interval '2 minutes');
+
+  -- Terminal at since + 1 day + 90 s; a pass at since + 9 days looks back
+  -- only to since + 2 days.
+  perform screening_v2.sweep_phone_stranded_sessions(200, v_since + interval '9 days');
+  select * into v_e from screening_v2.phone_engagements where id = v_s[1];
+  if v_e.state <> 'completed'
+     or exists (select 1 from screening_v2.audit_events
+                 where target_id = v_s[1]::text and metadata->>'reason' = 'screening_abandoned') then
+    raise exception 'p115r converge heal window: a pass more than 7 days later must not select it; got %/%',
+      v_e.state, v_e.state_reason;
+  end if;
+
+  -- Inside the window it is healed as usual.
+  perform screening_v2.sweep_phone_stranded_sessions(200, v_since + interval '1 day' + interval '2 hours');
+  select * into v_e from screening_v2.phone_engagements where id = v_s[1];
+  if v_e.state <> 'failed' or v_e.state_reason <> 'screening_abandoned' then
+    raise exception 'p115r converge heal window: a pass inside 7 days must heal it; got %/%',
+      v_e.state, v_e.state_reason;
+  end if;
+
+  raise notice 'p115r converge heal window: PASS (older than 7 days left to the operator; inside healed)';
+end $$;
+
+-- ─────────────────────────────────────────────────────────────────────
 -- acl — service_role only.
 -- ─────────────────────────────────────────────────────────────────────
 do $$

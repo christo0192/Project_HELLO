@@ -170,8 +170,9 @@ describe('sessionLegs', () => {
   });
 
   it('words a leg the same everywhere: connected, recorded, unobserved', () => {
-    // The 9f60523d shape, anonymised: leg A ended by the ledger with an
-    // estimated recording; leg B only ended by the lease reclaim ~6 min on.
+    // A ledger-ended leg with an estimated recording (leg A), and a leg only
+    // the lease reclaim ended ~6 min on (leg B). Anonymised timings; the real
+    // 9f60523d leg A was reconciler-DETECTED, which the next case covers.
     const legA = leg({
       id: 'a', attempt_seq: 1, admitted_at: iso(T0), answered_at: iso(T0 + 10_000),
       connected_from: iso(T0 + 10_000), connected_to: iso(T0 + 85_000), connected_to_source: 'ledger',

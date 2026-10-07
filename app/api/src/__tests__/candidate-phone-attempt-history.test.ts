@@ -428,9 +428,12 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
     ];
   }
 
-  it('9f60523d shape: ledger end + estimated length on leg A, unobserved leg B, no reclaim span as a length', async () => {
-    sessionRows = [parentSession()];
+  it('9f60523d shape: detected end + estimated length on leg A, unobserved leg B, no reclaim span as a length', async () => {
+    sessionRows = [parentSession({ ended_at: '2026-10-06T03:43:59.622Z' })];
     attempts = zeroAnswerShape();
+    // As in production: leg A's end is our reconciler's applied
+    // sip.participant_left, i.e. its DETECTION time (review round 2 nit).
+    events = [{ attempt_id: LEG_A, event_type: 'sip.participant_left', source: 'reconciliation', applied: true }];
     const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
     expect(res.status).toBe(200);
     const [c, b, a] = res.body.attempts;
@@ -438,9 +441,9 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
     expect(a).toMatchObject({
       connected_from: '2026-10-06T03:30:46.822Z',
       connected_to: '2026-10-06T03:32:02.356Z',
-      connected_to_source: 'ledger',
-      connected_sec: 75.534,
-      duration_sec: 75.534,
+      connected_to_source: 'detected',
+      connected_sec: null,
+      duration_sec: null,
       recorded_sec: 53.2,
       recorded_sec_estimated: true,
       recording_started_at_ms: null,
@@ -475,13 +478,57 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
     // No field of any leg carries a reclaim-based length (367.8 s / 443 s).
     for (const attempt of res.body.attempts) {
       for (const key of ['duration_sec', 'connected_sec', 'recorded_sec']) {
-        expect([null, 75.534, 53.2, 17.6]).toContain(attempt[key]);
+        expect([null, 53.2, 17.6]).toContain(attempt[key]);
       }
     }
     // Neither provider ids nor storage keys cross the boundary.
     const body = JSON.stringify(res.body);
     expect(body).not.toContain('EG_worker_');
     expect(body).not.toContain('worker.mp3');
+  });
+
+  it('a leg reclaimed after its completed session ended is bounded by the session end (0125 §3a)', async () => {
+    const reclaimedLate = workerLeg(LEG_A, {
+      admitted_at: '2026-10-07T04:00:00.000Z',
+      answered_at: '2026-10-07T04:00:10.000Z',
+      ended_at: '2026-10-07T04:04:10.000Z',
+      // The worker's heartbeat still held the lease when it completed the
+      // session at 04:02:00.
+      lease_expires_at: '2026-10-07T04:02:05.000Z',
+      state: 'abandoned',
+      outcome_class: null,
+      recording_size_bytes: 480_000,
+    });
+    attempts = [reclaimedLate];
+    sessionRows = [parentSession({ ended_at: '2026-10-07T04:02:00.000Z' })];
+    let res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0]).toMatchObject({
+      connected_to: '2026-10-07T04:02:00.000Z',
+      connected_to_source: 'ledger',
+      connected_sec: 110,
+      duration_sec: 110,
+    });
+    // The lease expiry is read, never returned.
+    expect(JSON.stringify(res.body)).not.toContain('lease_expires_at');
+    // Finalize-before-reclaim (review round 3): the lease lapsed at 04:00:40
+    // and the partial-finalize sweep completed the session at 04:03:41, past
+    // its 180 s grace. That end is the sweep's clock, not the call's: the
+    // leg stays unobserved rather than ~3 minutes of possible dead air.
+    attempts = [{ ...reclaimedLate, lease_expires_at: '2026-10-07T04:00:40.000Z' }];
+    sessionRows = [parentSession({ ended_at: '2026-10-07T04:03:41.000Z' })];
+    res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0]).toMatchObject({
+      connected_to: '2026-10-07T04:04:10.000Z',
+      connected_to_source: 'unobserved',
+      connected_sec: null,
+      duration_sec: null,
+    });
+    attempts = [reclaimedLate];
+    // A session that is not completed gives no bound: the reclaim stays
+    // unobserved (SQL computes no duration for it either).
+    sessionRows = [parentSession({ status: 'failed', ended_at: '2026-10-07T04:02:00.000Z' })];
+    res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0]).toMatchObject({ connected_to_source: 'unobserved', connected_sec: null });
   });
 
   it('a 0125 leg: observed end, true audio length, anchor and a flushed tail', async () => {

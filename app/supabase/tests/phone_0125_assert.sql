@@ -2,7 +2,8 @@
 -- 0125 assertions, part 3 — after the SECOND apply of 0125.
 --
 -- Proves by execution, against the real functions and triggers:
---   * idempotency: the second apply re-ran both backfills and changed no row;
+--   * idempotency: the second apply re-ran both backfills and changed no row,
+--     and wrote no second duration audit row;
 --   * §1: the columns exist with their types, and each CHECK refuses the
 --     garbage it exists for (0 ms, a seconds-for-ms slip, an end long before
 --     admission, a negative count);
@@ -13,8 +14,10 @@
 --   * §3: on first completion the new rule gives the 9f60523d shape 75 s / 1
 --     unobserved; the same shape with the reconnect leg's observed end gives
 --     94 s / 0; a session whose only answered leg is reclaimed gives NULL / 1;
---     a preset duration_sec is still kept; a terminal session accepts a
---     duration-only UPDATE;
+--     a leg still live at completion and reclaimed afterwards gives 120 s / 0,
+--     the same as the shared rule re-run after the reclaim (trigger and
+--     backfill agree); a preset duration_sec is still kept; a terminal
+--     session accepts a duration-only UPDATE;
 --   * posture: the new functions are not browser-executable, the definer one
 --     pins search_path.
 -- =====================================================================
@@ -79,6 +82,13 @@ begin
   if (select duration_sec from screening_v2.call_sessions s join _p115.snap p
         on p.session_id = s.id where p.slug = 'two_legs') <> 75 then
     raise exception 'p115 idempotency: two_legs lost its backfilled duration';
+  end if;
+  -- The second apply wrote no second snapshot of a prior duration_sec.
+  if (select count(*) from screening_v2.audit_events
+       where action = 'session_updated'
+         and metadata ->> 'migration' = '0125'
+         and metadata ->> 'reason' = 'duration_unobserved_leg_excluded') <> 2 then
+    raise exception 'p115 idempotency: the second apply wrote another duration audit row';
   end if;
 end $$;
 
@@ -313,6 +323,25 @@ begin
    where id = v_sess;
   insert into _p115.snap (slug, session_id) values ('new_preset', v_sess);
 
+  -- Still live when the session completes, reclaimed AFTERWARDS (the review's
+  -- round-2 shape): the trigger bounds it by the session end, 120 s / 0, and
+  -- nothing recomputes when the reclaim lands.
+  select eng, sess into v_eng, v_sess from _p115.chain('new_late');
+  insert into screening_v2.phone_call_attempts
+    (engagement_id, attempt_seq, epoch, kind, state, outcome_class, ist_date,
+     prior_engagement_state, session_id, admitted_at, answered_at, lease_expires_at)
+  values (v_eng, 1, 0, 'initial', 'human', null, '2026-10-05', 'eligible', v_sess,
+          '2026-10-05T12:00:00Z', '2026-10-05T12:00:30Z', '2026-10-05T12:02:30Z');
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete',
+         ended_at = '2026-10-05T12:02:30Z'
+   where id = v_sess;
+  update screening_v2.phone_call_attempts
+     set state = 'abandoned', outcome_class = null, lease_token = null,
+         lease_owner = null, ended_at = '2026-10-05T12:06:30Z'
+   where engagement_id = v_eng;
+  insert into _p115.snap (slug, session_id) values ('new_late', v_sess);
+
   select jsonb_object_agg(p.slug, jsonb_build_array(s.duration_sec, s.duration_unobserved_legs))
     into v_got
     from _p115.snap p join screening_v2.call_sessions s on s.id = p.session_id
@@ -322,8 +351,21 @@ begin
        'new_observed',   jsonb_build_array(94, 0),
        'new_only',       jsonb_build_array(null, 1),
        'new_live',       jsonb_build_array(100, 0),
-       'new_preset',     jsonb_build_array(42, null)) then
+       'new_preset',     jsonb_build_array(42, null),
+       'new_late',       jsonb_build_array(120, 0)) then
     raise exception 'p115 §3: unexpected (duration_sec, unobserved) on first completion: %', v_got;
+  end if;
+
+  -- Trigger and backfill agree: the shared rule, re-evaluated AFTER the
+  -- reclaim landed (what §3c computes for a pre-0125 session of this shape),
+  -- gives the value the trigger stored at first completion.
+  select jsonb_build_array(d.duration_sec, d.unobserved_legs) into v_got
+    from _p115.snap p
+    join screening_v2.call_sessions s on s.id = p.session_id
+    cross join lateral screening_v2.phone_session_leg_duration(s.id, s.ended_at) d
+   where p.slug = 'new_late';
+  if v_got <> jsonb_build_array(120, 0) then
+    raise exception 'p115 §3: the rule after the late reclaim gives % (trigger stored [120, 0])', v_got;
   end if;
 
   -- A terminal session accepts a duration-only UPDATE (what the §3c

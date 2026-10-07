@@ -687,6 +687,9 @@ export function createPhoneRuntime(
   // it on every pass and the operator cannot clear it (the row is terminal
   // and a newer cycle exists), so the warn fires only when the count changes.
   let lastLateSupersededWarned = 0;
+  // 0125 §5c: the zero_answer_relabel_errors count last WARNED, latched the
+  // same way (the heal pass re-counts a permanently failing relabel).
+  let lastRelabelErrorsWarned = 0;
   // 0071 / X5b: sessions driven terminal so a crashed call's recording could
   // finalize. Kept apart from `stranded` (0045), which resolves the opposite
   // shape — an engagement pointing at an already-terminal session.
@@ -1337,15 +1340,20 @@ export function createPhoneRuntime(
           }
           lastLateSupersededWarned = superseded;
           // 0125 §5c: a zero-answer relabel that raised inside the sweep was
-          // caught (the stranded resolution still committed) and will be
-          // retried by nothing, so it is operator attention. Count only.
+          // caught (the stranded resolution still committed). The sweep's
+          // self-healing pass retries it on every pass, so a transient
+          // failure clears itself; one that keeps failing is operator
+          // attention. Count only. Latched like late_superseded: a relabel
+          // that fails permanently is re-counted on every pass, so it warns
+          // once per change of value, not every tick.
           const relabelErrors = resolved.zeroAnswerRelabelErrors ?? 0;
-          if (relabelErrors > 0) {
+          if (relabelErrors > 0 && relabelErrors !== lastRelabelErrorsWarned) {
             logger.warn('unknown_event', {
               error_type: 'phone_zero_answer_relabel_failed',
               error_category: `phone_stranded:relabel_errors.${Math.min(relabelErrors, 9999)}`,
             });
           }
+          lastRelabelErrorsWarned = relabelErrors;
         }
         return resolved.status === 'ok' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
       },

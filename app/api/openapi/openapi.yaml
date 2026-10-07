@@ -8773,12 +8773,12 @@ components:
         duration_sec:
           type: integer
           nullable: true
-          description: Phone sessions (0125) - connected seconds summed over the answered legs whose end was observed or ledger-recorded; legs ended only by the lease reclaim are excluded and counted in duration_unobserved_legs (null when no leg end was observed). Not talk time, and not shown as call length for phone sessions - use recorded_total_sec / connected_total_sec.
+          description: Phone sessions (0125) - connected seconds summed over the legs answered at or before the session end, each ending at its observed or ledger end and never past the session end; a leg ended only by the lease reclaim AT OR BEFORE the session end is excluded and counted in duration_unobserved_legs (a leg reclaimed after the session ended counts up to the session end). null when no leg end was observed. Set on first completion (or by the 0125 backfill). Not talk time, and not shown as call length for phone sessions - use recorded_total_sec / connected_total_sec, which are stricter (a reconciler-detected end, or a session completed by a sweep after the leg's lease lapsed, is not treated as exact there).
         duration_unobserved_legs:
           type: integer
           minimum: 0
           nullable: true
-          description: M013 S02 (0125). Answered phone legs excluded from duration_sec because their end was never observed. null when not computed by the 0125 rule.
+          description: M013 S02 (0125). Answered phone legs excluded from duration_sec because their only end is a lease reclaim at or before the session end (a leg reclaimed after the session ended is counted to the session end, not here). null when not computed by the 0125 rule (any session that has not completed, and completed sessions from before 0125 that needed no correction).
         recorded_total_sec:
           type: number
           nullable: true
@@ -8792,15 +8792,30 @@ components:
           type: integer
           minimum: 0
           nullable: true
-          description: M013 S02. GET /api/candidates/{id} only. How many of this session's legs HAVE playable audio whose length is unknown (an OGG fallback or legacy OGG row). recorded_total_sec leaves them out, so it is a lower bound when this is greater than 0. Legs whose audio was erased, revoked, quarantined or failed count in neither. null as for recorded_total_sec.
+          description: M013 S02. GET /api/candidates/{id} only. How many of this session's legs HAVE uploaded audio (recording_ready, or a length stamped at /recording/complete) whose length is unknown (an OGG fallback or legacy OGG row). A leg whose object key was bound but never uploaded is not counted. recorded_total_sec leaves them out, so it is a lower bound when this is greater than 0. Legs whose audio was erased, revoked, quarantined or failed count in neither. null as for recorded_total_sec.
         connected_complete:
           type: boolean
           nullable: true
-          description: M013 S02. GET /api/candidates/{id} only. true when every answered leg's end was observed or ledger-recorded; false when any answered leg's end was not observed (lease reclaim), was only detected by our reconciler sweep (an upper bound), or it has not ended. null when no leg was answered or the legs could not be read.
+          description: M013 S02. GET /api/candidates/{id} only. true when every answered leg's end was observed or ledger-recorded; false when any answered leg's end was not observed (lease reclaim), was only detected by our reconciler sweep (an upper bound), or it has not ended. The reason is given by connected_unobserved_legs / connected_detected_legs / connected_open_legs. A leg answered after a completed session's end is not part of the session and is left out. null when no leg was answered or the legs could not be read.
         connected_total_sec:
           type: number
           nullable: true
           description: M013 S02. GET /api/candidates/{id} only. Sum of the answered legs' connected_sec, only when connected_complete is true; otherwise null.
+        connected_unobserved_legs:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: M013 S02. GET /api/candidates/{id} only. Answered legs whose end nobody observed (CandidatePhoneAttempt.connected_to_source unobserved). null when the session has no phone legs or they could not be read.
+        connected_detected_legs:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: M013 S02. GET /api/candidates/{id} only. Answered legs whose only end is our reconciler sweep's detection time, an approximate upper bound (connected_to_source detected). null as for connected_unobserved_legs.
+        connected_open_legs:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: M013 S02. GET /api/candidates/{id} only. Answered legs that have not ended yet (a call in progress). null as for connected_unobserved_legs.
         created_at:
           type: string
           format: date-time
@@ -10319,7 +10334,7 @@ components:
           type: string
           enum: [observed, ledger, detected, unobserved]
           nullable: true
-          description: M013 S02. observed = the SIP leave the worker observed (0125 observed_ended_at, unless an earlier ledger end exists); ledger = the ledger end (provider or worker event); detected = the only end is the one our reconciler sweep recorded, i.e. when it noticed the leg was gone (an upper bound, up to a reconcile interval after the hang-up); unobserved = ended only by the lease reclaim with no observed end, so the call's real end is unknown.
+          description: M013 S02. observed = the SIP leave the worker observed (0125 observed_ended_at, unless an earlier ledger end exists); ledger = the ledger end (provider or worker event), or a completed session's end - every end of a leg answered within a completed session is capped at that session's end, and a leg the lease reclaim ended only AFTER its session was completed (while the leg's lease was still held) counts up to the session end, as the 0125 duration_sec does; detected = the only end is the one our reconciler sweep recorded, i.e. when it noticed the leg was gone (an upper bound, up to a reconcile interval after the hang-up); unobserved = ended only by the lease reclaim with no observed end, at or before the session's end, or after a session that has not completed or that a sweep completed only after the leg's lease had lapsed (that session end is not a bound on the call), so the call's real end is unknown.
         connected_sec:
           type: number
           nullable: true
@@ -10349,7 +10364,7 @@ components:
           type: string
           enum: [before_consent, after_consent, consent_withdrawn, deferred_after_consent]
           nullable: true
-          description: Whether this leg's audio was captured before the candidate consented, and what the candidate did about consent on it. before_consent when the leg is unbound and either its outcome ends at or before the consent step (including opt_out, a refused disclosure) or its parent session never completed (worker clips kept under the 2026-09-26 retention decision recorded in 0105). On a consent-bound leg (0107 session_id set) - consent_withdrawn when the leg ended opt_out or a candidate.opt_out event names this attempt; deferred_after_consent when it ended callback_deferred or a callback.deferred_in_call event names it (a "call me later", not a withdrawal); otherwise after_consent. Keyed only on this leg's own facts, never the engagement's state. Every recording is kept; the stage only labels it. null when that cannot be told apart, e.g. a pre-0107 unbound leg under a completed parent. No transcript is read.
+          description: Whether this leg's audio was captured before the candidate consented, and what the candidate did about consent on it. before_consent when the leg is unbound and either its outcome ends at or before the consent step (including opt_out, a refused disclosure) or its parent session never completed (worker clips kept under the 2026-09-26 retention decision recorded in 0105). On a consent-bound leg (0107 session_id set) - consent_withdrawn when the leg ended opt_out or a candidate.opt_out event names this attempt; deferred_after_consent when it ended callback_deferred, a callback.deferred_in_call event names it, or a voice callback was booked and confirmed from it (0113 E4: a phone_appointments row with confirmed_from_attempt_id = this attempt) (a "call me later", not a withdrawal); otherwise after_consent. Keyed only on this leg's own facts, never the engagement's state. Every recording is kept; the stage only labels it. null when that cannot be told apart, e.g. a pre-0107 unbound leg under a completed parent. No transcript is read.
         transcript:
           allOf:
             - $ref: '#/components/schemas/CandidatePhoneAttemptTranscript'

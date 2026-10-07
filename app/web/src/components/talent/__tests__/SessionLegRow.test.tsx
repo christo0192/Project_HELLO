@@ -5,7 +5,7 @@
  * "may end a few seconds before the call did" next to "Recording deleted".
  * Synthetic timings only.
  */
-import { render } from '@testing-library/react';
+import { render, screen } from '@testing-library/react';
 import { describe, it, expect } from 'vitest';
 import type { CandidatePhoneAttempt } from '../../../types';
 import { SessionLegRow } from '../SessionLegRow';
@@ -59,6 +59,20 @@ describe('SessionLegRow', () => {
     const { container } = renderRow(leg({ recording: { state: 'unavailable', reason: 'revoked' } }));
     expect(container.textContent).not.toContain('Recorded');
     expect(container.querySelector('[data-leg-note="tail"]')).toBeNull();
+  });
+
+  it('each leg player names its controls by its leg, so two legs never share a button name (WCAG 2.4.6)', () => {
+    const ready = { state: 'ready', reason: null } as unknown as CandidatePhoneAttempt['recording'];
+    render(
+      <ul>
+        <SessionLegRow leg={leg({ id: 'a', recording: ready })} index={0} total={2} sessionId="s" />
+        <SessionLegRow leg={leg({ id: 'b', recording: ready })} index={1} total={2} sessionId="s" />
+      </ul>,
+    );
+    // The visible text leads the name (label in name, WCAG 2.5.3).
+    expect(screen.getByRole('button', { name: 'Load recording, Call 1 of 2' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Load recording, Call 2 of 2' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Load recording' })).toBeNull();
   });
 
   it('a reconciler-detected end reads approximate, with no length', () => {
