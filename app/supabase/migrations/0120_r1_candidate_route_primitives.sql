@@ -58,7 +58,7 @@ begin
 end;
 $$;
 
-create or replace trigger trg_interview_rounds_audience_locked
+create trigger trg_interview_rounds_audience_locked
   before update of consent_locale on screening_v2.interview_rounds
   for each row execute function screening_v2.reject_interview_round_audience_change();
 

@@ -93,7 +93,7 @@ describe('migration 0120', () => {
     const guard = between(
       flat,
       `create or replace function screening_v2.${AUDIENCE_GUARD}() returns trigger`,
-      '$$; create or replace trigger',
+      '$$; create trigger',
     );
     // SECURITY DEFINER with a pinned path, so row level security cannot hide the consent row.
     expect(guard).toContain('language plpgsql security definer set search_path = pg_catalog, screening_v2');
@@ -106,7 +106,7 @@ describe('migration 0120', () => {
     expect(guard).toContain("errcode = 'P0001'");
     // Fired for any UPDATE that names the column, on every row, before the write.
     expect(flat).toContain(
-      'create or replace trigger trg_interview_rounds_audience_locked '
+      'create trigger trg_interview_rounds_audience_locked '
         + 'before update of consent_locale on screening_v2.interview_rounds '
         + `for each row execute function screening_v2.${AUDIENCE_GUARD}();`,
     );
