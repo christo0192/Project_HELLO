@@ -344,6 +344,254 @@ to zero rooms, deploy in the merge window, verify a new R1 room and worker,
 then remove the old key and record non-secret rotation evidence. (implemented
 in PR-SFU-2)
 
+## Legacy browser screening retirement (PR-L, plan section 8.5, D12)
+
+Status: implemented in PR-L. This section is the drain procedure, the read-only
+SQL that shows legacy usage, and the rollback. It is a procedure for the owner
+or operator to run; no step here is automated and none is a launch
+authorisation. Claude has no production SQL or Fly access.
+
+### What PR-L changes
+
+One switch retires the legacy browser lane: `LEGACY_BROWSER_SCREENING_ENABLED`
+in `app/api/fly.toml` `[env]`, shipped as `"false"`. Unset or `"true"` leaves
+the lane running (the code default), and any other value fails closed
+(retired). The API reads it lazily on every request, so it never blocks boot.
+
+| Surface | Retired behaviour |
+|---|---|
+| `POST /api/livekit/start` | 410 `browser_screening_retired`; no session, quota reservation, room or egress |
+| `POST /api/livekit/invite` | 410; no invite minted |
+| `POST /api/livekit/preflight` | 410; no diagnostic room |
+| `POST /api/livekit/exchange` | 410, except the same-bearer re-exchange of an invite consumed within the last 5 minutes (the drain exception below) |
+| `POST /api/candidate-consent/status` and `/submit` | 410 before validation; no invite read and no `consent_records` write, for a grant or a decline. `GET .../template` stays open (invite-free, read-only) |
+| Ashby Mission Control `POST .../workflows/:id/invite` | 410 after the admin role check |
+| Ashby import (`runImport`) for non-`phone_primary` mappings | enqueues no browser `invite_delivery`; logs `ashby_legacy_browser_invite_skipped`; the application is still linked and ingested |
+| Ashby `invite_delivery` operation queued or deferred before T0 | the operation worker fails it with `browser_screening_retired` (terminal, never deferred), creates no session or invite, and logs `ashby_legacy_browser_invite_skipped`. `scorecard_write` is untouched |
+| `GET /api/me` | `legacyBrowserScreeningEnabled: false` |
+| Web, candidate detail | the "Browser voice screening" card and its Create invite action are not rendered; the Live call panel stays while a call is live |
+| Web, Ashby Mission Control | "Get invite link" and "Reissue invite link" are not rendered (button and More menu); Review screening and Cancel screening stay |
+| Web, candidate link | a retired link shows "no longer active, contact your recruiter" at the first call (the consent status), with no consent form |
+
+The response body is `{"error":"browser_screening_retired"}` (plus `"ok":false`
+on Mission Control), status 410, `Cache-Control: no-store`.
+
+The drain, meaning what an already-started legacy session still needs, is left
+open on purpose: `POST /api/livekit/worker-context`, `/:id/complete`,
+`/:id/recording`, `/grant/recording`, the agent worker, scoring and recording
+finalization, plus the one join-path step, the same-bearer re-exchange of an
+invite consumed within the last 5 minutes.
+
+The candidate consent routes are NOT part of the drain. They validate the
+invite, and validation rejects a consumed one, so they only ever serve a link
+whose session never started. Left open, a dead link could still write the
+candidate's latest `consent_records` row, which phone admission reads: a decline
+through a dead link would stop phone dialing for that candidate.
+
+R1 (`/api/r1`, `/api/internal/r1`, R1 rooms) and phone (`/api/phone*`, the phone
+webhook, `fly.phone.toml`, the phone worker) never read the switch; a test pins
+that.
+
+### Read-only SQL
+
+Legacy means `mode = 'browser'` and `interview_round_id is null` (R1 rows carry
+a round id). Run these in the Supabase SQL editor or `psql`. They only read.
+
+```sql
+-- Q1. Legacy usage by week, last 60 days. Negligible use is the D12 precondition.
+select date_trunc('week', created_at) as week_start,
+       count(*) as sessions_created,
+       count(*) filter (where status = 'completed') as completed,
+       count(*) filter (where status in ('failed', 'cancelled', 'expired')) as not_completed,
+       count(distinct candidate_id) as candidates,
+       coalesce(sum(duration_sec) filter (where status = 'completed'), 0) / 60 as completed_minutes
+  from screening_v2.call_sessions
+ where mode = 'browser'
+   and interview_round_id is null
+   and created_at > now() - interval '60 days'
+ group by 1
+ order by 1 desc;
+```
+
+```sql
+-- Q2. The 20 most recent legacy sessions (ids and states only, no candidate data).
+select id, created_at, status, terminal_reason, started_at, ended_at, duration_sec
+  from screening_v2.call_sessions
+ where mode = 'browser'
+   and interview_round_id is null
+ order by created_at desc
+ limit 20;
+```
+
+```sql
+-- Q3. Legacy sessions that are live or leftover. Zero rows means the drain is done.
+-- candidate_joined = the invite was consumed, i.e. a candidate is in or was in the room.
+select s.id,
+       s.status,
+       s.created_at,
+       now() - s.created_at as age,
+       exists (
+         select 1
+           from screening_v2.candidate_invites i
+          where i.session_id = s.id
+            and i.consumed_at is not null
+       ) as candidate_joined,
+       exists (
+         select 1
+           from screening_v2.candidate_invites i
+          where i.session_id = s.id
+            and i.revoked_at is null
+            and i.expires_at > now()
+       ) as has_unexpired_invite
+  from screening_v2.call_sessions s
+ where s.mode = 'browser'
+   and s.interview_round_id is null
+   and s.status in ('created', 'waiting', 'in_progress')
+ order by s.created_at;
+```
+
+```sql
+-- Q4. Outstanding legacy invites. latest_expiry is when the invite drain ends.
+select count(*) filter (
+         where i.consumed_at is null and i.revoked_at is null and i.expires_at > now()
+       ) as unconsumed_unexpired,
+       max(i.expires_at) as latest_expiry
+  from screening_v2.candidate_invites i
+  join screening_v2.call_sessions s on s.id = i.session_id
+ where s.mode = 'browser'
+   and s.interview_round_id is null;
+```
+
+```sql
+-- Q5. Ashby mappings that would still want a browser invite. Plan 8.5 step 1
+-- requires NO row with screening_mode = 'browser_primary' and status = 'enabled'.
+select screening_mode, status, count(*) as mappings
+  from screening_v2.ashby_job_mappings
+ group by 1, 2
+ order by 1, 2;
+```
+
+```sql
+-- Q6. Legacy sessions created at or after T0 (the deploy time). Must be 0.
+-- Replace the placeholder with the actual timestamp, for example
+-- '2026-11-02 08:20:00+05:30'.
+select count(*) as created_since_t0
+  from screening_v2.call_sessions
+ where mode = 'browser'
+   and interview_round_id is null
+   and created_at >= '<T0 timestamp with time zone>'::timestamptz;
+```
+
+### Merge preconditions (hard gate)
+
+Merging this PR IS the retirement. It ships `LEGACY_BROWSER_SCREENING_ENABLED =
+"false"` in `app/api/fly.toml`, and `deploy-fly.yml` deploys on any `app/api`
+change. Plan section 8.5 step 1 and D12 make the usage evidence a prerequisite,
+and only the owner can run it (Claude has no production SQL access). Do not merge
+until the owner has run Q1, Q3, Q4 and Q5 against production and pasted the four
+results into the PR.
+
+| Query | Merge only if |
+|---|---|
+| Q1 | recent legacy use is negligible. The owner judges it and records the weekly counts |
+| Q3 | no row is `in_progress`, and no `waiting` row has `candidate_joined = true`. Each is a candidate in a live call, and the API restart of the deploy would cut it |
+| Q4 | `unconsumed_unexpired = 0`, or the owner accepts the count in the PR. Each one is a candidate holding a link that becomes "no longer active" at T0 |
+| Q5 | no row has `screening_mode = 'browser_primary'` and `status = 'enabled'`. Such a mapping would silently stop getting invites |
+
+Then merge only in the 07:00 to 08:30 IST window under the standard merge gate
+above (`r1_settings.paused = true` and its zero checks). If the evidence is not
+ready, do not merge as is. Either wait, or drop the
+`LEGACY_BROWSER_SCREENING_ENABLED` line from `app/api/fly.toml` together with its
+pin in `legacy-browser-retirement-isolation.test.ts`. The code default is
+enabled, so that merge is inert, and the lane is retired later, once the four
+checks pass, with `fly secrets set LEGACY_BROWSER_SCREENING_ENABLED=false -a
+project-hello-api` (no PR cycle; verify with `GET /api/me` as in the rollback).
+
+### Drain procedure
+
+Define T0 as the moment the API deploy that carries `"false"` is serving (or the
+secret above has restarted the API).
+
+1. Before merging. Meet every merge precondition above, with the results pasted
+   in the PR.
+2. Merge and deploy. The Vercel web deploy for the same merge hides the card.
+3. At T0, verify (all must hold):
+   - `POST /api/livekit/exchange` with a well-formed unknown token
+     (64 hex characters) returns HTTP 410 and `{"error":"browser_screening_retired"}`.
+     Do the same for `/api/livekit/preflight` (body `{"invite_token": ...}`).
+   - An authenticated `GET /api/me` shows `legacyBrowserScreeningEnabled: false`.
+   - A candidate detail page shows no "Browser voice screening" card.
+   - The R1 settings page and the phone pages still load, and the next phone
+     Canary-1 dry run is unaffected.
+4. Live-session drain. Re-run Q3 until no `in_progress` row remains. Those
+   sessions keep working through worker-context, /complete and the recording
+   routes, and are scored normally. A stuck room ends on the worker residency
+   cap (`failed` with `residency_timeout`). Do not cancel an `in_progress`
+   session by hand.
+5. Invite drain. Invites last 24 hours (`lib/invite-token.ts`), and no new one
+   can be minted after T0, so every legacy invite has expired by T0 plus 24
+   hours. Q4 shows `unconsumed_unexpired = 0` once that is true.
+6. Leftovers. After T0 plus 24 hours, run Q3 again. Remaining `created` or
+   `waiting` rows have no joinable invite. Review the list, then cancel them
+   with the owner-run statement below. It is the only write in this procedure.
+
+   ```sql
+   -- OWNER-RUN WRITE. Review the Q3 rows first. created -> cancelled and
+   -- waiting -> cancelled are both allowed transitions.
+   begin;
+   update screening_v2.call_sessions
+      set status = 'cancelled',
+          terminal_reason = 'recruiter_cancelled',
+          ended_at = now()
+    where mode = 'browser'
+      and interview_round_id is null
+      and status in ('created', 'waiting')
+      and created_at < '<T0 timestamp with time zone>'::timestamptz
+   returning id, candidate_id, status;
+   -- Check the returned rows against Q3, then commit; otherwise roll back.
+   commit;
+   ```
+7. Close out. Q3 returns no rows, Q4 shows `unconsumed_unexpired = 0`, and Q6
+   returns 0. Only then may PR-4a set `R1_LANE_MODE=r1_only`.
+
+Ashby effects to expect after T0. An `invite_delivery` operation that was queued
+or deferred before T0 is failed once with `browser_screening_retired`. It is
+terminal and creates no session, so it cannot raise Q6, and it never blocks Q3.
+Mission Control shows it as failed and the runtime health `operationsFailed`
+count rises by that number, once: expected, not a fault. Operations already
+parked at `awaiting_manual_delivery` stay parked. Their link can no longer be
+delivered, and nothing in this procedure resolves them.
+
+### Rollback
+
+PR-L has no migration and writes no data, so there is nothing to restore.
+
+- Fast rollback, no PR (use this first):
+  `fly secrets set LEGACY_BROWSER_SCREENING_ENABLED=true -a project-hello-api`.
+  It restarts the API with the lane enabled and takes minutes, not a PR cycle.
+  It relies on a Fly secret overriding the `[env]` value of the same name, the
+  precedence `ashby-runtime-activation.md` section 4 already uses to turn
+  `ASHBY_RUNTIME_ENABLED` on over its `"false"` in `fly.toml`. Verify it rather
+  than assume it: an authenticated `GET /api/me` must show
+  `legacyBrowserScreeningEnabled: true` once the API is back. If it still shows
+  `false`, the secret did not take precedence, so use the `fly.toml` route below.
+  The web follows on its own because it reads `/api/me`. Afterwards make
+  `fly.toml` agree (`"true"`, or delete the line) in the next PR, then run
+  `fly secrets unset LEGACY_BROWSER_SCREENING_ENABLED` so a stale secret cannot
+  hide the file.
+- Durable rollback: set `LEGACY_BROWSER_SCREENING_ENABLED = "true"` (or delete
+  the line) in `app/api/fly.toml` and deploy the API in the merge window. No web
+  deploy is needed. Equivalently, squash-revert PR-L in the window. This takes
+  the full PR cycle (three adversarial reviews, green CI, the merge window).
+- Sessions cancelled in step 6 stay cancelled (terminal rows are immutable).
+  Recruiters create fresh sessions and invites after a rollback.
+- Ashby applications imported while the lane was retired have no browser
+  invite, and that includes those whose queued invite operation was failed with
+  `browser_screening_retired`. After a rollback, use Mission Control "Get invite
+  link" per workflow; nothing is back-filled automatically.
+- Do not roll back by editing any R1 or phone setting. Neither depends on this
+  switch, and `fly.phone.toml` must stay untouched.
+
 ## Incident handling and rollback
 
 For any active R1 incident, set `r1_settings.paused = true` first. Preserve

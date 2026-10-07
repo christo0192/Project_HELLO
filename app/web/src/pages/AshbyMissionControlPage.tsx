@@ -36,6 +36,10 @@ import { OverflowMenu } from '../components/design/OverflowMenu';
 import type { OverflowMenuItem } from '../components/design/OverflowMenu';
 import { humanizeEnum } from '../lib/humanize';
 import { ASHBY_ERROR_CODE_LABELS } from '../lib/ashby-labels';
+import {
+  isBrowserScreeningRetired,
+  RETIRED_INVITE_RECRUITER_MESSAGE,
+} from '../lib/browser-screening-retired';
 
 /**
  * Ashby Mission Control — admin-gated HR surface for the Ashby screening
@@ -355,6 +359,16 @@ export function AshbyMissionControlPage() {
   const [inviteError, setInviteError] = useState<{ linkId: string; message: string } | null>(null);
   const [copied, setCopied] = useState(false);
   /**
+   * PR-L: false once the API reports the legacy browser screening lane retired
+   * (`/api/me` `legacyBrowserScreeningEnabled: false`). Hides every invite
+   * action on a workflow row, because each one mints a legacy browser invite.
+   * Starts true and only an explicit `false` flips it: a missing `getMe`, a
+   * failed lookup or an older API without the field all mean "still enabled",
+   * as on CandidateDetailPage. The 410 handling in `deliverInvite` stays as the
+   * backstop for a lane retired while this page is open.
+   */
+  const [legacyInvitesEnabled, setLegacyInvitesEnabled] = useState(true);
+  /**
    * Discovered feedback-form schema for ONE mapping, held in component state
    * only. Never persisted, never logged, never sent to analytics — these are
    * tenant configuration ids, and this view is read-only reference material.
@@ -421,6 +435,19 @@ export function AshbyMissionControlPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    let live = true;
+    Promise.resolve()
+      .then(() => (typeof api.getMe === 'function' ? api.getMe() : undefined))
+      .then((me) => {
+        if (live && me?.legacyBrowserScreeningEnabled === false) setLegacyInvitesEnabled(false);
+      })
+      .catch(() => undefined);
+    return () => {
+      live = false;
+    };
+  }, []);
 
   /**
    * Read every role. Best effort: a failure costs the rows their role names
@@ -705,7 +732,9 @@ export function AshbyMissionControlPage() {
         setInvite(null);
         setInviteError({
           linkId,
-          message: e instanceof ApiError ? e.message : 'Could not issue an invite link',
+          message: isBrowserScreeningRetired(e)
+            ? RETIRED_INVITE_RECRUITER_MESSAGE
+            : e instanceof ApiError ? e.message : 'Could not issue an invite link',
         });
       } finally {
         setBusy(false);
@@ -1095,7 +1124,7 @@ export function AshbyMissionControlPage() {
         const menuItems: OverflowMenuItem[] = terminal
           ? []
           : [
-              ...(reviewable
+              ...(reviewable && legacyInvitesEnabled
                 ? [
                     {
                       key: 'invite',
@@ -1221,13 +1250,15 @@ export function AshbyMissionControlPage() {
                     Review screening
                   </Link>
                 ) : (
-                  <Button
-                    className={TOUCH}
-                    disabled={busy}
-                    onClick={() => void deliverInvite(w.applicationLinkId)}
-                  >
-                    {inviteLabel}
-                  </Button>
+                  legacyInvitesEnabled && (
+                    <Button
+                      className={TOUCH}
+                      disabled={busy}
+                      onClick={() => void deliverInvite(w.applicationLinkId)}
+                    >
+                      {inviteLabel}
+                    </Button>
+                  )
                 )}
                 {menuItems.length > 0 && (
                   <OverflowMenu label={`More actions for ${w.externalApplicationId}`} items={menuItems} />

@@ -361,6 +361,13 @@ export type ImportResult =
       /** The bound candidate shell, or null when none was created. */
       candidateId?: string | null;
       shell?: ImportShellStatus;
+      /**
+       * PR-L: present (true) ONLY when an invite_delivery operation that would
+       * have been enqueued was skipped because the legacy browser lane is
+       * retired. Absent in every other case, so the pre-retirement result shape
+       * is unchanged.
+       */
+      legacyInviteSkipped?: true;
     }
   /**
    * The link and ingestion row are durable but the candidate shell could NOT
@@ -403,6 +410,17 @@ export interface ImportDeps {
     | { status: 'skipped'; reason: string }
     | { status: 'failed'; reason: string }
   >;
+  /**
+   * PR-L: reports whether the legacy browser screening lane is still enabled.
+   * When it returns false, `runImport` enqueues NO invite_delivery operation for
+   * a browser-primary (non phone_primary) mapping, because the invite it would
+   * mint points at a lane that now answers 410. The phone_primary path never
+   * enqueued invites here and is untouched.
+   *
+   * Optional and read as "enabled" when absent, so every pre-existing caller and
+   * test fake behaves exactly as before.
+   */
+  legacyBrowserScreeningEnabled?: () => boolean;
 }
 
 /**
@@ -509,14 +527,18 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
   // but no invite is automatically delivered merely because the application
   // entered the stage. The post-parse engagement is the primary path.
   const channels = channelsForMode(mapping.deliveryMode);
-  if (mapping.screeningMode !== 'phone_primary' && channels.email) {
+  // PR-L: with the legacy lane retired the application is still imported,
+  // linked and ingested; only the browser invite is withheld.
+  const browserInvites = mapping.screeningMode !== 'phone_primary';
+  const legacyLaneRetired = deps.legacyBrowserScreeningEnabled?.() === false;
+  if (browserInvites && !legacyLaneRetired && channels.email) {
     await deps.stores.enqueueOperation({
       applicationLinkId: linkId,
       operationType: 'invite_delivery',
       operationKey: inviteDeliveryOperationKey({ externalApplicationId: appId, channel: 'email', inviteId: 'pending' }),
     });
   }
-  if (mapping.screeningMode !== 'phone_primary' && channels.manual) {
+  if (browserInvites && !legacyLaneRetired && channels.manual) {
     await deps.stores.enqueueOperation({
       applicationLinkId: linkId,
       operationType: 'invite_delivery',
@@ -524,7 +546,12 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
     });
   }
 
-  return { status: 'imported', applicationLinkId: linkId, reused, decision, candidateId, shell };
+  const legacyInviteSkipped = browserInvites && legacyLaneRetired
+    && (channels.email || channels.manual);
+  return {
+    status: 'imported', applicationLinkId: linkId, reused, decision, candidateId, shell,
+    ...(legacyInviteSkipped ? { legacyInviteSkipped: true as const } : {}),
+  };
 }
 
 // ── 2. Ingestion job orchestrator ────────────────────────────────────────────

@@ -135,6 +135,20 @@ primary_region = "sin"
   # the room agent-less (checked only at runtime). Only takes effect together
   # with WORKER_ORCHESTRATION=true (already set). A dispatch name, not a secret.
   BROWSER_AGENT_NAME = "browser-screener"
+  # PR-L (R1 plan 8.5, D12): the legacy browser screening lane is RETIRED.
+  # "false" makes POST /api/livekit/start|invite|preflight|exchange, POST
+  # /api/candidate-consent/status|submit (and the Ashby Mission Control manual
+  # invite) answer 410 browser_screening_retired, and the web hides the
+  # "Browser voice screening" card. Sessions that already
+  # started keep running to completion (worker-context, /complete, recording and
+  # scoring are not gated). The code default when unset is "true", so removing
+  # this line or setting "true" restores the lane. Merging this IS the
+  # retirement: the owner's Q1/Q3/Q4/Q5 usage evidence is a hard merge
+  # precondition. Fast flip or rollback without a PR cycle:
+  # `fly secrets set LEGACY_BROWSER_SCREENING_ENABLED=<true|false>` (verify with
+  # GET /api/me). Drain, verification and rollback:
+  # docs/runbooks/r1-operations.md. R1 and phone never read this.
+  LEGACY_BROWSER_SCREENING_ENABLED = "false"
 
 [http_service]
   internal_port = 8787

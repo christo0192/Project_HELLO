@@ -19,6 +19,15 @@
  *
  * Router-level auth is NOT added here; L4 adds the exact PUBLIC_ROUTES
  * entries. This router validates the invite on every candidate DB write.
+ *
+ * PR-L (R1 plan 8.5): POST /status and POST /submit belong to the legacy
+ * browser screening lane (only CandidateJoinPage calls them, keyed by a legacy
+ * invite token) and answer 410 `browser_screening_retired` while the lane is
+ * retired, BEFORE validation and any database access. They are not part of the
+ * drain: validateInvite rejects a consumed invite, so they only ever serve a
+ * link that never started a session, and an open /submit would let a dead link
+ * write the candidate's latest consent_records row, which phone admission
+ * reads. GET /template stays open: it is invite-free and read-only.
  */
 
 import { Router } from 'express';
@@ -34,6 +43,7 @@ import {
   type ConsentSubmitResponse,
 } from '../schemas/candidate-consent.js';
 import { validateInvite, STABLE_INVITE_ERROR } from '../lib/invite-validation.js';
+import { legacyBrowserScreeningGuard } from '../lib/legacy-browser-screening.js';
 
 const consentLogger = createLogger('candidate-consent');
 
@@ -67,6 +77,7 @@ export const candidateConsentRouter = Router();
  */
 candidateConsentRouter.post(
   '/status',
+  legacyBrowserScreeningGuard({ route: 'consent-status' }),
   validateBody(consentStatusSchema),
   async (req, res, next) => {
     try {
@@ -188,6 +199,7 @@ candidateConsentRouter.get(
  */
 candidateConsentRouter.post(
   '/submit',
+  legacyBrowserScreeningGuard({ route: 'consent-submit' }),
   validateBody(consentSubmitSchema),
   async (req, res, next) => {
     try {

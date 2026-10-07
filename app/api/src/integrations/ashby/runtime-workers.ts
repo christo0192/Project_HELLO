@@ -30,6 +30,7 @@
  */
 
 import { createLogger } from '../../lib/logger.js';
+import { legacyBrowserScreeningEnabled } from '../../lib/legacy-browser-screening.js';
 import {
   CANDIDATE_QUESTIONS_QUEUE,
   CANDIDATE_QUESTIONS_MAX_JOB_ATTEMPTS,
@@ -68,7 +69,7 @@ import {
   DEFAULT_MAX_ENABLED_MAPPINGS,
 } from './reconciliation.js';
 import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
-import { runAshbyOperationPass } from './operation-worker.js';
+import { LEGACY_INVITE_SKIPPED_EVENT, runAshbyOperationPass } from './operation-worker.js';
 import { probeFeedbackFormDefinition, type FormDefinitionReader, type ProbeFeedbackForm } from './probe.js';
 
 /**
@@ -857,6 +858,8 @@ export function buildAshbyHandlers(
         client: runtime.client,
         stores: runtime.stores,
         resolveMapping: (jobId) => runtime.resolveMappingByJobId(jobId),
+        // PR-L: a retired legacy lane withholds the browser invite.
+        legacyBrowserScreeningEnabled,
         admitIntake: async ({ applicationId, jobId, stageId }) => {
           if (runtime.isSnapshotApplicationAuthorized && await runtime.isSnapshotApplicationAuthorized({ applicationId, jobId, stageId })) return true;
           if (payload.source === 'explicit_backlog' && payload.explicitImportRunId
@@ -900,6 +903,13 @@ export function buildAshbyHandlers(
       // exhausts its attempts dead-letters LOUDLY instead of leaving an
       // invisible candidate behind.
       if (result.status === 'shell_unbound') throw new Error('ashby_import_shell_unbound');
+      if (result.status === 'imported' && result.legacyInviteSkipped) {
+        // Metadata only, no identifier: the skip must be visible in the logs.
+        logger.info('unknown_event', {
+          error_category: 'ashby_legacy_browser_invite_skipped',
+          error_type: 'browser_screening_retired',
+        });
+      }
       if (result.status === 'skipped'
           && (result.reason === 'mapping_inactive' || result.reason === 'stage_not_ai')
           && typeof payload.stageId === 'string'
@@ -1797,6 +1807,16 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             // never a metric name or a field path). Without this the binding
             // outcome of a scorecard write was observable nowhere.
             onEvent: (e) => {
+              // PR-L: an invite_delivery operation skipped because the legacy
+              // browser lane is retired logs the same marker the import path
+              // uses, metadata only.
+              if (e.kind === LEGACY_INVITE_SKIPPED_EVENT) {
+                logger.info('unknown_event', {
+                  error_category: 'ashby_legacy_browser_invite_skipped',
+                  error_type: 'browser_screening_retired',
+                });
+                return;
+              }
               logger.info('unknown_event', {
                 error_category: `operation_${e.kind}`,
                 error_type: e.operationType,

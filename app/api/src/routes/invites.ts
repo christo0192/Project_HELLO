@@ -60,6 +60,7 @@ import {
   browserOrchestrationGate,
   type BrowserWorkerGate,
 } from '../lib/browser-orchestration.js';
+import { legacyBrowserScreeningGuard } from '../lib/legacy-browser-screening.js';
 
 export const invitesRouter = Router();
 
@@ -99,6 +100,36 @@ const STABLE_EXPIRY_MSG = 'invite_token_invalid_or_expired';
 // past it, a consumed invite is terminal exactly as before.
 const CONSUMED_REEXCHANGE_WINDOW_MS = 5 * 60_000;
 
+/**
+ * Drain exception for the retired legacy lane (plan section 8.5, PR-L).
+ *
+ * While LEGACY_BROWSER_SCREENING_ENABLED=false every exchange answers 410 EXCEPT
+ * the same-bearer re-exchange of an invite that was consumed within the grace
+ * window above and is not revoked. That candidate already started this session;
+ * letting the existing grace path re-issue their join is how an already-issued
+ * live session finishes. A never-consumed, unknown, malformed or revoked token
+ * is not part of the drain and gets the 410. Consulted only while retired, so
+ * the enabled path performs no extra read. Any lookup error answers "not
+ * allowed": retirement fails closed.
+ *
+ * Expiry, consent, session joinability and the consume CAS are NOT re-decided
+ * here; the unchanged handler below owns them, so a drained exchange can never
+ * succeed where the pre-retirement handler would have refused.
+ */
+async function isDrainReExchange(req: Request): Promise<boolean> {
+  const token = (req.body as { token?: unknown } | undefined)?.token;
+  if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)) return false;
+  const { data, error } = await supabase
+    .from('candidate_invites')
+    .select('consumed_at, revoked_at')
+    .eq('token_digest', hashToken(token))
+    .maybeSingle();
+  if (error || !data || data.consumed_at === null || data.revoked_at !== null) return false;
+  const consumedAtMs = new Date(data.consumed_at as string).getTime();
+  return Number.isFinite(consumedAtMs)
+    && Date.now() - consumedAtMs <= CONSUMED_REEXCHANGE_WINDOW_MS;
+}
+
 // ── Interivewer auth context ─────────────────────────────────────────
 
 export interface InviteRequestContext {
@@ -130,6 +161,7 @@ export function requireInviteAuth(
 
 invitesRouter.post(
   '/invite',
+  legacyBrowserScreeningGuard({ route: 'invite' }),
   requireInviteAuth((req) => {
     const user = req.authUser;
     if (!user || (user.appRole !== 'admin' && user.appRole !== 'interviewer')) return null;
@@ -270,6 +302,7 @@ async function checkExchangeConsentGate(invite: {
 // diagnostic room. This path never consumes the invite or touches the session.
 invitesRouter.post(
   '/preflight',
+  legacyBrowserScreeningGuard({ route: 'preflight' }),
   validateBody(invitePreflightSchema),
   async (req, res, next) => {
     let diagnosticRoom: string | null = null;
@@ -353,6 +386,7 @@ invitesRouter.post(
 
 invitesRouter.post(
   '/exchange',
+  legacyBrowserScreeningGuard({ route: 'exchange', allowDrain: isDrainReExchange }),
   validateBody(inviteExchangeSchema),
   async (req, res, next) => {
     try {

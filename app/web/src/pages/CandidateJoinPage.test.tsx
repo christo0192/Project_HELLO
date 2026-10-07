@@ -480,6 +480,81 @@ describe('CandidateJoinPage', () => {
     expect(screen.getByRole('button', { name: 'Join screening' })).toBeEnabled();
   });
 
+  it('PR-L: tells the candidate a retired link is no longer active (no raw code, no retry promise)', async () => {
+    candidateConsentStatus.mockResolvedValue({
+      has_consent: true,
+      template_version: '1.0',
+      locale: 'en-IN',
+      required_consents: ['ai_interview', 'recording'],
+    });
+    const ApiError = (await import('../api')).ApiError;
+    exchangeCandidateInvite.mockRejectedValueOnce(new ApiError('browser_screening_retired', 410));
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Join screening' })).toBeInTheDocument();
+    });
+
+    await userEvent.click(screen.getByRole('button', { name: 'Join screening' }));
+
+    await waitFor(() => expect(exchangeCandidateInvite).toHaveBeenCalledWith(SYNTHETIC_INVITE));
+    expect(screen.getByText(/no longer active/i)).toBeInTheDocument();
+    expect(screen.getByText(/contact your recruiter/i)).toBeInTheDocument();
+    expect(screen.queryByText(/browser_screening_retired/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/your invite is still valid/i)).not.toBeInTheDocument();
+  });
+
+  it('PR-L: a retired link dead-ends at the status call, before any consent form', async () => {
+    const ApiError = (await import('../api')).ApiError;
+    candidateConsentStatus.mockRejectedValue(new ApiError('browser_screening_retired', 410));
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/no longer active/i);
+    expect(alert).toHaveTextContent(/contact your recruiter/i);
+    expect(alert).not.toHaveTextContent(/browser_screening_retired/);
+    // No consent form to fill in, no template fetched, nothing to join.
+    expect(getCandidateConsentTemplate).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText('ai interview')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Accept and continue' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Decline' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /join screening/i })).not.toBeInTheDocument();
+    expect(submitCandidateConsent).not.toHaveBeenCalled();
+    expect(exchangeCandidateInvite).not.toHaveBeenCalled();
+  });
+
+  it('PR-L: a status failure that is not the retirement keeps its own message', async () => {
+    const ApiError = (await import('../api')).ApiError;
+    candidateConsentStatus.mockRejectedValue(new ApiError('invite_token_invalid_or_expired', 404));
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    expect(await screen.findByRole('alert')).toHaveTextContent('invite_token_invalid_or_expired');
+  });
+
+  it.each([
+    ['grant', 'Accept and continue'],
+    ['decline', 'Decline'],
+  ])('PR-L: a retirement during the %s submit swaps the form for the dead end', async (_n, button) => {
+    const ApiError = (await import('../api')).ApiError;
+    submitCandidateConsent.mockRejectedValue(new ApiError('browser_screening_retired', 410));
+    window.history.replaceState(null, '', `/candidate/join#${SYNTHETIC_INVITE}`);
+    renderPage([`/candidate/join#${SYNTHETIC_INVITE}`]);
+    await screen.findByText('Screening consent');
+    if (button === 'Accept and continue') {
+      await userEvent.click(screen.getByLabelText('ai interview'));
+      await userEvent.click(screen.getByLabelText('recording'));
+    }
+    await userEvent.click(screen.getByRole('button', { name: button }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/no longer active/i);
+    expect(alert).not.toHaveTextContent(/browser_screening_retired/);
+    expect(screen.queryByRole('button', { name: 'Accept and continue' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /join screening/i })).not.toBeInTheDocument();
+    expect(exchangeCandidateInvite).not.toHaveBeenCalled();
+  });
+
   it('surfaces consent copy (not a raw code) when the exchange consent gate fails', async () => {
     candidateConsentStatus.mockResolvedValue({
       has_consent: true,

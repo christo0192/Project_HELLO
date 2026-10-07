@@ -64,7 +64,24 @@ describe('GET /api/me', () => {
       email: 'admin@example.com',
       role: 'admin',
       active: true,
+      // PR-L: the legacy browser lane is enabled unless explicitly retired.
+      legacyBrowserScreeningEnabled: true,
     });
+  });
+
+  it('PR-L: reports the legacy browser lane as retired when the switch is false', async () => {
+    const previous = process.env.LEGACY_BROWSER_SCREENING_ENABLED;
+    process.env.LEGACY_BROWSER_SCREENING_ENABLED = 'false';
+    try {
+      const app = makeApp(makeUser({ appRole: 'interviewer' }));
+      const res = await request(app).get('/api/me').set('Authorization', `Bearer ${JWT_AAL2}`);
+      expect(res.status).toBe(200);
+      expect(res.body.legacyBrowserScreeningEnabled).toBe(false);
+      expect(res.body.role).toBe('interviewer');
+    } finally {
+      if (previous === undefined) delete process.env.LEGACY_BROWSER_SCREENING_ENABLED;
+      else process.env.LEGACY_BROWSER_SCREENING_ENABLED = previous;
+    }
   });
 
   it('returns interviewer role from the membership resolver', async () => {

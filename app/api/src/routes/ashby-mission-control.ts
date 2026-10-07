@@ -39,6 +39,7 @@ import { Router, type Request, type Response } from 'express';
 import { supabase } from '../lib/supabase.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
+import { legacyBrowserScreeningGuard } from '../lib/legacy-browser-screening.js';
 import { createMissionControlStore, type MissionControlStore } from '../integrations/ashby/workflow-stores.js';
 import {
   loadAshbyConfig,
@@ -808,7 +809,14 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
   // sent to Ashby. The candidate link carries it in the URL FRAGMENT, which
   // browsers do not send to servers and which CandidateJoinPage strips
   // immediately into memory.
-  router.post('/workflows/:id/invite', requireRole('admin'), async (req: Request, res: Response) => {
+  //
+  // PR-L: this mints a legacy browser invite, so it is retired with the lane (410
+  // browser_screening_retired). Role check first: non-admins keep their 403.
+  const legacyInviteRetired = legacyBrowserScreeningGuard({
+    route: 'ashby-invite',
+    bodyExtras: { ok: false },
+  });
+  router.post('/workflows/:id/invite', requireRole('admin'), legacyInviteRetired, async (req: Request, res: Response) => {
     const id = req.params.id;
     if (!UUID_RE.test(id)) { res.status(400).json({ ok: false, error: 'invalid_workflow_id' }); return; }
     const actorId = req.authUser?.id ?? null;

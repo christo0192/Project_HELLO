@@ -6,10 +6,11 @@ import {
   Room,
   RoomEvent,
 } from 'livekit-client';
-import { api, ApiError } from '../../api';
+import { api } from '../../api';
 import type { CandidatePreflightResult } from '../../types';
 import { Button } from '../ui';
 import { evaluateCandidatePreflight, PREFLIGHT_LIMITS } from '../../lib/candidate-preflight-policy';
+import { messageFor } from '../../lib/candidate-readiness-message';
 
 const STABLE_WINDOW_MS = PREFLIGHT_LIMITS.stableMs;
 const AUDIO_THRESHOLD = 0.02;
@@ -22,26 +23,6 @@ interface AudioReadinessStepProps {
   roleTitle: string;
   onReady: (track: LocalAudioTrack) => void;
   onBack: () => void;
-}
-
-function messageFor(error: unknown): string {
-  if (error instanceof ApiError && error.message === 'consent_required') {
-    return 'Your consent is no longer valid. Please return and review it again.';
-  }
-  const name = error instanceof Error ? error.name : '';
-  if (name === 'NotAllowedError' || name === 'SecurityError') {
-    return 'Microphone permission is blocked. Allow microphone access in your browser settings, then try again.';
-  }
-  if (name === 'NotFoundError' || name === 'OverconstrainedError') {
-    return 'No usable microphone was found. Connect a microphone and try again.';
-  }
-  if (name === 'NotReadableError' || name === 'AbortError') {
-    return 'Your microphone could not be started. Close other apps using it and try again.';
-  }
-  if (error instanceof ApiError && error.message === 'screening_room_unavailable') {
-    return 'The connection test is unavailable right now. Your invite is still valid; please retry.';
-  }
-  return 'Your connection did not meet the minimum requirements. Check your microphone and internet, then retry.';
 }
 
 async function makeTrack(deviceId?: string): Promise<LocalAudioTrack> {

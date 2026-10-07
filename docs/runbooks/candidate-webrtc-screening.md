@@ -1,5 +1,14 @@
 # Candidate WebRTC screening runbook
 
+> **Retired (PR-L).** The legacy browser screening lane this runbook describes
+> is retired when `LEGACY_BROWSER_SCREENING_ENABLED="false"` (the shipped setting
+> in `app/api/fly.toml`): `start`, `invite`, `preflight` and `exchange` answer 410
+> `browser_screening_retired`. R1 replaces it. The drain procedure, the read-only
+> usage SQL and the rollback are in
+> [`r1-operations.md`](r1-operations.md#legacy-browser-screening-retirement-pr-l-plan-section-85-d12).
+> The text below stays accurate for a session that was already started, and for a
+> rollback that re-enables the lane.
+
 ## Candidate journey
 
 `invite landing → consent → audio/network readiness → interview`

@@ -286,6 +286,8 @@ describe('/api/me (invariant 5)', () => {
       email: ADMIN.email,
       role: 'admin',
       active: true,
+      // PR-L: additive; the legacy browser lane is enabled unless retired.
+      legacyBrowserScreeningEnabled: true,
     });
   });
 
