@@ -14,8 +14,6 @@ import inspect
 import logging
 import math
 import statistics
-import tempfile
-from urllib.parse import urlparse
 from collections.abc import Mapping
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -1881,70 +1879,149 @@ async def _publish_phone_agent_name(room: Any, dispatched_agent_name: Any = None
         _log.warn("unknown_event", error_type="phone_agent_name_published", error_category=outcome)
     return outcome
 
-_BROWSER_READY_MARKER_ENV = "_BROWSER_WORKER_READY_MARKER_DIR"
+
+# Mirrors the API's LIVEKIT_HOST_RE and migration 0118's CHECK: a plain, lowercase DNS
+# hostname (IPv4 literals are valid labels). IPv6 literals, trailing-dot FQDNs,
+# underscores and anything else are NOT hostnames the lease can store.
+_BROWSER_DNS_HOST_RE = re.compile(
+    r"^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    r"(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$"
+)
+
+# Strong references to in-flight registration posts: the event loop only keeps
+# weak references to tasks, so an unreferenced task can vanish mid-flight.
+_registration_post_tasks: set[asyncio.Task[None]] = set()
 
 
-def _browser_ready_marker_path() -> str | None:
-    directory = os.getenv(_BROWSER_READY_MARKER_ENV)
-    return os.path.join(directory, "registered") if directory else None
+def _browser_r1_readiness() -> bool:
+    """True iff THIS process is the NAMED browser worker AND the operator opted
+    into the R1 readiness contract with the EXACT value ``R1_READINESS_HOST=on``.
 
-
-def _browser_has_registered() -> bool:
-    marker = _browser_ready_marker_path()
-    return bool(marker and os.path.isfile(marker))
-
-
-def _mark_browser_registered() -> None:
-    """Atomically make main-process registration visible to job subprocesses."""
-    marker = _browser_ready_marker_path()
-    if marker is None:
-        return
-    try:
-        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return
-    except OSError:
-        return
-    else:
-        os.close(fd)
+    The opt-in is the single switch for every R1-only readiness behaviour: the
+    ``livekit_host`` report, the post-registration readiness timing
+    (``worker_registered`` in the main process instead of the process prewarm)
+    and the AgentServer startup path that makes that event observable.
+    ABSENT (the default, and what fly.toml ships) the named browser worker is
+    byte-identical to the live Cloud lane: the prewarm posts the legacy
+    ``{app, machine_id}`` body and ``cli.run_app(WorkerOptions)`` starts the
+    worker. Deploy-order safety follows from that default: a worker never sends
+    ``livekit_host`` to an API that predates it unless the operator turned this
+    on, and the runbook only turns it on AFTER the host-aware API is live.
+    Never true for the phone worker or the unnamed browser worker."""
+    return _browser_worker_named() and os.getenv("R1_READINESS_HOST") == "on"
 
 
 def _browser_livekit_host() -> str | None:
-    """Configured LiveKit URL's hostname, never a URL/port/credential string."""
+    """Configured LiveKit URL's lowercase DNS hostname, else None.
+
+    Never a URL, port or credential string. A LIVEKIT_URL whose host is not a
+    DNS name (an IPv6 literal, a trailing-dot FQDN, an unparseable URL) degrades
+    to "no host": the readiness post is still sent, host-less, and the R1 API
+    gate then fails its host match closed. It must never raise, and it must
+    never send a host the API's strict /ready-machine schema would 400 (which
+    would drop the readiness post altogether).
+
+    ``urlparse`` is imported HERE, not at module level: agent.py is a
+    phone-shared file whose top-level import list is frozen (plan section 9),
+    and this helper runs only on the opted-in R1 browser path."""
+    from urllib.parse import urlparse
+
     try:
         host = urlparse(os.getenv("LIVEKIT_URL") or "").hostname
     except ValueError:
-        host = None
-    return host.lower() if host else None
+        return None
+    if not host:
+        return None
+    host = host.lower()
+    return host if _BROWSER_DNS_HOST_RE.match(host) else None
+
+
+# The post-registration readiness post is attempted at most this many times per
+# registration (the first try plus ONE retry), separated by the backoff below.
+# Bounded on purpose: the API's start-wait budget and the reaper stay the
+# backstops, and every reconnect re-posts from scratch.
+_REGISTRATION_POST_ATTEMPTS = 2
+_REGISTRATION_POST_RETRY_DELAY_SEC = 2.0
 
 
 async def _post_browser_machine_ready_after_registration() -> None:
+    """Post MACHINE-level readiness (with the registered host) to the API.
+
+    Runs in the MAIN process, once per websocket registration (it fires again on
+    every reconnect). FAIL-OPEN and best-effort like the prewarm post: a failure
+    degrades to the API's start-wait budget + reaper. A missing/non-DNS host
+    still posts, host-less, so readiness is never lost to a host problem.
+
+    ONE bounded retry. In R1 mode this is the only readiness source, and the
+    API fails the host write closed (a transient 5xx, or its 500 for a host RPC
+    error, leaves the lease ``starting``), so a single lost post would stall the
+    claim until its ready budget expires. The post helper reports an HTTP or
+    transport failure as ``False`` (it never raises), so ``False`` or a raised
+    exception is retried once after ``_REGISTRATION_POST_RETRY_DELAY_SEC``. The
+    retry is idempotent (the API's ready and host writes are), harmless when the
+    answer was a deterministic ``False`` (a stale lease answers ``ok: false``
+    again), and runs in the scheduled task, so it never stalls the SDK's
+    connection task. Never raises; cancellation propagates."""
     host = _browser_livekit_host()
+    ready_kwargs: dict[str, Any] = {}
     if host is None:
         _log.info(
             "unknown_event",
             error_type="voice_worker_ready_machine",
             error_category="livekit_host_missing",
         )
-        return
+    else:
+        ready_kwargs["livekit_host"] = host
+    for attempt in range(_REGISTRATION_POST_ATTEMPTS):
+        if attempt > 0:
+            _log.info(
+                "unknown_event",
+                error_type="voice_worker_ready_machine",
+                error_category="registration_post_retry",
+            )
+            await asyncio.sleep(_REGISTRATION_POST_RETRY_DELAY_SEC)
+        try:
+            posted = await worker_ready_api.post_worker_ready_machine(**ready_kwargs)
+        except Exception:  # noqa: BLE001 - readiness remains fail-open
+            posted = False
+        if posted:
+            return
+    _log.info(
+        "unknown_event",
+        error_type="voice_worker_ready_machine",
+        error_category="registration_post_failed",
+    )
+
+
+def _on_browser_worker_registered(*_args: Any) -> None:
+    """AgentServer ``worker_registered`` handler (named browser worker, R1 only).
+
+    The server emits this from the running loop of the MAIN process only after
+    LiveKit accepted this worker's websocket registration, and again after every
+    reconnect. The post is scheduled, never awaited here, so a slow API cannot
+    stall the SDK's connection task.
+
+    CONNECTION LOSS: livekit-agents 1.6.x exposes exactly two server events
+    (``worker_started`` and ``worker_registered``); there is no disconnect
+    event to clear readiness on. There is also no cross-process "registered"
+    marker to go stale: in R1 mode the prewarm posts nothing, so this handler
+    is the ONLY readiness source and readiness is re-asserted on each
+    reconnect. The residual window (socket down, lease still `ready`) is
+    covered by the reconnect re-post, the R1 API's dispatch-drop safeguard
+    (a dispatch no worker accepts is deleted, never silently left) and the
+    reaper."""
     try:
-        await worker_ready_api.post_worker_ready_machine(livekit_host=host)
-    except Exception:  # noqa: BLE001 - readiness remains fail-open
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
         _log.info(
             "unknown_event",
             error_type="voice_worker_ready_machine",
-            error_category="registration_post_failed",
+            error_category="registration_no_loop",
         )
-
-
-def _prepare_browser_registration_marker() -> None:
-    """Create the private, per-boot marker directory before job children spawn."""
-    directory = tempfile.mkdtemp(prefix="hello-browser-worker-ready-")
-    try:
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
-    os.environ[_BROWSER_READY_MARKER_ENV] = directory
+        return
+    task = loop.create_task(_post_browser_machine_ready_after_registration())
+    _registration_post_tasks.add(task)
+    task.add_done_callback(_registration_post_tasks.discard)
 
 
 def _prewarm_post_machine_ready(_proc: Any) -> None:
@@ -1968,10 +2045,21 @@ def _prewarm_post_machine_ready(_proc: Any) -> None:
     prewarm_fnc is called synchronously in the job subprocess, so the async post
     is driven on a private event loop here. FAIL-OPEN and best-effort: any
     failure degrades to the API's start-wait budget + reaper and must never
-    raise out of process init (which would fail the warmup)."""
-    browser_named = _browser_worker_named()
-    phone_orchestrated = _phone_worker_orchestrated()
-    if not (browser_named or phone_orchestrated):
+    raise out of process init (which would fail the warmup).
+
+    R1 CARVE-OUT: with ``R1_READINESS_HOST=on`` on the named browser worker
+    (``_browser_r1_readiness``) this posts NOTHING; readiness then comes only
+    from the main process's ``worker_registered`` handler. With the opt-in
+    absent (every deployed lane today) this body is unchanged."""
+    if not (_browser_worker_named() or _phone_worker_orchestrated()):
+        return
+    if _browser_r1_readiness():
+        # R1 opt-in (R1_READINESS_HOST=on): readiness is posted ONLY by the main
+        # process after the websocket registration (_on_browser_worker_registered).
+        # A job process can warm before that registration completes, so letting
+        # it post would win the boot-readiness race; and with no prewarm post
+        # there is no cross-process "registered" state to go stale on a
+        # reconnect. Never reached by the phone worker or with the opt-in absent.
         return
     # E2: report the per-machine registration name ONLY when it differs from
     # the base — flag off (PR-A as deployed), the browser worker, and the
@@ -1979,16 +2067,7 @@ def _prewarm_post_machine_ready(_proc: Any) -> None:
     # body the pre-E2 strict /ready-machine schema accepts is unchanged. The
     # API stores a reported name on the lease and dispatches to it.
     ready_kwargs: dict[str, Any] = {}
-    if browser_named:
-        # Idle job processes can start before the parent has completed the
-        # websocket registration. They must never win the boot-readiness race.
-        if not _browser_has_registered():
-            return
-        host = _browser_livekit_host()
-        if host is None:
-            return
-        ready_kwargs["livekit_host"] = host
-    if phone_orchestrated:
+    if _phone_worker_orchestrated():
         registered = phone_registered_agent_name()
         if registered != _phone_agent_name():
             ready_kwargs["agent_name"] = registered
@@ -12331,27 +12410,23 @@ async def _run_session(
 
 
 def run_worker_app() -> None:
-    """Run the named browser worker with registration-derived readiness only."""
+    """Start the worker. Only the R1-opted-in NAMED browser worker leaves the
+    historical ``cli.run_app(WorkerOptions)`` path.
+
+    Phone, the unnamed browser worker and the LIVE Cloud browser worker (named,
+    but ``R1_READINESS_HOST`` absent) start exactly as before this seam
+    existed. The opted-in worker builds the same AgentServer the CLI would
+    (``AgentServer.from_server_options`` is what ``cli.run_app`` calls for a
+    WorkerOptions) and listens for ``worker_registered`` on that very instance."""
     options = build_worker_options()
-    if not _browser_worker_named():
-        # Phone and unnamed-browser invocation stay exactly on the historical
-        # WorkerOptions path. Only the named browser worker owns this seam.
+    if not _browser_r1_readiness():
         cli.run_app(options)
         return
 
-    # AgentServer emits worker_registered only after the server accepted this
-    # worker's websocket registration. The callback remains in the main process
-    # and fires again on reconnect, unlike a job-process prewarm callback.
-    from livekit.agents import AgentServer  # noqa: PLC0415 - named browser only
+    from livekit.agents import AgentServer  # noqa: PLC0415 - R1 browser worker only
 
-    _prepare_browser_registration_marker()
     server = AgentServer.from_server_options(options)
-
-    def _on_worker_registered(*_args: Any) -> None:
-        _mark_browser_registered()
-        asyncio.get_running_loop().create_task(_post_browser_machine_ready_after_registration())
-
-    server.on("worker_registered", _on_worker_registered)
+    server.on("worker_registered", _on_browser_worker_registered)
     cli.run_app(server)
 
 

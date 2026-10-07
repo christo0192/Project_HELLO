@@ -442,6 +442,23 @@ invitesRouter.post(
         return res.status(404).json({ error: STABLE_EXPIRY_MSG });
       }
 
+      // ── Fence 7: an R1 candidate token REQUIRES the orchestration gate ───
+      // With BROWSER_LIVEKIT_TARGET=r1 the gate is what proves a ready worker
+      // registered on the R1 endpoint (host match) and dispatches it. The gate
+      // is null whenever WORKER_ORCHESTRATION is off or BROWSER_AGENT_NAME is
+      // empty/malformed — a documented rollback lever — and without it this
+      // route would skip readiness AND the host check and mint an R1 token for
+      // a room with no worker dispatched. So on r1 a null gate FAILS CLOSED: no
+      // token, no grant, no room provisioned, the invite stays unconsumed. This
+      // runs before the consent gate/provisioning and also covers the grace
+      // re-exchange below, which re-mints without re-entering the gate. Cloud
+      // never takes this branch: the gate is resolved at Step 2c exactly as
+      // before.
+      const r1Gate = endpoint.target === 'r1' ? resolveBrowserGate() : undefined;
+      if (r1Gate === null) {
+        return res.status(503).json({ error: 'screening_room_unavailable' });
+      }
+
       // Phase 9 L4: server-authoritative consent gate BEFORE the atomic CAS
       // consume. Maintenance blocks new joins (503) and missing/declined/
       // withdrawn/expired consent or a missing/inactive template fails closed
@@ -537,7 +554,7 @@ invitesRouter.post(
       // unnamed worker auto-dispatches, and this path is byte-identical to
       // today. `disabled` (the service's own flag-off answer) is treated like a
       // null gate.
-      const browserGate = resolveBrowserGate();
+      const browserGate = r1Gate !== undefined ? r1Gate : resolveBrowserGate();
       let gatedMachineId: string | undefined;
       if (browserGate !== null && !isGraceReExchange) {
         const ready = await browserGate.ensureReadyWorker({ sessionId: session.id as string });
@@ -551,14 +568,19 @@ invitesRouter.post(
             await browserGate.releaseWorker({ machineId: gatedMachineId, sessionId: session.id as string });
             return res.status(202).json({ status: 'preparing' });
           }
-        } else if (ready.status !== 'disabled') {
+        } else if (ready.status !== 'disabled' || endpoint.target === 'r1') {
           // no_capacity | timeout | error — the service already released/stopped
           // any machine it claimed for this session (invariant I2), so there is
           // nothing to release here. Defer with the invite unconsumed.
+          //
+          // `disabled` on the R1 target (fence 7) is deferred too: the service
+          // says its flag is off, so nothing was readied or dispatched, and an
+          // R1 token must never be minted without both.
           return res.status(202).json({ status: 'preparing' });
         }
-        // status === 'disabled' falls through: the service's flag is off, so the
-        // gate is inert and the exchange proceeds exactly as with no gate.
+        // status === 'disabled' on Cloud falls through: the service's flag is
+        // off, so the gate is inert and the exchange proceeds exactly as with no
+        // gate.
       }
 
       // Step 3: Atomic CAS — update consumed_at where consumed_at IS NULL.

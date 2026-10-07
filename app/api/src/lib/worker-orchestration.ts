@@ -125,9 +125,11 @@ export interface LeaseStateSnapshot {
    */
   readonly registeredAgentName?: string | null;
   /**
-   * 0118: durable lowercase LiveKit hostname reported by the browser worker,
-   * or null when the worker explicitly reported no host. Optional so older
-   * hand-built readers still type-check; absent is treated as null.
+   * 0118: durable lowercase LiveKit hostname reported by the browser worker
+   * (R1 only), or null when the lease carries none. UNDEFINED means the reader
+   * did not select the column at all (every phone read, and every Cloud
+   * browser read): then no `livekitHost` is surfaced anywhere, so those lanes
+   * neither depend on 0118 nor change shape.
    */
   readonly livekitHost?: string | null;
 }
@@ -227,7 +229,11 @@ export type EnsureReadyResult =
        * same fake-compatibility reason; absent means null.
        */
       agentName?: string | null;
-      /** 0118: durable browser worker endpoint host from the ready lease. */
+      /**
+       * 0118: durable browser worker endpoint host from the ready lease. Present
+       * ONLY on a browser verdict whose lease reader selected the column (the R1
+       * target); absent on phone and on Cloud-browser verdicts.
+       */
       livekitHost?: string | null;
     }
   | { status: 'no_capacity' }
@@ -614,15 +620,18 @@ export function createWorkerOrchestrationService(
     const agentName = typeof readySnap?.registeredAgentName === 'string'
       ? readySnap.registeredAgentName
       : null;
-    const livekitHost = typeof readySnap?.livekitHost === 'string'
-      ? readySnap.livekitHost
-      : null;
     event('ready', { app });
-    // Keep phone gate results byte-for-byte unchanged. `livekit_host` belongs
-    // exclusively to the browser/R1 contract and is only surfaced there.
-    return pipeline === 'browser'
-      ? { status: 'ready', machineId, epoch: leaseEpoch, agentName, livekitHost }
-      : { status: 'ready', machineId, epoch: leaseEpoch, agentName };
+    // Keep phone AND Cloud-browser gate results byte-for-byte unchanged.
+    // `livekit_host` belongs exclusively to the browser/R1 contract: it is
+    // surfaced only for a browser verdict whose reader selected the column
+    // (`readySnap.livekitHost !== undefined`), i.e. only on the R1 target.
+    if (pipeline === 'browser' && readySnap?.livekitHost !== undefined) {
+      const livekitHost = typeof readySnap.livekitHost === 'string'
+        ? readySnap.livekitHost
+        : null;
+      return { status: 'ready', machineId, epoch: leaseEpoch, agentName, livekitHost };
+    }
+    return { status: 'ready', machineId, epoch: leaseEpoch, agentName };
   }
 
   async function releaseWorker(input: {
@@ -1011,6 +1020,13 @@ export function createDefaultWorkerOrchestrationService(
      * the phone/default orchestration on the permanent Cloud endpoint.
      */
     liveKitEndpoint?: LiveKitEndpoint;
+    /**
+     * Also select (and surface) `voice_worker_leases.livekit_host` (0118).
+     * Default FALSE: the phone lease reader and the Cloud-browser reader keep
+     * the exact pre-0118 select string, so neither lane's readiness depends on
+     * migration 0118 being applied. Only the R1-target browser service sets it.
+     */
+    readLivekitHost?: boolean;
   } = {},
 ): WorkerOrchestrationService {
   const client = supabase as unknown as SupabaseClient;
@@ -1019,6 +1035,7 @@ export function createDefaultWorkerOrchestrationService(
     baseUrl: env.flyApiBaseUrl,
   });
   const liveKitEndpoint = overrides.liveKitEndpoint ?? cloudLiveKitEndpoint();
+  const readLivekitHost = overrides.readLivekitHost === true;
 
   const rpc: RpcCaller = async (name, args) => {
     const { data, error } = await client.rpc(name, args);
@@ -1028,7 +1045,9 @@ export function createDefaultWorkerOrchestrationService(
   const readLeaseState: LeaseStateReader = async ({ app, machineId }) => {
     const { data, error } = await client
       .from('voice_worker_leases')
-      .select('state, claimed_session_id, epoch, registered_agent_name, livekit_host')
+      .select(readLivekitHost
+        ? 'state, claimed_session_id, epoch, registered_agent_name, livekit_host'
+        : 'state, claimed_session_id, epoch, registered_agent_name')
       .eq('app', app)
       .eq('machine_id', machineId)
       .maybeSingle();
@@ -1060,8 +1079,11 @@ export function createDefaultWorkerOrchestrationService(
       // defers), which is fail-closed, never a dispatch to a guessed name.
       registeredAgentName:
         typeof row?.registered_agent_name === 'string' ? row.registered_agent_name : null,
-      livekitHost:
-        typeof row?.livekit_host === 'string' ? row.livekit_host : null,
+      // 0118, R1-target browser reads only. Anything but a string reads as "no
+      // host reported" (null), which the R1 host match refuses.
+      ...(readLivekitHost
+        ? { livekitHost: typeof row?.livekit_host === 'string' ? row.livekit_host : null }
+        : {}),
     };
   };
 

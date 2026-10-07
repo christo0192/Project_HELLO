@@ -140,6 +140,12 @@ const NEG = [
   ["phone PHONE_PER_MACHINE_AGENT_NAME is not exactly true (TRUE)", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = "TRUE"\n')],
   ["phone PHONE_PER_MACHINE_AGENT_NAME is 1", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = "1"\n')],
   ["phone PHONE_PER_MACHINE_AGENT_NAME is empty", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = ""\n')],
+  // ── R1 (PR-LK-liveness): the opt-ins that must never ship in a fly.toml ──
+  ["browser sets R1_READINESS_HOST (live Cloud lane would change)", GOOD_BROWSER.replace("[env]\n", '[env]\n  R1_READINESS_HOST = "on"\n'), GOOD_PHONE],
+  ["browser sets R1_READINESS_HOST even as off", GOOD_BROWSER.replace("[env]\n", '[env]\n  R1_READINESS_HOST = "off"\n'), GOOD_PHONE],
+  ["phone sets R1_READINESS_HOST", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  R1_READINESS_HOST = "on"\n')],
+  ["browser sets BROWSER_WORKER_ONE_JOB", GOOD_BROWSER.replace("[env]\n", '[env]\n  BROWSER_WORKER_ONE_JOB = "on"\n'), GOOD_PHONE],
+  ["phone sets BROWSER_WORKER_ONE_JOB", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  BROWSER_WORKER_ONE_JOB = "on"\n')],
   ["phone kill_timeout below the 90 s drain floor", GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', 'kill_timeout = 5\n')],
   ["phone kill_timeout above Fly's 300 s max", GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', 'kill_timeout = 301\n')],
   ["phone kill_timeout quoted / not a bare integer", GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', 'kill_timeout = "300s"\n')],

@@ -1355,3 +1355,50 @@ describe('ensureReadyWorker — lease epoch and registered agent name (M009 E2)'
     expect(r).toEqual({ status: 'timeout' });
   });
 });
+
+// ── 0118 (PR-LK-liveness): the lease host is surfaced for R1 browser reads only ──
+describe('ensureReadyWorker — livekit host (0118)', () => {
+  const BROWSER_APP = 'project-hello-voice';
+
+  function svcReading(snapshot: Record<string, unknown>) {
+    const { rpc } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: MACHINE, epoch: 7 } }],
+    });
+    return createWorkerOrchestrationService(baseDeps({
+      rpc,
+      readLeaseState: async () => snapshot as never,
+    }));
+  }
+
+  it('browser + a reader that selected the column: the host reaches the verdict', async () => {
+    const svc = svcReading({ ...lease('ready', { epoch: 7 }), livekitHost: 'r1.example.test' });
+    const r = await svc.ensureReadyWorker({ app: BROWSER_APP, pipeline: 'browser', sessionId: SESSION });
+    expect(r).toEqual({
+      status: 'ready', machineId: MACHINE, epoch: 7, agentName: null, livekitHost: 'r1.example.test',
+    });
+  });
+
+  it('browser + a selected-but-empty host reads as null (never undefined, never a guess)', async () => {
+    for (const livekitHost of [null, 42, { host: 'r1.example.test' }]) {
+      const svc = svcReading({ ...lease('ready', { epoch: 7 }), livekitHost });
+      const r = await svc.ensureReadyWorker({ app: BROWSER_APP, pipeline: 'browser', sessionId: SESSION });
+      expect(r).toEqual({
+        status: 'ready', machineId: MACHINE, epoch: 7, agentName: null, livekitHost: null,
+      });
+    }
+  });
+
+  it('browser + a reader that did NOT select the column (Cloud): the verdict has no livekitHost key', async () => {
+    const svc = svcReading(lease('ready', { epoch: 7 }));
+    const r = await svc.ensureReadyWorker({ app: BROWSER_APP, pipeline: 'browser', sessionId: SESSION });
+    expect(r).toEqual({ status: 'ready', machineId: MACHINE, epoch: 7, agentName: null });
+    expect(r).not.toHaveProperty('livekitHost');
+  });
+
+  it('phone: the verdict never carries livekitHost, even from a reader that selected it', async () => {
+    const svc = svcReading({ ...lease('ready', { epoch: 7 }), livekitHost: 'r1.example.test' });
+    const r = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION, epoch: 1 });
+    expect(r).toEqual({ status: 'ready', machineId: MACHINE, epoch: 7, agentName: null });
+    expect(r).not.toHaveProperty('livekitHost');
+  });
+});

@@ -10,6 +10,12 @@
 # token it must contain. It runs after every production migration in
 # .github/workflows/deploy-fly.yml and in the PR-C post-deploy runbook.
 #
+# 0118 (R1 PR-LK-liveness) re-declares two PHONE-SHARED RPCs, claim_voice_worker
+# and reset_voice_worker, each as 0112 verbatim plus one `livekit_host = null`
+# assignment. Neither pre-0118 body contains the identifier `livekit_host` (the
+# column is added by 0118), so its presence in the live body proves production
+# runs the 0118 definitions and not the 0112 ones.
+#
 # It issues SELECTs only (pg_get_functiondef). No PII is queried or printed.
 #
 # Target:
@@ -26,6 +32,8 @@ CLI_VERSION="${SUPABASE_CLI_VERSION_DRIFT:-2.118.0}"
 # One line per check: <regprocedure>|<token the live body must contain>.
 CHECKS=(
   "screening_v2.request_phone_rescreen(uuid,text,text,text,uuid,timestamptz)|ensure_ashby_phone_engagement"
+  "screening_v2.claim_voice_worker(text,text,uuid,bigint,timestamptz)|livekit_host"
+  "screening_v2.reset_voice_worker(text,text,timestamptz)|livekit_host"
 )
 
 if [ -n "${SUPABASE_DB_URL:-}" ]; then

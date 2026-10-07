@@ -6,9 +6,13 @@
  * browser operation starts rather than while this module is imported.
  *
  * `BROWSER_LIVEKIT_TARGET=r1` must only be set as part of the R1 cutover
- * (plan v2 §8.2): first drain R1 sessions and point project-hello-voice
- * LIVEKIT_* at the R1 SFU; worker readiness host-binding lands in
- * PR-LK-liveness.
+ * (plan v2 §8.2; runbook docs/runbooks/r1-operations.md, "Fallback flip
+ * procedure"): drain R1 sessions, flip THIS target FIRST (the readiness host
+ * check, PR-LK-liveness, then runs and fails closed for any worker not yet on
+ * the R1 SFU), and only then point project-hello-voice LIVEKIT_* at the R1 SFU
+ * with R1_READINESS_HOST=on. Never leave this on Cloud while a browser worker is
+ * on the R1 SFU: the Cloud path skips the host check. Roll back in reverse:
+ * workers first, then this target.
  */
 
 import { AccessToken, AgentDispatchClient, RoomServiceClient } from 'livekit-server-sdk';

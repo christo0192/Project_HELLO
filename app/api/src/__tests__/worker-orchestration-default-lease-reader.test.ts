@@ -164,29 +164,18 @@ beforeEach(() => {
 });
 
 describe('createDefaultWorkerOrchestrationService — production lease reader (M009 E2)', () => {
-  it('(a) selects registered_agent_name and livekit_host from voice_worker_leases, keyed by (app, machine_id)', async () => {
-    h.row = readyRow({ registered_agent_name: PER_MACHINE, livekit_host: 'r1.example.test' });
+  it('(a) selects registered_agent_name from voice_worker_leases, keyed by (app, machine_id)', async () => {
+    h.row = readyRow({ registered_agent_name: PER_MACHINE });
     await gate();
     expect(h.tables).toContain('voice_worker_leases');
     expect(h.selects.length).toBeGreaterThan(0);
     for (const cols of h.selects) {
       const names = cols.split(',').map((c) => c.trim());
       expect(names).toEqual(
-        expect.arrayContaining(['state', 'claimed_session_id', 'epoch', 'registered_agent_name', 'livekit_host']),
+        expect.arrayContaining(['state', 'claimed_session_id', 'epoch', 'registered_agent_name']),
       );
     }
     expect(h.filters).toEqual(expect.arrayContaining([`app=${APP}`, `machine_id=${MACHINE}`]));
-  });
-
-  it('(d) a reported lease host reaches the readiness verdict, while non-strings become null', async () => {
-    h.row = readyRow({ registered_agent_name: PER_MACHINE, livekit_host: 'r1.example.test' });
-    await expect(createDefaultWorkerOrchestrationService().ensureReadyWorker({
-      app: APP, pipeline: 'browser', sessionId: SESSION, epoch: 1, readyTimeoutSec: 30,
-    })).resolves.toMatchObject({ livekitHost: 'r1.example.test' });
-    h.row = readyRow({ registered_agent_name: PER_MACHINE, livekit_host: { host: 'r1.example.test' } });
-    await expect(createDefaultWorkerOrchestrationService().ensureReadyWorker({
-      app: APP, pipeline: 'browser', sessionId: SESSION, epoch: 1, readyTimeoutSec: 30,
-    })).resolves.toMatchObject({ livekitHost: null });
   });
 
   it('(b) a reported per-machine name reaches the gate verdict as agentName, with the LEASE epoch', async () => {
@@ -275,5 +264,102 @@ describe('phone dial gate ceilings match the orchestration service bounds', () =
 
   it('the gate ceiling is the start wait plus the ready ceiling', () => {
     expect(PHONE_WORKER_GATE_CEILING_SEC).toBe(DEFAULT_START_WAIT_SEC + MAX_READY_TIMEOUT_MS / 1000);
+  });
+});
+
+// ── 0118 (PR-LK-liveness): `livekit_host` is an R1-browser-only column ──────
+// Every test above this block is byte-identical to origin/main. The phone lease
+// reader and the Cloud-browser lease reader must keep the exact pre-0118 select
+// string — so neither lane's readiness depends on migration 0118 — and neither
+// may surface a host. Only the R1-target browser service selects and surfaces it.
+describe('lease host column (0118) is R1-browser-only', () => {
+  const PRE_0118_SELECT = 'state, claimed_session_id, epoch, registered_agent_name';
+  const BROWSER_APP_NAME = 'project-hello-voice';
+
+  function selectR1(): void {
+    process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+    process.env.R1_LIVEKIT_URL = 'wss://r1.invalid';
+    process.env.R1_LIVEKIT_API_KEY = 'r1-key';
+    process.env.R1_LIVEKIT_API_SECRET = 'r1-secret';
+  }
+
+  function ensureBrowser(service: ReturnType<typeof createDefaultWorkerOrchestrationService>) {
+    return service.ensureReadyWorker({
+      app: BROWSER_APP_NAME,
+      pipeline: 'browser',
+      sessionId: SESSION,
+      epoch: 1,
+      readyTimeoutSec: 30,
+    });
+  }
+
+  it('the phone reader selects exactly the pre-0118 columns and never livekit_host', async () => {
+    h.row = readyRow({ registered_agent_name: PER_MACHINE, livekit_host: 'r1.example.test' });
+    await gate();
+    expect(h.selects.length).toBeGreaterThan(0);
+    for (const cols of h.selects) {
+      expect(cols).toBe(PRE_0118_SELECT);
+      expect(cols).not.toContain('livekit_host');
+    }
+  });
+
+  it('the phone verdict never carries livekitHost, even when the row has one', async () => {
+    h.row = readyRow({ registered_agent_name: PER_MACHINE, livekit_host: 'r1.example.test' });
+    const res = await gate();
+    expect(res).toEqual({ status: 'ready', machineId: MACHINE, epoch: LEASE_EPOCH, agentName: PER_MACHINE });
+    expect(res).not.toHaveProperty('livekitHost');
+  });
+
+  it('a phone-pipeline request never surfaces a host, even from a reader that selected it', async () => {
+    h.row = readyRow({ registered_agent_name: PER_MACHINE, livekit_host: 'r1.example.test' });
+    const res = await createDefaultWorkerOrchestrationService({ readLivekitHost: true }).ensureReadyWorker({
+      app: APP, pipeline: 'phone', sessionId: SESSION, epoch: 1, readyTimeoutSec: 30,
+    });
+    expect(res).not.toHaveProperty('livekitHost');
+  });
+
+  it('the Cloud browser reader keeps the pre-0118 select and a verdict with no livekitHost key', async () => {
+    h.row = readyRow({ registered_agent_name: null, livekit_host: 'r1.example.test' });
+    const res = await ensureBrowser(createBrowserWorkerOrchestrationService());
+    expect(res).toEqual({ status: 'ready', machineId: MACHINE, epoch: LEASE_EPOCH, agentName: null });
+    expect(res).not.toHaveProperty('livekitHost');
+    for (const cols of h.selects) expect(cols).toBe(PRE_0118_SELECT);
+  });
+
+  it('only the R1-target browser reader selects livekit_host and surfaces it on the verdict', async () => {
+    selectR1();
+    h.row = readyRow({ registered_agent_name: null, livekit_host: 'r1.example.test' });
+    const res = await ensureBrowser(createBrowserWorkerOrchestrationService());
+    expect(res).toEqual({
+      status: 'ready', machineId: MACHINE, epoch: LEASE_EPOCH, agentName: null,
+      livekitHost: 'r1.example.test',
+    });
+    expect(h.selects.length).toBeGreaterThan(0);
+    for (const cols of h.selects) {
+      expect(cols).toBe(`${PRE_0118_SELECT}, livekit_host`);
+    }
+  });
+
+  for (const [label, value] of [
+    ['null', null],
+    ['absent', undefined],
+    ['a number', 42],
+    ['an object', { host: 'r1.example.test' }],
+  ] as const) {
+    it(`the R1 browser reader reads a ${label} lease host as null (the host match then refuses it)`, async () => {
+      selectR1();
+      h.row = readyRow(value === undefined ? {} : { livekit_host: value });
+      const res = await ensureBrowser(createBrowserWorkerOrchestrationService());
+      expect(res).toMatchObject({ status: 'ready', livekitHost: null });
+    });
+  }
+
+  it('explicit opt-out keeps the default reader on the pre-0118 select', async () => {
+    h.row = readyRow({ livekit_host: 'r1.example.test' });
+    const res = await createDefaultWorkerOrchestrationService({ readLivekitHost: false }).ensureReadyWorker({
+      app: APP, pipeline: 'phone', sessionId: SESSION, epoch: 1, readyTimeoutSec: 30,
+    });
+    expect(res).not.toHaveProperty('livekitHost');
+    for (const cols of h.selects) expect(cols).toBe(PRE_0118_SELECT);
   });
 });

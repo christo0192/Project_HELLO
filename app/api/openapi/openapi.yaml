@@ -9413,7 +9413,7 @@ components:
           type: string
           maxLength: 253
           pattern: '^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?))*$'
-          description: Optional browser worker LiveKit hostname, lowercased by the API and persisted on the worker lease. Omission explicitly clears a prior host; R1 admission requires an exact durable host match. Intentionally absent from phone readiness bodies.
+          description: "R1, optional. The lowercase DNS hostname of the LiveKit endpoint a BROWSER worker registered with, sent only by a worker opted into the R1 readiness contract (R1_READINESS_HOST=on). Additive: the schema stays strict and an absent key is exactly the legacy body, which is all a Cloud browser worker or a phone worker ever sends. When present on a browser (project-hello-voice) post the API lowercases it and records it on the lease (set_voice_worker_livekit_host) BEFORE marking the row ready; a stale lease answers 200 {ok:false,status:stale}, and any other outcome is 500 with the row NOT marked ready. The database nulls the host on every new claim and on reset, so it never outlives its boot, and R1 admission requires an exact match with the R1 endpoint host. Accepted and ignored for any other app."
       additionalProperties: false
 
     VoiceWorkerReadyResponse:

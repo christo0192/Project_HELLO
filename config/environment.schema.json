@@ -271,6 +271,7 @@
         "PHONE_VOICE_APP": { "requiredInProduction": false, "secret": false },
         "BROWSER_AGENT_NAME": { "requiredInProduction": false, "secret": false },
         "BROWSER_WORKER_ONE_JOB": { "requiredInProduction": false, "secret": false },
+        "R1_READINESS_HOST": { "requiredInProduction": false, "secret": false },
         "WORKER_CONTEXT_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "WORKER_CONTEXT_RESOLVE_ATTEMPTS": { "requiredInProduction": false, "secret": false },
         "WORKER_CONTEXT_RESOLVE_BACKOFF_SEC": { "requiredInProduction": false, "secret": false },

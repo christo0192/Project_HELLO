@@ -61,6 +61,135 @@ migrations. (implemented in PR-1 and deploy-guard follow-up)
 Web-only deployments may occur outside this slot only with zero live R1
 sessions. (implemented in PR-6/PR-7)
 
+### PR-LK-liveness (PR #345): the gate for this merge is run by hand
+
+The automated zero-live pre-step named in the plan (section 9) does not exist
+yet: no step in `deploy-fly.yml` queries for live work, so nothing in CI stops a
+merge while a phone call or a screening is live. For this PR the operator runs
+the gate above by hand and records the result on the PR before squashing.
+
+One merge of this PR does all of the following:
+
+- `migrate-production` applies 0118. It takes an ACCESS EXCLUSIVE lock on
+  `voice_worker_leases` under a 10 s `lock_timeout` (a busy table fails the
+  migration instead of queueing behind live traffic). The read-only drift check
+  then runs three queries: `request_phone_rescreen`, `claim_voice_worker` and
+  `reset_voice_worker`.
+- The API, the browser voice app and the phone voice app all redeploy (the voice
+  sources are shared, so a change under `app/voice-livekit/` deploys both apps).
+  A live phone call is cut after the 90 s drain; a live screening is ended by
+  the worker shutdown (`shutdown_forced`).
+- The phone image also ships every phone change merged to `main` and not yet
+  deployed. The gate review named #334 (natural opening, pre-consent scheduling,
+  Q&A closing; merged 2026-10-06); confirm what else is pending before merging.
+
+Procedure (all times IST):
+
+1. Pick a merge slot between 07:00 and 08:00. Never later: no Quality re-run or
+   deploy dispatch is allowed after 08:15, and the deploy follows the merge.
+2. At least 30 minutes before the merge, set `r1_settings.paused = true`.
+3. Immediately before squashing, run the five read-only queries of the gate
+   above (live R1 sessions; live phone attempts; `phone.dial` jobs; phone
+   appointments due in the next 30 minutes; active `phone.assessment` jobs).
+   Abort on any row. This PR changes the API, so the `phone.assessment` check
+   applies.
+4. Confirm Quality and `supabase-check` are green on the exact commit being
+   squashed, rebased on the current `main`. A new push re-runs both.
+5. Squash. After the deploy verify the watermarked worker registration of BOTH
+   voice apps, the unchanged phone role-row snapshot, and a phone Canary-1 dry
+   run (`worker_present_before_originate|PASS`). Keep R1 paused until the owner
+   decides to resume.
+
+Transient drift-check failure. The drift script checks all three functions and
+then fails the job if any check failed. A log line `drift check could not query`
+or `drift check got no readable position` is transient (for example a dropped
+connection); `PROD FUNCTION DRIFT ... (position 0)` is real drift. After a
+transient failure `migrate-production` has already applied 0118 and every app
+deploy is skipped. That state is safe (0118 is additive and compatible with the
+old apps) but nothing is deployed. Recover inside the window by re-running the
+failed job from the same workflow run, or by dispatching `Deploy (Fly)` with
+service `all` (it re-applies pending migrations, of which there are none,
+repeats the drift check and deploys). Real drift: do not deploy; investigate.
+
+Gate record. Paste this on the PR, filled in, before squashing:
+
+```text
+Gate record, PR #345 (hand-run; the automated pre-step does not exist)
+- Merge time (IST, 07:00-08:00): __:__
+- r1_settings.paused = true since (IST, at least 30 minutes earlier): __:__
+- Live R1 sessions: 0
+- Live phone attempts (lease_expires_at > now()): 0
+- phone.dial jobs active or due in 30 minutes: 0
+- Phone appointments due in 30 minutes: 0
+- Active phone.assessment jobs: 0
+- Quality and supabase-check green on commit: <sha>
+```
+
+### PR-LK-liveness (PR #345): phone impact (plan section 9)
+
+This PR touches the phone-shared tier, so plan section 9 requires this record.
+Every new behaviour is opt-in (the table under "Browser readiness contract") and
+off by default. With the defaults the phone lane and the live Cloud browser lane
+run the same code paths as before. The record below states where this PR departs
+from the section 9 rules, and why that is acceptable.
+
+Phone-shared files this PR changes, and the rule each follows:
+
+- `app/voice-livekit/agent.py`: no new top-level imports (`urlparse` and
+  `AgentServer` are imported inside the one function that needs each, on the
+  opted-in browser path only). It modifies exactly three pre-existing
+  definitions, `_prewarm_post_machine_ready`, `build_worker_options` and the
+  `__main__` block, and otherwise only adds named-browser / R1 helpers that
+  those three call. `test_browser_liveness.py` pins this: the helpers may be
+  referenced only from the three seams, and never from a phone helper, the job
+  entrypoint or `_run_session`.
+- `app/voice-livekit/worker_ready_api.py`: one optional keyword,
+  `livekit_host`, sent only when set; every caller that omits it posts the
+  legacy body.
+- `app/api/src/routes/invites.ts`: fence 7, keyed on the R1 target; Cloud takes
+  the same branches as before.
+- `app/api/src/lib/worker-orchestration.ts`: a `readLivekitHost` option, default
+  off, so the phone reader and the Cloud-browser reader keep the exact pre-0118
+  `select`.
+- Environment schema and validator: additive (two worker switches).
+
+Three departures from section 9, each justified:
+
+1. **R1 early return in `_prewarm_post_machine_ready`.** Section 9 says "no R1
+   work in prewarm". With `R1_READINESS_HOST=on` on the named BROWSER worker the
+   prewarm returns without posting, and readiness comes only from the main
+   process once LiveKit accepts the registration. This cannot be done anywhere
+   else: a job process can warm before the registration completes, so letting it
+   post would win the readiness race. The branch is a bare `return`; it is
+   unreachable for the phone worker (`_browser_r1_readiness` is false whenever
+   the worker is not the named browser worker) and, with the switch absent,
+   the function is unchanged.
+2. **`build_worker_options` and the `__main__` block.** Section 9 allows
+   "build_worker_options keys only when R1 env is present" and entrypoint
+   additions only below the `_phone_agent_name()` return. The two opt-in keys
+   (`load_fnc`, `load_threshold`) are written only inside the named-browser
+   branch, and only when `BROWSER_WORKER_ONE_JOB=on`; the phone keys are not
+   touched. The `__main__` block now calls `run_worker_app`, which is the old
+   `cli.run_app(build_worker_options())` for every lane except the opted-in
+   named browser worker. The new helpers sit beside the existing browser helpers
+   rather than below that return, because nothing is added to the job
+   entrypoint itself.
+3. **0118 re-declares `claim_voice_worker` and `reset_voice_worker`.** Section 9
+   puts "the phone SQL RPCs" on the never-touch list, and both functions are
+   shared by the phone and the browser lane. Each is the 0112 text (their latest
+   definition) plus exactly ONE added line, `livekit_host = null,`, beside
+   `registered_agent_name = null`. The CHECK `livekit_host is null or pipeline =
+   'browser'` means a phone row can never hold a host, so for a phone row the
+   added assignment writes null over null: a no-op. Signatures, security posture
+   and grants are re-issued unchanged. Proof: `r1-lk-liveness-release-gate.test.ts`
+   diffs each re-declaration against 0112 line by line (nothing removed; the one
+   added line); `r1_foundation_assert.sql` runs both RPCs for a phone lease and
+   a browser lease.
+
+Phone tests that stay green and unmodified: `test_phone_gate`,
+`test_phone_agent_name`, `test_phone_drain` and `test_agent`. `test_worker_ready_api`
+gains additive `livekit_host` cases only.
+
 ## Budget, cap, and reconciliation
 
 R1 permits one live interview. Reserve 55 participant-minutes per attempt;
@@ -447,28 +576,166 @@ candidate network data. Deploys, upgrades, cert changes, and secret changes
 are manual, require zero live R1 rooms, and are followed by health, UDP-pair,
 worker-registration, and browser smoke checks. (implemented in PR-SFU-2)
 
-Fallback flip procedure:
+### Browser readiness contract (PR-LK-liveness)
 
-1. Pause R1 and drain all `waiting` and `in_progress` R1 sessions.
-2. Confirm zero R1 rooms and worker jobs; do not make an API-only flip.
-3. Make sure the host-aware readiness API (PR-LK-liveness) is already deployed;
-   it must be live BEFORE the worker reports `livekit_host`.
-4. Put the worker `LIVEKIT_*` triple on the selected endpoint. For the
-   self-hosted SFU, also set `BROWSER_WORKER_ONE_JOB=on` (one job per machine;
-   an idle worker is always available, a busy one never is). Deploy, then
-   verify the worker registered there: its post-registration ready record
-   carries that endpoint's `livekit_host`.
-5. Set `BROWSER_LIVEKIT_TARGET` to the same target, deploy the API, and verify
-   returned endpoint, candidate token, room creation, dispatch, and reaper.
-   With target `r1`, a ready record with a different or missing host is not
-   ready, and no candidate token or dispatch is issued.
-6. Apply the Cloud cap before admitting new sessions when the target is Cloud.
+The production Cloud browser worker is already a named, orchestrated worker
+(`BROWSER_AGENT_NAME`, `WORKER_ORCHESTRATION=worker`), so every R1 behaviour is
+OPT-IN and the Cloud lane is byte-identical to before this PR. Nothing below
+changes Cloud until the cutover steps explicitly turn it on.
 
-Rollback to Cloud reverses steps 4-5: return the worker to its Cloud `LIVEKIT_*`
-triple and remove `BROWSER_WORKER_ONE_JOB` (or set anything other than `on`),
-then select Cloud on the API.
+| Switch | Where | Absent / off (default, ships in `fly.toml`) | On (R1 cutover only) |
+| --- | --- | --- | --- |
+| `R1_READINESS_HOST=on` (exact) | browser worker | Prewarm posts the legacy `{app, machine_id}` readiness body; the worker starts through `cli.run_app(WorkerOptions)`; no `livekit_host` is ever sent. | Readiness is posted once from the main process when LiveKit accepts the registration (and again on every reconnect), carrying `livekit_host`, the lowercase DNS hostname of the worker's `LIVEKIT_URL`. The idle-process prewarm posts nothing. |
+| `BROWSER_WORKER_ONE_JOB=on` (exact) | browser worker | SDK CPU load average, as before. | One job per machine: an idle worker is always available, a busy one never is. |
+| `BROWSER_LIVEKIT_TARGET=r1` (exact) | API | Host match, dispatch verification and the token fence below never run. | They apply (below). |
+
+Both worker switches are validated absent from `fly.toml` and `fly.phone.toml`
+(`scripts/validate-voice-worker-apps.mjs`) and registered in
+`config/environment.schema.json`; they are set per cutover, never baked in.
+
+API behaviour with target `r1` only (with Cloud none of it runs):
+
+- **Host match.** A ready lease is admitted only when its durable
+  `voice_worker_leases.livekit_host` equals the hostname of `R1_LIVEKIT_URL`
+  (lowercase, port and path ignored). A missing or different host releases the
+  machine and answers `preparing`; no dispatch and no candidate token.
+- **Boot-scoped host.** Migration 0118 nulls the host on every new claim and on
+  reset, exactly like `registered_agent_name` (0112). A host report is recorded
+  before the lease is marked ready; if recording fails the lease is NOT marked
+  ready (500), and a stale lease answers `stale`. The host RPC accepts browser
+  leases only.
+- **Dispatch-drop safeguard.** After `createDispatch` the API waits for a job
+  (`BROWSER_DISPATCH_VERIFY_SEC`; above the worker SDK's 7.5 s assignment
+  allowance). Unset, blank, non-numeric, zero or negative means the default of
+  10 s; only an explicit positive value is used, clamped to 1-15 s (a value
+  below 8 deliberately undercuts the SDK allowance and can delete a slow but
+  live dispatch, so leave it unset). A dispatch that stays job-less is deleted
+  and re-issued ONCE, and only when the deletion is confirmed, no dispatch in
+  the room owns a LIVE job (a finished job left by an earlier exchange, status
+  `JS_SUCCESS`/`JS_FAILED` or a set `state.endedAt`, does not count; a
+  tombstoned dispatch, `deletedAt` set, is not still listed), and no agent
+  participant is in the room; anything unproven answers `preparing` instead.
+  A final dropped retry is deleted too. Two agents never share a room. Only a
+  double drop is slow: the exchange then waits about two windows plus up to 3 s
+  of deletion proof before answering `preparing`. LiveKit Cloud keeps its
+  single `createDispatch` (the drop evidence is OSS-only).
+- **Fails closed.** On R1 only a PROVEN assignment mints a token. A dispatch the
+  API cannot verify (no dispatch id, a `listDispatch` error, a dispatch that
+  vanished from the room) answers `preparing`: the machine is released, which
+  also ends any agent that did join, nothing is re-dispatched on an unproven
+  room, and the abandoned dispatch is deleted best-effort. The cost is a retry
+  for the candidate during a LiveKit API outage, never an agent-less room.
+- **Fence 7.** An R1 candidate token requires the orchestration gate. With
+  target `r1`, `WORKER_ORCHESTRATION` off, an empty/malformed
+  `BROWSER_AGENT_NAME`, or a `disabled` gate verdict yields no token: `503
+  screening_room_unavailable` (invite unconsumed) or `preparing`. Never turn
+  `WORKER_ORCHESTRATION` off on the API while target is `r1`.
+
+Deploy order and skew safety:
+
+- 0118 is additive and applied first by `deploy-fly` (`migrate-production`).
+  The API and browser-voice deploys then run in parallel; every order is safe
+  because both sides default off. The `/ready-machine` schema accepts an
+  optional `livekit_host` additively and stays `.strict()` otherwise, a Cloud
+  ready post makes no host RPC, and the Cloud and phone lease readers select
+  the same columns as before 0118 (neither lane depends on 0118).
+- A worker must never send `livekit_host` to an API that predates it: an older
+  strict schema answers 400 and readiness is lost. That is why
+  `R1_READINESS_HOST=on` is set only AFTER the host-aware API is live (step 3).
+- The worker's `LIVEKIT_URL` host must be a plain DNS name equal to the API's
+  `R1_LIVEKIT_URL` host. An IPv6 literal or a trailing-dot FQDN cannot be
+  stored: the worker then posts host-less and R1 never admits it (fails
+  closed; readiness itself is not lost). A private/`.internal` worker address
+  that differs from the public API URL fails the match for the same reason.
+- livekit-agents 1.6 emits only `worker_started` and `worker_registered`; there
+  is no disconnect event, so readiness cannot be withdrawn on a websocket drop.
+  It is re-asserted on every reconnect, and the residual window (socket down,
+  lease still `ready`) is closed by the dispatch-drop safeguard and the reaper.
+- The post-registration readiness post is retried ONCE after a 2 s backoff when
+  the API call fails (transport error, HTTP failure, or the API's fail-closed
+  500 for a host-write error). That is the only retry: a worker whose two
+  attempts both fail stays `starting` until the claim's ready budget expires,
+  the candidate sees `preparing`, and the next claim starts clean.
+
+Fallback flip procedure.
+
+Invariant: **the API target is never Cloud while a browser worker is on the R1
+SFU.** The host check runs only when the API target is `r1`. If a worker were on
+the R1 SFU while the API still pointed at Cloud, that API would skip the host
+check, admit the worker's ready lease, `createDispatch` against Cloud and mint a
+Cloud candidate token into a room with no worker. So the target r1 flip is
+ordered API FIRST, workers second; the two deploys cannot be made atomic, and
+the order below leaves no window that skips the host check. The window between
+the two deploys is fail-closed (every browser exchange answers `preparing`), so
+run it with browser exchanges quiesced.
+
+Forward flip, Cloud to R1 (target `r1`):
+
+1. Pause R1 and drain all `waiting` and `in_progress` R1 sessions. Also confirm
+   zero live browser sessions: rerun the first merge-gate query without its
+   `interview_round_id` filter (over-inclusive on purpose; abort on any row).
+   No browser exchange may run between steps 4 and 5.
+2. Confirm zero R1 rooms and worker jobs; do not make an API-only flip without
+   this. Wait out the invite re-exchange grace window (5 minutes) before
+   changing the API target: a re-exchange inside it re-issues a token against
+   the CURRENT endpoint without re-entering the worker gate.
+3. Make sure the host-aware readiness API (PR-LK-liveness) and migration 0118
+   are already deployed (target still Cloud). They must be live BEFORE any
+   worker sets `R1_READINESS_HOST=on`.
+4. API FIRST: set `BROWSER_LIVEKIT_TARGET=r1` (with the `R1_LIVEKIT_*` triple)
+   and deploy the API. The host check now runs and fails closed: workers still
+   on Cloud report no host (or another), are released, and never get a dispatch
+   or a candidate token. Verify the API's returned endpoint is the R1 SFU.
+5. THEN the workers: put the worker `LIVEKIT_*` triple on the R1 SFU and set
+   `BROWSER_WORKER_ONE_JOB=on` and `R1_READINESS_HOST=on`. Deploy, then verify
+   the worker registered there: its post-registration ready record carries that
+   endpoint's `livekit_host`. Verify candidate token, room creation, dispatch
+   and reaper with one smoke session; with a different or missing host the
+   record is not ready and no candidate token or dispatch is issued.
+6. Resume only after step 5 verifies and the owner's operating decision.
+
+Rollback, R1 to Cloud, is the reverse and keeps the invariant: WORKERS FIRST,
+then the API.
+
+1. Pause R1 and drain as above (zero R1 rooms, zero live browser sessions).
+2. Return the worker to its Cloud `LIVEKIT_*` triple and remove
+   `BROWSER_WORKER_ONE_JOB` and `R1_READINESS_HOST` (or set anything other than
+   `on`); deploy. The API is still on `r1`, so a Cloud worker's host-less
+   report fails the host match closed: `preparing`, no token.
+3. Select Cloud on the API (`BROWSER_LIVEKIT_TARGET` unset or any value other
+   than `r1`) and deploy. Only now do exchanges resume, against Cloud workers.
+4. Wait out the 5 minute re-exchange grace window, and apply the Cloud cap
+   before admitting new sessions (the target is Cloud again).
 
 (implemented in PR-LK-seam and PR-LK-liveness)
+
+### S0-F3 dispatch-matrix rerun: what it must also record
+
+The API's "any dispatch in the room owns a live job" rule (`jobIsLive`) is
+deliberate: concurrent exchanges share the idempotently claimed machine, so it
+must not be narrowed blindly. One residual is open and needs evidence from the
+required S0-F3 dispatch-matrix rerun (R1 SFU, Config B):
+
+- Stop a worker machine in the middle of a job and, for 60 s, poll
+  `listDispatch` for that room. Record the job's `JobStatus`, its
+  `state.endedAt`, and whether the dispatch stays listed.
+- Record whether deleting a dispatch ends its running job.
+
+Why it matters (R1 only; it cannot happen on Cloud and needs two failures in a
+row). Exchange 1: `listDispatch` errors, the best-effort discard of the dispatch
+also fails, and the claimed machine is stopped. If the OSS server leaves that
+orphaned job at JS_RUNNING with no `endedAt`, the candidate's next exchange sees
+it on its first poll and answers `assigned` (a token is minted) with no proof
+that its own new dispatch was accepted.
+
+Already in `jobIsLive`: a job counts as over when its status is JS_SUCCESS or
+JS_FAILED, or when `state.endedAt` is set (the server stamps it, so a positive
+value is proof). If the rerun shows a stopped machine's job stays JS_RUNNING with
+`endedAt` 0, the follow-up must also stop counting a job owned by a dispatch the
+API already abandoned. The gate is built per request, so that fact has to be
+carried across exchanges (for example by recording the abandoned dispatch id);
+it is not implemented now because doing it without evidence would relax the
+never-two-agents rule. This is not a blocker for the PR-LK-liveness merge.
 
 ## Key rotation
 

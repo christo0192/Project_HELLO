@@ -10,6 +10,9 @@
  *   - ON + NOT ready (timeout/no_capacity/error): 202 {status:'preparing'} and
  *     NO token, and the one-time invite is NOT consumed (retry stays valid).
  *   - ON + ready but dispatch FAILS: 202 preparing, worker released, no token.
+ *   - FENCE 7 (R1): with BROWSER_LIVEKIT_TARGET=r1 a candidate token REQUIRES the
+ *     gate. A null gate fails closed (503, nothing consumed/minted) and a
+ *     `disabled` verdict defers (202). Cloud behaviour is unchanged.
  *
  * The gate is injected via `__setBrowserGateResolverForTest`, so this test needs
  * no Fly/LiveKit; the session is pre-provisioned (`waiting`) so the room path is
@@ -134,6 +137,9 @@ beforeEach(async () => {
 afterEach(() => {
   // Reset the resolver to the real (env-gated) default so tests don't leak.
   setGate(() => null);
+  for (const key of [
+    'BROWSER_LIVEKIT_TARGET', 'R1_LIVEKIT_URL', 'R1_LIVEKIT_API_KEY', 'R1_LIVEKIT_API_SECRET',
+  ]) delete process.env[key];
   Object.assign(mockedEnv, {
     livekitUrl: 'wss://lk.example', livekitApiKey: 'k', livekitApiSecret: 's',
   });
@@ -151,6 +157,23 @@ function appWithGate(gate: unknown) {
 
 function exchange(app: express.Express) {
   return request(app).post('/api/livekit/exchange').send({ token: TOKEN });
+}
+
+/** A gate whose worker is ready and whose dispatch succeeds. */
+function readyGate() {
+  return {
+    app: 'project-hello-voice', agentName: 'browser-screener',
+    ensureReadyWorker: vi.fn(async () => ({ status: 'ready', machineId: 'm1' })),
+    dispatch: vi.fn(async () => true),
+    releaseWorker: vi.fn(async () => undefined),
+  };
+}
+
+function selectR1(): void {
+  process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+  process.env.R1_LIVEKIT_URL = 'wss://r1.example.test';
+  process.env.R1_LIVEKIT_API_KEY = 'r1-key';
+  process.env.R1_LIVEKIT_API_SECRET = 'r1-secret';
 }
 
 describe('exchange browser gate — OFF is byte-identical', () => {
@@ -217,7 +240,8 @@ describe('exchange browser gate — OFF is byte-identical', () => {
     process.env.R1_LIVEKIT_API_KEY = 'r1-key';
     process.env.R1_LIVEKIT_API_SECRET = 'r1-secret';
     try {
-      const res = await exchange(appWithGate(null));
+      // Fence 7: an R1 exchange needs the orchestration gate (null fails closed).
+      const res = await exchange(appWithGate(readyGate()));
       expect(res.status).toBe(200);
       expect(res.body.url).toBe('wss://r1.example.test');
 
@@ -389,5 +413,159 @@ describe('exchange — same-bearer re-exchange grace', () => {
     const res = await exchange(app);
     expect(res.status).toBe(404);
     expect(res.body.livekit_token).toBeUndefined();
+  });
+});
+
+// ── Fence 7: an R1 candidate token REQUIRES the orchestration gate ───────────
+// The gate is null whenever WORKER_ORCHESTRATION is off or BROWSER_AGENT_NAME is
+// empty/malformed. On Cloud that means "proceed as today"; on R1 it would mint a
+// token with no host check and no dispatch, so it must fail closed.
+describe('exchange browser gate — R1 fence 7', () => {
+  function expectNothingIssued() {
+    expect(accessTokenCtor).not.toHaveBeenCalled();
+    expect(consumeUpdate).not.toHaveBeenCalled();
+  }
+
+  it('r1 + NULL gate → 503 screening_room_unavailable, no token, invite untouched, no room work', async () => {
+    selectR1();
+    const res = await exchange(appWithGate(null));
+    expect(res.status).toBe(503);
+    expect(res.body).toEqual({ error: 'screening_room_unavailable' });
+    expect(res.body.livekit_token).toBeUndefined();
+    expect(res.body.grant_token).toBeUndefined();
+    expectNothingIssued();
+    // It fails before the consent gate, the session read and any provisioning:
+    // the only table touched is the invite lookup.
+    expect([...new Set(mockFrom.mock.calls.map((call) => call[0]))]).toEqual(['candidate_invites']);
+    const provisioning = await import('../lib/room-provisioning.js');
+    expect(provisioning.provisionRoomForCreatedSession).not.toHaveBeenCalled();
+  });
+
+  it('r1 + gate resolved EXACTLY once per exchange and reused for the readiness step', async () => {
+    selectR1();
+    const gate = readyGate();
+    const resolver = vi.fn(() => gate);
+    setGate(resolver);
+    const app = express();
+    app.use('/api/livekit', express.json(), invitesRouter);
+    const res = await exchange(app);
+    expect(res.status).toBe(200);
+    expect(resolver).toHaveBeenCalledTimes(1);
+    expect(gate.ensureReadyWorker).toHaveBeenCalledTimes(1);
+  });
+
+  it('r1 + DISABLED verdict → 202 preparing, no dispatch, no token, invite unconsumed', async () => {
+    selectR1();
+    const gate = readyGate();
+    gate.ensureReadyWorker.mockResolvedValue({ status: 'disabled' } as never);
+    const res = await exchange(appWithGate(gate));
+    expect(res.status).toBe(202);
+    expect(res.body).toEqual({ status: 'preparing' });
+    expect(gate.dispatch).not.toHaveBeenCalled();
+    expectNothingIssued();
+  });
+
+  it.each([
+    ['timeout', { status: 'timeout' }],
+    ['no_capacity', { status: 'no_capacity' }],
+    ['error', { status: 'error', code: 'fly_down' }],
+  ])('r1 + %s verdict → 202 preparing, no token', async (_label, verdict) => {
+    selectR1();
+    const gate = readyGate();
+    gate.ensureReadyWorker.mockResolvedValue(verdict as never);
+    const res = await exchange(appWithGate(gate));
+    expect(res.status).toBe(202);
+    expectNothingIssued();
+  });
+
+  it('r1 + ready + dropped dispatch → 202, worker released, no token', async () => {
+    selectR1();
+    const gate = readyGate();
+    gate.dispatch.mockResolvedValue(false);
+    const res = await exchange(appWithGate(gate));
+    expect(res.status).toBe(202);
+    expect(gate.releaseWorker).toHaveBeenCalledWith({ machineId: 'm1', sessionId: SESSION });
+    expectNothingIssued();
+  });
+
+  it('r1 + ready + dispatch → mints the token against the R1 endpoint', async () => {
+    selectR1();
+    const gate = readyGate();
+    const res = await exchange(appWithGate(gate));
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe('wss://r1.example.test');
+    expect(accessTokenCtor.mock.calls.at(-1)).toEqual([
+      'r1-key', 'r1-secret',
+      expect.objectContaining({ ttl: '5m' }),
+    ]);
+    expect(consumeUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['unset', undefined],
+    ['cloud', 'cloud'],
+    ['R1 (not exact)', 'R1'],
+    ['r1 with whitespace', ' r1'],
+  ])('target %s is Cloud: a null gate still proceeds exactly as today', async (_label, target) => {
+    if (target !== undefined) process.env.BROWSER_LIVEKIT_TARGET = target;
+    const res = await exchange(appWithGate(null));
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe('wss://lk.example');
+    expect(consumeUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it('Cloud + DISABLED verdict still falls through to the token path', async () => {
+    const gate = readyGate();
+    gate.ensureReadyWorker.mockResolvedValue({ status: 'disabled' } as never);
+    const res = await exchange(appWithGate(gate));
+    expect(res.status).toBe(200);
+    expect(gate.dispatch).not.toHaveBeenCalled();
+  });
+
+  describe('grace re-exchange', () => {
+    function reExchange(gate: unknown) {
+      const prev = mockFrom.getMockImplementation()!;
+      mockFrom.mockImplementation((table: string) => {
+        if (table === 'candidate_invites') {
+          return {
+            select: () => ({
+              eq: () => ({
+                single: () => Promise.resolve({
+                  data: {
+                    id: 'iv1', candidate_id: CANDIDATE, session_id: SESSION,
+                    expires_at: new Date(Date.now() + 3600_000).toISOString(),
+                    consumed_at: new Date(Date.now() - 10_000).toISOString(),
+                    revoked_at: null,
+                  },
+                  error: null,
+                }),
+              }),
+            }),
+            update: (...a: unknown[]) => consumeUpdate(...a),
+          };
+        }
+        return prev(table);
+      });
+      return exchange(appWithGate(gate));
+    }
+
+    it('r1 + NULL gate → 503 even inside the grace window (no token re-minted)', async () => {
+      selectR1();
+      const res = await reExchange(null);
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({ error: 'screening_room_unavailable' });
+      expect(accessTokenCtor).not.toHaveBeenCalled();
+    });
+
+    it('r1 + live gate re-issues inside the grace window WITHOUT re-entering the gate', async () => {
+      selectR1();
+      const gate = readyGate();
+      const res = await reExchange(gate);
+      expect(res.status).toBe(200);
+      expect(res.body.url).toBe('wss://r1.example.test');
+      expect(gate.ensureReadyWorker).not.toHaveBeenCalled();
+      expect(gate.dispatch).not.toHaveBeenCalled();
+      expect(consumeUpdate).not.toHaveBeenCalled();
+    });
   });
 });

@@ -276,14 +276,14 @@ class TestPrewarmReadyPostAgentName(unittest.TestCase):
                     env["FLY_MACHINE_ID"] = machine
                 self.assertEqual(_prewarm_post_kwargs(env), {})
 
-    def test_browser_named_worker_does_not_prewarm_before_registration(self):
+    def test_browser_named_worker_posts_no_agent_name(self):
         env = {
             "BROWSER_AGENT_NAME": "screening-agent",
             "WORKER_ORCHESTRATION": "worker",
             "PHONE_PER_MACHINE_AGENT_NAME": "true",
             "FLY_MACHINE_ID": _MACHINE,
         }
-        self.assertIsNone(_prewarm_post_kwargs(env))
+        self.assertEqual(_prewarm_post_kwargs(env), {})
 
     def test_orchestration_off_posts_nothing(self):
         env = dict(_PER_MACHINE_ON)
