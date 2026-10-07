@@ -20,7 +20,7 @@ const TEMPLATE: R1ConsentTemplate = {
     '<script>window.__pwned = true</script>',
     'Withdraw any time: [withdraw link](https://example.test/withdraw)',
   ].join('\n'),
-  required_consents: ['ai_interview', 'recording', 'ai_evaluation'],
+  required_consents: ['ai_interview', 'video_audio_recording', 'ai_evaluation', 'data_processing'],
   consent_items: [],
 };
 
@@ -79,11 +79,12 @@ describe('R1NoticeConsent', () => {
   it('offers each purpose as its own checkbox, with no select-all', () => {
     renderNotice();
     const boxes = screen.getAllByRole('checkbox');
-    expect(boxes).toHaveLength(3);
+    expect(boxes).toHaveLength(4);
     expect(screen.getByRole('group', { name: /agree to each purpose separately/i })).toBeVisible();
     expect(screen.getByLabelText(/AI interviewer, including a sales role-play/)).toBeVisible();
-    expect(screen.getByLabelText(/video and audio being recorded/)).toBeVisible();
+    expect(screen.getByLabelText(/camera video and voice being recorded/)).toBeVisible();
     expect(screen.getByLabelText(/AI evaluation of my interview/)).toBeVisible();
+    expect(screen.getByLabelText(/DeepSeek in the People's Republic of China/)).toBeVisible();
     expect(screen.queryByText(/select all/i)).toBeNull();
   });
 
@@ -91,8 +92,10 @@ describe('R1NoticeConsent', () => {
     renderNotice({
       template: {
         ...TEMPLATE,
-        required_consents: ['recording'],
-        consent_items: [{ type: 'recording', label: 'I allow IK to record my interview.' }],
+        required_consents: ['video_audio_recording'],
+        consent_items: [
+          { type: 'video_audio_recording', label: 'I allow IK to record my interview.' },
+        ],
       },
     });
     expect(screen.getByLabelText('I allow IK to record my interview.')).toBeVisible();
@@ -109,10 +112,17 @@ describe('R1NoticeConsent', () => {
     await user.click(boxes[1]);
     expect(agree).toBeDisabled();
     await user.click(boxes[2]);
+    expect(agree).toBeDisabled();
+    await user.click(boxes[3]);
     expect(agree).toBeEnabled();
 
     await user.click(agree);
-    expect(props.onGrant).toHaveBeenCalledWith(['ai_interview', 'recording', 'ai_evaluation']);
+    expect(props.onGrant).toHaveBeenCalledWith([
+      'ai_interview',
+      'video_audio_recording',
+      'ai_evaluation',
+      'data_processing',
+    ]);
   });
 
   it('un-ticking a purpose disables agreeing again', async () => {

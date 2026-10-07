@@ -39,7 +39,7 @@ export async function openLink(r1: R1Harness, hash: string = TOKEN_HASH): Promis
 /** Tick every purpose on the notice and agree. */
 export async function agree(page: Page): Promise<void> {
   // The notice renders once the template has loaded; `.all()` does not wait.
-  await expect(page.getByRole('checkbox')).toHaveCount(3);
+  await expect(page.getByRole('checkbox')).toHaveCount(4);
   for (const box of await page.getByRole('checkbox').all()) await box.check();
   await page.getByRole('button', { name: 'I agree and continue' }).click();
 }

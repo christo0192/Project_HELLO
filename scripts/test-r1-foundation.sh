@@ -106,4 +106,12 @@ r1_terminal_race() {
 r1_terminal_race 'cancel' 'ok|version_conflict'
 r1_terminal_race 'expiry' '[0-9]+'
 
-log 'PASS: full-chain assertions, first-of-month capacity race, and terminal transition races'
+# 0120 (PR-3): preflight caps, attempt settlement (plan D1) and consent
+# withdrawal. Deliberately LAST: it changes the R1 settings singleton and leaves
+# live fixtures behind, and nothing above may depend on that state.
+log 'Running R1 PR-3 candidate-route primitive assertions (0120)...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -q -v ON_ERROR_STOP=1 \
+  < "$TESTS/r1_candidate_routes_assert.sql"
+
+log 'PASS: full-chain assertions, first-of-month capacity race, terminal transition races, and 0120 primitives'

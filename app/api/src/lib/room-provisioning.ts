@@ -16,7 +16,8 @@
  *
  * Invariants:
  *  1. Room metadata is minimal and carries no candidate PII (session id, room
- *     name, correlation id only) — mirrors invites.ts invariant 4.
+ *     name, correlation id and, for an R1 room, the `lane: r1` routing marker)
+ *     — mirrors invites.ts invariant 4.
  *  2. Cloud authoritative egress is started BEFORE the session is published as
  *     joinable. R1 records in-worker and explicitly skips egress because its
  *     SFU has none. For Cloud, an enabled egress start failure aborts
@@ -131,13 +132,27 @@ export interface ProvisionRoomDeps {
   startRecording?: typeof startAuthoritativeRecording;
   /**
    * `call_sessions.interview_round_id` of the session being provisioned. A non-empty
-   * value marks an R1 round session. The room is marked `lane:r1` only when that
-   * agrees with the selected endpoint; a disagreement in either direction (an R1
-   * round on a non-R1 endpoint, or a legacy session on the R1 endpoint) fails
-   * provisioning closed as `r1_lane_mismatch`, before any provider call.
+   * value marks an R1 round session. Without `lane: 'r1'` (the legacy invite exchange
+   * and every other caller) the room is marked `lane:r1` only when that agrees with the
+   * selected endpoint; a disagreement in either direction (an R1 round on a non-R1
+   * endpoint, or a legacy session on the R1 endpoint) fails provisioning closed as
+   * `r1_lane_mismatch`, before any provider call.
    */
   interviewRoundId?: string | null;
+  /**
+   * Set by the R1 exchange only (routes/r1-candidate.ts), which has authenticated an R1
+   * attempt. An R1 room is always marked `lane: r1`, never runs LiveKit egress and uses
+   * the R1 room limits, on whichever SFU `browserLiveKitEndpoint()` selected: the R1 SFU,
+   * or the Cloud fallback. It REQUIRES a non-empty `interviewRoundId` (the session must be
+   * an R1 round session) or provisioning fails closed as `r1_lane_mismatch`. Omitted for
+   * every other caller, so the browser and phone rooms are provisioned exactly as before.
+   */
+  lane?: 'r1';
 }
+
+/** R1 rooms hold one candidate and one agent; the third seat is head-room (plan 4 step 7). */
+export const R1_ROOM_EMPTY_TIMEOUT_SEC = 180;
+export const R1_ROOM_MAX_PARTICIPANTS = 3;
 
 export type ProvisionRoomMode = 'new_session' | 'existing_session';
 
@@ -203,11 +218,11 @@ export async function provisionRoomForCreatedSession(
   const roomName = roomNameForSession(sessionId);
   const r1Round = typeof deps.interviewRoundId === 'string' && deps.interviewRoundId.length > 0;
   const r1Endpoint = endpoint.target === 'r1';
-  const metadata = buildMinimalRoomMetadata(
-    sessionId,
-    roomName,
-    r1Round && r1Endpoint ? 'r1' : 'cloud',
-  );
+  // The R1 exchange marks its own rooms on either SFU; every other caller gets the marker
+  // only when an R1 round session meets the R1 endpoint (anything else is refused below).
+  const r1Exchange = deps.lane === 'r1';
+  const r1Lane = r1Exchange ? r1Round : r1Round && r1Endpoint;
+  const metadata = buildMinimalRoomMetadata(sessionId, roomName, r1Lane ? 'r1' : 'cloud');
   const rooms = deps.rooms ?? roomClient(endpoint);
   const db = deps.db ?? supabase;
   const startRecording = deps.startRecording ?? startAuthoritativeRecording;
@@ -215,16 +230,17 @@ export async function provisionRoomForCreatedSession(
   try {
     // The R1 marker authorizes a worker to run R1, so it must come from the session
     // (an R1 round), never from the endpoint alone. Checked before any provider call.
-    if (r1LaneMismatch(deps.interviewRoundId, endpoint)) {
+    // The R1 exchange may use either SFU, but only for an R1 round session.
+    if (r1Exchange ? !r1Round : r1LaneMismatch(deps.interviewRoundId, endpoint)) {
       throw new Error(R1_LANE_MISMATCH_ERROR);
     }
     try {
       await rooms.createRoom({
         name: roomName,
-        emptyTimeout: ROOM_EMPTY_TIMEOUT_SEC,
-        maxParticipants: ROOM_MAX_PARTICIPANTS,
+        emptyTimeout: r1Lane ? R1_ROOM_EMPTY_TIMEOUT_SEC : ROOM_EMPTY_TIMEOUT_SEC,
+        maxParticipants: r1Lane ? R1_ROOM_MAX_PARTICIPANTS : ROOM_MAX_PARTICIPANTS,
         metadata,
-        ...(r1Endpoint ? { departureTimeout: R1_ROOM_DEPARTURE_TIMEOUT_SEC } : {}),
+        ...(r1Lane ? { departureTimeout: R1_ROOM_DEPARTURE_TIMEOUT_SEC } : {}),
       });
     } catch {
       // Room already exists (retry, or a concurrent provisioner) — converge
@@ -235,7 +251,7 @@ export async function provisionRoomForCreatedSession(
     // R1 records in its worker. It has no LiveKit Egress service, so never
     // construct the Cloud egress client for an R1 room. Cloud retains the
     // existing authoritative-egress gate, including required-egress failures.
-    const recording = r1Endpoint
+    const recording = r1Lane
       ? { kind: 'no_egress' as const }
       : { kind: 'egress' as const, result: await startRecording(roomName, sessionId) };
     if (

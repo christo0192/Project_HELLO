@@ -10,6 +10,7 @@ import { useCapabilitySupport } from '../lib/capability-check';
 import {
   classifyR1Error,
   r1Api,
+  type R1AttemptGrant,
   type R1ConsentTemplate,
   type R1ErrorKind,
   type R1LeadCard,
@@ -36,9 +37,16 @@ import { createR1Room, type R1RoomController, type R1RoomHandlers } from '../lib
  *   - The link token is captured from the URL fragment into a ref, the
  *     fragment is removed at once, and the token never reaches state, storage,
  *     the URL or a log. Missing or malformed means no API call at all.
- *   - Consent is server-authoritative: the page only trusts `consent_required`
- *     from the status route and re-checks it whenever the server reports the
- *     consent as stale. Declining makes no media request.
+ *   - Consent is server-authoritative: the page only trusts `consent.state` from the
+ *     status route and re-checks it whenever the server reports the consent as stale.
+ *     Declining makes no media request. A `declined` or `withdrawn` state is the person's
+ *     own final choice on this page: it shows the closed card that says so, never the
+ *     notice again.
+ *   - A consent can always be ended from the page, as it can from the API (PR-3
+ *     invariant 5): withdrawal is offered wherever consent is on file (the landing page,
+ *     R1 paused or switched off, a finished, lapsed or cancelled link, the live room and
+ *     the closing screens), and a decline wherever consent is not yet given, even while R1
+ *     is paused or switched off.
  *   - Nothing here records or uploads. There is no MediaRecorder and no
  *     completion call; leaving the room is the whole client-side ending.
  *   - A failure after the device check stops every track and returns to the
@@ -67,7 +75,6 @@ type Stage =
   | { name: 'live' }
   | { name: 'ended'; kind: R1EndedKind };
 
-const LOCALE = 'en-IN';
 const DEFAULT_ROLE_TITLE = 'Sales Program Advisor';
 const DEFAULT_MINUTES = 20;
 /** A cold worker takes 15-25 s to boot; poll the exchange for at most about 36 s. */
@@ -78,15 +85,45 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+/** The closed cards a person can still take a consent back from. */
+const WITHDRAWABLE_KINDS: readonly R1ClosedKind[] = [
+  'paused',
+  'completed',
+  'starts_exhausted',
+  'expired',
+  'cancelled',
+];
+
+const OPEN_ELSEWHERE =
+  'Your interview is open on another device or browser tab. Return to it there, or close it '
+  + 'and try again in a few minutes.';
+
+/**
+ * What starting again means after the interview the stored nonce named has ended. It is a NEW
+ * admission (it spends one of the link's starts and takes the next attempt), so the person is
+ * told before it happens instead of finding out from the attempts count.
+ */
+function restartNote(status: R1Status): string {
+  const allowed = status.attempts_allowed;
+  const next = allowed === null ? null : allowed - status.attempts_left + 1;
+  const which = allowed !== null && next !== null && next >= 1 && next <= allowed
+    ? `attempt ${next} of ${allowed}`
+    : 'a new attempt';
+  return `Your previous interview has ended and cannot be rejoined. Starting again begins ${which}.`;
+}
+
 function closedKindFor(kind: R1ErrorKind): R1ClosedKind {
   if (kind === 'link_invalid') return 'invalid';
   if (kind === 'link_expired') return 'expired';
   return 'unavailable';
 }
 
-function joinErrorMessage(kind: R1ErrorKind): string {
+function joinErrorMessage(kind: R1ErrorKind, liveElsewhere: boolean): string {
   switch (kind) {
     case 'busy':
+      // The link's own interview is live and this tab holds no nonce for it: it is the
+      // person's, not "another interview", and 20 minutes is the wrong thing to wait for.
+      if (liveElsewhere) return `${OPEN_ELSEWHERE} Your link stays valid.`;
       return 'Another interview is finishing. Please try again in about 20 minutes. '
         + 'Your link stays valid.';
     case 'rate_limited':
@@ -109,6 +146,9 @@ export function R1JoinPage() {
   const [busy, setBusy] = useState(false);
   const [consentError, setConsentError] = useState<string | null>(null);
   const [landingError, setLandingError] = useState<string | null>(null);
+  const [landingNote, setLandingNote] = useState<string | null>(null);
+  const [withdrawError, setWithdrawError] = useState<string | null>(null);
+  const [liveElsewhere, setLiveElsewhere] = useState(false);
   const [liveError, setLiveError] = useState<string | null>(null);
   const [lead, setLead] = useState<R1LeadCard | null>(null);
   const [phase, setPhase] = useState<R1Phase | null>(null);
@@ -127,6 +167,12 @@ export function R1JoinPage() {
   const loadRunRef = useRef(0);
   const mountedRef = useRef(false);
   const endedRef = useRef(false);
+  /** A withdrawal from the live room is in flight: the room ending is its doing, not news. */
+  const withdrawingRef = useRef(false);
+  /** An ending the room reported while a withdrawal was in flight, applied if it fails. */
+  const deferredEndRef = useRef<R1EndedKind | null>(null);
+  /** The next status read follows a rejoin that found its interview over. */
+  const restartPendingRef = useRef(false);
 
   const loadStatus = useCallback(async (token: string) => {
     loadRunRef.current += 1;
@@ -134,19 +180,53 @@ export function R1JoinPage() {
     const show = (next: Stage): void => {
       if (run === loadRunRef.current) setStage(next);
     };
+    const restarting = restartPendingRef.current;
+    restartPendingRef.current = false;
     show({ name: 'loading' });
     try {
       const next = await r1Api.status(token);
       if (run !== loadRunRef.current) return;
       setStatus(next);
+      setTemplate(null);
+      setWithdrawError(null);
+      setConsentError(null);
+      // This link's interview is live and this tab holds no nonce for it: it is open somewhere else.
+      const elsewhere = next.live_attempt === true && readNonce(token) === null;
+      setLiveElsewhere(elsewhere);
+      setLandingNote(null);
       const spent = next.attempts_left <= 0 && next.state !== 'in_progress';
-      if (next.state === 'expired') show({ name: 'closed', kind: 'expired' });
+      // Every start used, and nothing live to rejoin: the interview can never be started
+      // again from this link, so say so instead of letting each try spend a device check.
+      const noStarts = next.can_start === false
+        && next.starts_left === 0
+        && next.live_attempt === false;
+      // The person's own decision comes first: whatever else the link is, they chose that no
+      // interview is held with it, and the card says what they were told when they chose.
+      if (next.consent_state === 'withdrawn') show({ name: 'closed', kind: 'withdrawn' });
+      else if (next.consent_state === 'declined') show({ name: 'closed', kind: 'declined' });
+      else if (next.state === 'expired') show({ name: 'closed', kind: 'expired' });
       else if (next.state === 'cancelled') show({ name: 'closed', kind: 'cancelled' });
       else if (next.state === 'completed' || spent) show({ name: 'closed', kind: 'completed' });
-      else if (next.budget_paused) show({ name: 'closed', kind: 'paused' });
-      else if (!next.consent_required) show({ name: 'landing' });
-      else {
-        const notice = await r1Api.consentTemplate(token, LOCALE);
+      else if (noStarts) show({ name: 'closed', kind: 'starts_exhausted' });
+      else if (next.availability !== 'open') {
+        // R1 is off for now. Someone who has not agreed can still say no: the notice is not
+        // gated by availability, and the decline needs its version. Without a notice, no decline.
+        if (next.consent_state === 'required') {
+          try {
+            const notice = await r1Api.consentTemplate(token);
+            if (run !== loadRunRef.current) return;
+            setTemplate(notice);
+          } catch {
+            if (run !== loadRunRef.current) return;
+          }
+        }
+        show({ name: 'closed', kind: 'paused' });
+      } else if (next.consent_state === 'granted') {
+        setLandingNote(restarting ? restartNote(next) : elsewhere ? OPEN_ELSEWHERE : null);
+        show({ name: 'landing' });
+      } else {
+        // No locale is sent: the server picks the notice this link's audience is owed.
+        const notice = await r1Api.consentTemplate(token);
         if (run !== loadRunRef.current) return;
         setTemplate(notice);
         show({ name: 'notice' });
@@ -200,14 +280,19 @@ export function R1JoinPage() {
     try {
       await r1Api.submitConsent(token, {
         template_version: template.version,
-        locale: template.locale,
         consents,
         status: granted ? 'granted' : 'declined',
       });
       setStage(granted ? { name: 'landing' } : { name: 'closed', kind: 'declined' });
     } catch (error) {
+      const kind = classifyR1Error(error);
+      if (kind === 'consent_required') {
+        // The notice was superseded while it was open: read the current one and ask again.
+        void loadStatus(token);
+        return;
+      }
       setConsentError(
-        classifyR1Error(error) === 'link_invalid'
+        kind === 'link_invalid'
           ? 'This link is no longer valid. Please contact the hiring team.'
           : 'We could not record your choice. Please try again.',
       );
@@ -216,18 +301,37 @@ export function R1JoinPage() {
     }
   }
 
+  /**
+   * Take the consent back, from wherever the person is. From the live room the server stops
+   * the interview itself, so the room ending is part of this and not a connection loss to
+   * offer a rejoin for: its ending is held back until the withdrawal is known to have worked.
+   */
   async function withdraw(): Promise<void> {
     const token = linkRef.current;
     if (!token) return;
+    const inRoom = controllerRef.current !== null;
     setBusy(true);
-    setLandingError(null);
+    setWithdrawError(null);
+    withdrawingRef.current = inRoom;
     try {
       await r1Api.withdrawConsent(token);
       clearNonce();
+      deferredEndRef.current = null;
+      if (inRoom) {
+        endedRef.current = true;
+        abandonJoin(mediaRef.current);
+      }
+      setStatus((current) => (current ? { ...current, consent_state: 'withdrawn' } : current));
       setStage({ name: 'closed', kind: 'withdrawn' });
     } catch {
-      setLandingError('We could not record your withdrawal. Please try again.');
+      setWithdrawError('We could not record your withdrawal. Please try again.');
+      // The room may have ended while this was in flight; the person sees that ending now.
+      withdrawingRef.current = false;
+      const deferred = deferredEndRef.current;
+      deferredEndRef.current = null;
+      if (deferred) endInterview(deferred);
     } finally {
+      withdrawingRef.current = false;
       setBusy(false);
     }
   }
@@ -244,6 +348,10 @@ export function R1JoinPage() {
   }
 
   function endInterview(reason: R1EndedKind): void {
+    if (withdrawingRef.current) {
+      deferredEndRef.current = reason;
+      return;
+    }
     endedRef.current = true;
     // Only a finished or stopped interview forgets the nonce; a dropped one may rejoin.
     if (reason === 'agent_ended' || reason === 'aborted') clearNonce();
@@ -254,12 +362,30 @@ export function R1JoinPage() {
     setStage({ name: 'ended', kind: reason });
   }
 
-  function abandonJoin(media: R1LocalMedia): void {
+  function abandonJoin(media: R1LocalMedia | null): void {
     controllerRef.current?.dispose();
     controllerRef.current = null;
     stopR1Media(media);
     mediaRef.current = null;
     setLiveVideo(null);
+  }
+
+  /**
+   * Ask for an attempt, presenting the stored nonce to rejoin one. When the server says
+   * that attempt is no longer live (it ended, or was cut), the nonce is spent: forget it,
+   * and answer null so the page can say that starting again is a NEW interview (it spends
+   * one of the link's starts and takes the next attempt) and let the person choose it,
+   * rather than quietly admitting one the moment a rejoin fails.
+   */
+  async function requestAttempt(token: string): Promise<R1AttemptGrant | null> {
+    const held = readNonce(token);
+    try {
+      return await r1Api.createAttempt(token, held);
+    } catch (error) {
+      if (held === null || classifyR1Error(error) !== 'attempt_not_live') throw error;
+      clearNonce();
+      return null;
+    }
   }
 
   async function join(media: R1LocalMedia): Promise<void> {
@@ -269,10 +395,19 @@ export function R1JoinPage() {
     endedRef.current = false;
     resetLive();
     setLandingError(null);
+    setLandingNote(null);
     setStage({ name: 'joining', preparing: false });
     try {
-      const attempt = await r1Api.createAttempt(token, readNonce(token));
+      const attempt = await requestAttempt(token);
       if (!mountedRef.current) return;
+      if (attempt === null) {
+        // The interview this tab was in is over. Stop the camera and read the link again: the
+        // landing page then says what starting again means, and the counts it shows are fresh.
+        abandonJoin(media);
+        restartPendingRef.current = true;
+        void loadStatus(token);
+        return;
+      }
       saveNonce(token, attempt.nonce);
       setLead(attempt.lead);
       let room = await r1Api.exchange(attempt.attempt_token, attempt.nonce);
@@ -312,11 +447,20 @@ export function R1JoinPage() {
         void loadStatus(token);
         return;
       }
+      // The link has nothing left to start: say so, rather than a generic "could not start".
+      if (kind === 'starts_exhausted') {
+        setStage({ name: 'closed', kind: 'starts_exhausted' });
+        return;
+      }
+      if (kind === 'attempts_exhausted') {
+        setStage({ name: 'closed', kind: 'completed' });
+        return;
+      }
       // Forget the nonce only when the server refused the link or the nonce itself. A
       // timeout, a failed connect or a 5xx leaves the attempt live, and without the nonce the
       // retry would be refused as busy by this candidate's own session.
       if (kind === 'link_invalid' || kind === 'link_expired') clearNonce();
-      setLandingError(joinErrorMessage(kind));
+      setLandingError(joinErrorMessage(kind, liveElsewhere));
       setStage({ name: 'landing' });
     }
   }
@@ -355,6 +499,21 @@ export function R1JoinPage() {
   ];
   const retryable = stage.name === 'closed'
     && (stage.kind === 'paused' || stage.kind === 'unavailable');
+  const audience = status?.audience ?? 'candidate';
+  const withdrawControl = {
+    busy,
+    error: withdrawError,
+    onConfirm: () => void withdraw(),
+  };
+  // Withdraw where a consent is on file; decline where none is, but only with a notice to
+  // name (the paused card fetches it for exactly this).
+  const closedWithdraw = stage.name === 'closed'
+    && WITHDRAWABLE_KINDS.includes(stage.kind)
+    && status?.consent_state === 'granted';
+  const closedDecline = stage.name === 'closed'
+    && stage.kind === 'paused'
+    && status?.consent_state === 'required'
+    && template !== null;
 
   return (
     <R1Shell>
@@ -367,9 +526,16 @@ export function R1JoinPage() {
       {stage.name === 'closed' && capability !== 'checking' && (
         <R1ClosedCard
           kind={stage.kind}
+          audience={audience}
           onRetry={
             retryable && linkRef.current
               ? () => void loadStatus(linkRef.current as string)
+              : undefined
+          }
+          withdraw={closedWithdraw ? withdrawControl : undefined}
+          decline={
+            closedDecline
+              ? { busy, error: consentError, onConfirm: () => void submitConsent(false, []) }
               : undefined
           }
         />
@@ -377,6 +543,8 @@ export function R1JoinPage() {
 
       {stage.name === 'notice' && template && (
         <R1NoticeConsent
+          // A new notice version starts from unticked boxes: agreements never carry over.
+          key={template.version}
           template={template}
           roleTitle={roleTitle}
           facts={facts}
@@ -393,9 +561,12 @@ export function R1JoinPage() {
           pills={pills}
           attemptsLeft={status?.attempts_left ?? 0}
           error={landingError}
+          notice={landingNote}
+          withdrawError={withdrawError}
           busy={busy}
           onContinue={() => {
             setLandingError(null);
+            setLandingNote(null);
             setStage({ name: 'readiness' });
           }}
           onWithdraw={() => void withdraw()}
@@ -443,12 +614,17 @@ export function R1JoinPage() {
           onToggleMic={() => void toggleMicrophone()}
           onToggleCamera={() => void toggleCamera()}
           onLeave={() => void controllerRef.current?.leave()}
+          onWithdraw={() => void withdraw()}
+          withdrawBusy={busy}
+          withdrawError={withdrawError}
         />
       )}
 
       {stage.name === 'ended' && (
         <R1EndedCard
           kind={stage.kind}
+          audience={audience}
+          withdraw={withdrawControl}
           onRejoin={linkRef.current ? () => void loadStatus(linkRef.current as string) : undefined}
         />
       )}

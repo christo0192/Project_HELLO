@@ -57,10 +57,11 @@ test.describe('link and notice', () => {
     await expect(heading(r1.page, 'Notice and consent for your AI interview')).toBeVisible();
     expect(r1.page.url()).not.toContain(R1_LINK_TOKEN);
     expect(new URL(r1.page.url()).pathname).toBe('/candidate/r1');
-    expect(bodiesOf(r1, '/api/r1/status').every((body) => body?.link_token === R1_LINK_TOKEN)).toBe(true);
-    // The notice is fetched per link: a POST carrying the token in its body, never a GET or a URL.
+    expect(bodiesOf(r1, '/api/r1/status').every((body) => body?.token === R1_LINK_TOKEN)).toBe(true);
+    // The notice is fetched per link: a POST carrying the token in its body, never a GET or a URL,
+    // and no locale (the notice audience is chosen by the server).
     expect(r1.state.requests.filter((request) => request.path === '/api/r1/consent-template')).toEqual([
-      { method: 'POST', path: '/api/r1/consent-template', query: '', body: { link_token: R1_LINK_TOKEN, locale: 'en-IN' } },
+      { method: 'POST', path: '/api/r1/consent-template', query: '', body: { token: R1_LINK_TOKEN } },
     ]);
     expect(await r1.page.evaluate(() => document.body.innerHTML.includes('e2e1e2e1'))).toBe(false);
     expectCandidateHygiene(r1);
@@ -89,15 +90,15 @@ test.describe('link and notice', () => {
     const notice = page.getByRole('region', { name: 'Full notice' });
     await expect(notice.getByRole('heading', { name: 'Who processes it' })).toBeVisible();
     await expect(notice.getByText('DeepSeek (language model)')).toBeVisible();
-    await expect(page.getByRole('checkbox')).toHaveCount(3);
+    await expect(page.getByRole('checkbox')).toHaveCount(4);
     await expect(page.getByText(/select all/i)).toHaveCount(0);
 
     const agreeButton = page.getByRole('button', { name: 'I agree and continue' });
     await expect(agreeButton).toBeDisabled();
     const boxes = await page.getByRole('checkbox').all();
-    for (const box of boxes.slice(0, 2)) await box.check();
+    for (const box of boxes.slice(0, 3)) await box.check();
     await expect(agreeButton).toBeDisabled();
-    await boxes[2].check();
+    await boxes[3].check();
     await expect(agreeButton).toBeEnabled();
 
     await expectMobileFits(page, testInfo);
@@ -194,7 +195,7 @@ test.describe('device check', () => {
 
     // The preflight published the real budget, in its own disposable room.
     expect(snapshot.connects).toHaveLength(1);
-    expect(bodiesOf(r1, '/api/r1/preflight')).toEqual([{ link_token: R1_LINK_TOKEN }]);
+    expect(bodiesOf(r1, '/api/r1/preflight')).toEqual([{ token: R1_LINK_TOKEN }]);
     expect(snapshot.publishes.map((publish) => publish.kind)).toEqual(['audio', 'video']);
     // The check measures the uplink, so its microphone is published with Opus DTX off: a quiet
     // candidate under the SDK default would send ~2.5 packets a second and never reach 50.
@@ -254,9 +255,9 @@ test.describe('the full interview', () => {
     expect(bodiesOf(r1, '/api/r1/consent')).toEqual([
       expect.objectContaining({
         status: 'granted',
-        consents: ['ai_interview', 'recording', 'ai_evaluation'],
+        consents: ['ai_interview', 'video_audio_recording', 'ai_evaluation', 'data_processing'],
         template_version: 'e2e-r1-v1',
-        link_token: R1_LINK_TOKEN,
+        token: R1_LINK_TOKEN,
       }),
     ]);
     await passDeviceCheck(page);
@@ -268,7 +269,7 @@ test.describe('the full interview', () => {
       '/api/r1/attempts',
       '/api/r1/exchange',
     ]);
-    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([{ link_token: R1_LINK_TOKEN }]);
+    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([{ token: R1_LINK_TOKEN }]);
     expect(bodiesOf(r1, '/api/r1/exchange')).toEqual([{ attempt_token: R1_ATTEMPT_TOKEN, nonce: R1_NONCE }]);
     expect(await storedNonce(page)).toBe(R1_NONCE);
     // The entry names the link by a short digest and never holds the token itself.
@@ -310,7 +311,8 @@ test.describe('the full interview', () => {
     // The role-play: lead card and label, learner-labelled captions.
     await r1.mock.setPhase('transition');
     const lead = page.getByRole('region', { name: 'Your role-play' });
-    await expect(lead.getByText('Meera from Pune')).toBeVisible();
+    // PR-3 never returns the persona, so the card keeps its generic wording (no name or city).
+    await expect(lead.getByText('A prospective learner')).toBeVisible();
     await r1.mock.setPhase('roleplay');
     await expect(page.getByRole('status').filter({ hasText: 'You are the Program Advisor' })).toBeVisible();
     await r1.mock.caption('c2', 'Hello? Yes, this is Meera speaking.', true);
@@ -419,8 +421,8 @@ test.describe('the full interview', () => {
     // Without the nonce the fake server refuses the second attempt as r1_busy: the candidate's own
     // session is still live. It is admitted only because the page presented the stored nonce.
     expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
-      { link_token: R1_LINK_TOKEN },
-      { link_token: R1_LINK_TOKEN, nonce: R1_NONCE },
+      { token: R1_LINK_TOKEN },
+      { token: R1_LINK_TOKEN, nonce: R1_NONCE },
     ]);
     expect(bodiesOf(r1, '/api/r1/status')).toHaveLength(2);
     expect(bodiesOf(r1, '/api/r1/preflight')).toHaveLength(2);
@@ -439,7 +441,7 @@ test.describe('the full interview', () => {
     await passDeviceCheck(page);
     await page.getByRole('button', { name: 'Continue to interview' }).click();
     await expect(page.getByRole('region', { name: 'Live video interview' })).toBeVisible();
-    expect(bodiesOf(r1, '/api/r1/attempts')[1]).toEqual({ link_token: R1_LINK_TOKEN, nonce: R1_NONCE });
+    expect(bodiesOf(r1, '/api/r1/attempts')[1]).toEqual({ token: R1_LINK_TOKEN, nonce: R1_NONCE });
     r1.expectHealthy();
   });
 
@@ -551,8 +553,8 @@ test.describe('join failures keep the link valid and release the devices', () =>
     await r1.page.getByRole('button', { name: 'Continue to interview' }).click();
     await expect(r1.page.getByRole('region', { name: 'Live video interview' })).toBeVisible();
     expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
-      { link_token: R1_LINK_TOKEN },
-      { link_token: R1_LINK_TOKEN, nonce: R1_NONCE },
+      { token: R1_LINK_TOKEN },
+      { token: R1_LINK_TOKEN, nonce: R1_NONCE },
     ]);
     r1.expectHealthy();
   });

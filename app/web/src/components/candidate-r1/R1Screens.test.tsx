@@ -2,7 +2,17 @@ import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { R1Landing } from './R1Landing';
-import { R1_CLOSED_COPY, R1_ENDED_COPY, type R1ClosedKind, type R1EndedKind } from './r1-copy';
+import {
+  R1_CLOSED_COPY,
+  R1_ENDED_COPY,
+  R1_STAFF_CLOSED_COPY,
+  R1_STAFF_ENDED_COPY,
+  closedCopyFor,
+  endedCopyFor,
+  reviewNoteFor,
+  type R1ClosedKind,
+  type R1EndedKind,
+} from './r1-copy';
 import { R1ClosedCard, R1EndedCard, R1Shell } from './R1Screens';
 
 const CLOSED_KINDS = Object.keys(R1_CLOSED_COPY) as R1ClosedKind[];
@@ -40,6 +50,111 @@ describe('R1ClosedCard', () => {
   it('keeps the link valid on a temporary outage', () => {
     render(<R1ClosedCard kind="unavailable" />);
     expect(screen.getByText(/Your link stays valid/)).toBeVisible();
+  });
+
+  it('tells a link with no start left to contact the hiring team', () => {
+    render(<R1ClosedCard kind="starts_exhausted" />);
+    expect(
+      screen.getByRole('heading', { level: 1, name: 'This link cannot start another interview' }),
+    ).toBeVisible();
+    expect(screen.getByText(/Please contact the hiring team/)).toBeVisible();
+  });
+
+  describe('ending a consent', () => {
+    it('withdraws only after a confirmation, whatever the card says', async () => {
+      const user = userEvent.setup();
+      const onConfirm = vi.fn();
+      render(<R1ClosedCard kind="paused" withdraw={{ busy: false, error: null, onConfirm }} />);
+      await user.click(screen.getByRole('button', { name: 'Withdraw my consent' }));
+      expect(onConfirm).not.toHaveBeenCalled();
+      expect(screen.getByText(/this cannot be undone from this page/)).toBeVisible();
+      const group = screen.getByRole('group', { name: 'Withdraw consent' });
+      await user.click(within(group).getByRole('button', { name: 'Withdraw my consent' }));
+      expect(onConfirm).toHaveBeenCalledTimes(1);
+    });
+
+    it('declines only after a confirmation', async () => {
+      const user = userEvent.setup();
+      const onConfirm = vi.fn();
+      render(<R1ClosedCard kind="paused" decline={{ busy: false, error: null, onConfirm }} />);
+      expect(screen.queryByRole('button', { name: 'Withdraw my consent' })).toBeNull();
+      await user.click(screen.getByRole('button', { name: 'I do not want to take this interview' }));
+      expect(onConfirm).not.toHaveBeenCalled();
+      const group = screen.getByRole('group', { name: 'Decline the interview' });
+      await user.click(within(group).getByRole('button', { name: 'Keep my invitation' }));
+      expect(onConfirm).not.toHaveBeenCalled();
+      await user.click(screen.getByRole('button', { name: 'I do not want to take this interview' }));
+      await user.click(
+        within(screen.getByRole('group', { name: 'Decline the interview' })).getByRole('button', {
+          name: 'Decline the interview',
+        }),
+      );
+      expect(onConfirm).toHaveBeenCalledTimes(1);
+    });
+
+    it('announces why it failed, and keeps the choices disabled while it works', async () => {
+      const user = userEvent.setup();
+      const { rerender } = render(
+        <R1ClosedCard
+          kind="completed"
+          withdraw={{ busy: false, error: 'We could not record your withdrawal.', onConfirm: vi.fn() }}
+        />,
+      );
+      expect(screen.getByRole('alert')).toHaveTextContent('We could not record your withdrawal.');
+      await user.click(screen.getByRole('button', { name: 'Withdraw my consent' }));
+      rerender(
+        <R1ClosedCard kind="completed" withdraw={{ busy: true, error: null, onConfirm: vi.fn() }} />,
+      );
+      const group = screen.getByRole('group', { name: 'Withdraw consent' });
+      expect(within(group).getByRole('button', { name: 'Withdraw my consent' })).toBeDisabled();
+      expect(within(group).getByRole('button', { name: 'Keep my consent' })).toBeDisabled();
+    });
+  });
+
+  describe('the staff wording', () => {
+    it('covers the same screens as the candidate wording', () => {
+      expect(Object.keys(R1_STAFF_CLOSED_COPY).sort()).toEqual([...CLOSED_KINDS].sort());
+      expect(Object.keys(R1_STAFF_ENDED_COPY).sort()).toEqual(
+        Object.keys(R1_ENDED_COPY).sort(),
+      );
+    });
+
+    it('never names a hiring team, a conversation with a person or a way to contest', () => {
+      const all = [
+        ...Object.values(R1_STAFF_CLOSED_COPY),
+        ...Object.values(R1_STAFF_ENDED_COPY),
+      ].map((copy) => `${copy.eyebrow} ${copy.title} ${copy.body}`);
+      all.push(reviewNoteFor('staff'));
+      for (const text of all) {
+        expect(text).not.toMatch(/hiring team|conversation with a person|contest|appeal/i);
+      }
+    });
+
+    it('changes exactly the screens that name a team or promise a follow-up', () => {
+      const differs = (kinds: string[], a: Record<string, unknown>, b: Record<string, unknown>) =>
+        kinds.filter((kind) => JSON.stringify(a[kind]) !== JSON.stringify(b[kind])).sort();
+      expect(differs(CLOSED_KINDS, R1_CLOSED_COPY, R1_STAFF_CLOSED_COPY)).toEqual(
+        ['cancelled', 'completed', 'declined', 'expired', 'invalid', 'starts_exhausted', 'withdrawn'].sort(),
+      );
+      expect(
+        differs(Object.keys(R1_ENDED_COPY), R1_ENDED_COPY, R1_STAFF_ENDED_COPY),
+      ).toEqual(['aborted', 'agent_ended', 'disconnected']);
+    });
+
+    it('speaks the candidate wording unless told the audience is staff', () => {
+      expect(closedCopyFor('completed', 'candidate')).toBe(R1_CLOSED_COPY.completed);
+      expect(closedCopyFor('completed', 'staff')).toBe(R1_STAFF_CLOSED_COPY.completed);
+      expect(endedCopyFor('aborted', 'candidate')).toBe(R1_ENDED_COPY.aborted);
+      expect(endedCopyFor('aborted', 'staff')).toBe(R1_STAFF_ENDED_COPY.aborted);
+      render(<R1ClosedCard kind="completed" />);
+      expect(screen.getByText(/The hiring team will review it/)).toBeVisible();
+    });
+
+    it('renders the staff screens for audience staff', () => {
+      render(<R1ClosedCard kind="completed" audience="staff" />);
+      expect(screen.getByText(/The project team will review it/)).toBeVisible();
+      expect(screen.queryByText(/hiring team/)).toBeNull();
+    });
   });
 });
 
@@ -99,6 +214,32 @@ describe('R1EndedCard', () => {
       expect(container.innerHTML).not.toContain('/appeal');
     },
   );
+
+  it.each(kinds)('offers withdrawal on the closing screen when asked to (%s)', async (kind) => {
+    const user = userEvent.setup();
+    const onConfirm = vi.fn();
+    render(<R1EndedCard kind={kind} withdraw={{ busy: false, error: null, onConfirm }} />);
+    await user.click(screen.getByRole('button', { name: 'Withdraw my consent' }));
+    expect(onConfirm).not.toHaveBeenCalled();
+    const group = screen.getByRole('group', { name: 'Withdraw consent' });
+    await user.click(within(group).getByRole('button', { name: 'Withdraw my consent' }));
+    expect(onConfirm).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['agent_ended', 'left', 'disconnected'] as const)(
+    'tells a staff member the dry run decides nothing about them, with no way to contest (%s)',
+    (kind) => {
+      const { container } = render(<R1EndedCard kind={kind} audience="staff" onRejoin={vi.fn()} />);
+      expect(screen.getByText(/It is not used to make any decision about you/)).toBeVisible();
+      expect(container.textContent).not.toMatch(/hiring team|contest|appeal/i);
+    },
+  );
+
+  it('points a staff member at the project team after a technical stop', () => {
+    const { container } = render(<R1EndedCard kind="aborted" audience="staff" />);
+    expect(screen.getByText(/Tell the project team and they can send you a new link/)).toBeVisible();
+    expect(container.textContent).not.toMatch(/hiring team/i);
+  });
 
   it('tells a candidate whose interview was stopped by a fault that it does not count', () => {
     const { container } = render(<R1EndedCard kind="aborted" />);
@@ -173,6 +314,20 @@ describe('R1Landing', () => {
     const group = screen.getByRole('group', { name: 'Withdraw consent' });
     await user.click(within(group).getByRole('button', { name: 'Withdraw my consent' }));
     expect(props.onWithdraw).toHaveBeenCalledTimes(1);
+  });
+
+  it('announces a notice that is not a failure politely, apart from an error', () => {
+    renderLanding({ notice: 'Your previous interview has ended and cannot be rejoined.' });
+    expect(screen.getByRole('status')).toHaveTextContent('cannot be rejoined');
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('shows why a withdrawal failed, beside the control', async () => {
+    const user = userEvent.setup();
+    renderLanding({ withdrawError: 'We could not record your withdrawal. Please try again.' });
+    expect(screen.getByRole('alert')).toHaveTextContent('could not record your withdrawal');
+    await user.click(screen.getByRole('button', { name: 'Withdraw my consent' }));
+    expect(screen.getByRole('group', { name: 'Withdraw consent' })).toBeVisible();
   });
 
   it('announces a join failure and keeps the link usable', () => {

@@ -598,6 +598,16 @@ export const PUBLIC_ROUTES: { method: string; path: string }[] = [
   { method: 'POST', path: '/api/candidate-consent/status' },
   { method: 'POST', path: '/api/candidate-consent/submit' },
   { method: 'POST', path: '/api/appeals' },
+  // R1 candidate routes. Each authenticates inline with the link token (or the
+  // attempt token + nonce) BEFORE any read or write that depends on it; none of
+  // them accepts or creates a recruiter session. Exact method+path only.
+  { method: 'POST', path: '/api/r1/status' },
+  { method: 'POST', path: '/api/r1/consent-template' },
+  { method: 'POST', path: '/api/r1/consent' },
+  { method: 'POST', path: '/api/r1/consent/withdraw' },
+  { method: 'POST', path: '/api/r1/preflight' },
+  { method: 'POST', path: '/api/r1/attempts' },
+  { method: 'POST', path: '/api/r1/exchange' },
 ];
 
 export function isPublicRoute(method: string, path: string): boolean {

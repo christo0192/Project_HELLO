@@ -13,6 +13,7 @@ import {
   parsePreflight,
   parseStatus,
   R1_ROUTES,
+  R1_SERVER_ERROR_CODES,
   r1Api,
 } from './r1-api';
 
@@ -39,13 +40,25 @@ function lastCall(fetchMock: ReturnType<typeof mockFetch>) {
   return { url, init, body: init.body ? JSON.parse(String(init.body)) : null };
 }
 
+/** PR-3's `POST /api/r1/status` answer: the wire names, not the page model. */
 const STATUS = {
-  state: 'invited',
-  attempts_left: 2,
-  consent_required: true,
+  round_status: 'invited',
+  expires_at: '2026-10-10T00:00:00.000Z',
+  availability: 'open',
+  attempts_allowed: 2,
+  attempts_remaining: 2,
+  starts_remaining: 3,
+  consent: { state: 'required', template_version: 'r1-2026-10' },
+  live_attempt: false,
+  can_start: false,
   role_title: 'Sales Program Advisor',
-  format: { duration_minutes: 20, summary: 'A role-play interview' },
-  budget_paused: false,
+  format: {
+    duration_minutes: 20,
+    camera_required: true,
+    microphone_required: true,
+    interviewer: 'ai',
+    includes_role_play: true,
+  },
 };
 
 describe('R1 route table', () => {
@@ -78,7 +91,7 @@ describe('r1Api requests', () => {
     expect(init.credentials).toBe('omit');
     expect(init.cache).toBe('no-store');
     expect(init.referrerPolicy).toBe('no-referrer');
-    expect(body).toEqual({ link_token: LINK });
+    expect(body).toEqual({ token: LINK });
     const headerNames = Object.keys(init.headers as Record<string, string>);
     expect(headerNames.map((name) => name.toLowerCase())).not.toContain('authorization');
   });
@@ -96,56 +109,85 @@ describe('r1Api requests', () => {
         locale: 'en-IN',
         title: 'Notice',
         body_md: 'Body',
-        required_consents: ['ai_interview', 'recording', 'ai_evaluation'],
+        required_consents: ['ai_interview', 'video_audio_recording', 'ai_evaluation'],
       }),
     );
-    const template = await r1Api.consentTemplate(LINK, 'en-IN');
+    const template = await r1Api.consentTemplate(LINK);
     const { url, init, body } = lastCall(fetchMock);
     expect(init.method).toBe('POST');
-    expect(body).toEqual({ link_token: LINK, locale: 'en-IN' });
+    // The audience is server-owned: the body carries the token and nothing else.
+    expect(body).toEqual({ token: LINK });
     expect(url.endsWith('/api/r1/consent-template')).toBe(true);
     expect(url).not.toContain(LINK);
     expect(url).not.toContain('?');
-    expect(template.required_consents).toEqual(['ai_interview', 'recording', 'ai_evaluation']);
+    expect(template.required_consents).toEqual([
+      'ai_interview',
+      'video_audio_recording',
+      'ai_evaluation',
+    ]);
   });
 
-  it('submits consent with the version, locale and purposes', async () => {
-    const fetchMock = mockFetch(reply(200, { ok: true }));
+  it('submits consent with the version and purposes, and never a locale', async () => {
+    const fetchMock = mockFetch(reply(201, { status: 'granted', locale: 'en-IN-x-staff' }));
     await r1Api.submitConsent(LINK, {
       template_version: 'v1',
-      locale: 'en-IN',
       consents: ['ai_interview'],
       status: 'granted',
     });
-    expect(lastCall(fetchMock).body).toEqual({
-      link_token: LINK,
+    const { body } = lastCall(fetchMock);
+    expect(body).toEqual({
+      token: LINK,
       template_version: 'v1',
-      locale: 'en-IN',
       consents: ['ai_interview'],
       status: 'granted',
     });
+    expect(body).not.toHaveProperty('locale');
   });
 
   it('posts withdrawal and preflight with the link token only', async () => {
     const withdraw = mockFetch(reply(200, { ok: true }));
     await r1Api.withdrawConsent(LINK);
     expect(lastCall(withdraw).url.endsWith('/api/r1/consent/withdraw')).toBe(true);
-    expect(lastCall(withdraw).body).toEqual({ link_token: LINK });
+    expect(lastCall(withdraw).body).toEqual({ token: LINK });
 
     const preflight = mockFetch(reply(200, { url: 'wss://lk.invalid', livekit_token: 't' }));
     await r1Api.preflight(LINK);
-    expect(lastCall(preflight).body).toEqual({ link_token: LINK });
+    expect(lastCall(preflight).body).toEqual({ token: LINK });
   });
 
   it('sends the rejoin nonce only when there is one', async () => {
     const nonce = 'n'.repeat(32);
-    const fresh = mockFetch(reply(200, { attempt_token: 'tok', nonce }));
+    const fresh = mockFetch(reply(201, { attempt_token: 'tok', nonce, rejoin: false }));
     await r1Api.createAttempt(LINK, null);
-    expect(lastCall(fresh).body).toEqual({ link_token: LINK });
+    expect(lastCall(fresh).body).toEqual({ token: LINK });
 
-    const rejoin = mockFetch(reply(200, { attempt_token: 'tok', nonce }));
+    const rejoin = mockFetch(reply(200, { attempt_token: 'tok', rejoin: true }));
     await r1Api.createAttempt(LINK, nonce);
-    expect(lastCall(rejoin).body).toEqual({ link_token: LINK, nonce });
+    expect(lastCall(rejoin).body).toEqual({ token: LINK, nonce });
+  });
+
+  it('keeps the nonce the page holds when the server answers a rejoin without one', async () => {
+    const nonce = 'n'.repeat(32);
+    mockFetch(reply(200, { attempt_token: 'tok2', attempt_id: 'a-1', rejoin: true }));
+    await expect(r1Api.createAttempt(LINK, nonce)).resolves.toMatchObject({
+      attempt_token: 'tok2',
+      nonce,
+      rejoin: true,
+    });
+  });
+
+  it('takes the new nonce from a fresh attempt, and refuses a fresh attempt without one', async () => {
+    const issued = 'f'.repeat(64);
+    mockFetch(reply(201, { attempt_token: 'tok', nonce: issued, attempt_id: 'a-1', rejoin: false }));
+    await expect(r1Api.createAttempt(LINK, null)).resolves.toMatchObject({
+      nonce: issued,
+      attempt_id: 'a-1',
+      rejoin: false,
+    });
+    mockFetch(reply(201, { attempt_token: 'tok', rejoin: false }));
+    await expect(r1Api.createAttempt(LINK, null)).rejects.toMatchObject({
+      message: 'r1_malformed_response',
+    });
   });
 
   it('exchanges the attempt token and nonce, and reads a 202 preparing answer', async () => {
@@ -180,33 +222,88 @@ describe('r1Api requests', () => {
 });
 
 describe('response validation (fail closed)', () => {
-  it('normalises a full status', () => {
+  it('maps PR-3 status wire fields onto the page model', () => {
     expect(parseStatus(STATUS)).toEqual({
       state: 'invited',
       attempts_left: 2,
-      consent_required: true,
+      attempts_allowed: 2,
+      starts_left: 3,
+      can_start: false,
+      live_attempt: false,
+      consent_state: 'required',
       role_title: 'Sales Program Advisor',
-      format: { duration_minutes: 20, summary: 'A role-play interview' },
-      budget_paused: false,
+      format: { duration_minutes: 20 },
+      availability: 'open',
+      audience: 'candidate',
     });
+  });
+
+  it('keeps the four consent states apart: declined and withdrawn are not "required"', () => {
+    const stateOf = (state: string) =>
+      parseStatus({ ...STATUS, consent: { state, template_version: 'v1' } }).consent_state;
+    for (const state of ['granted', 'required', 'declined', 'withdrawn']) {
+      expect(stateOf(state), state).toBe(state);
+    }
+  });
+
+  it('reads the audience: staff only when the server says exactly staff', () => {
+    expect(parseStatus({ ...STATUS, audience: 'staff' }).audience).toBe('staff');
+    expect(parseStatus({ ...STATUS, audience: 'candidate' }).audience).toBe('candidate');
+    // Anything else is the stricter, candidate wording.
+    for (const odd of [undefined, null, '', 'Staff', 'staff ', 'admin', 1, true, {}]) {
+      expect(parseStatus({ ...STATUS, audience: odd }).audience, String(odd)).toBe('candidate');
+    }
+  });
+
+  it('reads the starts, attempts and live flags, and leaves anything unreadable unknown', () => {
+    const read = (over: object) => parseStatus({ ...STATUS, ...over });
+    expect(read({ starts_remaining: 0, can_start: false, live_attempt: true })).toMatchObject({
+      starts_left: 0,
+      can_start: false,
+      live_attempt: true,
+    });
+    for (const bad of [undefined, null, 'three', -1, 1.5, 101]) {
+      expect(read({ starts_remaining: bad }).starts_left, String(bad)).toBeNull();
+      expect(read({ attempts_allowed: bad }).attempts_allowed, String(bad)).toBeNull();
+    }
+    for (const bad of [undefined, null, 'true', 1, 0]) {
+      expect(read({ can_start: bad }).can_start, String(bad)).toBeNull();
+      expect(read({ live_attempt: bad }).live_attempt, String(bad)).toBeNull();
+    }
+  });
+
+  it.each(['paused', 'disabled'])('reads availability %s', (availability) => {
+    expect(parseStatus({ ...STATUS, availability }).availability).toBe(availability);
   });
 
   it('defaults optional status fields', () => {
     const minimal = parseStatus({
-      state: 'in_progress',
-      attempts_left: 1,
-      consent_required: false,
+      round_status: 'in_progress',
+      availability: 'open',
+      attempts_remaining: 1,
+      consent: { state: 'granted', template_version: null },
     });
     expect(minimal.role_title).toBeNull();
-    expect(minimal.format).toEqual({ duration_minutes: null, summary: null });
-    expect(minimal.budget_paused).toBe(false);
+    expect(minimal.format).toEqual({ duration_minutes: null });
+    expect(minimal.consent_state).toBe('granted');
+    // A server that predates these never closes a link on them.
+    expect(minimal).toMatchObject({
+      attempts_allowed: null,
+      starts_left: null,
+      can_start: null,
+      live_attempt: null,
+      audience: 'candidate',
+    });
   });
 
   it.each([
-    ['an unknown state', { ...STATUS, state: 'weird' }],
-    ['a missing attempts count', { ...STATUS, attempts_left: undefined }],
-    ['a negative attempts count', { ...STATUS, attempts_left: -1 }],
-    ['a non-boolean consent flag', { ...STATUS, consent_required: 'yes' }],
+    ['an unknown state', { ...STATUS, round_status: 'weird' }],
+    ['an unknown availability', { ...STATUS, availability: 'maybe' }],
+    ['a missing attempts count', { ...STATUS, attempts_remaining: undefined }],
+    ['a negative attempts count', { ...STATUS, attempts_remaining: -1 }],
+    ['a missing consent object', { ...STATUS, consent: undefined }],
+    ['an unknown consent state', { ...STATUS, consent: { state: 'maybe' } }],
+    ['the old page-model names', { state: 'invited', attempts_left: 2, consent_required: true }],
     ['a non-object body', 'ok'],
     ['null', null],
   ])('rejects status with %s', (_name, body) => {
@@ -250,7 +347,7 @@ describe('response validation (fail closed)', () => {
 
   it('requires the tokens that the join depends on', () => {
     expect(() => parsePreflight({ url: 'wss://x' })).toThrow();
-    expect(() => parseAttempt({ attempt_token: 't' })).toThrow();
+    expect(() => parseAttempt({ nonce: 'n' })).toThrow();
     expect(() => parseExchange({ status: 'ready' })).toThrow();
     const attempt = parseAttempt({
       attempt_token: 't',
@@ -259,6 +356,37 @@ describe('response validation (fail closed)', () => {
     });
     expect(attempt.lead).toEqual({ name: 'A', city: 'B' });
   });
+
+  it('reads PR-3 attempt and exchange answers', () => {
+    expect(
+      parseAttempt({
+        attempt_id: 'a-1',
+        attempt_number: 1,
+        attempt_token: 't',
+        attempt_token_expires_at: '2026-10-07T00:00:00.000Z',
+        nonce: 'n',
+        rejoin: false,
+      }),
+    ).toEqual({ attempt_token: 't', nonce: 'n', attempt_id: 'a-1', rejoin: false, lead: null });
+    expect(parseAttempt({ attempt_token: 't', rejoin: true }).nonce).toBeNull();
+    expect(
+      parseExchange({
+        url: 'wss://x',
+        livekit_token: 'k',
+        expires_at: '2026-10-07T00:10:00.000Z',
+        attempt_id: 'a-1',
+      }),
+    ).toEqual({
+      status: 'ready',
+      url: 'wss://x',
+      livekit_token: 'k',
+      expires_at: '2026-10-07T00:10:00.000Z',
+      attempt_id: 'a-1',
+    });
+    expect(parseExchange({ status: 'preparing', retry_after_sec: 3 })).toEqual({
+      status: 'preparing',
+    });
+  });
 });
 
 describe('classifyR1Error', () => {
@@ -266,9 +394,16 @@ describe('classifyR1Error', () => {
 
   it('recognises the plan codes and statuses', () => {
     expect(kind('r1_busy', 409)).toBe('busy');
+    expect(kind('r1_attempt_not_live', 409)).toBe('attempt_not_live');
     expect(kind('consent_required', 409)).toBe('consent_required');
-    expect(kind('consent_withdrawn', 409)).toBe('consent_required');
+    expect(kind('consent_template_stale', 409)).toBe('consent_required');
+    expect(kind('starts_exhausted', 409)).toBe('starts_exhausted');
+    expect(kind('attempts_exhausted', 409)).toBe('attempts_exhausted');
     expect(kind('http_410', 410)).toBe('link_expired');
+    expect(kind('round_expired', 409)).toBe('link_expired');
+    expect(kind('consent_template_unavailable', 503)).toBe('unavailable');
+    expect(kind('r1_link_invalid_or_expired', 404)).toBe('link_invalid');
+    expect(kind('r1_attempt_invalid', 404)).toBe('link_invalid');
     expect(kind('http_429', 429)).toBe('rate_limited');
     expect(kind('r1_unavailable', 503)).toBe('unavailable');
     expect(kind('http_502', 502)).toBe('unavailable');
@@ -276,6 +411,22 @@ describe('classifyR1Error', () => {
     expect(kind('http_404', 404)).toBe('link_invalid');
     expect(kind('http_401', 401)).toBe('link_invalid');
     expect(kind('http_418', 418)).toBe('unknown');
+  });
+
+  it('recognises every code it names, whatever status carries it', () => {
+    expect(R1_SERVER_ERROR_CODES.length).toBeGreaterThan(10);
+    for (const code of R1_SERVER_ERROR_CODES) {
+      for (const status of [409, 503, 500]) {
+        expect(['unknown', 'link_invalid'], `${code} ${status}`).not.toContain(kind(code, status));
+      }
+    }
+  });
+
+  it('never reads an Object.prototype name as a code', () => {
+    for (const name of ['constructor', 'toString', '__proto__', 'hasOwnProperty']) {
+      expect(kind(name, 418), name).toBe('unknown');
+      expect(kind(name, 404), name).toBe('link_invalid');
+    }
   });
 
   it('treats a malformed response as unknown, not as the link being bad', () => {

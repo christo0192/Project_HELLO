@@ -1,12 +1,22 @@
-import { useState } from 'react';
 import { Button } from '../ui';
+import { R1ConsentExit } from './R1ConsentExit';
+import { R1_WITHDRAW_QUESTIONS } from './r1-copy';
 
 interface R1LandingProps {
   roleTitle: string;
   /** The format pills: duration, camera, privacy. */
   pills: readonly string[];
   attemptsLeft: number;
+  /** A join that failed just now; the link is still usable. */
   error: string | null;
+  /**
+   * Something the person should know before they start, that is not a failure: their
+   * interview is open somewhere else, or the one they were in has ended and starting
+   * again is a new one.
+   */
+  notice?: string | null;
+  /** Why the last withdrawal did not go through. */
+  withdrawError?: string | null;
   busy: boolean;
   onContinue: () => void;
   onWithdraw: () => void;
@@ -23,11 +33,12 @@ export function R1Landing({
   pills,
   attemptsLeft,
   error,
+  notice = null,
+  withdrawError = null,
   busy,
   onContinue,
   onWithdraw,
 }: R1LandingProps) {
-  const [confirming, setConfirming] = useState(false);
   return (
     <section
       className="candidate-glass-card candidate-landing candidate-status-card"
@@ -52,6 +63,11 @@ export function R1Landing({
           ? 'You have 1 attempt left.'
           : `You have ${attemptsLeft} attempts left.`}
       </p>
+      {notice && (
+        <p className="candidate-muted" role="status">
+          {notice}
+        </p>
+      )}
       {error && (
         <p className="candidate-error" role="alert">
           {error}
@@ -60,30 +76,13 @@ export function R1Landing({
       <Button className="candidate-primary-cta" loading={busy} onClick={onContinue}>
         Check my camera and microphone
       </Button>
-      {confirming ? (
-        <div className="r1-withdraw" role="group" aria-label="Withdraw consent">
-          <p className="candidate-muted">
-            Withdraw your consent? Your interview cannot go ahead without it.
-          </p>
-          <div className="r1-actions">
-            <button type="button" className="r1-secondary-cta" disabled={busy} onClick={onWithdraw}>
-              Withdraw my consent
-            </button>
-            <button
-              type="button"
-              className="r1-secondary-cta"
-              disabled={busy}
-              onClick={() => setConfirming(false)}
-            >
-              Keep my consent
-            </button>
-          </div>
-        </div>
-      ) : (
-        <button type="button" className="r1-link-button" onClick={() => setConfirming(true)}>
-          Withdraw my consent
-        </button>
-      )}
+      <R1ConsentExit
+        kind="withdraw"
+        question={R1_WITHDRAW_QUESTIONS.before}
+        busy={busy}
+        error={withdrawError}
+        onConfirm={onWithdraw}
+      />
     </section>
   );
 }

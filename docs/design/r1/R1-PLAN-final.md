@@ -1031,7 +1031,7 @@ Rejected alternatives:
 | `GET /api/candidates/:id/interview-rounds` | admin, owning interviewer, viewer (no video) | Card and panel | PR-2 |
 | `POST /api/interview-rounds/:id/{cancel,reissue,grant-retake,cancel-pending-reject}` | admin / owning interviewer | Lifecycle (reissue invalidates the old digest; attempts not reset) | PR-2 / PR-5 |
 | `GET/PUT /api/admin/r1/settings` | admin | Caps, pause, thresholds, auto-status, dashboard reading | PR-2 |
-| `POST /api/r1/status`; `GET /api/r1/consent-template`; `POST /api/r1/consent`; `POST /api/r1/consent/withdraw` | link token (public allowlist, `auth.ts:585-603`) | Landing and consent | PR-3 |
+| `POST /api/r1/status`; `POST /api/r1/consent-template`; `POST /api/r1/consent`; `POST /api/r1/consent/withdraw` | link token in the JSON body field `token` (public allowlist, `auth.ts:585-603`); never a URL, query string or header | Landing and consent. The template is a POST so the token stays in the body, and the notice is chosen by the server from `interview_rounds.consent_locale`: no request carries a locale. The status reports that audience (`candidate` or `staff`) so the closing screens speak to the right team, and every consent read (status, preflight, attempts, exchange) counts a consent only for the audience it was given under | PR-3 |
 | `POST /api/r1/preflight` | link token + consent | A/V preflight (≤10 per link, 3/min) | PR-3 |
 | `POST /api/r1/attempts` | link token (+ nonce for rejoin) | Admission RPC; attempt token + nonce | PR-3 |
 | `POST /api/r1/exchange` | attempt token + nonce | Health probe; room without egress; worker gate; token | PR-3 |

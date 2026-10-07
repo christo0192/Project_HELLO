@@ -58,18 +58,36 @@ describe('parseNoticeBlocks', () => {
 });
 
 describe('consentLabel', () => {
+  /** The `required_consents` both 0123 notices (candidate and staff dry run) carry. */
+  const R1_NOTICE_KEYS = [
+    'ai_interview',
+    'video_audio_recording',
+    'ai_evaluation',
+    'data_processing',
+  ];
+
   it('prefers the template label', () => {
-    expect(consentLabel('recording', 'Agree to recording')).toBe('Agree to recording');
+    expect(consentLabel('video_audio_recording', 'Agree to recording')).toBe('Agree to recording');
   });
 
-  it('falls back to the plan wording for the three named purposes', () => {
-    expect(Object.keys(R1_CONSENT_FALLBACK_LABELS)).toEqual([
-      'ai_interview',
-      'recording',
-      'ai_evaluation',
-    ]);
-    expect(consentLabel('ai_evaluation', undefined)).toMatch(/contest/);
-    expect(consentLabel('recording', undefined)).toMatch(/video and audio/);
+  it('has its own wording for every purpose the R1 notices require', () => {
+    expect(Object.keys(R1_CONSENT_FALLBACK_LABELS)).toEqual(R1_NOTICE_KEYS);
+    for (const key of R1_NOTICE_KEYS) {
+      const label = consentLabel(key, undefined);
+      // Never the generic "I agree to <key>." humanised fallback.
+      expect(label, key).not.toBe(`I agree to ${key.replace(/_/g, ' ')}.`);
+      expect(label, key).toMatch(/^[\x20-\x7e]+$/);
+    }
+    expect(consentLabel('video_audio_recording', undefined)).toMatch(/camera video and voice/);
+    expect(consentLabel('data_processing', undefined)).toMatch(/DeepSeek in the People's/);
+  });
+
+  it('keeps the audience-specific purposes true for both notices', () => {
+    // The staff notice says no decision is made about the person: no status change, no
+    // "hiring team" in the fallback of the evaluation or the recording.
+    for (const key of ['video_audio_recording', 'ai_evaluation']) {
+      expect(consentLabel(key, undefined), key).not.toMatch(/application status|hiring team/);
+    }
   });
 
   it('humanises an unknown purpose rather than showing nothing', () => {
