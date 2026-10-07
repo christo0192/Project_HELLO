@@ -29,7 +29,7 @@ const expectedRoutes = [
   '/login', '/candidate/join', '/privacy-notice', '/status', '/appeal',
   '/dashboard', '/roles', '/candidates', '/candidates/:id',
   '/sessions/:sessionId', '/screening/:sessionId', '/phone-calendar',
-  '/admin', '/mission-control', '/ashby-mission-control',
+  '/admin', '/admin/r1', '/mission-control', '/ashby-mission-control',
   '/ashby/review/:applicationLinkId', '/mfa/*',
 ];
 const missingRoutes = expectedRoutes.filter((route) => !app.includes(`path="${route}"`));

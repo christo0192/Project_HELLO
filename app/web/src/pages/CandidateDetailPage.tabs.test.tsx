@@ -23,6 +23,8 @@ const mockApi = {
   issueLiveKitInvite: vi.fn(),
   getSession: vi.fn(),
   getCandidateAshbyWorkflow: vi.fn().mockResolvedValue({ ok: true, workflow: null }),
+  listR1Rounds: vi.fn().mockResolvedValue({ rounds: [] }),
+  getR1Availability: vi.fn().mockResolvedValue({ state: 'disabled', hold_minutes: 55 }),
   getCandidatePhoneAttempts: vi.fn(),
   getAttemptRecordingDownloadUrl: vi.fn(),
 };
@@ -40,6 +42,8 @@ vi.mock('../api', () => ({
     issueLiveKitInvite: (...args: any[]) => mockApi.issueLiveKitInvite(...args),
     getSession: (...args: any[]) => mockApi.getSession(...args),
     getCandidateAshbyWorkflow: (...args: any[]) => mockApi.getCandidateAshbyWorkflow(...args),
+    listR1Rounds: (...args: any[]) => mockApi.listR1Rounds(...args),
+    getR1Availability: (...args: any[]) => mockApi.getR1Availability(...args),
     getCandidatePhoneAttempts: (...args: any[]) => mockApi.getCandidatePhoneAttempts(...args),
     getAttemptRecordingDownloadUrl: (...args: any[]) => mockApi.getAttemptRecordingDownloadUrl(...args),
   },

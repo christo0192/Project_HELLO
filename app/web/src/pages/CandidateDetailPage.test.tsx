@@ -48,6 +48,10 @@ const mockApi = {
   // Default: this candidate is not Ashby-linked, so the read-only Ashby
   // pipeline card contributes nothing to the Overview.
   getCandidateAshbyWorkflow: vi.fn().mockResolvedValue({ ok: true, workflow: null }),
+  // The R1 card reads the candidate's rounds and whether R1 can take a send.
+  // R1 off with no rounds is the quiet default; R1Section.test.tsx covers the rest.
+  listR1Rounds: vi.fn().mockResolvedValue({ rounds: [] }),
+  getR1Availability: vi.fn().mockResolvedValue({ state: 'disabled', hold_minutes: 55 }),
   requestCandidatePhoneCall: vi.fn().mockResolvedValue({ ok: true, status: 'requested' }),
   releaseCandidatePhoneDuplicateHold: vi.fn().mockResolvedValue({
     ok: true, status: 'released', engagement_id: 'engagement-1', prerequisite_status: 'eligible',
@@ -76,6 +80,8 @@ vi.mock('../api', () => ({
     startLiveKitScreening: vi.fn().mockRejectedValue(new Error('mock')),
     listCandidates: vi.fn().mockResolvedValue([]),
     getCandidateAshbyWorkflow: (...args: any[]) => mockApi.getCandidateAshbyWorkflow(...args),
+    listR1Rounds: (...args: any[]) => mockApi.listR1Rounds(...args),
+    getR1Availability: (...args: any[]) => mockApi.getR1Availability(...args),
     requestCandidatePhoneCall: (...args: any[]) => mockApi.requestCandidatePhoneCall(...args),
     releaseCandidatePhoneDuplicateHold: (...args: any[]) => mockApi.releaseCandidatePhoneDuplicateHold(...args),
   },

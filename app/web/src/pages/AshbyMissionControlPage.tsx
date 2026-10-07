@@ -449,8 +449,17 @@ export function AshbyMissionControlPage() {
     void loadRoles();
   }, [loadRoles]);
 
-  /** The picker offers ACTIVE roles only: a retired role's script is unmaintained. */
-  const activeRoles = useMemo(() => (allRoles ?? []).filter((role) => role.is_active), [allRoles]);
+  /**
+   * The picker offers ACTIVE roles only: a retired role's script is unmaintained.
+   * It also withholds roles run by a dedicated interview lane (`interview_kind`,
+   * today the R1 sales role-play): the database and the mapping route both
+   * refuse to map one to an Ashby job, so offering it would only end in an
+   * error. Rows still resolve against EVERY role below, R1's included.
+   */
+  const activeRoles = useMemo(
+    () => (allRoles ?? []).filter((role) => role.is_active && role.interview_kind == null),
+    [allRoles],
+  );
   /** Rows resolve against EVERY role, retired ones included. */
   const rolesById = useMemo(
     () => (allRoles === null ? null : new Map(allRoles.map((role) => [role.id, role]))),

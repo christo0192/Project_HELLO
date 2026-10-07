@@ -82,6 +82,83 @@ paths:
       tags: [r1]
       operationId: updateR1Settings
       responses: { '200': { description: Updated, audited R1 settings } }
+  /api/interview-rounds/availability:
+    get:
+      tags: [r1]
+      operationId: getR1Availability
+      summary: Coarse Send R1 availability for the HR card (interviewer+; no figures)
+      description: "capacity_exhausted applies the capacity RPC's own shared-pool test: max(minutes_used, guard) + minutes_reserved + hold > least(cap, pause line), where guard = max(dashboard + ledger since the reading, r1 + phone + legacy) x 1.15. not_deployed means R1_ENABLED is off on the API process; disabled means the database switch is off."
+      responses:
+        '200':
+          description: One of ready, not_deployed, disabled, paused, capacity_exhausted, role_not_configured, config_invalid
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [state, hold_minutes]
+                properties:
+                  state:
+                    type: string
+                    enum: [ready, not_deployed, disabled, paused, capacity_exhausted, role_not_configured, config_invalid]
+                  hold_minutes: { type: number }
+  /api/admin/r1/usage:
+    get:
+      tags: [r1]
+      operationId: getR1Usage
+      summary: Current-month R1 budget and WebRTC minute estimate for Mission Control (admin)
+      responses:
+        '200':
+          description: Read-only monthly figures; no secrets
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required:
+                  - month_start
+                  - monthly_cap_minutes
+                  - pause_line_minutes
+                  - hold_minutes
+                  - dashboard_minutes
+                  - dashboard_read_at
+                  - minutes_reserved
+                  - minutes_used
+                  - starts_admitted
+                  - r1_minutes
+                  - phone_minutes
+                  - legacy_browser_minutes
+                  - estimated_minutes
+                  - ledger_since_minutes
+                  - guard_minutes
+                  - committed_minutes
+                  - sends_left
+                  - runtime
+                properties:
+                  month_start: { type: string }
+                  monthly_cap_minutes: { type: number }
+                  pause_line_minutes: { type: number }
+                  hold_minutes: { type: number }
+                  dashboard_minutes: { type: number }
+                  dashboard_read_at: { type: string, nullable: true }
+                  minutes_reserved: { type: number }
+                  minutes_used: { type: number }
+                  starts_admitted: { type: number }
+                  r1_minutes: { type: number }
+                  phone_minutes: { type: number }
+                  legacy_browser_minutes: { type: number }
+                  estimated_minutes: { type: number }
+                  ledger_since_minutes: { type: number, description: R1 ledger minutes recorded at or after dashboard_read_at }
+                  guard_minutes: { type: number, description: "max(dashboard_minutes + ledger_since_minutes, r1 + phone + legacy) x 1.15, as r1_send_round computes it" }
+                  committed_minutes: { type: number, description: "max(minutes_used, guard_minutes) + minutes_reserved" }
+                  sends_left: { type: integer, minimum: 0, description: "Whole sends that still fit under least(cap, pause line)" }
+                  runtime:
+                    type: object
+                    required: [enabled, status]
+                    properties:
+                      enabled: { type: boolean }
+                      status: { type: string, enum: [enabled, disabled, invalid] }
+                      reason: { type: string }
   /api/internal/r1/context:
     post:
       tags: [r1]

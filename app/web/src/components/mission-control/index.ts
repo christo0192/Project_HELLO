@@ -20,6 +20,7 @@ export { SessionsSection } from './SessionsSection';
 export { QuotasSection } from './QuotasSection';
 export { ScorebarSection } from './ScorebarSection';
 export { FunnelSection } from './FunnelSection';
+export { R1Section } from './R1Section';
 export { AuditSection } from './AuditSection';
 export { MaintenanceSection } from './MaintenanceSection';
 export { OperatorHaltControl } from './OperatorHaltControl';

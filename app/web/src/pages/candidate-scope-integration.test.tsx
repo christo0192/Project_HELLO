@@ -35,6 +35,9 @@ const mockApi = {
   listNotes: vi.fn(),
   listAppeals: vi.fn(),
   getCandidateAshbyWorkflow: vi.fn(),
+  // The R1 card on the candidate page (a viewer here, so it renders nothing).
+  listR1Rounds: vi.fn(),
+  getR1Availability: vi.fn(),
   getAshbyScopedReview: vi.fn(),
   listAshbyScopedReviewNotes: vi.fn(),
   getAshbyScopedReviewWorkflow: vi.fn(),
@@ -103,6 +106,8 @@ beforeEach(() => {
   mockApi.listNotes.mockResolvedValue({ notes: [] });
   mockApi.listAppeals.mockResolvedValue({ appeals: [] });
   mockApi.getCandidateAshbyWorkflow.mockResolvedValue({ ok: true, workflow: null });
+  mockApi.listR1Rounds.mockResolvedValue({ rounds: [] });
+  mockApi.getR1Availability.mockResolvedValue({ state: 'disabled', hold_minutes: 55 });
   mockApi.getAshbyScopedReview.mockResolvedValue(mockCandidateDetail);
   mockApi.listAshbyScopedReviewNotes.mockResolvedValue({ notes: [] });
   mockApi.getAshbyScopedReviewWorkflow.mockResolvedValue({ ok: true, workflow: null });

@@ -196,6 +196,55 @@ describe('MissionControlPage', () => {
     expect(await screen.findByText('Access entries')).toBeInTheDocument();
   });
 
+  it('adds an R1 tab that reads its two sources only once it is opened', async () => {
+    apiFns.getR1Usage.mockResolvedValue({
+      month_start: '2026-10-01',
+      monthly_cap_minutes: 4000,
+      pause_line_minutes: 4000,
+      hold_minutes: 55,
+      dashboard_minutes: 0,
+      dashboard_read_at: null,
+      minutes_reserved: 0,
+      minutes_used: 0,
+      starts_admitted: 0,
+      r1_minutes: 0,
+      phone_minutes: 0,
+      legacy_browser_minutes: 0,
+      estimated_minutes: 0,
+      ledger_since_minutes: 0,
+      guard_minutes: 0,
+      committed_minutes: 0,
+      sends_left: 72,
+      runtime: { enabled: true, status: 'enabled' },
+    });
+    apiFns.getR1Settings.mockResolvedValue({
+      enabled: false,
+      paused: false,
+      auto_status_enabled: false,
+      monthly_cap_minutes: 4000,
+      pause_line_minutes: 4000,
+      advance_threshold: 65,
+      hold_threshold: 45,
+      livekit_target: 'cloud',
+      dashboard_minutes: 0,
+      dashboard_read_at: null,
+      runtime: { enabled: true, status: 'enabled' },
+    });
+    renderPage();
+    const tablist = await screen.findByRole('tablist', { name: 'Mission Control sections' });
+    expect(withinTablist(tablist, 'R1')).toBeInTheDocument();
+    // Unvisited: nothing about R1 has been asked of the API.
+    expect(apiFns.getR1Usage).not.toHaveBeenCalled();
+    expect(apiFns.getR1Settings).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('tab', { name: 'R1' }));
+    expect(await screen.findByText('R1 allowance used')).toBeInTheDocument();
+    await waitFor(() => {
+      expect(apiFns.getR1Usage).toHaveBeenCalledTimes(1);
+      expect(apiFns.getR1Settings).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('renders under dark mode + reduced motion with no axe violations', async () => {
     forceDarkMode();
     const { container } = renderPage();

@@ -15,6 +15,7 @@ import type {
 } from "../types";
 import { LiveCallPanel } from "../components/LiveCallPanel";
 import { LiveKitCallCard } from "../components/LiveKitCallCard";
+import { R1Section } from "../components/r1/R1Section";
 import { StatusBadge } from "../components/design";
 import {
   CandidateButton,
@@ -394,6 +395,7 @@ export function CandidateDetailPage() {
                   candidate={candidate}
                   sessions={sessions}
                   phoneRole={me.role}
+                  viewerId={me.userId}
                   phoneAttempts={phoneAttempts}
                   showPhoneAttempts={tab === "overview"}
                   onSessionCompleted={refresh}
@@ -517,6 +519,7 @@ function OverviewTab({
   candidate,
   sessions,
   phoneRole,
+  viewerId,
   phoneAttempts,
   showPhoneAttempts,
   onSessionCompleted,
@@ -529,6 +532,8 @@ function OverviewTab({
   candidate: CandidateDetail["candidate"];
   sessions: CandidateDetail["sessions"];
   phoneRole: MeResponse["role"];
+  /** The signed-in user's id, so R1 round actions follow the API's ownership rule. */
+  viewerId: string;
   /** The page's shared attempt list (see `usePhoneAttemptHistory`). */
   phoneAttempts: PhoneAttemptHistorySource;
   /** False while another tab is open: unmounts the player (see the page). */
@@ -604,6 +609,15 @@ function OverviewTab({
             rescreenRecommendation={rescreenRecommendation}
           />
         )}
+
+        {/* R1 (WebRTC sales role-play): the Send R1 card and the rounds panel
+            in one surface. Renders nothing for a viewer until a round exists. */}
+        <R1Section
+          candidateId={candidate.id}
+          candidateName={candidate.name}
+          role={phoneRole}
+          userId={viewerId || null}
+        />
 
         {/* Read-only Ashby pipeline status. Renders nothing for a candidate
             with no Ashby application link. */}
