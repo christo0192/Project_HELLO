@@ -936,6 +936,15 @@ Rejected alternatives:
 - **Withdrawal:** `POST /api/r1/consent/withdraw` stops a live session (the API deletes the room, and the worker goes to FINISHING with no upload), deletes the video, and blocks scoring and status writes. `prepare` and exchange re-check the consent version and that it has not been withdrawn.
 - **Decline:** a card flag; HR arranges a human interview.
 - **Staff dry runs:** Stage A and A2 participants consent through the same flow, using a Legal-approved staff version.
+- **Audience is server-owned (PR-CT blocker for PR-3, PR-6 and PR-7):**
+  - The two notices are two rows of ONE version (locales `en-IN` and `en-IN-x-staff`), because admission honours only the greatest active version. Admission cannot tell the audiences apart.
+  - A round therefore carries a server-owned audience: `interview_rounds.consent_locale`, check `('en-IN','en-IN-x-staff')`, added by 0120 or 0124 and set only by the Send R1 path as `service_role`.
+  - PR-3 `GET /consent-template` and `POST /consent` load the template by that value and drop the client `locale` (or answer 400 when it differs). PR-6 never picks or hard-codes a locale.
+  - Optionally the migration that next replaces `r1_admit_attempt` adds `and t.locale = v_round.consent_locale` to the consent EXISTS.
+  - Any client locale that stays must accept BCP 47 private use: PR-3's `{0,3}` validator rejects `en-IN-x-staff`.
+- **Release record (0123):**
+  - The notice bodies are immutable once applied and are bound to md5 digests in the migration. A change of wording, provider, retention or grievance contact ships as a new version that re-ships BOTH audience rows.
+  - Open owner inputs: a named grievance officer and a monitored address; Legal sign-off of the exact bodies; the R2 jurisdiction (the bucket is created only after Legal advises).
 
 ### 7.9 Retention, deletion, DSAR and access
 
@@ -1225,6 +1234,13 @@ The S0-E webhook question is already answered (phone uses webhooks) and needs no
 | ~late Jan 2027 | Stage C, if calibration passes with ≥30 double-rated sessions |
 
 ### 10.4 Stage exits (numeric)
+
+- **Consent-notice gates (the 0123 notices promise these; they apply from Stage A0):**
+  - the candidate withdraw control and `POST /api/r1/consent/withdraw` are live: a withdrawal stops the session with no upload and blocks scoring and status writes;
+  - the round audience is server-owned (§7.8): PR-3 ignores a client `locale` and PR-6 does not choose one;
+  - `R1_VIDEO_RECORDING` stays off, and no R2 bucket exists, until `r1.sweep` (N=90) and the R2 `r1/` lifecycle rule (N+7 days; abort multipart after 1 day) are deployed (PR-8);
+  - PR-3 returns `consent_items` (type and label) for all four consent keys, and PR-6 shows no generic fallback label for any of them;
+  - before Stage B: the named grievance officer is in the notice, or a superseding release of BOTH rows is scheduled.
 
 - **Stage A0** (owner smoke, ≥2 sessions after PR-3/4a/6): round created through the PR-2 route; all phases run; turns carry `phase`; ledger rows written; room deleted; no phone regression.
 - **Stage A** (≥12 sessions: all 4 personas × 3 scripted skill levels by HR and the sales lead):

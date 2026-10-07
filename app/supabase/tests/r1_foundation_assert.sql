@@ -112,6 +112,246 @@ $$;
 create or replace function _r1_tests.booked(p_month date) returns numeric language sql as $$
   select coalesce((select minutes_used from screening_v2.r1_budget_month where month_start = p_month), 0);
 $$;
+-- PR-CT (0123): the shipped staff dry-run and candidate notices. These blocks run FIRST, while the
+-- two shipped rows are the only active templates. r1_admit_attempt accepts a consent only to the
+-- GREATEST active version, so the fixtures of the next block use versions ('9001', '9002') that
+-- sort above any shipped release (those are dates and start with '2') and stay authoritative
+-- there. When a later migration ships a newer release, move `release` below to it and keep
+-- proving admission for BOTH audiences.
+--
+-- REBASE RULE. PR-2b (0119) inserts its own helpers at this spot and replaces r1_admit_attempt
+-- with an r1_capacity_snapshot gate. Keep this block FIRST in the file (pinned by
+-- r1-consent-templates-migration.test.ts): a block that adds a higher active version before
+-- it breaks the 'greatest active version' and 'ok' assertions. Once 0119 lands the 'ok'
+-- scenarios of ct_admit must also satisfy its capacity gate, so re-run supabase-ci after the
+-- rebase and merge only on green.
+--
+-- KNOWN GAP (a blocker for PR-3, PR-6 and PR-7; see the AUDIENCE CONTRACT in 0123). A round
+-- has no server-owned audience yet, so admission treats the two notices as equivalent and the
+-- staff scenarios below admit an ordinary sales_r1 candidate round on staff consent. These
+-- scenarios prove the consent contract of each template, not that a round is bound to its
+-- audience.
+create or replace function _r1_tests.ct_admit(
+  p_release text, p_locale text, p_n integer, p_consents jsonb, p_withdrawn boolean default false
+) returns text
+language plpgsql
+as $$
+declare
+  v_owner constant uuid := 'c7000000-0000-4000-8000-000000000001';
+  v_role constant uuid := 'c7000000-0000-4000-8000-000000000002';
+  v_candidate uuid := ('c7000000-0000-4000-8000-' || lpad((100 + p_n)::text, 12, '0'))::uuid;
+  v_round uuid := ('c7000000-0000-4000-8000-' || lpad((200 + p_n)::text, 12, '0'))::uuid;
+  v_result jsonb;
+begin
+  insert into screening_v2.candidates (id, role_id, name)
+  values (v_candidate, v_role, 'PR-CT ' || p_n);
+  insert into screening_v2.interview_rounds
+    (id, candidate_id, role_id, link_token_digest, expires_at, created_by, status)
+  values
+    (v_round, v_candidate, v_role,
+     encode(sha256(convert_to('r1-prct-link-' || p_n, 'UTF8')), 'hex'),
+     now() + interval '1 day', v_owner, 'invited');
+  insert into screening_v2.interview_round_consents (round_id, template_id, consents, withdrawn_at)
+  select v_round, t.id, p_consents, case when p_withdrawn then now() end
+    from screening_v2.interview_round_consent_templates t
+   where t.version = p_release and t.locale = p_locale;
+  if not found then
+    raise exception 'PR-CT fixture: no template % / %', p_release, p_locale;
+  end if;
+  v_result := screening_v2.r1_admit_attempt(
+    v_round, encode(sha256(convert_to('r1-prct-nonce-' || p_n, 'UTF8')), 'hex'));
+  -- Free the one-live-R1 slot so the next scenario reaches the consent gate on its own merits.
+  update screening_v2.call_sessions
+     set status = 'failed', terminal_reason = 'provider_error'
+   where interview_round_id = v_round;
+  return v_result->>'status';
+end;
+$$;
+
+do $$
+declare
+  release constant text := '2026-10-06.1';
+  candidate_locale constant text := 'en-IN';
+  staff_locale constant text := 'en-IN-x-staff';
+  candidate_md5 constant text := '1a24de21b495d24c61484720c2c0dbec';
+  staff_md5 constant text := 'cbb69bcbfd332457d54edfe26c2c8016';
+  contract constant jsonb :=
+    '["ai_interview", "video_audio_recording", "ai_evaluation", "data_processing"]'::jsonb;
+  owner constant uuid := 'c7000000-0000-4000-8000-000000000001';
+  role_ct constant uuid := 'c7000000-0000-4000-8000-000000000002';
+  prior screening_v2.r1_settings%rowtype;
+  audience record;
+  consent_key text;
+  missing text;
+  body text;
+  status text;
+  n integer := 10;
+begin
+  -- The shipped rows: exactly the two audiences, one release, both active.
+  perform _r1_tests.assert('PR-CT: the release ships exactly the candidate and staff rows', (
+    select count(*) = 2
+       and count(*) filter (where locale = candidate_locale and is_active) = 1
+       and count(*) filter (where locale = staff_locale and is_active) = 1
+      from screening_v2.interview_round_consent_templates
+     where version = release));
+  perform _r1_tests.assert('PR-CT: the release is the authoritative (greatest active) version', (
+    select max(version) = release from screening_v2.interview_round_consent_templates
+     where is_active));
+  perform _r1_tests.assert('PR-CT: both audiences require exactly the four contract keys', (
+    select count(*) = 2
+      from screening_v2.interview_round_consent_templates t
+     where t.version = release
+       and jsonb_array_length(t.required_consents) = jsonb_array_length(contract)
+       and t.required_consents <@ contract
+       and contract <@ t.required_consents));
+  -- Each body is the text a sign-off was bound to: md5 digests, as in the 0123 verification.
+  perform _r1_tests.assert('PR-CT: the shipped bodies are the signed-off text (md5 digests)', (
+    select count(*) = 2
+      from screening_v2.interview_round_consent_templates t
+     where t.version = release
+       and ((t.locale = candidate_locale and md5(t.body_md) = candidate_md5)
+         or (t.locale = staff_locale and md5(t.body_md) = staff_md5))));
+
+  -- The itemised notice. Each element must be stated in each audience's text.
+  for audience in
+    select * from (values (candidate_locale), (staff_locale)) as a(locale)
+  loop
+    select t.body_md into body
+      from screening_v2.interview_round_consent_templates t
+     where t.version = release and t.locale = audience.locale;
+    select string_agg(p.label, ', ' order by p.label) into missing
+      from (values
+        ('AI interviewer', '%AI interviewer%'),
+        ('role-play', '%role-play%'),
+        ('transcript', '%transcript%'),
+        ('camera video recording', '%camera video and voice may be recorded%'),
+        ('DeepSeek processing', '%DeepSeek processes and stores data%'),
+        ('PRC location', '%People''s Republic of China%'),
+        ('video retention 90 days', '%Video recording: 90 days%'),
+        ('transcript retention', '%Transcript and scores:%'),
+        ('withdrawal path', '%## Withdraw your consent%'),
+        ('withdrawal deletes video', '%delete any video recording%'),
+        ('alternative path', case when audience.locale = candidate_locale
+           then '%arrange a human interview%' else '%you can decline%' end),
+        ('contact', '%Contact the Interview Kickstart %'),
+        ('Data Protection Board', '%Data Protection Board of India%'),
+        ('Sarvam', '%Sarvam AI%'),
+        ('LiveKit', '%LiveKit%'),
+        ('Cloudflare R2', '%Cloudflare R2%'),
+        ('Fly.io Singapore', '%Fly.io (Singapore)%'),
+        ('Supabase', '%Supabase%'),
+        ('Vercel hosting', '%Vercel: hosts the interview web page%'),
+        ('LiveKit mode', '%LiveKit runs on a server we operate at Fly.io (Singapore) or%'),
+        ('withdrawal ends scoring', '%After you withdraw, we will not score the %'),
+        ('withdrawal not penalised', '%Withdrawing will not count against you%'),
+        ('complaints route', '%questions and complaints about your data to the same contact%'),
+        ('audience statement', case when audience.locale = candidate_locale
+           then '%hiring team can review and change%' else '%not a real job application%' end)
+      ) as p(label, pat)
+     where body not ilike p.pat;
+    perform _r1_tests.assert(
+      'PR-CT: ' || audience.locale || ' notice states every itemised element',
+      missing is null, coalesce(missing, ''));
+    perform _r1_tests.assert('PR-CT: ' || audience.locale || ' notice is clean text',
+      body !~* '(placeholder|todo|tbd|lorem|\[|\]|\{|\})'
+        and position(chr(13) in body) = 0
+        and octet_length(body) = char_length(body)
+        and left(body, 2) = '# ');
+    -- 'because of it' read either as 'withdrawal is not penalised' or as 'no scoring at all'.
+    perform _r1_tests.assert(
+      'PR-CT: ' || audience.locale || ' notice has no ambiguous withdrawal sentence',
+      body not ilike '%because of it%');
+  end loop;
+
+  -- Immutable: no edit, deactivation or delete of a shipped row is possible.
+  begin
+    update screening_v2.interview_round_consent_templates
+       set title = title || ' edited' where version = release and locale = candidate_locale;
+    raise exception 'PR-CT sentinel: a shipped title unexpectedly changed';
+  exception when raise_exception then
+    if sqlerrm like 'PR-CT sentinel:%' or sqlerrm not like '%immutable%' then raise; end if;
+  end;
+  begin
+    update screening_v2.interview_round_consent_templates
+       set is_active = false where version = release and locale = staff_locale;
+    raise exception 'PR-CT sentinel: a shipped row was unexpectedly deactivated';
+  exception when raise_exception then
+    if sqlerrm like 'PR-CT sentinel:%' or sqlerrm not like '%immutable%' then raise; end if;
+  end;
+  begin
+    update screening_v2.interview_round_consent_templates
+       set required_consents = '[]'::jsonb where version = release;
+    raise exception 'PR-CT sentinel: shipped consent keys unexpectedly changed';
+  exception when raise_exception then
+    if sqlerrm like 'PR-CT sentinel:%' or sqlerrm not like '%immutable%' then raise; end if;
+  end;
+  begin
+    delete from screening_v2.interview_round_consent_templates where version = release;
+    raise exception 'PR-CT sentinel: a shipped row was unexpectedly deleted';
+  exception when raise_exception then
+    if sqlerrm like 'PR-CT sentinel:%' or sqlerrm not like '%immutable%' then raise; end if;
+  end;
+  -- A release/locale pair cannot be claimed twice, so a re-run of 0123 adds nothing.
+  begin
+    insert into screening_v2.interview_round_consent_templates
+      (version, locale, title, body_md, required_consents, is_active)
+    values (release, candidate_locale, 'duplicate', 'duplicate', '[]'::jsonb, true);
+    raise exception 'PR-CT sentinel: a duplicate release/locale was unexpectedly accepted';
+  exception when unique_violation then null;
+  end;
+  perform _r1_tests.assert('PR-CT: the shipped rows survive every mutation attempt unchanged', (
+    select count(*) = 2 and count(*) filter (where is_active) = 2
+       and bool_and(required_consents <@ contract and title not like '%edited%')
+      from screening_v2.interview_round_consent_templates where version = release));
+
+  -- Admission accepts consent to the new release, for both audiences, and refuses every
+  -- consent that omits one of its keys. Only the consent differs between the scenarios.
+  select * into prior from screening_v2.r1_settings where singleton;
+  update screening_v2.r1_settings
+     set enabled = true, paused = false, livekit_target = 'r1', monthly_cap_minutes = 100000,
+         pause_line_minutes = 100000, dashboard_minutes = 0, dashboard_read_at = null
+   where singleton;
+  insert into auth.users (id, email) values (owner, 'r1-consent-templates@example.test')
+  on conflict (id) do nothing;
+  insert into screening_v2.roles (id, title, interview_kind)
+  values (role_ct, 'R1 consent template test role', 'sales_r1');
+
+  status := _r1_tests.ct_admit(release, candidate_locale, 1, contract);
+  perform _r1_tests.assert('PR-CT: admission accepts consent to the candidate notice',
+    status = 'ok', status);
+  status := _r1_tests.ct_admit(release, staff_locale, 2, contract);
+  perform _r1_tests.assert('PR-CT: admission accepts consent to the staff dry-run notice',
+    status = 'ok', status);
+  for consent_key in select jsonb_array_elements_text(contract) loop
+    n := n + 1;
+    status := _r1_tests.ct_admit(release, candidate_locale, n, contract - consent_key);
+    perform _r1_tests.assert('PR-CT: a candidate consent without ' || consent_key
+      || ' refuses admission', status = 'consent_missing', status);
+    n := n + 1;
+    status := _r1_tests.ct_admit(release, staff_locale, n, contract - consent_key);
+    perform _r1_tests.assert('PR-CT: a staff consent without ' || consent_key
+      || ' refuses admission', status = 'consent_missing', status);
+  end loop;
+  status := _r1_tests.ct_admit(release, candidate_locale, 3, '[]'::jsonb);
+  perform _r1_tests.assert('PR-CT: an empty consent refuses admission',
+    status = 'consent_missing', status);
+  status := _r1_tests.ct_admit(release, candidate_locale, 4,
+    '["ai_interview", "recording", "purpose", "data_processing", "retention", "rights"]'::jsonb);
+  perform _r1_tests.assert('PR-CT: the phone consent vocabulary does not satisfy an R1 round',
+    status = 'consent_missing', status);
+  status := _r1_tests.ct_admit(release, candidate_locale, 5, contract, true);
+  perform _r1_tests.assert('PR-CT: a withdrawn consent to the new release refuses admission',
+    status = 'consent_missing', status);
+
+  -- Leave the shared settings exactly as found for the foundation assertions below.
+  update screening_v2.r1_settings
+     set enabled = prior.enabled, paused = prior.paused, livekit_target = prior.livekit_target,
+         monthly_cap_minutes = prior.monthly_cap_minutes,
+         pause_line_minutes = prior.pause_line_minutes,
+         dashboard_minutes = prior.dashboard_minutes, dashboard_read_at = prior.dashboard_read_at
+   where singleton;
+end;
+$$;
 
 do $$
 declare
@@ -164,14 +404,16 @@ begin
     (candidate_i, role_r1, 'I'), (candidate_j, role_r1, 'J'),
     (candidate_k, role_r1, 'K'), (candidate_l, role_r1, 'L');
 
-  -- Version 002 is authoritative. Templates at that version exercise locale,
-  -- inactive, withdrawal, and required-consent paths independently.
+  -- Version 9002 is authoritative. 0123 ships real active rows, so these fixtures use
+  -- versions that sort above any shipped release (dates start with '2') and stay the
+  -- greatest active version. Templates at 9002 exercise locale, inactive, withdrawal,
+  -- and required-consent paths independently.
   insert into screening_v2.interview_round_consent_templates
     (id, version, locale, title, body_md, required_consents, is_active) values
-    (template_old, '001', 'en-IN', 'R1 old test', 'test', '[]'::jsonb, true),
-    (template_new, '002', 'en-IN', 'R1 current test', 'test', '[]'::jsonb, true),
-    (template_inactive, '002', 'hi-IN', 'R1 current inactive locale test', 'test', '[]'::jsonb, false),
-    (template_required, '002', 'en-GB', 'R1 current required-consent locale test', 'test',
+    (template_old, '9001', 'en-IN', 'R1 old test', 'test', '[]'::jsonb, true),
+    (template_new, '9002', 'en-IN', 'R1 current test', 'test', '[]'::jsonb, true),
+    (template_inactive, '9002', 'hi-IN', 'R1 current inactive locale test', 'test', '[]'::jsonb, false),
+    (template_required, '9002', 'en-GB', 'R1 current required-consent locale test', 'test',
      '["terms","recording"]'::jsonb, true);
   insert into screening_v2.interview_rounds
     (id, candidate_id, role_id, link_token_digest, expires_at, created_by, status) values
