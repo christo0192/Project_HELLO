@@ -67,15 +67,25 @@ export function parseNoticeBlocks(markdown: string): NoticeBlock[] {
   return blocks;
 }
 
-/** Fallback wording for the purposes the plan names, used only when the template has no label. */
+/**
+ * Fallback wording, used only when the server sent no label for a purpose.
+ *
+ * It covers every key the R1 notices require (migration 0123, both audiences), so the
+ * generic "I agree to <key>" wording below is never reached for them. The server's own
+ * `consent_items` are the wording of record and differ by audience (a staff dry run says
+ * its evaluation decides nothing about the person), so the two audience-specific
+ * purposes here are deliberately neutral: true for both notices, deferring to the
+ * notice the person has just read for the detail.
+ */
 export const R1_CONSENT_FALLBACK_LABELS: Readonly<Record<string, string>> = Object.freeze({
   ai_interview:
-    'I agree to an interview conducted by an AI interviewer, including a sales role-play.',
-  recording:
-    'I agree to my video and audio being recorded for review by the hiring team.',
-  ai_evaluation:
-    'I agree to an AI evaluation of my interview that may update my application status, '
-    + 'which the hiring team can review and change and which I can contest.',
+    'I agree to take part in an interview led by an AI interviewer, including a sales role-play.',
+  video_audio_recording:
+    'I agree to my camera video and voice being recorded, as this notice describes.',
+  ai_evaluation: 'I agree to an AI evaluation of my interview, as this notice describes.',
+  data_processing:
+    "I agree to the providers listed in this notice, including DeepSeek in the People's "
+    + 'Republic of China, processing my data.',
 });
 
 export function consentLabel(type: string, templateLabel: string | undefined): string {

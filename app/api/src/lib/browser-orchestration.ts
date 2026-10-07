@@ -250,7 +250,9 @@ function isPositiveTimestamp(value: unknown): boolean {
  * treated as LIVE: this predicate only ever relaxes "an agent exists" for a job
  * that is positively finished, so it can never add a second agent. A finished
  * job left behind by an earlier exchange for the same room must not make a new
- * dispatch look accepted.
+ * dispatch look accepted. Exported so the R1 exchange's worker gate
+ * (lib/r1/worker-gate.ts) reads "a worker owns this room" through the SAME
+ * predicate: a dead job must not make a rejoin look like a running interviewer.
  *
  * RESIDUAL (R1, two failures in a row; cannot happen on Cloud): a job orphaned
  * by a stopped machine that the OSS server leaves at JS_RUNNING with NO end time
@@ -259,7 +261,7 @@ function isPositiveTimestamp(value: unknown): boolean {
  * observation (docs/runbooks/r1-operations.md, "S0-F3 dispatch-matrix rerun");
  * the "any dispatch" rule itself is deliberate and must not be narrowed blindly.
  */
-function jobIsLive(job: unknown): boolean {
+export function jobIsLive(job: unknown): boolean {
   const state = (job as { state?: { status?: unknown; endedAt?: unknown } } | null)?.state;
   const status = state?.status;
   if (

@@ -32,6 +32,7 @@ import { ashbyReviewRouter } from './routes/ashby-review.js';
 import { phoneApiRouter } from './routes/phone.js';
 import { r1Router, r1InternalRouter } from './routes/r1.js';
 import { r1HrRouter } from './routes/r1-hr.js';
+import { r1CandidateRouter } from './routes/r1-candidate.js';
 import { ashbyCandidateWorkflowRouter } from './routes/ashby-candidate-workflow.js';
 import { scorecardsRouter } from './routes/scorecards.js';
 import {
@@ -43,6 +44,7 @@ import {
 } from './lib/validation.js';
 import { createRequireAuth, isPublicRoute, setAuthSupabaseClient, type MembershipResolver, type TokenVerifier } from './lib/auth.js';
 import { createRateLimitMiddleware, type RateLimitConfig } from './lib/rate-limit.js';
+import { createR1RateLimit, createR1StartRateLimit } from './lib/r1/rate-limit.js';
 import { viewerReadOnly } from './lib/rbac.js';
 import { supabase } from './lib/supabase.js';
 import { setAuditSink, createDbAuditSink } from './lib/audit.js';
@@ -372,6 +374,18 @@ export function createApp(opts: CreateAppOptions = {}) {
   }));
   app.use('/api/candidates', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'candidates:', useUserKey: true }));
   app.use('/api/interview-rounds', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'r1-rounds:', useUserKey: true }));
+  // R1 candidate routes (link-token authenticated): their own per-IP bucket for
+  // every route, plus a tighter one, shared by the two routes that create a room
+  // or an attempt. The tight one is keyed on the LINK (its body token), not the
+  // IP: behind a proxy that hides the client address every candidate would share
+  // one IP bucket, and unauthenticated junk could lock them all out of
+  // preflight and admission. It is mounted on those POSTs only, so the polled
+  // status and the 202 exchange loop never spend it, and it reads the (tiny)
+  // body itself because the global JSON parser is mounted further down.
+  const r1StartBody = express.json({ limit: '4kb' });
+  app.use('/api/r1', createR1RateLimit(rateWindowSec));
+  app.post('/api/r1/preflight', r1StartBody, createR1StartRateLimit(rateWindowSec));
+  app.post('/api/r1/attempts', r1StartBody, createR1StartRateLimit(rateWindowSec));
   app.use('/api/screening', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'screening:', useUserKey: true }));
   app.use('/api/assess', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'assess:', useUserKey: true }));
   app.use('/api/resumes', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'resumes:', useUserKey: true }));
@@ -460,6 +474,9 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api', r1Router);
   // Read-only HR read models (availability, usage); see routes/r1-hr.ts.
   app.use('/api', r1HrRouter);
+  // R1 candidate surface (exact public allowlist entries in lib/auth.ts). Each
+  // route authenticates with the link token, or the attempt token + nonce.
+  app.use('/api/r1', r1CandidateRouter);
   // Read-only Ashby workflow card for a candidate. A separate router so the
   // Ashby integration stays out of the core candidates route; `/:id` above
   // never matches `/:id/ashby-workflow`, so ordering is not load-bearing.

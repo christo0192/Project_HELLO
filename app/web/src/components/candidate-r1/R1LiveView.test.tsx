@@ -166,6 +166,52 @@ describe('controls', () => {
   });
 });
 
+describe('withdrawing consent from the room', () => {
+  it('offers nothing unless the page wires it up', () => {
+    renderLive();
+    expect(screen.queryByRole('button', { name: 'Withdraw my consent' })).toBeNull();
+  });
+
+  it('asks first, says it ends the interview for good, and only then withdraws', async () => {
+    const user = userEvent.setup();
+    const onWithdraw = vi.fn();
+    const { props } = renderLive({ onWithdraw });
+    await user.click(screen.getByRole('button', { name: 'Withdraw my consent' }));
+    expect(onWithdraw).not.toHaveBeenCalled();
+    expect(screen.getByText(/ends your interview now and it cannot be rejoined/)).toBeVisible();
+    // It is not Leave: leaving stays rejoinable and is not touched.
+    expect(props.onLeave).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: 'Keep my consent' }));
+    expect(onWithdraw).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Withdraw my consent' }));
+    const group = screen.getByRole('group', { name: 'Withdraw consent' });
+    await user.click(within(group).getByRole('button', { name: 'Withdraw my consent' }));
+    expect(onWithdraw).toHaveBeenCalledTimes(1);
+    expect(props.onLeave).not.toHaveBeenCalled();
+  });
+
+  it('shows why a withdrawal failed, and disables the choice while it is being recorded', async () => {
+    const user = userEvent.setup();
+    const { rerender, props } = renderLive({
+      onWithdraw: vi.fn(),
+      withdrawError: 'We could not record your withdrawal. Please try again.',
+    });
+    expect(screen.getByRole('alert')).toHaveTextContent('could not record your withdrawal');
+    await user.click(screen.getByRole('button', { name: 'Withdraw my consent' }));
+    rerender(<R1LiveView {...props} onWithdraw={vi.fn()} withdrawBusy />);
+    const group = screen.getByRole('group', { name: 'Withdraw consent' });
+    expect(within(group).getByRole('button', { name: 'Withdraw my consent' })).toBeDisabled();
+  });
+
+  it('has no accessibility violations with the confirmation open', async () => {
+    const user = userEvent.setup();
+    const { container } = renderLive({ onWithdraw: vi.fn() });
+    await user.click(screen.getByRole('button', { name: 'Withdraw my consent' }));
+    await expect(container).toHaveNoViolations();
+  });
+});
+
 describe('self-view', () => {
   it('attaches the local camera to a muted inline video and detaches on unmount', () => {
     const video = { attach: vi.fn(), detach: vi.fn() } as unknown as LocalVideoTrack;

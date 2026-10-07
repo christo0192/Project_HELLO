@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -12,28 +12,29 @@ import {
   parseStatus,
   R1_CONTRACT,
   R1_ROUTES,
+  R1_SERVER_ERROR_CODES,
+  R1_STATUS_VOCABULARY,
   r1Api,
   type R1RouteContract,
   type R1RouteName,
 } from './r1-api';
 
 /**
- * The web side of the R1 wire contract (plan section 8.3).
- *
- * PR-3 owns the server and is built in parallel, so the shapes in r1-api.ts are
- * provisional. This suite keeps them honest in three layers:
+ * The web side of the R1 wire contract (plan section 8.3), reconciled with PR-3's
+ * implemented routes: the shapes in r1-api.ts are the server's, and this suite
+ * keeps the two from drifting apart in three layers:
  *
  *   1. r1-api.ts really sends what R1_CONTRACT declares (method, path, body);
  *   2. the `parse*` functions require exactly the response fields R1_CONTRACT
  *      declares, no more and no less;
  *   3. app/api/openapi/openapi.yaml documents every route, request field and
- *      required response field. This layer is SKIPPED while PR-3's candidate
- *      routes are absent from the spec (the web contract is then UNVERIFIED
- *      against the server, and the PR must not merge before PR-3 is deployed),
- *      and it switches itself on the moment the spec documents any
- *      `/api/r1/...` candidate path, after which a missing or mismatched route
- *      fails CI. The checker itself is proven on synthetic specs below, so the
- *      skipped layer is not an untested one.
+ *      required response field, and the status vocabularies the page accepts.
+ *      This layer is SKIPPED only on a tree whose spec documents no
+ *      `/api/r1/...` candidate path (the web contract is then UNVERIFIED
+ *      against the server); it switches itself on the moment the spec documents
+ *      one, after which a missing or mismatched route fails CI. The checker
+ *      itself is proven on synthetic specs below, so a skipped layer is not an
+ *      untested one.
  */
 
 const LINK = 'a'.repeat(64);
@@ -56,12 +57,18 @@ function mockFetch(body: unknown) {
 
 const FULL_RESPONSES: Record<R1RouteName, unknown> = {
   status: {
-    state: 'invited',
-    attempts_left: 2,
-    consent_required: false,
+    round_status: 'invited',
+    expires_at: '2026-10-10T00:00:00Z',
+    availability: 'open',
+    attempts_allowed: 2,
+    attempts_remaining: 2,
+    starts_remaining: 3,
+    consent: { state: 'granted', template_version: 'v1' },
+    live_attempt: false,
+    can_start: true,
     role_title: 'Sales Program Advisor',
-    format: { duration_minutes: 20, summary: null },
-    budget_paused: false,
+    format: { duration_minutes: 20, camera_required: true, includes_role_play: true },
+    audience: 'candidate',
   },
   consentTemplate: {
     version: 'v1',
@@ -71,8 +78,8 @@ const FULL_RESPONSES: Record<R1RouteName, unknown> = {
     required_consents: ['ai_interview'],
     consent_items: [{ type: 'ai_interview', label: 'Agree' }],
   },
-  consent: { ok: true },
-  consentWithdraw: { ok: true },
+  consent: { status: 'granted', consents: ['ai_interview'], template_version: 'v1' },
+  consentWithdraw: { ok: true, withdrawn: true, sessions_stopped: 0 },
   preflight: {
     url: 'wss://lk.invalid',
     livekit_token: 'token',
@@ -82,11 +89,16 @@ const FULL_RESPONSES: Record<R1RouteName, unknown> = {
   attempts: {
     attempt_token: 'attempt',
     nonce: NONCE,
-    session_id: 'session',
-    lead: { name: 'Meera', city: 'Pune' },
-    attempts_left: 1,
+    attempt_id: 'session',
+    rejoin: false,
   },
-  exchange: { status: 'ready', url: 'wss://lk.invalid', livekit_token: 'token', session_id: 's' },
+  exchange: {
+    status: 'ready',
+    url: 'wss://lk.invalid',
+    livekit_token: 'token',
+    expires_at: '2026-10-07T00:10:00Z',
+    attempt_id: 's',
+  },
 };
 
 interface Invocation {
@@ -97,14 +109,13 @@ interface Invocation {
 /** Every way the page calls each route, so optional request fields are exercised too. */
 const INVOCATIONS: Record<R1RouteName, Invocation[]> = {
   status: [{ label: 'status', run: () => r1Api.status(LINK) }],
-  consentTemplate: [{ label: 'template', run: () => r1Api.consentTemplate(LINK, 'en-IN') }],
+  consentTemplate: [{ label: 'template', run: () => r1Api.consentTemplate(LINK) }],
   consent: [
     {
       label: 'grant',
       run: () =>
         r1Api.submitConsent(LINK, {
           template_version: 'v1',
-          locale: 'en-IN',
           consents: ['ai_interview'],
           status: 'granted',
         }),
@@ -336,6 +347,13 @@ function contractProblems(specText: string): string[] {
         problems.push(`${where}: response does not mark ${field} required`);
       }
     }
+    // An optional field the page reads must still be one the server can send: a field the
+    // spec's closed (additionalProperties: false) schema does not list is a dead contract.
+    for (const field of contract.responseOptional) {
+      if (!hasProperty(responseText, field)) {
+        problems.push(`${where}: response lacks optional ${field}`);
+      }
+    }
   }
   return problems;
 }
@@ -354,11 +372,85 @@ describe('openapi.yaml documents the R1 candidate contract', () => {
     },
   );
 
+  it.skipIf(!SPEC_DOCUMENTS_R1_CANDIDATE_ROUTES)(
+    'accepts exactly the status vocabularies the spec documents (an unknown one fails closed)',
+    () => {
+      const spec = splitLines(REAL_SPEC);
+      const operation = (nested(nested(spec, 'paths', 0) ?? [], '/api/r1/status', 2) ?? []).join(
+        '\n',
+      );
+      const documented = (property: string): string[] | null => {
+        const match = new RegExp(
+          `\\b${property}:\\s*\\n\\s*type: string\\s*\\n\\s*enum: \\[([^\\]]*)\\]`,
+        ).exec(operation);
+        return match ? match[1].split(',').map((item) => item.trim()).sort() : null;
+      };
+      expect(documented('round_status')).toEqual([...R1_STATUS_VOCABULARY.round_status].sort());
+      expect(documented('availability')).toEqual([...R1_STATUS_VOCABULARY.availability].sort());
+      expect(documented('state')).toEqual([...R1_STATUS_VOCABULARY.consent_state].sort());
+    },
+  );
+
   it('finds the real spec, and tells candidate routes from the admin and worker ones', () => {
     expect(REAL_SPEC).toContain('openapi: 3.0.3');
     expect(REAL_SPEC).toMatch(/^paths:/m);
     // /api/internal/r1/* and /api/admin/r1/* are not candidate routes.
     expect(/^ {2}\/api\/(internal|admin)\/r1\//m.test(REAL_SPEC)).toBe(true);
+  });
+});
+
+// ── The error codes the web acts on are the server's ──────────────────────────
+
+const SERVER_SOURCE_PATH = resolve(
+  process.cwd(),
+  '..',
+  'api',
+  'src',
+  'routes',
+  'r1-candidate.ts',
+);
+const SERVER_SOURCE = existsSync(SERVER_SOURCE_PATH) ? readFileSync(SERVER_SOURCE_PATH, 'utf8') : '';
+/** The candidate routes of the spec: from the first /api/r1/ path to the next, unrelated one. */
+const CANDIDATE_SPEC = (() => {
+  const from = REAL_SPEC.indexOf('\n  /api/r1/status:');
+  const to = REAL_SPEC.indexOf('\n  /api/health:');
+  return from > -1 && to > from ? REAL_SPEC.slice(from, to) : '';
+})();
+
+describe('the error codes the web acts on are the ones the server answers', () => {
+  it('pins the three codes the page relies on most, by name', () => {
+    for (const code of ['r1_attempt_not_live', 'consent_template_stale', 'round_expired']) {
+      expect(R1_SERVER_ERROR_CODES, code).toContain(code);
+    }
+  });
+
+  it.skipIf(!SPEC_DOCUMENTS_R1_CANDIDATE_ROUTES || SERVER_SOURCE === '')(
+    'every code the page names is answered by r1-candidate.ts and named in the candidate spec ' +
+      '(a renamed code would turn a precise message into the generic one)',
+    () => {
+      expect(CANDIDATE_SPEC.length).toBeGreaterThan(1000);
+      const unanswered = R1_SERVER_ERROR_CODES.filter(
+        (code) => !SERVER_SOURCE.includes(`'${code}'`),
+      );
+      const undocumented = R1_SERVER_ERROR_CODES.filter(
+        (code) => !new RegExp(`\\b${code}\\b`).test(CANDIDATE_SPEC),
+      );
+      expect({ unanswered, undocumented }).toEqual({ unanswered: [], undocumented: [] });
+    },
+  );
+
+  it('would notice a code that is no longer there', () => {
+    const answered = (code: string, source: string) => source.includes(`'${code}'`);
+    expect(answered('r1_attempt_not_live', "refuse(res, 409, 'r1_attempt_not_live');")).toBe(true);
+    expect(answered('r1_attempt_not_live', "refuse(res, 409, 'r1_attempt_gone');")).toBe(false);
+    const named = (code: string, text: string) => new RegExp(`\\b${code}\\b`).test(text);
+    expect(named('round_expired', '409: round_expired, round_not_admissible')).toBe(true);
+    expect(named('round_expired', '409: round_expired_early')).toBe(false);
+  });
+
+  it('declares no field the spec does not document (the attempts `lead` was one)', () => {
+    expect(R1_CONTRACT.attempts.responseOptional).not.toContain('lead');
+    expect(Object.keys(FULL_RESPONSES.attempts as object)).not.toContain('lead');
   });
 });
 
@@ -485,9 +577,9 @@ describe('the contract checker', () => {
       'POST /api/r1/attempts: request lacks optional nonce',
     ]);
     const mandatory = syntheticSpec((name, parts) => {
-      if (name === 'status') parts.request = without(parts.request, 'link_token');
+      if (name === 'status') parts.request = without(parts.request, 'token');
     });
-    expect(contractProblems(mandatory)).toEqual(['POST /api/r1/status: request lacks link_token']);
+    expect(contractProblems(mandatory)).toEqual(['POST /api/r1/status: request lacks token']);
   });
 
   it('names a response field the parser needs but the server does not send', () => {
@@ -499,23 +591,34 @@ describe('the contract checker', () => {
     expect(contractProblems(spec)).toEqual(['POST /api/r1/exchange: response lacks livekit_token']);
   });
 
-  it('names a response field the server may omit although the parser requires it', () => {
+  it('names an optional response field the spec does not document (a dead contract field)', () => {
     const spec = syntheticSpec((name, parts) => {
-      if (name === 'attempts') parts.required = without(parts.required, 'nonce');
+      if (name === 'attempts') parts.response = without(parts.response, 'rejoin');
+      if (name === 'status') parts.response = without(parts.response, 'audience');
     });
     expect(contractProblems(spec)).toEqual([
-      'POST /api/r1/attempts: response does not mark nonce required',
+      'POST /api/r1/status: response lacks optional audience',
+      'POST /api/r1/attempts: response lacks optional rejoin',
+    ]);
+  });
+
+  it('names a response field the server may omit although the parser requires it', () => {
+    const spec = syntheticSpec((name, parts) => {
+      if (name === 'attempts') parts.required = without(parts.required, 'attempt_token');
+    });
+    expect(contractProblems(spec)).toEqual([
+      'POST /api/r1/attempts: response does not mark attempt_token required',
     ]);
   });
 
   it('does not take a field of an error response for the success response', () => {
     const spec = syntheticSpec((name, parts) => {
       if (name !== 'status') return;
-      parts.response = without(parts.response, 'state');
-      parts.required = without(parts.required, 'state');
-      parts.refusal = [...parts.refusal, 'state'];
+      parts.response = without(parts.response, 'round_status');
+      parts.required = without(parts.required, 'round_status');
+      parts.refusal = [...parts.refusal, 'round_status'];
     });
-    expect(contractProblems(spec)).toEqual(['POST /api/r1/status: response lacks state']);
+    expect(contractProblems(spec)).toEqual(['POST /api/r1/status: response lacks round_status']);
   });
 
   it('reports every route for a spec that documents none of them', () => {

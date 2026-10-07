@@ -154,3 +154,78 @@ async function r1Session(req: Request, res: Response): Promise<any | null> { con
 r1InternalRouter.post('/context', workerAuth, async (req, res, next) => { try { const session = await r1Session(req, res); if (!session) return; const [{ data: candidate }, { data: attempt }, { data: settings }] = await Promise.all([supabase.from('candidates').select('name').eq('id', session.candidate_id).single(), supabase.from('interview_round_attempts').select('round_id,attempt_number,persona_id,persona_version,persona_variant,content_sha').eq('session_id', session.id).single(), supabase.from('r1_settings').select('enabled,paused,advance_threshold,hold_threshold,livekit_target').eq('singleton', true).single()]); const raw = typeof candidate?.name === 'string' ? candidate.name.trim().split(/\s+/)[0] : ''; const first_name = /^[A-Za-z '-]{1,24}$/.test(raw) ? raw : 'there'; res.json({ first_name, round_id: session.interview_round_id, attempt_id: session.id, attempt, settings }); } catch (e) { next(e); } });
 r1InternalRouter.post('/usage', workerAuth, async (req, res, next) => { try { const session = await r1Session(req, res); if (!session) return; const body = req.body ?? {}; const key = typeof body.event_key === 'string' ? body.event_key : ''; const max = body.participant_kind === 'preflight' ? 15 : 1830; const occurred = body.occurred_at ? new Date(body.occurred_at).getTime() : Date.now(); if (!['candidate','agent','preflight','manual_test'].includes(body.participant_kind) || !Number.isFinite(body.seconds) || body.seconds < 0 || body.seconds > max || !/^[A-Za-z0-9:_-]{1,128}$/.test(key) || !Number.isFinite(occurred) || Math.abs(Date.now() - occurred) > 120_000) return res.status(400).json({ error: 'invalid_usage' }); const { data, error } = await supabase.rpc('r1_record_usage', { p_session_id: session.id, p_round_id: session.interview_round_id, p_participant_kind: body.participant_kind, p_event: body.event === 'disconnect' ? 'disconnect' : 'connect', p_seconds: body.seconds, p_event_key: key }); if (error) return res.status(503).json({ error: 'service_unavailable' }); res.status(data?.duplicate ? 200 : 201).json({ ok: true, duplicate: !!data?.duplicate }); } catch (e) { next(e); } });
 r1InternalRouter.post('/admin-log', workerAuth, async (req, res, next) => { try { const session = await r1Session(req, res); if (!session) return; const body = req.body ?? {}; if (!ADMIN_LOG_EVENTS.includes(body.event_type) || (body.turn_index !== undefined && (!Number.isInteger(body.turn_index) || body.turn_index < 0)) || (body.payload !== undefined && (typeof body.payload !== 'object' || Array.isArray(body.payload)))) return res.status(400).json({ error: 'invalid_admin_log' }); const { error } = await supabase.from('r1_admin_log').insert({ session_id: session.id, round_id: session.interview_round_id, event_type: body.event_type, turn_index: body.turn_index ?? null, family_id: typeof body.family_id === 'string' ? body.family_id.slice(0, 64) : null, payload: body.payload ?? {} }); if (error) throw error; res.status(201).json({ ok: true }); } catch (e) { next(e); } });
+
+/**
+ * Worker-reported attempt outcome (PR-3; payload fixed by r1_persistence.py on
+ * origin/r1/pr4a-worker-core: `{ attempt_id, outcome }`, posted after the
+ * durable terminal write, best-effort).
+ *
+ * `attempt_id` is the attempt's `session_id`. The count-or-not decision (plan
+ * D1: an attempt counts once TRANSITION has started; no-shows, early exits and
+ * system failures never count) is made by `r1_settle_attempt` in one
+ * transaction with the round's `attempts_counted`, so a retry can neither
+ * double-count nor lose a count. The route is deliberately NOT gated on
+ * R1_ENABLED: a worker must always be able to settle.
+ *
+ * The SESSION must be settled too (plan 8.3: the session is an R1 session in an
+ * allowed state). `r1_settle_attempt` refuses, atomically with its locks, an
+ * outcome for a session that is not a terminal browser session of the attempt's
+ * own round, and `complete` for one that is not `completed`. The worker secret
+ * is shared with the phone worker, and the R1 worker posts an outcome even when
+ * its terminal write failed; counting a live or failed session as complete
+ * would close the round with nothing to score. Refused outcomes are 409
+ * `r1_session_not_settled` and change nothing, which the worker logs and moves
+ * past (fail safe: not counted).
+ *
+ * 201 first settlement, 200 identical replay, 409 a different outcome for an
+ * already-settled attempt or a session that is not settled, 404 unknown attempt
+ * (the worker treats it as a logged, non-fatal compatibility condition).
+ */
+const R1_ATTEMPT_OUTCOMES: ReadonlySet<string> = new Set([
+  'complete',
+  'candidate_left',
+  'no_show',
+  'provider_error',
+  'residency_timeout',
+  'shutdown_forced',
+  'configuration_failed',
+  'context_failed',
+]);
+
+r1InternalRouter.post('/attempt-outcome', workerAuth, async (req, res, next) => {
+  try {
+    const body = req.body ?? {};
+    if (
+      typeof body.attempt_id !== 'string'
+      || !UUID.test(body.attempt_id)
+      || typeof body.outcome !== 'string'
+      || !R1_ATTEMPT_OUTCOMES.has(body.outcome)
+    ) {
+      return res.status(400).json({ error: 'invalid_attempt_outcome' });
+    }
+    const { data, error } = await supabase.rpc('r1_settle_attempt', {
+      p_session_id: body.attempt_id,
+      p_outcome: body.outcome,
+    });
+    if (error || !data) return res.status(503).json({ error: 'service_unavailable' });
+    if (data.status === 'ok') {
+      return res.status(201).json({ ok: true, counted: data.counted === true, duplicate: false });
+    }
+    if (data.status === 'duplicate') {
+      return res.status(200).json({ ok: true, counted: data.counted === true, duplicate: true });
+    }
+    if (data.status === 'attempt_not_found') {
+      return res.status(404).json({ error: 'r1_attempt_not_found' });
+    }
+    if (data.status === 'outcome_conflict') {
+      return res.status(409).json({ error: 'r1_outcome_conflict' });
+    }
+    if (data.status === 'session_not_settled') {
+      return res.status(409).json({ error: 'r1_session_not_settled' });
+    }
+    if (data.status === 'invalid_outcome') {
+      return res.status(400).json({ error: 'invalid_attempt_outcome' });
+    }
+    return res.status(503).json({ error: 'service_unavailable' });
+  } catch (e) { next(e); }
+});

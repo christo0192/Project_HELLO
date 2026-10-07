@@ -7,8 +7,10 @@ import {
   type R1Phase,
 } from '../../lib/r1/r1-phase';
 import { InterviewerAura } from '../candidate-join/InterviewerAura';
+import { R1ConsentExit } from './R1ConsentExit';
 import { R1LeadCardView } from './R1LeadCard';
 import { R1PhaseLabel } from './R1PhaseLabel';
+import { R1_WITHDRAW_QUESTIONS } from './r1-copy';
 
 interface R1LiveViewProps {
   roleTitle: string;
@@ -27,6 +29,15 @@ interface R1LiveViewProps {
   onToggleMic: () => void;
   onToggleCamera: () => void;
   onLeave: () => void;
+  /**
+   * Take the consent back from inside the room. It ends the interview at once and cannot be
+   * rejoined, which is why it is a separate control from Leave (that one can be rejoined for
+   * 90 seconds). Absent, no control is shown.
+   */
+  onWithdraw?: () => void;
+  withdrawBusy?: boolean;
+  /** Why the last withdrawal did not go through; the interview is still on. */
+  withdrawError?: string | null;
 }
 
 /**
@@ -50,6 +61,9 @@ export function R1LiveView({
   onToggleMic,
   onToggleCamera,
   onLeave,
+  onWithdraw,
+  withdrawBusy = false,
+  withdrawError = null,
 }: R1LiveViewProps) {
   const [confirmingLeave, setConfirmingLeave] = useState(false);
   const videoElementRef = useRef<HTMLVideoElement>(null);
@@ -111,6 +125,15 @@ export function R1LiveView({
           <p className="candidate-error" role="alert">
             {error}
           </p>
+        )}
+        {onWithdraw && (
+          <R1ConsentExit
+            kind="withdraw"
+            question={R1_WITHDRAW_QUESTIONS.live}
+            busy={withdrawBusy}
+            error={withdrawError}
+            onConfirm={onWithdraw}
+          />
         )}
       </div>
 

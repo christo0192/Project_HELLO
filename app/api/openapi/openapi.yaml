@@ -182,6 +182,511 @@ paths:
       tags: [r1]
       operationId: writeR1AdministrationLog
       responses: { '201': { description: Trusted, bounded R1 administration event } }
+  /api/internal/r1/attempt-outcome:
+    post:
+      tags: [r1]
+      operationId: settleR1AttemptOutcome
+      summary: Settle a worker-reported attempt outcome (worker bearer; idempotent)
+      description: 'Payload fixed by the R1 worker core (r1_persistence.py): attempt_id is the attempt session id and outcome is one of the worker outcomes. Applies plan decision D1 in one transaction (r1_settle_attempt): an attempt counts once TRANSITION has started; no-shows, early exits and system failures never count. A counted attempt also closes the round (status completed) in the same step. The attempt''s session must be settled: a terminal browser session of the attempt''s own round, and a completed one for outcome complete (409 r1_session_not_settled otherwise, nothing changes). 201 first settlement, 200 identical replay, 409 a different outcome for an already-settled attempt or a session that is not settled, 404 unknown attempt. Never gated on the R1 master switch.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [attempt_id, outcome]
+              properties:
+                attempt_id:
+                  type: string
+                  format: uuid
+                outcome:
+                  type: string
+                  enum: [complete, candidate_left, no_show, provider_error, residency_timeout, shutdown_forced, configuration_failed, context_failed]
+      responses:
+        '201':
+          description: First settlement of this attempt.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, counted, duplicate]
+                properties:
+                  ok:
+                    type: boolean
+                  counted:
+                    type: boolean
+                  duplicate:
+                    type: boolean
+        '200':
+          description: Identical replay; the stored count decision is returned.
+        '400':
+          description: Invalid attempt id or outcome.
+        '404':
+          description: Unknown attempt.
+        '409':
+          description: A different outcome was already recorded (r1_outcome_conflict), or the attempt's session is not settled yet or does not match (r1_session_not_settled).
+  /api/r1/status:
+    post:
+      tags: [r1]
+      operationId: r1CandidateStatus
+      summary: Landing state for an R1 link (link token; public by exact path)
+      description: 'Authenticated by the link token only. Reports the round state, attempts left, whether consent is needed, the interview format, an availability notice (open, paused, disabled) and the audience (candidate or staff dry run). Never returns a digest, the persona, the candidate name or any other candidate data. An unknown link is one stable 404.'
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  pattern: '^[a-f0-9]{64}$'
+      responses:
+        '200':
+          description: Link state.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [round_status, expires_at, availability, attempts_allowed, attempts_remaining, starts_remaining, consent, live_attempt, can_start, role_title, format, audience]
+                properties:
+                  round_status:
+                    type: string
+                    enum: [invited, in_progress, completed, expired, cancelled]
+                  audience:
+                    type: string
+                    enum: [candidate, staff]
+                    description: 'Whom the interview is for, from the round (interview_rounds.consent_locale; server-owned, never chosen by the client). `staff` is an internal dry run: its consent notice says no decision is made about the person, so the page words its closing screens for the project team rather than a hiring team. Anything that is not the staff notice reads `candidate`, the stricter wording.'
+                  expires_at:
+                    type: string
+                    format: date-time
+                  availability:
+                    type: string
+                    enum: [open, paused, disabled]
+                  attempts_allowed:
+                    type: integer
+                  attempts_remaining:
+                    type: integer
+                  starts_remaining:
+                    type: integer
+                  consent:
+                    type: object
+                    additionalProperties: false
+                    required: [state, template_version]
+                    properties:
+                      state:
+                        type: string
+                        enum: [granted, required, declined, withdrawn]
+                      template_version:
+                        type: string
+                        nullable: true
+                  live_attempt:
+                    type: boolean
+                  can_start:
+                    type: boolean
+                  role_title:
+                    type: string
+                    nullable: true
+                  format:
+                    type: object
+                    additionalProperties: false
+                    required: [duration_minutes, camera_required, microphone_required, interviewer, includes_role_play]
+                    properties:
+                      duration_minutes:
+                        type: integer
+                      camera_required:
+                        type: boolean
+                      microphone_required:
+                        type: boolean
+                      interviewer:
+                        type: string
+                      includes_role_play:
+                        type: boolean
+        '400':
+          description: Request validation failed.
+        '404':
+          description: Stable unknown-or-expired link response (r1_link_invalid_or_expired).
+        '503':
+          description: Database unavailable (service_unavailable).
+  /api/r1/consent-template:
+    post:
+      tags: [r1]
+      operationId: r1CandidateConsentTemplate
+      summary: The R1 consent notice this link is owed (link token; public by exact path)
+      description: 'Authenticated by the link token, which travels in the body (never a URL or query string). The notice is chosen by the SERVER from the round (interview_rounds.consent_locale: the candidate notice en-IN, or the staff dry-run notice en-IN-x-staff); there is no locale in the request, and a request that names one is a 400. Reads interview_round_consent_templates only (never the legacy consent_templates). consent_items carries the wording of each required agreement for that audience and is omitted when any required key has none. Absence fails closed with 503 consent_template_unavailable and no Legal copy is invented. A locale whose newest version is older than another active locale''s is not served either (same 503): admission accepts max(version) across locales, so a grant against it could never become valid. An unknown link is one stable 404.'
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  pattern: '^[a-f0-9]{64}$'
+      responses:
+        '200':
+          description: The active template for this round's audience.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [version, locale, title, body_md, required_consents]
+                properties:
+                  version:
+                    type: string
+                  locale:
+                    type: string
+                    enum: [en-IN, en-IN-x-staff]
+                  title:
+                    type: string
+                  body_md:
+                    type: string
+                  required_consents:
+                    type: array
+                    items:
+                      type: string
+                  consent_items:
+                    type: array
+                    description: The wording each required agreement carries at the point of consent, in the order of required_consents. Omitted when any required key has no wording.
+                    items:
+                      type: object
+                      additionalProperties: false
+                      required: [type, label]
+                      properties:
+                        type:
+                          type: string
+                        label:
+                          type: string
+        '400':
+          description: Request validation failed (a malformed token, or any key other than token such as a locale).
+        '404':
+          description: Stable unknown-or-expired link response (r1_link_invalid_or_expired).
+        '503':
+          description: No usable active template for the round's audience (consent_template_unavailable), or database unavailable (service_unavailable).
+  /api/r1/consent:
+    post:
+      tags: [r1]
+      operationId: submitR1Consent
+      summary: Record the candidate's R1 consent or decline (link token)
+      description: 'Writes interview_round_consents only. The template is the one the SERVER owes this round (interview_rounds.consent_locale), never one the client names: there is no locale in the request and a request that carries one is a 400. A grant must carry every consent the template requires and name that exact template version (409 consent_template_stale otherwise); a live consent for an older template is superseded. A grant for an audience whose newest version is behind another active locale''s is refused (503 consent_template_unavailable): admission accepts max(version) across locales. A decline is recorded as an immediately-withdrawn row with decision declined, which flags the HR card; declining after granting is a withdrawal stored as declined. A decline is not gated by the R1 kill switch (the human-interview alternative is always open); a grant is. If a live interview could not be stopped the answer is 503 r1_withdraw_incomplete (same body as consent/withdraw) and a retry re-attempts the room delete.'
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token, template_version, consents, status]
+              properties:
+                token:
+                  type: string
+                  pattern: '^[a-f0-9]{64}$'
+                template_version:
+                  type: string
+                consents:
+                  type: array
+                  items:
+                    type: string
+                status:
+                  type: string
+                  enum: [granted, declined]
+      responses:
+        '201':
+          description: Consent recorded.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, consents, template_version, locale, created_at]
+                properties:
+                  id:
+                    type: string
+                  status:
+                    type: string
+                    enum: [granted, declined]
+                  consents:
+                    type: array
+                    items:
+                      type: string
+                  template_version:
+                    type: string
+                  locale:
+                    type: string
+                  created_at:
+                    type: string
+                    format: date-time
+        '200':
+          description: The same valid consent was already in force (already_granted).
+        '400':
+          description: Validation failed, or a required consent is missing (required_consents_missing).
+        '404':
+          description: Stable unknown-or-expired link response (r1_link_invalid_or_expired).
+        '409':
+          description: Stale template (consent_template_stale), round not admissible (round_not_admissible), concurrent grant (consent_conflict), or R1 disabled (r1_disabled; grants only).
+        '503':
+          description: No usable active template (consent_template_unavailable), database unavailable (service_unavailable), or a decline that could not stop a live interview (r1_withdraw_incomplete).
+  /api/r1/consent/withdraw:
+    post:
+      tags: [r1]
+      operationId: withdrawR1Consent
+      summary: Withdraw R1 consent and stop any live interview (link token; never gated)
+      description: 'Always available: not gated by the R1 kill switch, maintenance mode or the round state. Sets withdrawn_at on the live consent (which blocks preflight, admission, exchange, scoring and status writes), deletes the live room and cancels a created or waiting session so the single R1 slot is freed. Idempotent. The grant''s evidence (IP prefix, user agent, template version, captured_at) is kept; the withdrawal''s own context is stored beside it. When a live interview could not be stopped the consent IS withdrawn but the answer is 503 r1_withdraw_incomplete, never 200, and a retry re-attempts the room delete.'
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  pattern: '^[a-f0-9]{64}$'
+      responses:
+        '200':
+          description: Withdrawal recorded (withdrawn=false when no consent was live).
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, withdrawn, sessions_stopped]
+                properties:
+                  ok:
+                    type: boolean
+                  withdrawn:
+                    type: boolean
+                  sessions_stopped:
+                    type: integer
+        '400':
+          description: Request validation failed.
+        '404':
+          description: Stable unknown-or-expired link response (r1_link_invalid_or_expired).
+        '503':
+          description: The withdrawal could not be recorded (service_unavailable), or it was recorded but a live interview could not be stopped (r1_withdraw_incomplete); retry.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                    enum: [service_unavailable, r1_withdraw_incomplete]
+                  withdrawn:
+                    type: boolean
+                    description: A live consent was withdrawn by this call.
+                  sessions_live:
+                    type: integer
+                  sessions_stopped:
+                    type: integer
+                  retry_after_sec:
+                    type: integer
+  /api/r1/preflight:
+    post:
+      tags: [r1]
+      operationId: r1CandidatePreflight
+      summary: Camera and microphone A/V check room (link token + consent; at most 10 per link, 3 per minute)
+      description: 'Gate order: link, round state, valid R1 consent, maintenance, R1 enabled and not paused, endpoint matches the settings, then an atomic per-link reservation (r1_reserve_preflight) BEFORE the room exists. Creates a disposable room (preflight marker; never dispatches an interviewer) cut at 12 s, and returns a token that can publish microphone and camera only, cannot subscribe or publish data. 429 r1_preflight_limit (10 per link) or r1_preflight_rate_limited (3 per minute).'
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  pattern: '^[a-f0-9]{64}$'
+      responses:
+        '200':
+          description: Short-lived diagnostic connection credentials and the pass policy.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [url, livekit_token, expires_at, policy_version, max_seconds, min_audio_packets, min_video_frames]
+                properties:
+                  url:
+                    type: string
+                  livekit_token:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+                  policy_version:
+                    type: string
+                  max_seconds:
+                    type: integer
+                  min_audio_packets:
+                    type: integer
+                  min_video_frames:
+                    type: integer
+        '400':
+          description: Request validation failed.
+        '404':
+          description: Stable unknown-or-expired link response (r1_link_invalid_or_expired).
+        '409':
+          description: Consent required (consent_required), R1 disabled or paused (r1_disabled, r1_paused), or round not admissible (round_not_admissible).
+        '429':
+          description: Per-link preflight cap reached (r1_preflight_limit) or three in the last minute (r1_preflight_rate_limited, with retry_after_sec).
+        '503':
+          description: Maintenance, endpoint mismatch (r1_endpoint_mismatch), R1 unavailable (r1_unavailable: no worker gate on the R1 SFU, or the Cloud fallback while the legacy browser lane is enabled), room unavailable (r1_room_unavailable), or service unavailable (service_unavailable).
+  /api/r1/attempts:
+    post:
+      tags: [r1]
+      operationId: createR1Attempt
+      summary: Admit an R1 attempt (link token) or rejoin a live one (link token + nonce)
+      description: 'Without a nonce: runs r1_admit_attempt (budget, concurrency, starts, consent, one live R1) and returns an attempt token plus a per-attempt nonce that only the creating tab keeps; 409 r1_busy when another interview is finishing. Refused with 503 r1_unavailable BEFORE admission while DeepSeek is unhealthy (cached probe), so an outage spends no start and no capacity. With the nonce: re-mints an attempt token for the attempt that is still live and admits nothing. The persona is never returned.'
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [token]
+              properties:
+                token:
+                  type: string
+                  pattern: '^[a-f0-9]{64}$'
+                nonce:
+                  type: string
+                  pattern: '^[a-f0-9]{64}$'
+      responses:
+        '201':
+          description: Attempt admitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [attempt_id, attempt_number, attempt_token, attempt_token_expires_at, nonce, rejoin]
+                properties:
+                  attempt_id:
+                    type: string
+                    format: uuid
+                  attempt_number:
+                    type: integer
+                  attempt_token:
+                    type: string
+                  attempt_token_expires_at:
+                    type: string
+                    format: date-time
+                  nonce:
+                    type: string
+                  rejoin:
+                    type: boolean
+        '200':
+          description: Rejoin; a fresh attempt token for the live attempt. The nonce is NOT returned again (the client already holds it; it only ever travels on the 201).
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [attempt_id, attempt_number, attempt_token, attempt_token_expires_at, rejoin]
+                properties:
+                  attempt_id:
+                    type: string
+                    format: uuid
+                  attempt_number:
+                    type: integer
+                  attempt_token:
+                    type: string
+                  attempt_token_expires_at:
+                    type: string
+                    format: date-time
+                  rejoin:
+                    type: boolean
+        '400':
+          description: Request validation failed.
+        '404':
+          description: Stable unknown-or-expired link (r1_link_invalid_or_expired) or invalid-attempt (r1_attempt_invalid) response.
+        '409':
+          description: Refused by admission (r1_busy, consent_required, r1_disabled, r1_paused, r1_capacity_exhausted, starts_exhausted, attempts_exhausted, round_expired, round_not_admissible) or, for a rejoin, because the attempt is no longer live (r1_attempt_not_live).
+        '503':
+          description: Maintenance, endpoint mismatch (r1_endpoint_mismatch), R1 unavailable (r1_unavailable: DeepSeek unhealthy or unconfigured with retry_after_sec, no worker gate on the R1 SFU, or the Cloud fallback while the legacy browser lane is enabled; all refused before admission spends a start), or service unavailable (service_unavailable).
+  /api/r1/exchange:
+    post:
+      tags: [r1]
+      operationId: exchangeR1Attempt
+      summary: Exchange an attempt token + nonce for a candidate LiveKit join (egress-free R1 room)
+      description: 'Gate order for a new start: attempt token and nonce, session and round state, consent, maintenance, R1 settings and endpoint, DeepSeek health probe (3 s, cached 60 s; zero LiveKit cost on failure), then room creation WITHOUT egress (room metadata lane=r1), the browser worker gate (idempotent: a dispatch that already has a job is never re-gated; a job-less one is replaced once stale; ready before dispatch, dispatch at most once) and the token. A rejoin of a waiting attempt re-asserts its marked room before the worker gate (idempotent; a provider failure is 503 r1_room_unavailable with no token). On the R1 SFU the worker gate is required (fence 7): with no gate the exchange answers 503 r1_unavailable before anything is provisioned, and a disabled gate verdict is a 202 preparing, never a token. A dispatch only counts as a running interviewer while it owns a live job. 202 preparing while a worker boots. The token publishes camera and microphone only, no data, no metadata updates, 10 minute TTL, signed with the secret of the selected endpoint (R1 when BROWSER_LIVEKIT_TARGET=r1, otherwise Cloud).'
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [attempt_token, nonce]
+              properties:
+                attempt_token:
+                  type: string
+                nonce:
+                  type: string
+                  pattern: '^[a-f0-9]{64}$'
+      responses:
+        '200':
+          description: Connection details.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [url, livekit_token, expires_at, attempt_id]
+                properties:
+                  url:
+                    type: string
+                  livekit_token:
+                    type: string
+                  expires_at:
+                    type: string
+                    format: date-time
+                  attempt_id:
+                    type: string
+                    format: uuid
+        '202':
+          description: A worker is being prepared (or, on the R1 SFU, the worker gate reported disabled); retry after retry_after_sec with the same attempt token and nonce. No token is issued.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status, retry_after_sec]
+                properties:
+                  status:
+                    type: string
+                    enum: [preparing]
+                  retry_after_sec:
+                    type: integer
+        '400':
+          description: Request validation failed.
+        '404':
+          description: One stable answer for an unknown attempt, wrong or expired token, or wrong nonce (r1_attempt_invalid).
+        '409':
+          description: Attempt ended (r1_attempt_ended), consent required (consent_required), round not admissible (round_not_admissible), or R1 disabled or paused (r1_disabled, r1_paused).
+        '503':
+          description: R1 unavailable (r1_unavailable: DeepSeek unhealthy or unconfigured with retry_after_sec, no worker gate on the R1 SFU, or the Cloud fallback while the legacy browser lane is enabled), maintenance, endpoint mismatch (r1_endpoint_mismatch), room unavailable (r1_room_unavailable, including a failed re-assert of a waiting attempt's room), or service unavailable (service_unavailable); the attempt stays valid.
   # ── Health ──────────────────────────────────────────────────────────
   /api/health:
     get:

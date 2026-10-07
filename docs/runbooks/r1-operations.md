@@ -603,13 +603,30 @@ metric keys or weights differ from the rubric (see "Wrong scorecard").
 ## Room-routing contract
 
 R1 selection requires both `R1_LANE_MODE=r1_only` on the browser worker and
-the API-authored room metadata JSON marker `{"lane":"r1"}`. The marker is set
-only when the session being provisioned is an R1 round (`interview_round_id`
-is not null) AND API provisioning selected the R1 endpoint; browser clients
-cannot set room metadata. A session and an endpoint that disagree (an R1 round
-on the Cloud endpoint, or a legacy session while `BROWSER_LIVEKIT_TARGET=r1`)
-fail provisioning closed with `r1_lane_mismatch` before any provider call (no room
-is created, updated or deleted, in either provisioning mode).
+the API-authored room metadata JSON marker `{"lane":"r1"}`. Browser clients
+cannot set room metadata. The marker is always derived from the session, never
+from the endpoint alone, under two rules:
+
+- The R1 exchange (`POST /api/r1/exchange`, provisioning with `lane: 'r1'`) marks
+  its room on EITHER SFU, the R1 SFU or the Cloud fallback, but only for an R1
+  round session: it requires `interview_round_id`, otherwise provisioning fails
+  closed with `r1_lane_mismatch`. The room is egress-free and carries the R1 limits
+  on both.
+- Every other caller (`/api/livekit/start` and exchange, Ashby) keeps the agreement
+  rule: the marker is set only when the session is an R1 round (`interview_round_id`
+  is not null) AND API provisioning selected the R1 endpoint. A session and an
+  endpoint that disagree (an R1 round on the Cloud endpoint, or a legacy session
+  while `BROWSER_LIVEKIT_TARGET=r1`) fail provisioning closed with `r1_lane_mismatch`
+  before any provider call (no room is created, updated or deleted, in either
+  provisioning mode).
+
+The R1 exchange also re-asserts the marked room of a `waiting` attempt on EVERY
+exchange, before the worker gate (R1 sessions stay `waiting` for the whole
+interview, so this is every refresh). The room lapses after 180 s empty and a
+refusing worker deletes it; on the R1 SFU (no auto-create) a missing room would
+otherwise be a permanent `preparing` loop, and on Cloud the join would auto-create
+an UNMARKED room. The re-assert is idempotent and a provider failure answers 503
+`r1_room_unavailable` with no token. `in_progress` attempts are left alone.
 
 The same fence runs in `/api/livekit/exchange` for a session whose room already
 exists (`waiting` or `in_progress`, for example a recruiter `/start` before a flip),
@@ -637,7 +654,10 @@ room (worker `r1_only` with legacy rooms, or API target `r1` with a worker in mo
 TOGETHER, inside a drained, maintenance-mode window with no `created`, `waiting` or
 `in_progress` session on either lane: follow the fallback flip procedure below, and
 set `R1_LANE_MODE` and `BROWSER_LIVEKIT_TARGET` in the same window. Never flip only
-one of them.
+one of them. The API refuses part of the mismatch itself: target `r1` with no worker
+gate, and the Cloud fallback while the legacy browser lane is enabled, both answer
+`503 r1_unavailable` (see "Fence 7 on the R1 candidate routes" and "Cloud fallback
+guard" below); a worker in the wrong mode is still only visible as refused rooms.
 
 Teardown budget. A drain never wakes a running interview by itself: livekit-agents 1.6.4
 `Worker.drain` only waits for the running jobs (up to `R1_DRAIN_TIMEOUT_SEC`, 60 s), and
@@ -727,6 +747,28 @@ API behaviour with target `r1` only (with Cloud none of it runs):
   `BROWSER_AGENT_NAME`, or a `disabled` gate verdict yields no token: `503
   screening_room_unavailable` (invite unconsumed) or `preparing`. Never turn
   `WORKER_ORCHESTRATION` off on the API while target is `r1`.
+- **Fence 7 on the R1 candidate routes.** `/api/r1/*` is not the legacy exchange
+  and has no invite, so it carries the same fence itself. With target `r1` and no
+  worker gate (`WORKER_ORCHESTRATION` off, an empty or malformed
+  `BROWSER_AGENT_NAME`), `/preflight`, `/attempts` and the exchange of a new or
+  `waiting` attempt answer `503 r1_unavailable` BEFORE admission, provisioning, any
+  room or any start spent, and a `disabled` gate verdict answers `202 preparing`
+  (`retry_after_sec`), never a token. Nothing auto-dispatches on the R1 SFU, so
+  proceeding without a gate would mint a token into an interviewer-less room. On
+  Cloud nothing changes: the unnamed worker auto-dispatches.
+- **Dead jobs do not count.** The R1 exchange's rejoin check reads a dispatch as a
+  running interviewer only while it owns a LIVE job (the same `jobIsLive` rule as
+  above: `JS_SUCCESS`, `JS_FAILED` or a set `endedAt` is over). A finished job left
+  in the room is replaced like a dropped dispatch, never minted into.
+
+Cloud fallback guard (target Cloud, the one R1 rule that runs on Cloud). While the
+legacy browser lane is enabled (`LEGACY_BROWSER_SCREENING_ENABLED` not `false`), the
+Cloud browser worker must stay in `R1_LANE_MODE=off` to serve legacy rooms, so it
+would refuse and delete every marked R1 room AFTER a start and capacity were spent.
+The R1 new-work gate (`/preflight`, `/attempts`, a new exchange) therefore answers
+`503 r1_unavailable` before admission spends anything. The API's `fly.toml` sets the
+switch to `false`, so this is a no-op in production today; it is the API-side
+backstop for the worker-mode pairing, not a substitute for the flip procedure.
 
 Deploy order and skew safety:
 

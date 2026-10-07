@@ -16,7 +16,8 @@
  *
  * Invariants:
  *  1. Room metadata is minimal and carries no candidate PII (session id, room
- *     name, correlation id only) — mirrors invites.ts invariant 4.
+ *     name, correlation id and, for an R1 room, the `lane: r1` routing marker)
+ *     — mirrors invites.ts invariant 4.
  *  2. Cloud authoritative egress is started BEFORE the session is published as
  *     joinable. R1 records in-worker and explicitly skips egress because its
  *     SFU has none. For Cloud, an enabled egress start failure aborts
@@ -35,13 +36,26 @@
  *     the mode simply never deletes; an orphan room self-reaps at
  *     ROOM_EMPTY_TIMEOUT_SEC and no token was ever minted for it.
  *  5. The R1 lane marker (`lane:r1` room metadata, which authorizes a worker to
- *     run R1) is derived from the SESSION (an R1 round: `interviewRoundId`), and
- *     must agree with the selected endpoint. A disagreement either way fails
- *     closed (`r1_lane_mismatch`) before any provider call, so a legacy session
- *     is never marked just because the endpoint is R1, and an R1 round is never
- *     left unmarked on the Cloud endpoint. Cloud room args stay byte-identical.
- *     The same predicate (`r1LaneMismatch`) guards the exchange route for a session
- *     whose room already exists, so no token is ever minted across a lane mismatch.
+ *     run R1) is derived from the SESSION (an R1 round: `interviewRoundId`), never
+ *     from the endpoint alone, in two rules:
+ *       - The R1 exchange (`lane: 'r1'`, routes/r1-candidate.ts) marks its room on
+ *         EITHER SFU, the R1 SFU or the Cloud fallback, but only for an R1 round
+ *         session: it REQUIRES a non-empty `interviewRoundId`, otherwise it fails
+ *         closed as `r1_lane_mismatch` before any provider call.
+ *       - Every other caller keeps the agreement rule: the marker is set only when
+ *         an R1 round session meets the R1 endpoint, and a disagreement either way
+ *         fails closed (`r1_lane_mismatch`) before any provider call, so a legacy
+ *         session is never marked just because the endpoint is R1, and an R1 round
+ *         is never left unmarked on the Cloud endpoint by those callers. Cloud room
+ *         args stay byte-identical.
+ *     The agreement predicate (`r1LaneMismatch`) also guards the legacy
+ *     `/api/livekit/exchange` route for a session whose room already exists, so no
+ *     token is ever minted across a lane mismatch.
+ *  6. `existing_session` is idempotent for a session that is already `waiting` with
+ *     this room: the create converges the marker and limits on an existing room
+ *     (or re-creates a lapsed one), the `created` -> `waiting` CAS reports a conflict
+ *     and the re-read adopts it (`adopted: true`). The R1 exchange relies on this to
+ *     re-assert the marked room of a `waiting` attempt on every rejoin.
  */
 
 import { supabase } from './supabase.js';
@@ -67,7 +81,8 @@ export const R1_ROOM_METADATA_LANE_VALUE = 'r1';
 /**
  * R1 rooms outlive the candidate's departure by the worker's 90 s rejoin grace plus a
  * 30 s margin. LiveKit's server default (20 s) would close the room, and cancel the
- * agent job, before the reconnect window ends. Cloud/legacy rooms never set it.
+ * agent job, before the reconnect window ends. Set for every marked R1 room (the R1
+ * exchange marks on either SFU); unmarked Cloud/legacy rooms never set it.
  */
 export const R1_ROOM_DEPARTURE_TIMEOUT_SEC = 120;
 
@@ -131,13 +146,27 @@ export interface ProvisionRoomDeps {
   startRecording?: typeof startAuthoritativeRecording;
   /**
    * `call_sessions.interview_round_id` of the session being provisioned. A non-empty
-   * value marks an R1 round session. The room is marked `lane:r1` only when that
-   * agrees with the selected endpoint; a disagreement in either direction (an R1
-   * round on a non-R1 endpoint, or a legacy session on the R1 endpoint) fails
-   * provisioning closed as `r1_lane_mismatch`, before any provider call.
+   * value marks an R1 round session. Without `lane: 'r1'` (the legacy invite exchange
+   * and every other caller) the room is marked `lane:r1` only when that agrees with the
+   * selected endpoint; a disagreement in either direction (an R1 round on a non-R1
+   * endpoint, or a legacy session on the R1 endpoint) fails provisioning closed as
+   * `r1_lane_mismatch`, before any provider call.
    */
   interviewRoundId?: string | null;
+  /**
+   * Set by the R1 exchange only (routes/r1-candidate.ts), which has authenticated an R1
+   * attempt. An R1 room is always marked `lane: r1`, never runs LiveKit egress and uses
+   * the R1 room limits, on whichever SFU `browserLiveKitEndpoint()` selected: the R1 SFU,
+   * or the Cloud fallback. It REQUIRES a non-empty `interviewRoundId` (the session must be
+   * an R1 round session) or provisioning fails closed as `r1_lane_mismatch`. Omitted for
+   * every other caller, so the browser and phone rooms are provisioned exactly as before.
+   */
+  lane?: 'r1';
 }
+
+/** R1 rooms hold one candidate and one agent; the third seat is head-room (plan 4 step 7). */
+export const R1_ROOM_EMPTY_TIMEOUT_SEC = 180;
+export const R1_ROOM_MAX_PARTICIPANTS = 3;
 
 export type ProvisionRoomMode = 'new_session' | 'existing_session';
 
@@ -203,11 +232,11 @@ export async function provisionRoomForCreatedSession(
   const roomName = roomNameForSession(sessionId);
   const r1Round = typeof deps.interviewRoundId === 'string' && deps.interviewRoundId.length > 0;
   const r1Endpoint = endpoint.target === 'r1';
-  const metadata = buildMinimalRoomMetadata(
-    sessionId,
-    roomName,
-    r1Round && r1Endpoint ? 'r1' : 'cloud',
-  );
+  // The R1 exchange marks its own rooms on either SFU; every other caller gets the marker
+  // only when an R1 round session meets the R1 endpoint (anything else is refused below).
+  const r1Exchange = deps.lane === 'r1';
+  const r1Lane = r1Exchange ? r1Round : r1Round && r1Endpoint;
+  const metadata = buildMinimalRoomMetadata(sessionId, roomName, r1Lane ? 'r1' : 'cloud');
   const rooms = deps.rooms ?? roomClient(endpoint);
   const db = deps.db ?? supabase;
   const startRecording = deps.startRecording ?? startAuthoritativeRecording;
@@ -215,16 +244,17 @@ export async function provisionRoomForCreatedSession(
   try {
     // The R1 marker authorizes a worker to run R1, so it must come from the session
     // (an R1 round), never from the endpoint alone. Checked before any provider call.
-    if (r1LaneMismatch(deps.interviewRoundId, endpoint)) {
+    // The R1 exchange may use either SFU, but only for an R1 round session.
+    if (r1Exchange ? !r1Round : r1LaneMismatch(deps.interviewRoundId, endpoint)) {
       throw new Error(R1_LANE_MISMATCH_ERROR);
     }
     try {
       await rooms.createRoom({
         name: roomName,
-        emptyTimeout: ROOM_EMPTY_TIMEOUT_SEC,
-        maxParticipants: ROOM_MAX_PARTICIPANTS,
+        emptyTimeout: r1Lane ? R1_ROOM_EMPTY_TIMEOUT_SEC : ROOM_EMPTY_TIMEOUT_SEC,
+        maxParticipants: r1Lane ? R1_ROOM_MAX_PARTICIPANTS : ROOM_MAX_PARTICIPANTS,
         metadata,
-        ...(r1Endpoint ? { departureTimeout: R1_ROOM_DEPARTURE_TIMEOUT_SEC } : {}),
+        ...(r1Lane ? { departureTimeout: R1_ROOM_DEPARTURE_TIMEOUT_SEC } : {}),
       });
     } catch {
       // Room already exists (retry, or a concurrent provisioner) — converge
@@ -235,7 +265,7 @@ export async function provisionRoomForCreatedSession(
     // R1 records in its worker. It has no LiveKit Egress service, so never
     // construct the Cloud egress client for an R1 room. Cloud retains the
     // existing authoritative-egress gate, including required-egress failures.
-    const recording = r1Endpoint
+    const recording = r1Lane
       ? { kind: 'no_egress' as const }
       : { kind: 'egress' as const, result: await startRecording(roomName, sessionId) };
     if (
