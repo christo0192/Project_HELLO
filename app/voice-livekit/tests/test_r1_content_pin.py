@@ -27,7 +27,8 @@ import r1_scheduler
 import r1_script
 import r1_world
 
-PINNED_CONTENT_SHA256 = "ab7b22c2757137f9ef87c1843ce951689db0e9bf858900a9f43604ca39e96b90"
+# Revision 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
+PINNED_CONTENT_SHA256 = "f2f72df832367fc7345c9991cf5bf6c75f16ec9d92ef1bc1e8013fb51193219f"
 
 CONTENT_MODULES = (
     "r1_text",

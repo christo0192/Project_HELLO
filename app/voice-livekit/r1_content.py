@@ -28,7 +28,8 @@ import r1_scheduler
 import r1_script
 import r1_world
 
-CONTENT_REVISION = 1
+# 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
+CONTENT_REVISION = 2
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -117,6 +118,7 @@ def manifest() -> dict[str, Any]:
         "prompts": {
             "interviewer_prefix": r1_prompts.interviewer_prefix(),
             "wrapup_note": r1_prompts.WRAPUP_NOTE,
+            "getting_to_know_you_note": r1_prompts.GETTING_TO_KNOW_YOU_NOTE,
             "learner_prefixes": {
                 f"{p.id}.{v.id}": r1_prompts.learner_prefix(r1_personas.resolve_persona(
                     p.id, variant=v.id

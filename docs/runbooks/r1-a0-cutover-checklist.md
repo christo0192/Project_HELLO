@@ -104,9 +104,11 @@ Equivalent raw form of one query, for reference:
       #350 PR-5 scorer (0122), #351 PR-7 HR web, #352 PR-L legacy retirement,
       #353 PR-4b content, #354 PR-CT consent (0123), #355 PR-2b capacity (0119).
 - [ ] **The PR-4b integration is merged: `<PR-4b integration PR #>`** (branch
-      `r1/pr4b-integration`). Until it is, the worker does not post
-      `session_facts`, and every A0 session fails the scoring gate
-      (`fidelity_facts_missing`).
+      `r1/pr4b-integration`) **and so is the smoke-readiness worker fix** (it
+      renames the admin-log payload keys to the API parser's and posts
+      `session_facts`; #358 alone did neither). Until both are, every A0 session
+      fails the scoring gate (`fidelity_facts_missing`) and the scorer is told
+      false facts (`NOT PROBED`, `slip not reported`).
 - [ ] The owner has decided whether PR-4c (latency) and PR-dep (freeze worker
       dependencies) must land before A0. This checklist assumes they do not.
 
@@ -690,12 +692,18 @@ Look for:
 - Ledger rows for `candidate` and `agent` (and the preflight), with plausible
   seconds; `v_r1_budget_month` moved by about one session (the 55-minute hold
   converted to booked minutes).
-- `r1_admin_log` contains `session_facts` (the PR-4b integration posts it before
-  the terminal transition). Without it the gate fails closed.
+- `r1_admin_log` contains `session_facts` (the worker posts it before the terminal
+  transition, with every key the API parser reads; `first_audio_p95_ms` is an
+  explicit null until PR-4c measures first-audio latency). Without the row the
+  gate fails closed with `fidelity_facts_missing`.
 - The `r1.assessment` job ran: `assessed = true`, a `recommendation` and
   `overall`, `status_write = flag_off` (auto-status is off) or `human_review`
-  with the reason in the assessment. `human_review` on every session is the
-  symptom of a missing `session_facts` (wrong order or no integration).
+  with the reason in the assessment. `human_review` on every session is
+  expected for now: the gate still lists `latency_unknown` (PR-4c) and, until the
+  API stops requiring an F1 push line (F1 is anchor + counter), `push_missing:f1`.
+  `fidelity_facts_missing`, `family_slip_unknown`, `unprobed_reveal` or
+  `roleplay_duration_unknown` mean the worker's rows no longer match the parser
+  (wrong order, or key drift: `tests/test_r1_admin_contract.py` pins the names).
 - The browser lease is back to `stopped` with a null host, and the Machine is
   stopped (the reaper released it). A Machine left `started` is a reaper fault.
 

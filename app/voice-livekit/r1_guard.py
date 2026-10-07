@@ -45,7 +45,10 @@ What it blocks (each category logs as ``r1_guard_<category>``):
     caste or health ("how old are you", "do you have kids"); the bare words are sales
     vocabulary ("convince parents to enrol their children", "sold health insurance").
 ``scripted_cue``
-    The scripted exit line imitated by the LLM.
+    The scripted exit line imitated by the LLM; and, in the opening and the icebreaker, the
+    LLM announcing the role-play itself ("Now let's move into the role-play...").  The
+    driver alone starts the role-play (the scripted transition line), so an improvised start
+    would be a second one.
 ``ack_format``
     Hygiene, not a leak: an acknowledgement sentence with a question, a digit or a product
     word that is not a card answer or a paraphrase of one.  The sentence is dropped, but
@@ -246,6 +249,22 @@ _PROTECTED = _ci(
     r"devices?|equipment|sales|clients?|accounts?|portfolio|territory))"
     r"|\bany (?:health|medical) (?:issues?|conditions?|problems?|concerns?)\b"
     r"|\bdo you have (?:a |any )?(?:disabilit\w+|illness\w*|chronic\w*)\b|\bare you disabled\b",
+)
+# The interviewer ANNOUNCING the role-play in the getting-to-know-you part.  A statement that
+# looks forward ("let's move into the role-play", "we'll start the role play", "I'll play a
+# prospective learner") is the driver's job, never the model's.  Repeating the candidate's own
+# history ("you ran role-plays for new hires") has no such marker and passes, as does any
+# question.
+_ROLEPLAY_WORD = r"role[- ]?play(?:s|ing|ed)?"
+_ROLEPLAY_ANNOUNCE = _ci(
+    r"\b(?:let'?s|let us|shall we|we\b|i(?:'ll| will|'m going to| am going to)|"
+    r"time (?:to|for)|ready (?:to|for)|about to|"
+    r"(?:move|moving|switch|switching|go|going|jump|jumping|dive|diving|get|getting|start|"
+    r"starting|begin|beginning|proceed|proceeding) (?:on )?(?:in)?to)\b[^.?!]{0,60}\b"
+    + _ROLEPLAY_WORD
+    + r"\b",
+    r"\bi(?:'ll| will|'m going to| am going to)\b[^.?!]{0,30}\bplay(?:ing)?\b[^.?!]{0,25}"
+    r"\b(?:learner|student|prospect|lead|customer)\b",
 )
 _ROLE_CONTEXT = _ci(
     r"\b(?:(?:this|the) role(?!-)|our shifts?|the shifts?|shift timings?|working days|"
@@ -543,6 +562,8 @@ def _interviewer_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
         hits.append(_hit(INVENTED_FACT, "role_fact_beyond_deck", sentence))
     if question and _PROTECTED.search(sentence):
         hits.append(_hit(PROTECTED_QUESTION, "protected_class", sentence))
+    if ctx.phase in SMALL_TALK_PHASES and not question and _ROLEPLAY_ANNOUNCE.search(sentence):
+        hits.append(_hit(SCRIPTED_CUE, "roleplay_announcement", sentence))
     return hits
 
 

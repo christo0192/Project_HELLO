@@ -55,6 +55,10 @@ _TRANSCRIPT_PHASE_ALIASES = {
 }
 # R is paused while role-play is in either of these (one continuous paused span).
 _PAUSED_PHASES = frozenset({R1Phase.ASIDE, R1Phase.PAUSED_DISCONNECTED})
+# Entering any of these means the role-play is over, however it ended: R stops counting.
+_AFTER_ROLEPLAY = frozenset(
+    {R1Phase.ROLEPLAY_EXIT, R1Phase.WRAPUP, R1Phase.CLOSING, R1Phase.FINISHING, R1Phase.ABORTED}
+)
 
 
 class R1PhaseMachine:
@@ -133,6 +137,7 @@ class R1PhaseMachine:
         self.started_at = clock()
         self.phase = R1Phase.PRE_JOIN
         self._roleplay_started: float | None = None
+        self._roleplay_ended: float | None = None
         self._roleplay_paused_at: float | None = None
         self._roleplay_pause_total = 0.0
         self._resume_phase: R1Phase | None = None
@@ -159,6 +164,12 @@ class R1PhaseMachine:
             self._roleplay_paused_at = None
         if self.phase is R1Phase.PAUSED_DISCONNECTED and target is not self.phase:
             self._resume_phase = None
+        if (
+            self._roleplay_started is not None
+            and self._roleplay_ended is None
+            and target in _AFTER_ROLEPLAY
+        ):
+            self._roleplay_ended = now  # R is final: the wrap-up is not role-play time
         self.phase = target
         # First entry wins: a rejoin must not restart a phase budget such as wrap-up's 2:00.
         self._phase_entered.setdefault(target, now)
@@ -209,13 +220,34 @@ class R1PhaseMachine:
 
     @property
     def roleplay_elapsed(self) -> float:
-        """Return role-play time excluding disconnect and mute/aside pauses."""
+        """Return role-play time excluding disconnect and mute/aside pauses.
+
+        R stops when the role-play ends (the exit line, the wrap-up or an abort is entered),
+        so the value read at the end of the session is the role-play's own length, not the
+        role-play plus the wrap-up: the trusted administration record and the plan 6.4 gate
+        (``R >= 10:00``) measure the role-play, not the session.
+        """
         if self._roleplay_started is None:
             return 0.0
+        end = self._clock() if self._roleplay_ended is None else self._roleplay_ended
         paused = self._roleplay_pause_total
         if self._roleplay_paused_at is not None:
-            paused += self._clock() - self._roleplay_paused_at
-        return max(0.0, self._clock() - self._roleplay_started - paused)
+            paused += end - self._roleplay_paused_at
+        return max(0.0, end - self._roleplay_started - paused)
+
+    @property
+    def roleplay_entered(self) -> bool:
+        """True once the role-play phase was ever entered."""
+        return self._roleplay_started is not None
+
+    @property
+    def roleplay_finished(self) -> bool:
+        """True once the role-play ended normally (the exit line was reached), at any later point.
+
+        Only ``ROLEPLAY_EXIT`` proves it: a role-play cut short by a stop goes straight to
+        ``CLOSING`` and never enters it.
+        """
+        return R1Phase.ROLEPLAY_EXIT in getattr(self, "_phase_entered", {})
 
     def icebreaker_should_end(self) -> bool:
         """Apply the soft four-turn exit and absolute 4:30 icebreaker deadline (both on S)."""

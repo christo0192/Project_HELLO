@@ -13,25 +13,35 @@ so the isolation rules are unit-testable without a session:
   role-play turns and the per-turn reminder.  An interviewer-phase call sees the interviewer
   prefix and only its own phase group.  Neither ever sees the scorer's world sheet, the
   rubric, a hidden need that has not been released, or another persona.
-* ``fidelity_events``: the trusted administration rows (``/api/internal/r1/admin-log``) that
-  carry the persona and content pins, the moves delivered with their transcript turn and the
-  guard trips.  The commitment outcome is deliberately NOT part of them: plan 5.8 makes it a
-  logged, non-evidence fact, and the scorer reads the administration log.
+* ``fidelity_events`` / ``session_facts_event``: the trusted administration rows
+  (``/api/internal/r1/admin-log``) that carry the persona and content pins, the moves
+  delivered with their transcript turn, the guard trips and the session facts.  The
+  commitment outcome is deliberately NOT part of them: plan 5.8 makes it a logged,
+  non-evidence fact, and the scorer reads the administration log.
+
+  THE PAYLOAD KEYS ARE THE API's, NOT THE WORKER'S.  The API stores a payload as sent and
+  ``parseR1AdministrationLog`` (``app/api/src/lib/r1/admin-log.ts``) reads exactly the names
+  below; any other name parses as unknown, the scorer is told ``NOT PROBED`` / ``slip not
+  reported``, and the gate fails closed.  ``tests/test_r1_admin_contract.py`` mirrors that key
+  set and fails when either side drifts.
 
 No I/O, no logging, no clock and no candidate text is kept beyond what the caller passes in.
 """
 from __future__ import annotations
 
 import hashlib
+import math
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
+from r1_guard import ACK_FORMAT
 from r1_personas import PERSONA_BY_ID, PERSONA_IDS, RenderedPersona, resolve_persona
 from r1_prompts import (
     ROLEPLAY_PHASE,
     assemble_messages,
     interviewer_prefix,
+    interviewer_reminder,
     learner_prefix,
     select_context,
 )
@@ -55,6 +65,52 @@ _MOVE_EVENTS: dict[str, tuple[str, str | None]] = {
     "F4-PUSH": ("push_delivered", "F4"),
     "L-TIME-CUE": ("time_cue", None),
 }
+
+# The guard kinds the API recognises (``GUARD_KINDS`` in admin-log.ts).  The gate acts on
+# ``commitment`` and ``concession`` (``out_of_level_*``) and counts every row toward its
+# three-hit limit; the rest are recorded for HR.
+GUARD_KINDS = ("commitment", "concession", "control", "persona", "feedback", "other")
+_GUARD_KIND = {
+    "commitment": "commitment",
+    "concession": "concession",
+    "control": "control",
+    "vendor": "control",
+    "evaluation": "control",
+    "meta": "control",
+    "scripted_cue": "control",
+    "persona_secret": "persona",
+    "volunteered_need": "persona",
+    "feedback": "feedback",
+    "hiring_comp": "feedback",
+}
+# The ``session_facts`` payload keys the API reads (admin-log.ts, ``R1SessionFacts``).
+SESSION_FACT_KEYS = (
+    "roleplay_seconds",
+    "talk_share_pct",
+    "longest_monologue_seconds",
+    "barge_in_count",
+    "question_count",
+    "interruption_count",
+    "first_audio_p95_ms",
+)
+
+
+def guard_kind(category: object) -> str:
+    """Map a worker guard category to the API's kind (anything unmapped is ``other``)."""
+    return _GUARD_KIND.get(str(category), "other")
+
+
+def _measured(value: object) -> int | float | None:
+    """A measured, finite, non-negative number; anything else is unknown (``None``).
+
+    The API parses every other value as unknown, so an unmeasured fact is sent as an explicit
+    ``None`` rather than a guess.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return value
 
 
 @dataclass(frozen=True)
@@ -143,7 +199,7 @@ def llm_messages(
         interviewer_prefix(),
         select_context(ordered, reply.phase),
         reply.candidate_text,
-        None,
+        interviewer_reminder(reply.phase),
     )
 
 
@@ -179,6 +235,13 @@ def fidelity_events(
 
     ``admin`` is ``RolePlayEngine.admin_log``.  Every row names transcript turn indices and
     carries the pins; none holds candidate text, a commitment outcome or a score.
+
+    The payload keys are the API parser's (see the module docstring): ``need`` and
+    ``probed_turn`` for a reveal, ``slip_seconds`` for a delivery, ``roleplay_seconds`` for the
+    time cue, ``amount_usd`` for a discount and ``kind`` for a guard hit.  The worker's own
+    finer detail (delivery clocks, release turns, the guard rule) rides along under names the
+    parser ignores.  Acknowledgement-format trips are hygiene, not leaks (``LEAK_CATEGORIES``),
+    and the API counts EVERY guard row toward its three-hit limit, so they are not posted.
     """
     events: list[dict[str, Any]] = []
     turn_map = {
@@ -203,8 +266,8 @@ def fidelity_events(
             need.get("revealed_transcript_turn"),
             None,
             {
-                "topic": need["topic"],
-                "probe_turn": need.get("probe_transcript_turn"),
+                "need": need["topic"],
+                "probed_turn": need.get("probe_transcript_turn"),
                 "followup_turn": need.get("followup_transcript_turn"),
                 "released_turn": need.get("released_transcript_turn"),
                 "revealed_turn": need.get("revealed_transcript_turn"),
@@ -218,21 +281,20 @@ def fidelity_events(
         if mapped is None:
             continue
         event_type, family = mapped
-        add(
-            event_type,
-            move.get("transcript_turn"),
-            family,
-            {
-                "move_id": move["id"],
-                "delivered_sec": move.get("delivered_sec"),
-                "deadline_sec": move.get("deadline_sec"),
-                "slip_sec": move.get("slip_sec"),
-                "lateness_sec": move.get("lateness_sec"),
-                "forced": move.get("forced"),
-                "issued": move.get("issued"),
-                "interruptions": move.get("interruptions"),
-            },
-        )
+        detail = {
+            "move_id": move["id"],
+            "slip_seconds": move.get("slip_sec"),
+            "delivered_sec": move.get("delivered_sec"),
+            "deadline_sec": move.get("deadline_sec"),
+            "lateness_sec": move.get("lateness_sec"),
+            "forced": move.get("forced"),
+            "issued": move.get("issued"),
+            "interruptions": move.get("interruptions"),
+        }
+        if event_type == "time_cue":
+            # The learner's time cue is read as the role-play clock R at delivery (about 11:00).
+            detail["roleplay_seconds"] = move.get("delivered_sec")
+        add(event_type, move.get("transcript_turn"), family, detail)
     discounts = admin.get("tracker", {}).get("discounts", {})
     for offer in discounts.get("offers", []):
         add(
@@ -240,21 +302,58 @@ def fidelity_events(
             turn_map.get(offer.get("turn")),
             None,
             {
-                "usd": offer.get("usd"),
+                "amount_usd": offer.get("usd"),
                 "conditional": offer.get("conditional"),
                 "value_before": offer.get("value_before"),
             },
         )
     for trip in guard_trips:
+        if trip.get("category") == ACK_FORMAT:
+            continue
         add(
             "guard_hit",
             trip.get("turn_index"),
             None,
             {
-                "category": trip.get("category"),
+                "kind": guard_kind(trip.get("category")),
                 "rule": trip.get("rule"),
                 "phase": trip.get("phase"),
                 "digest": trip.get("digest"),
             },
         )
     return events
+
+
+def session_facts_event(
+    admin: Mapping[str, Any] | None,
+    pins: Mapping[str, Any],
+    *,
+    roleplay_seconds: float,
+) -> dict[str, Any]:
+    """The one ``session_facts`` row the plan 6.4 gate cannot pass without.
+
+    Every key the API parser reads is present, so the row is the contract and not a subset of
+    it.  A value is a measured, finite, non-negative number, or ``None`` when the worker does
+    not measure it yet: the API parses ``None`` as unknown, which the gate fails closed on
+    (``first_audio_p95_ms`` is ``latency_unknown`` until the PR-4c latency tracker lands).
+    Measured today: the role-play clock R at its end, and the candidate's longest turn.
+    """
+    communication = (admin or {}).get("communication", {})
+    # The engine starts the longest turn at 0.0 and only raises it for a turn whose speaking
+    # time it was given; a real turn is never 0.0 s, so 0.0 means "never measured".
+    longest = _measured(communication.get("longest_candidate_turn_sec")) or None
+    facts = {
+        "roleplay_seconds": _measured(round(float(roleplay_seconds), 1)),
+        "talk_share_pct": None,
+        "longest_monologue_seconds": longest,
+        "barge_in_count": None,
+        "question_count": None,
+        "interruption_count": None,
+        "first_audio_p95_ms": None,
+    }
+    return {
+        "event_type": "session_facts",
+        "turn_index": None,
+        "family_id": None,
+        "payload": {"pins": dict(pins), **facts},
+    }

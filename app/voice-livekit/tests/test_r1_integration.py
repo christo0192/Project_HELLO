@@ -43,6 +43,7 @@ from r1_replies import (
     fidelity_pins,
     llm_messages,
     pick_persona_id,
+    session_facts_event,
 )
 from r1_roleplay import RolePlayEngine, TurnMode
 from r1_scheduler import F1_COUNTER, PLAN, SLIP_LIMIT_SEC
@@ -701,7 +702,7 @@ class TestOwedMoves(unittest.IsolatedAsyncioTestCase):
         )
         posted = [e for e in events if e["payload"].get("move_id") == plan.move_id]
         self.assertEqual(len(posted), 1)
-        self.assertEqual(posted[0]["payload"]["slip_sec"], late["slip_sec"])
+        self.assertEqual(posted[0]["payload"]["slip_seconds"], late["slip_sec"])
         self.assertEqual(posted[0]["payload"]["lateness_sec"], late["lateness_sec"])
 
     async def test_an_interrupted_move_stays_owed_and_is_issued_again(self) -> None:
@@ -976,8 +977,14 @@ class TestOutputGuardInEveryPhase(unittest.IsolatedAsyncioTestCase):
 
             return stream()
 
-        with self.assertRaisesRegex(RuntimeError, "reasoning_tokens"):
-            _ = [c async for c in rig.interview.llm_node_stream(SimpleNamespace(items=[]), provider)]
+        with capture_r1_logs() as lines:
+            spoken = [c async for c in rig.interview.llm_node_stream(SimpleNamespace(items=[]), provider)]
+        # The tainted reply is failed, not spoken: the candidate hears the safe fallback (a
+        # model failure never leaves them with silence), and the failure is counted.
+        self.assertEqual("".join(spoken).strip(), FALLBACK_REPLY)
+        self.assertNotIn("Hello.", "".join(spoken))
+        self.assertIn("r1_llm_reply_failed", error_types(lines))
+        self.assertEqual(rig.interview._failures, 1)
 
 
 class TestAcknowledgementIsOptionalTheOwedLineIsNot(unittest.IsolatedAsyncioTestCase):
@@ -1489,17 +1496,27 @@ class TestFidelityRecord(unittest.IsolatedAsyncioTestCase):
         counter = [e for e in events if e["event_type"] == "counter_delivered"]
         self.assertEqual([e["payload"]["move_id"] for e in counter], [F1_COUNTER])
         reveal = next(e for e in events if e["event_type"] == "need_revealed")
-        self.assertEqual(reveal["payload"]["topic"], "H1")
-        self.assertLessEqual(reveal["payload"]["probe_turn"], reveal["payload"]["released_turn"])
+        # The API's key names (admin-log.ts), not the worker's: ``need`` and ``probed_turn``.
+        self.assertEqual(reveal["payload"]["need"], "H1")
+        self.assertLessEqual(reveal["payload"]["probed_turn"], reveal["payload"]["released_turn"])
+        self.assertLessEqual(reveal["payload"]["probed_turn"], reveal["turn_index"])
         self.assertLessEqual(reveal["payload"]["released_turn"], reveal["payload"]["revealed_turn"])
         trip = next(e for e in events if e["event_type"] == "guard_hit")
-        self.assertEqual(trip["payload"]["category"], "control")
+        self.assertEqual(trip["payload"]["kind"], "control")
+        self.assertNotIn("category", trip["payload"])
         self.assertIn(trip["turn_index"], candidate_turns)
         # Every move row carries its slip and lateness, and no row carries text.
         for event in events:
             if event["event_type"] in ("family_delivered", "push_delivered", "counter_delivered"):
-                self.assertIn("slip_sec", event["payload"])
+                self.assertIn("slip_seconds", event["payload"])
+                self.assertNotIn("slip_sec", event["payload"])
                 self.assertIn("lateness_sec", event["payload"])
+        # The one session_facts row is posted, with the role-play clock at the role-play's end.
+        (facts,) = [e for e in events if e["event_type"] == "session_facts"]
+        self.assertIsNone(facts["turn_index"])
+        self.assertAlmostEqual(
+            facts["payload"]["roleplay_seconds"], rig.machine.roleplay_elapsed, delta=0.1
+        )
         blob = json.dumps(events)
         for text in (*cooperative_script(), ASK, OPENER, "language model"):
             self.assertNotIn(text, blob)
@@ -1544,11 +1561,12 @@ class TestFidelityRecord(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rig.writer.admin_events, [])
 
     async def expected_rows(self, rig: Rig) -> list[dict]:
-        return fidelity_events(
-            rig.engine.admin_log(final=True, r_end=rig.machine.roleplay_elapsed),
-            fidelity_pins(rig.interview.persona_choice),
-            rig.interview._guard_trips,
-        )
+        admin = rig.engine.admin_log(final=True, r_end=rig.machine.roleplay_elapsed)
+        pins = fidelity_pins(rig.interview.persona_choice)
+        return [
+            *fidelity_events(admin, pins, rig.interview._guard_trips),
+            session_facts_event(admin, pins, roleplay_seconds=rig.machine.roleplay_elapsed),
+        ]
 
     async def test_a_slow_route_does_not_truncate_the_record_because_rows_are_posted_together(
         self,
@@ -1583,9 +1601,11 @@ class TestFidelityRecord(unittest.IsolatedAsyncioTestCase):
         rig = await self.full_session()
         expected = await self.expected_rows(rig)
         important = [
-            e["event_type"] for e in expected if e["event_type"] in ("guard_hit", "discount_detected")
+            e["event_type"]
+            for e in expected
+            if e["event_type"] in ("guard_hit", "discount_detected", "session_facts")
         ]
-        self.assertTrue({"guard_hit", "discount_detected"} <= set(important))
+        self.assertTrue({"guard_hit", "discount_detected", "session_facts"} <= set(important))
         posted: list[str] = []
         keep = len(important) + 1
 
@@ -1636,16 +1656,15 @@ class TestFidelityRecord(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_record_is_queued_once(self) -> None:
         rig = await self.full_session()
-        expected = fidelity_events(
-            rig.engine.admin_log(final=True, r_end=rig.machine.roleplay_elapsed),
-            fidelity_pins(rig.interview.persona_choice),
-            rig.interview._guard_trips,
-        )
+        expected = await self.expected_rows(rig)
         rig.interview._begin_exit()
         rig.interview._queue_fidelity()
         rig.interview._queue_fidelity()
         await rig.flush()
         self.assertEqual(len(rig.writer.admin_events), len(expected))
+        self.assertEqual(
+            [e["event_type"] for e in rig.writer.admin_events].count("session_facts"), 1
+        )
 
     async def test_nothing_is_posted_for_a_session_that_never_reached_the_roleplay(self) -> None:
         rig = Rig()

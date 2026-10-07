@@ -42,8 +42,18 @@ phase:
   its text through ``r1_guard`` sentence by sentence in EVERY phase, before the transcription
   and TTS split.
 * ``_queue_fidelity`` posts the persona and content pins, the moves delivered with their
-  transcript turn and the guard trips to the existing admin-log route at exit, inside the
-  transcript drain's bound and before the terminal write.
+  transcript turn, the guard trips and the one ``session_facts`` row to the existing admin-log
+  route at exit, inside the transcript drain's bound and before the terminal write.  Their
+  payload keys are the API parser's (``r1_replies``; pinned by ``test_r1_admin_contract``).
+
+Three more facts shape the driver:
+
+* Every phase change is published as the participant attribute ``phase`` (``_enter``), which
+  the candidate's page follows; ``aborted`` marks a technical stop and ``ended`` closes the page.
+* A candidate's answer is matched on folded text (``fold_speech``: case, punctuation and
+  apostrophes removed), never on the raw transcript, so "No, thank you." is a refusal.
+* An ending that falls after the role-play (the candidate leaves, or the clock runs out, in
+  the exit line or the wrap-up) is ``complete``: the session is completed, scored and counted.
 """
 from __future__ import annotations
 
@@ -53,8 +63,9 @@ import inspect
 import math
 import os
 import re
-import string
 import time
+import unicodedata
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -72,6 +83,7 @@ from r1_replies import (
     fidelity_events,
     fidelity_pins,
     llm_messages,
+    session_facts_event,
 )
 from r1_prompts import ROLEPLAY_PHASE
 from r1_roleplay import RolePlayEngine, TurnMode, TurnPlan
@@ -109,12 +121,37 @@ _EXIT_BACKSTOP_SECONDS = (
     + 1.0
 )
 TURN_WRITE_SECONDS = 10.0
+# The participant attribute the candidate's page follows (``app/web/src/lib/r1/r1-phase.ts``,
+# ``R1_PHASE_ATTRIBUTE``).  It is ONE plain lowercase word on purpose: the livekit SDK rewrites
+# keys that contain separators (``lk.agent.name`` arrives as ``lkAgentName``, #332), so this
+# key and its values are the same on both ends.  The values are ``R1Phase`` values plus the
+# terminal ``ended``; ``aborted`` marks a technical stop and must be the last phase before it.
+PHASE_ATTRIBUTE = "phase"
+# One background phase write.  The ``ended`` write has its own, scaled bound
+# (``ENDED_ATTRIBUTE_SECONDS``) inside the teardown budget; these never run during teardown
+# because ``_announce_ended`` cancels the writer first.
+PHASE_PUBLISH_SECONDS = 3.0
+_PHASE_QUEUE_MAX = 16
+# Outcomes that are OUR fault: the candidate's page must say so (``phase=aborted``) rather
+# than "Interview complete".
+_TECHNICAL_OUTCOMES = frozenset(
+    {
+        "provider_error",
+        "shutdown_forced",
+        "residency_timeout",
+        "configuration_failed",
+        "context_failed",
+    }
+)
+# Outcomes of an ending nobody is told off for: the candidate chose to go, or the interview
+# finished.  The finishing speech is the closing line (or nothing), never the apology.
+_QUIET_OUTCOMES = frozenset({"candidate_left", "complete"})
 # The fidelity record is posted a few rows at a time: the route costs two database round trips
 # per row, and a one-by-one post of a 10-20 row record can outlast the shared drain bound.  The
 # rows the plan 6.4 gate and the negotiation evidence need go first, so a record that is cut
-# short loses the least important rows, never the guard hits or the discounts.
+# short loses the least important rows, never the guard hits, the discounts or the facts.
 FIDELITY_POST_CONCURRENCY = 4
-_FIDELITY_ROW_PRIORITY = {"guard_hit": 0, "discount_detected": 1}
+_FIDELITY_ROW_PRIORITY = {"session_facts": 0, "guard_hit": 0, "discount_detected": 1}
 REPLY_APPEAR_SECONDS = 5.0
 REPLY_SETTLE_SECONDS = 30.0
 # Candidate-silence windows (plan section 5.11; production values 30/20 in fly.toml).
@@ -154,15 +191,38 @@ _SESSION_ID_FROM_ROOM = re.compile(
     r"^screening-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
     re.IGNORECASE,
 )
-_READY_RE = re.compile(r"\bready\b", re.IGNORECASE)
-# These are intentionally narrow equivalents of an explicit ready response.
-_READY_ALLOWLIST = {"let's start", "lets start", "go ahead", "yes"}
+# Speech-to-text hands over punctuation and casing the candidate never "said" ("No, thank
+# you.", "Let's start.", "Sure!").  EVERY phrase test below runs on ``fold_speech`` of the
+# transcript, never on the raw text, so a comma, a full stop or a capital cannot change an
+# answer.  The regexes and allowlists are written for folded text: lower case, no punctuation,
+# single spaces, and an apostrophe only inside a word ("that's").
+_READY_RE = re.compile(r"\bready\b")
+# These are intentionally narrow equivalents of an explicit ready response, matched whole.
+_READY_ALLOWLIST = frozenset(
+    {
+        "let's start", "lets start", "let's begin", "lets begin", "let's go", "lets go",
+        "go ahead", "go on", "start", "begin",
+        "yes", "yes please", "yeah", "yep", "sure", "sure thing", "of course",
+        "okay", "ok", "alright", "all right",
+    }
+)
 # The phrases that say "I have nothing to ask".  They are only the first half of the test:
-# ``is_no_questions`` also requires that nothing but courtesy surrounds them.
+# ``is_no_questions`` also requires that nothing but courtesy surrounds them.  The longer
+# phrases come first and the bare "no" is LAST so that the longest reading wins; "no" is
+# safe on its own because any word after it that is not courtesy keeps the turn a question.
 _NO_QUESTIONS_RE = re.compile(
-    r"\b(?:no questions?|no thanks?|no thank you|nothing(?: else)?|nope|nah|"
-    r"i'?m good|i am good|that'?s all|that is all|all good)\b",
-    re.IGNORECASE,
+    r"\b(?:"
+    r"(?:i )?(?:do not|don't|dont|have no|got no)(?: have)?(?: any)?"
+    r"(?: more| other| further)? questions?|"
+    r"no(?: more| other| further)? questions?|"
+    r"no thanks?|no thank you|"
+    r"nothing(?: else| more| from my (?:side|end))?|"
+    r"nope|nah|"
+    r"not really|not (?:at the moment|right now|for now|at this time)|"
+    r"that'?s (?:all|it)|that is (?:all|it)|"
+    r"i'?m (?:good|all set|fine)|i am (?:good|all set|fine)|all (?:good|set)|"
+    r"no"
+    r")\b"
 )
 # Courtesy and filler: the ONLY words allowed next to a refusal.  This is an allowlist on
 # purpose.  A list of question words can never be complete ("any feedback for me", "the
@@ -173,17 +233,19 @@ _COURTESY_WORDS = frozenset(
     {
         "no", "thanks", "thank", "you", "so", "very", "much", "a", "lot", "really", "again",
         "too", "great", "bye", "goodbye", "ok", "okay", "um", "uh", "well", "oh", "and",
+        # A lead-in or an affirmation around the refusal ("Yeah, I'm good.", "I think I'm
+        # good."): a real request always carries a word that is not on this list.
+        "yeah", "yep", "yes", "sure", "i", "think",
     }
 )
-# Words are what is left between whitespace and punctuation (an apostrophe stays inside
-# "that's"), whatever their script: a digit or a non-Latin word is never courtesy.
-_WORD_BREAK_RE = re.compile(
-    r"[\s"
-    + re.escape(string.punctuation.replace("'", ""))
-    + chr(0x2013)
-    + chr(0x2014)
-    + chr(0x2026)
-    + "]+"
+# Every apostrophe look-alike folds to the ASCII one (Sarvam may emit U+2019).
+_APOSTROPHES = frozenset("'’‘ʼ`´")
+# An apostrophe that is not between two word characters is a quote mark, not part of a word.
+_EDGE_APOSTROPHES = re.compile(r"(?<!\w)'+|'+(?!\w)")
+# The phases in which a candidate turn can be answered by the model; every other phase is
+# driver-owned (its lines are scripted), so a model failure never matters there.
+_REPLY_PHASES = frozenset(
+    {R1Phase.OPENING, R1Phase.ICEBREAKER, R1Phase.ROLEPLAY, R1Phase.ASIDE, R1Phase.WRAPUP}
 )
 # The agent is "quiet" in these states; thinking and speaking are agent activity.
 _QUIET_AGENT_STATES = frozenset({"listening", "idle"})
@@ -309,20 +371,43 @@ def _is_candidate_microphone(participant: Any, publication: Any, identity: str |
     )
 
 
+def fold_speech(text: object) -> str:
+    """Normalise a transcript for phrase matching: case, punctuation, apostrophes, spacing.
+
+    Lower-cases, turns every punctuation mark and symbol into a space, folds the apostrophe
+    look-alikes to ``'`` (kept only inside a word), and collapses runs of whitespace.  Letters
+    of every script are kept as they are, so a non-Latin word is still a word that no
+    allowlist knows ("No, thank you." -> "no thank you"; "Let’s start!" -> "let's start").
+    """
+    folded: list[str] = []
+    for char in str(text or "").lower():
+        if char in _APOSTROPHES:
+            folded.append("'")
+        elif unicodedata.category(char)[0] in ("P", "S"):
+            folded.append(" ")
+        else:
+            folded.append(char)
+    return " ".join(_EDGE_APOSTROPHES.sub(" ", "".join(folded)).split())
+
+
 def is_no_questions(text: str) -> bool:
     """Return true only for a refusal wrapped in nothing but courtesy ("no questions, thanks").
 
-    The refusal phrases are cut out of ``text`` and EVERY word left must be courtesy or
-    filler (``_COURTESY_WORDS``).  So a question never has to be recognised: a word the
-    list does not know keeps the turn for the interviewer, whatever it opens with ("nothing
-    else, the notice period", "no thanks, any idea when results come").  A question mark
-    keeps the turn too, even when the rest is courtesy ("no questions?"): the interviewer
-    answers it, and an unneeded reply costs far less than a swallowed question.
+    The transcript is folded first (``fold_speech``), so "No.", "No, thank you." and "Nope!"
+    are the refusals they sound like.  The refusal phrases are cut out and EVERY word left
+    must be courtesy or filler (``_COURTESY_WORDS``).  So a question never has to be
+    recognised: a word the list does not know keeps the turn for the interviewer, whatever it
+    opens with ("nothing else, the notice period", "no thanks, any idea when results come").
+    A question mark keeps the turn too, even when the rest is courtesy ("no questions?"): the
+    interviewer answers it, and an unneeded reply costs far less than a swallowed question.
     """
-    if "?" in text or _NO_QUESTIONS_RE.search(text) is None:
+    if "?" in text or "？" in text:
         return False
-    rest = _NO_QUESTIONS_RE.sub(" ", text).lower()
-    return all(word in _COURTESY_WORDS for word in _WORD_BREAK_RE.split(rest) if word)
+    folded = fold_speech(text)
+    if _NO_QUESTIONS_RE.search(folded) is None:
+        return False
+    rest = _NO_QUESTIONS_RE.sub(" ", folded)
+    return all(word in _COURTESY_WORDS for word in rest.split())
 
 
 def _agent_turn_handling() -> dict[str, Any]:
@@ -486,6 +571,14 @@ class R1Interview:
         self._transition_nudged = False
         self._goodbye_spoken = False
         self._ended_announced = False
+        # The phase attribute the candidate's page follows: values wait here in order and one
+        # background writer sends them, so a slow write can neither reorder them nor stall
+        # the interview.  ``aborted`` (a technical stop) is sticky: nothing may follow it.
+        self._phase_queue: deque[str] = deque()
+        self._phase_task: asyncio.Future[Any] | None = None
+        self._phase_last_queued: str | None = None
+        self._abort_requested = False
+        self._abort_published = False
         # True: the activation CAS was applied. False: known NOT applied. None: unknown
         # (it timed out, errored or was cancelled, so it may still land from its thread).
         self._activated: bool | None = False
@@ -598,29 +691,122 @@ class R1Interview:
 
     # ------------------------------------------------------------------ exit
 
+    # ------------------------------------------------------------- phase attribute
+
+    def _enter(self, phase: R1Phase, *, publish: bool = True) -> None:
+        """Move the phase machine and tell the candidate's page (every move goes through here).
+
+        The page labels the interview from the ``phase`` attribute and shows the role-play lead
+        card only in the role-play phases (``r1-phase.ts``), so a transition that is not
+        published leaves it on its fallback label for the whole interview.
+        """
+        self.machine.transition(phase)
+        if publish:
+            self._publish_phase(phase.value)
+
+    def _begin_disconnect(self) -> None:
+        """Pause for a disconnect (the page is told ``paused_disconnected``)."""
+        self.machine.begin_disconnect()
+        self._publish_phase(self.machine.phase.value)
+
+    def _rejoin(self) -> None:
+        """Resume the interrupted phase and tell the page which one it is."""
+        self._publish_phase(self.machine.rejoin().value)
+
+    def _publish_phase(self, value: str) -> None:
+        """Queue one phase value for the background writer; never blocks, never raises.
+
+        Values are sent in order, one write at a time.  Nothing is queued after ``ended`` (the
+        page has left) or after ``aborted`` (the page reads the phase BEFORE ``ended`` to tell
+        a technical stop from a finished interview, so ``aborted`` must be the last one).
+        """
+        if self._ended_announced or value == self._phase_last_queued:
+            return
+        if self._abort_requested and value != "aborted":
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:  # no loop, nobody to publish to (a bare synchronous caller)
+            return
+        self._phase_last_queued = value
+        self._phase_queue.append(value)
+        while len(self._phase_queue) > _PHASE_QUEUE_MAX:
+            self._phase_queue.popleft()
+        if self._phase_task is None or self._phase_task.done():
+            task = asyncio.ensure_future(self._phase_pump())
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+            self._phase_task = task
+
+    def _publish_abort(self) -> None:
+        """Tell the page this is a technical stop on our side (``phase=aborted``)."""
+        if self._abort_requested:
+            return
+        self._abort_requested = True
+        self._publish_phase("aborted")
+
+    async def _phase_pump(self) -> None:
+        """Send the queued phase values in order, each on its own short bound."""
+        while self._phase_queue:
+            await self._write_phase(self._phase_queue.popleft(), PHASE_PUBLISH_SECONDS)
+
+    async def _write_phase(self, value: str, bound: float | None) -> bool:
+        """Set the ``phase`` participant attribute once; True when the write was made.
+
+        A room that is not connected, or that has no local participant yet, is skipped quietly
+        (nobody can be listening); a failed write is logged by type and swallowed, because a
+        label must never stop an interview or its exit.  ``bound`` None leaves the bound to
+        the caller (the ``ended`` write shares one bound with the ``aborted`` write before it).
+        """
+        failure = "r1_phase_ended_failed" if value == "ended" else "r1_phase_publish_failed"
+        room = getattr(self.ctx, "room", None)
+        try:
+            isconnected = getattr(room, "isconnected", None)
+            if callable(isconnected) and not isconnected():
+                return False
+            local_participant = getattr(room, "local_participant", None)
+            set_attributes = getattr(local_participant, "set_attributes", None)
+            if not callable(set_attributes):
+                return False
+            write = _maybe_await(set_attributes({PHASE_ATTRIBUTE: value}))
+            if bound is None:
+                await write
+            else:
+                await asyncio.wait_for(write, bound)
+        except Exception as exc:  # noqa: BLE001 - never block the interview or the exit funnel
+            _log.warn("unknown_event", error_type=failure, error_category=_error_type_of(exc))
+            return False
+        if value == "aborted":
+            self._abort_published = True
+        return True
+
     async def _announce_ended(self) -> None:
         """Publish ``phase=ended`` so the candidate's page leaves; idempotent and bounded.
 
         Called right after the closing line has played, and again by the room-close
         step as a fallback for exits that never played one.  The plain lowercase key
-        is deliberate (the SDK camel-cases attribute keys, #332).
+        is deliberate (the SDK camel-cases attribute keys, #332).  The background writer is
+        stopped first, and ``aborted`` (when this is a technical stop whose ``aborted`` has not
+        gone out yet) is written just before ``ended`` inside the SAME bound, so the page can
+        tell a stop on our side from a finished interview and the teardown budget is unchanged.
         """
         if self._ended_announced:
             return
         self._ended_announced = True
-        room = getattr(self.ctx, "room", None)
+        task, self._phase_task = self._phase_task, None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        pending_abort = self._abort_requested and not self._abort_published
+        self._phase_queue.clear()
+
+        async def publish() -> None:
+            if pending_abort:
+                await self._write_phase("aborted", None)
+            await self._write_phase("ended", None)
+
         try:
-            isconnected = getattr(room, "isconnected", None)
-            if callable(isconnected) and not isconnected():
-                return
-            local_participant = getattr(room, "local_participant", None)
-            set_attributes = getattr(local_participant, "set_attributes", None)
-            if not callable(set_attributes):
-                return
-            await asyncio.wait_for(
-                _maybe_await(set_attributes({"phase": "ended"})),
-                _scaled(ENDED_ATTRIBUTE_SECONDS),
-            )
+            await asyncio.wait_for(publish(), _scaled(ENDED_ATTRIBUTE_SECONDS))
         except Exception as exc:  # noqa: BLE001 - never block the exit funnel
             _log.warn(
                 "unknown_event",
@@ -737,12 +923,26 @@ class R1Interview:
             return
         self._fidelity_queued = True
         engine = self._engine
-        if engine is None or (engine.turn == 0 and not self._guard_trips):
+        has_record = engine is not None and (engine.turn > 0 or bool(self._guard_trips))
+        if not has_record and not self.machine.roleplay_entered:
             return
         try:
-            admin = engine.admin_log(final=True, r_end=self.machine.roleplay_elapsed)
-            self._log_fidelity(admin)
-            events = fidelity_events(admin, fidelity_pins(self.persona_choice), self._guard_trips)
+            pins = fidelity_pins(self.persona_choice)
+            admin: dict[str, Any] | None = None
+            events: list[dict[str, Any]] = []
+            if has_record and engine is not None:
+                admin = engine.admin_log(final=True, r_end=self.machine.roleplay_elapsed)
+                self._log_fidelity(admin)
+                events = fidelity_events(admin, pins, self._guard_trips)
+            if self.machine.roleplay_entered:
+                # The one row the plan 6.4 gate cannot pass without (``fidelity_facts_missing``):
+                # posted even when no learner turn was ever planned, as a short role-play is a
+                # fact too.  ``roleplay_elapsed`` stops at the role-play's end, not the session's.
+                events.append(
+                    session_facts_event(
+                        admin, pins, roleplay_seconds=self.machine.roleplay_elapsed
+                    )
+                )
         except Exception as exc:  # noqa: BLE001 - the record must never block the exit
             _log.error(
                 "unknown_event",
@@ -853,6 +1053,10 @@ class R1Interview:
             return
         self._exited = True
         self._begin_exit()
+        if outcome in _TECHNICAL_OUTCOMES:
+            # A stop on our side that never reached the closing speech (connect, context or
+            # configuration failures) still tells the page, before ``ended`` closes it.
+            self._publish_abort()
         elapsed = max(0, int(self.machine.session_elapsed))
         deadline = asyncio.get_running_loop().time() + _scaled(EXIT_STEPS_SECONDS)
 
@@ -982,8 +1186,12 @@ class R1Interview:
 
     @staticmethod
     def is_ready(text: str) -> bool:
-        """Accept a deliberate READY, not a substring such as ``already`` or ``unready``."""
-        normalized = " ".join(text.lower().split())
+        """Accept a deliberate READY, not a substring such as ``already`` or ``unready``.
+
+        The transcript is folded first (``fold_speech``): "Yes.", "Let's start." and "Sure!"
+        are the answers they sound like, however the speech-to-text punctuated them.
+        """
+        normalized = fold_speech(text)
         return bool(_READY_RE.search(normalized)) or normalized in _READY_ALLOWLIST
 
     async def _speak_pickup_once(self) -> None:
@@ -1083,6 +1291,12 @@ class R1Interview:
         seconds = self._take_user_turn_seconds()
         entry = self._note_candidate_turn(text, index) if text else None
         if self.reply_suppressed(text) or not text:
+            if self.machine.phase in (R1Phase.ICEBREAKER, R1Phase.ROLEPLAY, R1Phase.ASIDE):
+                # A phase that ended between this turn's transcript and its end of turn (the
+                # driver judged the transcript, this hook judges the end of turn) is over for
+                # the driver too: wake it, so it re-reads its budget and plays the boundary
+                # line now instead of waiting out a silence window for an answer nobody gave.
+                self._wake()
             raise StopResponse()
         if self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
             reply = self._plan_learner_reply(text, entry, index, seconds)
@@ -1153,7 +1367,7 @@ class R1Interview:
         """
         resume = self.machine.phase is R1Phase.ROLEPLAY
         if resume:
-            self.machine.transition(R1Phase.ASIDE)
+            self._enter(R1Phase.ASIDE)
         try:
             await self._say_text(
                 plan.scripted_text,
@@ -1177,7 +1391,7 @@ class R1Interview:
         """
         phase = self.machine.phase
         if phase is R1Phase.ASIDE and not self._muted:
-            self.machine.transition(R1Phase.ROLEPLAY)
+            self._enter(R1Phase.ROLEPLAY)
             self._restart_silence_window()
         elif phase is R1Phase.ASIDE or self.machine.resume_phase is R1Phase.ASIDE:
             self._mute_resume_phase = R1Phase.ROLEPLAY
@@ -1304,6 +1518,9 @@ class R1Interview:
         """
         from r1_llm import assert_thinking_disabled
 
+        reported_before = self._llm_errors_reported
+        spoke = False  # a sentence of the model's reply already reached the consumer
+        recover = False
         iterator: Any = None
         try:
             stream = await _maybe_await(factory())
@@ -1315,15 +1532,48 @@ class R1Interview:
                 text = delta_text(item)
                 if text:
                     for sentence in guard.feed(text):
+                        spoke = True
                         yield sentence + " "
             for sentence in guard.flush():
+                spoke = True
                 yield sentence + " "
+        except Exception as exc:  # noqa: BLE001 - a failed model reply must not leave silence
+            if spoke:
+                raise  # part of the reply was already heard: nothing sensible can follow it
+            recover = self._reply_failed(exc, reported_before)
+            if not recover:
+                raise
         finally:
             self._after_guard(reply, guard)
             aclose = getattr(iterator, "aclose", None)
             if callable(aclose):
                 with contextlib.suppress(Exception):
                     await aclose()
+        if recover:
+            # The candidate spoke and must hear SOMETHING: the safe fallback, as the first (and
+            # only) chunk of this reply.  It is not an answer from the provider, so it must not
+            # reset the failure count (the 3-failure abort stays reachable).
+            self._skip_failure_reset = True
+            yield FALLBACK_REPLY + " "
+
+    def _reply_failed(self, exc: BaseException, reported_before: int) -> bool:
+        """Count one failed model reply and say whether a recovery line should be spoken.
+
+        The SDK reports every unrecoverable provider error of the call to ``_on_provider_error``
+        BEFORE it reaches us (it emits, then raises), so only what it cannot see is counted
+        here: the reasoning-token guard, a broken factory.  Once the abort is due (three failures
+        in a row, or a provider abort) no recovery is spoken: the driver ends the interview with
+        the system-stop line instead.
+        """
+        _log.warn(
+            "unknown_event",
+            error_type="r1_llm_reply_failed",
+            error_category=_error_type_of(exc),
+            phase=self.machine.transcript_phase(),
+        )
+        if self._llm_errors_reported == reported_before:
+            self._record_generation_failure()
+        return not self._exiting and self._stop_outcome() is None
 
     async def _ack_then_say(
         self,
@@ -1441,6 +1691,7 @@ class R1Interview:
         loop = asyncio.get_running_loop()
         self._generation += 1
         generation = self._generation
+        started_phase = self.machine.phase
         started = loop.time()
         deadline = started + TURN_DEADLINE_SECONDS
         filler_at = started + FILLER_AFTER_SECONDS
@@ -1480,7 +1731,17 @@ class R1Interview:
             # the session while a newer reply is the one being spoken.
             self._record_generation_failure()
             if generation == self._generation:
-                self._spawn(self._interrupt_session())
+                # Nothing of the model's reply was spoken (the filler is not one): once the
+                # hung speech is cut, the candidate hears the recovery line instead of dead air
+                # followed by "Are you still there?".  Not when the abort is already due.
+                recover = (
+                    not got_first_chunk
+                    and not self._exiting
+                    and self._stop_outcome() is None
+                )
+                self._spawn(
+                    self._interrupt_session(recover_in=started_phase if recover else None)
+                )
             raise
         finally:
             if pending is not None:
@@ -1520,20 +1781,51 @@ class R1Interview:
             for slot in self._speeches.values()
         )
 
-    async def _interrupt_session(self) -> None:
-        """Cut a hung generation's speech, but never a protected scripted line."""
-        if self._uninterruptible_speech_live():
+    async def _interrupt_session(self, *, recover_in: R1Phase | None = None) -> None:
+        """Cut a hung generation's speech, but never a protected scripted line.
+
+        ``recover_in`` (the phase the hung reply was for) then speaks the recovery line
+        (``_speak_recovery``): the hung reply never said anything, and the candidate is
+        waiting for an answer.
+        """
+        if not self._uninterruptible_speech_live():
+            interrupt = getattr(self.session, "interrupt", None)
+            if callable(interrupt):
+                try:
+                    await _maybe_await(interrupt(force=True))
+                except Exception as exc:  # noqa: BLE001
+                    _log.warn(
+                        "unknown_event",
+                        error_type="r1_generation_interrupt_failed",
+                        error_category=_error_type_of(exc),
+                    )
+        if recover_in is not None:
+            await self._speak_recovery(recover_in)
+
+    async def _speak_recovery(self, phase: R1Phase) -> None:
+        """Say the safe fallback after a model reply that never spoke (the timeout path).
+
+        The line is the guard's own fallback for a reply with nothing usable, in the voice
+        that was due to answer (the learner in role-play).  It is a scripted ``say``, so it
+        never counts as an answer from the provider and the failure count is left alone.
+        Nothing is said to a candidate who has gone, once an abort is due, during exit, or when
+        the phase the reply was for is over (the boundary line already answered the turn).
+        """
+        if (
+            self._exiting
+            or not self._candidate_present
+            or self._stop_outcome() is not None
+            or self.machine.phase is not phase
+            or phase not in _REPLY_PHASES
+        ):
             return
-        interrupt = getattr(self.session, "interrupt", None)
-        if callable(interrupt):
-            try:
-                await _maybe_await(interrupt(force=True))
-            except Exception as exc:  # noqa: BLE001
-                _log.warn(
-                    "unknown_event",
-                    error_type="r1_generation_interrupt_failed",
-                    error_category=_error_type_of(exc),
-                )
+        in_roleplay = phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE)
+        await self._say_text(
+            FALLBACK_REPLY,
+            interruptible=True,
+            marker="llm_recovery",
+            voice="learner" if in_roleplay else "interviewer",
+        )
 
     def _record_generation_failure(self) -> None:
         """Count one failed LLM/TTS generation and wake the driver to evaluate the abort."""
@@ -1948,7 +2240,7 @@ class R1Interview:
         if muted:
             if self.machine.phase is R1Phase.ROLEPLAY:
                 self._mute_resume_phase = R1Phase.ROLEPLAY
-                self.machine.transition(R1Phase.ASIDE)
+                self._enter(R1Phase.ASIDE)
         else:
             self._leave_mute_aside()
             self._mute_announced = False
@@ -1958,7 +2250,7 @@ class R1Interview:
     def _leave_mute_aside(self) -> None:
         """Resume role-play after a mute aside; a no-op for any other kind of aside."""
         if self._mute_resume_phase is R1Phase.ROLEPLAY and self.machine.phase is R1Phase.ASIDE:
-            self.machine.transition(R1Phase.ROLEPLAY)
+            self._enter(R1Phase.ROLEPLAY)
         if self.machine.phase is not R1Phase.PAUSED_DISCONNECTED:
             self._mute_resume_phase = None
 
@@ -1986,11 +2278,25 @@ class R1Interview:
             return "shutdown_forced"
         return "candidate_left" if self._candidate_ever_present else "no_show"
 
+    def _after_roleplay(self, outcome: str) -> str:
+        """An ending that falls AFTER the role-play is a finished, scorable interview.
+
+        The candidate leaving (or the clock running out) during the exit line or the wrap-up
+        questions does not undo a role-play that was played to its end: such a session is
+        ``complete``, so it is completed, scored, and its attempt counted as complete.  Before
+        that point the outcome stays what it was (``candidate_left`` fails the session, and an
+        incomplete role-play is never scored).  Only an ending the candidate or the clock
+        caused is promoted; a provider failure or a worker drain is still a stop on our side.
+        """
+        if outcome in ("candidate_left", "residency_timeout") and self.machine.roleplay_finished:
+            return "complete"
+        return outcome
+
     def _stop_outcome(self) -> str | None:
         if self._room_disconnected:
-            return self._room_disconnect_outcome()
+            return self._after_roleplay(self._room_disconnect_outcome())
         if self._residency_expired or self._forced_close_due:
-            return "residency_timeout"
+            return self._after_roleplay("residency_timeout")
         if self._provider_abort or self._failures >= 3:
             return "provider_error"
         return None
@@ -2004,7 +2310,7 @@ class R1Interview:
         classified exactly as the in-line stop would have classified it.
         """
         if self._room_disconnected:
-            return self._room_disconnect_outcome()
+            return self._after_roleplay(self._room_disconnect_outcome())
         return "shutdown_forced"
 
     # ----------------------------------------------------------------- waits
@@ -2172,11 +2478,13 @@ class R1Interview:
     async def _handle_disconnect(self) -> str | None:
         """Pause the phase clock while only the selected candidate may rejoin."""
         if self.machine.phase in _LIVE_PHASES:
-            self.machine.begin_disconnect()
+            self._begin_disconnect()
         if not await self._wait_for_candidate(rejoin_grace_seconds()):
-            return self._stop_outcome() or "candidate_left"
+            # A candidate who stays away during the wrap-up has finished the role-play: the
+            # session is complete (scorable), not a candidate who walked out of the interview.
+            return self._stop_outcome() or self._after_roleplay("candidate_left")
         if self.machine.phase is R1Phase.PAUSED_DISCONNECTED:
-            self.machine.rejoin()
+            self._rejoin()
         # The pause may have hidden an unmute: re-check the aside against the room.
         if self._aside_needs_restore():
             self._leave_mute_aside()
@@ -2194,7 +2502,7 @@ class R1Interview:
         self._mute_announced = True
         if self.machine.phase is R1Phase.ROLEPLAY:
             self._mute_resume_phase = R1Phase.ROLEPLAY
-            self.machine.transition(R1Phase.ASIDE)
+            self._enter(R1Phase.ASIDE)
         if self._candidate_present:
             await self.say("L-MUTE")
 
@@ -2217,7 +2525,7 @@ class R1Interview:
             aside = line_id == "L-SIL-RP2"
             budget_left: Callable[[], float] | None = None
             if phase is R1Phase.ICEBREAKER:
-                budget_left = self.machine.remaining_icebreaker_seconds
+                budget_left = self._icebreaker_budget_left
             elif phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
                 budget_left = self._roleplay_budget_left
             if budget_left is not None:
@@ -2226,13 +2534,13 @@ class R1Interview:
                     return "phase_deadline"
             if aside and phase is R1Phase.ROLEPLAY:
                 # The interviewer speaks this aside, so role-play time pauses before it.
-                self.machine.transition(R1Phase.ASIDE)
+                self._enter(R1Phase.ASIDE)
             await self.say(line_id)
             hard = self.machine.remaining_roleplay_cap_seconds if aside else budget_left
             kind, value = await self._await_turn(wait_seconds, hard=hard)
             if kind == TURN:
                 if self.machine.phase is R1Phase.ASIDE:
-                    self.machine.transition(R1Phase.ROLEPLAY)
+                    self._enter(R1Phase.ROLEPLAY)
                     self._mute_resume_phase = None
                 return None
             if kind == STOP:
@@ -2323,10 +2631,14 @@ class R1Interview:
             # The agent session never started, so there is nobody to speak to.
             # PRE_JOIN -> FINISHING is the only legal move; CLOSING would raise
             # and replace a job cancellation with a RuntimeError.
-            self.machine.transition(R1Phase.FINISHING)
+            self._enter(R1Phase.FINISHING)
             return outcome
         if self.machine.phase is not R1Phase.CLOSING:
-            self.machine.transition(R1Phase.CLOSING)
+            # A technical stop is announced as ``aborted`` instead of ``closing``: the page
+            # must not show "Wrapping up" and then "Interview complete" for a stop on our side.
+            self._enter(R1Phase.CLOSING, publish=not system)
+        if system:
+            self._publish_abort()
         if self._candidate_present and not self._room_disconnected and not self._goodbye_spoken:
             try:
                 await self.say(
@@ -2341,19 +2653,32 @@ class R1Interview:
                 )
         # The page leaves when the closing line has played, not after the exit writes.
         await self._announce_ended()
-        self.machine.transition(R1Phase.FINISHING)
+        self._enter(R1Phase.FINISHING)
         return outcome
 
     async def _finish_stop(self, outcome: str | None) -> str:
         """Finish after a STOP outcome: a candidate-initiated end is not a system fault."""
         stop = outcome or "provider_error"
-        return await self._finish(stop, system=stop != "candidate_left")
+        return await self._finish(stop, system=stop not in _QUIET_OUTCOMES)
+
+    def _icebreaker_budget_left(self) -> float:
+        """Seconds of icebreaker left; zero once the phase is due to end, so every wait ends.
+
+        The driver judges the soft exit (four turns, S >= 3:30) when a transcript arrives, but
+        the SDK judges the same rule later, at the end of the turn (``prepare_turn``), and
+        suppresses the reply when it holds.  Both must read ONE answer: a wait bounded by the
+        hard S=4:30 alone would sit through a suppressed reply, then 30 s of silence, and then
+        ask "Are you still with me?".  ``prepare_turn`` wakes the driver; this is what it reads.
+        """
+        if self.machine.icebreaker_should_end():
+            return 0.0
+        return self.machine.remaining_icebreaker_seconds()
 
     async def _run_icebreaker(self) -> str | None:
         """Ask-and-listen until the soft four-turn exit or the hard S=4:30 deadline."""
         while not self.machine.icebreaker_should_end():
             kind, value = await self._await_turn(
-                ICEBREAKER_PROMPT_SECONDS, hard=self.machine.remaining_icebreaker_seconds
+                ICEBREAKER_PROMPT_SECONDS, hard=self._icebreaker_budget_left
             )
             if kind == DEADLINE:
                 return None
@@ -2404,9 +2729,9 @@ class R1Interview:
     def _end_roleplay(self) -> None:
         """Leave role-play for ROLEPLAY_EXIT from whichever role-play phase is current."""
         if self.machine.phase is R1Phase.ASIDE:
-            self.machine.transition(R1Phase.ROLEPLAY)
+            self._enter(R1Phase.ROLEPLAY)
         self._mute_resume_phase = None
-        self.machine.transition(R1Phase.ROLEPLAY_EXIT)
+        self._enter(R1Phase.ROLEPLAY_EXIT)
 
     async def _complete_wrapup_turn(self, text: str) -> tuple[str | None, str]:
         """Join what the candidate says right after an apparent refusal into one turn.
@@ -2469,31 +2794,31 @@ class R1Interview:
                 outcome = "configuration_failed"
                 return await self._finish(outcome)
             self._record_pins()
-            self.machine.transition(R1Phase.OPENING)
+            self._enter(R1Phase.OPENING)
             self._schedule_forced_close()
             await self._start()
             # The driver, not on_enter, speaks the opening so the icebreaker clock and
             # its silence window begin only once the candidate has heard the question.
             await self.say("L-OPEN")
-            self.machine.transition(R1Phase.ICEBREAKER)
+            self._enter(R1Phase.ICEBREAKER)
             stop = await self._run_icebreaker()
             if stop is not None:
                 outcome = await self._finish_stop(stop)
                 return outcome
-            self.machine.transition(R1Phase.TRANSITION)
+            self._enter(R1Phase.TRANSITION)
             await self.say("L-TRANSITION")
             stop = await self._run_transition()
             if stop is not None:
                 outcome = await self._finish_stop(stop)
                 return outcome
-            self.machine.transition(R1Phase.ROLEPLAY)
+            self._enter(R1Phase.ROLEPLAY)
             stop = await self._run_roleplay()
             if stop is not None:
                 outcome = await self._finish_stop(stop)
                 return outcome
             self._end_roleplay()
             await self.say("L-EXIT")
-            self.machine.transition(R1Phase.WRAPUP)
+            self._enter(R1Phase.WRAPUP)
             await self.say("L-WRAP")
             stop = await self._run_wrapup()
             if stop is not None:
@@ -2507,7 +2832,7 @@ class R1Interview:
             # drain reaches the interview (shutdown callbacks run after the entrypoint
             # has ended), so classify the cancellation itself.
             outcome = self._cancel_outcome()
-            await self._finish(outcome, system=outcome != "candidate_left")
+            await self._finish(outcome, system=outcome not in _QUIET_OUTCOMES)
             raise
         except Exception as exc:  # noqa: BLE001
             # Type only, never a traceback: its message could embed a transcript.
@@ -2551,7 +2876,11 @@ async def run_r1_session(
     del started_at
     room = _room_name(ctx)
     session_id = session_id_from_room_name(room)
-    writer = R1TurnWriter(session_id, room)
+    # The attempt id IS the session id (``routes/r1.ts``: ``attempt_id: session.id``), so the
+    # writer can post the attempt outcome from the start.  Built without it, a failure before
+    # the context arrived (connect, context) settled the session but never its attempt
+    # (``r1_attempt_outcome_skipped_no_attempt``).
+    writer = R1TurnWriter(session_id, room, attempt_id=session_id)
 
     async def settle_without_context(outcome: str) -> None:
         """Use the exit funnel even when connect or context resolution cannot start a session."""
@@ -2585,7 +2914,9 @@ async def run_r1_session(
         )
         await settle_without_context("context_failed")
         return "context_failed"
-    writer = R1TurnWriter(session_id, room, attempt_id=str(context.get("attempt_id") or "") or None)
+    writer = R1TurnWriter(
+        session_id, room, attempt_id=str(context.get("attempt_id") or session_id or "") or None
+    )
     try:
         session = await _maybe_await(session_factory(ctx, context))
     except Exception as exc:  # noqa: BLE001
