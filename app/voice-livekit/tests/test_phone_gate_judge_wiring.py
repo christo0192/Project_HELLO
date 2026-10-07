@@ -839,6 +839,56 @@ class TestVoicemailAndTheLatch(unittest.TestCase):
         ):
             self.assertFalse(agent_mod._voicemail_shaped(text), text)
 
+    #: Round-5 review: a live person's lines that the round-4 carrier and
+    #: greeting branches read as a machine.
+    _ROUND5_PERSON_LINES = (
+        "Is this some screening service?",
+        "Is this some screening service",
+        "Sorry I missed your call earlier, can I get back to you in ten minutes?",
+        "Sorry, she missed your call, she will get back to you",
+        "Who is the person you're calling for",
+        "Who is the person you are calling for?",
+        "Busy now. Try again later.",
+        "Not now, try again later",
+    )
+
+    def test_round5_person_lines_are_not_machine_shaped(self):
+        for text in self._ROUND5_PERSON_LINES:
+            self.assertFalse(agent_mod._voicemail_shaped(text), text)
+        # The real carrier / greeting wording still is.
+        for text in (
+            "Hi, the person you're calling is using a screening service from "
+            "Google and will get a copy of this conversation.",
+            "The number you are calling is switched off.",
+            "Please try again later.",
+            "Sorry I missed your call, I'll get back to you.",
+        ):
+            self.assertTrue(agent_mod._voicemail_shaped(text), text)
+
+    def test_round5_judged_voicemail_on_person_lines_is_rejected(self):
+        u = self._vm_utt
+        for text in self._ROUND5_PERSON_LINES:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    self._vm_guard(text.rstrip("?."), u(0, text)),
+                    gate_judge.GUARD_VOICEMAIL_NOT_MACHINE_SHAPED)
+        # A person picking up a retry dial, split across two finals: the
+        # missed-call greeting is read on one utterance, never the join.
+        self.assertEqual(
+            self._vm_guard("missed your call",
+                           u(0, "Sorry, I missed your call earlier"),
+                           u(1, "can I get back to you in ten minutes?")),
+            gate_judge.GUARD_VOICEMAIL_NOT_MACHINE_SHAPED)
+        self.assertEqual(
+            self._vm_guard("missed your call",
+                           u(0, "Sorry, I missed your call earlier."),
+                           u(1, "I'll get back to you in a bit.")),
+            gate_judge.GUARD_VOICEMAIL_NOT_MACHINE_SHAPED)
+        # A greeting in ONE utterance still may act.
+        self.assertIsNone(self._vm_guard(
+            "missed your call",
+            u(0, "Hi, sorry I missed your call, I'll get back to you soon.")))
+
 
 # â”€â”€ the identity turn through the real gate (extends TestGateIdentityFlow) â”€
 

@@ -4087,27 +4087,57 @@ _VOICEMAIL_SHAPE_RE = re.compile(
     r"\byou(?:'ve|\s+have)\s+reached\b|"
     r"\b(?:can't|cannot|can\s+not|unable\s+to)\s+(?:take|answer)\s+your\s+call\b|"
     r"\bat\s+the\s+(?:tone|beep)\b|"
-    # Round-4 review fix: carrier and greeting wording `_MACHINE_RE` misses.
-    # "The person you're calling is using a screening service" (you're).
-    r"\b(?:number|subscriber|person|customer)\s+you(?:'re|\s+are|'ve|\s+have)\s+"
-    r"(?:calling|called|dialled|dialed|trying\s+to\s+reach)\b|"
-    r"\bscreening\s+service\b|"
+    # Round-4 review fix: carrier wording `_MACHINE_RE` misses.
     # "The call cannot be completed as dialled", "this number does not exist".
     r"\b(?:cannot|can\s*not|can't|could\s+not)\s+be\s+completed\b|"
     r"\bnumber\s+(?:does\s+not|doesn't)\s+exist\b|"
     # Hindi carrier: "is number par incoming call ki suvidha uplabdh nahi
     # hai", "aapke dwara dial kiya gaya number abhi vyast hai".
     r"\bincoming\s+(?:call\s+)?(?:ki\s+)?suvidha\b|"
-    r"\bdial\s+kiya\s+gaya\s+number\b|"
-    # A personal greeting: "Sorry I missed your call, I'll get back to you".
-    r"\bmissed\s+your\s+call\b.{0,80}\bget\s+back\s+to\s+you\b",
+    r"\bdial\s+kiya\s+gaya\s+number\b",
     re.IGNORECASE,
 )
+#: Round-4/5 review fix: wording a machine uses and a live PERSON can use too.
+#: Each is machine-shaped only without the person markers named below (the
+#: way `_MACHINE_AVAILABILITY_RE` and the try-again-later rule work):
+#:
+#: * carrier "the person/number you're (you are) calling" (Google Call
+#:   Screen, "The person you're calling is using a screening service") —
+#:   not with a '?', a wh-word or an I/he/she subject ("Who is the person
+#:   you're calling for"). Also lifted out of `_MACHINE_RE`'s own match
+#:   for this guard only: the legacy readers are unchanged.
+_VOICEMAIL_CARRIER_PERSON_RE = re.compile(
+    r"\b(?:number|subscriber|person|customer)\s+you(?:'re|\s+are|'ve|\s+have)\s+"
+    r"(?:calling|called|dialled|dialed|trying\s+to\s+reach)\b",
+    re.IGNORECASE,
+)
+#: * "screening service" — not with a '?', an "is this/is it/are you"
+#:   ("Is this some screening service") or an I/he/she subject.
+_VOICEMAIL_SCREENING_RE = re.compile(r"\bscreening\s+service\b", re.IGNORECASE)
+#: * a personal greeting "Sorry I missed your call, I'll get back to you" —
+#:   read on ONE utterance only (`.` never crosses the newline
+#:   `gate_judge.voicemail_guard_failure` joins utterances with), and not
+#:   with a '?', a "can/shall/may I" offer or a he/she/they subject ("Sorry,
+#:   I missed your call earlier" + "can I get back to you in ten minutes?",
+#:   "Sorry, she missed your call, she will get back to you").
+_VOICEMAIL_MISSED_CALL_RE = re.compile(
+    r"\bmissed\s+your\s+call\b.{0,80}\bget\s+back\s+to\s+you\b", re.IGNORECASE)
+_VOICEMAIL_WH_RE = re.compile(r"\b(?:who|whom|whose|which|what)\b", re.IGNORECASE)
+_VOICEMAIL_IS_THIS_RE = re.compile(
+    r"\b(?:is|are)\s+(?:this|it|that|you)\b", re.IGNORECASE)
+_VOICEMAIL_OFFER_RE = re.compile(
+    r"\b(?:can|shall|may|should|could)\s+(?:i|we)\b", re.IGNORECASE)
+_VOICEMAIL_THIRD_PERSON_RE = re.compile(
+    r"\b(?:he|she|they|he'?s|she'?s|they'?re|him|her)\b", re.IGNORECASE)
 #: Round-4 review fix: "Please try again later" is a carrier prompt, but a
 #: person says it too ("I'm in a meeting, try again later"): machine-shaped
 #: only with no first-person / he / she subject and no '?' (as
-#: `_MACHINE_AVAILABILITY_RE`).
-_VOICEMAIL_TRY_LATER_RE = re.compile(r"\btry\s+again\s+later\b", re.IGNORECASE)
+#: `_MACHINE_AVAILABILITY_RE`). Round-5: and only in the carrier's own
+#: "please try again later" form; "Busy now. Try again later." and "Not now,
+#: try again later" are a person.
+_VOICEMAIL_TRY_LATER_RE = re.compile(
+    r"\bplease\s+try\s+again\s+later\b", re.IGNORECASE)
+_VOICEMAIL_NOT_NOW_RE = re.compile(r"\bnot\s+now\b", re.IGNORECASE)
 
 
 def _voicemail_shaped(value: str) -> bool:
@@ -4117,16 +4147,43 @@ def _voicemail_shaped(value: str) -> bool:
     on such words (`gate_judge.voicemail_guard_failure`): a person's own
     "Hello? Who is this?" misread as voicemail is never a silent hang-up.
     Blocking direction only; nothing here can make a call machine.
+
+    ``value`` is one utterance, or several joined with a newline in spoken
+    order; the person markers are read on the whole value (blocking
+    direction), the missed-call greeting on one line only.
     """
     if not isinstance(value, str) or not value.strip():
         return False
-    clean = value.replace("’", "'")
-    if _is_machine_text(clean) or _VOICEMAIL_SHAPE_RE.search(clean) is not None:
+    lines = value.replace("’", "'").split("\n")
+    clean = " ".join(lines)
+    asked = "?" in clean
+    first_person = _FIRST_PERSON_RE.search(clean) is not None
+    flat = clean
+    # Person-confusable wording is lifted out before the machine readers run.
+    if asked or first_person or _VOICEMAIL_WH_RE.search(clean):
+        flat = _VOICEMAIL_CARRIER_PERSON_RE.sub(" ", flat)
+    elif _VOICEMAIL_CARRIER_PERSON_RE.search(flat):
+        return True
+    if (
+        not asked and not first_person
+        and not _VOICEMAIL_IS_THIS_RE.search(clean)
+        and _VOICEMAIL_SCREENING_RE.search(flat)
+    ):
+        return True
+    if (
+        not asked
+        and not _VOICEMAIL_OFFER_RE.search(clean)
+        and not _VOICEMAIL_THIRD_PERSON_RE.search(clean)
+        and any(_VOICEMAIL_MISSED_CALL_RE.search(line) for line in lines)
+    ):
+        return True
+    if _is_machine_text(flat) or _VOICEMAIL_SHAPE_RE.search(flat) is not None:
         return True
     return bool(
         _VOICEMAIL_TRY_LATER_RE.search(clean)
-        and "?" not in clean
-        and not _FIRST_PERSON_RE.search(clean)
+        and not asked
+        and not first_person
+        and not _VOICEMAIL_NOT_NOW_RE.search(clean)
     )
 
 
@@ -7458,13 +7515,19 @@ async def _run_native_phone_screening(
         """`judge` when the last `_qna_kind` was a judge verdict, else `fallback`."""
         return "judge" if _qna_kind_judged() else "fallback"
 
-    async def _qna_kind(text: str, route: str | None) -> str:
+    async def _qna_kind(text: str, route: str | None, *, after_close: bool = False) -> str:
         """Decline, question or other, for one Q&A turn (T09).
 
         A valid `qna_close` judge verdict decides (llm mode); otherwise the
         fallback grammar: the old done/dismissal readers plus
         `phone_qna_decline` for a decline, the question route or a directed
         question for a question.
+
+        ``after_close`` (round-5 review fix): called by
+        `_qna_question_after_close` only for the verdict. The question-shape
+        overrides below are CANDIDATE_QNA answer routing, so there the plain
+        `judged_<verdict>` line is logged instead of a `*_question_shape`
+        override that never happened (the reopen logs its own decision).
         """
         key = (native_turn_seq[0], text)
         if qna_kind_cache.get("key") == key:
@@ -7473,20 +7536,26 @@ async def _run_native_phone_screening(
         kind, _ = await qna_window.read_qna(text)
         judged = kind in (QNA_KIND_DECLINE, QNA_KIND_QUESTION, QNA_KIND_OTHER)
         verdict = kind if judged else None
-        if kind == QNA_KIND_OTHER and phone.phone_qna_question_directed(text):
-            # Only in the safe direction: a reply shaped as a question to the
-            # interviewer ("…?", "what does the role pay") is answered even if
-            # the judge heard none. Nothing here can close the call.
-            _qna_note("judged_other_question_shape", "judge")
-            kind = QNA_KIND_QUESTION
-        elif kind == QNA_KIND_DECLINE and phone.phone_qna_carries_question(text):
-            # Round-2 review fix, the same safety net for a judged DECLINE:
-            # "Not really, but what is the salary" (no STT '?') is answered,
-            # never closed on. Only ever turns a close into an answer.
-            _qna_note("judged_decline_question_shape", "judge")
-            kind = QNA_KIND_QUESTION
-        elif kind in (QNA_KIND_DECLINE, QNA_KIND_QUESTION, QNA_KIND_OTHER):
-            _qna_note(f"judged_{kind}", "judge")
+        if judged:
+            override = None
+            if kind == QNA_KIND_OTHER and phone.phone_qna_question_directed(text):
+                # Only in the safe direction: a reply shaped as a question to
+                # the interviewer ("…?", "what does the role pay") is answered
+                # even if the judge heard none. Nothing here can close the call.
+                override = "judged_other_question_shape"
+            elif kind == QNA_KIND_DECLINE and phone.phone_qna_carries_question(text):
+                # Round-2 review fix, the same safety net for a judged
+                # DECLINE: "Not really, but what is the salary" (no STT '?')
+                # is answered, never closed on. Only ever turns a close into
+                # an answer.
+                override = "judged_decline_question_shape"
+            _qna_note(
+                override if override is not None and not after_close
+                else f"judged_{kind}",
+                "judge",
+            )
+            if override is not None:
+                kind = QNA_KIND_QUESTION
         else:
             if kind == "unavailable":
                 _qna_note("judge_unavailable", "fallback")
@@ -7518,16 +7587,28 @@ async def _run_native_phone_screening(
         timeout/error "Okay ma'am, will do" over a pending goodbye interrupted
         it and reopened Q&A (origin/main reopened only on the question route).
         A question is: the question route, the judge's OWN `question` verdict,
-        or `phone_qna_carries_question` (a '?', a request, a non-negated "one
-        more question", or a subject-inverted clause). The judge is asked at
-        most once per turn (`_qna_kind` caches it).
+        or `phone.phone_qna_asks_after_close` (a request, a non-negated "one
+        more question", or a subject-inverted / wh clause). The judge is asked
+        at most once per turn (`_qna_kind` caches it).
+
+        Round-5 review fix: a bare '?' no longer reopens on its own. With a
+        valid judge verdict it never overrides a judged OTHER/DECLINE (the
+        judge decides), and in fallback it does not count on a greeting /
+        courtesy turn ("Hello?", "Thank you?", "Bye?"). When the reopen rests
+        on the question shape, the cached kind becomes QUESTION so the
+        reopened Q&A answers it rather than acknowledging a judged OTHER.
         """
         if route == "candidate_question":
             return True
-        await _qna_kind(text, route)
-        if _qna_kind_judged() and qna_kind_cache.get("verdict") == QNA_KIND_QUESTION:
+        await _qna_kind(text, route, after_close=True)
+        judged = _qna_kind_judged()
+        if judged and qna_kind_cache.get("verdict") == QNA_KIND_QUESTION:
             return True
-        return phone.phone_qna_carries_question(text)
+        if not phone.phone_qna_asks_after_close(text, judged=judged):
+            return False
+        _qna_note("after_close_question_shape", "judge" if judged else "fallback")
+        qna_kind_cache["kind"] = QNA_KIND_QUESTION
+        return True
 
     def _qna_close(turn_ctx: Any, close_instruction: str) -> None:
         """Author the closing goodbye and arm the `completed` terminal."""

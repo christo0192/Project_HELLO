@@ -11385,6 +11385,170 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
                     hooks["log_patch"].stop()
                     self.assertEqual(client.event_types.count("assessment.completed"), 1)
 
+    #: Round-5 review: real questions STT left without a '?' whose subject
+    #: is "it", a determiner or a possessive after does/will/would/can/could.
+    _ROUND5_QUESTIONS = (
+        "No ma'am, but does it require relocation",
+        "Nothing much, will the interview be online",
+        "No, would it be remote",
+        "Nothing else, can the joining date be flexible",
+        "No ma'am, does the role include travel",
+        "Does the role involve travel",
+        "Will it be remote",
+        "Can the interview be rescheduled",
+        "Could it be hybrid",
+        "Can my joining date be moved",
+        "Okay ma'am, does this role have night shifts",
+        "No ma'am, nothing much. Will it be remote",
+        "How great is the work culture there",
+    )
+
+    def test_round5_wider_subjects_after_does_will_can_carry_a_question(self):
+        for text in self._ROUND5_QUESTIONS:
+            with self.subTest(text=text):
+                self.assertTrue(phone.phone_qna_carries_question(text))
+                self.assertTrue(phone.phone_qna_asks_after_close(text, judged=True))
+                self.assertTrue(phone.phone_qna_asks_after_close(text, judged=False))
+        # do/did keep the strict subject; rhetorical sign-offs stay sign-offs.
+        for text in ("Okay ma'am, will do", "No ma'am, do the needful.",
+                     "No ma'am, did my best, thank you",
+                     "Thank you, what more could I ask for",
+                     "No ma'am, what more can I ask, all is clear"):
+            with self.subTest(text=text):
+                self.assertFalse(phone.phone_qna_carries_question(text))
+                self.assertFalse(phone.phone_qna_asks_after_close(text, judged=False))
+
+    async def test_round5_judged_decline_with_an_unpunctuated_question_is_answered(self):
+        # llm mode: the judged-DECLINE safety net catches these again (round 4
+        # lost them by requiring a personal pronoun after will/does/can).
+        for text in self._ROUND5_QUESTIONS[:5] + ("No ma'am, nothing much. Will it be remote",):
+            with self.subTest(text=text):
+                evidence = re.split(r"[,.]", text)[0]
+                window, _, _ = _qna_window({text: _qna_verdict("end_call", evidence)})
+                agent, _, _, client, hooks = await self._enter_qna(window)
+                out, stopped = await self._qna_turn(hooks, text)
+                self.assertFalse(stopped)
+                self.assertIn("answer the candidate's question", out.lower())
+                self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
+                self.assertIn(("judged_decline_question_shape", "judge"),
+                              self._qna_close_lines(hooks))
+                self.assertNotIn("assessment.completed", client.event_types)
+                await self._stop(hooks)
+
+    def test_round5_a_bare_question_mark_after_close(self):
+        for text in ("Hello?", "Thank you?", "Bye?", "Okay?", "Hello? Hello?",
+                     "Thank you so much ma'am?"):
+            with self.subTest(text=text):
+                self.assertFalse(phone.phone_qna_asks_after_close(text, judged=False))
+                self.assertFalse(phone.phone_qna_asks_after_close(text, judged=True))
+        # In fallback a '?' on a non-courtesy turn still counts; with a
+        # valid judge verdict it never overrides it on its own.
+        self.assertTrue(phone.phone_qna_asks_after_close(
+            "And the stipend for interns?", judged=False))
+        self.assertFalse(phone.phone_qna_asks_after_close(
+            "And the stipend for interns?", judged=True))
+
+    def _assert_pending_goodbye_kept(self, agent, hooks, stale, stopped):
+        self.assertTrue(stopped)
+        self.assertEqual(stale.interrupt_calls, [])
+        self.assertEqual(agent._closing_state_machine.state.value, "closing_pending")
+        interlocks = [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_qna_terminal_interlock"
+        ]
+        self.assertEqual(interlocks, [])
+
+    async def test_round5_greeting_question_mark_over_a_pending_goodbye_stays_terminal(self):
+        # Round-5 review: "Hello?" / "Thank you?" over a pending goodbye
+        # reopened Q&A on the bare '?', in llm mode (judged other) and in
+        # legacy mode / with the judge down.
+        windows = (("llm", lambda: _qna_window({
+            "No thank you": _qna_verdict("end_call", "No thank you")})),
+        ) + self._fallback_windows()
+        for label, make in windows:
+            for text in ("Hello?", "Thank you?"):
+                with self.subTest(label=label, text=text):
+                    window, _, _ = make()
+                    agent, _, _, client, hooks = await self._enter_qna(window)
+                    await self._qna_turn(hooks, "No thank you")
+                    self.assertEqual(
+                        agent._closing_state_machine.state.value, "closing_pending")
+                    stale = _FakeSpeech()
+                    hooks["reply_handle"][0] = stale
+                    _, stopped = await self._qna_turn(hooks, text)
+                    self._assert_pending_goodbye_kept(agent, hooks, stale, stopped)
+                    await self._finish(hooks)
+                    self.assertEqual(client.event_types.count("assessment.completed"), 1)
+
+    async def test_round5_judged_other_question_mark_alone_does_not_reopen(self):
+        # llm mode: a valid OTHER verdict decides; the '?' alone does not
+        # override it after the close. In fallback the same turn reopens.
+        text = "And the stipend for interns?"
+        window, _, _ = _qna_window({
+            "No thank you": _qna_verdict("end_call", "No thank you"),
+            text: _QNA_UNCLEAR})
+        agent, _, _, _, hooks = await self._enter_qna(window)
+        await self._qna_turn(hooks, "No thank you")
+        stale = _FakeSpeech()
+        hooks["reply_handle"][0] = stale
+        _, stopped = await self._qna_turn(hooks, text)
+        self._assert_pending_goodbye_kept(agent, hooks, stale, stopped)
+        await self._stop(hooks)
+        for label, make in self._fallback_windows():
+            with self.subTest(label=label):
+                window, _, _ = make()
+                agent, _, _, _, hooks = await self._enter_qna(window)
+                await self._qna_turn(hooks, "No thank you")
+                stale = _FakeSpeech()
+                hooks["reply_handle"][0] = stale
+                out, stopped = await self._qna_turn(hooks, text)
+                self.assertFalse(stopped)
+                self.assertEqual(len(stale.interrupt_calls), 1)
+                self.assertIn("answer the candidate's question", out.lower())
+                self.assertIn(("after_close_question_shape", "fallback"),
+                              self._qna_close_lines(hooks))
+                await self._stop(hooks)
+
+    async def test_round5_after_close_logs_the_plain_verdict(self):
+        # Round-5 review (nit): a sign-off judged OTHER over a pending goodbye
+        # stays terminal, and the log says so (no question-shape override).
+        text = "Okay ma'am, will do"
+        window, _, _ = _qna_window({
+            "No thank you": _qna_verdict("end_call", "No thank you"), text: _QNA_UNCLEAR})
+        agent, _, _, _, hooks = await self._enter_qna(window)
+        await self._qna_turn(hooks, "No thank you")
+        stale = _FakeSpeech()
+        hooks["reply_handle"][0] = stale
+        _, stopped = await self._qna_turn(hooks, text)
+        self._assert_pending_goodbye_kept(agent, hooks, stale, stopped)
+        lines = self._qna_close_lines(hooks)
+        self.assertIn(("judged_other", "judge"), lines)
+        self.assertNotIn(("judged_other_question_shape", "judge"), lines)
+        await self._stop(hooks)
+
+    async def test_round5_judged_other_question_shape_reopens_and_is_answered(self):
+        # A judged OTHER over a pending goodbye that is question-shaped
+        # reopens, and the reopened Q&A ANSWERS it (the cached kind becomes
+        # QUESTION), rather than acknowledging a remark.
+        text = "No ma'am, nothing much. Will it be remote"
+        window, _, _ = _qna_window({
+            "No thank you": _qna_verdict("end_call", "No thank you"), text: _QNA_UNCLEAR})
+        agent, _, _, client, hooks = await self._enter_qna(window)
+        await self._qna_turn(hooks, "No thank you")
+        stale = _FakeSpeech()
+        hooks["reply_handle"][0] = stale
+        out, stopped = await self._qna_turn(hooks, text)
+        self.assertFalse(stopped)
+        self.assertEqual(len(stale.interrupt_calls), 1)
+        self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
+        self.assertIn("answer the candidate's question", out.lower())
+        lines = self._qna_close_lines(hooks)
+        self.assertIn(("judged_other", "judge"), lines)
+        self.assertIn(("after_close_question_shape", "judge"), lines)
+        self.assertNotIn("assessment.completed", client.event_types)
+        await self._stop(hooks)
+
     async def test_round3_question_judged_while_the_goodbye_finishes_is_answered(self):
         # Round-3 review (nit): the goodbye finished playing while this turn's
         # judge call was in flight. The question goes to the late-question

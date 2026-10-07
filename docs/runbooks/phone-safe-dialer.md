@@ -202,7 +202,10 @@ structured logger only accepts its allowlisted keys, so the fields are:
 - The Q&A close: `phone_qna_close` (`judged_<kind>`, `judged_other_question_shape`,
   `judged_decline_question_shape`, `judge_unavailable`,
   `fallback_other_answered`, `go_ahead`, `non_question_acknowledged`,
-  `non_question_close`, `filler_cap_close`; `phase` = who decided THIS turn:
+  `non_question_close`, `filler_cap_close`, `after_close_question_shape` (a
+  turn after the goodbye was authored reopened on its question shape; the
+  `*_question_shape` overrides are only logged in the open Q&A, a turn read
+  after the goodbye logs its plain `judged_<kind>`); `phase` = who decided THIS turn:
   `judge` (a valid `qna_close` verdict), `fallback` (the fallback grammar:
   `legacy`/`shadow`, or the judge unavailable) or `rule` (the bare-yes
   go-ahead and the filler cap, which no reader decides)),

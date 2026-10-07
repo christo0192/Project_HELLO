@@ -14892,31 +14892,57 @@ def phone_qna_question_directed(text: Any) -> bool:
 #: sign-offs, not questions. The auxiliary must be followed by whitespace,
 #: so "can't" / "don't" never count.
 #:
-#: Round-4 review fix: after do/does/did/will/would/can/could the subject
-#: must be a personal pronoun or "there" ("do you", "will I", "can we",
-#: "will there be"); a determiner, "it" or a possessive is an imperative or a
-#: statement there ("do the needful", "did my best"). "is"/"are" keep the
-#: wider subject list ("is it hybrid", "is the role remote"). Exclamatory and
-#: rhetorical wh forms are not questions: "what a nice conversation", "how
-#: nice", "what else, thank you", "what more to ask", "which is fine"
-#: ("what else do I need", "which is the office" still are).
+#: Round-4 review fix: after do/did the subject must be a personal pronoun
+#: or "there" ("do you", "did they", "do we"); a determiner, "it" or a
+#: possessive is an imperative or a statement there ("do the needful", "did
+#: my best").
+#:
+#: Round-5 review fix: that narrowing applies to do/did ONLY. After
+#: is/are/does/will/would/can/could the wider subject list stays ("does the
+#: role include travel", "will it be remote", "can the joining date be
+#: flexible", "could it be hybrid"): none of those is a sign-off, and STT
+#: often drops their '?'. A bare auxiliary still never counts ("will do",
+#: "will wait for your call", "can't wait").
+#:
+#: Exclamatory and rhetorical wh forms are not questions: "what a nice
+#: conversation", "how nice" (but "how nice is the office" is), "what else,
+#: thank you", "what more to ask", "which is fine" ("what else do I need",
+#: "which is the office" still are). "What more could I ask for" is stripped
+#: before any reader runs (`_QNA_RHETORICAL_RE`).
 _QNA_CLAUSE_QUESTION_RE = re.compile(
     r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now|um+|uh+|yeah|right|wait|"
     r"(?:(?:yes|no)[\s,.!-]*)?(?:ma['’]?a?m|maam|mam|madam|sir))[\s,.!?-]+){0,4}"
     r"(?:(?!what\s+(?:a|an)\b"
     r"|how\s+(?:nice|lovely|sweet|kind|wonderful|great|amazing|cool|beautiful"
-    r"|interesting)\b"
+    r"|interesting)\b(?!\s+(?:is|are|was|were|will|would|does|do|did|can|could)\b)"
     r"|what\s+(?:else|more)\b(?!\s+(?:do|does|did|is|are|can|could|should|would"
     r"|will|shall|i|you|we)\b)"
     r"|which\s+is\b(?!\s+(?:the|your|our|a|an|better|best)\b))"
     r"(?:what|which|who|where|when|why|how)\b"
-    r"|(?:is|are)\s+"
+    r"|(?:is|are|does|will|would|can|could)\s+"
     r"(?:you|u|i|we|they|it|there|this|that|these|those|the|a|an|any|my|your|"
     r"our|their|his|her|he|she|someone|somebody|anyone|anybody)\b"
-    r"|(?:can|could|would|will|do|does|did)\s+"
+    r"|(?:do|did)\s+"
     r"(?:you|u|i|we|they|he|she|someone|somebody|anyone|anybody|there)\b)",
     re.IGNORECASE,
 )
+#: Round-5 review fix: "Thank you, what more could I ask for" is a sign-off,
+#: not a question (nor a "could I ask" request). Removed before the readers.
+_QNA_RHETORICAL_RE = re.compile(
+    r"\bwhat\s+more\s+(?:could|can|would|should)\s+(?:i|one|anyone|we)\s+"
+    r"(?:ask|want|wish)(?:\s+for)?\b",
+    re.IGNORECASE,
+)
+#: Round-5 review fix: the words of a turn that is only a greeting,
+#: courtesy or filler ("Hello?", "Thank you?", "Bye?", "Okay?"). Over a
+#: closed screening a '?' on such a turn is prosody, not a question.
+_QNA_COURTESY_WORDS = frozenset({
+    "hello", "hallo", "helo", "hi", "hey", "okay", "ok", "okey", "thank",
+    "thanks", "you", "bye", "goodbye", "sir", "ma'am", "maam", "mam", "madam",
+    "yes", "yeah", "yep", "no", "sure", "right", "alright", "fine", "good",
+    "great", "so", "much", "very", "hmm", "um", "uh", "sorry", "oh", "ah",
+    "ji", "haan", "accha", "achha", "theek", "thik", "hai", "bas",
+})
 #: "No, I don't have a question" / "not a single doubt": a NEGATED mention
 #: of a question is a decline, not a request to ask one.
 _QNA_NEGATED_ASKS_RE = re.compile(
@@ -14943,21 +14969,63 @@ def phone_qna_carries_question(text: Any) -> bool:
     decline still close on the first one. Only ever turns a close into an
     answer.
     """
-    if not isinstance(text, str):
-        return False
-    clean = " ".join(text.replace("’", "'").replace("‘", "'").strip().split())
+    clean = _qna_clean(text)
     if not clean:
         return False
-    if "?" in clean or _QNA_REQUEST_RE.search(clean):
+    if "?" in clean:
+        return True
+    return _qna_question_shaped(clean)
+
+
+def _qna_clean(text: Any) -> str:
+    """Normalised Q&A text with rhetorical sign-offs removed ("" if none)."""
+    if not isinstance(text, str):
+        return ""
+    clean = " ".join(text.replace("’", "'").replace("‘", "'").strip().split())
+    if not clean:
+        return ""
+    return " ".join(_QNA_RHETORICAL_RE.sub(" ", clean).split())
+
+
+def _qna_question_shaped(clean: str) -> bool:
+    """A request, a non-negated "one more question", or a question clause."""
+    if _QNA_REQUEST_RE.search(clean):
         return True
     if _QNA_ASKS_RE.search(_QNA_NEGATED_ASKS_RE.sub(" ", clean)):
         return True
-    for clause in re.split(r"[.;!,]|\b(?:but|and|although|though)\b",
+    for clause in re.split(r"[.;!?,]|\b(?:but|and|although|though)\b",
                            clean, flags=re.IGNORECASE):
         clause = clause.strip()
         if clause and _QNA_CLAUSE_QUESTION_RE.match(clause):
             return True
     return False
+
+
+def phone_qna_asks_after_close(text: Any, *, judged: bool) -> bool:
+    """Q&A ONLY (M013 S01 round-5 review fix): reopen a closed screening?
+
+    The reader for a turn heard after the goodbye was authored (pending) or
+    played. Stricter than `phone_qna_carries_question` about a bare '?':
+
+    * a question shape (`_qna_question_shaped`: a request, a non-negated
+      "one more question", or a subject-inverted / wh clause) counts in
+      every mode;
+    * with a valid judge verdict (``judged``) that verdict decides, so a
+      '?' alone never overrides a judged OTHER or DECLINE (owner rule: the
+      judge decides gate turns);
+    * without one (legacy mode, judge timeout/error) a '?' counts unless
+      the turn is only greeting / courtesy / filler words ("Hello?",
+      "Thank you?", "Bye?", "Okay?").
+    """
+    clean = _qna_clean(text)
+    if not clean:
+        return False
+    if _qna_question_shaped(clean):
+        return True
+    if judged or "?" not in clean:
+        return False
+    words = re.findall(r"[a-z']+", clean.lower())
+    return any(word.strip("'") not in _QNA_COURTESY_WORDS for word in words)
 
 
 _GENERAL_CLARIFICATION_RE = re.compile(

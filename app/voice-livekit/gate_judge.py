@@ -1635,7 +1635,9 @@ def voicemail_guard_failure(
     read on the JOINED text of the cited utterances plus every post-question
     utterance the judge saw (every utterance when none is tagged), in spoken
     order. A person's own words stay unshaped however they are joined, so a
-    misread "Hello? Who is this?" is still rejected.
+    misread "Hello? Who is this?" is still rejected. The joined text uses a
+    newline between utterances (round 5), so the predicate can read a
+    single-utterance shape on one line only.
     """
     if verdict.intent != INTENT_VOICEMAIL:
         return None
@@ -1650,7 +1652,11 @@ def voicemail_guard_failure(
     if voicemail_shape is not None and phase in VOICEMAIL_SHAPE_PHASES:
         untagged = all(u.tag is None for u in shown)
         cited = {u.idx for u in matches}
-        joined = " ".join(
+        # Newline-joined (round-5 review fix): the caller's predicate can
+        # tell utterance boundaries apart, so a person's "Sorry, I missed
+        # your call earlier" + "can I get back to you…?" is not read as one
+        # voicemail greeting.
+        joined = "\n".join(
             u.text for u in sorted(shown, key=lambda u: u.idx)
             if u.idx in cited or untagged or u.tag == TAG_POST_QUESTION
         )
