@@ -27,8 +27,11 @@ Five livekit-agents 1.6.4 facts shape this module (verified in the installed whe
   learns of the drain solely through the cancellation ``run`` handles.
 
 The PR-4b content (persona, owed-move scheduler, tracker, commitment path, output guard) is
-wired through three seams and nothing else; the phase driver stays the only thing that moves
-a phase, and no candidate or model text can:
+wired through three seams and nothing else.  The phase driver makes every forward move; the
+only moves made outside it are the ROLEPLAY <-> ASIDE pair (the mute event, and the coach aside
+that the turn plan starts), and each of those records its return in ``_mute_resume_phase`` so
+the unmute, rejoin and attention paths restore it.  No candidate or model text can move a
+phase:
 
 * ``prepare_turn`` (from ``R1Agent.on_user_turn_completed``) runs the role-play engine ONCE per
   SDK turn and fixes what the reply must be: suppressed, scripted, an acknowledgement then the
@@ -106,6 +109,12 @@ _EXIT_BACKSTOP_SECONDS = (
     + 1.0
 )
 TURN_WRITE_SECONDS = 10.0
+# The fidelity record is posted a few rows at a time: the route costs two database round trips
+# per row, and a one-by-one post of a 10-20 row record can outlast the shared drain bound.  The
+# rows the plan 6.4 gate and the negotiation evidence need go first, so a record that is cut
+# short loses the least important rows, never the guard hits or the discounts.
+FIDELITY_POST_CONCURRENCY = 4
+_FIDELITY_ROW_PRIORITY = {"guard_hit": 0, "discount_detected": 1}
 REPLY_APPEAR_SECONDS = 5.0
 REPLY_SETTLE_SECONDS = 30.0
 # Candidate-silence windows (plan section 5.11; production values 30/20 in fly.toml).
@@ -124,8 +133,17 @@ WRAPUP_QUESTION_LIMIT = 2
 # phase machine only knows the hard caps, so the session applies the early rule itself.
 EARLY_EXIT_R_SEC = 600.0
 # The learner's one-line acknowledgement (plan 5.6 escalation step 1) is optional, the owed
-# line after it is not: an acknowledgement that is not done in time is dropped.
+# line after it is not: an acknowledgement that is not done in time is dropped.  Missing this
+# cutoff is slowness the plan tolerates (5.11 fails a turn at its 12 s deadline or on a provider
+# error), and the verbatim owed line is already the degradation, so it is logged for latency
+# analysis but never counted toward the 3-failure abort.
 ACK_DEADLINE_SECONDS = 5.0
+
+
+class AckCutoff(TimeoutError):
+    """The acknowledgement missed ``ACK_DEADLINE_SECONDS``: dropped, not a model failure."""
+
+
 # The shadow judge runs off the speech path with its own deadline (plan 5.9).
 JUDGE_DEADLINE_SECONDS = 4.0
 # Scripted lines the LEARNER speaks; every other line is the interviewer's.  The voice decides
@@ -500,6 +518,9 @@ class R1Interview:
         self._guard_trips: list[dict[str, Any]] = []
         self._logged_moves: set[str] = set()
         self._skip_failure_reset = False
+        # Unrecoverable LLM errors the SDK reported through ``_on_provider_error``: a call that
+        # raises after one of these was already counted there, and is not counted again.
+        self._llm_errors_reported = 0
         self._fidelity_queued = False
         self._judge_runner = judge_runner
         self._judge_llm: Any = None
@@ -739,25 +760,55 @@ class R1Interview:
     async def _post_fidelity(
         self, poster: Callable[..., Awaitable[Any]], events: list[dict[str, Any]]
     ) -> None:
-        """Post each row on its own bound; a failed row is logged by type and skipped."""
-        for event in events:
-            try:
-                await asyncio.wait_for(
-                    poster(
-                        event["event_type"],
-                        turn_index=event["turn_index"],
-                        family_id=event["family_id"],
-                        payload=event["payload"],
-                    ),
-                    TURN_WRITE_SECONDS,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001
+        """Post the rows a few at a time, each on its own bound, the important ones first.
+
+        A failed row is logged by type and skipped.  A record that is short for ANY reason (a
+        failed row, or the drain's shared bound cancelling this task) is logged with the number
+        of rows it lacks (``r1_admin_log_truncated``): a short record must never look the same
+        as a complete one, because it errs towards fewer guard hits.  Every row carries its own
+        ``turn_index``, so the order rows are inserted in is not meaningful to a reader.
+        """
+        ordered = sorted(events, key=lambda e: _FIDELITY_ROW_PRIORITY.get(e["event_type"], 2))
+        gate = asyncio.Semaphore(FIDELITY_POST_CONCURRENCY)
+        posted = 0
+        cancelled = False
+
+        async def post_one(event: dict[str, Any]) -> None:
+            nonlocal posted
+            async with gate:
+                try:
+                    await asyncio.wait_for(
+                        poster(
+                            event["event_type"],
+                            turn_index=event["turn_index"],
+                            family_id=event["family_id"],
+                            payload=event["payload"],
+                        ),
+                        TURN_WRITE_SECONDS,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001
+                    _log.warn(
+                        "unknown_event",
+                        error_type="r1_admin_log_failed",
+                        error_category=_error_type_of(exc),
+                    )
+                else:
+                    posted += 1
+
+        try:
+            await asyncio.gather(*(post_one(event) for event in ordered))
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+        finally:
+            if posted < len(ordered):
                 _log.warn(
                     "unknown_event",
-                    error_type="r1_admin_log_failed",
-                    error_category=_error_type_of(exc),
+                    error_type="r1_admin_log_truncated",
+                    error_category="cancelled" if cancelled else "rows_failed",
+                    option_count=len(ordered) - posted,
                 )
 
     def _log_fidelity(self, admin: dict[str, Any]) -> None:
@@ -1095,7 +1146,11 @@ class R1Interview:
         )
 
     async def _play_aside(self, plan: TurnPlan) -> None:
-        """Speak L-ASIDE-COACH as the interviewer: ASIDE pauses R, then role-play resumes."""
+        """Speak L-ASIDE-COACH as the interviewer: ASIDE pauses R, then role-play resumes.
+
+        This runs off the SDK hook, not in the driver, so it is the one place besides the mute
+        event that moves ROLEPLAY -> ASIDE, and it must guarantee the way back.
+        """
         resume = self.machine.phase is R1Phase.ROLEPLAY
         if resume:
             self.machine.transition(R1Phase.ASIDE)
@@ -1107,9 +1162,25 @@ class R1Interview:
                 voice="interviewer",
             )
         finally:
-            if resume and self.machine.phase is R1Phase.ASIDE and not self._muted:
-                self.machine.transition(R1Phase.ROLEPLAY)
-                self._restart_silence_window()
+            if resume:
+                self._close_coach_aside()
+
+    def _close_coach_aside(self) -> None:
+        """Return from the coach aside, or hand the return to the path that will see it.
+
+        The aside can end while the candidate is muted or gone.  Role-play must then NOT
+        resume here (R would run for a candidate who cannot hear), but nothing else knows
+        this aside is owed a return: the mute event only records one for an aside it
+        started itself, and a rejoin only restores what ``_mute_resume_phase`` names.  So the
+        return is recorded here, and the unmute, the rejoin and the attention wake-up
+        (``_leave_mute_aside``) restore it exactly as they do for a mute aside.
+        """
+        phase = self.machine.phase
+        if phase is R1Phase.ASIDE and not self._muted:
+            self.machine.transition(R1Phase.ROLEPLAY)
+            self._restart_silence_window()
+        elif phase is R1Phase.ASIDE or self.machine.resume_phase is R1Phase.ASIDE:
+            self._mute_resume_phase = R1Phase.ROLEPLAY
 
     def _spawn_judge(self, text: str, plan: TurnPlan) -> None:
         """Start the shadow judge for this turn, off the speech path (plan 5.9)."""
@@ -1133,12 +1204,14 @@ class R1Interview:
         """Ask the judge model on R1's OWN client, so its failures never reach the session.
 
         The session's LLM reports every error to ``_on_provider_error``, where three of them
-        end the interview; an advisory judge must not be able to do that.
+        end the interview; an advisory judge must not be able to do that.  It is also built
+        at temperature 0: its verdict feeds the commitment grade, which must be the same on
+        every run of the same conversation (plan 10.2, PR-4b "commitment determinism").
         """
-        from r1_llm import build_r1_llm
+        from r1_llm import build_r1_judge_llm
 
         if self._judge_llm is None:
-            self._judge_llm = build_r1_llm()
+            self._judge_llm = build_r1_judge_llm()
         parts: list[str] = []
         async with self._judge_llm.chat(chat_ctx=_chat_context_from(messages)) as stream:
             async for chunk in stream:
@@ -1269,6 +1342,8 @@ class R1Interview:
         assert plan is not None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + ACK_DEADLINE_SECONDS
+        reported_before = self._llm_errors_reported
+        spoke = False  # a sentence of the acknowledgement already reached the consumer
         iterator: Any = None
         try:
             stream = await _maybe_await(factory())
@@ -1276,19 +1351,23 @@ class R1Interview:
             while True:
                 remaining = deadline - loop.time()
                 if remaining <= 0:
-                    raise asyncio.TimeoutError()
+                    raise AckCutoff()
                 try:
                     item = await asyncio.wait_for(iterator.__anext__(), remaining)
                 except StopAsyncIteration:
                     break
+                except asyncio.TimeoutError:
+                    raise AckCutoff() from None
                 usage = getattr(item, "usage", None)
                 if usage is not None:
                     assert_thinking_disabled(usage)
                 text = delta_text(item)
                 if text:
                     for sentence in guard.feed(text):
+                        spoke = True
                         yield sentence + " "
             for sentence in guard.flush():
+                spoke = True
                 yield sentence + " "
         except Exception as exc:  # noqa: BLE001 - the acknowledgement is optional
             _log.warn(
@@ -1296,8 +1375,16 @@ class R1Interview:
                 error_type="r1_ack_failed",
                 error_category=_error_type_of(exc),
             )
-            self._record_generation_failure()
-            self._skip_failure_reset = True  # the scripted line below is not a model reply
+            # One failure, counted once.  The SDK reports every unrecoverable provider error of
+            # this call to ``_on_provider_error`` BEFORE it reaches us (``LLMStream._main_task``
+            # emits, then raises), so only what it cannot see is counted here: the reasoning-token
+            # guard, a broken factory.  The cutoff is not a failure at all (see the constant).
+            if not isinstance(exc, AckCutoff) and self._llm_errors_reported == reported_before:
+                self._record_generation_failure()
+            if not spoke:
+                # The scripted line below is then the first chunk and not a model reply.  Once a
+                # sentence went out, the first chunk was the model's and has already been judged.
+                self._skip_failure_reset = True
         finally:
             self._after_guard(reply, guard)
             aclose = getattr(iterator, "aclose", None)
@@ -1754,11 +1841,15 @@ class R1Interview:
         """Count unrecoverable LLM/TTS failures; recoverable ones are retried by the SDK."""
         if self._exiting:
             return
+        error = getattr(event, "error", event)
+        if str(getattr(error, "type", "")) == "llm_error" and not getattr(
+            error, "recoverable", False
+        ):
+            self._llm_errors_reported += 1  # see ``_ack_then_say``: one failure, one count
         if self._provider_status(event) in (401, 402):
             self._provider_abort = True
             self._wake()
             return
-        error = getattr(event, "error", event)
         if getattr(error, "recoverable", False):
             return
         if str(getattr(error, "type", "")) == "stt_error":

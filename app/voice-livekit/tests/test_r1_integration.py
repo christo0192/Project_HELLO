@@ -15,6 +15,7 @@ import asyncio
 import itertools
 import json
 import sys
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +25,7 @@ HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+import r1_llm
 import r1_session
 from r1_commitment import Level, commitment_line, stall_line
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
@@ -126,6 +128,61 @@ class FakeProvider:
             raise self.error
         for word in text.split(" "):
             yield SimpleNamespace(delta=SimpleNamespace(content=word + " "), usage=None)
+
+
+class SdkReportingFailure(FakeProvider):
+    """A failing call the way livekit-agents 1.6.4 shapes it.
+
+    ``LLMStream._main_task`` emits a non-recoverable ``LLMError`` on the LLM (``AgentActivity``
+    re-emits it as the session's ``error`` event, which ``_on_provider_error`` counts) and
+    THEN raises to the consumer.  The plain ``FakeProvider`` raises without the event, which
+    hid the coupling between the two counts.
+    """
+
+    def __init__(self, session, *, recoverable_first: bool = False) -> None:
+        super().__init__()
+        self.session = session
+        self.recoverable_first = recoverable_first
+
+    def __call__(self, messages):
+        self.calls.append([dict(message) for message in messages])
+        return self._fail()
+
+    def report(self, *, recoverable: bool) -> None:
+        error = SimpleNamespace(
+            type="llm_error", recoverable=recoverable, error=RuntimeError("503")
+        )
+        self.session.emit("error", SimpleNamespace(error=error, source="llm"))
+
+    async def _fail(self):
+        if self.recoverable_first:
+            self.report(recoverable=True)  # the SDK's retry that did not help
+        self.report(recoverable=False)
+        raise RuntimeError("APIConnectionError: failed after 2 attempts")
+        yield  # pragma: no cover - makes this an async generator
+
+
+class SlowAcknowledgements(FakeProvider):
+    """Free replies are prompt; every acknowledgement hangs past its cutoff."""
+
+    def __call__(self, messages):
+        self.calls.append([dict(message) for message in messages])
+        if "MODE: acknowledgement only" in "\n".join(m["content"] for m in messages):
+            return self._hang_forever()
+        return self._stream("Okay, that makes sense.")
+
+    async def _hang_forever(self):
+        await asyncio.Event().wait()
+        yield  # pragma: no cover
+
+
+class FailsAfterFirstSentence(FakeProvider):
+    """An acknowledgement whose first sentence is out before the call breaks."""
+
+    async def _stream(self, text: str):
+        for word in ("Okay,", "that", "makes", "sense.", "Right", "so"):
+            yield SimpleNamespace(delta=SimpleNamespace(content=word + " "), usage=None)
+        raise RuntimeError(POISON)
 
 
 def judge_returning(payload) -> object:
@@ -947,6 +1004,57 @@ class TestAcknowledgementIsOptionalTheOwedLineIsNot(unittest.IsolatedAsyncioTest
         self.assertEqual(rig.interview._failures, before + 1)
         self.assertNotIn(POISON, spoken)
 
+    async def test_a_failure_the_sdk_reports_counts_once_not_twice(self) -> None:
+        """One failed call is ONE failure: the SDK's own report counts it, not the ack as well."""
+        rig, _owed = await self.owed_rig(FakeProvider("ok"))
+        before = rig.interview._failures
+        spoken = await rig.converse(
+            "Our curriculum covers python modules.", advance=50,
+            provider=SdkReportingFailure(rig.session),
+        )
+        self.assertEqual(rig.plan().mode, TurnMode.ACK_THEN_SAY)
+        self.assertEqual(spoken, rig.plan().scripted_text)  # the owed line is still spoken
+        self.assertEqual(rig.interview._failures, before + 1)
+
+    async def test_a_retry_the_sdk_reports_as_recoverable_does_not_hide_the_final_failure(
+        self,
+    ) -> None:
+        rig, _owed = await self.owed_rig(FakeProvider("ok"))
+        before = rig.interview._failures
+        await rig.converse(
+            "Our curriculum covers python modules.", advance=50,
+            provider=SdkReportingFailure(rig.session, recoverable_first=True),
+        )
+        self.assertEqual(rig.interview._failures, before + 1)
+
+    async def test_two_failed_acknowledgements_in_a_row_do_not_end_the_interview(self) -> None:
+        """F3-PRIMARY then F3-PUSH are consecutive in the normal flow: 2 failures, not the abort."""
+        rig, _owed = await self.owed_rig(FakeProvider("ok"))
+        for text in ("Our curriculum covers python modules.", "It also covers SQL and statistics."):
+            await rig.converse(text, advance=50, provider=SdkReportingFailure(rig.session))
+        self.assertEqual(rig.interview._failures, 2)
+        self.assertIsNone(rig.interview._stop_outcome())
+
+    async def test_a_failure_the_sdk_cannot_see_is_still_counted_once(self) -> None:
+        """The reasoning-token guard runs in R1, after the SDK handed the chunk over."""
+        rig, _owed = await self.owed_rig(FakeProvider("ok"))
+        before = rig.interview._failures
+
+        def provider(_messages):
+            async def stream():
+                yield SimpleNamespace(
+                    delta=SimpleNamespace(content="Okay. "),
+                    usage=SimpleNamespace(reasoning_tokens=9),
+                )
+
+            return stream()
+
+        spoken = await rig.converse(
+            "Our curriculum covers python modules.", advance=50, provider=provider
+        )
+        self.assertEqual(spoken, rig.plan().scripted_text)
+        self.assertEqual(rig.interview._failures, before + 1)
+
     async def test_a_slow_acknowledgement_is_dropped_but_the_owed_line_is_spoken(self) -> None:
         rig, _owed = await self.owed_rig(FakeProvider("ok"))
         with mock.patch.object(r1_session, "ACK_DEADLINE_SECONDS", 0.05):
@@ -958,6 +1066,56 @@ class TestAcknowledgementIsOptionalTheOwedLineIsNot(unittest.IsolatedAsyncioTest
                 10.0,
             )
         self.assertEqual(spoken, rig.plan().scripted_text)
+
+    async def test_a_slow_acknowledgement_is_logged_but_is_not_a_failure(self) -> None:
+        """Plan 5.11 fails a turn at its 12 s deadline; a 5-12 s acknowledgement is only slow."""
+        rig, _owed = await self.owed_rig(FakeProvider("ok"))
+        rig.interview._failures = 2  # two earlier failures: a slow ack must neither add nor reset
+        with mock.patch.object(r1_session, "ACK_DEADLINE_SECONDS", 0.05), capture_r1_logs() as lines:
+            spoken = await asyncio.wait_for(
+                rig.converse(
+                    "Our curriculum covers python modules.", advance=50,
+                    provider=FakeProvider(hang=True),
+                ),
+                10.0,
+            )
+        self.assertEqual(spoken, rig.plan().scripted_text)
+        self.assertEqual(rig.interview._failures, 2)
+        self.assertIsNone(rig.interview._stop_outcome())
+        failed = [e for e in lines if e["error_type"] == "r1_ack_failed"]
+        self.assertEqual([e["error_category"] for e in failed], ["AckCutoff"])
+
+    async def test_slow_acknowledgements_across_the_script_never_reach_the_abort(self) -> None:
+        """A DeepSeek slowdown that only hits acknowledgements must not end the interviews."""
+        rig = Rig(provider=SlowAcknowledgements())
+        await rig.start_roleplay()
+        modes: list[TurnMode] = []
+        worst = 0
+        with mock.patch.object(r1_session, "ACK_DEADLINE_SECONDS", 0.05):
+            for index, text in enumerate(cooperative_script()):
+                await asyncio.wait_for(
+                    rig.converse(text, advance=20 if index == 0 else 50), 10.0
+                )
+                modes.append(rig.plan().mode)
+                worst = max(worst, rig.interview._failures)
+                self.assertIsNone(rig.interview._stop_outcome(), modes)
+        self.assertGreaterEqual(modes.count(TurnMode.ACK_THEN_SAY), 3, modes)  # not vacuous
+        self.assertEqual(worst, 0)
+
+    async def test_a_failure_after_the_first_sentence_does_not_block_the_next_reset(self) -> None:
+        """The first sentence was the model's: it answered, so nothing is held back for later."""
+        rig, _owed = await self.owed_rig(FakeProvider("ok"))
+        spoken = await rig.converse(
+            "Our curriculum covers python modules.", advance=50,
+            provider=FailsAfterFirstSentence(),
+        )
+        self.assertTrue(spoken.startswith("Okay, that makes sense."), spoken)
+        self.assertTrue(spoken.endswith(rig.plan().scripted_text))
+        self.assertFalse(rig.interview._skip_failure_reset)  # not left over for the next reply
+        self.assertEqual(rig.interview._failures, 1)  # reset by the answer, then this failure
+        await rig.converse("What else would you like to know?", advance=5)
+        self.assertIsNot(rig.plan().mode, TurnMode.SAY_ONLY)  # a turn the model answers
+        self.assertEqual(rig.interview._failures, 0)  # the next real reply resets as usual
 
     async def test_a_guarded_out_acknowledgement_is_a_neutral_one(self) -> None:
         rig, _owed = await self.owed_rig(FakeProvider("ok"))
@@ -1050,6 +1208,63 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rig.interview._roleplay_over())
 
 
+class TestTheJudgeIsDeterministic(unittest.IsolatedAsyncioTestCase):
+    """The shadow judge's verdict feeds the commitment grade, so it must not be sampled at 0.6."""
+
+    ENV = {"DEEPSEEK_API_KEY": "key"}
+
+    def test_the_judge_samples_greedily_and_the_learner_keeps_its_temperature(self) -> None:
+        learner = r1_llm.r1_llm_config(self.ENV)
+        judge = r1_llm.r1_llm_config(self.ENV, temperature=r1_llm.JUDGE_TEMPERATURE)
+        self.assertEqual(learner["temperature"], 0.6)
+        self.assertEqual(judge["temperature"], 0.0)
+        self.assertEqual({**judge, "temperature": 0.6}, learner)  # nothing else differs
+
+    def test_the_judge_client_is_built_with_temperature_zero(self) -> None:
+        built: list[dict] = []
+        fake_openai = SimpleNamespace(LLM=lambda **kwargs: built.append(kwargs) or SimpleNamespace())
+        fake_plugins = types.ModuleType("livekit.plugins")
+        fake_plugins.openai = fake_openai
+        fake_httpx = SimpleNamespace(Timeout=lambda **kwargs: kwargs)
+        with mock.patch.dict(sys.modules, {"httpx": fake_httpx, "livekit.plugins": fake_plugins}):
+            r1_llm.build_r1_judge_llm(self.ENV)
+            r1_llm.build_r1_llm(self.ENV)
+        self.assertEqual([item["temperature"] for item in built], [0.0, 0.6])
+        self.assertEqual(built[0]["model"], built[1]["model"])
+        self.assertEqual(built[0]["base_url"], built[1]["base_url"])
+
+    async def test_the_default_judge_asks_the_judge_client_and_never_the_learners(self) -> None:
+        rig = Rig()
+        built: list[str] = []
+
+        class Stream:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            def __aiter__(self):
+                return self._chunks()
+
+            async def _chunks(self):
+                yield SimpleNamespace(delta=SimpleNamespace(content='{"urgency_lever": false}'))
+
+        class Client:
+            def chat(self, *, chat_ctx):
+                return Stream()
+
+        with mock.patch.object(
+            r1_llm, "build_r1_judge_llm", lambda *a, **k: built.append("judge") or Client()
+        ), mock.patch.object(
+            r1_llm, "build_r1_llm", lambda *a, **k: built.append("learner") or Client()
+        ), mock.patch.object(r1_session, "_chat_context_from", lambda messages: messages):
+            first = await rig.interview._default_judge([{"role": "user", "content": "x"}])
+            await rig.interview._default_judge([{"role": "user", "content": "y"}])
+        self.assertEqual(built, ["judge"])  # the judge client, built once and reused
+        self.assertIn("urgency_lever", first)
+
+
 # ---------------------------------------------------------------------------- the driver
 
 
@@ -1109,6 +1324,133 @@ class TestRoleplayDriver(unittest.IsolatedAsyncioTestCase):
         )
         rig.final("sorry, I refreshed the page")
         self.assertIsNone(await asyncio.wait_for(turn, 10.0))
+
+
+class TestCoachAsideAlwaysReturns(unittest.IsolatedAsyncioTestCase):
+    """The coach aside starts in the SDK hook, not the driver, so it must bring itself back.
+
+    A mute or a disconnect that overlaps it must not strand the phase in ASIDE: R would stay
+    paused for the rest of the call (no deadline, time cue, stall or early exit would ever fire),
+    every later row would be labelled ``aside`` (which plan 5.10 excludes from evidence) and
+    the learner model would lose the context of those turns.
+    """
+
+    COACH = "What am I supposed to do here?"
+    NEXT = "So tell me, what made you look at data science now?"
+
+    async def coach_rig(
+        self, playout: float = 0.2
+    ) -> tuple[Rig, FakePublication, FakeParticipant]:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        rig.session.playout_seconds = playout  # the aside takes time to play
+        mic = FakePublication()
+        candidate = FakeParticipant("candidate", track_publications={"TR_mic": mic})
+        self.assertIsNone(await rig.converse(self.COACH))
+        await rig.until(lambda: rig.machine.phase is R1Phase.ASIDE)
+        return rig, mic, candidate
+
+    async def assert_role_play_is_running_again(self, rig: Rig, paused_at: float) -> None:
+        self.assertIs(rig.machine.phase, R1Phase.ROLEPLAY)
+        self.assertFalse(rig.interview._aside_needs_restore())
+        rig.clock.advance(120)
+        self.assertEqual(rig.machine.roleplay_elapsed, paused_at + 120)  # R runs again
+        rig.session.playout_seconds = 0.0
+        await rig.converse(self.NEXT)
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "roleplay")  # evidence, not an aside
+
+    async def test_a_mute_that_outlasts_the_aside_is_undone_by_the_unmute(self) -> None:
+        rig, mic, candidate = await self.coach_rig()
+        mic.muted = True
+        rig.ctx.room.emit("track_muted", candidate, mic)
+        await rig.until_spoken("L-ASIDE-COACH")
+        await rig.settle()
+        self.assertIs(rig.machine.phase, R1Phase.ASIDE)  # still muted: still paused
+        paused_at = rig.machine.roleplay_elapsed
+        rig.clock.advance(60)
+        self.assertEqual(rig.machine.roleplay_elapsed, paused_at)
+        mic.muted = False
+        rig.ctx.room.emit("track_unmuted", candidate, mic)
+        await rig.settle()
+        await self.assert_role_play_is_running_again(rig, paused_at)
+
+    async def test_a_mute_that_ends_inside_the_aside_leaves_it_to_the_aside_to_return(self) -> None:
+        rig, mic, candidate = await self.coach_rig()
+        mic.muted = True
+        rig.ctx.room.emit("track_muted", candidate, mic)
+        mic.muted = False
+        rig.ctx.room.emit("track_unmuted", candidate, mic)
+        self.assertIs(rig.machine.phase, R1Phase.ASIDE)  # the aside is still speaking
+        await rig.until_spoken("L-ASIDE-COACH")
+        await rig.settle()
+        await self.assert_role_play_is_running_again(rig, rig.machine.roleplay_elapsed)
+
+    async def test_a_mute_after_the_aside_is_the_ordinary_mute(self) -> None:
+        rig, mic, candidate = await self.coach_rig()
+        await rig.until_spoken("L-ASIDE-COACH")
+        await rig.settle()
+        self.assertIs(rig.machine.phase, R1Phase.ROLEPLAY)
+        mic.muted = True
+        rig.ctx.room.emit("track_muted", candidate, mic)
+        self.assertIs(rig.machine.phase, R1Phase.ASIDE)
+        paused_at = rig.machine.roleplay_elapsed
+        mic.muted = False
+        rig.ctx.room.emit("track_unmuted", candidate, mic)
+        await self.assert_role_play_is_running_again(rig, paused_at)
+
+    async def test_a_disconnect_during_the_aside_returns_to_the_roleplay_on_the_rejoin(self) -> None:
+        rig, _mic, _candidate = await self.coach_rig()
+        rig.interview._drop_stale_turns()
+        turn = asyncio.create_task(rig.interview._roleplay_turn())
+        await rig.settle()
+        rig.ctx.room.emit("participant_disconnected", FakeParticipant("candidate"))
+        await rig.until(lambda: rig.machine.phase is R1Phase.PAUSED_DISCONNECTED)
+        await rig.until_spoken("L-ASIDE-COACH")  # the aside ends while the candidate is gone
+        await rig.settle()
+        self.assertIs(rig.machine.phase, R1Phase.PAUSED_DISCONNECTED)
+        rig.ctx.room.emit(
+            "participant_connected",
+            FakeParticipant("candidate", track_publications={"TR_new": FakePublication()}),
+        )
+        await rig.until(lambda: rig.interview.render_line("L-REJOIN-RP") in rig.session.spoken)
+        await rig.until_spoken("L-REJOIN-RP")
+        paused_at = rig.machine.roleplay_elapsed
+        self.assertIs(rig.machine.phase, R1Phase.ROLEPLAY)
+        rig.final("sorry, I refreshed the page")
+        self.assertIsNone(await asyncio.wait_for(turn, 10.0))
+        await self.assert_role_play_is_running_again(rig, paused_at)
+
+    async def test_a_rejoin_inside_the_aside_returns_when_the_aside_ends(self) -> None:
+        rig, _mic, _candidate = await self.coach_rig(playout=0.6)
+        rig.interview._drop_stale_turns()
+        turn = asyncio.create_task(rig.interview._roleplay_turn())
+        await rig.settle()
+        rig.ctx.room.emit("participant_disconnected", FakeParticipant("candidate"))
+        await rig.until(lambda: rig.machine.phase is R1Phase.PAUSED_DISCONNECTED)
+        rig.ctx.room.emit(
+            "participant_connected",
+            FakeParticipant("candidate", track_publications={"TR_new": FakePublication()}),
+        )
+        await rig.until_spoken("L-ASIDE-COACH")
+        await rig.until(lambda: rig.interview.render_line("L-REJOIN-RP") in rig.session.spoken)
+        await rig.until_spoken("L-REJOIN-RP")
+        await rig.settle()
+        paused_at = rig.machine.roleplay_elapsed
+        rig.final("sorry, I refreshed the page")
+        self.assertIsNone(await asyncio.wait_for(turn, 10.0))
+        await self.assert_role_play_is_running_again(rig, paused_at)
+
+    async def test_an_aside_over_a_still_muted_candidate_does_not_restart_the_clock(self) -> None:
+        rig, mic, candidate = await self.coach_rig()
+        mic.muted = True
+        rig.ctx.room.emit("track_muted", candidate, mic)
+        await rig.until_spoken("L-ASIDE-COACH")
+        await rig.settle()
+        paused_at = rig.machine.roleplay_elapsed
+        rig.clock.advance(300)
+        self.assertEqual(rig.machine.roleplay_elapsed, paused_at)
+        self.assertIs(rig.machine.phase, R1Phase.ASIDE)
 
 
 # ------------------------------------------------------------------- the fidelity record
@@ -1200,6 +1542,85 @@ class TestFidelityRecord(unittest.IsolatedAsyncioTestCase):
         self.assertIn("r1_admin_log_failed", error_types(lines))
         self.assertNotIn(POISON, json.dumps(lines))
         self.assertEqual(rig.writer.admin_events, [])
+
+    async def expected_rows(self, rig: Rig) -> list[dict]:
+        return fidelity_events(
+            rig.engine.admin_log(final=True, r_end=rig.machine.roleplay_elapsed),
+            fidelity_pins(rig.interview.persona_choice),
+            rig.interview._guard_trips,
+        )
+
+    async def test_a_slow_route_does_not_truncate_the_record_because_rows_are_posted_together(
+        self,
+    ) -> None:
+        """One row at a time, ~0.6 s each, 10-20 rows outlast the drain's shared 10 s bound."""
+        rig = await self.full_session()
+        expected = await self.expected_rows(rig)
+        in_flight = peak = 0
+        posted: list[str] = []
+
+        async def slow_admin_log(event_type, **_kwargs):
+            nonlocal in_flight, peak
+            in_flight += 1
+            peak = max(peak, in_flight)
+            await asyncio.sleep(0.02)
+            in_flight -= 1
+            posted.append(event_type)
+
+        rig.writer.admin_log = slow_admin_log
+        with capture_r1_logs() as lines:
+            rig.interview._begin_exit()
+            rig.interview._queue_fidelity()
+            await rig.flush()
+        self.assertEqual(sorted(posted), sorted(e["event_type"] for e in expected))
+        self.assertGreater(peak, 1)  # together
+        self.assertLessEqual(peak, r1_session.FIDELITY_POST_CONCURRENCY)  # but not unbounded
+        self.assertNotIn("r1_admin_log_truncated", error_types(lines))  # complete: no flag
+
+    async def test_a_cut_short_record_keeps_the_guard_hits_and_discounts_and_says_it_is_short(
+        self,
+    ) -> None:
+        rig = await self.full_session()
+        expected = await self.expected_rows(rig)
+        important = [
+            e["event_type"] for e in expected if e["event_type"] in ("guard_hit", "discount_detected")
+        ]
+        self.assertTrue({"guard_hit", "discount_detected"} <= set(important))
+        posted: list[str] = []
+        keep = len(important) + 1
+
+        async def stalls_after_a_few(event_type, **_kwargs):
+            if len(posted) >= keep:
+                await asyncio.Event().wait()
+            posted.append(event_type)
+
+        rig.writer.admin_log = stalls_after_a_few
+        with mock.patch.object(r1_session, "FIDELITY_POST_CONCURRENCY", 1), mock.patch.object(
+            r1_session, "TRANSCRIPT_DRAIN_SECONDS", 0.2
+        ), capture_r1_logs() as lines:
+            rig.interview._begin_exit()
+            rig.interview._queue_fidelity()
+            await rig.flush()
+        # The rows that fail the 6.4 gate and the negotiation evidence went out FIRST.
+        self.assertCountEqual(posted[: len(important)], important)
+        self.assertEqual(len(posted), keep)
+        short = [e for e in lines if e["error_type"] == "r1_admin_log_truncated"]
+        self.assertEqual(len(short), 1)
+        self.assertEqual(short[0]["option_count"], len(expected) - keep)
+        self.assertEqual(short[0]["error_category"], "cancelled")
+
+    async def test_rows_that_failed_are_counted_in_the_short_record_flag(self) -> None:
+        rig = await self.full_session()
+        expected = await self.expected_rows(rig)
+        rig.writer.admin_error = RuntimeError(POISON)
+        with capture_r1_logs() as lines:
+            rig.interview._begin_exit()
+            rig.interview._queue_fidelity()
+            await asyncio.wait_for(rig.flush(), 10.0)
+        short = [e for e in lines if e["error_type"] == "r1_admin_log_truncated"]
+        self.assertEqual([e["option_count"] for e in short], [len(expected)])
+        self.assertEqual(short[0]["error_category"], "rows_failed")
+        self.assertNotIn(POISON, json.dumps(lines))
 
     async def test_the_rows_ride_the_transcript_drain_so_they_precede_the_terminal_write(
         self,
