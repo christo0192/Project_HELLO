@@ -2299,12 +2299,12 @@ describe('live handler shapes match documented schemas', () => {
     const res = await request(app)
       .post(`/api/export/${UUID_2}/report-audit`)
       .set('Authorization', AUTH_HEADER)
-      .send({ format: 'html', recordings: 2, transcript: true });
+      .send({ format: 'html', planned_recordings: 2, transcript: true });
     expect(res.status).toBe(204);
     const bad = await request(app)
       .post(`/api/export/${UUID_2}/report-audit`)
       .set('Authorization', AUTH_HEADER)
-      .send({ format: 'html', recordings: 2, transcript: true, extra: 'x' });
+      .send({ format: 'html', planned_recordings: 2, transcript: true, extra: 'x' });
     expect(bad.status).toBe(400);
   });
 
