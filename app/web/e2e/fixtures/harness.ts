@@ -25,7 +25,7 @@
  */
 
 import { test as base, expect, type Page, type Route, type TestInfo } from '@playwright/test';
-import { routeApi } from './api-router';
+import { routeApi, type MockResponse } from './api-router';
 import { createDataset, type Dataset } from './data';
 import { FROZEN_NOW_MS, MOCK_API_ORIGIN, MOCK_SUPABASE_ORIGIN } from './env';
 import { ACCESS_TOKEN, mockRealtime, seedAdminSession, supabaseReply } from './supabase';
@@ -38,6 +38,8 @@ export interface RecordedCall {
   mocked: boolean;
   /** Whether the request carried `Authorization: Bearer <the seeded session's access token>`. */
   authorized: boolean;
+  /** Whether the request carried ANY `Authorization` header (a candidate's must not). */
+  hasAuthorization: boolean;
 }
 
 export interface AppHarness {
@@ -107,7 +109,30 @@ async function waitForLoadingIndicators(page: Page): Promise<void> {
   );
 }
 
-async function installHarness(page: Page, testInfo: TestInfo): Promise<AppHarness> {
+/** Answers one API request, or null when nothing matches (a harness gap). */
+export type ApiRouter = (
+  method: string,
+  url: URL,
+  body: Record<string, unknown> | null,
+  db: Dataset,
+) => MockResponse | null;
+
+export interface HarnessOptions {
+  /**
+   * Seed the fabricated admin session. Candidate pages are public and must run
+   * signed out, exactly as a candidate's browser does (default true).
+   */
+  signedIn?: boolean;
+  /** The fake API. The candidate harness swaps in its own so no recruiter route answers. */
+  api?: ApiRouter;
+}
+
+export async function installHarness(
+  page: Page,
+  testInfo: TestInfo,
+  options: HarnessOptions = {},
+): Promise<AppHarness> {
+  const { signedIn = true, api = routeApi } = options;
   const db = createDataset();
   const calls: RecordedCall[] = [];
   const unmocked: RecordedCall[] = [];
@@ -117,7 +142,7 @@ async function installHarness(page: Page, testInfo: TestInfo): Promise<AppHarnes
   const baseHost = new URL(baseOrigin).host;
 
   await page.clock.setFixedTime(new Date(FROZEN_NOW_MS));
-  await seedAdminSession(page);
+  if (signedIn) await seedAdminSession(page);
 
   // WebSockets bypass `page.route` entirely, so they get their own guard.
   // ORDER MATTERS: for a WebSocket, Playwright runs only the MOST RECENTLY
@@ -160,10 +185,11 @@ async function installHarness(page: Page, testInfo: TestInfo): Promise<AppHarnes
     // THE seeded token, not merely some bearer: a call carrying a stale or
     // anon-key bearer would otherwise read as signed in.
     const authorized = request.headers()['authorization'] === `Bearer ${ACCESS_TOKEN}`;
+    const hasAuthorization = request.headers()['authorization'] !== undefined;
 
-    const reply = isApi ? routeApi(method, url, parseBody(route), db) : supabaseReply(method, url);
+    const reply = isApi ? api(method, url, parseBody(route), db) : supabaseReply(method, url);
     if (!reply) {
-      const call = { method, url: `${url.origin}${relative}`, status: 500, mocked: false, authorized };
+      const call = { method, url: `${url.origin}${relative}`, status: 500, mocked: false, authorized, hasAuthorization };
       calls.push(call);
       unmocked.push(call);
       console.error(`[e2e] UNMOCKED endpoint: ${method} ${url.origin}${relative}`);
@@ -175,7 +201,7 @@ async function installHarness(page: Page, testInfo: TestInfo): Promise<AppHarnes
       });
     }
 
-    calls.push({ method, url: `${url.origin}${relative}`, status: reply.status, mocked: true, authorized });
+    calls.push({ method, url: `${url.origin}${relative}`, status: reply.status, mocked: true, authorized, hasAuthorization });
     const headers = { ...CORS_HEADERS(route), ...('headers' in reply ? reply.headers : {}) };
     if (reply.status === 204) return route.fulfill({ status: 204, headers });
     if ('text' in reply && reply.text !== undefined) {
@@ -215,34 +241,42 @@ async function installHarness(page: Page, testInfo: TestInfo): Promise<AppHarnes
   return harness;
 }
 
+/**
+ * Attach diagnostics and fail the test if the page made a request the harness
+ * does not answer. Shared by the recruiter `app` fixture and the candidate
+ * fixture so both are loud by construction.
+ */
+export async function reportHarness(harness: AppHarness, testInfo: TestInfo): Promise<void> {
+  // Diagnostics ride along with every test result.
+  await testInfo.attach('api-calls.json', { body: JSON.stringify(harness.calls, null, 2), contentType: 'application/json' });
+  if (harness.consoleErrors.length) {
+    await testInfo.attach('console-errors.txt', { body: harness.consoleErrors.join('\n\n'), contentType: 'text/plain' });
+    // An unexpected failure usually IS a console error (a render crash
+    // behind an error boundary); print it where the runner output shows.
+    if (testInfo.status !== testInfo.expectedStatus) {
+      console.log(`[e2e] console errors in "${testInfo.title}" (${testInfo.project.name}):\n${harness.consoleErrors.map((e) => `  ${e.split('\n')[0]}`).join('\n')}`);
+    }
+  }
+  // Loud by construction: a gap in the mocks fails the test even when the
+  // test body never asserted on it (e.g. a screenshot-only test).
+  if (harness.unmocked.length || harness.external.length) {
+    throw new Error(
+      [
+        'The page made requests the offline harness does not answer:',
+        ...harness.unmocked.map((c) => `  UNMOCKED ${c.method} ${c.url}`),
+        ...harness.external.map((u) => `  EXTERNAL ${u}`),
+        'Add a row to e2e/fixtures/api-router.ts (or supabase.ts) for each.',
+      ].join('\n'),
+    );
+  }
+}
+
 export const test = base.extend<{ app: AppHarness }>({
   app: [
     async ({ page }, use, testInfo) => {
       const harness = await installHarness(page, testInfo);
       await use(harness);
-
-      // Diagnostics ride along with every test result.
-      await testInfo.attach('api-calls.json', { body: JSON.stringify(harness.calls, null, 2), contentType: 'application/json' });
-      if (harness.consoleErrors.length) {
-        await testInfo.attach('console-errors.txt', { body: harness.consoleErrors.join('\n\n'), contentType: 'text/plain' });
-        // An unexpected failure usually IS a console error (a render crash
-        // behind an error boundary); print it where the runner output shows.
-        if (testInfo.status !== testInfo.expectedStatus) {
-          console.log(`[e2e] console errors in "${testInfo.title}" (${testInfo.project.name}):\n${harness.consoleErrors.map((e) => `  ${e.split('\n')[0]}`).join('\n')}`);
-        }
-      }
-      // Loud by construction: a gap in the mocks fails the test even when the
-      // test body never asserted on it (e.g. a screenshot-only test).
-      if (harness.unmocked.length || harness.external.length) {
-        throw new Error(
-          [
-            'The page made requests the offline harness does not answer:',
-            ...harness.unmocked.map((c) => `  UNMOCKED ${c.method} ${c.url}`),
-            ...harness.external.map((u) => `  EXTERNAL ${u}`),
-            'Add a row to e2e/fixtures/api-router.ts (or supabase.ts) for each.',
-          ].join('\n'),
-        );
-      }
+      await reportHarness(harness, testInfo);
     },
     { auto: true },
   ],

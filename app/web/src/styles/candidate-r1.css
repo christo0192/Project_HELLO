@@ -1,0 +1,81 @@
+/* R1 candidate surfaces (notice, device check, live interview).
+
+   Layered on candidate-experience.css and the `.candidate-scope` palette:
+   every colour is a `--c-*` token, type is sentence case at the existing
+   label/body steps, and motion is limited to compositor properties. */
+
+.r1-secondary-cta {
+  min-height: 44px;
+  margin-top: 16px;
+  padding: 0 18px;
+  border: 1px solid var(--c-control-border);
+  border-radius: 14px;
+  background: rgb(255 255 255 / .72);
+  color: var(--c-ink-secondary);
+  font: inherit;
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.r1-secondary-cta:hover:not(:disabled) { background: var(--c-border-light); }
+.r1-secondary-cta:disabled { cursor: not-allowed; color: var(--c-ink-muted); }
+.r1-secondary-cta:focus-visible,
+.r1-link-button:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 3px; }
+.r1-link-button { margin-top: 18px; padding: 4px 0; border: 0; background: transparent; color: var(--c-accent); font: inherit; font-size: 13px; font-weight: 700; text-decoration: underline; cursor: pointer; }
+.r1-actions { display: grid; gap: 10px; margin-top: 20px; }
+.r1-actions .candidate-primary-cta, .r1-actions .r1-secondary-cta { width: 100%; margin-top: 0; }
+.r1-withdraw { margin-top: 18px; }
+.r1-ended__note { margin-top: 24px; text-align: left; }
+.r1-ended__note a { color: var(--c-accent); font-weight: 700; }
+
+/* Notice and consent */
+.r1-notice { margin: 24px auto 0; padding: 34px; }
+.r1-notice h1 { margin: 8px 0; font-size: clamp(28px, 5vw, 42px); letter-spacing: -.045em; line-height: 1.06; }
+.r1-notice__body { max-height: 320px; margin: 20px 0; padding: 16px 18px; overflow: auto; border: 1px solid var(--c-border); border-radius: 16px; background: rgb(255 255 255 / .62); color: var(--c-ink-secondary); font-size: 14px; line-height: 1.6; }
+.r1-notice__body:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 2px; }
+.r1-notice__body h2 { margin: 18px 0 6px; color: var(--c-ink); font-size: 15px; letter-spacing: -.01em; }
+.r1-notice__body h2:first-child { margin-top: 0; }
+.r1-notice__body p { margin: 0 0 10px; }
+.r1-notice__body ul { margin: 0 0 10px; padding-left: 20px; }
+.r1-notice__body li { margin: 0 0 4px; }
+.r1-notice__facts { display: grid; gap: 8px; margin: 18px 0 0; padding: 0; list-style: none; color: var(--c-ink-secondary); font-size: 14px; line-height: 1.5; }
+.r1-notice__facts li { padding-left: 18px; position: relative; }
+.r1-notice__facts li::before { position: absolute; left: 0; top: .6em; width: 6px; height: 6px; border-radius: 50%; background: var(--c-accent); content: ''; }
+
+/* Device check */
+.r1-devices { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.r1-devices .candidate-field-label { margin-top: 18px; }
+.r1-selfview { position: relative; width: 100%; max-width: 420px; margin: 18px auto 0; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 18px; background: var(--c-ink); }
+.r1-selfview video { display: block; width: 100%; height: 100%; object-fit: cover; transform: scaleX(-1); }
+.r1-selfview__placeholder { position: absolute; inset: 0; display: grid; place-items: center; padding: 12px; color: var(--c-border); font-size: 13px; text-align: center; }
+
+/* Live interview */
+.r1-live { display: grid; grid-template-columns: minmax(0, 1fr) minmax(300px, 360px); align-items: start; gap: 20px; width: min(100%, 1180px); margin: 24px auto 0; }
+.r1-live__stage { display: flex; min-height: min(720px, calc(100vh - 160px)); flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 28px; }
+.r1-live__stage .candidate-eyebrow { margin: 0; }
+.r1-live__title { margin: 0; font-size: clamp(22px, 3.4vw, 32px); letter-spacing: -.035em; line-height: 1.1; text-align: center; }
+.r1-live__side { display: grid; gap: 16px; }
+.r1-phase { width: min(100%, 520px); padding: 12px 16px; border: 1px solid var(--c-border); border-radius: 16px; background: rgb(255 255 255 / .66); text-align: center; }
+.r1-phase__label { margin: 0; color: var(--c-ink); font-size: 16px; font-weight: 700; }
+.r1-phase__detail { margin: 2px 0 0; color: var(--c-ink-secondary); font-size: 13px; line-height: 1.45; }
+.r1-phase[data-phase="roleplay"] { border-color: var(--c-accent); background: var(--c-accent-light); }
+.r1-banner { width: min(100%, 520px); padding: 10px 14px; border: 1px solid var(--c-caution); border-radius: 14px; background: var(--c-caution-light); color: var(--c-caution); font-size: 13px; font-weight: 650; line-height: 1.45; text-align: center; }
+.r1-live__selfview { width: min(46%, 200px); margin: 0 auto; }
+.r1-live__selfview.r1-selfview { max-width: 200px; margin-top: 0; border-radius: 14px; }
+.r1-lead { padding: 20px 22px; }
+.r1-lead h2 { margin: 0 0 6px; font-size: 17px; letter-spacing: -.02em; }
+.r1-lead__who { margin: 0 0 8px; color: var(--c-ink); font-size: 15px; font-weight: 700; }
+.r1-lead p { margin: 0; color: var(--c-ink-secondary); font-size: 14px; line-height: 1.55; }
+.r1-lead p + p { margin-top: 8px; }
+.r1-live .candidate-interview__captions { min-height: 280px; }
+
+@media (max-width: 760px) {
+  .r1-notice { padding: 24px 18px; }
+  .r1-devices { grid-template-columns: 1fr; }
+  .r1-live { grid-template-columns: 1fr; gap: 12px; }
+  .r1-live__stage { min-height: 0; padding: 18px 12px; }
+  .r1-live .candidate-interview__captions { min-height: 220px; }
+}
+@media (prefers-reduced-transparency: reduce), (forced-colors: active) {
+  .r1-phase, .r1-notice__body, .r1-secondary-cta { background: #fff; }
+}
