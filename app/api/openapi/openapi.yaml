@@ -5068,7 +5068,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
         '409':
-          description: Session not in an invitable state.
+          description: Session not in an invitable state (`session_not_available`), or bound to an R1 interview round (`r1_session_not_invitable`; R1 sessions are joined only through /api/r1/*). Nothing is created.
           content:
             application/json:
               schema:

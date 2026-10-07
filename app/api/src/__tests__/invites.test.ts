@@ -14,8 +14,10 @@
  * - Lifecycle cleanup regression
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach, afterEach } from 'vitest';
 import { randomBytes, createHash } from 'node:crypto';
+import express from 'express';
+import request from 'supertest';
 
 // ── Supabase mock ────────────────────────────────────────────────────
 
@@ -385,5 +387,201 @@ describe('recording object key', () => {
 
     // Verify the route in livekit.ts uses recording_object_key
     // by checking the source (compile-time check via typecheck)
+  });
+});
+
+// ── 8. POST /invite — R1 sessions are refused ────────────────────────
+// A session bound to an interview round (call_sessions.interview_round_id) is
+// joined only through /api/r1/*. A recruiter-issued legacy invite for one would
+// let the exchange provision a marked R1 room on BROWSER_LIVEKIT_TARGET=r1 while
+// skipping the R1 attempt token, consent re-check and health gate.
+
+describe('POST /invite — R1 lane fence', () => {
+  const ROUND_ID = '00000000-0000-4000-8000-0000000000a1';
+  const OTHER_USER_ID = '00000000-0000-4000-8000-0000000000b2';
+  const ENV_KEYS = [
+    'BROWSER_LIVEKIT_TARGET',
+    'R1_LIVEKIT_URL',
+    'R1_LIVEKIT_API_KEY',
+    'R1_LIVEKIT_API_SECRET',
+  ] as const;
+  const saved: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> = {};
+
+  // The router's import graph (room provisioning, egress, lifecycle) is heavy:
+  // load it once, up front, so no individual test pays for it against the 5 s
+  // default test timeout (a timed-out request would leak into the next test).
+  let invitesRouter: typeof import('../routes/invites.js').invitesRouter;
+  let finalErrorHandler: typeof import('../lib/validation.js').finalErrorHandler;
+
+  beforeAll(async () => {
+    invitesRouter = (await import('../routes/invites.js')).invitesRouter;
+    finalErrorHandler = (await import('../lib/validation.js')).finalErrorHandler;
+  }, 60_000);
+
+  beforeEach(() => {
+    for (const key of ENV_KEYS) {
+      saved[key] = process.env[key];
+      delete process.env[key];
+    }
+  });
+
+  afterEach(() => {
+    for (const key of ENV_KEYS) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  });
+
+  function selectR1Lane(): void {
+    process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+    process.env.R1_LIVEKIT_URL = 'http://r1-livekit-test:7880';
+    process.env.R1_LIVEKIT_API_KEY = 'test-r1-key';
+    process.env.R1_LIVEKIT_API_SECRET = 'test-r1-secret';
+  }
+
+  /** The invite router behind an injected recruiter, with Supabase stubbed per table. */
+  async function inviteApp(
+    session: Record<string, unknown> | null,
+    user: { id: string; appRole: 'admin' | 'interviewer' } = {
+      id: INTERVIEWER_ID,
+      appRole: 'interviewer',
+    },
+  ) {
+    const tablesTouched: string[] = [];
+    const inserts: Array<Record<string, unknown>> = [];
+    mockFrom.mockImplementation((table: string) => {
+      tablesTouched.push(table);
+      if (table === 'call_sessions') {
+        return chain(session
+          ? { data: session, error: null }
+          : { data: null, error: { message: 'not found' } });
+      }
+      if (table === 'candidate_invites') {
+        return {
+          insert: (row: Record<string, unknown>) => {
+            inserts.push(row);
+            return chain({ error: null });
+          },
+        };
+      }
+      throw new Error(`unexpected table ${table}`);
+    });
+
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => {
+      (req as unknown as { authUser: unknown }).authUser = user;
+      next();
+    });
+    app.use('/api/livekit', invitesRouter);
+    app.use(finalErrorHandler);
+    return { app, tablesTouched, inserts };
+  }
+
+  function sessionRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      id: SESSION_ID,
+      candidate_id: CANDIDATE_ID,
+      status: 'created',
+      external_call_id: null,
+      owner_id: INTERVIEWER_ID,
+      interview_round_id: null,
+      ...overrides,
+    };
+  }
+
+  const body = { candidate_id: CANDIDATE_ID, session_id: SESSION_ID };
+
+  it.each([
+    ['Cloud endpoint', () => undefined],
+    ['R1 endpoint', selectR1Lane],
+  ])('refuses an R1 round session with 409 r1_session_not_invitable and writes nothing (%s)', async (_label, select) => {
+    select();
+    const { app, tablesTouched, inserts } = await inviteApp(
+      sessionRow({ interview_round_id: ROUND_ID }),
+    );
+
+    const res = await request(app).post('/api/livekit/invite').send(body);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'r1_session_not_invitable' });
+    expect(res.body.token).toBeUndefined();
+    // Only the session lookup happened: no invite row, no audit or other write.
+    expect(tablesTouched).toEqual(['call_sessions']);
+    expect(inserts).toEqual([]);
+  });
+
+  it.each(['created', 'waiting'])('refuses an R1 round session in status %s', async (status) => {
+    selectR1Lane();
+    const { app, tablesTouched, inserts } = await inviteApp(
+      sessionRow({
+        status,
+        interview_round_id: ROUND_ID,
+        external_call_id: status === 'waiting' ? ROOM_NAME : null,
+      }),
+    );
+
+    const res = await request(app).post('/api/livekit/invite').send(body);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'r1_session_not_invitable' });
+    expect(tablesTouched).toEqual(['call_sessions']);
+    expect(inserts).toEqual([]);
+  });
+
+  it('refuses an R1 round session for an admin who does not own it', async () => {
+    selectR1Lane();
+    const { app, tablesTouched, inserts } = await inviteApp(
+      sessionRow({ owner_id: OTHER_USER_ID, interview_round_id: ROUND_ID }),
+      { id: INTERVIEWER_ID, appRole: 'admin' },
+    );
+
+    const res = await request(app).post('/api/livekit/invite').send(body);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'r1_session_not_invitable' });
+    expect(tablesTouched).toEqual(['call_sessions']);
+    expect(inserts).toEqual([]);
+  });
+
+  it('still answers owner_mismatch first, so a non-owner learns nothing about the lane', async () => {
+    const { app, inserts } = await inviteApp(
+      sessionRow({ owner_id: OTHER_USER_ID, interview_round_id: ROUND_ID }),
+    );
+
+    const res = await request(app).post('/api/livekit/invite').send(body);
+
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ error: 'owner_mismatch' });
+    expect(inserts).toEqual([]);
+  });
+
+  it('leaves a legacy session (no interview round) unchanged: 201 and one digest-only invite row', async () => {
+    const { app, tablesTouched, inserts } = await inviteApp(sessionRow());
+
+    const res = await request(app).post('/api/livekit/invite').send(body);
+
+    expect(res.status).toBe(201);
+    expect(res.body.token).toMatch(/^[0-9a-f]{64}$/);
+    expect(typeof res.body.expires_at).toBe('string');
+    expect(tablesTouched).toEqual(['call_sessions', 'candidate_invites']);
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]).toMatchObject({
+      candidate_id: CANDIDATE_ID,
+      session_id: SESSION_ID,
+      created_by: INTERVIEWER_ID,
+      token_digest: createHash('sha256').update(res.body.token).digest('hex'),
+    });
+    expect(JSON.stringify(inserts[0])).not.toContain(res.body.token);
+  });
+
+  it('keeps the non-invitable-status refusal for a legacy session', async () => {
+    const { app, inserts } = await inviteApp(sessionRow({ status: 'completed' }));
+
+    const res = await request(app).post('/api/livekit/invite').send(body);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'session_not_available' });
+    expect(inserts).toEqual([]);
   });
 });
