@@ -73,6 +73,14 @@ paths:
       tags: [r1]
       operationId: grantR1Retake
       responses: { '200': { description: Retake granted when remaining count permits } }
+  /api/interview-rounds/{id}/cancel-pending-reject:
+    post:
+      tags: [r1]
+      operationId: cancelR1PendingReject
+      summary: Cancel the 24 h pending reject R1 opened (audited override)
+      responses:
+        '200': { description: Pending reject cancelled; reports whether the override monitor switched auto-status off }
+        '409': { description: No pending reject on this round }
   /api/admin/r1/settings:
     get:
       tags: [r1]
@@ -1287,6 +1295,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '503':
+          description: The R1 session lookup that keeps R1 assessments out of the phone latest-assessment columns could not be completed (error service_unavailable). The list is never returned unfiltered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
 
   /api/candidates/summary:
     get:
@@ -1300,6 +1314,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CandidatesSummary'
+        '503':
+          description: The R1 session lookup that keeps R1 assessments out of the phone aggregate could not be completed (error service_unavailable). The aggregate is never computed unfiltered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
 
   /api/candidates/{id}:
     parameters:

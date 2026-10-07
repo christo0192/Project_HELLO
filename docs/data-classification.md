@@ -120,6 +120,7 @@
 | `interview_rounds.id`, `candidate_id`, `role_id`, `kind`, `status`, attempt counters, timestamps, `created_by`, `version` | Internal | R1 lifecycle and opaque references |
 | `interview_rounds.link_token_digest` | **Secret** | One-time-link digest; never returned to browser roles or logs |
 | `interview_rounds.candidate_status_at_send`, `recommendation`, `overall`, `assessment_id`, status-effect timestamps | Internal | Hiring workflow and scoring metadata |
+| `interview_rounds.status_write`, `status_write_assessment_id`, `status_write_audit`, `pending_reject_cancelled_at`, `pending_reject_cancelled_by` | Internal | R1 status-effect outcome, the version/threshold metadata a pending reject was opened with, and the audited HR cancellation of a pending reject (0122) |
 | `interview_round_attempts.session_id`, `round_id`, attempt/persona/version/variant, `counted`, `outcome`, timestamps | Internal | R1 attempt administration metadata |
 | `interview_round_attempts.content_sha` | Internal | Versioned R1 content-integrity digest |
 | `interview_round_attempts.nonce_digest` | **Secret** | Reconnect nonce digest; never browser-readable |
@@ -320,6 +321,16 @@ to describe implemented schema only.
 | `roles.interview_kind` | Internal | Selects an interview type such as `sales_r1` |
 | `call_sessions.interview_round_id` | Public | Opaque R1 round FK |
 | `transcript_turns.phase`, `transcript_turns.interrupted` | Internal | R1 phase/evidence administration metadata |
+
+### R1 scorer output (0122)
+
+| Data | Classification | Notes |
+|------|---------------|-------|
+| `assessments` rows for an R1 session (`metric_results`, `raw.r1`, rationale text, evidence quotes) | **Confidential PII** | Candidate speech excerpts and scoring text, like every assessment; retained under the same policy as phone assessments |
+| `raw.r1.administration_quality`, `raw.r1.gate`, `raw.r1.agreement`, `raw.r1.versions` | Internal | Counts, stable failure codes and version identifiers only; no candidate text |
+| `r1_admin_log.payload` for `session_facts` and the other worker events | Internal | Structured numbers and identifiers produced by the worker; never candidate speech |
+| `audit_events.metadata` written by the R1 scorer (versions, thresholds, prior/new status, gate codes) | Internal | Bounded to 2 KB; no transcript, name or score text |
+| `r1_settings.override_window_reset_at` | Internal | When auto-status was last switched back on; bounds the override monitor's window (0122) |
 
 ### `screening_v2.r1_usage_ledger` and `screening_v2.r1_admin_log` (planned)
 

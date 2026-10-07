@@ -310,6 +310,130 @@ restart, in the month of the restart), remove the duplicate attempt rows, and ap
 again. After 0119 is live, save the allocation once (see the
 launch checklist: `allocation_set_at` is NULL on the existing row) and re-enter
 the dashboard figure to re-stamp its baseline.
+## Scoring, status effects and the override monitor
+
+Implemented in PR-5 (migration 0122). R1 sessions are scored by their own queue
+runtime (`r1.assessment`, concurrency 1, started only when `R1_ENABLED=true` and
+claiming only while `r1_settings.enabled` is true), with its own DeepSeek runner
+and circuit breaker. The phone scorer, its prompt and the phone runtime handler
+set (`phone.dial`, `phone.assessment`) are untouched and fenced by tests.
+
+**Flow.** A completed R1 session enqueues `r1.assessment` (0116 trigger). The
+handler scores the phase-labelled transcript three times (median per metric),
+evaluates the coverage and fidelity gate, stores a v2 assessment, attaches it to
+the round (`r1_attach_assessment`) and applies the status effect
+(`r1_apply_status_effect`). A re-run adopts the stored assessment and never calls
+the model again. Anything that cannot be trusted ends in `human_review`, which has
+no status effect: a gate failure, disagreeing runs, invalid evidence references (a
+metric scored 3 or 4 must cite at least one valid candidate turn), an incomplete
+scorecard, a role whose active scorecard is not the R1 scorecard, or (on the final
+queue attempt) a provider or validation failure, which first records a `human_review`
+placeholder and then dead-letters.
+
+**Wrong scorecard.** If the R1 role's active scorecard is not exactly the five R1
+metric keys with their plan 6.1 weights (for example the role still carries the
+default phone metrics because the manual seed has not run), no model call is made:
+the session gets a `human_review` placeholder with code `r1_scorecard_mismatch`,
+the job succeeds, and nothing is retried. Run the seed (below) to fix it; a later
+re-score supersedes the placeholder.
+
+**Provider outages defer.** A DeepSeek timeout, a connection failure or R1's own open
+circuit breaker defers the job (reason `r1_provider_unavailable`, delay at least the
+60 s breaker cooldown) instead of failing it: the attempt is refunded, so a short
+outage does not dead-letter the job. A deferral streak is capped at 60 minutes; past
+it the failure takes the normal retry, placeholder and DLQ path.
+
+**Switches.** `R1_ENABLED` (API env) builds the runtime. `r1_settings.enabled`
+gates claiming. `r1_settings.auto_status_enabled` (default **off**, owner-only,
+audited) gates every candidate status write. With it off the outcome is recorded
+as `status_write = 'flag_off'` and is never applied retroactively. Thresholds
+(`advance_threshold` 65, `hold_threshold` 45) live in `r1_settings`; a level 1 on
+objection handling or negotiation caps an advance at hold.
+
+**`interview_rounds.status_write`.**
+
+| Value | Meaning |
+|---|---|
+| `human_review` | No auto effect: gate failed, runs disagreed, evidence invalid, or scoring failed |
+| `hold_flag` | Hold: a flag only, no write |
+| `flag_off` | An advance/reject was recommended but auto-status is off |
+| `advanced` | Candidate moved to `advanced` by compare-and-set |
+| `pending_reject` | 24 h cancellable window open (`pending_reject_until`) |
+| `rejected` | The window closed and the candidate was moved to `rejected` |
+| `pending_reject_cancelled` | HR cancelled the window (an override) |
+| `pending_reject_dropped` | Closed without executing: auto-status off, window overdue by more than an hour (`window_stale`), round no longer final (`round_not_final`), candidate changed by a human, appeal block, or a newer attempt replaced the assessment. The reason is in the audit row |
+| `cas_lost` | A human changed the candidate after sending; the human change wins |
+| `decision_blocked` | `decision_use_blocked_at` is set (appeal) |
+| `round_not_final` | The round was cancelled by HR, or a manual retake re-opened it, so no candidate status is written (D1: status is written only when the round is final) |
+
+**Pending reject.** HR cancels on the card (`POST
+/api/interview-rounds/{id}/cancel-pending-reject`, admin or owning interviewer).
+The `r1-status` loop closes due windows once a minute, and only while R1 is enabled.
+A window the loop did not get to within an hour of its close (R1 was switched off, or
+the API was down) is dropped as `window_stale`, never executed late: a human decides.
+A window whose round HR cancelled or re-opened with a manual retake is dropped as
+`round_not_final`. Every write, drop and cancellation is in `audit_events` (actor
+`system:r1` or the recruiter; scorer, rubric and thresholds versions the window was
+opened with; prior and new status).
+
+**Override monitor.** Over the latest 20 resolved R1 rejects (executed or
+cancelled), an override is an HR cancellation or an executed reject whose candidate
+was later moved off `rejected`. Above 10% auto-status is switched off and audited
+(`reason: override_rate_exceeded`). With fewer than 20 resolved rejects the
+denominator is the actual count, so a single early override trips it: switching off
+is the safe direction. The owner re-enables only after reviewing the overrides, and
+the re-enable starts a NEW window: `r1_settings.override_window_reset_at` is stamped
+by a trigger whenever auto-status goes from off to on, and only decisions resolved
+after it count. (Nothing can resolve while auto-status is off, so without the reset the
+same window would trip the monitor again on the next status tick.) Whether a minimum
+number of resolved decisions should be required before the monitor may trip is an
+open owner decision; today it is one.
+
+**Alerts.** Dead-lettered scoring jobs appear in `v_funnel_failures` as stage
+`scoring` with code `r1:<code>` (`r1.recording.*` as `recording`, other `r1.*` as
+`call`). Replay with the platform DLQ replay procedure; a successful re-score
+supersedes the placeholder as the next assessment revision.
+
+**Worker contract (`session_facts`).** The gate fails closed on anything the worker
+does not report. The worker (PR-4b) must post, through `POST
+/api/internal/r1/admin-log`: `need_revealed` (turn_index, `{need, probed_turn}`),
+`family_delivered` / `push_delivered` (family F1-F4, turn_index,
+`{slip_seconds}`), `counter_delivered` (F1, `{slip_seconds}`), `discount_detected`
+(`{amount_usd, conditional, value_before}`), `guard_hit` (`{kind}` of commitment,
+concession, control, persona, feedback or other), `time_cue`
+(`{roleplay_seconds}`) and one `session_facts` (`{roleplay_seconds,
+talk_share_pct, longest_monologue_seconds, barge_in_count, question_count,
+interruption_count, first_audio_p95_ms}`). Until `session_facts` is posted no
+session can pass the gate, which is the safe state while auto-status is off.
+
+**Ordering: post everything BEFORE the terminal transition.** The admin-log route
+answers 409 `r1_session` once the session has left `waiting`/`in_progress`, and the
+`r1.assessment` job is enqueued by the 0116 trigger at that same transition. Every
+row, `session_facts` included, must therefore be posted before the worker completes
+the session; a row posted afterwards is refused and the session fails the gate with
+`fidelity_facts_missing`. This is the opposite order to the attempt outcome, which PR-4a
+posts after the transition. A gate failure on `fidelity_facts_missing` for every
+session is the symptom of the wrong order.
+
+**Admission contract (PR-3).** "The later attempt wins" is safe only if attempt 2 can
+start solely when attempt 1 has no valid gated score (the D1 automatic retake) or HR
+granted the manual retake. Between attempt 1's completion and its attach (queue poll
+plus three model runs) the round is still `in_progress` with one attempt counted, and
+the admission in 0117 would admit attempt 2. PR-3's `r1_admit_attempt` must refuse a
+new attempt while the latest counted attempt's session is `completed` but the round
+holds no `assessment_id` for it; otherwise attempt 2's score replaces a valid
+attempt-1 score in `r1_attach_assessment`.
+
+**Rubric.** Seed with `npx tsx scripts/seed-r1-role.ts` (dry run) then `--apply`.
+The five metrics, weights and four-level anchors are defined once in
+`app/api/src/lib/r1/rubric.ts`, derived from plan 6.1 and the HR prep deck; the
+deck is the only product source. Changing an anchor requires a version bump, a new
+scorecard version and a refreshed pin in `r1-scorer-rubric.test.ts`. Version
+`r1-rubric-2026-10.2` ties the level-4 negotiation discount to "a payment plan or a
+prep-guide urgency lever (application deadline, seasonal discount)", the plan 6.1
+wording; the deck lists both levers. The owner's confirmation of that wording is
+pending. Re-run the seed after a rubric change: the scorer refuses a scorecard whose
+metric keys or weights differ from the rubric (see "Wrong scorecard").
 
 ## SFU operations and fallback
 

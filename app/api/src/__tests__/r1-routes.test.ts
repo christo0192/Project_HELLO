@@ -2,6 +2,9 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import request from 'supertest';
 import { createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const mocks = vi.hoisted(() => ({ from: vi.fn(), rpc: vi.fn() }));
 const { from, rpc } = mocks;
@@ -10,6 +13,7 @@ vi.mock('../lib/supabase.js', () => ({ supabase: { from: mocks.from, rpc: mocks.
 import { r1InternalRouter, r1Router } from '../routes/r1.js';
 import { getAuditSink, setAuditSink, type AuditEntry } from '../lib/audit.js';
 
+const here = path.dirname(fileURLToPath(import.meta.url));
 const CANDIDATE = '10000000-0000-4000-8000-000000000001';
 const ROUND = '20000000-0000-4000-8000-000000000001';
 const SESSION = '30000000-0000-4000-8000-000000000001';
@@ -448,6 +452,60 @@ describe('R1 internal worker routes', () => {
     expect((await request(app).post('/api/internal/r1/usage').set('authorization', `Bearer ${SECRET}`).send({ room, participant_kind: 'candidate', seconds: 12, event: 'disconnect', event_key: 'first' })).status).toBe(200);
     expect(tables.r1_usage_ledger).toHaveLength(1);
     expect((await request(app).post('/api/internal/r1/usage').set('authorization', `Bearer ${SECRET}`).send({ room, participant_kind: 'preflight', seconds: 16, event_key: 'bad' })).status).toBe(400);
+  });
+
+  describe('admin-log ordering contract (PR-4b must post BEFORE the terminal transition)', () => {
+    const post = (app: express.Express, body: Record<string, unknown>) =>
+      request(app).post('/api/internal/r1/admin-log').set('authorization', `Bearer ${SECRET}`)
+        .send({ room: `screening-${SESSION}`, ...body });
+    const facts = {
+      event_type: 'session_facts',
+      payload: {
+        roleplay_seconds: 700, talk_share_pct: 50, longest_monologue_seconds: 40, barge_in_count: 0,
+        question_count: 8, interruption_count: 0, first_audio_p95_ms: 2000,
+      },
+    };
+
+    it('accepts session_facts while the session is waiting or in progress', async () => {
+      const tables = readyTables();
+      const { app } = internalApp(tables);
+      expect((await post(app, facts)).status).toBe(201);
+      tables.call_sessions[0].status = 'in_progress';
+      expect((await post(app, facts)).status).toBe(201);
+      expect(tables.r1_admin_log).toHaveLength(2);
+      expect(tables.r1_admin_log[0]).toMatchObject({ session_id: SESSION, round_id: ROUND, event_type: 'session_facts' });
+    });
+
+    it.each(['completed', 'failed', 'cancelled', 'expired'])(
+      'refuses session_facts with 409 r1_session once the session is %s: the row would arrive too late to be scored',
+      async (status) => {
+        const tables = readyTables();
+        tables.call_sessions[0].status = status;
+        const { app } = internalApp(tables);
+        const response = await post(app, facts);
+        expect(response.status).toBe(409);
+        expect(response.body.error).toBe('r1_session');
+        expect(tables.r1_admin_log).toHaveLength(0);
+      },
+    );
+
+    it('applies the same ordering to every admin-log event type, not only session_facts', async () => {
+      const tables = readyTables();
+      tables.call_sessions[0].status = 'completed';
+      const { app } = internalApp(tables);
+      for (const event_type of ['need_revealed', 'family_delivered', 'push_delivered', 'counter_delivered', 'discount_detected', 'guard_hit', 'time_cue']) {
+        expect((await post(app, { event_type })).status, event_type).toBe(409);
+      }
+      expect(tables.r1_admin_log).toHaveLength(0);
+    });
+
+    it('documents the contract where the worker author will read it', () => {
+      const parser = readFileSync(path.resolve(here, '../lib/r1/admin-log.ts'), 'utf8');
+      expect(parser).toContain('ORDERING CONTRACT');
+      expect(parser).toContain('BEFORE the session\'s terminal transition');
+      const runbook = readFileSync(path.resolve(here, '../../../../docs/runbooks/r1-operations.md'), 'utf8');
+      expect(runbook).toContain('Ordering: post everything BEFORE the terminal transition');
+    });
   });
 
   it.each(['\u{1f600}', 'Robert; DROP TABLE candidates;--', 'a'.repeat(100), 'नमस्ते'])('falls back safely for unsafe worker names: %s', async (name) => {
