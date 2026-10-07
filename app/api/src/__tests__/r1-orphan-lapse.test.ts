@@ -5,15 +5,17 @@
  * far past anything a live session takes, writes ended_at as the LAST ACTIVITY (never now(), which
  * would book phantom minutes), and settles the attempt as an UNCOUNTED outcome.
  */
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   R1_ORPHAN_LAPSE_BOUNDS,
   lapseOrphanedR1Sessions,
+  type R1OrphanLapseOptions,
 } from '../lib/r1/orphan-lapse.js';
-import { createR1Runtime } from '../lib/r1/runtime.js';
+import { createR1Runtime, defaultR1DispatchLister } from '../lib/r1/runtime.js';
+import type { DispatchListerLike } from '../lib/r1/worker-gate.js';
 import { Queue } from '../lib/queue/index.js';
 import { MemoryAdapter } from '../lib/queue/memory-adapter.js';
 import { isValidReasonForStatus, isValidTransition } from '../lib/session-lifecycle.js';
@@ -234,7 +236,7 @@ describe('races and failures', () => {
         if (table === 'call_sessions') {
           q.update = () => {
             const u: any = {};
-            for (const method of ['eq', 'select']) u[method] = () => u;
+            for (const method of ['eq', 'lte', 'select']) u[method] = () => u;
             u.then = (resolve: (v: unknown) => unknown) => resolve({ data: null, error: { message: 'down' } });
             return u;
           };
@@ -296,6 +298,217 @@ describe('races and failures', () => {
   });
 });
 
+// ─────────────────────────────────────────────────────────────────────────────
+// A `waiting` row is not lapsed under a worker that was just dispatched into it (P2).
+
+const liveJob = { id: 'AJ_live', state: { status: 'JS_RUNNING' } };
+const dispatchOf = (jobs: unknown[], id = 'AD_1') => ({
+  id, agentName: 'browser-screener', state: { jobs, createdAt: 1n },
+});
+
+/** A dispatch lister that answers `listed` (or throws it), recording the rooms it was asked about. */
+function listerOf(listed: unknown[] | Error) {
+  const listDispatch = vi.fn(async (_room: string) => {
+    if (listed instanceof Error) throw listed;
+    return listed;
+  });
+  const lister = { listDispatch } as unknown as DispatchListerLike;
+  return { listDispatch, lister, factory: vi.fn(() => lister) };
+}
+
+async function lapseWith(tables: Tables, options: R1OrphanLapseOptions, rpc = settleRpc()) {
+  const db = createFakeDb(tables, rpc);
+  const result = await lapseOrphanedR1Sessions(db.client as never, NOW, options);
+  return { db, result };
+}
+
+const staleWaiting = (n = 1, patch: Row = {}): Row => session(n, {
+  status: 'waiting', started_at: minutesAgo(40), waiting_at: minutesAgo(25), updated_at: minutesAgo(25), ...patch,
+});
+
+describe('a stale waiting session whose worker is alive is not expired under it', () => {
+  it('leaves it for the worker when the room has a dispatch with a live job, and asks about THAT room', async () => {
+    const tables = tablesWith(staleWaiting());
+    const before = { ...tables.call_sessions![0]! };
+    const asked = listerOf([dispatchOf([liveJob])]);
+    const { db, result } = await lapseWith(tables, { dispatches: asked.factory });
+    expect(result).toEqual({ scanned: 1, lapsed: 0, settled: 0, errors: 0 });
+    expect(tables.call_sessions![0]).toEqual(before);
+    expect(db.rpcCalls).toHaveLength(0);
+    expect(asked.listDispatch).toHaveBeenCalledTimes(1);
+    expect(asked.listDispatch).toHaveBeenCalledWith(`screening-${SID(1)}`);
+  });
+
+  it.each([
+    ['no dispatch at all', []],
+    ['a dispatch no worker accepted', [dispatchOf([])]],
+    ['a finished job (JS_SUCCESS)', [dispatchOf([{ id: 'j', state: { status: 'JS_SUCCESS' } }])]],
+    ['a failed job (JS_FAILED)', [dispatchOf([{ id: 'j', state: { status: 'JS_FAILED' } }])]],
+    ['a job with an endedAt stamp', [dispatchOf([{ id: 'j', state: { status: 'JS_RUNNING', endedAt: 1_700_000_000n } }])]],
+  ])('still expires it when the room has %s', async (_label, listed) => {
+    const tables = tablesWith(staleWaiting());
+    const { result } = await lapseWith(tables, { dispatches: listerOf(listed as unknown[]).factory });
+    expect(result).toEqual({ scanned: 1, lapsed: 1, settled: 1, errors: 0 });
+    expect(tables.call_sessions![0]).toMatchObject({ status: 'expired', terminal_reason: 'idle_timeout' });
+  });
+
+  it('one live dispatch among dead ones is enough to spare it', async () => {
+    const tables = tablesWith(staleWaiting());
+    const listed = [dispatchOf([{ id: 'j', state: { status: 'JS_FAILED' } }], 'AD_dead'), dispatchOf([liveJob], 'AD_live')];
+    const { result } = await lapseWith(tables, { dispatches: listerOf(listed).factory });
+    expect(result).toMatchObject({ lapsed: 0, errors: 0 });
+    expect(tables.call_sessions![0]!.status).toBe('waiting');
+  });
+
+  it('a room the SFU no longer knows (not_found) has no worker: the row expires', async () => {
+    const gone = Object.assign(new Error('room does not exist'), { code: 'not_found', status: 404 });
+    const tables = tablesWith(staleWaiting());
+    const { result } = await lapseWith(tables, { dispatches: listerOf(gone).factory });
+    expect(result).toMatchObject({ lapsed: 1, settled: 1, errors: 0 });
+  });
+
+  it('an unreadable listing proves nothing: not expired, counted, and the next pass retries', async () => {
+    const tables = tablesWith(staleWaiting());
+    const first = await lapseWith(tables, { dispatches: listerOf(new Error('SFU down')).factory });
+    expect(first.result).toEqual({ scanned: 1, lapsed: 0, settled: 0, errors: 1 });
+    expect(tables.call_sessions![0]!.status).toBe('waiting');
+    expect(first.db.rpcCalls).toHaveLength(0);
+
+    const second = await lapseWith(tables, { dispatches: listerOf([]).factory });
+    expect(second.result).toMatchObject({ lapsed: 1, settled: 1, errors: 0 });
+  });
+
+  it('a listing that never answers is unreadable after the probe limit, and the pass still returns', async () => {
+    vi.useFakeTimers();
+    try {
+      const tables = tablesWith(staleWaiting());
+      const hung = { listDispatch: () => new Promise<never>(() => undefined) } as unknown as DispatchListerLike;
+      const pending = lapseWith(tables, { dispatches: () => hung });
+      await vi.advanceTimersByTimeAsync(R1_ORPHAN_LAPSE_BOUNDS.dispatchProbeMs + 1);
+      const { result } = await pending;
+      expect(result).toEqual({ scanned: 1, lapsed: 0, settled: 0, errors: 1 });
+      expect(tables.call_sessions![0]!.status).toBe('waiting');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a lister that cannot be built is an unreadable listing, not a crash', async () => {
+    const tables = tablesWith(staleWaiting());
+    const { result } = await lapseWith(tables, { dispatches: () => { throw new Error('bad url'); } });
+    expect(result).toEqual({ scanned: 1, lapsed: 0, settled: 0, errors: 1 });
+    expect(tables.call_sessions![0]!.status).toBe('waiting');
+  });
+
+  it('with no R1 SFU to ask (no lister), the timestamps alone decide, as before', async () => {
+    for (const options of [{}, { dispatches: () => null }]) {
+      const tables = tablesWith(staleWaiting());
+      const { result } = await lapseWith(tables, options);
+      expect(result).toMatchObject({ lapsed: 1, settled: 1, errors: 0 });
+    }
+  });
+
+  it('defers only up to the ceiling: an hour idle expires it whatever the SFU says', async () => {
+    const ceilingMin = R1_ORPHAN_LAPSE_BOUNDS.waitingLiveJobCeilingSec / 60;
+    expect(ceilingMin).toBeGreaterThan(R1_ORPHAN_LAPSE_BOUNDS.waitingIdleSec / 60);
+    const at = (min: number): Row => staleWaiting(1, {
+      started_at: minutesAgo(min + 5), waiting_at: minutesAgo(min), updated_at: minutesAgo(min),
+    });
+
+    // Just inside the ceiling: a live job, and an unreadable listing, both defer.
+    const inside = tablesWith(at(ceilingMin - 1));
+    expect((await lapseWith(inside, { dispatches: listerOf([dispatchOf([liveJob])]).factory })).result)
+      .toMatchObject({ lapsed: 0, errors: 0 });
+    expect((await lapseWith(inside, { dispatches: listerOf(new Error('down')).factory })).result)
+      .toMatchObject({ lapsed: 0, errors: 1 });
+    expect(inside.call_sessions![0]!.status).toBe('waiting');
+
+    // Past it: a zombie job and a dead SFU can no longer hold the global slot.
+    for (const listed of [[dispatchOf([liveJob])], new Error('down')]) {
+      const past = tablesWith(at(ceilingMin + 1));
+      const asked = listerOf(listed);
+      const { result } = await lapseWith(past, { dispatches: asked.factory });
+      expect(result).toEqual({ scanned: 1, lapsed: 1, settled: 1, errors: 0 });
+      expect(past.call_sessions![0]).toMatchObject({ status: 'expired', terminal_reason: 'idle_timeout' });
+      expect(asked.factory).not.toHaveBeenCalled();
+    }
+  });
+
+  it('asks the SFU only for a STALE waiting row: never for fresh, created or in_progress ones', async () => {
+    const tables = tablesWith(
+      staleWaiting(1, { waiting_at: minutesAgo(19), updated_at: minutesAgo(19) }),
+      session(2, { status: 'created', started_at: minutesAgo(30), updated_at: minutesAgo(30) }),
+      session(3, { status: 'in_progress', started_at: minutesAgo(180), updated_at: minutesAgo(120) }),
+    );
+    const asked = listerOf([dispatchOf([liveJob])]);
+    const { result } = await lapseWith(tables, { dispatches: asked.factory });
+    expect(result).toMatchObject({ scanned: 3, lapsed: 2, errors: 0 });
+    expect(asked.factory).not.toHaveBeenCalled();
+    expect(asked.listDispatch).not.toHaveBeenCalled();
+    expect(tables.call_sessions!.map((s) => s.status)).toEqual(['waiting', 'failed', 'failed']);
+  });
+
+  it('builds the lister once per pass and asks once per stale waiting row', async () => {
+    const tables = tablesWith(staleWaiting(1), staleWaiting(2));
+    const asked = listerOf([dispatchOf([liveJob])]);
+    const { result } = await lapseWith(tables, { dispatches: asked.factory });
+    expect(result).toMatchObject({ scanned: 2, lapsed: 0, errors: 0 });
+    expect(asked.factory).toHaveBeenCalledTimes(1);
+    expect(asked.listDispatch.mock.calls.map((call) => call[0])).toEqual([`screening-${SID(1)}`, `screening-${SID(2)}`]);
+  });
+});
+
+describe('a candidate retry is activity: it restarts the waiting window', () => {
+  // The exchange stamps `updated_at` on every waiting rejoin (routes/r1-candidate.ts); the lapse reads it.
+  const waitingMin = R1_ORPHAN_LAPSE_BOUNDS.waitingIdleSec / 60;
+  const rejoinedAt = (minutesSinceRejoin: number): Row => staleWaiting(1, {
+    started_at: minutesAgo(50), waiting_at: minutesAgo(40), updated_at: minutesAgo(minutesSinceRejoin),
+  });
+
+  it('a rejoin one minute inside the bound is not lapsed, however old the session is', async () => {
+    const tables = tablesWith(rejoinedAt(waitingMin - 1));
+    const before = { ...tables.call_sessions![0]! };
+    const asked = listerOf([]);
+    const { db, result } = await lapseWith(tables, { dispatches: asked.factory });
+    expect(result).toEqual({ scanned: 1, lapsed: 0, settled: 0, errors: 0 });
+    expect(tables.call_sessions![0]).toEqual(before);
+    expect(db.rpcCalls).toHaveLength(0);
+    expect(asked.factory).not.toHaveBeenCalled();
+  });
+
+  it('the window is measured from the rejoin: one minute past it, the row lapses (last activity as ended_at)', async () => {
+    const tables = tablesWith(rejoinedAt(waitingMin + 1));
+    const { result } = await lapseWith(tables, { dispatches: listerOf([]).factory });
+    expect(result).toMatchObject({ lapsed: 1, settled: 1, errors: 0 });
+    expect(tables.call_sessions![0]).toMatchObject({
+      status: 'expired', terminal_reason: 'idle_timeout', ended_at: minutesAgo(waitingMin + 1),
+    });
+  });
+
+  it('a rejoin that lands between the scan and the write wins: zero rows, no lapse, no error, no settle', async () => {
+    const tables = tablesWith(staleWaiting());
+    const db = createFakeDb(tables, settleRpc());
+    const racing = {
+      ...db.client,
+      from: (table: string) => {
+        const q = db.client.from(table);
+        if (table === 'call_sessions') {
+          const update = q.update;
+          q.update = (value: Row) => {
+            tables.call_sessions![0]!.updated_at = NOW.toISOString(); // the candidate retried just now
+            return update(value);
+          };
+        }
+        return q;
+      },
+    };
+    const result = await lapseOrphanedR1Sessions(racing as never, NOW, { dispatches: listerOf([]).factory });
+    expect(result).toEqual({ scanned: 1, lapsed: 0, settled: 0, errors: 0 });
+    expect(tables.call_sessions![0]).toMatchObject({ status: 'waiting', terminal_reason: null, ended_at: null });
+    expect(settleCalls(db)).toHaveLength(0);
+  });
+});
+
 describe('the r1-status loop runs it', () => {
   const ENABLED = { enabled: true, status: 'enabled' as const };
   const makeQueue = () => {
@@ -348,6 +561,20 @@ describe('the r1-status loop runs it', () => {
     expect(safe.snapshot()).toMatchObject({ lastStatusApplied: 3, statusLoopErrors: 0, orphanLapseErrors: 1 });
   });
 
+  it('hands the lapse its dispatch lister: a stale waiting row with a live worker survives the tick', async () => {
+    const tables = tablesWith(staleWaiting());
+    const db = createFakeDb(tables, (fn) => (fn === 'r1_apply_due_pending_rejects' ? { data: 0 } : { data: { status: 'ok' } }));
+    const asked = listerOf([dispatchOf([liveJob])]);
+    const runtime = createR1Runtime({
+      config: ENABLED, client: db.client as never, queue: makeQueue(), now: () => NOW, dispatches: asked.factory,
+    })!;
+    await runtime.tickAll();
+    await runtime.runner.stop();
+    expect(tables.call_sessions![0]!.status).toBe('waiting');
+    expect(asked.listDispatch).toHaveBeenCalledWith(`screening-${SID(1)}`);
+    expect(runtime.snapshot()).toMatchObject({ lastOrphansLapsed: 0, orphanLapseErrors: 0 });
+  });
+
   it('adds no loop and no queue: the runtime still has exactly r1-assessment and r1-status', () => {
     const runtime = createR1Runtime({ config: ENABLED, client: createFakeDb(baseTables()).client as never, queue: makeQueue() })!;
     expect(Object.keys(runtime.loopIntervalsMs)).toEqual(['r1-assessment', 'r1-status']);
@@ -359,8 +586,38 @@ describe('structural', () => {
   it('only compare-and-sets live statuses: it never writes a terminal row or a phone session', () => {
     const text = readFileSync(path.resolve(here, '../lib/r1/orphan-lapse.ts'), 'utf8');
     expect(text).toContain(".eq('status', fromStatus)");
+    expect(text).toContain(".lte('updated_at'");
     expect(text).toContain(".eq('mode', 'browser')");
     expect(text).toContain(".not('interview_round_id', 'is', null)");
     expect(text).toContain("const LIVE_STATUSES = Object.keys(PLANS)");
+  });
+});
+
+describe('the default R1 dispatch lister', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it('is absent unless the browser lane targets the R1 SFU with all three credentials', () => {
+    vi.stubEnv('BROWSER_LIVEKIT_TARGET', '');
+    expect(defaultR1DispatchLister()).toBeNull();
+    vi.stubEnv('BROWSER_LIVEKIT_TARGET', 'cloud');
+    expect(defaultR1DispatchLister()).toBeNull();
+
+    vi.stubEnv('BROWSER_LIVEKIT_TARGET', 'r1');
+    vi.stubEnv('R1_LIVEKIT_URL', 'wss://r1.example.test');
+    vi.stubEnv('R1_LIVEKIT_API_KEY', 'r1-test-key');
+    vi.stubEnv('R1_LIVEKIT_API_SECRET', '');
+    expect(defaultR1DispatchLister()).toBeNull();
+  });
+
+  it('is the R1 SFU agent-dispatch client once configured', () => {
+    vi.stubEnv('BROWSER_LIVEKIT_TARGET', 'r1');
+    vi.stubEnv('R1_LIVEKIT_URL', 'wss://r1.example.test');
+    vi.stubEnv('R1_LIVEKIT_API_KEY', 'r1-test-key');
+    vi.stubEnv('R1_LIVEKIT_API_SECRET', 's'.repeat(32));
+    const lister = defaultR1DispatchLister();
+    expect(lister).not.toBeNull();
+    expect(typeof lister!.listDispatch).toBe('function');
   });
 });

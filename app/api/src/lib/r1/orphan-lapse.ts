@@ -26,6 +26,22 @@
  *   in_progress  45 min since the last row update, transcript turn or ledger row (the worker's own
  *                residency cap is 1800 s and its rejoin grace 90 s, plus the closing line)
  *
+ * A `waiting` row is also spared while its worker is demonstrably alive. A candidate who retries in
+ * the same tab late in the window (the runbook's advice after a failed start) gets a worker
+ * dispatched into the SAME session, and the next tick must not expire the row under it. Two guards,
+ * so the lapse and the retry cannot cross:
+ *
+ *   - the exchange touches the row on every `waiting` rejoin (routes/r1-candidate.ts), so a retry is
+ *     activity and restarts the 20 min window. Every lapse write below is also conditional on the
+ *     row's `updated_at` still being past the bound, so a touch that lands between this scan and the
+ *     write turns the write into zero rows (a no-op, never an error);
+ *   - a stale `waiting` row is not lapsed while the R1 SFU lists a dispatch with a LIVE job
+ *     (`jobIsLive`, the predicate the exchange's own worker gate uses) in its room, nor while that
+ *     listing cannot be read. Both only DEFER: past `waitingLiveJobCeilingSec` of idle the row lapses
+ *     whatever the SFU says, because a worker that has not activated a session in an hour is a
+ *     zombie job or a dead SFU, and the global slot must not stay blocked for either. With no R1 SFU
+ *     configured there is nothing to ask and the timestamps alone decide, as they always did.
+ *
  * What it writes, per session, compare-and-set on the status it read (a worker that settled the
  * session first simply wins; zero rows is not an error):
  *
@@ -43,7 +59,9 @@
  * Metadata only is logged (a status and a count); never an id or a payload.
  */
 
+import { jobIsLive } from '../browser-orchestration.js';
 import { createLogger } from '../logger.js';
+import { roomNameForSession } from '../room-provisioning.js';
 import {
   isValidReasonForStatus,
   isValidTransition,
@@ -51,14 +69,31 @@ import {
   type TerminalReason,
 } from '../session-lifecycle.js';
 import type { R1DbClient } from '../../services/r1-assessment.js';
+import type { DispatchListerLike } from './worker-gate.js';
 
 export const R1_ORPHAN_LAPSE_BOUNDS = {
   createdIdleSec: 15 * 60,
   waitingIdleSec: 20 * 60,
+  /**
+   * A stale `waiting` row whose room has a live job (or whose dispatch listing cannot be read) is
+   * deferred, not lapsed, but only up to this much idle time. Past it the row lapses regardless.
+   */
+  waitingLiveJobCeilingSec: 60 * 60,
   inProgressIdleSec: 45 * 60,
+  /** How long one `listDispatch` may take before it counts as unreadable (the pass is 60 s apart). */
+  dispatchProbeMs: 8_000,
   /** Live R1 sessions are at most a handful (one per round, one admitted at a time). */
   scanLimit: 50,
 } as const;
+
+export interface R1OrphanLapseOptions {
+  /**
+   * The R1 SFU's agent-dispatch lister, built lazily the first time a stale `waiting` row needs it.
+   * Null (or absent): there is no R1 SFU to ask, so the row timestamps alone decide. May throw,
+   * which counts as an unreadable listing.
+   */
+  readonly dispatches?: () => DispatchListerLike | null;
+}
 
 type LiveStatus = 'created' | 'waiting' | 'in_progress';
 
@@ -137,6 +172,38 @@ async function newest(
   return { at: row ? ms(row[column]) : null, ok: true };
 }
 
+type Ownership = 'live' | 'none' | 'unknown';
+
+/** Reject when `work` has not settled within `limitMs`; the late result is dropped. */
+function withinMs<T>(work: Promise<T>, limitMs: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const limit = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('dispatch_probe_timeout')), limitMs);
+  });
+  return Promise.race([work, limit]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+/**
+ * Does a worker own this session's room? `live`: a dispatch there has a live job. `none`: the
+ * listing was read and no job is live (a room the SFU no longer knows is `none` too: a job cannot
+ * outlive its room). `unknown`: the listing failed or timed out, so nothing is proven either way.
+ */
+async function dispatchOwnership(lister: DispatchListerLike, sessionId: string): Promise<Ownership> {
+  try {
+    const listed = await withinMs(
+      lister.listDispatch(roomNameForSession(sessionId)),
+      R1_ORPHAN_LAPSE_BOUNDS.dispatchProbeMs,
+    );
+    const owned = (Array.isArray(listed) ? listed : [])
+      .some((dispatch) => (dispatch?.state?.jobs ?? []).some(jobIsLive));
+    return owned ? 'live' : 'none';
+  } catch (error) {
+    return (error as { code?: unknown } | null)?.code === 'not_found' ? 'none' : 'unknown';
+  }
+}
+
 async function settleAttempt(
   client: R1DbClient,
   sessionId: string,
@@ -169,12 +236,26 @@ async function settleAttempt(
 export async function lapseOrphanedR1Sessions(
   client: R1DbClient,
   now: Date,
+  options: R1OrphanLapseOptions = {},
 ): Promise<R1OrphanLapseResult> {
   let scanned = 0;
   let lapsed = 0;
   let settled = 0;
   let errors = 0;
   const nowMs = now.getTime();
+
+  // Built at most once per pass, and only when a stale `waiting` row needs it.
+  let lister: DispatchListerLike | null | 'unreadable' | undefined;
+  const listerForPass = (): DispatchListerLike | null | 'unreadable' => {
+    if (lister === undefined) {
+      try {
+        lister = options.dispatches?.() ?? null;
+      } catch {
+        lister = 'unreadable';
+      }
+    }
+    return lister;
+  };
 
   const { data, error } = await client
     .from('call_sessions')
@@ -211,6 +292,23 @@ export async function lapseOrphanedR1Sessions(
       if (nowMs - lastActivity <= plan.idleSec * 1000) continue;
     }
 
+    if (
+      fromStatus === 'waiting'
+      && nowMs - lastActivity <= R1_ORPHAN_LAPSE_BOUNDS.waitingLiveJobCeilingSec * 1000
+    ) {
+      // Stale by its timestamps, but a worker dispatched into this room is not an orphan: leave the
+      // row for the worker to activate or settle. An unreadable listing proves nothing: retry next pass.
+      const asked = listerForPass();
+      if (asked !== null) {
+        const owner = asked === 'unreadable' ? 'unknown' : await dispatchOwnership(asked, row.id);
+        if (owner === 'live') continue;
+        if (owner === 'unknown') {
+          errors += 1;
+          continue;
+        }
+      }
+    }
+
     // Defensive: the constants above must stay a legal transition with a legal reason.
     if (!isValidTransition(fromStatus, plan.to) || !isValidReasonForStatus(plan.reason, plan.to)) {
       errors += 1;
@@ -219,12 +317,19 @@ export async function lapseOrphanedR1Sessions(
 
     // The last evidence of life, never later than now: see the header (phantom minutes).
     const endedAt = new Date(Math.min(nowMs, Math.max(startedAt, lastActivity))).toISOString();
-    const { data: moved, error: moveError } = await client
+    let move = client
       .from('call_sessions')
       .update({ status: plan.to, terminal_reason: plan.reason, ended_at: endedAt })
       .eq('id', row.id)
-      .eq('status', fromStatus)
-      .select('id');
+      .eq('status', fromStatus);
+    // Compare-and-set on the row's age too: `updated_at` is bumped by the database on every write
+    // (trigger 0004), so a candidate's rejoin touch or a worker's write since the scan makes this
+    // zero rows. A cutoff, not an equality on the string read, so the column's text format cannot
+    // matter. `updated_at` is NOT NULL; an unreadable value just keeps the status-only check.
+    if (ms(row.updated_at) !== null) {
+      move = move.lte('updated_at', new Date(nowMs - plan.idleSec * 1000).toISOString());
+    }
+    const { data: moved, error: moveError } = await move.select('id');
     if (moveError) {
       errors += 1;
       continue;

@@ -27,8 +27,10 @@
  *                  R1 session no worker owns any more (created, waiting or in progress with no
  *                  activity far past anything a live one takes) is failed or expired with a
  *                  terminal reason and its attempt settled, because admission's one-live-R1
- *                  rule is GLOBAL and one such row blocked every R1 start forever. A failure of
- *                  one half never skips the other.
+ *                  rule is GLOBAL and one such row blocked every R1 start forever. A `waiting`
+ *                  row whose room still has a live worker job is spared (the pass asks the R1
+ *                  SFU's dispatch list; see `orphan-lapse.ts`). A failure of one half never
+ *                  skips the other.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -45,7 +47,9 @@ import { createLogger } from '../logger.js';
 import { supabase } from '../supabase.js';
 import { getR1Config, type R1Config } from './config.js';
 import { R1_ASSESSMENT_QUEUE, createR1AssessmentHandler } from './assessment-handler.js';
-import { lapseOrphanedR1Sessions } from './orphan-lapse.js';
+import { lapseOrphanedR1Sessions, type R1OrphanLapseOptions } from './orphan-lapse.js';
+import { agentDispatchClientFor, browserLiveKitEndpoint } from '../livekit-endpoints.js';
+import type { DispatchListerLike } from './worker-gate.js';
 import type { R1AssessmentOptions } from '../../services/r1-assessment.js';
 
 /** The ONLY queues this runtime registers. A structural test pins it. */
@@ -71,9 +75,22 @@ export interface R1RuntimeSnapshot {
   readonly jobEvents: Readonly<Record<string, number>>;
 }
 
+/**
+ * The R1 SFU's agent-dispatch lister, or null when there is none to ask: the browser lane is not
+ * on the R1 target, or the R1 credentials are not all set. Read at call time, never at import.
+ */
+export function defaultR1DispatchLister(): DispatchListerLike | null {
+  const endpoint = browserLiveKitEndpoint();
+  if (endpoint.target !== 'r1') return null;
+  if (!endpoint.url || !endpoint.apiKey || !endpoint.apiSecret) return null;
+  return agentDispatchClientFor(endpoint) as unknown as DispatchListerLike;
+}
+
 export interface R1RuntimeOptions {
   readonly config?: R1Config;
   readonly client?: SupabaseClient;
+  /** Test seam for the orphan lapse's dispatch lookup; production asks the R1 SFU. */
+  readonly dispatches?: R1OrphanLapseOptions['dispatches'];
   readonly queue?: Queue;
   readonly owner?: string;
   readonly infer?: R1AssessmentOptions['infer'];
@@ -184,7 +201,9 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
   /** Lapse R1 sessions no worker owns. Never throws; its own counters, its own log category. */
   const lapseOrphans = async (): Promise<boolean> => {
     try {
-      const result = await lapseOrphanedR1Sessions(client as never, clock());
+      const result = await lapseOrphanedR1Sessions(client as never, clock(), {
+        dispatches: options.dispatches ?? defaultR1DispatchLister,
+      });
       lastOrphansLapsed = result.lapsed;
       orphanLapseErrors += result.errors;
       return result.lapsed > 0;

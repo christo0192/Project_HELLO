@@ -70,6 +70,16 @@ function query(table: string, tables: Tables, onInsert: () => void) {
     select: () => q,
     eq: (key: string, value: unknown) => { filters.push((row) => row[key] === value); return q; },
     in: (key: string, values: unknown[]) => { filters.push((row) => values.includes(row[key])); return q; },
+    lte: (key: string, value: unknown) => {
+      filters.push((row) => {
+        const left = row[key];
+        if (left === null || left === undefined) return false; // SQL: NULL <= x is not true
+        const a = Date.parse(String(left));
+        const b = Date.parse(String(value));
+        return Number.isFinite(a) && Number.isFinite(b) ? a <= b : String(left) <= String(value);
+      });
+      return q;
+    },
     is: (key: string, value: unknown) => { filters.push((row) => (row[key] ?? null) === value); return q; },
     not: (key: string, operator: string, value: unknown) => {
       if (operator === 'is' && value === null) filters.push((row) => row[key] !== null && row[key] !== undefined);

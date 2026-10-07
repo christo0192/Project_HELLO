@@ -1106,6 +1106,30 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     return false;
   }
 
+  /**
+   * A `waiting` rejoin is the candidate's own activity: count it. The orphan lapse
+   * (`lib/r1/orphan-lapse.ts`) expires a `waiting` row that has been idle for 20
+   * minutes, so without this a same-tab retry made late in that window would have a
+   * worker dispatched into a session the next 60 s tick then expires under it. The
+   * write changes nothing else and only matches a row that is still `waiting`; the
+   * database stamps `updated_at` on every write (trigger 0004), which is what the
+   * lapse reads (and what its compare-and-set re-checks). Best effort: a failed
+   * touch must not turn a join into a failure, and the lapse's dispatch check still
+   * spares a row whose worker is already live.
+   */
+  async function touchWaitingSession(sessionId: string): Promise<void> {
+    try {
+      const { error } = await db
+        .from('call_sessions')
+        .update({ updated_at: new Date(now()).toISOString() })
+        .eq('id', sessionId)
+        .eq('status', 'waiting');
+      if (error) log.warn('unknown_event', { error_category: 'r1_waiting_touch_failed' });
+    } catch {
+      log.warn('unknown_event', { error_category: 'r1_waiting_touch_failed' });
+    }
+  }
+
   router.post('/exchange', validateBody(r1ExchangeSchema), route(async (req, res) => {
     if (!attemptTokensConfigured()) {
       refuse(res, 503, 'r1_unavailable');
@@ -1206,6 +1230,9 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
           refuse(res, 503, 'r1_unavailable');
           return;
         }
+        // The candidate is here: restart the orphan lapse's idle window before the
+        // gate below spends up to ~2 minutes readying a worker.
+        await touchWaitingSession(session.id);
         // R1 sessions stay `waiting` for the whole interview, so this is every
         // refresh and retry. The room lapses after 180 s empty and a refusing
         // worker deletes it; on the R1 SFU (no auto-create) a missing room would be
