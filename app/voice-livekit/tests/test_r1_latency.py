@@ -26,6 +26,7 @@ from r1_latency import (
     STAGE_A_HEADLINE_P95_SEC,
     STAGE_A_SCRIPTED_START_SEC,
     LatencyTracker,
+    count_words,
     latency_records,
     percentile,
     r1_turn_handling,
@@ -501,6 +502,43 @@ class TestStageAReport(unittest.TestCase):
                 self.assertEqual(report["targets"]["headline_p95_sec"], 3.0)
 
 
+class TestCountWords(unittest.TestCase):
+    """``count_words`` mirrors the SDK's ``split_words(..., split_character=True)`` for min_words.
+
+    ``test_r1_sdk_contract`` compares the two on the real SDK; these pin the rules without it.
+    """
+
+    def test_words_are_whitespace_separated_tokens_that_hold_more_than_punctuation(self) -> None:
+        cases = {
+            "": 0,
+            "   ": 0,
+            "Yes.": 1,
+            "...": 0,
+            "yes please": 2,
+            "Yes please do go on.": 5,
+            "don't": 1,
+            "a - b": 2,
+            "x-y z_w": 2,
+            "$ 5 % ?": 1,
+            "a b  c": 3,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(count_words(text), expected)
+
+    def test_typographic_punctuation_is_not_a_word(self) -> None:
+        quotes = chr(0x201C) + "Hi" + chr(0x201D)
+        self.assertEqual(count_words(quotes), 1)
+        self.assertEqual(count_words("ok" + chr(0x2026)), 1)
+        self.assertEqual(count_words("hello " + chr(0x2014) + " world"), 2)
+
+    def test_each_letter_of_a_character_based_script_is_a_word(self) -> None:
+        cjk = chr(0x4E2D) + chr(0x6587)
+        self.assertEqual(count_words(cjk), 2)
+        self.assertEqual(count_words("abc" + cjk + "def"), 4)
+        self.assertEqual(count_words(chr(0x0E2A) + chr(0x0E27) + chr(0x0E31)), 3)
+
+
 class TestModuleSurface(unittest.TestCase):
     def test_the_module_imports_only_the_standard_library(self) -> None:
         # No phone, session or SDK code: the tracker stays unit-testable and R1-only, and
@@ -514,7 +552,7 @@ class TestModuleSurface(unittest.TestCase):
                 imported.add((node.module or "").split(".")[0])
         self.assertEqual(
             imported,
-            {"__future__", "collections", "dataclasses", "json", "math", "os", "sys", "typing"},
+            {"__future__", "collections", "dataclasses", "json", "math", "os", "re", "sys", "typing"},
         )
 
 

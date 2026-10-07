@@ -2145,6 +2145,227 @@ class TestLatencyLines(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(line_["event"], "unknown_event")
 
 
+class TestHeldBackFragments(unittest.IsolatedAsyncioTestCase):
+    """A fragment the SDK holds back must not start the monologue clock (PR-4c review, P2).
+
+    With ``min_words`` 2 livekit-agents 1.6.4 refuses a turn of fewer words spoken over a reply
+    it may still cut (``on_end_of_turn`` returns False) and keeps the words, so they are
+    prepended to the NEXT committed turn.  Sarvam emits finals only, so that one-word "Yes."
+    arrives as a final and is held back.  R1's monologue clock starts at the first "speaking" of
+    a turn and stops at the hook, so without the fix the learner's remaining speech was counted
+    as the advisor's monologue.
+    """
+
+    ANSWER = PITCH
+    HELD = "Yes."
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("R1_INTERRUPT_MIN_WORDS", None)
+
+    @staticmethod
+    def speak(rig: Rig, seconds: float, final: str | None = None, *, before_stop: bool) -> None:
+        """One burst of candidate speech and its final transcript.
+
+        ``before_stop`` is the order Sarvam's own end-of-speech gives (the final, then the
+        "listening" state); the other order is a voice-activity stop followed by a late final.
+        """
+        rig.session.emit("user_state_changed", state("speaking"))
+        rig.clock.advance(seconds)
+        if final is not None and before_stop:
+            rig.final(final)
+        rig.session.emit("user_state_changed", state("listening"))
+        if final is not None and not before_stop:
+            rig.final(final)
+
+    @staticmethod
+    async def commit(rig: Rig, text: str) -> float | None:
+        """The SDK commits the turn 0.7 s after the speech; return what the engine was told."""
+        await rig.settle()
+        rig.clock.advance(0.7)
+        with mock.patch.object(rig.engine, "plan_turn", wraps=rig.engine.plan_turn) as plan:
+            await rig.agent.on_user_turn_completed(
+                None, SimpleNamespace(text_content=text, id=f"m_{next(rig._ids)}")
+            )
+        return plan.call_args.kwargs["candidate_seconds"]
+
+    async def mid_reply(self, rig: Rig, *, interruptible: bool = True) -> FakeSpeechHandle:
+        """A role-play whose learner is part-way through a reply."""
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        reply = FakeSpeechHandle("reply", allow_interruptions=interruptible)
+        rig.session.current_speech = reply
+        return reply
+
+    async def probe(self, rig: Rig, *, before_stop: bool) -> float | None:
+        """The review's probe: "Yes." (0.6 s) over a reply, 20 s more of the learner, a 45 s answer."""
+        await self.mid_reply(rig)
+        self.speak(rig, 0.6, self.HELD, before_stop=before_stop)
+        await rig.settle()
+        rig.clock.advance(20.0)  # the learner talks on, the candidate listens
+        rig.session.current_speech = None
+        self.speak(rig, 45.0, self.ANSWER, before_stop=before_stop)
+        return await self.commit(rig, f"{self.HELD} {self.ANSWER}")
+
+    async def test_a_held_back_yes_does_not_inflate_the_monologue_whichever_event_comes_first(self) -> None:
+        for before_stop in (True, False):
+            with self.subTest(final_before_the_stop=before_stop):
+                rig = Rig()
+                seconds = await self.probe(rig, before_stop=before_stop)
+                self.assertAlmostEqual(seconds, 45.7, places=3)  # the answer and the 0.7 s wait
+                self.assertNotIn("CANDIDATE_MONOLOGUE", rig.plan().reminder)
+
+    async def test_the_clock_is_restarted_when_the_held_back_fragment_ends(self) -> None:
+        for before_stop in (True, False):
+            with self.subTest(final_before_the_stop=before_stop):
+                rig = Rig()
+                await self.mid_reply(rig)
+                self.speak(rig, 0.6, self.HELD, before_stop=before_stop)
+                await rig.settle()
+                self.assertIsNone(rig.interview._user_turn_started)
+
+    async def test_a_long_answer_after_a_held_back_yes_still_counts_as_a_monologue(self) -> None:
+        rig = Rig()
+        await self.mid_reply(rig)
+        self.speak(rig, 0.6, self.HELD, before_stop=False)
+        await rig.settle()
+        rig.session.current_speech = None
+        self.speak(rig, 75.0, self.ANSWER, before_stop=False)
+        seconds = await self.commit(rig, f"{self.HELD} {self.ANSWER}")
+        self.assertAlmostEqual(seconds, 75.7, places=3)
+        self.assertIn("CANDIDATE_MONOLOGUE=75", rig.plan().reminder)
+
+    async def test_the_rest_of_an_answer_that_arrives_late_gives_the_clock_back(self) -> None:
+        # Sarvam finalised the first word while the candidate talked on; the local voice
+        # detector stopped 40 s in, and the final of everything else arrives after that.  The
+        # SDK commits the words together, so the whole speech is the monologue.
+        rig = Rig()
+        await self.mid_reply(rig)
+        rig.session.emit("user_state_changed", state("speaking"))
+        rig.clock.advance(2.0)
+        rig.final("Yes")
+        rig.clock.advance(38.0)
+        rig.session.emit("user_state_changed", state("listening"))
+        await rig.settle()
+        self.assertIsNone(rig.interview._user_turn_started)  # one word so far: held back
+        rig.final(self.ANSWER)
+        await rig.settle()
+        self.assertEqual(rig.interview._user_turn_started, 20.0)  # given back: it began at 20 s
+        self.assertAlmostEqual(await self.commit(rig, f"Yes {self.ANSWER}"), 40.7, places=3)
+
+    async def test_a_fragment_the_candidate_continues_straight_away_stays_in_the_clock(self) -> None:
+        # Burst, a 0.8 s pause, a second burst; the first word's final lands during the second.
+        rig = Rig()
+        await self.mid_reply(rig)
+        rig.session.emit("user_state_changed", state("speaking"))
+        rig.clock.advance(0.6)
+        rig.session.emit("user_state_changed", state("listening"))
+        rig.clock.advance(0.8)
+        rig.session.emit("user_state_changed", state("speaking"))
+        rig.clock.advance(5.0)
+        rig.final(self.HELD)  # the first burst's final, late
+        rig.session.emit("user_state_changed", state("listening"))
+        rig.final("and that is right.")
+        await rig.settle()
+        self.assertAlmostEqual(await self.commit(rig, f"{self.HELD} and that is right."), 7.1, places=3)
+
+    async def test_new_speech_after_a_held_back_fragment_does_not_give_the_clock_back(self) -> None:
+        rig = Rig()
+        await self.mid_reply(rig)
+        self.speak(rig, 0.6, self.HELD, before_stop=False)  # held back: the clock start dropped
+        await rig.settle()
+        rig.clock.advance(20.0)
+        rig.session.emit("user_state_changed", state("speaking"))  # a new burst: clock restarts
+        rig.clock.advance(3.0)
+        rig.session.emit("user_state_changed", state("listening"))
+        rig.final("Right, go ahead.")  # three words: the SDK commits them with "Yes."
+        await rig.settle()
+        self.assertAlmostEqual(await self.commit(rig, f"{self.HELD} Right, go ahead."), 3.7, places=3)
+
+    async def test_two_one_word_fragments_reach_the_limit_together_and_keep_the_clock(self) -> None:
+        # The SDK banks "Yes." and counts it with "Right." (two words): that turn commits.
+        rig = Rig()
+        await self.mid_reply(rig)
+        self.speak(rig, 0.6, self.HELD, before_stop=False)
+        await rig.settle()
+        self.assertIsNone(rig.interview._user_turn_started)
+        self.speak(rig, 30.0, "Right.", before_stop=False)  # the clock restarts with this burst
+        await rig.settle()
+        self.assertIsNotNone(rig.interview._user_turn_started)
+        seconds = await self.commit(rig, "Yes. Right.")
+        self.assertAlmostEqual(seconds, 30.7, places=3)
+
+    async def test_a_fragment_the_sdk_will_commit_keeps_its_clock(self) -> None:
+        for name, setup in (
+            ("two words", lambda rig: (rig.session.current_speech, "Yes please.")),
+            ("no speech to hold it back", lambda rig: (None, self.HELD)),
+        ):
+            with self.subTest(case=name):
+                rig = Rig()
+                await self.mid_reply(rig)
+                rig.session.current_speech, text = setup(rig)
+                self.speak(rig, 5.0, text, before_stop=False)
+                await rig.settle()
+                self.assertIsNotNone(rig.interview._user_turn_started)
+                self.assertAlmostEqual(await self.commit(rig, text), 5.7, places=3)
+
+    async def test_a_reply_the_sdk_may_not_cut_does_not_hold_the_fragment_back(self) -> None:
+        # allow_interruptions=False (or a reply already cut): the SDK does not apply min_words.
+        for name, kwargs in (("uninterruptible", {"interruptible": False}), ("cut", {})):
+            with self.subTest(case=name):
+                rig = Rig()
+                reply = await self.mid_reply(rig, **kwargs)
+                reply.interrupted = name == "cut"
+                self.speak(rig, 0.6, self.HELD, before_stop=False)
+                await rig.settle()
+                self.assertIsNotNone(rig.interview._user_turn_started)
+
+    async def test_a_limit_of_zero_holds_nothing_back(self) -> None:
+        os.environ["R1_INTERRUPT_MIN_WORDS"] = "0"
+        rig = Rig()
+        await self.mid_reply(rig)
+        self.speak(rig, 0.6, self.HELD, before_stop=False)
+        await rig.settle()
+        self.assertIsNotNone(rig.interview._user_turn_started)
+
+    async def test_the_limit_is_the_one_the_session_was_given(self) -> None:
+        os.environ["R1_INTERRUPT_MIN_WORDS"] = "4"
+        rig = Rig()
+        await self.mid_reply(rig)
+        self.speak(rig, 2.0, "Yes please do go on.", before_stop=False)  # 5 words: committed
+        await rig.settle()
+        self.assertIsNotNone(rig.interview._user_turn_started)
+        rig = Rig()
+        await self.mid_reply(rig)
+        self.speak(rig, 2.0, "Yes please do.", before_stop=False)  # 3 words: held back
+        await rig.settle()
+        self.assertIsNone(rig.interview._user_turn_started)
+
+    async def test_the_words_the_sdk_banks_are_forgotten_when_a_turn_commits(self) -> None:
+        rig = Rig()
+        await self.mid_reply(rig)
+        self.speak(rig, 0.6, self.HELD, before_stop=False)
+        await rig.settle()
+        rig.session.current_speech = None
+        self.speak(rig, 10.0, "Our fees are simple.", before_stop=False)
+        await self.commit(rig, f"{self.HELD} Our fees are simple.")
+        # The next fragment starts from zero: it is held back again, not counted with old words.
+        rig.session.current_speech = FakeSpeechHandle("reply")
+        self.speak(rig, 0.6, self.HELD, before_stop=False)
+        await rig.settle()
+        self.assertIsNone(rig.interview._user_turn_started)
+
+    async def test_a_final_with_no_words_in_it_is_held_back_like_any_other_fragment(self) -> None:
+        rig = Rig()
+        await self.mid_reply(rig)
+        self.speak(rig, 2.0, "...", before_stop=False)  # punctuation only: the SDK counts none
+        await rig.settle()
+        self.assertIsNone(rig.interview._user_turn_started)  # zero words is also held back
+        self.assertEqual(rig.interview._banked_words, 0)
+
+
 class TestTtsNodeSeam(unittest.IsolatedAsyncioTestCase):
     class Downstream:
         def __init__(self) -> None:

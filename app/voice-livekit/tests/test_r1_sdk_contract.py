@@ -27,6 +27,7 @@ try:
     from livekit.agents.ipc import job_proc_lazy_main
     from livekit.agents.llm.llm import LLMError
     from livekit.agents.voice.agent_activity import AgentActivity
+    from livekit.agents.voice.audio_recognition import AudioRecognition
     from livekit.agents.voice.agent_session import SessionConnectOptions
     from livekit.agents.voice.events import (
         AgentStateChangedEvent,
@@ -45,6 +46,7 @@ except ImportError:
     APIConnectOptions = Agent = AgentSession = ErrorEvent = JobContext = None
     SessionConnectOptions = StopResponse = RoomOptions = None
     ChatMessage = LLMError = AgentActivity = CloseEvent = SpeechCreatedEvent = None
+    AudioRecognition = None
     ChatContext = AgentStateChangedEvent = ConversationItemAddedEvent = None
     UserInputTranscribedEvent = EventTypes = None
     SpeechHandle = AgentServer = job_proc_lazy_main = None
@@ -607,6 +609,73 @@ class TestR1LatencyOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         agent_init = inspect.getsource(Agent.__init__)
         self.assertNotIn("min_duration", agent_init)
         self.assertNotIn("min_words", agent_init)
+
+    def test_a_short_turn_over_a_reply_the_sdk_may_cut_is_refused_and_its_words_are_banked(self) -> None:
+        # The behaviour r1_session._fragment_held_back mirrors.  If any condition below changes,
+        # the monologue clock is restarted for fragments the SDK now commits (or the reverse).
+        refusal = inspect.getsource(AgentActivity.on_end_of_turn)
+        for condition in (
+            "self._current_speech is not None",
+            "self._current_speech.allow_interruptions",
+            "not self._current_speech.interrupted",
+            'self._session.options.interruption["min_words"] > 0',
+            "len(split_words(info.new_transcript, split_character=True))",
+            '< self._session.options.interruption["min_words"]',
+        ):
+            self.assertIn(condition, refusal)
+        refused = refusal[refusal.index('< self._session.options.interruption["min_words"]'):]
+        self.assertLess(refused.index("return False"), refused.index("self._user_turn_completed_atask ="))
+        # A refused turn leaves the transcript where it is: it is cleared only once committed,
+        # so the words are prepended to the next turn.
+        recognition = inspect.getsource(AudioRecognition._run_eou_detection)
+        self.assertEqual(recognition.count('self._audio_transcript = ""'), 1)
+        self.assertLess(
+            recognition.index("if committed:"), recognition.index('self._audio_transcript = ""')
+        )
+
+    def test_r1_counts_words_the_way_the_sdk_applies_min_words(self) -> None:
+        from livekit.agents.tokenize.basic import split_words
+
+        import r1_latency
+
+        cjk = chr(0x4E2D) + chr(0x6587)
+        thai = chr(0x0E2A) + chr(0x0E27) + chr(0x0E31)
+        quotes = chr(0x201C) + "Hi" + chr(0x201D) + " " + "ok" + chr(0x2026) + " " + chr(0x2014)
+        for text in (
+            "", "   ", "Yes.", "...", "yes please", "don't", "a - b", "x-y z_w", "$ 5 % ?",
+            "Yes please do go on.", "a b  c", "abc" + cjk + "def", thai, quotes,
+        ):
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(
+                    r1_latency.count_words(text), len(split_words(text, split_character=True))
+                )
+
+    def test_the_sdk_judges_the_interruption_before_it_adds_a_final_to_the_transcript(self) -> None:
+        # Why barge-in needs a final of min_words words by itself: the check runs on the
+        # transcript as it was BEFORE this final, and no interim fills the gap (next test).
+        events = inspect.getsource(AudioRecognition._on_stt_event)
+        self.assertLess(
+            events.index("self._hooks.on_final_transcript("),
+            events.index('self._audio_transcript += f" {transcript}"'),
+        )
+        self.assertIn(
+            "self._audio_recognition.current_transcript",
+            inspect.getsource(AgentActivity._interrupt_by_audio_activity),
+        )
+
+    @unittest.skipIf(_sarvam_plugin is None, "the sarvam plugin is not installed (bare CI)")
+    def test_sarvam_streams_final_transcripts_only(self) -> None:
+        # The runbook's statement that R1_INTERRUPT_MIN_DURATION_SEC does nothing while
+        # R1_INTERRUPT_MIN_WORDS is above zero rests on this: no interim text ever reaches
+        # the transcript the barge-in check reads.  The phone fixtures shadow the plugin with a
+        # file-less stub when a mixed run collects them first; CI's SDK step does not, so there
+        # the real plugin is always inspected.
+        if getattr(_sarvam_plugin, "__file__", None) is not None:
+            from livekit.plugins.sarvam import stt as sarvam_stt
+
+            source = inspect.getsource(sarvam_stt)
+            self.assertIn("SpeechEventType.FINAL_TRANSCRIPT", source)
+            self.assertNotIn("INTERIM_TRANSCRIPT", source)
 
     def test_preemptive_generation_stays_off_because_the_sdk_cannot_see_the_decision(self) -> None:
         # The facts r1_session._agent_turn_handling gives for leaving it off.  If the SDK

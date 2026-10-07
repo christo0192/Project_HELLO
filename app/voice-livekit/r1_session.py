@@ -81,7 +81,7 @@ from observability import StructuredLogger
 from r1_content import CONTENT_SHA256
 from r1_context import fetch_context
 from r1_guard import FALLBACK_REPLY, StreamGuard
-from r1_latency import LatencyTracker, r1_turn_handling
+from r1_latency import LatencyTracker, count_words, interrupt_min_words, r1_turn_handling
 from r1_linecache import (
     LANE_R1,
     RATE_LIMITS,
@@ -740,6 +740,12 @@ class R1Interview:
         self._history: list[dict[str, Any]] = []
         self._latest_candidate_index: int | None = None
         self._user_turn_started: float | None = None
+        # Words the SDK is holding for the next committed turn (see ``_fragment_held_back``),
+        # whether a final arrived while the candidate was still speaking and is not yet judged,
+        # and the clock start a held-back fragment took away (given back if more words follow).
+        self._banked_words = 0
+        self._fragment_unjudged = False
+        self._dropped_turn_start: float | None = None
         self._replies: dict[str, Reply] = {}
         self._latest_reply: Reply | None = None  # prepared, not yet bound to a speech
         self._last_reply: Reply | None = None  # the newest prepared reply (lookup fallback)
@@ -1600,7 +1606,53 @@ class R1Interview:
     def _take_user_turn_seconds(self) -> float | None:
         """How long the candidate talked since the turn began (the monologue length)."""
         started, self._user_turn_started = self._user_turn_started, None
+        # The turn committed, so the SDK has handed over everything it was holding back.
+        self._banked_words = 0
+        self._fragment_unjudged = False
+        self._dropped_turn_start = None
         return None if started is None else max(0.0, self._clock() - started)
+
+    def _fragment_held_back(self) -> bool:
+        """True when livekit-agents will refuse the turn so far and bank its words.
+
+        With ``min_words`` above zero, ``AgentActivity.on_end_of_turn`` refuses a turn of fewer
+        words while the reply it would cut is still interruptible and not yet cut; the words
+        stay in the SDK's transcript and are prepended to the next committed turn.  The banked
+        words are counted the way the SDK counts them, so two one-word fragments reach the
+        limit together.
+        """
+        minimum = interrupt_min_words()
+        if minimum <= 0 or self._banked_words >= minimum:
+            return False
+        speech = getattr(self.session, "current_speech", None)
+        return (
+            speech is not None
+            and bool(getattr(speech, "allow_interruptions", True))
+            and not getattr(speech, "interrupted", False)
+        )
+
+    def _judge_fragment(self) -> None:
+        """A held-back fragment is not part of the candidate's monologue: restart the clock.
+
+        The monologue clock starts at the first ``speaking`` of a turn and stops at the turn
+        hook.  A fragment such as "Yes." said over the learner is refused by the SDK, so no hook
+        ends that clock, and it would keep running through the learner's remaining speech into
+        the candidate's next answer (a 45 s answer read as a 68 s monologue).  Called only while
+        the candidate is not speaking, so the next ``speaking`` starts the clock afresh.
+
+        The judgement can come too early: Sarvam finalises a first word while the candidate talks
+        on, and the final of the rest arrives after the speech has stopped.  Words that arrive
+        with no new speech in between belong with the fragment (the SDK commits them as one
+        turn), so the clock start is given back.
+        """
+        self._fragment_unjudged = False
+        if self._fragment_held_back():
+            if self._user_turn_started is not None:
+                self._dropped_turn_start = self._user_turn_started
+            self._user_turn_started = None
+        elif self._user_turn_started is None and self._dropped_turn_start is not None:
+            self._user_turn_started = self._dropped_turn_start
+            self._dropped_turn_start = None
 
     def prepare_turn(self, text: str, message_id: str | None = None) -> None:
         """Decide one candidate turn: suppress the SDK reply, or fix what the reply must be.
@@ -2267,6 +2319,11 @@ class R1Interview:
         if not text:
             return
         self._latency.note_final()
+        self._banked_words += count_words(text)
+        if self._user_state == "speaking":
+            self._fragment_unjudged = True  # the speech has not stopped: judge it when it does
+        else:
+            self._judge_fragment()
         if self.machine.phase in (R1Phase.OPENING, R1Phase.ICEBREAKER):
             # An early answer spoken over the opening line is still an icebreaker turn.
             self.machine.candidate_turns += 1
@@ -2451,8 +2508,13 @@ class R1Interview:
     def _on_user_state_changed(self, event: Any) -> None:
         self._user_state = str(getattr(event, "new_state", "") or "")
         self._latency.note_user_state(self._user_state)
-        if self._user_state == "speaking" and self._user_turn_started is None:
-            self._user_turn_started = self._clock()
+        if self._user_state == "speaking":
+            self._dropped_turn_start = None  # new speech: what a fragment dropped stays dropped
+            if self._user_turn_started is None:
+                self._user_turn_started = self._clock()
+        elif self._fragment_unjudged:
+            # The final came first (Sarvam ends the speech right after it): judge it now.
+            self._judge_fragment()
         self._refresh_quiet()
 
     def _refresh_quiet(self) -> None:

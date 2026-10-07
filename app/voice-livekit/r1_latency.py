@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import sys
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -76,6 +77,29 @@ def interrupt_min_words() -> int:
     return int(
         _bounded_float(os.getenv("R1_INTERRUPT_MIN_WORDS"), float(INTERRUPT_MIN_WORDS), 0.0, 6.0)
     )
+
+
+# Characters livekit-agents counts as a word each (CJK scripts and Thai), and the punctuation it
+# strips before deciding whether a token is a word: ``tokenize.basic.split_words`` as 1.6.4 calls
+# it for ``min_words`` (``split_character=True``).  ``tests/test_r1_sdk_contract.py`` compares the
+# two, so a change in the SDK is noticed.
+_CHARACTER_WORDS = re.compile("[\u4e00-\u9fff\u3040-\u30ff\u3400-\u4dbf\u0e00-\u0e7f]")
+_SDK_PUNCTUATION = str.maketrans(
+    "",
+    "",
+    "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
+    "\u00b1\u2014\u2018\u2019\u201c\u201d\u2026",
+)
+
+
+def count_words(text: str) -> int:
+    """How many words the SDK counts in ``text`` when it applies ``min_words``."""
+    words = 0
+    for token in text.split():
+        pieces = _CHARACTER_WORDS.split(token)
+        words += len(pieces) - 1  # every character-based letter is a word of its own
+        words += sum(1 for piece in pieces if piece.translate(_SDK_PUNCTUATION))
+    return words
 
 
 def r1_turn_handling() -> dict[str, Any]:

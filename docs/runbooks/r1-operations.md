@@ -1208,10 +1208,33 @@ Switches (all read at use, so a restart is enough; every one is optional):
 | Variable | Default | Effect and rollback |
 |---|---|---|
 | `R1_ENDPOINT_MIN_DELAY_SEC` / `R1_ENDPOINT_MAX_DELAY_SEC` | 0.7 / 3.5 | Endpointing waits (SDK default 0.3 / 2.5 s). Lower the minimum for speed, raise it if candidates are cut off |
-| `R1_INTERRUPT_MIN_DURATION_SEC` / `R1_INTERRUPT_MIN_WORDS` | 0.7 / 2 | How long and how many words an interruption needs (SDK default 0.5 s / 0) |
+| `R1_INTERRUPT_MIN_DURATION_SEC` / `R1_INTERRUPT_MIN_WORDS` | 0.7 / 2 | How long and how many words an interruption needs (SDK default 0.5 s / 0). With Sarvam only the words count: see "Interrupting with final-only speech recognition" below |
 | `R1_TTS_FLUSH_MIN_CHARS` | 60 | Early-flush length cap; `0` turns the early-flush `tts_node` off |
 | `R1_LINE_CACHE` | on | `off` speaks every scripted line live, as before PR-4c |
 | `R1_SYNTH_PER_MIN` | 5 | Background Sarvam syntheses started per minute (1-30); raise only after the Sarvam tier is confirmed (D13) |
+
+### Interrupting with final-only speech recognition
+
+Sarvam streams final transcripts only; it never sends an interim one. livekit-agents 1.6.4 lets
+the candidate's voice cut the learner's reply early only when the transcript it already holds has
+`R1_INTERRUPT_MIN_WORDS` words, and it makes that check before it adds a new final to the
+transcript. While the candidate speaks that transcript is empty, so with the default of 2 the
+voice never cuts the reply by itself: the learner stops when the candidate's turn is committed
+(a final of at least `R1_INTERRUPT_MIN_WORDS` words, after the endpointing wait), and
+`R1_INTERRUPT_MIN_DURATION_SEC` has no effect. `tests/test_r1_sdk_contract.py` pins the SDK facts
+this rests on.
+
+The same setting makes the SDK refuse a shorter turn ("Yes.") that is spoken over a reply it may
+still cut. It keeps the words and prepends them to the next committed turn. R1 does not count
+such a fragment as part of the candidate's monologue, so `CANDIDATE_MONOLOGUE` and the
+`longest_candidate_turn_sec` field of the administration log measure the answer alone.
+
+`R1_INTERRUPT_MIN_WORDS=0` restores the SDK's voice barge-in after `R1_INTERRUPT_MIN_DURATION_SEC`,
+at the price that a "yeah" or a cough cuts the learner. **Stage A decides between 2 and 0**: run
+the smoke session at each value and listen for the two faults, the learner talking over the
+candidate until the candidate's turn is committed (value 2) against a backchannel cutting the
+learner off (value 0). Keep 2 unless the first is the worse problem; the variable is read at use,
+so a restart switches it.
 
 Preemptive generation stays off: livekit-agents 1.6.4 starts it before the per-turn decision and
 cannot be told the decision differs (see `_agent_turn_handling` in `r1_session.py` and
