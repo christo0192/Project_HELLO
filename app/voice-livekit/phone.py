@@ -14881,6 +14881,34 @@ def phone_qna_question_directed(text: Any) -> bool:
     if _QNA_REQUEST_RE.search(clean):
         return True
     return _QNA_QUESTION_OPEN_RE.match(clean) is not None
+
+
+def phone_qna_carries_question(text: Any) -> bool:
+    """Q&A ONLY (M013 S01 round-2 review fix): does a reply ALSO ask something?
+
+    The guard a JUDGED decline must pass before it may close the call: True on
+    a '?', a "one more question" / "a doubt" mention, a request shape ("tell
+    me about…", "I wanted to know…"), or ANY clause that opens with a question
+    word ("Not really, but what is the salary", "Nothing as of now, but can
+    you tell me the salary"). The same clause rule `phone_qna_decline` fails
+    closed on, so with STT punctuation missing a question is still never
+    closed on. Only ever turns a close into an answer.
+    """
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.replace("’", "'").replace("‘", "'").strip().split())
+    if not clean:
+        return False
+    if "?" in clean or _QNA_ASKS_RE.search(clean) or _QNA_REQUEST_RE.search(clean):
+        return True
+    for clause in re.split(r"[.;!,]|\b(?:but|and|although|though)\b",
+                           clean, flags=re.IGNORECASE):
+        clause = clause.strip()
+        if clause and _QNA_QUESTION_OPEN_RE.match(clause):
+            return True
+    return phone_qna_question_directed(clean)
+
+
 _GENERAL_CLARIFICATION_RE = re.compile(
     r"\b(?:can|could|would)\s+you\s+(?:please\s+)?"
     r"(?:repeat|rephrase|explain|clarify|say\s+that\s+again)\b|"

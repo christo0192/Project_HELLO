@@ -1592,6 +1592,33 @@ def suppressive_guard_failure(
     return None
 
 
+def voicemail_guard_failure(
+    verdict: "JudgeVerdict", utterances: Iterable[GateUtterance],
+) -> Optional[str]:
+    """Why a ``voicemail_machine`` verdict may NOT act (``None`` = it may).
+
+    Round-2 review fix: in llm mode a judged voicemail at consent is a silent
+    hang-up (``machine``), and at identity it clears the weak latch. A single
+    hallucinated verdict whose cited words were never said must not do either
+    to a person who spoke. The evidence must be non-empty, must not name an
+    output label, and must be found in an utterance the judge saw. Unlike a
+    suppressive verdict, no ``post_question`` tag is required: a greeting
+    plays from pick-up and routinely overlaps the bot's line. A rejected
+    verdict is ``unclear``, which latches ``candidate_spoke`` like any other
+    valid non-voicemail verdict, so the call ends in a re-ask or a deferral,
+    never as machine.
+    """
+    if verdict.intent != INTENT_VOICEMAIL:
+        return None
+    if not normalize_gate_text(verdict.evidence):
+        return "no_evidence"
+    if evidence_names_a_label(verdict.evidence):
+        return "evidence_is_label"
+    if not evidence_utterances(verdict.evidence, utterances):
+        return "evidence_not_found"
+    return None
+
+
 def check_grant(
     verdict: JudgeVerdict,
     utterances: Iterable[GateUtterance],
@@ -1862,11 +1889,14 @@ async def judge_gate(
                 verdict = raw
             if verdict.intent != INTENT_CONSENT_GRANTED:
                 found = evidence_utterances(verdict.evidence, shown)
-                suppressive = suppressive_guard_failure(verdict, shown)
+                suppressive = (suppressive_guard_failure(verdict, shown)
+                               or voicemail_guard_failure(verdict, shown))
                 if suppressive is not None:
                     # A verdict that ends the call or suppresses the candidate
                     # must rest on their own words after the question, like a
-                    # grant (and like the post-consent window, T07).
+                    # grant (and like the post-consent window, T07). A judged
+                    # voicemail (a silent machine hang-up) must at least cite
+                    # words that were actually heard.
                     decision = GateDecision(
                         intent=INTENT_UNCLEAR, source=SOURCE_LLM,
                         guard_rejected_reason=suppressive,

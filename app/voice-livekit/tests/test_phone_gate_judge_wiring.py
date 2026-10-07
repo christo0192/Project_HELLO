@@ -612,6 +612,51 @@ class TestVoicemailAndTheLatch(unittest.TestCase):
         # Silence at consent with nobody heard: machine (T02 rule a/b).
         self.assertEqual(result.decision, phone.CLASSIFY_MACHINE)
 
+    # Round-2 review (major): a judged voicemail is a silent hang-up, so the
+    # words it cites must have been heard. Both shapes below used to end as
+    # machine on one hallucinated verdict.
+
+    def test_a_voicemail_verdict_citing_unsaid_words_at_consent_is_not_machine(self):
+        fixture = _fixture("hello_who_is_this", speech=[
+            _speech(12000, 13400, 13900, 13910, "Hello? Who is this?"),
+        ])
+        result = _llm(fixture, {"consent": [
+            (gr.judge_json("voicemail_machine", "leave a message after the tone"), 500),
+        ]})
+        self.assertNotEqual(result.decision, phone.CLASSIFY_MACHINE)
+        self.assertTrue(result.glue.spoke.spoke)
+        self.assertTrue(
+            "reask" in result.spoken_kinds()
+            or result.decision == phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE,
+            (result.decision, result.spoken_kinds()))
+        decision = _logs(result, "phone_gate_decision")[0]
+        self.assertEqual(decision.error_category, "llm.unclear")
+        self.assertIn("evidence_not_found", str(decision.fields))
+        self.assertEqual(result.leaked_text_in_logs(), [])
+
+    def test_a_voicemail_verdict_citing_unsaid_words_at_identity_keeps_the_latch(self):
+        fixture = _fixture("identity_hello", identity=(0, 500, 4000), consent=(9000, 9500, 15000),
+                           speech=[_speech(4200, 4700, 5200, 5210, "Hello?")])
+        result = _llm(fixture, {
+            "identity": [(gr.judge_json("voicemail_machine", "please record your message"), 400)],
+        })
+        self.assertTrue(result.glue.spoke.spoke)
+        # Silence at consent after a person spoke: the spoken deferral.
+        self.assertNotEqual(result.decision, phone.CLASSIFY_MACHINE)
+        self.assertEqual(result.decision, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+
+    def test_a_voicemail_verdict_naming_a_label_or_empty_is_not_machine(self):
+        for evidence in ("", "voicemail_machine"):
+            with self.subTest(evidence=evidence):
+                fixture = _fixture("voicemail_label", speech=[
+                    _speech(12000, 13400, 13900, 13910, "Hello? voicemail machine?"),
+                ])
+                result = _llm(fixture, {"consent": [
+                    (gr.judge_json("voicemail_machine", evidence), 500),
+                ]})
+                self.assertNotEqual(result.decision, phone.CLASSIFY_MACHINE)
+                self.assertTrue(result.glue.spoke.spoke)
+
 
 # â”€â”€ the identity turn through the real gate (extends TestGateIdentityFlow) â”€
 

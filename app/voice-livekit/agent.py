@@ -451,7 +451,11 @@ SESSION_MAX_RESIDENCY_SEC = _bounded_float_env(
 # Floor of 30s: below the consent backstop (`phone.phone_classify_timeout_sec`,
 # >= 50.4 s by default in legacy/shadow mode, 137.3 s in llm mode) a healthy
 # consent read would be cut off — the floor is a
-# config guard, not a recommendation. Ceiling of 600s: a gate that has run ten
+# config guard, not a recommendation. In llm mode (as shipped) that applies to
+# any value under about 150 s: the budget deadline is answer + this − 10 s, so
+# the old 116 s (a 106 s deadline) defers consenting candidates who need a
+# re-ask or ask a question back. 116 is a safe rollback only together with
+# PHONE_GATE_JUDGE=legacy or shadow. Ceiling of 600s: a gate that has run ten
 # minutes is wedged by definition.
 PHONE_GATE_MAX_SECONDS = _bounded_float_env(
     "PHONE_GATE_MAX_SECONDS", 180.0, 30.0, 600.0
@@ -4615,6 +4619,11 @@ async def _judge_consent_reply(
     """
     state: dict[str, Any] = {
         "text": text, "items": [chosen],
+        # Round-2 review fix: the text a legacy GRANT may rest on. A turn
+        # appended by the quiescence wait that may not ground a grant (no VAD
+        # timing) still counts for every other reading (busy, decline), but
+        # never helps make up a regex grant.
+        "grant_text": text,
         "after_idx": max((u.idx for u in judge.window()), default=None),
     }
     fallback: dict[str, Any] = {}
@@ -4626,6 +4635,15 @@ async def _judge_consent_reply(
             _log.info(
                 "unknown_event", error_type="phone_gate_turn_barrier",
                 error_category="legacy_grant_before_recording_anchor",
+            )
+            verdict = None
+        if (verdict == phone.CLASSIFY_HUMAN and state["grant_text"] != state["text"]
+                and classify_answer_text(
+                    state["grant_text"], candidate_spoke=spoke_before,
+                ) != phone.CLASSIFY_HUMAN):
+            _log.info(
+                "unknown_event", error_type="phone_gate_turn_barrier",
+                error_category="legacy_grant_needs_untimed_turn",
             )
             verdict = None
         fallback["verdict"] = verdict
@@ -4673,6 +4691,9 @@ async def _judge_consent_reply(
             state["items"].append(item)
             if isinstance(more_text, str) and more_text.strip():
                 state["text"] = f"{state['text']} {more_text.strip()}".strip()
+                if gate_judge.turn_is_grant_evidence(item):
+                    state["grant_text"] = (
+                        f"{state['grant_text']} {more_text.strip()}".strip())
             window = judge.window()
             state["after_idx"] = max((u.idx for u in window), default=state["after_idx"])
             return window
@@ -7349,14 +7370,26 @@ async def _run_native_phone_screening(
         "wish them well, and say goodbye. Do not ask another question."
     )
 
-    def _qna_note(category: str) -> None:
-        """One `phone_qna_close` line: the routing category, never the text."""
+    def _qna_note(category: str, decided_by: str) -> None:
+        """One `phone_qna_close` line: the routing category, never the text.
+
+        `phase` (allowlisted; a `source=` key was silently dropped by the
+        structured logger) is who decided this turn, passed explicitly by the
+        caller (round-2 review fix: it used to read "judge" whenever the
+        window was acting, so a timed-out judge's fallback logged as judge):
+        `judge` (a valid `qna_close` verdict), `fallback` (the fallback
+        grammar: legacy/shadow mode or the judge unavailable) or `rule` (a
+        fixed rule that never reaches a reader: the bare-yes go-ahead and
+        the filler cap).
+        """
         _log.info(
             "unknown_event", error_type="phone_qna_close", error_category=category,
-            # `phase` (allowlisted; a `source=` key was silently dropped by
-            # the structured logger): who decided this turn.
-            phase=("judge" if qna_window.acting else "fallback"),
+            phase=decided_by,
         )
+
+    def _qna_decided_by() -> str:
+        """`judge` when the last `_qna_kind` was a judge verdict, else `fallback`."""
+        return "judge" if _qna_kind_judged() else "fallback"
 
     async def _qna_kind(text: str, route: str | None) -> str:
         """Decline, question or other, for one Q&A turn (T09).
@@ -7376,13 +7409,19 @@ async def _run_native_phone_screening(
             # Only in the safe direction: a reply shaped as a question to the
             # interviewer ("…?", "what does the role pay") is answered even if
             # the judge heard none. Nothing here can close the call.
-            _qna_note("judged_other_question_shape")
+            _qna_note("judged_other_question_shape", "judge")
+            kind = QNA_KIND_QUESTION
+        elif kind == QNA_KIND_DECLINE and phone.phone_qna_carries_question(text):
+            # Round-2 review fix, the same safety net for a judged DECLINE:
+            # "Not really, but what is the salary" (no STT '?') is answered,
+            # never closed on. Only ever turns a close into an answer.
+            _qna_note("judged_decline_question_shape", "judge")
             kind = QNA_KIND_QUESTION
         elif kind in (QNA_KIND_DECLINE, QNA_KIND_QUESTION, QNA_KIND_OTHER):
-            _qna_note(f"judged_{kind}")
+            _qna_note(f"judged_{kind}", "judge")
         else:
             if kind == "unavailable":
-                _qna_note("judge_unavailable")
+                _qna_note("judge_unavailable", "fallback")
             if (
                 phone.phone_qna_done(text)
                 or phone.phone_qna_dismissal(text)
@@ -7820,7 +7859,7 @@ async def _run_native_phone_screening(
             ):
                 # M013 S01 T09: a stream of "Okay"s in the Q&A phase is
                 # bounded too; at the cap the screening closes warmly.
-                _qna_note("filler_cap_close")
+                _qna_note("filler_cap_close", "rule")
                 _qna_close(turn_ctx, _QNA_DONE_CLOSE_INSTRUCTION)
                 return
             setattr(agent, "_turn_policy", "patience_suppressed")
@@ -7835,11 +7874,17 @@ async def _run_native_phone_screening(
             set_reply_snapshot("Take your time.", phase="patience")
             add_turn_instruction(turn_ctx, phone.PHONE_PATIENCE_ENCOURAGEMENT_TEXT)
             return
-        if closing.state is ClosingState.CLOSING_PENDING and (
+        late_question = closing.state is ClosingState.CLOSING_PENDING and (
             route == "candidate_question"
             or phone.phone_qna_question_directed(text)
             or await _qna_kind(text, route) == QNA_KIND_QUESTION
-        ):
+        )
+        # Round-2 review fix: `_qna_kind` may await the judge (llm mode), and
+        # the goodbye's delivery callback can move the state on meanwhile
+        # (`closing_delivered()`); re-check it right before reopening, or
+        # `reopen_qna` raises. A goodbye that already played falls through to
+        # the terminal handling below.
+        if late_question and closing.state is ClosingState.CLOSING_PENDING:
             # A genuine late question outranks an authored-but-unplayed close.
             # Cancel the exact handle and terminal correlation, reopen Q&A, and
             # let the ordinary bounded Q&A branch below answer this same turn.
@@ -7897,10 +7942,10 @@ async def _run_native_phone_screening(
             # phase open forever.
             if not qna_ack and phone.phone_qna_bare_yes(text):
                 if _qna_filler_cap_reached():
-                    _qna_note("filler_cap_close")
+                    _qna_note("filler_cap_close", "rule")
                     _qna_close(turn_ctx, _QNA_DONE_CLOSE_INSTRUCTION)
                     return
-                _qna_note("go_ahead")
+                _qna_note("go_ahead", "rule")
                 qna_expects_question.update(value=True, nudged=False)
                 _speak_withdrawal_line(
                     turn_ctx, phone.PHONE_QNA_GO_AHEAD_TEXT, phase="candidate_qna",
@@ -7908,7 +7953,7 @@ async def _run_native_phone_screening(
                 return
             if phone.phone_qna_incomplete(text) and not qna_ack:
                 if _qna_filler_cap_reached():
-                    _qna_note("filler_cap_close")
+                    _qna_note("filler_cap_close", "rule")
                     _qna_close(turn_ctx, _QNA_DONE_CLOSE_INSTRUCTION)
                     return
                 if prior_interrupted:
@@ -7947,13 +7992,13 @@ async def _run_native_phone_screening(
                 # question": every non-decline turn gets the grounded answer,
                 # exactly as before T09, and it never closes the call. Only a
                 # judge verdict may route a turn to the acknowledge/close path.
-                _qna_note("fallback_other_answered")
+                _qna_note("fallback_other_answered", "fallback")
                 qna_kind = QNA_KIND_QUESTION
             if qna_kind == QNA_KIND_DECLINE:
                 close_instruction = _QNA_DONE_CLOSE_INSTRUCTION
             elif qna_kind == QNA_KIND_OTHER and qna_other["value"] < 1:
                 qna_other["value"] += 1
-                _qna_note("non_question_acknowledged")
+                _qna_note("non_question_acknowledged", _qna_decided_by())
                 qna_answer_delivery.update(sequence=speech_sequence[0] + 1, delivered=False)
                 set_reply_snapshot("Understood.", phase="candidate_qna")
                 setattr(agent, "_turn_policy", "clarification")
@@ -7967,7 +8012,7 @@ async def _run_native_phone_screening(
                 )
                 return
             elif qna_kind == QNA_KIND_OTHER:
-                _qna_note("non_question_close")
+                _qna_note("non_question_close", _qna_decided_by())
                 close_instruction = (
                     "The candidate has nothing more to ask. If what they just said "
                     "needs a reply, respond to it briefly in one short sentence "

@@ -206,7 +206,9 @@ class TestWatchedLogFieldsAreAllowlisted(unittest.TestCase):
         allowed = set(observability._ALLOWED_META_KEYS) | {"error_type"}
         seen: set[str] = set()
         bad = []
-        for name in ("agent.py", "gate_judge.py"):
+        # Round-2 review: phone.py emits phone_gate_budget, phone_callback_judge,
+        # phone_callback_turn and the gate-side phone_gate_compose.
+        for name in ("agent.py", "gate_judge.py", "phone.py"):
             for lineno, et, keys in _log_calls(_WORKER / name):
                 if et not in _WATCHED_LOG_TYPES:
                     continue
@@ -218,7 +220,8 @@ class TestWatchedLogFieldsAreAllowlisted(unittest.TestCase):
         # Not vacuous: most watched types are found as literal call sites
         # (the rest are emitted through helpers with a computed error_type).
         self.assertTrue({"phone_gate_compose", "phone_qna_close", "phone_q1_prefetch",
-                         "phone_gate_final", "phone_gate_turn_barrier"} <= seen, seen)
+                         "phone_gate_final", "phone_gate_turn_barrier", "phone_gate_budget",
+                         "phone_callback_judge", "phone_callback_turn"} <= seen, seen)
 
     def test_the_runbook_names_the_real_decision_keys(self):
         text = (_REPO / "docs" / "runbooks" / "phone-safe-dialer.md").read_text(

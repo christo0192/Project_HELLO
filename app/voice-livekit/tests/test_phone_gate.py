@@ -11147,6 +11147,94 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         await self._finish(hooks)
         self.assertIn("assessment.completed", client.event_types)
 
+    @staticmethod
+    def _qna_close_lines(hooks):
+        return [
+            (c.kwargs.get("error_category"), c.kwargs.get("phase"))
+            for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_qna_close"
+        ]
+
+    async def test_judged_decline_then_unpunctuated_question_is_answered(self):
+        # Round-2 review fix: a judged DECLINE needs the same safety net as a
+        # judged OTHER. With no STT '?', "Not really, but what is the salary"
+        # judged end_call on "Not really" must be answered, never closed on.
+        for text, evidence in (
+            ("Not really, but what is the salary", "Not really"),
+            ("Nothing as of now, but can you tell me the salary", "Nothing as of now"),
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(phone.phone_qna_decline(text))
+                self.assertTrue(phone.phone_qna_carries_question(text))
+                window, _, _ = _qna_window({text: _qna_verdict("end_call", evidence)})
+                agent, _, _, client, hooks = await self._enter_qna(window)
+                out, stopped = await self._qna_turn(hooks, text)
+                self.assertFalse(stopped)
+                self.assertIn("answer the candidate's question", out.lower())
+                self.assertNotIn("say goodbye.", out.lower())
+                self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
+                self.assertIn(("judged_decline_question_shape", "judge"),
+                              self._qna_close_lines(hooks))
+                self.assertNotIn("assessment.completed", client.event_types)
+                await self._stop(hooks)
+
+    def test_a_plain_decline_carries_no_question(self):
+        for text in ("No ma'am, thank you so much.", "Nothing as of now",
+                     "No sir, that's all", "It's all good, thanks"):
+            self.assertFalse(phone.phone_qna_carries_question(text), text)
+
+    async def test_qna_close_phase_names_who_decided(self):
+        # Round-2 review fix: `phase` is who decided THIS turn, not whether
+        # the window was acting. A timed-out judge's turn is `fallback`.
+        window, _, _ = _qna_window(fail=True)
+        agent, _, _, _, hooks = await self._enter_qna(window)
+        self.assertTrue(window.acting)
+        await self._qna_turn(hooks, "I'm good at sales")
+        self.assertEqual(self._qna_close_lines(hooks), [
+            ("judge_unavailable", "fallback"), ("fallback_other_answered", "fallback")])
+        await self._stop(hooks)
+
+        window, _, _ = _qna_window({"I'm good at sales": _QNA_UNCLEAR})
+        agent, _, _, _, hooks = await self._enter_qna(window)
+        await self._qna_turn(hooks, "Yes")
+        await self._qna_turn(hooks, "I'm good at sales")
+        self.assertEqual(self._qna_close_lines(hooks), [
+            ("go_ahead", "rule"), ("judged_other", "judge"),
+            ("non_question_acknowledged", "judge")])
+        await self._stop(hooks)
+
+    async def test_goodbye_delivered_during_the_late_question_judge_is_terminal(self):
+        # Round-2 review fix (nit): the judge awaited inside the
+        # CLOSING_PENDING check; the goodbye's delivery callback can move the
+        # state on meanwhile, and `reopen_qna` then raised inside llm_node.
+        text = "and the stipend amount for interns"
+        self.assertFalse(phone.phone_qna_question_directed(text))
+        window, transport, _ = _qna_window({
+            text: _qna_verdict("question", "the stipend amount for interns"),
+            "Nothing else": _qna_verdict("end_call", "Nothing else")})
+        agent, _, _, _, hooks = await self._enter_qna(window)
+        await self._qna_turn(hooks, "Nothing else")
+        self.assertEqual(agent._closing_state_machine.state.value, "closing_pending")
+        in_flight = asyncio.Event()
+        recorded = transport.request
+
+        async def _slow(**kwargs):
+            in_flight.set()
+            await asyncio.sleep(0.05)
+            return await recorded(**kwargs)
+
+        transport.request = _slow
+        turn = asyncio.create_task(self._qna_turn(hooks, text))
+        await asyncio.wait_for(in_flight.wait(), timeout=2)
+        # The goodbye's delivery callback lands while the verdict is in
+        # flight (the state flip it makes, `closing_delivered()`).
+        agent._closing_state_machine.closing_delivered()
+        self.assertEqual(agent._closing_state_machine.state.value, "closing_played")
+        _, stopped = await asyncio.wait_for(turn, timeout=5)
+        self.assertTrue(stopped)
+        self.assertEqual(agent._closing_state_machine.state.value, "closing_played")
+        await self._stop(hooks)
+
 
 class TestQnaClosingGrammar(unittest.TestCase):
     """M013 S01 T09: the fallback readers and the question-opener fix."""

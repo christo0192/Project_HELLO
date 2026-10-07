@@ -100,7 +100,7 @@ secret again afterwards so the repo shows the live value.
 | `PHONE_GATE_COMPOSE_TIMEOUT_SEC` | default `1.5` (clamp 0.5–4.0) | Cap on composing one gate line; a miss speaks the fixed line | `4.0` (the old cap) |
 | `PHONE_Q1_PRERENDER` | default `true` | Q1 audio is pre-rendered under the role line | `false` |
 | `PHONE_DETERMINISTIC_OPENER` | default `false` (composed openings) | `true` speaks the fixed scripted lines | `PHONE_DETERMINISTIC_OPENER=true` |
-| `PHONE_GATE_MAX_SECONDS` | default `180` | Gate wall clock; the lease heartbeat now runs from the answer and a budget is checked before every new ask | `116` (the old value) |
+| `PHONE_GATE_MAX_SECONDS` | default `180` | Gate wall clock; the lease heartbeat now runs from the answer and a budget is checked before every new ask | `116` (the old value), but ONLY together with `PHONE_GATE_JUDGE=legacy` or `shadow` (consent backstop 50.4 s). In `llm` mode the backstop is 137.3 s and 116 gives a budget deadline 106 s after the answer, so consenting candidates who need a re-ask or ask a question back are deferred; keep it at or above ~150 in `llm` mode |
 | `PHONE_CLASSIFY_TIMEOUT_SEC` | not set; derived 137.3 s as shipped (`llm`), 50.4 s in `legacy`/`shadow` | Consent backstop: in `llm` mode 3 × (answer window + 2 × 6 + 3 × judge timeout + 2 × 6 s quiescence) + 5; in `legacy`/`shadow` 2 × (answer window + 6 + judge timeout) + 5; an explicit value can only raise it. The gate budget (`PHONE_GATE_MAX_SECONDS`) still caps it | Set a higher value |
 
 **Why `llm` is the default.** `llm` ships by the owner's explicit decision of
@@ -196,9 +196,13 @@ structured logger only accepts its allowlisted keys, so the fields are:
   before Q1 is answered; `shadow_<intent>` in shadow mode) and its per-call
   `phone_gate_decision` / `phone_gate_shadow_decision` lines (phase
   `post_consent`).
-- The Q&A close: `phone_qna_close` (`judged_<kind>`, `judge_unavailable`,
+- The Q&A close: `phone_qna_close` (`judged_<kind>`, `judged_other_question_shape`,
+  `judged_decline_question_shape`, `judge_unavailable`,
   `fallback_other_answered`, `go_ahead`, `non_question_acknowledged`,
-  `non_question_close`, `filler_cap_close`; `phase` = `judge` or `fallback`),
+  `non_question_close`, `filler_cap_close`; `phase` = who decided THIS turn:
+  `judge` (a valid `qna_close` verdict), `fallback` (the fallback grammar:
+  `legacy`/`shadow`, or the judge unavailable) or `rule` (the bare-yes
+  go-ahead and the filler cap, which no reader decides)),
   `phone_qna_close_judge` (the `qna_close` judge's own lines) and
   `phone_silence` (`qna_silence_nudge`, `qna_silence_close`). A bare "yes"
   gets "Sure, go ahead."; a decline closes on the first one; silence after the
@@ -277,8 +281,12 @@ default is now `false` (composed openings). Set it to `true` explicitly. With
 `PHONE_GATE_FLOW` unset and the opener `true`, the gate returns to the fixed
 disclosure with no identity turn and no pre-consent generation by the main
 model. The gate judge (`PHONE_GATE_JUDGE=llm`, as shipped, or `shadow`) still
-sends the pre-consent identity and consent replies (first name only) to
-DeepSeek; set `PHONE_GATE_JUDGE=legacy` as well to stop that. Secrets-only, so
+sends candidate replies to DeepSeek, verbatim and unscrubbed, with the bot's
+own line and the candidate's first name only: the identity reply, the consent
+replies, the callback-time replies, every post-consent reply until Q1 is
+answered (the revocation window) and every Q&A-phase reply (the Q&A close
+judge); `shadow` sends the same replies and only logs the verdicts. Set `PHONE_GATE_JUDGE=legacy` as well to stop all of
+that. Secrets-only, so
 it needs no deploy and no revert, and it works even if later code has shipped.
 
 A third flag, `PHONE_IDENTITY_MISMATCH_SUPPRESSES`, defaults to **off**. Both

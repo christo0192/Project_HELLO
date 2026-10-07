@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import types
 import unittest
 import unittest.mock
 
@@ -285,6 +286,26 @@ class TestSuppressiveVerdictsNeedEvidence(unittest.TestCase):
                 self.assertEqual(d.intent, intent)
                 self.assertEqual(d.evidence_idx, 0)
 
+    def test_a_voicemail_verdict_must_cite_words_that_were_heard(self):
+        # Round 2 (major): a judged voicemail is a silent hang-up at consent.
+        for evidence, reason in (
+            ("", "no_evidence"),
+            ("voicemail_machine", "evidence_is_label"),
+            ("leave a message after the tone", "evidence_not_found"),
+        ):
+            with self.subTest(evidence=evidence):
+                d = _judge_run(_request(_utt(0, "Hello? Who is this? voicemail machine")),
+                               _verdict("voicemail_machine", evidence))
+                self.assertEqual((d.intent, d.guard_rejected_reason), ("unclear", reason))
+
+    def test_a_grounded_voicemail_acts_even_before_the_question(self):
+        # A greeting plays from pick-up and overlaps the bot's line: no
+        # post_question requirement, only that the cited words were heard.
+        greeting = _utt(0, "Please leave your message after the tone.",
+                        tag=gate_judge.TAG_PRE_QUESTION, start=8_000)
+        d = _judge_run(_request(greeting), _verdict("voicemail_machine", "leave your message"))
+        self.assertEqual((d.intent, d.evidence_idx), ("voicemail_machine", 0))
+
     def test_non_suppressive_verdicts_are_unchanged(self):
         d = _judge_run(_request(_utt(0, "how long will it take")),
                        _verdict("question", "", question="how_long"))
@@ -348,6 +369,67 @@ class TestPreloopSkipsBackchannels(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.intent, gate_judge.INTENT_NOT_NOW_BUSY)
         self.assertEqual(text, busy)
         window.close("test")
+
+
+def _gate_turn(text, idx, *, timed):
+    start = 20_000 + idx * 1000 if timed else None
+    return gate_judge.GateTurn(
+        text=text, utterance_idxs=(idx,), segment_start_ms=start,
+        segment_end_ms=(start + 600) if timed else None,
+        segment_speech_ms=600 if timed else None, final_arrival_ms=None,
+        committed=True, closed_by="commit",
+    )
+
+
+class _FallbackAfterWaitWiring:
+    """A wiring double whose judge grants, waits for the open turn, then is
+    unavailable on the re-judge: `legacy()` decides on the joined reply."""
+
+    def __init__(self):
+        self.latch = gate_judge.HumanSpeechLatch()
+        self.capture = types.SimpleNamespace(
+            utterances=types.SimpleNamespace(all=lambda: ()))
+        self._pending = ["open_segment"]
+
+    def window(self):
+        return ()
+
+    def recording_anchor_ms(self):
+        return 10_000
+
+    def pending_speech(self, after_idx):
+        return self._pending.pop(0) if self._pending else None
+
+    async def decide(self, phase, bot_line, *, legacy, wait_for_more=None):
+        await wait_for_more("open_segment")
+        intent = legacy()
+        return gate_judge.GateDecision(intent=intent, source=gate_judge.SOURCE_LEGACY_FALLBACK)
+
+
+class TestLegacyFallbackNeverGrantsOnAnUntimedTurn(unittest.IsolatedAsyncioTestCase):
+    """Round 2 (minor): after a quiescence wait, the llm-mode legacy fallback
+    must not let an appended turn with no speech timing make up a grant."""
+
+    async def _run(self, *, timed):
+        turns: asyncio.Queue = asyncio.Queue()
+        await turns.put(_gate_turn("yes.", 1, timed=timed))
+        return await agent_mod._judge_consent_reply(
+            _FallbackAfterWaitWiring(), gate_judge.PHASE_CONSENT, "line",
+            text="Hello,", chosen=_gate_turn("Hello,", 0, timed=True), turns=turns,
+            question_anchor=lambda: 15_000, budget=None, spoke_before=True,
+        )
+
+    async def test_an_untimed_appended_turn_does_not_complete_a_regex_grant(self):
+        self.assertEqual(agent_mod.classify_answer_text("Hello, yes.", candidate_spoke=True),
+                         phone.CLASSIFY_HUMAN)
+        self.assertIsNone(agent_mod.classify_answer_text("Hello,", candidate_spoke=True))
+        judged = await self._run(timed=False)
+        self.assertIsNone(judged.decision)
+        self.assertEqual(judged.text, "Hello, yes.")
+
+    async def test_a_timed_appended_turn_still_counts(self):
+        judged = await self._run(timed=True)
+        self.assertEqual(judged.decision, phone.CLASSIFY_HUMAN)
 
 
 if __name__ == "__main__":  # pragma: no cover

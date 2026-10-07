@@ -33,7 +33,14 @@ export const ALLOWED_POLICY_STATUSES = ['PROPOSED', 'PENDING', 'NOT_EVALUATED'] 
 export type PolicyStatus = (typeof ALLOWED_POLICY_STATUSES)[number];
 
 /** Current third-party/orchestrator providers present at some boundary. */
-export const ALLOWED_PROVIDERS = ['anthropic', 'sarvam', 'silero', 'livekit', 'supabase'] as const;
+export const ALLOWED_PROVIDERS = [
+  'anthropic',
+  'deepseek',
+  'sarvam',
+  'silero',
+  'livekit',
+  'supabase',
+] as const;
 export type ProviderName = (typeof ALLOWED_PROVIDERS)[number];
 
 /** Workloads served by the screening product. */
@@ -52,6 +59,7 @@ export const ALLOWED_BOUNDARY_KINDS = [
   'scoring', // post-session scoring path
   'provenance', // non-secret provenance tracking
   'persistence', // durable state / first-party API calls
+  'http_call', // direct HTTP call to a provider endpoint (no SDK)
 ] as const;
 export type BoundaryKind = (typeof ALLOWED_BOUNDARY_KINDS)[number];
 
@@ -532,6 +540,30 @@ export const PROVIDER_BOUNDARIES: readonly ProviderBoundaryEntry[] = [
       'Supabase client for session lifecycle plus first-party scoring-trigger and worker-context HTTP calls ' +
       'against the API (API_BASE). The scoring trigger is our own API, not a third-party provider. Breaker ' +
       'wrapping via provider_resilience.py.',
+  },
+  {
+    id: 'livekit-gate-judge-deepseek',
+    workloads: ['screening'],
+    provider: 'deepseek',
+    runtime: 'voice-livekit',
+    boundaryKind: 'http_call',
+    constructorPath: 'app/voice-livekit/gate_judge.py',
+    envVars: [
+      'PHONE_GATE_JUDGE',
+      'PHONE_GATE_JUDGE_MODEL',
+      'PHONE_JUDGE_SDK',
+      'PHONE_JUDGE_URL',
+      'PHONE_JUDGE_API_KEY',
+      'DEEPSEEK_API_KEY',
+    ],
+    allowlists: ['deepseek'],
+    policyStatus: 'PROPOSED',
+    notes:
+      'M013 S01 phone gate judge: a direct chat-completions call (gate_judge.call_judge) with a bounded ' +
+      "timeout and its own breaker. PHONE_GATE_JUDGE=llm (as shipped) or shadow sends the candidate's " +
+      'identity, consent, callback-time, post-consent (until Q1 is answered) and Q&A replies verbatim, the ' +
+      "bot's own line and the candidate's first name only; legacy sends nothing. A non-DeepSeek model id " +
+      'disables it. Env names only; no values recorded here.',
   },
 ];
 
