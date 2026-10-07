@@ -396,6 +396,7 @@ export function CandidateDetailPage() {
                   sessions={sessions}
                   phoneRole={me.role}
                   viewerId={me.userId}
+                  legacyBrowserScreening={me.legacyBrowserScreeningEnabled !== false}
                   phoneAttempts={phoneAttempts}
                   showPhoneAttempts={tab === "overview"}
                   onSessionCompleted={refresh}
@@ -522,6 +523,7 @@ function OverviewTab({
   sessions,
   phoneRole,
   viewerId,
+  legacyBrowserScreening,
   phoneAttempts,
   showPhoneAttempts,
   onSessionCompleted,
@@ -536,6 +538,13 @@ function OverviewTab({
   phoneRole: MeResponse["role"];
   /** The signed-in user's id, so R1 round actions follow the API's ownership rule. */
   viewerId: string;
+  /**
+   * PR-L: false once the API reports the legacy browser screening lane retired.
+   * Hides the "Browser voice screening" card (and with it the Create invite
+   * action). The Live call panel is NOT tied to this: it stays for any call
+   * that is still live, which is how an already-started legacy session drains.
+   */
+  legacyBrowserScreening: boolean;
   /** The page's shared attempt list (see `usePhoneAttemptHistory`). */
   phoneAttempts: PhoneAttemptHistorySource;
   /** False while another tab is open: unmounts the player (see the page). */
@@ -576,29 +585,38 @@ function OverviewTab({
         {/* Both call cards are frozen components; neither is modified. The
             Live call panel joins the invite card only while a call is live
             or has just happened on this page (useLiveCallRelevant); the rest
-            of the time the invite card has the row to itself. */}
-        <div
-          className={cx(
-            "grid gap-4",
-            liveCallRelevant && "sm:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] sm:items-start",
-          )}
-        >
-          <div className="min-w-0">
-            <LiveKitCallCard
-              candidateId={candidate.id}
-              candidateName={candidate.name}
-            />
+            of the time the invite card has the row to itself. With the legacy
+            lane retired (PR-L) the invite card is not rendered at all; the
+            Live call panel then takes the row on its own, and the row is
+            absent when nothing is live. */}
+        {(legacyBrowserScreening || liveCallRelevant) && (
+          <div
+            className={cx(
+              "grid gap-4",
+              legacyBrowserScreening
+                && liveCallRelevant
+                && "sm:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] sm:items-start",
+            )}
+          >
+            {legacyBrowserScreening && (
+              <div className="min-w-0">
+                <LiveKitCallCard
+                  candidateId={candidate.id}
+                  candidateName={candidate.name}
+                />
+              </div>
+            )}
+            {liveCallRelevant && (
+              <div className="min-w-0">
+                <LiveCallPanel
+                  candidateId={candidate.id}
+                  candidateName={candidate.name || undefined}
+                  onSessionCompleted={onSessionCompleted}
+                />
+              </div>
+            )}
           </div>
-          {liveCallRelevant && (
-            <div className="min-w-0">
-              <LiveCallPanel
-                candidateId={candidate.id}
-                candidateName={candidate.name || undefined}
-                onSessionCompleted={onSessionCompleted}
-              />
-            </div>
-          )}
-        </div>
+        )}
 
         {phoneRole !== "viewer" && (
           <PhoneCycleCard

@@ -1028,6 +1028,13 @@ export interface MeResponse {
   email: string | null;
   role: MembershipRole;
   active: boolean;
+  /**
+   * PR-L: `false` once the API has retired the legacy browser screening lane
+   * (LEGACY_BROWSER_SCREENING_ENABLED=false). Absent from an older API, and from
+   * the minimal fallback profile, which both mean "still enabled": only an
+   * explicit `false` hides the legacy card.
+   */
+  legacyBrowserScreeningEnabled?: boolean;
 }
 
 // ── Phase 9: candidate pre-join consent (invite-opaque) ─────────────

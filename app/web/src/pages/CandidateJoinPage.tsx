@@ -16,6 +16,10 @@ import { Button } from '../components/ui';
 import { AudioReadinessStep } from '../components/candidate-join/AudioReadinessStep';
 import { InterviewerAura } from '../components/candidate-join/InterviewerAura';
 import { useCapabilitySupport } from '../lib/capability-check';
+import {
+  isBrowserScreeningRetired,
+  RETIRED_LINK_CANDIDATE_MESSAGE,
+} from '../lib/browser-screening-retired';
 import '../styles/candidate-experience.css';
 
 const AGENT_PARTICIPANT_KIND = (ParticipantKind as unknown as { AGENT?: unknown } | undefined)?.AGENT;
@@ -117,6 +121,8 @@ async function acquireLocalAudioTrack(): Promise<LocalAudioTrack> {
  * server-side, so the join button stays usable and a retry is meaningful.
  */
 function exchangeErrorMessage(error: unknown): string {
+  // PR-L: the legacy lane is retired; the link can never work again.
+  if (isBrowserScreeningRetired(error)) return RETIRED_LINK_CANDIDATE_MESSAGE;
   const code = error instanceof ApiError ? error.message : '';
   if (code === 'screening_room_unavailable') {
     return 'We could not open your screening room just now. Please try again in a moment — your invite is still valid.';
@@ -314,10 +320,15 @@ export function CandidateJoinPage() {
       } catch (err) {
         if (cancelled) return;
         setPhase('error');
+        // PR-L: the legacy lane is retired, so the status call is where an
+        // outstanding link first fails. Say so here, with no consent form,
+        // instead of letting the candidate fill it in and fail later.
         setError(
-          err instanceof ApiError
-            ? err.message
-            : 'Unable to check your invitation. Please try again later.',
+          isBrowserScreeningRetired(err)
+            ? RETIRED_LINK_CANDIDATE_MESSAGE
+            : err instanceof ApiError
+              ? err.message
+              : 'Unable to check your invitation. Please try again later.',
         );
       }
     })();
@@ -325,6 +336,18 @@ export function CandidateJoinPage() {
       cancelled = true;
     };
   }, []);
+
+  /**
+   * PR-L: a consent submit that reaches the retired lane (the lane was retired
+   * while this page was open) swaps the form for the same "no longer active"
+   * dead end the status call shows. True when it handled the error.
+   */
+  function showRetiredLink(err: unknown): boolean {
+    if (!isBrowserScreeningRetired(err)) return false;
+    setPhase('error');
+    setError(RETIRED_LINK_CANDIDATE_MESSAGE);
+    return true;
+  }
 
   async function grantConsent() {
     const invite = inviteRef.current;
@@ -343,6 +366,7 @@ export function CandidateJoinPage() {
       }
       setPhase('granted');
     } catch (err) {
+      if (showRetiredLink(err)) return;
       setError(err instanceof ApiError ? err.message : 'Unable to record your consent.');
     }
   }
@@ -362,6 +386,7 @@ export function CandidateJoinPage() {
       // Decline persists and NEVER exchanges/joins/consumes the token.
       setPhase('declined');
     } catch (err) {
+      if (showRetiredLink(err)) return;
       setError(err instanceof ApiError ? err.message : 'Unable to record your consent.');
     }
   }

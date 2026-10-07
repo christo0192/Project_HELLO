@@ -4014,6 +4014,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyManualInviteResponse'
+        '410':
+          description: Legacy browser screening is retired (LEGACY_BROWSER_SCREENING_ENABLED=false), so no browser invite is minted. Stable code `browser_screening_retired`.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
   /api/integrations/ashby/mission-control/operations/{id}/retry:
     post:
       tags: [ashby]
@@ -4302,6 +4308,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SimpleError'
+        '410':
+          description: Legacy browser screening is retired (LEGACY_BROWSER_SCREENING_ENABLED=false). Stable code `browser_screening_retired`; nothing is created or consumed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
 
   /api/livekit/{sessionId}/complete:
     parameters:
@@ -4536,6 +4548,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SimpleError'
+        '410':
+          description: Legacy browser screening is retired (LEGACY_BROWSER_SCREENING_ENABLED=false). Stable code `browser_screening_retired`; nothing is created or consumed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
 
   /api/livekit/preflight:
     post:
@@ -4571,6 +4589,12 @@ paths:
                 $ref: '#/components/schemas/SimpleError'
         '409':
           description: Consent is missing or invalid; invite remains reusable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '410':
+          description: Legacy browser screening is retired (LEGACY_BROWSER_SCREENING_ENABLED=false). Stable code `browser_screening_retired`; nothing is created or consumed.
           content:
             application/json:
               schema:
@@ -4616,6 +4640,12 @@ paths:
                 $ref: '#/components/schemas/SimpleError'
         '409':
           description: Consent missing, declined, withdrawn, expired, or incomplete (`consent_required`). Invite left unconsumed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '410':
+          description: Legacy browser screening is retired (LEGACY_BROWSER_SCREENING_ENABLED=false). Stable code `browser_screening_retired`. Drain exception - the same-bearer re-exchange of an invite consumed within the last five minutes still proceeds through the unchanged handler so an already-started session can finish.
           content:
             application/json:
               schema:
@@ -6315,6 +6345,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '410':
+          description: Legacy browser screening is retired (LEGACY_BROWSER_SCREENING_ENABLED=false). Stable code `browser_screening_retired`; answered before validation, nothing is read.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
 
   /api/candidate-consent/template:
     get:
@@ -6374,6 +6410,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+        '410':
+          description: Legacy browser screening is retired (LEGACY_BROWSER_SCREENING_ENABLED=false). Stable code `browser_screening_retired`; answered before validation, and no consent_records row is written, for a grant or a decline.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
         '503':
           description: Consent template unavailable (fail closed, stable).
           content:
@@ -11280,6 +11322,9 @@ components:
           enum: [admin, interviewer, viewer]
         active:
           type: boolean
+        legacyBrowserScreeningEnabled:
+          type: boolean
+          description: Whether the legacy browser screening lane is still enabled (LEGACY_BROWSER_SCREENING_ENABLED). The web hides the legacy card when false; a client must treat an absent value as enabled.
       additionalProperties: false
 
     AdminMember:

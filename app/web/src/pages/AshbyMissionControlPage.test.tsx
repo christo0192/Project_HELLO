@@ -1,7 +1,7 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { AshbyMissionControlPage } from './AshbyMissionControlPage';
 import { ApiError } from '../api';
 
@@ -81,7 +81,7 @@ function expectOptions(list: HTMLElement, names: Array<string | RegExp>): void {
   options.forEach((option, i) => expect(option).toHaveAccessibleName(names[i]));
 }
 
-const { listAshbyMappings, listAshbyWorkflows, listAshbyJobs, pauseAshbyMapping, resumeAshbyMapping, archiveAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, previewAshbyBacklog, confirmAshbyBacklog, createAshbyMapping, listRoles } = vi.hoisted(() => ({
+const { listAshbyMappings, listAshbyWorkflows, listAshbyJobs, pauseAshbyMapping, resumeAshbyMapping, archiveAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, previewAshbyBacklog, confirmAshbyBacklog, createAshbyMapping, listRoles, getMe } = vi.hoisted(() => ({
   listAshbyMappings: vi.fn(),
   archiveAshbyMapping: vi.fn(),
   listAshbyJobs: vi.fn(),
@@ -97,10 +97,11 @@ const { listAshbyMappings, listAshbyWorkflows, listAshbyJobs, pauseAshbyMapping,
   confirmAshbyBacklog: vi.fn(),
   createAshbyMapping: vi.fn(),
   listRoles: vi.fn(),
+  getMe: vi.fn(),
 }));
 
 vi.mock('../api', () => ({
-  api: { listAshbyMappings, listAshbyWorkflows, listAshbyJobs, pauseAshbyMapping, resumeAshbyMapping, archiveAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, previewAshbyBacklog, confirmAshbyBacklog, createAshbyMapping, listRoles },
+  api: { listAshbyMappings, listAshbyWorkflows, listAshbyJobs, pauseAshbyMapping, resumeAshbyMapping, archiveAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, previewAshbyBacklog, confirmAshbyBacklog, createAshbyMapping, listRoles, getMe },
   ApiError: class ApiError extends Error {
     status: number;
     constructor(m: string, s: number) { super(m); this.status = s; }
@@ -356,6 +357,17 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     renderPage();
     await userEvent.click(await screen.findByRole('button', { name: /get invite link/i }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/blocked_terminal/i);
+    expect(screen.queryByLabelText(/candidate link/i)).toBeNull();
+  });
+
+  it('PR-L: explains that browser screening is retired when the invite answers 410', async () => {
+    const { ApiError } = await import('../api');
+    deliverAshbyManualInvite.mockRejectedValue(new ApiError('browser_screening_retired', 410));
+    renderPage();
+    await userEvent.click(await screen.findByRole('button', { name: /get invite link/i }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/retired/i);
+    expect(alert).not.toHaveTextContent(/browser_screening_retired/);
     expect(screen.queryByLabelText(/candidate link/i)).toBeNull();
   });
 
@@ -2431,5 +2443,98 @@ describe('Cancelling a screening asks first', () => {
     await userEvent.click(screen.getByRole('menuitem', { name: 'Cancel screening' }));
     screen.getByRole('dialog', { name: 'Cancel this screening?' });
     await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('AshbyMissionControlPage — invite actions follow the legacy lane switch (PR-L)', () => {
+  const IN_PROGRESS = WORKFLOWS;
+  const COMPLETED = {
+    ok: true,
+    workflows: [
+      {
+        ...WORKFLOWS.workflows[0],
+        lifecycle: 'writeback_pending',
+        sessionStatus: 'completed',
+        sessionId: 'sess-1',
+      },
+    ],
+  };
+  const ME = { userId: 'u1', email: 'a@example.com', role: 'admin', active: true };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listRoles.mockResolvedValue(ROLES);
+    listAshbyJobs.mockResolvedValue(JOBS);
+    listAshbyWorkflows.mockResolvedValue(IN_PROGRESS);
+    getMe.mockReset();
+  });
+  afterEach(() => {
+    // mockResolvedValue survives vi.clearAllMocks; do not leak it to other suites.
+    getMe.mockReset();
+  });
+
+  it('retired: hides "Get invite link" on a screening that has not completed', async () => {
+    getMe.mockResolvedValue({ ...ME, legacyBrowserScreeningEnabled: false });
+    renderPage();
+    await screen.findByText('app_1');
+    await waitFor(() => expect(screen.queryByRole('button', { name: /invite link/i })).toBeNull());
+    expect(getMe).toHaveBeenCalledTimes(1);
+    // The row keeps what is not retired: cancelling the screening.
+    await userEvent.click(screen.getByRole('button', { name: 'More actions for app_1' }));
+    const items = within(screen.getByRole('menu')).getAllByRole('menuitem');
+    expect(items.map((item) => item.textContent)).toEqual(['Cancel screening']);
+    expect(deliverAshbyManualInvite).not.toHaveBeenCalled();
+  });
+
+  it('retired: hides the invite item in More on a completed screening, keeps Review', async () => {
+    listAshbyWorkflows.mockResolvedValue(COMPLETED);
+    getMe.mockResolvedValue({ ...ME, legacyBrowserScreeningEnabled: false });
+    renderPage();
+    expect(await screen.findByRole('link', { name: 'Review screening' })).toHaveAttribute(
+      'href',
+      '/sessions/sess-1',
+    );
+    // Wait for the lookup to land: the invite item is present until it does.
+    await waitFor(async () => {
+      await userEvent.click(screen.getByRole('button', { name: 'More actions for app_1' }));
+      const names = within(screen.getByRole('menu'))
+        .getAllByRole('menuitem')
+        .map((item) => item.textContent);
+      expect(names).toEqual(['Cancel screening']);
+      await userEvent.keyboard('{Escape}');
+    });
+  });
+
+  it.each([
+    ['true', { ...ME, legacyBrowserScreeningEnabled: true }],
+    ['absent (an older API)', ME],
+  ])('keeps "Get invite link" when the field is %s', async (_name, me) => {
+    getMe.mockResolvedValue(me);
+    renderPage();
+    expect(await screen.findByRole('button', { name: /get invite link/i })).toBeInTheDocument();
+    await waitFor(() => expect(getMe).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole('button', { name: /get invite link/i })).toBeInTheDocument();
+  });
+
+  it('keeps "Get invite link" when the lookup fails', async () => {
+    getMe.mockRejectedValue(new Error('network down'));
+    renderPage();
+    expect(await screen.findByRole('button', { name: /get invite link/i })).toBeInTheDocument();
+    await waitFor(() => expect(getMe).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole('button', { name: /get invite link/i })).toBeInTheDocument();
+  });
+
+  it('keeps the invite item in More on a completed screening while enabled', async () => {
+    listAshbyWorkflows.mockResolvedValue(COMPLETED);
+    getMe.mockResolvedValue({ ...ME, legacyBrowserScreeningEnabled: true });
+    renderPage();
+    await screen.findByRole('link', { name: 'Review screening' });
+    await waitFor(() => expect(getMe).toHaveBeenCalledTimes(1));
+    await userEvent.click(screen.getByRole('button', { name: 'More actions for app_1' }));
+    const names = within(screen.getByRole('menu'))
+      .getAllByRole('menuitem')
+      .map((item) => item.textContent);
+    expect(names).toEqual(['Get invite link', 'Cancel screening']);
   });
 });

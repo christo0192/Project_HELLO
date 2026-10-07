@@ -40,6 +40,7 @@ import {
   provisionRoomForCreatedSession,
 } from '../lib/room-provisioning.js';
 import { requireBrowserLiveKitConfigured } from '../lib/livekit-endpoints.js';
+import { legacyBrowserScreeningGuard } from '../lib/legacy-browser-screening.js';
 import { createMaintenanceMiddleware } from '../lib/maintenance.js';
 import {
   extractIdempotencyKey,
@@ -147,6 +148,10 @@ function requireWorkerAuth(req: import('express').Request, res: import('express'
 
 livekitRouter.post(
   '/start',
+  // PR-L: answers 410 browser_screening_retired while the legacy lane is
+  // retired, BEFORE validation, the maintenance guard and quota reservation so
+  // a retired endpoint can never reserve a slot or touch a provider.
+  legacyBrowserScreeningGuard({ route: 'start' }),
   validateBody(livekitStartSchema),
   createMaintenanceMiddleware({ allowAdmin: true }),
   async (req, res, next) => {

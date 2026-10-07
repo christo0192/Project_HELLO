@@ -626,6 +626,76 @@ describe('CandidateDetailPage', () => {
     expect(screen.queryByText('No call in progress')).not.toBeInTheDocument();
   });
 
+  describe('PR-L: the legacy browser lane is retired', () => {
+    const retiredMe = {
+      userId: 'u-admin', email: null, role: 'admin', active: true,
+      legacyBrowserScreeningEnabled: false,
+    };
+    /** Rows laying the invite card beside the Live call panel (matched by class text). */
+    const twoColumnRows = (container: HTMLElement) =>
+      Array.from(container.querySelectorAll('div')).filter((el) =>
+        el.className.includes('sm:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]'),
+      );
+
+    it('hides the browser voice screening card and its Create invite action', async () => {
+      mockApi.getMe.mockResolvedValue(retiredMe);
+      renderDetailPage();
+      await screen.findByText('Jane Doe');
+      expect(screen.queryByText('Browser voice screening')).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Create invite' })).not.toBeInTheDocument();
+      expect(screen.queryByText('Live call')).not.toBeInTheDocument();
+    });
+
+    it('leaves the phone call action on the page', async () => {
+      mockApi.getMe.mockResolvedValue(retiredMe);
+      renderDetailPage();
+      expect(await screen.findByRole('button', { name: 'Call candidate' })).toBeInTheDocument();
+    });
+
+    it('still shows the Live call panel for a call in progress (the drain), full width', async () => {
+      mockApi.getMe.mockResolvedValue(retiredMe);
+      mockApi.getCandidate.mockResolvedValue({
+        ...mockCandidateDetail,
+        sessions: [{ ...mockCandidateDetail.sessions[0], id: 's-live', status: 'in_progress', duration_sec: null }],
+      });
+      const { container } = renderDetailPage();
+      expect(await screen.findByText('Live call')).toBeInTheDocument();
+      expect(screen.queryByText('Browser voice screening')).not.toBeInTheDocument();
+      // No two-column row is reserved for a card that is not there.
+      expect(twoColumnRows(container)).toHaveLength(0);
+    });
+
+    it('keeps the card when the API reports the lane enabled', async () => {
+      mockApi.getMe.mockResolvedValue({ ...retiredMe, legacyBrowserScreeningEnabled: true });
+      renderDetailPage();
+      expect(await screen.findByText('Browser voice screening')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: 'Create invite' })).toBeInTheDocument();
+    });
+
+    it('keeps the card for an older API that does not send the field at all', async () => {
+      mockApi.getMe.mockResolvedValue({ userId: 'u-admin', email: null, role: 'admin', active: true });
+      renderDetailPage();
+      expect(await screen.findByText('Browser voice screening')).toBeInTheDocument();
+    });
+
+    it('keeps the card when the profile lookup fails (no hiding on missing information)', async () => {
+      mockApi.getMe.mockRejectedValue(new Error('offline'));
+      renderDetailPage();
+      expect(await screen.findByText('Browser voice screening')).toBeInTheDocument();
+    });
+
+    it('keeps the two-column row when the lane is enabled and a call is live', async () => {
+      mockApi.getCandidate.mockResolvedValue({
+        ...mockCandidateDetail,
+        sessions: [{ ...mockCandidateDetail.sessions[0], id: 's-live', status: 'in_progress', duration_sec: null }],
+      });
+      const { container } = renderDetailPage();
+      expect(await screen.findByText('Live call')).toBeInTheDocument();
+      expect(screen.getByText('Browser voice screening')).toBeInTheDocument();
+      expect(twoColumnRows(container)).toHaveLength(1);
+    });
+  });
+
   it('shows the Live call panel while a session is live', async () => {
     mockApi.getCandidate.mockResolvedValue({
       ...mockCandidateDetail,

@@ -71,6 +71,18 @@ import type { ProbeFeedbackForm } from './probe.js';
 import { materializeInvite, type MaterializationStore, type MaterializationMapping } from './materialize.js';
 import type { EmailProviderState } from './invite-delivery.js';
 import { isAshbyError } from './errors.js';
+import {
+  BROWSER_SCREENING_RETIRED,
+  legacyBrowserScreeningEnabled,
+} from '../../lib/legacy-browser-screening.js';
+
+/**
+ * `OperationWorkerDeps.onEvent` kind emitted when an invite_delivery operation
+ * is terminally skipped because the legacy browser lane is retired (PR-L). The
+ * runtime logs it as `ashby_legacy_browser_invite_skipped`, the same marker the
+ * import path uses when it withholds the operation in the first place.
+ */
+export const LEGACY_INVITE_SKIPPED_EVENT = 'legacy_browser_invite_skipped';
 
 /**
  * The ONLY operation types this runtime executes. Deliberately excludes
@@ -332,6 +344,27 @@ export async function runClaimedAshbyOperation(
       const r = await deps.stores.completeOperation(claim.id, claim.leaseToken, 'scorecard_submitted', claim.marker);
       emit('scorecard_submitted', r === 'ok' ? 'scorecard_submitted' : 'stale_lease');
       return { claimed: true, operationType: claim.operationType, committed: r === 'ok', staleLease: r !== 'ok', code: 'scorecard_submitted' };
+    }
+
+    // PR-L (R1 plan 8.5 step 2, D12): once the legacy browser lane is retired
+    // nothing here may mint a browser session or invite. An invite_delivery
+    // operation enqueued before the retirement, or deferred across it
+    // (ingestion_not_ready, mapping_inactive), must not reach materializeInvite:
+    // it would insert a call_sessions row (mode 'browser') and a 24 h
+    // candidate_invites row for a lane that answers 410, and the drain could then
+    // never close. Checked BEFORE the mapping lookup so a paused mapping cannot
+    // keep deferring it forever. Terminal and non-retryable: no retry can bring
+    // the lane back. After a rollback, Mission Control "Get invite link" issues a
+    // fresh invite per workflow.
+    if (!legacyBrowserScreeningEnabled()) {
+      const r = await deps.stores.failOperation(
+        claim.id, claim.leaseToken, BROWSER_SCREENING_RETIRED, false,
+      );
+      emit(LEGACY_INVITE_SKIPPED_EVENT, BROWSER_SCREENING_RETIRED);
+      return {
+        claimed: true, operationType: claim.operationType, committed: false,
+        staleLease: r === 'not_owned', code: BROWSER_SCREENING_RETIRED,
+      };
     }
 
     const mapping = await deps.resolveMappingForLink(claim.applicationLinkId);

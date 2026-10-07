@@ -9,6 +9,7 @@
 
 import { Router } from 'express';
 import { requireRole } from '../lib/rbac.js';
+import { legacyBrowserScreeningEnabled } from '../lib/legacy-browser-screening.js';
 import type { MeResponse } from '../schemas/me.js';
 
 export const meRouter = Router();
@@ -27,6 +28,7 @@ meRouter.get('/', (req, res) => {
     email: user.email ?? null,
     role: user.appRole,
     active: user.active,
+    legacyBrowserScreeningEnabled: legacyBrowserScreeningEnabled(),
   };
   res.json(body);
 });
