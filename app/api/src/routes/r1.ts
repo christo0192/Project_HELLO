@@ -73,13 +73,61 @@ for (const action of ['cancel', 'reissue', 'grant-retake'] as const) r1Router.po
   const token = action === 'reissue' ? generateInviteToken() : null;
   const { data: transition, error } = await supabase.rpc('r1_transition_round', { p_round_id: round.id, p_action: action, p_expected_version: round.version, p_link_token_digest: token ? hashInviteToken(token) : null, p_expires_at: action === 'reissue' || action === 'grant-retake' ? new Date(Date.now() + 72 * 3600_000).toISOString() : null });
   if (error) return res.status(503).json({ error: 'service_unavailable' });
-  if (transition?.status !== 'ok') return res.status(409).json({ error: transition?.status === 'retake_not_allowed' ? 'retake_not_allowed' : 'round_transition_conflict' });
+  // Reissuing a link that had already lapsed re-enters its hold, so it can be refused for capacity (0119).
+  if (transition?.status !== 'ok') return res.status(409).json({ error: transition?.status === 'retake_not_allowed' ? 'retake_not_allowed' : transition?.status === 'capacity_exhausted' ? 'r1_capacity_exhausted' : 'round_transition_conflict' });
   if (token) { res.setHeader('Cache-Control', 'no-store'); await recordAudit(req, 'resource.update', 200, { metadata: { resource: 'interview_round_reissue', round_id: round.id } }); return res.json({ id: round.id, join_url: joinUrl(token) }); }
   await recordAudit(req, 'resource.update', 200, { metadata: { resource: `interview_round_${action}`, round_id: round.id } }); res.json({ ok: true });
 } catch (e) { next(e); } });
 
 r1Router.get('/admin/r1/settings', requireRole('admin'), async (_req, res, next) => { try { const { data, error } = await supabase.from('r1_settings').select('*').eq('singleton', true).single(); if (error) throw error; res.json({ ...data, runtime: getR1Config() }); } catch (e) { next(e); } });
-r1Router.put('/admin/r1/settings', requireRole('admin'), async (req, res, next) => { try { const allowed = ['enabled','paused','monthly_cap_minutes','pause_line_minutes','advance_threshold','hold_threshold','auto_status_enabled','livekit_target','dashboard_minutes','dashboard_read_at']; const body = req.body ?? {}; const patch: Record<string, unknown> = { updated_by: req.authUser!.id }; for (const k of allowed) if (k in body) patch[k] = body[k]; const validInt = (v: unknown) => Number.isInteger(v) && Number(v) > 0; const validScore = (v: unknown) => Number.isFinite(v) && Number(v) >= 0 && Number(v) <= 100; if ((patch.monthly_cap_minutes !== undefined && !validInt(patch.monthly_cap_minutes)) || (patch.pause_line_minutes !== undefined && !validInt(patch.pause_line_minutes)) || (patch.dashboard_minutes !== undefined && (!Number.isFinite(Number(patch.dashboard_minutes)) || Number(patch.dashboard_minutes) < 0)) || (patch.advance_threshold !== undefined && !validScore(patch.advance_threshold)) || (patch.hold_threshold !== undefined && !validScore(patch.hold_threshold)) || (patch.livekit_target !== undefined && !['cloud','r1'].includes(String(patch.livekit_target)))) return res.status(400).json({ error: 'invalid_r1_settings' }); const { data, error } = await supabase.from('r1_settings').update(patch).eq('singleton', true).select('*').single(); if (error) return res.status(400).json({ error: 'invalid_r1_settings' }); await recordAudit(req, 'resource.update', 200, { metadata: { resource: 'r1_settings' } }); res.json(data); } catch (e) { next(e); } });
+// Settings meaning (0119): `monthly_cap_minutes` is the owner-approved R1 allocation in minutes (sessions x 55)
+// and applies in BOTH livekit targets; `pause_line_minutes` is the total Cloud-pool pause line and applies only
+// while `livekit_target` is 'cloud'. A dashboard reading is stamped by the database (its own clock and its own
+// pool estimate, atomically, via r1_stamp_dashboard_reading): this route never computes either value and a
+// client can never supply them.
+// 0115 created `monthly_cap_minutes` with a default of 4000, which was the total Cloud-pool pause line. It now means
+// the R1 allocation, so an untouched default must never go live by accident: enabling R1 is refused while the stored
+// allocation is still that default, it has never been saved (`allocation_set_at` is NULL) and this request does not
+// set the allocation itself. `allocation_set_at` is stamped by the database only when a write names
+// `monthly_cap_minutes` (a deliberate save of 4000 counts); any other write, including a dashboard reading or an
+// empty save, records `updated_by` but does not lift the guard. A client can never supply it.
+const R1_DEFAULT_ALLOCATION_MINUTES = 4000;
+const R1_SETTINGS_FIELDS = ['enabled', 'paused', 'monthly_cap_minutes', 'pause_line_minutes', 'advance_threshold', 'hold_threshold', 'auto_status_enabled', 'livekit_target'] as const;
+const validMinutes = (v: unknown) => (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v)) && Number(v) >= 0 && Number(v) <= 99999999.99;
+r1Router.put('/admin/r1/settings', requireRole('admin'), async (req, res, next) => { try {
+  const body = req.body ?? {};
+  if ('dashboard_read_at' in body || 'dashboard_estimate_baseline' in body || 'allocation_set_at' in body) return res.status(400).json({ error: 'invalid_r1_settings' });
+  const patch: Record<string, unknown> = { updated_by: req.authUser!.id };
+  for (const k of R1_SETTINGS_FIELDS) if (k in body) patch[k] = body[k];
+  const validInt = (v: unknown) => Number.isInteger(v) && Number(v) > 0;
+  const validScore = (v: unknown) => Number.isFinite(v) && Number(v) >= 0 && Number(v) <= 100;
+  const dashboard = 'dashboard_minutes' in body;
+  if ((patch.monthly_cap_minutes !== undefined && !validInt(patch.monthly_cap_minutes)) || (patch.pause_line_minutes !== undefined && !validInt(patch.pause_line_minutes)) || (dashboard && !validMinutes(body.dashboard_minutes)) || (patch.advance_threshold !== undefined && !validScore(patch.advance_threshold)) || (patch.hold_threshold !== undefined && !validScore(patch.hold_threshold)) || (patch.livekit_target !== undefined && !['cloud', 'r1'].includes(String(patch.livekit_target))) || (patch.enabled !== undefined && typeof patch.enabled !== 'boolean')) return res.status(400).json({ error: 'invalid_r1_settings' });
+  if (patch.enabled === true && !('monthly_cap_minutes' in body)) {
+    const { data: current, error: currentError } = await supabase.from('r1_settings').select('monthly_cap_minutes,allocation_set_at').eq('singleton', true).single();
+    if (currentError || !current) return res.status(503).json({ error: 'service_unavailable' });
+    if (current.monthly_cap_minutes === R1_DEFAULT_ALLOCATION_MINUTES && !current.allocation_set_at) return res.status(409).json({ error: 'r1_allocation_not_set' });
+  }
+  let settings: unknown = null;
+  // A body carrying only a dashboard reading has nothing for the table update to do.
+  const applied = Object.keys(patch).length > 1 || !dashboard;
+  if (applied) {
+    const { data, error } = await supabase.from('r1_settings').update(patch).eq('singleton', true).select('*').single();
+    if (error) return res.status(400).json({ error: 'invalid_r1_settings' });
+    settings = data;
+  }
+  if (dashboard) {
+    const { data: stamped, error } = await supabase.rpc('r1_stamp_dashboard_reading', { p_dashboard_minutes: Number(body.dashboard_minutes), p_updated_by: req.authUser!.id });
+    if (error || stamped?.status !== 'ok') {
+      // Other validated fields may already be saved: keep the audit trail honest before failing.
+      if (applied) await recordAudit(req, 'resource.update', 200, { metadata: { resource: 'r1_settings' } });
+      return stamped?.status === 'invalid_request' ? res.status(400).json({ error: 'invalid_r1_settings' }) : res.status(503).json({ error: 'service_unavailable' });
+    }
+    settings = stamped.settings;
+  }
+  await recordAudit(req, 'resource.update', 200, { metadata: { resource: 'r1_settings' } });
+  res.json(settings);
+} catch (e) { next(e); } });
 
 function workerAuth(req: Request, res: Response, next: NextFunction): void { const secret = process.env.WORKER_CONTEXT_SECRET; const token = req.header('authorization')?.replace(/^Bearer /, ''); if (!secret || secret.length < 32) { res.status(503).json({ error: 'worker_auth_not_configured' }); return; } if (!token) { res.status(401).json({ error: 'authentication_required' }); return; } const a = Buffer.from(secret), b = Buffer.from(token); if (a.length !== b.length || !timingSafeEqual(a, b)) { res.status(403).json({ error: 'access_denied' }); return; } next(); }
 async function r1Session(req: Request, res: Response): Promise<any | null> { const room = req.body?.room; if (typeof room !== 'string' || !/^screening-[0-9a-f-]{36}$/i.test(room)) { res.status(400).json({ error: 'invalid_r1_room' }); return null; } const { data, error } = await supabase.from('call_sessions').select('id,candidate_id,interview_round_id,status,external_call_id,mode').eq('external_call_id', room).maybeSingle(); if (error) { res.status(503).json({ error: 'service_unavailable' }); return null; } if (!data || data.mode !== 'browser' || !data.interview_round_id || !['waiting','in_progress'].includes(data.status) || data.external_call_id !== room) { res.status(409).json({ error: 'r1_session' }); return null; } return data; }

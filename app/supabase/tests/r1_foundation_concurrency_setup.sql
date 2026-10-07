@@ -5,19 +5,17 @@ insert into screening_v2.candidates (id, role_id, name) values
 -- This creates genuine first-of-month contention: neither caller can observe a
 -- pre-existing budget row before the blocker releases the settings lock.
 delete from screening_v2.r1_budget_month where month_start = date_trunc('month', now())::date;
+-- Mode A (self-hosted R1): the R1 allocation (monthly_cap_minutes) is the only
+-- binding check, so the Cloud pause line is parked far above any pool estimate.
 update screening_v2.r1_settings set enabled = true, paused = false, livekit_target = 'r1',
-  dashboard_minutes = 0;
--- Earlier suites leave sessions that feed the WebRTC estimate, so pin the cap to
--- (the guard the RPC will compute) + exactly one 55-minute hold: the first racer
--- fits, and the second cannot, because its outstanding hold now counts.
+  pause_line_minutes = 100000, dashboard_minutes = 0, dashboard_read_at = null,
+  dashboard_estimate_baseline = null;
+-- Earlier suites leave sessions that feed the estimate, so pin the allocation to
+-- the committed R1 minutes the RPC will compute (taken from the SAME shared
+-- snapshot function, so the rule is not restated here) + exactly one 55-minute
+-- hold: the first racer fits, and the second cannot, because the first racer's
+-- outstanding hold now counts.
 update screening_v2.r1_settings s
-   set monthly_cap_minutes = ceil(g.guard) + 55, pause_line_minutes = ceil(g.guard) + 55
-  from (select greatest(
-          coalesce((select sum(l.seconds) / 60.0 from screening_v2.r1_usage_ledger l
-                     where l.occurred_at >= coalesce(x.dashboard_read_at, now())), 0),
-          coalesce((select e.r1_minutes + e.phone_minutes + e.legacy_browser_minutes
-                      from screening_v2.v_webrtc_minutes_estimate e
-                     where e.month_start = date_trunc('month', now())::date), 0)
-        ) * 1.15 as guard
-          from screening_v2.r1_settings x where x.singleton) g
+   set monthly_cap_minutes = ceil((c.snapshot->>'r1_committed')::numeric) + 55
+  from (select screening_v2.r1_capacity_snapshot(now(), 0) as snapshot) c
  where s.singleton;
