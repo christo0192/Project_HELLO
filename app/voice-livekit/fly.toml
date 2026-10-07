@@ -7,6 +7,20 @@ app = "project-hello-voice"
 # Approved regions: scripts/fly-region-policy.mjs, enforced in CI by
 # scripts/validate-voice-worker-apps.mjs.
 primary_region = "sin"
+# R1 A0 CUTOVER. This file's R1 posture (kill_timeout, R1_LANE_MODE and the two
+# R1 drain keys) merges ONLY inside the forward-flip window, AFTER the API is on
+# BROWSER_LIVEKIT_TARGET=r1 (docs/runbooks/r1-a0-cutover-checklist.md, step 4).
+#
+# kill_timeout: seconds Fly waits after the stop signal before it force-kills the
+# VM. Fly's DEFAULT is 5 s, which would defeat the R1 drain below and cut a live
+# interview mid-teardown. 300 is Fly's maximum; an IDLE worker has no job to drain
+# and exits at once, so it costs nothing on the healthy path. It is declared
+# TOGETHER with R1_DRAIN_TIMEOUT_SEC and R1_SHUTDOWN_PROCESS_TIMEOUT_SEC (in [env])
+# because scripts/validate-voice-worker-apps.mjs requires all three the moment
+# R1_LANE_MODE = "r1_only", and checks
+#   R1_DRAIN_TIMEOUT_SEC + 2 x R1_SHUTDOWN_PROCESS_TIMEOUT_SEC + 30 <= kill_timeout
+#   60 + 2 x 90 + 30 = 270 <= 300
+kill_timeout = 300
 
 [build]
   dockerfile = "Dockerfile"
@@ -22,12 +36,22 @@ primary_region = "sin"
   SARVAM_TTS_MODEL = "bulbul:v3"
   SARVAM_TTS_VOICE = "simran"
   LIVEKIT_WORKER_DRAIN_SEC = "10"
-  # R1 is shipped dormant until legacy browser retirement and staged secrets.
-  # The R1 drain budget (R1_DRAIN_TIMEOUT_SEC, R1_SHUTDOWN_PROCESS_TIMEOUT_SEC) and the
-  # top-level kill_timeout it needs are deliberately NOT declared here: they would change
-  # how the live legacy browser lane stops (Fly default 5 s -> 300 s). The PR that sets
-  # R1_LANE_MODE = "r1_only" adds all three together; the validator requires them then.
-  R1_LANE_MODE = "off"
+  # R1 A0 CUTOVER POSTURE. "r1_only" makes this browser worker serve ONLY rooms the
+  # API marks {"lane":"r1"}: an unmarked (legacy) room is refused and deleted. The
+  # legacy browser lane is retired (API LEGACY_BROWSER_SCREENING_ENABLED = "false"),
+  # so nothing legitimate is lost. It is only correct together with the API on
+  # BROWSER_LIVEKIT_TARGET=r1 (the mode and the endpoint must change in the same
+  # drained window: runbook "Room-routing contract", "Flip ordering"), so this line
+  # merges ONLY after the API flip. Do NOT set it back to "off" while R1 sessions can
+  # still be created, on the R1 SFU or on the Cloud fallback: the worker would refuse
+  # every marked room. Rollback to Cloud keeps this value (runbook "Fallback flip
+  # procedure", rollback: WORKERS FIRST, then the API).
+  # DRAIN BUDGET: the two keys below are read only when the mode is "r1_only" and are
+  # declared together with the top-level kill_timeout (top of file); see the budget
+  # note there. Worker bounds: drain 30..60, shutdown 30..90.
+  R1_LANE_MODE = "r1_only"
+  R1_DRAIN_TIMEOUT_SEC = "60"
+  R1_SHUTDOWN_PROCESS_TIMEOUT_SEC = "90"
   R1_LLM_MODEL = "deepseek-flash"
   R1_LLM_BASE_URL = "https://api.deepseek.com/v1"
   R1_SESSION_MAX_RESIDENCY_SEC = "1800"
@@ -62,8 +86,12 @@ primary_region = "sin"
   WORKER_ORCHESTRATION = "worker"
   # BROWSER_WORKER_ONE_JOB and R1_READINESS_HOST are deliberately ABSENT: exact
   # `on` is set only at the R1 self-hosted cutover, after the host-aware API
-  # readiness deploy. Absent, this named Cloud worker boots and reports readiness
-  # exactly as before (prewarm post, legacy body, cli.run_app(WorkerOptions)).
+  # readiness deploy. They are per-cutover Fly SECRETS on this app (step 4 of
+  # docs/runbooks/r1-a0-cutover-checklist.md), never baked in here, so that a
+  # rollback to Cloud only has to unset them (scripts/validate-voice-worker-apps.mjs
+  # requires them absent from this file). Absent, this named Cloud worker boots and
+  # reports readiness exactly as before (prewarm post, legacy body,
+  # cli.run_app(WorkerOptions)).
 
 # X1/VM PIN (2026-08-29 CPU-starvation incident): on `shared` CPU the worker's
 # VAD/EOU compute backed up (VAD backlog 67 s), the Sarvam STT websocket died
