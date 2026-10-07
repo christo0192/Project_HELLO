@@ -931,6 +931,35 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         "Nothing, thank you.",
         "Nothing else.",
         "Not at the moment, thanks.",
+        # The grammatical answer to "do you have any questions": "I don't", with no noun.
+        "No, I don't.",
+        "No, I don't, thank you.",
+        "No, I don’t.",
+        "I don't.",
+        "No, I do not.",
+        # L-EXIT has just introduced the interviewer by name.
+        "No, thank you, Christy.",
+        "Thank you, Christy.",
+        "No questions from my side.",
+        "No questions from my end, thank you.",
+        "No. Thank you so much for your time.",
+        "No, thank you for your time today.",
+        "No sir.",
+        "No, ma'am.",
+        "No, thank you, sir.",
+        "Hmm, no.",
+        "Mm, no.",
+        "No, I'm okay.",
+        "I'm okay, thank you.",
+        "No, none.",
+        "None.",
+        "None, thank you.",
+        "No, I'm fine.",
+        # A thank-you alone closes it; with a "yes" it may open a question (see below).
+        "Thank you.",
+        "Thanks!",
+        "Okay, thank you.",
+        "Okay, thanks a lot.",
     )
     # A real question stays a question, however it is punctuated and however polite it is.
     PUNCTUATED_QUESTIONS = (
@@ -946,6 +975,20 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         "No questions?",  # a question mark alone keeps the turn for the interviewer
         "Nothing else?",
         "What is the notice period?",
+        # "I don't" and the new courtesy words never swallow a request that follows them.
+        "No, I don't know when I'll hear back",
+        "No, I don't know what happens next",
+        "No, what time do I start",
+        "No, I don't have time for the next round",
+        "I don't, but what about the notice period",
+        "Thank you, can you tell me about the next steps",
+        "Thank you, any idea when I will hear back",
+        "Thanks, what about the salary",
+        "None of the above, what about the salary",
+        # A thank-you next to a "yes" may open a question: the interviewer answers it.
+        "Yes, thank you.",
+        "Yeah, thanks",
+        "Sure, thank you",
     )
 
     def test_a_punctuated_refusal_is_a_refusal(self) -> None:
@@ -974,12 +1017,21 @@ class TestPhaseAndConfiguration(unittest.TestCase):
             "Yes.", "Yes!", "YES", "Let's start.", "Let’s start", "Lets start",
             "Go ahead.", "Sure!", "Sure.", "Okay.", "OK!", "Yeah.", "I'm ready.", "Ready!",
             "Ready.", "Alright.",
+            # A ready phrase with nothing but filler around it is still a ready answer.
+            "Yes, let's start.", "Sure, go ahead.", "Okay, sure.", "Yep, go ahead.",
+            "Ok, let's go!", "Yeah sure.", "Alright, let's do it.", "Yes please, go ahead.",
+            "Okay, thank you, let's start.", "Yup.", "Of course, go on.", "Well, let's begin.",
         ):
             with self.subTest(text=text):
                 self.assertTrue(R1Interview.is_ready(text))
         for text in (
             "I am already prepared", "Unready", "What do I do?", "Who is she?", "Not sure yet.",
             "Yes, but what do I say?", "",
+            # A negation turns "ready" and the ready phrases around.
+            "Not ready yet.", "I'm not ready.", "I am not sure I'm ready.", "We aren't ready.",
+            "Don't start.", "Let's not start yet.", "No, not yet, I'm not ready.",
+            # A real request next to a ready phrase is not a ready answer.
+            "Yes, but where do I start", "Sure, what is her name", "Okay, I'll start in a minute",
         ):
             with self.subTest(text=text):
                 self.assertFalse(R1Interview.is_ready(text))
@@ -3105,7 +3157,11 @@ class TestWrapupAndReadyDriveTheDriver(R1TestCase):
                         await task
 
     async def test_punctuated_ready_answers_pick_up_at_once_without_a_nudge(self) -> None:
-        for text in ("Yes.", "Let's start.", "Go ahead.", "Sure!", "Let’s start", "OK."):
+        for text in (
+            "Yes.", "Let's start.", "Go ahead.", "Sure!", "Let’s start", "OK.",
+            "Yes, let's start.", "Sure, go ahead.", "Okay, sure.", "Yeah sure.",
+            "Alright, let's do it.",
+        ):
             with self.subTest(text=text):
                 await self.asyncSetUp()
                 self.interview.machine.transition(R1Phase.TRANSITION)
@@ -3192,6 +3248,91 @@ class TestIcebreakerEndRace(R1TestCase):
         outcome = await self.interview._silence_ladder([("L-SIL-IB", 20.0)])
         self.assertEqual(outcome, "phase_deadline")
         self.assertEqual(self.session.spoken, [])
+
+    async def four_answered_turns_then_a_follow_up_question_plays(
+        self, *, turn_ends_at: float, question_ends_at: float
+    ) -> tuple[asyncio.Task, R1Agent]:
+        """Four finals, the end of the 4th turn at ``turn_ends_at`` (before the soft exit), and
+        the interviewer's follow-up question playing until ``question_ends_at`` (S seconds)."""
+        self.clock.advance(turn_ends_at)
+        task = asyncio.create_task(self.interview._run_icebreaker())
+        await self.settle()
+        for answer in ("one", "two", "three", "four"):
+            self.final_transcript(answer)
+            await self.settle()
+        agent = R1Agent(self.interview)
+        # The SDK's end of turn: S < 3:30, so the reply is NOT suppressed and the model asks.
+        await agent.on_user_turn_completed(
+            None, SimpleNamespace(text_content="four", id="msg_follow_up")
+        )
+        self.agent_state("thinking")
+        self.agent_state("speaking")
+        await self.settle()
+        self.assertFalse(task.done())
+        self.clock.advance(question_ends_at - turn_ends_at)  # S crosses 3:30 mid-question
+        self.agent_state("listening")  # the question ends: every waiter is woken
+        await self.settle()
+        return task, agent
+
+    async def test_a_follow_up_question_finishing_after_the_soft_exit_is_still_answered(
+        self,
+    ) -> None:
+        # Fix-branch regression: the end of turn fell at S=205, the follow-up question finished
+        # at S=211, and the wake-up read "soft exit due" as "phase over": L-TRANSITION played
+        # right after the interviewer's own question, which the candidate never got to answer.
+        task, _agent = await self.four_answered_turns_then_a_follow_up_question_plays(
+            turn_ends_at=205.0, question_ends_at=211.0
+        )
+        self.assertFalse(task.done())  # still waiting for the answer
+        self.assertIs(self.interview.machine.phase, R1Phase.ICEBREAKER)
+        self.assertEqual(self.session.spoken, [])
+        self.assertGreater(self.interview._icebreaker_budget_left(), 0)
+        # The answer ends the phase through the driver's own check, and nothing is lost.
+        self.final_transcript("five")
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.session.spoken, [])
+
+    async def test_the_candidate_starting_an_answer_after_the_soft_exit_is_not_talked_over(
+        self,
+    ) -> None:
+        # The question ended at S=208, the candidate started answering at S=211: the wake-up
+        # from their speaking must not play the (non-interruptible) boundary line over them.
+        task, _agent = await self.four_answered_turns_then_a_follow_up_question_plays(
+            turn_ends_at=205.0, question_ends_at=208.0
+        )
+        self.clock.advance(3)  # S = 211
+        self.user_state("speaking")
+        await self.settle()
+        self.assertFalse(task.done())
+        self.assertIs(self.interview.machine.phase, R1Phase.ICEBREAKER)
+        self.assertEqual(self.session.spoken, [])
+        self.final_transcript("five")
+        self.user_state("listening")
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.session.spoken, [])
+
+    async def test_only_the_suppressed_boundary_turn_zeroes_the_icebreaker_budget(self) -> None:
+        self.clock.advance(215)
+        for answer in ("one", "two", "three", "four"):
+            self.final_transcript(answer)
+        self.assertTrue(self.interview.machine.icebreaker_should_end())
+        # The soft-exit rule alone is not the end of the phase for a waiter: 55 s remain.
+        self.assertEqual(self.interview._icebreaker_budget_left(), 55)
+        agent = R1Agent(self.interview)
+        with self.assertRaises(r1_session.StopResponse):  # this turn IS the boundary turn
+            await agent.on_user_turn_completed(
+                None, SimpleNamespace(text_content="four", id="msg_boundary")
+            )
+        self.assertEqual(self.interview._icebreaker_budget_left(), 0)
+
+    async def test_an_empty_turn_after_the_soft_exit_is_not_a_boundary_turn(self) -> None:
+        self.clock.advance(215)
+        for answer in ("one", "two", "three", "four"):
+            self.final_transcript(answer)
+        agent = R1Agent(self.interview)
+        with self.assertRaises(r1_session.StopResponse):
+            await agent.on_user_turn_completed(None, SimpleNamespace(text_content="", id="m"))
+        self.assertEqual(self.interview._icebreaker_budget_left(), 55)
 
     async def test_the_icebreaker_still_waits_for_an_answer_before_the_soft_exit(self) -> None:
         self.clock.advance(100)

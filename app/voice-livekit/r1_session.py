@@ -197,33 +197,63 @@ _SESSION_ID_FROM_ROOM = re.compile(
 # answer.  The regexes and allowlists are written for folded text: lower case, no punctuation,
 # single spaces, and an apostrophe only inside a word ("that's").
 _READY_RE = re.compile(r"\bready\b")
-# These are intentionally narrow equivalents of an explicit ready response, matched whole.
+# These are intentionally narrow equivalents of an explicit ready response.  A phrase counts
+# wherever it stands in the answer ("Yes, let's start.", "Sure, go ahead."): ``is_ready`` cuts
+# the phrases out and wants nothing but filler left.
 _READY_ALLOWLIST = frozenset(
     {
         "let's start", "lets start", "let's begin", "lets begin", "let's go", "lets go",
-        "go ahead", "go on", "start", "begin",
-        "yes", "yes please", "yeah", "yep", "sure", "sure thing", "of course",
+        "let's do it", "lets do it", "go ahead", "go on", "start", "begin",
+        "yes", "yes please", "yeah", "yep", "yup", "sure", "sure thing", "of course",
         "okay", "ok", "alright", "all right",
     }
 )
+# Longest first, so "sure thing" and "yes please" are read whole and not as "sure" + "thing".
+_READY_PHRASE_RE = re.compile(
+    r"\b(?:"
+    + "|".join(re.escape(phrase) for phrase in sorted(_READY_ALLOWLIST, key=len, reverse=True))
+    + r")\b"
+)
+# Filler allowed next to a ready phrase.  Anything else ("but what do I say", "not yet",
+# "I will start after the call") is left to the nudge.
+_READY_FILLER = frozenset(
+    {
+        "please", "so", "um", "uh", "well", "then", "now", "right", "thanks", "thank", "you",
+        "let's", "lets", "go", "ahead", "yes", "yeah", "yep", "yup", "sure", "okay", "ok",
+        "alright",
+    }
+)
+# "Not ready yet.", "I'm not sure I'm ready": a negation turns the word "ready" around.
+_READY_NEGATION_RE = re.compile(r"\b(?:not|never|cannot|dont|\w+n't)\b")
 # The phrases that say "I have nothing to ask".  They are only the first half of the test:
 # ``is_no_questions`` also requires that nothing but courtesy surrounds them.  The longer
 # phrases come first and the bare "no" is LAST so that the longest reading wins; "no" is
 # safe on its own because any word after it that is not courtesy keeps the turn a question.
 _NO_QUESTIONS_RE = re.compile(
     r"\b(?:"
-    r"(?:i )?(?:do not|don't|dont|have no|got no)(?: have)?(?: any)?"
-    r"(?: more| other| further)? questions?|"
+    # "I don't." / "I do not." is a refusal on its own (the grammatical answer to "do you have
+    # any questions"); a continuation ("I don't know when ...") leaves a word that is not
+    # courtesy, and that keeps the turn a question.
+    r"(?:i )?(?:do not|don't|dont)(?: have)?(?: any)?(?: more| other| further)?"
+    r"(?: questions?)?|"
+    r"(?:i )?(?:have no|got no)(?: more| other| further)? questions?|"
     r"no(?: more| other| further)? questions?|"
     r"no thanks?|no thank you|"
     r"nothing(?: else| more| from my (?:side|end))?|"
+    r"none|"
     r"nope|nah|"
     r"not really|not (?:at the moment|right now|for now|at this time)|"
     r"that'?s (?:all|it)|that is (?:all|it)|"
-    r"i'?m (?:good|all set|fine)|i am (?:good|all set|fine)|all (?:good|set)|"
+    r"i'?m (?:good|all set|fine|okay|ok|alright)|i am (?:good|all set|fine|okay|ok|alright)|"
+    r"all (?:good|set)|"
+    r"thank you|thanks?|"
     r"no"
     r")\b"
 )
+# Gratitude refuses only when nothing affirms: "Thank you." closes the wrap-up, but "Yes, thank
+# you." may open a question, and that is the interviewer's to answer.
+_GRATITUDE_RE = re.compile(r"\b(?:thank you|thanks?)\b")
+_AFFIRMATIONS = frozenset({"yes", "yeah", "yep", "yup", "sure"})
 # Courtesy and filler: the ONLY words allowed next to a refusal.  This is an allowlist on
 # purpose.  A list of question words can never be complete ("any feedback for me", "the
 # salary range", "please share my feedback" open with no question word), and the two ways
@@ -236,6 +266,10 @@ _COURTESY_WORDS = frozenset(
         # A lead-in or an affirmation around the refusal ("Yeah, I'm good.", "I think I'm
         # good."): a real request always carries a word that is not on this list.
         "yeah", "yep", "yes", "sure", "i", "think",
+        # The usual trimmings of a polite close ("No questions from my side, thank you for
+        # your time, sir.", "Hmm, no.", "No, thank you, Christy.", "No, I'm fine.").
+        "for", "your", "time", "today", "from", "my", "side", "end", "sir", "maam", "ma'am",
+        "mam", "madam", "hmm", "hm", "mm", "mhm", "none", "fine", INTERVIEWER_NAME.lower(),
     }
 )
 # Every apostrophe look-alike folds to the ASCII one (Sarvam may emit U+2019).
@@ -407,7 +441,12 @@ def is_no_questions(text: str) -> bool:
     if _NO_QUESTIONS_RE.search(folded) is None:
         return False
     rest = _NO_QUESTIONS_RE.sub(" ", folded)
-    return all(word in _COURTESY_WORDS for word in rest.split())
+    if not all(word in _COURTESY_WORDS for word in rest.split()):
+        return False
+    if _NO_QUESTIONS_RE.search(_GRATITUDE_RE.sub(" ", folded)) is None:
+        # Only a thank-you refuses here ("Thank you.", "Okay, thank you."): not next to a "yes".
+        return not any(word in _AFFIRMATIONS for word in folded.split())
+    return True
 
 
 def _agent_turn_handling() -> dict[str, Any]:
@@ -569,6 +608,9 @@ class R1Interview:
         self._mute_announced = False
         self._pickup_spoken = False
         self._transition_nudged = False
+        # True once a candidate turn was answered by the icebreaker's end (``prepare_turn``
+        # suppressed its reply because the soft exit was due): the boundary line answers it.
+        self._icebreaker_boundary_turn = False
         self._goodbye_spoken = False
         self._ended_announced = False
         # The phase attribute the candidate's page follows: values wait here in order and one
@@ -1189,10 +1231,18 @@ class R1Interview:
         """Accept a deliberate READY, not a substring such as ``already`` or ``unready``.
 
         The transcript is folded first (``fold_speech``): "Yes.", "Let's start." and "Sure!"
-        are the answers they sound like, however the speech-to-text punctuated them.
+        are the answers they sound like, however the speech-to-text punctuated them.  Two
+        readings count: the word "ready" (unless negated: "Not ready yet."), and the ready
+        phrases (``_READY_ALLOWLIST``) with nothing but filler around them, so "Yes, let's
+        start." and "Sure, go ahead." pick up at once while "Yes, but what do I say?" does not.
         """
         normalized = fold_speech(text)
-        return bool(_READY_RE.search(normalized)) or normalized in _READY_ALLOWLIST
+        if _READY_RE.search(normalized):
+            return _READY_NEGATION_RE.search(normalized) is None
+        if _READY_PHRASE_RE.search(normalized) is None:
+            return False
+        rest = _READY_PHRASE_RE.sub(" ", normalized)
+        return all(word in _READY_FILLER for word in rest.split())
 
     async def _speak_pickup_once(self) -> None:
         """Claim the pickup before scheduling speech so only the driver can deliver it once."""
@@ -1290,8 +1340,20 @@ class R1Interview:
         self._latest_candidate_index = None
         seconds = self._take_user_turn_seconds()
         entry = self._note_candidate_turn(text, index) if text else None
-        if self.reply_suppressed(text) or not text:
+        suppressed = self.reply_suppressed(text)
+        if suppressed or not text:
             if self.machine.phase in (R1Phase.ICEBREAKER, R1Phase.ROLEPLAY, R1Phase.ASIDE):
+                if (
+                    suppressed
+                    and text
+                    and self.machine.phase is R1Phase.ICEBREAKER
+                    and self.machine.icebreaker_should_end()
+                ):
+                    # THIS turn ended the icebreaker (S crossed 3:30 between its transcript
+                    # and its end of turn): it is the turn the boundary line answers.  Only
+                    # this turn may end the phase early; a later wake-up (the interviewer's
+                    # own question finishing, the candidate starting to answer) must not.
+                    self._icebreaker_boundary_turn = True
                 # A phase that ended between this turn's transcript and its end of turn (the
                 # driver judged the transcript, this hook judges the end of turn) is over for
                 # the driver too: wake it, so it re-reads its budget and plays the boundary
@@ -2526,6 +2588,11 @@ class R1Interview:
             budget_left: Callable[[], float] | None = None
             if phase is R1Phase.ICEBREAKER:
                 budget_left = self._icebreaker_budget_left
+                if self.machine.icebreaker_should_end():
+                    # The soft exit is due and the candidate has said nothing for the whole
+                    # silence window: move on to the transition rather than ask "Are you still
+                    # with me?" in the seconds before it.
+                    return "phase_deadline"
             elif phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
                 budget_left = self._roleplay_budget_left
             if budget_left is not None:
@@ -2662,15 +2729,22 @@ class R1Interview:
         return await self._finish(stop, system=stop not in _QUIET_OUTCOMES)
 
     def _icebreaker_budget_left(self) -> float:
-        """Seconds of icebreaker left; zero once the phase is due to end, so every wait ends.
+        """Seconds of icebreaker left; zero once a turn ended it, so every wait ends.
 
         The driver judges the soft exit (four turns, S >= 3:30) when a transcript arrives, but
         the SDK judges the same rule later, at the end of the turn (``prepare_turn``), and
-        suppresses the reply when it holds.  Both must read ONE answer: a wait bounded by the
-        hard S=4:30 alone would sit through a suppressed reply, then 30 s of silence, and then
-        ask "Are you still with me?".  ``prepare_turn`` wakes the driver; this is what it reads.
+        suppresses the reply when it holds.  A wait bounded by the hard S=4:30 alone would sit
+        through that suppressed reply, then 30 s of silence, and then ask "Are you still with
+        me?".  So ``prepare_turn`` records the suppressed boundary turn and wakes the driver,
+        and this is what the driver reads.
+
+        Only that turn ends the phase early.  The soft-exit RULE itself must not: once S passes
+        3:30 it holds on every later wake-up, including the interviewer's own follow-up
+        finishing and the candidate starting to answer it, and the boundary line would then play
+        over a question nobody answered.  Those turns end the phase through the driver's own
+        check after the transcript (``_run_icebreaker``), exactly as before.
         """
-        if self.machine.icebreaker_should_end():
+        if self._icebreaker_boundary_turn:
             return 0.0
         return self.machine.remaining_icebreaker_seconds()
 
