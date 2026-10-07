@@ -180,7 +180,17 @@ const ROUTES: Array<[string, string, Handler]> = [
   // must list three roles and hide three.
   ['GET', '/api/roles', (_r, db) => {
     const mapped = new Set(db.ashby.mappings.map((m) => m.roleId).filter(Boolean));
-    return ok(db.roles.map((role) => ({ ...role, has_ashby_mapping: mapped.has(role.id) })));
+    // `ashby_mapping_statuses`: the distinct, sorted statuses of the role's
+    // non-archived mappings (drives the Candidates Active / Paused scope).
+    const statusesOf = (roleId: string) =>
+      [...new Set(db.ashby.mappings.filter((m) => m.roleId === roleId).map((m) => m.status))].sort();
+    return ok(
+      db.roles.map((role) => ({
+        ...role,
+        has_ashby_mapping: mapped.has(role.id),
+        ashby_mapping_statuses: statusesOf(role.id),
+      })),
+    );
   }],
   ['POST', '/api/roles', ({ body }, db) => {
     const role = { ...(body as unknown as Role), id: mintId(), is_active: true, created_at: nowIso() };

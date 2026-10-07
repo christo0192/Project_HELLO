@@ -33,7 +33,32 @@ export type FilterableRole = {
   title: string;
   agent_name?: string | null;
   has_ashby_mapping?: boolean | null;
+  ashby_mapping_statuses?: readonly string[] | null;
 };
+
+/** The Ashby job state a filter can scope to (see `ashby_mapping_statuses`). */
+export type AshbyJobState = 'active' | 'paused';
+
+/**
+ * True when every row carries the server's `ashby_mapping_statuses` array.
+ * False means an older API: the Active / Paused control is hidden rather
+ * than shown filtering everything away.
+ */
+export function hasMappingStatuses(roles: readonly FilterableRole[]): boolean {
+  return roles.length > 0 && roles.every((role) => Array.isArray(role.ashby_mapping_statuses));
+}
+
+/**
+ * Does the role belong to the Ashby job state? Active = at least one
+ * non-archived mapping is `enabled` (Live); Paused = at least one is
+ * `paused`. `drift` (Out of sync) is in neither. A role with both a live and
+ * a paused mapping matches both.
+ */
+export function roleMatchesJobState(role: FilterableRole, state: AshbyJobState | null): boolean {
+  if (!state) return true;
+  const statuses = role.ashby_mapping_statuses ?? [];
+  return statuses.includes(state === 'active' ? 'enabled' : 'paused');
+}
 
 /**
  * True when the payload carries the server's mapping flag — every row has a
@@ -44,13 +69,20 @@ export function hasMappingFlag(roles: readonly FilterableRole[]): boolean {
 }
 
 /** The roles a filter lists: the mapped ones, or every role on an older API. */
-export function listedRoles<T extends FilterableRole>(roles: readonly T[]): T[] {
-  return hasMappingFlag(roles) ? roles.filter((role) => role.has_ashby_mapping === true) : [...roles];
+export function listedRoles<T extends FilterableRole>(
+  roles: readonly T[],
+  jobState: AshbyJobState | null = null,
+): T[] {
+  const mapped = hasMappingFlag(roles) ? roles.filter((role) => role.has_ashby_mapping === true) : [...roles];
+  return jobState ? mapped.filter((role) => roleMatchesJobState(role, jobState)) : mapped;
 }
 
 /** The options a role filter lists after "All roles", sorted by label. */
-export function roleFilterOptions(roles: readonly FilterableRole[]): RoleFilterOption[] {
-  const listed = listedRoles(roles);
+export function roleFilterOptions(
+  roles: readonly FilterableRole[],
+  jobState: AshbyJobState | null = null,
+): RoleFilterOption[] {
+  const listed = listedRoles(roles, jobState);
   const labels = uniqueRoleLabels(listed);
   return listed
     .map((role) => ({ id: role.id, label: labels.get(role.id) ?? role.title }))

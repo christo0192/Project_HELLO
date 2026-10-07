@@ -27,7 +27,7 @@ vi.mock('../../../api', () => ({
   },
   ApiError: class extends Error {},
 }));
-import { PipelineBar } from '../PipelineBar';
+import { PipelineBar, formatShare } from '../PipelineBar';
 import { RolePipelinePanel, segmentsFor } from '../RolePipelinePanel';
 
 /** One populated role, purely so `StageTotals` renders and can be read. */
@@ -351,5 +351,75 @@ describe('PipelineBar', () => {
     // as a listitem outside any list.
     expect(group.querySelector('li')).toBeNull();
     expect(within(group).queryAllByRole('listitem')).toHaveLength(0);
+  });
+});
+
+describe('PipelineBar hover detail', () => {
+  const SEGS = [
+    { key: 'a', label: 'Alpha', value: 3, tone: 'accent' as const },
+    { key: 'b', label: 'Beta', value: 1, tone: 'positive' as const },
+    { key: 'z', label: 'Zero', value: 0, tone: 'neutral' as const },
+  ];
+  const tooltip = (c: HTMLElement) => c.querySelector('[data-pipeline-tooltip]');
+  const seg = (c: HTMLElement, key: string) =>
+    c.querySelector<HTMLElement>(`[data-pipeline-segment="${key}"]`)!;
+
+  it('formats shares: rounded, one decimal under 10%, <1% for a sliver', () => {
+    expect(formatShare(7, 43)).toBe('16%');
+    expect(formatShare(2, 43)).toBe('4.7%');
+    expect(formatShare(1, 500)).toBe('<1%');
+    expect(formatShare(0, 10)).toBe('0%');
+    expect(formatShare(3, 0)).toBe('0%');
+  });
+
+  it('shows label, count and percentage on segment hover, and hides on leave', () => {
+    const { container } = render(<PipelineBar label="t" total={4} segments={SEGS} />);
+    expect(tooltip(container)).toBeNull();
+    fireEvent.mouseEnter(seg(container, 'a'), { clientX: 10 });
+    const tip = tooltip(container)!;
+    expect(tip).not.toBeNull();
+    expect(tip.textContent).toBe('Alpha·3·75%');
+    // Outside the overflow-hidden track, and decorative.
+    expect(container.querySelector('[data-pipeline-track]')!.contains(tip)).toBe(false);
+    expect(tip).toHaveAttribute('aria-hidden', 'true');
+    fireEvent.mouseLeave(container.querySelector('[data-pipeline-track]')!.parentElement!);
+    expect(tooltip(container)).toBeNull();
+  });
+
+  it('dims the other segments while one is active', () => {
+    const { container } = render(<PipelineBar label="t" total={4} segments={SEGS} />);
+    fireEvent.mouseEnter(seg(container, 'b'));
+    expect(seg(container, 'a').style.opacity).toBe('0.45');
+    expect(seg(container, 'b').style.opacity).toBe('1');
+  });
+
+  it('legend focus and hover show the same tooltip (no new tab stops)', () => {
+    const { container } = render(
+      <PipelineBar label="Filter" total={4} segments={SEGS} onToggle={() => {}} />,
+    );
+    const buttons = screen.getAllByRole('button');
+    expect(buttons).toHaveLength(3);
+    fireEvent.focus(buttons[1]);
+    expect(tooltip(container)!.textContent).toBe('Beta·1·25%');
+    fireEvent.blur(buttons[1]);
+    expect(tooltip(container)).toBeNull();
+    fireEvent.mouseEnter(buttons[0]);
+    expect(tooltip(container)!.textContent).toBe('Alpha·3·75%');
+    // Segments themselves are not focusable.
+    expect(container.querySelectorAll('[data-pipeline-track] [tabindex]')).toHaveLength(0);
+  });
+
+  it('shows nothing for a zero segment, which has no drawn block', () => {
+    const { container } = render(
+      <PipelineBar label="Filter" total={4} segments={SEGS} onToggle={() => {}} />,
+    );
+    fireEvent.focus(screen.getAllByRole('button')[2]);
+    expect(tooltip(container)).toBeNull();
+  });
+
+  it('measures the share against the stated total when parts fall short', () => {
+    const { container } = render(<PipelineBar label="t" total={8} segments={SEGS} />);
+    fireEvent.mouseEnter(seg(container, 'a'));
+    expect(tooltip(container)!.textContent).toBe('Alpha·3·38%');
   });
 });

@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import { questionTag, sectionHeading } from "../types";
 import type { Role, RoleInput, ScreeningCategory, ScreeningQuestion } from "../types";
@@ -16,6 +17,7 @@ import {
   RevealGroup,
   RevealItem,
   SectionHeader,
+  SegmentedControl,
   SlideOver,
   TextArea,
   TextField,
@@ -107,6 +109,12 @@ function rolesSummary(roles: Role[]): string {
   return `${roles.length} ${roles.length === 1 ? "agent" : "agents"}, ${active === 0 ? "none" : active} active`;
 }
 
+type StatusFilter = "all" | "active" | "inactive";
+
+function parseStatusFilter(raw: string | null): StatusFilter {
+  return raw === "active" || raw === "inactive" ? raw : "all";
+}
+
 export function RolesPage() {
   const [roles, setRoles] = useState<Role[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -191,7 +199,40 @@ export function RolesPage() {
     [deletingId, load],
   );
 
-  const pager = usePagination(roles ?? [], 10);
+  // The status filter lives in the URL (?status=active|inactive) so it survives
+  // a reload and Back. Absent or unknown means "all". It is NOT cleared by
+  // `load()`: a removal reloads the list and the operator stays on the filter
+  // they were using.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const statusFilter = parseStatusFilter(searchParams.get("status"));
+  const setStatusFilter = useCallback(
+    (next: StatusFilter) => {
+      setSearchParams(
+        (prev) => {
+          const params = new URLSearchParams(prev);
+          if (next === "all") params.delete("status");
+          else params.set("status", next);
+          return params;
+        },
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
+  const statusCounts = useMemo(() => {
+    const all = roles ?? [];
+    const active = all.filter((role) => role.is_active).length;
+    return { all: all.length, active, inactive: all.length - active };
+  }, [roles]);
+  const visibleRoles = useMemo(() => {
+    const all = roles ?? [];
+    if (statusFilter === "all") return all;
+    return all.filter((role) => role.is_active === (statusFilter === "active"));
+  }, [roles, statusFilter]);
+
+  // Changing the filter returns to page 1.
+  const pager = usePagination(visibleRoles, 10, statusFilter);
 
   return (
     <div className="space-y-6">
@@ -289,7 +330,40 @@ export function RolesPage() {
                 title="All agents"
                 // Said once here, so nobody counts the rows to learn it.
                 description={rolesSummary(roles)}
+                // Right-aligned beside the title; SectionHeader wraps it
+                // under the title on a phone.
+                actions={
+                  <SegmentedControl
+                    ariaLabel="Filter agents by status"
+                    size="sm"
+                    value={statusFilter}
+                    onChange={setStatusFilter}
+                    options={[
+                      { value: "all", label: "All", count: statusCounts.all },
+                      { value: "active", label: "Active", count: statusCounts.active },
+                      { value: "inactive", label: "Inactive", count: statusCounts.inactive },
+                    ]}
+                  />
+                }
               />
+              {/* Announces what a filter did; silent while unfiltered. */}
+              <p role="status" className="sr-only">
+                {statusFilter === "all"
+                  ? ""
+                  : `Showing ${visibleRoles.length} of ${roles.length} ${roles.length === 1 ? "agent" : "agents"}`}
+              </p>
+              {visibleRoles.length === 0 ? (
+                <div className="mt-4 flex flex-col items-start gap-3 border-t border-glass-ring pt-5 sm:flex-row sm:items-center sm:justify-between">
+                  <p className="text-label text-ink-secondary">
+                    {statusFilter === "active"
+                      ? "No active agents right now."
+                      : "No inactive agents. Every agent is active."}
+                  </p>
+                  <Button variant="secondary" onClick={() => setStatusFilter("all")}>
+                    Show all agents
+                  </Button>
+                </div>
+              ) : (
               <ul
                 // `role="list"`: Safari drops list semantics from a list
                 // styled without markers, and "list, 6 items" is how a screen
@@ -309,6 +383,7 @@ export function RolesPage() {
                   />
                 ))}
               </ul>
+              )}
               {/* Paging controls only when there is more than one page's
                   worth at the smallest size. "Showing 1–6 of 6 agents" with
                   disabled arrows was a second way of saying the summary. */}

@@ -265,6 +265,34 @@ test.describe('key states', () => {
     app.expectHealthy();
   });
 
+  test('Candidates Active / Paused scope follows the Ashby job state', async ({ app, page }) => {
+    // Seed: backend = enabled (Live), data = paused, frontend = drift (in
+    // neither), the rest unmapped.
+    await app.goto('/candidates');
+    const scope = page.getByRole('group', { name: 'Filter by Ashby job status' });
+    await expect(scope).toBeVisible();
+    const roleFilter = page.getByLabel('Filter by role').first();
+
+    await scope.getByRole('button', { name: /^Active/ }).click();
+    await expect(page).toHaveURL(/ashby=active/);
+    await expect(roleFilter.locator('option')).toHaveText(['All roles', 'Senior Backend Engineer']);
+    await expect(page.getByText('Ashby jobs: Active').first()).toBeVisible();
+
+    await scope.getByRole('button', { name: /^Paused/ }).click();
+    await expect(page).toHaveURL(/ashby=paused/);
+    await expect(roleFilter.locator('option')).toHaveText(['All roles', 'Data Analyst']);
+
+    await scope.getByRole('button', { name: /^All/ }).click();
+    await expect(page).not.toHaveURL(/ashby=/);
+    await expect(roleFilter.locator('option')).toHaveText([
+      'All roles',
+      'Data Analyst',
+      'Frontend Engineer',
+      'Senior Backend Engineer',
+    ]);
+    app.expectHealthy();
+  });
+
   test('Ashby Live Jobs shows every mapping state', async ({ app, page }) => {
     await app.goto('/ashby-mission-control');
     // In words (enabled / paused / drift on the wire).
