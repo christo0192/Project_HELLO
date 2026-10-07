@@ -11,6 +11,8 @@ export const r1InternalRouter = Router();
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const activePhone = new Set(['pending_prereqs', 'eligible', 'scheduled', 'dialing', 'in_call', 'reconnecting', 'awaiting_retry']);
 const terminal = new Set(['completed', 'expired', 'cancelled']);
+/** The trusted worker event types r1_admin_log accepts (0122 added session_facts). */
+const ADMIN_LOG_EVENTS = ['need_revealed','family_delivered','push_delivered','counter_delivered','discount_detected','guard_hit','time_cue','session_facts'];
 
 function r1Enabled(res: Response): boolean {
   const c = getR1Config();
@@ -63,7 +65,7 @@ r1Router.post('/candidates/:id/interview-rounds', requireRole('interviewer'), as
 r1Router.get('/candidates/:id/interview-rounds', requireRole('viewer'), async (req, res, next) => { try {
   if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
   if (!(await candidateAccess(req, res, req.params.id, false))) return;
-  const { data, error } = await supabase.from('interview_rounds').select('id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,created_at,created_by').eq('candidate_id', req.params.id).order('created_at', { ascending: false });
+  const { data, error } = await supabase.from('interview_rounds').select('id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,status_write,pending_reject_until,created_at,created_by').eq('candidate_id', req.params.id).order('created_at', { ascending: false });
   if (error) throw error; res.json({ rounds: data ?? [] });
 } catch (e) { next(e); } });
 
@@ -77,6 +79,24 @@ for (const action of ['cancel', 'reissue', 'grant-retake'] as const) r1Router.po
   if (transition?.status !== 'ok') return res.status(409).json({ error: transition?.status === 'retake_not_allowed' ? 'retake_not_allowed' : transition?.status === 'capacity_exhausted' ? 'r1_capacity_exhausted' : 'round_transition_conflict' });
   if (token) { res.setHeader('Cache-Control', 'no-store'); await recordAudit(req, 'resource.update', 200, { metadata: { resource: 'interview_round_reissue', round_id: round.id } }); return res.json({ id: round.id, join_url: joinUrl(token) }); }
   await recordAudit(req, 'resource.update', 200, { metadata: { resource: `interview_round_${action}`, round_id: round.id } }); res.json({ ok: true });
+} catch (e) { next(e); } });
+
+/**
+ * HR cancels the 24 h pending reject R1 opened (plan 6.5). Admin or the owning interviewer, like
+ * the other round actions. Deliberately NOT gated on R1_ENABLED: cancelling a pending reject is
+ * always the safe direction, even while R1 is switched off. The cancellation is an audited
+ * override: the RPC records it in audit_events and feeds the override monitor, which switches
+ * auto-status off at >10% over a rolling 20.
+ */
+r1Router.post('/interview-rounds/:id/cancel-pending-reject', requireRole('interviewer'), async (req, res, next) => { try {
+  if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
+  const round = await roundAccess(req, res, req.params.id); if (!round) return;
+  const { data, error } = await supabase.rpc('r1_cancel_pending_reject', { p_round_id: round.id, p_actor: req.authUser!.id });
+  if (error) return res.status(503).json({ error: 'service_unavailable' });
+  if (data?.status === 'not_pending') return res.status(409).json({ error: 'not_pending' });
+  if (data?.status !== 'ok') return res.status(409).json({ error: 'round_transition_conflict' });
+  await recordAudit(req, 'resource.update', 200, { metadata: { resource: 'interview_round_cancel_pending_reject', round_id: round.id } });
+  res.json({ ok: true, auto_status_disabled: data?.override?.disabled === true });
 } catch (e) { next(e); } });
 
 r1Router.get('/admin/r1/settings', requireRole('admin'), async (_req, res, next) => { try { const { data, error } = await supabase.from('r1_settings').select('*').eq('singleton', true).single(); if (error) throw error; res.json({ ...data, runtime: getR1Config() }); } catch (e) { next(e); } });
@@ -133,4 +153,4 @@ function workerAuth(req: Request, res: Response, next: NextFunction): void { con
 async function r1Session(req: Request, res: Response): Promise<any | null> { const room = req.body?.room; if (typeof room !== 'string' || !/^screening-[0-9a-f-]{36}$/i.test(room)) { res.status(400).json({ error: 'invalid_r1_room' }); return null; } const { data, error } = await supabase.from('call_sessions').select('id,candidate_id,interview_round_id,status,external_call_id,mode').eq('external_call_id', room).maybeSingle(); if (error) { res.status(503).json({ error: 'service_unavailable' }); return null; } if (!data || data.mode !== 'browser' || !data.interview_round_id || !['waiting','in_progress'].includes(data.status) || data.external_call_id !== room) { res.status(409).json({ error: 'r1_session' }); return null; } return data; }
 r1InternalRouter.post('/context', workerAuth, async (req, res, next) => { try { const session = await r1Session(req, res); if (!session) return; const [{ data: candidate }, { data: attempt }, { data: settings }] = await Promise.all([supabase.from('candidates').select('name').eq('id', session.candidate_id).single(), supabase.from('interview_round_attempts').select('round_id,attempt_number,persona_id,persona_version,persona_variant,content_sha').eq('session_id', session.id).single(), supabase.from('r1_settings').select('enabled,paused,advance_threshold,hold_threshold,livekit_target').eq('singleton', true).single()]); const raw = typeof candidate?.name === 'string' ? candidate.name.trim().split(/\s+/)[0] : ''; const first_name = /^[A-Za-z '-]{1,24}$/.test(raw) ? raw : 'there'; res.json({ first_name, round_id: session.interview_round_id, attempt_id: session.id, attempt, settings }); } catch (e) { next(e); } });
 r1InternalRouter.post('/usage', workerAuth, async (req, res, next) => { try { const session = await r1Session(req, res); if (!session) return; const body = req.body ?? {}; const key = typeof body.event_key === 'string' ? body.event_key : ''; const max = body.participant_kind === 'preflight' ? 15 : 1830; const occurred = body.occurred_at ? new Date(body.occurred_at).getTime() : Date.now(); if (!['candidate','agent','preflight','manual_test'].includes(body.participant_kind) || !Number.isFinite(body.seconds) || body.seconds < 0 || body.seconds > max || !/^[A-Za-z0-9:_-]{1,128}$/.test(key) || !Number.isFinite(occurred) || Math.abs(Date.now() - occurred) > 120_000) return res.status(400).json({ error: 'invalid_usage' }); const { data, error } = await supabase.rpc('r1_record_usage', { p_session_id: session.id, p_round_id: session.interview_round_id, p_participant_kind: body.participant_kind, p_event: body.event === 'disconnect' ? 'disconnect' : 'connect', p_seconds: body.seconds, p_event_key: key }); if (error) return res.status(503).json({ error: 'service_unavailable' }); res.status(data?.duplicate ? 200 : 201).json({ ok: true, duplicate: !!data?.duplicate }); } catch (e) { next(e); } });
-r1InternalRouter.post('/admin-log', workerAuth, async (req, res, next) => { try { const session = await r1Session(req, res); if (!session) return; const body = req.body ?? {}; if (!['need_revealed','family_delivered','push_delivered','counter_delivered','discount_detected','guard_hit','time_cue'].includes(body.event_type) || (body.turn_index !== undefined && (!Number.isInteger(body.turn_index) || body.turn_index < 0)) || (body.payload !== undefined && (typeof body.payload !== 'object' || Array.isArray(body.payload)))) return res.status(400).json({ error: 'invalid_admin_log' }); const { error } = await supabase.from('r1_admin_log').insert({ session_id: session.id, round_id: session.interview_round_id, event_type: body.event_type, turn_index: body.turn_index ?? null, family_id: typeof body.family_id === 'string' ? body.family_id.slice(0, 64) : null, payload: body.payload ?? {} }); if (error) throw error; res.status(201).json({ ok: true }); } catch (e) { next(e); } });
+r1InternalRouter.post('/admin-log', workerAuth, async (req, res, next) => { try { const session = await r1Session(req, res); if (!session) return; const body = req.body ?? {}; if (!ADMIN_LOG_EVENTS.includes(body.event_type) || (body.turn_index !== undefined && (!Number.isInteger(body.turn_index) || body.turn_index < 0)) || (body.payload !== undefined && (typeof body.payload !== 'object' || Array.isArray(body.payload)))) return res.status(400).json({ error: 'invalid_admin_log' }); const { error } = await supabase.from('r1_admin_log').insert({ session_id: session.id, round_id: session.interview_round_id, event_type: body.event_type, turn_index: body.turn_index ?? null, family_id: typeof body.family_id === 'string' ? body.family_id.slice(0, 64) : null, payload: body.payload ?? {} }); if (error) throw error; res.status(201).json({ ok: true }); } catch (e) { next(e); } });

@@ -225,6 +225,58 @@ interface LatestAssessment {
 }
 
 /**
+ * R1 (PR-5, migration 0122 M3): an R1 interview round's assessment is NOT a candidate's phone
+ * "latest assessment", so the list and summary reductions drop assessments whose session
+ * carries `interview_round_id`. The R1 session ids are read in bounded pages (R1 sessions are
+ * few: a handful a day at most), which replaces a per-chunk join.
+ *
+ * FAIL CLOSED. A lookup that errors or cannot be completed answers `null`, and both routes
+ * then answer 503 rather than reduce an unfiltered set: falling back to "include everything"
+ * would present an R1 recommendation as the candidate's latest phone assessment.
+ */
+const R1_SESSION_PAGE_SIZE = 1000;
+const R1_SESSION_MAX_PAGES = 50;
+interface LatestAssessmentRow {
+  candidate_id: string;
+  session_id?: string | null;
+  overall_score: number | string | null;
+  recommendation: string | null;
+  created_at: string;
+}
+
+async function loadR1SessionIds(): Promise<Set<string> | null> {
+  const ids = new Set<string>();
+  for (let page = 0; page < R1_SESSION_MAX_PAGES; page += 1) {
+    const from = page * R1_SESSION_PAGE_SIZE;
+    const { data, error } = await supabase
+      .from('call_sessions')
+      .select('id')
+      .not('interview_round_id', 'is', null)
+      .order('id', { ascending: true })
+      .range(from, from + R1_SESSION_PAGE_SIZE - 1);
+    // PostgREST answers `data: null` only together with an error, so the error is the one
+    // failure signal; an absent list is an empty page.
+    if (error) return null;
+    const rows = (Array.isArray(data) ? data : []) as Array<{ id: string }>;
+    for (const row of rows) ids.add(row.id);
+    if (rows.length < R1_SESSION_PAGE_SIZE) return ids;
+  }
+  // More R1 sessions than the bound: the set is incomplete, so it cannot be trusted.
+  return null;
+}
+
+/** The phone assessments only, or `null` when the R1 session lookup could not be completed. */
+async function withoutR1Assessments(
+  rows: LatestAssessmentRow[] | null,
+): Promise<{ rows: LatestAssessmentRow[] | null } | null> {
+  if (!rows || rows.length === 0) return { rows };
+  const r1Sessions = await loadR1SessionIds();
+  if (r1Sessions === null) return null;
+  if (r1Sessions.size === 0) return { rows };
+  return { rows: rows.filter((row) => !row.session_id || !r1Sessions.has(row.session_id)) };
+}
+
+/**
  * Reduce an assessments result set (ordered created_at DESC) to the latest
  * assessment per candidate. Single pass, no N+1 — the caller fetches all
  * assessments for the candidate set in one query.
@@ -344,10 +396,12 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
   if (ids.length > 0) {
     const { data: assessments } = await supabase
       .from('assessments')
-      .select('candidate_id, overall_score, recommendation, created_at')
+      .select('candidate_id, session_id, overall_score, recommendation, created_at')
       .in('candidate_id', ids)
       .order('created_at', { ascending: false });
-    latest = latestAssessmentByCandidate(assessments as never);
+    const phoneOnly = await withoutR1Assessments(assessments as LatestAssessmentRow[] | null);
+    if (phoneOnly === null) return res.status(503).json({ error: 'service_unavailable' });
+    latest = latestAssessmentByCandidate(phoneOnly.rows);
   }
 
   // ONE additional bounded query for the whole page — an `in (...)` over the
@@ -438,10 +492,12 @@ candidatesRouter.get('/summary', requireRole('viewer'), async (req, res, next) =
   if (eligibleIds.length > 0) {
     const { data: assessments } = await supabase
       .from('assessments')
-      .select('candidate_id, overall_score, recommendation, created_at')
+      .select('candidate_id, session_id, overall_score, recommendation, created_at')
       .in('candidate_id', eligibleIds)
       .order('created_at', { ascending: false });
-    const latest = latestAssessmentByCandidate(assessments as never);
+    const phoneOnly = await withoutR1Assessments(assessments as LatestAssessmentRow[] | null);
+    if (phoneOnly === null) return res.status(503).json({ error: 'service_unavailable' });
+    const latest = latestAssessmentByCandidate(phoneOnly.rows);
     for (const { overall_score, recommendation } of latest.values()) {
       if (recommendation) distribution[recommendation] += 1;
       if (overall_score != null) {

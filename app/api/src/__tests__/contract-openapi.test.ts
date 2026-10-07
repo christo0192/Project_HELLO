@@ -1144,9 +1144,10 @@ describe('OpenAPI document integrity', () => {
     // unchanged. 143 + 1 = 144.
     // PR-2 adds eight R1 path keys: candidate round list/send; cancel,
     // reissue and retake; settings; and the three worker-only R1 endpoints.
-    // PR-7 adds two read-only R1 path keys for the HR web: the Send R1
-    // availability answer and the admin usage figures. 152 + 2 = 154.
-    expect(Object.keys(paths).length).toBe(154);
+    // Main's count plus PR-5's ONE R1 path key:
+    // POST /api/interview-rounds/{id}/cancel-pending-reject (audited HR cancellation
+    // of the 24 h pending reject). Total 155.
+    expect(Object.keys(paths).length).toBe(155);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

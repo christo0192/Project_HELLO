@@ -15,6 +15,7 @@ const fixtures = [
   ['/api/interview-rounds/{id}/cancel', 'post', '200'],
   ['/api/interview-rounds/{id}/reissue', 'post', '200'],
   ['/api/interview-rounds/{id}/grant-retake', 'post', '200'],
+  ['/api/interview-rounds/{id}/cancel-pending-reject', 'post', '200'],
   ['/api/admin/r1/settings', 'get', '200'],
   ['/api/admin/r1/settings', 'put', '200'],
   ['/api/interview-rounds/availability', 'get', '200'],

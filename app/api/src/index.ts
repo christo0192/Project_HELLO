@@ -35,6 +35,7 @@ import {
   createFunnelRuntime,
   type FunnelRuntimeHandle,
 } from './lib/funnel/runtime.js';
+import { createR1Runtime, type R1RuntimeHandle } from './lib/r1/runtime.js';
 
 const startupLogger = createLogger('startup');
 const app = createApp();
@@ -140,6 +141,22 @@ try {
   funnelRuntime = null;
 }
 
+// ── R1 queue runtime (disabled by default) ────────────────────────────────────
+// A SIXTH independent try/catch, same rule as the five above. `createR1Runtime` returns
+// null unless `R1_ENABLED` is exactly "true", so with the shipped default nothing is
+// constructed: no runner, no scheduler, no timer, no DB poll, no provider call. It hosts
+// R1's own queue (`r1.assessment`) and its status loop, entirely separate from the phone
+// runtime. A failure to build it must never prevent the API, or any other runtime, from
+// serving.
+let r1Runtime: R1RuntimeHandle | null = null;
+try {
+  r1Runtime = createR1Runtime();
+} catch {
+  // Sanitized: the error is not logged verbatim because it can carry config text.
+  startupLogger.warn('unknown_event', { error_category: 'r1_runtime_start_failed' });
+  r1Runtime = null;
+}
+
 server.listen(env.port, () => {
   if (recordingRuntime) {
     recordingRuntime.scheduler.start();
@@ -187,6 +204,11 @@ server.listen(env.port, () => {
     // Only present when FUNNEL_OBSERVABILITY_ENABLED is on. Start the single
     // rollup-refresh loop now that the process is serving, mirroring the others.
     funnelRuntime.scheduler.start();
+  }
+  if (r1Runtime) {
+    // Only present when R1_ENABLED is on. Start the assessment queue loop and the
+    // pending-reject status loop now that the process is serving.
+    r1Runtime.scheduler.start();
   }
   startupLogger.info('startup_listen', {
     port: env.port,
@@ -249,6 +271,16 @@ shutdown.boot(server).then(async (code) => {
       // and advisory-locked, so an interrupted recompute leaves the rollup
       // consistent and the next tick simply recomputes the window again.
       await funnelRuntime.stop();
+    } catch {
+      // Never let a worker-stop failure change the process exit code.
+    }
+  }
+  if (r1Runtime) {
+    try {
+      // Stopped in its own try, like the others. An in-flight `r1.assessment` claim either
+      // completes or fails UNDER ITS LEASE (the scorer is idempotent per session), and an
+      // abandoned lease is recovered by the reclaim sweep on any machine.
+      await r1Runtime.stop();
     } catch {
       // Never let a worker-stop failure change the process exit code.
     }
