@@ -57,6 +57,9 @@ const CandidateScreeningEndedPage = lazyPage(
   () => import('./pages/CandidateScreeningEndedPage'),
   'CandidateScreeningEndedPage',
 );
+// The R1 candidate page also carries the LiveKit SDK, so it is lazy for the same
+// reason; it is a separate route and never shares code paths with the legacy join.
+const R1JoinPage = lazyPage(() => import('./pages/R1JoinPage'), 'R1JoinPage');
 const ScreeningPage = lazyPage(() => import('./pages/ScreeningPage'), 'ScreeningPage');
 const CandidateDetailPage = lazyPage(
   () => import('./pages/CandidateDetailPage'),
@@ -129,6 +132,14 @@ export default function App() {
           element={
             <Suspense fallback={<LoadingPanel />}>
               <CandidateJoinPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/candidate/r1"
+          element={
+            <Suspense fallback={<LoadingPanel />}>
+              <R1JoinPage />
             </Suspense>
           }
         />

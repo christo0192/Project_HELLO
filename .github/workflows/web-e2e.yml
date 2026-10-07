@@ -1,0 +1,95 @@
+name: Web E2E
+
+# The offline Playwright harness (app/web/e2e) on Linux, with ZERO tolerated
+# failures (R1 plan section 10.2, PR-6).
+#
+# What runs: the real web app on the Vite dev server, every backend answered by
+# in-process fixtures (`.invalid` hosts, so a missed mock fails DNS rather than
+# reaching anything real). No secrets, no provider calls, no deployed
+# environment. Chromium runs with fake camera and microphone devices
+# (`--use-fake-device-for-media-stream --use-fake-ui-for-media-stream`, set in
+# app/web/e2e/playwright.config.ts) and `livekit-client` is a scripted
+# stand-in, so the R1 candidate flow is exercised without WebRTC or LiveKit.
+#
+# Zero tolerance, stated in code:
+#   - playwright.config.ts sets `retries: 0` and `forbidOnly` under CI, so a
+#     test is green only if it passed on its first attempt;
+#   - this workflow has no `continue-on-error`, no `|| true` and no failure
+#     threshold;
+#   - scripts/check-e2e-results.mjs re-reads the JSON report and fails on any
+#     failed or flaky test and on a run that executed nothing, so an empty or
+#     partial run cannot read as a pass. It also requires passing tests from
+#     BOTH app.e2e.ts and candidate-r1.e2e.ts on BOTH projects (desktop and
+#     mobile), so a spec that silently drops out of collection (a renamed
+#     project, a changed testMatch, a grep) turns the job red instead of leaving
+#     the recruiter tests to carry a green gate with no R1 coverage.
+# The workflow's own policy is pinned by scripts/check-e2e-results.test.mjs.
+#
+# Every action SHA is pinned (no @vN tags), like deploy-fly.yml and the Phase 12
+# workflow. The job name `web-e2e` is deliberately NOT added to the required
+# checks list in .github/BRANCH_PROTECTION.md: path-filtered workflows do not
+# report on every pull request (see that file), so only `quality` and
+# `secret-scan` are suitable for required status enforcement.
+
+on:
+  pull_request:
+    paths:
+      - 'app/web/**'
+      - 'scripts/check-e2e-results.mjs'
+      - 'scripts/check-e2e-results.test.mjs'
+      - '.github/workflows/web-e2e.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'app/web/**'
+      - 'scripts/check-e2e-results.mjs'
+      - 'scripts/check-e2e-results.test.mjs'
+      - '.github/workflows/web-e2e.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  web-e2e:
+    name: web-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CI: 'true'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/web/package-lock.json
+      - name: Self-test the zero-tolerance gate and this workflow's policy
+        run: node scripts/check-e2e-results.test.mjs
+      - name: Install web dependencies
+        working-directory: app/web
+        run: npm ci
+      - name: Typecheck the e2e harness
+        working-directory: app/web
+        run: npm run e2e:typecheck
+      # `--no-install`: use the Playwright pinned in package-lock.json or FAIL;
+      # never let npx fetch whatever version the registry serves today.
+      - name: Install Chromium for Playwright
+        working-directory: app/web
+        run: npx --no-install playwright install --with-deps chromium
+      - name: Run the offline e2e suite (desktop and mobile projects)
+        working-directory: app/web
+        run: npm run e2e
+      - name: Zero-tolerance gate over the report
+        if: always()
+        run: node scripts/check-e2e-results.mjs app/web/e2e/.artifacts/results.json
+      - name: Upload the report, traces and axe records
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: web-e2e-artifacts
+          path: app/web/e2e/.artifacts
+          retention-days: 14
+          if-no-files-found: warn

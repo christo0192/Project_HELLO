@@ -9,6 +9,14 @@
  *   npm run e2e:shots   full-page screenshots of every route + key state
  *
  * Artifacts (gitignored) land in e2e/.artifacts/.
+ *
+ * Candidate media. The R1 candidate pages need a camera and a microphone, and
+ * a CI runner has neither. Chromium is therefore launched with
+ * `--use-fake-device-for-media-stream` (a synthetic camera and microphone) and
+ * `--use-fake-ui-for-media-stream` (accept the permission prompt), and the
+ * context pre-grants `camera` and `microphone`. The recruiter routes never
+ * ask for media, so this changes nothing for them. `livekit-client` itself is
+ * replaced by a scripted stand-in (see vite.e2e.config.ts).
  */
 import { createServer } from 'node:net';
 import path from 'node:path';
@@ -72,6 +80,10 @@ export default defineConfig({
     // src/csp.ts's unit tests; here it would only be noise in the console.
     bypassCSP: true,
     serviceWorkers: 'block',
+    permissions: ['camera', 'microphone'],
+    launchOptions: {
+      args: ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream'],
+    },
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },
