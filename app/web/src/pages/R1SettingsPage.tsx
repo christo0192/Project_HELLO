@@ -5,9 +5,10 @@
  * (admin-only on the server; the route is also behind `requireRole="admin"`,
  * a UX gate only). What it edits:
  *   - the two switches (enabled, paused);
- *   - the monthly cap and the pause line, in WebRTC minutes;
+ *   - the monthly cap (R1's own allocation) and the pause line (the shared Cloud
+ *     pool's line), in WebRTC minutes;
  *   - the advance and hold score thresholds, and automatic status changes;
- *   - the LiveKit dashboard reading, which the capacity guard never goes
+ *   - the LiveKit dashboard reading, which the Cloud pool's guard never goes
  *     below.
  * `livekit_target` is shown but not editable: moving R1 to another media
  * server is an infrastructure change, not a setting.
@@ -25,8 +26,13 @@
  *    Recording one moves the saved row, so the draft is rebased onto it:
  *    fields the person has not touched follow the server (another admin's
  *    pause stays a pause), fields they edited keep their edit.
- *  - The cap bounds the SHARED WebRTC pool (phone included) plus R1's held
- *    links, not R1's own minutes, and the page says so.
+ *  - Since 0119 the cap is the R1 ALLOCATION (sessions x hold): it is checked
+ *    against R1's own committed minutes (used plus the links already sent) on
+ *    both media servers, and phone use never counts against it. The pause line
+ *    belongs to the shared Cloud pool (phone and legacy browser included) and
+ *    gates sends ONLY while `livekit_target` is `cloud`; on `r1` it gates
+ *    nothing. The page says so, per target, and shows no combined ceiling.
+ *    Mission Control reads the same snapshot, so the two pages agree.
  *  - Every change is audited server-side (DB trigger plus route audit).
  */
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
@@ -99,12 +105,25 @@ const AUTO_STATUS_DESCRIPTION =
   'Off until calibration is signed off. When on, R1 advances candidates itself and rejects ' +
   'after a 24-hour window HR can cancel.';
 const READING_DESCRIPTION =
-  'Copy the month-to-date WebRTC minutes from the LiveKit dashboard. The capacity guard never ' +
-  'goes below it, and uses it as the baseline for R1 usage since. Record a new one each month: ' +
-  'the guard keeps counting the last reading until you do.';
-const CAP_HINT =
-  'Ceiling on the month’s shared WebRTC minutes (R1, phone and legacy browser, plus a 15% ' +
-  'margin) and the minutes held by R1 links already sent. Phone use counts against it.';
+  'Copy the month-to-date WebRTC minutes from the LiveKit dashboard. The Cloud-pool guard never ' +
+  'goes below it, and counts the pool’s growth since as its baseline. Record a new one each ' +
+  'month: the guard keeps counting the last reading until you do.';
+const capHint = (hold: number) =>
+  `R1’s own allocation for the month (sessions × ${hold} minutes), on either media server. It ` +
+  'is checked against R1’s used minutes plus the minutes held by links already sent. Phone ' +
+  'and legacy browser use do not count against it.';
+const PAUSE_LINE_HINT: Record<'cloud' | 'r1', string> = {
+  cloud:
+    'The Cloud pool’s line: R1, phone and legacy browser together. R1 stops taking sends when ' +
+    'the month’s pool use reaches it.',
+  r1:
+    'The Cloud pool’s line. R1 runs on its own media server, so this gates nothing now; it ' +
+    'applies again only if R1 moves back to LiveKit Cloud.',
+};
+const ALLOWANCE_NOTE: Record<'cloud' | 'r1', string> = {
+  cloud: 'Both limits must have room: R1’s allocation and the Cloud pool’s pause line.',
+  r1: 'Only R1’s allocation applies; the Cloud pool’s pause line gates nothing here.',
+};
 
 const TARGET_LABEL: Record<string, string> = {
   cloud: 'LiveKit Cloud, shared with phone',
@@ -185,12 +204,15 @@ export function R1SettingsPage() {
   const run = r1RunState(saved, saved.runtime);
   const dirty = !sameDraft(draft, draftFromSettings(saved));
   const cap = Number(draft.monthly_cap_minutes);
-  const line = Number(draft.pause_line_minutes);
-  const ceilingKnown =
-    Number.isInteger(cap) && cap > 0 && Number.isInteger(line) && line > 0;
-  const ceiling = ceilingKnown ? Math.min(cap, line) : null;
+  const allocationKnown = Number.isInteger(cap) && cap > 0;
   const hold = saved.admission_hold_minutes ?? 55;
-  const readingStale = isReadingStale(saved.dashboard_read_at, currentMonthStart());
+  // The pause line gates sends only on LiveKit Cloud; an unknown target is read as gating,
+  // the cautious reading (as in Mission Control).
+  const target: 'cloud' | 'r1' = saved.livekit_target === 'r1' ? 'r1' : 'cloud';
+  // The dashboard reading feeds the Cloud pool's guard, so a stale one can block sends only
+  // while the pool gates them.
+  const readingStale =
+    target === 'cloud' && isReadingStale(saved.dashboard_read_at, currentMonthStart());
 
   function update<K extends keyof R1SettingsDraft>(key: K, value: R1SettingsDraft[K]) {
     setDraft((current) => (current ? { ...current, [key]: value } : current));
@@ -341,20 +363,16 @@ export function R1SettingsPage() {
             level={2}
             title="Monthly allowance"
             description={
-              `WebRTC minutes. Each send reserves ${hold} minutes, ` +
-              'and the lower of the two limits applies.'
+              `WebRTC minutes. Each send reserves ${hold} minutes of R1’s allocation. ` +
+              ALLOWANCE_NOTE[target]
             }
-            meta={
-              ceiling !== null
-                ? `${formatMinutes(ceiling)} min ceiling, shared with phone`
-                : undefined
-            }
+            meta={allocationKnown ? `${formatMinutes(cap)} min R1 allocation` : undefined}
           />
           <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
             <Field
               id="r1-monthly-cap"
               label="Monthly cap (minutes)"
-              hint={CAP_HINT}
+              hint={capHint(hold)}
               error={errors.monthly_cap_minutes}
             >
               {({ id, describedBy, invalid }) => (
@@ -372,7 +390,7 @@ export function R1SettingsPage() {
             <Field
               id="r1-pause-line"
               label="Pause line (minutes)"
-              hint="R1 stops taking sends when the month’s WebRTC use reaches this line."
+              hint={PAUSE_LINE_HINT[target]}
               error={errors.pause_line_minutes}
             >
               {({ id, describedBy, invalid }) => (
