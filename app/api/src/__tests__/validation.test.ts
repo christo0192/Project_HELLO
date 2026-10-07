@@ -122,6 +122,10 @@ function chainable(value: any): any {
   fn.eq = () => chainable(value);
   fn.in = () => chainable(value);
   fn.is = () => chainable(value);
+  // `.not(col, 'is', null)` + `.range(a, b)`: the R1 session-id lookup behind GET /api/candidates
+  // (loadR1SessionIds). Without them it throws TypeError inside the async handler.
+  fn.not = () => chainable(value);
+  fn.range = () => chainable(value);
   fn.order = () => chainable(value);
   fn.limit = () => chainable(value);
   fn.select = () => chainable(value);

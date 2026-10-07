@@ -136,7 +136,10 @@ describe('0122 functions', () => {
     );
     expect(CODE).not.toMatch(/grant execute on function screening_v2\.r1_settings_stamp_override_reset/);
     // Only R1's own table carries the trigger, and the migration stays free of destructive DDL.
-    expect(CODE).toMatch(/create or replace trigger trg_r1_settings_override_reset\n\s+before update on screening_v2\.r1_settings/);
+    // A plain CREATE TRIGGER (the 0115 convention): `create or replace trigger` is not classifiable by the TST-15
+    // contract scan (UNCLASSIFIED_DDL), and a DROP is forbidden here.
+    expect(CODE).toMatch(/create trigger trg_r1_settings_override_reset\n\s+before update on screening_v2\.r1_settings/);
+    expect(CODE).not.toMatch(/create or replace trigger/i);
   });
 
   it('revokes from public/anon/authenticated and grants execute to service_role only', () => {

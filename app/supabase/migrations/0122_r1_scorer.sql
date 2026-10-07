@@ -107,9 +107,11 @@ begin
 end;
 $$;
 
--- CREATE OR REPLACE TRIGGER (Postgres 14+; the stack is 17) keeps the migration re-runnable
--- without a destructive DROP.
-create or replace trigger trg_r1_settings_override_reset
+-- A plain, additive CREATE TRIGGER (the 0115 convention): the trigger and its function are
+-- first created in this migration, and the chain is forward-only (each migration applies
+-- once), so no DROP and no CREATE OR REPLACE TRIGGER (which the TST-15 contract scan cannot
+-- classify) is needed.
+create trigger trg_r1_settings_override_reset
   before update on screening_v2.r1_settings
   for each row execute function screening_v2.r1_settings_stamp_override_reset();
 

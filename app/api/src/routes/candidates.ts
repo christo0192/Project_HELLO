@@ -230,9 +230,18 @@ interface LatestAssessment {
  * carries `interview_round_id`. The R1 session ids are read in bounded pages (R1 sessions are
  * few: a handful a day at most), which replaces a per-chunk join.
  *
- * FAIL CLOSED. A lookup that errors or cannot be completed answers `null`, and both routes
- * then answer 503 rather than reduce an unfiltered set: falling back to "include everything"
- * would present an R1 recommendation as the candidate's latest phone assessment.
+ * FAIL CLOSED, on purpose, and never by throwing. A lookup that errors, THROWS (a rejected
+ * promise, a client fault), or cannot be completed answers `null`, and both routes then
+ * answer 503 `service_unavailable` rather than reduce an unfiltered set. Failing OPEN
+ * (treating "unknown" as "no R1 sessions") would present an R1 sales role-play recommendation
+ * as the candidate's latest PHONE assessment, on the very list and aggregate a recruiter acts
+ * on (an R1 `reject` can feed a decision): a silent wrong answer. Failing closed costs
+ * availability only while this one indexed read is failing, which is when the candidates
+ * read beside it is failing too, so it adds no new outage class. The failure is logged with
+ * a fixed category and an enumerated type only: never the driver message, a row or an id.
+ * Express 4 does not catch a rejection from an async handler, so every failure mode of the
+ * lookup is converted to `null` here instead of escaping as an unhandled rejection (which
+ * would also leave the request hanging).
  */
 const R1_SESSION_PAGE_SIZE = 1000;
 const R1_SESSION_MAX_PAGES = 50;
@@ -244,25 +253,44 @@ interface LatestAssessmentRow {
   created_at: string;
 }
 
+type R1LookupFailure = 'query_failed' | 'lookup_threw' | 'page_bound_exceeded';
+
+function logR1LookupFailure(errorType: R1LookupFailure): void {
+  candidateLogger.error('db_error', {
+    error_category: 'r1_session_exclusion_lookup',
+    error_type: errorType,
+  });
+}
+
 async function loadR1SessionIds(): Promise<Set<string> | null> {
-  const ids = new Set<string>();
-  for (let page = 0; page < R1_SESSION_MAX_PAGES; page += 1) {
-    const from = page * R1_SESSION_PAGE_SIZE;
-    const { data, error } = await supabase
-      .from('call_sessions')
-      .select('id')
-      .not('interview_round_id', 'is', null)
-      .order('id', { ascending: true })
-      .range(from, from + R1_SESSION_PAGE_SIZE - 1);
-    // PostgREST answers `data: null` only together with an error, so the error is the one
-    // failure signal; an absent list is an empty page.
-    if (error) return null;
-    const rows = (Array.isArray(data) ? data : []) as Array<{ id: string }>;
-    for (const row of rows) ids.add(row.id);
-    if (rows.length < R1_SESSION_PAGE_SIZE) return ids;
+  try {
+    const ids = new Set<string>();
+    for (let page = 0; page < R1_SESSION_MAX_PAGES; page += 1) {
+      const from = page * R1_SESSION_PAGE_SIZE;
+      const { data, error } = await supabase
+        .from('call_sessions')
+        .select('id')
+        .not('interview_round_id', 'is', null)
+        .order('id', { ascending: true })
+        .range(from, from + R1_SESSION_PAGE_SIZE - 1);
+      // PostgREST answers `data: null` only together with an error, so the error is the one
+      // failure signal; an absent list is an empty page.
+      if (error) {
+        logR1LookupFailure('query_failed');
+        return null;
+      }
+      const rows = (Array.isArray(data) ? data : []) as Array<{ id: string }>;
+      for (const row of rows) ids.add(row.id);
+      if (rows.length < R1_SESSION_PAGE_SIZE) return ids;
+    }
+    // More R1 sessions than the bound: the set is incomplete, so it cannot be trusted.
+    logR1LookupFailure('page_bound_exceeded');
+    return null;
+  } catch {
+    // Deliberately not logging the thrown value: it can carry a driver message or a URL.
+    logR1LookupFailure('lookup_threw');
+    return null;
   }
-  // More R1 sessions than the bound: the set is incomplete, so it cannot be trusted.
-  return null;
 }
 
 /** The phone assessments only, or `null` when the R1 session lookup could not be completed. */
