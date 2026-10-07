@@ -159,7 +159,8 @@ describe('GET /api/candidates: R1 assessments are not the latest assessment', ()
     const res = await request(app()).get('/api/candidates').set('Authorization', AUTH);
     expect(res.status).toBe(200);
     expect(res.body[0].latest_recommendation).toBe('reject');
-    expect(rangeCalls).toEqual([
+    // The candidates list also pages ashby_application_links; only the R1 lookup is asserted here.
+    expect(rangeCalls.filter((c) => c.table === 'call_sessions')).toEqual([
       { table: 'call_sessions', from: 0, to: 999 },
       { table: 'call_sessions', from: 1000, to: 1999 },
     ]);
