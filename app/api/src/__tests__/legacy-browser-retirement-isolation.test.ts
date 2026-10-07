@@ -255,7 +255,11 @@ describe('isolation of the retirement switch', () => {
     const laneOwned = files.filter((f) => LANE_OWNED.test(f.path));
     expect(laneOwned.length).toBeGreaterThan(10);
     for (const file of laneOwned) {
-      expect(file.text, file.path).not.toMatch(/legacy-browser-screening|LEGACY_BROWSER/i);
+      // The switch's own identifiers only. The budget estimate's unrelated
+      // `legacy_browser_minutes` column (R1 capacity views) must not trip this.
+      expect(file.text, file.path).not.toMatch(
+        /legacy-browser-screening|LEGACY_BROWSER_SCREENING|legacyBrowserScreening/,
+      );
     }
   });
 
