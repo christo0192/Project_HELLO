@@ -7019,17 +7019,17 @@ paths:
           application/json:
             schema:
               type: object
-              required: [format, recordings, transcript]
+              required: [format, planned_recordings, transcript]
               additionalProperties: false
               properties:
                 format:
                   type: string
                   enum: [html]
-                recordings:
+                planned_recordings:
                   type: integer
                   minimum: 0
                   maximum: 100
-                  description: How many call recordings were embedded in the report.
+                  description: Upper bound of call recordings the report plans to embed (recorded before the file is built; R1 role-play sessions excluded).
                 transcript:
                   type: boolean
                   description: Whether any transcript was included.

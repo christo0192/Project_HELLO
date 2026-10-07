@@ -17,6 +17,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
 import { CandidateButton } from '../design/candidate';
+import { plannedRecordingCount } from '../../lib/candidate-report/collectReportData';
 import { downloadHtmlFile, generateCandidateReport } from '../../lib/candidate-report/generateCandidateReport';
 import type { CandidateDetail, MembershipRole } from '../../types';
 import { progressWords } from '../../lib/candidate-report/progress';
@@ -38,6 +39,8 @@ export function ExportReportButton({ detail, roleTitle, role }: ExportReportButt
   const [status, setStatus] = useState<Status>({ kind: 'idle' });
   const abortRef = useRef<AbortController | null>(null);
   const mounted = useRef(true);
+  // Viewers cannot export (the audit route is interviewer and above, like the old CSV).
+  const canExport = role !== 'viewer';
 
   useEffect(() => {
     mounted.current = true;
@@ -54,6 +57,15 @@ export function ExportReportButton({ detail, roleTitle, role }: ExportReportButt
     abortRef.current = controller;
     setStatus({ kind: 'running', progress: null });
     try {
+      // The audit is a precondition: no record, no file. It states what the
+      // report is planned to contain (an upper bound for recordings, R1
+      // role-play sessions excluded); the file is only built once the server
+      // has accepted it.
+      await api.exportReportAudit(detail.candidate.id, {
+        format: 'html',
+        planned_recordings: plannedRecordingCount(detail.sessions),
+        transcript: detail.sessions.some((s) => s.interview_round_id == null && s.status === 'completed'),
+      });
       const report = await generateCandidateReport({
         detail,
         roleTitle,
@@ -65,16 +77,6 @@ export function ExportReportButton({ detail, roleTitle, role }: ExportReportButt
         },
       });
       downloadHtmlFile(report.html, report.filename);
-      // Fire-and-forget: the file is already saved, so an audit failure never blocks or undoes it.
-      if (typeof api.exportReportAudit === 'function') {
-        Promise.resolve(
-          api.exportReportAudit(detail.candidate.id, {
-            format: 'html',
-            recordings: report.recordings,
-            transcript: report.transcript,
-          }),
-        ).catch(() => {});
-      }
       if (mounted.current) {
         setStatus({ kind: 'done', notes: report.omissions.length, recordings: report.recordings });
       }
@@ -86,6 +88,8 @@ export function ExportReportButton({ detail, roleTitle, role }: ExportReportButt
       });
     }
   }
+
+  if (!canExport) return null;
 
   const running = status.kind === 'running';
   let live = '';

@@ -65,6 +65,20 @@ export function legPlayable(leg: CandidatePhoneAttempt): boolean {
   return leg.recording.state === 'ready' || leg.recording.state === 'processing';
 }
 
+/** The call's recording is known to be gone (not merely absent or still processing). */
+export function legRecordingLost(leg: CandidatePhoneAttempt): boolean {
+  if (legPlayable(leg)) return false;
+  const reason = leg.recording.reason;
+  return (
+    reason === 'recording_failed' ||
+    reason === 'quarantined' ||
+    reason === 'deleted' ||
+    reason === 'revoked' ||
+    // The viewer does not own this audio, so the mint would be refused too.
+    reason === 'access_unavailable'
+  );
+}
+
 /**
  * t = 0 of the leg's file, and whether it is the legacy estimate.
  *
@@ -192,7 +206,10 @@ export function groupTurnsByLeg(
         // turn has its own clock time: place it against the best anchor.
         if (sessionExact !== null && sessionExact > 0) {
           offset = Math.round(Math.max(0, at - sessionExact)) / 1000;
-        } else if (sessionFallback) {
+        } else if (sessionFallback && at >= sessionFallback.ms && !legRecordingLost(legs[legIndex])) {
+          // An ESTIMATE, so only for turns inside the recording's coverage
+          // (not before it started) and never for a call whose recording
+          // failed or was withheld.
           offset = Math.round(Math.max(0, at - sessionFallback.ms)) / 1000;
           derivedApprox.add(legIndex);
         }
@@ -218,7 +235,12 @@ export function groupTurnsByLeg(
             turns.some((t) => t.turn.start_offset_sec != null)
           : derivedApprox.has(legIndex),
       unseekableReason:
-        seekMode === 'leg' && !legPlayable(legs[legIndex]) ? legUnseekableReason(legs[legIndex]) : null,
+        (seekMode === 'leg' && !legPlayable(legs[legIndex])) ||
+        (seekMode === 'session' &&
+          legRecordingLost(legs[legIndex]) &&
+          turns.every((t) => t.turn.start_offset_sec == null))
+          ? legUnseekableReason(legs[legIndex])
+          : null,
     }))
     .filter((g) => g.turns.length > 0);
   if (untimed.length > 0) groups.push({ legIndex: null, turns: untimed, approximate: false, unseekableReason: null });

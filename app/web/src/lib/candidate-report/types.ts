@@ -59,8 +59,10 @@ export interface ReportData {
   generatedAt: Date;
   /** Every scorecard the candidate detail returned, newest first. */
   assessments: Assessment[];
-  /** All sessions, newest first as the API lists them. */
+  /** All screening sessions, newest first as the API lists them (R1 role-play sessions excluded). */
   sessions: ReportSession[];
+  /** R1 sales role-play sessions left out of the report (no transcript, no recording). */
+  r1Sessions?: Session[];
   /** Every call attempt for the candidate (the "call attempts" summary). Null = not loaded. */
   attempts: CandidatePhoneAttempt[] | null;
   /** Ashby pipeline status when the candidate is Ashby-linked and the read succeeded. */

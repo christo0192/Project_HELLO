@@ -279,7 +279,7 @@ exportRouter.post(
     try {
       const candidateId = req.params.candidateId as string;
       const user = req.authUser!;
-      const body = req.body as { format: 'html'; recordings: number; transcript: boolean };
+      const body = req.body as { format: 'html'; planned_recordings: number; transcript: boolean };
 
       const { data: candidate } = await supabase
         .from('candidates')
@@ -299,7 +299,7 @@ exportRouter.post(
         target_id: candidateId,
         result: 'success',
         correlation_id: (req as { correlationId?: string | null }).correlationId ?? null,
-        metadata: { format: body.format, recordings: body.recordings, transcript: body.transcript },
+        metadata: { format: body.format, planned_recordings: body.planned_recordings, transcript: body.transcript },
       });
       if (error) return next(error);
       res.status(204).end();

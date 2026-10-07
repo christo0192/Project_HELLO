@@ -284,15 +284,15 @@ describe('buildReportHtml: omitted sections', () => {
       sessions: [
         makeReportSession({
           transcript: null,
-          transcriptNote: 'Transcript not included: reading transcripts requires admin access.',
+          transcriptNote: 'Transcript not included: the server refused access to it (403).',
         }),
       ],
-      omissions: ['Transcripts are not included: reading transcripts requires admin access.'],
+      omissions: ['Transcripts are not included: the server refused access to it (403).'],
     });
     const html = buildReportHtml(data);
     const text = bodyText(html);
     expect(text).toContain('Not in this report');
-    expect(text).toContain('requires admin access');
+    expect(text).toContain('not included');
     expect(reportIncludesTranscript(data)).toBe(false);
   });
 
@@ -480,5 +480,41 @@ describe('helpers', () => {
       sessions: [makeReportSession({ assessment: V2_ASSESSMENT }), makeReportSession({ assessment: V1_ASSESSMENT })],
     });
     expect(reportAssessments(data).map((a) => a.id)).toEqual(['assess-v2', 'assess-v1']);
+  });
+});
+
+
+describe('buildReportHtml: R1 role-play scores are never the screening score', () => {
+  const r1Assessment = {
+    ...V1_ASSESSMENT,
+    id: 'assess-r1',
+    session_id: 'session-r1',
+    overall_score: 11,
+    recommendation: 'reject',
+    summary: 'R1 ROLEPLAY SUMMARY',
+  } as unknown as Assessment;
+  const screening = { ...V1_ASSESSMENT, id: 'assess-scr', session_id: 'session-1', overall_score: 72 } as unknown as Assessment;
+  const data = makeReportData({
+    // R1 is the newest, as in the real list (newest first).
+    assessments: [r1Assessment, screening],
+    sessions: [
+      makeReportSession({ session: makeSession({ id: 'session-1' }) }),
+      makeReportSession({ session: makeSession({ id: 'session-r1', interview_round_id: 'round-1' }), assessment: r1Assessment }),
+    ],
+  });
+
+  it('excludes the R1 scorecard from the list and says so', () => {
+    expect(reportAssessments(data).map((a) => a.id)).toEqual(['assess-scr']);
+    const html = buildReportHtml(data);
+    expect(bodyText(html)).not.toContain('R1 ROLEPLAY SUMMARY');
+    expect(bodyText(html)).toContain('R1 sales role-play sessions (scorecards, transcripts and recordings) are not included');
+  });
+
+  it('the headline score is the screening one, not the newer R1 result', () => {
+    const doc = parse(buildReportHtml(data));
+    const strip = doc.querySelector('dl.strip')?.textContent ?? '';
+    expect(strip).toContain('72');
+    expect(strip).not.toContain('11');
+    expect(doc.body.textContent).toContain('Latest scorecard');
   });
 });

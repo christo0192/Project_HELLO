@@ -35,13 +35,19 @@ test.describe('export report', () => {
     expect(html).not.toMatch(/https?:\/\//);
     expect(html).not.toMatch(/token|bearer/i);
 
-    // The export is audited once the file is saved (fire-and-forget).
+    // The export is audited BEFORE the file is built (a precondition, not fire-and-forget).
     await expect
       .poll(() => app.calls.filter((c) => /\/api\/export\/[^/]+\/report-audit/.test(c.url)).length)
       .toBe(1);
     // Recordings were minted one after another, never in a burst.
     const mints = app.calls.filter((c) => /\/api\/recordings\/attempts\/[^/]+\/download/.test(c.url));
     expect(mints.length).toBeGreaterThan(0);
+    // Audit first: it precedes the first recording mint.
+    const urls = app.calls.map((c) => c.url);
+    const auditAt = urls.findIndex((u) => /\/report-audit/.test(u));
+    const firstMint = urls.findIndex((u) => /\/api\/recordings\/attempts\/[^/]+\/download/.test(u));
+    expect(auditAt).toBeGreaterThanOrEqual(0);
+    expect(auditAt).toBeLessThan(firstMint);
     await expect(page.getByText(/Report downloaded/)).toBeVisible();
 
     // Open the saved file from disk, as a stakeholder would.

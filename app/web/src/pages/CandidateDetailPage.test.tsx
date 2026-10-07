@@ -1047,7 +1047,7 @@ describe('CandidateDetailPage', () => {
       await waitFor(() =>
         expect(mockApi.exportReportAudit).toHaveBeenCalledWith('candidate-1', {
           format: 'html',
-          recordings: 0,
+          planned_recordings: expect.any(Number),
           transcript: true,
         }),
       );
@@ -1057,6 +1057,13 @@ describe('CandidateDetailPage', () => {
       createObjSpy.mockRestore();
       revokeSpy.mockRestore();
       clickSpy.mockRestore();
+    });
+
+    it('a viewer gets no Export report button (the audit route is interviewer and above)', async () => {
+      mockApi.getMe.mockResolvedValue({ userId: 'u-viewer', email: null, role: 'viewer', active: true });
+      renderDetailPage();
+      await screen.findByRole('heading', { name: /Jane Doe/ });
+      expect(screen.queryByRole('button', { name: 'Export report' })).not.toBeInTheDocument();
     });
 
     it('issues a one-time appeal grant and shows a fragment link', async () => {

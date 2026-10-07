@@ -14,6 +14,7 @@
  *    never copied, so the two surfaces cannot drift apart.
  */
 
+import { latestScreeningAssessment } from '../latest-screening-assessment';
 import type {
   Assessment,
   CandidatePhoneAttempt,
@@ -307,12 +308,28 @@ function scorecardBlock(a: Assessment, index: number, data: ReportData): string 
   );
 }
 
-/** Every scorecard: the candidate's list, plus any session scorecard not in it. */
+/** Ids of the R1 sales role-play sessions: their scores are not screening scores. */
+function r1SessionIds(data: ReportData): Set<string> {
+  const ids = data.sessions.filter((s) => s.session.interview_round_id != null).map((s) => s.session.id);
+  (data.r1Sessions ?? []).forEach((s) => ids.push(s.id));
+  return new Set(ids);
+}
+
+function isR1Assessment(a: Assessment, r1: Set<string>): boolean {
+  return !!a.session_id && r1.has(a.session_id);
+}
+
+/**
+ * Every SCREENING scorecard: the candidate's list, plus any session scorecard
+ * not in it. R1 role-play assessments are left out (the same rule as the page
+ * header's latestScreeningAssessment); the report says so.
+ */
 export function reportAssessments(data: ReportData): Assessment[] {
+  const r1 = r1SessionIds(data);
   const seen = new Set<string>();
   const out: Assessment[] = [];
   const add = (a: Assessment | null | undefined) => {
-    if (!a) return;
+    if (!a || isR1Assessment(a, r1)) return;
     const key = a.id ?? `${assessmentMeta(a).createdAt ?? ''}:${JSON.stringify([a.overall_score, a.recommendation])}`;
     if (seen.has(key)) return;
     seen.add(key);
@@ -489,7 +506,8 @@ function resumeSection(parsed: CandidateResumeFacts | null | undefined): string 
 }
 
 function summaryStrip(data: ReportData, scorecards: Assessment[], recordings: number): string {
-  const latest = scorecards[0] ?? null;
+  // The same selection as the page header, never an R1 role-play score.
+  const latest = latestScreeningAssessment(scorecards, [...data.sessions.map((s) => s.session), ...(data.r1Sessions ?? [])]);
   const blocked = data.candidate.decision_use_blocked_at != null;
   const cells: string[] = [];
   if (!blocked && latest) {
@@ -521,7 +539,14 @@ function scorecardsSection(data: ReportData, scorecards: Assessment[]): string {
   const body = scorecards.length
     ? scorecards.map((a, i) => scorecardBlock(a, i, data)).join('')
     : '<p class="muted">No scorecard has been produced for this candidate yet.</p>';
-  return `<section class="panel" id="scorecards" aria-labelledby="h-score"><h2 id="h-score">Scorecards</h2>${body}</section>`;
+  const r1 = r1SessionIds(data);
+  const r1Note =
+    r1.size > 0 ||
+    data.assessments.some((a) => isR1Assessment(a, r1)) ||
+    data.sessions.some((s) => s.assessment && isR1Assessment(s.assessment, r1))
+      ? '<p class="notice" role="note">R1 sales role-play sessions (scorecards, transcripts and recordings) are not included here; they are not screening material.</p>'
+      : '';
+  return `<section class="panel" id="scorecards" aria-labelledby="h-score"><h2 id="h-score">Scorecards</h2>${r1Note}${body}</section>`;
 }
 
 function attemptsSection(data: ReportData): string {

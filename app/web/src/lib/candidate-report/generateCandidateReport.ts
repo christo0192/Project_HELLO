@@ -14,8 +14,6 @@ export interface GeneratedReport {
   recordings: number;
   /** Whether any transcript made it into the file. */
   transcript: boolean;
-  /** Size of the file in bytes (UTF-8). */
-  bytes: number;
   /** Plain-language notes about anything left out. */
   omissions: string[];
 }
@@ -29,7 +27,6 @@ export async function generateCandidateReport(input: CollectReportInput): Promis
     filename: reportFilename(data.candidate.name, data.candidate.id, data.generatedAt),
     recordings: reportRecordingCount(data),
     transcript: reportIncludesTranscript(data),
-    bytes: new TextEncoder().encode(html).length,
     omissions: data.omissions,
   };
 }

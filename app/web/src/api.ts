@@ -470,7 +470,7 @@ export const api = {
   /** Fire-and-forget audit of a downloaded report: counts and a flag, never content. */
   exportReportAudit: (
     candidateId: string,
-    body: { format: 'html'; recordings: number; transcript: boolean },
+    body: { format: 'html'; planned_recordings: number; transcript: boolean },
   ) =>
     request<void>(`/api/export/${encodeURIComponent(candidateId)}/report-audit`, {
       method: 'POST',

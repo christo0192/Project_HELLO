@@ -181,6 +181,29 @@ describe('sessionLegs', () => {
     expect(groups[1].turns[0].turn.start_offset_sec).toBeNull();
   });
 
+  it('session mode: a call whose recording failed is not seekable and keeps its reason', () => {
+    const failed = { ...A, recording: { state: 'unavailable' as const, reason: 'recording_failed' as const } };
+    const groups = groupTurnsByLeg([turn('x', T0 + 20_000, null), turn('y', T0 + 30_000, null)], [failed], null, 'session');
+    expect(groups[0].turns.every((t) => t.turn.start_offset_sec === null)).toBe(true);
+    expect(groups[0].unseekableReason).toBe('Recording failed for this call, so its turns cannot start playback.');
+    expect(groups[0].approximate).toBe(false);
+  });
+
+  it('session mode: a call the viewer cannot access (access_unavailable) is not seekable and says why', () => {
+    const noAccess = { ...A, recording: { state: 'unavailable' as const, reason: 'access_unavailable' as const } };
+    const groups = groupTurnsByLeg([turn('x', T0 + 20_000, null)], [noAccess], null, 'session');
+    expect(groups[0].turns[0].turn.start_offset_sec).toBeNull();
+    expect(groups[0].unseekableReason).not.toBeNull();
+    expect(groups[0].approximate).toBe(false);
+  });
+
+  it('session mode: no fallback offset for a turn before the recording started', () => {
+    const dead = { ...A, recording: { state: 'unavailable' as const, reason: 'no_recording' as const } };
+    // answered_at + 1 s = T0 + 11 s; a turn at T0 + 2 s is outside the coverage.
+    const groups = groupTurnsByLeg([turn('early', T0 + 2_000, null)], [dead], null, 'session');
+    expect(groups[0].turns[0].turn.start_offset_sec).toBeNull();
+  });
+
   it('session mode keeps an exact API offset over a derived one', () => {
     const [g] = groupTurnsByLeg([turn('x', T0 + 20_000, 4)], [A], null, 'session');
     expect(g.turns[0].turn.start_offset_sec).toBe(4);

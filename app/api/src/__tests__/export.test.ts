@@ -471,7 +471,7 @@ describe('lib/export-csv — safe filename', () => {
 });
 
 describe('POST /api/export/:candidateId/report-audit', () => {
-  const BODY = { format: 'html', recordings: 3, transcript: true };
+  const BODY = { format: 'html', planned_recordings: 3, transcript: true };
   const url = `/api/export/${CANDIDATE_ID}/report-audit`;
 
   it('401 without auth', async () => {
@@ -498,8 +498,9 @@ describe('POST /api/export/:candidateId/report-audit', () => {
     for (const bad of [
       { ...BODY, extra: 'x' },
       { ...BODY, format: 'pdf' },
-      { ...BODY, recordings: -1 },
-      { ...BODY, recordings: 101 },
+      { ...BODY, planned_recordings: -1 },
+      { ...BODY, planned_recordings: 101 },
+      { format: 'html', recordings: 3, transcript: true },
       { ...BODY, transcript: 'yes' },
       {},
     ]) {
@@ -536,7 +537,7 @@ describe('POST /api/export/:candidateId/report-audit', () => {
       target_type: 'candidate',
       target_id: CANDIDATE_ID,
       result: 'success',
-      metadata: { format: 'html', recordings: 3, transcript: true },
+      metadata: { format: 'html', planned_recordings: 3, transcript: true },
     });
   });
 
@@ -547,8 +548,8 @@ describe('POST /api/export/:candidateId/report-audit', () => {
     const res = await request(makeApp(makeUser('admin')))
       .post(url)
       .set(AUTH)
-      .send({ format: 'html', recordings: 0, transcript: false });
+      .send({ format: 'html', planned_recordings: 0, transcript: false });
     expect(res.status).toBe(204);
-    expect(inserted[0][0].metadata).toEqual({ format: 'html', recordings: 0, transcript: false });
+    expect(inserted[0][0].metadata).toEqual({ format: 'html', planned_recordings: 0, transcript: false });
   });
 });

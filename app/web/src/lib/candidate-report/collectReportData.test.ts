@@ -5,6 +5,7 @@ import {
   MAX_RECORDINGS,
   collectReportData,
   mintFailureReason,
+  plannedRecordingCount,
 } from './collectReportData';
 import type { ReportApi } from './collectReportData';
 import { generateCandidateReport } from './generateCandidateReport';
@@ -214,8 +215,8 @@ describe('collectReportData: never fails the whole export for one item', () => {
     const { api } = makeApi({ getSession: vi.fn(async () => { throw new ApiError('Insufficient permissions', 403); }) });
     const data = await collectReportData({ detail: detailOf(), roleTitle: null, role: 'interviewer', api, fetchAudio: fetchOk });
     expect(data.sessions[0].transcript).toBeNull();
-    expect(data.sessions[0].transcriptNote).toContain('requires admin access');
-    expect(data.omissions.join(' ')).toContain('requires admin access');
+    expect(data.sessions[0].transcriptNote).toContain('refused');
+    expect(data.omissions.join(' ')).toContain('refused');
     expect(data.sessions[0].legAudio['leg-1'].kind).toBe('embedded');
     expect(data.generatedByRole).toBe('interviewer');
   });
@@ -302,8 +303,36 @@ describe('generateCandidateReport', () => {
     expect(report.filename).toBe('screening-report-shrinidhi-handigund-2026-10-07.html');
     expect(report.recordings).toBe(2);
     expect(report.transcript).toBe(true);
-    expect(report.bytes).toBeGreaterThan(1000);
+    expect(report.html.length).toBeGreaterThan(1000);
+    expect('bytes' in report).toBe(false);
     expect((report.html.match(/<audio /g) ?? []).length).toBe(2);
     expect(report.html).not.toContain('SECRET');
+  });
+});
+
+describe('collectReportData: R1 role-play sessions are left out', () => {
+  const r1 = makeSession({ id: 'session-r1', interview_round_id: 'round-1', mode: 'browser' });
+
+  it('does not load the transcript, legs or recording of an R1 session, and keeps it out of the plan', async () => {
+    const { api, order } = makeApi();
+    const data = await collectReportData({
+      detail: detailOf([r1, makeSession()]),
+      roleTitle: 'Role',
+      role: 'admin',
+      api,
+      fetchAudio: fetchOk,
+    });
+    expect(data.sessions.map((s) => s.session.id)).toEqual(['session-1']);
+    expect(data.r1Sessions?.map((s) => s.id)).toEqual(['session-r1']);
+    expect(api.getSession).not.toHaveBeenCalledWith('session-r1');
+    expect(order.some((o) => o.includes('session-r1'))).toBe(false);
+    expect(order).toEqual(['leg:leg-1', 'leg:leg-2']);
+  });
+
+  it('plannedRecordingCount ignores R1, unfinished and simulation sessions and caps at 15', () => {
+    const many = Array.from({ length: 20 }, (_, i) => makeSession({ id: `s-${i}` }));
+    expect(plannedRecordingCount([r1, makeSession(), makeSession({ status: 'abandoned' }), makeSession({ mode: 'simulation' })])).toBe(1);
+    expect(plannedRecordingCount([r1])).toBe(0);
+    expect(plannedRecordingCount(many)).toBe(MAX_RECORDINGS);
   });
 });

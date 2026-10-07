@@ -9,8 +9,8 @@
  *    on every mint), at most `MAX_RECORDINGS` per report;
  *  - a 409 (processing or quarantined), 403, 404 or 429 on one recording
  *    leaves a note for THAT recording and the export carries on;
- *  - what a non-admin cannot read (the per-session transcript is admin-only on
- *    the server) is left out and said so, never silently;
+ *  - anything the server refuses with a 403 (a transcript, say) is left out and
+ *    said so, never silently;
  *  - the minted URL lives only in a local variable: it is fetched and dropped,
  *    never stored, never written into the report.
  */
@@ -23,6 +23,7 @@ import type {
   CandidatePhoneAttemptsResponse,
   MembershipRole,
   RecordingDownloadResponse,
+  Session,
   SessionDetail,
 } from '../../types';
 import { fetchAudioBase64 } from './fetchAudio';
@@ -127,6 +128,24 @@ async function fetchAllAttempts(
   return all;
 }
 
+/** An R1 sales role-play session: not part of the screening report. */
+export function isR1Session(session: Session): boolean {
+  return session.interview_round_id != null;
+}
+
+/**
+ * Upper bound of the recordings a report will embed, known before anything is
+ * fetched: one per completed, non-simulation, non-R1 session (a session with
+ * several playable legs can add more), capped at MAX_RECORDINGS. Used as the
+ * audit's `planned_recordings`.
+ */
+export function plannedRecordingCount(sessions: readonly Session[]): number {
+  const eligible = sessions.filter(
+    (s) => !isR1Session(s) && s.status === 'completed' && s.mode !== 'simulation',
+  ).length;
+  return Math.min(MAX_RECORDINGS, eligible);
+}
+
 export async function collectReportData(input: CollectReportInput): Promise<ReportData> {
   const { detail, api, signal } = input;
   const includeAudio = input.includeAudio !== false;
@@ -143,7 +162,8 @@ export async function collectReportData(input: CollectReportInput): Promise<Repo
   const sessions: ReportSession[] = [];
   let transcriptDenied = false;
   let transcriptFailed = false;
-  for (const session of detail.sessions) {
+  const r1Sessions = detail.sessions.filter(isR1Session);
+  for (const session of detail.sessions.filter((s) => !isR1Session(s))) {
     throwIfAborted(signal);
     const rs: ReportSession = {
       session,
@@ -166,7 +186,7 @@ export async function collectReportData(input: CollectReportInput): Promise<Repo
       } catch (error) {
         if (statusOf(error) === 403) {
           transcriptDenied = true;
-          rs.transcriptNote = 'Transcript not included: reading transcripts requires admin access.';
+          rs.transcriptNote = 'Transcript not included: the server refused access to it (403).';
         } else {
           transcriptFailed = true;
           rs.transcriptNote = 'Transcript could not be loaded for this session.';
@@ -183,7 +203,7 @@ export async function collectReportData(input: CollectReportInput): Promise<Repo
     sessions.push(rs);
   }
   if (transcriptDenied) {
-    omissions.push('Transcripts are not included: reading transcripts requires admin access. Ask an admin to export if you need them.');
+    omissions.push('Transcripts are not included: the server refused to share them with your access (403).');
   }
   if (transcriptFailed) omissions.push('One or more transcripts could not be loaded.');
 
@@ -311,6 +331,7 @@ export async function collectReportData(input: CollectReportInput): Promise<Repo
     generatedAt: now(),
     assessments: detail.assessments,
     sessions,
+    r1Sessions,
     attempts,
     ashby,
     omissions,

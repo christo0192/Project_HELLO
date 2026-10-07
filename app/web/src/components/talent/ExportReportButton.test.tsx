@@ -28,7 +28,10 @@ import { progressWords } from '../../lib/candidate-report/progress';
 
 const detail = {
   candidate: { id: 'cand-1', name: 'Jane' },
-  sessions: [],
+  sessions: [
+    { id: 's1', status: 'completed', mode: 'live' },
+    { id: 's-r1', status: 'completed', mode: 'browser', interview_round_id: 'round-1' },
+  ],
   assessments: [],
 } as unknown as CandidateDetail;
 
@@ -38,7 +41,6 @@ function report(overrides: Partial<GeneratedReport> = {}): GeneratedReport {
     filename: 'screening-report-jane-2026-10-07.html',
     recordings: 2,
     transcript: true,
-    bytes: 10,
     omissions: [],
     ...overrides,
   };
@@ -87,7 +89,7 @@ describe('ExportReportButton', () => {
 
     await act(async () => finish(report()));
     await waitFor(() => expect(download).toHaveBeenCalledWith('<!doctype html>', 'screening-report-jane-2026-10-07.html'));
-    expect(audit).toHaveBeenCalledWith('cand-1', { format: 'html', recordings: 2, transcript: true });
+    expect(audit).toHaveBeenCalledWith('cand-1', { format: 'html', planned_recordings: 1, transcript: true });
     expect(await screen.findByText('Report downloaded with recordings.')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Export report' })).toBeEnabled();
   });
@@ -103,14 +105,29 @@ describe('ExportReportButton', () => {
     expect(input.signal).toBeInstanceOf(AbortSignal);
   });
 
-  it('a failing audit never blocks or undoes the download', async () => {
-    generate.mockResolvedValue(report({ omissions: ['A recording could not be included.'] }));
+  it('records the audit BEFORE building the file; a failing audit produces no file and shows an error', async () => {
     audit.mockRejectedValue(new Error('audit down'));
     renderButton();
     fireEvent.click(screen.getByRole('button', { name: 'Export report' }));
+    expect(await screen.findByRole('alert')).toBeInTheDocument();
+    expect(generate).not.toHaveBeenCalled();
+    expect(download).not.toHaveBeenCalled();
+  });
+
+  it('audits first (planned contents), then generates and downloads', async () => {
+    const order: string[] = [];
+    audit.mockImplementation(async () => { order.push('audit'); });
+    generate.mockImplementation(async () => { order.push('generate'); return report(); });
+    renderButton();
+    fireEvent.click(screen.getByRole('button', { name: 'Export report' }));
     await waitFor(() => expect(download).toHaveBeenCalled());
-    expect(await screen.findByText(/Report downloaded\. Some items are marked as not included/)).toBeInTheDocument();
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    expect(order).toEqual(['audit', 'generate']);
+    expect(audit).toHaveBeenCalledWith('cand-1', { format: 'html', planned_recordings: 1, transcript: true });
+  });
+
+  it('renders nothing for a viewer (the audit route is interviewer and above)', () => {
+    render(<ExportReportButton detail={detail} roleTitle="Role" role="viewer" />);
+    expect(screen.queryByRole('button', { name: 'Export report' })).not.toBeInTheDocument();
   });
 
   it('reports a failure in an alert, downloads nothing, and can be retried', async () => {
@@ -119,7 +136,6 @@ describe('ExportReportButton', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Export report' }));
     expect(await screen.findByRole('alert')).toHaveTextContent('Could not build the report. Try again.');
     expect(download).not.toHaveBeenCalled();
-    expect(audit).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: 'Export report' })).toBeEnabled();
 
     generate.mockResolvedValueOnce(report({ recordings: 0 }));

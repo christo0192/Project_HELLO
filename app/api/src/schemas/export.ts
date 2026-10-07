@@ -13,7 +13,7 @@ export const exportCandidateParamSchema = z.object({ candidateId: uuidSchema }).
 export const exportReportAuditBodySchema = z
   .object({
     format: z.literal('html'),
-    recordings: z.number().int().min(0).max(100),
+    planned_recordings: z.number().int().min(0).max(100),
     transcript: z.boolean(),
   })
   .strict();
