@@ -363,6 +363,8 @@ export interface Session {
   role_id: string | null;
   status: string;
   done?: boolean;
+  /** Set on an R1 (WebRTC sales role-play) round's session; null/absent for a phone screening. */
+  interview_round_id?: string | null;
   mode?: string;                 // "browser" (web voice) | "live" (telephony) | "simulation"
   /** @deprecated MIG-03/04/05 — use getRecordingDownloadUrl() for on-demand signed URL. */
   recording_url?: string | null;
@@ -508,6 +510,9 @@ export interface CommunicationScore extends SimpleScore {
 
 export interface Assessment {
   id?: string;
+  /** The `assessments` rows ride `select('*')`: the session it scored and when. */
+  session_id?: string | null;
+  created_at?: string | null;
   english?: EnglishScore;
   tone: ToneScore;
   communication?: CommunicationScore;

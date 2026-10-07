@@ -257,7 +257,7 @@ export const KEY_STATES: KeyState[] = [
     name: 'candidate-attempt-recording-player',
     fullPage: false,
     async run(app) {
-      await app.goto(`/candidates/${STAR_CANDIDATE_ID}`);
+      await app.goto(`/candidates/${STAR_CANDIDATE_ID}?tab=overview`);
       const history = app.page.getByRole('region', { name: 'Call attempts' });
       const row = history.getByRole('listitem').filter({ hasText: 'Attempt 2' });
       await expect(row.getByText('Recorded before consent')).toBeVisible();

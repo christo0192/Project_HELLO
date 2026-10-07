@@ -37,7 +37,7 @@ import type {
   ScorecardMetricTemplate,
 } from '../../src/types';
 import type { R1SettingsResponse, R1UsageResponse } from '../../src/lib/r1-types';
-import { ADMIN_USER_ID, PHONE_WINDOW, SCOPED_REVIEW_LINK_ID, STAR_CANDIDATE_ID, funnelSummary, phoneSlots, type Dataset } from './data';
+import { ADMIN_USER_ID, PHONE_WINDOW, SCOPED_REVIEW_LINK_ID, SEEK_ATTEMPT_IDS, STAR_CANDIDATE_ID, funnelSummary, phoneSlots, type Dataset } from './data';
 import { FROZEN_NOW_MS } from './env';
 
 export interface MockRequest {
@@ -86,6 +86,29 @@ const SILENT_WAV = (() => {
   buf.writeUInt16LE(16, 34);
   buf.write('data', 36);
   buf.writeUInt32LE(samples * 2, 40);
+  return `data:audio/wav;base64,${buf.toString('base64')}`;
+})();
+
+/**
+ * A 130 s silent WAV (8 kHz, 8-bit), long enough for the click-to-seek e2e
+ * to land a playhead at a turn offset (the short clip would clamp every seek
+ * to 0.2 s). Served only for the seek fixtures' recordings.
+ */
+const LONG_SILENT_WAV = (() => {
+  const samples = 8000 * 130;
+  const buf = Buffer.alloc(44 + samples, 128);
+  buf.write('RIFF', 0);
+  buf.writeUInt32LE(36 + samples, 4);
+  buf.write('WAVEfmt ', 8);
+  buf.writeUInt32LE(16, 16);
+  buf.writeUInt16LE(1, 20);
+  buf.writeUInt16LE(1, 22);
+  buf.writeUInt32LE(8000, 24);
+  buf.writeUInt32LE(8000, 28);
+  buf.writeUInt16LE(1, 32);
+  buf.writeUInt16LE(8, 34);
+  buf.write('data', 36);
+  buf.writeUInt32LE(samples, 40);
   return `data:audio/wav;base64,${buf.toString('base64')}`;
 })();
 
@@ -284,7 +307,7 @@ const ROUTES: Array<[string, string, Handler]> = [
     const assessment: Assessment | null = db.sessionDetails[params.id]?.assessment ?? null;
     return assessment ? ok(assessment) : notFound('assessment');
   }],
-  ['GET', '/api/recordings/attempts/:id/download', () => ok({ url: SILENT_WAV, content_type: 'audio/wav' })],
+  ['GET', '/api/recordings/attempts/:id/download', ({ params }) => ok({ url: SEEK_ATTEMPT_IDS.includes(params.id) ? LONG_SILENT_WAV : SILENT_WAV, content_type: 'audio/wav' })],
   ['GET', '/api/recordings/:id/download', () => ok({ url: SILENT_WAV, content_type: 'audio/wav' })],
 
   // ── LiveKit browser screening (candidate + recruiter "call now") ───
@@ -320,7 +343,8 @@ const ROUTES: Array<[string, string, Handler]> = [
     return ok({ ok: true, from, to: c.status });
   }],
   ['GET', '/api/notifications', (_r, db) => ok({ intents: db.intents })],
-  ['GET', '/api/export/:id/csv', ({ params }) => ({ status: 200, contentType: 'text/csv', text: `candidate_id,metric,score\n${params.id},communication_clarity,4\n` })],
+  // The stakeholder report is built in the browser; this only audits that it was (counts, no content).
+  ['POST', '/api/export/:id/report-audit', () => ({ status: 204 })],
   ['GET', '/api/appeals', ({ query }, db) => ok({ appeals: db.appeals.filter((a) => a.candidate_id === query.get('candidate_id')) })],
   ['POST', '/api/appeals/grants', () => ok({ appeal_grant_token: 'e2e-appeal-grant', expires_at: new Date(FROZEN_NOW_MS + 72 * 3_600_000).toISOString() })],
   ['POST', '/api/appeals', () => ok({ ok: true, appeal_id: mintId() })],

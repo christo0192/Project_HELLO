@@ -33,6 +33,7 @@ import {
   CandidateShell,
   DecisionBlockedBanner,
   NotesList,
+  HeaderScore,
   PhoneAttemptHistory,
   SessionsSummary,
   Tabs,
@@ -51,6 +52,7 @@ import {
   isAppealPending,
 } from "../components/talent/status";
 import { CandidateHeadlineFacts } from "../components/talent/CandidateHeadlineFacts";
+import { ExportReportButton } from "../components/talent/ExportReportButton";
 import { headlineCallFacts } from "../components/talent/sessionLegs";
 import { evidenceHoldReason, isEvidenceInsufficient } from "../lib/evidence-hold";
 import {
@@ -71,16 +73,17 @@ import type { PhoneSlot } from "../types";
 /**
  * HELLO Lane 3 — CandidateDetail as one recruiter review workspace.
  *
- * Two tabs:
- *   - Overview: identity/profile, live screening actions, session summary,
- *     append-only notes, and appeals + one-time grant links.
+ * Two tabs, Review first (it is the high-priority one):
  *   - Review: the single authoritative review workspace — session context,
  *     one recording player, synchronized transcript, and the session's
  *     scorecard (TranscriptionSyncWorkspace). This replaces the previously
  *     duplicated Sessions-tab audio, Recordings tab, and Overview scorecard.
+ *   - Overview: identity/profile, live screening actions, call attempts and
+ *     screening sessions, the Ashby pipeline, append-only notes, and appeals
+ *     + one-time grant links.
  *
  * Preserved behavior: decision-use block banner + scorecard suppression,
- * LiveKit invite + live call panel, ownership-scoped CSV export, append-only
+ * LiveKit invite + live call panel, stakeholder report export, append-only
  * notes, appeals + fragment-only grant links, on-demand (never auto-fetched)
  * short-lived recording playback.
  *
@@ -93,11 +96,24 @@ import type { PhoneSlot } from "../types";
  *   - otherwise             → no primary; the status says what is happening
  * Export is the secondary beside it.
  *
- * The open tab is in the URL (`?tab=review`), so the Candidates table's
- * "Review & decide" lands on the Review tab and a reload keeps the place.
+ * The latest screening score sits top right of the header (HeaderScore).
+ *
+ * The open tab is in the URL (`?tab=review` / `?tab=overview`), so the
+ * Candidates table's "Review & decide" lands on the Review tab and a reload
+ * keeps the place. With no `tab` param the page opens on Review when there is
+ * something to review, and on Overview otherwise (that is where the call
+ * actions live, and an empty Review workspace is not worth landing on).
  */
 
 type CandidateTab = "overview" | "review";
+
+/** Something to review: an assessment, or a completed session (transcript, recording). */
+function hasReviewable(d: Pick<CandidateDetail, "assessments" | "sessions"> | null): boolean {
+  return (
+    d !== null
+    && (d.assessments.length > 0 || d.sessions.some((session) => session.status === "completed"))
+  );
+}
 
 export function CandidateDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -106,14 +122,20 @@ export function CandidateDetailPage() {
   const [error, setError] = useState<string | null>(null);
 
   const [searchParams, setSearchParams] = useSearchParams();
-  const tab: CandidateTab = searchParams.get("tab") === "review" ? "review" : "overview";
+  // The tab a bare link lands on, decided ONCE per load. Re-deciding on a
+  // silent refresh would yank the reader from Overview to Review the moment a
+  // live call finishes under them.
+  const [defaultTab, setDefaultTab] = useState<CandidateTab>("review");
+  const tabParam = searchParams.get("tab");
+  const tab: CandidateTab =
+    tabParam === "review" || tabParam === "overview" ? tabParam : defaultTab;
   const selectTab = useCallback(
     (next: string) => {
       setSearchParams(
         (prev) => {
           const params = new URLSearchParams(prev);
-          if (next === "review") params.set("tab", "review");
-          else params.delete("tab");
+          // Explicit both ways: a reload (or a refreshed default) keeps the place.
+          params.set("tab", next === "overview" ? "overview" : "review");
           return params;
         },
         // Switching tabs is not a navigation: Back leaves the candidate.
@@ -175,6 +197,7 @@ export function CandidateDetailPage() {
       .catch(() => fallbackMe);
     Promise.all([api.getCandidate(id), meRequest])
       .then(([d, currentMe]) => {
+        setDefaultTab(hasReviewable(d) ? "review" : "overview");
         setDetail(d);
         setMe(currentMe);
       })
@@ -294,8 +317,7 @@ export function CandidateDetailPage() {
    * or an assessment. The Review tab renders either; without both it only
    * says there is nothing yet, which is not worth a primary action.
    */
-  const reviewable =
-    assessments.length > 0 || sessions.some((session) => session.status === "completed");
+  const reviewable = hasReviewable(detail);
 
   let primaryAction: ReactNode = null;
   if (reviewable) {
@@ -373,9 +395,16 @@ export function CandidateDetailPage() {
         }
         actions={
           <>
-            <CsvExportButton candidateId={candidate.id} />
+            <ExportReportButton detail={detail} roleTitle={roleTitle} role={me.role} />
             {primaryAction}
           </>
+        }
+        // The score is the page's most important number: top right, under
+        // the actions, hidden while an appeal blocks decision use.
+        aside={
+          decisionBlocked ? undefined : (
+            <HeaderScore assessments={assessments} sessions={sessions} />
+          )
         }
       />
 
@@ -387,27 +416,6 @@ export function CandidateDetailPage() {
           selectedId={tab}
           onSelect={selectTab}
           items={[
-            {
-              id: "overview",
-              label: "Overview",
-              panel: (
-                <OverviewTab
-                  candidate={candidate}
-                  sessions={sessions}
-                  phoneRole={me.role}
-                  viewerId={me.userId}
-                  legacyBrowserScreening={me.legacyBrowserScreeningEnabled !== false}
-                  phoneAttempts={phoneAttempts}
-                  showPhoneAttempts={tab === "overview"}
-                  onSessionCompleted={refresh}
-                  callInHeader={!reviewable}
-                  callRequest={callRequest}
-                  headerCallRef={headerCallRef}
-                  onCallAvailableChange={setCallAvailable}
-                  rescreenRecommendation={rescreenRecommended ? evidenceHoldReason(latestAssessment!) : null}
-                />
-              ),
-            },
             {
               id: "review",
               label: "Review",
@@ -434,6 +442,27 @@ export function CandidateDetailPage() {
                       />
                     ) : null
                   }
+                />
+              ),
+            },
+            {
+              id: "overview",
+              label: "Overview",
+              panel: (
+                <OverviewTab
+                  candidate={candidate}
+                  sessions={sessions}
+                  phoneRole={me.role}
+                  viewerId={me.userId}
+                  legacyBrowserScreening={me.legacyBrowserScreeningEnabled !== false}
+                  phoneAttempts={phoneAttempts}
+                  showPhoneAttempts={tab === "overview"}
+                  onSessionCompleted={refresh}
+                  callInHeader={!reviewable}
+                  callRequest={callRequest}
+                  headerCallRef={headerCallRef}
+                  onCallAvailableChange={setCallAvailable}
+                  rescreenRecommendation={rescreenRecommended ? evidenceHoldReason(latestAssessment!) : null}
                 />
               ),
             },
@@ -563,20 +592,16 @@ function OverviewTab({
     // not import a motion library, and this collapses with every other
     // animation under the global reduced-motion rule in index.css.
     //
-    // Two columns, not one short card beside a six-card stack. The reference
-    // material — profile, session history, notes — is a sticky left rail that
-    // stays put while the operator works; the acting surfaces — the two call
-    // cards, the phone cycle, the Ashby pipeline, appeals — own the wide
-    // column. Below `lg` this is one ordinary stack, reference first.
+    // Two columns, not one short card beside a six-card stack. The slim left
+    // rail holds who the person is (profile) and the notes; the wide column
+    // holds the acting surfaces and the evidence behind them, top to bottom:
+    // the call cards, the phone cycle, R1, call attempts + screening sessions,
+    // the Ashby pipeline, appeals. Below `lg` it is one stack with the wide
+    // column first. The rail is deliberately NOT sticky: notes grow, and a
+    // sticky box taller than the viewport cannot be scrolled to its end.
     <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
       <div className="order-2 space-y-4 lg:order-1 lg:col-span-4">
         <CandidateProfileCard candidate={candidate} className="p-4 sm:p-5" />
-
-        <SessionsSummary sessions={sessions} />
-
-        {showPhoneAttempts && (
-          <PhoneAttemptHistory candidateId={candidate.id} role={phoneRole} source={phoneAttempts} />
-        )}
 
         <NotesSection candidateId={candidate.id} />
       </div>
@@ -638,6 +663,30 @@ function OverviewTab({
           role={phoneRole}
           userId={viewerId || null}
         />
+
+        {/* Call attempts and screening sessions: side by side from `xl`, where
+            the wide column is ~700px (two ~340px cards), stacked below that.
+            Equal-height cards (`h-full`) so the pair shares one bottom edge;
+            each long list scrolls inside its own card (boundList), so the pair
+            never stretches the column. Same edges and rhythm as its siblings. */}
+        <div
+          data-overview-evidence=""
+          className="grid grid-cols-1 gap-4 sm:gap-6 xl:grid-cols-2 xl:items-stretch"
+        >
+          {showPhoneAttempts && (
+            <div className="min-w-0 [&>*]:h-full">
+              <PhoneAttemptHistory
+                candidateId={candidate.id}
+                role={phoneRole}
+                source={phoneAttempts}
+                className="h-full p-4 sm:p-5"
+              />
+            </div>
+          )}
+          <div className="min-w-0 [&>*]:h-full">
+            <SessionsSummary sessions={sessions} className="h-full p-4 sm:p-5" />
+          </div>
+        </div>
 
         {/* Read-only Ashby pipeline status. Renders nothing for a candidate
             with no Ashby application link. */}
@@ -1458,54 +1507,5 @@ function AppealsSection({
         )}
       </SurfaceCard>
     </SurfaceCard>
-  );
-}
-
-/* ── CSV export ─────────────────────────────────────────────────────── */
-
-function CsvExportButton({ candidateId }: { candidateId: string }) {
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  async function download() {
-    setBusy(true);
-    setErr(null);
-    try {
-      const csv = await api.exportCsv(candidateId);
-      const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `screening-export-${candidateId}.csv`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      setErr(e instanceof ApiError ? e.message : "Failed to export CSV.");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  // Secondary beside the header's primary. The label says what the file IS
-  // (a CSV) in two words; what is in it is the tooltip, not a sentence on a
-  // button (it used to read "Export screening data (scorecard + transcript)").
-  return (
-    <div className="flex flex-col items-start gap-1">
-      <CandidateButton
-        variant="secondary"
-        onClick={() => void download()}
-        loading={busy}
-        title="Download the scorecard and transcript as a CSV file"
-      >
-        Export CSV
-      </CandidateButton>
-      {err && (
-        <p role="alert" className="max-w-xs text-xs text-error-text">
-          {err}
-        </p>
-      )}
-    </div>
   );
 }

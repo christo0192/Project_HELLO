@@ -469,3 +469,87 @@ describe('lib/export-csv — safe filename', () => {
     expect(/^screening-export-[0-9a-f-]{36}\.csv$/.test(csvFilename(CANDIDATE_ID))).toBe(true);
   });
 });
+
+describe('POST /api/export/:candidateId/report-audit', () => {
+  const BODY = { format: 'html', planned_recordings: 3, transcript: true };
+  const url = `/api/export/${CANDIDATE_ID}/report-audit`;
+
+  it('401 without auth', async () => {
+    const res = await request(makeApp(makeUser('admin'))).post(url).send(BODY);
+    expect(res.status).toBe(401);
+  });
+
+  it('viewer is denied (403) and nothing is written', async () => {
+    const res = await request(makeApp(makeUser('viewer', { aal: 'aal1' }))).post(url).set(AUTH).send(BODY);
+    expect(res.status).toBe(403);
+    expect(inserted).toHaveLength(0);
+  });
+
+  it('400 on a non-UUID candidate id', async () => {
+    const res = await request(makeApp(makeUser('interviewer')))
+      .post('/api/export/not-a-uuid/report-audit')
+      .set(AUTH)
+      .send(BODY);
+    expect(res.status).toBe(400);
+  });
+
+  it('400 on an invalid body (unknown key, wrong format, out-of-range count)', async () => {
+    const app = makeApp(makeUser('admin'));
+    for (const bad of [
+      { ...BODY, extra: 'x' },
+      { ...BODY, format: 'pdf' },
+      { ...BODY, planned_recordings: -1 },
+      { ...BODY, planned_recordings: 101 },
+      { format: 'html', recordings: 3, transcript: true },
+      { ...BODY, transcript: 'yes' },
+      {},
+    ]) {
+      const res = await request(app).post(url).set(AUTH).send(bad);
+      expect(res.status).toBe(400);
+    }
+    expect(inserted).toHaveLength(0);
+  });
+
+  it('unknown candidate -> 404', async () => {
+    mockFrom.mockReturnValueOnce(chainable({ data: null, error: null }));
+    const res = await request(makeApp(makeUser('interviewer'))).post(url).set(AUTH).send(BODY);
+    expect(res.status).toBe(404);
+    expect(inserted).toHaveLength(0);
+  });
+
+  it('non-owner interviewer -> 403 and nothing is written', async () => {
+    mockFrom.mockReturnValueOnce(chainable({ data: { owner_id: OTHER_RECRUITER_ID }, error: null }));
+    const res = await request(makeApp(makeUser('interviewer'))).post(url).set(AUTH).send(BODY);
+    expect(res.status).toBe(403);
+    expect(inserted).toHaveLength(0);
+  });
+
+  it('owner interviewer -> 204 with an export_completed row carrying counts only', async () => {
+    mockFrom
+      .mockReturnValueOnce(chainable({ data: { owner_id: RECRUITER_ID }, error: null }))
+      .mockReturnValueOnce(chainable({ data: null, error: null }));
+    const res = await request(makeApp(makeUser('interviewer'))).post(url).set(AUTH).send(BODY);
+    expect(res.status).toBe(204);
+    expect(inserted).toHaveLength(1);
+    expect(inserted[0][0]).toMatchObject({
+      actor_id: RECRUITER_ID,
+      action: 'export_completed',
+      target_type: 'candidate',
+      target_id: CANDIDATE_ID,
+      result: 'success',
+      metadata: { format: 'html', planned_recordings: 3, transcript: true },
+    });
+  });
+
+  it('admin may audit any candidate', async () => {
+    mockFrom
+      .mockReturnValueOnce(chainable({ data: { owner_id: OTHER_RECRUITER_ID }, error: null }))
+      .mockReturnValueOnce(chainable({ data: null, error: null }));
+    const res = await request(makeApp(makeUser('admin')))
+      .post(url)
+      .set(AUTH)
+      .send({ format: 'html', planned_recordings: 0, transcript: false });
+    expect(res.status).toBe(204);
+    expect(inserted[0][0].metadata).toEqual({ format: 'html', planned_recordings: 0, transcript: false });
+  });
+});

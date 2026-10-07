@@ -65,6 +65,20 @@ export function legPlayable(leg: CandidatePhoneAttempt): boolean {
   return leg.recording.state === 'ready' || leg.recording.state === 'processing';
 }
 
+/** The call's recording is known to be gone (not merely absent or still processing). */
+export function legRecordingLost(leg: CandidatePhoneAttempt): boolean {
+  if (legPlayable(leg)) return false;
+  const reason = leg.recording.reason;
+  return (
+    reason === 'recording_failed' ||
+    reason === 'quarantined' ||
+    reason === 'deleted' ||
+    reason === 'revoked' ||
+    // The viewer does not own this audio, so the mint would be refused too.
+    reason === 'access_unavailable'
+  );
+}
+
 /**
  * t = 0 of the leg's file, and whether it is the legacy estimate.
  *
@@ -112,6 +126,14 @@ export interface LegTurn {
   index: number;
   /** `start_offset_sec` re-based on the seek target's file; null = cannot seek. */
   turn: TranscriptLine;
+  /**
+   * The turn's own start, seconds into ITS CALL (from when the call connected),
+   * even when the call's recording cannot be played. null when the turn or the
+   * call start is unknown. Display only: never a seek target.
+   */
+  callSec?: number | null;
+  /** The turn's absolute start (epoch ms), for a clock-time fallback. */
+  atMs?: number | null;
 }
 
 export interface LegGroup {
@@ -120,6 +142,11 @@ export interface LegGroup {
   turns: LegTurn[];
   /** Offsets are the legacy `answered_at + 1 s` estimate. */
   approximate: boolean;
+  /**
+   * Why this group's turns cannot start playback, in a recruiter's words, or
+   * null when they can (or the group is the "no timing" bucket).
+   */
+  unseekableReason?: string | null;
 }
 
 /**
@@ -145,13 +172,25 @@ export function groupTurnsByLeg(
 ): LegGroup[] {
   const starts = legs.map((leg) => instantMs(leg.admitted_at) ?? instantMs(leg.connected_from) ?? null);
   const anchors = legs.map((leg) => legRecordingAnchor(leg, sessionAnchorMs));
+  const callStarts = legs.map((leg) => instantMs(leg.connected_from ?? leg.answered_at));
+  // Session mode: the session recording's t = 0. The egress anchor when the
+  // session has one (exact); else the first leg's best anchor (an estimate).
+  const sessionExact = finiteOrNull(sessionAnchorMs);
+  const sessionFallback =
+    sessionExact !== null && sessionExact > 0 ? null : (anchors.find((a) => a !== null) ?? null);
   const byLeg: LegTurn[][] = legs.map(() => []);
   const untimed: LegTurn[] = [];
+  const derivedApprox = new Set<number>();
 
   transcript.forEach((turn, index) => {
     const at = turnStartMs(turn, sessionAnchorMs);
     if (at === null || legs.length === 0) {
-      untimed.push({ index, turn: seekMode === 'session' ? turn : { ...turn, start_offset_sec: null } });
+      untimed.push({
+        index,
+        turn: seekMode === 'session' ? turn : { ...turn, start_offset_sec: null },
+        callSec: null,
+        atMs: null,
+      });
       return;
     }
     let legIndex = 0;
@@ -162,13 +201,28 @@ export function groupTurnsByLeg(
     let offset: number | null;
     if (seekMode === 'session') {
       offset = finiteOrNull(turn.start_offset_sec);
+      if (offset === null) {
+        // The API left the offset null (no session anchor stored), but the
+        // turn has its own clock time: place it against the best anchor.
+        if (sessionExact !== null && sessionExact > 0) {
+          offset = Math.round(Math.max(0, at - sessionExact)) / 1000;
+        } else if (sessionFallback && at >= sessionFallback.ms && !legRecordingLost(legs[legIndex])) {
+          // An ESTIMATE, so only for turns inside the recording's coverage
+          // (not before it started) and never for a call whose recording
+          // failed or was withheld.
+          offset = Math.round(Math.max(0, at - sessionFallback.ms)) / 1000;
+          derivedApprox.add(legIndex);
+        }
+      }
     } else {
       const anchor = anchors[legIndex];
       offset = anchor && legPlayable(legs[legIndex])
         ? Math.round(Math.max(0, at - anchor.ms)) / 1000
         : null;
     }
-    byLeg[legIndex].push({ index, turn: { ...turn, start_offset_sec: offset } });
+    const callStart = callStarts[legIndex];
+    const callSec = callStart !== null ? Math.round(Math.max(0, at - callStart)) / 1000 : null;
+    byLeg[legIndex].push({ index, turn: { ...turn, start_offset_sec: offset }, callSec, atMs: at });
   });
 
   const groups: LegGroup[] = byLeg
@@ -176,13 +230,43 @@ export function groupTurnsByLeg(
       legIndex,
       turns,
       approximate:
-        seekMode === 'leg' &&
-        anchors[legIndex]?.approximate === true &&
-        turns.some((t) => t.turn.start_offset_sec != null),
+        seekMode === 'leg'
+          ? anchors[legIndex]?.approximate === true &&
+            turns.some((t) => t.turn.start_offset_sec != null)
+          : derivedApprox.has(legIndex),
+      unseekableReason:
+        (seekMode === 'leg' && !legPlayable(legs[legIndex])) ||
+        (seekMode === 'session' &&
+          legRecordingLost(legs[legIndex]) &&
+          turns.every((t) => t.turn.start_offset_sec == null))
+          ? legUnseekableReason(legs[legIndex])
+          : null,
     }))
     .filter((g) => g.turns.length > 0);
-  if (untimed.length > 0) groups.push({ legIndex: null, turns: untimed, approximate: false });
+  if (untimed.length > 0) groups.push({ legIndex: null, turns: untimed, approximate: false, unseekableReason: null });
   return groups;
+}
+
+/**
+ * The note shown over a call's turns when its recording cannot be played:
+ * names the reason, so a turn is never labelled "no timing data" when its
+ * time is known and only the audio is missing.
+ */
+export function legUnseekableReason(leg: CandidatePhoneAttempt): string {
+  switch (leg.recording.reason) {
+    case 'recording_failed':
+      return 'Recording failed for this call, so its turns cannot start playback.';
+    case 'quarantined':
+      return 'Recording withheld for this call (failed integrity check), so its turns cannot start playback.';
+    case 'deleted':
+      return 'Recording deleted for this call, so its turns cannot start playback.';
+    case 'revoked':
+      return 'Recording withdrawn for this call, so its turns cannot start playback.';
+    case 'access_unavailable':
+      return 'Recording access unavailable for this call, so its turns cannot start playback.';
+    default:
+      return 'No recording for this call, so its turns cannot start playback.';
+  }
 }
 
 /**

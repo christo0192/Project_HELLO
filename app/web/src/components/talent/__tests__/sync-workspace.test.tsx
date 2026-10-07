@@ -483,8 +483,10 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
     const second = await screen.findByRole('group', { name: 'Call 2 of 2 · reconnect' });
     fireEvent.click(within(second).getByRole('button', { name: /Turn 3:/ }));
 
-    await waitFor(() => expect(mockRecordingApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledWith('leg-b'));
-    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+    // Generous timeouts: the mint -> load -> play chain is several async hops and runs
+    // slowly under the CI coverage instrumentation (the 1s default flaked there).
+    await waitFor(() => expect(mockRecordingApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledWith('leg-b'), { timeout: 5000 });
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled(), { timeout: 5000 });
     expect(setCurrentTime).toHaveBeenCalledWith(3);
     expect(mockRecordingApi.getAttemptRecordingDownloadUrl).not.toHaveBeenCalledWith('leg-a');
     expect(mockRecordingApi.getRecordingDownloadUrl).not.toHaveBeenCalled();
@@ -492,9 +494,9 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
     // A legacy leg seeks at its estimated offset in its own file.
     const first = screen.getByRole('group', { name: 'Call 1 of 2 · first call' });
     fireEvent.click(within(first).getByRole('button', { name: /Turn 2:/ }));
-    await waitFor(() => expect(mockRecordingApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledWith('leg-a'));
-    await waitFor(() => expect(setCurrentTime).toHaveBeenCalledWith(54.66));
-  });
+    await waitFor(() => expect(mockRecordingApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledWith('leg-a'), { timeout: 5000 });
+    await waitFor(() => expect(setCurrentTime).toHaveBeenCalledWith(54.66), { timeout: 5000 });
+  }, 20_000);
 
   it('a single pre-consent leg: listed under its session, outcome as recorded, no notes', async () => {
     const answered = Date.parse('2026-10-05T05:00:10.000Z');
@@ -580,6 +582,68 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
     await waitFor(() => expect(mockRecordingApi.getRecordingDownloadUrl).toHaveBeenCalledWith('session-phone'));
     await waitFor(() => expect(setCurrentTime).toHaveBeenCalledWith(260));
     expect(mockRecordingApi.getAttemptRecordingDownloadUrl).not.toHaveBeenCalled();
+  });
+
+  it('production case: turns on a call whose recording failed show their time and the reason, not "no timing data"', async () => {
+    // Two legs; every turn falls in leg 1 (recording failed); leg 2 is the
+    // only playable recording and has no turns.
+    renderPhone({
+      legs: [
+        { ...LEG_A, recording: { state: 'unavailable', reason: 'recording_failed' } },
+        LEG_B,
+      ],
+      transcript: [
+        { speaker: 'candidate', text: 'Hello?', start_offset_sec: null, started_at_ms: ANS_A + 2000 },
+        { speaker: 'bot', text: 'Hi there.', start_offset_sec: null, started_at_ms: ANS_A + 65_000 },
+      ],
+    });
+    const first = await screen.findByRole('group', { name: 'Call 1 of 2 · first call' });
+    expect(within(first).getByText(/Recording failed for this call, so its turns cannot start playback\./)).toBeInTheDocument();
+    expect(within(first).queryByText(/no timing data/i)).toBeNull();
+    expect(within(first).queryByRole('button')).toBeNull();
+    // m:ss into the call (connected_from = answered).
+    expect(within(first).getByText('0:02')).toBeInTheDocument();
+    expect(within(first).getByText('1:05')).toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: 'Call 2 of 2 · reconnect' })).toBeNull();
+    expect(screen.queryByText(/no timing data/i)).toBeNull();
+  });
+
+  it('no playable call and no stored session anchor: offsets come from the turn clocks (marked approximate) and a click seeks the session recording', async () => {
+    mockRecordingApi.getRecordingDownloadUrl.mockResolvedValue({ url: 'https://x.invalid/session' });
+    const setCurrentTime = stubSeekableMedia();
+    renderPhone({
+      legs: [
+        { ...LEG_A, recording: { state: 'unavailable', reason: 'no_recording' } },
+        { ...LEG_B, recording: { state: 'unavailable', reason: 'recording_failed' } },
+      ],
+      transcript: [
+        // The API returned null offsets and the session has no anchor.
+        { speaker: 'bot', text: 'First question.', start_offset_sec: null, started_at_ms: ANS_A + 1000 + 54_660 },
+      ],
+    });
+    const first = await screen.findByRole('group', { name: 'Call 1 of 2 · first call' });
+    expect(within(first).getByText(/estimated from when it was answered/)).toBeInTheDocument();
+    const button = within(first).getByRole('button', { name: /Turn 1:.*At about 0:54/ });
+    expect(button).toHaveTextContent('≈0:54');
+    fireEvent.click(button);
+    await waitFor(() => expect(mockRecordingApi.getRecordingDownloadUrl).toHaveBeenCalledWith('session-phone'));
+    await waitFor(() => expect(setCurrentTime).toHaveBeenCalledWith(54.66));
+    expect(screen.queryByText(/no timing data/i)).toBeNull();
+  });
+
+  it('the turn being played highlights while its leg plays', async () => {
+    mockRecordingApi.getAttemptRecordingDownloadUrl.mockResolvedValue({ url: 'https://x.invalid/leg' });
+    stubSeekableMedia();
+    renderPhone();
+    const second = await screen.findByRole('group', { name: 'Call 2 of 2 · reconnect' });
+    fireEvent.click(within(second).getByRole('button', { name: /Turn 3:/ }));
+    await waitFor(() => expect(document.querySelector('audio')).not.toBeNull());
+    const audio = document.querySelector('audio')!;
+    Object.defineProperty(audio, 'currentTime', { configurable: true, get: () => 10.6, set: () => {} });
+    fireEvent.timeUpdate(audio);
+    await waitFor(() =>
+      expect(within(second).getByRole('button', { name: /Turn 4:/ })).toHaveAttribute('aria-current', 'true'),
+    );
   });
 
   it('a session with no listed legs keeps the single session player', async () => {

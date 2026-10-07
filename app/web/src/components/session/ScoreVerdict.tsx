@@ -19,7 +19,7 @@ import { finiteNumber, recommendationMeta } from './scorecard-read';
 /* Same token pairs as `StatusBadge` (hue in the dot and tint, small text in
    the `*-text` tokens or ink), one step larger: this pill sits beside a
    32px figure and is the verdict, not a row annotation. */
-const PILL_TONE: Record<StatusTone, string> = {
+export const PILL_TONE: Record<StatusTone, string> = {
   neutral: 'bg-ink/[0.05] text-ink-secondary',
   info: 'bg-info-soft text-ink-secondary',
   success: 'bg-success-soft text-success-text',
@@ -27,7 +27,7 @@ const PILL_TONE: Record<StatusTone, string> = {
   danger: 'bg-error-soft text-error-text',
 };
 
-const PILL_DOT: Record<StatusTone, string> = {
+export const PILL_DOT: Record<StatusTone, string> = {
   neutral: 'bg-ink-muted',
   info: 'bg-info',
   success: 'bg-success',
