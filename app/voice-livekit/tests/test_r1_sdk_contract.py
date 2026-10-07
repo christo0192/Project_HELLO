@@ -546,7 +546,10 @@ class TestR1LlmNodeOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         (call,) = seen["calls"]
         self.assertFalse(call["tools"])  # the model has no tools, whatever the SDK passed
         roles = [item.role for item in call["ctx"].items]
-        self.assertEqual(roles, ["system", "user"])
+        # The interviewer prefix, the getting-to-know-you note (the model may not start the
+        # role-play itself), then the newest candidate turn.
+        self.assertEqual(roles, ["system", "system", "user"])
+        self.assertIn("role-play", call["ctx"].items[1].text_content)
         self.assertEqual(call["ctx"].items[-1].text_content, "I sold courses")
 
     async def test_a_leak_from_the_real_stream_is_replaced_before_the_tts_split(self) -> None:

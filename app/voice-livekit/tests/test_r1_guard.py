@@ -919,5 +919,61 @@ class ScepticismIsNotAConcessionTests(unittest.TestCase):
                 self.assertIn("invented_fact", categories(text, ctx()))
 
 
+class RoleplayAnnouncementTests(unittest.TestCase):
+    """In the getting-to-know-you part only the driver starts the role-play, never the model."""
+
+    ANNOUNCEMENTS = (
+        "Nice work. Now let's move into the role-play where I play a learner.",
+        "Great, let's start the role play now.",
+        "We'll start the role-play shortly.",
+        "I'll play a prospective learner.",
+        "Time for the role-play.",
+        "Okay, now we move on to the role-play.",
+    )
+    # Repeating the candidate's own history is fine, and so is any question.
+    HISTORY = (
+        "You ran role-plays for new hires, which sounds useful.",
+        "That role-play experience sounds valuable.",
+        "I enjoyed hearing about your role-play training.",
+        "How did you handle the role-plays?",
+        "Role-plays are great practice, how did your team use them?",
+    )
+
+    def test_an_announcement_is_blocked_in_the_opening_and_the_icebreaker(self):
+        for phase in ("opening", "icebreaker"):
+            for text in self.ANNOUNCEMENTS:
+                with self.subTest(phase=phase, text=text):
+                    result = guard_text(text, ctx(phase))
+                    hits = [(h.category, h.rule) for h in result.hits]
+                    self.assertIn(("scripted_cue", "roleplay_announcement"), hits)
+                    self.assertNotIn("role", result.text.lower())
+                    self.assertTrue(result.text)  # never silence: what is left, or the fallback
+
+    def test_the_candidates_own_role_plays_are_not_an_announcement(self):
+        for phase in ("opening", "icebreaker"):
+            for text in self.HISTORY:
+                with self.subTest(phase=phase, text=text):
+                    self.assertNotIn(
+                        "roleplay_announcement",
+                        [h.rule for h in guard_text(text, ctx(phase)).hits],
+                    )
+
+    def test_only_the_getting_to_know_you_part_is_covered(self):
+        # The interviewer legitimately talks about the role-play after it (and the scripted
+        # transition line is not model output at all).
+        for phase in ("transition", "roleplay_exit", "wrapup", "closing"):
+            with self.subTest(phase=phase):
+                self.assertNotIn(
+                    "roleplay_announcement",
+                    [h.rule for h in guard_text(self.ANNOUNCEMENTS[0], ctx(phase)).hits],
+                )
+
+    def test_an_announcement_counts_as_a_leak_for_the_ledger(self):
+        ledger = GuardLedger()
+        for _ in range(3):
+            ledger.record(guard_text(self.ANNOUNCEMENTS[0], ctx("icebreaker")))
+        self.assertTrue(ledger.flagged)
+
+
 if __name__ == "__main__":
     unittest.main()

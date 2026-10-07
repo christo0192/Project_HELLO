@@ -51,6 +51,16 @@ CHARACTER_BREAK_NOTE = (
     "at courses, and carry on."
 )
 
+GETTING_TO_KNOW_YOU_NOTE = (
+    "INTERVIEW NOTE (not spoken; never mention it). This is the getting-to-know-you part. "
+    "Ask one short follow-up question about the candidate's background, their sales or "
+    "customer-facing work, or why they want the role. Never start, announce, describe or "
+    "hint at the role-play, never say the interview is moving on or ending, and never say "
+    "goodbye: the interview moves on by itself."
+)
+# The phases whose replies are the getting-to-know-you part.
+_GETTING_TO_KNOW_YOU_PHASES = frozenset({"opening", "icebreaker"})
+
 ROLEPLAY_PHASE = "roleplay"
 _INTERVIEW_CONTEXT_PHASES = {
     "opening": ("opening", "icebreaker"),
@@ -79,6 +89,18 @@ def interviewer_prefix() -> str:
         "else about the role, including pay, work mode, training, next steps and "
         f'timelines, say exactly: "{INTERVIEWER_DEFLECTION}"'
     )
+
+
+def interviewer_reminder(phase: str) -> str | None:
+    """The ephemeral note for an interviewer-phase reply (``None`` where the prefix is enough).
+
+    The prefix is byte-stable for the whole session (the DeepSeek cache prefix) and has no
+    notion of a phase, so what only the getting-to-know-you part needs travels here, just
+    before the newest user message, like the learner's per-turn note.  Without it the model
+    may start or announce the role-play itself ("Great, let's move into the role-play...")
+    while the driver is about to play the scripted transition line: two different starts.
+    """
+    return GETTING_TO_KNOW_YOU_NOTE if phase in _GETTING_TO_KNOW_YOU_PHASES else None
 
 
 def learner_prefix(persona: RenderedPersona) -> str:

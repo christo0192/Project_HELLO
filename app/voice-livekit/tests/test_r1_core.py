@@ -33,6 +33,7 @@ import r1_llm
 import r1_persistence
 import r1_routing
 import r1_session
+from r1_guard import FALLBACK_REPLY
 from r1_lines import INTERVIEWER_NAME, line, safe_first_name
 from r1_persistence import OUTCOME_DISPOSITIONS, R1TurnWriter
 from r1_phases import (
@@ -608,6 +609,50 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         machine.transition(R1Phase.ROLEPLAY_EXIT)
         self.assertIs(machine.phase, R1Phase.ROLEPLAY_EXIT)
 
+    def test_role_play_time_stops_when_the_role_play_ends(self) -> None:
+        # The administration record and the plan 6.4 gate (R >= 10:00) measure the role-play,
+        # not the session: R read at the end of the wrap-up must not include the wrap-up.
+        clock = Clock()
+        machine = R1PhaseMachine(clock)
+        for phase in (R1Phase.OPENING, R1Phase.ICEBREAKER, R1Phase.TRANSITION):
+            machine.transition(phase)
+        self.assertFalse(machine.roleplay_entered)
+        machine.transition(R1Phase.ROLEPLAY)
+        self.assertTrue(machine.roleplay_entered)
+        clock.advance(500)
+        self.assertEqual(machine.roleplay_elapsed, 500)
+        self.assertFalse(machine.roleplay_finished)
+        machine.transition(R1Phase.ROLEPLAY_EXIT)
+        self.assertTrue(machine.roleplay_finished)
+        clock.advance(120)  # the exit line and the wrap-up
+        machine.transition(R1Phase.WRAPUP)
+        clock.advance(100)
+        self.assertEqual(machine.roleplay_elapsed, 500)
+        machine.transition(R1Phase.CLOSING)
+        clock.advance(30)
+        self.assertEqual(machine.roleplay_elapsed, 500)
+
+    def test_role_play_time_stops_for_every_way_out_of_the_role_play(self) -> None:
+        # Ending from an aside or a reconnect pause closes the paused span at that moment.
+        for pause in (R1Phase.ASIDE, R1Phase.PAUSED_DISCONNECTED):
+            with self.subTest(pause=pause):
+                clock = Clock()
+                machine = R1PhaseMachine(clock)
+                for phase in (
+                    R1Phase.OPENING, R1Phase.ICEBREAKER, R1Phase.TRANSITION, R1Phase.ROLEPLAY
+                ):
+                    machine.transition(phase)
+                clock.advance(300)
+                if pause is R1Phase.ASIDE:
+                    machine.transition(R1Phase.ASIDE)
+                else:
+                    machine.begin_disconnect()
+                clock.advance(40)
+                machine.transition(R1Phase.CLOSING)  # a stop while paused: R stays at 300
+                clock.advance(60)
+                self.assertEqual(machine.roleplay_elapsed, 300)
+                self.assertFalse(machine.roleplay_finished)  # CLOSING is not a finished role-play
+
     def test_session_clock_runs_from_activation_not_from_pre_join(self) -> None:
         clock = Clock()
         machine = R1PhaseMachine(clock)
@@ -851,6 +896,145 @@ class TestPhaseAndConfiguration(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(is_no_questions(text))
                 self.assertTrue(is_no_questions(text.rstrip("?")))
+
+    # The answers the smoke test hit: every one comes back from the speech-to-text with a capital
+    # and a full stop (and often a comma), and none was recognised before the transcript was
+    # folded.  The bot then answered, sat through 20 s of silence, and said goodbye twice.
+    PUNCTUATED_REFUSALS = (
+        "No.",
+        "No",
+        "no",
+        "NO!",
+        "No, thank you.",
+        "No, thanks.",
+        "No. Thank you.",
+        "No, thank you so much.",
+        "No, I don't have any questions.",
+        "No, I don’t have any questions.",  # the curly apostrophe Sarvam may emit
+        "I do not have any questions.",
+        "I have no questions.",
+        "No further questions, thanks.",
+        "Nope.",
+        "Nope!",
+        "Nah.",
+        "That's all.",
+        "That’s all",
+        "That's it.",
+        "No, that's it.",
+        "I'm good.",
+        "I am good, thank you.",
+        "Yeah, I'm good.",
+        "I think I'm good.",
+        "I'm all set.",
+        "Not really.",
+        "No, nothing from my side.",
+        "Nothing, thank you.",
+        "Nothing else.",
+        "Not at the moment, thanks.",
+        # The grammatical answer to "do you have any questions": "I don't", with no noun.
+        "No, I don't.",
+        "No, I don't, thank you.",
+        "No, I don’t.",
+        "I don't.",
+        "No, I do not.",
+        # L-EXIT has just introduced the interviewer by name.
+        "No, thank you, Christy.",
+        "Thank you, Christy.",
+        "No questions from my side.",
+        "No questions from my end, thank you.",
+        "No. Thank you so much for your time.",
+        "No, thank you for your time today.",
+        "No sir.",
+        "No, ma'am.",
+        "No, thank you, sir.",
+        "Hmm, no.",
+        "Mm, no.",
+        "No, I'm okay.",
+        "I'm okay, thank you.",
+        "No, none.",
+        "None.",
+        "None, thank you.",
+        "No, I'm fine.",
+        # A thank-you alone closes it; with a "yes" it may open a question (see below).
+        "Thank you.",
+        "Thanks!",
+        "Okay, thank you.",
+        "Okay, thanks a lot.",
+    )
+    # A real question stays a question, however it is punctuated and however polite it is.
+    PUNCTUATED_QUESTIONS = (
+        "No, but when will I hear back?",
+        "No, but when will I hear back",
+        "No, what is the salary?",
+        "Not really, but what is the notice period",
+        "That's it, how long until I get results?",
+        "No, I don't have any questions about the role, but what about the team size?",
+        "Yeah, I do have one.",
+        "Yes, how many rounds are there?",
+        "No idea, what happens next?",
+        "No questions?",  # a question mark alone keeps the turn for the interviewer
+        "Nothing else?",
+        "What is the notice period?",
+        # "I don't" and the new courtesy words never swallow a request that follows them.
+        "No, I don't know when I'll hear back",
+        "No, I don't know what happens next",
+        "No, what time do I start",
+        "No, I don't have time for the next round",
+        "I don't, but what about the notice period",
+        "Thank you, can you tell me about the next steps",
+        "Thank you, any idea when I will hear back",
+        "Thanks, what about the salary",
+        "None of the above, what about the salary",
+        # A thank-you next to a "yes" may open a question: the interviewer answers it.
+        "Yes, thank you.",
+        "Yeah, thanks",
+        "Sure, thank you",
+    )
+
+    def test_a_punctuated_refusal_is_a_refusal(self) -> None:
+        for text in self.PUNCTUATED_REFUSALS:
+            with self.subTest(text=text):
+                self.assertTrue(is_no_questions(text))
+
+    def test_a_punctuated_question_is_still_a_question(self) -> None:
+        for text in self.PUNCTUATED_QUESTIONS:
+            with self.subTest(text=text):
+                self.assertFalse(is_no_questions(text))
+
+    def test_folding_speech_removes_case_punctuation_and_spacing_only(self) -> None:
+        self.assertEqual(r1_session.fold_speech("  No,   thank you.  "), "no thank you")
+        self.assertEqual(r1_session.fold_speech("Let’s start!"), "let's start")
+        self.assertEqual(r1_session.fold_speech("“Nope” — that's all…"), "nope that's all")
+        self.assertEqual(r1_session.fold_speech("go-ahead"), "go ahead")
+        self.assertEqual(r1_session.fold_speech(None), "")
+        # Letters of every script survive: a non-Latin word is still a word nobody allowlisted.
+        devanagari = chr(0x0915) + chr(0x094D) + chr(0x092F) + chr(0x093E)
+        self.assertEqual(r1_session.fold_speech("Nope, " + devanagari + "!"), "nope " + devanagari)
+        self.assertFalse(is_no_questions("Nope, " + devanagari + "."))
+
+    def test_ready_shortcuts_match_however_the_speech_to_text_punctuated_them(self) -> None:
+        for text in (
+            "Yes.", "Yes!", "YES", "Let's start.", "Let’s start", "Lets start",
+            "Go ahead.", "Sure!", "Sure.", "Okay.", "OK!", "Yeah.", "I'm ready.", "Ready!",
+            "Ready.", "Alright.",
+            # A ready phrase with nothing but filler around it is still a ready answer.
+            "Yes, let's start.", "Sure, go ahead.", "Okay, sure.", "Yep, go ahead.",
+            "Ok, let's go!", "Yeah sure.", "Alright, let's do it.", "Yes please, go ahead.",
+            "Okay, thank you, let's start.", "Yup.", "Of course, go on.", "Well, let's begin.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(R1Interview.is_ready(text))
+        for text in (
+            "I am already prepared", "Unready", "What do I do?", "Who is she?", "Not sure yet.",
+            "Yes, but what do I say?", "",
+            # A negation turns "ready" and the ready phrases around.
+            "Not ready yet.", "I'm not ready.", "I am not sure I'm ready.", "We aren't ready.",
+            "Don't start.", "Let's not start yet.", "No, not yet, I'm not ready.",
+            # A real request next to a ready phrase is not a ready answer.
+            "Yes, but where do I start", "Sure, what is her name", "Okay, I'll start in a minute",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(R1Interview.is_ready(text))
 
     def test_room_name_must_be_a_server_created_screening_room(self) -> None:
         self.assertEqual(r1_session.session_id_from_room_name(ROOM_NAME), SESSION_ID)
@@ -2103,7 +2287,11 @@ class TestExitInvariant(R1TestCase):
         self.assertEqual(self.writer.terminals, [("provider_error", {"activated": False})])
         self.assertEqual(self.ctx.deleted_rooms, [None])
         self.assertEqual(self.ctx.shutdowns, ["r1_exit"])
-        self.assertEqual(self.ctx.room.local_participant.attributes, [{"phase": "ended"}])
+        # A provider error is a stop on our side: the page is told so before it is told to leave.
+        self.assertEqual(
+            self.ctx.room.local_participant.attributes,
+            [{"phase": "aborted"}, {"phase": "ended"}],
+        )
         self.assertEqual(self.session.closed, 1)
 
     async def test_the_room_is_deleted_and_the_job_ended_after_the_terminal_write(self) -> None:
@@ -2165,11 +2353,10 @@ class TestExitInvariant(R1TestCase):
     async def test_phase_ended_is_published_when_the_closing_line_has_played(self) -> None:
         # Plan 5.12: L-CLOSE sets phase=ended so the page leaves, BEFORE the exit writes.
         await self.interview._finish("complete")
-        names = [item if isinstance(item, str) else item[0] for item in self.order]
-        self.assertIn("attributes", names)
         self.assertEqual(self.writer.terminals, [])
         self.assertEqual(self.session.spoken[-1], self.spoken_line("L-CLOSE"))
-        self.assertLess(names.index("play_end"), names.index("attributes"))
+        ended = self.order.index(("attributes", {"phase": "ended"}))
+        self.assertLess(self.order.index(("play_end", self.spoken_line("L-CLOSE"))), ended)
 
     async def test_a_goodbye_already_spoken_is_not_repeated(self) -> None:
         self.interview._goodbye_spoken = True
@@ -2547,8 +2734,71 @@ class TestRunFlow(R1TestCase):
         after_close = [item if isinstance(item, str) else item[0] for item in self.order]
         self.assertLess(after_close.index("activate"), after_close.index("terminal"))
         # phase=ended is published when L-CLOSE has played, before the terminal write.
-        self.assertLess(after_close.index("attributes"), after_close.index("terminal"))
-        self.assertEqual(self.ctx.room.local_participant.attributes, [{"phase": "ended"}])
+        ended = self.order.index(("attributes", {"phase": "ended"}))
+        self.assertLess(ended, self.order.index("terminal"))
+        self.assertLess(self.order.index(("play_end", self.spoken_line("L-CLOSE"))), ended)
+        # Every phase change was published on the way, in order (item 6 of the smoke fixes):
+        # the page labels the interview from it and shows the lead card only in role-play.
+        self.assertEqual(
+            [attributes["phase"] for attributes in self.ctx.room.local_participant.attributes],
+            [
+                "opening", "icebreaker", "transition", "roleplay", "roleplay_exit", "wrapup",
+                "closing", "ended",
+            ],
+        )
+
+    async def drive_to_the_wrapup(self) -> asyncio.Task:
+        """Run the real session until the wrap-up question has been asked."""
+        task = asyncio.create_task(
+            run_r1_session(self.ctx, session_factory=self.session_factory)
+        )
+        await self.until(lambda: self._machine_phase() is R1Phase.ICEBREAKER)
+        self.clock.advance(215)
+        for answer in ("I sold courses", "to working professionals", "mostly by phone", "yes"):
+            self.final_transcript(answer)
+        await self.candidate_replies_after("L-TRANSITION", "ready")
+        await self.until(lambda: self._machine_phase() is R1Phase.ROLEPLAY)
+        self.clock.advance(841)
+        self.final_transcript("let me summarise the offer")
+        await self.until(lambda: self.spoken_and_played("L-WRAP"))
+        await self.until(lambda: self._machine_phase() is R1Phase.WRAPUP)
+        await self.settle()
+        return task
+
+    async def test_a_candidate_who_leaves_during_the_wrapup_still_completes_the_session(
+        self,
+    ) -> None:
+        task = await self.drive_to_the_wrapup()
+        with mock.patch.object(r1_session, "rejoin_grace_seconds", return_value=0.05):
+            self.ctx.room.emit("participant_disconnected", FakeParticipant("candidate"))
+            self.assertEqual(await asyncio.wait_for(task, 10.0), "complete")
+        # Completed from in_progress, so the scorer's trigger fires; counted as complete.
+        self.assertEqual(self.writer.terminals, [("complete", {"activated": True})])
+        self.assertEqual(self.writer.outcomes, ["complete"])
+        # Nobody is there to hear a goodbye, and it is not an apology either.
+        self.assertNotIn(self.spoken_line("L-CLOSE"), self.session.spoken)
+        self.assertNotIn(self.spoken_line("L-SYSTEM-STOP"), self.session.spoken)
+        # The page is not told this was a technical stop.
+        self.assertNotIn({"phase": "aborted"}, self.ctx.room.local_participant.attributes)
+        self.assertEqual(self.ctx.room.local_participant.attributes[-1], {"phase": "ended"})
+
+    async def test_a_candidate_who_leaves_during_the_roleplay_is_still_a_failed_session(
+        self,
+    ) -> None:
+        task = asyncio.create_task(
+            run_r1_session(self.ctx, session_factory=self.session_factory)
+        )
+        await self.until(lambda: self._machine_phase() is R1Phase.ICEBREAKER)
+        self.clock.advance(215)
+        for answer in ("I sold courses", "to working professionals", "mostly by phone", "yes"):
+            self.final_transcript(answer)
+        await self.candidate_replies_after("L-TRANSITION", "ready")
+        await self.until(lambda: self._machine_phase() is R1Phase.ROLEPLAY)
+        with mock.patch.object(r1_session, "rejoin_grace_seconds", return_value=0.05):
+            self.ctx.room.emit("participant_disconnected", FakeParticipant("candidate"))
+            self.assertEqual(await asyncio.wait_for(task, 10.0), "candidate_left")
+        self.assertEqual(self.writer.terminals, [("candidate_left", {"activated": True})])
+        self.assertEqual(self.writer.outcomes, ["candidate_left"])
 
     def _machine_phase(self):
         # run_r1_session builds its own interview; the agent holds a reference to it.
@@ -2845,6 +3095,817 @@ class TestR1Context(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(r1_context.R1ContextError):
             await r1_context.fetch_context("screening-x", requester=unavailable)
+
+
+class TestWrapupAndReadyDriveTheDriver(R1TestCase):
+    """The smoke test's two matching bugs, through the real driver and the real reply hook.
+
+    A phrasing that is not recognised costs a free-form interviewer reply, then 20 s of
+    silence and a second goodbye (wrap-up), or a needless nudge (transition).  Each loop
+    rebuilds the interview (``asyncSetUp``) because a driver run changes its flags.
+    """
+
+    async def hook(self, text: str) -> None:
+        agent = R1Agent(self.interview)
+        await agent.on_user_turn_completed(
+            None, SimpleNamespace(text_content=text, id=f"msg_{next(_IDS)}")
+        )
+
+    def enter_wrapup(self) -> None:
+        self.enter_roleplay()
+        self.interview._end_roleplay()
+        self.interview.machine.transition(R1Phase.WRAPUP)
+
+    async def test_every_common_no_questions_answer_ends_wrapup_without_a_reply(self) -> None:
+        for text in TestPhaseAndConfiguration.PUNCTUATED_REFUSALS:
+            if "?" in text:
+                continue
+            with self.subTest(text=text):
+                await self.asyncSetUp()
+                self.enter_wrapup()
+                with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.02):
+                    task = asyncio.create_task(self.interview._run_wrapup())
+                    await self.settle()
+                    self.final_transcript(text)
+                    # The SDK's end of turn: the model must NOT answer a refusal.
+                    with self.assertRaises(r1_session.StopResponse):
+                        await self.hook(text)
+                    # ...and the driver ends the wrap-up now, not after WRAPUP_SILENCE_SECONDS.
+                    self.assertIsNone(await asyncio.wait_for(task, 5.0))
+                self.assertEqual(self.session.spoken, [])
+                self.assertEqual(self.interview._turns.qsize(), 0)
+
+    async def test_a_real_question_is_still_answered_and_keeps_wrapup_open(self) -> None:
+        for text in (
+            "What is the notice period for this role?",
+            "No, but when will I hear back",
+            "Not really, but what is the salary range",
+            "That's it, how long until I get results",
+        ):
+            with self.subTest(text=text):
+                await self.asyncSetUp()
+                self.enter_wrapup()
+                with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.02):
+                    task = asyncio.create_task(self.interview._run_wrapup())
+                    await self.settle()
+                    self.final_transcript(text)
+                    await self.hook(text)  # not suppressed: the interviewer answers it
+                    await asyncio.sleep(0.1)  # well past the settle window
+                    self.assertFalse(task.done())  # counted as a question, wrap-up stays open
+                    task.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await task
+
+    async def test_punctuated_ready_answers_pick_up_at_once_without_a_nudge(self) -> None:
+        for text in (
+            "Yes.", "Let's start.", "Go ahead.", "Sure!", "Let’s start", "OK.",
+            "Yes, let's start.", "Sure, go ahead.", "Okay, sure.", "Yeah sure.",
+            "Alright, let's do it.",
+        ):
+            with self.subTest(text=text):
+                await self.asyncSetUp()
+                self.interview.machine.transition(R1Phase.TRANSITION)
+                task = asyncio.create_task(self.interview._run_transition())
+                await self.settle()
+                self.final_transcript(text)
+                # Not the 20 s TRANSITION_DEADLINE_SECONDS: the answer itself is the pickup.
+                self.assertIsNone(await asyncio.wait_for(task, 5.0))
+                self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+
+
+class TestIcebreakerEndRace(R1TestCase):
+    """The soft exit (four turns, S >= 3:30) is judged twice: at the transcript and at end of turn.
+
+    The driver judges the transcript, the SDK judges the end of the same turn some 0.3-1.5 s
+    later.  When S crosses 3:30 in between, the reply is suppressed and the driver must be told.
+    """
+
+    async def four_turns_with_the_soft_exit_due_in_between(self) -> asyncio.Task:
+        self.clock.advance(209.6)
+        task = asyncio.create_task(self.interview._run_icebreaker())
+        await self.settle()
+        for answer in ("one", "two", "three", "four"):
+            self.final_transcript(answer)  # the 4th lands at S = 209.6: not over yet
+            await self.settle()
+        self.assertFalse(task.done())
+        self.clock.advance(0.6)  # S = 210.2 when the SDK's end of turn arrives
+        return task
+
+    async def test_the_transition_follows_promptly_when_the_boundary_is_crossed_mid_turn(
+        self,
+    ) -> None:
+        task = await self.four_turns_with_the_soft_exit_due_in_between()
+        agent = R1Agent(self.interview)
+        with self.assertRaises(r1_session.StopResponse):  # the reply is suppressed...
+            await agent.on_user_turn_completed(
+                None, SimpleNamespace(text_content="four", id="msg_race")
+            )
+        started = asyncio.get_running_loop().time()
+        # ...and the driver is woken: it ends the phase at once (the transition line plays)
+        # instead of waiting out ICEBREAKER_PROMPT_SECONDS and asking "Are you still with me?".
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertLess(asyncio.get_running_loop().time() - started, 2.0)
+        self.assertNotIn(self.spoken_line("L-SIL-IB"), self.session.spoken)
+        self.assertEqual(self.session.spoken, [])
+
+    async def test_a_driver_that_ends_the_phase_goes_on_to_the_transition_line(self) -> None:
+        context = FakeContext(self.order)
+        context.room.remote_participants["candidate"] = FakeParticipant("candidate")
+        clock = Clock()
+        session = FakeSession(log=self.order)
+        interview = R1Interview(
+            context,
+            {"first_name": "Asha", "candidate_identity": "candidate"},
+            session,
+            self.writer,
+            clock=clock,
+        )
+        task = asyncio.create_task(interview.run())
+        await self.until(lambda: interview.machine.phase is R1Phase.ICEBREAKER)
+        clock.advance(209.6)
+        for answer in ("one", "two", "three", "four"):
+            session.emit("user_input_transcribed", final_event(answer))
+            await self.settle()
+        clock.advance(0.6)
+        agent = R1Agent(interview)
+        with self.assertRaises(r1_session.StopResponse):
+            await agent.on_user_turn_completed(
+                None, SimpleNamespace(text_content="four", id="msg_race")
+            )
+        await self.until(lambda: interview.machine.phase is R1Phase.TRANSITION)
+        await self.until(
+            lambda: ("play_end", interview.render_line("L-TRANSITION")) in self.order
+        )
+        self.assertNotIn(interview.render_line("L-SIL-IB"), session.spoken)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_no_silence_prompt_is_spoken_once_the_soft_exit_is_due(self) -> None:
+        self.clock.advance(215)
+        for answer in ("one", "two", "three", "four"):
+            self.final_transcript(answer)
+        outcome = await self.interview._silence_ladder([("L-SIL-IB", 20.0)])
+        self.assertEqual(outcome, "phase_deadline")
+        self.assertEqual(self.session.spoken, [])
+
+    async def four_answered_turns_then_a_follow_up_question_plays(
+        self, *, turn_ends_at: float, question_ends_at: float
+    ) -> tuple[asyncio.Task, R1Agent]:
+        """Four finals, the end of the 4th turn at ``turn_ends_at`` (before the soft exit), and
+        the interviewer's follow-up question playing until ``question_ends_at`` (S seconds)."""
+        self.clock.advance(turn_ends_at)
+        task = asyncio.create_task(self.interview._run_icebreaker())
+        await self.settle()
+        for answer in ("one", "two", "three", "four"):
+            self.final_transcript(answer)
+            await self.settle()
+        agent = R1Agent(self.interview)
+        # The SDK's end of turn: S < 3:30, so the reply is NOT suppressed and the model asks.
+        await agent.on_user_turn_completed(
+            None, SimpleNamespace(text_content="four", id="msg_follow_up")
+        )
+        self.agent_state("thinking")
+        self.agent_state("speaking")
+        await self.settle()
+        self.assertFalse(task.done())
+        self.clock.advance(question_ends_at - turn_ends_at)  # S crosses 3:30 mid-question
+        self.agent_state("listening")  # the question ends: every waiter is woken
+        await self.settle()
+        return task, agent
+
+    async def test_a_follow_up_question_finishing_after_the_soft_exit_is_still_answered(
+        self,
+    ) -> None:
+        # Fix-branch regression: the end of turn fell at S=205, the follow-up question finished
+        # at S=211, and the wake-up read "soft exit due" as "phase over": L-TRANSITION played
+        # right after the interviewer's own question, which the candidate never got to answer.
+        task, _agent = await self.four_answered_turns_then_a_follow_up_question_plays(
+            turn_ends_at=205.0, question_ends_at=211.0
+        )
+        self.assertFalse(task.done())  # still waiting for the answer
+        self.assertIs(self.interview.machine.phase, R1Phase.ICEBREAKER)
+        self.assertEqual(self.session.spoken, [])
+        self.assertGreater(self.interview._icebreaker_budget_left(), 0)
+        # The answer ends the phase through the driver's own check, and nothing is lost.
+        self.final_transcript("five")
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.session.spoken, [])
+
+    async def test_the_candidate_starting_an_answer_after_the_soft_exit_is_not_talked_over(
+        self,
+    ) -> None:
+        # The question ended at S=208, the candidate started answering at S=211: the wake-up
+        # from their speaking must not play the (non-interruptible) boundary line over them.
+        task, _agent = await self.four_answered_turns_then_a_follow_up_question_plays(
+            turn_ends_at=205.0, question_ends_at=208.0
+        )
+        self.clock.advance(3)  # S = 211
+        self.user_state("speaking")
+        await self.settle()
+        self.assertFalse(task.done())
+        self.assertIs(self.interview.machine.phase, R1Phase.ICEBREAKER)
+        self.assertEqual(self.session.spoken, [])
+        self.final_transcript("five")
+        self.user_state("listening")
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.session.spoken, [])
+
+    async def test_only_the_suppressed_boundary_turn_zeroes_the_icebreaker_budget(self) -> None:
+        self.clock.advance(215)
+        for answer in ("one", "two", "three", "four"):
+            self.final_transcript(answer)
+        self.assertTrue(self.interview.machine.icebreaker_should_end())
+        # The soft-exit rule alone is not the end of the phase for a waiter: 55 s remain.
+        self.assertEqual(self.interview._icebreaker_budget_left(), 55)
+        agent = R1Agent(self.interview)
+        with self.assertRaises(r1_session.StopResponse):  # this turn IS the boundary turn
+            await agent.on_user_turn_completed(
+                None, SimpleNamespace(text_content="four", id="msg_boundary")
+            )
+        self.assertEqual(self.interview._icebreaker_budget_left(), 0)
+
+    async def test_an_empty_turn_after_the_soft_exit_is_not_a_boundary_turn(self) -> None:
+        self.clock.advance(215)
+        for answer in ("one", "two", "three", "four"):
+            self.final_transcript(answer)
+        agent = R1Agent(self.interview)
+        with self.assertRaises(r1_session.StopResponse):
+            await agent.on_user_turn_completed(None, SimpleNamespace(text_content="", id="m"))
+        self.assertEqual(self.interview._icebreaker_budget_left(), 55)
+
+    async def test_the_icebreaker_still_waits_for_an_answer_before_the_soft_exit(self) -> None:
+        self.clock.advance(100)
+        task = asyncio.create_task(self.interview._run_icebreaker())
+        await self.settle()
+        self.interview._wake()  # a stray wake-up is not the end of the phase
+        await self.settle()
+        self.assertFalse(task.done())
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+
+class TestIcebreakerNote(unittest.TestCase):
+    """The icebreaker prompt tells the model never to start or announce the role-play."""
+
+    def test_the_icebreaker_and_opening_replies_carry_the_note(self) -> None:
+        from r1_personas import resolve_persona
+        from r1_prompts import GETTING_TO_KNOW_YOU_NOTE, interviewer_prefix
+        from r1_replies import Reply, llm_messages
+
+        persona = resolve_persona("p1_career_switcher", variant="v1")
+        for phase in ("opening", "icebreaker"):
+            with self.subTest(phase=phase):
+                messages = llm_messages(
+                    Reply(phase=phase, candidate_text="I sell courses."), persona, []
+                )
+                self.assertEqual(
+                    messages[0], {"role": "system", "content": interviewer_prefix()}
+                )  # the cache prefix is untouched
+                self.assertEqual(
+                    messages[-2], {"role": "system", "content": GETTING_TO_KNOW_YOU_NOTE}
+                )
+                self.assertEqual(messages[-1], {"role": "user", "content": "I sell courses."})
+        lowered = GETTING_TO_KNOW_YOU_NOTE.lower()
+        self.assertIn("never start, announce", lowered)
+        self.assertIn("role-play", lowered)
+        self.assertIn("goodbye", lowered)
+
+    def test_no_other_interviewer_phase_gets_it(self) -> None:
+        from r1_personas import resolve_persona
+        from r1_prompts import GETTING_TO_KNOW_YOU_NOTE
+        from r1_replies import Reply, llm_messages
+
+        persona = resolve_persona("p1_career_switcher", variant="v1")
+        for phase in ("transition", "roleplay_exit", "wrapup", "closing"):
+            with self.subTest(phase=phase):
+                messages = llm_messages(Reply(phase=phase, candidate_text="Hello."), persona, [])
+                self.assertNotIn(
+                    GETTING_TO_KNOW_YOU_NOTE, "\n".join(m["content"] for m in messages)
+                )
+
+
+class TestLlmFailureRecovery(R1TestCase):
+    """A failed model reply is never silence: the candidate hears the safe fallback.
+
+    Before, the failed reply yielded nothing, the candidate waited 20-30 s and then heard
+    "Are you still there?" as if they had gone.  The 3-failure abort is unchanged.
+    """
+
+    FALLBACK = FALLBACK_REPLY
+
+    def provider(self, error: BaseException | None = None, *, reported: bool = False):
+        interview = self.interview
+
+        def make(_messages):
+            async def stream():
+                if reported:  # the SDK emits its error event BEFORE the call raises
+                    interview._on_provider_error(
+                        SimpleNamespace(error=SimpleNamespace(type="llm_error", recoverable=False))
+                    )
+                raise error or RuntimeError("provider unavailable")
+                yield ""  # pragma: no cover - makes this an async generator
+
+            return stream()
+
+        return make
+
+    async def reply(self, provider, text: str = "I sold courses") -> list[str]:
+        self.interview.machine.candidate_turns = 1
+        self.interview.prepare_turn(text, f"msg_{next(_IDS)}")
+        stream = self.interview.llm_node_stream(SimpleNamespace(items=[]), provider)
+        return [chunk async for chunk in stream]
+
+    async def test_a_failed_reply_speaks_the_fallback_instead_of_nothing(self) -> None:
+        with self.capture_logs() as logs:
+            spoken = await self.reply(self.provider())
+        self.assertEqual("".join(spoken).strip(), self.FALLBACK)
+        self.assertEqual(self.interview._failures, 1)  # counted
+        self.assertIn("r1_llm_reply_failed", error_types(logs))
+        self.assertNotIn("provider unavailable", json.dumps(logs))
+        # Not an answer from the provider: the failure count survives the fallback line.
+        self.assertEqual(self.interview._failures, 1)
+        self.assertFalse(self.interview._skip_failure_reset)
+        # The page is not left to wonder: no "Are you still there?" was queued by the failure.
+        self.assertEqual(self.session.spoken, [])
+
+    async def test_a_later_good_reply_resets_the_count(self) -> None:
+        await self.reply(self.provider())
+        spoken = await self.reply(lambda _messages: self_stream("Tell me more."))
+        self.assertEqual("".join(spoken).strip(), "Tell me more.")
+        self.assertEqual(self.interview._failures, 0)
+
+    async def test_three_failures_in_a_row_still_abort_and_the_third_says_nothing(self) -> None:
+        for _ in range(2):
+            spoken = await self.reply(self.provider())
+            self.assertEqual("".join(spoken).strip(), self.FALLBACK)
+        self.assertIsNone(self.interview._stop_outcome())
+        with self.assertRaises(RuntimeError):  # the abort is due: the driver ends the interview
+            await self.reply(self.provider())
+        self.assertEqual(self.interview._failures, 3)
+        self.assertEqual(self.interview._stop_outcome(), "provider_error")
+
+    async def test_a_failure_the_sdk_already_reported_is_counted_once(self) -> None:
+        spoken = await self.reply(self.provider(reported=True))
+        self.assertEqual("".join(spoken).strip(), self.FALLBACK)
+        self.assertEqual(self.interview._failures, 1)
+
+    async def test_a_reply_that_failed_after_it_began_is_not_papered_over(self) -> None:
+        async def partial():
+            yield "Thanks for sharing that. "
+            yield "And how"
+            raise RuntimeError("connection reset")
+
+        collected: list[str] = []
+        self.interview.machine.candidate_turns = 1
+        self.interview.prepare_turn("I sold courses", "msg_partial")
+        with self.assertRaises(RuntimeError):
+            async for chunk in self.interview.llm_node_stream(
+                SimpleNamespace(items=[]), lambda _messages: partial()
+            ):
+                collected.append(chunk)
+        self.assertEqual("".join(collected).strip(), "Thanks for sharing that.")
+        self.assertNotIn(self.FALLBACK, "".join(collected))
+
+    async def test_the_fallback_is_a_wrapup_reply_too(self) -> None:
+        self.enter_roleplay()
+        self.interview._end_roleplay()
+        self.interview.machine.transition(R1Phase.WRAPUP)
+        spoken = await self.reply(self.provider(), "What is the notice period?")
+        self.assertEqual("".join(spoken).strip(), self.FALLBACK)
+
+    async def test_a_hung_reply_is_followed_by_the_fallback_not_by_dead_air(self) -> None:
+        async def hung(_messages):
+            await asyncio.Event().wait()
+            yield "never"
+
+        with mock.patch.object(r1_session, "TURN_DEADLINE_SECONDS", 0.05), mock.patch.object(
+            r1_session, "FILLER_AFTER_SECONDS", 5.0
+        ):
+            with self.assertRaises(TimeoutError):
+                await self.reply(lambda messages: hung(messages))
+        await self.until(lambda: self.FALLBACK in self.session.spoken)
+        self.assertEqual(self.session.spoken.count(self.FALLBACK), 1)
+        self.assertEqual(self.interview._failures, 1)
+        await self.flush()
+
+    async def test_the_fallback_after_a_hung_roleplay_reply_is_the_learners(self) -> None:
+        self.enter_roleplay()
+        with mock.patch.object(r1_session, "TURN_DEADLINE_SECONDS", 0.05), mock.patch.object(
+            r1_session, "FILLER_AFTER_SECONDS", 5.0
+        ):
+            with self.assertRaises(TimeoutError):
+                await self.interview.guard_llm_stream(self.hung_stream()).__anext__()
+        await self.until(lambda: ("play_end", self.FALLBACK) in self.order)
+        await self.flush()
+        spoken = [item for item in self.interview._history if item["text"] == self.FALLBACK]
+        self.assertEqual([item["voice"] for item in spoken], ["learner"])
+
+    @staticmethod
+    async def hung_stream():
+        await asyncio.Event().wait()
+        yield "never"
+
+    async def test_three_hung_replies_abort_and_the_third_is_not_followed_by_the_fallback(
+        self,
+    ) -> None:
+        with mock.patch.object(r1_session, "TURN_DEADLINE_SECONDS", 0.03), mock.patch.object(
+            r1_session, "FILLER_AFTER_SECONDS", 5.0
+        ):
+            for index in range(3):
+                with self.assertRaises(TimeoutError):
+                    async for _ in self.interview.guard_llm_stream(self.hung_stream()):
+                        pass
+                if index < 2:
+                    await self.until(
+                        lambda index=index: self.session.spoken.count(self.FALLBACK) == index + 1
+                    )
+        await self.settle()
+        self.assertEqual(self.session.spoken.count(self.FALLBACK), 2)
+        self.assertEqual(self.interview._stop_outcome(), "provider_error")
+        await self.flush()
+
+    async def test_no_fallback_for_a_phase_that_is_over_or_a_candidate_who_left(self) -> None:
+        self.interview.machine.transition(R1Phase.TRANSITION)  # the reply was for the icebreaker
+        await self.interview._speak_recovery(R1Phase.ICEBREAKER)
+        self.assertEqual(self.session.spoken, [])
+        await self.interview._speak_recovery(R1Phase.TRANSITION)  # not a model-reply phase
+        self.assertEqual(self.session.spoken, [])
+        self.ctx.room.emit("participant_disconnected", FakeParticipant("candidate"))
+        self.enter_roleplay_from_transition()
+        await self.interview._speak_recovery(R1Phase.ROLEPLAY)
+        self.assertEqual(self.session.spoken, [])
+
+    def enter_roleplay_from_transition(self) -> None:
+        self.interview.machine.transition(R1Phase.ROLEPLAY)
+
+
+async def self_stream(*sentences: str):
+    """A provider stream of ``sentences`` (module level so a lambda can build one)."""
+    for sentence in sentences:
+        yield sentence + " "
+
+
+class TestPhaseAttribute(R1TestCase):
+    """The worker publishes the page's ``phase`` attribute on every change (and ``aborted``)."""
+
+    def published(self) -> list[str]:
+        return [item["phase"] for item in self.ctx.room.local_participant.attributes]
+
+    async def test_the_attribute_key_is_one_plain_lowercase_word(self) -> None:
+        # The livekit SDK rewrites separators in attribute keys (`lk.agent.name` arrives as
+        # `lkAgentName`, #332), so the key must not have any: the page reads `phase`.
+        self.assertEqual(r1_session.PHASE_ATTRIBUTE, "phase")
+        self.assertRegex(r1_session.PHASE_ATTRIBUTE, r"^[a-z]+$")
+
+    async def test_every_published_value_is_one_the_page_understands(self) -> None:
+        web = HERE.parent / "web" / "src" / "lib" / "r1" / "r1-phase.ts"
+        if not web.exists():
+            self.skipTest("the web app is not part of this checkout")
+        source = web.read_text(encoding="utf-8")
+        self.assertIn(f"R1_PHASE_ATTRIBUTE = '{r1_session.PHASE_ATTRIBUTE}'", source)
+        listing = re.search(r"R1_PHASES = \[(.*?)\] as const", source, re.DOTALL)
+        self.assertIsNotNone(listing)
+        vocabulary = set(re.findall(r"'([a-z_]+)'", listing.group(1)))
+        worker = {phase.value for phase in R1Phase} | {"ended"}
+        self.assertEqual(vocabulary, worker)
+
+    async def test_each_phase_change_is_published_in_order(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        await self.settle()
+        self.assertEqual(self.published(), ["transition", "roleplay"])
+        self.interview._enter(R1Phase.ROLEPLAY_EXIT)
+        self.interview._enter(R1Phase.WRAPUP)
+        await self.settle()
+        self.assertEqual(
+            self.ctx.room.local_participant.attributes,
+            [{"phase": value} for value in ("transition", "roleplay", "roleplay_exit", "wrapup")],
+        )
+
+    async def test_mute_aside_and_reconnect_pauses_are_published(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.ctx.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
+        self.ctx.room.emit("track_unmuted", FakeParticipant("candidate"), FakePublication())
+        self.interview._begin_disconnect()
+        self.interview._rejoin()
+        await self.settle()
+        self.assertEqual(
+            self.published(),
+            ["transition", "roleplay", "aside", "roleplay", "paused_disconnected", "roleplay"],
+        )
+
+    async def test_a_phase_is_not_published_twice_in_a_row(self) -> None:
+        self.interview._publish_phase("roleplay")
+        self.interview._publish_phase("roleplay")
+        await self.settle()
+        self.assertEqual(self.published(), ["roleplay"])
+
+    async def test_a_slow_write_never_blocks_the_interview_or_reorders_the_values(self) -> None:
+        gate = asyncio.Event()
+        sent: list[dict] = []
+
+        async def slow(attributes):
+            await gate.wait()
+            sent.append(dict(attributes))
+
+        self.ctx.room.local_participant.set_attributes = slow
+        self.interview._enter(R1Phase.TRANSITION)  # returns at once
+        self.interview._enter(R1Phase.ROLEPLAY)
+        await self.settle()
+        self.assertIs(self.interview.machine.phase, R1Phase.ROLEPLAY)
+        self.assertEqual(sent, [])
+        gate.set()
+        await self.until(lambda: len(sent) == 2)
+        self.assertEqual(sent, [{"phase": "transition"}, {"phase": "roleplay"}])
+
+    async def test_a_failing_write_is_logged_by_type_and_swallowed(self) -> None:
+        async def broken(_attributes):
+            raise RuntimeError(POISON_TEXT)
+
+        self.ctx.room.local_participant.set_attributes = broken
+        with self.capture_logs() as logs:
+            self.interview._enter(R1Phase.TRANSITION)
+            await self.settle()
+        self.assertEqual(error_types(logs), ["r1_phase_publish_failed"])
+        self.assertNotIn(POISON_TEXT, json.dumps(logs))
+
+    async def test_the_ended_write_replaces_a_writer_that_is_stuck(self) -> None:
+        calls = {"n": 0}
+        sent: list[dict] = []
+
+        async def first_call_hangs(attributes):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                await asyncio.Event().wait()
+            sent.append(dict(attributes))
+
+        self.ctx.room.local_participant.set_attributes = first_call_hangs
+        self.interview._enter(R1Phase.TRANSITION)
+        await self.settle()
+        await asyncio.wait_for(self.interview._announce_ended(), 5.0)
+        self.assertEqual(sent, [{"phase": "ended"}])
+        # Nothing is published after ended: the page has left.
+        self.interview._enter(R1Phase.ROLEPLAY)
+        await self.settle()
+        self.assertEqual(sent, [{"phase": "ended"}])
+
+    async def test_a_normal_finish_publishes_closing_then_ended_and_never_finishing(self) -> None:
+        await self.interview._finish("complete")
+        self.assertEqual(self.published(), ["closing", "ended"])
+        self.assertIs(self.interview.machine.phase, R1Phase.FINISHING)
+
+    async def test_a_technical_stop_publishes_aborted_before_the_apology_and_then_ended(
+        self,
+    ) -> None:
+        await self.interview._finish("provider_error", system=True)
+        self.assertEqual(self.published(), ["aborted", "ended"])
+        aborted = self.order.index(("attributes", {"phase": "aborted"}))
+        apology = ("play_end", self.spoken_line("L-SYSTEM-STOP"))
+        self.assertLess(aborted, self.order.index(apology))
+        self.assertLess(self.order.index(apology), self.order.index(("attributes", {"phase": "ended"})))
+
+    async def test_nothing_but_aborted_follows_an_abort(self) -> None:
+        # The page reads the phase BEFORE `ended`: a later value would turn "technical stop"
+        # into "Interview complete".
+        self.interview._publish_abort()
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._publish_phase("closing")
+        await self.settle()
+        self.assertEqual(self.published(), ["aborted"])
+
+    async def test_an_abort_that_never_went_out_is_written_before_ended(self) -> None:
+        # No time for the background writer (no candidate to speak to, so no pause): the
+        # funnel writes `aborted` itself, inside the same bound as `ended`.
+        self.interview._publish_abort()
+        await self.interview._announce_ended()
+        self.assertEqual(self.published(), ["aborted", "ended"])
+
+    async def test_a_stop_on_our_side_that_skipped_the_closing_speech_still_aborts(self) -> None:
+        for outcome in ("provider_error", "shutdown_forced", "residency_timeout",
+                        "configuration_failed", "context_failed"):
+            with self.subTest(outcome=outcome):
+                await self.asyncSetUp()
+                await self.interview._exit(outcome)
+                self.assertEqual(self.published(), ["aborted", "ended"])
+
+    async def test_a_candidate_ending_and_a_completion_are_not_aborted(self) -> None:
+        for outcome in ("candidate_left", "complete", "no_show"):
+            with self.subTest(outcome=outcome):
+                await self.asyncSetUp()
+                await self.interview._exit(outcome)
+                self.assertEqual(self.published(), ["ended"])
+
+
+POISON_TEXT = "Quokka-utterance-4417"
+
+
+class TestEarlyFailureSettlesTheAttempt(R1TestCase):
+    """A failure before the context arrived still posts its attempt outcome.
+
+    The attempt id IS the session id, so the writer is built with it from the start.  The
+    audit's 'r1_attempt_outcome_skipped_no_attempt' came from the pre-context writer.
+    """
+
+    async def asyncSetUp(self) -> None:
+        self.order: list = []
+        self.ctx = FakeContext(self.order)
+        self.posted: list[tuple[str, dict]] = []
+
+        def requester(path, payload, _timeout=10.0):
+            self.posted.append((path, dict(payload)))
+            return {}
+
+        self.session = FakeSession(log=self.order)
+        patches = [
+            # The REAL writer, with a recording requester and the lifecycle CAS faked.
+            mock.patch.object(
+                r1_session, "R1TurnWriter",
+                lambda *args, **kwargs: R1TurnWriter(*args, requester=requester, **kwargs),
+            ),
+            mock.patch.object(
+                persistence, "fail_session",
+                mock.AsyncMock(return_value=persistence.LifecycleOutcome(
+                    persistence.LifecycleOutcome.SUCCESS)),
+            ),
+            mock.patch.object(
+                persistence, "complete_session",
+                mock.AsyncMock(return_value=persistence.LifecycleOutcome(
+                    persistence.LifecycleOutcome.SUCCESS)),
+            ),
+        ]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    async def factory(self, _ctx, _context):
+        return self.session
+
+    def outcomes(self) -> list[dict]:
+        return [payload for path, payload in self.posted
+                if path == "/api/internal/r1/attempt-outcome"]
+
+    async def test_a_connect_failure_posts_provider_error_for_the_session(self) -> None:
+        self.ctx.connect_error = RuntimeError("peer connection failed")
+        outcome = await run_r1_session(self.ctx, session_factory=self.factory)
+        self.assertEqual(outcome, "provider_error")
+        self.assertEqual(
+            self.outcomes(), [{"attempt_id": SESSION_ID, "outcome": "provider_error"}]
+        )
+
+    async def test_a_context_failure_posts_context_failed_for_the_session(self) -> None:
+        async def failing_fetch(_room):
+            raise r1_context.R1ContextError("r1_context_unavailable")
+
+        with mock.patch.object(r1_session, "fetch_context", failing_fetch):
+            outcome = await run_r1_session(self.ctx, session_factory=self.factory)
+        self.assertEqual(outcome, "context_failed")
+        self.assertEqual(
+            self.outcomes(), [{"attempt_id": SESSION_ID, "outcome": "context_failed"}]
+        )
+
+    async def test_a_cancellation_before_the_context_posts_shutdown_forced(self) -> None:
+        self.ctx.connect_hangs = True
+        task = asyncio.create_task(run_r1_session(self.ctx, session_factory=self.factory))
+        await self.until(lambda: self.ctx.connects == 1)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(
+            self.outcomes(), [{"attempt_id": SESSION_ID, "outcome": "shutdown_forced"}]
+        )
+
+    async def test_a_configuration_failure_posts_with_the_contexts_attempt_id(self) -> None:
+        async def fetch(_room):
+            return {"first_name": "Asha", "attempt_id": SESSION_ID, "attempt": {}, "settings": {}}
+
+        async def broken_factory(_ctx, _context):
+            raise r1_llm.R1LLMConfigurationError("r1_llm_key_missing")
+
+        with mock.patch.object(r1_session, "fetch_context", fetch):
+            outcome = await run_r1_session(self.ctx, session_factory=broken_factory)
+        self.assertEqual(outcome, "configuration_failed")
+        self.assertEqual(
+            self.outcomes(), [{"attempt_id": SESSION_ID, "outcome": "configuration_failed"}]
+        )
+
+    async def test_a_room_without_a_session_id_posts_no_outcome(self) -> None:
+        self.ctx.room.name = "not-a-screening-room"
+        self.ctx.connect_error = RuntimeError("peer connection failed")
+        await run_r1_session(self.ctx, session_factory=self.factory)
+        self.assertEqual(self.outcomes(), [])
+
+
+class TestEndsAfterTheRoleplay(R1TestCase):
+    """A candidate who leaves or goes silent after the role-play has finished completes it.
+
+    ``complete`` is the only status the scorer takes (the 0116 trigger enqueues r1.assessment
+    on 'completed'), and ``r1_settle_attempt`` counts the attempt as complete.  Before the
+    role-play is over the same departure stays ``candidate_left`` (a failed, unscored session).
+    """
+
+    def enter_wrapup(self) -> None:
+        self.enter_roleplay()
+        self.interview._end_roleplay()
+        self.interview.machine.transition(R1Phase.WRAPUP)
+
+    def leave(self) -> None:
+        self.ctx.room.emit("participant_disconnected", FakeParticipant("candidate"))
+
+    async def test_leaving_during_the_wrapup_completes_the_session(self) -> None:
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "rejoin_grace_seconds", return_value=0.01):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            self.leave()
+            self.assertEqual(await asyncio.wait_for(task, 10.0), "complete")
+
+    async def test_leaving_during_the_exit_line_completes_the_session(self) -> None:
+        self.enter_roleplay()
+        self.interview._end_roleplay()  # ROLEPLAY_EXIT: the learner has just stepped out
+        with mock.patch.object(r1_session, "rejoin_grace_seconds", return_value=0.01):
+            self.leave()
+            self.assertEqual(await self.interview._handle_attention(), "complete")
+
+    async def test_leaving_during_the_roleplay_stays_candidate_left(self) -> None:
+        self.enter_roleplay()
+        with mock.patch.object(r1_session, "rejoin_grace_seconds", return_value=0.01):
+            task = asyncio.create_task(self.interview._roleplay_turn())
+            await self.settle()
+            self.leave()
+            self.assertEqual(await asyncio.wait_for(task, 10.0), "candidate_left")
+
+    async def test_leaving_before_the_roleplay_is_over_stays_candidate_left(self) -> None:
+        for phase in ("icebreaker", "roleplay"):
+            with self.subTest(phase=phase):
+                await self.asyncSetUp()  # a fresh interview per phase
+                if phase == "roleplay":
+                    self.enter_roleplay()
+                with mock.patch.object(r1_session, "rejoin_grace_seconds", return_value=0.01):
+                    self.leave()
+                    self.assertEqual(await self.interview._handle_attention(), "candidate_left")
+
+    async def test_a_candidate_who_comes_back_within_the_grace_resumes_the_wrapup(self) -> None:
+        self.enter_wrapup()
+        task = asyncio.create_task(self.interview._run_wrapup())
+        await self.settle()
+        self.leave()
+        await self.until(lambda: self.interview.machine.phase is R1Phase.PAUSED_DISCONNECTED)
+        self.ctx.room.emit("participant_connected", FakeParticipant("candidate"))
+        await self.until(lambda: self.spoken_and_played("L-REJOIN"))
+        self.assertIs(self.interview.machine.phase, R1Phase.WRAPUP)
+        self.assertFalse(task.done())
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_losing_the_room_after_the_candidate_left_in_wrapup_completes(self) -> None:
+        self.enter_wrapup()
+        self.leave()
+        self.ctx.room.emit("disconnected", "room closed")
+        self.assertEqual(self.interview._stop_outcome(), "complete")
+        self.assertEqual(self.interview._cancel_outcome(), "complete")
+
+    async def test_losing_the_room_in_the_roleplay_stays_candidate_left(self) -> None:
+        self.enter_roleplay()
+        self.leave()
+        self.ctx.room.emit("disconnected", "room closed")
+        self.assertEqual(self.interview._stop_outcome(), "candidate_left")
+
+    async def test_a_room_lost_while_the_candidate_is_present_is_still_a_system_stop(self) -> None:
+        self.enter_wrapup()
+        self.ctx.room.emit("disconnected", "room closed")
+        self.assertEqual(self.interview._stop_outcome(), "shutdown_forced")
+
+    async def test_the_clock_running_out_in_the_wrapup_completes_the_role_play_does_not(
+        self,
+    ) -> None:
+        self.enter_wrapup()
+        self.interview._on_residency_deadline()
+        self.assertEqual(self.interview._stop_outcome(), "complete")
+        await self.asyncSetUp()
+        self.enter_roleplay()
+        self.interview._on_forced_close_deadline()
+        self.assertEqual(self.interview._stop_outcome(), "residency_timeout")
+
+    async def test_a_provider_failure_in_the_wrapup_is_still_a_stop_on_our_side(self) -> None:
+        self.enter_wrapup()
+        self.interview._provider_abort = True
+        self.assertEqual(self.interview._stop_outcome(), "provider_error")
+
+    async def test_a_complete_stop_says_the_closing_line_not_the_apology(self) -> None:
+        self.enter_wrapup()
+        self.assertEqual(await self.interview._finish_stop("complete"), "complete")
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-CLOSE")])
+        self.assertNotIn(self.spoken_line("L-SYSTEM-STOP"), self.session.spoken)
+
+    async def test_a_complete_stop_for_a_candidate_who_is_gone_says_nothing(self) -> None:
+        self.enter_wrapup()
+        self.leave()
+        self.assertEqual(await self.interview._finish_stop("complete"), "complete")
+        self.assertEqual(self.session.spoken, [])
 
 
 class TestPhoneIsolation(unittest.TestCase):
