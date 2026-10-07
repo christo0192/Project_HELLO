@@ -180,7 +180,17 @@ const ROUTES: Array<[string, string, Handler]> = [
   // must list three roles and hide three.
   ['GET', '/api/roles', (_r, db) => {
     const mapped = new Set(db.ashby.mappings.map((m) => m.roleId).filter(Boolean));
-    return ok(db.roles.map((role) => ({ ...role, has_ashby_mapping: mapped.has(role.id) })));
+    // `ashby_mapping_statuses`: the distinct, sorted statuses of the role's
+    // non-archived mappings (drives the Candidates Active / Paused scope).
+    const statusesOf = (roleId: string) =>
+      [...new Set(db.ashby.mappings.filter((m) => m.roleId === roleId).map((m) => m.status))].sort();
+    return ok(
+      db.roles.map((role) => ({
+        ...role,
+        has_ashby_mapping: mapped.has(role.id),
+        ashby_mapping_statuses: statusesOf(role.id),
+      })),
+    );
   }],
   ['POST', '/api/roles', ({ body }, db) => {
     const role = { ...(body as unknown as Role), id: mintId(), is_active: true, created_at: nowIso() };
@@ -226,7 +236,14 @@ const ROUTES: Array<[string, string, Handler]> = [
   ['GET', '/api/candidates/summary', (_r, db) => ok(summaryOf(db))],
   ['GET', '/api/candidates', ({ query }, db) => {
     const roleId = query.get('role_id');
-    return ok(roleId ? db.candidates.filter((c) => c.role_id === roleId) : db.candidates);
+    const rows = roleId ? db.candidates.filter((c) => c.role_id === roleId) : db.candidates;
+    // `ashby_job_status`: the status of the Ashby job mapping the candidate's
+    // application link points at. The fixture has one mapping per mapped role
+    // and links each candidate to their role's mapping; unmapped roles (and
+    // role-less candidates) have no link, so null.
+    const statusOf = (roleKey: string | null) =>
+      db.ashby.mappings.find((m) => m.roleId === roleKey)?.status ?? null;
+    return ok(rows.map((c) => ({ ...c, ashby_job_status: c.role_id ? statusOf(c.role_id) : null })));
   }],
   ['GET', '/api/candidates/:id', ({ params }, db) => {
     const detail = db.candidateDetail(params.id);

@@ -19,6 +19,9 @@
  *   client-side over the already-loaded page: additive, adds no request, and
  *   changes nothing about the status vocabulary.
  * - `role` is a role id, applied server-side via `listCandidates(roleId)`.
+ * - `ashby` is `active` | `paused`: scope to roles whose Ashby job mapping is
+ *   Live (enabled) or Paused in Ashby Live Jobs. Applied client-side from the
+ *   roles list (`ashby_mapping_statuses`), never sent to the candidates API.
  * - `q` is a free-text search (name / email / phone digits). Applied
  *   client-side over the already-loaded rows by `matchesCandidateSearch`
  *   (candidateSearch.ts) and NEVER sent to the API, so it can only narrow
@@ -32,6 +35,7 @@
 import type { Candidate } from '../../types';
 import { candidateStatusKey, candidateStatusLabel } from './status';
 import { RESUME_REVIEW_ORDER } from './ResumeReviewBadge';
+import type { AshbyJobState } from '../../lib/mapped-roles';
 
 /**
  * Canonical funnel order for the candidate display-status vocabulary. The
@@ -106,6 +110,8 @@ export interface CandidateFilters {
   assessed: boolean;
   /** Selected role id, or null for all roles. */
   roleId: string | null;
+  /** Ashby job state scope (`active` | `paused`), or null for all. */
+  jobState: AshbyJobState | null;
   /**
    * Normalized free-text search (`''` = none). Client-side only; see
    * `matchesCandidateSearch`. `matchesCandidateFilters` deliberately ignores
@@ -134,6 +140,7 @@ export const EMPTY_CANDIDATE_FILTERS: CandidateFilters = {
   resumeReview: [],
   assessed: false,
   roleId: null,
+  jobState: null,
   query: '',
 };
 
@@ -164,12 +171,14 @@ export function parseCandidateFilters(params: URLSearchParams): CandidateFilters
       )
     : [];
   const roleId = params.get('role');
+  const rawAshby = params.get('ashby');
   return {
     statuses: [...statuses],
     recommendations: [...recommendations],
     resumeReview: [...resumeReview],
     assessed: params.get('assessed') === '1',
     roleId: roleId && roleId.trim() ? roleId.trim() : null,
+    jobState: rawAshby === 'active' || rawAshby === 'paused' ? rawAshby : null,
     query: normalizeCandidateQuery(params.get('q')),
   };
 }
@@ -194,6 +203,7 @@ export function buildCandidateSearch(filters: CandidateFilters): URLSearchParams
   }
   if (filters.assessed) params.set('assessed', '1');
   if (filters.roleId) params.set('role', filters.roleId);
+  if (filters.jobState) params.set('ashby', filters.jobState);
   // LAST, so every pre-existing canonical href is byte-identical.
   const query = normalizeCandidateQuery(filters.query);
   if (query) params.set('q', query);
@@ -252,6 +262,7 @@ export function hasActiveFilters(filters: CandidateFilters): boolean {
     filters.resumeReview.length > 0 ||
     filters.assessed ||
     filters.roleId !== null ||
+    filters.jobState !== null ||
     filters.query !== ''
   );
 }

@@ -38,6 +38,10 @@ const ROLE_MAPPING_BATCH = 100;
 // and audited (every page load wrote a `resource.list` row). One extra read
 // for the whole page, never one per role, and no audit write: this is the
 // same unaudited viewer read it always was.
+//
+// It also carries `ashby_mapping_statuses` (the distinct mapping statuses of
+// those non-archived rows) so the Candidates page can offer Active / Paused
+// without a second request.
 rolesRouter.get('/', requireRole('viewer'), async (req, res, next) => {
   let q = supabase
     .from('roles')
@@ -55,24 +59,40 @@ rolesRouter.get('/', requireRole('viewer'), async (req, res, next) => {
   const rows = (Array.isArray(data) ? data : []) as Array<Record<string, unknown> & { id: string }>;
   const ids = rows.map((row) => row.id).filter((id): id is string => typeof id === 'string');
   const mapped = new Set<string>();
+  const statusesByRole = new Map<string, Set<string>>();
   try {
     // Batched only so an admin with hundreds of roles never builds an
     // `in.(…)` URL a proxy refuses; a normal page is one read.
     for (let start = 0; start < ids.length; start += ROLE_MAPPING_BATCH) {
       const { data: mappings, error: mappingError } = await supabase
         .from('ashby_job_mappings')
-        .select('role_id')
+        .select('role_id, status')
         .is('archived_at', null)
         .in('role_id', ids.slice(start, start + ROLE_MAPPING_BATCH));
       if (mappingError) return next(mappingError);
-      for (const mapping of (mappings ?? []) as Array<{ role_id?: unknown }>) {
-        if (typeof mapping.role_id === 'string') mapped.add(mapping.role_id);
+      for (const mapping of (mappings ?? []) as Array<{ role_id?: unknown; status?: unknown }>) {
+        if (typeof mapping.role_id !== 'string') continue;
+        mapped.add(mapping.role_id);
+        if (mapping.status === 'enabled' || mapping.status === 'paused' || mapping.status === 'drift') {
+          const set = statusesByRole.get(mapping.role_id) ?? new Set<string>();
+          set.add(mapping.status);
+          statusesByRole.set(mapping.role_id, set);
+        }
       }
     }
   } catch (err) {
     return next(err);
   }
-  res.json(rows.map((row) => ({ ...row, has_ashby_mapping: mapped.has(row.id) })));
+  res.json(
+    rows.map((row) => ({
+      ...row,
+      has_ashby_mapping: mapped.has(row.id),
+      // Sorted, de-duplicated statuses of the role's non-archived mappings.
+      // Active = includes 'enabled' (Live), Paused = includes 'paused';
+      // 'drift' (Out of sync) is in neither filter.
+      ashby_mapping_statuses: [...(statusesByRole.get(row.id) ?? [])].sort(),
+    })),
+  );
 });
 
 // ── Ask Hello ────────────────────────────────────────────────────────────

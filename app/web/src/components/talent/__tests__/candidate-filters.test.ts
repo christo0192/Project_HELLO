@@ -48,6 +48,7 @@ describe('parseCandidateFilters', () => {
       resumeReview: [],
       assessed: true,
       roleId: 'r1',
+      jobState: null,
       query: '',
     });
   });
@@ -81,8 +82,17 @@ describe('buildCandidateSearch / candidatesHref', () => {
       resumeReview: [],
       assessed: true,
       roleId: 'r9',
+      jobState: null,
       query: '',
     });
+  });
+
+  it('round-trips the Ashby job state (ashby=active|paused) before q, and drops unknowns', () => {
+    const href = candidatesHref({ roleId: 'r1', jobState: 'active', query: 'sam' });
+    expect(href).toBe('/candidates?role=r1&ashby=active&q=sam');
+    expect(parseCandidateFilters(new URLSearchParams('ashby=paused')).jobState).toBe('paused');
+    expect(parseCandidateFilters(new URLSearchParams('ashby=drift')).jobState).toBeNull();
+    expect(buildCandidateSearch(f({ jobState: null })).has('ashby')).toBe(false);
   });
 
   it('produces a bare path with no filters', () => {
@@ -199,6 +209,7 @@ describe('hasActiveFilters / normalizeStatus / recommendationLabel', () => {
     expect(hasActiveFilters(f({ recommendations: ['hold'] }))).toBe(true);
     expect(hasActiveFilters(f({ assessed: true }))).toBe(true);
     expect(hasActiveFilters(f({ roleId: 'r' }))).toBe(true);
+    expect(hasActiveFilters(f({ jobState: 'paused' }))).toBe(true);
     expect(hasActiveFilters(f({ query: 'x' }))).toBe(true);
   });
 
@@ -263,6 +274,7 @@ describe('resume-review facet', () => {
       resumeReview: ['processing', 'cancelled'],
       assessed: true,
       roleId: 'r9',
+      jobState: null,
       query: '',
     });
   });

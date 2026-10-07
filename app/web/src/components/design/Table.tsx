@@ -36,7 +36,10 @@ export function Table({ caption, className, children, bare = false, maxHeight, .
       tabIndex={maxHeight ? 0 : undefined}
       className={cx(
         'w-full overflow-x-auto',
-        bare ? '' : 'glass rounded-card',
+        // Bare still establishes the containing block: an absolutely placed
+        // cell child (a row's stretched link) must be clipped by this scroller,
+        // not escape to the page and scroll it sideways.
+        bare ? 'relative' : 'glass rounded-card',
         maxHeight && 'overflow-y-auto focus:outline-none focus-visible:ring-2 focus-visible:ring-info',
       )}
       style={maxHeight ? { maxHeight } : undefined}

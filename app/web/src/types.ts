@@ -151,6 +151,13 @@ export interface Role {
    */
   has_ashby_mapping?: boolean;
   /**
+   * Distinct statuses of the role's non-archived Ashby mappings (Live Jobs:
+   * enabled = Live, paused = Paused, drift = Out of sync). Drives the
+   * Candidates Active / Paused filter. Absent on an API older than the
+   * field, in which case that control is hidden.
+   */
+  ashby_mapping_statuses?: Array<'enabled' | 'paused' | 'drift'>;
+  /**
    * 0115: non-null marks a role that is run by a dedicated interview lane
    * (today only `sales_r1`, the WebRTC sales role-play). Such a role is
    * never offered to an Ashby mapping (a DB trigger and the mapping route
@@ -291,6 +298,14 @@ export interface Candidate {
    * that predate the field; null when the candidate has no Ashby ingestion.
    */
   resume_review?: ResumeReview | null;
+  /**
+   * Status of the (non-archived) Ashby job mapping the candidate's own
+   * application link points at: enabled = Live, paused = Paused, drift = Out
+   * of sync. null = no Ashby link / archived / unreadable. ABSENT on an API
+   * older than the field, in which case the Candidates Active / Paused scope
+   * falls back to the role-level rule.
+   */
+  ashby_job_status?: 'enabled' | 'paused' | 'drift' | null;
   /**
    * Phone-screen progress (list and detail endpoints). Optional: payloads
    * that predate the fields, and the Ashby scoped review, omit them.

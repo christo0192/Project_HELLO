@@ -9,8 +9,9 @@
  *   - Keyboard and focus management
  */
 
-import { render, screen, waitFor, act, within } from '@testing-library/react';
+import { render as rtlRender, screen, waitFor, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { RolesPage } from './RolesPage';
 import { mockRole } from '../test/helpers';
@@ -82,6 +83,28 @@ vi.mock('../api', () => ({
     }
   },
 }));
+
+// The page keeps its status filter in the URL, so it needs a router. Every
+// test renders through this wrapper; `initialUrl` seeds a deep link and the
+// probe exposes the current query string.
+let initialUrl = '/roles';
+beforeEach(() => {
+  initialUrl = '/roles';
+});
+
+function LocationProbe() {
+  const { search } = useLocation();
+  return <div data-testid="location-search" hidden>{search}</div>;
+}
+
+function render(ui: React.ReactElement) {
+  return rtlRender(
+    <MemoryRouter initialEntries={[initialUrl]}>
+      {ui}
+      <LocationProbe />
+    </MemoryRouter>,
+  );
+}
 
 const DRAFTED = {
   jd: 'Sell the product to enterprise buyers.',
@@ -179,7 +202,8 @@ describe('RolesPage', () => {
     render(<RolesPage />);
 
     expect(await screen.findByText('Senior Frontend Engineer')).toBeInTheDocument();
-    expect(screen.getByText('Active')).toBeInTheDocument();
+    // Scoped to the row: the status filter's "Active" segment shares the word.
+    expect(within(screen.getByRole('list', { name: 'All agents' })).getByText('Active')).toBeInTheDocument();
     expect(screen.getByText('We need a React expert.')).toBeInTheDocument();
     expect(screen.getByText('2 screening questions')).toBeInTheDocument();
   });
@@ -699,6 +723,153 @@ describe('The role list — one surface of rows, not a card wall', () => {
     ]);
     const { container } = render(<RolesPage />);
     await screen.findByRole('list', { name: 'All agents' });
+    await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('The status filter — All / Active / Inactive', () => {
+  beforeEach(() => {
+    mockAuth = { role: 'interviewer' };
+    vi.clearAllMocks();
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: { metrics: [] } });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
+  });
+
+  const role = (n: number, over: Partial<typeof mockRole> = {}) => ({
+    ...mockRole,
+    id: `role-${n}`,
+    title: `Role number ${n}`,
+    ...over,
+  });
+  const mixed = () => [role(1), role(2, { is_active: false }), role(3), role(4, { is_active: false }), role(5, { is_active: false })];
+  const titles = async () =>
+    within(await screen.findByRole('list', { name: 'All agents' }))
+      .getAllByRole('heading', { level: 3 })
+      .map((h) => h.textContent);
+  const search = () => screen.getByTestId('location-search').textContent;
+
+  it('offers All, Active and Inactive with a count on each', async () => {
+    mockApi.listRoles.mockResolvedValue(mixed());
+    render(<RolesPage />);
+    const group = await screen.findByRole('group', { name: 'Filter agents by status' });
+    expect(within(group).getByRole('button', { name: /^All\s*5$/ })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(group).getByRole('button', { name: /^Active\s*2$/ })).toHaveAttribute('aria-pressed', 'false');
+    expect(within(group).getByRole('button', { name: /^Inactive\s*3$/ })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('filters the rows, writes ?status= to the URL, and leaves the summary counting every agent', async () => {
+    mockApi.listRoles.mockResolvedValue(mixed());
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    expect(await titles()).toHaveLength(5);
+
+    await user.click(screen.getByRole('button', { name: /^Inactive/ }));
+    expect(await titles()).toEqual(['Role number 2', 'Role number 4', 'Role number 5']);
+    expect(search()).toBe('?status=inactive');
+    expect(screen.getByText('5 agents, 2 active')).toBeInTheDocument();
+    expect(screen.getByRole('status')).toHaveTextContent('Showing 3 of 5 agents');
+
+    await user.click(screen.getByRole('button', { name: /^Active/ }));
+    expect(await titles()).toEqual(['Role number 1', 'Role number 3']);
+    expect(search()).toBe('?status=active');
+
+    await user.click(screen.getByRole('button', { name: /^All/ }));
+    expect(await titles()).toHaveLength(5);
+    expect(search()).toBe('');
+  });
+
+  it('opens already filtered from a deep link, and ignores an unknown value', async () => {
+    initialUrl = '/roles?status=inactive';
+    mockApi.listRoles.mockResolvedValue(mixed());
+    const first = render(<RolesPage />);
+    expect(await titles()).toEqual(['Role number 2', 'Role number 4', 'Role number 5']);
+    expect(screen.getByRole('button', { name: /^Inactive/ })).toHaveAttribute('aria-pressed', 'true');
+    first.unmount();
+
+    initialUrl = '/roles?status=bogus';
+    render(<RolesPage />);
+    expect(await titles()).toHaveLength(5);
+    expect(screen.getByRole('button', { name: /^All/ })).toHaveAttribute('aria-pressed', 'true');
+  });
+
+  it('keeps other query params when the filter changes', async () => {
+    initialUrl = '/roles?foo=1';
+    mockApi.listRoles.mockResolvedValue(mixed());
+    render(<RolesPage />);
+    await userEvent.setup().click(await screen.findByRole('button', { name: /^Active/ }));
+    expect(search()).toBe('?foo=1&status=active');
+  });
+
+  it('shows a calm empty state with "Show all agents" when the filter matches nothing', async () => {
+    initialUrl = '/roles?status=inactive';
+    mockApi.listRoles.mockResolvedValue([role(1), role(2)]);
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    expect(await screen.findByText('No inactive agents. Every agent is active.')).toBeInTheDocument();
+    expect(screen.queryByRole('list', { name: 'All agents' })).toBeNull();
+    // Not the first-run empty state.
+    expect(screen.queryByText('No agents yet')).toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Show all agents' }));
+    expect(await titles()).toHaveLength(2);
+    expect(search()).toBe('');
+  });
+
+  it('counts and filters with ONE predicate, even for a non-boolean is_active', async () => {
+    // Typed boolean, but nothing checks it at runtime: null must land in
+    // Inactive in the count AND in the list, never in the count alone.
+    const odd = [role(1), role(2, { is_active: null as unknown as boolean }), role(3, { is_active: false })];
+    mockApi.listRoles.mockResolvedValue(odd);
+    initialUrl = '/roles?status=inactive';
+    render(<RolesPage />);
+    expect(await titles()).toEqual(['Role number 2', 'Role number 3']);
+    expect(screen.getByRole('button', { name: /^Inactive\s*2$/ })).toBeInTheDocument();
+  });
+
+  it('says so when no agent is active', async () => {
+    initialUrl = '/roles?status=active';
+    mockApi.listRoles.mockResolvedValue([role(1, { is_active: false })]);
+    render(<RolesPage />);
+    expect(await screen.findByText('No active agents right now.')).toBeInTheDocument();
+    expect(screen.getByText('1 agent, none active')).toBeInTheDocument();
+  });
+
+  it('returns to page 1 when the filter changes', async () => {
+    const many = Array.from({ length: 14 }, (_, i) => role(i + 1, { is_active: i % 2 === 0 }));
+    mockApi.listRoles.mockResolvedValue(many);
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    await screen.findByRole('navigation', { name: 'agents pagination' });
+    await user.click(screen.getByRole('button', { name: /next/i }));
+    expect(await titles()).toEqual(['Role number 11', 'Role number 12', 'Role number 13', 'Role number 14']);
+    await user.click(screen.getByRole('button', { name: /^Active/ }));
+    // Seven active agents fit one page, and the list starts at its top.
+    expect((await titles())[0]).toBe('Role number 1');
+    expect(screen.queryByRole('navigation', { name: 'agents pagination' })).toBeNull();
+  });
+
+  it('survives a removal reload: the filter stays and the counts update', async () => {
+    initialUrl = '/roles?status=inactive';
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+    mockApi.listRoles
+      .mockResolvedValueOnce([role(1), role(2, { is_active: false })])
+      .mockResolvedValue([role(1), role(2, { is_active: false })]);
+    mockApi.deleteRole.mockResolvedValue({ outcome: 'archived', candidates: 1, sessions: 0 });
+    render(<RolesPage />);
+    await userEvent.setup().click(await screen.findByRole('button', { name: 'Delete agent Role number 2' }));
+    await waitFor(() => expect(mockApi.listRoles).toHaveBeenCalledTimes(2));
+    expect(await titles()).toEqual(['Role number 2']);
+    expect(search()).toBe('?status=inactive');
+  });
+
+  it('is reachable by keyboard and has no axe violations, filtered or not', async () => {
+    mockApi.listRoles.mockResolvedValue(mixed());
+    const { container } = render(<RolesPage />);
+    const user = userEvent.setup();
+    const inactive = await screen.findByRole('button', { name: /^Inactive/ });
+    inactive.focus();
+    await user.keyboard('{Enter}');
+    expect(inactive).toHaveAttribute('aria-pressed', 'true');
     await expect(container).toHaveNoViolations();
   });
 });

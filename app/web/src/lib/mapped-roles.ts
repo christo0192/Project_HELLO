@@ -33,7 +33,64 @@ export type FilterableRole = {
   title: string;
   agent_name?: string | null;
   has_ashby_mapping?: boolean | null;
+  ashby_mapping_statuses?: readonly string[] | null;
 };
+
+/** The Ashby job state a filter can scope to (see `ashby_mapping_statuses`). */
+export type AshbyJobState = 'active' | 'paused';
+
+/**
+ * True when every row carries the server's `ashby_mapping_statuses` array.
+ * False means an older API: the Active / Paused control is hidden rather
+ * than shown filtering everything away.
+ */
+export function hasMappingStatuses(roles: readonly FilterableRole[]): boolean {
+  return roles.length > 0 && roles.every((role) => Array.isArray(role.ashby_mapping_statuses));
+}
+
+/**
+ * Does the role belong to the Ashby job state? Active = at least one
+ * non-archived mapping is `enabled` (Live); Paused = at least one is
+ * `paused`. `drift` (Out of sync) is in neither. A role with both a live and
+ * a paused mapping matches both.
+ */
+export function roleMatchesJobState(role: FilterableRole, state: AshbyJobState | null): boolean {
+  if (!state) return true;
+  const statuses = role.ashby_mapping_statuses ?? [];
+  return statuses.includes(state === 'active' ? 'enabled' : 'paused');
+}
+
+/** The slice of a candidate the per-candidate Ashby job scope reads. */
+export type JobStatusCandidate = {
+  role_id: string | null;
+  ashby_job_status?: 'enabled' | 'paused' | 'drift' | null;
+};
+
+/**
+ * True when the loaded candidates carry the server's per-candidate
+ * `ashby_job_status` (an older API omits it). Needs at least one row: an
+ * empty set cannot say, and has nothing to scope anyway.
+ */
+export function candidatesCarryJobStatus(candidates: readonly JobStatusCandidate[]): boolean {
+  return candidates.length > 0 && candidates.every((c) => c.ashby_job_status !== undefined);
+}
+
+/**
+ * Does the candidate belong to the Ashby job state? Per CANDIDATE: the status
+ * of the job its own application link points at (enabled = Active, paused =
+ * Paused; drift and no link are in neither). Falls back to the role-level
+ * rule when the API predates `ashby_job_status`.
+ */
+export function candidateMatchesJobState(
+  candidate: JobStatusCandidate,
+  state: AshbyJobState,
+  perCandidate: boolean,
+  roleById: ReadonlyMap<string, FilterableRole>,
+): boolean {
+  if (perCandidate) return candidate.ashby_job_status === (state === 'active' ? 'enabled' : 'paused');
+  const role = candidate.role_id != null ? roleById.get(candidate.role_id) : undefined;
+  return role ? roleMatchesJobState(role, state) : false;
+}
 
 /**
  * True when the payload carries the server's mapping flag — every row has a
@@ -44,13 +101,20 @@ export function hasMappingFlag(roles: readonly FilterableRole[]): boolean {
 }
 
 /** The roles a filter lists: the mapped ones, or every role on an older API. */
-export function listedRoles<T extends FilterableRole>(roles: readonly T[]): T[] {
-  return hasMappingFlag(roles) ? roles.filter((role) => role.has_ashby_mapping === true) : [...roles];
+export function listedRoles<T extends FilterableRole>(
+  roles: readonly T[],
+  jobState: AshbyJobState | null = null,
+): T[] {
+  const mapped = hasMappingFlag(roles) ? roles.filter((role) => role.has_ashby_mapping === true) : [...roles];
+  return jobState ? mapped.filter((role) => roleMatchesJobState(role, jobState)) : mapped;
 }
 
 /** The options a role filter lists after "All roles", sorted by label. */
-export function roleFilterOptions(roles: readonly FilterableRole[]): RoleFilterOption[] {
-  const listed = listedRoles(roles);
+export function roleFilterOptions(
+  roles: readonly FilterableRole[],
+  jobState: AshbyJobState | null = null,
+): RoleFilterOption[] {
+  const listed = listedRoles(roles, jobState);
   const labels = uniqueRoleLabels(listed);
   return listed
     .map((role) => ({ id: role.id, label: labels.get(role.id) ?? role.title }))

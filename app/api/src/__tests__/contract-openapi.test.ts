@@ -1367,7 +1367,7 @@ describe('live handler shapes match documented schemas', () => {
   it('GET /api/roles → RoleListItem[] (Role + has_ashby_mapping)', async () => {
     configureTables({
       roles: ok([mockRole]),
-      ashby_job_mappings: ok([{ role_id: mockRole.id }]),
+      ashby_job_mappings: ok([{ role_id: mockRole.id, status: 'enabled' }]),
     });
     const app = createContractApp();
     const res = await request(app).get('/api/roles').set('Authorization', AUTH_HEADER);
@@ -1378,6 +1378,9 @@ describe('live handler shapes match documented schemas', () => {
     // The flag is REQUIRED on the list item: a row without it must not validate.
     const { has_ashby_mapping: _flag, ...withoutFlag } = res.body[0];
     expect(validateNamed(withoutFlag, 'RoleListItem', spec)).not.toEqual([]);
+    expect(res.body[0].ashby_mapping_statuses).toEqual(['enabled']);
+    const { ashby_mapping_statuses: _statuses, ...withoutStatuses } = res.body[0];
+    expect(validateNamed(withoutStatuses, 'RoleListItem', spec)).not.toEqual([]);
   });
 
   it('GET /api/roles/{id} → Role', async () => {
@@ -1417,6 +1420,12 @@ describe('live handler shapes match documented schemas', () => {
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
     expect(validateNamed(res.body[0], 'CandidateListItem', spec)).toEqual([]);
+    // ashby_job_status is OPTIONAL (omitted when the status could not be computed) and nullable.
+    expect(res.body[0].ashby_job_status).toBeNull();
+    const { ashby_job_status: _status, ...withoutStatus } = res.body[0];
+    expect(validateNamed(withoutStatus, 'CandidateListItem', spec)).toEqual([]);
+    expect(validateNamed({ ...res.body[0], ashby_job_status: 'paused' }, 'CandidateListItem', spec)).toEqual([]);
+    expect(validateNamed({ ...res.body[0], ashby_job_status: 'bogus' }, 'CandidateListItem', spec)).not.toEqual([]);
   });
 
   it('GET /api/candidates → CandidateListItem[] with phone progress (dialled, never engaged, unknown)', async () => {

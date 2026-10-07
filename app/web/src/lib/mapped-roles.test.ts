@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
+  candidateMatchesJobState,
+  candidatesCarryJobStatus,
   hasMappingFlag,
+  hasMappingStatuses,
   listedRoles,
+  roleMatchesJobState,
   roleFilterOptions,
   shouldResetRoleFilter,
   type FilterableRole,
@@ -93,5 +97,72 @@ describe('shouldResetRoleFilter', () => {
 
   it('keeps any real role on an older API, where every role is offered', () => {
     expect(shouldResetRoleFilter('r4', true, roleFilterOptions(UNFLAGGED))).toBe(false);
+  });
+});
+
+describe('Ashby job state (Active / Paused)', () => {
+  const STATUSED: FilterableRole[] = [
+    { id: 'live', title: 'Live Role', has_ashby_mapping: true, ashby_mapping_statuses: ['enabled'] },
+    { id: 'paused', title: 'Paused Role', has_ashby_mapping: true, ashby_mapping_statuses: ['paused'] },
+    { id: 'both', title: 'Both Role', has_ashby_mapping: true, ashby_mapping_statuses: ['enabled', 'paused'] },
+    { id: 'drift', title: 'Drift Role', has_ashby_mapping: true, ashby_mapping_statuses: ['drift'] },
+    { id: 'none', title: 'Unmapped', has_ashby_mapping: false, ashby_mapping_statuses: [] },
+  ];
+
+  it('hasMappingStatuses needs the array on every row (older API: false)', () => {
+    expect(hasMappingStatuses(STATUSED)).toBe(true);
+    expect(hasMappingStatuses(FLAGGED)).toBe(false);
+    expect(hasMappingStatuses([])).toBe(false);
+  });
+
+  it('Active = includes enabled, Paused = includes paused, drift is in neither', () => {
+    const ids = (state: 'active' | 'paused' | null) =>
+      STATUSED.filter((r) => roleMatchesJobState(r, state)).map((r) => r.id);
+    expect(ids('active')).toEqual(['live', 'both']);
+    expect(ids('paused')).toEqual(['paused', 'both']);
+    expect(ids(null)).toHaveLength(5);
+  });
+
+  it('scopes the role dropdown options to the state', () => {
+    expect(roleFilterOptions(STATUSED, 'paused').map((o) => o.id).sort()).toEqual(['both', 'paused']);
+    expect(roleFilterOptions(STATUSED).map((o) => o.id)).toHaveLength(4);
+    expect(listedRoles(STATUSED, 'active').map((r) => r.id)).toEqual(['live', 'both']);
+  });
+
+  it('resets a role outside the scoped options', () => {
+    expect(shouldResetRoleFilter('live', true, roleFilterOptions(STATUSED, 'paused'))).toBe(true);
+    expect(shouldResetRoleFilter('both', true, roleFilterOptions(STATUSED, 'paused'))).toBe(false);
+  });
+});
+
+describe('per-candidate Ashby job status', () => {
+  const ROLES_BY_ID: FilterableRole[] = [
+    { id: 'live', title: 'Live Role', has_ashby_mapping: true, ashby_mapping_statuses: ['enabled'] },
+    { id: 'both', title: 'Both Role', has_ashby_mapping: true, ashby_mapping_statuses: ['enabled', 'paused'] },
+  ];
+  const byId = new Map(ROLES_BY_ID.map((r) => [r.id, r]));
+  const c = (role_id: string | null, ashby_job_status?: 'enabled' | 'paused' | 'drift' | null) => ({
+    role_id,
+    ...(ashby_job_status === undefined ? {} : { ashby_job_status }),
+  });
+
+  it('detects the field only when every row carries it (null counts, absent does not)', () => {
+    expect(candidatesCarryJobStatus([])).toBe(false);
+    expect(candidatesCarryJobStatus([c('live', null), c('both', 'paused')])).toBe(true);
+    expect(candidatesCarryJobStatus([c('live', null), c('both')])).toBe(false);
+  });
+
+  it('attributes through the candidate own job, not the role', () => {
+    // `both` has a live AND a paused job; this candidate applied via the paused one.
+    expect(candidateMatchesJobState(c('both', 'paused'), 'active', true, byId)).toBe(false);
+    expect(candidateMatchesJobState(c('both', 'paused'), 'paused', true, byId)).toBe(true);
+    expect(candidateMatchesJobState(c('both', 'drift'), 'paused', true, byId)).toBe(false);
+    expect(candidateMatchesJobState(c('both', null), 'active', true, byId)).toBe(false);
+  });
+
+  it('falls back to the role-level rule without the field, and a role-less candidate is in neither', () => {
+    expect(candidateMatchesJobState(c('both'), 'active', false, byId)).toBe(true);
+    expect(candidateMatchesJobState(c('both'), 'paused', false, byId)).toBe(true);
+    expect(candidateMatchesJobState(c(null), 'active', false, byId)).toBe(false);
   });
 });

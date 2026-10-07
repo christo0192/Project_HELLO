@@ -25,13 +25,21 @@
  * (`parseCandidateFilters` / `buildCandidateSearch` / `matchesCandidateFilters`)
  * is untouched: the chips, the counts and "Clear all" drive the same URL.
  *
+ * ACTIVE / PAUSED (`?ashby=active|paused`) scopes the page to roles whose
+ * Ashby job mapping is Live (enabled) or Paused in Ashby Live Jobs, from
+ * `GET /api/roles` `ashby_mapping_statuses`. The scope feeds the table, the
+ * counts, both bars, the Pipeline-by-role panel and the role dropdown, so no
+ * figure counts a candidate the filter hides. Hidden on an API without the
+ * field.
+ *
  * SEARCH (`?q=`) is the fifth URL dimension. It matches name, email and —
  * only when the row carries one, i.e. only for a role the API lets see it —
  * phone digits (`matchesCandidateSearch`). It runs client-side over the rows
  * already loaded, so it can never widen what the server returned, and the
  * query is never sent to the API or logged. The input writes the URL after a
  * short debounce with REPLACE (one history entry per search, not one per
- * keystroke), so Back from a candidate returns to the searched list.
+ * keystroke), so Back from a candidate returns to the searched list. The box
+ * lives in the candidate-list panel header, next to the rows it filters.
  */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -39,7 +47,11 @@ import type { RefObject } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import {
+  candidateMatchesJobState,
+  candidatesCarryJobStatus,
+  hasMappingStatuses,
   roleFilterOptions,
+  roleMatchesJobState,
   shouldResetRoleFilter,
 } from "../lib/mapped-roles";
 import type { Candidate, Role } from "../types";
@@ -55,6 +67,7 @@ import {
   InlineNotice,
   LoadingPanel,
   Pagination,
+  SegmentedControl,
   SelectField,
   StatusBadge,
   Table,
@@ -233,7 +246,7 @@ function SkillsCell({ skills }: { skills: string[] }) {
   const more = skills.length - shown.length;
   return (
     <span
-      className="flex w-[8.5rem] items-baseline gap-1.5 text-label"
+      className="flex w-[7.5rem] items-baseline gap-1.5 text-label"
       title={skills.join(", ")}
     >
       <span className="min-w-0 truncate text-[var(--c-ink)]">{shown.join(", ")}</span>
@@ -344,8 +357,10 @@ export function CandidatesPage() {
   }, [draft, filterKey, setSearchParams]);
 
   const [roles, setRoles] = useState<Role[]>([]);
-  const [candidates, setCandidates] = useState<Candidate[] | null>(null);
+  const [rawCandidates, setCandidates] = useState<Candidate[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  /** True once a candidate load has succeeded; keeps the list panel header mounted across reloads. */
+  const [everLoaded, setEverLoaded] = useState(false);
 
   const uploadPanelId = useId();
   /**
@@ -398,7 +413,11 @@ export function CandidatesPage() {
     setCandidates(null);
     api
       .listCandidates(role || undefined)
-      .then((rows) => { if (gen === loadGen.current) setCandidates(rows); })
+      .then((rows) => {
+        if (gen !== loadGen.current) return;
+        setCandidates(rows);
+        setEverLoaded(true);
+      })
       .catch((e: ApiError) => { if (gen === loadGen.current) setError(e.message); });
   }, []);
 
@@ -413,6 +432,8 @@ export function CandidatesPage() {
    * dropdown; load-bearing now that a column asserts from it.
    */
   const [rolesLoaded, setRolesLoaded] = useState(false);
+  /** True once the roles request has settled either way (success or failure). */
+  const [rolesSettled, setRolesSettled] = useState(false);
   useEffect(() => {
     api
       .listRoles()
@@ -424,8 +445,12 @@ export function CandidatesPage() {
         // was deleted") this state was added to prevent. A failure means we do
         // not know, and "—" is what not knowing looks like.
         setRolesLoaded(true);
+        setRolesSettled(true);
       })
-      .catch(() => setRoles([]));
+      .catch(() => {
+        setRoles([]);
+        setRolesSettled(true);
+      });
   }, []);
 
   useEffect(() => {
@@ -466,6 +491,11 @@ export function CandidatesPage() {
     [filterKey, applyFilters],
   );
 
+  const setJobState = useCallback(
+    (next: "all" | "active" | "paused") => applyFilters({ jobState: next === "all" ? null : next }),
+    [applyFilters],
+  );
+
   const setRole = useCallback(
     (nextRole: string) => applyFilters({ roleId: nextRole || null }),
     [applyFilters],
@@ -478,6 +508,63 @@ export function CandidatesPage() {
   // loaded: REPLACING the history entry, so Back does not return to a filter
   // the control cannot show. No listed roles hides the control, as on the
   // Dashboard.
+  //
+  // ACTIVE / PAUSED is attributed PER CANDIDATE: the status of the Ashby job
+  // the candidate's own application link points at (`ashby_job_status`). An
+  // API that predates the field falls back to the role-level rule (needs the
+  // roles' `ashby_mapping_statuses`). The scope never touches the role
+  // filter: the two intersect, and an empty intersection is a calm empty
+  // state with a clear-filter action.
+  const roleById = useMemo(() => {
+    const byId = new Map<string, Role>();
+    for (const r of roles) byId.set(r.id, r);
+    return byId;
+  }, [roles]);
+  const perCandidate = useMemo(
+    () => (rawCandidates ? candidatesCarryJobStatus(rawCandidates) : false),
+    [rawCandidates],
+  );
+  const roleStatusesAvailable = rolesLoaded && hasMappingStatuses(roles);
+  const statusesAvailable = perCandidate || roleStatusesAvailable;
+  /** The EFFECTIVE scope: what the URL asked for, if this API can answer it. */
+  const jobState = statusesAvailable ? filters.jobState : null;
+  // A deep link with `?ashby=` waits for the roles only when it needs them
+  // (the role-level fallback), rather than flashing the unscoped set.
+  const awaitingRoles = filters.jobState !== null && !!rawCandidates && !perCandidate && !rolesSettled;
+  // A scope this API cannot answer is dropped from the URL once that is known,
+  // instead of leaving a chip-less "Active filters / Clear all" row over
+  // unscoped data.
+  const dropUnusableScope =
+    filters.jobState !== null && rolesSettled && rawCandidates !== null && rawCandidates.length > 0 && !statusesAvailable;
+  useEffect(() => {
+    if (!dropUnusableScope) return;
+    setSearchParams(buildCandidateSearch({ ...filters, jobState: null }), { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dropUnusableScope, filterKey, setSearchParams]);
+  /** Roles in the scope: feeds the Pipeline-by-role panel (a role-level funnel). */
+  const scopedRoles = useMemo(
+    () => (jobState && roleStatusesAvailable ? roles.filter((r) => roleMatchesJobState(r, jobState)) : roles),
+    [roles, jobState, roleStatusesAvailable],
+  );
+  /** Candidates inside the Ashby job scope; the rest of the page reads this. */
+  const candidates = useMemo(() => {
+    if (!rawCandidates || awaitingRoles) return null;
+    if (!jobState) return rawCandidates;
+    return rawCandidates.filter((c) => candidateMatchesJobState(c, jobState, perCandidate, roleById));
+  }, [rawCandidates, awaitingRoles, jobState, perCandidate, roleById]);
+  /**
+   * Per-segment counts for the Active / Paused control. Computed over the SAME
+   * loaded set the rows come from (the role-scoped load) with the SAME
+   * predicate, so a segment's number is exactly the rows it shows.
+   */
+  const jobStateCounts = useMemo(() => {
+    if (!rawCandidates || !statusesAvailable) return null;
+    const count = (state: "active" | "paused") =>
+      rawCandidates.filter((c) => candidateMatchesJobState(c, state, perCandidate, roleById)).length;
+    return { all: rawCandidates.length, active: count("active"), paused: count("paused") };
+  }, [rawCandidates, statusesAvailable, perCandidate, roleById]);
+  // The dropdown lists ALL mapped roles whatever the scope; the scope and the
+  // role intersect.
   const roleOptions = useMemo(() => roleFilterOptions(roles), [roles]);
   const resetRole = shouldResetRoleFilter(roleId, rolesLoaded, roleOptions);
   useEffect(() => {
@@ -543,7 +630,11 @@ export function CandidatesPage() {
 
   const page = usePagination(visible, 10, filterKey);
 
-  const active = hasActiveFilters(filters);
+  // From the EFFECTIVE scope, so an unusable `?ashby=` never leaves a chip-less row.
+  const active = hasActiveFilters({ ...filters, jobState });
+  /** Active filters other than the Ashby scope, which re-bases the figures instead of narrowing them. */
+  const narrowed = hasActiveFilters({ ...filters, jobState: null });
+  const jobStateLabel = jobState === "active" ? "Active" : jobState === "paused" ? "Paused" : null;
   const roleTitle = roles.find((r) => r.id === roleId)?.title;
 
   const phoneProgressUnknown = useMemo(
@@ -601,17 +692,20 @@ export function CandidatesPage() {
     [candidates],
   );
 
-  /** Role by id, for the table's Agent and Role columns. */
-  const roleById = useMemo(() => {
-    const byId = new Map<string, Role>();
-    for (const r of roles) byId.set(r.id, r);
-    return byId;
-  }, [roles]);
-
   // The facet is only meaningful where the signal exists. A deep link keeps
   // it visible so its own toggles stay reachable and removable.
   const showResumeFacet =
     resumeReviewCounts.size > 0 || filters.resumeReview.length > 0;
+
+  /**
+   * The list panel (search box + live region + rows) stays mounted across
+   * reloads once a list has loaded, and when a role-scoped load is empty but
+   * a `?q=` is set, so the box can always be cleared and the live region is
+   * never torn down.
+   */
+  const showListPanel =
+    !error &&
+    (rawCandidates !== null ? rawCandidates.length > 0 || filters.query !== "" : everLoaded);
 
   return (
     <CandidateShell variant="inset">
@@ -645,7 +739,7 @@ export function CandidatesPage() {
           question the page is opened with ("how is each role doing"), and it
           follows the page's role filter so drilling into one role narrows the
           chart with it. */}
-      <RolePipelinePanel roles={roles} roleId={roleId} />
+      <RolePipelinePanel roles={scopedRoles} roleId={roleId} />
 
       {/* Filter bar — one panel, so the whole filter contract reads as a
           single control surface rather than four stacked rows. */}
@@ -655,57 +749,25 @@ export function CandidatesPage() {
             All candidates
             {candidates && (
               <span className="ml-2 font-normal text-[var(--c-ink-secondary)]">
-                {active
+                {narrowed
                   ? `${visible.length} of ${candidates.length}`
                   : candidates.length}
               </span>
             )}
           </h2>
           <div className="flex w-full flex-wrap items-center gap-3 sm:w-auto">
-            {/* SEARCH. Not a <form>: Enter submits nothing, the list follows the
-                typing. `type="search"` gives the searchbox role; the browser's
-                own cancel glyph is hidden in favour of one real, labelled
-                button that every engine shows. */}
-            <div role="search" aria-label="Candidates" className="relative w-full sm:w-72">
-              <label htmlFor="candidate-search" className="sr-only">
-                Search candidates
-              </label>
-              <CandidateInput
-                id="candidate-search"
-                ref={searchInputRef}
-                type="search"
-                value={draft}
-                onChange={(e) => setDraft(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Escape" && draft) {
-                    e.preventDefault();
-                    clearSearch();
-                  }
-                }}
-                placeholder={phoneSearchable ? "Name, email or phone" : "Name or email"}
-                aria-describedby="candidate-search-hint"
-                maxLength={CANDIDATE_QUERY_MAX}
-                autoComplete="off"
-                spellCheck={false}
-                enterKeyHint="search"
-                className="w-full pr-11 [&::-webkit-search-cancel-button]:appearance-none"
+            {jobStateCounts && (
+              <SegmentedControl
+                ariaLabel="Filter by Ashby job status"
+                value={jobState ?? "all"}
+                onChange={setJobState}
+                options={[
+                  { value: "all", label: "All", count: jobStateCounts.all },
+                  { value: "active", label: "Active", count: jobStateCounts.active },
+                  { value: "paused", label: "Paused", count: jobStateCounts.paused },
+                ]}
               />
-              <span id="candidate-search-hint" className="sr-only">
-                {phoneSearchable
-                  ? "Matches name, email or phone. Results update as you type."
-                  : "Matches name or email. Results update as you type."}
-              </span>
-              {draft && (
-                <button
-                  type="button"
-                  onClick={clearSearch}
-                  aria-label="Clear search"
-                  className="absolute inset-y-0 right-0 inline-flex min-w-11 items-center justify-center rounded-control text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
-                >
-                  <span aria-hidden="true">×</span>
-                </button>
-              )}
-            </div>
+            )}
             {roleOptions.length > 0 && (
               <div className="w-full sm:w-56">
                 <label htmlFor="role-filter" className="sr-only">
@@ -730,10 +792,6 @@ export function CandidatesPage() {
           </div>
         </div>
 
-        <p role="status" className="sr-only">
-          {searchAnnouncement}
-        </p>
-
         {/* A failed phone read reports dial_count null, and the status then
             falls back to the stored value: an abandoned candidate reads
             "Queued". Said once, so that is never silent. */}
@@ -742,15 +800,6 @@ export function CandidatesPage() {
             Phone progress could not be loaded for some candidates. Their status shows the stored
             value, so a finished phone outcome (such as “Abandoned: no answer”) may read as
             “Queued”. Reload the page to try again.
-          </InlineNotice>
-        )}
-
-        {/* The list API stops at PostgREST's 1,000-row cap; a search over a
-            capped list would silently miss the older rows. */}
-        {filters.query && candidates && candidates.length >= 1000 && (
-          <InlineNotice tone="warning" className="mt-3">
-            Showing the newest {candidates.length.toLocaleString()} candidates; search covers only
-            these.
           </InlineNotice>
         )}
 
@@ -802,11 +851,13 @@ export function CandidatesPage() {
               // server-side but the status filter does not. Said plainly,
               // because the heading a few pixels above can read "1 of 3" and a
               // picture under it is taken to be a picture of the 1.
-              active
+              narrowed
                 ? `Across all ${candidates.length.toLocaleString()} loaded candidates${
                     roleTitle ? ` in ${roleTitle}` : ''
-                  }, not the current filter.`
-                : undefined
+                  }${jobStateLabel ? ` (${jobStateLabel} Ashby jobs)` : ''}, not the current filter.`
+                : jobStateLabel
+                  ? `${jobStateLabel} Ashby jobs only.`
+                  : undefined
             }
           />
         )}
@@ -891,6 +942,12 @@ export function CandidatesPage() {
                 onRemove={() => applyFilters({ query: "" })}
               />
             )}
+            {jobStateLabel && (
+              <FilterChip
+                label={`Ashby jobs: ${jobStateLabel}`}
+                onRemove={() => applyFilters({ jobState: null })}
+              />
+            )}
             {roleTitle && (
               <FilterChip
                 label={`Role: ${roleTitle}`}
@@ -943,10 +1000,12 @@ export function CandidatesPage() {
             onRetry={() => loadCandidates(roleId)}
           />
         )}
-        {!error && candidates === null && (
+        {/* While the list panel is mounted it carries its own loading state, so
+            its header (search + live region) is not torn down by a reload. */}
+        {!error && candidates === null && !showListPanel && (
           <LoadingPanel label="Loading candidates…" />
         )}
-        {!error && candidates !== null && candidates.length === 0 && (
+        {!error && candidates !== null && rawCandidates !== null && rawCandidates.length === 0 && !filters.query && (
           <EmptyPanel
             title="No candidates yet"
             // The upload form is collapsed by default now, so prose telling a
@@ -971,9 +1030,225 @@ export function CandidatesPage() {
             }
           />
         )}
+        {/* The candidate list: ONE panel holding the search box and the rows it
+            filters. The box stays mounted whenever the loaded set has
+            candidates, even when a search matches none, so it can always be
+            cleared. */}
+        {showListPanel && (
+          <GlassPanel as="section" aria-label="Candidate list" padding="sm">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              {/* SEARCH. Not a <form>: Enter submits nothing, the list follows the
+                  typing. `type="search"` gives the searchbox role; the browser's
+                  own cancel glyph is hidden in favour of one real, labelled
+                  button that every engine shows. */}
+              <div role="search" aria-label="Candidates" className="relative w-full sm:w-72">
+                <label htmlFor="candidate-search" className="sr-only">
+                  Search candidates
+                </label>
+                <CandidateInput
+                  id="candidate-search"
+                  ref={searchInputRef}
+                  type="search"
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Escape" && draft) {
+                      e.preventDefault();
+                      clearSearch();
+                    }
+                  }}
+                  placeholder={phoneSearchable ? "Name, email or phone" : "Name or email"}
+                  aria-describedby="candidate-search-hint"
+                  maxLength={CANDIDATE_QUERY_MAX}
+                  autoComplete="off"
+                  spellCheck={false}
+                  enterKeyHint="search"
+                  className="w-full pr-11 [&::-webkit-search-cancel-button]:appearance-none"
+                />
+                <span id="candidate-search-hint" className="sr-only">
+                  {phoneSearchable
+                    ? "Matches name, email or phone. Results update as you type."
+                    : "Matches name or email. Results update as you type."}
+                </span>
+                {draft && (
+                  <button
+                    type="button"
+                    onClick={clearSearch}
+                    aria-label="Clear search"
+                    className="absolute inset-y-0 right-0 inline-flex min-w-11 items-center justify-center rounded-control text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+                  >
+                    <span aria-hidden="true">×</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+          <p role="status" className="sr-only">
+            {searchAnnouncement}
+          </p>
+
+          {/* The list API stops at PostgREST's 1,000-row cap; a search over a
+              capped list would silently miss the older rows. */}
+          {(filters.query || jobState) && rawCandidates && rawCandidates.length >= 1000 && (
+            <InlineNotice tone="warning" className="mt-3">
+              Showing the newest {rawCandidates.length.toLocaleString()} candidates; search and the
+              Active / Paused counts cover only these.
+            </InlineNotice>
+          )}
+
+            {candidates === null && (
+              <div className="mt-3"><LoadingPanel label="Loading candidates…" /></div>
+            )}
+
+            {visible.length > 0 && (
+              <div className="-mx-4 mt-3">
+                {/* COLUMN WIDTHS. Every cell states the width it needs, so the
+                    table's own min-content width is a real layout rather than
+                    whatever the browser squeezes out of eight auto columns: at
+                    1440px it fits the column exactly, and below that (a 390px
+                    phone) it keeps these widths and scrolls sideways INSIDE the
+                    table's own container, never the page.
+                      - Exp., Status, Recommendation and Next action never wrap
+                        ("7 / yr" and a badge broken over two lines were the
+                        review's complaint).
+                      - Agent and Role may wrap, to two lines at most, at a
+                        minimum width that fits a two-word title per line.
+                      - Email and Skills truncate with the full value in
+                        `title`: both are shown in full on the profile, so the
+                        ellipsis never hides anything unreachable. */}
+                <Table bare caption="Candidates in your pipeline" className={TABLE_DENSITY}>
+                  <THead>
+                    <Tr>
+                      <Th>Name</Th>
+                      <Th>Agent</Th>
+                      <Th>Role</Th>
+                      <Th>Skills</Th>
+                      <Th className="whitespace-nowrap text-right">Exp.</Th>
+                      <Th>Status</Th>
+                      <Th>Recommendation</Th>
+                      <Th className="whitespace-nowrap">Next action</Th>
+                    </Tr>
+                  </THead>
+                  {/* Rows reveal in sequence; the class collapses under
+                      prefers-reduced-motion with the rest of the shell. */}
+                  <TBody className="fade-up-stagger">
+                    {page.items.map((c) => {
+                      // ONE derivation per row: badge, tooltip, next action and
+                      // the review link all read the same display status.
+                      const ds = candidateDisplayStatus(c);
+                      const next = candidateNextAction(ds.key);
+                      const role = c.role_id ? roleById.get(c.role_id) : undefined;
+                      const displayName = candidateDisplayName(c.name);
+                      return (
+                        <Tr key={c.id}>
+                          <Td className="py-2">
+                            <Link
+                              to={`/candidates/${c.id}`}
+                              className="font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+                            >
+                              {displayName}
+                            </Link>
+                            {c.email && (
+                              <p
+                                className="w-[10rem] truncate text-label text-[var(--c-ink-secondary)]"
+                                title={c.email}
+                              >
+                                {c.email}
+                              </p>
+                            )}
+                          </Td>
+                          {/* The role's AGENT, left of the role itself. Looked up
+                              from the same roles list — no extra request — and
+                              "—" whenever there is no agent name to show. */}
+                          <Td className="min-w-[7.5rem]">
+                            <AgentCell role={role} />
+                          </Td>
+                          {/* ONE role per row, because that is what the row IS.
+
+                              `candidates.role_id` is a single FK and a row is one
+                              Ashby APPLICATION, so a person who applied to two
+                              roles is two rows carrying one role each — not one
+                              row carrying two. Rendering a list here would imply
+                              a many-to-many the data cannot express, and would
+                              make the row's "Review & decide" ambiguous about
+                              which application it decides.
+
+                              A role the roles list does not carry (filtered by
+                              scope, or deleted) falls back to a neutral marker
+                              rather than a blank cell or a raw uuid. */}
+                          <Td className="min-w-[8.5rem]">
+                            <RoleCell
+                              roleId={c.role_id}
+                              title={role?.title}
+                              rolesLoaded={rolesLoaded}
+                            />
+                          </Td>
+                          <Td>
+                            <SkillsCell skills={c.skills} />
+                          </Td>
+                          <Td className="whitespace-nowrap text-right tabular-nums text-[var(--c-ink-secondary)]">
+                            {c.experience_years != null
+                              ? `${c.experience_years} yr`
+                              : "—"}
+                          </Td>
+                          <Td className="whitespace-nowrap">
+                            {/* Stacked, not wrapped: a status and a resume badge
+                                side by side would force the column wide, and a
+                                flex-wrap broke them at arbitrary points. */}
+                            <div className="flex flex-col items-start gap-1">
+                              <StatusBadge tone={ds.tone}>
+                                <span title={ds.title}>{ds.label}</span>
+                                {/* The tooltip's phone facts (reason, count,
+                                    last dial) for screen-reader users, who never
+                                    get a hover. */}
+                                {ds.detail && <span className="sr-only">{`, ${ds.detail}`}</span>}
+                              </StatusBadge>
+                              {/* Additive only: the candidate's own status is
+                                  unchanged and still first. */}
+                              <ResumeReviewBadge value={c.resume_review} />
+                            </div>
+                          </Td>
+                          <Td className="whitespace-nowrap">
+                            {c.latest_recommendation ? (
+                              <span className="inline-flex items-center gap-1.5">
+                                <StatusBadge
+                                  tone={RECOMMENDATION_TONE[c.latest_recommendation] ?? "neutral"}
+                                >
+                                  {recommendationLabel(c.latest_recommendation)}
+                                </StatusBadge>
+                                {c.latest_score != null && (
+                                  <span className="text-xs tabular-nums text-[var(--c-ink-secondary)]">
+                                    {c.latest_score}
+                                  </span>
+                                )}
+                              </span>
+                            ) : (
+                              <span className="text-[var(--c-ink-secondary)]">—</span>
+                            )}
+                          </Td>
+                          <Td className="whitespace-nowrap">
+                            <NextActionCell
+                              candidateId={c.id}
+                              candidateName={displayName}
+                              status={ds.key}
+                              next={next}
+                            />
+                          </Td>
+                        </Tr>
+                      );
+                    })}
+                  </TBody>
+                </Table>
+                <div className="px-3"><Pagination state={page} noun="candidates" /></div>
+              </div>
+            )}
+          </GlassPanel>
+        )}
+
         {!error &&
           candidates !== null &&
-          candidates.length > 0 &&
+          rawCandidates !== null &&
+          (rawCandidates.length > 0 || filters.query !== "") &&
           visible.length === 0 &&
           (filters.query && !hasActiveFilters({ ...filters, query: "" }) ? (
             <EmptyPanel
@@ -1000,148 +1275,6 @@ export function CandidatesPage() {
             />
           ))}
 
-        {!error && visible.length > 0 && (
-          <>
-            {/* COLUMN WIDTHS. Every cell states the width it needs, so the
-                table's own min-content width is a real layout rather than
-                whatever the browser squeezes out of eight auto columns: at
-                1440px it fits the column exactly, and below that (a 390px
-                phone) it keeps these widths and scrolls sideways INSIDE the
-                table's own container, never the page.
-                  - Exp., Status, Recommendation and Next action never wrap
-                    ("7 / yr" and a badge broken over two lines were the
-                    review's complaint).
-                  - Agent and Role may wrap, to two lines at most, at a
-                    minimum width that fits a two-word title per line.
-                  - Email and Skills truncate with the full value in
-                    `title`: both are shown in full on the profile, so the
-                    ellipsis never hides anything unreachable. */}
-            <Table caption="Candidates in your pipeline" className={TABLE_DENSITY}>
-              <THead>
-                <Tr>
-                  <Th>Name</Th>
-                  <Th>Agent</Th>
-                  <Th>Role</Th>
-                  <Th>Skills</Th>
-                  <Th className="whitespace-nowrap text-right">Exp.</Th>
-                  <Th>Status</Th>
-                  <Th>Recommendation</Th>
-                  <Th className="whitespace-nowrap">Next action</Th>
-                </Tr>
-              </THead>
-              {/* Rows reveal in sequence; the class collapses under
-                  prefers-reduced-motion with the rest of the shell. */}
-              <TBody className="fade-up-stagger">
-                {page.items.map((c) => {
-                  // ONE derivation per row: badge, tooltip, next action and
-                  // the review link all read the same display status.
-                  const ds = candidateDisplayStatus(c);
-                  const next = candidateNextAction(ds.key);
-                  const role = c.role_id ? roleById.get(c.role_id) : undefined;
-                  const displayName = candidateDisplayName(c.name);
-                  return (
-                    <Tr key={c.id}>
-                      <Td className="py-2">
-                        <Link
-                          to={`/candidates/${c.id}`}
-                          className="font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
-                        >
-                          {displayName}
-                        </Link>
-                        {c.email && (
-                          <p
-                            className="w-[10rem] truncate text-label text-[var(--c-ink-secondary)]"
-                            title={c.email}
-                          >
-                            {c.email}
-                          </p>
-                        )}
-                      </Td>
-                      {/* The role's AGENT, left of the role itself. Looked up
-                          from the same roles list — no extra request — and
-                          "—" whenever there is no agent name to show. */}
-                      <Td className="min-w-[8rem]">
-                        <AgentCell role={role} />
-                      </Td>
-                      {/* ONE role per row, because that is what the row IS.
-
-                          `candidates.role_id` is a single FK and a row is one
-                          Ashby APPLICATION, so a person who applied to two
-                          roles is two rows carrying one role each — not one
-                          row carrying two. Rendering a list here would imply
-                          a many-to-many the data cannot express, and would
-                          make the row's "Review & decide" ambiguous about
-                          which application it decides.
-
-                          A role the roles list does not carry (filtered by
-                          scope, or deleted) falls back to a neutral marker
-                          rather than a blank cell or a raw uuid. */}
-                      <Td className="min-w-[8.5rem]">
-                        <RoleCell
-                          roleId={c.role_id}
-                          title={role?.title}
-                          rolesLoaded={rolesLoaded}
-                        />
-                      </Td>
-                      <Td>
-                        <SkillsCell skills={c.skills} />
-                      </Td>
-                      <Td className="whitespace-nowrap text-right tabular-nums text-[var(--c-ink-secondary)]">
-                        {c.experience_years != null
-                          ? `${c.experience_years} yr`
-                          : "—"}
-                      </Td>
-                      <Td className="whitespace-nowrap">
-                        {/* Stacked, not wrapped: a status and a resume badge
-                            side by side would force the column wide, and a
-                            flex-wrap broke them at arbitrary points. */}
-                        <div className="flex flex-col items-start gap-1">
-                          <StatusBadge tone={ds.tone}>
-                            <span title={ds.title}>{ds.label}</span>
-                            {/* The tooltip's phone facts (reason, count,
-                                last dial) for screen-reader users, who never
-                                get a hover. */}
-                            {ds.detail && <span className="sr-only">{`, ${ds.detail}`}</span>}
-                          </StatusBadge>
-                          {/* Additive only: the candidate's own status is
-                              unchanged and still first. */}
-                          <ResumeReviewBadge value={c.resume_review} />
-                        </div>
-                      </Td>
-                      <Td className="whitespace-nowrap">
-                        {c.latest_recommendation ? (
-                          <span className="inline-flex items-center gap-1.5">
-                            <StatusBadge
-                              tone={RECOMMENDATION_TONE[c.latest_recommendation] ?? "neutral"}
-                            >
-                              {recommendationLabel(c.latest_recommendation)}
-                            </StatusBadge>
-                            {c.latest_score != null && (
-                              <span className="text-xs tabular-nums text-[var(--c-ink-secondary)]">
-                                {c.latest_score}
-                              </span>
-                            )}
-                          </span>
-                        ) : (
-                          <span className="text-[var(--c-ink-secondary)]">—</span>
-                        )}
-                      </Td>
-                      <Td className="whitespace-nowrap">
-                        <NextActionCell
-                          candidateId={c.id}
-                          candidateName={displayName}
-                          status={ds.key}
-                          next={next}
-                        />
-                      </Td>
-                    </Tr>
-                  );
-                })}
-              </TBody>
-            </Table>
-            <Pagination state={page} noun="candidates" />
-          </>
-        )}
       </div>
     </CandidateShell>
   );

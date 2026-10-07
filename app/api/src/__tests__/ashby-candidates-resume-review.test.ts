@@ -218,7 +218,7 @@ describe('GET /api/candidates — resume_review', () => {
     expect(eqCalls).toContainEqual({ table: 'candidates', column: 'owner_id', value: interviewer.id });
   });
 
-  it('the row shape is otherwise byte-identical — only resume_review and the four phone-progress fields are added', async () => {
+  it('the row shape is otherwise byte-identical — only resume_review, ashby_job_status and the four phone-progress fields are added', async () => {
     configure({
       candidates: ok([PARSED_CANDIDATE]),
       assessments: ok([]),
@@ -228,7 +228,7 @@ describe('GET /api/candidates — resume_review', () => {
     // dial_count / last_dialed_at / phone_state / phone_state_reason come from
     // lib/candidate-phone-progress.ts (candidates-phone-progress.test.ts).
     expect(Object.keys(res.body[0]).sort()).toEqual([
-      'created_at', 'dial_count', 'email', 'experience_years', 'id', 'last_dialed_at',
+      'ashby_job_status', 'created_at', 'dial_count', 'email', 'experience_years', 'id', 'last_dialed_at',
       'latest_recommendation', 'latest_score', 'name', 'phone_e164', 'phone_state',
       'phone_state_reason', 'phone_valid', 'resume_review', 'role_id', 'skills', 'status',
     ]);
@@ -253,6 +253,121 @@ describe('GET /api/candidates — resume_review', () => {
     expect(blob).not.toMatch(/application_link|external_application|file_handle/);
     // The SELECT itself is a narrow allowlist — it cannot over-read.
     const linkSelect = selects.find((s) => s.table === 'ashby_application_links');
-    expect(linkSelect!.columns).toBe('candidate_id, updated_at, ashby_resume_ingestions ( state )');
+    expect(linkSelect!.columns).toBe('candidate_id, updated_at, job_mapping_id, ashby_resume_ingestions ( state )');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 3. ashby_job_status — per-candidate attribution through the link's mapping
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('GET /api/candidates — ashby_job_status', () => {
+  const link = (candidate_id: string, job_mapping_id: string | null, updated_at = '2026-08-21T00:00:00Z') => ({
+    candidate_id, updated_at, job_mapping_id, ashby_resume_ingestions: [{ state: 'ready' }],
+  });
+  const cand = (id: string) => ({ ...PARSED_CANDIDATE, id });
+
+  it('reports the status of the mapping each candidate OWN link points at (same role, different jobs)', async () => {
+    configure({
+      candidates: ok([cand('c_live'), cand('c_paused'), cand('c_drift'), cand('c_nolink')]),
+      assessments: ok([]),
+      ashby_application_links: ok([
+        link('c_live', 'map_live'), link('c_paused', 'map_paused'), link('c_drift', 'map_drift'),
+      ]),
+      ashby_job_mappings: ok([
+        { id: 'map_live', status: 'enabled' },
+        { id: 'map_paused', status: 'paused' },
+        { id: 'map_drift', status: 'drift' },
+      ]),
+    });
+    const res = await request(appFor(admin)).get('/api/candidates').set('Authorization', AUTH);
+    const by = Object.fromEntries(res.body.map((r: { id: string; ashby_job_status: unknown }) => [r.id, r.ashby_job_status]));
+    expect(by).toEqual({ c_live: 'enabled', c_paused: 'paused', c_drift: 'drift', c_nolink: null });
+  });
+
+  it('is null for an archived or missing mapping (archived rows are filtered out of the read)', async () => {
+    configure({
+      candidates: ok([cand('c_arch')]),
+      assessments: ok([]),
+      ashby_application_links: ok([link('c_arch', 'map_archived')]),
+      ashby_job_mappings: ok([]),
+    });
+    const res = await request(appFor(admin)).get('/api/candidates').set('Authorization', AUTH);
+    expect(res.body[0].ashby_job_status).toBeNull();
+  });
+
+  it('the most recently updated link wins when a candidate has several', async () => {
+    configure({
+      candidates: ok([cand('c_two')]),
+      assessments: ok([]),
+      ashby_application_links: ok([link('c_two', 'map_new', '2026-09-01T00:00:00Z'), link('c_two', 'map_old', '2026-08-01T00:00:00Z')]),
+      ashby_job_mappings: ok([{ id: 'map_new', status: 'paused' }, { id: 'map_old', status: 'enabled' }]),
+    });
+    const res = await request(appFor(admin)).get('/api/candidates').set('Authorization', AUTH);
+    expect(res.body[0].ashby_job_status).toBe('paused');
+  });
+
+  it('OMITS ashby_job_status from every row when the mappings read fails', async () => {
+    configure({
+      candidates: ok([cand('c_a'), cand('c_b')]),
+      assessments: ok([]),
+      ashby_application_links: ok([link('c_a', 'map_x'), link('c_b', 'map_x')]),
+      ashby_job_mappings: { data: null, error: { message: 'boom' } },
+    });
+    const res = await request(appFor(admin)).get('/api/candidates').set('Authorization', AUTH);
+    expect(res.status).toBe(200);
+    for (const r of res.body) expect('ashby_job_status' in r).toBe(false);
+  });
+
+  it('OMITS ashby_job_status from every row when the links read fails', async () => {
+    configure({
+      candidates: ok([cand('c_a')]),
+      assessments: ok([]),
+      ashby_application_links: { data: null, error: { message: 'boom' } },
+    });
+    const res = await request(appFor(admin)).get('/api/candidates').set('Authorization', AUTH);
+    expect(res.status).toBe(200);
+    expect('ashby_job_status' in res.body[0]).toBe(false);
+  });
+
+  it('the NEWEST link decides even when its mapping was deleted (null job_mapping_id)', async () => {
+    configure({
+      candidates: ok([cand('c_del')]),
+      assessments: ok([]),
+      ashby_application_links: ok([link('c_del', null, '2026-09-01T00:00:00Z'), link('c_del', 'map_old', '2026-08-01T00:00:00Z')]),
+      ashby_job_mappings: ok([{ id: 'map_old', status: 'enabled' }]),
+    });
+    const res = await request(appFor(admin)).get('/api/candidates').set('Authorization', AUTH);
+    expect(res.body[0].ashby_job_status).toBeNull();
+  });
+
+  it('pages the links read past the PostgREST row cap, and omits the field if the page ceiling is hit', async () => {
+    const full = Array.from({ length: 1000 }, (_, i) => link('c_p', i === 0 ? 'map_new' : 'map_old', '2026-09-01T00:00:00Z'));
+    // Every page is full -> ceiling reached -> status unknown -> omitted.
+    configure({
+      candidates: ok([cand('c_p')]),
+      assessments: ok([]),
+      ashby_application_links: ok(full),
+      ashby_job_mappings: ok([{ id: 'map_new', status: 'paused' }]),
+    });
+    const res = await request(appFor(admin)).get('/api/candidates').set('Authorization', AUTH);
+    expect(res.status).toBe(200);
+    expect('ashby_job_status' in res.body[0]).toBe(false);
+    expect(fromCalls.filter((t) => t === 'ashby_application_links').length).toBeGreaterThan(1);
+  });
+
+  it('is batched: one mappings read for the page, scoped to non-archived ids; never fails the list', async () => {
+    configure({
+      candidates: ok([cand('c_a'), cand('c_b')]),
+      assessments: ok([]),
+      ashby_application_links: ok([link('c_a', 'map_x'), link('c_b', 'map_x')]),
+      ashby_job_mappings: { data: null, error: { message: 'boom' } },
+    });
+    const res = await request(appFor(admin)).get('/api/candidates').set('Authorization', AUTH);
+    expect(res.status).toBe(200);
+    expect(res.body.every((r: Record<string, unknown>) => !('ashby_job_status' in r))).toBe(true);
+    expect(fromCalls.filter((t) => t === 'ashby_job_mappings')).toHaveLength(1);
+    const scoped = inCalls.find((c) => c.table === 'ashby_job_mappings');
+    expect(scoped).toEqual({ table: 'ashby_job_mappings', column: 'id', values: ['map_x'] });
   });
 });

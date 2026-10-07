@@ -168,7 +168,11 @@ describe('GET /api/roles — has_ashby_mapping', () => {
     expect(res.body).toHaveLength(6);
     for (const row of res.body) expect(typeof row.has_ashby_mapping).toBe('boolean');
     const live = res.body.find((r: { id: string }) => r.id === R_LIVE);
-    expect(live).toEqual({ ...role(R_LIVE), has_ashby_mapping: true });
+    expect(live).toEqual({
+      ...role(R_LIVE),
+      has_ashby_mapping: true,
+      ashby_mapping_statuses: ['enabled', 'paused'],
+    });
   });
 
   it('keeps the interviewer owner filter, and flags only the rows they see', async () => {
@@ -213,6 +217,22 @@ describe('GET /api/roles — has_ashby_mapping', () => {
     const res = await list();
     expect(res.status).toBe(500);
     expect(Array.isArray(res.body)).toBe(false);
+  });
+
+  it('emits ashby_mapping_statuses: sorted, de-duplicated, non-archived only', async () => {
+    tables.ashby_job_mappings.push(mapping(R_LIVE, 'enabled'));
+    const res = await list();
+    const statuses = Object.fromEntries(
+      res.body.map((r: { id: string; ashby_mapping_statuses: string[] }) => [r.id, r.ashby_mapping_statuses]),
+    );
+    expect(statuses).toEqual({
+      [R_LIVE]: ['enabled', 'paused'],
+      [R_PAUSED]: ['paused'],
+      [R_DRIFT]: ['drift'],
+      [R_ARCHIVED_ONLY]: [],
+      [R_NONE]: [],
+      [R_OTHERS]: ['enabled'],
+    });
   });
 
   it('still propagates a roles read error', async () => {
