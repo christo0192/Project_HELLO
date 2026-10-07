@@ -180,8 +180,10 @@ class TestJudgeTimeoutFallsBackToLegacy(unittest.TestCase):
         self.assertEqual(fallbacks[0].error_category, "timeout")
         decision = _logs(result, "phone_gate_decision")[-1]
         self.assertEqual(decision.error_category, "legacy_fallback.consent_granted")
-        # Bounded by the judge timeout (default 2.5 s).
-        self.assertLessEqual(result.decision_at_ms - 25625, 2500 + 5)
+        # Bounded by the judge timeout (the default, from T11's bank).
+        self.assertLessEqual(
+            result.decision_at_ms - 25625,
+            int(gate_judge.GATE_JUDGE_TIMEOUT_DEFAULT_SEC * 1000) + 5)
         self.assertEqual(len(result.candidate_rows()), 1)
 
     def _yes_during(self, start):

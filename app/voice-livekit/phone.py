@@ -1633,7 +1633,7 @@ def phone_classify_backstop_floor_sec() -> float:
     """The smallest consent backstop that cannot cut off a real answer.
 
     attempts x (answer window + line + judge timeout) + margin. With the
-    defaults that is 2 x (15 + 6 + 2.5) + 5 = 52 s. The judge timeout is
+    defaults that is 2 x (15 + 6 + 1.7) + 5 = 50.4 s. The judge timeout is
     counted even in legacy mode: a backstop that is a few seconds generous
     costs nothing, one that is short ends a call a person is answering.
     """

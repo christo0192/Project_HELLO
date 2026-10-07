@@ -574,8 +574,8 @@ class TestConsentBackstop(unittest.TestCase):
     def test_the_derived_floor_with_defaults(self):
         self._with()
         self.assertAlmostEqual(phone.phone_classify_backstop_floor_sec(),
-                               2 * (15.0 + 6.0 + 2.5) + 5.0)
-        self.assertAlmostEqual(phone.phone_classify_timeout_sec(), 52.0)
+                               2 * (15.0 + 6.0 + 1.7) + 5.0)
+        self.assertAlmostEqual(phone.phone_classify_timeout_sec(), 50.4)
 
     def test_the_fly_phone_toml_value_cannot_cut_a_consent_read_short(self):
         toml = tomllib.loads((_WORKER / "fly.phone.toml").read_text(encoding="utf-8"))
@@ -599,8 +599,8 @@ class TestConsentBackstop(unittest.TestCase):
                                2 * (20.0 + 6.0 + 4.0) + 5.0)
 
     def test_the_judge_timeout_reader_is_bounded(self):
-        for raw, want in (("0.1", 1.0), ("9", 4.0), ("2", 2.0), ("nan", 2.5),
-                          ("junk", 2.5), ("", 2.5)):
+        for raw, want in (("0.1", 1.0), ("9", 4.0), ("2", 2.0), ("nan", 1.7),
+                          ("junk", 1.7), ("", 1.7)):
             with self.subTest(raw=raw):
                 self._with(PHONE_GATE_JUDGE_TIMEOUT_SEC=raw)
                 self.assertEqual(gate_judge.judge_timeout_sec(), want)

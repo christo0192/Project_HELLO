@@ -432,13 +432,16 @@ class HumanSpeechLatch:
 #: The judge timeout default and bounds (S01-PLAN T04). Read here so the
 #: consent backstop (phone.py, T02) can size itself for a judge round-trip
 #: before the judge exists; T04 reuses this reader rather than adding another.
-GATE_JUDGE_TIMEOUT_DEFAULT_SEC = 2.5
+#: T11 set the default from the live bank: p95 + 0.5 s over the gate phases
+#: (identity, consent, callback_time; p95 1.18 s, measured 2026-10-07 from a
+#: dev machine, see .gsd/milestones/M013/slices/S01/S01-BANK.md).
+GATE_JUDGE_TIMEOUT_DEFAULT_SEC = 1.7
 GATE_JUDGE_TIMEOUT_MIN_SEC = 1.0
 GATE_JUDGE_TIMEOUT_MAX_SEC = 4.0
 
 
 def judge_timeout_sec() -> float:
-    """``PHONE_GATE_JUDGE_TIMEOUT_SEC``, bounded to 1.0-4.0 (default 2.5)."""
+    """``PHONE_GATE_JUDGE_TIMEOUT_SEC``, bounded to 1.0-4.0 (default 1.7)."""
     raw = os.getenv("PHONE_GATE_JUDGE_TIMEOUT_SEC")
     try:
         value = float(raw) if raw not in (None, "") else GATE_JUDGE_TIMEOUT_DEFAULT_SEC
@@ -908,7 +911,8 @@ GATE_JUDGE_MODES = (GATE_JUDGE_MODE_LEGACY, GATE_JUDGE_MODE_SHADOW, GATE_JUDGE_M
 #: The owner-chosen judge model (DeepSeek V4 Flash), as production calls it.
 GATE_JUDGE_DEFAULT_MODEL = "deepseek-v4-flash"
 
-QNA_JUDGE_TIMEOUT_DEFAULT_SEC = 1.5
+#: T11: p95 + 0.5 s over post_consent and qna_close (p95 1.04 s, live bank).
+QNA_JUDGE_TIMEOUT_DEFAULT_SEC = 1.6
 QNA_JUDGE_TIMEOUT_MIN_SEC = 0.8
 QNA_JUDGE_TIMEOUT_MAX_SEC = 3.0
 
@@ -1018,7 +1022,7 @@ def judge_model() -> str:
 
 
 def qna_judge_timeout_sec() -> float:
-    """``PHONE_QNA_JUDGE_TIMEOUT_SEC``, bounded to 0.8-3.0 (default 1.5)."""
+    """``PHONE_QNA_JUDGE_TIMEOUT_SEC``, bounded to 0.8-3.0 (default 1.6)."""
     return _bounded_env_float(
         os.getenv("PHONE_QNA_JUDGE_TIMEOUT_SEC"), QNA_JUDGE_TIMEOUT_DEFAULT_SEC,
         QNA_JUDGE_TIMEOUT_MIN_SEC, QNA_JUDGE_TIMEOUT_MAX_SEC,
@@ -1185,7 +1189,7 @@ UTTERANCES: a JSON array in spoken order. tag says when the speech started relat
 INTENTS:
 - identity_confirmed: the person says they are the candidate ("yes", "speaking", "haan", "main hi hoon").
 - wrong_person: the person says they are not the candidate, or the number is wrong.
-- consent_granted: a clear yes to continuing the recorded call ("yes", "go ahead", "sure", "okay", "haan", "theek hai", "हाँ"). Only when the whole reply agrees: any "but", busy, later, condition or doubt means it is NOT a grant.
+- consent_granted: a clear yes to continuing the recorded call ("yes", "go ahead", "sure", "okay", "haan", "theek hai", "हाँ"). Only when the whole reply agrees: any "but", busy, later, condition or doubt means it is NOT a grant. Politeness around the yes ("thank you", "thanks", "sir", "ma'am") does not change it; a goodbye does.
 - consent_declined: no to the recording or to doing the call.
 - opt_out: asks never to be called again, or to remove their number.
 - not_now_busy: busy, driving, in a meeting, not now, later, call back, reschedule ("abhi nahi", "baad mein call karo"), or another person says the candidate is unavailable.
@@ -1206,6 +1210,8 @@ Only for question, add "question": "<how_long|who_reviews|what_role|is_ai|other>
 EXAMPLES (synthetic):
 DATA {"phase":"consent","utterances":[{"order":1,"tag":"post_question","text":"Yes, go ahead."}]}
 {"intent":"consent_granted","evidence":"Yes, go ahead","confidence":0.97}
+DATA {"phase":"consent_retry","utterances":[{"order":1,"tag":"post_question","text":"Sure, thanks."}]}
+{"intent":"consent_granted","evidence":"Sure, thanks","confidence":0.93}
 DATA {"phase":"consent","utterances":[{"order":1,"tag":"post_question","text":"Okay but I am driving right now"}]}
 {"intent":"not_now_busy","evidence":"I am driving right now","confidence":0.93,"callback":{"day_text":"","time_text":"","resolved_ist":null}}
 DATA {"phase":"consent","now_ist":"2026-01-05 10:00 Monday","utterances":[{"order":1,"tag":"post_question","text":"abhi nahi, kal shaam 5 baje call karo"}]}

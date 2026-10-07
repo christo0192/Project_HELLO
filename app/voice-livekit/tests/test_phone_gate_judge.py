@@ -175,11 +175,11 @@ class TestJudgeConfigReaders(unittest.TestCase):
     def test_timeouts_and_min_speech_are_bounded(self):
         cases = (
             ("PHONE_QNA_JUDGE_TIMEOUT_SEC", gj.qna_judge_timeout_sec,
-             (("", 1.5), ("0.1", 0.8), ("9", 3.0), ("2.2", 2.2), ("nan", 1.5), ("x", 1.5))),
+             (("", 1.6), ("0.1", 0.8), ("9", 3.0), ("2.2", 2.2), ("nan", 1.6), ("x", 1.6))),
             ("PHONE_GATE_GRANT_MIN_SPEECH_MS", gj.grant_min_speech_ms,
              (("", 250), ("50", 120), ("5000", 600), ("300", 300), ("inf", 250))),
             ("PHONE_GATE_JUDGE_TIMEOUT_SEC", gj.judge_timeout_sec,
-             (("", 2.5), ("0.2", 1.0), ("10", 4.0), ("3", 3.0))),
+             (("", 1.7), ("0.2", 1.0), ("10", 4.0), ("3", 3.0))),
         )
         for name, reader, pairs in cases:
             for raw, expected in pairs:
