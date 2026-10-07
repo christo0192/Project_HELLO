@@ -483,8 +483,10 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
     const second = await screen.findByRole('group', { name: 'Call 2 of 2 · reconnect' });
     fireEvent.click(within(second).getByRole('button', { name: /Turn 3:/ }));
 
-    await waitFor(() => expect(mockRecordingApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledWith('leg-b'));
-    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled());
+    // Generous timeouts: the mint -> load -> play chain is several async hops and runs
+    // slowly under the CI coverage instrumentation (the 1s default flaked there).
+    await waitFor(() => expect(mockRecordingApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledWith('leg-b'), { timeout: 5000 });
+    await waitFor(() => expect(HTMLMediaElement.prototype.play).toHaveBeenCalled(), { timeout: 5000 });
     expect(setCurrentTime).toHaveBeenCalledWith(3);
     expect(mockRecordingApi.getAttemptRecordingDownloadUrl).not.toHaveBeenCalledWith('leg-a');
     expect(mockRecordingApi.getRecordingDownloadUrl).not.toHaveBeenCalled();
@@ -492,9 +494,9 @@ describe('TranscriptionSyncWorkspace: phone legs (M013 S02)', () => {
     // A legacy leg seeks at its estimated offset in its own file.
     const first = screen.getByRole('group', { name: 'Call 1 of 2 · first call' });
     fireEvent.click(within(first).getByRole('button', { name: /Turn 2:/ }));
-    await waitFor(() => expect(mockRecordingApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledWith('leg-a'));
-    await waitFor(() => expect(setCurrentTime).toHaveBeenCalledWith(54.66));
-  });
+    await waitFor(() => expect(mockRecordingApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledWith('leg-a'), { timeout: 5000 });
+    await waitFor(() => expect(setCurrentTime).toHaveBeenCalledWith(54.66), { timeout: 5000 });
+  }, 20_000);
 
   it('a single pre-consent leg: listed under its session, outcome as recorded, no notes', async () => {
     const answered = Date.parse('2026-10-05T05:00:10.000Z');
