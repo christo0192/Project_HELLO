@@ -166,7 +166,10 @@ structured logger only accepts its allowlisted keys, so the fields are:
   `<source>.<intent>` (source `llm` / `legacy_fallback` / `legacy`, e.g.
   `llm.consent_granted`); `duration_sec` = judge latency; `rejection_reason` =
   the guard that turned a judge verdict into `unclear` (`before_recording_anchor`,
-  `speech_too_short`, `not_quiescent`, `evidence_not_post_question`, ...) or
+  `speech_too_short`, `not_quiescent`, `evidence_not_post_question`,
+  `voicemail_not_machine_shaped` (a judged voicemail at identity/consent whose
+  cited words do not read as a machine: a re-ask or a deferral, never a
+  silent hang-up), ...) or
   `err.<category>` for a judge failure; `turn_index` = the evidence utterance;
   `option_count` = utterances shown; `schema` = packed
   `pv:<prompt version>_el:<evidence len>_nt:<tagged>_ac:<speech ms>_cf:<confidence>_rj:<re-judges>`.
@@ -203,7 +206,11 @@ structured logger only accepts its allowlisted keys, so the fields are:
   `judge` (a valid `qna_close` verdict), `fallback` (the fallback grammar:
   `legacy`/`shadow`, or the judge unavailable) or `rule` (the bare-yes
   go-ahead and the filler cap, which no reader decides)),
-  `phone_qna_close_judge` (the `qna_close` judge's own lines) and
+  `phone_qna_close_judge` (the `qna_close` judge's own lines),
+  `phone_qna_terminal_interlock` (`pending_close_cancelled`: a late question
+  reopened Q&A over an unplayed goodbye; `late_question_after_goodbye_dropped`:
+  a question judged while the goodbye finished, when the once-per-call late
+  answer was no longer available), `phone_qna_late_question` and
   `phone_silence` (`qna_silence_nudge`, `qna_silence_close`). A bare "yes"
   gets "Sure, go ahead."; a decline closes on the first one; silence after the
   invite or the go-ahead gets one "Are you still there?", then completes;

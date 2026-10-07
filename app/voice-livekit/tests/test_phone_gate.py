@@ -10424,12 +10424,32 @@ class _QnaJudgeTransport:
         )
 
 
-def _qna_window(answers=(), *, fail=False, mode="llm"):
+class _HeldQnaJudgeTransport(_QnaJudgeTransport):
+    """Round-3: holds the verdict for ``hold_text`` until ``release`` is set,
+    so a test can land the goodbye's delivery while that turn is judged."""
+
+    def __init__(self, answers, hold_text):
+        super().__init__(answers)
+        self.hold_text = hold_text
+        self.held = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def request(self, **kwargs):
+        body = kwargs["json"]
+        payload = json.loads(body["messages"][1]["content"][len("DATA "):])
+        if payload["utterances"][-1]["text"] == self.hold_text:
+            self.held.set()
+            await self.release.wait()
+        return await super().request(**kwargs)
+
+
+def _qna_window(answers=(), *, fail=False, mode="llm", transport=None):
     """A real `_QnaCloseWindow` in llm mode on a recorded transport."""
     import gate_judge  # noqa: PLC0415
     from provider_resilience import CircuitBreaker, CircuitBreakerConfig  # noqa: PLC0415
 
-    transport = _QnaJudgeTransport(answers, fail=fail)
+    if transport is None:
+        transport = _QnaJudgeTransport(answers, fail=fail)
     logs: list[dict] = []
     window = agent_mod._QnaCloseWindow(
         first_name="Asha", mode=mode,
@@ -11182,6 +11202,122 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         for text in ("No ma'am, thank you so much.", "Nothing as of now",
                      "No sir, that's all", "It's all good, thanks"):
             self.assertFalse(phone.phone_qna_carries_question(text), text)
+
+    #: Round-3 review: Indian-English sign-offs the judge reads as a decline.
+    #: A bare auxiliary ("will", "do", "is", "can't") or a negated "a
+    #: question" made the round-2 safety net turn each into a QUESTION.
+    _SIGN_OFFS = (
+        "No, that's all. Will wait for your call.",
+        "Nothing ma'am. Do keep me posted.",
+        "No thank you, do let me know the result",
+        "Okay, thank you. Will wait for your call.",
+        "Thanks, and do call me back",
+        "Thank you, can't wait to hear back",
+        "No, I don't have a question, thank you.",
+        "No ma'am, will wait for your call.",
+        "No, that's all. Do take care.",
+        "No ma'am, nothing. Do let me know the result",
+        "No, thank you. Is fine.",
+        "Okay ma'am, will do",
+    )
+
+    def test_round3_sign_offs_carry_no_question(self):
+        for text in self._SIGN_OFFS:
+            self.assertFalse(phone.phone_qna_carries_question(text), text)
+
+    def test_round3_real_questions_still_carry_one(self):
+        for text in (
+            "Not really, but what is the salary",
+            "Nothing as of now, but can you tell me the salary",
+            "No ma'am, what is the stipend",
+            "Okay, is there a bond",
+            "Thanks. Do you have a hybrid option",
+            "No, will I get the offer letter by mail",
+            "No, one more question",
+            "No one more question",
+            "No, but I wanted to know the timings",
+            "Actually I have a doubt",
+        ):
+            self.assertTrue(phone.phone_qna_carries_question(text), text)
+
+    async def test_round3_judged_sign_off_closes_on_the_first_decline(self):
+        for text in self._SIGN_OFFS:
+            with self.subTest(text=text):
+                window, _, _ = _qna_window({text: _qna_verdict("end_call", text)})
+                agent, _, _, client, hooks = await self._enter_qna(window)
+                out, _ = await self._qna_turn(hooks, text)
+                self.assertIn("say goodbye", out.lower())
+                self.assertNotIn("answer the candidate's question", out.lower())
+                self.assertEqual(
+                    agent._closing_state_machine.state.value, "closing_pending")
+                self.assertIn(("judged_decline", "judge"), self._qna_close_lines(hooks))
+                self.assertNotIn(("judged_decline_question_shape", "judge"),
+                                 self._qna_close_lines(hooks))
+                await self._finish(hooks)
+                self.assertIn("assessment.completed", client.event_types)
+
+    async def test_round3_sign_off_over_a_pending_goodbye_stays_terminal(self):
+        # The over-the-goodbye "Okay, thank you. Will wait for your call."
+        # must never interrupt the goodbye or reopen Q&A.
+        for text in self._SIGN_OFFS:
+            with self.subTest(text=text):
+                window, _, _ = _qna_window({
+                    "No thank you": _qna_verdict("end_call", "No thank you"),
+                    text: _qna_verdict("end_call", text)})
+                agent, _, _, client, hooks = await self._enter_qna(window)
+                await self._qna_turn(hooks, "No thank you")
+                self.assertEqual(
+                    agent._closing_state_machine.state.value, "closing_pending")
+                stale = _FakeSpeech()
+                hooks["reply_handle"][0] = stale
+                _, stopped = await self._qna_turn(hooks, text)
+                self.assertTrue(stopped)
+                self.assertEqual(stale.interrupt_calls, [])
+                self.assertEqual(
+                    agent._closing_state_machine.state.value, "closing_pending")
+                interlocks = [
+                    c.kwargs.get("error_category")
+                    for c in hooks["log"].info.call_args_list
+                    if c.kwargs.get("error_type") == "phone_qna_terminal_interlock"
+                ]
+                self.assertEqual(interlocks, [])
+                await self._stop(hooks)
+
+    async def test_round3_question_judged_while_the_goodbye_finishes_is_answered(self):
+        # Round-3 review (nit): the goodbye finished playing while this turn's
+        # judge call was in flight. The question goes to the late-question
+        # path (one answer plus the goodbye again), not silently dropped.
+        late = "No ma'am, and the stipend amount for interns"
+        transport = _HeldQnaJudgeTransport({
+            "Nothing else": _qna_verdict("end_call", "Nothing else"),
+            late: _qna_verdict("question", "the stipend amount for interns")}, late)
+        window, _, _ = _qna_window(transport=transport)
+        agent, _, _, client, hooks = await self._enter_qna(window)
+        await self._qna_turn(hooks, "Nothing else")
+        self.assertEqual(agent._closing_state_machine.state.value, "closing_pending")
+        stale = _FakeSpeech()
+        hooks["reply_handle"][0] = stale
+        turn = asyncio.ensure_future(self._qna_turn(hooks, late))
+        await asyncio.wait_for(transport.held.wait(), timeout=2)
+        await agent._on_reply_delivered(False)
+        self.assertEqual(agent._closing_state_machine.state.value, "closing_played")
+        transport.release.set()
+        out, stopped = await asyncio.wait_for(turn, timeout=2)
+        self.assertFalse(stopped)
+        self.assertIn("goodbye again", out.lower())
+        self.assertEqual(stale.interrupt_calls, [])
+        answered = [
+            c.kwargs.get("error_category") for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_qna_late_question"
+        ]
+        self.assertEqual(answered, ["late_question_answered"])
+        # The judge was asked once for this turn (the late path reused it).
+        self.assertEqual([c["phase"] for c in transport.calls], ["qna_close", "qna_close"])
+        await agent._on_reply_delivered(False)
+        with patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock):
+            await asyncio.wait_for(hooks["task"], timeout=10)
+        hooks["log_patch"].stop()
+        self.assertEqual(client.event_types.count("assessment.completed"), 1)
 
     async def test_qna_close_phase_names_who_decided(self):
         # Round-2 review fix: `phase` is who decided THIS turn, not whether

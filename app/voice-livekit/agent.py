@@ -2076,16 +2076,26 @@ class _GateJudgeWiring:
         wait_for_more: "Callable[[str], Awaitable[Any]] | None" = None,
     ) -> "gate_judge.GateDecision":
         """The acting decision (llm mode). Latches `candidate_spoke` on a
-        valid verdict that is not voicemail; never raises."""
+        valid verdict that is not voicemail; never raises.
+
+        Round-3 review fix: a voicemail verdict rejected because its cited
+        words do not read as a machine (`voicemail_not_machine_shaped`) sets
+        the WEAK latch instead: the fall-through is a deferral, never a
+        silent machine hang-up, but later machine wording still decides.
+        """
         decision = await gate_judge.judge_gate(
             self.request(phase, bot_line),
             timeout_sec=self.timeout_sec, legacy=legacy,
             pending=self.pending_speech, wait_for_more=wait_for_more,
             config=self.config, transport=self.transport, breaker=self.breaker,
-            log=self.log, clock=self.clock,
+            log=self.log, clock=self.clock, voicemail_shape=_voicemail_shaped,
         )
         if decision.source == gate_judge.SOURCE_LLM and decision.intent is not None:
-            self.latch.note_judge_intent(decision.intent)
+            if (decision.guard_rejected_reason
+                    == gate_judge.GUARD_VOICEMAIL_NOT_MACHINE_SHAPED):
+                self.latch.note_skipped(phase, machine_match=False)
+            else:
+                self.latch.note_judge_intent(decision.intent)
         self.last_decision = decision
         return decision
 
@@ -2141,7 +2151,7 @@ class _GateJudgeWiring:
             decision = await gate_judge.judge_gate(
                 request, timeout_sec=self.timeout_sec, legacy=None,
                 config=self.config, transport=self.transport, breaker=self.breaker,
-                log=_shadow_log, clock=self.clock,
+                log=_shadow_log, clock=self.clock, voicemail_shape=_voicemail_shaped,
             )
             if legacy_intent is not None:
                 self._log_agreement(phase, decision, legacy_intent)
@@ -4065,6 +4075,36 @@ def _is_machine_text(value: str) -> bool:
         _MACHINE_AVAILABILITY_RE.search(value)
         and not _FIRST_PERSON_RE.search(value.replace("’", "'"))
     )
+
+
+#: Round-3 review fix: greeting wording a PERSON does not use, on top of
+#: `_MACHINE_RE`, for the judge's voicemail shape guard ONLY (the legacy
+#: readers keep `_is_machine_text` unchanged): "forwarded to an automated
+#: voice messaging system", "you have reached …", "can't take your call".
+_VOICEMAIL_SHAPE_RE = re.compile(
+    r"\bvoice\s*messag|\bautomated\s+(?:voice|message|messaging|system|attendant)\b|"
+    r"\banswering\s+(?:machine|service)\b|\bmail\s*box\b|"
+    r"\byou(?:'ve|\s+have)\s+reached\b|"
+    r"\b(?:can't|cannot|can\s+not|unable\s+to)\s+(?:take|answer)\s+your\s+call\b|"
+    r"\bat\s+the\s+(?:tone|beep)\b",
+    re.IGNORECASE,
+)
+
+
+def _voicemail_shaped(value: str) -> bool:
+    """Does an utterance a judged voicemail cites read as a machine?
+
+    The judge's `voicemail_machine` verdict may act at identity/consent only
+    on such words (`gate_judge.voicemail_guard_failure`): a person's own
+    "Hello? Who is this?" misread as voicemail is never a silent hang-up.
+    Blocking direction only; nothing here can make a call machine.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    clean = value.replace("’", "'")
+    return _is_machine_text(clean) or _VOICEMAIL_SHAPE_RE.search(clean) is not None
+
+
 _WRONG_NUMBER_RE = re.compile(
     r"wrong number|no one (?:by|with) that name|nobody (?:by|with) that name|"
     r"you(?:'ve| have) got the wrong",
@@ -7874,9 +7914,14 @@ async def _run_native_phone_screening(
             set_reply_snapshot("Take your time.", phase="patience")
             add_turn_instruction(turn_ctx, phone.PHONE_PATIENCE_ENCOURAGEMENT_TEXT)
             return
+        # Round-3 review fix: no separate `phone_qna_question_directed`
+        # short-cut here. `_qna_kind` already applies it (the fallback
+        # grammar, and a judged `other`), and in llm mode a judged decline is
+        # overridden only by the stricter `phone_qna_carries_question`; the
+        # short-cut skipped the judge and reopened Q&A (interrupting the
+        # goodbye) on sign-offs such as "Okay ma'am, will do".
         late_question = closing.state is ClosingState.CLOSING_PENDING and (
             route == "candidate_question"
-            or phone.phone_qna_question_directed(text)
             or await _qna_kind(text, route) == QNA_KIND_QUESTION
         )
         # Round-2 review fix: `_qna_kind` may await the judge (llm mode), and
@@ -7900,6 +7945,19 @@ async def _run_native_phone_screening(
             _log.info(
                 "unknown_event", error_type="phone_qna_terminal_interlock",
                 error_category="pending_close_cancelled",
+            )
+        elif late_question and closing.state is ClosingState.CLOSING_PLAYED:
+            # Round-3 review fix (nit): the goodbye finished playing while
+            # this question was being judged. Hand it to the late-question
+            # path (one short answer plus the goodbye again, once per call;
+            # the cached `_qna_kind` means no second judge call), exactly as
+            # if it had arrived a moment later. If that path declines (already
+            # used, or the terminal not yet `completed`), the drop is logged.
+            if await _late_qna_question(turn_ctx, text):
+                return
+            _log.info(
+                "unknown_event", error_type="phone_qna_terminal_interlock",
+                error_category="late_question_after_goodbye_dropped",
             )
         if closing.state in {ClosingState.CLOSING_PENDING, ClosingState.CLOSING_PLAYED}:
             # Callback intent was handled above. Every other utterance after the

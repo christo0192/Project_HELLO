@@ -14883,30 +14883,64 @@ def phone_qna_question_directed(text: Any) -> bool:
     return _QNA_QUESTION_OPEN_RE.match(clean) is not None
 
 
+#: Q&A ONLY (M013 S01 round-3 review fix): a clause that is unmistakably a
+#: question even with no STT '?'. The same leading skips as
+#: `_QNA_QUESTION_OPEN_RE`, then a wh-word, or an auxiliary WITH a subject
+#: after it (subject inversion: "can you", "is there", "will I", "do we").
+#: A bare auxiliary is not enough: "will wait for your call", "do keep me
+#: posted", "do take care", "is fine" and "will do" are Indian-English
+#: sign-offs, not questions. The auxiliary must be followed by whitespace,
+#: so "can't" / "don't" never count.
+_QNA_CLAUSE_QUESTION_RE = re.compile(
+    r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now|um+|uh+|yeah|right|wait|"
+    r"(?:(?:yes|no)[\s,.!-]*)?(?:ma['’]?a?m|maam|mam|madam|sir))[\s,.!?-]+){0,4}"
+    r"(?:(?:what|which|who|where|when|why|how)\b"
+    r"|(?:can|could|would|will|is|are|do|does|did)\s+"
+    r"(?:you|u|i|we|they|it|there|this|that|these|those|the|a|an|any|my|your|"
+    r"our|their|his|her|he|she|someone|somebody|anyone|anybody)\b)",
+    re.IGNORECASE,
+)
+#: "No, I don't have a question" / "not a single doubt": a NEGATED mention
+#: of a question is a decline, not a request to ask one.
+_QNA_NEGATED_ASKS_RE = re.compile(
+    r"\b(?:no|not|don't|do\s+not|dont|haven't|have\s+not|havent|never|without)"
+    r"(?:\s+(?:have|got|really|even|any|a|single))*\s+"
+    r"(?:(?:more|other|further)\s+)?"
+    r"(?:question|query|doubt)s?\b",
+    re.IGNORECASE,
+)
+
+
 def phone_qna_carries_question(text: Any) -> bool:
-    """Q&A ONLY (M013 S01 round-2 review fix): does a reply ALSO ask something?
+    """Q&A ONLY (M013 S01 round-2/3 review fix): does a reply ALSO ask something?
 
     The guard a JUDGED decline must pass before it may close the call: True on
-    a '?', a "one more question" / "a doubt" mention, a request shape ("tell
-    me about…", "I wanted to know…"), or ANY clause that opens with a question
-    word ("Not really, but what is the salary", "Nothing as of now, but can
-    you tell me the salary"). The same clause rule `phone_qna_decline` fails
-    closed on, so with STT punctuation missing a question is still never
-    closed on. Only ever turns a close into an answer.
+    a '?', a non-negated "one more question" / "a doubt" mention, a request
+    shape ("tell me about…", "I wanted to know…"), or ANY clause that is
+    question-shaped (`_QNA_CLAUSE_QUESTION_RE`: a wh-word, or an auxiliary
+    with a subject after it — "Not really, but what is the salary",
+    "Nothing as of now, but can you tell me the salary"). Round 3: a bare
+    auxiliary ("will wait for your call", "do let me know the result",
+    "Okay ma'am, will do") and a negated mention ("No, I don't have a
+    question") no longer count, so the common sign-offs the judge reads as a
+    decline still close on the first one. Only ever turns a close into an
+    answer.
     """
     if not isinstance(text, str):
         return False
     clean = " ".join(text.replace("’", "'").replace("‘", "'").strip().split())
     if not clean:
         return False
-    if "?" in clean or _QNA_ASKS_RE.search(clean) or _QNA_REQUEST_RE.search(clean):
+    if "?" in clean or _QNA_REQUEST_RE.search(clean):
+        return True
+    if _QNA_ASKS_RE.search(_QNA_NEGATED_ASKS_RE.sub(" ", clean)):
         return True
     for clause in re.split(r"[.;!,]|\b(?:but|and|although|though)\b",
                            clean, flags=re.IGNORECASE):
         clause = clause.strip()
-        if clause and _QNA_QUESTION_OPEN_RE.match(clause):
+        if clause and _QNA_CLAUSE_QUESTION_RE.match(clause):
             return True
-    return phone_qna_question_directed(clean)
+    return False
 
 
 _GENERAL_CLARIFICATION_RE = re.compile(

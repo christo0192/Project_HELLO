@@ -657,6 +657,114 @@ class TestVoicemailAndTheLatch(unittest.TestCase):
                 self.assertNotEqual(result.decision, phone.CLASSIFY_MACHINE)
                 self.assertTrue(result.glue.spoke.spoke)
 
+    # Round-3 review (minor): citing words that WERE heard is not enough. A
+    # voicemail verdict on a person's own first words used to be a silent
+    # machine hang-up; it now needs the cited utterance to read as a machine.
+
+    def test_round3_voicemail_citing_a_persons_own_words_at_consent_is_not_machine(self):
+        # Case (a): no identity turn; "Hello? Who is this?" judged voicemail
+        # citing "Who is this".
+        fixture = _fixture("own_words_voicemail", speech=[
+            _speech(12000, 13400, 13900, 13910, "Hello? Who is this?"),
+        ])
+        result = _llm(fixture, {"consent": [
+            (gr.judge_json("voicemail_machine", "Who is this"), 500),
+        ]})
+        self.assertNotEqual(result.decision, phone.CLASSIFY_MACHINE)
+        self.assertTrue(result.glue.spoke.spoke)
+        # The WEAK latch: later machine wording would still decide.
+        self.assertFalse(result.glue.spoke.confirmed)
+        self.assertIn("reask", result.spoken_kinds())
+        self.assertEqual(result.decision, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        decision = _logs(result, "phone_gate_decision")[0]
+        self.assertEqual(decision.error_category, "llm.unclear")
+        self.assertIn(gate_judge.GUARD_VOICEMAIL_NOT_MACHINE_SHAPED, str(decision.fields))
+        self.assertEqual(result.leaked_text_in_logs(), [])
+
+    def test_round3_hello_judged_voicemail_at_identity_and_consent_is_not_machine(self):
+        # Case (b): identity "Hello?" judged voicemail citing "Hello", then
+        # consent "Hello? Hello?" judged voicemail citing "Hello".
+        fixture = _fixture("hello_hello", identity=(0, 500, 4000), consent=(9000, 9500, 15000),
+                           speech=[
+                               _speech(4200, 4700, 5200, 5210, "Hello?"),
+                               _speech(16000, 17000, 17500, 17510, "Hello? Hello?"),
+                           ])
+        result = _llm(fixture, {
+            "identity": [(gr.judge_json("voicemail_machine", "Hello"), 400)],
+            "consent": [(gr.judge_json("voicemail_machine", "Hello"), 500)],
+        })
+        self.assertNotEqual(result.decision, phone.CLASSIFY_MACHINE)
+        self.assertEqual(result.decision, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertTrue(result.glue.spoke.spoke)
+        self.assertIn("reask", result.spoken_kinds())
+
+    def test_round3_hello_judged_voicemail_at_identity_then_silence_defers(self):
+        # A misread "Hello?" at identity no longer leaves an empty latch for
+        # silence at consent to turn into a machine hang-up.
+        fixture = _fixture("identity_hello_vm", identity=(0, 500, 4000), consent=(9000, 9500, 15000),
+                           speech=[_speech(4200, 4700, 5200, 5210, "Hello?")])
+        result = _llm(fixture, {
+            "identity": [(gr.judge_json("voicemail_machine", "Hello"), 400)],
+        })
+        self.assertEqual(result.identity_verdict, phone.PHONE_IDENTITY_UNCLEAR)
+        self.assertTrue(result.glue.spoke.spoke)
+        self.assertEqual(result.decision, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+
+    def test_round3_a_misread_then_a_real_greeting_still_reaches_machine(self):
+        # The weak latch: machine wording after a rejected voicemail verdict
+        # still decides, so a real greeting is not stuck as a person.
+        fixture = _fixture("greeting_in_two_parts", speech=[
+            _speech(12000, 12800, 13300, 13310, "Hi, this is Neha."),
+            _speech(20000, 22000, 22500, 22510, "Please leave your message after the tone."),
+        ])
+        result = _llm(fixture, {
+            "consent": [(gr.judge_json("voicemail_machine", "Hi, this is Neha"), 500)],
+            "consent_retry": [
+                (gr.judge_json("voicemail_machine", "Please leave your message after the tone"), 500),
+            ],
+        })
+        self.assertEqual(result.decision, phone.CLASSIFY_MACHINE)
+        self.assertFalse(result.glue.spoke.spoke)
+
+    def test_round3_real_greetings_still_reach_machine_at_consent(self):
+        for text in (
+            "Please leave your message after the tone.",
+            "The subscriber you are trying to reach is not reachable at the moment.",
+            "Your call has been forwarded to an automated voice messaging system.",
+            "Hi, you've reached Neha. I can't take your call right now.",
+        ):
+            with self.subTest(text=text):
+                fixture = _fixture("real_greeting", speech=[
+                    _speech(12000, 15000, 15500, 15510, text),
+                ])
+                result = _llm(fixture, {"consent": [
+                    (gr.judge_json("voicemail_machine", text.rstrip(".")), 500),
+                ]})
+                self.assertEqual(result.decision, phone.CLASSIFY_MACHINE)
+                self.assertFalse(result.glue.spoke.spoke)
+
+    def test_round3_bank_voicemail_utterances_are_machine_shaped(self):
+        # Every non-human voicemail item in the recorded bank reads as a
+        # machine, so the guard never blocks a real greeting the judge
+        # recognised. (Human items may mention "voicemail"; the guard only
+        # ever blocks, so that costs nothing.)
+        import json  # noqa: PLC0415
+        from pathlib import Path  # noqa: PLC0415
+        bank = json.loads(
+            (Path(__file__).resolve().parent / "fixtures" / "gate_bank_synthetic.json")
+            .read_text(encoding="utf-8"))
+        checked = 0
+        for item in bank["items"]:
+            if item.get("family") != "voicemail" or item["human"]:
+                continue
+            for utterance in item["utterances"]:
+                checked += 1
+                self.assertTrue(agent_mod._voicemail_shaped(utterance["text"]), item["id"])
+        self.assertGreaterEqual(checked, 10)
+        for text in ("Hello? Who is this?", "Hello? Hello?", "Hello?", "Yes, who is calling?",
+                     "Sorry, I'm not available right now, can you call me later?"):
+            self.assertFalse(agent_mod._voicemail_shaped(text), text)
+
 
 # â”€â”€ the identity turn through the real gate (extends TestGateIdentityFlow) â”€
 

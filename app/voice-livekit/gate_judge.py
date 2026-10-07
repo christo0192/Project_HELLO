@@ -1592,8 +1592,17 @@ def suppressive_guard_failure(
     return None
 
 
+#: Round-3 review fix: a judged voicemail whose cited words do not read as a
+#: machine (the caller's ``voicemail_shape``) may not act at these phases.
+GUARD_VOICEMAIL_NOT_MACHINE_SHAPED = "voicemail_not_machine_shaped"
+VOICEMAIL_SHAPE_PHASES = frozenset({PHASE_IDENTITY, PHASE_CONSENT, PHASE_CONSENT_RETRY})
+
+
 def voicemail_guard_failure(
     verdict: "JudgeVerdict", utterances: Iterable[GateUtterance],
+    *,
+    phase: Optional[str] = None,
+    voicemail_shape: Optional[Callable[[str], bool]] = None,
 ) -> Optional[str]:
     """Why a ``voicemail_machine`` verdict may NOT act (``None`` = it may).
 
@@ -1607,6 +1616,18 @@ def voicemail_guard_failure(
     verdict is ``unclear``, which latches ``candidate_spoke`` like any other
     valid non-voicemail verdict, so the call ends in a re-ask or a deferral,
     never as machine.
+
+    Round-3 review fix: citing words that WERE heard is not enough either. A
+    judge that misreads a person's own first words ("Hello? Who is this?",
+    citing "Who is this") would still hang up on them. At the identity and
+    consent phases, with a ``voicemail_shape`` predicate (the worker's
+    machine/carrier/IVR wording), at least one utterance holding the cited
+    words must read as a machine, or the verdict is rejected with
+    ``voicemail_not_machine_shaped``. Only ever in the blocking direction: it
+    turns a would-be machine hang-up into a re-ask or a deferral. The caller
+    gives this rejection the WEAK latch (machine wording heard later still
+    decides), so a real greeting the predicate does not know is not stuck
+    as a person.
     """
     if verdict.intent != INTENT_VOICEMAIL:
         return None
@@ -1614,8 +1635,20 @@ def voicemail_guard_failure(
         return "no_evidence"
     if evidence_names_a_label(verdict.evidence):
         return "evidence_is_label"
-    if not evidence_utterances(verdict.evidence, utterances):
+    matches = evidence_utterances(verdict.evidence, utterances)
+    if not matches:
         return "evidence_not_found"
+    if voicemail_shape is not None and phase in VOICEMAIL_SHAPE_PHASES:
+        shaped = False
+        for utterance in matches:
+            try:
+                shaped = bool(voicemail_shape(utterance.text))
+            except Exception:  # noqa: BLE001 — unknown shape never acts
+                shaped = False
+            if shaped:
+                break
+        if not shaped:
+            return GUARD_VOICEMAIL_NOT_MACHINE_SHAPED
     return None
 
 
@@ -1839,6 +1872,7 @@ async def judge_gate(
     breaker: Any = None,
     log: Optional[Callable[..., None]] = None,
     clock: Callable[[], float] = time.monotonic,
+    voicemail_shape: Optional[Callable[[str], bool]] = None,
 ) -> GateDecision:
     """Judge one reply window and return what the gate acts on. Never raises.
 
@@ -1856,6 +1890,9 @@ async def judge_gate(
 
     ``timeout_sec`` may be a callable, re-read before each judge call so a
     re-judge only spends what the gate budget still has.
+
+    ``voicemail_shape`` (round-3 review fix): the caller's machine-wording
+    predicate; see `voicemail_guard_failure`.
     """
     started = clock()
     min_speech = grant_min_speech_ms() if min_speech_ms is None else int(min_speech_ms)
@@ -1890,7 +1927,9 @@ async def judge_gate(
             if verdict.intent != INTENT_CONSENT_GRANTED:
                 found = evidence_utterances(verdict.evidence, shown)
                 suppressive = (suppressive_guard_failure(verdict, shown)
-                               or voicemail_guard_failure(verdict, shown))
+                               or voicemail_guard_failure(
+                                   verdict, shown, phase=request.phase,
+                                   voicemail_shape=voicemail_shape))
                 if suppressive is not None:
                     # A verdict that ends the call or suppresses the candidate
                     # must rest on their own words after the question, like a
