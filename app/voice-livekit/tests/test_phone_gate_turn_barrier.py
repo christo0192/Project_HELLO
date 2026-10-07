@@ -326,12 +326,22 @@ class TestClassifyPhoneAnswerSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision, phone.CLASSIFY_HUMAN)
         self.assertEqual(consumed, ["Yes, that's fine."])
 
-    async def test_only_stale_turns_falls_closed_to_MACHINE(self):
+    async def test_only_stale_turns_defer_never_machine(self):
+        # Review fix: stale words are never consent, but they are a person
+        # (the weak latch), so the call is deferred with a goodbye, not hung
+        # up on as a voicemail.
         decision, _, consumed = await self._classify(
             [("Hello?", 1_000), ("Hello?", 1_100)], anchor=5_000,
         )
-        self.assertEqual(decision, phone.CLASSIFY_MACHINE)
+        self.assertEqual(decision, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
         self.assertEqual(consumed, [], "a stale turn was consumed as consent")
+
+    async def test_only_stale_voicemail_wording_still_falls_closed_to_MACHINE(self):
+        decision, _, consumed = await self._classify(
+            [("Please leave a message after the tone.", 1_000)], anchor=5_000,
+        )
+        self.assertEqual(decision, phone.CLASSIFY_MACHINE)
+        self.assertEqual(consumed, [])
 
     @staticmethod
     def _turn(text, *, start, end=None, committed=True, closed_by="commit",
@@ -1039,7 +1049,9 @@ class TestFifoPairing(unittest.TestCase):
         self.assertEqual(rig.rel(utterance.segment_start_ms), 22_378)
         self.assertEqual(rig.rel(utterance.segment_end_ms), 24_732)
         self.assertEqual(rig.rel(utterance.segment_first_end_ms), 23_333)
-        self.assertEqual(utterance.segment_speech_ms, 955 + 1_032)
+        # The LONGEST paired segment (review fix: never the sum, so blips
+        # cannot add up to the acoustic minimum).
+        self.assertEqual(utterance.segment_speech_ms, 1_032)
 
     def test_ATTACK_a_noise_segment_after_the_question_cannot_lend_its_start(self):
         # Identity "Yes" 2000-2600; consent question heard at 4000; noise

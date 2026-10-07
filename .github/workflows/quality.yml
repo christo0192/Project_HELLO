@@ -177,6 +177,18 @@ jobs:
           /tmp/ns-venv/bin/python -m unittest tests.test_recorder_flush -v > /tmp/rf-test.log 2>&1 || { cat /tmp/rf-test.log; exit 1; }
           cat /tmp/rf-test.log
           if grep -q "skipped" /tmp/rf-test.log; then echo "::error::recording tail-flush SDK tests skipped"; exit 1; fi
+      # M013 S01 gate: the turn barrier rests on livekit-agents 1.6.4
+      # behaviours the bare-python step stubs away (clear_user_turn, a
+      # non-interruptible say dropping a completed turn, user_state created_at,
+      # the VAD timing fields, the agent-state toggle between back-to-back
+      # says). Checked against the REAL pinned SDK in the venv the step above
+      # built from requirements.txt; a skip is a failure.
+      - name: Gate real-SDK contract (livekit-agents 1.6.4)
+        run: |
+          cd app/voice-livekit
+          GATE_SDK_CONTRACT_REQUIRED=1 /tmp/ns-venv/bin/python -m unittest tests.test_gate_sdk_contract -v > /tmp/sdk-contract.log 2>&1 || { cat /tmp/sdk-contract.log; exit 1; }
+          cat /tmp/sdk-contract.log
+          if grep -Eq "\.\.\. skipped|skipped=" /tmp/sdk-contract.log; then echo "::error::gate SDK contract tests skipped"; exit 1; fi
       # R1 SDK contract (tests/test_r1_sdk_contract.py): the bare-python step above SKIPS
       # it (no livekit SDK there) and runs test_r1_core against stand-ins, so every
       # livekit-agents 1.6.4 fact the R1 worker relies on (no JobContext.close_room,

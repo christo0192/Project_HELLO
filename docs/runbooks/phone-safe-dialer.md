@@ -101,7 +101,7 @@ secret again afterwards so the repo shows the live value.
 | `PHONE_Q1_PRERENDER` | default `true` | Q1 audio is pre-rendered under the role line | `false` |
 | `PHONE_DETERMINISTIC_OPENER` | default `false` (composed openings) | `true` speaks the fixed scripted lines | `PHONE_DETERMINISTIC_OPENER=true` |
 | `PHONE_GATE_MAX_SECONDS` | default `180` | Gate wall clock; the lease heartbeat now runs from the answer and a budget is checked before every new ask | `116` (the old value) |
-| `PHONE_CLASSIFY_TIMEOUT_SEC` | not set; derived 50.4 s | Consent backstop = 2 × (answer window + 6 + judge timeout) + 5; an explicit value can only raise it | Set a higher value |
+| `PHONE_CLASSIFY_TIMEOUT_SEC` | not set; derived 50.4 s (137.3 s in `llm` mode) | Consent backstop = 2 × (answer window + 6 + judge timeout) + 5; in `llm` mode 3 × (answer window + 2 × 6 + 3 × judge timeout + 2 × 6 s quiescence) + 5; an explicit value can only raise it | Set a higher value |
 
 **Why `shadow` and not `llm`.** The T11 bank (`.gsd/milestones/M013/slices/S01/S01-BANK.md`)
 gave the judge 0 false grants where the regex gave 2 real and 9 synthetic ones.
@@ -109,10 +109,18 @@ But the judge granted 16 of 17 real consenting replies against the regex's 17,
 which fails the plan's "recall ≥ legacy" rule. Turning on `llm` is the owner's
 call: `fly secrets set PHONE_GATE_JUDGE=llm -a project-hello-phone-voice`.
 
-**Consent rules in `llm` mode (owner constraints):**
-- A judge error (timeout, transport error, bad JSON, breaker open, judge
-  disabled) **never grants**. The regex rules decide instead and may grant,
-  but only on speech that started after the recording sentence was heard.
+**Consent rules (owner constraints):**
+- In every mode (`legacy`, `shadow`, `llm`) a regex grant needs speech that
+  started at or after the recording sentence: a "yes" said over the first half
+  of the consent line is never consent (log `phone_gate_turn_barrier` /
+  `legacy_grant_before_recording_anchor`); the bot listens about 3 s more,
+  then re-asks.
+- In `llm` mode a judge error (timeout, transport error, bad JSON, breaker
+  open, judge disabled) **never grants**. The regex rules decide instead and
+  may grant, under the same recording-sentence rule.
+- In `llm` mode a judged opt-out, wrong person or decline must quote the
+  candidate's own words spoken after the question, or it is `unclear` (a
+  re-ask), never a suppression.
 - A valid judge verdict that is not a grant (no, busy, question, unclear) is
   never overridden by the regex.
 - A judge grant that fails a deterministic guard (evidence not in the
@@ -123,6 +131,9 @@ call: `fly secrets set PHONE_GATE_JUDGE=llm -a project-hello-phone-voice`.
 
 **The "a person spoke" rule (`candidate_spoke`, all modes).** Once a reply that
 is not voicemail wording is heard, the call can no longer end as `machine`.
+Words a reader skipped (said before the question, or over the consent line)
+count too, but only weakly: they turn a silent ending into the deferral, while
+voicemail wording heard afterwards still makes it `machine`.
 Voicemail wording, silence or an unreadable reply after that ends with the
 deferral goodbye ("Sorry, I'll let you go for now. Our team will call you
 another time. Bye!") and `candidate.deferred_pre_disclosure` (uncharged, next IST
@@ -132,9 +143,18 @@ never to a yes/no re-ask. S01 posts only existing events and never stops or
 purges a recording itself; what happens to the audio is S02's (the recording
 flag), not this section's.
 
-**Logs to watch (categories, lengths and timings only; never text):**
-- `phone_gate_decision`: one per decision that acted (`source` = `llm` /
-  `legacy_fallback` / `legacy`, `intent`, `latency_ms`, `guard_rejected_reason`).
+**Logs to watch (categories, lengths and timings only; never text).** The
+structured logger only accepts its allowlisted keys, so the fields are:
+- `phone_gate_decision`: one per decision that acted. `error_category` =
+  `<source>.<intent>` (source `llm` / `legacy_fallback` / `legacy`, e.g.
+  `llm.consent_granted`); `duration_sec` = judge latency; `rejection_reason` =
+  the guard that turned a judge verdict into `unclear` (`before_recording_anchor`,
+  `speech_too_short`, `not_quiescent`, `evidence_not_post_question`, ...) or
+  `err.<category>` for a judge failure; `turn_index` = the evidence utterance;
+  `option_count` = utterances shown; `schema` = packed
+  `pv:<prompt version>_el:<evidence len>_nt:<tagged>_ac:<speech ms>_cf:<confidence>_rj:<re-judges>`.
+  Query `rejection_reason`, not `guard_rejected_reason` or `latency_ms`
+  (those names are internal and never logged).
 - `phone_gate_shadow_decision` and `phone_gate_shadow` (`agree` / `disagree` /
   `judge_unavailable`): what the judge would have done in `shadow`.
 - `gate_judge_fallback_legacy` (with the reason) and `gate_judge_disabled`
@@ -144,9 +164,36 @@ flag), not this section's.
 - `phone_gate_compose` (`composed` / `timeout` / `rejected_<reason>`),
   `phone_gate_budget`, `phone_gate_heartbeat`, the `gate_lease_halted` outcome,
   and `consent_turn_skipped` (a reply read as belonging to an earlier question).
+- `phone_gate_turn_barrier`: `consent_turn_skipped`, `consent_turn_not_grant_evidence`
+  and `legacy_grant_before_recording_anchor` (with `phase` = the tag and
+  `schema` = signed ms deltas); `phone_gate_quiescence` (a judge grant waiting
+  for the candidate to stop talking); `phone_gate_final` (`paired`,
+  `paired_chained`, `open_segment`, `shared_segment`, `no_segment`, with
+  `duration_sec` = the longest paired VAD segment).
+- `phone_callback_judge` (`spans_not_in_reply`, `spans_disagree`,
+  `resolved_match` / `resolved_mismatch`) and `phone_callback_turn`.
 - After consent: `phone_revocation_window` (busy, decline or opt-out spoken
-  before Q1 is answered) and the Q&A close (a bare "yes" gets "Sure, go ahead.";
-  a decline closes on the first one; a decline followed by silence completes).
+  before Q1 is answered; `shadow_<intent>` in shadow mode) and its per-call
+  `phone_gate_decision` / `phone_gate_shadow_decision` lines (phase
+  `post_consent`).
+- The Q&A close: `phone_qna_close` (`judged_<kind>`, `judge_unavailable`,
+  `fallback_other_answered`, `go_ahead`, `non_question_acknowledged`,
+  `non_question_close`, `filler_cap_close`; `source` = `judge` or `fallback`),
+  `phone_qna_close_judge` (the `qna_close` judge's own lines) and
+  `phone_silence` (`qna_silence_nudge`, `qna_silence_close`). A bare "yes"
+  gets "Sure, go ahead."; a decline closes on the first one; silence after the
+  invite or the go-ahead gets one "Are you still there?", then completes;
+  silence after a decline or an answer completes.
+
+**What the switches do NOT undo.** `PHONE_GATE_JUDGE=legacy` stops every judge
+call (identity, consent, revocation window, Q&A close) and
+`PHONE_DETERMINISTIC_OPENER=true` restores the scripted lines, but the Q&A
+closing changes have **no runtime switch**: the wider decline grammar (closes
+on the first "No, I don't have any questions"), the one-nudge-then-complete
+silence close, the filler/go-ahead cap and the fallback that answers every
+other Q&A turn. So do the turn-barrier changes (capture of finals the SDK
+dropped, the recording-sentence rule, the "a person spoke" deferral). Undoing
+those needs a revert and a redeploy of the previous image.
 
 ### 2y. Conversational gate rollback point — 2026-09-10 (0095)
 
@@ -208,7 +255,10 @@ fly secrets set PHONE_DETERMINISTIC_OPENER=true --app project-hello-phone-voice
 Since #334 unsetting `PHONE_DETERMINISTIC_OPENER` is **not** a rollback: its
 default is now `false` (composed openings). Set it to `true` explicitly. With
 `PHONE_GATE_FLOW` unset and the opener `true`, the gate returns to the fixed
-disclosure with no identity turn and no pre-consent generation. Secrets-only, so
+disclosure with no identity turn and no pre-consent generation by the main
+model. The gate judge (`PHONE_GATE_JUDGE=shadow`, as shipped, or `llm`) still
+sends the pre-consent identity and consent replies (first name only) to
+DeepSeek; set `PHONE_GATE_JUDGE=legacy` as well to stop that. Secrets-only, so
 it needs no deploy and no revert, and it works even if later code has shipped.
 
 A third flag, `PHONE_IDENTITY_MISMATCH_SUPPRESSES`, defaults to **off**. Both

@@ -485,6 +485,15 @@ class C5ParserTableTests(unittest.TestCase):
         ("call me at this time", None),
         # An explicit clock wins over "same time".
         ("tomorrow same time, no, make it 4pm", _ist_on(_SUN, 16)),
+        # M013 S01 review fix: a negated day is not the day; two days, or a
+        # negation with two clocks, are a guess either way.
+        ("not tomorrow, day after tomorrow at 5 pm", _ist_on("2026-10-05", 17)),
+        ("tomorrow is not possible, friday at 11 am", _ist_on("2026-10-09", 11)),
+        ("I'm not free tomorrow, call me monday at 11 am", _ist_on("2026-10-05", 11)),
+        ("tomorrow won't work, monday 10 am", _ist_on("2026-10-05", 10)),
+        ("no, tomorrow at 5 pm is fine", _ist_on(_SUN, 17)),
+        ("tomorrow or monday at 11 am", None),
+        ("not tomorrow at 5, monday at 11", None),
         # Bare 1-6 is PM; bare 7/8 and h:mm before 09:00 are None.
         ("tomorrow at 3", _ist_on(_SUN, 15)),
         ("tomorrow 3:30", _ist_on(_SUN, 15, 30)),
@@ -1059,8 +1068,45 @@ class T06ConversationTests(unittest.TestCase):
         client = _ScriptedClient()
         d = self._turn(flow, client, "not at 5 pm, tomorrow at 11 am is better",
                        _judged(day="tomorrow", when="11 am", resolved=f"{_TOMORROW}T11:00"))
+        # Review fix: the whole reply holds two clocks and a negation, so the
+        # parser picks neither; the judge's spans are only ever OFFERED, and
+        # booked on the candidate's yes.
+        self.assertFalse(d.booked)
+        self.assertEqual(client.propose_calls, [])
+        self.assertIn("tomorrow at 11", d.spoken)
+        self.assertTrue(self._turn(flow, client, "yes").booked)
+        self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 11)])
+
+    def test_a_negated_day_is_not_booked_from_the_judges_spans(self):
+        # "not tomorrow, day after tomorrow at 5 pm" with spans lifted out of
+        # their sentence ("tomorrow", "5 pm"): the reply's own reading (the
+        # day after tomorrow) wins, and is confirmed before it is booked.
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        d = self._turn(flow, client, "not tomorrow, day after tomorrow at 5 pm",
+                       _judged(day="tomorrow", when="5 pm", resolved=None))
+        self.assertFalse(d.booked)
+        self.assertEqual(client.propose_calls, [])
+        self.assertTrue(self._turn(flow, client, "yes").booked)
+        self.assertEqual(client.propose_calls, [_ist_on("2026-10-05", 17)])
+
+    def test_agreeing_readings_are_proposed_directly(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        d = self._turn(flow, client, "tomorrow at 11 am please",
+                       _judged(day="tomorrow", when="11 am", resolved=None))
         self.assertTrue(d.booked)
         self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 11)])
+
+    def test_spans_alone_are_offered_never_booked_directly(self):
+        # The parser cannot read the whole reply; the judge's spans can be
+        # read, but only as an offer the candidate confirms.
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        d = self._turn(flow, client, "not at 5 pm, tomorrow at 11 am",
+                       _judged(day="tomorrow", when="11 am", resolved=None))
+        self.assertFalse(d.booked)
+        self.assertEqual(client.propose_calls, [])
 
     def test_anytime_is_offered_and_confirmed(self):
         flow = phone.CallbackFlowState(conversational=True)

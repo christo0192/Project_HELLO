@@ -475,7 +475,9 @@ kill_timeout = 300
   # PHONE_CLASSIFY_TIMEOUT_SEC (the consent BACKSTOP) is deliberately NOT set
   # here any more (M013 S01). It is derived in code as
   #   2 x (PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC + 6 + PHONE_GATE_JUDGE_TIMEOUT_SEC) + 5
-  # = 50.4 s with the values in this file, and an explicit value can only RAISE
+  # = 50.4 s with the values in this file (legacy/shadow; in llm mode the judge's
+  # re-judges, quiescence waits and the question round raise it to 137.3 s),
+  # and an explicit value can only RAISE
   # it. The old "40" here could no longer do anything, so it only misled.
   # Its expiry is a spoken deferral, never "machine".
   # Per-answer window for ONE consent reply (each classify attempt gets its own).

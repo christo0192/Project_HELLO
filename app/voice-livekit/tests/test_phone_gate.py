@@ -10993,6 +10993,8 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
             "My brother works in sales too": _QNA_UNCLEAR,
         }
         for label, make in self._qna_modes(judged):
+            if label != "llm":
+                continue  # the fallback never decides "not a question" (below)
             with self.subTest(label):
                 agent, _, _, client, hooks = await self._enter_qna(make())
                 out, stopped = await self._qna_turn(hooks, "I'm good at sales")
@@ -11008,6 +11010,72 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
                     agent._closing_state_machine.state.value, "closing_pending")
                 await self._finish(hooks)
                 self.assertIn("assessment.completed", client.event_types)
+
+    async def test_the_fallback_answers_every_non_decline_and_never_closes_on_it(self):
+        # Review fix (legacy and shadow ship the fallback): an unpunctuated
+        # question cannot be told from a remark by grammar, so every
+        # non-decline turn gets the grounded answer, as before T09, and a
+        # repeated question is never hung up on.
+        for label, make in self._qna_modes({}):
+            if label == "llm":
+                continue
+            for first, second in (
+                ("Tell me about the work timings", "I want to know the salary"),
+                ("what is the stipend", "what is the stipend"),
+                ("I'm good at sales", "When will I hear back"),
+                ("Yes ma'am, what is your company's leave policy",
+                 "How many rounds are there"),
+            ):
+                with self.subTest(label=label, first=first):
+                    agent, _, _, client, hooks = await self._enter_qna(make())
+                    for reply in (first, second):
+                        out, stopped = await self._qna_turn(hooks, reply)
+                        self.assertFalse(stopped)
+                        self.assertIn("answer the candidate's question", out.lower())
+                        self.assertNotIn("nothing to answer", out.lower())
+                        self.assertIn("do not say goodbye yet", out.lower())
+                    self.assertEqual(
+                        agent._closing_state_machine.state.value, "candidate_qna")
+                    await self._stop(hooks)
+
+    async def test_the_fallback_closes_on_the_first_common_decline(self):
+        for label, make in self._qna_modes({}):
+            if label == "llm":
+                continue
+            for reply in ("I don't have any questions", "Not really, thank you",
+                          "No, thank you. Bye.", "Nothing as of now"):
+                with self.subTest(label=label, reply=reply):
+                    agent, _, _, client, hooks = await self._enter_qna(make())
+                    out, _ = await self._qna_turn(hooks, reply)
+                    self.assertIn("say goodbye", out.lower())
+                    self.assertEqual(
+                        agent._closing_state_machine.state.value, "closing_pending")
+                    await self._finish(hooks)
+                    self.assertIn("assessment.completed", client.event_types)
+
+    async def test_go_ahead_then_silence_nudges_once_then_completes(self):
+        # Review fix: after "Sure, go ahead." (or the invite) the candidate is
+        # about to ask; silence gets one "are you still there?" first.
+        for label, make in self._qna_modes({}):
+            if label == "llm_judge_down":
+                continue
+            with self.subTest(label), \
+                    patch.object(agent_mod, "CANDIDATE_SILENCE_PROMPT_SEC", 0.05):
+                agent, session, _, client, hooks = await self._enter_qna(make())
+                out, stopped = await self._qna_turn(hooks, "Yes")
+                self.assertIn(phone.PHONE_QNA_GO_AHEAD_TEXT, out)
+                hooks["agent_listening"].set()
+                with patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock):
+                    await asyncio.wait_for(hooks["task"], timeout=10)
+                hooks["log_patch"].stop()
+                self.assertIn("assessment.completed", client.event_types)
+                self.assertNotIn("assessment.aborted", client.event_types)
+                self.assertEqual(session.spoken.count(phone.PHONE_SILENCE_PROMPT_TEXT), 1)
+                categories = [
+                    c.kwargs.get("error_category") for c in hooks["log"].info.call_args_list
+                    if c.kwargs.get("error_type") == "phone_silence"
+                ]
+                self.assertEqual(categories, ["qna_silence_nudge", "qna_silence_close"])
 
     async def test_judge_question_verdict_is_not_overridden_by_the_decline_grammar(self):
         # A valid verdict decides (owner rule): the grammar would close on
@@ -11083,20 +11151,99 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
 class TestQnaClosingGrammar(unittest.TestCase):
     """M013 S01 T09: the fallback readers and the question-opener fix."""
 
-    def test_question_opener_skips_yes_no_honorific_and_wait(self):
+    def test_qna_question_opener_skips_yes_no_honorific_and_wait(self):
+        # Review fix: the honorific skip is Q&A-only (`_QNA_QUESTION_OPEN_RE`,
+        # `phone_qna_question_directed`), and it is tested WITHOUT a "?" too:
+        # every case ending in "?" was already a question on main.
         for text in (
             "Yes ma'am, what is the role?",
             "No ma'am, what is the stipend?",
             "No sir what about leave?",
             "Ma'am, what is the stipend?",
             "Wait, what's the salary?",
+            "Yes ma'am, what is the role",
+            "No ma'am, what is the stipend",
+            "No ma'am what is the stipend",
+            "Ma'am, how many rounds are there",
+            "Wait, what's the salary",
+            "Yes ma'am, what is your company's leave policy",
         ):
             with self.subTest(text):
-                self.assertEqual(phone.candidate_turn_route(text), "candidate_question")
-                self.assertTrue(phone.phone_candidate_question_directed(text))
+                self.assertTrue(phone.phone_qna_question_directed(text))
+                self.assertFalse(phone.phone_qna_decline(text))
+        for text in (
+            "Yes ma'am, what is the role",
+            "No ma'am, what is the stipend",
+            "Ma'am, how many rounds are there",
+            "Wait, what's the salary",
+        ):
+            with self.subTest(text):
+                self.assertIsNotNone(phone._QNA_QUESTION_OPEN_RE.match(text))
         # "Yes"/"No" alone are not skipped: an answer stays an answer.
-        self.assertIsNone(phone._QUESTION_OPEN_RE.search("Yes, I can join the team"))
-        self.assertIsNone(phone._QUESTION_OPEN_RE.search("No, I would not relocate"))
+        self.assertIsNone(phone._QNA_QUESTION_OPEN_RE.search("Yes, I can join the team"))
+        self.assertIsNone(phone._QNA_QUESTION_OPEN_RE.search("No, I would not relocate"))
+
+    def test_qna_requests_without_a_question_word_are_questions(self):
+        for text in (
+            "Tell me about the work timings",
+            "I want to know the salary",
+            "I wanted to know about the stipend",
+            "what is the stipend",
+            "How many rounds are there",
+            "when will I hear back",
+            "Can I ask about the leave policy",
+        ):
+            with self.subTest(text):
+                self.assertTrue(phone.phone_qna_question_directed(text))
+                self.assertFalse(phone.phone_qna_decline(text))
+
+    def test_the_shared_opener_is_unchanged_for_mid_interview_answers(self):
+        # Review fix: these are ANSWERS mid-interview; the honorific skip must
+        # not make them candidate questions (an extra interrupted re-ask, or a
+        # re-ask prefixed "first answer what the candidate asked").
+        for text in (
+            "Yes sir, will do.",
+            "Yes ma'am, will join in 30 days",
+            "Yes sir, can do",
+            "Yes ma'am, can relocate to Pune",
+            "No ma'am, did not work there",
+            "Yes ma'am, would be fine",
+            "Ma'am, how I handle objections is by listening",
+        ):
+            with self.subTest(text):
+                self.assertIsNone(phone._QUESTION_OPEN_RE.match(text))
+                dims = phone.phone_turn_dimensions("q", "open", text)
+                self.assertFalse(dims.get("candidate_question"))
+                self.assertIsNone(phone.candidate_turn_route(text))
+
+    def test_common_indian_english_declines(self):
+        for text in (
+            "I don't have any questions",
+            "No, I don't have any questions",
+            "No, I don't have any more questions as of now, thank you",
+            "I have no questions",
+            "Not really",
+            "Not really, thank you",
+            "Nothing as of now",
+            "No questions as of now",
+            "No, not as such",
+            "No, thank you. Bye.",
+            "Okay bye",
+            "Thank you so much ma'am, bye",
+            "No, I think that covers it",
+            "No ma'am, thank you so much.",
+            "It's all good",
+        ):
+            with self.subTest(text):
+                self.assertTrue(phone.phone_qna_decline(text))
+        for text in (
+            "Yes", "Okay", "No, but I have one question",
+            "Not really sure what the role is",
+            "I don't have any questions about the role but what is the salary",
+            "Bye the way, what is the salary",
+        ):
+            with self.subTest(text):
+                self.assertFalse(phone.phone_qna_decline(text))
 
     def test_bare_yes_reader(self):
         for text in ("Yes", "Yeah", "Right", "Yes ma'am", "Haan ji", "Yes?",

@@ -1911,6 +1911,10 @@ class TestRoleOpeningIsComposedNotStreamed(unittest.IsolatedAsyncioTestCase):
         fixed = phone.phone_role_opening_text(self.ROLE)
         self.assertFalse(phone.phone_role_opening_greets(fixed))
         self.assertTrue(phone.phone_role_opening_clean(fixed, self.ROLE))
+        # Review fix: no third-greeting pleasantry in the fixed line either.
+        low = fixed.lower()
+        for pleasantry in ("glad you could", "hop on", "hopping on", "thanks for"):
+            self.assertNotIn(pleasantry, low)
 
     def test_the_INSTRUCTION_says_already_greeted_and_forbids_a_greeting(self):
         text = phone.phone_role_opening_instruction(self.ROLE)

@@ -846,13 +846,17 @@ def phone_role_opening_text(role_title: str | None) -> str | None:
     spoken when the role is unknown, generation fails, or the generated line does
     not name the exact role (`phone_role_opening_faithful` is False) — so the
     verbatim server role is NEVER lost to a paraphrase or a hallucination.
+
+    M013 S01 review fix: no "Really glad you could hop on" pleasantry. After
+    the identity and consent lines it was the third greeting the owner
+    complained about (T08b), and every compose miss or timeout played it.
     """
     role = (role_title or "").strip()
     if not role:
         return None
     return (
         f"{_PHONE_ROLE_OPENING_PREFIX}this is about the {role} role at "
-        "Interview Kickstart. Really glad you could hop on — let's dive in!"
+        "Interview Kickstart."
     )
 
 
@@ -1629,20 +1633,39 @@ _CONSENT_LINE_ESTIMATE_SEC = 6.0
 _CONSENT_BACKSTOP_MARGIN_SEC = 5.0
 
 
+#: llm mode (review fix): a judged question back buys one more round
+#: (agent `_CONSENT_MAX_ATTEMPTS_WITH_QUESTION`), answered by a fixed FAQ line.
+_CONSENT_ATTEMPTS_LLM = 3
+
+
 def phone_classify_backstop_floor_sec() -> float:
     """The smallest consent backstop that cannot cut off a real answer.
 
-    attempts x (answer window + line + judge timeout) + margin. With the
-    defaults that is 2 x (15 + 6 + 1.7) + 5 = 50.4 s. The judge timeout is
-    counted even in legacy mode: a backstop that is a few seconds generous
-    costs nothing, one that is short ends a call a person is answering.
+    legacy / shadow: attempts x (answer window + line + judge timeout) +
+    margin. With the defaults that is 2 x (15 + 6 + 1.7) + 5 = 50.4 s. The
+    judge timeout is counted even in legacy mode: a backstop that is a few
+    seconds generous costs nothing, one that is short ends a call a person is
+    answering.
+
+    llm (review fix): the judge ACTS, so one attempt can also spend a
+    re-judge per quiescence wait and the waits themselves, and a question
+    back buys a third round with an FAQ line before its re-ask:
+    3 x (15 + 2 x 6 + 3 x 1.7 + 2 x 6) + 5 = 137.3 s with the defaults. Still
+    only the wedge backstop: `GateBudget` decides every healthy re-ask.
     """
-    return (
-        PHONE_CONSENT_ATTEMPTS * (
-            phone_classify_answer_timeout_sec()
-            + _CONSENT_LINE_ESTIMATE_SEC
-            + gate_judge.judge_timeout_sec()
+    answer = phone_classify_answer_timeout_sec()
+    judge = gate_judge.judge_timeout_sec()
+    if gate_judge.judge_mode() == gate_judge.GATE_JUDGE_MODE_LLM:
+        rejudges = gate_judge.GATE_JUDGE_MAX_REJUDGES
+        per_attempt = (
+            answer
+            + 2 * _CONSENT_LINE_ESTIMATE_SEC
+            + (1 + rejudges) * judge
+            + rejudges * gate_judge.GATE_QUIESCENCE_WAIT_MAX_SEC
         )
+        return _CONSENT_ATTEMPTS_LLM * per_attempt + _CONSENT_BACKSTOP_MARGIN_SEC
+    return (
+        PHONE_CONSENT_ATTEMPTS * (answer + _CONSENT_LINE_ESTIMATE_SEC + judge)
         + _CONSENT_BACKSTOP_MARGIN_SEC
     )
 
@@ -5241,6 +5264,63 @@ def _month_date_next(month: int, day: int, now_ist: datetime) -> Optional[Any]:
     return None
 
 
+#: A relative day or weekday named in a callback reply (longest first, so
+#: "day after tomorrow" is one mention, not also a "tomorrow").
+_CALLBACK_DAY_WORD_RE = re.compile(
+    r"\b(day after tomorrow|tomorrow|today|tonight|"
+    + "|".join(sorted(_WEEKDAYS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+#: A negation right before a day word: "not tomorrow", "can't do tomorrow",
+#: "I'm not free on Monday". A bare "no" is not one ("no, tomorrow is fine").
+_CALLBACK_DAY_NEGATED_BEFORE_RE = re.compile(
+    r"\b(?:not|never|can't|cant|cannot|won't|wont|don't|dont|isn't|isnt)"
+    r"(?:\s+[a-z']+){0,2}?\s+(?:on\s+|this\s+|for\s+)?$",
+    re.IGNORECASE,
+)
+#: A negation right after a day word: "tomorrow is not possible", "tomorrow
+#: won't work", "Monday doesn't suit me".
+_CALLBACK_DAY_NEGATED_AFTER_RE = re.compile(
+    r"^\s*(?:is\s+|would\s+be\s+|will\s+be\s+|i\s+am\s+|i'm\s+|im\s+)?"
+    r"(?:not\b|no\s+good\b|impossible\b|won't\b|wont\b|doesn't\b|doesnt\b"
+    r"|does\s+not\b|isn't\b|isnt\b|can't\b|cant\b|cannot\b|busy\b)",
+    re.IGNORECASE,
+)
+
+
+#: Any negation in a callback reply (with two clocks, which one is meant is a guess).
+_CALLBACK_NEGATION_RE = re.compile(
+    r"\b(?:not|never|can't|cant|cannot|won't|wont|don't|dont|isn't|isnt|doesn't|doesnt)\b",
+    re.IGNORECASE,
+)
+
+
+def _callback_day_mentions(low: str) -> tuple[list[str], int]:
+    """Review fix: the day words a reply names, minus the negated ones.
+
+    Returns ``(kinds, negated)``: each kept mention's canonical kind
+    ("tomorrow", "today", a weekday index as text...) and how many were
+    negated. "not tomorrow, day after tomorrow at 5 pm" names the day after
+    tomorrow; "tomorrow is not possible, friday at 11 am" names Friday.
+    """
+    kinds: list[str] = []
+    negated = 0
+    for match in _CALLBACK_DAY_WORD_RE.finditer(low):
+        before = low[max(0, match.start() - 40):match.start()]
+        after = low[match.end():match.end() + 40]
+        if (_CALLBACK_DAY_NEGATED_BEFORE_RE.search(before)
+                or _CALLBACK_DAY_NEGATED_AFTER_RE.search(after)):
+            negated += 1
+            continue
+        word = match.group(1).lower()
+        if word == "tonight":
+            word = "today"
+        elif word in _WEEKDAYS:
+            word = f"weekday:{_WEEKDAYS[word]}"
+        kinds.append(word)
+    return kinds, negated
+
+
 def _callback_day_ist(clean: str, now_ist: datetime) -> tuple[bool, Any]:
     """The IST calendar DAY an utterance names: ``(ok, date | None)``.
 
@@ -5272,22 +5352,29 @@ def _callback_day_ist(clean: str, now_ist: datetime) -> tuple[bool, Any]:
         day = int(m.group("d1") or m.group("d2"))
         value = _month_date_next(month, day, now_ist)
         return (value is not None), value
-    if re.search(r"\bday after tomorrow\b", low):
+    # Review fix: a negated day ("not tomorrow", "tomorrow is not possible")
+    # is not the day, and two different days left over ("tomorrow or
+    # Friday") are a guess either way: no day, so the caller asks.
+    kinds, _ = _callback_day_mentions(low)
+    distinct = set(kinds)
+    if len(distinct) > 1:
+        return False, None
+    if not distinct:
+        return True, None
+    kind = distinct.pop()
+    if kind == "day after tomorrow":
         return True, (now_ist + timedelta(days=2)).date()
-    if re.search(r"\btomorrow\b", low):
+    if kind == "tomorrow":
         return True, (now_ist + timedelta(days=1)).date()
-    if re.search(r"\b(?:today|tonight)\b", low):
+    if kind == "today":
         return True, now_ist.date()
-    m_wd = _WEEKDAY_RE.search(low)
-    if m_wd:
-        target_wd = _WEEKDAYS[m_wd.group(1).lower()]
-        # The NEXT occurrence of that weekday, strictly ahead (0 days would
-        # mean "today", which the candidate would have said as "today").
-        delta = (target_wd - now_ist.weekday()) % 7
-        if delta == 0:
-            delta = 7
-        return True, (now_ist + timedelta(days=delta)).date()
-    return True, None
+    target_wd = int(kind.split(":", 1)[1])
+    # The NEXT occurrence of that weekday, strictly ahead (0 days would
+    # mean "today", which the candidate would have said as "today").
+    delta = (target_wd - now_ist.weekday()) % 7
+    if delta == 0:
+        delta = 7
+    return True, (now_ist + timedelta(days=delta)).date()
 
 
 def parse_callback_day_ist(text: Any, now: datetime) -> Any:
@@ -5377,6 +5464,11 @@ def parse_callback_time_ist(
         flags=re.IGNORECASE,
     )
     resolved_hm = None
+    # Review fix: with a negation in the reply ("not tomorrow at 5, Friday at
+    # 11", "not at 5 pm, tomorrow at 11 am"), a second clock may belong to the
+    # negated clause: which one is meant is a guess, so none is.
+    negated_days = _callback_day_mentions(low)[1] or bool(_CALLBACK_NEGATION_RE.search(low))
+    clocks = 0
     for m_time in _TIME_RE.finditer(time_search):
         has_evidence = (
             m_time.group("ampm")
@@ -5387,6 +5479,11 @@ def parse_callback_time_ist(
         )
         if not has_evidence:
             continue
+        clocks += 1
+        if negated_days and clocks > 1:
+            return None
+        if resolved_hm is not None:
+            continue
         hour_text = m_time.group("hour")
         hour = int(hour_text)
         minute = int(m_time.group("minute") or 0)
@@ -5395,7 +5492,7 @@ def parse_callback_time_ist(
             m_time.group("part") or day_part,
             zero_padded=len(hour_text) == 2 and hour_text.startswith("0"),
         )
-        if resolved_hm is not None:
+        if resolved_hm is not None and not negated_days:
             break
 
     if (
@@ -6503,24 +6600,49 @@ def _callback_ask_text(flow: CallbackFlowState, now: datetime) -> str:
     return _CALLBACK_ASK_TIME_TEXT
 
 
+def _span_slot(
+    spans: _CallbackSpans, flow: CallbackFlowState, now: datetime,
+) -> Optional[str]:
+    """The judge's day/time spans read by the deterministic parser, or None."""
+    joined = " ".join(part for part in (spans.day_text, spans.time_text) if part)
+    candidates = [joined]
+    if spans.time_text and not re.match(r"(?i)at\b", spans.time_text):
+        candidates.append(" ".join(
+            part for part in (spans.day_text, "at " + spans.time_text) if part))
+    for candidate in candidates:
+        slot = parse_callback_time_ist(candidate, now, default_day=flow.day)
+        if slot is not None:
+            return slot
+    return None
+
+
 def _deterministic_slot(
     text: str, spans: Optional[_CallbackSpans], flow: CallbackFlowState, now: datetime,
-) -> tuple[Optional[str], str]:
-    """(instant, source): the judge's spans read by the parser first, then
-    the whole reply. Deterministic either way: the model chose WHICH words,
-    the parser decides WHAT they mean."""
-    if spans is not None:
-        joined = " ".join(part for part in (spans.day_text, spans.time_text) if part)
-        candidates = [joined]
-        if spans.time_text and not re.match(r"(?i)at\b", spans.time_text):
-            candidates.append(" ".join(
-                part for part in (spans.day_text, "at " + spans.time_text) if part))
-        for candidate in candidates:
-            slot = parse_callback_time_ist(candidate, now, default_day=flow.day)
-            if slot is not None:
-                return slot, "judge_spans"
-    slot = parse_callback_time_ist(text, now, default_day=flow.day)
-    return slot, "deterministic"
+) -> tuple[Optional[str], str, str]:
+    """(instant, source, kind): the whole reply first, the judge's spans second.
+
+    Review fix: spans are words lifted OUT of their sentence, so they lose
+    what surrounds them ("NOT tomorrow, day after tomorrow at 5 pm" -> spans
+    "tomorrow", "5 pm"), and they may come from an earlier reply. So the
+    deterministic parse of THIS reply decides when it resolves; a span
+    reading is only ever offered for confirmation (``kind`` ``confirm``),
+    never proposed directly, and when the two readings disagree the reply's
+    own reading is offered for confirmation too. ``kind`` ``slot``: the
+    candidate's own words resolved unambiguously, proposed directly.
+    """
+    whole = parse_callback_time_ist(text, now, default_day=flow.day)
+    span = _span_slot(spans, flow, now) if spans is not None else None
+    if whole is not None:
+        if span is not None and span != whole:
+            _log.info(
+                "unknown_event", error_type="phone_callback_judge",
+                error_category="spans_disagree",
+            )
+            return whole, "deterministic", "confirm"
+        return whole, "deterministic", "slot"
+    if span is not None:
+        return span, "judge_spans", "confirm"
+    return None, "deterministic", "slot"
 
 
 async def _conversational_callback_turn(
@@ -6534,8 +6656,10 @@ async def _conversational_callback_turn(
     """T06: one turn of the gate's callback conversation (time-capture phases).
 
     Order: a pending offer is confirmed or dropped; then the reply is
-    resolved — the judge's spans and the whole reply by the deterministic
-    parser (the judge's ``resolved_ist`` only cross-checked), a judge-only
+    resolved — the whole reply by the deterministic parser (proposed
+    directly; offered for confirmation when the judge's spans read it
+    differently), the judge's spans by the parser (always offered for
+    confirmation; `_deterministic_slot`), a judge-only
     resolution (confirmed before it is proposed), "anytime" (a confirmed
     offer), a day with no time (remembered; "what time tomorrow?"), or
     nothing (a clarification). Every instant is re-validated locally before
@@ -6560,7 +6684,7 @@ async def _conversational_callback_turn(
             error_category="offer_not_confirmed",
         )
 
-    slot, source = _deterministic_slot(text, spans, flow, now)
+    slot, source, kind = _deterministic_slot(text, spans, flow, now)
     if slot is not None:
         if spans is not None and spans.resolved_utc is not None:
             _log.info(
@@ -6574,7 +6698,7 @@ async def _conversational_callback_turn(
             "unknown_event", error_type="phone_callback_turn",
             error_category="resolved", schema=f"{source}:{problem or 'ok'}",
         )
-        return await _resolved_slot_turn(flow, client, attempt_id, slot, problem, now, "slot")
+        return await _resolved_slot_turn(flow, client, attempt_id, slot, problem, now, kind)
 
     if spans is not None and spans.resolved_utc is not None and spans.time_text:
         judge_slot = spans.resolved_utc
@@ -9771,10 +9895,19 @@ def classify_withdrawal_confirm_reply(text: Any) -> str:
 REVOCATION_CONFIRM_CALLBACK = "callback"
 REVOCATION_CONFIRM_CONTINUE = "continue"
 
+#: Review fix: no "ok", "okay", "alright" or "ji" here. In Indian English
+#: "Okay" / "Okay, tell me" / "Ji" to "would you prefer a call back?" usually
+#: means "go on", and a wrong callback ends a just-consented screening.
 _RV_YES_RE = re.compile(
-    r"^\s*(?:yes|yeah|yep|yup|ya|yah|haan|haa|han|ji|sure|please|ok|okay|"
-    r"alright|all\s+right|definitely|of\s+course|that\s+would\s+be\s+"
+    r"^\s*(?:yes|yeah|yep|yup|ya|yah|haan|haa|han|sure|please|"
+    r"definitely|of\s+course|that\s+would\s+be\s+"
     r"(?:better|great|good|nice)|that'?s\s+better|better)\b",
+    re.IGNORECASE,
+)
+#: "Go on" in any form: carry on with the screening (checked before a yes).
+_RV_CONTINUE_RE = re.compile(
+    r"\b(?:tell\s+me|go\s+on|go\s+ahead|continue|carry\s+on|proceed|"
+    r"ask(?:\s+(?:me|away|now|your\s+questions?))?|let'?s\s+(?:do\s+it|start|begin|go))\b",
     re.IGNORECASE,
 )
 _RV_NO_RE = re.compile(
@@ -9804,6 +9937,8 @@ def classify_revocation_busy_confirm_reply(text: Any) -> str:
     if candidate_turn_route(value) == "callback_deferral":
         return REVOCATION_CONFIRM_CALLBACK
     if _RV_NO_RE.search(value):
+        return REVOCATION_CONFIRM_CONTINUE
+    if _RV_CONTINUE_RE.search(value):
         return REVOCATION_CONFIRM_CONTINUE
     if _RV_YES_RE.match(value):
         return REVOCATION_CONFIRM_CALLBACK
@@ -10073,7 +10208,7 @@ def phone_qna_dismissal(text: Any) -> bool:
     for clause in re.split(r"[.;!,]|\b(?:but|and|although|though)\b",
                            normalized, flags=re.IGNORECASE):
         clause = clause.strip()
-        if clause and _QUESTION_OPEN_RE.match(clause):
+        if clause and _QNA_QUESTION_OPEN_RE.match(clause):
             return False
     return _QNA_DISMISSAL_RE.search(normalized) is not None
 
@@ -10118,6 +10253,8 @@ def phone_qna_incomplete(text: Any) -> bool:
 _QNA_HONORIFIC_RE = re.compile(
     r"\b(?:ma'?a?m|maam|mam|madam|sir|ji|mister)\b", re.IGNORECASE,
 )
+#: "for now", "as of now", "right now", "at the moment" after a decline core.
+_QNA_FOR_NOW = r"(?:\s+(?:for\s+now|as\s+of\s+now|right\s+now|at\s+the\s+moment))"
 _QNA_DECLINE_RE = re.compile(
     # Up to three leading tokens: "No", "No no", "Okay", "Nahi", "Yes" ("yes,
     # thank you" is a polite close); never enough on their own (see the
@@ -10126,24 +10263,36 @@ _QNA_DECLINE_RE = re.compile(
     r"actually|right|sure|no\s+no)[\s,.!-]*){0,3}"
     # An optional core: nothing (else) | no (more) questions | all good |
     # it's clear | that's all | bas, in English and romanised Hindi.
+    # Review fix: also the commonest Indian-English declines the first cut
+    # missed: "I don't have any (more) questions", "I have no questions",
+    # "not really", "not as such", "nothing / no questions as of now",
+    # "I think that covers it".
     r"(?:(?:nothing|kuch\s+nahi|kuch\s+nahin|kuch\s+bhi\s+nahi|koi\s+nahi)"
-    r"(?:\s+(?:else|more|much|as\s+such))?(?:\s+for\s+now)?"
+    r"(?:\s+(?:else|more|much|as\s+such))?" + _QNA_FOR_NOW + r"?"
     r"|no\s+(?:more\s+|other\s+|further\s+)?(?:questions?|quer(?:y|ies)|doubts?)"
-    r"(?:\s+as\s+such)?"
+    r"(?:\s+as\s+such)?" + _QNA_FOR_NOW + r"?"
+    r"|(?:i\s+)?(?:don't|do\s+not|dont)\s+have\s+(?:any\s+)?(?:more\s+|other\s+|further\s+)?"
+    r"(?:questions?|quer(?:y|ies)|doubts?)(?:\s+as\s+such)?" + _QNA_FOR_NOW + r"?"
+    r"|i\s+have\s+no\s+(?:more\s+|other\s+|further\s+)?(?:questions?|quer(?:y|ies)|doubts?)"
+    r"(?:\s+as\s+such)?" + _QNA_FOR_NOW + r"?"
+    r"|not\s+(?:really|as\s+such)" + _QNA_FOR_NOW + r"?"
+    r"|(?:i\s+think\s+)?that\s+covers\s+(?:it|everything)"
     r"|(?:it(?:'s|\s+is)|its|everything(?:'s|\s+is)?|i(?:'m|\s+am)|we(?:'re|\s+are))"
     r"\s+(?:all\s+)?(?:good|fine|clear|ok(?:ay)?|done|set)"
     r"|all\s+(?:good|clear|fine|set)|that(?:'s|\s+is)\s+(?:all|it|fine)|bas"
     r")?[\s,.!-]*"
     # An optional thanks ending.
     r"(?:(?:thank\s*you|thanks|thank\s+u)(?:\s+(?:so|very)\s+much|\s+a\s+lot|"
-    r"\s+again)?[\s,.!-]*)?$",
+    r"\s+again)?[\s,.!-]*)?"
+    # An optional goodbye ("No, thank you. Bye.", "Okay bye").
+    r"(?:(?:ok(?:ay)?[\s,.!-]+)?(?:bye(?:[\s,.!-]+bye)?|good\s*bye)[\s,.!-]*)?$",
     re.IGNORECASE,
 )
-#: A decline needs at least one negative, closure or thank-you word: a bare
-#: "Yes" / "Okay" means "I have a question", never "I am done".
+#: A decline needs at least one negative, closure, thank-you or goodbye word:
+#: a bare "Yes" / "Okay" means "I have a question", never "I am done".
 _QNA_DECLINE_WORD_RE = re.compile(
     r"\b(?:no|nope|nah|nahi|nahin|nai|na|nothing|good|fine|clear|done|set|all|"
-    r"it|bas|thank|thanks)\b",
+    r"it|bas|thank|thanks|not|don't|dont|covers|bye|goodbye)\b",
     re.IGNORECASE,
 )
 _QNA_ASKS_RE = re.compile(
@@ -10153,7 +10302,7 @@ _QNA_ASKS_RE = re.compile(
 )
 #: Longest reply the decline grammar may close on (after honorifics are
 #: stripped). A long reply is never a bare "no more questions".
-_QNA_DECLINE_MAX_TOKENS = 10
+_QNA_DECLINE_MAX_TOKENS = 14
 
 
 def phone_qna_decline(text: Any) -> bool:
@@ -10178,7 +10327,7 @@ def phone_qna_decline(text: Any) -> bool:
     for clause in re.split(r"[.;!,]|\b(?:but|and|although|though)\b",
                            clean, flags=re.IGNORECASE):
         clause = clause.strip()
-        if clause and _QUESTION_OPEN_RE.match(clause):
+        if clause and _QNA_QUESTION_OPEN_RE.match(clause):
             return False
     stripped = " ".join(_QNA_HONORIFIC_RE.sub(" ", clean).split())
     stripped = re.sub(r"\s+([,.!])", r"\1", stripped).strip(" ,.!-")
@@ -14673,16 +14822,65 @@ _QUESTION_OPEN_RE = re.compile(
     # for a substantive answer (call 24, turn 23: "And what do you think about
     # my workflow? ..." fell through this gate because it did not start with an
     # interrogative). Up to two leading conjunctions/fillers are skipped.
-    # M013 S01 T09 (session 62aec5d9): also a leading "Yes/No ma'am|sir", a
-    # bare "Ma'am"/"Sir" and "Wait," — "Yes ma'am, what is the role…?" and
-    # "No ma'am, what is the stipend?" are questions. "Yes"/"No" are skipped
-    # only together with the honorific, so "Yes, I can join" stays an answer.
-    r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now|um+|uh+|yeah|right|wait|"
-    r"(?:(?:yes|no)[\s,.!-]*)?(?:ma['’]?a?m|maam|mam|madam|sir))[\s,.!?-]+){0,4}"
+    #
+    # SHARED by the mid-interview readers (`phone_turn_dimensions`,
+    # `candidate_turn_route`, `phone_candidate_question_directed`), so it is
+    # left exactly as before M013: skipping "Yes sir," here made ordinary
+    # answers ("Yes sir, will do", "Yes ma'am, can relocate") read as
+    # candidate questions (review fix). The end-of-screening Q&A uses its own
+    # `_QNA_QUESTION_OPEN_RE` below.
+    r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now|um+|uh+|yeah|right)[\s,.!?-]+){0,4}"
     r"(?:can|could|would|will|what|which|who|where|when|why|how|"
     r"is|are|do|does|did)\b",
     re.IGNORECASE,
 )
+#: M013 S01 T09 (session 62aec5d9), Q&A ONLY: `_QUESTION_OPEN_RE` that also
+#: skips a leading "Yes/No ma'am|sir", a bare "Ma'am"/"Sir" and "Wait," —
+#: "Yes ma'am, what is the role" and "No ma'am, what is the stipend" are
+#: questions once the bot has asked "any questions?". "Yes"/"No" are skipped
+#: only together with the honorific, so "Yes, I can join" stays an answer.
+_QNA_QUESTION_OPEN_RE = re.compile(
+    r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now|um+|uh+|yeah|right|wait|"
+    r"(?:(?:yes|no)[\s,.!-]*)?(?:ma['’]?a?m|maam|mam|madam|sir))[\s,.!?-]+){0,4}"
+    r"(?P<q>can|could|would|will|what|which|who|where|when|why|how|"
+    r"is|are|do|does|did)\b",
+    re.IGNORECASE,
+)
+#: Q&A ONLY: a request for information with no question word ("tell me about
+#: the work timings", "I wanted to know the stipend", "can I ask about leave").
+_QNA_REQUEST_RE = re.compile(
+    r"\b(?:tell\s+me\s+(?:about|more|what|how|if|whether)"
+    r"|i\s+(?:want|wanted|would\s+like|'d\s+like|wish)\s+to\s+(?:know|ask|understand|check)"
+    r"|(?:can|could|may)\s+i\s+(?:ask|know)"
+    r"|(?:want|wanted)\s+to\s+ask"
+    r"|ask\s+(?:you\s+)?about"
+    r"|what\s+about)\b",
+    re.IGNORECASE,
+)
+
+
+def phone_qna_question_directed(text: Any) -> bool:
+    """Q&A ONLY (M013 S01 review fix): a question or request for the interviewer.
+
+    After the bot asked "any questions?", a reply that OPENS with a question
+    word is a question for it ("what is the stipend", "how many rounds are
+    there"), past a leading "Yes ma'am," / "Sir," / "Wait," (the Q&A opener),
+    and so is a request with no question word ("tell me about the work
+    timings", "I wanted to know the stipend"), on top of
+    `phone_candidate_question_directed`. Only used to answer (never to
+    close); mid-interview readers keep the narrower predicate, where "What I
+    do is..." is an answer.
+    """
+    if phone_candidate_question_directed(text):
+        return True
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.replace("’", "'").replace("‘", "'").strip().split())
+    if not clean:
+        return False
+    if _QNA_REQUEST_RE.search(clean):
+        return True
+    return _QNA_QUESTION_OPEN_RE.match(clean) is not None
 _GENERAL_CLARIFICATION_RE = re.compile(
     r"\b(?:can|could|would)\s+you\s+(?:please\s+)?"
     r"(?:repeat|rephrase|explain|clarify|say\s+that\s+again)\b|"

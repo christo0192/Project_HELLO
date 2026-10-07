@@ -363,8 +363,8 @@ class TestReplay9f60523dDroppedYes(unittest.TestCase):
         self.assertEqual(
             turn.tag_for(_EPOCH_MS + self.consent.first_audio_ms),
             gate_judge.TAG_POST_QUESTION)
-        # Two VAD segments, one final.
-        self.assertEqual(turn.segment_speech_ms, 955 + 1032)
+        # Two VAD segments, one final: the longer one is the acoustic measure.
+        self.assertEqual(turn.segment_speech_ms, 1032)
         self.assertEqual(turn.closed_by, "commit")
 
     def test_exactly_one_candidate_row_holds_the_grant(self):

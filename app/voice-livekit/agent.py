@@ -449,7 +449,8 @@ SESSION_MAX_RESIDENCY_SEC = _bounded_float_env(
 # (and the API's lease sizing re-checked), not a quiet bump.
 #
 # Floor of 30s: below the consent backstop (`phone.phone_classify_timeout_sec`,
-# >= 52 s by default) a healthy consent read would be cut off — the floor is a
+# >= 50.4 s by default in legacy/shadow mode, 137.3 s in llm mode) a healthy
+# consent read would be cut off — the floor is a
 # config guard, not a recommendation. Ceiling of 600s: a gate that has run ten
 # minutes is wedged by definition.
 PHONE_GATE_MAX_SECONDS = _bounded_float_env(
@@ -1401,7 +1402,9 @@ async def _read_fresh_turn(
 
     M013 S01 T02: the reply it returns sets the call's ``spoke`` latch unless it
     is machine wording, so a person who answered the identity question can
-    never later be hung up on as a voicemail. A stale reply never sets it.
+    never later be hung up on as a voicemail. A stale reply sets only the
+    WEAK latch (`gate_judge.HumanSpeechLatch.note_skipped`), which machine
+    wording clears.
     """
     deadline = time.monotonic() + timeout_sec
     # NEVER WAIT LONGER THAN THE CALLER'S OLD BUDGET, however much the candidate
@@ -1444,6 +1447,9 @@ async def _read_fresh_turn(
         text, anchor_ms = _queued_turn(item)
         question_ms = question_anchor()
         if _queued_turn_is_stale(anchor_ms, question_ms):
+            if spoke is not None and isinstance(text, str):
+                # Review fix: the weak latch (machine wording clears it).
+                spoke.note_skipped(text, machine_match=_is_machine_text(text))
             _log_gate_turn_skip(
                 "pre_question_turn_skipped", item, anchor_ms, question_ms)
             continue
@@ -1729,7 +1735,17 @@ _INTENT_FOR_CLASSIFICATION: dict[str | None, str] = {
 #: pairing window plus a settle, with headroom; always also bounded by the
 #: gate budget. A wait that expires re-checks quiescence (an expired blip is
 #: quiet again); at most `GATE_JUDGE_MAX_REJUDGES` waits, then `unclear`.
-_GATE_QUIESCENCE_WAIT_MAX_SEC = 6.0
+_GATE_QUIESCENCE_WAIT_MAX_SEC = gate_judge.GATE_QUIESCENCE_WAIT_MAX_SEC
+#: How often that wait re-checks quiet (review fix: it waits for quiet, not
+#: for a new turn, so an expired blip costs at most this much).
+_GATE_QUIESCENCE_POLL_SEC = 0.1
+
+#: How long the legacy consent reader keeps listening after a "yes" that began
+#: before the recording sentence (review fix): long enough for the candidate's
+#: answer to the question they just heard, short enough that a candidate who
+#: thinks they already answered is re-asked promptly rather than left in
+#: silence for the whole answer window.
+_PRE_RECORDING_YES_LISTEN_SEC = 3.0
 
 #: How far after part A's end part B's first audio may still raise the
 #: recording anchor (synthesis of part B; S01-PLAN measures the live gap on
@@ -2574,7 +2590,15 @@ class _RevocationWindow:
         turn has read yet, or None. Consumes what it reads."""
         if not self.acting:
             return None
-        pending = [e for e in self._entries if e.consumed_by is None]
+        # Review fix: a back-channel heard during the role line ("okay",
+        # "hmm", "yes", "thank you") can never be a revocation, so Q1 never
+        # waits for its verdict (that wait was up to the judge timeout of
+        # dead air before the first question). Only substantive finals are
+        # waited for, bounded as before.
+        pending = [
+            e for e in self._entries
+            if e.consumed_by is None and not _preloop_backchannel(e.text)
+        ]
         if not pending:
             return None
         results = await self._await_entries(pending)
@@ -2585,6 +2609,16 @@ class _RevocationWindow:
                 entry.consumed_by = "preloop"
                 return decision, entry.text
         return None
+
+
+def _preloop_backchannel(text: Any) -> bool:
+    """A final that is only a back-channel or filler, never a revocation."""
+    try:
+        return bool(
+            phone.phone_qna_incomplete(text) or phone.phone_qna_acknowledgement(text)
+        ) and isinstance(text, str) and bool(text.strip())
+    except Exception:  # noqa: BLE001 — unknown: wait for its verdict
+        return False
 
 
 def _consume_task_exception(task: "asyncio.Task[Any]") -> None:
@@ -4579,7 +4613,10 @@ async def _judge_consent_reply(
     * Valid verdicts map through `_CONSENT_CLASSIFICATION_FOR_INTENT`; a
       judged voicemail after a person was heard is not machine (T02 rule b).
     """
-    state: dict[str, Any] = {"text": text, "items": [chosen]}
+    state: dict[str, Any] = {
+        "text": text, "items": [chosen],
+        "after_idx": max((u.idx for u in judge.window()), default=None),
+    }
     fallback: dict[str, Any] = {}
 
     def _legacy() -> str:
@@ -4595,6 +4632,14 @@ async def _judge_consent_reply(
         return _INTENT_FOR_CLASSIFICATION.get(verdict, gate_judge.INTENT_UNCLEAR)
 
     async def _wait_for_more(reason: str) -> Any:
+        """Wait for QUIET, not for a new turn (review fix).
+
+        Returns the fuller window when the turn the candidate was still
+        speaking closes, or None as soon as the line is quiet again (an echo
+        blip that never produced a final expires from the pairing window in
+        well under the bound): `gate_judge.judge_gate` then re-checks
+        quiescence and applies the grant with no added dead air.
+        """
         _log.info(
             "unknown_event", error_type="phone_gate_quiescence",
             error_category=str(reason)[:32],
@@ -4608,18 +4653,29 @@ async def _judge_consent_reply(
             if remaining <= 0:
                 return None
             try:
-                item = await asyncio.wait_for(turns.get(), timeout=remaining)
-            except asyncio.TimeoutError:
+                still = judge.pending_speech(state["after_idx"])
+            except Exception:  # noqa: BLE001 — unknown: keep waiting, bounded
+                still = "pending_check_failed"
+            if still is None:
                 return None
+            try:
+                item = await asyncio.wait_for(
+                    turns.get(), timeout=min(remaining, _GATE_QUIESCENCE_POLL_SEC))
+            except asyncio.TimeoutError:
+                continue
             more_text, more_anchor = _queued_turn(item)
             question_ms = question_anchor() if question_anchor is not None else None
             if question_anchor is not None and _queued_turn_is_stale(more_anchor, question_ms):
+                judge.latch.note_skipped(
+                    more_text, machine_match=_is_machine_text(more_text))
                 _log_gate_turn_skip("consent_turn_skipped", item, more_anchor, question_ms)
                 continue
             state["items"].append(item)
             if isinstance(more_text, str) and more_text.strip():
                 state["text"] = f"{state['text']} {more_text.strip()}".strip()
-            return judge.window()
+            window = judge.window()
+            state["after_idx"] = max((u.idx for u in window), default=state["after_idx"])
+            return window
 
     decision = await judge.decide(
         phase, bot_line, legacy=_legacy, wait_for_more=_wait_for_more,
@@ -4712,6 +4768,14 @@ async def _classify_phone_answer(
     nobody was heard at all, or whose first words were machine wording. The
     re-ask is worded by its reason (`phone.phone_consent_reask_text`).
 
+    Review fixes (M013 S01): words skipped as stale set the latch's WEAK
+    form (`gate_judge.HumanSpeechLatch.note_skipped`: the fall-through is a
+    deferral, but machine wording still decides and clears it). And the
+    informed-consent rule holds in EVERY mode: when the judge is not acting
+    (legacy, shadow, or no judge), a regex grant on speech that began before
+    the recording sentence is skipped (`legacy_grant_before_recording_anchor`),
+    the reader listens `_PRE_RECORDING_YES_LISTEN_SEC` more, then re-asks.
+
     M013 S01 T03: with a ``budget`` (`phone.GateBudget`), the re-ask is
     spoken only if its answer still fits before the gate's deadline;
     otherwise this returns ``CLASSIFY_DEFERRED_PRE_DISCLOSURE`` (the gate
@@ -4738,6 +4802,8 @@ async def _classify_phone_answer(
     if answer_timeout_sec is None:
         answer_timeout_sec = phone.phone_classify_answer_timeout_sec()
     latch = spoke if spoke is not None else gate_judge.HumanSpeechLatch()
+    recording_anchor_ms: "Callable[[], int | None]" = (
+        judge.recording_anchor_ms if judge is not None else (lambda: None))
     responsive = 0
     limit = max(1, attempts)
     question_extension_used = False
@@ -4773,13 +4839,17 @@ async def _classify_phone_answer(
             ):
                 _log_gate_turn_skip(
                     "consent_turn_skipped", item, anchor_ms, question_ms)
+                # Review fix: skipped words are still a person (the weak
+                # latch; machine wording clears it), so a candidate whose only
+                # words were skipped is deferred with a goodbye, never hung up
+                # on as "machine".
+                latch.note_skipped(
+                    candidate_text, machine_match=_is_machine_text(candidate_text))
                 continue
-            if (
-                not gate_judge.turn_is_grant_evidence(item)
-                and classify_answer_text(
-                    candidate_text, candidate_spoke=latch.spoke,
-                ) == phone.CLASSIFY_HUMAN
-            ):
+            legacy_grant = classify_answer_text(
+                candidate_text, candidate_spoke=latch.confirmed,
+            ) == phone.CLASSIFY_HUMAN
+            if legacy_grant and not gate_judge.turn_is_grant_evidence(item):
                 # Words with no speech timing cannot be shown to answer THIS
                 # question, so they never become consent. Kept waiting in the
                 # same window, exactly like a stale skip. They are still a
@@ -4792,6 +4862,29 @@ async def _classify_phone_answer(
                 _log_gate_turn_skip(
                     "consent_turn_not_grant_evidence", item, anchor_ms, question_ms)
                 continue
+            if (
+                legacy_grant
+                and not (judge is not None and judge.acting)
+                and not _turn_started_after(item, recording_anchor_ms())
+            ):
+                # REVIEW FIX (blocker): the regex acts in legacy and shadow
+                # mode (shadow is what production runs), so the informed-
+                # consent rule applies here too, not only in the llm-mode
+                # fallback: a "yes" that began before the recording sentence
+                # (spoken over part A, its commit dropped by the SDK and
+                # recovered by the settle close) is never consent. Listen
+                # briefly for the answer to the question just heard, then
+                # re-ask; the words still mean a person is on the line.
+                heard_ineligible = True
+                latch.note_reply(
+                    candidate_text, machine_match=False,
+                    source=gate_judge.SPOKE_SOURCE_CONSENT,
+                )
+                _log_gate_turn_skip(
+                    "legacy_grant_before_recording_anchor", item, anchor_ms, question_ms)
+                deadline = min(
+                    deadline, time.monotonic() + _PRE_RECORDING_YES_LISTEN_SEC)
+                continue
             text = candidate_text
             chosen = item
             break
@@ -4801,8 +4894,9 @@ async def _classify_phone_answer(
             responsive += 1
         # Classified against the latch as it stood BEFORE this reply: a reply
         # is judged machine or not on its own words, then (if it is not) it
-        # sets the latch for everything after it.
-        spoke_before = latch.spoke
+        # sets the latch for everything after it. Only a CONFIRMED latch
+        # silences machine wording; skipped words alone (the weak latch) do not.
+        spoke_before = latch.confirmed
         legacy_decision = classify_answer_text(text, candidate_spoke=spoke_before)
         decision = legacy_decision
         judged_valid = False
@@ -5749,8 +5843,12 @@ async def _run_native_phone_screening(
         else _QnaCloseWindow(first_name="")
     )
     qna_fillers = {"value": 0}
-    qna_kind_cache: dict[str, Any] = {"key": None, "kind": None}
+    qna_kind_cache: dict[str, Any] = {"key": None, "kind": None, "judged": False}
     qna_other = {"value": 0}
+    # Review fix: True while the bot's last Q&A line invited a question (the
+    # "any questions?" invite, or "Sure, go ahead."): silence then gets ONE
+    # "are you still there?" before it closes as completed.
+    qna_expects_question = {"value": True, "nudged": False}
     late_qna: dict[str, Any] = {
         "used": False, "closed": False, "judging": False, "sequence": None,
         "done": None, "finished_mono": None,
@@ -6312,6 +6410,26 @@ async def _run_native_phone_screening(
             # Consume the away latch so a still-set flag cannot re-trigger the
             # next pass's first wait without a fresh away transition.
             away_event.clear()
+            if (
+                _qna_silence_closes()
+                and qna_expects_question["value"]
+                and not qna_expects_question["nudged"]
+            ):
+                # Review fix: the candidate was just invited to ask (or told
+                # "go ahead" after saying they had a question): one nudge
+                # first, then the next silent window closes as completed.
+                qna_expects_question["nudged"] = True
+                _log.info(
+                    "unknown_event", error_type="phone_silence",
+                    error_category="qna_silence_nudge",
+                )
+                nudge = session.say(
+                    phone.PHONE_SILENCE_PROMPT_TEXT, allow_interruptions=True,
+                )
+                wait = getattr(nudge, "wait_for_playout", None)
+                if callable(wait):
+                    await wait()
+                continue
             if _qna_silence_closes():
                 # M013 S01 T09: every planned question is answered and the
                 # candidate has gone quiet in the "any questions?" phase
@@ -7251,7 +7369,8 @@ async def _run_native_phone_screening(
             # Read once per turn: a reopened pending close reuses the verdict.
             return str(qna_kind_cache["kind"])
         kind, _ = await qna_window.read_qna(text)
-        if kind == QNA_KIND_OTHER and phone.phone_candidate_question_directed(text):
+        judged = kind in (QNA_KIND_DECLINE, QNA_KIND_QUESTION, QNA_KIND_OTHER)
+        if kind == QNA_KIND_OTHER and phone.phone_qna_question_directed(text):
             # Only in the safe direction: a reply shaped as a question to the
             # interviewer ("…?", "what does the role pay") is answered even if
             # the judge heard none. Nothing here can close the call.
@@ -7269,12 +7388,16 @@ async def _run_native_phone_screening(
             ):
                 kind = QNA_KIND_DECLINE
             elif (route == "candidate_question"
-                    or phone.phone_candidate_question_directed(text)):
+                    or phone.phone_qna_question_directed(text)):
                 kind = QNA_KIND_QUESTION
             else:
                 kind = QNA_KIND_OTHER
-        qna_kind_cache.update(key=key, kind=kind)
+        qna_kind_cache.update(key=key, kind=kind, judged=judged)
         return kind
+
+    def _qna_kind_judged() -> bool:
+        """Was the last `_qna_kind` a judge verdict (not the fallback grammar)?"""
+        return bool(qna_kind_cache.get("judged"))
 
     def _qna_close(turn_ctx: Any, close_instruction: str) -> None:
         """Author the closing goodbye and arm the `completed` terminal."""
@@ -7712,7 +7835,7 @@ async def _run_native_phone_screening(
             return
         if closing.state is ClosingState.CLOSING_PENDING and (
             route == "candidate_question"
-            or phone.phone_candidate_question_directed(text)
+            or phone.phone_qna_question_directed(text)
             or await _qna_kind(text, route) == QNA_KIND_QUESTION
         ):
             # A genuine late question outranks an authored-but-unplayed close.
@@ -7776,6 +7899,7 @@ async def _run_native_phone_screening(
                     _qna_close(turn_ctx, _QNA_DONE_CLOSE_INSTRUCTION)
                     return
                 _qna_note("go_ahead")
+                qna_expects_question.update(value=True, nudged=False)
                 _speak_withdrawal_line(
                     turn_ctx, phone.PHONE_QNA_GO_AHEAD_TEXT, phase="candidate_qna",
                 )
@@ -7810,6 +7934,19 @@ async def _run_native_phone_screening(
             # never sent down the "answer their question" path: the first gets
             # a short acknowledgement, the second closes (answering it first).
             qna_kind = QNA_KIND_DECLINE if qna_ack else await _qna_kind(text, route)
+            # A decline, a remark or a question was heard: silence after the
+            # reply to it closes as completed (no nudge).
+            qna_expects_question["value"] = False
+            if qna_kind == QNA_KIND_OTHER and not _qna_kind_judged():
+                # REVIEW FIX: the fallback grammar (legacy and shadow mode,
+                # or a judge that was unavailable) cannot tell an unpunctuated
+                # question ("tell me about the work timings", "what is the
+                # stipend") from a remark, so it never decides "not a
+                # question": every non-decline turn gets the grounded answer,
+                # exactly as before T09, and it never closes the call. Only a
+                # judge verdict may route a turn to the acknowledge/close path.
+                _qna_note("fallback_other_answered")
+                qna_kind = QNA_KIND_QUESTION
             if qna_kind == QNA_KIND_DECLINE:
                 close_instruction = _QNA_DONE_CLOSE_INSTRUCTION
             elif qna_kind == QNA_KIND_OTHER and qna_other["value"] < 1:
@@ -13884,7 +14021,7 @@ async def _run_phone_session(
             # Deterministic opener (default): withhold the LLM role opener so
             # `_deliver_role_opening` speaks the FIXED `phone_role_opening_text`
             # ("Before we dive in, just to confirm — this is about the {role} role at
-            # Interview Kickstart. Really glad you could hop on — let's dive in!").
+            # Interview Kickstart.").
             # `speak_opening` itself self-gates on the same flag (returns None →
             # fixed disclosure). Both openers are then scripted, never model-authored,
             # so neither can be spoken-then-contradicted. PHONE_DETERMINISTIC_OPENER=false

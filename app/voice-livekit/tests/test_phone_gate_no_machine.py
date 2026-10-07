@@ -283,10 +283,47 @@ class TestHumanSpeechLatch(unittest.TestCase):
                 _reply, latch = self._identity_read([text])
                 self.assertFalse(latch.spoke)
 
-    def test_a_stale_reply_does_not_set_it(self):
+    def test_a_stale_reply_sets_only_the_weak_latch(self):
+        # Review fix: skipped words are still a person, so the fall-through
+        # can no longer be "machine"; but machine wording still decides.
         reply, latch = self._identity_read([("Hello?", 1_000)], question_ms=2_000)
         self.assertEqual(reply, "")
+        self.assertTrue(latch.spoke)
+        self.assertFalse(latch.confirmed)
+        self.assertEqual(latch.source, gate_judge.SPOKE_SOURCE_SKIPPED)
+
+    def test_a_stale_voicemail_greeting_does_not_latch(self):
+        reply, latch = self._identity_read(
+            [("Please leave a message after the tone.", 1_000)], question_ms=2_000)
+        self.assertEqual(reply, "")
         self.assertFalse(latch.spoke)
+
+    def test_machine_wording_clears_a_weak_latch_but_never_a_confirmed_one(self):
+        weak = gate_judge.HumanSpeechLatch()
+        weak.note_skipped("Hi, this is Raj.", machine_match=False)
+        self.assertTrue(weak.spoke)
+        weak.note_skipped("Please leave a message.", machine_match=True)
+        self.assertFalse(weak.spoke, "a greeting's first fragment is not a person")
+        judged = gate_judge.HumanSpeechLatch()
+        judged.note_skipped("Hi.", machine_match=False)
+        judged.note_judge_intent(gate_judge.INTENT_VOICEMAIL)
+        self.assertFalse(judged.spoke)
+        confirmed = gate_judge.HumanSpeechLatch()
+        confirmed.note_reply("Yes, speaking.", machine_match=False,
+                             source=gate_judge.SPOKE_SOURCE_IDENTITY)
+        confirmed.note_reply("leave a message", machine_match=True,
+                             source=gate_judge.SPOKE_SOURCE_CONSENT)
+        confirmed.note_judge_intent(gate_judge.INTENT_VOICEMAIL)
+        self.assertTrue(confirmed.spoke)
+        self.assertTrue(confirmed.confirmed)
+
+    def test_a_weak_latch_does_not_stop_machine_wording_deciding(self):
+        latch = gate_judge.HumanSpeechLatch()
+        latch.note_skipped("Hello?", machine_match=False)
+        decision, _, _ = self._consent(
+            ["The person you are calling is not available, please leave a message."],
+            latch=latch)
+        self.assertEqual(decision, phone.CLASSIFY_MACHINE)
 
     def _consent(self, items, *, latch=None, timeout=0.05):
         async def _t():

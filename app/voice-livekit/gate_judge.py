@@ -120,6 +120,22 @@ TAG_NO_SEGMENT = "no_segment"
 #: final, so it can never lend its start to a later, unrelated final.
 GATE_STT_PAIRING_WINDOW_MS = 3000
 
+#: An unconsumed segment older than the pairing window still belongs to a
+#: final when it ends at most this long before the speech that final pairs
+#: with (one utterance with a pause in it). Chaining only moves a start earlier.
+_GATE_CHAIN_GAP_MS = 1200
+
+#: How long an OPEN VAD segment may hold a judge grant back (quiescence).
+#: Real speech produces a final; a segment open longer than this with none is
+#: line noise or a stuck VAD, and must not cost a consenting candidate the
+#: grant (a re-ask) or seconds of dead air.
+GATE_OPEN_SEGMENT_BLOCK_MAX_MS = 5000
+
+#: A closed segment shorter than this does not hold a grant back while it
+#: waits for a final (quiescence): below the shortest spoken word on a phone
+#: line, so an echo blip or click costs no dead air.
+GATE_QUIESCENCE_MIN_SPEECH_MS = 200
+
 #: Added to the endpointing ceiling before a group of finals the SDK never
 #: committed is closed by silence. The SDK commits a normal turn at or before
 #: the ceiling, so the margin keeps the commit (the authoritative close) ahead
@@ -376,6 +392,8 @@ SPOKE_SOURCE_IDENTITY = "identity"
 SPOKE_SOURCE_CONSENT = "consent"
 SPOKE_SOURCE_CALLBACK = "callback"
 SPOKE_SOURCE_JUDGE = "judge"
+#: The weak latch: words a reader skipped (stale, or not grant evidence).
+SPOKE_SOURCE_SKIPPED = "skipped"
 
 
 class HumanSpeechLatch:
@@ -390,42 +408,83 @@ class HumanSpeechLatch:
     Once set, the call can no longer end as "machine": every exit that would
     have been a machine verdict becomes the spoken deferral instead. It never
     unsets, and it carries no text.
+
+    THE WEAK LATCH (review fix). Words a reader SKIPPED (a final older than the
+    question now asking, or one that may not ground a grant) are still a
+    person speaking: the 9f60523d shape (an identity reply STT never finalised,
+    then a "Yes." over the consent line) used to end as a silent "machine"
+    hang-up. Such words set a WEAK latch (``note_skipped``): it turns the
+    fall-through exit (nothing usable after the re-ask) into the deferral, but
+    machine wording still decides (``confirmed`` is what the classifiers
+    read), and any later machine wording or judged voicemail clears it. So a
+    voicemail greeting whose first fragment happened to be skipped is still a
+    voicemail.
     """
 
-    __slots__ = ("_source",)
+    __slots__ = ("_source", "_weak_source")
 
     def __init__(self) -> None:
         self._source: Optional[str] = None
+        self._weak_source: Optional[str] = None
 
     @property
     def spoke(self) -> bool:
+        """A person was heard (confirmed or weak): never fall through to machine."""
+        return self._source is not None or self._weak_source is not None
+
+    @property
+    def confirmed(self) -> bool:
+        """A reply a reader ACCEPTED was a person: machine wording no longer decides."""
         return self._source is not None
 
     @property
     def source(self) -> Optional[str]:
-        return self._source
+        return self._source if self._source is not None else self._weak_source
 
     def mark(self, source: str) -> bool:
         """Latch it. True only for the call that set it (the first one)."""
         if self._source is not None:
             return False
         self._source = str(source or "unknown")
+        self._weak_source = None
         return True
+
+    def _machine_heard(self) -> None:
+        # Machine wording (or a judged voicemail) after only SKIPPED words:
+        # those words were most likely the greeting's first fragment.
+        if self._source is None:
+            self._weak_source = None
 
     def note_reply(self, text: Any, *, machine_match: bool, source: str) -> bool:
         """Latch on a non-empty, non-machine reply. Returns ``spoke`` after."""
-        if isinstance(text, str) and text.strip() and not machine_match:
-            self.mark(source)
+        if isinstance(text, str) and text.strip():
+            if machine_match:
+                self._machine_heard()
+            else:
+                self.mark(source)
+        return self.spoke
+
+    def note_skipped(self, text: Any, *, machine_match: bool) -> bool:
+        """Words a reader skipped: the weak latch (cleared by machine wording)."""
+        if isinstance(text, str) and text.strip():
+            if machine_match:
+                self._machine_heard()
+            elif self._source is None and self._weak_source is None:
+                self._weak_source = SPOKE_SOURCE_SKIPPED
         return self.spoke
 
     def note_judge_intent(self, intent: Any) -> bool:
         """Latch on a VALID judge verdict that is not ``voicemail_machine``.
 
         A judge outage (no verdict) never latches here: the legacy reader that
-        decides instead latches through ``note_reply``. Returns ``spoke`` after.
+        decides instead latches through ``note_reply``. A judged voicemail
+        clears a weak latch. Returns ``spoke`` after.
         """
-        if isinstance(intent, str) and intent in INTENTS and intent != INTENT_VOICEMAIL:
-            self.mark(SPOKE_SOURCE_JUDGE)
+        if isinstance(intent, str) and intent in INTENTS:
+            if intent == INTENT_VOICEMAIL:
+                self._machine_heard()
+            else:
+                self.mark(SPOKE_SOURCE_JUDGE)
         return self.spoke
 
 
@@ -591,25 +650,47 @@ class GateTurnCapture:
         ``first_end`` is the end of the segment the speech started in.
         """
         candidates: list[_Segment] = []
+        expired: list[_Segment] = []
         for segment in self._segments:
             if segment.consumed or segment.end_ms is None:
                 continue
             if segment.end_ms > arrival_ms:
                 continue
             if arrival_ms - segment.end_ms > self._window_ms:
+                expired.append(segment)
+                continue
+            candidates.append(segment)
+        chained = 0
+        if candidates and expired:
+            # REVIEW FIX: an older segment that runs straight into the speech
+            # this final pairs with is the SAME utterance (a long reply whose
+            # final arrived late), not a blip. Expiring it would move the
+            # reported start LATER, the unsafe direction for the staleness
+            # and recording-anchor checks; chaining it can only move it
+            # earlier.
+            earliest = min(s.start_ms for s in candidates)
+            for segment in sorted(expired, key=lambda s: s.end_ms or 0, reverse=True):
+                if segment.end_ms is not None and 0 <= earliest - segment.end_ms <= _GATE_CHAIN_GAP_MS:
+                    candidates.append(segment)
+                    earliest = min(earliest, segment.start_ms)
+                    chained += 1
+        for segment in expired:
+            if segment not in candidates:
                 # Expired: a blip whose final never came. Consumed so it can
                 # never lend its start to a later final.
                 segment.consumed = True
-                continue
-            candidates.append(segment)
         if candidates:
             for segment in candidates:
                 segment.consumed = True
             first = min(candidates, key=lambda s: s.start_ms)
             end = max(s.end_ms for s in candidates if s.end_ms is not None)
-            speech = sum(int(s.speech_ms or 0) for s in candidates)
+            # REVIEW FIX: the acoustic guard reads the LONGEST paired segment,
+            # never the sum: a click plus a nearby blip must not add up to the
+            # minimum speech a grant needs.
+            speech = max(int(s.speech_ms or 0) for s in candidates)
             self._last_consumed = (first.start_ms, first.end_ms, end, speech)
-            return first.start_ms, first.end_ms, end, speech, "paired", len(candidates)
+            return (first.start_ms, first.end_ms, end, speech,
+                    "paired_chained" if chained else "paired", len(candidates))
         opened = self._open_segment
         if opened is not None and opened.start_ms <= arrival_ms:
             # STT finalised mid-segment: the speech is still going on. Share
@@ -789,9 +870,14 @@ class GateTurnCapture:
         candidate may still be saying something the judge has not seen.
 
         * ``later_final``: a final newer than ``after_idx`` exists;
-        * ``open_segment``: a VAD segment is open (they are still talking);
-        * ``awaiting_final``: a closed segment is still waiting for its STT
-          final (inside the pairing window).
+        * ``open_segment``: a VAD segment is open (they are still talking),
+          for at most ``GATE_OPEN_SEGMENT_BLOCK_MAX_MS`` (line noise never
+          blocks a grant for ever);
+        * ``awaiting_final``: a closed segment of at least
+          ``GATE_QUIESCENCE_MIN_SPEECH_MS`` is still waiting for its STT final
+          (inside the pairing window). A shorter one (an echo blip, a click)
+          is too short to be words that change the answer, and waiting the
+          whole pairing window for it was seconds of dead air (review fix).
 
         ``None`` means quiet. ``after_idx`` None means "the judge saw nothing",
         so any final at all is a later one.
@@ -801,11 +887,14 @@ class GateTurnCapture:
                 return "later_final"
         if not self.active:
             return None
-        if self._open_segment is not None:
-            return "open_segment"
         now = self._now_ms()
+        opened = self._open_segment
+        if opened is not None and now - opened.start_ms <= GATE_OPEN_SEGMENT_BLOCK_MAX_MS:
+            return "open_segment"
         for segment in self._segments:
             if segment.consumed or segment.end_ms is None:
+                continue
+            if segment.speech_ms is not None and segment.speech_ms < GATE_QUIESCENCE_MIN_SPEECH_MS:
                 continue
             if 0 <= now - segment.end_ms <= self._window_ms:
                 return "awaiting_final"
@@ -925,6 +1014,9 @@ GATE_JUDGE_MAX_TOKENS = 300
 #: A grant seen while the candidate may still be talking waits and re-judges
 #: at most this many times, then becomes ``unclear``.
 GATE_JUDGE_MAX_REJUDGES = 2
+#: The longest one quiescence wait may hold a judge grant (the consent
+#: reader's `_wait_for_more`; also sizes phone's consent backstop).
+GATE_QUIESCENCE_WAIT_MAX_SEC = 6.0
 
 _PROMPT_MAX_UTTERANCES = 8
 _PROMPT_UTTERANCE_MAX_CHARS = 400
@@ -1095,9 +1187,9 @@ class JudgeCallback:
     """Callback spans from a busy verdict. ``day_text``/``time_text`` must be
     verbatim spans of the candidate's words: `phone._judge_callback_spans`
     (T06) checks each against what the candidate said and otherwise ignores
-    the whole callback; ``resolved_ist`` is only cross-checked when the
-    deterministic parser resolves the spans, and a judge-only resolution is
-    confirmed by a question before it is proposed."""
+    the whole callback; the deterministic parse of the whole reply comes
+    first, and any reading that rests on the spans (or on ``resolved_ist``
+    alone) is confirmed by a question before it is proposed."""
 
     day_text: str
     time_text: str
@@ -1464,6 +1556,42 @@ def grant_guard_failure(
     return None
 
 
+#: Verdicts that end the call or suppress the candidate (permanently, for an
+#: opt-out or a wrong number). Each must cite the candidate's own words.
+SUPPRESSIVE_INTENTS = frozenset({
+    INTENT_OPT_OUT, INTENT_WRONG_PERSON, INTENT_CONSENT_DECLINED,
+})
+
+
+def suppressive_guard_failure(
+    verdict: "JudgeVerdict", utterances: Iterable[GateUtterance],
+) -> Optional[str]:
+    """Why a suppressive verdict may NOT act (``None`` = it may, or it is not one).
+
+    Review fix: a hallucinated ``opt_out`` on noise, or one parroted from
+    injected text, must never suppress a candidate. The evidence must be
+    non-empty, must not name an output label, and must be found in an
+    utterance spoken after the question (``post_question``).
+    """
+    if verdict.intent not in SUPPRESSIVE_INTENTS:
+        return None
+    if not normalize_gate_text(verdict.evidence):
+        return "no_evidence"
+    if evidence_names_a_label(verdict.evidence):
+        return "evidence_is_label"
+    shown = tuple(utterances)
+    matches = evidence_utterances(verdict.evidence, shown)
+    if not matches:
+        return "evidence_not_found"
+    if all(u.tag is None for u in shown):
+        # No anchor to tag against at all: the reader's own staleness rule
+        # already chose the reply; nothing finer can be checked here.
+        return None
+    if not any(u.tag == TAG_POST_QUESTION for u in matches):
+        return "evidence_not_post_question"
+    return None
+
+
 def check_grant(
     verdict: JudgeVerdict,
     utterances: Iterable[GateUtterance],
@@ -1734,6 +1862,18 @@ async def judge_gate(
                 verdict = raw
             if verdict.intent != INTENT_CONSENT_GRANTED:
                 found = evidence_utterances(verdict.evidence, shown)
+                suppressive = suppressive_guard_failure(verdict, shown)
+                if suppressive is not None:
+                    # A verdict that ends the call or suppresses the candidate
+                    # must rest on their own words after the question, like a
+                    # grant (and like the post-consent window, T07).
+                    decision = GateDecision(
+                        intent=INTENT_UNCLEAR, source=SOURCE_LLM,
+                        guard_rejected_reason=suppressive,
+                        confidence=verdict.confidence, rejudges=rejudges,
+                        latency_ms=_elapsed_ms(started, clock),
+                    )
+                    break
                 decision = GateDecision(
                     intent=verdict.intent, source=SOURCE_LLM,
                     evidence_idx=found[0].idx if found else None,

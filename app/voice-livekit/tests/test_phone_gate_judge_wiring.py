@@ -1344,11 +1344,15 @@ class TestRevocationWindow(_OrchestratorCase):
         self.assertTrue(phone.is_gate_copy(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT))
 
     def test_the_confirm_reply_classifier(self):
-        callback = ("Yes.", "Yes, please.", "Okay.", "Sure, call me tomorrow.",
-                    "Yeah that would be better.", "Please call me later.")
+        callback = ("Yes.", "Yes, please.", "Sure, call me tomorrow.",
+                    "Yeah that would be better.", "Please call me later.", "Sure.")
+        # Review fix: "Okay" / "Okay, tell me" / "Ji" mean "go on" here; a
+        # wrong callback ends a just-consented screening, so they carry on.
         carry_on = ("No.", "No, it's fine, let's continue.", "No thanks, go on.",
                     "Go ahead with the questions.", "I'm free now.",
-                    "I have five years of experience in sales.", "", "Hmm.")
+                    "I have five years of experience in sales.", "", "Hmm.",
+                    "Okay.", "Ok", "Okay sir", "Okay, tell me", "Ji", "Okay go on",
+                    "Alright.")
         for text in callback:
             with self.subTest(text=text):
                 self.assertEqual(phone.classify_revocation_busy_confirm_reply(text),
