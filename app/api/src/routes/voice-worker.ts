@@ -42,6 +42,20 @@ const log = createLogger('voice-worker');
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 /** Fly app slugs are [a-z0-9-]; machine ids are hex. Bounded and structural. */
 const FLY_ID_RE = /^[A-Za-z0-9_.-]{1,256}$/;
+/**
+ * The browser worker's Fly app (BROWSER_FLY_APP). Duplicated as a literal so
+ * this thin route does not import the orchestration runtime; the browser host
+ * report below is accepted for THIS app only.
+ */
+const BROWSER_APP = 'project-hello-voice';
+// DNS hostnames only: no scheme, port, path, whitespace, or credentials.
+// IPv4 literals are valid hostname labels and intentionally accepted.
+// Mirrors the worker's _BROWSER_DNS_HOST_RE and migration 0118's CHECK (which also
+// requires lowercase: the schema below lowercases an accepted value).
+const DNS_LABEL = '[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?';
+export const LIVEKIT_HOST_RE = new RegExp(
+  String.raw`^(?=.{1,253}$)(?:${DNS_LABEL})(?:\.(?:${DNS_LABEL}))*$`,
+);
 
 const readySchema = z
   .object({
@@ -76,6 +90,11 @@ const readyMachineSchema = z
     app: z.string().regex(FLY_ID_RE),
     machine_id: z.string().regex(FLY_ID_RE),
     agent_name: z.string().regex(AGENT_NAME_RE).optional(),
+    livekit_host: z
+      .string()
+      .regex(LIVEKIT_HOST_RE)
+      .transform((value) => value.toLowerCase())
+      .optional(),
   })
   .strict();
 
@@ -188,6 +207,60 @@ export function createVoiceWorkerRouter(deps: VoiceWorkerRouterDeps = {}): Route
       const parsed = readyMachineSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ ok: false, error: 'invalid_request' });
+      }
+      // ── R1: record the reported LiveKit host BEFORE marking ready ──────
+      // Same ordering safety as the agent name below: the R1 gate admits a
+      // worker only when the lease carries its endpoint host, and it reads
+      // `ready` and the host from the same row. If `ready` could land before
+      // the host, the gate would read a ready lease with no (or an OLD) host.
+      //
+      // Scope, all deliberate:
+      //   - BROWSER app only. A phone body that carries `livekit_host` is
+      //     accepted and IGNORED (200, only mark_ready runs): a 400 would defer
+      //     phone dials, and the lease column / RPC are browser-only anyway.
+      //   - PRESENT only. A body without the key (every Cloud browser worker and
+      //     every phone worker — the worker sends it only when it is opted into
+      //     R1) makes NO host RPC: the live Cloud lane's calls here are exactly
+      //     what they were before 0118, and an API deploy never needs 0118 for
+      //     Cloud readiness. A stale host from an earlier boot cannot leak into
+      //     a host-less report either: claim/reset null it in the database.
+      //   - FAIL-CLOSED, like the name. Anything but `ok` is NOT marked ready:
+      //     `stale` (no starting/ready browser lease) answers 200 {ok:false,
+      //     status:'stale'} exactly like a stale ready, and every other outcome
+      //     (driver error, throw, invalid_request, unrecognised) is a 500. The
+      //     worker treats the ping as fail-open and re-posts on reconnect, and
+      //     the R1 gate's ready budget then times out and DEFERS rather than
+      //     admitting a worker whose endpoint it cannot prove. The worker's
+      //     post is bounded-retried ONCE after a short backoff (a transient 5xx
+      //     or this 500 is thereby recoverable inside the budget) and re-posts
+      //     on every websocket reconnect; there is no further retry. Logs carry
+      //     the event kind only — never the host, the machine id or driver
+      //     detail.
+      if (parsed.data.app === BROWSER_APP && parsed.data.livekit_host !== undefined) {
+        let hostStatus: unknown;
+        try {
+          const hosted = await rpc('set_voice_worker_livekit_host', {
+            p_app: parsed.data.app,
+            p_machine_id: parsed.data.machine_id,
+            p_livekit_host: parsed.data.livekit_host,
+            p_now: now().toISOString(),
+          });
+          hostStatus = (!hosted.error && hosted.data && typeof hosted.data === 'object'
+            && !Array.isArray(hosted.data)
+            ? (hosted.data as Record<string, unknown>).status
+            : undefined);
+        } catch {
+          log.info('unknown_event', { error_category: 'browser_ready_host_record_error' });
+          return res.status(500).json({ ok: false, error: 'voice_worker_ready_error' });
+        }
+        if (hostStatus === 'stale') {
+          log.info('unknown_event', { error_category: 'voice_worker_ready_machine_stale' });
+          return res.json({ ok: false, status: 'stale' });
+        }
+        if (hostStatus !== 'ok') {
+          log.info('unknown_event', { error_category: 'browser_ready_host_record_rejected' });
+          return res.status(500).json({ ok: false, error: 'voice_worker_ready_error' });
+        }
       }
       // ── M009 E2: record the reported per-machine name BEFORE marking ready.
       // ORDER IS THE SAFETY PROPERTY. The dial gate dispatches the moment it

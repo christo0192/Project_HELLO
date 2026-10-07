@@ -37,6 +37,10 @@
  *      stale pre-winner snapshot to any ownership-probe read, so the old
  *      read-then-delete `reapUnownedRoom` would delete the winner's room here
  *      and fail the test.
+ *  12. R1 target (plan v2 §8.2/§9 fence 7): with a working orchestration gate the
+ *      room is created on the R1 endpoint (no Egress) and the worker is
+ *      dispatched into it; with no gate the exchange fails closed (503) before
+ *      any room, grant, token or invite consume.
  *
  * Offline, deterministic, synthetic fixtures only.
  */
@@ -44,7 +48,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../app.js';
+import { browserOrchestrationGate } from '../lib/browser-orchestration.js';
 import { MemoryRateLimitStore, setRateLimitStore } from '../lib/rate-limit.js';
+import { __setBrowserGateResolverForTest } from '../routes/invites.js';
 import { setAuditSink } from '../lib/audit.js';
 
 // ── Provider (LiveKit) mocks ─────────────────────────────────────────
@@ -209,6 +215,9 @@ function invites(consumed: boolean) {
 beforeEach(() => {
   vi.clearAllMocks();
   callLog.length = 0;
+  // Restore the real (env-gated) browser orchestration gate: null here, since
+  // WORKER_ORCHESTRATION is off in the test env. Individual R1 tests inject one.
+  __setBrowserGateResolverForTest(() => browserOrchestrationGate());
   setRateLimitStore(new MemoryRateLimitStore(10_000));
   setAuditSink(() => {});
   mockRpc.mockResolvedValue({ data: null, error: { message: 'unknown rpc' } });
@@ -324,12 +333,39 @@ describe('JIT provisioning on a created (Ashby-materialized) session', () => {
     expect(grant.roomCreate).toBeUndefined();
   });
 
-  it('creates the browser room on the selected R1 endpoint', async () => {
+  // R1 (plan v2 §8.2/§9 fence 7): a candidate token on target r1 REQUIRES the
+  // browser orchestration gate, because the gate is what proves a ready worker
+  // registered on the R1 host and dispatches it. These two tests pin both sides:
+  // with a working gate the R1 room is created and the exchange succeeds; with
+  // no gate the exchange fails closed BEFORE any room is provisioned.
+  async function withR1Target(run: () => Promise<void>): Promise<void> {
     process.env.BROWSER_LIVEKIT_TARGET = 'r1';
     process.env.R1_LIVEKIT_URL = 'wss://r1.example.test';
     process.env.R1_LIVEKIT_API_KEY = 'r1-key';
     process.env.R1_LIVEKIT_API_SECRET = 'r1-secret';
     try {
+      await run();
+    } finally {
+      delete process.env.BROWSER_LIVEKIT_TARGET;
+      delete process.env.R1_LIVEKIT_URL;
+      delete process.env.R1_LIVEKIT_API_KEY;
+      delete process.env.R1_LIVEKIT_API_SECRET;
+    }
+  }
+
+  it('creates the browser room on the selected R1 endpoint', async () => {
+    await withR1Target(async () => {
+      // A working orchestration gate: a worker is ready (host matched on R1) and
+      // the dispatch lands.
+      const gate = {
+        app: 'project-hello-voice',
+        agentName: 'browser-screener',
+        ensureReadyWorker: vi.fn(async () => ({ status: 'ready', machineId: 'm1' })),
+        dispatch: vi.fn(async () => true),
+        releaseWorker: vi.fn(async () => undefined),
+      };
+      __setBrowserGateResolverForTest(() => gate as never);
+
       const app = exchangeApp({
         candidate_invites: invites(true),
         call_sessions: sessionsSequence([
@@ -341,16 +377,50 @@ describe('JIT provisioning on a created (Ashby-materialized) session', () => {
       const res = await exchange(app);
       expect(res.status).toBe(200);
       expect(res.body.url).toBe('wss://r1.example.test');
+      // The room is created on the R1 endpoint with the R1 credentials.
       expect(roomClientCtor).toHaveBeenLastCalledWith(
         'wss://r1.example.test', 'r1-key', 'r1-secret',
       );
+      expect(createRoom).toHaveBeenCalledTimes(1);
+      expect(createRoom).toHaveBeenCalledWith(expect.objectContaining({ name: ROOM }));
+      // R1 provisioning makes no Egress call (fence 4).
       expect(startAuthoritativeRecording).not.toHaveBeenCalled();
-    } finally {
-      delete process.env.BROWSER_LIVEKIT_TARGET;
-      delete process.env.R1_LIVEKIT_URL;
-      delete process.env.R1_LIVEKIT_API_KEY;
-      delete process.env.R1_LIVEKIT_API_SECRET;
-    }
+      // The gate ran after the room existed: readiness, then dispatch into it.
+      expect(gate.ensureReadyWorker).toHaveBeenCalledWith({ sessionId: SESSION_ID });
+      expect(gate.dispatch).toHaveBeenCalledWith({ sessionId: SESSION_ID, roomName: ROOM });
+      expect(gate.releaseWorker).not.toHaveBeenCalled();
+      expect(createRoom.mock.invocationCallOrder[0])
+        .toBeLessThan(gate.dispatch.mock.invocationCallOrder[0]);
+    });
+  });
+
+  it('fails closed on target r1 when the orchestration gate is unavailable', async () => {
+    await withR1Target(async () => {
+      // Orchestration off / agent name unset: the gate resolver yields null.
+      __setBrowserGateResolverForTest(() => null);
+
+      const app = exchangeApp({
+        candidate_invites: invites(true),
+        call_sessions: sessionsSequence([
+          ok({ id: SESSION_ID, external_call_id: null, status: 'created' }),
+          ok([{ id: SESSION_ID }]),
+        ]),
+      });
+
+      const res = await exchange(app);
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({ error: 'screening_room_unavailable' });
+      // No token or grant, no room, no egress, no session CAS, invite unconsumed.
+      expect(res.body.grant_token).toBeUndefined();
+      expect(res.body.livekit_token).toBeUndefined();
+      expect(addGrant).not.toHaveBeenCalled();
+      expect(toJwt).not.toHaveBeenCalled();
+      expect(createRoom).not.toHaveBeenCalled();
+      expect(updateRoomMetadata).not.toHaveBeenCalled();
+      expect(startAuthoritativeRecording).not.toHaveBeenCalled();
+      expect(callsFor('call_sessions', 'update')).toHaveLength(0);
+      expect(callsFor('candidate_invites', 'update')).toHaveLength(0);
+    });
   });
 });
 

@@ -168,6 +168,7 @@ async def post_worker_ready_machine(
     app: Optional[str] = None,
     machine_id: Optional[str] = None,
     agent_name: Optional[str] = None,
+    livekit_host: Optional[str] = None,
     post: PostFn = _default_post,
 ) -> bool:
     """Tell the API this MACHINE's worker process is up and registered.
@@ -178,6 +179,12 @@ async def post_worker_ready_machine(
     the API's /ready-machine schema is strict, and an older API must never see
     a key it would reject. The API stores the name on the lease row and
     dispatches the leased session's job to it.
+
+    ``livekit_host`` (R1, PR-LK-liveness): the lowercase DNS hostname of the
+    LiveKit endpoint a BROWSER worker registered with. Sent ONLY when not None
+    and ONLY by the R1-opted-in browser worker (``R1_READINESS_HOST=on``), never
+    by the phone worker or the Cloud browser worker, so the same strict-schema
+    rule applies: no caller that omits it posts anything but the legacy body.
 
     The BROWSER worker (named, explicit dispatch — design §2.3b B-i) posts THIS
     at registration/prewarm, BEFORE it knows its session, so the API's
@@ -206,6 +213,8 @@ async def post_worker_ready_machine(
     body: dict[str, Any] = {"app": resolved_app, "machine_id": resolved_machine}
     if agent_name is not None:
         body["agent_name"] = agent_name
+    if livekit_host is not None:
+        body["livekit_host"] = livekit_host
     try:
         resp = await post("POST", f"{API_BASE}{_READY_MACHINE_URL}", headers, body)
         data = getattr(resp, "json", lambda: {})()

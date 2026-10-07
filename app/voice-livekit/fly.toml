@@ -50,6 +50,10 @@ primary_region = "sin"
   # UP first (runbook docs/runbooks/phone-worker-orchestration-activation.md §5).
   BROWSER_AGENT_NAME = "browser-screener"
   WORKER_ORCHESTRATION = "worker"
+  # BROWSER_WORKER_ONE_JOB and R1_READINESS_HOST are deliberately ABSENT: exact
+  # `on` is set only at the R1 self-hosted cutover, after the host-aware API
+  # readiness deploy. Absent, this named Cloud worker boots and reports readiness
+  # exactly as before (prewarm post, legacy body, cli.run_app(WorkerOptions)).
 
 # X1/VM PIN (2026-08-29 CPU-starvation incident): on `shared` CPU the worker's
 # VAD/EOU compute backed up (VAD backlog 67 s), the Sarvam STT websocket died

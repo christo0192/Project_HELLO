@@ -2032,4 +2032,181 @@ begin
 end;
 $$;
 
+-- 0118: durable, boot-scoped, browser-only worker host. These use distinct apps,
+-- machine ids and claim ids so they cannot collide with the admission /
+-- concurrency fixtures or the policy_tests lease apps.
+do $$
+declare
+  browser_app constant text := 'r1-host-browser-0118';
+  phone_app constant text := 'r1-host-phone-0118';
+  claim_app constant text := 'r1-host-claim-0118';
+  phone_claim_app constant text := 'r1-host-phone-claim-0118';
+  browser_machine constant text := 'r1hostbrowser0118';
+  phone_machine constant text := 'r1hostphone0118';
+  claim_machine constant text := 'r1hostclaim0118';
+  phone_claim_machine constant text := 'r1hostphoneclaim0118';
+  browser_session constant uuid := '30000000-0000-4000-8000-000000000181';
+  phone_session constant uuid := '30000000-0000-4000-8000-000000000182';
+  claim_session constant uuid := '30000000-0000-4000-8000-000000000183';
+  phone_claim_session constant uuid := '30000000-0000-4000-8000-000000000184';
+  claim_fn constant text :=
+    'screening_v2.claim_voice_worker(text,text,uuid,bigint,timestamptz)';
+  reset_fn constant text :=
+    'screening_v2.reset_voice_worker(text,text,timestamptz)';
+  res jsonb;
+  lease screening_v2.voice_worker_leases%rowtype;
+begin
+  insert into screening_v2.voice_worker_leases
+    (app, machine_id, pipeline, state, claimed_session_id, epoch, livekit_host) values
+    (browser_app, browser_machine, 'browser', 'starting', browser_session, 1, null),
+    (phone_app, phone_machine, 'phone', 'ready', phone_session, 1, null);
+
+  perform _r1_tests.assert('0118 livekit_host column and both validated checks exist',
+    exists (
+      select 1 from pg_catalog.pg_attribute
+       where attrelid = 'screening_v2.voice_worker_leases'::regclass
+         and attname = 'livekit_host' and not attisdropped
+    ) and (
+      select count(*) from pg_catalog.pg_constraint
+       where conrelid = 'screening_v2.voice_worker_leases'::regclass
+         and conname in ('voice_worker_leases_livekit_host_format',
+                         'voice_worker_leases_livekit_host_browser_only')
+         and convalidated
+    ) = 2);
+  perform _r1_tests.assert('0118 host RPC is security-definer, search-path-pinned, service-role-only',
+    exists (
+      select 1 from pg_catalog.pg_proc p
+       where p.oid = 'screening_v2.set_voice_worker_livekit_host(text,text,text,timestamptz)'::regprocedure
+         and p.prosecdef
+         and p.proconfig @> array['search_path=pg_catalog, screening_v2']
+    ) and has_function_privilege('service_role',
+      'screening_v2.set_voice_worker_livekit_host(text,text,text,timestamptz)', 'execute')
+      and not has_function_privilege('anon',
+        'screening_v2.set_voice_worker_livekit_host(text,text,text,timestamptz)', 'execute')
+      and not has_function_privilege('authenticated',
+        'screening_v2.set_voice_worker_livekit_host(text,text,text,timestamptz)', 'execute')
+      and not has_function_privilege('public',
+        'screening_v2.set_voice_worker_livekit_host(text,text,text,timestamptz)', 'execute'));
+
+  res := screening_v2.set_voice_worker_livekit_host(
+    browser_app, browser_machine, 'r1.example.test', '2026-10-06 00:00:00+00');
+  perform _r1_tests.assert('0118 RPC sets a valid lowercase browser host',
+    res->>'status' = 'ok' and (select livekit_host = 'r1.example.test'
+      from screening_v2.voice_worker_leases where app = browser_app and machine_id = browser_machine));
+  res := screening_v2.set_voice_worker_livekit_host(
+    browser_app, browser_machine, null, '2026-10-06 00:00:01+00');
+  perform _r1_tests.assert('0118 RPC null explicitly clears a prior host',
+    res->>'status' = 'ok' and (select livekit_host is null
+      from screening_v2.voice_worker_leases where app = browser_app and machine_id = browser_machine));
+  begin
+    update screening_v2.voice_worker_leases set livekit_host = 'R1.EXAMPLE.TEST'
+     where app = browser_app and machine_id = browser_machine;
+    raise exception '0118 hostname check unexpectedly accepted uppercase host';
+  exception when check_violation then null;
+  end;
+  perform _r1_tests.assert('0118 hostname check rejects uppercase direct writes',
+    (select livekit_host is null
+      from screening_v2.voice_worker_leases where app = browser_app and machine_id = browser_machine));
+  res := screening_v2.set_voice_worker_livekit_host(
+    browser_app, browser_machine, 'WSS://invalid.example.test', '2026-10-06 00:00:02+00');
+  perform _r1_tests.assert('0118 RPC rejects invalid hostname syntax without a write',
+    res->>'status' = 'invalid_request' and (select livekit_host is null
+      from screening_v2.voice_worker_leases where app = browser_app and machine_id = browser_machine));
+  res := screening_v2.set_voice_worker_livekit_host(
+    'r1-host-absent-0118', browser_machine, 'r1.example.test', '2026-10-06 00:00:03+00');
+  perform _r1_tests.assert('0118 RPC refuses absent rows as stale', res->>'status' = 'stale');
+
+  -- Browser-only: a PHONE lease is rejected by the RPC and by the table check.
+  res := screening_v2.set_voice_worker_livekit_host(
+    phone_app, phone_machine, 'phone.example.test', '2026-10-06 00:00:03+00');
+  perform _r1_tests.assert('0118 RPC rejects a phone lease (invalid_pipeline) without a write',
+    res->>'status' = 'invalid_pipeline' and (select livekit_host is null
+      from screening_v2.voice_worker_leases where app = phone_app and machine_id = phone_machine));
+  res := screening_v2.set_voice_worker_livekit_host(
+    phone_app, phone_machine, null, '2026-10-06 00:00:03+00');
+  perform _r1_tests.assert('0118 RPC rejects a phone lease even for a null (clear) report',
+    res->>'status' = 'invalid_pipeline');
+  begin
+    update screening_v2.voice_worker_leases set livekit_host = 'phone.example.test'
+     where app = phone_app and machine_id = phone_machine;
+    raise exception '0118 browser-only check unexpectedly accepted a phone host';
+  exception when check_violation then null;
+  end;
+  perform _r1_tests.assert('0118 browser-only check rejects a direct phone host write',
+    (select livekit_host is null
+      from screening_v2.voice_worker_leases where app = phone_app and machine_id = phone_machine));
+
+  update screening_v2.voice_worker_leases set state = 'busy' where app = browser_app and machine_id = browser_machine;
+  res := screening_v2.set_voice_worker_livekit_host(
+    browser_app, browser_machine, 'r1.example.test', '2026-10-06 00:00:04+00');
+  perform _r1_tests.assert('0118 RPC refuses non-starting-ready rows as stale', res->>'status' = 'stale');
+
+  -- Boot scoping: a NEW claim never inherits an earlier boot's host. The stale
+  -- host is planted directly on the stopped row, as an earlier boot would have
+  -- left it had nothing nulled it.
+  insert into screening_v2.voice_worker_leases
+    (app, machine_id, pipeline, state, claimed_session_id, epoch, livekit_host) values
+    (claim_app, claim_machine, 'browser', 'stopped', null, 0, 'stale-boot.example.test');
+  res := screening_v2.claim_voice_worker(claim_app, 'browser', claim_session, null, '2026-10-06 01:00:00+00');
+  perform _r1_tests.assert('0118 claim returns the claimed machine and nulls a stale host',
+    res->>'status' = 'claimed' and res->>'machine_id' = claim_machine
+      and (select livekit_host is null and state = 'starting'
+             and claimed_session_id = claim_session
+        from screening_v2.voice_worker_leases where app = claim_app and machine_id = claim_machine));
+  res := screening_v2.set_voice_worker_livekit_host(
+    claim_app, claim_machine, 'r1.example.test', '2026-10-06 01:00:01+00');
+  perform _r1_tests.assert('0118 a claimed boot can then report its host', res->>'status' = 'ok');
+  res := screening_v2.claim_voice_worker(claim_app, 'browser', claim_session, null, '2026-10-06 01:00:02+00');
+  perform _r1_tests.assert('0118 an idempotent re-claim of the same boot keeps its reported host',
+    res->>'status' = 'claimed' and res->>'machine_id' = claim_machine
+      and (select livekit_host = 'r1.example.test'
+        from screening_v2.voice_worker_leases where app = claim_app and machine_id = claim_machine));
+  res := screening_v2.reset_voice_worker(claim_app, claim_machine, '2026-10-06 01:00:03+00');
+  select * into lease from screening_v2.voice_worker_leases
+   where app = claim_app and machine_id = claim_machine;
+  perform _r1_tests.assert('0118 reset nulls the host and releases the claim',
+    res->>'status' = 'stopped' and lease.livekit_host is null
+      and lease.state = 'stopped' and lease.claimed_session_id is null);
+
+  -- The two re-declared phone-shared RPCs keep their 0112 behaviour and posture.
+  insert into screening_v2.voice_worker_leases
+    (app, machine_id, pipeline, state, claimed_session_id, epoch, registered_agent_name) values
+    (phone_claim_app, phone_claim_machine, 'phone', 'stopped', null, 0, 'phone-screener-abcdef0123');
+  res := screening_v2.claim_voice_worker(
+    phone_claim_app, 'phone', phone_claim_session, null, '2026-10-06 02:00:00+00');
+  select * into lease from screening_v2.voice_worker_leases
+   where app = phone_claim_app and machine_id = phone_claim_machine;
+  perform _r1_tests.assert('0118 phone claim still nulls the per-machine agent name (0112) and carries no host',
+    res->>'status' = 'claimed' and lease.registered_agent_name is null
+      and lease.livekit_host is null and lease.state = 'starting' and lease.epoch = 1);
+  update screening_v2.voice_worker_leases set registered_agent_name = 'phone-screener-abcdef0123'
+   where app = phone_claim_app and machine_id = phone_claim_machine;
+  res := screening_v2.reset_voice_worker(phone_claim_app, phone_claim_machine, '2026-10-06 02:00:01+00');
+  select * into lease from screening_v2.voice_worker_leases
+   where app = phone_claim_app and machine_id = phone_claim_machine;
+  perform _r1_tests.assert('0118 phone reset still nulls the per-machine agent name (0112)',
+    res->>'status' = 'stopped' and lease.registered_agent_name is null
+      and lease.livekit_host is null and lease.state = 'stopped');
+  res := screening_v2.claim_voice_worker(phone_claim_app, 'pager', phone_claim_session, null);
+  perform _r1_tests.assert('0118 claim still rejects an unknown pipeline', res->>'status' = 'invalid_pipeline');
+  res := screening_v2.claim_voice_worker('r1-host-none-0118', 'phone', phone_claim_session, null);
+  perform _r1_tests.assert('0118 claim still answers no_capacity for an empty pool', res->>'status' = 'no_capacity');
+  res := screening_v2.reset_voice_worker('r1-host-none-0118', 'nomachine');
+  perform _r1_tests.assert('0118 reset still answers unknown_machine', res->>'status' = 'unknown_machine');
+  perform _r1_tests.assert('0118 claim/reset keep the 0112 name reset and add the host reset',
+    (select bool_and(p.prosrc ~* 'registered_agent_name[[:space:]]*=[[:space:]]*null'
+                     and p.prosrc ~* 'livekit_host[[:space:]]*=[[:space:]]*null')
+       from pg_catalog.pg_proc p
+      where p.oid in (to_regprocedure(claim_fn)::oid, to_regprocedure(reset_fn)::oid)));
+  perform _r1_tests.assert('0118 claim/reset stay security-definer, search-path-pinned, service-role-only',
+    (select bool_and(p.prosecdef and p.proconfig @> array['search_path=pg_catalog, screening_v2']
+                     and has_function_privilege('service_role', p.oid, 'execute')
+                     and not has_function_privilege('anon', p.oid, 'execute')
+                     and not has_function_privilege('authenticated', p.oid, 'execute')
+                     and not has_function_privilege('public', p.oid, 'execute'))
+       from pg_catalog.pg_proc p
+      where p.oid in (to_regprocedure(claim_fn)::oid, to_regprocedure(reset_fn)::oid)));
+end;
+$$;
+
 drop schema _r1_tests cascade;

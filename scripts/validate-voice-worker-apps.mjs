@@ -296,6 +296,10 @@ ok(browserApp === "project-hello-voice", `fly.toml app must be project-hello-voi
 ok(phoneApp === "project-hello-phone-voice", `fly.phone.toml app must be project-hello-phone-voice (got ${phoneApp})`);
 
 ok(!hasEnvKey(browser, "PHONE_AGENT_NAME"), "fly.toml (browser) must NOT set PHONE_AGENT_NAME — the browser worker registers under its own BROWSER_AGENT_NAME; carrying the phone name would misroute phone dispatch");
+ok(!hasEnvKey(browser, "BROWSER_WORKER_ONE_JOB"), "fly.toml must leave BROWSER_WORKER_ONE_JOB absent until the reviewed R1 cutover sets its exact on value");
+ok(!hasEnvKey(phoneCfg, "BROWSER_WORKER_ONE_JOB"), "fly.phone.toml must NOT set BROWSER_WORKER_ONE_JOB — the one-job browser gate is never a phone setting");
+ok(!hasEnvKey(browser, "R1_READINESS_HOST"), "fly.toml must leave R1_READINESS_HOST absent: the live Cloud browser worker is already named and orchestrated, and this opt-in (post-registration readiness + the livekit_host report) is set only at the reviewed R1 cutover, after the host-aware API is deployed — shipping it in fly.toml would change the live Cloud lane and break it against an older API's strict /ready-machine schema");
+ok(!hasEnvKey(phoneCfg, "R1_READINESS_HOST"), "fly.phone.toml must NOT set R1_READINESS_HOST — the R1 readiness contract is browser-only and never a phone setting");
 const phoneName = envValue(phoneCfg, "PHONE_AGENT_NAME");
 ok(typeof phoneName === "string" && phoneName.trim().length > 0, "fly.phone.toml must set a NON-EMPTY PHONE_AGENT_NAME (named worker)");
 

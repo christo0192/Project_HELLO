@@ -9409,6 +9409,11 @@ components:
           type: string
           pattern: '^[A-Za-z0-9_-]{1,64}-[0-9a-z]{8,32}$'
           description: "M009 E2, optional. The per-machine LiveKit agent name (<base>-<flyMachineId>) a phone worker registered under when per-machine naming is on. When present the API records it on the lease (set_voice_worker_agent_name) BEFORE marking the row ready, and dispatches that machine's session to exactly this name; if recording it fails or is stale the response is 500 and the row is NOT marked ready (the dial gate then times out and defers rather than dispatching to an unrecorded name). Absent (browser workers, phone workers with per-machine naming off) the behaviour is unchanged."
+        livekit_host:
+          type: string
+          maxLength: 253
+          pattern: '^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(?:\.(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?))*$'
+          description: "R1, optional. The lowercase DNS hostname of the LiveKit endpoint a BROWSER worker registered with, sent only by a worker opted into the R1 readiness contract (R1_READINESS_HOST=on). Additive: the schema stays strict and an absent key is exactly the legacy body, which is all a Cloud browser worker or a phone worker ever sends. When present on a browser (project-hello-voice) post the API lowercases it and records it on the lease (set_voice_worker_livekit_host) BEFORE marking the row ready; a stale lease answers 200 {ok:false,status:stale}, and any other outcome is 500 with the row NOT marked ready. The database nulls the host on every new claim and on reset, so it never outlives its boot, and R1 admission requires an exact match with the R1 endpoint host. Accepted and ignored for any other app."
       additionalProperties: false
 
     VoiceWorkerReadyResponse:
