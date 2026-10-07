@@ -7,8 +7,9 @@
  *
  *   - the role-play clock reached 10:00 and the candidate gave at least 8 role-play turns
  *     of 3 or more words;
- *   - all four objection families were delivered (primary AND push), plus the F1 counter,
- *     and every delivery slipped by at most 60 seconds;
+ *   - all four objection families were delivered, exactly as the worker's deck defines them
+ *     (`r1_scheduler.py` PLAN): F2, F3 and F4 are a primary AND a push; F1 is the anchor AND the
+ *     counter, and has NO push. Every delivery slipped by at most 60 seconds;
  *   - no deep need was revealed without a logged probe before it (a reveal with no turn
  *     index fails too);
  *   - no commitment or concession outside the permitted level reached the guard, and fewer
@@ -17,8 +18,11 @@
  *   - speech-to-text sanity: fewer than 10% of candidate role-play turns are at most two
  *     words or non-lexical;
  *   - scoring is complete, the three runs agree, and the evidence references validated;
- *   - no system-failure outcome, and the session ended cleanly. The round is final (D1) by
- *     construction: a valid gated score is what makes a round final.
+ *   - no system-failure outcome, and the session ended cleanly (it completed). A counted
+ *     attempt that did NOT complete (the candidate left, or the residency cap hit) is still
+ *     scored so HR sees what was said, but it can never pass: `session_not_completed` and
+ *     `session_not_clean` make it `human_review`. The round is final (D1) by construction: a
+ *     valid gated score is what makes a round final.
  *
  * FAIL CLOSED. A fact the worker never reported is unknown, and unknown fails. Until the
  * worker posts `session_facts` (PR-4b) no session can pass, which is the safe state while
@@ -27,8 +31,17 @@
  * Pure: no I/O, no clock, no randomness. Every failure is a stable lowercase code.
  */
 
-import { R1_FAMILIES, type R1AdministrationLog } from './admin-log.js';
+import { R1_FAMILIES, type R1AdministrationLog, type R1Family } from './admin-log.js';
 import type { R1TranscriptStats } from './transcript.js';
+
+/**
+ * The families whose second move is a `push` line. F1 is the other kind: its second move is the
+ * COUNTER (`counter_delivered`), after the first concession or refusal, and the deck has no F1
+ * push (`r1_scheduler.py` PLAN: F1-ANCHOR primary, F1-COUNTER; the worker posts F1-COUNTER as
+ * `counter_delivered`, never as `push_delivered`). The gate requires exactly the moves the deck
+ * defines, so a perfectly administered session can pass.
+ */
+const R1_FAMILIES_WITH_PUSH: ReadonlySet<R1Family> = new Set<R1Family>(['F2', 'F3', 'F4']);
 
 export const R1_GATE_LIMITS = {
   MIN_ROLEPLAY_SECONDS: 600,
@@ -54,6 +67,12 @@ export const R1_SYSTEM_FAILURE_OUTCOMES: ReadonlySet<string> = new Set([
 export interface R1GateInput {
   readonly transcript: R1TranscriptStats;
   readonly log: R1AdministrationLog;
+  /**
+   * `call_sessions.status` when the scorer ran. A session that did not `complete` (a counted
+   * attempt the candidate left, or the residency cap ended) is scored for HR but can never pass.
+   * Optional so a caller that predates this field is unchanged; the scorer always passes it.
+   */
+  readonly sessionStatus?: string | null;
   /** `call_sessions.terminal_reason`; null when unknown. */
   readonly terminalReason: string | null;
   /** `interview_round_attempts.outcome`; null until the worker settles it. */
@@ -89,12 +108,15 @@ export function evaluateR1Gate(input: R1GateInput): R1GateResult {
     failures.push('too_few_candidate_turns');
   }
 
-  // Every family delivered (primary and push), the F1 counter, and no delivery slipped.
+  // Every family delivered exactly as the deck defines it (F2-F4 primary and push; F1 anchor and
+  // the counter below), and no delivery slipped. An F1 `push` row, if one ever arrives, is not a
+  // deck move and is neither required nor judged.
   for (const family of R1_FAMILIES) {
     const entry = log.families[family];
+    const hasPush = R1_FAMILIES_WITH_PUSH.has(family);
     if (entry.primary === null) failures.push(`family_missing:${family.toLowerCase()}`);
-    if (entry.push === null) failures.push(`push_missing:${family.toLowerCase()}`);
-    for (const delivery of [entry.primary, entry.push]) {
+    if (hasPush && entry.push === null) failures.push(`push_missing:${family.toLowerCase()}`);
+    for (const delivery of hasPush ? [entry.primary, entry.push] : [entry.primary]) {
       if (delivery === null) continue;
       if (delivery.slipSeconds === null) {
         failures.push(`family_slip_unknown:${family.toLowerCase()}`);
@@ -150,6 +172,11 @@ export function evaluateR1Gate(input: R1GateInput): R1GateResult {
   if (input.attemptOutcome !== null && R1_SYSTEM_FAILURE_OUTCOMES.has(input.attemptOutcome)) {
     failures.push('system_failure_outcome');
   }
+  // Fail closed: only a `completed` session can pass. A counted attempt the candidate left, or
+  // the residency cap ended, is scored for HR but never decides the round on its own.
+  if (input.sessionStatus !== undefined && input.sessionStatus !== 'completed') {
+    failures.push('session_not_completed');
+  }
   if (input.terminalReason !== null
       && input.terminalReason !== 'conversation_complete'
       && input.terminalReason !== 'assessment_done') {
@@ -180,7 +207,9 @@ export function describeAdministrationQuality(
 ): R1AdministrationQuality {
   const delivered = R1_FAMILIES.filter((family) => {
     const entry = input.log.families[family];
-    return entry.primary !== null && entry.push !== null;
+    // F1's second move is the counter; the others' is the push.
+    const second = R1_FAMILIES_WITH_PUSH.has(family) ? entry.push : input.log.counter;
+    return entry.primary !== null && second !== null;
   }).length;
   return {
     status: result.passed ? 'ok' : 'review',

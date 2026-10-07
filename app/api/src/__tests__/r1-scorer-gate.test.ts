@@ -29,12 +29,14 @@ function baseline(overrides: {
   log?: (log: R1AdministrationLog) => R1AdministrationLog;
   terminalReason?: string | null;
   attemptOutcome?: string | null;
+  sessionStatus?: string | null;
   scoring?: Partial<R1GateInput['scoring']>;
 } = {}): R1GateInput {
   const log = parseR1AdministrationLog(cleanLogRows());
   return {
     transcript: { ...stats(), ...overrides.transcript },
     log: overrides.log ? overrides.log(log) : log,
+    sessionStatus: overrides.sessionStatus === undefined ? 'completed' : overrides.sessionStatus,
     terminalReason: overrides.terminalReason === undefined ? 'conversation_complete' : overrides.terminalReason,
     attemptOutcome: overrides.attemptOutcome === undefined ? 'complete' : overrides.attemptOutcome,
     scoring: { complete: true, runsAgree: true, evidenceValid: true, ...overrides.scoring },
@@ -114,14 +116,66 @@ describe('R1 coverage and fidelity gate', () => {
   });
 
   describe('all four objection families, the F1 counter, and slip', () => {
-    it('fails each missing primary and each missing push by family', () => {
+    it('fails each missing primary by family, and each missing push for F2-F4', () => {
       for (const family of ['F1', 'F2', 'F3', 'F4'] as const) {
         const lower = family.toLowerCase();
         expect(evaluateR1Gate(baseline({ log: (l) => withFamily(l, family, { primary: null }) })).failures)
           .toEqual([`family_missing:${lower}`]);
-        expect(evaluateR1Gate(baseline({ log: (l) => withFamily(l, family, { push: null }) })).failures)
-          .toEqual([`push_missing:${lower}`]);
       }
+      for (const family of ['F2', 'F3', 'F4'] as const) {
+        expect(evaluateR1Gate(baseline({ log: (l) => withFamily(l, family, { push: null }) })).failures)
+          .toEqual([`push_missing:${family.toLowerCase()}`]);
+      }
+    });
+
+    it('F1 is anchor + counter: it needs NO push, and a stray F1 push is neither required nor judged', () => {
+      // The deck (r1_scheduler.py PLAN) defines F1-ANCHOR and F1-COUNTER only, and the worker posts
+      // the counter as counter_delivered. A perfectly administered session has no F1 push row.
+      const input = baseline();
+      expect(input.log.families.F1.push).toBeNull();
+      expect(evaluateR1Gate(input)).toEqual({ passed: true, failures: [] });
+      expect(evaluateR1Gate(baseline({ log: (l) => withFamily(l, 'F1', { push: null }) })).failures).toEqual([]);
+      // A stray F1 push with a bad slip does not fail the gate: it is not a deck move.
+      const stray: R1Delivery = { turn: 4, slipSeconds: 999 };
+      expect(evaluateR1Gate(baseline({ log: (l) => withFamily(l, 'F1', { push: stray }) })).failures).toEqual([]);
+      // What F1 DOES need is the anchor and the counter, each on time.
+      expect(evaluateR1Gate(baseline({ log: (l) => ({ ...l, counter: null }) })).failures).toEqual(['counter_missing']);
+      expect(evaluateR1Gate(baseline({ log: (l) => withFamily(l, 'F1', { primary: null }) })).failures)
+        .toEqual(['family_missing:f1']);
+      expect(evaluateR1Gate(baseline({
+        log: (l) => withFamily(l, 'F1', { primary: { turn: 3, slipSeconds: 61 } }),
+      })).failures).toEqual(['family_slip:f1']);
+    });
+
+    it('requires exactly the moves the worker deck defines, end to end from the worker row shapes', () => {
+      // The row shapes r1_replies.fidelity_events produces for a flawless session, F1 included.
+      const movesByEvent = {
+        'F3-PRIMARY': ['family_delivered', 'F3'], 'F3-PUSH': ['push_delivered', 'F3'],
+        'F2-PRIMARY': ['family_delivered', 'F2'], 'F2-PUSH': ['push_delivered', 'F2'],
+        'F1-ANCHOR': ['family_delivered', 'F1'], 'F1-COUNTER': ['counter_delivered', 'F1'],
+        'F4-PRIMARY': ['family_delivered', 'F4'], 'F4-PUSH': ['push_delivered', 'F4'],
+      } as const;
+      const rows = Object.values(movesByEvent).map(([event_type, family_id], i) => ({
+        event_type, family_id, turn_index: 20 + i, payload: { slip_seconds: 1 },
+        created_at: `2026-10-06T10:00:${String(10 + i).padStart(2, '0')}Z`,
+      }));
+      const withoutDeckMoves = (drop: string) => rows.filter((row) =>
+        `${row.family_id}:${row.event_type}` !== drop);
+      // Everything but the families comes from the clean fixture, so only the deck moves vary.
+      const clean = parseR1AdministrationLog(cleanLogRows());
+      const run = (list: typeof rows) => evaluateR1Gate({
+        ...baseline(),
+        log: {
+          ...parseR1AdministrationLog(list),
+          needs: clean.needs,
+          timeCueRoleplaySeconds: clean.timeCueRoleplaySeconds,
+          facts: clean.facts,
+        },
+      }).failures;
+      expect(run(rows)).toEqual([]);
+      expect(run(withoutDeckMoves('F1:counter_delivered'))).toEqual(['counter_missing']);
+      expect(run(withoutDeckMoves('F2:push_delivered'))).toEqual(['push_missing:f2']);
+      expect(run(withoutDeckMoves('F1:family_delivered'))).toEqual(['family_missing:f1']);
     });
 
     it('allows a 60 s slip and fails 61 s, for primaries, pushes and the counter', () => {
@@ -232,6 +286,24 @@ describe('R1 coverage and fidelity gate', () => {
       expect(evaluateR1Gate(baseline({ terminalReason: null })).failures).toEqual([]);
       expect(evaluateR1Gate(baseline({ terminalReason: 'worker_crash' })).failures).toEqual(['session_not_clean']);
     });
+
+    it('a counted attempt that did not complete is scored for HR but can never pass (fail closed)', () => {
+      // The candidate left (worker_crash) or the residency cap ended the session (residency_timeout).
+      expect(evaluateR1Gate(baseline({
+        sessionStatus: 'failed', terminalReason: 'worker_crash', attemptOutcome: 'candidate_left',
+      })).failures).toEqual(['session_not_completed', 'session_not_clean']);
+      expect(evaluateR1Gate(baseline({
+        sessionStatus: 'failed', terminalReason: 'residency_timeout', attemptOutcome: 'residency_timeout',
+      })).failures).toEqual(['system_failure_outcome', 'session_not_completed', 'session_not_clean']);
+      // Unknown terminal reason does not smuggle a non-completed session through.
+      expect(evaluateR1Gate(baseline({ sessionStatus: 'failed', terminalReason: null })).failures)
+        .toEqual(['session_not_completed']);
+      expect(evaluateR1Gate(baseline({ sessionStatus: null })).failures).toEqual(['session_not_completed']);
+      // A caller that predates the field is unchanged.
+      const { sessionStatus: omitted, ...legacy } = baseline();
+      expect(omitted).toBe('completed');
+      expect(evaluateR1Gate(legacy as R1GateInput).failures).toEqual([]);
+    });
   });
 
   it('reports every failure at once, in a fixed order, so HR sees the whole picture', () => {
@@ -288,5 +360,16 @@ describe('administration quality line', () => {
     expect(quality.status).toBe('review');
     expect(quality.failures).toEqual(['push_missing:f2']);
     expect(quality.counts.familiesDelivered).toBe(3);
+  });
+
+  it('counts F1 as delivered when the anchor and the counter are present (it has no push)', () => {
+    const delivered = (log: (l: R1AdministrationLog) => R1AdministrationLog) => {
+      const input = baseline({ log });
+      return describeAdministrationQuality(input, evaluateR1Gate(input)).counts.familiesDelivered;
+    };
+    expect(delivered((l) => l)).toBe(4);
+    expect(delivered((l) => ({ ...l, counter: null }))).toBe(3);
+    expect(delivered((l) => withFamily(l, 'F1', { primary: null }))).toBe(3);
+    expect(delivered((l) => withFamily(l, 'F1', { push: null }))).toBe(4);
   });
 });

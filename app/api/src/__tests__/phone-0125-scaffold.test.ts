@@ -65,12 +65,17 @@ describe(`${N} registration`, () => {
     expect(PHONE_MIGRATIONS[0].sql).toBe(MIGRATION_0125);
   });
 
-  it('is the one CI-legal 0125 file and the newest migration file', () => {
+  it('is the one CI-legal 0125 file and the newest NON-R1 migration file', () => {
     const base = path.basename(MIGRATION_0125_PATH);
     expect(base).toMatch(new RegExp(`^${N}_[a-z0-9_]+\\.sql$`));
     const files = readdirSync(MIGRATIONS).filter((f) => /^\d{4}_.*\.sql$/.test(f)).sort();
     expect(files.filter((f) => f.startsWith(`${N}_`))).toEqual([base]);
-    expect(files[files.length - 1]).toBe(base);
+    // Same relaxation #329 applied to 0113 and 0114: R1-lane migrations (`_r1_` in the name, e.g.
+    // 0126's r1_settle_attempt / r1_transition_round) may follow it; nothing else may.
+    const after = files.slice(files.indexOf(base) + 1);
+    expect(after.every((f) => /_r1_/.test(f))).toBe(true);
+    const nonR1 = files.filter((f) => !/_r1_/.test(f));
+    expect(nonR1[nonR1.length - 1]).toBe(base);
   });
 });
 

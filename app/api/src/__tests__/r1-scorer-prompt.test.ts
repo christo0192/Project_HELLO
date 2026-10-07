@@ -118,8 +118,11 @@ describe('R1 scorer prompt', () => {
     const prompt = build();
     expect(prompt).toContain('TRUSTED ADMINISTRATION LOG');
     expect(prompt).toContain('- H1: probed at T10, revealed at T12');
-    expect(prompt).toContain('- F1: primary T12 (slip 5); push T14 (slip 0)');
-    expect(prompt).toContain('- F1 counter T20 (slip 2)');
+    // F1 is the anchor and the counter: it has no push, so the scorer is never told one was missed.
+    expect(prompt).toContain('- F1: anchor T12 (slip 5); counter T20 (slip 2)');
+    expect(prompt).toContain('- F2: primary T13 (slip 5); push T15 (slip 0)');
+    expect(prompt).not.toContain('F1: anchor T12 (slip 5); push');
+    expect(prompt.split('\n').find((line) => line.startsWith('- F1:'))).not.toContain('push');
     expect(prompt).toContain('- T19: $500, conditional=true, value stated before=true');
     expect(prompt).toContain('TRUSTED COMMUNICATION FACTS');
     expect(prompt).toContain('talk share in role-play (worker-computed): 52%');
@@ -135,7 +138,8 @@ describe('R1 scorer prompt', () => {
     const text = formatAdministrationLog(log);
     expect(text).toContain('- H2: NOT PROBED, revealed at T5');
     expect(text).toContain('- F3: primary NOT delivered; push NOT delivered');
-    expect(text).toContain('- F1 counter NOT delivered');
+    expect(text).toContain('- F1: anchor NOT delivered; counter NOT delivered');
+    expect(text.split('\n').find((line) => line.startsWith('- F1:'))).not.toContain('push');
     expect(text).toContain('- none');
     const facts = formatCommunicationFacts(log, computeTranscriptStats([]));
     expect(facts).toContain('not reported');

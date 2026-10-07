@@ -28,12 +28,16 @@ type Tables = Record<string, Row[]>;
 
 /** A deliberately small Supabase query double. It preserves the methods this
  * router uses so the tests exercise its authorization and ordering logic. */
+/** Tables whose SELECTs answer a PostgREST-style error (a transient read failure). */
+const failingTables = new Set<string>();
+
 function query(table: string, tables: Tables) {
   let operation = 'select';
   let value: any;
   let filters: Array<(row: Row) => boolean> = [];
   const rows = () => (tables[table] ?? []).filter((row) => filters.every((f) => f(row)));
-  const result = () => {
+  const result = (): { data: any; error: any } => {
+    if (operation === 'select' && failingTables.has(table)) return { data: null, error: { message: 'boom' } };
     if (operation === 'select') return { data: rows(), error: null };
     if (operation === 'insert') {
       const inserted = (Array.isArray(value) ? value : [value]).map((item) => ({ ...item, id: item.id ?? `${table}-${tables[table]!.length + 1}` }));
@@ -53,8 +57,8 @@ function query(table: string, tables: Tables) {
     order: () => q,
     update: (next: Row) => { operation = 'update'; value = next; return q; },
     insert: (next: Row | Row[]) => { operation = 'insert'; value = next; return q; },
-    maybeSingle: async () => ({ data: result().data[0] ?? null, error: null }),
-    single: async () => ({ data: result().data[0] ?? null, error: null }),
+    maybeSingle: async () => { const r = result(); return { data: Array.isArray(r.data) ? (r.data[0] ?? null) : null, error: r.error }; },
+    single: async () => { const r = result(); return { data: Array.isArray(r.data) ? (r.data[0] ?? null) : null, error: r.error }; },
     then: (resolve: (x: any) => unknown, reject?: (x: unknown) => unknown) => Promise.resolve(result()).then(resolve, reject),
   };
   return q;
@@ -419,6 +423,7 @@ describe('R1 internal worker routes', () => {
   beforeEach(() => {
     process.env.WORKER_CONTEXT_SECRET = SECRET;
     from.mockReset();
+    failingTables.clear();
   });
 
   function readyTables() {
@@ -454,6 +459,110 @@ describe('R1 internal worker routes', () => {
     expect((await request(app).post('/api/internal/r1/usage').set('authorization', `Bearer ${SECRET}`).send({ room, participant_kind: 'preflight', seconds: 16, event_key: 'bad' })).status).toBe(400);
   });
 
+  describe('POST context fails closed (a failed read must never become a silent seed-picked persona)', () => {
+    const context = (app: express.Express) =>
+      request(app).post('/api/internal/r1/context').set('authorization', `Bearer ${SECRET}`).send({ room: `screening-${SESSION}` });
+
+    it('returns the server-assigned attempt (persona included) when every read succeeds', async () => {
+      const response = await context(internalApp(readyTables()).app);
+      expect(response.status).toBe(200);
+      expect(response.body.attempt).toMatchObject({ persona_id: 'p1', attempt_number: 1 });
+      expect(response.body.attempt_id).toBe(SESSION);
+      expect(response.body.settings).toMatchObject({ enabled: true });
+    });
+
+    it.each(['interview_round_attempts', 'candidates', 'r1_settings'])(
+      'answers 503 service_unavailable, with no attempt and no context, when the %s read fails',
+      async (table) => {
+        const { app } = internalApp(readyTables());
+        failingTables.add(table);
+        const response = await context(app);
+        expect(response.status).toBe(503);
+        expect(response.body).toEqual({ error: 'service_unavailable' });
+      },
+    );
+
+    it('answers 503 when the attempt the admission created for the session is missing (no 200 with attempt: null)', async () => {
+      const tables = readyTables();
+      tables.interview_round_attempts.length = 0;
+      const response = await context(internalApp(tables).app);
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({ error: 'service_unavailable' });
+      expect('attempt' in response.body).toBe(false);
+    });
+
+    it('still refuses a non-R1 or settled session with 409 before any read', async () => {
+      const tables = readyTables();
+      tables.call_sessions[0].status = 'failed';
+      failingTables.add('interview_round_attempts');
+      const response = await context(internalApp(tables).app);
+      expect(response.status).toBe(409);
+      expect(response.body.error).toBe('r1_session');
+    });
+  });
+
+  describe('POST usage clamps a residency-timeout exit instead of losing its ledger row', () => {
+    const usage = (app: express.Express, body: Record<string, unknown>) =>
+      request(app).post('/api/internal/r1/usage').set('authorization', `Bearer ${SECRET}`)
+        .send({ room: `screening-${SESSION}`, ...body });
+    const recorded = () => {
+      const call = rpc.mock.calls.filter(([fn]) => fn === 'r1_record_usage').at(-1);
+      return call?.[1] as Record<string, any> | undefined;
+    };
+
+    it.each([
+      [1830, 1830],
+      [1831, 1830],
+      [1845.7, 1830],
+      [3600, 1830],
+      [1799.5, 1799.5],
+      [0, 0],
+    ])('accepts seconds=%s for a disconnect row and records %s', async (seconds, expected) => {
+      rpc.mockClear();
+      const { app, tables } = internalApp(readyTables());
+      const response = await usage(app, { participant_kind: 'agent', event: 'disconnect', seconds, event_key: `exit-${String(seconds).replace('.', '_')}` });
+      expect(response.status).toBe(201);
+      expect(response.body).toEqual({ ok: true, duplicate: false });
+      expect(recorded()).toMatchObject({ p_seconds: expected, p_participant_kind: 'agent', p_event: 'disconnect', p_session_id: SESSION });
+      expect(tables.r1_usage_ledger).toHaveLength(1);
+    });
+
+    it('clamps for the candidate and manual_test kinds as well', async () => {
+      for (const participant_kind of ['candidate', 'manual_test']) {
+        rpc.mockClear();
+        const { app } = internalApp(readyTables());
+        expect((await usage(app, { participant_kind, event: 'disconnect', seconds: 1900, event_key: `k-${participant_kind}` })).status).toBe(201);
+        expect(recorded()!.p_seconds).toBe(1830);
+      }
+    });
+
+    it('still refuses what is not a usable number, an unknown kind, a bad key, a stale clock, and a long preflight', async () => {
+      const { app } = internalApp(readyTables());
+      const base = { participant_kind: 'candidate', event: 'disconnect', seconds: 12, event_key: 'ok-key' };
+      for (const bad of [
+        { seconds: -1 },
+        { seconds: Number.NaN },
+        { seconds: null },
+        { seconds: '1900' },
+        { seconds: 1e999 },
+        { participant_kind: 'recruiter' },
+        { event_key: 'has space' },
+        { event_key: '' },
+        { occurred_at: '2000-01-01T00:00:00Z' },
+        { participant_kind: 'preflight', seconds: 16 },
+      ]) {
+        rpc.mockClear();
+        const response = await usage(app, { ...base, ...bad });
+        expect(response.status, JSON.stringify(bad)).toBe(400);
+        expect(response.body).toEqual({ error: 'invalid_usage' });
+        expect(recorded()).toBeUndefined();
+      }
+      rpc.mockClear();
+      expect((await usage(app, { ...base, participant_kind: 'preflight', seconds: 15, event_key: 'pf' })).status).toBe(201);
+      expect(recorded()!.p_seconds).toBe(15);
+    });
+  });
+
   describe('admin-log ordering contract (PR-4b must post BEFORE the terminal transition)', () => {
     const post = (app: express.Express, body: Record<string, unknown>) =>
       request(app).post('/api/internal/r1/admin-log').set('authorization', `Bearer ${SECRET}`)
@@ -474,6 +583,36 @@ describe('R1 internal worker routes', () => {
       expect((await post(app, facts)).status).toBe(201);
       expect(tables.r1_admin_log).toHaveLength(2);
       expect(tables.r1_admin_log[0]).toMatchObject({ session_id: SESSION, round_id: ROUND, event_type: 'session_facts' });
+    });
+
+    it('accepts every canonical row the worker posts and stores its payload untouched (pins and bookkeeping keys ride along)', async () => {
+      const tables = readyTables();
+      const { app } = internalApp(tables);
+      const pins = { persona_id: 'p4_research_scholar', persona_source: 'attempt' };
+      const canonical = [
+        { event_type: 'need_revealed', turn_index: 12, payload: { pins, need: 'H1', probed_turn: 10, revealed_turn: 12 } },
+        { event_type: 'family_delivered', turn_index: 21, family_id: 'F1', payload: { pins, move_id: 'F1-ANCHOR', slip_seconds: 5 } },
+        { event_type: 'counter_delivered', turn_index: 23, family_id: 'F1', payload: { pins, move_id: 'F1-COUNTER', slip_seconds: 3 } },
+        { event_type: 'push_delivered', turn_index: 15, family_id: 'F3', payload: { pins, move_id: 'F3-PUSH', slip_seconds: 0 } },
+        { event_type: 'discount_detected', turn_index: 22, payload: { pins, amount_usd: 500, conditional: true, value_before: true } },
+        { event_type: 'guard_hit', turn_index: 24, payload: { pins, kind: 'control', rule: 'vendor' } },
+        { event_type: 'time_cue', payload: { pins, roleplay_seconds: 660 } },
+        facts,
+      ];
+      for (const body of canonical) expect((await post(app, body)).status, body.event_type).toBe(201);
+      expect(tables.r1_admin_log).toHaveLength(canonical.length);
+      expect(tables.r1_admin_log[1]).toMatchObject({
+        event_type: 'family_delivered', family_id: 'F1', turn_index: 21,
+        payload: { move_id: 'F1-ANCHOR', slip_seconds: 5 },
+      });
+      // An explicit null turn_index / family_id (a row with no transcript turn, e.g. session_facts or the
+      // time cue) is stored as NULL, exactly like an omitted one; a negative or fractional index is not.
+      expect((await post(app, { event_type: 'time_cue', turn_index: null, family_id: null, payload: { roleplay_seconds: 661 } })).status).toBe(201);
+      expect(tables.r1_admin_log.at(-1)).toMatchObject({ event_type: 'time_cue', turn_index: null, family_id: null });
+      expect((await post(app, { event_type: 'time_cue', turn_index: -1, payload: {} })).status).toBe(400);
+      expect((await post(app, { event_type: 'time_cue', turn_index: 1.5, payload: {} })).status).toBe(400);
+      // A stray event type is still refused: the worker cannot invent rows the scorer reads.
+      expect((await post(app, { event_type: 'free_text', payload: {} })).status).toBe(400);
     });
 
     it.each(['completed', 'failed', 'cancelled', 'expired'])(

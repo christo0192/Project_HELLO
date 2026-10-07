@@ -2026,4 +2026,96 @@ describe('POST /api/r1/exchange: review hardening', () => {
       expect(h.gate.dispatch).toHaveBeenCalledTimes(1);
     });
   });
+
+  describe('a waiting rejoin is the candidate\'s activity for the orphan lapse', () => {
+    const TOUCHED = new Date(NOW).toISOString();
+    const AGED = new Date(NOW - 19 * 60_000).toISOString();
+
+    /** A waiting session that has sat for 19 minutes, one minute short of the lapse bound. */
+    async function agedWaiting(): Promise<{ attempt_token: string; nonce: string; attempt_id: string }> {
+      const secrets = await ready();
+      expect((await exchange(secrets)).status).toBe(200);
+      expect(sessionRow().status).toBe('waiting');
+      sessionRow().updated_at = AGED;
+      return secrets;
+    }
+
+    it('stamps updated_at on a waiting rejoin and changes nothing else about the session', async () => {
+      const secrets = await agedWaiting();
+      const before = { ...sessionRow() };
+      expect((await exchange(secrets)).status).toBe(200);
+      expect(sessionRow()).toEqual({ ...before, updated_at: TOUCHED });
+    });
+
+    it('stamps it BEFORE the worker gate readies a worker, so a slow boot is covered', async () => {
+      const secrets = await agedWaiting();
+      h.dispatched.splice(0); // the interviewer is gone: the retry must ready a new worker
+      let stampWhileReadying: unknown;
+      h.gate.ensureReadyWorker.mockImplementationOnce(async () => {
+        stampWhileReadying = sessionRow().updated_at;
+        return { status: 'timeout' };
+      });
+      const response = await exchange(secrets);
+      expect(response.status).toBe(202);
+      expect(stampWhileReadying).toBe(TOUCHED);
+    });
+
+    it('does not stamp a rejoin that is refused before anything is provisioned (fence 7)', async () => {
+      selectR1Sfu(h);
+      const secrets = await agedWaiting();
+      use(h.tables, { resolveGate: () => null });
+      expect((await exchange(secrets)).status).toBe(503);
+      expect(sessionRow().updated_at).toBe(AGED);
+    });
+
+    it('leaves an in_progress session alone: the lapse judges it by the worker\'s own writes', async () => {
+      const secrets = await agedWaiting();
+      sessionRow().status = 'in_progress';
+      expect((await exchange(secrets)).status).toBe(200);
+      expect(sessionRow().updated_at).toBe(AGED);
+    });
+
+    it('only matches a row that is still waiting (a session settled meanwhile is not resurrected)', async () => {
+      const secrets = await agedWaiting();
+      const original = h.db.from;
+      h.db.from = (table: string) => {
+        const query = original(table);
+        if (table !== 'call_sessions') return query;
+        const update = query.update;
+        query.update = (patch: Record<string, unknown>) => {
+          if (Object.keys(patch).join() === 'updated_at') sessionRow().status = 'expired'; // the lapse got there first
+          return update(patch);
+        };
+        return query;
+      };
+      await exchange(secrets);
+      expect(sessionRow()).toMatchObject({ status: 'expired', updated_at: AGED });
+    });
+
+    it.each([
+      ['a database error', 'error'],
+      ['a thrown error', 'throw'],
+    ])('a failed stamp (%s) never fails the join', async (_label, mode) => {
+      const secrets = await agedWaiting();
+      const original = h.db.from;
+      h.db.from = (table: string) => {
+        const query = original(table);
+        if (table !== 'call_sessions') return query;
+        const update = query.update;
+        query.update = (patch: Record<string, unknown>) => {
+          if (Object.keys(patch).join() !== 'updated_at') return update(patch);
+          if (mode === 'throw') throw new Error('connection reset');
+          const failing: any = {};
+          for (const method of ['eq', 'select']) failing[method] = () => failing;
+          failing.then = (resolve: (value: unknown) => unknown) => resolve({ data: null, error: { message: 'down' } });
+          return failing;
+        };
+        return query;
+      };
+      const response = await exchange(secrets);
+      expect(response.status).toBe(200);
+      expect(response.body.livekit_token).toBeTruthy();
+      expect(sessionRow()).toMatchObject({ status: 'waiting', updated_at: AGED });
+    });
+  });
 });

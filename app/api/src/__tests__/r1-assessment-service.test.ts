@@ -563,6 +563,155 @@ describe('session guards', () => {
   });
 });
 
+describe('a COUNTED attempt that did not complete is still scored (never a dead-ended round)', () => {
+  /** The candidate left (or the residency cap hit) after the role-play began: counted per plan D1. */
+  function failedCounted(
+    outcome: 'candidate_left' | 'residency_timeout',
+    terminal: 'worker_crash' | 'residency_timeout',
+    options: { turns?: typeof rows } = {},
+  ): Tables {
+    const tables = tablesWithInterview({ turns: options.turns });
+    tables.call_sessions![0] = { ...tables.call_sessions![0]!, status: 'failed', terminal_reason: terminal };
+    tables.interview_round_attempts![0] = {
+      ...tables.interview_round_attempts![0]!, outcome, counted: true,
+    };
+    tables.interview_round_consents = [{ id: 'consent-1', round_id: ROUND_ID, withdrawn_at: null }];
+    return tables;
+  }
+
+  it('scores a candidate who left after the role-play: a real scorecard, human_review, and the reason', async () => {
+    const { db, rpc } = setup(failedCounted('candidate_left', 'worker_crash'));
+    const infer = goodInfer();
+    const result = await runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW });
+
+    expect(infer).toHaveBeenCalledTimes(3);
+    expect(result).toMatchObject({ recommendation: 'human_review', valid: false, attach: 'ok' });
+    const row = db.tables.assessments![0]!;
+    expect(row.scoring_status).toBe('complete');
+    expect(row.overall_score).toBe(67);
+    // Stored NULL (the CHECK admits only advance|hold|reject); human_review preserved in raw.
+    expect(row.recommendation).toBeNull();
+    expect(row.raw.recommendation).toBe('human_review');
+    expect(row.raw.r1.scored_recommendation).toBe('advance');
+    expect(row.raw.r1.valid).toBe(false);
+    expect(row.raw.r1.gate.failures).toEqual(['session_not_completed', 'session_not_clean']);
+    expect(row.raw.r1.administration_quality.status).toBe('review');
+    // The round is settled: attach then apply, neither valid nor with a status effect.
+    expect(rpc).toHaveBeenCalledTimes(2);
+    expect(db.rpcCalls[0]).toMatchObject({ fn: 'r1_attach_assessment' });
+    expect(db.rpcCalls[0]!.args).toMatchObject({
+      p_round_id: ROUND_ID, p_session_id: SESSION_ID, p_recommendation: 'human_review', p_valid: false, p_overall: 67,
+    });
+    expect(db.rpcCalls[1]).toMatchObject({ fn: 'r1_apply_status_effect' });
+    expect(db.rpcCalls[1]!.args).toMatchObject({ p_recommendation: 'human_review' });
+  });
+
+  it('a residency-timeout end also records the system failure', async () => {
+    const { db } = setup(failedCounted('residency_timeout', 'residency_timeout'));
+    const result = await runR1Assessment(SESSION_ID, { client: db.client, infer: goodInfer(), now: () => NOW });
+    expect(result).toMatchObject({ recommendation: 'human_review', valid: false });
+    expect(db.tables.assessments![0]!.raw.r1.gate.failures)
+      .toEqual(['system_failure_outcome', 'session_not_completed', 'session_not_clean']);
+  });
+
+  it('an incomplete role-play is scored with its coverage gaps listed, never silently', async () => {
+    // The candidate gave only the first two role-play answers and left.
+    const firstTwo = new Set(
+      rows.filter((r) => r.speaker === 'candidate' && r.phase === 'roleplay').slice(0, 2).map((r) => r.turn_index),
+    );
+    const turns = rows.filter((r) => r.phase !== 'wrapup' && r.phase !== 'closing' && r.phase !== 'roleplay_exit'
+      && !(r.speaker === 'candidate' && r.phase === 'roleplay' && !firstTwo.has(r.turn_index)));
+    const { db } = setup(failedCounted('candidate_left', 'worker_crash', { turns }));
+    const result = await runR1Assessment(SESSION_ID, { client: db.client, infer: goodInfer(), now: () => NOW });
+    expect(result).toMatchObject({ recommendation: 'human_review', valid: false });
+    const failures = db.tables.assessments![0]!.raw.r1.gate.failures as string[];
+    expect(failures).toEqual(expect.arrayContaining(['too_few_candidate_turns', 'session_not_completed', 'session_not_clean']));
+  });
+
+  it('a failed session with no candidate speech gets the human_review placeholder and no model call', async () => {
+    const botOnly = rows.filter((r) => r.speaker === 'bot');
+    const { db } = setup(failedCounted('candidate_left', 'worker_crash', { turns: botOnly }));
+    const infer = goodInfer();
+    const result = await runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW });
+    expect(infer).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ recommendation: 'human_review', valid: false });
+    expect(db.tables.assessments![0]!.raw.r1.outcome).toBe('no_candidate_speech');
+  });
+
+  it('is idempotent: a second run adopts the stored row and never calls the model again', async () => {
+    const { db } = setup(failedCounted('candidate_left', 'worker_crash'));
+    const infer = goodInfer();
+    await runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW });
+    const again = await runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW });
+    expect(infer).toHaveBeenCalledTimes(3);
+    expect(again).toMatchObject({ reused: true, recommendation: 'human_review', valid: false });
+    expect(db.tables.assessments).toHaveLength(1);
+  });
+
+  it('never scores an UNCOUNTED failed attempt (no-show, early exit, system failure)', async () => {
+    const tables = failedCounted('candidate_left', 'worker_crash');
+    tables.interview_round_attempts![0]!.counted = false;
+    const infer = goodInfer();
+    await expect(runR1Assessment(SESSION_ID, { client: setup(tables).db.client, infer }))
+      .rejects.toThrow('r1_session_not_completed');
+    expect(infer).not.toHaveBeenCalled();
+  });
+
+  it.each(['cancelled', 'expired', 'in_progress', 'waiting', 'created'])(
+    'never scores a %s session, counted or not',
+    async (status) => {
+      const tables = failedCounted('candidate_left', 'worker_crash');
+      tables.call_sessions![0]!.status = status;
+      const infer = goodInfer();
+      await expect(runR1Assessment(SESSION_ID, { client: setup(tables).db.client, infer }))
+        .rejects.toThrow('r1_session_not_completed');
+      expect(infer).not.toHaveBeenCalled();
+    },
+  );
+
+  it('never scores a failed session once the consent was withdrawn (a withdrawal stops all processing)', async () => {
+    const tables = failedCounted('candidate_left', 'worker_crash');
+    tables.interview_round_consents![0]!.withdrawn_at = '2026-10-06T10:20:00Z';
+    const infer = goodInfer();
+    const { db } = setup(tables);
+    await expect(runR1Assessment(SESSION_ID, { client: db.client, infer })).rejects.toThrow('r1_consent_withdrawn');
+    expect(infer).not.toHaveBeenCalled();
+    expect(db.tables.assessments).toHaveLength(0);
+    // No consent row at all is the same fail-closed answer.
+    const none = failedCounted('candidate_left', 'worker_crash');
+    none.interview_round_consents = [];
+    await expect(runR1Assessment(SESSION_ID, { client: setup(none).db.client, infer })).rejects.toThrow('r1_consent_withdrawn');
+  });
+
+  it('a failed consent read is a retryable error, not a score', async () => {
+    const { db } = setup(failedCounted('candidate_left', 'worker_crash'));
+    const failing = {
+      ...db.client,
+      from: (table: string) => {
+        if (table === 'interview_round_consents') {
+          const q: any = {
+            select: () => q,
+            eq: () => q,
+            is: () => q,
+            limit: () => Promise.resolve({ data: null, error: { message: 'down' } }),
+          };
+          return q;
+        }
+        return db.client.from(table);
+      },
+    };
+    await expect(runR1Assessment(SESSION_ID, { client: failing as never, infer: goodInfer() }))
+      .rejects.toThrow('r1_consent_read_error');
+  });
+
+  it('does not change the completed-session path: no consent read and one attempt read', async () => {
+    const { db } = setup(tablesWithInterview());
+    await runR1Assessment(SESSION_ID, { client: db.client, infer: goodInfer(), now: () => NOW });
+    expect(db.fromCalls).not.toContain('interview_round_consents');
+    expect(db.fromCalls.filter((t) => t === 'interview_round_attempts')).toHaveLength(1);
+  });
+});
+
 describe('r1ErrorCode', () => {
   it('maps every error class to a sanitized, queue-safe code', () => {
     const queueSafe = /^[a-z][a-z0-9_.:-]{2,63}$/;

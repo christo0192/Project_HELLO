@@ -182,12 +182,20 @@ paths:
     post:
       tags: [r1]
       operationId: getR1WorkerContext
-      responses: { '200': { description: Sanitized R1 worker context } }
+      description: 'Worker bearer. FAILS CLOSED: a failed read of the candidate, the attempt or the settings, or a missing attempt row, is 503 service_unavailable with no body of context, so the worker aborts or retries cleanly (context_failed) instead of starting with a seed-picked persona that differs from the one recorded on the attempt.'
+      responses:
+        '200': { description: Sanitized R1 worker context, including the server-assigned attempt (persona) }
+        '409': { description: The room is not a waiting or in-progress R1 browser session (r1_session). }
+        '503': { description: A required read failed (service_unavailable), or the worker secret is not configured (worker_auth_not_configured). }
   /api/internal/r1/usage:
     post:
       tags: [r1]
       operationId: writeR1Usage
-      responses: { '201': { description: Append-only R1 usage entry } }
+      description: 'Worker bearer. A candidate, agent or manual_test row may report at most 1830 seconds (the ledger bound); a larger finite value, for example a residency-timeout exit measured after the closing line, is CLAMPED to 1830 and recorded, never refused. A negative or non-finite value, an unknown participant kind, a bad event key or a stale clock is 400 invalid_usage. A preflight row is capped at 15 seconds and is not clamped.'
+      responses:
+        '201': { description: Append-only R1 usage entry }
+        '200': { description: Identical replay of an event key already recorded. }
+        '400': { description: Invalid usage entry (invalid_usage). }
   /api/internal/r1/admin-log:
     post:
       tags: [r1]
@@ -198,7 +206,7 @@ paths:
       tags: [r1]
       operationId: settleR1AttemptOutcome
       summary: Settle a worker-reported attempt outcome (worker bearer; idempotent)
-      description: 'Payload fixed by the R1 worker core (r1_persistence.py): attempt_id is the attempt session id and outcome is one of the worker outcomes. Applies plan decision D1 in one transaction (r1_settle_attempt): an attempt counts once TRANSITION has started; no-shows, early exits and system failures never count. A counted attempt also closes the round (status completed) in the same step. The attempt''s session must be settled: a terminal browser session of the attempt''s own round, and a completed one for outcome complete (409 r1_session_not_settled otherwise, nothing changes). 201 first settlement, 200 identical replay, 409 a different outcome for an already-settled attempt or a session that is not settled, 404 unknown attempt. Never gated on the R1 master switch.'
+      description: 'Payload fixed by the R1 worker core (r1_persistence.py): attempt_id is the attempt session id and outcome is one of the worker outcomes. Applies plan decision D1 in one transaction (r1_settle_attempt): an attempt counts once TRANSITION has started; no-shows, early exits and system failures never count. A counted attempt also closes the round (status completed) in the same step; a counted attempt whose session ended failed (the candidate left or the residency cap hit) is also queued for scoring in the same transaction, while the round holds a live consent, so HR gets a scorecard with a human_review recommendation instead of a dead-ended round. The attempt''s session must be settled: a terminal browser session of the attempt''s own round, and a completed one for outcome complete (409 r1_session_not_settled otherwise, nothing changes). 201 first settlement, 200 identical replay, 409 a different outcome for an already-settled attempt or a session that is not settled, 404 unknown attempt. Never gated on the R1 master switch.'
       requestBody:
         required: true
         content:

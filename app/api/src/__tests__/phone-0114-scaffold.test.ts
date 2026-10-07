@@ -85,10 +85,12 @@ describe('0114 registration', () => {
     expect(files.filter((f) => f.startsWith('0114_'))).toEqual(['0114_phone_outcome_integrity.sql']);
     // Same relaxation #329 applied to 0113. After 0114 only R1-lane migrations
     // (`_r1_` in the name) and the M013 S02 phone recording-integrity migration
-    // may follow, and the phone recording-integrity one is the newest file.
+    // may follow, and the phone recording-integrity one is the newest NON-R1 file (a later R1
+    // migration, e.g. 0126, may sit after it).
     const after = files.slice(files.indexOf('0114_phone_outcome_integrity.sql') + 1);
     expect(after.every((f) => /_r1_|_phone_recording_integrity\.sql$/.test(f))).toBe(true);
-    expect(files[files.length - 1]).toMatch(/_phone_recording_integrity\.sql$/);
+    const nonR1 = files.filter((f) => !/_r1_/.test(f));
+    expect(nonR1[nonR1.length - 1]).toMatch(/_phone_recording_integrity\.sql$/);
   });
 });
 

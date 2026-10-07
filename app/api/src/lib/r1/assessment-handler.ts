@@ -27,6 +27,7 @@ import type { QueueHandler, QueueHandlerResult } from '../queue/runner.js';
 import type { QueueJob } from '../queue/types.js';
 import { R1_BREAKER_COOLDOWN_MS } from './deepseek-runner.js';
 import {
+  R1_CONSENT_WITHDRAWN_CODE,
   runR1Assessment,
   type R1AssessmentOptions,
   type R1AssessmentResult,
@@ -98,6 +99,10 @@ export function createR1AssessmentHandler(
       options.onResult?.(result);
     } catch (error) {
       const code = error instanceof Error ? error.message : '';
+      // A withdrawal that landed between the settlement and this job stops all processing of the
+      // interview: complete the job without scoring. Retrying it would only dead-letter a
+      // correct decision as a Mission Control alert.
+      if (code === R1_CONSENT_WITHDRAWN_CODE) return;
       if (PROVIDER_UNAVAILABLE_CODES.has(code) && mayDefer(job, clock())) {
         return {
           outcome: 'defer',
