@@ -148,7 +148,7 @@ jobs:
           path: sbom-artifacts/*.cdx.json
           retention-days: 90
       - name: Compile LiveKit worker
-        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/gate_judge.py app/voice-livekit/noise_suppression.py app/voice-livekit/phone.py app/voice-livekit/phone_canary.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py app/voice-livekit/r1_context.py app/voice-livekit/r1_lines.py app/voice-livekit/r1_llm.py app/voice-livekit/r1_persistence.py app/voice-livekit/r1_phases.py app/voice-livekit/r1_routing.py app/voice-livekit/r1_session.py app/voice-livekit/r1_commitment.py app/voice-livekit/r1_content.py app/voice-livekit/r1_guard.py app/voice-livekit/r1_personas.py app/voice-livekit/r1_prompts.py app/voice-livekit/r1_roleplay.py app/voice-livekit/r1_scheduler.py app/voice-livekit/r1_script.py app/voice-livekit/r1_text.py app/voice-livekit/r1_tracker.py app/voice-livekit/r1_world.py
+        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/gate_judge.py app/voice-livekit/noise_suppression.py app/voice-livekit/phone.py app/voice-livekit/phone_canary.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py app/voice-livekit/r1_context.py app/voice-livekit/r1_lines.py app/voice-livekit/r1_llm.py app/voice-livekit/r1_persistence.py app/voice-livekit/r1_phases.py app/voice-livekit/r1_routing.py app/voice-livekit/r1_session.py app/voice-livekit/r1_commitment.py app/voice-livekit/r1_content.py app/voice-livekit/r1_guard.py app/voice-livekit/r1_personas.py app/voice-livekit/r1_prompts.py app/voice-livekit/r1_roleplay.py app/voice-livekit/r1_scheduler.py app/voice-livekit/r1_script.py app/voice-livekit/r1_text.py app/voice-livekit/r1_tracker.py app/voice-livekit/r1_world.py app/voice-livekit/r1_replies.py
       - name: Test LiveKit worker
         run: cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v
       # Phone RNNoise (noise_suppression.py): the bare-python step above SKIPS
@@ -203,7 +203,7 @@ jobs:
           /tmp/r1-sdk-venv/bin/pip install --no-cache-dir -q -r app/voice-livekit/requirements.txt "livekit-agents==1.6.4" "livekit==1.1.12"
           /tmp/r1-sdk-venv/bin/python -c "import importlib.metadata as m; assert m.version('livekit-agents') == '1.6.4' and m.version('livekit') == '1.1.12', 'SDK pins drifted'"
           cd app/voice-livekit
-          /tmp/r1-sdk-venv/bin/python -m unittest tests.test_r1_sdk_contract tests.test_r1_core tests.test_r1_fences -v > /tmp/r1-sdk-test.log 2>&1 || { cat /tmp/r1-sdk-test.log; exit 1; }
+          /tmp/r1-sdk-venv/bin/python -m unittest tests.test_r1_sdk_contract tests.test_r1_core tests.test_r1_fences tests.test_r1_commitment tests.test_r1_content_pin tests.test_r1_guard tests.test_r1_personas tests.test_r1_prompts tests.test_r1_roleplay tests.test_r1_scheduler tests.test_r1_script tests.test_r1_text tests.test_r1_tracker tests.test_r1_world tests.test_r1_integration -v > /tmp/r1-sdk-test.log 2>&1 || { cat /tmp/r1-sdk-test.log; exit 1; }
           cat /tmp/r1-sdk-test.log
           if grep -Eq '\.\.\. skipped|skipped=[0-9]+' /tmp/r1-sdk-test.log; then echo "::error::R1 SDK contract tests skipped"; exit 1; fi
       # R1 routing (tests/test_r1_routing.py): the only entrypoint routing and refuse-path

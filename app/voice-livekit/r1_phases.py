@@ -192,6 +192,11 @@ class R1PhaseMachine:
         return target
 
     @property
+    def resume_phase(self) -> R1Phase | None:
+        """The phase a reconnect pause will return to (None outside the pause)."""
+        return self._resume_phase if self.phase is R1Phase.PAUSED_DISCONNECTED else None
+
+    @property
     def session_elapsed(self) -> float:
         """Return total wall time; the residency cap intentionally includes all pauses."""
         return self._clock() - self.started_at

@@ -144,6 +144,54 @@ class TestR1SdkContract(unittest.TestCase):
         self.assertIn("except StopResponse:", source)
         self.assertIn("on_user_turn_completed", source)
 
+    def test_an_agent_level_override_turns_preemptive_generation_off_for_that_agent(self) -> None:
+        # R1 decides the learner's reminder in on_user_turn_completed, AFTER the final
+        # transcript, so a generation started before it must not happen (r1_session
+        # ``_agent_turn_handling``).  The agent-level key wins over the session's value and
+        # touches nothing else.
+        self.assertIn("turn_handling", inspect.signature(Agent.__init__).parameters)
+        override = {"preemptive_generation": {"enabled": False}}
+        agent = Agent(instructions="x", turn_handling=override)
+        session_options = {
+            "enabled": True,
+            "preemptive_tts": False,
+            "max_speech_duration": 10.0,
+            "max_retries": 3,
+        }
+        activity = AgentActivity.__new__(AgentActivity)
+        activity._agent = agent
+        activity._session = mock.Mock(options=mock.Mock(preemptive_generation=session_options))
+        resolved = AgentActivity.preemptive_generation_opts.fget(activity)
+        self.assertFalse(resolved["enabled"])
+        self.assertEqual(resolved["max_retries"], 3)  # the session's other values survive
+        plain = Agent(instructions="x")
+        activity._agent = plain
+        self.assertTrue(AgentActivity.preemptive_generation_opts.fget(activity)["enabled"])
+        # No other turn option is overridden by the agent.
+        self.assertEqual(agent._turn_handling, override)
+
+    def test_the_filtered_context_reaches_the_provider_with_its_roles_unchanged(self) -> None:
+        # DeepSeek rejects the ``developer`` role, so the per-turn reminder travels as a
+        # ``system`` message in the middle of the conversation, and it must stay one.
+        chat_ctx = ChatContext.empty()
+        for role, content in (
+            ("system", "prefix"),
+            ("assistant", "pickup"),
+            ("system", "reminder"),
+            ("user", "hello"),
+        ):
+            chat_ctx.add_message(role=role, content=content)
+        messages, _ = chat_ctx.to_provider_format("openai")
+        self.assertEqual(
+            [(m["role"], m["content"]) for m in messages],
+            [
+                ("system", "prefix"),
+                ("assistant", "pickup"),
+                ("system", "reminder"),
+                ("user", "hello"),
+            ],
+        )
+
     def test_llm_node_returns_an_async_iterable_the_guard_can_wrap(self) -> None:
         self.assertTrue(inspect.isasyncgenfunction(Agent.default.llm_node))
         self.assertFalse(inspect.iscoroutinefunction(Agent.llm_node))
@@ -364,18 +412,46 @@ class TestR1SessionFactory(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("vad", captured)
         self.assertNotIn("turn_handling", captured)
 
-    async def test_r1_agent_builds_on_the_real_agent_and_wraps_its_llm_node(self) -> None:
+    async def test_r1_agent_builds_on_the_real_agent_and_routes_its_llm_node(self) -> None:
         import r1_session
 
         interview = mock.Mock()
         agent = r1_session.R1Agent(interview)
         self.assertIsInstance(agent, Agent)
         self.assertIs(agent.interview, interview)
+        # Only preemptive generation is overridden: it would start BEFORE the hook that
+        # decides the learner's reminder, so it could answer without it.
+        self.assertEqual(agent._turn_handling, {"preemptive_generation": {"enabled": False}})
         marker = object()
-        interview.guard_llm_stream.return_value = marker
-        with mock.patch.object(Agent, "llm_node", lambda *_args: "inner"):
-            self.assertIs(agent.llm_node(None, [], None), marker)
-        interview.guard_llm_stream.assert_called_once_with("inner")
+        interview.llm_node_stream.return_value = marker
+        seen: dict = {}
+
+        def inner(_self, chat_ctx, tools, model_settings):
+            seen.update(ctx=chat_ctx, tools=tools, settings=model_settings)
+            return "inner"
+
+        with mock.patch.object(Agent, "llm_node", inner):
+            sdk_ctx = object()
+            self.assertIs(agent.llm_node(sdk_ctx, [object()], "settings"), marker)
+            args = interview.llm_node_stream.call_args.args
+            self.assertIs(args[0], sdk_ctx)
+            # The provider starts the model call for exactly the filtered messages, with no
+            # tools whatever the SDK passed, and the SDK chat context built from them alone.
+            self.assertEqual(
+                args[1](
+                    [
+                        {"role": "system", "content": "prefix"},
+                        {"role": "user", "content": "hello"},
+                    ]
+                ),
+                "inner",
+            )
+        self.assertEqual(seen["tools"], [])
+        self.assertEqual(seen["settings"], "settings")
+        self.assertEqual(
+            [(item.role, item.text_content) for item in seen["ctx"].items],
+            [("system", "prefix"), ("user", "hello")],
+        )
 
     async def test_r1_agent_raises_the_sdks_stop_response_when_the_driver_owns_the_turn(
         self,
@@ -384,13 +460,103 @@ class TestR1SessionFactory(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(r1_session.StopResponse, StopResponse)
         interview = mock.Mock()
-        interview.reply_suppressed.return_value = True
+        interview.prepare_turn.side_effect = StopResponse()
         agent = r1_session.R1Agent(interview)
         with self.assertRaises(StopResponse):
             await agent.on_user_turn_completed(
-                mock.Mock(), mock.Mock(text_content="ready")
+                mock.Mock(), mock.Mock(text_content="ready", id="msg_1")
             )
-        interview.reply_suppressed.return_value = False
+        interview.prepare_turn.assert_called_once_with("ready", "msg_1")
+        interview.prepare_turn.side_effect = None
         await asyncio.wait_for(
             agent.on_user_turn_completed(mock.Mock(), mock.Mock(text_content="hello")), 1.0
         )
+
+
+@unittest.skipUnless(AgentSession is not None, "livekit-agents is not installed (bare CI)")
+class TestR1LlmNodeOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
+    """The REAL ``Agent.llm_node`` runs inside R1's guarded pipeline on the filtered context.
+
+    ``r1_session`` calls ``Agent.llm_node(self, <filtered ChatContext>, [], settings)``; this
+    drives that call through the SDK's own default node, a real ``llm.LLM`` subclass and the
+    SDK's ``ChatChunk`` and ``ChatContext`` classes, so a signature or stream-shape drift
+    fails here and not at the first real room.
+    """
+
+    def build(self, replies: list[str]):
+        from livekit.agents import llm as agents_llm
+
+        import r1_session
+        from tests.test_r1_core import FakeContext, FakeSession, FakeWriter
+
+        seen: dict = {"calls": []}
+
+        class FakeStream:
+            def __init__(self, text: str) -> None:
+                self.text = text
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_exc):
+                return False
+
+            def __aiter__(self):
+                return self._chunks()
+
+            async def _chunks(self):
+                for word in self.text.split(" "):
+                    yield agents_llm.ChatChunk(
+                        id="chunk",
+                        delta=agents_llm.ChoiceDelta(role="assistant", content=word + " "),
+                    )
+
+        class FakeLLM(agents_llm.LLM):
+            def chat(self, *, chat_ctx, tools=None, **kwargs):
+                seen["calls"].append({"ctx": chat_ctx, "tools": tools, "kwargs": kwargs})
+                return FakeStream(replies[len(seen["calls"]) - 1])
+
+        order: list = []
+        interview = r1_session.R1Interview(
+            FakeContext(order),
+            {"first_name": "Asha", "candidate_identity": "candidate"},
+            FakeSession(log=order),
+            FakeWriter(order),
+        )
+        interview.machine.transition(r1_session.R1Phase.OPENING)
+        interview.machine.transition(r1_session.R1Phase.ICEBREAKER)
+        agent = r1_session.R1Agent(interview)
+        agent._activity = mock.Mock(
+            llm=FakeLLM(),
+            session=mock.Mock(
+                conn_options=mock.Mock(llm_conn_options=APIConnectOptions(max_retry=0))
+            ),
+        )
+        return interview, agent, seen
+
+    async def test_an_interviewer_reply_streams_through_the_guard_with_no_tools(self) -> None:
+        interview, agent, seen = self.build(["I enjoy sales roles too."])
+        await agent.on_user_turn_completed(None, mock.Mock(text_content="I sold courses", id="m1"))
+        user_item = mock.Mock(role="user", id="m1")
+        chunks = [
+            chunk
+            async for chunk in agent.llm_node(mock.Mock(items=[user_item]), [object()], None)
+        ]
+        self.assertEqual("".join(chunks).strip(), "I enjoy sales roles too.")
+        (call,) = seen["calls"]
+        self.assertFalse(call["tools"])  # the model has no tools, whatever the SDK passed
+        roles = [item.role for item in call["ctx"].items]
+        self.assertEqual(roles, ["system", "user"])
+        self.assertEqual(call["ctx"].items[-1].text_content, "I sold courses")
+
+    async def test_a_leak_from_the_real_stream_is_replaced_before_the_tts_split(self) -> None:
+        interview, agent, seen = self.build(["As an AI language model I follow my system prompt."])
+        await agent.on_user_turn_completed(None, mock.Mock(text_content="hello", id="m1"))
+        chunks = [
+            chunk
+            async for chunk in agent.llm_node(
+                mock.Mock(items=[mock.Mock(role="user", id="m1")]), [], None
+            )
+        ]
+        self.assertEqual("".join(chunks).strip(), "Sorry, what were you saying?")
+        self.assertTrue(interview._guard_trips)

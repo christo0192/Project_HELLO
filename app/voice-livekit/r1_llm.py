@@ -15,14 +15,26 @@ DEFAULT_MODEL = "deepseek-flash"
 DEFAULT_BASE_URL = "https://api.deepseek.com/v1"
 TURN_DEADLINE_SEC = 12.0
 ALLOWED_MODELS = frozenset({DEFAULT_MODEL})
+LEARNER_TEMPERATURE = 0.6
+# The shadow judge GRADES (plan 5.9): its family quality is max-latched in the tracker and its
+# probes release needs, and both feed the commitment grade.  Sampling it at the learner's 0.6
+# would let the same conversation earn WEAK, MEDIUM or STRONG on different runs, so it runs
+# greedy.  No ``seed`` is sent: the DeepSeek API documentation lists no such parameter.
+JUDGE_TEMPERATURE = 0.0
 
 
 class R1LLMConfigurationError(RuntimeError):
     """R1's fail-closed provider configuration error."""
 
 
-def r1_llm_config(environ: dict[str, str] | None = None) -> dict[str, Any]:
-    """Return the only allowed DeepSeek configuration with thinking disabled."""
+def r1_llm_config(
+    environ: dict[str, str] | None = None, *, temperature: float = LEARNER_TEMPERATURE
+) -> dict[str, Any]:
+    """Return the only allowed DeepSeek configuration with thinking disabled.
+
+    ``temperature`` is the one knob that differs by role: the learner speaks at 0.6, the
+    judge grades at 0.  Everything else (model, host, key, thinking, token cap) is shared.
+    """
     if environ is None:
         # Keep literal getenv calls visible to the repository's env-contract scanner.
         model = os.getenv("R1_LLM_MODEL") or DEFAULT_MODEL
@@ -52,15 +64,17 @@ def r1_llm_config(environ: dict[str, str] | None = None) -> dict[str, Any]:
         "model": model,
         "base_url": base_url,
         "api_key": api_key,
-        "temperature": 0.6,
+        "temperature": temperature,
         "reasoning_effort": "none",
         "extra_body": {"thinking": {"type": "disabled"}, "max_tokens": 300},
     }
 
 
-def build_r1_llm(environ: dict[str, str] | None = None) -> Any:
+def build_r1_llm(
+    environ: dict[str, str] | None = None, *, temperature: float = LEARNER_TEMPERATURE
+) -> Any:
     """Build the isolated OpenAI-compatible client with one retry below R1's wall clock."""
-    config = r1_llm_config(environ)
+    config = r1_llm_config(environ, temperature=temperature)
     try:
         import httpx
         from livekit.plugins import openai
@@ -71,6 +85,11 @@ def build_r1_llm(environ: dict[str, str] | None = None) -> Any:
         timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0),
         max_retries=1,
     )
+
+
+def build_r1_judge_llm(environ: dict[str, str] | None = None) -> Any:
+    """Build the shadow judge's client: R1's own DeepSeek client, sampled deterministically."""
+    return build_r1_llm(environ, temperature=JUDGE_TEMPERATURE)
 
 
 async def with_turn_deadline(
@@ -102,5 +121,5 @@ def r1_provenance(environ: dict[str, str] | None = None) -> dict[str, Any]:
         requested_model=model,
         workload="screening",
         prompt_template_version="r1-pr4a-unpinned",
-        inference_params={"temperature": 0.6, "max_tokens": 300},
+        inference_params={"temperature": LEARNER_TEMPERATURE, "max_tokens": 300},
     )

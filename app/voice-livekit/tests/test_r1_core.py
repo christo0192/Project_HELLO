@@ -420,7 +420,7 @@ class R1TestCase(unittest.IsolatedAsyncioTestCase):
         self.writer = FakeWriter(self.order)
         self.interview = R1Interview(
             self.ctx,
-            {"first_name": "Asha", "candidate_identity": "candidate"},
+            dict(self.LINE_CONTEXT),
             self.session,
             self.writer,
             clock=self.clock,
@@ -444,8 +444,15 @@ class R1TestCase(unittest.IsolatedAsyncioTestCase):
     def user_state(self, state: str) -> None:
         self.session.emit("user_state_changed", state_event(state))
 
+    # The context a case's interview is built from: the persona (and so the lead's name and
+    # city in the pickup and the transition line) is chosen from it.
+    LINE_CONTEXT = {"first_name": "Asha", "candidate_identity": "candidate"}
+
     def spoken_line(self, line_id: str) -> str:
-        return line(line_id, first_name="Asha")
+        """The line as the interview renders it (the persona fills the lead's name and city)."""
+        return R1Interview(
+            self.ctx, dict(self.LINE_CONTEXT), self.session, self.writer
+        ).render_line(line_id)
 
     async def flush(self) -> None:
         """Let queued transcript writes finish."""
@@ -2455,6 +2462,15 @@ class TestTeardownBudget(R1TestCase):
 class TestRunFlow(R1TestCase):
     """The whole phase machine, PRE_JOIN to complete, through an injected session factory."""
 
+    LINE_CONTEXT = {
+        "first_name": "Asha",
+        "candidate_identity": "candidate",
+        "round_id": "round",
+        "attempt_id": "attempt",
+        "attempt": {},
+        "settings": {},
+    }
+
     async def asyncSetUp(self) -> None:
         self.clock = Clock()
         self.order: list = []
@@ -2469,14 +2485,7 @@ class TestRunFlow(R1TestCase):
             return self.session
 
         async def fetch(_room):
-            return {
-                "first_name": "Asha",
-                "candidate_identity": "candidate",
-                "round_id": "round",
-                "attempt_id": "attempt",
-                "attempt": {},
-                "settings": {},
-            }
+            return dict(self.LINE_CONTEXT)
 
         self.session_factory = session_factory
         patches = [
