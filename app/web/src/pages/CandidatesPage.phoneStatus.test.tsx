@@ -256,7 +256,7 @@ describe('CandidatesPage phone status', () => {
         ...mockCandidate,
         id: 'c-dropped',
         name: 'Dropped Dora',
-        // The 0118 relabel leaves the stored status `screening`, never `queued`.
+        // The 0125 relabel leaves the stored status `screening`, never `queued`.
         status: 'screening',
         dial_count: 2,
         phone_state: 'failed',

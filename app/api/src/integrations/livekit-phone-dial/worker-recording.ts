@@ -68,11 +68,11 @@ export function workerRecordingEgressId(attemptId: string): string {
  */
 export const LEG_TIMING_BEFORE_ANSWER_SLACK_MS = 30_000;
 export const LEG_TIMING_AFTER_NOW_SLACK_MS = 60_000;
-/** 0118 `recording_duration_ms` CHECK: 1 ms to 24 h. */
+/** 0125 `recording_duration_ms` CHECK: 1 ms to 24 h. */
 export const LEG_TIMING_MAX_DURATION_MS = 86_400_000;
-/** 0118 `observed_ended_at` CHECK floor: `admitted_at − 5 min`. */
+/** 0125 `observed_ended_at` CHECK floor: `admitted_at − 5 min`. */
 const OBSERVED_END_ADMITTED_FLOOR_MS = 5 * 60_000;
-/** 0118 `recording_started_at_ms` CHECK: [2020-01-01, 2100-01-01). */
+/** 0125 `recording_started_at_ms` CHECK: [2020-01-01, 2100-01-01). */
 const EPOCH_MS_CHECK_MIN = 1_577_836_800_000;
 const EPOCH_MS_CHECK_MAX = 4_102_444_800_000;
 
@@ -143,7 +143,7 @@ function isoMs(value: string | null): number | null {
  *     by the ledger's `ended_at` when the attempt has ended
  *     (`least(coalesce(existing, new), new)` with `new = min(leg_end, ended_at)`);
  *   - every other column is first-write-wins (`coalesce(existing, new)`).
- * A value outside the sanity window or the 0118 CHECK ranges is dropped and
+ * A value outside the sanity window or the 0125 CHECK ranges is dropped and
  * reported, never written.
  */
 export function planAttemptLegTimingStamp(
@@ -197,7 +197,7 @@ export function planAttemptLegTimingStamp(
     }
   }
 
-  // recording_duration_ms — first write wins, within the 0118 CHECK.
+  // recording_duration_ms — first write wins, within the 0125 CHECK.
   if (typeof report.durationMs === 'number' && Number.isFinite(report.durationMs)) {
     const duration = Math.trunc(report.durationMs);
     if (duration < 1 || duration > LEG_TIMING_MAX_DURATION_MS) dropped.push('duration_out_of_range');

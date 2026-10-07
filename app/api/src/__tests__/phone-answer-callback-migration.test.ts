@@ -38,11 +38,11 @@ const OWNED = [
 describe('0113 — harness registration', () => {
   const idx = (name: string): number => PHONE_MIGRATIONS.findIndex((m) => m.name === name);
 
-  it('is the newest entry after 0118 and 0114, ahead of every migration whose body it lifts', () => {
+  it('is the newest entry after 0125 and 0114, ahead of every migration whose body it lifts', () => {
     // 0114 (M009 PR-C) re-lifts apply_phone_event, finalize and sweep FROM
-    // 0113, and 0118 (M013 S02) re-lifts finalize from 0114, so those two sit
+    // 0113, and 0125 (M013 S02) re-lifts finalize from 0114, so those two sit
     // first; 0113 stays directly behind them.
-    expect(PHONE_MIGRATIONS[0].name).toBe('0118');
+    expect(PHONE_MIGRATIONS[0].name).toBe('0125');
     expect(PHONE_MIGRATIONS[1].name).toBe('0114');
     expect(PHONE_MIGRATIONS[2].name).toBe('0113');
     for (const older of ['0112', '0095', '0073', '0045']) {

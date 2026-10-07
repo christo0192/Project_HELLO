@@ -1094,7 +1094,7 @@ export type CompletePhoneEngagementAfterLateScoreStatus =
   (typeof COMPLETE_PHONE_ENGAGEMENT_AFTER_LATE_SCORE_STATUSES)[number];
 
 // ═══════════════════════════════════════════════════════════════════════
-// 0118 §5 (M013 S02, T06) — the zero-answer relabel, OUTSIDE the store-layer
+// 0125 §5 (M013 S02, T06) — the zero-answer relabel, OUTSIDE the store-layer
 // contract
 // ═══════════════════════════════════════════════════════════════════════
 //
@@ -1103,10 +1103,10 @@ export type CompletePhoneEngagementAfterLateScoreStatus =
 // break the store bijection. It is called directly by the phone assessment
 // handler (`phone-runtime/assessment-handler.ts`) with the system actor, and
 // once by an operator for the historical 9f60523d correction.
-// `phone-0118-relabel.test.ts` asserts every entry below against the 0118
+// `phone-0125-relabel.test.ts` asserts every entry below against the 0125
 // signature and body.
 
-/** 0118 §5 RPC with no store adapter, with its exact parameter names. */
+/** 0125 §5 RPC with no store adapter, with its exact parameter names. */
 export const PHONE_RELABEL_RPC_PARAMETERS = Object.freeze({
   relabel_zero_answer_phone_engagement: ['p_engagement_id', 'p_actor_id', 'p_now'],
 } as const satisfies Record<string, readonly string[]>);
@@ -1126,7 +1126,7 @@ export const RELABEL_ZERO_ANSWER_PHONE_ENGAGEMENT_STATUSES = [
 export type RelabelZeroAnswerPhoneEngagementStatus =
   (typeof RELABEL_ZERO_ANSWER_PHONE_ENGAGEMENT_STATUSES)[number];
 
-/** The engagement `state_reason` the relabel writes (0118 §5). */
+/** The engagement `state_reason` the relabel writes (0125 §5). */
 export const SCREENING_ABANDONED_REASON = 'screening_abandoned' as const;
 
 // ═══════════════════════════════════════════════════════════════════════

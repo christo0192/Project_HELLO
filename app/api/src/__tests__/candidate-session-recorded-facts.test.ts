@@ -151,7 +151,7 @@ describe('candidate detail: per-session recorded facts (M013 S02 T07)', () => {
       connected_complete: false,
       connected_total_sec: null,
     });
-    // duration_sec is passed through untouched (0118 recomputes it); the new
+    // duration_sec is passed through untouched (0125 recomputes it); the new
     // facts never repeat it as a call length.
     for (const key of ['recorded_total_sec', 'connected_total_sec']) {
       expect(session[key]).not.toBe(443);

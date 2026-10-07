@@ -719,7 +719,7 @@ sessionDetails[LEGACY_SESSION_ID].transcript = legacyTurns.map((t) => {
   return { ...t, start_offset_sec: null, started_at_ms: Math.round(startedAt) };
 });
 Object.assign(legacySession, {
-  // 0118: the unobserved reconnect is left out of duration_sec.
+  // 0125: the unobserved reconnect is left out of duration_sec.
   duration_sec: LEGACY_A_CONNECTED_SEC,
   duration_unobserved_legs: 1,
   recorded_total_sec: Math.round((LEGACY_A_RECORDED_SEC + LEGACY_B_RECORDED_SEC) * 10) / 10,

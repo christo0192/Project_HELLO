@@ -21,7 +21,7 @@
 --     residue's illegal re-transition;
 --   * idempotency / no-re-score: once an assessment row exists for the crash
 --     session, a re-run no longer selects it;
---   * 0118 §4: the HELD session (engagement `reconnecting`) is not selected
+--   * 0125 §4: the HELD session (engagement `reconnecting`) is not selected
 --     and stays in_progress while the reconnect is pending.
 --
 -- Raises (and therefore fails the suite) on any violation.
@@ -134,7 +134,7 @@ begin
     raise exception 'pf72: control session status = %, expected in_progress (still within grace)', v_ctrl_status;
   end if;
 
-  -- 0118 §4: the HELD session (engagement `reconnecting`, a reconnect still
+  -- 0125 §4: the HELD session (engagement `reconnecting`, a reconnect still
   -- pending) was NOT selected although its attempt ended past the grace: it
   -- stays in_progress so the reconnect can continue it.
   select status into v_held_status
@@ -206,7 +206,7 @@ begin
   end if;
 
   -- ── CRASH entry: transitioned=false, worker_crash. ──
-  -- 0118 §4 keeps worker_crash here: the abandoned attempt shows no teardown
+  -- 0125 §4 keeps worker_crash here: the abandoned attempt shows no teardown
   -- evidence (no verified upload, no completed egress, no observed leave).
   if (v_crash_entry->>'transitioned')::boolean is not false then
     raise exception 'pf72: expected transitioned=false for the crash residue (already terminal)';

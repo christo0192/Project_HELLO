@@ -41,7 +41,7 @@ export type EvidenceGradeValue = (typeof EVIDENCE_GRADES)[number];
  *   no_candidate_speech  — the candidate said nothing in the scored section;
  *   infra_interrupted    — insufficient, and the call was killed by our side
  *                          (`worker_crash`), not by the candidate. An
- *                          `unobserved_disconnect` (0118) is NOT our side;
+ *                          `unobserved_disconnect` (0125) is NOT our side;
  *   partial_thin         — insufficient partial, any other disconnect;
  *   no_plan              — partial, and the session has no question plan;
  *   evidence_read_failed — the coverage read failed twice (fail closed).
@@ -80,7 +80,7 @@ export const ANSWERED_DISPOSITIONS: readonly string[] = [
 export const INFRA_DISCONNECT_REASON = 'worker_crash';
 
 /**
- * 0118 §4: a leg ended by the lease reclaim (or a lapsed lease) that still
+ * 0125 §4: a leg ended by the lease reclaim (or a lapsed lease) that still
  * shows TEARDOWN EVIDENCE — a verified recording upload, a completed egress or
  * the worker's observed SIP leave — so the worker was alive at the end and the
  * line simply dropped unobserved. NOT an infrastructure fault: it grades like
@@ -89,7 +89,7 @@ export const INFRA_DISCONNECT_REASON = 'worker_crash';
 export const UNOBSERVED_DISCONNECT_REASON = 'unobserved_disconnect';
 
 /**
- * Every `disconnect_reason` partial-finalize can report (0072 → 0118 §4), in
+ * Every `disconnect_reason` partial-finalize can report (0072 → 0125 §4), in
  * the order its CASE decides them. Carried as a free string end to end (job
  * payload, `raw.partial.disconnect_reason`, the runtime log's `error_type`),
  * so an older API reading a newer token degrades safely: only

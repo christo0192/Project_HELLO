@@ -108,7 +108,7 @@ describe('gradeEvidence — the rule table', () => {
       .toBe('infra_interrupted');
   });
 
-  it('0118 unobserved_disconnect is NOT an infrastructure fault (only worker_crash is)', () => {
+  it('0125 unobserved_disconnect is NOT an infrastructure fault (only worker_crash is)', () => {
     // A reclaimed leg with teardown evidence: the line dropped unobserved, our
     // side was alive. 0 answers grades no_candidate_speech, never
     // infra_interrupted; a thin partial grades partial_thin.

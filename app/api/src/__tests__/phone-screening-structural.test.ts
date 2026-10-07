@@ -383,7 +383,7 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       'lib/phone-runtime/due-loop.ts',
       'lib/phone-runtime/read.ts',
       'lib/phone-runtime/runtime.ts',
-      // M013 S02 (T06) — the phone assessment handler calls the 0118
+      // M013 S02 (T06) — the phone assessment handler calls the 0125
       // `relabel_zero_answer_phone_engagement` RPC. It imports the domain
       // core only for that RPC's pinned constants (`SCREENING_ABANDONED_REASON`
       // in rpc-contract) and the system actor sentinel (`PHONE_SYSTEM_ACTOR`):

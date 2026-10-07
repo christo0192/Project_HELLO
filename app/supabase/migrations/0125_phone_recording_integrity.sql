@@ -1,8 +1,8 @@
 -- =====================================================================
--- 0118 — Phone recording and call-record integrity (M013 / S02, PR-2).
+-- 0125 — Phone recording and call-record integrity (M013 / S02, PR-2).
 --
 -- FORWARD-ONLY. ONE migration in numbered sections, each filled only by the
--- task that owns it, strictly between its own `-- ==== 0118 §N BEGIN ====` /
+-- task that owns it, strictly between its own `-- ==== 0125 §N BEGIN ====` /
 -- `END` markers:
 --
 --   §1  Leg-timing columns (T03). phone_call_attempts gains
@@ -39,7 +39,7 @@
 --       (0114) is lifted in full so the relabel also converges when that
 --       sweep completes the engagement after the handler ran.
 --
--- Numbered 0118: origin/main took 0115-0117 for the R1 lane (_r1_ files,
+-- Numbered 0125: origin/main took 0115-0117 for the R1 lane (_r1_ files,
 -- which touch no phone function, trigger or table this file reads). No other
 -- migration may re-declare the functions this file owns.
 --
@@ -66,7 +66,7 @@
 set local lock_timeout = '10s';
 
 
--- ==== 0118 §1 BEGIN ====
+-- ==== 0125 §1 BEGIN ====
 -- ─────────────────────────────────────────────────────────────────────
 -- §1a — per-leg timing facts on phone_call_attempts.
 --
@@ -129,26 +129,26 @@ alter table screening_v2.phone_call_attempts
   );
 
 comment on column screening_v2.phone_call_attempts.observed_ended_at is
-  '0118: the leg end the worker observed (SIP participant left), from /recording/complete '
+  '0125: the leg end the worker observed (SIP participant left), from /recording/complete '
   'leg_ended_at_ms when leg_end_source = sip_left (a session-close or teardown mark is never '
   'stamped). NULL when unobserved. Data only: never causes a state transition, and the API '
   'keeps the earliest value. A reclaimed leg with this NULL has no known end.';
 comment on column screening_v2.phone_call_attempts.recording_started_at_ms is
-  '0118: epoch ms of t = 0 in this leg''s recording file (worker clock). Used to place '
+  '0125: epoch ms of t = 0 in this leg''s recording file (worker clock). Used to place '
   'transcript turns on the leg''s audio. Data only.';
 comment on column screening_v2.phone_call_attempts.recording_duration_ms is
-  '0118: true audio length of this leg''s uploaded recording, in ms (samples encoded / rate). '
+  '0125: true audio length of this leg''s uploaded recording, in ms (samples encoded / rate). '
   'NULL when unknown; never 0. Data only.';
 comment on column screening_v2.phone_call_attempts.recording_tail_flushed is
-  '0118: true only when the worker''s tail flush ran and the recorder closed cleanly. '
+  '0125: true only when the worker''s tail flush ran and the recorder closed cleanly. '
   'NULL/false means the recording may end a few seconds before the call did. Data only.';
 
 -- ─────────────────────────────────────────────────────────────────────
 -- §1b — call_sessions.duration_unobserved_legs.
 --
 -- How many answered legs §3 EXCLUDED from duration_sec because their only end
--- was the lease-reclaim time. NULL = never computed by the 0118 rule (a
--- session completed before 0118 and untouched by the §3 backfill, or not a
+-- was the lease-reclaim time. NULL = never computed by the 0125 rule (a
+-- session completed before 0125 and untouched by the §3 backfill, or not a
 -- phone session); 0 = every answered leg's end was observed or bounded by the
 -- session's own end.
 -- ─────────────────────────────────────────────────────────────────────
@@ -163,13 +163,13 @@ alter table screening_v2.call_sessions
   );
 
 comment on column screening_v2.call_sessions.duration_unobserved_legs is
-  '0118: answered phone legs excluded from duration_sec because their end was never '
-  'observed (lease reclaim, no observed_ended_at). NULL = not computed by the 0118 rule. '
+  '0125: answered phone legs excluded from duration_sec because their end was never '
+  'observed (lease reclaim, no observed_ended_at). NULL = not computed by the 0125 rule. '
   'When > 0, duration_sec is a lower bound, or NULL if no leg end was observed.';
--- ==== 0118 §1 END ====
+-- ==== 0125 §1 END ====
 
 
--- ==== 0118 §2 BEGIN ====
+-- ==== 0125 §2 BEGIN ====
 -- ─────────────────────────────────────────────────────────────────────
 -- §2 — room_name stamp on phone_call_attempts.
 --
@@ -223,7 +223,7 @@ on screening_v2.phone_call_attempts
 for each row execute function screening_v2.stamp_phone_attempt_room_name();
 
 comment on function screening_v2.stamp_phone_attempt_room_name() is
-  '0118: fills phone_call_attempts.room_name with the deterministic phone room '
+  '0125: fills phone_call_attempts.room_name with the deterministic phone room '
   '(phone-<session_id>) when a leg is bound to a session and has no room name, so the '
   'reconciler can observe reconnect legs. Never overwrites an existing room_name.';
 
@@ -233,10 +233,10 @@ update screening_v2.phone_call_attempts
    set room_name = 'phone-' || session_id::text
  where session_id is not null
    and room_name is null;
--- ==== 0118 §2 END ====
+-- ==== 0125 §2 END ====
 
 
--- ==== 0118 §3 BEGIN ====
+-- ==== 0125 §3 BEGIN ====
 -- ─────────────────────────────────────────────────────────────────────
 -- §3a — phone_session_leg_duration: the ONE rule for a phone session's
 -- connected time, shared by the trigger (§3b) and the backfill (§3c) so the
@@ -316,9 +316,9 @@ grant execute on function screening_v2.phone_session_leg_duration(uuid, timestam
   to service_role;
 
 comment on function screening_v2.phone_session_leg_duration(uuid, timestamptz) is
-  '0118: connected seconds of a phone session summed over its answered legs, each ending at '
+  '0125: connected seconds of a phone session summed over its answered legs, each ending at '
   'its observed end when known; a leg ended only by the lease reclaim is excluded and '
-  'counted. duration_sec NULL = unknown. Shared by set_phone_session_duration and the 0118 '
+  'counted. duration_sec NULL = unknown. Shared by set_phone_session_duration and the 0125 '
   'backfill. Reads no clock; service-role-only.';
 
 -- ─────────────────────────────────────────────────────────────────────
@@ -371,7 +371,7 @@ grant execute on function screening_v2.set_phone_session_duration()
   to service_role;
 
 comment on function screening_v2.set_phone_session_duration() is
-  '0118 (from 0076): on first completion of a phone session, sets duration_sec from '
+  '0125 (from 0076): on first completion of a phone session, sets duration_sec from '
   'phone_session_leg_duration (observed leg ends preferred; reclaim-only ends excluded and '
   'counted in duration_unobserved_legs; NULL when no end was observed). Preserves an '
   'existing duration_sec; service-role-only.';
@@ -381,9 +381,9 @@ comment on function screening_v2.set_phone_session_duration() is
 --
 -- The trigger fires only on first completion and keeps an existing value, so
 -- history must be corrected explicitly. Scope: completed phone sessions the
--- 0118 rule has never computed (duration_unobserved_legs IS NULL) that have
+-- 0125 rule has never computed (duration_unobserved_legs IS NULL) that have
 -- at least one unobserved leg. Everything else keeps its 0076 value, which is
--- what the 0118 rule gives anyway when no leg is unobserved and no
+-- what the 0125 rule gives anyway when no leg is unobserved and no
 -- observed_ended_at exists yet (every row before this migration).
 --
 -- Idempotent: a backfilled row has duration_unobserved_legs >= 1, so a second
@@ -415,16 +415,16 @@ update screening_v2.call_sessions s
        and d.unobserved_legs > 0
   ) t
  where s.id = t.id;
--- ==== 0118 §3 END ====
+-- ==== 0125 §3 END ====
 
 
--- ==== 0118 §4 BEGIN ====
+-- ==== 0125 §4 BEGIN ====
 -- ─────────────────────────────────────────────────────────────────────
 -- §4 — finalize_phone_partial_sessions: the reconnect guard and the
 -- truthful disconnect label (T05, S02-4). Lifted IN FULL from 0114 §3 (the
 -- newest declaration: 0113's E4 callback flag and 0114's C2/C7 hunks live
--- there). Every 0114 line is kept byte-for-byte; 0118 only ADDS four marked
--- hunks (`-- ▼ 0118 <id>` … `-- ▲ 0118 <id>`), and phone-0118-finalize.test.ts
+-- there). Every 0114 line is kept byte-for-byte; 0125 only ADDS four marked
+-- hunks (`-- ▼ 0125 <id>` … `-- ▲ 0125 <id>`), and phone-0125-finalize.test.ts
 -- proves that stripping them restores the 0114 body exactly.
 --
 --   S02-4 declare        the named hold bound, v_reconnect_hold = 30 min;
@@ -437,7 +437,7 @@ update screening_v2.call_sessions s
 --
 -- The session transition, the scoring keys, the C2 suppression and the C7
 -- withdrawn path are unchanged. Behaviour is proven on real Postgres by
--- app/supabase/tests/phone_0118_finalize.sql (scripts/test-phone-0118.sh)
+-- app/supabase/tests/phone_0125_finalize.sql (scripts/test-phone-0125.sh)
 -- and phone_partial_finalize_{setup,assert}.sql (scripts/supabase-test.sh).
 -- ─────────────────────────────────────────────────────────────────────
 create or replace function screening_v2.finalize_phone_partial_sessions(
@@ -475,12 +475,12 @@ declare
   v_withdrawn_skipped integer := 0;
   v_suppress          text;
   -- ▲ 0114 C2/C7 declare
-  -- ▼ 0118 S02-4 declare
+  -- ▼ 0125 S02-4 declare
   -- S02-4: how long a PENDING RECONNECT may hold a session out of this sweep,
   -- measured from the end (or lapsed lease) of the session's latest bound
   -- leg. A named bound, not an open-ended wait: see the reconnect guard.
   v_reconnect_hold constant interval := interval '30 minutes';
-  -- ▲ 0118 S02-4 declare
+  -- ▲ 0125 S02-4 declare
   v_sessions jsonb := '[]'::jsonb;
 begin
   for v_row in
@@ -497,12 +497,12 @@ begin
            a.outcome_class as attempt_outcome,
            a.ended_at      as attempt_ended_at,
            a.lease_expires_at
-           -- ▼ 0118 S02-4 label columns
+           -- ▼ 0125 S02-4 label columns
            -- S02-4: the leg's TEARDOWN EVIDENCE, read by the disconnect label
            -- below. Each is written only by a worker or egress that saw the
            -- leg end: a verified recording upload (0107 recording_ready), a
            -- completed egress OF THIS LEG, or the worker's observed SIP leave
-           -- (0118 §1, stamped from /recording/complete). The egress ids
+           -- (0125 §1, stamped from /recording/complete). The egress ids
            -- tell a leg's own egress from the session's: 0062's projection
            -- copies the SESSION's egress id/status onto every bound attempt
            -- whose egress_id is NULL or equal, so a crashed reconnect leg
@@ -512,7 +512,7 @@ begin
            , a.egress_id         as attempt_egress_id
            , s.recording_egress_id as session_egress_id
            , a.observed_ended_at as attempt_observed_ended_at
-           -- ▲ 0118 S02-4 label columns
+           -- ▲ 0125 S02-4 label columns
       from screening_v2.call_sessions s
       -- The LATEST attempt on this session decides whether the call is over.
       -- A session is adopted across a no-answer ladder, so join the newest by
@@ -584,7 +584,7 @@ begin
             and coalesce(a.ended_at, a.lease_expires_at)
                   <= p_now - (v_grace * interval '1 second'))
        )
-       -- ▼ 0118 S02-4 reconnect guard
+       -- ▼ 0125 S02-4 reconnect guard
        -- A RECONNECT IS STILL PENDING, so the call is not over. 9f60523d: the
        -- reconnect leg was reclaimed, the engagement was `dialing` the next
        -- reconnect, and this sweep completed and scored the session in the
@@ -609,7 +609,7 @@ begin
        -- (or its lapsed lease). An engagement wedged in `reconnecting` or
        -- `dialing` therefore cannot keep a session out of scoring and the
        -- MP3 transition for ever: once the bound passes, the session is
-       -- selected exactly as before 0118. The normal exit is the engagement
+       -- selected exactly as before 0125. The normal exit is the engagement
        -- leaving those states (a failed reconnect goes `eligible` within a
        -- minute); a consent.resumed reconnect binds its leg, which then
        -- becomes the latest bound leg and is live, so nothing is selected.
@@ -617,7 +617,7 @@ begin
        -- Known residue, NOT covered: a drop outside the IST window parks the
        -- engagement in `scheduled`/window_closed (a next-day reconnect).
        -- That is not a guarded state, so such a session still finalizes
-       -- before the reconnect, as it did before 0118 (owner follow-up).
+       -- before the reconnect, as it did before 0125 (owner follow-up).
        and not (
          coalesce(a.ended_at, a.lease_expires_at) is not null
          and p_now < coalesce(a.ended_at, a.lease_expires_at) + v_reconnect_hold
@@ -634,7 +634,7 @@ begin
                         and na.state in ('admitted','ringing','answered_unclassified',
                                          'human','machine'))))
        )
-       -- ▲ 0118 S02-4 reconnect guard
+       -- ▲ 0125 S02-4 reconnect guard
      order by s.started_at asc
      limit v_limit
      for update of s skip locked
@@ -701,11 +701,11 @@ begin
         then 'worker_crash'
       else 'disconnected'
     end;
-    -- ▼ 0118 S02-4 label
+    -- ▼ 0125 S02-4 label
     -- A FOURTH token, 'unobserved_disconnect'. `worker_crash` claimed our
     -- side died, but the lease reclaim (or a lapsed lease) is also how a leg
     -- ends when the CANDIDATE hung up and nothing reported it (the reconnect
-    -- leg's room was invisible to the reconciler before 0118 §2). When the
+    -- leg's room was invisible to the reconciler before 0125 §2). When the
     -- leg shows teardown evidence (a verified recording upload, a completed
     -- egress, or an observed SIP leave), the worker was alive at the end, so
     -- the truthful label is "the line dropped and we did not observe it".
@@ -726,7 +726,7 @@ begin
             or v_row.attempt_observed_ended_at is not null) then
       v_reason := 'unobserved_disconnect';
     end if;
-    -- ▲ 0118 S02-4 label
+    -- ▲ 0125 S02-4 label
 
     -- ── 0095 / issue #286: DID A SCREENING ACTUALLY HAPPEN? ───────────
     -- The sweep already knew — it selects `covered` and reads the plan's
@@ -910,15 +910,15 @@ comment on function screening_v2.finalize_phone_partial_sessions is
   'candidate.opt_out on the leg) is cancelled, never completed or returned '
   '(withdrawn_skipped); a leg phone_attempt_score_suppression withholds is '
   'still completed for its MP3 and reported score_suppressed/suppress_reason '
-  'so the caller never scores it. 0118: a session whose bound engagement is '
+  'so the caller never scores it. 0125: a session whose bound engagement is '
   'reconnecting/dialing, or has a live leg newer than the session''s latest '
   'bound leg, is not selected for up to 30 minutes after that leg ended; '
   'disconnect_reason is unobserved_disconnect (not worker_crash) when a '
   'reclaimed or lease-lapsed leg shows teardown evidence. Service-role-only.';
--- ==== 0118 §4 END ====
+-- ==== 0125 §4 END ====
 
 
--- ==== 0118 §5 BEGIN ====
+-- ==== 0125 §5 BEGIN ====
 -- ─────────────────────────────────────────────────────────────────────
 -- §5 — The zero-answer relabel (T06, S02-4 / S02-6 mechanism).
 --
@@ -937,7 +937,7 @@ comment on function screening_v2.finalize_phone_partial_sessions is
 --
 --   §5a enforce_phone_engagement_transition — LIFTED IN FULL from 0114 §2
 --       (the newest declaration: 0045 plus the 0114 C2 late-score hunk).
---       BYTE-IDENTICAL to 0114 apart from ONE marked hunk (`▼ 0118`), placed
+--       BYTE-IDENTICAL to 0114 apart from ONE marked hunk (`▼ 0125`), placed
 --       after the C2 exception and before the terminal-immutability raise:
 --       completed -> failed/screening_abandoned. The phone-0114-* tests read
 --       the NEWEST declaration, so the C2 hunk and the transition table must
@@ -1020,8 +1020,8 @@ begin
     return new;
   end if;
   -- ▲ 0114 C2 late-score exception
-  -- ▼ 0118 S02-4 zero-answer relabel
-  -- THE SECOND EXCEPTION to terminal immutability (0118 §5). A phone
+  -- ▼ 0125 S02-4 zero-answer relabel
+  -- THE SECOND EXCEPTION to terminal immutability (0125 §5). A phone
   -- screening in which the candidate answered NONE of the planned questions
   -- was completed and read "Screened" (9f60523d: 0 of 5). The truth is that
   -- it was abandoned before screening (M013 D1). Allowed only as a relabel,
@@ -1035,7 +1035,7 @@ begin
   --     evidence_answered = 0. NULL (unmeasured) never qualifies, nor does a
   --     browser row, a `decision` grade or one answered question;
   --   * the transaction-local GUC screening_v2.zero_answer_relabel names this
-  --     engagement. Only relabel_zero_answer_phone_engagement (0118 §5b) sets
+  --     engagement. Only relabel_zero_answer_phone_engagement (0125 §5b) sets
   --     it, but ANY writer can call set_config: it is defence in depth that
   --     keeps an accidental UPDATE out, NOT a security boundary.
   -- It can never be flipped back: the C2 exception above matches only
@@ -1062,7 +1062,7 @@ begin
                     and l.evidence_answered = 0) then
     return new;
   end if;
-  -- ▲ 0118 S02-4 zero-answer relabel
+  -- ▲ 0125 S02-4 zero-answer relabel
   if old.terminal_at is not null and new is distinct from old then
     raise exception 'phone engagement % is terminal (%) and immutable', old.id, old.state
       using errcode = 'P0001';
@@ -1127,7 +1127,7 @@ comment on function screening_v2.enforce_phone_engagement_transition is
   'change: (0114) failed/assessment_aborted -> '
   'completed/late_score_after_stranded_abort when a phone assessment exists '
   'for the bound session and the abort was the stranded sweep''s own ledger '
-  'row; (0118) completed -> failed/screening_abandoned when the bound '
+  'row; (0125) completed -> failed/screening_abandoned when the bound '
   'session''s latest assessment is a phone row graded insufficient with a '
   'measured evidence_answered = 0 and the transaction-local GUC '
   'screening_v2.zero_answer_relabel names the engagement (set only by '
@@ -1157,7 +1157,7 @@ comment on function screening_v2.enforce_phone_engagement_transition is
 --      this truthfully: phone_engagement_late_completed would read
 --      "completed") and `candidate_status_changed` on the candidate, both
 --      with metadata {from, to, reason: 'screening_abandoned',
---      migration: '0118'}. Opaque ids and stable codes only, no PII.
+--      migration: '0125'}. Opaque ids and stable codes only, no PII.
 -- It NEVER requeues, rescreens, creates an attempt, a ledger row or a queue
 -- job, and never touches the Ashby link.
 --
@@ -1265,7 +1265,7 @@ begin
     (p_actor_id, v_actor_type, 'screening_failed', 'phone_engagement',
      v_eng.id::text, 'success',
      jsonb_build_object('from', 'completed', 'to', 'failed',
-                        'reason', 'screening_abandoned', 'migration', '0118',
+                        'reason', 'screening_abandoned', 'migration', '0125',
                         'session_id', v_eng.session_id),
      p_now);
 
@@ -1298,7 +1298,7 @@ begin
       (p_actor_id, v_actor_type, 'candidate_status_changed', 'candidate',
        v_asm_cand::text, 'success',
        jsonb_build_object('from', 'screened', 'to', 'screening',
-                          'reason', 'screening_abandoned', 'migration', '0118'),
+                          'reason', 'screening_abandoned', 'migration', '0125'),
        p_now);
   end if;
 
@@ -1315,21 +1315,21 @@ grant execute on function screening_v2.relabel_zero_answer_phone_engagement(uuid
   to service_role;
 
 comment on function screening_v2.relabel_zero_answer_phone_engagement is
-  '0118 (M013 S02, D1): relabels a completed phone engagement whose bound '
+  '0125 (M013 S02, D1): relabels a completed phone engagement whose bound '
   'session''s latest assessment is a phone row graded insufficient with a '
   'measured evidence_answered = 0 -> failed/screening_abandoned (terminal_at '
   'and every other column unchanged), and moves the candidate screened -> '
   'screening (never queued) under the 0114 §4e guards (latest assessment, not '
   'decision-blocked, no human status change since). Audits screening_failed '
   '(phone_engagement) and candidate_status_changed with metadata {from, to, '
-  'reason: screening_abandoned, migration: 0118}. Never requeues, rescreens, '
+  'reason: screening_abandoned, migration: 0125}. Never requeues, rescreens, '
   'creates an attempt, ledger row or job, or touches the Ashby link. '
   'Idempotent: applied | already | not_eligible (reason). Service-role-only.';
 -- §5c ── sweep_phone_stranded_sessions: the relabel converges in SQL ────
 -- LIFTED IN FULL from 0114 §3 (the newest declaration: 0113's E4 callback
 -- guard and 0114's C2-P4/C2-P5 hunks live there). Every 0114 line is kept
--- byte-for-byte; 0118 only ADDS four marked hunks (`-- ▼ 0118 <id>` …
--- `-- ▲ 0118 <id>`), and phone-0118-relabel.test.ts proves that stripping
+-- byte-for-byte; 0125 only ADDS four marked hunks (`-- ▼ 0125 <id>` …
+-- `-- ▲ 0125 <id>`), and phone-0125-relabel.test.ts proves that stripping
 -- them restores the 0114 body exactly.
 --
 -- WHY (adversarial review, S02). The C3 rule no longer moves a measured
@@ -1393,8 +1393,8 @@ declare
   v_late_completed  integer := 0;
   v_late_superseded integer := 0;
   -- ▲ 0114 C2-P5 declare
-  -- ▼ 0118 S02-4 converge declare
-  -- S02-4: the zero-answer relabel (0118 §5b) converges HERE as well as in
+  -- ▼ 0125 S02-4 converge declare
+  -- S02-4: the zero-answer relabel (0125 §5b) converges HERE as well as in
   -- the assessment handler. Both completions this sweep performs (the
   -- stranded `assessment.completed` and the C2-P5 late completion) happen
   -- after the handler already ran, so the handler's inline relabel never
@@ -1403,7 +1403,7 @@ declare
   v_relabel              jsonb;
   v_zero_relabelled      integer := 0;
   v_zero_relabel_errors  integer := 0;
-  -- ▲ 0118 S02-4 converge declare
+  -- ▲ 0125 S02-4 converge declare
 begin
   for v_row in
     select e.id,
@@ -1480,7 +1480,7 @@ begin
       if v_row.scored then v_completed := v_completed + 1;
       else v_failed := v_failed + 1;
       end if;
-      -- ▼ 0118 S02-4 converge stranded
+      -- ▼ 0125 S02-4 converge stranded
       -- A stranded `assessment.completed` just moved the engagement to
       -- completed. If the bound session's latest assessment is a measured
       -- 0-answer phone row, that is the 9f60523d defect: relabel it now.
@@ -1497,7 +1497,7 @@ begin
           v_zero_relabel_errors := v_zero_relabel_errors + 1;
         end;
       end if;
-      -- ▲ 0118 S02-4 converge stranded
+      -- ▲ 0125 S02-4 converge stranded
     else
       v_skipped := v_skipped + 1;
     end if;
@@ -1538,7 +1538,7 @@ begin
     v_late := screening_v2.complete_phone_engagement_after_late_score(v_late_row.id, p_now);
     if (v_late ->> 'status') is not distinct from 'completed' then
       v_late_completed := v_late_completed + 1;
-      -- ▼ 0118 S02-4 converge late
+      -- ▼ 0125 S02-4 converge late
       -- The late completion relabelled failed/assessment_aborted ->
       -- completed. A late score with a measured 0 answers is still not a
       -- screening: relabel completed -> failed/screening_abandoned in the
@@ -1553,7 +1553,7 @@ begin
       exception when others then
         v_zero_relabel_errors := v_zero_relabel_errors + 1;
       end;
-      -- ▲ 0118 S02-4 converge late
+      -- ▲ 0125 S02-4 converge late
     end if;
   end loop;
 
@@ -1597,10 +1597,10 @@ begin
     'late_completed',  v_late_completed,
     'late_superseded', v_late_superseded,
     -- ▲ 0114 C2-P5 keys
-    -- ▼ 0118 S02-4 converge keys
+    -- ▼ 0125 S02-4 converge keys
     'zero_answer_relabelled',     v_zero_relabelled,
     'zero_answer_relabel_errors', v_zero_relabel_errors,
-    -- ▲ 0118 S02-4 converge keys
+    -- ▲ 0125 S02-4 converge keys
     'grace_seconds', v_grace
   );
 end;
@@ -1624,12 +1624,12 @@ comment on function screening_v2.sweep_phone_stranded_sessions is
   'phone.assessment job is not stranded; a sweep-aborted engagement whose '
   'phone score landed later is completed as late_score_after_stranded_abort '
   '(late_completed) unless a newer cycle exists (late_superseded, counted '
-  'only). 0118: right after either completion, an engagement whose bound '
+  'only). 0125: right after either completion, an engagement whose bound '
   'session''s latest assessment is a measured 0-answer phone row is relabelled '
   'failed/screening_abandoned by relabel_zero_answer_phone_engagement '
   '(zero_answer_relabelled; a caught failure counts zero_answer_relabel_errors '
   'and never rolls back the resolution). Service-role-only.';
--- ==== 0118 §5 END ====
+-- ==== 0125 §5 END ====
 
 
 notify pgrst, 'reload schema';

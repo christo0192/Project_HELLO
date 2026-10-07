@@ -270,7 +270,7 @@ export function CandidateDetailPage() {
   // recommends a re-screen. Never while an appeal blocks decision use.
   const latestAssessment = assessments[0] ?? null;
   const rescreenRecommended = !decisionBlocked && isEvidenceInsufficient(latestAssessment);
-  // An "Abandoned: dropped before screening" cycle (0118) says WHY in its
+  // An "Abandoned: dropped before screening" cycle (0125) says WHY in its
   // detail line: the held assessment's evidence reason, in words.
   const displayStatus = candidateDisplayStatus({
     ...candidate,

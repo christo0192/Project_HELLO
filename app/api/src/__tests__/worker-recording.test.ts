@@ -423,7 +423,7 @@ describe('planAttemptLegTimingStamp — sanity window, earliest end, first write
     expect(noAnchor.patch).toEqual({ recording_duration_ms: 17_650, recording_tail_flushed: true });
   });
 
-  it('keeps the duration inside the 0118 CHECK (1 ms .. 24 h)', () => {
+  it('keeps the duration inside the 0125 CHECK (1 ms .. 24 h)', () => {
     for (const bad of [0, -5, LEG_TIMING_MAX_DURATION_MS + 1]) {
       const plan = planAttemptLegTimingStamp(row(), { durationMs: bad }, AT);
       expect(plan.patch).toEqual({});
@@ -436,7 +436,7 @@ describe('planAttemptLegTimingStamp — sanity window, earliest end, first write
   it('stamps observed_ended_at ONLY for an observed SIP leave; a teardown mark is dropped', () => {
     // session_close is an upper bound and finish the last-resort teardown
     // time: neither is an observation, so neither may pass for one (it would
-    // over-count the leg and count as SIP-leave evidence in the 0118 label).
+    // over-count the leg and count as SIP-leave evidence in the 0125 label).
     for (const legEndSource of ['session_close', 'finish', null, undefined] as const) {
       const plan = planAttemptLegTimingStamp(row(), { ...report, legEndSource }, AT);
       expect(plan.patch.observed_ended_at, String(legEndSource)).toBeUndefined();

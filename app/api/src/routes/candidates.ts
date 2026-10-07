@@ -102,7 +102,7 @@ function decodeAttemptHistoryCursor(value: string | undefined): AttemptHistoryCu
 }
 
 /**
- * The attempt columns the per-leg timing reads (0118). Selected by the history
+ * The attempt columns the per-leg timing reads (0125). Selected by the history
  * and by the candidate detail's session roll-up so both state the same facts.
  * `egress_id` only tells a worker recording apart; it is never returned.
  */

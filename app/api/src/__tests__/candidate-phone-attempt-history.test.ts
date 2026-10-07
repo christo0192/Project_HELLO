@@ -358,7 +358,7 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
     };
   }
 
-  /** A legacy (pre-T01/T02) worker MP3 leg: size only, no 0118 facts. */
+  /** A legacy (pre-T01/T02) worker MP3 leg: size only, no 0125 facts. */
   function workerLeg(id: string, fields: Record<string, unknown>) {
     return {
       id,
@@ -484,7 +484,7 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
     expect(body).not.toContain('worker.mp3');
   });
 
-  it('a 0118 leg: observed end, true audio length, anchor and a flushed tail', async () => {
+  it('a 0125 leg: observed end, true audio length, anchor and a flushed tail', async () => {
     sessionRows = [parentSession()];
     attempts = [workerLeg(LEG_A, {
       admitted_at: '2026-10-07T04:00:00.000Z',
@@ -560,7 +560,7 @@ describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => 
     }
   });
 
-  it('a 0118 leg whose fail-open flush was skipped still says the tail may be missing', async () => {
+  it('a 0125 leg whose fail-open flush was skipped still says the tail may be missing', async () => {
     sessionRows = [parentSession()];
     attempts = [workerLeg(LEG_A, {
       admitted_at: '2026-10-07T04:00:00.000Z',

@@ -1,8 +1,8 @@
 -- =====================================================================
--- 0118 §5 (T06) — the zero-answer relabel, on real Postgres.
+-- 0125 §5 (T06) — the zero-answer relabel, on real Postgres.
 --
--- scripts/test-phone-0118.sh runs this AFTER phone_0118_finalize.sql, so
--- every migration (0118 applied twice) is in place and the `replay` chain
+-- scripts/test-phone-0125.sh runs this AFTER phone_0125_finalize.sql, so
+-- every migration (0125 applied twice) is in place and the `replay` chain
 -- that file built (the 9f60523d sequence, finalized as an
 -- unobserved_disconnect) is in _p115.fin_ids. Synthetic `p115r` namespace.
 --
@@ -158,7 +158,7 @@ declare
 begin
   select ids into v_ids from _p115.fin_ids where slug = 'replay';
   if v_ids is null then
-    raise exception 'p115r replay: phone_0118_finalize.sql must run first (no replay chain)';
+    raise exception 'p115r replay: phone_0125_finalize.sql must run first (no replay chain)';
   end if;
   v_eng := v_ids[1]; v_sess := v_ids[2];
   select candidate_id into v_cand from screening_v2.call_sessions where id = v_sess;
@@ -212,7 +212,7 @@ begin
    where action = 'screening_failed' and target_type = 'phone_engagement'
      and target_id = v_eng::text and actor_type = 'system';
   if v_meta is null
-     or v_meta - 'session_id' <> '{"from":"completed","to":"failed","reason":"screening_abandoned","migration":"0118"}'::jsonb
+     or v_meta - 'session_id' <> '{"from":"completed","to":"failed","reason":"screening_abandoned","migration":"0125"}'::jsonb
      or (v_meta->>'session_id')::uuid <> v_sess then
     raise exception 'p115r replay: engagement audit missing or wrong: %', v_meta;
   end if;
@@ -220,7 +220,7 @@ begin
    where action = 'candidate_status_changed' and target_type = 'candidate'
      and target_id = v_cand::text and actor_type = 'system';
   if v_meta is distinct from
-     '{"from":"screened","to":"screening","reason":"screening_abandoned","migration":"0118"}'::jsonb then
+     '{"from":"screened","to":"screening","reason":"screening_abandoned","migration":"0125"}'::jsonb then
     raise exception 'p115r replay: candidate audit missing or wrong: %', v_meta;
   end if;
 

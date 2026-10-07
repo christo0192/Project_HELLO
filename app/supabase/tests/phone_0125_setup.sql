@@ -1,10 +1,10 @@
 -- =====================================================================
--- 0118 fixture, part 1 — HISTORY seeded BEFORE 0118 is applied.
+-- 0125 fixture, part 1 — HISTORY seeded BEFORE 0125 is applied.
 --
--- scripts/test-phone-0118.sh applies every migration up to 0114, runs THIS
--- file, then applies 0118 (twice), then runs phone_0118_assert.sql. So the
+-- scripts/test-phone-0125.sh applies every migration up to 0114, runs THIS
+-- file, then applies 0125 (twice), then runs phone_0125_assert.sql. So the
 -- sessions below complete under the OLD 0076 duration rule, exactly as the
--- production rows did, and the assert proves what 0118's §2/§3 backfills do
+-- production rows did, and the assert proves what 0125's §2/§3 backfills do
 -- to them.
 --
 -- Four completed phone sessions, each with its own engagement chain
@@ -20,14 +20,14 @@
 --             session completed at 03:43:59.6. 0076 sums 75.6 + 367.856 =
 --             443 s; the truthful answer is 75 s plus one unobserved leg.
 --   only      A single answered leg, reclaimed 6 min later; the session
---             completed after the reclaim. 0076: 360 s. 0118: NULL (unknown)
+--             completed after the reclaim. 0076: 360 s. 0125: NULL (unknown)
 --             with 1 unobserved leg.
---   clean     One leg ended by the reconciler. 0076: 90 s. 0118 must leave
+--   clean     One leg ended by the reconciler. 0076: 90 s. 0125 must leave
 --             it untouched (nothing unobserved).
 --   late      One leg still live when the session completed (0076 bounds it
 --             by the session end: 120 s), reclaimed AFTERWARDS. Its end was
 --             never observed either (the session end is no observation of
---             the leg), so 0118 makes it NULL (unknown) with 1 unobserved
+--             the leg), so 0125 makes it NULL (unknown) with 1 unobserved
 --             leg, the same rule as the API's per-leg read.
 --
 -- Synthetic identifiers only; no real candidate, email, number or document.
@@ -55,7 +55,7 @@ declare
   v_n    integer := 0;
 begin
   insert into screening_v2.roles (title, jd, required_skills, screening_template, owner_id)
-  values ('p115 role', 'Synthetic role for the 0118 harness.', '[]'::jsonb,
+  values ('p115 role', 'Synthetic role for the 0125 harness.', '[]'::jsonb,
           jsonb_build_array(jsonb_build_object('id','q1','question','Tell me about yourself?','weight',1)),
           v_owner)
   returning id into v_role;
@@ -169,7 +169,7 @@ begin
   end loop;
 end $$;
 
--- The 0076 baseline these rows carry into 0118: the numbers the backfill
+-- The 0076 baseline these rows carry into 0125: the numbers the backfill
 -- must change (two_legs, only) or must leave alone (clean, late).
 do $$
 declare

@@ -68,11 +68,11 @@ function section(n: number): string {
 }
 
 describe('0114 registration', () => {
-  it('is the newest PHONE_MIGRATIONS entry after 0118 (M013 S02), ahead of 0113 and 0112', () => {
-    // 0118 lifts finalize and the engagement transition trigger FROM 0114,
+  it('is the newest PHONE_MIGRATIONS entry after 0125 (M013 S02), ahead of 0113 and 0112', () => {
+    // 0125 lifts finalize and the engagement transition trigger FROM 0114,
     // so it sits first; 0114 stays directly behind it.
     const names = PHONE_MIGRATIONS.map((m) => m.name);
-    expect(names[0]).toBe('0118');
+    expect(names[0]).toBe('0125');
     expect(names[1]).toBe('0114');
     expect(names.indexOf('0114')).toBeLessThan(names.indexOf('0113'));
     expect(names.indexOf('0113')).toBeLessThan(names.indexOf('0112'));

@@ -372,7 +372,7 @@ export interface Session {
    */
   candidate_words?: number | null;
   /**
-   * M013 S02 (0118). Answered phone legs left out of `duration_sec` because
+   * M013 S02 (0125). Answered phone legs left out of `duration_sec` because
    * their end was never observed (lease reclaim). null when not computed.
    */
   duration_unobserved_legs?: number | null;

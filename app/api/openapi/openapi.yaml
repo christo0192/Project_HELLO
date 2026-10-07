@@ -8773,12 +8773,12 @@ components:
         duration_sec:
           type: integer
           nullable: true
-          description: Phone sessions (0118) - connected seconds summed over the answered legs whose end was observed or ledger-recorded; legs ended only by the lease reclaim are excluded and counted in duration_unobserved_legs (null when no leg end was observed). Not talk time, and not shown as call length for phone sessions - use recorded_total_sec / connected_total_sec.
+          description: Phone sessions (0125) - connected seconds summed over the answered legs whose end was observed or ledger-recorded; legs ended only by the lease reclaim are excluded and counted in duration_unobserved_legs (null when no leg end was observed). Not talk time, and not shown as call length for phone sessions - use recorded_total_sec / connected_total_sec.
         duration_unobserved_legs:
           type: integer
           minimum: 0
           nullable: true
-          description: M013 S02 (0118). Answered phone legs excluded from duration_sec because their end was never observed. null when not computed by the 0118 rule.
+          description: M013 S02 (0125). Answered phone legs excluded from duration_sec because their end was never observed. null when not computed by the 0125 rule.
         recorded_total_sec:
           type: number
           nullable: true
@@ -10319,7 +10319,7 @@ components:
           type: string
           enum: [observed, ledger, detected, unobserved]
           nullable: true
-          description: M013 S02. observed = the SIP leave the worker observed (0118 observed_ended_at, unless an earlier ledger end exists); ledger = the ledger end (provider or worker event); detected = the only end is the one our reconciler sweep recorded, i.e. when it noticed the leg was gone (an upper bound, up to a reconcile interval after the hang-up); unobserved = ended only by the lease reclaim with no observed end, so the call's real end is unknown.
+          description: M013 S02. observed = the SIP leave the worker observed (0125 observed_ended_at, unless an earlier ledger end exists); ledger = the ledger end (provider or worker event); detected = the only end is the one our reconciler sweep recorded, i.e. when it noticed the leg was gone (an upper bound, up to a reconcile interval after the hang-up); unobserved = ended only by the lease reclaim with no observed end, so the call's real end is unknown.
         connected_sec:
           type: number
           nullable: true
@@ -10327,7 +10327,7 @@ components:
         recorded_sec:
           type: number
           nullable: true
-          description: M013 S02. Length of this leg's recording in seconds - the worker's true audio length (0118 recording_duration_ms), or for a legacy worker MP3 an estimate from its size at 64 kbps (recorded_sec_estimated). null when unknown, when the recording is unavailable (recording.state unavailable - failed, erased, revoked, quarantined, not uploaded), or when the caller may not read the session.
+          description: M013 S02. Length of this leg's recording in seconds - the worker's true audio length (0125 recording_duration_ms), or for a legacy worker MP3 an estimate from its size at 64 kbps (recorded_sec_estimated). null when unknown, when the recording is unavailable (recording.state unavailable - failed, erased, revoked, quarantined, not uploaded), or when the caller may not read the session.
         recorded_sec_estimated:
           type: boolean
           description: M013 S02. recorded_sec is a size-based estimate (show it as approximate).

@@ -163,8 +163,8 @@ beforeEach(() => {
 afterEach(() => injectAssessmentRunner(null));
 
 describe('phone first score — grade persisted, one status rule', () => {
-  it('a744741c shape (partial, 0/4 answered, MEASURED): insufficient, held at Ashby, status NOT written (0118)', async () => {
-    // 0118 (M013 D1/D3): a measured 0-answer phone row was not a screening.
+  it('a744741c shape (partial, 0/4 answered, MEASURED): insufficient, held at Ashby, status NOT written (0125)', async () => {
+    // 0125 (M013 D1/D3): a measured 0-answer phone row was not a screening.
     // The candidate stays at its pre-assessment status (`screening`); the
     // handler relabels the engagement failed/screening_abandoned.
     setDefault('phone_session_progress', progress('asked_declined', 'asked_declined'));
@@ -181,7 +181,7 @@ describe('phone first score — grade persisted, one status rule', () => {
     expect(observeAshbyCompletion).toHaveBeenCalledWith(SESSION_ID, expect.anything(), { evidenceGrade: 'insufficient' });
   });
 
-  it('9f60523d shape (0 candidate turns, 0/5 MEASURED): no_candidate_speech, status NOT written (0118)', async () => {
+  it('9f60523d shape (0 candidate turns, 0/5 MEASURED): no_candidate_speech, status NOT written (0125)', async () => {
     setDefault('transcript_turns', ok([{ speaker: 'bot', text: 'Tell me about your last role.' }]));
     setDefault('phone_session_plans', ok({ question_count: 5 }));
     setDefault('phone_session_progress', progress());
@@ -210,7 +210,7 @@ describe('phone first score — grade persisted, one status rule', () => {
     });
   });
 
-  it('UNMEASURED answered (a pre-0086 NULL disposition): insufficient, still screened (0118 keys on a measured 0 only)', async () => {
+  it('UNMEASURED answered (a pre-0086 NULL disposition): insufficient, still screened (0125 keys on a measured 0 only)', async () => {
     setDefault('phone_session_progress', progress(null, 'asked_declined'));
     await runAssessment(SESSION_ID, { source: 'phone', partial: true, covered: 2, total: 4, disconnectReason: 'candidate_hangup' });
     expect(insertPayloads()[0]).toMatchObject({ evidence_grade: 'insufficient', evidence_answered: null });
@@ -333,7 +333,7 @@ describe('rescore — copies the superseded revision, recomputes only when it ha
     expect(candidateUpdate()?.filters).toContainEqual(['in', ['status', ['new', 'queued', 'screening']]]);
   });
 
-  it('a copied MEASURED 0-answer grade leaves the candidate status alone (0118)', async () => {
+  it('a copied MEASURED 0-answer grade leaves the candidate status alone (0125)', async () => {
     queue('assessments',
       ok(null),
       ok({ id: 'prior', revision: 1, created_at: '2026-10-01T00:00:00Z' }),

@@ -38,7 +38,7 @@ function payloadAttemptId(payload: unknown): string | null {
  * field degrades to the complete-screening shape, never throws.
  *
  * `disconnect_reason` is passed through as a free string (any of
- * `PHONE_DISCONNECT_REASONS`, including 0118's `unobserved_disconnect`): the
+ * `PHONE_DISCONNECT_REASONS`, including 0125's `unobserved_disconnect`): the
  * grade, not this reader, decides what a token means, so a token newer than
  * this build is still forwarded rather than dropped.
  */
@@ -130,7 +130,7 @@ export function createPhoneAssessmentHandler(
       return;
     }
 
-    // 0118 (M013 S02, T06) — ZERO-ANSWER RETRY SAFETY, after both guards and
+    // 0125 (M013 S02, T06) — ZERO-ANSWER RETRY SAFETY, after both guards and
     // before ANY score() call. The relabel below runs AFTER the completion
     // post; if it failed (the job threw), the retry must not score again. So
     // when this session's latest phone assessment is already a measured
@@ -232,14 +232,14 @@ export function createPhoneAssessmentHandler(
   };
 }
 
-// ── 0118 (M013 S02, T06) — the zero-answer relabel ──────────────────────
+// ── 0125 (M013 S02, T06) — the zero-answer relabel ──────────────────────
 //
 // A phone screening in which the candidate answered NONE of the planned
 // questions — the assessment's MEASURED `evidence_answered = 0` on an
 // `insufficient` grade, never an unmeasured NULL — was not a screening. After
 // the completion post (which keeps the 0044 interlock, the MP3 finalize and
 // the download backstop exactly as before), the engagement is relabelled
-// failed/screening_abandoned by `relabel_zero_answer_phone_engagement` (0118
+// failed/screening_abandoned by `relabel_zero_answer_phone_engagement` (0125
 // §5b), which also restores a `screened` candidate to `screening`. It never
 // requeues or redials. The RPC re-checks everything under the engagement
 // lock; the checks here only avoid a pointless call.
@@ -267,7 +267,7 @@ function isZeroAnswer(evidence: PhoneEvidence | null): boolean {
 
 /**
  * The session's LATEST phone assessment's evidence columns (created_at, then
- * revision — the order the 0118 interlock reads), or null when none exists.
+ * revision — the order the 0125 interlock reads), or null when none exists.
  * A read error throws.
  */
 async function latestPhoneEvidence(

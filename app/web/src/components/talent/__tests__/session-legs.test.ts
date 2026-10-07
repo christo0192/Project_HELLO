@@ -235,7 +235,7 @@ describe('sessionLegs', () => {
     const base: Session = { id: 's', candidate_id: 'c', role_id: null, status: 'completed', created_at: null };
 
     it('a phone session with an unobserved leg: recorded across its calls, no call length', () => {
-      // 0118 stored duration_sec 75 for the 9f60523d shape; it must not show.
+      // 0125 stored duration_sec 75 for the 9f60523d shape; it must not show.
       const facts = headlineCallFacts([
         { ...base, mode: 'live', duration_sec: 75, recorded_total_sec: 70.8, recorded_legs: 2,
           connected_complete: false, connected_total_sec: null, candidate_words: 4 },

@@ -1336,7 +1336,7 @@ export function createPhoneRuntime(
             });
           }
           lastLateSupersededWarned = superseded;
-          // 0118 §5c: a zero-answer relabel that raised inside the sweep was
+          // 0125 §5c: a zero-answer relabel that raised inside the sweep was
           // caught (the stranded resolution still committed) and will be
           // retried by nothing, so it is operator attention. Count only.
           const relabelErrors = resolved.zeroAnswerRelabelErrors ?? 0;
@@ -1507,7 +1507,7 @@ export function createPhoneRuntime(
           // the two already-present signals are encoded into a single bounded,
           // SAFE_IDENT-shaped composite category (max 64 chars, no PII): e.g.
           // `phone_partial_finalize:c3:t5:mp3.1:sc.0`. `error_type` carries the
-          // disconnect reason token (PHONE_DISCONNECT_REASONS; 0118 adds
+          // disconnect reason token (PHONE_DISCONNECT_REASONS; 0125 adds
           // `unobserved_disconnect`, so the `unobserved_disconnect` vs
           // `worker_crash` split is countable from this line). No transcript,
           // no candidate data, no session id.

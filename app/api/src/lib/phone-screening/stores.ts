@@ -547,7 +547,7 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         // tick must not report a late completion nobody performed.
         lateCompleted: num(row, 'late_completed'),
         lateSuperseded: num(row, 'late_superseded'),
-        // 0118 §5c. Absent from an older RPC -> undefined.
+        // 0125 §5c. Absent from an older RPC -> undefined.
         zeroAnswerRelabelled: num(row, 'zero_answer_relabelled'),
         zeroAnswerRelabelErrors: num(row, 'zero_answer_relabel_errors'),
       };

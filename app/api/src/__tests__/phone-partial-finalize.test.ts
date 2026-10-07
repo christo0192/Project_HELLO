@@ -514,7 +514,7 @@ describe('the partial-finalize tick delivers the scorecard on a disconnect', () 
     expect(enqueues[0].options?.dedupKey).toBe(phoneAssessmentDedupKey(SESSION_A));
   });
 
-  it('0118 §4: an unobserved_disconnect is enqueued like any partial and logged as its own error_type', async () => {
+  it('0125 §4: an unobserved_disconnect is enqueued like any partial and logged as its own error_type', async () => {
     // The RPC now reports a reclaimed leg WITH teardown evidence as
     // `unobserved_disconnect` instead of `worker_crash`. The tick forwards the
     // token verbatim (the grade decides what it means) and the log line keeps
@@ -905,7 +905,7 @@ function makeAssessmentClient(opts: {
     from(table: string) {
       const builder = {
         select() { return builder; },
-        // 0118 (T06): the latest-phone-evidence read orders and limits.
+        // 0125 (T06): the latest-phone-evidence read orders and limits.
         order() { return builder; },
         limit() { return builder; },
         eq(column: string, value: unknown) {
@@ -968,7 +968,7 @@ describe('the scorer plumbing forwards the partial fields', () => {
     });
   });
 
-  it('0118: an unobserved_disconnect job scores with that reason, verbatim', async () => {
+  it('0125: an unobserved_disconnect job scores with that reason, verbatim', async () => {
     const seen: Array<{ options: unknown }> = [];
     const { client } = makeAssessmentClient({ engagementId: ENGAGEMENT_A });
     const handler = createPhoneAssessmentHandler({
@@ -1364,7 +1364,7 @@ describe('0114 (C2) — the handler never scores a score-suppressed leg', () => 
     expect(order).toEqual([
       'from:phone_appointments',
       'rpc:phone_attempt_score_suppression',
-      // 0118 (T06): the zero-answer retry check, then (after the post) the
+      // 0125 (T06): the zero-answer retry check, then (after the post) the
       // relabel check. Not a 0-answer row here, so no relabel call.
       'from:assessments',
       'score',

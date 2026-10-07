@@ -9,7 +9,7 @@
  * the candidate hung up: 9f60523d read "7m 23s on the call" for 53 s + 18 s of
  * audio. The surfaces now read per-leg facts instead, each with its source:
  *
- * - connected window: `answered_at` -> the observed SIP leave (0118
+ * - connected window: `answered_at` -> the observed SIP leave (0125
  *   `observed_ended_at`, `observed`; the ledger end instead when that is
  *   earlier), else the ledger end (`ledger`). A leg ended only by the lease
  *   reclaim with no observed end is `unobserved`: its `connected_to` is the
@@ -19,14 +19,14 @@
  *   'reconciliation'`) is `detected`: that time is when the sweep NOTICED the
  *   empty room, up to a reconcile interval after the hang-up, so it is an
  *   upper bound with no exact `connected_sec` either.
- * - recorded length: the worker's true audio length (0118
+ * - recorded length: the worker's true audio length (0125
  *   `recording_duration_ms`), else, for a legacy worker MP3, an estimate from
  *   the file size at the worker's fixed 64 kbps CBR, flagged as estimated.
  * - `tail_may_be_missing`: a worker recording whose tail flush is not known to
  *   have run (legacy rows, and fail-open skips) — unless the connected span
  *   and the recorded length already agree within a few seconds.
  *
- * The unobserved rule is the SQL one (0118 §3a `phone_session_leg_duration`):
+ * The unobserved rule is the SQL one (0125 §3a `phone_session_leg_duration`):
  * state `abandoned`, `outcome_class` NULL, `abandon_reason` NULL, an
  * `ended_at`, and no `observed_ended_at` — whatever the session's end, in
  * both places. (`detected` is API-only: the SQL duration keeps a reconciler
@@ -146,7 +146,7 @@ export function isWorkerInbandAttempt(row: Pick<AttemptLegTimingRow, 'egress_id'
 }
 
 /**
- * The lease-reclaim signature with no observed end (0118 §3a): the leg's
+ * The lease-reclaim signature with no observed end (0125 §3a): the leg's
  * `ended_at` is the sweep's time, not the call's end. The SAME predicate as
  * the SQL rule, with no session-end clause in either (a leg reclaimed after
  * its session ended is unobserved too), so the session header and
@@ -176,7 +176,7 @@ export function attemptLegTiming(row: AttemptLegTimingRow): AttemptLegTiming {
     let toMs: number | null = null;
     if (observedMs !== null && !(endedMs !== null && !sweptEnd && endedMs < observedMs)) {
       // The observed SIP leave, unless a non-sweep ledger end is EARLIER
-      // (the 0118 §3a `least(observed, ended)`): a skewed worker clock never
+      // (the 0125 §3a `least(observed, ended)`): a skewed worker clock never
       // stretches a leg past the ledger.
       connectedTo = row.observed_ended_at as string;
       source = 'observed';

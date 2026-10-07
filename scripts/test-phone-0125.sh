@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Isolated real-Postgres behavioural test for 0118 (M013 S02, PR-2): phone
+# Isolated real-Postgres behavioural test for 0125 (M013 S02, PR-2): phone
 # recording and call-record integrity.
 #
-# WHY THIS EXISTS: 0118 re-declares the trigger that computes a phone
+# WHY THIS EXISTS: 0125 re-declares the trigger that computes a phone
 # session's duration_sec, adds a room_name stamp trigger on
 # phone_call_attempts, and BACKFILLS both over production history. Every
 # vitest suite mocks Supabase, so the only place the new rule, the triggers
@@ -10,28 +10,28 @@
 # proven is a real Postgres that has seen that history.
 #
 # So the order matters, and differs from the sibling harnesses:
-#   1. apply every migration BEFORE 0118;
-#   2. seed history under the OLD 0076 rule (phone_0118_setup.sql), including
+#   1. apply every migration BEFORE 0125;
+#   2. seed history under the OLD 0076 rule (phone_0125_setup.sql), including
 #      the 9f60523d shape (timings only, synthetic ids) that 0076 turned into
 #      443 s;
-#   3. apply 0118, assert both backfills (phone_0118_backfill_assert.sql);
-#   4. apply 0118 a SECOND time (idempotency), then any later migration;
+#   3. apply 0125, assert both backfills (phone_0125_backfill_assert.sql);
+#   4. apply 0125 a SECOND time (idempotency), then any later migration;
 #   5. assert no row changed on the second apply, the column CHECKs, the
 #      exact attempt-trigger set, the room_name stamp and the new duration
-#      rule on first completion (phone_0118_assert.sql);
+#      rule on first completion (phone_0125_assert.sql);
 #   6. replay the 9f60523d sequence against §4's partial-finalize reconnect
-#      guard and the unobserved_disconnect label (phone_0118_finalize.sql);
+#      guard and the unobserved_disconnect label (phone_0125_finalize.sql);
 #   7. continue that replay into §5's zero-answer relabel, and try every
-#      shape the relabel exception must refuse (phone_0118_relabel.sql).
+#      shape the relabel exception must refuse (phone_0125_relabel.sql).
 #
-# If S01 (or anything else) merges a migration numbered 0118 first, this
+# If S01 (or anything else) merges a migration numbered 0125 first, this
 # migration is renumbered; MIGRATION below is the one place to change.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-readonly MIGRATION="0118"
-readonly IMAGE="${PHONE_0118_TEST_PG_IMAGE:-pgvector/pgvector:pg17}"
-readonly CTR="phone-0118-test-pg-$$"
+readonly MIGRATION="0125"
+readonly IMAGE="${PHONE_0125_TEST_PG_IMAGE:-pgvector/pgvector:pg17}"
+readonly CTR="phone-0125-test-pg-$$"
 readonly TESTS="app/supabase/tests"
 readonly MIG="app/supabase/migrations"
 
@@ -114,9 +114,9 @@ apply() {
   local f="$1"
   docker cp "$f" "$CTR:/tmp/$(basename "$f")" >/dev/null
   if ! docker exec "$CTR" psql -U postgres -q -1 -v ON_ERROR_STOP=1 \
-        -f "/tmp/$(basename "$f")" >/tmp/phone-0118-migrate.log 2>&1; then
+        -f "/tmp/$(basename "$f")" >/tmp/phone-0125-migrate.log 2>&1; then
     log "ERROR: $(basename "$f") failed:"
-    tail -30 /tmp/phone-0118-migrate.log
+    tail -30 /tmp/phone-0125-migrate.log
     exit 1
   fi
 }
@@ -134,13 +134,13 @@ for f in "$MIG"/*.sql; do
 done
 
 log 'seeding call history under the 0076 duration rule...'
-run_sql phone_0118_setup.sql
+run_sql phone_0125_setup.sql
 
 log "applying $(basename "$TARGET")..."
 apply "$TARGET"
 
 log 'asserting the room_name and duration backfills...'
-run_sql phone_0118_backfill_assert.sql
+run_sql phone_0125_backfill_assert.sql
 
 log "applying $(basename "$TARGET") a second time (idempotency)..."
 apply "$TARGET"
@@ -153,12 +153,12 @@ for f in "$MIG"/*.sql; do
 done
 
 log 'asserting idempotency, CHECKs, the trigger set, the stamp and the duration rule...'
-run_sql phone_0118_assert.sql
+run_sql phone_0125_assert.sql
 
 log 'replaying the partial-finalize reconnect guard and the disconnect label (§4)...'
-run_sql phone_0118_finalize.sql
+run_sql phone_0125_finalize.sql
 
 log 'continuing the replay into the zero-answer relabel and its refusals (§5)...'
-run_sql phone_0118_relabel.sql
+run_sql phone_0125_relabel.sql
 
 log 'PASS'

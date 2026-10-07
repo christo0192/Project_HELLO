@@ -74,7 +74,7 @@ describe('attemptLegTiming', () => {
     expect(t).toMatchObject({ connected_to: '2026-10-06T03:31:48.296Z', connected_to_source: 'observed', connected_sec: 61.474 });
   });
 
-  it('an EARLIER ledger end beats the observed end (0118 least(observed, ended)), unless it is a sweep detection', () => {
+  it('an EARLIER ledger end beats the observed end (0125 least(observed, ended)), unless it is a sweep detection', () => {
     const skewed = attemptLegTiming(row({ observed_ended_at: '2026-10-06T03:32:05.000Z' }));
     expect(skewed).toMatchObject({ connected_to: '2026-10-06T03:32:02.356Z', connected_to_source: 'ledger', connected_sec: 75.534 });
     const swept = attemptLegTiming(row({ observed_ended_at: '2026-10-06T03:32:05.000Z', end_detected_by_sweep: true }));
@@ -126,7 +126,7 @@ describe('attemptLegTiming', () => {
       .toMatchObject({ connected_to_source: 'observed', connected_sec: 18.718 });
   });
 
-  it('matches the 0118 §3a reclaim signature exactly', () => {
+  it('matches the 0125 §3a reclaim signature exactly', () => {
     expect(isUnobservedReclaim(reclaimed())).toBe(true);
     // 0083 infra defer is not a reclaim.
     expect(isUnobservedReclaim(reclaimed({ abandon_reason: 'infra_deferred' }))).toBe(false);
@@ -137,7 +137,7 @@ describe('attemptLegTiming', () => {
     expect(isUnobservedReclaim(reclaimed({ observed_ended_at: '2026-10-06T03:35:08.330Z' }))).toBe(false);
     // The SQL body states the same predicate.
     const sql = readFileSync(
-      fileURLToPath(new URL('../../../supabase/migrations/0118_phone_recording_integrity.sql', import.meta.url)),
+      fileURLToPath(new URL('../../../supabase/migrations/0125_phone_recording_integrity.sql', import.meta.url)),
       'utf8',
     );
     const body = sql.slice(sql.indexOf('create or replace function screening_v2.phone_session_leg_duration('));

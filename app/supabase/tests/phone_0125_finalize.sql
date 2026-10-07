@@ -1,9 +1,9 @@
 -- =====================================================================
--- 0118 §4 (T05) — the partial-finalize reconnect guard and the truthful
+-- 0125 §4 (T05) — the partial-finalize reconnect guard and the truthful
 -- disconnect label, on real Postgres.
 --
--- scripts/test-phone-0118.sh runs this AFTER phone_0118_assert.sql, so every
--- migration (0118 applied twice) is in place. Each case builds its own
+-- scripts/test-phone-0125.sh runs this AFTER phone_0125_assert.sql, so every
+-- migration (0125 applied twice) is in place. Each case builds its own
 -- engagement chain under the synthetic `p115f` namespace and calls
 -- finalize_phone_partial_sessions at a frozen instant. The sweep is
 -- fleet-wide, so every assertion looks its session up by id and the cases
@@ -65,7 +65,7 @@ begin
   select id into v_role from screening_v2.roles where title = 'p115f role';
   if v_role is null then
     insert into screening_v2.roles (title, jd, required_skills, screening_template, owner_id)
-    values ('p115f role', 'Synthetic role for the 0118 finalize harness.', '[]'::jsonb,
+    values ('p115f role', 'Synthetic role for the 0125 finalize harness.', '[]'::jsonb,
             jsonb_build_array(jsonb_build_object('id','q1','question','Tell me about yourself?','weight',1)),
             v_owner)
     returning id into v_role;
@@ -374,7 +374,7 @@ begin
       'the expired-arm session; entry=%', _p115.fin_entry(v_fin, v_sess);
   end if;
 
-  -- +31 min: the bound has passed -> selected exactly as before 0118.
+  -- +31 min: the bound has passed -> selected exactly as before 0125.
   v_fin := screening_v2.finalize_phone_partial_sessions(200, 180, '2026-10-05T09:36:00Z');
   v_e := _p115.fin_entry(v_fin, v_sess);
   select status into v_status from screening_v2.call_sessions where id = v_sess;

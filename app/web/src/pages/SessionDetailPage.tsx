@@ -103,7 +103,7 @@ function positiveOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : null;
 }
 
-/** Answered legs left out of `duration_sec` because nobody saw them end (0118). */
+/** Answered legs left out of `duration_sec` because nobody saw them end (0125). */
 function unobservedLegs(session: Session): number {
   const n = session.duration_unobserved_legs;
   return typeof n === 'number' && Number.isInteger(n) && n > 0 ? n : 0;
@@ -225,7 +225,7 @@ export function SessionDetailPage() {
               {phone ? (
                 <>
                   {/* A phone session's `duration_sec` is CONNECTED time
-                      summed over the calls whose end was seen (0118). A call
+                      summed over the calls whose end was seen (0125). A call
                       only the timeout closed is left out and said so, never
                       counted as minutes nobody was on the line for. */}
                   {(session.duration_sec != null || unobserved > 0) && (

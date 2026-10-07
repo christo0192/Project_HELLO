@@ -36,22 +36,22 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-// 0118 (M013 S02, PR-2, one migration in numbered sections) re-declares
+// 0125 (M013 S02, PR-2, one migration in numbered sections) re-declares
 // set_phone_session_duration (0076, never registered here: it is a trigger
 // function, not an RPC) and declares stamp_phone_attempt_room_name and
 // phone_session_leg_duration. Later S02 sections lift
 // finalize_phone_partial_sessions and enforce_phone_engagement_transition from
 // 0114, so it must sit FIRST, ahead of 0114, or every extractor reads a
-// superseded body. If 0118 is ever renumbered, this constant and the head of
+// superseded body. If 0125 is ever renumbered, this constant and the head of
 // PHONE_MIGRATIONS are the places to change.
-export const MIGRATION_0118_PATH = fileURLToPath(
+export const MIGRATION_0125_PATH = fileURLToPath(
   new URL(
-    '../../../../supabase/migrations/0118_phone_recording_integrity.sql',
+    '../../../../supabase/migrations/0125_phone_recording_integrity.sql',
     import.meta.url,
   ),
 );
 
-export const MIGRATION_0118 = readFileSync(MIGRATION_0118_PATH, 'utf8');
+export const MIGRATION_0125 = readFileSync(MIGRATION_0125_PATH, 'utf8');
 
 // 0114 (PR-C, one migration in numbered sections) re-declares IN FULL, each
 // exactly once: apply_phone_event, finalize_phone_partial_sessions and
@@ -390,10 +390,10 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
-    // 0118 — M013 S02 (PR-2). Leg-timing columns, the room_name stamp and the
+    // 0125 — M013 S02 (PR-2). Leg-timing columns, the room_name stamp and the
     // truthful-duration rule; its later sections lift finalize and the
     // engagement transition trigger from 0114, so it precedes 0114.
-    { name: '0118', sql: MIGRATION_0118 },
+    { name: '0125', sql: MIGRATION_0125 },
     // 0114 — PR-C. Redeclares the functions in S03-RESEARCH table 1a
     // (apply_phone_event, finalize, sweep from 0113; the 0045 transition
     // trigger; admit 0095; ensure/request_phone_rescreen 0057;

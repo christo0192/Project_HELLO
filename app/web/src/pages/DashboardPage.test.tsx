@@ -326,7 +326,7 @@ describe('DashboardPage', () => {
       getMe.mockResolvedValue(VIEWER_ME);
       listCandidates.mockResolvedValue([
         // Newest first (the list API's order), so she is in the recent list.
-        // The 0118 relabel leaves the candidate `screening`, never `queued`.
+        // The 0125 relabel leaves the candidate `screening`, never `queued`.
         { ...CANDIDATES[0], id: 'p5', name: 'Dropped Dora', status: 'screening', dial_count: 2, phone_state: 'failed', phone_state_reason: 'screening_abandoned' },
         ...PHONE_CANDIDATES,
       ]);

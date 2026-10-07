@@ -265,7 +265,7 @@ const SESSION_PHONE: Session = {
   role_id: null,
   status: 'completed',
   mode: 'live',
-  // 0118 excludes the unobserved leg: 75 s is NOT what was recorded, and
+  // 0125 excludes the unobserved leg: 75 s is NOT what was recorded, and
   // the picker must not present it as the length.
   duration_sec: 75,
   duration_unobserved_legs: 1,

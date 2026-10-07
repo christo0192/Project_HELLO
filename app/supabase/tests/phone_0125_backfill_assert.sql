@@ -1,6 +1,6 @@
 -- =====================================================================
--- 0118 assertions, part 2 — the BACKFILLS, run right after the FIRST apply
--- of 0118 over the history phone_0118_setup.sql seeded under 0076.
+-- 0125 assertions, part 2 — the BACKFILLS, run right after the FIRST apply
+-- of 0125 over the history phone_0125_setup.sql seeded under 0076.
 --
 -- Proves by execution:
 --   * §2: the reconnect leg bound with room_name NULL now carries
@@ -11,8 +11,8 @@
 --     with 1 unobserved leg; clean untouched (duration_unobserved_legs stays
 --     NULL) — and every one of those UPDATEs landed on a TERMINAL
 --     (`completed`) session row.
--- Then it snapshots updated_at so phone_0118_assert.sql can prove the SECOND
--- apply of 0118 changed no row (idempotent backfills).
+-- Then it snapshots updated_at so phone_0125_assert.sql can prove the SECOND
+-- apply of 0125 changed no row (idempotent backfills).
 -- =====================================================================
 \set ON_ERROR_STOP on
 
