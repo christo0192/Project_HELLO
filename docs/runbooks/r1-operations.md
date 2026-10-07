@@ -587,6 +587,46 @@ new attempt while the latest counted attempt's session is `completed` but the ro
 holds no `assessment_id` for it; otherwise attempt 2's score replaces a valid
 attempt-1 score in `r1_attach_assessment`.
 
+**Gate rule for F1 (PR-B).** The deck defines F1 as the $7,000 anchor plus the counter
+after the advisor's first answer; it has no push (`r1_scheduler.py` PLAN). The worker
+posts the anchor as `family_delivered` and the counter as `counter_delivered`, both with
+`family_id: 'F1'`. The gate therefore requires a primary and a push for F2-F4, and the
+anchor and the counter for F1; an `F1` `push_delivered` row is neither required nor
+judged. The scorer prompt prints F1 as `anchor ...; counter ...`.
+
+**Attempts that did not complete (PR-B, migration 0126).** A candidate who leaves after
+the role-play began (or whom the residency cap ends) is a COUNTED attempt (plan D1):
+`candidate_left` and `residency_timeout` count once TRANSITION started, the session ends
+`failed`, and the round closes. Before 0126 nothing ever scored such a session (only a
+`completed` session enqueued `r1.assessment`) and Grant retake answered
+`retake_not_allowed`. Now `r1_settle_attempt` enqueues the same `r1.assessment` job in the
+same transaction when the counted attempt's session is `failed` and the round holds a live
+(not withdrawn) consent. The scorer scores it, and the gate can never pass it
+(`session_not_completed`, `session_not_clean`, plus `system_failure_outcome` for the
+residency cap): HR sees a real scorecard with a `human_review` recommendation and the
+failure codes, and may Grant retake (it now needs exactly one counted attempt, whatever its
+session status). An attempt that did not count (a no-show, leaving before TRANSITION, a
+system failure) is never scored and the link keeps its start. A withdrawn consent is never
+scored. To find rounds in this state:
+`select r.id, r.status, r.attempts_counted, a.outcome, s.status, s.terminal_reason from
+screening_v2.interview_rounds r join screening_v2.interview_round_attempts a on a.round_id =
+r.id and a.counted join screening_v2.call_sessions s on s.id = a.session_id where s.status =
+'failed'`.
+
+**Orphaned sessions lapse (PR-B).** Admission's one-live-R1 rule is global (`r1_in_flight`,
+409 `r1_busy`), so a session no worker owns blocked every R1 start. The `r1-status` loop
+(60 s, only while R1 is enabled) now lapses them, compare-and-set on the status it read:
+`created` untouched for 15 minutes -> `failed` / `room_create_error` (attempt `no_show`);
+`waiting` for 20 minutes -> `expired` / `idle_timeout` (`configuration_failed`);
+`in_progress` with no row update, transcript turn or ledger row for 45 minutes -> `failed` /
+`worker_crash` (`shutdown_forced`). All three outcomes are uncounted, `ended_at` is written
+as the last real activity (never `now()`, so no phantom minutes are booked against the
+allocation), and a worker that settles the session first simply wins. The snapshot
+(`lastOrphansLapsed`, `orphanLapseErrors`) and the log categories
+`r1_orphan_session_lapsed`, `r1_orphan_settle_failed`, `r1_orphan_lapse_throw` show it ran.
+After a failed start the tester still retries in the SAME tab (the stored nonce rejoins a
+live session); another tab or device sees `r1_busy` until the lapse runs.
+
 **Rubric.** Seed with `npx tsx scripts/seed-r1-role.ts` (dry run) then `--apply`.
 The five metrics, weights and four-level anchors are defined once in
 `app/api/src/lib/r1/rubric.ts`, derived from plan 6.1 and the HR prep deck; the

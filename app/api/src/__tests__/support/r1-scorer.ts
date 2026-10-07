@@ -101,9 +101,14 @@ export function cleanLogRows(): R1AdminLogRow[] {
   for (const [need, probed, revealed] of [['H1', 10, 12], ['H2', 14, 16], ['H3', 18, 20]] as const) {
     rows.push(logRow('need_revealed', { need, probed_turn: probed }, { turn_index: revealed }));
   }
+  // The deck's families, exactly as the worker posts them (r1_scheduler.py PLAN, r1_replies.py
+  // _MOVE_EVENTS): F2-F4 are a primary (family_delivered) and a push (push_delivered); F1 is the
+  // anchor (family_delivered) and the counter (counter_delivered). F1 has NO push row.
   for (const [n, family] of ['F1', 'F2', 'F3', 'F4'].entries()) {
     rows.push(logRow('family_delivered', { slip_seconds: 5 }, { turn_index: 12 + n, family_id: family }));
-    rows.push(logRow('push_delivered', { slip_seconds: 0 }, { turn_index: 14 + n, family_id: family }));
+    if (family !== 'F1') {
+      rows.push(logRow('push_delivered', { slip_seconds: 0 }, { turn_index: 14 + n, family_id: family }));
+    }
   }
   rows.push(logRow('counter_delivered', { slip_seconds: 2 }, { turn_index: 20, family_id: 'F1' }));
   rows.push(logRow('discount_detected', { amount_usd: 500, conditional: true, value_before: true }, { turn_index: 19 }));

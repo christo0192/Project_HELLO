@@ -114,4 +114,12 @@ docker exec -i "$SUPABASE_DB_CONTAINER" \
   psql -U postgres -d postgres -q -v ON_ERROR_STOP=1 \
   < "$TESTS/r1_candidate_routes_assert.sql"
 
-log 'PASS: full-chain assertions, first-of-month capacity race, terminal transition races, and 0120 primitives'
+# 0126 (PR-B): a COUNTED attempt whose session did not complete is scored (r1_settle_attempt
+# enqueues r1.assessment) and can be retaken (r1_transition_round grant-retake). Self-contained
+# fixtures (70000000-...), so it runs after the 0120 block that leaves its own behind.
+log 'Running R1 PR-B incomplete-attempt assertions (0126)...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -q -v ON_ERROR_STOP=1 \
+  < "$TESTS/r1_incomplete_attempts_assert.sql"
+
+log 'PASS: full-chain assertions, first-of-month capacity race, terminal transition races, 0120 primitives, and 0126 incomplete attempts'

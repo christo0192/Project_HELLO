@@ -23,7 +23,12 @@
  *                  second replica is harmless. The loop runs only while R1 is enabled, so a
  *                  window left open while it was off is overdue when R1 comes back: the RPC
  *                  drops a window more than an hour overdue (`window_stale`) instead of
- *                  executing it late.
+ *                  executing it late. It also LAPSES ORPHANED SESSIONS (`orphan-lapse.ts`): an
+ *                  R1 session no worker owns any more (created, waiting or in progress with no
+ *                  activity far past anything a live one takes) is failed or expired with a
+ *                  terminal reason and its attempt settled, because admission's one-live-R1
+ *                  rule is GLOBAL and one such row blocked every R1 start forever. A failure of
+ *                  one half never skips the other.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -40,6 +45,7 @@ import { createLogger } from '../logger.js';
 import { supabase } from '../supabase.js';
 import { getR1Config, type R1Config } from './config.js';
 import { R1_ASSESSMENT_QUEUE, createR1AssessmentHandler } from './assessment-handler.js';
+import { lapseOrphanedR1Sessions } from './orphan-lapse.js';
 import type { R1AssessmentOptions } from '../../services/r1-assessment.js';
 
 /** The ONLY queues this runtime registers. A structural test pins it. */
@@ -58,6 +64,10 @@ export const R1_RUNTIME_BOUNDS = {
 export interface R1RuntimeSnapshot {
   readonly lastStatusApplied: number | null;
   readonly statusLoopErrors: number;
+  /** Orphaned sessions the last lapse pass moved to a terminal state (null before the first pass). */
+  readonly lastOrphansLapsed: number | null;
+  /** Lapse reads/writes that failed (the next pass retries). */
+  readonly orphanLapseErrors: number;
   readonly jobEvents: Readonly<Record<string, number>>;
 }
 
@@ -124,6 +134,8 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
   const jobEvents: Record<string, number> = {};
   let lastStatusApplied: number | null = null;
   let statusLoopErrors = 0;
+  let lastOrphansLapsed: number | null = null;
+  let orphanLapseErrors = 0;
 
   const runner = createQueueRunner({
     queue,
@@ -149,8 +161,7 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
     },
   });
 
-  const statusTick = async (): Promise<boolean> => {
-    if (!(await r1Enabled())) return false;
+  const sweepPendingRejects = async (): Promise<boolean> => {
     try {
       const { data, error } = await client.rpc('r1_apply_due_pending_rejects', {
         p_now: clock().toISOString(),
@@ -168,6 +179,28 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
       logger.warn('unknown_event', { error_category: 'r1_status_sweep_throw' });
       return false;
     }
+  };
+
+  /** Lapse R1 sessions no worker owns. Never throws; its own counters, its own log category. */
+  const lapseOrphans = async (): Promise<boolean> => {
+    try {
+      const result = await lapseOrphanedR1Sessions(client as never, clock());
+      lastOrphansLapsed = result.lapsed;
+      orphanLapseErrors += result.errors;
+      return result.lapsed > 0;
+    } catch {
+      orphanLapseErrors += 1;
+      logger.warn('unknown_event', { error_category: 'r1_orphan_lapse_throw' });
+      return false;
+    }
+  };
+
+  const statusTick = async (): Promise<boolean> => {
+    if (!(await r1Enabled())) return false;
+    // Independent halves: one failing must never skip the other.
+    const rejected = await sweepPendingRejects();
+    const lapsed = await lapseOrphans();
+    return rejected || lapsed;
   };
 
   const loopIntervalsMs = {
@@ -193,7 +226,13 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
     queue,
     queues: R1_RUNTIME_QUEUES,
     loopIntervalsMs,
-    snapshot: () => ({ lastStatusApplied, statusLoopErrors, jobEvents: { ...jobEvents } }),
+    snapshot: () => ({
+      lastStatusApplied,
+      statusLoopErrors,
+      lastOrphansLapsed,
+      orphanLapseErrors,
+      jobEvents: { ...jobEvents },
+    }),
     async tickAll(): Promise<void> {
       await runner.tick();
       await statusTick();

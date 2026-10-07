@@ -255,6 +255,17 @@ describe('the handler', () => {
     ]);
   });
 
+  it('completes (does not retry or dead-letter) a job whose consent was withdrawn after it was queued', async () => {
+    const onResult = vi.fn();
+    const run = vi.fn(async () => { throw new Error('r1_consent_withdrawn'); });
+    const handler = createR1AssessmentHandler({ run, onResult });
+    await expect(handler(job({ session_id: SESSION_ID }, 5, 5))).resolves.toBeUndefined();
+    expect(onResult).not.toHaveBeenCalled();
+    // Any other failure still takes the retry/DLQ path.
+    const other = createR1AssessmentHandler({ run: async () => { throw new Error('r1_consent_read_error'); } });
+    await expect(other(job({ session_id: SESSION_ID }, 1, 5))).rejects.toThrow('r1_consent_read_error');
+  });
+
   it('reports each result to the observer', async () => {
     const onResult = vi.fn();
     const result = { sessionId: SESSION_ID } as never;

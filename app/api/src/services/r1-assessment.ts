@@ -9,6 +9,16 @@
  *   -> insert the v2 assessment -> r1_attach_assessment (round + audit)
  *   -> r1_apply_status_effect (the audited CAS; the flag ships OFF).
  *
+ * WHICH SESSIONS ARE SCORED. A `completed` session, and a COUNTED attempt whose session ended
+ * `failed` (the candidate left after the role-play started, the role-play silence ladder ran out,
+ * or the residency cap ended it: `r1_settle_attempt` counts these per plan D1 and enqueues the
+ * job in the same transaction while the round holds a live consent). Without this the attempt was
+ * counted, the round closed, and nothing was ever scored: no scorecard, no recommendation, and a
+ * round HR could neither read nor retake. A session that did not complete can NEVER pass the
+ * gate (`session_not_completed`, `session_not_clean`, and `system_failure_outcome` for the
+ * residency cap): HR gets a real scorecard and a `human_review` recommendation that says why.
+ * An uncounted attempt, or a failed session whose consent was withdrawn, is never scored.
+ *
  * IDEMPOTENT. A re-run for a session that already has a scored assessment skips the model
  * entirely and only re-drives the two RPCs, each of which is an idempotent no-op once done.
  * `uq_assessments_v2_session_revision` makes a concurrent double insert answer 23505, which
@@ -118,6 +128,12 @@ interface StoredAssessment {
   readonly raw: unknown;
 }
 
+/**
+ * The stable code for "this session's consent was withdrawn, so it is not scored". Not a fault:
+ * the queue handler completes the job without scoring instead of retrying it into the DLQ.
+ */
+export const R1_CONSENT_WITHDRAWN_CODE = 'r1_consent_withdrawn';
+
 function fail(code: string): never {
   throw new Error(code);
 }
@@ -137,8 +153,27 @@ async function loadSession(client: R1DbClient, sessionId: string): Promise<Sessi
   if (!data) fail('r1_session_not_found');
   const session = data as SessionRow;
   if (!session.interview_round_id || session.mode !== 'browser') fail('r1_session_invalid');
-  if (session.status !== 'completed') fail('r1_session_not_completed');
+  if (session.status === 'completed') return session;
+  // A session that did not complete is scored only as a COUNTED attempt that ended `failed`
+  // (see the header). Anything else (a live session, a cancelled or expired one, an uncounted
+  // attempt) has no role-play to judge and is refused exactly as before.
+  if (session.status !== 'failed') fail('r1_session_not_completed');
+  const attempt = await loadAttempt(client, sessionId);
+  if (!attempt.counted) fail('r1_session_not_completed');
+  // A withdrawn consent stops all processing of the interview, a failed one included.
+  if (!(await roundHasLiveConsent(client, session.interview_round_id))) fail(R1_CONSENT_WITHDRAWN_CODE);
   return session;
+}
+
+async function roundHasLiveConsent(client: R1DbClient, roundId: string): Promise<boolean> {
+  const { data, error } = await client
+    .from('interview_round_consents')
+    .select('id')
+    .eq('round_id', roundId)
+    .is('withdrawn_at', null)
+    .limit(1);
+  if (error) fail('r1_consent_read_error');
+  return Array.isArray(data) && data.length > 0;
 }
 
 async function loadLatestAssessment(
@@ -488,6 +523,7 @@ export async function runR1Assessment(
     const gateInput: R1GateInput = {
       transcript: stats,
       log: loaded.log,
+      sessionStatus: session.status,
       terminalReason: session.terminal_reason,
       attemptOutcome: attempt.outcome,
       scoring: {
@@ -635,16 +671,19 @@ async function loadSettings(client: R1DbClient): Promise<Settings> {
 async function loadAttempt(
   client: R1DbClient,
   sessionId: string,
-): Promise<{ outcome: string | null }> {
+): Promise<{ outcome: string | null; counted: boolean }> {
   const { data, error } = await client
     .from('interview_round_attempts')
-    .select('round_id,attempt_number,outcome')
+    .select('round_id,attempt_number,outcome,counted')
     .eq('session_id', sessionId)
     .maybeSingle();
   if (error) fail('r1_attempt_read_error');
   if (!data) fail('r1_attempt_missing');
-  const outcome = (data as { outcome: unknown }).outcome;
-  return { outcome: typeof outcome === 'string' ? outcome : null };
+  const row = data as { outcome: unknown; counted?: unknown };
+  return {
+    outcome: typeof row.outcome === 'string' ? row.outcome : null,
+    counted: row.counted === true,
+  };
 }
 
 async function loadScoringInputs(client: R1DbClient, session: SessionRow) {

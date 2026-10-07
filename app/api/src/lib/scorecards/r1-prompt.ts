@@ -79,6 +79,17 @@ export function formatAdministrationLog(log: R1AdministrationLog): string {
   lines.push('Objections the worker delivered (turn, slip in seconds from the scheduled moment):');
   for (const family of R1_FAMILIES) {
     const entry = log.families[family];
+    if (family === 'F1') {
+      // F1 is the $7,000 anchor and the counter after the advisor's first answer. It has no push.
+      const anchor = entry.primary === null
+        ? 'anchor NOT delivered'
+        : `anchor ${turnLabel(entry.primary.turn)} (slip ${num(entry.primary.slipSeconds)})`;
+      const counter = log.counter === null
+        ? 'counter NOT delivered'
+        : `counter ${turnLabel(log.counter.turn)} (slip ${num(log.counter.slipSeconds)})`;
+      lines.push(`- F1: ${anchor}; ${counter}`);
+      continue;
+    }
     const primary = entry.primary === null
       ? 'primary NOT delivered'
       : `primary ${turnLabel(entry.primary.turn)} (slip ${num(entry.primary.slipSeconds)})`;
@@ -87,9 +98,6 @@ export function formatAdministrationLog(log: R1AdministrationLog): string {
       : `push ${turnLabel(entry.push.turn)} (slip ${num(entry.push.slipSeconds)})`;
     lines.push(`- ${family}: ${primary}; ${push}`);
   }
-  lines.push(log.counter === null
-    ? '- F1 counter NOT delivered'
-    : `- F1 counter ${turnLabel(log.counter.turn)} (slip ${num(log.counter.slipSeconds)})`);
   lines.push('Discounts the worker detected in the candidate\'s offers:');
   if (log.discounts.length === 0) lines.push('- none');
   for (const discount of log.discounts) {
