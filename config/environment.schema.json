@@ -30,6 +30,7 @@
         "R1_LIVEKIT_URL": { "requiredInProduction": false, "secret": false },
         "R1_LIVEKIT_API_KEY": { "requiredInProduction": false, "secret": true },
         "R1_LIVEKIT_API_SECRET": { "requiredInProduction": false, "secret": true },
+        "R1_ENABLED": { "requiredInProduction": false, "secret": false },
         "LEGACY_BROWSER_SCREENING_ENABLED": { "requiredInProduction": false, "secret": false },
         "RECORDINGS_BUCKET": { "requiredInProduction": true, "secret": false },
         "RECORDING_DOWNLOAD_TTL_SEC": { "requiredInProduction": false, "secret": false },

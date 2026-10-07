@@ -21,6 +21,11 @@
  *    provider call. The candidate's valid invite plus a valid consent record
  *    IS the authorization for provisioning — there is no recruiter auth on
  *    this route.
+ * 6. Recruiter issuance refuses an R1 session (call_sessions.interview_round_id
+ *    set) with 409 `r1_session_not_invitable`, writing nothing. An R1 session is
+ *    joined only through /api/r1/* (attempt token, consent re-check and health
+ *    gate); a legacy invite for one would provision a marked R1 room and skip all
+ *    three.
  *
  * DB migration 0007 tables: candidate_invites, candidate_access_grants.
  * Invite active = consumed_at IS NULL AND revoked_at IS NULL.
@@ -182,7 +187,7 @@ invitesRouter.post(
       // Validate session exists
       const { data: session, error: sessionErr } = await supabase
         .from('call_sessions')
-        .select('id, candidate_id, status, external_call_id, owner_id')
+        .select('id, candidate_id, status, external_call_id, owner_id, interview_round_id')
         .eq('id', session_id)
         .single();
 
@@ -198,6 +203,16 @@ invitesRouter.post(
       // or an admin may issue an invite. owner_id is set at session creation.
       if (!inviteCtx.is_admin && session.owner_id !== inviteCtx.interviewer_id) {
         return res.status(403).json({ error: 'owner_mismatch' });
+      }
+
+      // R1 lane fence: a session bound to an interview round is joined ONLY via
+      // /api/r1/*. Issuing a legacy invite for it would let the exchange
+      // provision a marked R1 room (BROWSER_LIVEKIT_TARGET=r1) while skipping the
+      // R1 attempt token, the consent re-check and the health gate. Refused after
+      // the ownership check (no existence/lane oracle for non-owners) and before
+      // any write, so no invite row is created.
+      if (session.interview_round_id != null) {
+        return res.status(409).json({ error: 'r1_session_not_invitable' });
       }
 
       // Only allow inviting for non-terminal sessions
