@@ -1,0 +1,38 @@
+{
+  "schema": "gate_replay/v1",
+  "session_prefix": "7a84dc44",
+  "provenance": "synthetic_shape",
+  "summary": "Synthetic reconstruction of a shape, not a copy of a transcript: a short 'Okay.' at consent, then, about 7.4 s after it began and before the role line is heard, a request to reschedule. The second utterance starts only after the consent decision, so it is a revocation case (T07); T05 shifts it earlier to make it arrive while a verdict is in flight.",
+  "time_origin": "call.answered",
+  "candidate_first_name": "Meera",
+  "bot_lines": [
+    {"kind": "consent", "ask_ms": 3000, "first_audio_ms": 4200, "playout_end_ms": 11500},
+    {"kind": "role", "ask_ms": 19236, "first_audio_ms": 20620, "playout_end_ms": 27000}
+  ],
+  "vad_events": [
+    {"t_ms": 12060, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 12706, "type": "end_of_speech", "speech_duration_ms": 450, "silence_duration_ms": 256, "inference_duration_ms": 0},
+    {"t_ms": 19449, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 22156, "type": "end_of_speech", "speech_duration_ms": 2511, "silence_duration_ms": 256, "inference_duration_ms": 0}
+  ],
+  "stt_finals": [
+    {"t_ms": 13050, "text": "Okay."},
+    {"t_ms": 22800, "text": "Can we reschedule this, I'm out somewhere."}
+  ],
+  "committed_turns": [
+    {"t_ms": 13060, "text": "Okay.", "started_speaking_at_ms": 12000, "created_at_ms": 13060},
+    {"t_ms": 22810, "text": "Can we reschedule this, I'm out somewhere.", "started_speaking_at_ms": 19389, "created_at_ms": 22810}
+  ],
+  "judge_responses": {
+    "identity": []
+  },
+  "observed_production": {
+    "build": "synthetic",
+    "events": []
+  },
+  "notes": [
+    "Synthetic times and synthetic first name. Only the relative order is taken from the real call: the reschedule request began 7.39 s after 'Okay' began, after the gate batch was committed (consent already decided), and about 1.2 s before the role line's first audio.",
+    "No identity turn in this shape: the replay starts at the consent line.",
+    "The second committed turn lands while the role line is playing; a driver that models the role line as a non-interruptible say will see the SDK drop that commit, and only the STT final survives."
+  ]
+}

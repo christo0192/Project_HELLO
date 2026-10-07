@@ -514,6 +514,194 @@ class TestHeartbeatLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(halts, [])
 
 
+# ── M013 S01 T03: the heartbeat starts at the ANSWER, inside the gate ─
+
+class _FakeClock:
+    """A monotonic clock the test moves by hand, yielding as it goes so the
+    heartbeat task (whose sleep reads this clock) gets to run."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    async def advance(self, seconds, *, step=5.0):
+        while seconds > 0:
+            delta = min(step, seconds)
+            self.t += delta
+            seconds -= delta
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+    async def sleep(self, seconds):
+        target = self.t + seconds
+        while self.t < target:
+            await asyncio.sleep(0)
+
+
+class TestGateHeartbeat(unittest.IsolatedAsyncioTestCase):
+    """`run_phone_gate`'s `start_lease_heartbeat` seam (T03).
+
+    The heartbeat used to start only after consent; the gate got one
+    fire-and-forget re-base at the answer and nothing after it, so a long
+    callback conversation could outlive the lease. Now the call's ONE
+    heartbeat starts at the answer and its first beat replaces the re-base.
+    """
+
+    async def _gate(self, *, start_lease_heartbeat=None, classify=None,
+                    budget=None, session_id=_SESSION_ID, epoch=_EPOCH):
+        rebases: list[tuple] = []
+        spoken: list[str] = []
+
+        async def fake_rebase(_client, attempt_id, sid, ep):
+            rebases.append((attempt_id, sid, ep))
+            return False
+
+        async def say(text):
+            spoken.append(text)
+
+        async def deferred():
+            return phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE
+
+        client = types.SimpleNamespace(
+            post_event=lambda *_a, **_k: _applied(),
+        )
+        with patch.object(phone, "rebase_lease_on_answer", fake_rebase), \
+                patch.dict(phone.os.environ, {"PHONE_GATE_FLOW": "deterministic"}):
+            result = await phone.run_phone_gate(
+                attempt_id=_ATTEMPT_ID, client=client,
+                wait_for_participant=lambda: _present(),
+                classify=classify or deferred, say=say,
+                post_call_answered=True, session_id=session_id, epoch=epoch,
+                gate_budget=budget, start_lease_heartbeat=start_lease_heartbeat,
+            )
+            for _ in range(5):
+                await asyncio.sleep(0)
+        return result, rebases, spoken
+
+    async def test_a_running_heartbeat_REPLACES_the_one_shot_rebase(self):
+        started: list[bool] = []
+        result, rebases, spoken = await self._gate(
+            start_lease_heartbeat=lambda: started.append(True) or True)
+        self.assertEqual(started, [True])
+        self.assertEqual(rebases, [])
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertEqual(spoken[-1], phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+
+    async def test_no_heartbeat_keeps_the_rebase_and_CAPS_the_budget(self):
+        """No session id or epoch: no heartbeat can fence, so the re-base is
+        kept and the gate may not outlive the admission lease known to remain
+        (lease - boot/join - the ring this gate measured)."""
+        clock = _FakeClock()
+        budget = phone.GateBudget(180.0, clock=clock)
+
+        async def ring():
+            await clock.advance(40.0)
+            return object()
+
+        rebases: list[tuple] = []
+
+        async def fake_rebase(_client, attempt_id, sid, ep):
+            rebases.append((attempt_id, sid, ep))
+            return False
+
+        async def say(_text):
+            return None
+
+        async def deferred():
+            return phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE
+
+        client = types.SimpleNamespace(post_event=lambda *_a, **_k: _applied())
+        with patch.object(phone, "rebase_lease_on_answer", fake_rebase), \
+                patch.dict(phone.os.environ, {"PHONE_GATE_FLOW": "deterministic"}):
+            await phone.run_phone_gate(
+                attempt_id=_ATTEMPT_ID, client=client, wait_for_participant=ring,
+                classify=deferred, say=say, post_call_answered=True,
+                session_id=None, epoch=_EPOCH, gate_budget=budget,
+                start_lease_heartbeat=lambda: False,
+            )
+            await asyncio.sleep(0)
+        self.assertEqual(rebases, [(_ATTEMPT_ID, None, _EPOCH)])
+        self.assertEqual(budget.capped_by, "unrenewed_lease")
+        # Answer at t=40: 240 - 52 - 40 = 148 s of lease left, less the margin.
+        self.assertAlmostEqual(
+            budget.remaining(), 148.0 - phone.GATE_BUDGET_MARGIN_SEC, places=6)
+
+    async def test_a_heartbeat_with_room_to_spare_does_not_cap_the_budget(self):
+        clock = _FakeClock()
+        budget = phone.GateBudget(180.0, clock=clock)
+        await self._gate(start_lease_heartbeat=lambda: True, budget=budget)
+        self.assertIsNone(budget.capped_by)
+        self.assertAlmostEqual(budget.remaining(), 180.0 - phone.GATE_BUDGET_MARGIN_SEC)
+
+    async def test_a_RAISING_start_falls_back_to_the_rebase(self):
+        def boom():
+            raise RuntimeError("synthetic")
+
+        records: list[tuple] = []
+
+        def _emit(level, event, meta=None):
+            records.append((level, event, dict(meta or {})))
+
+        with patch.object(phone._log, "_emit", _emit):
+            result, rebases, _ = await self._gate(start_lease_heartbeat=boom)
+        self.assertEqual(len(rebases), 1)
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertIn(
+            "gate_heartbeat_start_failed",
+            [r[2].get("error_category") for r in records])
+
+    async def test_without_the_seam_the_gate_is_unchanged(self):
+        _result, rebases, _ = await self._gate()
+        self.assertEqual(rebases, [(_ATTEMPT_ID, _SESSION_ID, _EPOCH)])
+
+    async def test_the_heartbeat_RENEWS_during_a_long_gate(self):
+        """A 100 s gate (fake clock): beats at the answer and keeps beating,
+        at the server's cadence, while the gate is still talking."""
+        clock = _FakeClock()
+        hb_client = ScriptedHeartbeatClient([_ok(30)] * 10)
+        halts: list[str] = []
+        tasks: list[asyncio.Task] = []
+
+        async def halt(reason):
+            halts.append(reason)
+
+        def start():
+            tasks.append(asyncio.ensure_future(phone.run_phone_heartbeat(
+                attempt_id=_ATTEMPT_ID, session_id=_SESSION_ID, epoch=_EPOCH,
+                client=hb_client, halt=halt, sleep=clock.sleep,
+            )))
+            return True
+
+        async def slow_consent():
+            await clock.advance(100.0)
+            return phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE
+
+        try:
+            result, rebases, _ = await self._gate(
+                start_lease_heartbeat=start, classify=slow_consent,
+                budget=phone.GateBudget(180.0, clock=clock))
+        finally:
+            for task in tasks:
+                task.cancel()
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertEqual(rebases, [])
+        self.assertEqual(halts, [])
+        # The immediate beat at the answer plus at least one renewal inside
+        # the gate (at 30 s cadence over 100 s: 0, 30, 60, 90).
+        self.assertGreaterEqual(len(hb_client.calls), 2)
+        self.assertEqual(len(hb_client.calls), 4)
+
+
+async def _applied():
+    return phone.PhoneApiOutcome(True, "applied")
+
+
+async def _present():
+    return object()
+
+
 # ── Nothing identifying is ever logged ────────────────────────────────
 
 class TestHeartbeatLogsNoIdentifier(unittest.IsolatedAsyncioTestCase):

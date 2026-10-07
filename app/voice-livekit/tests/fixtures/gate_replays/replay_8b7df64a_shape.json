@@ -1,0 +1,32 @@
+{
+  "schema": "gate_replay/v1",
+  "session_prefix": "8b7df64a",
+  "provenance": "synthetic_shape",
+  "summary": "Synthetic reconstruction of a shape, not a copy of a transcript: one consent reply that opens with a hesitant yes and then says now is not a good time. The legacy regex grants on the leading yes (a known false grant on the offline bank); the judge must not.",
+  "time_origin": "call.answered",
+  "candidate_first_name": "Arjun",
+  "bot_lines": [
+    {"kind": "consent", "ask_ms": 3000, "first_audio_ms": 4300, "playout_end_ms": 11000}
+  ],
+  "vad_events": [
+    {"t_ms": 12160, "type": "start_of_speech", "speech_duration_ms": 50, "silence_duration_ms": 0, "inference_duration_ms": 10},
+    {"t_ms": 16156, "type": "end_of_speech", "speech_duration_ms": 3800, "silence_duration_ms": 256, "inference_duration_ms": 0}
+  ],
+  "stt_finals": [
+    {"t_ms": 16800, "text": "Uh, yes. For me some other time, busy right now."}
+  ],
+  "committed_turns": [
+    {"t_ms": 16810, "text": "Uh, yes. For me some other time, busy right now.", "started_speaking_at_ms": 12100, "created_at_ms": 16810}
+  ],
+  "judge_responses": {
+    "identity": []
+  },
+  "observed_production": {
+    "build": "synthetic",
+    "events": []
+  },
+  "notes": [
+    "Synthetic times and synthetic first name. A single utterance with a single final, so the turn-grouping rule cannot split it: the defect is the classifier, not the barrier.",
+    "No identity turn in this shape: the replay starts at the consent line."
+  ]
+}

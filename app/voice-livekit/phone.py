@@ -53,6 +53,7 @@ from datetime import datetime, time as dt_time, timedelta, timezone
 from typing import Any, Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
+import gate_judge
 from observability import StructuredLogger, get_correlation_id
 from provider_resilience import (
     BusinessError,
@@ -464,12 +465,183 @@ PHONE_WITHDRAWAL_CONFIRM_REASK_TEXT = (
     "Sorry, just so I get this right: should I stop here, or carry on with "
     "the questions?"
 )
-# Asked once when the first response cannot be read as any of the five outcomes.
-# Consent must be affirmative, so an unreadable answer is re-asked rather than
-# assumed either way.
-PHONE_REASK_TEXT = (
-    "Sorry, I just need a yes or a no — is it okay if we carry on with this "
+# M013 S01 T07: the ONE confirmation asked when, right after consent (during
+# the role line or the first question), the judge reads the candidate as busy
+# ("can we reschedule this, I'm out somewhere"). A yes goes to the existing
+# in-call callback path; a no, or an answer, carries on with the first
+# question. Asked before anything ends, so a Q1 answer like "I'm busy with a
+# project at work" can never end the screening. Fixed copy: it is gate copy,
+# never a screening turn.
+PHONE_REVOCATION_BUSY_CONFIRM_TEXT = (
+    "Would you prefer I call you back at a better time?"
+)
+# M013 S01 T09: the reply to a bare "Yes" / "Yeah" / "Right" after the
+# end-of-screening "any questions?" invite. The candidate is saying they have a
+# question but has not asked it yet; the old silent hold left them waiting for
+# a prompt that never came. Fixed copy, never a screening turn.
+PHONE_QNA_GO_AHEAD_TEXT = "Sure, go ahead."
+# ── The consent re-ask, worded by WHY it is asked (M013 S01 T02) ──────────
+# Asked at most once when the first reply cannot be read as an outcome. Consent
+# must be affirmative, so an unreadable answer is re-asked rather than assumed
+# either way. The old single line demanded "a yes or a no", which is the wrong
+# thing to say to somebody who just said they are busy (that is a callback now,
+# never a re-ask), who asked a question, or who said nothing at all. These are
+# gate copy, not the AI disclosure, and they are never spoken after a grant or
+# a busy verdict. Every one is registered in `gate_copy_texts`.
+CONSENT_REASK_UNCLEAR = "unclear"
+CONSENT_REASK_SILENCE = "silence"
+CONSENT_REASK_QUESTION = "question"
+#: The reply was heard but did not answer the question.
+PHONE_CONSENT_REASK_UNCLEAR_TEXT = (
+    "Sorry, I didn't quite catch that. Is it okay if we carry on with this "
     "recorded call?"
+)
+#: Nothing usable was heard in the answer window.
+PHONE_CONSENT_REASK_SILENCE_TEXT = (
+    "Sorry, I couldn't hear a reply. Is it okay if we carry on with this "
+    "recorded call?"
+)
+#: The reply was a question back ("who is this?", "what is this about?"). It
+#: restates the purpose and repeats the recording sentence VERBATIM, then asks
+#: again. It says nothing about being an AI (owner constraint: no new AI
+#: wording); T05 adds the fixed FAQ answers on top of this.
+PHONE_CONSENT_REASK_QUESTION_TEXT = (
+    "Sure. It's a short screening call about your job application. "
+    "This call is recorded so the hiring team can review it. "
+    "Is it okay if we carry on?"
+)
+_CONSENT_REASK_TEXTS: dict[str, str] = {
+    CONSENT_REASK_UNCLEAR: PHONE_CONSENT_REASK_UNCLEAR_TEXT,
+    CONSENT_REASK_SILENCE: PHONE_CONSENT_REASK_SILENCE_TEXT,
+    CONSENT_REASK_QUESTION: PHONE_CONSENT_REASK_QUESTION_TEXT,
+}
+
+
+def phone_consent_reask_text(reason: Any) -> str:
+    """The consent re-ask for ``reason``; an unknown reason is ``unclear``."""
+    return _CONSENT_REASK_TEXTS.get(
+        reason if isinstance(reason, str) else "", PHONE_CONSENT_REASK_UNCLEAR_TEXT,
+    )
+
+
+# ── Fixed answers to a question asked at the consent turn (M013 S01 T05) ─────
+# When the gate judge reads the consent reply as a QUESTION, the bot answers
+# from fixed copy only and then asks again. Owner constraints: the answers
+# state only facts the worker holds (the role title from the server
+# projection; "the hiring team"), never an invented duration or number; and
+# no new sentence about being an AI is written: "is this an AI?" is answered
+# with the VERBATIM first sentence of `phone_identity_text`. Every line is
+# registered in `gate_copy_texts` (the role answer by its fixed frame in
+# `is_gate_copy`).
+CONSENT_FAQ_HOW_LONG = "how_long"
+CONSENT_FAQ_WHO_REVIEWS = "who_reviews"
+CONSENT_FAQ_WHAT_ROLE = "what_role"
+CONSENT_FAQ_IS_AI = "is_ai"
+#: No factual duration source exists on the worker, so no number is given.
+PHONE_CONSENT_FAQ_HOW_LONG_TEXT = "It's a short call, just a few questions."
+PHONE_CONSENT_FAQ_WHO_REVIEWS_TEXT = "The hiring team reviews it."
+PHONE_CONSENT_FAQ_ROLE_UNKNOWN_TEXT = "It's about your job application."
+_CONSENT_FAQ_ROLE_PREFIX = "It's about the "
+_CONSENT_FAQ_ROLE_SUFFIX = " role you applied for."
+_CONSENT_FAQ_ROLE_MAX_CHARS = 80
+#: Asked right after a fixed answer. The recording sentence VERBATIM, then the
+#: question, so the reply to it is informed consent on its own.
+PHONE_CONSENT_REASK_AFTER_ANSWER_TEXT = (
+    "This call is recorded so the hiring team can review it. "
+    "Is it okay if we carry on?"
+)
+
+
+def phone_ai_identity_sentence() -> str:
+    """The VERBATIM first sentence of `phone_identity_text`.
+
+    "Hi, this is Christy, an AI voice assistant calling from <company>." It is
+    derived from the identity line itself, never re-typed, so the answer to
+    "is this an AI?" can only ever be words the owner already approved.
+    """
+    line = phone_identity_text(None)
+    end = line.find(f"{_COMPANY}.")
+    if end < 0:  # pragma: no cover — pinned by a test
+        return line
+    return line[: end + len(_COMPANY) + 1]
+
+
+def _consent_faq_role_text(role_title: Any) -> str:
+    role = " ".join(str(role_title or "").split())
+    if not role or len(role) > _CONSENT_FAQ_ROLE_MAX_CHARS:
+        return PHONE_CONSENT_FAQ_ROLE_UNKNOWN_TEXT
+    return f"{_CONSENT_FAQ_ROLE_PREFIX}{role}{_CONSENT_FAQ_ROLE_SUFFIX}"
+
+
+def phone_consent_faq_text(kind: Any, *, role_title: Any = None) -> Optional[str]:
+    """The fixed answer to a consent-turn question of ``kind``, or None.
+
+    ``None`` (an ``other`` question, or anything unknown) means no fixed
+    answer exists: the caller speaks the question re-ask
+    (`PHONE_CONSENT_REASK_QUESTION_TEXT`) alone.
+    """
+    if kind == CONSENT_FAQ_HOW_LONG:
+        return PHONE_CONSENT_FAQ_HOW_LONG_TEXT
+    if kind == CONSENT_FAQ_WHO_REVIEWS:
+        return PHONE_CONSENT_FAQ_WHO_REVIEWS_TEXT
+    if kind == CONSENT_FAQ_WHAT_ROLE:
+        return _consent_faq_role_text(role_title)
+    if kind == CONSENT_FAQ_IS_AI:
+        return phone_ai_identity_sentence()
+    return None
+
+
+# ── The consent line, split at the recording sentence (M013 S01 T05) ────────
+def phone_split_consent_line(line: Any) -> tuple[str, str]:
+    """``(part_a, part_b)`` with ``part_a + part_b == line``.
+
+    Part B starts at the VERBATIM recording sentence and runs to the end (the
+    sentence and the consent question); part A is everything before it, and
+    may be empty. A line without the verbatim sentence is ``("", line)``. The
+    gate speaks the two parts back to back so it can tell WHEN the recording
+    notice was heard: a consent grant must rest on speech that began after it.
+    The wording is unchanged, character for character.
+    """
+    text = line if isinstance(line, str) else ""
+    index = text.find(PHONE_DISCLOSURE_RECORDING_SENTENCE)
+    if index <= 0:
+        return "", text
+    return text[:index], text[index:]
+
+
+def _split_parts_of(*lines: str) -> list[str]:
+    parts: list[str] = []
+    for line in lines:
+        part_a, part_b = phone_split_consent_line(line)
+        if part_a.strip():
+            parts.extend([part_a.strip(), part_b.strip()])
+    return parts
+
+
+def phone_disclosure_line_start(text: Any) -> bool:
+    """True when ``text`` is the FIRST audible piece of a fixed disclosure line
+    (the whole line, or its part A when the gate splits it)."""
+    if not isinstance(text, str):
+        return False
+    clean = text.strip()
+    starts = {PHONE_DISCLOSURE_TEXT, PHONE_DISCLOSURE_CONTINUATION_TEXT}
+    for line in (PHONE_DISCLOSURE_TEXT, PHONE_DISCLOSURE_CONTINUATION_TEXT):
+        part_a, _ = phone_split_consent_line(line)
+        if part_a.strip():
+            starts.add(part_a.strip())
+    return clean in starts
+
+
+#: The goodbye spoken on every pre-consent DEFERRAL that has no more specific
+#: line of its own: silence or an unreadable reply after a person spoke, a
+#: classifier timeout, exception or unknown verdict, and the gate wall-clock
+#: overrun. A person who spoke is never hung up on in silence as "voicemail"
+#: (S01 T02). It promises only what `candidate.deferred_pre_disclosure` does:
+#: the attempt ends uncharged and the team tries again another day. Kept SHORT
+#: (about 4 s of audio): on a wall-clock overrun it must play inside the 4 s
+#: goodbye bound before the room is torn down.
+PHONE_GATE_DEFERRAL_GOODBYE_TEXT = (
+    "Sorry, I'll let you go for now. Our team will call you another time. Bye!"
 )
 PHONE_WRONG_NUMBER_TEXT = (
     "Sorry about that, I've reached the wrong person. I'll have this number "
@@ -674,13 +846,17 @@ def phone_role_opening_text(role_title: str | None) -> str | None:
     spoken when the role is unknown, generation fails, or the generated line does
     not name the exact role (`phone_role_opening_faithful` is False) — so the
     verbatim server role is NEVER lost to a paraphrase or a hallucination.
+
+    M013 S01 review fix: no "Really glad you could hop on" pleasantry. After
+    the identity and consent lines it was the third greeting the owner
+    complained about (T08b), and every compose miss or timeout played it.
     """
     role = (role_title or "").strip()
     if not role:
         return None
     return (
         f"{_PHONE_ROLE_OPENING_PREFIX}this is about the {role} role at "
-        "Interview Kickstart. Really glad you could hop on — let's dive in!"
+        "Interview Kickstart."
     )
 
 
@@ -698,10 +874,19 @@ def phone_role_opening_instruction(role_title: str | None) -> str | None:
     if not role:
         return None
     return (
-        "You are Christy, warmly opening a friendly phone screening. In ONE or "
-        "two short, natural spoken sentences: confirm this chat is about the "
-        f"\"{role}\" role at Interview Kickstart, and say you're glad they could "
-        "hop on. You MUST say the exact role title "
+        # M013 S01 T08b: THE THIRD GREETING. This one-shot has no context, so
+        # it did not know the call was already open: live, the role line
+        # opened "Hi there, thanks for hopping on…" after the identity line
+        # and the consent line had both greeted. Say so, and
+        # `phone_role_opening_clean` rejects a draft that greets anyway.
+        "You are Christy, partway into a friendly phone screening you have "
+        "ALREADY opened: the candidate has already been greeted and has just "
+        "agreed to continue. In ONE or two short, natural spoken sentences: "
+        f"confirm this chat is about the \"{role}\" role at Interview "
+        "Kickstart and hand over warmly to the questions. Do NOT greet them "
+        "again: do not say hi, hello or hey, do not introduce yourself again, "
+        "and do not thank them for hopping on, joining or taking the call. "
+        "You MUST say the exact role title "
         f"\"{role}\" verbatim, word for word — never paraphrase, shorten, or "
         "guess a different role. No stage directions. "
         # THE CONTRADICTION THAT CAUSED THE DOUBLE QUESTION. This used to say
@@ -765,7 +950,49 @@ def phone_role_opening_clean(text: Any, role_title: Any) -> bool:
     """
     if not phone_role_opening_faithful(text, role_title):
         return False
+    if phone_role_opening_greets(text):
+        return False
     return phone_generated_question_act_count(text) == 0
+
+
+# M013 S01 T08b: the role line is the THIRD bot turn of the call, after the
+# identity line and the consent line have both greeted. A leading greeting
+# (optionally after one filler word: "Great, hi there"), a self-introduction,
+# or "thanks for hopping on / joining / taking the call" is a third greeting.
+_ROLE_OPENING_LEADING_GREETING_RE = re.compile(
+    r"^\W*(?:(?:okay|ok|great|awesome|lovely|perfect|wonderful|alright|"
+    r"all right|so|well|oh)\W+)?"
+    r"(?:hi|hello|hey|hiya|howdy|namaste|greetings|"
+    r"good\s+(?:morning|afternoon|evening|day))\b",
+    re.IGNORECASE,
+)
+_ROLE_OPENING_THANKS_FOR_JOINING_RE = re.compile(
+    r"\bthank(?:s|\s+you)\b[^.!?]{0,40}?\b(?:"
+    r"hop(?:ping)?\s+on|join(?:ing)?|"
+    r"tak(?:e|ing)\s+(?:the|this|my|our)\s+call|"
+    r"mak(?:e|ing)\s+(?:the\s+)?time|pick(?:ing)?\s+up|com(?:e|ing)\s+on)\b",
+    re.IGNORECASE,
+)
+_ROLE_OPENING_SELF_INTRO_RE = re.compile(
+    r"\b(?:i\s+am|i'm|i’m|this\s+is|my\s+name\s+is|it's|it’s)\s+christy\b",
+    re.IGNORECASE,
+)
+
+
+def phone_role_opening_greets(text: Any) -> bool:
+    """True when a role-opening draft greets the candidate (again).
+
+    Fail-closed for non-strings (True), so a caller that forgets the type
+    check still falls back to the fixed line.
+    """
+    if not isinstance(text, str):
+        return True
+    compact = " ".join(text.split())
+    return bool(
+        _ROLE_OPENING_LEADING_GREETING_RE.search(compact)
+        or _ROLE_OPENING_THANKS_FOR_JOINING_RE.search(compact)
+        or _ROLE_OPENING_SELF_INTRO_RE.search(compact)
+    )
 
 
 def phone_q1_rephrase_instruction(question_text: Any) -> str | None:
@@ -833,7 +1060,22 @@ def gate_copy_texts() -> frozenset[str]:
         # skip, binding the candidate's first answer to the disclosure text
         # instead of Q1.
         PHONE_DISCLOSURE_CONTINUATION_TEXT,
-        PHONE_REASK_TEXT,
+        # M013 S01 T02: the reason-specific consent re-asks and the deferral
+        # goodbye. Unregistered, any of them would reach `latest_assistant[0]`
+        # and break the Q1 priming guard exactly as described above.
+        *_CONSENT_REASK_TEXTS.values(),
+        PHONE_GATE_DEFERRAL_GOODBYE_TEXT,
+        # M013 S01 T05: the fixed answers to a consent-turn question, the
+        # re-ask spoken after one, and the two halves of each fixed
+        # disclosure line as the gate now speaks them (split at the recording
+        # sentence). The role answer carries a runtime value and is matched by
+        # its fixed frame in `is_gate_copy`.
+        PHONE_CONSENT_FAQ_HOW_LONG_TEXT,
+        PHONE_CONSENT_FAQ_WHO_REVIEWS_TEXT,
+        PHONE_CONSENT_FAQ_ROLE_UNKNOWN_TEXT,
+        phone_ai_identity_sentence(),
+        PHONE_CONSENT_REASK_AFTER_ANSWER_TEXT,
+        *_split_parts_of(PHONE_DISCLOSURE_TEXT, PHONE_DISCLOSURE_CONTINUATION_TEXT),
         PHONE_REFUSED_TEXT,
         PHONE_OPT_OUT_TEXT,
         # M009 PR-C (C7): the mid-call withdrawal confirmation and its single
@@ -841,6 +1083,10 @@ def gate_copy_texts() -> frozenset[str]:
         # open question's boundary as if it were a screening turn.
         PHONE_WITHDRAWAL_CONFIRM_TEXT,
         PHONE_WITHDRAWAL_CONFIRM_REASK_TEXT,
+        # M013 S01 T07: the post-consent busy confirmation.
+        PHONE_REVOCATION_BUSY_CONFIRM_TEXT,
+        # M013 S01 T09: the go-ahead after a bare "Yes" to the Q&A invite.
+        PHONE_QNA_GO_AHEAD_TEXT,
         PHONE_WRONG_NUMBER_TEXT,
         PHONE_ASSESSMENT_CLOSING_TEXT,
         PHONE_CANDIDATE_END_TEXT,
@@ -854,6 +1100,13 @@ def gate_copy_texts() -> frozenset[str]:
         # The terminal wording of the same refusals. Omitting these would make
         # the bot's own sign-off look like a screening answer.
         *_SCHEDULE_TERMINAL_TEXT.values(),
+        # M013 S01 T06: the gate's callback conversation. The day-specific
+        # time question and the confirm question name a day/time, so
+        # `is_gate_copy` matches them by their fixed frames.
+        _CALLBACK_EARLIEST_TOMORROW_TEXT,
+        _CALLBACK_TOO_FAR_TEXT,
+        _CALLBACK_OUTSIDE_HOURS_TEXT,
+        PHONE_CALLBACK_NOTHING_BOOKED_TEXT,
     ])
 
 
@@ -868,6 +1121,20 @@ def is_gate_copy(text: Any) -> bool:
         # M009 PR-C (C5): the booked line names its time, so it is composed at
         # runtime and matched by its fixed prefix (`_callback_booked_text`).
         clean.startswith(_CALLBACK_BOOKED_PREFIX)
+    ) or (
+        # M013 S01 T05: the consent-turn "what role?" answer names the role.
+        clean.startswith(_CONSENT_FAQ_ROLE_PREFIX)
+        and clean.endswith(_CONSENT_FAQ_ROLE_SUFFIX)
+    ) or (
+        # M013 S01 T06: "Sure, what time tomorrow works? Anywhere between …".
+        clean.startswith(_CALLBACK_PARTIAL_TIME_PREFIX)
+        and clean.endswith(_CALLBACK_PARTIAL_TIME_SUFFIX)
+    ) or (
+        # M013 S01 T06: the confirm question for a time the candidate did not
+        # say verbatim ("So that's tomorrow at 2 in the afternoon, India time.
+        # Does that work?").
+        clean.endswith(_CALLBACK_OFFER_SUFFIX)
+        and any(clean.startswith(p) for p in _CALLBACK_OFFER_PREFIXES.values())
     )
 
 
@@ -1321,6 +1588,19 @@ def phone_output_subscribe_timeout_sec() -> float:
     return _bounded_float(os.getenv("PHONE_OUTPUT_SUBSCRIBE_TIMEOUT_SEC"), 8.0, 0.5, 30.0)
 
 
+def phone_gate_compose_timeout_sec() -> float:
+    """Cap on composing ONE gate line (identity ask, consent line) privately.
+
+    M013 S01 T08a (roadmap 10). The compose is a buffered, tool-less draft the
+    gate validates before speaking, and every miss already falls back to a
+    fixed line, so waiting longer only ever buys silence on the call. The old
+    hard-coded 4 s cap could hold the first word of the call for 4 s on a slow
+    provider. Default 1.5 s; clamped to 0.5–4.0 (4.0 is the old cap); garbage
+    is the default.
+    """
+    return _bounded_float(os.getenv("PHONE_GATE_COMPOSE_TIMEOUT_SEC"), 1.5, 0.5, 4.0)
+
+
 def phone_classify_timeout_sec() -> float:
     """Bounded wall clock BACKSTOP for the whole human/machine decision.
 
@@ -1331,8 +1611,63 @@ def phone_classify_timeout_sec() -> float:
     beat late — or answered the wrong (identity) question and needed the re-ask —
     was torn down to MACHINE before they could answer. This outer bound is now
     only a hung-classifier backstop, sized above the per-attempt budget.
+
+    M013 S01 T02: DERIVED, and an explicit value can only RAISE it. The fixed
+    40 s wrapped 2 x 15 s answer windows plus one re-ask playout with almost no
+    room; one judge round-trip per attempt, or a slower re-ask, overflowed it
+    and the expiry used to be "machine". The effective backstop is now
+    ``max(configured, phone_classify_backstop_floor_sec())``, so
+    fly.phone.toml's ``PHONE_CLASSIFY_TIMEOUT_SEC = "40"`` can no longer cut a
+    consent read short. Its expiry is a spoken deferral, never "machine".
     """
-    return _bounded_float(os.getenv("PHONE_CLASSIFY_TIMEOUT_SEC"), 40.0, 1.0, 120.0)
+    configured = _bounded_float(
+        os.getenv("PHONE_CLASSIFY_TIMEOUT_SEC"), 40.0, 1.0, 120.0)
+    return max(configured, phone_classify_backstop_floor_sec())
+
+
+#: How many answers the consent reader takes: the first, and one re-ask.
+PHONE_CONSENT_ATTEMPTS = 2
+#: A conservative playout estimate for one consent-phase line (the re-ask).
+_CONSENT_LINE_ESTIMATE_SEC = 6.0
+#: Slack on top of the derived consent budget.
+_CONSENT_BACKSTOP_MARGIN_SEC = 5.0
+
+
+#: llm mode (review fix): a judged question back buys one more round
+#: (agent `_CONSENT_MAX_ATTEMPTS_WITH_QUESTION`), answered by a fixed FAQ line.
+_CONSENT_ATTEMPTS_LLM = 3
+
+
+def phone_classify_backstop_floor_sec() -> float:
+    """The smallest consent backstop that cannot cut off a real answer.
+
+    legacy / shadow: attempts x (answer window + line + judge timeout) +
+    margin. With the defaults that is 2 x (15 + 6 + 1.7) + 5 = 50.4 s. The
+    judge timeout is counted even in legacy mode: a backstop that is a few
+    seconds generous costs nothing, one that is short ends a call a person is
+    answering.
+
+    llm (review fix): the judge ACTS, so one attempt can also spend a
+    re-judge per quiescence wait and the waits themselves, and a question
+    back buys a third round with an FAQ line before its re-ask:
+    3 x (15 + 2 x 6 + 3 x 1.7 + 2 x 6) + 5 = 137.3 s with the defaults. Still
+    only the wedge backstop: `GateBudget` decides every healthy re-ask.
+    """
+    answer = phone_classify_answer_timeout_sec()
+    judge = gate_judge.judge_timeout_sec()
+    if gate_judge.judge_mode() == gate_judge.GATE_JUDGE_MODE_LLM:
+        rejudges = gate_judge.GATE_JUDGE_MAX_REJUDGES
+        per_attempt = (
+            answer
+            + 2 * _CONSENT_LINE_ESTIMATE_SEC
+            + (1 + rejudges) * judge
+            + rejudges * gate_judge.GATE_QUIESCENCE_WAIT_MAX_SEC
+        )
+        return _CONSENT_ATTEMPTS_LLM * per_attempt + _CONSENT_BACKSTOP_MARGIN_SEC
+    return (
+        PHONE_CONSENT_ATTEMPTS * (answer + _CONSENT_LINE_ESTIMATE_SEC + judge)
+        + _CONSENT_BACKSTOP_MARGIN_SEC
+    )
 
 
 def phone_classify_answer_timeout_sec() -> float:
@@ -1363,6 +1698,150 @@ def phone_identity_answer_timeout_sec() -> float:
     """
     return _bounded_float(
         os.getenv("PHONE_IDENTITY_ANSWER_TIMEOUT_SEC"), 4.0, 2.0, 30.0)
+
+
+# ── M013 S01 T03: the gate's time budget ──────────────────────────────
+#
+# The worker's wall clock (`agent.PHONE_GATE_MAX_SECONDS`, wrapped around the
+# whole gate) is a WEDGE backstop: when it fires the gate task is cancelled
+# wherever it happens to be, mid-line or mid-booking. A healthy gate must
+# never reach it. So every new ask (identity re-ask, consent line, consent
+# re-ask, callback turn) first checks that one more round still fits before
+# the deadline; if it does not, the gate says the deferral goodbye and posts
+# `candidate.deferred_pre_disclosure` (uncharged, next IST-day window) on its
+# own terms, with time left to do both.
+
+#: Kept back at the end of the gate budget for the deferral goodbye (about 4 s
+#: of audio) and its terminal post, so a budget exit always finishes before
+#: the wall clock would cancel it.
+GATE_BUDGET_MARGIN_SEC = 10.0
+#: A conservative playout estimate for one short fixed gate line: a re-ask, a
+#: callback question or a read-back.
+GATE_LINE_ESTIMATE_SEC = 6.0
+#: The same for the consent line (the recording disclosure plus its question).
+GATE_DISCLOSURE_LINE_ESTIMATE_SEC = 12.0
+#: The admission lease the API mints at admission (`PHONE_LEASE_SECONDS`,
+#: 240 s, app/api/src/lib/phone-screening/config.ts). Only used when the gate
+#: heartbeat cannot run: then nothing renews the lease during the gate.
+PHONE_ADMISSION_LEASE_SEC = 240.0
+#: The worst case spent of that lease before the ring even starts: a cold
+#: machine boot (<= 32 s) plus the agent-join wait before originate (<= 20 s).
+#: Mirrors tests/test_phone_answer.py `TestLeaseBudget`.
+PHONE_PRE_RING_LEASE_SPEND_SEC = 52.0
+#: The fixed outcome schema of a gate that ran out of budget.
+GATE_BUDGET_EXHAUSTED_SCHEMA = "gate_budget_exhausted"
+
+
+class GateBudget:
+    """The post-answer time budget of one call's opening gate.
+
+    ``deadline = answer + max_seconds - margin``. Created unstarted by the
+    session and started by `run_phone_gate` at the answer; an unstarted
+    budget reports the whole of it as remaining. The clock is injectable so a
+    test can run a long gate on a fake clock. Never raises.
+    """
+
+    def __init__(
+        self,
+        max_seconds: float,
+        *,
+        margin_sec: float = GATE_BUDGET_MARGIN_SEC,
+        clock: Callable[[], float] = time_module.monotonic,
+    ) -> None:
+        self.max_seconds = max(0.0, float(max_seconds))
+        self.margin_sec = max(0.0, float(margin_sec))
+        self._clock = clock
+        self._started_at: float | None = None
+        self._deadline: float | None = None
+        #: Why the deadline was lowered below `max_seconds`, if it was.
+        self.capped_by: str | None = None
+
+    def now(self) -> float:
+        return float(self._clock())
+
+    @property
+    def started(self) -> bool:
+        return self._started_at is not None
+
+    def start(self) -> None:
+        """Start the budget at the answer. Idempotent: the first call wins."""
+        if self._started_at is not None:
+            return
+        self._started_at = self.now()
+        self._deadline = self._started_at + self.max_seconds - self.margin_sec
+
+    def cap_total(self, seconds: float, *, reason: str) -> None:
+        """Lower the deadline to ``answer + seconds - margin``; never raises it.
+
+        Used when the lease cannot be renewed during the gate: the gate may
+        then not outlive what is known to remain of the admission lease.
+        """
+        if self._started_at is None:
+            self.start()
+        capped = self._started_at + max(0.0, float(seconds)) - self.margin_sec  # type: ignore[operator]
+        if self._deadline is None or capped < self._deadline:
+            self._deadline = capped
+            self.capped_by = reason
+            _log.info(
+                "unknown_event", error_type="phone_gate_budget",
+                error_category="capped", phase=reason,
+                duration_sec=round(max(0.0, capped - self._started_at), 1),  # type: ignore[operator]
+            )
+
+    def remaining(self) -> float:
+        """Seconds left before the deadline (already net of the margin)."""
+        if self._deadline is None:
+            return max(0.0, self.max_seconds - self.margin_sec)
+        return self._deadline - self.now()
+
+    def bound(self, seconds: float) -> float:
+        """``seconds`` capped at what remains, never below zero."""
+        return max(0.0, min(float(seconds), self.remaining()))
+
+    def judge_timeout_sec(self) -> float:
+        """The gate judge's timeout for the next call: ``min(configured,
+        remaining)``. ``remaining`` is already net of the margin, so a judge
+        call can never eat the time reserved for the goodbye."""
+        return self.bound(gate_judge.judge_timeout_sec())
+
+    def round_cost_sec(self, line_sec: float | None = None) -> float:
+        """One more ask: the line, a full answer window and one judge call.
+
+        The CONFIGURED judge timeout, not the capped one: the question is
+        whether a whole round fits, so it is counted at full size even in
+        legacy mode (a few generous seconds cost nothing; a short budget
+        cuts off a person who is answering)."""
+        line = GATE_LINE_ESTIMATE_SEC if line_sec is None else float(line_sec)
+        return (
+            line + phone_classify_answer_timeout_sec()
+            + gate_judge.judge_timeout_sec()
+        )
+
+    def can_ask(self, phase: str, *, line_sec: float | None = None) -> bool:
+        """True when one more round of ``phase`` fits before the deadline.
+
+        False is logged once per refusal (`phone_gate_budget/exhausted`, with
+        the phase and the seconds left; never text).
+        """
+        remaining = self.remaining()
+        if remaining >= self.round_cost_sec(line_sec):
+            return True
+        _log.warn(
+            "unknown_event", error_type="phone_gate_budget",
+            error_category="exhausted", phase=phase,
+            duration_sec=round(max(0.0, remaining), 1),
+        )
+        return False
+
+
+def phone_unrenewed_lease_after_answer_sec(pre_answer_elapsed_sec: float) -> float:
+    """What is known to remain of the admission lease at the answer when
+    nothing renews it: lease - (boot + agent join) - the measured ring."""
+    return max(
+        0.0,
+        PHONE_ADMISSION_LEASE_SEC - PHONE_PRE_RING_LEASE_SPEND_SEC
+        - max(0.0, float(pre_answer_elapsed_sec)),
+    )
 
 
 def phone_answer_timeout_sec() -> float:
@@ -4525,6 +5004,49 @@ _WEEKDAY_RE = re.compile(
 # ISO date the candidate (or a downstream) might have already resolved.
 _EXPLICIT_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 
+#: M013 S01 T06: a calendar date NAMED with its month ("October 8", "8th
+#: October", "the 8th of Oct"). C5 refused these because they used to be
+#: silently dropped (and the call booked today/tomorrow at the clock); they
+#: now resolve to their NEXT occurrence instead. A day number WITHOUT a month
+#: ("on the 5th") is still refused: which month is a guess.
+_MONTHS = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sept": 9, "sep": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+_MONTH_NAME_ALT = "|".join(sorted(_MONTHS, key=len, reverse=True))
+_MONTH_DAY_NUM = r"(?:3[01]|[12]\d|0?[1-9])"
+_MONTH_DATE_RE = re.compile(
+    r"\b(?:(?P<m1>" + _MONTH_NAME_ALT + r")\.?\s+(?:the\s+)?(?P<d1>" + _MONTH_DAY_NUM
+    + r")(?:st|nd|rd|th)?"
+    r"|(?:the\s+)?(?P<d2>" + _MONTH_DAY_NUM + r")(?P<ord2>st|nd|rd|th)?\s+(?P<of2>of\s+)?"
+    r"(?P<m2>" + _MONTH_NAME_ALT + r"))\b",
+    re.IGNORECASE,
+)
+#: "4 may" is also "at 4 may be fine": a bare number before may/mar/march is
+#: a date only with an ordinal or "of" ("4th May", "4 of March"); otherwise it
+#: stays unresolved, exactly as C5 refused it.
+_AMBIGUOUS_TRAILING_MONTHS = frozenset({"may", "mar", "march"})
+
+
+def _month_date_matches(clean: str) -> tuple[bool, list[re.Match[str]]]:
+    """``(ok, matches)``: month-named dates, refusing the ambiguous form."""
+    matches = list(_MONTH_DATE_RE.finditer(clean))
+    for m in matches:
+        if (m.group("m2") and m.group("m2").lower() in _AMBIGUOUS_TRAILING_MONTHS
+                and not (m.group("ord2") or m.group("of2"))):
+            return False, []
+    return True, matches
+
+
+def _strip_month_dates(clean: str, matches: list[re.Match[str]]) -> str:
+    """``clean`` with each month-named date blanked (by position)."""
+    out = clean
+    for m in reversed(matches):
+        out = out[:m.start()] + " " + out[m.end():]
+    return out
+
 
 #: M009 PR-C (C5). The bookable IST window, in minutes after midnight: a
 #: resolved start outside [09:00, 21:00) returns None (one clarification)
@@ -4722,7 +5244,159 @@ def _resolve_ist_hour(
     return None
 
 
-def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
+def _callback_now_ist(now: datetime) -> datetime:
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(_IST_ZONE)
+
+
+def _month_date_next(month: int, day: int, now_ist: datetime) -> Optional[Any]:
+    """The NEXT occurrence (today counts) of a month/day, or None if invalid."""
+    year = now_ist.year
+    for candidate_year in (year, year + 1):
+        try:
+            value = datetime(candidate_year, month, day).date()
+        except ValueError:
+            # Feb 29 in a non-leap year, "April 31": not a date.
+            continue
+        if value >= now_ist.date():
+            return value
+    return None
+
+
+#: A relative day or weekday named in a callback reply (longest first, so
+#: "day after tomorrow" is one mention, not also a "tomorrow").
+_CALLBACK_DAY_WORD_RE = re.compile(
+    r"\b(day after tomorrow|tomorrow|today|tonight|"
+    + "|".join(sorted(_WEEKDAYS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
+#: A negation right before a day word: "not tomorrow", "can't do tomorrow",
+#: "I'm not free on Monday". A bare "no" is not one ("no, tomorrow is fine").
+_CALLBACK_DAY_NEGATED_BEFORE_RE = re.compile(
+    r"\b(?:not|never|can't|cant|cannot|won't|wont|don't|dont|isn't|isnt)"
+    r"(?:\s+[a-z']+){0,2}?\s+(?:on\s+|this\s+|for\s+)?$",
+    re.IGNORECASE,
+)
+#: A negation right after a day word: "tomorrow is not possible", "tomorrow
+#: won't work", "Monday doesn't suit me".
+_CALLBACK_DAY_NEGATED_AFTER_RE = re.compile(
+    r"^\s*(?:is\s+|would\s+be\s+|will\s+be\s+|i\s+am\s+|i'm\s+|im\s+)?"
+    r"(?:not\b|no\s+good\b|impossible\b|won't\b|wont\b|doesn't\b|doesnt\b"
+    r"|does\s+not\b|isn't\b|isnt\b|can't\b|cant\b|cannot\b|busy\b)",
+    re.IGNORECASE,
+)
+
+
+#: Any negation in a callback reply (with two clocks, which one is meant is a guess).
+_CALLBACK_NEGATION_RE = re.compile(
+    r"\b(?:not|never|can't|cant|cannot|won't|wont|don't|dont|isn't|isnt|doesn't|doesnt)\b",
+    re.IGNORECASE,
+)
+
+
+def _callback_day_mentions(low: str) -> tuple[list[str], int]:
+    """Review fix: the day words a reply names, minus the negated ones.
+
+    Returns ``(kinds, negated)``: each kept mention's canonical kind
+    ("tomorrow", "today", a weekday index as text...) and how many were
+    negated. "not tomorrow, day after tomorrow at 5 pm" names the day after
+    tomorrow; "tomorrow is not possible, friday at 11 am" names Friday.
+    """
+    kinds: list[str] = []
+    negated = 0
+    for match in _CALLBACK_DAY_WORD_RE.finditer(low):
+        before = low[max(0, match.start() - 40):match.start()]
+        after = low[match.end():match.end() + 40]
+        if (_CALLBACK_DAY_NEGATED_BEFORE_RE.search(before)
+                or _CALLBACK_DAY_NEGATED_AFTER_RE.search(after)):
+            negated += 1
+            continue
+        word = match.group(1).lower()
+        if word == "tonight":
+            word = "today"
+        elif word in _WEEKDAYS:
+            word = f"weekday:{_WEEKDAYS[word]}"
+        kinds.append(word)
+    return kinds, negated
+
+
+def _callback_day_ist(clean: str, now_ist: datetime) -> tuple[bool, Any]:
+    """The IST calendar DAY an utterance names: ``(ok, date | None)``.
+
+    ``ok`` is False when the day is named in a way that cannot be resolved
+    honestly (an ordinal with no month, "next week", two named dates); the
+    caller then returns None rather than guess. ``(True, None)``: no day named.
+    """
+    ok_months, month_dates = _month_date_matches(clean)
+    if not ok_months:
+        return False, None
+    without_dates = _strip_month_dates(clean, month_dates)
+    if _UNRESOLVED_DAY_RE.search(_EXPLICIT_DATE_RE.sub(" ", without_dates)):
+        return False, None
+    low = clean.lower()
+    m_date = _EXPLICIT_DATE_RE.search(clean)
+    if (m_date is not None) + len(month_dates) > 1:
+        # "the 8th of October or the 9th of October": which one is a guess.
+        return False, None
+    if m_date:
+        try:
+            return True, datetime(
+                int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3)),
+            ).date()
+        except ValueError:
+            return False, None
+    if month_dates:
+        m = month_dates[0]
+        month = _MONTHS[(m.group("m1") or m.group("m2")).lower()]
+        day = int(m.group("d1") or m.group("d2"))
+        value = _month_date_next(month, day, now_ist)
+        return (value is not None), value
+    # Review fix: a negated day ("not tomorrow", "tomorrow is not possible")
+    # is not the day, and two different days left over ("tomorrow or
+    # Friday") are a guess either way: no day, so the caller asks.
+    kinds, _ = _callback_day_mentions(low)
+    distinct = set(kinds)
+    if len(distinct) > 1:
+        return False, None
+    if not distinct:
+        return True, None
+    kind = distinct.pop()
+    if kind == "day after tomorrow":
+        return True, (now_ist + timedelta(days=2)).date()
+    if kind == "tomorrow":
+        return True, (now_ist + timedelta(days=1)).date()
+    if kind == "today":
+        return True, now_ist.date()
+    target_wd = int(kind.split(":", 1)[1])
+    # The NEXT occurrence of that weekday, strictly ahead (0 days would
+    # mean "today", which the candidate would have said as "today").
+    delta = (target_wd - now_ist.weekday()) % 7
+    if delta == 0:
+        delta = 7
+    return True, (now_ist + timedelta(days=delta)).date()
+
+
+def parse_callback_day_ist(text: Any, now: datetime) -> Any:
+    """M013 S01 T06: the IST DAY a reply names, with or without a clock.
+
+    "call me back tomorrow?" -> tomorrow's IST date. None when no day is
+    named or it cannot be resolved honestly (same refusals as
+    `parse_callback_time_ist`). Used to remember a day across a "what time
+    tomorrow?" turn; never booked on its own.
+    """
+    if not isinstance(text, str):
+        return None
+    clean = " ".join(text.strip().split())
+    if not clean:
+        return None
+    ok, value = _callback_day_ist(clean, _callback_now_ist(now))
+    return value if ok else None
+
+
+def parse_callback_time_ist(
+    text: Any, now: datetime, *, default_day: Any = None,
+) -> str | None:
     """Resolve a candidate's spoken callback time to a UTC ISO-8601 instant.
 
     Deterministic and IST-aware. `now` is the anchor instant (tz-aware; the
@@ -4742,56 +5416,40 @@ def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
     * a daypart binds only as a phrase (see `_DAYPART_PHRASE_RE`);
     * a bare 1-6 reads as PM; a bare 7/8, or h:mm before 09:00 without
       am/pm, is None;
-    * a date it cannot resolve ("on the 5th", "October 4", "next week"), or a
-      relative offset ("in 2 hours"), is None — never silently today/tomorrow;
+    * a date it cannot resolve ("on the 5th", "next week"), or a relative
+      offset ("in 2 hours"), is None — never silently today/tomorrow;
     * a resolved start outside 09:00-21:00 IST is None.
+
+    M013 S01 T06 additions:
+    * a date named with its month ("October 8 at 11am", "8th October at 3")
+      resolves to its next occurrence (it used to be refused as unresolved);
+    * ``default_day`` (an IST ``date``) is the day the conversation already
+      settled ("call me back tomorrow?" -> "what time tomorrow?" -> "11 am"):
+      it is used only when THIS utterance names no day of its own.
     """
     if not isinstance(text, str):
         return None
     clean = " ".join(text.strip().split())
     if not clean:
         return None
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    now_ist = now.astimezone(_IST_ZONE)
+    now_ist = _callback_now_ist(now)
 
     # 0) Refuse what cannot be resolved honestly, before any guessing.
-    if _UNRESOLVED_DAY_RE.search(_EXPLICIT_DATE_RE.sub(" ", clean)):
+    ok_day, named_day = _callback_day_ist(clean, now_ist)
+    if not ok_day:
         return None
     if _RELATIVE_OFFSET_RE.search(clean):
         return None
-    clean = _normalize_clock_words(clean)
+    clean = _normalize_clock_words(
+        _strip_month_dates(clean, _month_date_matches(clean)[1]))
     low = clean.lower()
     day_part = _utterance_daypart(low)
     if day_part is False:
         return None
 
-    # 1) Resolve the DAY (IST calendar date).
-    target_date = None
-    m_date = _EXPLICIT_DATE_RE.search(clean)
-    if m_date:
-        try:
-            target_date = datetime(
-                int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3)),
-            ).date()
-        except ValueError:
-            return None
-    elif re.search(r"\bday after tomorrow\b", low):
-        target_date = (now_ist + timedelta(days=2)).date()
-    elif re.search(r"\btomorrow\b", low):
-        target_date = (now_ist + timedelta(days=1)).date()
-    elif re.search(r"\b(?:today|tonight)\b", low):
-        target_date = now_ist.date()
-    else:
-        m_wd = _WEEKDAY_RE.search(low)
-        if m_wd:
-            target_wd = _WEEKDAYS[m_wd.group(1).lower()]
-            # The NEXT occurrence of that weekday, strictly ahead (0 days would
-            # mean "today", which the candidate would have said as "today").
-            delta = (target_wd - now_ist.weekday()) % 7
-            if delta == 0:
-                delta = 7
-            target_date = (now_ist + timedelta(days=delta)).date()
+    # 1) The DAY (IST calendar date): the one this utterance names, else the
+    # conversation's settled day, else (step 3) today-or-tomorrow.
+    target_date = named_day if named_day is not None else default_day
 
     # 2) Resolve the TIME. Strip the day words first so "tomorrow" cannot be read
     # as an hour, then find the first clock phrase carrying real time evidence
@@ -4806,6 +5464,11 @@ def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
         flags=re.IGNORECASE,
     )
     resolved_hm = None
+    # Review fix: with a negation in the reply ("not tomorrow at 5, Friday at
+    # 11", "not at 5 pm, tomorrow at 11 am"), a second clock may belong to the
+    # negated clause: which one is meant is a guess, so none is.
+    negated_days = _callback_day_mentions(low)[1] or bool(_CALLBACK_NEGATION_RE.search(low))
+    clocks = 0
     for m_time in _TIME_RE.finditer(time_search):
         has_evidence = (
             m_time.group("ampm")
@@ -4816,6 +5479,11 @@ def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
         )
         if not has_evidence:
             continue
+        clocks += 1
+        if negated_days and clocks > 1:
+            return None
+        if resolved_hm is not None:
+            continue
         hour_text = m_time.group("hour")
         hour = int(hour_text)
         minute = int(m_time.group("minute") or 0)
@@ -4824,7 +5492,7 @@ def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
             m_time.group("part") or day_part,
             zero_padded=len(hour_text) == 2 and hour_text.startswith("0"),
         )
-        if resolved_hm is not None:
+        if resolved_hm is not None and not negated_days:
             break
 
     if (
@@ -5247,6 +5915,249 @@ _CALLBACK_ASK_TIME_TEXT = (
     "You can say something like tomorrow at 3 in the afternoon."
 )
 
+# ── M013 S01 T06: the gate's callback CONVERSATION ─────────────────────
+#
+# Before consent (`run_phone_gate` -> `converse_callback_before_consent`) the
+# callback flow runs CONVERSATIONALLY (`CallbackFlowState(conversational=True)`):
+# it remembers a day the candidate already gave ("call me back tomorrow?" ->
+# "what time tomorrow?" -> "11 am"), asks up to TWO clarifications instead of
+# one, offers tomorrow instead of a same-day time the server would refuse,
+# re-validates every instant locally (09:00-21:00 IST, at most 14 days ahead,
+# never the same IST day), and CONFIRMS any time it did not hear verbatim
+# (a judge-only resolution, an "anytime" slot, a moved same-day time) before
+# proposing it. The in-call (post-consent) flow keeps the original behaviour.
+#
+# Every line below is gate copy (`gate_copy_texts` / `is_gate_copy`).
+CALLBACK_GATE_MAX_CLARIFICATIONS = 2
+#: Confirm questions ("So that's tomorrow at 2 in the afternoon, India time.
+#: Does that work?"). One per conversation: a second one becomes a
+#: clarification, so the conversation stays bounded.
+CALLBACK_GATE_MAX_OFFERS = 1
+#: The furthest ahead a callback may be booked (IST calendar days).
+CALLBACK_MAX_DAYS_AHEAD = 14
+#: The clock offered for "anytime" (IST), on the settled day or tomorrow.
+_CALLBACK_ANYTIME_HOUR = 11
+
+_CALLBACK_PARTIAL_TIME_PREFIX = "Sure, what time "
+_CALLBACK_PARTIAL_TIME_SUFFIX = (
+    " works? Anywhere between 9 in the morning and 9 at night."
+)
+_CALLBACK_EARLIEST_TOMORROW_TEXT = (
+    "Sorry, the earliest I can do is tomorrow. What time tomorrow works for "
+    "you? Anywhere between 9 in the morning and 9 at night."
+)
+_CALLBACK_TOO_FAR_TEXT = (
+    "I can only book a call within the next two weeks. What day and time in "
+    "the next two weeks works for you?"
+)
+_CALLBACK_OUTSIDE_HOURS_TEXT = (
+    "I can only set up calls between 9 in the morning and 9 at night. What "
+    "time in that window works for you?"
+)
+#: The confirm question. Composed at runtime (it names the time), so
+#: `is_gate_copy` matches it by one of these prefixes AND this suffix.
+_CALLBACK_OFFER_SUFFIX = ", India time. Does that work?"
+_CALLBACK_OFFER_PREFIXES: dict[str, str] = {
+    "confirm": "So that's ",
+    "anytime": "Sure. I can do ",
+    "earliest": "Sorry, the earliest I can do is tomorrow. I can do ",
+}
+#: The sign-off when the conversation ends with nothing booked (and nothing
+#: more specific to say): `candidate.deferred_pre_disclosure` is posted.
+PHONE_CALLBACK_NOTHING_BOOKED_TEXT = (
+    "No problem, our team will reach out to find a better time. Thanks, bye!"
+)
+
+#: "anytime", "whenever", "any time is fine", "kabhi bhi", "koi bhi time".
+_CALLBACK_ANYTIME_RE = re.compile(
+    r"\b(?:any\s?time|whenever|whatever\s+time|any\s+time\s+is\s+(?:fine|ok|okay)"
+    r"|kabhi\s+bhi|koi\s+bhi\s+time)\b",
+    re.IGNORECASE,
+)
+_JUDGE_RESOLVED_IST_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2})?$"
+)
+
+
+def _callback_now() -> datetime:
+    """The gate's clock for resolving spoken days (a seam for tests)."""
+    return datetime.now(timezone.utc)
+
+
+def _utc_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_utc_iso(starts_at: Any) -> Optional[datetime]:
+    if not isinstance(starts_at, str) or not _ISO_UTC_RE.match(starts_at.strip()):
+        return None
+    try:
+        return datetime.fromisoformat(starts_at.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def callback_slot_problem(starts_at: Any, now: datetime) -> Optional[str]:
+    """Why a resolved callback instant may NOT be proposed (None = it may).
+
+    The worker's own re-validation (the server stays the authority):
+    ``unreadable``; ``same_day`` (today or earlier, IST: the server refuses a
+    same-IST-day callback during the call); ``outside_hours`` (start outside
+    09:00-21:00 IST); ``too_far`` (more than 14 IST days ahead).
+    """
+    instant = _parse_utc_iso(starts_at)
+    if instant is None:
+        return "unreadable"
+    now_ist = _callback_now_ist(now)
+    ist = instant.astimezone(_IST_ZONE)
+    if ist.date() <= now_ist.date():
+        return "same_day"
+    minutes = ist.hour * 60 + ist.minute
+    if not _CALLBACK_WINDOW_OPEN_MIN <= minutes < _CALLBACK_WINDOW_CLOSE_MIN:
+        return "outside_hours"
+    if (ist.date() - now_ist.date()).days > CALLBACK_MAX_DAYS_AHEAD:
+        return "too_far"
+    return None
+
+
+def _callback_day_phrase(day: Any, now: datetime) -> str:
+    """'tomorrow', 'the day after tomorrow', 'on Monday', 'on Monday, October 12'."""
+    delta = (day - _callback_now_ist(now).date()).days
+    if delta == 0:
+        return "today"
+    if delta == 1:
+        return "tomorrow"
+    if delta == 2:
+        return "the day after tomorrow"
+    weekday = _WEEKDAY_NAMES[day.weekday()]
+    if 2 < delta < 7:
+        return f"on {weekday}"
+    month = (
+        "January", "February", "March", "April", "May", "June", "July",
+        "August", "September", "October", "November", "December",
+    )[day.month - 1]
+    return f"on {weekday}, {month} {day.day}"
+
+
+def _callback_clock_phrase(hour: int, minute: int) -> str:
+    """'11 in the morning', '2:30 in the afternoon', '12 noon', '6 in the evening'."""
+    if hour == 12 and minute == 0:
+        return "12 noon"
+    hour12 = hour % 12 or 12
+    clock = f"{hour12}" if minute == 0 else f"{hour12}:{minute:02d}"
+    if hour < 12:
+        part = "in the morning"
+    elif hour < 17:
+        part = "in the afternoon"
+    else:
+        part = "in the evening"
+    return f"{clock} {part}"
+
+
+def _callback_when_text(starts_at: str, now: datetime) -> str:
+    instant = _parse_utc_iso(starts_at)
+    ist = instant.astimezone(_IST_ZONE)  # type: ignore[union-attr]
+    return (
+        f"{_callback_day_phrase(ist.date(), now)} at "
+        f"{_callback_clock_phrase(ist.hour, ist.minute)}"
+    )
+
+
+def _callback_offer_text(kind: str, starts_at: str, now: datetime) -> str:
+    return (
+        _CALLBACK_OFFER_PREFIXES[kind] + _callback_when_text(starts_at, now)
+        + _CALLBACK_OFFER_SUFFIX
+    )
+
+
+def _callback_partial_time_text(day: Any, now: datetime) -> str:
+    """'Sure, what time tomorrow works? Anywhere between 9 … and 9 at night.'"""
+    return (
+        _CALLBACK_PARTIAL_TIME_PREFIX + _callback_day_phrase(day, now)
+        + _CALLBACK_PARTIAL_TIME_SUFFIX
+    )
+
+
+def _callback_at(day: Any, hour: int, minute: int) -> str:
+    return _utc_iso(datetime.combine(day, dt_time(hour, minute), tzinfo=_IST_ZONE))
+
+
+def _judge_resolved_ist_utc(value: Any) -> Optional[str]:
+    """The judge's ``resolved_ist`` ("YYYY-MM-DDTHH:MM", India time) as UTC."""
+    if not isinstance(value, str):
+        return None
+    m = _JUDGE_RESOLVED_IST_RE.match(value.strip())
+    if m is None:
+        return None
+    try:
+        local = datetime(
+            int(m.group(1)), int(m.group(2)), int(m.group(3)),
+            int(m.group(4)), int(m.group(5)), tzinfo=_IST_ZONE,
+        )
+    except ValueError:
+        return None
+    return _utc_iso(local)
+
+
+class _CallbackSpans:
+    """The judge's callback spans, already checked against the candidate's words."""
+
+    __slots__ = ("day_text", "time_text", "resolved_utc")
+
+    def __init__(self, day_text: str, time_text: str, resolved_utc: Optional[str]) -> None:
+        self.day_text = day_text
+        self.time_text = time_text
+        self.resolved_utc = resolved_utc
+
+
+def _usable_judged(judged: Any) -> bool:
+    """A valid judge verdict (llm source, known intent); else legacy decides."""
+    return (
+        judged is not None
+        and getattr(judged, "source", None) == gate_judge.SOURCE_LLM
+        and getattr(judged, "intent", None) in gate_judge.INTENTS
+    )
+
+
+def _judge_callback_spans(judged: Any, heard: list[str]) -> Optional[_CallbackSpans]:
+    """The judge's day/time spans, or None when unusable.
+
+    Owner rule (S01-PLAN T06, critique 15): each non-empty span must be a
+    normalised, word-bounded substring of something the candidate SAID in
+    this conversation (`gate_judge.evidence_in_text`, the grant-evidence
+    rule); otherwise the judge's whole callback is ignored, so an invented
+    date can never be booked. Logs categories only, never the spans.
+    """
+    if not _usable_judged(judged):
+        return None
+    callback = getattr(judged, "callback", None)
+    if not isinstance(callback, gate_judge.JudgeCallback):
+        return None
+    day_text = str(callback.day_text or "").strip()
+    time_text = str(callback.time_text or "").strip()
+    if not day_text and not time_text:
+        return None
+    for span in (day_text, time_text):
+        if span and not any(gate_judge.evidence_in_text(span, said) for said in heard):
+            _log.info(
+                "unknown_event", error_type="phone_callback_judge",
+                error_category="spans_not_in_reply",
+            )
+            return None
+    return _CallbackSpans(day_text, time_text, _judge_resolved_ist_utc(callback.resolved_ist))
+
+
+def _callback_reply_confirms(text: Any, judged: Any) -> bool:
+    """Is this reply a yes to the time just offered?
+
+    A valid judge verdict decides (``consent_granted`` = the affirmative; it
+    passed the grant guards in `gate_judge.judge_gate`); with no usable
+    verdict the deterministic read-back classifier decides.
+    """
+    if _usable_judged(judged):
+        return getattr(judged, "intent", None) == gate_judge.INTENT_CONSENT_GRANTED
+    return callback_confirmation_decision(text) == "confirmed"
+
 
 def _alternatives_offer_text(alternatives: list[CallbackAlternative]) -> str:
     """One spoken line offering the nearest one or two free slots."""
@@ -5303,13 +6214,33 @@ def _match_alternative(text: Any, alternatives: list[CallbackAlternative]) -> Ca
 
 
 class CallbackFlowState:
-    """The bounded, forward-only state of one in-call callback negotiation."""
+    """The bounded, forward-only state of one in-call callback negotiation.
 
-    __slots__ = ("phase", "alternatives")
+    M013 S01 T06: ``conversational=True`` (the pre-consent gate) adds the
+    conversation's memory and its bounds. The phase still only moves forward;
+    inside the time-capture phases each extra question spends one of
+    ``max_clarifications`` or ``max_offers``, so the flow stays finite:
+    ``day`` (a settled IST date), ``pending_slot`` (an offered, unconfirmed
+    instant) and ``heard`` (the candidate's words in this flow, held only to
+    check the judge's spans; never logged).
+    """
 
-    def __init__(self) -> None:
+    __slots__ = (
+        "phase", "alternatives", "conversational", "max_clarifications",
+        "clarifications", "max_offers", "offers", "day", "pending_slot", "heard",
+    )
+
+    def __init__(self, *, conversational: bool = False) -> None:
         self.phase = CALLBACK_PHASE_AWAITING_TIME
         self.alternatives: list[CallbackAlternative] = []
+        self.conversational = bool(conversational)
+        self.max_clarifications = CALLBACK_GATE_MAX_CLARIFICATIONS if conversational else 1
+        self.clarifications = 0
+        self.max_offers = CALLBACK_GATE_MAX_OFFERS if conversational else 0
+        self.offers = 0
+        self.day: Any = None
+        self.pending_slot: Optional[str] = None
+        self.heard: list[str] = []
 
 
 class CallbackDecision:
@@ -5414,11 +6345,25 @@ def _confirmation_failure_decision() -> CallbackDecision:
     )
 
 
+def _retry_refusal_text(status: str, flow: CallbackFlowState, now: Optional[datetime]) -> str:
+    """The re-ask for a refusal the candidate can fix.
+
+    T06: in the gate's conversation `slot_not_yet_eligible` (today is
+    refused) says plainly that tomorrow is the earliest, and settles the day
+    on tomorrow so a bare "11 am" next is read as tomorrow.
+    """
+    if flow.conversational and status == "slot_not_yet_eligible" and now is not None:
+        flow.day = (_callback_now_ist(now) + timedelta(days=1)).date()
+        return _CALLBACK_EARLIEST_TOMORROW_TEXT
+    return schedule_refusal_text(status)
+
+
 async def _propose_and_confirm(
     client: PhoneEventClient,
     attempt_id: str,
     starts_at: str,
     flow: CallbackFlowState,
+    now: Optional[datetime] = None,
 ) -> CallbackDecision:
     """Propose a resolved instant and, if valid, confirm it in the same turn.
 
@@ -5497,7 +6442,7 @@ async def _propose_and_confirm(
             )
             flow.phase = CALLBACK_PHASE_AWAITING_RETIME
             return CallbackDecision(
-                schedule_refusal_text(confirm_status), terminal=False,
+                _retry_refusal_text(confirm_status, flow, now), terminal=False,
             )
         # THE RE-ASK IS SPENT ON THIS LEG TOO. This used to fall straight
         # through to `_confirmation_failure_decision()`, which speaks the bare
@@ -5565,7 +6510,7 @@ async def _propose_and_confirm(
             error_category=status, schema="retried",
         )
         flow.phase = CALLBACK_PHASE_AWAITING_RETIME
-        return CallbackDecision(schedule_refusal_text(status), terminal=False)
+        return CallbackDecision(_retry_refusal_text(status, flow, now), terminal=False)
 
     # ── THE RE-ASK IS SPENT, BUT THE CANDIDATE STILL DESERVES THE REASON ──
     # A retryable status reaching here means the time was refused for something
@@ -5602,12 +6547,257 @@ async def _propose_and_confirm(
     )
 
 
+def _callback_clarify(flow: CallbackFlowState, spoken: str) -> CallbackDecision:
+    """T06: one more time question, or the end when the clarifications are spent.
+
+    Never moves the phase backwards: from `awaiting_time` it moves to
+    `awaiting_clarify`; in a later phase it stays put and only the counter
+    moves. The end is the bounded deferral (`retime_spent` after a refusal
+    re-ask, else `unparseable`), spoken as the nothing-booked sign-off.
+    """
+    if flow.clarifications >= flow.max_clarifications:
+        sub_reason = (
+            "retime_spent" if flow.phase == CALLBACK_PHASE_AWAITING_RETIME
+            else "unparseable"
+        )
+        flow.phase = CALLBACK_PHASE_DONE
+        flow.pending_slot = None
+        return _deferral_decision(sub_reason, PHONE_CALLBACK_NOTHING_BOOKED_TEXT)
+    flow.clarifications += 1
+    if flow.phase == CALLBACK_PHASE_AWAITING_TIME:
+        flow.phase = CALLBACK_PHASE_AWAITING_CLARIFY
+    return CallbackDecision(spoken, terminal=False)
+
+
+def _callback_offer(
+    flow: CallbackFlowState, kind: str, starts_at: str, now: datetime,
+    fallback_spoken: str,
+) -> CallbackDecision:
+    """T06: offer a time the candidate did not say verbatim, to be confirmed.
+
+    Bounded by ``max_offers``; past it the same turn is a clarification.
+    """
+    if flow.offers >= flow.max_offers:
+        return _callback_clarify(flow, fallback_spoken)
+    flow.offers += 1
+    flow.pending_slot = starts_at
+    # The offered day is now the conversation's day: "yes, but make it 4 pm"
+    # means 4 pm on THAT day.
+    flow.day = _parse_utc_iso(starts_at).astimezone(_IST_ZONE).date()  # type: ignore[union-attr]
+    if flow.phase == CALLBACK_PHASE_AWAITING_TIME:
+        flow.phase = CALLBACK_PHASE_AWAITING_CLARIFY
+    _log.info(
+        "unknown_event", error_type="phone_callback_turn",
+        error_category="offer", schema=kind,
+    )
+    return CallbackDecision(_callback_offer_text(kind, starts_at, now), terminal=False)
+
+
+def _callback_ask_text(flow: CallbackFlowState, now: datetime) -> str:
+    """The generic time question, or the day-specific one once a day is settled."""
+    if flow.day is not None:
+        return _callback_partial_time_text(flow.day, now)
+    return _CALLBACK_ASK_TIME_TEXT
+
+
+def _span_slot(
+    spans: _CallbackSpans, flow: CallbackFlowState, now: datetime,
+) -> Optional[str]:
+    """The judge's day/time spans read by the deterministic parser, or None."""
+    joined = " ".join(part for part in (spans.day_text, spans.time_text) if part)
+    candidates = [joined]
+    if spans.time_text and not re.match(r"(?i)at\b", spans.time_text):
+        candidates.append(" ".join(
+            part for part in (spans.day_text, "at " + spans.time_text) if part))
+    for candidate in candidates:
+        slot = parse_callback_time_ist(candidate, now, default_day=flow.day)
+        if slot is not None:
+            return slot
+    return None
+
+
+def _deterministic_slot(
+    text: str, spans: Optional[_CallbackSpans], flow: CallbackFlowState, now: datetime,
+) -> tuple[Optional[str], str, str]:
+    """(instant, source, kind): the whole reply first, the judge's spans second.
+
+    Review fix: spans are words lifted OUT of their sentence, so they lose
+    what surrounds them ("NOT tomorrow, day after tomorrow at 5 pm" -> spans
+    "tomorrow", "5 pm"), and they may come from an earlier reply. So the
+    deterministic parse of THIS reply decides when it resolves; a span
+    reading is only ever offered for confirmation (``kind`` ``confirm``),
+    never proposed directly, and when the two readings disagree the reply's
+    own reading is offered for confirmation too. ``kind`` ``slot``: the
+    candidate's own words resolved unambiguously, proposed directly.
+    """
+    whole = parse_callback_time_ist(text, now, default_day=flow.day)
+    span = _span_slot(spans, flow, now) if spans is not None else None
+    if whole is not None:
+        if span is not None and span != whole:
+            _log.info(
+                "unknown_event", error_type="phone_callback_judge",
+                error_category="spans_disagree",
+            )
+            return whole, "deterministic", "confirm"
+        return whole, "deterministic", "slot"
+    if span is not None:
+        return span, "judge_spans", "confirm"
+    return None, "deterministic", "slot"
+
+
+async def _conversational_callback_turn(
+    flow: CallbackFlowState,
+    client: PhoneEventClient,
+    attempt_id: str,
+    text: str,
+    now: datetime,
+    judged: Any,
+) -> CallbackDecision:
+    """T06: one turn of the gate's callback conversation (time-capture phases).
+
+    Order: a pending offer is confirmed or dropped; then the reply is
+    resolved — the whole reply by the deterministic parser (proposed
+    directly; offered for confirmation when the judge's spans read it
+    differently), the judge's spans by the parser (always offered for
+    confirmation; `_deterministic_slot`), a judge-only
+    resolution (confirmed before it is proposed), "anytime" (a confirmed
+    offer), a day with no time (remembered; "what time tomorrow?"), or
+    nothing (a clarification). Every instant is re-validated locally before
+    it is proposed or offered.
+    """
+    if text.strip():
+        flow.heard.append(text)
+    spans = _judge_callback_spans(judged, flow.heard)
+
+    pending, flow.pending_slot = flow.pending_slot, None
+    if pending is not None:
+        restated = parse_callback_time_ist(text, now, default_day=flow.day)
+        if restated in (None, pending) and _callback_reply_confirms(text, judged):
+            _log.info(
+                "unknown_event", error_type="phone_callback_turn",
+                error_category="offer_confirmed",
+            )
+            return await _propose_and_confirm(client, attempt_id, pending, flow, now)
+        # Anything else is a clarification turn: the reply is read below.
+        _log.info(
+            "unknown_event", error_type="phone_callback_turn",
+            error_category="offer_not_confirmed",
+        )
+
+    slot, source, kind = _deterministic_slot(text, spans, flow, now)
+    if slot is not None:
+        if spans is not None and spans.resolved_utc is not None:
+            _log.info(
+                "unknown_event", error_type="phone_callback_judge",
+                error_category=(
+                    "resolved_match" if spans.resolved_utc == slot else "resolved_mismatch"
+                ),
+            )
+        problem = callback_slot_problem(slot, now)
+        _log.info(
+            "unknown_event", error_type="phone_callback_turn",
+            error_category="resolved", schema=f"{source}:{problem or 'ok'}",
+        )
+        return await _resolved_slot_turn(flow, client, attempt_id, slot, problem, now, kind)
+
+    if spans is not None and spans.resolved_utc is not None and spans.time_text:
+        judge_slot = spans.resolved_utc
+        if not spans.day_text and flow.day is not None:
+            # The day was settled earlier; only the clock is the judge's.
+            clock = _parse_utc_iso(judge_slot).astimezone(_IST_ZONE)  # type: ignore[union-attr]
+            judge_slot = _callback_at(flow.day, clock.hour, clock.minute)
+        problem = callback_slot_problem(judge_slot, now)
+        _log.info(
+            "unknown_event", error_type="phone_callback_turn",
+            error_category="resolved", schema=f"judge_only:{problem or 'ok'}",
+        )
+        return await _resolved_slot_turn(
+            flow, client, attempt_id, judge_slot, problem, now, "confirm")
+
+    day = parse_callback_day_ist(text, now)
+    if day is None and spans is not None and spans.day_text:
+        day = parse_callback_day_ist(spans.day_text, now)
+
+    if _CALLBACK_ANYTIME_RE.search(text):
+        offer_day = day or flow.day or (_callback_now_ist(now) + timedelta(days=1)).date()
+        anytime = _callback_at(offer_day, _CALLBACK_ANYTIME_HOUR, 0)
+        problem = callback_slot_problem(anytime, now)
+        _log.info(
+            "unknown_event", error_type="phone_callback_turn",
+            error_category="resolved", schema=f"anytime:{problem or 'ok'}",
+        )
+        return await _resolved_slot_turn(
+            flow, client, attempt_id, anytime, problem, now, "anytime")
+
+    if day is not None:
+        today = _callback_now_ist(now).date()
+        if day <= today:
+            flow.day = today + timedelta(days=1)
+            spoken = _CALLBACK_EARLIEST_TOMORROW_TEXT
+            category = "same_day"
+        elif (day - today).days > CALLBACK_MAX_DAYS_AHEAD:
+            spoken = _CALLBACK_TOO_FAR_TEXT
+            category = "too_far"
+        else:
+            flow.day = day
+            spoken = _callback_partial_time_text(day, now)
+            category = "ok"
+        _log.info(
+            "unknown_event", error_type="phone_callback_turn",
+            error_category="day_only", schema=category,
+        )
+        return _callback_clarify(flow, spoken)
+
+    _log.info(
+        "unknown_event", error_type="phone_callback_turn",
+        error_category="unresolved",
+    )
+    return _callback_clarify(flow, _callback_ask_text(flow, now))
+
+
+async def _resolved_slot_turn(
+    flow: CallbackFlowState,
+    client: PhoneEventClient,
+    attempt_id: str,
+    slot: str,
+    problem: Optional[str],
+    now: datetime,
+    kind: str,
+) -> CallbackDecision:
+    """Propose a resolved instant, or offer/clarify when it may not be.
+
+    ``kind``: ``slot`` (the candidate's own words: proposed directly),
+    ``confirm`` (judge-only) or ``anytime`` (offered and confirmed first).
+    """
+    if problem is None:
+        if kind == "slot":
+            return await _propose_and_confirm(client, attempt_id, slot, flow, now)
+        return _callback_offer(flow, kind, slot, now, _callback_ask_text(flow, now))
+    if problem == "same_day":
+        # "today at 5": the server refuses today, so offer the same clock
+        # tomorrow (confirmed), or ask what time tomorrow.
+        tomorrow = (_callback_now_ist(now) + timedelta(days=1)).date()
+        flow.day = tomorrow
+        clock = _parse_utc_iso(slot).astimezone(_IST_ZONE)  # type: ignore[union-attr]
+        moved = _callback_at(tomorrow, clock.hour, clock.minute)
+        if callback_slot_problem(moved, now) is None:
+            return _callback_offer(flow, "earliest", moved, now, _CALLBACK_EARLIEST_TOMORROW_TEXT)
+        return _callback_clarify(flow, _CALLBACK_EARLIEST_TOMORROW_TEXT)
+    if problem == "too_far":
+        return _callback_clarify(flow, _CALLBACK_TOO_FAR_TEXT)
+    if problem == "outside_hours":
+        return _callback_clarify(flow, _CALLBACK_OUTSIDE_HOURS_TEXT)
+    return _callback_clarify(flow, _callback_ask_text(flow, now))
+
+
 async def run_callback_turn(
     flow: CallbackFlowState,
     client: PhoneEventClient,
     attempt_id: str,
     candidate_text: Any,
     now: datetime,
+    *,
+    judged: Any = None,
 ) -> CallbackDecision:
     """Advance the bounded callback flow by exactly one candidate turn.
 
@@ -5621,13 +6811,48 @@ async def run_callback_turn(
     round is reachable AFTER the re-ask because it ranks strictly later, so
     counting it out (as an earlier version of this docstring did) understates
     the bound by one turn.
+
+    M013 S01 T06: a ``conversational`` flow (the pre-consent gate) handles
+    the time-capture phases in `_conversational_callback_turn`, with
+    ``judged`` (the gate judge's `callback_time` decision, or None). Its
+    extra questions are bounded by counters (``max_clarifications``,
+    ``max_offers``) while the phase still only moves forward, so its longest
+    chain is: initial → 2 clarifications → 1 offer → 1 refusal re-ask → 1
+    alternatives round → end (`CALLBACK_GATE_MAX_TURNS` replies). A plain
+    deferral it ends in is spoken as `PHONE_CALLBACK_NOTHING_BOOKED_TEXT`.
     """
+    if flow.conversational:
+        decision = await _run_callback_phase(
+            flow, client, attempt_id, candidate_text, now, judged)
+        if (decision.terminal and decision.terminal_reason == HALT_CALLBACK_DEFERRED
+                and decision.spoken == PHONE_CALLBACK_DEFERRAL_TEXT):
+            decision.spoken = PHONE_CALLBACK_NOTHING_BOOKED_TEXT
+        return decision
+    return await _run_callback_phase(flow, client, attempt_id, candidate_text, now, None)
+
+
+async def _run_callback_phase(
+    flow: CallbackFlowState,
+    client: PhoneEventClient,
+    attempt_id: str,
+    candidate_text: Any,
+    now: datetime,
+    judged: Any,
+) -> CallbackDecision:
     phase = flow.phase
+
+    if flow.conversational and phase in (
+        CALLBACK_PHASE_AWAITING_TIME, CALLBACK_PHASE_AWAITING_CLARIFY,
+        CALLBACK_PHASE_AWAITING_RETIME,
+    ):
+        text = candidate_text if isinstance(candidate_text, str) else ""
+        return await _conversational_callback_turn(
+            flow, client, attempt_id, text, now, judged)
 
     if phase == CALLBACK_PHASE_AWAITING_TIME:
         starts_at = parse_callback_time_ist(candidate_text, now)
         if starts_at is not None:
-            return await _propose_and_confirm(client, attempt_id, starts_at, flow)
+            return await _propose_and_confirm(client, attempt_id, starts_at, flow, now)
         # Unparseable: ask ONCE for a specific time.
         flow.phase = CALLBACK_PHASE_AWAITING_CLARIFY
         return CallbackDecision(_CALLBACK_ASK_TIME_TEXT, terminal=False)
@@ -5635,7 +6860,7 @@ async def run_callback_turn(
     if phase == CALLBACK_PHASE_AWAITING_CLARIFY:
         starts_at = parse_callback_time_ist(candidate_text, now)
         if starts_at is not None:
-            return await _propose_and_confirm(client, attempt_id, starts_at, flow)
+            return await _propose_and_confirm(client, attempt_id, starts_at, flow, now)
         # Still unparseable after the one clarification: terminal deferral.
         flow.phase = CALLBACK_PHASE_DONE
         return _deferral_decision("unparseable")
@@ -5648,14 +6873,14 @@ async def run_callback_turn(
         # can no longer re-ask, and an unparseable answer defers immediately.
         starts_at = parse_callback_time_ist(candidate_text, now)
         if starts_at is not None:
-            return await _propose_and_confirm(client, attempt_id, starts_at, flow)
+            return await _propose_and_confirm(client, attempt_id, starts_at, flow, now)
         flow.phase = CALLBACK_PHASE_DONE
         return _deferral_decision("retime_spent")
 
     if phase == CALLBACK_PHASE_AWAITING_ALT_PICK:
         picked = _match_alternative(candidate_text, flow.alternatives)
         if picked is not None:
-            return await _propose_and_confirm(client, attempt_id, picked.starts_at, flow)
+            return await _propose_and_confirm(client, attempt_id, picked.starts_at, flow, now)
         # No clear pick from the offered slots: terminal deferral. ONE round only.
         flow.phase = CALLBACK_PHASE_DONE
         return _deferral_decision("alt_unpicked")
@@ -5666,6 +6891,136 @@ async def run_callback_turn(
     # the bounded catch-all.
     flow.phase = CALLBACK_PHASE_DONE
     return _deferral_decision(_PROPOSE_STATUS_PREFIX + "unknown")
+
+
+#: T06: the most candidate replies the gate's callback conversation reads —
+#: the first reply, the clarifications, the offer, one refusal re-ask and
+#: one alternatives round (see `run_callback_turn`). The budget usually ends
+#: it sooner.
+CALLBACK_GATE_MAX_TURNS = 1 + CALLBACK_GATE_MAX_CLARIFICATIONS + CALLBACK_GATE_MAX_OFFERS + 2
+
+GATE_CALLBACK_END_DECISION = "decision"        # a terminal CallbackDecision
+GATE_CALLBACK_END_VERDICT = "verdict"          # opt-out / wrong number / refusal
+GATE_CALLBACK_END_REQUESTED = "end_requested"  # "please hang up"
+GATE_CALLBACK_END_BUDGET = "budget"            # the T03 gate budget ran out
+GATE_CALLBACK_END_NO_REPLY = "no_reply"        # silence after a callback question
+GATE_CALLBACK_END_TURNS = "turns_exhausted"    # the turn bound (defensive)
+
+
+class GateCallbackEnd:
+    """How the gate's callback conversation ended. The gate posts the
+    terminal FIRST and then speaks (``decision.spoken`` or its own goodbye),
+    so nothing here posts an event."""
+
+    __slots__ = ("kind", "decision", "verdict", "schema")
+
+    def __init__(
+        self, kind: str, *, decision: Optional[CallbackDecision] = None,
+        verdict: Optional[str] = None, schema: Optional[str] = None,
+    ) -> None:
+        self.kind = kind
+        self.decision = decision
+        self.verdict = verdict
+        self.schema = schema
+
+
+async def _judge_callback_reply(
+    judge_callback: Optional[Callable[..., Awaitable[Any]]], reply: str, *, first: bool,
+) -> Any:
+    """The judge's reading of one callback reply, or None. Never raises."""
+    if judge_callback is None or not isinstance(reply, str) or not reply.strip():
+        return None
+    try:
+        return await judge_callback(reply, first=first)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — a broken judge is "no verdict"
+        _log.warn(
+            "unknown_event", error_type="phone_callback_judge",
+            error_category="judge_seam_failed",
+        )
+        return None
+
+
+async def converse_callback_before_consent(
+    first_reply: str,
+    *,
+    client: PhoneEventClient,
+    attempt_id: str,
+    say: Callable[[str], Awaitable[Any]],
+    read_reply: Optional[Callable[[], Awaitable[str]]],
+    ask_barrier: Callable[[], None],
+    budget_allows: Callable[[str], bool],
+    gate_budget: Any = None,
+    classify_gate_reply: Optional[Callable[[str], Optional[str]]] = None,
+    judge_callback: Optional[Callable[..., Awaitable[Any]]] = None,
+    now: Optional[Callable[[], datetime]] = None,
+) -> GateCallbackEnd:
+    """M013 S01 T06: the pre-consent callback CONVERSATION.
+
+    The calendar pipeline (propose, then confirm) without authorizing the
+    screening. Each reply: the hard exits first (opt-out / wrong number, an
+    explicit end request, a recording refusal — the regex reader, as before),
+    then the gate judge's ``callback_time`` reading (llm mode only; None
+    otherwise), then one `run_callback_turn` of a conversational flow. A
+    non-terminal line is spoken only when its answer still fits the T03
+    budget, after the question barrier. Silence after a callback question
+    ends the conversation (the gate says its deferral goodbye). Returns how
+    it ended; the gate posts and speaks the terminal.
+    """
+    clock = now if now is not None else _callback_now
+    flow = CallbackFlowState(conversational=True)
+    reply = first_reply if isinstance(first_reply, str) else ""
+    for turn in range(CALLBACK_GATE_MAX_TURNS):
+        if turn > 0 and not reply.strip():
+            return GateCallbackEnd(GATE_CALLBACK_END_NO_REPLY, schema="callback_no_reply")
+        verdict = classify_gate_reply(reply) if classify_gate_reply else None
+        if verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
+            return GateCallbackEnd(GATE_CALLBACK_END_VERDICT, verdict=verdict)
+        if phone_preconsent_end_requested(reply):
+            return GateCallbackEnd(GATE_CALLBACK_END_REQUESTED)
+        # 'No, tomorrow at three' corrects the proposed TIME; it is not a
+        # recording refusal. Strong recording/participation refusals remain
+        # terminal even when they also mention a time.
+        if verdict == CLASSIFY_REFUSED and re.search(
+            r"\brecord\w*\b|\bnot interested\b", reply, re.IGNORECASE,
+        ):
+            return GateCallbackEnd(GATE_CALLBACK_END_VERDICT, verdict=verdict)
+
+        async def _one_turn(reply: str = reply, first: bool = turn == 0) -> CallbackDecision:
+            judged = await _judge_callback_reply(judge_callback, reply, first=first)
+            return await run_callback_turn(
+                flow, client, attempt_id, reply, clock(), judged=judged,
+            )
+
+        if gate_budget is None:
+            decision = await _one_turn()
+        else:
+            # T03: the judge call and a slow propose/confirm round trip are
+            # bounded by what is left of the budget, so they end in a spoken
+            # deferral and not in the wall clock cancelling the gate.
+            try:
+                decision = await asyncio.wait_for(
+                    _one_turn(), timeout=gate_budget.bound(gate_budget.remaining()),
+                )
+            except asyncio.TimeoutError:
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_budget",
+                    error_category="exhausted", phase="callback_booking",
+                )
+                return GateCallbackEnd(GATE_CALLBACK_END_BUDGET)
+        if decision.terminal:
+            return GateCallbackEnd(GATE_CALLBACK_END_DECISION, decision=decision)
+        # T03: one more callback question only if its answer still fits.
+        if not budget_allows("callback_turn"):
+            return GateCallbackEnd(GATE_CALLBACK_END_BUDGET)
+        ask_barrier()
+        await say(decision.spoken)
+        reply = await read_reply() if read_reply else ""
+        if not isinstance(reply, str):
+            reply = ""
+    # Out of turns: still a goodbye, never a silent hang-up (S01 T02).
+    return GateCallbackEnd(GATE_CALLBACK_END_TURNS, schema="callback_turns_exhausted")
 
 
 # ── LLM tool binding ──────────────────────────────────────────────────
@@ -5807,6 +7162,12 @@ GATE_TIMED_OUT = "gate_timed_out"
 #: `assessment_allowed` is False, so the caller closes the room; it must post
 #: NOTHING further for this outcome.
 GATE_NOT_ANSWERED = "not_answered"
+#: M013 S01 T03: the lease heartbeat that runs during the gate could no longer
+#: prove the slot (`lease_lost` / `lease_unconfirmed`), so the gate was
+#: cancelled. Before durable consent the person heard the deferral goodbye;
+#: nothing new is posted (the epoch fence would refuse it, and the slot may
+#: already be someone else's), and the room is closed.
+GATE_LEASE_HALTED = "gate_lease_halted"
 
 
 class PhoneParticipantGone(Exception):
@@ -5987,6 +7348,7 @@ class PhoneGateResult:
         "assessment_state",
         "role_opening_spoken",
         "scoring_queue_owned",
+        "q1_prefetch",
     )
 
     def __init__(
@@ -5999,6 +7361,7 @@ class PhoneGateResult:
         spoken: Optional[list[str]] = None,
         assessment_state: Optional["PhoneAssessmentState"] = None,
         role_opening_spoken: bool = False,
+        q1_prefetch: Optional["PhoneQ1Prefetch"] = None,
     ) -> None:
         self.outcome = outcome
         self.assessment_allowed = assessment_allowed
@@ -6021,6 +7384,11 @@ class PhoneGateResult:
         # `abandoned`). Not a constructor arg — only the coordinator sets it.
         self.scoring_queue_owned = False
         self.not_the_candidate = False
+        # M013 S01 T08b: the first question, rephrased (and maybe rendered)
+        # while the role line played. Started the moment the atomic
+        # consent/start RPC returned; None on every other path, where the
+        # pre-loop rephrases on demand as before.
+        self.q1_prefetch = q1_prefetch
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return (
@@ -6160,6 +7528,28 @@ PHONE_IDENTITY_VERDICTS: frozenset[str] = frozenset([
     PHONE_IDENTITY_UNAVAILABLE,
     PHONE_IDENTITY_UNCLEAR,
 ])
+
+#: M013 S01 T05: a gate-judge intent at the identity turn → the existing
+#: verdict (S01-PLAN, fixed table). `opt_out`, `end_call` and
+#: `consent_declined` are terminal routes, handled before this lookup.
+#: `voicemail_machine` takes no action at identity (as today) and is never a
+#: reason to hang up here; `question` and `unclear` proceed (fail open).
+_IDENTITY_VERDICT_FOR_INTENT: dict[str, str] = {
+    gate_judge.INTENT_IDENTITY_CONFIRMED: PHONE_IDENTITY_SELF,
+    gate_judge.INTENT_CONSENT_GRANTED: PHONE_IDENTITY_SELF,
+    gate_judge.INTENT_WRONG_PERSON: PHONE_IDENTITY_OTHER,
+    gate_judge.INTENT_NOT_NOW_BUSY: PHONE_IDENTITY_UNAVAILABLE,
+    gate_judge.INTENT_QUESTION: PHONE_IDENTITY_UNCLEAR,
+    gate_judge.INTENT_UNCLEAR: PHONE_IDENTITY_UNCLEAR,
+    gate_judge.INTENT_VOICEMAIL: PHONE_IDENTITY_UNCLEAR,
+}
+#: The reverse view, for a shadow judge's agreement log only.
+_INTENT_FOR_IDENTITY_VERDICT: dict[str, str] = {
+    PHONE_IDENTITY_SELF: gate_judge.INTENT_IDENTITY_CONFIRMED,
+    PHONE_IDENTITY_OTHER: gate_judge.INTENT_WRONG_PERSON,
+    PHONE_IDENTITY_UNAVAILABLE: gate_judge.INTENT_NOT_NOW_BUSY,
+    PHONE_IDENTITY_UNCLEAR: gate_judge.INTENT_UNCLEAR,
+}
 
 #: The verdict words as WHOLE words. The `\b` on each side is load-bearing:
 #: without it `self` matches inside himself / herself / myself / yourself /
@@ -6309,19 +7699,32 @@ async def phone_classify_identity(
     # would downgrade EVERY other_person verdict to self, screening whoever
     # answered. The backstop may only overrule the model when the record has a
     # name to overrule it WITH.
-    record_first = phone_safe_first_name(candidate_name)
-    introduced = phone_extract_introduced_name(reply)
-    if (
-        len(record_first) > 2
-        and introduced
-        and phone_name_mismatch(reply, candidate_name) is None
-    ):
+    if _identity_reply_names_the_record(reply, candidate_name):
         _log.info(
             "unknown_event", error_type="phone_identity_verdict",
             error_category="other_downgraded_record_name_spoken",
         )
         return PHONE_IDENTITY_SELF
     return PHONE_IDENTITY_OTHER
+
+
+def _identity_reply_names_the_record(reply: Any, candidate_name: Any) -> bool:
+    """The one-way record-name backstop (property 2 of `phone_classify_identity`).
+
+    True only when the reply CARRIES AN EXTRACTABLE NAME and that name is the
+    record's own; then an `other_person` verdict (from the identity model or,
+    since M013 S01 T05, from the gate judge) is downgraded to `self`. It only
+    ever moves a verdict toward continuing.
+    """
+    if not isinstance(reply, str):
+        return False
+    record_first = phone_safe_first_name(candidate_name)
+    introduced = phone_extract_introduced_name(reply)
+    return bool(
+        len(record_first) > 2
+        and introduced
+        and phone_name_mismatch(reply, candidate_name) is None
+    )
 
 
 def _opening_is_verified(text: Any) -> bool:
@@ -6359,25 +7762,89 @@ def _opening_is_verified(text: Any) -> bool:
     return True
 
 
-def phone_opening_draft_verified(text: Any, *, identity_done: bool = False) -> bool:
-    """Check an UNSPOKEN draft; no model text reaches TTS before this passes."""
+def phone_opening_draft_rejection(
+    text: Any, *, identity_done: bool = False,
+) -> Optional[str]:
+    """Why an UNSPOKEN consent draft is rejected, or None when it passes.
+
+    M013 S01 T08a: the checks of `phone_opening_draft_verified`, unchanged and
+    in the same order, returning a fixed reason so a rejected draft is logged
+    with it (`phone_gate_compose/rejected_<reason>`). The AI checks are the
+    same expressions as before (owner constraint 2).
+    """
+    if not isinstance(text, str) or not text.strip():
+        return "empty"
     if not _opening_is_verified(text):
-        return False
+        return "unverified"
     clean = text.strip()
-    if len(clean) > 650 or clean.count("?") != 1:
-        return False
+    if len(clean) > 650:
+        return "too_long"
+    if clean.count("?") != 1:
+        return "question_count"
     # Keep the disclosure contract while allowing the introduction and question
     # to be naturally authored. A mention of 'record' alone is not disclosure.
     if PHONE_DISCLOSURE_RECORDING_SENTENCE not in clean:
-        return False
+        return "no_recording_sentence"
+    # M013 S01 T05: the notice must be heard BEFORE the question. A "yes" to
+    # a question asked ahead of the recording sentence was not informed, and
+    # the grant guards (which time evidence against the sentence) would
+    # re-ask it. Both fixed lines already put the sentence first.
+    if clean.find("?") < clean.find(PHONE_DISCLOSURE_RECORDING_SENTENCE):
+        return "order"
     if _OPENING_IDENTITY_CUE_RE.search(clean):
-        return False
+        return "identity_question"
     if not identity_done and not (
         "christy" in clean.lower() and "ai" in clean.lower().split()
         and _COMPANY.lower() in clean.lower()
     ):
-        return False
-    return not any(token in clean for token in ("```", "**", "<", ">"))
+        return "no_ai_introduction"
+    if any(token in clean for token in ("```", "**", "<", ">")):
+        return "markup"
+    return None
+
+
+def phone_opening_draft_verified(text: Any, *, identity_done: bool = False) -> bool:
+    """Check an UNSPOKEN draft; no model text reaches TTS before this passes.
+
+    A draft that was composed (a non-empty string) and fails is logged as
+    `phone_gate_compose/rejected_<reason>` (T05's `rejected_order` is one of
+    them); a missing draft is the compose's own `timeout`/`unavailable` and
+    is not logged twice.
+    """
+    reason = phone_opening_draft_rejection(text, identity_done=identity_done)
+    if reason is None:
+        return True
+    if reason != "empty":
+        _log.info(
+            "unknown_event", error_type="phone_gate_compose",
+            error_category=f"rejected_{reason}", schema="consent",
+        )
+    return False
+
+
+def phone_identity_draft_rejection(text: Any, *, introduced: bool) -> Optional[str]:
+    """Why an UNSPOKEN identity-ask draft is rejected, or None when it passes.
+
+    M013 S01 T08a: the exact checks `run_phone_gate` applied inline, in the
+    same order, returning a fixed reason for the log. ``introduced`` is True
+    when the call already heard the bot introduce itself (an earlier gate
+    line), which waives the introduction check exactly as before.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return "empty"
+    if len(text) > 650:
+        return "too_long"
+    if text.count("?") != 1:
+        return "question_count"
+    if not _identity_line_asks_identity(text):
+        return "no_identity_ask"
+    if not introduced and not (
+        "christy" in text.lower()
+        and re.search(r"\bAI\b", text, re.IGNORECASE)
+        and _COMPANY.lower() in text.lower()
+    ):
+        return "no_ai_introduction"
+    return None
 
 
 async def run_phone_gate(
@@ -6504,6 +7971,51 @@ async def run_phone_gate(
     # (`ANSWERED_POST_TASK_KEY`), so the worker's own teardown terminal can
     # await it before posting. Absent ⇒ a private holder.
     answer_post_out: Optional[dict[str, Any]] = None,
+    # ── M013 S01 T03 (both optional; absent ⇒ today's behaviour) ──────────
+    # The post-answer time budget (`GateBudget`), started here at the answer
+    # and checked before every new ask. When one more round no longer fits,
+    # the gate says the deferral goodbye and posts
+    # `candidate.deferred_pre_disclosure` instead of running into the wall
+    # clock.
+    gate_budget: Optional[GateBudget] = None,
+    # Start the call's ONE lease heartbeat at the answer. Returns True when it
+    # is running: its first, immediate beat then replaces the one-shot
+    # `rebase_lease_on_answer`. False (no session id or epoch to fence with)
+    # keeps the re-base and caps the budget to the lease known to remain.
+    start_lease_heartbeat: Optional[Callable[[], bool]] = None,
+    # ── M013 S01 T05 (all optional; absent ⇒ today's behaviour) ──────────
+    # The gate judge at the identity turn. Given the reply text, returns the
+    # judge's intent when a VALID verdict should act (`PHONE_GATE_JUDGE=llm`),
+    # or None: legacy mode, shadow mode, or the judge unavailable — then the
+    # legacy regex pre-checks and `phone_classify_identity` decide as today.
+    judge_identity: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
+    # Told the route the LEGACY identity path took, as a judge intent, so a
+    # shadow judge can log whether it agreed. Never changes the route.
+    note_identity_route: Optional[Callable[[str], Any]] = None,
+    # Stamp the moment the recording sentence is heard. With it, the consent
+    # line is spoken as two back-to-back lines split at the verbatim recording
+    # sentence (`phone_split_consent_line`); the stamp is taken between them
+    # (or just before the line when the sentence opens it). Absent ⇒ the line
+    # is spoken whole, byte-identical.
+    mark_recording_sentence: Optional[Callable[[], Any]] = None,
+    # ── M013 S01 T06 (optional; absent ⇒ the deterministic parser alone) ─
+    # The gate judge's `callback_time` reading of one callback reply:
+    # `judge_callback(reply, first=bool)` returns a `gate_judge.GateDecision`
+    # (only a valid llm verdict is used: its day/time spans, which must be
+    # the candidate's own words, and its affirmative for a confirm question),
+    # or None (legacy / shadow mode, or the judge unavailable).
+    judge_callback: Optional[Callable[..., Awaitable[Any]]] = None,
+    # ── M013 S01 T08b (both optional; absent ⇒ today's behaviour) ─────────
+    # Start preparing the first question from the state the atomic
+    # consent/start RPC just returned (`phone_start_q1_prefetch`). Returns a
+    # `PhoneQ1Prefetch` (or None), carried out on the result so the pre-loop
+    # speaks Q1 the moment the role line ends instead of rephrasing it then.
+    start_q1_prefetch: Optional[Callable[[Any], Any]] = None,
+    # Start composing the role line while the consent question is asked
+    # (the role title is known before the call). Fired once, just before the
+    # consent line; `speak_role_opening` then uses the draft when the title
+    # the RPC returns is the same one.
+    start_role_compose: Optional[Callable[[], Any]] = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
@@ -6566,6 +8078,9 @@ async def run_phone_gate(
     """
     events: list[str] = []
     spoken: list[str] = []
+    # T03: when the gate (and with it the ring) began, on the budget's clock,
+    # so an unrenewed lease can be charged the ring it actually spent.
+    gate_entered_at = gate_budget.now() if gate_budget is not None else None
     #: The exact opening the bot spoke — from whichever path — so the gate
     #: transcript commit records what the candidate actually heard.
     opening_spoken: list[str] = []
@@ -6580,6 +8095,52 @@ async def run_phone_gate(
     def _phase(name: str) -> None:
         if gate_phase_out is not None:
             gate_phase_out[name] = True
+
+    # ── M013 S01 T08a: the consent line, composed ahead ───────────────────
+    # The consent draft is composed the moment the identity reply's turn
+    # closes, CONCURRENTLY with the identity verdict (the judge round trip),
+    # instead of after it. It is composed verdict-neutrally (see the agent's
+    # `speak_opening`), so it fits whatever the verdict is, and it is
+    # DISCARDED (cancelled, never spoken) on every route that does not reach
+    # the consent question. It is private text: nothing is spoken or sent to
+    # the candidate before the gate validates it, exactly as before.
+    consent_draft: list[Optional["asyncio.Future[Optional[str]]"]] = [None]
+
+    def _discard_consent_draft(reason: str) -> None:
+        task = consent_draft[0]
+        consent_draft[0] = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        elif not task.cancelled():
+            task.exception()  # retrieved: a failed draft is never an unhandled error
+        _log.info(
+            "unknown_event", error_type="phone_gate_compose",
+            error_category="consent_draft_discarded", schema=reason,
+        )
+
+    def _start_consent_draft() -> None:
+        _discard_consent_draft("superseded")
+        if compose_opening is None:
+            return
+        try:
+            consent_draft[0] = asyncio.ensure_future(compose_opening())
+        except Exception:  # noqa: BLE001 — no head start; the consent turn composes inline
+            consent_draft[0] = None
+
+    async def _take_consent_draft() -> Optional[str]:
+        """The consent draft: the one composed ahead, else composed now."""
+        task = consent_draft[0]
+        consent_draft[0] = None
+        if task is None:
+            return await compose_opening()  # type: ignore[misc]
+        try:
+            return await task
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a failed draft is the fixed line
+            return None
 
     # M009 E6: the backgrounded `call.answered` lives here. Empty on every path
     # that awaits it inline (presence, bounce), so `_await_answered_post` is a
@@ -6610,6 +8171,8 @@ async def run_phone_gate(
         outcomes have never done so, and a caller that needs to commit does it
         explicitly before calling here.
         """
+        # T08a: a terminal never reaches the consent question.
+        _discard_consent_draft("terminal")
         # Privacy disposition is content-free and must be latched before any
         # terminal API call or courtesy speech can raise/cancel. The worker
         # must discard even if the terminal post never returns a result.
@@ -6838,6 +8401,20 @@ async def run_phone_gate(
         # post-answer exit must never be charged as a no-answer.
         _phase("answer_observed")
 
+    # T03: the conversation's budget is measured from the answer, on every
+    # path that reaches one (seam, bounce, presence).
+    if gate_budget is not None:
+        gate_budget.start()
+
+    def _budget_allows(phase: str, *, line_sec: float | None = None) -> bool:
+        """T03: may the gate start one more ask? Always True with no budget."""
+        if gate_budget is None:
+            return True
+        try:
+            return gate_budget.can_ask(phase, line_sec=line_sec)
+        except Exception:  # noqa: BLE001 — a broken budget never ends a call
+            return True
+
     def _fire_begin_recording_at_answer() -> None:
         """0105: RECORD FROM THE ANSWER, fired and not awaited.
 
@@ -6954,11 +8531,42 @@ async def run_phone_gate(
         # The reference is held so the task cannot be garbage-collected
         # mid-flight, and the gate's own teardown outlives it: the renewal is a
         # single bounded HTTP round trip.
-        _rebase = asyncio.ensure_future(
-            rebase_lease_on_answer(client, attempt_id, session_id, epoch)
-        )
-        _lease_rebase_tasks.add(_rebase)
-        _rebase.add_done_callback(_lease_rebase_tasks.discard)
+        #
+        # M013 S01 T03: when the call's lease HEARTBEAT can start here, it
+        # replaces this one-shot re-base. Its first beat is immediate (the
+        # same renewal, from the same instant) and it keeps beating through
+        # the gate, so a long callback conversation can no longer outlive the
+        # lease. It is the ONE heartbeat of the call: the post-consent code
+        # reuses it. Starting it never awaits (no dead air after the answer).
+        heartbeat_running = False
+        if start_lease_heartbeat is not None:
+            try:
+                heartbeat_running = bool(start_lease_heartbeat())
+            except Exception:  # noqa: BLE001 — fall back to the re-base
+                heartbeat_running = False
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_heartbeat",
+                    error_category="gate_heartbeat_start_failed",
+                )
+        if not heartbeat_running:
+            _rebase = asyncio.ensure_future(
+                rebase_lease_on_answer(client, attempt_id, session_id, epoch)
+            )
+            _lease_rebase_tasks.add(_rebase)
+            _rebase.add_done_callback(_lease_rebase_tasks.discard)
+            if gate_budget is not None:
+                # Nothing renews the lease during this gate (the re-base may
+                # not land either), so it may not outlive what is KNOWN to
+                # remain of the admission lease: lease - (boot + join) - the
+                # ring this gate measured.
+                pre_answer = (
+                    gate_budget.now() - gate_entered_at
+                    if gate_entered_at is not None else 0.0
+                )
+                gate_budget.cap_total(
+                    phone_unrenewed_lease_after_answer_sec(pre_answer),
+                    reason="unrenewed_lease",
+                )
 
     # ── Durable consent short-circuit: a re-entry never re-asks ────────────
     # A worker deploy/crash mid-call re-dispatches this leg into a conversation
@@ -7226,17 +8834,16 @@ async def run_phone_gate(
         _ask_barrier()
         if compose_gate_line is not None:
             draft = await compose_gate_line(instruction)
-            valid = (
-                isinstance(draft, str) and len(draft) <= 650
-                and draft.count("?") == 1
-                and _identity_line_asks_identity(draft)
-                and (gate_turns or (
-                    "christy" in draft.lower()
-                    and re.search(r"\bAI\b", draft, re.IGNORECASE)
-                    and _COMPANY.lower() in draft.lower()
-                ))
-            )
-            line = draft.strip() if valid else fixed_line
+            # T08a: the same checks, now with a reason for the log. A missing
+            # draft (None, "") is the compose's own timeout/unavailable log.
+            rejection = phone_identity_draft_rejection(
+                draft, introduced=bool(gate_turns))
+            if rejection is not None and rejection != "empty":
+                _log.info(
+                    "unknown_event", error_type="phone_gate_compose",
+                    error_category=f"rejected_{rejection}", schema="identity",
+                )
+            line = draft.strip() if rejection is None else fixed_line  # type: ignore[union-attr]
             await _say(line)
             gate_turns.append({"speaker": "bot", "text": line})
             reply = await next_candidate_turn()
@@ -7302,50 +8909,141 @@ async def run_phone_gate(
         await _say(PHONE_CANDIDATE_END_TEXT)
         return result
 
-    async def _schedule_before_consent(first_reply: str) -> PhoneGateResult:
-        """Use the existing calendar pipeline without authorizing screening."""
-        await _await_answered_post()
-        flow = CallbackFlowState()
-        reply = first_reply
-        for _ in range(5):
-            verdict = classify_gate_reply(reply) if classify_gate_reply else None
-            if verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
-                return await _terminal_outcome(verdict)
-            if phone_preconsent_end_requested(reply):
-                return await _end_before_consent()
-            # 'No, tomorrow at three' corrects the proposed TIME; it is not a
-            # recording refusal. Strong recording/participation refusals remain
-            # terminal even when they also mention a time.
-            if verdict == CLASSIFY_REFUSED and re.search(
-                r"\brecord\w*\b|\bnot interested\b", reply, re.IGNORECASE,
-            ):
-                return await _terminal_outcome(verdict)
-            decision = await run_callback_turn(
-                flow, client, attempt_id, reply, datetime.now(timezone.utc),
+    async def _defer_with_goodbye(schema: str) -> PhoneGateResult:
+        """M013 S01 T02: the deferral every "a person may be here" exit ends in.
+
+        Posts `candidate.deferred_pre_disclosure` (uncharged, next IST-day
+        window, per 0114) FIRST, like every terminal here, then says the
+        goodbye. A hang-up during the goodbye is the expected ending: the
+        terminal is already posted, so it is swallowed rather than allowed to
+        reach the call site's participant-gone handler and post a second one.
+        """
+        result = await _terminal_outcome(
+            CLASSIFY_DEFERRED_PRE_DISCLOSURE, schema=schema,
+        )
+        try:
+            await _say(PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+        except PhoneParticipantGone:
+            _log.info(
+                "unknown_event", error_type="phone_gate_outcome",
+                error_category="deferral_goodbye_unheard_participant_gone",
             )
-            if decision.terminal:
-                if decision.booked:
-                    # Confirmation has durably ended the attempt. Latch before
-                    # farewell: a hangup must never post a second terminal.
-                    _phase("terminal_posted")
-                    await _say(decision.spoken)
-                    return PhoneGateResult(HALT_CALLBACK_SCHEDULED, events=events, spoken=spoken)
-                if decision.terminal_reason == HALT_CALLBACK_RECOVERY:
-                    _phase("consent_failure")
-                    outcome = await client.post_event(attempt_id, "consent.failed", epoch=epoch)
-                    if event_applied(outcome):
-                        events.append("consent.failed")
-                        _phase("terminal_posted")
-                    await _say(decision.spoken)
-                    return PhoneGateResult(HALT_CALLBACK_RECOVERY, events=events, spoken=spoken)
-                result = await _terminal_outcome(CLASSIFY_DEFERRED_PRE_DISCLOSURE)
-                await _say(decision.spoken)
-                return result
-            _ask_barrier()
+        return result
+
+    async def _schedule_before_consent(first_reply: str) -> PhoneGateResult:
+        """Use the existing calendar pipeline without authorizing screening.
+
+        M013 S01 T06: the conversation itself is
+        `converse_callback_before_consent`; this posts and speaks its end.
+        """
+        _discard_consent_draft("callback")  # T08a: no consent question follows
+        await _await_answered_post()
+        end = await converse_callback_before_consent(
+            first_reply,
+            client=client, attempt_id=attempt_id, say=_say,
+            read_reply=next_callback_turn or next_candidate_turn,
+            ask_barrier=_ask_barrier, budget_allows=_budget_allows,
+            gate_budget=gate_budget, classify_gate_reply=classify_gate_reply,
+            judge_callback=judge_callback,
+        )
+        if end.kind == GATE_CALLBACK_END_VERDICT:
+            return await _terminal_outcome(end.verdict)
+        if end.kind == GATE_CALLBACK_END_REQUESTED:
+            return await _end_before_consent()
+        if end.kind == GATE_CALLBACK_END_BUDGET:
+            return await _defer_with_goodbye(GATE_BUDGET_EXHAUSTED_SCHEMA)
+        decision = end.decision
+        if end.kind != GATE_CALLBACK_END_DECISION or decision is None:
+            # Silence after a callback question, or the turn bound: still a
+            # goodbye, never a silent hang-up (S01 T02).
+            return await _defer_with_goodbye(end.schema or "callback_turns_exhausted")
+        if decision.booked:
+            # Confirmation has durably ended the attempt. Latch before
+            # farewell: a hangup must never post a second terminal.
+            _phase("terminal_posted")
             await _say(decision.spoken)
-            reader = next_callback_turn or next_candidate_turn
-            reply = await reader() if reader else ""
-        return await _terminal_outcome(CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+            return PhoneGateResult(HALT_CALLBACK_SCHEDULED, events=events, spoken=spoken)
+        if decision.terminal_reason == HALT_CALLBACK_RECOVERY:
+            _phase("consent_failure")
+            outcome = await client.post_event(attempt_id, "consent.failed", epoch=epoch)
+            if event_applied(outcome):
+                events.append("consent.failed")
+                _phase("terminal_posted")
+            await _say(decision.spoken)
+            return PhoneGateResult(HALT_CALLBACK_RECOVERY, events=events, spoken=spoken)
+        result = await _terminal_outcome(CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        await _say(decision.spoken)
+        return result
+
+    async def _judge_identity_reply(reply: str) -> Optional[str]:
+        """T05: the judge's acting intent for one identity reply, or None."""
+        if judge_identity is None or not isinstance(reply, str) or not reply.strip():
+            return None
+        try:
+            intent = await judge_identity(reply)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a broken judge seam is "no verdict"
+            return None
+        return intent if isinstance(intent, str) and intent in gate_judge.INTENTS else None
+
+    def _note_identity_route(intent: str) -> None:
+        if note_identity_route is None:
+            return
+        try:
+            note_identity_route(intent)
+        except Exception:  # noqa: BLE001 — shadow bookkeeping never fails the gate
+            pass
+
+    async def _identity_route(reply: str, *, stage: str) -> "PhoneGateResult | str":
+        """Route ONE identity reply: a terminal result, or an identity verdict.
+
+        T05: in llm mode a valid judge verdict decides through the fixed
+        intent → verdict table (`_IDENTITY_VERDICT_FOR_INTENT`); the regex
+        pre-checks and `phone_classify_identity` run only in legacy/shadow
+        mode or when the judge was unavailable. The record-name backstop still
+        applies to a judged `wrong_person`, and only ever moves toward
+        continuing.
+        """
+        judged = await _judge_identity_reply(reply)
+        if judged is not None:
+            if judged == gate_judge.INTENT_OPT_OUT:
+                return await _terminal_outcome(CLASSIFY_OPT_OUT)
+            if judged in (gate_judge.INTENT_END_CALL, gate_judge.INTENT_CONSENT_DECLINED):
+                return await _end_before_consent()
+            verdict = _IDENTITY_VERDICT_FOR_INTENT.get(judged, PHONE_IDENTITY_UNCLEAR)
+            if verdict == PHONE_IDENTITY_OTHER and _identity_reply_names_the_record(
+                    reply, candidate_name):
+                _log.info(
+                    "unknown_event", error_type="phone_identity_verdict",
+                    error_category="other_downgraded_record_name_spoken",
+                )
+                verdict = PHONE_IDENTITY_SELF
+            _log.info(
+                "unknown_event", error_type="phone_identity_verdict",
+                error_category=verdict, schema=f"{stage}_judge",
+            )
+            return verdict
+        gate_verdict = classify_gate_reply(reply) if classify_gate_reply else None
+        if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
+            _note_identity_route(
+                gate_judge.INTENT_OPT_OUT if gate_verdict == CLASSIFY_OPT_OUT
+                else gate_judge.INTENT_WRONG_PERSON)
+            return await _terminal_outcome(gate_verdict)
+        if phone_preconsent_end_requested(reply):
+            _note_identity_route(gate_judge.INTENT_END_CALL)
+            return await _end_before_consent()
+        if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
+            _note_identity_route(gate_judge.INTENT_NOT_NOW_BUSY)
+            return await _schedule_before_consent(reply)
+        verdict = await phone_classify_identity(reply, candidate_name)
+        _log.info(
+            "unknown_event", error_type="phone_identity_verdict",
+            error_category=verdict, schema=stage,
+        )
+        _note_identity_route(
+            _INTENT_FOR_IDENTITY_VERDICT.get(verdict, gate_judge.INTENT_UNCLEAR))
+        return verdict
 
     identity_reply = ""
     if identity_ran:
@@ -7354,41 +9052,44 @@ async def run_phone_gate(
             phone_identity_text(candidate_name),
         )
         identity_reply = first_reply
-        gate_verdict = classify_gate_reply(first_reply) if classify_gate_reply else None
-        if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
-            return await _terminal_outcome(gate_verdict)
-        if phone_preconsent_end_requested(first_reply):
-            return await _end_before_consent()
-        if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
-            return await _schedule_before_consent(first_reply)
-        identity_verdict = await phone_classify_identity(first_reply, candidate_name)
-        _log.info(
-            "unknown_event", error_type="phone_identity_verdict",
-            error_category=identity_verdict, schema="first",
-        )
+        # T08a: the reply's turn has closed; compose the consent line while
+        # the identity verdict is worked out.
+        _start_consent_draft()
+        try:
+            routed = await _identity_route(first_reply, stage="first")
+        except BaseException:
+            _discard_consent_draft("gate_error")
+            raise
+        if isinstance(routed, PhoneGateResult):
+            _discard_consent_draft("terminal")
+            return routed
+        identity_verdict = routed
         if identity_verdict == PHONE_IDENTITY_OTHER:
+            # T08a: the re-ask is not the consent question; its own reply
+            # starts a fresh draft.
+            _discard_consent_draft("identity_reask")
             # ONE confirming re-ask, never more. The person who says "no, this
             # is her father" may equally be the candidate correcting a mangled
             # name, so the first verdict alone may not end a call.
+            # T03: only if its answer still fits the budget. A deferral is
+            # not a wrong-number verdict: nothing is suppressed or discarded.
+            if not _budget_allows("identity_reask"):
+                return await _defer_with_goodbye(GATE_BUDGET_EXHAUSTED_SCHEMA)
             second_reply = await _ask_identity(
                 phone_identity_reask_instruction(candidate_name),
                 phone_identity_reask_text(candidate_name),
             )
             identity_reply = second_reply
-            gate_verdict = classify_gate_reply(second_reply) if classify_gate_reply else None
-            if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
-                return await _terminal_outcome(gate_verdict)
-            if phone_preconsent_end_requested(second_reply):
-                return await _end_before_consent()
-            if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
-                return await _schedule_before_consent(second_reply)
-            identity_verdict = await phone_classify_identity(
-                second_reply, candidate_name,
-            )
-            _log.info(
-                "unknown_event", error_type="phone_identity_verdict",
-                error_category=identity_verdict, schema="reask",
-            )
+            _start_consent_draft()
+            try:
+                routed = await _identity_route(second_reply, stage="reask")
+            except BaseException:
+                _discard_consent_draft("gate_error")
+                raise
+            if isinstance(routed, PhoneGateResult):
+                _discard_consent_draft("terminal")
+                return routed
+            identity_verdict = routed
             # The re-ask verdict stands on its own, and DELIBERATELY is not
             # coerced. An earlier draft forced everything-but-`other_person` to
             # `self` here as a fail-open; that also swallowed `unavailable`, so
@@ -7396,6 +9097,10 @@ async def run_phone_gate(
             # proceeded to read the recording disclosure to the father instead
             # of taking the callback path. Fail-open is already provided by the
             # verdict vocabulary itself: only `other_person` ends the call.
+
+    if identity_verdict in (PHONE_IDENTITY_UNAVAILABLE, PHONE_IDENTITY_OTHER):
+        # T08a: neither route asks the consent question.
+        _discard_consent_draft(f"identity_{identity_verdict}")
 
     if identity_verdict == PHONE_IDENTITY_UNAVAILABLE:
         if classify_gate_reply is not None:
@@ -7470,19 +9175,68 @@ async def run_phone_gate(
     # Scoped to the conversational flow so the deterministic rollback stays
     # byte-identical. There is no identity turn there, so nothing can have been
     # left in the queue by one.
+    # T03: the consent question is asked only if its answer still fits; a
+    # consent read the wall clock would cut short helps nobody.
+    if not _budget_allows("consent", line_sec=GATE_DISCLOSURE_LINE_ESTIMATE_SEC):
+        return await _defer_with_goodbye(GATE_BUDGET_EXHAUSTED_SCHEMA)
     if identity_ran:
         _ask_barrier()
+    if start_role_compose is not None:
+        # T08b: the role line composes during the consent wait.
+        try:
+            start_role_compose()
+        except Exception:  # noqa: BLE001 — the role line then composes after consent
+            _log.warn(
+                "unknown_event", error_type="phone_role_opening",
+                error_category="precompose_start_failed",
+            )
+
+    def _mark_recording_heard() -> None:
+        if mark_recording_sentence is None:
+            return
+        try:
+            mark_recording_sentence()
+        except Exception:  # noqa: BLE001 — a missed stamp leaves the question anchor
+            _log.warn(
+                "unknown_event", error_type="phone_gate_recording_anchor",
+                error_category="mark_failed",
+            )
+
+    async def _say_consent_line(line: str) -> None:
+        """T05: speak the consent line split at the verbatim recording sentence.
+
+        Part A (the text before the sentence) and part B (the sentence and
+        the question) are two back-to-back lines; their concatenation is the
+        line, character for character. The recording anchor is stamped
+        between them, after part A's playout (the agent raises it to part B's
+        first audio when the SDK reports one). When the sentence opens the
+        line there is no part A: the stamp is taken before the line and
+        raised to its first audio. Without the seam the line is spoken whole.
+        """
+        part_a, part_b = phone_split_consent_line(line)
+        if (mark_recording_sentence is None
+                or PHONE_DISCLOSURE_RECORDING_SENTENCE not in part_b):
+            await _say(line)
+            return
+        if not part_a.strip():
+            _mark_recording_heard()
+            await _say(line)
+            return
+        await _say(part_a.rstrip())
+        _mark_recording_heard()
+        await _say(part_b)
 
     # ── The opening: model-generated-and-verified, or the fixed disclosure ─
     if compose_opening is not None:
-        draft = await compose_opening()
+        # T08a: usually composed already, during the identity verdict.
+        draft = await _take_consent_draft()
         line = (
             draft.strip() if phone_opening_draft_verified(draft, identity_done=identity_ran)
             else _fixed_disclosure_text()
         )
         # Playout errors propagate. Replaying a fallback after audio may have
         # started would recreate the duplicate opening this path removes.
-        await _say(line)
+        await _say_consent_line(line)
         opening_spoken.append(line)
     elif speak_opening is not None:
         try:
@@ -7529,16 +9283,21 @@ async def run_phone_gate(
                 PHONE_DISCLOSURE_CONTINUATION_TEXT if heard
                 else _fixed_disclosure_text()
             )
-            await _say(fallback)
+            await _say_consent_line(fallback)
             opening_spoken.append(fallback)
     else:
-        await _say(_fixed_disclosure_text())
+        await _say_consent_line(_fixed_disclosure_text())
         opening_spoken.append(_fixed_disclosure_text())
 
     timeout = (
         classify_timeout_sec if classify_timeout_sec is not None
         else phone_classify_timeout_sec()
     )
+    if gate_budget is not None:
+        # T03: the backstop never runs past the budget. The reader's own
+        # re-ask check normally defers first; this is the net under it, and
+        # its expiry is the same spoken deferral (never "machine").
+        timeout = max(1.0, min(timeout, gate_budget.remaining()))
     # ── Consent-turn short max-endpointing (2026-09-09 latency RCA) ────────────
     # The consent reply is a bare affirmation ("yes"), which the local v1-mini
     # EOU scores INCOMPLETE — so it waits out the full mid-answer max tail (2.5s)
@@ -7566,6 +9325,9 @@ async def run_phone_gate(
                 "unknown_event", error_type="phone_consent_endpointing",
                 schema="tightened", duration_sec=consent_max,
             )
+    # M013 S01 T02: why a consent read ended in a deferral, as a fixed category
+    # for the outcome log. Never text.
+    deferral_schema = "consent_deferred"
     try:
         decision = await asyncio.wait_for(classify(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -7576,10 +9338,22 @@ async def run_phone_gate(
             "unknown_event", error_type="phone_gate_timeout",
             error_category="classify",
         )
-        decision = CLASSIFY_MACHINE
+        # A DEFERRAL, not "machine" (S01 T02). The backstop is sized above the
+        # reader's own budget, so reaching it means our side hung, not that a
+        # voicemail answered; the person who may be on the line hears a
+        # goodbye and is tried again another day, uncharged.
+        decision = CLASSIFY_DEFERRED_PRE_DISCLOSURE
+        deferral_schema = "consent_classify_timeout"
     except Exception:  # noqa: BLE001
-        # A broken classifier must not become consent.
-        decision = CLASSIFY_MACHINE
+        # A broken classifier must not become consent — nor "machine" for a
+        # person who may be on the line. Deferral is the one verdict that is
+        # neither.
+        _log.warn(
+            "unknown_event", error_type="phone_gate_classify",
+            error_category="classify_failed",
+        )
+        decision = CLASSIFY_DEFERRED_PRE_DISCLOSURE
+        deferral_schema = "consent_classify_failed"
     finally:
         if tightened_endpointing:
             try:
@@ -7601,7 +9375,20 @@ async def run_phone_gate(
     if decision == CLASSIFY_CALLBACK_REQUESTED and consent_reply_out:
         return await _schedule_before_consent(consent_reply_out[-1])
     if decision not in PHONE_CLASSIFICATIONS:
-        decision = CLASSIFY_MACHINE
+        # The reader's own deferral (a person spoke, then nothing readable),
+        # an unknown or coerced verdict (including a callback request with no
+        # reply to schedule from), a timeout or a classifier error: a spoken
+        # goodbye and `candidate.deferred_pre_disclosure`. Never "machine" —
+        # that verdict is reserved for a line on which no person was heard.
+        # Still fail-closed for consent: none of these is in the consent
+        # vocabulary, so none can reach the HUMAN branch below.
+        if decision != CLASSIFY_DEFERRED_PRE_DISCLOSURE:
+            _log.warn(
+                "unknown_event", error_type="phone_gate_outcome",
+                error_category="consent_verdict_unknown",
+            )
+            deferral_schema = "consent_verdict_unknown"
+        return await _defer_with_goodbye(deferral_schema)
 
     if decision != CLASSIFY_HUMAN:
         return await _terminal_outcome(decision)
@@ -7683,6 +9470,18 @@ async def run_phone_gate(
             return PhoneGateResult(CLASSIFY_HUMAN, events=events, spoken=spoken)
         _phase("consent_durable")
         events.extend(["classify.human", "disclosure.delivered"])
+        # T08b: the plan is known now, a whole role line before Q1 is due, so
+        # Q1's rephrase (and its audio) is prepared underneath the role line.
+        q1_prefetch = None
+        if start_q1_prefetch is not None:
+            try:
+                q1_prefetch = start_q1_prefetch(combined)
+            except Exception:  # noqa: BLE001 — the pre-loop rephrases on demand
+                q1_prefetch = None
+                _log.warn(
+                    "unknown_event", error_type="phone_q1_prefetch",
+                    error_category="start_failed",
+                )
         # THE LATENCY MASK. The deterministic role-opening line (a USEFUL
         # sentence, not a throwaway bridge) is spoken as a background task so it
         # plays WHILE the gate-turn commit and the egress start run underneath
@@ -7738,23 +9537,31 @@ async def run_phone_gate(
             return False
 
         role_spoken = False
-        role_task = asyncio.ensure_future(_deliver_role_opening())
         try:
-            await _commit_gate_turns()
-            if start_recording is not None:
-                await start_recording()
-        finally:
+            role_task = asyncio.ensure_future(_deliver_role_opening())
             try:
-                role_spoken = await role_task
-            except Exception:  # noqa: BLE001
-                _log.warn(
-                    "unknown_event", error_type="phone_role_opening_failed",
-                    error_category="role_opening",
-                )
+                await _commit_gate_turns()
+                if start_recording is not None:
+                    await start_recording()
+            finally:
+                try:
+                    role_spoken = await role_task
+                except Exception:  # noqa: BLE001
+                    _log.warn(
+                        "unknown_event", error_type="phone_role_opening_failed",
+                        error_category="role_opening",
+                    )
+        except BaseException:
+            # T08b: a gate that does not return leaves nothing preparing Q1.
+            cancel_prefetch = getattr(q1_prefetch, "cancel", None)
+            if callable(cancel_prefetch):
+                cancel_prefetch()
+            raise
         return PhoneGateResult(CLASSIFY_HUMAN, assessment_allowed=True,
                                recording_allowed=True, events=events, spoken=spoken,
                                assessment_state=combined,
-                               role_opening_spoken=role_spoken)
+                               role_opening_spoken=role_spoken,
+                               q1_prefetch=q1_prefetch)
 
     await _await_answered_post()
     human = await client.post_event(attempt_id, "classify.human", epoch=epoch)
@@ -8084,9 +9891,66 @@ def classify_withdrawal_confirm_reply(text: Any) -> str:
     return WITHDRAWAL_REPLY_AMBIGUOUS
 
 
+# ── M013 S01 T07: the reply to PHONE_REVOCATION_BUSY_CONFIRM_TEXT ─────────
+REVOCATION_CONFIRM_CALLBACK = "callback"
+REVOCATION_CONFIRM_CONTINUE = "continue"
+
+#: Review fix: no "ok", "okay", "alright" or "ji" here. In Indian English
+#: "Okay" / "Okay, tell me" / "Ji" to "would you prefer a call back?" usually
+#: means "go on", and a wrong callback ends a just-consented screening.
+_RV_YES_RE = re.compile(
+    r"^\s*(?:yes|yeah|yep|yup|ya|yah|haan|haa|han|sure|please|"
+    r"definitely|of\s+course|that\s+would\s+be\s+"
+    r"(?:better|great|good|nice)|that'?s\s+better|better)\b",
+    re.IGNORECASE,
+)
+#: "Go on" in any form: carry on with the screening (checked before a yes).
+_RV_CONTINUE_RE = re.compile(
+    r"\b(?:tell\s+me|go\s+on|go\s+ahead|continue|carry\s+on|proceed|"
+    r"ask(?:\s+(?:me|away|now|your\s+questions?))?|let'?s\s+(?:do\s+it|start|begin|go))\b",
+    re.IGNORECASE,
+)
+_RV_NO_RE = re.compile(
+    r"\b(?:no|nope|nah|nahi|not\s+needed|no\s+need|it'?s\s+(?:fine|okay|ok|alright)|"
+    r"(?:i'?m|i\s+am)\s+(?:fine|free|okay|ok|good|available)(?:\s+now)?|"
+    r"(?:now|this)\s+is\s+(?:fine|okay|ok|good))\b",
+    re.IGNORECASE,
+)
+
+
+def classify_revocation_busy_confirm_reply(text: Any) -> str:
+    """Classify the reply to PHONE_REVOCATION_BUSY_CONFIRM_TEXT (M013 T07).
+
+    ``callback`` only on a clear yes or a callback request ("yes", "please",
+    "call me later"); everything else (a no, "carry on", an answer to the
+    question, silence-shaped noise) is ``continue``. Wrongly carrying on is
+    recoverable (the candidate can still ask for a callback, which the
+    ordinary in-call path books); wrongly ending the screening is not, so an
+    unclear reply carries on. A withdrawal-shaped reply is the caller's to
+    route to the existing withdrawal confirmation before this is consulted.
+    """
+    value = _wd_normalise(text)
+    if not value:
+        return REVOCATION_CONFIRM_CONTINUE
+    if classify_withdrawal_confirm_reply(value) == WITHDRAWAL_REPLY_CONTINUE:
+        return REVOCATION_CONFIRM_CONTINUE
+    if candidate_turn_route(value) == "callback_deferral":
+        return REVOCATION_CONFIRM_CALLBACK
+    if _RV_NO_RE.search(value):
+        return REVOCATION_CONFIRM_CONTINUE
+    if _RV_CONTINUE_RE.search(value):
+        return REVOCATION_CONFIRM_CONTINUE
+    if _RV_YES_RE.match(value):
+        return REVOCATION_CONFIRM_CALLBACK
+    return REVOCATION_CONFIRM_CONTINUE
+
+
 # Post-plan candidate Q&A is deliberately bounded. Five real questions is
 # enough space for a candidate to understand the role without turning a phone
 # screen into an unbounded support call that holds a fleet slot indefinitely.
+# M013 S01 T09: fillers and go-aheads ("Okay", a bare "Yes") are counted
+# against the same bound in their own counter, so a stream of them cannot hold
+# the phase open forever either.
 PHONE_QNA_MAX_ROUNDS = 5
 _QNA_DONE_RE = re.compile(
     r"^\s*(?:"
@@ -8344,7 +10208,7 @@ def phone_qna_dismissal(text: Any) -> bool:
     for clause in re.split(r"[.;!,]|\b(?:but|and|although|though)\b",
                            normalized, flags=re.IGNORECASE):
         clause = clause.strip()
-        if clause and _QUESTION_OPEN_RE.match(clause):
+        if clause and _QNA_QUESTION_OPEN_RE.match(clause):
             return False
     return _QNA_DISMISSAL_RE.search(normalized) is not None
 
@@ -8372,6 +10236,141 @@ def phone_qna_incomplete(text: Any) -> bool:
     if _QUESTION_OPEN_RE.match(clean) or _CONTENT_DIGIT_RE.search(clean) or clean.endswith("?"):
         return False
     return bool(_QNA_INCOMPLETE_RE.fullmatch(clean))
+
+
+# ── M013 S01 T09: the Q&A closing fallback grammar ───────────────────────
+#
+# At the end of the screening the bot asks "any questions?". The judge
+# (phase `qna_close`) decides decline vs question vs anything else; these two
+# deterministic readers are used only when the judge is not acting (legacy
+# mode, or the judge unavailable), and for the bare "Yes" go-ahead, which needs
+# no model. Live (session 62aec5d9): "No ma'am, thank you so much.", "No
+# ma'am", "It's all good" each burned a Q&A round because the anchored
+# `_QNA_DONE_RE` could not see past "ma'am" or "so much", and the bot asked
+# "anything else?" four times.
+
+#: Honorifics stripped before the decline grammar runs ("No ma'am, thanks").
+_QNA_HONORIFIC_RE = re.compile(
+    r"\b(?:ma'?a?m|maam|mam|madam|sir|ji|mister)\b", re.IGNORECASE,
+)
+#: "for now", "as of now", "right now", "at the moment" after a decline core.
+_QNA_FOR_NOW = r"(?:\s+(?:for\s+now|as\s+of\s+now|right\s+now|at\s+the\s+moment))"
+_QNA_DECLINE_RE = re.compile(
+    # Up to three leading tokens: "No", "No no", "Okay", "Nahi", "Yes" ("yes,
+    # thank you" is a polite close); never enough on their own (see the
+    # closure-word check in `phone_qna_decline`).
+    r"^(?:(?:no|nope|nah|nahi|nahin|nai|na|ok|okay|yeah|yes|ya|alright|fine|"
+    r"actually|right|sure|no\s+no)[\s,.!-]*){0,3}"
+    # An optional core: nothing (else) | no (more) questions | all good |
+    # it's clear | that's all | bas, in English and romanised Hindi.
+    # Review fix: also the commonest Indian-English declines the first cut
+    # missed: "I don't have any (more) questions", "I have no questions",
+    # "not really", "not as such", "nothing / no questions as of now",
+    # "I think that covers it".
+    r"(?:(?:nothing|kuch\s+nahi|kuch\s+nahin|kuch\s+bhi\s+nahi|koi\s+nahi)"
+    r"(?:\s+(?:else|more|much|as\s+such))?" + _QNA_FOR_NOW + r"?"
+    r"|no\s+(?:more\s+|other\s+|further\s+)?(?:questions?|quer(?:y|ies)|doubts?)"
+    r"(?:\s+as\s+such)?" + _QNA_FOR_NOW + r"?"
+    r"|(?:i\s+)?(?:don't|do\s+not|dont)\s+have\s+(?:any\s+)?(?:more\s+|other\s+|further\s+)?"
+    r"(?:questions?|quer(?:y|ies)|doubts?)(?:\s+as\s+such)?" + _QNA_FOR_NOW + r"?"
+    r"|i\s+have\s+no\s+(?:more\s+|other\s+|further\s+)?(?:questions?|quer(?:y|ies)|doubts?)"
+    r"(?:\s+as\s+such)?" + _QNA_FOR_NOW + r"?"
+    r"|not\s+(?:really|as\s+such)" + _QNA_FOR_NOW + r"?"
+    r"|(?:i\s+think\s+)?that\s+covers\s+(?:it|everything)"
+    r"|(?:it(?:'s|\s+is)|its|everything(?:'s|\s+is)?|i(?:'m|\s+am)|we(?:'re|\s+are))"
+    r"\s+(?:all\s+)?(?:good|fine|clear|ok(?:ay)?|done|set)"
+    r"|all\s+(?:good|clear|fine|set)|that(?:'s|\s+is)\s+(?:all|it|fine)|bas"
+    r")?[\s,.!-]*"
+    # An optional thanks ending.
+    r"(?:(?:thank\s*you|thanks|thank\s+u)(?:\s+(?:so|very)\s+much|\s+a\s+lot|"
+    r"\s+again)?[\s,.!-]*)?"
+    # An optional goodbye ("No, thank you. Bye.", "Okay bye").
+    r"(?:(?:ok(?:ay)?[\s,.!-]+)?(?:bye(?:[\s,.!-]+bye)?|good\s*bye)[\s,.!-]*)?$",
+    re.IGNORECASE,
+)
+#: A decline needs at least one negative, closure, thank-you or goodbye word:
+#: a bare "Yes" / "Okay" means "I have a question", never "I am done".
+_QNA_DECLINE_WORD_RE = re.compile(
+    r"\b(?:no|nope|nah|nahi|nahin|nai|na|nothing|good|fine|clear|done|set|all|"
+    r"it|bas|thank|thanks|not|don't|dont|covers|bye|goodbye)\b",
+    re.IGNORECASE,
+)
+_QNA_ASKS_RE = re.compile(
+    r"\b(?:one|a|another|quick|last|small|final)\s+(?:more\s+)?"
+    r"(?:question|query|doubt)s?\b",
+    re.IGNORECASE,
+)
+#: Longest reply the decline grammar may close on (after honorifics are
+#: stripped). A long reply is never a bare "no more questions".
+_QNA_DECLINE_MAX_TOKENS = 14
+
+
+def phone_qna_decline(text: Any) -> bool:
+    """True when a Q&A reply politely declines to ask anything (M013 T09).
+
+    The fallback for the `qna_close` judge. Honorifics are stripped, then the
+    whole reply must match a short decline: leading no/okay tokens, an optional
+    "nothing else / no more questions / it's all good / that's all / kuch
+    nahi", and an optional thanks ending ("thank you so much"). Fails CLOSED
+    (False) on any "?", on a clause that opens with a question word, on "one
+    more question" / "a doubt", on more than ten words, and on a reply with no
+    negative, closure or thank-you word, so "Yes", "Okay" and "No ma'am, what
+    is the stipend" stay open.
+    """
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.replace("’", "'").replace("‘", "'").strip().split())
+    if not clean or "?" in clean:
+        return False
+    if _QNA_ASKS_RE.search(clean):
+        return False
+    for clause in re.split(r"[.;!,]|\b(?:but|and|although|though)\b",
+                           clean, flags=re.IGNORECASE):
+        clause = clause.strip()
+        if clause and _QNA_QUESTION_OPEN_RE.match(clause):
+            return False
+    stripped = " ".join(_QNA_HONORIFIC_RE.sub(" ", clean).split())
+    stripped = re.sub(r"\s+([,.!])", r"\1", stripped).strip(" ,.!-")
+    if not stripped or len(stripped.split()) > _QNA_DECLINE_MAX_TOKENS:
+        return False
+    if not _QNA_DECLINE_WORD_RE.search(stripped):
+        return False
+    return _QNA_DECLINE_RE.fullmatch(stripped) is not None
+
+
+#: A bare "yes" to the Q&A invite: the candidate has a question but has not
+#: asked it yet ("Yes", "Yeah", "Right", "Yes ma'am", "Haan ji", "Yes, I have
+#: a question"). Never a question itself and never a decline.
+_QNA_BARE_YES_RE = re.compile(
+    r"^(?:(?:yes|yeah|yea|yep|yup|ya|right|sure|haan|han|okay\s+yes)"
+    r"[\s,.!-]*){1,2}"
+    r"(?:(?:i\s+(?:do|have|had)|there\s+is|i've\s+got|i\s+have\s+got)"
+    r"(?:\s+(?:one|a|some|a\s+few|few|a\s+couple\s+of|couple\s+of))?"
+    r"(?:\s+(?:questions?|quer(?:y|ies)|doubts?))?"
+    r"|(?:one|a)\s+(?:question|query|doubt)|please)?[\s.!-]*$",
+    re.IGNORECASE,
+)
+
+
+def phone_qna_bare_yes(text: Any) -> bool:
+    """True when a Q&A reply is a bare "yes, I have a question" (M013 T09).
+
+    The bot answers it with ``PHONE_QNA_GO_AHEAD_TEXT`` instead of the old
+    silent hold. A reply that already carries the question ("Yes, what is the
+    stipend?") is not bare: a question word or a "?" after the yes fails it.
+    """
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.replace("’", "'").replace("‘", "'").strip().split())
+    if not clean:
+        return False
+    stripped = " ".join(_QNA_HONORIFIC_RE.sub(" ", clean).split())
+    stripped = re.sub(r"\s+([,.!?])", r"\1", stripped).strip(" ,.!-")
+    # One trailing "?" on the bare word itself ("Yes?") is still a go-ahead.
+    stripped = stripped[:-1] if stripped.endswith("?") else stripped
+    if not stripped or "?" in stripped:
+        return False
+    return _QNA_BARE_YES_RE.fullmatch(stripped) is not None
 
 
 # ── PR-9: shadow coverage + resume-conflict judge ─────────────────────
@@ -8945,6 +10944,52 @@ async def _default_phone_interviewer_text(instruction: str) -> str | None:
         return None
 
 
+def phone_prefix_warm_request_body(system_prefix: str) -> dict[str, Any]:
+    """The prefix-cache warm-up request: the prompt as the SYSTEM message.
+
+    M013 S01 T08a. The session's LLM requests open with the screening prompt
+    as their system message, and DeepSeek caches by rendered-prompt prefix, so
+    only a request that also opens with it as the system message can seed
+    their cache. A one-character user turn makes the request valid; one
+    output token, discarded, keeps the cost to the prefill.
+    """
+    body: dict[str, Any] = {
+        "model": phone_primary_model(),
+        "temperature": 0,
+        "max_tokens": 1,
+        "messages": [
+            {"role": "system", "content": system_prefix},
+            {"role": "user", "content": "."},
+        ],
+    }
+    effort = phone_llm_reasoning_effort()
+    if effort is not None:
+        body["reasoning_effort"] = effort
+    return body
+
+
+async def _warm_phone_system_prefix(system_prefix: str) -> None:
+    """POST `phone_prefix_warm_request_body` to the interviewer. Never raises."""
+    api_key = phone_llm_api_key()
+    if not api_key:
+        return
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+        "Cache-Control": "no-store",
+    }
+    try:
+        await call_with_breaker(
+            "POST", _phone_interviewer_chat_url(),
+            breaker=_PHONE_COVERAGE_BREAKER,
+            transport=_phone_coverage_transport(),
+            headers=headers, json_body=phone_prefix_warm_request_body(system_prefix),
+            endpoint_hint="unknown", log_failures=False,
+        )
+    except Exception:  # noqa: BLE001 — a warm-up never surfaces on the call
+        return
+
+
 #: Bound on the Gemini connection warm-up. It runs off the speech path and is
 #: discarded, so the only cost of expiry is the cold turn it was avoiding.
 PHONE_GOOGLE_WARMUP_TIMEOUT_SEC = 6.0
@@ -9070,7 +11115,14 @@ async def phone_warm_prefix_cache(
     prefix = str(system_prefix or "").strip()
     if not prefix:
         return
-    infer_fn = infer or _default_phone_interviewer_text
+    # M013 S01 T08a: the default sends the prefix as the SYSTEM message, the
+    # role the session's own requests give it. Sent as a USER message (the
+    # pre-T08a default) the chat template puts a user-role marker before the
+    # prompt, so the rendered request did not share the real requests' prefix
+    # and could not seed their cache. That gap was hidden while every
+    # pre-consent turn ran a real (discarded) generation on the main prompt;
+    # T08a removed those calls, so this warm-up is now the only one.
+    infer_fn = infer or _warm_phone_system_prefix
     try:
         # We only need DeepSeek to READ (and cache) the prefix; the generated
         # continuation is irrelevant, so discard whatever comes back.
@@ -9151,6 +11203,179 @@ async def phone_rephrase_first_question(
     if candidate and phone_rephrased_question_acceptable(candidate):
         return candidate
     return text
+
+
+# ── M013 S01 T08b: the first question, prepared during the role line ────────
+#
+# THE Q1 GAP. After consent the role line plays (5-8 s), and only once it had
+# finished did the pre-loop ask the model to rephrase Q1 (a one-shot of up to
+# 3 s), then synthesise it. Live 9f60523d: 1.8 s of silence between the role
+# line and Q1; worst case about 9 s; in #334's stage-2 call the candidate
+# filled it with "Okay" and Q1 was cut off. The plan, and so Q1, is known the
+# moment the atomic consent/start RPC returns, a whole role line earlier.
+#
+# So the gate starts the rephrase there (and, when enabled, renders its audio
+# straight after), and the pre-loop takes whatever is ready once the role line
+# ends. It waits at most `PHONE_Q1_PREFETCH_WAIT_SEC` for a rephrase that is
+# still running: the verbatim planned question is always a correct thing to
+# say, and silence is not. The role line and Q1 stay two utterances (the
+# ffab6c2a double-question risk).
+
+#: The longest the pre-loop waits, after the role line, for a rephrase started
+#: at consent before it speaks the verbatim planned question instead.
+PHONE_Q1_PREFETCH_WAIT_SEC = 0.3
+
+#: `phone_take_q1_prefetch` outcome categories (logged, never text).
+Q1_PREFETCH_PRERENDERED = "prerendered"
+Q1_PREFETCH_REPHRASED = "rephrased"
+Q1_PREFETCH_RENDER_UNAVAILABLE = "render_unavailable"
+Q1_PREFETCH_TIMEOUT = "timeout"
+Q1_PREFETCH_MISMATCH = "mismatch"
+Q1_PREFETCH_ERROR = "error"
+
+
+def phone_q1_prerender_enabled() -> bool:
+    """Pre-render the first question's audio during the role line (T08b).
+
+    DEFAULT ON; an explicit off token (``false``/``0``/``no``/``off``)
+    disables it, and Q1 is then synthesised on demand as before (the rephrase
+    still starts at consent). Read with the literal name so the env-contract
+    scanner sees it.
+    """
+    return (os.getenv("PHONE_Q1_PRERENDER") or "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    )
+
+
+class PhoneQ1Prefetch:
+    """The first question, being prepared while the role line plays.
+
+    Carries what it was prepared FOR (cursor, key, planned text), so the
+    pre-loop can refuse it when the leg's question differs, and the two
+    tasks: the rephrase, and the optional audio render of its result.
+    """
+
+    __slots__ = ("cursor", "key", "planned_text", "rephrase_task", "frames_task")
+
+    def __init__(
+        self,
+        *,
+        cursor: int,
+        key: str,
+        planned_text: str,
+        rephrase_task: "asyncio.Future[str]",
+        frames_task: "asyncio.Future[list[Any]] | None" = None,
+    ) -> None:
+        self.cursor = cursor
+        self.key = key
+        self.planned_text = planned_text
+        self.rephrase_task = rephrase_task
+        self.frames_task = frames_task
+
+    def matches(self, cursor: int, question: Any) -> bool:
+        return (
+            question is not None
+            and self.cursor == cursor
+            and self.key == getattr(question, "key", None)
+            and self.planned_text == getattr(question, "spoken_text", None)
+        )
+
+    def cancel(self) -> None:
+        """Stop whatever is still running. Idempotent; never raises."""
+        for task in (self.frames_task, self.rephrase_task):
+            if task is not None and not task.done():
+                task.cancel()
+
+
+def phone_start_q1_prefetch(
+    state: Any,
+    *,
+    render: Optional[Callable[[str], Awaitable[Any]]] = None,
+) -> Optional[PhoneQ1Prefetch]:
+    """Start rephrasing (and optionally rendering) the leg's next question.
+
+    Called by the gate the moment the atomic consent/start RPC returns. None
+    when the state has no question at its cursor. ``render(text)`` returns
+    the audio frames for ``text`` (an empty list on any failure); it runs on
+    the rephrase's RESULT, so the frames always match the text spoken.
+    """
+    if state is None or not getattr(state, "ok", False):
+        return None
+    cursor = getattr(state, "cursor", 0)
+    question_at = getattr(state, "question_at", None)
+    question = question_at(cursor) if callable(question_at) else None
+    if question is None:
+        return None
+    planned = question.spoken_text
+    rephrase_task = asyncio.ensure_future(phone_rephrase_first_question(planned))
+    frames_task = None
+    if render is not None:
+        async def _render_rephrased() -> list[Any]:
+            text = await rephrase_task
+            frames = await render(text)
+            return list(frames or [])
+
+        frames_task = asyncio.ensure_future(_render_rephrased())
+        # A render that fails or is cancelled is simply not used; retrieve
+        # its outcome so asyncio never reports it as unretrieved.
+        frames_task.add_done_callback(_q1_prefetch_consume)
+    return PhoneQ1Prefetch(
+        cursor=cursor, key=question.key, planned_text=planned,
+        rephrase_task=rephrase_task, frames_task=frames_task,
+    )
+
+
+def _q1_prefetch_consume(task: "asyncio.Future[Any]") -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def phone_take_q1_prefetch(
+    prefetch: Optional[PhoneQ1Prefetch],
+    *,
+    cursor: int,
+    question: Any,
+    wait_sec: float | None = None,
+) -> Optional[tuple[str, Optional[list[Any]], str]]:
+    """What to say for the first question: ``(text, frames, outcome)``.
+
+    None when there is no prefetch (the caller rephrases now, as before).
+    ``frames`` is None unless pre-rendered audio for exactly ``text`` is
+    ready. A prefetch made for another cursor, key or planned text, a
+    rephrase still running after ``wait_sec``, or a failed one gives the
+    VERBATIM planned question of ``question`` — never the prefetched one.
+    """
+    if prefetch is None:
+        return None
+    planned = getattr(question, "spoken_text", None) or ""
+    if not prefetch.matches(cursor, question):
+        prefetch.cancel()
+        return planned, None, Q1_PREFETCH_MISMATCH
+    wait = PHONE_Q1_PREFETCH_WAIT_SEC if wait_sec is None else max(0.0, wait_sec)
+    task = prefetch.rephrase_task
+    if not task.done():
+        done, _pending = await asyncio.wait({task}, timeout=wait)
+        if not done:
+            prefetch.cancel()
+            return planned, None, Q1_PREFETCH_TIMEOUT
+    if task.cancelled() or task.exception() is not None:
+        prefetch.cancel()
+        return planned, None, Q1_PREFETCH_ERROR
+    text = task.result()
+    if not isinstance(text, str) or not text.strip():
+        prefetch.cancel()
+        return planned, None, Q1_PREFETCH_ERROR
+    frames_task = prefetch.frames_task
+    if frames_task is None:
+        return text, None, Q1_PREFETCH_REPHRASED
+    if (
+        frames_task.done() and not frames_task.cancelled()
+        and frames_task.exception() is None and frames_task.result()
+    ):
+        return text, list(frames_task.result()), Q1_PREFETCH_PRERENDERED
+    # Not ready (or failed): synthesise on demand rather than wait for it.
+    prefetch.cancel()
+    return text, None, Q1_PREFETCH_RENDER_UNAVAILABLE
 
 
 def _coverage_keywords(text: Any) -> set[str]:
@@ -12597,11 +14822,212 @@ _QUESTION_OPEN_RE = re.compile(
     # for a substantive answer (call 24, turn 23: "And what do you think about
     # my workflow? ..." fell through this gate because it did not start with an
     # interrogative). Up to two leading conjunctions/fillers are skipped.
+    #
+    # SHARED by the mid-interview readers (`phone_turn_dimensions`,
+    # `candidate_turn_route`, `phone_candidate_question_directed`), so it is
+    # left exactly as before M013: skipping "Yes sir," here made ordinary
+    # answers ("Yes sir, will do", "Yes ma'am, can relocate") read as
+    # candidate questions (review fix). The end-of-screening Q&A uses its own
+    # `_QNA_QUESTION_OPEN_RE` below.
     r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now|um+|uh+|yeah|right)[\s,.!?-]+){0,4}"
     r"(?:can|could|would|will|what|which|who|where|when|why|how|"
     r"is|are|do|does|did)\b",
     re.IGNORECASE,
 )
+#: M013 S01 T09 (session 62aec5d9), Q&A ONLY: `_QUESTION_OPEN_RE` that also
+#: skips a leading "Yes/No ma'am|sir", a bare "Ma'am"/"Sir" and "Wait," —
+#: "Yes ma'am, what is the role" and "No ma'am, what is the stipend" are
+#: questions once the bot has asked "any questions?". "Yes"/"No" are skipped
+#: only together with the honorific, so "Yes, I can join" stays an answer.
+_QNA_QUESTION_OPEN_RE = re.compile(
+    r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now|um+|uh+|yeah|right|wait|"
+    r"(?:(?:yes|no)[\s,.!-]*)?(?:ma['’]?a?m|maam|mam|madam|sir))[\s,.!?-]+){0,4}"
+    r"(?P<q>can|could|would|will|what|which|who|where|when|why|how|"
+    r"is|are|do|does|did)\b",
+    re.IGNORECASE,
+)
+#: Q&A ONLY: a request for information with no question word ("tell me about
+#: the work timings", "I wanted to know the stipend", "can I ask about leave").
+_QNA_REQUEST_RE = re.compile(
+    r"\b(?:tell\s+me\s+(?:about|more|what|how|if|whether)"
+    r"|i\s+(?:want|wanted|would\s+like|'d\s+like|wish)\s+to\s+(?:know|ask|understand|check)"
+    r"|(?:can|could|may)\s+i\s+(?:ask|know)"
+    r"|(?:want|wanted)\s+to\s+ask"
+    r"|ask\s+(?:you\s+)?about"
+    r"|what\s+about)\b",
+    re.IGNORECASE,
+)
+
+
+def phone_qna_question_directed(text: Any) -> bool:
+    """Q&A ONLY (M013 S01 review fix): a question or request for the interviewer.
+
+    After the bot asked "any questions?", a reply that OPENS with a question
+    word is a question for it ("what is the stipend", "how many rounds are
+    there"), past a leading "Yes ma'am," / "Sir," / "Wait," (the Q&A opener),
+    and so is a request with no question word ("tell me about the work
+    timings", "I wanted to know the stipend"), on top of
+    `phone_candidate_question_directed`. Only used to answer (never to
+    close); mid-interview readers keep the narrower predicate, where "What I
+    do is..." is an answer.
+    """
+    if phone_candidate_question_directed(text):
+        return True
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.replace("’", "'").replace("‘", "'").strip().split())
+    if not clean:
+        return False
+    if _QNA_REQUEST_RE.search(clean):
+        return True
+    return _QNA_QUESTION_OPEN_RE.match(clean) is not None
+
+
+#: Q&A ONLY (M013 S01 round-3 review fix): a clause that is unmistakably a
+#: question even with no STT '?'. The same leading skips as
+#: `_QNA_QUESTION_OPEN_RE`, then a wh-word, or an auxiliary WITH a subject
+#: after it (subject inversion: "can you", "is there", "will I", "do we").
+#: A bare auxiliary is not enough: "will wait for your call", "do keep me
+#: posted", "do take care", "is fine" and "will do" are Indian-English
+#: sign-offs, not questions. The auxiliary must be followed by whitespace,
+#: so "can't" / "don't" never count.
+#:
+#: Round-4 review fix: after do/did the subject must be a personal pronoun
+#: or "there" ("do you", "did they", "do we"); a determiner, "it" or a
+#: possessive is an imperative or a statement there ("do the needful", "did
+#: my best").
+#:
+#: Round-5 review fix: that narrowing applies to do/did ONLY. After
+#: is/are/does/will/would/can/could the wider subject list stays ("does the
+#: role include travel", "will it be remote", "can the joining date be
+#: flexible", "could it be hybrid"): none of those is a sign-off, and STT
+#: often drops their '?'. A bare auxiliary still never counts ("will do",
+#: "will wait for your call", "can't wait").
+#:
+#: Exclamatory and rhetorical wh forms are not questions: "what a nice
+#: conversation", "how nice" (but "how nice is the office" is), "what else,
+#: thank you", "what more to ask", "which is fine" ("what else do I need",
+#: "which is the office" still are). "What more could I ask for" is stripped
+#: before any reader runs (`_QNA_RHETORICAL_RE`).
+_QNA_CLAUSE_QUESTION_RE = re.compile(
+    r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now|um+|uh+|yeah|right|wait|"
+    r"(?:(?:yes|no)[\s,.!-]*)?(?:ma['’]?a?m|maam|mam|madam|sir))[\s,.!?-]+){0,4}"
+    r"(?:(?!what\s+(?:a|an)\b"
+    r"|how\s+(?:nice|lovely|sweet|kind|wonderful|great|amazing|cool|beautiful"
+    r"|interesting)\b(?!\s+(?:is|are|was|were|will|would|does|do|did|can|could)\b)"
+    r"|what\s+(?:else|more)\b(?!\s+(?:do|does|did|is|are|can|could|should|would"
+    r"|will|shall|i|you|we)\b)"
+    r"|which\s+is\b(?!\s+(?:the|your|our|a|an|better|best)\b))"
+    r"(?:what|which|who|where|when|why|how)\b"
+    r"|(?:is|are|does|will|would|can|could)\s+"
+    r"(?:you|u|i|we|they|it|there|this|that|these|those|the|a|an|any|my|your|"
+    r"our|their|his|her|he|she|someone|somebody|anyone|anybody)\b"
+    r"|(?:do|did)\s+"
+    r"(?:you|u|i|we|they|he|she|someone|somebody|anyone|anybody|there)\b)",
+    re.IGNORECASE,
+)
+#: Round-5 review fix: "Thank you, what more could I ask for" is a sign-off,
+#: not a question (nor a "could I ask" request). Removed before the readers.
+_QNA_RHETORICAL_RE = re.compile(
+    r"\bwhat\s+more\s+(?:could|can|would|should)\s+(?:i|one|anyone|we)\s+"
+    r"(?:ask|want|wish)(?:\s+for)?\b",
+    re.IGNORECASE,
+)
+#: Round-5 review fix: the words of a turn that is only a greeting,
+#: courtesy or filler ("Hello?", "Thank you?", "Bye?", "Okay?"). Over a
+#: closed screening a '?' on such a turn is prosody, not a question.
+_QNA_COURTESY_WORDS = frozenset({
+    "hello", "hallo", "helo", "hi", "hey", "okay", "ok", "okey", "thank",
+    "thanks", "you", "bye", "goodbye", "sir", "ma'am", "maam", "mam", "madam",
+    "yes", "yeah", "yep", "no", "sure", "right", "alright", "fine", "good",
+    "great", "so", "much", "very", "hmm", "um", "uh", "sorry", "oh", "ah",
+    "ji", "haan", "accha", "achha", "theek", "thik", "hai", "bas",
+})
+#: "No, I don't have a question" / "not a single doubt": a NEGATED mention
+#: of a question is a decline, not a request to ask one.
+_QNA_NEGATED_ASKS_RE = re.compile(
+    r"\b(?:no|not|don't|do\s+not|dont|haven't|have\s+not|havent|never|without)"
+    r"(?:\s+(?:have|got|really|even|any|a|single))*\s+"
+    r"(?:(?:more|other|further)\s+)?"
+    r"(?:question|query|doubt)s?\b",
+    re.IGNORECASE,
+)
+
+
+def phone_qna_carries_question(text: Any) -> bool:
+    """Q&A ONLY (M013 S01 round-2/3 review fix): does a reply ALSO ask something?
+
+    The guard a JUDGED decline must pass before it may close the call: True on
+    a '?', a non-negated "one more question" / "a doubt" mention, a request
+    shape ("tell me about…", "I wanted to know…"), or ANY clause that is
+    question-shaped (`_QNA_CLAUSE_QUESTION_RE`: a wh-word, or an auxiliary
+    with a subject after it — "Not really, but what is the salary",
+    "Nothing as of now, but can you tell me the salary"). Round 3: a bare
+    auxiliary ("will wait for your call", "do let me know the result",
+    "Okay ma'am, will do") and a negated mention ("No, I don't have a
+    question") no longer count, so the common sign-offs the judge reads as a
+    decline still close on the first one. Only ever turns a close into an
+    answer.
+    """
+    clean = _qna_clean(text)
+    if not clean:
+        return False
+    if "?" in clean:
+        return True
+    return _qna_question_shaped(clean)
+
+
+def _qna_clean(text: Any) -> str:
+    """Normalised Q&A text with rhetorical sign-offs removed ("" if none)."""
+    if not isinstance(text, str):
+        return ""
+    clean = " ".join(text.replace("’", "'").replace("‘", "'").strip().split())
+    if not clean:
+        return ""
+    return " ".join(_QNA_RHETORICAL_RE.sub(" ", clean).split())
+
+
+def _qna_question_shaped(clean: str) -> bool:
+    """A request, a non-negated "one more question", or a question clause."""
+    if _QNA_REQUEST_RE.search(clean):
+        return True
+    if _QNA_ASKS_RE.search(_QNA_NEGATED_ASKS_RE.sub(" ", clean)):
+        return True
+    for clause in re.split(r"[.;!?,]|\b(?:but|and|although|though)\b",
+                           clean, flags=re.IGNORECASE):
+        clause = clause.strip()
+        if clause and _QNA_CLAUSE_QUESTION_RE.match(clause):
+            return True
+    return False
+
+
+def phone_qna_asks_after_close(text: Any, *, judged: bool) -> bool:
+    """Q&A ONLY (M013 S01 round-5 review fix): reopen a closed screening?
+
+    The reader for a turn heard after the goodbye was authored (pending) or
+    played. Stricter than `phone_qna_carries_question` about a bare '?':
+
+    * a question shape (`_qna_question_shaped`: a request, a non-negated
+      "one more question", or a subject-inverted / wh clause) counts in
+      every mode;
+    * with a valid judge verdict (``judged``) that verdict decides, so a
+      '?' alone never overrides a judged OTHER or DECLINE (owner rule: the
+      judge decides gate turns);
+    * without one (legacy mode, judge timeout/error) a '?' counts unless
+      the turn is only greeting / courtesy / filler words ("Hello?",
+      "Thank you?", "Bye?", "Okay?").
+    """
+    clean = _qna_clean(text)
+    if not clean:
+        return False
+    if _qna_question_shaped(clean):
+        return True
+    if judged or "?" not in clean:
+        return False
+    words = re.findall(r"[a-z']+", clean.lower())
+    return any(word.strip("'") not in _QNA_COURTESY_WORDS for word in words)
+
+
 _GENERAL_CLARIFICATION_RE = re.compile(
     r"\b(?:can|could|would)\s+you\s+(?:please\s+)?"
     r"(?:repeat|rephrase|explain|clarify|say\s+that\s+again)\b|"
@@ -13795,6 +16221,27 @@ def phone_agent_class(agent_base: Any) -> Any:
                     return content
                 return chunk if isinstance(chunk, str) else ""
 
+            # ── M013 S01 T08a: no stray pre-consent generation (roadmap 11) ──
+            # Before consent the SDK still schedules a reply for every
+            # committed candidate turn ("Hello?", the identity answer, the
+            # consent reply). Its output was always discarded unheard, yet the
+            # model call ran in full: a wasted generation per gate turn, and a
+            # speech that held the SDK's queue while it streamed, so the next
+            # gate line could wait behind it. Return BEFORE `super().llm_node`
+            # so no request is made at all. An empty async generator is a
+            # normal empty reply to the SDK: nothing is spoken, the empty
+            # assistant item is never persisted (`_on_phone_item` drops empty
+            # text), and the user turn is still committed and buffered as a
+            # gate row, which `StopResponse` from the turn hook would not do.
+            # The main prompt's DeepSeek prefix cache is warmed on its own
+            # (`phone_warm_prefix_cache`), not as a side effect of this call.
+            if not self._screening_authorized and not self._gate_opening:
+                _log.info(
+                    "unknown_event", error_type="phone_llm_node",
+                    error_category="preconsent_generation_skipped",
+                )
+                return
+
             generation_ctx = bounded_phone_chat_context(chat_ctx)
             # F-B: the phone OpenAI-compat lane (DeepSeek/Sarvam etc.) rejects the
             # `developer` role with a non-retryable 400. Rewrite it to `system`
@@ -14146,14 +16593,11 @@ def phone_agent_class(agent_base: Any) -> Any:
             result = super().llm_node(generation_ctx, tools, model_settings)
             if inspect.isawaitable(result):
                 result = await result
-            if not self._screening_authorized:
-                # Gemini still participates in the consent-response turn, but
-                # its speculative output is structurally unschedulable and is
-                # discarded before playout/recording. The deterministic
-                # classifier remains the sole authorization authority.
-                async for _ in result:
-                    pass
-                return
+            # (T08a) The pre-consent speculative generation that used to be
+            # drained and discarded here no longer runs: `llm_node` returns at
+            # its top before consent, so this point is reached only after
+            # `authorize_screening`. The deterministic gate remains the sole
+            # consent authority.
 
             objective = self._generation_objective
             if (

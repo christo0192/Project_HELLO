@@ -24,6 +24,7 @@ from livekit import api as livekit_api
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.plugins import openai, sarvam
 
+import gate_judge
 import noise_suppression
 import persistence
 import phone
@@ -404,10 +405,11 @@ SESSION_MAX_RESIDENCY_SEC = _bounded_float_env(
 # reported rather than a wait to be extended. The API sizes the concurrency
 # lease on exactly this number — `PHONE_OPENING_GATE_SECONDS = 60 +
 # PHONE_IDENTITY_TURN_SECONDS (46) = 106` in
-# `app/api/src/lib/phone-screening/config.ts:146` — so the two are deliberately
-# the same 106s, plus a small margin so the worker's own timeout fires FIRST
-# and produces a diagnosable `gate_timed_out` instead of a silent server-side
-# reap.
+# `app/api/src/lib/phone-screening/config.ts:146` — so the two were
+# deliberately the same 106s, plus a small margin so the worker's own timeout
+# fires FIRST and produces a diagnosable `gate_timed_out` instead of a silent
+# server-side reap. (Until M013 S01 T03: the lease is now heartbeaten from the
+# answer, see below.)
 #
 # ── IT MEASURES THE POST-ANSWER STRETCH, AND ONLY THAT ────────────────────
 # `PHONE_OPENING_GATE_SECONDS` is defined as the spend "from the moment
@@ -426,11 +428,37 @@ SESSION_MAX_RESIDENCY_SEC = _bounded_float_env(
 # conversation half of the gate may take) and the wrapper covers what it
 # actually wraps.
 #
-# Floor of 30s: below the classify wait (40s) the bound would cut off healthy
-# calls. Ceiling of 600s: a gate that has run ten minutes is wedged by
-# definition.
+# ── M013 S01 T03: 116 → 180 s, a BUDGET in front of the wall clock, and the
+# lease heartbeat from the answer ─────────────────────────────────────────
+# #334 put a whole callback conversation (and, with M013, consent re-asks
+# worded by reason) inside this stretch: identity, a busy reply, "what time
+# works?", a clarification, propose/confirm and the read-back do not fit in
+# 116 s once a re-ask is involved, and the wall clock then cut the call off
+# mid-booking. Two changes make a larger number safe:
+#   * the call's lease heartbeat now starts at the ANSWER, not at consent
+#     (`phone.run_phone_heartbeat`, one task per call), so the lease is
+#     renewed for as long as the gate runs and the API's 106 s sizing
+#     allowance (`PHONE_OPENING_GATE_SECONDS`) is no longer what reaps a long
+#     gate — no API change. Without a session id/epoch to fence with, the
+#     heartbeat cannot run and the budget is capped to the admission lease
+#     known to remain (`phone.phone_unrenewed_lease_after_answer_sec`);
+#   * `phone.GateBudget` (deadline = answer + this − 10 s) is checked before
+#     every new ask, so a healthy gate ends with a spoken deferral on its own
+#     terms and this wall clock is left as the wedge backstop it was built as.
+# 180 s is the M013 target ceiling; going past 200 s needs an owner decision
+# (and the API's lease sizing re-checked), not a quiet bump.
+#
+# Floor of 30s: below the consent backstop (`phone.phone_classify_timeout_sec`,
+# >= 50.4 s by default in legacy/shadow mode, 137.3 s in llm mode) a healthy
+# consent read would be cut off — the floor is a
+# config guard, not a recommendation. In llm mode (as shipped) that applies to
+# any value under about 150 s: the budget deadline is answer + this − 10 s, so
+# the old 116 s (a 106 s deadline) defers consenting candidates who need a
+# re-ask or ask a question back. 116 is a safe rollback only together with
+# PHONE_GATE_JUDGE=legacy or shadow. Ceiling of 600s: a gate that has run ten
+# minutes is wedged by definition.
 PHONE_GATE_MAX_SECONDS = _bounded_float_env(
-    "PHONE_GATE_MAX_SECONDS", 116.0, 30.0, 600.0
+    "PHONE_GATE_MAX_SECONDS", 180.0, 30.0, 600.0
 )
 
 
@@ -465,6 +493,85 @@ def _phone_gate_wall_clock_seconds() -> float:
     if phone.phone_bounce_mode():
         pre_answer += phone.phone_answer_timeout_sec()
     return pre_answer + PHONE_GATE_MAX_SECONDS
+
+
+#: The whole budget for the goodbye spoken when the gate overruns its wall
+#: clock: interrupting what is playing, then the line itself.
+_GATE_GOODBYE_BOUND_SEC = 4.0
+#: How long the interrupted gate line may take to drain before the goodbye.
+#: A line still playing after a FORCED interrupt is a wedged playout, and a
+#: goodbye queued behind it would wedge too: it is skipped, not awaited.
+_GATE_GOODBYE_DRAIN_SEC = 1.0
+
+
+async def _speak_gate_goodbye_bounded(
+    session: Any,
+    say: "Callable[[str], Awaitable[Any]]",
+    text: str,
+    *,
+    pending_speech: Any = None,
+    timeout_sec: float = _GATE_GOODBYE_BOUND_SEC,
+    drain_sec: float = _GATE_GOODBYE_DRAIN_SEC,
+) -> str:
+    """Interrupt whatever is playing, then speak ``text``; bounded, never raises.
+
+    M013 S01 T02. Used only when the gate overruns `PHONE_GATE_MAX_SECONDS`
+    after the answer and BEFORE durable consent: the person on the line hears
+    a goodbye instead of the call simply going dead. The gate's own lines are
+    non-interruptible, so the in-flight one (``pending_speech``, the likely
+    wedge) is force-interrupted first and given ``drain_sec`` to stop.
+
+    Returns a fixed outcome category (`spoken`, `timeout`, `failed`,
+    `skipped_wedged`), which is also logged. Swallows every error: teardown
+    must still run after it. A cancellation of the caller is NOT swallowed.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, float(timeout_sec))
+    interrupted = "none"
+    interrupt = getattr(session, "interrupt", None)
+    if callable(interrupt):
+        try:
+            pending = interrupt(force=True)
+            if inspect.isawaitable(pending):
+                await asyncio.wait_for(pending, timeout=max(
+                    0.0, min(float(drain_sec), deadline - loop.time())))
+            interrupted = "ok"
+        except Exception:  # noqa: BLE001 — still try to say goodbye
+            interrupted = "failed"
+    if pending_speech is not None:
+        try:
+            speech_interrupt = getattr(pending_speech, "interrupt", None)
+            if callable(speech_interrupt):
+                speech_interrupt(force=True)
+        except Exception:  # noqa: BLE001
+            pass
+        drain = getattr(pending_speech, "wait_for_playout", None)
+        if callable(drain):
+            try:
+                await asyncio.wait_for(drain(), timeout=max(
+                    0.0, min(float(drain_sec), deadline - loop.time())))
+            except asyncio.TimeoutError:
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_overrun_goodbye",
+                    error_category="skipped_wedged",
+                    phase=f"interrupt_{interrupted}",
+                )
+                return "skipped_wedged"
+            except Exception:  # noqa: BLE001 — an ended playout is drained
+                pass
+    try:
+        await asyncio.wait_for(
+            say(text), timeout=max(0.0, deadline - loop.time()))
+        outcome = "spoken"
+    except asyncio.TimeoutError:
+        outcome = "timeout"
+    except Exception:  # noqa: BLE001 — a goodbye must never break teardown
+        outcome = "failed"
+    _log.info(
+        "unknown_event", error_type="phone_gate_overrun_goodbye",
+        error_category=outcome, phase=f"interrupt_{interrupted}",
+    )
+    return outcome
 
 
 def _int_env(name: str, default: int) -> int:
@@ -1279,6 +1386,8 @@ async def _read_fresh_turn(
     *,
     speaking: "Callable[[], bool] | None" = None,
     hard_timeout_sec: float | None = None,
+    spoke: "gate_judge.HumanSpeechLatch | None" = None,
+    spoke_source: str = gate_judge.SPOKE_SOURCE_IDENTITY,
 ) -> str:
     """Pop the first utterance that began AFTER the question, within one budget.
 
@@ -1294,6 +1403,12 @@ async def _read_fresh_turn(
     Stale utterances are skipped WITHIN the same budget: one must not buy the
     candidate extra time, nor spend theirs. Returns "" when the budget runs out,
     which the caller reads as "nothing usable" rather than as an answer.
+
+    M013 S01 T02: the reply it returns sets the call's ``spoke`` latch unless it
+    is machine wording, so a person who answered the identity question can
+    never later be hung up on as a voicemail. A stale reply sets only the
+    WEAK latch (`gate_judge.HumanSpeechLatch.note_skipped`), which machine
+    wording clears.
     """
     deadline = time.monotonic() + timeout_sec
     # NEVER WAIT LONGER THAN THE CALLER'S OLD BUDGET, however much the candidate
@@ -1334,12 +1449,18 @@ async def _read_fresh_turn(
         except Exception:  # noqa: BLE001
             return ""
         text, anchor_ms = _queued_turn(item)
-        if _queued_turn_is_stale(anchor_ms, question_anchor()):
-            _log.info(
-                "unknown_event", error_type="phone_gate_turn_barrier",
-                error_category="pre_question_turn_skipped",
-            )
+        question_ms = question_anchor()
+        if _queued_turn_is_stale(anchor_ms, question_ms):
+            if spoke is not None and isinstance(text, str):
+                # Review fix: the weak latch (machine wording clears it).
+                spoke.note_skipped(text, machine_match=_is_machine_text(text))
+            _log_gate_turn_skip(
+                "pre_question_turn_skipped", item, anchor_ms, question_ms)
             continue
+        if spoke is not None and isinstance(text, str):
+            spoke.note_reply(
+                text, machine_match=_is_machine_text(text), source=spoke_source,
+            )
         return text
 
 
@@ -1387,7 +1508,16 @@ def _queued_turn(item: Any) -> tuple[str, int | None]:
     module-level function with its own direct tests that hand it a plain
     `Queue[str]`, and widening the queue should not force every one of those to
     learn a shape they do not care about.
+
+    M013 S01: the live producer now enqueues a `gate_judge.GateTurn`, whose
+    anchor is the start of the VAD speech its STT finals were paired with
+    (see `gate_judge`), not the SDK's carried-over `started_speaking_at`.
     """
+    if isinstance(item, gate_judge.GateTurn):
+        anchor = item.anchor_ms
+        return item.text, (
+            anchor if isinstance(anchor, int) and not isinstance(anchor, bool) else None
+        )
     if isinstance(item, tuple) and len(item) == 2:
         text, anchor = item
         return (text if isinstance(text, str) else ""), (
@@ -1417,6 +1547,1198 @@ def _queued_turn_is_stale(anchor_ms: int | None, question_anchor_ms: int | None)
     if question_anchor_ms - anchor_ms > _TURN_ANCHOR_SANE_LOOKBACK_MS:
         return False
     return anchor_ms < question_anchor_ms
+
+
+def _log_gate_turn_skip(
+    category: str, item: Any, anchor_ms: int | None, question_anchor_ms: int | None,
+) -> None:
+    """Log one gate reader skip: the reason, the tag and signed deltas, NO text.
+
+    M013 S01: the consent reader used to skip a stale turn with a bare
+    `continue` (the 9f60523d drop left no trace at all). Every skip now says
+    where the utterance sat relative to the question (`phase` = pre_question /
+    during_question / post_question / no_segment) and by how much
+    (`schema` = anchor / final-arrival / segment-start deltas in ms against
+    the question anchor), so a dropped answer can be told from a correct skip.
+    """
+    def _delta(value: int | None) -> int | None:
+        if value is None or question_anchor_ms is None:
+            return None
+        return value - question_anchor_ms
+
+    if isinstance(item, gate_judge.GateTurn):
+        tag = item.tag_for(question_anchor_ms)
+        final_ms = item.final_arrival_ms
+        segment_ms = item.segment_start_ms
+    else:
+        # An older producer's (text, anchor) pair: judged by its start alone.
+        tag = gate_judge.question_tag(anchor_ms, anchor_ms, question_anchor_ms) or (
+            gate_judge.TAG_NO_SEGMENT)
+        final_ms = None
+        segment_ms = None
+    _log.info(
+        "unknown_event", error_type="phone_gate_turn_barrier",
+        error_category=category, phase=tag,
+        schema=gate_judge.delta_schema(
+            anchor_ms=_delta(anchor_ms), final_ms=_delta(final_ms),
+            segment_ms=_delta(segment_ms),
+        ),
+    )
+
+
+def _gate_turn_settle_ms() -> int:
+    """How long a group of finals the SDK never committed waits before closing.
+
+    The endpointing ceiling (the longest the SDK itself waits to commit a turn
+    on this lane) plus a margin, so a turn the SDK does commit is always
+    closed by that commit first. The consent turn tightens the SDK's ceiling
+    below this, which only widens the margin.
+    """
+    return (
+        int(round(phone.phone_static_endpointing_max_delay() * 1000))
+        + gate_judge.GATE_SETTLE_MARGIN_MS
+    )
+
+
+def _gate_capture_log(**fields: Any) -> None:
+    """The capture's log sink: categories, counts and durations only."""
+    _log.info("unknown_event", **fields)
+
+
+def _new_gate_turn_capture(
+    emit: Callable[["gate_judge.GateTurn"], None],
+) -> "gate_judge.GateTurnCapture":
+    """The per-call gate capture `_run_phone_session` feeds (and the replay does).
+
+    Module level so the replay harness drives the SAME construction the
+    session does, not a copy of it.
+    """
+    return gate_judge.GateTurnCapture(
+        emit=emit,
+        now_ms=lambda: int(round(time.time() * 1000)),
+        settle_ms=_gate_turn_settle_ms,
+        log=_gate_capture_log,
+    )
+
+
+def _user_state_anchor_ms(event: Any, now_s: float) -> int:
+    """The speech start a `user_state_changed` -> speaking event reports, in ms.
+
+    The SDK stamps the event's `created_at` with THIS segment's start
+    (`on_start_of_speech(speech_start_time=...)`), which is the real start of
+    what the candidate is saying. `time.time()` at the handler is later by the
+    VAD's detection delay. Anything implausible (a Mock, a wrong clock, more
+    than an hour away from now) falls back to `now_s`.
+    """
+    created_at = getattr(event, "created_at", None)
+    if (
+        isinstance(created_at, (int, float))
+        and not isinstance(created_at, bool)
+        and math.isfinite(float(created_at))
+        and abs(float(created_at) - float(now_s)) <= _TURN_ANCHOR_SANE_LOOKBACK_MS / 1000.0
+    ):
+        return int(round(float(created_at) * 1000))
+    return int(round(float(now_s) * 1000))
+
+
+def _gate_source_item_id(seq: Any) -> str:
+    """The per-item idempotency key of one buffered gate row.
+
+    An int is a conversation item (`phone-gate-item-<seq>`); a string is a
+    consent-grant utterance the SDK never committed (`phone-gate-final-<idx>`).
+    """
+    if isinstance(seq, str):
+        return f"phone-gate-{seq}"
+    return f"phone-gate-item-{seq}"
+
+
+def _gate_evidence_row(
+    item: Any, evidence_keys: "set[str]",
+    capture: "gate_judge.GateTurnCapture | None" = None,
+) -> "tuple[str, str, int | None, str] | None":
+    """The `gate_pending` row for a consent grant the SDK never committed.
+
+    A turn the SDK committed already reached the transcript through
+    `conversation_item_added`; one it dropped (committed while a gate line was
+    playing) never did, and the grant would rest on words with no row. Such a
+    turn gets exactly one candidate row, keyed `final-<first utterance idx>`.
+    A turn the SDK committed late (after the gate closed it by silence, before
+    the grant was read) already has its conversation row, so gets none.
+    """
+    if not isinstance(item, gate_judge.GateTurn) or item.committed:
+        return None
+    text = item.text.strip()
+    if not text or not item.utterance_idxs:
+        return None
+    if capture is not None and capture.is_committed(item.utterance_idxs):
+        return None
+    key = f"final-{item.utterance_idxs[0]}"
+    if key in evidence_keys:
+        return None
+    evidence_keys.add(key)
+    return ("candidate", text, item.anchor_ms, key)
+
+
+def _gate_user_row_is_evidence_echo(
+    text: str, capture: "gate_judge.GateTurnCapture", evidence_keys: "set[str]",
+) -> bool:
+    """True when a kept user item is the late commit of a grant already buffered.
+
+    The SDK can commit a turn after the gate closed it by silence and granted
+    on it; that commit must not write the same words a second time. Decided
+    by the capture, which saw the commit duplicate a closed turn, so a later
+    utterance that merely repeats the same words is still written.
+    """
+    idxs = capture.take_duplicate_commit(text)
+    return bool(idxs) and f"final-{idxs[0]}" in evidence_keys
+
+
+# ── M013 S01 T05: the gate judge, wired into the readers ──────────────────
+#
+# `PHONE_GATE_JUDGE` (gate_judge.judge_mode):
+#
+# * ``legacy`` (the code default): today's readers, unchanged;
+# * ``shadow``: the judge runs concurrently on the same window, fire-and-
+#   forget, and its decision is logged with whether it agreed; the legacy
+#   result acts and its timing is unchanged;
+# * ``llm``: a VALID judge verdict acts. When the judge is unavailable the
+#   legacy regex decides (it may grant, but only on speech that began after
+#   the recording sentence was heard). A valid non-grant verdict is never
+#   overridden by the regex, and a judge grant that fails a deterministic
+#   guard is `unclear` (gate_judge.judge_gate), never a regex fallback.
+
+#: A consent-phase judge intent → the gate's existing classification. `None`
+#: means "not a decision": the reader re-asks (or, out of attempts, defers).
+_CONSENT_CLASSIFICATION_FOR_INTENT: dict[str, str | None] = {
+    gate_judge.INTENT_CONSENT_GRANTED: phone.CLASSIFY_HUMAN,
+    gate_judge.INTENT_CONSENT_DECLINED: phone.CLASSIFY_REFUSED,
+    gate_judge.INTENT_OPT_OUT: phone.CLASSIFY_OPT_OUT,
+    gate_judge.INTENT_NOT_NOW_BUSY: phone.CLASSIFY_CALLBACK_REQUESTED,
+    gate_judge.INTENT_END_CALL: phone.CLASSIFY_END_REQUESTED,
+    gate_judge.INTENT_WRONG_PERSON: phone.CLASSIFY_WRONG_NUMBER,
+    gate_judge.INTENT_VOICEMAIL: phone.CLASSIFY_MACHINE,
+    gate_judge.INTENT_QUESTION: None,
+    gate_judge.INTENT_UNCLEAR: None,
+    gate_judge.INTENT_IDENTITY_CONFIRMED: None,
+}
+#: The reverse view: a legacy classification as a judge intent (for the
+#: fallback's audit line and the shadow agreement log).
+_INTENT_FOR_CLASSIFICATION: dict[str | None, str] = {
+    phone.CLASSIFY_HUMAN: gate_judge.INTENT_CONSENT_GRANTED,
+    phone.CLASSIFY_REFUSED: gate_judge.INTENT_CONSENT_DECLINED,
+    phone.CLASSIFY_OPT_OUT: gate_judge.INTENT_OPT_OUT,
+    phone.CLASSIFY_CALLBACK_REQUESTED: gate_judge.INTENT_NOT_NOW_BUSY,
+    phone.CLASSIFY_END_REQUESTED: gate_judge.INTENT_END_CALL,
+    phone.CLASSIFY_WRONG_NUMBER: gate_judge.INTENT_WRONG_PERSON,
+    phone.CLASSIFY_MACHINE: gate_judge.INTENT_VOICEMAIL,
+    None: gate_judge.INTENT_UNCLEAR,
+}
+
+#: How long the consent reader waits for a turn that is still being spoken
+#: (or still awaiting its STT final) before a judge grant may be applied. The
+#: pairing window plus a settle, with headroom; always also bounded by the
+#: gate budget. A wait that expires re-checks quiescence (an expired blip is
+#: quiet again); at most `GATE_JUDGE_MAX_REJUDGES` waits, then `unclear`.
+_GATE_QUIESCENCE_WAIT_MAX_SEC = gate_judge.GATE_QUIESCENCE_WAIT_MAX_SEC
+#: How often that wait re-checks quiet (review fix: it waits for quiet, not
+#: for a new turn, so an expired blip costs at most this much).
+_GATE_QUIESCENCE_POLL_SEC = 0.1
+
+#: How long the legacy consent reader keeps listening after a "yes" that began
+#: before the recording sentence (review fix): long enough for the candidate's
+#: answer to the question they just heard, short enough that a candidate who
+#: thinks they already answered is re-asked promptly rather than left in
+#: silence for the whole answer window.
+_PRE_RECORDING_YES_LISTEN_SEC = 3.0
+
+#: How far after part A's end part B's first audio may still raise the
+#: recording anchor (synthesis of part B; S01-PLAN measures the live gap on
+#: T14 and expects it far below this).
+_RECORDING_ANCHOR_RAISE_MAX_MS = 3000
+
+#: A composed gate line longer than this is abandoned mid-stream (the gate's
+#: validators reject anything longer anyway).
+_GATE_COMPOSE_MAX_CHARS = 650
+
+
+async def _compose_gate_draft(
+    llm: Any, instructions: str, *, timeout_sec: float,
+    chat_context_factory: Callable[[], Any] | None = None,
+    schema: str = "gate",
+) -> str | None:
+    """Buffer ONE gate line from the session's model: no tools, no records.
+
+    M013 S01 T08a. The gate validates the draft before `say`, so no generated
+    token reaches TTS here; cancellation (or the cap) closes the provider
+    stream. Bounded by ``timeout_sec`` (`PHONE_GATE_COMPOSE_TIMEOUT_SEC`,
+    formerly a fixed 4 s). Returns the draft, "" for an over-long one, or None
+    when nothing usable arrived; every outcome is logged as
+    `phone_gate_compose` (`composed_ok`, `timeout`, `rejected_too_long`,
+    `unavailable`) with its duration and never the text.
+    """
+    started = time.monotonic()
+    overflowed = [False]
+
+    def _log_compose(category: str) -> None:
+        _log.info(
+            "unknown_event", error_type="phone_gate_compose",
+            error_category=category, schema=schema,
+            duration_sec=round(time.monotonic() - started, 3),
+        )
+
+    try:
+        if chat_context_factory is None:
+            from livekit.agents.llm import ChatContext
+
+            chat_context_factory = ChatContext
+        chat = chat_context_factory()
+        chat.add_message(role="system", content=instructions)
+        chat.add_message(role="user", content="Write only the short spoken line.")
+
+        async def collect() -> str:
+            parts: list[str] = []
+            async with llm.chat(chat_ctx=chat, tools=[]) as stream:
+                async for chunk in stream:
+                    delta = getattr(chunk, "delta", None)
+                    content = getattr(delta, "content", None)
+                    if isinstance(content, str):
+                        parts.append(content)
+                        if sum(map(len, parts)) > _GATE_COMPOSE_MAX_CHARS:
+                            overflowed[0] = True
+                            return ""
+            return "".join(parts).strip()
+
+        draft = await asyncio.wait_for(collect(), timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        _log_compose("timeout")
+        _log.info("unknown_event", error_type="phone_opening_fallback",
+                  error_category="draft_unavailable")
+        return None
+    except Exception:  # noqa: BLE001 — every miss is the fixed line
+        _log_compose("unavailable")
+        _log.info("unknown_event", error_type="phone_opening_fallback",
+                  error_category="draft_unavailable")
+        return None
+    _log_compose(
+        "composed_ok" if draft
+        else "rejected_too_long" if overflowed[0]
+        else "rejected_empty"
+    )
+    return draft
+
+
+async def _compose_alongside_subscription(
+    compose: Callable[[], Awaitable[str | None]],
+    await_subscription: Callable[[], Awaitable[None]],
+) -> str | None:
+    """Compose a gate line WHILE the SIP output subscription settles.
+
+    M013 S01 T08a (roadmap 10). The compose used to start only after the
+    (bounded) subscription wait, so the first line of the call paid both in
+    series. Neither needs the other: the draft is private text and the wait
+    only guards the first spoken frame. Run together, the line is ready after
+    the longer of the two, never their sum. The draft is still returned only
+    after the wait, so nothing is spoken before the subscription settles.
+    """
+    task = asyncio.ensure_future(compose())
+    try:
+        await await_subscription()
+        return await task
+    finally:
+        if not task.done():
+            task.cancel()
+
+
+def _consent_line_starts(draft: Any) -> set[str]:
+    """The first audible piece(s) of a COMPOSED consent line, for the metric.
+
+    T08a: the gate speaks a validated composed line split at the recording
+    sentence (`phone_split_consent_line`), so its first piece is part A, or
+    the whole line when the sentence opens it. Empty for anything else.
+    """
+    if not isinstance(draft, str) or not draft.strip():
+        return set()
+    part_a, _ = phone.phone_split_consent_line(draft.strip())
+    starts = {draft.strip()}
+    if part_a.strip():
+        starts.add(part_a.strip())
+    return starts
+
+
+def _is_disclosure_line_start(text: Any, composed_starts: set[str]) -> bool:
+    """Is ``text`` the first audible piece of the consent (disclosure) line?
+
+    The fixed lines (`phone.phone_disclosure_line_start`) or, since T08a, a
+    composed consent line, so `voice_phone_participant_to_disclosure_sec`
+    stops missing every call that speaks a composed line.
+    """
+    if phone.phone_disclosure_line_start(text):
+        return True
+    return isinstance(text, str) and text.strip() in composed_starts
+
+
+async def _render_tts_frames(session: Any, text: str) -> list[Any]:
+    """Synthesise ``text`` to audio frames ahead of time, or [] on any miss.
+
+    M013 S01 T08b: the first question is rendered while the role line plays
+    (the pattern of the role line's own pre-render), so it starts with no
+    synthesis latency. The markdown strip `tts_node` applies on the live path
+    is applied here, because pre-rendered audio never passes through it. Never
+    raises; the stream is always closed.
+    """
+    tts_obj = getattr(session, "tts", None)
+    synth = getattr(tts_obj, "synthesize", None)
+    spoken = phone.strip_markdown_for_speech(text)
+    if not callable(synth) or not spoken.strip():
+        return []
+    frames: list[Any] = []
+    stream = None
+    try:
+        stream = synth(spoken)
+        async for ev in stream:
+            frame = getattr(ev, "frame", None)
+            if frame is not None:
+                frames.append(frame)
+    except Exception:  # noqa: BLE001 — the say path synthesises on demand
+        frames = []
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001
+                pass
+    return frames
+
+
+def _cancel_q1_prefetch(result: Any) -> None:
+    """T08b: stop preparing Q1 for a leg that will not ask it. Never raises."""
+    cancel = getattr(getattr(result, "q1_prefetch", None), "cancel", None)
+    if callable(cancel):
+        try:
+            cancel()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _same_role_title(a: Any, b: Any) -> bool:
+    """Do two role titles name the same role (case/whitespace-insensitive)?"""
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    norm_a = " ".join(a.split()).strip().lower()
+    return bool(norm_a) and norm_a == " ".join(b.split()).strip().lower()
+
+
+class _GateRecordingAnchor:
+    """When the recording sentence of the consent line was heard (ms).
+
+    ``mark`` stamps it between the two halves of the split consent line (part
+    A's playout end) and ARMS a one-shot raise: the next first audio the SDK
+    reports (part B's, when the agent state toggles between the halves) lifts
+    it, never lowers it. ``reset`` at each new gate question. Pure; the
+    session and the replay harness call the same methods.
+    """
+
+    __slots__ = ("value", "_armed")
+
+    def __init__(self) -> None:
+        self.value: int | None = None
+        self._armed = False
+
+    def reset(self) -> None:
+        self.value = None
+        self._armed = False
+
+    def mark(self, now_ms: int) -> None:
+        self.value = int(now_ms)
+        self._armed = True
+
+    def on_first_audio(self, first_audio_ms: int) -> None:
+        if not self._armed or self.value is None:
+            return
+        self._armed = False
+        # Only part B's own first audio may raise it: it follows part A's
+        # end within synthesis time. A later "speaking" (when the SDK never
+        # toggled between the halves, the next line's first audio) leaves the
+        # anchor at part A's end.
+        if self.value < first_audio_ms <= self.value + _RECORDING_ANCHOR_RAISE_MAX_MS:
+            self.value = int(first_audio_ms)
+
+
+class _GateJudgeWiring:
+    """One call's gate judge: mode, inputs, and the decision/shadow calls.
+
+    Built by `_run_phone_session` (and by the replay harness) from the call's
+    `gate_judge.GateTurnCapture`, its `HumanSpeechLatch`, the question anchor,
+    the recording anchor and the gate budget. The transport, config, breaker,
+    clock and log sink are injectable so tests replay recorded responses.
+    Never raises to a reader.
+    """
+
+    def __init__(
+        self,
+        *,
+        capture: "gate_judge.GateTurnCapture",
+        latch: "gate_judge.HumanSpeechLatch",
+        question_anchor: "Callable[[], int | None]",
+        recording_anchor: "Callable[[], int | None] | None" = None,
+        budget: "phone.GateBudget | None" = None,
+        first_name: Any = "",
+        mode: str | None = None,
+        config: Any = None,
+        transport: Any = None,
+        breaker: Any = None,
+        log: "Callable[..., None] | None" = None,
+        clock: "Callable[[], float] | None" = None,
+    ) -> None:
+        self.capture = capture
+        self.latch = latch
+        self._question_anchor = question_anchor
+        self._recording_anchor = recording_anchor
+        self.budget = budget
+        self.first_name = gate_judge.first_name_only(first_name)
+        self.mode = mode if mode in gate_judge.GATE_JUDGE_MODES else gate_judge.judge_mode()
+        self.config = config
+        self.transport = transport
+        self.breaker = breaker
+        self.log = log if log is not None else _gate_judge_log
+        self.clock = clock if clock is not None else (lambda: time.monotonic())
+        self._shadow_tasks: "set[asyncio.Task[Any]]" = set()
+        self._identity_shadow: "asyncio.Task[Any] | None" = None
+        self.stopped = False
+        # T06: the last ACTING decision, so the callback conversation can
+        # reuse the busy verdict that started it instead of judging the same
+        # reply twice.
+        self.last_decision: "gate_judge.GateDecision | None" = None
+
+    # ── mode ─────────────────────────────────────────────────────────────
+    @property
+    def acting(self) -> bool:
+        return self.mode == gate_judge.GATE_JUDGE_MODE_LLM and not self.stopped
+
+    @property
+    def shadowing(self) -> bool:
+        return self.mode == gate_judge.GATE_JUDGE_MODE_SHADOW and not self.stopped
+
+    # ── inputs ───────────────────────────────────────────────────────────
+    def recording_anchor_ms(self) -> int | None:
+        if self._recording_anchor is None:
+            return None
+        try:
+            value = self._recording_anchor()
+        except Exception:  # noqa: BLE001
+            return None
+        return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+    def tag_anchor_ms(self) -> int | None:
+        """The anchor utterances are tagged against: the question's; else
+        (the deterministic flow sets none) the recording sentence's."""
+        try:
+            value = self._question_anchor()
+        except Exception:  # noqa: BLE001
+            value = None
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return self.recording_anchor_ms()
+
+    def window(self) -> "tuple[gate_judge.GateUtterance, ...]":
+        return self.capture.utterances.tagged(self.tag_anchor_ms())
+
+    def pending_speech(self, after_idx: int | None) -> str | None:
+        """Quiescence for a grant: the capture's own probe, plus a final the
+        judge saw whose turn has not closed yet (the reader has not consumed
+        it, so the grant could not cite it as evidence)."""
+        why = self.capture.pending_speech(after_idx)
+        if why is None and self.capture.active and self.capture.has_open_finals:
+            return "open_turn"
+        return why
+
+    def timeout_sec(self) -> float:
+        if self.budget is not None:
+            return self.budget.judge_timeout_sec()
+        return gate_judge.judge_timeout_sec()
+
+    def request(self, phase: str, bot_line: Any) -> "gate_judge.GateJudgeRequest":
+        consent = phase in (gate_judge.PHASE_CONSENT, gate_judge.PHASE_CONSENT_RETRY)
+        return gate_judge.GateJudgeRequest(
+            phase=phase, bot_line=str(bot_line or ""), utterances=self.window(),
+            first_name=self.first_name,
+            recording_anchor_ms=self.recording_anchor_ms() if consent else None,
+        )
+
+    # ── decisions ────────────────────────────────────────────────────────
+    async def decide(
+        self,
+        phase: str,
+        bot_line: Any,
+        *,
+        legacy: "Callable[[], Any] | None",
+        wait_for_more: "Callable[[str], Awaitable[Any]] | None" = None,
+    ) -> "gate_judge.GateDecision":
+        """The acting decision (llm mode). Latches `candidate_spoke` on a
+        valid verdict that is not voicemail; never raises.
+
+        Round-3 review fix: a voicemail verdict rejected because its cited
+        words do not read as a machine (`voicemail_not_machine_shaped`) sets
+        the WEAK latch instead: the fall-through is a deferral, never a
+        silent machine hang-up, but later machine wording still decides.
+        """
+        decision = await gate_judge.judge_gate(
+            self.request(phase, bot_line),
+            timeout_sec=self.timeout_sec, legacy=legacy,
+            pending=self.pending_speech, wait_for_more=wait_for_more,
+            config=self.config, transport=self.transport, breaker=self.breaker,
+            log=self.log, clock=self.clock, voicemail_shape=_voicemail_shaped,
+        )
+        if decision.source == gate_judge.SOURCE_LLM and decision.intent is not None:
+            if (decision.guard_rejected_reason
+                    == gate_judge.GUARD_VOICEMAIL_NOT_MACHINE_SHAPED):
+                self.latch.note_skipped(phase, machine_match=False)
+            else:
+                self.latch.note_judge_intent(decision.intent)
+        self.last_decision = decision
+        return decision
+
+    async def judge_callback(
+        self, reply: Any, bot_line: Any, *, first: bool = False,
+    ) -> "gate_judge.GateDecision | None":
+        """T06: the `callback_time` reading of one callback reply, or None.
+
+        llm mode only (legacy and shadow: None, so the deterministic parser
+        alone decides). The FIRST reply of the conversation is the busy reply
+        the identity or consent judge just read: its decision is reused when
+        it was a valid busy verdict, and otherwise not re-judged (the judge was
+        unavailable, or legacy routed it). Never raises.
+        """
+        if not self.acting or not isinstance(reply, str) or not reply.strip():
+            return None
+        if first:
+            last = self.last_decision
+            if (last is not None and last.source == gate_judge.SOURCE_LLM
+                    and last.intent == gate_judge.INTENT_NOT_NOW_BUSY):
+                return last
+            return None
+        try:
+            decision = await self.decide(
+                gate_judge.PHASE_CALLBACK_TIME, bot_line, legacy=lambda: None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — the judge never fails the gate
+            return None
+        if decision.source != gate_judge.SOURCE_LLM or decision.intent is None:
+            return None
+        return decision
+
+    def shadow(self, phase: str, bot_line: Any, legacy_intent: str | None) -> "asyncio.Task[Any] | None":
+        """Shadow mode: judge the same window concurrently and log agreement.
+
+        Fire-and-forget: the caller never awaits it, so the acting (legacy)
+        decision time is unchanged. No legacy reader, no quiescence wait, no
+        latch. Cancelled when the gate ends.
+        """
+        if not self.shadowing:
+            return None
+        request = self.request(phase, bot_line)
+
+        def _shadow_log(**fields: Any) -> None:
+            # A shadow decision is audited on its own line, so the acting
+            # `phone_gate_decision` counts stay the decisions that acted.
+            if fields.get("error_type") == "phone_gate_decision":
+                fields = {**fields, "error_type": "phone_gate_shadow_decision"}
+            self.log(**fields)
+
+        async def _run() -> "gate_judge.GateDecision":
+            decision = await gate_judge.judge_gate(
+                request, timeout_sec=self.timeout_sec, legacy=None,
+                config=self.config, transport=self.transport, breaker=self.breaker,
+                log=_shadow_log, clock=self.clock, voicemail_shape=_voicemail_shaped,
+            )
+            if legacy_intent is not None:
+                self._log_agreement(phase, decision, legacy_intent)
+            return decision
+
+        try:
+            task = asyncio.get_running_loop().create_task(_run())
+        except RuntimeError:
+            return None
+        self._shadow_tasks.add(task)
+        task.add_done_callback(self._shadow_done)
+        return task
+
+    def shadow_identity(self, bot_line: Any) -> None:
+        """Start the identity shadow; `note_identity_route` logs agreement."""
+        self._identity_shadow = self.shadow(gate_judge.PHASE_IDENTITY, bot_line, None)
+
+    def note_identity_route(self, legacy_intent: str) -> None:
+        task = self._identity_shadow
+        self._identity_shadow = None
+        if task is None:
+            return
+
+        def _compare(done: "asyncio.Task[Any]") -> None:
+            if done.cancelled() or done.exception() is not None:
+                return
+            self._log_agreement(gate_judge.PHASE_IDENTITY, done.result(), legacy_intent)
+
+        if task.done():
+            _compare(task)
+        else:
+            task.add_done_callback(_compare)
+
+    def _shadow_done(self, task: "asyncio.Task[Any]") -> None:
+        self._shadow_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()  # consume; judge_gate never raises, this is belt and braces
+
+    def _log_agreement(
+        self, phase: str, decision: "gate_judge.GateDecision", legacy_intent: str,
+    ) -> None:
+        judged = decision.intent
+        if judged is None:
+            category = "judge_unavailable"
+        else:
+            category = "agree" if judged == legacy_intent else "disagree"
+        try:
+            self.log(
+                error_type="phone_gate_shadow", error_category=category,
+                phase=phase if phase in gate_judge.PHASES else "unknown",
+                schema=f"judge:{judged or 'none'}_legacy:{legacy_intent}"[:64],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def stop(self) -> None:
+        """The gate is over: cancel any shadow call still in flight."""
+        self.stopped = True
+        for task in list(self._shadow_tasks):
+            if not task.done():
+                task.cancel()
+        self._identity_shadow = None
+
+
+def _gate_judge_log(**fields: Any) -> None:
+    """The gate judge's log sink: categories, counts and durations only."""
+    _log.info("unknown_event", **fields)
+
+
+# ── M013 S01 T07: the post-consent revocation window ──────────────────────
+#
+# From the consent grant until the first accepted answer to the first
+# question, every STT final the candidate produces is judged with phase
+# `post_consent` the moment it lands (speculatively, concurrently with normal
+# turn handling, bounded by `PHONE_QNA_JUDGE_TIMEOUT_SEC`). The committed
+# turn reuses the verdict for the same words; a final whose turn the SDK
+# dropped while the gate's non-interruptible role line played is read by the
+# screening pre-loop before the first question. Only on the leg where consent
+# was granted in this call: a `consent.resumed` reconnect leg never reads a
+# consent reply, so the window is never armed there.
+#
+# Acts only in `PHONE_GATE_JUDGE=llm`; `shadow` judges and logs; `legacy`
+# (the default) leaves the window inert, and so does a judge that is
+# unavailable: the existing in-call detectors decide, unchanged.
+
+#: Judge intents the window acts on. Each needs evidence copied from the
+#: candidate's own words (the same substring rule the gate uses).
+_REVOCATION_INTENTS = frozenset({
+    gate_judge.INTENT_NOT_NOW_BUSY,
+    gate_judge.INTENT_CONSENT_DECLINED,
+    gate_judge.INTENT_OPT_OUT,
+})
+#: Finals kept per window (a window lasts one question; this bounds a
+#: talkative candidate, never a real call).
+_REVOCATION_MAX_ENTRIES = 16
+
+
+class _RevocationEntry:
+    """One candidate final inside the window and its in-flight verdict."""
+
+    __slots__ = ("idx", "text", "norm", "started", "task", "consumed_by",
+                 "duplicate_swallowed")
+
+    def __init__(self, idx: int, text: str, started: float) -> None:
+        self.idx = idx
+        self.text = text
+        self.norm = gate_judge.normalize_gate_text(text)
+        self.started = started
+        self.task: "asyncio.Task[Any] | None" = None
+        #: None (unread), "turn" (a committed turn read it) or "preloop".
+        self.consumed_by: str | None = None
+        self.duplicate_swallowed = False
+
+
+class _RevocationWindow:
+    """One call's post-consent revocation window (T07). Never raises.
+
+    Built by `_run_phone_session` (``arm`` on the consent grant, ``on_final``
+    from the transcript hook) and read by `_run_native_phone_screening`
+    (``read_turn`` per committed turn, ``read_preloop`` before the first
+    question, ``close`` when the first answer is accepted). The transport,
+    config, breaker, clock, timeout and log sink are injectable so tests
+    replay recorded answers.
+    """
+
+    #: The judge phase, the intents that act and the log line's type. T09's
+    #: `_QnaCloseWindow` reuses the window machinery with its own three.
+    _PHASE = gate_judge.PHASE_POST_CONSENT
+    _ACTING_INTENTS = _REVOCATION_INTENTS
+    _LOG_TYPE = "phone_revocation_window"
+
+    def __init__(
+        self,
+        *,
+        first_name: Any = "",
+        bot_line: "Callable[[], Any] | None" = None,
+        mode: str | None = None,
+        config: Any = None,
+        transport: Any = None,
+        breaker: Any = None,
+        log: "Callable[..., None] | None" = None,
+        clock: "Callable[[], float] | None" = None,
+        timeout_sec: "Callable[[], float] | None" = None,
+    ) -> None:
+        self.first_name = gate_judge.first_name_only(first_name)
+        self._bot_line_source = bot_line
+        self._bot_line_override: str | None = None
+        self._mode = mode if mode in gate_judge.GATE_JUDGE_MODES else None
+        self.config = config
+        self.transport = transport
+        self.breaker = breaker
+        self.log = log if log is not None else _revocation_log
+        self.clock = clock if clock is not None else (lambda: time.monotonic())
+        self._timeout = timeout_sec
+        self.armed = False
+        self.closed = False
+        self.close_reason: str | None = None
+        self.mode = gate_judge.GATE_JUDGE_MODE_LEGACY
+        self._entries: list[_RevocationEntry] = []
+        self._next_idx = 0
+
+    # ── state ────────────────────────────────────────────────────────────
+    @property
+    def open(self) -> bool:
+        return self.armed and not self.closed
+
+    @property
+    def acting(self) -> bool:
+        return self.open and self.mode == gate_judge.GATE_JUDGE_MODE_LLM
+
+    @property
+    def shadowing(self) -> bool:
+        return self.open and self.mode == gate_judge.GATE_JUDGE_MODE_SHADOW
+
+    def arm(self) -> None:
+        """Consent was granted in this call: open the window (llm/shadow)."""
+        if self.armed or self.closed:
+            return
+        mode = self._mode or gate_judge.judge_mode()
+        if mode not in (gate_judge.GATE_JUDGE_MODE_LLM, gate_judge.GATE_JUDGE_MODE_SHADOW):
+            return
+        self.mode = mode
+        self.armed = True
+        self.note("opened")
+
+    def close(self, reason: str) -> None:
+        """The window is over: cancel what is still in flight. Idempotent."""
+        if self.closed:
+            return
+        self.closed = True
+        self.close_reason = reason
+        for entry in self._entries:
+            task = entry.task
+            if task is not None and not task.done():
+                task.cancel()
+        if self.armed:
+            self.note(f"closed_{reason}")
+
+    def set_bot_line(self, text: Any) -> None:
+        """The line the candidate is now hearing (the first question)."""
+        if isinstance(text, str) and text.strip():
+            self._bot_line_override = text
+
+    def bot_line(self) -> str:
+        if self._bot_line_override is not None:
+            return self._bot_line_override
+        if self._bot_line_source is None:
+            return ""
+        try:
+            value = self._bot_line_source()
+        except Exception:  # noqa: BLE001
+            return ""
+        return value if isinstance(value, str) else ""
+
+    def timeout_sec(self) -> float:
+        if self._timeout is not None:
+            try:
+                return float(self._timeout())
+            except Exception:  # noqa: BLE001
+                pass
+        return gate_judge.qna_judge_timeout_sec()
+
+    def note(self, category: str, **fields: Any) -> None:
+        """One `phone_revocation_window` line: the outcome category, no text."""
+        try:
+            self.log(
+                error_type=self._LOG_TYPE, error_category=category,
+                phase=self._PHASE, **fields,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ── judging ──────────────────────────────────────────────────────────
+    def on_final(self, text: Any) -> None:
+        """Start the speculative judge call for one STT final."""
+        if not self.open:
+            return
+        clean = text.strip() if isinstance(text, str) else ""
+        if not clean:
+            return
+        self._add_entry(clean)
+
+    def _add_entry(self, text: str) -> "_RevocationEntry | None":
+        entry = _RevocationEntry(self._next_idx, text, self.clock())
+        self._next_idx += 1
+        try:
+            entry.task = asyncio.get_running_loop().create_task(self._judge(entry))
+        except RuntimeError:
+            return None
+        if self.shadowing:
+            entry.task.add_done_callback(self._shadow_done)
+        else:
+            entry.task.add_done_callback(_consume_task_exception)
+        self._entries.append(entry)
+        while len(self._entries) > _REVOCATION_MAX_ENTRIES:
+            dropped = self._entries.pop(0)
+            if dropped.task is not None and not dropped.task.done():
+                dropped.task.cancel()
+        return entry
+
+    async def _judge(self, entry: _RevocationEntry) -> "gate_judge.GateDecision":
+        """One `post_consent` verdict for one final. Never raises (except
+        cancellation). A revocation intent must cite the candidate's own
+        words, and never a label, or it is `unclear`."""
+        started = self.clock()
+        utterance = gate_judge.GateUtterance(
+            idx=entry.idx, text=entry.text, final_arrival_ms=int(round(time.time() * 1000)),
+            segment_start_ms=None, segment_end_ms=None, segment_speech_ms=None,
+            tag=gate_judge.TAG_POST_QUESTION,
+        )
+        request = gate_judge.GateJudgeRequest(
+            phase=self._PHASE, bot_line=self.bot_line(),
+            utterances=(utterance,), first_name=self.first_name,
+        )
+        model = ""
+        evidence = ""
+        rejected: str | None = None
+        try:
+            cfg = self.config if self.config is not None else gate_judge.resolve_judge_config()
+            model = getattr(cfg, "model", "") or ""
+            raw = await gate_judge.call_judge(
+                request, timeout_sec=self.timeout_sec(), config=cfg,
+                transport=self.transport, breaker=self.breaker, log=self._decision_log,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — the judge never fails the screening
+            raw = gate_judge.JudgeUnavailable("internal_error")
+        latency_ms = max(0, int(round((self.clock() - started) * 1000)))
+        if isinstance(raw, gate_judge.JudgeUnavailable):
+            decision = gate_judge.GateDecision(
+                intent=None, source=gate_judge.SOURCE_LLM,
+                error_category=raw.reason, latency_ms=latency_ms,
+            )
+        else:
+            evidence = raw.evidence or ""
+            intent = raw.intent
+            idx: int | None = None
+            if gate_judge.evidence_in_text(evidence, entry.text):
+                idx = entry.idx
+            if intent in self._ACTING_INTENTS:
+                if not evidence.strip():
+                    rejected = "no_evidence"
+                elif gate_judge.evidence_names_a_label(evidence):
+                    rejected = "evidence_is_label"
+                elif idx is None:
+                    rejected = "evidence_not_found"
+                else:
+                    rejected = self._extra_guard(entry)
+                if rejected is not None:
+                    intent, idx = gate_judge.INTENT_UNCLEAR, None
+            decision = gate_judge.GateDecision(
+                intent=intent, source=gate_judge.SOURCE_LLM, evidence_idx=idx,
+                callback=raw.callback if intent == gate_judge.INTENT_NOT_NOW_BUSY else None,
+                latency_ms=latency_ms, guard_rejected_reason=rejected,
+                confidence=raw.confidence,
+            )
+        try:
+            gate_judge.log_decision(
+                decision, phase=self._PHASE, model=model,
+                n_utterances=1, n_tagged=1, evidence_len=len(evidence),
+                rejection_reason=rejected or (
+                    f"err.{decision.error_category}" if decision.error_category else None),
+                log=self._decision_log,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return decision
+
+    def _decision_log(self, **fields: Any) -> None:
+        # A shadow decision is audited on its own line, so the acting
+        # `phone_gate_decision` counts stay the decisions that acted.
+        if self.shadowing and fields.get("error_type") == "phone_gate_decision":
+            fields = {**fields, "error_type": "phone_gate_shadow_decision"}
+        try:
+            self.log(**fields)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _shadow_done(self, task: "asyncio.Task[Any]") -> None:
+        if task.cancelled() or task.exception() is not None:
+            return
+        decision = task.result()
+        self.note(f"shadow_{decision.intent or 'judge_unavailable'}")
+
+    def _extra_guard(self, entry: _RevocationEntry) -> str | None:
+        """A further reason an acting verdict may not act (None = it may)."""
+        return None
+
+    @classmethod
+    def acting_decision(cls, decision: Any) -> bool:
+        """A valid judge revocation verdict grounded in the candidate's words."""
+        return (
+            isinstance(decision, gate_judge.GateDecision)
+            and decision.source == gate_judge.SOURCE_LLM
+            and decision.intent in cls._ACTING_INTENTS
+            and decision.evidence_idx is not None
+        )
+
+    async def _await_entries(
+        self, entries: "list[_RevocationEntry]",
+    ) -> "list[tuple[_RevocationEntry, gate_judge.GateDecision | None]]":
+        """Each entry's verdict, waiting at most what is left of each call's
+        own timeout (so a turn never waits longer than the judge bound)."""
+        tasks = [e.task for e in entries if e.task is not None and not e.task.done()]
+        if tasks:
+            now = self.clock()
+            bound = max(
+                (e.started + self.timeout_sec() - now for e in entries if e.task in tasks),
+                default=0.0,
+            )
+            if bound > 0:
+                try:
+                    await asyncio.wait(set(tasks), timeout=bound)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    pass
+        results: list[tuple[_RevocationEntry, gate_judge.GateDecision | None]] = []
+        for entry in entries:
+            task = entry.task
+            decision = None
+            if task is not None and task.done() and not task.cancelled():
+                try:
+                    decision = task.result()
+                except Exception:  # noqa: BLE001
+                    decision = None
+            results.append((entry, decision))
+        return results
+
+    async def read_turn(
+        self, text: Any,
+    ) -> "tuple[str, gate_judge.GateDecision | None, str]":
+        """The verdict for one committed turn: ``(route, decision, text)``.
+
+        ``route``: ``revocation`` (an acting verdict; ``decision`` is it and
+        ``text`` the words it rests on), ``answer`` (a valid judge verdict
+        that is not a revocation), ``unavailable`` (no usable verdict: the
+        existing detectors decide), ``duplicate`` (the late commit of a final
+        the pre-loop already acted on: swallow it) or ``inactive``.
+        """
+        if not self.acting:
+            return "inactive", None, ""
+        clean = text.strip() if isinstance(text, str) else ""
+        norm = gate_judge.normalize_gate_text(clean)
+        if not norm:
+            return "inactive", None, ""
+        if self.take_duplicate(clean):
+            return "duplicate", None, ""
+        matched = [
+            e for e in self._entries
+            if e.consumed_by is None and e.norm and (e.norm in norm or norm in e.norm)
+        ]
+        if not matched:
+            # No final reached the window for these words (a test, or STT
+            # finalised differently): judge the committed text itself, under
+            # the same bound.
+            fresh = self._add_entry(clean)
+            matched = [fresh] if fresh is not None else []
+        for entry in matched:
+            entry.consumed_by = "turn"
+        results = await self._await_entries(matched)
+        for entry, decision in results:
+            if self.acting_decision(decision):
+                return "revocation", decision, entry.text
+        if any(d is not None and d.intent is not None for _, d in results):
+            return "answer", None, ""
+        return "unavailable", None, ""
+
+    def take_duplicate(self, text: Any) -> bool:
+        """True (once) when ``text`` is the SDK's late commit of the final the
+        pre-loop already acted on: the turn is swallowed, never read twice
+        (as the reply to the confirmation it caused, for one)."""
+        norm = gate_judge.normalize_gate_text(text)
+        if not norm:
+            return False
+        for entry in self._entries:
+            if (entry.consumed_by == "preloop" and not entry.duplicate_swallowed
+                    and entry.norm == norm):
+                entry.duplicate_swallowed = True
+                self.note("duplicate_commit_swallowed")
+                return True
+        return False
+
+    async def read_preloop(
+        self,
+    ) -> "tuple[gate_judge.GateDecision, str] | None":
+        """Before the first question: an acting verdict on a final heard
+        since the grant (typically during the role line) that no committed
+        turn has read yet, or None. Consumes what it reads."""
+        if not self.acting:
+            return None
+        # Review fix: a back-channel heard during the role line ("okay",
+        # "hmm", "yes", "thank you") can never be a revocation, so Q1 never
+        # waits for its verdict (that wait was up to the judge timeout of
+        # dead air before the first question). Only substantive finals are
+        # waited for, bounded as before.
+        pending = [
+            e for e in self._entries
+            if e.consumed_by is None and not _preloop_backchannel(e.text)
+        ]
+        if not pending:
+            return None
+        results = await self._await_entries(pending)
+        for entry, decision in results:
+            if self.acting_decision(decision) and entry.consumed_by is None:
+                # Only the final acted on is the pre-loop's: its late commit
+                # is swallowed. Every other final stays readable by its turn.
+                entry.consumed_by = "preloop"
+                return decision, entry.text
+        return None
+
+
+def _preloop_backchannel(text: Any) -> bool:
+    """A final that is only a back-channel or filler, never a revocation."""
+    try:
+        return bool(
+            phone.phone_qna_incomplete(text) or phone.phone_qna_acknowledgement(text)
+        ) and isinstance(text, str) and bool(text.strip())
+    except Exception:  # noqa: BLE001 — unknown: wait for its verdict
+        return False
+
+
+def _consume_task_exception(task: "asyncio.Task[Any]") -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+def _revocation_log(**fields: Any) -> None:
+    """The revocation window's log sink: categories and durations only."""
+    _log.info("unknown_event", **fields)
+
+
+# ── M013 S01 T09: the end-of-screening Q&A judge ─────────────────────────
+#
+# Once the bot has asked "any questions?", every STT final is judged with phase
+# `qna_close` the moment it lands (speculatively, bounded by
+# `PHONE_QNA_JUDGE_TIMEOUT_SEC`), so most of the judge's latency hides behind
+# end-of-turn detection; the committed turn reuses the verdict for the same
+# words. The judge decides decline vs question vs anything else. Acts only in
+# `PHONE_GATE_JUDGE=llm`; `shadow` judges and logs; in `legacy`, or when the
+# judge is unavailable, the deterministic fallback grammar decides
+# (`phone.phone_qna_decline` and the question readers).
+
+#: Judge intents that close the Q&A. Each needs evidence copied from the
+#: candidate's own words, and no "?" in the reply (`_QnaCloseWindow`).
+_QNA_DECLINE_INTENTS = frozenset({
+    gate_judge.INTENT_END_CALL,
+    gate_judge.INTENT_CONSENT_DECLINED,
+})
+
+QNA_KIND_DECLINE = "decline"
+QNA_KIND_QUESTION = "question"
+QNA_KIND_OTHER = "other"
+
+
+class _QnaCloseWindow(_RevocationWindow):
+    """The `qna_close` judge for one call (T09). Never raises.
+
+    Built by `_run_phone_session` (``on_final`` from the transcript hook),
+    armed by `_run_native_phone_screening` when it asks "any questions?", read
+    per committed turn with ``read_qna`` and closed at leg end. Any leg may arm
+    it: unlike the revocation window it is not tied to the consent leg.
+    """
+
+    _PHASE = gate_judge.PHASE_QNA_CLOSE
+    _ACTING_INTENTS = _QNA_DECLINE_INTENTS
+    _LOG_TYPE = "phone_qna_close_judge"
+
+    def _extra_guard(self, entry: _RevocationEntry) -> str | None:
+        # A reply with a "?" is never closed on, whatever the judge says.
+        return "question_mark" if "?" in entry.text else None
+
+    def bind_bot_line(self, source: "Callable[[], Any] | None") -> None:
+        """The line the candidate is answering (the invite, then each answer)."""
+        self._bot_line_source = source
+        self._bot_line_override = None
+
+    async def read_qna(self, text: Any) -> "tuple[str, gate_judge.GateDecision | None]":
+        """The judge's reading of one committed Q&A turn: ``(kind, decision)``.
+
+        ``kind``: ``question`` (wins over everything else: a question is never
+        closed on), ``decline`` (a grounded end_call/consent_declined verdict),
+        ``other`` (any other valid verdict), ``unavailable`` (no usable
+        verdict: the fallback grammar decides) or ``inactive``.
+        """
+        if not self.acting:
+            return "inactive", None
+        clean = text.strip() if isinstance(text, str) else ""
+        norm = gate_judge.normalize_gate_text(clean)
+        if not norm:
+            return "inactive", None
+        matched = [
+            e for e in self._entries
+            if e.consumed_by is None and e.norm and (e.norm in norm or norm in e.norm)
+        ]
+        if not matched:
+            fresh = self._add_entry(clean)
+            matched = [fresh] if fresh is not None else []
+        for entry in matched:
+            entry.consumed_by = "turn"
+        results = await self._await_entries(matched)
+        decisions = [d for _, d in results if d is not None and d.intent is not None]
+        for decision in decisions:
+            if decision.intent == gate_judge.INTENT_QUESTION:
+                return QNA_KIND_QUESTION, decision
+        for decision in decisions:
+            if self.acting_decision(decision) and "?" not in clean:
+                return QNA_KIND_DECLINE, decision
+        if decisions:
+            return QNA_KIND_OTHER, decisions[0]
+        return "unavailable", None
+
+
+def _turn_started_after(item: Any, anchor_ms: int | None) -> bool:
+    """Did the speech behind ``item`` begin at or after ``anchor_ms``?
+
+    The legacy fallback's informed-consent guard (T05): with no anchor, or an
+    item the gate cannot time but already accepted as grant evidence (a bare
+    string from a direct test), it holds.
+    """
+    if anchor_ms is None:
+        return True
+    _, started = _queued_turn(item)
+    if started is None:
+        return not isinstance(item, gate_judge.GateTurn)
+    return started >= anchor_ms
 
 
 def _native_turn_predates_question(message: Any, question_anchor_ms: int | None) -> bool:
@@ -1484,6 +2806,8 @@ _ROOM_TEARDOWN_LABELS: dict[str | None, str] = {
     # M009 E6: the callee never really answered. The room delete CANCELs the
     # still-ringing INVITE; nothing was spoken or recorded.
     phone.GATE_NOT_ANSWERED: "not_answered",
+    # M013 S01 T03: the gate's lease heartbeat lost the slot mid-gate.
+    phone.GATE_LEASE_HALTED: "gate_lease_halted",
 }
 
 
@@ -2693,12 +4017,176 @@ async def _wait_for_sip_answer(
 #: it is the bound that makes the filler alternation safe against a hum.
 _REPEATED_RUN_RE = re.compile(r"(.)\1{3,}", re.DOTALL)
 
+#: Unmistakable answering-machine / carrier / IVR wording. A match is "machine"
+#: only while no human-directed speech has been heard on the call (see
+#: `classify_answer_text(candidate_spoke=...)`, M013 S01 T02).
+#:
+#: Indian carrier and IVR prompts are here because a carrier message heard at
+#: the identity turn must NOT read as a person: it would set the "a person
+#: spoke" latch, and the call could then never end as machine. Romanised and
+#: Devanagari, as Sarvam transcribes them.
 _MACHINE_RE = re.compile(
     r"leave (?:a )?(?:your )?message|after the (?:tone|beep)|voice\s?mail|"
-    r"not available (?:right now|at the moment)|record your message|"
-    r"press \d|unable to take your call",
+    r"record your message|press \d|"
+    # Carrier: "The number you are calling is not reachable / switched off",
+    # "the subscriber you have dialled cannot be reached".
+    r"\b(?:number|subscriber|person|customer)\s+you\s+(?:are|have)\s+"
+    r"(?:calling|called|dialled|dialed|trying\s+to\s+reach)\b|"
+    r"\baap\s+jis\s+(?:number|vyakti)\b|\bjis\s+number\s+(?:par|pe|ko)\s+aap\b|"
+    r"\bsandesh\s+chhod|"
+    # Devanagari, spelled as escapes so the nukta form cannot drift: STT emits
+    # both the precomposed U+095C and U+0921 U+093C for the same letter.
+    #   आप जिस नंबर / नम्बर / व्यक्ति   ("the number / person you …")
+    "आप\\s*जिस\\s*(?:नंबर|"
+    "नम्बर|व्यक्ति)|"
+    #   संदेश छोड़   ("leave a message")
+    "संदेश\\s*छो(?:ड़|ड़)|"
+    #   पहुंच / पहुँच से बाहर   ("out of reach")
+    "पहु(?:ं|ँ)च\\s*से\\s*"
+    "बाहर",
     re.IGNORECASE,
 )
+#: Availability wording a voicemail greeting uses — and a PERSON uses too.
+#: "The number you have dialled is not available right now" is a machine;
+#: "Sorry, I'm not available right now" is a human telling us it is a bad time.
+#: These count as machine only when the utterance has no first-person subject
+#: (nor a "he"/"she": a relative saying the candidate is unavailable is a
+#: person too; carrier prompts say "the person you are calling", never "she").
+_MACHINE_AVAILABILITY_RE = re.compile(
+    r"not available (?:right now|at the moment)|unable to take your call|"
+    r"\b(?:is|are)\s+(?:currently\s+)?(?:not\s+reachable|unreachable|"
+    r"switched\s+off|out\s+of\s+(?:service|coverage))\b",
+    re.IGNORECASE,
+)
+_FIRST_PERSON_RE = re.compile(
+    r"\b(?:i|i'?m|im|i\s+am|me|my|main|mai|he|she|he'?s|she'?s)\b|"
+    "मैं|मुझे",  # मैं, मुझे
+    re.IGNORECASE,
+)
+
+
+def _is_machine_text(value: str) -> bool:
+    """True when ``value`` reads as an answering machine, carrier or IVR."""
+    if not value:
+        return False
+    if _MACHINE_RE.search(value):
+        return True
+    return bool(
+        _MACHINE_AVAILABILITY_RE.search(value)
+        and not _FIRST_PERSON_RE.search(value.replace("’", "'"))
+    )
+
+
+#: Round-3 review fix: greeting wording a PERSON does not use, on top of
+#: `_MACHINE_RE`, for the judge's voicemail shape guard ONLY (the legacy
+#: readers keep `_is_machine_text` unchanged): "forwarded to an automated
+#: voice messaging system", "you have reached …", "can't take your call".
+_VOICEMAIL_SHAPE_RE = re.compile(
+    r"\bvoice\s*messag|\bautomated\s+(?:voice|message|messaging|system|attendant)\b|"
+    r"\banswering\s+(?:machine|service)\b|\bmail\s*box\b|"
+    r"\byou(?:'ve|\s+have)\s+reached\b|"
+    r"\b(?:can't|cannot|can\s+not|unable\s+to)\s+(?:take|answer)\s+your\s+call\b|"
+    r"\bat\s+the\s+(?:tone|beep)\b|"
+    # Round-4 review fix: carrier wording `_MACHINE_RE` misses.
+    # "The call cannot be completed as dialled", "this number does not exist".
+    r"\b(?:cannot|can\s*not|can't|could\s+not)\s+be\s+completed\b|"
+    r"\bnumber\s+(?:does\s+not|doesn't)\s+exist\b|"
+    # Hindi carrier: "is number par incoming call ki suvidha uplabdh nahi
+    # hai", "aapke dwara dial kiya gaya number abhi vyast hai".
+    r"\bincoming\s+(?:call\s+)?(?:ki\s+)?suvidha\b|"
+    r"\bdial\s+kiya\s+gaya\s+number\b",
+    re.IGNORECASE,
+)
+#: Round-4/5 review fix: wording a machine uses and a live PERSON can use too.
+#: Each is machine-shaped only without the person markers named below (the
+#: way `_MACHINE_AVAILABILITY_RE` and the try-again-later rule work):
+#:
+#: * carrier "the person/number you're (you are) calling" (Google Call
+#:   Screen, "The person you're calling is using a screening service") —
+#:   not with a '?', a wh-word or an I/he/she subject ("Who is the person
+#:   you're calling for"). Also lifted out of `_MACHINE_RE`'s own match
+#:   for this guard only: the legacy readers are unchanged.
+_VOICEMAIL_CARRIER_PERSON_RE = re.compile(
+    r"\b(?:number|subscriber|person|customer)\s+you(?:'re|\s+are|'ve|\s+have)\s+"
+    r"(?:calling|called|dialled|dialed|trying\s+to\s+reach)\b",
+    re.IGNORECASE,
+)
+#: * "screening service" — not with a '?', an "is this/is it/are you"
+#:   ("Is this some screening service") or an I/he/she subject.
+_VOICEMAIL_SCREENING_RE = re.compile(r"\bscreening\s+service\b", re.IGNORECASE)
+#: * a personal greeting "Sorry I missed your call, I'll get back to you" —
+#:   read on ONE utterance only (`.` never crosses the newline
+#:   `gate_judge.voicemail_guard_failure` joins utterances with), and not
+#:   with a '?', a "can/shall/may I" offer or a he/she/they subject ("Sorry,
+#:   I missed your call earlier" + "can I get back to you in ten minutes?",
+#:   "Sorry, she missed your call, she will get back to you").
+_VOICEMAIL_MISSED_CALL_RE = re.compile(
+    r"\bmissed\s+your\s+call\b.{0,80}\bget\s+back\s+to\s+you\b", re.IGNORECASE)
+_VOICEMAIL_WH_RE = re.compile(r"\b(?:who|whom|whose|which|what)\b", re.IGNORECASE)
+_VOICEMAIL_IS_THIS_RE = re.compile(
+    r"\b(?:is|are)\s+(?:this|it|that|you)\b", re.IGNORECASE)
+_VOICEMAIL_OFFER_RE = re.compile(
+    r"\b(?:can|shall|may|should|could)\s+(?:i|we)\b", re.IGNORECASE)
+_VOICEMAIL_THIRD_PERSON_RE = re.compile(
+    r"\b(?:he|she|they|he'?s|she'?s|they'?re|him|her)\b", re.IGNORECASE)
+#: Round-4 review fix: "Please try again later" is a carrier prompt, but a
+#: person says it too ("I'm in a meeting, try again later"): machine-shaped
+#: only with no first-person / he / she subject and no '?' (as
+#: `_MACHINE_AVAILABILITY_RE`). Round-5: and only in the carrier's own
+#: "please try again later" form; "Busy now. Try again later." and "Not now,
+#: try again later" are a person.
+_VOICEMAIL_TRY_LATER_RE = re.compile(
+    r"\bplease\s+try\s+again\s+later\b", re.IGNORECASE)
+_VOICEMAIL_NOT_NOW_RE = re.compile(r"\bnot\s+now\b", re.IGNORECASE)
+
+
+def _voicemail_shaped(value: str) -> bool:
+    """Does an utterance a judged voicemail cites read as a machine?
+
+    The judge's `voicemail_machine` verdict may act at identity/consent only
+    on such words (`gate_judge.voicemail_guard_failure`): a person's own
+    "Hello? Who is this?" misread as voicemail is never a silent hang-up.
+    Blocking direction only; nothing here can make a call machine.
+
+    ``value`` is one utterance, or several joined with a newline in spoken
+    order; the person markers are read on the whole value (blocking
+    direction), the missed-call greeting on one line only.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return False
+    lines = value.replace("’", "'").split("\n")
+    clean = " ".join(lines)
+    asked = "?" in clean
+    first_person = _FIRST_PERSON_RE.search(clean) is not None
+    flat = clean
+    # Person-confusable wording is lifted out before the machine readers run.
+    if asked or first_person or _VOICEMAIL_WH_RE.search(clean):
+        flat = _VOICEMAIL_CARRIER_PERSON_RE.sub(" ", flat)
+    elif _VOICEMAIL_CARRIER_PERSON_RE.search(flat):
+        return True
+    if (
+        not asked and not first_person
+        and not _VOICEMAIL_IS_THIS_RE.search(clean)
+        and _VOICEMAIL_SCREENING_RE.search(flat)
+    ):
+        return True
+    if (
+        not asked
+        and not _VOICEMAIL_OFFER_RE.search(clean)
+        and not _VOICEMAIL_THIRD_PERSON_RE.search(clean)
+        and any(_VOICEMAIL_MISSED_CALL_RE.search(line) for line in lines)
+    ):
+        return True
+    if _is_machine_text(flat) or _VOICEMAIL_SHAPE_RE.search(flat) is not None:
+        return True
+    return bool(
+        _VOICEMAIL_TRY_LATER_RE.search(clean)
+        and not asked
+        and not first_person
+        and not _VOICEMAIL_NOT_NOW_RE.search(clean)
+    )
+
+
 _WRONG_NUMBER_RE = re.compile(
     r"wrong number|no one (?:by|with) that name|nobody (?:by|with) that name|"
     r"you(?:'ve| have) got the wrong",
@@ -2894,7 +4382,7 @@ _AFFIRMATIVE_RE = re.compile(
     r"uh[\s-]*huh|mm[\s-]*hmm|mhm|"
     # ── ADDED 2026-09-15 after a live double-ask ────────────────────────
     # Fourteen of forty-eight natural ways to say yes returned None and
-    # produced the re-ask ("Sorry, I just need a yes or a no"). The candidate
+    # produced the consent re-ask (since retired for worded re-asks). The candidate
     # had consented; the vocabulary simply did not contain their word. These
     # are the misses, each a complete answer to "is it okay to continue?".
     # `right`, `correct`, `good`, `great`, `cool`, `understood` were here and
@@ -2944,14 +4432,61 @@ _AFFIRMATIVE_RE = re.compile(
 #: "Right, can I call you back?" and "Alright, let me call you back" were read
 #: as consent on the strength of their first word.
 _AMBIGUOUS_RE = re.compile(
-    r"\bcall\s+(?:you|me)\s+back\b|\bcall\s+back\b|"
     r"\bhold\s+on\b|\bone\s+(?:second|sec|minute|min)\b|\bhang\s+on\b|"
     r"\bwho\s+is\s+this\b|\bwho'?s\s+this\b|"
     r"\bwhat\s+is\s+this\s+(?:about|regarding|for)\b|"
     r"\bwhat'?s\s+this\s+(?:about|regarding|for)\b|"
-    r"\bleave\s+me\s+alone\b|\bnot\s+a\s+good\s+time\b|"
-    r"\bi'?m\s+(?:busy|driving)\b|\bi\s+am\s+(?:busy|driving)\b|"
-    r"\bin\s+a\s+meeting\b|\bmaybe\s+later\b|\bnot\s+now\b",
+    r"\bleave\s+me\s+alone\b",
+    re.IGNORECASE,
+)
+
+#: BUSY / CALL ME BACK — never a yes/no re-ask (M013 S01 T02, roadmap 3).
+#:
+#: These used to live in `_AMBIGUOUS_RE` and therefore re-asked "Sorry, I just
+#: need a yes or a no" of somebody who had just said they were driving, then
+#: hung up on them as "machine" when they did not answer it. Each is a request
+#: for another time, so it goes to the pre-consent callback flow (#334's
+#: `_schedule_before_consent`), exactly like the bare "I'm busy" that
+#: `phone.phone_preconsent_callback_requested` already routes there.
+#:
+#: Checked where `_AMBIGUOUS_RE` was: AFTER every refusal branch, so "no
+#: thanks, not now" still refuses, and BEFORE the affirmative, so "Sure, but
+#: I'm driving" is a callback and never consent.
+_BUSY_RE = re.compile(
+    r"\bcall\s+(?:you|me)\s+back\b|\bcall\s+back\b|"
+    r"\b(?:call|ring|phone|talk|speak)\s+(?:me\s+|to\s+me\s+)?later\b|"
+    r"\bmaybe\s+later\b|\blater\s+(?:please|pls|plz)\b|"
+    r"\b(?:some\s*other|another|a\s+better|a\s+different)\s+time\b|"
+    r"\bnot\s+(?:a\s+)?(?:good|right|great|convenient)\s+time\b|"
+    r"\bbad\s+time\b|\bnot\s+now\b|\bnot\s+right\s+now\b|"
+    r"\b(?:i'?m|i\s+am|im)\s+(?:(?:really|very|currently|a\s+bit|kind\s+of|"
+    r"little|a\s+little)\s+)?(?:busy|driving|occupied|travel+ing|in\s+a\s+meeting|"
+    r"in\s+the\s+middle\s+of|out\s+somewhere)\b|"
+    r"\bin\s+a\s+meeting\b|\b(?:can'?t|cannot|can\s+not)\s+(?:talk|speak)\b|"
+    r"\breschedule\b|"
+    r"\b(?:i'?m|i\s+am|im)\s+(?:(?:currently|really|just)\s+)?not\s+"
+    r"(?:available|free)\b|"
+    r"\babhi\s+(?:nahi|nahin|busy)\b|\bbaad\s+(?:mein|me|main)\b",
+    re.IGNORECASE,
+)
+#: …unless the same turn says the opposite about NOW: "I am busy in the
+#: mornings but free now" is not a request for another time (#334's own
+#: negative case). It falls through to the re-ask instead.
+_BUSY_VETO_RE = re.compile(
+    # The lookbehind keeps "I'm not available right now" — the busy phrase
+    # itself — from vetoing its own match.
+    r"(?<!not\s)\b(?:free|available)\s+(?:right\s+)?now\b|"
+    r"\bnow\s+is\s+(?:fine|good|okay|ok)\b",
+    re.IGNORECASE,
+)
+
+#: A question back at the consent line: worded re-ask "question", not
+#: "unclear". Legacy only; the judge (T05) answers from a fixed FAQ instead.
+_CONSENT_QUESTION_RE = re.compile(
+    r"\?\s*$|^\s*(?:(?:um+|uh+|sorry|hello|hi|yes|yeah|ok|okay)[\s,.]*)*"
+    r"(?:who|what|why|how|which|when|where)\b|"
+    r"\bwho\s+is\s+this\b|\bwho'?s\s+this\b|\bwhat\s+is\s+this\b|"
+    r"\bwhat'?s\s+this\b",
     re.IGNORECASE,
 )
 
@@ -3006,12 +4541,17 @@ _RECORDING_CONFLICT_RE = re.compile(
 )
 
 
-def classify_answer_text(text: str) -> str | None:
+def classify_answer_text(text: str, *, candidate_spoke: bool = False) -> str | None:
     """Map one spoken response to a gate outcome, or None if unreadable.
 
     Order matters: opt-out and wrong-number are checked before refusal, because
     "don't call me again" is both, and the stronger, more suppressive reading is
     the one the candidate meant.
+
+    ``candidate_spoke`` (M013 S01 T02): once human-directed speech has been
+    heard on this call, machine wording never decides — "press 1" or "voice
+    mail" in a person's mouth is not an answering machine. The rest of the
+    turn is classified as if the machine branch did not exist.
     """
     value = (text or "").strip()
     if not value:
@@ -3032,7 +4572,7 @@ def classify_answer_text(text: str) -> str | None:
     # their meaning. Linear, and it runs before every branch, so the
     # machine/refusal patterns are protected too.
     value = _REPEATED_RUN_RE.sub(r"\1\1\1", value)
-    if _MACHINE_RE.search(value):
+    if not candidate_spoke and _is_machine_text(value):
         return phone.CLASSIFY_MACHINE
     if _WRONG_NUMBER_RE.search(value):
         return phone.CLASSIFY_WRONG_NUMBER
@@ -3048,6 +4588,13 @@ def classify_answer_text(text: str) -> str | None:
         return phone.CLASSIFY_REFUSED
     # Before the affirmative, deliberately: an `^`-anchored affirmative would
     # otherwise accept "Right, can I call you back?" on its first word.
+    if _BUSY_RE.search(value) and not _BUSY_VETO_RE.search(value):
+        # Busy / call me back is a callback, never a yes/no re-ask (T02). A
+        # recording objection in the same turn is not something to schedule
+        # around, so it keeps the re-ask, as the callback branch above does.
+        if _RECORDING_CONFLICT_RE.search(value):
+            return None
+        return phone.CLASSIFY_CALLBACK_REQUESTED
     if _AMBIGUOUS_RE.search(value):
         return None
     if _AFFIRMATIVE_RE.search(value):
@@ -3100,14 +4647,235 @@ async def _phone_recording_permitted() -> None:
     _log.info("unknown_event", error_type="phone_recording_permitted")
 
 
+def _consent_reask_reason(text: Any, *, heard: bool) -> str:
+    """Why the consent question is being asked again: a fixed category.
+
+    ``silence`` when nothing usable was heard, ``question`` when the reply was a
+    question back, ``unclear`` for everything else. Busy and grant verdicts
+    never reach a re-ask (they are decisions), so neither has a reason here.
+    """
+    value = text.strip() if isinstance(text, str) else ""
+    if not value:
+        return phone.CONSENT_REASK_UNCLEAR if heard else phone.CONSENT_REASK_SILENCE
+    if _CONSENT_QUESTION_RE.search(value):
+        return phone.CONSENT_REASK_QUESTION
+    return phone.CONSENT_REASK_UNCLEAR
+
+
+#: The consent read's attempts when a judged question buys one more round
+#: (T05): the first ask plus at most two re-asks.
+_CONSENT_MAX_ATTEMPTS_WITH_QUESTION = 3
+
+
+def _gate_bot_line(bot_line: "Callable[[], Any] | None") -> str:
+    """The gate line the candidate just heard, for the judge prompt."""
+    if bot_line is None:
+        return ""
+    try:
+        value = bot_line()
+    except Exception:  # noqa: BLE001
+        return ""
+    return value if isinstance(value, str) else ""
+
+
+class _ConsentJudgement:
+    """What one judged consent reply decided (T05). No text leaves it but
+    the reply the reader consumed."""
+
+    __slots__ = (
+        "text", "decision", "judged_valid", "reask_reason", "faq_kind",
+        "evidence_item",
+    )
+
+    def __init__(self, *, text: str, decision: str | None, judged_valid: bool,
+                 reask_reason: str | None, faq_kind: str | None,
+                 evidence_item: Any) -> None:
+        self.text = text
+        self.decision = decision
+        self.judged_valid = judged_valid
+        self.reask_reason = reask_reason
+        self.faq_kind = faq_kind
+        self.evidence_item = evidence_item
+
+
+def _judged_reply_text(judge: "_GateJudgeWiring", items: list[Any], default: str) -> str:
+    """The text of every final from the first read item on, in order."""
+    idxs = [
+        idx for item in items if isinstance(item, gate_judge.GateTurn)
+        for idx in item.utterance_idxs
+    ]
+    if not idxs:
+        return default
+    first = min(idxs)
+    texts = [
+        u.text for u in judge.capture.utterances.all()
+        if u.idx >= first and u.text.strip()
+    ]
+    return " ".join(texts).strip() or default
+
+
+async def _judge_consent_reply(
+    judge: "_GateJudgeWiring",
+    phase: str,
+    bot_line: str,
+    *,
+    text: str,
+    chosen: Any,
+    turns: "asyncio.Queue",
+    question_anchor: "Callable[[], int | None] | None",
+    budget: "phone.GateBudget | None",
+    spoke_before: bool,
+) -> _ConsentJudgement:
+    """llm mode: judge ONE closed consent reply and map it to the gate's vocabulary.
+
+    * A judge grant waits for quiescence: while the candidate may still be
+      talking, the next closed turn is read from the SAME queue (bounded by
+      `_GATE_QUIESCENCE_WAIT_MAX_SEC` and the budget; stale turns skipped and
+      logged), joined to the reply, and the fuller window is re-judged. So
+      "Okay." then "can we reschedule, I'm out somewhere" is ONE reply.
+    * Judge unavailable: the legacy regex decides on the reply as read (it may
+      grant, but only on speech that began at or after the recording
+      sentence; `legacy_grant_before_recording_anchor` otherwise).
+    * Valid verdicts map through `_CONSENT_CLASSIFICATION_FOR_INTENT`; a
+      judged voicemail after a person was heard is not machine (T02 rule b).
+    """
+    state: dict[str, Any] = {
+        "text": text, "items": [chosen],
+        # Round-2 review fix: the text a legacy GRANT may rest on. A turn
+        # appended by the quiescence wait that may not ground a grant (no VAD
+        # timing) still counts for every other reading (busy, decline), but
+        # never helps make up a regex grant.
+        "grant_text": text,
+        "after_idx": max((u.idx for u in judge.window()), default=None),
+    }
+    fallback: dict[str, Any] = {}
+
+    def _legacy() -> str:
+        verdict = classify_answer_text(state["text"], candidate_spoke=spoke_before)
+        if verdict == phone.CLASSIFY_HUMAN and not _turn_started_after(
+                chosen, judge.recording_anchor_ms()):
+            _log.info(
+                "unknown_event", error_type="phone_gate_turn_barrier",
+                error_category="legacy_grant_before_recording_anchor",
+            )
+            verdict = None
+        if (verdict == phone.CLASSIFY_HUMAN and state["grant_text"] != state["text"]
+                and classify_answer_text(
+                    state["grant_text"], candidate_spoke=spoke_before,
+                ) != phone.CLASSIFY_HUMAN):
+            _log.info(
+                "unknown_event", error_type="phone_gate_turn_barrier",
+                error_category="legacy_grant_needs_untimed_turn",
+            )
+            verdict = None
+        fallback["verdict"] = verdict
+        return _INTENT_FOR_CLASSIFICATION.get(verdict, gate_judge.INTENT_UNCLEAR)
+
+    async def _wait_for_more(reason: str) -> Any:
+        """Wait for QUIET, not for a new turn (review fix).
+
+        Returns the fuller window when the turn the candidate was still
+        speaking closes, or None as soon as the line is quiet again (an echo
+        blip that never produced a final expires from the pairing window in
+        well under the bound): `gate_judge.judge_gate` then re-checks
+        quiescence and applies the grant with no added dead air.
+        """
+        _log.info(
+            "unknown_event", error_type="phone_gate_quiescence",
+            error_category=str(reason)[:32],
+        )
+        bound = _GATE_QUIESCENCE_WAIT_MAX_SEC
+        if budget is not None:
+            bound = budget.bound(bound)
+        end = time.monotonic() + max(0.0, bound)
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                still = judge.pending_speech(state["after_idx"])
+            except Exception:  # noqa: BLE001 — unknown: keep waiting, bounded
+                still = "pending_check_failed"
+            if still is None:
+                return None
+            try:
+                item = await asyncio.wait_for(
+                    turns.get(), timeout=min(remaining, _GATE_QUIESCENCE_POLL_SEC))
+            except asyncio.TimeoutError:
+                continue
+            more_text, more_anchor = _queued_turn(item)
+            question_ms = question_anchor() if question_anchor is not None else None
+            if question_anchor is not None and _queued_turn_is_stale(more_anchor, question_ms):
+                judge.latch.note_skipped(
+                    more_text, machine_match=_is_machine_text(more_text))
+                _log_gate_turn_skip("consent_turn_skipped", item, more_anchor, question_ms)
+                continue
+            state["items"].append(item)
+            if isinstance(more_text, str) and more_text.strip():
+                state["text"] = f"{state['text']} {more_text.strip()}".strip()
+                if gate_judge.turn_is_grant_evidence(item):
+                    state["grant_text"] = (
+                        f"{state['grant_text']} {more_text.strip()}".strip())
+            window = judge.window()
+            state["after_idx"] = max((u.idx for u in window), default=state["after_idx"])
+            return window
+
+    decision = await judge.decide(
+        phase, bot_line, legacy=_legacy, wait_for_more=_wait_for_more,
+    )
+    joined = state["text"]
+    if decision.source == gate_judge.SOURCE_LEGACY_FALLBACK:
+        return _ConsentJudgement(
+            text=joined, decision=fallback.get("verdict"), judged_valid=False,
+            reask_reason=None, faq_kind=None, evidence_item=chosen,
+        )
+    if decision.intent is None:
+        return _ConsentJudgement(
+            text=joined, decision=None, judged_valid=False, reask_reason=None,
+            faq_kind=None, evidence_item=chosen,
+        )
+    # The reply the verdict read: every final from this reply on, including
+    # one whose turn has not closed yet (the judge saw it), in spoken order.
+    joined = _judged_reply_text(judge, state["items"], joined)
+    verdict = _CONSENT_CLASSIFICATION_FOR_INTENT.get(decision.intent)
+    if verdict == phone.CLASSIFY_MACHINE and spoke_before:
+        # A person was heard earlier on this call: never machine (T02).
+        verdict = None
+    reask_reason: str | None = None
+    faq_kind: str | None = None
+    if verdict is None:
+        if decision.intent == gate_judge.INTENT_QUESTION:
+            reask_reason = phone.CONSENT_REASK_QUESTION
+            faq_kind = decision.question
+        else:
+            reask_reason = phone.CONSENT_REASK_UNCLEAR
+    evidence_item = chosen
+    if verdict == phone.CLASSIFY_HUMAN and decision.evidence_idx is not None:
+        for item in state["items"]:
+            if isinstance(item, gate_judge.GateTurn) and (
+                    decision.evidence_idx in item.utterance_idxs):
+                evidence_item = item
+                break
+    return _ConsentJudgement(
+        text=joined, decision=verdict, judged_valid=True, reask_reason=reask_reason,
+        faq_kind=faq_kind, evidence_item=evidence_item,
+    )
+
+
 async def _classify_phone_answer(
     turns: "asyncio.Queue[str]",
     say: Callable[[str], Any],
     *,
-    attempts: int = 2,
+    attempts: int = phone.PHONE_CONSENT_ATTEMPTS,
     consumed: "list[str] | None" = None,
     answer_timeout_sec: float | None = None,
     question_anchor: "Callable[[], int | None] | None" = None,
+    on_grant_evidence: "Callable[[Any], Any] | None" = None,
+    spoke: "gate_judge.HumanSpeechLatch | None" = None,
+    budget: "phone.GateBudget | None" = None,
+    judge: "_GateJudgeWiring | None" = None,
+    bot_line: "Callable[[], Any] | None" = None,
+    role_title: Any = None,
 ) -> str:
     """Read the response to the disclosure, re-asking at most once.
 
@@ -3124,11 +4892,67 @@ async def _classify_phone_answer(
     the gate can read the RAW consent reply (the last consumed text) it decided
     HUMAN on and commit it as the candidate half of the gate transcript. The
     classifier reads it; the gate records it — no text is inferred after.
+
+    M013 S01: a skipped utterance is LOGGED (`consent_turn_skipped`, with its
+    tag and deltas, no text), never dropped silently. A turn that may not
+    ground a grant (`gate_judge.turn_is_grant_evidence` — a reply the SDK
+    dropped with no VAD timing) can still refuse, defer or end the call, but
+    it never grants: a would-be grant on it is logged and the reader keeps
+    waiting in the same window. ``on_grant_evidence`` receives the queued
+    item a HUMAN decision rests on, so the session can persist it once.
+
+    M013 S01 T02 — NEVER "MACHINE" AFTER A PERSON SPOKE. ``spoke`` is the
+    call's `gate_judge.HumanSpeechLatch`, shared with the identity reader. A
+    non-stale reply that is not itself machine wording sets it. Once set:
+    machine wording no longer decides, and the fallthrough (an unreadable
+    reply, or silence, after the re-ask) returns
+    ``CLASSIFY_DEFERRED_PRE_DISCLOSURE`` — the gate speaks a goodbye and the
+    attempt is deferred, uncharged. "Machine" remains only for a line on which
+    nobody was heard at all, or whose first words were machine wording. The
+    re-ask is worded by its reason (`phone.phone_consent_reask_text`).
+
+    Review fixes (M013 S01): words skipped as stale set the latch's WEAK
+    form (`gate_judge.HumanSpeechLatch.note_skipped`: the fall-through is a
+    deferral, but machine wording still decides and clears it). And the
+    informed-consent rule holds in EVERY mode: when the judge is not acting
+    (legacy, shadow, or no judge), a regex grant on speech that began before
+    the recording sentence is skipped (`legacy_grant_before_recording_anchor`),
+    the reader listens `_PRE_RECORDING_YES_LISTEN_SEC` more, then re-asks.
+
+    M013 S01 T03: with a ``budget`` (`phone.GateBudget`), the re-ask is
+    spoken only if its answer still fits before the gate's deadline;
+    otherwise this returns ``CLASSIFY_DEFERRED_PRE_DISCLOSURE`` (the gate
+    then speaks the deferral goodbye) rather than starting a round the wall
+    clock would cut off.
+
+    M013 S01 T05 — THE GATE JUDGE. With a ``judge`` (`_GateJudgeWiring`):
+
+    * llm mode: each closed reply is judged (phase ``consent``, then
+      ``consent_retry``) on the tagged utterance window, with the bot line
+      just spoken (``bot_line``). A valid verdict decides
+      (`_CONSENT_CLASSIFICATION_FOR_INTENT`); a grant must pass the judge's
+      guards and quiescence, waiting (bounded) for a turn still being spoken
+      and re-judging the fuller window. When the judge is unavailable the
+      legacy regex decides, and a legacy grant also needs speech that began
+      at or after the recording sentence. A judged ``question`` is answered
+      from fixed copy (`phone.phone_consent_faq_text`, ``role_title`` for
+      "what role") before the re-ask, and may buy ONE extra re-ask (at most
+      two in all). A judged ``voicemail_machine`` is machine only when nobody
+      was heard before it.
+    * shadow mode: the legacy result acts; the judge runs concurrently on the
+      same window and only logs whether it agreed.
     """
     if answer_timeout_sec is None:
         answer_timeout_sec = phone.phone_classify_answer_timeout_sec()
+    latch = spoke if spoke is not None else gate_judge.HumanSpeechLatch()
+    recording_anchor_ms: "Callable[[], int | None]" = (
+        judge.recording_anchor_ms if judge is not None else (lambda: None))
     responsive = 0
-    for attempt in range(max(1, attempts)):
+    limit = max(1, attempts)
+    question_extension_used = False
+    attempt = -1
+    while attempt + 1 < limit:
+        attempt += 1
         # Skip utterances that began before THIS question, inside the SAME
         # per-attempt budget. The consent turn shares one FIFO with the identity
         # reader, so a trailing fragment of the identity answer is sitting in it,
@@ -3136,6 +4960,8 @@ async def _classify_phone_answer(
         # would be consent. That is the shared-FIFO defect, and it is why the
         # staleness test lives at the READER: only the reader knows its question.
         text = ""
+        chosen: Any = None
+        heard_ineligible = False
         deadline = time.monotonic() + answer_timeout_sec
         while True:
             remaining = deadline - time.monotonic()
@@ -3150,36 +4976,175 @@ async def _classify_phone_answer(
                 text = ""
                 break
             candidate_text, anchor_ms = _queued_turn(item)
+            question_ms = question_anchor() if question_anchor is not None else None
             if question_anchor is not None and _queued_turn_is_stale(
-                anchor_ms, question_anchor()
+                anchor_ms, question_ms
             ):
+                _log_gate_turn_skip(
+                    "consent_turn_skipped", item, anchor_ms, question_ms)
+                # Review fix: skipped words are still a person (the weak
+                # latch; machine wording clears it), so a candidate whose only
+                # words were skipped is deferred with a goodbye, never hung up
+                # on as "machine".
+                latch.note_skipped(
+                    candidate_text, machine_match=_is_machine_text(candidate_text))
+                continue
+            legacy_grant = classify_answer_text(
+                candidate_text, candidate_spoke=latch.confirmed,
+            ) == phone.CLASSIFY_HUMAN
+            if legacy_grant and not gate_judge.turn_is_grant_evidence(item):
+                # Words with no speech timing cannot be shown to answer THIS
+                # question, so they never become consent. Kept waiting in the
+                # same window, exactly like a stale skip. They are still a
+                # person speaking after the question.
+                heard_ineligible = True
+                latch.note_reply(
+                    candidate_text, machine_match=False,
+                    source=gate_judge.SPOKE_SOURCE_CONSENT,
+                )
+                _log_gate_turn_skip(
+                    "consent_turn_not_grant_evidence", item, anchor_ms, question_ms)
+                continue
+            if (
+                legacy_grant
+                and not (judge is not None and judge.acting)
+                and not _turn_started_after(item, recording_anchor_ms())
+            ):
+                # REVIEW FIX (blocker): the regex acts in legacy and shadow
+                # mode (both are the documented rollbacks), so the informed-
+                # consent rule applies here too, not only in the llm-mode
+                # fallback: a "yes" that began before the recording sentence
+                # (spoken over part A, its commit dropped by the SDK and
+                # recovered by the settle close) is never consent. Listen
+                # briefly for the answer to the question just heard, then
+                # re-ask; the words still mean a person is on the line.
+                heard_ineligible = True
+                latch.note_reply(
+                    candidate_text, machine_match=False,
+                    source=gate_judge.SPOKE_SOURCE_CONSENT,
+                )
+                _log_gate_turn_skip(
+                    "legacy_grant_before_recording_anchor", item, anchor_ms, question_ms)
+                deadline = min(
+                    deadline, time.monotonic() + _PRE_RECORDING_YES_LISTEN_SEC)
                 continue
             text = candidate_text
+            chosen = item
             break
         if isinstance(text, str) and text.strip():
             responsive += 1
-            if consumed is not None:
-                consumed.append(text)
-        decision = classify_answer_text(text)
+        elif heard_ineligible:
+            responsive += 1
+        # Classified against the latch as it stood BEFORE this reply: a reply
+        # is judged machine or not on its own words, then (if it is not) it
+        # sets the latch for everything after it. Only a CONFIRMED latch
+        # silences machine wording; skipped words alone (the weak latch) do not.
+        spoke_before = latch.confirmed
+        legacy_decision = classify_answer_text(text, candidate_spoke=spoke_before)
+        decision = legacy_decision
+        judged_valid = False
+        reask_reason: str | None = None
+        faq_kind: str | None = None
+        evidence_item: Any = chosen
+        if judge is not None and isinstance(text, str) and text.strip():
+            phase = (
+                gate_judge.PHASE_CONSENT if attempt == 0
+                else gate_judge.PHASE_CONSENT_RETRY
+            )
+            line = _gate_bot_line(bot_line)
+            if judge.acting:
+                outcome = await _judge_consent_reply(
+                    judge, phase, line, text=text, chosen=chosen, turns=turns,
+                    question_anchor=question_anchor, budget=budget,
+                    spoke_before=spoke_before,
+                )
+                text = outcome.text
+                decision = outcome.decision
+                judged_valid = outcome.judged_valid
+                reask_reason = outcome.reask_reason
+                faq_kind = outcome.faq_kind
+                evidence_item = outcome.evidence_item
+            elif judge.shadowing:
+                judge.shadow(
+                    phase, line,
+                    _INTENT_FOR_CLASSIFICATION.get(
+                        legacy_decision, gate_judge.INTENT_UNCLEAR),
+                )
+        if isinstance(text, str) and text.strip() and consumed is not None:
+            consumed.append(text)
+        # A valid judge verdict has latched (or, for voicemail, not latched)
+        # in `_GateJudgeWiring.decide`; the legacy readers latch here.
+        if not judged_valid and decision != phone.CLASSIFY_MACHINE:
+            latch.note_reply(
+                text, machine_match=False, source=gate_judge.SPOKE_SOURCE_CONSENT,
+            )
+        if decision == phone.CLASSIFY_HUMAN and on_grant_evidence is not None:
+            try:
+                on_grant_evidence(evidence_item)
+            except Exception:  # noqa: BLE001 — persistence never blocks consent
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_turn_barrier",
+                    error_category="grant_evidence_record_failed",
+                )
         if decision is not None:
             return decision
-        if attempt + 1 < attempts:
+        if (
+            attempt + 1 >= limit
+            and judged_valid
+            and reask_reason == phone.CONSENT_REASK_QUESTION
+            and not question_extension_used
+            and limit < _CONSENT_MAX_ATTEMPTS_WITH_QUESTION
+        ):
+            # A question back is not an answer: it buys ONE more round (at
+            # most two re-asks in all), still inside the budget check below.
+            question_extension_used = True
+            limit += 1
+        if attempt + 1 < limit:
             # THE RE-ASK IS OTHERWISE INVISIBLE. The gate transcript commits
             # exactly two rows — the LAST bot line and the LAST answer — so a
             # first answer that failed to classify, and this re-ask itself,
             # appear nowhere. Without this line there is no way to measure how
             # often a consenting candidate is asked twice. Counts and a fixed
             # category only, never the utterance (PII).
+            if budget is not None and not budget.can_ask("consent_reask"):
+                # T03: no time for another round. A deferral, never "machine":
+                # the budget ran out, which says nothing about who answered.
+                return phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE
+            reason = reask_reason or _consent_reask_reason(text, heard=bool(responsive))
             _log.info(
                 "unknown_event", error_type="phone_consent_reask",
                 error_category="unmatched" if responsive else "no_speech",
+                phase=reason,
             )
-            await say(phone.PHONE_REASK_TEXT)
-    # Fail closed to MACHINE — but make WHY visible. A line that WAS responsive
-    # (the human spoke) yet still defaulted here is the 2026-09-02 signature: a
-    # cooperating candidate whose phrasing missed every classifier branch, which
-    # then tore the room down. Distinguishing it from genuine silence is the
-    # difference between "widen the classifier" and "it really was a machine".
+            answer = (
+                phone.phone_consent_faq_text(faq_kind, role_title=role_title)
+                if reason == phone.CONSENT_REASK_QUESTION and faq_kind else None
+            )
+            if answer:
+                # T05: a fixed answer, then the recording sentence and the
+                # question again. Never a new sentence about being an AI.
+                await say(answer)
+                await say(phone.PHONE_CONSENT_REASK_AFTER_ANSWER_TEXT)
+            else:
+                await say(phone.phone_consent_reask_text(reason))
+    if latch.spoke:
+        # A PERSON SPOKE on this call (here or at the identity turn), so this
+        # is not a voicemail, whatever happened after. RCA: session 32757295
+        # answered "Hello" at identity, went quiet at consent, and was hung up
+        # on in silence as "machine". The gate now speaks the deferral goodbye
+        # and posts `candidate.deferred_pre_disclosure` (uncharged).
+        _log.warn(
+            "unknown_event",
+            error_type="phone_classify_fallback_deferral",
+            error_category=(
+                "responsive_unmatched" if responsive else "no_speech_after_spoke"
+            ),
+            phase=latch.source,
+        )
+        return phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE
+    # Fail closed to MACHINE — only for a line on which NOBODY was heard. A
+    # line that was responsive cannot reach here any more (it set the latch);
+    # the category is kept so the two exits stay distinguishable in the logs.
     # Counts and a fixed category only — never the utterance text (PII).
     _log.warn(
         "unknown_event",
@@ -3930,6 +5895,13 @@ async def _run_native_phone_screening(
     close_room: Callable[[], Awaitable[Any]] | None = None,
     close_room_after_evidence: Callable[[], Awaitable[Any]] | None = None,
     before_terminal: Callable[[], Awaitable[Any]] | None = None,
+    # M013 S01 T07: the call's post-consent revocation window (armed by the
+    # gate on a grant in THIS call). None, unarmed, or a reconnect leg: inert.
+    revocation_window: "_RevocationWindow | None" = None,
+    # M013 S01 T09: the call's end-of-screening Q&A judge (fed every STT
+    # final by the session). None: a private one that only judges committed
+    # turns (and only in llm/shadow mode).
+    qna_close_window: "_QnaCloseWindow | None" = None,
 ) -> phone.PhoneGateResult:
     """Run post-consent screening through LiveKit's native turn lifecycle.
 
@@ -4004,6 +5976,28 @@ async def _run_native_phone_screening(
     closing = ClosingStateMachine()
     qna_rounds = {"value": 0}
     qna_answer_delivery = {"sequence": None, "delivered": False}
+    # M013 S01 T09: the Q&A judge, the filler/go-ahead counter (bounded by
+    # PHONE_QNA_MAX_ROUNDS like the answer rounds), the count of non-question
+    # replies (the second one closes), and the one late question answered
+    # after the goodbye played (`used` caps it at one per call; `closed` once
+    # the teardown is past the point where the room is still open).
+    qna_window = (
+        qna_close_window if qna_close_window is not None
+        else _QnaCloseWindow(first_name="")
+    )
+    qna_fillers = {"value": 0}
+    qna_kind_cache: dict[str, Any] = {
+        "key": None, "kind": None, "judged": False, "verdict": None,
+    }
+    qna_other = {"value": 0}
+    # Review fix: True while the bot's last Q&A line invited a question (the
+    # "any questions?" invite, or "Sure, go ahead."): silence then gets ONE
+    # "are you still there?" before it closes as completed.
+    qna_expects_question = {"value": True, "nudged": False}
+    late_qna: dict[str, Any] = {
+        "used": False, "closed": False, "judging": False, "sequence": None,
+        "done": None, "finished_mono": None,
+    }
     silence_prompted = {"value": False}
     # The bounded in-call callback negotiation. `None` until the candidate first
     # asks for a callback; then a forward-only state machine that CANNOT loop
@@ -4020,6 +6014,30 @@ async def _run_native_phone_screening(
     withdrawal: dict[str, Any] = {
         "pending": False, "reasks": 0, "last_text": "", "last_verdict": None,
         "declines_dismissed": False, "stage": None,
+    }
+    # M013 S01 T07: the post-consent revocation window. Open only on the leg
+    # where consent was granted in this call (the gate posted
+    # `disclosure.delivered` here; a `consent.resumed` leg never arms it), and
+    # only until the first answer to the first question is accepted.
+    # `confirm_pending`: PHONE_REVOCATION_BUSY_CONFIRM_TEXT is owed an answer;
+    # `busy_text`: the words the busy verdict rests on (handed to the callback
+    # flow on a yes); `withdrawal_latched`: the window latched the existing
+    # withdrawal confirmation on a judged decline/opt-out.
+    window = revocation_window
+    if window is not None:
+        gate_events = list(getattr(result, "events", None) or [])
+        if not window.open:
+            window = None
+        elif (
+            phone.CONSENT_RESUMED_EVENT in gate_events
+            or "disclosure.delivered" not in gate_events
+        ):
+            window.close("not_consent_leg")
+            window = None
+    window_start_cursor = cursor
+    revocation: dict[str, Any] = {
+        "confirm_pending": False, "busy_text": "", "withdrawal_latched": False,
+        "q1_spoken": False,
     }
     # The coordinator owns pending evidence; durable effects happen only from
     # coordinator-bound tools after LiveKit authorizes the scheduled reply.
@@ -4482,6 +6500,22 @@ async def _run_native_phone_screening(
                     task.cancel()
             await asyncio.gather(*waiters, return_exceptions=True)
 
+    def _qna_silence_closes() -> bool:
+        """T09: silence in the "any questions?" phase completes the screening.
+
+        Only while nothing else owns the call: no planned question owed, no
+        callback negotiation, no withdrawal confirmation, no armed terminal.
+        """
+        return (
+            closing.state is ClosingState.CANDIDATE_QNA
+            and state.question_at(cursor) is None
+            and callback_flow["state"] is None
+            and not withdrawal["pending"]
+            and pending_terminal_reason.get("value") is None
+            and not candidate_end_requested.is_set()
+            and not finished.is_set()
+        )
+
     async def native_silence_loop() -> None:
         """Use LiveKit state/activity as the only phone inactivity authority."""
         while not finished.is_set():
@@ -4521,6 +6555,41 @@ async def _run_native_phone_screening(
             # Consume the away latch so a still-set flag cannot re-trigger the
             # next pass's first wait without a fresh away transition.
             away_event.clear()
+            if (
+                _qna_silence_closes()
+                and qna_expects_question["value"]
+                and not qna_expects_question["nudged"]
+            ):
+                # Review fix: the candidate was just invited to ask (or told
+                # "go ahead" after saying they had a question): one nudge
+                # first, then the next silent window closes as completed.
+                qna_expects_question["nudged"] = True
+                _log.info(
+                    "unknown_event", error_type="phone_silence",
+                    error_category="qna_silence_nudge",
+                )
+                nudge = session.say(
+                    phone.PHONE_SILENCE_PROMPT_TEXT, allow_interruptions=True,
+                )
+                wait = getattr(nudge, "wait_for_playout", None)
+                if callable(wait):
+                    await wait()
+                continue
+            if _qna_silence_closes():
+                # M013 S01 T09: every planned question is answered and the
+                # candidate has gone quiet in the "any questions?" phase
+                # (after a decline the bot missed, an answer, or the invite):
+                # that is a finished screening, not a no-answer abort. The
+                # teardown speaks the fixed closing goodbye (nothing armed
+                # played it) and posts `assessment.completed`.
+                _log.info(
+                    "unknown_event", error_type="phone_silence",
+                    error_category="qna_silence_close",
+                )
+                closing.candidate_questions_handled()
+                terminal_reason.setdefault("reason", "completed")
+                finished.set()
+                return
             silence_prompted["value"] = True
             _log.info(
                 "unknown_event", error_type="phone_silence",
@@ -5237,6 +7306,384 @@ async def _run_native_phone_screening(
         _withdrawal_log("decline_confirm_asked")
         return "reply"
 
+    # ── M013 S01 T07: the post-consent revocation window ─────────────────
+    def _window_note(category: str) -> None:
+        if window is not None:
+            window.note(category)
+
+    def _window_active() -> bool:
+        """The window is open and the first question is still the owed one.
+        The cursor moving on (the first answer accepted) closes it."""
+        if window is None or not window.open:
+            return False
+        if cursor != window_start_cursor:
+            window.close("answered")
+            return False
+        return state.question_at(cursor) is not None
+
+    def _latch_window_withdrawal(basis: str) -> bool:
+        """A judged decline/opt-out: latch the EXISTING withdrawal
+        confirmation (it already confirms before anything ends). Stage
+        `judged` so a later fragment of the same words is the window's to
+        swallow, not a latch release. False under the C7 kill switch."""
+        if not phone.phone_midcall_opt_out_enabled():
+            return False
+        callback_flow["state"] = None
+        withdrawal["pending"] = True
+        withdrawal["stage"] = "judged"
+        withdrawal["reasks"] = 0
+        withdrawal["last_verdict"] = None
+        withdrawal["last_text"] = str(basis or "")[-2000:]
+        revocation["withdrawal_latched"] = True
+        return True
+
+    def _continue_owed_question(turn_ctx: Any) -> None:
+        """The candidate does not want a callback: carry on with the first
+        question (asked again if it was already heard)."""
+        question = state.question_at(cursor)
+        setattr(agent, "_turn_policy", "clarification")
+        if question is None:
+            add_turn_instruction(
+                turn_ctx,
+                "The candidate is happy to continue. Briefly thank them and "
+                "carry on. Do not say goodbye.",
+            )
+            return
+        set_question_reply_snapshot(question)
+        verb = "ask the SAME question again" if revocation["q1_spoken"] else "ask this question"
+        control = (
+            "The candidate is happy to continue now. Briefly acknowledge, then "
+            f"{verb} in your own natural words and wait. Do not advance to a "
+            "new topic and do not mention a callback again."
+        )
+        authorize_generated_reply(question.spoken_text, control_text=control)
+        add_turn_instruction(turn_ctx, control + " The question: " + question.spoken_text)
+        revocation["q1_spoken"] = True
+        if window is not None:
+            window.set_bot_line(question.spoken_text)
+
+    async def _revocation_turn(
+        turn_ctx: Any, text: Any, *, continuation: bool,
+    ) -> str | None:
+        """Route one committed turn through the revocation window.
+
+        ``"reply"``: consumed, a reply is owed (the caller returns);
+        ``"swallow"``: a fragment of a turn already answered, or the late
+        commit of a final the pre-loop acted on (StopResponse); ``"answer"``:
+        the judge read it as an answer, so the regex callback route must not
+        end the screening on it; None: fall through untouched.
+        """
+        if window is not None and window.take_duplicate(text):
+            return "swallow"
+        if revocation["confirm_pending"] or revocation["withdrawal_latched"]:
+            if continuation:
+                # A later fragment of the turn the confirmation answers: the
+                # confirmation already in flight stands.
+                if revocation["confirm_pending"]:
+                    fragment = str(text or "").strip()
+                    revocation["busy_text"] = (
+                        str(revocation["busy_text"]) + " " + fragment
+                    ).strip()[-2000:]
+                _window_note("fragment_swallowed")
+                return "swallow"
+        if revocation["withdrawal_latched"]:
+            # The reply to the withdrawal confirmation: the existing path reads it.
+            revocation["withdrawal_latched"] = False
+            return None
+        if revocation["confirm_pending"]:
+            revocation["confirm_pending"] = False
+            if phone.classify_midcall_withdrawal(text) is not None:
+                # A decline beats a callback: the existing withdrawal path decides.
+                _window_note("busy_confirm_withdrawal")
+                return None
+            if phone.classify_revocation_busy_confirm_reply(text) == phone.REVOCATION_CONFIRM_CALLBACK:
+                _window_note("busy_confirmed_callback")
+                if window is not None:
+                    window.close("callback")
+                _log.info(
+                    "unknown_event", error_type="phone_callback_heard",
+                    error_category="revocation_window", schema="screening",
+                )
+                flow = phone.CallbackFlowState()
+                callback_flow["state"] = flow
+                decision = await phone.run_callback_turn(
+                    flow, events, attempt_id,
+                    (str(revocation["busy_text"]) + " " + str(text or "")).strip(),
+                    datetime.now(timezone.utc),
+                )
+                _apply_callback_decision(turn_ctx, decision)
+                return "reply"
+            _window_note("busy_declined_continue")
+            _continue_owed_question(turn_ctx)
+            return "reply"
+        if (
+            not _window_active()
+            or candidate_end_requested.is_set()
+            or pending_terminal_reason.get("value") is not None
+            or callback_flow["state"] is not None
+            or withdrawal["pending"]
+            or phone.is_explicit_end_call_request(text)
+        ):
+            return None
+        route, decision, basis = await window.read_turn(text)
+        if route == "duplicate":
+            return "swallow"
+        if route == "answer":
+            _window_note("answer")
+            return "answer"
+        if route != "revocation" or decision is None:
+            if route == "unavailable":
+                _window_note("judge_unavailable")
+            return None
+        if phone.classify_midcall_withdrawal(text) is not None:
+            # The existing detector already reads this turn as a withdrawal
+            # or an opt-out: it decides, exactly as it does today.
+            _window_note(f"{decision.intent}_left_to_detector")
+            return None
+        if continuation:
+            _interrupt_stale_reply()
+        if decision.intent == gate_judge.INTENT_NOT_NOW_BUSY:
+            revocation["confirm_pending"] = True
+            revocation["busy_text"] = basis
+            _speak_withdrawal_line(
+                turn_ctx, phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT,
+                phase="revocation_confirm",
+            )
+            _window_note("busy_confirm_asked")
+            return "reply"
+        if not _latch_window_withdrawal(basis):
+            _window_note(f"{decision.intent}_kill_switch_off")
+            return None
+        _speak_withdrawal_line(
+            turn_ctx, phone.PHONE_WITHDRAWAL_CONFIRM_TEXT, phase="withdrawal_confirm",
+        )
+        _withdrawal_log("decline_confirm_asked")
+        _window_note(f"{decision.intent}_confirm_asked")
+        return "reply"
+
+    async def _revocation_preloop() -> str | None:
+        """Before the first question: act on a final heard since the grant
+        (typically spoken over the role line, whose turn the SDK dropped).
+        ``"spoken"`` / ``"unheard"`` when a confirmation replaced the first
+        question; None to ask it as usual."""
+        if not _window_active():
+            return None
+        found = await window.read_preloop()
+        if found is None or close_event.is_set():
+            return None
+        decision, basis = found
+        if decision.intent == gate_judge.INTENT_NOT_NOW_BUSY:
+            revocation["confirm_pending"] = True
+            revocation["busy_text"] = basis
+            _window_note("busy_confirm_asked_preloop")
+            line = phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT
+        elif _latch_window_withdrawal(basis):
+            _withdrawal_log("decline_confirm_asked")
+            _window_note(f"{decision.intent}_confirm_asked_preloop")
+            line = phone.PHONE_WITHDRAWAL_CONFIRM_TEXT
+        else:
+            _window_note(f"{decision.intent}_kill_switch_off")
+            return None
+        heard = await _speak_preloop(line, "preloop_revocation_confirm")
+        return "spoken" if heard else "unheard"
+
+    # ── M013 S01 T09: the end-of-screening Q&A ─────────────────────────────
+    _QNA_DONE_CLOSE_INSTRUCTION = (
+        "The candidate has no more questions. Thank them warmly and "
+        "personally, say the team will review and be in touch soon, "
+        "wish them well, and say goodbye. Do not ask another question."
+    )
+
+    def _qna_note(category: str, decided_by: str) -> None:
+        """One `phone_qna_close` line: the routing category, never the text.
+
+        `phase` (allowlisted; a `source=` key was silently dropped by the
+        structured logger) is who decided this turn, passed explicitly by the
+        caller (round-2 review fix: it used to read "judge" whenever the
+        window was acting, so a timed-out judge's fallback logged as judge):
+        `judge` (a valid `qna_close` verdict), `fallback` (the fallback
+        grammar: legacy/shadow mode or the judge unavailable) or `rule` (a
+        fixed rule that never reaches a reader: the bare-yes go-ahead and
+        the filler cap).
+        """
+        _log.info(
+            "unknown_event", error_type="phone_qna_close", error_category=category,
+            phase=decided_by,
+        )
+
+    def _qna_decided_by() -> str:
+        """`judge` when the last `_qna_kind` was a judge verdict, else `fallback`."""
+        return "judge" if _qna_kind_judged() else "fallback"
+
+    async def _qna_kind(text: str, route: str | None, *, after_close: bool = False) -> str:
+        """Decline, question or other, for one Q&A turn (T09).
+
+        A valid `qna_close` judge verdict decides (llm mode); otherwise the
+        fallback grammar: the old done/dismissal readers plus
+        `phone_qna_decline` for a decline, the question route or a directed
+        question for a question.
+
+        ``after_close`` (round-5 review fix): called by
+        `_qna_question_after_close` only for the verdict. The question-shape
+        overrides below are CANDIDATE_QNA answer routing, so there the plain
+        `judged_<verdict>` line is logged instead of a `*_question_shape`
+        override that never happened (the reopen logs its own decision).
+        """
+        key = (native_turn_seq[0], text)
+        if qna_kind_cache.get("key") == key:
+            # Read once per turn: a reopened pending close reuses the verdict.
+            return str(qna_kind_cache["kind"])
+        kind, _ = await qna_window.read_qna(text)
+        judged = kind in (QNA_KIND_DECLINE, QNA_KIND_QUESTION, QNA_KIND_OTHER)
+        verdict = kind if judged else None
+        if judged:
+            override = None
+            if kind == QNA_KIND_OTHER and phone.phone_qna_question_directed(text):
+                # Only in the safe direction: a reply shaped as a question to
+                # the interviewer ("…?", "what does the role pay") is answered
+                # even if the judge heard none. Nothing here can close the call.
+                override = "judged_other_question_shape"
+            elif kind == QNA_KIND_DECLINE and phone.phone_qna_carries_question(text):
+                # Round-2 review fix, the same safety net for a judged
+                # DECLINE: "Not really, but what is the salary" (no STT '?')
+                # is answered, never closed on. Only ever turns a close into
+                # an answer.
+                override = "judged_decline_question_shape"
+            _qna_note(
+                override if override is not None and not after_close
+                else f"judged_{kind}",
+                "judge",
+            )
+            if override is not None:
+                kind = QNA_KIND_QUESTION
+        else:
+            if kind == "unavailable":
+                _qna_note("judge_unavailable", "fallback")
+            if (
+                phone.phone_qna_done(text)
+                or phone.phone_qna_dismissal(text)
+                or phone.phone_qna_decline(text)
+            ):
+                kind = QNA_KIND_DECLINE
+            elif (route == "candidate_question"
+                    or phone.phone_qna_question_directed(text)):
+                kind = QNA_KIND_QUESTION
+            else:
+                kind = QNA_KIND_OTHER
+        qna_kind_cache.update(key=key, kind=kind, judged=judged, verdict=verdict)
+        return kind
+
+    def _qna_kind_judged() -> bool:
+        """Was the last `_qna_kind` a judge verdict (not the fallback grammar)?"""
+        return bool(qna_kind_cache.get("judged"))
+
+    async def _qna_question_after_close(text: str, route: str | None) -> bool:
+        """After the goodbye was authored or played: does this turn ask something?
+
+        Round-4 review fix (major): reopening a closed screening needs the
+        STRICT reader, never the broad `phone_qna_question_directed` the
+        fallback grammar answers with in CANDIDATE_QNA. That one reads a bare
+        "will"/"do" opener as a question, so in legacy mode and on every judge
+        timeout/error "Okay ma'am, will do" over a pending goodbye interrupted
+        it and reopened Q&A (origin/main reopened only on the question route).
+        A question is: the question route, the judge's OWN `question` verdict,
+        or `phone.phone_qna_asks_after_close` (a request, a non-negated "one
+        more question", or a subject-inverted / wh clause). The judge is asked
+        at most once per turn (`_qna_kind` caches it).
+
+        Round-5 review fix: a bare '?' no longer reopens on its own. With a
+        valid judge verdict it never overrides a judged OTHER/DECLINE (the
+        judge decides), and in fallback it does not count on a greeting /
+        courtesy turn ("Hello?", "Thank you?", "Bye?"). When the reopen rests
+        on the question shape, the cached kind becomes QUESTION so the
+        reopened Q&A answers it rather than acknowledging a judged OTHER.
+        """
+        if route == "candidate_question":
+            return True
+        await _qna_kind(text, route, after_close=True)
+        judged = _qna_kind_judged()
+        if judged and qna_kind_cache.get("verdict") == QNA_KIND_QUESTION:
+            return True
+        if not phone.phone_qna_asks_after_close(text, judged=judged):
+            return False
+        _qna_note("after_close_question_shape", "judge" if judged else "fallback")
+        qna_kind_cache["kind"] = QNA_KIND_QUESTION
+        return True
+
+    def _qna_close(turn_ctx: Any, close_instruction: str) -> None:
+        """Author the closing goodbye and arm the `completed` terminal."""
+        closing.candidate_questions_handled()
+        set_reply_snapshot(phone.PHONE_ASSESSMENT_CLOSING_TEXT, phase="closing")
+        setattr(agent, "_turn_policy", "closing")
+        authorize_generated_reply(
+            "Close the completed screening without making promises or asking another question.",
+            allow_closing=True,
+            control_text=close_instruction,
+        )
+        arm_terminal_reply("completed")
+        add_turn_instruction(turn_ctx, close_instruction)
+
+    def _qna_filler_cap_reached() -> bool:
+        """Count one filler or go-ahead; True once PHONE_QNA_MAX_ROUNDS is hit."""
+        qna_fillers["value"] += 1
+        return qna_fillers["value"] >= phone.PHONE_QNA_MAX_ROUNDS
+
+    async def _late_qna_question(turn_ctx: Any, text: str) -> bool:
+        """T09: a question asked after the goodbye played, room still open.
+
+        One short answer plus the goodbye again, once per call. Anything else
+        (a thank-you, a bye, a second late question) stays terminal.
+        """
+        if (
+            late_qna["used"] or late_qna["closed"] or late_qna["judging"]
+            or terminal_reason.get("reason") != "completed"
+            or closing.state is not ClosingState.CLOSING_PLAYED
+            or turn_ctx is None
+        ):
+            return False
+        # Hold the teardown while this turn is judged: it waits on `done`
+        # (bounded) before it closes the late window and deletes the room.
+        gate = asyncio.Event()
+        late_qna["done"] = gate
+        late_qna["judging"] = True
+        try:
+            # Round-4 review fix: the same strict reader as the pending
+            # reopen, so "Okay ma'am, will do" after the goodbye is never
+            # answered as a question in legacy mode or with the judge down.
+            asks = await _qna_question_after_close(
+                text, phone.candidate_turn_route(text))
+        except Exception:  # noqa: BLE001 — never answer on a failed read
+            asks = False
+        finally:
+            late_qna["judging"] = False
+        if not asks or late_qna["closed"]:
+            gate.set()
+            late_qna["done"] = None
+            return False
+        late_qna["used"] = True
+        late_qna["sequence"] = speech_sequence[0] + 1
+        instruction = (
+            "After your goodbye the candidate asked one more question. Answer it "
+            "in one or two short sentences like a warm human recruiter; for role "
+            "or company facts use only verified role context, and if you don't "
+            "have the detail, say plainly that the hiring team can answer it. "
+            "Never invent specifics. Then thank them and say goodbye again. Do "
+            "not ask any question."
+        )
+        set_reply_snapshot(phone.PHONE_ASSESSMENT_CLOSING_TEXT, phase="closing")
+        setattr(agent, "_turn_policy", "closing")
+        authorize_generated_reply(
+            "Answer the late question briefly, then say goodbye again.",
+            allow_closing=True,
+            control_text=instruction,
+        )
+        add_turn_instruction(turn_ctx, instruction)
+        _log.info(
+            "unknown_event", error_type="phone_qna_late_question",
+            error_category="late_question_answered",
+        )
+        return True
+
     async def on_native_turn(
         text: str, message: Any = None, turn_ctx: Any = None,
     ) -> None:
@@ -5353,6 +7800,10 @@ async def _run_native_phone_screening(
         compensation_slots.update(phone.phone_compensation_slots(text))
         authorize_generated_reply(None)
         if finished.is_set():
+            # M013 S01 T09: one late question after the goodbye played is
+            # answered (with the goodbye again) while the room is still open.
+            if await _late_qna_question(turn_ctx, text):
+                return
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
         # Finding E (Codex review §7): grade the ONE candidate turn that
@@ -5388,17 +7839,6 @@ async def _run_native_phone_screening(
         # beats a callback, and an opt-out beats an end-call. Active only while
         # a planned question is owed (or a confirmation is), never once a
         # terminal reply is armed, and not at all under PHONE_MIDCALL_OPT_OUT=off.
-        active_flow_for_withdrawal = callback_flow["state"]
-        withdrawal_active = (
-            phone.phone_midcall_opt_out_enabled()
-            and not candidate_end_requested.is_set()
-            and pending_terminal_reason.get("value") is None
-            and not (
-                active_flow_for_withdrawal is not None
-                and active_flow_for_withdrawal.phase == phone.CALLBACK_PHASE_DONE
-            )
-            and (withdrawal["pending"] or state.question_at(cursor) is not None)
-        )
         withdrawal_continuation = bool(
             (
                 # The coalescer's own structural signal (~the split-final
@@ -5409,6 +7849,38 @@ async def _run_native_phone_screening(
                 and not prior_handle_interrupted
             )
             or _native_turn_predates_question(message, latest_assistant_anchor[0])
+        )
+        # M013 S01 T07: THE POST-CONSENT REVOCATION WINDOW (consent leg only,
+        # until the first answer is accepted). The judge's `post_consent`
+        # verdict, started on the STT final, is read here BEFORE the C7
+        # withdrawal block: a judged busy asks one confirm question first; a
+        # judged decline/opt-out latches C7's own confirmation; a judged
+        # answer keeps the regex callback route from ending the screening.
+        # Inert in legacy mode and when the judge is unavailable.
+        revocation_route = await _revocation_turn(
+            turn_ctx, text, continuation=withdrawal_continuation,
+        )
+        if revocation_route == "swallow" or (
+            revocation_route == "reply" and withdrawal_continuation
+        ):
+            # A consumed continuation fragment (or a duplicate commit) is not
+            # a new LOGICAL turn.
+            _uncount_continuation_fragment()
+        if revocation_route == "swallow":
+            from livekit.agents import StopResponse  # noqa: PLC0415
+            raise StopResponse()
+        if revocation_route == "reply":
+            return
+        active_flow_for_withdrawal = callback_flow["state"]
+        withdrawal_active = (
+            phone.phone_midcall_opt_out_enabled()
+            and not candidate_end_requested.is_set()
+            and pending_terminal_reason.get("value") is None
+            and not (
+                active_flow_for_withdrawal is not None
+                and active_flow_for_withdrawal.phase == phone.CALLBACK_PHASE_DONE
+            )
+            and (withdrawal["pending"] or state.question_at(cursor) is not None)
         )
         withdrawal_route = _midcall_withdrawal_turn(
             turn_ctx, text, continuation=withdrawal_continuation,
@@ -5496,6 +7968,12 @@ async def _run_native_phone_screening(
         # real question then arrived under closing/recovery and was never answered.
         patience_on = phone.phone_patience_gate_enabled()
         route = phone.candidate_turn_route(text)
+        if revocation_route == "answer" and route == "callback_deferral":
+            # M013 S01 T07: the judge read this reply to the first question as
+            # an answer ("I'm busy with a project at work"); a valid verdict is
+            # not overridden by the regex, so it must not end the screening.
+            _window_note("callback_route_overruled")
+            route = None
         substance = phone.phone_turn_substance(text) if patience_on else None
         qna_ack = (
             closing.state is ClosingState.CANDIDATE_QNA
@@ -5548,6 +8026,16 @@ async def _run_native_phone_screening(
             and not prior_interrupted
             and (route == "hesitation" or substance == phone.PHONE_SUBSTANCE_HESITATION)
         ):
+            if (
+                closing.state is ClosingState.CANDIDATE_QNA
+                and question is None
+                and _qna_filler_cap_reached()
+            ):
+                # M013 S01 T09: a stream of "Okay"s in the Q&A phase is
+                # bounded too; at the cap the screening closes warmly.
+                _qna_note("filler_cap_close", "rule")
+                _qna_close(turn_ctx, _QNA_DONE_CLOSE_INSTRUCTION)
+                return
             setattr(agent, "_turn_policy", "patience_suppressed")
             _log.info(
                 "unknown_event", error_type="phone_turn_completion",
@@ -5560,10 +8048,30 @@ async def _run_native_phone_screening(
             set_reply_snapshot("Take your time.", phase="patience")
             add_turn_instruction(turn_ctx, phone.PHONE_PATIENCE_ENCOURAGEMENT_TEXT)
             return
-        if closing.state is ClosingState.CLOSING_PENDING and route == "candidate_question":
+        # Round-3 review fix: no separate `phone_qna_question_directed`
+        # short-cut here. `_qna_kind` already applies it (the fallback
+        # grammar, and a judged `other`), and in llm mode a judged decline is
+        # overridden only by the stricter `phone_qna_carries_question`; the
+        # short-cut skipped the judge and reopened Q&A (interrupting the
+        # goodbye) on sign-offs such as "Okay ma'am, will do".
+        # Round-4 review fix: the reopen uses the strict reader in every mode
+        # (`_qna_question_after_close`), not `_qna_kind`'s fallback grammar,
+        # so legacy mode and a judge timeout/error cannot reopen on it either.
+        late_question = (
+            closing.state is ClosingState.CLOSING_PENDING
+            and await _qna_question_after_close(text, route)
+        )
+        # Round-2 review fix: `_qna_kind` may await the judge (llm mode), and
+        # the goodbye's delivery callback can move the state on meanwhile
+        # (`closing_delivered()`); re-check it right before reopening, or
+        # `reopen_qna` raises. A goodbye that already played falls through to
+        # the terminal handling below.
+        if late_question and closing.state is ClosingState.CLOSING_PENDING:
             # A genuine late question outranks an authored-but-unplayed close.
             # Cancel the exact handle and terminal correlation, reopen Q&A, and
             # let the ordinary bounded Q&A branch below answer this same turn.
+            # M013 S01 T09: any judged question or directed question cancels it
+            # ("No ma'am, what is the stipend?"), not only the question route.
             stale_handle = reply_handle[0]
             interrupt = getattr(stale_handle, "interrupt", None)
             if callable(interrupt):
@@ -5574,6 +8082,19 @@ async def _run_native_phone_screening(
             _log.info(
                 "unknown_event", error_type="phone_qna_terminal_interlock",
                 error_category="pending_close_cancelled",
+            )
+        elif late_question and closing.state is ClosingState.CLOSING_PLAYED:
+            # Round-3 review fix (nit): the goodbye finished playing while
+            # this question was being judged. Hand it to the late-question
+            # path (one short answer plus the goodbye again, once per call;
+            # the cached `_qna_kind` means no second judge call), exactly as
+            # if it had arrived a moment later. If that path declines (already
+            # used, or the terminal not yet `completed`), the drop is logged.
+            if await _late_qna_question(turn_ctx, text):
+                return
+            _log.info(
+                "unknown_event", error_type="phone_qna_terminal_interlock",
+                error_category="late_question_after_goodbye_dropped",
             )
         if closing.state in {ClosingState.CLOSING_PENDING, ClosingState.CLOSING_PLAYED}:
             # Callback intent was handled above. Every other utterance after the
@@ -5608,7 +8129,28 @@ async def _run_native_phone_screening(
 
             # Invite once on entry. Acknowledgement after an answer closes;
             # unfinished thoughts get space, never another invitation.
+            #
+            # M013 S01 T09: a bare "Yes" / "Yeah" / "Right" to the invite means
+            # "I have a question": it gets the spoken go-ahead instead of the
+            # old silent hold. Fillers keep the silent hold. Both count toward
+            # PHONE_QNA_MAX_ROUNDS (their own counter), so neither can hold the
+            # phase open forever.
+            if not qna_ack and phone.phone_qna_bare_yes(text):
+                if _qna_filler_cap_reached():
+                    _qna_note("filler_cap_close", "rule")
+                    _qna_close(turn_ctx, _QNA_DONE_CLOSE_INSTRUCTION)
+                    return
+                _qna_note("go_ahead", "rule")
+                qna_expects_question.update(value=True, nudged=False)
+                _speak_withdrawal_line(
+                    turn_ctx, phone.PHONE_QNA_GO_AHEAD_TEXT, phase="candidate_qna",
+                )
+                return
             if phone.phone_qna_incomplete(text) and not qna_ack:
+                if _qna_filler_cap_reached():
+                    _qna_note("filler_cap_close", "rule")
+                    _qna_close(turn_ctx, _QNA_DONE_CLOSE_INSTRUCTION)
+                    return
                 if prior_interrupted:
                     set_reply_snapshot("Take your time.", phase="candidate_qna")
                     setattr(agent, "_turn_policy", "clarification")
@@ -5626,11 +8168,52 @@ async def _run_native_phone_screening(
             # closed on any turn that also carries a question, so a genuine late
             # question is never swallowed. Treated exactly like `phone_qna_done`
             # (close warmly), so no new terminal path is introduced.
-            if phone.phone_qna_done(text) or phone.phone_qna_dismissal(text) or qna_ack:
+            #
+            # M013 S01 T09: decline vs question vs anything else is now the
+            # `qna_close` judge's call (llm mode); the fallback grammar adds the
+            # polite declines the live call missed ("No ma'am, thank you so
+            # much."). A reply that is neither a decline nor a question is
+            # never sent down the "answer their question" path: the first gets
+            # a short acknowledgement, the second closes (answering it first).
+            qna_kind = QNA_KIND_DECLINE if qna_ack else await _qna_kind(text, route)
+            # A decline, a remark or a question was heard: silence after the
+            # reply to it closes as completed (no nudge).
+            qna_expects_question["value"] = False
+            if qna_kind == QNA_KIND_OTHER and not _qna_kind_judged():
+                # REVIEW FIX: the fallback grammar (legacy and shadow mode,
+                # or a judge that was unavailable) cannot tell an unpunctuated
+                # question ("tell me about the work timings", "what is the
+                # stipend") from a remark, so it never decides "not a
+                # question": every non-decline turn gets the grounded answer,
+                # exactly as before T09, and it never closes the call. Only a
+                # judge verdict may route a turn to the acknowledge/close path.
+                _qna_note("fallback_other_answered", "fallback")
+                qna_kind = QNA_KIND_QUESTION
+            if qna_kind == QNA_KIND_DECLINE:
+                close_instruction = _QNA_DONE_CLOSE_INSTRUCTION
+            elif qna_kind == QNA_KIND_OTHER and qna_other["value"] < 1:
+                qna_other["value"] += 1
+                _qna_note("non_question_acknowledged", _qna_decided_by())
+                qna_answer_delivery.update(sequence=speech_sequence[0] + 1, delivered=False)
+                set_reply_snapshot("Understood.", phase="candidate_qna")
+                setattr(agent, "_turn_policy", "clarification")
+                add_turn_instruction(
+                    turn_ctx,
+                    "The candidate's reply is not a question for you, so there is "
+                    "nothing to answer. Acknowledge it warmly in a few words. If it "
+                    "sounds like they started to ask something, invite them to go "
+                    "ahead. Do not answer a question nobody asked, do not invent "
+                    "details, and do not say goodbye yet.",
+                )
+                return
+            elif qna_kind == QNA_KIND_OTHER:
+                _qna_note("non_question_close", _qna_decided_by())
                 close_instruction = (
-                    "The candidate has no more questions. Thank them warmly and "
-                    "personally, say the team will review and be in touch soon, "
-                    "wish them well, and say goodbye. Do not ask another question."
+                    "The candidate has nothing more to ask. If what they just said "
+                    "needs a reply, respond to it briefly in one short sentence "
+                    "without inventing details; then thank them warmly for their "
+                    "time, say the team will review and be in touch soon, and say "
+                    "goodbye. Do not ask another question."
                 )
             else:
                 # F-P0c (call #2 RCA, 2026-09-07): count Q&A rounds per
@@ -5686,7 +8269,7 @@ async def _run_native_phone_screening(
                 # (`candidate_question`) rather than inventing a detector. A
                 # non-question that still landed here (e.g. a "Nope" that
                 # `phone_qna_done` failed to catch) gets a neutral ack instead.
-                turn_is_question = route == "candidate_question"
+                turn_is_question = route == "candidate_question" or qna_kind == QNA_KIND_QUESTION
                 if qna_rounds["value"] < phone.PHONE_QNA_MAX_ROUNDS:
                     qna_answer_delivery.update(sequence=speech_sequence[0] + 1, delivered=False)
                     set_reply_snapshot(
@@ -5710,16 +8293,7 @@ async def _run_native_phone_screening(
                     "ask another question and do not add unsupported claims."
                 )
 
-            closing.candidate_questions_handled()
-            set_reply_snapshot(phone.PHONE_ASSESSMENT_CLOSING_TEXT, phase="closing")
-            setattr(agent, "_turn_policy", "closing")
-            authorize_generated_reply(
-                "Close the completed screening without making promises or asking another question.",
-                allow_closing=True,
-                control_text=close_instruction,
-            )
-            arm_terminal_reply("completed")
-            add_turn_instruction(turn_ctx, close_instruction)
+            _qna_close(turn_ctx, close_instruction)
             return
         if silence_prompted["value"]:
             silence_prompted["value"] = False
@@ -6158,11 +8732,11 @@ async def _run_native_phone_screening(
                     interrupted_reask_counts[question.key] = interrupted_seen + 1
                     prior_turn_interrupted["value"] = False
                     setattr(agent, "_turn_policy", "interrupted_reask")
-                    add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
+                    add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance. They have not answered it yet, so do not thank them or react as if they had.")
                     set_question_reply_snapshot(question, text)
                     authorize_generated_reply(
                         question.spoken_text,
-                        control_text="The previous question was interrupted. Re-ask the same topic naturally and wait; do not advance.",
+                        control_text="The previous question was interrupted. Re-ask the same topic naturally and wait; do not advance. They have not answered it yet, so do not thank them.",
                     )
                     _log.info(
                         "unknown_event", error_type="phone_interrupted_recovery",
@@ -6196,7 +8770,7 @@ async def _run_native_phone_screening(
                 # first-audio watchdog via `_on_reply_expected()` after this
                 # normal return, so no explicit arm is added here.)
                 prior_turn_interrupted["value"] = False
-                add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
+                add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance. They have not answered it yet, so do not thank them or react as if they had.")
                 set_reply_snapshot(
                     phone.PHONE_POST_INTERRUPT_ACK_TEXT, phase="post_interrupt_ack",
                 )
@@ -7104,6 +9678,9 @@ async def _run_native_phone_screening(
             if covered_key not in completed:
                 completed.append(covered_key)
         cursor = outcome.cursor
+        # M013 S01 T07: the first accepted answer closes the revocation window.
+        if window is not None and window.open:
+            window.close("answered")
         # R6 (2026-09-06): clearing a pending reanchor for the key we just
         # advanced past is where an identity-shadowed reanchor (see the reanchor
         # gate ~3648) is silently DROPPED — the cursor moved on before the
@@ -7119,6 +9696,10 @@ async def _run_native_phone_screening(
             if callable(getattr(events, "record_probe", None)):
                 closing.plan_completed()
                 closing.wind_down_delivered()
+                # M013 S01 T09: from the "any questions?" invite on, every
+                # final is judged with phase `qna_close` (llm/shadow only).
+                qna_window.bind_bot_line(lambda: latest_assistant[0])
+                qna_window.arm()
                 set_reply_snapshot(
                     "Thank you. Do you have any questions about the role, team, company, or process?",
                     objective="Ask whether the candidate has questions about the role, team, company, or process.",
@@ -7829,6 +10410,13 @@ async def _run_native_phone_screening(
         if (delivered_seq is not None
                 and delivered_seq == qna_answer_delivery["sequence"]):
             qna_answer_delivery["delivered"] = not interrupted
+        # T09: the late answer (and its second goodbye) has stopped playing,
+        # cleanly or not: the teardown may now take the room down.
+        late_done = late_qna.get("done")
+        if (late_done is not None and not late_done.is_set() and late_qna["used"]
+                and (delivered_seq is None or delivered_seq == late_qna.get("sequence"))):
+            late_qna["finished_mono"] = time.monotonic()
+            late_done.set()
         reason = pending_terminal_reason.get("value")
         expected_seq = pending_terminal_speech_seq.get("value")
         conflict_seq = conflict_delivery.get("sequence")
@@ -8224,12 +10812,40 @@ async def _run_native_phone_screening(
     # phone-e5f260c9, agent.py:7162). Now a line that cannot be heard ends the
     # pre-loop as a DISCONNECT and falls through to that try/finally. A
     # non-marker RuntimeError still propagates, unchanged.
-    async def _speak_preloop(text: str, category: str) -> bool:
-        """Speak one pre-loop line. True only if it played with the leg up."""
+    async def _speak_preloop(
+        text: str, category: str, frames: list[Any] | None = None,
+    ) -> bool:
+        """Speak one pre-loop line. True only if it played with the leg up.
+
+        T08b: ``frames`` is pre-rendered audio for exactly ``text``; it plays
+        with no synthesis latency. If the SDK refuses it at ``say`` (nothing
+        was queued), the line is synthesised on demand instead.
+        """
         if close_event.is_set():
             return False
         try:
-            speech = session.say(text, allow_interruptions=True)
+            speech = None
+            if frames:
+                prerendered = list(frames)
+
+                async def _frames() -> Any:
+                    for frame in prerendered:
+                        yield frame
+
+                try:
+                    speech = session.say(
+                        text, audio=_frames(), allow_interruptions=True,
+                    )
+                except RuntimeError:
+                    raise
+                except Exception:  # noqa: BLE001 — nothing queued: synthesise
+                    speech = None
+                    _log.warn(
+                        "unknown_event", error_type="phone_q1_prefetch",
+                        error_category="prerendered_say_refused",
+                    )
+            if speech is None:
+                speech = session.say(text, allow_interruptions=True)
             wait = getattr(speech, "wait_for_playout", None)
             if callable(wait):
                 value = wait()
@@ -8256,12 +10872,20 @@ async def _run_native_phone_screening(
     # egress start), so agent.py must NOT speak it again when it already did.
     preloop_done = asyncio.Event()
     setattr(agent, "_native_preloop_done", preloop_done)
+    # T08b: Q1 as prepared during the role line (None unless the gate made one).
+    q1_prefetch = getattr(result, "q1_prefetch", None)
     preloop_heard = True
     role_opening = phone.phone_role_opening_text(state.role_title)
     if role_opening is not None and not getattr(result, "role_opening_spoken", False):
         preloop_heard = await _speak_preloop(role_opening, "preloop_role_opening")
 
     question = state.question_at(cursor)
+    # M013 S01 T07: a revocation heard over the role line (its turn dropped
+    # by the SDK while that non-interruptible line played) is confirmed
+    # BEFORE the first question, which is then not asked over it.
+    revocation_preloop = None
+    if preloop_heard and question is not None and not close_event.is_set():
+        revocation_preloop = await _revocation_preloop()
     if not preloop_heard:
         # The role opening was not heard: skip the whole question block (no
         # `completed`, no rephrase, no Q1, no F0a).
@@ -8272,6 +10896,11 @@ async def _run_native_phone_screening(
     elif close_event.is_set():
         # Gone before the rephrase: do not spend an LLM call on nobody.
         _preloop_disconnect()
+    elif revocation_preloop is not None:
+        # The confirmation replaced the first question; the reply to it is a
+        # native turn. Nothing to prime: no question was asked.
+        if revocation_preloop != "spoken":
+            _preloop_disconnect()
     else:
         # Q1 is spoken via `say`, NOT a live generation — the context here ends
         # with the model's role-opening turn, which the LLM rejects ("Requests
@@ -8283,8 +10912,39 @@ async def _run_native_phone_screening(
         # rephrase LLM is already warm (the gate ran the consent + role openings),
         # and the owed objective is unchanged: the candidate's first answer binds
         # to it regardless of the phrasing actually spoken.
-        q1_text = await phone.phone_rephrase_first_question(question.spoken_text)
-        if not await _speak_preloop(q1_text, "preloop_q1"):
+        # M013 S01 T08b: the gate started that rephrase (and its audio) at
+        # consent, so it is normally ready the moment the role line ends. A
+        # prefetch made for another question, or not ready within
+        # `PHONE_Q1_PREFETCH_WAIT_SEC`, gives the verbatim planned question of
+        # THIS leg's cursor. No prefetch (a reconnect leg, a legacy gate):
+        # rephrase now, as before.
+        q1_frames: list[Any] | None = None
+        q1_wait_started = _monotonic()
+        taken = await phone.phone_take_q1_prefetch(
+            q1_prefetch, cursor=cursor, question=question,
+        )
+        if taken is None:
+            q1_text = await phone.phone_rephrase_first_question(question.spoken_text)
+            q1_outcome = "on_demand"
+        else:
+            q1_text, q1_frames, q1_outcome = taken
+        _log.info(
+            "unknown_event", error_type="phone_q1_prefetch",
+            error_category=q1_outcome,
+            duration_sec=round(_monotonic() - q1_wait_started, 3),
+        )
+        if revocation["confirm_pending"] or revocation["withdrawal_latched"]:
+            # M013 S01 T07: a turn committed during the rephrase was judged a
+            # revocation and its confirmation is owed: do not ask the first
+            # question over it (the reply to the confirmation decides).
+            _window_note("q1_held")
+            question = None
+        elif window is not None and window.open:
+            window.set_bot_line(q1_text)
+            revocation["q1_spoken"] = True
+        if question is None:
+            pass
+        elif not await _speak_preloop(q1_text, "preloop_q1", frames=q1_frames):
             # Q1 was not heard: a disconnect, and F0a is skipped (there is no
             # delivered ask to prime the turn tracking with).
             _preloop_disconnect()
@@ -8330,6 +10990,9 @@ async def _run_native_phone_screening(
             if not assistant_delivery_complete.is_set():
                 assistant_delivery_complete.set()
             await prime_preemptive_objective(state.question_at(cursor + 1))
+    # T08b: whatever path the pre-loop took, nothing keeps preparing Q1 (a
+    # leg that never asked it does not pay for its rephrase or its audio).
+    _cancel_q1_prefetch(result)
     # M009 C4 test seam: the pre-loop (role opening, Q1, F0a) is over, either
     # way. Session harnesses that end a fake call by firing `close` wait for it,
     # because a close that lands earlier is now (correctly) a disconnect.
@@ -8342,6 +11005,13 @@ async def _run_native_phone_screening(
     except asyncio.TimeoutError:
         terminal_reason["reason"] = "residency_timeout"
     finally:
+        # M013 S01 T07: nothing of the window outlives the leg.
+        if window is not None:
+            window.close("leg_ended")
+        # T09: the Q&A judge stays open through a completed teardown, which
+        # may still answer one late question (`_await_late_qna_answer`).
+        if terminal_reason.get("reason") != "completed":
+            qna_window.close("leg_ended")
         silence_task.cancel()
         await asyncio.gather(silence_task, return_exceptions=True)
         watchdog = speech_watchdog_task[0]
@@ -8553,6 +11223,38 @@ async def _run_native_phone_screening(
                     min(PHONE_CLOSE_VAD_RECENT_SEC, max(remaining, 0.0)),
                 )
 
+    async def _await_late_qna_answer() -> float:
+        """T09: let the one late answer (and its goodbye) finish before delete.
+
+        A question asked after the goodbye played, while the room was still
+        open, got one short answer plus the goodbye again (the turn hook,
+        capped at one per call). Wait for that reply to stop playing, bounded
+        like the fixed farewell; then close the late window so any later turn
+        is terminal, exactly as before. Returns the monotonic time the late
+        answer ended (0.0 if there was none), the new tail-grace anchor.
+        """
+        try:
+            done = late_qna.get("done")
+            if done is not None and not done.is_set():
+                try:
+                    await asyncio.wait_for(
+                        done.wait(),
+                        timeout=max(
+                            PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
+                            PHONE_FAREWELL_PLAYOUT_FLOOR_SEC,
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    _log.info(
+                        "unknown_event", error_type="phone_qna_late_question",
+                        error_category="late_answer_wait_timeout",
+                    )
+            ended = late_qna.get("finished_mono")
+            return float(ended) if isinstance(ended, (int, float)) else 0.0
+        finally:
+            late_qna["closed"] = True
+            qna_window.close("leg_ended")
+
     if reason != "completed":
         # Every non-completed terminal exit (candidate hangup, no-answer,
         # malformed, disconnect, retryable recovery, aborts) persists its
@@ -8618,6 +11320,10 @@ async def _run_native_phone_screening(
             # F-P0b: the candidate may still be mid-sentence (a late thanks,
             # a question racing the goodbye) — wait for end-of-speech, bounded.
             await _await_candidate_silence_before_delete()
+            # T09: one late question answered after the goodbye plays out.
+            goodbye_finished_monotonic = max(
+                goodbye_finished_monotonic, await _await_late_qna_answer(),
+            )
             close_grace = phone.PHONE_CLOSE_TAIL_GRACE_SEC - (
                 time.monotonic() - goodbye_finished_monotonic
             )
@@ -8778,6 +11484,10 @@ async def _run_native_phone_screening(
         # F-P0b: the closing-state VAD check runs BEFORE the tail grace — the
         # room must not come down while the candidate is audibly mid-sentence.
         await _await_candidate_silence_before_delete()
+        # T09: one late question answered after the goodbye plays out.
+        goodbye_finished_monotonic = max(
+            goodbye_finished_monotonic, await _await_late_qna_answer(),
+        )
         # Pre-delete tail grace, minus whatever the completion round-trips
         # already spent: deleting the room kills the SIP audio buffers
         # instantly and a goodbye clipped on its last words is perceived as a
@@ -8877,13 +11587,20 @@ async def _run_phone_session(
     # and then popped by the CONSENT classifier, which is the shared-FIFO defect
     # this whole mechanism exists to close. Filtering at the producer cannot see
     # that; filtering at the reader can.
-    user_turns: "asyncio.Queue[tuple[str, int | None]]" = asyncio.Queue()
+    # M013 S01: entries are `gate_judge.GateTurn`s (closed by `gate_capture`).
+    user_turns: "asyncio.Queue[gate_judge.GateTurn]" = asyncio.Queue()
     # The gate's CURRENT question, as a speech-start anchor in ms. Set when the
     # gate begins asking, cleared when the gate returns. While set, a candidate
     # final whose SPEECH STARTED before it is never enqueued -- see
     # `on_candidate_turn`. `None` outside the gate, so the screening loop's own
     # `latest_assistant_anchor` machinery is untouched.
     gate_question_anchor: list[int | None] = [None]
+    # M013 S01 T05: when the consent line's recording sentence was heard
+    # (stamped between the two halves of the split line, raised to part B's
+    # first audio), and the gate line the candidate heard last (for the judge
+    # prompt). Defined here, before any handler that reads them can fire.
+    gate_recording_anchor = _GateRecordingAnchor()
+    gate_last_line: list[str] = [""]
     candidate_activity = asyncio.Event()
     agent_listening = asyncio.Event()
     agent_listening.set()
@@ -8972,10 +11689,33 @@ async def _run_phone_session(
     # bystander's words filed as `candidate` under the candidate's session
     # would have no erasure route (`transcript_turns` carries no candidate id,
     # so the DSAR erase matches nothing). See `_flush_gate_transcript`.
-    gate_pending: list[tuple[str, str, int | None, int]] = []
+    # The 4th element is the item seq (`phone-gate-item-<seq>`), or the string
+    # `final-<idx>` for a consent-grant utterance the SDK never committed
+    # (`phone-gate-final-<idx>`, see `_gate_evidence_row`).
+    gate_pending: list[tuple[str, str, int | None, int | str]] = []
+    gate_evidence_keys: set[str] = set()
     item_seq: list[int] = [0]
     persist_session_id = phone.session_id_from_room_name(room_name)
     persist_tasks: set[asyncio.Task] = set()
+    # M013 S01 T08b: the post-consent gate flush runs alongside the first
+    # question instead of in front of it. Every per-item screening row waits
+    # for it (`_spawn_item_persist`), so the gate rows still come first in
+    # `turn_index` order. The boundary commit is deliberately NOT made to
+    # wait: delaying it changes the toolless commit timing the next turn
+    # relies on. It cannot run before Q1 has played and been answered, which
+    # outlasts the flush's 5 s bound (one row, normally a single round trip).
+    gate_flush_holder: list["asyncio.Task[Any] | None"] = [None]
+
+    async def _await_gate_flush() -> None:
+        """Wait for the concurrent gate flush, if one is running.
+
+        Bounded by the flush's own budget. Never raises, except this task's
+        own cancellation.
+        """
+        task = gate_flush_holder[0]
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        await asyncio.wait({task})
 
     async def _persist_phone_item(speaker: str, text: str, anchor_ms: int | None,
                                   source_item_id: str, is_gate: bool = False) -> None:
@@ -9021,14 +11761,23 @@ async def _run_phone_session(
         dedups on it, so a duplicate cannot double-insert. Never awaited on the
         hot path; tracked so a stop can drain it.
         """
+        source_item_id = f"phone-gate-item-{seq}" if is_gate else f"phone-item-{seq}"
+        flush = gate_flush_holder[0]
+        if not is_gate and flush is not None and not flush.done():
+            # T08b: a screening row never lands before the gate rows.
+            async def _after_gate_flush() -> None:
+                await _await_gate_flush()
+                await _persist_phone_item(
+                    speaker, text, anchor_ms, source_item_id, is_gate)
+
+            persist = _after_gate_flush()
+        else:
+            persist = _persist_phone_item(
+                speaker, text, anchor_ms, source_item_id, is_gate)
         try:
-            task = asyncio.create_task(
-                _persist_phone_item(
-                    speaker, text, anchor_ms,
-                    f"phone-gate-item-{seq}" if is_gate else f"phone-item-{seq}",
-                    is_gate,
-                ))
+            task = asyncio.create_task(persist)
         except RuntimeError:
+            persist.close()
             # No running loop (e.g. a synthetic test emitting outside the
             # session loop): the boundary path still persists the pair.
             return
@@ -9048,6 +11797,12 @@ async def _run_phone_session(
         died at the gate still has its transcript. Idempotent: an empty buffer
         is a no-op. Bounded: a persist that hangs cannot hold the call.
         """
+        running = gate_flush_holder[0]
+        if (running is not None and not running.done()
+                and running is not asyncio.current_task()):
+            # T08b: one flush at a time, so two callers never write the same
+            # turns in an interleaved order. Bounded by this call's budget.
+            await asyncio.wait({running}, timeout=max(0.05, budget))
         pending = list(gate_pending)
         if not pending:
             return
@@ -9066,8 +11821,11 @@ async def _run_phone_session(
         # writes then raced, and the server assigns `turn_index` by arrival —
         # so the stored gate transcript came back SHUFFLED. The 2026-09-27
         # owner test is the proof: eight turns written inside 15 ms, with the
-        # candidate's "Hello?" stored above the greeting that prompted it and
-        # the yes/no re-ask above the disclosure it was re-asking.
+        # yes/no re-ask stored above the disclosure it was re-asking. (The
+        # "Hello?" filed as the candidate's above the greeting on that call
+        # was not the candidate: it was the opening-generation seed, which the
+        # SDK records as a user turn. #334 removed the seed; M013 S01 T10 pins
+        # that no candidate gate row comes from anything but an STT final.)
         #
         # That matters more here than anywhere else in the transcript. These
         # rows exist to evidence WHAT WAS DISCLOSED AND WHEN THE CANDIDATE
@@ -9105,7 +11863,7 @@ async def _run_phone_session(
                 return
             try:
                 task = asyncio.create_task(_persist_phone_item(
-                    speaker, text, anchor_ms, f"phone-gate-item-{seq}", True))
+                    speaker, text, anchor_ms, _gate_source_item_id(seq), True))
             except RuntimeError:
                 _leave_rest("gate_flush_loop_closing")
                 return
@@ -9200,10 +11958,36 @@ async def _run_phone_session(
     candidate_speaking: dict[str, bool] = {"value": False}
     candidate_speech_ended = asyncio.Event()
 
+    # ── M013 S01: THE GATE'S OWN RECORD OF WHAT THE CANDIDATE SAID ─────────
+    # Every VAD segment and every STT final, paired FIFO, closed into turns
+    # (on commit, or by silence for a turn the SDK dropped while a gate line
+    # played) and handed to the gate readers through `user_turns`. Why the
+    # SDK's committed turns alone were not enough is in `gate_judge`.
+    def _emit_gate_turn(turn: "gate_judge.GateTurn") -> None:
+        # A turn the SDK never committed skipped `on_candidate_turn`, so its
+        # explicit hang-up request is honoured here instead.
+        if turn.closed_by == "settle" and phone.is_explicit_end_call_request(turn.text):
+            candidate_end_requested.set()
+        user_turns.put_nowait(turn)
+
+    gate_capture = _new_gate_turn_capture(_emit_gate_turn)
+
+    def _record_gate_grant_evidence(item: Any) -> None:
+        """Buffer one candidate row for a grant whose words never committed."""
+        if not gate_persist_active[0] or assessment_persist_active[0]:
+            return
+        row = _gate_evidence_row(item, gate_evidence_keys, gate_capture)
+        if row is not None:
+            gate_pending.append(row)
+
     def _on_phone_vad_event(event: Any) -> None:
         """Record the actual local VAD boundary and bounded event fields."""
         raw_type = getattr(event, "type", None)
         event_type = getattr(raw_type, "value", raw_type)
+        try:
+            gate_capture.on_vad_event(event, time.time())
+        except Exception:  # noqa: BLE001 — the gate record never breaks the VAD hook
+            pass
         if event_type == "start_of_speech":
             candidate_speaking["value"] = True
             return
@@ -9399,8 +12183,10 @@ async def _run_phone_session(
             candidate_activity.set()
             # LiveKit 1.6.4 does not guarantee speech-start metrics on every
             # finalized ChatMessage. This event is the real local VAD anchor,
-            # used only when the message has no provider timestamp.
-            latest_candidate_anchor[0] = int(round(time.time() * 1000))
+            # used only when the message has no provider timestamp. M013 S01:
+            # the event's own `created_at` IS this segment's start; the
+            # handler's clock is later by the VAD's detection delay.
+            latest_candidate_anchor[0] = _user_state_anchor_ms(event, time.time())
         # DISCONNECT DIAGNOSTICS. A candidate going 'away' (LiveKit's own
         # inactivity state) and coming back is exactly the shape a dropped or
         # muted leg leaves behind, and the live call had no record of it. Log
@@ -9442,6 +12228,24 @@ async def _run_phone_session(
                     "unknown_event", error_type="voice_phone_boundary",
                     error_category="stt_final_arrived",
                 )
+                # M013 S01: every final reaches the gate, including one whose
+                # turn the SDK will drop for committing during a gate line.
+                try:
+                    gate_capture.on_final(str(getattr(event, "transcript", "") or ""))
+                except Exception:  # noqa: BLE001 — never breaks the transcript hook
+                    pass
+                # M013 S01 T07: and, once consent is granted, the revocation
+                # window (its judge call starts on the final itself).
+                try:
+                    revocation_window.on_final(str(getattr(event, "transcript", "") or ""))
+                except Exception:  # noqa: BLE001 — never breaks the transcript hook
+                    pass
+                # M013 S01 T09: and, once "any questions?" is asked, the Q&A
+                # judge (its call starts on the final, hiding its latency).
+                try:
+                    qna_close_window.on_final(str(getattr(event, "transcript", "") or ""))
+                except Exception:  # noqa: BLE001 — never breaks the transcript hook
+                    pass
 
     @session.on("agent_state_changed")
     def _on_phone_agent_state_changed(event):  # noqa: ANN001
@@ -9470,6 +12274,9 @@ async def _run_phone_session(
                 _first_audio_ms = int(round(first_audio_wall * 1000))
                 if _first_audio_ms > gate_question_anchor[0]:
                     gate_question_anchor[0] = _first_audio_ms
+            # T05: the recording anchor, armed between the halves of the split
+            # consent line, rises once to part B's first audio (one way only).
+            gate_recording_anchor.on_first_audio(int(round(first_audio_wall * 1000)))
             created_mono = latency_state.get("speech_created_mono")
             if created_mono is not None:
                 _emit_phone_latency_segment(
@@ -9551,9 +12358,13 @@ async def _run_phone_session(
                 # 0105: the speaker's words in the gate — the consent reply, an
                 # identity answer, a "call me later" — buffered, flagged as the
                 # gate, and persisted once the gate says whose they are.
-                item_seq[0] += 1
-                gate_pending.append(
-                    ("candidate", text, _turn_anchor_ms(item), item_seq[0]))
+                # M013 S01: unless the gate already buffered these words as the
+                # evidence of a grant it read before the SDK committed them.
+                if not _gate_user_row_is_evidence_echo(
+                        text, gate_capture, gate_evidence_keys):
+                    item_seq[0] += 1
+                    gate_pending.append(
+                        ("candidate", text, _turn_anchor_ms(item), item_seq[0]))
             return
         # 0105: a bot item in the GATE phase — the disclosure, the identity
         # ask, the role line, a refusal closing — is persisted before the
@@ -9686,10 +12497,23 @@ async def _run_phone_session(
                 delta_ms / 1000.0, {"channel": "phone"},
             )
 
+    # M013 S01 T02: the handle of the gate line most recently handed to the
+    # SDK, so a wall-clock overrun can interrupt it and check its playout
+    # drained before saying goodbye (`_speak_gate_goodbye_bounded`).
+    gate_speech_holder: list[Any] = [None]
+    # M013 S01 T08a: the first audible pieces of every COMPOSED consent line
+    # (filled by `speak_opening`), so the disclosure-latency metric covers a
+    # composed line, not only the two fixed ones; and its once-per-call latch.
+    composed_consent_starts: set[str] = set()
+    disclosure_metric_emitted: list[bool] = [False]
+
     async def say(text: str) -> None:
         started_ms = int(round(time.time() * 1000))
+        # T05: the line the candidate is hearing, for the gate judge prompt.
+        gate_last_line[0] = text if isinstance(text, str) else ""
         try:
             speech = session.say(text, allow_interruptions=False)
+            gate_speech_holder[0] = speech
         except RuntimeError as exc:
             # The leg dropped while the gate was mid-await. Translate the SDK's
             # generic RuntimeError into the typed signal the gate call site
@@ -9714,11 +12538,15 @@ async def _run_phone_session(
         # the moment the conversational flow is enabled (that flow speaks
         # `PHONE_DISCLOSURE_CONTINUATION_TEXT` and never the other one).
         _note_first_gate_audio(started_ms)
-        if text in (
-            phone.PHONE_DISCLOSURE_TEXT, phone.PHONE_DISCLOSURE_CONTINUATION_TEXT,
-        ) and participant_present_anchor[0] is not None:
+        # T05: the gate now speaks the fixed disclosure in two halves; its
+        # first half starts the line, so it carries the metric.
+        # T08a: so does a composed consent line's first piece; once per call.
+        if (not disclosure_metric_emitted[0]
+                and _is_disclosure_line_start(text, composed_consent_starts)
+                and participant_present_anchor[0] is not None):
             delta_ms = started_ms - participant_present_anchor[0]
             if delta_ms >= 0:
+                disclosure_metric_emitted[0] = True
                 _safe_emit(histogram_metric, "voice_phone_participant_to_disclosure_sec", delta_ms / 1000.0, {"channel": "phone"})
 
     def on_candidate_turn(text: str, message: Any = None, turn_ctx: Any = None) -> None:
@@ -9747,7 +12575,14 @@ async def _run_phone_session(
         # after the anchor and be kept. Fail-open either way, which is the
         # chosen direction. Only a message with neither is `None`, which the
         # readers also treat as KEEP.
-        user_turns.put_nowait((text, _turn_anchor_ms(message)))
+        #
+        # M013 S01: the commit now goes through the gate capture, which closes
+        # the STT finals it reconciles with and times them by their own VAD
+        # speech (FIFO-paired), not by the SDK's carried-over speech start —
+        # the 9f60523d drop. The SDK anchor is only the fallback for a call
+        # that delivered no VAD event at all. A commit that repeats a turn the
+        # capture already closed is not enqueued twice.
+        gate_capture.on_commit(text, _turn_anchor_ms(message))
 
     # Complete and immutable from construction. The exact owed question is
     # still supplied only per turn; this prompt carries role, resume,
@@ -9788,8 +12623,9 @@ async def _run_phone_session(
     # 0095: this condition is DELIBERATELY unchanged by the conversational gate.
     # An earlier draft widened it to fire on Gemini deployments too, because that
     # draft composed the identity line on the OpenAI-compat one-shot endpoint and
-    # wanted its transport warm. The rebuilt gate speaks every line through
-    # `session.generate_reply` on the SESSION LLM, so on a Gemini deployment the
+    # wanted its transport warm. The rebuilt gate composes every line on the
+    # SESSION LLM (since #334 a private-context draft, `_compose_gate_draft`,
+    # spoken with `say`), so on a Gemini deployment the
     # first spoken line depends on nothing this warm-up touches — widening it
     # would POST the full system prompt, résumé facts included, to a second
     # provider that previously received nothing from this call. Reverted.
@@ -9958,14 +12794,82 @@ async def _run_phone_session(
     # The raw consent utterance the classifier consumed, threaded out so the
     # gate can commit it as the candidate half of the gate transcript.
     consent_reply_out: list[str] = []
+    # M013 S01 T02: the call's "a person spoke" latch, shared by the identity,
+    # callback and consent readers. Once set, the gate can no longer end as
+    # "machine" (see `_classify_phone_answer`).
+    gate_spoke = gate_judge.HumanSpeechLatch()
+    # M013 S01 T03: the gate's post-answer time budget, started by the gate at
+    # the answer and checked before every new ask (here: the consent re-ask).
+    gate_budget = phone.GateBudget(PHONE_GATE_MAX_SECONDS)
+    # M013 S01 T05: the gate judge (`PHONE_GATE_JUDGE` = legacy | shadow |
+    # llm), reading the call's own capture, latch, anchors and budget.
+    gate_judge_wiring = _GateJudgeWiring(
+        capture=gate_capture, latch=gate_spoke,
+        question_anchor=lambda: gate_question_anchor[0],
+        recording_anchor=lambda: gate_recording_anchor.value,
+        budget=gate_budget,
+        first_name=getattr(instruction_state, "candidate_name", None),
+    )
+    # M013 S01 T07: the post-consent revocation window, armed by a consent
+    # grant in THIS call (a `consent.resumed` leg never reads a consent reply,
+    # so never arms it) and fed every STT final from then on.
+    revocation_window = _RevocationWindow(
+        first_name=getattr(instruction_state, "candidate_name", None),
+        bot_line=lambda: gate_last_line[0],
+    )
+    # M013 S01 T09: the end-of-screening Q&A judge, armed by the screening
+    # when it asks "any questions?" (any leg) and fed every STT final.
+    qna_close_window = _QnaCloseWindow(
+        first_name=getattr(instruction_state, "candidate_name", None),
+    )
 
     async def classify() -> str:
         if classifier is not None:
             return await classifier(user_turns, say)
-        return await _classify_phone_answer(
+        outcome = await _classify_phone_answer(
             user_turns, say, consumed=consent_reply_out,
             question_anchor=lambda: gate_question_anchor[0],
+            on_grant_evidence=_record_gate_grant_evidence,
+            spoke=gate_spoke,
+            budget=gate_budget,
+            judge=gate_judge_wiring,
+            bot_line=lambda: gate_last_line[0],
+            role_title=getattr(instruction_state, "role_title", None),
         )
+        if outcome == phone.CLASSIFY_HUMAN:
+            # T07: consent granted in this call opens the revocation window.
+            revocation_window.arm()
+        return outcome
+
+    def _mark_recording_sentence() -> None:
+        """T05: the recording sentence is about to be heard (split consent line)."""
+        gate_recording_anchor.mark(int(round(time.time() * 1000)))
+
+    async def _judge_identity(reply: str) -> str | None:
+        """T05: the acting identity intent (llm mode), or None for legacy.
+
+        Shadow mode starts the identity shadow and returns None, so the legacy
+        path decides; `_note_identity_route` then logs the agreement. When the
+        judge is unavailable (llm mode) the legacy path decides too, and the
+        latch is set the legacy way (the identity reader does not set it in
+        llm mode, so a judged voicemail greeting never sets it).
+        """
+        line = gate_last_line[0]
+        if gate_judge_wiring.shadowing:
+            gate_judge_wiring.shadow_identity(line)
+            return None
+        if not gate_judge_wiring.acting:
+            return None
+        decision = await gate_judge_wiring.decide(
+            gate_judge.PHASE_IDENTITY, line, legacy=lambda: None,
+        )
+        if decision.source == gate_judge.SOURCE_LLM and decision.intent is not None:
+            return decision.intent
+        gate_spoke.note_reply(
+            reply, machine_match=_is_machine_text(reply),
+            source=gate_judge.SPOKE_SOURCE_IDENTITY,
+        )
+        return None
 
     # Arm the gate-window leak veto with the RÉSUMÉ FACTS — the text that must
     # not reach a pre-consent listener, and that the bot is never meant to say.
@@ -10038,46 +12942,70 @@ async def _run_phone_session(
 
         Stamping here as well keeps the barrier armed for the window BEFORE
         first audio, which is what rejects the pickup "Hello?".
+
+        M013 S01: also clears the SDK's pending user turn, so speech from
+        before this question (a blip, an identity reply STT never finalised)
+        can no longer lend its start to the next committed turn. The gate's
+        own capture still holds every final, so nothing heard is lost.
         """
         gate_question_anchor[0] = int(round(time.time() * 1000))
+        gate_recording_anchor.reset()
+        _clear_sdk_user_turn()
+
+    clear_user_turn_unavailable_logged: list[bool] = [False]
+
+    def _clear_sdk_user_turn() -> None:
+        """`AgentSession.clear_user_turn()` (1.6.4), guarded. Never fails the gate."""
+        clear = getattr(session, "clear_user_turn", None)
+        if not callable(clear):
+            if not clear_user_turn_unavailable_logged[0]:
+                clear_user_turn_unavailable_logged[0] = True
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_turn_barrier",
+                    error_category="clear_user_turn_unavailable",
+                )
+            return
+        try:
+            clear()
+        except Exception:  # noqa: BLE001 — a failed clear costs a stale start, not the call
+            _log.warn(
+                "unknown_event", error_type="phone_gate_turn_barrier",
+                error_category="clear_user_turn_failed",
+            )
 
     def _clear_question_anchor() -> None:
-        """Drop the barrier when the gate is done, so screening turns flow."""
-        gate_question_anchor[0] = None
+        """Drop the barrier when the gate is done, so screening turns flow.
 
-    async def _compose_gate_line(instructions: str) -> str | None:
+        M013 S01: the gate capture stops with it; screening turns are the
+        SDK's again.
+        """
+        gate_question_anchor[0] = None
+        gate_capture.stop()
+        gate_judge_wiring.stop()
+
+    async def _compose_gate_line(instructions: str, *, schema: str = "identity") -> str | None:
         """Buffer the session's own model, with no tools or candidate records.
 
         The gate validates the draft before calling say. No generated tokens
         enter TTS here, and cancellation closes the provider stream.
+
+        M013 S01 T08a: capped by `PHONE_GATE_COMPOSE_TIMEOUT_SEC` (was a fixed
+        4 s) and composed CONCURRENTLY with the output-subscription wait, so
+        the first line of the call waits for the longer of the two, not both.
         """
-        await _await_output_subscription()
         if phone.phone_deterministic_opener():
+            await _await_output_subscription()
             return None
-        try:
-            from livekit.agents.llm import ChatContext
-
-            chat = ChatContext()
-            chat.add_message(role="system", content=instructions)
-            chat.add_message(role="user", content="Write only the short spoken line.")
-
-            async def collect() -> str:
-                parts: list[str] = []
-                async with session.llm.chat(chat_ctx=chat, tools=[]) as stream:
-                    async for chunk in stream:
-                        delta = getattr(chunk, "delta", None)
-                        content = getattr(delta, "content", None)
-                        if isinstance(content, str):
-                            parts.append(content)
-                            if sum(map(len, parts)) > 650:
-                                return ""
-                return "".join(parts).strip()
-
-            return await asyncio.wait_for(collect(), timeout=4.0)
-        except Exception:
-            _log.info("unknown_event", error_type="phone_opening_fallback",
-                      error_category="draft_unavailable")
-            return None
+        return await _compose_alongside_subscription(
+            lambda: _compose_gate_draft(
+                # No LLM on the session is a compose miss (the fixed line),
+                # inside the helper's own error handling, as before.
+                getattr(session, "llm", None), instructions,
+                timeout_sec=phone.phone_gate_compose_timeout_sec(),
+                schema=schema,
+            ),
+            _await_output_subscription,
+        )
 
     async def speak_opening() -> str | None:
         """Compose a private opening draft; the gate validates and speaks it.
@@ -10091,12 +13019,19 @@ async def _run_phone_session(
         # them and said who we are, so this turn must not do it again — the
         # #279 "double-Hi", one turn earlier. The fixed fallback handles the
         # same case via `PHONE_DISCLOSURE_CONTINUATION_TEXT`.
+        #
+        # M013 S01 T08a: VERDICT-NEUTRAL. This line is now composed while the
+        # identity reply is still being judged, so the model must not react to
+        # that reply: no acknowledgement, no "thanks for confirming". The same
+        # line then fits every route that reaches consent.
         if phone.phone_gate_flow() == "conversational":
             greeting_clause = (
                 "You have ALREADY greeted this candidate and told them who you "
                 "are on the previous turn, so do NOT introduce yourself again "
-                "and do NOT say hello again. Continue naturally from their "
-                "answer. You MUST include this exact sentence "
+                "and do NOT say hello again. Do NOT acknowledge, thank, or "
+                "react to what they just said (no \"thanks for confirming\", "
+                "no \"great\"): go straight to the point. You MUST include "
+                "this exact sentence "
             )
         else:
             greeting_clause = (
@@ -10115,12 +13050,68 @@ async def _run_phone_session(
             "MUST END with the consent question (for example, \"Is it okay to "
             "continue?\") so a simple yes or no answers it."
         )
-        # Warm the output track for both model-composed and rollback openings.
-        # The gate validates the private draft before any audio is emitted.
-        await _await_output_subscription()
-        if phone.phone_deterministic_opener():
-            return None
-        return await _compose_gate_line(opening_instructions)
+        # Warm the output track for both model-composed and rollback openings
+        # (`_compose_gate_line` awaits it on both paths; T08a runs the compose
+        # alongside it rather than after it, which matters when this is the
+        # first line of the call). The gate validates the private draft before
+        # any audio is emitted.
+        draft = await _compose_gate_line(opening_instructions, schema="consent")
+        # T08a: a composed consent line's first audible piece also carries the
+        # disclosure-latency metric (see `say`).
+        composed_consent_starts.update(_consent_line_starts(draft))
+        return draft
+
+    # ── M013 S01 T08b: the role line composes during the consent wait ──────
+    # The role title is known before the call (`instruction_state.role_title`),
+    # so the one-shot that writes the role line runs while the consent line
+    # plays and the candidate answers, not after "yes" (live: 2.3 s from the
+    # end of "Yes, yes." to the role line). After consent the draft is used
+    # only when the RPC's verbatim title names the same role, and it is
+    # re-checked against THAT title; otherwise it is composed then, as before.
+    role_precompose: dict[str, Any] = {"task": None, "title": None}
+
+    def _start_role_compose() -> None:
+        if role_precompose["task"] is not None:
+            return
+        title = getattr(instruction_state, "role_title", None)
+        if not isinstance(title, str) or not title.strip():
+            return
+        role_precompose["title"] = title
+        role_precompose["task"] = asyncio.ensure_future(
+            phone.phone_compose_role_opening(title))
+        role_precompose["task"].add_done_callback(_consume_detached_task)
+
+    def _cancel_role_compose() -> None:
+        task = role_precompose["task"]
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _take_role_draft(role_title: str) -> str | None:
+        task = role_precompose["task"]
+        if task is None or not _same_role_title(role_precompose["title"], role_title):
+            if task is not None:
+                _cancel_role_compose()
+                _log.info(
+                    "unknown_event", error_type="phone_role_opening",
+                    error_category="precomposed_title_changed",
+                )
+            return await phone.phone_compose_role_opening(role_title)
+        try:
+            # Bounded: the compose carries its own timeout from its start.
+            draft = await task
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001
+            current = asyncio.current_task()
+            cancelling = getattr(current, "cancelling", None)
+            if callable(cancelling) and cancelling():
+                raise
+            draft = None
+        if isinstance(draft, str) and phone.phone_role_opening_clean(draft, role_title):
+            _log.info(
+                "unknown_event", error_type="phone_role_opening",
+                error_category="precomposed_used",
+            )
+            return draft
+        return None
 
     async def speak_role_opening(role_title: str) -> str | None:
         """Author the role-opening OUT OF BAND, validate it, then speak it.
@@ -10154,7 +13145,7 @@ async def _run_phone_session(
         #
         # Nothing is emitted until `phone_role_opening_clean` passes, so exactly
         # one of {model line, fixed line} is ever spoken.
-        composed = await phone.phone_compose_role_opening(role_title)
+        composed = await _take_role_draft(role_title)
         if composed is None:
             # Timed out, or asked something, or renamed the role. The gate speaks
             # the deterministic `phone_role_opening_text` — the verbatim role is
@@ -10429,6 +13420,25 @@ async def _run_phone_session(
                 return
         await say(text)
 
+    # ── M013 S01 T08b: Q1 is prepared while the role line plays ──────────
+    def _start_q1_prefetch(state: Any) -> "phone.PhoneQ1Prefetch | None":
+        """The gate's `start_q1_prefetch` seam: rephrase the leg's next
+        question now and, unless `PHONE_Q1_PRERENDER` is off, render its
+        audio as soon as the rephrase lands."""
+        render = (
+            (lambda text: _render_tts_frames(session, text))
+            if phone.phone_q1_prerender_enabled() else None
+        )
+        prefetch = phone.phone_start_q1_prefetch(state, render=render)
+        _log.info(
+            "unknown_event", error_type="phone_q1_prefetch",
+            error_category=(
+                "not_started" if prefetch is None
+                else "started_prerender" if render is not None else "started"
+            ),
+        )
+        return prefetch
+
     async def _next_candidate_turn() -> str:
         """One candidate utterance for the gate's identity turn, or "" on silence.
 
@@ -10458,6 +13468,10 @@ async def _run_phone_session(
             phone.phone_identity_answer_timeout_sec(),
             speaking=lambda: bool(candidate_speaking.get("value")),
             hard_timeout_sec=phone.phone_classify_answer_timeout_sec(),
+            # T05: in llm mode the identity JUDGE latches (a judged voicemail
+            # greeting must not); `_judge_identity` latches the legacy way when
+            # the judge is unavailable.
+            spoke=None if gate_judge_wiring.acting else gate_spoke,
         )
 
     async def _next_callback_turn() -> str:
@@ -10465,6 +13479,7 @@ async def _run_phone_session(
         return await _read_fresh_turn(
             user_turns, lambda: gate_question_anchor[0],
             phone.phone_classify_answer_timeout_sec(),
+            spoke=gate_spoke, spoke_source=gate_judge.SPOKE_SOURCE_CALLBACK,
         )
 
     recording_finish_lock = asyncio.Lock()
@@ -11131,6 +14146,75 @@ async def _run_phone_session(
             answered_anchor[0] = int(round(time.time() * 1000))
         return verdict
 
+    # ── M013 S01 T03: ONE lease heartbeat per call, from the answer ──────────
+    # The gate starts it at the answer (`start_lease_heartbeat`), its first
+    # immediate beat replacing the one-shot re-base, and the post-consent code
+    # REUSES it rather than starting a second one. What a lost lease does
+    # depends on where the call is, so `halt` is a dispatcher: before the
+    # screening starts it cancels the gate (`_halt_gate_for_lease`), and once
+    # the screening is running it is re-pointed to `halt_for_lease`.
+    gate_heartbeat: list["asyncio.Task[Any] | None"] = [None]
+    gate_lease_halt: dict[str, str] = {}
+    lease_halt_target: list[Any] = [None]
+
+    async def _halt_gate_for_lease(reason: str) -> None:
+        # The reason is recorded FIRST, so the gate's cancellation can be told
+        # apart from an SDK close or a caller's cancellation at the await.
+        gate_lease_halt["reason"] = reason
+        task = gate_task_holder[0]
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _dispatch_lease_halt(reason: str) -> None:
+        target = lease_halt_target[0] or _halt_gate_for_lease
+        try:
+            await target(reason)
+        except Exception:  # noqa: BLE001 — a halt must never kill the beat task
+            _log.warn(
+                "unknown_event", error_type="phone_gate_heartbeat",
+                error_category="halt_dispatch_failed",
+            )
+
+    def _start_gate_heartbeat() -> bool:
+        """Start the call's lease heartbeat. True when it is running.
+
+        The heartbeat route fences on a UUID session id and the dispatch epoch
+        (`heartbeat_phone_attempt_by_epoch`); without both, a beat is a
+        guaranteed `lease_lost`, so none is started and the gate keeps the
+        one-shot re-base with a budget capped to the lease known to remain.
+        The DB fence accepts pre-consent beats (null attempt session,
+        `answered_unclassified`), so beating during the gate is valid.
+        """
+        if gate_heartbeat[0] is not None:
+            return not gate_heartbeat[0].done()
+        hb_session_id = phone.session_id_from_room_name(room_name)
+        if hb_session_id is None or epoch is None:
+            _log.info(
+                "unknown_event", error_type="phone_gate_heartbeat",
+                error_category="gate_heartbeat_unavailable",
+            )
+            return False
+        gate_heartbeat[0] = asyncio.ensure_future(
+            phone.run_phone_heartbeat(
+                attempt_id=attempt_id,
+                session_id=hb_session_id,
+                epoch=epoch,
+                client=events,
+                halt=_dispatch_lease_halt,
+            )
+        )
+        _log.info(
+            "unknown_event", error_type="phone_gate_heartbeat",
+            error_category="gate_heartbeat_started",
+        )
+        return True
+
+    def _stop_gate_heartbeat() -> None:
+        task = gate_heartbeat[0]
+        if task is not None and not task.done():
+            task.cancel()
+            task.add_done_callback(_consume_detached_task)
+
     async def _run_gate() -> "phone.PhoneGateResult":
         return await phone.run_phone_gate(
             attempt_id=attempt_id,
@@ -11179,7 +14263,7 @@ async def _run_phone_session(
             # Deterministic opener (default): withhold the LLM role opener so
             # `_deliver_role_opening` speaks the FIXED `phone_role_opening_text`
             # ("Before we dive in, just to confirm — this is about the {role} role at
-            # Interview Kickstart. Really glad you could hop on — let's dive in!").
+            # Interview Kickstart.").
             # `speak_opening` itself self-gates on the same flag (returns None →
             # fixed disclosure). Both openers are then scripted, never model-authored,
             # so neither can be spoken-then-contradicted. PHONE_DETERMINISTIC_OPENER=false
@@ -11217,6 +14301,27 @@ async def _run_phone_session(
             # rtc) ⇒ presence is the answer, the pre-E6 path.
             wait_for_answer=_wait_for_answer if answer_seam_wired else None,
             answer_post_out=answer_post_holder,
+            # M013 S01 T03: the post-answer budget, and the call's one lease
+            # heartbeat started at the answer.
+            gate_budget=gate_budget,
+            start_lease_heartbeat=_start_gate_heartbeat,
+            # M013 S01 T05: the gate judge at the identity turn, the shadow
+            # agreement hook, and the recording-sentence anchor of the split
+            # consent line.
+            judge_identity=_judge_identity,
+            note_identity_route=gate_judge_wiring.note_identity_route,
+            mark_recording_sentence=_mark_recording_sentence,
+            # M013 S01 T06: the judge's reading of each callback reply (llm
+            # mode; None otherwise), against the bot line just spoken.
+            judge_callback=lambda reply, first=False: gate_judge_wiring.judge_callback(
+                reply, gate_last_line[0], first=first),
+            # M013 S01 T08b: Q1 is rephrased (and rendered) under the role line,
+            # and the model-written role line composes during the consent wait
+            # (only when that line is model-written at all).
+            start_q1_prefetch=_start_q1_prefetch,
+            start_role_compose=(
+                None if phone.phone_deterministic_opener() else _start_role_compose
+            ),
         )
 
     # Boolean phase marks from the gate, plus E3's `sip_left_reason` (a fixed
@@ -11224,6 +14329,8 @@ async def _run_phone_session(
     gate_lifecycle: dict[str, Any] = {}
     gate_error: BaseException | None = None
     gate_cancelled = False
+    # M013 S01 T03: the gate was cancelled by its lease heartbeat.
+    gate_lease_halted = False
     result: phone.PhoneGateResult | None = None
 
     # ── E3 (M009): OUR SIP leg leaving before consent ends the gate now ──
@@ -11355,13 +14462,58 @@ async def _run_phone_session(
             gate_task.cancel()
             gate_task.add_done_callback(_consume_detached_task)
             raise asyncio.TimeoutError
-        result = gate_task.result()
+        if gate_lease_halt.get("reason") and gate_task.cancelled():
+            # M013 S01 T03: the lease heartbeat lost the slot during the gate
+            # and cancelled it. A goodbye before durable consent (never after
+            # it: R4, nothing is spoken post-consent here), then teardown in
+            # the `finally` below, posting nothing new.
+            gate_lease_halted = True
+            _log.warn(
+                "unknown_event", error_type="phone_gate_outcome",
+                schema=phone.GATE_LEASE_HALTED,
+                error_category=gate_lease_halt["reason"],
+            )
+            if (
+                not gate_lifecycle.get("consent_durable")
+                and "terminal_posted" not in gate_lifecycle
+                and not (
+                    gate_lifecycle.get("answer_seam")
+                    and not gate_lifecycle.get("answer_observed")
+                )
+            ):
+                await _speak_gate_goodbye_bounded(
+                    session, say, phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT,
+                    pending_speech=gate_speech_holder[0],
+                )
+            result = phone.PhoneGateResult(
+                phone.GATE_LEASE_HALTED, events=[], spoken=[],
+            )
+        else:
+            result = gate_task.result()
     except asyncio.TimeoutError:
         _log.warn(
             "unknown_event", error_type="phone_gate_outcome",
             schema=phone.GATE_TIMED_OUT,
             duration_sec=_gate_wall_clock,
         )
+        # M013 S01 T02: a goodbye, not dead air — but ONLY before durable
+        # consent (after it, nothing is spoken here: the R4 posture), and not
+        # after a terminal already spoke its own closing. Teardown still maps
+        # this outcome to `candidate.deferred_pre_disclosure`.
+        # Never before the call was answered either: nobody is listening, and
+        # pre-answer audio is exactly what M009 E6 removed.
+        if (
+            not gate_lifecycle.get("consent_durable")
+            and "terminal_posted" not in gate_lifecycle
+            and not (
+                gate_lifecycle.get("answer_seam")
+                and not gate_lifecycle.get("answer_observed")
+            )
+        ):
+            await _speak_gate_goodbye_bounded(
+                session, say, phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT,
+                pending_speech=gate_speech_holder[0],
+            )
         result = phone.PhoneGateResult(phone.GATE_TIMED_OUT, events=[], spoken=[])
     except phone.PhoneParticipantGone:
         _log.info(
@@ -11398,6 +14550,8 @@ async def _run_phone_session(
         # `latest_assistant_anchor` machinery for that job.
         _clear_question_anchor()
         gate_done.set()
+        # T08b: a role-line draft still composing is never used after this.
+        _cancel_role_compose()
         # E3: the gate is over, so the SIP-departure listener has nothing left
         # to end. Deregister before any teardown await.
         if sip_left_registered:
@@ -11410,6 +14564,18 @@ async def _run_phone_session(
                     )
                 except Exception:  # noqa: BLE001 — the gate-done check is the backstop
                     pass
+        # M013 S01 T03: the gate's lease heartbeat outlives the gate only into
+        # a screening, which reuses it. Every other exit stops it here.
+        if result is None or not result.assessment_allowed:
+            _stop_gate_heartbeat()
+        if gate_lease_halted:
+            # The slot is lost: settle the evidence (the recording is KEPT)
+            # and close the room, but post NOTHING new. Teardown is handed the
+            # cancellation that ended the gate, which is exactly the
+            # "reconnect/lease owner's signal" it already posts nothing for.
+            # Single-flight, so the post-gate teardown call below is a no-op.
+            await _request_room_close()
+            await _run_teardown(result, asyncio.CancelledError())
         if gate_cancelled:
             # This raise exits before the post-gate finally exists. Preserve
             # evidence here while leaving terminal ownership to lease/recovery.
@@ -11436,16 +14602,33 @@ async def _run_phone_session(
     # wrong-number privacy discard. A consented human must flush the gate
     # transcript here before entering screening; the coordinator settles it on
     # every later exit. This keeps discard/finish ownership single-flight.
+    #
+    # M013 S01 T08b: the flush no longer sits in front of the first question
+    # (it was dead air between the role line and Q1). It runs alongside it,
+    # and every per-item screening row waits for it (`_spawn_item_persist`),
+    # so the gate rows still land first. Single-flight with the settle-time
+    # flush.
     if result.assessment_allowed:
-        try:
-            await _flush_gate_transcript()
-        except Exception:  # noqa: BLE001
-            _log.warn(
-                "unknown_event", error_type="phone_item_persist",
-                error_category="gate_flush_failed",
-            )
+        async def _flush_after_gate() -> None:
+            try:
+                await _flush_gate_transcript()
+            except Exception:  # noqa: BLE001
+                _log.warn(
+                    "unknown_event", error_type="phone_item_persist",
+                    error_category="gate_flush_failed",
+                )
+
+        gate_flush_task = asyncio.ensure_future(_flush_after_gate())
+        gate_flush_holder[0] = gate_flush_task
+        persist_tasks.add(gate_flush_task)
+        gate_flush_task.add_done_callback(persist_tasks.discard)
+    else:
+        # T08b: no screening, so nothing may keep preparing Q1.
+        _cancel_q1_prefetch(result)
     # The gate phase is over: nothing after this line is ever flagged as it.
     gate_persist_active[0] = False
+    if not result.assessment_allowed:
+        revocation_window.close("no_screening")  # M013 S01 T07
 
     try:
         if not result.assessment_allowed:
@@ -11468,6 +14651,7 @@ async def _run_phone_session(
                 "unknown_event", error_type="phone_assessment_unstarted",
                 error_category="session_unresolved",
             )
+            _cancel_q1_prefetch(result)  # T08b
             await _request_room_close()
             return result
 
@@ -11515,6 +14699,7 @@ async def _run_phone_session(
             state = gate_state if gate_state is not None and gate_state.ok \
                 else await events.start_assessment(attempt_id, session_id)
             if not state.ok:
+                _cancel_q1_prefetch(result)  # T08b: no question will be asked
                 # ── A REFUSED START IS NOT PROOF THAT NOTHING HAPPENED ────────
                 # `session_not_active` is exactly what a session that is ALREADY
                 # COMPLETED presents — which is the state a scored-but-unacknowledged
@@ -11650,6 +14835,8 @@ async def _run_phone_session(
                 prior_turn_interrupted=prior_turn_interrupted,
                 turn_mode=turn_mode,
                 coverage_judge_enabled=coverage_judge_enabled,
+                revocation_window=revocation_window,
+                qna_close_window=qna_close_window,
                 candidate_speaking=candidate_speaking,
                 candidate_speech_ended=candidate_speech_ended,
                 close_room=_request_room_close,
@@ -11669,18 +14856,32 @@ async def _run_phone_session(
             )
             await _request_room_close()
 
-        heartbeat_task = asyncio.create_task(
-            phone.run_phone_heartbeat(
-                attempt_id=attempt_id,
-                session_id=session_id,
-                epoch=epoch,
-                client=events,
-                halt=halt_for_lease,
+        # M013 S01 T03: REUSE the heartbeat the gate started at the answer
+        # (never a second one), re-pointing its halt at the screening. A lease
+        # lost between the gate's return and this line was recorded by the gate
+        # halt and is acted on as soon as the screening task exists. Only when
+        # the gate could not start one is a heartbeat started here, as before.
+        lease_halt_target[0] = halt_for_lease
+        lost_before_screening = gate_lease_halt.get("reason")
+        heartbeat_task = gate_heartbeat[0]
+        if heartbeat_task is None or (
+            heartbeat_task.done() and lost_before_screening is None
+        ):
+            heartbeat_task = asyncio.create_task(
+                phone.run_phone_heartbeat(
+                    attempt_id=attempt_id,
+                    session_id=session_id,
+                    epoch=epoch,
+                    client=events,
+                    halt=halt_for_lease,
+                )
             )
-        )
+            gate_heartbeat[0] = heartbeat_task
         try:
             screening = asyncio.ensure_future(_screen())
             running["screening"] = screening
+            if lost_before_screening is not None:
+                await halt_for_lease(lost_before_screening)
             try:
                 screened = await screening
                 if getattr(screened, "scoring_queue_owned", False):
@@ -11833,6 +15034,8 @@ async def _run_phone_session(
                     # every child) when the bound expires; nothing further is
                     # needed here.
     finally:
+        # T03 backstop: no exit may leave the call's lease heartbeat beating.
+        _stop_gate_heartbeat()
         # One owner settles gate/post-gate evidence, then performs any requested
         # room delete. It also runs when the caller cancels this task.
         await _run_teardown(result, gate_error)
