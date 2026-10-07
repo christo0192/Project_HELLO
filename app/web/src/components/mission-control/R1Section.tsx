@@ -14,12 +14,13 @@
  * zero it did not measure. The page shell owns the page header; this section
  * starts at a `SectionHeader`.
  *
- * The allowance is NOT an R1-only budget. The capacity RPCs hold the cap
- * against the shared WebRTC pool (phone included, with a 15% margin, never
- * below the owner's dashboard reading) plus R1's held links, so "used",
- * "more sends fit" and "free" are the API's own figures for that test
- * (`committed_minutes`, `sends_left`). Subtracting R1's minutes from the cap
- * here would promise sends the RPC refuses.
+ * Every capacity figure is the API's, read from the same 0119 snapshot Send
+ * uses, so the page cannot promise a send the RPC refuses. The monthly cap is
+ * the R1 allocation, held against R1's own committed minutes
+ * (`committed_minutes`, `sends_left`) in both LiveKit targets. The pause line
+ * belongs to the shared Cloud pool (phone and legacy browser included) and gates
+ * sends only on the cloud target (Mode B); on the self-hosted r1 target (Mode A)
+ * the pool tile is informational, and says so.
  */
 
 import { useCallback, useEffect, useState } from 'react';
@@ -46,9 +47,10 @@ import {
   isReadingStale,
   percentOf,
   r1Ceiling,
+  poolGatesSends,
   r1FreeMinutes,
-  r1PoolMinutes,
   r1RunState,
+  r1UsedMinutes,
   readingMonthLabel,
   usageTone,
 } from '../../lib/r1';
@@ -63,8 +65,8 @@ function empty<T>(): Source<T> {
 }
 
 const DESCRIPTION =
-  'Usage and allocation of the R1 sales role-play interviews, which share LiveKit ' +
-  'minutes with phone.';
+  'Usage and allocation of the R1 sales role-play interviews, and the shared LiveKit ' +
+  'pool they sit beside.';
 
 function monthLabel(monthStart: string): string {
   const date = new Date(`${monthStart}T00:00:00Z`);
@@ -104,7 +106,10 @@ export function R1Section() {
   const committed = u ? u.committed_minutes : 0;
   const committedPct = u ? percentOf(committed, ceiling) : null;
   const poolPct = u ? percentOf(u.guard_minutes, u.pause_line_minutes) : null;
-  const readingStale = u ? isReadingStale(u.dashboard_read_at, u.month_start) : false;
+  // The pause line gates sends only on the cloud target; elsewhere the pool is information.
+  const poolGates = u ? poolGatesSends(u) : true;
+  const readingStale =
+    u && poolGates ? isReadingStale(u.dashboard_read_at, u.month_start) : false;
 
   const dash = (source: Source<unknown>, item: MetricItem): MetricItem =>
     source.error
@@ -151,10 +156,11 @@ export function R1Section() {
       value: u ? (poolPct === null ? '—' : `${poolPct}%`) : '',
       context: u
         ? `${formatMinutes(u.guard_minutes)} of ` +
-          `${formatMinutes(u.pause_line_minutes)} min pause line`
+          `${formatMinutes(u.pause_line_minutes)} min pause line` +
+          (poolGates ? '' : ' · informational, R1 is self-hosted')
         : undefined,
-      tone: usageTone(poolPct),
-      attention: poolPct !== null && poolPct >= 75,
+      tone: poolGates ? usageTone(poolPct) : 'neutral',
+      attention: poolGates && poolPct !== null && poolPct >= 75,
     }),
   ];
 
@@ -192,10 +198,10 @@ export function R1Section() {
           title="R1 allowance"
           description={
             u
-              ? `Against the ${formatMinutes(ceiling)}-minute ceiling (the lower of the cap and ` +
-                'the pause line). Used: the shared pool, phone included, or R1’s started ' +
-                'interviews if higher. Held: links already sent.'
-              : 'Minutes against the monthly ceiling.'
+              ? `Against the ${formatMinutes(ceiling)}-minute R1 allocation (the monthly cap). ` +
+                'Used: R1’s own interview minutes, booked or estimated, whichever is higher. ' +
+                'Held: links already sent.'
+              : 'Minutes against the monthly allocation.'
           }
         >
           {usage.error ? (
@@ -211,7 +217,7 @@ export function R1Section() {
               data={
                 u
                   ? [
-                      { label: 'Used', value: r1PoolMinutes(u), tone: 'info' },
+                      { label: 'Used', value: r1UsedMinutes(u), tone: 'info' },
                       {
                         label: 'Held',
                         value: u.minutes_reserved,
@@ -282,7 +288,10 @@ export function R1Section() {
           {u.dashboard_read_at ? (
             <>
               LiveKit dashboard reading: {formatReading(u.dashboard_minutes)} min, read{' '}
-              {formatDateTime(u.dashboard_read_at)}. The guard never goes below it.
+              {formatDateTime(u.dashboard_read_at)}.{' '}
+              {poolGates
+                ? 'The guard never goes below it.'
+                : 'It sets the shared-pool figure only; it does not limit R1 here.'}
             </>
           ) : (
             <>

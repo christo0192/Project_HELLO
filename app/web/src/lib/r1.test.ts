@@ -19,13 +19,14 @@ import {
   needsConfirmation,
   parseDashboardMinutes,
   percentOf,
+  poolGatesSends,
   r1Ceiling,
   r1ErrorMessage,
   r1FreeMinutes,
-  r1PoolMinutes,
   r1RunState,
   r1StatusLabel,
   r1StatusTone,
+  r1UsedMinutes,
   readingMonthLabel,
   rebaseDraft,
   sendGate,
@@ -438,41 +439,51 @@ describe('run state', () => {
 });
 
 describe('usage figures', () => {
-  // The capacity figures are the API's (the RPCs' shared-pool arithmetic); this module only
-  // shows them. committed_minutes already includes the pool guard and the held links.
+  // The capacity figures are the API's (the 0119 snapshot Send also uses); this module only
+  // shows them. committed_minutes is R1's own committed minutes, including the held links, and
+  // the monthly cap is the R1 allocation it is held against.
   const usage = {
-    monthly_cap_minutes: 4000,
-    pause_line_minutes: 3500,
+    monthly_cap_minutes: 1100,
+    pause_line_minutes: 4000,
     minutes_reserved: 55,
-    committed_minutes: 1205,
+    committed_minutes: 110,
   };
 
-  it('takes the lower of the cap and the pause line as the ceiling', () => {
-    expect(r1Ceiling(usage)).toBe(3500);
-    expect(r1Ceiling({ ...usage, monthly_cap_minutes: 100 })).toBe(100);
+  it('takes the monthly cap, the R1 allocation, as the ceiling whatever the pause line is', () => {
+    expect(r1Ceiling(usage)).toBe(1100);
+    // The pause line belongs to the shared Cloud pool, so it never lowers R1's ceiling.
+    const lowLine = { ...usage, pause_line_minutes: 500 };
+    expect(r1Ceiling(lowLine)).toBe(1100);
+    const highCap = { ...usage, monthly_cap_minutes: 4000, pause_line_minutes: 3500 };
+    expect(r1Ceiling(highCap)).toBe(4000);
   });
 
-  it('leaves free what the committed pool and held links have not claimed', () => {
-    expect(r1FreeMinutes(usage)).toBe(3500 - 1205);
+  it('leaves free what R1’s own use and held links have not claimed', () => {
+    expect(r1FreeMinutes(usage)).toBe(1100 - 110);
   });
 
-  it('never reports negative free minutes when the pool is past the line', () => {
-    expect(r1FreeMinutes({ ...usage, committed_minutes: 3967.5, pause_line_minutes: 3000 })).toBe(
-      0,
-    );
+  it('never reports negative free minutes when R1 is past its allocation', () => {
+    expect(r1FreeMinutes({ ...usage, committed_minutes: 1200 })).toBe(0);
   });
 
-  it('separates the pool from the held links inside the committed minutes', () => {
-    expect(r1PoolMinutes(usage)).toBe(1150);
-    expect(r1PoolMinutes({ ...usage, committed_minutes: 20 })).toBe(0);
+  it('separates R1’s own use from the held links inside the committed minutes', () => {
+    expect(r1UsedMinutes(usage)).toBe(55);
+    expect(r1UsedMinutes({ ...usage, committed_minutes: 20 })).toBe(0);
   });
 
-  it('shows phone-dominated use as claimed, not as free (the review’s figures)', () => {
-    // 3,450 phone minutes: the guard is 3,967.5, R1 itself used and held nothing.
-    const phoneHeavy = { ...usage, pause_line_minutes: 4000, minutes_reserved: 0 };
-    const figures = { ...phoneHeavy, committed_minutes: 3967.5 };
-    expect(r1PoolMinutes(figures)).toBe(3967.5);
-    expect(r1FreeMinutes(figures)).toBe(32.5);
+  it('does not charge the allocation for a full Cloud pool (production, Mode A)', () => {
+    // The pool is far past the pause line (phone and a stuck legacy session), R1 used 0 and holds
+    // 55: the committed minutes are R1's alone, so 1,045 of the 1,100 are still free.
+    const figures = { ...usage, committed_minutes: 55 };
+    expect(r1UsedMinutes(figures)).toBe(0);
+    expect(r1FreeMinutes(figures)).toBe(1045);
+  });
+
+  it('reads the pause line as gating only on the cloud target', () => {
+    expect(poolGatesSends({ pool_check_applies: true })).toBe(true);
+    expect(poolGatesSends({ pool_check_applies: false })).toBe(false);
+    // An older API says nothing: keep the cautious reading.
+    expect(poolGatesSends({})).toBe(true);
   });
 
   it('bands the pool at 60, 75 and 90 percent', () => {

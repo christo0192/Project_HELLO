@@ -7,11 +7,14 @@
  * measure) with retry, the empty month, the link to R1 settings, the
  * dashboard-reading line, dark mode, and axe.
  *
- * The allowance is the capacity RPCs' own shared-pool test, so "used", "more
- * sends fit" and "free" come from the API's `committed_minutes` and
- * `sends_left`, never from R1's minutes alone (phone minutes can leave no
- * sends while R1 itself has used none). A dashboard reading from an earlier
- * month is flagged, because the guard keeps counting it.
+ * Every capacity figure is the API's, read from the 0119 snapshot Send uses:
+ * "used", "more sends fit" and "free" come from `committed_minutes` (R1's own
+ * minutes against the R1 allocation, the monthly cap) and `sends_left`. The
+ * shared pool and its pause line gate sends only on the cloud target (Mode B),
+ * where a full pool can leave no sends while R1 itself has used none; on the
+ * self-hosted r1 target (Mode A) the pool tile is informational and says so.
+ * A dashboard reading from an earlier month is flagged where the guard still
+ * counts it (the cloud target).
  */
 import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
@@ -39,13 +42,19 @@ const USAGE = {
   phone_minutes: 900,
   legacy_browser_minutes: 10,
   estimated_minutes: 1092.5,
-  // max(1,000 dashboard + 0 ledger, 950 pure) x 1.15.
   ledger_since_minutes: 0,
+  // The shared Cloud pool: the dashboard reading (1,000) grown by 1.15 x the estimate since.
   guard_minutes: 1150,
-  // max(110 used, 1,150 guard) + 55 held.
-  committed_minutes: 1205,
-  // floor((4,000 - 1,205) / 55).
-  sends_left: 50,
+  // R1's own: max(110 used, R1 estimate) + 55 held, against the 4,000 allocation.
+  committed_minutes: 165,
+  // The cloud target: both limits apply, and the pool is the tighter one.
+  livekit_target: 'cloud' as const,
+  pool_check_applies: true,
+  r1_headroom_minutes: 3835,
+  pool_committed_minutes: 1269,
+  pool_headroom_minutes: 2731,
+  // floor(min(3,835, 2,731) / 55).
+  sends_left: 49,
   runtime: { enabled: true, status: 'enabled' as const },
 };
 
@@ -110,24 +119,25 @@ describe('R1Section (Mission Control)', () => {
     ).toBeInTheDocument();
 
     const allowance = tile('R1 allowance used');
-    // The pool guard (1,150) governs over R1's own 110 used, plus 55 held: 1,205 of 4,000.
-    expect(within(allowance).getByText('1,205')).toBeInTheDocument();
+    // R1's own committed minutes (110 used plus 55 held) against the 4,000 allocation.
+    expect(within(allowance).getByText('165')).toBeInTheDocument();
     expect(within(allowance).getByText('/ 4,000 min')).toBeInTheDocument();
-    expect(within(allowance).getByText('50 more sends fit · 30% committed')).toBeInTheDocument();
+    expect(within(allowance).getByText('49 more sends fit · 4% committed')).toBeInTheDocument();
 
     const started = tile('Interviews started');
     expect(within(started).getByText('2')).toBeInTheDocument();
     expect(within(started).getByText('110 min taken · 55 min held')).toBeInTheDocument();
 
     const pool = tile('Shared WebRTC pool');
-    // The guard (dashboard reading x 1.15, above the pure estimate) over the pause line.
+    // The guard (dashboard reading x 1.15, above the pure estimate) over the pause line, which
+    // gates sends on the cloud target.
     expect(within(pool).getByText('29%')).toBeInTheDocument();
     expect(within(pool).getByText('1,150 of 4,000 min pause line')).toBeInTheDocument();
   });
 
-  it('reports the shared pool, not R1 alone: phone minutes can leave no sends', async () => {
-    // The review's figures: 3,450 phone minutes, R1 used and held 0. The R1-only subtraction
-    // said "72 more sends fit" and 0% committed while the capacity RPC refused every send.
+  it('on the cloud target a full pool leaves no sends although R1 itself has used none', async () => {
+    // 3,450 phone minutes, R1 used and held 0: R1's allocation is untouched (0% committed, all
+    // 4,000 free) but the pause line has no room, so the API says no sends fit.
     apiFns.getR1Usage.mockResolvedValue({
       ...USAGE,
       dashboard_minutes: 0,
@@ -141,34 +151,111 @@ describe('R1Section (Mission Control)', () => {
       estimated_minutes: 3967.5,
       ledger_since_minutes: 0,
       guard_minutes: 3967.5,
-      committed_minutes: 3967.5,
+      committed_minutes: 0,
+      r1_headroom_minutes: 4000,
+      pool_committed_minutes: 3967.5,
+      pool_headroom_minutes: 32.5,
       sends_left: 0,
     });
     renderSection();
     await waitFor(() => {
       expect(
-        within(tile('R1 allowance used')).getByText('0 more sends fit · 99% committed'),
+        within(tile('R1 allowance used')).getByText('0 more sends fit · 0% committed'),
       ).toBeInTheDocument();
     });
-    expect(within(tile('R1 allowance used')).getByText('3,968').closest('dd')).toHaveClass(
+    expect(within(tile('Shared WebRTC pool')).getByText('99%').closest('dd')).toHaveClass(
       'text-warning-text',
     );
     const allowance = await screen.findByRole('table', { name: 'R1 allowance data' });
     const free = within(allowance).getByRole('rowheader', { name: 'Free' }).closest('tr')!;
-    // 4,000 - 3,967.5: what is genuinely left, not 4,000 - R1's 0.
-    expect(free).toHaveTextContent(/32\.5|33/);
-    expect(free).not.toHaveTextContent('4,000');
+    expect(free).toHaveTextContent('4,000');
   });
 
-  it('counts the dashboard reading at the same margin the RPC does', async () => {
-    // Dashboard 3,600 read today and a smaller pure estimate: the RPC guard is 4,140.
+  it('on the self-hosted target the pool is information, not a limit (production, Mode A)', async () => {
+    // 2026-10-08: the estimate holds 6,396 legacy-browser and 412 phone minutes, far past the pause
+    // line, while R1 has used none of its 1,100-minute allocation and holds one link (55).
+    apiFns.getR1Usage.mockResolvedValue({
+      ...USAGE,
+      monthly_cap_minutes: 1100,
+      pause_line_minutes: 4000,
+      dashboard_minutes: 3900,
+      dashboard_read_at: '2026-10-06T10:00:00.000Z',
+      minutes_reserved: 55,
+      minutes_used: 0,
+      starts_admitted: 0,
+      r1_minutes: 0,
+      phone_minutes: 412,
+      legacy_browser_minutes: 6396,
+      estimated_minutes: 7829.2,
+      guard_minutes: 7829.2,
+      committed_minutes: 55,
+      livekit_target: 'r1' as const,
+      pool_check_applies: false,
+      r1_headroom_minutes: 1045,
+      pool_committed_minutes: 7884.2,
+      pool_headroom_minutes: -3884.2,
+      sends_left: 19,
+    });
+    renderSection();
+    await waitFor(() => {
+      expect(
+        within(tile('R1 allowance used')).getByText('19 more sends fit · 5% committed'),
+      ).toBeInTheDocument();
+    });
+    expect(within(tile('R1 allowance used')).getByText('/ 1,100 min')).toBeInTheDocument();
+    const table = await screen.findByRole('table', { name: 'R1 allowance data' });
+    const free = within(table).getByRole('rowheader', { name: 'Free' }).closest('tr')!;
+    expect(free).toHaveTextContent('1,045');
+
+    const pool = tile('Shared WebRTC pool');
+    expect(within(pool).getByText('196%')).toBeInTheDocument();
+    expect(
+      within(pool).getByText('7,829 of 4,000 min pause line · informational, R1 is self-hosted'),
+    ).toBeInTheDocument();
+    // Past the line, but nothing is wrong with R1: no attention colour on the figure.
+    expect(within(pool).getByText('196%').closest('dd')).not.toHaveClass('text-warning-text');
+    expect(
+      screen.getByText(/It sets the shared-pool figure only; it does not limit R1 here/),
+    ).toBeInTheDocument();
+  });
+
+  it('does not flag a stale dashboard reading on the self-hosted target, where it limits nothing', async () => {
+    apiFns.getR1Usage.mockResolvedValue({
+      ...USAGE,
+      dashboard_minutes: 3900,
+      dashboard_read_at: '2026-09-30T20:00:00.000Z',
+      livekit_target: 'r1' as const,
+      pool_check_applies: false,
+    });
+    renderSection();
+    await screen.findByText(/LiveKit dashboard reading: 3,900 min, read/);
+    expect(screen.queryByText(/but the guard still counts it/)).not.toBeInTheDocument();
+  });
+
+  it('keeps the cautious reading when an older API does not say which target applies', async () => {
+    const older: Record<string, unknown> = { ...USAGE };
+    delete older.livekit_target;
+    delete older.pool_check_applies;
+    apiFns.getR1Usage.mockResolvedValue(older);
+    renderSection();
+    await waitFor(() => {
+      expect(
+        within(tile('Shared WebRTC pool')).getByText('1,150 of 4,000 min pause line'),
+      ).toBeInTheDocument();
+    });
+  });
+
+  it('shows the dashboard-reading guard the API computes, over the pause line', async () => {
+    // Dashboard 3,600 read today and a smaller pure estimate: the snapshot's pool guard is 4,140.
     apiFns.getR1Usage.mockResolvedValue({
       ...USAGE,
       dashboard_minutes: 3600,
       minutes_reserved: 0,
       minutes_used: 0,
       guard_minutes: 4140,
-      committed_minutes: 4140,
+      committed_minutes: 0,
+      pool_committed_minutes: 4140,
+      pool_headroom_minutes: -140,
       sends_left: 0,
     });
     renderSection();
@@ -181,16 +268,14 @@ describe('R1Section (Mission Control)', () => {
     expect(within(tile('R1 allowance used')).getByText(/^0 more sends fit/)).toBeInTheDocument();
   });
 
-  it('uses the lower of the cap and the pause line as the ceiling', async () => {
+  it('uses the monthly cap, the R1 allocation, as the ceiling, not the pause line', async () => {
     apiFns.getR1Usage.mockResolvedValue({ ...USAGE, pause_line_minutes: 1000 });
     renderSection();
     await waitFor(() => {
-      expect(within(tile('R1 allowance used')).getByText('/ 1,000 min')).toBeInTheDocument();
+      expect(within(tile('R1 allowance used')).getByText('/ 4,000 min')).toBeInTheDocument();
     });
     expect(
-      screen.getByText(
-        /Against the 1,000-minute ceiling \(the lower of the cap and the pause line\)/,
-      ),
+      screen.getByText(/Against the 4,000-minute R1 allocation \(the monthly cap\)/),
     ).toBeInTheDocument();
   });
 
@@ -274,7 +359,7 @@ describe('R1Section (Mission Control)', () => {
 
     fireEvent.click(screen.getAllByRole('button', { name: 'Try again' })[0]!);
     await waitFor(() => {
-      expect(within(tile('R1 allowance used')).getByText('1,205')).toBeInTheDocument();
+      expect(within(tile('R1 allowance used')).getByText('165')).toBeInTheDocument();
     });
     expect(apiFns.getR1Usage).toHaveBeenCalledTimes(2);
   });
@@ -285,7 +370,7 @@ describe('R1Section (Mission Control)', () => {
     await waitFor(() => {
       expect(within(tile('R1 status')).getByText('Not available')).toBeInTheDocument();
     });
-    expect(within(tile('R1 allowance used')).getByText('1,205')).toBeInTheDocument();
+    expect(within(tile('R1 allowance used')).getByText('165')).toBeInTheDocument();
   });
 
   it('says there is nothing to chart for an empty month, without inventing numbers', async () => {

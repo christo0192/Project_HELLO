@@ -125,11 +125,20 @@ export type R1SettingsPatch = Partial<
 /**
  * `GET /api/admin/r1/usage`: the current UTC month.
  *
- * The capacity figures are the capacity RPCs' own shared-pool arithmetic, not
- * R1's minutes alone: `guard_minutes = max(dashboard_minutes +
- * ledger_since_minutes, r1 + phone + legacy) * 1.15`, `committed_minutes =
- * max(minutes_used, guard_minutes) + minutes_reserved`, and a send fits while
- * `committed_minutes + hold_minutes <= min(cap, pause line)`.
+ * The capacity figures are the 0119 capacity snapshot's own (the one function
+ * Send and admission also call), not a second formula:
+ *  - `committed_minutes` is R1's committed minutes (the larger of the booked and
+ *    the estimated minutes, plus the links held) against the R1 ALLOCATION,
+ *    `monthly_cap_minutes`, in both LiveKit targets. `r1_headroom_minutes` is
+ *    what is left of it.
+ *  - `guard_minutes` is the shared Cloud pool (phone, legacy browser and R1),
+ *    checked against `pause_line_minutes` ONLY when `pool_check_applies` (the
+ *    cloud target, Mode B). On the r1 target (Mode A, self-hosted) R1 spends no
+ *    Cloud minutes, so the pool figures are informational and gate nothing.
+ *  - `sends_left` is the whole sends that fit now under the limits that apply.
+ *
+ * The fields added with the snapshot are optional here, so an older API never
+ * makes the page throw.
  */
 export interface R1UsageResponse {
   month_start: string;
@@ -145,11 +154,22 @@ export interface R1UsageResponse {
   phone_minutes: number;
   legacy_browser_minutes: number;
   estimated_minutes: number;
-  /** R1 ledger minutes recorded at or after `dashboard_read_at`. */
+  /** R1 ledger minutes recorded at or after `dashboard_read_at`. Informational since 0119. */
   ledger_since_minutes: number;
+  /** The shared Cloud pool as the snapshot guards it; informational on the r1 target. */
   guard_minutes: number;
+  /** R1's committed minutes, against the R1 allocation (`monthly_cap_minutes`). */
   committed_minutes: number;
-  /** Whole sends that still fit under the ceiling (never negative). */
+  /** Whole sends that still fit under the limits that apply (never negative). */
   sends_left: number;
+  /** `cloud` is Mode B (the pause line gates the pool); `r1` is Mode A (self-hosted). */
+  livekit_target?: 'cloud' | 'r1';
+  /** True only on the cloud target; absent from an older API, which is read as true. */
+  pool_check_applies?: boolean;
+  /** The allocation less `committed_minutes`; negative when over it. */
+  r1_headroom_minutes?: number;
+  pool_committed_minutes?: number;
+  /** The pause line less `pool_committed_minutes`; gates a send only on the cloud target. */
+  pool_headroom_minutes?: number;
   runtime: R1RuntimeStatus;
 }

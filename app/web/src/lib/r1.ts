@@ -187,8 +187,9 @@ export const R1_AVAILABILITY_COPY: Readonly<
   capacity_exhausted: {
     title: 'This month’s R1 allowance is used up',
     detail:
-      'The shared WebRTC allowance, which phone calls also use, has no room for another R1 ' +
-      'link. It reopens when the allowance is raised or the month rolls over.',
+      'There is no room left for another R1 link this month, counting the links already ' +
+      'sent. It reopens when the allowance is raised, an unused link is cancelled or ' +
+      'expires, or the month rolls over.',
   },
   role_not_configured: {
     title: 'R1 is not set up yet',
@@ -413,35 +414,44 @@ export function needsConfirmation(patch: R1SettingsPatch): string[] {
 /* ── Usage, for Mission Control ───────────────────────────────────── */
 
 /**
- * The capacity figures come from the API, which applies the capacity RPCs'
- * own arithmetic (see `R1UsageResponse`): the allowance is a ceiling on the
- * SHARED WebRTC pool plus R1's holds, not an R1-only budget. This module only
- * displays them, so a figure here can never disagree with what a send does.
+ * The capacity figures come from the API, which reads the 0119 capacity
+ * snapshot that Send and admission also use (see `R1UsageResponse`): the
+ * monthly cap is the R1 ALLOCATION, checked against R1's own committed minutes
+ * in both LiveKit targets, and the pause line belongs to the shared Cloud pool,
+ * which gates sends only on the cloud target. This module only displays them,
+ * so a figure here can never disagree with what a send does.
  */
 type UsageFigures = Pick<
   R1UsageResponse,
-  'monthly_cap_minutes' | 'pause_line_minutes' | 'minutes_reserved' | 'committed_minutes'
+  'monthly_cap_minutes' | 'minutes_reserved' | 'committed_minutes'
 >;
 
-/** The lower of the cap and the pause line is the ceiling the admission RPC enforces. */
-export function r1Ceiling(
-  usage: Pick<UsageFigures, 'monthly_cap_minutes' | 'pause_line_minutes'>,
-): number {
-  return Math.min(usage.monthly_cap_minutes, usage.pause_line_minutes);
+/** The R1 allocation: the monthly cap. The pause line is the Cloud pool's, not R1's. */
+export function r1Ceiling(usage: Pick<UsageFigures, 'monthly_cap_minutes'>): number {
+  return usage.monthly_cap_minutes;
 }
 
-/** Minutes of the ceiling still unclaimed by the pool or by held links (never negative). */
+/** Minutes of the allocation neither used by R1 nor held by links already sent (never negative). */
 export function r1FreeMinutes(
-  usage: Pick<UsageFigures, 'monthly_cap_minutes' | 'pause_line_minutes' | 'committed_minutes'>,
+  usage: Pick<UsageFigures, 'monthly_cap_minutes' | 'committed_minutes'>,
 ): number {
   return Math.max(0, r1Ceiling(usage) - usage.committed_minutes);
 }
 
-/** The part of the committed minutes that is the pool itself, before held links. */
-export function r1PoolMinutes(
+/** The part of the committed minutes that is R1's own use, before held links. */
+export function r1UsedMinutes(
   usage: Pick<UsageFigures, 'minutes_reserved' | 'committed_minutes'>,
 ): number {
   return Math.max(0, usage.committed_minutes - usage.minutes_reserved);
+}
+
+/**
+ * True when the shared pool's pause line gates sends (the cloud target, Mode B).
+ * On the self-hosted r1 target (Mode A) the pool figures are informational. An
+ * API that does not say is read as gating, the cautious reading.
+ */
+export function poolGatesSends(usage: Pick<R1UsageResponse, 'pool_check_applies'>): boolean {
+  return usage.pool_check_applies !== false;
 }
 
 /**
