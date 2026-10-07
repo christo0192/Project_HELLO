@@ -11,37 +11,162 @@ die() {
 : "${LIVEKIT_KEYS:?LIVEKIT_KEYS must be a Fly secret (<key>: <32+ char secret>)}"
 
 # Config A is the required baseline: no rtc.ips filter and no Fly Global
-# Services lookup. Config B is an explicit follow-up experiment only.
+# Services lookup. Config B is an explicit follow-up experiment only: it binds
+# the browser-facing UDP socket to fly-global-services. Config C is Config B
+# plus this Machine's Fly 6PN IPv6 address, so the R1 worker (another Fly app in
+# the same organization) reaches the SFU over private IPv6 instead of the
+# public dedicated IPv4, which a Fly Machine cannot reach (no hairpin; see
+# README "Config C").
 R1_CONFIG="${LIVEKIT_R1_CONFIG:-A}"
 case "$R1_CONFIG" in
-  A | B) ;;
-  *) die "LIVEKIT_R1_CONFIG must be A (default) or B" ;;
+  A | B | C) ;;
+  *) die "LIVEKIT_R1_CONFIG must be A (default), B or C" ;;
 esac
 
-# This seam is useful only for a local Config-B smoke test. Fly must never
-# accept it: a typo such as 127.0.0.1 would leave signaling healthy but UDP dead.
+# These seams are useful only for a local Config-B/C smoke test. Fly must never
+# accept them: a typo such as 127.0.0.1 would leave signaling healthy but UDP dead.
 if [ -n "${LIVEKIT_R1_FGS_IP_OVERRIDE:-}" ] && { [ -n "${FLY_APP_NAME:-}" ] || [ -n "${FLY_MACHINE_ID:-}" ]; }; then
   die "LIVEKIT_R1_FGS_IP_OVERRIDE is forbidden on Fly"
+fi
+if [ -n "${LIVEKIT_R1_6PN_IP_OVERRIDE:-}" ] && { [ -n "${FLY_APP_NAME:-}" ] || [ -n "${FLY_MACHINE_ID:-}" ]; }; then
+  die "LIVEKIT_R1_6PN_IP_OVERRIDE is forbidden on Fly"
+fi
+# Test seam for the Config C interface check below. On Fly it would let a fake
+# table vouch for an address the kernel does not have, so it is rejected there.
+if [ -n "${LIVEKIT_R1_IF_INET6_FILE:-}" ] && { [ -n "${FLY_APP_NAME:-}" ] || [ -n "${FLY_MACHINE_ID:-}" ]; }; then
+  die "LIVEKIT_R1_IF_INET6_FILE is forbidden on Fly"
 fi
 
 case "$NODE_IP" in
   *[!0-9.]* | .* | *..* | '') die "NODE_IP must be an IPv4 address" ;;
 esac
 
+# Succeeds only for an fdaa:-prefixed IPv6 literal made of 1-4 digit hex groups:
+# eight groups, or at most seven with one `::`. The value is rendered into YAML
+# and handed to livekit-server as a /128, so nothing else (zone ids, prefix
+# lengths, brackets, whitespace, newlines) may pass. Pure POSIX sh + awk, and no
+# regex intervals, so it behaves the same under busybox, dash, mawk and gawk.
+is_6pn_ipv6() {
+  case "$1" in
+    *[!0-9A-Fa-f:]*) return 1 ;;
+  esac
+  printf '%s\n' "$1" | awk '
+    # Every ":"-separated group is 1-4 hex digits (an empty text has no groups).
+    function groups_ok(text,    parts, i, n) {
+      if (text == "") return 1
+      n = split(text, parts, ":")
+      for (i = 1; i <= n; i++) {
+        if (length(parts[i]) < 1 || length(parts[i]) > 4 || parts[i] !~ /^[0-9A-Fa-f]+$/) return 0
+      }
+      return 1
+    }
+    {
+      addr = $0
+      if (addr !~ /^[Ff][Dd][Aa][Aa]:/) exit 1
+      if (addr ~ /:::/) exit 1
+      copy = addr
+      doubles = gsub(/::/, "::", copy)
+      if (doubles > 1) exit 1
+      if (doubles == 0) {
+        if (split(addr, parts, ":") != 8) exit 1
+        if (!groups_ok(addr)) exit 1
+        exit 0
+      }
+      at = index(addr, "::")
+      left = substr(addr, 1, at - 1)
+      right = substr(addr, at + 2)
+      total = split(left, lparts, ":")
+      if (right != "") total += split(right, rparts, ":")
+      if (total > 7) exit 1
+      if (!groups_ok(left) || !groups_ok(right)) exit 1
+      exit 0
+    }
+  '
+}
+
+# Succeeds only when the IPv6 literal $1 (already accepted by is_6pn_ipv6) is
+# assigned to a local interface, according to the kernel table $2 (/proc/net/if_inet6:
+# one line per address, field 1 = the address as 32 lowercase hex digits). LiveKit
+# applies rtc.ips as an allow-list of local interface addresses, so a well-formed
+# /128 that matches no interface opens no socket, gathers no candidate and logs
+# nothing: Config C would silently behave like Config B. The literal is expanded
+# to 32 digits here, without `ip`, so it needs nothing beyond awk. An unreadable
+# table counts as a miss (fail closed).
+v6_is_configured() {
+  [ -r "$2" ] || return 1
+  v6_hex="$(printf '%s\n' "$1" | awk '
+    function pad(group) { return substr("0000", 1, 4 - length(group)) tolower(group) }
+    {
+      at = index($0, "::")
+      if (at == 0) {
+        n = split($0, parts, ":")
+        out = ""
+        for (i = 1; i <= n; i++) out = out pad(parts[i])
+        print out
+        exit
+      }
+      left = substr($0, 1, at - 1)
+      right = substr($0, at + 2)
+      nl = (left == "") ? 0 : split(left, lparts, ":")
+      nr = (right == "") ? 0 : split(right, rparts, ":")
+      out = ""
+      for (i = 1; i <= nl; i++) out = out pad(lparts[i])
+      for (i = nl + nr; i < 8; i++) out = out "0000"
+      for (i = 1; i <= nr; i++) out = out pad(rparts[i])
+      print out
+    }
+  ')"
+  [ "${#v6_hex}" -eq 32 ] || return 1
+  awk -v want="$v6_hex" '
+    tolower($1) == want { found = 1; exit }
+    END { exit (found ? 0 : 1) }
+  ' "$2"
+}
+
 FGS=""
-if [ "$R1_CONFIG" = "B" ]; then
+if [ "$R1_CONFIG" = "B" ] || [ "$R1_CONFIG" = "C" ]; then
   # `getent hosts` resolves Fly's per-Machine reply-source address, not public
   # DNS. Docker lacks that hostname, so the override is local-only (above).
   if [ -n "${LIVEKIT_R1_FGS_IP_OVERRIDE:-}" ]; then
     FGS="$LIVEKIT_R1_FGS_IP_OVERRIDE"
-    echo "livekit-r1-entrypoint: using LIVEKIT_R1_FGS_IP_OVERRIDE=${FGS} for a non-Fly local Config-B run" >&2
+    echo "livekit-r1-entrypoint: using LIVEKIT_R1_FGS_IP_OVERRIDE=${FGS} for a non-Fly local Config-${R1_CONFIG} run" >&2
   else
     FGS="$(getent hosts fly-global-services 2>/dev/null | awk '$1 ~ /^[0-9]+(\.[0-9]+){3}$/ { print $1; exit }')"
-    [ -n "$FGS" ] || die "Config B requires fly-global-services IPv4; set LIVEKIT_R1_FGS_IP_OVERRIDE only for a local smoke test"
+    [ -n "$FGS" ] || die "Config ${R1_CONFIG} requires fly-global-services IPv4; set LIVEKIT_R1_FGS_IP_OVERRIDE only for a local smoke test"
   fi
   case "$FGS" in
     *[!0-9.]* | .* | *..* | '') die "fly-global-services returned an invalid IPv4 address" ;;
   esac
+fi
+
+# Config C only. Fly aliases the Machine's own 6PN address to fly-local-6pn in
+# /etc/hosts (and also exports it as FLY_PRIVATE_IP, used only if that alias does
+# not resolve here). It is not static (it can change on a reboot or host
+# migration), so it is read at every boot and never stored in fly.toml or a
+# secret. Fail closed: without it Config C would silently degrade to Config B,
+# the broken worker path. The same is true of a well-formed address that no
+# interface carries (a stale /etc/hosts or a mismatched FLY_PRIVATE_IP), so it
+# must also be present in the kernel's address table before anything is rendered.
+V6=""
+if [ "$R1_CONFIG" = "C" ]; then
+  if [ -n "${LIVEKIT_R1_6PN_IP_OVERRIDE:-}" ]; then
+    V6="$LIVEKIT_R1_6PN_IP_OVERRIDE"
+    echo "livekit-r1-entrypoint: using LIVEKIT_R1_6PN_IP_OVERRIDE=${V6} for a non-Fly local Config-C run" >&2
+  else
+    V6="$(getent hosts fly-local-6pn 2>/dev/null | awk '$1 ~ /:/ { print $1; exit }')"
+    if [ -z "$V6" ] && [ -n "${FLY_PRIVATE_IP:-}" ]; then
+      V6="$FLY_PRIVATE_IP"
+      echo "livekit-r1-entrypoint: fly-local-6pn did not resolve; using FLY_PRIVATE_IP" >&2
+    fi
+    [ -n "$V6" ] || die "Config C requires the Machine's fly-local-6pn IPv6 (Fly private network); set LIVEKIT_R1_6PN_IP_OVERRIDE only for a local smoke test"
+  fi
+  is_6pn_ipv6 "$V6" || die "fly-local-6pn must be an fdaa: 6PN IPv6 address made of hex groups"
+  # The local override is a non-Fly smoke test (forbidden on Fly), where a made-up
+  # address cannot be on an interface; every real Fly start is checked.
+  if [ -z "${LIVEKIT_R1_6PN_IP_OVERRIDE:-}" ]; then
+    IF_INET6_FILE="${LIVEKIT_R1_IF_INET6_FILE:-/proc/net/if_inet6}"
+    v6_is_configured "$V6" "$IF_INET6_FILE" || die "Config C: 6PN address ${V6} is not configured on any interface (not in ${IF_INET6_FILE}); LiveKit would open no 6PN socket and behave like Config B"
+  fi
 fi
 
 # A mapping line is accepted, rather than arbitrary YAML, so a malformed or
@@ -65,19 +190,20 @@ if [ "${LIVEKIT_R1_RENDER_ONLY:-}" = "1" ] && [ ! -f "$TEMPLATE_FILE" ]; then
 fi
 [ -r "$TEMPLATE_FILE" ] || die "LiveKit configuration template is unreadable: $TEMPLATE_FILE"
 
-# The template has a standalone marker for the optional Config-B block. Render
+# The template has a standalone marker for the optional Config-B/C block. Render
 # line-by-line instead of sed's multi-line `c\` command: an empty Config-A
 # replacement can consume the following sed expression, and literal newlines
 # are not portable across sed implementations.
 if [ "${LIVEKIT_R1_RENDER_ONLY:-}" = "1" ]; then
   KEYS_YAML="$KEY_NAME: REDACTED"
 fi
-awk -v node_ip="$NODE_IP" -v keys_yaml="$KEYS_YAML" -v r1_config="$R1_CONFIG" -v fgs="$FGS" '
+awk -v node_ip="$NODE_IP" -v keys_yaml="$KEYS_YAML" -v r1_config="$R1_CONFIG" -v fgs="$FGS" -v v6="$V6" '
   /__RTC_IPS__/ {
-    if (r1_config == "B") {
+    if (r1_config == "B" || r1_config == "C") {
       print "  ips:"
       print "    includes:"
       print "      - \"" fgs "/32\""
+      if (r1_config == "C") print "      - \"" v6 "/128\""
     }
     next
   }
@@ -99,7 +225,11 @@ else
   echo "livekit-r1-entrypoint: could not set UDP receive buffers to 5000000; continuing" >&2
 fi
 
-echo "livekit-r1-entrypoint: Config ${R1_CONFIG}; advertising ${NODE_IP}:7882" >&2
+if [ "$R1_CONFIG" = "C" ]; then
+  echo "livekit-r1-entrypoint: Config C; advertising ${NODE_IP}:7882 and 6PN ${V6}" >&2
+else
+  echo "livekit-r1-entrypoint: Config ${R1_CONFIG}; advertising ${NODE_IP}:7882" >&2
+fi
 # livekit-server also reads LIVEKIT_KEYS from the environment, in its own
 # "key: secret" format, which conflicts with our validated form. The keys are
 # already rendered into $CONFIG_FILE, so drop the env copy.

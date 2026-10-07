@@ -21,7 +21,7 @@ Every other step only reads.
 
 | Item | Value |
 |---|---|
-| R1 SFU (reused spike app) | `project-hello-r1-rtc-spike`, Fly `sin`, one Machine, dedicated IPv4 `37.16.23.137`, Config B, the setup the S0-F spike proved (its settings are the SFU's Fly secrets `LIVEKIT_R1_CONFIG` and `NODE_IP`; this checklist never touches either) |
+| R1 SFU (reused spike app) | `project-hello-r1-rtc-spike`, Fly `sin`, one Machine, dedicated IPv4 `37.16.23.137`, Config B (or Config C once rolled out: `infra/livekit-r1/README.md`), the setup the S0-F spike proved (its settings are the SFU's Fly secrets `LIVEKIT_R1_CONFIG` and `NODE_IP`; this checklist never touches either) |
 | R1 SFU URL | `wss://project-hello-r1-rtc-spike.fly.dev` |
 | API | `project-hello-api` (target flips to `r1`; Cloud `LIVEKIT_*` stay for phone) |
 | Browser worker | `project-hello-voice` (agent name `browser-screener`) |
@@ -267,7 +267,7 @@ fly machines list -a project-hello-r1-rtc-spike --json | node (Join-Path $Repo "
 ```
 
 - [ ] One Machine in `sin`; the three secret names exist. If `LIVEKIT_R1_CONFIG`
-      is missing the SFU is running Config A, not the proven Config B: STOP and
+      is missing the SFU is running Config A, not the proven Config B (or C): STOP and
       ask before changing anything.
 - [ ] Stop any spike echo agent or browser spike page still using the old key.
 
@@ -305,7 +305,7 @@ fly secrets set "LIVEKIT_KEYS=${NewKey}:${NewSecret}" -a project-hello-r1-rtc-sp
 ```powershell
 curl.exe -sS -o NUL -w "%{http_code}`n" https://project-hello-r1-rtc-spike.fly.dev/      # 200 (this also wakes a stopped Machine)
 fly status -a project-hello-r1-rtc-spike                                                  # one Machine started, check passing
-fly logs -a project-hello-r1-rtc-spike --no-tail | Select-String "livekit-r1-entrypoint"  # "Config B; advertising 37.16.23.137:7882", and no "must be" error
+fly logs -a project-hello-r1-rtc-spike --no-tail | Select-String "livekit-r1-entrypoint"  # "Config B; advertising 37.16.23.137:7882" (Config C: "Config C; advertising 37.16.23.137:7882 and 6PN fdaa:..."), and no "must be" error
 fly machines list -a project-hello-r1-rtc-spike --json | node (Join-Path $Repo "infra/livekit-r1/preflight.mjs")   # still one Machine in sin
 ```
 

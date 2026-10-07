@@ -69,6 +69,162 @@ fly secrets set -a project-hello-r1-rtc-spike LIVEKIT_R1_CONFIG=B
 Do not interpret Config B as a production setting. Repeat its UDP and forced
 TCP checks and record why Config A failed before considering it.
 
+## Config C: worker media over Fly 6PN
+
+Config C is Config B plus the SFU Machine's own Fly 6PN (private IPv6) address.
+It exists because the R1 browser worker cannot reach the SFU over the public
+dedicated IPv4. Select it with `LIVEKIT_R1_CONFIG=C`; Configs A and B render
+byte-for-byte what they rendered before and are unaffected.
+
+### Why (R1 A0 smoke, 2026-10-07 20:37 UTC)
+
+- The worker (`project-hello-voice`, `sin`, livekit-agents 1.6.4 / livekit rtc
+  1.1.12) received the job, then logged
+  `livekit::rtc_engine failed to connect: wait_pc_connection timed out`, retried,
+  and gave up.
+- The SFU's `ICE candidate pair stats` for the agent participant showed local
+  `37.16.23.137:7882 udp host` against remotes `172.19.66.154:55113 udp host` and
+  `138.199.24.x:55113 udp srflx`, with `requestsSent 8, responsesReceived 0,
+  requestsReceived 0`. UDP from a Fly Machine to another app's dedicated public
+  IPv4 never arrives (no hairpin; observed, not documented by Fly).
+- The ICE/TCP fallback on 7881 through Fly's proxy failed with
+  `could not proxy TCP data ... Connection reset by peer`. Config B binds only
+  `fly-global-services`, pion's TCP mux matches connections by local IP, and the
+  proxy delivers them on eth0 instead.
+- Browsers are unaffected: they connect over UDP to `37.16.23.137:7882`, which is
+  exactly how S0-F1 passed under Config B.
+
+### What Config C changes
+
+The entrypoint renders both addresses into `rtc.ips.includes`:
+
+```yaml
+rtc:
+  ips:
+    includes:
+      - "<fly-global-services IPv4>/32"   # browsers (advertised as node_ip)
+      - "<fly-local-6pn IPv6>/128"        # the worker, over private IPv6
+```
+
+`<fly-local-6pn IPv6>` comes from `getent hosts fly-local-6pn` at every boot (the
+address is not static, so it is never stored in `fly.toml` or a secret;
+`$FLY_PRIVATE_IP` is only a fallback when the alias does not resolve). It must be
+an `fdaa:` address made of hex groups, or the entrypoint exits with an error. A
+Config C start without a 6PN address fails closed instead of quietly behaving
+like Config B. So does a well-formed address that no interface carries (a stale
+`/etc/hosts` entry or a mismatched `FLY_PRIVATE_IP`): LiveKit treats `rtc.ips`
+as an allow-list of local interface addresses, so it would open no `[fdaa:...]:7882`
+socket and log nothing. Before rendering anything, the entrypoint looks the
+address up in the kernel's `/proc/net/if_inet6` and exits with
+`Config C: 6PN address <addr> is not configured on any interface` on a miss.
+
+How it works, from the pinned LiveKit v1.13.7 / pion sources:
+
+- LiveKit's single-port UDP mux binds one socket per local IP that passes
+  `rtc.ips`, so the second include opens `[fdaa:...]:7882` next to the
+  `fly-global-services` socket and gathers a UDP host candidate for it. The TCP
+  listener on 7881 is dual-stack, so ICE/TCP over 6PN works too, and a direct 6PN
+  connection arrives on the address that the mux matches.
+- `node_ip` stays the IPv4. Its rewrite rule is scoped to the IPv4 family, so the
+  fdaa candidate is advertised unchanged while the `fly-global-services` one is
+  still advertised as `37.16.23.137`.
+- The worker needs **no change**: libwebrtc (livekit rtc 1.1.12) gathers IPv6 ULA
+  host candidates by default, and ranks them above IPv4. It pairs
+  `fdaa:` with `fdaa:` directly over Fly's private network: no proxy and no
+  hairpin. The browser also receives the fdaa candidate, cannot reach it, and
+  keeps using the public IPv4 pair.
+- Signaling stays on the public `wss://` URL. Fly's proxy still autostarts the
+  Machine, and the API's readiness contract
+  (`LIVEKIT_URL` host == `R1_LIVEKIT_URL` host) is unchanged. Do not point the
+  worker at a `.internal` URL.
+- There is no other `livekit.yaml` change. LiveKit has no IPv6 switch (UDP6 and
+  TCP6 are on unless `force_tcp` is set). Never set `rtc.port_range_start` or
+  `port_range_end` (it bypasses the mux and drops the 6PN socket; the validator
+  rejects it).
+
+### Preconditions
+
+- `project-hello-voice` and the SFU app must be in the same Fly organization and
+  on the default 6PN network (neither created with `fly apps create --network`).
+  Check that both Machines share the first three hextets:
+
+  ```sh
+  fly ssh console -a project-hello-r1-rtc-spike -C 'getent hosts fly-local-6pn'
+  fly ssh console -a project-hello-voice -C 'getent hosts fly-local-6pn'
+  ```
+
+- The worker Machine needs a normal global-scope fdaa address (not deprecated,
+  not EUI-64): `fly ssh console -a project-hello-voice -C 'ip -6 addr show eth0'`.
+- The production SFU app (`project-hello-r1-rtc`) repeats both checks.
+
+### Deploy
+
+Order matters: an older image rejects `LIVEKIT_R1_CONFIG=C` and would crash-loop.
+Deploying changes the Machine, so do it with zero live rooms.
+
+```sh
+fly machines list -a project-hello-r1-rtc-spike --json | node infra/livekit-r1/preflight.mjs
+fly deploy infra/livekit-r1 --ha=false --remote-only -a project-hello-r1-rtc-spike   # still Config B
+fly secrets set -a project-hello-r1-rtc-spike LIVEKIT_R1_CONFIG=C                    # restarts the Machine
+```
+
+Roll back with `fly secrets set -a project-hello-r1-rtc-spike LIVEKIT_R1_CONFIG=B`.
+
+To check the rendering locally without Docker (render-only mode redacts the key
+and never starts LiveKit; `LIVEKIT_R1_6PN_IP_OVERRIDE` is rejected whenever
+`FLY_APP_NAME` or `FLY_MACHINE_ID` is set, exactly like the FGS override; a
+made-up override address is on no local interface, so the interface check above is
+skipped for the override, and only for the override):
+
+```sh
+NODE_IP=203.0.113.10 LIVEKIT_KEYS="r1-local:$(printf 'a%.0s' $(seq 40))" LIVEKIT_R1_RENDER_ONLY=1 \
+  LIVEKIT_R1_CONFIG=C LIVEKIT_R1_FGS_IP_OVERRIDE=127.0.0.1 \
+  LIVEKIT_R1_6PN_IP_OVERRIDE=fdaa:0:1:2:3:4:5:6 sh infra/livekit-r1/entrypoint.sh
+```
+
+### Verify Config C
+
+1. The startup log names both addresses:
+
+   ```sh
+   fly logs -a project-hello-r1-rtc-spike --no-tail | grep livekit-r1-entrypoint
+   # livekit-r1-entrypoint: Config C; advertising 37.16.23.137:7882 and 6PN fdaa:...
+   ```
+
+2. Both UDP sockets exist. The entrypoint already refuses to start when the
+   address is on no interface, but that is a pre-flight guard: this `ss` check is
+   the proof that LiveKit really bound the 6PN socket, and it stays a hard gate
+   for the rollout. If only the IPv4 one is listed, the `/128` matched no
+   interface and LiveKit logs nothing:
+
+   ```sh
+   fly ssh console -a project-hello-r1-rtc-spike -C 'ss -ulpn | grep :7882; ss -tlnp | grep :7881'
+   # <fly-global-services>:7882  and  [fdaa:...]:7882  (7881 on a wildcard/[::] listener)
+   ```
+
+3. A worker job joins: start an R1 smoke session. The worker log must not show
+   `wait_pc_connection timed out`.
+4. The SFU's `ICE candidate pair stats` for the agent participant
+   (`fly logs -a project-hello-r1-rtc-spike --no-tail | grep -i "ICE candidate pair stats"`)
+   show the selected pair local `[fdaa:...]:7882` udp host against the worker's
+   `fdaa:` address, with `responsesReceived > 0`. The failing pair was
+   `37.16.23.137:7882` with `responsesReceived 0`.
+5. Browsers still pair on the public IPv4: re-run the S0-F1 page and the
+   forced-TCP check below. The selected UDP pair must still be
+   `37.16.23.137:7882`, and connect time must not regress.
+
+### Limits
+
+- 6PN media bypasses Fly's proxy, so only the public WSS signaling connections
+  keep the Machine from autostopping. They exist for every session already.
+- Browsers see an unroutable `fdaa:` candidate: one extra failed ICE pair, and
+  the SFU's internal 6PN address appears in their SDP.
+- Config C depends on the worker and the SFU sharing a Fly 6PN. Moving either
+  to another organization, a custom network, or a non-Fly host breaks the worker
+  path silently; browsers keep working over the public IPv4.
+- 6PN rides WireGuard (lower MTU). RTP and DTLS packets stay well below it, but
+  this has not been measured on Fly.
+
 ## S0-F1 operator check
 
 For Config A, the browser page must sample a selected UDP pair to the dedicated

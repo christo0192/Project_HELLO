@@ -144,6 +144,7 @@
 
 - The worker connects to the **public** hostname, not `.internal`. Private 6PN traffic bypasses Fly's proxy and would not autostart a stopped SFU.
 - Media from the worker goes UDP to `node_ip:7882` through Fly's edge (a hairpin; unverified), with TCP 7881 as fallback. S0 measures this.
+- **Update 2026-10-07 (R1 A0 smoke): the hairpin does not work.** The worker's UDP checks to `37.16.23.137:7882` never arrived (SFU pair stats: `requestsSent 8, responsesReceived 0`), and the ICE/TCP fallback through Fly's proxy was reset because pion's TCP mux matches by local IP. **Config C** therefore also includes the SFU Machine's Fly 6PN IPv6 in `rtc.ips.includes`, so the worker connects over private IPv6 with no proxy and no hairpin, while signaling stays on the public `wss://` URL. Browsers still use the public IPv4. See `infra/livekit-r1/README.md` ("Config C").
 - Same-region traffic to a public IP is billed as egress; the amount is small.
 
 ### 3.7 Reference `fly.toml` (sketch; validate in S0, not deployable as written)
