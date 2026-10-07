@@ -82,6 +82,72 @@ this lane has prior form for Sarvam 400s being swallowed rather than raised.
 Apply it as a secret on ONE test call and listen before pinning it in the toml —
 no secret shadows that name, so a toml entry ships hot on the next deploy.
 
+### 2x. Gate judge, consent backstop and opening — M013 S01
+
+The gate (identity → consent → role line → Q1) now reads replies with an LLM
+judge, **DeepSeek V4 Flash** (owner decision), behind one switch. Every row
+below is an `[env]` value or a code default. A Fly secret of the same name
+overrides it, so each rollback is `fly secrets set …` with no deploy; unset the
+secret again afterwards so the repo shows the live value.
+
+| Variable | Shipped (fly.phone.toml / code default) | What it does | Rollback |
+|---|---|---|---|
+| `PHONE_GATE_JUDGE` | `shadow` / `legacy` | `legacy`: the regex rules decide and the judge is never called. `shadow`: the regex rules decide; the judge runs on the same reply and only logs. `llm`: a valid judge verdict decides | `PHONE_GATE_JUDGE=legacy` |
+| `PHONE_GATE_JUDGE_MODEL` | `deepseek-v4-flash` | The judge model id. A non-DeepSeek id disables the judge (legacy decides) | Swap the id, e.g. `deepseek-flash` |
+| `PHONE_GATE_JUDGE_TIMEOUT_SEC` | `1.7` (clamp 1.0–4.0) | Judge wall clock for identity, consent and callback time | Raise it |
+| `PHONE_QNA_JUDGE_TIMEOUT_SEC` | `1.6` (clamp 0.8–3.0) | Judge wall clock after consent (revocation window, Q&A close) | Raise it |
+| `PHONE_GATE_GRANT_MIN_SPEECH_MS` | default `250` (clamp 120–600) | A judge grant needs this much VAD speech behind its evidence | Recalibrate from logged `segment_speech_ms` |
+| `PHONE_GATE_COMPOSE_TIMEOUT_SEC` | default `1.5` (clamp 0.5–4.0) | Cap on composing one gate line; a miss speaks the fixed line | `4.0` (the old cap) |
+| `PHONE_Q1_PRERENDER` | default `true` | Q1 audio is pre-rendered under the role line | `false` |
+| `PHONE_DETERMINISTIC_OPENER` | default `false` (composed openings) | `true` speaks the fixed scripted lines | `PHONE_DETERMINISTIC_OPENER=true` |
+| `PHONE_GATE_MAX_SECONDS` | default `180` | Gate wall clock; the lease heartbeat now runs from the answer and a budget is checked before every new ask | `116` (the old value) |
+| `PHONE_CLASSIFY_TIMEOUT_SEC` | not set; derived 50.4 s | Consent backstop = 2 × (answer window + 6 + judge timeout) + 5; an explicit value can only raise it | Set a higher value |
+
+**Why `shadow` and not `llm`.** The T11 bank (`.gsd/milestones/M013/slices/S01/S01-BANK.md`)
+gave the judge 0 false grants where the regex gave 2 real and 9 synthetic ones.
+But the judge granted 16 of 17 real consenting replies against the regex's 17,
+which fails the plan's "recall ≥ legacy" rule. Turning on `llm` is the owner's
+call: `fly secrets set PHONE_GATE_JUDGE=llm -a project-hello-phone-voice`.
+
+**Consent rules in `llm` mode (owner constraints):**
+- A judge error (timeout, transport error, bad JSON, breaker open, judge
+  disabled) **never grants**. The regex rules decide instead and may grant,
+  but only on speech that started after the recording sentence was heard.
+- A valid judge verdict that is not a grant (no, busy, question, unclear) is
+  never overridden by the regex.
+- A judge grant that fails a deterministic guard (evidence not in the
+  candidate's words, started before the recording sentence, too little speech,
+  candidate still talking) is a re-ask, never a regex fallback.
+- The AI-disclosure wording is unchanged and pinned by
+  `tests/test_phone_disclosure_pinned.py`.
+
+**The "a person spoke" rule (`candidate_spoke`, all modes).** Once a reply that
+is not voicemail wording is heard, the call can no longer end as `machine`.
+Voicemail wording, silence or an unreadable reply after that ends with the
+deferral goodbye ("Sorry, I'll let you go for now. Our team will call you
+another time. Bye!") and `candidate.deferred_pre_disclosure` (uncharged, next IST
+day). `machine` means nobody was heard, or the first words were voicemail or
+carrier wording. Busy, "call me later" and "abhi nahi" go to the callback flow,
+never to a yes/no re-ask. S01 posts only existing events and never stops or
+purges a recording itself; what happens to the audio is S02's (the recording
+flag), not this section's.
+
+**Logs to watch (categories, lengths and timings only; never text):**
+- `phone_gate_decision`: one per decision that acted (`source` = `llm` /
+  `legacy_fallback` / `legacy`, `intent`, `latency_ms`, `guard_rejected_reason`).
+- `phone_gate_shadow_decision` and `phone_gate_shadow` (`agree` / `disagree` /
+  `judge_unavailable`): what the judge would have done in `shadow`.
+- `gate_judge_fallback_legacy` (with the reason) and `gate_judge_disabled`
+  (once per process). **Alias-retirement risk:** if the provider retires
+  `deepseek-v4-flash`, every call falls back to legacy. A rising
+  `gate_judge_fallback_legacy` rate is the signal; swap `PHONE_GATE_JUDGE_MODEL`.
+- `phone_gate_compose` (`composed` / `timeout` / `rejected_<reason>`),
+  `phone_gate_budget`, `phone_gate_heartbeat`, the `gate_lease_halted` outcome,
+  and `consent_turn_skipped` (a reply read as belonging to an earlier question).
+- After consent: `phone_revocation_window` (busy, decline or opt-out spoken
+  before Q1 is answered) and the Q&A close (a bare "yes" gets "Sure, go ahead.";
+  a decline closes on the first one; a decline followed by silence completes).
+
 ### 2y. Conversational gate rollback point — 2026-09-10 (0095)
 
 The identity turn before consent is behind TWO flags, and **both default to the
@@ -89,11 +155,18 @@ setup that is live today**, so merging changes nothing until they are set. Unlik
 §2z these are `[env]` defaults in code, not secrets, so they CAN be read back —
 but the staging order matters, so it is recorded.
 
+> **Superseded default (#334, M013 S01).** `PHONE_DETERMINISTIC_OPENER` now
+> defaults to **false**: an unset value gives composed (model-authored,
+> validated-before-speech) openings, not scripted ones. The table below is the
+> 2026-09-10 history. Today the scripted rollback must be SET, not unset:
+> `fly secrets set PHONE_DETERMINISTIC_OPENER=true --app project-hello-phone-voice`.
+> See §2x.
+
 | Stage | `PHONE_GATE_FLOW` | `PHONE_DETERMINISTIC_OPENER` | What the candidate hears |
 |---|---|---|---|
-| 0 (today, and the rollback target) | unset / `deterministic` | unset / `true` | Fixed disclosure → fixed role line → Q1 |
-| 1 | `conversational` | unset / `true` | Fixed identity ask → fixed consent → fixed role → Q1 |
-| 2 | `conversational` | `false` | Model-authored identity ask, consent and role line, all streamed |
+| 0 (2026-09-10; the rollback target) | unset / `deterministic` | `true` (was the unset default then) | Fixed disclosure → fixed role line → Q1 |
+| 1 | `conversational` | `true` (was the unset default then) | Fixed identity ask → fixed consent → fixed role → Q1 |
+| 2 | `conversational` | `false` (unset today) | Model-authored identity ask, consent and role line, all streamed |
 
 Stage 1 exists on purpose: it proves the new turn ORDER, the identity classifier
 and the turn-buffer barrier on a live call **without** switching on
@@ -128,14 +201,15 @@ fly secrets set PHONE_DETERMINISTIC_OPENER=false --app project-hello-phone-voice
 **To roll all the way back to the 2026-09-10 production setup:**
 
 ```
-fly secrets unset PHONE_GATE_FLOW PHONE_DETERMINISTIC_OPENER \
-                  --app project-hello-phone-voice
+fly secrets unset PHONE_GATE_FLOW --app project-hello-phone-voice
+fly secrets set PHONE_DETERMINISTIC_OPENER=true --app project-hello-phone-voice
 ```
 
-Unsetting is the true rollback: both readers default to the current behaviour, so
-the gate returns to the fixed disclosure with no identity turn and no
-pre-consent generation. Secrets-only, so it needs no deploy and no revert, and it
-works even if later code has shipped.
+Since #334 unsetting `PHONE_DETERMINISTIC_OPENER` is **not** a rollback: its
+default is now `false` (composed openings). Set it to `true` explicitly. With
+`PHONE_GATE_FLOW` unset and the opener `true`, the gate returns to the fixed
+disclosure with no identity turn and no pre-consent generation. Secrets-only, so
+it needs no deploy and no revert, and it works even if later code has shipped.
 
 A third flag, `PHONE_IDENTITY_MISMATCH_SUPPRESSES`, defaults to **off**. Both
 settings post a real purging terminal event; the only difference is whether a
@@ -487,10 +561,18 @@ every dial.
   widening both `chk_call_sessions_terminal_reason` and `persistence._FAILED_REASONS`
   together; that pair was left alone deliberately rather than half-done. Blast radius is
   an operator-facing label on `call_sessions` — no budget is affected.
-- **The default human/machine classifier is a deterministic rule set behind an injectable
-  seam.** An unreadable answer is re-asked once and then fails closed to `machine`, which
-  costs a no-answer budget charge for a mumbling human. The direction is safe (no consent
-  → no recording, no score) but the mis-classification risk is real.
+- **The human/machine and consent reader is the gate judge with a deterministic fallback
+  (M013 S01, §2x).** With `PHONE_GATE_JUDGE=llm` a valid DeepSeek V4 Flash verdict decides;
+  when the judge is unavailable the deterministic rule set (`classify_answer_text`, the
+  code default under `legacy`, and the deciding reader under `shadow`) decides, and it may
+  grant consent only on speech that started after the recording sentence. A judge error
+  never grants by itself. The `candidate_spoke` rule applies in every mode: once a person
+  was heard the call can no longer end as `machine`, and an unreadable answer is re-asked
+  and then ends with the spoken deferral goodbye and `candidate.deferred_pre_disclosure`
+  (uncharged, next IST day) instead of a no-answer charge. `machine` is left for calls where
+  nobody was heard or the first words were voicemail/carrier wording. The residual risk is
+  the opposite direction: a voicemail greeting that does not look like one after a real
+  "hello" defers instead of ending as `machine`, which costs a redial the next IST day.
 - **The worker always sends a null epoch.** The phone room name carries only the attempt
   id; P3 projects `phone_epoch` at the ingress boundary. Both the client and the gate
   accept an epoch, so wiring it is a one-line change once there is a worker-visible

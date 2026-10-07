@@ -273,6 +273,32 @@ kill_timeout = 300
   PHONE_JUDGE_SDK = "openai"
   PHONE_JUDGE_URL = "https://api.deepseek.com/v1/chat/completions"
   PHONE_JUDGE_MODEL = "deepseek-v4-flash"
+  # ── M013 S01: the GATE judge (owner decision: DeepSeek V4 Flash) ──────────
+  # Reads the candidate's replies before consent (identity, consent, callback
+  # time), in the post-consent revocation window and at the Q&A close. It uses
+  # the endpoint and key above. Modes: legacy (code default, regex decides),
+  # shadow (regex decides, judge only logs `phone_gate_shadow_decision`), llm
+  # (a valid judge verdict decides; judge unavailable -> regex, which may grant
+  # only on speech after the recording sentence; a judge error never grants).
+  #
+  # SHADOW, per the T11 rollout gate (.gsd/milestones/M013/slices/S01/
+  # S01-BANK.md): on the live bank the judge made 0 false grants (regex: 2 real,
+  # 9 synthetic) but granted 16/17 real consenting replies against the regex's
+  # 17/17, so it fails the "recall >= legacy" rule. Moving to llm is the
+  # owner's call. No deploy is needed for either direction (a secret of the same
+  # name shadows this line; unset it again afterwards):
+  #   fly secrets set PHONE_GATE_JUDGE=llm    -a project-hello-phone-voice
+  #   fly secrets set PHONE_GATE_JUDGE=legacy -a project-hello-phone-voice  # rollback
+  PHONE_GATE_JUDGE = "shadow"
+  # Config so a retired alias can be swapped without a deploy. If the provider
+  # retires it, every judge call fails and legacy decides: watch
+  # `gate_judge_fallback_legacy`.
+  PHONE_GATE_JUDGE_MODEL = "deepseek-v4-flash"
+  # Live p95 + 0.5 s (T11 bank, 2026-10-07): gate phases 1.7 s, post-consent
+  # and Q&A close 1.6 s. Same as the code defaults; pinned so the deploy shows
+  # them. Confirm from live `phone_gate_decision` latency_ms (T14).
+  PHONE_GATE_JUDGE_TIMEOUT_SEC = "1.7"
+  PHONE_QNA_JUDGE_TIMEOUT_SEC = "1.6"
   # Controller selects the objective; Gemini authors one natural bridge and
   # paraphrased question in a single phone-only generation.
   PHONE_TURN_MODE = "toolless"
@@ -446,13 +472,12 @@ kill_timeout = 300
   # restores presence-as-answer (the pre-E6 gate). A Fly SECRET of the same
   # name shadows this line, so unset it again after the incident.
   PHONE_ANSWER_SIGNAL = "sip_status"
-  # RCA 2026-09-09: this is now the BACKSTOP wall clock for the WHOLE consent
-  # classification (raised 20->40). Each individual answer — the first, and the
-  # answer after the single re-ask — is bounded by PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC
-  # below, so a candidate who answered a beat late (or answered the wrong question
-  # and needed the re-ask) is no longer torn down to MACHINE mid-re-ask. Keep this
-  # >= 2 x the per-answer bound.
-  PHONE_CLASSIFY_TIMEOUT_SEC = "40"
+  # PHONE_CLASSIFY_TIMEOUT_SEC (the consent BACKSTOP) is deliberately NOT set
+  # here any more (M013 S01). It is derived in code as
+  #   2 x (PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC + 6 + PHONE_GATE_JUDGE_TIMEOUT_SEC) + 5
+  # = 50.4 s with the values in this file, and an explicit value can only RAISE
+  # it. The old "40" here could no longer do anything, so it only misled.
+  # Its expiry is a spoken deferral, never "machine".
   # Per-answer window for ONE consent reply (each classify attempt gets its own).
   PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC = "15"
   PHONE_ANSWER_TIMEOUT_SEC = "90"
