@@ -51,6 +51,7 @@ import {
 } from '../lib/room-provisioning.js';
 import {
   accessTokenFor,
+  r1LaneMismatch,
   requireBrowserLiveKitConfigured,
   roomServiceClientFor,
   type LiveKitEndpoint,
@@ -477,7 +478,7 @@ invitesRouter.post(
       // after ops/admin fixes session state without the token being burned.
       const { data: session } = await supabase
         .from('call_sessions')
-        .select('id, external_call_id, status')
+        .select('id, external_call_id, status, interview_round_id')
         .eq('id', invite.session_id)
         .single();
 
@@ -487,6 +488,24 @@ invitesRouter.post(
 
       const sessionStatus = session.status as string;
       let roomName: string;
+
+      // ── Lane fence (R1) ─────────────────────────────────────────────────
+      // The same session/endpoint agreement `provisionRoomForCreatedSession` enforces for
+      // a JIT room must hold for a session whose room ALREADY exists (recruiter `/start`
+      // before a flip): otherwise a token for the other lane's SFU would be minted, the
+      // candidate would land in an auto-created unmarked room, and the worker would refuse
+      // and delete it while the invite is consumed. Checked before any branch, before the
+      // worker gate, the invite consume and any token. Terminal sessions keep the stable
+      // 404 below. Legacy sessions on the Cloud endpoint (no round, no R1 target) never
+      // mismatch, so that path is unchanged.
+      if (
+        (sessionStatus === 'created'
+          || sessionStatus === 'waiting'
+          || sessionStatus === 'in_progress')
+        && r1LaneMismatch(session.interview_round_id as string | null, endpoint)
+      ) {
+        return res.status(503).json({ error: 'screening_room_unavailable' });
+      }
 
       if (
         (sessionStatus === 'waiting' || sessionStatus === 'in_progress')
@@ -515,7 +534,7 @@ invitesRouter.post(
         const provisioned = await provisionRoomForCreatedSession(
           session.id as string,
           'existing_session',
-          { endpoint },
+          { endpoint, interviewRoundId: session.interview_round_id as string | null },
         );
         if (!provisioned.ok) {
           if (provisioned.code === 'provider_failed') {

@@ -7,24 +7,31 @@ condition: terminal session settlement must never depend on a newer API route.
 from __future__ import annotations
 
 import asyncio
-import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
 from urllib.error import HTTPError
 
 import persistence
+from observability import StructuredLogger
 from r1_context import _request_json
 
-_LOG = logging.getLogger("r1")
+# Plan section 9 fence 10: StructuredLogger only (its allowlist and secret scan drop
+# anything else); a call names a status or an exception TYPE, never a message or text.
+_log = StructuredLogger("r1")
 
 
 @dataclass(frozen=True)
 class TerminalDisposition:
-    """An internal R1 outcome mapped to an existing session lifecycle terminal reason."""
+    """An internal R1 outcome mapped to an existing session lifecycle terminal reason.
+
+    The CAS source status is deliberately NOT part of the disposition: it is a
+    property of the session (waiting until ``activate_session`` succeeds,
+    in_progress afterwards), never of the outcome.  ``R1TurnWriter.terminal``
+    derives it from the caller's activation state.
+    """
 
     terminal_reason: str
-    expected_status: str = "in_progress"
     completed: bool = False
 
 
@@ -34,12 +41,12 @@ class TerminalDisposition:
 OUTCOME_DISPOSITIONS: dict[str, TerminalDisposition] = {
     "complete": TerminalDisposition("conversation_complete", completed=True),
     "candidate_left": TerminalDisposition("worker_crash"),
-    "no_show": TerminalDisposition("worker_crash", expected_status="waiting"),
+    "no_show": TerminalDisposition("worker_crash"),
     "provider_error": TerminalDisposition("provider_error"),
     "residency_timeout": TerminalDisposition("residency_timeout"),
     "shutdown_forced": TerminalDisposition("shutdown_forced"),
-    "configuration_failed": TerminalDisposition("room_create_error", expected_status="waiting"),
-    "context_failed": TerminalDisposition("worker_crash", expected_status="waiting"),
+    "configuration_failed": TerminalDisposition("room_create_error"),
+    "context_failed": TerminalDisposition("worker_crash"),
 }
 
 
@@ -80,7 +87,7 @@ class R1TurnWriter:
 
         def write_turn() -> None:
             if not self.session_id:
-                _LOG.warning("r1 transcript skipped: room has no session id")
+                _log.warn("unknown_event", error_type="r1_transcript_skipped_no_session")
                 return
             table = persistence._table("transcript_turns")
             if not table:
@@ -103,7 +110,7 @@ class R1TurnWriter:
     async def usage_disconnect(self, seconds: float, *, participant_kind: str = "agent") -> None:
         """Write the R1 usage-ledger disconnect before terminal settlement."""
         if not self.session_id:
-            _LOG.warning("r1 usage disconnect skipped: room has no session id")
+            _log.warn("unknown_event", error_type="r1_usage_skipped_no_session")
             return
         payload = {
             "room": self.room,
@@ -115,28 +122,71 @@ class R1TurnWriter:
         }
         await asyncio.to_thread(self._requester, "/api/internal/r1/usage", payload, 10.0)
 
-    async def terminal(self, outcome: str, duration_sec: int) -> Any:
-        """Map every R1 outcome to a pre-existing state-compatible terminal reason."""
+    async def activate(self) -> Any:
+        """CAS ``waiting`` to ``in_progress``; the caller must fail closed unless ``.ok``.
+
+        Only the worker activates a session, and ``complete_session`` and the default
+        ``fail_session`` compare-and-set from ``in_progress`` (plan section 4 step 8).
+        Missing session ids are reported as a non-ok DISABLED outcome by ``persistence``.
+        """
+        return await persistence.activate_session(self.session_id)
+
+    async def terminal(
+        self, outcome: str, duration_sec: int, *, activated: bool | None = False
+    ) -> Any:
+        """Map an R1 outcome to a pre-existing terminal reason and the right CAS source.
+
+        ``activated`` is the worker's own record of ``activate``: True leaves
+        ``in_progress``, False (no-show, context or configuration failure, cancellation
+        before the candidate joined) leaves ``waiting``.  None means the activation
+        CAS timed out or errored, so it may still have landed from its thread: the
+        failure CAS then tries ``in_progress`` first and ``waiting`` second (each is a
+        compare-and-set, so only the real current status can match).  A CAS that does
+        not apply is logged, never silent: a CONFLICT means another writer already
+        settled the row, which an operator must be able to see.
+        """
         if not self.session_id:
-            _LOG.warning("r1 terminal skipped: room has no session id")
+            _log.warn("unknown_event", error_type="r1_terminal_skipped_no_session")
             return None
         disposition = OUTCOME_DISPOSITIONS[outcome]
         if disposition.completed:
-            return await persistence.complete_session(
+            result = await persistence.complete_session(
                 self.session_id,
                 duration_sec,
                 disposition.terminal_reason,
             )
-        return await persistence.fail_session(
-            self.session_id,
-            disposition.terminal_reason,
-            expected_status=disposition.expected_status,
+            self._log_unapplied(outcome, "in_progress", result)
+            return result
+        sources = ("in_progress", "waiting") if activated is None else (
+            ("in_progress",) if activated else ("waiting",)
+        )
+        result = None
+        for expected_status in sources:
+            result = await persistence.fail_session(
+                self.session_id,
+                disposition.terminal_reason,
+                expected_status=expected_status,
+            )
+            if getattr(result, "ok", False):
+                return result
+            self._log_unapplied(outcome, expected_status, result)
+        return result
+
+    @staticmethod
+    def _log_unapplied(outcome: str, expected_status: str, result: Any) -> None:
+        """Record a terminal CAS that did not apply (outcome and source are fixed labels)."""
+        if getattr(result, "ok", False):
+            return
+        _log.warn(
+            "unknown_event",
+            error_type=f"r1_terminal_not_applied:{outcome}",
+            error_category=f"{expected_status}_{getattr(result, 'kind', 'unknown')}",
         )
 
     async def attempt_outcome(self, outcome: str) -> None:
         """Best-effort PR-3 outcome write, intentionally after the durable terminal transition."""
         if not self.attempt_id:
-            _LOG.info("r1 attempt outcome skipped: no attempt id")
+            _log.info("unknown_event", error_type="r1_attempt_outcome_skipped_no_attempt")
             return
         payload = {"attempt_id": self.attempt_id, "outcome": outcome}
         try:
@@ -148,10 +198,21 @@ class R1TurnWriter:
             )
         except HTTPError as exc:
             if exc.code == 404:
-                _LOG.info("r1 attempt outcome endpoint unavailable status=404")
+                _log.info(
+                    "unknown_event", error_type="r1_attempt_outcome_unavailable", status=404
+                )
                 exc.close()
                 return
-            _LOG.warning("r1 attempt outcome write failed status=%s", exc.code)
+            _log.warn(
+                "unknown_event",
+                error_type="r1_attempt_outcome_failed",
+                status=exc.code if isinstance(exc.code, int) else None,
+            )
             exc.close()
         except Exception as exc:  # noqa: BLE001
-            _LOG.warning("r1 attempt outcome write failed status=%s", _http_status(exc))
+            _log.warn(
+                "unknown_event",
+                error_type="r1_attempt_outcome_failed",
+                error_category=type(exc).__name__,
+                status=_http_status(exc),
+            )

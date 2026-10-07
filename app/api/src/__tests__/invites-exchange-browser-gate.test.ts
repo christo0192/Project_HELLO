@@ -83,6 +83,10 @@ const SESSION = '00000000-0000-4000-8000-000000000001';
 const CANDIDATE = '00000000-0000-4000-8000-000000000002';
 const ROOM = `screening-${SESSION}`;
 const TOKEN = 'b'.repeat(64);
+// An R1 round: every session that may be exchanged against the R1 endpoint has one (the
+// lane fence refuses a session and an endpoint that disagree), so the fixture follows the
+// selected target. Cloud/legacy sessions keep no round, exactly as before.
+const ROUND = '00000000-0000-4000-8000-000000000004';
 
 let setGate: (r: () => unknown) => void;
 let invitesRouter: express.Router;
@@ -124,7 +128,8 @@ beforeEach(async () => {
       return { select: () => ({ eq: () => ({ order: () => ({ limit: () => ({ maybeSingle: () => Promise.resolve({ data: { required_consents: ['recording'] }, error: null }) }) }) }) }) };
     }
     if (table === 'call_sessions') {
-      return { select: () => ({ eq: () => ({ single: () => Promise.resolve({ data: { id: SESSION, external_call_id: ROOM, status: 'waiting' }, error: null }) }) }) };
+      const interviewRoundId = process.env.BROWSER_LIVEKIT_TARGET === 'r1' ? ROUND : null;
+      return { select: () => ({ eq: () => ({ single: () => Promise.resolve({ data: { id: SESSION, external_call_id: ROOM, status: 'waiting', interview_round_id: interviewRoundId }, error: null }) }) }) };
     }
     return { select: () => ({ eq: () => ({ single: () => Promise.resolve({ data: null, error: null }) }) }) };
   });

@@ -2170,11 +2170,21 @@ def build_worker_options() -> WorkerOptions:
         options["shutdown_process_timeout"] = _phone_shutdown_process_timeout()
     # R1's longer bounded finish runs only in the non-phone R1 deployment.
     # Do not add either key to the legacy browser/phone WorkerOptions shape.
-    if not _phone_agent_name() and os.getenv("R1_LANE_MODE") == "r1_only":
-        if _worker_options_accepts("drain_timeout"):
-            options["drain_timeout"] = int(_bounded_float_env("R1_DRAIN_TIMEOUT_SEC", 60.0, 30.0, 60.0))
-        if _worker_options_accepts("shutdown_process_timeout"):
-            options["shutdown_process_timeout"] = int(_bounded_float_env("R1_SHUTDOWN_PROCESS_TIMEOUT_SEC", 90.0, 30.0, 90.0))
+    if not _phone_agent_name():
+        # Lazy and inside the non-phone branch: the phone worker never imports R1
+        # code. ONE predicate (r1_mode_allows) decides both here and in routing, so
+        # a padded "r1_only " cannot run R1 sessions without R1's drain budget.
+        from r1_routing import r1_mode_allows  # noqa: PLC0415
+
+        if r1_mode_allows(os.getenv("R1_LANE_MODE")):
+            if _worker_options_accepts("drain_timeout"):
+                options["drain_timeout"] = int(
+                    _bounded_float_env("R1_DRAIN_TIMEOUT_SEC", 60.0, 30.0, 60.0)
+                )
+            if _worker_options_accepts("shutdown_process_timeout"):
+                options["shutdown_process_timeout"] = int(
+                    _bounded_float_env("R1_SHUTDOWN_PROCESS_TIMEOUT_SEC", 90.0, 30.0, 90.0)
+                )
     if browser_named:
         # The browser worker becomes NAMED + explicit-dispatch. Its prewarm
         # posts machine-level readiness (ready-before-dispatch). The API
@@ -11932,6 +11942,29 @@ async def _close_phone_room(room_name: str) -> None:
         )
 
 
+async def _refuse_r1_room(ctx: JobContext, room_name: str, *, r1_marked: bool) -> None:
+    """Close a room this worker must not serve and end the job (fail closed).
+
+    Only reached from the non-phone path when the R1 mode gate and the API-authored
+    room marker disagree. The job never connected, so no disconnect event will end
+    it: ``JobContext`` has no ``close_room`` (livekit-agents 1.6.4), the room is
+    removed with ``delete_room`` and the job is ended with ``shutdown``. Without the
+    shutdown every refused room would leak a job process until the worker drains.
+    """
+    _log.warn(
+        "unknown_event",
+        error_type="r1_room_routing_refused",
+        error_category="marked_room_mode_off" if r1_marked else "unmarked_room_r1_only",
+    )
+    try:
+        deletion = ctx.delete_room(room_name)
+        if inspect.isawaitable(deletion):
+            await asyncio.wait_for(deletion, 5.0)
+    except Exception:  # noqa: BLE001 - a failed delete must still end the job
+        _log.warn("unknown_event", error_type="r1_room_refuse_delete_failed")
+    ctx.shutdown(reason="r1_routing_refused")
+
+
 async def entrypoint(ctx: JobContext) -> None:
     started_at = _monotonic()
 
@@ -11963,18 +11996,10 @@ async def entrypoint(ctx: JobContext) -> None:
     # legacy, and never run R1 for an unmarked browser room.
     from r1_routing import room_is_r1, routing_decision  # noqa: PLC0415
 
-    r1_decision = routing_decision(os.getenv("R1_LANE_MODE"), room_is_r1(room_metadata))
+    r1_marked = room_is_r1(room_metadata)
+    r1_decision = routing_decision(os.getenv("R1_LANE_MODE"), r1_marked)
     if r1_decision == "refuse":
-        _log.warning(
-            "r1_room_routing_refused",
-            room_name=room_identity,
-            r1_marked=room_is_r1(room_metadata),
-        )
-        close_room = getattr(ctx, "close_room", None)
-        if callable(close_room):
-            result = close_room()
-            if inspect.isawaitable(result):
-                await result
+        await _refuse_r1_room(ctx, room_identity, r1_marked=r1_marked)
         return
     # R1 is a separate browser-only lane. Keep this import after the phone
     # return: the phone worker must neither import nor initialise R1 code.

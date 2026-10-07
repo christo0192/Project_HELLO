@@ -281,9 +281,21 @@ export function checkPhoneDrainBudget({ killTimeout, drain, shutdown }) {
   return problems;
 }
 
-/** R1 has its own shutdown budget and is never valid on the phone app. */
-export function checkR1DrainBudget({ killTimeout, drain, shutdown }) {
+/**
+ * R1 has its own shutdown budget and is never valid on the phone app.
+ *
+ * While R1 is dormant (mode absent, "off" or unknown) the browser app declares none
+ * of it, so the live legacy lane keeps Fly's default stop behaviour. The change that
+ * selects R1 (mode "r1_only", compared exactly like the worker's own predicate: trimmed)
+ * must declare kill_timeout and both drain settings in the same file.
+ */
+export function checkR1DrainBudget({ killTimeout, drain, shutdown, mode }) {
   const problems = [];
+  if (String(mode ?? "").trim() === "r1_only"
+    && (killTimeout === undefined || drain === undefined || shutdown === undefined)) {
+    problems.push("fly.toml R1_LANE_MODE=r1_only requires kill_timeout, R1_DRAIN_TIMEOUT_SEC and R1_SHUTDOWN_PROCESS_TIMEOUT_SEC to be declared together");
+    return problems;
+  }
   if (drain === undefined && shutdown === undefined) return problems;
   if (killTimeout === undefined) {
     problems.push("fly.toml must declare kill_timeout when R1 drain settings are present");
@@ -445,6 +457,7 @@ for (const [label, text, isPhone] of [["fly.toml", browser, false], ["fly.phone.
     killTimeout,
     drain: envValue(browser, "R1_DRAIN_TIMEOUT_SEC"),
     shutdown: envValue(browser, "R1_SHUTDOWN_PROCESS_TIMEOUT_SEC"),
+    mode: envValue(browser, "R1_LANE_MODE"),
   })) ok(false, problem);
 }
 

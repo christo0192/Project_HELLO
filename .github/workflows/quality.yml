@@ -148,7 +148,7 @@ jobs:
           path: sbom-artifacts/*.cdx.json
           retention-days: 90
       - name: Compile LiveKit worker
-        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/noise_suppression.py app/voice-livekit/phone.py app/voice-livekit/phone_canary.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py app/voice-livekit/r1_context.py app/voice-livekit/r1_lines.py app/voice-livekit/r1_llm.py app/voice-livekit/r1_persistence.py app/voice-livekit/r1_phases.py app/voice-livekit/r1_session.py
+        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/noise_suppression.py app/voice-livekit/phone.py app/voice-livekit/phone_canary.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py app/voice-livekit/r1_context.py app/voice-livekit/r1_lines.py app/voice-livekit/r1_llm.py app/voice-livekit/r1_persistence.py app/voice-livekit/r1_phases.py app/voice-livekit/r1_routing.py app/voice-livekit/r1_session.py
       - name: Test LiveKit worker
         run: cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v
       # Phone RNNoise (noise_suppression.py): the bare-python step above SKIPS
@@ -177,3 +177,32 @@ jobs:
           /tmp/ns-venv/bin/python -m unittest tests.test_recorder_flush -v > /tmp/rf-test.log 2>&1 || { cat /tmp/rf-test.log; exit 1; }
           cat /tmp/rf-test.log
           if grep -q "skipped" /tmp/rf-test.log; then echo "::error::recording tail-flush SDK tests skipped"; exit 1; fi
+      # R1 SDK contract (tests/test_r1_sdk_contract.py): the bare-python step above SKIPS
+      # it (no livekit SDK there) and runs test_r1_core against stand-ins, so every
+      # livekit-agents 1.6.4 fact the R1 worker relies on (no JobContext.close_room,
+      # delete_room + shutdown, say() and LLM replies sharing one speech queue, the two
+      # opposite item-reporting orders) would otherwise be pinned nowhere in CI and an
+      # SDK bump could not fail it. Run them against the production pins in an isolated
+      # venv (requirements.txt, with the exact SDK and rtc pins asserted) and fail if any
+      # of them skipped. The skip grep matches unittest's own markers, not test names.
+      - name: Test R1 SDK contract (livekit-agents 1.6.4)
+        run: |
+          python3 -m venv /tmp/r1-sdk-venv
+          /tmp/r1-sdk-venv/bin/pip install --no-cache-dir -q -r app/voice-livekit/requirements.txt "livekit-agents==1.6.4" "livekit==1.1.12"
+          /tmp/r1-sdk-venv/bin/python -c "import importlib.metadata as m; assert m.version('livekit-agents') == '1.6.4' and m.version('livekit') == '1.1.12', 'SDK pins drifted'"
+          cd app/voice-livekit
+          /tmp/r1-sdk-venv/bin/python -m unittest tests.test_r1_sdk_contract tests.test_r1_core tests.test_r1_fences -v > /tmp/r1-sdk-test.log 2>&1 || { cat /tmp/r1-sdk-test.log; exit 1; }
+          cat /tmp/r1-sdk-test.log
+          if grep -Eq '\.\.\. skipped|skipped=[0-9]+' /tmp/r1-sdk-test.log; then echo "::error::R1 SDK contract tests skipped"; exit 1; fi
+      # R1 routing (tests/test_r1_routing.py): the only entrypoint routing and refuse-path
+      # tests (delete_room + shutdown, padded mode, phone options identical). The suite skips
+      # itself when the shared phone fixtures cannot import, it cannot run under the SDK
+      # environment above, and the discover step reports a skip as a pass, so a broken import
+      # would drop it silently. Run it alone on bare python and fail if any of it skipped.
+      # tests/test_r1_shipping.py pins that every R1 test module is named by a guarded step.
+      - name: Test R1 routing (bare python, no skips)
+        run: |
+          cd app/voice-livekit
+          python3 -m unittest tests.test_r1_routing -v > /tmp/r1-routing-test.log 2>&1 || { cat /tmp/r1-routing-test.log; exit 1; }
+          cat /tmp/r1-routing-test.log
+          if grep -Eq '\.\.\. skipped|skipped=[0-9]+' /tmp/r1-routing-test.log; then echo "::error::R1 routing tests skipped"; exit 1; fi

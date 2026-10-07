@@ -533,6 +533,20 @@ for (const [label, phone, apiEnv, apiFly] of AGREE_NEG) {
       "R1 budget overflow must fail");
     ok(R({ killTimeout: "300", drain: undefined, shutdown: undefined }).length === 0,
       "absent R1 settings keep the dormant browser lane valid");
+    ok(R({ killTimeout: undefined, drain: undefined, shutdown: undefined, mode: "off" }).length === 0,
+      "a dormant browser app declares no kill_timeout and no R1 drain settings");
+    for (const mode of ["r1_only", " r1_only "]) {
+      ok(R({ killTimeout: undefined, drain: undefined, shutdown: undefined, mode })
+        .some((p) => /requires kill_timeout/.test(p)),
+      `mode ${JSON.stringify(mode)} must require kill_timeout plus both drain settings`);
+      ok(R({ killTimeout: "300", drain: "60", shutdown: undefined, mode })
+        .some((p) => /requires kill_timeout/.test(p)),
+      `mode ${JSON.stringify(mode)} must require BOTH drain settings`);
+      ok(R({ killTimeout: "300", drain: "60", shutdown: "90", mode }).length === 0,
+        `mode ${JSON.stringify(mode)} with the full budget is valid`);
+    }
+    ok(R({ killTimeout: undefined, drain: undefined, shutdown: undefined, mode: "garbage" }).length === 0,
+      "an unknown mode is not R1, so it demands nothing");
   }
 }
 

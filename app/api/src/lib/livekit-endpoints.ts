@@ -54,6 +54,24 @@ export function browserLiveKitEndpoint(): LiveKitEndpoint {
   return cloudLiveKitEndpoint();
 }
 
+/** The error a lane mismatch fails provisioning with (and the exchange route's reason). */
+export const R1_LANE_MISMATCH_ERROR = 'r1_lane_mismatch';
+
+/**
+ * True when a session and the selected LiveKit endpoint disagree about the lane: an R1
+ * round (`interview_round_id` set) on a non-R1 endpoint, or a legacy session while the
+ * R1 endpoint is selected. ONE predicate for room provisioning and for the exchange
+ * route's already-provisioned branch, so the two can never drift apart. It lives with
+ * the endpoint seam, not in `room-provisioning`, which the phone lane imports.
+ */
+export function r1LaneMismatch(
+  interviewRoundId: string | null | undefined,
+  endpoint: Pick<LiveKitEndpoint, 'target'>,
+): boolean {
+  const r1Round = typeof interviewRoundId === 'string' && interviewRoundId.length > 0;
+  return r1Round !== (endpoint.target === 'r1');
+}
+
 /**
  * Reject a selected endpoint before a provider client or token is created.
  * The Cloud message deliberately remains byte-for-byte compatible with the
