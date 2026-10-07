@@ -57,6 +57,7 @@ import {
   addAttempt,
   addSession,
   buildHarness,
+  dispatchCreatedAt,
   grantConsent,
   joblessDispatch,
   runningDispatch,
@@ -1516,7 +1517,9 @@ describe('POST /api/r1/exchange', () => {
 
     expect((await exchange(secrets)).status).toBe(200);
     expect(h.gate.dispatch).toHaveBeenCalledTimes(1);
-    expect(h.rooms.createRoom).toHaveBeenCalledTimes(1);
+    // The retry is a `waiting` rejoin: it re-asserts the (idempotent) marked room
+    // once before the worker gate, and nothing else is created.
+    expect(h.rooms.createRoom).toHaveBeenCalledTimes(2);
   });
 
   it('releases the worker and defers when the dispatch fails', async () => {
@@ -1735,5 +1738,292 @@ describe('POST /api/r1/exchange', () => {
     const secrets = await ready();
     process.env.R1_ENABLED = 'false';
     expect((await exchange(secrets)).body.error).toBe('r1_disabled');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PR-3 adversarial-review fixes: fence 7 on the R1 SFU, the waiting re-assert, the
+// Cloud-fallback guard, the session/round binding and the live-job rejoin rule.
+
+describe('POST /api/r1/exchange: review hardening', () => {
+  const OTHER_ROUND = '20000000-0000-4000-8000-0000000000a2';
+  const ROOM_OF = (id: string) => `screening-${id}`;
+
+  async function ready(): Promise<{ attempt_token: string; nonce: string; attempt_id: string }> {
+    grantConsent(h.tables);
+    return admit();
+  }
+  const exchange = (secrets: { attempt_token: string; nonce: string }) =>
+    post('/exchange', { attempt_token: secrets.attempt_token, nonce: secrets.nonce });
+  const sessionRow = () => h.tables.call_sessions![0]!;
+
+  describe('fence 7: the R1 SFU never mints a token without the worker gate', () => {
+    it('answers 503 r1_unavailable BEFORE any room, recording or token when the gate is null', async () => {
+      selectR1Sfu(h);
+      const secrets = await ready();
+      // Orchestration off, or BROWSER_AGENT_NAME empty or malformed: resolveGate() is null.
+      use(h.tables, { resolveGate: () => null });
+      const response = await exchange(secrets);
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({ error: 'r1_unavailable' });
+      expect(response.body.livekit_token).toBeUndefined();
+      expect(h.health).not.toHaveBeenCalled();
+      expect(h.rooms.createRoom).not.toHaveBeenCalled();
+      expect(h.rooms.updateRoomMetadata).not.toHaveBeenCalled();
+      expect(h.gate.ensureReadyWorker).not.toHaveBeenCalled();
+      expect(mocks.startRecording).not.toHaveBeenCalled();
+      expect(sessionRow()).toMatchObject({ status: 'created' });
+    });
+
+    it('treats a gate that cannot be built as missing, not as a proceed', async () => {
+      selectR1Sfu(h);
+      const secrets = await ready();
+      use(h.tables, {
+        resolveGate: () => {
+          throw new Error('gate config exploded');
+        },
+      });
+      const response = await exchange(secrets);
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({ error: 'r1_unavailable' });
+      expect(h.rooms.createRoom).not.toHaveBeenCalled();
+    });
+
+    it('also refuses a waiting rejoin before it re-provisions anything', async () => {
+      selectR1Sfu(h);
+      const secrets = await ready();
+      expect((await exchange(secrets)).status).toBe(200);
+      expect(sessionRow().status).toBe('waiting');
+      use(h.tables, { resolveGate: () => null });
+      const response = await exchange(secrets);
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({ error: 'r1_unavailable' });
+      expect(response.body.livekit_token).toBeUndefined();
+      expect(h.rooms.createRoom).not.toHaveBeenCalled();
+      expect(h.gate.ensureReadyWorker).not.toHaveBeenCalled();
+    });
+
+    it('refuses new work before admission spends a start or capacity', async () => {
+      selectR1Sfu(h);
+      grantConsent(h.tables);
+      use(h.tables, { resolveGate: () => null });
+      const attempts = await post('/attempts', { token: LINK });
+      expect(attempts.status).toBe(503);
+      expect(attempts.body).toEqual({ error: 'r1_unavailable' });
+      expect(h.tables.interview_rounds![0]!.starts_used).toBe(0);
+      expect(h.tables.call_sessions).toHaveLength(0);
+      const preflight = await post('/preflight', { token: LINK });
+      expect(preflight.status).toBe(503);
+      expect(preflight.body).toEqual({ error: 'r1_unavailable' });
+      expect(h.tables.r1_usage_ledger).toHaveLength(0);
+      expect(h.rooms.createRoom).not.toHaveBeenCalled();
+    });
+
+    it('answers 202 preparing, never a token, for a disabled verdict on the R1 SFU', async () => {
+      selectR1Sfu(h);
+      const secrets = await ready();
+      h.gate.ensureReadyWorker.mockResolvedValueOnce({ status: 'disabled' });
+      const response = await exchange(secrets);
+      expect(response.status).toBe(202);
+      expect(response.body).toEqual({ status: 'preparing', retry_after_sec: 3 });
+      expect(response.headers['retry-after']).toBe('3');
+      expect(response.body.livekit_token).toBeUndefined();
+      expect(h.gate.dispatch).not.toHaveBeenCalled();
+      // The attempt stays valid: the next exchange (gate enabled again) joins.
+      expect((await exchange(secrets)).status).toBe(200);
+    });
+
+    it('leaves Cloud as it was: a disabled verdict still proceeds on the unnamed worker', async () => {
+      const secrets = await ready();
+      h.gate.ensureReadyWorker.mockResolvedValueOnce({ status: 'disabled' });
+      const response = await exchange(secrets);
+      expect(response.status).toBe(200);
+      expect(response.body.livekit_token).toBeTruthy();
+      expect(h.gate.dispatch).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('the Cloud fallback is refused while the legacy browser lane is enabled', () => {
+    it('answers 503 r1_unavailable before a room, a recording or any spend', async () => {
+      const secrets = await ready();
+      use(h.tables, { legacyBrowserEnabled: () => true });
+      const response = await exchange(secrets);
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({ error: 'r1_unavailable' });
+      expect(response.body.livekit_token).toBeUndefined();
+      expect(h.health).not.toHaveBeenCalled();
+      expect(h.rooms.createRoom).not.toHaveBeenCalled();
+      expect(mocks.startRecording).not.toHaveBeenCalled();
+      expect(h.gate.ensureReadyWorker).not.toHaveBeenCalled();
+      expect(sessionRow().status).toBe('created');
+    });
+
+    it('refuses /attempts and /preflight first, so no start or capacity is spent', async () => {
+      grantConsent(h.tables);
+      use(h.tables, { legacyBrowserEnabled: () => true });
+      const attempts = await post('/attempts', { token: LINK });
+      expect(attempts.status).toBe(503);
+      expect(attempts.body).toEqual({ error: 'r1_unavailable' });
+      expect(h.tables.interview_rounds![0]!.starts_used).toBe(0);
+      expect(h.tables.call_sessions).toHaveLength(0);
+      const preflight = await post('/preflight', { token: LINK });
+      expect(preflight.status).toBe(503);
+      expect(h.tables.r1_usage_ledger).toHaveLength(0);
+    });
+
+    it('does not apply to the R1 SFU, which has no Cloud worker to refuse the room', async () => {
+      selectR1Sfu(h);
+      const secrets = await ready();
+      use(h.tables, { legacyBrowserEnabled: () => true });
+      expect((await exchange(secrets)).status).toBe(200);
+    });
+
+    it('reads the PR-L switch by default: enabled refuses, retired lets R1 through', async () => {
+      const saved = process.env.LEGACY_BROWSER_SCREENING_ENABLED;
+      try {
+        const secrets = await ready();
+        use(h.tables, { legacyBrowserEnabled: undefined });
+        process.env.LEGACY_BROWSER_SCREENING_ENABLED = 'true';
+        expect((await exchange(secrets)).body).toEqual({ error: 'r1_unavailable' });
+        process.env.LEGACY_BROWSER_SCREENING_ENABLED = 'false';
+        expect((await exchange(secrets)).status).toBe(200);
+      } finally {
+        if (saved === undefined) delete process.env.LEGACY_BROWSER_SCREENING_ENABLED;
+        else process.env.LEGACY_BROWSER_SCREENING_ENABLED = saved;
+      }
+    });
+  });
+
+  describe.each([
+    ['the Cloud fallback', false],
+    ['the R1 SFU', true],
+  ])('a waiting attempt re-asserts its marked room (%s)', (_label, r1) => {
+    beforeEach(() => {
+      if (r1) selectR1Sfu(h);
+    });
+
+    it('re-provisions the marked, egress-free room BEFORE the worker gate dispatches', async () => {
+      const secrets = await ready();
+      expect((await exchange(secrets)).status).toBe(200);
+      expect(sessionRow()).toMatchObject({
+        status: 'waiting',
+        external_call_id: ROOM_OF(secrets.attempt_id),
+      });
+
+      // The room lapsed (180 s empty) or a refusing worker deleted it, and the
+      // interviewer that was dispatched into it is gone.
+      h.dispatched.splice(0);
+      for (const fn of [h.rooms.createRoom, h.gate.ensureReadyWorker, h.gate.dispatch]) {
+        fn.mockClear();
+      }
+      const again = await exchange(secrets);
+      expect(again.status).toBe(200);
+      expect(again.body.livekit_token).toBeTruthy();
+
+      expect(h.rooms.createRoom).toHaveBeenCalledTimes(1);
+      const options = h.rooms.createRoom.mock.calls[0]![0] as any;
+      expect(options).toMatchObject({
+        name: ROOM_OF(secrets.attempt_id),
+        emptyTimeout: 180,
+        maxParticipants: 3,
+        departureTimeout: 120,
+      });
+      expect(JSON.parse(options.metadata)).toMatchObject({
+        session_id: secrets.attempt_id,
+        lane: 'r1',
+      });
+      expect(mocks.startRecording).not.toHaveBeenCalled();
+      const order = (fn: { mock: { invocationCallOrder: number[] } }) =>
+        fn.mock.invocationCallOrder[0]!;
+      expect(order(h.rooms.createRoom)).toBeLessThan(order(h.gate.ensureReadyWorker));
+      expect(order(h.gate.ensureReadyWorker)).toBeLessThan(order(h.gate.dispatch));
+      // Adopting a `waiting` session changes nothing about it.
+      expect(sessionRow()).toMatchObject({
+        status: 'waiting',
+        external_call_id: ROOM_OF(secrets.attempt_id),
+      });
+    });
+
+    it('answers 503 r1_room_unavailable with no token when the room cannot be re-asserted', async () => {
+      const secrets = await ready();
+      expect((await exchange(secrets)).status).toBe(200);
+      h.dispatched.splice(0);
+      for (const fn of [h.gate.ensureReadyWorker, h.gate.dispatch]) fn.mockClear();
+      h.rooms.createRoom.mockRejectedValue(new Error('livekit down'));
+      h.rooms.updateRoomMetadata.mockRejectedValue(new Error('livekit down'));
+      const response = await exchange(secrets);
+      expect(response.status).toBe(503);
+      expect(response.body).toEqual({ error: 'r1_room_unavailable' });
+      expect(response.body.livekit_token).toBeUndefined();
+      expect(h.gate.ensureReadyWorker).not.toHaveBeenCalled();
+      expect(h.gate.dispatch).not.toHaveBeenCalled();
+      expect(h.rooms.deleteRoom).not.toHaveBeenCalled();
+      expect(sessionRow().status).toBe('waiting');
+
+      // LiveKit recovers: the same attempt converges.
+      h.rooms.createRoom.mockResolvedValue({});
+      expect((await exchange(secrets)).status).toBe(200);
+    });
+
+    it('leaves an in_progress attempt alone: no room, worker or gate', async () => {
+      const secrets = await ready();
+      expect((await exchange(secrets)).status).toBe(200);
+      sessionRow().status = 'in_progress';
+      for (const fn of [h.rooms.createRoom, h.gate.ensureReadyWorker, h.gate.dispatch]) {
+        fn.mockClear();
+      }
+      expect((await exchange(secrets)).status).toBe(200);
+      expect(h.rooms.createRoom).not.toHaveBeenCalled();
+      expect(h.gate.ensureReadyWorker).not.toHaveBeenCalled();
+    });
+  });
+
+  describe.each([
+    ['no round (interview_round_id null)', null],
+    ['another round id', OTHER_ROUND],
+  ])('a session bound to %s is never provisioned or joined', (_label, roundId) => {
+    it.each(['created', 'waiting'])('answers the stable 404 on the %s path', async (status) => {
+      const secrets = await ready();
+      sessionRow().interview_round_id = roundId;
+      sessionRow().status = status;
+      sessionRow().external_call_id = ROOM_OF(secrets.attempt_id);
+      h.health.mockClear(); // admission probed DeepSeek; the exchange must not
+      const response = await exchange(secrets);
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({ error: STABLE_ATTEMPT_ERROR });
+      expect(response.body.livekit_token).toBeUndefined();
+      expect(h.rooms.createRoom).not.toHaveBeenCalled();
+      expect(h.rooms.updateRoomMetadata).not.toHaveBeenCalled();
+      expect(h.health).not.toHaveBeenCalled();
+      expect(h.gate.ensureReadyWorker).not.toHaveBeenCalled();
+      expect(mocks.startRecording).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('a finished job is not a running interviewer', () => {
+    const deadDispatch = (state: Record<string, unknown>) => ({
+      id: 'AD_dead',
+      agentName: 'browser-screener',
+      state: {
+        jobs: [{ id: 'AJ_dead', state }],
+        createdAt: dispatchCreatedAt(5 * 60_000),
+      },
+    });
+
+    it.each([
+      ['JS_FAILED', { status: 'JS_FAILED' }],
+      ['JS_SUCCESS', { status: 'JS_SUCCESS' }],
+      ['an endedAt stamp', { status: 'JS_RUNNING', endedAt: BigInt(NOW) * 1_000_000n }],
+    ])('replaces a rejoin room whose only job ended (%s) instead of minting into it', async (_l, state) => {
+      const secrets = await ready();
+      expect((await exchange(secrets)).status).toBe(200);
+      h.dispatched.splice(0, h.dispatched.length, deadDispatch(state));
+      for (const fn of [h.gate.ensureReadyWorker, h.gate.dispatch]) fn.mockClear();
+      const response = await exchange(secrets);
+      expect(response.status).toBe(200);
+      expect(h.deleteDispatch).toHaveBeenCalledWith('AD_dead', ROOM_OF(secrets.attempt_id));
+      expect(h.gate.ensureReadyWorker).toHaveBeenCalledTimes(1);
+      expect(h.gate.dispatch).toHaveBeenCalledTimes(1);
+    });
   });
 });

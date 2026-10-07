@@ -244,6 +244,9 @@ describe('isolation of the retirement switch', () => {
       'routes/invites.ts',
       'routes/livekit.ts',
       'routes/me.ts',
+      // R1 reads the boolean ONLY to refuse the Cloud fallback while the legacy
+      // browser lane is enabled (see the exemption below).
+      'routes/r1-candidate.ts',
     ]);
     // The variable itself is READ in one place only (comments elsewhere may name it).
     expect(referencing(/process\.env\.LEGACY_BROWSER_SCREENING_ENABLED/)).toEqual([
@@ -251,16 +254,34 @@ describe('isolation of the retirement switch', () => {
     ]);
   });
 
+  // The ONE R1 file allowed to read the switch: the candidate router's Cloud-fallback
+  // guard (`laneForNewWork`) refuses R1 on the Cloud SFU while the legacy browser lane
+  // is still enabled, because that Cloud worker must run R1_LANE_MODE=off and would
+  // delete every marked R1 room. It reads the boolean helper only: R1 is never retired
+  // by the switch (no 410 guard) and never reads the variable itself.
+  const R1_FENCE_READER = 'routes/r1-candidate.ts';
+
   it('is never referenced by phone or R1 source', () => {
     const laneOwned = files.filter((f) => LANE_OWNED.test(f.path));
     expect(laneOwned.length).toBeGreaterThan(10);
     for (const file of laneOwned) {
+      if (file.path === R1_FENCE_READER) continue;
       // The switch's own identifiers only. The budget estimate's unrelated
       // `legacy_browser_minutes` column (R1 capacity views) must not trip this.
       expect(file.text, file.path).not.toMatch(
         /legacy-browser-screening|LEGACY_BROWSER_SCREENING|legacyBrowserScreening/,
       );
     }
+  });
+
+  it('lets R1 read the boolean helper for the Cloud-fallback fence, never retire R1', () => {
+    const reader = files.find((f) => f.path === R1_FENCE_READER);
+    expect(reader).toBeDefined();
+    // The helper only: no 410 guard, no raw config reader, no direct env read.
+    expect(reader!.text).toMatch(/legacyBrowserScreeningEnabled/);
+    expect(reader!.text).not.toMatch(/legacyBrowserScreeningGuard/);
+    expect(reader!.text).not.toMatch(/getLegacyBrowserScreeningConfig/);
+    expect(reader!.text).not.toMatch(/process\.env\.LEGACY_BROWSER_SCREENING_ENABLED/);
   });
 
   it('is not present in the phone Fly config or the voice worker sources', () => {

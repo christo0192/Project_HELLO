@@ -41,6 +41,21 @@
  *     (PR-CT audience contract, migration 0123). The template route is therefore
  *     a POST carrying the link token in its body, never a GET with the token in
  *     the URL.
+ *  8. Fence 7 (the candidate token requires a dispatched interviewer) holds on the
+ *     R1 SFU, where nothing auto-dispatches: with target `r1` and no worker gate
+ *     (orchestration off, empty or malformed `BROWSER_AGENT_NAME`) every new-work
+ *     route and the exchange of a `waiting` attempt answer 503 `r1_unavailable`
+ *     BEFORE admission, provisioning or any room, and a `disabled` gate verdict is
+ *     a 202 `preparing`, never a token. Cloud keeps the unnamed auto-dispatching
+ *     worker. Cloud as the R1 SFU is also refused while the legacy browser lane is
+ *     enabled: that worker must run `R1_LANE_MODE=off` and would delete every
+ *     marked room after a start and capacity were spent.
+ *  9. A `waiting` attempt re-asserts its marked room on EVERY exchange, before the
+ *     worker gate: R1 sessions stay `waiting` for the whole interview, the room
+ *     lapses after 180 s empty or is deleted by a refusing worker, and on the R1 SFU
+ *     (no auto-create) a missing room is otherwise a permanent `preparing` loop (on
+ *     Cloud the join would auto-create an UNMARKED room). `in_progress` is left
+ *     alone: the candidate is already in the room.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -66,6 +81,7 @@ import {
   type LiveKitEndpoint,
 } from '../lib/livekit-endpoints.js';
 import { browserOrchestrationGate, type BrowserWorkerGate } from '../lib/browser-orchestration.js';
+import { legacyBrowserScreeningEnabled } from '../lib/legacy-browser-screening.js';
 import { getR1Config } from '../lib/r1/config.js';
 import {
   generateNonce,
@@ -206,6 +222,12 @@ export interface R1CandidateDeps {
   provisionRoom?: typeof provisionRoomForCreatedSession;
   /** The browser worker gate, or null when on-demand orchestration is off. */
   resolveGate?: () => BrowserWorkerGate | null;
+  /**
+   * Is the legacy browser screening lane still enabled (PR-L's
+   * `legacyBrowserScreeningEnabled`, read at call time)? Only the Cloud-fallback
+   * guard in `laneForNewWork` reads it.
+   */
+  legacyBrowserEnabled?: () => boolean;
   rooms?: (endpoint: LiveKitEndpoint) => R1RoomClient;
   dispatches?: (endpoint: LiveKitEndpoint) => DispatchListerLike;
   /** DeepSeek health verdict (cached 60 s inside the default probe). */
@@ -229,6 +251,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
   const uuid = deps.uuid ?? randomUUID;
   const provisionRoom = deps.provisionRoom ?? provisionRoomForCreatedSession;
   const resolveGate = deps.resolveGate ?? (() => browserOrchestrationGate());
+  const legacyBrowserEnabled = deps.legacyBrowserEnabled ?? legacyBrowserScreeningEnabled;
   const roomsFor = deps.rooms
     ?? ((endpoint: LiveKitEndpoint) => roomServiceClientFor(endpoint) as unknown as R1RoomClient);
   const dispatchesFor = deps.dispatches
@@ -359,7 +382,38 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       refuse(res, 503, 'r1_endpoint_mismatch');
       return null;
     }
+    if (endpoint.target === 'cloud' && legacyBrowserEnabled()) {
+      // Cloud fallback while the legacy browser lane lives: that worker must stay in
+      // R1_LANE_MODE=off, so it would refuse and delete every marked R1 room AFTER
+      // a start and capacity were spent. Refuse before admission spends anything.
+      log.error('unknown_event', { error_category: 'r1_cloud_fallback_legacy_browser_enabled' });
+      refuse(res, 503, 'r1_unavailable');
+      return null;
+    }
+    if (r1GateMissing(endpoint)) {
+      refuse(res, 503, 'r1_unavailable');
+      return null;
+    }
     return endpoint;
+  }
+
+  /**
+   * Fence 7 on the R1 SFU. Nothing auto-dispatches there, so with no worker gate
+   * (orchestration off, `BROWSER_AGENT_NAME` empty or malformed) a candidate token
+   * would be minted for a room no interviewer will ever join. True means "refuse
+   * with 503 r1_unavailable", and it must be asked BEFORE anything is provisioned.
+   * Cloud is never affected: its unnamed worker auto-dispatches (legacy behaviour).
+   * A gate that cannot even be built counts as missing.
+   */
+  function r1GateMissing(endpoint: LiveKitEndpoint): boolean {
+    if (endpoint.target !== 'r1') return false;
+    try {
+      if (resolveGate() !== null) return false;
+    } catch {
+      /* unbuildable gate: fail closed below */
+    }
+    log.error('unknown_event', { error_category: 'r1_worker_gate_missing' });
+    return true;
   }
 
   // ── POST /api/r1/status ────────────────────────────────────────────
@@ -1024,6 +1078,34 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     };
   }
 
+  /**
+   * Provision (or re-assert) the egress-free, `lane: r1`-marked room for an R1
+   * round session. True means the room is there; otherwise the refusal has been
+   * written: a provider failure is 503 `r1_room_unavailable` (the attempt stays
+   * retryable), anything else means the attempt is no longer joinable. An
+   * `adopted: true` answer (a concurrent exchange won the `created` -> `waiting`
+   * CAS, or the session was already `waiting`) is success.
+   */
+  async function provisionMarkedRoom(
+    res: Response,
+    session: { id: string; interview_round_id: string | null },
+    endpoint: LiveKitEndpoint,
+  ): Promise<boolean> {
+    const provisioned = await provisionRoom(session.id, 'existing_session', {
+      endpoint,
+      lane: 'r1',
+      interviewRoundId: session.interview_round_id,
+      ...(deps.rooms ? { rooms: roomsFor(endpoint) } : {}),
+    });
+    if (provisioned.ok) return true;
+    if (provisioned.code === 'provider_failed') {
+      refuse(res, 503, 'r1_room_unavailable');
+      return false;
+    }
+    refuse(res, 409, 'r1_attempt_ended');
+    return false;
+  }
+
   router.post('/exchange', validateBody(r1ExchangeSchema), route(async (req, res) => {
     if (!attemptTokensConfigured()) {
       refuse(res, 503, 'r1_unavailable');
@@ -1107,21 +1189,9 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
         refuseUnhealthy(res);
         return;
       }
-      const provisioned = await provisionRoom(session.id, 'existing_session', {
-        endpoint,
-        lane: 'r1',
-        interviewRoundId: session.interview_round_id as string | null,
-        ...(deps.rooms ? { rooms: roomsFor(endpoint) } : {}),
-      });
-      if (!provisioned.ok) {
-        if (provisioned.code === 'provider_failed') {
-          // The attempt stays `created`: nothing was consumed and a retry converges.
-          refuse(res, 503, 'r1_room_unavailable');
-          return;
-        }
-        refuse(res, 409, 'r1_attempt_ended');
-        return;
-      }
+      // The attempt stays `created` on a provider failure: nothing was consumed and
+      // a retry converges.
+      if (!(await provisionMarkedRoom(res, session, endpoint))) return;
     } else {
       // Rejoin or retry of an attempt that already has a room.
       try {
@@ -1129,6 +1199,23 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       } catch {
         refuse(res, 503, 'r1_unavailable');
         return;
+      }
+      if (session.status === 'waiting') {
+        // Fence 7, BEFORE anything is provisioned: no gate on the R1 SFU, no token.
+        if (r1GateMissing(endpoint)) {
+          refuse(res, 503, 'r1_unavailable');
+          return;
+        }
+        // R1 sessions stay `waiting` for the whole interview, so this is every
+        // refresh and retry. The room lapses after 180 s empty and a refusing
+        // worker deletes it; on the R1 SFU (no auto-create) a missing room would be
+        // a permanent `preparing` loop, on Cloud the join would auto-create an
+        // UNMARKED room. Re-assert the marked room first: idempotent (createRoom
+        // converges the marker and limits on an existing room; a lost
+        // `created` -> `waiting` CAS is `adopted: true`, which is success).
+        if (session.external_call_id === roomName) {
+          if (!(await provisionMarkedRoom(res, session, endpoint))) return;
+        }
       }
     }
 
@@ -1139,6 +1226,9 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
         roomName,
         dispatches: () => dispatchesFor(endpoint),
         now,
+        // The R1 SFU has no unnamed worker to auto-dispatch: a null gate or a
+        // `disabled` verdict defers instead of minting a token (fence 7).
+        failClosed: endpoint.target === 'r1',
       });
       if (gate === 'preparing') {
         res.setHeader('Retry-After', String(PREPARING_RETRY_AFTER_SEC));

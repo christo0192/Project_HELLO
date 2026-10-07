@@ -548,7 +548,7 @@ paths:
         '429':
           description: Per-link preflight cap reached (r1_preflight_limit) or three in the last minute (r1_preflight_rate_limited, with retry_after_sec).
         '503':
-          description: Maintenance, endpoint mismatch (r1_endpoint_mismatch), R1 unavailable (r1_unavailable), room unavailable (r1_room_unavailable), or service unavailable (service_unavailable).
+          description: Maintenance, endpoint mismatch (r1_endpoint_mismatch), R1 unavailable (r1_unavailable: no worker gate on the R1 SFU, or the Cloud fallback while the legacy browser lane is enabled), room unavailable (r1_room_unavailable), or service unavailable (service_unavailable).
   /api/r1/attempts:
     post:
       tags: [r1]
@@ -623,13 +623,13 @@ paths:
         '409':
           description: Refused by admission (r1_busy, consent_required, r1_disabled, r1_paused, r1_capacity_exhausted, starts_exhausted, attempts_exhausted, round_expired, round_not_admissible) or, for a rejoin, because the attempt is no longer live (r1_attempt_not_live).
         '503':
-          description: Maintenance, endpoint mismatch (r1_endpoint_mismatch), DeepSeek unhealthy or unconfigured (r1_unavailable, retry_after_sec), or service unavailable (service_unavailable).
+          description: Maintenance, endpoint mismatch (r1_endpoint_mismatch), R1 unavailable (r1_unavailable: DeepSeek unhealthy or unconfigured with retry_after_sec, no worker gate on the R1 SFU, or the Cloud fallback while the legacy browser lane is enabled; all refused before admission spends a start), or service unavailable (service_unavailable).
   /api/r1/exchange:
     post:
       tags: [r1]
       operationId: exchangeR1Attempt
       summary: Exchange an attempt token + nonce for a candidate LiveKit join (egress-free R1 room)
-      description: 'Gate order for a new start: attempt token and nonce, session and round state, consent, maintenance, R1 settings and endpoint, DeepSeek health probe (3 s, cached 60 s; zero LiveKit cost on failure), then room creation WITHOUT egress (room metadata lane=r1), the browser worker gate (idempotent: a dispatch that already has a job is never re-gated; a job-less one is replaced once stale; ready before dispatch, dispatch at most once) and the token. 202 preparing while a worker boots. The token publishes camera and microphone only, no data, no metadata updates, 10 minute TTL, signed with the secret of the selected endpoint (R1 when BROWSER_LIVEKIT_TARGET=r1, otherwise Cloud).'
+      description: 'Gate order for a new start: attempt token and nonce, session and round state, consent, maintenance, R1 settings and endpoint, DeepSeek health probe (3 s, cached 60 s; zero LiveKit cost on failure), then room creation WITHOUT egress (room metadata lane=r1), the browser worker gate (idempotent: a dispatch that already has a job is never re-gated; a job-less one is replaced once stale; ready before dispatch, dispatch at most once) and the token. A rejoin of a waiting attempt re-asserts its marked room before the worker gate (idempotent; a provider failure is 503 r1_room_unavailable with no token). On the R1 SFU the worker gate is required (fence 7): with no gate the exchange answers 503 r1_unavailable before anything is provisioned, and a disabled gate verdict is a 202 preparing, never a token. A dispatch only counts as a running interviewer while it owns a live job. 202 preparing while a worker boots. The token publishes camera and microphone only, no data, no metadata updates, 10 minute TTL, signed with the secret of the selected endpoint (R1 when BROWSER_LIVEKIT_TARGET=r1, otherwise Cloud).'
       security: []
       requestBody:
         required: true
@@ -666,7 +666,7 @@ paths:
                     type: string
                     format: uuid
         '202':
-          description: A worker is being prepared; retry after retry_after_sec with the same attempt token and nonce.
+          description: A worker is being prepared (or, on the R1 SFU, the worker gate reported disabled); retry after retry_after_sec with the same attempt token and nonce. No token is issued.
           content:
             application/json:
               schema:
@@ -686,7 +686,7 @@ paths:
         '409':
           description: Attempt ended (r1_attempt_ended), consent required (consent_required), round not admissible (round_not_admissible), or R1 disabled or paused (r1_disabled, r1_paused).
         '503':
-          description: DeepSeek unhealthy or unconfigured (r1_unavailable, retry_after_sec), maintenance, endpoint mismatch (r1_endpoint_mismatch), room unavailable (r1_room_unavailable), or service unavailable (service_unavailable); the attempt stays valid.
+          description: R1 unavailable (r1_unavailable: DeepSeek unhealthy or unconfigured with retry_after_sec, no worker gate on the R1 SFU, or the Cloud fallback while the legacy browser lane is enabled), maintenance, endpoint mismatch (r1_endpoint_mismatch), room unavailable (r1_room_unavailable, including a failed re-assert of a waiting attempt's room), or service unavailable (service_unavailable); the attempt stays valid.
   # ── Health ──────────────────────────────────────────────────────────
   /api/health:
     get:

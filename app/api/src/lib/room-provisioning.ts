@@ -36,13 +36,26 @@
  *     the mode simply never deletes; an orphan room self-reaps at
  *     ROOM_EMPTY_TIMEOUT_SEC and no token was ever minted for it.
  *  5. The R1 lane marker (`lane:r1` room metadata, which authorizes a worker to
- *     run R1) is derived from the SESSION (an R1 round: `interviewRoundId`), and
- *     must agree with the selected endpoint. A disagreement either way fails
- *     closed (`r1_lane_mismatch`) before any provider call, so a legacy session
- *     is never marked just because the endpoint is R1, and an R1 round is never
- *     left unmarked on the Cloud endpoint. Cloud room args stay byte-identical.
- *     The same predicate (`r1LaneMismatch`) guards the exchange route for a session
- *     whose room already exists, so no token is ever minted across a lane mismatch.
+ *     run R1) is derived from the SESSION (an R1 round: `interviewRoundId`), never
+ *     from the endpoint alone, in two rules:
+ *       - The R1 exchange (`lane: 'r1'`, routes/r1-candidate.ts) marks its room on
+ *         EITHER SFU, the R1 SFU or the Cloud fallback, but only for an R1 round
+ *         session: it REQUIRES a non-empty `interviewRoundId`, otherwise it fails
+ *         closed as `r1_lane_mismatch` before any provider call.
+ *       - Every other caller keeps the agreement rule: the marker is set only when
+ *         an R1 round session meets the R1 endpoint, and a disagreement either way
+ *         fails closed (`r1_lane_mismatch`) before any provider call, so a legacy
+ *         session is never marked just because the endpoint is R1, and an R1 round
+ *         is never left unmarked on the Cloud endpoint by those callers. Cloud room
+ *         args stay byte-identical.
+ *     The agreement predicate (`r1LaneMismatch`) also guards the legacy
+ *     `/api/livekit/exchange` route for a session whose room already exists, so no
+ *     token is ever minted across a lane mismatch.
+ *  6. `existing_session` is idempotent for a session that is already `waiting` with
+ *     this room: the create converges the marker and limits on an existing room
+ *     (or re-creates a lapsed one), the `created` -> `waiting` CAS reports a conflict
+ *     and the re-read adopts it (`adopted: true`). The R1 exchange relies on this to
+ *     re-assert the marked room of a `waiting` attempt on every rejoin.
  */
 
 import { supabase } from './supabase.js';
@@ -68,7 +81,8 @@ export const R1_ROOM_METADATA_LANE_VALUE = 'r1';
 /**
  * R1 rooms outlive the candidate's departure by the worker's 90 s rejoin grace plus a
  * 30 s margin. LiveKit's server default (20 s) would close the room, and cancel the
- * agent job, before the reconnect window ends. Cloud/legacy rooms never set it.
+ * agent job, before the reconnect window ends. Set for every marked R1 room (the R1
+ * exchange marks on either SFU); unmarked Cloud/legacy rooms never set it.
  */
 export const R1_ROOM_DEPARTURE_TIMEOUT_SEC = 120;
 

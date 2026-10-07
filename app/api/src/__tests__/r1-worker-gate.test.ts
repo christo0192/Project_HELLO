@@ -312,6 +312,128 @@ describe('R1 worker gate: a dispatch only counts when a worker took the job', ()
   });
 });
 
+describe('R1 worker gate: a finished job is not a running interviewer', () => {
+  /** A dispatch whose only job is in `state`, created long ago (never "in flight"). */
+  const withJob = (state: Record<string, unknown> | undefined, id = 'AD_job'): DispatchLike => ({
+    id,
+    agentName: 'browser-screener',
+    state: { jobs: [state === undefined ? { id: 'AJ_1' } : { id: 'AJ_1', state }], createdAt: created(60_000) },
+  });
+
+  it.each([
+    ['JS_SUCCESS', { status: 'JS_SUCCESS' }],
+    ['JS_FAILED', { status: 'JS_FAILED' }],
+    ['numeric JS_SUCCESS (2)', { status: 2 }],
+    ['numeric JS_FAILED (3)', { status: 3 }],
+    ['an endedAt stamp on a RUNNING status', { status: 'JS_RUNNING', endedAt: BigInt(NOW) * 1_000_000n }],
+    ['an endedAt stamp as a string', { status: 1, endedAt: '1700000000000000000' }],
+  ])('replaces a dispatch whose only job ended (%s), never proceeds into its room', async (_label, state) => {
+    const gate = gateWith();
+    const list = lister([withJob(state, 'AD_dead')]);
+    expect(await run(gate, list)).toBe('proceed');
+    // The dead dispatch was not taken for a running interviewer: a worker was
+    // readied, the dead record deleted, and a fresh dispatch made.
+    expect(gate.ensureReadyWorker).toHaveBeenCalledTimes(1);
+    expect(list.deleteDispatch).toHaveBeenCalledWith('AD_dead', ROOM);
+    expect(gate.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('defers instead of proceeding when the replacement dispatch cannot be made', async () => {
+    const gate = gateWith({ dispatch: vi.fn(async () => false) });
+    const list = lister([withJob({ status: 'JS_FAILED' }, 'AD_dead')]);
+    expect(await run(gate, list)).toBe('preparing');
+    expect(gate.releaseWorker).toHaveBeenCalledWith({ machineId: 'm1', sessionId: SESSION });
+  });
+
+  it.each([
+    ['no job state at all (proto3 default JS_PENDING)', undefined],
+    ['JS_PENDING', { status: 'JS_PENDING' }],
+    ['JS_RUNNING', { status: 'JS_RUNNING' }],
+    ['numeric JS_RUNNING (1)', { status: 1 }],
+    ['an unset endedAt (0)', { status: 'JS_RUNNING', endedAt: 0 }],
+  ])('still proceeds, touching nothing, on a live job (%s)', async (_label, state) => {
+    const gate = gateWith();
+    const list = lister([withJob(state)]);
+    expect(await run(gate, list)).toBe('proceed');
+    expect(gate.ensureReadyWorker).not.toHaveBeenCalled();
+    expect(gate.dispatch).not.toHaveBeenCalled();
+    expect(list.deleteDispatch).not.toHaveBeenCalled();
+  });
+
+  it('proceeds when ANY job of the dispatch is live, even beside a finished one', async () => {
+    const gate = gateWith();
+    const mixed: DispatchLike = {
+      id: 'AD_mixed',
+      agentName: 'browser-screener',
+      state: {
+        jobs: [{ id: 'AJ_old', state: { status: 'JS_FAILED' } }, { id: 'AJ_new', state: { status: 'JS_RUNNING' } }],
+        createdAt: created(60_000),
+      },
+    };
+    expect(await run(gate, lister([mixed]))).toBe('proceed');
+    expect(gate.ensureReadyWorker).not.toHaveBeenCalled();
+  });
+
+  it('prefers a live dispatch over a finished sibling', async () => {
+    const gate = gateWith();
+    const list = lister([withJob({ status: 'JS_SUCCESS' }, 'AD_dead'), running('AD_live')]);
+    expect(await run(gate, list)).toBe('proceed');
+    expect(gate.ensureReadyWorker).not.toHaveBeenCalled();
+    expect(list.deleteDispatch).not.toHaveBeenCalled();
+  });
+
+  it('clears the finished-job record a failed dispatch left behind', async () => {
+    const items: DispatchLike[] = [];
+    const gate = gateWith({
+      dispatch: vi.fn(async () => {
+        items.push(withJob({ status: 'JS_FAILED' }, 'AD_dead_after'));
+        return false;
+      }),
+    });
+    const list = lister(items);
+    expect(await run(gate, list)).toBe('preparing');
+    expect(list.deleteDispatch).toHaveBeenCalledWith('AD_dead_after', ROOM);
+  });
+});
+
+describe('R1 worker gate: failClosed (the R1 SFU has no auto-dispatching worker)', () => {
+  const runStrict = (gate: BrowserWorkerGate | null, list: ReturnType<typeof lister>) =>
+    runR1WorkerGate({
+      gate, sessionId: SESSION, roomName: ROOM, dispatches: () => list, now: clock, failClosed: true,
+    });
+
+  it('defers on a null gate and touches nothing (never a bare proceed)', async () => {
+    const dispatches = vi.fn();
+    expect(await runR1WorkerGate({
+      gate: null, sessionId: SESSION, roomName: ROOM, dispatches, failClosed: true,
+    })).toBe('preparing');
+    expect(dispatches).not.toHaveBeenCalled();
+  });
+
+  it('defers on a disabled verdict instead of proceeding, with no dispatch', async () => {
+    const gate = gateWith({ ensureReadyWorker: vi.fn(async () => ({ status: 'disabled' })) });
+    expect(await runStrict(gate, lister())).toBe('preparing');
+    expect(gate.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('still proceeds on a live dispatch and on a successful ready + dispatch', async () => {
+    const live = gateWith();
+    expect(await runStrict(live, lister([running()]))).toBe('proceed');
+    expect(live.ensureReadyWorker).not.toHaveBeenCalled();
+    const fresh = gateWith();
+    expect(await runStrict(fresh, lister())).toBe('proceed');
+    expect(fresh.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves the default (Cloud) behaviour as it was: null and disabled proceed', async () => {
+    expect(await runR1WorkerGate({
+      gate: null, sessionId: SESSION, roomName: ROOM, dispatches: vi.fn(), failClosed: false,
+    })).toBe('proceed');
+    const disabled = gateWith({ ensureReadyWorker: vi.fn(async () => ({ status: 'disabled' })) });
+    expect(await run(disabled, lister())).toBe('proceed');
+  });
+});
+
 describe('epochMs', () => {
   const T = NOW;
 

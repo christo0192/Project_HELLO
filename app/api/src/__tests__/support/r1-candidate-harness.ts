@@ -326,6 +326,9 @@ export function buildHarness(
     rooms: () => rooms,
     dispatches: () => ({ listDispatch: async () => [...dispatched], deleteDispatch }),
     resolveGate: () => (gateEnabled ? gate : null),
+    // The Cloud-fallback guard refuses R1 on Cloud while the legacy browser lane is
+    // enabled; the default fixture is the retired-legacy configuration (production's).
+    legacyBrowserEnabled: () => false,
     health,
     maintenance: async () => ({ ok: true, enabled: false, reason: null, updatedAt: null }),
     schedule: (work, delayMs) => {

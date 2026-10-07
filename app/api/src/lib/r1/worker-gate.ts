@@ -10,17 +10,20 @@
  * rejoin passes through here. "Already dispatched" is therefore read from
  * LiveKit itself, BEFORE anything is asked of the worker pool:
  *
- *   - a dispatch of our agent that has a JOB (a worker accepted it) means the
- *     interviewer is running: mint a token and touch nothing. Calling
+ *   - a dispatch of our agent that has a LIVE JOB (a worker accepted it and the
+ *     job is not finished: `jobIsLive`, the same predicate the browser worker gate
+ *     uses; a JS_SUCCESS / JS_FAILED job or one with `endedAt` set is a dead
+ *     interviewer, not a running one) means the interviewer is running: mint a
+ *     token and touch nothing. Calling
  *     `ensureReadyWorker` here would re-claim and `startMachine` a machine that
  *     is hosting a live interview, and a failed start releases the claim and
  *     stops that machine;
- *   - a dispatch with NO job that is younger than the verify window is another
- *     exchange's dispatch still in flight: defer, never dispatch twice;
- *   - a dispatch with no job past that window was dropped (the S0-F3 case: the
- *     SFU accepted it with no registered worker). It is deleted, a worker is
- *     readied, and a fresh dispatch is made, so a stale record can never stand
- *     in for a running interviewer;
+ *   - a dispatch with NO live job that is younger than the verify window is
+ *     another exchange's dispatch still in flight: defer, never dispatch twice;
+ *   - a dispatch with no live job past that window was dropped (the S0-F3 case:
+ *     the SFU accepted it with no registered worker) or its interviewer already
+ *     ended. It is deleted, a worker is readied, and a fresh dispatch is made, so
+ *     a stale record can never stand in for a running interviewer;
  *   - no dispatch at all: ready a worker, then dispatch once;
  *   - a dispatch listing that cannot be read defers instead of guessing.
  *
@@ -29,11 +32,16 @@
  * serialization is best-effort; the young-dispatch rule above closes most of
  * that window. See the PR-3 open risks.
  *
- * `gate` is null when on-demand orchestration is off. The exchange then
- * proceeds exactly like the legacy path: the unnamed worker auto-dispatches.
+ * `gate` is null when on-demand orchestration is off (or `BROWSER_AGENT_NAME` is
+ * empty or malformed). On the Cloud SFU the exchange then proceeds exactly like
+ * the legacy path: the unnamed worker auto-dispatches. On the R1 SFU NOTHING
+ * auto-dispatches, so a null gate (and a `disabled` verdict from the service)
+ * must never mint a token: the caller sets `failClosed` and both answer
+ * `preparing` (fence 7; the route also refuses 503 `r1_unavailable` before it
+ * provisions anything, so this is the second line of defence).
  */
 
-import type { BrowserWorkerGate } from '../browser-orchestration.js';
+import { jobIsLive, type BrowserWorkerGate } from '../browser-orchestration.js';
 
 /** The part of an `AgentDispatch` the gate reads (the SDK type satisfies it). */
 export interface DispatchLike {
@@ -62,6 +70,13 @@ export interface R1GateInput {
   dispatches: () => DispatchListerLike;
   /** Epoch ms, injectable for tests. */
   now?: () => number;
+  /**
+   * R1 SFU: no unnamed worker auto-dispatches there, so "no gate" and a `disabled`
+   * verdict can never stand in for a dispatched interviewer. When true both answer
+   * `preparing` instead of `proceed`. Cloud (false/omitted) keeps the legacy
+   * behaviour: it proceeds and the unnamed worker auto-dispatches.
+   */
+  failClosed?: boolean;
 }
 
 /**
@@ -102,8 +117,13 @@ export function epochMs(value: bigint | number | string | undefined): number | n
   return Math.floor(n * 1000); // seconds
 }
 
+/**
+ * A worker owns a LIVE job for this dispatch. A finished or failed job (status
+ * JS_SUCCESS / JS_FAILED, or `endedAt` set) is the remains of an interviewer that
+ * is gone, so it must not make a rejoin `proceed` into an agent-less room.
+ */
 function hasJob(dispatch: DispatchLike): boolean {
-  return (dispatch.state?.jobs?.length ?? 0) > 0;
+  return (dispatch.state?.jobs ?? []).some(jobIsLive);
 }
 
 /** Young enough that a worker may still pick it up. Unknown age counts as stale. */
@@ -132,7 +152,7 @@ async function deleteJobless(
 
 async function gateOnce(input: R1GateInput): Promise<R1GateVerdict> {
   const { gate, sessionId, roomName } = input;
-  if (gate === null) return 'proceed';
+  if (gate === null) return input.failClosed ? 'preparing' : 'proceed';
   const nowMs = (input.now ?? Date.now)();
 
   // 1. Read what LiveKit already holds. Unreadable: defer, never guess (a
@@ -152,8 +172,10 @@ async function gateOnce(input: R1GateInput): Promise<R1GateVerdict> {
 
   // 3. Nothing usable is dispatched. Ready a worker first.
   const ready = await gate.ensureReadyWorker({ sessionId });
-  // The service's own flag-off answer: inert gate, proceed as with no gate.
-  if (ready.status === 'disabled') return 'proceed';
+  // The service's own flag-off answer: an inert gate. Cloud proceeds as with no
+  // gate (the unnamed worker auto-dispatches); the R1 SFU has no such worker, so
+  // it defers rather than mint a token into an agent-less room (fence 7).
+  if (ready.status === 'disabled') return input.failClosed ? 'preparing' : 'proceed';
   // no_capacity | timeout | error: the service already released what it claimed.
   if (ready.status !== 'ready') return 'preparing';
 
