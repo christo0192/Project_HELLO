@@ -38,6 +38,17 @@ const MIGRATIONS = 'app/supabase/migrations/';
 
 const migrationFiles = (): string[] =>
   readdirSync(`${ROOT}${MIGRATIONS}`).filter((f) => f.endsWith('.sql')).sort();
+/** Migration numbers (the 4-digit prefix) that more than one file claims, sorted. */
+const duplicateMigrationNumbers = (files: string[]): string[] => {
+  const seen = new Set<string>();
+  const dupes = new Set<string>();
+  for (const file of files) {
+    const number = file.slice(0, 4);
+    if (seen.has(number)) dupes.add(number);
+    seen.add(number);
+  }
+  return [...dupes].sort();
+};
 const migrationNamed = (prefix: string): string => {
   const matches = migrationFiles().filter((f) => f.startsWith(`${prefix}_`));
   if (matches.length !== 1) throw new Error(`expected exactly one ${prefix}_ migration`);
@@ -147,12 +158,35 @@ describe('1. CI wiring: what this PR adds is collected and executed', () => {
     expect(DEPLOY.match(/needs: \[detect, migrate-production\]/g)).toHaveLength(3);
   });
 
-  it('migration numbers are unique and gap-free, so a rebase collision turns red', () => {
-    const numbers = migrationFiles().map((f) => Number(f.slice(0, 4)));
-    expect(new Set(numbers).size).toBe(numbers.length);
-    numbers.forEach((n, index) => expect(n).toBe(index + 1));
-    expect(numbers).toContain(117);
-    expect(numbers).toContain(118);
+  // Production applies with `supabase db push --include-all`, so a number GAP is
+  // legitimate: the R1 migrations (0118-0124) and main's own phone migrations
+  // (e.g. 0125) land as separate PRs in any order. What must never happen is two
+  // files sharing a number (a rebase collision), so that is what turns this red.
+  it('migration numbers are unique, so a rebase collision turns red', () => {
+    const files = migrationFiles();
+    for (const file of files) expect(file, 'migration filename').toMatch(/^\d{4}_.+\.sql$/);
+    expect(duplicateMigrationNumbers(files)).toEqual([]);
+  });
+
+  it('0118 exists exactly once and carries the _r1_ infix', () => {
+    const files = migrationFiles().filter((f) => f.startsWith('0118_'));
+    expect(files).toHaveLength(1);
+    expect(files[0]).toMatch(/^0118_r1_/);
+  });
+
+  it('a duplicate migration number is detected (the uniqueness check can go red)', () => {
+    expect(
+      duplicateMigrationNumbers([
+        '0118_r1_browser_ready_livekit_host.sql',
+        '0118_phone_something_else.sql',
+        '0119_r1_capacity_model.sql',
+        '0125_phone_recording_integrity.sql',
+      ]),
+    ).toEqual(['0118']);
+    // Gaps and out-of-order arrival are fine.
+    expect(
+      duplicateMigrationNumbers(['0119_a.sql', '0125_b.sql', '0118_c.sql', '0124_d.sql']),
+    ).toEqual([]);
   });
 });
 
