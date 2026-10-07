@@ -95,8 +95,16 @@ ok(!/^[ \t]*keys:/m.test(toml), "SFU TOML must not contain inline LiveKit YAML k
 
 const digest = "sha256:5d3dcc475d064536d9948ebe4eeab8e3b24d6f07a46f6d71a3415a2901bbdc52";
 ok(new RegExp(`^FROM livekit/livekit-server:v1\\.13\\.7@${digest}$`, "m").test(dockerfile), "Dockerfile must pin livekit/livekit-server:v1.13.7 to the approved amd64 digest");
-ok(/LIVEKIT_R1_CONFIG:-A/.test(entrypoint) && /if \[ "\$R1_CONFIG" = "B" \]/.test(entrypoint) && /__RTC_IPS__/.test(template) && !/^\s*ips:/m.test(template), "Config A must default to no rtc.ips filter; Config B alone may render the FGS filter");
-ok(/FLY_APP_NAME/.test(entrypoint) && /FLY_MACHINE_ID/.test(entrypoint) && /forbidden on Fly/.test(entrypoint), "the local FGS override must fail closed on Fly");
+ok(/LIVEKIT_R1_CONFIG:-A/.test(entrypoint) && /if \[ "\$R1_CONFIG" = "B" \]/.test(entrypoint) && /__RTC_IPS__/.test(template) && !/^\s*ips:/m.test(template), "Config A must default to no rtc.ips filter; Config B and C alone may render the FGS filter");
+ok(/FLY_APP_NAME/.test(entrypoint) && /FLY_MACHINE_ID/.test(entrypoint) && /LIVEKIT_R1_FGS_IP_OVERRIDE is forbidden on Fly/.test(entrypoint), "the local FGS override must fail closed on Fly");
+// Config C (worker media over Fly 6PN, no public-IP hairpin).
+ok(/^\s*A \| B \| C\) ;;/m.test(entrypoint), "LIVEKIT_R1_CONFIG must accept exactly A, B and C");
+ok(/LIVEKIT_R1_6PN_IP_OVERRIDE is forbidden on Fly/.test(entrypoint) && /LIVEKIT_R1_6PN_IP_OVERRIDE:-/.test(entrypoint), "the local 6PN override must exist and fail closed on Fly");
+ok(/getent hosts fly-local-6pn/.test(entrypoint) && /^is_6pn_ipv6\(\) \{/m.test(entrypoint) && /\[Ff\]\[Dd\]\[Aa\]\[Aa\]:/.test(entrypoint) && /is_6pn_ipv6 "\$V6" \|\| die/.test(entrypoint), "Config C must read fly-local-6pn and validate it as an fdaa: IPv6 literal before rendering");
+ok(/if \(r1_config == "C"\) print "      - \\"" v6 "\/128\\""/.test(entrypoint) && /Config C requires the Machine's fly-local-6pn IPv6/.test(entrypoint), "Config C must render the 6PN address as a /128 include and fail closed when it is missing");
+ok(/Config C; advertising \$\{NODE_IP\}:7882 and 6PN \$\{V6\}/.test(entrypoint), "Config C must log its advertised addresses at startup");
+// LiveKit's port-range mode bypasses the single UDP mux (verified in mediatransportutil), which would silently drop the 6PN socket.
+ok(!/port_range_(?:start|end)/.test(template) && !/port_range/.test(entrypoint), "the SFU must never set rtc.port_range_*: it bypasses the single-port UDP mux");
 ok(/udp_port:\s*7882/.test(template) && /tcp_port:\s*7881/.test(template) && /use_external_ip:\s*false/.test(template), "LiveKit template must pin the reviewed ICE ports and explicit node-IP mode");
 ok(/node_ip:\s*"__NODE_IP__"/.test(template) && /auto_create:\s*false/.test(template) && /prometheus:\s*\{ port: 6789 \}/.test(template), "LiveKit template must use NODE_IP, API-created rooms, and private Prometheus");
 

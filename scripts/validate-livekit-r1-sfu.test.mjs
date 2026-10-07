@@ -52,6 +52,8 @@ ok(/sysctl -w net\.core\.rmem_max=5000000 net\.core\.rmem_default=5000000/.test(
 ok(/sed -i 's\/\\r\$\/\/' \/etc\/livekit\/livekit\.yaml\.tmpl \/usr\/local\/bin\/livekit-r1-entrypoint/.test(goodDockerfile), "Dockerfile must defensively normalize CRLF on the template and entrypoint");
 ok(/Local Docker smoke test/.test(readme) && /LIVEKIT_R1_FGS_IP_OVERRIDE=127\.0\.0\.1/.test(readme), "runbook must document the local Docker smoke-test override");
 ok(/Config A first/.test(readme) && /Config B only if Config A fails/.test(readme) && /forced-TCP/.test(readme), "runbook must require Config A before opt-in Config B, including forced TCP");
+ok(/Config C/.test(readme) && /LIVEKIT_R1_CONFIG=C/.test(readme) && /fly-local-6pn/.test(readme) && /fdaa:/.test(readme) && /LIVEKIT_R1_6PN_IP_OVERRIDE/.test(readme) && /ICE candidate pair stats/.test(readme) && /37\.16\.23\.137:7882/.test(readme), "runbook must document Config C: why, selection, the 6PN override, and the ICE pair-stats verification for worker and browsers");
+ok(/ss -ulpn[^\n]*7882/.test(readme) && /\[fdaa:/.test(readme), "runbook must verify the 6PN UDP socket with ss");
 ok(/CRLF/.test(readme) && /LIVEKIT_KEYS/.test(readme) && /collide/.test(readme), "runbook must document the CRLF and LIVEKIT_KEYS parser-collision fixes");
 ok(/cdn\.jsdelivr\.net\/npm\/livekit-client/.test(page) && /URLSearchParams/.test(page) && /createLocalAudioTrack/.test(page) && /createLocalVideoTrack/.test(page), "spike page must use CDN LiveKit client, query/form inputs, microphone, and camera");
 for (const [label, html] of [["spike page", page], ["S0-E probe", s0eProbe]]) {
@@ -80,6 +82,11 @@ const cases = [
   ["generic password", { "fly.toml": `${goodToml}\nTURN_PASSWORD = \"not-a-secret\"\n` }, /secret-shaped/],
   ["credential URL", { "fly.toml": `${goodToml}\nSUPABASE_DB_URL = \"postgresql:\/\/user:pass@example.test\/db\"\n` }, /credential-bearing URL/],
   ["env NODE_IP bypass", { "fly.toml": goodToml.replace("  # NODE_IP", "  NODE_IP = \"1.2.3.4\"\n  # NODE_IP") }, /not allowlisted/],
+  ["6PN override allowed on Fly", { "entrypoint.sh": entrypoint.replace('die "LIVEKIT_R1_6PN_IP_OVERRIDE is forbidden on Fly"', "true") }, /6PN override/],
+  ["Config C drops the 6PN /128", { "entrypoint.sh": entrypoint.replace('if (r1_config == "C") print', 'if (0) print') }, /6PN address as a \/128/],
+  ["Config C skips 6PN validation", { "entrypoint.sh": entrypoint.replace('is_6pn_ipv6 "$V6" || die', 'true || die') }, /validate it as an fdaa: IPv6/],
+  ["Config C accepts any selector", { "entrypoint.sh": entrypoint.replace("A | B | C) ;;", "A | B | C | D) ;;") }, /exactly A, B and C/],
+  ["port range bypasses the UDP mux", { "livekit.yaml.tmpl": goodTemplate.replace("  udp_port: 7882", "  udp_port: 7882\n  port_range_start: 50000") }, /port_range/],
 ];
 for (const [label, mutation, expected] of cases) {
   const dir = fixture(mutation);
