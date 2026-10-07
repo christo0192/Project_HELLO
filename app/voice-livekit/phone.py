@@ -14891,13 +14891,30 @@ def phone_qna_question_directed(text: Any) -> bool:
 #: posted", "do take care", "is fine" and "will do" are Indian-English
 #: sign-offs, not questions. The auxiliary must be followed by whitespace,
 #: so "can't" / "don't" never count.
+#:
+#: Round-4 review fix: after do/does/did/will/would/can/could the subject
+#: must be a personal pronoun or "there" ("do you", "will I", "can we",
+#: "will there be"); a determiner, "it" or a possessive is an imperative or a
+#: statement there ("do the needful", "did my best"). "is"/"are" keep the
+#: wider subject list ("is it hybrid", "is the role remote"). Exclamatory and
+#: rhetorical wh forms are not questions: "what a nice conversation", "how
+#: nice", "what else, thank you", "what more to ask", "which is fine"
+#: ("what else do I need", "which is the office" still are).
 _QNA_CLAUSE_QUESTION_RE = re.compile(
     r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now|um+|uh+|yeah|right|wait|"
     r"(?:(?:yes|no)[\s,.!-]*)?(?:ma['’]?a?m|maam|mam|madam|sir))[\s,.!?-]+){0,4}"
-    r"(?:(?:what|which|who|where|when|why|how)\b"
-    r"|(?:can|could|would|will|is|are|do|does|did)\s+"
+    r"(?:(?!what\s+(?:a|an)\b"
+    r"|how\s+(?:nice|lovely|sweet|kind|wonderful|great|amazing|cool|beautiful"
+    r"|interesting)\b"
+    r"|what\s+(?:else|more)\b(?!\s+(?:do|does|did|is|are|can|could|should|would"
+    r"|will|shall|i|you|we)\b)"
+    r"|which\s+is\b(?!\s+(?:the|your|our|a|an|better|best)\b))"
+    r"(?:what|which|who|where|when|why|how)\b"
+    r"|(?:is|are)\s+"
     r"(?:you|u|i|we|they|it|there|this|that|these|those|the|a|an|any|my|your|"
-    r"our|their|his|her|he|she|someone|somebody|anyone|anybody)\b)",
+    r"our|their|his|her|he|she|someone|somebody|anyone|anybody)\b"
+    r"|(?:can|could|would|will|do|does|did)\s+"
+    r"(?:you|u|i|we|they|he|she|someone|somebody|anyone|anybody|there)\b)",
     re.IGNORECASE,
 )
 #: "No, I don't have a question" / "not a single doubt": a NEGATED mention

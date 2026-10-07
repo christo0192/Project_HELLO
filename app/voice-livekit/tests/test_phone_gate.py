@@ -11219,6 +11219,18 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         "No ma'am, nothing. Do let me know the result",
         "No, thank you. Is fine.",
         "Okay ma'am, will do",
+        # Round-4 review: a determiner after do/did, and exclamatory or
+        # rhetorical wh forms.
+        "No ma'am, do the needful.",
+        "No, that's all. Do the needful.",
+        "No ma'am, did my best, thank you",
+        "No madam, it's fine. What else, thank you",
+        "No thanks, which is fine",
+        "What a nice conversation, thank you",
+        "How nice, bye",
+        "No ma'am, what more to ask, all is clear",
+        "Will wait for your call",
+        "Okay, do keep me posted",
     )
 
     def test_round3_sign_offs_carry_no_question(self):
@@ -11237,6 +11249,12 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
             "No one more question",
             "No, but I wanted to know the timings",
             "Actually I have a doubt",
+            # Round-4: the narrowed clause rule keeps these.
+            "No ma'am, what else do I need to prepare",
+            "Okay, which is the office location",
+            "No, is it hybrid",
+            "Okay, will there be a bond",
+            "No sir, can we get the offer by mail",
         ):
             self.assertTrue(phone.phone_qna_carries_question(text), text)
 
@@ -11282,6 +11300,90 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
                 ]
                 self.assertEqual(interlocks, [])
                 await self._stop(hooks)
+
+    @staticmethod
+    def _fallback_windows():
+        """Legacy (rollback) mode, and llm mode with the judge down (503)."""
+        return (
+            ("legacy", lambda: _qna_window(mode="legacy")),
+            ("judge_down", lambda: _qna_window(fail=True)),
+        )
+
+    async def test_round4_sign_off_over_a_pending_goodbye_stays_terminal_in_fallback(self):
+        # Round-4 review (major): in legacy mode and on a judge timeout/error
+        # the pending-goodbye reopen used the broad fallback grammar, so
+        # "Okay ma'am, will do" interrupted the goodbye and reopened Q&A.
+        for label, make in self._fallback_windows():
+            for text in self._SIGN_OFFS:
+                with self.subTest(label=label, text=text):
+                    window, _, _ = make()
+                    agent, _, _, client, hooks = await self._enter_qna(window)
+                    await self._qna_turn(hooks, "No thank you")
+                    self.assertEqual(
+                        agent._closing_state_machine.state.value, "closing_pending")
+                    stale = _FakeSpeech()
+                    hooks["reply_handle"][0] = stale
+                    _, stopped = await self._qna_turn(hooks, text)
+                    self.assertTrue(stopped)
+                    self.assertEqual(stale.interrupt_calls, [])
+                    self.assertEqual(
+                        agent._closing_state_machine.state.value, "closing_pending")
+                    interlocks = [
+                        c.kwargs.get("error_category")
+                        for c in hooks["log"].info.call_args_list
+                        if c.kwargs.get("error_type") == "phone_qna_terminal_interlock"
+                    ]
+                    self.assertEqual(interlocks, [])
+                    await self._finish(hooks)
+                    self.assertEqual(client.event_types.count("assessment.completed"), 1)
+
+    async def test_round4_real_question_over_a_pending_goodbye_reopens_in_fallback(self):
+        # The strict reader still reopens on a real question, '?' or not.
+        for label, make in self._fallback_windows():
+            for text in ("No ma'am, what is the stipend",
+                         "Okay, is there a bond",
+                         "Wait, what's the salary?"):
+                with self.subTest(label=label, text=text):
+                    window, _, _ = make()
+                    agent, _, _, client, hooks = await self._enter_qna(window)
+                    await self._qna_turn(hooks, "No thank you")
+                    stale = _FakeSpeech()
+                    hooks["reply_handle"][0] = stale
+                    out, stopped = await self._qna_turn(hooks, text)
+                    self.assertFalse(stopped)
+                    self.assertEqual(len(stale.interrupt_calls), 1)
+                    self.assertEqual(
+                        agent._closing_state_machine.state.value, "candidate_qna")
+                    self.assertIn("answer the candidate's question", out.lower())
+                    self.assertNotIn("assessment.completed", client.event_types)
+                    await self._stop(hooks)
+
+    async def test_round4_sign_off_after_the_goodbye_played_is_not_answered_in_fallback(self):
+        # The late-question path (goodbye already played) uses the same
+        # strict reader: a sign-off is terminal, never "one more question".
+        for label, make in self._fallback_windows():
+            for text in ("Okay ma'am, will do", "No ma'am, do the needful.",
+                         "Will wait for your call"):
+                with self.subTest(label=label, text=text):
+                    window, _, _ = make()
+                    agent, _, _, client, hooks = await self._enter_qna(window)
+                    await self._qna_turn(hooks, "No thank you")
+                    await agent._on_reply_delivered(False)
+                    self.assertEqual(
+                        agent._closing_state_machine.state.value, "closing_played")
+                    out, stopped = await self._qna_turn(hooks, text)
+                    self.assertTrue(stopped)
+                    self.assertNotIn("goodbye again", out.lower())
+                    answered = [
+                        c for c in hooks["log"].info.call_args_list
+                        if c.kwargs.get("error_type") == "phone_qna_late_question"
+                    ]
+                    self.assertEqual(answered, [])
+                    with patch.object(agent_mod, "_delete_livekit_room",
+                                      new_callable=AsyncMock):
+                        await asyncio.wait_for(hooks["task"], timeout=10)
+                    hooks["log_patch"].stop()
+                    self.assertEqual(client.event_types.count("assessment.completed"), 1)
 
     async def test_round3_question_judged_while_the_goodbye_finishes_is_answered(self):
         # Round-3 review (nit): the goodbye finished playing while this turn's

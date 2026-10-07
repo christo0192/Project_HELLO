@@ -4086,9 +4086,28 @@ _VOICEMAIL_SHAPE_RE = re.compile(
     r"\banswering\s+(?:machine|service)\b|\bmail\s*box\b|"
     r"\byou(?:'ve|\s+have)\s+reached\b|"
     r"\b(?:can't|cannot|can\s+not|unable\s+to)\s+(?:take|answer)\s+your\s+call\b|"
-    r"\bat\s+the\s+(?:tone|beep)\b",
+    r"\bat\s+the\s+(?:tone|beep)\b|"
+    # Round-4 review fix: carrier and greeting wording `_MACHINE_RE` misses.
+    # "The person you're calling is using a screening service" (you're).
+    r"\b(?:number|subscriber|person|customer)\s+you(?:'re|\s+are|'ve|\s+have)\s+"
+    r"(?:calling|called|dialled|dialed|trying\s+to\s+reach)\b|"
+    r"\bscreening\s+service\b|"
+    # "The call cannot be completed as dialled", "this number does not exist".
+    r"\b(?:cannot|can\s*not|can't|could\s+not)\s+be\s+completed\b|"
+    r"\bnumber\s+(?:does\s+not|doesn't)\s+exist\b|"
+    # Hindi carrier: "is number par incoming call ki suvidha uplabdh nahi
+    # hai", "aapke dwara dial kiya gaya number abhi vyast hai".
+    r"\bincoming\s+(?:call\s+)?(?:ki\s+)?suvidha\b|"
+    r"\bdial\s+kiya\s+gaya\s+number\b|"
+    # A personal greeting: "Sorry I missed your call, I'll get back to you".
+    r"\bmissed\s+your\s+call\b.{0,80}\bget\s+back\s+to\s+you\b",
     re.IGNORECASE,
 )
+#: Round-4 review fix: "Please try again later" is a carrier prompt, but a
+#: person says it too ("I'm in a meeting, try again later"): machine-shaped
+#: only with no first-person / he / she subject and no '?' (as
+#: `_MACHINE_AVAILABILITY_RE`).
+_VOICEMAIL_TRY_LATER_RE = re.compile(r"\btry\s+again\s+later\b", re.IGNORECASE)
 
 
 def _voicemail_shaped(value: str) -> bool:
@@ -4102,7 +4121,13 @@ def _voicemail_shaped(value: str) -> bool:
     if not isinstance(value, str) or not value.strip():
         return False
     clean = value.replace("’", "'")
-    return _is_machine_text(clean) or _VOICEMAIL_SHAPE_RE.search(clean) is not None
+    if _is_machine_text(clean) or _VOICEMAIL_SHAPE_RE.search(clean) is not None:
+        return True
+    return bool(
+        _VOICEMAIL_TRY_LATER_RE.search(clean)
+        and "?" not in clean
+        and not _FIRST_PERSON_RE.search(clean)
+    )
 
 
 _WRONG_NUMBER_RE = re.compile(
@@ -5904,7 +5929,9 @@ async def _run_native_phone_screening(
         else _QnaCloseWindow(first_name="")
     )
     qna_fillers = {"value": 0}
-    qna_kind_cache: dict[str, Any] = {"key": None, "kind": None, "judged": False}
+    qna_kind_cache: dict[str, Any] = {
+        "key": None, "kind": None, "judged": False, "verdict": None,
+    }
     qna_other = {"value": 0}
     # Review fix: True while the bot's last Q&A line invited a question (the
     # "any questions?" invite, or "Sure, go ahead."): silence then gets ONE
@@ -7445,6 +7472,7 @@ async def _run_native_phone_screening(
             return str(qna_kind_cache["kind"])
         kind, _ = await qna_window.read_qna(text)
         judged = kind in (QNA_KIND_DECLINE, QNA_KIND_QUESTION, QNA_KIND_OTHER)
+        verdict = kind if judged else None
         if kind == QNA_KIND_OTHER and phone.phone_qna_question_directed(text):
             # Only in the safe direction: a reply shaped as a question to the
             # interviewer ("…?", "what does the role pay") is answered even if
@@ -7473,12 +7501,33 @@ async def _run_native_phone_screening(
                 kind = QNA_KIND_QUESTION
             else:
                 kind = QNA_KIND_OTHER
-        qna_kind_cache.update(key=key, kind=kind, judged=judged)
+        qna_kind_cache.update(key=key, kind=kind, judged=judged, verdict=verdict)
         return kind
 
     def _qna_kind_judged() -> bool:
         """Was the last `_qna_kind` a judge verdict (not the fallback grammar)?"""
         return bool(qna_kind_cache.get("judged"))
+
+    async def _qna_question_after_close(text: str, route: str | None) -> bool:
+        """After the goodbye was authored or played: does this turn ask something?
+
+        Round-4 review fix (major): reopening a closed screening needs the
+        STRICT reader, never the broad `phone_qna_question_directed` the
+        fallback grammar answers with in CANDIDATE_QNA. That one reads a bare
+        "will"/"do" opener as a question, so in legacy mode and on every judge
+        timeout/error "Okay ma'am, will do" over a pending goodbye interrupted
+        it and reopened Q&A (origin/main reopened only on the question route).
+        A question is: the question route, the judge's OWN `question` verdict,
+        or `phone_qna_carries_question` (a '?', a request, a non-negated "one
+        more question", or a subject-inverted clause). The judge is asked at
+        most once per turn (`_qna_kind` caches it).
+        """
+        if route == "candidate_question":
+            return True
+        await _qna_kind(text, route)
+        if _qna_kind_judged() and qna_kind_cache.get("verdict") == QNA_KIND_QUESTION:
+            return True
+        return phone.phone_qna_carries_question(text)
 
     def _qna_close(turn_ctx: Any, close_instruction: str) -> None:
         """Author the closing goodbye and arm the `completed` terminal."""
@@ -7517,12 +7566,16 @@ async def _run_native_phone_screening(
         late_qna["done"] = gate
         late_qna["judging"] = True
         try:
-            kind = await _qna_kind(text, phone.candidate_turn_route(text))
+            # Round-4 review fix: the same strict reader as the pending
+            # reopen, so "Okay ma'am, will do" after the goodbye is never
+            # answered as a question in legacy mode or with the judge down.
+            asks = await _qna_question_after_close(
+                text, phone.candidate_turn_route(text))
         except Exception:  # noqa: BLE001 — never answer on a failed read
-            kind = QNA_KIND_OTHER
+            asks = False
         finally:
             late_qna["judging"] = False
-        if kind != QNA_KIND_QUESTION or late_qna["closed"]:
+        if not asks or late_qna["closed"]:
             gate.set()
             late_qna["done"] = None
             return False
@@ -7920,9 +7973,12 @@ async def _run_native_phone_screening(
         # overridden only by the stricter `phone_qna_carries_question`; the
         # short-cut skipped the judge and reopened Q&A (interrupting the
         # goodbye) on sign-offs such as "Okay ma'am, will do".
-        late_question = closing.state is ClosingState.CLOSING_PENDING and (
-            route == "candidate_question"
-            or await _qna_kind(text, route) == QNA_KIND_QUESTION
+        # Round-4 review fix: the reopen uses the strict reader in every mode
+        # (`_qna_question_after_close`), not `_qna_kind`'s fallback grammar,
+        # so legacy mode and a judge timeout/error cannot reopen on it either.
+        late_question = (
+            closing.state is ClosingState.CLOSING_PENDING
+            and await _qna_question_after_close(text, route)
         )
         # Round-2 review fix: `_qna_kind` may await the judge (llm mode), and
         # the goodbye's delivery callback can move the state on meanwhile

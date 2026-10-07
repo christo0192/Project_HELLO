@@ -765,6 +765,80 @@ class TestVoicemailAndTheLatch(unittest.TestCase):
                      "Sorry, I'm not available right now, can you call me later?"):
             self.assertFalse(agent_mod._voicemail_shaped(text), text)
 
+    # Round-4 review (minor + nit): the shape guard read only the cited
+    # utterance, so a greeting STT split into fragments was rejected; and
+    # several real carrier / greeting lines were not machine-shaped.
+
+    @staticmethod
+    def _vm_utt(idx, text, tag=gate_judge.TAG_POST_QUESTION):
+        return gate_judge.GateUtterance(
+            idx=idx, text=text, final_arrival_ms=13_000 + idx * 500,
+            segment_start_ms=12_000 + idx * 500, segment_end_ms=12_400 + idx * 500,
+            segment_speech_ms=400, tag=tag)
+
+    def _vm_guard(self, evidence, *utterances, phase=gate_judge.PHASE_CONSENT):
+        return gate_judge.voicemail_guard_failure(
+            gate_judge.JudgeVerdict(intent=gate_judge.INTENT_VOICEMAIL, evidence=evidence),
+            utterances, phase=phase, voicemail_shape=agent_mod._voicemail_shaped)
+
+    def test_round4_split_greeting_with_a_fragment_citation_may_act(self):
+        u = self._vm_utt
+        for tags in ((gate_judge.TAG_POST_QUESTION, gate_judge.TAG_POST_QUESTION),
+                     (gate_judge.TAG_DURING_QUESTION, gate_judge.TAG_POST_QUESTION),
+                     (None, None)):
+            with self.subTest(tags=tags):
+                self.assertIsNone(self._vm_guard(
+                    "Please leave",
+                    u(0, "Hi, you can reach Neha later. Please leave", tags[0]),
+                    u(1, "a message.", tags[1])))
+        # The person's own words stay rejected however they are joined.
+        self.assertEqual(
+            self._vm_guard("Who is this", u(0, "Hello?"), u(1, "Who is this?")),
+            gate_judge.GUARD_VOICEMAIL_NOT_MACHINE_SHAPED)
+        # Machine wording before the question that the judge did not cite is
+        # not joined onto a person's post-question words.
+        self.assertEqual(
+            self._vm_guard("Who is this",
+                           u(0, "Please leave a message", gate_judge.TAG_PRE_QUESTION),
+                           u(1, "Hello? Who is this?")),
+            gate_judge.GUARD_VOICEMAIL_NOT_MACHINE_SHAPED)
+
+    def test_round4_split_greeting_replay_reaches_machine(self):
+        # One turn, two STT finals; the judge cites the keyword-free fragment.
+        fixture = _fixture("split_greeting", speech=[
+            _speech(12000, 13400, 13900, None, "Hi, you can reach Neha later. Please leave"),
+            _speech(13950, 14500, 14600, 14610, "a message."),
+        ])
+        result = _llm(fixture, {"consent": [
+            (gr.judge_json("voicemail_machine", "Please leave"), 500),
+        ]})
+        self.assertEqual(result.decision, phone.CLASSIFY_MACHINE)
+        self.assertFalse(result.glue.spoke.spoke)
+        self.assertNotIn("reask", result.spoken_kinds())
+        decision = _logs(result, "phone_gate_decision")[0]
+        self.assertEqual(decision.error_category, "llm.voicemail_machine")
+        self.assertEqual(result.leaked_text_in_logs(), [])
+
+    def test_round4_more_carrier_and_greeting_lines_are_machine_shaped(self):
+        for text in (
+            "The person you're calling is using a screening service.",
+            "The number you’re calling is not reachable.",
+            "Please try again later.",
+            "Is number par incoming call ki suvidha uplabdh nahi hai.",
+            "The call cannot be completed as dialled.",
+            "This number does not exist.",
+            "Aapke dwara dial kiya gaya number abhi vyast hai.",
+            "Sorry I missed your call, I'll get back to you.",
+        ):
+            self.assertTrue(agent_mod._voicemail_shaped(text), text)
+        for text in (
+            "I'm in a meeting, try again later.",
+            "Can you try again later?",
+            "Main abhi vyast hoon.",
+            "Sorry I missed your call earlier, who is this?",
+        ):
+            self.assertFalse(agent_mod._voicemail_shaped(text), text)
+
 
 # â”€â”€ the identity turn through the real gate (extends TestGateIdentityFlow) â”€
 

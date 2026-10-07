@@ -1628,6 +1628,14 @@ def voicemail_guard_failure(
     gives this rejection the WEAK latch (machine wording heard later still
     decides), so a real greeting the predicate does not know is not stuck
     as a person.
+
+    Round-4 review fix: STT splits a greeting into several finals ("Hi, you
+    can reach Neha later. Please leave" + "a message."), and the judge may
+    cite a fragment without the machine words. The shape is therefore also
+    read on the JOINED text of the cited utterances plus every post-question
+    utterance the judge saw (every utterance when none is tagged), in spoken
+    order. A person's own words stay unshaped however they are joined, so a
+    misread "Hello? Who is this?" is still rejected.
     """
     if verdict.intent != INTENT_VOICEMAIL:
         return None
@@ -1635,14 +1643,22 @@ def voicemail_guard_failure(
         return "no_evidence"
     if evidence_names_a_label(verdict.evidence):
         return "evidence_is_label"
-    matches = evidence_utterances(verdict.evidence, utterances)
+    shown = tuple(utterances)
+    matches = evidence_utterances(verdict.evidence, shown)
     if not matches:
         return "evidence_not_found"
     if voicemail_shape is not None and phase in VOICEMAIL_SHAPE_PHASES:
+        untagged = all(u.tag is None for u in shown)
+        cited = {u.idx for u in matches}
+        joined = " ".join(
+            u.text for u in sorted(shown, key=lambda u: u.idx)
+            if u.idx in cited or untagged or u.tag == TAG_POST_QUESTION
+        )
+        texts = [u.text for u in matches] + [joined]
         shaped = False
-        for utterance in matches:
+        for text in texts:
             try:
-                shaped = bool(voicemail_shape(utterance.text))
+                shaped = bool(voicemail_shape(text))
             except Exception:  # noqa: BLE001 — unknown shape never acts
                 shaped = False
             if shaped:
