@@ -150,6 +150,14 @@ export interface Role {
    * case the filters list every role (see `lib/mapped-roles.ts`).
    */
   has_ashby_mapping?: boolean;
+  /**
+   * 0115: non-null marks a role that is run by a dedicated interview lane
+   * (today only `sales_r1`, the WebRTC sales role-play). Such a role is
+   * never offered to an Ashby mapping (a DB trigger and the mapping route
+   * both refuse it), so pickers must filter on it. Absent on an API older
+   * than the column, which reads as "not an interview-kind role".
+   */
+  interview_kind?: string | null;
 }
 
 /** Where an Ask Hello job currently is. */

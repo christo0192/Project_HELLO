@@ -108,6 +108,7 @@ const PAGE_TITLES: Array<[RegExp, string]> = [
   [/^\/phone-calendar/, 'Phone calendar'],
   [/^\/ashby-mission-control/, 'Ashby Live Jobs'],
   [/^\/ashby\/review/, 'Ashby review'],
+  [/^\/admin\/r1/, 'R1 settings'],
   [/^\/mission-control/, 'Mission Control'],
 ];
 

@@ -36,6 +36,7 @@ import type {
   ScorecardMetricDraft,
   ScorecardMetricTemplate,
 } from '../../src/types';
+import type { R1SettingsResponse, R1UsageResponse } from '../../src/lib/r1-types';
 import { ADMIN_USER_ID, PHONE_WINDOW, SCOPED_REVIEW_LINK_ID, STAR_CANDIDATE_ID, funnelSummary, phoneSlots, type Dataset } from './data';
 import { FROZEN_NOW_MS } from './env';
 
@@ -102,6 +103,49 @@ function summaryOf(db: Dataset): CandidatesSummary {
 function phoneWrite(engagementState = 'scheduled'): PhoneAppointmentWriteResponse {
   return { ok: true, appointment_id: mintId(), version: 1, engagement_state: engagementState, prereqs_pending: false, superseded_appointment_id: null };
 }
+
+/**
+ * R1 (WebRTC sales role-play). Off by default, as in production: the candidate
+ * card then shows its disabled state and the rounds list is empty, so no
+ * candidate page claims a round that no dataset row backs. The settings and
+ * usage answers are typed against the wire types, so a drift fails `tsc`.
+ */
+const R1_JOIN_URL = `https://hello.e2e.invalid/candidate/r1#${'e'.repeat(64)}`;
+const R1_SETTINGS: R1SettingsResponse = {
+  enabled: false,
+  paused: false,
+  auto_status_enabled: false,
+  monthly_cap_minutes: 4000,
+  pause_line_minutes: 4000,
+  admission_hold_minutes: 55,
+  advance_threshold: 65,
+  hold_threshold: 45,
+  livekit_target: 'cloud',
+  dashboard_minutes: 0,
+  dashboard_read_at: null,
+  updated_at: '2026-09-01T00:00:00.000Z',
+  runtime: { enabled: true, status: 'enabled' },
+};
+const R1_USAGE: R1UsageResponse = {
+  month_start: '2026-09-01',
+  monthly_cap_minutes: 4000,
+  pause_line_minutes: 4000,
+  hold_minutes: 55,
+  dashboard_minutes: 0,
+  dashboard_read_at: null,
+  minutes_reserved: 0,
+  minutes_used: 0,
+  starts_admitted: 0,
+  r1_minutes: 0,
+  phone_minutes: 1500,
+  legacy_browser_minutes: 0,
+  estimated_minutes: 1725,
+  ledger_since_minutes: 0,
+  guard_minutes: 1725,
+  committed_minutes: 1725,
+  sends_left: 41,
+  runtime: { enabled: true, status: 'enabled' },
+};
 
 /** Proportional re-spread of the other metrics' weights so the total stays 10 000 bps. */
 function redistribute(metrics: RoleScorecardMetric[], editedId: string, newWeight: number): RoleScorecardMetric[] {
@@ -301,6 +345,17 @@ const ROUTES: Array<[string, string, Handler]> = [
     Object.assign(entry, body);
     return ok({ ok: true });
   }],
+
+  // ── R1 (WebRTC sales role-play) ────────────────────────────────────
+  ['GET', '/api/interview-rounds/availability', () => ok({ state: 'disabled', hold_minutes: 55 })],
+  ['GET', '/api/candidates/:id/interview-rounds', () => ok({ rounds: [] })],
+  ['POST', '/api/candidates/:id/interview-rounds', () => created({ id: mintId(), status: 'invited', expires_at: new Date(FROZEN_NOW_MS + 72 * 3_600_000).toISOString(), join_url: R1_JOIN_URL })],
+  ['POST', '/api/interview-rounds/:id/cancel', () => ok({ ok: true })],
+  ['POST', '/api/interview-rounds/:id/reissue', ({ params }) => ok({ id: params.id, join_url: R1_JOIN_URL })],
+  ['POST', '/api/interview-rounds/:id/grant-retake', () => ok({ ok: true })],
+  ['GET', '/api/admin/r1/settings', () => ok(R1_SETTINGS)],
+  ['PUT', '/api/admin/r1/settings', ({ body }) => ok({ ...R1_SETTINGS, ...body, runtime: undefined })],
+  ['GET', '/api/admin/r1/usage', () => ok(R1_USAGE)],
 
   // ── Ashby Mission Control ──────────────────────────────────────────
   ['GET', `${ASHBY}/mappings`, (_r, db) => ok({ ok: true, mappings: db.ashby.mappings })],

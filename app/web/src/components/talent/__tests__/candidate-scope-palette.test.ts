@@ -49,6 +49,12 @@ const CANDIDATE_SCOPE_SOURCES = [
   'src/components/talent/Tabs.tsx',
   'src/components/talent/RecordingPlayer.tsx',
   'src/components/talent/SeekableTranscript.tsx',
+  // R1 (PR-7): the Send R1 card and rounds panel render inside the Candidate
+  // Detail Overview, so they are candidate-scoped like everything above.
+  'src/components/r1/R1Section.tsx',
+  'src/components/r1/SendR1Controls.tsx',
+  'src/components/r1/R1RoundsPanel.tsx',
+  'src/components/r1/IssuedLink.tsx',
   'src/components/design/SurfaceCard.tsx',
   'src/components/design/Meter.tsx',
   'src/components/design/Tag.tsx',

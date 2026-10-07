@@ -1320,6 +1320,67 @@ describe('Adding a job mapping', () => {
     expect(within(list).queryByRole('option', { name: /Retired Role/ })).toBeNull();
   });
 
+  it('NEVER OFFERS a role run by a dedicated interview lane (R1)', async () => {
+    // The database and the mapping route both refuse an Ashby mapping for a
+    // role with an `interview_kind`, so offering it could only end in an error.
+    // A normal role carries `interview_kind: null`, which must stay pickable.
+    listRoles.mockResolvedValue([
+      { ...ROLES[0], interview_kind: null },
+      ROLES[1],
+      {
+        id: '33333333-3333-4333-8333-333333333333',
+        title: 'Sales Program Advisor',
+        agent_name: 'R1 role-play',
+        jd: '',
+        required_skills: [],
+        screening_template: [],
+        is_active: true,
+        created_at: '2026-10-01T00:00:00Z',
+        interview_kind: 'sales_r1',
+      },
+    ]);
+    await openDialog();
+    await waitFor(() => expect(rolePicker()).toBeEnabled());
+    const list = await openPicker(ROLE_PICKER);
+    expectOptions(list, [SALES_OPTION]);
+    expect(within(list).queryByRole('option', { name: /Sales Program Advisor/ })).toBeNull();
+    // The live announcement counts what is offered, not what exists.
+    expect(rolesLive()).toHaveTextContent('1 active role');
+  });
+
+  it('treats a role from an API older than the column (no interview_kind) as pickable', async () => {
+    listRoles.mockResolvedValue(ROLES);
+    await openDialog();
+    await waitFor(() => expect(rolePicker()).toBeEnabled());
+    const list = await openPicker(ROLE_PICKER);
+    expectOptions(list, [SALES_OPTION]);
+  });
+
+  it('with ONLY an R1 role active, says there are no agents to map', async () => {
+    listRoles.mockResolvedValue([
+      { ...ROLES[0], is_active: true, interview_kind: 'sales_r1' },
+      ROLES[1],
+    ]);
+    renderPage();
+    await screen.findByText('Account Executive');
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    await waitFor(() =>
+      expect(roleNote()).toHaveTextContent(
+        'There are no active agents yet. Create one on the Agents page first.',
+      ),
+    );
+    expect(rolePicker()).toBeDisabled();
+  });
+
+  it('still NAMES an R1 role on a row that predates the guard', async () => {
+    // A mapping made before the role was designated keeps working as a row:
+    // rows resolve against EVERY role, exactly as for a retired one.
+    listRoles.mockResolvedValue([{ ...ROLES[0], interview_kind: 'sales_r1' }, ROLES[1]]);
+    renderPage();
+    await screen.findByText('Account Executive');
+    expect(await screen.findByText('Role: Sales Advisor')).toBeInTheDocument();
+  });
+
   it('SURVIVES a roles lookup failure', async () => {
     // The picker is a convenience; the mapping list and its pause/resume
     // actions are what this page is for and must not disappear with it.

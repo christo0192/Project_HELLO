@@ -112,6 +112,17 @@ import type {
   UploadResumeResult,
   RoleDraftJob,
 } from './types';
+import type {
+  R1AvailabilityResponse,
+  R1OkResponse,
+  R1ReissueResponse,
+  R1RoundsResponse,
+  R1SendInput,
+  R1SendResponse,
+  R1SettingsPatch,
+  R1SettingsResponse,
+  R1UsageResponse,
+} from './lib/r1-types';
 
 export { ApiError };
 
@@ -290,6 +301,44 @@ export const api = {
     ),
   getCandidatesSummary: () =>
     request<CandidatesSummary>('/api/candidates/summary'),
+
+  // ── R1 (WebRTC sales role-play): HR side ────────────────────────
+  // Sends and lifecycle actions need interviewer or above (owner or admin);
+  // reads need viewer. Settings and usage are admin-only. The API re-checks
+  // the role and ownership on every request regardless of what is sent here.
+  // `sendR1Round` and `reissueR1Round` return the candidate's join URL
+  // exactly once: callers must hold it in memory only, never persist it.
+  getR1Availability: () =>
+    request<R1AvailabilityResponse>('/api/interview-rounds/availability'),
+  listR1Rounds: (candidateId: string) =>
+    request<R1RoundsResponse>(
+      `/api/candidates/${encodeURIComponent(candidateId)}/interview-rounds`,
+    ),
+  sendR1Round: (candidateId: string, body: R1SendInput) =>
+    request<R1SendResponse>(
+      `/api/candidates/${encodeURIComponent(candidateId)}/interview-rounds`,
+      { method: 'POST', body: JSON.stringify(body) },
+    ),
+  cancelR1Round: (roundId: string) =>
+    request<R1OkResponse>(`/api/interview-rounds/${encodeURIComponent(roundId)}/cancel`, {
+      method: 'POST',
+    }),
+  reissueR1Round: (roundId: string) =>
+    request<R1ReissueResponse>(`/api/interview-rounds/${encodeURIComponent(roundId)}/reissue`, {
+      method: 'POST',
+    }),
+  grantR1Retake: (roundId: string) =>
+    request<R1OkResponse>(
+      `/api/interview-rounds/${encodeURIComponent(roundId)}/grant-retake`,
+      { method: 'POST' },
+    ),
+  getR1Settings: () => request<R1SettingsResponse>('/api/admin/r1/settings'),
+  updateR1Settings: (patch: R1SettingsPatch) =>
+    request<R1SettingsResponse>('/api/admin/r1/settings', {
+      method: 'PUT',
+      body: JSON.stringify(patch),
+    }),
+  getR1Usage: () => request<R1UsageResponse>('/api/admin/r1/usage'),
 
   // Screening
   startScreening: (candidateId: string) =>

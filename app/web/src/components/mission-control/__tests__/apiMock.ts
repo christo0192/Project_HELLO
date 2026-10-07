@@ -37,6 +37,9 @@ const hoisted = vi.hoisted(() => {
     getPhoneHealth: vi.fn(),
     setPhoneHalt: vi.fn(),
     clearPhoneHalt: vi.fn(),
+    // The R1 section (usage tiles and allocation).
+    getR1Usage: vi.fn(),
+    getR1Settings: vi.fn(),
   };
 
   const api = {
@@ -55,6 +58,8 @@ const hoisted = vi.hoisted(() => {
     getPhoneHealth: fns.getPhoneHealth,
     setPhoneHalt: fns.setPhoneHalt,
     clearPhoneHalt: fns.clearPhoneHalt,
+    getR1Usage: fns.getR1Usage,
+    getR1Settings: fns.getR1Settings,
   };
 
   return { api, fns, ApiError };

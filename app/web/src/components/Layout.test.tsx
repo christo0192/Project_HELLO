@@ -168,6 +168,13 @@ describe('Layout shell', () => {
     expect(pageTitleFor('/mission-control')).toBe('Mission Control');
   });
 
+  it('titles the top bar "R1 settings" on /admin/r1, not "HELLO"', () => {
+    expect(pageTitleFor('/admin/r1')).toBe('R1 settings');
+    // Unrelated admin-looking paths keep their own titles.
+    expect(pageTitleFor('/mission-control')).toBe('Mission Control');
+    expect(pageTitleFor('/admin')).toBe('HELLO');
+  });
+
   /*
     The Operations GROUP is no longer admin-only, because the phone calendar
     inside it is readable by interviewers — that is the API's rule

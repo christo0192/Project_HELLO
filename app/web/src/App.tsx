@@ -70,6 +70,7 @@ const MissionControlPage = lazyPage(
   () => import('./pages/MissionControlPage'),
   'MissionControlPage',
 );
+const R1SettingsPage = lazyPage(() => import('./pages/R1SettingsPage'), 'R1SettingsPage');
 const PhoneCalendarPage = lazyPage(
   () => import('./pages/PhoneCalendarPage'),
   'PhoneCalendarPage',
@@ -191,6 +192,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route path="/admin" element={<Navigate to="/mission-control" replace />} />
             <Route path="/mission-control" element={<MissionControlPage />} />
+            <Route path="/admin/r1" element={<R1SettingsPage />} />
             <Route path="/ashby-mission-control" element={<AshbyMissionControlPage />} />
           </Route>
         </Route>

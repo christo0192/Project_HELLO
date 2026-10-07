@@ -31,6 +31,7 @@ import { ashbyMissionControlRouter } from './routes/ashby-mission-control.js';
 import { ashbyReviewRouter } from './routes/ashby-review.js';
 import { phoneApiRouter } from './routes/phone.js';
 import { r1Router, r1InternalRouter } from './routes/r1.js';
+import { r1HrRouter } from './routes/r1-hr.js';
 import { ashbyCandidateWorkflowRouter } from './routes/ashby-candidate-workflow.js';
 import { scorecardsRouter } from './routes/scorecards.js';
 import {
@@ -457,6 +458,8 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/resumes', resumesRouter);
   app.use('/api/candidates', candidatesRouter);
   app.use('/api', r1Router);
+  // Read-only HR read models (availability, usage); see routes/r1-hr.ts.
+  app.use('/api', r1HrRouter);
   // Read-only Ashby workflow card for a candidate. A separate router so the
   // Ashby integration stays out of the core candidates route; `/:id` above
   // never matches `/:id/ashby-workflow`, so ordering is not load-bearing.

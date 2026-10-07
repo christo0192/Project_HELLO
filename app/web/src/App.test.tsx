@@ -5,7 +5,7 @@
  *   - `/` lands on `/dashboard` (primary TA/HR landing)
  *   - `/dashboard`, `/candidates/:id`, `/sessions/:id` render their pages
  *   - `/admin` is a safe alias redirecting to `/mission-control`
- *   - Mission Control is admin-gated (non-admin → /unauthorized)
+ *   - Mission Control and R1 settings (`/admin/r1`) are admin-gated (non-admin → /unauthorized)
  *   - all legacy public routes still render (login)
  *   - unknown paths: authenticated → dashboard; unauthenticated → 404
  *   - lazy chunks resolve (React.lazy + Suspense) inside the app shell
@@ -68,6 +68,9 @@ vi.mock('./pages/SessionDetailPage', () => ({
 }));
 vi.mock('./pages/MissionControlPage', () => ({
   MissionControlPage: () => <div data-testid="page-mission-control">Mission Control</div>,
+}));
+vi.mock('./pages/R1SettingsPage', () => ({
+  R1SettingsPage: () => <div data-testid="page-r1-settings">R1 settings</div>,
 }));
 vi.mock('./pages/PhoneCalendarPage', () => ({
   PhoneCalendarPage: () => <div data-testid="page-phone-calendar">Phone calendar</div>,
@@ -158,6 +161,24 @@ describe('App route wiring', () => {
   it('aliases /admin to /mission-control for admins', async () => {
     renderApp('/admin');
     expect(await screen.findByTestId('page-mission-control')).toBeInTheDocument();
+  });
+
+  it('renders R1 settings for admins at /admin/r1, beside (not instead of) the /admin alias', async () => {
+    renderApp('/admin/r1');
+    expect(await screen.findByTestId('page-r1-settings')).toBeInTheDocument();
+  });
+
+  it('gates R1 settings for non-admins (→ /unauthorized)', async () => {
+    authedInterviewer();
+    renderApp('/admin/r1');
+    expect(await screen.findByText('Access denied')).toBeInTheDocument();
+    expect(screen.queryByTestId('page-r1-settings')).not.toBeInTheDocument();
+  });
+
+  it('keeps /admin itself an alias for Mission Control', async () => {
+    renderApp('/admin');
+    expect(await screen.findByTestId('page-mission-control')).toBeInTheDocument();
+    expect(screen.queryByTestId('page-r1-settings')).not.toBeInTheDocument();
   });
 
   it('gates Mission Control for non-admins (→ /unauthorized)', async () => {
