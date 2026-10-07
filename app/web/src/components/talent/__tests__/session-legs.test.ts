@@ -16,6 +16,7 @@ import {
   legRecordedWords,
   legRecordingShown,
   legUnobservedNote,
+  legUnseekableReason,
   legNoAudioLabel,
   legPlayable,
   legRecordingAnchor,
@@ -131,6 +132,59 @@ describe('sessionLegs', () => {
     const groups = groupTurnsByLeg([turn('x', null, 4), turn('y', null, 320)], [A, B], T0, 'session');
     expect(groups.map((g) => [g.legIndex, g.turns[0].turn.start_offset_sec])).toEqual([[0, 4], [1, 320]]);
     expect(groups.every((g) => !g.approximate)).toBe(true);
+  });
+
+  it('production case: turns on a leg whose recording failed keep their call time and name the reason', () => {
+    const failed = {
+      ...A,
+      recording: { state: 'unavailable' as const, reason: 'recording_failed' as const },
+    };
+    // Turns only on leg 1; leg 2 (reconnect) is the only playable recording.
+    const [g, ...rest] = groupTurnsByLeg(
+      [turn('Hello?', T0 + 12_000), turn('Hi', T0 + 75_000)],
+      [failed, B],
+      null,
+      'leg',
+    );
+    expect(rest).toEqual([]);
+    expect(g.legIndex).toBe(0);
+    // Not seekable (wrong file would be worse than none)...
+    expect(g.turns.map((t) => t.turn.start_offset_sec)).toEqual([null, null]);
+    // ...but the time is known: seconds into the call (answered at +10 s).
+    expect(g.turns.map((t) => t.callSec)).toEqual([2, 65]);
+    expect(g.turns.every((t) => t.atMs !== null)).toBe(true);
+    expect(g.unseekableReason).toMatch(/Recording failed for this call/);
+    expect(legUnseekableReason(failed)).toBe(g.unseekableReason);
+  });
+
+  it('a playable leg has no unseekable reason', () => {
+    const [g] = groupTurnsByLeg([turn('x', T0 + 320_000)], [A, B], null, 'leg');
+    expect(g.unseekableReason).toBeNull();
+    expect(g.turns[0].turn.start_offset_sec).toBe(9);
+  });
+
+  it('session mode with a null API offset derives it from the turn clock and the session anchor', () => {
+    const dead = { ...A, recording: { state: 'unavailable' as const, reason: 'no_recording' as const } };
+    const groups = groupTurnsByLeg([turn('x', T0 + 20_000, null)], [dead], T0, 'session');
+    expect(groups[0].turns[0].turn.start_offset_sec).toBe(20);
+    expect(groups[0].approximate).toBe(false);
+  });
+
+  it('session mode with no session anchor falls back to the first leg anchor and is approximate', () => {
+    const dead = { ...A, recording: { state: 'unavailable' as const, reason: 'no_recording' as const } };
+    const groups = groupTurnsByLeg([turn('x', T0 + 20_000, null), turn('y', null, null)], [dead], null, 'session');
+    // answered_at (T0+10 s) + 1 s lag => 9 s into the recording.
+    expect(groups[0].turns[0].turn.start_offset_sec).toBe(9);
+    expect(groups[0].approximate).toBe(true);
+    // A turn with no clock at all stays untimed.
+    expect(groups[1].legIndex).toBeNull();
+    expect(groups[1].turns[0].turn.start_offset_sec).toBeNull();
+  });
+
+  it('session mode keeps an exact API offset over a derived one', () => {
+    const [g] = groupTurnsByLeg([turn('x', T0 + 20_000, 4)], [A], null, 'session');
+    expect(g.turns[0].turn.start_offset_sec).toBe(4);
+    expect(g.approximate).toBe(false);
   });
 
   it('drops empty groups but keeps the legs list intact', () => {

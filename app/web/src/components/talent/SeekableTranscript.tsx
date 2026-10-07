@@ -18,6 +18,13 @@ import type { TranscriptLine } from '../../types';
 import { cx } from '../design/cx';
 import { SkeletonText } from '../design/Skeleton';
 import { presentTranscriptTurn } from '../../lib/transcript-presentation';
+import { formatIstTime } from '../../lib/ist-datetime';
+
+/** A turn's time when it cannot seek: seconds into its call, or a clock time. */
+export interface TurnTime {
+  sec?: number | null;
+  atMs?: number | null;
+}
 
 export interface SeekableTranscriptProps {
   transcript: TranscriptLine[];
@@ -38,6 +45,14 @@ export interface SeekableTranscriptProps {
    * one leg's slice of the transcript. Defaults to the row position + 1.
    */
   turnNumbers?: readonly number[];
+  /**
+   * Per-row display time for a turn that has a time but no seek offset (its
+   * call's recording cannot be played). Shown as "m:ss" into the call, else an
+   * IST clock time, instead of "no timing data".
+   */
+  turnTimes?: readonly (TurnTime | null | undefined)[];
+  /** Why timed-but-not-seekable turns cannot start playback; read by AT. */
+  unseekableReason?: string | null;
 }
 
 const prefersReducedMotion = (): boolean =>
@@ -55,6 +70,20 @@ function hasTiming(t: TranscriptLine): boolean {
   return t.start_offset_sec != null;
 }
 
+/** The label for a turn's non-seekable time, or null when it has none. */
+function displayTime(time: TurnTime | null | undefined): { text: string; spoken: string } | null {
+  if (!time) return null;
+  if (typeof time.sec === 'number' && Number.isFinite(time.sec)) {
+    const text = formatOffset(time.sec);
+    return { text, spoken: `${text} into the call` };
+  }
+  if (typeof time.atMs === 'number' && Number.isFinite(time.atMs)) {
+    const text = formatIstTime(new Date(time.atMs).toISOString());
+    return { text, spoken: `at ${text}` };
+  }
+  return null;
+}
+
 export function SeekableTranscript({
   transcript,
   activeTurnIndex,
@@ -66,6 +95,8 @@ export function SeekableTranscript({
   className,
   approximateTiming = false,
   turnNumbers,
+  turnTimes,
+  unseekableReason = null,
 }: SeekableTranscriptProps) {
   const numberOf = (index: number) => turnNumbers?.[index] ?? index + 1;
   const approx = approximateTiming ? '≈' : '';
@@ -94,7 +125,10 @@ export function SeekableTranscript({
   }, [activeTurnIndex, transcript, turnNumbers]);
 
   const anyTimed = useMemo(() => transcript.some(hasTiming), [transcript]);
-  const anyUntimed = useMemo(() => transcript.some((t) => !hasTiming(t)), [transcript]);
+  const anyUntimed = useMemo(
+    () => transcript.some((t, i) => !hasTiming(t) && !displayTime(turnTimes?.[i])),
+    [transcript, turnTimes],
+  );
 
   let body: React.ReactNode;
 
@@ -210,19 +244,33 @@ export function SeekableTranscript({
               );
             }
 
+            const shown = displayTime(turnTimes?.[index]);
             return (
               <li key={index}>
                 <div
                   className={cx('min-h-[44px] rounded-md px-3 py-2.5', speakerTint)}
-                  aria-label={`Turn ${numberOf(index)}: ${speaker}. Timing data not available.`}
+                  aria-label={
+                    shown
+                      ? `Turn ${numberOf(index)}: ${speaker}. ${shown.spoken}.${unseekableReason ? ` ${unseekableReason}` : ''}`
+                      : `Turn ${numberOf(index)}: ${speaker}. Timing data not available.`
+                  }
                 >
                   <span className="flex items-baseline justify-between gap-2">
                     <span className="text-xs font-medium text-[var(--c-ink-secondary)]">
                       {speaker}
                     </span>
-                    <span className="text-xs italic text-[var(--c-ink-secondary)]">
-                      no timing data
-                    </span>
+                    {shown ? (
+                      <span
+                        data-turn-time="not-seekable"
+                        className="text-xs tabular-nums text-[var(--c-ink-secondary)]"
+                      >
+                        {shown.text}
+                      </span>
+                    ) : (
+                      <span className="text-xs italic text-[var(--c-ink-secondary)]">
+                        no timing data
+                      </span>
+                    )}
                   </span>
                   <span className="mt-0.5 block whitespace-pre-wrap text-sm leading-relaxed text-[var(--c-ink)]">
                     {presented.text}

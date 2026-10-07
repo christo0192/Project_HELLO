@@ -44,7 +44,7 @@ const mockApi = {
     appeal_grant_token: 'c'.repeat(64),
     expires_at: '2999-01-01T00:00:00.000Z',
   }),
-  exportCsv: vi.fn().mockResolvedValue('﻿candidate_id,status\n'),
+  exportReportAudit: vi.fn().mockResolvedValue(undefined),
   // Default: this candidate is not Ashby-linked, so the read-only Ashby
   // pipeline card contributes nothing to the Overview.
   getCandidateAshbyWorkflow: vi.fn().mockResolvedValue({ ok: true, workflow: null }),
@@ -76,7 +76,7 @@ vi.mock('../api', () => ({
     addNote: (...args: any[]) => mockApi.addNote(...args),
     listAppeals: (...args: any[]) => mockApi.listAppeals(...args),
     issueAppealGrant: (...args: any[]) => mockApi.issueAppealGrant(...args),
-    exportCsv: (...args: any[]) => mockApi.exportCsv(...args),
+    exportReportAudit: (...args: any[]) => mockApi.exportReportAudit(...args),
     startLiveKitScreening: vi.fn().mockRejectedValue(new Error('mock')),
     listCandidates: vi.fn().mockResolvedValue([]),
     getCandidateAshbyWorkflow: (...args: any[]) => mockApi.getCandidateAshbyWorkflow(...args),
@@ -648,7 +648,7 @@ describe('CandidateDetailPage', () => {
 
     it('leaves the phone call action on the page', async () => {
       mockApi.getMe.mockResolvedValue(retiredMe);
-      renderDetailPage();
+      renderDetailPage("candidate-1", "?tab=overview");
       expect(await screen.findByRole('button', { name: 'Call candidate' })).toBeInTheDocument();
     });
 
@@ -667,7 +667,7 @@ describe('CandidateDetailPage', () => {
 
     it('keeps the card when the API reports the lane enabled', async () => {
       mockApi.getMe.mockResolvedValue({ ...retiredMe, legacyBrowserScreeningEnabled: true });
-      renderDetailPage();
+      renderDetailPage("candidate-1", "?tab=overview");
       expect(await screen.findByText('Browser voice screening')).toBeInTheDocument();
       expect(screen.getByRole('button', { name: 'Create invite' })).toBeInTheDocument();
     });
@@ -748,7 +748,7 @@ describe('CandidateDetailPage', () => {
   });
 
   it('requires confirmation before requesting a phone screening', async () => {
-    renderDetailPage();
+    renderDetailPage("candidate-1", "?tab=overview");
     await screen.findByText('Jane Doe');
     await screen.findByRole('button', { name: 'Call candidate' });
     expect(mockApi.requestCandidatePhoneCall).not.toHaveBeenCalled();
@@ -783,7 +783,7 @@ describe('CandidateDetailPage', () => {
         appointment: null,
       }],
     });
-    renderDetailPage();
+    renderDetailPage("candidate-1", "?tab=overview");
     await screen.findByRole('button', { name: 'Request re-screen' });
     fireEvent.change(screen.getByRole('combobox', { name: 'Reason for new cycle' }), {
       target: { value: 'technical_issue' },
@@ -816,7 +816,7 @@ describe('CandidateDetailPage', () => {
         evidence_planned: 5,
       }],
     });
-    renderDetailPage();
+    renderDetailPage("candidate-1", "?tab=overview");
     const button = await screen.findByRole('button', { name: 'Rescreen recommended' });
     expect(screen.getByText(/cut off on our side/)).toBeInTheDocument();
     // The ordinary governed form is still there.
@@ -841,7 +841,7 @@ describe('CandidateDetailPage', () => {
       mockApi.getCandidatePhoneScreenings.mockResolvedValue({
         ok: true, enabled: true, current_cycle: 1, cycles: [heldCycle],
       });
-      renderDetailPage();
+      renderDetailPage("candidate-1", "?tab=overview");
       expect(await screen.findByText('Held: duplicate application')).toBeInTheDocument();
       expect(screen.getByText(/already has a phone screen for this role on another candidate record/)).toBeInTheDocument();
       await userEvent.click(screen.getByRole('button', { name: 'Release hold' }));
@@ -856,7 +856,7 @@ describe('CandidateDetailPage', () => {
         ok: true, enabled: true, current_cycle: 1,
         cycles: [{ ...heldCycle, state_reason: 'consent_missing' }],
       });
-      renderDetailPage();
+      renderDetailPage("candidate-1", "?tab=overview");
       await screen.findByRole('button', { name: 'Book a slot' });
       expect(screen.queryByRole('button', { name: 'Release hold' })).toBeNull();
     });
@@ -864,7 +864,7 @@ describe('CandidateDetailPage', () => {
     it('a request answered duplicate_application shows recruiter copy, not the raw code', async () => {
       const { ApiError } = await import('../api');
       mockApi.requestCandidatePhoneCall.mockRejectedValueOnce(new ApiError('duplicate_application', 409));
-      renderDetailPage();
+      renderDetailPage("candidate-1", "?tab=overview");
       await screen.findByText('Jane Doe');
       await userEvent.click(await screen.findByRole('button', { name: 'Call candidate' }));
       await userEvent.click(screen.getByRole('button', { name: 'Confirm call' }));
@@ -885,7 +885,7 @@ describe('CandidateDetailPage', () => {
         has_session: true, has_assessment: true, appointment: null,
       }],
     });
-    renderDetailPage();
+    renderDetailPage("candidate-1", "?tab=overview");
     await screen.findByRole('button', { name: 'Request re-screen' });
     expect(screen.queryByRole('button', { name: 'Rescreen recommended' })).toBeNull();
   });
@@ -902,7 +902,56 @@ describe('CandidateDetailPage', () => {
     await screen.findByText('Jane Doe');
     fireEvent.click(reviewTab());
     expect(await screen.findByText('Scorecard for this session')).toBeInTheDocument();
-    expect(screen.getByText('78')).toBeInTheDocument();
+    // The figure is on the Review scorecard AND, as the latest screening, in the header.
+    const review = screen.getByRole('tabpanel', { name: 'Review' });
+    expect(within(review).getByText('78')).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'Latest screening score' })).getByText('78')).toBeInTheDocument();
+  });
+
+  it('opens on Review by default when there is something to review, Overview when there is not', async () => {
+    renderDetailPage();
+    await screen.findByText('Jane Doe');
+    expect(reviewTab()).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Review', 'Overview']);
+  });
+
+  it('keeps ?tab=overview deep links on Overview, and writes the tab into the URL when switched', async () => {
+    renderDetailPage('candidate-1', '?tab=overview');
+    await screen.findByText('Jane Doe');
+    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+    fireEvent.click(reviewTab());
+    expect(reviewTab()).toHaveAttribute('aria-selected', 'true');
+  });
+
+  it('shows the latest screening score in the header with its recommendation, never 0', async () => {
+    renderDetailPage();
+    await screen.findByText('Jane Doe');
+    const score = screen.getByRole('region', { name: 'Latest screening score' });
+    expect(within(score).getByText('78')).toBeInTheDocument();
+    expect(within(score).getByText('/ 100')).toBeInTheDocument();
+    expect(within(score).getByText('Advance')).toBeInTheDocument();
+    expect(within(score).getByText(/Latest screening/)).toBeInTheDocument();
+  });
+
+  it('shows "Not scored" in the header when the candidate has no assessment', async () => {
+    mockApi.getCandidate.mockResolvedValue({ ...mockCandidateDetail, assessments: [] });
+    renderDetailPage();
+    await screen.findByText('Jane Doe');
+    const score = screen.getByRole('region', { name: 'Latest screening score' });
+    expect(within(score).getByText('Not scored')).toBeInTheDocument();
+    expect(within(score).queryByText('0')).not.toBeInTheDocument();
+  });
+
+  it('lists Call attempts and Screening sessions BEFORE the Ashby pipeline on Overview', async () => {
+    renderDetailPage('candidate-1', '?tab=overview');
+    const attempts = await screen.findByRole('region', { name: 'Call attempts' });
+    const sessions = screen.getByRole('region', { name: 'Screening sessions' });
+    const evidence = attempts.closest('[data-overview-evidence]');
+    expect(evidence).not.toBeNull();
+    expect(evidence).toContainElement(sessions);
+    // And not in the left rail (profile + notes) any more.
+    const profile = screen.getByRole('region', { name: 'Profile' });
+    expect(profile.parentElement).not.toContainElement(sessions);
   });
 
   it('has no axe violations', async () => {
@@ -954,34 +1003,64 @@ describe('CandidateDetailPage', () => {
         await screen.findByText(/Scorecards are suppressed while an appeal is under review/i),
       ).toBeInTheDocument();
       expect(screen.queryByText('78')).not.toBeInTheDocument();
+      expect(screen.queryByRole('region', { name: 'Latest screening score' })).not.toBeInTheDocument();
     });
 
     it('renders the notes section and adds a note', async () => {
       mockApi.listNotes.mockResolvedValue({
         notes: [{ id: 'n1', candidate_id: 'candidate-1', author_id: 'u1', note: 'Call back next week', created_at: '2026-01-01T00:00:00Z' }],
       });
-      renderDetailPage();
+      renderDetailPage("candidate-1", "?tab=overview");
       expect(await screen.findByText('Call back next week')).toBeInTheDocument();
       await userEvent.type(screen.getByPlaceholderText('Add a note…'), 'Follow up');
       await userEvent.click(screen.getByRole('button', { name: 'Add' }));
       await waitFor(() => expect(mockApi.addNote).toHaveBeenCalledWith('candidate-1', 'Follow up'));
     });
 
-    it('exports the scorecard CSV on click', async () => {
+    it('exports the stakeholder report on click: a self-contained HTML download, then a fire-and-forget audit', async () => {
       const createObjSpy = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => 'blob:mock');
       const revokeSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
+      const downloads: string[] = [];
+      const clickSpy = vi
+        .spyOn(HTMLAnchorElement.prototype, 'click')
+        .mockImplementation(function (this: HTMLAnchorElement) {
+          downloads.push(this.download);
+        });
       renderDetailPage();
-      const btn = await screen.findByRole('button', { name: 'Export CSV' });
+      // The old CSV action is gone.
+      expect(screen.queryByRole('button', { name: 'Export CSV' })).not.toBeInTheDocument();
+      const btn = await screen.findByRole('button', { name: 'Export report' });
       fireEvent.click(btn);
-      await waitFor(() => expect(mockApi.exportCsv).toHaveBeenCalledWith('candidate-1'));
       await waitFor(() => expect(createObjSpy).toHaveBeenCalled());
-      expect(revokeSpy).toHaveBeenCalled();
+      const blob = createObjSpy.mock.calls[0][0] as Blob;
+      expect(blob.type).toBe('text/html;charset=utf-8');
+      const text = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.readAsText(blob);
+      });
+      expect(text).toContain('<!doctype html>');
+      expect(text).toContain('Jane Doe');
+      expect(text).toContain('Welcome to the screening.');
+      expect(downloads).toHaveLength(1);
+      expect(downloads[0]).toMatch(/^screening-report-jane-doe-\d{4}-\d{2}-\d{2}\.html$/);
+      await waitFor(() =>
+        expect(mockApi.exportReportAudit).toHaveBeenCalledWith('candidate-1', {
+          format: 'html',
+          recordings: 0,
+          transcript: true,
+        }),
+      );
+      expect(await screen.findByText(/Report downloaded/)).toBeInTheDocument();
+      // Back to a usable button once done.
+      expect(screen.getByRole('button', { name: 'Export report' })).toBeEnabled();
       createObjSpy.mockRestore();
       revokeSpy.mockRestore();
+      clickSpy.mockRestore();
     });
 
     it('issues a one-time appeal grant and shows a fragment link', async () => {
-      renderDetailPage();
+      renderDetailPage("candidate-1", "?tab=overview");
       const issueBtn = await screen.findByRole('button', { name: 'Issue one-time appeal grant' });
       fireEvent.click(issueBtn);
       await waitFor(() => {
@@ -1011,10 +1090,10 @@ describe('Candidate header: one primary action for the state', () => {
 
   it('offers "Review screening" when there is a screening to read, and it opens the Review tab', async () => {
     const user = userEvent.setup();
-    renderDetailPage();
+    renderDetailPage('candidate-1', '?tab=overview');
     const primary = await screen.findByRole('button', { name: 'Review screening' });
     // Export is the only other header action, and it is not a primary.
-    expect(screen.getByRole('button', { name: 'Export CSV' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Export report' })).toBeInTheDocument();
     await user.click(primary);
     const review = reviewTab();
     expect(review).toHaveAttribute('aria-selected', 'true');
@@ -1118,7 +1197,7 @@ describe('Candidate header: one primary action for the state', () => {
         appointment: null,
       }],
     });
-    renderDetailPage();
+    renderDetailPage("candidate-1", "?tab=overview");
     const rescreen = await screen.findByRole('button', { name: 'Request re-screen' });
     const primary = screen.getByRole('button', { name: 'Review screening' });
     // `bg-info` is the filled primary's paint (Button.tsx `variants.primary`).
@@ -1203,7 +1282,7 @@ describe('Human words for machine values', () => {
   });
 
   it('names appeal-grant sessions by when they happened, never by an id prefix', async () => {
-    renderDetailPage();
+    renderDetailPage("candidate-1", "?tab=overview");
     const select = await screen.findByRole('combobox', { name: 'Session' });
     const option = within(select).getAllByRole('option')[0];
     expect(option).toHaveValue('session-1');
@@ -1253,7 +1332,7 @@ describe('Ashby pipeline card on the Overview', () => {
         updatedAt: '2026-08-20T10:00:00.000Z',
       },
     });
-    renderDetailPage();
+    renderDetailPage("candidate-1", "?tab=overview");
     // Wait for the resolved card, not the identically-headed loading state.
     expect(await screen.findByText('Ready to screen')).toBeInTheDocument();
     expect(screen.getByText('Ashby screening pipeline')).toBeInTheDocument();

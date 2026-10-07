@@ -599,9 +599,9 @@ export function TranscriptionSyncWorkspace({
                       Times in this call (≈) are estimated from when it was answered.
                     </p>
                   )}
-                  {seekMode === 'leg' && leg && !legPlayable(leg) && (
+                  {group.unseekableReason && (
                     <p className="mb-2 text-xs text-[var(--c-ink-secondary)]">
-                      This call has no playable recording, so its turns cannot start playback.
+                      {group.unseekableReason}
                     </p>
                   )}
                   <SeekableTranscript
@@ -611,6 +611,8 @@ export function TranscriptionSyncWorkspace({
                     onSeek={(offsetSec) => handleGroupSeek(group, offsetSec)}
                     recordingReady={true}
                     approximateTiming={group.approximate}
+                    turnTimes={group.turns.map((t) => ({ sec: t.callSec, atMs: t.atMs }))}
+                    unseekableReason={group.unseekableReason}
                   />
                 </div>
             );

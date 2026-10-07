@@ -21,8 +21,8 @@
 import { Router } from 'express';
 import { supabase } from '../lib/supabase.js';
 import { requireInterviewer } from '../lib/rbac.js';
-import { validateParams } from '../lib/validation.js';
-import { exportCandidateParamSchema } from '../schemas/export.js';
+import { validateBody, validateParams } from '../lib/validation.js';
+import { exportCandidateParamSchema, exportReportAuditBodySchema } from '../schemas/export.js';
 import { CSV_BOM, toCsv, csvFilename } from '../lib/export-csv.js';
 
 export const exportRouter = Router();
@@ -253,6 +253,56 @@ exportRouter.get(
         correlation_id: (req as { correlationId?: string | null }).correlationId ?? null,
         metadata: { format: 'csv', record_types: ['scorecard', 'transcript'] },
       });
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/**
+ * POST /api/export/:candidateId/report-audit
+ *
+ * The stakeholder report (one self-contained HTML file with the call audio
+ * embedded) is generated in the browser from the data the signed-in user is
+ * already allowed to read, so no server route sees it being built. This route
+ * records that it happened: same `export_completed` audit action and the same
+ * ownership scope as the CSV route (interviewer owns; admin all). The body is
+ * counts and a flag only (`exportReportAuditBodySchema`); no content is stored.
+ * Each recording the report embeds is separately audited as `recording.download`.
+ */
+exportRouter.post(
+  '/:candidateId/report-audit',
+  requireInterviewer,
+  validateParams(exportCandidateParamSchema),
+  validateBody(exportReportAuditBodySchema),
+  async (req, res, next) => {
+    try {
+      const candidateId = req.params.candidateId as string;
+      const user = req.authUser!;
+      const body = req.body as { format: 'html'; recordings: number; transcript: boolean };
+
+      const { data: candidate } = await supabase
+        .from('candidates')
+        .select('owner_id')
+        .eq('id', candidateId)
+        .maybeSingle();
+      if (!candidate) return res.status(404).json({ error: 'candidate_not_found' });
+      if (user.appRole === 'interviewer' && candidate.owner_id !== user.id) {
+        return res.status(403).json(forbiddenBody());
+      }
+
+      const { error } = await supabase.from('audit_events').insert({
+        actor_id: user.id,
+        actor_type: 'recruiter',
+        action: 'export_completed',
+        target_type: 'candidate',
+        target_id: candidateId,
+        result: 'success',
+        correlation_id: (req as { correlationId?: string | null }).correlationId ?? null,
+        metadata: { format: body.format, recordings: body.recordings, transcript: body.transcript },
+      });
+      if (error) return next(error);
+      res.status(204).end();
     } catch (error) {
       next(error);
     }

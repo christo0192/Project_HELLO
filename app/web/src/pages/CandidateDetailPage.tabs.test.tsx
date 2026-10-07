@@ -18,7 +18,7 @@ const mockApi = {
   addNote: vi.fn().mockResolvedValue({ id: 'n1' }),
   listAppeals: vi.fn().mockResolvedValue({ appeals: [] }),
   issueAppealGrant: vi.fn(),
-  exportCsv: vi.fn(),
+  exportReportAudit: vi.fn().mockResolvedValue(undefined),
   startLiveKitScreening: vi.fn().mockRejectedValue(new Error('mock')),
   issueLiveKitInvite: vi.fn(),
   getSession: vi.fn(),
@@ -37,7 +37,7 @@ vi.mock('../api', () => ({
     addNote: (...args: any[]) => mockApi.addNote(...args),
     listAppeals: (...args: any[]) => mockApi.listAppeals(...args),
     issueAppealGrant: (...args: any[]) => mockApi.issueAppealGrant(...args),
-    exportCsv: (...args: any[]) => mockApi.exportCsv(...args),
+    exportReportAudit: (...args: any[]) => mockApi.exportReportAudit(...args),
     startLiveKitScreening: (...args: any[]) => mockApi.startLiveKitScreening(...args),
     issueLiveKitInvite: (...args: any[]) => mockApi.issueLiveKitInvite(...args),
     getSession: (...args: any[]) => mockApi.getSession(...args),
@@ -103,20 +103,21 @@ describe('CandidateDetailPage tabs', () => {
     await screen.findByText('Jane Doe');
     const tablist = screen.getByRole('tablist', { name: 'Candidate sections' });
     expect(tablist).toBeInTheDocument();
-    expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Overview', 'Review']);
-    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getAllByRole('tab').map((t) => t.textContent)).toEqual(['Review', 'Overview']);
+    // Review is the high-priority tab: first, and the default when there is something to review.
+    expect(screen.getByRole('tab', { name: 'Review' })).toHaveAttribute('aria-selected', 'true');
   });
 
-  it('activates the Review tab on ArrowRight', async () => {
+  it('activates the Overview tab on ArrowRight from Review', async () => {
     const user = userEvent.setup();
     renderDetailPage();
     await screen.findByText('Jane Doe');
-    screen.getByRole('tab', { name: 'Overview' }).focus();
+    screen.getByRole('tab', { name: 'Review' }).focus();
     await user.keyboard('{ArrowRight}');
-    const review = screen.getByRole('tab', { name: 'Review' });
-    expect(review).toHaveFocus();
-    expect(review).toHaveAttribute('aria-selected', 'true');
-    expect(screen.getByRole('tabpanel', { name: 'Review' })).not.toHaveAttribute('hidden');
+    const overview = screen.getByRole('tab', { name: 'Overview' });
+    expect(overview).toHaveFocus();
+    expect(overview).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tabpanel', { name: 'Overview' })).not.toHaveAttribute('hidden');
   });
 
   it('auto-loads the transcript for the first completed session', async () => {

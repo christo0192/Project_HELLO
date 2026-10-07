@@ -85,6 +85,11 @@ export interface CandidateHeaderProps {
    */
   meta?: ReactNode;
   actions?: ReactNode;
+  /**
+   * Rendered under the actions, top right (the candidate page's headline
+   * score). Below `sm` the header is one column and it stacks under them.
+   */
+  aside?: ReactNode;
   /** Rule under the header — used by the standalone scoped shell. */
   divided?: boolean;
 }
@@ -100,6 +105,7 @@ export function CandidateHeader({
   description,
   meta,
   actions,
+  aside,
   divided = false,
 }: CandidateHeaderProps) {
   return (
@@ -127,8 +133,13 @@ export function CandidateHeader({
         )}
         {meta && <div className="mt-3">{meta}</div>}
       </div>
-      {actions && (
-        <div className="flex shrink-0 flex-wrap items-center gap-2 sm:pt-1">{actions}</div>
+      {aside ? (
+        <div className="flex shrink-0 flex-col gap-2 sm:items-end sm:pt-1">
+          {actions && <div className="flex flex-wrap items-center gap-2 sm:justify-end">{actions}</div>}
+          {aside}
+        </div>
+      ) : (
+        actions && <div className="flex shrink-0 flex-wrap items-center gap-2 sm:pt-1">{actions}</div>
       )}
     </div>
   );

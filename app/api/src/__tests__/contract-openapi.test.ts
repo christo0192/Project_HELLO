@@ -719,7 +719,9 @@ describe('OpenAPI document integrity', () => {
     // Main's 155 (152 + PR-7's two HR keys + PR-5's cancel-pending-reject) plus PR-3's
     // eight INLINE-body keys: the seven candidate-facing /api/r1 paths and the worker-only
     // /api/internal/r1/attempt-outcome. 155 + 8 = 163.
-    expect(Object.keys(paths).length).toBe(163);
+    // The stakeholder HTML report adds ONE path: POST /api/export/{candidateId}/
+    // report-audit (inline body, no new schema). 163 + 1 = 164.
+    expect(Object.keys(paths).length).toBe(164);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1342,6 +1344,7 @@ describe('auth boundary vs spec security model', () => {
       ['get', '/api/notes', undefined],
       ['get', '/api/notifications', undefined],
       ['get', '/api/export/' + UUID_1 + '/csv', undefined],
+      ['post', '/api/export/' + UUID_1 + '/report-audit', {}],
     ];
     const failures: string[] = [];
     for (const [method, path, body] of nearMisses) {
@@ -2285,6 +2288,24 @@ describe('live handler shapes match documented schemas', () => {
     expect(res.status).toBe(200);
     expect(res.headers['content-type']).toMatch(/^text\/csv/);
     expect(res.text.startsWith('\uFEFF')).toBe(true);
+  });
+
+  it('POST /api/export/{candidateId}/report-audit → 204 (counts only) and rejects extra keys', async () => {
+    configureTables({
+      candidates: ok({ id: UUID_2, owner_id: null }),
+      audit_events: ok(null),
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .post(`/api/export/${UUID_2}/report-audit`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ format: 'html', recordings: 2, transcript: true });
+    expect(res.status).toBe(204);
+    const bad = await request(app)
+      .post(`/api/export/${UUID_2}/report-audit`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ format: 'html', recordings: 2, transcript: true, extra: 'x' });
+    expect(bad.status).toBe(400);
   });
 
   it('POST /api/appeals/grants → 201 AppealGrantResponse (digest persisted, plaintext once)', async () => {

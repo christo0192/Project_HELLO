@@ -10,7 +10,6 @@
  */
 
 import { apiClient, ApiError } from './lib/api-client';
-import { supabase } from './lib/supabase';
 import type {
   AdminAllowlistAddInput,
   AdminAllowlistAddResponse,
@@ -127,55 +126,6 @@ import type {
 export { ApiError };
 
 const request = apiClient.request;
-const BASE_URL = apiClient.BASE_URL;
-
-/**
- * Fetch a raw text resource (CSV export) with the same in-memory bearer
- * token attachment as apiClient. Never stores the token; the CSV text is
- * returned to the caller which triggers a same-tab download.
- */
-async function requestText(path: string, init?: RequestInit): Promise<string> {
-  let token: string | null = null;
-  try {
-    const result = await supabase.auth.getSession();
-    token = result?.data?.session?.access_token ?? null;
-  } catch {
-    token = null;
-  }
-  const headers: Record<string, string> = {
-    Accept: 'text/csv',
-    ...(init?.headers as Record<string, string> | undefined),
-  };
-  if (token) headers['Authorization'] = `Bearer ${token}`;
-  const res = await fetch(`${BASE_URL}${path}`, { ...init, headers });
-  if (res.status === 401) {
-    if (typeof window !== 'undefined') {
-      window.dispatchEvent(new CustomEvent('auth:unauthorized'));
-    }
-  }
-  if (!res.ok) {
-    let message = `${res.status} ${res.statusText}`;
-    try {
-      const data = (await res.json()) as { error?: unknown; message?: unknown };
-      if (typeof data?.error === 'string' && data.error.trim()) {
-        message = data.error;
-      } else if (data?.error && typeof data.error === 'object') {
-        const nested = data.error as { message?: unknown; type?: unknown };
-        if (typeof nested.message === 'string' && nested.message.trim()) {
-          message = nested.message;
-        } else if (typeof nested.type === 'string' && nested.type.trim()) {
-          message = nested.type;
-        }
-      } else if (typeof data?.message === 'string' && data.message.trim()) {
-        message = data.message;
-      }
-    } catch {
-      // non-JSON error body
-    }
-    throw new ApiError(message, res.status);
-  }
-  return res.text();
-}
 
 export const api = {
   health: () => request<HealthResult>('/api/health'),
@@ -515,9 +465,17 @@ export const api = {
   listNotificationIntents: () =>
     request<NotificationIntentListResponse>('/api/notifications'),
 
-  // ── Phase 9: CSV scorecard export (ownership-scoped) ─────────────
+  // ── Stakeholder report (built in the browser; this only records it) ──
 
-  exportCsv: (candidateId: string) => requestText(`/api/export/${candidateId}/csv`),
+  /** Fire-and-forget audit of a downloaded report: counts and a flag, never content. */
+  exportReportAudit: (
+    candidateId: string,
+    body: { format: 'html'; recordings: number; transcript: boolean },
+  ) =>
+    request<void>(`/api/export/${encodeURIComponent(candidateId)}/report-audit`, {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
 
   // ── Phase 9: appeals ─────────────────────────────────────────────
 

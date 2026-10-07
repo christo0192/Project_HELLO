@@ -68,6 +68,8 @@ export function Field({ label, children }: { label: string; children: ReactNode 
  * name is an axe `landmark-unique` violation.
  */
 const SESSION_ROWS_BEFORE_SCROLL = 5;
+/** Attempt rows are tall (outcome, figures, notes, player); bound the list sooner. */
+const ATTEMPT_ROWS_BEFORE_SCROLL = 4;
 const NOTE_ROWS_BEFORE_SCROLL = 4;
 
 /** One attempt's inline audio: what the open row is showing. */
@@ -144,6 +146,7 @@ export function PhoneAttemptHistory({
   source,
   title = 'Call attempts',
   description = 'Every phone leg and its recording, including calls that ended at the consent step.',
+  className = 'p-4 sm:p-5',
 }: {
   candidateId: string;
   role: MembershipRole;
@@ -151,6 +154,8 @@ export function PhoneAttemptHistory({
   source?: PhoneAttemptHistorySource;
   title?: string;
   description?: string;
+  /** Card padding / sizing; defaults to `p-4 sm:p-5`. */
+  className?: string;
 }) {
   const headingId = useId();
   const playerBaseId = useId();
@@ -255,7 +260,7 @@ export function PhoneAttemptHistory({
   }, [readyUrl]);
 
   return (
-    <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
+    <SurfaceCard as="section" labelledBy={headingId} className={className}>
       <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         {title}
       </h2>
@@ -275,7 +280,11 @@ export function PhoneAttemptHistory({
       ) : attempts.length === 0 ? (
         <p className="text-sm text-ink-secondary">No phone call attempts yet.</p>
       ) : (
-        <ul className="divide-y divide-line">
+        boundList(
+          attempts.length > ATTEMPT_ROWS_BEFORE_SCROLL,
+          'Call attempt list',
+          '28rem',
+          <ul className="divide-y divide-line">
           {attempts.map((attempt) => {
             const open = audio?.attemptId === attempt.id ? audio : null;
             const playerId = `${playerBaseId}-player-${attempt.id}`;
@@ -422,7 +431,8 @@ export function PhoneAttemptHistory({
               </li>
             );
           })}
-        </ul>
+          </ul>,
+        )
       )}
       {attempts && nextCursor && !error && (
         <button
@@ -590,6 +600,8 @@ export interface SessionsSummaryProps {
   linkToSession?: boolean;
   /** Copy shown when the candidate has no sessions yet. */
   emptyLabel?: string;
+  /** Card padding / sizing; defaults to the rail's `p-4 sm:p-5`. */
+  className?: string;
 }
 
 /** Compact screening-session list (newest first, as loaded). */
@@ -597,10 +609,11 @@ export function SessionsSummary({
   sessions,
   linkToSession = true,
   emptyLabel = 'No screening sessions yet. Start one above.',
+  className = 'p-4 sm:p-5',
 }: SessionsSummaryProps) {
   const headingId = useId();
   return (
-    <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
+    <SurfaceCard as="section" labelledBy={headingId} className={className}>
       <h2 id={headingId} className="mb-3 text-[15px] font-semibold tracking-tight text-ink">
         Screening sessions
       </h2>

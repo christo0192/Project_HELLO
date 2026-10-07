@@ -112,6 +112,39 @@ describe('SeekableTranscript', () => {
     expect(screen.getByText(/no timing data/i)).toBeInTheDocument();
   });
 
+  it('a turn with a call time but no seek offset shows that time, not "no timing data", and is not clickable', () => {
+    render(
+      <SeekableTranscript
+        transcript={LEGACY}
+        activeTurnIndex={null}
+        onSeek={vi.fn()}
+        recordingReady={true}
+        turnTimes={[{ sec: 2 }, { sec: 65 }]}
+        unseekableReason="Recording failed for this call, so its turns cannot start playback."
+      />,
+    );
+    expect(screen.queryByRole('button')).toBeNull();
+    expect(screen.queryByText(/no timing data/i)).toBeNull();
+    expect(screen.getByText('0:02')).toBeInTheDocument();
+    expect(screen.getByText('1:05')).toBeInTheDocument();
+    expect(screen.getByLabelText(/Turn 1: .*0:02 into the call.*Recording failed for this call/)).toBeInTheDocument();
+    // Every turn has a time, so the "saved without timing" banner stays away.
+    expect(screen.queryByText(/saved without timing/i)).toBeNull();
+  });
+
+  it('falls back to an IST clock time when only the absolute start is known', () => {
+    render(
+      <SeekableTranscript
+        transcript={[LEGACY[0]]}
+        activeTurnIndex={null}
+        onSeek={vi.fn()}
+        recordingReady={true}
+        turnTimes={[{ sec: null, atMs: Date.parse('2026-10-03T03:43:01Z') }]}
+      />,
+    );
+    expect(screen.getByText(/IST$/)).toBeInTheDocument();
+  });
+
   it('shows the informational banner when recording is not yet loaded', () => {
     render(
       <SeekableTranscript

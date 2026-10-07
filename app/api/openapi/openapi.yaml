@@ -7001,6 +7001,60 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
 
+  /api/export/{candidateId}/report-audit:
+    post:
+      tags: [export]
+      operationId: auditCandidateReportExport
+      summary: Record that a stakeholder HTML report was generated in the browser (interviewer+, ownership-scoped). Counts only; no content.
+      parameters:
+        - name: candidateId
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [format, recordings, transcript]
+              additionalProperties: false
+              properties:
+                format:
+                  type: string
+                  enum: [html]
+                recordings:
+                  type: integer
+                  minimum: 0
+                  maximum: 100
+                  description: How many call recordings were embedded in the report.
+                transcript:
+                  type: boolean
+                  description: Whether any transcript was included.
+      responses:
+        '204':
+          description: Audit event recorded (export_completed).
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Viewer, or interviewer who does not own the candidate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Candidate not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
   # ── Phase 9: appeals (separate grants table; immutable review events) ─
   /api/appeals/grants:
     post:

@@ -759,6 +759,87 @@ function legacyTwoLegAttempts(): CandidatePhoneAttempt[] {
   return [legB, legA];
 }
 
+/*
+ * Transcript click-to-seek fixtures (M014). Two phone sessions on one
+ * candidate, both mirroring a production shape:
+ *   - SEEK_NORMAL: two ready legs. Leg 1 carries the worker's stamped
+ *     recording start (exact times); leg 2 is a legacy leg (times read "≈").
+ *   - SEEK_FAILED: production session ab83952e. Every turn falls in leg 1,
+ *     whose recording FAILED; leg 2 holds the only ready recording and has no
+ *     turns. The turns must show their time and the reason, not "no timing
+ *     data", and must not seek leg 2's file.
+ */
+export const SEEK_CANDIDATE_ID = CANDIDATES.find((c) => c.name === 'Fatima Qureshi')!.id;
+export const SEEK_NORMAL_SESSION_ID = uid('3', 802);
+export const SEEK_FAILED_SESSION_ID = uid('3', 801);
+const SEEK_BASE_MS = FROZEN_NOW_MS - 2 * DAY;
+/** The turn offsets the e2e test seeks to (seconds into each leg's file). */
+export const SEEK_LEG1_TURN_SEC = 5;
+export const SEEK_LEG1_LATER_TURN_SEC = 40;
+export const SEEK_ATTEMPT_IDS = [uid('7', 801), uid('7', 802), uid('7', 803), uid('7', 804)];
+
+function addSeekSession(id: string, n: number, recordedSec: number, turns: TranscriptLine[]): void {
+  const candidate = CANDIDATES.find((c) => c.id === SEEK_CANDIDATE_ID)!;
+  const session = addSession(candidate, n, { duration_sec: recordedSec + 5 });
+  Object.assign(session, {
+    mode: 'live',
+    status: 'completed',
+    recorded_total_sec: recordedSec,
+    recorded_legs: 2,
+    connected_complete: false,
+    connected_total_sec: null,
+    recording_egress_started_at_ms: null,
+    created_at: iso(SEEK_BASE_MS - 30_000),
+    started_at: iso(SEEK_BASE_MS),
+  } satisfies Partial<Session>);
+  sessionDetails[session.id] = { session, transcript: turns, assessment: null };
+  if (session.id !== id) throw new Error('seek fixture id drifted');
+}
+
+addSeekSession(SEEK_FAILED_SESSION_ID, 801, 90, [
+  { speaker: 'candidate', text: 'Hello?', start_offset_sec: null, started_at_ms: SEEK_BASE_MS + 2_000 },
+  { speaker: 'bot', text: 'Hi, this is the screening assistant. Is now a good time?', start_offset_sec: null, started_at_ms: SEEK_BASE_MS + 9_000 },
+  { speaker: 'candidate', text: 'Yes, go ahead.', start_offset_sec: null, started_at_ms: SEEK_BASE_MS + 65_000 },
+]);
+addSeekSession(SEEK_NORMAL_SESSION_ID, 802, 120, [
+  { speaker: 'bot', text: 'Welcome to the screening.', start_offset_sec: null, started_at_ms: SEEK_BASE_MS + 1_000 + SEEK_LEG1_TURN_SEC * 1000 },
+  { speaker: 'candidate', text: 'Thanks, happy to start.', start_offset_sec: null, started_at_ms: SEEK_BASE_MS + 1_000 + SEEK_LEG1_LATER_TURN_SEC * 1000 },
+  { speaker: 'bot', text: 'Welcome back after the drop.', start_offset_sec: null, started_at_ms: SEEK_BASE_MS + 131_000 + 3_000 },
+]);
+
+function seekLeg(
+  idIndex: number, seq: number, sessionId: string, admittedOffset: number, answeredOffset: number,
+  over: Partial<CandidatePhoneAttempt>,
+): CandidatePhoneAttempt {
+  const answered = SEEK_BASE_MS + answeredOffset;
+  return {
+    id: SEEK_ATTEMPT_IDS[idIndex], attempt_seq: seq,
+    admitted_at: iso(SEEK_BASE_MS + admittedOffset), answered_at: iso(answered),
+    ended_at: iso(answered + 100_000),
+    state: 'completed', abandon_reason: null, outcome_class: 'disconnected', duration_sec: 100,
+    connected_from: iso(answered), connected_to: iso(answered + 100_000),
+    connected_to_source: 'ledger', connected_sec: 100,
+    recorded_sec: 99, recorded_sec_estimated: false, recording_started_at_ms: null,
+    tail_may_be_missing: false, session_ref: sessionId,
+    recording: { state: 'ready' }, consent_stage: 'after_consent',
+    transcript: { href: `/sessions/${sessionId}`, scope: 'session', kind: 'session', shared_session: true },
+    ...over,
+  };
+}
+
+function seekAttempts(): CandidatePhoneAttempt[] {
+  return [
+    // SEEK_FAILED: leg 1 failed (turns live here), leg 2 ready (no turns).
+    seekLeg(0, 1, SEEK_FAILED_SESSION_ID, -10_000, 0, {
+      recording: { state: 'unavailable', reason: 'recording_failed' }, recorded_sec: null,
+    }),
+    seekLeg(1, 2, SEEK_FAILED_SESSION_ID, 200_000, 210_000, {}),
+    // SEEK_NORMAL: leg 1 stamped (exact), leg 2 legacy (approximate).
+    seekLeg(2, 1, SEEK_NORMAL_SESSION_ID, -10_000, 0, { recording_started_at_ms: SEEK_BASE_MS + 1_000 }),
+    seekLeg(3, 2, SEEK_NORMAL_SESSION_ID, 120_000, 130_000, {}),
+  ].reverse();
+}
+
 const PARSED: CandidateResumeFacts = {
   current_role: 'Staff Engineer, Payments Platform',
   recent_role: {
@@ -893,6 +974,7 @@ function phoneAttempts(c: Candidate): CandidatePhoneAttempt[] {
     ];
   }
   if (c.id === LEGACY_CANDIDATE_ID) return legacyTwoLegAttempts();
+  if (c.id === SEEK_CANDIDATE_ID) return seekAttempts();
   if (c.id === ABANDONED_CANDIDATE_ID) {
     // The whole no-answer budget: three rings, nobody picked up.
     return [3, 2, 1].map((seq) => {
