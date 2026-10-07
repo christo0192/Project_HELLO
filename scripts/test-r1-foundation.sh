@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # R1 assertions run inside scripts/supabase-test.sh's already-started local
-# Supabase stack. It has applied the complete 0001..0117 chain: never use stubs.
+# Supabase stack. It has applied the complete 0001..latest chain: never use stubs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,7 +13,7 @@ trap cleanup EXIT INT TERM
 docker inspect "$SUPABASE_DB_CONTAINER" >/dev/null \
   || { log "ERROR: expected Supabase database container $SUPABASE_DB_CONTAINER"; exit 1; }
 
-log 'Running R1 assertions against the complete 0001..0117 schema...'
+log 'Running R1 assertions against the complete 0001..latest schema...'
 docker exec -i "$SUPABASE_DB_CONTAINER" \
   psql -U postgres -d postgres -q -v ON_ERROR_STOP=1 \
   < "$TESTS/r1_foundation_assert.sql"
@@ -69,7 +69,10 @@ r1_terminal_race() {
   if [ "$label" = 'cancel' ]; then
     terminal_sql="select 'terminal:' || (screening_v2.r1_transition_round('${round_id}'::uuid, 'cancel', (select version from screening_v2.interview_rounds where id='${round_id}'::uuid), null, null)->>'status')"
   else
-    terminal_sql="select 'terminal:' || screening_v2.r1_sweep_expired_rounds(now()+interval '2 hours', 1)::text"
+    # The sweep also gives back the uncounted charge of the cancel fixture (0119), whose expires_at ties with
+    # the expiry fixture's, so a limit of 1 could sweep either one. A wider limit always reaches the expiry
+    # fixture; the sweep still takes the settings lock first, which is what this race proves.
+    terminal_sql="select 'terminal:' || screening_v2.r1_sweep_expired_rounds(now()+interval '2 hours', 10)::text"
   fi
   app_prefix="r1-terminal-${label}"
   R1_FIFO="$(mktemp -u)"; mkfifo "$R1_FIFO"; R1_OUT="$(mktemp)"
@@ -101,6 +104,6 @@ r1_terminal_race() {
 }
 
 r1_terminal_race 'cancel' 'ok|version_conflict'
-r1_terminal_race 'expiry' '0|1'
+r1_terminal_race 'expiry' '[0-9]+'
 
 log 'PASS: full-chain assertions, first-of-month capacity race, and terminal transition races'

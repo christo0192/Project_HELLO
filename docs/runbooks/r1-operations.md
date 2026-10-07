@@ -73,6 +73,205 @@ Pause at the owner-approved R1 operating cap or projected provider/operational
 overload. Reconcile the R1 ledger with Fly and provider dashboards daily during
 launch and weekly thereafter. (implemented in PR-2)
 
+### Capacity settings and the two checks (implemented in PR-2b, migration 0119)
+
+Two settings control R1 capacity. They mean different things and must be set
+separately:
+
+| Setting | Meaning | Applies |
+|---|---|---|
+| `monthly_cap_minutes` | The owner-approved **R1 allocation**: sessions x 55 (for example 20 x 55 = 1,100 in December, about 40 x 55 = 2,200 in steady state). | Always, in both targets |
+| `pause_line_minutes` | The **total Cloud-pool pause line** (4,000 = 80% of the 5,000 free-plan pool). | Only while `livekit_target` is `cloud` (Mode B) |
+
+A self-hosted R1 (Mode A, `livekit_target = r1`) uses no LiveKit Cloud minutes,
+so only the allocation gates it. In Mode B both checks must pass. Phone
+admission is never gated by either check.
+
+**Set the allocation before enabling R1.** `monthly_cap_minutes` defaults to
+4,000, a placeholder from 0115 when it was a total-pool limit. As the R1
+allocation it would mean 72 sessions a month, and in Mode A nothing else would
+stop it. The settings API therefore refuses `enabled = true` (409
+`r1_allocation_not_set`) while the stored allocation is still 4,000, it has
+never been saved (`r1_settings.allocation_set_at` is NULL) and the same request
+does not set `monthly_cap_minutes`. The database stamps `allocation_set_at` only
+when a write names `monthly_cap_minutes`, so a deliberate save of an unchanged
+4,000 counts, and **nothing else does**: a dashboard reading, a pause, a
+threshold or an empty save records `updated_by` but leaves the guard in place
+(`PUT {dashboard_minutes: 1200}` then `PUT {enabled: true}` is still refused
+while the allocation is 4,000). The column is NULL on every existing row after
+0119, so an operator who had chosen 4,000 saves it once more. Launch checklist
+for these settings: (1) set the allocation, (2) set the pause line (Mode B), (3)
+enter the first dashboard reading, (4) only then enable; a reading entered
+early does not count as step 1.
+
+Both Send R1 and the candidate's admission evaluate one database function,
+`screening_v2.r1_capacity_snapshot`, which `v_r1_budget_month` also reads, so
+Mission Control and the RPCs cannot disagree. For the current month (minutes):
+
+- `r1_actual` is the R1 **session** minutes: the candidate and agent ledger
+  plus a session-timestamp fallback for sessions with no positive candidate or
+  agent ledger row. The fallback counts candidate and agent (x2, like legacy
+  browser); a zero-second row, or a preflight row, does not suppress it; a live
+  session with no metering yet counts at least its 55-minute charge (the "live
+  floor"). The floor is a **booked charge**, like the Send hold it replaces: it
+  counts once and is never multiplied by 1.15 (a session unmetered for more than
+  about 27 minutes counts its elapsed x2 instead, also unmultiplied: a few
+  minutes under until the metering replaces it). A metered session counts 1x
+  elapsed in the ledger while the fallback for a crashed one counts 2x: the
+  ledger stays authoritative when the worker supplies it, so the two
+  conventions are expected to differ.
+- `preflight` and `manual_test` ledger minutes are **pool-only**: they count in
+  `pool_pure` but not in `r1_actual`, because the cap formula already subtracts
+  planned test minutes from the session allocation.
+- **Uncounted charges**: a charged attempt that ended without counting (a
+  no-show or technical failure, plan 5.11: "not counted; the hold is kept for
+  the link") has `charged_attempt_number > attempts_counted` and no live session.
+  Its 55 is a hold, not a spend: it leaves `minutes_used` and joins the
+  outstanding holds while the link lives. This is derived by the snapshot, so it
+  does not wait for any sweep.
+- `outstanding_holds` is every unconverted Send hold plus those uncounted
+  charges, in **any** month (a hold is future minutes whenever its calendar
+  month ends), but only while the link can still be used (status `invited` or
+  `in_progress`, `expires_at` in the future). A lapsed or cancelled link stops
+  counting immediately, before any sweep.
+- `minutes_used` is the month's booked minutes less its uncounted charges
+  (`booked_minutes_used` is the stored column).
+- `floors` are the live floors plus the floor of the start being checked.
+  `r1_estimate = 1.15 x (r1_actual - floors) + floors`.
+- `r1_committed = greatest(minutes_used, r1_estimate) + outstanding_holds`.
+- `pool_pure` is R1 actual + preflight/test + phone + legacy browser;
+  `pool_settled` is `pool_pure` less the live floors;
+  `pool_estimate = 1.15 x (pool_pure - floors) + floors`.
+- `pool_guard` is `pool_estimate`, or, when a dashboard reading from **this**
+  month exists, `greatest(dashboard, dashboard + 1.15 x (pool_pure - floors -
+  baseline) + floors, pool_estimate)`. The authoritative dashboard figure is never
+  multiplied, the guard is never below it, and a reading from an earlier month is
+  ignored.
+- `pool_committed = pool_guard + greatest(0, minutes_used - r1_estimate) +
+  outstanding_holds`: the admitted R1 minutes not yet visible in the estimate.
+
+**The checks run on the state after the change.** A Send adds a 55-minute hold:
+refused as `capacity_exhausted` when `r1_committed + 55 > monthly_cap_minutes`,
+or in Mode B when `pool_committed + 55 > pause_line_minutes`. Admission is
+checked as if the start had already happened, so a start can never leave R1
+above either limit: the new live session's 55-minute floor joins `r1_actual`.
+
+**Send and start agree.** The start that converts a Send hold exchanges the hold
+for a booked 55 and a 55-minute floor, which together count as 55 (the
+`greatest()` of the booked and the floored terms), so a start admitted at Send
+time is admitted again unless other usage grew in between. On the first of a
+month, with nothing booked or metered, an allocation of 20 x 55 = 1,100 admits 20
+Sends and then all 20 starts; the 21st Send is refused. (An earlier draft
+multiplied the floor by 1.15: each start then needed 63.25 against its 55 hold and
+all 20 starts were refused, "temporarily unavailable", until a link expired or HR
+cancelled one.) The suite pins this in both modes.
+
+| Start | Effect on the checked state |
+|---|---|
+| Converting the Send hold | the hold leaves `outstanding_holds`, 55 is booked, plus the live floor |
+| Restarting an uncounted attempt (same attempt number) | the attempt's 55 returns from a hold to booked, plus the live floor: no new charge, charged once |
+| Retake, or a first start with no hold | a fresh 55 is booked, plus the live floor |
+
+When metered minutes dominate the booked ones (A-dominated: sessions running
+longer than about 48 participant-minutes), the live floor shows on top of
+1.15 x the metered minutes, so a start can need more than the hold it converts
+once real usage has grown since the Send; that is real growth, not a rule
+mismatch. Above either limit the API must show the candidate "temporarily
+unavailable, your link stays valid" (plan D5). Reissuing a link that had **already lapsed** revives its hold, so it
+re-checks capacity as a fresh 55 (409 `r1_capacity_exhausted`); reissuing a link
+that is still alive changes nothing and is not checked.
+
+**A hold is charged to the month that booked it (Mode A overshoot at month
+end).** A link Sent on July 31 and started on August 1 converts a charge that is
+already in July's `minutes_used`: its 55 is booked to July, and August's
+allocation check adds no booked 55 for it. While the session is live it is
+absorbed by August's `greatest(booked, estimate)`. Mode A's allocation therefore
+**can be exceeded by one session per link that straddles a month end**: the links
+Sent in the last 72 hours of a month. For example, with August at 18 sessions
+booked, a July-Sent session running and an allocation of 20, two more August
+Sends are still admitted, so August hosts 21 sessions against an allocation of 20. The total across the two months is unchanged and the
+overshoot is bounded by the Sends of the last 72 hours; the owner may accept it or
+stop sending in the last three days of a month. (Mode B's pool is unaffected in
+substance: the session's metered minutes enter the estimate and the dashboard
+reading in the month they run.) The suite pins this behaviour.
+
+**No-shows do not consume the allocation.** The charge of an attempt that ended
+uncounted is a hold kept for the link, so a restart (up to three starts per
+link) takes it back instead of paying twice, and it is released when the link
+ends: cancel and expiry refund it from the month that booked it, exactly once
+(the marker is `interview_rounds.charged_attempt_number`, which lives on the
+round, so deleting an attempt row by retention cannot cause a second charge).
+`r1_sweep_expired_rounds` also releases the hold or uncounted charge of a round
+that is still `in_progress` (or already terminal) with a lapsed link, without
+changing its status. The sweep is scheduled by the PR-8 `r1.sweep` job; capacity
+decisions never depend on it, because the snapshot already ignores lapsed links.
+
+**Worker contract for counting (PR-4 and PR-8).** The no-show derivation treats a
+round with `charged_attempt_number > attempts_counted` and no live session as a
+hold kept for the link, and the sweep, cancel and expiry refund it for good once
+the link is dead (three starts used, a lapsed link, or a terminal status). The
+worker must therefore:
+
+1. write `attempts_counted` (and flip `interview_round_attempts.counted`) **while
+   the session is still live**, at TRANSITION (plan D1), never after the session
+   has left live status. A count written afterwards can lose the race with the
+   sweep: a counted third start, or a session that ends just before the link
+   expires, is refunded before it is counted and its 55 is lost from
+   `minutes_used`;
+2. write an **uncount after a system failure in the same transaction that
+   terminalizes the session**, so no reader sees the session terminal while its
+   attempt is still counted (a restart would be refused as `attempts_exhausted` in
+   that window);
+3. never end a session uncounted and count it later: an attempt that did not
+   count is released with the link, by design.
+
+The same rule is in the plan (`docs/design/r1/R1-PLAN-final.md` section 5.12,
+"Counting contract") for the PR-4a worker and the PR-8 `r1.sweep` crash recovery.
+
+The suite pins both orders (a count written while live keeps its 55 through the
+sweep, also as a third start; a count written after the session ended finds its 55
+refunded). Cancelling a round while its session is **live** refunds nothing, for
+the same reason: the worker may still count that session, and the refund waits
+until it has ended uncounted.
+
+`v_r1_budget_month` exposes `r1_committed`, `pool_committed`, `pool_guard`,
+`outstanding_holds`, `r1_headroom` and `pool_headroom` (the limit minus the
+committed minutes) for the current month, and `pool_check_applies` (true in Mode
+B). The current month is always present, even before its first Send creates a
+budget row. It is read-only for the service role.
+
+For reconciliation the raw columns keep their meaning and the derived terms are
+appended: `minutes_used` is the **booked** column and `starts_admitted` counts
+**charged** starts (a restart of an uncounted attempt is not charged again, so it
+does not increment it); `booked_minutes_used`, `uncounted_charges`,
+`restored_holds`, `r1_minutes_used` (booked less 55 per uncounted charge, never
+below 0) and `r1_estimate` give the figures the checks use, so that
+`r1_committed = greatest(r1_minutes_used, r1_estimate) + outstanding_holds` can be
+reproduced from one row. A no-show moves its 55 from `r1_minutes_used` into
+`restored_holds` while `minutes_used` keeps it. The derived terms exist for the
+current month only.
+
+Reconcile by entering the dashboard's month-to-date figure through the settings
+API (`dashboard_minutes`). The **database** stamps `dashboard_read_at` with its
+own clock and `dashboard_estimate_baseline` with its own `pool_settled` at that
+instant, in one statement under the settings lock; clients cannot supply either
+value and the API rejects them. The baseline excludes the live floors: the
+metering later replaces a floor, which would otherwise read as negative growth
+and pull the guard under the authoritative figure. A reading counts as new when
+its value changes, was never stamped, or was stamped in an earlier month (an
+unchanged figure, such as 0 on the 1st, is a new month's reading), so re-saving
+other settings cannot reset the baseline of an unchanged current-month reading. `dashboard_read_at` is the **entry** time: usage between
+looking at the dashboard and entering the figure is not added, so enter it
+promptly. Enter the figure daily during S0 through Stage B, then weekly.
+
+A current-month reading entered under 0117 has no baseline. Migration 0119
+backfills it with the estimate now (net of live floors), because the estimate at
+read time is not computable from stored rows (the estimate has no as-of
+dimension): usage before the migration is not added on top of that reading,
+usage after it is. A reading with no baseline is always treated that way by the
+snapshot. Re-enter the dashboard figure after deploying 0119 to re-stamp it
+exactly.
+
 For Cloud fallback, calculate the permitted sessions as:
 
 ```
@@ -85,6 +284,32 @@ two reconciliations agree within 5%. Apply a 1.15 reconciliation factor until
 the ledger is demonstrated. Warn at 60/75/90%, pause at the line or projected
 month-end ≥90%, and keep R1 paused through 12:00 UTC on the first until reset
 behavior is evidenced. (implemented in PR-2)
+
+### Deploying 0119
+
+0119 backfills `charged_attempt_number` from the latest attempt of every existing
+round (each start 0115 or 0117 admitted was charged). It cannot repair 0117's
+restarts: 0117 charged a fresh 55 for the **restart of an uncounted attempt**,
+which this model charges once, and the months of those charges are not recorded.
+Production has never enabled R1, so there should be no rounds, but verify it
+before applying, with read-only SQL, and record the results in the PR:
+
+```sql
+select count(*) from screening_v2.interview_rounds;                           -- expect 0
+select month_start, minutes_used, minutes_reserved from screening_v2.r1_budget_month;  -- expect no rows, or zeros
+select round_id, attempt_number, count(*) from screening_v2.interview_round_attempts
+ group by 1, 2 having count(*) > 1;                                            -- expect no rows
+```
+
+If the first count is not 0, stop and review each round (its `starts_used`
+against its latest attempt number): a restart left a second attempt row with the
+same attempt number, and the migration itself refuses to run while any such
+rows exist (`0119 refused: N R1 round(s) were charged twice ...`). Correct the
+affected months' `minutes_used` and `starts_admitted` (55 and 1 per extra
+restart, in the month of the restart), remove the duplicate attempt rows, and apply
+again. After 0119 is live, save the allocation once (see the
+launch checklist: `allocation_set_at` is NULL on the existing row) and re-enter
+the dashboard figure to re-stamp its baseline.
 
 ## SFU operations and fallback
 
