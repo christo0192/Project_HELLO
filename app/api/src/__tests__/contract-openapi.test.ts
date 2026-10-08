@@ -721,7 +721,9 @@ describe('OpenAPI document integrity', () => {
     // /api/internal/r1/attempt-outcome. 155 + 8 = 163.
     // The stakeholder HTML report adds ONE path: POST /api/export/{candidateId}/
     // report-audit (inline body, no new schema). 163 + 1 = 164.
-    expect(Object.keys(paths).length).toBe(164);
+    // R1-Q adds ONE candidate path: POST /api/r1/ready, the "I'm ready" button's server relay
+    // (inline bodies, no new schema). 164 + 1 = 165.
+    expect(Object.keys(paths).length).toBe(165);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1235,6 +1237,7 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/r1/preflight',
     'POST /api/r1/attempts',
     'POST /api/r1/exchange',
+    'POST /api/r1/ready',
   ]);
   const grantAuthenticatedPattern = /^POST \/api\/livekit\/\{sessionId\}\/(recording|complete)$/;
 

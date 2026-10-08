@@ -42,6 +42,7 @@ vi.mock('../lib/recording-egress.js', async (importOriginal) => ({
 }));
 
 import { getAuditSink, setAuditSink } from '../lib/audit.js';
+import { createReadyLimiter } from '../lib/r1/ready-limiter.js';
 import {
   LINK,
   NOW,
@@ -69,6 +70,7 @@ const ROUTES = [
   '/api/r1/preflight',
   '/api/r1/attempts',
   '/api/r1/exchange',
+  '/api/r1/ready',
 ] as const;
 type Route = (typeof ROUTES)[number];
 
@@ -376,6 +378,48 @@ describe('R1 candidate routes: real responses against openapi.yaml', () => {
     h.rooms.updateRoomMetadata.mockRejectedValue(new Error('livekit down'));
     await hit('/api/r1/exchange', exchange, 503, 'r1_room_unavailable');
     finish('/api/r1/exchange');
+  });
+
+  it('POST /api/r1/ready', async () => {
+    grantConsent(h.tables);
+    const secrets = (await hit('/api/r1/attempts', { token: LINK }, 201)).body;
+    const ready = { attempt_token: secrets.attempt_token, nonce: secrets.nonce };
+
+    // `created`: no room has been provisioned, so there is nobody to tell.
+    await hit('/api/r1/ready', ready, 409, 'not_live');
+    await hit('/api/r1/exchange', ready, 200);
+    const relayed = await hit('/api/r1/ready', ready, 200);
+    expect(relayed.body).toEqual({ ok: true });
+    await hit('/api/r1/ready', { attempt_token: 'junk' }, 400);
+    await hit('/api/r1/ready', { ...ready, nonce: '8'.repeat(64) }, 404, 'r1_attempt_invalid');
+
+    h.tables.interview_round_consents![0]!.withdrawn_at = new Date(NOW).toISOString();
+    await hit('/api/r1/ready', ready, 409, 'consent_required');
+    h.tables.interview_round_consents![0]!.withdrawn_at = null;
+    h.tables.interview_rounds![0]!.expires_at = new Date(NOW - 1).toISOString();
+    await hit('/api/r1/ready', ready, 409, 'round_not_admissible');
+    h.tables.interview_rounds![0]!.expires_at = new Date(NOW + 1e9).toISOString();
+    process.env.R1_ENABLED = 'false';
+    await hit('/api/r1/ready', ready, 409, 'r1_disabled');
+    process.env.R1_ENABLED = 'true';
+
+    h.rooms.sendData.mockRejectedValueOnce(new Error('livekit down'));
+    await hit('/api/r1/ready', ready, 503, 'r1_room_unavailable');
+    process.env.WORKER_CONTEXT_SECRET = 'short';
+    await hit('/api/r1/ready', ready, 503, 'r1_unavailable');
+    process.env.WORKER_CONTEXT_SECRET = WORKER_SECRET;
+
+    // The per-attempt allowance: the second press inside the window is refused.
+    fresh(seedTables(), { readyLimiter: createReadyLimiter(1, 60_000) });
+    grantConsent(h.tables);
+    const second = (await hit('/api/r1/attempts', { token: LINK }, 201)).body;
+    const again = { attempt_token: second.attempt_token, nonce: second.nonce };
+    await hit('/api/r1/exchange', again, 200);
+    await hit('/api/r1/ready', again, 200);
+    const limited = await hit('/api/r1/ready', again, 429, 'r1_ready_rate_limited');
+    expect(limited.body.retry_after_sec).toBeGreaterThan(0);
+    expect(limited.headers['retry-after']).toBe(String(limited.body.retry_after_sec));
+    finish('/api/r1/ready');
   });
 });
 

@@ -11,10 +11,15 @@ import { Queue } from '../lib/queue/index.js';
 import { MemoryAdapter } from '../lib/queue/memory-adapter.js';
 import {
   R1_ASSESSMENT_QUEUE,
+  R1_DEFERRABLE_CODES,
+  R1_PROVIDER_DEFER_MAX_COUNT,
   R1_PROVIDER_DEFER_MAX_MS,
   R1_PROVIDER_DEFER_REASON,
   R1_PROVIDER_DEFER_SECONDS,
+  R1_TIMEOUT_CODES,
+  R1_TIMEOUT_DEFER_MAX_COUNT,
   createR1AssessmentHandler,
+  createR1FinalDeferralGuard,
 } from '../lib/r1/assessment-handler.js';
 import { R1_BREAKER_COOLDOWN_MS } from '../lib/r1/deepseek-runner.js';
 import { BusinessError, ProviderError } from '../lib/provider-resilience.js';
@@ -300,9 +305,35 @@ describe('provider outages defer instead of dead-lettering', () => {
 
   it('defers on the codes the service really produces for a provider outage', async () => {
     const { r1ErrorCode } = await import('../services/r1-assessment.js');
-    for (const error of [new DeepseekError('timeout'), new DeepseekError('connection'), new ProviderError('circuit_open')]) {
+    for (const error of [
+      new DeepseekError('timeout'),
+      new DeepseekError('connection'),
+      new ProviderError('circuit_open'),
+      // A rate limit and any 5xx are the provider being unavailable too.
+      new DeepseekError('protocol', 429),
+      new DeepseekError('protocol', 500),
+      new DeepseekError('protocol', 503),
+    ]) {
       const handler = failingWith(new Error(r1ErrorCode(error), { cause: error }));
       await expect(handler(job())).resolves.toMatchObject({ outcome: 'defer' });
+    }
+  });
+
+  it('the deferrable codes are an explicit set, and an exhausted balance or a bad key is not in it', () => {
+    expect([...R1_DEFERRABLE_CODES].sort()).toEqual([
+      'deepseek_connection',
+      'deepseek_rate_limited',
+      'deepseek_server_error',
+      'deepseek_timeout',
+      'provider_circuit_open',
+      'provider_connection',
+      'provider_timeout',
+    ]);
+    for (const code of [
+      'deepseek_insufficient_balance', 'deepseek_auth', 'deepseek_protocol', 'deepseek_http_400',
+      'deepseek_parse_error', 'deepseek_output_limit', 'deepseek_missing_api_key', 'r1_assessment_failed',
+    ]) {
+      expect(R1_DEFERRABLE_CODES.has(code), code).toBe(false);
     }
   });
 
@@ -310,6 +341,12 @@ describe('provider outages defer instead of dead-lettering', () => {
     const failures = [
       new DeepseekError('output_limit'),
       new DeepseekError('missing_api_key'),
+      // 402 (balance exhausted), 401/403 (bad key), other 4xx, and a 200 with an unusable body.
+      new DeepseekError('protocol', 402),
+      new DeepseekError('protocol', 401),
+      new DeepseekError('protocol', 403),
+      new DeepseekError('protocol', 400),
+      new DeepseekError('protocol'),
       new BusinessError(),
       new ScorecardValidationError('x', 'scorecard_invalid:result_count'),
       new Error('r1_attach_failed'),
@@ -329,6 +366,113 @@ describe('provider outages defer instead of dead-lettering', () => {
     const beyond = new Date(now - R1_PROVIDER_DEFER_MAX_MS - 1).toISOString();
     await expect(handler(job({ deferredAt: within }))).resolves.toMatchObject({ outcome: 'defer' });
     await expect(handler(job({ deferredAt: beyond }))).rejects.toThrow('deepseek_timeout');
+  });
+
+  it('stops deferring once the job has deferred the total cap (the count outlives a counted failure)', async () => {
+    const now = Date.parse('2026-10-06T12:00:00Z');
+    const handler = failingWith(new Error('deepseek_rate_limited'));
+    // A fresh streak (a counted failure just reset `deferredAt`) does not reset the count.
+    const freshStreak = new Date(now - 60_000).toISOString();
+    await expect(handler(job({ deferCount: R1_PROVIDER_DEFER_MAX_COUNT - 1, deferredAt: freshStreak })))
+      .resolves.toMatchObject({ outcome: 'defer' });
+    await expect(handler(job({ deferCount: R1_PROVIDER_DEFER_MAX_COUNT, deferredAt: freshStreak })))
+      .rejects.toThrow('deepseek_rate_limited');
+    await expect(handler(job({ deferCount: R1_PROVIDER_DEFER_MAX_COUNT + 40 })))
+      .rejects.toThrow('deepseek_rate_limited');
+    // A job whose count was never reported (an older row shape) still defers within its streak.
+    await expect(handler(job({ deferCount: undefined }))).resolves.toMatchObject({ outcome: 'defer' });
+  });
+
+  it('tells the service whether THIS failure will defer, from the same budget that decides it', async () => {
+    const now = Date.parse('2026-10-06T12:00:00Z');
+    const seen: Array<{ code: string; defers: boolean }> = [];
+    const probe = (jobToRun: QueueJob<unknown>) => createR1AssessmentHandler({
+      now: () => now,
+      run: async (_sessionId, options) => {
+        for (const code of [
+          'deepseek_timeout', 'deepseek_rate_limited', 'deepseek_server_error', 'provider_circuit_open',
+          'deepseek_insufficient_balance', 'deepseek_auth', 'deepseek_protocol',
+        ]) {
+          seen.push({ code, defers: options.willDefer!(code) });
+        }
+        throw new Error('deepseek_timeout');
+      },
+    })(jobToRun);
+
+    await expect(probe(job())).resolves.toMatchObject({ outcome: 'defer' });
+    expect(seen.filter((entry) => entry.defers).map((entry) => entry.code)).toEqual([
+      'deepseek_timeout', 'deepseek_rate_limited', 'deepseek_server_error', 'provider_circuit_open',
+    ]);
+    expect(seen.filter((entry) => !entry.defers).map((entry) => entry.code)).toEqual([
+      'deepseek_insufficient_balance', 'deepseek_auth', 'deepseek_protocol',
+    ]);
+
+    // With the provider-failure budget spent, no provider failure defers, and the handler agrees:
+    // it throws. The breaker's refusal (no call was made) is the one code that still defers.
+    seen.length = 0;
+    await expect(probe(job({ deferCount: R1_PROVIDER_DEFER_MAX_COUNT }))).rejects.toThrow('deepseek_timeout');
+    expect(seen.filter((entry) => entry.defers).map((entry) => entry.code)).toEqual(['provider_circuit_open']);
+  });
+
+  it('gives a TIMEOUT a much smaller deferral budget than a rate limit or a 5xx (it is the billed failure)', async () => {
+    expect(R1_TIMEOUT_DEFER_MAX_COUNT).toBeGreaterThan(0);
+    expect(R1_TIMEOUT_DEFER_MAX_COUNT).toBeLessThan(R1_PROVIDER_DEFER_MAX_COUNT);
+    expect([...R1_TIMEOUT_CODES].sort()).toEqual(['deepseek_timeout', 'provider_timeout']);
+    for (const code of R1_TIMEOUT_CODES) expect(R1_DEFERRABLE_CODES.has(code)).toBe(true);
+
+    const spent = job({ deferCount: R1_TIMEOUT_DEFER_MAX_COUNT });
+    const left = job({ deferCount: R1_TIMEOUT_DEFER_MAX_COUNT - 1 });
+    for (const code of ['deepseek_timeout', 'provider_timeout']) {
+      await expect(failingWith(new Error(code))(left)).resolves.toMatchObject({ outcome: 'defer' });
+      await expect(failingWith(new Error(code))(spent)).rejects.toThrow(code);
+    }
+    // The same count does not touch the failures that cost nothing.
+    for (const code of ['deepseek_rate_limited', 'deepseek_server_error', 'deepseek_connection', 'provider_connection']) {
+      await expect(failingWith(new Error(code))(spent)).resolves.toMatchObject({ outcome: 'defer' });
+    }
+    // They keep the long cap.
+    await expect(failingWith(new Error('deepseek_rate_limited'))(job({ deferCount: R1_PROVIDER_DEFER_MAX_COUNT - 1 })))
+      .resolves.toMatchObject({ outcome: 'defer' });
+    // A count that was never reported still defers a timeout (an older row shape).
+    await expect(failingWith(new Error('deepseek_timeout'))(job({ deferCount: undefined })))
+      .resolves.toMatchObject({ outcome: 'defer' });
+  });
+
+  it('the breaker REFUSING a call defers past the count caps (it made no call), but never past the streak', async () => {
+    const now = Date.parse('2026-10-06T12:00:00Z');
+    const handler = failingWith(new Error('provider_circuit_open'));
+    // No call, no bill, no count: the caps that bound real failures do not apply to it.
+    for (const deferCount of [0, R1_TIMEOUT_DEFER_MAX_COUNT, R1_PROVIDER_DEFER_MAX_COUNT, R1_PROVIDER_DEFER_MAX_COUNT + 40]) {
+      await expect(handler(job({ deferCount }))).resolves.toMatchObject({ outcome: 'defer' });
+    }
+    // The streak bound still ends an endless run of refusals.
+    const beyond = new Date(now - R1_PROVIDER_DEFER_MAX_MS - 1).toISOString();
+    await expect(handler(job({ deferCount: R1_PROVIDER_DEFER_MAX_COUNT, deferredAt: beyond })))
+      .rejects.toThrow('provider_circuit_open');
+  });
+
+  it('reports a deferral on the FINAL attempt (and only that) so the runtime can guard its commit', async () => {
+    const onFinalDeferral = vi.fn();
+    const handler = (error: Error) => createR1AssessmentHandler({
+      run: async () => { throw error; },
+      now: () => Date.parse('2026-10-06T12:00:00Z'),
+      onFinalDeferral,
+    });
+    // Final attempt, deferred: reported with the job id, the session and the sanitized code.
+    await expect(handler(new Error('deepseek_rate_limited'))(job({ id: 'job-final' })))
+      .resolves.toMatchObject({ outcome: 'defer' });
+    expect(onFinalDeferral).toHaveBeenCalledTimes(1);
+    expect(onFinalDeferral).toHaveBeenCalledWith('job-final', { sessionId: SESSION_ID, code: 'deepseek_rate_limited' });
+
+    // Not the final attempt: nothing to report (the job is simply retried if the commit fails).
+    onFinalDeferral.mockClear();
+    await expect(handler(new Error('deepseek_rate_limited'))(job({ attempts: 2 })))
+      .resolves.toMatchObject({ outcome: 'defer' });
+    // Final attempt but NOT deferred (balance, cap reached): the service wrote the placeholder.
+    await expect(handler(new Error('deepseek_insufficient_balance'))(job())).rejects.toThrow();
+    await expect(handler(new Error('deepseek_rate_limited'))(job({ deferCount: R1_PROVIDER_DEFER_MAX_COUNT })))
+      .rejects.toThrow();
+    expect(onFinalDeferral).not.toHaveBeenCalled();
   });
 
   it('through the real runtime: the job returns to delayed with its attempt refunded, no DLQ row', async () => {
@@ -351,7 +495,7 @@ describe('provider outages defer instead of dead-lettering', () => {
     expect(db.tables.assessments).toHaveLength(0);
   });
 
-  it('on the last attempt HR still gets the placeholder, and the job waits instead of dead-lettering', async () => {
+  it('on the last attempt a job that DEFERS leaves NO placeholder: it is alive and will be scored', async () => {
     const db = createFakeDb(tablesWithInterview(), happyRpc());
     const queue = makeQueue();
     const queued = await queue.enqueue(R1_ASSESSMENT_QUEUE, { session_id: SESSION_ID }, { maxAttempts: 1 });
@@ -360,9 +504,57 @@ describe('provider outages defer instead of dead-lettering', () => {
     await runtime.tickAll();
     await runtime.runner.stop();
     expect(await queue.getDlqJobs()).toHaveLength(0);
-    expect((await queue.getById(queued.id))!.status).toBe('delayed');
+    expect(await queue.getById(queued.id)).toMatchObject({ status: 'delayed', attempts: 0 });
+    // The incident (owner test b58c7d9c): the placeholder said "scoring failed" while the job
+    // lived on, and the row and the DLQ later disagreed. Nothing is written while it waits.
+    expect(db.tables.assessments).toHaveLength(0);
+    // Neither round RPC ran (the status loop's own sweep RPC is not one of them).
+    expect(db.rpcCalls.filter((call) => /^r1_(attach_assessment|apply_status_effect)$/.test(call.fn))).toHaveLength(0);
+  });
+
+  it('the same failure past the deferral cap ends the job: DLQ and ONE placeholder with the real code', async () => {
+    const db = createFakeDb(tablesWithInterview(), happyRpc());
+    const infer = vi.fn(async () => { throw new DeepseekError('protocol', 429); });
+    const handler = createR1AssessmentHandler({ client: db.client as never, infer });
+    const finalClaim = (deferCount: number): QueueJob<unknown> => job({ deferCount });
+
+    // One short of the cap: still deferring, still no placeholder.
+    await expect(handler(finalClaim(R1_PROVIDER_DEFER_MAX_COUNT - 1))).resolves.toMatchObject({ outcome: 'defer' });
+    expect(db.tables.assessments).toHaveLength(0);
+
+    // At the cap: the failure is terminal. The service records the placeholder, then rethrows.
+    await expect(handler(finalClaim(R1_PROVIDER_DEFER_MAX_COUNT))).rejects.toThrow('deepseek_rate_limited');
     expect(db.tables.assessments).toHaveLength(1);
-    expect(db.tables.assessments![0]!.raw.r1).toMatchObject({ outcome: 'scoring_failed', code: 'deepseek_timeout' });
+    expect(db.tables.assessments![0]!.raw.r1).toMatchObject({ outcome: 'scoring_failed', code: 'deepseek_rate_limited' });
+  });
+
+  it('an open breaker past the cap still defers (no call is made) so the NEXT claim is a real probe', async () => {
+    // The old rule made this terminal, which dead-lettered every outage as `provider_circuit_open`
+    // (r1-scoring-outage.test.ts drives that end to end with the real breaker). A refusal makes
+    // no call, so deferring it for the cooldown costs nothing; the probe that follows either
+    // succeeds or fails with the REAL code, and that is the attempt that counts.
+    const db = createFakeDb(tablesWithInterview(), happyRpc());
+    const infer = vi.fn(async () => { throw new ProviderError('circuit_open'); });
+    const handler = createR1AssessmentHandler({ client: db.client as never, infer });
+    await expect(handler(job({ attempts: 2, deferCount: R1_PROVIDER_DEFER_MAX_COUNT })))
+      .resolves.toMatchObject({ outcome: 'defer', delaySeconds: R1_PROVIDER_DEFER_SECONDS });
+    // Even on the final attempt it records nothing: the job is alive and a probe is coming.
+    await expect(handler(job({ attempts: 5, deferCount: R1_PROVIDER_DEFER_MAX_COUNT })))
+      .resolves.toMatchObject({ outcome: 'defer' });
+    expect(db.tables.assessments).toHaveLength(0);
+  });
+
+  it('a refusal is not an endless wait: past the streak bound it is terminal, with a placeholder on the last attempt', async () => {
+    const db = createFakeDb(tablesWithInterview(), happyRpc());
+    const infer = vi.fn(async () => { throw new ProviderError('circuit_open'); });
+    const now = Date.parse('2026-10-06T12:00:00Z');
+    const handler = createR1AssessmentHandler({ client: db.client as never, infer, now: () => now });
+    const beyond = new Date(now - R1_PROVIDER_DEFER_MAX_MS - 1).toISOString();
+    await expect(handler(job({ attempts: 2, deferredAt: beyond }))).rejects.toThrow('provider_circuit_open');
+    expect(db.tables.assessments).toHaveLength(0);
+    await expect(handler(job({ attempts: 5, deferredAt: beyond }))).rejects.toThrow('provider_circuit_open');
+    expect(db.tables.assessments).toHaveLength(1);
+    expect(db.tables.assessments![0]!.raw.r1).toMatchObject({ outcome: 'scoring_failed', code: 'provider_circuit_open' });
   });
 
   it('an open R1 breaker defers the job within the breaker cooldown instead of burning attempts', async () => {
@@ -375,6 +567,161 @@ describe('provider outages defer instead of dead-lettering', () => {
     await runtime.runner.stop();
     expect(await queue.getDlqJobs()).toHaveLength(0);
     expect(await queue.getById(queued.id)).toMatchObject({ status: 'delayed', attempts: 0 });
+  });
+});
+
+describe('the final-deferral guard (a deferral that does not commit must not leave HR nothing)', () => {
+  const deferral = { sessionId: SESSION_ID, code: 'deepseek_rate_limited' };
+  function fakeQueue(deferClaim: () => Promise<string>) {
+    return {
+      claim: vi.fn(async () => null),
+      completeClaim: vi.fn(async () => true),
+      failClaim: vi.fn(async () => 'retry_scheduled'),
+      heartbeat: vi.fn(async () => true),
+      deferClaim: vi.fn(deferClaim),
+    };
+  }
+  const guarded = (queue: ReturnType<typeof fakeQueue>, record = vi.fn(async () => undefined)) => {
+    const guard = createR1FinalDeferralGuard(record);
+    return { guard, record, queue: guard.guard(queue as never) };
+  };
+
+  it('does nothing when the deferral lands, and when no final deferral was noted', async () => {
+    const lands = fakeQueue(async () => 'deferred');
+    const first = guarded(lands);
+    first.guard.note('job-1', deferral);
+    await expect(first.queue.deferClaim('job-1', 'lease', 'r1_provider_unavailable', 65)).resolves.toBe('deferred');
+    expect(first.record).not.toHaveBeenCalled();
+
+    // A job that was never noted (a non-final attempt) never records, whatever the commit does.
+    const fails = fakeQueue(async () => { throw new Error('db down'); });
+    const second = guarded(fails);
+    await expect(second.queue.deferClaim('job-2', 'lease', 'r1_provider_unavailable', 65)).rejects.toThrow('db down');
+    expect(second.record).not.toHaveBeenCalled();
+  });
+
+  it('records when the commit throws (and rethrows), and when it answers not_owned', async () => {
+    const throws = fakeQueue(async () => { throw new Error('db down'); });
+    const a = guarded(throws);
+    a.guard.note('job-1', deferral);
+    await expect(a.queue.deferClaim('job-1', 'lease', 'r1_provider_unavailable', 65)).rejects.toThrow('db down');
+    expect(a.record).toHaveBeenCalledExactlyOnceWith(deferral);
+
+    const lost = fakeQueue(async () => 'not_owned');
+    const b = guarded(lost);
+    b.guard.note('job-1', deferral);
+    await expect(b.queue.deferClaim('job-1', 'lease', 'r1_provider_unavailable', 65)).resolves.toBe('not_owned');
+    expect(b.record).toHaveBeenCalledExactlyOnceWith(deferral);
+  });
+
+  it('records once per noted deferral and forgets it: the next commit of that job id is not covered', async () => {
+    const lost = fakeQueue(async () => 'not_owned');
+    const { guard, queue, record } = guarded(lost);
+    guard.note('job-1', deferral);
+    await queue.deferClaim('job-1', 'lease', 'r1_provider_unavailable', 65);
+    await queue.deferClaim('job-1', 'lease', 'r1_provider_unavailable', 65);
+    expect(record).toHaveBeenCalledTimes(1);
+  });
+
+  it('is best effort: a failing record never changes what the runner sees', async () => {
+    const lost = fakeQueue(async () => 'not_owned');
+    const { guard, queue } = guarded(lost, vi.fn(async () => { throw new Error('db down too'); }));
+    guard.note('job-1', deferral);
+    await expect(queue.deferClaim('job-1', 'lease', 'r1_provider_unavailable', 65)).resolves.toBe('not_owned');
+    const throws = fakeQueue(async () => { throw new Error('db down'); });
+    const other = guarded(throws, vi.fn(async () => { throw new Error('db down too'); }));
+    other.guard.note('job-1', deferral);
+    // The ORIGINAL error is the one that surfaces, not the fallback's.
+    await expect(other.queue.deferClaim('job-1', 'lease', 'r1_provider_unavailable', 65)).rejects.toThrow('db down');
+  });
+
+  it('passes every other queue method straight through, untouched', async () => {
+    const base = fakeQueue(async () => 'deferred');
+    const { queue } = guarded(base);
+    await queue.claim('r1.assessment', { leaseSeconds: 600, owner: 'o' });
+    await queue.completeClaim('j', 'l');
+    await queue.failClaim('j', 'l', 'deepseek_auth');
+    await queue.heartbeat('j', 'l', { leaseSeconds: 600 });
+    await queue.deferClaim('j', 'l', 'r1_provider_unavailable', 65);
+    expect(base.claim).toHaveBeenCalledWith('r1.assessment', { leaseSeconds: 600, owner: 'o' });
+    expect(base.completeClaim).toHaveBeenCalledWith('j', 'l');
+    expect(base.failClaim).toHaveBeenCalledWith('j', 'l', 'deepseek_auth');
+    expect(base.heartbeat).toHaveBeenCalledWith('j', 'l', { leaseSeconds: 600 });
+    expect(base.deferClaim).toHaveBeenCalledWith('j', 'l', 'r1_provider_unavailable', 65);
+  });
+});
+
+describe('DeepSeek HTTP status codes through the real runtime', () => {
+  /** One claim of a fresh job whose model call fails with `error`. */
+  async function runOnce(error: Error, maxAttempts: number) {
+    const db = createFakeDb(tablesWithInterview(), happyRpc());
+    const queue = makeQueue();
+    const queued = await queue.enqueue(R1_ASSESSMENT_QUEUE, { session_id: SESSION_ID }, { maxAttempts });
+    const infer = vi.fn(async () => { throw error; });
+    const runtime = createR1Runtime({ config: ENABLED, client: db.client as never, queue, infer })!;
+    await runtime.tickAll();
+    await runtime.runner.stop();
+    return { queue, db, id: queued.id, snapshot: () => runtime.snapshot() };
+  }
+
+  it('402 is NOT deferred: it counts the attempt and records the balance code, with no placeholder yet', async () => {
+    const { queue, db, id } = await runOnce(new DeepseekError('protocol', 402), 5);
+    expect(await queue.getDlqJobs()).toHaveLength(0);
+    expect(await queue.getById(id)).toMatchObject({
+      status: 'delayed', attempts: 1, errorMessage: 'deepseek_insufficient_balance',
+    });
+    expect((await queue.getById(id))!.deferReason).toBeUndefined();
+    expect(db.tables.assessments).toHaveLength(0);
+  });
+
+  it('402 on the last attempt dead-letters as deepseek_insufficient_balance, with an operator message and no key', async () => {
+    process.env.DEEPSEEK_API_KEY = 'sk-test-key-must-never-appear';
+    try {
+      const { queue, db } = await runOnce(new DeepseekError('protocol', 402), 1);
+      const dlq = await queue.getDlqJobs();
+      expect(dlq).toHaveLength(1);
+      expect(dlq[0]!.errorMessage).toBe('deepseek_insufficient_balance');
+      expect(db.tables.assessments).toHaveLength(1);
+      const row = db.tables.assessments![0]!;
+      expect(row.raw.r1).toMatchObject({ outcome: 'scoring_failed', valid: false, code: 'deepseek_insufficient_balance' });
+      const rationale = String(row.metric_results[0].rationale);
+      expect(rationale).toMatch(/DeepSeek balance is exhausted/);
+      expect(rationale).toMatch(/replayed after the top-up/);
+      expect(JSON.stringify(row)).not.toContain('sk-test-key-must-never-appear');
+    } finally {
+      delete process.env.DEEPSEEK_API_KEY;
+    }
+  });
+
+  it('401 is NOT deferred: it dead-letters as deepseek_auth on the last attempt', async () => {
+    const { queue, db } = await runOnce(new DeepseekError('protocol', 401), 1);
+    const dlq = await queue.getDlqJobs();
+    expect(dlq).toHaveLength(1);
+    expect(dlq[0]!.errorMessage).toBe('deepseek_auth');
+    expect(db.tables.assessments![0]!.raw.r1).toMatchObject({ code: 'deepseek_auth' });
+    expect(String(db.tables.assessments![0]!.metric_results[0].rationale)).toMatch(/rejected the API key/);
+  });
+
+  it('429 IS deferred: the attempt is refunded, nothing is dead-lettered, nothing is recorded', async () => {
+    const { queue, db, id, snapshot } = await runOnce(new DeepseekError('protocol', 429), 1);
+    expect(await queue.getDlqJobs()).toHaveLength(0);
+    expect(await queue.getById(id)).toMatchObject({
+      status: 'delayed', attempts: 0, deferReason: R1_PROVIDER_DEFER_REASON,
+    });
+    expect(db.tables.assessments).toHaveLength(0);
+    expect(snapshot().jobEvents.deferred).toBe(1);
+  });
+
+  it('a 5xx IS deferred too', async () => {
+    const { queue, db, id } = await runOnce(new DeepseekError('protocol', 503), 1);
+    expect(await queue.getDlqJobs()).toHaveLength(0);
+    expect(await queue.getById(id)).toMatchObject({ status: 'delayed', attempts: 0 });
+    expect(db.tables.assessments).toHaveLength(0);
+  });
+
+  it('any other status is a plain failure carrying its status', async () => {
+    const { queue } = await runOnce(new DeepseekError('protocol', 422), 1);
+    expect((await queue.getDlqJobs())[0]!.errorMessage).toBe('deepseek_http_422');
   });
 });
 

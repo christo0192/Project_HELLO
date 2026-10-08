@@ -693,14 +693,20 @@ Look for:
   seconds; `v_r1_budget_month` moved by about one session (the 55-minute hold
   converted to booked minutes).
 - `r1_admin_log` contains `session_facts` (the worker posts it before the terminal
-  transition, with every key the API parser reads; `first_audio_p95_ms` is an
-  explicit null until PR-4c measures first-audio latency). Without the row the
-  gate fails closed with `fidelity_facts_missing`.
+  transition, with every key the API parser reads; `first_audio_p95_ms` is the
+  role-play p95 of end of speech to first audio in milliseconds, or an explicit
+  null when fewer than 8 role-play turns were measured). Without the row the
+  gate fails closed with `fidelity_facts_missing`; with a null latency it lists
+  `latency_unknown`, and with a value above 3000 `latency_p95_exceeded`. Compare
+  the posted value with the `r1_latency` line `schema=first_audio_p95`.
 - The `r1.assessment` job ran: `assessed = true`, a `recommendation` and
   `overall`, `status_write = flag_off` (auto-status is off) or `human_review`
-  with the reason in the assessment. `human_review` on every session is
-  expected for now: the gate still lists `latency_unknown` (PR-4c) and, until the
-  API stops requiring an F1 push line (F1 is anchor + counter), `push_missing:f1`.
+  with the reason in the assessment. The worker no longer leaves a permanent gate
+  failure behind (the API stopped requiring an F1 push line, and the worker now
+  posts `first_audio_p95_ms`), so a `human_review` is a real finding: read the
+  gate failures (`latency_p95_exceeded` means the session was slower than 3.0 s at
+  p95, which the first smoke may well show; `latency_unknown` means fewer than 8
+  role-play turns were measured).
   `fidelity_facts_missing`, `family_slip_unknown`, `unprobed_reveal` or
   `roleplay_duration_unknown` mean the worker's rows no longer match the parser
   (wrong order, or key drift: `tests/test_r1_admin_contract.py` pins the names).

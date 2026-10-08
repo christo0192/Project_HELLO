@@ -10270,7 +10270,7 @@ async def _make_native_coordinator(
     *, turn_mode="toolfirst", client=None, state=None,
     coverage_judge_enabled=False, call_metrics=None,
     candidate_speaking=None, candidate_speech_ended=None,
-    speech_sequence=None, qna_close_window=None,
+    speech_sequence=None, qna_close_window=None, persist_candidate_text=None,
 ):
     """Start a REAL `_run_native_phone_screening` and return its live turn hook.
 
@@ -10335,6 +10335,12 @@ async def _make_native_coordinator(
             candidate_speaking=candidate_speaking,
             candidate_speech_ended=candidate_speech_ended,
             qna_close_window=qna_close_window,
+            # M014 S01: omitted (the coordinator's no-op default) unless a test
+            # asks to observe the rows the coordinator persists for kept turns.
+            **(
+                {"persist_candidate_text": persist_candidate_text}
+                if persist_candidate_text is not None else {}
+            ),
         )
     )
     # Let the coordinator install its hook and deliver the (inert) first question.

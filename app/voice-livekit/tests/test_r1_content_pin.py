@@ -48,7 +48,11 @@ import r1_world
 # Revision 8 (R1-Q round 2 review fixes): the reached anchor (a price at or below $7,000 already on
 # the table) asks what the price includes instead of "is that the final price?" (the counter owns
 # that question) and names the amount in every variant; the manifest samples the below-$7,000 case.
-PINNED_CONTENT_SHA256 = "e60b351d675b59a1007205c680ad48151117bedc9e7a63f218dd8b5f84e13226"
+# Revision 9 (merge of origin/main, R1-Q PR-B #369): PR-B's own revision 3 text changes join the
+# learner branch's 3..8: L-NO-FEEDBACK is one short refusal that does not name the hiring team
+# (L-CLOSE is the one mention of who reviews the interview), and the wrap-up reply note
+# (r1_prompts.WRAPUP_REMINDER) forbids a goodbye.  CONTENT_REVISION = max(8, 3) + 1.
+PINNED_CONTENT_SHA256 = "c00ff14acb19e36f1570913c372ed9d5bf6db1f5d42ed17361249635bd98985b"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -144,6 +148,8 @@ class PinTests(unittest.TestCase):
         )
         self.assertEqual(set(manifest["commitment"]["lines"]), {"STRONG", "MEDIUM", "WEAK"})
         self.assertIn("interviewer_prefix", manifest["prompts"])
+        self.assertEqual(manifest["prompts"]["wrapup_reminder"], r1_prompts.WRAPUP_REMINDER)
+        self.assertEqual(manifest["guard"]["no_feedback"], r1_script.LINES["L-NO-FEEDBACK"])
 
     def test_the_manifest_covers_the_r1_q_disclosure_layers(self):
         manifest = r1_content.manifest()
@@ -541,6 +547,31 @@ class WorkerCoreDriftTests(unittest.TestCase):
                 self.lines.line(line_id, first_name="Arjun"),
                 r1_script.line(line_id, first_name="Arjun"),
             )
+
+    def test_an_unknown_name_is_dropped_the_same_way_in_both(self):
+        # R1-Q item 6: "", the API's "there" (any case), a rejected name and an initial are
+        # unknown, and the slot goes with its comma.
+        for first_name in ("", None, "there", "There", "THERE", "A", "Arjun<b>", "x" * 25):
+            self.assertEqual(self.lines.known_first_name(first_name), "")
+            self.assertEqual(r1_script.known_first_name(first_name), "")
+            for line_id in ("L-OPEN", "L-CLOSE", "L-SIL-IB", "L-REJOIN", "L-SYSTEM-STOP"):
+                with self.subTest(first_name=first_name, line=line_id):
+                    self.assertEqual(
+                        self.lines.line(line_id, first_name=first_name),
+                        r1_script.line(line_id, first_name=first_name),
+                    )
+                    self.assertNotIn(
+                        "there", r1_script.line(line_id, first_name=first_name).lower()
+                    )
+            self.assertEqual(
+                self.lines.line("L-TRANSITION", first_name=first_name,
+                                lead_name="Meera Iyer", lead_city="Edison, New Jersey"),
+                r1_script.line("L-TRANSITION", first_name=first_name,
+                               lead_name="Meera Iyer", lead_city="Edison, New Jersey"),
+            )
+        for first_name in ("Arjun", "Mary-Ann", "Bo"):
+            self.assertEqual(self.lines.known_first_name(first_name), first_name)
+            self.assertEqual(r1_script.known_first_name(first_name), first_name)
 
 
 if __name__ == "__main__":

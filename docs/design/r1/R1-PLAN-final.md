@@ -441,7 +441,7 @@ Clocks:
 | L-TIME-CUE (learner, R ≈ 11:00) | "Just so you know, I've only got a couple of minutes before my next call." |
 | L-EXIT | "Let's pause the role-play here. I'm stepping out of the learner's role now; this is Christy, your interviewer, again. Thank you, that's the end of the role-play." |
 | L-WRAP | "Before we finish, do you have any questions about the role or the next steps?" |
-| L-NO-FEEDBACK | "I'm not able to share how it went. The hiring team will review the full interview and get back to you." |
+| L-NO-FEEDBACK | "I'm sorry, I can't share any feedback on how it went." |
 | L-FAQ-DEFER | "That's a good question for the hiring team; they'll follow up with you on it." |
 | L-CLOSE | "Thank you for your time today, {first_name}. The hiring team will review your interview and get back to you. You can close this window now. Goodbye." |
 | L-ASIDE-COACH | "Quick note from Christy, your interviewer: in this role-play you're the Program Advisor and I'm the learner, {lead_name}. She enquired about the Data Science course and you're calling her back. Please carry on as you would on a real call." |

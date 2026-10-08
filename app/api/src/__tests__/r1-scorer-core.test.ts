@@ -2,7 +2,7 @@
  * The R1 three-run scorer: median, agreement, thresholds, the integrity floor, the single
  * repair resample, evidence validation, and fail-closed behaviour.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   R1_SCORING_RUNS,
   aggregateR1Runs,
@@ -21,6 +21,13 @@ import { parseR1AdministrationLog } from '../lib/r1/admin-log.js';
 import { computeTranscriptStats, maskR1Turns, toR1Turns } from '../lib/r1/transcript.js';
 import { ScorecardValidationError } from '../lib/scorecards/domain.js';
 import { DeepseekError } from '../lib/deepseek.js';
+import { CircuitBreaker, ProviderError } from '../lib/provider-resilience.js';
+import {
+  R1_BREAKER_COOLDOWN_MS,
+  R1_BREAKER_FAILURE_THRESHOLD,
+  createR1DeepseekRunner,
+  createR1Infer,
+} from '../lib/r1/deepseek-runner.js';
 import { METRIC_IDS, cleanLogRows, interviewRows, modelAnswer, r1Scorecard } from './support/r1-scorer.js';
 
 const THRESHOLDS: R1Thresholds = { advance: 65, hold: 45 };
@@ -87,7 +94,7 @@ describe('thresholds and the recommendation rule', () => {
 });
 
 describe('three runs and the median', () => {
-  it('runs the scorer three times in parallel and agrees when all runs match', async () => {
+  it('runs the scorer three times (run 0, then two in parallel) and agrees when all runs match', async () => {
     const { infer, prompts } = scripted([modelAnswer(rows, allScores(3))]);
     const outcome = await scoreR1Transcript({ infer }, input());
     expect(R1_SCORING_RUNS).toBe(3);
@@ -275,6 +282,146 @@ describe('malformed output gets exactly one repair resample', () => {
     };
     await expect(scoreR1Transcript({ infer }, input())).rejects.toMatchObject({ category: 'timeout' });
     expect(calls).toBe(3);
+  });
+});
+
+describe('run 0 first (a provider failure costs one call; a half-open breaker cannot fail the attempt)', () => {
+  it('scores run 0 ALONE, and only after it succeeds starts the other runs in parallel', async () => {
+    const events: string[] = [];
+    let inFlight = 0;
+    let peak = 0;
+    let calls = 0;
+    const infer = async (): Promise<unknown> => {
+      calls += 1;
+      const id = calls;
+      events.push(`start${id}`);
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      events.push(`end${id}`);
+      return modelAnswer(rows, allScores(3));
+    };
+    const outcome = await scoreR1Transcript({ infer }, input());
+    expect(calls).toBe(3);
+    // Run 0 starts AND ends before any other call starts.
+    expect(events.slice(0, 2)).toEqual(['start1', 'end1']);
+    expect(events.slice(2, 4)).toEqual(['start2', 'start3']);
+    // Then runs 1 and 2 overlap: two in flight, never three.
+    expect(peak).toBe(2);
+    expect(outcome.runs).toHaveLength(3);
+    expect(outcome.runsAgree).toBe(true);
+  });
+
+  it('a provider failure on run 0 ends the attempt after ONE call, keeping the HTTP status', async () => {
+    const infer = vi.fn(async (): Promise<unknown> => { throw new DeepseekError('protocol', 402); });
+    await expect(scoreR1Transcript({ infer }, input())).rejects.toMatchObject({
+      category: 'protocol', status: 402,
+    });
+    expect(infer).toHaveBeenCalledTimes(1);
+  });
+
+  it('a timeout on run 0 ends the attempt after ONE call (it used to bill three)', async () => {
+    const infer = vi.fn(async (): Promise<unknown> => { throw new DeepseekError('timeout'); });
+    await expect(scoreR1Transcript({ infer }, input())).rejects.toMatchObject({ category: 'timeout' });
+    expect(infer).toHaveBeenCalledTimes(1);
+  });
+
+  it('a validation failure on run 0 stops after its single repair: 2 calls, not 6', async () => {
+    const { infer, prompts } = scripted([{ results: 'nope' }]);
+    await expect(scoreR1Transcript({ infer }, input())).rejects.toMatchObject({
+      code: 'scorecard_invalid:results_missing',
+    });
+    expect(prompts).toHaveLength(2);
+  });
+
+  it('a failure in a LATER run still rethrows only after every sibling has settled', async () => {
+    const settledCalls: number[] = [];
+    let calls = 0;
+    const infer = async (): Promise<unknown> => {
+      calls += 1;
+      const id = calls;
+      if (id === 1) return modelAnswer(rows, allScores(3));
+      await new Promise((resolve) => setTimeout(resolve, id === 2 ? 1 : 10));
+      settledCalls.push(id);
+      if (id === 2) throw new DeepseekError('protocol', 503);
+      return modelAnswer(rows, allScores(3));
+    };
+    await expect(scoreR1Transcript({ infer }, input())).rejects.toMatchObject({ status: 503 });
+    // The slower sibling (call 3) finished before the rejection surfaced.
+    expect(settledCalls).toEqual([2, 3]);
+  });
+
+  describe('against the real R1 breaker', () => {
+    const answer = () => JSON.stringify(modelAnswer(rows, allScores(3)));
+
+    /** An R1 runner on a controllable clock whose breaker is OPEN and whose cooldown has passed. */
+    async function halfOpenRunner() {
+      let nowMs = 0;
+      const clock = { now: () => nowMs };
+      const breaker = new CircuitBreaker({
+        failureThreshold: R1_BREAKER_FAILURE_THRESHOLD,
+        cooldownMs: R1_BREAKER_COOLDOWN_MS,
+        clock,
+      });
+      let healthy = false;
+      const transport = vi.fn(async () => (healthy
+        ? { ok: true, status: 200, text: async () => JSON.stringify({ choices: [{ message: { content: answer() } }] }) }
+        : { ok: false, status: 402, text: async () => '{"error":{"message":"Insufficient Balance"}}' }));
+      const runner = createR1DeepseekRunner({ transport, breaker });
+      for (let i = 0; i < R1_BREAKER_FAILURE_THRESHOLD; i += 1) {
+        await expect(runner.runDeepseek('x')).rejects.toMatchObject({ status: 402 });
+      }
+      expect(breaker.getState()).toBe('OPEN');
+      nowMs += R1_BREAKER_COOLDOWN_MS + 1;
+      healthy = true;
+      transport.mockClear();
+      return { runner, breaker, transport };
+    }
+
+    it('premise: fanned out together, a half-open breaker admits ONE probe and refuses the siblings', async () => {
+      process.env.DEEPSEEK_API_KEY = 'test-key-not-real';
+      try {
+        const { runner } = await halfOpenRunner();
+        const infer = createR1Infer(runner);
+        const settled = await Promise.allSettled([infer('p'), infer('p'), infer('p')]);
+        expect(settled.filter((entry) => entry.status === 'fulfilled')).toHaveLength(1);
+        const rejected = settled.filter((entry): entry is PromiseRejectedResult => entry.status === 'rejected');
+        expect(rejected).toHaveLength(2);
+        for (const entry of rejected) expect(entry.reason).toBeInstanceOf(ProviderError);
+      } finally {
+        delete process.env.DEEPSEEK_API_KEY;
+      }
+    });
+
+    it('run 0 is the half-open probe: it succeeds, closes the breaker, and the other two runs then succeed', async () => {
+      process.env.DEEPSEEK_API_KEY = 'test-key-not-real';
+      try {
+        const { runner, breaker, transport } = await halfOpenRunner();
+        const outcome = await scoreR1Transcript({ infer: createR1Infer(runner) }, input());
+        expect(transport).toHaveBeenCalledTimes(3);
+        expect(breaker.getState()).toBe('CLOSED');
+        expect(outcome.runs).toHaveLength(3);
+        expect(outcome.complete).toBe(true);
+        expect(outcome.runsAgree).toBe(true);
+        expect(outcome.recommendation).toBe('advance');
+      } finally {
+        delete process.env.DEEPSEEK_API_KEY;
+      }
+    });
+
+    it('a still-failing provider costs the half-open probe ONE call and fails the attempt with its status', async () => {
+      process.env.DEEPSEEK_API_KEY = 'test-key-not-real';
+      try {
+        const { runner, transport } = await halfOpenRunner();
+        transport.mockImplementation(async () => ({ ok: false, status: 402, text: async () => '{}' }));
+        await expect(scoreR1Transcript({ infer: createR1Infer(runner) }, input()))
+          .rejects.toMatchObject({ category: 'protocol', status: 402 });
+        expect(transport).toHaveBeenCalledTimes(1);
+      } finally {
+        delete process.env.DEEPSEEK_API_KEY;
+      }
+    });
   });
 });
 

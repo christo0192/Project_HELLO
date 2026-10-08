@@ -223,5 +223,94 @@ class TestBackToBackSayTogglesTheAgentState(_ContractCase):
         self.assertIn(("speaking", "listening"), self.states[:-1])
 
 
+class TestOverlapMergeSdkContract(unittest.IsolatedAsyncioTestCase):
+    """M014 S01: what the post-cut router (agent.py `_route_continuation` /
+    `_route_overlap_reask`) assumes about livekit-agents 1.6.4.
+
+    1. ``SpeechHandle.interrupt()`` makes ``.interrupted`` True (the hook's
+       synchronous read of the previous reply);
+    2. ``_user_turn_completed_task`` awaits ``current_speech.interrupt()`` BEFORE
+       it calls ``on_user_turn_completed``: the bot is already cut when the hook
+       runs, even a reply that never played ("nothing_played");
+    3. ``except StopResponse: return`` adds NO chat item and fires NO
+       ``conversation_item_added``: why a held-but-kept turn needs its own
+       persisted row;
+    4. a reply interrupted before its first audio frame writes NO assistant
+       item, and one interrupted after it writes only the PLAYED text, marked
+       ``interrupted`` (the coordinator reads the cut line off that item).
+
+    No candidate data: synthetic text only.
+    """
+
+    async def test_interrupt_marks_the_handle_interrupted(self):
+        from livekit.agents.voice.speech_handle import (  # noqa: PLC0415
+            DEFAULT_INPUT_DETAILS, SpeechHandle,
+        )
+
+        handle = SpeechHandle(
+            speech_id="contract", allow_interruptions=True,
+            input_details=DEFAULT_INPUT_DETAILS,
+        )
+        self.assertFalse(handle.interrupted)
+        handle.interrupt()
+        self.assertTrue(handle.interrupted)
+
+    def test_the_previous_reply_is_interrupted_before_the_turn_hook_runs(self):
+        import inspect  # noqa: PLC0415
+        from livekit.agents.voice.agent_activity import AgentActivity  # noqa: PLC0415
+
+        source = inspect.getsource(AgentActivity._user_turn_completed_task)  # noqa: SLF001
+        interrupt_at = source.index("await current_speech.interrupt()")
+        hook_at = source.index("self._agent.on_user_turn_completed(")
+        self.assertLess(interrupt_at, hook_at)
+        self.assertIn("except StopResponse:", source)
+
+    def test_a_cut_reply_writes_only_the_played_text_and_none_before_first_audio(self):
+        import inspect  # noqa: PLC0415
+        from livekit.agents.voice.agent_activity import AgentActivity  # noqa: PLC0415
+
+        source = inspect.getsource(AgentActivity)
+        self.assertIn("forwarded_text = playback_ev.synchronized_transcript", source)
+        # Interrupted before the first audio frame: nothing was heard, so the
+        # forwarded text is emptied and no assistant message is added.
+        self.assertIn('forwarded_text = ""', source)
+        self.assertIn("if forwarded_text and add_to_chat_ctx:", source)
+        self.assertIn("interrupted=speech_handle.interrupted", source)
+
+    async def test_stop_response_adds_no_chat_item_and_fires_no_item_event(self):
+        agents = _SDK["agents"]
+        ar = _SDK["audio_recognition"]
+        events: list = []
+
+        class _StoppingAgent(agents.Agent):
+            async def on_user_turn_completed(self, turn_ctx, new_message) -> None:
+                raise agents.StopResponse()
+
+        agent = _StoppingAgent(instructions="contract test")
+        session = agents.AgentSession()
+        session.on("conversation_item_added", events.append)
+        session.output.audio = _fake_audio_output()
+        await session.start(agent)
+        try:
+            now = time.time()
+            info = ar._EndOfTurnInfo(
+                skip_reply=False, new_transcript="A synthetic held turn.",
+                transcript_confidence=1.0,
+                metrics=ar._EndOfTurnMetrics(
+                    started_speaking_at=now - 0.6, stopped_speaking_at=now - 0.2,
+                    transcription_delay=0.1, end_of_turn_delay=0.2),
+            )
+            await session._activity._user_turn_completed_task(None, info)  # noqa: SLF001
+            users = [
+                i for i in agent.chat_ctx.items if getattr(i, "role", None) == "user"
+            ]
+            self.assertEqual(users, [])
+            # (Starting the session itself adds an agent-handoff item.)
+            messages = [e for e in events if getattr(e.item, "type", None) == "message"]
+            self.assertEqual(messages, [])
+        finally:
+            await session.aclose()
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

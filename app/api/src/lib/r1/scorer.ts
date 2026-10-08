@@ -1,8 +1,8 @@
 /**
  * The R1 three-run scorer (plan 6.3, 6.5).
  *
- * One transcript is scored THREE times in parallel against the R1 scorecard. Per metric the
- * MEDIAN level is kept. The result is trusted for a status effect only when the runs agree:
+ * One transcript is scored THREE times against the R1 scorecard (run 0 first, then the other
+ * two in parallel; see `scoreR1Transcript`). Per metric the MEDIAN level is kept. The result is trusted for a status effect only when the runs agree:
  * the recommendation is identical across runs and no metric spreads by more than one level,
  * and every run's evidence references validated. Otherwise the recommendation is
  * `human_review`.
@@ -414,7 +414,18 @@ export function aggregateR1Runs(
   };
 }
 
-/** Score a transcript with `R1_SCORING_RUNS` parallel runs and aggregate. */
+/**
+ * Score a transcript with `R1_SCORING_RUNS` runs and aggregate: run 0 ALONE first, then the
+ * remaining runs in parallel.
+ *
+ * Why run 0 goes first. All runs share ONE circuit breaker. Fanned out together, a breaker that
+ * is half-open admits a single probe and refuses the siblings with `circuit_open`, so the
+ * attempt could not succeed even when the probe did (the half-open trap, RCA for owner test
+ * b58c7d9c). And a provider failure that applies to every call (an exhausted balance, a bad
+ * key, a timeout on a long transcript) used to bill three calls for nothing. Run 0 first means a
+ * failure costs ONE call and ends the attempt before the other runs start, and a successful
+ * probe closes the breaker before the fan-out. The price is at most one extra run of latency.
+ */
 export async function scoreR1Transcript(
   deps: R1ScoreDeps,
   input: R1ScoreInput,
@@ -429,12 +440,13 @@ export async function scoreR1Transcript(
     deckFacts: input.deckFacts,
     sentinel: deps.sentinel,
   });
+  // Run 0: any failure (provider or validation) propagates here and no further run starts.
+  const outcomes: R1RunOutcome[] = [await scoreOneR1Run(deps, input, prompt)];
   // allSettled: a failing run must not leave its siblings as unhandled rejections or abandon
   // in-flight provider calls. The FIRST failure in run order is rethrown once all have settled.
   const settled = await Promise.allSettled(
-    Array.from({ length: runs }, () => scoreOneR1Run(deps, input, prompt)),
+    Array.from({ length: runs - 1 }, () => scoreOneR1Run(deps, input, prompt)),
   );
-  const outcomes: R1RunOutcome[] = [];
   for (const entry of settled) {
     if (entry.status === 'rejected') throw entry.reason;
     outcomes.push(entry.value);

@@ -48,7 +48,10 @@ import r1_world
 # 8: R1-Q round 2 review fixes: the reached anchor (a price at or below $7,000 already on the
 #    table) asks what the price includes instead of "is that the final price?" (the counter owns
 #    that question) and names the amount in every variant.
-CONTENT_REVISION = 8
+# 9: merge of origin/main (R1-Q PR-B #369) into the learner branch: PR-B's revision 3 joins 3..8
+#    above (L-NO-FEEDBACK is one short refusal that does not name the hiring team, L-CLOSE is the
+#    one mention of who reviews the interview; the wrap-up reply note forbids a goodbye).
+CONTENT_REVISION = 9
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -196,6 +199,7 @@ def manifest() -> dict[str, Any]:
         "prompts": {
             "interviewer_prefix": r1_prompts.interviewer_prefix(),
             "wrapup_note": r1_prompts.WRAPUP_NOTE,
+            "wrapup_reminder": r1_prompts.WRAPUP_REMINDER,
             "getting_to_know_you_note": r1_prompts.GETTING_TO_KNOW_YOU_NOTE,
             "learner_prefixes": {
                 f"{p.id}.{v.id}": r1_prompts.learner_prefix(r1_personas.resolve_persona(

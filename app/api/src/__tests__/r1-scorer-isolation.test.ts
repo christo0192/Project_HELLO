@@ -148,6 +148,29 @@ describe('R1 DeepSeek runner isolation (PR-5)', () => {
     expect(R1_SCORER_TIMEOUT_MS).toBeLessThanOrEqual(DEEPSEEK_TIMEOUT_CEILING_MS);
     expect(r1ScoringModel()).toMatch(/^deepseek/);
   });
+
+  it('allows a scoring call 300 s (the shared ceiling), and that is the timer the request really arms', async () => {
+    process.env.DEEPSEEK_API_KEY = 'test-key-not-real';
+    // 180 s was too short for a 5-metric, 100-turn transcript at reasoning high (owner test
+    // b58c7d9c); a job is bounded by 2 x 4 sequential calls of this length, inside the 3600 s
+    // absolute lease deadline.
+    expect(R1_SCORER_TIMEOUT_MS).toBe(300_000);
+    expect(R1_SCORER_TIMEOUT_MS).toBe(DEEPSEEK_TIMEOUT_CEILING_MS);
+    expect(2 * 4 * R1_SCORER_TIMEOUT_MS / 1000).toBeLessThan(3600);
+    const armed: number[] = [];
+    const timers = {
+      setTimeout: ((_fn: () => void, ms: number) => { armed.push(ms); return 0; }) as unknown as typeof setTimeout,
+      clearTimeout: (() => undefined) as unknown as typeof clearTimeout,
+    };
+    const transport = vi.fn(async () => ({
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ choices: [{ message: { content: '{"results":[]}' } }] }),
+    }));
+    const infer = createR1Infer(createR1DeepseekRunner({ transport, timers }));
+    await expect(infer('p')).resolves.toEqual({ results: [] });
+    expect(armed).toEqual([300_000]);
+  });
 });
 
 function listFiles(dir: string): string[] {
