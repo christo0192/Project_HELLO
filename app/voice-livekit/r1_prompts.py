@@ -61,6 +61,15 @@ GETTING_TO_KNOW_YOU_NOTE = (
 # The phases whose replies are the getting-to-know-you part.
 _GETTING_TO_KNOW_YOU_PHASES = frozenset({"opening", "icebreaker"})
 
+WRAPUP_REMINDER = (
+    "INTERVIEW NOTE (not spoken; never mention it). This is the candidate's question time. "
+    "Answer the question in one or two short sentences. Never thank the candidate for their "
+    "time, never say goodbye, bye, take care or have a great day, and never ask whether they "
+    "have more questions: the interview closes by itself, with its own goodbye."
+)
+# The phases whose replies answer the candidate's questions after the role-play.
+_WRAPUP_PHASES = frozenset({"wrapup", "closing"})
+
 ROLEPLAY_PHASE = "roleplay"
 _INTERVIEW_CONTEXT_PHASES = {
     "opening": ("opening", "icebreaker"),
@@ -99,8 +108,16 @@ def interviewer_reminder(phase: str) -> str | None:
     before the newest user message, like the learner's per-turn note.  Without it the model
     may start or announce the role-play itself ("Great, let's move into the role-play...")
     while the driver is about to play the scripted transition line: two different starts.
+
+    The wrap-up has the same problem the other way round: the model closed the interview
+    itself ("Thank you for your time today ... Have a great day") and the scripted L-CLOSE then
+    said goodbye again.  Its note says the closing line is the only goodbye.
     """
-    return GETTING_TO_KNOW_YOU_NOTE if phase in _GETTING_TO_KNOW_YOU_PHASES else None
+    if phase in _GETTING_TO_KNOW_YOU_PHASES:
+        return GETTING_TO_KNOW_YOU_NOTE
+    if phase in _WRAPUP_PHASES:
+        return WRAPUP_REMINDER
+    return None
 
 
 def learner_prefix(persona: RenderedPersona) -> str:

@@ -77,6 +77,16 @@ R1-Q (turn taking) changes how the candidate's speech becomes TURNS, in three pl
 * A reply the SDK cancelled before any audio is logged (``r1_reply_cancelled_before_audio``,
   a running count), and when the icebreaker's exit is due it is not left as silence: the
   boundary line answers the turn that lost its reply.
+
+R1-Q (interviewer lines) changes what the scripted lines and the wrap-up say, in three places:
+
+* A first name that is empty or the API's placeholder "there" is unknown (``_first_name``): the
+  lines drop it ("Thank you. We'll now move ...") instead of speaking it, and a name the
+  candidate gives in the opening or the icebreaker ("my name is Cristo") is used from then on.
+* An acknowledgement ("Alright", "Okay, got it") is a refusal in the wrap-up (``is_no_questions``),
+  so the model is not asked to answer it with a goodbye of its own before ``L-CLOSE``.
+* The guard's feedback refusal ends the reply (``r1_guard``), and ``L-NO-FEEDBACK`` is one
+  sentence that names the hiring team once.
 """
 from __future__ import annotations
 
@@ -128,7 +138,7 @@ from r1_replies import (
 )
 from r1_prompts import ROLEPLAY_PHASE
 from r1_roleplay import RolePlayEngine, TurnMode, TurnPlan
-from r1_script import INTERVIEWER_NAME, is_candidate_free, line
+from r1_script import INTERVIEWER_NAME, is_candidate_free, known_first_name, line, spoken_first_name
 from r1_tts import flush_min_chars, flush_tts, r1_tts_kwargs
 
 R1_RECORD = False
@@ -298,12 +308,21 @@ _NO_QUESTIONS_RE = re.compile(
     r"i'?m (?:good|all set|fine|okay|ok|alright)|i am (?:good|all set|fine|okay|ok|alright)|"
     r"all (?:good|set)|"
     r"thank you|thanks?|"
+    # An acknowledgement ("Alright.", "Okay, got it.") is what a candidate with nothing to ask
+    # says, to L-WRAP and to the answer that follows it.  Treating it as a question made the
+    # interviewer reply to it (with a goodbye of its own) before the scripted close.
+    r"alright|all right|okay|ok|got it|sounds good|understood|perfect|cool|noted|great|"
     r"no"
     r")\b"
 )
-# Gratitude refuses only when nothing affirms: "Thank you." closes the wrap-up, but "Yes, thank
-# you." may open a question, and that is the interviewer's to answer.
-_GRATITUDE_RE = re.compile(r"\b(?:thank you|thanks?)\b")
+# Gratitude and acknowledgement refuse only when nothing affirms: "Thank you." and "Alright." close
+# the wrap-up, but "Yes, thank you." or "Yeah, okay." may open a question, and that is the
+# interviewer's to answer.  "I'm okay" / "I am alright" are refusals in their own right (above), so
+# the lookbehinds keep the acknowledgement word of those phrases in place.
+_SOFT_CLOSE_RE = re.compile(
+    r"(?<!i'm )(?<!i am )\b(?:thank you|thanks?|alright|all right|okay|ok|got it|sounds good|"
+    r"understood|perfect|cool|noted|great)\b"
+)
 _AFFIRMATIONS = frozenset({"yes", "yeah", "yep", "yup", "sure"})
 # Courtesy and filler: the ONLY words allowed next to a refusal.  This is an allowlist on
 # purpose.  A list of question words can never be complete ("any feedback for me", "the
@@ -541,8 +560,9 @@ def is_no_questions(text: str) -> bool:
     rest = _NO_QUESTIONS_RE.sub(" ", folded)
     if not all(word in _COURTESY_WORDS for word in rest.split()):
         return False
-    if _NO_QUESTIONS_RE.search(_GRATITUDE_RE.sub(" ", folded)) is None:
-        # Only a thank-you refuses here ("Thank you.", "Okay, thank you."): not next to a "yes".
+    if _NO_QUESTIONS_RE.search(_SOFT_CLOSE_RE.sub(" ", folded)) is None:
+        # Only a thank-you or an acknowledgement refuses here ("Thank you.", "Okay, thank you.",
+        # "Alright."): not next to a "yes".
         return not any(word in _AFFIRMATIONS for word in folded.split())
     return True
 
@@ -794,6 +814,9 @@ class R1Interview:
         # use, so an interview that only settles an outcome never loads them.
         self._choice: PersonaChoice | None = None
         self._engine: RolePlayEngine | None = None
+        # The first name the candidate gave in their own introduction, kept only while the record
+        # has no usable name (``_first_name``).  Never logged.
+        self._spoken_name = ""
         self._history: list[dict[str, Any]] = []
         self._latest_candidate_index: int | None = None
         self._user_turn_started: float | None = None
@@ -867,16 +890,57 @@ class R1Interview:
         if self._engine is None:
             self._engine = RolePlayEngine(
                 self.persona,
-                candidate_first_name=str(self.context.get("first_name") or ""),
+                candidate_first_name=self._first_name(),
                 seed=self._seed(),
             )
         return self._engine
+
+    def _first_name(self) -> str:
+        """The name the interviewer may speak: the record's, else the candidate's own, else "".
+
+        The record's name is unknown when the API sent nothing usable (it sends "there" for a
+        name it cannot use).  "" makes ``r1_script.line`` drop the name from the line instead of
+        speaking "there" into it.
+        """
+        return known_first_name(self.context.get("first_name")) or self._spoken_name
+
+    def _learn_spoken_name(self, text: str) -> None:
+        """Adopt the first name the candidate introduced themselves with ("my name is Cristo").
+
+        Only while the record has no usable name, only in the opening and the icebreaker, and
+        only once: the first introduction wins.  A name that is the learner's (the persona's
+        first or last name) or the interviewer's is not adopted, so the scripted lines never
+        have two people with one name on the call.  The name is candidate PII: it is spoken in
+        the lines that carry ``{first_name}`` and handed to the guard (so it can repeat the
+        candidate's own name), never logged.
+        """
+        if self._spoken_name or known_first_name(self.context.get("first_name")):
+            return
+        if self.machine.phase not in (R1Phase.OPENING, R1Phase.ICEBREAKER):
+            return
+        name = spoken_first_name(text)
+        if not name:
+            return
+        taken = {INTERVIEWER_NAME.lower()}
+        with contextlib.suppress(Exception):
+            variant = self.persona.variant
+            taken |= {variant.first_name.lower(), variant.last_name.lower()}
+        if name.lower() in taken:
+            return
+        self._spoken_name = name
+        if self._engine is not None:
+            self._engine.candidate_first_name = name
+        # A label only, never the name.  The lines that carry the name were warmed for the
+        # name-less text, so the first time one is spoken it is a cache miss and is synthesised
+        # live (one TTS round trip); warming the new text again would spend Sarvam requests,
+        # a budget shared with the phone lane, for a path that is rare (the record has a name).
+        _log.info("unknown_event", error_type="r1_spoken_name_adopted")
 
     def render_line(self, line_id: str) -> str:
         """Render one pinned line; the persona supplies the lead name, city and pickup."""
         return line(
             line_id,
-            first_name=self.context.get("first_name"),
+            first_name=self._first_name(),
             **self.persona.line_values,
         )
 
@@ -2501,6 +2565,7 @@ class R1Interview:
             )
         row.parts.append(text)
         self._latest_candidate_index = row.index  # the SDK turn that follows is judged at this row
+        self._learn_spoken_name(" ".join(row.parts))
         self.note_turn(text)
 
     def _flush_candidate_row(self) -> None:

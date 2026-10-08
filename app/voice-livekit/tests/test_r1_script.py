@@ -19,10 +19,12 @@ from r1_script import (
     NAME_FREE_LINES,
     filler_line,
     is_candidate_free,
+    known_first_name,
     line,
     line_sha256,
     placeholders,
     safe_first_name,
+    spoken_first_name,
 )
 
 PLAN_IDS = (
@@ -130,7 +132,8 @@ class RenderTests(unittest.TestCase):
 
     def test_lines_render_with_the_sanitised_name(self):
         self.assertTrue(line("L-OPEN", first_name="Arjun").startswith("Hi Arjun, I'm Christy"))
-        self.assertTrue(line("L-OPEN", first_name="Arjun<b>").startswith("Hi there, I'm Christy"))
+        # A name the sanitiser rejects is unknown, not "there": the slot is dropped.
+        self.assertTrue(line("L-OPEN", first_name="Arjun<b>").startswith("Hi, I'm Christy"))
         self.assertEqual(line("L-SIL-IB", first_name="Arjun"), "Are you still with me, Arjun?")
         self.assertEqual(line("L-WRAP"), LINES["L-WRAP"])
 
@@ -182,6 +185,148 @@ class RenderTests(unittest.TestCase):
         self.assertRegex(digest, r"^[a-f0-9]{64}$")
         self.assertEqual(digest, line_sha256(LINES["L-WRAP"]))
         self.assertNotEqual(digest, line_sha256(LINES["L-WRAP"] + " "))
+
+
+class UnknownNameTests(unittest.TestCase):
+    """R1-Q item 6: "Thank you, there." The API's placeholder is an unknown name, not a name."""
+
+    UNKNOWN = ("", None, "there", "There", "THERE", " there ", "A", "-", "Arjun<b>", "x" * 25, "12")
+    NAMED = ("Arjun", "Mary-Ann", "O'Neil", "Meera", "Bo")
+
+    def persona_values(self):
+        return resolve_persona("p1_career_switcher", variant="v1").line_values
+
+    def test_known_first_name_is_the_name_or_empty(self):
+        for value in self.NAMED:
+            with self.subTest(value=value):
+                self.assertEqual(known_first_name(value), value)
+        self.assertEqual(known_first_name("  Arjun "), "Arjun")
+        for value in self.UNKNOWN:
+            with self.subTest(value=value):
+                self.assertEqual(known_first_name(value), "")
+
+    def test_safe_first_name_still_falls_back_to_there(self):
+        # The old helper keeps its contract (the provisional r1_lines copy is pinned to it).
+        for value in self.UNKNOWN[:3] + ("Arjun<b>",):
+            self.assertEqual(safe_first_name(value), "there")
+
+    def test_each_name_line_reads_naturally_without_a_name(self):
+        values = self.persona_values()
+        expected = {
+            "L-OPEN": "Hi, I'm Christy, an AI interviewer from Interview Kickstart, and I'll",
+            "L-TRANSITION": "Thank you. We'll now move to the role-play. I'll play a prospective",
+            "L-CLOSE": (
+                "Thank you for your time today. The hiring team will review your interview and "
+                "get back to you. You can close this window now. Goodbye."
+            ),
+            "L-SIL-IB": "Are you still with me?",
+            "L-REJOIN": "Welcome back. Let's pick up where we left off.",
+            "L-SYSTEM-STOP": (
+                "I'm sorry, we need to stop here because of a technical problem on our side. "
+                "This won't count against you, and the hiring team will send you a new link. "
+                "Goodbye."
+            ),
+        }
+        # Every line that carries the name slot is covered, so a new one cannot slip through.
+        self.assertEqual(
+            {line_id for line_id in LINES if "first_name" in placeholders(line_id)},
+            set(expected),
+        )
+        for unknown in self.UNKNOWN:
+            for line_id, start in expected.items():
+                with self.subTest(unknown=unknown, line=line_id):
+                    text = line(line_id, first_name=unknown, **values)
+                    self.assertTrue(text.startswith(start), text)
+                    self.assertEqual(text, line(line_id, first_name="", **values))
+                    self.assertNotIn("{", text)
+                    self.assertNotIn("  ", text)
+                    self.assertNotRegex(text, r"\s[,.?]|,,|,\.|Hi there|, there\b")
+
+    def test_a_known_name_renders_exactly_as_before(self):
+        values = self.persona_values()
+        self.assertEqual(
+            line("L-CLOSE", first_name="Arjun", **values),
+            "Thank you for your time today, Arjun. The hiring team will review your interview "
+            "and get back to you. You can close this window now. Goodbye.",
+        )
+        self.assertEqual(
+            line("L-SYSTEM-STOP", first_name="Arjun", **values),
+            "I'm sorry, Arjun, we need to stop here because of a technical problem on our side. "
+            "This won't count against you, and the hiring team will send you a new link. "
+            "Goodbye.",
+        )
+        self.assertEqual(
+            line("L-REJOIN", first_name="Arjun"),
+            "Welcome back, Arjun. Let's pick up where we left off.",
+        )
+
+    def test_name_free_lines_are_untouched_by_an_unknown_name(self):
+        for line_id in NAME_FREE_LINES:
+            self.assertEqual(line(line_id, first_name=""), LINES[line_id])
+
+    def test_an_unknown_name_does_not_change_which_lines_may_be_cached(self):
+        # Cacheability is a property of the template (its slots), not of the name we have.
+        self.assertFalse(is_candidate_free("L-CLOSE"))
+        self.assertTrue(is_candidate_free("L-WRAP"))
+        self.assertEqual(placeholders("L-CLOSE"), {"first_name"})
+
+
+class SpokenNameTests(unittest.TestCase):
+    """The first name a candidate introduces themselves with (capital letter, letters only)."""
+
+    def test_introductions_are_recognised(self):
+        for text, expected in (
+            ("Yeah, so my name is Cristo.", "Cristo"),
+            ("My name is Cristo and I have eleven years in sales", "Cristo"),
+            ("Hi, my name's Priya, nice to meet you", "Priya"),
+            ("Hi, my name’s Dev.", "Dev"),
+            ("Myself Rahul, working as a sales executive", "Rahul"),
+            ("Hello. Myself Anand Kumar.", "Anand"),
+            ("Okay, myself Neha.", "Neha"),
+            ("Thank you for the opportunity. Myself Vikram.", "Vikram"),
+            ("Hi Christy, this is Meera", "Meera"),
+            ("This is Sandeep speaking", "Sandeep"),
+            ("Good morning, this is Ananya.", "Ananya"),
+            ("my name is CRISTO", "Cristo"),
+            ("I was told to say it first. My name is Ishaan Rao", "Ishaan"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(spoken_first_name(text), expected)
+
+    def test_everything_else_is_not_a_name(self):
+        for text in (
+            "",
+            None,
+            "I taught myself Python and then Salesforce",
+            "I worked there and this is Salesforce",
+            "Well, I think this is Salesforce",
+            "Yes, this is Salesforce related",
+            "My name is not on the list",
+            "this is great",
+            "This is a good question",
+            "This is Great",
+            "my name is",
+            "my name is O",
+            "my name is " + "A" * 25,
+            "my name is Krishna1",
+            "my name is Mary-Ann",
+            "my name is Christy",
+            "I'm Cristo",
+            "I am Cristo",
+            "Cristo here",
+            "my name is " + chr(0x0930) + chr(0x0935) + chr(0x093F),
+            "My name is the one on my resume",
+            "my name is also on the offer",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(spoken_first_name(text), "")
+
+    def test_the_first_introduction_wins_and_the_result_is_always_a_known_name(self):
+        self.assertEqual(spoken_first_name("My name is Asha. Myself Bina."), "Asha")
+        for text in ("My name is Asha", "Myself Rohit.", "Hi, this is Zoe"):
+            self.assertEqual(known_first_name(spoken_first_name(text)), spoken_first_name(text))
+            self.assertTrue(2 <= len(spoken_first_name(text)) <= 24)
+            self.assertTrue(spoken_first_name(text).isalpha())
 
 
 if __name__ == "__main__":

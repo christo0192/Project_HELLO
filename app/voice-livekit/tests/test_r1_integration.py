@@ -43,7 +43,7 @@ from r1_linecache import (
 from r1_persistence import R1TurnWriter
 from r1_personas import PERSONA_IDS, PERSONAS, resolve_persona
 from r1_phases import R1Phase, R1PhaseMachine
-from r1_prompts import WRAPUP_NOTE, interviewer_prefix, learner_prefix
+from r1_prompts import WRAPUP_NOTE, WRAPUP_REMINDER, interviewer_prefix, learner_prefix
 from r1_replies import (
     SOURCE_ATTEMPT,
     SOURCE_SEED,
@@ -856,6 +856,29 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
         self.assertIs(wrap.machine.phase, R1Phase.WRAPUP)
         self.assertEqual(wrap.last_messages()[1], {"role": "system", "content": WRAPUP_NOTE})
 
+    async def test_a_wrapup_acknowledgement_gets_no_model_reply_and_a_question_gets_the_note(
+        self,
+    ) -> None:
+        # R1-Q item 8: "Alright" used to count as a question, the model answered it with its own
+        # goodbye, and L-CLOSE then said goodbye again.
+        wrap = Rig()
+        wrap.machine.transition(R1Phase.TRANSITION)
+        wrap.machine.transition(R1Phase.ROLEPLAY)
+        wrap.machine.transition(R1Phase.ROLEPLAY_EXIT)
+        wrap.machine.transition(R1Phase.WRAPUP)
+        await wrap.interview.say("L-WRAP")
+        for acknowledgement in ("Alright.", "Okay, thank you.", "Got it.", "No, that's all."):
+            with self.subTest(text=acknowledgement):
+                self.assertIsNone(await wrap.converse(acknowledgement))
+        self.assertEqual(wrap.provider.calls, [])  # the model was never asked
+        spoken = await wrap.converse("Can I get some feedback on how it went?")
+        self.assertTrue(spoken)
+        messages = wrap.last_messages()
+        self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
+        self.assertEqual(messages[1], {"role": "system", "content": WRAPUP_NOTE})
+        self.assertEqual(messages[-2], {"role": "system", "content": WRAPUP_REMINDER})
+        self.assertIn("never say goodbye", messages[-2]["content"])
+
     async def test_the_phase_driver_keeps_waiting_through_an_injection(self) -> None:
         rig = Rig()
         await rig.start_roleplay()
@@ -964,6 +987,25 @@ class TestOutputGuardInEveryPhase(unittest.IsolatedAsyncioTestCase):
                     rig, self.reply_for(rig, phase), "You did well, your score is high."
                 )
                 self.assertEqual(spoken, NO_FEEDBACK_LINE)
+
+    async def test_the_feedback_refusal_is_the_whole_reply(self) -> None:
+        # The owner's turn 97: the guard swapped the feedback sentence for the refusal, and the
+        # model's next sentence (a paraphrase of the deferral line) was spoken after it, so the
+        # candidate heard "the hiring team" twice.  The refusal now ends the reply.
+        for phase in ("roleplay_exit", "wrapup", "closing"):
+            with self.subTest(phase=phase):
+                rig = Rig()
+                spoken = await self.run_reply(
+                    rig,
+                    self.reply_for(rig, phase),
+                    "You did a great job overall. That's handled by the hiring team, and "
+                    "they'll follow up with you on it.",
+                )
+                self.assertEqual(spoken, NO_FEEDBACK_LINE)
+                self.assertEqual(spoken.lower().count("hiring team"), 1)
+                self.assertEqual(
+                    [trip["category"] for trip in rig.interview._guard_trips], ["feedback"]
+                )
 
     async def test_the_persona_never_reaches_the_interviewer_after_the_reveal(self) -> None:
         rig = Rig()

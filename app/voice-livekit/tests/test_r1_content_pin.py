@@ -28,7 +28,9 @@ import r1_script
 import r1_world
 
 # Revision 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
-PINNED_CONTENT_SHA256 = "f2f72df832367fc7345c9991cf5bf6c75f16ec9d92ef1bc1e8013fb51193219f"
+# Revision 3 (R1-Q S02 T03): L-NO-FEEDBACK is one sentence naming the hiring team once, and the
+# wrap-up reply note (r1_prompts.WRAPUP_REMINDER) forbids a goodbye.
+PINNED_CONTENT_SHA256 = "906f6bfd14ffeafddc2f0894a5a240bf6311e04e4517a408804a0f87e69fe49a"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -123,6 +125,8 @@ class PinTests(unittest.TestCase):
         )
         self.assertEqual(set(manifest["commitment"]["lines"]), {"STRONG", "MEDIUM", "WEAK"})
         self.assertIn("interviewer_prefix", manifest["prompts"])
+        self.assertEqual(manifest["prompts"]["wrapup_reminder"], r1_prompts.WRAPUP_REMINDER)
+        self.assertEqual(manifest["guard"]["no_feedback"], r1_script.LINES["L-NO-FEEDBACK"])
 
     def test_changing_any_pinned_text_changes_the_sha(self):
         base = r1_content.content_sha256()
@@ -274,6 +278,31 @@ class WorkerCoreDriftTests(unittest.TestCase):
                 self.lines.line(line_id, first_name="Arjun"),
                 r1_script.line(line_id, first_name="Arjun"),
             )
+
+    def test_an_unknown_name_is_dropped_the_same_way_in_both(self):
+        # R1-Q item 6: "", the API's "there" (any case), a rejected name and an initial are
+        # unknown, and the slot goes with its comma.
+        for first_name in ("", None, "there", "There", "THERE", "A", "Arjun<b>", "x" * 25):
+            self.assertEqual(self.lines.known_first_name(first_name), "")
+            self.assertEqual(r1_script.known_first_name(first_name), "")
+            for line_id in ("L-OPEN", "L-CLOSE", "L-SIL-IB", "L-REJOIN", "L-SYSTEM-STOP"):
+                with self.subTest(first_name=first_name, line=line_id):
+                    self.assertEqual(
+                        self.lines.line(line_id, first_name=first_name),
+                        r1_script.line(line_id, first_name=first_name),
+                    )
+                    self.assertNotIn(
+                        "there", r1_script.line(line_id, first_name=first_name).lower()
+                    )
+            self.assertEqual(
+                self.lines.line("L-TRANSITION", first_name=first_name,
+                                lead_name="Meera Iyer", lead_city="Edison, New Jersey"),
+                r1_script.line("L-TRANSITION", first_name=first_name,
+                               lead_name="Meera Iyer", lead_city="Edison, New Jersey"),
+            )
+        for first_name in ("Arjun", "Mary-Ann", "Bo"):
+            self.assertEqual(self.lines.known_first_name(first_name), first_name)
+            self.assertEqual(r1_script.known_first_name(first_name), first_name)
 
 
 if __name__ == "__main__":

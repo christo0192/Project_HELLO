@@ -988,6 +988,31 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         "Thanks!",
         "Okay, thank you.",
         "Okay, thanks a lot.",
+        # R1-Q item 8: an acknowledgement is what a candidate with nothing to ask says, both to
+        # L-WRAP and to the answer after it ("Alright" was counted as question #2, the model said a
+        # goodbye of its own, and L-CLOSE said it again).
+        "Alright.",
+        "Alright",
+        "All right.",
+        "Okay.",
+        "Okay",
+        "OK.",
+        "Ok, got it.",
+        "Got it.",
+        "Got it, thanks.",
+        "Sounds good.",
+        "Alright, sounds good.",
+        "Alright, thank you.",
+        "Alright. Thank you so much.",
+        "Okay, that's all.",
+        "Okay, no, that's all.",
+        "No, that's all.",
+        "Understood.",
+        "Perfect, thank you.",
+        "Cool.",
+        "Noted.",
+        "Great.",
+        "Okay, great.",
     )
     # A real question stays a question, however it is punctuated and however polite it is.
     PUNCTUATED_QUESTIONS = (
@@ -1017,6 +1042,21 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         "Yes, thank you.",
         "Yeah, thanks",
         "Sure, thank you",
+        # An acknowledgement never swallows a request after it, and next to a "yes" it may open one.
+        "Alright, one more question about shifts",
+        "Alright but how long until I hear back",
+        "Okay, so what happens next?",
+        "Okay, so what happens next",
+        "Okay, what is the notice period",
+        "Got it, can you repeat that",
+        "Sounds good, what about the team size",
+        "Cool, any idea when I hear back",
+        "Okay, I do have one",
+        "Okay, yes",
+        "Yeah, okay",
+        "Yes, alright",
+        "Okay?",
+        "Alright?",
     )
 
     def test_a_punctuated_refusal_is_a_refusal(self) -> None:
@@ -3252,6 +3292,132 @@ class TestWrapupAndReadyDriveTheDriver(R1TestCase):
                 # Not the 20 s TRANSITION_DEADLINE_SECONDS: the answer itself is the pickup.
                 self.assertIsNone(await asyncio.wait_for(task, 5.0))
                 self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+
+
+class TestUnknownAndSpokenFirstName(R1TestCase):
+    """R1-Q item 6: "Thank you, there." is never spoken; the name the candidate gave is used.
+
+    The API sends the literal "there" for a name it cannot use, and the lines that splice the
+    name in read badly with it.  An unknown name drops out of the line; when the candidate says
+    their own name in the opening or the icebreaker, later lines use it.
+    """
+
+    LINE_CONTEXT = {"first_name": "there", "candidate_identity": "candidate"}
+    NAME_LINES = ("L-OPEN", "L-TRANSITION", "L-CLOSE", "L-SIL-IB", "L-REJOIN", "L-SYSTEM-STOP")
+
+    def spoken_lines(self) -> dict[str, str]:
+        return {line_id: self.interview.render_line(line_id) for line_id in self.NAME_LINES}
+
+    async def test_the_placeholder_name_is_dropped_from_every_line(self) -> None:
+        rendered = self.spoken_lines()
+        self.assertTrue(rendered["L-OPEN"].startswith("Hi, I'm Christy,"))
+        self.assertTrue(rendered["L-TRANSITION"].startswith("Thank you. We'll now move"))
+        self.assertIn("for your time today. The hiring team", rendered["L-CLOSE"])
+        self.assertEqual(rendered["L-SIL-IB"], "Are you still with me?")
+        self.assertEqual(rendered["L-REJOIN"], "Welcome back. Let's pick up where we left off.")
+        self.assertTrue(rendered["L-SYSTEM-STOP"].startswith("I'm sorry, we need to stop here"))
+        for line_id, text in rendered.items():
+            with self.subTest(line=line_id):
+                self.assertNotIn("there", text)
+                self.assertNotIn("{", text)
+
+    async def test_an_empty_or_unusable_record_name_is_unknown_too(self) -> None:
+        for value in ("", None, "THERE", "A", "Ar<script>"):
+            with self.subTest(value=value):
+                self.interview.context["first_name"] = value
+                self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
+
+    async def test_a_usable_record_name_is_spoken_and_the_candidate_cannot_replace_it(self) -> None:
+        self.interview.context["first_name"] = "Asha"
+        self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me, Asha?")
+        await self.answer("Hi, my name is Cristo and I sell courses.")
+        self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me, Asha?")
+
+    async def test_the_name_the_candidate_gives_is_used_in_the_later_lines(self) -> None:
+        await self.answer("Yeah, so my name is Cristo, and I have eleven years in sales.")
+        rendered = self.spoken_lines()
+        self.assertEqual(rendered["L-SIL-IB"], "Are you still with me, Cristo?")
+        self.assertTrue(rendered["L-TRANSITION"].startswith("Thank you, Cristo. We'll now move"))
+        self.assertIn("for your time today, Cristo. The hiring team", rendered["L-CLOSE"])
+        self.assertEqual(
+            rendered["L-REJOIN"], "Welcome back, Cristo. Let's pick up where we left off."
+        )
+        self.assertTrue(rendered["L-SYSTEM-STOP"].startswith("I'm sorry, Cristo, we need to stop"))
+
+    async def test_the_first_introduction_wins(self) -> None:
+        await self.answer("My name is Cristo.")
+        await self.answer("Myself Bina, I mean.")  # a valid introduction, but the second one
+        self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me, Cristo?")
+
+    async def test_the_introduction_may_be_split_across_the_speech_to_texts_finals(self) -> None:
+        self.final_transcript("Hello, my name is")
+        self.final_transcript("Cristo.")
+        await self.settle()
+        self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me, Cristo?")
+
+    async def test_a_remark_in_the_roleplay_is_not_an_introduction(self) -> None:
+        self.enter_roleplay()  # the rig starts in the icebreaker, where the same words count
+        self.final_transcript("My name is Cristo.")
+        await self.settle()
+        self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
+
+    async def test_words_that_only_look_like_an_introduction_are_not_a_name(self) -> None:
+        for text in (
+            "I taught myself Python.",
+            "This is great, honestly.",
+            "I worked at a firm where this is Salesforce.",
+            "My name is not on the list.",
+            "I'm Cristo.",
+        ):
+            with self.subTest(text=text):
+                await self.answer(text)
+                self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
+
+    async def test_a_name_that_belongs_to_the_learner_or_the_interviewer_is_not_adopted(self) -> None:
+        variant = self.interview.persona.variant
+        for name in (variant.first_name, variant.last_name, "Christy"):
+            with self.subTest(name=name):
+                await self.answer(f"Hello, my name is {name}.")
+                self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
+
+    async def test_the_guard_may_repeat_the_name_the_candidate_gave(self) -> None:
+        from r1_guard import guard_text
+        from r1_personas import PERSONAS
+
+        chosen = self.interview.persona.variant
+        # The first name of a persona this session is NOT playing: the guard blocks it in the
+        # interviewer's mouth after the reveal, unless it is the candidate's own name.
+        other = next(
+            v.first_name
+            for p in PERSONAS
+            for v in p.variants
+            if v.first_name not in (chosen.first_name, chosen.last_name)
+        )
+        engine = self.interview.engine  # built before the name is known
+        self.assertEqual(engine.candidate_first_name, "")
+        blocked = guard_text(f"Thanks, {other}.", engine.guard_context("wrapup"))
+        self.assertNotEqual(blocked.text, f"Thanks, {other}.")
+        await self.answer(f"Hi, my name is {other}.")
+        self.assertEqual(engine.candidate_first_name, other)
+        allowed = guard_text(f"Thanks, {other}.", engine.guard_context("wrapup"))
+        self.assertEqual(allowed.text, f"Thanks, {other}.")
+
+    async def test_an_engine_built_later_starts_with_the_name(self) -> None:
+        await self.answer("Hi, my name is Cristo.")
+        self.assertEqual(self.interview.engine.candidate_first_name, "Cristo")
+
+    async def test_the_name_is_never_logged(self) -> None:
+        with self.capture_logs() as logs:
+            await self.answer("Hi, my name is Cristo and I sell courses.")
+            self.interview.render_line("L-CLOSE")
+        self.assertIn("r1_spoken_name_adopted", error_types(logs))
+        self.assertNotIn("Cristo", json.dumps(logs))
+
+    async def test_no_name_is_adopted_when_the_record_has_one(self) -> None:
+        self.interview.context["first_name"] = "Asha"
+        with self.capture_logs() as logs:
+            await self.answer("Hi, my name is Cristo.")
+        self.assertNotIn("r1_spoken_name_adopted", error_types(logs))
 
 
 class TestIcebreakerEndRace(R1TestCase):

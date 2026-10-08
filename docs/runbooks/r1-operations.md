@@ -1302,6 +1302,39 @@ Only a line that reaches `session.say` can play cached audio, so the warm list (
 `L-TIME-CUE`, `L-NO-FEEDBACK` and `L-FAQ-DEFER` are never passed to `say` (the first two travel inside
 a reply stream; the third has no runtime caller), so they are not synthesised.
 
+### Interviewer lines: names, the wrap-up close and the feedback refusal (R1-Q)
+
+* **An unknown first name is not spoken.** The API sends the literal `there` when a candidate's name
+  fails its letters-only test, and six scripted lines splice the name in after a comma ("Thank you,
+  there."). `r1_script.known_first_name` treats an empty value, a rejected value, `there` (any case)
+  and a single letter as unknown, and `r1_script.line` then deletes the `{first_name}` slot together
+  with its comma: "Thank you. We'll now move to the role-play", "Hi, I'm Christy", "Are you still
+  with me?", "Welcome back.", "I'm sorry, we need to stop here". The API is unchanged. The provisional
+  `r1_lines.py` mirrors it (the drift test pins both).
+* **The name the candidate gives.** While the record has no usable name, a self-introduction in the
+  opening or the icebreaker ("my name is Cristo", "myself Cristo", "this is Cristo", after an optional
+  greeting; `r1_script.spoken_first_name`) is adopted for the lines that follow and handed to the guard
+  as the candidate's own name. It is deliberately narrow: the name must start with a capital letter
+  as the speech-to-text wrote it, be letters only (2 to 24), be the first introduction of the session
+  and not be the learner's or the interviewer's name; "I taught myself Python" and "this is great" are
+  not names. The record's name always wins. A line warmed in the cache before the name was known is
+  spoken live the first time (the cache keys on the exact text). The name is never logged: a
+  `r1_spoken_name_adopted` line (no value) marks that it happened.
+* **Acknowledgements close the wrap-up.** "Alright", "okay", "got it", "sounds good", "understood",
+  "perfect", "cool", "noted" and "great" (with or without "thank you" and the other courtesy words) now
+  count as "no more questions", like "No, that's all" and "That's it". Next to a "yes", or with any word
+  that is not courtesy ("Alright, one more question about shifts"), the turn stays a question. The model
+  is not asked to answer an acknowledgement any more, and its wrap-up replies carry a note
+  (`r1_prompts.WRAPUP_REMINDER`) that forbids thanking, goodbye and "any more questions?": the scripted
+  `L-CLOSE` is the only goodbye. Before this, the owner's session heard two.
+* **The feedback refusal ends the reply.** When the guard swaps a feedback sentence for `L-NO-FEEDBACK`,
+  nothing the model says after it is spoken (the owner heard "the hiring team" twice in one turn).
+  `L-NO-FEEDBACK` is one sentence that names the hiring team once: "I'm not able to share feedback, but
+  the hiring team will review your interview and be in touch."
+* **Content pin.** These changed pinned text: `CONTENT_REVISION` is 3 (`L-NO-FEEDBACK`,
+  `WRAPUP_REMINDER`); `docs/design/r1/R1-PLAN-final.md` carries the new `L-NO-FEEDBACK` text (a test
+  compares it). Nothing else in the lines changed.
+
 ## Incident handling and rollback
 
 For any active R1 incident, set `r1_settings.paused = true` first. Preserve

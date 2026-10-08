@@ -39,8 +39,8 @@ LINES = {
     ),
     "L-WRAP": "Before we finish, do you have any questions about the role or the next steps?",
     "L-NO-FEEDBACK": (
-        "I'm not able to share how it went. The hiring team will review the full interview "
-        "and get back to you."
+        "I'm not able to share feedback, but the hiring team will review your interview and "
+        "be in touch."
     ),
     "L-FAQ-DEFER": "That's a good question for the hiring team; they'll follow up with you on it.",
     "L-CLOSE": (
@@ -78,6 +78,8 @@ LINES = {
 }
 
 _NAME = re.compile(r"^[A-Za-z '-]{1,24}$")
+# The ``{first_name}`` slot with the comma that leads into it (mirrors ``r1_script``).
+_NAME_SLOT = re.compile(r",? \{first_name\}")
 
 
 def safe_first_name(value: object) -> str:
@@ -86,10 +88,26 @@ def safe_first_name(value: object) -> str:
     return name if _NAME.fullmatch(name) else "there"
 
 
+def known_first_name(value: object) -> str:
+    """The display-safe first name, or "" when it is unknown (empty, rejected, or "there")."""
+    name = str(value or "").strip()
+    if not _NAME.fullmatch(name) or name.lower() == "there":
+        return ""
+    return name if sum(char.isalpha() for char in name) >= 2 else ""
+
+
 def line(line_id: str, **values: object) -> str:
-    """Render a reviewed line while sanitising the only candidate-derived field."""
-    return LINES[line_id].format(
-        first_name=safe_first_name(values.get("first_name")),
+    """Render a reviewed line while sanitising the only candidate-derived field.
+
+    An unknown first name is not spoken: the slot is deleted with its comma ("Thank you,
+    {first_name}. We'll" -> "Thank you. We'll"), exactly as ``r1_script.line`` does.
+    """
+    text = LINES[line_id]
+    first_name = known_first_name(values.get("first_name"))
+    if not first_name:
+        text = _NAME_SLOT.sub("", text)
+    return text.format(
+        first_name=first_name,
         lead_name=values.get("lead_name", "Meera"),
         lead_city=values.get("lead_city", "Bengaluru"),
     )

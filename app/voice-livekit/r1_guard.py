@@ -32,7 +32,8 @@ What it blocks (each category logs as ``r1_guard_<category>``):
     on the public card.  Interviewer: salary or work-mode claims, next-step timelines
     and role facts beyond the deck's shift timings, replaced by the deferral line.
 ``feedback`` / ``hiring_comp``
-    Interviewer: feedback phrasing in wrap-up (replaced by L-NO-FEEDBACK), and hiring or
+    Interviewer: feedback phrasing in wrap-up (replaced by L-NO-FEEDBACK, and the reply ends
+    there: nothing the model says after the refusal is spoken), and hiring or
     compensation statements.  Outcomes and pay figures are always blocked; incentives,
     work mode and timelines only when the sentence is about THIS role, the future or an
     offer, so the candidate's own history ("you earned strong incentives", "you relocated
@@ -827,10 +828,15 @@ class StreamGuard:
             return []
         hits = check_sentence(sentence, self.ctx)
         out = sentence
+        # The feedback refusal is the whole answer: whatever the model says after it (in the
+        # owner's session, a paraphrase of the deferral line, "the hiring team will follow up")
+        # would say the same thing twice.  The reply ends with the refusal.
+        final = False
         if hits:
             self._hits.extend(hits)
             self._replaced = True
             out = _replacement(hits, self.ctx)
+            final = out == NO_FEEDBACK_LINE
             if out in self._replacements:
                 out = ""
             if out:
@@ -855,6 +861,8 @@ class StreamGuard:
             if self._used >= cap:
                 self._done = True
         self._emitted.append(out)
+        if final:
+            self._done = True
         return [out]
 
     def feed(self, delta: str) -> list[str]:
