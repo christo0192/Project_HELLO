@@ -715,6 +715,108 @@ test.describe('live layout with a long interview', () => {
     r1.expectHealthy();
   });
 
+  test('lines that change size after they are on screen (a web font replacing the fallback) leave the list on the newest line', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'one desktop run is enough for the behaviour');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await reachLiveWithConversation(r1);
+    const log = page.getByRole('log', { name: 'Transcript' });
+    const before = await log.evaluate((element) => ({ height: element.scrollHeight, box: element.clientHeight }));
+    expect(await log.evaluate((element) => element.scrollTop + element.clientHeight)).toBeGreaterThanOrEqual(before.height - 2);
+
+    // A web font arriving after first paint changes every line's metrics at once, with no render of
+    // ours and no change to the list's own box. Larger type does the same here on every platform
+    // (the fallback font differs from machine to machine, so a real swap may not re-wrap anything).
+    await page.addStyleTag({ content: '.r1-captions__list .candidate-caption { font-size: 21px; }' });
+    await expect
+      .poll(() => log.evaluate((element) => element.scrollHeight), { message: 'the lines re-wrapped taller' })
+      .toBeGreaterThan(before.height + 200);
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+
+    const layout = await liveLayout(page);
+    expect(layout.list!.clientHeight, 'the list box did not change').toBe(before.box);
+    expect(layout.newestLineInView, 'the list is still on the newest line').toBe(true);
+    expect(layout.list!.scrollTop + layout.list!.clientHeight).toBeGreaterThanOrEqual(layout.list!.scrollHeight - 2);
+    expect(layout.jumpButton, 'a re-wrap is not the reader scrolling away').toBeNull();
+    r1.expectHealthy();
+  });
+
+  test('the list is on the newest line the moment the briefing card is committed, not a frame later', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'one desktop run is enough for the behaviour');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await reachLiveWithConversation(r1);
+
+    // A ResizeObserver reports in the browser's NEXT rendering step, so the DOM that React has just
+    // committed is, for a while, a list that is shorter but still scrolled to its old place. Anything
+    // that looks at the page in that gap (an assistive tool, a screenshot, a test's evaluate) sees the
+    // newest line cut off, and on a loaded CI runner the gap is long enough for all of them. A
+    // MutationObserver callback runs right after the commit task, before any rendering step: it is the
+    // page as the first thing that can look at it finds it.
+    type AfterCommit = { inView: boolean; height: number };
+    await page.evaluate(() => {
+      const side = document.querySelector('.r1-live__side')!;
+      const list = document.querySelector<HTMLElement>('[role="log"]')!;
+      const seen: AfterCommit[] = [];
+      (window as unknown as { __afterCommit: AfterCommit[] }).__afterCommit = seen;
+      new MutationObserver(() => {
+        const lines = document.querySelectorAll('.candidate-caption');
+        const line = lines[lines.length - 1].getBoundingClientRect();
+        const frame = list.getBoundingClientRect();
+        seen.push({
+          inView: line.bottom <= frame.bottom + 1 && line.top >= frame.top - 1,
+          height: list.clientHeight,
+        });
+      }).observe(side, { childList: true, subtree: true, attributes: true });
+    });
+
+    await backToBriefing(r1);
+    const seen = await page.evaluate(() => (window as unknown as { __afterCommit: AfterCommit[] }).__afterCommit);
+    expect(seen.length, 'the card change was observed').toBeGreaterThan(0);
+    expect(
+      seen.map((entry) => entry.inView),
+      'the newest line was in view right after every commit',
+    ).not.toContain(false);
+
+    // The card is restyled by the commit itself. The global reduced-motion rule (this project runs
+    // under it) turns each property change into a 0.01 ms transition that lands a frame or more later,
+    // and the first style recalculation that sees it done (a measuring script, say) resizes the list a
+    // second time with nothing to say so: the heading of the card was still at the strip's 13 px
+    // while the card was already full.
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))));
+    const settled = await page.getByRole('log', { name: 'Transcript' }).evaluate((element) => element.clientHeight);
+    expect(settled, 'the list is no taller or shorter once the frames have run than it was at the commit').toBe(seen[seen.length - 1].height);
+    r1.expectHealthy();
+  });
+
+  test('holds the reader\'s place while the briefing card comes and goes', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'one desktop run is enough for the behaviour');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await reachLiveWithConversation(r1);
+    const log = page.getByRole('log', { name: 'Transcript' });
+    await log.evaluate((element) => {
+      element.scrollTop = 600;
+    });
+    await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+
+    // The list shrinks (the full card) and grows back (the strip) under a reader who is rereading.
+    await backToBriefing(r1);
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    expect(await log.evaluate((element) => Math.round(element.scrollTop))).toBe(600);
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', rpleft: '600', awaiting: '' });
+    await expect(page.getByRole('timer')).toHaveText(/Role-play/);
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    expect(await log.evaluate((element) => Math.round(element.scrollTop))).toBe(600);
+    await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+
+    // And the way back still lands on the newest line.
+    await page.getByRole('button', { name: 'Jump to latest' }).click();
+    const after = await liveLayout(page);
+    expect(after.newestLineInView).toBe(true);
+    r1.expectHealthy();
+  });
+
   test('keeps the existing caption text findable exactly once', async ({ r1 }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop', 'text lookups do not depend on the window');
     const { page } = r1;

@@ -192,6 +192,21 @@ describe('R1 live view fits the window and bounds its captions', () => {
     expect(css).toMatch(/\.r1-captions__list \{[^}]*min-height: 0;[^}]*overflow-y: auto/);
   });
 
+  it('restyles the scenario card at once, so the captions list is resized once and not again a frame later', () => {
+    // The global reduced-motion rule gives every property a 0.01 ms transition; without this the card
+    // is half restyled at the commit and finishes later, with no render and no observer callback.
+    expect(css).toMatch(/\.r1-scenario, \.r1-scenario \* \{ transition: none !important; \}/);
+  });
+
+  it('keeps the browser from moving the captions list, and gives its content one box to observe', () => {
+    // R1Captions owns the scroll position: scroll anchoring would shift it when a web font re-wraps the
+    // lines above the viewport and report that as the reader scrolling away.
+    expect(css).toMatch(/\.r1-captions__list \{[^}]*overflow-anchor: none/);
+    // The lines' bottom margins stay inside the box R1Captions observes (a margin that collapsed
+    // through it would change the content's height without changing the box).
+    expect(css).toMatch(/\.r1-captions__content \{[^}]*display: flow-root/);
+  });
+
   it('sizes the aura from the window height so the controls keep their room', () => {
     expect(css).toMatch(/\.candidate-aura \{[^}]*width: clamp\(168px, calc\(100dvh - 600px\), 420px\)/);
   });

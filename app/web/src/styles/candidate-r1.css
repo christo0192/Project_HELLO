@@ -83,6 +83,14 @@
 .r1-scenario__goal { color: var(--c-ink); font-weight: 650; }
 .r1-scenario__note { margin-top: 6px; }
 .r1-live__side .r1-scenario { flex: 0 0 auto; }
+/* The card changes size when it goes from the briefing's full form to the strip and back, and the
+   captions list beside it gives or takes that height. Nothing in it is meant to animate, but the
+   global reduced-motion rule (`* { transition-duration: .01ms !important }`) turns every property
+   change into a transition (`transition-property` is `all` by default), and even one that short
+   lands a frame or more after the commit: the card first appears half-restyled (the heading still
+   at the strip's 13px) and settles later, so the list is resized twice, the second time with no
+   render of ours and no mention in the DOM. The card restyles at once. */
+.r1-scenario, .r1-scenario * { transition: none !important; }
 /* After the briefing the card shrinks to a facts strip (name and the three facts): the role-play
    is where the captions are read, and a full card would take a third of a laptop's column. */
 .r1-scenario--compact { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 10px; padding: 10px 16px; }
@@ -106,7 +114,12 @@
 /* Captions: the card is bounded by the live view, and the list inside it is the only scroller. */
 .r1-live .candidate-interview__captions { flex: 1 1 0; min-height: 140px; padding: 20px 22px; overflow: hidden; }
 .r1-captions__body { position: relative; display: flex; flex: 1 1 auto; min-height: 0; margin-top: 14px; }
-.r1-captions__list { flex: 1 1 auto; min-height: 0; margin-top: 0; padding-right: 8px; overflow-y: auto; overscroll-behavior: contain; }
+/* The list keeps its own scroll position (R1Captions pins it to the newest line, or holds the reader's
+   place), so the browser must not move it as well: scroll anchoring would shift it when the lines
+   above re-wrap (a web font arriving) and report that as the reader scrolling away. The content box
+   is what R1Captions observes for a change of size; flow-root keeps the lines' bottom margins inside it. */
+.r1-captions__list { flex: 1 1 auto; min-height: 0; margin-top: 0; padding-right: 8px; overflow-y: auto; overflow-anchor: none; overscroll-behavior: contain; }
+.r1-captions__content { display: flow-root; }
 .r1-captions__list:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 2px; border-radius: 10px; }
 .r1-captions__jump { position: absolute; right: 14px; bottom: 10px; min-height: 40px; padding: 0 16px; border: 0; border-radius: 999px; background: var(--c-accent); color: var(--c-data-label-inside); font: inherit; font-size: 13px; font-weight: 700; box-shadow: 0 6px 16px rgb(78 107 166 / .28); cursor: pointer; }
 .r1-captions__jump:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 3px; }

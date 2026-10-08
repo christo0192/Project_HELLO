@@ -25,6 +25,20 @@ function countAfter(captions: readonly R1Caption[], anchorId: string | null): nu
  *     the button unmounts and a keyboard user must not be dropped on the page.
  *   - The list is focusable (`tabIndex`) so a keyboard user can scroll it with the arrow keys.
  *
+ * Staying on the newest line while the list RESIZES. Three things change the height of the list
+ * or of what is in it without a new caption arriving: a sibling renders (the scenario card grows
+ * to its briefing form and takes room from the column), a web font arrives and the lines wrap
+ * differently, and the window or the scrollbar changes the width. A list that is pinned must be
+ * on the newest line after each of them, so:
+ *   - every commit of this component re-pins a pinned list in a layout effect, which is the
+ *     moment the DOM is final and before the browser can run any other task or paint. A
+ *     ResizeObserver alone is too late for a render caused by a parent: its callback runs in the
+ *     next rendering step, and anything that looks at the page in between (a test, an assistive
+ *     tool, a screenshot) sees the newest line cut off;
+ *   - a ResizeObserver on the list (its viewport) AND on its content re-pins for the changes no
+ *     render of ours announces (a font swap, a resize of the window, a scroll bar appearing).
+ *     Observing the list alone misses content that grows inside a box that keeps its size.
+ *
  * Screen readers. A caption keeps growing while it is interim, and a live region that sees its
  * text change reads the whole paragraph again. So the log is a polite region that announces
  * ADDITIONS only, and a line is added to the accessibility tree only once it is final: an
@@ -33,6 +47,7 @@ function countAfter(captions: readonly R1Caption[], anchorId: string | null): nu
  */
 export function R1Captions({ captions }: R1CaptionsProps) {
   const listRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement>(null);
   const stuckRef = useRef(true);
   // Where WE last put the list. A browser reports a programmatic scroll later, in its next
   // rendering step, by when the box may have changed height (the scenario card appeared and
@@ -51,20 +66,25 @@ export function R1Captions({ captions }: R1CaptionsProps) {
     pinnedTopRef.current = element.scrollTop;
   }
 
-  // Follow new and growing lines while the reader is at the end.
+  // After EVERY commit, not only one that changed the captions: the parent re-renders this
+  // component when the box around it changed (a new caption, the scenario card, the phase), and
+  // the list has then already been given its new height. A reader who scrolled away is left alone.
   useLayoutEffect(() => {
     if (stuckRef.current) pinToEnd();
-  }, [captions]);
+  });
 
-  // The box can change height under a pinned log (the scenario card appears at the briefing and
-  // takes room from it): stay on the newest line. jsdom has no ResizeObserver.
+  // What no render announces: a web font replacing the fallback re-wraps every line, a window
+  // resize changes the width, a scroll bar appears. The list and its content are both watched,
+  // because a box that keeps its size can hold content that does not. jsdom has no ResizeObserver.
   useEffect(() => {
-    const element = listRef.current;
-    if (!element || typeof ResizeObserver === 'undefined') return undefined;
+    const list = listRef.current;
+    const content = contentRef.current;
+    if (!list || !content || typeof ResizeObserver === 'undefined') return undefined;
     const observer = new ResizeObserver(() => {
       if (stuckRef.current) pinToEnd();
     });
-    observer.observe(element);
+    observer.observe(list);
+    observer.observe(content);
     return () => observer.disconnect();
   }, []);
 
@@ -106,22 +126,24 @@ export function R1Captions({ captions }: R1CaptionsProps) {
           tabIndex={0}
           onScroll={onScroll}
         >
-          {captions.length === 0 ? (
-            <p className="candidate-muted">Listening for the interviewer…</p>
-          ) : (
-            captions.map((caption) => (
-              <p
-                className="candidate-caption"
-                key={caption.final ? `${caption.id}:final` : caption.id}
-                aria-hidden={caption.final ? undefined : true}
-              >
-                <small data-speaker={caption.speaker}>
-                  {R1_CAPTION_SPEAKER_LABELS[caption.speaker]}
-                </small>
-                {caption.text}
-              </p>
-            ))
-          )}
+          <div ref={contentRef} className="r1-captions__content">
+            {captions.length === 0 ? (
+              <p className="candidate-muted">Listening for the interviewer…</p>
+            ) : (
+              captions.map((caption) => (
+                <p
+                  className="candidate-caption"
+                  key={caption.final ? `${caption.id}:final` : caption.id}
+                  aria-hidden={caption.final ? undefined : true}
+                >
+                  <small data-speaker={caption.speaker}>
+                    {R1_CAPTION_SPEAKER_LABELS[caption.speaker]}
+                  </small>
+                  {caption.text}
+                </p>
+              ))
+            )}
+          </div>
         </div>
         {awayFrom && (
           <button type="button" className="r1-captions__jump" onClick={jumpToLatest}>

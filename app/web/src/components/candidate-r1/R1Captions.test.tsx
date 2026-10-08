@@ -1,6 +1,6 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { R1Caption } from '../../lib/r1/r1-phase';
 import { R1Captions } from './R1Captions';
 
@@ -254,6 +254,143 @@ describe('R1Captions scrolling', () => {
     }));
     rerender(<R1Captions captions={later} />);
     expect(screen.getByRole('button', { name: 'Jump to latest (3 new)' })).toBeVisible();
+  });
+});
+
+/**
+ * jsdom has no ResizeObserver. This one records what is observed and reports a resize of one
+ * element on demand, to the observers that watch it, the way a browser does after layout.
+ */
+class FakeResizeObserver {
+  static instances: FakeResizeObserver[] = [];
+
+  readonly targets = new Set<Element>();
+
+  readonly callback: ResizeObserverCallback;
+
+  constructor(callback: ResizeObserverCallback) {
+    this.callback = callback;
+    FakeResizeObserver.instances.push(this);
+  }
+
+  observe(target: Element): void {
+    this.targets.add(target);
+  }
+
+  unobserve(target: Element): void {
+    this.targets.delete(target);
+  }
+
+  disconnect(): void {
+    this.targets.clear();
+  }
+
+  static resize(target: Element): void {
+    for (const observer of FakeResizeObserver.instances) {
+      if (observer.targets.has(target)) {
+        observer.callback(
+          [{ target } as ResizeObserverEntry],
+          observer as unknown as ResizeObserver,
+        );
+      }
+    }
+  }
+}
+
+describe('R1Captions when the list changes size', () => {
+  beforeEach(() => {
+    FakeResizeObserver.instances = [];
+    vi.stubGlobal('ResizeObserver', FakeResizeObserver);
+  });
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /** A pinned list on forty lines, with its geometry faked. */
+  function pinnedList() {
+    const current = lines(40);
+    const view = render(<R1Captions captions={current} />);
+    const log = screen.getByRole('log');
+    const scroll = fakeGeometry(log, { scrollHeight: 2000, clientHeight: 300 });
+    view.rerender(<R1Captions captions={lines(40)} />);
+    expect(scroll.top).toBe(1700);
+    return { ...view, log, scroll, content: log.firstElementChild as HTMLElement };
+  }
+
+  it('watches the list and the box its lines are in', () => {
+    const { log, content, unmount } = pinnedList();
+    expect(content).toHaveClass('r1-captions__content');
+    expect(content.querySelectorAll('.candidate-caption')).toHaveLength(40);
+    const watched = new Set(FakeResizeObserver.instances.flatMap((observer) => [...observer.targets]));
+    expect(watched).toEqual(new Set([log, content]));
+    unmount();
+    expect(FakeResizeObserver.instances.every((observer) => observer.targets.size === 0)).toBe(true);
+  });
+
+  it('stays on the newest line when a parent re-render shrinks the list, before any observer reports it', () => {
+    const { rerender, scroll } = pinnedList();
+    // The scenario card grows to its briefing form and takes 150 px from the list. The captions
+    // are the very same array: only the box around them changed, in the commit of the parent.
+    const same = lines(40);
+    rerender(<R1Captions captions={same} />);
+    scroll.geometry.clientHeight = 150;
+    rerender(<R1Captions captions={same} />);
+    expect(scroll.top).toBe(1850);
+  });
+
+  it('stays on the newest line when the list box shrinks and the observer reports it', () => {
+    const { log, scroll } = pinnedList();
+    scroll.geometry.clientHeight = 100;
+    FakeResizeObserver.resize(log);
+    expect(scroll.top).toBe(1900);
+  });
+
+  it('stays on the newest line when the lines re-wrap inside a list that keeps its size', () => {
+    const { scroll, content } = pinnedList();
+    // The web font arrives: every line is a little wider, so the content is 400 px taller. The
+    // list box is the same height and there is no new caption, so only the content's own resize
+    // can tell the component.
+    scroll.geometry.scrollHeight = 2400;
+    FakeResizeObserver.resize(content);
+    expect(scroll.top).toBe(2100);
+    expect(screen.queryByRole('button', { name: /Jump to latest/ })).toBeNull();
+  });
+
+  it('holds a reader who scrolled up in place through every one of those changes', () => {
+    const { rerender, log, scroll, content } = pinnedList();
+    scroll.scrollTo(200);
+    expect(screen.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+
+    const same = lines(40);
+    scroll.geometry.clientHeight = 150;
+    rerender(<R1Captions captions={same} />);
+    FakeResizeObserver.resize(log);
+    scroll.geometry.scrollHeight = 2400;
+    FakeResizeObserver.resize(content);
+    rerender(<R1Captions captions={same} />);
+
+    expect(scroll.top).toBe(200);
+    expect(screen.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+
+    // And the way back still works, onto the newest line of the list as it is now.
+    scroll.geometry.scrollHeight = 2480;
+    rerender(<R1Captions captions={lines(41)} />);
+    expect(scroll.top).toBe(200);
+    expect(screen.getByRole('button', { name: 'Jump to latest (1 new)' })).toBeVisible();
+  });
+
+  it('follows again after the reader returns to the end, through the next resize', () => {
+    const { rerender, log, scroll } = pinnedList();
+    scroll.scrollTo(0);
+    expect(screen.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+    scroll.scrollTo(1700);
+    expect(screen.queryByRole('button', { name: /Jump to latest/ })).toBeNull();
+
+    scroll.geometry.clientHeight = 120;
+    FakeResizeObserver.resize(log);
+    expect(scroll.top).toBe(1880);
+    rerender(<R1Captions captions={lines(40)} />);
+    expect(scroll.top).toBe(1880);
   });
 });
 

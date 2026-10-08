@@ -85,9 +85,22 @@ export interface R1Harness extends AppHarness {
   mock: MockRemote;
 }
 
+/**
+ * Opt-in: `E2E_CPU_THROTTLE=4` slows the page's main thread 4x (Chromium DevTools protocol), the
+ * way a loaded CI runner does, so a test that only passes when the browser is quick shows itself
+ * on a developer machine too. Unset, or 1, changes nothing.
+ */
+async function throttleCpu(page: Page): Promise<void> {
+  const rate = Number(process.env.E2E_CPU_THROTTLE ?? 1);
+  if (!(rate > 1)) return;
+  const session = await page.context().newCDPSession(page);
+  await session.send('Emulation.setCPUThrottlingRate', { rate });
+}
+
 export const test = base.extend<{ r1: R1Harness }>({
   r1: [
     async ({ page }, use, testInfo) => {
+      await throttleCpu(page);
       const state = createR1State();
       const harness = await installHarness(page, testInfo, { signedIn: false, api: r1Router(state) });
       await use(Object.assign(harness, { state, mock: remote(page) }));
