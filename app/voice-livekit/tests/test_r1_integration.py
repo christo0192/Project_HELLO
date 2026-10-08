@@ -739,7 +739,9 @@ class TestOwedMoves(unittest.IsolatedAsyncioTestCase):
         spoken = await rig.converse("The curriculum covers python and sql modules.", advance=100)
         plan = rig.plan()
         self.assertIs(plan.mode, TurnMode.INTENT)
-        self.assertTrue(spoken.startswith("Okay, I see."))
+        # The fake model says "Okay, I see." every turn; the style rules take a repeated "Okay," off
+        # (R1-Q iteration 1), so the reaction is either form.
+        self.assertTrue(spoken.startswith(("Okay, I see.", "I see.")), spoken)
         self.assertTrue(spoken.endswith(plan.intent.fallback))
         self.assertEqual(plan.move_id, rig.engine.scheduler.deliveries()[-1].move_id)
         self.assertEqual(rig.engine.admin_log()["intents"]["fallback_appended"], {plan.move_id: 1})

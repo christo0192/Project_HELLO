@@ -52,7 +52,13 @@ import r1_world
 # learner branch's 3..8: L-NO-FEEDBACK is one short refusal that does not name the hiring team
 # (L-CLOSE is the one mention of who reviews the interview), and the wrap-up reply note
 # (r1_prompts.WRAPUP_REMINDER) forbids a goodbye.  CONTENT_REVISION = max(8, 3) + 1.
-PINNED_CONTENT_SHA256 = "c00ff14acb19e36f1570913c372ed9d5bf6db1f5d42ed17361249635bd98985b"
+# Revision 10 (R1-Q learner iteration 1, owner decisions of 2026-10-08): no scripted or prompted
+# "hmm"/"honestly" (prefix, hints, fillers, the rotating opening-style notes, the guard's style rules),
+# a warm confirmation once a call is booked (CONFIRM_NOTE, CONFIRM_FALLBACKS), the decision maker on
+# the public card and in DECIDER_ASKED_NOTE, the $7,000 anchor is never an offer
+# (ANCHOR_NOT_OFFERED_NOTE, ANCHOR_REPLACEMENT), "I can check with my manager" grants nothing
+# (TRY_NOT_GRANTED_NOTE, GRATITUDE_REPLACEMENT) and the time cue is the learner's own next call.
+PINNED_CONTENT_SHA256 = "a2f516e8f0b49a83f3d38a3e4d43d69917e4d22666dd1a95237e9ceb7d287d77"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -365,6 +371,79 @@ class PinTests(unittest.TestCase):
         self.assertEqual(prompts["email_offer_note"], r1_prompts.EMAIL_OFFER_NOTE)
         self.assertIn("how their last point lands for you", prompts["checkin_note"])
         self.assertNotIn("something you liked", json.dumps(manifest))
+
+    def test_the_manifest_covers_the_iteration_one_texts(self):
+        manifest = r1_content.manifest()
+        self.assertGreaterEqual(manifest["revision"], 10)
+        prompts = manifest["prompts"]
+        self.assertEqual(prompts["style_notes"], list(r1_prompts.STYLE_NOTES))
+        self.assertEqual(prompts["confirm_note"], r1_prompts.CONFIRM_NOTE)
+        self.assertEqual(prompts["anchor_not_offered_note"], r1_prompts.ANCHOR_NOT_OFFERED_NOTE)
+        self.assertEqual(prompts["try_not_granted_note"], r1_prompts.TRY_NOT_GRANTED_NOTE)
+        self.assertIn("I'd talk it over with my husband first.", prompts["decider_asked_note"])
+        self.assertIn(r1_prompts.CONFIRM_NOTE, prompts["confirm_reminder_sample"])
+        self.assertIn(r1_prompts.STYLE_NOTES[1], prompts["style_reminder_sample"])
+        guard = manifest["guard"]
+        self.assertEqual(guard["confirm_fallbacks"], list(r1_guard.CONFIRM_FALLBACKS))
+        self.assertEqual(guard["anchor_replacement"], r1_guard.ANCHOR_REPLACEMENT)
+        self.assertEqual(guard["gratitude_replacement"], r1_guard.GRATITUDE_REPLACEMENT)
+        self.assertEqual(guard["style"]["tic_window"], r1_guard.STYLE_TIC_WINDOW)
+        for text in prompts["learner_prefixes"].values():
+            self.assertIn("who else is involved in your decision", text)
+
+    def test_editing_an_iteration_one_text_or_style_constant_changes_the_sha(self):
+        base = r1_content.content_sha256()
+        edits = (
+            (r1_prompts, "CONFIRM_NOTE", r1_prompts.CONFIRM_NOTE + " "),
+            (r1_prompts, "ANCHOR_NOT_OFFERED_NOTE", r1_prompts.ANCHOR_NOT_OFFERED_NOTE + " "),
+            (r1_prompts, "TRY_NOT_GRANTED_NOTE", r1_prompts.TRY_NOT_GRANTED_NOTE + " "),
+            (r1_prompts, "STYLE_NOTES", r1_prompts.STYLE_NOTES[:-1] + ("- Plain.",)),
+            (r1_guard, "ANCHOR_REPLACEMENT", r1_guard.ANCHOR_REPLACEMENT + " "),
+            (r1_guard, "GRATITUDE_REPLACEMENT", r1_guard.GRATITUDE_REPLACEMENT + " "),
+            (r1_guard, "CONFIRM_FALLBACKS", r1_guard.CONFIRM_FALLBACKS[:-1] + ("Fine.",)),
+            (r1_guard, "STYLE_TIC_WINDOW", r1_guard.STYLE_TIC_WINDOW + 1),
+            (r1_guard, "STYLE_OPENER_WINDOW", r1_guard.STYLE_OPENER_WINDOW + 1),
+        )
+        for module, name, value in edits:
+            original = getattr(module, name)
+            try:
+                setattr(module, name, value)
+                self.assertNotEqual(r1_content.content_sha256(), base, name)
+            finally:
+                setattr(module, name, original)
+        self.assertEqual(r1_content.content_sha256(), base)
+
+    def test_no_pinned_learner_text_teaches_the_tics(self):
+        """No pinned text the learner is prompted with or speaks carries "hmm" or "honestly" outside
+        double quotes (the style note that names them does it as an example to avoid)."""
+        import re
+
+        from r1_text import TIC_PATTERNS
+
+        quoted = re.compile(r'"[^"]*"')
+        manifest = r1_content.manifest()
+        pieces = [
+            *manifest["script"]["lines"].values(),
+            *manifest["script"]["learner_filler_variants"],
+            manifest["script"]["learner_filler_short"],
+            *(item for move in manifest["scheduler"]["moves"] for item in (move["line"], move["brief"], *move["variants"])),
+            *(item for spec in manifest["negotiation"]["specs"] for item in (spec["brief"], *spec["variants"])),
+            *(item for counter in manifest["negotiation"]["counters"] for item in (counter["brief"], *counter["variants"])),
+            *(item for anchor in manifest["negotiation"]["anchor_after_offer"] for item in (anchor["brief"], *anchor["variants"])),
+            *(text for text in manifest["prompts"]["learner_prefixes"].values()),
+            *(note for note in manifest["prompts"]["style_notes"]),
+            manifest["prompts"]["confirm_note"],
+            manifest["prompts"]["decider_asked_note"],
+            manifest["prompts"]["try_not_granted_note"],
+            manifest["prompts"]["anchor_not_offered_note"],
+        ]
+        for persona in manifest["personas"].values():
+            for need in persona["needs"]:
+                pieces.extend((need["surface"], need["hint"]))
+        for piece in pieces:
+            bare = quoted.sub(" ", piece)
+            for tic, pattern in TIC_PATTERNS.items():
+                self.assertIsNone(pattern.search(bare), (tic, piece[:80]))
 
     def test_editing_the_backstory_a_filler_or_the_policy_changes_the_sha(self):
         base = r1_content.content_sha256()

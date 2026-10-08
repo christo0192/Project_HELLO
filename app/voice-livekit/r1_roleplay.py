@@ -81,7 +81,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any
+from typing import Any, Iterable
 
 from r1_commitment import (
     COMMIT_STALL_R_SEC,
@@ -104,6 +104,7 @@ from r1_guard import (
     has_concession,
 )
 from r1_negotiation import (
+    ANCHOR_USD,
     COMMIT_REACTION_BRIEF,
     KIND_COMMIT,
     KIND_STALL,
@@ -120,14 +121,18 @@ from r1_negotiation import (
     fill_decision_maker,
     filled_markers,
 )
-from r1_personas import RenderedPersona
+from r1_personas import H_TOPICS, RenderedPersona
 from r1_prompts import (
+    ANCHOR_NOT_OFFERED_NOTE,
     CHECKIN_DONE_NOTE,
     CHECKIN_NOTE,
+    DECIDER_ASKED_NOTE,
     EMAIL_AGAIN_NOTE,
     EMAIL_OFFER_NOTE,
     NEXT_STEP_PROPOSED_NOTE,
     RESOLVED_NOTE,
+    STYLE_NOTES,
+    TRY_NOT_GRANTED_NOTE,
     control_prose,
     interviewer_prefix,
     learner_prefix,
@@ -158,11 +163,14 @@ from r1_text import (
     normalize,
     pick_variant,
     repeat_kind,
+    reply_opener,
+    reply_tics,
     split_sentences,
     word_count,
 )
 from r1_tracker import (
     CoverageTracker,
+    NeedState,
     build_judge_messages,
     detect_character_break,
     parse_judge_output,
@@ -180,6 +188,10 @@ FIDELITY_MIN_R_SEC = 600
 KIND_OBJECTION = "objection"
 KIND_REDIRECT = "redirect"
 KIND_CUE = "cue"
+# How many of the learner's last replies the style rules look back over (``r1_guard``).
+STYLE_HISTORY = 8
+# Situation notes that belong to a free reply: an intent has its own brief to voice.
+_FREE_REPLY_NOTES = frozenset({ANCHOR_NOT_OFFERED_NOTE, TRY_NOT_GRANTED_NOTE})
 
 
 class TurnMode(str, Enum):
@@ -310,6 +322,13 @@ class RolePlayEngine:
         self._notes: list[str] = []
         self._new_offer_usd: int | None = None
         self._force_curiosity = False
+        # R1-Q iteration 1.  How the learner's replies opened and which tic words they held
+        # (the style rules vary the next reply), the ask that could not be answered before the
+        # close window (a farewell inside the window answers it), and whether the advisor only
+        # said they would check on the price (nothing granted: no thanks for a discount).
+        self._styles: list[tuple[str, tuple[str, ...]]] = []
+        self._pending_ask: AskKind | None = None
+        self._nothing_granted = False
 
     # ------------------------------------------------------------------- properties
     @property
@@ -331,6 +350,10 @@ class RolePlayEngine:
         on_record = self._commitment_level
         return Level.WEAK if on_record is None else max(Level.WEAK, on_record)
 
+    def _confirming(self) -> bool:
+        """A call or a start is agreed (MEDIUM or STRONG on record): the learner only confirms."""
+        return self._commitment_level in (Level.MEDIUM, Level.STRONG)
+
     def guard_context(
         self,
         phase: str = "roleplay",
@@ -339,6 +362,8 @@ class RolePlayEngine:
         turn: int | None = None,
         reminder: str | None = None,
         quiet_empty: bool = False,
+        released: Iterable[str] | None = None,
+        confirm: bool = False,
     ) -> GuardContext:
         """The guard context for an LLM reply now.
 
@@ -347,8 +372,19 @@ class RolePlayEngine:
         ``quiet_empty`` is for an intent reply: an empty result stays empty, because the
         session appends the intent's own scripted variant instead of "Sorry, what were you
         saying?".
+
+        ``released`` (a plan's own call) is the deep needs that may be told in THIS reply, the ones
+        the turn asked about: a need told earlier is not told again, and one never asked about
+        is never dumped (R1-Q iteration 1).  Without it every unlocked need counts as released.
         """
-        released = self.tracker.gate.released_topics if mode == "reply" else frozenset()
+        if mode != "reply":
+            released_topics: frozenset[str] = frozenset()
+        elif released is None:
+            released_topics = self.tracker.gate.released_topics
+        else:
+            released_topics = frozenset(released)
+        gate = self.tracker.gate
+        spent = frozenset(topic for topic in H_TOPICS if gate.state(topic) is NeedState.REVEALED)
         if phase == "roleplay":
             control = (self._learner_control,)
             if reminder:
@@ -359,7 +395,7 @@ class RolePlayEngine:
             phase=phase,
             persona=self.persona,
             candidate_first_name=self.candidate_first_name,
-            released_topics=released,
+            released_topics=released_topics,
             advisor_amounts=frozenset(self._advisor_amounts),
             mode=mode,
             commitment_cap=self._commitment_cap(),
@@ -370,6 +406,11 @@ class RolePlayEngine:
             seed=self.seed,
             variant=self._fallbacks,
             quiet_empty=quiet_empty,
+            spent_topics=spent,
+            nothing_granted=self._nothing_granted,
+            recent_styles=tuple(self._styles[-STYLE_HISTORY:]),
+            confirm=confirm,
+            offer_usd=self.negotiation.best_offer_usd,
         )
 
     def filler_text(self) -> str:
@@ -377,7 +418,7 @@ class RolePlayEngine:
 
         A variant whose sentences the learner already played is skipped (a slow provider makes
         the fourth filler repeat the first word for word); when all of them were played the
-        filler is the one-word "Hmm...", which can never be a repeat.
+        filler is the short "One moment...", which can never be a repeat.
         """
         said = self._spoken.snapshot()
         text = LEARNER_FILLER_SHORT
@@ -408,6 +449,7 @@ class RolePlayEngine:
         turn = self.turn
         self.last_r = r_sec
         self._notes = []
+        self._nothing_granted = False
         self._force_curiosity = False
         if turn_index is not None:
             self._turn_map[turn] = turn_index
@@ -418,6 +460,7 @@ class RolePlayEngine:
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
         self._advisor_amounts.update(dollar_amounts(candidate_text))
         negotiated = self._observe_negotiation(candidate_text, turn)
+        self._note_situation(negotiated)
         self._note_curiosity_covered(candidate_text)
         ask = detect_ask(candidate_text)
         wants = ask.kind if ask is not None else None
@@ -429,10 +472,23 @@ class RolePlayEngine:
         if break_kind:
             reasons.append(f"character_break:{break_kind}")
         self._break_kind = break_kind
+        # A proposal the learner could not answer before the close window is still open when the
+        # advisor says goodbye inside it: the farewell answers as the ask would have (a strong
+        # advisor closing at 11:20 after an early proposal used to get the WEAK stall).
+        farewell_ask = (
+            wants is None
+            and signals.close_attempt
+            and self._pending_ask is not None
+            and self.scheduler.commit_permitted(r_sec)
+            and not (self.negotiation.resolved or self.commitment_resolved)
+        )
+        if farewell_ask:
+            wants = self._pending_ask
+            reasons.append("pending_ask_at_farewell")
         decision = None
         if signals.close_attempt:
             decision = self.scheduler.register_close_attempt(r_sec)
-            if decision.action == "exit":
+            if decision.action == "exit" and not farewell_ask:
                 self.exit_requested = True
                 reasons.append("close_attempt_exit")
                 return self._plan(TurnMode.EXIT, reasons)
@@ -575,6 +631,24 @@ class RolePlayEngine:
         self._new_offer_usd = seen.offers[-1].net_usd if seen.offers else None
         return seen
 
+    def _note_situation(self, seen: NegotiationTurn) -> None:
+        """Worker notes for what this advisor turn did that the learner must not misread.
+
+        Who else decides is always the persona's decision maker (a model answered "it's just me
+        deciding" and, two minutes later, "I'd want to talk to my husband first"); the $7,000 is the
+        learner's own number until the advisor plainly offers it (a model said "Oh, $7,000, that's
+        better than I expected" after raising it itself); and "I can check with my manager" grants
+        nothing (the judge flagged the thanks that followed it).
+        """
+        if seen.decider_asked:
+            self._notes.append(DECIDER_ASKED_NOTE.format(answer=self.persona.decider_answer))
+        best = self.negotiation.best_offer_usd
+        if seen.anchor_mentioned and (best is None or best > ANCHOR_USD):
+            self._notes.append(ANCHOR_NOT_OFFERED_NOTE)
+        if seen.tentative:
+            self._notes.append(TRY_NOT_GRANTED_NOTE)
+            self._nothing_granted = True
+
     def _evidence(self, kind: AskKind) -> CommitmentEvidence:
         """The commitment evidence, with the stall reasons the advisor handled added."""
         return replace(
@@ -622,6 +696,7 @@ class RolePlayEngine:
             return None
         if wants is not None:
             if not self.scheduler.commit_permitted(r_sec):
+                self._pending_ask = wants  # open until the close window (a farewell answers it)
                 owed = self.scheduler.select(r_sec)
                 if owed is not None and (owed.forced or owed.family == "F4"):
                     # The owed objection lands in context (the advisor just proposed a next
@@ -635,6 +710,7 @@ class RolePlayEngine:
                 self._stalls += 1
                 reasons.append("ask_before_close_window")
                 return self._reason_plan(reasons, **layers)
+            self._pending_ask = None
             level = grade(self._evidence(wants))
             reasons.append(f"ask_in_window:grade_{level.name.lower()}")
             if level > Level.WEAK:
@@ -936,6 +1012,23 @@ class RolePlayEngine:
         kind = None if aside else self._break_kind
         price_wrap = self.scheduler.price_wrap_turn == self.scheduler.turn
         if mode in (TurnMode.INTENT, TurnMode.LLM_REPLY):
+            # After a MEDIUM or STRONG commitment a free reply only confirms it: no new doubt,
+            # no probe answered, no curiosity (in the smoke test the learner answered the
+            # advisor's confirmation with "hold on, what would that call involve?").
+            confirm = mode is TurnMode.LLM_REPLY and self._confirming()
+            if confirm:
+                first_probes = ()
+                reveal_topics = ()
+                curiosity = ""
+            # One opening style per free reply, rotated (an intent opens with its own reaction).
+            style_note = (
+                pick_variant(STYLE_NOTES, self.seed, self.turn)
+                if mode is TurnMode.LLM_REPLY
+                else ""
+            )
+            notes = tuple(
+                note for note in self._notes if intent is None or note not in _FREE_REPLY_NOTES
+            )
             # The layers are handed over only here, on the turn that asked about the topic.
             self.tracker.gate.mark_hint_offered(first_probes)
             self.tracker.gate.mark_deep_offered(reveal_topics)
@@ -954,11 +1047,17 @@ class RolePlayEngine:
                 offer_usd=self.negotiation.best_offer_usd,
                 # The anchor already reacts to the price on the table: no "pleasant surprise".
                 new_offer_usd=None if move_id == F1_ANCHOR else self._new_offer_usd,
-                notes=tuple(self._notes),
+                notes=notes,
                 reaction_only=intent is not None and intent.kind == KIND_COMMIT,
+                style_note=style_note,
+                confirm=confirm,
             )
             ctx = self.guard_context(
-                mode="reply", reminder=reminder, quiet_empty=mode is TurnMode.INTENT
+                mode="reply",
+                reminder=reminder,
+                quiet_empty=mode is TurnMode.INTENT,
+                released=reveal_topics,
+                confirm=confirm,
             )
         else:
             ctx = self.guard_context(mode="reply")
@@ -1032,6 +1131,8 @@ class RolePlayEngine:
         when = self.last_r if r_sec is None else r_sec
         cap = self._commitment_cap()  # the level on record BEFORE this turn's line
         self._spoken.add(spoken_text)
+        if spoken_text.strip():
+            self._styles.append((reply_opener(spoken_text), reply_tics(spoken_text)))
         self.tracker.note_learner_text(spoken_text, plan.turn)
         self.negotiation.note_learner_text(spoken_text)
         if plan.move_id is not None:

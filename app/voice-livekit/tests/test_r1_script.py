@@ -189,7 +189,7 @@ class RenderTests(unittest.TestCase):
                          "Atlanta, Georgia")
 
     def test_fillers_follow_the_voice(self):
-        self.assertEqual(filler_line("learner"), "Hmm, one second...")
+        self.assertEqual(filler_line("learner"), "One second...")
         self.assertEqual(filler_line("interviewer"), "Let me think about that for a second.")
 
     def test_line_sha_is_the_digest_of_the_exact_text(self):

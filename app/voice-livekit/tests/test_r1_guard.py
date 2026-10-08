@@ -10,7 +10,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import r1_guard
-from r1_commitment import Level
+from r1_commitment import Level, classify_learner_commitment
 from r1_guard import (
     ACK_WORD_CAP,
     FALLBACK_REPLIES,
@@ -27,7 +27,7 @@ from r1_guard import (
     log_keys,
 )
 from r1_personas import PERSONAS, resolve_persona
-from r1_text import SpokenMemory
+from r1_text import SpokenMemory, normalize
 from r1_world import INTERVIEWER_DEFLECTION
 
 ALL_PHASES = (
@@ -919,10 +919,11 @@ class AckHygieneTests(unittest.TestCase):
     def test_only_hygiene_categories_are_outside_the_leak_categories(self):
         self.assertEqual(
             set(r1_guard.CATEGORIES) - set(r1_guard.LEAK_CATEGORIES),
-            {r1_guard.ACK_FORMAT, r1_guard.REPEAT},
+            {r1_guard.ACK_FORMAT, r1_guard.REPEAT, r1_guard.REOPEN, r1_guard.MISREAD},
         )
         self.assertEqual(
-            r1_guard.HYGIENE_CATEGORIES, frozenset({r1_guard.ACK_FORMAT, r1_guard.REPEAT})
+            r1_guard.HYGIENE_CATEGORIES,
+            frozenset({r1_guard.ACK_FORMAT, r1_guard.REPEAT, r1_guard.REOPEN, r1_guard.MISREAD}),
         )
 
 
@@ -1354,6 +1355,281 @@ class RoleplayAnnouncementTests(unittest.TestCase):
         for _ in range(3):
             ledger.record(guard_text(self.ANNOUNCEMENTS[0], ctx("icebreaker")))
         self.assertTrue(ledger.flagged)
+
+
+class SpeakingStyleGuardTests(unittest.TestCase):
+    """R1-Q iteration 1 (owner decision b.1): a tic word ("hmm", "honestly") is kept at most once in
+    five replies, a reply holds one filler, and a repeated reaction opener is taken off.  Pure text
+    surgery on the learner's free replies: nothing is added, nothing costs a model call."""
+
+    P1 = resolve_persona("p1_career_switcher", variant="v1")
+
+    def ctx(self, styles=(), **kwargs):
+        return GuardContext(
+            phase="roleplay", persona=self.P1, mode="reply", seed="s", turn=4,
+            recent_styles=tuple(styles), **kwargs,
+        )
+
+    def test_a_first_tic_is_kept_a_recent_one_is_taken_out(self):
+        fresh = guard_text("Hmm, that makes sense.", self.ctx())
+        self.assertEqual(fresh.text, "Hmm, that makes sense.")
+        self.assertEqual(fresh.style_edits, 0)
+        recent = guard_text("Hmm, that makes sense.", self.ctx([("hmm", ("hmm",))]))
+        self.assertEqual(recent.text, "That makes sense.")
+        self.assertEqual(recent.style_edits, 1)
+        self.assertTrue(recent.clean)  # never a hit
+
+    def test_each_tic_has_its_own_quota(self):
+        styles = [("hmm", ("hmm",))]
+        result = guard_text("Honestly, I am not sure yet.", self.ctx(styles))
+        self.assertEqual(result.text, "Honestly, I am not sure yet.")
+        result = guard_text("Honestly, I am not sure yet.", self.ctx(styles + [("honestly", ("honestly",))]))
+        self.assertEqual(result.text, "I am not sure yet.")
+
+    def test_a_reply_never_holds_two_fillers(self):
+        for text, expected in (
+            ("Hmm, honestly I am not sure.", "Hmm, I am not sure."),
+            ("Hmm, well, I am not sure.", "Hmm, I am not sure."),
+            ("Honestly, you know, it is a lot.", "Honestly, it is a lot."),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx()).text, expected)
+
+    def test_a_tic_in_the_middle_of_a_sentence_goes_too(self):
+        styles = [("hmm", ("hmm",)), ("honestly", ("honestly",))]
+        result = guard_text("My schedule is packed, honestly, and money is tight.", self.ctx(styles))
+        self.assertEqual(result.text, "My schedule is packed, and money is tight.")
+        result = guard_text("That is a lot of money, to be honest.", self.ctx(styles))
+        self.assertNotIn("honest", result.text.lower())
+
+    def test_a_reaction_opener_used_in_the_last_six_replies_is_taken_off(self):
+        styles = [("okay", ()), ("who", ()), ("right", ())]
+        result = guard_text("Okay, how long does the course take?", self.ctx(styles))
+        self.assertEqual(result.text, "How long does the course take?")
+        result = guard_text("Sure, how long does the course take?", self.ctx(styles))
+        self.assertEqual(result.text, "Sure, how long does the course take?")  # not used lately
+
+    def test_a_word_that_belongs_to_the_sentence_is_never_taken_for_an_interjection(self):
+        styles = [("right", ()), ("so", ()), ("well", ()), ("sure", ()), ("look", ())]
+        for text in (
+            "Right now I only have a few minutes.",
+            "So far it sounds good to me.",
+            "Well done on the explanation.",
+            "Sure enough, the price is a lot.",
+            "Look at my schedule, it is packed.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx(styles)).text, text)
+        self.assertEqual(
+            guard_text("Right, that makes sense to me.", self.ctx(styles)).text,
+            "That makes sense to me.",
+        )
+
+    def test_a_demonstrative_opener_is_varied_too_and_the_chain_ends(self):
+        styles = [("okay", ()), ("that", ())]
+        result = guard_text("Okay, that is really helpful to know.", self.ctx(styles))
+        self.assertEqual(result.text, "Really helpful to know.")
+
+    def test_nothing_is_stripped_down_to_a_fragment(self):
+        styles = [("okay", ()), ("hmm", ("hmm",))]
+        for text in ("Okay, I see.", "Hmm, okay.", "Okay."):
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx(styles))
+                self.assertTrue(result.text.strip(), text)
+                self.assertGreaterEqual(len(result.text.split()), 1)
+
+    def test_a_bare_hmm_becomes_a_neutral_acknowledgement_when_it_is_not_allowed(self):
+        result = guard_text("Hmm.", self.ctx([("hmm", ("hmm",))]))
+        self.assertIn(result.text, NEUTRAL_ACKS)
+
+    def test_acknowledgements_and_the_interviewer_are_never_varied(self):
+        styles = [("hmm", ("hmm",)), ("okay", ())]
+        ack = GuardContext(phase="roleplay", persona=self.P1, mode="ack", recent_styles=tuple(styles))
+        self.assertEqual(guard_text("Hmm.", ack).text, "Hmm.")
+        interviewer = GuardContext(phase="opening", recent_styles=tuple(styles))
+        self.assertEqual(guard_text("Hmm, okay, tell me more.", interviewer).text, "Hmm, okay, tell me more.")
+
+    def test_the_streamed_form_varies_the_same_way(self):
+        guard = StreamGuard(self.ctx([("hmm", ("hmm",))]))
+        out = []
+        for delta in ("Hmm, that makes", " sense. Honestly,", " I am not sure."):
+            out.extend(guard.feed(delta))
+        out.extend(guard.flush())
+        self.assertEqual(" ".join(out), "That makes sense. Honestly, I am not sure.")
+        self.assertEqual(guard.result.style_edits, 1)
+
+    def test_the_ledger_counts_style_edits_apart_from_hits(self):
+        ledger = GuardLedger()
+        ledger.record(guard_text("Hmm, that makes sense.", self.ctx([("hmm", ("hmm",))])))
+        summary = ledger.summary()
+        self.assertEqual(summary["style_edits"], 1)
+        self.assertEqual(summary["hits"], 0)
+
+    def test_a_scripted_line_with_no_tics_passes_untouched(self):
+        for text in ("One second...", "Let me think for a second...", "Give me a moment...", "One moment..."):
+            self.assertEqual(guard_text(text, self.ctx([("hmm", ("hmm",))])).text, text)
+
+
+class MisreadAndReopenGuardTests(unittest.TestCase):
+    """R1-Q iteration 1: hygiene rules for the live misfires.  They never count toward the gate."""
+
+    P1 = resolve_persona("p1_career_switcher", variant="v1")
+
+    def ctx(self, **kwargs):
+        return GuardContext(phase="roleplay", persona=self.P1, mode="reply", seed="s", turn=4, **kwargs)
+
+    def rules(self, text, **kwargs):
+        return [hit.rule for hit in check_sentence(text, self.ctx(**kwargs))]
+
+    def test_the_new_categories_are_hygiene(self):
+        self.assertIn(r1_guard.REOPEN, r1_guard.HYGIENE_CATEGORIES)
+        self.assertIn(r1_guard.MISREAD, r1_guard.HYGIENE_CATEGORIES)
+        ledger = GuardLedger()
+        for _ in range(5):
+            ledger.record(guard_text("Hold on, what would that call involve?", self.ctx(confirm=True)))
+        self.assertFalse(ledger.flagged)
+        self.assertEqual(ledger.leak_total, 0)
+        self.assertEqual(ledger.counts.get("reopen"), 5)
+
+    def test_the_time_cue_is_the_learners_own(self):
+        for text in (
+            "You mentioned you only have a couple of minutes.",
+            "Right, you said you only have a few minutes before another call.",
+            "You've only got a couple of minutes, I know.",
+            "You told me you have a next call soon, so I will be quick.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("time_cue_reversed", self.rules(text))
+        for text in (
+            "I only have a couple of minutes before my next call.",
+            "Just so you know, I've only got a couple of minutes before my next call.",
+            "You said the course is six months, right?",
+            "You mentioned live classes. Are they recorded?",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("time_cue_reversed", self.rules(text))
+
+    def test_deciding_alone_contradicts_the_card(self):
+        for text in (
+            "It's just me deciding, really.",
+            "It is only me who decides.",
+            "I decide on my own.",
+            "Nobody else is involved in the decision.",
+            "No one else decides this for me.",
+            "I don't need to ask anyone about it.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("decider_alone", self.rules(text))
+        for text in (
+            "I'd talk it over with my husband first.",
+            "I'd like to run it by my husband, since we decide together.",
+            "It's my decision in the end, but I'd talk to him first.",
+            "Nobody else has asked me about it yet.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("decider_alone", self.rules(text))
+
+    def test_gratitude_for_nothing_only_when_nothing_was_granted(self):
+        thanks = "Thank you so much, that helps a lot."
+        self.assertNotIn("gratitude_for_nothing", self.rules(thanks))
+        for text in (thanks, "Great news!", "That's better than I expected.", "Thanks for the discount."):
+            with self.subTest(text=text):
+                self.assertIn("gratitude_for_nothing", self.rules(text, nothing_granted=True))
+        for text in ("Thanks for checking on that.", "I appreciate you looking into it.", "That would be good to know."):
+            with self.subTest(text=text):
+                self.assertNotIn("gratitude_for_nothing", self.rules(text, nothing_granted=True))
+
+    def test_the_anchor_is_an_offer_only_when_the_advisor_offered_it(self):
+        text = "Oh, $7,000, that's better than I expected."
+        self.assertIn("anchor_taken_as_offer", self.rules(text))
+        self.assertIn("anchor_taken_as_offer", self.rules(text, offer_usd=8500))
+        self.assertNotIn("anchor_taken_as_offer", self.rules(text, offer_usd=7000))
+        self.assertNotIn("anchor_taken_as_offer", self.rules(text, offer_usd=6500))
+        self.assertNotIn("anchor_taken_as_offer", self.rules("I heard people paid about $7,000."))
+
+    def test_a_confirmation_holds_no_question_and_no_doubt(self):
+        for text in (
+            "Hold on, what would that call involve?",
+            "What will we talk about?",
+            "I'm not sure about the timing.",
+            "I'm a bit worried about that.",
+            "I have a few concerns.",
+            "Wait, can we move it?",
+            "I'd rather do it later.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("confirm_only", self.rules(text, confirm=True))
+                self.assertNotIn("confirm_only", self.rules(text))
+        for text in (
+            "Sounds good, thank you.",
+            "I can't wait to get started.",
+            "No worries at all, thanks.",
+            "Looking forward to it.",
+            "Great, talk to you Thursday then.",
+            "We can wait for your email.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("confirm_only", self.rules(text, confirm=True))
+
+    def test_each_misread_has_a_replacement_that_is_not_the_misreading(self):
+        cases = (
+            ("Oh, $7,000, that's better than I expected.", {}, r1_guard.ANCHOR_REPLACEMENT),
+            ("Thank you so much, that helps a lot.", {"nothing_granted": True}, r1_guard.GRATITUDE_REPLACEMENT),
+            ("It's just me deciding, really.", {}, self.P1.decider_answer),
+            ("You mentioned you only have a couple of minutes.", {}, ""),
+        )
+        for text, kwargs, expected in cases:
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx(**kwargs, quiet_empty=True))
+                self.assertEqual(result.text, expected)
+                self.assertTrue(result.replaced)
+                self.assertEqual(result.hits[0].category, r1_guard.MISREAD)
+
+    def test_the_confirm_fallback_is_warm_and_rotates(self):
+        self.assertTrue(
+            all("forward" in t.lower() or "talk to you" in t.lower() for t in r1_guard.CONFIRM_FALLBACKS)
+        )
+        first = guard_text("Hold on, what would that call involve?", self.ctx(confirm=True, variant=0))
+        self.assertTrue(first.fallback_used)
+        self.assertIn(first.text, r1_guard.CONFIRM_FALLBACKS)
+        again = guard_text(
+            "Hold on, what would that call involve?",
+            self.ctx(confirm=True, variant=0, said=(normalize(first.text),)),
+        )
+        self.assertIn(again.text, r1_guard.CONFIRM_FALLBACKS)
+        self.assertNotEqual(again.text, first.text)
+
+    def test_the_confirm_fallbacks_are_ascii_and_within_the_recorded_commitment(self):
+        for text in r1_guard.CONFIRM_FALLBACKS:
+            text.encode("ascii")
+            self.assertLessEqual(classify_learner_commitment(text), Level.MEDIUM, text)
+            self.assertFalse(has_concession(text), text)
+            self.assertFalse(r1_guard.check_sentence(text, self.ctx(confirm=True, commitment_cap=Level.MEDIUM)), text)
+
+    def test_a_spent_need_is_dropped_not_swapped_for_the_surface_answer(self):
+        deep = "My plant is being consolidated next year."
+        swapped = guard_text(deep, self.ctx())
+        self.assertEqual(swapped.text, self.P1.surface("H1"))
+        dropped = guard_text(deep, self.ctx(spent_topics=frozenset({"H1"}), quiet_empty=True))
+        self.assertEqual(dropped.text, "")
+        self.assertEqual(dropped.hits[0].category, r1_guard.VOLUNTEERED_NEED)
+
+    def test_the_new_patterns_are_fast_on_hostile_text(self):
+        import time
+
+        hostile = (
+            "you mentioned " * 4000,
+            "it's just me " * 4000,
+            "thank you " * 4000,
+            ("you said " + "x " * 30) * 800,
+            "hold on wait " * 4000,
+            "i " * 20000,
+        )
+        for text in hostile:
+            with self.subTest(prefix=text[:20]):
+                started = time.perf_counter()
+                check_sentence(text, self.ctx(confirm=True, nothing_granted=True))
+                self.assertLess(time.perf_counter() - started, 2.0)
 
 
 if __name__ == "__main__":

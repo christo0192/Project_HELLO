@@ -158,7 +158,12 @@ class LearnerPrefixTests(unittest.TestCase):
         self.assertIn("Talk like a real person on a phone call", prefix)
         self.assertIn("under 25 words", prefix)
         self.assertIn("contractions", prefix)
-        self.assertIn('"hmm"', prefix)
+        # R1-Q iteration 1: the prefix no longer teaches the tics it used to ask for (44 of 90
+        # live replies started with "Hmm"); it asks for a varied start and never two fillers.
+        self.assertNotIn('"hmm"', prefix)
+        self.assertNotIn("honestly", prefix.split("YOUR CARD")[0].lower())
+        self.assertIn("Vary how you start", prefix)
+        self.assertIn("never use two filler words", prefix)
         self.assertIn("react to what the advisor just said before you answer", prefix)
         self.assertIn("ask a short follow-up question when you are curious", prefix)
         self.assertIn("careful about time and money", prefix)
@@ -503,7 +508,7 @@ class NotesTests(unittest.TestCase):
         # R1-Q: no scripted "Okay, that's helpful" any more (owner test turn 59): an honest
         # reaction in the learner's own words.
         self.assertNotIn("Okay, that's helpful", PRICE_WRAP_NOTE)
-        self.assertIn("React honestly to their last answer", PRICE_WRAP_NOTE)
+        self.assertIn("React to their last answer", PRICE_WRAP_NOTE)
         self.assertIn("do not accept, concede or push", PRICE_WRAP_NOTE)
         for word in RUBRIC_WORDS:
             self.assertNotRegex(PRICE_WRAP_NOTE, rf"\b{re.escape(word)}\b", word)
@@ -771,6 +776,106 @@ class AssembleTests(unittest.TestCase):
         for messages in (first, second):
             self.assertTrue({m["role"] for m in messages} <= {"system", "user", "assistant"})
         self.assertEqual(assemble_messages("P", [], "x", None)[-2:][0]["content"], "P")
+
+
+class IterationOneNotesTests(unittest.TestCase):
+    """R1-Q iteration 1: the style rotation, the confirmation reminder and the situation notes."""
+
+    def test_the_confirm_reminder_asks_for_a_warm_short_reply_and_nothing_new(self):
+        from r1_prompts import CONFIRM_NOTE, IGNORE_RULE_NOTE, NEXT_STEP_NOTE
+
+        text = turn_reminder(
+            P1, r_sec=700, confirm=True, intent_brief="you raise a worry", curiosity="the weekly hours"
+        )
+        self.assertIn(CONFIRM_NOTE, text)
+        self.assertIn(IGNORE_RULE_NOTE, text)
+        self.assertNotIn("you raise a worry", text)  # an intent never rides on a confirmation
+        self.assertNotIn("weekly hours", text)
+        self.assertNotIn(NEXT_STEP_NOTE, text)
+        self.assertIn("looking forward", text)
+        self.assertIn("Do not raise a new worry", text)
+
+    def test_the_confirm_reminder_still_carries_style_and_situation_notes(self):
+        from r1_prompts import CONFIRM_NOTE, RESOLVED_NOTE, STYLE_NOTES
+
+        text = turn_reminder(P1, r_sec=700, confirm=True, style_note=STYLE_NOTES[0], notes=(RESOLVED_NOTE,))
+        self.assertIn(STYLE_NOTES[0], text)
+        self.assertIn(RESOLVED_NOTE, text)
+        self.assertTrue(text.index(CONFIRM_NOTE) < text.index(STYLE_NOTES[0]))
+
+    def test_a_style_note_rides_on_a_free_reply_and_an_intent_alike(self):
+        from r1_prompts import STYLE_NOTES
+
+        for kwargs in ({}, {"intent_brief": "you raise a worry"}):
+            text = turn_reminder(P1, r_sec=100, style_note=STYLE_NOTES[1], **kwargs)
+            self.assertIn(STYLE_NOTES[1], text)
+        self.assertNotIn(STYLE_NOTES[1], turn_reminder(P1, r_sec=100))
+
+    def test_no_prompt_text_teaches_a_tic(self):
+        """The prefix and every reminder note keep "hmm"/"honestly" out of the instruction prose (the
+        style note that names them does so inside quotes, as an example to avoid)."""
+        from r1_prompts import (
+            ANCHOR_NOT_OFFERED_NOTE, CONFIRM_NOTE, DECIDER_ASKED_NOTE, STYLE_NOTES, TRY_NOT_GRANTED_NOTE,
+        )
+        from r1_text import TIC_PATTERNS
+
+        texts = [control_prose(learner_prefix(P1)), CONFIRM_NOTE, ANCHOR_NOT_OFFERED_NOTE, TRY_NOT_GRANTED_NOTE]
+        texts.extend(control_prose(note) for note in STYLE_NOTES)
+        texts.append(control_prose(DECIDER_ASKED_NOTE.format(answer=P1.decider_answer)))
+        texts.append(control_prose(turn_reminder(P1, r_sec=100, offer_usd=8500, price_wrap=True)))
+        for text in texts:
+            for tic, pattern in TIC_PATTERNS.items():
+                with self.subTest(tic=tic, text=text[:60]):
+                    self.assertIsNone(pattern.search(text))
+
+    def test_there_are_enough_distinct_styles_and_each_is_short(self):
+        from r1_prompts import STYLE_NOTES
+
+        self.assertGreaterEqual(len(STYLE_NOTES), 6)
+        self.assertEqual(len(set(STYLE_NOTES)), len(STYLE_NOTES))
+        for note in STYLE_NOTES:
+            self.assertTrue(note.startswith("- "))
+            self.assertLessEqual(len(note.split()), 30)
+            note.encode("ascii")
+
+    def test_the_decider_note_quotes_the_card_answer_for_every_persona(self):
+        from r1_prompts import DECIDER_ASKED_NOTE
+
+        for persona in PERSONAS:
+            rendered = resolve_persona(persona.id, variant="v1")
+            note = DECIDER_ASKED_NOTE.format(answer=rendered.decider_answer)
+            self.assertIn(f'"{rendered.decider_answer}"', note)
+            self.assertIn(rendered.decision_maker, note)
+            self.assertIn("on your own", note)
+
+    def test_a_natural_reply_to_each_new_note_is_not_an_instruction_echo(self):
+        """The suggested wording sits in double quotes, so saying it is never a control echo."""
+        from r1_guard import echo_detected
+        from r1_prompts import ANCHOR_NOT_OFFERED_NOTE, CONFIRM_NOTE, DECIDER_ASKED_NOTE, TRY_NOT_GRANTED_NOTE
+
+        controls = tuple(
+            control_prose(text)
+            for text in (
+                learner_prefix(P1), CONFIRM_NOTE, ANCHOR_NOT_OFFERED_NOTE, TRY_NOT_GRANTED_NOTE,
+                DECIDER_ASKED_NOTE.format(answer=P1.decider_answer),
+            )
+        )
+        for reply in (
+            "That would be good to know.",
+            P1.decider_answer,
+            "Nobody else is involved in the decision.",
+            "Sounds good, thank you. I'm looking forward to it.",
+            "It is only the number I heard from someone.",
+            "Thanks, I will talk it over with my husband first.",
+        ):
+            with self.subTest(reply=reply):
+                self.assertFalse(echo_detected(reply, controls))
+
+    def test_the_prefix_says_the_anchor_is_never_an_offer_and_the_decider_matches_the_card(self):
+        prefix = learner_prefix(P1)
+        self.assertIn("never an offer until the advisor plainly offers it", prefix)
+        self.assertIn("who decides, and who you would talk to, always matches your card", prefix)
+        self.assertIn(P1.decider_answer, prefix)
 
 
 if __name__ == "__main__":

@@ -157,7 +157,7 @@ PLAN: tuple[MoveSpec, ...] = (
             ),
         ),
         variants=(
-            "Honestly, I can find a lot of this for free online. What would I be paying for?",
+            "I can find a lot of this for free online. What would I be paying for?",
             "I keep seeing free courses everywhere, so why would I pay for this one?",
         ),
     ),
@@ -233,7 +233,7 @@ PLAN: tuple[MoveSpec, ...] = (
             ),
         ),
         variants=(
-            "Honestly my schedule is pretty packed, and six months feels like a long time to "
+            "My schedule is pretty packed, and six months feels like a long time to "
             "keep up.",
             "I'm quite busy as it is, so I'm worried about keeping up with this for six months.",
         ),
@@ -273,7 +273,7 @@ PLAN: tuple[MoveSpec, ...] = (
         must_say=("$9,000", "$7,000"),
         markers=((r"(?<![\d,])7,?000\b", r"\bseven thousand\b", r"\b7k\b"),),
         variants=(
-            "Honestly $9,000 feels like a lot, and I heard some people paid around $7,000. "
+            "$9,000 feels like a lot, and I heard some people paid around $7,000. "
             "Can you match that?",
             "$9,000 is a big number for me, and I read people got this for about $7,000. "
             "Is that possible?",
@@ -387,7 +387,10 @@ PLAN: tuple[MoveSpec, ...] = (
         TIME_CUE_LINE,
         None,
         False,
-        brief="you mention that you only have a couple of minutes before your next call",
+        brief=(
+            "you tell the advisor that YOU only have a couple of minutes left before YOUR own "
+            "next call; it is your time that is short, not theirs"
+        ),
         markers=(
             (
                 r"\bminutes?\b",
@@ -518,6 +521,12 @@ _NAME_TAIL = (
 # What may follow "thanks for your time" in a sign-off: well wishes, an invitation to get back
 # ("let me know what you decide", "I hope this helps you decide", "no pressure, take your time",
 # "looking forward to hearing from you").  A statement about the programme is not one.
+# What may follow the opening words of a sign-off: a few more words, never a sentence that goes on
+# to the next topic ("Let me know if anything is unclear as I walk you through the fees").
+_SIGN_OFF_TAIL = (
+    r"(?:(?!\b(?:next|now|then|because|while|where|walk|explain|cover|so let|as i|and i|"
+    r"coming|moving)\b)[^?.!]){0,60}"
+)
 _CLOSING_COURTESY = (
     r"(?:good luck|best of luck|all the best|enjoy|feel free|please (?:reach|feel)|reach out|"
     r"let me know|let us know|i hope (?:this|that|it) (?:helps|helped|was|makes)|"
@@ -525,16 +534,16 @@ _CLOSING_COURTESY = (
     r"it was (?:nice|great|a pleasure|good|lovely)|(?:a )?pleasure|no pressure|no rush|"
     r"take your time|whenever you(?:'re| are)? ready|when you(?:'re| are) ready|"
     r"don'?t hesitate|(?:keep|stay) in touch|see you)\b"
-    r"[^?]*"
+    + _SIGN_OFF_TAIL
 )
 _CLOSING_PROMISE = (
     r"(?:i|we)(?:'ll| will| can)\s+(?:send|follow|be in touch|get back|have|email|reach|call|"
     r"look|keep|check|share|forward|get|text|ping|connect|let you know|talk|speak|catch)\b"
-    r"[^?]*"
+    + _SIGN_OFF_TAIL
 )
 _CLOSING_SENTENCE = re.compile(
     r"^(?:(?:and|so|okay|ok|great|sure|alright)[,\s]+)*(?:" + _CLOSING_COURTESY + r"|"
-    + _CLOSING_PROMISE + r")",
+    + _CLOSING_PROMISE + r")[\s.!]*$",
     re.IGNORECASE,
 )
 _FAREWELL_TAIL = (
@@ -547,8 +556,9 @@ _CLOSE_FAREWELL = _compile(
     r"\b(?:good ?bye|bye(?: bye)?)\b" + _FAREWELL_TAIL,
     r"\btake care(?:\s+of\s+your(?:self|selves))?\b" + _FAREWELL_TAIL,
     r"\b(?:talk|speak)(?: to you)? soon\b" + _FAREWELL_TAIL,
-    r"\bhave a (?:great|good|nice|wonderful|lovely) "
-    r"(?:day|evening|night|one|week|weekend)\b" + _FAREWELL_TAIL,
+    r"\bhave a (?:great|good|nice|wonderful|lovely|fantastic|amazing) "
+    r"(?:rest of (?:your|the) )?(?:day|workday|work ?week|evening|night|one|week|weekend)\b"
+    + _FAREWELL_TAIL,
     r"\bi'?ll let you go\b" + _FAREWELL_TAIL,
     r"\bthat'?s all (?:from me|i have)\b" + _FAREWELL_TAIL,
     r"\b(?:let'?s|we can|i'?ll|i will) wrap (?:this|it|things) up(?: here| now| for today)?\b"
@@ -563,6 +573,8 @@ _CLOSE_THANKS = _compile(
 )
 CLOSE_MIN_R_SEC = 60
 CLOSE_THANKS_MIN_R_SEC = 240
+# A farewell comes last: a runaway turn is read from its end (and the reading stays linear).
+CLOSE_MAX_CHARS = 12000
 STT_TAIL_MIN_OTHER_WORDS = 20
 STT_TAIL_MAX_WORDS = 4
 # After "thanks for your time" only a word or two ("Bye.", "Take care.") may follow.
@@ -711,6 +723,10 @@ def _asks_something(sentence: str) -> bool:
 # Trail-off fillers only.  Courtesies ("thank you", "thanks a lot", "alright then") are not here:
 # "Thank you so much, bye." ends a long wrap-up and is a real goodbye (R1-Q round 2).
 _STT_TAIL_WORDS = frozenset("bye so yeah yes okay ok um uh hmm well".split())
+# A tail trails off ("So yeah. Bye"); "Okay. Bye." has no trail-off word and is a goodbye.
+_TRAIL_OFF_WORDS = frozenset("so yeah yes um uh hmm well".split())
+# A lone acknowledgement before the "bye" is a wrap-up: "Okay. Bye." is a goodbye.
+_WRAP_UP_WORDS = frozenset("okay ok alright all right great perfect cool sure fine then".split())
 
 
 _WORD_TOKEN = re.compile(r"[A-Za-z0-9']+")
@@ -738,11 +754,17 @@ def _strip_stt_bye_tail(text: object) -> str:
         or words[-1] != "bye"
         or len(words) > STT_TAIL_MAX_WORDS
         or any(word not in _STT_TAIL_WORDS for word in words)
+        or not (
+            all(word == "bye" for word in words) or any(word in _TRAIL_OFF_WORDS for word in words)
+        )
     ):
         return folded
     head = " ".join(sentences[:-1])
     if word_count(head) < STT_TAIL_MIN_OTHER_WORDS:
         return folded
+    wrap_up = [match.group(0).lower() for match in _WORD_TOKEN.finditer(sentences[-2])]
+    if wrap_up and all(word in _WRAP_UP_WORDS for word in wrap_up):
+        return folded  # "... Okay. Bye." wraps up: the advisor is leaving
     return head
 
 
@@ -762,17 +784,27 @@ def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
     if r_sec is not None and r_sec < CLOSE_MIN_R_SEC:
         return False
     thanks_allowed = r_sec is None or r_sec >= CLOSE_THANKS_MIN_R_SEC
-    sentences = _sentences(_strip_stt_bye_tail(text))
+    sentences = _sentences(_strip_stt_bye_tail(fold(text)[-CLOSE_MAX_CHARS:]))
+    count = len(sentences)
+    # What follows each sentence, worked out once from the end (two passes over the sentences, not
+    # one pass per sentence): whether a later sentence asks something, and whether every later
+    # sentence is a sign-off tail.
+    asks_after = [False] * (count + 1)
+    closing_after = [True] * (count + 1)
+    for index in range(count - 1, -1, -1):
+        asks_after[index] = asks_after[index + 1] or _asks_something(sentences[index])
+        closing_after[index] = closing_after[index + 1] and (
+            not thanks_allowed or _is_closing_tail(sentences[index])
+        )
     for index, sentence in enumerate(sentences):
-        later_sentences = sentences[index + 1 :]
-        if any(_asks_something(later) for later in later_sentences):
+        if asks_after[index + 1]:
             continue
         if any(pattern.search(sentence) for pattern in _CLOSE_FAREWELL):
             return True
         if (
             thanks_allowed
+            and closing_after[index + 1]
             and any(pattern.search(sentence) for pattern in _CLOSE_THANKS)
-            and all(_is_closing_tail(later) for later in later_sentences)
         ):
             return True
     return False

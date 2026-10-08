@@ -1473,11 +1473,27 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   hiring team will review your interview and get back to you."), so a candidate who asks for feedback
   hears it once. (The first R1-Q wording also said "the hiring team will review your interview and be in
   touch", which put the same sentence twice, a few seconds apart, in front of the close.)
-* **Content pin.** These changed pinned text: `CONTENT_REVISION` is 3 (`L-NO-FEEDBACK`,
-  `WRAPUP_REMINDER`; revision 3 has not shipped, main is at 2, so the review round re-pinned it instead
-  of taking a fourth); `docs/design/r1/R1-PLAN-final.md` carries the new `L-NO-FEEDBACK` text (a test
-  compares it). If the learner branch (R1-Q S01) also bumps the revision, the second merge takes one
-  more bump and a recomputed `PINNED_CONTENT_SHA256`. Nothing else in the lines changed.
+* **Content pin.** Any pinned text change bumps `CONTENT_REVISION` and the recomputed
+  `PINNED_CONTENT_SHA256` (`tests/test_r1_content_pin.py`; the history of every revision is in the comment
+  blocks of that test and of `r1_content.py`). PR-B's own revision 3 (`L-NO-FEEDBACK`, `WRAPUP_REMINDER`)
+  joined the learner branch's revisions at 9 in the merge of main; learner iteration 1 (R1-Q S01, owner
+  decisions of 2026-10-08) is revision 10: no scripted or prompted "hmm"/"honestly", a rotating
+  opening-style note per free reply, a warm confirmation once a call is booked, the decision maker on the
+  public card, the $7,000 anchor never an offer, "I can check with my manager" grants nothing, and the
+  time cue is the learner's own next call. `docs/design/r1/R1-PLAN-final.md` carries the `L-NO-FEEDBACK`
+  text (a test compares it). Check the pin comment and `CONTENT_REVISION` after every merge of main: a
+  second branch that also changed pinned text takes one more bump and a recomputed hash.
+* **Learner speaking style (R1-Q iteration 1).** The guard now also varies the learner's free replies,
+  deterministically and with no extra model call: a tic word ("hmm", "honestly") is kept at most once in
+  five replies and never twice in one, and a reaction opener ("Okay,", "Right,", "That's") used in the last
+  six replies is taken off. Style edits are counted in the guard summary (`style_edits`), never posted and
+  never a leak. Two new HYGIENE categories join `ack_format` and `repeat`: `reopen` (a question or a doubt
+  after a MEDIUM or STRONG call was booked: the reply becomes a warm confirmation) and `misread` (the
+  $7,000 taken for an offer, thanks for a discount nobody granted, "it's just me deciding", the time cue
+  turned round). They show as `r1_guard_reopen` / `r1_guard_misread` log keys, count toward nothing and are
+  not posted to the API (`HYGIENE_CATEGORIES`). The rehearsal scorecard gates the tics (no reaction word on
+  more than 15 % of the replies, "hmm" and "honestly" on at most 20 % each); reply length is information
+  only.
 
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 

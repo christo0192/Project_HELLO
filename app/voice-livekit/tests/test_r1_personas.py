@@ -615,5 +615,48 @@ class FollowUpScopeTests(unittest.TestCase):
                 self.assertEqual(gate.released_count, 0)
 
 
+class DeciderAnswerTests(unittest.TestCase):
+    """R1-Q iteration 1 (owner decision b.3): the card names who else decides, so the learner who is
+    asked never says "it's just me deciding" and later "I'd talk to my husband"."""
+
+    def test_every_card_has_one_public_decider_answer(self):
+        for persona in PERSONAS:
+            with self.subTest(persona=persona.id):
+                rendered = resolve_persona(persona.id, variant="v1")
+                card = rendered.public_card_text()
+                self.assertEqual(card.count(rendered.decider_answer), 1)
+                self.assertIn("who else is involved in your decision", card)
+                self.assertEqual(rendered.decider_answer, f"I'd talk it over with my {persona.decision_maker} first.")
+
+    def test_the_decider_answer_is_not_a_secret_a_number_or_a_commitment(self):
+        for persona in PERSONAS:
+            rendered = resolve_persona(persona.id, variant="v1")
+            with self.subTest(persona=persona.id):
+                self.assertEqual(deep_need_topics_in(rendered, rendered.decider_answer), frozenset())
+                self.assertEqual(detect_probes(rendered.decider_answer), frozenset())
+                self.assertNotRegex(rendered.decider_answer, r"\d")
+                rendered.decider_answer.encode("ascii")
+
+    def test_it_is_the_same_person_in_the_card_and_the_owed_objection(self):
+        from r1_scheduler import F4_PUSH, OwedMoveScheduler
+
+        for persona in PERSONAS:
+            rendered = resolve_persona(persona.id, variant="v1")
+            move = OwedMoveScheduler(rendered.decision_maker)._states[F4_PUSH]
+            with self.subTest(persona=persona.id):
+                self.assertIn(rendered.decision_maker, move.text)
+                self.assertIn(rendered.decision_maker, rendered.decider_answer)
+
+    def test_the_hints_carry_no_tic_word(self):
+        from r1_text import TIC_PATTERNS
+
+        for persona in PERSONAS:
+            for need in persona.needs:
+                for tic, pattern in TIC_PATTERNS.items():
+                    with self.subTest(persona=persona.id, topic=need.topic, tic=tic):
+                        self.assertIsNone(pattern.search(need.hint))
+                        self.assertIsNone(pattern.search(need.surface))
+
+
 if __name__ == "__main__":
     unittest.main()

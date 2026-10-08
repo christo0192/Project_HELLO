@@ -51,7 +51,12 @@ import r1_world
 # 9: merge of origin/main (R1-Q PR-B #369) into the learner branch: PR-B's revision 3 joins 3..8
 #    above (L-NO-FEEDBACK is one short refusal that does not name the hiring team, L-CLOSE is the
 #    one mention of who reviews the interview; the wrap-up reply note forbids a goodbye).
-CONTENT_REVISION = 9
+# 10: R1-Q learner iteration 1 (owner decisions of 2026-10-08): the learner no longer teaches
+#    itself "hmm"/"honestly" (prefix, scripted lines, hints, fillers; a rotating opening-style note
+#    and the guard's style rules), a warm confirmation after a booked call (never a new doubt), the
+#    decision maker on the public card and in a note, the $7,000 anchor is never an offer, "I can
+#    check with my manager" grants nothing, the time cue is the learner's own next call.
+CONTENT_REVISION = 10
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -192,6 +197,14 @@ def manifest() -> dict[str, Any]:
             "no_feedback": r1_guard.NO_FEEDBACK_LINE,
             "contact": r1_guard.CONTACT_REPLACEMENT,
             "neutral_acks": list(r1_guard.NEUTRAL_ACKS),
+            "anchor_replacement": r1_guard.ANCHOR_REPLACEMENT,
+            "gratitude_replacement": r1_guard.GRATITUDE_REPLACEMENT,
+            "confirm_fallbacks": list(r1_guard.CONFIRM_FALLBACKS),
+            "style": {
+                "tic_window": r1_guard.STYLE_TIC_WINDOW,
+                "opener_window": r1_guard.STYLE_OPENER_WINDOW,
+                "max_chars": r1_guard.STYLE_MAX_CHARS,
+            },
             "reply_word_cap": r1_guard.REPLY_WORD_CAP,
             "ack_word_cap": r1_guard.ACK_WORD_CAP,
             "flag_threshold": r1_guard.HIT_FLAG_THRESHOLD,
@@ -239,6 +252,19 @@ def manifest() -> dict[str, Any]:
                 notes=(r1_prompts.RESOLVED_NOTE, r1_prompts.CHECKIN_NOTE),
             ),
             "reaction_only_sample": r1_prompts.turn_reminder(sample, r_sec=0, reaction_only=True),
+            "confirm_reminder_sample": r1_prompts.turn_reminder(
+                sample, r_sec=0, confirm=True, style_note=r1_prompts.STYLE_NOTES[0]
+            ),
+            "style_reminder_sample": r1_prompts.turn_reminder(
+                sample, r_sec=0, style_note=r1_prompts.STYLE_NOTES[1]
+            ),
+            "style_notes": list(r1_prompts.STYLE_NOTES),
+            "confirm_note": r1_prompts.CONFIRM_NOTE,
+            "decider_asked_note": r1_prompts.DECIDER_ASKED_NOTE.format(
+                answer=sample.decider_answer
+            ),
+            "anchor_not_offered_note": r1_prompts.ANCHOR_NOT_OFFERED_NOTE,
+            "try_not_granted_note": r1_prompts.TRY_NOT_GRANTED_NOTE,
             "character_break_note": r1_prompts.CHARACTER_BREAK_NOTE,
             "intent_price_note": r1_prompts.INTENT_PRICE_NOTE,
             "price_wrap_note": r1_prompts.PRICE_WRAP_NOTE,

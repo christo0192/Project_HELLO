@@ -25,7 +25,7 @@ Invariants (each has a test in ``tests/test_r1_negotiation.py``):
   before the anchor an amount needs a pricing word (R1-Q round 2).
 * A pitch about the programme ("you can book a slot with a mentor every week", "we'll send you the
   link to the live class") is neither a callback nor an e-mail offer (``r1_commitment.
-  is_call_proposal``, R1-Q round 2).
+  call_proposal_in``, R1-Q round 2 and iteration 1).
 * The commitment lines stay scripted and masked (``r1_commitment``); this module only picks the
   slot of the MEDIUM line (the advisor's evening or weekend proposal, else 7 PM) and whether
   the WEAK line was already said.  The WEAK line is said at most once per session.
@@ -40,12 +40,14 @@ from typing import Any, Iterable
 
 from r1_commitment import (
     DEFAULT_SLOT,
+    AskKind,
     Level,
     around,
+    ask_acts,
+    call_proposal_in,
     describes_programme,
-    is_call_proposal,
 )
-from r1_scheduler import has_refusal, markers_match
+from r1_scheduler import has_refusal, is_close_attempt, markers_match
 from r1_text import (
     canonical_amounts,
     clause_after,
@@ -164,7 +166,7 @@ SPECS: tuple[NegotiationSpec, ...] = (
             ),
         ),
         (
-            "I'm not ready to decide today, to be honest. I'd rather not rush into this.",
+            "I'm not ready to decide today. I'd rather not rush into this.",
             "That feels like a lot too fast. I need some more time before I decide anything.",
             "I don't want to rush into it, so let me take some time to think it over.",
         ),
@@ -192,7 +194,7 @@ SPECS: tuple[NegotiationSpec, ...] = (
             ),
         ),
         (
-            "Honestly, the cost is still weighing on me. I'd need to work out how I could "
+            "The cost is still weighing on me. I'd need to work out how I could "
             "manage the payment.",
             "It's a lot of money to commit, so I'm not sure about the payment side yet.",
             "I'm still worried about the cost, and I'd have to see how I could afford it.",
@@ -377,7 +379,7 @@ def anchor_after_offer(offer_usd: int) -> AnchorSituation:
             (
                 f"{amount} is still a lot for me, and I heard people got it for around $7,000. "
                 "Can you do that?",
-                f"Honestly {amount} is still a stretch, and I read some people paid about "
+                f"{amount} is still a stretch, and I read some people paid about "
                 "$7,000. Is that possible?",
                 f"Okay, but {amount} is still a big number for me, and I heard it went for "
                 "around $7,000. Can you match that?",
@@ -581,69 +583,60 @@ def choose_slot(slot: Slot | None) -> SlotChoice:
 
 
 # ----------------------------------------------------------------------------------
-# Detectors on the advisor's text.
+# Detectors on the advisor's text.  A call, a time or a follow-up is read by
+# ``r1_commitment.call_proposal_in`` (one structural reading, shared with the ask detector).  An
+# e-mail OFFER asks the same four questions: the advisor is the subject, the object is
+# information, and no programme timeline or cadence hangs on it.
 # ----------------------------------------------------------------------------------
-_DAY_WORDS = (
-    r"(?:tomorrow|tonight|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
-    r"next week|this week|the weekend|this weekend|weekend)"
-)
-# "call you on/at/in/next/this ..." is a callback only when a day, a clock time or a part of the
-# day follows ("call you at 7 pm", "call you on Monday"); "reach you on the next session" is a
-# pitch about the programme, not a proposal (R1-Q round 1, review 2).
-_WHEN_WORD = (
-    r"(?:tomorrow|tonight|today|later|next week|this week|the weekend|this weekend|weekend|"
-    r"(?:on|at|this|next|in|around|by|after|before)\s+(?:the\s+)?(?:monday|tuesday|wednesday|"
-    r"thursday|friday|saturday|sunday|tomorrow|tonight|today|\d|noon|midnight|morning|afternoon|"
-    r"evening|night|(?:a )?(?:few|couple)|one|two|three|four|five|six|seven|eight|nine|ten))"
-)
-# LOOSE callback patterns are booking-style wording a pitch uses too ("you can book a slot with a
-# mentor every week", "mentors will schedule a call with you in the third month"): a hit counts
-# only when ``is_call_proposal`` agrees (R1-Q round 2).  The FIRM ones are about a call between the
-# advisor and the learner and need no such check.
-_CALLBACK_LOOSE = _compile(
-    r"\b(?:call|ring|phone|ping|text) (?:you|me) (?:back |again )?" + _WHEN_WORD + r"\b",
-    r"\b(?:schedul\w*|set up|book|arrange|fix|plan|organi[sz]e|pencil in)\b[^.?!]{0,30}\b"
-    r"(?:call|chat|meeting|session|follow[- ]?up|catch[- ]?up|conversation|time|slot)\b",
-    r"\b(?:follow[- ]?up|second|another|next|quick) (?:call|chat|meeting|conversation)\b",
-    r"\b(?:talk|speak|connect|chat|catch up|meet)\b(?: again| to you| with you)? "
-    r"(?:on |this |next |later )?" + _DAY_WORDS + r"\b",
-)
-_CALLBACK = _compile(
-    r"\bcall(?:ing)? (?:you |me )?back\b",
-    r"\bpencil (?:you|me|us|it|that|this|something) in\b",
-    r"\bwhen (?:you|i|we) (?:call|ring|phone) (?:me|you)\b",
-    r"\bwhat (?:time|day)s? (?:works?|suits?|is good|is best|would work)\b",
-    r"\bwhen (?:can|could|shall|should|would) (?:i|we) (?:call|talk|speak|connect|catch up)\b",
-    r"\bwhen (?:will|can|could|would) (?:you|i) (?:get|come|be) back\b",
-    r"\bwhen (?:can|will|should) i expect\b",
-    r"\bget back to (?:me|us)\b",
-)
-# An e-mail OFFER is a first-person promise to send information: "I'll email you the details",
-# "let me send you the brochure", "I will mail that once we finish".  A pitch about what the
-# programme sends ("we send you the recordings after every class", "we will send you a
-# certificate", "the platform will send you an email reminder") is not one (R1-Q round 1,
-# review 2): the subject must be I / we / let me with a modal, and the object must be
-# information or a pronoun followed by a "when" cue.
-_OFFER_SUBJECT = (
+_OFFER_FRAME = (
     r"(?:(?:i|we)(?:'ll|'d|'m going to| am going to| are going to| will| can| could| shall|"
-    r" would)|let me|let us|let'?s)"
+    r" would| should| may)|let me|let us|let'?s|(?:can|could|shall|should|may|will|would) (?:i|we)|"
+    r"(?:want|like) me to|how about (?:i|we)|what if (?:i|we)|if (?:i|we)(?: sent| send| emailed)|"
+    r"would it help (?:if (?:i|we)|to)|if you(?:'d| would) like,? (?:i|we))"
 )
-_MAIL_VERB = r"(?:e-?mail|mail|send)"
+_ADVERBS = r"(?:(?:also|then|just|happily|gladly|definitely|actually|still|quickly|at least|"
+_ADVERBS += r"go ahead and|really|now) )*"
+_MAIL_VERB = r"(?:e-?mail|mail|send|sent|text|whatsapp|message|drop|shoot)"
 _MAIL_INFO = (
-    r"(?:details|brochure|curriculum|syllabus|information|info|summary|link|everything|"
-    r"overview|outline|breakdown|pricing|fee structure|proposal|document|pdf|schedule|"
-    r"timetable|payment details)"
+    r"(?:details|brochure|curriculum|syllabus|information|info|summary|everything|overview|"
+    r"outline|breakdown|pricing|fee structure|fees|proposal|document|pdf|schedule|timetable|"
+    r"recap|plan options|payment plan options|payment plans|outcome data|course outline|"
+    r"course details|program details|programme details|payment details|the e-?mail|it all|"
+    r"all of it|full details|plan details|options|plan|start dates?|cohort schedule)"
+)
+# The words between the verb and the information: no "so" or "that" clause ("send a calendar
+# invite so you both have the details" sends an invite, not the details).
+_GAP = r"(?:(?!\b(?:so|because|which|who|that)\b)[^.?!]){0,40}?"
+_NOT_REMINDERS = (
+    r"(?!\s+(?:reminders?|notifications?|updates?|alerts?|newsletters?|receipts?|"
+    r"confirmations?|invites?)\b)"
 )
 _EMAIL_OFFER = _compile(
-    r"\b" + _OFFER_SUBJECT + r"\s+(?:also |then |just |happily |gladly |definitely |actually )?"
-    + _MAIL_VERB + r"\b[^.?!]{0,30}\b" + _MAIL_INFO + r"\b",
-    r"\b" + _OFFER_SUBJECT + r"\s+(?:also |then |just )?(?:send|shoot|drop|mail|e-?mail) "
-    r"(?:you |me )?(?:an? )?(?:e-?mail|mail|message)\b"
-    r"(?!\s+(?:reminders?|notifications?|updates?|alerts?|newsletters?|receipts?|"
-    r"confirmations?|invites?)\b)",
-    r"\b" + _OFFER_SUBJECT + r"\s+(?:also |then |just )?" + _MAIL_VERB + r" "
-    r"(?:it|that|this|them|everything)\b[^.?!]{0,15}\b(?:over|across|once|after|later|today|"
-    r"tonight|shortly|right now|right away|when|as soon)\b",
+    r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + _MAIL_VERB + r"\b" + _GAP + r"\b" + _MAIL_INFO
+    + r"\b",
+    r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + r"(?:e-?mail|mail) (?:you|me|him|her|them|it|"
+    r"that|this|everything)\b(?!\s+(?:the|your|a|an|some|all|my|these|those)\b)",
+    r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + r"(?:send|shoot|drop|mail|e-?mail) "
+    r"(?:you |me )?(?:an? |the |that |this |your )?(?:e-?mail|mail|message)\b" + _NOT_REMINDERS,
+    r"\b" + _OFFER_FRAME + r"\b[^.?!]{0,30}\b(?:send|give|share|forward|put)\b[^.?!]{0,40}\b"
+    r"(?:(?:in|on|by|via|over|to|into) (?:an? |your |the |my )?(?:e-?mail|mail|inbox|whatsapp|"
+    r"address)|in writing)\b",
+    r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + r"(?:send|forward|share) (?:it|that|this|them|"
+    r"everything) (?:over|across|out|your way|right away|right now|shortly|today|tonight|later|"
+    r"right after|after|once|as soon as|before)\b",
+    r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + r"(?:e-?mail|mail) (?:you |me )?(?:the |a |an )?"
+    r"(?:[\w-]+ ){0,2}(?:link|form)\b",
+    # "I'll also share a course outline beforehand": information handed over between calls
+    r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + r"(?:share|forward) " + _GAP + r"\b" + _MAIL_INFO
+    + r"\b[^.?!]{0,20}\b(?:beforehand|ahead of|in advance|before (?:our|the|then|that|we)|"
+    r"after (?:our|the|this|that)|later|today|tonight)\b",
+    # "The email will cover the full breakdown": the e-mail the advisor is sending
+    r"\bthe e-?mail (?:will |would |should )?(?:cover|covers|include|includes|contain|contains|"
+    r"list|lists|has|show|shows|outline|outlines)\b",
+    # "I'll get that e-mail out to you today", "I'll have the plan details e-mailed to you"
+    r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + r"(?:get|have) (?:that |the |an |your |this )?"
+    r"(?:[\w-]+ ){0,4}?(?:e-?mails?|mail|details|information|brochure|everything)\b[^.?!]{0,25}"
+    r"\b(?:out|sent|over|e-?mailed|mailed|off)\b",
 )
 # The details of a class are class logistics, not the information a learner decides on: "we'll send
 # you the link to the live class on Monday".  ("details of the program" is information.)
@@ -651,8 +644,10 @@ _CLASS_OBJECT = re.compile(
     r"\b(?:link|links|schedule|timetable|details|notes|materials?|recordings?|invites?|"
     r"invitations?|reminders?)\s+(?:to|for|of|about)\s+(?:(?:join|attend|access|watch|view|open|"
     r"enter)\s+)?(?:the |your |our |every |each |all )?"
-    r"(?:live |recorded |weekly |online |upcoming |first )?(?:class|classes|session|sessions|"
-    r"lecture|lectures|webinars?|workshops?|zoom|meeting|demo|orientation|induction)\b",
+    r"(?:live |recorded |weekly |online |upcoming |first |demo )?(?:class|classes|session|"
+    r"sessions|lecture|lectures|webinars?|workshops?|zoom|meeting|demo|orientation|induction)\b"
+    r"|\b(?:class|session|lecture|webinar|workshop|zoom|meeting|demo|orientation) "
+    r"(?:link|links|schedule|invite|invites|reminder|reminders|recording|recordings)\b",
     re.IGNORECASE,
 )
 _CHECKIN = _compile(
@@ -720,28 +715,17 @@ def detect_callback(text: object) -> Callback | None:
 
     The slot is read from the sentence that proposes it and its neighbours ("Can we call back
     tomorrow? Maybe like 10:00 a.m."), so an unrelated "today" elsewhere in a long turn is
-    not mistaken for the day.
+    not mistaken for the day.  What counts as a proposal is ``r1_commitment.call_proposal_in``.
     """
     sentences = split_sentences(_tail(text).lower())
     for index, sentence in enumerate(sentences):
-        if _proposes_callback(sentence):
+        if call_proposal_in(sentence) is not None:
             # The proposing sentence first, then the one after it, then the one before it.
             after = sentences[index + 1 : index + 2]
             before = sentences[max(0, index - 1) : index]
             near = [sentence, *after, *before]
             return Callback(parse_slot(*near))
     return None
-
-
-def _proposes_callback(sentence: str) -> bool:
-    """One lower-cased sentence proposes (or asks about) a call back, not a programme feature."""
-    if any(pattern.search(sentence) for pattern in _CALLBACK):
-        return True
-    return any(
-        is_call_proposal(sentence, match.start(), match.end())
-        for pattern in _CALLBACK_LOOSE
-        for match in pattern.finditer(sentence)
-    )
 
 
 def detect_email_offer(text: object) -> bool:
@@ -771,6 +755,66 @@ def detect_checkin(text: object) -> bool:
         if is_question_like(sentence) and any(
             pattern.search(sentence) for pattern in _CHECKIN_ASKED
         ):
+            return True
+    return False
+
+
+# R1-Q iteration 1.  "Let me check with my manager" is no discount: the judge flagged the thanks
+# that followed it as unwarranted gratitude.  Tentative wording about the price, with nothing
+# put on the table in the same turn, grants nothing.
+_TENTATIVE = re.compile(
+    r"\b(?:check|speak|talk|ask|run (?:it|this|that) by|escalate (?:it|this|that) to) "
+    r"(?:with |to )?(?:my|the|our) (?:manager|supervisor|boss|lead|team lead|director|head|"
+    r"finance team|team|seniors?)\b"
+    r"|\blet me (?:check|see|try|talk|ask|find out|look into|speak|run)\b"
+    r"|\bi(?:'ll| will| can| could| might| may) (?:try|see|check|ask|look into|find out|talk to|"
+    r"speak to|reach out)\b"
+    r"|\bsee what i can do\b|\bno promises\b|\b(?:can'?t|cannot|not) promise\b"
+    r"|\bi(?:'ll| will) do my best\b|\b(?:might|may) be able to\b",
+    re.IGNORECASE,
+)
+_TENTATIVE_PRICE = re.compile(
+    r"\b(?:price|cost|fees?|discount\w*|lower|reduc\w+|less|cheaper|deal|waive\w*|"
+    r"scholarship|offer|special|exception|that low|that much|the number)\b|\$\s?\d",
+    re.IGNORECASE,
+)
+# Who else is involved in the decision: "Is anyone else involved in the decision?", "Would you
+# talk it over with your husband?".  Asked of the learner, so questions only.
+_DECIDER_ASKED = re.compile(
+    r"\b(?:who else|any ?(?:one|body) else|some ?(?:one|body) else|other (?:people|person))\b"
+    r"[^?]{0,40}\b(?:involved|decisions?|decid\w+|say in|part of|on board|weigh in|sign off|"
+    r"approv\w+|consult\w*)\b"
+    r"|\bdecision[- ]?makers?\b"
+    r"|\b(?:involved|part) in (?:the|this|that|your) (?:decision|choice)\b"
+    r"|\bwho(?:'s| is| makes| will make| decides| helps)\b[^?]{0,30}\b(?:decision|decid\w+)\b"
+    r"|\bdecide (?:this |it |that )?(?:together|with|alone|on your own|by yourself)\b"
+    r"|\bdiscuss (?:it|this|that) with\b"
+    r"|\b(?:do|will|would|did) you (?:need to |have to |want to |plan to )?(?:talk|speak|check|"
+    r"discuss|consult|run)\b[^?]{0,30}\b(?:"
+    + _DM_WORDS
+    + r"|any ?(?:one|body)|some ?(?:one|body))\b"
+    r"|\b(?:your|any) "
+    + _DM_WORDS
+    + r"\b[^?]{0,30}\b(?:involved|decision|decide\w*|on board|part of|a say|input|opinion)\b",
+    re.IGNORECASE,
+)
+
+
+def detect_tentative(text: object) -> bool:
+    """The advisor only SAYS they will check or try on the price ("I can check with my manager").
+
+    A turn that also puts a figure on the table is an offer, not a hedge (the caller checks); the
+    turn must be about the price, so "let me check the start date" is not a hedge on a discount.
+    """
+    folded = _tail(text).lower()
+    return _TENTATIVE.search(folded) is not None and _TENTATIVE_PRICE.search(folded) is not None
+
+
+def asks_decider(text: object) -> bool:
+    """The advisor asks the learner who else is involved in the decision."""
+    for sentence in split_sentences(_tail(text).lower()):
+        sentence = sentence[-PIECE_CHARS:]
+        if is_question_like(sentence) and _DECIDER_ASKED.search(sentence) is not None:
             return True
     return False
 
@@ -813,14 +857,24 @@ _BARE_DECIMAL = re.compile(
     r"(?<![\d$.,:])(\d{1,2}\.\d{1,2})(?![\d:])" + _NOT_UNIT, re.IGNORECASE
 )
 _BARE_WHOLE = re.compile(r"(?<![\d$.,])(\d{1,2},?\d{3})(?![\d])" + _NOT_UNIT, re.IGNORECASE)
-_OFF_AFTER = re.compile(r"^\s*(?:off|discount|less|reduction)\b", re.IGNORECASE)
+_OFF_AFTER = re.compile(
+    r"^\s*(?:off|discount|less|reduction)\b"
+    r"|^\s*(?:is|as) (?:genuinely |really |truly )?(?:the |our )?(?:deepest|maximum|max|biggest|"
+    r"largest|most|top)\b",
+    re.IGNORECASE,
+)
 _DISCOUNT_BEFORE = re.compile(
-    r"\bdiscounts?\s+(?:of|worth|up to|around|about)?\s*$", re.IGNORECASE
+    r"\bdiscounts?\s+(?:of|worth|up to|around|about)?\s*$"
+    r"|\b(?:reduc\w+|cut|knock|shave|lower|waive|slash|trim|drop|take|sav(?:e|es|ed|ing))\s+"
+    r"(?:the price |it |that |this |the fee |you |your partner )?(?:by |of |down by |off )?"
+    r"(?:another |an extra |a further )?\s*$",
+    re.IGNORECASE,
 )
 _PRICE_CUE = re.compile(
     r"\b(?:deal|price|cost|fee|make it|let'?s (?:make|do|say|go|settle|keep)|lets (?:make|do|"
     r"say|go)|come down|bring (?:it|that|the|this)|go (?:down )?to|settle|special|final|offer|"
-    r"discount|for you|meet)\b",
+    r"discount|for you|meet|floor|deepest|lowest|minimum|maximum|best (?:i|we) can|"
+    r"(?:ends|expires?|expired|holds|valid|good) (?:tonight|today|at midnight|till|until|by))\b",
     re.IGNORECASE,
 )
 _ASK_ECHO = re.compile(
@@ -852,7 +906,14 @@ _PRICE_NO = re.compile(
     r"don'?t think (?:we|i) can|no longer|expired|never (?:offered|promised)|"
     r"(?:isn'?t|aren'?t|wasn'?t|weren'?t) (?:available|valid|applicable|possible|offered)|"
     r"was (?:for|only|valid|available)|only (?:for|valid|available|applicable)|"
-    r"last (?:year|batch|cohort|month))\b",
+    r"last (?:year|batch|cohort|month)|no way|not happening|isn'?t happening|"
+    r"not what we (?:charge|offer)|what we charge|doesn'?t exist|not our (?:price|rate)|"
+    r"(?:was|were) (?:the |a )?(?:early[- ]bird|scholarship|promo\w*)|scholarship|"
+    r"don'?t know where (?:that|you|it)|wish (?:i|we) could|if only|"
+    r"(?:below|under|beneath) (?:our|the) (?:minimum|floor|limit|lowest)|"
+    r"not (?:a|an|the) (?:\w+ ){0,2}(?:we|i) (?:offer|do|can|have|give|charge)|"
+    r"old (?:curriculum|program\w*|course|version|intake|term)|(?:paid|was|were) [^.?!]{0,20}"
+    r"\bin (?:19|20)\d\d|not (?:something|what) we|not yours|isn'?t something we)\b",
     re.IGNORECASE,
 )
 # A question ABOUT a figure (where it came from, whether the learner is sure, what the learner's
@@ -892,7 +953,13 @@ _NOT_OURS_BEFORE = re.compile(
     r"(?:students?|alumni|alumnus|learners?|someone|somebody|people|others|candidates?|"
     r"professionals?|folks|they|he|she)\s+(?:\w+\s+){0,2}?(?:paid|got|took|"
     r"enrolled|joined|saved|received|availed|used|bought|spent)|"
-    r"last (?:year|month|quarter|cohort|batch)|previously|used to|in the past)\b",
+    r"last (?:year|month|quarter|cohort|batch)|previously|used to|in the past|"
+    r"(?:previous|prior|earlier|old|last) (?:cohort|batch|class|intake)|"
+    r"(?:quoted|offered|told|given|charged)|"
+    r"bootcamps?|institutes?|universit\w+|colleges?|degrees?|competitors?|market|industry|"
+    r"companies|employers?|recruiters?|salar\w+|raise|bonus\w*|value|worth|valued|"
+    r"graduates?|alumni|freshers?|analysts?|scientists?|engineers?|signing|offers? that|"
+    r"typical\w*|average|most (?:\w+ )?(?:programs?|courses?)|roles?|jobs?|positions?)\b",
     re.IGNORECASE,
 )
 _NOT_OURS_AFTER = re.compile(
@@ -900,18 +967,48 @@ _NOT_OURS_AFTER = re.compile(
     r"(?:month|year|annum|week|hour)\b"
     r"|^\s*(?:monthly|yearly|annual\w*|p\.?a\.?|lpa)\b"
     r"|^\s*(?:bootcamp|degree|mba|masters?|diploma|university|college|certification)\b"
-    r"|^\s*(?:hike|raise|increase|salary|income|jump|bonus)\b",
+    r"|^\s*(?:hike|raise|increase|salary|income|jump|bonus)\b"
+    r"|^[^.?!]{0,25}\b(?:elsewhere|on its own|by itself|alone|each|apiece|per session|higher|"
+    r"more on average|compared (?:to|with))\b"
+    r"|^\s*(?:later|afterwards|after that|on completion|when you finish)\b",
     re.IGNORECASE,
 )
 # Before the learner's anchor an amount counts as the price on the table only next to a pricing
 # word: nobody has asked for a price yet, so a bare "$8,000" in a pitch is not an offer.
 _COURSE_PRICE_CUE = re.compile(
-    r"\b(?:prices?|costs?|fees?|tuition|total|deal|offers?|offered|offering|discounts?|off|"
-    r"special|final|net|for you|make it|let'?s make|bring(?:ing)? (?:it|that|the|this)|"
-    r"come down|comes? to|works? out|early[- ]bird|you(?:'ll| will| would|'d)? pay|"
-    r"pay(?:ing)? (?:only|just)|scholarships?|waive\w*|reduc\w+|lower\w*|cut|knock|drop|match|"
-    r"meet|program(?:me)? (?:is|for|at)|course (?:is|for|at)|enrol+\w* (?:for|at)|"
-    r"get it (?:for|at)|have it (?:for|at)|take it)\b",
+    r"\b(?:prices?|costs?|fees?|tuition|total (?:cost|price|fee)|deal|(?:we|i|they) offer\w*|"
+    r"offer(?:ed|ing)? (?:you|of|a|an)|special offer|on offer|discounts?|off|special|final|net|"
+    r"for you|make it|let'?s (?:make|do|say|go|settle|keep)|lets (?:make|do|say|go)|"
+    r"come down|bring(?:ing)? (?:it|that|the|this)|go (?:down )?to|settle|meet you|"
+    r"push it|comes? to|works? out|early[- ]bird|you(?:'ll| will| would|'d)? pay|"
+    r"pay(?:ing)? (?:only|just)|scholarships?|waive\w*|reduc\w+|lower\w*|knock|drop|match|"
+    r"program(?:me)? (?:is|for|at)|course (?:is|for|at)|enrol+\w* (?:for|at)|"
+    r"get it (?:for|at)|have it (?:for|at)|take it|lock(?:ed)? (?:it|that|this|the)|"
+    r"rate|floor|deepest|best (?:i|we) can|lowest|sav(?:e|es|ed|ing)|(?:ends|expires?|expired|"
+    r"holds|valid|good) (?:tonight|today|at midnight|till|until|by))\b",
+    re.IGNORECASE,
+)
+# Said while a figure is hedged: "I'll try for $8,000", "let me see if I can do $8,000".
+_HEDGE_BEFORE = re.compile(
+    r"\b(?:might|may|maybe|perhaps|possibly|probably|hopefully|try(?:ing)?|see (?:if|what|"
+    r"whether|how)|check(?:ing)?|ask(?:ing)?|find out|look(?:ing)? (?:at|into)|depends?|"
+    r"depending|if (?:we|i) can|can'?t promise|no promise|not sure|should be able|could be able|"
+    r"wish|if only|would love to|i'?d love to|would if i could)\b",
+    re.IGNORECASE,
+)
+# ... and, for a figure the learner said, a rough one ("around", "close to", "the range").
+_HEDGE_LOOSE = re.compile(
+    r"\b(?:get(?:ting)? close|close to|near(?:ly)?|around|roughly|approximately|about|ballpark|"
+    r"range|up to)\b",
+    re.IGNORECASE,
+)
+_HEDGE_AFTER = re.compile(
+    r"^\s*(?:\w+ ){0,2}?(?:is possible|would be possible|may be possible|might be possible|"
+    r"could be possible|may be|might be|could be)\b",
+    re.IGNORECASE,
+)
+_HEDGE_AFTER_LEARNER = re.compile(
+    r"^\s*(?:\w+ ){0,2}?(?:would depend|depends on|depending on|is subject to)\b",
     re.IGNORECASE,
 )
 # A figure the LEARNER said (the $7,000 anchor, or any amount it spoke) is only an offer when
@@ -927,7 +1024,9 @@ _FIRST_PERSON_OFFER = re.compile(
 )
 _ACCEPTING_AFTER = re.compile(
     r"^\s*(?:then|it is|it'?s (?:a deal|done|yours|fine|ok|okay)|for you|works|deal|"
-    r"is (?:fine|okay|ok|good|doable|possible|done|a deal|acceptable|alright|yours))\b",
+    r"is (?:fine|okay|ok|good|done|a deal|acceptable|alright|yours)|"
+    r"is (?:genuinely |really |truly |our |the |my )?(?:final|best|lowest|last|floor|deepest|"
+    r"limit|minimum|total))\b",
     re.IGNORECASE,
 )
 # Plain acceptances of a figure the learner asked for, without "I can do": "Yes, you can have it
@@ -962,9 +1061,14 @@ _OFFER_VERB = (
 )
 _QUESTION_OFFER_ALWAYS = re.compile(
     r"\b(?:how|what) about\b|\bwhat if (?:i|we)\b|\b(?:want|like) me to\b[^?]{0,20}\b"
-    + _OFFER_VERB + r"\b|\b(?:shall|can|could|may) (?:i|we) (?:\w+ ){0,2}?" + _OFFER_VERB + r"\b"
+    + _OFFER_VERB + r"\b|\b(?:shall|should|can|could|may) (?:i|we) (?:\w+ ){0,2}?" + _OFFER_VERB
+    + r"\b|\b(?:shall|should|can|could|may) (?:i|we) (?:\w+ ){0,2}?(?:reserve|hold|lock|secure|"
+    r"book|enrol+|sign)\b|(?:^\W*(?:and |so )*|\b(?:do you|would you) )(?:want|take|grab|accept|"
+    r"like) (?:the |this |that )?\$\d[\d,]*"
     r"|\bhow (?:does|do|would|will|is|are) [^?]{0,25}\b(?:sound|look|feel|work|seem)\b"
-    r"|\bwhat (?:do|would|will) you say\b"
+    r"|\bwhat (?:do|would|will) you (?:say|think)\b(?: (?:about|of|to|if))?"
+    r"|\b(?:can|could|would) you (?:\w+ ){0,2}?(?:do|stretch|go|manage|afford|pay|meet|spend|swing|"
+    r"handle|live with)\b"
     r"|\b(?:can|could|shall|may) (?:we|i) (?:\w+ ){0,2}?(?:close|settle|finali[sz]e|agree|"
     r"lock|wrap|call it|say|meet|split)\b"
     r"|\b(?:would|will|can|could) you (?:\w+ ){0,2}?(?:join|enrol+|sign|commit|take|accept|"
@@ -973,8 +1077,9 @@ _QUESTION_OFFER_ALWAYS = re.compile(
     re.IGNORECASE,
 )
 _QUESTION_OFFER_PLAIN = re.compile(
-    r"\b(?:would|will|does|do|is|are)\b[^?]{0,25}\b(?:work|fine|ok|okay|alright|acceptable|"
-    r"good|comfortable|suit\w*|manage\w*|afford\w*|doable|feasible)\b",
+    r"\b(?:would|will|does|do|is|are)\b[^?]{0,45}\b(?:work|fine|ok|okay|alright|acceptable|"
+    r"good|comfortable|suit\w*|manage\w*|afford\w*|doable|feasible|fit|easier|lighter|"
+    r"better|more (?:comfortable|manageable|affordable))\b",
     re.IGNORECASE,
 )
 _WH_START = re.compile(
@@ -984,8 +1089,21 @@ _WH_START = re.compile(
 )
 
 
+_NOT_AN_OFFER_QUESTION = re.compile(
+    r"\b(?:your|the) (?:friend|colleague|husband|wife|partner|father|mother|company|employer|"
+    r"boss|manager|roommate|family|parents|brother|sister|dad|mom)\b"
+    r"|\b(?:other|another) (?:institutes?|bootcamps?|providers?|programs?|courses?|schools?)\b"
+    r"|\bcompared (?:to|with)\b|\btalk(?:ing)? about\b|\bwhat would you do\b"
+    r"|\bhow (?:would|do) you feel\b|\byou'?d save\b|\b(?:isn'?t|aren'?t|wasn'?t|weren'?t)\b"
+    r"|\bso you(?:'re| are) saying\b|\bwhy\b",
+    re.IGNORECASE,
+)
+
+
 def _question_is_an_offer(lowered: str) -> bool:
     """A question sentence phrased as an offer (see the frames above)."""
+    if _NOT_AN_OFFER_QUESTION.search(lowered) is not None:
+        return False
     if _QUESTION_OFFER_ALWAYS.search(lowered) is not None:
         return True
     if _WH_START.match(lowered) is not None:
@@ -1010,9 +1128,49 @@ def _lead_clause(lowered: str, start: int) -> str:
     return earlier[-1] if earlier else ""
 
 
+_ACCEPT_WORDS = frozenset(
+    "okay ok fine alright all right sure yes yeah yep done deal agreed sold then it is its s you "
+    "win got a final good great perfect certainly absolutely of course for now i m ll give take "
+    "will have your yours set settled accepted goes on that bring down at to we meet match well "
+    "so and just let make say go with can do".split()
+)
+_AFFIRM_WORDS = frozenset(
+    "okay ok fine alright sure yes yeah yep done deal agreed sold win absolutely certainly "
+    "great perfect settled accepted".split()
+)
+_FIGURE_WORDS = re.compile(r"\$\s?\d[\d,]*(?:\.\d+)?|\b\d[\d,]*\b", re.IGNORECASE)
+
+
+def bare_acceptance(lowered: str) -> bool:
+    """The sentence is nothing but an affirmation and a figure ("Okay fine, 7000.").
+
+    Structural: whatever surrounds the figure is affirmation words, there is at least one real
+    affirmation among them, and the whole sentence is short.  ("Seven thousand, done." reads as
+    ``$7000, done.`` once amounts are canonical.)
+    """
+    rest = _FIGURE_WORDS.sub(" ", lowered)
+    words = [word.replace("'", "") for word in re.findall(r"[a-z']+", rest)]
+    if not words or len(words) > 8:
+        return False
+    return all(word in _ACCEPT_WORDS for word in words) and any(
+        word in _AFFIRM_WORDS for word in words
+    )
+
+
+_RESULT_BEFORE = re.compile(
+    r"\b(?:bring(?:s|ing)?|mak(?:es|ing)|tak(?:es|ing)|put(?:s|ting)|get(?:s|ting)) "
+    r"(?:it|that|this|you|the [\w ]{1,40}?)\s*(?:down |back )?(?:to|at)\s*$",
+    re.IGNORECASE,
+)
+
+
 def _promised(lowered: str, start: int, end: int) -> bool:
     """The advisor's own clause promises the amount at ``start:end`` ("I can do $7,000")."""
+    if bare_acceptance(lowered):
+        return True
     before = clause_before(lowered, start)
+    if _RESULT_BEFORE.search(before) and _FIRST_PERSON_OFFER.search(lowered[:start]):
+        return True  # "I'll take another $500 off, bringing the course down to $7000"
     if _FIRST_PERSON_OFFER.search(before) or _GRANT.search(before):
         return True
     if _ACCEPTING_AFTER.search(clause_after(lowered, end)):
@@ -1043,6 +1201,13 @@ def _offered(lowered: str, start: int, end: int, *, learner_said: bool = False) 
     after = clause_after(lowered, end)
     if (has_refusal(after) or _PRICE_NO.search(after)) and not cue:
         return False
+    if _HEDGE_BEFORE.search(before) is not None or _HEDGE_AFTER.match(lowered[end:]) is not None:
+        return False
+    if learner_said and (
+        _HEDGE_LOOSE.search(before) is not None
+        or _HEDGE_AFTER_LEARNER.match(lowered[end:]) is not None
+    ):
+        return False
     return not learner_said or _promised(lowered, start, end)
 
 
@@ -1057,6 +1222,21 @@ def _not_our_price(lowered: str, start: int, end: int) -> bool:
 # A sentence is read in pieces of at most this many characters: speech-to-text may run a whole
 # monologue together, and the amount grammar must stay fast on any input.
 PIECE_CHARS = 400
+
+
+# Independent clauses are read one by one: "..., and I can apply the maximum discount" is its own
+# offer and not a member of the list of discounts before it; "that $6300 ends tonight, can I send
+# the link?" is a statement followed by a question.
+_CLAUSE_SPLIT = re.compile(
+    r"\s*[;]\s*|\s*,\s*(?:and |but |so |yet )?(?=(?:i|we|let me|you)\b)"
+    r"|\s*,\s*(?=(?:can|could|should|shall|would|will|do|does|is|are) (?:i|we|you|that|it)\b)",
+    re.IGNORECASE,
+)
+
+
+def _clauses(sentence: str) -> list[str]:
+    """``sentence`` split into its independent clauses (see ``_CLAUSE_SPLIT``)."""
+    return [part for part in _CLAUSE_SPLIT.split(sentence) if part and part.strip()]
 
 
 def _pieces(sentence: str) -> list[str]:
@@ -1090,13 +1270,19 @@ def _piece_offers(
     proposes it.  ``require_cue`` (before the learner's anchor) wants a pricing word in the
     sentence, and an income, a competitor's price or what someone else paid is never an offer.
     """
-    lowered = canonical_amounts(piece).lower()
+    # "$6500, which is ..." keeps its comma: the amount grammar would swallow it, and with it the
+    # clause boundary the refusal and hedge checks read.
+    lowered = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", piece)).lower()
     asked = is_question_like(piece)
     if asked and _INQUIRY.search(lowered):
         return {}
-    # A question phrased as an offer promises the figure itself, so it needs no further promise.
+    # A question phrased as an offer promises the figure itself, so it needs no further promise;
+    # any other question that names a figure is the advisor asking about it, not offering it.
     asked_as_offer = asked and _question_is_an_offer(lowered)
-    if require_cue and _COURSE_PRICE_CUE.search(lowered) is None:
+    if asked and not asked_as_offer:
+        return {}
+    plain_acceptance = bare_acceptance(lowered)
+    if require_cue and not asked_as_offer and _COURSE_PRICE_CUE.search(lowered) is None:
         return {}
     conditional = _CONDITIONAL.search(lowered) is not None
     found: dict[int, bool] = {}
@@ -1105,8 +1291,6 @@ def _piece_offers(
 
     def admitted(value: int, start: int, end: int) -> bool:
         said = value in own
-        if asked and said and not asked_as_offer:
-            return False  # a question about the learner's own figure, not an offer of it
         if _not_our_price(lowered, start, end):
             return False
         return _offered(lowered, start, end, learner_said=said and not asked_as_offer)
@@ -1130,7 +1314,7 @@ def _piece_offers(
     # Several small amounts in one sentence are a LIST of the deck's discounts, not an offer.
     if len(discounts) == 1 and small <= discounts:
         found[PRICE_USD - next(iter(discounts))] = conditional
-    if _PRICE_CUE.search(lowered):
+    if _PRICE_CUE.search(lowered) or asked_as_offer or plain_acceptance:
         for pattern in (_BARE_THOUSANDS, _BARE_DECIMAL):
             for match in pattern.finditer(lowered):
                 value = int(round(float(match.group(1)) * 1000))
@@ -1168,17 +1352,141 @@ def parse_price_offers(
     own = frozenset({ANCHOR_USD, *own_amounts})
     offers: dict[int, bool] = {}
     for sentence in split_sentences(_tail(text)):
-        for piece in _pieces(sentence):
-            offers.update(_piece_offers(piece, own, require_cue=require_cue))
+        for clause in _clauses(sentence):
+            for piece in _pieces(clause):
+                offers.update(_piece_offers(piece, own, require_cue=require_cue))
     return sorted(offers.items(), reverse=True)
 
 
-def refuses_price(text: object) -> bool:
-    """The advisor refuses to move the price ("we can't go lower", "the price is fixed")."""
-    return any(
-        has_refusal(sentence) and _PRICE_TALK.search(sentence) is not None
-        for sentence in split_sentences(_tail(text).lower())
+@dataclass(frozen=True)
+class AdvisorActs:
+    """What one advisor turn does, read with the detectors the engine uses (one reading).
+
+    ``enrol`` / ``call`` are the two kinds of ask (a callback or time proposal is a call),
+    ``email_offer`` an offer to send information, ``best_offer_usd`` the lowest net price put on
+    the table, ``price_answer`` whether the turn answers the learner's anchor (an offer or a
+    refusal) and ``close_attempt`` a farewell.  ``tests/test_r1_detector_corpus.py`` scores every
+    field against the labelled advisor-utterance corpus.
+    """
+
+    enrol: bool
+    call: bool
+    callback: Callback | None
+    email_offer: bool
+    best_offer_usd: int | None
+    price_answer: bool
+    close_attempt: bool
+
+    @property
+    def ask_kind(self) -> AskKind | None:
+        """The engine's single answer: an enrolment ask outranks a call ask."""
+        if self.enrol:
+            return AskKind.ENROL
+        return AskKind.CALL if self.call else None
+
+
+def read_advisor_turn(
+    text: object, *, after_anchor: bool = True, r_sec: float = 345.0
+) -> AdvisorActs:
+    """Read one advisor turn the way ``RolePlayEngine.plan_turn`` does.
+
+    ``after_anchor`` says the learner's $7,000 anchor was already delivered: an amount then answers
+    it, while before it an amount needs a pricing word.  ``r_sec`` is the role-play clock for the
+    farewell rule (a courtesy such as "thanks for your time" only counts from 4:00).
+    """
+    acts = ask_acts(text)
+    state = Negotiation("husband")
+    seen = state.observe(5, text, anchor_turn=4 if after_anchor else None)
+    return AdvisorActs(
+        enrol=AskKind.ENROL in acts,
+        call=AskKind.CALL in acts or seen.callback is not None,
+        callback=seen.callback,
+        email_offer=seen.email_offer,
+        best_offer_usd=state.best_offer_usd,
+        price_answer=seen.price_answer,
+        close_attempt=is_close_attempt(text, r_sec),
     )
+
+
+_ANCHOR_REF = re.compile(
+    r"(?<![\d,.])\$?7,?000\b(?!\s*(?:months?|students|people))|\bseven thousand\b|\b7k\b",
+    re.IGNORECASE,
+)
+_LIST_PRICE = re.compile(
+    r"(?:\bprice|\bfee|\bcost|\bit'?s|\bis|\bcosts|\bat)\s+(?:is |only |just )?\$?9,?000\b",
+    re.IGNORECASE,
+)
+# "If I can't do $8,000, would you still join?" supposes a refusal; it does not make one.
+_SUPPOSES = re.compile(
+    r"\b(?:if|unless|in case|suppose|supposing|what if) (?:i|we)\b"
+    r"|^\W*(?:and |so |but |okay |ok )*(?:if|unless|suppose|supposing)\b",
+    re.IGNORECASE,
+)
+# "That's our deepest discount.", "That's the lowest with instalments.": the price will not move.
+_FINAL_STATEMENT = re.compile(
+    r"\b(?:that|this|it)(?:'s| is) (?:genuinely |really |truly |absolutely )?(?:our|the|my) "
+    r"(?:deepest|lowest|best|final|maximum|max|biggest|largest|last|bottom)\b",
+    re.IGNORECASE,
+)
+_PRONOUN_OBJECT = re.compile(r"\b(?:that|this|it|those|them)\b", re.IGNORECASE)
+def mentions_anchor(text: object) -> bool:
+    """The advisor's turn names the learner's $7,000 (any wording of it)."""
+    for sentence in split_sentences(_tail(text).lower()):
+        sentence = sentence[-PIECE_CHARS:]  # the amount grammar must stay fast on any input
+        canon = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", sentence)).lower()
+        if _ANCHOR_REF.search(canon) is not None:
+            return True
+    return False
+
+
+_HEDGED_REFUSAL = re.compile(
+    r"\b(?:can'?t|cannot|no) promise|\bnot (?:sure|certain)\b|\blet me (?:see|check)\b|"
+    r"\bi'?ll (?:try|see|check)\b|\bcheck with\b",
+    re.IGNORECASE,
+)
+
+
+def refuses_price(text: object) -> bool:
+    """The advisor refuses the learner's price ("we can't go lower", "$7,000 is impossible").
+
+    Four shapes count: a refusal in a sentence about the price ("we can't go lower"); a sentence
+    that names the $7,000 anchor and denies it (impossible, too low, no way, an old batch,
+    "that's not what we charge"); a challenge to where the anchor came from ("Who told you
+    $7,000?"); and the list price restated after the anchor was named ("You heard $7,000. The
+    price is $9,000.").  A hedge ("I can't promise anything, but let me see") and a supposed refusal
+    ("If I can't do $8,000, would you still join?") are not refusals.
+    """
+    anchor_seen = False
+    list_price = False
+    previous_anchor = False
+    for sentence in split_sentences(_tail(text).lower()):
+        sentence = sentence[-PIECE_CHARS:]  # the amount grammar must stay fast on any input
+        canon = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", sentence)).lower()
+        asked = is_question_like(sentence)
+        mentions = _ANCHOR_REF.search(canon) is not None
+        anchor_seen = anchor_seen or mentions
+        if _LIST_PRICE.search(canon) is not None and not asked:
+            list_price = True
+        supposes = _SUPPOSES.search(sentence) is not None
+        hedged = _HEDGED_REFUSAL.search(sentence) is not None
+        denies = has_refusal(sentence) or _PRICE_NO.search(canon) is not None
+        if not asked and not supposes and not hedged:
+            if _FINAL_STATEMENT.search(sentence) is not None:
+                return True
+            carried = previous_anchor and (
+                _PRONOUN_OBJECT.search(sentence) is not None
+                or _PRICE_NO.search(canon) is not None
+            )
+            if denies and (mentions or carried or _PRICE_TALK.search(sentence)):
+                return True
+            if mentions and negated_before(canon, _ANCHOR_REF.search(canon).start(), 8):
+                return True
+        if asked and mentions and _INQUIRY.search(canon) is not None:
+            return True
+        if asked and previous_anchor and _INQUIRY.search(canon) is not None:
+            return True
+        previous_anchor = mentions
+    return anchor_seen and list_price
 
 
 # ----------------------------------------------------------------------------------
@@ -1205,6 +1513,11 @@ class NegotiationTurn:
     # True when the turn put a price on the table that the learner's anchor has already been
     # delivered against, whether that price is new or a restatement of an earlier one.
     answered_price: bool = False
+    # R1-Q iteration 1: the turn named the $7,000 anchor after it was delivered; the advisor only
+    # said they would check or try (nothing granted); the advisor asked who else decides.
+    anchor_mentioned: bool = False
+    tentative: bool = False
+    decider_asked: bool = False
 
     @property
     def offer_added(self) -> bool:
@@ -1305,6 +1618,9 @@ class Negotiation:
             refusal=refusal,
             reasons_handled=frozenset(newly),
             answered_price=answered_price,
+            anchor_mentioned=after_anchor and mentions_anchor(text),
+            tentative=not mentioned and not refusal and detect_tentative(text),
+            decider_asked=asks_decider(text),
         )
 
     def note_learner_text(self, spoken: object) -> None:

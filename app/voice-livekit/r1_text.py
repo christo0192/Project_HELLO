@@ -254,6 +254,33 @@ def pick_variant(variants: Sequence[str], seed: str, count: int) -> str:
     return variants[(start + max(0, count)) % len(variants)]
 
 
+# ----------------------------------------------------------------------------------
+# Speaking style: how a reply opens and which filler words it leans on (R1-Q iteration 1).
+# 44 of 90 live replies started with "Hmm" and 50 of 90 held "Honestly": a person on a phone call
+# does not hum at every turn.  The guard varies a reply with these helpers (``r1_guard``) and the
+# rehearsal harness measures the same words with its own copy.
+# ----------------------------------------------------------------------------------
+TIC_HMM = "hmm"
+TIC_HONESTLY = "honestly"
+TIC_PATTERNS = {
+    TIC_HMM: re.compile(r"(?<![a-z-])hmm+\b|(?<![a-z-])hm\b", re.IGNORECASE),
+    TIC_HONESTLY: re.compile(r"\b(?:honestly|to be honest|frankly)\b", re.IGNORECASE),
+}
+_FIRST_WORD = re.compile(r"[a-z]+")
+
+
+def reply_opener(text: object) -> str:
+    """The first word of ``text``, lower-case ("That's fine" -> "that"); "" for no word."""
+    words = _FIRST_WORD.findall(fold(text).lower())
+    return words[0] if words else ""
+
+
+def reply_tics(text: object) -> tuple[str, ...]:
+    """The tic words ("hmm", "honestly") that ``text`` contains, in a fixed order."""
+    folded = fold(text)
+    return tuple(tic for tic, pattern in TIC_PATTERNS.items() if pattern.search(folded))
+
+
 _NUMBER_WORD = r"zero|one|two|three|four|five|six|seven|eight|nine|oh"
 # Every quantifier below is bounded, so a long run of word characters (or dots, or
 # digits) cannot trigger quadratic backtracking in these detectors.

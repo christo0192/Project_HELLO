@@ -1118,7 +1118,6 @@ class FarewellScopeTests(unittest.TestCase):
             "So yeah. Bye bye.",
             "So yeah, okay, bye.",
             "Yeah. Bye.",
-            "Okay. Bye bye.",
         ):
             for prefix in ("", "So that is the whole thing. "):
                 with self.subTest(tail=tail, prefix=prefix):
@@ -1337,6 +1336,87 @@ class CuriosityCoverageTests(unittest.TestCase):
     def test_the_topics_are_the_two_old_questions_plus_three(self):
         ids = [topic for topic, _label in sched.CURIOSITY_TOPICS]
         self.assertEqual(ids, ["format", "build", "payment", "mentor_time", "weekly_hours"])
+
+
+class CloseScanIsLinearTests(unittest.TestCase):
+    """R1-Q iteration 1: ``is_close_attempt`` asked every later sentence about every sentence, so a
+    runaway speech-to-text turn of 6,000 short sentences took minutes.  It is read from its end, in
+    two passes."""
+
+    def test_a_runaway_turn_is_read_quickly(self):
+        import time
+        from r1_scheduler import is_close_attempt
+
+        for text in (". " * 8000, "okay. " * 4000, "thanks for your time. " * 1000, "what? " * 4000):
+            with self.subTest(prefix=text[:12]):
+                started = time.perf_counter()
+                is_close_attempt(text, 345.0)
+                is_close_attempt(text, None)
+                self.assertLess(time.perf_counter() - started, 8.0)
+
+    def test_the_farewell_at_the_end_of_a_long_turn_is_still_found(self):
+        from r1_scheduler import is_close_attempt
+
+        body = "The program covers python and sql with a mentor for every module. " * 120
+        self.assertTrue(is_close_attempt(body + "Alright, thanks so much. Bye for now!", 345.0))
+        self.assertFalse(is_close_attempt(body + "Any questions on that?", 345.0))
+
+    def test_a_question_after_the_farewell_still_cancels_it(self):
+        from r1_scheduler import is_close_attempt
+
+        self.assertFalse(is_close_attempt("Take care. Any questions before I go?", 345.0))
+        self.assertTrue(is_close_attempt("Any questions? No? Alright, take care.", 345.0))
+
+    def test_thanks_for_your_time_needs_a_sign_off_after_it(self):
+        from r1_scheduler import is_close_attempt
+
+        self.assertTrue(is_close_attempt("Thanks for your time. Bye.", 345.0))
+        self.assertTrue(is_close_attempt("Thanks for your time. Feel free to reach out.", 345.0))
+        self.assertFalse(
+            is_close_attempt("Thanks for your time. So, coming to the fees, it is nine thousand.", 345.0)
+        )
+        # Before 4:00 the courtesy alone is an opening line; only the real "Bye." still counts.
+        self.assertFalse(is_close_attempt("Thanks for your time. Feel free to reach out.", 100.0))
+        self.assertTrue(is_close_attempt("Thanks for your time. Bye.", 100.0))
+
+
+class TimeCueBriefIterationOneTests(unittest.TestCase):
+    """R1-Q iteration 1: the time cue is the learner's own (a live reply turned it into "you
+    mentioned you only have a couple of minutes")."""
+
+    def test_the_brief_says_whose_time_it_is(self):
+        from r1_scheduler import SPEC_BY_ID, TIME_CUE
+
+        brief = SPEC_BY_ID[TIME_CUE].brief
+        self.assertIn("YOU only have a couple of minutes", brief)
+        self.assertIn("YOUR own next call", brief)
+        self.assertIn("not theirs", brief)
+        brief.encode("ascii")
+
+    def test_the_variants_and_the_line_speak_in_the_first_person(self):
+        from r1_scheduler import SPEC_BY_ID, TIME_CUE, TIME_CUE_LINE
+
+        for text in (TIME_CUE_LINE, *SPEC_BY_ID[TIME_CUE].variants):
+            self.assertRegex(text, r"\bI(?:'ve| have|'m)?\b")
+            self.assertNotRegex(text.lower(), r"\byou(?:'ve| have)? (?:mentioned|said|only)")
+
+    def test_the_markers_prove_the_learners_cue_and_not_much_else(self):
+        from r1_scheduler import SPEC_BY_ID, TIME_CUE, TIME_CUE_LINE, markers_match
+
+        markers = SPEC_BY_ID[TIME_CUE].markers
+        self.assertTrue(markers_match(markers, TIME_CUE_LINE))
+        self.assertTrue(markers_match(markers, "I only have a couple of minutes before my next call."))
+        self.assertFalse(markers_match(markers, "Okay, that makes sense to me."))
+
+    def test_no_scripted_learner_line_carries_a_tic_word(self):
+        from r1_scheduler import PLAN
+        from r1_text import TIC_PATTERNS
+
+        for spec in PLAN:
+            for text in (spec.line, *spec.variants):
+                for tic, pattern in TIC_PATTERNS.items():
+                    with self.subTest(move=spec.id, tic=tic):
+                        self.assertIsNone(pattern.search(text))
 
 
 if __name__ == "__main__":

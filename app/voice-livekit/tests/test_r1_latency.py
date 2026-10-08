@@ -347,7 +347,7 @@ class TestLatencyTracker(unittest.TestCase):
                 self.lines.items.clear()
                 self.clock.at(10.0)
                 self.tracker.begin_turn(1, "roleplay")
-                self.tracker.set_kind("ack_then_say")
+                self.tracker.set_kind("intent")
                 self.clock.at(10.5)
                 self.tracker.mark("llm_start")
                 self.clock.at(12.0)
@@ -378,7 +378,7 @@ class TestLatencyTracker(unittest.TestCase):
         self.assertEqual((audio[1], audio[4]), (1.0, 2))
 
     def test_the_headline_names_the_kind_of_turn(self) -> None:
-        for kind in ("llm_reply", "ack_then_say", "say_only", "reply"):
+        for kind in ("llm_reply", "intent", "say_only", "reply"):
             with self.subTest(kind=kind):
                 self.lines.items.clear()
                 self.clock.at(1.0)

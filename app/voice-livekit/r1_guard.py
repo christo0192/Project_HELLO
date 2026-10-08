@@ -89,6 +89,10 @@ from r1_personas import (
 )
 from r1_script import EXIT_CUE, LINES
 from r1_text import (
+    canonical_amounts,
+    TIC_HMM,
+    TIC_HONESTLY,
+    TIC_PATTERNS,
     dollar_amounts,
     fold,
     fuzzy_contains,
@@ -99,6 +103,7 @@ from r1_text import (
     normalize,
     pick_variant,
     repeat_kind,
+    reply_opener,
     split_sentences,
     truncate_words,
     word_count,
@@ -119,6 +124,95 @@ NEUTRAL_ACKS = ("Okay.", "I see.", "Right.", "Mm-hmm.")
 REPLY_WORD_CAP = 45
 ACK_WORD_CAP = 15
 HIT_FLAG_THRESHOLD = 3
+# Speaking style (R1-Q iteration 1).  A tic word ("hmm", "honestly") may appear in at most one
+# reply in five, an interjection or demonstrative may open at most one reply in seven, and a reply
+# never holds two filler words.  All of it is deterministic text surgery: zero extra model calls.
+STYLE_TIC_WINDOW = 4
+STYLE_OPENER_WINDOW = 6
+# A word that can also start a sentence ("Look at the schedule", "Right now", "So far", "Well done")
+# only counts as a filler or an interjection when a comma, a full stop or a dash follows it.
+_LEAD_FILLER = re.compile(
+    r"^\W*(?:(?:hmm+|hm|honestly|to be honest|frankly|actually|basically)\b[,.\s-]*"
+    r"|(?:well|look|listen|i mean|you know)\b[,.-]+\s*)",
+    re.IGNORECASE,
+)
+_LEAD_INTERJECTION = re.compile(
+    r"^\W*(?:(?:okay|ok|oh|yeah|alright|all right|ah|wow|mm|um+|uh+)\b[,.!?\s-]*"
+    r"|(?:right|sure|well|so|great|perfect|cool|fine|yes)\b[,.!?-]+\s*)+",
+    re.IGNORECASE,
+)
+_INLINE_FILLER = re.compile(r",?\s*\b(?:you know|i mean)\b,?", re.IGNORECASE)
+# A sentence longer than this is left alone: the style rules are for spoken sentences.
+STYLE_MAX_CHARS = 600
+# "that's reassuring" -> "reassuring": only where dropping the demonstrative leaves a sentence.
+_LEAD_DEMONSTRATIVE = re.compile(
+    r"^that(?:'s| is)?\s+(?=(?:a|an|the|really|so|very|pretty|quite|good|great|fair|true|helpful|"
+    r"reassuring|interesting|nice|useful|clear|helps|makes|sounds|gives|means|feels|seems|covers|"
+    r"explains|answers|eases|works)\b)",
+    re.IGNORECASE,
+)
+_TIC_STRIP = {
+    TIC_HMM: (
+        re.compile(r"^\W*hmm+\b[,.\s-]*", re.IGNORECASE),
+        re.compile(r"\s*,?\s*\bhmm+\b[,.]?", re.IGNORECASE),
+    ),
+    TIC_HONESTLY: (
+        re.compile(r"^\W*(?:honestly|to be honest|frankly)\b[,.\s-]*", re.IGNORECASE),
+        re.compile(r"\s*,?\s*\b(?:honestly|to be honest|frankly)\b[,]?", re.IGNORECASE),
+    ),
+}
+# A confirmation holds no doubt and asks nothing new: these words reopen what was agreed.
+_DOUBT = re.compile(
+    r"\b(?:hold on|not sure|hesitat\w+|hard sell|pressure|but what|what if|still need|i'?d rather|"
+    r"i don'?t want|too soon|too early|i'?m afraid|on second thought|i'?m (?:a bit |a little )?"
+    r"worried|i worry|concerns?)\b"
+    r"|(?<!can't )(?<!cannot )(?<!can not )\bwait\b(?! (?:to|for|until)\b)",
+    re.IGNORECASE,
+)
+# The time cue is the LEARNER's: "you mentioned you only have a couple of minutes" turns it round.
+_TIME_REVERSAL = re.compile(
+    r"\byou(?:'ve| have)? (?:just |only )?(?:mentioned|said|told me|noted)\b[^.?!]{0,40}"
+    r"\b(?:minutes?|next call|another call|short on time)\b"
+    r"|\byou(?:'ve| have|'re| are)? (?:only |just )?(?:got|have|having) (?:only |just )?"
+    r"(?:a couple of|a few|two|five|ten|\d+) minutes\b",
+    re.IGNORECASE,
+)
+# The decision maker stays the persona's whole call ("it's just me deciding" is the contradiction).
+_DECIDES_ALONE = re.compile(
+    r"\b(?:it'?s|it is|its) (?:just|only) me\b[^.?!]{0,25}\b(?:decid\w+|decision|who decides)\b"
+    r"|\b(?:just|only) me (?:deciding|who decides|making (?:the|this) decision)\b"
+    r"|\bi (?:decide|make (?:the|this|my own) decisions?) (?:on my own|alone|by myself|myself)\b"
+    r"|\b(?:no ?one|nobody) else (?:is |will be |has to be )?(?:involved|decides?|deciding|"
+    r"part of|in (?:the|this) decision)\b"
+    r"|\bi don'?t (?:need to|have to) (?:ask|check with|talk to|run (?:it|this) by) "
+    r"(?:any ?one|anybody|someone)\b",
+    re.IGNORECASE,
+)
+# Thanks for a discount nobody granted: "I can check with my manager" -> "Thank you, that helps".
+_GRANT_GRATITUDE = re.compile(
+    r"\b(?:thank(?:s| you)|appreciate|grateful)\b[^.?!]{0,50}\b(?:discount|reduc\w+|"
+    r"(?:lower|better|special) (?:price|rate|deal)|the deal|that helps?|that would help|"
+    r"helps a lot|great news|good news|that'?s great)\b"
+    r"|\b(?:great|good|wonderful) news\b|\bbetter than i expected\b|\bthat'?s a (?:huge )?relief\b",
+    re.IGNORECASE,
+)
+# What the learner says in place of a misreading (never the misreading itself).
+ANCHOR_REPLACEMENT = "So what would the actual price come to?"
+GRATITUDE_REPLACEMENT = "That would be good to know."
+# A warm confirmation for a reply that held only doubts or questions after a commitment.
+CONFIRM_FALLBACKS = (
+    "Sounds good, thank you. I'm looking forward to it.",
+    "Great, thanks so much. Looking forward to it.",
+    "Perfect, thank you. Talk to you then.",
+)
+# "Oh, $7,000, that's better than I expected" after the learner only RAISED $7,000.
+_ANCHOR_REACTION = re.compile(
+    r"\b7,?000\b[^?]{0,60}\b(?:better than i expected|a relief|great|good news|wonderful|perfect|"
+    r"amazing|that works|works for me|sounds good|i'?ll take)\b"
+    r"|\b(?:better than i expected|that'?s a relief|great news|good news)\b[^?]{0,40}\b7,?000\b"
+    r"|\bso you can (?:actually |really )?do (?:the |that )?\$?7,?000\b",
+    re.IGNORECASE,
+)
 
 LEARNER_PHASE = "roleplay"
 FEEDBACK_PHASES = frozenset({"roleplay_exit", "wrapup", "closing"})
@@ -140,6 +234,8 @@ PROTECTED_QUESTION = "protected_question"
 SCRIPTED_CUE = "scripted_cue"
 ACK_FORMAT = "ack_format"
 REPEAT = "repeat"
+REOPEN = "reopen"
+MISREAD = "misread"
 CATEGORIES = (
     CONTROL,
     VENDOR,
@@ -157,9 +253,11 @@ CATEGORIES = (
     SCRIPTED_CUE,
     ACK_FORMAT,
     REPEAT,
+    REOPEN,
+    MISREAD,
 )
 # Hygiene is counted and logged but is not a leak and is never posted to the API.
-HYGIENE_CATEGORIES = frozenset({ACK_FORMAT, REPEAT})
+HYGIENE_CATEGORIES = frozenset({ACK_FORMAT, REPEAT, REOPEN, MISREAD})
 # Categories that count toward the 3-hit gate: everything except hygiene.
 LEAK_CATEGORIES = frozenset(CATEGORIES) - HYGIENE_CATEGORIES
 
@@ -424,6 +522,18 @@ class GuardContext:
     # model's reply misses the move's markers: a reply with nothing usable left stays EMPTY
     # instead of becoming "Sorry, what were you saying?" in front of that line.
     quiet_empty: bool = False
+    # Topics whose deep need was already told (a later mention is dropped, not swapped for the
+    # surface answer), and whether the advisor only said they would check or try on the price.
+    spent_topics: frozenset[str] = frozenset()
+    nothing_granted: bool = False
+    # How the learner's last replies opened and which tic words they held (oldest first):
+    # ``(opener, tics)`` pairs from ``r1_text.reply_opener`` / ``reply_tics``.
+    recent_styles: tuple[tuple[str, tuple[str, ...]], ...] = ()
+    # The commitment is on record: the reply only confirms it, so a question or a doubt is dropped.
+    confirm: bool = False
+    # The best price the advisor has put on the table (None: none); "$7,000, better than I
+    # expected" is a misreading unless it is at or below $7,000.
+    offer_usd: int | None = None
 
     @property
     def is_learner(self) -> bool:
@@ -445,6 +555,7 @@ class GuardResult:
     replaced: bool
     fallback_used: bool
     truncated: bool = False
+    style_edits: int = 0
 
     @property
     def clean(self) -> bool:
@@ -466,8 +577,10 @@ class GuardLedger:
     counts: dict[str, int] = field(default_factory=dict)
     total: int = 0
     leak_total: int = 0
+    style_edits: int = 0
 
     def record(self, result: GuardResult) -> None:
+        self.style_edits += result.style_edits
         for hit in result.hits:
             self.counts[hit.category] = self.counts.get(hit.category, 0) + 1
             self.total += 1
@@ -485,6 +598,8 @@ class GuardLedger:
             "hygiene_hits": self.total - self.leak_total,
             "by_category": dict(self.counts),
             "flagged": self.flagged,
+            # Filler words and repeated openers the style rules took out (counts only).
+            "style_edits": self.style_edits,
         }
 
 
@@ -698,6 +813,19 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
         hits.append(_hit(INVENTED_FACT, "own_availability_figure", sentence))
     elif any(amount not in allowed for amount in dollar_amounts(sentence)):
         hits.append(_hit(INVENTED_FACT, "amount_off_card", sentence))
+    if ctx.confirm and (question or _DOUBT.search(sentence) is not None):
+        hits.append(_hit(REOPEN, "confirm_only", sentence))
+    if _TIME_REVERSAL.search(sentence) is not None:
+        hits.append(_hit(MISREAD, "time_cue_reversed", sentence))
+    if persona is not None and _DECIDES_ALONE.search(sentence) is not None:
+        hits.append(_hit(MISREAD, "decider_alone", sentence))
+    if ctx.nothing_granted and _GRANT_GRATITUDE.search(sentence) is not None:
+        hits.append(_hit(MISREAD, "gratitude_for_nothing", sentence))
+    if (
+        (ctx.offer_usd is None or ctx.offer_usd > 7000)
+        and _ANCHOR_REACTION.search(canonical_amounts(sentence)) is not None
+    ):
+        hits.append(_hit(MISREAD, "anchor_taken_as_offer", sentence))
     if ctx.mode == "ack" and not _is_card_answer(sentence, persona):
         if question:
             hits.append(_hit(ACK_FORMAT, "ack_question", sentence))
@@ -747,6 +875,7 @@ def _card_texts(persona: RenderedPersona) -> list[str]:
     answers = [answer for _, answer in PUBLIC_ANSWERS]
     answers.append(persona.persona.prior_learning)
     answers.extend(persona.surface(topic) for topic in H_TOPICS)
+    answers.append(persona.decider_answer)
     return answers
 
 
@@ -822,9 +951,17 @@ def _replacement(hits: list[Hit], ctx: GuardContext) -> str:
     if ctx.is_learner and ctx.persona is not None:
         need = next((hit for hit in hits if hit.category == VOLUNTEERED_NEED), None)
         if need is not None:
-            return ctx.persona.surface(need.rule)
+            return "" if need.rule in ctx.spent_topics else ctx.persona.surface(need.rule)
     if ctx.is_learner and CONTACT in categories:
         return CONTACT_REPLACEMENT
+    if ctx.is_learner and MISREAD in categories:
+        rule = next(hit.rule for hit in hits if hit.category == MISREAD)
+        if rule == "anchor_taken_as_offer":
+            return ANCHOR_REPLACEMENT
+        if rule == "gratitude_for_nothing":
+            return GRATITUDE_REPLACEMENT
+        if rule == "decider_alone" and ctx.persona is not None:
+            return ctx.persona.decider_answer
     return ""
 
 
@@ -839,6 +976,12 @@ def _fallback(ctx: GuardContext, *, only_repeats: bool = False) -> str:
     """
     if ctx.is_learner and (ctx.mode == "ack" or only_repeats):
         return NEUTRAL_ACKS[ctx.turn % len(NEUTRAL_ACKS)]
+    if ctx.is_learner and ctx.confirm:
+        for offset in range(len(CONFIRM_FALLBACKS)):
+            candidate = pick_variant(CONFIRM_FALLBACKS, ctx.seed, ctx.variant + offset)
+            if repeat_kind(candidate, ctx.said) is None:
+                return candidate
+        return pick_variant(CONFIRM_FALLBACKS, ctx.seed, ctx.variant)
     if ctx.is_learner:
         for offset in range(len(FALLBACK_REPLIES)):
             candidate = pick_variant(FALLBACK_REPLIES, ctx.seed, ctx.variant + offset)
@@ -869,6 +1012,8 @@ class StreamGuard:
         self._done = False
         self._repeat_drops = 0
         self._other_drops = 0
+        self._reply_fillers = 0  # filler words already kept in this reply
+        self._style_edits = 0
 
     def _repeat_hit(self, kind: str, sentence: str) -> Hit:
         """A ``repeat`` hit for ``sentence`` (digest always; excerpt only if opted in)."""
@@ -898,6 +1043,76 @@ class StreamGuard:
         kind = repeat_kind(out, self.ctx.said)
         return None if kind is None else self._repeat_hit(kind, out)
 
+    def _tic_allowed(self, tic: str) -> bool:
+        """A tic word may appear in at most one reply in five, and one filler per reply."""
+        if self._reply_fillers >= 1:
+            return False
+        recent = self.ctx.recent_styles[-STYLE_TIC_WINDOW:]
+        return not any(tic in tics for _opener, tics in recent)
+
+    def _vary(self, sentence: str) -> str:
+        """The sentence with its tic words, extra fillers and a repeated opener taken out.
+
+        Only a learner reply is varied.  A sentence that would be left with fewer than two words
+        keeps its filler (a bare "Hmm." becomes a neutral acknowledgement instead).
+        """
+        ctx = self.ctx
+        if not ctx.is_learner or ctx.mode != "reply" or len(sentence) > STYLE_MAX_CHARS:
+            return sentence
+        text = sentence
+        for tic, (leading, inline) in _TIC_STRIP.items():
+            if TIC_PATTERNS[tic].search(text) is None:
+                continue
+            if self._tic_allowed(tic):
+                self._reply_fillers += 1
+                continue
+            text = leading.sub("", text, count=1)
+            text = inline.sub(_filler_gap, text)
+        text = self._single_filler(text)
+        if self._reply_fillers >= 1:
+            text = _INLINE_FILLER.sub(_filler_gap, text)
+        if not self._emitted:
+            text = self._vary_opener(text)
+        if text != sentence:
+            text = _tidy(text)
+            if text and text[0].islower():
+                text = text[0].upper() + text[1:]
+            if not re.search(r"[A-Za-z0-9]", text):
+                text = NEUTRAL_ACKS[ctx.turn % len(NEUTRAL_ACKS)]
+            self._style_edits += 1
+        return text
+
+    def _single_filler(self, text: str) -> str:
+        """Keep the first filler word that opens ``text`` (if the reply has none), drop the rest.
+
+        A tic word that is still here was allowed by ``_tic_allowed`` and is already counted; any
+        other opening filler ("Well,", "Actually,") counts once and a second one is dropped, so
+        "Hmm, well, ..." becomes "Hmm, ...".  A filler that is all there is of the sentence stays.
+        """
+        kept = ""
+        while True:
+            lead = _LEAD_FILLER.match(text)
+            if lead is None or word_count(text[lead.end() :]) < 2:
+                return kept + text
+            if _is_tic_word(lead.group(0)):
+                kept += lead.group(0)
+            elif self._reply_fillers == 0:
+                self._reply_fillers += 1
+                kept += lead.group(0)
+            text = text[lead.end() :]
+
+    def _vary_opener(self, text: str) -> str:
+        """Take an interjection or a "That's" off a reply that opens like one of the last six."""
+        recent = [past for past, _tics in self.ctx.recent_styles[-STYLE_OPENER_WINDOW:]]
+        for pattern in (_LEAD_INTERJECTION, _LEAD_DEMONSTRATIVE):
+            opener = reply_opener(text)
+            if not opener or opener not in recent:
+                break
+            match = pattern.match(text)
+            if match is not None and word_count(text[match.end() :]) >= 2:
+                text = text[match.end() :]
+        return text
+
     def _vet(self, sentence: str) -> list[str]:
         if self._done:
             return []
@@ -916,6 +1131,8 @@ class StreamGuard:
                 out = ""
             if out:
                 self._replacements.add(out)
+        if out and not hits:
+            out = self._vary(out)
         if out and out not in self._emitted:
             repeated = self._repeated(out)
             if repeated is not None:
@@ -983,6 +1200,7 @@ class StreamGuard:
             replaced=self._replaced,
             fallback_used=self._fallback_used,
             truncated=self._truncated,
+            style_edits=self._style_edits,
         )
 
 
@@ -992,6 +1210,25 @@ def guard_text(text: str, ctx: GuardContext) -> GuardResult:
     guard.feed(text)
     guard.flush()
     return guard.result
+
+
+def _filler_gap(match: re.Match[str]) -> str:
+    """What replaces a filler taken out of the middle of a sentence: its comma, or one space."""
+    return "," if "," in match.group(0) else " "
+
+
+def _tidy(text: str) -> str:
+    """Spacing and commas after a filler was taken out ("packed , , and" -> "packed, and")."""
+    text = re.sub(r"\s+([,.?!])", r"\1", text)
+    text = re.sub(r",(?:\s*,)+", ",", text)
+    text = re.sub(r",\s*([.?!])", r"\1", text)
+    text = re.sub(r"^[\s,]+", "", text)
+    return re.sub(r"\s{2,}", " ", text).strip()
+
+
+def _is_tic_word(text: str) -> bool:
+    """True when ``text`` is (led by) one of the tic words, which have their own quota."""
+    return any(pattern.search(text) is not None for pattern in TIC_PATTERNS.values())
 
 
 def has_concession(text: object) -> bool:

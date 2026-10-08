@@ -457,5 +457,52 @@ class CanonicalAmountTests(unittest.TestCase):
                 self.assertEqual(dollar_amounts(text), [1500])
 
 
+class SpeakingStyleHelperTests(unittest.TestCase):
+    """R1-Q iteration 1: the opener word and the tic words of a reply (shared by the guard and the
+    engine's style memory; the rehearsal harness keeps its own copy of the same idea)."""
+
+    def test_the_opener_is_the_first_word_in_lower_case(self):
+        from r1_text import reply_opener
+
+        for text, expected in (
+            ("Hmm, that makes sense.", "hmm"),
+            ("That's fair.", "that"),
+            ("  \"Okay.\"", "okay"),
+            ("I'm not sure.", "i"),
+            ("Mm-hmm, right.", "mm"),
+            ("...Well, maybe.", "well"),
+            ("", ""),
+            ("$7,000 is a lot.", "is"),  # digits are skipped: the first word is the first letters
+            (None, ""),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(reply_opener(text), expected)
+
+    def test_the_tic_words_a_reply_holds(self):
+        from r1_text import reply_tics
+
+        for text, expected in (
+            ("Hmm, that makes sense.", ("hmm",)),
+            ("Honestly, I am not sure.", ("honestly",)),
+            ("Hmm... to be honest, it is a lot.", ("hmm", "honestly")),
+            ("Frankly, no.", ("honestly",)),
+            ("Mm-hmm, I follow.", ()),
+            ("Whim and hmmm.", ("hmm",)),
+            ("The hmmer is broken.", ()),
+            ("That is an honest question.", ()),
+            ("", ()),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(reply_tics(text), expected)
+
+    def test_the_tic_patterns_are_linear_on_hostile_text(self):
+        import time
+        from r1_text import reply_tics
+
+        started = time.perf_counter()
+        reply_tics("hm" * 40000 + " honest" * 20000)
+        self.assertLess(time.perf_counter() - started, 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -8,7 +8,10 @@ judge gates in an offline sweep, the simulator gates with a scripted advisor, an
 the full flow) is ``n/a``, never a pass: ``ready_for_owner_test`` needs every applicable gate
 measured and met on a LIVE sweep.
 
-``info`` gates (the intent fallback rate) are reported but never block.
+``info`` gates (the intent fallback rate, and since R1-Q iteration 1 the reply-length gates: mean
+<= 22 words, p90 <= 35, short replies >= 30 %) are reported but never block.  Wordiness is the
+owner's accepted trade (2026-10-08); the verbal-tic gates (a reaction word opening more than 15 % of
+the replies, "hmm" or "honestly" in more than 20 %) block instead.
 """
 from __future__ import annotations
 
@@ -26,6 +29,10 @@ LEVEL_GROUP = {
 }
 ALL_GROUPS = {"strong": 0.0, "average": 0.0, "other": 0.0}
 MIN_CALLS_FOR_READY = 20
+# Verbal tics (owner decision 2026-10-08): the live sweep had "Hmm" opening 44 of 90 replies and
+# "Honestly" in 50 of 90.
+OPENER_SHARE_LIMIT = 0.15
+TIC_SHARE_LIMIT = 0.20
 
 # (id, label, metric, op, {group: threshold}, kind)
 GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
@@ -129,26 +136,50 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
     ),
     (
         "length_high",
-        "Reply length, mean words <= 22",
+        "Reply length, mean words <= 22 (info: wordiness is accepted)",
         "reply_words_mean",
         "<=",
         {"strong": 22, "average": 22, "other": 22},
-        "gate",
+        "info",
     ),
     (
         "length_p90",
-        "Reply length, p90 words <= 35",
+        "Reply length, p90 words <= 35 (info: wordiness is accepted)",
         "reply_words_p90",
         "<=",
         {"strong": 35, "average": 35, "other": 35},
-        "gate",
+        "info",
     ),
     (
         "short_share",
-        "Short replies (<= 8 words) share >= 30 %",
+        "Short replies (<= 8 words) share >= 30 % (info: wordiness is accepted)",
         "short_reply_share",
         ">=",
         {"strong": 0.3, "average": 0.3, "other": 0.3},
+        "info",
+    ),
+    (
+        "opener_tic",
+        "No reaction word opens more than 15 % of the replies",
+        "opener_top_share",
+        "<=",
+        {"strong": OPENER_SHARE_LIMIT, "average": OPENER_SHARE_LIMIT, "other": OPENER_SHARE_LIMIT},
+        "gate",
+    ),
+    (
+        "hmm_tic",
+        '"hmm" in at most 20 % of the replies',
+        "hmm_share",
+        "<=",
+        {"strong": TIC_SHARE_LIMIT, "average": TIC_SHARE_LIMIT, "other": TIC_SHARE_LIMIT},
+        "gate",
+    ),
+    (
+        "honestly_tic",
+        '"honestly" in at most 20 % of the replies',
+        "honestly_share",
+        "<=",
+        {"strong": TIC_SHARE_LIMIT, "average": TIC_SHARE_LIMIT, "other": TIC_SHARE_LIMIT},
         "gate",
     ),
     (
@@ -260,7 +291,23 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         float(m["judge_misfire_count"]) if m.get("judge_misfire_count") is not None else float(m.get("misfire_count") or 0)
         for m in calls
     ]
+    # Tics are pooled over the group's replies (a share of all replies, not a mean of call shares).
+    replies = sum(int(m.get("reply_count") or 0) for m in calls)
+    openers: Counter[str] = Counter()
+    for m in calls:
+        openers.update(m.get("opener_counts") or {})
+    top = openers.most_common(1)
+    misfire_kinds: Counter[str] = Counter(
+        str(item.get("kind")) for m in calls for item in m.get("misfires") or []
+    )
     return {
+        "opener_top_word": top[0][0] if top else None,
+        "opener_top_share": _rate(top[0][1], replies) if top else (0.0 if replies else None),
+        "hmm_share": _rate(sum(int(m.get("reply_hmm_count") or 0) for m in calls), replies),
+        "honestly_share": _rate(
+            sum(int(m.get("reply_honestly_count") or 0) for m in calls), replies
+        ),
+        "misfire_kinds": dict(misfire_kinds),
         "calls": n,
         "hard_fail_calls": len(failing),
         "hard_fail_rate": _rate(len(failing), n),
@@ -457,6 +504,9 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
         ("short replies share", "short_reply_share"),
         ("question rate", "question_rate"),
         ("reaction-opener rate", "reaction_rate"),
+        ("top reaction opener share", "opener_top_share"),
+        ("replies with hmm", "hmm_share"),
+        ("replies with honestly", "honestly_share"),
         ("style mean (judge)", "style_mean"),
         ("intents needing the scripted variant", "intent_fallback_rate"),
         ("fidelity pass rate", "fidelity_pass_rate"),
@@ -473,13 +523,14 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
         cells = [_fmt((agg[level].get("max_slip_sec_by_family") or {}).get(family), 1) for level in levels]
         lines.append(f"| {family} | " + " | ".join(cells) + " |")
     lines.append("")
-    lines.append("commitment levels / guard hits / stop reasons:")
+    lines.append("commitment levels / guard hits / stop reasons / misfire kinds / top opener:")
     lines.append("")
     for level in levels:
         group = agg[level]
         lines.append(
             f"- {level}: commitment {group['commitment_levels']}, guard {group['guard_by_category']}, "
-            f"stop {group['stop_reasons']}"
+            f"stop {group['stop_reasons']}, misfires {group['misfire_kinds']}, "
+            f"top opener {group['opener_top_word']}"
         )
     lines.append("")
     lines.append("## Gates")

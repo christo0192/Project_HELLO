@@ -93,7 +93,7 @@ LINES: dict[str, str] = {
     ),
     "L-FILLER": "Let me think about that for a second.",
     "L-FILLER-INTERVIEWER": "Let me think about that for a second.",
-    "L-FILLER-LEARNER": "Hmm, one second...",
+    "L-FILLER-LEARNER": "One second...",
 }
 
 # The learner's thinking filler rotates through three variants so a slow model never makes the
@@ -101,12 +101,12 @@ LINES: dict[str, str] = {
 # starts at a point derived from the attempt id (``r1_text.pick_variant``).
 LEARNER_FILLER_VARIANTS: tuple[str, ...] = (
     LINES["L-FILLER-LEARNER"],
-    "Hmm, let me think for a second...",
-    "Hmm, give me a moment...",
+    "Let me think for a second...",
+    "Give me a moment...",
 )
 # When every variant above was already played, the filler is this one-word hum: under four words,
 # so it is never a repeat in the sense of ``r1_text.repeat_kind`` (R1-Q round 1).
-LEARNER_FILLER_SHORT = "Hmm..."
+LEARNER_FILLER_SHORT = "One moment..."
 
 # The exit line's first sentence is the cue the LLM must never imitate (``r1_guard``).
 EXIT_CUE = "Let's pause the role-play here."

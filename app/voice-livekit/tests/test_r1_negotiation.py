@@ -1243,7 +1243,7 @@ class AnchorAfterOfferTests(unittest.TestCase):
                 situation = neg.anchor_after_offer(offer)
                 context = GuardContext(
                     phase="roleplay", persona=rendered, mode="reply",
-                    advisor_amounts=frozenset({offer}),
+                    advisor_amounts=frozenset({offer}), offer_usd=offer,
                 )
                 for text in (situation.brief, *situation.variants):
                     self.assertEqual(deep_need_topics_in(rendered, text), frozenset(), text)
@@ -1256,6 +1256,145 @@ class AnchorAfterOfferTests(unittest.TestCase):
                         hits = check_sentence(sentence, context)
                         self.assertEqual(hits, [], f"{rendered.id}: {sentence!r} -> {hits}")
                 self.assertNotIn('"', situation.brief)
+
+
+class AdvisorTurnReadingsIterationOneTests(unittest.TestCase):
+    """R1-Q iteration 1: three more things the learner reads in an advisor turn -- a hedge that
+    grants nothing, a question about who else decides, and a mention of the $7,000 anchor."""
+
+    TENTATIVE = (
+        "I can check with my manager about a discount for you.",
+        "Let me see what I can do on the price.",
+        "I'll try to get you a better price, but I can't promise anything.",
+        "No promises, but I might be able to bring the fee down.",
+        "Let me talk to my supervisor and see if there is a lower price.",
+        "I'll do my best on the price.",
+    )
+    NOT_TENTATIVE = (
+        "Let me check the start date for you.",
+        "I can check which cohort is next.",
+        "Let me see, the next cohort starts in March.",
+        "The price is $9,000 and we have a payment plan.",
+        "I can do $8,000 for you today.",
+        "That sounds like a good plan.",
+    )
+    DECIDER = (
+        "Is anyone else involved in the decision?",
+        "Who else would be part of this decision?",
+        "Would you want to talk it over with your husband?",
+        "Do you need to check with anyone before you decide?",
+        "Are you the only decision maker here?",
+        "Does your father get a say in this?",
+        "Will your partner be involved in the decision?",
+        "Would you decide this together with your wife?",
+        "Do you discuss things like this with anyone else?",
+    )
+    NOT_DECIDER = (
+        "We can enrol you tomorrow.",
+        "Our decision is to keep the batch small.",
+        "That is a big decision, and I respect that.",
+        "Who else from your team has joined the program?",
+        "Is anyone else in your family in data science?",
+        "How do you feel about the schedule?",
+        "I decided to become an advisor years ago.",
+    )
+    ANCHOR = (
+        "Who told you seven thousand dollars?",
+        "So you are looking at $7,000.",
+        "$7,000 is not something I can promise.",
+        "You said 7000. Let me see what is possible.",
+        "I can't do 7k, sorry.",
+    )
+    NOT_ANCHOR = (
+        "The price is $9,000.",
+        "We have about 7,000 students across 18 domains.",
+        "It is 7,000 people who attended the webinar.",
+        "I can do $8,500 for you.",
+        "The program is six months.",
+    )
+
+    def test_a_hedge_about_the_price_is_tentative(self):
+        for text in self.TENTATIVE:
+            with self.subTest(text=text):
+                self.assertTrue(neg.detect_tentative(text))
+        for text in self.NOT_TENTATIVE:
+            with self.subTest(text=text):
+                self.assertFalse(neg.detect_tentative(text))
+
+    def test_asking_who_else_decides(self):
+        for text in self.DECIDER:
+            with self.subTest(text=text):
+                self.assertTrue(neg.asks_decider(text))
+        for text in self.NOT_DECIDER:
+            with self.subTest(text=text):
+                self.assertFalse(neg.asks_decider(text))
+
+    def test_a_statement_about_a_decision_maker_is_not_a_question_to_the_learner(self):
+        self.assertFalse(neg.asks_decider("The decision maker for discounts is my manager."))
+        self.assertFalse(neg.asks_decider("You will talk it over with your husband and then we decide."))
+
+    def test_naming_the_anchor(self):
+        for text in self.ANCHOR:
+            with self.subTest(text=text):
+                self.assertTrue(neg.mentions_anchor(text))
+        for text in self.NOT_ANCHOR:
+            with self.subTest(text=text):
+                self.assertFalse(neg.mentions_anchor(text))
+
+    def test_the_turn_carries_the_three_readings(self):
+        state = neg.Negotiation("husband")
+        seen = state.observe(5, "Who told you $7,000? Is anyone else involved in the decision?", anchor_turn=4)
+        self.assertTrue(seen.anchor_mentioned)
+        self.assertTrue(seen.decider_asked)
+        self.assertFalse(seen.tentative)
+        seen = state.observe(6, "I can check with my manager about a discount for you.", anchor_turn=4)
+        self.assertTrue(seen.tentative)
+        self.assertFalse(seen.anchor_mentioned)
+
+    def test_the_anchor_is_only_named_after_the_learner_said_it(self):
+        state = neg.Negotiation("husband")
+        seen = state.observe(2, "Some people get $7,000 off the price.", anchor_turn=None)
+        self.assertFalse(seen.anchor_mentioned)
+
+    def test_a_turn_with_a_figure_or_a_refusal_is_no_hedge(self):
+        state = neg.Negotiation("husband")
+        seen = state.observe(5, "Let me check with my manager, but I can do $8,000 today.", anchor_turn=4)
+        self.assertFalse(seen.tentative)
+        self.assertTrue(seen.offers)
+        refused = neg.Negotiation("husband").observe(
+            6, "We can't go lower than that, I'm afraid.", anchor_turn=4
+        )
+        self.assertFalse(refused.tentative)
+
+    def test_the_new_detectors_are_fast_on_hostile_text(self):
+        hostile = (
+            "let me check with my " * 3000,
+            "i can try to see " * 3000,
+            "who else " * 4000,
+            ("is anyone else involved in " + "the " * 40) * 400,
+            "7,000 " * 5000,
+            "$" + "7" * 20000,
+        )
+        for text in hostile:
+            with self.subTest(prefix=text[:20]):
+                started = time.perf_counter()
+                neg.detect_tentative(text)
+                neg.asks_decider(text)
+                neg.mentions_anchor(text)
+                self.assertLess(time.perf_counter() - started, 3.0)
+
+    def test_the_spoken_variants_carry_no_tic_words(self):
+        from r1_text import TIC_PATTERNS
+
+        texts = [variant for spec in neg.SPECS for variant in spec.variants]
+        for counter in neg.COUNTERS:
+            texts.extend(counter.variants)
+        for offer in (6000, 7000, 8500):
+            texts.extend(neg.anchor_after_offer(offer).variants)
+        for text in texts:
+            for tic, pattern in TIC_PATTERNS.items():
+                with self.subTest(text=text, tic=tic):
+                    self.assertIsNone(pattern.search(text))
 
 
 if __name__ == "__main__":

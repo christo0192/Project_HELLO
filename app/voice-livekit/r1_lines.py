@@ -71,7 +71,7 @@ LINES = {
     ),
     "L-FILLER": "Let me think about that for a second.",
     "L-FILLER-INTERVIEWER": "Let me think about that for a second.",
-    "L-FILLER-LEARNER": "Hmm, one second...",
+    "L-FILLER-LEARNER": "One second...",
 }
 
 _NAME = re.compile(r"^[A-Za-z '-]{1,24}$")

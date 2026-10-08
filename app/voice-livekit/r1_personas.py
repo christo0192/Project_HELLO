@@ -141,7 +141,7 @@ PERSONAS: tuple[Persona, ...] = (
                     r"no (?:growth|promotion)",
                 ),
                 hint=(
-                    "Honestly, things at work feel a bit uncertain right now, and I've been "
+                    "Things at work feel a bit uncertain right now, and I've been "
                     "in the same spot for a while."
                 ),
                 facts=(
@@ -186,7 +186,7 @@ PERSONAS: tuple[Persona, ...] = (
                     r"\b(?:daughters?|sons?)\b",
                     r"\bchildcare\b",
                 ),
-                hint="Time and money are both tight at home, to be honest.",
+                hint="Time and money are both tight at home right now.",
                 facts=(
                     "you have two kids",
                     "so it could only be evenings and weekends",
@@ -236,7 +236,7 @@ PERSONAS: tuple[Persona, ...] = (
                     r"\brenewal\b",
                 ),
                 hint=(
-                    "Honestly, my current job feels a bit temporary, and I'd like something "
+                    "My current job feels a bit temporary, and I'd like something "
                     "more settled."
                 ),
                 facts=(
@@ -257,7 +257,7 @@ PERSONAS: tuple[Persona, ...] = (
                     r"(?:rejected|failed) (?:in|after|at) (?:the )?(?:ml|machine[- ]learning|"
                     r"technical|final)",
                 ),
-                hint="The interviews haven't really been going my way lately, honestly.",
+                hint="The interviews haven't really been going my way lately.",
                 facts=(
                     "you keep failing the ML and technical rounds",
                     "learning on your own is not working for you",
@@ -521,6 +521,11 @@ class RenderedPersona:
         return self.persona.decision_maker
 
     @property
+    def decider_answer(self) -> str:
+        """The public answer to "who else is involved in your decision" (one person, all call)."""
+        return f"I'd talk it over with my {self.persona.decision_maker} first."
+
+    @property
     def spoken_city(self) -> str:
         """The city as TTS should read it: "Edison, New Jersey", not "Edison, NJ"."""
         town, _, state = self.variant.city.partition(", ")
@@ -582,6 +587,7 @@ class RenderedPersona:
         parts.append(f'- what you have studied so far: "{self.persona.prior_learning}"')
         for label, answer in PUBLIC_ANSWERS:
             parts.append(f'- {label}: "{answer}"')
+        parts.append(f'- who else is involved in your decision: "{self.decider_answer}"')
         parts.append(
             "Anything else about yourself that is not listed here: answer in a few vague, "
             "believable words and invent no numbers, names or dates. Anything else about "
@@ -758,6 +764,41 @@ _FOLLOWUP = re.compile(
     r"what does (?:that|this|it) (?:[\w-]+ ){0,3}look like)\b",
     re.IGNORECASE,
 )
+# A follow-up also picks up what the learner just said: "When you say it didn't work out, was it
+# the technical rounds or something else?", "What specifically tripped you up?".
+_FOLLOWUP_REFERENCING = re.compile(
+    r"\bwhen you say\b|\byou(?:'ve| have)? (?:mentioned|said|told me)\b|\bsomething else\b"
+    r"|\b(?:was|is) it (?:more|the|that|because)\b|\bwhat (?:tripped|held|stopped|kept) you\b"
+    r"|\bwhat do you think (?:is|was|held|tripped|made|caused)\b|\bwhat(?:'s| is) making\b"
+    r"|\bwhat(?:'s| is) really (?:driving|behind)\b|\bwhy (?:data science|that|this) "
+    r"specifically\b|\band why\b|\bwhat would need to be (?:different|true)\b"
+    r"|\bwhat(?:'s| is) the main thing\b|\bwhere do you feel\b",
+    re.IGNORECASE,
+)
+# The advisor offering or suggesting something is not asking the learner about themselves:
+# "Would it help if I set up a call with you and your father?", "Would a payment plan help?".
+_OFFER_QUESTION = re.compile(
+    r"\bwould (?:it|that|this|a|an|the|some|any)\b[^?]{0,40}\bhelp\b"
+    r"|\bwould it be (?:ok|okay|better|good|helpful|useful|nice)\b|\bwould you like me to\b"
+    r"|\bdo you want me to\b|\bwant me to\b|\b(?:shall|should) (?:i|we)\b"
+    r"|\b(?:can|could) (?:i|we)\b(?! (?:just |quickly )?ask\b)|\bhow about\b|\bwhy don'?t we\b",
+    re.IGNORECASE,
+)
+# A check-in on the advisor's own answer is not a probe of the learner: "Did that answer your
+# concern?", "Does that ease the schedule worry?", "Would that structure work for your budget?".
+_CHECKIN_ON_ANSWER = re.compile(
+    r"^\W*(?:(?:and|so|okay|ok|well|now|then)\W+)*(?:did|does|do|is|was|would|will|could|can)\s+"
+    r"(?:that|this|it|those|these|all (?:of )?that|all this|(?:the|a|an|our|my) [\w' -]{1,40}?)"
+    r"\s+(?:\w+\s+){0,3}?(?:help|ease|address|answer|make sense|sound|feel|work|fit|resolve|"
+    r"cover|clear|settle|reassure|satisfy|speak to|relieve|lighten|take|give|change)\w*\b",
+    re.IGNORECASE,
+)
+# "Which payment plan sounds most realistic for your budget?" asks for a choice, not a situation.
+_CHOICE_QUESTION = re.compile(
+    r"^\W*(?:(?:and|so|okay|ok|well|now|then)\W+)*(?:which|what)\s+(?:\w+\s+){0,2}?"
+    r"(?:plan|option|discount|tier|package|batch|cohort|payment plan)s?\b",
+    re.IGNORECASE,
+)
 _FOLLOWUP_IMPERATIVE = re.compile(
     r"^(?:(?:okay|ok|so|and|please)[,\s]+)*(?:please\s+)?"
     r"(?:say more|elaborate|expand|dig (?:in|deeper)|go on|keep going|unpack that)\b",
@@ -776,6 +817,12 @@ def detect_probes(text: object) -> frozenset[str]:
         if not is_question_like(sentence):
             continue
         lowered = fold(sentence).lower()
+        if (
+            _CHECKIN_ON_ANSWER.search(lowered) is not None
+            or _OFFER_QUESTION.search(lowered) is not None
+            or _CHOICE_QUESTION.search(lowered) is not None
+        ):
+            continue
         in_sentence: set[str] = set()
         for topic, patterns in PROBE_RULES.items():
             if any(pattern.search(lowered) for pattern in patterns):
@@ -796,7 +843,9 @@ def detect_followup(text: object) -> bool:
         folded = fold(sentence)
         if _FOLLOWUP_IMPERATIVE.match(folded.strip()):
             return True
-        if is_question_like(folded) and _FOLLOWUP.search(folded):
+        if is_question_like(folded) and (
+            _FOLLOWUP.search(folded) or _FOLLOWUP_REFERENCING.search(folded)
+        ):
             return True
     return False
 

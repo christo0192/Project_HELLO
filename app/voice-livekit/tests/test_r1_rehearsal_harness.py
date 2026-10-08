@@ -1261,6 +1261,10 @@ def fake_record(level, *, fails=(), commitment="MEDIUM", slips=None, **extra):
         "short_reply_share": 0.35,
         "question_rate": 0.4,
         "reaction_rate": 0.6,
+        "reply_count": 20,
+        "opener_counts": {"okay": 2},
+        "reply_hmm_count": 1,
+        "reply_honestly_count": 1,
         "near_repeat_count": 0,
         "exact_repeat_extra": 0,
         "needs_dug": ["H1"],
@@ -1776,6 +1780,258 @@ class NoBalanceTests(unittest.TestCase):
             if path.is_file():
                 assert FAKE_KEY not in path.read_text(encoding="utf-8", errors="replace"), path
         assert not any(FAKE_KEY in line for line in lines)
+
+
+def tic_exchange(n, advisor_text, spoken, *, intent="other", topic="", r_sec=100.0, plan=None):
+    return {
+        "n": n,
+        "r_sec": r_sec,
+        "advisor": {"text": advisor_text, "intent": intent, "topic": topic},
+        "learner": {"spoken": spoken, "plan": plan or {}},
+    }
+
+
+class VerbalTicMetricTests(unittest.TestCase):
+    """R1-Q iteration 1 (owner decision b.1): the harness measures the tics with its own regexes."""
+
+    def test_hmm_honestly_and_the_top_opener_are_counted(self) -> None:
+        texts = [
+            "Hmm, that makes sense.",
+            "Hmm, how long is it?",
+            "Honestly, I am not sure.",
+            "To be honest, money is tight.",
+            "Okay, and then?",
+            "Mm-hmm, I follow.",
+            "I would like to know more.",
+            "What does the mentoring look like?",
+        ]
+        found = metrics.style_metrics(texts)
+        self.assertEqual(found["reply_hmm_count"], 2)  # "Mm-hmm" is a back-channel, not the tic
+        self.assertEqual(found["reply_honestly_count"], 2)
+        self.assertAlmostEqual(found["hmm_share"], 0.25)
+        self.assertAlmostEqual(found["honestly_share"], 0.25)
+        self.assertEqual(found["opener_top_word"], "hmm")
+        self.assertAlmostEqual(found["opener_top_share"], 0.25)
+        self.assertEqual(found["opener_counts"]["okay"], 1)
+
+    def test_a_substantive_first_word_is_not_a_reaction_opener(self) -> None:
+        found = metrics.style_metrics(["I would like to know more.", "My schedule is packed.", "What next?"])
+        self.assertEqual(found["opener_counts"], {})
+        self.assertEqual(found["opener_top_share"], 0.0)
+        self.assertEqual(found["hmm_share"], 0.0)
+
+    def test_no_replies_measure_nothing(self) -> None:
+        found = metrics.style_metrics([])
+        self.assertIsNone(found["opener_top_share"])
+        self.assertIsNone(found["hmm_share"])
+        self.assertIsNone(found["honestly_share"])
+
+    def test_the_harness_does_not_use_the_engines_tic_detector(self) -> None:
+        source = (HERE / "rehearsal" / "metrics.py").read_text(encoding="utf-8")
+        self.assertNotIn("reply_tics", source)
+        self.assertNotIn("TIC_PATTERNS", source)
+
+    def test_the_owner_sweep_would_have_failed_the_tic_gates(self) -> None:
+        """44 of 90 replies opened with "Hmm" and 50 of 90 held "Honestly" in the live sweep."""
+        texts = ["Hmm, that makes sense."] * 44 + ["Honestly, I am not sure."] * 6 + ["What next?"] * 40
+        records = [fake_record("strong", **metrics.style_metrics(texts))]
+        card = scorecard.build_scorecard(records, offline=False)
+        by = {(g["level"], g["gate"]): g for g in card["gates"]}
+        for gate in ("opener_tic", "hmm_tic"):
+            self.assertEqual(by[("strong", gate)]["status"], "fail", gate)
+        self.assertEqual(by[("strong", "honestly_tic")]["status"], "pass")
+        self.assertFalse(card["readiness"]["ready"])
+
+    def test_varied_replies_pass_the_tic_gates(self) -> None:
+        texts = (
+            ["Hmm, that makes sense."] * 2
+            + ["Honestly, I am not sure."] * 2
+            + ["Okay, how long is it?"] * 2
+            + ["What does the mentoring look like?", "I would like to know more.", "My schedule is packed."] * 4
+        )
+        records = [fake_record("average", **metrics.style_metrics(texts))]
+        card = scorecard.build_scorecard(records, offline=False)
+        by = {(g["level"], g["gate"]): g["status"] for g in card["gates"]}
+        for gate in ("opener_tic", "hmm_tic", "honestly_tic"):
+            self.assertEqual(by[("average", gate)], "pass", gate)
+
+    def test_tics_are_pooled_over_the_replies_of_a_group(self) -> None:
+        heavy = metrics.style_metrics(["Hmm, yes."] * 4 + ["What next?"] * 4)
+        light = metrics.style_metrics(["What next?"] * 12)
+        agg = scorecard.aggregate_group(
+            [fake_record("strong", **heavy), fake_record("strong", **light)]
+        )
+        self.assertAlmostEqual(agg["hmm_share"], 4 / 20)
+        self.assertEqual(agg["opener_top_word"], "hmm")
+
+
+class LengthGatesAreInfoOnlyTests(unittest.TestCase):
+    """Owner decision (a) of 2026-10-08: wordiness is accepted; the reply-length gates never block."""
+
+    def gates(self):
+        return {gate[0]: gate for gate in scorecard.GATES}
+
+    def test_the_high_p90_and_short_share_gates_are_info(self) -> None:
+        gates = self.gates()
+        for gate_id in ("length_high", "length_p90", "short_share"):
+            self.assertEqual(gates[gate_id][5], "info", gate_id)
+        self.assertEqual(gates["length_low"][5], "gate")
+
+    def test_a_wordy_call_does_not_block_ready(self) -> None:
+        records = []
+        for level in ("strong", "average", "weak", "pushy", "terse"):
+            commitment = "STRONG" if level == "strong" else "WEAK"
+            for _ in range(5):
+                records.append(
+                    fake_record(
+                        level,
+                        commitment=commitment,
+                        reply_words_mean=31.0,
+                        reply_words_p90=52.0,
+                        short_reply_share=0.05,
+                    )
+                )
+        card = scorecard.build_scorecard(records, offline=False)
+        statuses = {(g["gate"], g["status"]) for g in card["gates"]}
+        self.assertIn(("length_high", "info-fail"), statuses)
+        self.assertIn(("length_p90", "info-fail"), statuses)
+        self.assertIn(("short_share", "info-fail"), statuses)
+        self.assertEqual([g for g in card["gates"] if g["status"] in ("fail", "n/a")], [])
+        self.assertTrue(card["readiness"]["ready"], card["readiness"])
+
+    def test_a_terse_call_still_fails_the_low_bound(self) -> None:
+        card = scorecard.build_scorecard([fake_record("strong", reply_words_mean=4.0)], offline=False)
+        by = {(g["level"], g["gate"]): g["status"] for g in card["gates"]}
+        self.assertEqual(by[("strong", "length_low")], "fail")
+
+
+class IterationOneMisfireTests(unittest.TestCase):
+    """R1-Q iteration 1: misfire shapes of the live sweeps, read from the transcript alone."""
+
+    def kinds(self, exchanges):
+        return [item["kind"] for item in metrics.misfire_metrics(exchanges)["misfires"]]
+
+    def test_the_time_cue_turned_round(self) -> None:
+        kinds = self.kinds([tic_exchange(1, "Let me tell you about the program.", "Right, you mentioned you only have a couple of minutes.")])
+        self.assertEqual(kinds, ["time_cue_reversed"])
+        own = self.kinds([tic_exchange(1, "Let me tell you.", "I only have a couple of minutes before my next call.")])
+        self.assertNotIn("time_cue_reversed", own)
+
+    def test_deciding_alone(self) -> None:
+        kinds = self.kinds([tic_exchange(1, "Who else decides?", "It's just me deciding, really.")])
+        self.assertEqual(kinds, ["decider_alone"])
+        self.assertEqual(self.kinds([tic_exchange(1, "Who else decides?", "I'd talk it over with my husband first.")]), [])
+
+    def test_the_anchor_taken_for_an_offer(self) -> None:
+        said = "Oh, $7,000, that's better than I expected."
+        refused = tic_exchange(1, "Who told you seven thousand dollars?", said, intent="price")
+        self.assertEqual(self.kinds([refused]), ["anchor_taken_as_offer"])
+        offered = tic_exchange(1, "Okay, I can do $7,000 for you today.", said, intent="discount")
+        self.assertEqual(self.kinds([offered]), [])
+        late = [
+            tic_exchange(1, "Okay, I can do $6,500 for you today.", "That is a lot.", intent="discount"),
+            tic_exchange(2, "It is a good price.", said),
+        ]
+        self.assertEqual(self.kinds(late), [])  # an offer at or below $7,000 stands for the rest of the call
+
+    def test_thanks_after_i_can_check_with_my_manager(self) -> None:
+        hedge = tic_exchange(1, "I can check with my manager about a discount.", "Thank you so much, that helps a lot.")
+        self.assertEqual(self.kinds([hedge]), ["gratitude_after_hedge"])
+        polite = tic_exchange(1, "I can check with my manager about a discount.", "Thanks for checking on that.")
+        self.assertEqual(self.kinds([polite]), [])
+        figure = tic_exchange(1, "Let me check, but I can do $8,000.", "Thank you, that helps a lot.")
+        self.assertNotIn("gratitude_after_hedge", self.kinds([figure]))
+
+    def test_a_question_or_a_doubt_after_a_booked_call(self) -> None:
+        booked = {"commitment_level": "MEDIUM", "delivered_commitment": True, "resolves": True}
+        exchanges = [
+            tic_exchange(1, "Shall we book a call?", "Let's book a call tomorrow at 7 PM.", plan=booked),
+            tic_exchange(2, "Great, I'll send an invite.", "Hold on, what would that call involve?"),
+            tic_exchange(3, "It covers your plan.", "Sounds good, thank you."),
+            tic_exchange(4, "Talk soon.", "I'm not sure about the timing."),
+        ]
+        found = metrics.misfire_metrics(exchanges)
+        self.assertEqual(
+            [(item["exchange"], item["kind"]) for item in found["misfires"]],
+            [(2, "reopened_after_commit"), (4, "reopened_after_commit")],
+        )
+
+    def test_nothing_is_reopened_before_a_commitment(self) -> None:
+        exchanges = [tic_exchange(1, "Tell me more?", "Hold on, what would that involve?")]
+        self.assertEqual(self.kinds(exchanges), [])
+
+    def test_the_judge_knows_the_new_kinds(self) -> None:
+        from rehearsal import judge
+
+        for kind in ("time_cue_reversed", "anchor_as_offer", "decider_inconsistent", "reopened_after_commit"):
+            self.assertIn(kind, judge.MISFIRE_KINDS)
+            self.assertIn(kind, judge.RUBRIC)
+        raw = (
+            '{"objections":[],"disclosures":[],"misfires":[{"turn":3,"kind":"anchor_as_offer"},'
+            '{"turn":4,"kind":"made_up"}],"stall_loop":false,'
+            '"style":{"reactions":3,"followups":3,"hesitation":3,"continuity":3,"variety":3},'
+            '"ignored_advisor_offers":[]}'
+        )
+        verdict = judge.parse_verdict(raw)
+        self.assertEqual([m["kind"] for m in verdict["misfires"]], ["anchor_as_offer", "other"])
+
+    def test_misfire_kinds_are_listed_per_group(self) -> None:
+        agg = scorecard.aggregate_group(
+            [fake_record("strong", misfires=[{"exchange": 3, "kind": "decider_alone"}, {"exchange": 5, "kind": "decider_alone"}])]
+        )
+        self.assertEqual(agg["misfire_kinds"], {"decider_alone": 2})
+
+
+class UnpromptedDumpVocabularyTests(unittest.TestCase):
+    """R1-Q iteration 1: a deep need told right after an advisor QUESTION in the topic's own words is
+    prompted, even when the simulator did not tag that question as a probe."""
+
+    def persona(self):
+        return resolve_persona("p1_career_switcher", variant="v1")
+
+    DEEP = "My plant is being consolidated next year, so I worry."
+
+    def test_a_tagged_probe_is_the_ground_truth(self) -> None:
+        exchanges = [
+            tic_exchange(1, "What made you look now?", "Things feel uncertain.", intent="probe", topic="H1"),
+            tic_exchange(2, "Tell me more.", self.DEEP, intent="followup", topic="H1"),
+        ]
+        found = metrics.disclosure_metrics(self.persona(), exchanges)
+        self.assertEqual(found["unprompted_dump_count"], 0)
+        self.assertEqual(found["unprompted_dump_excused"], 0)
+
+    def test_an_untagged_question_about_the_topic_excuses_the_dump(self) -> None:
+        exchanges = [
+            tic_exchange(1, "What has been the timeline, why now?", "Just exploring.", intent="other"),
+            tic_exchange(2, "Okay, noted.", self.DEEP, intent="other"),
+        ]
+        found = metrics.disclosure_metrics(self.persona(), exchanges)
+        self.assertEqual(found["unprompted_dump_count"], 0)
+        self.assertEqual(found["unprompted_dump_excused"], 1)
+
+    def test_a_statement_or_an_unrelated_question_does_not_excuse_it(self) -> None:
+        for text in ("The program is six months long.", "Do you have any questions about the syllabus?"):
+            with self.subTest(text=text):
+                exchanges = [tic_exchange(1, text, self.DEEP, intent="pitch")]
+                found = metrics.disclosure_metrics(self.persona(), exchanges)
+                self.assertEqual(found["unprompted_dump_count"], 1)
+                self.assertEqual(found["unprompted_dumps"], [{"exchange": 1, "topic": "H1"}])
+
+    def test_the_vocabulary_is_per_topic(self) -> None:
+        """An H3 question (hours, money, family) does not excuse an H1 reveal."""
+        exchanges = [tic_exchange(1, "How many hours a week could you give it?", self.DEEP, intent="other")]
+        found = metrics.disclosure_metrics(self.persona(), exchanges)
+        self.assertEqual(found["unprompted_dump_count"], 1)
+
+    def test_the_window_is_two_exchanges(self) -> None:
+        exchanges = [
+            tic_exchange(1, "What made you look now?", "Fine.", intent="other"),
+            tic_exchange(2, "Okay.", "Right.", intent="other"),
+            tic_exchange(3, "Okay.", "Mm.", intent="other"),
+            tic_exchange(4, "Okay.", self.DEEP, intent="other"),
+        ]
+        found = metrics.disclosure_metrics(self.persona(), exchanges)
+        self.assertEqual(found["unprompted_dump_count"], 1)
 
 
 if __name__ == "__main__":

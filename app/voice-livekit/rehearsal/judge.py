@@ -9,7 +9,8 @@ persona's hidden needs, the deck facts) and must return ONE JSON object::
      "disclosures": [{"need": "H1|H2|H3", "probe_turn": N, "reveal_turn": N|null,
                       "emotional": bool}],
      "misfires":    [{"turn": N, "kind": "unwarranted_gratitude|no_one_leaving|ignored_offer|
-                                           repeat|off_card_fact|other"}],
+                                           repeat|off_card_fact|time_cue_reversed|anchor_as_offer|
+                                           decider_inconsistent|reopened_after_commit|other"}],
      "stall_loop": bool,
      "style": {"reactions": 1-5, "followups": 1-5, "hesitation": 1-5, "continuity": 1-5,
                "variety": 1-5},
@@ -45,6 +46,10 @@ MISFIRE_KINDS = (
     "ignored_offer",
     "repeat",
     "off_card_fact",
+    "time_cue_reversed",
+    "anchor_as_offer",
+    "decider_inconsistent",
+    "reopened_after_commit",
     "other",
 )
 STYLE_KEYS = ("reactions", "followups", "hesitation", "continuity", "variety")
@@ -70,7 +75,12 @@ RUBRIC = (
     "'before you go' when the advisor was not ending the call. ignored_offer: the advisor made a "
     "concrete offer (a call time, an e-mail, a price) and the learner did not react to it. repeat: "
     "the learner repeats something it already said. off_card_fact: the learner states a course "
-    "fact it could not know.\n"
+    "fact it could not know. time_cue_reversed: the learner says the ADVISOR has little time ('you "
+    "mentioned you only have a couple of minutes') when it was the learner's own next call. "
+    "anchor_as_offer: the learner is pleased about, or thanks the advisor for, $7,000 when the "
+    "advisor never offered that price. decider_inconsistent: the learner says it decides alone and "
+    "later says it must talk to someone (or the other way round). reopened_after_commit: after the "
+    "learner agreed to a call or a start, it raises a new doubt or asks what the call involves.\n"
     "4. stall_loop: true when the learner answers different questions with the same 'let me think "
     "about it, e-mail me' reply.\n"
     "5. style, each 1 (poor) to 5 (excellent): reactions (reacts to what was just said before "

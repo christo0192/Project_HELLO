@@ -42,6 +42,7 @@ CALLBACK_GROUP = 15  # rows 62-66, "Can we do a schedule to call back tomorrow? 
 TIME_CUE_GROUP = 18  # rows 78: where the original learner's time cue (turn 79) landed
 STALL_GROUP = 22  # the first group at or after 13:00 in the replay (original stall: turn 92)
 CALLBACK_HUSBAND_GROUP = 18  # rows 78: "when you call me back, I can also talk to your husband ..."
+ENROL_SUGGESTED_GROUP = 17  # rows 70-76: "... I would suggest you enroll tomorrow and sit in this next cohort"
 WEAK = stall_line("")
 FIXTURE = replay.load_fixture()
 
@@ -146,14 +147,17 @@ class ReplayInvariantTests(unittest.TestCase):
 
     def test_the_whole_call_is_replayed(self) -> None:
         # Round 1 tightened the e-mail and callback detectors (a pitch about recordings or "the next
-        # session" is no offer or proposal), so the families finish earlier and the advisor's
-        # turn-78 offer to include the husband earns the MEDIUM call at group 18; the role-play
-        # ends there, as it does in a live call.
+        # session" is no offer or proposal), so the families finish earlier.  Iteration 1 reads who
+        # acts and with whom (``r1_commitment.enrol_ask_in``): the advisor's turn-76 "I would
+        # suggest you enroll tomorrow and sit in this next cohort" (group 17) is an enrolment ask
+        # inside the close window, so it earns the MEDIUM call there, one turn before the
+        # turn-78 offer to include the husband (group 18); the role-play ends on it, as it does in
+        # a live call.
         self.assertGreaterEqual(len(self.turns), 17)
         self.assertTrue(all(turn.plan is not None for turn in self.turns))
         commitment = self.result["admin_log"]["commitment"]
         self.assertEqual((commitment["level"], commitment["resolved"]), ("MEDIUM", True))
-        self.assertEqual(self.turns[-1].group, CALLBACK_HUSBAND_GROUP)
+        self.assertEqual(self.turns[-1].group, ENROL_SUGGESTED_GROUP)
         self.assertEqual(self.turns[-1].mode, "say_only")
 
     def test_the_stall_is_never_said_twice(self) -> None:

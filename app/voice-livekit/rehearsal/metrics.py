@@ -16,7 +16,9 @@ IDs follow the research doc: M1 exact repeats, M2 near repeats, M3 old WEAK stal
 catch-all deflection, M6 need disclosure after a genuine probe, M6b unprompted dump, M7
 commitment, M8 premature commit, M9 misfires, M10 fact errors, M11 reply length, M12 question
 and reaction rate, M14 name fallback, M15 farewell rows, M16 repeated phrase in a row, M18
-fragmentation, M19 guard and fidelity, M21 neutral acks.
+fragmentation, M19 guard and fidelity, M21 neutral acks, M22 verbal tics (R1-Q iteration 1: a
+reaction word opening more than 15 % of the replies, "hmm" or "honestly" in more than 20 %; the
+tic words have their own regexes here, the engine's tic detector in ``r1_text`` is not imported).
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ import difflib
 import math
 import re
 import unicodedata
+from collections import Counter
 from typing import Any, Iterable, Mapping, Sequence
 
 from r1_commitment import COMMIT_PERMITTED_R_SEC, stall_line
@@ -81,6 +84,71 @@ _STOP = frozenset(
     "we our i me my they them their that this these those there here not no yes if then "
     "than too very just also".split()
 )
+# M22 verbal tics.  Own regexes (anti-circularity): "Mm-hmm" is a back-channel, not the tic.
+_HMM = re.compile(r"(?<![a-z-])hmm+\b|(?<![a-z-])hm\b", re.IGNORECASE)
+_HONESTLY = re.compile(r"\b(?:honestly|to be honest|frankly)\b", re.IGNORECASE)
+# First words that are a reaction rather than the substance of a reply.
+_TIC_OPENERS = frozenset(
+    "okay ok oh right sure hmm hm mm mhm mmhmm yeah yes got ah alright good great nice fair "
+    "interesting honestly well wow wait thanks thank that really so actually look true".split()
+)
+# What the advisor's question must be about for a deep need told soon after it not to count as an
+# unprompted dump, when the simulator did not tag the question as a probe (a permissive check:
+# the simulator's tag stays the ground truth for everything else).
+_PROBE_VOCAB = {
+    "H1": re.compile(
+        r"\b(?:why (?:now|this|are you|did you|do you)|what (?:made|prompted|brought|changed|"
+        r"is driving|'s driving)|timeline|timeframe|deadline|trigger|urgency|how soon|"
+        r"when (?:do|are|would) you (?:want|hope|need|plan)|looking (?:now|into)|interested in)\b",
+        re.IGNORECASE,
+    ),
+    "H2": re.compile(
+        r"\b(?:concerns?|worr\w+|hesitat\w+|holding you back|stopping you|tried|struggl\w+|"
+        r"challenge\w*|obstacle|didn'?t work|went wrong|so far|biggest|afraid|nervous|doubts?|"
+        r"hurdle|blocker|friction|previous|before)\b",
+        re.IGNORECASE,
+    ),
+    "H3": re.compile(
+        r"\b(?:hours?|schedule|week|budget|afford\w*|money|pay\w*|instal\w+|husband|wife|partner|"
+        r"spouse|family|kids|parents|decid\w+|anyone else|someone else|time|commitments?|"
+        r"workload|finances?)\b",
+        re.IGNORECASE,
+    ),
+}
+# M9 misfire shapes added in iteration 1 (the live misfires of the sweeps).
+_TIME_CUE_REVERSED = re.compile(
+    r"\byou(?:'ve| have)? (?:just |only )?(?:mentioned|said|told me)\b[^.?!]{0,40}"
+    r"\b(?:minutes?|next call|another call)\b"
+    r"|\byou(?:'ve| have|'re| are)? (?:only |just )?(?:got|have) (?:a couple of|a few) minutes\b",
+    re.IGNORECASE,
+)
+_DECIDES_ALONE = re.compile(
+    r"\b(?:it'?s|it is) (?:just|only) me\b"
+    r"|\b(?:nobody|no ?one) else\b[^.?!]{0,25}\b(?:decid|involved)"
+    r"|\bi (?:decide|make the decision) (?:on my own|alone|by myself)\b",
+    re.IGNORECASE,
+)
+_ADVISOR_HEDGE = re.compile(
+    r"\b(?:check|talk|speak) (?:with|to) (?:my|the) (?:manager|supervisor|boss|lead|team)\b"
+    r"|\blet me (?:check|see|try)\b|\bi(?:'ll| will| can) (?:try|see|check|ask)\b|\bno promises\b",
+    re.IGNORECASE,
+)
+_GRATITUDE_FOR_GRANT = re.compile(
+    r"\b(?:thank(?:s| you)|appreciate)\b[^.?!]{0,50}\b(?:discount|reduc\w+|lower|better|"
+    r"that helps|helps a lot)\b|\bbetter than i expected\b|\bgreat news\b",
+    re.IGNORECASE,
+)
+_ANCHOR_AS_OFFER = re.compile(
+    r"7,?000\b[^?]{0,60}\b(?:better than i expected|a relief|great news|good news|sounds good|"
+    r"that works)\b|\bbetter than i expected\b[^?]{0,40}7,?000",
+    re.IGNORECASE,
+)
+_QUESTION_OR_DOUBT = re.compile(
+    r"\?|\b(?:hold on|not sure|worried|worry|concerns?|hesitat\w+|what if|i'?d rather)\b",
+    re.IGNORECASE,
+)
+# A real price (not a $500 discount): the lowest net figure the course is sold at.
+_NET_PRICE_FLOOR = 4500
 _SURPRISE = re.compile(
     r"\b(?:nice|pleasant|lovely) surprise\b|\bpleasantly surprised\b|\bwhat a surprise\b",
     re.IGNORECASE,
@@ -313,7 +381,22 @@ def style_metrics(texts: Sequence[str]) -> dict[str, Any]:
             reactions += 1
     neutral = {norm(ack) for ack in NEUTRAL_ACKS}
     count = len(texts)
+    openers: Counter[str] = Counter()
+    for text in texts:
+        tokens = norm(text).split()
+        if tokens and tokens[0] in _TIC_OPENERS:
+            openers[tokens[0]] += 1
+    top_word, top_count = openers.most_common(1)[0] if openers else ("", 0)
+    hmm = sum(1 for text in texts if _HMM.search(text))
+    honestly = sum(1 for text in texts if _HONESTLY.search(text))
     return {
+        "opener_counts": dict(openers),
+        "opener_top_word": top_word or None,
+        "opener_top_share": (top_count / count) if count else None,
+        "reply_hmm_count": hmm,
+        "reply_honestly_count": honestly,
+        "hmm_share": (hmm / count) if count else None,
+        "honestly_share": (honestly / count) if count else None,
         "reply_count": count,
         "reply_words_mean": mean(lengths),
         "reply_words_p90": percentile(lengths, 90),
@@ -454,14 +537,20 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
         if topic in deep_by_turn[first_probe]:
             deep_on_first_probe.append(topic)
     unprompted: list[dict[str, Any]] = []
+    excused = 0
     for index, topics in enumerate(deep_by_turn):
         for topic in sorted(topics):
             recent = [
                 i for i, _intent in touches.get(topic, []) if index - DEEP_WINDOW_TURNS <= i <= index
             ]
-            if not recent:
-                unprompted.append({"exchange": index + 1, "topic": topic})
+            if recent:
+                continue
+            if _asked_in_window(topic, exchanges, index):
+                excused += 1  # the advisor asked about it in so many words; the simulator did not tag it
+                continue
+            unprompted.append({"exchange": index + 1, "topic": topic})
     return {
+        "unprompted_dump_excused": excused,
         "needs_probed": sorted(probed),
         "needs_dug": sorted(dug),
         "needs_disclosed_after_dig": sorted(disclosed),
@@ -471,6 +560,24 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
         "unprompted_dumps": unprompted,
         "deep_revealed_total": len({t for topics in deep_by_turn for t in topics}),
     }
+
+
+def _asked_in_window(topic: str, exchanges: Sequence[Mapping[str, Any]], index: int) -> bool:
+    """True when an advisor QUESTION about ``topic`` stands within the deep window before ``index``.
+
+    The simulator's probe tags are the ground truth for disclosure, but they come from a model that
+    sometimes asks "what is holding you back?" and tags it ``other``.  A reveal that answers such a
+    question (a question sentence with the topic's own vocabulary, in this exchange or the
+    ``DEEP_WINDOW_TURNS`` before it) is a prompted one.
+    """
+    pattern = _PROBE_VOCAB.get(topic)
+    if pattern is None:
+        return False
+    for i in range(max(0, index - DEEP_WINDOW_TURNS), index + 1):
+        for sentence in split_sentences(str(_advisor(exchanges[i]).get("text") or "")):
+            if "?" in sentence and pattern.search(sentence):
+                return True
+    return False
 
 
 def commitment_metrics(
@@ -513,13 +620,43 @@ def _spoke_commitment(ex: Mapping[str, Any]) -> bool:
 
 
 def misfire_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
-    """M9: lines the learner said that the preceding advisor turn did not warrant."""
+    """M9: lines the learner said that the preceding advisor turn did not warrant.
+
+    Iteration 1 adds the live misfires: ``time_cue_reversed`` ("you mentioned you only have a couple
+    of minutes"), ``decider_alone`` ("it's just me deciding" for a persona who decides with someone),
+    ``anchor_taken_as_offer`` (pleased about the $7,000 the advisor never offered),
+    ``gratitude_after_hedge`` (thanks after "I can check with my manager") and
+    ``reopened_after_commit`` (a question or a doubt after a MEDIUM or STRONG line).
+    """
     found: list[dict[str, Any]] = []
+    committed_at: int | None = None
+    for index, ex in enumerate(exchanges):
+        plan = _learner(ex).get("plan") or {}
+        if (
+            committed_at is None
+            and plan.get("commitment_level") in ("MEDIUM", "STRONG")
+            and _spoke_commitment(ex)
+        ):
+            committed_at = index
+    best_offer: int | None = None
     for index, ex in enumerate(exchanges):
         text = str(_learner(ex).get("spoken") or "")
         advisor = _advisor(ex)
         advisor_text = str(advisor.get("text") or "")
         intent = str(advisor.get("intent") or "")
+        figures = [value for value in _dollar_figures(advisor_text) if value >= _NET_PRICE_FLOOR]
+        if figures:
+            best_offer = min([*figures, *([best_offer] if best_offer is not None else [])])
+        if _TIME_CUE_REVERSED.search(text):
+            found.append({"exchange": index + 1, "kind": "time_cue_reversed"})
+        if _DECIDES_ALONE.search(text):
+            found.append({"exchange": index + 1, "kind": "decider_alone"})
+        if _ANCHOR_AS_OFFER.search(text) and not (best_offer is not None and best_offer <= 7000):
+            found.append({"exchange": index + 1, "kind": "anchor_taken_as_offer"})
+        if _ADVISOR_HEDGE.search(advisor_text) and not figures and _GRATITUDE_FOR_GRANT.search(text):
+            found.append({"exchange": index + 1, "kind": "gratitude_after_hedge"})
+        if committed_at is not None and index > committed_at and _QUESTION_OR_DOUBT.search(text):
+            found.append({"exchange": index + 1, "kind": "reopened_after_commit"})
         if _SURPRISE.search(text) and not (
             intent in ("discount", "price") and _DISCOUNT_CUE.search(advisor_text)
         ):

@@ -35,6 +35,16 @@ run stopped. Nothing written holds the API key.
 Exit codes: 0 ok, 1 usage or unexpected error, 2 no key, 3 no balance (HTTP 402), 4 budget exceeded,
 5 hard fails or failed gates with `--strict`.
 
+Gates added or changed in R1-Q iteration 1 (owner decisions of 2026-10-08): the reply-length gates
+(mean <= 22 words, p90 <= 35, short replies >= 30 %) are INFO only and never block (wordiness is
+accepted; `length_low`, mean >= 8, still gates); the verbal-tic gates block: no reaction word
+(`okay`, `hmm`, `that`, ...) opens more than 15 % of the learner's replies, "hmm" is in at most
+20 % and "honestly" in at most 20 % (pooled over the group's replies, with the harness's own
+regexes). Misfires now also count `time_cue_reversed`, `decider_alone`, `anchor_taken_as_offer`,
+`gratitude_after_hedge` and `reopened_after_commit`. A deep need told within two exchanges of an
+advisor QUESTION that uses the topic's own words is not an "unprompted dump" even when the
+simulator did not tag the question as a probe (`unprompted_dump_excused` counts those).
+
 An OFFLINE scorecard checks the plumbing and the engine's decisions (schedule, negotiation, guard,
 repetition, disclosure layers), never the model: it can never be "ready for an owner test". Ready
 means a live sweep of 20 or more calls with every applicable gate measured and met.
