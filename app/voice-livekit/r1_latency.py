@@ -3,11 +3,15 @@
 Two independent, SDK-free pieces live here so both are unit-testable without a session:
 
 * ``r1_turn_handling``: the endpointing, interruption and preemptive-generation options R1
-  hands the ``AgentSession``.  The plan's values are endpointing 0.7 / 3.5 s, interruption
-  ``min_duration`` 0.7 s and ``min_words`` 2.  The SDK's own defaults are slower to wait and
+  hands the ``AgentSession``.  The values are endpointing 0.8 / 3.0 s, interruption
+  ``min_duration`` 0.8 s and ``min_words`` 3 (R1-Q: the owner's 4/10 session showed 0.3 s
+  committing a turn on a breath and a two-word "Thank you" cutting a reply; the phone lane
+  settled on the same 0.8 s / 3 words).  The SDK's own defaults are quicker to commit and
   quicker to cut in: its streaming turn detector (the session default) uses 0.3 / 2.5 s and
   its interruption defaults are 0.5 s and 0 words, which lets a "yeah" or a cough cut a reply.
-  Each value is bounded and can be tuned from the environment during Stage A.  Preemptive
+  Each value is bounded and can be tuned from the environment during Stage A.  The
+  transition phase, where the only thing the candidate says is "ready", runs a quicker pair
+  (``r1_transition_endpointing``, 0.4 / 1.2 s, never above the session's own).  Preemptive
   generation stays OFF; ``r1_session`` explains why.
 
 * ``LatencyTracker``: stamps the stages of one candidate turn and hands every segment to an
@@ -40,10 +44,14 @@ from typing import Any, Callable
 
 # ---------------------------------------------------------------------------- turn handling
 
-ENDPOINT_MIN_DELAY_SEC = 0.7
-ENDPOINT_MAX_DELAY_SEC = 3.5
-INTERRUPT_MIN_DURATION_SEC = 0.7
-INTERRUPT_MIN_WORDS = 2
+ENDPOINT_MIN_DELAY_SEC = 0.8
+ENDPOINT_MAX_DELAY_SEC = 3.0
+INTERRUPT_MIN_DURATION_SEC = 0.8
+INTERRUPT_MIN_WORDS = 3
+# The transition phase waits for one word ("ready"), so a turn there commits quickly.  These are
+# CEILINGS on the session's own numbers (``r1_transition_endpointing``), never a way to wait longer.
+TRANSITION_ENDPOINT_MIN_DELAY_SEC = 0.4
+TRANSITION_ENDPOINT_MAX_DELAY_SEC = 1.2
 
 
 def _bounded_float(raw: str | None, default: float, low: float, high: float) -> float:
@@ -129,6 +137,21 @@ def r1_turn_handling() -> dict[str, Any]:
         },
         "preemptive_generation": {"enabled": False},
     }
+
+
+def r1_transition_endpointing() -> dict[str, float]:
+    """The endpointing pair for the TRANSITION phase: the session's, capped at 0.4 / 1.2 s.
+
+    The candidate's only job there is to say "ready", so a short turn should commit quickly.
+    The pair never exceeds the session's own (an operator who lowered
+    ``R1_ENDPOINT_MIN_DELAY_SEC`` below 0.4 s keeps the lower value), and its maximum never
+    undercuts its minimum.  Handed to ``AgentSession.update_options(endpointing_opts=...)`` on
+    entering the phase; ``r1_turn_handling()["endpointing"]`` is what restores the session's.
+    """
+    session = r1_turn_handling()["endpointing"]
+    minimum = min(session["min_delay"], TRANSITION_ENDPOINT_MIN_DELAY_SEC)
+    maximum = max(min(session["max_delay"], TRANSITION_ENDPOINT_MAX_DELAY_SEC), minimum)
+    return {"min_delay": minimum, "max_delay": maximum}
 
 
 # ----------------------------------------------------------------------- latency tracker

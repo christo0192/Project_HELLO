@@ -9,6 +9,7 @@ test was skipped.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import sys
 import typing
@@ -358,6 +359,9 @@ class TestR1TranscriptOrderOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
             session.emit("conversation_item_added", ConversationItemAddedEvent(item=item))
             handle._item_added([item])  # the LLM-reply order
         session.current_speech = None
+        # The SDK commits the interrupting turn: its final becomes the candidate's one row.
+        with contextlib.suppress(r1_session.StopResponse):
+            interview.prepare_turn("excuse me")
         await interview._drain_background()
         rows = sorted(writer.saved)
         self.assertEqual(
@@ -589,11 +593,34 @@ class TestR1LatencyOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         # turn_detection is pinned here only so the test does not build the cloud detector.
         handling = {**r1_latency.r1_turn_handling(), "turn_detection": "stt"}
         options = AgentSession(vad=None, turn_handling=handling).options
-        self.assertEqual(options.endpointing["min_delay"], 0.7)
-        self.assertEqual(options.endpointing["max_delay"], 3.5)
-        self.assertEqual(options.interruption["min_duration"], 0.7)
-        self.assertEqual(options.interruption["min_words"], 2)
+        self.assertEqual(options.endpointing["min_delay"], 0.8)
+        self.assertEqual(options.endpointing["max_delay"], 3.0)
+        self.assertEqual(options.interruption["min_duration"], 0.8)
+        self.assertEqual(options.interruption["min_words"], 3)
         self.assertFalse(options.preemptive_generation["enabled"])
+
+    def test_the_session_takes_a_new_endpointing_pair_while_it_runs(self) -> None:
+        # r1_session._apply_endpointing: the transition phase runs 0.4 / 1.2 s through
+        # AgentSession.update_options and the session's own pair is restored afterwards.
+        import r1_latency
+
+        self.assertIn("endpointing_opts", inspect.signature(AgentSession.update_options).parameters)
+        session = AgentSession(
+            vad=None, turn_handling={**r1_latency.r1_turn_handling(), "turn_detection": "stt"}
+        )
+        session.update_options(endpointing_opts=r1_latency.r1_transition_endpointing())
+        self.assertEqual(session.options.endpointing["min_delay"], 0.4)
+        self.assertEqual(session.options.endpointing["max_delay"], 1.2)
+        session.update_options(endpointing_opts=r1_latency.r1_turn_handling()["endpointing"])
+        self.assertEqual(session.options.endpointing["min_delay"], 0.8)
+        self.assertEqual(session.options.endpointing["max_delay"], 3.0)
+        # A running activity gets a fresh endpointing object built from the session's options.
+        self.assertIn("self._opts.endpointing if is_given(endpointing_opts)", inspect.getsource(
+            AgentSession.update_options
+        ))
+        activity = inspect.getsource(AgentActivity.update_options)
+        self.assertIn("create_endpointing(endpointing_opts)", activity)
+        self.assertIn("self._audio_recognition.update_options(", activity)
 
     def test_the_sdk_reads_interruption_options_from_the_session_not_the_agent(self) -> None:
         # So R1's interruption numbers must be on the AgentSession (r1_latency.r1_turn_handling),

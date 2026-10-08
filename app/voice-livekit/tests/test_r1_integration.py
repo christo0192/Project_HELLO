@@ -1865,11 +1865,16 @@ class TestEndToEnd(R1TestCase):
         await self.until(lambda: self.session.agent is not None)
         interview = self.session.agent.interview
         self.assertEqual(interview.persona_choice.label, "p1_career_switcher.v1")
-        # Icebreaker: four candidate turns at S >= 3:30 end it at the next boundary.
+        # Icebreaker: four committed answers at S >= 3:30 end it at the boundary turn.
         await self.until(lambda: interview.machine.phase is R1Phase.ICEBREAKER)
         self.clock.advance(215)
-        for answer in ("I sold courses", "to working professionals", "mostly by phone", "yes"):
-            self.final_transcript(answer)
+        for answer in (
+            "I sold courses",
+            "to working professionals",
+            "mostly by phone",
+            "yes that is right",
+        ):
+            await self.answer(answer)
         # The announce line names the chosen persona; then READY, then her pickup.
         await self.candidate_replies_after("L-TRANSITION", "ready")
         await self.until(lambda: self.spoken_and_played("L-PICKUP"))
@@ -2178,7 +2183,7 @@ class TestLatencyLines(unittest.IsolatedAsyncioTestCase):
 class TestHeldBackFragments(unittest.IsolatedAsyncioTestCase):
     """A fragment the SDK holds back must not start the monologue clock (PR-4c review, P2).
 
-    With ``min_words`` 2 livekit-agents 1.6.4 refuses a turn of fewer words spoken over a reply
+    With ``min_words`` 3 livekit-agents 1.6.4 refuses a turn of fewer words spoken over a reply
     it may still cut (``on_end_of_turn`` returns False) and keeps the words, so they are
     prepended to the NEXT committed turn.  Sarvam emits finals only, so that one-word "Yes."
     arrives as a final and is held back.  R1's monologue clock starts at the first "speaking" of
@@ -2314,22 +2319,32 @@ class TestHeldBackFragments(unittest.IsolatedAsyncioTestCase):
         await rig.settle()
         self.assertAlmostEqual(await self.commit(rig, f"{self.HELD} Right, go ahead."), 3.7, places=3)
 
-    async def test_two_one_word_fragments_reach_the_limit_together_and_keep_the_clock(self) -> None:
-        # The SDK banks "Yes." and counts it with "Right." (two words): that turn commits.
+    async def test_two_fragments_reach_the_limit_together_and_keep_the_clock(self) -> None:
+        # The SDK banks "Yes." and counts it with "Right, sure." (three words): that turn commits.
         rig = Rig()
         await self.mid_reply(rig)
         self.speak(rig, 0.6, self.HELD, before_stop=False)
         await rig.settle()
         self.assertIsNone(rig.interview._user_turn_started)
-        self.speak(rig, 30.0, "Right.", before_stop=False)  # the clock restarts with this burst
+        self.speak(rig, 30.0, "Right, sure.", before_stop=False)  # the clock restarts here
         await rig.settle()
         self.assertIsNotNone(rig.interview._user_turn_started)
-        seconds = await self.commit(rig, "Yes. Right.")
+        seconds = await self.commit(rig, "Yes. Right, sure.")
         self.assertAlmostEqual(seconds, 30.7, places=3)
+
+    async def test_a_bare_thank_you_over_a_reply_is_held_back(self) -> None:
+        # The owner's turn 4 was cut by exactly this ("Thank you." is two words; the limit was 0
+        # on the SDK defaults and 2 in PR-4c, so it still cut).  At 3 it is banked, not a turn.
+        rig = Rig()
+        await self.mid_reply(rig)
+        self.speak(rig, 1.0, "Thank you.", before_stop=False)
+        await rig.settle()
+        self.assertIsNone(rig.interview._user_turn_started)  # two words: held back, as "Sorry"
+        self.assertEqual(rig.interview._banked_words, 2)
 
     async def test_a_fragment_the_sdk_will_commit_keeps_its_clock(self) -> None:
         for name, setup in (
-            ("two words", lambda rig: (rig.session.current_speech, "Yes please.")),
+            ("three words", lambda rig: (rig.session.current_speech, "Yes please do.")),
             ("no speech to hold it back", lambda rig: (None, self.HELD)),
         ):
             with self.subTest(case=name):

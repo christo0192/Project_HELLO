@@ -61,6 +61,22 @@ this module logs the stages as ``r1_latency`` lines; ``r1_linecache`` keeps the 
 scripted lines behind ``say`` and counts Sarvam 429s by lane; the session is built with R1's
 turn handling.  None of them can change what is said, a phase, a grade or a guard verdict:
 a stage that fails to measure is skipped, and a line that is not cached is spoken live.
+
+R1-Q (turn taking) changes how the candidate's speech becomes TURNS, in three places:
+
+* One transcript row per committed turn.  Sarvam closes an utterance at each of its own pauses
+  and the SDK merges those finals into one turn, so a long answer used to be 5-6 rows (the
+  gate's ``stt_sanity`` counts rows of two words or fewer).  The finals now collect in one open
+  row (``_CandidateRow``; its index is reserved at the FIRST final, so ordering against the
+  bot's rows is unchanged) that is written when the turn commits (``prepare_turn``), when a bot
+  speech claims its row, when the phase changes, and when the session exits.
+* The icebreaker's exit is decided at a committed turn.  ``candidate_turns`` counts committed
+  answers of three words or more (not STT finals), the driver no longer leaves the icebreaker on
+  a raw final, and the hard S=4:30 cap waits (bounded) for a turn in flight instead of starting
+  the uninterruptible transition line over a candidate who is mid-answer.
+* A reply the SDK cancelled before any audio is logged (``r1_reply_cancelled_before_audio``,
+  a running count), and when the icebreaker's exit is due it is not left as silence: the
+  boundary line answers the turn that lost its reply.
 """
 from __future__ import annotations
 
@@ -85,7 +101,9 @@ from r1_latency import (
     GATE_PHASE,
     LatencyTracker,
     count_words,
+    endpoint_max_delay_sec,
     interrupt_min_words,
+    r1_transition_endpointing,
     r1_turn_handling,
 )
 from r1_linecache import (
@@ -181,6 +199,15 @@ REPLY_SETTLE_SECONDS = 30.0
 # Candidate-silence windows (plan section 5.11; production values 30/20 in fly.toml).
 ICEBREAKER_PROMPT_SECONDS = 30.0
 ICEBREAKER_END_SECONDS = 20.0
+# The soft exit (four turns, S >= 3:30) counts a COMMITTED candidate turn only when it is an
+# answer: at least this many words, the floor the SDK applies to an interruption.  "Sorry",
+# "Thank you." and "Hello" are not answers, and neither is a fragment of one.
+ICEBREAKER_ANSWER_MIN_WORDS = 3
+# The hard S=4:30 cap never starts the (uninterruptible) transition line over a candidate who is
+# mid-answer: it waits for the turn in flight to commit, for the SDK's endpointing maximum plus
+# this margin after the last sign of speech, and never longer than the ceiling.
+ICEBREAKER_HOLD_MARGIN_SECONDS = 1.0
+ICEBREAKER_HOLD_CEILING_SECONDS = 30.0
 ROLEPLAY_PROMPT_SECONDS = 20.0
 ROLEPLAY_FIRST_STEP_SECONDS = 20.0
 ROLEPLAY_ASIDE_STEP_SECONDS = 15.0
@@ -663,6 +690,20 @@ class _SpeechSlot:
     source: str | None = None  # the SDK's speech source: "say" for a scripted line
 
 
+@dataclass
+class _CandidateRow:
+    """The candidate's turn so far: ONE transcript row, written once when the turn is over.
+
+    The STT hands over a candidate's turn as several finals; the SDK commits them as one turn.
+    ``index`` is reserved at the first final (so the row sorts before any bot speech that starts
+    afterwards) and ``phase`` is the phase it was spoken in; ``parts`` are the finals in order.
+    """
+
+    index: int
+    phase: str
+    parts: list[str]
+
+
 class R1Interview:
     """Drive one interview with prompt stop handling and one ordered exit invariant.
 
@@ -712,6 +753,15 @@ class R1Interview:
         # True once a candidate turn was answered by the icebreaker's end (``prepare_turn``
         # suppressed its reply because the soft exit was due): the boundary line answers it.
         self._icebreaker_boundary_turn = False
+        # The candidate's open transcript row (``_CandidateRow``), the last sign of candidate
+        # activity (clock seconds), when the hard icebreaker cap began to wait for a turn in
+        # flight, how many replies the SDK cancelled before any audio, and whether the session
+        # runs the transition's quicker endpointing right now.
+        self._open_row: _CandidateRow | None = None
+        self._candidate_activity_at: float | None = None
+        self._icebreaker_hold_since: float | None = None
+        self._replies_cancelled_before_audio = 0
+        self._quick_endpointing = False
         self._goodbye_spoken = False
         self._ended_announced = False
         # The phase attribute the candidate's page follows: values wait here in order and one
@@ -855,19 +905,55 @@ class R1Interview:
         The page labels the interview from the ``phase`` attribute and shows the role-play lead
         card only in the role-play phases (``r1-phase.ts``), so a transition that is not
         published leaves it on its fallback label for the whole interview.
+
+        A candidate row that is still open is written first: a row never straddles a phase.
         """
+        self._flush_candidate_row()
         self.machine.transition(phase)
+        self._apply_endpointing(phase)
         if publish:
             self._publish_phase(phase.value)
 
     def _begin_disconnect(self) -> None:
         """Pause for a disconnect (the page is told ``paused_disconnected``)."""
+        self._flush_candidate_row()
         self.machine.begin_disconnect()
         self._publish_phase(self.machine.phase.value)
 
     def _rejoin(self) -> None:
         """Resume the interrupted phase and tell the page which one it is."""
-        self._publish_phase(self.machine.rejoin().value)
+        self._flush_candidate_row()
+        resumed = self.machine.rejoin()
+        self._apply_endpointing(resumed)
+        self._publish_phase(resumed.value)
+
+    def _apply_endpointing(self, phase: R1Phase) -> None:
+        """Run the transition's quicker endpointing in TRANSITION, the session's own elsewhere.
+
+        The candidate's only job in the transition is to say "ready", so a turn there should
+        commit quickly (``r1_transition_endpointing``, 0.4 / 1.2 s, capped at the session's own
+        numbers).  ``AgentSession.update_options`` takes effect on the running activity.  It is
+        called only when the setting changes, so a session that never reaches the transition
+        never calls it; a failure is logged by type and costs only the quicker window.
+        """
+        quick = phase is R1Phase.TRANSITION
+        if quick == self._quick_endpointing:
+            return
+        update = getattr(self.session, "update_options", None)
+        if not callable(update):
+            return
+        options = r1_transition_endpointing() if quick else r1_turn_handling()["endpointing"]
+        try:
+            update(endpointing_opts=dict(options))
+        except Exception as exc:  # noqa: BLE001 - a timing tweak must never stop an interview
+            _log.warn(
+                "unknown_event",
+                error_type="r1_endpointing_update_failed",
+                error_category=_error_type_of(exc),
+                phase=self.machine.transcript_phase(),
+            )
+            return
+        self._quick_endpointing = quick
 
     def _publish_phase(self, value: str) -> None:
         """Queue one phase value for the background writer; never blocks, never raises.
@@ -1048,7 +1134,12 @@ class R1Interview:
         self._forced_close_handle = None
 
     def _begin_exit(self) -> None:
-        """Stop recording new speech and suppress replies once the exit has started."""
+        """Stop recording new speech and suppress replies once the exit has started.
+
+        The candidate's open row is written first: it is the last thing they said, and the
+        transcript drain that follows waits for it.
+        """
+        self._flush_candidate_row()
         self._exiting = True
         self._cancel_deadlines()
 
@@ -1610,6 +1701,20 @@ class R1Interview:
             return is_no_questions(text) or self.machine.remaining_wrapup_seconds() <= 0
         return True
 
+    def _count_icebreaker_answer(self, text: str) -> None:
+        """Count one COMMITTED candidate turn toward the icebreaker's soft exit, if it is an answer.
+
+        The soft exit (``icebreaker_should_end``: four turns once S >= 3:30) used to count STT
+        finals, so one long answer that Sarvam split at its pauses was four "turns" and a
+        one-word "Sorry" was one more.  It counts the SDK's committed turns now, and only those of
+        ``ICEBREAKER_ANSWER_MIN_WORDS`` words or more.  An early answer spoken over the opening
+        line still counts, as it did.
+        """
+        if self.machine.phase not in (R1Phase.OPENING, R1Phase.ICEBREAKER):
+            return
+        if count_words(text) >= ICEBREAKER_ANSWER_MIN_WORDS:
+            self.machine.candidate_turns += 1
+
     # ----------------------------------------------------- role-play turns
 
     def _roleplay_exit_requested(self) -> bool:
@@ -1720,12 +1825,16 @@ class R1Interview:
         so the plan is computed exactly once and before any generation (preemptive
         generation is off for this agent).
         """
+        # The SDK committed the candidate's turn: the finals it was made of are ONE row now,
+        # written before anything below can raise ``StopResponse``.
+        self._flush_candidate_row()
         index = self._latest_candidate_index
         self._latest_candidate_index = None
         seconds = self._take_user_turn_seconds()
         entry = self._note_candidate_turn(text, index) if text else None
         if text:
             self._latency.begin_turn(index, self.machine.transcript_phase())
+            self._count_icebreaker_answer(text)
         suppressed = self.reply_suppressed(text)
         if suppressed or not text:
             if self.machine.phase in (R1Phase.ICEBREAKER, R1Phase.ROLEPLAY, R1Phase.ASIDE):
@@ -2365,10 +2474,13 @@ class R1Interview:
             )
 
     def _on_user_input_transcribed(self, event: Any) -> None:
-        """Record a final candidate transcript at event time and hand it to the driver.
+        """Collect a final candidate transcript into the open row and hand it to the driver.
 
-        The row and its order are fixed here, not when the driver gets around to the
-        turn, so a busy driver can neither lose nor reorder it.
+        The row's position is fixed here, at its FIRST final, not when the driver gets around
+        to the turn, so a busy driver can neither lose nor reorder it.  The row itself is
+        written when the turn is over (``_flush_candidate_row``): the STT's finals of one answer
+        become one row, as the SDK's committed turn is one.  The driver still reads every final
+        (``note_turn``): its ready and wrap-up matching works on them one at a time.
         """
         if self._exiting or not getattr(event, "is_final", False):
             return
@@ -2376,18 +2488,48 @@ class R1Interview:
         if not text:
             return
         self._latency.note_final()
+        self._candidate_activity_at = self._clock()
         self._banked_words += count_words(text)
         if self._user_state == "speaking":
             self._fragment_unjudged = True  # the speech has not stopped: judge it when it does
         else:
             self._judge_fragment()
-        if self.machine.phase in (R1Phase.OPENING, R1Phase.ICEBREAKER):
-            # An early answer spoken over the opening line is still an icebreaker turn.
-            self.machine.candidate_turns += 1
-        index = self._reserve_turn_index()
-        self._latest_candidate_index = index  # the SDK turn that follows is judged at this row
-        self._write_turn(index, "candidate", text, self.machine.transcript_phase())
+        row = self._open_row
+        if row is None:
+            row = self._open_row = _CandidateRow(
+                self._reserve_turn_index(), self.machine.transcript_phase(), []
+            )
+        row.parts.append(text)
+        self._latest_candidate_index = row.index  # the SDK turn that follows is judged at this row
         self.note_turn(text)
+
+    def _flush_candidate_row(self) -> None:
+        """Write the open candidate row (all its finals, one space apart), once, then close it.
+
+        Called wherever the candidate's turn is over: the SDK committed it (``prepare_turn``), a
+        bot speech starts (``_reserve_bot_index``: whatever the candidate says next is a new
+        row, after the bot's), the phase changes, and the session exits.  A row that never gets
+        one of those (the SDK banked a short fragment and nothing followed) is written at the
+        next of them; a crash before that loses at most that one open row.
+        """
+        row, self._open_row = self._open_row, None
+        if row is None:
+            return
+        self._write_turn(row.index, "candidate", " ".join(row.parts), row.phase)
+
+    def _reserve_bot_index(self) -> int:
+        """Reserve a transcript position for a bot speech, closing the candidate's open row first.
+
+        The row keeps the (lower) index it reserved at its first final, so closing it here only
+        decides that the candidate's NEXT words are a new row after this speech, which is where
+        they were said.
+        """
+        self._flush_candidate_row()
+        return self._reserve_turn_index()
+
+    def _candidate_turn_open(self) -> bool:
+        """True while the candidate is mid-turn: speaking, or a final heard whose turn has not committed."""
+        return self._user_state == "speaking" or self._open_row is not None
 
     def _on_speech_created(self, event: Any) -> None:
         """Track a speech; its transcript position is fixed when it starts speaking."""
@@ -2410,7 +2552,7 @@ class R1Interview:
     def _claim_slot(self, slot: _SpeechSlot) -> None:
         """Fix a speech's row position and phase now, once."""
         if slot.index is None:
-            slot.index = self._reserve_turn_index()
+            slot.index = self._reserve_bot_index()
             slot.phase = self.machine.transcript_phase()
 
     def _claim_current_speech_slot(self) -> None:
@@ -2426,11 +2568,46 @@ class R1Interview:
 
     def _on_speech_done(self, handle: Any) -> None:
         speech_id = getattr(handle, "id", None)
-        self._speeches.pop(speech_id, None)
+        slot = self._speeches.pop(speech_id, None)
         if speech_id is not None:
             self._latency.say_done(str(speech_id))
+        if slot is not None:
+            self._note_reply_lost(slot, handle)
         if speech_id in self._open_replies:
             self._open_replies.discard(speech_id)
+            self._wake()
+
+    def _note_reply_lost(self, slot: _SpeechSlot, handle: Any) -> None:
+        """Log a reply the SDK cancelled before the candidate heard any of it (a count, no text).
+
+        A reply that never claimed a transcript position never began speaking, so an
+        ``interrupted`` one was cut while it was still being thought of: the owner's 4/10 session
+        lost three replies this way, to "Sorry", "Thank you" and "Hey, are you there?", and the
+        candidate heard nothing at all (the rows show no bot turn).  Nothing here changes what
+        is said, with one exception that is the point of the log: when the icebreaker's exit is
+        due and nobody is mid-turn, the turn that lost its reply is the boundary turn, so the
+        transition line answers it now instead of the candidate waiting out a silence window.
+        """
+        if (
+            slot.source != "generate_reply"
+            or slot.index is not None
+            or not bool(getattr(handle, "interrupted", False))
+            or self._exiting
+        ):
+            return
+        self._replies_cancelled_before_audio += 1
+        _log.warn(
+            "unknown_event",
+            error_type="r1_reply_cancelled_before_audio",
+            phase=self.machine.transcript_phase(),
+            option_count=self._replies_cancelled_before_audio,
+        )
+        if (
+            self.machine.phase is R1Phase.ICEBREAKER
+            and self.machine.icebreaker_should_end()
+            and not self._candidate_turn_open()
+        ):
+            self._icebreaker_boundary_turn = True
             self._wake()
 
     @staticmethod
@@ -2493,7 +2670,7 @@ class R1Interview:
             return
         slot = self._slot_for_item(item)
         if slot is None:
-            index, phase = self._reserve_turn_index(), self.machine.transcript_phase()
+            index, phase = self._reserve_bot_index(), self.machine.transcript_phase()
         else:
             self._claim_slot(slot)  # a speech that never reported speaking claims it now
             slot.used = True
@@ -2564,6 +2741,7 @@ class R1Interview:
 
     def _on_user_state_changed(self, event: Any) -> None:
         self._user_state = str(getattr(event, "new_state", "") or "")
+        self._candidate_activity_at = self._clock()
         self._latency.note_user_state(self._user_state)
         if self._user_state == "speaking":
             self._dropped_turn_start = None  # new speech: what a fragment dropped stays dropped
@@ -3189,16 +3367,52 @@ class R1Interview:
         Only that turn ends the phase early.  The soft-exit RULE itself must not: once S passes
         3:30 it holds on every later wake-up, including the interviewer's own follow-up
         finishing and the candidate starting to answer it, and the boundary line would then play
-        over a question nobody answered.  Those turns end the phase through the driver's own
-        check after the transcript (``_run_icebreaker``), exactly as before.
+        over a question nobody answered.  Those turns end the phase when the SDK commits them
+        (``prepare_turn`` marks the boundary), not when their first transcript arrives.
+
+        The hard S=4:30 cap ends the budget too, except that a turn in flight is given a bounded
+        moment to commit (``_icebreaker_hold_left``).
         """
         if self._icebreaker_boundary_turn:
             return 0.0
-        return self.machine.remaining_icebreaker_seconds()
+        left = self.machine.remaining_icebreaker_seconds()
+        if left > 0:
+            return left
+        return self._icebreaker_hold_left()
+
+    def _icebreaker_hold_left(self) -> float:
+        """Seconds the hard S=4:30 cap may still wait for the candidate's turn in flight.
+
+        The cap is the phase's deadline, not the candidate's: the transition line that follows
+        is uninterruptible, so starting it while the candidate is mid-answer talks over them
+        and throws their audio away.  While they are speaking, or a final was heard whose turn
+        the SDK has not committed, the cap waits one endpointing maximum plus a margin after the
+        last sign of speech (the commit then ends the phase through ``prepare_turn``), and never
+        longer than ``ICEBREAKER_HOLD_CEILING_SECONDS`` in all.  Zero when nobody is mid-turn.
+        """
+        if not self._candidate_turn_open():
+            self._icebreaker_hold_since = None
+            return 0.0
+        now = self._clock()
+        if self._icebreaker_hold_since is None:
+            self._icebreaker_hold_since = now
+        grace = endpoint_max_delay_sec() + ICEBREAKER_HOLD_MARGIN_SECONDS
+        last = now if self._user_state == "speaking" else (self._candidate_activity_at or now)
+        ceiling = self._icebreaker_hold_since + ICEBREAKER_HOLD_CEILING_SECONDS
+        return max(0.0, min(ceiling, last + grace) - now)
 
     async def _run_icebreaker(self) -> str | None:
-        """Ask-and-listen until the soft four-turn exit or the hard S=4:30 deadline."""
-        while not self.machine.icebreaker_should_end():
+        """Ask-and-listen until a committed turn ends the phase, or the hard S=4:30 deadline.
+
+        The exit is decided at a COMMITTED candidate turn, never at a raw transcript: once the
+        soft exit is due (four answers, S >= 3:30) the turn the SDK commits next is suppressed
+        and answered by the transition line (``prepare_turn``), which zeroes the budget below.
+        A raw final that merely arrives while the exit is due is the middle of the candidate's
+        answer, so it does not end the phase; the transition line must not start over it.
+        """
+        while True:
+            if self.machine.icebreaker_should_end() and not self._candidate_turn_open():
+                return None  # due, and nobody is mid-turn (the phase was entered already due)
             kind, value = await self._await_turn(
                 ICEBREAKER_PROMPT_SECONDS, hard=self._icebreaker_budget_left
             )
@@ -3212,7 +3426,6 @@ class R1Interview:
                     return None
                 if value is not None:
                     return value
-        return None
 
     async def _run_transition(self) -> str | None:
         """Wait for READY (or 20 s), then let the driver speak the one pickup line."""

@@ -1218,8 +1218,8 @@ Switches (all read at use, so a restart is enough; every one is optional):
 
 | Variable | Default | Effect and rollback |
 |---|---|---|
-| `R1_ENDPOINT_MIN_DELAY_SEC` / `R1_ENDPOINT_MAX_DELAY_SEC` | 0.7 / 3.5 | Endpointing waits (SDK default 0.3 / 2.5 s). Lower the minimum for speed, raise it if candidates are cut off |
-| `R1_INTERRUPT_MIN_DURATION_SEC` / `R1_INTERRUPT_MIN_WORDS` | 0.7 / 2 | How long and how many words an interruption needs (SDK default 0.5 s / 0). With Sarvam only the words count: see "Interrupting with final-only speech recognition" below |
+| `R1_ENDPOINT_MIN_DELAY_SEC` / `R1_ENDPOINT_MAX_DELAY_SEC` | 0.8 / 3.0 | Endpointing waits (SDK default 0.3 / 2.5 s). Lower the minimum for speed, raise it if candidates are cut off. The transition phase runs a quicker 0.4 / 1.2 s (never above these two): see "Turn taking and transcript rows" below |
+| `R1_INTERRUPT_MIN_DURATION_SEC` / `R1_INTERRUPT_MIN_WORDS` | 0.8 / 3 | How long and how many words an interruption needs (SDK default 0.5 s / 0). With Sarvam only the words count: see "Interrupting with final-only speech recognition" below |
 | `R1_TTS_FLUSH_MIN_CHARS` | 60 | Early-flush length cap; `0` turns the early-flush `tts_node` off |
 | `R1_LINE_CACHE` | on | `off` speaks every scripted line live, as before PR-4c |
 | `R1_SYNTH_PER_MIN` | 5 | Background Sarvam syntheses started per minute (1-30); raise only after the Sarvam tier is confirmed (D13) |
@@ -1229,23 +1229,61 @@ Switches (all read at use, so a restart is enough; every one is optional):
 Sarvam streams final transcripts only; it never sends an interim one. livekit-agents 1.6.4 lets
 the candidate's voice cut the learner's reply early only when the transcript it already holds has
 `R1_INTERRUPT_MIN_WORDS` words, and it makes that check before it adds a new final to the
-transcript. While the candidate speaks that transcript is empty, so with the default of 2 the
+transcript. While the candidate speaks that transcript is empty, so with the default of 3 the
 voice never cuts the reply by itself: the learner stops when the candidate's turn is committed
 (a final of at least `R1_INTERRUPT_MIN_WORDS` words, after the endpointing wait), and
 `R1_INTERRUPT_MIN_DURATION_SEC` has no effect. `tests/test_r1_sdk_contract.py` pins the SDK facts
 this rests on.
 
-The same setting makes the SDK refuse a shorter turn ("Yes.") that is spoken over a reply it may
-still cut. It keeps the words and prepends them to the next committed turn. R1 does not count
-such a fragment as part of the candidate's monologue, so `CANDIDATE_MONOLOGUE` and the
-`longest_candidate_turn_sec` field of the administration log measure the answer alone.
+The same setting makes the SDK refuse a shorter turn ("Yes.", "Sorry", "Thank you.") that is spoken
+over a reply it may still cut. It keeps the words and prepends them to the next committed turn. R1
+does not count such a fragment as part of the candidate's monologue, so `CANDIDATE_MONOLOGUE` and
+the `longest_candidate_turn_sec` field of the administration log measure the answer alone.
 
 `R1_INTERRUPT_MIN_WORDS=0` restores the SDK's voice barge-in after `R1_INTERRUPT_MIN_DURATION_SEC`,
-at the price that a "yeah" or a cough cuts the learner. **Stage A decides between 2 and 0**: run
+at the price that a "yeah" or a cough cuts the learner. **Stage A decides between 3 and 0**: run
 the smoke session at each value and listen for the two faults, the learner talking over the
-candidate until the candidate's turn is committed (value 2) against a backchannel cutting the
-learner off (value 0). Keep 2 unless the first is the worse problem; the variable is read at use,
-so a restart switches it.
+candidate until the candidate's turn is committed (value 3) against a backchannel cutting the
+learner off (value 0). Keep 3 unless the first is the worse problem; the variable is read at use,
+so a restart switches it. The default was 2 in PR-4c: the owner's 4/10 session (b58c7d9c) showed a
+two-word "Thank you." still cutting a reply, and "Sorry" / "Thank you." / "Hey, are you there?"
+cancelling three replies before any audio (the candidate heard nothing), so R1-Q raised it to 3,
+the value the phone lane uses for the same reason.
+
+### Turn taking and transcript rows (R1-Q)
+
+* **Endpointing 0.8 / 3.0 s** (was 0.7 / 3.5; the SDK's own 0.3 / 2.5 s committed a turn on a
+  breath after a sentence-final clause, so a long answer was cut into several turns and several
+  replies). The **transition phase** runs 0.4 / 1.2 s (`r1_transition_endpointing`, sent through
+  `AgentSession.update_options(endpointing_opts=...)` on entering the phase; the session's own pair
+  is sent back on leaving it): the candidate only says "ready" there. The quick pair is a ceiling on
+  the session's numbers, never above them: an operator who sets `R1_ENDPOINT_MIN_DELAY_SEC` below 0.4
+  keeps the lower value. A failed update is logged as `r1_endpointing_update_failed` (type only) and
+  costs only the quicker window.
+* **One transcript row per committed candidate turn.** Sarvam closes an utterance at each of its own
+  pauses, and the SDK merges those finals into one turn, so a long answer used to be 5-6
+  `transcript_turns` rows, and the short ones ("Hello", "Good", "Okay") made 13.7% of the owner's
+  role-play rows two words or fewer, which alone fails the gate's `stt_sanity` (below 10%). The finals
+  now collect in one open row whose `turn_index` is reserved at the FIRST final (so ordering against
+  the bot's rows is unchanged) and which is written, once, when the SDK commits the turn, when a bot
+  speech starts (what the candidate says next is a new row, after the bot's: barge-in order is kept),
+  when the phase changes, and when the session exits. The phase driver still reads every final
+  separately (ready and wrap-up matching). A crash between the last final and one of those events
+  loses at most the one open row. A fragment the SDK banked (refused over a reply) joins the next
+  committed turn's row, as it joins that turn's text.
+* **The icebreaker exit is decided at a committed turn.** The soft exit (four answers once S >= 3:30)
+  counts the SDK's committed turns of at least three words, not STT finals: one long answer used to
+  count as several turns, and "Sorry" as one more. The driver no longer leaves the icebreaker at a raw
+  final (the transition line is uninterruptible, so that talked over a candidate who was mid-answer):
+  the turn the SDK commits next is suppressed and answered by the transition line, and the hard S=4:30
+  cap waits for a turn in flight (speaking, or a final not yet committed) for at most the endpointing
+  maximum plus one second after the last sign of speech, and never more than 30 s.
+* **`r1_reply_cancelled_before_audio`** (warning, `option_count` = running total for the session, no
+  text): the SDK cancelled a model reply before the candidate heard any of it. A few are normal (the
+  candidate really did start a new turn); a run of them is the owner's "dead air" and means the
+  interruption settings are letting fragments cancel replies. When the icebreaker's exit is due and
+  nobody is mid-turn, the turn that lost its reply is answered by the transition line instead of a
+  silence window.
 
 Preemptive generation stays off: livekit-agents 1.6.4 starts it before the per-turn decision and
 cannot be told the decision differs (see `_agent_turn_handling` in `r1_session.py` and

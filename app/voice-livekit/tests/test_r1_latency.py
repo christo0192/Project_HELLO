@@ -78,16 +78,26 @@ class TestTurnHandling(unittest.TestCase):
         for key in _ENV_KEYS:
             os.environ.pop(key, None)
 
-    def test_the_defaults_are_the_plans_numbers(self) -> None:
-        # Plan 5.15 item 3: endpointing 0.7 / 3.5 s, interruption min_duration 0.7 s, min_words 2.
+    def test_the_defaults_are_the_turn_taking_numbers(self) -> None:
+        # R1-Q S02 (interviewer-flow.md section 6): endpointing 0.8 / 3.0 s, interruption
+        # min_duration 0.8 s and min_words 3 (the phone lane's pair; PR-4c had 0.7 / 3.5 / 0.7 / 2).
         self.assertEqual(
             r1_turn_handling(),
             {
-                "endpointing": {"min_delay": 0.7, "max_delay": 3.5},
-                "interruption": {"min_duration": 0.7, "min_words": 2},
+                "endpointing": {"min_delay": 0.8, "max_delay": 3.0},
+                "interruption": {"min_duration": 0.8, "min_words": 3},
                 "preemptive_generation": {"enabled": False},
             },
         )
+
+    def test_a_two_word_courtesy_cannot_interrupt_a_reply(self) -> None:
+        # "Thank you." caused the owner's interrupted turn 4: the default word floor must sit
+        # above it, and above a bare "Sorry" and "Hello" too.
+        floor = r1_turn_handling()["interruption"]["min_words"]
+        for words in ("Sorry", "Hello", "Thank you.", "Yes please"):
+            with self.subTest(words=words):
+                self.assertLess(count_words(words), floor)
+        self.assertGreaterEqual(count_words("Hey, are you there?"), floor)
 
     def test_preemptive_generation_is_off_and_nothing_else_leaks_in(self) -> None:
         # No turn_detection key: the session keeps the browser lane's detector, and R1 only
@@ -150,15 +160,54 @@ class TestTurnHandling(unittest.TestCase):
     def test_each_call_returns_a_fresh_dict(self) -> None:
         first = r1_turn_handling()
         first["endpointing"]["min_delay"] = 99
-        self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], 0.7)
+        self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], 0.8)
 
     @staticmethod
     def _defaults() -> dict:
         return {
-            "endpointing": {"min_delay": 0.7, "max_delay": 3.5},
-            "interruption": {"min_duration": 0.7, "min_words": 2},
+            "endpointing": {"min_delay": 0.8, "max_delay": 3.0},
+            "interruption": {"min_duration": 0.8, "min_words": 3},
             "preemptive_generation": {"enabled": False},
         }
+
+
+class TestTransitionEndpointing(unittest.TestCase):
+    """The transition waits for one word ("ready"), so its turns commit quicker (0.4 / 1.2 s)."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in _ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def test_the_default_is_quicker_than_the_session(self) -> None:
+        self.assertEqual(
+            r1_latency.r1_transition_endpointing(), {"min_delay": 0.4, "max_delay": 1.2}
+        )
+        session = r1_turn_handling()["endpointing"]
+        self.assertLess(r1_latency.r1_transition_endpointing()["min_delay"], session["min_delay"])
+        self.assertLess(r1_latency.r1_transition_endpointing()["max_delay"], session["max_delay"])
+
+    def test_it_never_waits_longer_than_the_session_does(self) -> None:
+        os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.3"
+        os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
+        self.assertEqual(
+            r1_latency.r1_transition_endpointing(), {"min_delay": 0.3, "max_delay": 1.0}
+        )
+
+    def test_the_maximum_never_undercuts_the_minimum(self) -> None:
+        os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.2"
+        os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
+        endpointing = r1_latency.r1_transition_endpointing()
+        self.assertLessEqual(endpointing["min_delay"], endpointing["max_delay"])
+
+    def test_a_slower_session_is_capped_at_the_transition_numbers(self) -> None:
+        os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "1.5"
+        os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "6"
+        self.assertEqual(
+            r1_latency.r1_transition_endpointing(), {"min_delay": 0.4, "max_delay": 1.2}
+        )
 
 
 class TestLatencyTracker(unittest.TestCase):
