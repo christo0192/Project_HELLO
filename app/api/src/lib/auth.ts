@@ -608,6 +608,7 @@ export const PUBLIC_ROUTES: { method: string; path: string }[] = [
   { method: 'POST', path: '/api/r1/preflight' },
   { method: 'POST', path: '/api/r1/attempts' },
   { method: 'POST', path: '/api/r1/exchange' },
+  { method: 'POST', path: '/api/r1/ready' },
 ];
 
 export function isPublicRoute(method: string, path: string): boolean {

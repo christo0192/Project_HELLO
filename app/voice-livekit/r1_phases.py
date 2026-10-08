@@ -144,6 +144,8 @@ class R1PhaseMachine:
         self._phase_entered: dict[R1Phase, float] = {R1Phase.PRE_JOIN: self.started_at}
         # S (plan section 5.1) runs from activation, which is the first entry to OPENING.
         self._activated_at: float | None = None
+        # Committed candidate answers in OPENING/ICEBREAKER (the session counts the SDK's turns of
+        # three words or more, not STT finals): the soft exit needs four of them.
         self.candidate_turns = 0
 
     def transition(self, target: R1Phase) -> None:

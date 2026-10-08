@@ -31,9 +31,13 @@
  * cannot fix configuration), and (on the FINAL queue attempt) a provider or validation
  * failure, which records a placeholder assessment so HR sees "needs human review" instead of
  * nothing, then rethrows so the job lands in the DLQ (`v_funnel_failures`, M3) as the
- * Mission Control alert. A final-attempt failure AFTER a scored row was stored (the round
- * settlement threw) records no placeholder: the scored row stays the truth and a DLQ replay
- * re-drives the settlement through the adopt path.
+ * Mission Control alert. The exception is a failure the queue handler is about to DEFER (a
+ * provider outage within its deferral budget, `options.willDefer`): that job is still alive, so
+ * no placeholder is written for it (if the deferral then fails to commit on the final attempt,
+ * the runtime's queue guard records the same placeholder through `recordR1ScoringFailure`).
+ * A final-attempt failure AFTER a scored row was stored (the
+ * round settlement threw) records no placeholder: the scored row stays the truth and a DLQ
+ * replay re-drives the settlement through the adopt path.
  *
  * No candidate text is logged or audited; audit metadata carries versions, thresholds and
  * stable codes only.
@@ -91,6 +95,13 @@ export interface R1AssessmentOptions {
   readonly now?: () => Date;
   /** True on the last queue attempt: a failure then records a human_review placeholder. */
   readonly finalAttempt?: boolean;
+  /**
+   * Asked on a failure with its stable `r1ErrorCode`: will the queue handler DEFER this job
+   * (return it to `delayed` with the attempt refunded) instead of failing it? A job that will
+   * defer is still alive and will be scored later, so it must not leave a `scoring_failed`
+   * placeholder behind, even when this claim is the final attempt. Absent means "no".
+   */
+  readonly willDefer?: (code: string) => boolean;
   /** Test seam: a fixed prompt sentinel. */
   readonly sentinel?: string;
 }
@@ -250,11 +261,43 @@ interface PlaceholderInput {
   readonly now: Date;
 }
 
+/**
+ * Stable codes for the HTTP status DeepSeek answered with. The status used to be dropped, so a
+ * 402 (balance exhausted), a 401 (bad key) and a 500 all read `deepseek_protocol` and the owner
+ * test b58c7d9c dead-lettered with no way to tell which (RCA 2026-10-08). The queue handler
+ * treats 429 and 5xx as provider unavailability (deferred) and everything else as a failure.
+ */
+export const R1_CODE_INSUFFICIENT_BALANCE = 'deepseek_insufficient_balance';
+export const R1_CODE_AUTH = 'deepseek_auth';
+export const R1_CODE_RATE_LIMITED = 'deepseek_rate_limited';
+export const R1_CODE_SERVER_ERROR = 'deepseek_server_error';
+
+/**
+ * What an operator should do about a code, in words. Static text only: it never carries the
+ * provider's response, the key or candidate text. Shown in the `human_review` placeholder.
+ */
+const OPERATOR_MESSAGES: Readonly<Record<string, string>> = {
+  [R1_CODE_INSUFFICIENT_BALANCE]:
+    'the DeepSeek balance is exhausted (HTTP 402); top up the DeepSeek account, and the job '
+    + 'can be replayed after the top-up',
+  [R1_CODE_AUTH]:
+    'DeepSeek rejected the API key (HTTP 401/403); fix the DEEPSEEK_API_KEY secret, and the '
+    + 'job can be replayed after the fix',
+};
+
+/** The operator-facing sentence for a code, or null when the code needs no explanation. */
+export function r1OperatorMessage(code: string): string | null {
+  return OPERATOR_MESSAGES[code] ?? null;
+}
+
 /** A human_review row with every metric `insufficient_evidence`: the shape the HR card renders. */
 function buildPlaceholderPayload(input: PlaceholderInput): Record<string, unknown> {
+  const operator = r1OperatorMessage(input.code);
   const reason = input.outcome === 'no_candidate_speech'
     ? 'The candidate said too little in the scored phases to assess; human review is required.'
-    : `R1 scoring could not be completed (${input.code}); human review is required.`;
+    : operator
+      ? `R1 scoring could not be completed because ${operator} (${input.code}); human review is required.`
+      : `R1 scoring could not be completed (${input.code}); human review is required.`;
   const metricResults = (input.scorecard?.metrics ?? []).map((metric) => ({
     configMetricId: metric.id,
     score: null,
@@ -446,10 +489,35 @@ async function settleRound(
   return fail(`r1_status_${appliedStatus}`.slice(0, 60));
 }
 
+/** The HTTP status a DeepSeek failure carries, when it is a real one. */
+function deepseekHttpStatus(err: unknown): number | null {
+  if (!(err instanceof DeepseekError)) return null;
+  const status = err.status;
+  return typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
+    ? status
+    : null;
+}
+
+/**
+ * The code for a non-2xx DeepSeek answer: 402 -> insufficient balance, 401/403 -> auth,
+ * 429 -> rate limited, 5xx -> server error, any other status -> `deepseek_http_<status>`.
+ * Null when the error carries no status (a 200 with an unusable body stays `deepseek_protocol`).
+ */
+function deepseekStatusCode(status: number | null): string | null {
+  if (status === null) return null;
+  if (status === 402) return R1_CODE_INSUFFICIENT_BALANCE;
+  if (status === 401 || status === 403) return R1_CODE_AUTH;
+  if (status === 429) return R1_CODE_RATE_LIMITED;
+  if (status >= 500) return R1_CODE_SERVER_ERROR;
+  return `deepseek_http_${status}`;
+}
+
 /** A stable, sanitized code for the queue/DLQ; never provider text, never candidate text. */
 export function r1ErrorCode(err: unknown): string {
   if (err instanceof ScorecardValidationError) return err.code;
-  if (err instanceof DeepseekError) return `deepseek_${err.category}`;
+  if (err instanceof DeepseekError) {
+    return deepseekStatusCode(deepseekHttpStatus(err)) ?? `deepseek_${err.category}`;
+  }
   if (err instanceof ProviderError) return `provider_${err.message}`.slice(0, 63);
   if (err instanceof BusinessError) return 'deepseek_parse_error';
   const message = err instanceof Error ? err.message : '';
@@ -577,8 +645,18 @@ export async function runR1Assessment(
     };
   } catch (err) {
     const code = r1ErrorCode(err);
-    r1Log.warn('unknown_event', { error_category: 'r1_assessment_failed', rejection_reason: code });
-    if (options.finalAttempt === true) {
+    const httpStatus = deepseekHttpStatus(err);
+    r1Log.warn('unknown_event', {
+      error_category: 'r1_assessment_failed',
+      rejection_reason: code,
+      ...(httpStatus === null ? {} : { http_status: httpStatus }),
+    });
+    // A job the handler is about to DEFER is still alive and will be scored on a later claim:
+    // recording "scoring failed" for it would put a wrong, HR-visible outcome on a candidate
+    // whose score is merely late (and the row would disagree with the queue). Only a failure
+    // that ends the job, the DLQ path, leaves the placeholder.
+    const deferring = options.willDefer?.(code) === true;
+    if (options.finalAttempt === true && !deferring) {
       // Last attempt: leave HR a "needs human review" record before the job dead-letters,
       // unless a scored row already exists (its settlement failed): that row stays the truth
       // and a DLQ replay re-drives the settlement. Best effort: a failure here must not mask
@@ -597,6 +675,39 @@ export async function runR1Assessment(
     }
     throw new Error(code, { cause: err });
   }
+}
+
+/**
+ * Record the `scoring_failed` placeholder for a job that is ending without a score, from OUTSIDE
+ * `runR1Assessment`: the queue guard calls it when a FINAL-attempt deferral did not commit, so the
+ * job is about to be dead-lettered by its lease expiry with nothing for HR to see
+ * (`createR1FinalDeferralGuard`). The same placeholder the final-attempt catch above writes, with
+ * the same `code`.
+ *
+ * No-op (`exists`) when the session already has any v2 assessment, scored or a placeholder: a
+ * stored row is the truth, never stacked over. Throws on a database error; the caller treats this
+ * as best effort. No model call.
+ */
+export async function recordR1ScoringFailure(
+  sessionId: string,
+  code: string,
+  options: { readonly client?: R1DbClient; readonly now?: () => Date } = {},
+): Promise<'recorded' | 'exists'> {
+  const client = options.client ?? (supabase as unknown as R1DbClient);
+  const now = options.now ?? ((): Date => new Date());
+  const session = await loadSession(client, sessionId);
+  const existing = await loadLatestAssessment(client, sessionId);
+  if (existing) return 'exists';
+  const settings = await loadSettings(client);
+  const loaded = session.role_id ? await loadActiveRoleScorecard(client, session.role_id) : null;
+  // Only the exact R1 scorecard is shown on the HR card, as everywhere else in this file.
+  const scorecard = loaded && r1ScorecardMatchesRubric(loaded.metrics) ? loaded : null;
+  await persistPlaceholder({
+    client, session, roundId: session.interview_round_id as string, scorecard, existing: null,
+    revision: 1, supersedes: null, outcome: 'scoring_failed', code, settings,
+    gateFailures: ['scoring_failed'], now: now(),
+  });
+  return 'recorded';
 }
 
 const SCORECARD_MISMATCH_CODE = 'r1_scorecard_mismatch';

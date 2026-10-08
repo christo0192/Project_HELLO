@@ -1,0 +1,870 @@
+"""R1 turn handling and the per-turn latency tracker (plan 5.15).  Pure python: no SDK.
+
+``r1_turn_handling`` is the one place R1's turn-taking numbers live; ``LatencyTracker`` turns
+the stamps of one candidate turn into the segments ``r1_session`` logs.  Both are tested here
+with a manual clock, and the wiring into a session is tested in ``test_r1_integration``.
+"""
+from __future__ import annotations
+
+import ast
+import io
+import json
+import math
+import os
+import sys
+import unittest
+from pathlib import Path
+from unittest import mock
+
+HERE = Path(__file__).resolve().parents[1]
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+import r1_latency
+from r1_latency import (
+    STAGE_A_HEADLINE_P50_SEC,
+    STAGE_A_HEADLINE_P95_SEC,
+    STAGE_A_SCRIPTED_START_SEC,
+    LatencyTracker,
+    count_words,
+    latency_records,
+    percentile,
+    r1_turn_handling,
+    stage_a_report,
+)
+
+_ENV_KEYS = (
+    "R1_ENDPOINT_MIN_DELAY_SEC",
+    "R1_ENDPOINT_MAX_DELAY_SEC",
+    "R1_INTERRUPT_MIN_DURATION_SEC",
+    "R1_INTERRUPT_MIN_WORDS",
+)
+
+
+class Clock:
+    def __init__(self, start: float = 0.0) -> None:
+        self.now = start
+
+    def __call__(self) -> float:
+        return self.now
+
+    def at(self, value: float) -> None:
+        self.now = value
+
+
+class Lines:
+    """Collects what the tracker reports, rounded so the arithmetic reads exactly."""
+
+    def __init__(self) -> None:
+        self.items: list[tuple] = []
+
+    def __call__(self, schema, seconds, *, category, phase, turn_index) -> None:
+        self.items.append((schema, round(seconds, 3), category, phase, turn_index))
+
+    def schemas(self) -> list[str]:
+        return [item[0] for item in self.items]
+
+    def get(self, schema: str) -> tuple:
+        found = [item for item in self.items if item[0] == schema]
+        assert len(found) == 1, (schema, self.items)
+        return found[0]
+
+
+class TestTurnHandling(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {}, clear=False)  # restores whatever the test sets
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in _ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def test_the_defaults_are_the_turn_taking_numbers(self) -> None:
+        # R1-Q S02 (interviewer-flow.md section 6): endpointing 0.8 / 3.0 s, interruption
+        # min_duration 0.8 s and min_words 3 (the phone lane's pair; PR-4c had 0.7 / 3.5 / 0.7 / 2).
+        self.assertEqual(
+            r1_turn_handling(),
+            {
+                "endpointing": {"min_delay": 0.8, "max_delay": 3.0},
+                "interruption": {"min_duration": 0.8, "min_words": 3},
+                "preemptive_generation": {"enabled": False},
+            },
+        )
+
+    def test_a_two_word_courtesy_cannot_interrupt_a_reply(self) -> None:
+        # "Thank you." caused the owner's interrupted turn 4: the default word floor must sit
+        # above it, and above a bare "Sorry" and "Hello" too.
+        floor = r1_turn_handling()["interruption"]["min_words"]
+        for words in ("Sorry", "Hello", "Thank you.", "Yes please"):
+            with self.subTest(words=words):
+                self.assertLess(count_words(words), floor)
+        self.assertGreaterEqual(count_words("Hey, are you there?"), floor)
+
+    def test_preemptive_generation_is_off_and_nothing_else_leaks_in(self) -> None:
+        # No turn_detection key: the session keeps the browser lane's detector, and R1 only
+        # changes the timings around it.
+        handling = r1_turn_handling()
+        self.assertEqual(handling["preemptive_generation"], {"enabled": False})
+        self.assertEqual(
+            set(handling), {"endpointing", "interruption", "preemptive_generation"}
+        )
+
+    def test_each_value_can_be_tuned_from_the_environment(self) -> None:
+        os.environ.update(
+            {
+                "R1_ENDPOINT_MIN_DELAY_SEC": "0.5",
+                "R1_ENDPOINT_MAX_DELAY_SEC": "4.5",
+                "R1_INTERRUPT_MIN_DURATION_SEC": "1.0",
+                "R1_INTERRUPT_MIN_WORDS": "3",
+            }
+        )
+        handling = r1_turn_handling()
+        self.assertEqual(handling["endpointing"], {"min_delay": 0.5, "max_delay": 4.5})
+        self.assertEqual(handling["interruption"], {"min_duration": 1.0, "min_words": 3})
+
+    def test_every_value_is_bounded(self) -> None:
+        os.environ.update(
+            {
+                "R1_ENDPOINT_MIN_DELAY_SEC": "0.0",
+                "R1_ENDPOINT_MAX_DELAY_SEC": "99",
+                "R1_INTERRUPT_MIN_DURATION_SEC": "0.0",
+                "R1_INTERRUPT_MIN_WORDS": "99",
+            }
+        )
+        handling = r1_turn_handling()
+        self.assertEqual(handling["endpointing"], {"min_delay": 0.2, "max_delay": 8.0})
+        self.assertEqual(handling["interruption"], {"min_duration": 0.3, "min_words": 6})
+        os.environ.update(
+            {
+                "R1_ENDPOINT_MIN_DELAY_SEC": "50",
+                "R1_INTERRUPT_MIN_DURATION_SEC": "50",
+                "R1_INTERRUPT_MIN_WORDS": "-4",
+            }
+        )
+        handling = r1_turn_handling()
+        self.assertEqual(handling["endpointing"]["min_delay"], 2.0)
+        self.assertEqual(handling["interruption"], {"min_duration": 2.0, "min_words": 0})
+
+    def test_a_malformed_value_falls_back_to_the_default(self) -> None:
+        for bad in ("", "  ", "abc", "nan", "inf", "-inf", "1,5"):
+            with self.subTest(value=bad):
+                for key in _ENV_KEYS:
+                    os.environ[key] = bad
+                self.assertEqual(r1_turn_handling(), self._defaults())
+
+    def test_the_maximum_delay_never_undercuts_the_minimum(self) -> None:
+        os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "2.0"
+        os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
+        endpointing = r1_turn_handling()["endpointing"]
+        self.assertEqual(endpointing, {"min_delay": 2.0, "max_delay": 2.0})
+
+    def test_each_call_returns_a_fresh_dict(self) -> None:
+        first = r1_turn_handling()
+        first["endpointing"]["min_delay"] = 99
+        self.assertEqual(r1_turn_handling()["endpointing"]["min_delay"], 0.8)
+
+    @staticmethod
+    def _defaults() -> dict:
+        return {
+            "endpointing": {"min_delay": 0.8, "max_delay": 3.0},
+            "interruption": {"min_duration": 0.8, "min_words": 3},
+            "preemptive_generation": {"enabled": False},
+        }
+
+
+class TestTransitionEndpointing(unittest.TestCase):
+    """The transition waits for one word ("ready"), so its turns commit quicker (0.4 / 1.2 s)."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in _ENV_KEYS:
+            os.environ.pop(key, None)
+
+    def test_the_default_is_quicker_than_the_session(self) -> None:
+        self.assertEqual(
+            r1_latency.r1_transition_endpointing(), {"min_delay": 0.4, "max_delay": 1.2}
+        )
+        session = r1_turn_handling()["endpointing"]
+        self.assertLess(r1_latency.r1_transition_endpointing()["min_delay"], session["min_delay"])
+        self.assertLess(r1_latency.r1_transition_endpointing()["max_delay"], session["max_delay"])
+
+    def test_it_never_waits_longer_than_the_session_does(self) -> None:
+        os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.3"
+        os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
+        self.assertEqual(
+            r1_latency.r1_transition_endpointing(), {"min_delay": 0.3, "max_delay": 1.0}
+        )
+
+    def test_the_maximum_never_undercuts_the_minimum(self) -> None:
+        os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.2"
+        os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
+        endpointing = r1_latency.r1_transition_endpointing()
+        self.assertLessEqual(endpointing["min_delay"], endpointing["max_delay"])
+
+    def test_a_slower_session_is_capped_at_the_transition_numbers(self) -> None:
+        os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "1.5"
+        os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "6"
+        self.assertEqual(
+            r1_latency.r1_transition_endpointing(), {"min_delay": 0.4, "max_delay": 1.2}
+        )
+
+
+class TestLatencyTracker(unittest.TestCase):
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.lines = Lines()
+        self.tracker = LatencyTracker(self.clock, self.lines)
+
+    def speak(self, start: float, stop: float) -> None:
+        self.clock.at(start)
+        self.tracker.note_user_state("speaking")
+        self.clock.at(stop)
+        self.tracker.note_user_state("listening")
+
+    def test_a_full_reply_reports_every_segment_from_the_end_of_speech(self) -> None:
+        self.speak(10.0, 12.0)
+        self.clock.at(12.2)
+        self.tracker.note_final()
+        self.clock.at(12.9)
+        self.tracker.begin_turn(7, "roleplay")
+        self.tracker.set_kind("llm_reply")
+        self.clock.at(13.0)
+        self.tracker.mark("llm_start")
+        self.clock.at(13.5)
+        self.tracker.mark("llm_first_token")
+        self.clock.at(14.0)
+        self.tracker.mark("guard_release")
+        self.tracker.mark("tts_first_text")
+        self.clock.at(14.25)
+        self.tracker.mark("tts_first_frame")
+        self.clock.at(14.5)
+        self.tracker.first_audio()
+        self.assertEqual(
+            self.lines.items,
+            [
+                ("eou_to_turn_hook", 0.9, "vad", "roleplay", 7),
+                ("eou_to_llm_first_token", 1.5, "llm_reply", "roleplay", 7),
+                ("llm_ttft", 0.5, "llm_reply", "roleplay", 7),
+                ("eou_to_guard_release", 2.0, "llm_reply", "roleplay", 7),
+                ("guard_hold", 0.5, "llm_reply", "roleplay", 7),
+                ("eou_to_tts_first_frame", 2.25, "llm_reply", "roleplay", 7),
+                ("tts_ttfb", 0.25, "llm_reply", "roleplay", 7),
+                ("eou_to_first_audio", 2.5, "llm_reply", "roleplay", 7),
+            ],
+        )
+
+    def test_a_pause_inside_an_utterance_does_not_move_the_anchor(self) -> None:
+        # speaking, a pause (stop at 5), speaking again, the real stop at 8
+        self.speak(1.0, 5.0)
+        self.clock.at(6.0)
+        self.tracker.note_user_state("speaking")
+        self.clock.at(8.0)
+        self.tracker.note_user_state("listening")
+        self.clock.at(9.0)
+        self.tracker.begin_turn(1, "icebreaker")
+        self.assertEqual(self.lines.get("eou_to_turn_hook")[1], 1.0)
+
+    def test_a_resumed_utterance_is_not_anchored_on_the_earlier_stop(self) -> None:
+        self.speak(1.0, 5.0)
+        self.clock.at(6.0)
+        self.tracker.note_user_state("speaking")  # still talking when the hook runs
+        self.clock.at(6.5)
+        self.tracker.note_final()
+        self.clock.at(7.0)
+        self.tracker.begin_turn(1, "icebreaker")
+        # The anchor falls back to the final transcript, not the stale stop at 5.0.
+        self.assertEqual(self.lines.get("eou_to_turn_hook"), ("eou_to_turn_hook", 0.5, "final", "icebreaker", 1))
+
+    def test_without_a_speech_stop_the_final_transcript_is_the_anchor(self) -> None:
+        self.clock.at(3.0)
+        self.tracker.note_final()
+        self.clock.at(4.0)
+        self.tracker.begin_turn(2, "wrapup")
+        self.assertEqual(self.lines.get("eou_to_turn_hook"), ("eou_to_turn_hook", 1.0, "final", "wrapup", 2))
+
+    def test_without_either_the_hook_is_the_anchor_and_the_segment_is_zero(self) -> None:
+        self.clock.at(4.0)
+        self.tracker.begin_turn(None, "wrapup")
+        self.assertEqual(
+            self.lines.get("eou_to_turn_hook"), ("eou_to_turn_hook", 0.0, "hook", "wrapup", None)
+        )
+
+    def test_an_anchor_is_used_once(self) -> None:
+        self.speak(1.0, 2.0)
+        self.clock.at(2.5)
+        self.tracker.begin_turn(1, "icebreaker")
+        self.clock.at(10.0)
+        self.tracker.note_final()
+        self.clock.at(10.4)
+        self.tracker.begin_turn(2, "icebreaker")
+        second = [item for item in self.lines.items if item[0] == "eou_to_turn_hook"][1]
+        self.assertEqual(second, ("eou_to_turn_hook", 0.4, "final", "icebreaker", 2))
+
+    def test_an_anchor_never_lies_after_the_hook(self) -> None:
+        self.speak(5.0, 9.0)
+        self.clock.at(8.0)  # a clock that stepped back
+        self.tracker.begin_turn(1, "icebreaker")
+        self.assertEqual(self.lines.get("eou_to_turn_hook")[1], 0.0)
+
+    def test_the_first_stamp_of_a_stage_wins(self) -> None:
+        self.clock.at(1.0)
+        self.tracker.begin_turn(1, "icebreaker")
+        self.clock.at(2.0)
+        self.tracker.mark("llm_first_token")
+        self.clock.at(3.0)
+        self.tracker.mark("llm_first_token")
+        self.clock.at(4.0)
+        self.tracker.first_audio()
+        self.clock.at(5.0)
+        self.tracker.first_audio()
+        self.assertEqual(self.lines.schemas().count("eou_to_llm_first_token"), 1)
+        self.assertEqual(self.lines.schemas().count("eou_to_first_audio"), 1)
+        self.assertEqual(self.lines.get("eou_to_llm_first_token")[1], 1.0)
+        self.assertEqual(self.lines.get("eou_to_first_audio")[1], 3.0)
+
+    def test_a_segment_that_needs_a_missing_stamp_is_skipped(self) -> None:
+        self.clock.at(1.0)
+        self.tracker.begin_turn(1, "icebreaker")
+        self.clock.at(2.0)
+        self.tracker.mark("llm_first_token")  # no llm_start: no ttft
+        self.tracker.mark("guard_release")  # fine: first token stamped
+        self.tracker.mark("tts_first_frame")  # no tts_first_text: no ttfb
+        self.assertEqual(
+            self.lines.schemas(),
+            [
+                "eou_to_turn_hook",
+                "eou_to_llm_first_token",
+                "eou_to_guard_release",
+                "guard_hold",
+                "eou_to_tts_first_frame",
+            ],
+        )
+
+    def test_the_acknowledgement_reports_its_outcome(self) -> None:
+        for outcome in ("done", "cutoff", "failed"):
+            with self.subTest(outcome=outcome):
+                self.lines.items.clear()
+                self.clock.at(10.0)
+                self.tracker.begin_turn(1, "roleplay")
+                self.tracker.set_kind("ack_then_say")
+                self.clock.at(10.5)
+                self.tracker.mark("llm_start")
+                self.clock.at(12.0)
+                self.tracker.mark("ack", outcome)
+                self.assertEqual(self.lines.get("ack"), ("ack", 1.5, outcome, "roleplay", 1))
+
+    def test_an_acknowledgement_without_a_model_call_reports_nothing(self) -> None:
+        self.clock.at(1.0)
+        self.tracker.begin_turn(1, "roleplay")
+        self.clock.at(2.0)
+        self.tracker.mark("ack", "failed")
+        self.assertNotIn("ack", self.lines.schemas())
+
+    def test_stamps_without_an_open_turn_do_nothing(self) -> None:
+        self.tracker.mark("llm_first_token")
+        self.tracker.first_audio()
+        self.tracker.set_kind("llm_reply")
+        self.assertEqual(self.lines.items, [])
+
+    def test_a_new_turn_replaces_the_old_one(self) -> None:
+        self.clock.at(1.0)
+        self.tracker.begin_turn(1, "icebreaker")
+        self.clock.at(5.0)
+        self.tracker.begin_turn(2, "icebreaker")
+        self.clock.at(6.0)
+        self.tracker.first_audio()
+        audio = self.lines.get("eou_to_first_audio")
+        self.assertEqual((audio[1], audio[4]), (1.0, 2))
+
+    def test_the_headline_names_the_kind_of_turn(self) -> None:
+        for kind in ("llm_reply", "ack_then_say", "say_only", "reply"):
+            with self.subTest(kind=kind):
+                self.lines.items.clear()
+                self.clock.at(1.0)
+                self.tracker.begin_turn(1, "roleplay")
+                self.tracker.set_kind(kind)
+                self.clock.at(2.0)
+                self.tracker.first_audio()
+                self.assertEqual(self.lines.get("eou_to_first_audio")[2], kind)
+
+    def test_negative_and_absurd_durations_are_never_reported(self) -> None:
+        self.clock.at(100.0)
+        self.tracker.note_final()
+        self.clock.at(50.0)  # time ran backwards
+        self.tracker.begin_turn(1, "roleplay")
+        self.assertEqual(self.lines.items[0][1], 0.0)  # clamped by the anchor rule
+        self.lines.items.clear()
+        self.clock.at(10_000.0)  # an absurd gap
+        self.tracker.first_audio()
+        self.assertEqual(self.lines.items, [])
+        self.clock.at(10.0)
+        self.tracker.mark("llm_first_token")  # before the anchor: negative
+        self.assertEqual(self.lines.items, [])
+
+    def test_a_scripted_line_reports_the_delay_to_its_audio(self) -> None:
+        self.clock.at(1.0)
+        self.tracker.say_created("speech_1", "L-EXIT", "roleplay_exit")
+        self.clock.at(1.4)
+        self.assertTrue(self.tracker.say_audio("speech_1"))
+        self.assertEqual(
+            self.lines.items, [("say_to_first_audio", 0.4, "L-EXIT", "roleplay_exit", None)]
+        )
+        self.assertFalse(self.tracker.say_audio("speech_1"))  # reported once
+        self.assertFalse(self.tracker.say_audio("speech_unknown"))
+
+    def test_an_interrupted_scripted_line_is_forgotten_without_a_report(self) -> None:
+        self.clock.at(1.0)
+        self.tracker.say_created("speech_1", "L-WRAP", "wrapup")
+        self.tracker.say_done("speech_1")
+        self.clock.at(2.0)
+        self.assertFalse(self.tracker.say_audio("speech_1"))
+        self.assertEqual(self.lines.items, [])
+
+    def test_unfinished_scripted_lines_are_bounded(self) -> None:
+        for number in range(40):
+            self.tracker.say_created(f"speech_{number}", "L-WRAP", "wrapup")
+        self.assertFalse(self.tracker.say_audio("speech_0"))  # the oldest were dropped
+        self.assertTrue(self.tracker.say_audio("speech_39"))
+
+    def test_a_scripted_line_does_not_feed_the_open_turn(self) -> None:
+        self.clock.at(1.0)
+        self.tracker.begin_turn(1, "roleplay")
+        self.tracker.say_created("speech_1", "L-ASIDE-COACH", "aside")
+        self.clock.at(1.2)
+        self.assertTrue(self.tracker.say_audio("speech_1"))
+        self.assertNotIn("eou_to_first_audio", self.lines.schemas())
+
+    def test_every_reported_value_is_finite(self) -> None:
+        self.clock.at(math.inf)
+        self.tracker.note_final()
+        self.clock.at(1.0)
+        self.tracker.begin_turn(1, "roleplay")
+        self.assertTrue(all(math.isfinite(item[1]) for item in self.lines.items))
+
+
+class TestFirstAudioP95(unittest.TestCase):
+    """The one number the API gate reads: ``session_facts.first_audio_p95_ms`` (pr4c-rebase 3.3)."""
+
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.lines = Lines()
+        self.tracker = LatencyTracker(self.clock, self.lines)
+        self.turns = 0
+
+    def turn(self, phase: str, seconds: float) -> None:
+        """One candidate turn whose audio starts ``seconds`` after the end of speech."""
+        self.turns += 1
+        base = self.clock.now + 10.0
+        self.clock.at(base)
+        self.tracker.note_user_state("speaking")
+        self.clock.at(base + 1.0)
+        self.tracker.note_user_state("listening")  # the anchor
+        self.tracker.begin_turn(self.turns, phase)
+        self.clock.at(base + 1.0 + seconds)
+        self.tracker.first_audio()
+
+    def test_the_gate_reads_role_play_turns_in_milliseconds(self) -> None:
+        for step in range(1, 21):  # 0.1 s ... 2.0 s
+            self.turn("roleplay", step / 10)
+        self.assertEqual(self.tracker.first_audio_samples(), 20)
+        # nearest rank: the 19th of 20 (a manual clock sums floats, so compare to the millisecond)
+        self.assertAlmostEqual(self.tracker.first_audio_p95_seconds(), 1.9, places=6)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1900)
+        self.assertIsInstance(self.tracker.first_audio_p95_ms(), int)
+
+    def test_the_milliseconds_are_the_headline_lines_not_a_second_measurement(self) -> None:
+        for value in (0.9, 1.2, 1.1, 2.4, 1.0, 0.8, 1.3, 1.6, 0.7, 3.2):
+            self.turn("roleplay", value)
+        logged = [item[1] for item in self.lines.items if item[0] == "eou_to_first_audio"]
+        self.assertEqual(len(logged), 10)
+        expected = percentile(logged, 95)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), int(round(expected * 1000)))
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 3200)
+
+    def test_fewer_than_eight_turns_is_unknown_never_a_number(self) -> None:
+        for _ in range(7):
+            self.turn("roleplay", 1.0)
+        self.assertEqual(self.tracker.first_audio_samples(), 7)
+        self.assertIsNone(self.tracker.first_audio_p95_ms())
+        self.assertIsNone(self.tracker.first_audio_p95_seconds())
+        self.turn("roleplay", 1.0)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)
+
+    def test_no_turn_at_all_is_unknown(self) -> None:
+        self.assertIsNone(self.tracker.first_audio_p95_ms())
+        self.assertIsNone(self.tracker.first_audio_p95_ms(None, min_samples=1))
+        self.assertEqual(self.tracker.first_audio_samples(None), 0)
+
+    def test_only_role_play_turns_count_for_the_gate(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.0)
+        for phase in ("opening", "icebreaker", "wrapup", "aside"):
+            for _ in range(3):
+                self.turn(phase, 9.0)  # the interviewer's turns are slow and must not count
+        self.assertEqual(self.tracker.first_audio_samples(), 8)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)
+        # For information the every-phase figure is available, and it does see them.
+        self.assertEqual(self.tracker.first_audio_samples(None), 20)
+        self.assertEqual(self.tracker.first_audio_p95_ms(None), 9000)
+        self.assertEqual(self.tracker.first_audio_p95_ms("icebreaker", min_samples=3), 9000)
+
+    def test_the_other_phases_cannot_make_a_thin_role_play_look_measured(self) -> None:
+        for _ in range(5):
+            self.turn("roleplay", 1.0)
+        for _ in range(20):
+            self.turn("icebreaker", 1.0)
+        self.assertIsNone(self.tracker.first_audio_p95_ms())
+
+    def test_the_value_is_rounded_to_whole_milliseconds(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.2346)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1235)
+
+    def test_a_turn_counts_once_whatever_stamps_follow(self) -> None:
+        for _ in range(7):
+            self.turn("roleplay", 1.0)
+        self.turn("roleplay", 1.0)
+        self.clock.at(self.clock.now + 5.0)
+        self.tracker.first_audio()  # a later "speaking" event in the same turn
+        self.tracker.first_audio()
+        self.assertEqual(self.tracker.first_audio_samples(), 8)
+
+    def test_a_clock_artefact_is_never_a_sample(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.0)
+        self.turn("roleplay", 700.0)  # a stale anchor: not a latency
+        self.clock.at(self.clock.now + 1.0)
+        self.tracker.note_user_state("speaking")
+        self.clock.at(self.clock.now + 1.0)
+        self.tracker.note_user_state("listening")
+        self.tracker.begin_turn(99, "roleplay")
+        self.clock.at(self.clock.now - 30.0)  # the clock stepped back
+        self.tracker.first_audio()
+        self.assertEqual(self.tracker.first_audio_samples(), 8)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)
+
+    def test_a_scripted_line_and_a_turn_without_audio_add_no_sample(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.0)
+        self.clock.at(self.clock.now + 5.0)
+        self.tracker.say_created("speech_1", "L-EXIT", "roleplay")
+        self.clock.at(self.clock.now + 0.4)
+        self.assertTrue(self.tracker.say_audio("speech_1"))
+        self.tracker.begin_turn(50, "roleplay")  # a suppressed turn: no reply, no audio
+        self.assertEqual(self.tracker.first_audio_samples(), 8)
+
+    def test_the_samples_are_bounded_and_the_newest_win(self) -> None:
+        for _ in range(600):
+            self.turn("roleplay", 5.0)
+        for _ in range(512):
+            self.turn("roleplay", 1.0)
+        self.assertEqual(self.tracker.first_audio_samples(), 512)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)
+
+    def test_the_gate_defaults_are_the_apis(self) -> None:
+        self.assertEqual(r1_latency.GATE_PHASE, "roleplay")
+        self.assertEqual(r1_latency.GATE_MIN_SAMPLES, 8)  # R1_GATE_LIMITS.MIN_QUALIFYING_TURNS
+
+
+class TestRepliesLostBeforeAnyAudio(unittest.TestCase):
+    """A reply cancelled before the candidate heard it still counts toward the p95 (as a lower bound).
+
+    The headline sample is added when the first audio plays, so a turn whose reply was cancelled
+    first (the owner's row 26 "Hello": dead air) never entered the percentile the gate compares
+    with 3 s.  The slowest turns are exactly the ones that never reach their first audio.
+    """
+
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.lines = Lines()
+        self.tracker = LatencyTracker(self.clock, self.lines)
+        self.turns = 0
+
+    def turn(self, phase: str, seconds: float | None) -> int | None:
+        """A turn whose audio starts after ``seconds`` (``None``: no audio is ever reported)."""
+        self.turns += 1
+        self.clock.at(self.clock.now + 10.0)
+        self.tracker.begin_turn(self.turns, phase)
+        turn_id = self.tracker.open_turn_id()
+        if seconds is not None:
+            self.clock.at(self.clock.now + seconds)
+            self.tracker.first_audio()
+        return turn_id
+
+    def test_a_lost_reply_adds_the_wait_so_far_as_a_sample(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.0)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)
+        turn_id = self.turn("roleplay", None)
+        self.clock.at(self.clock.now + 6.0)
+        self.tracker.reply_lost(turn_id)
+        self.assertEqual(self.tracker.first_audio_samples(), 9)
+        self.assertEqual(self.tracker.replies_lost(), 1)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 6000)
+        self.assertEqual(self.lines.get("eou_to_reply_lost")[1:], (6.0, "reply", "roleplay", 9))
+
+    def test_the_slowest_turn_cannot_hide_by_never_being_heard(self) -> None:
+        # Ten role-play turns answered in 1 s and one the candidate sat through for 9 s before the
+        # SDK cancelled its reply: the session must not read as a 1 s session.
+        for _ in range(10):
+            self.turn("roleplay", 1.0)
+        turn_id = self.turn("roleplay", None)
+        self.clock.at(self.clock.now + 9.0)
+        self.tracker.reply_lost(turn_id)
+        self.assertGreater(self.tracker.first_audio_p95_ms(), 3000)
+
+    def test_a_lost_turn_counts_once(self) -> None:
+        turn_id = self.turn("roleplay", None)
+        self.clock.at(self.clock.now + 2.0)
+        self.tracker.reply_lost(turn_id)
+        self.tracker.reply_lost(turn_id)
+        self.assertEqual(self.tracker.first_audio_samples(), 1)
+        self.assertEqual(self.tracker.replies_lost(), 1)
+        self.assertEqual(self.lines.schemas().count("eou_to_reply_lost"), 1)
+
+    def test_a_reply_that_reached_its_audio_is_not_lost(self) -> None:
+        turn_id = self.turn("roleplay", 1.0)
+        self.clock.at(self.clock.now + 5.0)
+        self.tracker.reply_lost(turn_id)  # cut while speaking: the candidate heard it
+        self.assertEqual(self.tracker.first_audio_samples(), 1)
+        self.assertEqual(self.tracker.replies_lost(), 0)
+
+    def test_a_lost_turn_ignores_audio_that_plays_afterwards(self) -> None:
+        turn_id = self.turn("roleplay", None)
+        self.clock.at(self.clock.now + 3.0)
+        self.tracker.reply_lost(turn_id)
+        self.clock.at(self.clock.now + 1.0)
+        self.tracker.first_audio()  # some other speech, before the next turn is opened
+        self.assertEqual(self.tracker.first_audio_samples(), 1)
+        self.assertNotIn("eou_to_first_audio", self.lines.schemas())
+
+    def test_a_reply_is_matched_to_its_own_turn_not_the_newest(self) -> None:
+        old = self.turn("roleplay", None)
+        started = self.clock.now
+        self.turn("roleplay", None)  # a newer turn is open now (10 s later)
+        self.clock.at(self.clock.now + 1.0)
+        now = self.clock.now
+        self.tracker.reply_lost(old)
+        (sample,) = list(self.tracker._headline)
+        self.assertAlmostEqual(sample[1], now - started)  # the OLD turn's wait, 11 s
+        self.assertAlmostEqual(now - started, 11.0)
+
+    def test_only_the_role_play_turns_feed_the_gate_number(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.0)
+        turn_id = self.turn("icebreaker", None)
+        self.clock.at(self.clock.now + 20.0)
+        self.tracker.reply_lost(turn_id)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)  # the interviewer's wait is not priced
+        self.assertEqual(self.tracker.first_audio_samples(None), 9)
+        self.assertEqual(self.tracker.replies_lost(), 0)
+        self.assertEqual(self.tracker.replies_lost(None), 1)
+
+    def test_nothing_is_added_for_an_unknown_turn_an_old_turn_or_none(self) -> None:
+        turn_id = self.turn("roleplay", None)
+        for _ in range(6):  # more turns than the tracker remembers
+            self.turn("roleplay", 1.0)
+        samples = self.tracker.first_audio_samples()
+        self.tracker.reply_lost(None)
+        self.tracker.reply_lost(9999)
+        self.tracker.reply_lost(turn_id)
+        self.assertEqual(self.tracker.first_audio_samples(), samples)
+        self.assertEqual(self.tracker.replies_lost(), 0)
+
+    def test_a_clock_artefact_is_not_a_sample(self) -> None:
+        turn_id = self.turn("roleplay", None)
+        self.clock.at(self.clock.now + 10_000.0)
+        self.tracker.reply_lost(turn_id)
+        self.assertEqual(self.tracker.first_audio_samples(), 0)
+
+    def test_a_reply_lost_with_no_turn_open_does_nothing(self) -> None:
+        self.assertIsNone(self.tracker.open_turn_id())
+        self.tracker.reply_lost(self.tracker.open_turn_id())
+        self.assertEqual(self.tracker.first_audio_samples(None), 0)
+
+    def test_the_turn_numbers_are_distinct_and_increasing(self) -> None:
+        ids = [self.turn("roleplay", 1.0) for _ in range(3)]
+        self.assertEqual(ids, sorted(set(ids)))
+
+
+def log_line(schema: str, seconds, *, component: str = "r1", error_type: str = "r1_latency") -> dict:
+    return {
+        "timestamp": "2026-10-08T00:00:00.000Z",
+        "level": "info",
+        "component": component,
+        "event": "unknown_event",
+        "error_type": error_type,
+        "schema": schema,
+        "duration_sec": seconds,
+    }
+
+
+def headline(*seconds) -> list[dict]:
+    return [log_line("eou_to_first_audio", value) for value in seconds]
+
+
+class TestPercentile(unittest.TestCase):
+    def test_nearest_rank(self) -> None:
+        values = [5, 1, 4, 2, 3]
+        self.assertEqual(percentile(values, 50), 3.0)
+        self.assertEqual(percentile(values, 95), 5.0)
+        self.assertEqual(percentile(values, 100), 5.0)
+        self.assertEqual(percentile(values, 0), 1.0)
+        self.assertEqual(percentile([7], 95), 7.0)
+        self.assertEqual(percentile(range(1, 101), 95), 95.0)
+
+    def test_only_finite_numbers_count(self) -> None:
+        self.assertIsNone(percentile([], 50))
+        self.assertIsNone(percentile([None, "x", True, math.nan, math.inf], 50))
+        self.assertEqual(percentile([1, None, "x", 3, True], 50), 1.0)
+
+
+class TestStageAReport(unittest.TestCase):
+    def test_the_targets_are_the_plans(self) -> None:
+        self.assertEqual(
+            (STAGE_A_HEADLINE_P50_SEC, STAGE_A_HEADLINE_P95_SEC, STAGE_A_SCRIPTED_START_SEC),
+            (1.8, 3.0, 0.5),
+        )
+
+    def test_a_session_inside_every_target_passes(self) -> None:
+        lines = headline(1.2, 1.5, 1.7, 1.8, 2.9) + [log_line("say_to_first_audio", 0.3)]
+        report = stage_a_report(lines)
+        self.assertEqual(
+            (report["headline_turns"], report["headline_p50_sec"], report["headline_p95_sec"]),
+            (5, 1.7, 2.9),
+        )
+        self.assertTrue(report["passes"])
+        self.assertTrue(report["scripted_ok"])
+
+    def test_a_slow_median_or_a_slow_tail_fails(self) -> None:
+        slow_median = stage_a_report(headline(1.9, 2.0, 2.1))
+        self.assertFalse(slow_median["headline_p50_ok"])
+        self.assertFalse(slow_median["passes"])
+        slow_tail = stage_a_report(headline(*([1.0] * 18), 3.5, 3.6))
+        self.assertTrue(slow_tail["headline_p50_ok"])
+        self.assertFalse(slow_tail["headline_p95_ok"])
+        self.assertFalse(slow_tail["passes"])
+
+    def test_a_slow_scripted_line_fails_the_session(self) -> None:
+        lines = headline(1.0, 1.1) + [log_line("say_to_first_audio", 0.9)]
+        report = stage_a_report(lines)
+        self.assertFalse(report["scripted_ok"])
+        self.assertFalse(report["passes"])
+
+    def test_a_session_with_no_scripted_line_is_judged_on_the_headline(self) -> None:
+        report = stage_a_report(headline(1.0, 1.1))
+        self.assertIsNone(report["scripted_ok"])
+        self.assertTrue(report["passes"])
+
+    def test_nothing_measured_is_not_a_pass(self) -> None:
+        for lines in ([], [log_line("llm_ttft", 0.4)], headline(None, "x")):
+            with self.subTest(lines=lines):
+                report = stage_a_report(lines)
+                self.assertIsNone(report["passes"])
+                self.assertEqual(report["headline_turns"], 0)
+
+    def test_a_cancelled_reply_counts_with_the_headline_as_a_lower_bound(self) -> None:
+        lines = headline(*([1.0] * 9)) + [log_line("eou_to_reply_lost", 7.0)]
+        report = stage_a_report(lines)
+        self.assertEqual((report["headline_turns"], report["lost_replies"]), (10, 1))
+        self.assertEqual(report["headline_p95_sec"], 7.0)
+        self.assertFalse(report["headline_p95_ok"])
+        self.assertFalse(report["passes"])
+        # Without the lost turn the same session reads as a fast one: the point of counting it.
+        self.assertTrue(stage_a_report(headline(*([1.0] * 9)))["passes"])
+        self.assertEqual(stage_a_report(headline(1.0))["lost_replies"], 0)
+
+    def test_a_session_of_nothing_but_lost_replies_was_measured_and_fails(self) -> None:
+        report = stage_a_report([log_line("eou_to_reply_lost", 6.0)] * 3)
+        self.assertEqual((report["headline_turns"], report["lost_replies"]), (3, 3))
+        self.assertFalse(report["passes"])
+
+    def test_only_r1_latency_lines_count(self) -> None:
+        lines = (
+            headline(1.0)
+            + [log_line("eou_to_first_audio", 9.0, component="phone")]
+            + [log_line("eou_to_first_audio", 9.0, error_type="voice_phone_headline_latency")]
+            + [{"component": "r1", "error_type": "r1_fidelity_move", "duration_sec": 9.0}]
+        )
+        self.assertEqual(stage_a_report(lines)["headline_turns"], 1)
+
+    def test_json_text_and_fly_wrapped_lines_are_read(self) -> None:
+        plain = json.dumps(log_line("eou_to_first_audio", 1.0))
+        wrapped = json.dumps({"instance": "i", "level": "info", "message": plain})
+        stream = [plain, wrapped, "not json at all", "", json.dumps({"message": "nor this"}), b"{}"]
+        self.assertEqual(len(list(latency_records(stream))), 2)
+        self.assertEqual(stage_a_report(stream)["headline_turns"], 2)
+
+    def test_the_command_line_reports_and_exits_by_the_verdict(self) -> None:
+        cases = (
+            (headline(1.0, 1.2), 0),
+            (headline(2.5, 2.6), 1),
+            ([], 2),
+        )
+        for lines, expected in cases:
+            with self.subTest(expected=expected):
+                stdin = io.StringIO(chr(10).join(json.dumps(line_) for line_ in lines))
+                stdout = io.StringIO()
+                with mock.patch.object(sys, "stdin", stdin), mock.patch.object(sys, "stdout", stdout):
+                    self.assertEqual(r1_latency.main(), expected)
+                report = json.loads(stdout.getvalue())
+                self.assertEqual(report["targets"]["headline_p95_sec"], 3.0)
+
+
+class TestCountWords(unittest.TestCase):
+    """``count_words`` mirrors the SDK's ``split_words(..., split_character=True)`` for min_words.
+
+    ``test_r1_sdk_contract`` compares the two on the real SDK; these pin the rules without it.
+    """
+
+    def test_words_are_whitespace_separated_tokens_that_hold_more_than_punctuation(self) -> None:
+        cases = {
+            "": 0,
+            "   ": 0,
+            "Yes.": 1,
+            "...": 0,
+            "yes please": 2,
+            "Yes please do go on.": 5,
+            "don't": 1,
+            "a - b": 2,
+            "x-y z_w": 2,
+            "$ 5 % ?": 1,
+            "a b  c": 3,
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(count_words(text), expected)
+
+    def test_typographic_punctuation_is_not_a_word(self) -> None:
+        quotes = chr(0x201C) + "Hi" + chr(0x201D)
+        self.assertEqual(count_words(quotes), 1)
+        self.assertEqual(count_words("ok" + chr(0x2026)), 1)
+        self.assertEqual(count_words("hello " + chr(0x2014) + " world"), 2)
+
+    def test_each_letter_of_a_character_based_script_is_a_word(self) -> None:
+        cjk = chr(0x4E2D) + chr(0x6587)
+        self.assertEqual(count_words(cjk), 2)
+        self.assertEqual(count_words("abc" + cjk + "def"), 4)
+        self.assertEqual(count_words(chr(0x0E2A) + chr(0x0E27) + chr(0x0E31)), 3)
+
+
+class TestModuleSurface(unittest.TestCase):
+    def test_the_module_imports_only_the_standard_library(self) -> None:
+        # No phone, session or SDK code: the tracker stays unit-testable and R1-only, and
+        # the module reports through its ``emit`` callback instead of logging itself.
+        tree = ast.parse(Path(r1_latency.__file__).read_text(encoding="utf-8"))
+        imported = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name.split(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add((node.module or "").split(".")[0])
+        self.assertEqual(
+            imported,
+            {"__future__", "collections", "dataclasses", "json", "math", "os", "re", "sys", "typing"},
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

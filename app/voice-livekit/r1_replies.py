@@ -329,14 +329,17 @@ def session_facts_event(
     pins: Mapping[str, Any],
     *,
     roleplay_seconds: float,
+    first_audio_p95_ms: float | None = None,
 ) -> dict[str, Any]:
     """The one ``session_facts`` row the plan 6.4 gate cannot pass without.
 
     Every key the API parser reads is present, so the row is the contract and not a subset of
     it.  A value is a measured, finite, non-negative number, or ``None`` when the worker does
-    not measure it yet: the API parses ``None`` as unknown, which the gate fails closed on
-    (``first_audio_p95_ms`` is ``latency_unknown`` until the PR-4c latency tracker lands).
-    Measured today: the role-play clock R at its end, and the candidate's longest turn.
+    not measure it yet: the API parses ``None`` as unknown, which the gate fails closed on.
+    Measured today: the role-play clock R at its end, the candidate's longest turn and, from
+    the PR-4c latency tracker, ``first_audio_p95_ms`` (milliseconds, role-play turns only; the
+    caller passes ``None`` when fewer than 8 turns were measured, so the gate says
+    ``latency_unknown`` instead of reading a number nobody measured).
     """
     communication = (admin or {}).get("communication", {})
     # The engine starts the longest turn at 0.0 and only raises it for a turn whose speaking
@@ -349,7 +352,7 @@ def session_facts_event(
         "barge_in_count": None,
         "question_count": None,
         "interruption_count": None,
-        "first_audio_p95_ms": None,
+        "first_audio_p95_ms": _measured(first_audio_p95_ms),
     }
     return {
         "event_type": "session_facts",

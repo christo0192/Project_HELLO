@@ -22,11 +22,17 @@ import {
 import { CircuitBreaker } from '../provider-resilience.js';
 
 /**
- * Per-call timeout. Three runs go in parallel, each with at most one repair, and the shared
- * JSON helper may re-ask once on unparsable output, so a job is bounded by 4 calls of this
- * length: 4 x 180 s = 720 s, inside the 900 s maximum queue lease the runtime heartbeats.
+ * Per-call timeout: the shared 300 s ceiling. A 5-metric, 100-turn transcript at reasoning
+ * `high` routinely outran the old 180 s (owner test b58c7d9c), so every attempt timed out and
+ * deferred. A run makes at most 4 sequential calls (one base call and one repair, each of
+ * which the shared JSON helper may re-ask once on unparsable output), and scoring is run 0
+ * alone, then runs 1..n in parallel (`scoreR1Transcript`), so a job is bounded by 2 x 4 calls
+ * of this length: 8 x 300 s = 2400 s. The runner heartbeats the 600 s lease (every 200 s, each
+ * heartbeat capped at 900 s), and total visibility is capped at the 3600 s absolute lease
+ * deadline (migration 0028), so 2400 s fits. The usual case is far shorter: the first
+ * provider failure ends the attempt.
  */
-export const R1_SCORER_TIMEOUT_MS = 180_000;
+export const R1_SCORER_TIMEOUT_MS = 300_000;
 
 /** Two fully failed jobs (3 runs each) open the R1 breaker; it half-opens after a minute. */
 export const R1_BREAKER_FAILURE_THRESHOLD = 6;

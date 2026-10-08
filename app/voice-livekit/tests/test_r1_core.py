@@ -445,6 +445,29 @@ class R1TestCase(unittest.IsolatedAsyncioTestCase):
     def user_state(self, state: str) -> None:
         self.session.emit("user_state_changed", state_event(state))
 
+    async def commit_turn(self, text: str, *, agent: R1Agent | None = None) -> bool:
+        """The SDK commits the candidate's turn: the hook runs (``prepare_turn``).
+
+        Returns True when the hook suppressed the reply (``StopResponse``).  R1 writes the
+        candidate's row, counts an icebreaker answer and decides the icebreaker's exit HERE, at
+        the committed turn, never at the raw final transcript.
+        """
+        hook = agent or self.session.agent or R1Agent(self.interview)
+        try:
+            await hook.on_user_turn_completed(
+                None, SimpleNamespace(text_content=text, id=f"msg_{next(_IDS)}")
+            )
+        except r1_session.StopResponse:
+            await self.settle()
+            return True
+        return False
+
+    async def answer(self, text: str, *, agent: R1Agent | None = None) -> bool:
+        """A candidate answer the way the SDK delivers it: the final transcript, then the commit."""
+        self.final_transcript(text)
+        await self.settle()
+        return await self.commit_turn(text, agent=agent)
+
     # The context a case's interview is built from: the persona (and so the lead's name and
     # city in the pickup and the transition line) is chosen from it.
     LINE_CONTEXT = {"first_name": "Asha", "candidate_identity": "candidate"}
@@ -798,18 +821,23 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         }
         self.assertEqual(set(OUTCOME_DISPOSITIONS), expected)
 
-    def test_session_factory_keeps_browser_provider_defaults_without_turn_overrides(self) -> None:
+    def test_session_factory_keeps_browser_provider_defaults_and_only_r1s_turn_timings(self) -> None:
         source = (HERE / "r1_session.py").read_text(encoding="utf-8")
         factory_start = source.index("async def _default_session_factory")
         factory_end = source.index("class _SpeechSlot")
         factory = source[factory_start:factory_end]
         self.assertIn('os.getenv("SARVAM_STT_MODEL", "saaras:v3")', factory)
         self.assertIn('os.getenv("SARVAM_LANGUAGE", "en-IN")', factory)
-        self.assertIn('os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")', factory)
-        self.assertIn('os.getenv("SARVAM_TTS_VOICE", "simran")', factory)
-        self.assertIn("pace=1.0", factory)
-        self.assertIn("temperature=0.8", factory)
-        self.assertNotIn("turn_handling", factory)
+        # The voice is the browser lane's, defined once in r1_tts and shared with the line cache.
+        self.assertIn("sarvam.TTS(**r1_tts_kwargs())", factory)
+        voice = (HERE / "r1_tts.py").read_text(encoding="utf-8")
+        self.assertIn('os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")', voice)
+        self.assertIn('os.getenv("SARVAM_TTS_VOICE", "simran")', voice)
+        self.assertIn('"pace": 1.0', voice)
+        self.assertIn('"temperature": 0.8', voice)
+        # PR-4c: R1's turn TIMINGS, never the detector or the VAD (those stay the session's).
+        self.assertIn("turn_handling=r1_turn_handling()", factory)
+        self.assertNotIn("turn_detection", factory)
         self.assertNotIn("vad=", factory)
 
     def test_session_factory_pins_llm_retry_options_and_disables_user_away(self) -> None:
@@ -960,6 +988,31 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         "Thanks!",
         "Okay, thank you.",
         "Okay, thanks a lot.",
+        # R1-Q item 8: an acknowledgement is what a candidate with nothing to ask says, both to
+        # L-WRAP and to the answer after it ("Alright" was counted as question #2, the model said a
+        # goodbye of its own, and L-CLOSE said it again).
+        "Alright.",
+        "Alright",
+        "All right.",
+        "Okay.",
+        "Okay",
+        "OK.",
+        "Ok, got it.",
+        "Got it.",
+        "Got it, thanks.",
+        "Sounds good.",
+        "Alright, sounds good.",
+        "Alright, thank you.",
+        "Alright. Thank you so much.",
+        "Okay, that's all.",
+        "Okay, no, that's all.",
+        "No, that's all.",
+        "Understood.",
+        "Perfect, thank you.",
+        "Cool.",
+        "Noted.",
+        "Great.",
+        "Okay, great.",
     )
     # A real question stays a question, however it is punctuated and however polite it is.
     PUNCTUATED_QUESTIONS = (
@@ -989,6 +1042,21 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         "Yes, thank you.",
         "Yeah, thanks",
         "Sure, thank you",
+        # An acknowledgement never swallows a request after it, and next to a "yes" it may open one.
+        "Alright, one more question about shifts",
+        "Alright but how long until I hear back",
+        "Okay, so what happens next?",
+        "Okay, so what happens next",
+        "Okay, what is the notice period",
+        "Got it, can you repeat that",
+        "Sounds good, what about the team size",
+        "Cool, any idea when I hear back",
+        "Okay, I do have one",
+        "Okay, yes",
+        "Yeah, okay",
+        "Yes, alright",
+        "Okay?",
+        "Alright?",
     )
 
     def test_a_punctuated_refusal_is_a_refusal(self) -> None:
@@ -1491,18 +1559,161 @@ class TestReplyPolicy(R1TestCase):
 
     async def test_the_icebreaker_turn_that_ends_the_phase_gets_no_reply(self) -> None:
         self.clock.advance(215)
-        self.final_transcript("one")
-        self.final_transcript("two")
-        self.final_transcript("three")
-        await self.hook()  # three turns: not yet the soft exit
-        self.final_transcript("four")
+        for answer in ("I sell courses", "mostly by phone", "for three years"):
+            self.assertFalse(await self.answer(answer))  # three turns: not yet the soft exit
+        self.final_transcript("and I enjoy it")
         with self.assertRaises(r1_session.StopResponse):
-            await self.hook()
+            await self.hook("and I enjoy it")  # the fourth committed answer is the boundary
+
+    async def test_the_soft_exit_counts_committed_answers_not_transcript_finals(self) -> None:
+        # Sarvam splits one spoken answer at its own pauses; the SDK commits it as ONE turn.  Six
+        # finals of one answer used to be six "turns" (and the exit fell mid-conversation).
+        self.clock.advance(215)
+        for fragment in ("I sell courses,", "mostly by phone,", "to working professionals,"):
+            self.final_transcript(fragment)
+        self.final_transcript("for about three years.")
+        self.assertEqual(self.interview.machine.candidate_turns, 0)
+        self.assertFalse(self.interview.machine.icebreaker_should_end())
+        self.assertFalse(await self.commit_turn("I sell courses, mostly by phone, for years."))
+        self.assertEqual(self.interview.machine.candidate_turns, 1)
+        self.assertFalse(self.interview.machine.icebreaker_should_end())
+
+    async def test_a_committed_fragment_is_not_an_answer(self) -> None:
+        # "Sorry", "Thank you." and "Hello" commit as turns when no reply is pending to protect,
+        # but they are not answers: it takes ICEBREAKER_ANSWER_MIN_WORDS words that are not noise.
+        for fragment in ("Sorry.", "Thank you.", "Hello", "Yes please"):
+            self.assertFalse(await self.answer(fragment))
+        self.assertEqual(self.interview.machine.candidate_turns, 0)
+
+    async def test_committed_backchannel_of_three_words_or_more_is_not_an_answer(self) -> None:
+        # The SDK's own floor is the WORD count, and the owner's session had all of these: "Sorry"
+        # banked and committed with the next "Thank you." (three words), "Hey, are you there?"
+        # (four).  None of them answers the question, so none counts toward the soft exit.
+        for noise in (
+            "Sorry Thank you.",
+            "Hey, are you there?",
+            "Sorry. Thank you. Hey, are you there?",
+            "Hmm. Okay. Right.",
+            "Yes. Right, sure.",
+            "Alright, thank you.",
+            "Okay, got it, thanks.",
+            "Hello? Hello? Hello?",
+        ):
+            with self.subTest(noise=noise):
+                self.assertGreaterEqual(r1_session.count_words(noise), 3)  # the SDK commits it
+                self.assertFalse(await self.answer(noise))
+                self.assertEqual(self.interview.machine.candidate_turns, 0)
+
+    # Requests to hear the question again, and audio checks.  Each is three words or more, so the
+    # SDK commits it as a turn, and none of them answers the question.
+    CLARIFICATIONS = (
+        "Sorry, can you repeat that?",
+        "What did you say?",
+        "Yes, I can hear you",
+        "Sorry, I didn't catch that.",
+        "Could you say that again, please?",
+        "Can you hear me?",
+        "Please repeat the question",
+        "Sorry, what was the question again?",
+        "I didn't get the question",
+        "Sorry I couldn't hear you",
+        "You are breaking up",
+        "Can you speak a bit louder",
+        "Pardon, could you repeat what you said?",
+        "What do you mean?",
+        "Can you rephrase that?",
+        "Sorry I missed the last part",
+        "Hello, can you hear me now?",
+    )
+
+    async def test_a_request_to_repeat_or_an_audio_check_is_not_an_answer(self) -> None:
+        for clarification in self.CLARIFICATIONS:
+            with self.subTest(clarification=clarification):
+                self.assertGreaterEqual(r1_session.count_words(clarification), 3)  # the SDK commits it
+                self.assertEqual(r1_session.content_word_count(clarification), 0)
+                self.assertFalse(await self.answer(clarification))  # the model repeats the question
+                self.assertEqual(self.interview.machine.candidate_turns, 0)
+
+    async def test_an_answer_after_a_request_to_repeat_is_still_an_answer(self) -> None:
+        for answer_text in (
+            "Sorry, can you repeat that? I sell courses to working professionals.",
+            "Yes, I can hear you, I sell courses online",
+            "Can you repeat that? I work in sales for three years",
+        ):
+            with self.subTest(answer=answer_text):
+                before = self.interview.machine.candidate_turns
+                self.assertFalse(await self.answer(answer_text))
+                self.assertEqual(self.interview.machine.candidate_turns, before + 1)
+
+    def test_the_words_of_a_real_answer_are_not_cut_as_a_clarification(self) -> None:
+        # The phrases are cut out of the turn, never matched loosely: an answer that merely uses
+        # the same verbs ("say", "ask", "repeat", "hear", "get", "understand") is left whole.
+        for text, words in (
+            ("I couldn't get a job at first", 7),
+            ("I say what I think to every learner", 8),
+            ("We ask learners about their goals", 6),
+            ("I explain the program to the learners", 7),
+            ("I can hear the objection coming from a mile away", 10),
+            ("I repeat the same process every day", 7),
+            ("I understand what customers want", 5),
+            ("I sell courses", 3),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(r1_session.content_word_count(text), words)
+
+    async def test_a_request_to_repeat_at_the_boundary_gets_the_question_repeated(self) -> None:
+        # S >= 3:30 and three answers in: the next committed answer is the boundary, and the
+        # transition line (uninterruptible) answers it.  "Sorry, can you repeat that?" is not an
+        # answer, so the model repeats the question; only a real fourth answer ends the phase.
+        self.clock.advance(215)
+        for answer in ("I sell courses", "mostly by phone", "for three years"):
+            self.assertFalse(await self.answer(answer))
+        self.assertEqual(self.interview.machine.candidate_turns, 3)
+        for clarification in ("Sorry, can you repeat that?", "Yes, I can hear you"):
+            with self.subTest(clarification=clarification):
+                self.final_transcript(clarification)
+                await self.hook(clarification)  # no StopResponse: the SDK generates the reply
+                self.assertEqual(self.interview.machine.candidate_turns, 3)
+                self.assertFalse(self.interview.machine.icebreaker_should_end())
+                self.assertFalse(self.interview._icebreaker_boundary_turn)
+        self.final_transcript("and I enjoy it")
+        with self.assertRaises(r1_session.StopResponse):
+            await self.hook("and I enjoy it")  # the real fourth answer is the boundary
+        self.assertTrue(self.interview._icebreaker_boundary_turn)
+
+    async def test_the_real_answers_of_the_owner_session_are_counted(self) -> None:
+        for answer_text in (
+            "Yeah, so my name is Cristo. I have around 11 years of experience.",
+            "I have been, my previous companies are Scalar, Great Learning and Upgrade.",
+            "Sorry, I sell courses to working professionals.",  # a filler inside a real answer
+            "I sell courses",
+            "Yeah I do sales",
+        ):
+            with self.subTest(answer=answer_text):
+                before = self.interview.machine.candidate_turns
+                self.assertFalse(await self.answer(answer_text))
+                self.assertEqual(self.interview.machine.candidate_turns, before + 1)
+
+    def test_the_noise_filter_works_on_folded_text(self) -> None:
+        self.assertEqual(r1_session.content_word_count("Sorry. Thank you!"), 0)
+        self.assertEqual(r1_session.content_word_count("SORRY, thank-you"), 0)
+        self.assertEqual(r1_session.content_word_count("I sell courses"), 3)
+        self.assertEqual(r1_session.content_word_count(""), 0)
+        self.assertTrue(r1_session.is_backchannel_turn("Hey, are you there?"))
+        self.assertTrue(r1_session.is_backchannel_turn("Okay, right."))
+        self.assertFalse(r1_session.is_backchannel_turn("Okay, I sell courses."))
+        self.assertFalse(r1_session.is_backchannel_turn(""))
+        self.assertFalse(r1_session.is_backchannel_turn("..."))
 
     async def test_an_early_answer_spoken_over_the_opening_still_counts_as_a_turn(self) -> None:
         self.interview.machine.phase = R1Phase.OPENING
-        self.final_transcript("I have been selling for six years")
+        self.assertTrue(await self.answer("I have been selling for six years"))
         self.assertEqual(self.interview.machine.candidate_turns, 1)
+
+    async def test_only_the_icebreaker_phases_count_answers(self) -> None:
+        self.enter_roleplay()
+        await self.answer("I have been selling for six years")
+        self.assertEqual(self.interview.machine.candidate_turns, 0)
 
     async def test_the_hard_icebreaker_deadline_ends_the_phase_without_a_reply(self) -> None:
         self.clock.advance(271)
@@ -1880,6 +2091,141 @@ class TestPhaseDriver(R1TestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await task
 
+    def test_the_settle_window_depends_on_how_final_the_words_sound(self) -> None:
+        plain = r1_session.WRAPUP_SETTLE_SECONDS
+        for text in (
+            "No questions.", "No, thanks.", "Nothing else.", "That's all, thank you.", "Nope",
+            "I'm good.", "I'm okay.", "No, I don't have any questions.", "Hmm, no.",
+        ):
+            with self.subTest(explicit=text):
+                self.assertTrue(is_no_questions(text))
+                self.assertEqual(r1_session.wrapup_settle_seconds(text), plain)
+        for text in (
+            "Okay.", "Alright.", "Thank you.", "Thanks!", "Okay, got it.", "Great, thanks.",
+            "Sounds good.", "Cool",
+        ):
+            with self.subTest(acknowledgement=text):
+                self.assertTrue(is_no_questions(text))
+                self.assertEqual(r1_session.wrapup_settle_seconds(text), plain * 2.0)
+        for text in (
+            "Okay, so", "Okay, so...", "Thank you, and", "Alright, um", "Okay. Well", "No questions, uh",
+            # A courtesy word that cannot end a sentence: the candidate is about to say the rest.
+            "Okay, I think", "Okay, I think...", "Okay, I", "Thank you for", "Thanks for your",
+            "Alright, from my", "Okay, a",
+        ):
+            with self.subTest(lead_in=text):
+                self.assertTrue(is_no_questions(text))
+                self.assertEqual(r1_session.wrapup_settle_seconds(text), plain * 2.5)
+        # ... while the same words, finished, keep the window of what they say.
+        for text, factor in (
+            ("Okay, I think I'm good.", 1.0),
+            ("Okay, I think that's all.", 1.0),
+            ("Thank you for your time.", 2.0),
+            ("Thanks for your time, no questions.", 1.0),
+        ):
+            with self.subTest(finished=text):
+                self.assertTrue(is_no_questions(text))
+                self.assertEqual(r1_session.wrapup_settle_seconds(text), plain * factor)
+        self.assertEqual((plain, plain * 2.0, plain * 2.5), (1.5, 3.0, 3.75))
+
+    def spy_on_waits(self) -> list[float]:
+        """Record the silence window of every ``_await_turn`` the driver opens (then run it)."""
+        waits: list[float] = []
+        real = self.interview._await_turn
+
+        async def spy(timeout, **kwargs):
+            waits.append(timeout)
+            return await real(timeout, **kwargs)
+
+        self.interview._await_turn = spy
+        return waits
+
+    async def test_the_driver_waits_the_window_for_the_words_that_were_said(self) -> None:
+        # The windows themselves are checked by value (no wall-clock race): the first wait is the
+        # 20 s silence window of the wrap-up, the second is the settle window of the refusal.
+        plain = 0.02
+        for text, factor in (
+            ("Nothing else.", 1.0),
+            ("Thank you.", 2.0),
+            ("Okay.", 2.0),
+            ("Okay, so", 2.5),
+            ("Thank you, and", 2.5),
+            ("Okay, I think", 2.5),
+            ("Thank you for", 2.5),
+        ):
+            with self.subTest(text=text):
+                await self.asyncSetUp()
+                self.enter_wrapup()
+                with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", plain):
+                    waits = self.spy_on_waits()
+                    task = asyncio.create_task(self.interview._run_wrapup())
+                    await self.settle()
+                    self.final_transcript(text)
+                    self.assertIsNone(await asyncio.wait_for(task, 10.0))  # and all of them close
+                self.assertEqual(len(waits), 2, waits)
+                self.assertEqual(waits[0], r1_session.WRAPUP_SILENCE_SECONDS)
+                self.assertAlmostEqual(waits[1], plain * factor)
+
+    async def test_okay_so_and_a_pause_does_not_end_the_wrapup_over_the_question_that_follows(
+        self,
+    ) -> None:
+        # The research list for item 8 had no "okay", and the plan added it: "Okay, so ... [two
+        # seconds of thinking] what are the next steps?" must not get L-CLOSE, uninterruptibly,
+        # spoken over the question.  The refusal is not believed for 2.5 settle windows, and a
+        # final that arrives in that time is joined to it and judged with it.
+        self.enter_wrapup()
+        settled = mock.AsyncMock()  # reached only once TWO questions have been counted
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 4.0):  # lead-in: 10 s
+            waits = self.spy_on_waits()
+            with mock.patch.object(self.interview, "_wait_reply_settled", settled):
+                task = asyncio.create_task(self.interview._run_wrapup())
+                await self.settle()
+                self.final_transcript("Okay, so")
+                await self.settle()
+                self.assertFalse(task.done())
+                self.assertEqual(waits[-1], 10.0)  # not the plain 4.0
+                self.final_transcript("what are the next steps")
+                await self.settle()
+                self.assertFalse(task.done())  # ONE question: the wrap-up is still open
+                settled.assert_not_awaited()
+                self.final_transcript("and who is on the team?")
+                self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        settled.assert_awaited_once()
+
+    async def test_okay_i_think_and_a_pause_does_not_end_the_wrapup_over_the_question_that_follows(
+        self,
+    ) -> None:
+        # The same race as "Okay, so": "I think" is a courtesy word, so "Okay, I think" read as a
+        # refusal and only got the 3 s window of a bare "Okay".  It stops on a lead-in now: 3.75 s,
+        # and the sentence that follows is joined to it and judged as a question.
+        self.enter_wrapup()
+        settled = mock.AsyncMock()  # reached only once TWO questions have been counted
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 4.0):  # lead-in: 10 s
+            waits = self.spy_on_waits()
+            with mock.patch.object(self.interview, "_wait_reply_settled", settled):
+                task = asyncio.create_task(self.interview._run_wrapup())
+                await self.settle()
+                self.final_transcript("Okay, I think")
+                await self.settle()
+                self.assertFalse(task.done())
+                self.assertEqual(waits[-1], 10.0)  # not the 8.0 of an acknowledgement
+                self.final_transcript("I have one about the next steps")
+                await self.settle()
+                self.assertFalse(task.done())  # ONE question: the wrap-up is still open
+                settled.assert_not_awaited()
+                self.final_transcript("and who is on the team?")
+                self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        settled.assert_awaited_once()
+
+    async def test_a_lone_okay_so_still_closes_once_nothing_follows(self) -> None:
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.02):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            self.final_transcript("Okay, so")
+            self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken, [])
+
     async def test_wrapup_ends_after_twenty_seconds_of_silence(self) -> None:
         self.enter_wrapup()
         with mock.patch.object(r1_session, "WRAPUP_SILENCE_SECONDS", 0.05):
@@ -2026,11 +2372,23 @@ class TestTranscript(R1TestCase):
             [row["speaker"] for row in self.writer.saved], ["bot", "candidate", "bot"]
         )
 
-    async def test_a_candidate_turn_is_recorded_at_event_time_even_if_nobody_waits(self) -> None:
+    async def test_a_candidate_turn_is_recorded_when_it_commits_even_if_nobody_waits(self) -> None:
         self.final_transcript("spoken while the driver was busy")
+        await self.flush()
+        self.assertEqual(self.writer.saved, [])  # still the open row: the turn has not committed
+        await self.commit_turn("spoken while the driver was busy")
         await self.flush()
         self.assertEqual(self.writer.saved[0]["text"], "spoken while the driver was busy")
         self.assertEqual(self.writer.saved[0]["phase"], "icebreaker")
+
+    async def test_a_candidate_turn_is_recorded_when_the_session_exits_uncommitted(self) -> None:
+        self.final_transcript("said just before the connection dropped")
+        self.interview._begin_exit()
+        await self.flush()
+        self.assertEqual(
+            [(row["index"], row["speaker"], row["text"]) for row in self.writer.saved],
+            [(1, "candidate", "said just before the connection dropped")],
+        )
 
     async def test_interim_and_empty_transcripts_are_not_recorded(self) -> None:
         self.session.emit(
@@ -2061,7 +2419,7 @@ class TestTranscript(R1TestCase):
     async def test_a_failing_write_never_ends_the_interview(self) -> None:
         self.writer.save_error = RuntimeError("database unavailable")
         with self.capture_logs() as logs:
-            self.final_transcript("hello")
+            await self.answer("hello")
             await self.flush()
         self.assertIsNone(self.interview._stop_outcome())
         failed = [
@@ -2081,6 +2439,8 @@ class TestTranscript(R1TestCase):
             self.assertEqual(
                 await asyncio.wait_for(self.interview._await_turn(5.0), 10.0), (TURN, "hello")
             )
+            await self.commit_turn("hello")  # the row's write starts here, and hangs
+            self.assertEqual(len(self.interview._turn_writes), 1)
             await asyncio.wait_for(self.interview._drain_background(), 10.0)
         self.assertEqual(self.writer.saved, [])
 
@@ -2120,6 +2480,11 @@ class TestTranscript(R1TestCase):
         self.assertIn("save", names)
         last_save = max(i for i, name in enumerate(names) if name == "save")
         self.assertLess(last_save, names.index("terminal"))
+        # The answer was still an open row when the exit began: the exit wrote it, in time.
+        self.assertIn(
+            "an answer given just before the end",
+            [row["text"] for row in self.writer.saved if row["speaker"] == "candidate"],
+        )
 
 
 class TranscriptOrdering:
@@ -2195,6 +2560,7 @@ class TranscriptOrdering:
         self.begins_speaking(handle)
         self.final_transcript("excuse me")
         self.deliver(handle, "partial", interrupted=True)
+        await self.commit_turn("excuse me")  # the SDK commits the interrupting turn
         await self.flush()
         rows = self.rows()
         self.assertEqual([row["speaker"] for row in rows], ["bot", "candidate"])
@@ -2211,6 +2577,7 @@ class TranscriptOrdering:
         self.final_transcript("excuse me")
         message = FakeChatMessage("first, interrupted", interrupted=True)
         self.session.emit("conversation_item_added", SimpleNamespace(item=message))
+        await self.commit_turn("excuse me")
         await self.flush()
         self.assertEqual([row["speaker"] for row in self.rows()], ["bot", "candidate"])
         self.assertEqual([row["index"] for row in self.rows()], [1, 2])
@@ -2698,11 +3065,10 @@ class TestRunFlow(R1TestCase):
         self.assertLess(names.index("start"), names.index("play_start"))
         self.assertNotIn("terminal", names)  # nothing settles before the interview ran
         self.assertIsInstance(self.session.agent, R1Agent)
-        # ICEBREAKER: four candidate turns at S >= 3:30 end it at the next boundary.
+        # ICEBREAKER: four committed candidate answers at S >= 3:30 end it at the boundary turn.
         await self.until(lambda: self._machine_phase() is R1Phase.ICEBREAKER)
         self.clock.advance(215)
-        for answer in ("I sold courses", "to working professionals", "mostly by phone", "yes"):
-            self.final_transcript(answer)  # counted and queued synchronously, at event time
+        await self.four_icebreaker_answers()
         # TRANSITION then READY then the pickup, then ROLEPLAY.  The candidate answers
         # only after the line has finished playing, as a real candidate would.
         await self.candidate_replies_after("L-TRANSITION", "ready")
@@ -2747,6 +3113,16 @@ class TestRunFlow(R1TestCase):
             ],
         )
 
+    async def four_icebreaker_answers(self) -> None:
+        """Four answers, each a final transcript the SDK then commits as a turn (the hook)."""
+        for answer in (
+            "I sold courses",
+            "to working professionals",
+            "mostly by phone",
+            "yes that is how I work",  # an answer has three words that are not noise
+        ):
+            await self.answer(answer)
+
     async def drive_to_the_wrapup(self) -> asyncio.Task:
         """Run the real session until the wrap-up question has been asked."""
         task = asyncio.create_task(
@@ -2754,8 +3130,7 @@ class TestRunFlow(R1TestCase):
         )
         await self.until(lambda: self._machine_phase() is R1Phase.ICEBREAKER)
         self.clock.advance(215)
-        for answer in ("I sold courses", "to working professionals", "mostly by phone", "yes"):
-            self.final_transcript(answer)
+        await self.four_icebreaker_answers()
         await self.candidate_replies_after("L-TRANSITION", "ready")
         await self.until(lambda: self._machine_phase() is R1Phase.ROLEPLAY)
         self.clock.advance(841)
@@ -2790,8 +3165,7 @@ class TestRunFlow(R1TestCase):
         )
         await self.until(lambda: self._machine_phase() is R1Phase.ICEBREAKER)
         self.clock.advance(215)
-        for answer in ("I sold courses", "to working professionals", "mostly by phone", "yes"):
-            self.final_transcript(answer)
+        await self.four_icebreaker_answers()
         await self.candidate_replies_after("L-TRANSITION", "ready")
         await self.until(lambda: self._machine_phase() is R1Phase.ROLEPLAY)
         with mock.patch.object(r1_session, "rejoin_grace_seconds", return_value=0.05):
@@ -3173,20 +3547,153 @@ class TestWrapupAndReadyDriveTheDriver(R1TestCase):
                 self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
 
 
-class TestIcebreakerEndRace(R1TestCase):
-    """The soft exit (four turns, S >= 3:30) is judged twice: at the transcript and at end of turn.
+class TestUnknownAndSpokenFirstName(R1TestCase):
+    """R1-Q item 6: "Thank you, there." is never spoken; the name the candidate gave is used.
 
-    The driver judges the transcript, the SDK judges the end of the same turn some 0.3-1.5 s
-    later.  When S crosses 3:30 in between, the reply is suppressed and the driver must be told.
+    The API sends the literal "there" for a name it cannot use, and the lines that splice the
+    name in read badly with it.  An unknown name drops out of the line; when the candidate says
+    their own name in the opening or the icebreaker, later lines use it.
     """
+
+    LINE_CONTEXT = {"first_name": "there", "candidate_identity": "candidate"}
+    NAME_LINES = ("L-OPEN", "L-TRANSITION", "L-CLOSE", "L-SIL-IB", "L-REJOIN", "L-SYSTEM-STOP")
+
+    def spoken_lines(self) -> dict[str, str]:
+        return {line_id: self.interview.render_line(line_id) for line_id in self.NAME_LINES}
+
+    async def test_the_placeholder_name_is_dropped_from_every_line(self) -> None:
+        rendered = self.spoken_lines()
+        self.assertTrue(rendered["L-OPEN"].startswith("Hi, I'm Christy,"))
+        self.assertTrue(rendered["L-TRANSITION"].startswith("Thank you. We'll now move"))
+        self.assertIn("for your time today. The hiring team", rendered["L-CLOSE"])
+        self.assertEqual(rendered["L-SIL-IB"], "Are you still with me?")
+        self.assertEqual(rendered["L-REJOIN"], "Welcome back. Let's pick up where we left off.")
+        self.assertTrue(rendered["L-SYSTEM-STOP"].startswith("I'm sorry, we need to stop here"))
+        for line_id, text in rendered.items():
+            with self.subTest(line=line_id):
+                self.assertNotIn("there", text)
+                self.assertNotIn("{", text)
+
+    async def test_an_empty_or_unusable_record_name_is_unknown_too(self) -> None:
+        for value in ("", None, "THERE", "A", "Ar<script>"):
+            with self.subTest(value=value):
+                self.interview.context["first_name"] = value
+                self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
+
+    async def test_a_usable_record_name_is_spoken_and_the_candidate_cannot_replace_it(self) -> None:
+        self.interview.context["first_name"] = "Asha"
+        self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me, Asha?")
+        await self.answer("Hi, my name is Cristo and I sell courses.")
+        self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me, Asha?")
+
+    async def test_the_name_the_candidate_gives_is_used_in_the_later_lines(self) -> None:
+        await self.answer("Yeah, so my name is Cristo, and I have eleven years in sales.")
+        rendered = self.spoken_lines()
+        self.assertEqual(rendered["L-SIL-IB"], "Are you still with me, Cristo?")
+        self.assertTrue(rendered["L-TRANSITION"].startswith("Thank you, Cristo. We'll now move"))
+        self.assertIn("for your time today, Cristo. The hiring team", rendered["L-CLOSE"])
+        self.assertEqual(
+            rendered["L-REJOIN"], "Welcome back, Cristo. Let's pick up where we left off."
+        )
+        self.assertTrue(rendered["L-SYSTEM-STOP"].startswith("I'm sorry, Cristo, we need to stop"))
+
+    async def test_the_first_introduction_wins(self) -> None:
+        await self.answer("My name is Cristo.")
+        await self.answer("Myself Bina, I mean.")  # a valid introduction, but the second one
+        self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me, Cristo?")
+
+    async def test_the_introduction_may_be_split_across_the_speech_to_texts_finals(self) -> None:
+        self.final_transcript("Hello, my name is")
+        self.final_transcript("Cristo.")
+        await self.settle()
+        self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me, Cristo?")
+
+    async def test_a_remark_in_the_roleplay_is_not_an_introduction(self) -> None:
+        self.enter_roleplay()  # the rig starts in the icebreaker, where the same words count
+        self.final_transcript("My name is Cristo.")
+        await self.settle()
+        self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
+
+    async def test_words_that_only_look_like_an_introduction_are_not_a_name(self) -> None:
+        for text in (
+            "I taught myself Python.",
+            "This is great, honestly.",
+            "I worked at a firm where this is Salesforce.",
+            "My name is not on the list.",
+            "I'm Cristo.",
+        ):
+            with self.subTest(text=text):
+                await self.answer(text)
+                self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
+
+    async def test_a_name_that_belongs_to_the_learner_or_the_interviewer_is_not_adopted(self) -> None:
+        variant = self.interview.persona.variant
+        for name in (variant.first_name, variant.last_name, "Christy"):
+            with self.subTest(name=name):
+                await self.answer(f"Hello, my name is {name}.")
+                self.assertEqual(self.interview.render_line("L-SIL-IB"), "Are you still with me?")
+
+    async def test_the_guard_may_repeat_the_name_the_candidate_gave(self) -> None:
+        from r1_guard import guard_text
+        from r1_personas import PERSONAS
+
+        chosen = self.interview.persona.variant
+        # The first name of a persona this session is NOT playing: the guard blocks it in the
+        # interviewer's mouth after the reveal, unless it is the candidate's own name.
+        other = next(
+            v.first_name
+            for p in PERSONAS
+            for v in p.variants
+            if v.first_name not in (chosen.first_name, chosen.last_name)
+        )
+        engine = self.interview.engine  # built before the name is known
+        self.assertEqual(engine.candidate_first_name, "")
+        blocked = guard_text(f"Thanks, {other}.", engine.guard_context("wrapup"))
+        self.assertNotEqual(blocked.text, f"Thanks, {other}.")
+        await self.answer(f"Hi, my name is {other}.")
+        self.assertEqual(engine.candidate_first_name, other)
+        allowed = guard_text(f"Thanks, {other}.", engine.guard_context("wrapup"))
+        self.assertEqual(allowed.text, f"Thanks, {other}.")
+
+    async def test_an_engine_built_later_starts_with_the_name(self) -> None:
+        await self.answer("Hi, my name is Cristo.")
+        self.assertEqual(self.interview.engine.candidate_first_name, "Cristo")
+
+    async def test_the_name_is_never_logged(self) -> None:
+        with self.capture_logs() as logs:
+            await self.answer("Hi, my name is Cristo and I sell courses.")
+            self.interview.render_line("L-CLOSE")
+        self.assertIn("r1_spoken_name_adopted", error_types(logs))
+        self.assertNotIn("Cristo", json.dumps(logs))
+
+    async def test_no_name_is_adopted_when_the_record_has_one(self) -> None:
+        self.interview.context["first_name"] = "Asha"
+        with self.capture_logs() as logs:
+            await self.answer("Hi, my name is Cristo.")
+        self.assertNotIn("r1_spoken_name_adopted", error_types(logs))
+
+
+class TestIcebreakerEndRace(R1TestCase):
+    """The soft exit (four turns, S >= 3:30) is decided at the end of a COMMITTED turn.
+
+    The SDK commits a turn some 0.8-3 s after the candidate's last word.  The soft exit counts
+    committed answers and is judged there (``prepare_turn``): when S crosses 3:30 while the
+    4th answer is still being said, that turn's reply is suppressed and the driver is told.  The
+    driver never ends the phase at a raw transcript: the transition line is uninterruptible, so
+    starting it in the middle of an answer would talk over the candidate.
+    """
+
+    # Three words each: the floor for an answer (ICEBREAKER_ANSWER_MIN_WORDS).
+    ANSWERS = ("one two three", "four five six", "seven eight nine", "ten eleven twelve")
 
     async def four_turns_with_the_soft_exit_due_in_between(self) -> asyncio.Task:
         self.clock.advance(209.6)
         task = asyncio.create_task(self.interview._run_icebreaker())
         await self.settle()
-        for answer in ("one", "two", "three", "four"):
-            self.final_transcript(answer)  # the 4th lands at S = 209.6: not over yet
-            await self.settle()
+        for answer in self.ANSWERS[:3]:
+            await self.answer(answer)  # committed before the soft exit is due
+        self.final_transcript(self.ANSWERS[3])  # the 4th lands at S = 209.6: not over yet
+        await self.settle()
         self.assertFalse(task.done())
         self.clock.advance(0.6)  # S = 210.2 when the SDK's end of turn arrives
         return task
@@ -3198,7 +3705,7 @@ class TestIcebreakerEndRace(R1TestCase):
         agent = R1Agent(self.interview)
         with self.assertRaises(r1_session.StopResponse):  # the reply is suppressed...
             await agent.on_user_turn_completed(
-                None, SimpleNamespace(text_content="four", id="msg_race")
+                None, SimpleNamespace(text_content=self.ANSWERS[3], id="msg_race")
             )
         started = asyncio.get_running_loop().time()
         # ...and the driver is woken: it ends the phase at once (the transition line plays)
@@ -3223,14 +3730,18 @@ class TestIcebreakerEndRace(R1TestCase):
         task = asyncio.create_task(interview.run())
         await self.until(lambda: interview.machine.phase is R1Phase.ICEBREAKER)
         clock.advance(209.6)
-        for answer in ("one", "two", "three", "four"):
+        agent = R1Agent(interview)
+        for number, answer in enumerate(self.ANSWERS):
             session.emit("user_input_transcribed", final_event(answer))
             await self.settle()
+            if number < 3:  # committed before the soft exit is due
+                await agent.on_user_turn_completed(
+                    None, SimpleNamespace(text_content=answer, id=f"msg_{number}")
+                )
         clock.advance(0.6)
-        agent = R1Agent(interview)
         with self.assertRaises(r1_session.StopResponse):
             await agent.on_user_turn_completed(
-                None, SimpleNamespace(text_content="four", id="msg_race")
+                None, SimpleNamespace(text_content=self.ANSWERS[3], id="msg_race")
             )
         await self.until(lambda: interview.machine.phase is R1Phase.TRANSITION)
         await self.until(
@@ -3241,10 +3752,15 @@ class TestIcebreakerEndRace(R1TestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
 
+    async def four_answers_before_the_soft_exit(self) -> None:
+        """Four committed answers at S = 205: the rule's turns are in, its clock is not (S < 3:30)."""
+        self.clock.advance(205)
+        for answer in self.ANSWERS:
+            self.assertFalse(await self.answer(answer))  # none is a boundary turn yet
+        self.clock.advance(10)  # S = 215: the soft exit is due from now on
+
     async def test_no_silence_prompt_is_spoken_once_the_soft_exit_is_due(self) -> None:
-        self.clock.advance(215)
-        for answer in ("one", "two", "three", "four"):
-            self.final_transcript(answer)
+        await self.four_answers_before_the_soft_exit()
         outcome = await self.interview._silence_ladder([("L-SIL-IB", 20.0)])
         self.assertEqual(outcome, "phase_deadline")
         self.assertEqual(self.session.spoken, [])
@@ -3252,18 +3768,19 @@ class TestIcebreakerEndRace(R1TestCase):
     async def four_answered_turns_then_a_follow_up_question_plays(
         self, *, turn_ends_at: float, question_ends_at: float
     ) -> tuple[asyncio.Task, R1Agent]:
-        """Four finals, the end of the 4th turn at ``turn_ends_at`` (before the soft exit), and
+        """Four committed answers, the 4th turn ending at ``turn_ends_at`` (before the soft exit), and
         the interviewer's follow-up question playing until ``question_ends_at`` (S seconds)."""
         self.clock.advance(turn_ends_at)
         task = asyncio.create_task(self.interview._run_icebreaker())
         await self.settle()
-        for answer in ("one", "two", "three", "four"):
-            self.final_transcript(answer)
-            await self.settle()
         agent = R1Agent(self.interview)
-        # The SDK's end of turn: S < 3:30, so the reply is NOT suppressed and the model asks.
+        for answer in self.ANSWERS[:3]:
+            await self.answer(answer, agent=agent)
+        # The SDK's end of the 4th turn: S < 3:30, so the reply is NOT suppressed and the model asks.
+        self.final_transcript(self.ANSWERS[3])
+        await self.settle()
         await agent.on_user_turn_completed(
-            None, SimpleNamespace(text_content="four", id="msg_follow_up")
+            None, SimpleNamespace(text_content=self.ANSWERS[3], id="msg_follow_up")
         )
         self.agent_state("thinking")
         self.agent_state("speaking")
@@ -3280,15 +3797,19 @@ class TestIcebreakerEndRace(R1TestCase):
         # Fix-branch regression: the end of turn fell at S=205, the follow-up question finished
         # at S=211, and the wake-up read "soft exit due" as "phase over": L-TRANSITION played
         # right after the interviewer's own question, which the candidate never got to answer.
-        task, _agent = await self.four_answered_turns_then_a_follow_up_question_plays(
+        task, agent = await self.four_answered_turns_then_a_follow_up_question_plays(
             turn_ends_at=205.0, question_ends_at=211.0
         )
         self.assertFalse(task.done())  # still waiting for the answer
         self.assertIs(self.interview.machine.phase, R1Phase.ICEBREAKER)
         self.assertEqual(self.session.spoken, [])
         self.assertGreater(self.interview._icebreaker_budget_left(), 0)
-        # The answer ends the phase through the driver's own check, and nothing is lost.
-        self.final_transcript("five")
+        # The answer's transcript alone does not end the phase (it may be half an answer); the
+        # turn the SDK commits does, and it is the boundary turn the transition line answers.
+        self.final_transcript("five six seven")
+        await self.settle()
+        self.assertFalse(task.done())
+        self.assertTrue(await self.commit_turn("five six seven", agent=agent))
         self.assertIsNone(await asyncio.wait_for(task, 5.0))
         self.assertEqual(self.session.spoken, [])
 
@@ -3297,7 +3818,7 @@ class TestIcebreakerEndRace(R1TestCase):
     ) -> None:
         # The question ended at S=208, the candidate started answering at S=211: the wake-up
         # from their speaking must not play the (non-interruptible) boundary line over them.
-        task, _agent = await self.four_answered_turns_then_a_follow_up_question_plays(
+        task, agent = await self.four_answered_turns_then_a_follow_up_question_plays(
             turn_ends_at=205.0, question_ends_at=208.0
         )
         self.clock.advance(3)  # S = 211
@@ -3306,29 +3827,43 @@ class TestIcebreakerEndRace(R1TestCase):
         self.assertFalse(task.done())
         self.assertIs(self.interview.machine.phase, R1Phase.ICEBREAKER)
         self.assertEqual(self.session.spoken, [])
-        self.final_transcript("five")
+        self.final_transcript("five six seven")
         self.user_state("listening")
+        await self.settle()
+        self.assertFalse(task.done())  # a final is half an answer until the SDK commits it
+        self.assertTrue(await self.commit_turn("five six seven", agent=agent))
         self.assertIsNone(await asyncio.wait_for(task, 5.0))
         self.assertEqual(self.session.spoken, [])
 
+    async def test_a_raw_final_never_ends_the_icebreaker_even_when_the_exit_is_due(self) -> None:
+        # The owner's session: a fragment final at S >= 3:30 started the uninterruptible
+        # transition line while the candidate was still answering.
+        task, _agent = await self.four_answered_turns_then_a_follow_up_question_plays(
+            turn_ends_at=205.0, question_ends_at=211.0
+        )
+        for fragment in ("and that is why", "I moved into", "this kind of work"):
+            self.final_transcript(fragment)
+            await self.settle()
+            self.assertFalse(task.done())
+        self.assertEqual(self.session.spoken, [])
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
     async def test_only_the_suppressed_boundary_turn_zeroes_the_icebreaker_budget(self) -> None:
-        self.clock.advance(215)
-        for answer in ("one", "two", "three", "four"):
-            self.final_transcript(answer)
+        await self.four_answers_before_the_soft_exit()
         self.assertTrue(self.interview.machine.icebreaker_should_end())
         # The soft-exit rule alone is not the end of the phase for a waiter: 55 s remain.
         self.assertEqual(self.interview._icebreaker_budget_left(), 55)
         agent = R1Agent(self.interview)
         with self.assertRaises(r1_session.StopResponse):  # this turn IS the boundary turn
             await agent.on_user_turn_completed(
-                None, SimpleNamespace(text_content="four", id="msg_boundary")
+                None, SimpleNamespace(text_content="five six seven", id="msg_boundary")
             )
         self.assertEqual(self.interview._icebreaker_budget_left(), 0)
 
     async def test_an_empty_turn_after_the_soft_exit_is_not_a_boundary_turn(self) -> None:
-        self.clock.advance(215)
-        for answer in ("one", "two", "three", "four"):
-            self.final_transcript(answer)
+        await self.four_answers_before_the_soft_exit()
         agent = R1Agent(self.interview)
         with self.assertRaises(r1_session.StopResponse):
             await agent.on_user_turn_completed(None, SimpleNamespace(text_content="", id="m"))
@@ -3344,6 +3879,804 @@ class TestIcebreakerEndRace(R1TestCase):
         task.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await task
+
+
+class TestIcebreakerHardCapWaitsForTheAnswerInFlight(R1TestCase):
+    """The S=4:30 cap is the phase's deadline, not the candidate's: it never talks over an answer.
+
+    The transition line is uninterruptible, so starting it while the candidate is mid-answer
+    discards what they say.  The cap waits for the turn in flight to commit, but only briefly:
+    one endpointing maximum plus a second after the last sign of speech, and 30 s in all.
+    """
+
+    GRACE = 3.0 + 1.0  # R1_ENDPOINT_MAX_DELAY_SEC default + ICEBREAKER_HOLD_MARGIN_SECONDS
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("R1_ENDPOINT_MIN_DELAY_SEC", "R1_ENDPOINT_MAX_DELAY_SEC"):
+            os.environ.pop(key, None)
+
+    async def test_past_the_cap_with_nobody_mid_turn_the_budget_is_zero(self) -> None:
+        self.clock.advance(271)
+        self.assertEqual(self.interview._icebreaker_budget_left(), 0)
+
+    async def test_a_speaking_candidate_is_given_the_endpointing_window(self) -> None:
+        self.clock.advance(271)
+        self.user_state("speaking")
+        self.assertEqual(self.interview._icebreaker_budget_left(), self.GRACE)
+        self.clock.advance(2.0)  # still speaking: the window is renewed, not spent
+        self.assertEqual(self.interview._icebreaker_budget_left(), self.GRACE)
+
+    async def test_an_uncommitted_final_holds_the_cap_until_the_window_after_it_runs_out(self) -> None:
+        self.clock.advance(271)
+        self.final_transcript("and that is how I would handle it")
+        self.assertEqual(self.interview._icebreaker_budget_left(), self.GRACE)
+        self.clock.advance(3.0)
+        self.assertAlmostEqual(self.interview._icebreaker_budget_left(), 1.0)
+        self.clock.advance(1.5)
+        self.assertEqual(self.interview._icebreaker_budget_left(), 0)
+
+    async def test_the_hold_never_lasts_beyond_its_ceiling(self) -> None:
+        self.clock.advance(271)
+        self.user_state("speaking")
+        self.assertGreater(self.interview._icebreaker_budget_left(), 0)
+        self.clock.advance(29.5)
+        self.assertAlmostEqual(self.interview._icebreaker_budget_left(), 0.5)
+        self.clock.advance(1.0)
+        self.assertEqual(self.interview._icebreaker_budget_left(), 0)
+
+    async def test_the_hold_starts_afresh_for_the_next_turn(self) -> None:
+        self.clock.advance(271)
+        self.user_state("speaking")
+        self.interview._icebreaker_budget_left()
+        self.user_state("listening")
+        self.clock.advance(100)  # nobody mid-turn for a long time: the ceiling is forgotten
+        self.assertEqual(self.interview._icebreaker_budget_left(), 0)
+        self.user_state("speaking")
+        self.assertEqual(self.interview._icebreaker_budget_left(), self.GRACE)
+
+    async def test_the_driver_does_not_leave_while_the_candidate_is_still_speaking(self) -> None:
+        self.clock.advance(268)
+        task = asyncio.create_task(self.interview._run_icebreaker())
+        await self.settle()
+        self.user_state("speaking")
+        self.clock.advance(4.0)  # S = 272: the cap has passed in the middle of the answer
+        self.interview._wake()
+        await self.settle()
+        self.assertFalse(task.done())
+        self.assertEqual(self.session.spoken, [])
+        self.final_transcript("so that is what I would do")
+        self.user_state("listening")
+        await self.settle()
+        self.assertFalse(task.done())  # the final is half an answer until the SDK commits it
+        self.assertTrue(await self.commit_turn("so that is what I would do"))  # the boundary turn
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.session.spoken, [])
+
+    async def test_a_turn_the_sdk_never_commits_cannot_hold_the_phase_open(self) -> None:
+        self.clock.advance(268)
+        task = asyncio.create_task(self.interview._run_icebreaker())
+        await self.settle()
+        self.clock.advance(4.0)  # S = 272
+        self.final_transcript("Yes")  # a fragment the SDK banks and never commits
+        await self.settle()
+        self.assertFalse(task.done())
+        self.clock.advance(self.GRACE + 0.1)
+        self.interview._wake()
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+
+
+class TestSoftExitBoundaryWaitsForTheAnswerInFlight(R1TestCase):
+    """The boundary turn ends the icebreaker, but not over a candidate who goes on speaking.
+
+    The SDK commits a turn at its endpoint (0.8 s after a sentence that sounds finished); a
+    candidate who pauses that long and goes on is mid-answer again when the commit arrives.  The
+    transition line is uninterruptible and discards their audio, so the boundary waits for them
+    exactly as the hard S=4:30 cap does: until the continued speech is committed (and answered by
+    the transition line in its turn), bounded by the endpointing maximum plus a second, and by 30 s.
+    """
+
+    GRACE = 3.0 + 1.0  # R1_ENDPOINT_MAX_DELAY_SEC default + ICEBREAKER_HOLD_MARGIN_SECONDS
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("R1_ENDPOINT_MIN_DELAY_SEC", "R1_ENDPOINT_MAX_DELAY_SEC"):
+            os.environ.pop(key, None)
+
+    LAST = TestIcebreakerEndRace.ANSWERS[3]
+
+    async def due_and_driving(self) -> asyncio.Task:
+        """The driver waits; the 4th answer's final has landed at S = 205 and S passes 3:30 before
+        the SDK commits it, so that commit is the boundary turn (not yet committed here)."""
+        self.clock.advance(205)
+        task = asyncio.create_task(self.interview._run_icebreaker())
+        await self.settle()
+        for answer in TestIcebreakerEndRace.ANSWERS[:3]:
+            self.assertFalse(await self.answer(answer))
+        self.final_transcript(self.LAST)
+        await self.settle()
+        self.clock.advance(10)  # S = 215
+        self.assertFalse(task.done())
+        return task
+
+    async def test_a_boundary_commit_while_the_candidate_goes_on_speaking_is_not_talked_over(
+        self,
+    ) -> None:
+        task = await self.due_and_driving()
+        self.user_state("speaking")  # they paused 0.8 s, the SDK committed, they went on
+        self.assertTrue(await self.commit_turn(self.LAST))  # suppressed: the boundary turn
+        self.assertTrue(self.interview._icebreaker_boundary_turn)
+        self.assertEqual(self.interview._icebreaker_budget_left(), self.GRACE)
+        await self.settle()
+        self.assertFalse(task.done())
+        self.assertEqual(self.session.spoken, [])  # the transition line has NOT started
+        self.final_transcript("and the other thing I did was")
+        self.user_state("listening")
+        await self.settle()
+        self.assertFalse(task.done())  # half an answer until the SDK commits it
+        self.assertTrue(await self.commit_turn("and the other thing I did was"))
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))  # now the transition line plays
+        self.assertEqual(self.session.spoken, [])
+
+    async def test_a_boundary_commit_with_nobody_mid_turn_still_ends_the_phase_at_once(self) -> None:
+        task = await self.due_and_driving()
+        self.assertTrue(await self.commit_turn(self.LAST))
+        self.assertEqual(self.interview._icebreaker_budget_left(), 0)
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+
+    async def test_a_final_that_the_sdk_has_not_committed_holds_the_boundary_too(self) -> None:
+        task = await self.due_and_driving()
+        self.assertTrue(await self.commit_turn(self.LAST))
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))  # nobody mid-turn: over
+        # Same state, but a final of the continued speech was heard before the driver looked.
+        self.interview._icebreaker_boundary_turn = True
+        self.final_transcript("and one more thing")
+        self.assertEqual(self.interview._icebreaker_budget_left(), self.GRACE)
+
+    async def test_continued_speech_that_is_never_committed_cannot_hold_the_phase_open(self) -> None:
+        task = await self.due_and_driving()
+        self.user_state("speaking")
+        self.assertTrue(await self.commit_turn(self.LAST))
+        self.final_transcript("and one more thing")  # a fragment the SDK banks and never commits
+        self.user_state("listening")
+        await self.settle()
+        self.assertFalse(task.done())
+        self.clock.advance(self.GRACE + 0.1)
+        self.interview._wake()
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+
+    async def test_the_boundary_hold_never_lasts_beyond_its_ceiling(self) -> None:
+        await self.due_and_driving()
+        self.user_state("speaking")
+        self.assertTrue(await self.commit_turn(self.LAST))
+        self.assertEqual(self.interview._icebreaker_budget_left(), self.GRACE)
+        self.clock.advance(29.5)  # still speaking: the window is renewed, up to the ceiling
+        self.assertAlmostEqual(self.interview._icebreaker_budget_left(), 0.5)
+        self.clock.advance(1.0)
+        self.assertEqual(self.interview._icebreaker_budget_left(), 0)
+
+
+class TestRepliesCancelledBeforeAnyAudio(R1TestCase):
+    """The owner's 4/10 session lost three replies to "Sorry", "Thank you" and "Hey, are you there?"
+
+    The candidate heard nothing and the transcript showed no bot turn.  The SDK reports such a
+    reply as a speech that ended ``interrupted`` without ever speaking; R1 counts and logs it
+    (no text), and when the icebreaker's exit is due the lost turn is answered by the transition.
+    """
+
+    def create_reply(self, source: str = "generate_reply") -> FakeSpeechHandle:
+        handle = FakeSpeechHandle("a reply")
+        self.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source=source, user_initiated=False),
+        )
+        return handle
+
+    @staticmethod
+    def lost(logs: list[dict]) -> list[dict]:
+        return [entry for entry in logs if entry.get("error_type") == "r1_reply_cancelled_before_audio"]
+
+    async def test_a_reply_cancelled_before_it_spoke_is_logged_with_a_running_count(self) -> None:
+        with self.capture_logs() as logs:
+            for _ in range(2):
+                handle = self.create_reply()
+                handle.interrupted = True
+                handle.finish()
+        lines = self.lost(logs)
+        self.assertEqual([entry["option_count"] for entry in lines], [1, 2])
+        self.assertEqual(lines[0]["phase"], "icebreaker")
+        self.assertEqual(set(lines[0]) - {"timestamp", "level", "component", "event", "correlationId"},
+                         {"error_type", "phase", "option_count"})
+        self.assertEqual(self.interview._replies_cancelled_before_audio, 2)
+
+    async def test_a_reply_that_began_speaking_is_not_a_lost_reply(self) -> None:
+        handle = self.create_reply()
+        self.session.current_speech = handle
+        self.agent_state("speaking")  # claims its transcript position: the candidate heard it
+        with self.capture_logs() as logs:
+            handle.interrupted = True
+            handle.finish()
+        self.assertEqual(self.lost(logs), [])
+
+    async def test_a_reply_that_finished_unharmed_is_not_a_lost_reply(self) -> None:
+        handle = self.create_reply()
+        with self.capture_logs() as logs:
+            handle.finish()
+        self.assertEqual(self.lost(logs), [])
+
+    async def test_a_scripted_line_is_not_a_lost_reply(self) -> None:
+        handle = self.create_reply("say")
+        handle.interrupted = True
+        with self.capture_logs() as logs:
+            handle.finish()
+        self.assertEqual(self.lost(logs), [])
+
+    async def test_nothing_is_counted_once_the_exit_has_begun(self) -> None:
+        handle = self.create_reply()
+        self.interview._begin_exit()
+        handle.interrupted = True
+        with self.capture_logs() as logs:
+            handle.finish()
+        self.assertEqual(self.lost(logs), [])
+
+    async def test_a_lost_reply_when_the_exit_is_due_is_answered_by_the_transition(self) -> None:
+        self.clock.advance(205)
+        task = asyncio.create_task(self.interview._run_icebreaker())
+        await self.settle()
+        for answer in TestIcebreakerEndRace.ANSWERS:
+            self.assertFalse(await self.answer(answer))
+        handle = self.create_reply()  # the 4th turn's reply is being thought of...
+        self.clock.advance(10)  # ...and S crosses 3:30 meanwhile
+        await self.settle()
+        self.assertFalse(task.done())
+        handle.interrupted = True  # ...then it is cancelled before any audio
+        handle.finish()
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))  # the transition speaks, not silence
+        self.assertEqual(self.session.spoken, [])
+
+    async def test_a_lost_reply_before_the_exit_is_due_changes_nothing(self) -> None:
+        self.clock.advance(100)
+        task = asyncio.create_task(self.interview._run_icebreaker())
+        await self.settle()
+        handle = self.create_reply()
+        handle.interrupted = True
+        handle.finish()
+        await self.settle()
+        self.assertFalse(task.done())
+        self.assertFalse(self.interview._icebreaker_boundary_turn)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+    async def test_a_lost_reply_while_the_candidate_is_mid_turn_leaves_the_decision_to_the_commit(
+        self,
+    ) -> None:
+        self.clock.advance(215)
+        for answer in TestIcebreakerEndRace.ANSWERS:
+            self.interview.machine.candidate_turns += 1
+        self.user_state("speaking")
+        handle = self.create_reply()
+        handle.interrupted = True
+        handle.finish()
+        self.assertFalse(self.interview._icebreaker_boundary_turn)
+
+
+class TestBackchannelsOverAPendingReply(R1TestCase):
+    """"Sorry" then "Thank you." is ONE committed turn of three words, and it cancels the pending reply.
+
+    livekit-agents 1.6.4 refuses a turn of fewer than ``min_words`` words only while it can still
+    cut the reply, and it KEEPS the refused words (``AudioRecognition`` clears its transcript when
+    a turn is committed, not when one is refused): the next final is judged together with them
+    (``AgentActivity.on_end_of_turn``).  So "Sorry" (1 word) is banked, "Thank you." (2) makes
+    three, the SDK commits, and ``_user_turn_completed_task`` interrupts the reply it was still
+    thinking of BEFORE it calls R1's hook.  ``min_words=3`` therefore stops one short fragment, not
+    a sequence of them, and the owner's rows 12-14 still end in dead air.  R1 cannot stop the SDK
+    from committing, so these tests pin what it does about the committed turn: it does not count
+    it as an answer, it does not restart the candidate's wait for the next reply, and the reply it
+    cost is counted in the p95.
+    """
+
+    ANSWER = "I have been selling courses to working professionals for eleven years now"
+
+    @staticmethod
+    async def hung_stream():
+        await asyncio.Event().wait()
+        yield "never"
+
+    @staticmethod
+    async def gated(gate: asyncio.Event, *items):
+        await gate.wait()
+        for item in items:
+            yield item
+
+    async def collect(self, stream) -> list:
+        return [item async for item in self.interview.guard_llm_stream(stream)]
+
+    async def reply_pending_for(self, text: str) -> tuple[FakeSpeechHandle, asyncio.Task]:
+        """The candidate's answer is committed and the model starts to think of the reply."""
+        self.final_transcript(text)
+        await self.settle()
+        self.assertFalse(await self.commit_turn(text))
+        handle = FakeSpeechHandle("the reply")
+        self.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=False),
+        )
+        self.session.current_speech = handle
+        generation = asyncio.create_task(self.collect(self.hung_stream()))
+        await self.settle()
+        return handle, generation
+
+    async def sdk_commits(
+        self, handle: FakeSpeechHandle, generation: asyncio.Task, text: str
+    ) -> bool:
+        """``_user_turn_completed_task``: cut the pending reply FIRST, then call the hook."""
+        handle.interrupted = True
+        generation.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await generation
+        handle.finish()
+        self.session.current_speech = None
+        return await self.commit_turn(text)
+
+    async def owner_sequence(self) -> tuple[FakeSpeechHandle, asyncio.Task]:
+        """Rows 12-14 of the owner's session: an answer, its reply pending, "Sorry", "Thank you."."""
+        handle, generation = await self.reply_pending_for(self.ANSWER)
+        self.final_transcript("Sorry")
+        await self.settle()
+        self.assertTrue(self.interview._fragment_held_back())  # one word: refused and banked
+        self.final_transcript("Thank you.")
+        await self.settle()
+        self.assertEqual(self.interview._banked_words, 3)
+        self.assertFalse(self.interview._fragment_held_back())  # three words: the SDK commits
+        return handle, generation
+
+    def lost(self, logs: list[dict]) -> list[dict]:
+        return [e for e in logs if e.get("error_type") == "r1_reply_cancelled_before_audio"]
+
+    async def test_the_sdk_commits_sorry_and_thank_you_together_and_the_pending_reply_is_lost(
+        self,
+    ) -> None:
+        handle, generation = await self.owner_sequence()
+        with self.capture_logs() as logs:
+            self.assertFalse(await self.sdk_commits(handle, generation, "Sorry Thank you."))
+        # The reply was cut before it spoke: that is the owner's dead air, and it is logged.
+        self.assertEqual(len(self.lost(logs)), 1)
+        await self.flush()
+        self.assertEqual(
+            [r["text"] for r in self.writer.saved if r["speaker"] == "candidate"],
+            [self.ANSWER, "Sorry Thank you."],
+        )
+        self.assertEqual(self.bot_rows(), [])  # and the candidate heard nothing
+
+    async def test_that_committed_turn_is_not_an_answer(self) -> None:
+        handle, generation = await self.owner_sequence()
+        self.assertEqual(self.interview.machine.candidate_turns, 1)  # the real answer
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.assertEqual(self.interview.machine.candidate_turns, 1)  # not a second one
+
+    async def test_noise_never_brings_the_soft_exit_closer(self) -> None:
+        # Four turns of noise at S >= 3:30 used to END the icebreaker (each was three words or more).
+        self.clock.advance(215)
+        for noise in ("Sorry Thank you.", "Hey, are you there?", "Hmm. Okay. Right.", "Yes. Right, sure."):
+            self.assertFalse(await self.answer(noise))  # the reply is not suppressed
+        self.assertEqual(self.interview.machine.candidate_turns, 0)
+        self.assertFalse(self.interview.machine.icebreaker_should_end())
+
+    async def test_the_next_replys_filler_is_counted_from_the_real_answer(self) -> None:
+        handle, generation = await self.owner_sequence()
+        self.clock.advance(3.99)  # the candidate has waited this long when the SDK cuts the reply
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        with mock.patch.object(r1_session, "FILLER_RESTART_MIN_SECONDS", 0.02):
+            guard = self.interview.guard_llm_stream(self.gated(asyncio.Event()))
+            # Counted from the start of THIS generation the filler would come 4 s from now.
+            first = await asyncio.wait_for(guard.__anext__(), 3.0)
+            await guard.aclose()
+        self.assertEqual(first, self.spoken_line("L-FILLER-INTERVIEWER") + " ")
+
+    async def test_the_filler_keeps_a_floor_so_a_reply_about_to_arrive_is_not_pre_empted(
+        self,
+    ) -> None:
+        handle, generation = await self.owner_sequence()
+        self.clock.advance(3.99)
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        delay = self.interview._filler_delay()
+        self.assertEqual(delay, r1_session.FILLER_RESTART_MIN_SECONDS)
+        self.assertGreater(delay, 0.0)
+
+    async def test_a_candidate_who_has_waited_only_a_little_gets_the_rest_of_the_four_seconds(
+        self,
+    ) -> None:
+        handle, generation = await self.owner_sequence()
+        self.clock.advance(1.0)
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.assertAlmostEqual(self.interview._filler_delay(), 3.0)
+
+    async def test_without_a_cancelled_reply_the_filler_still_waits_its_full_four_seconds(
+        self,
+    ) -> None:
+        guard = self.interview.guard_llm_stream(self.gated(asyncio.Event()))
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(guard.__anext__(), 0.3)
+        self.assertEqual(r1_session.FILLER_AFTER_SECONDS, 4.0)
+        self.interview._unvoiced_since = None
+        self.assertEqual(self.interview._filler_delay(), 4.0)
+
+    async def test_something_real_said_after_the_noise_starts_the_wait_afresh(self) -> None:
+        handle, generation = await self.owner_sequence()
+        self.clock.advance(3.5)
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.assertIsNotNone(self.interview._unvoiced_since)  # the wait is still the old one
+        await self.answer("Actually I also spent two years in enterprise sales")
+        self.assertIsNone(self.interview._unvoiced_since)
+        self.assertEqual(self.interview._filler_delay(), 4.0)
+
+    async def test_any_speech_that_begins_ends_the_wait(self) -> None:
+        handle, generation = await self.owner_sequence()
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.assertIsNotNone(self.interview._unvoiced_since)
+        self.interview._filler_delay()
+        reply = FakeSpeechHandle("the next reply")
+        self.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=reply, source="generate_reply", user_initiated=False),
+        )
+        self.session.current_speech = reply
+        self.agent_state("speaking")  # the candidate hears something
+        self.assertIsNone(self.interview._unvoiced_since)
+
+    async def test_a_new_phase_is_a_new_wait(self) -> None:
+        handle, generation = await self.owner_sequence()
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.assertIsNotNone(self.interview._unvoiced_since)
+        self.interview._enter(R1Phase.TRANSITION)
+        self.assertIsNone(self.interview._unvoiced_since)
+
+    async def test_an_old_wait_is_not_the_current_one(self) -> None:
+        handle, generation = await self.owner_sequence()
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.clock.advance(r1_session.FILLER_ANCHOR_MAX_SECONDS + 1.0)
+        self.assertEqual(self.interview._filler_delay(), 4.0)
+
+    async def test_the_anchor_never_makes_the_filler_later_than_the_plain_four_seconds(self) -> None:
+        self.interview._unvoiced_since = 0.0
+        for waited in (0.0, 0.1, 2.0, 3.9, 4.0, 10.0, 19.9):
+            self.clock.value = waited
+            self.interview._unvoiced_since = 0.0
+            delay = self.interview._filler_delay()
+            self.assertLessEqual(delay, 4.0, waited)
+            self.assertGreaterEqual(delay, min(0.5, 4.0), waited)
+
+    async def test_a_clock_that_stepped_back_is_not_a_wait(self) -> None:
+        self.interview._unvoiced_since = 100.0  # the manual clock reads 0.0
+        self.assertEqual(self.interview._filler_delay(), 4.0)
+
+    # ------------------------------------------------ the p95 does not lose the cancelled turn
+
+    async def roleplay_turn_with_a_reply_pending(self) -> tuple[FakeSpeechHandle, int | None]:
+        self.enter_roleplay()
+        self.final_transcript("Hi Meera, thanks for taking my call today")
+        await self.settle()
+        self.assertFalse(await self.commit_turn("Hi Meera, thanks for taking my call today"))
+        handle = FakeSpeechHandle("the learner's reply")
+        self.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=False),
+        )
+        return handle, self.interview._latency.open_turn_id()
+
+    async def test_a_cancelled_role_play_reply_adds_its_wait_to_the_p95_as_a_lower_bound(self) -> None:
+        tracker = self.interview._latency
+        for number in range(8):  # eight prompt answers, 1 s each
+            self.clock.advance(10.0)
+            tracker.begin_turn(100 + number, "roleplay")
+            self.clock.advance(1.0)
+            tracker.first_audio()
+        self.assertEqual(tracker.first_audio_p95_ms(), 1000)
+        handle, _turn = await self.roleplay_turn_with_a_reply_pending()
+        with self.capture_logs() as logs:
+            self.clock.advance(6.0)  # the candidate has waited 6 s when the reply is cut
+            handle.interrupted = True
+            handle.finish()
+        self.assertEqual(tracker.replies_lost("roleplay"), 1)
+        self.assertEqual(tracker.first_audio_samples(), 9)
+        self.assertEqual(tracker.first_audio_p95_ms(), 6000)  # it can no longer look fast
+        (line_,) = [e for e in logs if e.get("schema") == "eou_to_reply_lost"]
+        self.assertEqual((line_["phase"], line_["duration_sec"]), ("roleplay", 6.0))
+
+    async def test_audio_that_plays_afterwards_is_not_that_turns_first_audio(self) -> None:
+        tracker = self.interview._latency
+        handle, _turn = await self.roleplay_turn_with_a_reply_pending()
+        self.clock.advance(5.0)
+        handle.interrupted = True
+        handle.finish()
+        samples = tracker.first_audio_samples(None)
+        self.clock.advance(1.0)
+        later = FakeSpeechHandle("an unrelated scripted line")
+        self.session.current_speech = later
+        self.agent_state("speaking")  # some speech starts before the next turn is opened
+        self.assertEqual(tracker.first_audio_samples(None), samples)
+
+    async def test_the_session_posts_the_count_of_lost_replies_beside_the_p95(self) -> None:
+        handle, _turn = await self.roleplay_turn_with_a_reply_pending()
+        self.clock.advance(5.0)
+        handle.interrupted = True
+        handle.finish()
+        with self.capture_logs() as logs:
+            self.assertIsNone(self.interview._first_audio_p95_ms())  # one turn: unknown, not a number
+        lost = [e for e in logs if e.get("error_category") == "lost_replies"]
+        self.assertEqual([e["option_count"] for e in lost], [1])
+
+    async def test_a_reply_that_spoke_is_not_counted_as_lost(self) -> None:
+        tracker = self.interview._latency
+        handle, _turn = await self.roleplay_turn_with_a_reply_pending()
+        self.clock.advance(1.0)
+        self.session.current_speech = handle
+        self.agent_state("speaking")  # the candidate hears it
+        handle.interrupted = True  # cut later, while speaking
+        handle.finish()
+        self.assertEqual(tracker.replies_lost(None), 0)
+        self.assertEqual(tracker.first_audio_samples(None), 1)
+
+    async def test_a_lost_reply_does_not_pay_for_another_turns_wait(self) -> None:
+        # The reply is tied to the turn that was open when it was created, not to the newest turn.
+        tracker = self.interview._latency
+        handle, turn = await self.roleplay_turn_with_a_reply_pending()
+        self.clock.advance(2.0)
+        await self.answer("and the second part of my opening pitch")  # a newer turn opens
+        self.clock.advance(1.0)
+        handle.interrupted = True  # the OLD reply is cut afterwards
+        handle.finish()
+        self.assertEqual(tracker.replies_lost(None), 1)
+        (sample,) = [s for s in tracker._headline if s[1] > 2.5]
+        self.assertAlmostEqual(sample[1], 3.0)  # the old turn's own wait, not the new one's
+        self.assertIsNotNone(turn)
+
+
+class TestTransitionRunsQuickerEndpointing(R1TestCase):
+    """The transition (the candidate only says "ready") commits turns at 0.4 / 1.2 s.
+
+    The pair goes to ``AgentSession.update_options`` on entering the phase and the session's own
+    0.8 / 3.0 s comes back when it ends.  A session that never reaches the transition, or whose
+    update fails, keeps the session's pair and carries on.
+    """
+
+    SESSION = {"min_delay": 0.8, "max_delay": 3.0}
+    QUICK = {"min_delay": 0.4, "max_delay": 1.2}
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("R1_ENDPOINT_MIN_DELAY_SEC", "R1_ENDPOINT_MAX_DELAY_SEC"):
+            os.environ.pop(key, None)
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.updates: list[dict] = []
+        self.session.update_options = lambda **kwargs: self.updates.append(kwargs)
+
+    async def test_entering_the_transition_makes_it_quick_and_leaving_restores_the_session(
+        self,
+    ) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.assertEqual(self.updates, [{"endpointing_opts": self.QUICK}])
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.assertEqual(
+            self.updates, [{"endpointing_opts": self.QUICK}, {"endpointing_opts": self.SESSION}]
+        )
+
+    async def test_a_session_that_never_reaches_the_transition_never_calls_the_sdk(self) -> None:
+        self.interview._enter(R1Phase.CLOSING)
+        self.interview._enter(R1Phase.FINISHING)
+        self.assertEqual(self.updates, [])
+
+    async def test_the_pair_is_sent_once_however_often_the_phase_is_entered_or_left(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._begin_disconnect()  # paused in the transition: the setting stays
+        self.assertEqual(len(self.updates), 1)
+        self.interview._rejoin()  # back in the transition: still quick, nothing to send
+        self.assertEqual(len(self.updates), 1)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.assertEqual(len(self.updates), 2)
+
+    async def test_a_reconnect_that_resumes_after_the_transition_restores_the_session(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._begin_disconnect()
+        self.interview.machine._resume_phase = R1Phase.ROLEPLAY  # as if it had been in role-play
+        self.interview._rejoin()
+        self.assertEqual(self.updates[-1], {"endpointing_opts": self.SESSION})
+
+    async def test_the_quick_pair_follows_the_operators_numbers_when_they_are_lower(self) -> None:
+        os.environ["R1_ENDPOINT_MIN_DELAY_SEC"] = "0.3"
+        os.environ["R1_ENDPOINT_MAX_DELAY_SEC"] = "1.0"
+        self.interview._enter(R1Phase.TRANSITION)
+        self.assertEqual(self.updates, [{"endpointing_opts": {"min_delay": 0.3, "max_delay": 1.0}}])
+
+    async def test_a_failing_update_is_logged_by_type_and_retried_at_the_next_phase(self) -> None:
+        calls: list[dict] = []
+
+        def flaky(**kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise RuntimeError("sdk refused the update")
+
+        self.session.update_options = flaky
+        with self.capture_logs() as logs:
+            self.interview._enter(R1Phase.TRANSITION)  # fails: nothing changed
+            self.assertIs(self.interview.machine.phase, R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+        failed = [e for e in logs if e.get("error_type") == "r1_endpointing_update_failed"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["error_category"], "RuntimeError")
+        self.assertNotIn("sdk refused the update", json.dumps(logs))
+        # The quick pair never took effect, so leaving the transition has nothing to restore.
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(self.interview._quick_endpointing)
+
+    async def test_a_session_without_update_options_is_left_alone(self) -> None:
+        del self.session.update_options
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.assertIs(self.interview.machine.phase, R1Phase.ROLEPLAY)
+
+
+class TestCandidateRowCoalescing(R1TestCase):
+    """One transcript row per committed candidate turn, not one per STT final.
+
+    Sarvam closes an utterance at each of its own pauses, and the SDK merges those finals into
+    one turn.  In the owner's session a single answer was 5-6 rows, and 13.7% of the role-play
+    rows were two words or fewer, which alone fails the gate's ``stt_sanity`` (below 10%).
+    """
+
+    ANSWER = (
+        "Yeah, so, um, I just got a call from you and, uh,",
+        "realized that you have been looking through our programs",
+        "Hello",
+        "whether are you looking for upskilling or like",
+        "know what you do in your career.",
+    )
+
+    def candidate_rows(self) -> list[dict]:
+        return [row for row in self.writer.saved if row["speaker"] == "candidate"]
+
+    async def test_the_finals_of_one_answer_are_one_row_written_when_the_turn_commits(self) -> None:
+        for fragment in self.ANSWER:
+            self.final_transcript(fragment)
+        await self.flush()
+        self.assertEqual(self.writer.saved, [])  # one open row, not written yet
+        await self.commit_turn(" ".join(self.ANSWER))
+        await self.flush()
+        self.assertEqual(
+            [(r["index"], r["speaker"], r["phase"], r["text"]) for r in self.writer.saved],
+            [(1, "candidate", "icebreaker", " ".join(self.ANSWER))],
+        )
+
+    async def test_the_driver_still_reads_every_final_one_at_a_time(self) -> None:
+        # Ready and wrap-up matching works on single finals: only the PERSISTENCE is coalesced.
+        for fragment in ("Not ready yet.", "Okay, ready now."):
+            self.final_transcript(fragment)
+        self.assertEqual(await self.interview._await_turn(5.0), (TURN, "Not ready yet."))
+        self.assertEqual(await self.interview._await_turn(5.0), (TURN, "Okay, ready now."))
+
+    async def test_the_row_is_placed_at_its_first_final_ahead_of_a_later_bot_speech(self) -> None:
+        self.final_transcript("tell me about the course")
+        self.final_transcript("and the fees")
+        await self.interview.say("L-SIL-IB")  # a bot speech starts: the candidate's turn is over
+        await self.flush()
+        self.assertEqual(
+            [(r["index"], r["speaker"]) for r in self.writer.saved], [(1, "candidate"), (2, "bot")]
+        )
+        self.assertEqual(self.writer.saved[0]["text"], "tell me about the course and the fees")
+
+    async def test_what_the_candidate_says_after_a_bot_speech_starts_is_a_new_row(self) -> None:
+        self.final_transcript("first thing")
+        await self.interview.say("L-SIL-IB")
+        self.final_transcript("second thing")
+        await self.commit_turn("second thing")
+        await self.flush()
+        self.assertEqual(
+            [(r["index"], r["speaker"], r["text"]) for r in self.writer.saved if r["speaker"] == "candidate"],
+            [(1, "candidate", "first thing"), (3, "candidate", "second thing")],
+        )
+
+    async def test_a_row_never_straddles_a_phase(self) -> None:
+        self.final_transcript("the end of my answer")
+        self.interview._enter(R1Phase.TRANSITION)
+        self.final_transcript("ready")
+        await self.commit_turn("ready")
+        await self.flush()
+        self.assertEqual(
+            [(r["index"], r["phase"], r["text"]) for r in self.writer.saved],
+            [(1, "icebreaker", "the end of my answer"), (2, "transition", "ready")],
+        )
+
+    async def test_a_disconnect_closes_the_open_row(self) -> None:
+        self.final_transcript("said just before dropping")
+        self.interview._begin_disconnect()
+        await self.flush()
+        self.assertEqual([r["text"] for r in self.writer.saved], ["said just before dropping"])
+
+    async def test_words_the_sdk_banked_are_part_of_the_committed_row(self) -> None:
+        # The SDK banks the words it refuses and judges the next final together with them, so
+        # "Sorry" + "Thank you." is already a committed turn of three words (and that commit cuts
+        # a pending reply: TestBackchannelsOverAPendingReply).  Whatever turn commits carries
+        # every banked word, and so does its one row.
+        for fragment in ("Sorry", "Thank you.", "Hey, are you there?"):
+            self.final_transcript(fragment)
+        await self.commit_turn("Sorry Thank you. Hey, are you there?")
+        await self.flush()
+        self.assertEqual(
+            [r["text"] for r in self.writer.saved], ["Sorry Thank you. Hey, are you there?"]
+        )
+
+    async def test_the_history_entry_and_the_row_share_the_turn_index(self) -> None:
+        self.final_transcript("one part,")
+        self.final_transcript("and another.")
+        await self.commit_turn("one part, and another.")
+        entry = [item for item in self.interview._history if item["role"] == "candidate"][-1]
+        self.assertEqual(entry["seq"], 1)
+        await self.flush()
+        self.assertEqual(self.writer.saved[0]["index"], 1)
+
+    async def test_an_empty_commit_with_no_finals_writes_nothing(self) -> None:
+        await self.commit_turn("")
+        await self.flush()
+        self.assertEqual(self.writer.saved, [])
+
+    async def test_each_row_is_written_exactly_once(self) -> None:
+        self.final_transcript("an answer")
+        await self.commit_turn("an answer")
+        await self.commit_turn("")  # a second, empty commit
+        self.interview._begin_exit()
+        await self.flush()
+        self.assertEqual(len(self.writer.saved), 1)
+
+    async def test_the_owner_sessions_fragments_pass_the_gates_stt_sanity(self) -> None:
+        # The role-play rows of b58c7d9c (19-28, 32-40): the same speech, as the SDK commits it.
+        turns = [
+            ["Hey Meera, how are you doing?"],
+            list(self.ANSWER),
+            ["Okay, so what brings you here like", "Do you want?",
+             "Like I wanted to know why you are looking at our programs and what the blocker is"],
+            ["Um yeah, so I I mean, we as an interview kickstart, have a professionals program.",
+             "You know, you will land on something where you wanted in your career,",
+             "We really kill it and we have a good conversion rate as well.", "Good",
+             "They don't, we don't give it for free. I mean, usually that's how the world is."],
+            ["Of course, that's why we are well known for like.",
+             "So when it comes to layoffs, people will be panicking, they don't know what to do."],
+            ["Okay"],
+            ["Like fall behind, can you please elaborate it?"],
+            ["Yeah, we have our own portal, so when you miss the live classes, you can always "
+             "request a recorded clip of that session."],
+            ["Um, actually you, uh, how do you get to know that 9000 USD is the program value?"],
+            ["Um, yeah, I mean we can", "So 9000, okay, so you want the deal to be in 7000 "
+             "and it also includes live classes."],
+            ["So you're saying you need $7000. Okay, let's make it $8500 and I will talk to my manager."],
+            ["When it comes to the course it depends on which program you pick up."],
+        ]
+        self.enter_roleplay()
+        finals = 0
+        for fragments in turns:
+            for fragment in fragments:
+                self.final_transcript(fragment)
+                finals += 1
+            await self.commit_turn(" ".join(fragments))
+        await self.flush()
+        rows = [r for r in self.candidate_rows() if r["phase"] == "roleplay"]
+        self.assertEqual(len(rows), len(turns))  # one row per committed turn
+        short = [r for r in rows if len(r["text"].split()) <= 2]
+        self.assertEqual([r["text"] for r in short], ["Okay"])  # only the genuine one-word turn
+        self.assertLess(len(short) / len(rows), 0.1)  # R1_GATE_LIMITS.STT_SUSPECT_SHARE_FAIL_AT
+        # Row per final it would have been 5 short rows of 25 (20%): the gate would have failed.
+        per_final_short = sum(
+            1 for fragments in turns for f in fragments if len(f.split()) <= 2
+        )
+        self.assertGreaterEqual(per_final_short / finals, 0.1)
 
 
 class TestIcebreakerNote(unittest.TestCase):
@@ -3579,9 +4912,21 @@ class TestPhaseAttribute(R1TestCase):
         self.interview._enter(R1Phase.ROLEPLAY_EXIT)
         self.interview._enter(R1Phase.WRAPUP)
         await self.settle()
+        # The live-UI signals (R1-Q) ride in the same writes: ``leadname`` and ``awaiting`` with the
+        # transition, ``awaiting`` cleared and ``rpleft`` set with the role-play, ``rpleft`` cleared
+        # with the phase after it, and a plain ``phase`` for every phase that touches none of them.
         self.assertEqual(
             self.ctx.room.local_participant.attributes,
-            [{"phase": value} for value in ("transition", "roleplay", "roleplay_exit", "wrapup")],
+            [
+                {
+                    "phase": "transition",
+                    "leadname": self.interview.persona.lead_name,
+                    "awaiting": "ready",
+                },
+                {"phase": "roleplay", "awaiting": "", "rpleft": "840"},
+                {"phase": "roleplay_exit", "rpleft": ""},
+                {"phase": "wrapup"},
+            ],
         )
 
     async def test_mute_aside_and_reconnect_pauses_are_published(self) -> None:
@@ -3619,7 +4964,7 @@ class TestPhaseAttribute(R1TestCase):
         self.assertEqual(sent, [])
         gate.set()
         await self.until(lambda: len(sent) == 2)
-        self.assertEqual(sent, [{"phase": "transition"}, {"phase": "roleplay"}])
+        self.assertEqual([item["phase"] for item in sent], ["transition", "roleplay"])
 
     async def test_a_failing_write_is_logged_by_type_and_swallowed(self) -> None:
         async def broken(_attributes):
@@ -3697,6 +5042,706 @@ class TestPhaseAttribute(R1TestCase):
                 await self.asyncSetUp()
                 await self.interview._exit(outcome)
                 self.assertEqual(self.published(), ["ended"])
+
+
+READY_BYTES = b'{"v":1,"kind":"ready"}'
+
+
+def ready_packet(
+    *,
+    topic: str | None = "r1ready",
+    data: object = READY_BYTES,
+    participant: object = None,
+) -> SimpleNamespace:
+    """A ``DataPacket`` as the SDK delivers it: data, kind, the sending participant, topic.
+
+    ``participant`` is None for a message sent by a server SDK, which is the only kind the
+    "I'm ready" button produces (the API relays it).
+    """
+    return SimpleNamespace(data=data, kind=0, participant=participant, topic=topic)
+
+
+class TestLiveUiSignals(R1TestCase):
+    """``leadname``, ``awaiting`` and ``rpleft`` ride on the one ordered phase writer (R1-Q).
+
+    The contract is in ``.gsd/milestones/R1-Q/IMPLEMENTER-RULES.md``: keys are single plain
+    lowercase words, values are strings, an empty string deletes, and the page reads them only
+    from the agent participant.
+    """
+
+    def writes(self) -> list[dict]:
+        return list(self.ctx.room.local_participant.attributes)
+
+    async def until_writes(self, count: int) -> list[dict]:
+        await self.until(lambda: len(self.writes()) >= count)
+        return self.writes()
+
+    async def test_the_keys_and_values_are_the_contracts(self) -> None:
+        self.assertEqual(
+            (
+                r1_session.LEADNAME_ATTRIBUTE,
+                r1_session.AWAITING_ATTRIBUTE,
+                r1_session.RPLEFT_ATTRIBUTE,
+                r1_session.AWAITING_READY,
+            ),
+            ("leadname", "awaiting", "rpleft", "ready"),
+        )
+        for key in (
+            r1_session.PHASE_ATTRIBUTE,
+            r1_session.LEADNAME_ATTRIBUTE,
+            r1_session.AWAITING_ATTRIBUTE,
+            r1_session.RPLEFT_ATTRIBUTE,
+        ):
+            self.assertRegex(key, r"^[a-z]+$")  # the SDK camel-cases keys with separators (#332)
+        self.assertEqual(r1_session.RPLEFT_HEARTBEAT_SECONDS, 30.0)
+        self.assertEqual(r1_session.RPLEFT_MAX_SECONDS, 3600)
+        self.assertEqual(r1_session.LEADNAME_MAX_CHARS, 40)
+
+    async def test_the_transition_write_carries_the_learner_name_and_awaiting_in_one_call(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        writes = await self.until_writes(1)
+        self.assertEqual(
+            writes,
+            [
+                {
+                    "phase": "transition",
+                    "leadname": self.interview.persona.lead_name,
+                    "awaiting": "ready",
+                }
+            ],
+        )
+        # Every value is a string, and the name is the one the interviewer says aloud.
+        self.assertTrue(all(isinstance(value, str) for value in writes[0].values()))
+        self.assertIn(writes[0]["leadname"], self.spoken_line("L-TRANSITION"))
+
+    async def test_awaiting_is_cleared_once_when_the_transition_is_left_and_leadname_is_kept(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.interview._enter(R1Phase.ROLEPLAY_EXIT)
+        self.interview._enter(R1Phase.WRAPUP)
+        writes = await self.until_writes(4)
+        self.assertEqual(writes[1]["awaiting"], "")
+        for later in writes[2:]:
+            self.assertNotIn("awaiting", later)
+        # `leadname` is written once with the transition and never deleted ("kept afterwards").
+        self.assertEqual(sum("leadname" in write for write in writes), 1)
+        for write in writes:
+            self.assertNotEqual(write.get("leadname"), "")
+
+    async def test_no_awaiting_or_leadname_before_the_transition(self) -> None:
+        self.interview._publish_phase("icebreaker")  # the fixture is in the icebreaker
+        writes = await self.until_writes(1)
+        self.assertEqual(writes, [{"phase": "icebreaker"}])
+
+    async def test_rpleft_goes_with_every_roleplay_phase_write_and_is_the_machines_budget(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.clock.advance(100)  # R = S = 100 s into the role-play
+        self.ctx.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
+        self.clock.advance(50)  # the aside pauses R; S keeps running
+        self.ctx.room.emit("track_unmuted", FakeParticipant("candidate"), FakePublication())
+        writes = await self.until_writes(4)
+        self.assertEqual([write["phase"] for write in writes], ["transition", "roleplay", "aside", "roleplay"])
+        self.assertEqual(writes[1]["rpleft"], "840")
+        self.assertEqual(writes[2]["rpleft"], "740")
+        # The paused clock: the budget has not moved while the aside lasted.
+        self.assertEqual(writes[3]["rpleft"], "740")
+        self.assertNotIn("rpleft", writes[0])
+
+    async def test_rpleft_is_the_shorter_of_the_role_play_and_the_session_cap(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.clock.advance(1100)  # S = 1100 s: only 100 s of the 20:00 session cap are left
+        self.interview._enter(R1Phase.ROLEPLAY)
+        writes = await self.until_writes(2)
+        self.assertEqual(writes[1]["rpleft"], "100")
+        self.assertEqual(
+            writes[1]["rpleft"], str(int(self.interview.machine.remaining_roleplay_seconds()))
+        )
+
+    async def test_rpleft_is_an_integer_string_clamped_to_zero_and_3600(self) -> None:
+        for budget, expected in ((99999.0, "3600"), (-5.0, "0"), (0.4, "0"), (839.9, "839"),
+                                 (float("nan"), "0"), (float("inf"), "0")):
+            with self.subTest(budget=budget):
+                with mock.patch.object(
+                    self.interview.machine, "remaining_roleplay_seconds", return_value=budget
+                ):
+                    self.assertEqual(self.interview._rpleft_value(), expected)
+
+    async def test_a_pause_inside_the_roleplay_keeps_rpleft_and_the_rejoin_refreshes_it(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.clock.advance(30)
+        self.interview._begin_disconnect()
+        self.clock.advance(20)  # R is paused by the disconnect, S is not
+        self.interview._rejoin()
+        writes = await self.until_writes(4)
+        self.assertEqual(
+            [(write["phase"], write.get("rpleft")) for write in writes[1:]],
+            [("roleplay", "840"), ("paused_disconnected", "810"), ("roleplay", "810")],
+        )
+
+    async def test_a_disconnect_before_the_roleplay_publishes_no_rpleft(self) -> None:
+        self.interview._begin_disconnect()
+        self.interview._rejoin()
+        writes = await self.until_writes(2)
+        self.assertEqual(writes, [{"phase": "paused_disconnected"}, {"phase": "icebreaker"}])
+
+    async def test_a_disconnect_in_the_transition_withdraws_awaiting_and_the_rejoin_asks_again(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._begin_disconnect()
+        self.interview._rejoin()
+        writes = await self.until_writes(3)
+        self.assertEqual(
+            writes,
+            [
+                {
+                    "phase": "transition",
+                    "leadname": self.interview.persona.lead_name,
+                    "awaiting": "ready",
+                },
+                {"phase": "paused_disconnected", "awaiting": ""},
+                {
+                    "phase": "transition",
+                    "leadname": self.interview.persona.lead_name,
+                    "awaiting": "ready",
+                },
+            ],
+        )
+
+    async def test_once_the_button_was_pressed_a_rejoin_does_not_ask_again(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.ctx.room.emit("data_received", ready_packet())
+        self.interview._begin_disconnect()
+        self.interview._rejoin()
+        writes = await self.until_writes(3)
+        self.assertEqual(writes[1], {"phase": "paused_disconnected", "awaiting": ""})
+        self.assertEqual(
+            writes[2], {"phase": "transition", "leadname": self.interview.persona.lead_name}
+        )
+
+    async def test_rpleft_is_cleared_once_by_the_first_phase_after_the_roleplay(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.interview._end_roleplay()
+        self.interview._enter(R1Phase.WRAPUP)
+        writes = await self.until_writes(4)
+        self.assertEqual(
+            [(write["phase"], write.get("rpleft")) for write in writes],
+            [("transition", None), ("roleplay", "840"), ("roleplay_exit", ""), ("wrapup", None)],
+        )
+
+    async def test_a_technical_stop_in_the_roleplay_clears_the_signals_with_aborted(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        await self.interview._finish("provider_error", system=True)
+        self.assertEqual(
+            self.writes()[-2:],
+            [{"phase": "aborted", "rpleft": ""}, {"phase": "ended"}],
+        )
+
+    async def test_a_name_the_page_would_refuse_is_not_published(self) -> None:
+        with mock.patch.object(R1Interview, "_lead_name", return_value=""):
+            self.interview._enter(R1Phase.TRANSITION)
+            writes = await self.until_writes(1)
+        self.assertEqual(writes, [{"phase": "transition", "awaiting": "ready"}])
+
+    async def test_a_persona_that_cannot_be_read_costs_only_the_name(self) -> None:
+        with mock.patch.object(
+            R1Interview, "persona", new_callable=mock.PropertyMock, side_effect=RuntimeError(POISON_TEXT)
+        ):
+            with self.capture_logs() as logs:
+                self.interview._enter(R1Phase.TRANSITION)
+                writes = await self.until_writes(1)
+        self.assertEqual(writes, [{"phase": "transition", "awaiting": "ready"}])
+        self.assertEqual(error_types(logs), ["r1_leadname_unavailable"])
+        self.assertNotIn(POISON_TEXT, json.dumps(logs))
+
+
+class TestLeadDisplayName(unittest.TestCase):
+    """The name goes to a page that refuses anything outside letters, spaces, ' and -."""
+
+    def test_the_contracts_names_are_accepted_as_they_are(self) -> None:
+        for name in ("Meera Iyer", "Mary-Ann O'Neil", "Li", "Åsa Öberg", "A" * 40):
+            with self.subTest(name=name):
+                self.assertEqual(r1_session.lead_display_name(name), name)
+
+    def test_whitespace_is_normalised(self) -> None:
+        self.assertEqual(r1_session.lead_display_name("  Meera \t Iyer\n"), "Meera Iyer")
+
+    def test_everything_else_is_not_published(self) -> None:
+        for name in (
+            "", "   ", None, 7, "A" * 41, "-Meera", "'Meera", "Meera1", "Meera_Iyer",
+            "Meera <b>", "Meera, Iyer", "Meera.Iyer", "Meera​Iyer", "Meera (Edison)",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(r1_session.lead_display_name(name), "")
+
+    def test_every_persona_in_the_pool_is_publishable(self) -> None:
+        from r1_personas import PERSONAS
+
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                with self.subTest(variant=variant.id):
+                    self.assertEqual(r1_session.lead_display_name(variant.full_name), variant.full_name)
+
+
+class TestRpleftHeartbeat(R1TestCase):
+    """``rpleft`` is refreshed every 30 s while the role-play phase itself is running."""
+
+    def writes(self) -> list[dict]:
+        return list(self.ctx.room.local_participant.attributes)
+
+    def heartbeats(self) -> list[dict]:
+        return [write for write in self.writes() if set(write) == {"rpleft"}]
+
+    async def test_it_publishes_only_rpleft_through_the_phase_writer_while_the_roleplay_runs(self) -> None:
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.01):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+            await self.until(lambda: len(self.heartbeats()) >= 2)
+            first = int(self.heartbeats()[0]["rpleft"])
+            self.clock.advance(60)
+            await self.until(lambda: int(self.heartbeats()[-1]["rpleft"]) < first)
+        self.assertLessEqual(int(self.heartbeats()[-1]["rpleft"]), first - 60)
+        for beat in self.heartbeats():
+            self.assertEqual(set(beat), {"rpleft"})
+            self.assertTrue(beat["rpleft"].isdigit())
+            self.assertLessEqual(int(beat["rpleft"]), 3600)
+
+    async def test_the_default_interval_is_thirty_seconds_and_nothing_is_sent_before_it(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        await self.settle()
+        self.assertEqual(self.heartbeats(), [])
+        self.assertIsNotNone(self.interview._rpleft_heartbeat)
+        self.assertFalse(self.interview._rpleft_heartbeat.done())
+
+    async def test_it_is_silent_during_an_aside_and_resumes_after_it(self) -> None:
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.01):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+            await self.until(lambda: len(self.heartbeats()) >= 1)
+            self.ctx.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
+            await self.settle()
+            frozen = len(self.writes())
+            await asyncio.sleep(0.1)
+            self.assertEqual(len(self.writes()), frozen)  # the aside is a phase of its own
+            self.ctx.room.emit("track_unmuted", FakeParticipant("candidate"), FakePublication())
+            await self.until(lambda: len(self.writes()) > frozen + 1)
+
+    async def test_it_stops_when_the_roleplay_is_over_and_nothing_follows_the_clearing_write(self) -> None:
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.01):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+            await self.until(lambda: len(self.heartbeats()) >= 1)
+            self.interview._end_roleplay()
+            self.interview._enter(R1Phase.WRAPUP)
+            await self.settle()
+            task = self.interview._rpleft_heartbeat
+            self.assertIsNone(task)
+            sent = len(self.writes())
+            await asyncio.sleep(0.1)
+        self.assertEqual(len(self.writes()), sent)
+        self.assertEqual(self.writes()[-1], {"phase": "wrapup"})
+        cleared = [write for write in self.writes() if write.get("rpleft") == ""]
+        self.assertEqual(cleared, [{"phase": "roleplay_exit", "rpleft": ""}])
+
+    async def test_it_does_not_run_before_the_roleplay_or_after_the_end(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.assertIsNone(self.interview._rpleft_heartbeat)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.assertIsNotNone(self.interview._rpleft_heartbeat)
+        task = self.interview._rpleft_heartbeat
+        await self.interview._announce_ended()
+        await self.settle()
+        self.assertTrue(task.cancelled() or task.done())
+        self.assertIsNone(self.interview._rpleft_heartbeat)
+
+    async def test_a_reconnect_pause_keeps_the_heartbeat_and_a_pause_before_the_roleplay_never_starts_it(self) -> None:
+        self.interview._begin_disconnect()
+        self.assertIsNone(self.interview._rpleft_heartbeat)
+        self.interview._rejoin()
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        task = self.interview._rpleft_heartbeat
+        self.interview._begin_disconnect()
+        self.assertIs(self.interview._rpleft_heartbeat, task)
+        self.interview._rejoin()
+        self.assertIs(self.interview._rpleft_heartbeat, task)
+        self.assertFalse(task.done())
+
+    async def test_a_stuck_writer_is_not_flooded_by_heartbeats(self) -> None:
+        gate = asyncio.Event()
+        sent: list[dict] = []
+
+        async def stuck(attributes):
+            await gate.wait()
+            sent.append(dict(attributes))
+
+        self.ctx.room.local_participant.set_attributes = stuck
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.001):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+            await asyncio.sleep(0.2)  # hundreds of ticks while the first write is stuck
+            queued = list(self.interview._phase_queue)
+        # The roleplay phase write is still queued, followed by at most ONE pending heartbeat.
+        self.assertEqual(queued[0]["phase"], "roleplay")
+        self.assertLessEqual(len(queued), 2)
+        gate.set()
+        await self.until(lambda: len(sent) >= 2)
+        self.assertEqual([item.get("phase") for item in sent[:2]], ["transition", "roleplay"])
+
+    async def test_writes_are_never_concurrent(self) -> None:
+        in_flight = {"now": 0, "max": 0}
+        sent: list[dict] = []
+
+        async def tracked(attributes):
+            in_flight["now"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["now"])
+            await asyncio.sleep(0.002)
+            sent.append(dict(attributes))
+            in_flight["now"] -= 1
+
+        self.ctx.room.local_participant.set_attributes = tracked
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.001):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+            await self.until(lambda: len(sent) >= 6)
+            self.interview._end_roleplay()
+        await self.settle()
+        self.assertEqual(in_flight["max"], 1)
+
+    async def test_a_failing_heartbeat_write_is_swallowed_and_does_not_stop_the_next(self) -> None:
+        calls = {"n": 0}
+        sent: list[dict] = []
+
+        async def flaky(attributes):
+            calls["n"] += 1
+            if "rpleft" in attributes and "phase" not in attributes and calls["n"] == 3:
+                raise RuntimeError(POISON_TEXT)
+            sent.append(dict(attributes))
+
+        self.ctx.room.local_participant.set_attributes = flaky
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.01):
+            with self.capture_logs() as logs:
+                self.interview._enter(R1Phase.TRANSITION)
+                self.interview._enter(R1Phase.ROLEPLAY)
+                await self.until(lambda: calls["n"] >= 5)
+        self.assertIn("r1_phase_publish_failed", error_types(logs))
+        self.assertNotIn(POISON_TEXT, json.dumps(logs))
+        self.assertGreaterEqual(len([item for item in sent if set(item) == {"rpleft"}]), 1)
+
+
+class TestReadyButton(R1TestCase):
+    """The page's "I'm ready" button reaches the worker as a server-sent ``r1ready`` message."""
+
+    async def start_transition(self) -> asyncio.Task:
+        """Enter the transition and start its driver, as ``run`` does after the briefing."""
+        self.interview._enter(R1Phase.TRANSITION)
+        task = asyncio.create_task(self.interview._run_transition())
+        await self.settle()
+        return task
+
+    def press(self, **over) -> None:
+        self.ctx.room.emit("data_received", ready_packet(**over))
+
+    def rejected(self, logs: list[dict]) -> list[str]:
+        return [
+            line_.get("error_category", "")
+            for line_ in logs
+            if line_.get("error_type") == "r1_ready_rejected"
+        ]
+
+    async def test_the_topic_and_payload_are_the_contracts(self) -> None:
+        self.assertEqual(r1_session.READY_TOPIC, "r1ready")
+        self.assertRegex(r1_session.READY_TOPIC, r"^[a-z0-9]+$")
+        self.assertEqual(
+            (r1_session.READY_PAYLOAD_VERSION, r1_session.READY_PAYLOAD_KIND), (1, "ready")
+        )
+        self.assertIn("data_received", self.ctx.room.handlers)  # wired by wire_events
+
+    async def test_the_topic_and_payload_are_the_ones_the_api_relays(self) -> None:
+        api = HERE.parent / "api" / "src" / "routes" / "r1-candidate.ts"
+        if not api.exists():
+            self.skipTest("the API is not part of this checkout")
+        source = api.read_text(encoding="utf-8")
+        topic = re.search(r"R1_READY_TOPIC = '([^']+)'", source)
+        payload = re.search(r"R1_READY_PAYLOAD = \{ v: (\d+), kind: '([^']+)' \}", source)
+        self.assertIsNotNone(topic)
+        self.assertIsNotNone(payload)
+        self.assertEqual(topic.group(1), r1_session.READY_TOPIC)
+        self.assertEqual(
+            (int(payload.group(1)), payload.group(2)),
+            (r1_session.READY_PAYLOAD_VERSION, r1_session.READY_PAYLOAD_KIND),
+        )
+        # The API sends JSON.stringify of that object; the worker accepts exactly those bytes.
+        self.assertTrue(
+            r1_session.ready_payload_ok(
+                json.dumps(
+                    {"v": int(payload.group(1)), "kind": payload.group(2)}, separators=(",", ":")
+                ).encode("utf-8")
+            )
+        )
+
+    async def test_a_press_while_waiting_picks_up_at_once_without_a_nudge(self) -> None:
+        task = await self.start_transition()
+        self.assertFalse(task.done())
+        self.press()
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+        self.assertNotIn(self.spoken_line("L-TRANSITION-NUDGE"), self.session.spoken)
+
+    async def test_a_press_while_the_briefing_is_still_playing_is_not_lost(self) -> None:
+        # The driver has not started waiting yet: `_run_transition` forgets the turns queued
+        # before it begins, and a queued "ready" would go with them.  The press is latched.
+        self.interview._enter(R1Phase.TRANSITION)
+        self.press()
+        self.interview.note_turn("a stray answer from the briefing")
+        self.assertIsNone(await asyncio.wait_for(self.interview._run_transition(), 10.0))
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+
+    async def test_a_press_during_the_nudge_ends_the_wait_right_after_it(self) -> None:
+        task = await self.start_transition()
+        self.final_transcript("what do I do?")
+        await self.until(lambda: self.session.spoken.count(self.spoken_line("L-TRANSITION-NUDGE")) == 1)
+        self.press()
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-TRANSITION-NUDGE")), 1)
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-PICKUP")), 1)
+
+    async def test_a_press_is_not_a_transcript_row_or_a_turn(self) -> None:
+        task = await self.start_transition()
+        self.press()
+        await asyncio.wait_for(task, 10.0)
+        await self.flush()
+        self.assertEqual([row for row in self.writer.saved if row["speaker"] == "candidate"], [])
+        self.assertTrue(self.interview._turns.empty())
+
+    async def test_the_spoken_ready_still_works_and_is_not_a_button_press(self) -> None:
+        task = await self.start_transition()
+        self.final_transcript("ok, ready")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+
+    async def test_a_message_that_names_a_sender_is_never_the_button(self) -> None:
+        # Server-sent data has no participant.  A candidate's token cannot publish data at all;
+        # if a grant ever changed, a participant's message must still not move the interview.
+        await self.start_transition()
+        with self.capture_logs() as logs:
+            self.press(participant=FakeParticipant("candidate"))
+            self.press(participant=FakeParticipant("someone-else", kind=SIP))
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.rejected(logs), ["sender", "sender"])
+        self.assertTrue(self.interview._awaiting_ready)
+
+    async def test_only_the_exact_payload_is_the_button(self) -> None:
+        await self.start_transition()
+        bad = [
+            b"",
+            b"ready",
+            b"not json",
+            b"\xff\xfe",
+            b'["ready"]',
+            b'"ready"',
+            b"null",
+            b'{"v":1}',
+            b'{"kind":"ready"}',
+            b'{"v":2,"kind":"ready"}',
+            b'{"v":"1","kind":"ready"}',
+            b'{"v":true,"kind":"ready"}',
+            b'{"v":1.0,"kind":"ready"}',
+            b'{"v":1,"kind":"READY"}',
+            b'{"v":1,"kind":"go"}',
+            b'{"v":1,"kind":"ready","extra":1}',
+            b'{"v":1,"kind":"ready","phase":"roleplay"}',
+            b'{"v":1,"kind":"ready"}' + b" " * 200,
+            None,
+            "not bytes",
+            12,
+        ]
+        with self.capture_logs() as logs:
+            for data in bad:
+                self.press(data=data)
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.rejected(logs), ["payload"] * len(bad))
+        for variant in (bytearray(READY_BYTES), memoryview(READY_BYTES), b' {"v": 1, "kind": "ready"} '):
+            with self.subTest(variant=type(variant).__name__):
+                self.assertTrue(r1_session.ready_payload_ok(variant))
+
+    async def test_another_topic_is_never_the_button_and_leaves_one_line_while_awaited(self) -> None:
+        # Another topic is none of our business.  While the button is awaited, the FIRST message of
+        # another topic is logged once (a closed label for the topic, nothing of the payload): the
+        # relay has only run against fakes, and a topic the real SFU changed would otherwise be
+        # invisible.
+        await self.start_transition()
+        topics = (None, "", "lk.chat", "R1READY", "r1ready ", "r1.ready", "ready")
+        with self.capture_logs() as logs:
+            for topic in topics:
+                self.press(topic=topic)
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(error_types(logs), ["r1_data_ignored"])
+        self.assertEqual(logs[0]["error_category"], "topic")
+        self.assertEqual(logs[0]["schema"], "none")  # the first one had no topic at all
+        self.assertEqual(logs[0]["phase"], "transition")
+        self.assertNotIn("data", logs[0])
+        self.assertTrue(self.interview._awaiting_ready)  # and the real button still works
+        self.press()
+        self.assertTrue(self.interview._ready_latched)
+
+    def test_the_topic_label_is_a_closed_vocabulary_never_the_topic(self) -> None:
+        label = r1_session.topic_label
+        for topic, expected in (
+            (None, "none"), ("", "none"), (12, "none"), (b"r1ready", "none"),
+            ("R1READY", "spelling"), ("r1.ready", "spelling"), ("r1ready ", "spelling"),
+            ("R1_Ready", "spelling"),
+            ("lk.chat", "livekit"), ("lk.transcription", "livekit"),
+            ("ready", "other"), ("r1ready2", "other"), ("candidate.secret.name", "other"),
+        ):
+            with self.subTest(topic=topic):
+                self.assertEqual(label(topic), expected)
+        self.assertEqual(label("r1ready"), "spelling")  # only logged when it was rejected anyway
+
+    async def test_a_misspelt_topic_is_labelled_so_a_mismatch_on_the_sfu_can_be_diagnosed(
+        self,
+    ) -> None:
+        await self.start_transition()
+        with self.capture_logs() as logs:
+            self.press(topic="R1Ready")
+        self.assertEqual(logs[0]["schema"], "spelling")
+        self.assertNotIn("R1Ready", json.dumps(logs))
+
+    async def test_another_topic_is_silent_when_the_button_is_not_awaited(self) -> None:
+        with self.capture_logs() as logs:  # the icebreaker: nobody asked for a press
+            self.press(topic="lk.chat")
+            self.press(topic=None)
+        self.assertEqual(logs, [])
+
+    async def test_it_is_accepted_only_in_the_transition(self) -> None:
+        def roleplay() -> None:
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+
+        def aside() -> None:
+            roleplay()
+            self.interview._enter(R1Phase.ASIDE)
+
+        def roleplay_exit() -> None:
+            roleplay()
+            self.interview._end_roleplay()
+
+        def wrapup() -> None:
+            roleplay_exit()
+            self.interview._enter(R1Phase.WRAPUP)
+
+        for name, reach in (
+            ("icebreaker", lambda: None),
+            ("roleplay", roleplay),
+            ("aside", aside),
+            ("roleplay_exit", roleplay_exit),
+            ("wrapup", wrapup),
+        ):
+            with self.subTest(phase=name):
+                await self.asyncSetUp()
+                reach()
+                self.assertEqual(self.interview.machine.phase.value, name)
+                with self.capture_logs() as logs:
+                    self.press()
+                self.assertFalse(self.interview._ready_latched)
+                self.assertEqual(self.rejected(logs), ["not_awaiting"])
+
+    async def test_it_is_not_accepted_before_the_worker_asked(self) -> None:
+        # The fixture is in the icebreaker: the page was never told `awaiting=ready`.
+        with self.capture_logs() as logs:
+            self.press()
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.rejected(logs), ["not_awaiting"])
+
+    async def test_it_is_not_accepted_while_the_candidate_is_disconnected(self) -> None:
+        await self.start_transition()
+        self.interview._begin_disconnect()
+        with self.capture_logs() as logs:
+            self.press()
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.rejected(logs), ["not_awaiting"])
+        self.interview._rejoin()
+        self.press()  # asked again at the rejoin: now it counts
+        self.assertTrue(self.interview._ready_latched)
+
+    async def test_a_press_after_the_wait_is_over_is_ignored(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        with mock.patch.object(r1_session, "TRANSITION_DEADLINE_SECONDS", 0.02):
+            await asyncio.wait_for(self.interview._run_transition(), 10.0)
+        # The learner is picking up; the phase has not moved on yet, but nothing is awaited.
+        self.assertIs(self.interview.machine.phase, R1Phase.TRANSITION)
+        with self.capture_logs() as logs:
+            self.press()
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.rejected(logs), ["not_awaiting"])
+
+    async def test_a_second_press_changes_nothing(self) -> None:
+        task = await self.start_transition()
+        with self.capture_logs() as logs:
+            self.press()
+            self.press()
+        await asyncio.wait_for(task, 10.0)
+        self.assertEqual(self.rejected(logs), ["not_awaiting"])
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-PICKUP")), 1)
+
+    async def test_nothing_is_accepted_once_the_exit_has_begun(self) -> None:
+        await self.start_transition()
+        self.interview._begin_exit()
+        with self.capture_logs() as logs:
+            self.press()
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(logs, [])
+
+    async def test_the_press_is_logged_by_label_only(self) -> None:
+        await self.start_transition()
+        with self.capture_logs() as logs:
+            self.press()
+        self.assertEqual(error_types(logs), ["r1_ready_button"])
+        self.assertNotIn(self.interview.persona.lead_name, json.dumps(logs))
+
+    async def test_a_stop_during_the_wait_still_wins(self) -> None:
+        task = await self.start_transition()
+        self.interview._on_residency_deadline()
+        self.assertEqual(await asyncio.wait_for(task, 10.0), "residency_timeout")
+        self.assertNotIn(self.spoken_line("L-PICKUP"), self.session.spoken)
+
+    async def test_await_turn_returns_pressed_when_the_condition_holds(self) -> None:
+        flag = {"on": False}
+        task = asyncio.create_task(
+            self.interview._await_turn(30.0, until=lambda: flag["on"])
+        )
+        await self.settle()
+        self.assertFalse(task.done())
+        flag["on"] = True
+        self.interview._wake()
+        self.assertEqual(await asyncio.wait_for(task, 10.0), (r1_session.PRESSED, None))
+
+    async def test_a_whole_interview_takes_a_press_made_while_the_briefing_plays(self) -> None:
+        # Through ``run``: the press arrives while L-TRANSITION is still being spoken, before
+        # the driver has started waiting for "ready" (and so before it forgets queued turns).
+        run = await self.start_interview()
+        run.session.playout_seconds = 0.2  # the briefing takes a moment to play
+        run.clock.advance(271)
+        run.interview._wake()
+        await self.until(lambda: run.interview.machine.phase is R1Phase.TRANSITION)
+        self.assertFalse(self.spoken_and_played("L-TRANSITION"))
+        run.context.room.emit("data_received", ready_packet())
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ROLEPLAY)
+        self.assertEqual(run.session.spoken.count(self.spoken_line("L-PICKUP")), 1)
+        self.assertNotIn(self.spoken_line("L-TRANSITION-NUDGE"), run.session.spoken)
+        await self.until(lambda: len(run.context.room.local_participant.attributes) >= 2)
+        writes = run.context.room.local_participant.attributes
+        self.assertEqual(
+            [write["phase"] for write in writes if write["phase"] in ("transition", "roleplay")],
+            ["transition", "roleplay"],
+        )
+        self.assertEqual(writes[-1]["awaiting"], "")
+        self.assertTrue(writes[-1]["rpleft"].isdigit())
+        await self.drain_cancel(run)
 
 
 POISON_TEXT = "Quokka-utterance-4417"

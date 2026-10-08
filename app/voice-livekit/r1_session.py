@@ -54,18 +54,65 @@ Three more facts shape the driver:
   apostrophes removed), never on the raw transcript, so "No, thank you." is a refusal.
 * An ending that falls after the role-play (the candidate leaves, or the clock runs out, in
   the exit line or the wrap-up) is ``complete``: the session is completed, scored and counted.
+
+PR-4c (plan 5.15) adds speed and measurement, never a decision.  ``tts_node_stream`` flushes
+the first speakable fragment of a reply early (``r1_tts``); ``r1_latency`` stamps each turn and
+this module logs the stages as ``r1_latency`` lines; ``r1_linecache`` keeps the audio of
+scripted lines behind ``say`` and counts Sarvam 429s by lane; the session is built with R1's
+turn handling.  None of them can change what is said, a phase, a grade or a guard verdict:
+a stage that fails to measure is skipped, and a line that is not cached is spoken live.
+
+R1-Q (turn taking) changes how the candidate's speech becomes TURNS, in three places:
+
+* One transcript row per committed turn.  Sarvam closes an utterance at each of its own pauses
+  and the SDK merges those finals into one turn, so a long answer used to be 5-6 rows (the
+  gate's ``stt_sanity`` counts rows of two words or fewer).  The finals now collect in one open
+  row (``_CandidateRow``; its index is reserved at the FIRST final, so ordering against the
+  bot's rows is unchanged) that is written when the turn commits (``prepare_turn``), when a bot
+  speech claims its row, when the phase changes, and when the session exits.
+* The icebreaker's exit is decided at a committed turn.  ``candidate_turns`` counts committed
+  answers of three words that are not backchannel (not STT finals, and not "Sorry Thank you."),
+  the driver no longer leaves the icebreaker on a raw final, and the hard S=4:30 cap and the
+  boundary turn both wait (bounded) for a turn in flight instead of starting the uninterruptible
+  transition line over a candidate who is mid-answer.
+* A reply the SDK cancelled before any audio is logged (``r1_reply_cancelled_before_audio``,
+  a running count), and when the icebreaker's exit is due it is not left as silence: the
+  boundary line answers the turn that lost its reply.  min_words cannot stop two short fragments
+  from adding up to a committed turn that cuts the pending reply (the SDK keeps refused words),
+  so the next reply's thinking filler is counted from the candidate's real answer
+  (``_filler_delay``) and the lost reply counts toward the p95 (``LatencyTracker.reply_lost``).
+
+R1-Q (interviewer lines) changes what the scripted lines and the wrap-up say, in three places:
+
+* A first name that is empty or the API's placeholder "there" is unknown (``_first_name``): the
+  lines drop it ("Thank you. We'll now move ...") instead of speaking it, and a name the
+  candidate gives in the opening or the icebreaker ("my name is Cristo") is used from then on.
+* An acknowledgement ("Alright", "Okay, got it") is a refusal in the wrap-up (``is_no_questions``),
+  so the model is not asked to answer it with a goodbye of its own before ``L-CLOSE``.
+* The guard's feedback refusal ends the reply (``r1_guard``), and ``L-NO-FEEDBACK`` is one short
+  sentence that leaves the hiring team to ``L-CLOSE`` (a candidate hears it once, not twice).
+
+R1-Q (live-UI signals) tells the candidate's page three more things on the same attribute writer
+as ``phase`` (``LEADNAME_ATTRIBUTE``): the simulated learner's name (``leadname``, with
+``phase=transition``), that the interviewer is waiting for the "I'm ready" button (``awaiting``),
+and how much role-play budget is left (``rpleft``, with every role-play phase write and a 30 s
+heartbeat).  The button itself comes back as a server-sent ``r1ready`` data message that the API
+relays (``_on_data_received``): it is accepted only from the server, only in the transition and
+only while ``awaiting=ready``, and is latched so the driver treats it exactly like a spoken "ready".
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import inspect
+import json
 import math
 import os
 import re
 import time
 import unicodedata
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -73,6 +120,23 @@ from observability import StructuredLogger
 from r1_content import CONTENT_SHA256
 from r1_context import fetch_context
 from r1_guard import FALLBACK_REPLY, StreamGuard
+from r1_latency import (
+    GATE_PHASE,
+    LatencyTracker,
+    count_words,
+    endpoint_max_delay_sec,
+    interrupt_min_words,
+    r1_transition_endpointing,
+    r1_turn_handling,
+)
+from r1_linecache import (
+    LANE_R1,
+    RATE_LIMITS,
+    LineCache,
+    LineSpec,
+    RateLimitCounter,
+    build_line_cache,
+)
 from r1_persistence import R1TurnWriter
 from r1_phases import R1Phase, R1PhaseMachine
 from r1_replies import (
@@ -87,13 +151,21 @@ from r1_replies import (
 )
 from r1_prompts import ROLEPLAY_PHASE
 from r1_roleplay import RolePlayEngine, TurnMode, TurnPlan
-from r1_script import INTERVIEWER_NAME, line
+from r1_script import INTERVIEWER_NAME, is_candidate_free, known_first_name, line, spoken_first_name
+from r1_tts import flush_min_chars, flush_tts, r1_tts_kwargs
 
 R1_RECORD = False
 NO_SHOW_SECONDS = 120.0
 ACTIVATION_SECONDS = 15.0
 TURN_DEADLINE_SECONDS = 12.0
 FILLER_AFTER_SECONDS = 4.0
+# A reply the SDK cancelled before any audio, for a candidate who then only made a noise ("Sorry",
+# "Thank you."), leaves the candidate waiting from their real answer.  The next reply's filler is
+# counted from there, not from its own start, but never sooner than this after it starts (a reply
+# that is about to arrive should not be pre-empted by a filler).  See ``_filler_delay``.
+FILLER_RESTART_MIN_SECONDS = 0.5
+# An unvoiced wait older than this is not the candidate's current wait any more.
+FILLER_ANCHOR_MAX_SECONDS = 20.0
 TRANSITION_DEADLINE_SECONDS = 20.0
 SAY_PLAYOUT_SECONDS = 90.0
 # Teardown budget (plan section 7.4). livekit-agents 1.6.4 cancels a still-running
@@ -132,6 +204,27 @@ PHASE_ATTRIBUTE = "phase"
 # because ``_announce_ended`` cancels the writer first.
 PHASE_PUBLISH_SECONDS = 3.0
 _PHASE_QUEUE_MAX = 16
+# R1-Q live-UI signals.  Three more plain lowercase attributes ride on the same writer as ``phase``
+# (cross-PR contract in ``.gsd/milestones/R1-Q/IMPLEMENTER-RULES.md``; the page reads them only from
+# the agent participant).  Values are strings, and an empty string deletes the attribute:
+#   leadname  the simulated learner's display name, in the SAME write as ``phase=transition``, kept;
+#   awaiting  ``ready`` from ``phase=transition`` until the transition is left (the page's
+#             "I'm ready" button);
+#   rpleft    whole seconds of role-play budget left, with every phase write while the role-play is
+#             active or paused and on a heartbeat while it runs, ``""`` once it is over.
+LEADNAME_ATTRIBUTE = "leadname"
+AWAITING_ATTRIBUTE = "awaiting"
+AWAITING_READY = "ready"
+RPLEFT_ATTRIBUTE = "rpleft"
+RPLEFT_HEARTBEAT_SECONDS = 30.0
+RPLEFT_MAX_SECONDS = 3600
+LEADNAME_MAX_CHARS = 40
+# The "I'm ready" button reaches the worker as a SERVER-sent data message (the API relays it; the
+# candidate's token cannot publish data).  Topic and payload are pinned on both ends.
+READY_TOPIC = "r1ready"
+READY_PAYLOAD_VERSION = 1
+READY_PAYLOAD_KIND = "ready"
+READY_PAYLOAD_MAX_BYTES = 128
 # Outcomes that are OUR fault: the candidate's page must say so (``phase=aborted``) rather
 # than "Interview complete".
 _TECHNICAL_OUTCOMES = frozenset(
@@ -157,6 +250,17 @@ REPLY_SETTLE_SECONDS = 30.0
 # Candidate-silence windows (plan section 5.11; production values 30/20 in fly.toml).
 ICEBREAKER_PROMPT_SECONDS = 30.0
 ICEBREAKER_END_SECONDS = 20.0
+# The soft exit (four turns, S >= 3:30) counts a COMMITTED candidate turn only when it is an
+# answer: at least this many words that are not backchannel (``_BACKCHANNEL_WORDS``).  The SDK's
+# own floor (``R1_INTERRUPT_MIN_WORDS``) cannot tell an answer from noise: it banks "Sorry" and
+# commits it together with the next "Thank you." (three words), and "Hey, are you there?" is four
+# words.  None of those is an answer, so they are counted by what is left once the noise is out.
+ICEBREAKER_ANSWER_MIN_WORDS = 3
+# The hard S=4:30 cap never starts the (uninterruptible) transition line over a candidate who is
+# mid-answer: it waits for the turn in flight to commit, for the SDK's endpointing maximum plus
+# this margin after the last sign of speech, and never longer than the ceiling.
+ICEBREAKER_HOLD_MARGIN_SECONDS = 1.0
+ICEBREAKER_HOLD_CEILING_SECONDS = 30.0
 ROLEPLAY_PROMPT_SECONDS = 20.0
 ROLEPLAY_FIRST_STEP_SECONDS = 20.0
 ROLEPLAY_ASIDE_STEP_SECONDS = 15.0
@@ -165,6 +269,13 @@ WRAPUP_SILENCE_SECONDS = 20.0
 # I hear back?"), and the driver reads them one at a time.  A refusal is therefore only
 # believed after this much candidate silence, counted from the final that carried it.
 WRAPUP_SETTLE_SECONDS = 1.5
+# ... but "Okay." and "Thank you." are also what a candidate says BEFORE a question ("Okay, so
+# ... what are the next steps?"), so a refusal that is only an acknowledgement waits twice as
+# long (3 s), and one that stops on a lead-in word ("Okay, so") two and a half times (3.75 s).
+# An explicit "no questions" / "that's all" keeps the short window: nothing is left to wait for.
+# They are multiples of ``WRAPUP_SETTLE_SECONDS`` so one number tunes (or, in a test, shrinks) all.
+WRAPUP_SETTLE_ACK_FACTOR = 2.0
+WRAPUP_SETTLE_LEAD_IN_FACTOR = 2.5
 WRAPUP_QUESTION_LIMIT = 2
 # Plan 5.1: role-play may end early once R >= 10:00 and the commitment is resolved.  The
 # phase machine only knows the hard caps, so the session applies the early rule itself.
@@ -247,12 +358,21 @@ _NO_QUESTIONS_RE = re.compile(
     r"i'?m (?:good|all set|fine|okay|ok|alright)|i am (?:good|all set|fine|okay|ok|alright)|"
     r"all (?:good|set)|"
     r"thank you|thanks?|"
+    # An acknowledgement ("Alright.", "Okay, got it.") is what a candidate with nothing to ask
+    # says, to L-WRAP and to the answer that follows it.  Treating it as a question made the
+    # interviewer reply to it (with a goodbye of its own) before the scripted close.
+    r"alright|all right|okay|ok|got it|sounds good|understood|perfect|cool|noted|great|"
     r"no"
     r")\b"
 )
-# Gratitude refuses only when nothing affirms: "Thank you." closes the wrap-up, but "Yes, thank
-# you." may open a question, and that is the interviewer's to answer.
-_GRATITUDE_RE = re.compile(r"\b(?:thank you|thanks?)\b")
+# Gratitude and acknowledgement refuse only when nothing affirms: "Thank you." and "Alright." close
+# the wrap-up, but "Yes, thank you." or "Yeah, okay." may open a question, and that is the
+# interviewer's to answer.  "I'm okay" / "I am alright" are refusals in their own right (above), so
+# the lookbehinds keep the acknowledgement word of those phrases in place.
+_SOFT_CLOSE_RE = re.compile(
+    r"(?<!i'm )(?<!i am )\b(?:thank you|thanks?|alright|all right|okay|ok|got it|sounds good|"
+    r"understood|perfect|cool|noted|great)\b"
+)
 _AFFIRMATIONS = frozenset({"yes", "yeah", "yep", "yup", "sure"})
 # Courtesy and filler: the ONLY words allowed next to a refusal.  This is an allowlist on
 # purpose.  A list of question words can never be complete ("any feedback for me", "the
@@ -295,11 +415,60 @@ _LIVE_PHASES = frozenset(
     }
 )
 
+# The scripted lines worth warming, in the order an interview first needs them.  Only a line that
+# reaches ``session.say`` can play cached audio, so three kinds are absent on purpose: L-OPEN
+# (spoken at once, before anything could be warm), the lines that travel inside a reply stream
+# (L-FILLER*, L-TIME-CUE, the guard's L-NO-FEEDBACK swap) and L-FAQ-DEFER (no runtime caller).
+# Warming them would spend Sarvam requests, a budget shared with the phone lane, on audio nothing
+# can play (pr4c-rebase.md 4.1).
+_WARM_ORDER = (
+    "L-TRANSITION",
+    "L-TRANSITION-NUDGE",
+    "L-PICKUP",
+    "L-EXIT",
+    "L-WRAP",
+    "L-CLOSE",
+    "L-ASIDE-COACH",
+    "L-MUTE",
+    "L-SIL-IB",
+    "L-SIL-RP1",
+    "L-SIL-RP2",
+    "L-REJOIN",
+    "L-REJOIN-RP",
+    "L-SIL-END",
+    "L-SYSTEM-STOP",
+)
+# Line-cache events that mean something went wrong (logged as warnings).
+_LINE_CACHE_WARNINGS = frozenset(
+    {
+        "disk_corrupt",
+        "disk_write_failed",
+        "disk_full",
+        "synth_failed",
+        "rate_limited",
+        "gave_up",
+        "clip_rejected",
+        "warm_aborted",
+    }
+)
+# The SDK's per-turn timings (``MetricsReport``), logged beside R1's own stamps.
+_SDK_METRICS = (
+    ("transcription_delay", "sdk_transcription"),
+    ("end_of_turn_delay", "sdk_end_of_turn"),
+    ("on_user_turn_completed_delay", "sdk_turn_hook"),
+    ("llm_node_ttft", "sdk_llm_first_token"),
+    ("tts_node_ttfb", "sdk_tts_first_audio"),
+    ("playback_latency", "sdk_playback"),
+    ("e2e_latency", "sdk_e2e"),
+)
+
 # Results of ``R1Interview._await_turn``.
 TURN = "turn"
 SILENCE = "silence"
 STOP = "stop"
 DEADLINE = "deadline"
+# The caller's own ``until`` condition became true (the "I'm ready" button was pressed).
+PRESSED = "pressed"
 # Plan section 9 fence 10: R1 logs only through StructuredLogger. Its key allowlist and
 # secret scan drop anything else, and every call below names an exception TYPE (never
 # its message), so an utterance, a first name or a presigned URL cannot reach a log.
@@ -443,21 +612,210 @@ def is_no_questions(text: str) -> bool:
     rest = _NO_QUESTIONS_RE.sub(" ", folded)
     if not all(word in _COURTESY_WORDS for word in rest.split()):
         return False
-    if _NO_QUESTIONS_RE.search(_GRATITUDE_RE.sub(" ", folded)) is None:
-        # Only a thank-you refuses here ("Thank you.", "Okay, thank you."): not next to a "yes".
+    if _NO_QUESTIONS_RE.search(_SOFT_CLOSE_RE.sub(" ", folded)) is None:
+        # Only a thank-you or an acknowledgement refuses here ("Thank you.", "Okay, thank you.",
+        # "Alright."): not next to a "yes".
         return not any(word in _AFFIRMATIONS for word in folded.split())
     return True
+
+
+# The last word of a turn that is not over: "Okay, so ..." / "Thank you, and ..." is followed by
+# what the candidate came to say.  Only courtesy words can end a refusal (``_COURTESY_WORDS``), so
+# these are the courtesy words that lead into something.
+_LEAD_IN_WORDS = frozenset(
+    {
+        "so", "and", "well", "um", "uh", "oh", "hmm", "hm", "mm", "mhm",
+        # A courtesy word that cannot end a sentence either: "Okay, I think ...", "Thank you
+        # for ...", "Alright, I ...".  "think" is the one that opened a refusal's 3 s window.
+        "i", "think", "for", "your", "my", "from", "a",
+    }
+)
+
+
+def wrapup_settle_seconds(text: str) -> float:
+    """How long a wrap-up refusal must stand unanswered before it is believed (candidate silence).
+
+    The STT hands over one turn as several finals, and a candidate who says "Okay." or "Thank
+    you." may be about to ask: "Okay, so ... [two seconds of thinking] what are the next steps?".
+    So the window depends on how final the words sound: an explicit refusal ("No questions.",
+    "That's all.") keeps ``WRAPUP_SETTLE_SECONDS``; one made of acknowledgements alone
+    ("Alright.", "Thank you.") waits ``WRAPUP_SETTLE_ACK_FACTOR`` times that (3 s); and one that
+    stops on a lead-in ("Okay, so", "Okay, I think", "Thank you for") ``WRAPUP_SETTLE_LEAD_IN_FACTOR``
+    times (3.75 s).  The cost of
+    waiting is a second or two before the closing line; the cost of not waiting is the closing
+    line spoken, uninterruptibly, over the candidate's question.
+    """
+    folded = fold_speech(text)
+    words = folded.split()
+    if words and words[-1] in _LEAD_IN_WORDS:
+        return WRAPUP_SETTLE_SECONDS * WRAPUP_SETTLE_LEAD_IN_FACTOR
+    if _NO_QUESTIONS_RE.search(_SOFT_CLOSE_RE.sub(" ", folded)) is None:
+        # only an acknowledgement or a thank-you refuses here
+        return WRAPUP_SETTLE_SECONDS * WRAPUP_SETTLE_ACK_FACTOR
+    return WRAPUP_SETTLE_SECONDS
+
+
+# Words that answer nothing: apology, thanks, greeting, "are you there?", hesitation and
+# acknowledgement.  A committed turn made of nothing else ("Sorry Thank you.", "Hey, are you
+# there?", "Hmm, okay, right") is a backchannel, not an answer.  Deliberately NOT the courtesy list
+# of ``is_no_questions``: that one holds "I", "my", "for", "time" and "today", which an answer is
+# made of.
+_BACKCHANNEL_WORDS = frozenset(
+    {
+        "sorry", "pardon", "excuse", "me", "thanks", "thank", "you", "please", "bye", "goodbye",
+        "hello", "hi", "hey", "are", "there",
+        "hmm", "hm", "mm", "mmm", "mhm", "um", "uh", "oh", "ah", "well", "so",
+        "okay", "ok", "alright", "all", "right", "sure", "yes", "yeah", "yep", "yup", "no", "nope",
+        "great", "cool", "fine", "good", "perfect", "noted", "understood", "got", "it", "sounds",
+        "really", "again", "very", "much",
+    }
+)
+
+
+# A request to hear it again, or a check that the line works: "Sorry, can you repeat that?", "What
+# did you say?", "I didn't catch that.", "Yes, I can hear you.", "Can you hear me?".  Such a turn
+# answers nothing, and it is the one turn the interviewer must REPEAT its question for, so it never
+# counts as an icebreaker answer: counted as the fourth, it would hand the candidate the
+# uninterruptible transition line instead of the question they asked to hear again.  The phrases
+# are matched on folded text and only the phrase is cut out: whatever else the turn says still
+# counts ("Sorry, can you repeat that? I sell courses to working professionals" is an answer).
+# Each phrase needs its modal, its object or its "again", so a real answer's "I say ...", "we ask
+# ...", "I couldn't get a job" is left whole.
+_REPEAT_OBJECT = (
+    r"(?: that| it| this| you| what you (?:said|asked)| the (?:last |whole )?(?:question|part|bit)"
+    r"| your (?:last )?question)"
+)
+_AGAIN = r"(?: again| once more| one more time)"
+_CLARIFICATION_RE = re.compile(
+    r"\b(?:"
+    # "Can/could you (please) repeat/say/rephrase/explain/clarify (that) (again) (please)"
+    r"(?:can|could|would|will) you (?:please |just |kindly )?"
+    r"(?:repeat|rephrase|say|ask|clarify|explain|go over)" + _REPEAT_OBJECT + r"?" + _AGAIN + r"?"
+    r"(?: please)?|"
+    # "Please repeat (that)", "Repeat the question", "Say that again", "Ask me once more"
+    r"please (?:repeat|rephrase|say|clarify)" + _REPEAT_OBJECT + r"?" + _AGAIN + r"?|"
+    r"(?:repeat|rephrase)" + _REPEAT_OBJECT + _AGAIN + r"?(?: please)?|"
+    r"(?:say|ask)" + _REPEAT_OBJECT + r"?" + _AGAIN + r"(?: please)?|"
+    # "What did you say/ask/mean?", "What was that / the question?", "What does that mean?"
+    r"what (?:did|do) you (?:say|ask|mean)|what (?:was|is) (?:that|the question|your question)|"
+    r"what does (?:that|this|it) mean|"
+    # "I didn't catch/hear (that)", "I couldn't get/understand/follow the question", "I missed it"
+    r"(?:i|we) (?:did not|didn't|didnt|could not|couldn't|couldnt|can not|cannot|can't|cant)"
+    r"(?: quite| really| properly| clearly| fully)? (?:catch|hear)" + _REPEAT_OBJECT + r"?|"
+    r"(?:i|we) (?:did not|didn't|didnt|could not|couldn't|couldnt|can not|cannot|can't|cant)"
+    r"(?: quite| really| properly| clearly| fully)? (?:get|understand|follow)" + _REPEAT_OBJECT + r"|"
+    r"(?:i|we) (?:missed|lost)" + _REPEAT_OBJECT + r"|"
+    # Audio checks: "Can you hear me?", "Yes, I can hear you.", "You are breaking up.", "Speak up."
+    r"(?:can|could) you (?:hear|see) me(?: now| ok| okay| clearly| properly| well)?|"
+    r"(?:i|we) (?:can|could) (?:hear|see) you"
+    r"(?: now| ok| okay| fine| clearly| properly| well| loud and clear)?|"
+    r"(?:you(?:'re| are)|your (?:voice|audio|mic|microphone|sound) (?:is|was)) "
+    r"(?:breaking up|cutting (?:out|off)|muted|very low|too low|too quiet|not (?:audible|clear)|"
+    r"muffled|echoing)|"
+    r"(?:(?:can|could|would) you (?:please )?)?speak(?: a (?:little )?bit| a little)? "
+    r"(?:up|louder|slower|more (?:slowly|clearly|loudly))(?: please)?"
+    r")\b"
+)
+
+
+def content_word_count(text: str) -> int:
+    """How many words of ``text`` answer something, on folded text.
+
+    Words of a request to repeat or of an audio check (``_CLARIFICATION_RE``) and backchannel words
+    (``_BACKCHANNEL_WORDS``) are left out, so "Sorry, can you repeat that?" and "Yes, I can hear
+    you" count 0 while "Sorry, I sell courses" counts 3.
+    """
+    folded = _CLARIFICATION_RE.sub(" ", fold_speech(text))
+    return sum(1 for word in folded.split() if word not in _BACKCHANNEL_WORDS)
+
+
+def is_backchannel_turn(text: str) -> bool:
+    """True for a turn of nothing but backchannel words: it answers nothing and asks nothing."""
+    words = fold_speech(text).split()
+    return bool(words) and all(word in _BACKCHANNEL_WORDS for word in words)
+
+
+def lead_display_name(value: object) -> str:
+    """The simulated learner's name for the candidate's scenario card, or "" when it cannot go out.
+
+    The page's contract is letters, spaces, apostrophes and hyphens, at most
+    ``LEADNAME_MAX_CHARS`` characters, starting with a letter; it refuses anything else, so a
+    value outside that is simply not published (the card then reads "A prospective learner").
+    """
+    name = " ".join(str(value or "").split())
+    if not name or len(name) > LEADNAME_MAX_CHARS or not name[0].isalpha():
+        return ""
+    if not all(char.isalpha() or char in " '-" for char in name):
+        return ""
+    return name
+
+
+def topic_label(topic: object) -> str:
+    """A closed-vocabulary label for a data message's topic, safe to log (never the topic itself).
+
+    ``none``: no topic.  ``spelling``: the button's topic with another case, punctuation or
+    spacing (the likeliest way for the real SFU to differ from the fakes).  ``livekit``: one of
+    the SDK's own ``lk.`` topics.  ``other``: anything else.
+    """
+    if not isinstance(topic, str) or not topic:
+        return "none"
+    if re.sub(r"[^a-z0-9]", "", topic.lower()) == READY_TOPIC:
+        return "spelling"
+    if topic.lower().startswith("lk"):
+        return "livekit"
+    return "other"
+
+
+def ready_payload_ok(data: object) -> bool:
+    """True only for the exact message the API relays: ``{"v": 1, "kind": "ready"}``.
+
+    Nothing else is read from it.  A different version, an extra key, another kind, a payload that
+    is not UTF-8 JSON or is larger than ``READY_PAYLOAD_MAX_BYTES`` is not the button.
+    """
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        return False
+    raw = bytes(data)
+    if not raw or len(raw) > READY_PAYLOAD_MAX_BYTES:
+        return False
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and set(payload) == {"v", "kind"}
+        and type(payload["v"]) is int
+        and payload["v"] == READY_PAYLOAD_VERSION
+        and payload["kind"] == READY_PAYLOAD_KIND
+    )
 
 
 def _agent_turn_handling() -> dict[str, Any]:
     """Agent-level turn handling: ONLY preemptive generation is overridden (turned off).
 
     The learner's per-turn reminder and the owed move are decided in
-    ``on_user_turn_completed``, after the final transcript.  A preemptive generation starts
-    BEFORE that hook, from the transcript so far, so it could answer without the reminder (and
-    would have to be discarded whenever it differed).  Every other turn setting keeps the
-    session value, so browser R1 turn taking stays what the browser lane uses.  Measuring what
-    this costs, and whether it can be bought back, is the PR-4c latency item (plan 5.15).
+    ``on_user_turn_completed``, after the final transcript.  Every other turn setting is the
+    session's (``r1_latency.r1_turn_handling``, given to the ``AgentSession``).
+
+    PR-4c (plan 5.15 item 3) looked at buying preemptive generation back and it STAYS OFF,
+    because livekit-agents 1.6.4 gives no safe way to make the per-turn decision apply to it
+    (every fact below is read from the installed source and pinned in ``test_r1_sdk_contract``):
+
+    * ``AgentActivity.on_preemptive_generation`` starts the model call from the transcript so far
+      (``_generate_reply(..., schedule_speech=False)``) BEFORE ``on_user_turn_completed`` runs;
+    * the SDK keeps that generation when the final text is identical and the chat context is
+      equivalent.  R1 never edits ``turn_ctx`` (the context filter builds the model's context in
+      ``llm_node``), so the SDK cannot see that the decision differs and would keep a generation
+      made without it;
+    * the decision is not idempotent: ``RolePlayEngine.plan_turn`` advances the turn counter, the
+      owed-move scheduler, the disclosure gate, the reveal offers, the ask stalls and the close
+      attempts, and it has no dry-run form to compare against afterwards, so it cannot be run for
+      a transcript that may still change;
+    * a speculative ``llm_node`` would also feed ``_after_guard`` (guard hits become admin-log
+      rows), the failure counter and the speech slots with a generation the SDK may discard.
+
+    What it would buy is measured instead: ``r1_latency`` reports ``eou_to_turn_hook``, the
+    endpointing window a preemptive generation could overlap.
     """
     return {"preemptive_generation": {"enabled": False}}
 
@@ -513,12 +871,26 @@ class R1Agent(Agent):
 
         return self.interview.llm_node_stream(chat_ctx, provider)
 
+    def tts_node(self, text: Any, model_settings: Any) -> Any:
+        """Flush the first speakable fragment early; the SDK's default node does the rest.
+
+        ``Agent.tts_node`` is the downstream call (the SDK default).  A reply is split into at
+        most two calls of it, a scripted ``say`` line is passed through whole.
+        """
+
+        def synth(stream: Any) -> Any:
+            return Agent.tts_node(self, stream, model_settings)
+
+        return self.interview.tts_node_stream(text, synth)
+
 
 async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
     """Build R1 providers with the browser lane's env variables and exact defaults.
 
-    Browser sessions pass neither VAD nor turn detection, so R1 does the same.
-    Adding either here would make browser R1 turn taking silently diverge.
+    Browser sessions pass neither VAD nor turn detection, so R1 does the same: both stay the
+    session's defaults.  PR-4c changes only the TIMINGS around them (``r1_turn_handling``:
+    endpointing, interruption length and words; preemptive generation stays off), which the
+    SDK reads from the session, and nothing else about turn taking.
     """
     from livekit.agents import APIConnectOptions, AgentSession
     from livekit.agents.voice.agent_session import SessionConnectOptions
@@ -530,12 +902,7 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
             model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
             language=os.getenv("SARVAM_LANGUAGE", "en-IN"),
         ),
-        tts=sarvam.TTS(
-            model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
-            speaker=os.getenv("SARVAM_TTS_VOICE", "simran"),
-            pace=1.0,
-            temperature=0.8,
-        ),
+        tts=sarvam.TTS(**r1_tts_kwargs()),
         llm=build_r1_llm(),
         conn_options=SessionConnectOptions(
             llm_conn_options=APIConnectOptions(
@@ -544,6 +911,7 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
                 timeout=10.0,
             )
         ),
+        turn_handling=r1_turn_handling(),
         user_away_timeout=None,
     )
 
@@ -562,6 +930,24 @@ class _SpeechSlot:
     phase: str | None = None
     used: bool = False
     reply: Any = None  # the Reply the hook prepared for this generation (role-play only)
+    source: str | None = None  # the SDK's speech source: "say" for a scripted line
+    # The latency tracker's number for the turn this reply answers (``LatencyTracker.open_turn_id``
+    # when the reply was created), so a reply cancelled before any audio finds its own turn.
+    latency_turn: int | None = None
+
+
+@dataclass
+class _CandidateRow:
+    """The candidate's turn so far: ONE transcript row, written once when the turn is over.
+
+    The STT hands over a candidate's turn as several finals; the SDK commits them as one turn.
+    ``index`` is reserved at the first final (so the row sorts before any bot speech that starts
+    afterwards) and ``phase`` is the phase it was spoken in; ``parts`` are the finals in order.
+    """
+
+    index: int
+    phase: str
+    parts: list[str]
 
 
 class R1Interview:
@@ -583,6 +969,8 @@ class R1Interview:
         close_room: Callable[[], Awaitable[Any]] | None = None,
         recorder_finish: Callable[[], Awaitable[Any]] | None = None,
         judge_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
+        line_cache: LineCache | None = None,
+        rate_limits: RateLimitCounter | None = None,
     ) -> None:
         self.ctx = ctx
         self.context = context
@@ -611,12 +999,37 @@ class R1Interview:
         # True once a candidate turn was answered by the icebreaker's end (``prepare_turn``
         # suppressed its reply because the soft exit was due): the boundary line answers it.
         self._icebreaker_boundary_turn = False
+        # The candidate's open transcript row (``_CandidateRow``), the last sign of candidate
+        # activity (clock seconds), when the hard icebreaker cap began to wait for a turn in
+        # flight, how many replies the SDK cancelled before any audio, and whether the session
+        # runs the transition's quicker endpointing right now.
+        self._open_row: _CandidateRow | None = None
+        self._candidate_activity_at: float | None = None
+        self._icebreaker_hold_since: float | None = None
+        self._replies_cancelled_before_audio = 0
+        # When (``_clock``) the candidate began waiting for a reply nobody has heard yet: set when
+        # a generation starts, cleared when any speech begins, when the candidate says something
+        # that is not a backchannel, and with the phase.  A reply cancelled by a "Sorry" / "Thank
+        # you." leaves it set, so the next filler counts from the candidate's real answer.
+        self._unvoiced_since: float | None = None
+        self._quick_endpointing = False
+        # R1-Q live-UI signals (``LEADNAME_ATTRIBUTE``): the worker is in the transition and has
+        # not had the "I'm ready" press yet (``_awaiting_ready``: what the data handler checks),
+        # the page was told ``awaiting=ready`` and not yet that it is over, the press itself
+        # (latched, so nothing the driver forgets between phases can lose it), whether a non-empty
+        # ``rpleft`` is published, and the heartbeat task that refreshes it.
+        self._awaiting_ready = False
+        self._foreign_data_logged = False  # one line per session: a data message of another topic
+        self._awaiting_published = False
+        self._ready_latched = False
+        self._rpleft_published = False
+        self._rpleft_heartbeat: asyncio.Future[Any] | None = None
         self._goodbye_spoken = False
         self._ended_announced = False
         # The phase attribute the candidate's page follows: values wait here in order and one
         # background writer sends them, so a slow write can neither reorder them nor stall
         # the interview.  ``aborted`` (a technical stop) is sticky: nothing may follow it.
-        self._phase_queue: deque[str] = deque()
+        self._phase_queue: deque[dict[str, str]] = deque()
         self._phase_task: asyncio.Future[Any] | None = None
         self._phase_last_queued: str | None = None
         self._abort_requested = False
@@ -643,9 +1056,18 @@ class R1Interview:
         # use, so an interview that only settles an outcome never loads them.
         self._choice: PersonaChoice | None = None
         self._engine: RolePlayEngine | None = None
+        # The first name the candidate gave in their own introduction, kept only while the record
+        # has no usable name (``_first_name``).  Never logged.
+        self._spoken_name = ""
         self._history: list[dict[str, Any]] = []
         self._latest_candidate_index: int | None = None
         self._user_turn_started: float | None = None
+        # Words the SDK is holding for the next committed turn (see ``_fragment_held_back``),
+        # whether a final arrived while the candidate was still speaking and is not yet judged,
+        # and the clock start a held-back fragment took away (given back if more words follow).
+        self._banked_words = 0
+        self._fragment_unjudged = False
+        self._dropped_turn_start: float | None = None
         self._replies: dict[str, Reply] = {}
         self._latest_reply: Reply | None = None  # prepared, not yet bound to a speech
         self._last_reply: Reply | None = None  # the newest prepared reply (lookup fallback)
@@ -659,6 +1081,13 @@ class R1Interview:
         self._fidelity_queued = False
         self._judge_runner = judge_runner
         self._judge_llm: Any = None
+        # Latency (PR-4c): the stage stamps of the open turn, reported as ``r1_latency`` lines.
+        self._latency = LatencyTracker(clock, self._emit_latency)
+        # The audio of scripted lines (None: every line is spoken live) and the 429 counter.
+        self._line_cache = line_cache
+        self._rate_limits = RATE_LIMITS if rate_limits is None else rate_limits
+        if line_cache is not None:
+            line_cache.listen(self._on_line_cache_event)
 
     def _context_candidate_identity(self) -> str | None:
         """Read only server context identity, never participant metadata supplied by a client."""
@@ -703,16 +1132,57 @@ class R1Interview:
         if self._engine is None:
             self._engine = RolePlayEngine(
                 self.persona,
-                candidate_first_name=str(self.context.get("first_name") or ""),
+                candidate_first_name=self._first_name(),
                 seed=self._seed(),
             )
         return self._engine
+
+    def _first_name(self) -> str:
+        """The name the interviewer may speak: the record's, else the candidate's own, else "".
+
+        The record's name is unknown when the API sent nothing usable (it sends "there" for a
+        name it cannot use).  "" makes ``r1_script.line`` drop the name from the line instead of
+        speaking "there" into it.
+        """
+        return known_first_name(self.context.get("first_name")) or self._spoken_name
+
+    def _learn_spoken_name(self, text: str) -> None:
+        """Adopt the first name the candidate introduced themselves with ("my name is Cristo").
+
+        Only while the record has no usable name, only in the opening and the icebreaker, and
+        only once: the first introduction wins.  A name that is the learner's (the persona's
+        first or last name) or the interviewer's is not adopted, so the scripted lines never
+        have two people with one name on the call.  The name is candidate PII: it is spoken in
+        the lines that carry ``{first_name}`` and handed to the guard (so it can repeat the
+        candidate's own name), never logged.
+        """
+        if self._spoken_name or known_first_name(self.context.get("first_name")):
+            return
+        if self.machine.phase not in (R1Phase.OPENING, R1Phase.ICEBREAKER):
+            return
+        name = spoken_first_name(text)
+        if not name:
+            return
+        taken = {INTERVIEWER_NAME.lower()}
+        with contextlib.suppress(Exception):
+            variant = self.persona.variant
+            taken |= {variant.first_name.lower(), variant.last_name.lower()}
+        if name.lower() in taken:
+            return
+        self._spoken_name = name
+        if self._engine is not None:
+            self._engine.candidate_first_name = name
+        # A label only, never the name.  The lines that carry the name were warmed for the
+        # name-less text, so the first time one is spoken it is a cache miss and is synthesised
+        # live (one TTS round trip); warming the new text again would spend Sarvam requests,
+        # a budget shared with the phone lane, for a path that is rare (the record has a name).
+        _log.info("unknown_event", error_type="r1_spoken_name_adopted")
 
     def render_line(self, line_id: str) -> str:
         """Render one pinned line; the persona supplies the lead name, city and pickup."""
         return line(
             line_id,
-            first_name=self.context.get("first_name"),
+            first_name=self._first_name(),
             **self.persona.line_values,
         )
 
@@ -741,19 +1211,241 @@ class R1Interview:
         The page labels the interview from the ``phase`` attribute and shows the role-play lead
         card only in the role-play phases (``r1-phase.ts``), so a transition that is not
         published leaves it on its fallback label for the whole interview.
+
+        A candidate row that is still open is written first: a row never straddles a phase.
         """
+        self._flush_candidate_row()
+        self._unvoiced_since = None  # a new phase is a new wait
         self.machine.transition(phase)
+        self._apply_endpointing(phase)
+        self._track_signals(phase)
         if publish:
             self._publish_phase(phase.value)
 
     def _begin_disconnect(self) -> None:
         """Pause for a disconnect (the page is told ``paused_disconnected``)."""
+        self._flush_candidate_row()
         self.machine.begin_disconnect()
+        # Nobody is there to press the button; the rejoin asks again.  The role-play keeps its
+        # signals (paused, not over): ``rpleft`` goes out with the pause.
+        self._awaiting_ready = False
+        self._sync_rpleft_heartbeat()
         self._publish_phase(self.machine.phase.value)
 
     def _rejoin(self) -> None:
         """Resume the interrupted phase and tell the page which one it is."""
-        self._publish_phase(self.machine.rejoin().value)
+        self._flush_candidate_row()
+        resumed = self.machine.rejoin()
+        self._apply_endpointing(resumed)
+        self._track_signals(resumed)
+        self._publish_phase(resumed.value)
+
+    # ------------------------------------------------------------- live-UI signals (R1-Q)
+
+    def _track_signals(self, phase: R1Phase) -> None:
+        """Follow the phase with the two pieces of state the page's signals depend on.
+
+        The worker waits for the "I'm ready" button only while it is in the transition and has not
+        had the press yet; the role-play heartbeat runs while the role-play does.
+        """
+        self._awaiting_ready = phase is R1Phase.TRANSITION and not self._ready_latched
+        self._sync_rpleft_heartbeat()
+
+    def _lead_name(self) -> str:
+        """The learner's name as the page may show it, or "" (nothing is published then)."""
+        try:
+            return lead_display_name(self.persona.lead_name)
+        except Exception as exc:  # noqa: BLE001 - a card label must never stop an interview
+            _log.warn(
+                "unknown_event",
+                error_type="r1_leadname_unavailable",
+                error_category=_error_type_of(exc),
+            )
+            return ""
+
+    def _rpleft_value(self) -> str:
+        """Whole seconds of role-play budget left (``remaining_roleplay_seconds``), 0..3600."""
+        left = self.machine.remaining_roleplay_seconds()
+        if not math.isfinite(left):
+            left = 0.0
+        return str(min(RPLEFT_MAX_SECONDS, max(0, int(left))))
+
+    def _roleplay_signals_active(self) -> bool:
+        """True while the role-play is running or paused (an aside, or a reconnect pause in it)."""
+        phase = self.machine.phase
+        if phase is R1Phase.PAUSED_DISCONNECTED:
+            phase = self.machine.resume_phase
+        return phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE)
+
+    def _signal_attributes(self, value: str) -> dict[str, str]:
+        """The live-UI attributes that go out in the SAME write as ``phase=value``.
+
+        * ``transition``: ``leadname`` (when the persona's name is publishable) and
+          ``awaiting=ready`` (unless the button was already pressed);
+        * any other phase after that: ``awaiting=""``, once;
+        * ``roleplay``, ``aside`` and a reconnect pause inside the role-play: ``rpleft``;
+        * the first phase after the role-play: ``rpleft=""``, once.
+
+        Only the changes are sent (an attribute that has not changed is not repeated), and a phase
+        that touches none of them is written as the bare ``phase`` it always was.
+        """
+        extra: dict[str, str] = {}
+        if value == R1Phase.TRANSITION.value:
+            name = self._lead_name()
+            if name:
+                extra[LEADNAME_ATTRIBUTE] = name
+            if not self._ready_latched:
+                extra[AWAITING_ATTRIBUTE] = AWAITING_READY
+                self._awaiting_published = True
+        elif self._awaiting_published:
+            extra[AWAITING_ATTRIBUTE] = ""
+            self._awaiting_published = False
+        resume = self.machine.resume_phase
+        in_roleplay = value in (R1Phase.ROLEPLAY.value, R1Phase.ASIDE.value) or (
+            value == R1Phase.PAUSED_DISCONNECTED.value
+            and resume in (R1Phase.ROLEPLAY, R1Phase.ASIDE)
+        )
+        if in_roleplay:
+            extra[RPLEFT_ATTRIBUTE] = self._rpleft_value()
+            self._rpleft_published = True
+        elif self._rpleft_published:
+            extra[RPLEFT_ATTRIBUTE] = ""
+            self._rpleft_published = False
+        return extra
+
+    def _sync_rpleft_heartbeat(self) -> None:
+        """Run the ``rpleft`` heartbeat while the role-play is running or paused, and not after.
+
+        A browser that rejoins restarts its local clock from the last value it read, so the value
+        is refreshed every ``RPLEFT_HEARTBEAT_SECONDS`` while the role-play is the current phase.
+        """
+        task = self._rpleft_heartbeat
+        if not self._roleplay_signals_active() or self._exiting or self._ended_announced:
+            if task is not None:
+                task.cancel()  # a no-op when it already finished
+                self._rpleft_heartbeat = None
+            return
+        if task is not None and not task.done():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:  # no loop, nobody to publish to (a bare synchronous caller)
+            return
+        task = asyncio.ensure_future(self._rpleft_heartbeat_loop())
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        self._rpleft_heartbeat = task
+
+    async def _rpleft_heartbeat_loop(self) -> None:
+        """Refresh ``rpleft`` on the phase writer while the role-play phase itself is running."""
+        while True:
+            await asyncio.sleep(RPLEFT_HEARTBEAT_SECONDS)
+            if self._exiting or self._ended_announced or not self._roleplay_signals_active():
+                return
+            if self.machine.phase is R1Phase.ROLEPLAY:
+                self._publish_rpleft()
+
+    def _publish_rpleft(self) -> None:
+        """Queue one ``rpleft`` refresh behind whatever the writer still has to send."""
+        if self._ended_announced or self._abort_requested:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._rpleft_published = True
+        self._enqueue_attributes({RPLEFT_ATTRIBUTE: self._rpleft_value()}, replace_pending=True)
+
+    # ------------------------------------------------------- the "I'm ready" button (R1-Q)
+
+    def _on_data_received(self, packet: Any) -> None:
+        """Take the candidate's "I'm ready" button: a SERVER-sent message the API relays.
+
+        Accepted only when ALL of these hold, and ignored otherwise:
+
+        * the topic is ``READY_TOPIC`` (every other data message is none of our business);
+        * the packet has NO sending participant: only server credentials produce that, and a
+          candidate's token cannot publish data at all (``canPublishData`` is false), so a message
+          that names a participant is never the button, whatever it says;
+        * the payload is exactly ``{"v": 1, "kind": "ready"}``;
+        * the worker is in the transition, waiting for "ready" (``awaiting=ready`` is what the page
+          was told), and the press has not already been taken.
+
+        The press is LATCHED rather than queued as a turn: the transition driver forgets the turns
+        queued before it starts (``_drop_stale_turns``), and the button may well be pressed while
+        the briefing is still playing.  It is then handled exactly as a spoken "ready" is: the
+        driver stops waiting and the learner picks up.  It is not a transcript row (the candidate
+        said nothing).
+
+        Another topic is none of our business, with one exception: while the page's button is
+        being waited for, the first data message of ANY other topic is logged once
+        (``r1_data_ignored``, a closed label from ``topic_label``, never the topic).  The relay
+        has only ever run against fakes; if the real SFU delivers the button under a different
+        topic, this line is the only sign that it arrived at all.
+        """
+        if self._exiting:
+            return
+        topic = getattr(packet, "topic", None)
+        if topic != READY_TOPIC:
+            if self._awaiting_ready and not self._foreign_data_logged:
+                self._foreign_data_logged = True
+                _log.info(
+                    "unknown_event",
+                    error_type="r1_data_ignored",
+                    error_category="topic",
+                    schema=topic_label(topic),
+                    phase=self.machine.transcript_phase(),
+                )
+            return
+        if getattr(packet, "participant", None) is not None:
+            reason = "sender"
+        elif not ready_payload_ok(getattr(packet, "data", None)):
+            reason = "payload"
+        elif not (self._awaiting_ready and self.machine.phase is R1Phase.TRANSITION):
+            reason = "not_awaiting"
+        else:
+            reason = ""
+        if reason:
+            log = _log.info if reason == "not_awaiting" else _log.warn
+            log(
+                "unknown_event",
+                error_type="r1_ready_rejected",
+                error_category=reason,
+                phase=self.machine.transcript_phase(),
+            )
+            return
+        self._ready_latched = True
+        self._awaiting_ready = False
+        _log.info("unknown_event", error_type="r1_ready_button", phase="transition")
+        self._wake()
+
+    def _apply_endpointing(self, phase: R1Phase) -> None:
+        """Run the transition's quicker endpointing in TRANSITION, the session's own elsewhere.
+
+        The candidate's only job in the transition is to say "ready", so a turn there should
+        commit quickly (``r1_transition_endpointing``, 0.4 / 1.2 s, capped at the session's own
+        numbers).  ``AgentSession.update_options`` takes effect on the running activity.  It is
+        called only when the setting changes, so a session that never reaches the transition
+        never calls it; a failure is logged by type and costs only the quicker window.
+        """
+        quick = phase is R1Phase.TRANSITION
+        if quick == self._quick_endpointing:
+            return
+        update = getattr(self.session, "update_options", None)
+        if not callable(update):
+            return
+        options = r1_transition_endpointing() if quick else r1_turn_handling()["endpointing"]
+        try:
+            update(endpointing_opts=dict(options))
+        except Exception as exc:  # noqa: BLE001 - a timing tweak must never stop an interview
+            _log.warn(
+                "unknown_event",
+                error_type="r1_endpointing_update_failed",
+                error_category=_error_type_of(exc),
+                phase=self.machine.transcript_phase(),
+            )
+            return
+        self._quick_endpointing = quick
 
     def _publish_phase(self, value: str) -> None:
         """Queue one phase value for the background writer; never blocks, never raises.
@@ -771,7 +1463,26 @@ class R1Interview:
         except RuntimeError:  # no loop, nobody to publish to (a bare synchronous caller)
             return
         self._phase_last_queued = value
-        self._phase_queue.append(value)
+        # The live-UI attributes (R1-Q) ride in the same write as the phase they belong to.
+        self._enqueue_attributes({PHASE_ATTRIBUTE: value, **self._signal_attributes(value)})
+
+    def _enqueue_attributes(
+        self, attributes: dict[str, str], *, replace_pending: bool = False
+    ) -> None:
+        """Queue one ``set_attributes`` write for the background writer (the ONE ordered writer).
+
+        ``replace_pending`` swaps a still-queued write that carries nothing but ``rpleft`` for this
+        one, so a stuck writer cannot be flooded with heartbeats and push a phase write out of the
+        bounded queue.
+        """
+        if (
+            replace_pending
+            and self._phase_queue
+            and set(self._phase_queue[-1]) == {RPLEFT_ATTRIBUTE}
+        ):
+            self._phase_queue[-1] = attributes
+        else:
+            self._phase_queue.append(attributes)
         while len(self._phase_queue) > _PHASE_QUEUE_MAX:
             self._phase_queue.popleft()
         if self._phase_task is None or self._phase_task.done():
@@ -788,18 +1499,23 @@ class R1Interview:
         self._publish_phase("aborted")
 
     async def _phase_pump(self) -> None:
-        """Send the queued phase values in order, each on its own short bound."""
+        """Send the queued attribute writes in order, each on its own short bound."""
         while self._phase_queue:
-            await self._write_phase(self._phase_queue.popleft(), PHASE_PUBLISH_SECONDS)
+            await self._write_attributes(self._phase_queue.popleft(), PHASE_PUBLISH_SECONDS)
 
     async def _write_phase(self, value: str, bound: float | None) -> bool:
-        """Set the ``phase`` participant attribute once; True when the write was made.
+        """Set the ``phase`` participant attribute alone, once; True when the write was made."""
+        return await self._write_attributes({PHASE_ATTRIBUTE: value}, bound)
+
+    async def _write_attributes(self, attributes: dict[str, str], bound: float | None) -> bool:
+        """Set participant attributes in ONE ``set_attributes`` call; True when the write was made.
 
         A room that is not connected, or that has no local participant yet, is skipped quietly
         (nobody can be listening); a failed write is logged by type and swallowed, because a
         label must never stop an interview or its exit.  ``bound`` None leaves the bound to
         the caller (the ``ended`` write shares one bound with the ``aborted`` write before it).
         """
+        value = attributes.get(PHASE_ATTRIBUTE)
         failure = "r1_phase_ended_failed" if value == "ended" else "r1_phase_publish_failed"
         room = getattr(self.ctx, "room", None)
         try:
@@ -810,7 +1526,7 @@ class R1Interview:
             set_attributes = getattr(local_participant, "set_attributes", None)
             if not callable(set_attributes):
                 return False
-            write = _maybe_await(set_attributes({PHASE_ATTRIBUTE: value}))
+            write = _maybe_await(set_attributes(dict(attributes)))
             if bound is None:
                 await write
             else:
@@ -835,6 +1551,7 @@ class R1Interview:
         if self._ended_announced:
             return
         self._ended_announced = True
+        self._sync_rpleft_heartbeat()  # nothing is published after ``ended``: stop the heartbeat
         task, self._phase_task = self._phase_task, None
         if task is not None and not task.done():
             task.cancel()
@@ -934,9 +1651,15 @@ class R1Interview:
         self._forced_close_handle = None
 
     def _begin_exit(self) -> None:
-        """Stop recording new speech and suppress replies once the exit has started."""
+        """Stop recording new speech and suppress replies once the exit has started.
+
+        The candidate's open row is written first: it is the last thing they said, and the
+        transcript drain that follows waits for it.
+        """
+        self._flush_candidate_row()
         self._exiting = True
         self._cancel_deadlines()
+        self._sync_rpleft_heartbeat()
 
     async def _drain_background(self) -> None:
         """Flush queued transcript writes, then cancel anything still running."""
@@ -952,6 +1675,21 @@ class R1Interview:
         leftovers = [*self._turn_writes, *self._background]
         if leftovers:
             await asyncio.gather(*leftovers, return_exceptions=True)
+        await self._close_line_cache()
+
+    async def _close_line_cache(self) -> None:
+        """Release the cache's own TTS client; the warm-up task was cancelled just above."""
+        cache, self._line_cache = self._line_cache, None
+        if cache is None:
+            return
+        try:
+            await asyncio.wait_for(cache.aclose(), _scaled(SESSION_CLOSE_SECONDS))
+        except Exception as exc:  # noqa: BLE001 - never block the exit funnel
+            _log.warn(
+                "unknown_event",
+                error_type="r1_line_cache_close_failed",
+                error_category=_error_type_of(exc),
+            )
 
     def _queue_fidelity(self) -> None:
         """Queue the trusted administration rows; they ride the transcript drain's bound.
@@ -982,7 +1720,10 @@ class R1Interview:
                 # fact too.  ``roleplay_elapsed`` stops at the role-play's end, not the session's.
                 events.append(
                     session_facts_event(
-                        admin, pins, roleplay_seconds=self.machine.roleplay_elapsed
+                        admin,
+                        pins,
+                        roleplay_seconds=self.machine.roleplay_elapsed,
+                        first_audio_p95_ms=self._first_audio_p95_ms(),
                     )
                 )
         except Exception as exc:  # noqa: BLE001 - the record must never block the exit
@@ -1161,17 +1902,19 @@ class R1Interview:
         reports it through ``conversation_item_added``, which is the single source of
         bot transcript rows.  ``voice`` says who is speaking (the learner or the
         interviewer), which decides which later model call may see the line.
+
+        A line the cache holds is played from its stored audio (``say(audio=...)``): same
+        text, same transcript row, no TTS round trip.  Anything else is spoken live.
         """
-        handle = self.session.say(text, allow_interruptions=interruptible)
+        audio = self._cached_audio(text, marker)
+        if audio is None:
+            handle = self.session.say(text, allow_interruptions=interruptible)
+        else:
+            handle = self.session.say(text, audio=audio, allow_interruptions=interruptible)
         handle_id = getattr(handle, "id", None)
         if handle_id is not None:
             self._voices[handle_id] = voice
-        _log.info(
-            "unknown_event",
-            error_type="r1_turn_stage",
-            error_category="tts_first_frame",
-            phase=self.machine.phase.value,
-        )
+            self._latency.say_created(str(handle_id), marker, self.machine.transcript_phase())
         wait_for_playout = getattr(handle, "wait_for_playout", None)
         if not callable(wait_for_playout):
             return
@@ -1205,6 +1948,215 @@ class R1Interview:
             marker=line_id,
             timeout=timeout,
             voice="learner" if line_id in _LEARNER_LINES else "interviewer",
+        )
+
+    # ------------------------------------------------------------ line cache
+
+    def _cached_audio(self, text: str, marker: str) -> Any:
+        """The stored audio of ``text`` as SDK frames, or None when it must be spoken live."""
+        cache = self._line_cache
+        if cache is None:
+            return None
+        clip = cache.lookup(text)
+        _log.info(
+            "unknown_event",
+            error_type="r1_line_cache_play",
+            error_category="live" if clip is None else "cached",
+            schema=marker,
+        )
+        return None if clip is None else clip.frames()
+
+    def _warm_specs(self, *, candidate_free: bool) -> list[LineSpec]:
+        """The scripted lines to warm, in the order the interview first needs them.
+
+        Only a candidate-free line may be kept on disk (``is_candidate_free``); a line that
+        carries the first name is synthesised for this session and stays in memory.  L-OPEN is
+        left out: it is spoken the moment the candidate is here, before it could be warmed.
+        ``candidate_free`` picks one group, so the two can be warmed at different times.
+        """
+        specs: list[LineSpec] = []
+        for line_id in _WARM_ORDER:
+            if is_candidate_free(line_id) is not candidate_free:
+                continue
+            try:
+                text = self.render_line(line_id)
+            except Exception:  # noqa: BLE001 - a line that cannot be rendered is just not warmed
+                continue
+            specs.append(LineSpec(line_id, text, persist=candidate_free))
+        return specs
+
+    def _start_line_warmup(self, *, candidate_free: bool) -> None:
+        """Warm one group of lines in the background.
+
+        The candidate-free lines are warmed in PRE_JOIN, from the moment the job starts: they
+        are kept on disk for every later interview on this machine, so a session whose
+        candidate never arrives wastes nothing.  The lines with the candidate's first name wait
+        for the activated session (``run``): they are synthesised for this session alone.
+        """
+        if self._line_cache is not None:
+            self._spawn(self._warm_line_cache(candidate_free=candidate_free))
+
+    async def _warm_line_cache(self, *, candidate_free: bool) -> None:
+        cache = self._line_cache
+        if cache is None:
+            return
+        try:
+            await cache.warm(self._warm_specs(candidate_free=candidate_free))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - the cache is an optimisation, never a failure
+            _log.warn(
+                "unknown_event",
+                error_type="r1_line_cache_failed",
+                error_category=_error_type_of(exc),
+            )
+
+    def _on_line_cache_event(self, kind: str, line_id: str, **detail: Any) -> None:
+        """One ``r1`` line per cache event: a label, a line id, a duration or a count."""
+        seconds = detail.get("seconds")
+        if kind in _LINE_CACHE_WARNINGS:
+            _log.warn(
+                "unknown_event",
+                error_type=f"r1_line_cache_{kind}",
+                error_category=detail.get("error"),
+                schema=line_id or None,
+                duration_sec=None if seconds is None else round(float(seconds), 3),
+                option_count=detail.get("count"),
+            )
+        else:
+            _log.info(
+                "unknown_event",
+                error_type=f"r1_line_cache_{kind}",
+                error_category=detail.get("error"),
+                schema=line_id or None,
+                duration_sec=None if seconds is None else round(float(seconds), 3),
+                option_count=detail.get("count"),
+            )
+
+    # --------------------------------------------------------------- latency
+
+    def _emit_latency(
+        self,
+        schema: str,
+        seconds: float,
+        *,
+        category: str,
+        phase: str,
+        turn_index: int | None,
+    ) -> None:
+        """One ``r1_latency`` line: a stage name, a duration, a phase and a turn index.
+
+        Never an utterance: the stage names, categories and phases are fixed labels, and the
+        index is a transcript row number.
+        """
+        _log.info(
+            "unknown_event",
+            error_type="r1_latency",
+            schema=schema,
+            error_category=category,
+            phase=phase,
+            turn_index=turn_index,
+            duration_sec=round(seconds, 3),
+        )
+
+    def _first_audio_p95_ms(self) -> int | None:
+        """The number the plan 6.4 gate reads, and its log line (plan 5.15, pr4c-rebase.md 3.3).
+
+        End of speech to first audio, nearest-rank p95 over the ROLE-PLAY turns (the learner's
+        turns; the interviewer's icebreaker and wrap-up are not what the gate prices), in
+        milliseconds, or ``None`` when fewer than 8 of them were measured: unknown fails the
+        gate closed, which is right for a session that was barely measured.  A turn whose reply
+        was cancelled before any audio counts with the seconds it had waited by then (a lower
+        bound; ``LatencyTracker.reply_lost``), so the turns the candidate sat through cannot be
+        left out of the percentile.  The same number is
+        logged (``r1_latency`` schema ``first_audio_p95``, category ``gate``) with the count of
+        turns behind it, beside the all-phase figure (category ``all_phases``) for information, so
+        the Stage A report and the posted fact can be compared, and beside the count of lost
+        replies among them (category ``lost_replies``).  Logging never decides anything.
+        """
+        tracker = self._latency
+        try:
+            gate_ms = tracker.first_audio_p95_ms()
+            lines = (
+                (
+                    "gate" if gate_ms is not None else "unknown",
+                    GATE_PHASE,
+                    None if gate_ms is None else gate_ms / 1000.0,
+                    tracker.first_audio_samples(GATE_PHASE),
+                ),
+                (
+                    "all_phases",
+                    "all",
+                    tracker.first_audio_p95_seconds(None, min_samples=1),
+                    tracker.first_audio_samples(None),
+                ),
+                ("lost_replies", GATE_PHASE, None, tracker.replies_lost(GATE_PHASE)),
+            )
+        except Exception as exc:  # noqa: BLE001 - a measurement must never cost the other facts
+            _log.warn(
+                "unknown_event",
+                error_type="r1_first_audio_p95_failed",
+                error_category=_error_type_of(exc),
+            )
+            return None
+        for category, phase, seconds, count in lines:
+            _log.info(
+                "unknown_event",
+                error_type="r1_latency",
+                schema="first_audio_p95",
+                error_category=category,
+                phase=phase,
+                duration_sec=None if seconds is None else round(seconds, 3),
+                option_count=count,
+            )
+        return gate_ms
+
+    def _log_sdk_metrics(self, item: Any) -> None:
+        """Log the SDK's own per-turn timings for a chat item, beside R1's stamps.
+
+        They cross-check the stamps (``sdk_e2e`` is the SDK's end of speech to first audio) and
+        carry two the stamps cannot see (``sdk_transcription``, ``sdk_end_of_turn``).
+        """
+        metrics = getattr(item, "metrics", None)
+        if not isinstance(metrics, Mapping):
+            return
+        role = str(getattr(item, "role", "")).lower()
+        if role not in ("user", "assistant"):
+            return
+        for field_name, schema in _SDK_METRICS:
+            value = metrics.get(field_name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            self._emit_latency(
+                schema,
+                max(0.0, float(value)),
+                category=role,
+                phase=self.machine.transcript_phase(),
+                turn_index=None,
+            )
+
+    def _speaking_scripted_line(self) -> bool:
+        """True while the speech being voiced is a ``say`` line (the whole text is known)."""
+        handle = getattr(self.session, "current_speech", None)
+        slot = self._speeches.get(getattr(handle, "id", None))
+        return slot is not None and slot.source == "say"
+
+    def tts_node_stream(self, text: Any, synth: Callable[[Any], Any]) -> AsyncIterator[Any]:
+        """The body of ``R1Agent.tts_node``: early-flush a reply, pass a scripted line whole.
+
+        A reply arrives sentence by sentence, so its first fragment is sent on at once (see
+        ``r1_tts``).  A ``say`` line arrives complete, where splitting would only cost a
+        prosody reset, so it goes to the downstream node in one call, as the SDK does.  Only a
+        reply's stages feed the turn's latency record.
+        """
+        if self._speaking_scripted_line():
+            return flush_tts(text, synth, min_chars=0)
+        return flush_tts(
+            text,
+            synth,
+            min_chars=flush_min_chars(),
+            on_first_text=lambda: self._latency.mark("tts_first_text"),
+            on_first_frame=lambda: self._latency.mark("tts_first_frame"),
         )
 
     def note_turn(self, text: str) -> None:
@@ -1272,6 +2224,25 @@ class R1Interview:
             return is_no_questions(text) or self.machine.remaining_wrapup_seconds() <= 0
         return True
 
+    def _count_icebreaker_answer(self, text: str) -> None:
+        """Count one COMMITTED candidate turn toward the icebreaker's soft exit, if it is an answer.
+
+        The soft exit (``icebreaker_should_end``: four turns once S >= 3:30) used to count STT
+        finals, so one long answer that Sarvam split at its pauses was four "turns" and a
+        one-word "Sorry" was one more.  It counts the SDK's committed turns now, and only those
+        with ``ICEBREAKER_ANSWER_MIN_WORDS`` words that are not backchannel.  The SDK's own floor
+        (``min_words``) is not enough: it banks "Sorry" and commits it with the next "Thank you."
+        as one turn of three words, and "Hey, are you there?" is four, and none of them answers
+        the question.  Nor does a request to hear the question again ("Sorry, can you repeat
+        that?", "Yes, I can hear you"): that turn is the one the interviewer must answer by
+        repeating, not by moving on.  An early answer spoken over the opening line still counts,
+        as it did.
+        """
+        if self.machine.phase not in (R1Phase.OPENING, R1Phase.ICEBREAKER):
+            return
+        if content_word_count(text) >= ICEBREAKER_ANSWER_MIN_WORDS:
+            self.machine.candidate_turns += 1
+
     # ----------------------------------------------------- role-play turns
 
     def _roleplay_exit_requested(self) -> bool:
@@ -1325,7 +2296,53 @@ class R1Interview:
     def _take_user_turn_seconds(self) -> float | None:
         """How long the candidate talked since the turn began (the monologue length)."""
         started, self._user_turn_started = self._user_turn_started, None
+        # The turn committed, so the SDK has handed over everything it was holding back.
+        self._banked_words = 0
+        self._fragment_unjudged = False
+        self._dropped_turn_start = None
         return None if started is None else max(0.0, self._clock() - started)
+
+    def _fragment_held_back(self) -> bool:
+        """True when livekit-agents will refuse the turn so far and bank its words.
+
+        With ``min_words`` above zero, ``AgentActivity.on_end_of_turn`` refuses a turn of fewer
+        words while the reply it would cut is still interruptible and not yet cut; the words
+        stay in the SDK's transcript and are prepended to the next committed turn.  The banked
+        words are counted the way the SDK counts them, so two one-word fragments reach the
+        limit together.
+        """
+        minimum = interrupt_min_words()
+        if minimum <= 0 or self._banked_words >= minimum:
+            return False
+        speech = getattr(self.session, "current_speech", None)
+        return (
+            speech is not None
+            and bool(getattr(speech, "allow_interruptions", True))
+            and not getattr(speech, "interrupted", False)
+        )
+
+    def _judge_fragment(self) -> None:
+        """A held-back fragment is not part of the candidate's monologue: restart the clock.
+
+        The monologue clock starts at the first ``speaking`` of a turn and stops at the turn
+        hook.  A fragment such as "Yes." said over the learner is refused by the SDK, so no hook
+        ends that clock, and it would keep running through the learner's remaining speech into
+        the candidate's next answer (a 45 s answer read as a 68 s monologue).  Called only while
+        the candidate is not speaking, so the next ``speaking`` starts the clock afresh.
+
+        The judgement can come too early: Sarvam finalises a first word while the candidate talks
+        on, and the final of the rest arrives after the speech has stopped.  Words that arrive
+        with no new speech in between belong with the fragment (the SDK commits them as one
+        turn), so the clock start is given back.
+        """
+        self._fragment_unjudged = False
+        if self._fragment_held_back():
+            if self._user_turn_started is not None:
+                self._dropped_turn_start = self._user_turn_started
+            self._user_turn_started = None
+        elif self._user_turn_started is None and self._dropped_turn_start is not None:
+            self._user_turn_started = self._dropped_turn_start
+            self._dropped_turn_start = None
 
     def prepare_turn(self, text: str, message_id: str | None = None) -> None:
         """Decide one candidate turn: suppress the SDK reply, or fix what the reply must be.
@@ -1336,10 +2353,20 @@ class R1Interview:
         so the plan is computed exactly once and before any generation (preemptive
         generation is off for this agent).
         """
+        # The SDK committed the candidate's turn: the finals it was made of are ONE row now,
+        # written before anything below can raise ``StopResponse``.
+        self._flush_candidate_row()
         index = self._latest_candidate_index
         self._latest_candidate_index = None
         seconds = self._take_user_turn_seconds()
         entry = self._note_candidate_turn(text, index) if text else None
+        if text:
+            self._latency.begin_turn(index, self.machine.transcript_phase())
+            self._count_icebreaker_answer(text)
+            if not is_backchannel_turn(text):
+                # The candidate said something: their wait starts again from here.  A backchannel
+                # ("Sorry", "Thank you.") leaves the wait for the reply it cancelled running.
+                self._unvoiced_since = None
         suppressed = self.reply_suppressed(text)
         if suppressed or not text:
             if self.machine.phase in (R1Phase.ICEBREAKER, R1Phase.ROLEPLAY, R1Phase.ASIDE):
@@ -1362,6 +2389,8 @@ class R1Interview:
             raise StopResponse()
         if self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
             reply = self._plan_learner_reply(text, entry, index, seconds)
+            if reply.plan is not None:
+                self._latency.set_kind(reply.plan.mode.value)
         else:
             reply = Reply(
                 phase=self.machine.transcript_phase(),
@@ -1585,6 +2614,7 @@ class R1Interview:
         recover = False
         iterator: Any = None
         try:
+            self._latency.mark("llm_start")
             stream = await _maybe_await(factory())
             iterator = stream.__aiter__()
             async for item in iterator:
@@ -1593,11 +2623,14 @@ class R1Interview:
                     assert_thinking_disabled(usage)
                 text = delta_text(item)
                 if text:
+                    self._latency.mark("llm_first_token")
                     for sentence in guard.feed(text):
                         spoke = True
+                        self._latency.mark("guard_release")
                         yield sentence + " "
             for sentence in guard.flush():
                 spoke = True
+                self._latency.mark("guard_release")
                 yield sentence + " "
         except Exception as exc:  # noqa: BLE001 - a failed model reply must not leave silence
             if spoke:
@@ -1658,6 +2691,7 @@ class R1Interview:
         spoke = False  # a sentence of the acknowledgement already reached the consumer
         iterator: Any = None
         try:
+            self._latency.mark("llm_start")
             stream = await _maybe_await(factory())
             iterator = stream.__aiter__()
             while True:
@@ -1675,13 +2709,18 @@ class R1Interview:
                     assert_thinking_disabled(usage)
                 text = delta_text(item)
                 if text:
+                    self._latency.mark("llm_first_token")
                     for sentence in guard.feed(text):
                         spoke = True
+                        self._latency.mark("guard_release")
                         yield sentence + " "
             for sentence in guard.flush():
                 spoke = True
+                self._latency.mark("guard_release")
                 yield sentence + " "
+            self._latency.mark("ack", "done")
         except Exception as exc:  # noqa: BLE001 - the acknowledgement is optional
+            self._latency.mark("ack", "cutoff" if isinstance(exc, AckCutoff) else "failed")
             _log.warn(
                 "unknown_event",
                 error_type="r1_ack_failed",
@@ -1738,15 +2777,39 @@ class R1Interview:
         line_id = "L-FILLER-LEARNER" if in_roleplay else "L-FILLER-INTERVIEWER"
         return self.render_line(line_id) + " "
 
+    def _filler_delay(self) -> float:
+        """Seconds from the start of a generation to its thinking filler, and note the wait began.
+
+        ``FILLER_AFTER_SECONDS`` for a generation that answers a candidate who has been waiting
+        since just now.  A candidate can also have been waiting longer for a reply nobody has
+        heard: the SDK cancels the reply it is still thinking of when a "Sorry" and a "Thank you."
+        add up to a committed turn (it banks refused words and commits them together), and the
+        reply to THAT starts a new generation.  Counting the filler from the new start would make
+        the candidate sit through the first generation's wait AND a whole new 4 s of silence; the
+        filler is counted from where the wait began instead, never sooner than
+        ``FILLER_RESTART_MIN_SECONDS`` after the new generation starts.
+        """
+        now = self._clock()
+        since = self._unvoiced_since
+        if since is None or not 0.0 <= now - since <= FILLER_ANCHOR_MAX_SECONDS:
+            self._unvoiced_since = now
+            return FILLER_AFTER_SECONDS
+        waited = now - since
+        return min(
+            FILLER_AFTER_SECONDS,
+            max(FILLER_RESTART_MIN_SECONDS, FILLER_AFTER_SECONDS - waited),
+        )
+
     async def guard_llm_stream(self, stream: Any) -> AsyncIterator[Any]:
         """Own one reply's deadlines: a 4 s filler and a 12 s wall clock (plan section 5.11).
 
         Everything here is scoped to THIS generation, so a slow turn can never
         interrupt, reset, or count against another one.  The filler is yielded
-        INTO the reply stream because ``say()`` would queue behind it.  The 12 s
-        deadline is wall clock on purpose: DeepSeek SSE keep-alives defeat read
-        timeouts.  Only an LLM reply (its first chunk) resets the failure count;
-        scripted lines, fillers included, never do.
+        INTO the reply stream because ``say()`` would queue behind it; it is counted from the
+        candidate's real answer when an earlier reply to it was cancelled unheard
+        (``_filler_delay``).  The 12 s deadline is wall clock on purpose: DeepSeek SSE
+        keep-alives defeat read timeouts.  Only an LLM reply (its first chunk) resets the
+        failure count; scripted lines, fillers included, never do.
         """
         from r1_llm import assert_thinking_disabled
 
@@ -1756,7 +2819,7 @@ class R1Interview:
         started_phase = self.machine.phase
         started = loop.time()
         deadline = started + TURN_DEADLINE_SECONDS
-        filler_at = started + FILLER_AFTER_SECONDS
+        filler_at = started + self._filler_delay()
         filler_done = not self._candidate_present
         got_first_chunk = False
         iterator = stream.__aiter__()
@@ -1924,6 +2987,8 @@ class R1Interview:
             room_on("track_published", self._on_track_published)
             room_on("track_unpublished", self._on_track_unpublished)
             room_on("disconnected", self._on_room_disconnected)
+            # The API relays the page's "I'm ready" button as server-sent data (R1-Q).
+            room_on("data_received", self._on_data_received)
 
     def _reserve_turn_index(self) -> int:
         self._turn_index += 1
@@ -1967,23 +3032,63 @@ class R1Interview:
             )
 
     def _on_user_input_transcribed(self, event: Any) -> None:
-        """Record a final candidate transcript at event time and hand it to the driver.
+        """Collect a final candidate transcript into the open row and hand it to the driver.
 
-        The row and its order are fixed here, not when the driver gets around to the
-        turn, so a busy driver can neither lose nor reorder it.
+        The row's position is fixed here, at its FIRST final, not when the driver gets around
+        to the turn, so a busy driver can neither lose nor reorder it.  The row itself is
+        written when the turn is over (``_flush_candidate_row``): the STT's finals of one answer
+        become one row, as the SDK's committed turn is one.  The driver still reads every final
+        (``note_turn``): its ready and wrap-up matching works on them one at a time.
         """
         if self._exiting or not getattr(event, "is_final", False):
             return
         text = str(getattr(event, "transcript", "") or "").strip()
         if not text:
             return
-        if self.machine.phase in (R1Phase.OPENING, R1Phase.ICEBREAKER):
-            # An early answer spoken over the opening line is still an icebreaker turn.
-            self.machine.candidate_turns += 1
-        index = self._reserve_turn_index()
-        self._latest_candidate_index = index  # the SDK turn that follows is judged at this row
-        self._write_turn(index, "candidate", text, self.machine.transcript_phase())
+        self._latency.note_final()
+        self._candidate_activity_at = self._clock()
+        self._banked_words += count_words(text)
+        if self._user_state == "speaking":
+            self._fragment_unjudged = True  # the speech has not stopped: judge it when it does
+        else:
+            self._judge_fragment()
+        row = self._open_row
+        if row is None:
+            row = self._open_row = _CandidateRow(
+                self._reserve_turn_index(), self.machine.transcript_phase(), []
+            )
+        row.parts.append(text)
+        self._latest_candidate_index = row.index  # the SDK turn that follows is judged at this row
+        self._learn_spoken_name(" ".join(row.parts))
         self.note_turn(text)
+
+    def _flush_candidate_row(self) -> None:
+        """Write the open candidate row (all its finals, one space apart), once, then close it.
+
+        Called wherever the candidate's turn is over: the SDK committed it (``prepare_turn``), a
+        bot speech starts (``_reserve_bot_index``: whatever the candidate says next is a new
+        row, after the bot's), the phase changes, and the session exits.  A row that never gets
+        one of those (the SDK banked a short fragment and nothing followed) is written at the
+        next of them; a crash before that loses at most that one open row.
+        """
+        row, self._open_row = self._open_row, None
+        if row is None:
+            return
+        self._write_turn(row.index, "candidate", " ".join(row.parts), row.phase)
+
+    def _reserve_bot_index(self) -> int:
+        """Reserve a transcript position for a bot speech, closing the candidate's open row first.
+
+        The row keeps the (lower) index it reserved at its first final, so closing it here only
+        decides that the candidate's NEXT words are a new row after this speech, which is where
+        they were said.
+        """
+        self._flush_candidate_row()
+        return self._reserve_turn_index()
+
+    def _candidate_turn_open(self) -> bool:
+        """True while the candidate is mid-turn: speaking, or a final heard whose turn has not committed."""
+        return self._user_state == "speaking" or self._open_row is not None
 
     def _on_speech_created(self, event: Any) -> None:
         """Track a speech; its transcript position is fixed when it starts speaking."""
@@ -1991,7 +3096,10 @@ class R1Interview:
         speech_id = getattr(handle, "id", None)
         if self._exiting or handle is None or speech_id is None:
             return
-        slot = _SpeechSlot(handle)
+        slot = _SpeechSlot(handle, source=getattr(event, "source", None))
+        if getattr(event, "source", None) == "generate_reply":
+            # The reply answers the turn the hook has just opened (a lost reply finds it again).
+            slot.latency_turn = self._latency.open_turn_id()
         if getattr(event, "source", None) == "generate_reply" and self._latest_reply is not None:
             # The SDK creates this speech right after the hook that prepared the reply.
             slot.reply, self._latest_reply = self._latest_reply, None
@@ -2006,8 +3114,9 @@ class R1Interview:
     def _claim_slot(self, slot: _SpeechSlot) -> None:
         """Fix a speech's row position and phase now, once."""
         if slot.index is None:
-            slot.index = self._reserve_turn_index()
+            slot.index = self._reserve_bot_index()
             slot.phase = self.machine.transcript_phase()
+            self._unvoiced_since = None  # the candidate hears something: the wait is over
 
     def _claim_current_speech_slot(self) -> None:
         """The speech that just started speaking owns the next transcript position.
@@ -2022,9 +3131,49 @@ class R1Interview:
 
     def _on_speech_done(self, handle: Any) -> None:
         speech_id = getattr(handle, "id", None)
-        self._speeches.pop(speech_id, None)
+        slot = self._speeches.pop(speech_id, None)
+        if speech_id is not None:
+            self._latency.say_done(str(speech_id))
+        if slot is not None:
+            self._note_reply_lost(slot, handle)
         if speech_id in self._open_replies:
             self._open_replies.discard(speech_id)
+            self._wake()
+
+    def _note_reply_lost(self, slot: _SpeechSlot, handle: Any) -> None:
+        """Log a reply the SDK cancelled before the candidate heard any of it (a count, no text).
+
+        A reply that never claimed a transcript position never began speaking, so an
+        ``interrupted`` one was cut while it was still being thought of: the owner's 4/10 session
+        lost three replies this way, to "Sorry", "Thank you" and "Hey, are you there?", and the
+        candidate heard nothing at all (the rows show no bot turn).  Nothing here changes what
+        is said, with one exception that is the point of the log: when the icebreaker's exit is
+        due and nobody is mid-turn, the turn that lost its reply is the boundary turn, so the
+        transition line answers it now instead of the candidate waiting out a silence window.
+        """
+        if (
+            slot.source != "generate_reply"
+            or slot.index is not None
+            or not bool(getattr(handle, "interrupted", False))
+            or self._exiting
+        ):
+            return
+        self._replies_cancelled_before_audio += 1
+        _log.warn(
+            "unknown_event",
+            error_type="r1_reply_cancelled_before_audio",
+            phase=self.machine.transcript_phase(),
+            option_count=self._replies_cancelled_before_audio,
+        )
+        # The turn it answered never gets a first audio: keep how long the candidate had waited as
+        # a lower bound, so the slowest turns still count toward the p95 the gate reads.
+        self._latency.reply_lost(slot.latency_turn)
+        if (
+            self.machine.phase is R1Phase.ICEBREAKER
+            and self.machine.icebreaker_should_end()
+            and not self._candidate_turn_open()
+        ):
+            self._icebreaker_boundary_turn = True
             self._wake()
 
     @staticmethod
@@ -2077,14 +3226,17 @@ class R1Interview:
         SDK actually forwarded and ``interrupted`` when a barge-in cut them short.
         """
         item = getattr(event, "item", event)
-        if self._exiting or str(getattr(item, "role", "")).lower() != "assistant":
+        if self._exiting:
+            return
+        self._log_sdk_metrics(item)
+        if str(getattr(item, "role", "")).lower() != "assistant":
             return
         text = self._item_text(item)
         if not text.strip():
             return
         slot = self._slot_for_item(item)
         if slot is None:
-            index, phase = self._reserve_turn_index(), self.machine.transcript_phase()
+            index, phase = self._reserve_bot_index(), self.machine.transcript_phase()
         else:
             self._claim_slot(slot)  # a speech that never reported speaking claims it now
             slot.used = True
@@ -2142,12 +3294,28 @@ class R1Interview:
         self._agent_state = str(getattr(event, "new_state", "") or "")
         if self._agent_state == "speaking":
             self._claim_current_speech_slot()
+            self._note_audio_started()
         self._refresh_quiet()
+
+    def _note_audio_started(self) -> None:
+        """The agent's audio began: a scripted line reports its own delay, a reply the turn's."""
+        handle = getattr(self.session, "current_speech", None)
+        speech_id = getattr(handle, "id", None)
+        if speech_id is not None and self._latency.say_audio(str(speech_id)):
+            return
+        self._latency.first_audio()
 
     def _on_user_state_changed(self, event: Any) -> None:
         self._user_state = str(getattr(event, "new_state", "") or "")
-        if self._user_state == "speaking" and self._user_turn_started is None:
-            self._user_turn_started = self._clock()
+        self._candidate_activity_at = self._clock()
+        self._latency.note_user_state(self._user_state)
+        if self._user_state == "speaking":
+            self._dropped_turn_start = None  # new speech: what a fragment dropped stays dropped
+            if self._user_turn_started is None:
+                self._user_turn_started = self._clock()
+        elif self._fragment_unjudged:
+            # The final came first (Sarvam ends the speech right after it): judge it now.
+            self._judge_fragment()
         self._refresh_quiet()
 
     def _refresh_quiet(self) -> None:
@@ -2191,6 +3359,27 @@ class R1Interview:
             current = getattr(current, "error", None)
         return None
 
+    def _note_rate_limited(self, error: Any) -> None:
+        """Count a provider 429 for this lane (``r1``) and component, and log the running total.
+
+        Every 429 counts, recoverable or not: the SDK retries a 429, and a retried 429 is still
+        a request Sarvam (or the LLM) refused.  Sarvam's limits are per account and shared with
+        the phone lane, so this is how an R1 burst is told apart from a phone one.
+        """
+        kind = str(getattr(error, "type", ""))
+        component = kind[: -len("_error")] if kind.endswith("_error") else ""
+        if component not in ("llm", "tts", "stt"):
+            component = "provider"
+        count = self._rate_limits.record(LANE_R1, component)
+        _log.warn(
+            "unknown_event",
+            error_type="r1_provider_429",
+            error_category=component,
+            schema=LANE_R1,
+            phase=self.machine.transcript_phase(),
+            option_count=count,
+        )
+
     def _on_provider_error(self, event: Any) -> None:
         """Count unrecoverable LLM/TTS failures; recoverable ones are retried by the SDK."""
         if self._exiting:
@@ -2200,7 +3389,10 @@ class R1Interview:
             error, "recoverable", False
         ):
             self._llm_errors_reported += 1  # see ``_ack_then_say``: one failure, one count
-        if self._provider_status(event) in (401, 402):
+        status = self._provider_status(event)
+        if status == 429:
+            self._note_rate_limited(error)
+        if status in (401, 402):
             self._provider_abort = True
             self._wake()
             return
@@ -2427,6 +3619,7 @@ class R1Interview:
         timeout: float,
         *,
         hard: Callable[[], float] | None = None,
+        until: Callable[[], bool] | None = None,
     ) -> tuple[str, str | None]:
         """Wait for a candidate turn through any number of attention wake-ups.
 
@@ -2435,12 +3628,14 @@ class R1Interview:
         microphone is not muted, and it restarts whenever any of those changes.
         ``hard`` returns the seconds left in the phase's absolute budget; it is
         re-read on every wake-up (a paused role-play clock moves it) and bounds
-        every wait, muted or not.
+        every wait, muted or not.  ``until`` is the caller's own end condition (the
+        "I'm ready" button): checked on every wake-up, a true value ends the wait.
 
         Returns one of:
         - ``(TURN, text)``: a final transcript (already recorded at event time);
         - ``(SILENCE, None)``: ``timeout`` seconds of candidate silence;
         - ``(DEADLINE, None)``: the phase's hard budget ran out first;
+        - ``(PRESSED, None)``: ``until`` became true;
         - ``(STOP, outcome)``: room loss, deadline, provider abort, or a
           departure that outlived the rejoin grace.
 
@@ -2452,6 +3647,8 @@ class R1Interview:
                 stop = await self._handle_attention()
                 if stop is not None:
                     return (STOP, stop)
+            if until is not None and until():
+                return (PRESSED, None)
             now = loop.time()
             wait: float | None = None
             if hard is not None:
@@ -2741,16 +3938,56 @@ class R1Interview:
         Only that turn ends the phase early.  The soft-exit RULE itself must not: once S passes
         3:30 it holds on every later wake-up, including the interviewer's own follow-up
         finishing and the candidate starting to answer it, and the boundary line would then play
-        over a question nobody answered.  Those turns end the phase through the driver's own
-        check after the transcript (``_run_icebreaker``), exactly as before.
+        over a question nobody answered.  Those turns end the phase when the SDK commits them
+        (``prepare_turn`` marks the boundary), not when their first transcript arrives.
+
+        The hard S=4:30 cap ends the budget too, except that a turn in flight is given a bounded
+        moment to commit (``_icebreaker_hold_left``).  So does the boundary turn: the SDK commits
+        at its endpoint (0.8 s after a sentence that sounds finished), and a candidate who goes on
+        speaking after that is mid-answer again; the transition line is uninterruptible and would
+        talk over them.  Both exits therefore wait the same bounded moment (zero when nobody is
+        mid-turn), and the continued speech is committed, suppressed and answered in its turn.
         """
         if self._icebreaker_boundary_turn:
+            return self._icebreaker_hold_left()
+        left = self.machine.remaining_icebreaker_seconds()
+        if left > 0:
+            return left
+        return self._icebreaker_hold_left()
+
+    def _icebreaker_hold_left(self) -> float:
+        """Seconds the hard S=4:30 cap may still wait for the candidate's turn in flight.
+
+        The cap is the phase's deadline, not the candidate's: the transition line that follows
+        is uninterruptible, so starting it while the candidate is mid-answer talks over them
+        and throws their audio away.  While they are speaking, or a final was heard whose turn
+        the SDK has not committed, the cap waits one endpointing maximum plus a margin after the
+        last sign of speech (the commit then ends the phase through ``prepare_turn``), and never
+        longer than ``ICEBREAKER_HOLD_CEILING_SECONDS`` in all.  Zero when nobody is mid-turn.
+        """
+        if not self._candidate_turn_open():
+            self._icebreaker_hold_since = None
             return 0.0
-        return self.machine.remaining_icebreaker_seconds()
+        now = self._clock()
+        if self._icebreaker_hold_since is None:
+            self._icebreaker_hold_since = now
+        grace = endpoint_max_delay_sec() + ICEBREAKER_HOLD_MARGIN_SECONDS
+        last = now if self._user_state == "speaking" else (self._candidate_activity_at or now)
+        ceiling = self._icebreaker_hold_since + ICEBREAKER_HOLD_CEILING_SECONDS
+        return max(0.0, min(ceiling, last + grace) - now)
 
     async def _run_icebreaker(self) -> str | None:
-        """Ask-and-listen until the soft four-turn exit or the hard S=4:30 deadline."""
-        while not self.machine.icebreaker_should_end():
+        """Ask-and-listen until a committed turn ends the phase, or the hard S=4:30 deadline.
+
+        The exit is decided at a COMMITTED candidate turn, never at a raw transcript: once the
+        soft exit is due (four answers, S >= 3:30) the turn the SDK commits next is suppressed
+        and answered by the transition line (``prepare_turn``), which zeroes the budget below.
+        A raw final that merely arrives while the exit is due is the middle of the candidate's
+        answer, so it does not end the phase; the transition line must not start over it.
+        """
+        while True:
+            if self.machine.icebreaker_should_end() and not self._candidate_turn_open():
+                return None  # due, and nobody is mid-turn (the phase was entered already due)
             kind, value = await self._await_turn(
                 ICEBREAKER_PROMPT_SECONDS, hard=self._icebreaker_budget_left
             )
@@ -2764,10 +4001,15 @@ class R1Interview:
                     return None
                 if value is not None:
                     return value
-        return None
 
     async def _run_transition(self) -> str | None:
-        """Wait for READY (or 20 s), then let the driver speak the one pickup line."""
+        """Wait for READY (or 20 s), then let the driver speak the one pickup line.
+
+        READY is the candidate saying it, or pressing the page's "I'm ready" button (R1-Q).  The
+        press may come while the briefing is still playing, before this wait starts; it is latched
+        (``_on_data_received``), so the turns forgotten just below cannot lose it, and there is then
+        nothing to wait for.
+        """
         self._drop_stale_turns()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + TRANSITION_DEADLINE_SECONDS
@@ -2775,17 +4017,22 @@ class R1Interview:
         def left() -> float:
             return deadline - loop.time()
 
-        while left() > 0:
-            kind, value = await self._await_turn(left(), hard=left)
+        while not self._ready_latched and left() > 0:
+            kind, value = await self._await_turn(
+                left(), hard=left, until=lambda: self._ready_latched
+            )
             if kind == STOP:
                 return value
-            if kind in (SILENCE, DEADLINE):
+            if kind in (SILENCE, DEADLINE, PRESSED):
                 break
             if self.is_ready(value or ""):
                 break
             if not self._transition_nudged:
                 self._transition_nudged = True
                 await self.say("L-TRANSITION-NUDGE")
+        # Waiting is over, however it ended: a press that arrives from now on is not "ready" for
+        # anything (the learner is picking up), so the page is not asked and the handler ignores it.
+        self._awaiting_ready = False
         if self._candidate_present:
             await self._speak_pickup_once()
         return None
@@ -2816,12 +4063,14 @@ class R1Interview:
         play L-CLOSE over a question the interviewer is about to answer.  So a refusal
         is believed only after ``WRAPUP_SETTLE_SECONDS`` of candidate silence, counted
         from now (it is not running while the candidate talks, the agent speaks, or the
-        microphone is muted), and every further final is joined and judged together.
+        microphone is muted), and every further final is joined and judged together.  How long
+        depends on how final the words sound (``wrapup_settle_seconds``): "Okay, so" is the
+        start of a question far more often than "No questions."
         """
         while is_no_questions(text):
             self._restart_silence_window()
             kind, more = await self._await_turn(
-                WRAPUP_SETTLE_SECONDS, hard=self.machine.remaining_wrapup_seconds
+                wrapup_settle_seconds(text), hard=self.machine.remaining_wrapup_seconds
             )
             if kind == STOP:
                 return more, text
@@ -2859,6 +4108,7 @@ class R1Interview:
         outcome = "provider_error"
         self.wire_events()
         self._schedule_residency_deadline()
+        self._start_line_warmup(candidate_free=True)
         try:
             self._seed_candidate_from_room()
             if not await self._wait_for_candidate(NO_SHOW_SECONDS):
@@ -2868,6 +4118,7 @@ class R1Interview:
                 outcome = "configuration_failed"
                 return await self._finish(outcome)
             self._record_pins()
+            self._start_line_warmup(candidate_free=False)
             self._enter(R1Phase.OPENING)
             self._schedule_forced_close()
             await self._start()
@@ -3002,4 +4253,13 @@ async def run_r1_session(
         interview = R1Interview(ctx, context, _NoopSession(), writer)
         await interview._exit("configuration_failed")
         return "configuration_failed"
-    return await R1Interview(ctx, context, session, writer).run()
+    line_cache: LineCache | None = None
+    try:
+        line_cache = build_line_cache(session)
+    except Exception as exc:  # noqa: BLE001 - the cache is an optimisation: speak every line live
+        _log.warn(
+            "unknown_event",
+            error_type="r1_line_cache_unavailable",
+            error_category=_error_type_of(exc),
+        )
+    return await R1Interview(ctx, context, session, writer, line_cache=line_cache).run()

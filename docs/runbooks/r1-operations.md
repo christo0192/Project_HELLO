@@ -500,11 +500,106 @@ the session gets a `human_review` placeholder with code `r1_scorecard_mismatch`,
 the job succeeds, and nothing is retried. Run the seed (below) to fix it; a later
 re-score supersedes the placeholder.
 
-**Provider outages defer.** A DeepSeek timeout, a connection failure or R1's own open
-circuit breaker defers the job (reason `r1_provider_unavailable`, delay at least the
-60 s breaker cooldown) instead of failing it: the attempt is refunded, so a short
-outage does not dead-letter the job. A deferral streak is capped at 60 minutes; past
-it the failure takes the normal retry, placeholder and DLQ path.
+**Provider outages defer.** A DeepSeek timeout, a connection failure, a rate limit
+(429), a server error (5xx) or R1's own open circuit breaker defers the job (reason
+`r1_provider_unavailable`, delay 65 s, at least the 60 s breaker cooldown) instead of failing
+it: the attempt is refunded, so a short outage does not dead-letter the job. The set of
+deferrable codes is explicit (`R1_DEFERRABLE_CODES` in `lib/r1/assessment-handler.ts`).
+The wait is bounded, from the job's own `job_queue` columns (which keep no per-code
+count):
+
+- a deferral **streak** is capped at 60 minutes (any code);
+- a job is deferred at most **30 times** in its life for a provider failure
+  (`job_queue.defer_count`, which a counted failure does not reset);
+- a **timeout** is deferred only while the job has been deferred fewer than **3** times in
+  total (`R1_TIMEOUT_DEFER_MAX_COUNT`). A timeout is a full billed 300 s reasoning call,
+  and a transcript too long for one call times out every time, so waiting cannot fix it.
+  A job that times out on every call makes about 8 calls (3 deferred, then its 5 attempts,
+  about 45 minutes), not 31 (about 3 hours);
+- the breaker **refusing** a call (`provider_circuit_open`) makes no call and bills
+  nothing, so neither cap stops it, only the streak bound does (each refusal is still a
+  deferral and adds to `defer_count`).
+
+Past a bound the failure takes the normal path: up to 5 counted attempts with the queue's
+retry backoff, a placeholder on the last, then the DLQ. **The refusal stays deferrable past
+the cap on purpose.** By the cap every deferral cycle has been a failing half-open probe,
+so the breaker is open. A terminal refusal would let the five attempts after the cap arrive
+seconds apart inside its 60 s cooldown: one real probe failure and four refusals, so the
+job would dead-letter as `provider_circuit_open`, which names no cause. Deferring the
+refusal makes every counted attempt after the cap a real probe (about 70 s apart, about 6
+minutes in all), so the DLQ row and the placeholder carry the provider's real code. A job
+that sees a 429, a 5xx or a connection failure on every call therefore makes 35 calls (30
+deferred, then its 5 attempts) over about 40 minutes before it dead-letters.
+`r1-scoring-outage.test.ts` drives this with the real breaker.
+
+**A job that defers writes no placeholder**, not even on its last attempt: it is alive and
+will be scored, so HR sees no outcome yet instead of a wrong "scoring failed". The
+placeholder is written only when the job is really ending. If the deferral on the LAST
+attempt cannot be committed (a database error, or the lease is gone), the R1 runtime writes
+the placeholder itself and the job then dead-letters by lease expiry as
+`lease_expired_attempts_exhausted` (see the table).
+
+**Scoring failure codes (R1-Q).** The DeepSeek HTTP status is no longer dropped. The real
+code lands in `job_queue.error_message` on every counted (retried) failure and, once
+dead-lettered, in `job_dlq.error_message` and `v_funnel_failures` as `r1:<code>`. While a
+job defers, `error_message` is empty by design (`defer_job` clears it; `defer_reason =
+r1_provider_unavailable` says it is waiting), and the code is only in the warn log line
+`r1_assessment_failed` (`rejection_reason`, plus `http_status`).
+
+| Code | Cause | Deferred? | What to do |
+|---|---|---|---|
+| `deepseek_insufficient_balance` | HTTP 402: the DeepSeek account balance is exhausted | No (waiting cannot fix it) | Top up the balance, then replay (below) |
+| `deepseek_auth` | HTTP 401 or 403: DeepSeek rejected the API key | No | Fix the `DEEPSEEK_API_KEY` secret, then replay |
+| `deepseek_rate_limited` | HTTP 429 | Yes (up to 30 times) | None unless it dead-letters (cap reached, then 5 real probes): replay once the limit clears |
+| `deepseek_server_error` | HTTP 5xx | Yes (up to 30 times) | Same |
+| `deepseek_connection` | The network failed | Yes (up to 30 times) | Same |
+| `deepseek_timeout` | The call timed out (300 s) | Yes, but only the first 3 deferrals of a job | Same; a repeated timeout on one session means the transcript is too long for one call, so replaying it will time out again |
+| `provider_circuit_open` | R1's own breaker refused a call after repeated provider failures (a side effect, never a cause). It defers; it should not be a DLQ code | Yes (streak bound only) | Look for the failure that opened it in the log lines before it. Seen as a DLQ code only after a refusal streak of over 60 minutes |
+| `lease_expired_attempts_exhausted` | The worker lost its lease on the LAST attempt (a process crash, or the final deferral could not be committed) and the reclaim sweep dead-lettered the job. The queue writes this code, not the scorer | n/a | The placeholder is written when the final deferral fails to commit, but NOT after a crash, so check whether the session has an `assessments` row; if not, HR sees no outcome: replay the job |
+| `deepseek_http_<status>` | Any other non-2xx status (for example 400 or 422) | No | Read the status; usually a request or model-name problem |
+| `deepseek_protocol` | A 200 whose body could not be used | No | Check the provider status page |
+
+The two actionable codes carry a plain sentence on the `human_review` placeholder HR
+sees ("the DeepSeek balance is exhausted (HTTP 402); top up the DeepSeek account, and the
+job can be replayed after the top-up"). No log line, code or message contains the key
+or the provider's response body; the warn line `r1_assessment_failed` carries the code
+and an `http_status` field.
+
+**Scoring order and timeout (R1-Q).** Each call may take up to 300 s (the shared
+ceiling; 180 s was too short for a long role-play at reasoning `high`). Run 0 is scored
+alone and the other two runs start only after it succeeds. A provider failure therefore
+costs one call, not three, and a half-open breaker (which admits exactly one probe) is
+closed by run 0 before the other two run, so it can no longer fail an attempt that its
+own probe passed. Worst case per job is 2 x 4 sequential calls = 2400 s, inside the 3600 s
+absolute lease (the runner heartbeats the 600 s lease every 200 s).
+
+**Replaying a dead-lettered scoring job (owner / operator step).** The code never
+replays anything by itself, and a replay is deliberately a human decision.
+
+1. Fix the cause first. For `deepseek_insufficient_balance`, open the DeepSeek
+   dashboard for the account that owns the **production** key (the Fly secret
+   `DEEPSEEK_API_KEY` on `project-hello-api`; do not assume the dev key in
+   `app/api/.env` is the same account), check the balance and the usage graph for the
+   failure window, and top up. For `deepseek_auth`, correct the secret and redeploy.
+2. Find the job (read-only):
+   `select id, attempts, max_attempts, error_message, failed_at from screening_v2.job_dlq
+   where name = 'r1.assessment' order by failed_at desc;`
+3. Replay it with the platform procedure, `screening_v2.replay_dlq_job(<dlq id>)` as
+   the service role (`docs/runbooks/queue-leases.md`): it inserts one pending replacement
+   job (attempts 0, `defer_count` 0, `dedup_key` null) and removes the DLQ row. The
+   scorer then runs normally, and a successful re-score supersedes the placeholder as the
+   next assessment revision.
+4. Replay only AFTER the R1-Q scoring fixes (300 s timeout, run 0 first) are deployed.
+   Owner test session `b58c7d9c`: DLQ id `f2123f6e-3875-441a-94c2-725d9ed21f42`, dead-lettered
+   `deepseek_protocol` at 2026-10-08 08:34:37 UTC (probably a 402). Replaying it before
+   the fix is deployed risks another billed hour of 180 s timeouts.
+5. Confirm: the job leaves `job_queue` as `completed`, the session has an `assessments`
+   row with `schema_version = 2` and the next revision, and `v_funnel_failures` no longer
+   lists it.
+
+The phone scorer shares the DeepSeek account but not this code. A `phone.assessment`
+job that dead-lettered for the same balance reason is replayed with the same
+procedure (step 3) once the balance is topped up; this change does not touch it.
 
 **Switches.** `R1_ENABLED` (API env) builds the runtime. `r1_settings.enabled`
 gates claiming. `r1_settings.auto_status_enabled` (default **off**, owner-only,
@@ -554,8 +649,9 @@ open owner decision; today it is one.
 
 **Alerts.** Dead-lettered scoring jobs appear in `v_funnel_failures` as stage
 `scoring` with code `r1:<code>` (`r1.recording.*` as `recording`, other `r1.*` as
-`call`). Replay with the platform DLQ replay procedure; a successful re-score
-supersedes the placeholder as the next assessment revision.
+`call`). Replay with the platform DLQ replay procedure (steps under "Replaying a
+dead-lettered scoring job" above); a successful re-score supersedes the placeholder as
+the next assessment revision.
 
 **Worker contract (`session_facts`).** The gate fails closed on anything the worker
 does not report. The worker (PR-4b) must post, through `POST
@@ -568,6 +664,16 @@ concession, control, persona, feedback or other), `time_cue`
 talk_share_pct, longest_monologue_seconds, barge_in_count, question_count,
 interruption_count, first_audio_p95_ms}`). Until `session_facts` is posted no
 session can pass the gate, which is the safe state while auto-status is off.
+
+`first_audio_p95_ms` is measured by the PR-4c latency tracker (`r1_latency.LatencyTracker`): the
+nearest-rank p95 of candidate end of speech to the agent's first audio over the **role-play** turns
+only, a JSON number in **milliseconds** (the gate's limit is 3000). A session with fewer than 8
+measured role-play turns posts an explicit `null`, so the gate says `latency_unknown` instead of
+reading a number nobody measured. The worker logs the same figure as an `r1_latency` line
+(`schema=first_audio_p95`, `error_category=gate`, `option_count` the turns behind it) beside the
+all-phase figure (`error_category=all_phases`), so a posted value can be compared with the Stage A
+report. The other four communication facts (`talk_share_pct`, `barge_in_count`, `question_count`,
+`interruption_count`) are still sent as `null`; they do not fail the gate.
 
 **Ordering: post everything BEFORE the terminal transition.** The admin-log route
 answers 409 `r1_session` once the session has left `waiting`/`in_progress`, and the
@@ -1172,6 +1278,287 @@ PR-L has no migration and writes no data, so there is nothing to restore.
   link" per workflow; nothing is back-filled automatically.
 - Do not roll back by editing any R1 or phone setting. Neither depends on this
   switch, and `fly.phone.toml` must stay untouched.
+
+## Latency: what R1 logs, how to read it, and the switches (PR-4c, plan 5.15)
+
+Measure first: the metric sink is a no-op, so every R1 turn writes one structured log
+line per stage (component `r1`, event `unknown_event`, `error_type=r1_latency`). Each line
+carries `schema` (the stage), `duration_sec`, `phase`, `turn_index` (the transcript row of the
+candidate turn) and `error_category`. No line holds an utterance or a name.
+
+| `schema` | Meaning (seconds) |
+|---|---|
+| `eou_to_turn_hook` | Candidate end of speech to `on_user_turn_completed` (endpointing plus the transcript wait); `error_category` says which anchor was used (`vad`, `final`, `hook`). This is the window a preemptive generation could overlap |
+| `eou_to_llm_first_token`, `llm_ttft` | To the model's first text; and from the model call to it |
+| `eou_to_guard_release`, `guard_hold` | To the first vetted sentence leaving the output guard; and how long the guard held it after the first token (it releases a sentence only once the next has begun) |
+| `ack` | The acknowledgement before an owed line, with `error_category` `done`, `cutoff` or `failed` |
+| `eou_to_tts_first_frame`, `tts_ttfb` | To the first audio frame the TTS node produced; and its time from the first text |
+| `eou_to_first_audio` | The headline: end of speech to the agent's audio starting; `error_category` is the turn kind (`llm_reply`, `ack_then_say`, `say_only`, `reply`) |
+| `eou_to_reply_lost` | A reply the SDK cancelled before the candidate heard any of it: end of speech to the cancellation, `error_category` the turn kind. It is a **lower bound** of that turn's wait (the candidate went on waiting for the next reply), and it counts as one more sample in the p95 below and in the `r1_latency.py` report, so the slowest turns cannot drop out of the percentile by never being heard (a turn that reaches its audio is never counted here too) |
+| `say_to_first_audio` | A scripted line, `error_category` the line id |
+| `first_audio_p95` | Logged once at exit: the p95 of `eou_to_first_audio` (and `eou_to_reply_lost`) that the worker posts as `session_facts.first_audio_p95_ms` (here in seconds). `error_category` `gate` = the role-play turns the API gate reads (at least 8, else `unknown` and no `duration_sec`), `all_phases` = every phase, for information; `option_count` is the number of turns behind it. `lost_replies` is a separate line whose `option_count` is how many of the role-play samples are lost replies |
+| `sdk_*` | The SDK's own per-turn timings (`sdk_e2e`, `sdk_end_of_turn`, `sdk_transcription`, ...), to cross-check the stamps above |
+
+Stage A targets (plan 5.15): `eou_to_first_audio` p50 <= 1.8 s and p95 <= 3.0 s, scripted lines
+(`say_to_first_audio`) within 0.5 s. `fly logs --json | python app/voice-livekit/r1_latency.py`
+reads a smoke session's lines (plain JSON lines work too) and prints the verdict against those
+targets; its exit code is 0 for a pass, 1 for a miss and 2 when nothing was measured. Then
+`eou_to_turn_hook` and `guard_hold` say where the time went.
+
+Related lines: `r1_line_cache_play` (`cached` or `live`, with the line id as `schema`) and
+`r1_line_cache_*` (warm-up events: `synth_ok`, `disk_hit`, `rate_limited`, `gave_up`, ...), and
+`r1_provider_429` (a provider 429 on lane `r1`, `error_category` the component, `option_count`
+the running total for this worker). Sarvam's limits are per account and shared with the phone
+lane, so a phone TTS 429 burst that lines up with `r1_line_cache_rate_limited` lines is R1's.
+
+Switches (all read at use, so a restart is enough; every one is optional):
+
+| Variable | Default | Effect and rollback |
+|---|---|---|
+| `R1_ENDPOINT_MIN_DELAY_SEC` / `R1_ENDPOINT_MAX_DELAY_SEC` | 0.8 / 3.0 | Endpointing waits (SDK default 0.3 / 2.5 s). Lower the minimum for speed, raise it if candidates are cut off. The transition phase runs a quicker 0.4 / 1.2 s (never above these two): see "Turn taking and transcript rows" below |
+| `R1_INTERRUPT_MIN_DURATION_SEC` / `R1_INTERRUPT_MIN_WORDS` | 0.8 / 3 | How long and how many words an interruption needs (SDK default 0.5 s / 0). With Sarvam only the words count: see "Interrupting with final-only speech recognition" below |
+| `R1_TTS_FLUSH_MIN_CHARS` | 60 | Early-flush length cap; `0` turns the early-flush `tts_node` off |
+| `R1_LINE_CACHE` | on | `off` speaks every scripted line live, as before PR-4c |
+| `R1_SYNTH_PER_MIN` | 5 | Background Sarvam syntheses started per minute (1-30); raise only after the Sarvam tier is confirmed (D13) |
+
+### Interrupting with final-only speech recognition
+
+Sarvam streams final transcripts only; it never sends an interim one. livekit-agents 1.6.4 lets
+the candidate's voice cut the learner's reply early only when the transcript it already holds has
+`R1_INTERRUPT_MIN_WORDS` words, and it makes that check before it adds a new final to the
+transcript. While the candidate speaks that transcript is empty, so with the default of 3 the
+voice never cuts the reply by itself: the learner stops when the candidate's turn is committed
+(a final of at least `R1_INTERRUPT_MIN_WORDS` words, after the endpointing wait), and
+`R1_INTERRUPT_MIN_DURATION_SEC` has no effect. `tests/test_r1_sdk_contract.py` pins the SDK facts
+this rests on.
+
+The same setting makes the SDK refuse a shorter turn ("Yes.", "Sorry", "Thank you.") that is spoken
+over a reply it may still cut. It keeps the words and prepends them to the next committed turn. R1
+does not count such a fragment as part of the candidate's monologue, so `CANDIDATE_MONOLOGUE` and
+the `longest_candidate_turn_sec` field of the administration log measure the answer alone.
+
+`R1_INTERRUPT_MIN_WORDS=0` restores the SDK's voice barge-in after `R1_INTERRUPT_MIN_DURATION_SEC`,
+at the price that a "yeah" or a cough cuts the learner. **Stage A decides between 3 and 0**: run
+the smoke session at each value and listen for the two faults, the learner talking over the
+candidate until the candidate's turn is committed (value 3) against a backchannel cutting the
+learner off (value 0). Keep 3 unless the first is the worse problem; the variable is read at use,
+so a restart switches it. The default was 2 in PR-4c: the owner's 4/10 session (b58c7d9c) showed a
+two-word "Thank you." still cutting a reply, and "Sorry" / "Thank you." / "Hey, are you there?"
+cancelling three replies before any audio (the candidate heard nothing), so R1-Q raised it to 3,
+the value the phone lane uses for the same reason. That stops a single short fragment from cutting
+a reply; it does not stop two of them adding up (see the next paragraph).
+
+**What 3 does not fix: fragments that add up.** The SDK keeps the words it refused (its transcript
+is cleared when a turn is committed, not when one is refused) and judges the next final together
+with them. "Sorry" (1 word) is refused and banked; "Thank you." (2) then makes three; the SDK
+commits, and it interrupts the reply it was still thinking of *before* it calls R1's hook. So the
+owner's rows 12-14 ("Sorry", "Thank you.") would still cancel a pending reply at 3, and so would
+"Hmm", "Okay", "Right" said one after the other. `tests/test_r1_core.py`
+`TestBackchannelsOverAPendingReply` reproduces the sequence. R1 cannot stop the SDK committing that
+turn, so it limits what the turn costs the candidate:
+
+* the committed turn is **not counted as an answer** toward the icebreaker's soft exit (only words that
+  are not backchannel count, see below), so noise cannot end the icebreaker;
+* the next reply's **thinking filler is counted from the candidate's real answer**, not restarted
+  with the backchannel: a candidate who has already waited 3.5 s hears the filler about 0.5 s after the
+  new generation starts instead of 4 s later (`FILLER_RESTART_MIN_SECONDS` is the floor, so a reply that
+  is about to arrive is not pre-empted). Anything the candidate hears, a real new answer from them, or a
+  new phase starts the wait afresh;
+* the reply that was lost still **counts in the p95** (`eou_to_reply_lost`, see the latency table).
+
+None of this makes the lost reply come back: item 7 (dead air after short fragments) now depends on
+the latency work above (PR-4c) and on the filler, not on `min_words` alone. At the first smoke, count
+`r1_reply_cancelled_before_audio` and look for a `lost_replies` count above zero in the
+`first_audio_p95` lines.
+
+### Turn taking and transcript rows (R1-Q)
+
+* **Endpointing 0.8 / 3.0 s** (was 0.7 / 3.5; the SDK's own 0.3 / 2.5 s committed a turn on a
+  breath after a sentence-final clause, so a long answer was cut into several turns and several
+  replies). The **transition phase** runs 0.4 / 1.2 s (`r1_transition_endpointing`, sent through
+  `AgentSession.update_options(endpointing_opts=...)` on entering the phase; the session's own pair
+  is sent back on leaving it): the candidate only says "ready" there. The quick pair is a ceiling on
+  the session's numbers, never above them: an operator who sets `R1_ENDPOINT_MIN_DELAY_SEC` below 0.4
+  keeps the lower value. A failed update is logged as `r1_endpointing_update_failed` (type only) and
+  costs only the quicker window.
+* **One transcript row per committed candidate turn.** Sarvam closes an utterance at each of its own
+  pauses, and the SDK merges those finals into one turn, so a long answer used to be 5-6
+  `transcript_turns` rows, and the short ones ("Hello", "Good", "Okay") made 13.7% of the owner's
+  role-play rows two words or fewer, which alone fails the gate's `stt_sanity` (below 10%). The finals
+  now collect in one open row whose `turn_index` is reserved at the FIRST final (so ordering against
+  the bot's rows is unchanged) and which is written, once, when the SDK commits the turn, when a bot
+  speech starts (what the candidate says next is a new row, after the bot's: barge-in order is kept),
+  when the phase changes, and when the session exits. The phase driver still reads every final
+  separately (ready and wrap-up matching). A crash between the last final and one of those events
+  loses at most the one open row. A fragment the SDK banked (refused over a reply) joins the next
+  committed turn's row, as it joins that turn's text.
+* **The icebreaker exit is decided at a committed turn.** The soft exit (four answers once S >= 3:30)
+  counts the SDK's committed turns, not STT finals, and only a turn with **at least three words that
+  are not backchannel** (`content_word_count`: apology, thanks, greeting, "are you there", hesitation and
+  acknowledgement words such as sorry, thank you, hello, hey, hmm, okay, right, sure are left out): one
+  long answer used to count as several turns, and "Sorry", then "Thank you.", then "Hey, are you
+  there?" as three more (the SDK commits them as turns of three and four words). A request to hear the
+  question again or an audio check ("Sorry, can you repeat that?", "What did you say?", "I didn't catch
+  that.", "Yes, I can hear you.", `_CLARIFICATION_RE`) is not an answer either, so it can never be the
+  fourth answer that hands the candidate the transition line instead of the question they asked to hear
+  again; the phrase is cut out of the turn and anything else the turn says still counts ("Can you repeat
+  that? I work in sales" is an answer). The driver no longer
+  leaves the icebreaker at a raw final (the transition line is uninterruptible, so that talked over a
+  candidate who was mid-answer): the turn the SDK commits next is suppressed and answered by the
+  transition line. Both ways out of the phase, the suppressed boundary turn and the hard S=4:30 cap, wait
+  for a turn in flight (the candidate speaking again, or a final not yet committed) for at most the
+  endpointing maximum plus one second after the last sign of speech, and never more than 30 s.
+* **`r1_reply_cancelled_before_audio`** (warning, `option_count` = running total for the session, no
+  text): the SDK cancelled a model reply before the candidate heard any of it. A few are normal (the
+  candidate really did start a new turn, or two short fragments added up to the three words the SDK
+  commits: see "What 3 does not fix" above); a run of them is the owner's "dead air". The cancelled
+  turn's wait is also kept as a lower-bound latency sample (`eou_to_reply_lost`), and the next
+  reply's filler counts from the candidate's real answer. When the icebreaker's exit is due and
+  nobody is mid-turn, the turn that lost its reply is answered by the transition line instead of a
+  silence window.
+
+Preemptive generation stays off: livekit-agents 1.6.4 starts it before the per-turn decision and
+cannot be told the decision differs (see `_agent_turn_handling` in `r1_session.py` and
+`tests/test_r1_sdk_contract.py`). Buying it back is a separate change that needs the engine's
+decision to be repeatable first.
+
+The line cache keeps candidate-free lines on this machine's disk (`r1-line-cache` under the temp
+directory, keyed by the text and the voice) and the lines that carry the candidate's first name in
+memory only. It is rebuilt after a restart. Listen to one cached and one live line at the first
+smoke: a clip that sounds wrong is removed with `R1_LINE_CACHE=off`.
+
+Only a line that reaches `session.say` can play cached audio, so the warm list (`_WARM_ORDER` in
+`r1_session.py`) holds exactly the lines the driver says: `L-TRANSITION`, `L-TRANSITION-NUDGE`,
+`L-PICKUP`, `L-EXIT`, `L-WRAP`, `L-CLOSE`, `L-ASIDE-COACH`, `L-MUTE`, `L-SIL-IB`, `L-SIL-RP1`,
+`L-SIL-RP2`, `L-REJOIN`, `L-REJOIN-RP`, `L-SIL-END` and `L-SYSTEM-STOP`. `L-OPEN` is spoken at once, and
+`L-TIME-CUE`, `L-NO-FEEDBACK` and `L-FAQ-DEFER` are never passed to `say` (the first two travel inside
+a reply stream; the third has no runtime caller), so they are not synthesised.
+
+### Interviewer lines: names, the wrap-up close and the feedback refusal (R1-Q)
+
+* **An unknown first name is not spoken.** The API sends the literal `there` when a candidate's name
+  fails its letters-only test, and six scripted lines splice the name in after a comma ("Thank you,
+  there."). `r1_script.known_first_name` treats an empty value, a rejected value, `there` (any case)
+  and a single letter as unknown, and `r1_script.line` then deletes the `{first_name}` slot together
+  with its comma: "Thank you. We'll now move to the role-play", "Hi, I'm Christy", "Are you still
+  with me?", "Welcome back.", "I'm sorry, we need to stop here". The API is unchanged. The provisional
+  `r1_lines.py` mirrors it (the drift test pins both).
+* **The name the candidate gives.** While the record has no usable name, a self-introduction in the
+  opening or the icebreaker ("my name is Cristo", "myself Cristo", "this is Cristo", after an optional
+  greeting; `r1_script.spoken_first_name`) is adopted for the lines that follow and handed to the guard
+  as the candidate's own name. It is deliberately narrow: the name must start with a capital letter
+  as the speech-to-text wrote it, be letters only (2 to 24), be the first introduction of the session
+  and not be the learner's or the interviewer's name; "I taught myself Python" and "this is great" are
+  not names. The record's name always wins. A line warmed in the cache before the name was known is
+  spoken live the first time (the cache keys on the exact text). The name is never logged: a
+  `r1_spoken_name_adopted` line (no value) marks that it happened.
+* **Acknowledgements close the wrap-up.** "Alright", "okay", "got it", "sounds good", "understood",
+  "perfect", "cool", "noted" and "great" (with or without "thank you" and the other courtesy words) now
+  count as "no more questions", like "No, that's all" and "That's it". Next to a "yes", or with any word
+  that is not courtesy ("Alright, one more question about shifts"), the turn stays a question. The model
+  is not asked to answer an acknowledgement any more, and its wrap-up replies carry a note
+  (`r1_prompts.WRAPUP_REMINDER`) that forbids thanking, goodbye and "any more questions?": the scripted
+  `L-CLOSE` is the only goodbye. Before this, the owner's session heard two.
+  An acknowledgement is also what a candidate says *before* a question ("Okay, so ... [thinking] what
+  are the next steps?"), so the driver believes a refusal only after candidate silence that depends on
+  how final it sounds (`wrapup_settle_seconds`): an explicit "No questions." / "That's all." / "I'm good."
+  1.5 s (`WRAPUP_SETTLE_SECONDS`, as before); a refusal made only of acknowledgements ("Alright.", "Thank
+  you.", "Okay, got it.") twice that, 3 s; one that stops on a lead-in word ("Okay, so", "Thank you, and",
+  "Okay, I think", "Thank you for", a trailing "um") 2.5 times, 3.75 s. Any further final in the window is joined to the turn and judged
+  with it. The price is up to 2.25 s more before the closing line for a candidate who only said "Okay".
+* **The feedback refusal ends the reply.** When the guard swaps a feedback sentence for `L-NO-FEEDBACK`,
+  nothing the model says after it is spoken (the owner heard "the hiring team" twice in one turn).
+  `L-NO-FEEDBACK` is one short sentence that does not name the hiring team: "I'm sorry, I can't share any
+  feedback on how it went." `L-CLOSE` then carries the one mention of who reviews the interview ("The
+  hiring team will review your interview and get back to you."), so a candidate who asks for feedback
+  hears it once. (The first R1-Q wording also said "the hiring team will review your interview and be in
+  touch", which put the same sentence twice, a few seconds apart, in front of the close.)
+* **Content pin.** These changed pinned text: `CONTENT_REVISION` is 3 (`L-NO-FEEDBACK`,
+  `WRAPUP_REMINDER`; revision 3 has not shipped, main is at 2, so the review round re-pinned it instead
+  of taking a fourth); `docs/design/r1/R1-PLAN-final.md` carries the new `L-NO-FEEDBACK` text (a test
+  compares it). If the learner branch (R1-Q S01) also bumps the revision, the second merge takes one
+  more bump and a recomputed `PINNED_CONTENT_SHA256`. Nothing else in the lines changed.
+
+### Live-UI signals and the "I'm ready" relay (R1-Q)
+
+The candidate's page follows three more participant attributes of the **agent** (the page trusts only
+an agent-kind participant). They go out on the same single ordered writer as `phase`
+(`R1Interview._enqueue_attributes`), so a slow write can neither reorder them nor stall the interview.
+Keys are single plain lowercase words (the SDK camel-cases keys with separators, #332), values are
+strings, and an empty string deletes the attribute. Only changes are sent; a phase that touches none
+of them is the bare `{"phase": ...}` it always was.
+
+| Key | Value | Written |
+|---|---|---|
+| `leadname` | the simulated learner's name, e.g. `Meera Iyer` (letters, spaces, `'`, `-`, at most 40; anything else is not published) | in the SAME `set_attributes` call as `phase=transition`; kept afterwards |
+| `awaiting` | `ready` | with `phase=transition`; `""` with the next phase write (including a reconnect pause; the rejoin into the transition asks again, unless the button was already pressed) |
+| `rpleft` | whole seconds of role-play budget left (`remaining_roleplay_seconds()`: the shorter of the 14:00 role-play clock and the 20:00 session cap), clamped 0..3600 | with every phase write while the role-play runs or is paused (`roleplay`, `aside`, a reconnect pause inside it, the rejoin); a **30 s heartbeat** while the phase is `roleplay` (`RPLEFT_HEARTBEAT_SECONDS`, refreshed value only, coalesced so a stuck writer is not flooded); `""` with the first phase write after the role-play (`roleplay_exit`, `closing`, `aborted`) |
+
+It is an upper bound, not a promise: the role-play can end early (R >= 10:00 with the commitment
+resolved). An old page ignores all three; a new page with an old worker simply shows no button and no
+clock.
+
+**The "I'm ready" button.** The candidate token has `canPublishData: false` (R1-PLAN threat 13), so the
+browser cannot send anything into the room. It calls `POST /api/r1/ready` with
+`{"attempt_token", "nonce"}` (the exchange's two secrets and nothing else; extra keys are a 400), and
+the API relays one fixed message with the LiveKit server SDK: topic `r1ready`, reliable, bytes
+`{"v":1,"kind":"ready"}`, addressed to the agent participant(s) found with `listParticipants` in that
+attempt's own room (broadcast when none is found or the listing fails: the payload is the same and only
+the worker acts on it). No token grant changed; two tests pin `canPublishData: false` on both tokens.
+
+| Answer | Meaning |
+|---|---|
+| 200 `{"ok": true}` | the message was handed to LiveKit (not a promise the worker acted on it) |
+| 404 `r1_attempt_invalid` | unknown attempt, wrong nonce, **or an attempt token older than 5 minutes**: the page re-mints a token (a rejoin: `POST /api/r1/attempts` with the link and the nonce) and presses again once |
+| 409 `not_live` | no live room for the attempt (not provisioned, ended, or LiveKit says the room is gone) |
+| 409 `consent_required` / `round_not_admissible` / `r1_disabled` | as for the exchange: a withdrawal, a lapsed round or the master switch stops it |
+| 429 `r1_ready_rate_limited` | 6 requests a minute per attempt (sliding window, in memory, counted only after the token and nonce verified, so junk cannot spend a real candidate's allowance) |
+| 503 `r1_room_unavailable` | LiveKit did not take the message (each server call is bounded at 4 s); retry |
+
+The relay is not new work: R1 pause, maintenance and the DeepSeek probe do not stop it. Each accepted
+relay writes one `resource.update` audit event (`resource: interview_round_attempt_ready`, round id,
+attempt number; no secret).
+
+**What the worker accepts** (`R1Interview._on_data_received`): topic `r1ready`; **no sending
+participant** (only server credentials produce a data packet without one, and a message that names a
+participant is never the button, whatever it says); the payload exactly `{"v": 1, "kind": "ready"}`
+(UTF-8 JSON, at most 128 bytes, no extra key); the phase is `transition` and the worker is waiting
+(`awaiting=ready` was sent and the wait has not ended); and it has not been pressed already. The press
+is **latched**, not queued as a turn: the transition driver forgets the turns queued before it starts
+waiting, and the button is usually pressed while the ~30 s briefing is still playing. A latched press
+ends the wait at once (no "Whenever you're ready" nudge) and the learner picks up, exactly as for a
+spoken "ready" (which keeps working). It is not a transcript row.
+
+Logs, all by label (no name, no text): `r1_ready_button` (accepted); `r1_ready_rejected` with
+`error_category` `sender` or `payload` (warning: something other than the relay sent on the topic),
+or `not_awaiting` (info: too late, too early or a repeat, which is normal); `r1_data_ignored` with
+`error_category=topic` (info, **once per session**, only while the button is awaited): a data message
+arrived under another topic, and `schema` is a closed label for it, never the topic itself (the log
+fence allows no runtime string): `none` (no topic), `spelling` (the button's topic with other case,
+punctuation or spacing, the likeliest way for the real SFU to differ from the fakes), `livekit` (an `lk.`
+topic of the SDK) or `other`. In the API,
+`r1_ready_send_failed` and `r1_ready_agent_lookup_failed` are the two LiveKit failure labels.
+
+Triage for "the button did nothing": the audit event says the API relayed it; an `r1_ready_button` line
+in the worker log says the worker took it; `not_awaiting` says it came outside the transition; a `404`
+on the page is a stale attempt token; an `r1_data_ignored` line means the message reached the room under
+a topic the worker does not take (`schema=spelling` means a case or punctuation difference from
+`R1_READY_TOPIC` in `app/api/src/routes/r1-candidate.ts`, `other` means look at what the SFU delivers);
+no worker line at all with an audit event means the message did
+not reach the room (check the interviewer's identity in the room and the R1 SFU's server API).
+
+**Smoke it on the real SFU before the owner tests it.** Every test of the relay uses fakes (the API's
+`sendData` and `listParticipants`, and a synthetic packet on the worker side), so that a *server-sent*
+message with `destinationIdentities` reaches the agent's `data_received` with `participant=None` and
+`topic == "r1ready"` rests on the pinned SDK shape (`test_r1_sdk_contract`), not on a live call. After
+the merge and the deploy (merge window rules: after 21:00 IST, ping the phone session, zero live calls),
+run the first R1 smoke through the normal flow and press the button once in the transition. Pass: one
+`interview_round_attempt_ready` audit row, one `r1_ready_button` worker line, the learner picks up
+without the nudge, and no `r1_ready_rejected` or `r1_data_ignored` line. Alternatively, in a throwaway
+room: join with a Python `rtc` client, have `RoomServiceClient.send_data` (the R1 SFU's server API) send
+`{"v":1,"kind":"ready"}` as `RELIABLE` with topic `r1ready` and `destination_identities` = the client,
+and assert `packet.participant is None` and `packet.topic == "r1ready"`. A spoken "ready" works either
+way, so a failure here costs the button only, never the interview.
 
 ## Incident handling and rollback
 

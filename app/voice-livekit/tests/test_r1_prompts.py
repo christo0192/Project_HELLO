@@ -321,6 +321,48 @@ class ContextFilterTests(unittest.TestCase):
         self.assertEqual(select_context(items, "roleplay"), [])
 
 
+class WrapupReminderTests(unittest.TestCase):
+    """R1-Q item 8: the model answered "Alright" with a goodbye, and L-CLOSE said it again."""
+
+    def test_the_wrapup_replies_carry_a_note_that_forbids_a_goodbye(self):
+        from r1_prompts import WRAPUP_REMINDER, interviewer_reminder
+        from r1_replies import Reply, llm_messages
+
+        for phase in ("wrapup", "closing"):
+            with self.subTest(phase=phase):
+                self.assertEqual(interviewer_reminder(phase), WRAPUP_REMINDER)
+                messages = llm_messages(
+                    Reply(phase=phase, candidate_text="What is the shift?"), P1, []
+                )
+                self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
+                self.assertEqual(messages[-2], {"role": "system", "content": WRAPUP_REMINDER})
+                self.assertEqual(messages[-1], {"role": "user", "content": "What is the shift?"})
+        lowered = WRAPUP_REMINDER.lower()
+        for phrase in ("never say goodbye", "have a great day", "never thank", "closes by itself"):
+            self.assertIn(phrase, lowered)
+        self.assertIn("one or two short sentences", lowered)
+
+    def test_no_other_phase_gets_it_and_the_cache_prefix_is_untouched(self):
+        from r1_prompts import GETTING_TO_KNOW_YOU_NOTE, WRAPUP_REMINDER, interviewer_reminder
+
+        for phase in ("opening", "icebreaker", "transition", "roleplay_exit", "roleplay", ""):
+            self.assertNotEqual(interviewer_reminder(phase), WRAPUP_REMINDER)
+        self.assertEqual(interviewer_reminder("icebreaker"), GETTING_TO_KNOW_YOU_NOTE)
+        self.assertIsNone(interviewer_reminder("roleplay_exit"))
+        self.assertNotIn(WRAPUP_REMINDER, interviewer_prefix())
+        self.assertEqual(interviewer_prefix(), interviewer_prefix())
+
+    def test_the_note_is_instruction_prose_with_no_persona_or_rubric_words(self):
+        from r1_prompts import WRAPUP_REMINDER
+
+        for name in ALL_PERSONA_NAMES:
+            self.assertNotIn(name.lower(), WRAPUP_REMINDER.lower())
+        for word in RUBRIC_WORDS:
+            self.assertIsNone(
+                re.search(rf"\b{re.escape(word)}\b", WRAPUP_REMINDER), word
+            )
+
+
 class AssembleTests(unittest.TestCase):
     def test_the_reminder_sits_just_before_the_newest_user_turn(self):
         history = [{"role": "assistant", "content": "Hello?"}]

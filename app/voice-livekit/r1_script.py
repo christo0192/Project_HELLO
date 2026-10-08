@@ -8,9 +8,12 @@ call shape, so the follow-up integration swaps the import and nothing else.
 Invariants:
 
 * ``{first_name}`` is the candidate's sanitised first name and the ONLY candidate PII in
-  any line (``safe_first_name``: letters, space, hyphen, apostrophe, at most 24
-  characters, else "there").  Lines without it are candidate-free, so they can be
-  synthesised once per machine and cached by SHA and voice (plan 5.2).
+  any line (``known_first_name``: letters, space, hyphen, apostrophe, at most 24
+  characters).  An empty name or the API's placeholder "there" is UNKNOWN: ``line`` then
+  deletes the slot with its comma ("Thank you, {first_name}. We'll" -> "Thank you. We'll"),
+  so the candidate never hears "Thank you, there.".  Lines without the slot are
+  candidate-free, so they can be synthesised once per machine and cached by SHA and
+  voice (plan 5.2).
 * ``L-PICKUP`` and ``L-ASIDE-COACH`` are persona lines; their values come from the
   rendered persona (``RenderedPersona.line_values``), never from the candidate.
 * The learner's objection lines, the commitment lines and the WEAK stall live with the
@@ -54,10 +57,9 @@ LINES: dict[str, str] = {
         "is Christy, your interviewer, again. Thank you, that's the end of the role-play."
     ),
     "L-WRAP": "Before we finish, do you have any questions about the role or the next steps?",
-    "L-NO-FEEDBACK": (
-        "I'm not able to share how it went. The hiring team will review the full interview "
-        "and get back to you."
-    ),
+    # No "hiring team" here: L-CLOSE carries the one mention of who reviews the interview, so a
+    # candidate who asks for feedback hears it once, not twice a few seconds apart.
+    "L-NO-FEEDBACK": "I'm sorry, I can't share any feedback on how it went.",
     "L-FAQ-DEFER": "That's a good question for the hiring team; they'll follow up with you on it.",
     "L-CLOSE": (
         "Thank you for your time today, {first_name}. The hiring team will review your "
@@ -97,13 +99,83 @@ LINES: dict[str, str] = {
 # The exit line's first sentence is the cue the LLM must never imitate (``r1_guard``).
 EXIT_CUE = "Let's pause the role-play here."
 _NAME = re.compile(r"^[A-Za-z '-]{1,24}$")
+# The placeholder the API sends for a name it could not use (``r1.ts``: "there").
+PLACEHOLDER_NAME = "there"
+# The ``{first_name}`` slot with the comma that leads into it: ", {first_name}" or " {first_name}".
+_NAME_SLOT = re.compile(r",? \{first_name\}")
 _FORMATTER = string.Formatter()
 
 
 def safe_first_name(value: object) -> str:
     """A short display-safe first name, or the neutral greeting "there"."""
     name = str(value or "").strip()
-    return name if _NAME.fullmatch(name) else "there"
+    return name if _NAME.fullmatch(name) else PLACEHOLDER_NAME
+
+
+def known_first_name(value: object) -> str:
+    """The candidate's display-safe first name, or "" when the name is UNKNOWN.
+
+    Unknown is an empty value, a value ``safe_first_name`` rejects, the API's placeholder
+    "there" (any case), and a name with fewer than two letters (an initial is not a name to
+    greet someone by).  ``line`` renders an unknown name by dropping the slot, never by
+    speaking "there" into it.
+    """
+    name = str(value or "").strip()
+    if not _NAME.fullmatch(name) or name.lower() == PLACEHOLDER_NAME:
+        return ""
+    return name if sum(char.isalpha() for char in name) >= 2 else ""
+
+
+# A spoken self-introduction: "my name is X" and "my name's X" anywhere, "myself X" as the opener of
+# a sentence ("I taught myself Python" is not one) and "this is X" as the opener of the turn
+# ("this is Salesforce" mid-answer is not one), each after an optional greeting.  The name must
+# start with a capital letter as the speech-to-text wrote it ("my name is not on it" and "this is
+# great" are not names) and is letters only.
+_HELLO = r"hi|hello|hey|christy|good (?:morning|afternoon|evening)"
+_FILLER = r"yeah|yes|yep|so|um|uh|well|okay|ok|sure|alright"
+_NAME_TAIL = r"\s+([A-Z][A-Za-z]{1,23})(?![A-Za-z0-9'-])"
+_SPOKEN_NAME = (
+    re.compile(r"(?i:\bmy name(?: is|'s|\u2019s))" + _NAME_TAIL),
+    re.compile(
+        r"(?:^|[.!?]\s+)(?i:(?:(?:" + _HELLO + "|" + _FILLER + r")[\s,.!-]*)*myself)" + _NAME_TAIL
+    ),
+    re.compile(r"^(?i:(?:(?:" + _HELLO + r")[\s,.!-]*)*this is)" + _NAME_TAIL),
+)
+# Capitalised words that follow those openers without being a name.
+_NOT_A_NAME = frozenset(
+    {
+        "a", "an", "the", "and", "but", "or", "so", "um", "uh", "from", "not", "very", "really",
+        "basically", "currently", "working", "just", "also", "actually", "honestly", "quite",
+        "pretty", "sort", "kind", "one", "first", "new", "good", "great", "nice", "fine", "okay",
+        "interesting", "important", "awesome", "amazing", "yes", "no", "sir", "madam", "maam",
+        "my", "our", "your", "his", "her", "it", "its", "in", "on", "at", "to", "for", "with",
+        "what", "why", "how", "when", "who", "which", "where", "that", "this", "there", "here",
+        "christy", "interviewer", "interview", "kickstart",
+    }
+)
+SPOKEN_NAME_MIN_LETTERS = 2
+SPOKEN_NAME_MAX_LETTERS = 24
+
+
+def spoken_first_name(text: object) -> str:
+    """The first name a candidate introduced themselves with in ``text``, or "".
+
+    Narrow on purpose: a wrong name spoken back to the candidate is worse than none.  Only the
+    forms in ``_SPOKEN_NAME`` count, the first match wins, and a word from ``_NOT_A_NAME`` is
+    skipped.  The result is letters only, 2 to 24 of them, in capital-then-lower case.
+    """
+    raw = str(text or "")
+    for pattern in _SPOKEN_NAME:
+        for match in pattern.finditer(raw):
+            word = match.group(1)
+            if word.lower() in _NOT_A_NAME:
+                continue
+            if not SPOKEN_NAME_MIN_LETTERS <= len(word) <= SPOKEN_NAME_MAX_LETTERS:
+                continue
+            name = word[:1].upper() + word[1:].lower()
+            if known_first_name(name):
+                return name
+    return ""
 
 
 def placeholders(line_id: str) -> frozenset[str]:
@@ -125,6 +197,11 @@ CANDIDATE_FREE_LINES = tuple(line_id for line_id in LINES if is_candidate_free(l
 def line(line_id: str, **values: Any) -> str:
     """Render a reviewed line.  ``first_name`` is sanitised; unknown ids raise KeyError.
 
+    An unknown first name (``known_first_name`` is "": empty, rejected, or the placeholder
+    "there") is not spoken: the slot is deleted with its comma, so "Thank you, {first_name}.
+    We'll" reads "Thank you. We'll" and "Are you still with me, {first_name}?" reads "Are you
+    still with me?".
+
     Persona placeholders must be supplied (``**persona.line_values``); a missing one is a
     programming error and raises KeyError rather than speaking a literal ``{lead_name}``.
     """
@@ -132,7 +209,11 @@ def line(line_id: str, **values: Any) -> str:
     needed = placeholders(line_id)
     fields: dict[str, str] = {}
     if "first_name" in needed:
-        fields["first_name"] = safe_first_name(values.get("first_name"))
+        first_name = known_first_name(values.get("first_name"))
+        if first_name:
+            fields["first_name"] = first_name
+        else:
+            text = _NAME_SLOT.sub("", text)
     for name in needed - {"first_name"}:
         fields[name] = str(values[name])
     return text.format(**fields)

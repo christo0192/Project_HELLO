@@ -585,6 +585,82 @@ class StreamGuardTests(unittest.TestCase):
         self.assertEqual(out, [FALLBACK_REPLY])
 
 
+class NoFeedbackIsTerminalTests(unittest.TestCase):
+    """R1-Q item 13: the refusal ends the reply (turn 97 said "the hiring team" twice)."""
+
+    OWNER_REPLY = (
+        "You did a good job overall. That's handled by the hiring team, and they'll follow up "
+        "with you on it."
+    )
+
+    def test_nothing_the_model_says_after_the_refusal_is_spoken(self):
+        for phase in ("roleplay_exit", "wrapup", "closing"):
+            with self.subTest(phase=phase):
+                result = guard_text(self.OWNER_REPLY, ctx(phase))
+                self.assertEqual(result.text, NO_FEEDBACK_LINE)
+                self.assertTrue(result.replaced)
+                self.assertFalse(result.fallback_used)
+                self.assertEqual([h.category for h in result.hits], ["feedback"])
+
+    def test_the_stream_stops_releasing_after_the_refusal_whatever_the_chunking(self):
+        text = self.OWNER_REPLY + " Anything else I can help with? Have a nice day."
+        for size in (1, 4, 9, len(text)):
+            chunks = [text[i : i + size] for i in range(0, len(text), size)]
+            guard = StreamGuard(ctx("wrapup"))
+            out: list[str] = []
+            for chunk in chunks:
+                out.extend(guard.feed(chunk))
+            out.extend(guard.flush())
+            with self.subTest(size=size):
+                self.assertEqual(out, [NO_FEEDBACK_LINE])
+                self.assertEqual(guard.result.text, NO_FEEDBACK_LINE)
+
+    def test_sentences_before_the_refusal_are_kept(self):
+        result = guard_text(
+            "Sure, happy to help. Your score was strong. We start on Monday.", ctx("wrapup")
+        )
+        self.assertEqual(result.text, "Sure, happy to help. " + NO_FEEDBACK_LINE)
+
+    def test_a_clean_answer_is_not_cut(self):
+        text = "The shifts run from ten at night. The team is based in the US."
+        result = guard_text(text, ctx("wrapup"))
+        self.assertEqual(result.text, text)
+
+    def test_the_deferral_line_is_not_terminal(self):
+        from r1_guard import INTERVIEWER_DEFLECTION
+
+        result = guard_text(
+            "The salary is 12 LPA. The shifts run from ten at night.", ctx("wrapup")
+        )
+        self.assertEqual(
+            result.text, f"{INTERVIEWER_DEFLECTION} The shifts run from ten at night."
+        )
+
+    def test_feedback_phrasing_outside_the_wrapup_phases_is_not_policed(self):
+        text = "Good job on that answer. Tell me more about your last role."
+        result = guard_text(text, ctx("icebreaker"))
+        self.assertEqual(result.text, text)
+
+    def test_the_refusal_is_one_short_sentence_that_leaves_the_hiring_team_to_the_close(self):
+        from r1_script import LINES
+        from r1_text import split_sentences
+
+        self.assertEqual(len(split_sentences(NO_FEEDBACK_LINE)), 1)
+        self.assertLessEqual(len(NO_FEEDBACK_LINE.split()), 14)
+        # The owner heard "the hiring team will review your interview" in the refusal AND in
+        # L-CLOSE a few seconds later: the close is the one place it is said.
+        self.assertNotIn("hiring team", NO_FEEDBACK_LINE.lower())
+        self.assertEqual(LINES["L-CLOSE"].lower().count("hiring team"), 1)
+
+    def test_a_feedback_request_hears_the_hiring_team_once_in_the_whole_wrapup(self):
+        from r1_script import LINES
+
+        wrapup = " ".join(
+            [LINES["L-WRAP"], NO_FEEDBACK_LINE, LINES["L-CLOSE"]]
+        ).lower()
+        self.assertEqual(wrapup.count("hiring team"), 1)
+
+
 class LedgerTests(unittest.TestCase):
     def test_three_hits_flag_the_session(self):
         ledger = GuardLedger()
