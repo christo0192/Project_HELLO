@@ -1587,25 +1587,20 @@ def _log_gate_turn_skip(
     )
 
 
-# M014 (owner): the screening max rose to 2.0 s, but the identity/consent gate
-# keeps the settle timing it had at the old 1.0 s max. Above this ceiling a turn
-# the SDK commits late is closed by silence first and its commit is logged
-# `commit_duplicate` (the gate's existing late-commit path).
-GATE_SETTLE_MAX_CEILING_SEC = 1.0
-
-
 def _gate_turn_settle_ms() -> int:
     """How long a group of finals the SDK never committed waits before closing.
 
-    The endpointing ceiling (the longest the SDK itself waits to commit a turn
-    on this lane), capped at `GATE_SETTLE_MAX_CEILING_SEC`, plus a margin. Up
-    to that cap a turn the SDK does commit is closed by that commit first. The
-    consent turn tightens the SDK's ceiling below this, which only widens the
-    margin.
+    The GATE's endpointing ceiling (the longest the SDK itself waits to commit a
+    turn before screening is armed) plus a margin, so a turn the SDK does commit
+    is always closed by that commit first. M014: the gate ceiling stays at the
+    pre-M014 1.0 s (`phone.phone_gate_endpointing_max_delay`) even though the
+    screening max is 2.0, so this is unchanged. The consent turn tightens the
+    SDK's ceiling below this, which only widens the margin.
     """
-    ceiling = min(
-        phone.phone_static_endpointing_max_delay(), GATE_SETTLE_MAX_CEILING_SEC)
-    return int(round(ceiling * 1000)) + gate_judge.GATE_SETTLE_MARGIN_MS
+    return (
+        int(round(phone.phone_gate_endpointing_max_delay() * 1000))
+        + gate_judge.GATE_SETTLE_MARGIN_MS
+    )
 
 
 def _gate_capture_log(**fields: Any) -> None:
@@ -5878,7 +5873,12 @@ def _build_provider_session(
         else:
             # Local Silero VAD + LiveKit v1-mini EOU, with a bounded tail.
             session_options["min_endpointing_delay"] = endpoint_min
-            session_options["max_endpointing_delay"] = endpoint_max
+            # M014: the session STARTS at the gate max (the pre-M014 1.0 s cap)
+            # so pickup / identity / consent keep their decision timing; the
+            # screening max (`endpoint_max`, 2.0 in the deploy) is applied when
+            # the screening phase is armed (`_arm_screening_endpointing_max`).
+            session_options["max_endpointing_delay"] = (
+                phone.phone_gate_endpointing_max_delay())
             # Deprecated dialect, to match the endpointing kwargs above. Mixing
             # dialects is what silently drops one set or the other.
             session_options["min_interruption_duration"] = interrupt_secs
@@ -5886,7 +5886,14 @@ def _build_provider_session(
         _log.info(
             "unknown_event", error_type="phone_turn_detection",
             error_category=turn_detection,
-            duration_sec=endpoint_max if turn_detection == phone.PHONE_TURN_DETECTION_LOCAL else None,
+            # The max the session is CONSTRUCTED with: the gate max on the
+            # fixed-local lane (M014: the screening max follows at arming, see
+            # `phone_screening_endpointing`), the plain max in dynamic mode.
+            duration_sec=(
+                None if turn_detection != phone.PHONE_TURN_DETECTION_LOCAL
+                else endpoint_max if phone.phone_dynamic_endpointing_enabled()
+                else phone.phone_gate_endpointing_max_delay()
+            ),
         )
         if turn_detection == phone.PHONE_TURN_DETECTION_LOCAL:
             _log.info(
@@ -6311,6 +6318,15 @@ async def _run_native_phone_screening(
     # in a background task while the watchdog is recovering; recovery must use
     # the objective selected for this reply, never reread that mutable cursor.
     reply_snapshot: dict[str, Any] = {}
+    # M014 PR-B: the live snapshot (cleared / updated IN PLACE, never rebound) is
+    # what the per-question minimum reads when a reply starts playing: every
+    # reply path sets it, unlike `_generation_phase`, which only
+    # `authorize_generated_reply` writes. Separate attribute, so the objective
+    # guard's own state is untouched.
+    try:
+        setattr(agent, "_endpointing_reply_snapshot", reply_snapshot)
+    except (AttributeError, TypeError):
+        pass
 
     def set_reply_snapshot(
         fallback: str | None, *, objective: str | None = None, phase: str = "screening",
@@ -12891,15 +12907,15 @@ async def _run_phone_session(
         speech_sequence[0] += 1
         created_seq = speech_sequence[0]
         reply_handle[0] = getattr(event, "speech_handle", None)
-        # M014 PR-B: note the minimum endpointing delay for the answer this reply
-        # waits for (open question: longer; yes/no and terminal phases: the static
-        # minimum). Applied once the reply is playing, only on a class change.
+        # M014 PR-B: note that a generated reply exists; the minimum endpointing
+        # delay for the answer it waits for (open question: longer; yes/no and
+        # terminal phases: the static minimum) is applied once THIS reply is
+        # playing, from the reply snapshot read then, only on a class change.
         # Screening phase only; never raises.
         try:
             endpointing_phase_state.on_speech_created(
                 source=getattr(event, "source", None),
-                phase=getattr(agent, "_generation_phase", None),
-                objective=getattr(agent, "_generation_objective", None),
+                handle=getattr(event, "speech_handle", None),
                 apply_min=_phase_min_apply,
             )
         except Exception:  # noqa: BLE001 — never breaks the speech lifecycle
@@ -13107,7 +13123,12 @@ async def _run_phone_session(
             # M014 PR-B: a generated reply is PLAYING now: apply the minimum
             # endpointing delay noted for the question it asks. Never raises.
             try:
-                endpointing_phase_state.reply_playing()
+                _snap = getattr(agent, "_endpointing_reply_snapshot", None) or {}
+                endpointing_phase_state.reply_playing(
+                    playing_handle=getattr(session, "current_speech", None),
+                    phase=_snap.get("phase"),
+                    objective=_snap.get("objective"),
+                )
             except Exception:  # noqa: BLE001 — never breaks the state hook
                 pass
             first_audio_mono = _monotonic()
@@ -14199,6 +14220,34 @@ async def _run_phone_session(
         if not callable(upd):
             return
         upd(endpointing_opts={"max_delay": float(max_delay)})
+
+    def _arm_screening_endpointing_max() -> None:
+        """M014: raise the endpointing MAX from the gate max to the screening max.
+
+        The session starts at the gate max (`phone_gate_endpointing_max_delay`,
+        the pre-M014 1.0 s) so pickup, identity and consent keep their decision
+        timing; the screening phase (open answers, mid-thought pauses) runs at
+        `phone_static_endpointing_max_delay` (2.0 in the deploy). Same seam and
+        the same fixed-local predicate as the consent setter (`_phase_min_apply`
+        is None in dynamic / stt mode). Never raises: a failed raise leaves the
+        screening on the gate max, which is the pre-M014 behaviour.
+        """
+        try:
+            if _phase_min_apply is None:
+                return
+            target = phone.phone_static_endpointing_max_delay()
+            if target <= phone.phone_gate_endpointing_max_delay():
+                return
+            _set_consent_endpointing_max(target)
+            _log.info(
+                "unknown_event", error_type="phone_screening_endpointing",
+                schema="raised", duration_sec=target,
+            )
+        except Exception:  # noqa: BLE001 — logged, the call continues
+            _log.warn(
+                "unknown_event", error_type="phone_screening_endpointing",
+                schema="raise_failed",
+            )
 
     # Fix 2: pre-render the FIXED role line during the consent wait. Enabled only
     # in deterministic-opener mode with a known role (the fixed line is then what
@@ -15674,6 +15723,7 @@ async def _run_phone_session(
             # line is ever flagged as the gate.
             assessment_persist_active[0] = True
             gate_persist_active[0] = False
+            _arm_screening_endpointing_max()
 
             _persist_kept_candidate_text = _make_kept_text_persister(
                 assessment_persist_active, item_seq, _spawn_item_persist,

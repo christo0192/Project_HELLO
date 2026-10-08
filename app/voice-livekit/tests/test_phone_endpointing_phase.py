@@ -3,10 +3,12 @@
 The 2026-10-08 interruption RCA: Sarvam is finals-only (a final arrives
 ~0.9-1.0 s after the candidate stops), so the SDK started or resumed the bot's
 reply on 0.15-0.25 s of quiet, long before the words existed. PR-B raises the
-endpointing max to 2.0 and applies a longer minimum
-(`PHONE_OPEN_ANSWER_MIN_DELAY_SEC`, 0.8) while the bot waits for an OPEN answer;
-the identity / consent gate keeps its settle timing
-(`agent.GATE_SETTLE_MAX_CEILING_SEC`).
+screening endpointing max to 2.0 and applies a longer minimum
+(`PHONE_OPEN_ANSWER_MIN_DELAY_SEC`, 0.8) while the bot waits for an OPEN answer.
+The session STARTS at the gate max (the pre-M014 1.0 s,
+`phone.phone_gate_endpointing_max_delay`) and the screening max is applied when
+the screening phase is armed, so the pickup / identity / consent turns keep their
+decision timing.
 
 Synthetic text and timelines only: no candidate data. Runs on bare python3
 (SDK stubbed via the shared `test_phone_gate` fixtures); the real-SDK facts
@@ -90,10 +92,10 @@ def _make(*, active=True, open_min=0.8, short_min=0.3):
     return phase, log, state
 
 
-def _created(tracker, **kwargs):
-    """A generated reply is created and starts playing."""
-    tracker.on_speech_created(**kwargs)
-    tracker.reply_playing()
+def _created(tracker, *, source, phase, objective, apply_min):
+    """A reply is created and starts playing; its snapshot holds phase/objective."""
+    tracker.on_speech_created(source=source, handle=None, apply_min=apply_min)
+    tracker.reply_playing(phase=phase, objective=objective)
 
 
 # ── readers, clamps and manifest pins ────────────────────────────────────────
@@ -105,7 +107,10 @@ class TestReaders(unittest.TestCase):
             ("nope", 0.8), ("nan", 0.8), ("inf", 0.8), ("0.5", 0.5), ("0.3", 0.3),
         )
         for raw, expected in cases:
-            env = {"PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": "2.0"}
+            env = {
+                "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": "2.0",
+                "PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC": "0.3",
+            }
             if raw is not None:
                 env["PHONE_OPEN_ANSWER_MIN_DELAY_SEC"] = raw
             with self.subTest(raw=raw), _Env(env):
@@ -117,6 +122,29 @@ class TestReaders(unittest.TestCase):
             "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": "0.6",
         }):
             self.assertAlmostEqual(phone.phone_open_answer_min_delay(), 0.6)
+
+    def test_open_answer_min_is_floored_at_the_static_min(self):
+        """The rollback value 0.3 can only ever be a no-op, never an inversion."""
+        with _Env({
+            "PHONE_OPEN_ANSWER_MIN_DELAY_SEC": "0.3",
+            "PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC": "0.5",
+            "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": "2.0",
+        }):
+            self.assertAlmostEqual(phone.phone_open_answer_min_delay(), 0.5)
+        # Unset static min: the reader default (0.4) is the floor.
+        with _Env({
+            "PHONE_OPEN_ANSWER_MIN_DELAY_SEC": "0.3",
+            "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": "2.0",
+        }):
+            self.assertAlmostEqual(
+                phone.phone_open_answer_min_delay(),
+                phone.phone_static_endpointing_min_delay())
+
+    def test_the_gate_max_is_capped_at_the_pre_m014_ceiling(self):
+        cases = (("2.0", 1.0), ("3.0", 1.0), ("1.0", 1.0), ("0.8", 0.8), ("0.5", 0.5))
+        for raw, expected in cases:
+            with self.subTest(raw=raw), _Env({"PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": raw}):
+                self.assertAlmostEqual(phone.phone_gate_endpointing_max_delay(), expected)
 
     def test_static_max_clamp_admits_2_0(self):
         cases = (
@@ -214,6 +242,8 @@ class TestClassifier(unittest.TestCase):
             "Okay. Can you start next month?",
             "Great. Do you ever work weekends?",
             "Is that a hard requirement, or would you consider remote?",
+            "Is your current notice period negotiable?",
+            "Is the night shift okay for you?",
         )
         for text in yes_no:
             with self.subTest(text=text):
@@ -243,27 +273,86 @@ class TestPerPhaseMinimum(unittest.TestCase):
         """Creating the reply must not change the minimum: the SDK is still
         deciding when to START it, using the class of the answer it follows."""
         phase, log, applied, apply = self._phase()
-        phase.on_speech_created(
-            source="generate_reply", phase="screening",
-            objective="Tell me about your last role", apply_min=apply)
+        phase.on_speech_created(source="generate_reply", handle=None, apply_min=apply)
         self.assertEqual(applied, [])
         self.assertEqual(log.rows, [])
-        phase.reply_playing()
+        phase.reply_playing(phase="screening", objective="Tell me about your last role")
         self.assertEqual(applied, [0.8])
-        phase.reply_playing()          # consumed: nothing is applied twice
+        phase.reply_playing(phase="screening", objective="Tell me about your last role")
+        self.assertEqual(applied, [0.8])      # consumed: nothing is applied twice
+
+    def test_the_class_is_read_when_the_reply_plays_not_when_it_is_created(self):
+        """Preemptive generation creates the reply BEFORE the turn is authorized,
+        so the snapshot still holds the previous question at creation time."""
+        phase, _, applied, apply = self._phase()
+        snapshot = {"phase": "screening", "objective": "Do you have a laptop?"}
+        phase.on_speech_created(source="generate_reply", handle=None, apply_min=apply)
+        snapshot.update(objective="Tell me about your last role")   # authorized later
+        phase.reply_playing(phase=snapshot["phase"], objective=snapshot["objective"])
         self.assertEqual(applied, [0.8])
 
     def test_a_reply_that_never_plays_does_not_change_the_minimum(self):
         phase, _, applied, apply = self._phase()
-        phase.on_speech_created(
-            source="generate_reply", phase="screening",
-            objective="Tell me about your last role", apply_min=apply)
+        phase.on_speech_created(source="generate_reply", handle=None, apply_min=apply)
         # Cancelled before any audio; the next reply asks a yes/no question.
-        phase.on_speech_created(
-            source="generate_reply", phase="screening",
-            objective="Do you have a laptop?", apply_min=apply)
-        phase.reply_playing()
+        phase.on_speech_created(source="generate_reply", handle=None, apply_min=apply)
+        phase.reply_playing(phase="screening", objective="Do you have a laptop?")
         self.assertEqual(applied, [])
+
+    def test_another_line_playing_first_does_not_consume_the_deferral(self):
+        """A say() / recovery line that plays before the generated reply must not
+        apply that reply's class early."""
+        phase, _, applied, apply = self._phase()
+        reply, say_line = object(), object()
+        phase.on_speech_created(source="generate_reply", handle=reply, apply_min=apply)
+        phase.reply_playing(
+            playing_handle=say_line, phase="screening",
+            objective="Tell me about your last role")
+        self.assertEqual(applied, [])
+        phase.reply_playing(
+            playing_handle=reply, phase="screening",
+            objective="Tell me about your last role")
+        self.assertEqual(applied, [0.8])
+
+    def test_a_finished_reply_that_never_played_drops_the_deferral(self):
+        class _Done:
+            def done(self):
+                return True
+
+        phase, _, applied, apply = self._phase()
+        phase.on_speech_created(source="generate_reply", handle=_Done(), apply_min=apply)
+        phase.reply_playing(
+            playing_handle=object(), phase="screening",
+            objective="Tell me about your last role")
+        phase.reply_playing(
+            playing_handle=object(), phase="screening",
+            objective="Tell me about your last role")
+        self.assertEqual(applied, [])
+
+    def test_a_reply_with_no_phase_keeps_the_current_class(self):
+        """The silence re-ask of an open question sets no snapshot: the class of
+        the question being re-asked is unchanged, not reset to short."""
+        phase, log, applied, apply = self._phase()
+        _created(phase, source="generate_reply", phase="screening",
+                 objective="Tell me about your last role", apply_min=apply)
+        _created(phase, source="generate_reply", phase=None,
+                 objective=None, apply_min=apply)
+        self.assertEqual(applied, [0.8])
+        self.assertEqual(log.categories(), ["open"])
+
+    def test_patience_and_qna_lines_are_open_withdrawal_and_callback_short(self):
+        phase, _, applied, apply = self._phase()
+        _created(phase, source="generate_reply", phase="patience",
+                 objective=None, apply_min=apply)
+        self.assertEqual(applied, [0.8])
+        for short in ("callback", "withdrawal_confirm", "candidate_opt_out", "candidate_end"):
+            with self.subTest(phase=short):
+                p2, _, a2, ap2 = self._phase()
+                _created(p2, source="generate_reply", phase="screening",
+                         objective="Tell me about your last role", apply_min=ap2)
+                _created(p2, source="generate_reply", phase=short,
+                         objective=None, apply_min=ap2)
+                self.assertEqual(a2, [0.8, 0.3])
 
     def test_open_then_the_same_class_is_applied_once(self):
         phase, log, applied, apply = self._phase()
@@ -534,37 +623,113 @@ _YN_Q2 = {"key": "k3", "text": "Are you open to relocating?", "mandatory": False
 
 
 class TestPerPhaseMinimumThroughTheSession(unittest.IsolatedAsyncioTestCase):
+    #: Production pins toolless; toolfirst is the explicit rollback. Preemptive
+    #: generation is off (its production value is a Fly secret that cannot be read).
+    MODES = ("toolless", "toolfirst")
+
+    def _mode_env(self, mode, **more):
+        return {"PHONE_TURN_MODE": mode, "PHONE_OBJECTIVE_PREEMPTIVE": "off", **more}
+
     async def test_open_questions_apply_the_open_minimum_once_and_closing_goes_back(self):
-        session, _ = await _SessionHarness(self).run()
-        # Q2 is open (0.8, once); the closing line is a short-answer phase (0.3).
-        self.assertEqual(session.min_updates(), [0.8, 0.3])
-        # The consent max update (gate) is a separate key and still happens.
-        self.assertTrue(any(
-            "max_delay" in (u.get("endpointing_opts") or {})
-            for u in session.option_updates))
-        for update in session.option_updates:
-            opts = update["endpointing_opts"]
-            self.assertTrue(set(opts) == {"min_delay"} or set(opts) == {"max_delay"}, opts)
+        # toolfirst applies the closing class too; toolless ends the call on the
+        # closing line, so only the open class is ever applied there.
+        expected = {"toolless": [0.8], "toolfirst": [0.8, 0.3]}
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                session, _ = await _SessionHarness(self).run(env=self._mode_env(mode))
+                self.assertEqual(session.min_updates(), expected[mode])
+                # The endpointing max updates (gate + screening) are a separate key.
+                self.assertTrue(any(
+                    "max_delay" in (u.get("endpointing_opts") or {})
+                    for u in session.option_updates))
+                for update in session.option_updates:
+                    opts = update["endpointing_opts"]
+                    self.assertTrue(
+                        set(opts) == {"min_delay"} or set(opts) == {"max_delay"}, opts)
 
     async def test_gate_isolation_no_minimum_is_sent_before_screening(self):
         """Identity, pickup and consent turns never see a minimum update: every
         `min_delay` update comes after the last gate (consent) max update."""
-        session, _ = await _SessionHarness(self).run()
-        kinds = [
-            "min" if "min_delay" in u["endpointing_opts"] else "max"
-            for u in session.option_updates
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                session, _ = await _SessionHarness(self).run(env=self._mode_env(mode))
+                kinds = [
+                    "min" if "min_delay" in u["endpointing_opts"] else "max"
+                    for u in session.option_updates
+                ]
+                self.assertIn("min", kinds)
+                self.assertIn("max", kinds)
+                self.assertLess(
+                    max(i for i, k in enumerate(kinds) if k == "max"),
+                    min(i for i, k in enumerate(kinds) if k == "min"),
+                    kinds)
+
+    async def test_the_session_starts_at_the_gate_max_and_screening_raises_it(self):
+        """M014: pickup / identity / consent run at the pre-M014 1.0 s max, NOT the
+        screening 2.0. The consent turn tightens to 0.5 and restores to 1.0, and
+        the 2.0 arrives only when the screening phase is armed (after the gate,
+        before the first screening reply)."""
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                session, _ = await _SessionHarness(self).run(env=self._mode_env(mode))
+                self.assertEqual(session.ctor["max_endpointing_delay"], 1.0)
+                self.assertEqual(session.ctor["min_endpointing_delay"], 0.3)
+                maxes = [
+                    u["endpointing_opts"]["max_delay"] for u in session.option_updates
+                    if "max_delay" in u["endpointing_opts"]
+                ]
+                self.assertEqual(maxes, [0.5, 1.0, 2.0])
+
+    async def test_the_rollback_max_never_raises_above_the_gate(self):
+        session, _ = await _SessionHarness(self).run(
+            env=self._mode_env("toolless", PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC="1.0"))
+        self.assertEqual(session.ctor["max_endpointing_delay"], 1.0)
+        maxes = [
+            u["endpointing_opts"]["max_delay"] for u in session.option_updates
+            if "max_delay" in u["endpointing_opts"]
         ]
-        self.assertIn("min", kinds)
-        self.assertIn("max", kinds)
-        self.assertLess(
-            max(i for i, k in enumerate(kinds) if k == "max"),
-            min(i for i, k in enumerate(kinds) if k == "min"),
-            kinds)
+        self.assertEqual(maxes, [0.5, 1.0])
+
+    async def test_a_failed_screening_raise_leaves_the_gate_max_and_the_call_runs(self):
+        class _NoRaise(_RecordingSession):
+            def update_options(self, **kwargs):
+                if (kwargs.get("endpointing_opts") or {}).get("max_delay") == 2.0:
+                    raise RuntimeError("update_options failed")
+                return super().update_options(**kwargs)
+
+        session, client = await _SessionHarness(self).run(
+            session_cls=_NoRaise, env=self._mode_env("toolless"))
+        self.assertIn("assessment.completed", client.event_types)
+
+    async def test_the_agent_seam_classifies_from_the_snapshot_when_the_reply_plays(self):
+        """The class comes from the reply snapshot read at first audio: the
+        phases/objectives the module sees are the question just asked."""
+        seen: list = []
+        real = endpointing_phase.PhoneEndpointingPhase.reply_playing
+
+        def spy(self_, **kwargs):
+            seen.append((kwargs.get("phase"), kwargs.get("objective")))
+            return real(self_, **kwargs)
+
+        for mode in self.MODES:
+            seen.clear()
+            with self.subTest(mode=mode), patch.object(
+                endpointing_phase.PhoneEndpointingPhase, "reply_playing", spy,
+            ):
+                await _SessionHarness(self).run(
+                    questions=[_OPEN_Q, _YN_Q, _YN_Q2],
+                    replies=["I built it.", "Yes.", "No."],
+                    env=self._mode_env(mode))
+            phases = [p for p, _ in seen if p]
+            self.assertIn("screening", phases)
+            self.assertTrue(
+                any(o and "laptop" in o for p, o in seen if p == "screening"), seen)
 
     async def test_an_open_first_question_gets_the_open_minimum_when_heard(self):
         """Q1 is a say() line, so no generated reply noted its class."""
         session, _ = await _SessionHarness(self).run(
-            questions=[_OPEN_Q, _YN_Q, _YN_Q2], replies=["I built it.", "Yes.", "No."])
+            questions=[_OPEN_Q, _YN_Q, _YN_Q2], replies=["I built it.", "Yes.", "No."],
+            env=self._mode_env("toolfirst"))
         self.assertEqual(session.min_updates()[:1], [0.8])
         # Q2 is a yes/no: back to the static minimum once it plays.
         self.assertEqual(session.min_updates()[:2], [0.8, 0.3])
@@ -576,18 +741,25 @@ class TestPerPhaseMinimumThroughTheSession(unittest.IsolatedAsyncioTestCase):
 
     async def test_a_yes_no_question_returns_to_the_static_minimum(self):
         session, _ = await _SessionHarness(self).run(
-            questions=[_YN_Q, _OPEN_Q, _YN_Q2], replies=["Yes.", "I built it.", "No."])
+            questions=[_YN_Q, _OPEN_Q, _YN_Q2], replies=["Yes.", "I built it.", "No."],
+            env=self._mode_env("toolfirst"))
         self.assertEqual(session.min_updates(), [0.8, 0.3])
 
     async def test_dynamic_endpointing_is_not_touched(self):
         session, _ = await _SessionHarness(self).run(
             env={"PHONE_DYNAMIC_ENDPOINTING": "on"})
         self.assertEqual(session.min_updates(), [])
+        self.assertNotIn(2.0, [
+            (u.get("endpointing_opts") or {}).get("max_delay")
+            for u in session.option_updates])
 
     async def test_stt_turn_detection_is_not_touched(self):
         session, _ = await _SessionHarness(self).run(
             env={"PHONE_TURN_DETECTION": "stt"})
         self.assertEqual(session.min_updates(), [])
+        self.assertNotIn(2.0, [
+            (u.get("endpointing_opts") or {}).get("max_delay")
+            for u in session.option_updates])
 
     async def test_a_failing_update_never_breaks_the_call(self):
         class _Failing(_RecordingSession):
@@ -603,24 +775,45 @@ class TestPerPhaseMinimumThroughTheSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.min_updates(), [])
 
 
+class TestEveryReplyPhaseIsClassified(unittest.TestCase):
+    """Every `phase=` literal agent.py puts in a reply snapshot has a documented
+    class, so a new phase cannot silently fall into the wrong one."""
+
+    OPEN = {"candidate_qna", "patience", "post_interrupt_ack", "resume_conflict",
+            "screening", "wind_down"}
+    SHORT = {"callback", "candidate_end", "candidate_opt_out", "close_scheduled",
+             "closing", "drop_or_timeout", "exception", "name_confirm",
+             "revocation_confirm", "teardown", "withdrawal_confirm"}
+
+    def test_the_phase_literals_in_agent_py(self):
+        source = (_CTX / "agent.py").read_text(encoding="utf-8")
+        found = set(re.findall(r'phase="([a-z_]+)"', source))
+        self.assertGreater(len(found), 10)
+        self.assertEqual(found - self.OPEN - self.SHORT, set(), "unclassified phase")
+        for phase in sorted(found):
+            with self.subTest(phase=phase):
+                expected = "open" if phase in self.OPEN else "short"
+                self.assertEqual(
+                    endpointing_phase.classify_answer_endpointing(phase, None), expected)
+        self.assertEqual(self.OPEN, set(endpointing_phase.OPEN_PHASES))
+
+
 # ── the gate at the production max of 2.0 ────────────────────────────────────
 
 class TestGateReplaysAtProductionMax(unittest.TestCase):
-    """The gate at the production max of 2.0.
+    """The gate at the production screening max of 2.0.
 
-    `gate_replay` strips the env override and so runs on the code default
-    (0.8). Every replay case is re-run with that default patched to 2.0.
-
-    M014 decision: an uncapped settle (max + 250 ms) changed the closing path of
-    two cases at max >= ~1.2. The gate settle is pinned to the old 1.0 max
-    (`agent.GATE_SETTLE_MAX_CEILING_SEC`), so the gate keeps today's timing and
-    every replay case passes at 2.0.
+    The session starts at the GATE max (`phone.phone_gate_endpointing_max_delay`,
+    the pre-M014 1.0 s) and the screening max is applied only when the screening
+    phase is armed, so the SDK's own commit timing on identity / pickup / consent
+    turns is the pre-M014 timing too (the replay fixtures carry recorded commit
+    times, so the replay alone cannot show that; the max the SDK is given is
+    pinned in `TestPerPhaseMinimumThroughTheSession`). `gate_replay` strips the
+    env override and runs on the code default (0.8); every replay case is re-run
+    with that default patched to 2.0.
     """
 
     KNOWN_DIVERGENT = frozenset()
-
-    def test_the_ceiling_is_the_old_max(self):
-        self.assertEqual(agent_mod.GATE_SETTLE_MAX_CEILING_SEC, 1.0)
 
     def test_the_gate_settle_keeps_the_1_0_timing_at_2_0(self):
         with _Env():
@@ -634,7 +827,7 @@ class TestGateReplaysAtProductionMax(unittest.TestCase):
         self.assertEqual(at_1_0, 1250)
         self.assertEqual(at_0_8, 1050)
 
-    def test_the_settle_follows_the_env_but_never_exceeds_the_cap(self):
+    def test_the_settle_follows_the_env_but_never_exceeds_the_gate_ceiling(self):
         for raw, expected in (("0.5", 750), ("1.0", 1250), ("2.0", 1250), ("3.0", 1250)):
             with self.subTest(raw=raw), _Env({"PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": raw}):
                 self.assertEqual(agent_mod._gate_turn_settle_ms(), expected)

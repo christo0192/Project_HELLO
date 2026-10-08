@@ -2,16 +2,25 @@
 
 The bot waits for two kinds of answer. An OPEN one ("tell me about ...", "what /
 how / when ...") is where a candidate pauses to think, so the SDK should wait a
-little longer before it starts the reply (``min_delay / 2`` of quiet). A SHORT
-one (yes/no, name confirmation, callback, closing) keeps the static minimum.
+little longer before it starts the reply: the SDK's reply-start silence gate is
+``min_delay / 2`` of quiet, capped in practice by the deployed Silero VAD, which
+ends speech after 0.25 s of silence (so the gate moves from 0.15 s to about
+0.25 s; a longer gate needs a longer VAD ``min_silence_duration``, an owner
+decision outside this module). A SHORT one (yes/no, name confirmation, callback,
+closing) keeps the static minimum.
 
-``PhoneEndpointingPhase`` notes the class of the answer a generated reply asks
-for when the reply is created, and applies the matching minimum once that reply
-is PLAYING (the SDK is still deciding when to START the reply, using the minimum
-of the answer it follows, so the change must not land earlier). It applies a
-value only on a class change, only while the screening phase is active, and a
-failure is logged and swallowed. Identity, pickup and consent turns are never
-touched (``active`` is False until the screening phase is armed).
+``PhoneEndpointingPhase`` notes that a generated reply was created, and applies
+the minimum for the answer THAT reply asks for once the reply is PLAYING (the
+SDK is still deciding when to START the reply, using the minimum of the answer it
+follows, so the change must not land earlier). The class is read from the reply
+snapshot at that moment (every reply path sets it; with preemptive generation the
+reply is created before the turn is authorized, so reading at creation would lag
+one question). The deferral is bound to the speech handle: a different line
+(a ``say()``) that plays first does not consume it. An unknown phase keeps the
+current class. It applies a value only on a class change, only while the
+screening phase is active, and a failure is logged and swallowed. Identity,
+pickup and consent turns are never touched (``active`` is False until the
+screening phase is armed).
 
 No hold, no carry, no yield: this module never delays or drops a reply.
 Content-free logging: a class, a duration and a bounded phase identifier only.
@@ -28,10 +37,11 @@ ERROR_TYPE_PHASE = "phone_endpointing_phase"
 OPEN = "open"
 SHORT = "short"
 
-#: Reply phases whose next answer is open-ended. Everything else (name confirm,
-#: callback, withdrawal/revocation confirm, opt-out, end, closing,
-#: close_scheduled, drop_or_timeout, exception, teardown, None/unknown) is a
-#: short answer and keeps the static minimum.
+#: Reply phases whose next answer is open-ended. Every other NAMED phase (name
+#: confirm, callback, withdrawal/revocation confirm, opt-out, end, closing,
+#: close_scheduled, drop_or_timeout, exception, teardown) is a short answer and
+#: keeps the static minimum. A reply with NO phase (None) keeps the current
+#: class (see `PhoneEndpointingPhase.reply_playing`).
 OPEN_PHASES = frozenset({
     "screening",
     "resume_conflict",
@@ -51,7 +61,7 @@ _OPEN_MARKERS_RE = re.compile(
 _YES_NO_CLAUSE_RE = re.compile(
     r"(^|[.?!:,;]\s*(and|or|so)?\s*)"
     r"(are|is|do|does|did|have|has|can|could|would|will|were|was|should|may)"
-    r"\s+(you|we|there|it|that|this)\b"
+    r"\s+(you|we|there|it|that|this|your|the|a|an|my|our|their)\b"
 )
 
 
@@ -101,7 +111,7 @@ class PhoneEndpointingPhase:
         self._phase_apply = apply_min
         self._min_class = SHORT
         self._applied_min: Optional[float] = None
-        self._deferred: Optional[tuple[str, Any, Callable[[float], Any]]] = None
+        self._pending: Optional[tuple[Any, Callable[[float], Any]]] = None
 
     def _is_active(self) -> bool:
         try:
@@ -129,21 +139,19 @@ class PhoneEndpointingPhase:
         self,
         *,
         source: Any,
-        phase: Any,
-        objective: Any,
+        handle: Any,
         apply_min: Optional[Callable[[float], Any]],
     ) -> None:
-        """Note the minimum for the answer the bot will wait for once this reply
-        has been spoken. Generated replies only (``say`` lines keep the current
-        class) and only while the screening phase is active. Nothing is applied
-        here; see ``reply_playing``. Never raises."""
+        """Note that a generated reply was created; the minimum for its answer is
+        applied when THAT reply plays (see ``reply_playing``). Generated replies
+        only (``say`` lines keep the current class) and only while the screening
+        phase is active. Nothing is applied here. Never raises."""
         try:
             if apply_min is None or source != "generate_reply":
                 return
             if not self._is_active():
                 return
-            self._deferred = (
-                classify_answer_endpointing(phase, objective), phase, apply_min)
+            self._pending = (handle, apply_min)
         except Exception:  # noqa: BLE001
             pass
 
@@ -159,18 +167,47 @@ class PhoneEndpointingPhase:
         except Exception:  # noqa: BLE001
             pass
 
-    def reply_playing(self) -> None:
-        """A generated reply started PLAYING (``agent_state_changed`` ->
-        ``speaking``): apply the minimum noted by ``on_speech_created`` (only
-        when its class changes). Never raises."""
+    def reply_playing(
+        self, *, playing_handle: Any = None, phase: Any = None, objective: Any = None,
+    ) -> None:
+        """A reply started PLAYING (``agent_state_changed`` -> ``speaking``):
+        apply the minimum for the answer it asks for, read from the reply
+        snapshot's ``phase`` / ``objective`` NOW (only when the class changes).
+
+        ``playing_handle`` is the speech now playing. When it is known and is not
+        the generated reply noted by ``on_speech_created`` (a ``say()`` line, a
+        watchdog recovery line), the deferral is kept for that reply, or dropped
+        when that reply has already finished without playing. A reply with no
+        phase keeps the current class. Never raises."""
         try:
-            deferred, self._deferred = self._deferred, None
-            if deferred is None:
+            pending = self._pending
+            if pending is None:
                 return
-            wanted, phase, apply_min = deferred
-            self._apply_class(wanted, phase, apply_min)
+            handle, apply_min = pending
+            if (
+                handle is not None and playing_handle is not None
+                and playing_handle is not handle
+            ):
+                if self._handle_done(handle):
+                    self._pending = None
+                return
+            self._pending = None
+            if not self._is_active():
+                return
+            if not isinstance(phase, str) or not phase.strip():
+                return
+            self._apply_class(
+                classify_answer_endpointing(phase, objective), phase, apply_min)
         except Exception:  # noqa: BLE001
             pass
+
+    @staticmethod
+    def _handle_done(handle: Any) -> bool:
+        try:
+            done = getattr(handle, "done", None)
+            return bool(done()) if callable(done) else False
+        except Exception:  # noqa: BLE001
+            return False
 
     def _apply_class(
         self, wanted: str, phase: Any, apply_min: Callable[[float], Any],

@@ -66,22 +66,31 @@ and delivers a final 0.9-1.0 s after the candidate stops, so the SDK used to sta
 words existed. Two changes:
 
 1. MAX `1.0` -> `2.0`. It costs up to +1.0 s only on a turn the end-of-utterance
-   model scores incomplete (a bare "yes" can score incomplete); the consent turn
-   keeps its own `0.5`. The identity / pickup / consent gate keeps its decision
-   timing: the gate's turn-settle (how long finals the SDK never committed wait
-   before the gate closes the turn) is capped at the old `1.0` s
-   (`GATE_SETTLE_MAX_CEILING_SEC` in `agent.py`), so a turn the SDK commits later
-   than that is closed by silence first and its commit is logged
-   `commit_duplicate`, exactly as before.
+   model scores incomplete (a bare "yes" can score incomplete), on SCREENING turns
+   only. The identity / pickup / consent gate keeps its decision timing: the
+   session STARTS at the gate max (`min(PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC, 1.0)`,
+   `phone_gate_endpointing_max_delay`), the consent turn tightens to `0.5` and
+   restores to that gate max, and the screening max (`2.0`) is applied only when
+   the screening phase is armed (`_arm_screening_endpointing_max` in `agent.py`,
+   logged as `phone_screening_endpointing` `raised`). The gate's turn-settle (how
+   long finals the SDK never committed wait before the gate closes the turn) is
+   sized from the gate max, so it is unchanged (1250 ms).
 2. Per-question MIN: while the bot waits for an OPEN answer (what / how / tell me,
-   candidate Q&A, resume conflict, patience) the minimum is `0.8`, so a reply needs
-   0.4 s of quiet before it starts instead of 0.15 s. Yes/no screening questions,
+   candidate Q&A, resume conflict, patience) the minimum is `0.8`. The SDK's
+   reply-start gate is `min / 2` of quiet, but the deployed Silero VAD ends speech
+   after 0.25 s of silence and the SDK then releases the gate regardless, so the
+   **effective gain is about 0.1 s (the gate moves from 0.15 s to about 0.25 s),
+   not 0.4 s.** A longer gate needs a longer VAD `min_silence_duration`, a VAD
+   change that also touches the consent gate and barge-in; it is an owner
+   decision and is NOT part of this change. Yes/no screening questions,
    name confirm, callback and every terminal phase keep `0.3`, and the identity,
    pickup and consent turns are never changed (the minimum is applied only once
-   the screening phase is armed). The class changes when the bot's reply STARTS
-   PLAYING (the question it asks; the session's `speaking` state), never earlier,
-   so the reply to an answer is still gated by that answer's own class, and only
-   when the class actually changes. The first planned question is a spoken line,
+   the screening phase is armed). The class is read from the reply snapshot (the
+   question the reply asks) when that reply STARTS PLAYING (the session's
+   `speaking` state, bound to the reply's own speech handle), never earlier, so
+   the reply to an answer is still gated by that answer's own class, and only
+   when the class actually changes. A reply with no phase keeps the current
+   class. The first planned question is a spoken line,
    so its class is applied once it has been heard. Fixed-local endpointing only:
    the opt-in dynamic mode and `PHONE_TURN_DETECTION=stt` are not touched. A
    failed update is logged and swallowed; the call carries on with the previous
@@ -108,10 +117,30 @@ LLM-invoke-to-first-audio floor that four prior PRs were spent removing.
 **Logs to watch after an endpointing deploy (categories and timings only; never
 text):**
 
+- First call after the deploy: `phone_turn_detection` `duration_sec=1.0` (the max
+  the session is CONSTRUCTED with: the gate max) followed, after consent, by
+  `phone_screening_endpointing` `schema=raised` `duration_sec=2.0` (the screening
+  max actually applied). A missing `raised` line, or `raise_failed`, means the
+  screening runs at the old 1.0 max; a `duration_sec` other than the above means a
+  Fly secret is shadowing the toml (`fly secrets list` shows names only).
 - `phone_endpointing_phase`: `open` | `short` (`duration_sec` = the minimum
   applied, `phase`), `apply_failed`.
 - The headline latency (alarm: median candidate-stop to bot-audio above 3.2 s);
   the nightly talk-over rate (target 0).
+
+**Historical (2026-09-10, SUPERSEDED, kept for the audit trail).** The previous
+rollback point recorded two voice-tuning values that had been set by hand as Fly
+secrets (secrets are opaque; `fly secrets list` shows names and digests only):
+
+| Secret (`project-hello-phone-voice`) | Before 2026-09-10 | Set 2026-09-10 | toml `[env]` (shadowed) |
+|---|---|---|---|
+| `PHONE_TTS_FLUSH_MIN_CHARS` | `20` | `40` | `60` |
+| `PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC` | `1.5` | `1.25` | `2.5` |
+
+Evidence for superseding it: on 2026-10-08 `fly secrets list` showed none of the
+voice-tuning names, and `fly config show` `[env]` matched `fly.phone.toml`. Re-run
+`fly secrets list -a project-hello-phone-voice` as a pre-deploy check; if any of
+the names in the table above appears, unset it AFTER the deploy.
 
 `PHONE_TTS_PACE` is deliberately NOT set anywhere. The reader exists
 (`phone_tts_pace()`, default `1.0`) so it can be applied as a secret, but the

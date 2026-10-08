@@ -19603,8 +19603,19 @@ class TestConsentLatencyFixes(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(result.assessment_allowed)
         # Tighten to the consent ceiling for the consent turn, then restore the
-        # configured mid-answer tail — in that order, exactly once each.
-        self.assertEqual(calls, [0.4, 2.5])
+        # GATE max (M014: the static max capped at the pre-M014 1.0 s; the
+        # screening max is applied later, when the screening phase is armed) —
+        # in that order, exactly once each.
+        self.assertEqual(calls, [0.4, 1.0])
+
+    async def test_consent_restore_follows_a_static_max_below_the_gate_cap(self):
+        calls: list[float] = []
+        with patch.dict(os.environ, {
+            "PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC": "0.4",
+            "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": "0.8",
+        }):
+            await self._run_gate(set_endpointing_max=lambda m: calls.append(m))
+        self.assertEqual(calls, [0.4, 0.8])
 
     async def test_endpointing_untouched_when_no_setter_wired(self):
         # Absent setter ⇒ byte-identical behaviour; the gate still consents.

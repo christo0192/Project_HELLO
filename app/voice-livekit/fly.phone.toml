@@ -230,20 +230,26 @@ kill_timeout = 300
   # the FINAL's arrival, not the endpointer, was what committed a turn, and a
   # ready reply needed only min/2 = 0.15 s of quiet to start: the bot talked into
   # breath gaps. MAX only bounds the wait on a turn the EOU scores incomplete (a
-  # bare "yes" included), so the owner accepts up to +1.0 s there. The consent
-  # turn keeps its own 0.5 s max (phone_consent_endpointing_max_delay), and the
-  # identity / consent gate keeps its decision timing: the gate's turn-settle is
-  # capped at the old 1.0 s (agent.GATE_SETTLE_MAX_CEILING_SEC).
+  # bare "yes" included), so the owner accepts up to +1.0 s there, on the
+  # SCREENING turns only. The session STARTS at the gate max (this value capped
+  # at the old 1.0 s, phone_gate_endpointing_max_delay) so pickup / identity /
+  # consent keep their decision timing (the consent turn also keeps its own 0.5 s
+  # max, phone_consent_endpointing_max_delay); this value is applied when the
+  # screening phase is armed (agent._arm_screening_endpointing_max).
   # ROLLBACK: edit this file and deploy; or, in an emergency,
   #   fly secrets set PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC=1.0 -a project-hello-phone-voice
   # and UNSET the secret afterwards (a secret shadows this line).
   PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC = "0.3"
   PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "2.0"
   # M014: the MIN used while the bot waits for an OPEN answer (what / how / tell
-  # me ... , Q&A, resume conflict, patience), so a reply needs min/2 = 0.4 s of
-  # quiet before it starts instead of 0.15 s. Yes/no screening questions, name
-  # confirm, callback, closing and the identity / consent turns keep the 0.3
-  # above. Clamp [0.3, 1.2] and never above the MAX. Fixed-local endpointing only.
+  # me ... , Q&A, resume conflict, patience). The SDK's reply-start gate is
+  # min/2 of quiet, but the deployed Silero VAD ends speech after 0.25 s of
+  # silence and the SDK then releases the gate regardless, so the EFFECTIVE gate
+  # moves from 0.15 s to about 0.25 s (not to min/2 = 0.4 s); a longer gate needs
+  # a longer VAD min_silence_duration (owner decision, not part of this change).
+  # Yes/no screening questions, name confirm, callback, closing and the identity /
+  # consent turns keep the 0.3 above. Clamp [0.3, 1.2], never below the static MIN
+  # and never above the MAX. Fixed-local endpointing only.
   # ROLLBACK: "0.3" makes the per-question minimum a no-op.
   PHONE_OPEN_ANSWER_MIN_DELAY_SEC = "0.8"
 

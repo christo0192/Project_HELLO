@@ -2362,7 +2362,8 @@ def phone_static_endpointing_max_delay() -> float:
     pause breathe like the browser lane at near-zero common-case latency cost.
     The MIN reader and its [0.3, 0.5] clamp are unchanged.
 
-    M014: deploy pins 2.0 (fly.phone.toml)."""
+    M014: deploy pins 2.0 (fly.phone.toml) for the SCREENING phase; the gate
+    (pickup / identity / consent) runs at `phone_gate_endpointing_max_delay`."""
     raw = os.getenv("PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC")
     if raw in (None, ""):
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
@@ -2371,6 +2372,21 @@ def phone_static_endpointing_max_delay() -> float:
     except ValueError:
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
     return min(3.0, max(0.5, value))
+
+
+#: M014: before the screening phase is armed (pickup, identity, consent) the
+#: endpointing MAX stays at the pre-M014 ceiling, so the gate's decision timing
+#: is unchanged by the screening max of 2.0. The screening max is applied when
+#: the screening phase is armed (agent.py ``_arm_screening_endpointing_max``).
+PHONE_GATE_ENDPOINTING_MAX_CEILING_SEC = 1.0
+
+
+def phone_gate_endpointing_max_delay() -> float:
+    """Endpointing MAX for the gate (pickup / identity / consent): the screening
+    MAX (``phone_static_endpointing_max_delay``) capped at the pre-M014 1.0 s.
+    Equal to the screening MAX whenever that is <= 1.0 (the rollback)."""
+    return min(
+        phone_static_endpointing_max_delay(), PHONE_GATE_ENDPOINTING_MAX_CEILING_SEC)
 
 
 #: Short max-endpointing for the CONSENT turn only (2026-09-09 latency RCA). A
@@ -2415,20 +2431,27 @@ def phone_local_endpointing_delays() -> tuple[float, float]:
 #: Sarvam is finals-only and delivers a final ~0.9-1.0 s after speech ends, so a
 #: 0.3 s MIN is long gone by the time the words exist; the MIN that matters for
 #: turn-taking is the SDK's reply-start silence gate (``min_delay / 2``): with
-#: 0.3 a reply needed only 0.15 s of quiet and landed in breath gaps. 0.8 makes
-#: that 0.4 s for the questions where a candidate pauses to think.
+#: 0.3 a reply needed only 0.15 s of quiet and landed in breath gaps. A raised
+#: MIN lifts that gate, BUT the deployed Silero VAD (``inference.VAD(model=
+#: "silero")``, ``min_silence_duration`` 0.25 s) emits END_OF_SPEECH after 0.25 s
+#: of silence and the SDK then releases the gate unconditionally, so the
+#: effective gate moves from 0.15 s to about 0.25 s, not to ``min / 2``. A larger
+#: gain needs a longer VAD ``min_silence_duration`` (a VAD change that also
+#: touches the consent gate and barge-in: an owner decision, not made here).
 PHONE_OPEN_ANSWER_MIN_DELAY_SEC_DEFAULT = 0.8
 
 
 def phone_open_answer_min_delay() -> float:
     """MIN endpointing delay for OPEN-answer questions, default 0.8s.
 
-    Bounded to [0.3, 1.2] and never above ``phone_static_endpointing_max_delay``
-    (a min above the max would invert the SDK's own bounds). An unset, empty,
-    non-numeric or non-finite value falls back to the default.
-    ``PHONE_OPEN_ANSWER_MIN_DELAY_SEC=0.3`` makes the per-question minimum a no-op
-    (the live ``PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC`` is also 0.3). Read at
-    the call site with the literal name so the env-contract scanner sees it.
+    Bounded to [0.3, 1.2], never below ``phone_static_endpointing_min_delay``
+    (so the rollback value ``0.3`` can only ever be a no-op, never invert the
+    feature) and never above ``phone_static_endpointing_max_delay`` (a min above
+    the max would invert the SDK's own bounds). An unset, empty, non-numeric or
+    non-finite value falls back to the default.
+    ``PHONE_OPEN_ANSWER_MIN_DELAY_SEC=0.3`` makes the per-question minimum a no-op.
+    Read at the call site with the literal name so the env-contract scanner sees
+    it.
     """
     raw = os.getenv("PHONE_OPEN_ANSWER_MIN_DELAY_SEC")
     value = PHONE_OPEN_ANSWER_MIN_DELAY_SEC_DEFAULT
@@ -2440,6 +2463,7 @@ def phone_open_answer_min_delay() -> float:
         if math.isfinite(parsed):
             value = parsed
     value = min(1.2, max(0.3, value))
+    value = max(value, phone_static_endpointing_min_delay())
     return min(value, phone_static_endpointing_max_delay())
 
 
@@ -9343,7 +9367,7 @@ async def run_phone_gate(
     # sees the restored value. No-op unless a setter is wired and the consent max
     # is strictly shorter than the global max (the rollback: set them equal).
     consent_max = phone_consent_endpointing_max_delay()
-    normal_max = phone_static_endpointing_max_delay()
+    normal_max = phone_gate_endpointing_max_delay()
     tightened_endpointing = False
     if set_endpointing_max is not None and consent_max < normal_max:
         try:
