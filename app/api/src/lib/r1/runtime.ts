@@ -56,7 +56,10 @@ import type { R1AssessmentOptions } from '../../services/r1-assessment.js';
 export const R1_RUNTIME_QUEUES: readonly string[] = [R1_ASSESSMENT_QUEUE];
 
 export const R1_RUNTIME_BOUNDS = {
-  /** A scoring job is bounded by ~4 model calls of 180 s; the runner heartbeats the lease. */
+  /**
+   * A scoring job is bounded by 2 x 4 sequential model calls of 300 s (run 0, then the others;
+   * see deepseek-runner.ts); the runner heartbeats the lease every third of it.
+   */
   jobLeaseSeconds: 600,
   queuePollMs: 5_000,
   statusPollMs: 60_000,

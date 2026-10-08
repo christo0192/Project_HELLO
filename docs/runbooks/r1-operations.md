@@ -500,11 +500,74 @@ the session gets a `human_review` placeholder with code `r1_scorecard_mismatch`,
 the job succeeds, and nothing is retried. Run the seed (below) to fix it; a later
 re-score supersedes the placeholder.
 
-**Provider outages defer.** A DeepSeek timeout, a connection failure or R1's own open
-circuit breaker defers the job (reason `r1_provider_unavailable`, delay at least the
-60 s breaker cooldown) instead of failing it: the attempt is refunded, so a short
-outage does not dead-letter the job. A deferral streak is capped at 60 minutes; past
-it the failure takes the normal retry, placeholder and DLQ path.
+**Provider outages defer.** A DeepSeek timeout, a connection failure, a rate limit
+(429), a server error (5xx) or R1's own open circuit breaker defers the job (reason
+`r1_provider_unavailable`, delay at least the 60 s breaker cooldown) instead of failing
+it: the attempt is refunded, so a short outage does not dead-letter the job. The set of
+deferrable codes is explicit (`R1_DEFERRABLE_CODES` in `lib/r1/assessment-handler.ts`).
+The wait is bounded twice: a deferral streak is capped at 60 minutes, and a job is
+deferred at most 30 times in its life (`job_queue.defer_count`, which a counted failure
+does not reset). Past either bound the failure takes the normal retry, placeholder and
+DLQ path. **A job that defers writes no placeholder**, not even on its last attempt: it
+is alive and will be scored, so HR sees no outcome yet instead of a wrong "scoring
+failed". The placeholder is written only when the job is really ending.
+
+**Scoring failure codes (R1-Q).** The DeepSeek HTTP status is no longer dropped. The
+code lands in `job_queue.error_message` and, once dead-lettered, in `job_dlq.error_message`
+and `v_funnel_failures` as `r1:<code>`.
+
+| Code | Cause | Deferred? | What to do |
+|---|---|---|---|
+| `deepseek_insufficient_balance` | HTTP 402: the DeepSeek account balance is exhausted | No (waiting cannot fix it) | Top up the balance, then replay (below) |
+| `deepseek_auth` | HTTP 401 or 403: DeepSeek rejected the API key | No | Fix the `DEEPSEEK_API_KEY` secret, then replay |
+| `deepseek_rate_limited` | HTTP 429 | Yes | None unless it dead-letters (cap reached): replay once the limit clears |
+| `deepseek_server_error` | HTTP 5xx | Yes | Same |
+| `deepseek_timeout`, `deepseek_connection` | The call timed out (300 s) or the network failed | Yes | Same; a repeated timeout on one session means the transcript is too long for one call |
+| `provider_circuit_open` | R1's own breaker is open after repeated provider failures (a side effect, not a cause) | Yes | Look for the failure that opened it in the log lines before it |
+| `deepseek_http_<status>` | Any other non-2xx status (for example 400 or 422) | No | Read the status; usually a request or model-name problem |
+| `deepseek_protocol` | A 200 whose body could not be used | No | Check the provider status page |
+
+The two actionable codes carry a plain sentence on the `human_review` placeholder HR
+sees ("the DeepSeek balance is exhausted (HTTP 402); top up the DeepSeek account, and the
+job can be replayed after the top-up"). No log line, code or message contains the key
+or the provider's response body; the warn line `r1_assessment_failed` carries the code
+and an `http_status` field.
+
+**Scoring order and timeout (R1-Q).** Each call may take up to 300 s (the shared
+ceiling; 180 s was too short for a long role-play at reasoning `high`). Run 0 is scored
+alone and the other two runs start only after it succeeds. A provider failure therefore
+costs one call, not three, and a half-open breaker (which admits exactly one probe) is
+closed by run 0 before the other two run, so it can no longer fail an attempt that its
+own probe passed. Worst case per job is 2 x 4 sequential calls = 2400 s, inside the 3600 s
+absolute lease (the runner heartbeats the 600 s lease every 200 s).
+
+**Replaying a dead-lettered scoring job (owner / operator step).** The code never
+replays anything by itself, and a replay is deliberately a human decision.
+
+1. Fix the cause first. For `deepseek_insufficient_balance`, open the DeepSeek
+   dashboard for the account that owns the **production** key (the Fly secret
+   `DEEPSEEK_API_KEY` on `project-hello-api`; do not assume the dev key in
+   `app/api/.env` is the same account), check the balance and the usage graph for the
+   failure window, and top up. For `deepseek_auth`, correct the secret and redeploy.
+2. Find the job (read-only):
+   `select id, attempts, max_attempts, error_message, failed_at from screening_v2.job_dlq
+   where name = 'r1.assessment' order by failed_at desc;`
+3. Replay it with the platform procedure, `screening_v2.replay_dlq_job(<dlq id>)` as
+   the service role (`docs/runbooks/queue-leases.md`): it inserts one pending replacement
+   job (attempts 0, `defer_count` 0, `dedup_key` null) and removes the DLQ row. The
+   scorer then runs normally, and a successful re-score supersedes the placeholder as the
+   next assessment revision.
+4. Replay only AFTER the R1-Q scoring fixes (300 s timeout, run 0 first) are deployed.
+   Owner test session `b58c7d9c`: DLQ id `f2123f6e-3875-441a-94c2-725d9ed21f42`, dead-lettered
+   `deepseek_protocol` at 2026-10-08 08:34:37 UTC (probably a 402). Replaying it before
+   the fix is deployed risks another billed hour of 180 s timeouts.
+5. Confirm: the job leaves `job_queue` as `completed`, the session has an `assessments`
+   row with `schema_version = 2` and the next revision, and `v_funnel_failures` no longer
+   lists it.
+
+The phone scorer shares the DeepSeek account but not this code. A `phone.assessment`
+job that dead-lettered for the same balance reason is replayed with the same
+procedure (step 3) once the balance is topped up; this change does not touch it.
 
 **Switches.** `R1_ENABLED` (API env) builds the runtime. `r1_settings.enabled`
 gates claiming. `r1_settings.auto_status_enabled` (default **off**, owner-only,
@@ -554,8 +617,9 @@ open owner decision; today it is one.
 
 **Alerts.** Dead-lettered scoring jobs appear in `v_funnel_failures` as stage
 `scoring` with code `r1:<code>` (`r1.recording.*` as `recording`, other `r1.*` as
-`call`). Replay with the platform DLQ replay procedure; a successful re-score
-supersedes the placeholder as the next assessment revision.
+`call`). Replay with the platform DLQ replay procedure (steps under "Replaying a
+dead-lettered scoring job" above); a successful re-score supersedes the placeholder as
+the next assessment revision.
 
 **Worker contract (`session_facts`).** The gate fails closed on anything the worker
 does not report. The worker (PR-4b) must post, through `POST

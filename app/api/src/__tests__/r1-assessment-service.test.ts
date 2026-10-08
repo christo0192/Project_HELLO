@@ -17,7 +17,8 @@ import {
 } from './support/r1-fake-db.js';
 import { METRIC_IDS, cleanLogRows, interviewRows, modelAnswer } from './support/r1-scorer.js';
 import { R1_METRICS, R1_METRIC_KEYS } from '../lib/r1/rubric.js';
-import { runR1Assessment, r1ErrorCode } from '../services/r1-assessment.js';
+import { runR1Assessment, r1ErrorCode, r1OperatorMessage } from '../services/r1-assessment.js';
+import { createR1DeepseekRunner, createR1Infer } from '../lib/r1/deepseek-runner.js';
 import { DeepseekError } from '../lib/deepseek.js';
 import { BusinessError, ProviderError } from '../lib/provider-resilience.js';
 import { ScorecardValidationError } from '../lib/scorecards/domain.js';
@@ -266,6 +267,156 @@ describe('provider and validation failures', () => {
     await expect(runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW, finalAttempt: true })).rejects.toThrow();
     await expect(runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW, finalAttempt: true })).rejects.toThrow();
     expect(db.tables.assessments).toHaveLength(1);
+  });
+
+  it('a 402 on the final attempt throws deepseek_insufficient_balance and records an operator-readable placeholder', async () => {
+    const infer = vi.fn(async () => { throw new DeepseekError('protocol', 402); });
+    const { db } = setup(tablesWithInterview());
+    await expect(runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW, finalAttempt: true }))
+      .rejects.toThrow('deepseek_insufficient_balance');
+    expect(db.tables.assessments).toHaveLength(1);
+    const row = db.tables.assessments![0]!;
+    expect(row.raw.r1).toMatchObject({ outcome: 'scoring_failed', valid: false, code: 'deepseek_insufficient_balance' });
+    expect(row.raw.recommendation).toBe('human_review');
+    expect(row.recommendation).toBeNull();
+    const rationale = row.metric_results[0].rationale as string;
+    expect(rationale).toContain('the DeepSeek balance is exhausted');
+    expect(rationale).toContain('the job can be replayed after the top-up');
+    expect(rationale).toContain('human review is required');
+    expect(row.metric_results.every((m: any) => m.rationale === rationale)).toBe(true);
+  });
+
+  it('a second final failure with another code does not stack or overwrite the placeholder', async () => {
+    const { db } = setup(tablesWithInterview());
+    const first = vi.fn(async () => { throw new DeepseekError('protocol', 402); });
+    const second = vi.fn(async () => { throw new DeepseekError('protocol', 401); });
+    await expect(runR1Assessment(SESSION_ID, { client: db.client, infer: first, now: () => NOW, finalAttempt: true }))
+      .rejects.toThrow('deepseek_insufficient_balance');
+    await expect(runR1Assessment(SESSION_ID, { client: db.client, infer: second, now: () => NOW, finalAttempt: true }))
+      .rejects.toThrow('deepseek_auth');
+    expect(db.tables.assessments).toHaveLength(1);
+    expect(db.tables.assessments![0]!.raw.r1.code).toBe('deepseek_insufficient_balance');
+  });
+
+  it('a final attempt the handler will DEFER writes no placeholder and runs no round RPC, but still rethrows', async () => {
+    const asked: string[] = [];
+    const willDefer = (code: string): boolean => { asked.push(code); return true; };
+    const infer = vi.fn(async () => { throw new DeepseekError('protocol', 429); });
+    const { db } = setup(tablesWithInterview());
+    await expect(runR1Assessment(SESSION_ID, {
+      client: db.client, infer, now: () => NOW, finalAttempt: true, willDefer,
+    })).rejects.toThrow('deepseek_rate_limited');
+    // The predicate gets the sanitized code, never the error object or provider text.
+    expect(asked).toEqual(['deepseek_rate_limited']);
+    expect(db.tables.assessments).toHaveLength(0);
+    expect(db.rpcCalls).toHaveLength(0);
+  });
+
+  it('a final attempt the handler will NOT defer records the placeholder exactly as before', async () => {
+    const infer = vi.fn(async () => { throw new DeepseekError('timeout'); });
+    const { db } = setup(tablesWithInterview());
+    await expect(runR1Assessment(SESSION_ID, {
+      client: db.client, infer, now: () => NOW, finalAttempt: true, willDefer: () => false,
+    })).rejects.toThrow('deepseek_timeout');
+    expect(db.tables.assessments).toHaveLength(1);
+    expect(db.tables.assessments![0]!.raw.r1).toMatchObject({ outcome: 'scoring_failed', code: 'deepseek_timeout' });
+  });
+
+  it('willDefer never matters before the final attempt: nothing is written either way', async () => {
+    for (const willDefer of [() => true, () => false, undefined]) {
+      const infer = vi.fn(async () => { throw new DeepseekError('protocol', 402); });
+      const { db } = setup(tablesWithInterview());
+      await expect(runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW, willDefer }))
+        .rejects.toThrow('deepseek_insufficient_balance');
+      expect(db.tables.assessments).toHaveLength(0);
+    }
+  });
+
+  it('logs the HTTP status with the code, and never the key or the provider text', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    process.env.DEEPSEEK_API_KEY = 'sk-test-key-must-never-appear';
+    try {
+      const infer = vi.fn(async () => { throw new DeepseekError('protocol', 402); });
+      const { db } = setup(tablesWithInterview());
+      await expect(runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW }))
+        .rejects.toThrow('deepseek_insufficient_balance');
+      const lines = warn.mock.calls.map((call) => String(call[0]));
+      const line = lines.find((entry) => entry.includes('r1_assessment_failed'));
+      expect(line).toBeDefined();
+      expect(JSON.parse(line as string)).toMatchObject({
+        error_category: 'r1_assessment_failed',
+        rejection_reason: 'deepseek_insufficient_balance',
+        http_status: 402,
+      });
+      expect(lines.join('\n')).not.toContain('sk-test-key-must-never-appear');
+    } finally {
+      delete process.env.DEEPSEEK_API_KEY;
+    }
+  });
+
+  it('a failure with no HTTP status logs no http_status', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const infer = vi.fn(async () => { throw new DeepseekError('timeout'); });
+    const { db } = setup(tablesWithInterview());
+    await expect(runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW })).rejects.toThrow();
+    const line = warn.mock.calls.map((call) => String(call[0])).find((entry) => entry.includes('r1_assessment_failed'));
+    expect(JSON.parse(line as string)).not.toHaveProperty('http_status');
+  });
+});
+
+describe('scoring order (run 0 first)', () => {
+  it('a provider failure on run 0 costs ONE model call, not three', async () => {
+    const infer = vi.fn(async () => { throw new DeepseekError('protocol', 402); });
+    const { db } = setup(tablesWithInterview());
+    await expect(runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW }))
+      .rejects.toThrow('deepseek_insufficient_balance');
+    expect(infer).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('a real provider answer through the R1 runner', () => {
+  const answerWith = (status: number, body: string) => vi.fn(async () => ({
+    ok: status >= 200 && status < 300,
+    status,
+    text: async () => body,
+  }));
+
+  it.each([
+    [402, 'deepseek_insufficient_balance'],
+    [401, 'deepseek_auth'],
+    [429, 'deepseek_rate_limited'],
+    [503, 'deepseek_server_error'],
+    [400, 'deepseek_http_400'],
+  ])('HTTP %i reaches the queue as %s, after ONE call, with no provider text or key stored', async (status, code) => {
+    process.env.DEEPSEEK_API_KEY = 'sk-test-key-must-never-appear';
+    try {
+      const transport = answerWith(status, '{"error":{"message":"PROVIDER_BODY_TEXT Insufficient Balance"}}');
+      const infer = createR1Infer(createR1DeepseekRunner({ transport }));
+      const { db } = setup(tablesWithInterview());
+      await expect(runR1Assessment(SESSION_ID, {
+        client: db.client, infer, now: () => NOW, finalAttempt: true,
+      })).rejects.toThrow(code);
+      expect(transport).toHaveBeenCalledTimes(1);
+      const stored = JSON.stringify(db.tables.assessments);
+      expect(stored).toContain(code);
+      expect(stored).not.toContain('PROVIDER_BODY_TEXT');
+      expect(stored).not.toContain('sk-test-key-must-never-appear');
+    } finally {
+      delete process.env.DEEPSEEK_API_KEY;
+    }
+  });
+
+  it('a 200 with an unusable body stays deepseek_protocol (no status to name)', async () => {
+    process.env.DEEPSEEK_API_KEY = 'sk-test-key-must-never-appear';
+    try {
+      const transport = answerWith(200, '{"choices":[]}');
+      const infer = createR1Infer(createR1DeepseekRunner({ transport }));
+      const { db } = setup(tablesWithInterview());
+      await expect(runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW }))
+        .rejects.toThrow('deepseek_protocol');
+    } finally {
+      delete process.env.DEEPSEEK_API_KEY;
+    }
   });
 });
 
@@ -719,6 +870,22 @@ describe('r1ErrorCode', () => {
       [new ScorecardValidationError('x', 'scorecard_invalid:result_count'), 'scorecard_invalid:result_count'],
       [new DeepseekError('timeout'), 'deepseek_timeout'],
       [new DeepseekError('output_limit'), 'deepseek_output_limit'],
+      // The HTTP status is no longer dropped: each non-2xx answer gets a code that names it.
+      [new DeepseekError('protocol', 402), 'deepseek_insufficient_balance'],
+      [new DeepseekError('protocol', 401), 'deepseek_auth'],
+      [new DeepseekError('protocol', 403), 'deepseek_auth'],
+      [new DeepseekError('protocol', 429), 'deepseek_rate_limited'],
+      [new DeepseekError('protocol', 500), 'deepseek_server_error'],
+      [new DeepseekError('protocol', 503), 'deepseek_server_error'],
+      [new DeepseekError('protocol', 599), 'deepseek_server_error'],
+      [new DeepseekError('protocol', 400), 'deepseek_http_400'],
+      [new DeepseekError('protocol', 404), 'deepseek_http_404'],
+      [new DeepseekError('protocol', 422), 'deepseek_http_422'],
+      // No status (a 200 with an unusable body), or a status that is not an HTTP one.
+      [new DeepseekError('protocol'), 'deepseek_protocol'],
+      [new DeepseekError('protocol', 0), 'deepseek_protocol'],
+      [new DeepseekError('protocol', 600), 'deepseek_protocol'],
+      [new DeepseekError('protocol', 402.5), 'deepseek_protocol'],
       [new ProviderError('circuit_open'), 'provider_circuit_open'],
       [new BusinessError(), 'deepseek_parse_error'],
       [new Error('r1_attach_failed'), 'r1_attach_failed'],
@@ -729,6 +896,23 @@ describe('r1ErrorCode', () => {
       const code = r1ErrorCode(error);
       expect(code).toBe(expected);
       expect(code).toMatch(queueSafe);
+    }
+  });
+
+  it('keeps every status code inside the DB defer-reason and queue error-code shapes', () => {
+    for (let status = 100; status <= 599; status += 1) {
+      expect(r1ErrorCode(new DeepseekError('protocol', status))).toMatch(/^[a-z][a-z0-9_.:-]{2,63}$/);
+    }
+  });
+
+  it('explains in words only the codes an operator has to act on, and never carries provider text', () => {
+    expect(r1OperatorMessage('deepseek_insufficient_balance')).toMatch(/DeepSeek balance is exhausted.*replayed after the top-up/);
+    expect(r1OperatorMessage('deepseek_auth')).toMatch(/rejected the API key.*replayed/);
+    for (const code of ['deepseek_timeout', 'deepseek_rate_limited', 'deepseek_protocol', 'r1_assessment_failed']) {
+      expect(r1OperatorMessage(code), code).toBeNull();
+    }
+    for (const code of ['deepseek_insufficient_balance', 'deepseek_auth']) {
+      expect(r1OperatorMessage(code)).not.toMatch(/sk-|bearer|authorization/i);
     }
   });
 });
