@@ -17644,12 +17644,18 @@ class TestPhoneManifestTunables(unittest.TestCase):
         # And the floor must not regress below what the 9/31 revert bought.
         self.assertGreaterEqual(int(env["PHONE_SARVAM_NEGATIVE_FRAMES_COUNT"]), 18)
 
-    def test_endpointing_max_lowered_to_1_0_min_unchanged(self):
+    def test_endpointing_max_raised_to_2_0_min_unchanged(self):
         # PR2a raised MAX 1.0->2.5: the built-in v1-mini EOU commits a COMPLETE
         # answer at MIN regardless of MAX, so MAX only bounds the wait on a
         # genuinely-INCOMPLETE mid-thought pause.
         #
         # OWNER RETUNE (2026-09-16): back to 1.0, decided against live calls.
+        # OWNER, M014 (2026-10-08): 1.0 -> 2.0. Sarvam (finals-only) delivers a
+        # final 0.9-1.0 s after speech ends, so with 1.0 the final's arrival, not
+        # the endpointer, committed turns and the bot talked into breath gaps.
+        # `fly secrets list` showed no secret shadowing this name, so this pin IS
+        # what production runs. MIN stays 0.3, so the common case (a complete
+        # answer) is unchanged; the consent turn keeps its own 0.5 max.
         # This manifest had said 2.5 while production ran a SECRET of the same
         # name — the same shadowing trap as PHONE_TTS_FLUSH_MIN_CHARS — so this
         # pin is now what production actually runs once the secret is unset.
@@ -17657,8 +17663,9 @@ class TestPhoneManifestTunables(unittest.TestCase):
         # real mid-thought pause. MIN stays 0.3, so the common case (a complete
         # answer) is unchanged.
         env = self._phone_env()
-        self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"], "1.0")
+        self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"], "2.0")
         self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC"], "0.3")
+        self.assertEqual(env["PHONE_OPEN_ANSWER_MIN_DELAY_SEC"], "0.8")
         self.assertGreaterEqual(float(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"]), 0.5)
         self.assertLessEqual(float(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"]), 3.0)
         # MAX must still exceed MIN, or the bound is nonsense.
@@ -17671,7 +17678,7 @@ class TestPhoneManifestTunables(unittest.TestCase):
             "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC":
                 env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"],
         }):
-            self.assertAlmostEqual(phone.phone_static_endpointing_max_delay(), 1.0)
+            self.assertAlmostEqual(phone.phone_static_endpointing_max_delay(), 2.0)
 
 
 class TestReasoningEffortTripwire(unittest.TestCase):

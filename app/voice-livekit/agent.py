@@ -24,6 +24,7 @@ from livekit import api as livekit_api
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.plugins import openai, sarvam
 
+import endpointing_phase
 import gate_judge
 import noise_suppression
 import persistence
@@ -1586,18 +1587,25 @@ def _log_gate_turn_skip(
     )
 
 
+# M014 (owner): the screening max rose to 2.0 s, but the identity/consent gate
+# keeps the settle timing it had at the old 1.0 s max. Above this ceiling a turn
+# the SDK commits late is closed by silence first and its commit is logged
+# `commit_duplicate` (the gate's existing late-commit path).
+GATE_SETTLE_MAX_CEILING_SEC = 1.0
+
+
 def _gate_turn_settle_ms() -> int:
     """How long a group of finals the SDK never committed waits before closing.
 
     The endpointing ceiling (the longest the SDK itself waits to commit a turn
-    on this lane) plus a margin, so a turn the SDK does commit is always
-    closed by that commit first. The consent turn tightens the SDK's ceiling
-    below this, which only widens the margin.
+    on this lane), capped at `GATE_SETTLE_MAX_CEILING_SEC`, plus a margin. Up
+    to that cap a turn the SDK does commit is closed by that commit first. The
+    consent turn tightens the SDK's ceiling below this, which only widens the
+    margin.
     """
-    return (
-        int(round(phone.phone_static_endpointing_max_delay() * 1000))
-        + gate_judge.GATE_SETTLE_MARGIN_MS
-    )
+    ceiling = min(
+        phone.phone_static_endpointing_max_delay(), GATE_SETTLE_MAX_CEILING_SEC)
+    return int(round(ceiling * 1000)) + gate_judge.GATE_SETTLE_MARGIN_MS
 
 
 def _gate_capture_log(**fields: Any) -> None:
@@ -11730,6 +11738,19 @@ async def _run_native_phone_screening(
             # delivered ask to prime the turn tracking with).
             _preloop_disconnect()
             question = None
+        else:
+            # M014 PR-B: Q1 is a say() line, so no generated reply noted its
+            # class; its answer (usually open-ended) gets the longer minimum
+            # endpointing delay from here. A no-op for a yes/no Q1 and for the
+            # rollback value. Never raises.
+            _q1_phase = getattr(agent, "_endpointing_phase", None)
+            if _q1_phase is not None:
+                try:
+                    _q1_phase.note_spoken_question(
+                        phase="screening", objective=q1_text,
+                    )
+                except Exception:  # noqa: BLE001 — never breaks the pre-loop
+                    pass
         # F0a — PRIME THE NATIVE TURN TRACKING AT THE GATE HANDOFF.
         # The first planned question is delivered HERE, at the consent→screening
         # handoff, through `generate_reply`/`say`. The native turn hook
@@ -12739,6 +12760,44 @@ async def _run_phone_session(
     candidate_speaking: dict[str, bool] = {"value": False}
     candidate_speech_ended = asyncio.Event()
 
+    # ── M014 PR-B: PER-QUESTION MINIMUM ENDPOINTING ───────────────────────
+    # Open screening questions wait with the longer minimum
+    # (`PHONE_OPEN_ANSWER_MIN_DELAY_SEC`); yes/no, name confirmation, callback
+    # and closing keep the static minimum. Inert until the screening phase is
+    # armed (`assessment_persist_active`, True only right before the native
+    # coordinator starts), so identity and consent turns are never re-timed.
+    # See `endpointing_phase`.
+    def _set_phase_min_delay(min_delay: float) -> None:
+        """Live MIN-endpointing override for the answer the bot now waits for.
+
+        Sibling of `_set_consent_endpointing_max`: the supported
+        `AgentSession.update_options` seam (livekit-agents 1.6.4), merged per
+        key so it never clobbers the consent max. `endpointing_phase` swallows
+        and logs a failure; a session without `update_options` is a quiet no-op.
+        """
+        upd = getattr(session, "update_options", None)
+        if not callable(upd):
+            return
+        upd(endpointing_opts={"min_delay": float(min_delay)})
+
+    # Fixed-local endpointing only (the same predicate as the consent setter):
+    # min_endpointing_delay governs the commit there. Excluded in dynamic mode
+    # (a different, untested envelope) and in stt mode (the provider owns the
+    # end of utterance).
+    _phase_min_apply = (
+        _set_phase_min_delay
+        if phone.phone_turn_detection() == phone.PHONE_TURN_DETECTION_LOCAL
+        and not phone.phone_dynamic_endpointing_enabled()
+        else None
+    )
+    endpointing_phase_state = endpointing_phase.PhoneEndpointingPhase(
+        active=lambda: bool(assessment_persist_active[0]),
+        open_min_sec=phone.phone_open_answer_min_delay,
+        short_min_sec=phone.phone_static_endpointing_min_delay,
+        log=_log.info,
+        apply_min=_phase_min_apply,
+    )
+
     # ── M013 S01: THE GATE'S OWN RECORD OF WHAT THE CANDIDATE SAID ─────────
     # Every VAD segment and every STT final, paired FIFO, closed into turns
     # (on commit, or by silence for a turn the SDK dropped while a gate line
@@ -12832,6 +12891,19 @@ async def _run_phone_session(
         speech_sequence[0] += 1
         created_seq = speech_sequence[0]
         reply_handle[0] = getattr(event, "speech_handle", None)
+        # M014 PR-B: note the minimum endpointing delay for the answer this reply
+        # waits for (open question: longer; yes/no and terminal phases: the static
+        # minimum). Applied once the reply is playing, only on a class change.
+        # Screening phase only; never raises.
+        try:
+            endpointing_phase_state.on_speech_created(
+                source=getattr(event, "source", None),
+                phase=getattr(agent, "_generation_phase", None),
+                objective=getattr(agent, "_generation_objective", None),
+                apply_min=_phase_min_apply,
+            )
+        except Exception:  # noqa: BLE001 — never breaks the speech lifecycle
+            pass
         # PR-2 change 2: reply generation is starting (t_invoke). If a candidate
         # turn stamped t_EOU, emit the endpoint delay and CONSUME the stamp so a
         # later reply on the same session cannot re-fire against a stale EOU.
@@ -13032,6 +13104,12 @@ async def _run_phone_session(
     def _on_phone_agent_state_changed(event):  # noqa: ANN001
         new_state = getattr(event, "new_state", None)
         if new_state == "speaking":
+            # M014 PR-B: a generated reply is PLAYING now: apply the minimum
+            # endpointing delay noted for the question it asks. Never raises.
+            try:
+                endpointing_phase_state.reply_playing()
+            except Exception:  # noqa: BLE001 — never breaks the state hook
+                pass
             first_audio_mono = _monotonic()
             first_audio_wall = time.time()
             latest_assistant_anchor[0] = int(round(first_audio_wall * 1000))
@@ -13381,6 +13459,16 @@ async def _run_phone_session(
         native_turns=True,
         turn_mode=turn_mode,
     )
+    # M014 PR-B: the pre-loop (first planned question) finds the per-question
+    # minimum through this attribute. Guarded like the other best-effort
+    # attachments: a __slots__-ed Agent only loses the per-question minimum.
+    try:
+        setattr(agent, "_endpointing_phase", endpointing_phase_state)
+    except (AttributeError, TypeError):
+        _log.warn(
+            "unknown_event", error_type="phone_endpointing_phase",
+            error_category="attach_failed",
+        )
 
     # ── PR2a FIX A2: DEEPSEEK PREFIX-CACHE WARM-UP ─────────────────────────
     # Fire ONE throwaway completion of the (large, static) system-prompt prefix

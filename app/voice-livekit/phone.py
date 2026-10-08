@@ -45,6 +45,7 @@ import functools
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import time as time_module
@@ -2359,7 +2360,9 @@ def phone_static_endpointing_max_delay() -> float:
     a genuinely-INCOMPLETE utterance — the built-in v1-mini EOU commits a
     COMPLETE answer at MIN regardless of MAX — so a larger MAX lets a mid-thought
     pause breathe like the browser lane at near-zero common-case latency cost.
-    The MIN reader and its [0.3, 0.5] clamp are unchanged."""
+    The MIN reader and its [0.3, 0.5] clamp are unchanged.
+
+    M014: deploy pins 2.0 (fly.phone.toml)."""
     raw = os.getenv("PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC")
     if raw in (None, ""):
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
@@ -2406,6 +2409,38 @@ def phone_local_endpointing_delays() -> tuple[float, float]:
         phone_static_endpointing_min_delay(),
         phone_static_endpointing_max_delay(),
     )
+
+
+#: M014 PR-B: the MIN endpointing delay while the bot waits for an OPEN answer.
+#: Sarvam is finals-only and delivers a final ~0.9-1.0 s after speech ends, so a
+#: 0.3 s MIN is long gone by the time the words exist; the MIN that matters for
+#: turn-taking is the SDK's reply-start silence gate (``min_delay / 2``): with
+#: 0.3 a reply needed only 0.15 s of quiet and landed in breath gaps. 0.8 makes
+#: that 0.4 s for the questions where a candidate pauses to think.
+PHONE_OPEN_ANSWER_MIN_DELAY_SEC_DEFAULT = 0.8
+
+
+def phone_open_answer_min_delay() -> float:
+    """MIN endpointing delay for OPEN-answer questions, default 0.8s.
+
+    Bounded to [0.3, 1.2] and never above ``phone_static_endpointing_max_delay``
+    (a min above the max would invert the SDK's own bounds). An unset, empty,
+    non-numeric or non-finite value falls back to the default.
+    ``PHONE_OPEN_ANSWER_MIN_DELAY_SEC=0.3`` makes the per-question minimum a no-op
+    (the live ``PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC`` is also 0.3). Read at
+    the call site with the literal name so the env-contract scanner sees it.
+    """
+    raw = os.getenv("PHONE_OPEN_ANSWER_MIN_DELAY_SEC")
+    value = PHONE_OPEN_ANSWER_MIN_DELAY_SEC_DEFAULT
+    if raw not in (None, ""):
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = value
+        if math.isfinite(parsed):
+            value = parsed
+    value = min(1.2, max(0.3, value))
+    return min(value, phone_static_endpointing_max_delay())
 
 
 def phone_min_interruption_words() -> int:
