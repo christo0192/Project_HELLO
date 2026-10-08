@@ -17025,6 +17025,52 @@ def phone_agent_class(agent_base: Any) -> Any:
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
 
+        #: Cap (characters) on the authored text kept per spoken line (M014 S01).
+        _SPOKEN_SOURCE_MAX_CHARS = 2000
+
+        def _record_spoken_source(self, text: Any) -> Any:
+            """M014 S01: tee the text a line is about to speak, unchanged.
+
+            ``tts_node`` is the one funnel every spoken line passes through, so
+            this is the only place the AUTHORED text (what the bot meant to say)
+            is known; the interrupted assistant item only holds the part that
+            played. The coordinator compares the two to tell a cut question
+            from a cut "Nice, ..." bridge. Every chunk is yielded unchanged
+            (non-str chunks are passed on, never captured); capture is reset on
+            each call and capped, so nothing here can affect the audio.
+            """
+            parts: list[str] = []
+            self._spoken_source_parts = parts
+            captured = 0
+            limit = self._SPOKEN_SOURCE_MAX_CHARS
+
+            def _capture(chunk: Any) -> None:
+                nonlocal captured
+                if isinstance(chunk, str) and captured < limit:
+                    parts.append(chunk)
+                    captured += len(chunk)
+
+            async def _tee() -> Any:
+                if isinstance(text, str):
+                    _capture(text)
+                    yield text
+                    return
+                if callable(getattr(text, "__aiter__", None)):
+                    async for chunk in text:
+                        _capture(chunk)
+                        yield chunk
+                    return
+                for chunk in text:  # sync iterable fallback
+                    _capture(chunk)
+                    yield chunk
+
+            return _tee()
+
+        def spoken_source_text(self) -> str:
+            """The authored text of the latest spoken line, capped (M014 S01)."""
+            parts = getattr(self, "_spoken_source_parts", [])
+            return "".join(parts)[:self._SPOKEN_SOURCE_MAX_CHARS]
+
         async def tts_node(self, text: Any, model_settings: Any) -> Any:
             """Strip markdown AND flush the first speakable fragment early.
 
@@ -17074,6 +17120,7 @@ def phone_agent_class(agent_base: Any) -> Any:
             flushed as its own segment (the prosody tradeoff documented on the
             env reader).
             """
+            text = self._record_spoken_source(text)
             min_chars = phone_tts_flush_min_chars()
             first_frame_seen = False
             frame_generation = self._reply_generation
