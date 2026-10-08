@@ -2751,6 +2751,16 @@ def _native_turn_predates_question(message: Any, question_anchor_ms: int | None)
     )
 
 
+# ── M014 S01: silence watchdog bounds ───────────────────────────────────────
+#
+#: Silence watchdog: never speak (or complete a close) while the candidate is
+#: talking, or stopped talking less than this long ago.
+PHONE_SILENCE_SPEECH_GRACE_SEC = 1.5
+#: A VAD "speaking" latch older than this is treated as stuck and ignored, so a
+#: lost end-of-speech event can never keep the watchdog silent for ever.
+PHONE_SILENCE_SPEAKING_MAX_SUPPRESS_SEC = 120.0
+
+
 # ── Bounded session outcome counter mapping (OBS-06) ────────────────
 # Fixed, explicit allowlist for the session outcome label.  Values outside this
 # fixed set (including any future/unknown terminal reason) map to the bounded
@@ -6518,6 +6528,40 @@ async def _run_native_phone_screening(
 
     async def native_silence_loop() -> None:
         """Use LiveKit state/activity as the only phone inactivity authority."""
+        # M014 S01 (4ab3b64d #14): `candidate_activity` is set once at the START
+        # of a long answer, so 30 s into a monologue this loop used to speak
+        # "Are you still there?" over the candidate. Before ANY of the five
+        # silence actions it now checks the live VAD speaking state.
+        suppress_since: dict[str, float | None] = {"value": None}
+
+        def _silence_blocked_by_speech(step: str) -> bool:
+            speaking = bool(candidate_speaking.get("value"))
+            ended = candidate_speaking.get("ended_mono")
+            recent = (
+                isinstance(ended, (int, float))
+                and _monotonic() - float(ended) < PHONE_SILENCE_SPEECH_GRACE_SEC
+            )
+            if not (speaking or recent):
+                suppress_since["value"] = None
+                return False
+            now = _monotonic()
+            if suppress_since["value"] is None:
+                suppress_since["value"] = now
+            if now - float(suppress_since["value"]) > PHONE_SILENCE_SPEAKING_MAX_SUPPRESS_SEC:
+                # A lost end-of-speech event must never keep the watchdog
+                # silent for ever: ignore the stuck latch and act.
+                _log.warn(
+                    "unknown_event", error_type="phone_silence",
+                    error_category="speaking_latch_stale", phase=step,
+                )
+                suppress_since["value"] = None
+                return False
+            _log.info(
+                "unknown_event", error_type="phone_silence",
+                error_category="suppressed_candidate_speaking", phase=step,
+            )
+            return True
+
         while not finished.is_set():
             if not agent_listening.is_set():
                 ready = asyncio.create_task(agent_listening.wait())
@@ -6563,6 +6607,8 @@ async def _run_native_phone_screening(
                 # Review fix: the candidate was just invited to ask (or told
                 # "go ahead" after saying they had a question): one nudge
                 # first, then the next silent window closes as completed.
+                if _silence_blocked_by_speech("qna_nudge"):
+                    continue
                 qna_expects_question["nudged"] = True
                 _log.info(
                     "unknown_event", error_type="phone_silence",
@@ -6582,6 +6628,8 @@ async def _run_native_phone_screening(
                 # that is a finished screening, not a no-answer abort. The
                 # teardown speaks the fixed closing goodbye (nothing armed
                 # played it) and posts `assessment.completed`.
+                if _silence_blocked_by_speech("qna_silence_close"):
+                    continue
                 _log.info(
                     "unknown_event", error_type="phone_silence",
                     error_category="qna_silence_close",
@@ -6590,6 +6638,8 @@ async def _run_native_phone_screening(
                 terminal_reason.setdefault("reason", "completed")
                 finished.set()
                 return
+            if _silence_blocked_by_speech("prompt"):
+                continue
             silence_prompted["value"] = True
             _log.info(
                 "unknown_event", error_type="phone_silence",
@@ -6615,6 +6665,8 @@ async def _run_native_phone_screening(
             outcome = await wait_for_activity(CANDIDATE_SILENCE_END_SEC)
             if outcome != "timeout":
                 continue
+            if _silence_blocked_by_speech("second_nudge"):
+                continue
             # FIX 2: a brief SECOND nudge before the goodbye — one more chance for
             # a candidate who stepped away momentarily. Kept short so the whole
             # prompt→nudge→goodbye ladder stays near ~30s to goodbye.
@@ -6635,6 +6687,8 @@ async def _run_native_phone_screening(
             agent_activity_changed.clear()
             outcome = await wait_for_activity(CANDIDATE_SILENCE_SECOND_NUDGE_SEC)
             if outcome != "timeout":
+                continue
+            if _silence_blocked_by_speech("goodbye"):
                 continue
             _log.info(
                 "unknown_event", error_type="phone_silence",
