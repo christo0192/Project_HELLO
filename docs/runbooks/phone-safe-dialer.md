@@ -96,6 +96,18 @@ words existed. Two changes:
    failed update is logged and swallowed; the call carries on with the previous
    minimum.
 
+**Turns that inherit the 2.0 max.** After the screening phase is armed EVERY turn
+runs at max 2.0, including turns whose minimum stays `0.3`: yes/no screening
+questions, name confirm, callback, and the consent-withdrawal / revocation
+confirm ("do you want to stop?" -> "yes"). A bare "yes"/"no" the end-of-utterance
+model scores incomplete can therefore wait up to +1.0 s more than before M014.
+This is the accepted cost (owner decision 2026-10-09); a later change could pair
+the short class with a lower max. The opt-in dynamic mode is built at the gate
+max (1.0) and is not raised. Known edges: a yes/no question that follows an open
+answer drops the minimum back to 0.3 as soon as it starts playing (a candidate
+who keeps talking over it gets the short gate); the `wind_down` "any questions?"
+line is deliberately OPEN.
+
 This change never delays or drops a reply; the next step for the finals-latency
 problem is streaming STT, not more waiting.
 

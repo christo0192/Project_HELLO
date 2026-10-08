@@ -5861,7 +5861,11 @@ def _build_provider_session(
                 "endpointing": {
                     "mode": "dynamic",
                     "min_delay": endpoint_min,
-                    "max_delay": endpoint_max,
+                    # M014: capped at the gate max (the pre-M014 1.0 s) so the
+                    # opt-in dynamic lane keeps its gate timing; the screening
+                    # max is only ever raised on the fixed-local lane.
+                    "max_delay": min(
+                        endpoint_max, phone.phone_gate_endpointing_max_delay()),
                 },
                 # Same dict, because passing `turn_handling` at all disables the
                 # deprecated kwargs — including the interruption ones.
@@ -5891,7 +5895,6 @@ def _build_provider_session(
             # `phone_screening_endpointing`), the plain max in dynamic mode.
             duration_sec=(
                 None if turn_detection != phone.PHONE_TURN_DETECTION_LOCAL
-                else endpoint_max if phone.phone_dynamic_endpointing_enabled()
                 else phone.phone_gate_endpointing_max_delay()
             ),
         )
@@ -11758,12 +11761,13 @@ async def _run_native_phone_screening(
             # M014 PR-B: Q1 is a say() line, so no generated reply noted its
             # class; its answer (usually open-ended) gets the longer minimum
             # endpointing delay from here. A no-op for a yes/no Q1 and for the
-            # rollback value. Never raises.
+            # rollback value. Classified from the PLANNED text, like Q2+ (the
+            # rephrase may reword it). Never raises.
             _q1_phase = getattr(agent, "_endpointing_phase", None)
             if _q1_phase is not None:
                 try:
                     _q1_phase.note_spoken_question(
-                        phase="screening", objective=q1_text,
+                        phase="screening", objective=question.spoken_text,
                     )
                 except Exception:  # noqa: BLE001 — never breaks the pre-loop
                     pass

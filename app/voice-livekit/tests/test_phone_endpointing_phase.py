@@ -727,12 +727,15 @@ class TestPerPhaseMinimumThroughTheSession(unittest.IsolatedAsyncioTestCase):
 
     async def test_an_open_first_question_gets_the_open_minimum_when_heard(self):
         """Q1 is a say() line, so no generated reply noted its class."""
-        session, _ = await _SessionHarness(self).run(
-            questions=[_OPEN_Q, _YN_Q, _YN_Q2], replies=["I built it.", "Yes.", "No."],
-            env=self._mode_env("toolfirst"))
-        self.assertEqual(session.min_updates()[:1], [0.8])
-        # Q2 is a yes/no: back to the static minimum once it plays.
-        self.assertEqual(session.min_updates()[:2], [0.8, 0.3])
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                session, _ = await _SessionHarness(self).run(
+                    questions=[_OPEN_Q, _YN_Q, _YN_Q2],
+                    replies=["I built it.", "Yes.", "No."],
+                    env=self._mode_env(mode))
+                self.assertEqual(session.min_updates()[:1], [0.8])
+                # Q2 is a yes/no: back to the static minimum once it plays.
+                self.assertEqual(session.min_updates()[:2], [0.8, 0.3])
 
     async def test_a_yes_no_first_question_never_touches_the_minimum(self):
         session, _ = await _SessionHarness(self).run(
@@ -740,10 +743,22 @@ class TestPerPhaseMinimumThroughTheSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.min_updates(), [])
 
     async def test_a_yes_no_question_returns_to_the_static_minimum(self):
+        for mode in self.MODES:
+            with self.subTest(mode=mode):
+                session, _ = await _SessionHarness(self).run(
+                    questions=[_YN_Q, _OPEN_Q, _YN_Q2],
+                    replies=["Yes.", "I built it.", "No."],
+                    env=self._mode_env(mode))
+                self.assertEqual(session.min_updates()[:2], [0.8, 0.3])
+
+    async def test_dynamic_endpointing_keeps_the_gate_max(self):
+        """The opt-in dynamic lane is built at the gate max (1.0), not the 2.0
+        screening max, so its gate timing and the 1250 ms settle stay paired."""
         session, _ = await _SessionHarness(self).run(
-            questions=[_YN_Q, _OPEN_Q, _YN_Q2], replies=["Yes.", "I built it.", "No."],
-            env=self._mode_env("toolfirst"))
-        self.assertEqual(session.min_updates(), [0.8, 0.3])
+            env={"PHONE_DYNAMIC_ENDPOINTING": "on"})
+        endpointing = session.ctor["turn_handling"]["endpointing"]
+        self.assertEqual(endpointing["mode"], "dynamic")
+        self.assertEqual(endpointing["max_delay"], 1.0)
 
     async def test_dynamic_endpointing_is_not_touched(self):
         session, _ = await _SessionHarness(self).run(
@@ -788,6 +803,10 @@ class TestEveryReplyPhaseIsClassified(unittest.TestCase):
     def test_the_phase_literals_in_agent_py(self):
         source = (_CTX / "agent.py").read_text(encoding="utf-8")
         found = set(re.findall(r'phase="([a-z_]+)"', source))
+        # Phases passed through a variable (`_judge_phase = "a" if x else "b"`).
+        for line in re.findall(r'^\s*\w*_phase = ("[^\r\n]+)$', source, re.M):
+            found |= set(re.findall(r'"([a-z_]{3,})"', line))
+        found.discard("unknown")
         self.assertGreater(len(found), 10)
         self.assertEqual(found - self.OPEN - self.SHORT, set(), "unclassified phase")
         for phase in sorted(found):
@@ -810,9 +829,12 @@ class TestGateReplaysAtProductionMax(unittest.TestCase):
     times, so the replay alone cannot show that; the max the SDK is given is
     pinned in `TestPerPhaseMinimumThroughTheSession`). `gate_replay` strips the
     env override and runs on the code default (0.8); every replay case is re-run
-    with that default patched to 2.0.
+    with that default patched to 2.0 (the gate itself still runs at the 1.0
+    cap, so this shows the replays are unchanged when the screening max is 2.0).
     """
 
+    #: Cases allowed to differ at 2.0 (none: the gate runs at its 1.0 cap, so a
+    #: patched 2.0 default replays the same settle).
     KNOWN_DIVERGENT = frozenset()
 
     def test_the_gate_settle_keeps_the_1_0_timing_at_2_0(self):
@@ -860,7 +882,7 @@ class TestGateReplaysAtProductionMax(unittest.TestCase):
         }
         self.assertEqual(failed, set(self.KNOWN_DIVERGENT), stream.getvalue()[-3000:])
 
-    def test_the_diverging_cases_reach_the_same_decisions(self):
+    def test_replayed_cases_reach_the_same_decisions_at_2_0(self):
         import tests.gate_replay as gr
         import tests.test_phone_gate_replay as replay_tests
 

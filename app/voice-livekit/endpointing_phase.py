@@ -22,6 +22,12 @@ screening phase is active, and a failure is logged and swallowed. Identity,
 pickup and consent turns are never touched (``active`` is False until the
 screening phase is armed).
 
+Known trade-off (owner-accepted, simplest rule): the class switches when the NEXT
+reply starts playing. If that reply is a yes/no question and the candidate keeps
+talking over it, the continuation runs at the static minimum again, not the open
+one. Dropping back only after the yes/no line finished playing would need
+playout-end tracking; deliberately not done here.
+
 No hold, no carry, no yield: this module never delays or drops a reply.
 Content-free logging: a class, a duration and a bounded phase identifier only.
 """
@@ -41,7 +47,9 @@ SHORT = "short"
 #: confirm, callback, withdrawal/revocation confirm, opt-out, end, closing,
 #: close_scheduled, drop_or_timeout, exception, teardown) is a short answer and
 #: keeps the static minimum. A reply with NO phase (None) keeps the current
-#: class (see `PhoneEndpointingPhase.reply_playing`).
+#: class (see `PhoneEndpointingPhase.reply_playing`). ``wind_down`` ("any
+#: questions?") is deliberately OPEN: the candidate may ask a real question, and
+#: a bare "no" costs at most the open minimum.
 OPEN_PHASES = frozenset({
     "screening",
     "resume_conflict",

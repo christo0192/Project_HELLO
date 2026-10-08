@@ -103,7 +103,7 @@ COPY --from=builder /opt/venv /opt/venv
 # dynamic imports (importlib.import_module("x")/__import__("x")); a first-party
 # module pulled in only via a computed/non-literal import name cannot be seen
 # statically and must be added here by hand.
-COPY agent.py closing.py endpointing_phase.py noise_suppression.py gate_judge.py observability.py persistence.py phone.py phone_canary.py prompting.py provenance.py provider_resilience.py recording.py recording_api.py worker_ready_api.py r1_context.py r1_lines.py r1_llm.py r1_persistence.py r1_phases.py r1_routing.py r1_session.py r1_commitment.py r1_content.py r1_guard.py r1_personas.py r1_prompts.py r1_replies.py r1_roleplay.py r1_scheduler.py r1_script.py r1_text.py r1_tracker.py r1_world.py r1_latency.py r1_linecache.py r1_tts.py ./
+COPY agent.py closing.py noise_suppression.py endpointing_phase.py gate_judge.py observability.py persistence.py phone.py phone_canary.py prompting.py provenance.py provider_resilience.py recording.py recording_api.py worker_ready_api.py r1_context.py r1_lines.py r1_llm.py r1_persistence.py r1_phases.py r1_routing.py r1_session.py r1_commitment.py r1_content.py r1_guard.py r1_personas.py r1_prompts.py r1_replies.py r1_roleplay.py r1_scheduler.py r1_script.py r1_text.py r1_tracker.py r1_world.py r1_latency.py r1_linecache.py r1_tts.py ./
 
 USER 1000:1000
 
