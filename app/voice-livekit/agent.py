@@ -2811,7 +2811,7 @@ PHONE_TURN_DROP_REASONS = frozenset({
     "call_finished", "revocation_fragment", "withdrawal_fragment",
     "callback_done", "goodbye_teardown", "hesitation_suppressed",
     "closing_ack", "qna_incomplete_hold", "hesitation_route_suppressed",
-    "predates_screening_start", "split_final_coalesced",
+    "predates_screening_start", "split_final_coalesced", "predates_question",
 })
 
 PHONE_CONTINUATION_ASK_INSTRUCTION = (
@@ -2854,6 +2854,16 @@ PHONE_CONTINUATION_WIND_DOWN_INSTRUCTION = (
     "naturally whether they have any questions about the role, team, company, "
     "or process. Do not say goodbye yet."
 )
+
+#: Words of a bare greeting / presence check / acknowledgement. A short overlap
+#: made only of these is not part of the candidate's answer.
+_PRESENCE_ONLY_WORDS = frozenset({
+    "hello", "hi", "hey", "yes", "yeah", "yep", "ya", "ok", "okay", "um", "uh",
+    "hmm", "hm", "ah", "oh", "sorry", "sir", "madam", "mam", "ma'am", "are",
+    "you", "there", "can", "could", "do", "still", "hear", "see", "me", "is",
+    "the", "line", "working", "clear", "no", "not", "right", "sure", "so",
+    "well", "and", "thanks", "thank", "please",
+})
 
 _CUT_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?…])\s+")
 
@@ -6632,6 +6642,23 @@ async def _run_native_phone_screening(
     # before it belongs to the consent gate and is never merged into a
     # screening answer (it keeps today's exact drop).
     screening_anchor: list[int | None] = [None]
+    # The post-cut router (continuation / overlap re-ask) was designed and
+    # reviewed for the toolless turn mode with preemptive generation OFF (the
+    # shipped fly.phone.toml values). Under any other combination, speech that
+    # main dropped could be credited to a next question the candidate never
+    # heard, so those calls keep origin/main's exact behaviour: a turn that
+    # predates the latest bot line is dropped (and logged). Decided once per
+    # call; the log carries only this category, never an env value.
+    overlap_router_active = bool(
+        turn_mode == phone.PHONE_TURN_MODE_TOOLLESS
+        and not phone.phone_objective_preemptive_enabled()
+    )
+    _log.info(
+        "unknown_event", error_type="phone_turn_overlap",
+        error_category=(
+            "router_active" if overlap_router_active else "router_inactive_mode"
+        ),
+    )
     # Which exchange's advance reply is (about to be) on the wire. Stamped at
     # the toolless advance return with the speech sequence that reply will
     # get; the cut line "was the advance reply" iff `speech_sequence[0]`
@@ -8101,6 +8128,18 @@ async def _run_native_phone_screening(
             return state.question_at(expected + 1 + covered)
         return state.question_at(cursor)
 
+    def _short_reply_has_content(fragment: str) -> bool:
+        """A short reply ("Yes I use Excel") that is more than a greeting.
+
+        Not content: a question (counter-question / clarification), or words
+        made only of greeting, presence-check and acknowledgement vocabulary.
+        Anything else carries something the candidate said, so it is merged.
+        """
+        if fragment.endswith("?") or phone.phone_clarification_shape(fragment):
+            return False
+        words = re.findall(r"[a-z0-9']+", fragment.casefold())
+        return any(w not in _PRESENCE_ONLY_WORDS for w in words)
+
     def _merge_into_previous_exchange(
         target: dict[str, Any], text: str,
     ) -> str:
@@ -8117,6 +8156,7 @@ async def _run_native_phone_screening(
         if not fragment or not (
             phone.phone_turn_is_substantive_declarative(fragment)
             or len(fragment.split()) >= 6
+            or _short_reply_has_content(fragment)
         ):
             # A greeting / connectivity check ("Hello", "are you there") is
             # not part of the answer; the SDK still keeps it as a transcript
@@ -8299,19 +8339,25 @@ async def _run_native_phone_screening(
         if seen < INTERRUPTED_REASK_CAP and holds < combined_reask_cap:
             interrupted_reask_counts[question.key] = seen + 1
             category = "overlap_reask"
+            instruction = PHONE_OVERLAP_REASK_INSTRUCTION
+            control = PHONE_OVERLAP_REASK_CONTROL
         else:
-            # Spent: a plain first-time ask, no counter. It cannot loop on its
-            # own: another round needs another overlapping candidate turn.
+            # Spent: a plain ask (no "ask it again" wording, no counter). It
+            # cannot loop on its own: another round needs another overlapping
+            # candidate turn.
             category = "overlap_ask_capped"
+            instruction = (
+                PHONE_CONTINUATION_PRESENCE_INSTRUCTION
+                if merged == "not_merged_filler"
+                else PHONE_CONTINUATION_ASK_INSTRUCTION
+            )
+            control = PHONE_CONTINUATION_CONTROL
         setattr(agent, "_turn_policy", "clarification")
         set_question_reply_snapshot(question, text)
-        authorize_generated_reply(
-            question.spoken_text, control_text=PHONE_OVERLAP_REASK_CONTROL,
-        )
+        authorize_generated_reply(question.spoken_text, control_text=control)
         add_turn_instruction(
             turn_ctx,
-            PHONE_OVERLAP_REASK_INSTRUCTION + question.spoken_text
-            + _owed_ask_slot_note(question),
+            instruction + question.spoken_text + _owed_ask_slot_note(question),
         )
         _restamp_owed_ask(target)
         _log.info(
@@ -9082,8 +9128,18 @@ async def _run_native_phone_screening(
             # logical turn; roll back the freshness tick (BUG 1).
             _uncount_continuation_fragment()
             _stop_turn("predates_screening_start")
+        # The router stays out of (a) any call that is not toolless with
+        # preemptive off, and (b) a turn that arrives while a delivered
+        # résumé-conflict probe is waiting for its reply: re-asking the planned
+        # question there would leave the probe armed and take the next answer
+        # as the probe's reply. Both keep origin/main's exact behaviour.
+        router_on = overlap_router_active and not conflict_reply_pending["value"]
+        if not router_on:
+            if overlap:
+                _uncount_continuation_fragment()
+                _stop_turn("predates_question")
         cut_kind: str | None = None
-        if prior_interrupted:
+        if router_on and prior_interrupted:
             try:
                 _authored_source = getattr(agent, "spoken_source_text", None)
                 _authored = _authored_source() if callable(_authored_source) else None
@@ -9094,7 +9150,7 @@ async def _run_native_phone_screening(
                 authored=_authored,
                 played=_played_text_of_cut_line(latest_assistant[0]),
             )
-        if cut_kind in {CUT_BRIDGE_ONLY, CUT_NOTHING_PLAYED}:
+        if router_on and cut_kind in {CUT_BRIDGE_ONLY, CUT_NOTHING_PLAYED}:
             if await _route_continuation(turn_ctx, text):
                 return
             # Round 2: with the continuation cap spent, speech that began
@@ -9104,7 +9160,7 @@ async def _run_native_phone_screening(
             # words kept, owed question asked again, bounded.
             if overlap and await _route_overlap_reask(turn_ctx, text):
                 return
-        elif overlap:
+        elif router_on and overlap:
             if await _route_overlap_reask(turn_ctx, text):
                 return
         # Route split finals BEFORE conflict/clarification state. A second

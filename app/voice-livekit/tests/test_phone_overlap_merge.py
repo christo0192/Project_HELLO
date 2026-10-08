@@ -27,6 +27,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import inspect
+import os
 import pathlib
 import types
 import unittest
@@ -81,14 +82,21 @@ class _Rig(unittest.IsolatedAsyncioTestCase):
 
     QUESTIONS = staticmethod(_questions)
     CLIENT = fixtures.FakeEventClient
+    TURN_MODE = "toolless"
+    #: env overrides active while the coordinator starts (the router switch is
+    #: decided once per call, at start).
+    ENV: dict = {}
 
     async def asyncSetUp(self):
         self.persisted: list[tuple[str, object]] = []
         self.client = self.CLIENT()
         self.state = fixtures._default_state(questions=self.QUESTIONS())
+        env_patch = patch.dict(os.environ, self.ENV)
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
         (self.agent, self.session, _, _, self.hooks) = (
             await fixtures._make_native_coordinator(
-                turn_mode="toolless", client=self.client, state=self.state,
+                turn_mode=self.TURN_MODE, client=self.client, state=self.state,
                 persist_candidate_text=lambda t, a: self.persisted.append((t, a)),
             )
         )
@@ -719,7 +727,10 @@ class TestSecondCutOfTheOwedQuestionAsk(_Rig):
             anchor_ms=T0 + 12000, advance=False,
         )
         ctx = await self.turn("Also I trained two new joiners in the team", T0 + 11500)
-        self.assertIn(agent_mod.PHONE_OVERLAP_REASK_INSTRUCTION, _rendered(ctx))
+        # The re-ask budget is spent: the line is a plain ask, not "again".
+        self.assertIn("overlap_ask_capped", self.categories("phone_turn_overlap"))
+        self.assertNotIn(agent_mod.PHONE_OVERLAP_REASK_INSTRUCTION, _rendered(ctx))
+        self.assertIn(agent_mod.PHONE_CONTINUATION_ASK_INSTRUCTION, _rendered(ctx))
         await asyncio.sleep(0.8)
         self.assertEqual(self.client.committed_keys, ["intro"])
 
@@ -1010,7 +1021,12 @@ class TestQuestionCutStillReasksOnce(_Rig):
         ctx = await self.turn("Also I trained two new joiners in the team", T0 + 15200)
         self.assertIn("overlap_ask_capped", self.categories("phone_turn_overlap"))
         self.assertEqual(self.agent._interrupted_reask_counts, {"role": 1})
-        self.assertIn(agent_mod.PHONE_OVERLAP_REASK_INSTRUCTION, _rendered(ctx))
+        # Spent: the plain ask carries no "ask it again" wording at all.
+        capped = _rendered(ctx)
+        self.assertNotIn(agent_mod.PHONE_OVERLAP_REASK_INSTRUCTION, capped)
+        self.assertNotIn("again", capped.lower())
+        self.assertIn(agent_mod.PHONE_CONTINUATION_ASK_INSTRUCTION, capped)
+        self.assertIn(self.q[1].spoken_text, capped)
 
     async def test_overlap_over_a_fully_delivered_line_is_kept_not_dropped(self):
         await self.answer_first_question()
@@ -1441,6 +1457,170 @@ class TestSilenceNeverSpeaksOverTheCandidate(unittest.IsolatedAsyncioTestCase):
             hooks["log_patch"].stop()
             kinds = [k.get("error_category") for k in self._silence(hooks)]
             self.assertTrue({"qna_silence_nudge", "qna_silence_close"} & set(kinds))
+
+
+# ── the router only runs where it was reviewed ────────────────────────────
+
+class TestRouterIsActiveOnlyForToollessWithPreemptiveOff(_Rig):
+    async def test_the_shipped_configuration_logs_router_active_once(self):
+        await self.answer_first_question()
+        self.cut_line(
+            first_audio=True, played=BRIDGE_PLAYED, authored=BRIDGE_AUTHORED,
+            anchor_ms=T0 + 6000,
+        )
+        await self.turn("I know spreadsheets and did data entry work", T0 + 5500)
+        categories = self.categories("phone_turn_overlap")
+        self.assertEqual(categories.count("router_active"), 1)
+        self.assertNotIn("router_inactive_mode", categories)
+        self.assertIn("continuation_ask", categories)
+
+
+class _InactiveRouterChecks:
+    """Under any other turn mode / preemptive setting the new router must stay
+    out: a turn that predates the latest bot line is dropped (and logged) with
+    origin/main's behaviour, and a cut bridge is not turned into a continuation
+    ask, because the words could otherwise be credited to a next question the
+    candidate never heard."""
+
+    async def _first_answer(self):
+        await self.turn(
+            "I finished my graduation in commerce and then did data entry work.",
+            T0 + 3000)
+
+    async def test_the_category_logged_is_router_inactive_mode_once(self):
+        await self._first_answer()
+        categories = self.categories("phone_turn_overlap")
+        self.assertEqual(categories.count("router_inactive_mode"), 1)
+        self.assertNotIn("router_active", categories)
+
+    async def test_speech_that_predates_the_latest_line_is_dropped_and_logged(self):
+        await self._first_answer()
+        self.persisted.clear()
+        self.hooks["latest_assistant"][0] = BRIDGE_AUTHORED
+        self.hooks["latest_assistant_anchor"][0] = T0 + 6000
+        self.hooks["assistant_delivery_complete"].set()
+        ctx = await self.turn_dropped(
+            "I also helped with the audit documentation", T0 + 5600)
+        self.assertEqual(self.categories("phone_turn_drop"), ["predates_question"])
+        categories = self.categories("phone_turn_overlap")
+        for routed in ("overlap_reask", "continuation_ask", "overlap_no_target",
+                       "merged_uncommitted", "merged_after_commit"):
+            self.assertNotIn(routed, categories)
+        self.assertEqual(_rendered(ctx), "")
+        self.assertEqual(self.persisted, [])
+
+    async def test_a_cut_bridge_is_not_turned_into_a_continuation_ask(self):
+        await self._first_answer()
+        self.cut_line(
+            first_audio=True, played=BRIDGE_PLAYED, authored=BRIDGE_AUTHORED,
+            anchor_ms=T0 + 6000, advance=False,
+        )
+        try:
+            ctx = await self.turn(
+                "and I also maintained the vendor ledger every single month there",
+                T0 + 8000)
+        except Exception as exc:  # noqa: BLE001 - a drop is also main's behaviour
+            self.assertIn("StopResponse", type(exc).__name__)
+            ctx = types.SimpleNamespace(items=[])
+        rendered = _rendered(ctx)
+        self.assertNotIn(agent_mod.PHONE_CONTINUATION_ASK_INSTRUCTION, rendered)
+        self.assertNotIn(agent_mod.PHONE_OVERLAP_REASK_INSTRUCTION, rendered)
+        categories = self.categories("phone_turn_overlap")
+        for routed in ("continuation_ask", "overlap_reask", "continuation_no_target"):
+            self.assertNotIn(routed, categories)
+
+
+class TestRouterInactiveInToolfirstMode(_InactiveRouterChecks, _Rig):
+    TURN_MODE = "toolfirst"
+
+
+class TestRouterInactiveWhenPreemptiveIsOn(_InactiveRouterChecks, _Rig):
+    ENV = {"PHONE_OBJECTIVE_PREEMPTIVE": "on"}
+
+
+class TestRouterStaysOutWhileAConflictProbeAwaitsItsReply(_Rig):
+    async def test_an_overlap_over_a_delivered_probe_is_dropped_like_main(self):
+        await self.answer_first_question()
+        self.agent._conflict_reply_pending["value"] = True
+        self.hooks["speech_sequence"][0] = self.agent._advance_reply["seq"]
+        self.hooks["latest_assistant"][0] = BRIDGE_AUTHORED
+        self.hooks["latest_assistant_anchor"][0] = T0 + 6000
+        self.hooks["assistant_delivery_complete"].set()
+        await self.turn_dropped("I also helped with the audit documentation", T0 + 5600)
+        self.assertEqual(self.categories("phone_turn_drop"), ["predates_question"])
+        categories = self.categories("phone_turn_overlap")
+        self.assertNotIn("overlap_reask", categories)
+        self.assertNotIn("merged_after_commit", categories)
+        # The probe stays armed for the candidate's next real reply, and the
+        # planned question was not asked or credited in the meantime.
+        self.assertTrue(self.agent._conflict_reply_pending["value"])
+        await asyncio.sleep(0.5)
+        self.assertEqual(self.client.committed_keys, ["intro"])
+
+
+class TestOverlapReaskWhileTheCommitIsStillInFlight(_Rig):
+    CLIENT = _SlowCommitClient
+
+    async def test_a_slow_commit_does_not_make_the_overlap_reask_ask_the_answered_question(self):
+        await self.turn(
+            "I finished my graduation in commerce and then did data entry work.",
+            T0 + 3000)
+        await asyncio.sleep(0.05)
+        self.assertEqual(self.client.committed_keys, [])  # commit is in flight
+        self.cut_line(
+            first_audio=True, played=QUESTION_PLAYED, authored=BRIDGE_AUTHORED,
+            anchor_ms=T0 + 6000,
+        )
+        with patch.object(agent_mod, "PHONE_OVERLAP_COMMIT_WAIT_SEC", 0.1):
+            ctx = await self.turn(
+                "And I also supported the vendor payments team", T0 + 5200)
+        rendered = _rendered(ctx)
+        categories = self.categories("phone_turn_overlap")
+        self.assertIn("commit_wait_timeout", categories)
+        self.assertIn("overlap_reask", categories)
+        self.assertIn(agent_mod.PHONE_OVERLAP_REASK_INSTRUCTION, rendered)
+        self.assertIn(self.q[1].spoken_text, rendered)
+        self.assertNotIn(self.q[0].spoken_text, rendered)
+        await self.committed(1)
+        self.assertEqual(self.client.committed_keys, ["intro"])
+        self.assertEqual(self.agent._interrupted_reask_counts, {"role": 1})
+
+
+class TestShortReplyOverACutBridge(_Rig):
+    """A short reply with real content is part of the answer, not a greeting."""
+
+    async def _overlap_a_cut_bridge(self, text):
+        await self.answer_first_question()
+        self.cut_line(
+            first_audio=True, played=BRIDGE_PLAYED, authored=BRIDGE_AUTHORED,
+            anchor_ms=T0 + 6000,
+        )
+        return await self.turn(text, T0 + 5500)
+
+    async def _assert_merged(self, text):
+        rendered = _rendered(await self._overlap_a_cut_bridge(text))
+        self.assertIn(agent_mod.PHONE_CONTINUATION_ASK_INSTRUCTION, rendered)
+        self.assertNotIn(agent_mod.PHONE_CONTINUATION_PRESENCE_INSTRUCTION, rendered)
+        categories = self.categories("phone_turn_overlap")
+        self.assertIn("merged_after_commit", categories)
+        self.assertNotIn("not_merged_filler", categories)
+
+    async def _assert_presence_only(self, text):
+        rendered = _rendered(await self._overlap_a_cut_bridge(text))
+        self.assertIn(agent_mod.PHONE_CONTINUATION_PRESENCE_INSTRUCTION, rendered)
+        self.assertIn("not_merged_filler", self.categories("phone_turn_overlap"))
+
+    async def test_yes_i_use_excel_is_merged(self):
+        await self._assert_merged("Yes I use Excel")
+
+    async def test_i_handled_billing_is_merged(self):
+        await self._assert_merged("I handled billing")
+
+    async def test_hello_is_still_a_presence_check(self):
+        await self._assert_presence_only("Hello")
+
+    async def test_yes_okay_is_still_a_presence_check(self):
+        await self._assert_presence_only("Yes okay")
 
 
 # ── logging contract ─────────────────────────────────────────────────────
