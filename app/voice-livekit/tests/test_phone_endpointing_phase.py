@@ -231,6 +231,29 @@ class TestClassifier(unittest.TestCase):
                 self.assertEqual(
                     endpointing_phase.classify_answer_endpointing(phase, objective), expected)
 
+    def test_every_production_question_is_open(self):
+        spoken = list(phone._PRODUCTION_SPOKEN_QUESTIONS.values())
+        self.assertGreaterEqual(len(spoken), 8, "not vacuous")
+        for text in spoken:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    endpointing_phase.classify_answer_endpointing("screening", text), "open")
+
+    def test_polite_requests_are_open(self):
+        for text in (
+            "Could you introduce yourself and summarize your current work?",
+            "Could you summarize your biggest achievement?",
+            "Could you give an example of a difficult sale?",
+            "Could you list the CRMs you have used?",
+            "Can you talk about a project you led?",
+            "Could you elaborate on that?",
+            "Could you walk me through your day?",
+            "Can you go over your last role?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    endpointing_phase.classify_answer_endpointing("screening", text), "open")
+
     def test_a_missing_objective_in_screening_is_open(self):
         self.assertEqual(
             endpointing_phase.classify_answer_endpointing("screening", None), "open")

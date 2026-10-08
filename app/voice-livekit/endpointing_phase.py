@@ -59,9 +59,14 @@ OPEN_PHASES = frozenset({
     "post_interrupt_ack",
 })
 
+# Open markers include the action verbs of a polite request ("Could you
+# introduce yourself and summarize your current work?" is the production Q1),
+# so "could/can you <action>" is not read as a yes/no question.
 _OPEN_MARKERS_RE = re.compile(
     r"\b(what|how|why|which|where|when|who|tell me|walk me|describe|explain|"
-    r"share|talk me|take me through)\b"
+    r"share|talk me|take me through|introduce|summari[sz]e|give|list|"
+    r"elaborate|talk about|outline|run me through|brief|provide|detail|"
+    r"discuss|go over|go through)\b"
 )
 # A yes/no clause starts the text, or a clause after a sentence/clause break
 # (optionally led by and/or/so), with an auxiliary + a pronoun subject. So
