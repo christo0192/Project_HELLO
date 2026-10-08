@@ -295,7 +295,7 @@ PLAN: tuple[MoveSpec, ...] = (
                 r"\blow(?:er|est)\b",
                 r"\bcome down\b",
                 r"\bbring (?:it|that|the price|this) down\b",
-                r"\bany (?:room|flexibility)\b",
+                r"\bany (?:more |extra )?(?:room|flexibility)\b",
                 r"\bbest (?:you|price|offer|number)\b",
                 r"\bfinal (?:price|number)\b",
                 r"\bstretch\b",
@@ -303,6 +303,10 @@ PLAN: tuple[MoveSpec, ...] = (
                 r"\breduce\w*",
                 r"\bdiscount\b",
                 r"\bcheaper\b",
+                r"\bflexibility\b",
+                r"\bnothing\b",
+                r"\bpayment plans?\b",
+                r"\banything at all\b",
             ),
         ),
         variants=(
@@ -483,7 +487,9 @@ _REFUSAL = _compile(
     r"that'?s (?:our|the) (?:best|lowest|final|fixed)|fixed (?:price|fee)|"
     r"not something we|we don'?t (?:negotiate|discount|offer)|"
     r"isn'?t (?:something|an option|available)|is not (?:something|an option|available)|"
-    r"off the table|out of the question|won'?t (?:work|happen))\b",
+    r"off the table|out of the question|won'?t (?:work|happen)|"
+    r"that (?:is|'s) (?:as low as|as good as|the (?:best|lowest|final|limit)|our (?:best|"
+    r"lowest|final))|best (?:i|we) can (?:do|offer)|as low as (?:i|we) can)\b",
 )
 _FORMAT = _compile(
     r"\blive (?:classes|sessions|lectures|instruction|mentoring|teaching|training|online|"
@@ -618,6 +624,8 @@ _CLOSE_TALK = _compile(
     r"\b(?:e-?mail|mail|send)\b[^.?!]{0,30}\b(?:details|brochure|curriculum|information|info|"
     r"link|summary)\b",
     r"\bcall (?:you )?back\b",
+    r"\bwhen (?:you|i|we) (?:call|ring)\b",
+    r"\bschedul\w+\b[^.?!]{0,20}\b(?:call|chat|meeting|session|time|slot)\b",
     r"\bfollow[- ]?up\b",
     r"\bget back to\b",
     r"\b(?:decide|decision)\b",
@@ -955,6 +963,27 @@ class OwedMoveScheduler:
     def mark_commitment_resolved(self) -> None:
         """Record that a grade-level commitment line (or the 13:00 stall) was spoken."""
         self.commitment_resolved = True
+
+    def note_price_answered(self) -> None:
+        """The negotiation read the advisor's answer to the anchor (an offer or a refusal).
+
+        The price words of ``answers_price`` miss "let's make it 8.5" and a bare 8500; the
+        negotiation reads those, so the counter does not have to wait for its fallback.
+        """
+        anchor = self._states[F1_ANCHOR]
+        if (
+            anchor.delivered_turn is not None
+            and anchor.delivered_turn < self.turn
+            and self.price_answered_turn is None
+        ):
+            self.price_answered_turn = self.turn
+
+    def note_objection(self) -> None:
+        """A learner objection that is not a scheduled move (a stall reason) just landed.
+
+        Spacing counts it, so the next scheduled objection still has breathing room.
+        """
+        self._last_objection_turn = self.turn
 
     def _primary_gate(self, family: str | None) -> bool:
         return self.open_family in (None, family)

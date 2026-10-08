@@ -9,7 +9,7 @@ HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from r1_commitment import COMMITMENT_LINES
+from r1_commitment import COMMITMENT_LINES, Level, commitment_line
 from r1_personas import (
     ALL_PERSONA_NAMES,
     H_TOPICS,
@@ -221,7 +221,8 @@ class MarkerTests(unittest.TestCase):
     def test_markers_match_their_own_deep_need_and_nothing_public(self):
         scripted = [spec.line.format(decision_maker="husband") for spec in PLAN if spec.line]
         scripted.append(TIME_CUE_LINE)
-        scripted.extend(line.format(decision_maker="husband") for line in COMMITMENT_LINES.values())
+        scripted.extend(commitment_line(level, "husband") for level in COMMITMENT_LINES)
+        scripted.append(commitment_line(Level.MEDIUM, "husband", "tomorrow at 7 PM", moved=True))
         for persona in PERSONAS:
             for variant in persona.variants:
                 rendered = resolve_persona(persona.id, variant=variant.id)

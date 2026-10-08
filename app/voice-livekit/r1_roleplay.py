@@ -10,19 +10,22 @@ engine only DECIDES, deterministically, what the learner does on each candidate 
 ``plan.mode`` is one of
 
 ``SAY_ONLY``
-    Speak ``plan.scripted_text`` verbatim and call no LLM: a commitment line, the WEAK
-    stall, or (``plan.aside``) the interviewer's one-off L-ASIDE-COACH, which the session
-    speaks in the ASIDE phase with ``plan.voice == "interviewer"`` and which is excluded from
-    evidence (plan 5.10).
+    Speak ``plan.scripted_text`` verbatim and call no LLM: the graded commitment line (STRONG,
+    MEDIUM with its call slot, or the WEAK resolution), the close-attempt stall, or
+    (``plan.aside``) the interviewer's one-off L-ASIDE-COACH, which the session speaks in the
+    ASIDE phase with ``plan.voice == "interviewer"`` and which is excluded from evidence
+    (plan 5.10).  The WEAK line is spoken at most once per session (``r1_negotiation``).
 ``INTENT``
     R1-Q option B, intent-voiced moves.  The worker decides WHAT the learner raises (an owed
-    objection, an early-farewell redirect, the time cue) and the model voices it in context,
+    objection, an early-farewell redirect, the time cue, and, from the negotiation, a stall
+    reason, the e-mail yes, one question about the call) and the model voices it in context,
     in the same single call: it reacts to the advisor first and then raises
     ``plan.intent.brief`` in its own words.  Delivery is proven by ``plan.intent.markers`` in
     the text that was played.  If the model's reply misses them, ``intent_tail`` returns a
     scripted variant (``plan.intent.fallbacks``, vetted by the repetition check) that the
     session appends, so an owed move is never lost to the model.  ``compose_speech`` builds
-    the final text for callers that do not stream.
+    the final text for callers that do not stream.  The 13:00 stall is an INTENT without
+    markers: one short model reaction, then the scripted WEAK line, always.
 ``LLM_REPLY``
     A free, constrained reply using ``plan.reminder`` (a HINT for a first probe, the DEEP
     need's facts only on the turn that asks about a released topic, and now and then one
@@ -36,6 +39,13 @@ the output guard drops a sentence the learner already said (a ``repeat`` hit: hy
 posted).  The thinking filler and the guard fallback are 3-variant rotations seeded by the
 attempt id (``filler_text``, ``GuardContext.variant``), and so are the scripted variants of
 every intent.
+
+Negotiation (R1-Q): ``self.negotiation`` (``r1_negotiation``) remembers what the advisor put on
+the table (prices, callbacks, an e-mail offer, check-ins), which of the learner's stall reasons
+(timing, money, decision maker) were raised and which the advisor handled.  An ask before the
+close window is met with the next unused reason (or the owed F4 move, or any forced move); an
+ask inside the window is graded with the handled reasons as evidence.  The price counter
+follows the advisor's actual answer, and the wrap turn reacts to the number on the table.
 
 Nothing here can change a phase, a grade or the schedule from candidate or model text
 beyond the deterministic rules: the LLM has no tools, the judge's JSON is whitelisted,
@@ -66,19 +76,19 @@ transcript in ROLEPLAY, with ``r_sec`` read from the phase machine's role-play c
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
 from r1_commitment import (
     COMMIT_STALL_R_SEC,
     AskKind,
+    CommitmentEvidence,
     Level,
     classify_learner_commitment,
     commitment_line,
     detect_ask,
     grade,
-    stall_line,
 )
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
 from r1_guard import (
@@ -90,8 +100,28 @@ from r1_guard import (
     guard_text,
     has_concession,
 )
+from r1_negotiation import (
+    COMMIT_REACTION_BRIEF,
+    KIND_COMMIT,
+    KIND_STALL,
+    N_EMAIL,
+    N_QUESTION,
+    REASON_DECISION_MAKER,
+    REASON_TIMING,
+    SPEC_BY_ID,
+    SPEC_BY_REASON,
+    Negotiation,
+    NegotiationSpec,
+    NegotiationTurn,
+    fill_decision_maker,
+    filled_markers,
+)
 from r1_personas import RenderedPersona
 from r1_prompts import (
+    CHECKIN_DONE_NOTE,
+    CHECKIN_NOTE,
+    EMAIL_AGAIN_NOTE,
+    RESOLVED_NOTE,
     control_prose,
     interviewer_prefix,
     learner_prefix,
@@ -101,7 +131,10 @@ from r1_scheduler import (
     COMMIT_STALL,
     CURIOSITY_EVERY,
     CURIOSITY_TOPICS,
+    F1_ANCHOR,
     F1_COUNTER,
+    F4_PRIMARY,
+    F4_PUSH,
     REDIRECT_BRIEF,
     REDIRECT_OPENERS,
     TIME_CUE,
@@ -131,7 +164,6 @@ from r1_tracker import (
 from r1_world import WORLD_VERSION
 
 STALL_DEFER_GRACE_SEC = 30
-MAX_EARLY_STALLS = 2
 MAX_ASIDES = 3
 MIN_SUBSTANTIVE_TURNS = 8
 SUBSTANTIVE_WORDS = 3
@@ -188,6 +220,8 @@ class TurnPlan:
     aside: bool = False
     character_break: str | None = None
     intent: LearnerIntent | None = None
+    # R1-Q: the negotiation spec an INTENT plan voices (a stall reason, the e-mail yes ...), if any.
+    negotiation_id: str | None = None
 
     @property
     def needs_llm(self) -> bool:
@@ -263,6 +297,13 @@ class RolePlayEngine:
         self._curiosity_asked: set[str] = set()
         self._free_replies = 0
         self._free_at_last_curiosity = 0
+        # Negotiation (R1-Q): what is on the table, the stall reasons used and the commitment
+        # on record.  ``_notes`` are this turn's situation notes for the reminder, and
+        # ``_new_offer_usd`` the price an advisor turn added (the only "pleasant surprise" turn).
+        self.negotiation = Negotiation(persona.decision_maker)
+        self._notes: list[str] = []
+        self._new_offer_usd: int | None = None
+        self._force_curiosity = False
 
     # ------------------------------------------------------------------- properties
     @property
@@ -338,6 +379,8 @@ class RolePlayEngine:
         self.turn += 1
         turn = self.turn
         self.last_r = r_sec
+        self._notes = []
+        self._force_curiosity = False
         if turn_index is not None:
             self._turn_map[turn] = turn_index
         if candidate_seconds is not None:
@@ -346,8 +389,12 @@ class RolePlayEngine:
         signals = self.scheduler.observe_candidate_turn(candidate_text, r_sec)
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
         self._advisor_amounts.update(dollar_amounts(candidate_text))
+        negotiated = self._observe_negotiation(candidate_text, turn)
         self._note_curiosity_covered(candidate_text)
         ask = detect_ask(candidate_text)
+        wants = ask.kind if ask is not None else None
+        if wants is None and negotiated.callback is not None:
+            wants = AskKind.CALL  # a concrete callback or time proposal is a call ask
         reasons: list[str] = []
         if obs.injection:
             reasons.append("injection_phrase_flagged")
@@ -361,14 +408,22 @@ class RolePlayEngine:
                 self.exit_requested = True
                 reasons.append("close_attempt_exit")
                 return self._plan(TurnMode.EXIT, reasons)
-        if ask is not None:
-            planned = self._plan_ask(ask.kind, r_sec, reasons)
-            if planned is not None:
-                return planned
         # Disclosure is tied to the turn that asks about the topic: a first probe is answered
         # with the HINT layer and a follow-up (or a repeat probe of a released need) with the
         # DEEP layer, in that very reply.  An owed move that is not forced waits one turn.
         reveal_topics = self.tracker.gate.deep_due(obs.gate)
+        if wants is not None or negotiated.email_offer or negotiated.checkin:
+            planned = self._negotiate(
+                negotiated,
+                wants,
+                r_sec,
+                reasons,
+                first_probes=obs.gate.first_probes,
+                reveal_topics=reveal_topics,
+                monologue=candidate_seconds,
+            )
+            if planned is not None:
+                return planned
         if decision is not None and decision.move is not None:
             move = decision.move
             self.scheduler.issue(move)
@@ -400,26 +455,34 @@ class RolePlayEngine:
                 self.scheduler.issue(move)
                 reasons.append(f"owed:{move.id}" + (":forced" if move.forced else ""))
                 if move.id == COMMIT_STALL:
-                    # The 13:00 stall is the scripted WEAK line, spoken and masked exactly.
-                    return self._plan(
-                        TurnMode.SAY_ONLY,
+                    # The 13:00 stall: a short reaction, then the scripted WEAK line, spoken
+                    # and masked exactly, and never a second time (``Negotiation``).
+                    stall = self._commit_stall_plan(
+                        move,
                         reasons,
-                        scripted=move.text,
-                        move_id=move.id,
-                        level=Level.WEAK,
-                        resolves=True,
+                        first_probes=obs.gate.first_probes,
+                        reveal_topics=reveal_topics,
+                        monologue=candidate_seconds,
                     )
-                return self._intent_plan(
-                    move,
-                    reasons,
-                    redirect=False,
-                    first_probes=obs.gate.first_probes,
-                    reveal_topics=reveal_topics,
-                    monologue=candidate_seconds,
-                )
+                    if stall is not None:
+                        return stall
+                else:
+                    return self._intent_plan(
+                        move,
+                        reasons,
+                        redirect=False,
+                        first_probes=obs.gate.first_probes,
+                        reveal_topics=reveal_topics,
+                        monologue=candidate_seconds,
+                    )
         reasons.append("free_reply")
         curiosity = ""
-        if not reveal_due and break_kind is None:
+        if self._force_curiosity and not reveal_due and break_kind is None:
+            # The advisor checked in ("what do you think?", "anything else?"): an honest
+            # reaction and one real question, never the stall.
+            curiosity = self._curiosity_for_free_reply(force=True)
+            self._notes.append(CHECKIN_NOTE if curiosity else CHECKIN_DONE_NOTE)
+        elif not reveal_due and break_kind is None:
             curiosity = self._curiosity_for_free_reply()
         return self._plan(
             TurnMode.LLM_REPLY,
@@ -470,34 +533,202 @@ class RolePlayEngine:
             aside=True,
         )
 
-    def _plan_ask(self, kind: AskKind, r_sec: float, reasons: list[str]) -> TurnPlan | None:
-        """Answer an ask; None means "carry on with the owed move" (see MAX_EARLY_STALLS)."""
+    # ----------------------------------------------------------------- negotiation
+    def _observe_negotiation(self, candidate_text: str, turn: int) -> NegotiationTurn:
+        """Let the negotiation read this advisor turn (offers, callbacks, e-mail, check-ins)."""
+        anchor = self.scheduler.deliveries_by_id().get(F1_ANCHOR)
+        seen = self.negotiation.observe(
+            turn, candidate_text, anchor_turn=None if anchor is None else anchor.turn
+        )
+        if seen.price_answer:
+            self.scheduler.note_price_answered()
+        for offer in seen.offers:
+            self._advisor_amounts.add(offer.net_usd)  # the learner may name a price it heard
+        self._new_offer_usd = seen.offers[-1].net_usd if seen.offers else None
+        return seen
+
+    def _evidence(self, kind: AskKind) -> CommitmentEvidence:
+        """The commitment evidence, with the stall reasons the advisor handled added."""
+        return replace(
+            self.tracker.commitment_evidence(kind),
+            reasons_handled=self.negotiation.reasons_handled_count,
+        )
+
+    def _negotiate(
+        self,
+        seen: NegotiationTurn,
+        wants: AskKind | None,
+        r_sec: float,
+        reasons: list[str],
+        *,
+        first_probes: tuple[str, ...],
+        reveal_topics: tuple[str, ...],
+        monologue: float | None,
+    ) -> TurnPlan | None:
+        """The learner's answer to an ask, a callback, an e-mail offer or a check-in.
+
+        None means "carry on with the normal path" (an owed move, or a free reply), possibly with
+        a situation note added for the reminder.  The responses are the table of R1-Q 4.4:
+
+        * a commitment is already on record: never repeat it, react in a free reply;
+        * an ask before the close window: the owed F4 move if it can land now (or any forced
+          move), else the next unused stall reason, else one question about the call;
+        * an ask inside the window: the graded scripted line (STRONG, MEDIUM with the slot),
+          or, when the grade is WEAK and a reason is left (at most two rounds), that reason;
+          with none left, the scripted WEAK resolution line;
+        * an e-mail offer: yes, and what will it include (once); a check-in: an honest reaction
+          and one real question, never the stall.
+        """
+        negotiation = self.negotiation
+        layers = {
+            "first_probes": first_probes,
+            "reveal_topics": reveal_topics,
+            "monologue": monologue,
+        }
+        if wants is not None:
+            self._asks.append({"turn": self.turn, "kind": wants.value})
+        if negotiation.resolved or self.commitment_resolved:
+            if wants is not None or seen.email_offer or seen.checkin:
+                reasons.append("commitment_on_record")
+                self._notes.append(RESOLVED_NOTE)
+            return None
+        if wants is not None:
+            if not self.scheduler.commit_permitted(r_sec):
+                owed = self.scheduler.select(r_sec)
+                if owed is not None and (owed.forced or owed.family == "F4"):
+                    # The owed objection lands in context (the advisor just proposed a next
+                    # step), and a deadline is never starved by an advisor who asks every turn.
+                    reasons.append("ask_yields_to_owed_move")
+                    return None
+                self._stalls += 1
+                reasons.append("ask_before_close_window")
+                return self._reason_plan(reasons, **layers)
+            level = grade(self._evidence(wants))
+            reasons.append(f"ask_in_window:grade_{level.name.lower()}")
+            if level > Level.WEAK:
+                return self._commit_plan(level, reasons)
+            if negotiation.can_stall():
+                negotiation.stall_rounds += 1
+                planned = self._reason_plan(reasons, **layers)
+                if planned is not None:
+                    return planned
+            return self._commit_plan(Level.WEAK, reasons)
+        if seen.email_offer:
+            if not negotiation.email_answered:
+                reasons.append("email_offer")
+                return self._spec_plan(SPEC_BY_ID[N_EMAIL], reasons, **layers)
+            self._notes.append(EMAIL_AGAIN_NOTE)
+        if seen.checkin:
+            reasons.append("checkin")
+            self._force_curiosity = True
+        return None
+
+    def _reason_plan(self, reasons: list[str], **layers: Any) -> TurnPlan | None:
+        """Voice the next unused stall reason, else the one question about the call, else None."""
+        reason = self.negotiation.next_reason()
+        if reason is not None:
+            spec = SPEC_BY_REASON[reason]
+        elif not self.negotiation.question_used:
+            spec = SPEC_BY_ID[N_QUESTION]
+        else:
+            return None  # every reason is spent: react in a free reply (the next-step note)
+        reasons.append(f"stall_reason:{spec.reason or spec.kind}")
+        if spec.kind == KIND_STALL:
+            self.scheduler.note_objection()
+        return self._spec_plan(spec, reasons, **layers)
+
+    def _spec_plan(
+        self,
+        spec: NegotiationSpec,
+        reasons: list[str],
+        *,
+        first_probes: tuple[str, ...],
+        reveal_topics: tuple[str, ...],
+        monologue: float | None,
+    ) -> TurnPlan:
+        """The plan for a negotiation spec the model voices (a reason, a question, e-mail yes)."""
         dm = self.persona.decision_maker
-        self._asks.append({"turn": self.turn, "kind": kind.value})
-        if not self.scheduler.commit_permitted(r_sec):
-            if self._stalls >= MAX_EARLY_STALLS and self.scheduler.select(r_sec) is not None:
-                # A candidate who asks every turn must not freeze the schedule forever.
-                reasons.append("ask_yields_to_owed_move")
-                return None
-            self._stalls += 1
-            reasons.append("ask_before_close_window")
-            return self._plan(
-                TurnMode.SAY_ONLY,
-                reasons,
-                scripted=stall_line(dm),
-                level=Level.WEAK,
-                resolves=False,
-            )
-        level = self._commitment_level
-        if level is None:
-            level = grade(self.tracker.commitment_evidence(kind))
-        reasons.append(f"ask_in_window:grade_{level.name.lower()}")
+        variants = tuple(fill_decision_maker(text, dm) for text in spec.variants)
+        fallbacks = self._fallback_order(spec.id, variants)
+        self._intent_uses[spec.id] = self._intent_uses.get(spec.id, 0) + 1
+        intent = LearnerIntent(
+            kind=spec.kind,
+            brief=fill_decision_maker(spec.brief, dm),
+            must_say=(),
+            markers=filled_markers(spec.markers, dm),
+            fallback=fallbacks[0],
+            fallbacks=fallbacks,
+        )
+        self.negotiation.note_response(self.turn, spec.id)
+        return self._plan(
+            TurnMode.INTENT,
+            reasons,
+            intent=intent,
+            negotiation_id=spec.id,
+            first_probes=first_probes,
+            reveal_topics=reveal_topics,
+            monologue=monologue,
+        )
+
+    def _commit_plan(self, level: Level, reasons: list[str]) -> TurnPlan | None:
+        """The scripted commitment line for ``level`` (MEDIUM carries the call slot)."""
+        negotiation = self.negotiation
+        dm = self.persona.decision_maker
+        if level is Level.WEAK and negotiation.weak_line_said:
+            self._notes.append(RESOLVED_NOTE)  # the WEAK line is said at most once
+            return None
+        if level is Level.MEDIUM:
+            choice = negotiation.slot_choice()
+            text = commitment_line(level, dm, choice.phrase, moved=choice.moved)
+        else:
+            text = commitment_line(level, dm)
+        negotiation.note_response(self.turn, f"commit:{level.name.lower()}")
         return self._plan(
             TurnMode.SAY_ONLY,
             reasons,
-            scripted=commitment_line(level, dm),
+            scripted=text,
             level=level,
             resolves=True,
+        )
+
+    def _commit_stall_plan(
+        self,
+        move: OwedMove,
+        reasons: list[str],
+        *,
+        first_probes: tuple[str, ...],
+        reveal_topics: tuple[str, ...],
+        monologue: float | None,
+    ) -> TurnPlan | None:
+        """The 13:00 stall: one short reaction by the model, then the scripted WEAK line.
+
+        The intent has no markers on purpose: the line is always appended after the reaction
+        (``intent_tail``), and the model is told to say nothing about thinking it over, so the
+        WEAK wording is spoken exactly once and stays maskable.
+        """
+        if self.negotiation.weak_line_said:
+            self._notes.append(RESOLVED_NOTE)
+            return None
+        intent = LearnerIntent(
+            kind=KIND_COMMIT,
+            brief=COMMIT_REACTION_BRIEF,
+            must_say=(),
+            markers=(),
+            fallback=move.text,
+            fallbacks=(move.text,),
+        )
+        self.negotiation.note_response(self.turn, "commit:weak_at_stall")
+        return self._plan(
+            TurnMode.INTENT,
+            reasons,
+            scripted=move.text,
+            move_id=move.id,
+            level=Level.WEAK,
+            resolves=True,
+            intent=intent,
+            first_probes=first_probes,
+            reveal_topics=reveal_topics,
+            monologue=monologue,
         )
 
     # ------------------------------------------------------------------- intents
@@ -533,7 +764,16 @@ class RolePlayEngine:
         reveal_topics: tuple[str, ...],
         monologue: float | None,
     ) -> TurnPlan:
-        """The plan for an owed move the model voices (the move is already issued)."""
+        """The plan for an owed move the model voices (the move is already issued).
+
+        The price counter depends on how the advisor answered the anchor (R1-Q): push for a bit
+        more after a concession short of the ask, "is there nothing at all?" after a refusal,
+        "so what is the final price?" when the answer was unclear.
+        """
+        if move.id == F1_COUNTER:
+            situation = self.negotiation.counter_situation()
+            move = replace(move, brief=situation.brief, variants=situation.variants)
+            self.negotiation.note_response(self.turn, f"counter:{situation.id}")
         variants = move.variants or (move.text,)
         fallbacks = self._fallback_order(
             move.id, variants, REDIRECT_OPENERS if redirect else ()
@@ -572,13 +812,16 @@ class RolePlayEngine:
         intent = plan.intent
         if intent is None or markers_match(intent.markers, spoken_so_far):
             return ""
+        if intent.kind == KIND_COMMIT and fuzzy_contains(spoken_so_far, plan.scripted_text):
+            return ""  # the model already said the closing line: it is never said twice
         said = self._spoken.snapshot() + tuple(
             normalize(sentence) for sentence in split_sentences(spoken_so_far)
         )
         candidates = intent.fallbacks or (intent.fallback,)
         chosen = next((text for text in candidates if not _repeats(text, said)), candidates[0])
-        if plan.move_id is not None:
-            self._intent_fallbacks[plan.move_id] = self._intent_fallbacks.get(plan.move_id, 0) + 1
+        key = plan.move_id or plan.negotiation_id
+        if key is not None:
+            self._intent_fallbacks[key] = self._intent_fallbacks.get(key, 0) + 1
         return chosen
 
     # ------------------------------------------------------------------- curiosity
@@ -588,15 +831,16 @@ class RolePlayEngine:
             if topic not in self._curiosity_asked and curiosity_covered(topic, advisor_text):
                 self._curiosity_asked.add(topic)
 
-    def _curiosity_for_free_reply(self) -> str:
+    def _curiosity_for_free_reply(self, *, force: bool = False) -> str:
         """One unasked question topic every ``CURIOSITY_EVERY`` free replies, else "".
 
         These are the neutral questions that used to be scheduled (live or recorded, what
         would I build) plus three more; the model is only told what it is curious about and
-        may ask in its own words, so nothing is owed and nothing is graded.
+        may ask in its own words, so nothing is owed and nothing is graded.  ``force`` (the
+        advisor checked in) ignores the cadence.
         """
         self._free_replies += 1
-        if self._free_replies - self._free_at_last_curiosity < CURIOSITY_EVERY:
+        if not force and self._free_replies - self._free_at_last_curiosity < CURIOSITY_EVERY:
             return ""
         ids = tuple(topic for topic, _label in CURIOSITY_TOPICS)
         labels = dict(CURIOSITY_TOPICS)
@@ -625,6 +869,7 @@ class RolePlayEngine:
         aside: bool = False,
         intent: LearnerIntent | None = None,
         curiosity: str = "",
+        negotiation_id: str | None = None,
     ) -> TurnPlan:
         reminder: str | None = None
         kind = None if aside else self._break_kind
@@ -645,6 +890,10 @@ class RolePlayEngine:
                 must_say=() if intent is None else intent.must_say,
                 intent_forced=False if intent is None else intent.forced,
                 curiosity=curiosity,
+                offer_usd=self.negotiation.best_offer_usd,
+                new_offer_usd=self._new_offer_usd,
+                notes=tuple(self._notes),
+                reaction_only=intent is not None and intent.kind == KIND_COMMIT,
             )
             ctx = self.guard_context(
                 mode="reply", reminder=reminder, quiet_empty=mode is TurnMode.INTENT
@@ -665,6 +914,7 @@ class RolePlayEngine:
             aside=aside,
             character_break=kind,
             intent=intent,
+            negotiation_id=negotiation_id,
         )
 
     # ---------------------------------------------------------------------- speech
@@ -721,9 +971,17 @@ class RolePlayEngine:
         self._spoken.add(spoken_text)
         self.tracker.note_learner_text(spoken_text, plan.turn)
         if plan.move_id is not None:
-            self.scheduler.confirm_if_spoken(
+            delivery = self.scheduler.confirm_if_spoken(
                 plan.move_id, spoken_text, when, interrupted=interrupted
             )
+            # The owed F4 pair voices two stall reasons; the advisor's answer to them counts
+            # as handled evidence for the grade.
+            if delivery is not None and delivery.move_id == F4_PRIMARY:
+                self.negotiation.note_reason_voiced(REASON_TIMING, plan.turn)
+            elif delivery is not None and delivery.move_id == F4_PUSH:
+                self.negotiation.note_reason_voiced(REASON_DECISION_MAKER, plan.turn)
+        if plan.negotiation_id is not None:
+            self.negotiation.note_spoken(plan.negotiation_id, spoken_text, plan.turn)
         scripted_commitment = plan.commitment_level is not None and bool(plan.scripted_text)
         if plan.resolves_commitment and scripted_commitment:
             if fuzzy_contains(spoken_text, plan.scripted_text):
@@ -731,6 +989,8 @@ class RolePlayEngine:
                     self._commitment_level = plan.commitment_level
                     self._commitment_turn = plan.turn
                 self.scheduler.mark_commitment_resolved()
+                if plan.commitment_level is not None:
+                    self.negotiation.note_commitment(plan.commitment_level, plan.turn)
         if not scripted_commitment or plan.commitment_level is Level.WEAK:
             if classify_learner_commitment(spoken_text) > Level.WEAK or has_concession(
                 spoken_text
@@ -851,6 +1111,9 @@ class RolePlayEngine:
                 "fallback_appended": dict(self._intent_fallbacks),
                 "curiosity_asked": sorted(self._curiosity_asked),
             },
+            # What the learner remembers about the price, callbacks, reasons and the close
+            # (turn indices, integers and ids only; logged, not posted).
+            "negotiation": self.negotiation.log(),
             "early_close": {
                 "attempts": self.scheduler.close_attempts,
                 "exit_requested": self.exit_requested,

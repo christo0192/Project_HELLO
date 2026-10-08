@@ -22,6 +22,7 @@ from typing import Any
 
 import r1_commitment
 import r1_guard
+import r1_negotiation
 import r1_personas
 import r1_prompts
 import r1_scheduler
@@ -37,7 +38,11 @@ import r1_world
 #    markers and three scripted variants (the model voices it, the variants are the fallback);
 #    Q-A and Q-B became curiosity topics; deadlines F2 450 / F1 570; the early-farewell redirect
 #    has three scripted openers; PLAN_VERSION 2.
-CONTENT_REVISION = 5
+# 6: R1-Q negotiation: graded commitment with stall-reason evidence, the MEDIUM line's call slot,
+#    stall reasons / e-mail yes / call question as intents, the price counter by situation, the
+#    WEAK line at most once (a reaction before the 13:00 stall), offer-on-the-table and
+#    check-in notes, "pleasant surprise" only on a new offer.
+CONTENT_REVISION = 6
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -123,8 +128,36 @@ def manifest() -> dict[str, Any]:
                 "early_close_before_sec": r1_scheduler.EARLY_CLOSE_BEFORE_SEC,
             },
         },
+        "negotiation": {
+            "specs": [
+                {
+                    "id": spec.id,
+                    "kind": spec.kind,
+                    "reason": spec.reason,
+                    "brief": spec.brief,
+                    "markers": [list(group) for group in spec.markers],
+                    "variants": list(spec.variants),
+                }
+                for spec in r1_negotiation.SPECS
+            ],
+            "counters": [
+                {"id": item.id, "brief": item.brief, "variants": list(item.variants)}
+                for item in r1_negotiation.COUNTERS
+            ],
+            "commit_reaction_brief": r1_negotiation.COMMIT_REACTION_BRIEF,
+            "reasons": list(r1_negotiation.REASONS),
+            "constants": {
+                "max_stall_rounds": r1_negotiation.MAX_STALL_ROUNDS,
+                "anchor_usd": r1_negotiation.ANCHOR_USD,
+                "min_net_usd": r1_negotiation.MIN_NET_USD,
+                "preferred_time": r1_negotiation.PREFERRED_TIME,
+                "moved_day": r1_negotiation.MOVED_DAY,
+            },
+        },
         "commitment": {
             "lines": {level.name: text for level, text in r1_commitment.COMMITMENT_LINES.items()},
+            "default_slot": r1_commitment.DEFAULT_SLOT,
+            "moved_line": r1_commitment.MEDIUM_MOVED_LINE,
             "permitted_r_sec": r1_commitment.COMMIT_PERMITTED_R_SEC,
             "stall_r_sec": r1_commitment.COMMIT_STALL_R_SEC,
             "discount_cap_usd": r1_commitment.DISCOUNT_CAP_USD,
@@ -173,8 +206,25 @@ def manifest() -> dict[str, Any]:
             "curiosity_reminder_sample": r1_prompts.turn_reminder(
                 sample, r_sec=0, curiosity=r1_scheduler.CURIOSITY_TOPICS[0][1]
             ),
+            "negotiation_reminder_sample": r1_prompts.turn_reminder(
+                sample,
+                r_sec=0,
+                price_wrap=True,
+                offer_usd=8500,
+                new_offer_usd=8500,
+                notes=(r1_prompts.RESOLVED_NOTE, r1_prompts.CHECKIN_NOTE),
+            ),
+            "reaction_only_sample": r1_prompts.turn_reminder(sample, r_sec=0, reaction_only=True),
             "character_break_note": r1_prompts.CHARACTER_BREAK_NOTE,
             "intent_price_note": r1_prompts.INTENT_PRICE_NOTE,
+            "price_wrap_note": r1_prompts.PRICE_WRAP_NOTE,
+            "offer_on_table_note": r1_prompts.OFFER_ON_TABLE_NOTE,
+            "new_offer_note": r1_prompts.NEW_OFFER_NOTE,
+            "resolved_note": r1_prompts.RESOLVED_NOTE,
+            "checkin_note": r1_prompts.CHECKIN_NOTE,
+            "checkin_done_note": r1_prompts.CHECKIN_DONE_NOTE,
+            "email_again_note": r1_prompts.EMAIL_AGAIN_NOTE,
+            "reaction_only_note": r1_prompts.REACTION_ONLY_NOTE,
             "forced_note": r1_prompts.FORCED_NOTE,
         },
     }

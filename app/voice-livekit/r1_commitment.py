@@ -45,23 +45,44 @@ class AskKind(str, Enum):
     CALL = "call"
 
 
+# R1-Q: the MEDIUM line gains a time slot, still ONE sentence ending "so we can decide", which
+# is what the scorer-side mask matches (app/api/src/lib/r1/transcript.ts).  ``DEFAULT_SLOT`` is
+# the slot when the advisor proposed nothing usable; ``r1_negotiation`` picks the real one.
+DEFAULT_SLOT = "on Thursday at 7 PM"
 COMMITMENT_LINES = {
     Level.STRONG: (
         "Okay, let's do it. Send me the enrolment link for that plan and I'll pay the "
         "deposit today."
     ),
     Level.MEDIUM: (
-        "Let's book a call on Thursday at 7 PM with my {decision_maker} so we can decide."
+        "Let's book a call {slot} with my {decision_maker} so we can decide."
     ),
     Level.WEAK: "Let me think about it. Just email me the details and I'll get back to you.",
 }
+# The MEDIUM line when the advisor proposed a daytime weekday slot and the learner moves it to
+# the evening.  Still one sentence, still ending "so we can decide".
+MEDIUM_MOVED_LINE = (
+    "Daytime is tough for me, so let's book a call {slot} with my {decision_maker} so we can "
+    "decide."
+)
 
 
-def commitment_line(level: Level, decision_maker: str) -> str:
-    """The scripted line for ``level``; NONE is not a commitment and has no line."""
+def commitment_line(
+    level: Level,
+    decision_maker: str,
+    slot: str = DEFAULT_SLOT,
+    *,
+    moved: bool = False,
+) -> str:
+    """The scripted line for ``level``; NONE is not a commitment and has no line.
+
+    ``slot`` and ``moved`` only shape the MEDIUM line: the call slot, and whether the learner
+    moved the advisor's daytime proposal to the evening.
+    """
     if level is Level.NONE:
         raise ValueError("no commitment line for Level.NONE")
-    return COMMITMENT_LINES[level].format(decision_maker=decision_maker)
+    template = MEDIUM_MOVED_LINE if (moved and level is Level.MEDIUM) else COMMITMENT_LINES[level]
+    return template.format(decision_maker=decision_maker, slot=slot)
 
 
 def stall_line(decision_maker: str) -> str:
@@ -240,6 +261,7 @@ def classify_learner_commitment(text: object) -> Level:
     if any(pattern.search(lowered) for pattern in _MEDIUM):
         return Level.MEDIUM
     medium_line = COMMITMENT_LINES[Level.MEDIUM].replace("{decision_maker}", "")
+    medium_line = medium_line.replace("{slot}", DEFAULT_SLOT)
     if fuzzy_contains(folded, medium_line, 0.7):
         return Level.MEDIUM
     if any(pattern.search(lowered) for pattern in _WEAK):
@@ -256,6 +278,10 @@ class CommitmentEvidence:
     family_quality: Mapping[str, int | None]
     discount_ok: bool
     urgency_lever: bool
+    # R1-Q: how many of the learner's stall reasons (timing, money, decision maker) the advisor
+    # actually handled after the learner raised them.  Deterministic, so it only ever adds
+    # evidence the worker itself observed.
+    reasons_handled: int = 0
 
 
 def families_answered(quality: Mapping[str, int | None]) -> tuple[str, ...]:
@@ -272,17 +298,18 @@ def grade(evidence: CommitmentEvidence) -> Level:
 
     STRONG: commitment asked; at least 2 of 3 deep needs released; all four families
     answered with quality at least 1 (so F1 included); discount discipline intact; a
-    legitimate urgency lever used.  MEDIUM: asked; at least 1 deep need released; at
-    least 2 families answered.  Otherwise WEAK.  A call-only ask is capped at MEDIUM,
-    because the learner is never offered a payment moment it did not ask for.  Missing
-    tracker data (quality ``None``) counts as not answered, so a failed shadow judge can
-    only lower the grade.
+    legitimate urgency lever used.  MEDIUM: asked; at least 1 deep need released; and either
+    at least 2 families answered or at least 1 stall reason handled (R1-Q: an advisor who
+    solved the learner's stated reason has earned a call even if the judge was slow).
+    Otherwise WEAK.  A call-only ask is capped at MEDIUM, because the learner is never
+    offered a payment moment it did not ask for.  Missing tracker data (quality ``None``)
+    counts as not answered, so a failed shadow judge can only lower the family evidence.
     """
     if evidence.ask_kind is None:
         return Level.WEAK
     answered = families_answered(evidence.family_quality)
     result = Level.WEAK
-    if evidence.needs_released >= 1 and len(answered) >= 2:
+    if evidence.needs_released >= 1 and (len(answered) >= 2 or evidence.reasons_handled >= 1):
         result = Level.MEDIUM
     if (
         evidence.needs_released >= 2

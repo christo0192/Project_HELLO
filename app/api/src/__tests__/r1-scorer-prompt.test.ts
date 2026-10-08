@@ -56,6 +56,23 @@ describe('R1 scorer prompt', () => {
     expect(prompt).not.toContain('enrolment link');
   });
 
+  it('masks the MEDIUM commitment line with a call slot before the model sees it', () => {
+    const rows = interviewRows();
+    const last = rows.findIndex((row) => row.phase === 'roleplay_exit');
+    rows.splice(last, 0, {
+      turn_index: 900,
+      speaker: 'bot',
+      phase: 'roleplay',
+      text: "Daytime is tough for me, so let's book a call tomorrow at 7 PM with my husband so we can decide.",
+      interrupted: false,
+    });
+    const prompt = build({ rows });
+    expect(prompt).not.toContain('book a call');
+    expect(prompt).not.toContain('Daytime is tough');
+    expect(prompt).not.toContain('7 PM');
+    expect(prompt).toContain(R1_COMMITMENT_MASK);
+  });
+
   it('flags an interrupted learner turn', () => {
     const prompt = build();
     expect(prompt).toMatch(/Learner \(simulated by the AI; never evidence\): Mm-hm, go on\. \[interrupted\]/);

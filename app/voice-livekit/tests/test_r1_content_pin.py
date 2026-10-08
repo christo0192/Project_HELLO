@@ -22,6 +22,7 @@ if str(HERE) not in sys.path:
 import r1_commitment
 import r1_content
 import r1_guard
+import r1_negotiation
 import r1_personas
 import r1_prompts
 import r1_scheduler
@@ -36,7 +37,11 @@ import r1_world
 # Revision 5 (R1-Q): intent-voiced moves (a brief, must-say figures, delivery markers and three
 # scripted variants per owed move), Q-A and Q-B turned into curiosity topics, deadlines F2 450 and
 # F1 570, scripted redirect openers, PLAN_VERSION 2.
-PINNED_CONTENT_SHA256 = "7e33588d6a84b4adefacfbb699b4f69860b22da087f727cb52550c01e8eb0814"
+# Revision 6 (R1-Q): the negotiation (stall reasons, the e-mail yes, the call question, the price
+# counter by situation), the MEDIUM line's call slot, the WEAK line at most once with a reaction
+# before the 13:00 stall, offer-on-the-table / check-in / commitment-on-record notes, and
+# "pleasant surprise" only on a new offer (the prefix no longer primes it).
+PINNED_CONTENT_SHA256 = "ef3939cde1d9535316e4c403f5473aa8b46b7c74c45504c6db5e70fc99ed8881"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -45,6 +50,7 @@ CONTENT_MODULES = (
     "r1_personas",
     "r1_commitment",
     "r1_scheduler",
+    "r1_negotiation",
     "r1_tracker",
     "r1_guard",
     "r1_prompts",
@@ -204,6 +210,89 @@ class PinTests(unittest.TestCase):
             (r1_scheduler, "IDLE_GAP_TURNS", 4),
             (r1_prompts, "INTENT_PRICE_NOTE", "- Do not push on price."),
             (r1_prompts, "FORCED_NOTE", "- Link it."),
+        ):
+            original = getattr(module, name)
+            try:
+                setattr(module, name, value)
+                self.assertNotEqual(r1_content.content_sha256(), base, name)
+            finally:
+                setattr(module, name, original)
+        self.assertEqual(r1_content.content_sha256(), base)
+
+    def test_the_manifest_covers_the_r1_q_negotiation(self):
+        manifest = r1_content.manifest()
+        self.assertGreaterEqual(manifest["revision"], 6)
+        negotiation = manifest["negotiation"]
+        specs = {item["id"]: item for item in negotiation["specs"]}
+        self.assertEqual(set(specs), {spec.id for spec in r1_negotiation.SPECS})
+        for spec in r1_negotiation.SPECS:
+            entry = specs[spec.id]
+            self.assertEqual(entry["brief"], spec.brief)
+            self.assertEqual(entry["markers"], [list(group) for group in spec.markers])
+            self.assertEqual(entry["variants"], list(spec.variants))
+        counters = {item["id"]: item for item in negotiation["counters"]}
+        self.assertEqual(set(counters), {item.id for item in r1_negotiation.COUNTERS})
+        self.assertEqual(
+            negotiation["commit_reaction_brief"], r1_negotiation.COMMIT_REACTION_BRIEF
+        )
+        self.assertEqual(negotiation["reasons"], list(r1_negotiation.REASONS))
+        self.assertEqual(
+            negotiation["constants"]["max_stall_rounds"], r1_negotiation.MAX_STALL_ROUNDS
+        )
+        commitment = manifest["commitment"]
+        self.assertEqual(commitment["default_slot"], r1_commitment.DEFAULT_SLOT)
+        self.assertEqual(commitment["moved_line"], r1_commitment.MEDIUM_MOVED_LINE)
+        self.assertIn("{slot}", commitment["lines"]["MEDIUM"])
+        prompts = manifest["prompts"]
+        for key, value in (
+            ("price_wrap_note", r1_prompts.PRICE_WRAP_NOTE),
+            ("offer_on_table_note", r1_prompts.OFFER_ON_TABLE_NOTE),
+            ("new_offer_note", r1_prompts.NEW_OFFER_NOTE),
+            ("resolved_note", r1_prompts.RESOLVED_NOTE),
+            ("checkin_note", r1_prompts.CHECKIN_NOTE),
+            ("checkin_done_note", r1_prompts.CHECKIN_DONE_NOTE),
+            ("email_again_note", r1_prompts.EMAIL_AGAIN_NOTE),
+            ("reaction_only_note", r1_prompts.REACTION_ONLY_NOTE),
+        ):
+            self.assertEqual(prompts[key], value, key)
+        self.assertIn('"$8,500"', prompts["negotiation_reminder_sample"])
+        self.assertIn(r1_prompts.REACTION_ONLY_NOTE, prompts["reaction_only_sample"])
+        self.assertNotIn("pleasant surprise", json.dumps(prompts["learner_prefixes"]))
+
+    def test_editing_a_negotiation_text_a_marker_or_a_slot_constant_changes_the_sha(self):
+        base = r1_content.content_sha256()
+        original_specs = r1_negotiation.SPECS
+        spec = original_specs[0]
+        try:
+            for change in (
+                {"brief": spec.brief + " Really."},
+                {"markers": spec.markers + ((r"foo",),)},
+                {"variants": spec.variants[:-1] + ("Not today.",)},
+            ):
+                edited = dataclasses.replace(spec, **change)
+                r1_negotiation.SPECS = (edited,) + original_specs[1:]
+                self.assertNotEqual(r1_content.content_sha256(), base, change)
+        finally:
+            r1_negotiation.SPECS = original_specs
+        original_counters = r1_negotiation.COUNTERS
+        try:
+            first = original_counters[0]
+            r1_negotiation.COUNTERS = (
+                dataclasses.replace(first, variants=first.variants + ("Maybe lower?",)),
+            ) + original_counters[1:]
+            self.assertNotEqual(r1_content.content_sha256(), base)
+        finally:
+            r1_negotiation.COUNTERS = original_counters
+        for module, name, value in (
+            (r1_negotiation, "COMMIT_REACTION_BRIEF", "x"),
+            (r1_negotiation, "MAX_STALL_ROUNDS", 3),
+            (r1_negotiation, "PREFERRED_TIME", "8 PM"),
+            (r1_commitment, "DEFAULT_SLOT", "on Friday at 7 PM"),
+            (r1_commitment, "MEDIUM_MOVED_LINE", "Moved {slot} {decision_maker}."),
+            (r1_prompts, "OFFER_ON_TABLE_NOTE", "- Offer {amount}."),
+            (r1_prompts, "NEW_OFFER_NOTE", "- New {amount}."),
+            (r1_prompts, "RESOLVED_NOTE", "- Done."),
+            (r1_prompts, "CHECKIN_NOTE", "- Check."),
         ):
             original = getattr(module, name)
             try:

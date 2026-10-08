@@ -10,13 +10,14 @@ HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from r1_commitment import COMMITMENT_LINES, Level
+from r1_commitment import COMMITMENT_LINES, Level, commitment_line
 from r1_guard import REPLY_WORD_CAP
 from r1_personas import ALL_PERSONA_NAMES, PERSONAS, resolve_persona
 from r1_prompts import (
     INTERVIEWER_NAME,
     WRAPUP_NOTE,
     assemble_messages,
+    control_prose,
     interviewer_prefix,
     learner_prefix,
     select_context,
@@ -255,7 +256,7 @@ class ReminderTests(unittest.TestCase):
         """R1-Q: "answer exactly: <WEAK stall>" caused turns 61, 81, 87 and 90 of the owner test."""
         text = turn_reminder(P1, r_sec=100)
         for level in (Level.WEAK, Level.MEDIUM, Level.STRONG):
-            self.assertNotIn(COMMITMENT_LINES[level].format(decision_maker="husband"), text)
+            self.assertNotIn(commitment_line(level, "husband"), text)
             self.assertNotIn(COMMITMENT_LINES[level][:25], text)
         self.assertNotIn("answer exactly", text)
         self.assertNotIn("Just email me the details", text)
@@ -408,10 +409,96 @@ class NotesTests(unittest.TestCase):
 
         self.assertIn(PRICE_WRAP_NOTE, turn_reminder(P1, r_sec=5, price_wrap=True))
         self.assertNotIn(PRICE_WRAP_NOTE, turn_reminder(P1, r_sec=5))
-        self.assertIn("Okay, that's helpful.", PRICE_WRAP_NOTE)
+        # R1-Q: no scripted "Okay, that's helpful" any more (owner test turn 59): an honest
+        # reaction in the learner's own words.
+        self.assertNotIn("Okay, that's helpful", PRICE_WRAP_NOTE)
+        self.assertIn("React honestly to their last answer", PRICE_WRAP_NOTE)
         self.assertIn("do not accept, concede or push", PRICE_WRAP_NOTE)
         for word in RUBRIC_WORDS:
             self.assertNotRegex(PRICE_WRAP_NOTE, rf"\b{re.escape(word)}\b", word)
+
+    def test_an_offer_on_the_table_is_named_in_the_wrap_note_so_the_learner_reacts_to_it(self):
+        from r1_prompts import OFFER_ON_TABLE_NOTE, PRICE_WRAP_NOTE, format_usd
+
+        text = turn_reminder(P1, r_sec=5, price_wrap=True, offer_usd=8500)
+        self.assertIn(OFFER_ON_TABLE_NOTE.format(amount="$8,500"), text)
+        self.assertIn('has "$8,500" on the table', text)
+        self.assertNotIn(PRICE_WRAP_NOTE, text)
+        self.assertIn("still a stretch", text)
+        self.assertIn("Do not accept it, agree to it or push for more", text)
+        self.assertEqual(format_usd(8500), "$8,500")
+        # Without a wrap turn the offer is not shown in the wrap note.
+        self.assertNotIn("on the table", turn_reminder(P1, r_sec=5, offer_usd=8500))
+        for word in RUBRIC_WORDS:
+            self.assertNotRegex(OFFER_ON_TABLE_NOTE, rf"\b{re.escape(word)}\b", word)
+
+    def test_pleasant_surprise_is_primed_only_on_the_turn_an_offer_was_added(self):
+        from r1_prompts import NEW_OFFER_NOTE
+
+        added = turn_reminder(P1, r_sec=5, new_offer_usd=8500)
+        self.assertIn(NEW_OFFER_NOTE.format(amount="$8,500"), added)
+        self.assertIn("mildly pleasantly surprised", added)
+        self.assertIn("do not accept it", added)
+        plain = turn_reminder(P1, r_sec=5)
+        self.assertNotIn("pleasantly surprised", plain)
+        self.assertNotIn("surprise", learner_prefix(P1))  # the byte-stable prefix never primes it
+        # An intent turn on the wrap turn keeps the intent note (no number, no second note).
+        from r1_prompts import INTENT_PRICE_NOTE
+
+        both = turn_reminder(
+            P1, r_sec=5, price_wrap=True, offer_usd=8500, new_offer_usd=8500,
+            intent_brief="you ask a thing",
+        )
+        self.assertIn(INTENT_PRICE_NOTE, both)
+        self.assertNotIn("pleasantly surprised", both)
+        # A better offer added on the wrap turn of a normal reply is both: the real number on
+        # the table, and news the learner may be mildly pleasantly surprised by.
+        both_notes = turn_reminder(
+            P1, r_sec=5, price_wrap=True, offer_usd=8000, new_offer_usd=8000
+        )
+        self.assertIn('has "$8,000" on the table', both_notes)
+        self.assertIn("mildly pleasantly surprised", both_notes)
+
+    def test_the_negotiation_notes_are_ascii_quote_their_examples_and_carry_no_rubric_words(self):
+        from r1_prompts import (
+            CHECKIN_DONE_NOTE,
+            CHECKIN_NOTE,
+            EMAIL_AGAIN_NOTE,
+            NEW_OFFER_NOTE,
+            OFFER_ON_TABLE_NOTE,
+            REACTION_ONLY_NOTE,
+            RESOLVED_NOTE,
+        )
+
+        for note in (
+            CHECKIN_DONE_NOTE, CHECKIN_NOTE, EMAIL_AGAIN_NOTE, NEW_OFFER_NOTE,
+            OFFER_ON_TABLE_NOTE, REACTION_ONLY_NOTE, RESOLVED_NOTE,
+        ):
+            note.encode("ascii")
+            for word in RUBRIC_WORDS:
+                self.assertNotRegex(note, rf"\b{re.escape(word)}\b", word)
+        # The example reaction sits in double quotes, so voicing it is never an echo.
+        prose = control_prose(turn_reminder(P1, r_sec=5, price_wrap=True, offer_usd=8500))
+        self.assertNotIn("better, but it is still a stretch", prose)
+
+    def test_situation_notes_are_added_in_order_and_empty_ones_dropped(self):
+        from r1_prompts import CHECKIN_NOTE, RESOLVED_NOTE
+
+        text = turn_reminder(P1, r_sec=5, notes=(RESOLVED_NOTE, "", CHECKIN_NOTE))
+        self.assertLess(text.index(RESOLVED_NOTE), text.index(CHECKIN_NOTE))
+        self.assertNotIn("\n\n", text)
+
+    def test_a_reaction_only_reminder_asks_for_one_sentence_and_carries_no_brief(self):
+        from r1_prompts import REACTION_ONLY_NOTE
+
+        text = turn_reminder(
+            P1, r_sec=5, reaction_only=True, intent_brief="you raise a thing", price_wrap=True
+        )
+        self.assertIn(REACTION_ONLY_NOTE, text)
+        self.assertNotIn("you raise a thing", text)
+        self.assertNotIn("raise something of your own", text)
+        self.assertNotIn("answer what they asked", text)
+        self.assertNotIn("on price", text)  # nothing else competes with the single sentence
 
     def test_an_intent_turn_gets_the_softer_price_note_not_the_say_only_helpful_one(self):
         from r1_prompts import INTENT_PRICE_NOTE, PRICE_WRAP_NOTE
@@ -423,10 +510,11 @@ class NotesTests(unittest.TestCase):
         for word in RUBRIC_WORDS:
             self.assertNotRegex(INTENT_PRICE_NOTE, rf"\b{re.escape(word)}\b", word)
 
-    def test_the_learner_reacts_pleasantly_to_unexpected_offers_without_committing(self):
+    def test_the_learner_takes_unexpected_offers_as_news_without_committing(self):
         prefix = learner_prefix(P1)
         self.assertIn("offers a discount or an extra", prefix)
-        self.assertIn("do not question it, correct it or commit to anything", prefix)
+        self.assertIn("take it in as news", prefix)
+        self.assertIn("not question it, correct it or commit to anything", prefix)
 
 
 class CharacterBreakPromptTests(unittest.TestCase):

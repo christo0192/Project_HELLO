@@ -87,11 +87,16 @@ export const R1_NAME_MASK = '[CANDIDATE]';
  * The three scripted commitment lines (plan 5.5). The commitment outcome is logged by the
  * worker and is NOT scoring evidence, so the scorer sees a masked placeholder instead of
  * which level the learner chose. Matching is sentence-level so surrounding talk survives.
+ *
+ * R1-Q: the MEDIUM line carries a call slot ("Let's book a call tomorrow at 7 PM with my
+ * husband so we can decide.", or "Daytime is tough for me, so let's book a call ... so we can
+ * decide."), so it is recognised by its fixed frame, not by one slot: the worker keeps it ONE
+ * sentence that starts the call booking and ends "so we can decide".
  */
 const COMMITMENT_PATTERNS: readonly RegExp[] = [
   /send me the enrol+ment link/i,
   /pay the deposit today/i,
-  /book a call on thursday at 7\s?pm/i,
+  /book a call\b[^.!?]*\bso we can decide/i,
   /email me the details and i['’]?ll get back to you/i,
 ];
 

@@ -1226,18 +1226,23 @@ class TestTheScriptedVariantIsTheFallbackOfAnIntent(unittest.IsolatedAsyncioTest
 class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
     CALL_ASK = "Shall I send you the enrolment link so you can enrol today?"
 
-    async def test_an_ask_before_the_window_gets_the_stall_and_never_the_model(self) -> None:
+    async def test_an_ask_before_the_window_gets_a_reason_and_never_a_commitment(self) -> None:
         rig = Rig()
         await rig.start_roleplay()
         await rig.converse(OPENER, advance=20)
         calls = len(rig.provider.calls)
         spoken = await rig.converse(self.CALL_ASK, advance=100)
         plan = rig.plan()
-        self.assertIs(plan.mode, TurnMode.SAY_ONLY)
-        self.assertEqual(spoken, stall_line(rig.persona.decision_maker))
-        self.assertEqual(len(rig.provider.calls), calls)  # the model was not called
+        # R1-Q: no sanctioned stall line; the learner voices a reason in its own words (one model
+        # call, a scripted variant if the reply misses it) and agrees to nothing.
+        self.assertIs(plan.mode, TurnMode.INTENT)
+        self.assertEqual(plan.negotiation_id, "N-TIMING")
+        self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
+        self.assertEqual(len(rig.provider.calls), calls + 1)
         self.assertFalse(rig.engine.commitment_resolved)
         self.assertIn("ask_before_close_window", plan.reasons)
+        self.assertEqual(rig.engine.negotiation.voiced, {"timing": plan.turn})
+        self.assertEqual(rig.engine.ledger.leak_total, 0)
 
     async def test_an_ask_in_the_window_gets_the_graded_line_verbatim(self) -> None:
         rig = Rig(judge=judge_returning(GOOD_JUDGE))
@@ -1254,6 +1259,51 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rig.provider.calls), calls)
         self.assertTrue(rig.engine.commitment_resolved)
         self.assertEqual(rig.engine.commitment_level, plan.commitment_level)
+
+    async def test_the_thirteen_minute_stall_is_one_model_reaction_then_the_scripted_line(
+        self,
+    ) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        await cooperative_conversation(rig)  # R = 12:50 after the last advisor turn
+        self.assertFalse(rig.engine.commitment_resolved)
+        reaction = FakeProvider("Thanks, that was a helpful walk-through.")
+        spoken = await rig.converse(
+            "That makes sense, thank you for sharing that.", advance=20, provider=reaction
+        )
+        plan = rig.plan()
+        dm = rig.persona.decision_maker
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, "COMMIT-STALL"))
+        self.assertEqual(spoken, f"Thanks, that was a helpful walk-through. {stall_line(dm)}")
+        self.assertEqual(len(reaction.calls), 1)  # one model call, for the reaction only
+        self.assertTrue(rig.engine.commitment_resolved)
+        self.assertEqual(rig.engine.commitment_level, Level.WEAK)
+        # The model was asked for ONE sentence and was not handed the stall wording.
+        reminder = reaction.calls[0][-2]["content"]
+        self.assertIn("ONE short sentence", reminder)
+        self.assertNotIn("Just email me the details", reminder)
+        # The stall is never said again, whatever the advisor does next.
+        later = await rig.converse(ASK, advance=5)
+        self.assertNotIn("email me the details", (later or "").lower())
+
+    async def test_a_callback_proposal_before_the_window_is_met_with_a_reason_through_the_session(
+        self,
+    ) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        spoken = await rig.converse(
+            "Can we schedule a call back tomorrow at 10:00 a.m.? I will email you the details.",
+            advance=100,
+            provider=FakeProvider("Okay."),
+        )
+        plan = rig.plan()
+        self.assertEqual(plan.negotiation_id, "N-TIMING")
+        self.assertTrue(spoken.startswith("Okay."))
+        self.assertNotIn("tomorrow", spoken.lower())
+        self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
+        self.assertEqual(rig.engine.negotiation.callbacks, [{"turn": 2, "has_slot": True}])
+        self.assertEqual(rig.engine.ledger.leak_total, 0)
 
     async def test_the_same_conversation_gets_the_same_commitment_every_time(self) -> None:
         outcomes = []
@@ -1921,14 +1971,19 @@ class TestEndToEnd(R1TestCase):
         self.assertEqual(self.session.spoken[2], persona.pickup_line)
         # Role-play: the cooperative advisor script, 50 s apart, through the SDK seams.
         spoken = []
-        for index, text in enumerate((*cooperative_script(), ASK)):
-            spoken.append(await self.converse(text, 20 if index == 0 else 50))
+        # With no judge data the grade is WEAK: the first ask meets the one reason left (money),
+        # the second gets the scripted WEAK resolution (R1-Q: stall reasons before the WEAK line).
+        script = cooperative_script()
+        for index, text in enumerate((*script, ASK, ASK)):
+            gap = 20 if index == 0 else (50 if index < len(script) else 5)  # R stays < 14:00
+            spoken.append(await self.converse(text, gap))
         self.assertTrue(all(spoken))
         self.assertIs(interview.machine.phase, R1Phase.ROLEPLAY)
         self.assertGreaterEqual(len(interview.engine.scheduler.deliveries()), 9)
         # The commitment was asked for after R = 9:00, so the role-play is over at the next
         # boundary (R >= 10:00, resolved): the interviewer answers it with L-EXIT.
         self.assertTrue(interview.engine.commitment_resolved)
+        self.assertEqual(spoken[-1], stall_line(interview.persona.decision_maker))
         self.clock.advance(5)
         self.final_transcript("let me summarise the offer")
         with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.05):

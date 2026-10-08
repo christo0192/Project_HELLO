@@ -25,7 +25,9 @@ from r1_commitment import (
     mask_for_scorer,
     stall_line,
 )
+from r1_commitment import DEFAULT_SLOT
 from r1_scheduler import PLAN, TIME_CUE_LINE
+from r1_text import split_sentences
 
 STRONG = Level.STRONG
 MEDIUM = Level.MEDIUM
@@ -38,10 +40,11 @@ def evidence(
     quality=None,
     discount_ok=True,
     urgency=True,
+    handled=0,
 ) -> CommitmentEvidence:
     if quality is None:
         quality = {"F1": 1, "F2": 1, "F3": 2, "F4": 1}
-    return CommitmentEvidence(kind, needs, quality, discount_ok, urgency)
+    return CommitmentEvidence(kind, needs, quality, discount_ok, urgency, handled)
 
 
 class LineTests(unittest.TestCase):
@@ -60,6 +63,30 @@ class LineTests(unittest.TestCase):
             "Let me think about it. Just email me the details and I'll get back to you.",
         )
         self.assertEqual(stall_line("father"), commitment_line(WEAK, "father"))
+
+    def test_the_medium_line_takes_a_call_slot_and_keeps_one_sentence(self):
+        """R1-Q: the slot is the only thing that varies; the frame is what the scorer mask matches."""
+        self.assertEqual(
+            commitment_line(MEDIUM, "husband", "tomorrow at 7 PM"),
+            "Let's book a call tomorrow at 7 PM with my husband so we can decide.",
+        )
+        self.assertEqual(DEFAULT_SLOT, "on Thursday at 7 PM")
+        moved = commitment_line(MEDIUM, "father", "tomorrow at 7 PM", moved=True)
+        self.assertEqual(
+            moved,
+            "Daytime is tough for me, so let's book a call tomorrow at 7 PM with my father so we "
+            "can decide.",
+        )
+        for line in (moved, commitment_line(MEDIUM, "husband", "on Saturday")):
+            self.assertEqual(len(split_sentences(line)), 1)
+            self.assertTrue(line.endswith("so we can decide."))
+            self.assertEqual(classify_learner_commitment(line), MEDIUM)
+            self.assertTrue(is_commitment_line(line, "husband") or "father" in line)
+        # The slot arguments only shape MEDIUM.
+        self.assertEqual(commitment_line(STRONG, "husband", "tonight", moved=True),
+                         commitment_line(STRONG, "husband"))
+        self.assertEqual(commitment_line(WEAK, "husband", "tonight", moved=True),
+                         commitment_line(WEAK, "husband"))
 
     def test_none_has_no_line(self):
         with self.assertRaises(ValueError):
@@ -260,6 +287,22 @@ class GradeTests(unittest.TestCase):
         self.assertEqual(grade(evidence(needs=1, quality={"F1": 1, "F2": 1})), MEDIUM)
         self.assertEqual(grade(evidence(needs=0, quality={"F1": 2, "F2": 2, "F3": 2})), WEAK)
         self.assertEqual(grade(evidence(needs=3, quality={"F1": 1})), WEAK)
+
+    def test_a_handled_stall_reason_reaches_medium_without_the_family_evidence(self):
+        """R1-Q: an advisor who solved the learner's stated reason has earned a call."""
+        none_quality = {"F1": None, "F2": None, "F3": None, "F4": None}
+        self.assertEqual(grade(evidence(needs=1, quality=none_quality)), WEAK)
+        self.assertEqual(grade(evidence(needs=1, quality=none_quality, handled=1)), MEDIUM)
+        self.assertEqual(grade(evidence(needs=1, quality={"F1": 1}, handled=2)), MEDIUM)
+        # It still needs a released need, and it never reaches STRONG by itself.
+        self.assertEqual(grade(evidence(needs=0, quality=none_quality, handled=3)), WEAK)
+        self.assertEqual(grade(evidence(needs=1, quality=none_quality, handled=3)), MEDIUM)
+        self.assertEqual(grade(evidence(kind=None, handled=3)), WEAK)
+        self.assertEqual(
+            grade(evidence(kind=AskKind.CALL, quality=none_quality, handled=1)), MEDIUM
+        )
+        # The default is no handled reason, so every older caller keeps its grade.
+        self.assertEqual(CommitmentEvidence(AskKind.ENROL, 1, {"F1": 1}, True, True).reasons_handled, 0)
 
     def test_no_ask_is_weak(self):
         self.assertEqual(grade(evidence(kind=None)), WEAK)

@@ -1160,6 +1160,61 @@ class RefusalVocabularyTests(unittest.TestCase):
         self.assertTrue(answers_price("A lower price isn't something we can offer."))
         self.assertTrue(answers_price("That is off the table."))
 
+    def test_r1_q_the_best_i_can_do_is_a_refusal_and_an_answer_to_the_anchor(self):
+        """T03 found "that is the best I can do on price" waiting for the 2-turn fallback."""
+        for text in (
+            "That is the best I can do on price.",
+            "That's the best we can offer.",
+            "Honestly, the best I can do is what I said.",
+            "That is as low as we can go.",
+            "That is the lowest we can do.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(sched.has_refusal(text), text)
+                self.assertTrue(answers_price(text), text)
+        for text in ("The best part is the capstone.", "That is the first module.", "I can do $500 off."):
+            with self.subTest(text=text):
+                self.assertFalse(sched.has_refusal(text), text)
+
+
+class NegotiationHooksTests(unittest.TestCase):
+    """R1-Q T04: the negotiation tells the scheduler what the price words miss."""
+
+    def test_note_price_answered_releases_the_counter_before_its_fallback(self):
+        s = make()
+        turn(s, OPENER, 20)
+        turn(s, PRICE_ONLY, 60)  # F1-ANCHOR delivered
+        s.observe_candidate_turn("Okay, let's make it 8.5.", 100)  # the price words miss this
+        self.assertIsNone(s.price_answered_turn)
+        s.note_price_answered()
+        self.assertEqual(s.price_answered_turn, s.turn)
+        self.assertEqual(s.select(100).id, F1_COUNTER)
+
+    def test_note_price_answered_waits_for_the_anchor_and_counts_once(self):
+        s = make()
+        turn(s, OPENER, 20)
+        s.note_price_answered()
+        self.assertIsNone(s.price_answered_turn)  # no anchor yet: nothing was answered
+        turn(s, PRICE_ONLY, 60)
+        s.note_price_answered()
+        self.assertIsNone(s.price_answered_turn)  # the same turn as the anchor does not count
+        s.observe_candidate_turn(NEUTRAL, 100)
+        s.note_price_answered()
+        first = s.price_answered_turn
+        s.observe_candidate_turn(NEUTRAL, 140)
+        s.note_price_answered()
+        self.assertEqual(s.price_answered_turn, first)
+
+    def test_a_stall_reason_counts_as_an_objection_for_spacing(self):
+        s = make()
+        turn(s, OPENER, 20)
+        s.observe_candidate_turn(PITCH, 60)
+        s.note_objection()  # a stall reason landed on this turn
+        s.observe_candidate_turn(PITCH, 100)
+        self.assertIsNone(s.select(100))  # breathing room: F3 waits one more turn
+        s.observe_candidate_turn(PITCH, 140)
+        self.assertEqual(s.select(140).id, F3_PRIMARY)
+
 
 class CuriosityCoverageTests(unittest.TestCase):
     def test_the_advisor_answering_a_topic_covers_it(self):

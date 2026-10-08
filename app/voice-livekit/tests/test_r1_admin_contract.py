@@ -345,6 +345,23 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
         intents = rig.engine.admin_log()["intents"]
         self.assertGreaterEqual(sum(intents["handed_to_model"].values()), 8)
 
+    async def test_the_negotiation_memory_is_logged_but_never_posted(self):
+        """R1-Q: offers, callbacks, reasons and the slot stay in the worker's own log."""
+        rig, rows = await self.session_rows()
+        negotiation = rig.engine.admin_log()["negotiation"]
+        self.assertIn("reasons_voiced", negotiation)
+        self.assertIn("weak_line_said", negotiation)
+        blob = json.dumps(rows)
+        for private in (
+            "negotiation", "reasons_voiced", "reasons_handled", "weak_line_said", "stall_rounds",
+            "price_situation", "best_offer_usd", "email_answered", "slot_moved", "N-TIMING",
+            "N-MONEY", "N-EMAIL", "counter:",
+        ):
+            self.assertNotIn(private, blob, private)
+        # The only commitment trace is the logged level; no event row carries a level.
+        for row in rows:
+            self.assertNotIn("level", row["payload"])
+
     async def test_the_guard_trip_of_the_session_is_a_known_kind(self):
         _, rows = await self.session_rows()
         hits = [row for row in rows if row["event_type"] == "guard_hit"]

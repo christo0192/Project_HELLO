@@ -116,6 +116,35 @@ describe('masking', () => {
     );
   });
 
+  it('masks the MEDIUM line with any call slot, including the moved-to-the-evening variant', () => {
+    for (const line of [
+      "Let's book a call tomorrow at 7 PM with my husband so we can decide.",
+      "Let's book a call on Saturday at 11 AM with my father so we can decide.",
+      "Let's book a call tonight with my partner so we can decide.",
+      "Let's book a call this weekend with my husband so we can decide.",
+      "Let's book a call on Wednesday at 6:30 PM with my husband so we can decide.",
+      "Daytime is tough for me, so let's book a call tomorrow at 7 PM with my husband so we can decide.",
+    ]) {
+      expect(maskCommitmentLines(line)).toBe(R1_COMMITMENT_MASK);
+      expect(maskCommitmentLines(`Hmm, okay. ${line}`)).toBe(`Hmm, okay. ${R1_COMMITMENT_MASK}`);
+    }
+  });
+
+  it('does not mask ordinary talk about calls, and masks only the one sentence', () => {
+    for (const text of [
+      'Can we book a call to talk about the price?',
+      'I can book a call with you later. Does that work?',
+      'So we can decide together, let us look at the curriculum.',
+      'Let me think about the call.',
+    ]) {
+      expect(maskCommitmentLines(text)).toBe(text);
+    }
+    // The pattern never reaches across a sentence boundary into the next sentence.
+    expect(
+      maskCommitmentLines("I can book a call. Then, so we can decide, let's look at the price."),
+    ).toBe("I can book a call. Then, so we can decide, let's look at the price.");
+  });
+
   it('masks commitment lines only in learner role-play turns', () => {
     const masked = maskR1Turns([
       turn(1, 'bot', 'roleplay', 'Send me the enrolment link for that plan.'),

@@ -252,11 +252,15 @@ class LearnerCommitmentTests(unittest.TestCase):
                 self.assertTrue(guard_text(text, ctx()).clean, text)
 
     def test_commitment_lines_are_only_ever_spoken_by_the_worker(self):
-        from r1_commitment import COMMITMENT_LINES
+        from r1_commitment import commitment_line
 
         for level in (Level.STRONG, Level.MEDIUM):
-            line = COMMITMENT_LINES[level].format(decision_maker="husband")
+            line = commitment_line(level, "husband")
             self.assertIn("commitment", categories(line, ctx()))
+        # The MEDIUM line with a slot, and the moved-to-the-evening variant, are the same.
+        for slot, moved in (("tomorrow at 7 PM", False), ("tomorrow at 7 PM", True)):
+            line = commitment_line(Level.MEDIUM, "husband", slot, moved=moved)
+            self.assertIn("commitment", categories(line, ctx()), line)
 
 
 class LearnerFactTests(unittest.TestCase):
