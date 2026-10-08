@@ -59,8 +59,14 @@
 .r1-phase__label { margin: 0; color: var(--c-ink); font-size: 16px; font-weight: 700; }
 .r1-phase__detail { margin: 2px 0 0; color: var(--c-ink-secondary); font-size: 13px; line-height: 1.45; }
 .r1-phase[data-phase="roleplay"] { border-color: var(--c-accent); background: var(--c-accent-light); }
+/* Never a Tab stop: the live view parks the keyboard here when the control that held it goes away. */
+.r1-phase:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 3px; }
 .r1-banner { width: min(100%, 520px); padding: 10px 14px; border: 1px solid var(--c-caution); border-radius: 14px; background: var(--c-caution-light); color: var(--c-caution); font-size: 13px; font-weight: 650; line-height: 1.45; text-align: center; }
-.r1-live__selfview { width: min(46%, 200px); margin: 0 auto; }
+/* The interviewer aura and the candidate's own camera sit side by side where the stage is wide
+   enough, so the self-view costs no height; they stack (the aura first) where it is not. Neither
+   shrinks: the camera keeps its 16:9 box and the stage scrolls before it would be crushed. */
+.r1-live__media { display: flex; flex: none; flex-wrap: wrap; align-items: center; justify-content: center; gap: 14px; max-width: 100%; }
+.r1-live__selfview { flex: none; width: 200px; max-width: 100%; margin: 0; }
 .r1-live__selfview.r1-selfview { max-width: 200px; margin-top: 0; border-radius: 14px; }
 /* The role-play scenario card: compact, so the captions card keeps most of the column. */
 .r1-scenario { padding: 14px 20px; }
@@ -75,6 +81,12 @@
 .r1-scenario__goal { color: var(--c-ink); font-weight: 650; }
 .r1-scenario__note { margin-top: 6px; }
 .r1-live__side .r1-scenario { flex: 0 0 auto; }
+/* After the briefing the card shrinks to a facts strip (name and the three facts): the role-play
+   is where the captions are read, and a full card would take a third of a laptop's column. */
+.r1-scenario--compact { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0 10px; padding: 10px 16px; }
+.r1-scenario--compact h2 { margin: 0; color: var(--c-ink-secondary); font-size: 13px; letter-spacing: 0; }
+.r1-scenario--compact .r1-scenario__who { margin: 0; }
+.r1-scenario--compact .r1-scenario__facts { flex: 1 0 100%; margin: 6px 0 0; padding: 5px 10px; }
 
 /* The role-play clock (outside the phase label's live region) and the "I'm ready" button. */
 .r1-timer { margin: 0; padding: 4px 14px; border-radius: 999px; background: var(--c-accent-light); color: var(--c-ink); font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
@@ -90,15 +102,17 @@
 .r1-shell { overflow: clip; }
 
 /* Captions: the card is bounded by the live view, and the list inside it is the only scroller. */
-.r1-live .candidate-interview__captions { flex: 1 1 0; min-height: 180px; padding: 20px 22px; overflow: hidden; }
+.r1-live .candidate-interview__captions { flex: 1 1 0; min-height: 140px; padding: 20px 22px; overflow: hidden; }
 .r1-captions__body { position: relative; display: flex; flex: 1 1 auto; min-height: 0; margin-top: 14px; }
 .r1-captions__list { flex: 1 1 auto; min-height: 0; margin-top: 0; padding-right: 8px; overflow-y: auto; overscroll-behavior: contain; }
 .r1-captions__list:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 2px; border-radius: 10px; }
 .r1-captions__jump { position: absolute; right: 14px; bottom: 10px; min-height: 40px; padding: 0 16px; border: 0; border-radius: 999px; background: var(--c-accent); color: var(--c-data-label-inside); font: inherit; font-size: 13px; font-weight: 700; box-shadow: 0 6px 16px rgb(78 107 166 / .28); cursor: pointer; }
 .r1-captions__jump:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 3px; }
 
-/* Desktop: the live view fits the window (the shell is a 100dvh column, see R1Shell `fill`). */
-@media (min-width: 769px) and (min-height: 600px) {
+/* Desktop: the live view fits the window (the shell is a 100dvh column, see R1Shell `fill`).
+   A real browser window is the screen minus the taskbar and the browser's own bars, so a 1080p
+   laptop at 150% scaling gives about 1280x580: the layout is built for that, not for the screen. */
+@media (min-width: 769px) and (min-height: 480px) {
   .candidate-shell--fill { display: flex; flex-direction: column; height: 100vh; height: 100dvh; min-height: 0; padding-bottom: 20px; overflow: hidden; }
   .candidate-shell--fill .candidate-shell__inner { display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; }
   .candidate-shell--fill .r1-live { flex: 1 1 auto; min-height: 0; margin-top: 16px; grid-template-rows: minmax(0, 1fr); align-items: stretch; }
@@ -107,16 +121,44 @@
   .candidate-shell--fill .r1-live__stage { min-height: 0; height: 100%; padding: 22px 28px; justify-content: flex-start; overflow-y: auto; }
   .candidate-shell--fill .r1-live__stage > :first-child { margin-top: auto; }
   .candidate-shell--fill .r1-live__stage > :last-child { margin-bottom: auto; }
+  .candidate-shell--fill .r1-live__stage .candidate-interview__controls { margin-top: 6px; }
+  .candidate-shell--fill .r1-live__stage .r1-link-button { margin-top: 0; }
   /* The aura is sized from the window height, not its width, so it gives way to the controls. */
   .candidate-shell--fill .r1-live .candidate-aura { flex: none; width: clamp(168px, calc(100dvh - 600px), 420px); }
   .candidate-shell--fill .r1-live .candidate-aura__logo-plate { width: min(126px, 46%); height: auto; aspect-ratio: 1; border-radius: 28%; }
   .candidate-shell--fill .r1-live .candidate-aura__logo-plate img { width: 70%; height: 70%; }
-  /* The side column is not a scroller: its cards have shadows that a clip would cut off. At 600px of
-     height the lead card plus the captions minimum still fit. */
+  /* The side column is not a scroller: its cards have shadows that a clip would cut off. */
 }
 
-/* Phones and short landscape windows: the page scrolls naturally; the captions card is bounded. */
-@media (max-width: 768px), (max-height: 599px) {
+/* Short desktop windows (a 1366x768 laptop's browser is about 650px high): everything that is not
+   the interview itself gives up room, so the controls, a camera-off banner and a failed "I'm ready"
+   all stay inside the stage card and the captions keep a usable height. */
+@media (min-width: 769px) and (min-height: 480px) and (max-height: 740px) {
+  .candidate-shell--fill { padding-top: 14px; padding-bottom: 14px; }
+  .candidate-shell--fill .candidate-brand img { width: 32px; height: 32px; padding: 3px; border-radius: 10px; }
+  .candidate-shell--fill .r1-live { margin-top: 10px; }
+  .candidate-shell--fill .r1-live__stage { gap: 8px; padding: 12px 24px; }
+  .candidate-shell--fill .r1-live__stage .candidate-eyebrow { display: none; }
+  .candidate-shell--fill .r1-live__title { margin-top: auto; }
+  .candidate-shell--fill .r1-live .candidate-aura { width: clamp(132px, calc(100dvh - 540px), 168px); }
+  .candidate-shell--fill .r1-phase { padding: 8px 14px; }
+  .candidate-shell--fill .r1-live__side { gap: 12px; }
+  .candidate-shell--fill .r1-scenario { padding: 10px 16px; }
+  .candidate-shell--fill .r1-scenario--compact { padding: 8px 14px; }
+  .candidate-shell--fill .r1-scenario__note { display: none; }
+  .candidate-shell--fill .r1-live .candidate-interview__captions { padding: 14px 18px; }
+}
+
+/* A 1080p laptop at 150% scaling gives about 580px: the briefing card and the captions card give up
+   their last few pixels so the list still shows a few lines beside the full briefing card. */
+@media (min-width: 769px) and (min-height: 480px) and (max-height: 600px) {
+  .candidate-shell--fill .r1-scenario { padding: 8px 14px; }
+  .candidate-shell--fill .r1-scenario__facts { margin: 6px 0; }
+  .candidate-shell--fill .r1-captions__body { margin-top: 8px; }
+}
+
+/* Phones and very short landscape windows: the page scrolls naturally; the captions card is bounded. */
+@media (max-width: 768px), (max-height: 479px) {
   .r1-live { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .r1-live__stage { min-height: 0; padding: 18px 12px; }
   .r1-live .candidate-aura { width: min(56vw, 220px); }

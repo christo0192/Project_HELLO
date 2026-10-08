@@ -91,6 +91,7 @@ const FULL_RESPONSES: Record<R1RouteName, unknown> = {
     nonce: NONCE,
     attempt_id: 'session',
     rejoin: false,
+    attempt_token_expires_at: '2026-10-07T00:05:00.000Z',
   },
   exchange: {
     status: 'ready',

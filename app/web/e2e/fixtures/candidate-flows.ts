@@ -105,6 +105,30 @@ export const LIVE_DESKTOP_SIZES = [
   { width: 1920, height: 1080 },
 ] as const;
 
+/**
+ * The windows a candidate really has. A browser window is the screen minus the taskbar and the
+ * browser's own bars, so these are NOT screen sizes: a 1080p laptop at Windows' default 150%
+ * scaling gives about 1280x584, a 1366x768 laptop about 1366x632, a 1080p screen at 125% about
+ * 1536x728. The live view must hold every state in them without cutting anything off.
+ */
+export const REALISTIC_WINDOWS = [
+  { width: 1280, height: 584 },
+  { width: 1366, height: 632 },
+  { width: 1536, height: 728 },
+] as const;
+
+/**
+ * Every window the "every state fits" check runs in: the realistic ones, plus the screen sizes the
+ * first cut was proven at (where the camera was already being crushed, 1280x720 and 1366x768) and
+ * the shortest window of the old two-column rule (1100x600).
+ */
+export const FIT_WINDOWS = [
+  ...REALISTIC_WINDOWS,
+  { width: 1280, height: 720 },
+  { width: 1366, height: 768 },
+  { width: 1100, height: 600 },
+] as const;
+
 /** The learner the interviewer publishes in the e2e role-play. */
 export const LEARNER_NAME = 'Meera Iyer';
 
@@ -130,6 +154,17 @@ export async function reachLiveWithConversation(r1: R1Harness, count = 40): Prom
   await expect(r1.page.locator('.candidate-caption', { hasText: `Line ${count}.` })).toBeAttached();
   await expect(r1.page.getByRole('region', { name: 'Your role-play' })).toBeVisible();
   await expect(r1.page.getByRole('timer')).toHaveText('Role-play · 10 min left');
+}
+
+/**
+ * From a role-play in progress back to the briefing, as the worker would write it: the clock is
+ * cleared and the interviewer waits for "ready". The button and the full scenario card are on screen.
+ */
+export async function backToBriefing(r1: R1Harness): Promise<void> {
+  await r1.mock.setAgentAttributes({ phase: 'transition', rpleft: '', awaiting: 'ready' });
+  await expect(r1.page.getByRole('button', { name: "I'm ready" })).toBeVisible();
+  await expect(r1.page.getByRole('timer')).toHaveCount(0);
+  await expect(r1.page.getByText('Your goal:')).toBeVisible();
 }
 
 /**

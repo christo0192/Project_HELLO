@@ -23,6 +23,7 @@ import { auditA11y } from './fixtures/axe';
 import { expect, test } from './fixtures/candidate-harness';
 import {
   agree,
+  backToBriefing,
   bodiesOf,
   expectCandidateHygiene,
   expectMobileFits,
@@ -31,13 +32,14 @@ import {
   LIVE_DESKTOP_SIZES,
   openLink,
   passDeviceCheck,
+  FIT_WINDOWS,
   reachBriefing,
   reachLive,
   reachLiveWithConversation,
   storedNonce,
   storedNonceRaw,
 } from './fixtures/candidate-flows';
-import { liveLayout } from './fixtures/layout';
+import { insideStage, liveLayout } from './fixtures/layout';
 import {
   R1_ATTEMPT_TOKEN,
   R1_FRESH_ATTEMPT_TOKEN,
@@ -603,29 +605,33 @@ test.describe('live layout with a long interview', () => {
       // The controls never sit below the fold.
       expect(layout.controlsBottom).not.toBeNull();
       expect(layout.controlsBottom!).toBeLessThanOrEqual(size.height);
+      // The candidate's own camera keeps its 16:9 box (it was crushed to a sliver, or to nothing,
+      // when it was a shrinkable flex item in the stage column).
+      expect(layout.selfview!.height, 'the camera keeps its box').toBeGreaterThanOrEqual(100);
 
       await auditA11y(page, testInfo, `r1-live-long-${size.width}x${size.height}`, { strict: true });
       r1.expectHealthy();
     });
   }
 
-  test('still fits the shortest window it fills (600 px high), with the stage scrolling inside its card', async ({ r1 }, testInfo) => {
+  test('still fits the shortest window it fills (480 px high)', async ({ r1 }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop', 'desktop sizes run on the desktop project');
     const { page } = r1;
-    await page.setViewportSize({ width: 1100, height: 600 });
+    await page.setViewportSize({ width: 1100, height: 480 });
     await reachLiveWithConversation(r1);
 
     const layout = await liveLayout(page);
-    expect(layout.pageScrollHeight, 'the page must not scroll').toBeLessThanOrEqual(601);
-    expect(layout.captionsCard?.bottom).toBeLessThanOrEqual(600);
-    expect(layout.stage?.bottom).toBeLessThanOrEqual(600);
-    expect(layout.list!.clientHeight, 'the scenario card leaves the list a usable height').toBeGreaterThanOrEqual(110);
+    expect(layout.pageScrollHeight, 'the page must not scroll').toBeLessThanOrEqual(481);
+    expect(layout.captionsCard?.bottom).toBeLessThanOrEqual(480);
+    expect(layout.stage?.bottom).toBeLessThanOrEqual(480);
+    expect(layout.list!.clientHeight, 'the facts strip leaves the list a usable height').toBeGreaterThanOrEqual(110);
+    expect(layout.selfview!.height, 'the camera is never crushed').toBeGreaterThanOrEqual(100);
     // The list is only about one caption tall here, so 'the newest line fits whole' is too strict:
     // what matters is that it is parked on the end.
     expect(layout.list!.scrollTop + layout.list!.clientHeight).toBeGreaterThanOrEqual(layout.list!.scrollHeight - 2);
     // The stage may be taller than the window gives it: then it scrolls in its own card (and the
     // axe rule for a scrollable region needs something focusable inside, which its controls are).
-    await auditA11y(page, testInfo, 'r1-live-long-1100x600', { strict: true });
+    await auditA11y(page, testInfo, 'r1-live-long-1100x480', { strict: true });
     r1.expectHealthy();
   });
 
@@ -743,6 +749,116 @@ test.describe('live layout with a long interview', () => {
 });
 
 /**
+ * The live view in the window a candidate really has. The layout was first proven only at the
+ * screen sizes (1366x768, 1440x900, 1920x1080), but a browser window is the screen minus the
+ * taskbar and the browser's own bars: 1280x584, 1366x632 and 1536x728 are the common ones, and
+ * there the first cut sent the 1280x584 window to the phone layout (captions two screens down) and
+ * crushed the camera to nothing at 1280x720. Every state is measured, because the states that add
+ * a line (the camera-off banner, a failed "I'm ready", a question to confirm) are the ones that
+ * push the controls out of the card.
+ */
+test.describe('live layout in the window a candidate really has', () => {
+  for (const size of FIT_WINDOWS) {
+    test(`${size.width}x${size.height}: every state fits, the controls stay in reach and the camera keeps its box`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop windows run on the desktop project');
+      test.setTimeout(120_000);
+      const { page } = r1;
+      await page.setViewportSize(size);
+      await reachLiveWithConversation(r1);
+
+      const expectFits = async (state: string, minList: number) => {
+        const layout = await liveLayout(page);
+        const where = `${size.width}x${size.height}, ${state}`;
+        expect(layout.pageScrollHeight, `${where}: the page must not scroll`).toBeLessThanOrEqual(size.height + 1);
+        expect(layout.stage, `${where}: the stage`).not.toBeNull();
+        expect(layout.stage!.scrollHeight, `${where}: the stage must not scroll inside its card`).toBeLessThanOrEqual(layout.stage!.clientHeight + 1);
+        expect(layout.controlsBottom, `${where}: the controls are in the stage's visible part`).not.toBeNull();
+        expect(layout.controlsBottom!, `${where}: the controls are in the stage's visible part`).toBeLessThanOrEqual(layout.stage!.bottom);
+        expect(layout.captionsCard!.bottom, `${where}: the captions card ends in the window`).toBeLessThanOrEqual(size.height);
+        expect(layout.selfview!.height, `${where}: the camera keeps its 16:9 box`).toBeGreaterThanOrEqual(100);
+        expect(layout.list!.clientHeight, `${where}: the captions list shows several lines`).toBeGreaterThanOrEqual(minList);
+        expect(layout.newestLineInView, `${where}: the list follows the newest line`).toBe(true);
+        return layout;
+      };
+
+      // The role-play proper: the scenario card is a facts strip, the captions get the column.
+      const roleplay = await expectFits('role-play', 250);
+      expect(roleplay.scenarioCard!.height, 'the strip is not the full card').toBeLessThan(150);
+
+      await page.getByRole('button', { name: 'Turn camera off' }).click();
+      await expect(page.getByText(/Your camera is off/)).toBeVisible();
+      await expectFits('role-play, camera off', 250);
+      await page.getByRole('button', { name: 'Turn camera on' }).click();
+      await expect(page.getByText(/Your camera is off/)).toHaveCount(0);
+
+      // The briefing: the full card, the ready button, and no clock.
+      await backToBriefing(r1);
+      await expectFits('briefing', 200);
+      expect((await insideStage(page, '.r1-ready__button')).inside, 'the ready button is in view').toBe(true);
+
+      // A press that failed adds a line, and the camera-off banner another.
+      r1.state.failures.ready = { status: 503, error: 'service_unavailable' };
+      await page.getByRole('button', { name: "I'm ready" }).click();
+      await expect(page.getByRole('alert')).toContainText("We couldn't send that");
+      r1.consoleErrors.length = 0; // a 503 is logged by the browser's network layer
+      await expectFits('briefing, press failed', 200);
+      expect((await insideStage(page, '.r1-ready__error')).inside, 'the failure is in view').toBe(true);
+
+      await page.getByRole('button', { name: 'Turn camera off' }).click();
+      await expect(page.getByText(/Your camera is off/)).toBeVisible();
+      await expectFits('briefing, press failed, camera off', 200);
+      expect((await insideStage(page, '.r1-banner')).inside, 'the banner is in view').toBe(true);
+
+      await auditA11y(page, testInfo, `r1-live-realistic-${size.width}x${size.height}`, { strict: true });
+      r1.expectHealthy();
+    });
+  }
+
+  test('a window that gives the live view 584 px stays two columns, with the captions beside the stage', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'desktop windows run on the desktop project');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1280, height: 584 });
+    await reachLiveWithConversation(r1);
+    const layout = await liveLayout(page);
+    // The first cut fell back to the phone layout under 600 px: the page was 1355 px tall, the
+    // captions began at y=1056, and the right half of the screen was empty.
+    expect(layout.pageScrollHeight).toBeLessThanOrEqual(585);
+    expect(layout.captionsCard!.top, 'the captions card is in the first screen').toBeLessThan(300);
+    const stageRight = await page.evaluate(() => document.querySelector('.r1-live__stage')!.getBoundingClientRect().right);
+    const captionsLeft = await page.evaluate(() => document.querySelector('.candidate-interview__captions')!.getBoundingClientRect().left);
+    expect(captionsLeft, 'the captions are beside the stage').toBeGreaterThanOrEqual(stageRight);
+    r1.expectHealthy();
+  });
+
+  test('a question opened inside the stage is brought into view, with the keyboard on the safe choice', async ({ r1 }) => {
+    test.skip(test.info().project.name !== 'desktop', 'desktop windows run on the desktop project');
+    // The tightest window: the withdrawal question is 20 to 30 px more than the stage has room
+    // for, so the stage scrolls, and an unscrolled question would sit cut off below the card's edge
+    // (at 1366x768 it was 711 to 755 in a stage that ends at 748).
+    const { page } = r1;
+    await page.setViewportSize({ width: 1280, height: 584 });
+    await reachLiveWithConversation(r1);
+
+    await page.getByRole('button', { name: 'Withdraw my consent' }).click();
+    const withdraw = page.getByRole('group', { name: 'Withdraw consent' });
+    await expect(withdraw).toBeVisible();
+    expect((await insideStage(page, '[role="group"][aria-label="Withdraw consent"]')).inside, 'the question is wholly in view').toBe(true);
+    await expect(page.getByRole('button', { name: 'Keep my consent' })).toBeFocused();
+    await page.getByRole('button', { name: 'Keep my consent' }).press('Enter');
+    await expect(withdraw).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Withdraw my consent' })).toBeFocused();
+
+    await page.getByRole('button', { name: 'Leave interview' }).click();
+    await expect(page.getByRole('group', { name: 'Leave the interview' })).toBeVisible();
+    expect((await insideStage(page, '[role="group"][aria-label="Leave the interview"]')).inside, 'the question is wholly in view').toBe(true);
+    await expect(page.getByRole('button', { name: 'Stay in the interview' })).toBeFocused();
+    await page.getByRole('button', { name: 'Stay in the interview' }).press('Enter');
+    await expect(page.getByRole('button', { name: 'Leave interview' })).toBeFocused();
+    r1.expectHealthy();
+  });
+});
+
+/**
  * The role-play briefing and the role-play itself: the scenario card (learner name from the
  * interviewer, static course facts), the role-play clock, and the "I'm ready" button. The browser
  * cannot publish to the room (its token has canPublishData: false), so the button goes through
@@ -772,22 +888,18 @@ test.describe('scenario card, role-play clock and "I\'m ready"', () => {
     r1.expectHealthy();
   });
 
-  test('"I\'m ready" asks the server with a fresh attempt token, confirms, and goes when the role-play starts', async ({ r1 }, testInfo) => {
+  test('"I\'m ready" presents the token the join gave it while that is good, confirms, and goes when the role-play starts', async ({ r1 }, testInfo) => {
     await reachBriefing(r1);
     const { page } = r1;
     await page.getByRole('button', { name: "I'm ready" }).click();
     await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
 
-    // The join's own attempt token is five minutes old by now in real life: a current one is
-    // minted for the same attempt (link + nonce, the rejoin call) and that is what is relayed.
-    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
-      { token: R1_LINK_TOKEN },
-      { token: R1_LINK_TOKEN, nonce: R1_NONCE },
-    ]);
+    // The join's token says when it ends (`attempt_token_expires_at`) and has time left: nothing is
+    // minted, so a press costs the server one request and none of the link's start rate limit.
+    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([{ token: R1_LINK_TOKEN }]);
     expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
-      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
+      { attempt_token: R1_ATTEMPT_TOKEN, nonce: R1_NONCE },
     ]);
-    expect(JSON.stringify(bodiesOf(r1, '/api/r1/ready'))).not.toContain(R1_ATTEMPT_TOKEN);
 
     // Sent once: the button stays but does nothing more; the briefing carries on.
     const button = page.getByRole('button', { name: "I'm ready" });
@@ -806,24 +918,111 @@ test.describe('scenario card, role-play clock and "I\'m ready"', () => {
     r1.expectHealthy();
   });
 
-  test('when "I\'m ready" cannot be sent the candidate is told to say it, and can press again', async ({ r1 }, testInfo) => {
+  test('"I\'m ready" mints a current token, once, when the join\'s has lapsed by the time of the briefing', async ({ r1 }) => {
+    // In real life the briefing comes minutes after the join and the token lasts five: here the
+    // join's is already spent when it is minted.
+    r1.state.attemptTokenTtlSec = 0;
     await reachBriefing(r1);
     const { page } = r1;
-    r1.state.failures.ready = { status: 429, error: 'rate_limited' };
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+
+    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
+      { token: R1_LINK_TOKEN },
+      { token: R1_LINK_TOKEN, nonce: R1_NONCE },
+    ]);
+    expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
+      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
+    ]);
+    expect(JSON.stringify(bodiesOf(r1, '/api/r1/ready'))).not.toContain(R1_ATTEMPT_TOKEN);
+    expectCandidateHygiene(r1);
+    r1.expectHealthy();
+  });
+
+  test('when "I\'m ready" cannot be sent the candidate is told to say it, waits a moment, and can press again', async ({ r1 }, testInfo) => {
+    r1.state.attemptTokenTtlSec = 0;
+    await reachBriefing(r1);
+    const { page } = r1;
+    r1.state.failures.ready = { status: 503, error: 'service_unavailable' };
     await page.getByRole('button', { name: "I'm ready" }).click();
     await expect(page.getByRole('alert')).toContainText("We couldn't send that. Just say “I'm ready”.");
     await expect(page.getByText('Sent — starting the role-play')).toHaveCount(0);
-    await expect(page.getByRole('button', { name: "I'm ready" })).not.toHaveAttribute('aria-disabled', 'true');
+    // A refused button is not hammered: it is locked for a few seconds (a rate limit: longer).
+    const button = page.getByRole('button', { name: "I'm ready" });
+    await expect(button).toHaveAttribute('aria-disabled', 'true');
+    await button.click({ force: true });
+    expect(bodiesOf(r1, '/api/r1/ready')).toHaveLength(1);
     await expectMobileFits(page, testInfo);
     await auditA11y(page, testInfo, 'r1-live-briefing-failed', { strict: true });
 
-    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(button).not.toHaveAttribute('aria-disabled', 'true', { timeout: 10_000 });
+    await button.click();
     await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
     await expect(page.getByRole('alert')).toHaveCount(0);
     expect(bodiesOf(r1, '/api/r1/ready')).toHaveLength(2);
+    // The press that failed had minted the current token; the press that worked presented it
+    // again instead of minting another: one mint in all, not one per press.
+    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
+      { token: R1_LINK_TOKEN },
+      { token: R1_LINK_TOKEN, nonce: R1_NONCE },
+    ]);
+    expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
+      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
+      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
+    ]);
     // The interview carried on throughout, and the spoken "ready" was never blocked.
     await expect(page.getByRole('region', { name: 'Live video interview' })).toBeVisible();
-    r1.consoleErrors.length = 0; // a 429 is logged by the browser's network layer
+    r1.consoleErrors.length = 0; // a 503 is logged by the browser's network layer
+    r1.expectHealthy();
+  });
+
+  test('a token the server has stopped accepting gets one new token and one more try', async ({ r1 }) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    // The browser's clock thought the join's token good for minutes yet; the server disagrees.
+    delete r1.state.tokenExpiresAt[R1_ATTEMPT_TOKEN];
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
+      { token: R1_LINK_TOKEN },
+      { token: R1_LINK_TOKEN, nonce: R1_NONCE },
+    ]);
+    expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
+      { attempt_token: R1_ATTEMPT_TOKEN, nonce: R1_NONCE },
+      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
+    ]);
+    r1.consoleErrors.length = 0; // the first refusal is a 404 the browser logs
+    r1.expectHealthy();
+  });
+
+  test('keyboard focus is not dropped to the page when the ready button goes away', async ({ r1 }) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    const ready = page.getByRole('button', { name: "I'm ready" });
+    await ready.focus();
+    await page.keyboard.press('Enter');
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+    await expect(ready).toBeFocused();
+
+    // The interviewer picks up: the button unmounts under the keyboard. The focus must land on the
+    // panel that announces the role-play, never on <body> (WCAG 2.4.3).
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', awaiting: '', rpleft: '840' });
+    await expect(ready).toHaveCount(0);
+    await expect(page.locator('.r1-phase')).toBeFocused();
+    expect(await page.evaluate(() => document.activeElement?.tagName)).not.toBe('BODY');
+    // Tab carries on from there: the next stop is a control of the page, not the top of it.
+    await page.keyboard.press('Tab');
+    expect(await page.evaluate(() => document.activeElement?.closest('.r1-live') !== null)).toBe(true);
+    r1.expectHealthy();
+  });
+
+  test('the ready button going away leaves a focus that was elsewhere alone', async ({ r1 }) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    await page.getByRole('button', { name: 'Mute microphone' }).focus();
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', awaiting: '', rpleft: '840' });
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Mute microphone' })).toBeFocused();
     r1.expectHealthy();
   });
 

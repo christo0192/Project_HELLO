@@ -171,7 +171,9 @@ describe('R1 live view fits the window and bounds its captions', () => {
   const css = read('src/styles/candidate-r1.css');
 
   it('locks the desktop shell to the viewport height, with a modifier the page opts into', () => {
-    expect(css).toMatch(/@media \(min-width: 769px\) and \(min-height: 600px\)/);
+    // 480, not 600: a real window is the screen minus the taskbar and the browser's bars, so a
+    // 1080p laptop at 150% is about 1280x580 and must stay two columns.
+    expect(css).toMatch(/@media \(min-width: 769px\) and \(min-height: 480px\) \{/);
     expect(css).toMatch(/\.candidate-shell--fill \{[^}]*height: 100dvh;[^}]*overflow: hidden/);
     expect(css).toMatch(/\.candidate-shell--fill \.r1-live \{[^}]*grid-template-rows: minmax\(0, 1fr\)/);
     expect(read('src/pages/R1JoinPage.tsx')).toMatch(/<R1Shell fill=\{stage\.name === 'live'\}>/);
@@ -182,7 +184,7 @@ describe('R1 live view fits the window and bounds its captions', () => {
   });
 
   it('makes the captions list, and only the list, the scroller of the right column', () => {
-    expect(css).toMatch(/\.r1-live \.candidate-interview__captions \{[^}]*flex: 1 1 0;[^}]*min-height: 180px/);
+    expect(css).toMatch(/\.r1-live \.candidate-interview__captions \{[^}]*flex: 1 1 0;[^}]*min-height: 140px/);
     expect(css).toMatch(/\.r1-captions__body \{[^}]*min-height: 0/);
     expect(css).toMatch(/\.r1-captions__list \{[^}]*min-height: 0;[^}]*overflow-y: auto/);
   });
@@ -192,8 +194,25 @@ describe('R1 live view fits the window and bounds its captions', () => {
   });
 
   it('lets a phone scroll the page and bounds the captions card instead', () => {
-    expect(css).toMatch(/@media \(max-width: 768px\), \(max-height: 599px\)/);
+    expect(css).toMatch(/@media \(max-width: 768px\), \(max-height: 479px\)/);
     expect(css).toMatch(/\.r1-live \.candidate-interview__captions \{[^}]*height: clamp\(240px, 45dvh, 440px\)/);
+  });
+
+  it('never crushes the candidate\'s camera: the self-view keeps its box and sits beside the aura', () => {
+    // A flex item that may shrink is squeezed before the stage's scroll valve is used (it was 0 to
+    // 38 px high on a 1280x720 window). It does not shrink, and it costs no height beside the aura.
+    expect(css).toMatch(/\.r1-live__selfview \{[^}]*flex: none;[^}]*width: 200px/);
+    expect(css).toMatch(/\.r1-live__media \{[^}]*display: flex;[^}]*flex-wrap: wrap/);
+    expect(read('src/components/candidate-r1/R1LiveView.tsx')).toMatch(
+      /<div className="r1-live__media">\s*<InterviewerAura[\s\S]*?\/>\s*<div className="r1-selfview r1-live__selfview">/,
+    );
+  });
+
+  it('has a short-window variant that gives the chrome up before the interview', () => {
+    expect(css).toMatch(
+      /@media \(min-width: 769px\) and \(min-height: 480px\) and \(max-height: 740px\) \{[^@]*\.r1-live__stage \{[^}]*gap: 8px/,
+    );
+    expect(css).toMatch(/\.r1-scenario--compact \{/);
   });
 
   it('clips the decorative blobs of the R1 shell, which would add blank scroll', () => {

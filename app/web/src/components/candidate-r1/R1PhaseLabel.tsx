@@ -1,3 +1,4 @@
+import type { Ref } from 'react';
 import {
   R1_NO_PHASE_LABELS,
   R1_PHASE_LABELS,
@@ -18,6 +19,12 @@ interface R1PhaseLabelProps {
    * button is showing: the transition line then says so, which a screen reader announces.
    */
   readyHint?: boolean;
+  /**
+   * The panel can be focused by script (never by Tab): when a control that held the keyboard
+   * goes away because the phase moved on, the live view parks the focus here, on the very
+   * panel that announces the change.
+   */
+  regionRef?: Ref<HTMLDivElement>;
 }
 
 /**
@@ -28,12 +35,19 @@ interface R1PhaseLabelProps {
  * candidate reading "Waiting for your interviewer to join" while the interviewer
  * is talking, so presence alone moves the label to a neutral "in progress".
  */
-export function R1PhaseLabel({ phase, agentPresent, readyHint = false }: R1PhaseLabelProps) {
+export function R1PhaseLabel({
+  phase,
+  agentPresent,
+  readyHint = false,
+  regionRef,
+}: R1PhaseLabelProps) {
   const unannounced = agentPresent ? 'inProgress' : 'waiting';
   const copy = phase ? R1_PHASE_LABELS[phase] : R1_NO_PHASE_LABELS[unannounced];
   const detail = phase === 'transition' && readyHint ? R1_READY_DETAIL : copy.detail;
   return (
     <div
+      ref={regionRef}
+      tabIndex={-1}
       className="r1-phase"
       data-phase={phase ?? (agentPresent ? 'unannounced' : 'none')}
       role="status"

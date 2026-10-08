@@ -40,6 +40,37 @@ export function horizontalOverflow(page: Page): Promise<Overflow> {
   });
 }
 
+export interface Inside {
+  found: boolean;
+  /** The element lies wholly inside the stage card, i.e. a candidate can see all of it. */
+  inside: boolean;
+  top: number;
+  bottom: number;
+  stageTop: number;
+  stageBottom: number;
+}
+
+/**
+ * Whether the first element matching `selector` lies wholly inside the stage card's box. The
+ * stage clips what it overflows (it scrolls), so "inside" is "visible without scrolling".
+ */
+export function insideStage(page: Page, selector: string): Promise<Inside> {
+  return page.evaluate((target) => {
+    const el = document.querySelector<HTMLElement>(target);
+    const stage = document.querySelector<HTMLElement>('.r1-live__stage')?.getBoundingClientRect();
+    if (!el || !stage) return { found: false, inside: false, top: 0, bottom: 0, stageTop: 0, stageBottom: 0 };
+    const rect = el.getBoundingClientRect();
+    return {
+      found: true,
+      inside: rect.top >= stage.top - 0.5 && rect.bottom <= stage.bottom + 0.5,
+      top: Math.round(rect.top),
+      bottom: Math.round(rect.bottom),
+      stageTop: Math.round(stage.top),
+      stageBottom: Math.round(stage.bottom),
+    };
+  }, selector);
+}
+
 export interface Box {
   top: number;
   bottom: number;
@@ -55,6 +86,10 @@ export interface LiveLayout {
   pageScrollHeight: number;
   stage: Box | null;
   captionsCard: Box | null;
+  /** The role-play card (full in the briefing, a strip in the role-play), when it is on screen. */
+  scenarioCard: Box | null;
+  /** The candidate's own camera box. */
+  selfview: Box | null;
   list: (Box & { scrollTop: number }) | null;
   /** The newest caption is inside the visible part of the list. */
   newestLineInView: boolean | null;
@@ -66,9 +101,11 @@ export interface LiveLayout {
 /**
  * Where everything of the R1 live view is, measured in the page: the page itself, the stage card,
  * the captions card and its list. Used to prove the live view fits the window and that the
- * captions list, not the page, is what scrolls.
+ * captions list, not the page, is what scrolls. It waits for the web fonts first: the page is
+ * measured in IBM Plex, whose wider letters wrap lines the fallback font does not.
  */
-export function liveLayout(page: Page): Promise<LiveLayout> {
+export async function liveLayout(page: Page): Promise<LiveLayout> {
+  await page.evaluate(() => document.fonts.ready.then(() => undefined));
   return page.evaluate(() => {
     const q = (selector: string) => document.querySelector<HTMLElement>(selector);
     const box = (el: HTMLElement | null) => {
@@ -100,6 +137,8 @@ export function liveLayout(page: Page): Promise<LiveLayout> {
       pageScrollHeight: document.scrollingElement?.scrollHeight ?? 0,
       stage: box(q('.r1-live__stage')),
       captionsCard: box(q('.candidate-interview__captions')),
+      scenarioCard: box(q('.r1-scenario')),
+      selfview: box(q('.r1-live__selfview')),
       list: listBox && list ? { ...listBox, scrollTop: Math.round(list.scrollTop) } : null,
       newestLineInView,
       controlsBottom: controls.length

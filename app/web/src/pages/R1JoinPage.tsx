@@ -85,6 +85,33 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
+/**
+ * An attempt token is valid for five minutes, and a request made with the last seconds of one
+ * can reach the server after it has lapsed: a token with less than this left is not reused.
+ */
+const ATTEMPT_TOKEN_MARGIN_MS = 60_000;
+/**
+ * How long a token is trusted when the server did not say when it ends. It lasts five minutes in
+ * all, so one obtained moments ago is good for a retry; one from earlier is replaced.
+ */
+const ATTEMPT_TOKEN_UNSTATED_MS = 30_000;
+
+interface HeldAttemptToken {
+  token: string;
+  /** Wall-clock time (ms) until which the token may be presented. */
+  usableUntil: number;
+}
+
+function holdAttemptToken(grant: R1AttemptGrant): HeldAttemptToken {
+  const ends = grant.expires_at === null ? Number.NaN : Date.parse(grant.expires_at);
+  return {
+    token: grant.attempt_token,
+    usableUntil: Number.isFinite(ends)
+      ? ends - ATTEMPT_TOKEN_MARGIN_MS
+      : Date.now() + ATTEMPT_TOKEN_UNSTATED_MS,
+  };
+}
+
 /** The closed cards a person can still take a consent back from. */
 const WITHDRAWABLE_KINDS: readonly R1ClosedKind[] = [
   'paused',
@@ -172,6 +199,8 @@ export function R1JoinPage() {
   const phaseRef = useRef<R1Phase | null>(null);
   /** The nonce of the attempt this tab is in: what "I'm ready" presents to the server. */
   const nonceRef = useRef<string | null>(null);
+  /** The attempt token this tab last held, and until when "I'm ready" may still present it. */
+  const attemptTokenRef = useRef<HeldAttemptToken | null>(null);
   const mountedRef = useRef(false);
   const endedRef = useRef(false);
   /** A withdrawal from the live room is in flight: the room ending is its doing, not news. */
@@ -346,6 +375,7 @@ export function R1JoinPage() {
   function resetLive(): void {
     phaseRef.current = null;
     nonceRef.current = null;
+    attemptTokenRef.current = null;
     setPhase(null);
     setLeadName(null);
     setRoleplayClock(null);
@@ -422,6 +452,7 @@ export function R1JoinPage() {
       }
       saveNonce(token, attempt.nonce);
       nonceRef.current = attempt.nonce;
+      attemptTokenRef.current = holdAttemptToken(attempt);
       let room = await r1Api.exchange(attempt.attempt_token, attempt.nonce);
       for (let tries = 0; room.status === 'preparing'; tries += 1) {
         if (!mountedRef.current) return;
@@ -490,17 +521,37 @@ export function R1JoinPage() {
 
   /**
    * "I'm ready": the candidate's room token cannot publish data, so the server relays it to the
-   * interviewer. The attempt token from joining lasts five minutes and the briefing comes later,
-   * so a current one is minted first with the rejoin-style call (same link, same nonce, same
-   * attempt; it changes nothing on the server). Any failure rejects: the button says so and the
-   * candidate can say "ready" instead.
+   * interviewer, on the strength of the attempt token. That token lasts five minutes and the
+   * briefing comes later, so by then it is usually spent. A new one is minted with the
+   * rejoin-style call (same link, same nonce, same attempt; nothing is written) and KEPT, so a
+   * second press does not mint again.
+   *
+   * That call is not free. It is the rejoin branch of `/api/r1/attempts`, so it is refused once
+   * the round has lapsed or R1 is switched off, and it spends from the link's start rate limit
+   * (shared with the device check, the admission and a real rejoin). Hence: mint only when the
+   * token in hand is spent or nearly, never because the last press failed, and mint again after
+   * a refusal of the token itself (a clock that disagrees with the server's) at most once.
+   *
+   * Any failure rejects: the button says so, waits a few seconds, and the candidate can say
+   * "ready" instead.
    */
   async function sendReady(): Promise<void> {
-    const token = linkRef.current;
+    const link = linkRef.current;
     const nonce = nonceRef.current;
-    if (!token || !nonce) throw new Error('r1_no_attempt');
-    const current = await r1Api.createAttempt(token, nonce);
-    await r1Api.ready(current.attempt_token, nonce);
+    if (!link || !nonce) throw new Error('r1_no_attempt');
+    const held = attemptTokenRef.current;
+    if (held !== null && Date.now() < held.usableUntil) {
+      try {
+        await r1Api.ready(held.token, nonce);
+        return;
+      } catch (error) {
+        // Only the token being refused is worth a second try, with a new one.
+        if (classifyR1Error(error) !== 'link_invalid') throw error;
+      }
+    }
+    const grant = await r1Api.createAttempt(link, nonce);
+    attemptTokenRef.current = holdAttemptToken(grant);
+    await r1Api.ready(grant.attempt_token, nonce);
   }
 
   async function toggleMicrophone(): Promise<void> {

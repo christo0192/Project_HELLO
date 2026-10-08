@@ -126,6 +126,8 @@ const ATTEMPT = {
   attempt_id: null,
   rejoin: false,
   lead: { name: 'Meera', city: 'Pune' },
+  // The server did not say when the token ends: it is trusted only for a moment.
+  expires_at: null,
 };
 const ROOM = {
   status: 'ready',
@@ -802,37 +804,202 @@ describe('the role-play briefing, clock and "I\'m ready"', () => {
     expect(screen.queryByRole('button', READY)).toBeNull();
   });
 
-  it('sends the signal with a freshly minted attempt token and the attempt\'s own nonce', async () => {
-    const live = await toLive();
-    h.createAttempt.mockClear();
-    h.createAttempt.mockResolvedValue({ ...ATTEMPT, attempt_token: 'fresh-token', rejoin: true });
-    act(() => live.handlers.onPhase('transition'));
-    act(() => live.handlers.onAwaitingReady(true));
-    fireEvent.click(screen.getByRole('button', READY));
-    expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
-    // The token from joining lasts five minutes and the briefing is later: a current one is minted
-    // for the same attempt with the stored nonce, and that is what the server is shown.
-    expect(h.createAttempt).toHaveBeenCalledTimes(1);
-    expect(h.createAttempt).toHaveBeenCalledWith(LINK, NONCE);
-    expect(h.ready).toHaveBeenCalledTimes(1);
-    expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
-  });
+  // What the attempt token costs. It lasts five minutes (the server says when, as
+  // `attempt_token_expires_at`) and the briefing comes later; a new one is the rejoin branch of
+  // `/api/r1/attempts`, which the server refuses once the round has lapsed or R1 is off and which
+  // spends from the link's start rate limit. So the page mints only when it has to.
+  describe('the attempt token it presents', () => {
+    const inMs = (ms: number) => new Date(Date.now() + ms).toISOString();
+    const FRESH = { ...ATTEMPT, attempt_token: 'fresh-token', rejoin: true };
 
-  it('says what to do instead when the signal could not be sent, and lets the candidate try again', async () => {
-    const live = await toLive();
-    act(() => live.handlers.onPhase('transition'));
-    act(() => live.handlers.onAwaitingReady(true));
-    h.ready.mockRejectedValueOnce(new ApiError('http_429', 429));
-    fireEvent.click(screen.getByRole('button', READY));
-    expect(await screen.findByRole('alert')).toHaveTextContent(
-      "We couldn't send that. Just say “I'm ready”.",
-    );
-    fireEvent.click(screen.getByRole('button', READY));
-    expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
-    expect(h.ready).toHaveBeenCalledTimes(2);
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** Joined with a token that lasts `ms` more: the join's own, as old as the briefing makes it. */
+    async function toBriefing(ms = 280_000) {
+      h.createAttempt.mockResolvedValueOnce({ ...ATTEMPT, expires_at: inMs(ms) });
+      const live = await toLive();
+      act(() => live.handlers.onPhase('transition'));
+      act(() => live.handlers.onAwaitingReady(true));
+      return live;
+    }
+
+    /** Time passes in the page without the waits of the test (the retry wait is seconds). */
+    function clock() {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      return (ms: number) => act(() => vi.advanceTimersByTime(ms));
+    }
+
+    it('presents the token it already holds while that has time left, and mints nothing', async () => {
+      await toBriefing();
+      h.createAttempt.mockClear();
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.createAttempt).not.toHaveBeenCalled();
+      expect(h.ready).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledWith('attempt-token', NONCE);
+    });
+
+    it('mints a current one, for the same attempt, when the one it holds has lapsed', async () => {
+      await toBriefing(-1_000);
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.createAttempt).toHaveBeenCalledWith(LINK, NONCE);
+      expect(h.ready).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
+    });
+
+    it('does not trust a token that has under a minute left: a request can arrive after it lapses', async () => {
+      await toBriefing(45_000);
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByText('Sent — starting the role-play');
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
+    });
+
+    it('mints once, not on every press: a press after a failure presents the token it minted', async () => {
+      await toBriefing(-1_000);
+      const advance = clock();
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      h.ready.mockRejectedValueOnce(new ApiError('http_503', 503));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        "We couldn't send that. Just say “I'm ready”.",
+      );
+      advance(5_500);
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledTimes(2);
+      expect(h.ready).toHaveBeenNthCalledWith(1, 'fresh-token', NONCE);
+      expect(h.ready).toHaveBeenNthCalledWith(2, 'fresh-token', NONCE);
+    });
+
+    it('never mints because a press failed for some other reason', async () => {
+      await toBriefing();
+      const advance = clock();
+      h.createAttempt.mockClear();
+      h.ready
+        .mockRejectedValueOnce(new ApiError('http_500', 500))
+        .mockRejectedValueOnce(new ApiError('not_live', 409));
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByRole('alert');
+      advance(5_500);
+      fireEvent.click(screen.getByRole('button', READY));
+      await waitFor(() => expect(h.ready).toHaveBeenCalledTimes(2));
+      await screen.findByRole('alert');
+      expect(h.createAttempt).not.toHaveBeenCalled();
+    });
+
+    it('waits before it can be pressed again, whatever the failure, so a refusal is not hammered', async () => {
+      await toBriefing();
+      const advance = clock();
+      h.ready.mockRejectedValueOnce(new ApiError('http_500', 500));
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByRole('alert');
+      fireEvent.click(screen.getByRole('button', READY));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(h.ready).toHaveBeenCalledTimes(1);
+      advance(5_500);
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.ready).toHaveBeenCalledTimes(2);
+    });
+
+    it('says what to do instead when the server is asking it to slow down, and waits longer', async () => {
+      await toBriefing();
+      const advance = clock();
+      h.ready.mockRejectedValueOnce(new ApiError('http_429', 429));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        "We couldn't send that. Just say “I'm ready”.",
+      );
+      advance(6_000);
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(h.ready).toHaveBeenCalledTimes(1);
+      advance(10_000);
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.ready).toHaveBeenCalledTimes(2);
+    });
+
+    it('tries once more with a new token when the server refuses the one it holds', async () => {
+      await toBriefing();
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      // A browser clock that is behind the server's: the token looked good and was not.
+      h.ready.mockRejectedValueOnce(new ApiError('r1_attempt_invalid', 404));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenNthCalledWith(1, 'attempt-token', NONCE);
+      expect(h.ready).toHaveBeenNthCalledWith(2, 'fresh-token', NONCE);
+    });
+
+    it('gives up after that one new token, and says so the usual way', async () => {
+      await toBriefing();
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      h.ready.mockRejectedValue(new ApiError('r1_attempt_invalid', 404));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByRole('alert')).toHaveTextContent(/couldn't send that/);
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledTimes(2);
+    });
+
+    it('trusts a token the server gave no end time for only for a moment', async () => {
+      // The join's grant carries no `expires_at` (as before the server said it): fine to retry
+      // with straight away, not minutes later.
+      h.createAttempt.mockResolvedValueOnce({ ...ATTEMPT, expires_at: null });
+      const live = await toLive();
+      const advance = clock();
+      act(() => live.handlers.onPhase('transition'));
+      act(() => live.handlers.onAwaitingReady(true));
+      advance(60_000);
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByText('Sent — starting the role-play');
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
+    });
+
+    it('starts over with the attempt a rejoin gives it, never with the last one\'s token', async () => {
+      const live = await toBriefing();
+      act(() => live.handlers.onEnded('disconnected'));
+      await findH1('The connection to your interview ended.');
+      h.createAttempt.mockResolvedValueOnce({
+        ...ATTEMPT,
+        attempt_token: 'rejoin-token',
+        rejoin: true,
+        expires_at: inMs(290_000),
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Rejoin interview' }));
+      await findH1('Video interview');
+      fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+      await screen.findByRole('region', { name: 'Live video interview' });
+      const again = h.created[h.created.length - 1];
+      act(() => again.handlers.onPhase('transition'));
+      act(() => again.handlers.onAwaitingReady(true));
+      h.createAttempt.mockClear();
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByText('Sent — starting the role-play');
+      expect(h.createAttempt).not.toHaveBeenCalled();
+      expect(h.ready).toHaveBeenCalledWith('rejoin-token', NONCE);
+    });
   });
 
   it('reports a failure to mint the attempt token the same way, and sends nothing', async () => {
+    h.createAttempt.mockResolvedValueOnce({ ...ATTEMPT, expires_at: new Date(Date.now() - 1_000).toISOString() });
     const live = await toLive();
     act(() => live.handlers.onPhase('transition'));
     act(() => live.handlers.onAwaitingReady(true));

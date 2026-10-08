@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 
 type R1ConsentExitKind = 'withdraw' | 'decline';
 
@@ -15,6 +15,13 @@ interface R1ConsentExitProps {
   /** Why the last attempt failed, shown beside the control so the person can retry. */
   error?: string | null;
   onConfirm: () => void;
+  /**
+   * For a control inside a card that scrolls (the live interview's stage): opening the question
+   * scrolls it into view and puts the keyboard on the safe choice, which is described by the
+   * question; closing it returns to the button that opened it; an error is brought into view.
+   * Off elsewhere, so the other screens behave exactly as before.
+   */
+  keepInView?: boolean;
 }
 
 const WORDING: Readonly<
@@ -39,21 +46,54 @@ const WORDING: Readonly<
  * interview for this link. Used on every screen that can be reached while a consent is on
  * file (or while none is, for a decline), so the control is the same everywhere.
  */
-export function R1ConsentExit({ kind, question, busy, error, onConfirm }: R1ConsentExitProps) {
+export function R1ConsentExit({
+  kind,
+  question,
+  busy,
+  error,
+  onConfirm,
+  keepInView = false,
+}: R1ConsentExitProps) {
   const [confirming, setConfirming] = useState(false);
   const words = WORDING[kind];
+  const questionId = useId();
+  const groupRef = useRef<HTMLDivElement>(null);
+  const keepRef = useRef<HTMLButtonElement>(null);
+  const openRef = useRef<HTMLButtonElement>(null);
+  const errorRef = useRef<HTMLParagraphElement>(null);
+  const wasConfirming = useRef(false);
+
+  useEffect(() => {
+    if (!keepInView) return;
+    if (confirming) {
+      groupRef.current?.scrollIntoView?.({ block: 'nearest' });
+      keepRef.current?.focus({ preventScroll: true });
+    } else if (wasConfirming.current) {
+      openRef.current?.focus({ preventScroll: true });
+    }
+    wasConfirming.current = confirming;
+  }, [confirming, keepInView]);
+
+  useEffect(() => {
+    if (keepInView && error) errorRef.current?.scrollIntoView?.({ block: 'nearest' });
+  }, [keepInView, error]);
+
   return (
     <>
       {confirming ? (
-        <div className="r1-withdraw" role="group" aria-label={words.group}>
-          <p className="candidate-muted">{question}</p>
+        <div ref={groupRef} className="r1-withdraw" role="group" aria-label={words.group}>
+          <p id={questionId} className="candidate-muted">
+            {question}
+          </p>
           <div className="r1-actions">
             <button type="button" className="r1-secondary-cta" disabled={busy} onClick={onConfirm}>
               {words.confirm}
             </button>
             <button
+              ref={keepRef}
               type="button"
               className="r1-secondary-cta"
+              aria-describedby={keepInView ? questionId : undefined}
               disabled={busy}
               onClick={() => setConfirming(false)}
             >
@@ -62,12 +102,17 @@ export function R1ConsentExit({ kind, question, busy, error, onConfirm }: R1Cons
           </div>
         </div>
       ) : (
-        <button type="button" className="r1-link-button" onClick={() => setConfirming(true)}>
+        <button
+          ref={openRef}
+          type="button"
+          className="r1-link-button"
+          onClick={() => setConfirming(true)}
+        >
           {words.open}
         </button>
       )}
       {error && (
-        <p className="candidate-error" role="alert">
+        <p ref={errorRef} className="candidate-error" role="alert">
           {error}
         </p>
       )}

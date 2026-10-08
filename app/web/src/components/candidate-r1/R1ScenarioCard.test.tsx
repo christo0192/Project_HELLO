@@ -66,3 +66,44 @@ describe('the scenario card', () => {
     await expect(container).toHaveNoViolations();
   });
 });
+
+describe('the scenario card as a facts strip', () => {
+  function strip(leadName: string | null = 'Meera Iyer') {
+    const view = render(<R1ScenarioCard leadName={leadName} compact />);
+    return { ...view, region: screen.getByRole('region', { name: 'Your role-play' }) };
+  }
+
+  it('keeps the name and exactly the same three facts', () => {
+    const full = card();
+    const fullFacts = full.region.querySelector('dl')!.textContent;
+    full.unmount();
+    const { region } = strip();
+    expect(within(region).getByText('Meera Iyer')).toBeVisible();
+    expect(region.querySelector('dl')!.textContent).toBe(fullFacts);
+    expect(region.querySelectorAll('dt')).toHaveLength(3);
+  });
+
+  it('drops the introduction, the goal and the in-character line, which the briefing carries', () => {
+    const { region } = strip();
+    expect(region).toHaveClass('r1-scenario--compact');
+    expect(region.querySelectorAll('p')).toHaveLength(1);
+    expect(region).not.toHaveTextContent(/Filled in a form|Your goal|stays in character/);
+  });
+
+  it('is the same labelled region, so the way to it does not change', () => {
+    const { region } = strip(null);
+    expect(within(region).getByRole('heading', { level: 2, name: 'Your role-play' })).toBeVisible();
+    expect(within(region).getByText('A prospective learner')).toBeVisible();
+  });
+
+  it('shows nothing the candidate is meant to find out for themselves', () => {
+    const { region } = strip();
+    const text = region.textContent ?? '';
+    expect(text).not.toMatch(/7,?000|budget|per month|monthly|afford|timeline|decision|upfront/i);
+  });
+
+  it('has no accessibility violations', async () => {
+    const { container } = strip();
+    await expect(container).toHaveNoViolations();
+  });
+});

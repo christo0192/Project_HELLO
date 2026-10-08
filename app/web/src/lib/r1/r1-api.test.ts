@@ -403,7 +403,14 @@ describe('response validation (fail closed)', () => {
         nonce: 'n',
         rejoin: false,
       }),
-    ).toEqual({ attempt_token: 't', nonce: 'n', attempt_id: 'a-1', rejoin: false, lead: null });
+    ).toEqual({
+      attempt_token: 't',
+      nonce: 'n',
+      attempt_id: 'a-1',
+      rejoin: false,
+      lead: null,
+      expires_at: '2026-10-07T00:00:00.000Z',
+    });
     expect(parseAttempt({ attempt_token: 't', rejoin: true }).nonce).toBeNull();
     expect(
       parseExchange({
@@ -422,6 +429,17 @@ describe('response validation (fail closed)', () => {
     expect(parseExchange({ status: 'preparing', retry_after_sec: 3 })).toEqual({
       status: 'preparing',
     });
+  });
+
+  it('reads when an attempt token ends, and only as a time the browser can read', () => {
+    const at = (value: unknown) =>
+      parseAttempt({ attempt_token: 't', attempt_token_expires_at: value }).expires_at;
+    expect(at('2026-10-07T00:05:00.000Z')).toBe('2026-10-07T00:05:00.000Z');
+    // Absent or unreadable means "the server did not say": the page then trusts the token briefly.
+    expect(parseAttempt({ attempt_token: 't' }).expires_at).toBeNull();
+    for (const bad of ['', '   ', 'soon', '2026-99-99', 12, null, {}, []]) {
+      expect(at(bad), String(bad)).toBeNull();
+    }
   });
 });
 

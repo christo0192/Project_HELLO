@@ -84,9 +84,38 @@ export function R1LiveView({
 }: R1LiveViewProps) {
   const [confirmingLeave, setConfirmingLeave] = useState(false);
   const videoElementRef = useRef<HTMLVideoElement>(null);
+  const phaseRegionRef = useRef<HTMLDivElement>(null);
+  const leaveConfirmRef = useRef<HTMLDivElement>(null);
+  const leaveButtonRef = useRef<HTMLButtonElement>(null);
+  const stayButtonRef = useRef<HTMLButtonElement>(null);
+  // Set by the ready button as it unmounts while it holds the keyboard focus (see below).
+  const readyHadFocusRef = useRef(false);
   // The button exists only while the interviewer is waiting for it, in the briefing. Leaving the
   // briefing unmounts it, so its "sent" state never leaks into a later wait.
   const readyShown = phase === 'transition' && awaitingReady && onReady !== undefined;
+
+  // The interviewer picks up the role-play and the button goes away. If the candidate had pressed
+  // it from the keyboard, focus would drop to the page; it goes to the phase panel instead, which
+  // is where the change is announced from, so keyboard and screen-reader users keep their place.
+  useEffect(() => {
+    if (readyShown || !readyHadFocusRef.current) return;
+    readyHadFocusRef.current = false;
+    phaseRegionRef.current?.focus({ preventScroll: true });
+  }, [readyShown]);
+
+  // "Leave interview" opens its confirmation inside the stage card, which can scroll on a short
+  // window: bring it into view and put the keyboard on the safe choice, so the destructive one
+  // is never one stray Enter away. Closing it returns to the button that opened it.
+  const wasConfirmingLeave = useRef(false);
+  useEffect(() => {
+    if (confirmingLeave) {
+      leaveConfirmRef.current?.scrollIntoView?.({ block: 'nearest' });
+      stayButtonRef.current?.focus({ preventScroll: true });
+    } else if (wasConfirmingLeave.current) {
+      leaveButtonRef.current?.focus({ preventScroll: true });
+    }
+    wasConfirmingLeave.current = confirmingLeave;
+  }, [confirmingLeave]);
 
   useEffect(() => {
     const element = videoElementRef.current;
@@ -102,21 +131,35 @@ export function R1LiveView({
       <div className="candidate-glass-card r1-live__stage">
         <p className="candidate-eyebrow">Live interview</p>
         <h1 className="r1-live__title">{roleTitle}</h1>
-        <R1PhaseLabel phase={phase} agentPresent={agentPresent} readyHint={readyShown} />
+        <R1PhaseLabel
+          phase={phase}
+          agentPresent={agentPresent}
+          readyHint={readyShown}
+          regionRef={phaseRegionRef}
+        />
         {leadVisible && roleplayClock && (
           <R1RoleplayTimer clock={roleplayClock} running={phase === 'roleplay'} />
         )}
-        {readyShown && onReady && <R1ReadyButton onReady={onReady} />}
+        {readyShown && onReady && (
+          <R1ReadyButton
+            onReady={onReady}
+            onRemovedWithFocus={() => {
+              readyHadFocusRef.current = true;
+            }}
+          />
+        )}
         {!cameraOn && (
           <p className="r1-banner" role="status">
             Your camera is off. This interview needs your camera, so please turn it back on.
           </p>
         )}
-        <InterviewerAura level={level} speaking={level > 0.025} />
-        <div className="r1-selfview r1-live__selfview">
-          <video ref={videoElementRef} autoPlay muted playsInline aria-label="Your camera">
-            <track kind="captions" />
-          </video>
+        <div className="r1-live__media">
+          <InterviewerAura level={level} speaking={level > 0.025} />
+          <div className="r1-selfview r1-live__selfview">
+            <video ref={videoElementRef} autoPlay muted playsInline aria-label="Your camera">
+              <track kind="captions" />
+            </video>
+          </div>
         </div>
         <div className="candidate-interview__controls">
           <button type="button" aria-pressed={micMuted} onClick={onToggleMic}>
@@ -125,12 +168,17 @@ export function R1LiveView({
           <button type="button" aria-pressed={!cameraOn} onClick={onToggleCamera}>
             {cameraOn ? 'Turn camera off' : 'Turn camera on'}
           </button>
-          <button type="button" onClick={() => setConfirmingLeave(true)}>
+          <button ref={leaveButtonRef} type="button" onClick={() => setConfirmingLeave(true)}>
             Leave interview
           </button>
         </div>
         {confirmingLeave && (
-          <div className="r1-withdraw" role="group" aria-label="Leave the interview">
+          <div
+            ref={leaveConfirmRef}
+            className="r1-withdraw"
+            role="group"
+            aria-label="Leave the interview"
+          >
             <p className="candidate-muted">
               Leave the interview? You can rejoin within 90 seconds from the next screen, as
               long as you keep this tab open.
@@ -139,7 +187,11 @@ export function R1LiveView({
               <button type="button" onClick={onLeave}>
                 Yes, leave
               </button>
-              <button type="button" onClick={() => setConfirmingLeave(false)}>
+              <button
+                ref={stayButtonRef}
+                type="button"
+                onClick={() => setConfirmingLeave(false)}
+              >
                 Stay in the interview
               </button>
             </div>
@@ -157,12 +209,14 @@ export function R1LiveView({
             busy={withdrawBusy}
             error={withdrawError}
             onConfirm={onWithdraw}
+            keepInView
           />
         )}
       </div>
 
       <div className="r1-live__side">
-        {leadVisible && <R1ScenarioCard leadName={leadName} />}
+        {/* The full card is the briefing's; once the role-play is on it shrinks to a facts strip. */}
+        {leadVisible && <R1ScenarioCard leadName={leadName} compact={phase !== 'transition'} />}
         <R1Captions captions={captions} />
       </div>
     </section>

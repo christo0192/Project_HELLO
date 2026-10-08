@@ -3,6 +3,12 @@ import { R1_SCENARIO_COPY } from './r1-scenario';
 interface R1ScenarioCardProps {
   /** The learner's name as the interviewer published it, or null before it has. */
   leadName: string | null;
+  /**
+   * The strip the card shrinks to once the role-play is on: who, and the three course facts. The
+   * briefing shows the whole card; the role-play is where the captions are read, and the full card
+   * would take a third of a laptop's column from them.
+   */
+  compact?: boolean;
 }
 
 /**
@@ -15,12 +21,15 @@ interface R1ScenarioCardProps {
  * with which payment plan, and never shows anything about the learner beyond their name: their
  * budget, needs and timeline are what the candidate is assessed on finding out.
  */
-export function R1ScenarioCard({ leadName }: R1ScenarioCardProps) {
+export function R1ScenarioCard({ leadName, compact = false }: R1ScenarioCardProps) {
   return (
-    <section className="candidate-glass-card r1-scenario" aria-labelledby="r1-scenario-title">
+    <section
+      className={`candidate-glass-card r1-scenario${compact ? ' r1-scenario--compact' : ''}`}
+      aria-labelledby="r1-scenario-title"
+    >
       <h2 id="r1-scenario-title">{R1_SCENARIO_COPY.heading}</h2>
       <p className="r1-scenario__who">{leadName ?? R1_SCENARIO_COPY.unnamedLearner}</p>
-      <p>{R1_SCENARIO_COPY.intro}</p>
+      {!compact && <p>{R1_SCENARIO_COPY.intro}</p>}
       <dl className="r1-scenario__facts">
         <dt>{R1_SCENARIO_COPY.priceLabel}</dt>
         <dd>{R1_SCENARIO_COPY.price}</dd>
@@ -29,8 +38,8 @@ export function R1ScenarioCard({ leadName }: R1ScenarioCardProps) {
         <dt>{R1_SCENARIO_COPY.discountsLabel}</dt>
         <dd>{R1_SCENARIO_COPY.discounts}</dd>
       </dl>
-      <p className="r1-scenario__goal">{R1_SCENARIO_COPY.goal}</p>
-      <p className="r1-scenario__note">{R1_SCENARIO_COPY.inCharacter}</p>
+      {!compact && <p className="r1-scenario__goal">{R1_SCENARIO_COPY.goal}</p>}
+      {!compact && <p className="r1-scenario__note">{R1_SCENARIO_COPY.inCharacter}</p>}
     </section>
   );
 }

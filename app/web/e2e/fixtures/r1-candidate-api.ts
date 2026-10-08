@@ -34,7 +34,15 @@
 
 import type { MockResponse } from './api-router';
 import type { ApiRouter } from './harness';
-import { MOCK_LIVEKIT_ORIGIN } from './env';
+import { FROZEN_NOW_MS, MOCK_LIVEKIT_ORIGIN } from './env';
+
+/**
+ * "Now", for token lifetimes: the instant the browser's clock is frozen at (`page.clock.setFixedTime`
+ * in the harness). The page reads `attempt_token_expires_at` against ITS clock, so a lifetime
+ * counted from the machine's clock would put every token years away from, or behind, the page's
+ * "now". Time does not pass in the page; a token lapses only by being minted with `ttl` 0.
+ */
+const now = (): number => FROZEN_NOW_MS;
 
 /** 64 lowercase hex characters, the shape the page accepts from the fragment. */
 export const R1_LINK_TOKEN = 'e2e1'.repeat(16);
@@ -73,6 +81,14 @@ export interface R1MockState {
   liveSession: boolean;
   /** How many 202 `preparing` answers the exchange gives before the room is ready. */
   exchangePreparing: number;
+  /**
+   * How long an attempt token minted from now lasts, in seconds (the real one: 300). The page
+   * reads it back as `attempt_token_expires_at`; a test sets it to 0 BEFORE joining to stand for
+   * "the briefing comes minutes after the join, and the join's token has lapsed by then".
+   */
+  attemptTokenTtlSec: number;
+  /** When each token this fake minted stops being accepted by `/api/r1/ready`, in epoch ms. */
+  tokenExpiresAt: Record<string, number>;
   /** Install an error to make one route fail (consumed on use unless `sticky`). */
   failures: Partial<
     Record<'status' | 'preflight' | 'attempts' | 'exchange' | 'consent' | 'ready', R1ForcedError>
@@ -91,6 +107,8 @@ export function createR1State(): R1MockState {
     withdrawn: false,
     liveSession: false,
     exchangePreparing: 0,
+    attemptTokenTtlSec: 300,
+    tokenExpiresAt: {},
     failures: {},
   };
 }
@@ -284,22 +302,32 @@ export function r1Router(state: R1MockState): ApiRouter {
         if (!tokenOk(body)) return json(404, { error: LINK_INVALID });
         const failure = forced('attempts');
         if (failure) return failure;
-        const attempt = {
-          attempt_id: 'e2e00000-0000-4000-8000-0000000000a1',
-          attempt_number: 1,
-          attempt_token: R1_ATTEMPT_TOKEN,
-          attempt_token_expires_at: '2026-10-07T00:10:00.000Z',
+        // Every token is minted with a lifetime, like the real route's (`attempt_token_expires_at`).
+        const mint = (token: string, ttlSec: number) => {
+          const expiresAt = now() + ttlSec * 1000;
+          state.tokenExpiresAt[token] = expiresAt;
+          return {
+            attempt_id: 'e2e00000-0000-4000-8000-0000000000a1',
+            attempt_number: 1,
+            attempt_token: token,
+            attempt_token_expires_at: new Date(expiresAt).toISOString(),
+          };
         };
         if (body?.nonce !== undefined) {
           // A rejoin: link + nonce re-mint a token for the live attempt, and the
           // nonce is NOT returned again (the page already holds it).
           if (!state.liveSession) return json(409, { error: 'r1_attempt_not_live' });
           if (body.nonce !== R1_NONCE) return json(404, { error: 'r1_attempt_invalid' });
-          return json(200, { ...attempt, attempt_token: R1_FRESH_ATTEMPT_TOKEN, rejoin: true });
+          // A re-mint always lasts the full five minutes, whatever the join's token was minted with.
+          return json(200, { ...mint(R1_FRESH_ATTEMPT_TOKEN, 300), rejoin: true });
         }
         if (state.liveSession) return json(409, { error: 'r1_busy', retry_after_sec: 1200 });
         state.liveSession = true;
-        return json(201, { ...attempt, nonce: R1_NONCE, rejoin: false });
+        return json(201, {
+          ...mint(R1_ATTEMPT_TOKEN, state.attemptTokenTtlSec),
+          nonce: R1_NONCE,
+          rejoin: false,
+        });
       }
       case 'POST /api/r1/exchange': {
         if (!onlyKeys(body, ['attempt_token', 'nonce'])) return validationError();
@@ -323,9 +351,13 @@ export function r1Router(state: R1MockState): ApiRouter {
       }
       case 'POST /api/r1/ready': {
         // The relay to the interviewer (the candidate's room token cannot publish data). The body is
-        // the exchange's; the attempt token must be a current one, and the attempt must be live.
+        // the exchange's; the attempt token must be a current one (this fake's exchange takes
+        // either token without looking at its lifetime, because it is called right after the
+        // join), and the attempt must be live.
         if (!onlyKeys(body, ['attempt_token', 'nonce'])) return validationError();
-        if (body?.attempt_token !== R1_FRESH_ATTEMPT_TOKEN || body?.nonce !== R1_NONCE) {
+        const token = typeof body?.attempt_token === 'string' ? body.attempt_token : '';
+        const lapsed = (state.tokenExpiresAt[token] ?? 0) <= now();
+        if (lapsed || body?.nonce !== R1_NONCE) {
           return json(404, { error: 'r1_attempt_invalid' });
         }
         const failure = forced('ready');

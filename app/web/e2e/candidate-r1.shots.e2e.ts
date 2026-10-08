@@ -15,7 +15,9 @@ import { expect, test } from './fixtures/candidate-harness';
 import {
   LEARNER_NAME,
   LIVE_DESKTOP_SIZES,
+  REALISTIC_WINDOWS,
   agree,
+  backToBriefing,
   heading,
   openLink,
   passDeviceCheck,
@@ -117,6 +119,40 @@ test.describe('R1 candidate screenshots @shots', () => {
         animations: 'disabled',
         caret: 'hide',
       });
+    });
+  }
+
+  /**
+   * The windows a candidate really has (the screen minus the taskbar and the browser's bars):
+   * the role-play with its facts strip, the briefing with the full card, and the briefing after a
+   * failed press with the camera off, which is the tallest the stage ever gets.
+   */
+  for (const size of REALISTIC_WINDOWS) {
+    test(`live view, realistic window, ${size.width}x${size.height}`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop windows run on the desktop project');
+      const { page } = r1;
+      const project = testInfo.project.name;
+      await page.setViewportSize(size);
+      await reachLiveWithConversation(r1);
+      const view = (name: string) => page.screenshot({
+        path: shotPath(project, `live-realistic-${size.width}x${size.height}-${name}`),
+        fullPage: false,
+        animations: 'disabled',
+        caret: 'hide',
+      });
+      expect((await liveLayout(page)).pageScrollHeight).toBeLessThanOrEqual(size.height + 1);
+      await view('roleplay');
+
+      await backToBriefing(r1);
+      await view('briefing');
+
+      r1.state.failures.ready = { status: 503, error: 'service_unavailable' };
+      await page.getByRole('button', { name: "I'm ready" }).click();
+      await expect(page.getByRole('alert')).toContainText("We couldn't send that");
+      r1.consoleErrors.length = 0; // a 503 is logged by the browser's network layer
+      await page.getByRole('button', { name: 'Turn camera off' }).click();
+      await expect(page.getByText(/Your camera is off/)).toBeVisible();
+      await view('briefing-failed-camera-off');
     });
   }
 
