@@ -93,13 +93,17 @@ COPY --from=builder /opt/venv /opt/venv
 # agent.py, for phone-path RNNoise) and MUST ship for the same reason — a worker
 # that cannot import it crash-loops at startup even though suppression is
 # switchable OFF with PHONE_NOISE_SUPPRESSION=off.
+# turn_hold.py (M014 S02: pending-final hold + per-phase endpointing) was added the
+# same way (`import turn_hold` in agent.py) and MUST ship for the same reason — a
+# worker that cannot import it crash-loops at startup even though the hold is
+# switchable OFF with PHONE_PENDING_FINAL_HOLD_MAX_SEC=0.
 # Deliberately excluded (not on the runtime import path): voice_quality_harness.py,
 # model_governance/, tests/ — see .dockerignore.
 # Limitation: the static closure resolves absolute, relative, and literal-string
 # dynamic imports (importlib.import_module("x")/__import__("x")); a first-party
 # module pulled in only via a computed/non-literal import name cannot be seen
 # statically and must be added here by hand.
-COPY agent.py closing.py noise_suppression.py gate_judge.py observability.py persistence.py phone.py phone_canary.py prompting.py provenance.py provider_resilience.py recording.py recording_api.py worker_ready_api.py r1_context.py r1_lines.py r1_llm.py r1_persistence.py r1_phases.py r1_routing.py r1_session.py r1_commitment.py r1_content.py r1_guard.py r1_personas.py r1_prompts.py r1_replies.py r1_roleplay.py r1_scheduler.py r1_script.py r1_text.py r1_tracker.py r1_world.py r1_latency.py r1_linecache.py r1_tts.py ./
+COPY agent.py closing.py noise_suppression.py gate_judge.py observability.py persistence.py phone.py phone_canary.py prompting.py provenance.py provider_resilience.py recording.py recording_api.py worker_ready_api.py r1_context.py r1_lines.py r1_llm.py r1_persistence.py r1_phases.py r1_routing.py r1_session.py r1_commitment.py r1_content.py r1_guard.py r1_personas.py r1_prompts.py r1_replies.py r1_roleplay.py r1_scheduler.py r1_script.py r1_text.py r1_tracker.py r1_world.py r1_latency.py r1_linecache.py r1_tts.py turn_hold.py ./
 
 USER 1000:1000
 

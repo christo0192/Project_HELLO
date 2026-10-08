@@ -45,6 +45,7 @@ import functools
 import hashlib
 import inspect
 import json
+import math
 import os
 import re
 import time as time_module
@@ -2359,7 +2360,9 @@ def phone_static_endpointing_max_delay() -> float:
     a genuinely-INCOMPLETE utterance — the built-in v1-mini EOU commits a
     COMPLETE answer at MIN regardless of MAX — so a larger MAX lets a mid-thought
     pause breathe like the browser lane at near-zero common-case latency cost.
-    The MIN reader and its [0.3, 0.5] clamp are unchanged."""
+    The MIN reader and its [0.3, 0.5] clamp are unchanged.
+
+    M014: deploy pins 2.0 (fly.phone.toml)."""
     raw = os.getenv("PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC")
     if raw in (None, ""):
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
@@ -2368,6 +2371,19 @@ def phone_static_endpointing_max_delay() -> float:
     except ValueError:
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
     return min(3.0, max(0.5, value))
+
+
+#: M014: the screening max rose to 2.0 s, but the identity / pickup / consent
+#: gate keeps the SDK commit timing it had at the old 1.0 s max (the owner's
+#: decision): a bare "yes" the turn model scores unfinished would otherwise wait
+#: ~1 s longer for its commit. The session starts on this gate max and is raised
+#: to `phone_static_endpointing_max_delay` when the screening phase is armed.
+PHONE_GATE_ENDPOINTING_MAX_CEILING_SEC = 1.0
+
+
+def phone_gate_endpointing_max_delay() -> float:
+    """SDK max-endpointing for the identity / pickup / consent gate."""
+    return min(phone_static_endpointing_max_delay(), PHONE_GATE_ENDPOINTING_MAX_CEILING_SEC)
 
 
 #: Short max-endpointing for the CONSENT turn only (2026-09-09 latency RCA). A
@@ -2406,6 +2422,59 @@ def phone_local_endpointing_delays() -> tuple[float, float]:
         phone_static_endpointing_min_delay(),
         phone_static_endpointing_max_delay(),
     )
+
+
+#: M014 (S02): the MIN endpointing delay while the bot waits for an OPEN answer.
+#: Sarvam is finals-only and delivers a final ~0.9-1.0 s after speech ends, so a
+#: 0.3 s MIN is long gone by the time the words exist; the MIN that matters for
+#: turn-taking is the SDK's reply-start silence gate (``min_delay / 2``): with
+#: 0.3 a reply needed only 0.15 s of quiet and landed in breath gaps. 0.8 makes
+#: that 0.4 s for the questions where a candidate pauses to think.
+PHONE_OPEN_ANSWER_MIN_DELAY_SEC_DEFAULT = 0.8
+PHONE_PENDING_FINAL_HOLD_MAX_SEC_DEFAULT = 2.0
+
+
+def phone_open_answer_min_delay() -> float:
+    """MIN endpointing delay for OPEN-answer questions, default 0.8s.
+
+    Bounded to [0.3, 1.2] and never above ``phone_static_endpointing_max_delay``
+    (a min above the max would invert the SDK's own bounds). An unset, empty,
+    non-numeric or non-finite value falls back to the default.
+    ``PHONE_OPEN_ANSWER_MIN_DELAY_SEC=0.3`` makes the per-phase minimum a no-op
+    (the live ``PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC`` is also 0.3). Read at
+    the call site with the literal name so the env-contract scanner sees it.
+    """
+    raw = os.getenv("PHONE_OPEN_ANSWER_MIN_DELAY_SEC")
+    value = PHONE_OPEN_ANSWER_MIN_DELAY_SEC_DEFAULT
+    if raw not in (None, ""):
+        try:
+            parsed = float(raw)
+        except ValueError:
+            parsed = value
+        if math.isfinite(parsed):
+            value = parsed
+    value = min(1.2, max(0.3, value))
+    return min(value, phone_static_endpointing_max_delay())
+
+
+def phone_pending_final_hold_max_sec() -> float:
+    """Longest a reply may be held while candidate speech is still un-finalized.
+
+    Default 2.0s, bounded to [0, 3.0]. ``0`` (or any negative value) is the kill
+    switch: no hold, no carry, no re-arm. A non-numeric or non-finite value falls
+    back to the default. Read at the call site with the literal name so the
+    env-contract scanner sees it.
+    """
+    raw = os.getenv("PHONE_PENDING_FINAL_HOLD_MAX_SEC")
+    if raw in (None, ""):
+        return PHONE_PENDING_FINAL_HOLD_MAX_SEC_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return PHONE_PENDING_FINAL_HOLD_MAX_SEC_DEFAULT
+    if not math.isfinite(value):
+        return PHONE_PENDING_FINAL_HOLD_MAX_SEC_DEFAULT
+    return min(3.0, max(0.0, value))
 
 
 def phone_min_interruption_words() -> int:
@@ -9308,7 +9377,9 @@ async def run_phone_gate(
     # sees the restored value. No-op unless a setter is wired and the consent max
     # is strictly shorter than the global max (the rollback: set them equal).
     consent_max = phone_consent_endpointing_max_delay()
-    normal_max = phone_static_endpointing_max_delay()
+    # The gate's own max (the session starts on it; screening raises it later),
+    # so the consent restore never lifts the identity/consent timing above it.
+    normal_max = phone_gate_endpointing_max_delay()
     tightened_endpointing = False
     if set_endpointing_max is not None and consent_max < normal_max:
         try:
@@ -16948,10 +17019,22 @@ def phone_agent_class(agent_base: Any) -> Any:
         async def on_user_turn_completed(self, turn_ctx: Any, new_message: Any) -> None:
             """Persist the user turn and optionally return to LiveKit's scheduler.
 
-            Native phone screening deliberately does not raise ``StopResponse``:
-            after the durable callback, LiveKit owns the ordinary reply,
-            interruption, and playout lifecycle just as it does for WebRTC.
+            Native phone screening deliberately does not raise ``StopResponse``
+            itself: after the durable callback, LiveKit owns the ordinary reply,
+            interruption, and playout lifecycle just as it does for WebRTC. (The
+            coordinator's own drops, and the M014 pending-final yield in
+            ``turn_hold``, are the exceptions.)
             """
+            if self._native_turns:
+                # M014 S02: while the VAD heard candidate speech no STT final
+                # has covered yet, hold and yield to the late final (it then
+                # commits as the next turn and is merged into it); a carried
+                # earlier turn is merged into THIS message here. A no-op unless
+                # the screening phase is active and speech is pending, and
+                # `None` in tests and on the gate path. May raise StopResponse.
+                turn_hold = getattr(self, "_turn_hold", None)
+                if turn_hold is not None:
+                    await turn_hold.before_turn(new_message)
             text = _message_text(new_message)
             # FIX 3: remember the candidate turn this reply answers so the
             # objective guard can tell a candidate-introduced comp/notice ack
@@ -17132,12 +17215,59 @@ def phone_agent_class(agent_base: Any) -> Any:
                     or frame_generation == self._reply_generation
                 )
 
+            def _line_interruptible() -> bool:
+                # The SDK plays a non-interruptible line (the fixed closing
+                # goodbye, any `say(..., allow_interruptions=False)`) over the
+                # candidate on purpose and no commit can cancel it, so the
+                # first-audio hold must neither hold it nor wait a commit
+                # grace for it. The line being spoken is the activity's current
+                # speech (the speech queue is serial). Unknown -> interruptible
+                # (the hold is bounded either way).
+                try:
+                    speech = getattr(self.session, "current_speech", None)
+                    return getattr(speech, "allow_interruptions", True) is not False
+                except Exception:  # noqa: BLE001 — never breaks a line
+                    return True
+
             async def _note_first_frame() -> bool:
                 nonlocal first_frame_seen
                 if not _generation_current():
                     return False
                 if first_frame_seen:
                     return True
+                # M014 S02: never start a line while the VAD heard candidate
+                # speech no STT final has covered yet (bounded; a no-op when
+                # nothing is pending, on the gate path and in tests). The
+                # re-arm restarts the first-audio watchdog once so it cannot
+                # fire a fallback mid-hold; only a generated reply owns it.
+                turn_hold = getattr(self, "_turn_hold", None)
+                if turn_hold is not None:
+                    reply_expected = getattr(self, "_on_reply_expected", None)
+                    rearm = None
+                    if (
+                        callable(reply_expected)
+                        and frame_generation is not None
+                        and frame_generation == self._reply_generation
+                    ):
+                        def rearm() -> Any:
+                            # `hold=True`: the coordinator skips this when the
+                            # line is a fallback / silence prompt (the
+                            # generation already has its fallback, is empty or
+                            # has first audio), so a held `say()` line is never
+                            # force-interrupted by a restarted watchdog.
+                            return reply_expected(rearm_only=True, hold=True)
+                    await turn_hold.before_first_audio(
+                        rearm=rearm, interruptible=_line_interruptible())
+                    if not _generation_current():
+                        return False
+                    # (The minimum endpointing delay noted for the question this
+                    # reply asks is applied when the reply starts PLAYING, from
+                    # the session's `agent_state_changed` -> `speaking` handler.)
+                    # NB the SDK authorizes a reply ONCE, right after it is
+                    # scheduled, and never re-checks that the candidate is silent
+                    # before forwarding its audio: the hold above is what keeps a
+                    # ready reply from playing over a continuing answer, so it
+                    # waits for as long as a VAD segment is open.
                 first_frame_seen = True
                 callback = self._on_tts_first_frame
                 if callable(callback):

@@ -41,38 +41,108 @@ each represents a distinct decision, and none is allowed to imply another.
 | `PHONE_SIP_TRUNK_ID` | empty | Provider-neutral trunk. **Empty is fail-closed.** |
 | LiveKit credentials | — | Checked independently of the phone flags. |
 
-### 2z. Voice-tuning rollback point — 2026-09-10
+### 2z. Voice-tuning rollback point — rewritten 2026-10-08 (M014)
 
-The phone worker's voice tuning lives in **Fly secrets**, which SHADOW the
-`[env]` values in `fly.phone.toml`. Secrets are opaque — `fly secrets list`
-shows only a digest — so the values below are recorded here BECAUSE THEY CANNOT
-BE READ BACK. Update this block whenever they change, or the next rollback is a
-guess.
+**Verified 2026-10-08:** `fly secrets list -a project-hello-phone-voice` shows
+**no** secret for any voice-tuning name below, and the deployed `fly config show`
+`[env]` equals `fly.phone.toml` `[env]` (zero differences). The 2026-09-10 table
+that used to be here (secrets `1.25` / `40`, toml `2.5` / `60`) was stale and has
+been removed: the toml pins ARE the live values. Do not create a secret for these
+names; change `fly.phone.toml` and deploy. (A Fly secret of the same name would
+SHADOW the toml value. `PHONE_OBJECTIVE_PREEMPTIVE` and `PHONE_TURN_MODE` ARE
+shadowed by secrets whose values cannot be read back; they are out of scope here.)
 
-| Secret (`project-hello-phone-voice`) | Before 2026-09-10 | Set 2026-09-10 | toml `[env]` (shadowed) |
-|---|---|---|---|
-| `PHONE_TTS_FLUSH_MIN_CHARS` | `20` | `40` | `60` |
-| `PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC` | `1.5` | `1.25` | `2.5` |
+| Variable (`fly.phone.toml` `[env]`) | Live value | Rollback |
+|---|---|---|
+| `PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC` | `0.3` (reader clamp 0.3-0.5) | n/a |
+| `PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC` | `2.0` (was `1.0` until M014; clamp 0.5-3.0) | `1.0` |
+| `PHONE_OPEN_ANSWER_MIN_DELAY_SEC` | `0.8` (clamp 0.3-1.2, never above the max) | `0.3` makes the per-phase minimum a no-op |
+| `PHONE_PENDING_FINAL_HOLD_MAX_SEC` | `2.0` (clamp 0-3.0) | `0` disables the hold, the merge and the re-arm |
+| `PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC` | unset, code default `0.5` (consent turn only) | n/a |
+| `PHONE_TTS_FLUSH_MIN_CHARS` | `35` (unchanged by M014) | `0` is the deep rollback (below) |
 
-**To roll back to the 2026-09-10 pre-change production setup:**
+**M014 (2026-10-08): what the endpointing change does.** Sarvam is finals-only
+and delivers a final 0.9-1.0 s after the candidate stops, so the SDK used to start
+(or resume) the bot's reply on 0.15-0.25 s of quiet, long before the candidate's
+words existed. Three changes, all in the screening phase only (the identity,
+pickup and consent turns keep their old commit timing: the session starts on a
+gate max of `min(MAX, 1.0)` and the screening phase raises it to the MAX):
+
+1. MAX `1.0` -> `2.0` for the screening phase. It costs up to +1.0 s only on a
+   turn the end-of-utterance model scores incomplete (a bare "yes" can score
+   incomplete); the consent turn keeps its own `0.5`.
+2. Per-phase MIN: while the bot waits for an OPEN answer (what / how / tell me,
+   candidate Q&A, resume conflict, patience) the minimum is `0.8`, so a reply needs
+   0.4 s of quiet before it starts instead of 0.15 s. Yes/no screening questions,
+   name confirm, callback and every terminal phase keep `0.3`. The class changes
+   when the bot's reply STARTS PLAYING (the question it asks; the session's
+   `speaking` state), never earlier, so the reply to an answer is still gated by
+   that answer's own class. The first planned question is a spoken line, so its
+   class is applied once it has been heard.
+3. Pending-final hold: when the VAD heard candidate speech no STT final has
+   covered yet, the reply is held at hook time (and again before its first audio)
+   for at most `PHONE_PENDING_FINAL_HOLD_MAX_SEC`, then yields to the late final
+   and is merged into it. A turn with no pending speech waits 0. Speech that
+   never gets a final (a cough, a breath, line noise: the SDK drops empty finals)
+   stops counting as pending 1.5 s after it ended (`PENDING_CLOSED_EXPIRY_SEC`),
+   so it costs at most ~1.5 s once, shared by both holds.
+   Before its first audio a held reply waits for the SDK's commit only for a
+   final the SDK WILL commit (at least `PHONE_MIN_INTERRUPTION_WORDS` words
+   banked since the last turn); a one- or two-word backchannel releases the
+   reply as soon as it is covered. Both holds count QUIET time only: while the
+   candidate is still talking (a VAD segment is open) a held reply keeps waiting,
+   because the SDK authorizes a reply once and never re-checks for silence before
+   its audio plays, and the bounds restart when the candidate stops. That
+   extension has an ABSOLUTE ceiling per hold, wall clock from when the hold
+   starts: `PHONE_PENDING_FINAL_HOLD_MAX_SEC` + max endpointing + 0.3 s, never
+   more than 4.0 s (`HOLD_ABSOLUTE_CEILING_SEC`), however many finals, noise
+   bursts or speech segments arrive. Worst case with recurring wordless noise:
+   one 4 s hold at hook time then one 4 s hold before first audio (about 8 s
+   in total, then the reply plays). The first-audio watchdog is re-armed every
+   second inside a hold and never past its ceiling, so it cannot be suppressed
+   indefinitely. A line that cannot be interrupted (the fixed closing goodbye,
+   any `say(..., allow_interruptions=False)`) is never held and never waits for a
+   commit, because the SDK plays it over the candidate on purpose and no commit
+   can cancel it; the farewell keeps its 10 s playout bound. If a committable
+   final was banked and a wordless segment then opens, the commit window is
+   re-opened from that segment's end (up to the endpoint max + 0.3 s, inside the
+   ceiling) so the reply is not started and then cut by the SDK's delayed commit.
+
+**Rollbacks.** Edit `fly.phone.toml` and deploy (the normal path). In an
+emergency, with no deploy:
 
 ```
-fly secrets set PHONE_TTS_FLUSH_MIN_CHARS=20 \
-                PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC=1.5 \
+fly secrets set PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC=1.0 \
+                PHONE_PENDING_FINAL_HOLD_MAX_SEC=0 \
+                PHONE_OPEN_ANSWER_MIN_DELAY_SEC=0.3 \
                 --app project-hello-phone-voice
 ```
 
-That restarts the worker machines; no deploy and no merge is involved, so it
-works even if a code change has since shipped. `PHONE_TTS_FLUSH_MIN_CHARS=0`
-is the deeper rollback — it disables the first-fragment early flush entirely
-and restores the ~2.9 s LLM-invoke→first-audio floor that four prior PRs were
-spent removing, so prefer the table above.
+That restarts the worker machines. **Unset the secrets afterwards**
+(`fly secrets unset NAME ... --app project-hello-phone-voice`) once the toml is
+changed and deployed, or the toml stays documentation. `PHONE_TTS_FLUSH_MIN_CHARS=0`
+disables the first-fragment early flush entirely and restores the ~2.9 s
+LLM-invoke-to-first-audio floor that four prior PRs were spent removing.
 
-Why these two moved: on the 2026-09-10 live call a word came out cracked at the
-first-fragment join. `tts_node` synthesizes the first fragment and the
-remainder as SEPARATE Sarvam calls, and at a 20-character cap the split lands
-mid-phrase far more often than at 40. The endpointing max is a separate
-complaint — the tail a slow speaker gets before their turn is closed.
+**Logs to watch after an endpointing deploy (categories and timings only; never
+text):**
+
+- `phone_turn_hold`: `held_yield`, `held_cleared`, `held_cap_reached`
+  (`duration_sec`), `held_ceiling_reached` (the absolute ceiling ended a hook-time
+  hold that had been extended by speech or noise), `carry_merged`, `carry_orphaned` (the backstop spoke),
+  `carry_unmerged_at_close`, `audio_hold` (`duration_sec`),
+  `audio_hold_cap_reached` (`schema` = `pending`: the cap ended the hold;
+  `after_final`: the absolute ceiling cut a commit grace short),
+  `audio_hold_ceiling_reached` (same `schema` values: the ceiling ended a hold
+  that speech or noise had extended; frequent hits mean a noisy line),
+  `audio_hold_skipped` (`schema` = `non_interruptible`: a line nothing can cancel
+  was spoken without a hold).
+- `phone_endpointing_phase`: `open` | `short` (`duration_sec` = the minimum
+  applied, `phase`), `apply_failed`, `screening_max` (`duration_sec` = the max
+  applied when screening starts), `screening_max_failed` (screening stayed on
+  the gate max of 1.0 s).
+- The SDK warning "late stt final"; the headline latency (alarm: median
+  candidate-stop to bot-audio above 3.2 s); the nightly talk-over rate (target 0).
 
 `PHONE_TTS_PACE` is deliberately NOT set anywhere. The reader exists
 (`phone_tts_pace()`, default `1.0`) so it can be applied as a secret, but the

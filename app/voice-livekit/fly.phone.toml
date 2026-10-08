@@ -192,7 +192,7 @@ kill_timeout = 300
   # one-word backchannel ("Yeah", "please continue") fired a full turn-end and
   # barged in on the bot mid-sentence, forcing regenerate storms: measured ~60s
   # of zero outbound audio and a 3.49s median acoustic latency (vs ~1.2s on the
-  # local path). "local" restores the Silero endpointing floor (0.3/1.0 below)
+  # local path). "local" restores the Silero endpointing floor (0.3/2.0 below)
   # that debounces those backchannels. The code path is agent.py ~1928: only
   # "stt" injects turn_detection="stt"; any other value (incl. "local") keeps the
   # local endpointer. ENV-REVERTIBLE without a code change.
@@ -223,28 +223,54 @@ kill_timeout = 300
   # speech only in the cases where the EOU judges the utterance INCOMPLETE;
   # a complete answer still commits at MIN (0.3) regardless of MAX, so the
   # common case is unchanged either way. Owner's call, made against live calls.
+  #
+  # M014 2026-10-08 (OWNER): MAX 1.0 -> 2.0, plus a per-phase MIN and a
+  # pending-final hold. Evidence: 29 of 85 post-opening bot lines were cut in the
+  # 2026-10-08 calls. Sarvam (finals-only) delivers a final 0.9-1.0 s after
+  # speech ends, so with 0.3/1.0 the FINAL's arrival, not the endpointer, was
+  # what committed a turn, and a ready reply needed only min/2 = 0.15 s of quiet
+  # to start (a paused one resumes ~0.25 s after VAD end-of-speech): the bot
+  # talked into breath gaps. MAX only bounds the wait on a turn the EOU scores
+  # incomplete (a bare "yes" included), so the owner accepts up to +1.0 s there
+  # IN THE SCREENING PHASE ONLY: the session starts on the gate max
+  # (min(this, 1.0), phone_gate_endpointing_max_delay) so the identity / pickup /
+  # consent turns commit as before, and the screening phase raises it to this
+  # value. The consent turn keeps its own 0.5 s max (phone_consent_endpointing_max_delay).
+  # ROLLBACK: edit this file and deploy; or, in an emergency,
+  #   fly secrets set PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC=1.0 -a project-hello-phone-voice
+  # and UNSET the secret afterwards (a secret shadows this line).
   PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC = "0.3"
-  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "1.0"
+  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "2.0"
+  # M014: the MIN used while the bot waits for an OPEN answer (what / how / tell
+  # me ... , Q&A, resume conflict, patience). Yes/no screening questions, name
+  # confirm, callback and every terminal phase keep the 0.3 above. Clamp [0.3, 1.2]
+  # and never above the MAX. ROLLBACK: "0.3" makes the per-phase minimum a no-op.
+  PHONE_OPEN_ANSWER_MIN_DELAY_SEC = "0.8"
+  # M014: longest the reply is held (hook time, then again before its first audio)
+  # while the VAD heard candidate speech no STT final has covered yet. Only ever
+  # entered while such speech is pending, so a turn with none pays nothing.
+  # Clamp [0, 3.0]. ROLLBACK / KILL SWITCH: "0" disables the hold entirely.
+  PHONE_PENDING_FINAL_HOLD_MAX_SEC = "2.0"
 
-  # ═══ DEPLOY NOTE — FOUR SECRETS MUST BE UNSET, AND ONLY AFTER THE DEPLOY ═══
-  # These four values were tuned live, as Fly SECRETS, so they could be changed
-  # without a deploy while listening to a call:
+  # ═══ DEPLOY NOTE — A FLY SECRET SHADOWS THE `[env]` VALUE OF THE SAME NAME ═══
+  # VERIFIED 2026-10-08 (M014): `fly secrets list -a project-hello-phone-voice`
+  # shows NONE of these names as a secret, so this `[env]` block is live
+  # configuration, not documentation (the deployed `fly config show` `[env]` and
+  # this file had zero differences):
   #
-  #   PHONE_SARVAM_NEGATIVE_SPEECH_THRESHOLD   0.55
-  #   PHONE_SARVAM_NEGATIVE_FRAMES_COUNT       22
-  #   PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW      28
-  #   PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC   1.0
+  #   PHONE_SARVAM_NEGATIVE_SPEECH_THRESHOLD  PHONE_SARVAM_NEGATIVE_FRAMES_COUNT
+  #   PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW     PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC
+  #   PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC  PHONE_OPEN_ANSWER_MIN_DELAY_SEC
+  #   PHONE_PENDING_FINAL_HOLD_MAX_SEC
   #
-  # A secret SHADOWS the `[env]` value of the same name, so until they are
-  # unset THIS FILE IS DOCUMENTATION, NOT CONFIGURATION — which is exactly the
-  # state that made the manifest lie about the endpointing max and about
-  # PHONE_TTS_FLUSH_MIN_CHARS before it.
-  #
-  # ORDER MATTERS, and getting it backwards silently reverts the tuning:
-  #   1. deploy this file (the `[env]` values land but stay shadowed);
-  #   2. THEN `fly secrets unset <name> -a project-hello-phone-voice` for each.
-  # Unsetting FIRST drops production back to the previous `[env]` numbers
-  # (0.45-unset / 18 / 24 / 2.5) until the deploy completes.
+  # The general rule stands: a secret of the same name SHADOWS the `[env]` value,
+  # which is exactly how this manifest once lied about the endpointing max and
+  # about PHONE_TTS_FLUSH_MIN_CHARS. Do NOT create a secret for any name above;
+  # change this file and deploy. If a secret is set for an emergency rollback,
+  # unset it AFTER the deploy that makes this file true again (unsetting first
+  # drops production back to the previous `[env]` numbers).
+  # (PHONE_OBJECTIVE_PREEMPTIVE and PHONE_TURN_MODE ARE currently shadowed by
+  # secrets whose values are not readable here; out of scope for M014.)
   # ═════════════════════════════════════════════════════════════════════════
   # ── Coverage JUDGE provider (Call G, 2026-09-08) ─────────────────────────────
   # Point the off-speech-path coverage judge at DeepSeek V4-Flash with reasoning

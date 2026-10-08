@@ -247,6 +247,8 @@
         "PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC": { "requiredInProduction": false, "secret": false },
+        "PHONE_OPEN_ANSWER_MIN_DELAY_SEC": { "requiredInProduction": false, "secret": false },
+        "PHONE_PENDING_FINAL_HOLD_MAX_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_ROLE_OPENING_PRERENDER": { "requiredInProduction": false, "secret": false },
         "PHONE_TTS_FLUSH_MIN_CHARS": { "requiredInProduction": false, "secret": false },
         "PHONE_TTS_PACE": { "requiredInProduction": false, "secret": false },

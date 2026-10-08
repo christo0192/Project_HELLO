@@ -807,6 +807,12 @@ function tools, the human/machine classifier, `run_phone_gate`'s ordering, and
 the callback-scheduling tool. The canary drives a **bare `Agent`** with fixed
 instructions. It exercises the provider *pipeline*, not the screening *agent*.
 
+**M014 screening endpointing is also outside what the canary evidences.** The
+canary builds the shared provider session, which starts on the gate-era
+endpointing max (1.0 s), and never arms the screening phase: the screening max
+(2.0 s), the per-phase minimum and the pending-final hold (`turn_hold.py`) only
+run in a real screening call. A green canary says nothing about that timing.
+
 **Canary-0 proves the state machine without a call; Canary-1 proves the call
 without the state machine.** Neither substitutes for the other, and the two
 together still do not prove the joined system — which only a supervised first

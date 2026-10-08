@@ -31,6 +31,7 @@ import phone
 import phone_canary
 import recording
 import recording_api
+import turn_hold
 import worker_ready_api
 from closing import ClosingState, ClosingStateMachine
 from observability import (
@@ -1586,18 +1587,25 @@ def _log_gate_turn_skip(
     )
 
 
+# M014 (owner): the screening max rose to 2.0 s, but the identity/consent gate
+# keeps the timing it had at the old 1.0 s max. Above this ceiling a turn the
+# SDK commits late is closed by silence first and its commit is logged
+# `commit_duplicate` (the gate's existing late-commit path).
+GATE_SETTLE_MAX_CEILING_SEC = phone.PHONE_GATE_ENDPOINTING_MAX_CEILING_SEC
+
+
 def _gate_turn_settle_ms() -> int:
     """How long a group of finals the SDK never committed waits before closing.
 
     The endpointing ceiling (the longest the SDK itself waits to commit a turn
-    on this lane) plus a margin, so a turn the SDK does commit is always
-    closed by that commit first. The consent turn tightens the SDK's ceiling
-    below this, which only widens the margin.
+    on this lane), capped at `GATE_SETTLE_MAX_CEILING_SEC`, plus a margin. Up
+    to that cap a turn the SDK does commit is closed by that commit first. The
+    consent turn tightens the SDK's ceiling below this, which only widens the
+    margin.
     """
-    return (
-        int(round(phone.phone_static_endpointing_max_delay() * 1000))
-        + gate_judge.GATE_SETTLE_MARGIN_MS
-    )
+    ceiling = min(
+        phone.phone_static_endpointing_max_delay(), GATE_SETTLE_MAX_CEILING_SEC)
+    return int(round(ceiling * 1000)) + gate_judge.GATE_SETTLE_MARGIN_MS
 
 
 def _gate_capture_log(**fields: Any) -> None:
@@ -5854,6 +5862,10 @@ def _build_provider_session(
         elif phone.phone_dynamic_endpointing_enabled():
             # Opt-in phone-only adaptation, hard-bounded to the fixed safety
             # envelope. Fixed endpointing remains the default/rollback path.
+            # M014: the gate keeps the old 1.0 s ceiling here too; the screening
+            # raise (`_set_screening_endpointing_max`) is local-mode only, so
+            # the opt-in dynamic lane stays on today's timing throughout.
+            endpoint_max = phone.phone_gate_endpointing_max_delay()
             session_options["turn_handling"] = {
                 "endpointing": {
                     "mode": "dynamic",
@@ -5870,6 +5882,10 @@ def _build_provider_session(
         else:
             # Local Silero VAD + LiveKit v1-mini EOU, with a bounded tail.
             session_options["min_endpointing_delay"] = endpoint_min
+            # M014: the identity / pickup / consent gate keeps its old (1.0 s)
+            # SDK commit timing; `_set_screening_endpointing_max` raises this to
+            # the screening max when the screening phase is armed.
+            endpoint_max = phone.phone_gate_endpointing_max_delay()
             session_options["max_endpointing_delay"] = endpoint_max
             # Deprecated dialect, to match the endpointing kwargs above. Mixing
             # dialects is what silently drops one set or the other.
@@ -10928,7 +10944,9 @@ async def _run_native_phone_screening(
     # running (the candidate audibly noticed on the first DeepSeek call).
     last_fallback_text: dict[str, Any] = {"text": None, "repeats": 0}
 
-    async def on_reply_expected(*, rearm_only: bool = False) -> None:
+    async def on_reply_expected(
+        *, rearm_only: bool = False, hold: bool = False,
+    ) -> None:
         """Arm one generation-correlated first-audio watchdog.
 
         LiveKit 1.6.4 exposes cancellation on the SpeechHandle itself.  A
@@ -10949,7 +10967,26 @@ async def _run_native_phone_screening(
         the deadline clock and the fallback snapshot are refreshed. A `no_first_
         audio` fallback fired mid-answer on the live call because the deadline
         kept counting through the pause; this stops that spurious fire.
+
+        M014 S02: `hold=True` (with `rearm_only`) is the pending-final hold
+        asking for the same restart while it keeps a line silent. It is a no-op
+        when the restart could only do harm: the generation already has its
+        first audio (nothing to guard), came back empty, or already claimed its
+        fallback. Without that, a held fallback / silence-prompt `say()` line
+        would restart the watchdog, which force-interrupts that very line and
+        speaks another fallback, once per Sarvam TTS call, until the candidate
+        speaks.
         """
+        if (
+            rearm_only
+            and hold
+            and (
+                speech_first_audio.is_set()
+                or generation_empty.is_set()
+                or fallback_generation[0] == expected_reply_generation[0]
+            )
+        ):
+            return
         previous = speech_watchdog_task[0]
         if previous is not None and not previous.done():
             previous.cancel()
@@ -11485,6 +11522,35 @@ async def _run_native_phone_screening(
         generation_empty.set()
 
     setattr(agent, "_on_generation_empty", on_generation_empty)
+
+    # M014 S02 (turn_hold seams; the hold object lives in `_run_phone_session`,
+    # the watchdog state lives here).
+    def turn_hold_suspend() -> None:
+        """The hook yielded a turn to a late final: stand the watchdog down.
+
+        The previous reply's watchdog would otherwise count down through the
+        candidate's resumed speech and speak a stale fallback into the gap after
+        they stop, just before the late commit cuts it (whose first audio would
+        also move the question anchor past the merged answer). The successor
+        turn's coordinator arms the next watchdog; the orphan backstop covers a
+        successor that never comes. A watchdog already speaking its fallback is
+        left alone.
+        """
+        if fallback_generation[0] == expected_reply_generation[0]:
+            return
+        task = speech_watchdog_task[0]
+        if task is not None and not task.done():
+            task.cancel()
+
+    def turn_hold_reset() -> None:
+        """Mirror the coordinator's per-turn reset of the empty-generation latch
+        for the orphan backstop, so its watchdog does not fire at once with the
+        previous (never-run) generation's stale `generation_empty`."""
+        generation_empty.clear()
+        generation_empty_reason[0] = None
+
+    setattr(agent, "_on_turn_hold_suspend", turn_hold_suspend)
+    setattr(agent, "_on_turn_hold_reset", turn_hold_reset)
     setattr(agent, "_on_reply_delivered", on_reply_delivered)
     setattr(agent, "_on_probe", on_probe)
     setattr(agent, "_on_advance", on_advance)
@@ -11730,6 +11796,19 @@ async def _run_native_phone_screening(
             # delivered ask to prime the turn tracking with).
             _preloop_disconnect()
             question = None
+        else:
+            # M014 S02: Q1 is a say() line, so no generated reply noted its
+            # class; its answer (usually open-ended) gets the longer minimum
+            # endpointing delay from here. A no-op for a yes/no Q1, a build
+            # without the hold, and the rollback value.
+            _q1_hold = getattr(agent, "_turn_hold", None)
+            if _q1_hold is not None:
+                try:
+                    _q1_hold.note_spoken_question(
+                        phase="screening", objective=q1_text,
+                    )
+                except Exception:  # noqa: BLE001 — never breaks the pre-loop
+                    pass
         # F0a — PRIME THE NATIVE TURN TRACKING AT THE GATE HANDOFF.
         # The first planned question is delivered HERE, at the consent→screening
         # handoff, through `generate_reply`/`say`. The native turn hook
@@ -12739,6 +12818,131 @@ async def _run_phone_session(
     candidate_speaking: dict[str, bool] = {"value": False}
     candidate_speech_ended = asyncio.Event()
 
+    # ── M014 S02: PENDING-FINAL HOLD + PER-PHASE MINIMUM ENDPOINTING ──────
+    # `hold_tracker` pairs the VAD's speech segments with the STT finals and is
+    # fed from the handlers below (never from its own `session.on`: the test
+    # sessions keep one handler per event). Inert until the screening phase is
+    # armed (`assessment_persist_active`, True only right before the native
+    # coordinator starts), so identity and consent turns are never held, merged
+    # or re-timed. See `turn_hold`.
+    async def _turn_hold_orphan_backstop() -> None:
+        """A yielded turn's successor never reached the hook: speak.
+
+        No turn reached the coordinator, so mirror its per-turn reset of the
+        first-audio latches, then arm the existing first-audio watchdog (it
+        speaks the current deterministic fallback, deferring while the
+        candidate speaks).
+        """
+        if close_event.is_set():
+            return
+        expected = getattr(agent, "_on_reply_expected", None)
+        if not callable(expected):
+            return
+        reply_started.clear()
+        speech_first_audio.clear()
+        reset = getattr(agent, "_on_turn_hold_reset", None)
+        if callable(reset):
+            reset()
+        value = expected()
+        if inspect.isawaitable(value):
+            await value
+
+    def _turn_hold_suspend() -> None:
+        """The hook yielded: the previous reply's watchdog stands down (it would
+        speak a stale fallback into the candidate's end-of-speech gap)."""
+        suspend = getattr(agent, "_on_turn_hold_suspend", None)
+        if callable(suspend):
+            suspend()
+
+    async def _turn_hold_rearm() -> None:
+        """Restart the first-audio watchdog's deadline for the reply in flight.
+
+        Used when a hold begins: the previous reply's watchdog is still
+        counting, and its fallback must not be spoken over the candidate while
+        we wait for their words. `rearm_only` keeps the generation and handle.
+        """
+        expected = getattr(agent, "_on_reply_expected", None)
+        if callable(expected):
+            value = expected(rearm_only=True, hold=True)
+            if inspect.isawaitable(value):
+                await value
+
+    hold_tracker = turn_hold.PendingFinalTracker(
+        active=lambda: bool(assessment_persist_active[0]),
+    )
+    turn_hold_state = turn_hold.TurnHold(
+        hold_tracker,
+        hold_max_sec=phone.phone_pending_final_hold_max_sec,
+        log=_log.info,
+        endpoint_max_sec=phone.phone_static_endpointing_max_delay,
+        open_min_sec=phone.phone_open_answer_min_delay,
+        short_min_sec=phone.phone_static_endpointing_min_delay,
+        on_orphan=_turn_hold_orphan_backstop,
+        rearm=_turn_hold_rearm,
+        suspend=_turn_hold_suspend,
+        min_words=phone.phone_min_interruption_words,
+    )
+
+    def _feed_hold_from_vad(event: Any, event_type: Any) -> None:
+        """M014 S02: feed the pending-final tracker the VAD boundaries, timed
+        with the SDK's own formulas (audio_recognition.py): start = now -
+        speech - inference; end = now - silence - inference. Never raises."""
+        try:
+            if event_type == "start_of_speech":
+                hold_tracker.on_speech_start(
+                    time.time()
+                    - float(getattr(event, "speech_duration", 0.0) or 0.0)
+                    - float(getattr(event, "inference_duration", 0.0) or 0.0)
+                )
+            elif event_type == "end_of_speech":
+                hold_tracker.on_speech_end(
+                    time.time()
+                    - float(getattr(event, "silence_duration", 0.0) or 0.0)
+                    - float(getattr(event, "inference_duration", 0.0) or 0.0)
+                )
+        except Exception:  # noqa: BLE001 — never breaks the VAD hook
+            pass
+
+    def _hold_event_wall(event: Any) -> float:
+        """Wall time of a session event: its own `created_at` when sane."""
+        now = time.time()
+        created = getattr(event, "created_at", None)
+        if (
+            isinstance(created, (int, float))
+            and not isinstance(created, bool)
+            and math.isfinite(float(created))
+            and 0.0 <= now - float(created) <= 5.0
+        ):
+            return float(created)
+        return now
+
+    def _set_phase_min_delay(min_delay: float) -> None:
+        """Live MIN-endpointing override for the answer the bot now waits for.
+
+        Sibling of `_set_consent_endpointing_max`: the supported
+        `AgentSession.update_options` seam (livekit-agents 1.6.4), merged per
+        key so it never clobbers the consent max. `TurnHold` swallows and logs a
+        failure; a session without `update_options` is a quiet no-op.
+        """
+        upd = getattr(session, "update_options", None)
+        if not callable(upd):
+            return
+        upd(endpointing_opts={"min_delay": float(min_delay)})
+
+    # Fixed-local endpointing only (the same predicate as the consent setter):
+    # min_endpointing_delay governs the commit there. Excluded in dynamic mode
+    # (a different, untested envelope) and in stt mode (the provider owns the
+    # end of utterance).
+    _phase_min_apply = (
+        _set_phase_min_delay
+        if phone.phone_turn_detection() == phone.PHONE_TURN_DETECTION_LOCAL
+        and not phone.phone_dynamic_endpointing_enabled()
+        else None
+    )
+    # The first planned question is a say() line (no generated-reply
+    # `speech_created` notes its class): the pre-loop applies it once heard.
+    turn_hold_state.set_phase_apply(_phase_min_apply)
+
     # ── M013 S01: THE GATE'S OWN RECORD OF WHAT THE CANDIDATE SAID ─────────
     # Every VAD segment and every STT final, paired FIFO, closed into turns
     # (on commit, or by silence for a turn the SDK dropped while a gate line
@@ -12769,6 +12973,7 @@ async def _run_phone_session(
             gate_capture.on_vad_event(event, time.time())
         except Exception:  # noqa: BLE001 — the gate record never breaks the VAD hook
             pass
+        _feed_hold_from_vad(event, event_type)  # M014 S02
         if event_type == "start_of_speech":
             candidate_speaking["value"] = True
             return
@@ -12832,6 +13037,19 @@ async def _run_phone_session(
         speech_sequence[0] += 1
         created_seq = speech_sequence[0]
         reply_handle[0] = getattr(event, "speech_handle", None)
+        # M014 S02: apply the minimum endpointing delay for the answer this reply
+        # waits for (open question: longer; yes/no and terminal phases: the static
+        # minimum). Screening phase only, once per class change, never raises.
+        try:
+            if hold_tracker.active():
+                turn_hold_state.on_speech_created(
+                    source=getattr(event, "source", None),
+                    phase=getattr(agent, "_generation_phase", None),
+                    objective=getattr(agent, "_generation_objective", None),
+                    apply_min=_phase_min_apply,
+                )
+        except Exception:  # noqa: BLE001 — never breaks the speech lifecycle
+            pass
         # PR-2 change 2: reply generation is starting (t_invoke). If a candidate
         # turn stamped t_EOU, emit the endpoint delay and CONSUME the stamp so a
         # later reply on the same session cannot re-fire against a stale EOU.
@@ -12912,6 +13130,17 @@ async def _run_phone_session(
             candidate_speaking["value"] = False
             candidate_speaking["ended_mono"] = _monotonic()
             candidate_speech_ended.set()
+        # M014 S02: fallback feed for the pending-final tracker when the VAD
+        # stream is unavailable. Idempotent with the VAD feed: a second start
+        # for the same segment keeps the earlier time, an end with no open
+        # segment only refines the one that just closed.
+        try:
+            if new_state == "speaking":
+                hold_tracker.on_speech_start(_hold_event_wall(event))
+            elif old_state == "speaking" and new_state in {"listening", "idle"}:
+                hold_tracker.on_speech_end(_hold_event_wall(event))
+        except Exception:  # noqa: BLE001 — never breaks the user-state hook
+            pass
         if old_state == "speaking" and new_state in {"listening", "idle"}:
             # Explicit VAD observation is the authoritative local boundary. The
             # state transition remains a compatibility fallback for STT mode or
@@ -13005,6 +13234,13 @@ async def _run_phone_session(
             if bool(getattr(event, "is_final", False)):
                 final_wall = time.time()
                 latency_state["final_transcript_wall"] = final_wall
+                # M014 S02: this final now covers the VAD speech heard before it.
+                try:
+                    hold_tracker.on_final(
+                        final_wall, str(getattr(event, "transcript", "") or ""),
+                    )
+                except Exception:  # noqa: BLE001 — never breaks the transcript hook
+                    pass
                 _log.info(
                     "unknown_event", error_type="voice_phone_boundary",
                     error_category="stt_final_arrived",
@@ -13027,11 +13263,22 @@ async def _run_phone_session(
                     qna_close_window.on_final(str(getattr(event, "transcript", "") or ""))
                 except Exception:  # noqa: BLE001 — never breaks the transcript hook
                     pass
+        # An EMPTY final never reaches this handler (livekit-agents 1.6.4 drops
+        # it before `user_input_transcribed`), so a wordless VAD segment is
+        # released by the tracker's own expiry, not by an event here.
 
     @session.on("agent_state_changed")
     def _on_phone_agent_state_changed(event):  # noqa: ANN001
         new_state = getattr(event, "new_state", None)
         if new_state == "speaking":
+            # M014 S02: a generated reply is PLAYING now (not merely its first
+            # TTS frame synthesized): apply the minimum endpointing delay noted
+            # for the question it asks. Never raises.
+            try:
+                if hold_tracker.active():
+                    turn_hold_state.first_audio_released()
+            except Exception:  # noqa: BLE001 — never breaks the state hook
+                pass
             first_audio_mono = _monotonic()
             first_audio_wall = time.time()
             latest_assistant_anchor[0] = int(round(first_audio_wall * 1000))
@@ -13219,6 +13466,12 @@ async def _run_phone_session(
             "unknown_event", error_type="phone_session_closed",
             error_category=bounded,
         )
+        # M014 S02: log a yielded turn whose successor never arrived and stop
+        # its backstop watch (content-free).
+        try:
+            turn_hold_state.on_close()
+        except Exception:  # noqa: BLE001 — never breaks the close handler
+            pass
         close_event.set()
 
     # FIX 4 (2026-09-06): OUTBOUND-path diagnostics. The live call lost audio TO
@@ -13381,6 +13634,17 @@ async def _run_phone_session(
         native_turns=True,
         turn_mode=turn_mode,
     )
+    # M014 S02: the agent's hook-time and first-audio seams (phone.py) find the
+    # hold through this attribute; the first-audio re-arm resolves the
+    # coordinator's `_on_reply_expected` at call time. Guarded like the other
+    # best-effort attachments: a __slots__-ed Agent only loses the hold.
+    try:
+        setattr(agent, "_turn_hold", turn_hold_state)
+    except (AttributeError, TypeError):
+        _log.warn(
+            "unknown_event", error_type="phone_turn_hold",
+            error_category="attach_failed",
+        )
 
     # ── PR2a FIX A2: DEEPSEEK PREFIX-CACHE WARM-UP ─────────────────────────
     # Fire ONE throwaway completion of the (large, static) system-prompt prefix
@@ -14111,6 +14375,37 @@ async def _run_phone_session(
         if not callable(upd):
             return
         upd(endpointing_opts={"max_delay": float(max_delay)})
+
+    def _set_screening_endpointing_max() -> None:
+        """Raise the SDK max-endpointing from the gate's to the screening value.
+
+        The session starts on `phone_gate_endpointing_max_delay` so the identity,
+        pickup and consent turns commit as before; the screening Q&A, where a
+        candidate pauses mid-answer, gets `phone_static_endpointing_max_delay`.
+        Same fixed-local predicate and `update_options` seam as the consent
+        setter; a failure leaves screening on the gate max (never a crash).
+        """
+        screening_max = phone.phone_static_endpointing_max_delay()
+        if screening_max <= phone.phone_gate_endpointing_max_delay():
+            return
+        upd = getattr(session, "update_options", None)
+        if (
+            not callable(upd)
+            or phone.phone_turn_detection() != phone.PHONE_TURN_DETECTION_LOCAL
+            or phone.phone_dynamic_endpointing_enabled()
+        ):
+            return
+        try:
+            upd(endpointing_opts={"max_delay": float(screening_max)})
+            _log.info(
+                "unknown_event", error_type="phone_endpointing_phase",
+                error_category="screening_max", duration_sec=screening_max,
+            )
+        except Exception:  # noqa: BLE001 — screening stays on the gate max
+            _log.warn(
+                "unknown_event", error_type="phone_endpointing_phase",
+                error_category="screening_max_failed",
+            )
 
     # Fix 2: pre-render the FIXED role line during the consent wait. Enabled only
     # in deterministic-opener mode with a known role (the fixed line is then what
@@ -15586,6 +15881,8 @@ async def _run_phone_session(
             # line is ever flagged as the gate.
             assessment_persist_active[0] = True
             gate_persist_active[0] = False
+            # M014: screening gets the longer SDK max; the gate had the old one.
+            _set_screening_endpointing_max()
 
             _persist_kept_candidate_text = _make_kept_text_persister(
                 assessment_persist_active, item_seq, _spawn_item_persist,
