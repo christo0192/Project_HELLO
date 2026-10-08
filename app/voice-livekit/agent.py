@@ -2802,6 +2802,12 @@ PHONE_CONTINUATION_ASK_INSTRUCTION = (
     "added in a few words, then ask this question in your own natural words "
     "and wait: "
 )
+PHONE_CONTINUATION_PRESENCE_INSTRUCTION = (
+    "You started speaking before the candidate had finished and they only "
+    "checked that you are there. Do not apologise, do not mention the line or "
+    "the audio. Confirm in a few words that you are here, then ask this "
+    "question in your own natural words and wait: "
+)
 PHONE_CONTINUATION_CONTROL = (
     "Acknowledge what the candidate added, then ask the authorized question "
     "once. Do not re-ask a previous question and do not close."
@@ -2850,6 +2856,45 @@ def _played_text_of_cut_line(latest_assistant_text: Any) -> str | None:
     return None
 
 
+# Phrases that open the part of a bot line the candidate can answer (a
+# question, a request, or a topic announcement). Matched on lower-cased words,
+# punctuation stripped, so how the sentences are punctuated never matters.
+_CUT_QUESTION_PHRASES: tuple[tuple[str, ...], ...] = (
+    ("could", "you"), ("can", "you"), ("would", "you"), ("will", "you"),
+    ("do", "you"), ("did", "you"), ("are", "you"), ("have", "you"),
+    ("were", "you"), ("tell", "me"), ("walk", "me", "through"),
+    ("talk", "me", "through"), ("share", "with", "me"), ("describe",),
+    ("explain",), ("let's", "talk"), ("let's", "discuss"), ("let's", "move"),
+    ("let's", "go"), ("moving", "on"), ("next", "question"),
+    ("let", "me", "ask"), ("can", "i", "ask"), ("may", "i", "ask"),
+    ("i'd", "like", "to", "ask"), ("i'd", "like", "to", "know"),
+    ("i'd", "like", "to", "hear"), ("i'd", "like", "to", "understand"),
+    ("i", "want", "to", "ask"), ("i", "want", "to", "know"),
+)
+# Question words count only where a question starts (sentence start, after a
+# comma, or after a lead-in), so "that's what I expected" stays a reaction.
+_CUT_WH_WORDS = frozenset({"what", "how", "why", "which", "who", "whom", "when", "where"})
+_CUT_LEAD_INS = frozenset({
+    "and", "so", "then", "now", "but", "also", "okay", "ok", "well", "right",
+    "next", "alright",
+})
+
+
+def _cut_line_question_offset(sentence: str) -> int | None:
+    """Word offset in `sentence` where its answerable part starts, else None."""
+    raw = sentence.split()
+    words = [re.sub(r"[^\w']", "", w.replace("’", "'")).lower() for w in raw]
+    for i in range(len(words)):
+        for phrase in _CUT_QUESTION_PHRASES:
+            if tuple(words[i:i + len(phrase)]) == phrase:
+                return i
+        if words[i] in _CUT_WH_WORDS and (
+            i == 0 or words[i - 1] in _CUT_LEAD_INS or raw[i - 1].endswith(",")
+        ):
+            return i
+    return None
+
+
 def _classify_cut_line(
     *, first_audio: bool, authored: str | None, played: str | None,
 ) -> str:
@@ -2859,9 +2904,16 @@ def _classify_cut_line(
     thing ``CUT_NOTHING_PLAYED`` rests on. Otherwise the authored text (what
     the bot meant to say) is compared with the played text by WORD COUNT, so
     punctuation differences between the two never matter: the line had reached
-    its question when at least two words of the first question sentence played.
-    A line with no ``?`` is read as a bridge followed by a question statement
-    (the second sentence); a single sentence without ``?`` is reaction-only.
+    its question when at least two words of its answerable part played.
+
+    The answerable part is found by its wording, not by the first "?": the
+    first sentence (or comma clause) that opens with a question/request/topic
+    phrase ("could you", "tell me", "what", "let's talk about" ...). A short
+    reaction that happens to end in "?" ("Oh, really?") is not the question.
+    Only when no such phrase exists does the first "?" sentence of four or
+    more words stand in for it. A line with no recognisable question is
+    ``CUT_UNKNOWN``, so it takes today's bounded interrupted-recovery path
+    instead of being guessed to be a bridge.
     """
     if not first_audio:
         return CUT_NOTHING_PLAYED
@@ -2870,13 +2922,24 @@ def _classify_cut_line(
     sentences = [
         s for s in _CUT_SENTENCE_SPLIT_RE.split(authored.strip()) if s.strip()
     ]
-    question_idx = next((i for i, s in enumerate(sentences) if "?" in s), None)
-    if question_idx is None:
-        if len(sentences) < 2:
-            return CUT_BRIDGE_ONLY
-        question_idx = 1
-    words_before_question = sum(len(s.split()) for s in sentences[:question_idx])
-    if len(played.split()) >= words_before_question + 2:
+    words_before = 0
+    question_at: int | None = None
+    for sentence in sentences:
+        offset = _cut_line_question_offset(sentence)
+        if offset is not None:
+            question_at = words_before + offset
+            break
+        words_before += len(sentence.split())
+    if question_at is None:
+        words_before = 0
+        for sentence in sentences:
+            if "?" in sentence and len(sentence.split()) >= 4:
+                question_at = words_before
+                break
+            words_before += len(sentence.split())
+    if question_at is None:
+        return CUT_UNKNOWN
+    if len(played.split()) >= question_at + 2:
         return CUT_QUESTION_REACHED
     return CUT_BRIDGE_ONLY
 
@@ -6695,10 +6758,19 @@ async def _run_native_phone_screening(
         # "Are you still there?" over the candidate. Before ANY of the five
         # silence actions it now checks the live VAD speaking state.
         suppress_since: dict[str, float | None] = {"value": None}
+        # Set once a speaking latch has been declared stuck: that SAME latch
+        # (no end-of-speech seen since) stays ignored for the rest of the
+        # ladder, so the prompt, second nudge and goodbye still run in turn.
+        stale_latch: dict[str, Any] = {"active": False, "ended": None}
 
         def _silence_blocked_by_speech(step: str) -> bool:
             speaking = bool(candidate_speaking.get("value"))
             ended = candidate_speaking.get("ended_mono")
+            if stale_latch["active"]:
+                if speaking and ended == stale_latch["ended"]:
+                    return False
+                stale_latch["active"] = False
+                suppress_since["value"] = None
             recent = (
                 isinstance(ended, (int, float))
                 and _monotonic() - float(ended) < PHONE_SILENCE_SPEECH_GRACE_SEC
@@ -6717,6 +6789,7 @@ async def _run_native_phone_screening(
                     error_category="speaking_latch_stale", phase=step,
                 )
                 suppress_since["value"] = None
+                stale_latch.update(active=True, ended=ended)
                 return False
             _log.info(
                 "unknown_event", error_type="phone_silence",
@@ -7946,6 +8019,13 @@ async def _run_native_phone_screening(
             return target
         return None
 
+    def _restamp_owed_ask(target: dict[str, Any]) -> None:
+        """The reply about to be created (the owed-question ask) belongs to the
+        same previous answer, so a candidate who cuts THAT line too is routed
+        the same way instead of being credited to a question they never heard.
+        Bounded by PHONE_CONTINUATION_ASK_CAP / the interrupted re-ask cap."""
+        advance_reply.update(seq=speech_sequence[0] + 1, exchange=target)
+
     def _owed_question_after(target: dict[str, Any]) -> Any:
         """The question owed once `target`'s exchange has been committed."""
         expected = target.get("expected_index")
@@ -7984,12 +8064,14 @@ async def _run_native_phone_screening(
             target["revision"] = int(target.get("revision") or 1) + 1
         return "merged_uncommitted"
 
-    async def _await_exchange_commit(target: dict[str, Any]) -> None:
+    async def _await_exchange_commit(target: dict[str, Any]) -> bool:
         """Bounded wait for `target`'s in-flight commit to move the cursor.
 
         The question owed next is only known once that commit has landed. It
         never waits on the shadow judge that runs after the commit (only until
-        the cursor has moved), and never past the overlap bound.
+        the cursor has moved), and never past the overlap bound. True: settled
+        (nothing in flight, or the cursor moved). False: the bound ran out with
+        the commit still in flight, so the cursor is stale.
         """
         expected = target.get("expected_index")
         deadline = _monotonic() + min(
@@ -7998,14 +8080,14 @@ async def _run_native_phone_screening(
         while True:
             inflight = [t for t in commit_tasks if not t.done()]
             if not inflight or (isinstance(expected, int) and cursor > expected):
-                return
+                return True
             remaining = deadline - _monotonic()
             if remaining <= 0:
                 _log.warn(
                     "unknown_event", error_type="phone_turn_overlap",
                     error_category="commit_wait_timeout",
                 )
-                return
+                return False
             await asyncio.wait(inflight, timeout=min(0.05, remaining))
 
     def _author_wind_down_after_overlap(turn_ctx: Any) -> None:
@@ -8048,7 +8130,7 @@ async def _run_native_phone_screening(
             )
             return False
         merged = _merge_into_previous_exchange(target, text)
-        await _await_exchange_commit(target)
+        settled = await _await_exchange_commit(target)
         _log.info(
             "unknown_event", error_type="phone_turn_overlap",
             error_category=merged, schema="continuation",
@@ -8057,7 +8139,11 @@ async def _run_native_phone_screening(
             # The words continue the previous LOGICAL answer.
             _uncount_continuation_fragment()
         prior_turn_interrupted["value"] = False
-        question = state.question_at(cursor)
+        # A commit still in flight leaves the cursor on the question the
+        # candidate just answered: ask the one owed AFTER it, never that one.
+        question = (
+            state.question_at(cursor) if settled else _owed_question_after(target)
+        )
         if question is None:
             _author_wind_down_after_overlap(turn_ctx)
             _log.info(
@@ -8072,8 +8158,14 @@ async def _run_native_phone_screening(
             question.spoken_text, control_text=PHONE_CONTINUATION_CONTROL,
         )
         add_turn_instruction(
-            turn_ctx, PHONE_CONTINUATION_ASK_INSTRUCTION + question.spoken_text,
+            turn_ctx,
+            (
+                PHONE_CONTINUATION_PRESENCE_INSTRUCTION
+                if merged == "not_merged_filler"
+                else PHONE_CONTINUATION_ASK_INSTRUCTION
+            ) + question.spoken_text,
         )
+        _restamp_owed_ask(target)
         _log.info(
             "unknown_event", error_type="phone_turn_overlap",
             error_category="continuation_ask", schema="continuation",
@@ -8096,7 +8188,7 @@ async def _run_native_phone_screening(
             )
             return False
         merged = _merge_into_previous_exchange(target, text)
-        await _await_exchange_commit(target)
+        settled = await _await_exchange_commit(target)
         _log.info(
             "unknown_event", error_type="phone_turn_overlap",
             error_category=merged, schema="overlap_reask",
@@ -8104,7 +8196,9 @@ async def _run_native_phone_screening(
         if merged in {"merged_uncommitted", "merged_after_commit"}:
             _uncount_continuation_fragment()
         prior_turn_interrupted["value"] = False
-        question = state.question_at(cursor)
+        question = (
+            state.question_at(cursor) if settled else _owed_question_after(target)
+        )
         if question is None:
             _author_wind_down_after_overlap(turn_ctx)
             return True
@@ -8129,6 +8223,7 @@ async def _run_native_phone_screening(
         add_turn_instruction(
             turn_ctx, PHONE_OVERLAP_REASK_INSTRUCTION + question.spoken_text,
         )
+        _restamp_owed_ask(target)
         _log.info(
             "unknown_event", error_type="phone_turn_overlap",
             error_category=category, schema="overlap_reask",
