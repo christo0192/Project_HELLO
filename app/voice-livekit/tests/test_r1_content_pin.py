@@ -33,7 +33,10 @@ import r1_world
 # "answer exactly" stall rule in the reminder, filler and fallback rotations.
 # Revision 4 (R1-Q): disclosure layers (a hint per need, the deep need as facts plus stems) and
 # their reminder lines.
-PINNED_CONTENT_SHA256 = "98e2971016e4a1915757596a8c3c1a4b674a8e897809045d11a6b39800d41fe1"
+# Revision 5 (R1-Q): intent-voiced moves (a brief, must-say figures, delivery markers and three
+# scripted variants per owed move), Q-A and Q-B turned into curiosity topics, deadlines F2 450 and
+# F1 570, scripted redirect openers, PLAN_VERSION 2.
+PINNED_CONTENT_SHA256 = "7e33588d6a84b4adefacfbb699b4f69860b22da087f727cb52550c01e8eb0814"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -142,6 +145,73 @@ class PinTests(unittest.TestCase):
         self.assertIn(sample.hint("H1"), reminder)  # the first-probe line
         self.assertIn(sample.facts("H2")[0], reminder)  # the deep line carries facts ...
         self.assertNotIn(sample.deep("H2"), reminder)  # ... never the full deep text
+
+    def test_the_manifest_covers_the_r1_q_intent_voiced_moves(self):
+        manifest = r1_content.manifest()
+        self.assertGreaterEqual(manifest["revision"], 5)
+        scheduler = manifest["scheduler"]
+        self.assertEqual(scheduler["plan_version"], 2)
+        moves = {item["id"]: item for item in scheduler["moves"]}
+        self.assertNotIn("Q-A", moves)
+        self.assertNotIn("Q-B", moves)
+        for spec in r1_scheduler.PLAN:
+            entry = moves[spec.id]
+            self.assertEqual(entry["brief"], spec.brief)
+            self.assertEqual(entry["must_say"], list(spec.must_say))
+            self.assertEqual(entry["markers"], [list(group) for group in spec.markers])
+            self.assertEqual(entry["variants"], list(spec.variants))
+        self.assertEqual(scheduler["redirect_openers"], list(r1_scheduler.REDIRECT_OPENERS))
+        self.assertEqual(scheduler["redirect_brief"], r1_scheduler.REDIRECT_BRIEF)
+        self.assertEqual(
+            scheduler["curiosity_topics"], [list(item) for item in r1_scheduler.CURIOSITY_TOPICS]
+        )
+        self.assertEqual(scheduler["constants"]["idle_gap_turns"], r1_scheduler.IDLE_GAP_TURNS)
+        self.assertNotIn("q_a_opens_sec", scheduler["constants"])
+        self.assertNotIn("oh_wait", scheduler)
+        prompts = manifest["prompts"]
+        brief = r1_scheduler.SPEC_BY_ID[r1_scheduler.F1_ANCHOR].brief
+        self.assertIn(brief, prompts["intent_reminder_sample"])
+        self.assertIn('"$9,000", "$7,000"', prompts["intent_reminder_sample"])
+        self.assertIn("You are curious about", prompts["curiosity_reminder_sample"])
+        self.assertNotIn("ack_reminder_sample", prompts)
+        self.assertEqual(prompts["intent_price_note"], r1_prompts.INTENT_PRICE_NOTE)
+
+    def test_editing_a_brief_a_marker_a_variant_or_a_figure_changes_the_sha(self):
+        base = r1_content.content_sha256()
+        original = r1_scheduler.PLAN
+        spec = r1_scheduler.SPEC_BY_ID[r1_scheduler.F1_ANCHOR]
+        index = original.index(spec)
+        try:
+            for change in (
+                {"brief": spec.brief + " Really."},
+                {"must_say": spec.must_say + ("six months",)},
+                {"markers": spec.markers + ((r"\bfoo\b",),)},
+                {"variants": spec.variants[:-1] + ("Is that possible?",)},
+            ):
+                edited = dataclasses.replace(spec, **change)
+                r1_scheduler.PLAN = original[:index] + (edited,) + original[index + 1 :]
+                self.assertNotEqual(r1_content.content_sha256(), base, change)
+        finally:
+            r1_scheduler.PLAN = original
+        self.assertEqual(r1_content.content_sha256(), base)
+
+    def test_editing_the_redirect_openers_the_curiosity_topics_or_the_notes_changes_the_sha(self):
+        base = r1_content.content_sha256()
+        for module, name, value in (
+            (r1_scheduler, "REDIRECT_OPENERS", ("Hold on.",) * 3),
+            (r1_scheduler, "REDIRECT_BRIEF", "x"),
+            (r1_scheduler, "CURIOSITY_TOPICS", (("format", "x"),)),
+            (r1_scheduler, "IDLE_GAP_TURNS", 4),
+            (r1_prompts, "INTENT_PRICE_NOTE", "- Do not push on price."),
+            (r1_prompts, "FORCED_NOTE", "- Link it."),
+        ):
+            original = getattr(module, name)
+            try:
+                setattr(module, name, value)
+                self.assertNotEqual(r1_content.content_sha256(), base, name)
+            finally:
+                setattr(module, name, original)
+        self.assertEqual(r1_content.content_sha256(), base)
 
     def test_editing_a_hint_a_fact_or_a_stem_changes_the_sha(self):
         base = r1_content.content_sha256()

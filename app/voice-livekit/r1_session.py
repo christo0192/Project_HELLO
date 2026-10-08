@@ -34,9 +34,9 @@ the unmute, rejoin and attention paths restore it.  No candidate or model text c
 phase:
 
 * ``prepare_turn`` (from ``R1Agent.on_user_turn_completed``) runs the role-play engine ONCE per
-  SDK turn and fixes what the reply must be: suppressed, scripted, an acknowledgement then the
-  owed line verbatim, or a free reply.  Preemptive generation is off for this agent so no
-  generation can start before that decision.
+  SDK turn and fixes what the reply must be: suppressed, scripted, an owed move the model
+  voices (with a scripted variant as the fallback), or a free reply.  Preemptive generation is
+  off for this agent so no generation can start before that decision.
 * ``llm_node_stream`` (from ``R1Agent.llm_node``) builds the model's whole context from the
   interview's own history (``r1_replies.llm_messages``: the context filter, no tools) and passes
   its text through ``r1_guard`` sentence by sentence in EVERY phase, before the transcription
@@ -1560,8 +1560,8 @@ class R1Interview:
             ctx = self.engine.guard_context(reply.phase, mode="reply", turn=reply.candidate_index)
         guard = StreamGuard(ctx)
         messages = llm_messages(reply, self.persona, self._history)
-        if plan is not None and plan.mode is TurnMode.ACK_THEN_SAY:
-            source = self._ack_then_say(lambda: provider(messages), guard, reply)
+        if plan is not None and plan.mode is TurnMode.INTENT:
+            source = self._intent_reply(lambda: provider(messages), guard, reply)
         else:
             source = self._screened(lambda: provider(messages), guard, reply)
         return self.guard_llm_stream(source)
@@ -1637,16 +1637,21 @@ class R1Interview:
             self._record_generation_failure()
         return not self._exiting and self._stop_outcome() is None
 
-    async def _ack_then_say(
+    async def _intent_reply(
         self,
         factory: Callable[[], Any],
         guard: StreamGuard,
         reply: Reply,
     ) -> AsyncIterator[str]:
-        """A short guarded acknowledgement, then the owed line VERBATIM (plan 5.6 step 1).
+        """The model voices an owed move in context; a scripted variant is the fallback (R1-Q).
 
-        The acknowledgement is optional and bounded: if the model is slow or fails, the owed
-        line is still spoken, so a move is never lost to the provider.
+        One call, streamed through the guard sentence by sentence like any reply.  When the
+        stream ends the engine checks the move's markers on what was said
+        (``RolePlayEngine.intent_tail``); if they miss, a scripted variant that does not repeat
+        anything already said is appended, so an owed move is never lost to the provider.  A
+        slow, failed or off-topic model reply still raises the objection.  The cutoff
+        (``ACK_DEADLINE_SECONDS``) is the old acknowledgement's worst case: a reply that is not
+        complete by then is cut where it stands and the variant follows.
         """
         from r1_llm import assert_thinking_disabled
 
@@ -1655,7 +1660,7 @@ class R1Interview:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + ACK_DEADLINE_SECONDS
         reported_before = self._llm_errors_reported
-        spoke = False  # a sentence of the acknowledgement already reached the consumer
+        spoken: list[str] = []  # the sentences of the model's reply that reached the consumer
         iterator: Any = None
         try:
             stream = await _maybe_await(factory())
@@ -1676,12 +1681,12 @@ class R1Interview:
                 text = delta_text(item)
                 if text:
                     for sentence in guard.feed(text):
-                        spoke = True
+                        spoken.append(sentence)
                         yield sentence + " "
             for sentence in guard.flush():
-                spoke = True
+                spoken.append(sentence)
                 yield sentence + " "
-        except Exception as exc:  # noqa: BLE001 - the acknowledgement is optional
+        except Exception as exc:  # noqa: BLE001 - the scripted variant below is the fallback
             _log.warn(
                 "unknown_event",
                 error_type="r1_ack_failed",
@@ -1693,9 +1698,9 @@ class R1Interview:
             # guard, a broken factory.  The cutoff is not a failure at all (see the constant).
             if not isinstance(exc, AckCutoff) and self._llm_errors_reported == reported_before:
                 self._record_generation_failure()
-            if not spoke:
-                # The scripted line below is then the first chunk and not a model reply.  Once a
-                # sentence went out, the first chunk was the model's and has already been judged.
+            if not spoken:
+                # The scripted variant below is then the first chunk and not a model reply.  Once
+                # a sentence went out, the first chunk was the model's and has already been judged.
                 self._skip_failure_reset = True
         finally:
             self._after_guard(reply, guard)
@@ -1703,7 +1708,9 @@ class R1Interview:
             if callable(aclose):
                 with contextlib.suppress(Exception):
                     await aclose()
-        yield plan.scripted_text
+        tail = self.engine.intent_tail(plan, " ".join(spoken))
+        if tail:
+            yield tail
 
     def _after_guard(self, reply: Reply, guard: StreamGuard) -> None:
         """Count the guard's hits once per reply: ledger, trip record and an ``r1_guard_*`` log."""
@@ -2200,7 +2207,7 @@ class R1Interview:
         if str(getattr(error, "type", "")) == "llm_error" and not getattr(
             error, "recoverable", False
         ):
-            self._llm_errors_reported += 1  # see ``_ack_then_say``: one failure, one count
+            self._llm_errors_reported += 1  # see ``_intent_reply``: one failure, one count
         if self._provider_status(event) in (401, 402):
             self._provider_abort = True
             self._wake()

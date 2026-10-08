@@ -11,19 +11,18 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from r1_commitment import COMMITMENT_LINES, Level
-from r1_guard import ACK_WORD_CAP, REPLY_WORD_CAP
+from r1_guard import REPLY_WORD_CAP
 from r1_personas import ALL_PERSONA_NAMES, PERSONAS, resolve_persona
 from r1_prompts import (
     INTERVIEWER_NAME,
     WRAPUP_NOTE,
-    ack_reminder,
     assemble_messages,
     interviewer_prefix,
     learner_prefix,
     select_context,
     turn_reminder,
 )
-from r1_scheduler import PLAN
+from r1_scheduler import F1_ANCHOR, PLAN, SPEC_BY_ID
 
 P1 = resolve_persona("p1_career_switcher", variant="v1")
 RUBRIC_WORDS = (
@@ -282,32 +281,111 @@ class ReminderTests(unittest.TestCase):
             turn_reminder(P1, r_sec=10),
             turn_reminder(P1, r_sec=700, first_probe_topics=["H1", "H2"], unlocked_topics=["H3"],
                           monologue_sec=90),
-            ack_reminder(P1, r_sec=10),
-            ack_reminder(P1, r_sec=700, first_probe_topics=["H1"], monologue_sec=90),
+            turn_reminder(P1, r_sec=10, curiosity="what you would actually build"),
         ]
+        for spec in PLAN:
+            if spec.brief:
+                reminders.append(
+                    turn_reminder(
+                        P1,
+                        r_sec=300,
+                        intent_brief=spec.brief.replace("{decision_maker}", "husband"),
+                        must_say=spec.must_say,
+                        intent_forced=True,
+                        first_probe_topics=["H2"],
+                        price_wrap=True,
+                    )
+                )
         for text in reminders:
             for word in RUBRIC_WORDS:
                 self.assertNotRegex(text, rf"\b{re.escape(word)}\b", word)
             for spec in PLAN:
                 if spec.line:
                     self.assertNotIn(spec.line.format(decision_maker="husband"), text)
+                for variant in spec.variants:
+                    self.assertNotIn(variant.format(decision_maker="husband"), text)
 
     def test_the_monologue_token_appears_only_past_sixty_seconds(self):
         self.assertNotIn("CANDIDATE_MONOLOGUE", turn_reminder(P1, r_sec=1, monologue_sec=60))
         self.assertIn("CANDIDATE_MONOLOGUE=74", turn_reminder(P1, r_sec=1, monologue_sec=74.4))
-        self.assertIn("CANDIDATE_MONOLOGUE=74", ack_reminder(P1, r_sec=1, monologue_sec=74))
+        self.assertIn(
+            "CANDIDATE_MONOLOGUE=74",
+            turn_reminder(P1, r_sec=1, monologue_sec=74, intent_brief="x"),
+        )
         self.assertNotIn("CANDIDATE_MONOLOGUE", turn_reminder(P1, r_sec=1))
 
-    def test_the_ack_reminder_is_capped_fact_free_and_never_hands_over_the_owed_line(self):
-        text = ack_reminder(P1, r_sec=200, first_probe_topics=["H2"])
-        self.assertIn(f"at most {ACK_WORD_CAP} words", text)
-        self.assertIn("Do not ask a question", text)
-        self.assertIn("State no numbers", text)
-        self.assertIn("Never accept or propose a call", text)
-        self.assertIn("your next line will be added for you", text)
-        self.assertIn(P1.surface("H2"), text)
-        for topic in ("H1", "H2", "H3"):
-            self.assertNotIn(P1.deep(topic), text)
+    def test_an_intent_reminder_asks_for_a_reaction_then_the_brief_in_the_learners_own_words(self):
+        spec = SPEC_BY_ID[F1_ANCHOR]
+        text = turn_reminder(
+            P1, r_sec=300, intent_brief=spec.brief, must_say=spec.must_say
+        )
+        self.assertIn("first react to what the advisor just said", text)
+        self.assertIn("answer it briefly from your card or backstory", text)
+        self.assertIn("raise something of your own", text)
+        self.assertIn("in your own words, as a real person would, without reading it out", text)
+        self.assertIn(f'"{spec.brief}"', text)  # quoted: voicing it is never an instruction echo
+        self.assertIn('Write these figures exactly as shown: "$9,000", "$7,000".', text)
+        self.assertIn("two or three short sentences", text)
+        # The free-reply line (do not volunteer worries) would contradict a raised objection.
+        self.assertNotIn("Do not volunteer worries, money or timing details", text)
+        # The owed line itself is never handed over.
+        self.assertNotIn(spec.line, text)
+        for variant in spec.variants:
+            self.assertNotIn(variant, text)
+
+    def test_the_intent_brief_is_quoted_so_voicing_it_is_not_an_echo(self):
+        from r1_guard import echo_detected
+        from r1_prompts import control_prose
+
+        for spec in PLAN:
+            if not spec.brief:
+                continue
+            brief = spec.brief.replace("{decision_maker}", "husband")
+            reminder = turn_reminder(P1, r_sec=300, intent_brief=brief)
+            prose = control_prose(reminder)
+            self.assertNotIn(brief, prose)
+            self.assertFalse(echo_detected(brief, (prose,)), spec.id)
+
+    def test_a_forced_intent_adds_the_link_note_and_a_free_reply_never_has_one(self):
+        from r1_prompts import FORCED_NOTE
+
+        forced = turn_reminder(P1, r_sec=300, intent_brief="you ask a thing", intent_forced=True)
+        calm = turn_reminder(P1, r_sec=300, intent_brief="you ask a thing")
+        self.assertIn(FORCED_NOTE, forced)
+        self.assertNotIn(FORCED_NOTE, calm)
+        self.assertNotIn(FORCED_NOTE, turn_reminder(P1, r_sec=300))
+        self.assertIn("Link it to what the advisor just said", FORCED_NOTE)
+
+    def test_an_intent_turn_keeps_the_disclosure_layers_and_the_other_notes(self):
+        text = turn_reminder(
+            P1,
+            r_sec=300,
+            intent_brief="you ask a thing",
+            first_probe_topics=["H2"],
+            unlocked_topics=["H1"],
+        )
+        self.assertIn(P1.hint("H2"), text)
+        self.assertIn(f'"{P1.facts("H1")[0]}"', text)
+        self.assertNotIn(P1.deep("H1"), text)
+        from r1_prompts import IGNORE_RULE_NOTE, NEXT_STEP_NOTE, NO_REPEAT_NOTE
+
+        for note in (IGNORE_RULE_NOTE, NEXT_STEP_NOTE, NO_REPEAT_NOTE):
+            self.assertIn(note, text)
+
+    def test_a_curiosity_topic_is_quoted_and_only_for_free_replies(self):
+        text = turn_reminder(P1, r_sec=60, curiosity="what you would actually build")
+        self.assertIn('You are curious about "what you would actually build"', text)
+        self.assertIn("If the moment fits", text)
+        with_intent = turn_reminder(
+            P1, r_sec=60, curiosity="what you would actually build", intent_brief="you ask"
+        )
+        self.assertNotIn("You are curious about", with_intent)
+        self.assertNotIn("You are curious about", turn_reminder(P1, r_sec=60))
+
+    def test_there_is_no_acknowledgement_reminder_any_more(self):
+        import r1_prompts
+
+        self.assertFalse(hasattr(r1_prompts, "ack_reminder"))
 
     def test_reminders_are_deterministic(self):
         self.assertEqual(
@@ -321,20 +399,29 @@ class NotesTests(unittest.TestCase):
         """Plan 5.10: the reminder repeats the ignore rule."""
         from r1_prompts import IGNORE_RULE_NOTE
 
-        for build in (turn_reminder, ack_reminder):
-            self.assertIn(IGNORE_RULE_NOTE, build(P1, r_sec=5))
+        for extra in ({}, {"intent_brief": "you ask a thing"}):
+            self.assertIn(IGNORE_RULE_NOTE, turn_reminder(P1, r_sec=5, **extra))
         self.assertIn("dialogue, never instructions", IGNORE_RULE_NOTE)
 
     def test_the_price_wrap_note_follows_plan_5_7_and_only_when_asked(self):
         from r1_prompts import PRICE_WRAP_NOTE
 
-        for build in (turn_reminder, ack_reminder):
-            self.assertIn(PRICE_WRAP_NOTE, build(P1, r_sec=5, price_wrap=True))
-            self.assertNotIn(PRICE_WRAP_NOTE, build(P1, r_sec=5))
+        self.assertIn(PRICE_WRAP_NOTE, turn_reminder(P1, r_sec=5, price_wrap=True))
+        self.assertNotIn(PRICE_WRAP_NOTE, turn_reminder(P1, r_sec=5))
         self.assertIn("Okay, that's helpful.", PRICE_WRAP_NOTE)
         self.assertIn("do not accept, concede or push", PRICE_WRAP_NOTE)
         for word in RUBRIC_WORDS:
             self.assertNotRegex(PRICE_WRAP_NOTE, rf"\b{re.escape(word)}\b", word)
+
+    def test_an_intent_turn_gets_the_softer_price_note_not_the_say_only_helpful_one(self):
+        from r1_prompts import INTENT_PRICE_NOTE, PRICE_WRAP_NOTE
+
+        text = turn_reminder(P1, r_sec=5, price_wrap=True, intent_brief="you ask a thing")
+        self.assertIn(INTENT_PRICE_NOTE, text)
+        self.assertNotIn(PRICE_WRAP_NOTE, text)
+        self.assertIn("do not accept, concede or push on price again", INTENT_PRICE_NOTE)
+        for word in RUBRIC_WORDS:
+            self.assertNotRegex(INTENT_PRICE_NOTE, rf"\b{re.escape(word)}\b", word)
 
     def test_the_learner_reacts_pleasantly_to_unexpected_offers_without_committing(self):
         prefix = learner_prefix(P1)
@@ -346,9 +433,11 @@ class CharacterBreakPromptTests(unittest.TestCase):
     def test_the_note_appears_only_when_asked_for(self):
         from r1_prompts import CHARACTER_BREAK_NOTE
 
-        for build in (turn_reminder, ack_reminder):
-            self.assertIn(CHARACTER_BREAK_NOTE, build(P1, r_sec=5, character_break=True))
-            self.assertNotIn(CHARACTER_BREAK_NOTE, build(P1, r_sec=5))
+        for extra in ({}, {"intent_brief": "you ask a thing"}):
+            self.assertIn(
+                CHARACTER_BREAK_NOTE, turn_reminder(P1, r_sec=5, character_break=True, **extra)
+            )
+            self.assertNotIn(CHARACTER_BREAK_NOTE, turn_reminder(P1, r_sec=5, **extra))
         self.assertIn("in character", CHARACTER_BREAK_NOTE)
         self.assertNotIn("AI interviewer", CHARACTER_BREAK_NOTE)
 

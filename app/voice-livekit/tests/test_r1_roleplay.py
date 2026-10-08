@@ -13,20 +13,30 @@ if str(HERE) not in sys.path:
 import r1_roleplay
 from r1_commitment import COMMITMENT_LINES, Level, commitment_line, stall_line
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
-from r1_guard import ACK_WORD_CAP, FALLBACK_REPLIES, FALLBACK_REPLY, NEUTRAL_ACKS
+from r1_guard import CONTACT_REPLACEMENT, FALLBACK_REPLIES, FALLBACK_REPLY, NEUTRAL_ACKS
 from r1_personas import PERSONAS, resolve_persona
 from r1_prompts import CHARACTER_BREAK_NOTE
 from r1_roleplay import RolePlayEngine, TurnMode
 from r1_script import LEARNER_FILLER_VARIANTS, line
-from r1_scheduler import COMMIT_STALL, OH_WAIT_PREFIX, Q_A, TIME_CUE
+from r1_scheduler import (
+    COMMIT_STALL,
+    F1_ANCHOR,
+    F1_COUNTER,
+    F3_PRIMARY,
+    F3_PUSH,
+    REDIRECT_OPENERS,
+    TIME_CUE,
+)
 from r1_world import WORLD_VERSION
 
 P1 = resolve_persona("p1_career_switcher", variant="v1")
 OPENER = "Hi, this is the Program Advisor from Interview Kickstart. Thanks for taking my call."
 H1_PROBE = "What made you look into data science right now?"
+H3_PROBE = "How many hours a week could you realistically put in?"
 FOLLOWUP = "Tell me more about that."
 PITCH = "Our curriculum covers python, sql and machine learning modules with mentorship."
 NEUTRAL = "That makes sense. What else is on your mind?"
+SCHEDULE_TALK = "The classes are live on weekends and you also get recordings of every session."
 PRICE_ONLY = "The course costs $9000."
 PRICE_TALK = (
     "The course is $9000, and we offer discounts of $500, $1000 and $1500 depending on the "
@@ -44,7 +54,11 @@ def engine(persona=P1, name="Arjun", seed="sess-1") -> RolePlayEngine:
 
 
 class Session:
-    """Drives an engine like the worker would, with a scripted LLM."""
+    """Drives an engine like the worker would, with a scripted LLM.
+
+    ``ack`` is what the model says on an INTENT turn (it misses the move's markers by
+    default, so the scripted variant is appended); ``reply`` is what it says on a free reply.
+    """
 
     def __init__(self, eng: RolePlayEngine, ack="Okay, I see.", reply="Just exploring options."):
         self.eng = eng
@@ -58,7 +72,7 @@ class Session:
         self.plans.append(plan)
         if plan.mode is TurnMode.SAY_ONLY:
             spoken = self.eng.compose_speech(plan).text
-        elif plan.mode is TurnMode.ACK_THEN_SAY:
+        elif plan.mode is TurnMode.INTENT:
             spoken = self.eng.compose_speech(plan, self.ack).text
         elif plan.mode is TurnMode.LLM_REPLY:
             spoken = self.eng.sanitize_reply(plan, self.reply).text
@@ -188,53 +202,85 @@ class PlanModeTests(unittest.TestCase):
         asked = eng.plan_turn(H1_PROBE, 120)
         self.assertIn(P1.facts("H1")[0], asked.reminder)
 
-    def test_an_owed_move_is_ack_then_verbatim_and_the_line_is_not_in_the_reminder(self):
+    def test_an_owed_move_is_voiced_by_the_model_with_a_scripted_variant_as_the_fallback(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        plan = s.say(NEUTRAL, 130)
-        self.assertEqual(plan.mode, TurnMode.ACK_THEN_SAY)
-        self.assertEqual(plan.move_id, Q_A)
-        self.assertEqual(plan.scripted_text, "Is it live classes or recorded?")
-        self.assertNotIn(plan.scripted_text, plan.reminder)
-        self.assertIn(f"at most {ACK_WORD_CAP} words", plan.reminder)
-        self.assertEqual(plan.ack_word_cap, ACK_WORD_CAP)
-        self.assertEqual(s.spoken[-1], "Okay, I see. Is it live classes or recorded?")
+        plan = s.say(PITCH, 60)
+        self.assertEqual(plan.mode, TurnMode.INTENT)
+        self.assertEqual(plan.move_id, F3_PRIMARY)
+        self.assertTrue(plan.needs_llm)
+        self.assertEqual(plan.scripted_text, "")  # nothing is read out by the worker
+        intent = plan.intent
+        self.assertEqual(intent.kind, "objection")
+        self.assertIn(intent.fallback, intent.fallbacks)
+        self.assertEqual(len(intent.fallbacks), 3)
+        # The brief is in the reminder (quoted); the scripted lines never are.
+        self.assertIn(f'"{intent.brief}"', plan.reminder)
+        self.assertIn("react to what the advisor just said", plan.reminder)
+        for variant in intent.fallbacks:
+            self.assertNotIn(variant, plan.reminder)
+        # The model said nothing that raises it, so a variant follows the model's reply.
+        self.assertTrue(s.spoken[-1].startswith("Okay, I see."))
+        self.assertTrue(s.spoken[-1].endswith(intent.fallback))
+        self.assertEqual(s.eng.scheduler._states[F3_PRIMARY].status, "delivered")
 
-    def test_the_owed_line_survives_an_llm_failure(self):
+    def test_a_model_that_raises_the_objection_in_its_own_words_gets_no_tail(self):
+        s = Session(
+            engine(),
+            ack="Honestly, I can learn most of this on YouTube. Why would I pay for it?",
+        )
+        s.say(OPENER, 20)
+        s.say(PITCH, 60)
+        self.assertEqual(
+            s.spoken[-1], "Honestly, I can learn most of this on YouTube. Why would I pay for it?"
+        )
+        self.assertEqual(s.eng.scheduler._states[F3_PRIMARY].status, "delivered")
+        self.assertEqual(s.eng.admin_log()["intents"]["fallback_appended"], {})
+        self.assertEqual(s.eng.admin_log()["intents"]["handed_to_model"], {F3_PRIMARY: 1})
+
+    def test_the_owed_move_survives_an_llm_failure(self):
         eng = engine()
         eng.plan_turn(OPENER, 20)
-        plan = eng.plan_turn(NEUTRAL, 130)
+        plan = eng.plan_turn(PITCH, 60)
         speech = eng.compose_speech(plan, "")
-        self.assertEqual(speech.text, "Is it live classes or recorded?")
-        self.assertEqual(speech.ack_text, "")
+        self.assertEqual(speech.text, plan.intent.fallback)
+        self.assertEqual((speech.model_text, speech.tail_text), ("", plan.intent.fallback))
         self.assertIsNone(speech.guard)
+        eng.record_spoken(plan, speech.text, r_sec=61)
+        self.assertEqual(eng.scheduler._states[F3_PRIMARY].status, "delivered")
+        self.assertEqual(eng.admin_log()["intents"]["fallback_appended"], {F3_PRIMARY: 1})
 
-    def test_guard_swallowing_cannot_lose_an_owed_line(self):
-        """S0-B: guard replacements swallowed whole owed lines; verbatim primaries cannot be."""
+    def test_guard_swallowing_cannot_lose_an_owed_move(self):
+        """S0-B: guard replacements swallowed whole owed lines; a scripted variant cannot be."""
         eng = engine()
         eng.plan_turn(OPENER, 20)
-        plan = eng.plan_turn(NEUTRAL, 130)
+        plan = eng.plan_turn(PITCH, 60)
         hostile = "Sure, Thursday works. My email is a.b@gmail.com. As an AI I owe H1."
         speech = eng.compose_speech(plan, hostile)
-        self.assertTrue(speech.text.endswith("Is it live classes or recorded?"))
+        # Nothing of the reply survived but the guard's own contact line; the variant follows.
+        self.assertTrue(speech.text.endswith(plan.intent.fallback))
+        self.assertEqual(speech.model_text, CONTACT_REPLACEMENT)
         self.assertTrue(speech.guard.hits)
         for forbidden in ("Thursday", "@", "AI", "H1"):
             self.assertNotIn(forbidden, speech.text)
-        self.assertIn(speech.ack_text, NEUTRAL_ACKS)
+        self.assertNotIn(FALLBACK_REPLY, speech.text)  # no "Sorry, what were you saying?"
 
-    def test_an_acknowledgement_is_capped_and_cannot_ask_or_state_facts(self):
+    def test_a_partly_blocked_reply_keeps_its_clean_sentences_and_adds_the_variant(self):
         eng = engine()
         eng.plan_turn(OPENER, 20)
-        plan = eng.plan_turn(NEUTRAL, 130)
-        long_ack = (
-            "Okay that makes sense to me and I really do appreciate how thoroughly you explain."
-        )
-        speech = eng.compose_speech(plan, long_ack)
-        self.assertLessEqual(len(speech.ack_text.split()), ACK_WORD_CAP)
-        question = eng.compose_speech(plan, "Can you tell me about the classes?")
-        self.assertIn(question.ack_text, NEUTRAL_ACKS)
-        facts = eng.compose_speech(plan, "Sure, I can do 5 hours a week in the evenings.")
-        self.assertIn(facts.ack_text, NEUTRAL_ACKS)
+        plan = eng.plan_turn(PITCH, 60)
+        speech = eng.compose_speech(plan, "Got it. Sure, Thursday works for me.")
+        self.assertEqual(speech.model_text, "Got it.")
+        self.assertEqual(speech.text, f"Got it. {plan.intent.fallback}")
+
+    def test_an_intent_reply_is_capped_like_any_learner_reply(self):
+        eng = engine()
+        eng.plan_turn(OPENER, 20)
+        plan = eng.plan_turn(PITCH, 60)
+        long_reply = " ".join(f"Okay that makes sense to me number {i}." for i in range(30))
+        speech = eng.compose_speech(plan, long_reply)
+        self.assertLessEqual(len(speech.model_text.split()), 45)
+        self.assertTrue(speech.text.endswith(plan.intent.fallback))
 
     def test_composing_a_free_reply_plan_is_an_error(self):
         eng = engine()
@@ -242,23 +288,133 @@ class PlanModeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             eng.compose_speech(plan, "x")
 
-    def test_scripted_owed_lines_are_spoken_verbatim_through_the_whole_run(self):
+    def test_every_delivered_move_was_proven_by_its_markers_through_the_whole_run(self):
         session, _ = run_cooperative()
         said = " ".join(session.spoken)
-        for state in session.eng.scheduler._states.values():
-            if state.status == "delivered" and state.spec.id not in (COMMIT_STALL,):
+        sched_ = session.eng.scheduler
+        delivered = [s for s in sched_._states.values() if s.status == "delivered"]
+        self.assertGreaterEqual(len(delivered), 8)
+        for state in delivered:
+            if state.spec.id == COMMIT_STALL:
                 self.assertIn(state.text, said)
+            else:
+                self.assertTrue(sched_.spoken_proves(state.spec.id, said), state.spec.id)
 
-    def test_an_interrupted_line_stays_owed_and_is_issued_again(self):
+    def test_an_interrupted_move_stays_owed_and_is_issued_again_with_the_next_variant(self):
         eng = engine()
         eng.plan_turn(OPENER, 20)
-        plan = eng.plan_turn(NEUTRAL, 130)
-        eng.record_spoken(plan, "Okay. Is it", r_sec=131, interrupted=True)
-        self.assertEqual(eng.scheduler._states[Q_A].status, "pending")
-        again = eng.plan_turn(NEUTRAL, 180)
-        self.assertEqual((again.mode, again.move_id), (TurnMode.ACK_THEN_SAY, Q_A))
-        eng.record_spoken(again, eng.compose_speech(again, "Right.").text, r_sec=181)
-        self.assertEqual(eng.scheduler._states[Q_A].status, "delivered")
+        plan = eng.plan_turn(PITCH, 60)
+        first = plan.intent.fallback
+        eng.record_spoken(plan, "Okay, I see. Hmm.", r_sec=61, interrupted=True)
+        self.assertEqual(eng.scheduler._states[F3_PRIMARY].status, "pending")
+        self.assertEqual(eng.scheduler._states[F3_PRIMARY].interruptions, 1)
+        again = eng.plan_turn(NEUTRAL, 110)
+        self.assertEqual((again.mode, again.move_id), (TurnMode.INTENT, F3_PRIMARY))
+        self.assertEqual(eng.scheduler._states[F3_PRIMARY].issued, 2)
+        self.assertNotEqual(again.intent.fallback, first)  # the rotation moved on
+        eng.record_spoken(again, eng.compose_speech(again, "Right.").text, r_sec=111)
+        self.assertEqual(eng.scheduler._states[F3_PRIMARY].status, "delivered")
+
+    def test_an_interrupted_reply_that_already_raised_it_counts_as_delivered(self):
+        eng = engine()
+        eng.plan_turn(OPENER, 20)
+        plan = eng.plan_turn(PITCH, 60)
+        eng.record_spoken(
+            plan, "There is so much free stuff on YouTube, why would I pay for", r_sec=61,
+            interrupted=True,
+        )
+        self.assertEqual(eng.scheduler._states[F3_PRIMARY].status, "delivered")
+
+    def test_the_variants_start_at_a_point_derived_from_the_attempt_id(self):
+        def first_fallback(seed: str) -> str:
+            eng = engine(seed=seed)
+            eng.plan_turn(OPENER, 20)
+            return eng.plan_turn(PITCH, 60).intent.fallback
+
+        self.assertEqual(first_fallback("attempt-5"), first_fallback("attempt-5"))
+        variants = {first_fallback(f"attempt-{n}") for n in range(30)}
+        self.assertEqual(len(variants), 3)
+
+    def test_the_fallback_skips_a_variant_the_learner_already_said(self):
+        eng = engine()
+        eng.plan_turn(OPENER, 20)
+        plan = eng.plan_turn(PITCH, 60)
+        planned = plan.intent.fallbacks
+        # The learner began the first variant and was cut off before it raised the objection.
+        partial = " ".join(planned[0].split()[:6])
+        eng.record_spoken(plan, partial, r_sec=61, interrupted=True)
+        self.assertEqual(eng.scheduler._states[F3_PRIMARY].status, "pending")
+        again = eng.plan_turn(NEUTRAL, 110)
+        self.assertEqual(again.move_id, F3_PRIMARY)
+        self.assertNotEqual(again.intent.fallbacks[0], planned[0])
+        self.assertEqual(again.intent.fallbacks[-1], planned[0])  # a repeat is tried last
+
+    def test_the_tail_never_repeats_what_the_same_reply_just_said(self):
+        eng = engine()
+        eng.plan_turn(OPENER, 20)
+        plan = eng.plan_turn(PITCH, 60)
+        said = "Honestly, I can find a lot of this for free online."  # no "pay" word: a miss
+        own = next(v for v in plan.intent.fallbacks if v.startswith(said))
+        tail = eng.intent_tail(plan, said)
+        self.assertNotEqual(tail, "")
+        self.assertIn(tail, plan.intent.fallbacks)
+        self.assertNotEqual(tail, own)  # the variant that repeats the sentence is skipped
+
+    def test_a_move_is_voiced_once_and_never_again_after_it_was_delivered(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PITCH, 60)
+        pushes = [s.say(NEUTRAL, 100 + 40 * i) for i in range(2)]
+        self.assertEqual(pushes[0].move_id, F3_PUSH)
+        for plan in s.plans:
+            if plan.move_id == F3_PRIMARY:
+                self.assertEqual(plan.turn, 2)
+        self.assertEqual(s.eng.admin_log()["intents"]["handed_to_model"][F3_PRIMARY], 1)
+
+    def test_the_stall_at_thirteen_minutes_is_the_scripted_line_with_no_model_call(self):
+        session, _ = run_cooperative(40.0)
+        eng = session.eng
+        r = 790.0
+        plan = session.say(NEUTRAL, r)
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.SAY_ONLY, COMMIT_STALL))
+        self.assertEqual(plan.scripted_text, stall_line("husband"))
+        self.assertIsNone(plan.reminder)
+        self.assertEqual(plan.commitment_level, Level.WEAK)
+        self.assertTrue(plan.resolves_commitment)
+        self.assertTrue(eng.commitment_resolved)
+
+    def test_a_forced_move_asks_the_model_to_link_it_to_what_was_just_said(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(NEUTRAL, 270)  # F3 is due at 5:00, so it is forced now
+        self.assertTrue(plan.reasons[-1].endswith(":forced"))
+        self.assertTrue(plan.intent.forced)
+        self.assertIn("Link it to what the advisor just said", plan.reminder)
+        unforced = Session(engine())
+        unforced.say(OPENER, 20)
+        calm = unforced.say(PITCH, 60)
+        self.assertNotIn("Link it to what the advisor just said", calm.reminder)
+
+    def test_the_anchor_hands_over_the_exact_figures(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(PRICE_ONLY, 60)
+        self.assertEqual(plan.move_id, F1_ANCHOR)
+        self.assertEqual(plan.intent.must_say, ("$9,000", "$7,000"))
+        self.assertIn('"$9,000", "$7,000"', plan.reminder)
+        self.assertIn("exactly as shown", plan.reminder)
+        for variant in plan.intent.fallbacks:
+            self.assertIn("$9,000", variant)
+            self.assertIn("$7,000", variant)
+
+    def test_the_time_cue_is_an_intent_of_its_own_kind(self):
+        session, r = run_cooperative(40.0)
+        self.assertGreaterEqual(r, 660)
+        plan = session.say(NEUTRAL, r)
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, TIME_CUE))
+        self.assertEqual(plan.intent.kind, "cue")
+        self.assertEqual(session.eng.scheduler._states[TIME_CUE].status, "delivered")
+        self.assertIn("minutes", session.spoken[-1])
 
 
 class DisclosureThroughTheEngineTests(unittest.TestCase):
@@ -294,19 +450,19 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
     def test_a_reveal_deferred_owed_move_comes_back_next_turn(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        s.say("How many hours a week could you realistically put in?", 55)
+        s.say(H3_PROBE, 55)
         s.say(NEUTRAL, 90)
-        plan = s.say("And would anyone else be involved in the decision?", 125)
-        # Q-A is owed (R >= 2:00) but not forced yet, and a deep need was just released:
+        plan = s.say(PITCH + " And would anyone else be involved in the decision?", 125)
+        # F3 is owed (a pitch was made) but not forced yet, and a deep need was just released:
         # the learner answers the advisor properly first.
         self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
         self.assertIn("owed_deferred_for_reveal", plan.reasons)
         self.assertIn(P1.facts("H3")[0], plan.reminder)
-        # The reveal was tied to that turn: the very next turn gets the owed line, and the
+        # The reveal was tied to that turn: the very next turn gets the owed move, and the
         # deep need is not offered again on an unrelated turn.
         later = s.say(NEUTRAL, 160)
-        self.assertEqual(later.mode, TurnMode.ACK_THEN_SAY)
-        self.assertEqual(later.move_id, Q_A)
+        self.assertEqual(later.mode, TurnMode.INTENT)
+        self.assertEqual(later.move_id, F3_PRIMARY)
         self.assertNotIn(P1.facts("H3")[0], later.reminder)
 
     def test_a_first_probe_turn_also_holds_back_a_non_forced_owed_move(self):
@@ -314,21 +470,25 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
         s = Session(engine())
         s.say(OPENER, 20)
         s.say(NEUTRAL, 60)
-        plan = s.say("How many hours a week could you realistically put in?", 125)
-        # Q-A is owed (R >= 2:00) but not forced (its deadline is 3:30): the learner answers
-        # the advisor's question first, with the hint layer.
+        plan = s.say(PITCH + " " + H3_PROBE, 125)
+        # F3 is owed but not forced (its deadline is 5:00): the learner answers the advisor's
+        # question first, with the hint layer.
         self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
         self.assertIn("owed_deferred_for_reveal", plan.reasons)
         self.assertIn(P1.hint("H3"), plan.reminder)
         later = s.say(NEUTRAL, 160)
-        self.assertEqual((later.mode, later.move_id), (TurnMode.ACK_THEN_SAY, Q_A))
+        self.assertEqual((later.mode, later.move_id), (TurnMode.INTENT, F3_PRIMARY))
 
     def test_a_forced_owed_move_is_not_held_back_by_a_first_probe(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        plan = s.say("How many hours a week could you realistically put in?", 200)
-        self.assertEqual(plan.mode, TurnMode.ACK_THEN_SAY)
+        plan = s.say(H3_PROBE, 270)
+        self.assertEqual(plan.mode, TurnMode.INTENT)
         self.assertTrue(plan.reasons[-1].endswith(":forced"))
+        # The hint layer goes into the SAME reply (the old acknowledgement dropped it).
+        self.assertIn(P1.hint("H3"), plan.reminder)
+        self.assertIn(plan.intent.brief, plan.reminder)
+        self.assertEqual(s.eng.tracker.gate.offers_view()["H3"]["hint_turn"], 2)
 
     def test_the_time_cue_waits_one_turn_for_a_due_reveal_then_comes(self):
         """R1-Q turn 79: the cue was exempt from the reveal deferral and landed on top of it."""
@@ -340,7 +500,7 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
         self.assertIn("owed_deferred_for_reveal", plan.reasons)
         self.assertIn(P1.facts("H1")[0], plan.reminder)
         nxt = session.say(NEUTRAL, r + 20)
-        self.assertEqual((nxt.mode, nxt.move_id), (TurnMode.ACK_THEN_SAY, TIME_CUE))
+        self.assertEqual((nxt.mode, nxt.move_id), (TurnMode.INTENT, TIME_CUE))
 
     def test_the_stall_waits_for_a_reveal_only_during_the_grace_period(self):
         early, _ = run_cooperative(40.0)
@@ -351,16 +511,19 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
         # (the role-play hard-ends at 14:00).
         late, _ = run_cooperative(40.0)
         spoken = late.say(H1_PROBE, 785.0 + r1_roleplay.STALL_DEFER_GRACE_SEC + 5)
-        self.assertEqual((spoken.mode, spoken.move_id), (TurnMode.ACK_THEN_SAY, COMMIT_STALL))
+        self.assertEqual((spoken.mode, spoken.move_id), (TurnMode.SAY_ONLY, COMMIT_STALL))
 
-    def test_a_forced_owed_move_is_not_deferred(self):
+    def test_a_forced_owed_move_is_not_deferred_and_carries_the_due_reveal(self):
         eng = engine()
         s = Session(eng)
         s.say(OPENER, 20)
-        s.say("How many hours a week could you realistically put in?", 40)
-        plan = s.say("And would anyone else be involved in the decision?", 200)
-        self.assertEqual(plan.mode, TurnMode.ACK_THEN_SAY)
+        s.say(H3_PROBE, 40)
+        plan = s.say("And would anyone else be involved in the decision?", 270)
+        self.assertEqual(plan.mode, TurnMode.INTENT)
         self.assertTrue(plan.reasons[-1].endswith(":forced"))
+        # The deep layer is handed over in the same single call, after the reaction.
+        self.assertIn(P1.facts("H3")[0], plan.reminder)
+        self.assertEqual(eng.tracker.gate.offers_view()["H3"]["deep_offer_turns"], [3])
 
 
 class OwnerTestDisclosureTests(unittest.TestCase):
@@ -530,8 +693,8 @@ class AskTests(unittest.TestCase):
         s.say(OPENER, 20)
         modes = [s.say(ASK, 130 + 40 * i).mode for i in range(4)]
         self.assertEqual(modes[:2], [TurnMode.SAY_ONLY, TurnMode.SAY_ONLY])
-        self.assertEqual(modes[2], TurnMode.ACK_THEN_SAY)
-        self.assertIn("ask_yields_to_owed_move", s.plans[3].reasons)
+        self.assertEqual(modes[3], TurnMode.INTENT)  # F3 is forced from 4:15
+        self.assertIn("ask_yields_to_owed_move", s.plans[4].reasons)
 
     def test_an_ask_inside_the_window_gets_the_grade_line_and_resolves(self):
         session, r = run_cooperative(50.0)
@@ -585,20 +748,40 @@ class AskTests(unittest.TestCase):
 
 
 class CloseLadderTests(unittest.TestCase):
-    def test_the_first_early_farewell_redirects_and_the_second_exits(self):
+    def test_the_first_early_farewell_redirects_in_context_and_the_second_exits(self):
         s = Session(engine())
         s.say(OPENER, 20)
         first = s.say("Thanks for your time, bye.", 100)
-        self.assertEqual(first.mode, TurnMode.SAY_ONLY)
-        self.assertTrue(first.scripted_text.startswith(OH_WAIT_PREFIX))
-        self.assertIn("Is it live classes or recorded?", first.scripted_text)
-        self.assertEqual(first.move_id, Q_A)
+        # R1-Q: no canned "Oh wait, before you go..." read out; the model is told to stop the
+        # advisor politely and raise the next owed move, and a scripted opener + variant is the
+        # fallback if it does not.
+        self.assertEqual(first.mode, TurnMode.INTENT)
+        self.assertIn("close_attempt_redirect", first.reasons)
+        self.assertEqual(first.move_id, F3_PRIMARY)
+        self.assertEqual(first.intent.kind, "redirect")
+        self.assertIn("wrapping up", first.intent.brief)
+        self.assertIn(first.intent.brief, first.reminder)
         self.assertFalse(first.exit_roleplay)
-        self.assertEqual(s.eng.scheduler._states[Q_A].status, "delivered")
+        self.assertTrue(any(first.intent.fallback.startswith(o) for o in REDIRECT_OPENERS))
+        self.assertTrue(s.spoken[-1].endswith(first.intent.fallback))
+        self.assertEqual(s.eng.scheduler._states[F3_PRIMARY].status, "delivered")
         second = s.say("Okay, goodbye then.", 150)
         self.assertEqual(second.mode, TurnMode.EXIT)
         self.assertTrue(second.exit_roleplay)
         self.assertTrue(s.eng.exit_requested)
+
+    def test_a_model_that_redirects_in_its_own_words_needs_no_canned_opener(self):
+        s = Session(
+            engine(),
+            ack="Oh, hold on a second. There's so much free stuff online, why would I pay?",
+        )
+        s.say(OPENER, 20)
+        s.say("Thanks for your time, bye.", 100)
+        self.assertEqual(
+            s.spoken[-1],
+            "Oh, hold on a second. There's so much free stuff online, why would I pay?",
+        )
+        self.assertFalse(any(opener in s.spoken[-1] for opener in REDIRECT_OPENERS))
 
     def test_the_early_closer_adversary_is_stalled_then_exits(self):
         """S0-B early_closer: wrap up and send the enrolment link immediately."""
@@ -607,7 +790,7 @@ class CloseLadderTests(unittest.TestCase):
         first = s.say("Please wrap this up now and send the enrolment link immediately.", 60)
         self.assertEqual(first.scripted_text, stall_line("husband"))
         second = s.say("Okay, thanks for your time, bye.", 100)
-        self.assertTrue(second.scripted_text.startswith(OH_WAIT_PREFIX))
+        self.assertEqual(second.intent.kind, "redirect")
         third = s.say("Goodbye.", 140)
         self.assertEqual(third.mode, TurnMode.EXIT)
 
@@ -768,7 +951,7 @@ class InvariantFuzzTests(unittest.TestCase):
     def _speak(self, eng, plan, rng):
         if plan.mode is TurnMode.SAY_ONLY:
             return eng.compose_speech(plan).text
-        if plan.mode is TurnMode.ACK_THEN_SAY:
+        if plan.mode is TurnMode.INTENT:
             return eng.compose_speech(plan, rng.choice(("Okay.", "", "Sure, call Thursday."))).text
         if plan.mode is TurnMode.LLM_REPLY:
             hostile = rng.choice(
@@ -806,7 +989,6 @@ class InvariantFuzzTests(unittest.TestCase):
             ("F2-PRIMARY", "F2-PUSH"),
             ("F1-ANCHOR", "F1-COUNTER"),
             ("F4-PRIMARY", "F4-PUSH"),
-            ("F1-COUNTER", "Q-B"),
             ("F3-PUSH", "F4-PRIMARY"),
             ("F2-PUSH", "F4-PRIMARY"),
             ("F1-COUNTER", "F4-PRIMARY"),
@@ -883,15 +1065,28 @@ class PriceWrapThroughTheEngineTests(unittest.TestCase):
 
         s = Session(engine())
         s.say(OPENER, 20)
-        s.eng.scheduler._states[Q_A].status = "skipped"
         anchor = s.say(PRICE_ONLY, 60)
         counter = s.say(ANSWER, 100)
         self.assertEqual((anchor.move_id, counter.move_id), ("F1-ANCHOR", "F1-COUNTER"))
         self.assertNotIn(PRICE_WRAP_NOTE, counter.reminder)
         wrap = s.say("So that is the best I can do on price.", 140)
+        self.assertEqual(wrap.mode, TurnMode.LLM_REPLY)
         self.assertIn(PRICE_WRAP_NOTE, wrap.reminder)
         after = s.say(NEUTRAL, 180)
         self.assertNotIn(PRICE_WRAP_NOTE, after.reminder or "")
+
+    def test_an_owed_move_on_the_wrap_turn_gets_the_intent_variant_of_the_note(self):
+        from r1_prompts import INTENT_PRICE_NOTE, PRICE_WRAP_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PRICE_ONLY, 60)
+        s.say(ANSWER, 100)
+        # The turn after the counter is the wrap turn; F4 is forced by its deadline there.
+        wrap = s.say("So that is the best I can do on price.", 600)
+        self.assertEqual(wrap.mode, TurnMode.INTENT)
+        self.assertIn(INTENT_PRICE_NOTE, wrap.reminder)
+        self.assertNotIn(PRICE_WRAP_NOTE, wrap.reminder)
 
 
 class CharacterBreakTests(unittest.TestCase):
@@ -958,14 +1153,14 @@ class CharacterBreakTests(unittest.TestCase):
         s.eng.record_spoken(plan, s.eng.compose_speech(plan).text, r_sec=61)
         self.assertEqual(json.dumps(s.eng.admin_log(), sort_keys=True), before)
 
-    def test_a_character_break_on_an_owed_turn_still_delivers_the_owed_line(self):
+    def test_a_character_break_on_an_owed_turn_still_delivers_the_owed_move(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        plan = s.say("Are you an AI?", 130)
-        # Q-A is owed at 2:00: the acknowledgement carries the deflection note.
-        self.assertEqual((plan.mode, plan.move_id), (TurnMode.ACK_THEN_SAY, Q_A))
+        plan = s.say("Are you an AI?", 270)
+        # F3 is due at 5:00 and forced here: the reminder carries the deflection note too.
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, F3_PRIMARY))
         self.assertIn(CHARACTER_BREAK_NOTE, plan.reminder)
-        self.assertTrue(s.spoken[-1].endswith("Is it live classes or recorded?"))
+        self.assertTrue(s.spoken[-1].endswith(plan.intent.fallback))
 
     def test_the_aside_is_capped(self):
         eng = engine()
@@ -1049,14 +1244,17 @@ class RepetitionControlTests(unittest.TestCase):
         s.say(NEUTRAL, 60)
         self.assertEqual(s.spoken[1], "Honestly I just like to compare a few places.")
 
-    def test_the_acknowledgement_before_an_owed_line_cannot_repeat_either(self):
+    def test_the_reaction_before_an_owed_move_cannot_repeat_either(self):
         """Turn 41: the ack copied the surface sentence already said at turn 35."""
         s = Session(engine(), reply=self.SURFACE, ack=self.SURFACE)
         s.say(OPENER, 20)
-        plan = s.say(PITCH, 100)  # F3-PRIMARY is owed (a pitch was made): ack, then the line
-        self.assertEqual(plan.mode, TurnMode.ACK_THEN_SAY)
-        self.assertEqual(s.spoken[1], f"{NEUTRAL_ACKS[plan.guard_ctx.turn % 4]} {plan.scripted_text}")
+        plan = s.say(PITCH, 100)  # F3-PRIMARY is owed (a pitch was made): the model voices it
+        self.assertEqual(plan.mode, TurnMode.INTENT)
+        # The repeated sentence is dropped without an apology; the scripted variant follows.
+        self.assertEqual(s.spoken[1], plan.intent.fallback)
         self.assertNotIn(self.SURFACE, s.spoken[1])
+        self.assertEqual(s.eng.ledger.counts, {"repeat": 1})
+        self.assertEqual(s.eng.ledger.leak_total, 0)
 
     def test_a_scripted_line_that_was_spoken_cannot_be_repeated_by_the_model(self):
         """Turns 77, 81, 87, 90 and 92: the stall phrase came back through acks and replies."""
@@ -1126,6 +1324,196 @@ class FillerAndFallbackRotationTests(unittest.TestCase):
         first = s.spoken[0]
         s.say(NEUTRAL, 60)
         self.assertNotEqual(s.spoken[1], first)
+
+
+class IntentContentTests(unittest.TestCase):
+    """The scripted variants and briefs are spoken or prompted for every persona: they must be safe."""
+
+    def _all_texts(self):
+        import r1_scheduler as sched_
+
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                scheduler = sched_.OwedMoveScheduler(rendered.decision_maker)
+                for state in scheduler._states.values():
+                    for text in state.variants:
+                        yield rendered, state.spec.id, text
+                    for opener in REDIRECT_OPENERS:
+                        for text in state.variants:
+                            yield rendered, state.spec.id, f"{opener} {text}"
+
+    def test_every_variant_passes_the_learner_guard_for_every_persona(self):
+        from r1_guard import GuardContext, check_sentence
+        from r1_text import split_sentences
+
+        seen = 0
+        for rendered, move_id, text in self._all_texts():
+            context = GuardContext(phase="roleplay", persona=rendered, mode="reply")
+            for sentence in split_sentences(text):
+                hits = check_sentence(sentence, context)
+                self.assertEqual(hits, [], f"{rendered.id}/{move_id}: {sentence!r} -> {hits}")
+            seen += 1
+        self.assertGreater(seen, 400)
+
+    def test_no_variant_or_brief_carries_a_locked_deep_need(self):
+        from r1_personas import deep_need_topics_in
+        import r1_scheduler as sched_
+
+        for rendered, move_id, text in self._all_texts():
+            self.assertEqual(deep_need_topics_in(rendered, text), frozenset(), (move_id, text))
+        for persona in PERSONAS:
+            rendered = resolve_persona(persona.id, variant="v1")
+            for state in sched_.OwedMoveScheduler(rendered.decision_maker)._states.values():
+                self.assertEqual(deep_need_topics_in(rendered, state.brief), frozenset())
+
+    def test_no_variant_is_a_commitment_or_a_concession(self):
+        from r1_guard import has_concession
+
+        for rendered, move_id, text in self._all_texts():
+            self.assertLessEqual(classify_learner_commitment_of(text), Level.WEAK, text)
+            self.assertFalse(has_concession(text), text)
+
+    def test_every_intent_reminder_is_free_of_rubric_words_and_scripted_lines(self):
+        import re
+
+        from tests.test_r1_prompts import RUBRIC_WORDS
+
+        for persona in PERSONAS:
+            rendered = resolve_persona(persona.id, variant="v1")
+            eng = engine(rendered)
+            scheduler = eng.scheduler
+            for state in scheduler._states.values():
+                if not state.variants:
+                    continue
+                plan_text = state.brief
+                reminder = r1_roleplay.turn_reminder(
+                    rendered, r_sec=300, intent_brief=plan_text, must_say=state.spec.must_say,
+                    intent_forced=True,
+                )
+                for word in RUBRIC_WORDS:
+                    self.assertNotRegex(reminder, rf"\b{re.escape(word)}\b", (state.spec.id, word))
+                for text in state.variants:
+                    self.assertNotIn(text, reminder)
+
+
+def classify_learner_commitment_of(text):
+    from r1_commitment import classify_learner_commitment
+
+    return classify_learner_commitment(text)
+
+
+class TopicTriggeredObjectionsThroughTheEngineTests(unittest.TestCase):
+    """R1-Q: the objections arrive when the advisor's turn invited them, not on a timer."""
+
+    def test_the_time_worry_follows_schedule_talk_not_a_price_quote(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PITCH, 60)  # F3 primary
+        s.say(NEUTRAL, 100)  # F3 push
+        s.say(NEUTRAL, 140)  # breathing room
+        plan = s.say(SCHEDULE_TALK, 180)
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, "F2-PRIMARY"))
+        self.assertFalse(plan.intent.forced)
+
+    def test_the_anchor_follows_a_price_quote(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(PRICE_ONLY, 60)
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, F1_ANCHOR))
+
+    def test_nothing_is_owed_on_the_advisors_discovery_question(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Why are you looking at our programs, what is the friction in your career?", 60)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertNotIn("owed", " ".join(plan.reasons))
+
+    def test_a_push_waits_for_the_advisors_answer(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PITCH, 60)
+        short = s.say("Okay, got it.", 100)
+        self.assertEqual(short.mode, TurnMode.LLM_REPLY)  # a bare acknowledgement is no answer
+        push = s.say("Sure, our mentors review every project you build with you.", 140)
+        self.assertEqual((push.mode, push.move_id), (TurnMode.INTENT, F3_PUSH))
+
+
+class CuriosityTests(unittest.TestCase):
+    """The neutral questions (live or recorded, what would I build) are curiosity topics now."""
+
+    def _free_replies(self, s, count, start=20):
+        plans = []
+        for index in range(count):
+            plans.append(s.say(NEUTRAL, start + 5 * index))
+        return plans
+
+    def test_one_unasked_topic_is_suggested_every_third_free_reply(self):
+        s = Session(engine())
+        plans = self._free_replies(s, 9)
+        given = [p for p in plans if "You are curious about" in p.reminder]
+        self.assertEqual([p.turn for p in given], [3, 6, 9])
+        topics = [p.reminder.split('curious about "')[1].split('"')[0] for p in given]
+        self.assertEqual(len(set(topics)), 3)
+        labels = {label for _topic, label in r1_roleplay.CURIOSITY_TOPICS}
+        self.assertTrue(set(topics) <= labels)
+
+    def test_the_suggestion_is_quoted_and_never_a_demand(self):
+        from r1_prompts import control_prose
+
+        s = Session(engine())
+        plans = self._free_replies(s, 3)
+        reminder = plans[2].reminder
+        self.assertIn("If the moment fits, ask the advisor one short question", reminder)
+        label = reminder.split('curious about "')[1].split('"')[0]
+        self.assertNotIn(label, control_prose(reminder))  # quoted: no echo trip when asked
+
+    def test_a_topic_the_advisor_already_answered_is_not_suggested(self):
+        s = Session(engine())
+        s.say("The classes are live with recordings. You'll build a recommender system.", 20)
+        plans = self._free_replies(s, 12, start=60)
+        asked = {p.reminder.split('curious about "')[1].split('"')[0]
+                 for p in plans if "You are curious about" in p.reminder}
+        self.assertNotIn("whether the classes are live or recorded", asked)
+        self.assertNotIn("what you would actually build in the course", asked)
+
+    def test_each_topic_is_suggested_once_and_then_the_pool_is_empty(self):
+        s = Session(engine())
+        plans = self._free_replies(s, 30)
+        given = [p for p in plans if "You are curious about" in p.reminder]
+        self.assertEqual(len(given), len(r1_roleplay.CURIOSITY_TOPICS))
+
+    def test_it_is_never_suggested_on_a_probe_a_reveal_a_break_or_an_intent_turn(self):
+        s = Session(engine())
+        self._free_replies(s, 2)
+        probe = s.say(H1_PROBE, 60)  # the third free reply would have been the first suggestion
+        self.assertNotIn("You are curious about", probe.reminder)
+        s2 = Session(engine())
+        self._free_replies(s2, 2)
+        ai = s2.say("Are you an AI?", 60)
+        self.assertNotIn("You are curious about", ai.reminder)
+        s3 = Session(engine())
+        self._free_replies(s3, 2)
+        intent = s3.say(PITCH, 60)
+        self.assertEqual(intent.mode, TurnMode.INTENT)
+        self.assertNotIn("You are curious about", intent.reminder)
+
+    def test_the_topic_order_starts_at_a_point_derived_from_the_attempt_id(self):
+        def first_topic(seed: str) -> str:
+            s = Session(engine(seed=seed))
+            plan = self._free_replies(s, 3)[2]
+            return plan.reminder.split('curious about "')[1].split('"')[0]
+
+        self.assertEqual(first_topic("attempt-9"), first_topic("attempt-9"))
+        self.assertGreater(len({first_topic(f"attempt-{n}") for n in range(30)}), 2)
+
+    def test_the_log_records_which_topics_were_asked_as_ids_only(self):
+        s = Session(engine())
+        self._free_replies(s, 6)
+        asked = s.eng.admin_log()["intents"]["curiosity_asked"]
+        self.assertEqual(len(asked), 2)
+        ids = {topic for topic, _label in r1_roleplay.CURIOSITY_TOPICS}
+        self.assertTrue(set(asked) <= ids)
 
 
 class TimeAndCueTests(unittest.TestCase):
@@ -1238,35 +1626,29 @@ class FullRunTests(unittest.TestCase):
 class ReviewFixRegressionTests(unittest.TestCase):
     """Engine-level regressions for the PR-4b adversarial review."""
 
-    def test_benign_ack_hygiene_hits_do_not_fail_fidelity_or_flag_the_session(self):
+    def test_hygiene_hits_on_an_intent_do_not_fail_fidelity_or_flag_the_session(self):
         """Review P1: 4 hygiene hits used to set ``flagged`` and fail the 3-hit gate."""
         eng = engine()
         eng.plan_turn(OPENER, 20)
-        plan = eng.plan_turn(NEUTRAL, 130)
-        self.assertEqual(plan.mode, TurnMode.ACK_THEN_SAY)
+        plan = eng.plan_turn(PITCH, 60)
+        self.assertEqual(plan.mode, TurnMode.INTENT)
+        eng.record_spoken(plan, "There is so much free stuff online, why pay?", r_sec=61)
+        again = eng.plan_turn(NEUTRAL, 100)
         for _ in range(4):
-            speech = eng.compose_speech(plan, "Okay, that's a lot of money for me right now.")
-            self.assertEqual([h.rule for h in speech.guard.hits], ["ack_fact_vocabulary"])
-            self.assertIn(speech.ack_text, NEUTRAL_ACKS)
-            self.assertTrue(speech.text.endswith("Is it live classes or recorded?"))
+            # The model keeps repeating a sentence the learner already said: a hygiene drop.
+            speech = eng.compose_speech(again, "There is so much free stuff online, why pay?")
+            self.assertEqual([h.category for h in speech.guard.hits], ["repeat"])
         summary = eng.ledger.summary()
         self.assertEqual((summary["hits"], summary["hygiene_hits"]), (4, 4))
         self.assertFalse(eng.ledger.flagged)
         self.assertTrue(eng.fidelity(700)["checks"]["guard_hits_below_threshold"])
         self.assertEqual(eng.admin_log()["guard"]["leak_hits"], 0)
 
-    def test_a_card_paraphrase_is_spoken_as_the_acknowledgement(self):
+    def test_three_real_leaks_in_intent_replies_still_fail_fidelity(self):
         eng = engine()
         eng.plan_turn(OPENER, 20)
-        plan = eng.plan_turn(NEUTRAL, 130)
-        speech = eng.compose_speech(plan, "My schedule's pretty packed, honestly.")
-        self.assertEqual(speech.ack_text, "My schedule's pretty packed, honestly.")
-        self.assertEqual(eng.ledger.total, 0)
-
-    def test_three_real_leaks_still_fail_fidelity(self):
-        eng = engine()
-        eng.plan_turn(OPENER, 20)
-        plan = eng.plan_turn(NEUTRAL, 130)
+        plan = eng.plan_turn(PITCH, 60)
+        self.assertEqual(plan.mode, TurnMode.INTENT)
         for _ in range(3):
             eng.compose_speech(plan, "My email is a.b@gmail.com.")
         self.assertTrue(eng.ledger.flagged)

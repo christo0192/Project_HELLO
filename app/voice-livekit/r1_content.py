@@ -33,7 +33,11 @@ import r1_world
 #    no "answer exactly" stall rule, 3-variant filler and fallback rotations.
 # 4: R1-Q probe-driven disclosure: a hint layer per need (first probe), the deep need handed
 #    over as facts plus stems on the turn that asks, the first-probe and deep reminder lines.
-CONTENT_REVISION = 4
+# 5: R1-Q intent-voiced moves: every owed objection carries a brief, must-say figures, delivery
+#    markers and three scripted variants (the model voices it, the variants are the fallback);
+#    Q-A and Q-B became curiosity topics; deadlines F2 450 / F1 570; the early-farewell redirect
+#    has three scripted openers; PLAN_VERSION 2.
+CONTENT_REVISION = 5
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -73,6 +77,7 @@ def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
 def manifest() -> dict[str, Any]:
     """The canonical content manifest (JSON-serialisable, key order irrelevant)."""
     sample = r1_personas.resolve_persona("p1_career_switcher", variant="v1")
+    intent_sample = r1_scheduler.SPEC_BY_ID[r1_scheduler.F1_ANCHOR]
     return {
         "revision": CONTENT_REVISION,
         "world": {"version": r1_world.WORLD_VERSION, "sha256": r1_world.WORLD_SHA256},
@@ -96,14 +101,23 @@ def manifest() -> dict[str, Any]:
                     "role": spec.role,
                     "line": spec.line,
                     "deadline_sec": spec.deadline_sec,
+                    "brief": spec.brief,
+                    "must_say": list(spec.must_say),
+                    "markers": [list(group) for group in spec.markers],
+                    "variants": list(spec.variants),
                 }
                 for spec in r1_scheduler.PLAN
             ],
-            "oh_wait": r1_scheduler.OH_WAIT_PREFIX,
+            "redirect_openers": list(r1_scheduler.REDIRECT_OPENERS),
+            "redirect_brief": r1_scheduler.REDIRECT_BRIEF,
+            "curiosity_topics": [list(item) for item in r1_scheduler.CURIOSITY_TOPICS],
             "constants": {
                 "slip_limit_sec": r1_scheduler.SLIP_LIMIT_SEC,
                 "spacing_turns": r1_scheduler.SPACING_TURNS,
-                "q_a_opens_sec": r1_scheduler.Q_A_OPENS_SEC,
+                "idle_gap_turns": r1_scheduler.IDLE_GAP_TURNS,
+                "substantive_answer_words": r1_scheduler.SUBSTANTIVE_ANSWER_WORDS,
+                "push_patience_turns": r1_scheduler.PUSH_PATIENCE_TURNS,
+                "curiosity_every": r1_scheduler.CURIOSITY_EVERY,
                 "f3_fallback_open_sec": r1_scheduler.F3_FALLBACK_OPEN_SEC,
                 "time_cue_sec": r1_scheduler.TIME_CUE_SEC,
                 "early_close_before_sec": r1_scheduler.EARLY_CLOSE_BEFORE_SEC,
@@ -145,14 +159,23 @@ def manifest() -> dict[str, Any]:
                 monologue_sec=61,
                 character_break=True,
             ),
-            "ack_reminder_sample": r1_prompts.ack_reminder(
+            "intent_reminder_sample": r1_prompts.turn_reminder(
                 sample,
                 r_sec=0,
                 first_probe_topics=("H1",),
                 monologue_sec=61,
                 character_break=True,
+                price_wrap=True,
+                intent_brief=intent_sample.brief,
+                must_say=intent_sample.must_say,
+                intent_forced=True,
+            ),
+            "curiosity_reminder_sample": r1_prompts.turn_reminder(
+                sample, r_sec=0, curiosity=r1_scheduler.CURIOSITY_TOPICS[0][1]
             ),
             "character_break_note": r1_prompts.CHARACTER_BREAK_NOTE,
+            "intent_price_note": r1_prompts.INTENT_PRICE_NOTE,
+            "forced_note": r1_prompts.FORCED_NOTE,
         },
     }
 

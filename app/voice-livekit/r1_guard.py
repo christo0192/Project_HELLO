@@ -419,6 +419,10 @@ class GuardContext:
     said: tuple[str, ...] = ()
     seed: str = ""
     variant: int = 0
+    # An INTENT reply (R1-Q) has its own scripted fallback, appended by the session when the
+    # model's reply misses the move's markers: a reply with nothing usable left stays EMPTY
+    # instead of becoming "Sorry, what were you saying?" in front of that line.
+    quiet_empty: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -946,7 +950,7 @@ class StreamGuard:
         for sentence in split_sentences(self._buffer):
             out.extend(self._vet(sentence))
         self._buffer = ""
-        if not self._emitted:
+        if not self._emitted and not self.ctx.quiet_empty:
             self._fallback_used = True
             only_repeats = self._repeat_drops > 0 and self._other_drops == 0
             self._emitted.append(_fallback(self.ctx, only_repeats=only_repeats))

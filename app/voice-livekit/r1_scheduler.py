@@ -1,10 +1,17 @@
 """R1 owed-move scheduler: deterministic, worker-side, on the role-play clock R.
 
-Plan 5.6.  The worker, not the LLM, decides which objection or neutral question the
-learner owes next.  The moves are:
+Plan 5.6.  The worker, not the LLM, decides which objection the learner owes next.  The
+moves are:
 
-    Q-A   F3 value (primary, push)   F2 time (primary, push)   F1 price (anchor, counter)
-    Q-B   F4 stall (primary, push)   L-TIME-CUE                COMMIT-STALL
+    F3 value (primary, push)   F2 time (primary, push)   F1 price (anchor, counter)
+    F4 stall (primary, push)   L-TIME-CUE                COMMIT-STALL
+
+R1-Q: the worker decides WHAT is owed and the model voices it in context.  Each move
+carries a worker-authored ``brief`` (what to raise, no candidate text), the exact
+``must_say`` figures, ``markers`` (all-of groups of any-of regexes that prove it was
+raised) and scripted ``variants`` (the first is ``line``) that the session appends if the
+model's reply misses the markers.  Q-A and Q-B are no longer scheduled: they became
+curiosity topics of the free replies (``r1_roleplay``).
 
 Rules enforced here (each has a unit test):
 
@@ -12,19 +19,20 @@ Rules enforced here (each has a unit test):
   pitch statement, or R reaches 3:30.  A greeting that merely names "Program Advisor" or
   "Interview Kickstart" is not a pitch (S0-B defect 3).
 * At most ONE owed move per learner turn.
-* A family is not opened until the previous family's exchange is answered, and a forced
-  neutral question (Q-A, Q-B) never jumps the open family's pending push: the push is owed
-  "unconditionally, next learner turn" and the question's slip gates nothing.
-* Spacing ("at least 2 candidate turns after") is a soft floor.  A deadline FORCES the
-  move at the last learner turn that still lands on time, so spacing can never make a
-  family unschedulable (S0-B defects 1 and 2).
+* A family is not opened until the previous family's exchange is answered.
+* Topic triggers and spacing (R1-Q).  A primary is raised in context: the advisor's turn
+  touched its topic (value, time, price, close) this turn or the last, or no objection was
+  raised for ``IDLE_GAP_TURNS`` turns; and never closer than ``SPACING_TURNS`` learner
+  turns after the previous objection of any family.  A push waits for a substantive answer
+  (``SUBSTANTIVE_ANSWER_WORDS`` words) or ``PUSH_PATIENCE_TURNS`` turns.
+* A deadline FORCES the move at the last learner turn that still lands on time, so spacing
+  and triggers can never make a family unschedulable (S0-B defects 1 and 2).
 * "Later deadlines shift instead": a move's effective deadline is
   ``max(nominal deadline, the turn its hard prerequisites were first met)``, so a late
   predecessor never makes its successors look late.  Slip is measured against that
   effective deadline; lateness against the nominal one is logged as well.
-* Q-B skipped because the advisor already explained what is built counts as resolved at
-  the moment of the skip, so F4 is never starved of its prerequisite.
-* A move that was not delivered (interrupted, TTS failure) stays owed.
+* A move that was not delivered (interrupted, TTS failure) stays owed.  Delivery is proven
+  by the move's markers in the text that was actually played (``confirm_if_spoken``).
 * L-TIME-CUE is only owed between 11:00 and 13:00 (after that the WEAK stall takes the
   turn), and a polite "thanks for your time" opener is not a farewell (``is_close_attempt``
   ignores the first minute, and that phrase until 4:00).  A farewell must END its
@@ -35,13 +43,12 @@ Rules enforced here (each has a unit test):
   answers the anchor, the second candidate turn after it (S0-B: it was never owed in 4 runs).
 * Any family slipping more than 60 s, or never delivered, excludes the session from
   auto-status.
-* The learner's lines are spoken VERBATIM by the worker (escalation step 1 from S0-B);
-  this module only says what is owed and records delivery.
 
 The module is pure: it never reads a clock, so every test drives R explicitly.
 """
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass
 
@@ -49,6 +56,7 @@ from r1_commitment import (
     COMMIT_PERMITTED_R_SEC,
     COMMIT_STALL_R_SEC,
     commitment_line,
+    detect_ask,
     Level,
 )
 from r1_script import LINES
@@ -61,38 +69,57 @@ from r1_text import (
     word_count,
 )
 
-PLAN_VERSION = 1
+PLAN_VERSION = 2
 SLIP_LIMIT_SEC = 60.0
 DEFAULT_TURN_SEC = 45.0
 LOOKAHEAD_MIN_SEC = 20.0
 LOOKAHEAD_MAX_SEC = 90.0
+# At least this many learner turns between two objections of any family (one normal turn).
 SPACING_TURNS = 2
-Q_A_OPENS_SEC = 120
+# A primary whose topic never came up is raised after this many turns without an objection.
+IDLE_GAP_TURNS = SPACING_TURNS + 1
+# An advisor turn this long (and not a bare "Okay") counts as a substantive answer to a primary.
+SUBSTANTIVE_ANSWER_WORDS = 8
+PUSH_PATIENCE_TURNS = 2
 F3_FALLBACK_OPEN_SEC = 210
 TIME_CUE_SEC = 660
 EARLY_CLOSE_BEFORE_SEC = 600
 MATCH_THRESHOLD = 0.78
 
-Q_A = "Q-A"
 F3_PRIMARY = "F3-PRIMARY"
 F3_PUSH = "F3-PUSH"
 F2_PRIMARY = "F2-PRIMARY"
 F2_PUSH = "F2-PUSH"
 F1_ANCHOR = "F1-ANCHOR"
 F1_COUNTER = "F1-COUNTER"
-Q_B = "Q-B"
 F4_PRIMARY = "F4-PRIMARY"
 F4_PUSH = "F4-PUSH"
 COMMIT_STALL = "COMMIT-STALL"
 TIME_CUE = "L-TIME-CUE"
 
 TIME_CUE_LINE = LINES["L-TIME-CUE"]
-OH_WAIT_PREFIX = "Oh wait, before you go..."
+# An early farewell is answered by the learner stopping the advisor (an intent, voiced by the
+# model); these are the scripted openers of the fallback, one of three picked by the attempt.
+REDIRECT_OPENERS = (
+    "Oh wait, before you go...",
+    "Sorry, one more thing before you go...",
+    "Actually, before we wrap up...",
+)
+REDIRECT_BRIEF = (
+    "the advisor sounds like they are wrapping up the call, so stop them politely for a "
+    "moment because you have one more thing to bring up; then"
+)
 
 
 @dataclass(frozen=True)
 class MoveSpec:
-    """One row of the plan 5.6 table."""
+    """One row of the plan 5.6 table.
+
+    ``brief`` says what to raise (plain language, no candidate text); ``must_say`` are figures
+    that must be written exactly; ``markers`` are all-of groups of any-of regexes proving the
+    move was raised; ``variants`` are scripted alternatives to ``line`` (the first fallback).
+    ``{decision_maker}`` is filled per persona, in regexes as an escaped literal.
+    """
 
     id: str
     family: str | None
@@ -100,10 +127,13 @@ class MoveSpec:
     line: str
     deadline_sec: int | None
     required: bool
+    brief: str = ""
+    must_say: tuple[str, ...] = ()
+    markers: tuple[tuple[str, ...], ...] = ()
+    variants: tuple[str, ...] = ()
 
 
 PLAN: tuple[MoveSpec, ...] = (
-    MoveSpec(Q_A, None, "question", "Is it live classes or recorded?", 210, False),
     MoveSpec(
         F3_PRIMARY,
         "F3",
@@ -111,6 +141,26 @@ PLAN: tuple[MoveSpec, ...] = (
         "There's so much free stuff on YouTube and Coursera \u2014 why pay?",
         300,
         True,
+        brief=(
+            "you doubt it is worth paying when so much free material is available online "
+            "(YouTube, Coursera), and you ask what this gives you that free material does not"
+        ),
+        markers=(
+            (r"\bfree\b", r"\byoutube\b", r"\bcoursera\b", r"\budemy\b", r"\bfor nothing\b"),
+            (
+                r"\bpay(?:ing)?\b",
+                r"\bpaid\b",
+                r"\bworth\b",
+                r"\bmoney\b",
+                r"\bcost(?:s|ly)?\b",
+                r"\bprice\b",
+                r"\bspend(?:ing)?\b",
+            ),
+        ),
+        variants=(
+            "Honestly, I can find a lot of this for free online. What would I be paying for?",
+            "I keep seeing free courses everywhere, so why would I pay for this one?",
+        ),
     ),
     MoveSpec(
         F3_PUSH,
@@ -119,26 +169,147 @@ PLAN: tuple[MoveSpec, ...] = (
         "Will this actually get me a job, with all these layoffs?",
         300,
         True,
+        brief=(
+            "you wonder whether this would actually help you get a job, given the layoffs "
+            "you keep hearing about"
+        ),
+        markers=(
+            (
+                r"\bjobs?\b",
+                r"\bhired\b",
+                r"\bhiring\b",
+                r"\bplace(?:d|ments?)\b",
+                r"\bemploy\w*",
+            ),
+            (
+                r"\blay ?offs?\b",
+                r"\blaid off\b",
+                r"\bmarket\b",
+                r"\bguarantee\w*",
+                r"\bland\b",
+                r"\bget me\b",
+                r"\b(?:actually|really) (?:get|help|lead|land|work)\b",
+                r"\bhelp me (?:get|land|find)\b",
+                r"\blead to\b",
+            ),
+        ),
+        variants=(
+            "And with so many layoffs going on, can this really help me land a job?",
+            "Do people actually get jobs after this, given how the market is right now?",
+        ),
     ),
     MoveSpec(
         F2_PRIMARY,
         "F2",
         "primary",
         "My schedule is already packed; I'm not sure I can keep up for six months.",
-        420,
+        450,
         True,
+        brief=(
+            "you are worried that your schedule is already packed and that you cannot keep "
+            "up for six months"
+        ),
+        must_say=("six months",),
+        markers=(
+            (
+                r"\bschedules?\b",
+                r"\bbusy\b",
+                r"\bpacked\b",
+                r"\btime\b",
+                r"\bhours\b",
+                r"\bweek\b",
+                r"\bwork\b",
+                r"\bfamily\b",
+            ),
+            (
+                r"\bkeep(?:ing)? up\b",
+                r"\b(?:six|6) months\b",
+                r"\bmanage\b",
+                r"\bcope\b",
+                r"\bfit\b",
+                r"\bhandle\b",
+                r"\bbalance\b",
+                r"\bstay(?:ing)? on track\b",
+                r"\bstick(?:ing)? with\b",
+            ),
+        ),
+        variants=(
+            "Honestly my schedule is pretty packed, and six months feels like a long time to "
+            "keep up.",
+            "I'm quite busy as it is, so I'm worried about keeping up with this for six months.",
+        ),
     ),
-    MoveSpec(F2_PUSH, "F2", "push", "What happens if I fall behind?", 420, True),
+    MoveSpec(
+        F2_PUSH,
+        "F2",
+        "push",
+        "What happens if I fall behind?",
+        450,
+        True,
+        brief="you ask what happens if you fall behind",
+        markers=(
+            (
+                r"\b(?:fall|falls|falling|fell|get|gets|getting|got) behind\b",
+                r"\bmiss(?:ed|es|ing)? (?:(?:a|an|some|the|few|many|one|two|several|couple|of) )*"
+                r"(?:class|classes|session|sessions|lecture|lectures|week|weeks|module)\b",
+                r"\bcatch(?:ing)? up\b",
+            ),
+        ),
+        variants=(
+            "And if I miss a few classes, how do I catch up?",
+            "What if I get busy at work and fall behind?",
+        ),
+    ),
     MoveSpec(
         F1_ANCHOR,
         "F1",
         "primary",
         "$9,000 is a lot. I've heard people got it for around $7,000 \u2014 can you do that?",
-        540,
+        570,
         True,
+        brief=(
+            "you say $9,000 feels like a lot, that you heard people got it for around "
+            "$7,000, and you ask if the advisor can do that"
+        ),
+        must_say=("$9,000", "$7,000"),
+        markers=((r"(?<![\d,])7,?000\b", r"\bseven thousand\b", r"\b7k\b"),),
+        variants=(
+            "Honestly $9,000 feels like a lot, and I heard some people paid around $7,000. "
+            "Can you match that?",
+            "$9,000 is a big number for me, and I read people got this for about $7,000. "
+            "Is that possible?",
+        ),
     ),
-    MoveSpec(F1_COUNTER, "F1", "push", "Can you do a little better than that?", 540, True),
-    MoveSpec(Q_B, None, "question", "What would I actually build in the course?", 585, False),
+    MoveSpec(
+        F1_COUNTER,
+        "F1",
+        "push",
+        "Can you do a little better than that?",
+        570,
+        True,
+        brief="you push once more for a better price, because the number is still a stretch",
+        markers=(
+            (
+                r"\b(?:little|bit|touch|tad) (?:better|lower|less|more)\b",
+                r"\bbetter (?:price|deal|number|offer)\b",
+                r"\blow(?:er|est)\b",
+                r"\bcome down\b",
+                r"\bbring (?:it|that|the price|this) down\b",
+                r"\bany (?:room|flexibility)\b",
+                r"\bbest (?:you|price|offer|number)\b",
+                r"\bfinal (?:price|number)\b",
+                r"\bstretch\b",
+                r"\bdo better\b",
+                r"\breduce\w*",
+                r"\bdiscount\b",
+                r"\bcheaper\b",
+            ),
+        ),
+        variants=(
+            "Is there any room to bring that down a bit more?",
+            "Could you go a little lower for me?",
+        ),
+    ),
     MoveSpec(
         F4_PRIMARY,
         "F4",
@@ -146,12 +317,103 @@ PLAN: tuple[MoveSpec, ...] = (
         "Let me think about it \u2014 maybe I'll join the next cohort.",
         630,
         True,
+        brief="you are not ready to decide today and might wait for the next cohort",
+        markers=(
+            (
+                r"\bthink(?:ing)? (?:about|it|this|that|over)\b",
+                r"\bdecid\w*",
+                r"\bready\b",
+                r"\bwait(?:ing)?\b",
+                r"\bsleep on\b",
+                r"\bmull\b",
+                r"\bconsider\w*",
+                r"\bhold off\b",
+                r"\bnot sure\b",
+            ),
+            (
+                r"\bcohort\b",
+                r"\bbatch\b",
+                r"\blater\b",
+                r"\bnext\b",
+                r"\byet\b",
+                r"\btoday\b",
+                r"\btomorrow\b",
+                r"\bfew days\b",
+                r"\bweek\b",
+                r"\bsome time\b",
+            ),
+        ),
+        variants=(
+            "I'm not ready to decide today. Maybe the next cohort would suit me better.",
+            "I think I need some time to think this over, probably for the next batch.",
+        ),
     ),
-    MoveSpec(F4_PUSH, "F4", "push", "I'd also need to talk to my {decision_maker}.", 630, True),
+    MoveSpec(
+        F4_PUSH,
+        "F4",
+        "push",
+        "I'd also need to talk to my {decision_maker}.",
+        630,
+        True,
+        brief="you add that you would also need to talk to your {decision_maker} first",
+        markers=(
+            (r"\b{decision_maker}\b",),
+            (
+                r"\btalk(?:ing)?\b",
+                r"\bdiscuss\w*",
+                r"\bcheck\w*",
+                r"\bask\w*",
+                r"\brun (?:it|this|that) by\b",
+                r"\bspeak\b",
+                r"\bconsult\w*",
+                r"\btell\b",
+                r"\bshow\b",
+                r"\bmention\b",
+            ),
+        ),
+        variants=(
+            "I'd want to run this by my {decision_maker} first.",
+            "I should discuss it with my {decision_maker} before deciding.",
+        ),
+    ),
     MoveSpec(COMMIT_STALL, None, "stall", "", None, False),
-    MoveSpec(TIME_CUE, None, "cue", TIME_CUE_LINE, None, False),
+    MoveSpec(
+        TIME_CUE,
+        None,
+        "cue",
+        TIME_CUE_LINE,
+        None,
+        False,
+        brief="you mention that you only have a couple of minutes before your next call",
+        markers=(
+            (
+                r"\bminutes?\b",
+                r"\banother call\b",
+                r"\bnext call\b",
+                r"\bhop on\b",
+                r"\bshort on time\b",
+                r"\brunning out of time\b",
+                r"\b(?:have|need|got) to (?:go|run|jump)\b",
+            ),
+        ),
+        variants=(
+            "Heads up, I have to hop on another call in a few minutes.",
+            "I should mention I only have a few minutes left before another call.",
+        ),
+    ),
 )
 FAMILIES = ("F3", "F2", "F1", "F4")
+# Curiosity topics of the free replies (R1-Q): the two neutral questions that used to be
+# scheduled (Q-A "live or recorded?", Q-B "what would I build?") plus three more.  The engine
+# hands the model one unasked topic every ``CURIOSITY_EVERY`` free replies.
+CURIOSITY_EVERY = 3
+CURIOSITY_TOPICS: tuple[tuple[str, str], ...] = (
+    ("format", "whether the classes are live or recorded"),
+    ("build", "what you would actually build in the course"),
+    ("payment", "whether you could pay in monthly instalments"),
+    ("mentor_time", "how much time you would get with mentors"),
+    ("weekly_hours", "how many hours a week it takes"),
+)
 REQUIRED_MOVES = tuple(spec.id for spec in PLAN if spec.required)
 SPEC_BY_ID = {spec.id: spec for spec in PLAN}
 _ORDER = {spec.id: index for index, spec in enumerate(PLAN)}
@@ -159,6 +421,33 @@ _ORDER = {spec.id: index for index, spec in enumerate(PLAN)}
 
 def _compile(*patterns: str) -> tuple[re.Pattern[str], ...]:
     return tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
+
+
+def _fill(text: str, decision_maker: str, *, regex: bool = False) -> str:
+    """Put the persona's decision maker into a line, a brief or (escaped) a marker regex."""
+    value = re.escape(decision_maker) if regex else decision_maker
+    return text.replace("{decision_maker}", value)
+
+
+@functools.lru_cache(maxsize=256)
+def _compiled_markers(
+    markers: tuple[tuple[str, ...], ...],
+) -> tuple[tuple[re.Pattern[str], ...], ...]:
+    return tuple(_compile(*group) for group in markers)
+
+
+def markers_match(markers: tuple[tuple[str, ...], ...], text: object) -> bool:
+    """True when every marker group has at least one regex that hits ``text``.
+
+    No markers means "nothing to prove", which is NOT a delivery (the caller falls back to
+    the verbatim line).  Pure; the text is folded and matched case-insensitively.
+    """
+    if not markers:
+        return False
+    folded = fold(text)
+    return all(
+        any(pattern.search(folded) for pattern in group) for group in _compiled_markers(markers)
+    )
 
 
 # A value or pitch statement describes what the product is or does.  Naming the company
@@ -309,6 +598,84 @@ def covers_projects(text: object) -> bool:
     return any(pattern.search(lowered) for pattern in _PROJECTS)
 
 
+# Topic triggers (R1-Q): which objection family the advisor's turn invited.  A discovery
+# QUESTION about a topic ("have you tried free courses?") never triggers it: in the owner test
+# (b58c7d9c, turn 35) the value objection landed on a question about the learner's blocker.
+_VALUE_TALK = _compile(
+    r"\b(?:free|youtube|coursera|udemy|certificates?|certification|worth|roi|outcomes?|"
+    r"job market|salary hike|career growth)\b",
+)
+_SCHEDULE_TALK = _compile(
+    r"\b(?:schedules?|timings?|time commitment|per week|a week|weekends?|weekdays?|evenings?|"
+    r"flexib\w+|self[- ]paced|at your own pace|pace|deadlines?|batch(?:es)?|duration|"
+    r"(?:six|6|\d+) months?|hours? (?:a|per|each|every) (?:week|day))\b",
+)
+_CLOSE_TALK = _compile(
+    r"\bwhat do you think\b",
+    r"\bshall we\b",
+    r"\bnext steps?\b",
+    r"\bmove forward\b",
+    r"\b(?:e-?mail|mail|send)\b[^.?!]{0,30}\b(?:details|brochure|curriculum|information|info|"
+    r"link|summary)\b",
+    r"\bcall (?:you )?back\b",
+    r"\bfollow[- ]?up\b",
+    r"\bget back to\b",
+    r"\b(?:decide|decision)\b",
+    r"\b(?:limited|few) (?:seats|spots)\b",
+    r"\b(?:next|upcoming) cohort\b|\bcohort (?:starts|begins|is starting)\b",
+    r"\bready to (?:join|enrol+|start|go)\b",
+)
+
+
+_CURIOSITY_COVERED = {
+    "format": _FORMAT,
+    "build": _PROJECTS,
+    "payment": _compile(
+        r"\binstal+ments?\b", r"\bemi\b", r"\bmonthly\b", r"\bpayment plans?\b"
+    ),
+    "mentor_time": _compile(
+        r"\bmentor(?:s|ship|ing)?\b", r"\binstructors?\b", r"\b1[- ]on[- ]1\b"
+    ),
+    "weekly_hours": _compile(
+        r"\bhours? (?:a|per|each|every) (?:week|day)\b", r"\b\d+ hours?\b", r"\bhours of\b"
+    ),
+}
+
+
+def curiosity_covered(topic: str, text: object) -> bool:
+    """The advisor's text already answered curiosity ``topic``, so the learner need not ask."""
+    lowered = fold(text).lower()
+    return any(pattern.search(lowered) for pattern in _CURIOSITY_COVERED.get(topic, ()))
+
+
+def topics_in(text: object) -> frozenset[str]:
+    """The objection families (F3 value, F2 time, F1 price, F4 close) this advisor turn touches.
+
+    F3: a statement about what the course is or does (a pitch), or free material, certificates
+    and outcomes.  F2: format or schedule talk.  F1: a price or a discount.  F4: any close
+    talk (an ask, a callback or e-mail offer, "what do you think", "shall we").  Questions
+    do not trigger F3 and F2 (they are discovery), but they may trigger F1 and F4.
+    """
+    found: set[str] = set()
+    if quotes_price(text):
+        found.add("F1")
+    if covers_format(text):
+        found.add("F2")
+    if detect_ask(text) is not None:
+        found.add("F4")
+    if is_pitch_statement(text):
+        found.add("F3")
+    for sentence in _sentences(text):
+        statement = not is_question_like(sentence)
+        if statement and any(pattern.search(sentence) for pattern in _VALUE_TALK):
+            found.add("F3")
+        if statement and any(pattern.search(sentence) for pattern in _SCHEDULE_TALK):
+            found.add("F2")
+        if any(pattern.search(sentence) for pattern in _CLOSE_TALK):
+            found.add("F4")
+    return frozenset(found)
+
+
 def _asks_something(sentence: str) -> bool:
     """A question that is not itself a farewell ("Have a great day." opens like one)."""
     if "?" in sentence:
@@ -372,11 +739,17 @@ class TurnSignals:
     projects_covered: bool
     close_attempt: bool
     substantive: bool
+    topics: frozenset[str] = frozenset()
+    answered: bool = False
 
 
 @dataclass(frozen=True)
 class OwedMove:
-    """The one move owed this turn.  ``text`` is spoken verbatim by the worker."""
+    """The one move owed this turn.
+
+    ``text`` is the move's own scripted line (the first fallback variant).  The session does
+    not speak it: the model voices ``brief`` (R1-Q) and the line is only the fallback.
+    """
 
     id: str
     family: str | None
@@ -385,6 +758,10 @@ class OwedMove:
     forced: bool
     deadline_sec: int | None
     due_sec: float
+    brief: str = ""
+    must_say: tuple[str, ...] = ()
+    markers: tuple[tuple[str, ...], ...] = ()
+    variants: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -402,7 +779,11 @@ class Delivery:
 
 @dataclass(frozen=True)
 class CloseDecision:
-    """Response to an early close attempt: redirect with a move, stall, or exit."""
+    """Response to an early close attempt: redirect with a move, stall, or exit.
+
+    ``prefix`` is always empty since R1-Q (the redirect is a brief the model voices; the
+    scripted openers are ``REDIRECT_OPENERS``).  The field stays for the contract.
+    """
 
     action: str
     move: OwedMove | None
@@ -413,6 +794,9 @@ class CloseDecision:
 class _MoveState:
     spec: MoveSpec
     text: str
+    brief: str = ""
+    markers: tuple[tuple[str, ...], ...] = ()
+    variants: tuple[str, ...] = ()
     status: str = "pending"
     enabled_sec: float | None = None
     delivered_sec: float | None = None
@@ -434,8 +818,19 @@ class OwedMoveScheduler:
             if spec.id == COMMIT_STALL:
                 text = commitment_line(Level.WEAK, decision_maker)
             else:
-                text = spec.line.format(decision_maker=decision_maker)
-            self._states[spec.id] = _MoveState(spec, text)
+                text = _fill(spec.line, decision_maker)
+            self._states[spec.id] = _MoveState(
+                spec,
+                text,
+                brief=_fill(spec.brief, decision_maker),
+                markers=tuple(
+                    tuple(_fill(pattern, decision_maker, regex=True) for pattern in group)
+                    for group in spec.markers
+                ),
+                variants=(text, *(_fill(item, decision_maker) for item in spec.variants))
+                if spec.variants
+                else (),
+            )
         self.turn = 0
         self.last_r: float | None = None
         self._gaps: list[float] = []
@@ -447,6 +842,9 @@ class OwedMoveScheduler:
         self.close_attempts = 0
         self.commitment_resolved = False
         self._delivered_in_turn = -1
+        self._last_objection_turn: int | None = None
+        self._topic_turn: dict[str, int] = {}
+        self._turn_answered = False
 
     # ------------------------------------------------------------------ observation
     @property
@@ -466,6 +864,10 @@ class OwedMoveScheduler:
         price = quotes_price(text)
         fmt = covers_format(text)
         projects = covers_projects(text)
+        topics = topics_in(text)
+        for family in topics:
+            self._topic_turn[family] = self.turn
+        self._turn_answered = word_count(text) >= SUBSTANTIVE_ANSWER_WORDS
         if pitch and self.pitch_turn is None:
             self.pitch_turn = self.turn
         if price and self.price_quoted_turn is None:
@@ -484,7 +886,6 @@ class OwedMoveScheduler:
             self.format_covered_turn = self.turn
         if projects and self.projects_covered_turn is None:
             self.projects_covered_turn = self.turn
-        self._auto_skip()
         # Record when each move became ready even if this turn is answered by something
         # other than an owed move (a stall, a reveal, a free reply), so slip is never
         # understated.
@@ -498,18 +899,9 @@ class OwedMoveScheduler:
             projects_covered=projects,
             close_attempt=is_close_attempt(text, r_sec),
             substantive=word_count(text) >= 2,
+            topics=topics,
+            answered=self._turn_answered,
         )
-
-    def _auto_skip(self) -> None:
-        """Skip a neutral question the advisor already answered; resolved NOW (defect 1)."""
-        for move_id, covered in (
-            (Q_A, self.format_covered_turn),
-            (Q_B, self.projects_covered_turn),
-        ):
-            state = self._states[move_id]
-            if state.status == "pending" and covered is not None:
-                state.status = "skipped"
-                state.resolved_turn = self.turn
 
     # -------------------------------------------------------------------- selection
     def _state(self, move_id: str) -> _MoveState:
@@ -523,9 +915,6 @@ class OwedMoveScheduler:
         if state.delivered_turn is None:
             return None
         return self.turn - state.delivered_turn
-
-    def _resolved(self, move_id: str) -> bool:
-        return self._states[move_id].status in ("delivered", "skipped")
 
     def family_complete(self, family: str) -> bool:
         """True when every required component of ``family`` has been delivered."""
@@ -554,7 +943,7 @@ class OwedMoveScheduler:
     def price_wrap_turn(self) -> int | None:
         """The turn that follows the F1 counter: the advisor's second answer on price.
 
-        Plan 5.7 step 3: after it the learner says "Okay, that's helpful" and moves on.
+        Plan 5.7 step 3: after it the learner does not push on price again.
         """
         counter = self._states[F1_COUNTER]
         return None if counter.delivered_turn is None else counter.delivered_turn + 1
@@ -578,8 +967,6 @@ class OwedMoveScheduler:
         if state.spec.role == "primary" and not self._primary_gate(family):
             return False
         since = self._since
-        if move_id == Q_A:
-            return r_sec >= Q_A_OPENS_SEC
         if move_id == F3_PRIMARY:
             return self.pitch_turn is not None or r_sec >= F3_FALLBACK_OPEN_SEC
         if move_id == F3_PUSH:
@@ -592,15 +979,12 @@ class OwedMoveScheduler:
             return (since(F2_PUSH) or 0) >= 1 or self.price_quoted_turn is not None
         if move_id == F1_COUNTER:
             return (since(F1_ANCHOR) or 0) >= 1
-        if move_id == Q_B:
-            return self.family_complete("F1") and (since(F1_COUNTER) or 0) >= 1
         if move_id == F4_PRIMARY:
             return (
                 self.family_complete("F3")
                 and self.family_complete("F2")
                 and self.family_complete("F1")
-                and self._resolved(Q_B)
-                and self._turns_since_f4_prerequisites() >= 1
+                and (since(F1_COUNTER) or 0) >= 1
             )
         if move_id == F4_PUSH:
             return (since(F4_PRIMARY) or 0) >= 1
@@ -618,30 +1002,43 @@ class OwedMoveScheduler:
             )
         return False
 
-    def _turns_since_f4_prerequisites(self) -> int:
-        """Candidate turns since F1 and Q-B were both resolved (delivered or skipped)."""
-        turns = []
-        for move_id in (F1_COUNTER, Q_B):
-            state = self._states[move_id]
-            marker = state.delivered_turn if state.delivered_turn is not None else (
-                state.resolved_turn
-            )
-            if marker is None:
-                return 0
-            turns.append(marker)
-        return self.turn - max(turns)
+    def _since_objection(self) -> int:
+        """Learner turns since the last objection of any family (since the start if none)."""
+        if self._last_objection_turn is None:
+            return self.turn
+        return self.turn - self._last_objection_turn
+
+    def _topic_fresh(self, family: str | None) -> bool:
+        """The advisor's turn touched ``family``'s topic this turn or the one before."""
+        if family is None:
+            return False
+        last = self._topic_turn.get(family)
+        return last is not None and self.turn - last <= 1
+
+    def _primary_in_context(self, family: str | None) -> bool:
+        """Breathing room first; then the topic came up, or it has been quiet for a while."""
+        gap = self._since_objection()
+        if gap < SPACING_TURNS:
+            return False
+        return self._topic_fresh(family) or gap >= IDLE_GAP_TURNS
+
+    def _push_answered(self, primary_id: str) -> bool:
+        """A push follows a substantive answer to its primary, or waits a couple of turns."""
+        return self._turn_answered or (self._since(primary_id) or 0) >= PUSH_PATIENCE_TURNS
 
     def _soft_ready(self, state: _MoveState) -> bool:
         move_id = state.spec.id
         since = self._since
-        if move_id == F2_PRIMARY:
-            return (since(F3_PUSH) or 0) >= SPACING_TURNS
-        if move_id == F1_ANCHOR:
-            return self.price_quoted_turn is not None or (since(F2_PUSH) or 0) >= SPACING_TURNS
+        if state.spec.role == "primary":
+            return self._primary_in_context(state.spec.family)
+        if move_id == F3_PUSH:
+            return self._push_answered(F3_PRIMARY)
+        if move_id == F2_PUSH:
+            return self._push_answered(F2_PRIMARY)
+        if move_id == F4_PUSH:
+            return self._push_answered(F4_PRIMARY)
         if move_id == F1_COUNTER:
             return self.price_answered_turn is not None or (since(F1_ANCHOR) or 0) >= 2
-        if move_id == F4_PRIMARY:
-            return self._turns_since_f4_prerequisites() >= SPACING_TURNS
         return True
 
     def _is_forced(self, state: _MoveState, r_sec: float) -> bool:
@@ -651,13 +1048,11 @@ class OwedMoveScheduler:
     def _enable_time(self, state: _MoveState, r_sec: float) -> float:
         """When a move that just became ready could first have been spoken.
 
-        A turn-gated move became ready at this learner turn.  A clock-gated move (Q-A at
-        2:00, the F3 fallback at 3:30, the cue at 11:00) became ready at its clock time,
-        so a long candidate monologue cannot hide a late first learner turn.
+        A turn-gated move became ready at this learner turn.  A clock-gated move (the F3
+        fallback at 3:30, the cue at 11:00) became ready at its clock time, so a long
+        candidate monologue cannot hide a late first learner turn.
         """
         move_id = state.spec.id
-        if move_id == Q_A:
-            return min(r_sec, float(Q_A_OPENS_SEC))
         if move_id == F3_PRIMARY and self.pitch_turn is None:
             return min(r_sec, float(F3_FALLBACK_OPEN_SEC))
         if move_id == TIME_CUE:
@@ -697,11 +1092,6 @@ class OwedMoveScheduler:
                 key = (0, float(deadline or 0), order)
             elif open_family is not None and state.spec.family == open_family:
                 key = (1, 0.0, order)
-            elif forced:
-                # A neutral question (Q-A, Q-B) is never required and its slip gates
-                # nothing, so it must not jump an open family's pending push, which the
-                # plan owes "unconditionally, next learner turn".
-                key = (1, 1.0, order)
             else:
                 key = (2, float(deadline) if deadline is not None else 1e9, order)
             if best is None or key < best[0]:
@@ -720,6 +1110,10 @@ class OwedMoveScheduler:
             forced=forced,
             deadline_sec=state.spec.deadline_sec,
             due_sec=self._due(state, r_sec),
+            brief=state.brief,
+            must_say=state.spec.must_say,
+            markers=state.markers,
+            variants=state.variants,
         )
 
     def issue(self, move: OwedMove) -> None:
@@ -739,7 +1133,7 @@ class OwedMoveScheduler:
     def confirm_delivered(
         self, move_id: str, r_sec: float, *, interrupted: bool = False
     ) -> Delivery | None:
-        """Record that the worker finished speaking ``move_id``'s line.
+        """Record that the worker finished saying ``move_id``.
 
         An interrupted playout is not a delivery: the move stays owed and is issued
         again at the next learner turn.  Returns None for an unknown, already-delivered
@@ -770,23 +1164,39 @@ class OwedMoveScheduler:
         state.resolved_turn = self.turn
         state.delivery = delivery
         self._delivered_in_turn = self.turn
+        if state.spec.family is not None:
+            self._last_objection_turn = self.turn
         if move_id == COMMIT_STALL:
             self.commitment_resolved = True
         return delivery
+
+    def spoken_proves(self, move_id: str, spoken_text: object) -> bool:
+        """Whether the played text raised ``move_id``: its markers, else its verbatim line.
+
+        A move with markers is proven by them (the model voices it in its own words, or the
+        scripted fallback does: every variant satisfies the markers).  A move without markers
+        (the 13:00 stall) is proven by the verbatim line, as before.
+        """
+        state = self._states.get(move_id)
+        if state is None:
+            return False
+        if state.markers:
+            return markers_match(state.markers, spoken_text)
+        return fuzzy_contains(spoken_text, state.text, MATCH_THRESHOLD)
 
     def confirm_if_spoken(
         self, move_id: str, spoken_text: object, r_sec: float, *, interrupted: bool = False
     ) -> Delivery | None:
         """Confirm delivery from the text that was actually played.
 
-        The line counts as delivered when the played text contains it (fuzzy match, so
-        punctuation and small STT-style changes do not matter).  A barge-in that cut the
-        line short fails the match and leaves the move owed.
+        The move counts as delivered when the played text proves it (``spoken_proves``), so
+        punctuation, wording and small STT-style changes do not matter.  A barge-in that cut
+        it short fails the check and leaves the move owed.
         """
         state = self._states.get(move_id)
         if state is None or state.status != "pending":
             return None
-        if not fuzzy_contains(spoken_text, state.text, MATCH_THRESHOLD):
+        if not self.spoken_proves(move_id, spoken_text):
             if interrupted:
                 state.interruptions += 1
             return None
@@ -816,11 +1226,11 @@ class OwedMoveScheduler:
     def register_close_attempt(self, r_sec: float) -> CloseDecision:
         """Handle a farewell: redirect once before R = 10:00, otherwise exit.
 
-        First attempt before 10:00 gets "Oh wait, before you go..." plus the next owed
-        move, once.  A second attempt, or any attempt once R >= 10:00 with the
-        commitment resolved (or R >= 13:00), goes to ROLEPLAY_EXIT.  If nothing is left
-        to redirect with, the learner delivers the WEAK stall when the close window is
-        open, else the call exits.
+        First attempt before 10:00 is answered by the next owed move, once (the learner
+        stops the advisor: the redirect is an intent the model voices).  A second attempt, or
+        any attempt once R >= 10:00 with the commitment resolved (or R >= 13:00), goes to
+        ROLEPLAY_EXIT.  If nothing is left to redirect with, the learner delivers the WEAK
+        stall when the close window is open, else the call exits.
         """
         self.close_attempts += 1
         resolved = self.commitment_resolved
@@ -830,7 +1240,7 @@ class OwedMoveScheduler:
             return CloseDecision("exit", None, "")
         move = self._force_next(r_sec)
         if move is not None:
-            return CloseDecision("redirect", move, OH_WAIT_PREFIX)
+            return CloseDecision("redirect", move, "")
         if self.commit_permitted(r_sec) and not resolved:
             state = self._states[COMMIT_STALL]
             state.enabled_sec = state.enabled_sec if state.enabled_sec is not None else r_sec

@@ -52,8 +52,8 @@ SOURCE_ATTEMPT = "attempt"
 SOURCE_SEED = "session_seed"
 DEFAULT_SEED = "r1"
 
-# The admin-log ``event_type`` CHECK set (migration 0117) has no slot for the neutral
-# questions or the commitment stall, so those moves are logged but never posted.
+# The admin-log ``event_type`` CHECK set (migration 0117) has no slot for the commitment stall,
+# so that move is logged but never posted (the neutral questions are no longer scheduled).
 _MOVE_EVENTS: dict[str, tuple[str, str | None]] = {
     "F3-PRIMARY": ("family_delivered", "F3"),
     "F3-PUSH": ("push_delivered", "F3"),

@@ -22,7 +22,7 @@ from __future__ import annotations
 import re
 from typing import Iterable, Mapping, Sequence
 
-from r1_guard import ACK_WORD_CAP, REPLY_WORD_CAP
+from r1_guard import REPLY_WORD_CAP
 from r1_personas import TOPIC_LABELS, RenderedPersona
 from r1_script import INTERVIEWER_NAME
 from r1_world import AUDIENCE_INTERVIEWER_FAQ, INTERVIEWER_DEFLECTION, facts_for
@@ -38,6 +38,11 @@ PRICE_WRAP_NOTE = (
     "- The advisor has now answered you twice on price. Say only that it is helpful (for "
     "example, \"Okay, that's helpful.\") and move on: do not accept, concede or push on "
     "price again."
+)
+FORCED_NOTE = "- Link it to what the advisor just said, so it sounds natural and not abrupt."
+INTENT_PRICE_NOTE = (
+    "- The advisor has now answered you twice on price: do not accept, concede or push on "
+    "price again in this reply."
 )
 NEXT_STEP_NOTE = (
     "- Never agree to a call, a day, a time, an enrolment or a payment yourself. If the "
@@ -168,6 +173,10 @@ def _monologue_line(monologue_sec: float | None) -> str:
     return ""
 
 
+def _quoted_list(items: Iterable[str]) -> str:
+    return ", ".join(f'"{item}"' for item in items)
+
+
 def turn_reminder(
     persona: RenderedPersona,
     *,
@@ -177,8 +186,12 @@ def turn_reminder(
     monologue_sec: float | None = None,
     character_break: bool = False,
     price_wrap: bool = False,
+    intent_brief: str = "",
+    must_say: Iterable[str] = (),
+    intent_forced: bool = False,
+    curiosity: str = "",
 ) -> str:
-    """The ephemeral note for a free learner reply (no owed line this turn).
+    """The ephemeral note for a learner reply (a free reply, or an intent the worker owes).
 
     Disclosure comes in layers and only on the turn that asks about the topic.
     ``first_probe_topics`` get the HINT layer (a little feeling, no cause: marker-free).
@@ -190,14 +203,38 @@ def turn_reminder(
     commitment line: the learner has no sanctioned stall to recite (that loop is what the
     R1-Q owner test found), so it must react to a proposed call, day, time or next step in
     its own words and never agree to one.
+
+    ``intent_brief`` (R1-Q) is what the worker wants raised this turn.  The model voices it in
+    the same single call, after reacting to the advisor, instead of the worker reading a
+    canned line: the brief is worker-authored (never candidate text) and quoted, like the
+    facts, so voicing it is never an instruction echo.  ``must_say`` figures are written
+    exactly.  ``curiosity`` is one question topic the learner has not asked yet.
     """
-    lines = [
-        f"ROLEPLAY NOTE (not spoken; never mention it). R={_clock(r_sec)}.",
-        "Reply as the learner, naturally: react to what the advisor just said, then answer "
-        "what they asked. Do not volunteer worries, money or timing details the advisor "
-        "did not ask about.",
-        IGNORE_RULE_NOTE,
-    ]
+    lines = [f"ROLEPLAY NOTE (not spoken; never mention it). R={_clock(r_sec)}."]
+    if intent_brief:
+        lines.append(
+            "Reply as the learner, naturally: first react to what the advisor just said in a "
+            "few words, and if they asked you something, answer it briefly from your card or "
+            "backstory. Then, in the same reply, raise something of your own."
+        )
+    else:
+        lines.append(
+            "Reply as the learner, naturally: react to what the advisor just said, then answer "
+            "what they asked. Do not volunteer worries, money or timing details the advisor "
+            "did not ask about."
+        )
+    lines.append(IGNORE_RULE_NOTE)
+    if intent_brief:
+        lines.append(
+            "- Raise this in your own words, as a real person would, without reading it out: "
+            f'"{intent_brief}".'
+        )
+        figures = tuple(must_say)
+        if figures:
+            lines.append(f"- Write these figures exactly as shown: {_quoted_list(figures)}.")
+        if intent_forced:
+            lines.append(FORCED_NOTE)
+        lines.append("- Keep the whole reply to two or three short sentences.")
     for topic in first_probe_topics:
         lines.append(
             f"- This is the advisor's first real question about {TOPIC_LABELS[topic]}. Answer "
@@ -216,49 +253,12 @@ def turn_reminder(
     lines.append(NEXT_STEP_NOTE)
     lines.append(NO_REPEAT_NOTE)
     if price_wrap:
-        lines.append(PRICE_WRAP_NOTE)
-    if character_break:
-        lines.append(CHARACTER_BREAK_NOTE)
-    monologue = _monologue_line(monologue_sec)
-    if monologue:
-        lines.append(monologue)
-    return "\n".join(lines)
-
-
-def ack_reminder(
-    persona: RenderedPersona,
-    *,
-    r_sec: float,
-    first_probe_topics: Iterable[str] = (),
-    monologue_sec: float | None = None,
-    character_break: bool = False,
-    price_wrap: bool = False,
-) -> str:
-    """The ephemeral note for an acknowledgement before a verbatim owed line.
-
-    The owed line's text is NOT in this note: the worker speaks it itself, so the LLM
-    cannot paraphrase, delay or swallow it.  The acknowledgement is word-capped and
-    forbidden from stating facts or accepting a call.
-    """
-    lines = [
-        f"ROLEPLAY NOTE (not spoken; never mention it). R={_clock(r_sec)}.",
-        f"MODE: acknowledgement only. Reply with at most {ACK_WORD_CAP} words.",
-        "React briefly to what the advisor just said. If they asked you a question, answer "
-        "it only from your card.",
-    ]
-    for topic in first_probe_topics:
+        lines.append(INTENT_PRICE_NOTE if intent_brief else PRICE_WRAP_NOTE)
+    if curiosity and not intent_brief:
         lines.append(
-            f"- For {TOPIC_LABELS[topic]} use only a short answer from your card (for "
-            f'example "{persona.surface(topic)}").'
+            f'- You are curious about "{curiosity}". If the moment fits, ask the advisor one '
+            "short question about it in your own words."
         )
-    lines.append(
-        "Do not ask a question. State no numbers, schedule, availability, contact details "
-        "or product details. Never accept or propose a call, a day, a time, an enrolment or "
-        "a payment. Say nothing else: your next line will be added for you."
-    )
-    lines.append(IGNORE_RULE_NOTE)
-    if price_wrap:
-        lines.append(PRICE_WRAP_NOTE)
     if character_break:
         lines.append(CHARACTER_BREAK_NOTE)
     monologue = _monologue_line(monologue_sec)

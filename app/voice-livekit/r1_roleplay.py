@@ -11,18 +11,22 @@ engine only DECIDES, deterministically, what the learner does on each candidate 
 
 ``SAY_ONLY``
     Speak ``plan.scripted_text`` verbatim and call no LLM: a commitment line, the WEAK
-    stall, "Oh wait, before you go..." plus the next owed move, or (``plan.aside``) the
-    interviewer's one-off L-ASIDE-COACH, which the session speaks in the ASIDE phase with
-    ``plan.voice == "interviewer"`` and which is excluded from evidence (plan 5.10).
-``ACK_THEN_SAY``
-    Escalation step 1 from S0-B.  The LLM gives a short acknowledgement using
-    ``plan.reminder`` (<= 15 words, no facts, no question); then the worker speaks
-    ``plan.scripted_text`` (the owed line) VERBATIM.  ``compose_speech`` builds the final
-    text and falls back to the scripted line alone if the LLM failed.
+    stall, or (``plan.aside``) the interviewer's one-off L-ASIDE-COACH, which the session
+    speaks in the ASIDE phase with ``plan.voice == "interviewer"`` and which is excluded from
+    evidence (plan 5.10).
+``INTENT``
+    R1-Q option B, intent-voiced moves.  The worker decides WHAT the learner raises (an owed
+    objection, an early-farewell redirect, the time cue) and the model voices it in context,
+    in the same single call: it reacts to the advisor first and then raises
+    ``plan.intent.brief`` in its own words.  Delivery is proven by ``plan.intent.markers`` in
+    the text that was played.  If the model's reply misses them, ``intent_tail`` returns a
+    scripted variant (``plan.intent.fallbacks``, vetted by the repetition check) that the
+    session appends, so an owed move is never lost to the model.  ``compose_speech`` builds
+    the final text for callers that do not stream.
 ``LLM_REPLY``
     A free, constrained reply using ``plan.reminder`` (a HINT for a first probe, the DEEP
-    need's facts only on the turn that asks about a released topic), screened sentence by
-    sentence by ``plan.guard_ctx``.
+    need's facts only on the turn that asks about a released topic, and now and then one
+    curiosity topic), screened sentence by sentence by ``plan.guard_ctx``.
 ``EXIT``
     The candidate said goodbye again: the session moves to ROLEPLAY_EXIT.
 
@@ -30,12 +34,14 @@ Repetition control (R1-Q): ``record_spoken`` feeds every sentence the learner ac
 played into a ``SpokenMemory``; each plan's guard context carries a snapshot (``said``), so
 the output guard drops a sentence the learner already said (a ``repeat`` hit: hygiene, never
 posted).  The thinking filler and the guard fallback are 3-variant rotations seeded by the
-attempt id (``filler_text``, ``GuardContext.variant``).
+attempt id (``filler_text``, ``GuardContext.variant``), and so are the scripted variants of
+every intent.
 
 Nothing here can change a phase, a grade or the schedule from candidate or model text
 beyond the deterministic rules: the LLM has no tools, the judge's JSON is whitelisted,
-and farewell/ask detection is lexical.  The engine never stores candidate text; its logs
-hold turn indices, counts and booleans only.
+and farewell/ask detection is lexical.  An intent's brief is worker-authored and never holds
+candidate text.  The engine never stores candidate text; its logs hold turn indices, counts
+and booleans only.
 
 Integration sketch for ``r1_session`` (the follow-up change; one call per final candidate
 transcript in ROLEPLAY, with ``r_sec`` read from the phase machine's role-play clock)::
@@ -47,11 +53,10 @@ transcript in ROLEPLAY, with ``r_sec`` read from the phase machine's role-play c
     if plan.exit_roleplay:            -> machine.transition(ROLEPLAY_EXIT)
     elif plan.aside:                  -> ASIDE phase, say(plan.scripted_text), back to ROLEPLAY
     elif plan.mode is SAY_ONLY:       -> raise StopResponse; say(plan.scripted_text)
-    elif plan.mode is ACK_THEN_SAY:   -> raise StopResponse; ack = <one short LLM call using
-                                         plan.reminder, <= plan.ack_word_cap words>;
-                                         say(engine.compose_speech(plan, ack).text)
-    else (LLM_REPLY):                 -> add plan.reminder as the ephemeral system message;
-                                         llm_node streams through engine.stream_guard(plan)
+    else (INTENT or LLM_REPLY):       -> add plan.reminder as the ephemeral system message;
+                                         llm_node streams through engine.stream_guard(plan);
+                                         for an INTENT, once the stream ended, append
+                                         engine.intent_tail(plan, <what was streamed>)
     afterwards: engine.record_spoken(plan, spoken_text, interrupted=...),
                 messages = engine.judge_messages(text, learner_last, turn=plan.turn)
                 ... later, off the speech path (possibly after the NEXT plan_turn):
@@ -77,7 +82,6 @@ from r1_commitment import (
 )
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
 from r1_guard import (
-    ACK_WORD_CAP,
     REPEAT,
     GuardContext,
     GuardLedger,
@@ -88,16 +92,36 @@ from r1_guard import (
 )
 from r1_personas import RenderedPersona
 from r1_prompts import (
-    ack_reminder,
     control_prose,
     interviewer_prefix,
     learner_prefix,
     turn_reminder,
 )
-from r1_scheduler import COMMIT_STALL, F1_COUNTER, OwedMoveScheduler
+from r1_scheduler import (
+    COMMIT_STALL,
+    CURIOSITY_EVERY,
+    CURIOSITY_TOPICS,
+    F1_COUNTER,
+    REDIRECT_BRIEF,
+    REDIRECT_OPENERS,
+    TIME_CUE,
+    OwedMove,
+    OwedMoveScheduler,
+    curiosity_covered,
+    markers_match,
+)
 from r1_script import LEARNER_FILLER_VARIANTS
 from r1_script import line as script_line
-from r1_text import SpokenMemory, dollar_amounts, fuzzy_contains, pick_variant, word_count
+from r1_text import (
+    SpokenMemory,
+    dollar_amounts,
+    fuzzy_contains,
+    normalize,
+    pick_variant,
+    repeat_kind,
+    split_sentences,
+    word_count,
+)
 from r1_tracker import (
     CoverageTracker,
     build_judge_messages,
@@ -115,12 +139,36 @@ STT_SHORT_WORDS = 2
 STT_SHORT_SHARE_LIMIT = 0.10
 FIDELITY_MIN_R_SEC = 600
 
+KIND_OBJECTION = "objection"
+KIND_REDIRECT = "redirect"
+KIND_CUE = "cue"
+
 
 class TurnMode(str, Enum):
     SAY_ONLY = "say_only"
-    ACK_THEN_SAY = "ack_then_say"
+    INTENT = "intent"
     LLM_REPLY = "llm_reply"
     EXIT = "exit"
+
+
+@dataclass(frozen=True)
+class LearnerIntent:
+    """What the model must voice this turn (R1-Q).
+
+    ``brief`` is a plain-language goal written by the worker (never candidate text);
+    ``must_say`` are figures that must be written exactly; ``markers`` are all-of groups of
+    any-of regexes that prove the move was raised (``r1_scheduler.markers_match``);
+    ``fallbacks`` are the scripted variants to append, in the order to try them, if the
+    reply misses the markers, and ``fallback`` is the first of them.
+    """
+
+    kind: str
+    brief: str
+    must_say: tuple[str, ...]
+    markers: tuple[tuple[str, ...], ...]
+    fallback: str
+    fallbacks: tuple[str, ...] = ()
+    forced: bool = False
 
 
 @dataclass(frozen=True)
@@ -135,15 +183,15 @@ class TurnPlan:
     commitment_level: Level | None
     resolves_commitment: bool
     reminder: str | None
-    ack_word_cap: int
     guard_ctx: GuardContext
     voice: str = "learner"
     aside: bool = False
     character_break: str | None = None
+    intent: LearnerIntent | None = None
 
     @property
     def needs_llm(self) -> bool:
-        return self.mode in (TurnMode.ACK_THEN_SAY, TurnMode.LLM_REPLY)
+        return self.mode in (TurnMode.INTENT, TurnMode.LLM_REPLY)
 
     @property
     def exit_roleplay(self) -> bool:
@@ -152,11 +200,15 @@ class TurnPlan:
 
 @dataclass(frozen=True)
 class Speech:
-    """The text to hand to ``session.say``, and how it was built."""
+    """The text to hand to ``session.say``, and how it was built.
+
+    ``model_text`` is what survived the guard of the model's reply, ``tail_text`` the scripted
+    line or variant appended after it (an intent's fallback), ``guard`` the guard result.
+    """
 
     text: str
-    ack_text: str
-    scripted_text: str
+    model_text: str
+    tail_text: str
     guard: GuardResult | None
     voice: str = "learner"
 
@@ -202,6 +254,15 @@ class RolePlayEngine:
         self._spoken = SpokenMemory()
         self._fallbacks = 0
         self._fillers = 0
+        # Intent-voiced moves: how often each move was handed to the model and how often its
+        # scripted fallback had to be appended (counts only; logged, not posted).
+        self._intent_uses: dict[str, int] = {}
+        self._intent_fallbacks: dict[str, int] = {}
+        # Curiosity: the topics already asked (or answered by the advisor) and the free replies
+        # since the last one was suggested.
+        self._curiosity_asked: set[str] = set()
+        self._free_replies = 0
+        self._free_at_last_curiosity = 0
 
     # ------------------------------------------------------------------- properties
     @property
@@ -219,11 +280,15 @@ class RolePlayEngine:
         mode: str = "reply",
         turn: int | None = None,
         reminder: str | None = None,
+        quiet_empty: bool = False,
     ) -> GuardContext:
-        """The guard context for an LLM reply now.  An acknowledgement may reveal nothing.
+        """The guard context for an LLM reply now.
 
         Its ``control_texts`` are the private instruction prose of the prompts in play
         (never the words the model is meant to say), for the guard's echo check.
+        ``quiet_empty`` is for an intent reply: an empty result stays empty, because the
+        session appends the intent's own scripted variant instead of "Sorry, what were you
+        saying?".
         """
         released = self.tracker.gate.released_topics if mode == "reply" else frozenset()
         if phase == "roleplay":
@@ -246,6 +311,7 @@ class RolePlayEngine:
             said=self._spoken.snapshot() if phase == "roleplay" else (),
             seed=self.seed,
             variant=self._fallbacks,
+            quiet_empty=quiet_empty,
         )
 
     def filler_text(self) -> str:
@@ -280,6 +346,7 @@ class RolePlayEngine:
         signals = self.scheduler.observe_candidate_turn(candidate_text, r_sec)
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
         self._advisor_amounts.update(dollar_amounts(candidate_text))
+        self._note_curiosity_covered(candidate_text)
         ask = detect_ask(candidate_text)
         reasons: list[str] = []
         if obs.injection:
@@ -298,13 +365,23 @@ class RolePlayEngine:
             planned = self._plan_ask(ask.kind, r_sec, reasons)
             if planned is not None:
                 return planned
+        # Disclosure is tied to the turn that asks about the topic: a first probe is answered
+        # with the HINT layer and a follow-up (or a repeat probe of a released need) with the
+        # DEEP layer, in that very reply.  An owed move that is not forced waits one turn.
+        reveal_topics = self.tracker.gate.deep_due(obs.gate)
         if decision is not None and decision.move is not None:
             move = decision.move
             self.scheduler.issue(move)
             if decision.action == "redirect":
                 reasons.append("close_attempt_redirect")
-                text = f"{decision.prefix} {move.text}"
-                return self._plan(TurnMode.SAY_ONLY, reasons, scripted=text, move_id=move.id)
+                return self._intent_plan(
+                    move,
+                    reasons,
+                    redirect=True,
+                    first_probes=obs.gate.first_probes,
+                    reveal_topics=reveal_topics,
+                    monologue=candidate_seconds,
+                )
             reasons.append("close_attempt_stall")
             return self._plan(
                 TurnMode.SAY_ONLY,
@@ -314,10 +391,6 @@ class RolePlayEngine:
                 level=Level.WEAK,
                 resolves=True,
             )
-        # Disclosure is tied to the turn that asks about the topic: a first probe is answered
-        # with the HINT layer and a follow-up (or a repeat probe of a released need) with the
-        # DEEP layer, in that very reply.  An owed move that is not forced waits one turn.
-        reveal_topics = self.tracker.gate.deep_due(obs.gate)
         reveal_due = bool(obs.gate.first_probes) or bool(reveal_topics)
         move = self.scheduler.select(r_sec)
         if move is not None:
@@ -326,24 +399,35 @@ class RolePlayEngine:
             else:
                 self.scheduler.issue(move)
                 reasons.append(f"owed:{move.id}" + (":forced" if move.forced else ""))
-                is_stall = move.id == COMMIT_STALL
-                return self._plan(
-                    TurnMode.ACK_THEN_SAY,
+                if move.id == COMMIT_STALL:
+                    # The 13:00 stall is the scripted WEAK line, spoken and masked exactly.
+                    return self._plan(
+                        TurnMode.SAY_ONLY,
+                        reasons,
+                        scripted=move.text,
+                        move_id=move.id,
+                        level=Level.WEAK,
+                        resolves=True,
+                    )
+                return self._intent_plan(
+                    move,
                     reasons,
-                    scripted=move.text,
-                    move_id=move.id,
+                    redirect=False,
                     first_probes=obs.gate.first_probes,
+                    reveal_topics=reveal_topics,
                     monologue=candidate_seconds,
-                    level=Level.WEAK if is_stall else None,
-                    resolves=is_stall,
                 )
         reasons.append("free_reply")
+        curiosity = ""
+        if not reveal_due and break_kind is None:
+            curiosity = self._curiosity_for_free_reply()
         return self._plan(
             TurnMode.LLM_REPLY,
             reasons,
             first_probes=obs.gate.first_probes,
             reveal_topics=reveal_topics,
             monologue=candidate_seconds,
+            curiosity=curiosity,
         )
 
     @staticmethod
@@ -416,6 +500,115 @@ class RolePlayEngine:
             resolves=True,
         )
 
+    # ------------------------------------------------------------------- intents
+    def _fallback_order(
+        self, key: str, variants: tuple[str, ...], openers: tuple[str, ...] = ()
+    ) -> tuple[str, ...]:
+        """The scripted variants in the order to try them: seeded rotation, fresh ones first.
+
+        The start of the rotation comes from the attempt id and the move (so two sessions do
+        not open with the same variant), and each time the move is handed to the model the
+        rotation moves on.  A variant whose sentences the learner already said is tried last.
+        ``openers`` (the early-farewell redirect) are paired with the variants one for one.
+        """
+        count = self._intent_uses.get(key, 0)
+        seed = f"{self.seed}:{key}"
+        ordered: list[str] = []
+        for step in range(len(variants)):
+            text = pick_variant(variants, seed, count + step)
+            if openers:
+                text = f"{pick_variant(openers, seed, count + step)} {text}"
+            ordered.append(text)
+        said = self._spoken.snapshot()
+        fresh = [text for text in ordered if not _repeats(text, said)]
+        return tuple(fresh + [text for text in ordered if text not in fresh])
+
+    def _intent_plan(
+        self,
+        move: OwedMove,
+        reasons: list[str],
+        *,
+        redirect: bool,
+        first_probes: tuple[str, ...],
+        reveal_topics: tuple[str, ...],
+        monologue: float | None,
+    ) -> TurnPlan:
+        """The plan for an owed move the model voices (the move is already issued)."""
+        variants = move.variants or (move.text,)
+        fallbacks = self._fallback_order(
+            move.id, variants, REDIRECT_OPENERS if redirect else ()
+        )
+        self._intent_uses[move.id] = self._intent_uses.get(move.id, 0) + 1
+        brief = f"{REDIRECT_BRIEF} {move.brief}" if redirect else move.brief
+        kind = KIND_REDIRECT if redirect else (KIND_CUE if move.id == TIME_CUE else KIND_OBJECTION)
+        intent = LearnerIntent(
+            kind=kind,
+            brief=brief,
+            must_say=move.must_say,
+            markers=move.markers,
+            fallback=fallbacks[0],
+            fallbacks=fallbacks,
+            forced=move.forced and not redirect,
+        )
+        return self._plan(
+            TurnMode.INTENT,
+            reasons,
+            move_id=move.id,
+            intent=intent,
+            first_probes=first_probes,
+            reveal_topics=reveal_topics,
+            monologue=monologue,
+        )
+
+    def intent_tail(self, plan: TurnPlan, spoken_so_far: str) -> str:
+        """The scripted variant to append after an intent reply, or "" if it already delivered.
+
+        ``spoken_so_far`` is what the guard let through of the model's reply.  If it proves
+        the move (the markers hit) nothing is appended.  Otherwise the first variant that does
+        not repeat something the learner already said, in this call or in this very reply,
+        is returned (the repetition check; the first one if every variant repeats), so the
+        owed move is never lost to the model and is never said twice word for word.
+        """
+        intent = plan.intent
+        if intent is None or markers_match(intent.markers, spoken_so_far):
+            return ""
+        said = self._spoken.snapshot() + tuple(
+            normalize(sentence) for sentence in split_sentences(spoken_so_far)
+        )
+        candidates = intent.fallbacks or (intent.fallback,)
+        chosen = next((text for text in candidates if not _repeats(text, said)), candidates[0])
+        if plan.move_id is not None:
+            self._intent_fallbacks[plan.move_id] = self._intent_fallbacks.get(plan.move_id, 0) + 1
+        return chosen
+
+    # ------------------------------------------------------------------- curiosity
+    def _note_curiosity_covered(self, advisor_text: str) -> None:
+        """A topic the advisor already answered is not asked about."""
+        for topic, _label in CURIOSITY_TOPICS:
+            if topic not in self._curiosity_asked and curiosity_covered(topic, advisor_text):
+                self._curiosity_asked.add(topic)
+
+    def _curiosity_for_free_reply(self) -> str:
+        """One unasked question topic every ``CURIOSITY_EVERY`` free replies, else "".
+
+        These are the neutral questions that used to be scheduled (live or recorded, what
+        would I build) plus three more; the model is only told what it is curious about and
+        may ask in its own words, so nothing is owed and nothing is graded.
+        """
+        self._free_replies += 1
+        if self._free_replies - self._free_at_last_curiosity < CURIOSITY_EVERY:
+            return ""
+        ids = tuple(topic for topic, _label in CURIOSITY_TOPICS)
+        labels = dict(CURIOSITY_TOPICS)
+        for step in range(len(ids)):
+            topic = pick_variant(ids, self.seed, step)
+            if topic not in self._curiosity_asked:
+                self._curiosity_asked.add(topic)
+                self._free_at_last_curiosity = self._free_replies
+                return labels[topic]
+        return ""
+
+    # ------------------------------------------------------------------ the plan
     def _plan(
         self,
         mode: TurnMode,
@@ -430,21 +623,13 @@ class RolePlayEngine:
         monologue: float | None = None,
         voice: str = "learner",
         aside: bool = False,
+        intent: LearnerIntent | None = None,
+        curiosity: str = "",
     ) -> TurnPlan:
         reminder: str | None = None
         kind = None if aside else self._break_kind
         price_wrap = self.scheduler.price_wrap_turn == self.scheduler.turn
-        if mode is TurnMode.ACK_THEN_SAY:
-            reminder = ack_reminder(
-                self.persona,
-                r_sec=self.last_r,
-                first_probe_topics=first_probes,
-                monologue_sec=monologue,
-                character_break=kind is not None,
-                price_wrap=price_wrap,
-            )
-            ctx = self.guard_context(mode="ack", reminder=reminder)
-        elif mode is TurnMode.LLM_REPLY:
+        if mode in (TurnMode.INTENT, TurnMode.LLM_REPLY):
             # The layers are handed over only here, on the turn that asked about the topic.
             self.tracker.gate.mark_hint_offered(first_probes)
             self.tracker.gate.mark_deep_offered(reveal_topics)
@@ -456,8 +641,14 @@ class RolePlayEngine:
                 monologue_sec=monologue,
                 character_break=kind is not None,
                 price_wrap=price_wrap,
+                intent_brief="" if intent is None else intent.brief,
+                must_say=() if intent is None else intent.must_say,
+                intent_forced=False if intent is None else intent.forced,
+                curiosity=curiosity,
             )
-            ctx = self.guard_context(mode="reply", reminder=reminder)
+            ctx = self.guard_context(
+                mode="reply", reminder=reminder, quiet_empty=mode is TurnMode.INTENT
+            )
         else:
             ctx = self.guard_context(mode="reply")
         return TurnPlan(
@@ -469,34 +660,36 @@ class RolePlayEngine:
             commitment_level=level,
             resolves_commitment=resolves,
             reminder=reminder,
-            ack_word_cap=ACK_WORD_CAP,
             guard_ctx=ctx,
             voice=voice,
             aside=aside,
             character_break=kind,
+            intent=intent,
         )
 
     # ---------------------------------------------------------------------- speech
-    def compose_speech(self, plan: TurnPlan, ack_raw: str = "") -> Speech:
-        """The text to say for a SAY_ONLY or ACK_THEN_SAY plan.
+    def compose_speech(self, plan: TurnPlan, model_raw: str = "") -> Speech:
+        """The text to say for a SAY_ONLY or INTENT plan, for callers that do not stream.
 
-        The acknowledgement is guarded and word-capped; an empty or failed LLM call
-        simply yields the scripted line alone, so an owed move is never lost.
+        An INTENT plan's ``model_raw`` is guarded like a streamed reply; when it does not
+        prove the move, the scripted variant follows it (``intent_tail``).  An empty or failed
+        model call therefore yields the scripted variant alone, so an owed move is never lost.
         """
         if plan.mode is TurnMode.EXIT:
             return Speech("", "", "", None, plan.voice)  # nothing is said on an exit
         if plan.mode is TurnMode.SAY_ONLY:
             return Speech(plan.scripted_text, "", plan.scripted_text, None, plan.voice)
-        if plan.mode is not TurnMode.ACK_THEN_SAY:
+        if plan.mode is not TurnMode.INTENT:
             raise ValueError("an LLM_REPLY plan is streamed through stream_guard")
-        ack = ""
+        model_text = ""
         result: GuardResult | None = None
-        if ack_raw.strip():
-            result = guard_text(ack_raw, plan.guard_ctx)
+        if model_raw.strip():
+            result = guard_text(model_raw, plan.guard_ctx)
             self.record_guard(result)
-            ack = result.text
-        text = f"{ack} {plan.scripted_text}".strip()
-        return Speech(text, ack, plan.scripted_text, result, plan.voice)
+            model_text = result.text
+        tail = self.intent_tail(plan, model_text)
+        text = f"{model_text} {tail}".strip()
+        return Speech(text, model_text, tail, result, plan.voice)
 
     def stream_guard(self, plan: TurnPlan) -> StreamGuard:
         """A per-reply sentence guard; pass its ``result`` to ``record_guard`` afterwards."""
@@ -650,6 +843,14 @@ class RolePlayEngine:
                 "fallbacks_used": self._fallbacks,
                 "fillers_used": self._fillers,
             },
+            # Intent-voiced moves (counts only; logged for the rehearsal metrics, not posted):
+            # how often each move went to the model and how often its scripted variant had to
+            # be appended because the model's reply missed the markers.
+            "intents": {
+                "handed_to_model": dict(self._intent_uses),
+                "fallback_appended": dict(self._intent_fallbacks),
+                "curiosity_asked": sorted(self._curiosity_asked),
+            },
             "early_close": {
                 "attempts": self.scheduler.close_attempts,
                 "exit_requested": self.exit_requested,
@@ -666,3 +867,8 @@ class RolePlayEngine:
             "exclusion_reasons": schedule["exclusion_reasons"],
             "fidelity": fidelity,
         }
+
+
+def _repeats(text: str, said: tuple[str, ...]) -> bool:
+    """True when any sentence of ``text`` repeats something in ``said`` (``repeat_kind``)."""
+    return any(repeat_kind(sentence, said) is not None for sentence in split_sentences(text))

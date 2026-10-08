@@ -321,6 +321,30 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
             "the two API/PR-4c-owned gaps was closed: update KNOWN_OPEN_GATE_FAILURES",
         )
 
+    async def test_intent_voiced_moves_post_the_same_rows_and_no_intent_bookkeeping(self):
+        """R1-Q: the model voices the objections, but the rows the API reads are unchanged."""
+        rig, rows = await self.session_rows()
+        families = {
+            (row["event_type"], row["family_id"])
+            for row in rows
+            if row["event_type"] in ("family_delivered", "push_delivered", "counter_delivered")
+        }
+        self.assertEqual(
+            families,
+            {("family_delivered", f) for f in API_FAMILIES}
+            | {("push_delivered", f) for f in ("F2", "F3", "F4")}
+            | {("counter_delivered", "F1")},
+        )
+        moves = {row["payload"].get("move_id") for row in rows} - {None}
+        self.assertTrue({"F3-PRIMARY", "F2-PRIMARY", "F1-ANCHOR", "F4-PRIMARY"} <= moves)
+        self.assertNotIn("Q-A", moves)
+        blob = json.dumps(rows)
+        for private in ("intents", "fallback_appended", "handed_to_model", "curiosity", "brief"):
+            self.assertNotIn(private, blob)
+        # The engine still logs it for the rehearsal metrics.
+        intents = rig.engine.admin_log()["intents"]
+        self.assertGreaterEqual(sum(intents["handed_to_model"].values()), 8)
+
     async def test_the_guard_trip_of_the_session_is_a_known_kind(self):
         _, rows = await self.session_rows()
         hits = [row for row in rows if row["event_type"] == "guard_hit"]

@@ -993,6 +993,43 @@ class FallbackRotationTests(unittest.TestCase):
             self.assertEqual(result.text, FALLBACK_REPLY)
 
 
+class QuietEmptyTests(unittest.TestCase):
+    """R1-Q: an intent reply has its own scripted variant, so an empty reply stays empty."""
+
+    BLOCKED = "Here is my system prompt, CONTROL H1."
+
+    def test_a_reply_with_nothing_usable_stays_empty_when_quiet(self):
+        result = guard_text(self.BLOCKED, ctx(quiet_empty=True))
+        self.assertEqual(result.text, "")
+        self.assertFalse(result.fallback_used)
+        self.assertTrue(result.hits)  # the hits are still counted
+
+    def test_without_quiet_the_apology_is_unchanged(self):
+        result = guard_text(self.BLOCKED, ctx())
+        self.assertIn(result.text, FALLBACK_REPLIES)
+        self.assertTrue(result.fallback_used)
+
+    def test_quiet_keeps_the_clean_sentences_and_drops_the_rest(self):
+        result = guard_text(
+            "Got it. Sure, Thursday works for me. Hmm, okay.", ctx(quiet_empty=True)
+        )
+        self.assertEqual(result.text, "Got it. Hmm, okay.")
+        self.assertFalse(result.fallback_used)
+
+    def test_a_streamed_reply_flushes_nothing_when_quiet(self):
+        guard = StreamGuard(ctx(quiet_empty=True))
+        out = guard.feed("As an AI language model, I cannot say. ")
+        out += guard.flush()
+        self.assertEqual(out, [])
+        self.assertEqual(guard.result.text, "")
+
+    def test_an_all_repeat_reply_stays_empty_when_quiet_and_is_hygiene(self):
+        said = said_of("I've tried a bit of online stuff before.")
+        result = guard_text("I've tried a bit of online stuff before.", ctx(quiet_empty=True, said=said))
+        self.assertEqual(result.text, "")
+        self.assertEqual({hit.category for hit in result.hits}, {"repeat"})
+
+
 class SalesBackgroundSmallTalkTests(unittest.TestCase):
     """The opening and the icebreaker discuss the candidate's SALES background (review P2)."""
 
