@@ -66,7 +66,8 @@ _OPEN_MARKERS_RE = re.compile(
     r"\b(what|how|why|which|where|when|who|tell me|walk me|describe|explain|"
     r"share|talk me|take me through|introduce|summari[sz]e|give|list|"
     r"elaborate|talk about|outline|run me through|brief|provide|detail|"
-    r"discuss|go over|go through)\b"
+    r"discuss|go over|go through|walk through|walk us|take us through|expand|"
+    r"break down|example|recall|highlight|mention|compare|speak about)\b"
 )
 # A yes/no clause starts the text, or a clause after a sentence/clause break
 # (optionally led by and/or/so), with an auxiliary + a pronoun subject. So

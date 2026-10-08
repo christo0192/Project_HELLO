@@ -249,6 +249,11 @@ class TestClassifier(unittest.TestCase):
             "Could you elaborate on that?",
             "Could you walk me through your day?",
             "Can you go over your last role?",
+            "Could you walk through your last project?",
+            "Could you take us through your sales process?",
+            "Could you expand on that?",
+            "Could you break down your responsibilities?",
+            "Can you think of an example of a hard deal?",
         ):
             with self.subTest(text=text):
                 self.assertEqual(
