@@ -13,6 +13,7 @@ import type { Page } from '@playwright/test';
 import { ARTIFACTS_DIR } from './fixtures/axe';
 import { expect, test } from './fixtures/candidate-harness';
 import {
+  LEARNER_NAME,
   LIVE_DESKTOP_SIZES,
   agree,
   heading,
@@ -59,10 +60,32 @@ test.describe('R1 candidate screenshots @shots', () => {
     await expect(page.getByText('Getting to know you')).toBeVisible();
     await shoot(page, project, 'live-icebreaker');
 
-    await r1.mock.setPhase('roleplay');
+    // The briefing: the interviewer has named the learner and is waiting for "ready".
+    await r1.mock.setAgentAttributes({ phase: 'transition', leadname: LEARNER_NAME, awaiting: 'ready' });
+    await expect(page.getByRole('button', { name: "I'm ready" })).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Your role-play' }).getByText(LEARNER_NAME)).toBeVisible();
+    await shoot(page, project, 'live-briefing');
+
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+    await shoot(page, project, 'live-briefing-sent');
+
+    // The role-play: the clock is up, the button is gone.
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', awaiting: '', rpleft: '780' });
     await r1.mock.caption('c2', 'Hello? Yes, this is Meera speaking.', true);
     await expect(page.getByRole('region', { name: 'Your role-play' })).toBeVisible();
+    await expect(page.getByRole('timer')).toHaveText('Role-play · 13 min left');
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
     await shoot(page, project, 'live-roleplay');
+
+    // The button failing: the candidate is told to say it instead.
+    await r1.mock.setAgentAttributes({ phase: 'transition', awaiting: 'ready', rpleft: '' });
+    r1.state.failures.ready = { status: 500, error: 'service_unavailable' };
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByRole('alert')).toContainText("We couldn't send that");
+    await shoot(page, project, 'live-briefing-failed');
+    r1.consoleErrors.length = 0; // a 500 is logged by the browser's network layer
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', awaiting: '', rpleft: '700' });
 
     await page.getByRole('button', { name: 'Turn camera off' }).click();
     await expect(page.getByText(/Your camera is off/)).toBeVisible();

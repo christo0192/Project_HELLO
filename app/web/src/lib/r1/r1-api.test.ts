@@ -71,6 +71,7 @@ describe('R1 route table', () => {
       preflight: '/api/r1/preflight',
       attempts: '/api/r1/attempts',
       exchange: '/api/r1/exchange',
+      ready: '/api/r1/ready',
     });
   });
 });
@@ -198,6 +199,41 @@ describe('r1Api requests', () => {
       nonce: 'nonce-value',
     });
     expect(result).toEqual({ status: 'preparing' });
+  });
+
+  it('sends "I\'m ready" as the attempt token and nonce, in the body only', async () => {
+    const fetchMock = mockFetch(reply(200, { ok: true }));
+    await expect(r1Api.ready('attempt-token', 'nonce-value')).resolves.toBeUndefined();
+    const { url, init, body } = lastCall(fetchMock);
+    expect(url.endsWith('/api/r1/ready')).toBe(true);
+    expect(url).not.toContain('attempt-token');
+    expect(url).not.toContain('?');
+    expect(init.method).toBe('POST');
+    expect(init.credentials).toBe('omit');
+    expect(body).toEqual({ attempt_token: 'attempt-token', nonce: 'nonce-value' });
+    expect(
+      Object.keys(init.headers as Record<string, string>).map((name) => name.toLowerCase()),
+    ).not.toContain('authorization');
+  });
+
+  it.each([
+    [409, 'not_live'],
+    [429, 'http_429'],
+    [404, 'r1_attempt_invalid'],
+    [503, 'service_unavailable'],
+  ])('rejects a %d answer to "I\'m ready" with its code', async (status, code) => {
+    mockFetch(reply(status, status === 429 ? {} : { error: code }));
+    const error = await r1Api.ready('attempt-token', 'nonce-value').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ message: code, status });
+  });
+
+  it('rejects "I\'m ready" when the network is down', async () => {
+    mockFetch(new TypeError('Failed to fetch'));
+    await expect(r1Api.ready('attempt-token', 'nonce-value')).rejects.toMatchObject({
+      message: 'network_unreachable',
+      status: 0,
+    });
   });
 
   it('surfaces only the machine code of an error, never server prose', async () => {

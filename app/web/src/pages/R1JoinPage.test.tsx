@@ -12,9 +12,13 @@ const h = vi.hoisted(() => ({
   withdrawConsent: vi.fn(),
   createAttempt: vi.fn(),
   exchange: vi.fn(),
+  ready: vi.fn(),
   created: [] as Array<{
     handlers: {
       onPhase: (phase: string) => void;
+      onLeadName: (name: string | null) => void;
+      onRoleplayLeft: (seconds: number | null) => void;
+      onAwaitingReady: (awaiting: boolean) => void;
       onAgentPresent: (present: boolean) => void;
       onAgentLevel: (level: number) => void;
       onCaptions: (segments: unknown[], phase: string | null) => void;
@@ -46,6 +50,7 @@ vi.mock('../lib/r1/r1-api', async (importOriginal) => ({
     withdrawConsent: h.withdrawConsent,
     createAttempt: h.createAttempt,
     exchange: h.exchange,
+    ready: h.ready,
   },
 }));
 vi.mock('../lib/r1/r1-room', () => ({
@@ -174,6 +179,7 @@ beforeEach(() => {
   h.withdrawConsent.mockResolvedValue(undefined);
   h.createAttempt.mockResolvedValue(ATTEMPT);
   h.exchange.mockResolvedValue(ROOM);
+  h.ready.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -705,7 +711,11 @@ describe('live interview', () => {
 
     act(() => live.handlers.onPhase('transition'));
     const card = screen.getByRole('region', { name: 'Your role-play' });
-    expect(within(card).getByText('Meera from Pune')).toBeVisible();
+    // The server never names the learner; until the interviewer does, the card is generic.
+    expect(within(card).getByText('A prospective learner')).toBeVisible();
+    act(() => live.handlers.onLeadName('Meera Iyer'));
+    expect(within(card).getByText('Meera Iyer')).toBeVisible();
+    expect(within(card).queryByText('A prospective learner')).toBeNull();
 
     act(() => live.handlers.onPhase('roleplay'));
     expect(screen.getByText('Role-play')).toBeVisible();
@@ -766,6 +776,180 @@ describe('live interview', () => {
     live.controller.setMicMuted.mockRejectedValueOnce(new Error('device busy'));
     fireEvent.click(screen.getByRole('button', { name: 'Mute microphone' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/could not change your microphone/);
+  });
+});
+
+describe('the role-play briefing, clock and "I\'m ready"', () => {
+  const READY = { name: "I'm ready" };
+
+  it('shows no button, and no clock, from an interviewer that publishes neither', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    expect(screen.queryByRole('button', READY)).toBeNull();
+    act(() => live.handlers.onPhase('roleplay'));
+    expect(screen.queryByRole('timer')).toBeNull();
+  });
+
+  it('shows the button only while the interviewer is waiting in the briefing', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onAwaitingReady(true));
+    expect(screen.getByRole('button', READY)).toBeVisible();
+    act(() => live.handlers.onAwaitingReady(false));
+    expect(screen.queryByRole('button', READY)).toBeNull();
+    act(() => live.handlers.onAwaitingReady(true));
+    act(() => live.handlers.onPhase('roleplay'));
+    expect(screen.queryByRole('button', READY)).toBeNull();
+  });
+
+  it('sends the signal with a freshly minted attempt token and the attempt\'s own nonce', async () => {
+    const live = await toLive();
+    h.createAttempt.mockClear();
+    h.createAttempt.mockResolvedValue({ ...ATTEMPT, attempt_token: 'fresh-token', rejoin: true });
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onAwaitingReady(true));
+    fireEvent.click(screen.getByRole('button', READY));
+    expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+    // The token from joining lasts five minutes and the briefing is later: a current one is minted
+    // for the same attempt with the stored nonce, and that is what the server is shown.
+    expect(h.createAttempt).toHaveBeenCalledTimes(1);
+    expect(h.createAttempt).toHaveBeenCalledWith(LINK, NONCE);
+    expect(h.ready).toHaveBeenCalledTimes(1);
+    expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
+  });
+
+  it('says what to do instead when the signal could not be sent, and lets the candidate try again', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onAwaitingReady(true));
+    h.ready.mockRejectedValueOnce(new ApiError('http_429', 429));
+    fireEvent.click(screen.getByRole('button', READY));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "We couldn't send that. Just say “I'm ready”.",
+    );
+    fireEvent.click(screen.getByRole('button', READY));
+    expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+    expect(h.ready).toHaveBeenCalledTimes(2);
+  });
+
+  it('reports a failure to mint the attempt token the same way, and sends nothing', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onAwaitingReady(true));
+    h.createAttempt.mockRejectedValueOnce(new ApiError('r1_attempt_not_live', 409));
+    fireEvent.click(screen.getByRole('button', READY));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/couldn't send that/);
+    expect(h.ready).not.toHaveBeenCalled();
+  });
+
+  it('keeps the interview going, and the nonce, when "I\'m ready" fails', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onAwaitingReady(true));
+    h.ready.mockRejectedValueOnce(new ApiError('not_live', 409));
+    fireEvent.click(screen.getByRole('button', READY));
+    await screen.findByRole('alert');
+    expect(screen.getByRole('region', { name: 'Live video interview' })).toBeVisible();
+    expect(readNonce(LINK)).toBe(NONCE);
+    expect(live.controller.dispose).not.toHaveBeenCalled();
+  });
+
+  it('shows the clock from the interviewer, counted down only while the role-play runs', async () => {
+    const live = await toLive();
+    // Faked only now: the waits above use real timers, and the page measures with performance.now().
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] });
+    try {
+      act(() => live.handlers.onPhase('transition'));
+      act(() => live.handlers.onRoleplayLeft(480));
+      // In the briefing the role-play has not begun: it holds at the full budget.
+      act(() => {
+        vi.advanceTimersByTime(120_000);
+      });
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 8 min left');
+
+      act(() => live.handlers.onPhase('roleplay'));
+      act(() => {
+        vi.advanceTimersByTime(65_000);
+      });
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 7 min left');
+
+      // An aside pauses it at the value it had counted down to, however long the aside is.
+      act(() => live.handlers.onPhase('aside'));
+      act(() => {
+        vi.advanceTimersByTime(300_000);
+      });
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 7 min left');
+
+      // A fresh number from the interviewer wins over the local count.
+      act(() => live.handlers.onRoleplayLeft(200));
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 4 min left');
+      act(() => live.handlers.onPhase('roleplay'));
+      act(() => {
+        vi.advanceTimersByTime(30_000);
+      });
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 3 min left');
+
+      // The interviewer clears it when the role-play is over.
+      act(() => live.handlers.onRoleplayLeft(null));
+      expect(screen.queryByRole('timer')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('takes the number that arrives with a phase change after freezing the old count', async () => {
+    const live = await toLive();
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] });
+    try {
+      act(() => live.handlers.onPhase('roleplay'));
+      act(() => live.handlers.onRoleplayLeft(300));
+      act(() => {
+        vi.advanceTimersByTime(40_000);
+      });
+      // The room reports the phase first, then the clock that came with it.
+      act(() => {
+        live.handlers.onPhase('aside');
+        live.handlers.onRoleplayLeft(255);
+      });
+      act(() => {
+        vi.advanceTimersByTime(600_000);
+      });
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 5 min left');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('forgets the name, the clock and the wait when the candidate rejoins', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onLeadName('Meera Iyer'));
+    act(() => live.handlers.onRoleplayLeft(480));
+    act(() => live.handlers.onAwaitingReady(true));
+    expect(screen.getByRole('button', READY)).toBeVisible();
+    act(() => live.handlers.onEnded('disconnected'));
+    await findH1('The connection to your interview ended.');
+    fireEvent.click(screen.getByRole('button', { name: 'Rejoin interview' }));
+    await findH1('Video interview');
+    fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+    await screen.findByRole('region', { name: 'Live video interview' });
+    // The new room starts blank; what the interviewer still publishes arrives from the room.
+    expect(screen.queryByRole('button', READY)).toBeNull();
+    expect(screen.queryByRole('timer')).toBeNull();
+    const again = h.created[h.created.length - 1];
+    act(() => again.handlers.onPhase('transition'));
+    expect(screen.getByText('A prospective learner')).toBeVisible();
+    expect(screen.queryByText('Meera Iyer')).toBeNull();
+  });
+
+  it('sends nothing to the server about "ready" unless the candidate presses the button', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onAwaitingReady(true));
+    act(() => live.handlers.onPhase('roleplay'));
+    act(() => live.handlers.onAwaitingReady(false));
+    expect(h.ready).not.toHaveBeenCalled();
   });
 });
 

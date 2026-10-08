@@ -39,6 +39,12 @@ import { MOCK_LIVEKIT_ORIGIN } from './env';
 /** 64 lowercase hex characters, the shape the page accepts from the fragment. */
 export const R1_LINK_TOKEN = 'e2e1'.repeat(16);
 export const R1_ATTEMPT_TOKEN = 'e2e-attempt-token-not-a-secret';
+/**
+ * What a rejoin-style `attempts` call (link + nonce) mints. The real attempt token lasts five
+ * minutes and the role-play briefing comes later, so "I'm ready" must present a FRESH one: the
+ * fake accepts only this token on `/api/r1/ready`, while the exchange takes either.
+ */
+export const R1_FRESH_ATTEMPT_TOKEN = 'e2e-fresh-attempt-token-not-a-secret';
 export const R1_NONCE = 'e2e-nonce-0123456789abcdef';
 
 export interface R1RecordedRequest {
@@ -68,7 +74,9 @@ export interface R1MockState {
   /** How many 202 `preparing` answers the exchange gives before the room is ready. */
   exchangePreparing: number;
   /** Install an error to make one route fail (consumed on use unless `sticky`). */
-  failures: Partial<Record<'status' | 'preflight' | 'attempts' | 'exchange' | 'consent', R1ForcedError>>;
+  failures: Partial<
+    Record<'status' | 'preflight' | 'attempts' | 'exchange' | 'consent' | 'ready', R1ForcedError>
+  >;
 }
 
 export function createR1State(): R1MockState {
@@ -287,7 +295,7 @@ export function r1Router(state: R1MockState): ApiRouter {
           // nonce is NOT returned again (the page already holds it).
           if (!state.liveSession) return json(409, { error: 'r1_attempt_not_live' });
           if (body.nonce !== R1_NONCE) return json(404, { error: 'r1_attempt_invalid' });
-          return json(200, { ...attempt, rejoin: true });
+          return json(200, { ...attempt, attempt_token: R1_FRESH_ATTEMPT_TOKEN, rejoin: true });
         }
         if (state.liveSession) return json(409, { error: 'r1_busy', retry_after_sec: 1200 });
         state.liveSession = true;
@@ -295,7 +303,9 @@ export function r1Router(state: R1MockState): ApiRouter {
       }
       case 'POST /api/r1/exchange': {
         if (!onlyKeys(body, ['attempt_token', 'nonce'])) return validationError();
-        if (body?.attempt_token !== R1_ATTEMPT_TOKEN || body?.nonce !== R1_NONCE) {
+        const knownToken = body?.attempt_token === R1_ATTEMPT_TOKEN
+          || body?.attempt_token === R1_FRESH_ATTEMPT_TOKEN;
+        if (!knownToken || body?.nonce !== R1_NONCE) {
           return json(404, { error: 'r1_attempt_invalid' });
         }
         const failure = forced('exchange');
@@ -310,6 +320,18 @@ export function r1Router(state: R1MockState): ApiRouter {
           expires_at: '2026-10-07T00:10:00.000Z',
           attempt_id: 'e2e00000-0000-4000-8000-0000000000a1',
         });
+      }
+      case 'POST /api/r1/ready': {
+        // The relay to the interviewer (the candidate's room token cannot publish data). The body is
+        // the exchange's; the attempt token must be a current one, and the attempt must be live.
+        if (!onlyKeys(body, ['attempt_token', 'nonce'])) return validationError();
+        if (body?.attempt_token !== R1_FRESH_ATTEMPT_TOKEN || body?.nonce !== R1_NONCE) {
+          return json(404, { error: 'r1_attempt_invalid' });
+        }
+        const failure = forced('ready');
+        if (failure) return failure;
+        if (!state.liveSession) return json(409, { error: 'not_live' });
+        return json(200, { ok: true });
       }
       default:
         // An /api/r1/ route the page called that this fake does not know:

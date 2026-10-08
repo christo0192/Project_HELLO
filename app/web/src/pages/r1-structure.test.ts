@@ -124,10 +124,10 @@ describe('R1 never touches the legacy or recording paths', () => {
 });
 
 describe('R1 trusts only the agent', () => {
-  it('reads the phase and speaker only through the agent-kind rule', () => {
+  it('reads the phase, the speaker and the other attributes only through the agent-kind rule', () => {
     const room = read('src/lib/r1/r1-room.ts');
     expect(room).toContain('isAgentParticipant');
-    expect(room).toContain('trustedPhase');
+    expect(room).toContain('trustedSignals');
     expect(room).not.toMatch(/\.attributes\b/);
     const agent = read('src/lib/r1/r1-agent.ts');
     expect(agent).toContain('ParticipantKind');
@@ -140,6 +140,28 @@ describe('R1 trusts only the agent', () => {
       const rawPhase = /attributes\??\.\s*phase|\[['"]phase['"]\]/;
       expect(read(file), `${file} reads a raw phase attribute`).not.toMatch(rawPhase);
     }
+  });
+
+  it('reads the learner name, the clock and the ready flag only in the agent module', () => {
+    for (const file of R1_FILES) {
+      if (file === 'src/lib/r1/r1-agent.ts') continue;
+      const code = read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      const raw = /attributes\??\.\s*(leadname|rpleft|awaiting)|\[['"](leadname|rpleft|awaiting)['"]\]/;
+      expect(code, `${file} reads a raw agent attribute`).not.toMatch(raw);
+    }
+  });
+
+  it('sends "I\'m ready" through the one API client, never over the room', () => {
+    // The candidate token cannot publish data (canPublishData: false is a pinned security
+    // control), and the browser must not try: the server relays the signal.
+    for (const file of R1_FILES) {
+      const code = read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      expect(code, `${file} publishes data from the browser`).not.toMatch(
+        /\b(publishData|performRpc|sendText|sendBytes|setAttributes|setMetadata)\b/,
+      );
+    }
+    expect(read('src/lib/r1/r1-api.ts')).toContain("ready: '/api/r1/ready'");
+    expect(read('src/pages/R1JoinPage.tsx')).toContain('r1Api.ready(');
   });
 });
 

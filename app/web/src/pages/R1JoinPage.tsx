@@ -13,9 +13,9 @@ import {
   type R1AttemptGrant,
   type R1ConsentTemplate,
   type R1ErrorKind,
-  type R1LeadCard,
   type R1Status,
 } from '../lib/r1/r1-api';
+import { anchorClock, retimeClock, type R1Clock } from '../lib/r1/r1-clock';
 import { captureLinkToken, clearNonce, readNonce, saveNonce } from '../lib/r1/r1-link';
 import { stopR1Media, type R1LocalMedia } from '../lib/r1/r1-media';
 import {
@@ -150,7 +150,10 @@ export function R1JoinPage() {
   const [withdrawError, setWithdrawError] = useState<string | null>(null);
   const [liveElsewhere, setLiveElsewhere] = useState(false);
   const [liveError, setLiveError] = useState<string | null>(null);
-  const [lead, setLead] = useState<R1LeadCard | null>(null);
+  // What the interviewer publishes beside the phase (all optional; see r1-agent.ts).
+  const [leadName, setLeadName] = useState<string | null>(null);
+  const [roleplayClock, setRoleplayClock] = useState<R1Clock | null>(null);
+  const [awaitingReady, setAwaitingReady] = useState(false);
   const [phase, setPhase] = useState<R1Phase | null>(null);
   const [agentPresent, setAgentPresent] = useState(false);
   const [lastActive, setLastActive] = useState<R1Phase | null>(null);
@@ -165,6 +168,10 @@ export function R1JoinPage() {
   const mediaRef = useRef<R1LocalMedia | null>(null);
   const audioElementRef = useRef<HTMLAudioElement | null>(null);
   const loadRunRef = useRef(0);
+  /** The phase last reported, so the role-play clock can tell when the role-play starts or stops. */
+  const phaseRef = useRef<R1Phase | null>(null);
+  /** The nonce of the attempt this tab is in: what "I'm ready" presents to the server. */
+  const nonceRef = useRef<string | null>(null);
   const mountedRef = useRef(false);
   const endedRef = useRef(false);
   /** A withdrawal from the live room is in flight: the room ending is its doing, not news. */
@@ -337,7 +344,12 @@ export function R1JoinPage() {
   }
 
   function resetLive(): void {
+    phaseRef.current = null;
+    nonceRef.current = null;
     setPhase(null);
+    setLeadName(null);
+    setRoleplayClock(null);
+    setAwaitingReady(false);
     setAgentPresent(false);
     setLastActive(null);
     setLevel(0);
@@ -409,7 +421,7 @@ export function R1JoinPage() {
         return;
       }
       saveNonce(token, attempt.nonce);
-      setLead(attempt.lead);
+      nonceRef.current = attempt.nonce;
       let room = await r1Api.exchange(attempt.attempt_token, attempt.nonce);
       for (let tries = 0; room.status === 'preparing'; tries += 1) {
         if (!mountedRef.current) return;
@@ -421,9 +433,20 @@ export function R1JoinPage() {
       if (!mountedRef.current) return;
       const handlers: R1RoomHandlers = {
         onPhase: (next) => {
+          // The role-play clock freezes when the role-play stops and restarts when it starts.
+          const previous = phaseRef.current;
+          phaseRef.current = next;
+          const now = performance.now();
+          setRoleplayClock((clock) => retimeClock(clock, previous, next, now));
           setPhase(next);
           if (next !== 'paused_disconnected' && next !== 'ended') setLastActive(next);
         },
+        onLeadName: setLeadName,
+        onRoleplayLeft: (seconds) => {
+          const now = performance.now();
+          setRoleplayClock(seconds === null ? null : anchorClock(seconds, now));
+        },
+        onAwaitingReady: setAwaitingReady,
         onAgentPresent: setAgentPresent,
         onAgentLevel: setLevel,
         onCaptions: (segments, current) => {
@@ -463,6 +486,21 @@ export function R1JoinPage() {
       setLandingError(joinErrorMessage(kind, liveElsewhere));
       setStage({ name: 'landing' });
     }
+  }
+
+  /**
+   * "I'm ready": the candidate's room token cannot publish data, so the server relays it to the
+   * interviewer. The attempt token from joining lasts five minutes and the briefing comes later,
+   * so a current one is minted first with the rejoin-style call (same link, same nonce, same
+   * attempt; it changes nothing on the server). Any failure rejects: the button says so and the
+   * candidate can say "ready" instead.
+   */
+  async function sendReady(): Promise<void> {
+    const token = linkRef.current;
+    const nonce = nonceRef.current;
+    if (!token || !nonce) throw new Error('r1_no_attempt');
+    const current = await r1Api.createAttempt(token, nonce);
+    await r1Api.ready(current.attempt_token, nonce);
   }
 
   async function toggleMicrophone(): Promise<void> {
@@ -604,7 +642,10 @@ export function R1JoinPage() {
           phase={phase}
           agentPresent={agentPresent}
           leadVisible={isLeadCardVisible(phase, lastActive)}
-          lead={lead}
+          leadName={leadName}
+          roleplayClock={roleplayClock}
+          awaitingReady={awaitingReady}
+          onReady={sendReady}
           level={level}
           captions={captions}
           micMuted={micMuted}

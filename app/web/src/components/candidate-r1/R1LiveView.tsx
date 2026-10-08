@@ -1,12 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import type { LocalVideoTrack } from 'livekit-client';
-import type { R1LeadCard } from '../../lib/r1/r1-api';
+import type { R1Clock } from '../../lib/r1/r1-clock';
 import type { R1Caption, R1Phase } from '../../lib/r1/r1-phase';
 import { InterviewerAura } from '../candidate-join/InterviewerAura';
 import { R1Captions } from './R1Captions';
 import { R1ConsentExit } from './R1ConsentExit';
-import { R1LeadCardView } from './R1LeadCard';
 import { R1PhaseLabel } from './R1PhaseLabel';
+import { R1ReadyButton } from './R1ReadyButton';
+import { R1RoleplayTimer } from './R1RoleplayTimer';
+import { R1ScenarioCard } from './R1ScenarioCard';
 import { R1_WITHDRAW_QUESTIONS } from './r1-copy';
 
 interface R1LiveViewProps {
@@ -14,8 +16,22 @@ interface R1LiveViewProps {
   phase: R1Phase | null;
   /** An interviewer (AGENT-kind participant) is in the room, announced a phase or not. */
   agentPresent: boolean;
+  /** The role-play scenario card is on screen (transition, role-play, aside). */
   leadVisible: boolean;
-  lead: R1LeadCard | null;
+  /** The learner's name as the interviewer published it; the card says "A prospective learner" without it. */
+  leadName: string | null;
+  /**
+   * The role-play budget left, as the interviewer last said (null when it never published one).
+   * Shown with the scenario card, and counted down only while the role-play itself is running.
+   */
+  roleplayClock?: R1Clock | null;
+  /** The interviewer is waiting for the candidate to say they are ready (`awaiting=ready`). */
+  awaitingReady?: boolean;
+  /**
+   * Send "I'm ready" to the interviewer. Without it, or outside the transition phase while
+   * the interviewer is waiting, no button is shown: saying "ready" is the main way anyway.
+   */
+  onReady?: () => Promise<void>;
   /** Interviewer speech level, 0 to 1. */
   level: number;
   captions: readonly R1Caption[];
@@ -40,7 +56,8 @@ interface R1LiveViewProps {
 /**
  * The live interview (plan section 7.10): a small mirrored self-view, the
  * interviewer aura, captions of the interviewer only, the phase label, the
- * lead card while the role-play is on, and a banner whenever the camera is
+ * scenario card, the role-play clock and the "I'm ready" button while the
+ * role-play is being set up or is on, and a banner whenever the camera is
  * off. The candidate's own speech is never captioned or shown back.
  */
 export function R1LiveView({
@@ -48,7 +65,10 @@ export function R1LiveView({
   phase,
   agentPresent,
   leadVisible,
-  lead,
+  leadName,
+  roleplayClock = null,
+  awaitingReady = false,
+  onReady,
   level,
   captions,
   micMuted,
@@ -64,6 +84,9 @@ export function R1LiveView({
 }: R1LiveViewProps) {
   const [confirmingLeave, setConfirmingLeave] = useState(false);
   const videoElementRef = useRef<HTMLVideoElement>(null);
+  // The button exists only while the interviewer is waiting for it, in the briefing. Leaving the
+  // briefing unmounts it, so its "sent" state never leaks into a later wait.
+  const readyShown = phase === 'transition' && awaitingReady && onReady !== undefined;
 
   useEffect(() => {
     const element = videoElementRef.current;
@@ -79,7 +102,11 @@ export function R1LiveView({
       <div className="candidate-glass-card r1-live__stage">
         <p className="candidate-eyebrow">Live interview</p>
         <h1 className="r1-live__title">{roleTitle}</h1>
-        <R1PhaseLabel phase={phase} agentPresent={agentPresent} />
+        <R1PhaseLabel phase={phase} agentPresent={agentPresent} readyHint={readyShown} />
+        {leadVisible && roleplayClock && (
+          <R1RoleplayTimer clock={roleplayClock} running={phase === 'roleplay'} />
+        )}
+        {readyShown && onReady && <R1ReadyButton onReady={onReady} />}
         {!cameraOn && (
           <p className="r1-banner" role="status">
             Your camera is off. This interview needs your camera, so please turn it back on.
@@ -135,7 +162,7 @@ export function R1LiveView({
       </div>
 
       <div className="r1-live__side">
-        {leadVisible && <R1LeadCardView lead={lead} />}
+        {leadVisible && <R1ScenarioCard leadName={leadName} />}
         <R1Captions captions={captions} />
       </div>
     </section>

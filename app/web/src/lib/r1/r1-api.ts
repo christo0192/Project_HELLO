@@ -33,6 +33,7 @@ export const R1_ROUTES = Object.freeze({
   preflight: '/api/r1/preflight',
   attempts: '/api/r1/attempts',
   exchange: '/api/r1/exchange',
+  ready: '/api/r1/ready',
 });
 
 /**
@@ -137,6 +138,17 @@ export const R1_CONTRACT: Readonly<Record<R1RouteName, R1RouteContract>> = Objec
     requestOptional: [],
     response: ['url', 'livekit_token'],
     responseOptional: ['status', 'expires_at', 'attempt_id'],
+  }),
+  // "I'm ready" during the role-play briefing: the server relays it to the interviewer in the
+  // room (the candidate's room token cannot publish data, so the browser cannot). Same body as
+  // the exchange, and the attempt token it carries must be a current one (they last five
+  // minutes), which the page gets from a rejoin-style `attempts` call. The 200 body is `{ok:true}`;
+  // the page needs only the status, so no response field is declared or parsed.
+  ready: route('ready', {
+    request: ['attempt_token', 'nonce'],
+    requestOptional: [],
+    response: [],
+    responseOptional: [],
   }),
 });
 
@@ -505,6 +517,15 @@ export const r1Api = {
 
   exchange: async (attemptToken: string, nonce: string): Promise<R1ExchangeResult> =>
     parseExchange(await call('exchange', { attempt_token: attemptToken, nonce })),
+
+  /**
+   * Tell the interviewer, through the server, that the candidate pressed "I'm ready". Resolves
+   * on any 2xx; a refusal (no live session, rate limit, a stale token) rejects with the error
+   * code. The spoken "ready" keeps working either way, so a failure is never fatal.
+   */
+  ready: async (attemptToken: string, nonce: string): Promise<void> => {
+    await call('ready', { attempt_token: attemptToken, nonce });
+  },
 };
 
 /**

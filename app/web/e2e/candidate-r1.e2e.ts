@@ -27,16 +27,23 @@ import {
   expectCandidateHygiene,
   expectMobileFits,
   heading,
+  LEARNER_NAME,
   LIVE_DESKTOP_SIZES,
   openLink,
   passDeviceCheck,
+  reachBriefing,
   reachLive,
   reachLiveWithConversation,
   storedNonce,
   storedNonceRaw,
 } from './fixtures/candidate-flows';
 import { liveLayout } from './fixtures/layout';
-import { R1_ATTEMPT_TOKEN, R1_LINK_TOKEN, R1_NONCE } from './fixtures/r1-candidate-api';
+import {
+  R1_ATTEMPT_TOKEN,
+  R1_FRESH_ATTEMPT_TOKEN,
+  R1_LINK_TOKEN,
+  R1_NONCE,
+} from './fixtures/r1-candidate-api';
 
 test.describe('link and notice', () => {
   test('a link with no token is refused without a single API call', async ({ r1 }, testInfo) => {
@@ -314,8 +321,13 @@ test.describe('the full interview', () => {
     // The role-play: lead card and label, learner-labelled captions.
     await r1.mock.setPhase('transition');
     const lead = page.getByRole('region', { name: 'Your role-play' });
-    // PR-3 never returns the persona, so the card keeps its generic wording (no name or city).
+    // The server never returns the persona and this interviewer has not named the learner yet,
+    // so the card keeps its generic wording; the course facts do not wait for a name.
     await expect(lead.getByText('A prospective learner')).toBeVisible();
+    await expect(lead).toContainText('$9,000');
+    await r1.mock.setAgentAttributes({ leadname: LEARNER_NAME });
+    await expect(lead.getByText(LEARNER_NAME)).toBeVisible();
+    await expect(lead.getByText('A prospective learner')).toHaveCount(0);
     await r1.mock.setPhase('roleplay');
     await expect(page.getByRole('status').filter({ hasText: 'You are the Program Advisor' })).toBeVisible();
     await r1.mock.caption('c2', 'Hello? Yes, this is Meera speaking.', true);
@@ -607,13 +619,58 @@ test.describe('live layout with a long interview', () => {
     expect(layout.pageScrollHeight, 'the page must not scroll').toBeLessThanOrEqual(601);
     expect(layout.captionsCard?.bottom).toBeLessThanOrEqual(600);
     expect(layout.stage?.bottom).toBeLessThanOrEqual(600);
-    expect(layout.list!.clientHeight, 'the lead card leaves the list a usable height').toBeGreaterThanOrEqual(90);
+    expect(layout.list!.clientHeight, 'the scenario card leaves the list a usable height').toBeGreaterThanOrEqual(110);
     // The list is only about one caption tall here, so 'the newest line fits whole' is too strict:
     // what matters is that it is parked on the end.
     expect(layout.list!.scrollTop + layout.list!.clientHeight).toBeGreaterThanOrEqual(layout.list!.scrollHeight - 2);
     // The stage may be taller than the window gives it: then it scrolls in its own card (and the
     // axe rule for a scrollable region needs something focusable inside, which its controls are).
     await auditA11y(page, testInfo, 'r1-live-long-1100x600', { strict: true });
+    r1.expectHealthy();
+  });
+
+  test('the briefing (scenario card and ready button) fits a 1366x768 window with the page still, and the button in view', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'desktop sizes run on the desktop project');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await reachLiveWithConversation(r1);
+    // Back to the briefing: the clock is gone (the interviewer clears it), the wait is on.
+    await r1.mock.setAgentAttributes({ phase: 'transition', rpleft: '', awaiting: 'ready' });
+    const ready = page.getByRole('button', { name: "I'm ready" });
+    await expect(ready).toBeVisible();
+    await expect(page.getByRole('timer')).toHaveCount(0);
+
+    const layout = await liveLayout(page);
+    expect(layout.pageScrollHeight, 'the page must not scroll').toBeLessThanOrEqual(769);
+    expect(layout.captionsCard?.bottom).toBeLessThanOrEqual(768);
+    expect(layout.list!.clientHeight, 'the captions keep room beside the scenario card').toBeGreaterThanOrEqual(220);
+    expect(layout.newestLineInView).toBe(true);
+    // The stage holds the clock or the button AND the controls without scrolling inside its card.
+    expect(layout.stage!.scrollHeight).toBeLessThanOrEqual(layout.stage!.clientHeight + 1);
+    const box = await ready.boundingBox();
+    expect(box, 'the ready button is laid out').not.toBeNull();
+    expect(box!.y).toBeGreaterThanOrEqual(0);
+    expect(box!.y + box!.height).toBeLessThanOrEqual(768);
+    expect(box!.height).toBeGreaterThanOrEqual(44);
+    await auditA11y(page, testInfo, 'r1-live-briefing-1366x768', { strict: true });
+    r1.expectHealthy();
+  });
+
+  test('on a phone the ready button is in the first screen, above the scenario card and the captions', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'mobile', 'the phone layout runs on the mobile project');
+    const { page } = r1;
+    await reachBriefing(r1);
+    const ready = page.getByRole('button', { name: "I'm ready" });
+    const box = await ready.boundingBox();
+    expect(box).not.toBeNull();
+    // No scrolling needed: it is in the stage, which comes first on a phone.
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+    expect(box!.y + box!.height).toBeLessThanOrEqual(844);
+    expect(box!.height).toBeGreaterThanOrEqual(44);
+    const card = await page.getByRole('region', { name: 'Your role-play' }).boundingBox();
+    expect(card!.y, 'the card follows the stage').toBeGreaterThan(box!.y);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-briefing-390x844', { strict: true });
     r1.expectHealthy();
   });
 
@@ -681,6 +738,225 @@ test.describe('live layout with a long interview', () => {
 
     await expectMobileFits(page, testInfo);
     await auditA11y(page, testInfo, 'r1-live-long-390x844', { strict: true });
+    r1.expectHealthy();
+  });
+});
+
+/**
+ * The role-play briefing and the role-play itself: the scenario card (learner name from the
+ * interviewer, static course facts), the role-play clock, and the "I'm ready" button. The browser
+ * cannot publish to the room (its token has canPublishData: false), so the button goes through
+ * the API, which relays it; every signal here degrades to nothing when the interviewer does not
+ * publish it.
+ */
+test.describe('scenario card, role-play clock and "I\'m ready"', () => {
+  test('the briefing shows the learner, the three course facts, the goal and the ready button', async ({ r1 }, testInfo) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    const card = page.getByRole('region', { name: 'Your role-play' });
+    await expect(card.getByText(LEARNER_NAME)).toBeVisible();
+    await expect(card.getByText('$9,000')).toBeVisible();
+    await expect(card.getByText('6 months')).toBeVisible();
+    await expect(card.getByText('$500, $1,000 or $1,500, depending on the payment plan')).toBeVisible();
+    await expect(card).toContainText('Data Science course');
+    await expect(card).toContainText('understand their needs, handle their concerns, and agree a clear next step');
+    await expect(card).toContainText('stays in character');
+    // What the candidate is assessed on finding out is not on the card.
+    await expect(card).not.toContainText(/7,?000|budget|per month|decision|upfront|installment/i);
+
+    // The phase panel says the button is there (it is a polite region, so that is announced).
+    await expect(page.getByRole('status').filter({ hasText: 'when you want to start, or just say' })).toBeVisible();
+    await expect(page.getByRole('timer')).toHaveCount(0);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-briefing', { strict: true });
+    r1.expectHealthy();
+  });
+
+  test('"I\'m ready" asks the server with a fresh attempt token, confirms, and goes when the role-play starts', async ({ r1 }, testInfo) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+
+    // The join's own attempt token is five minutes old by now in real life: a current one is
+    // minted for the same attempt (link + nonce, the rejoin call) and that is what is relayed.
+    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
+      { token: R1_LINK_TOKEN },
+      { token: R1_LINK_TOKEN, nonce: R1_NONCE },
+    ]);
+    expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
+      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
+    ]);
+    expect(JSON.stringify(bodiesOf(r1, '/api/r1/ready'))).not.toContain(R1_ATTEMPT_TOKEN);
+
+    // Sent once: the button stays but does nothing more; the briefing carries on.
+    const button = page.getByRole('button', { name: "I'm ready" });
+    await expect(button).toHaveAttribute('aria-disabled', 'true');
+    // Playwright treats aria-disabled as not enabled, so the second press is forced.
+    await button.click({ force: true });
+    expect(bodiesOf(r1, '/api/r1/ready')).toHaveLength(1);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-briefing-sent', { strict: true });
+
+    // The interviewer picks up: the button is gone and the clock starts.
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', awaiting: '', rpleft: '840' });
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await expect(page.getByRole('timer')).toHaveText('Role-play · 14 min left');
+    expectCandidateHygiene(r1);
+    r1.expectHealthy();
+  });
+
+  test('when "I\'m ready" cannot be sent the candidate is told to say it, and can press again', async ({ r1 }, testInfo) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    r1.state.failures.ready = { status: 429, error: 'rate_limited' };
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByRole('alert')).toContainText("We couldn't send that. Just say “I'm ready”.");
+    await expect(page.getByText('Sent — starting the role-play')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: "I'm ready" })).not.toHaveAttribute('aria-disabled', 'true');
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-briefing-failed', { strict: true });
+
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    expect(bodiesOf(r1, '/api/r1/ready')).toHaveLength(2);
+    // The interview carried on throughout, and the spoken "ready" was never blocked.
+    await expect(page.getByRole('region', { name: 'Live video interview' })).toBeVisible();
+    r1.consoleErrors.length = 0; // a 429 is logged by the browser's network layer
+    r1.expectHealthy();
+  });
+
+  test('the ready button is shown only while the interviewer is waiting in the briefing', async ({ r1 }) => {
+    await reachLive(r1);
+    const { page } = r1;
+    const ready = page.getByRole('button', { name: "I'm ready" });
+    await r1.mock.joinAgent();
+    // Before and after the briefing, and a briefing that is not waiting, show no button.
+    await r1.mock.setAgentAttributes({ phase: 'icebreaker', awaiting: 'ready' });
+    await expect(page.getByText('Getting to know you')).toBeVisible();
+    await expect(ready).toHaveCount(0);
+    await r1.mock.setAgentAttributes({ phase: 'transition', awaiting: '' });
+    await expect(page.getByText('Role-play briefing')).toBeVisible();
+    await expect(ready).toHaveCount(0);
+    await r1.mock.setAgentAttributes({ awaiting: 'ready' });
+    await expect(ready).toBeVisible();
+    await r1.mock.setAgentAttributes({ awaiting: '' });
+    await expect(ready).toHaveCount(0);
+    r1.expectHealthy();
+  });
+
+  test('the clock shows the minutes left, holds during an aside, resumes, and goes when the role-play is over', async ({ r1 }, testInfo) => {
+    await reachLive(r1);
+    const { page } = r1;
+    await r1.mock.joinAgent();
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', leadname: LEARNER_NAME, rpleft: '63' });
+    const timer = page.getByRole('timer');
+    await expect(timer).toHaveText('Role-play · 2 min left');
+    // About three seconds on it is under a minute: it counts down by itself.
+    await expect(timer).toHaveText('Role-play · under a minute left', { timeout: 10_000 });
+    // It is not live itself, and it is outside the phase label's polite region.
+    expect(await timer.evaluate((element) => element.closest('[aria-live]'))).toBeNull();
+    const phaseRegion = page.getByRole('status').filter({ hasText: 'You are the Program Advisor' });
+    expect(await phaseRegion.locator('[role="timer"]').count()).toBe(0);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-clock', { strict: true });
+
+    // An aside pauses it where the interviewer says: still "3 min" after more than a second.
+    await r1.mock.setAgentAttributes({ phase: 'aside', rpleft: '121' });
+    await expect(timer).toHaveText('Role-play · 3 min left');
+    await page.waitForTimeout(2_500);
+    await expect(timer).toHaveText('Role-play · 3 min left');
+    // Back in the role-play it runs again from there: 121 s is "3 min" until 120 s.
+    await r1.mock.setPhase('roleplay');
+    await expect(timer).toHaveText('Role-play · 2 min left', { timeout: 6_000 });
+
+    // The interviewer clears the clock when the role-play is over.
+    await r1.mock.setAgentAttributes({ phase: 'roleplay_exit', rpleft: '' });
+    await expect(timer).toHaveCount(0);
+    await expect(page.getByRole('region', { name: 'Your role-play' })).toHaveCount(0);
+    r1.expectHealthy();
+  });
+
+  test('reads the name and the clock off an interviewer that joins already mid role-play', async ({ r1 }) => {
+    await reachLive(r1);
+    const { page } = r1;
+    await r1.mock.joinAgent({ phase: 'roleplay', leadname: LEARNER_NAME, rpleft: '300' });
+    await expect(page.getByRole('timer')).toHaveText('Role-play · 5 min left');
+    await expect(page.getByRole('region', { name: 'Your role-play' }).getByText(LEARNER_NAME)).toBeVisible();
+    r1.expectHealthy();
+  });
+
+  test('an interviewer that publishes only the phase gets the card with no name, no clock and no button', async ({ r1 }) => {
+    await reachLive(r1);
+    const { page } = r1;
+    await r1.mock.joinAgent();
+    await r1.mock.setPhase('transition');
+    const card = page.getByRole('region', { name: 'Your role-play' });
+    await expect(card.getByText('A prospective learner')).toBeVisible();
+    await expect(card).toContainText('$9,000');
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await r1.mock.setPhase('roleplay');
+    await expect(page.getByRole('status').filter({ hasText: 'You are the Program Advisor' })).toBeVisible();
+    await expect(page.getByRole('timer')).toHaveCount(0);
+    r1.expectHealthy();
+  });
+
+  test('values the interviewer sends in the wrong shape are ignored, never shown', async ({ r1 }) => {
+    await reachLive(r1);
+    const { page } = r1;
+    await r1.mock.joinAgent();
+    await r1.mock.setAgentAttributes({
+      phase: 'transition',
+      leadname: '<img src=x onerror=alert(1)>',
+      rpleft: 'soon',
+      awaiting: 'yes',
+    });
+    const card = page.getByRole('region', { name: 'Your role-play' });
+    await expect(card.getByText('A prospective learner')).toBeVisible();
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await r1.mock.setPhase('roleplay');
+    await expect(page.getByRole('timer')).toHaveCount(0);
+    expect(await page.locator('img[src="x"]').count()).toBe(0);
+    r1.expectHealthy();
+  });
+
+  test('nobody but the interviewer can name the learner, set the clock or raise the button', async ({ r1 }) => {
+    await reachLive(r1);
+    const { page } = r1;
+    await r1.mock.joinAgent();
+    await r1.mock.setPhase('transition');
+    await r1.mock.intrude({ awaiting: 'ready', leadname: 'Mallory', rpleft: '5', phase: 'roleplay' });
+    const card = page.getByRole('region', { name: 'Your role-play' });
+    await expect(card.getByText('A prospective learner')).toBeVisible();
+    await expect(card.getByText('Mallory')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await expect(page.getByRole('timer')).toHaveCount(0);
+    await expect(page.getByText('Role-play briefing')).toBeVisible();
+    r1.expectHealthy();
+  });
+
+  test('a rejoining candidate starts clean and reads what the interviewer still publishes', async ({ r1 }) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    await r1.mock.drop();
+    await expect(heading(page, 'The connection to your interview ended.')).toBeVisible();
+    await page.getByRole('button', { name: 'Rejoin interview' }).click();
+    await passDeviceCheck(page);
+    await page.getByRole('button', { name: 'Continue to interview' }).click();
+    await expect(page.getByRole('region', { name: 'Live video interview' })).toBeVisible();
+    // The new room has no interviewer yet: nothing of the old briefing is left on screen.
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await expect(page.getByRole('region', { name: 'Your role-play' })).toHaveCount(0);
+    // The interviewer comes back still waiting, and everything is read from what it published.
+    await r1.mock.joinAgent({ phase: 'transition', leadname: LEARNER_NAME, awaiting: 'ready' });
+    await expect(page.getByRole('region', { name: 'Your role-play' }).getByText(LEARNER_NAME)).toBeVisible();
+    await expect(page.getByRole('button', { name: "I'm ready" })).toBeVisible();
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+    expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
+      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
+    ]);
     r1.expectHealthy();
   });
 });

@@ -9,7 +9,7 @@
 import type { Page, TestInfo } from '@playwright/test';
 import { expect, type R1Harness } from './candidate-harness';
 import { horizontalOverflow } from './layout';
-import { R1_ATTEMPT_TOKEN, R1_LINK_TOKEN } from './r1-candidate-api';
+import { R1_ATTEMPT_TOKEN, R1_FRESH_ATTEMPT_TOKEN, R1_LINK_TOKEN } from './r1-candidate-api';
 
 export const TOKEN_HASH = `#${R1_LINK_TOKEN}`;
 export const NONCE_KEY = 'r1.attempt.nonce';
@@ -76,7 +76,12 @@ export function expectCandidateHygiene(r1: R1Harness): void {
     'candidate requests must carry no Authorization header',
   ).toEqual([]);
   expect(
-    r1.calls.filter((call) => call.url.includes(R1_LINK_TOKEN) || call.url.includes(R1_ATTEMPT_TOKEN)),
+    r1.calls.filter(
+      (call) =>
+        call.url.includes(R1_LINK_TOKEN)
+        || call.url.includes(R1_ATTEMPT_TOKEN)
+        || call.url.includes(R1_FRESH_ATTEMPT_TOKEN),
+    ),
     'a token must never appear in a URL',
   ).toEqual([]);
   expect(
@@ -100,22 +105,44 @@ export const LIVE_DESKTOP_SIZES = [
   { width: 1920, height: 1080 },
 ] as const;
 
+/** The learner the interviewer publishes in the e2e role-play. */
+export const LEARNER_NAME = 'Meera Iyer';
+
 const LONG_CAPTION =
   'Honestly I am not sure yet, the price feels high for me right now and I would need to talk it over at home first.';
 
 /**
  * Consent already on file, straight to the live view, with an interview that has run for a
- * while: `count` finished caption lines (the last ten in the role-play, so the lead card is on
- * screen too). Leaves the page in the role-play with the newest line at the end of the log.
+ * while: `count` finished caption lines (the last ten in the role-play, so the scenario card and
+ * the role-play clock are on screen too). Leaves the page in the role-play with the newest line at
+ * the end of the log.
  */
 export async function reachLiveWithConversation(r1: R1Harness, count = 40): Promise<void> {
   await reachLive(r1);
   await r1.mock.joinAgent();
   await r1.mock.setPhase('icebreaker');
   for (let index = 1; index <= count; index += 1) {
-    if (index === count - 9) await r1.mock.setPhase('roleplay');
+    if (index === count - 9) {
+      await r1.mock.setAgentAttributes({ phase: 'roleplay', leadname: LEARNER_NAME, rpleft: '600' });
+    }
     await r1.mock.caption(`c${index}`, `Line ${index}. ${LONG_CAPTION}`, true);
   }
   await expect(r1.page.locator('.candidate-caption', { hasText: `Line ${count}.` })).toBeAttached();
   await expect(r1.page.getByRole('region', { name: 'Your role-play' })).toBeVisible();
+  await expect(r1.page.getByRole('timer')).toHaveText('Role-play · 10 min left');
+}
+
+/**
+ * Consent already on file, straight to the role-play briefing: the interviewer has said the
+ * learner's name and is waiting for "ready" (`phase=transition`, `leadname`, `awaiting=ready`, all
+ * in one write like the worker's). The scenario card and the "I'm ready" button are on screen.
+ */
+export async function reachBriefing(r1: R1Harness): Promise<void> {
+  await reachLive(r1);
+  await r1.mock.joinAgent();
+  await r1.mock.setPhase('icebreaker');
+  await r1.mock.caption('b1', 'Thank you. We will now move to the role-play.', true);
+  await r1.mock.setAgentAttributes({ phase: 'transition', leadname: LEARNER_NAME, awaiting: 'ready' });
+  await expect(r1.page.getByRole('region', { name: 'Your role-play' })).toBeVisible();
+  await expect(r1.page.getByRole('button', { name: "I'm ready" })).toBeVisible();
 }

@@ -1,17 +1,23 @@
-import { render, screen, within } from '@testing-library/react';
+import { act, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { LocalVideoTrack } from 'livekit-client';
 import { describe, expect, it, vi } from 'vitest';
-import { R1_PHASES, R1_PHASE_LABELS, type R1Caption } from '../../lib/r1/r1-phase';
+import {
+  R1_PHASES,
+  R1_PHASE_LABELS,
+  R1_READY_DETAIL,
+  type R1Caption,
+  type R1Phase,
+} from '../../lib/r1/r1-phase';
 import { R1LiveView } from './R1LiveView';
 
 function renderLive(overrides: Partial<Parameters<typeof R1LiveView>[0]> = {}) {
   const props = {
     roleTitle: 'Sales Program Advisor',
-    phase: 'icebreaker' as const,
+    phase: 'icebreaker' as R1Phase | null,
     agentPresent: true,
     leadVisible: false,
-    lead: { name: 'Meera', city: 'Pune' },
+    leadName: 'Meera Iyer' as string | null,
     level: 0,
     captions: [] as R1Caption[],
     micMuted: false,
@@ -67,30 +73,140 @@ describe('phase label', () => {
   });
 });
 
-describe('lead card', () => {
+describe('scenario card', () => {
   it('is absent until the role-play is on screen', () => {
     renderLive({ leadVisible: false });
     expect(screen.queryByRole('heading', { name: 'Your role-play' })).toBeNull();
   });
 
-  it('shows who the candidate is calling and why', () => {
+  it('shows who the candidate is calling, why, and the three course facts', () => {
     renderLive({ leadVisible: true, phase: 'roleplay' });
     const card = screen.getByRole('region', { name: 'Your role-play' });
-    expect(within(card).getByText('Meera from Pune')).toBeVisible();
+    expect(within(card).getByText('Meera Iyer')).toBeVisible();
     expect(card).toHaveTextContent('Data Science course');
     expect(card).toHaveTextContent('Program Advisor');
-    expect(card).toHaveTextContent('preparation guide');
+    expect(card).toHaveTextContent('$9,000');
+    expect(card).toHaveTextContent('6 months');
+    expect(card).toHaveTextContent('$500, $1,000 or $1,500, depending on the payment plan');
   });
 
-  it('degrades to a generic card when the server gave no lead', () => {
-    renderLive({ leadVisible: true, lead: null });
+  it('degrades to a generic card when the interviewer has not published a name', () => {
+    renderLive({ leadVisible: true, leadName: null });
     expect(screen.getByText('A prospective learner')).toBeVisible();
+    // The facts are static, so they do not wait for the name.
+    expect(screen.getByRole('region', { name: 'Your role-play' })).toHaveTextContent('$9,000');
   });
 
-  it('asserts no product facts of its own', () => {
+  it('states the advisor goal and keeps the in-character line', () => {
     renderLive({ leadVisible: true });
     const card = screen.getByRole('region', { name: 'Your role-play' });
-    expect(card.textContent).not.toMatch(/\$|\bprice\b|\bdiscount\b|\bmonths?\b|\bseats?\b/i);
+    expect(card).toHaveTextContent('understand their needs');
+    expect(card).toHaveTextContent('agree a clear next step');
+    expect(card).toHaveTextContent('stays in character');
+  });
+});
+
+describe('role-play clock', () => {
+  const clock = { seconds: 480, at: performance.now() };
+
+  it('shows the minutes left beside the scenario card, outside the phase status region', () => {
+    renderLive({ phase: 'roleplay', leadVisible: true, roleplayClock: clock });
+    const timer = screen.getByRole('timer');
+    expect(timer).toHaveTextContent('Role-play · 8 min left');
+    expect(screen.getByRole('status', { name: '' })).not.toContainElement(timer);
+    expect(timer.closest('[aria-live]')).toBeNull();
+  });
+
+  it('is hidden when the interviewer publishes no clock', () => {
+    renderLive({ phase: 'roleplay', leadVisible: true, roleplayClock: null });
+    expect(screen.queryByRole('timer')).toBeNull();
+  });
+
+  it('is hidden when the scenario card is, whatever the clock holds', () => {
+    renderLive({ phase: 'roleplay_exit', leadVisible: false, roleplayClock: clock });
+    expect(screen.queryByRole('timer')).toBeNull();
+    renderLive({ phase: 'icebreaker', leadVisible: false, roleplayClock: clock });
+    expect(screen.queryByRole('timer')).toBeNull();
+  });
+
+  it('holds its value outside the role-play itself', () => {
+    const stale = { seconds: 480, at: performance.now() - 120_000 };
+    renderLive({ phase: 'aside', leadVisible: true, roleplayClock: stale });
+    // Two minutes have passed since it arrived, but the role-play was paused: still 8 minutes.
+    expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 8 min left');
+  });
+
+  it('counts down while the role-play is on', () => {
+    const running = { seconds: 480, at: performance.now() - 120_000 };
+    renderLive({ phase: 'roleplay', leadVisible: true, roleplayClock: running });
+    expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 6 min left');
+  });
+});
+
+describe('"I\'m ready" button', () => {
+  const READY = { phase: 'transition' as const, awaitingReady: true, leadVisible: true };
+
+  it('is shown only in the briefing while the interviewer is waiting', () => {
+    const onReady = vi.fn().mockResolvedValue(undefined);
+    renderLive({ ...READY, onReady });
+    expect(screen.getByRole('button', { name: "I'm ready" })).toBeVisible();
+  });
+
+  it.each(R1_PHASES.filter((phase) => phase !== 'transition'))(
+    'is not shown in %s, even if the interviewer still says it is waiting',
+    (phase) => {
+      renderLive({ ...READY, phase, onReady: vi.fn() });
+      expect(screen.queryByRole('button', { name: "I'm ready" })).toBeNull();
+    },
+  );
+
+  it('is not shown when the interviewer is not waiting for it', () => {
+    renderLive({ ...READY, awaitingReady: false, onReady: vi.fn() });
+    expect(screen.queryByRole('button', { name: "I'm ready" })).toBeNull();
+  });
+
+  it('is not shown when the page wires no way to send it', () => {
+    renderLive({ ...READY });
+    expect(screen.queryByRole('button', { name: "I'm ready" })).toBeNull();
+  });
+
+  it('is not shown before the interviewer has announced a phase', () => {
+    renderLive({ ...READY, phase: null, onReady: vi.fn() });
+    expect(screen.queryByRole('button', { name: "I'm ready" })).toBeNull();
+  });
+
+  it('goes away when the interviewer moves on to the role-play', () => {
+    const onReady = vi.fn().mockResolvedValue(undefined);
+    const { rerender, props } = renderLive({ ...READY, onReady });
+    expect(screen.getByRole('button', { name: "I'm ready" })).toBeVisible();
+    rerender(<R1LiveView {...props} phase="roleplay" awaitingReady={false} />);
+    expect(screen.queryByRole('button', { name: "I'm ready" })).toBeNull();
+  });
+
+  it('tells the phase region about it, so a screen reader hears it arrive', () => {
+    const { rerender, props } = renderLive({ ...READY, awaitingReady: false, onReady: vi.fn() });
+    const status = screen.getByRole('status', { name: '' });
+    expect(status).toHaveTextContent(R1_PHASE_LABELS.transition.detail);
+    rerender(<R1LiveView {...props} awaitingReady />);
+    expect(status).toHaveTextContent(R1_READY_DETAIL);
+    expect(R1_READY_DETAIL).toMatch(/say .*ready/);
+  });
+
+  it('sends once, locks while sending, and confirms', async () => {
+    const user = userEvent.setup();
+    let finish: () => void = () => undefined;
+    const onReady = vi.fn(() => new Promise<void>((resolve) => { finish = resolve; }));
+    renderLive({ ...READY, onReady });
+    const button = screen.getByRole('button', { name: "I'm ready" });
+    await user.click(button);
+    expect(onReady).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole('button', { name: 'Sending…' })).toHaveAttribute('aria-disabled', 'true');
+    await user.click(screen.getByRole('button', { name: 'Sending…' }));
+    expect(onReady).toHaveBeenCalledTimes(1);
+    await act(async () => finish());
+    expect(screen.getByText('Sent — starting the role-play')).toBeVisible();
+    await user.click(screen.getByRole('button', { name: "I'm ready" }));
+    expect(onReady).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -244,13 +360,39 @@ describe('self-view', () => {
 });
 
 describe('accessibility', () => {
-  it('has no violations with the lead card, captions and banner showing', async () => {
+  it('has no violations with the scenario card, clock, captions and banner showing', async () => {
     const { container } = renderLive({
       leadVisible: true,
       cameraOn: false,
       phase: 'roleplay',
+      roleplayClock: { seconds: 300, at: performance.now() },
       captions: [{ id: '1', text: 'Hello?', final: true, speaker: 'learner' }],
     });
+    await expect(container).toHaveNoViolations();
+  });
+
+  it('has no violations in the briefing, with the ready button waiting', async () => {
+    const { container } = renderLive({
+      leadVisible: true,
+      phase: 'transition',
+      awaitingReady: true,
+      onReady: vi.fn().mockResolvedValue(undefined),
+    });
+    await expect(container).toHaveNoViolations();
+  });
+
+  it('has no violations after the ready button failed and its alert shows', async () => {
+    const user = userEvent.setup();
+    const { container } = renderLive({
+      leadVisible: true,
+      phase: 'transition',
+      awaitingReady: true,
+      onReady: vi.fn().mockRejectedValue(new Error('refused')),
+    });
+    await user.click(screen.getByRole('button', { name: "I'm ready" }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      "We couldn't send that. Just say “I'm ready”.",
+    );
     await expect(container).toHaveNoViolations();
   });
 });

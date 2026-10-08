@@ -37,6 +37,8 @@ export interface MockRemote {
   snapshot(): Promise<MockSnapshot>;
   joinAgent(attributes?: Record<string, string>): Promise<void>;
   setPhase(phase: string): Promise<void>;
+  /** Several interviewer attributes in one update; `''` removes one (see mock-livekit-client.ts). */
+  setAgentAttributes(attributes: Record<string, string>): Promise<void>;
   speak(level: number): Promise<void>;
   caption(id: string, text: string, final: boolean): Promise<void>;
   intrude(attributes: Record<string, string>): Promise<void>;
@@ -64,6 +66,8 @@ function remote(page: Page): MockRemote {
       }),
     joinAgent: (attributes) => page.evaluate((a) => window.__r1Mock!.joinAgent(a), attributes),
     setPhase: (phase) => page.evaluate((p) => window.__r1Mock!.setPhase(p), phase),
+    setAgentAttributes: (attributes) =>
+      page.evaluate((a) => window.__r1Mock!.setAgentAttributes(a), attributes),
     speak: (level) => page.evaluate((l) => window.__r1Mock!.speak(l), level),
     caption: (id, text, final) => page.evaluate(([i, t, f]) => window.__r1Mock!.caption(i as string, t as string, f as boolean), [id, text, final] as const),
     intrude: (attributes) => page.evaluate((a) => window.__r1Mock!.intrude(a), attributes),

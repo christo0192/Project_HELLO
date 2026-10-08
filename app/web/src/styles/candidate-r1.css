@@ -62,12 +62,29 @@
 .r1-banner { width: min(100%, 520px); padding: 10px 14px; border: 1px solid var(--c-caution); border-radius: 14px; background: var(--c-caution-light); color: var(--c-caution); font-size: 13px; font-weight: 650; line-height: 1.45; text-align: center; }
 .r1-live__selfview { width: min(46%, 200px); margin: 0 auto; }
 .r1-live__selfview.r1-selfview { max-width: 200px; margin-top: 0; border-radius: 14px; }
-.r1-lead { padding: 20px 22px; }
-.r1-lead h2 { margin: 0 0 6px; font-size: 17px; letter-spacing: -.02em; }
-.r1-lead__who { margin: 0 0 8px; color: var(--c-ink); font-size: 15px; font-weight: 700; }
-.r1-lead p { margin: 0; color: var(--c-ink-secondary); font-size: 14px; line-height: 1.55; }
-.r1-lead p + p { margin-top: 8px; }
-.r1-live__side .r1-lead { flex: 0 0 auto; }
+/* The role-play scenario card: compact, so the captions card keeps most of the column. */
+.r1-scenario { padding: 14px 20px; }
+.r1-scenario h2 { margin: 0 0 2px; font-size: 16px; letter-spacing: -.02em; }
+.r1-scenario__who { margin: 0 0 4px; color: var(--c-ink); font-size: 15px; font-weight: 700; }
+.r1-scenario p { margin: 0; color: var(--c-ink-secondary); font-size: 13px; line-height: 1.45; }
+/* Price and duration share the first row; the discounts, the longest value, take the second. */
+.r1-scenario__facts { display: grid; grid-template-columns: auto auto auto minmax(0, 1fr); gap: 2px 8px; margin: 8px 0; padding: 7px 12px; border: 1px solid var(--c-border); border-radius: 12px; background: rgb(255 255 255 / .6); font-size: 13px; line-height: 1.4; }
+.r1-scenario__facts dt { color: var(--c-ink-secondary); }
+.r1-scenario__facts dd { margin: 0; color: var(--c-ink); font-weight: 700; }
+.r1-scenario__facts dd:last-of-type { grid-column: 2 / -1; }
+.r1-scenario__goal { color: var(--c-ink); font-weight: 650; }
+.r1-scenario__note { margin-top: 6px; }
+.r1-live__side .r1-scenario { flex: 0 0 auto; }
+
+/* The role-play clock (outside the phase label's live region) and the "I'm ready" button. */
+.r1-timer { margin: 0; padding: 4px 14px; border-radius: 999px; background: var(--c-accent-light); color: var(--c-ink); font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; }
+.r1-ready { display: grid; justify-items: center; gap: 4px; width: min(100%, 520px); }
+.r1-ready__button { width: 100%; min-height: 44px; padding: 0 18px; border: 0; border-radius: 14px; background: var(--c-accent); color: var(--c-data-label-inside); font: inherit; font-size: 15px; font-weight: 750; box-shadow: 0 8px 18px rgb(78 107 166 / .22); cursor: pointer; }
+.r1-ready__button:hover:not([aria-disabled="true"]) { filter: brightness(.94); }
+.r1-ready__button[aria-disabled="true"] { cursor: not-allowed; background: var(--c-border); color: var(--c-ink-muted); box-shadow: none; }
+.r1-ready__button:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 3px; }
+.r1-ready__note, .r1-ready__error { margin: 0; font-size: 13px; line-height: 1.4; text-align: center; }
+.r1-ready__note { color: var(--c-ink-secondary); }
 
 /* The R1 shell clips the decorative blobs that hang off the page, so they add no blank scroll. */
 .r1-shell { overflow: clip; }
