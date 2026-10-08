@@ -246,10 +246,13 @@ kill_timeout = 300
   # confirm, callback and every terminal phase keep the 0.3 above. Clamp [0.3, 1.2]
   # and never above the MAX. ROLLBACK: "0.3" makes the per-phase minimum a no-op.
   PHONE_OPEN_ANSWER_MIN_DELAY_SEC = "0.8"
-  # M014: longest the reply is held (hook time, then again before its first audio)
-  # while the VAD heard candidate speech no STT final has covered yet. Only ever
-  # entered while such speech is pending, so a turn with none pays nothing.
-  # Clamp [0, 3.0]. ROLLBACK / KILL SWITCH: "0" disables the hold entirely.
+  # M014: longest the reply waits for a final AFTER the candidate stopped (hook time
+  # and first audio share this, cumulative per reply) while the VAD heard candidate
+  # speech no STT final has covered yet. A reply is also held for as long as a VAD
+  # segment is open (the candidate is speaking): no absolute ceiling, only a
+  # stuck-VAD guard at 10 s. Only ever entered while speech is pending or open, so a
+  # turn with none pays nothing. Clamp [0, 3.0]. ROLLBACK / KILL SWITCH: "0"
+  # disables the hold entirely.
   PHONE_PENDING_FINAL_HOLD_MAX_SEC = "2.0"
 
   # ═══ DEPLOY NOTE — A FLY SECRET SHADOWS THE `[env]` VALUE OF THE SAME NAME ═══

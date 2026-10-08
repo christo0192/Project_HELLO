@@ -80,33 +80,47 @@ gate max of `min(MAX, 1.0)` and the screening phase raises it to the MAX):
    that answer's own class. The first planned question is a spoken line, so its
    class is applied once it has been heard.
 3. Pending-final hold: when the VAD heard candidate speech no STT final has
-   covered yet, the reply is held at hook time (and again before its first audio)
-   for at most `PHONE_PENDING_FINAL_HOLD_MAX_SEC`, then yields to the late final
-   and is merged into it. A turn with no pending speech waits 0. Speech that
-   never gets a final (a cough, a breath, line noise: the SDK drops empty finals)
-   stops counting as pending 1.5 s after it ended (`PENDING_CLOSED_EXPIRY_SEC`),
-   so it costs at most ~1.5 s once, shared by both holds.
+   covered yet, or the candidate is audibly speaking (a VAD segment is open), the
+   reply is held at hook time (and again before its first audio), then yields to
+   the late final and is merged into it. A turn with nothing pending waits 0.
+   There is deliberately **no absolute ceiling from the start of a hold**: a
+   ceiling talks over a candidate who is still answering, which is the
+   interruption RCA's main pattern. Two kinds of time are treated differently.
+   * **While a VAD segment is open** the hold keeps waiting (the SDK authorizes a
+     reply once and never re-checks for silence before its audio plays, so this
+     hold is all that stops a ready reply from playing over a continuing
+     answer). 6-8 s of continuous speech is simply held. Only a stuck VAD bounds
+     it: an open segment older than 10 s (`OPEN_SEGMENT_STALE_SEC`) stops
+     counting and is logged (`held_open_segment_stale` /
+     `audio_hold_open_segment_stale`). When the continuation's final (at least
+     `PHONE_MIN_INTERRUPTION_WORDS` words) lands, the SDK itself interrupts the
+     held reply and starts a new turn. An open segment always means hold, even in
+     its first 0.3 s, so a reply never releases into the candidate's next sentence
+     when the previous sentence's final lands early in it.
+   * **Waiting for a final after speech ended** (closed segments no final has
+     covered) is capped **cumulatively per reply** at
+     `PHONE_PENDING_FINAL_HOLD_MAX_SEC` and shared by the hook-time and the
+     first-audio hold of that reply (the budget restarts at the next hook and
+     after a line's first audio is released). Speech that never gets a final (a
+     cough, a breath, line noise: the SDK drops empty finals) also stops counting
+     as pending 1.5 s after it ended (`PENDING_CLOSED_EXPIRY_SEC`). Worst case
+     with recurring wordless noise: about the cap (2 s) of extra waiting plus the
+     noise bursts themselves, then the reply plays.
    Before its first audio a held reply waits for the SDK's commit only for a
    final the SDK WILL commit (at least `PHONE_MIN_INTERRUPTION_WORDS` words
-   banked since the last turn); a one- or two-word backchannel releases the
-   reply as soon as it is covered. Both holds count QUIET time only: while the
-   candidate is still talking (a VAD segment is open) a held reply keeps waiting,
-   because the SDK authorizes a reply once and never re-checks for silence before
-   its audio plays, and the bounds restart when the candidate stops. That
-   extension has an ABSOLUTE ceiling per hold, wall clock from when the hold
-   starts: `PHONE_PENDING_FINAL_HOLD_MAX_SEC` + max endpointing + 0.3 s, never
-   more than 4.0 s (`HOLD_ABSOLUTE_CEILING_SEC`), however many finals, noise
-   bursts or speech segments arrive. Worst case with recurring wordless noise:
-   one 4 s hold at hook time then one 4 s hold before first audio (about 8 s
-   in total, then the reply plays). The first-audio watchdog is re-armed every
-   second inside a hold and never past its ceiling, so it cannot be suppressed
-   indefinitely. A line that cannot be interrupted (the fixed closing goodbye,
-   any `say(..., allow_interruptions=False)`) is never held and never waits for a
-   commit, because the SDK plays it over the candidate on purpose and no commit
-   can cancel it; the farewell keeps its 10 s playout bound. If a committable
-   final was banked and a wordless segment then opens, the commit window is
-   re-opened from that segment's end (up to the endpoint max + 0.3 s, inside the
-   ceiling) so the reply is not started and then cut by the SDK's delayed commit.
+   banked since the last turn), for at most one commit window (max endpointing +
+   0.3 s) of quiet time since that final; a one- or two-word backchannel releases
+   the reply as soon as it is covered. The first-audio watchdog is re-armed every
+   second while a segment is open and when each quiet wait begins, so it cannot
+   speak into the candidate. A yielded turn whose successor never reaches the
+   hook is recovered by the orphan backstop after max endpointing + 2 s of
+   cumulative quiet time (and in any case after 30 s), so neither noise bursts nor
+   a stuck VAD can suppress the watchdog indefinitely. A line that cannot be
+   interrupted (the fixed closing goodbye, any `say(..., allow_interruptions=False)`)
+   is never held and never waits for a commit, because the SDK plays it over the
+   candidate on purpose and no commit can cancel it; the farewell keeps its 10 s
+   playout bound. `PHONE_PENDING_FINAL_HOLD_MAX_SEC=0` is the kill switch: no
+   hold, no merge, no re-arm and no hold logs.
 
 **Rollbacks.** Edit `fly.phone.toml` and deploy (the normal path). In an
 emergency, with no deploy:
@@ -128,13 +142,12 @@ LLM-invoke-to-first-audio floor that four prior PRs were spent removing.
 text):**
 
 - `phone_turn_hold`: `held_yield`, `held_cleared`, `held_cap_reached`
-  (`duration_sec`), `held_ceiling_reached` (the absolute ceiling ended a hook-time
-  hold that had been extended by speech or noise), `carry_merged`, `carry_orphaned` (the backstop spoke),
-  `carry_unmerged_at_close`, `audio_hold` (`duration_sec`),
-  `audio_hold_cap_reached` (`schema` = `pending`: the cap ended the hold;
-  `after_final`: the absolute ceiling cut a commit grace short),
-  `audio_hold_ceiling_reached` (same `schema` values: the ceiling ended a hold
-  that speech or noise had extended; frequent hits mean a noisy line),
+  (`duration_sec`; the cumulative wait for a final ran out), `held_open_segment_stale`
+  (a stuck open VAD segment ended a hook-time hold), `carry_merged`,
+  `carry_orphaned` (the backstop spoke), `carry_unmerged_at_close`, `audio_hold`
+  (`duration_sec`), `audio_hold_cap_reached` (`schema` = `pending`: the
+  cumulative wait ran out; frequent hits mean a noisy line),
+  `audio_hold_open_segment_stale` (a stuck open VAD segment ended the hold),
   `audio_hold_skipped` (`schema` = `non_interruptible`: a line nothing can cancel
   was spoken without a hold).
 - `phone_endpointing_phase`: `open` | `short` (`duration_sec` = the minimum

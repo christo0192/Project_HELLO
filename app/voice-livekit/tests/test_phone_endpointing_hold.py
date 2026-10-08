@@ -295,13 +295,27 @@ class TestTrackerTruthTable(unittest.TestCase):
         self.assertFalse(t.pending(10.2))
         self.assertTrue(t.pending(10.35))
 
-    def test_a_stuck_open_segment_is_ignored_after_two_minutes(self):
+    def test_a_stuck_open_segment_is_ignored_after_ten_seconds(self):
+        self.assertEqual(turn_hold.OPEN_SEGMENT_STALE_SEC, 10.0)
         t = self._t()
         t.on_speech_start(10.0)            # its end event was lost
-        self.assertTrue(t.pending(60.0))
+        self.assertTrue(t.pending(15.0))
+        self.assertTrue(t.open_segment_stale(10.0 + turn_hold.OPEN_SEGMENT_STALE_SEC))
+        self.assertFalse(t.open_segment_stale(15.0))
         self.assertFalse(t.pending(10.0 + turn_hold.OPEN_SEGMENT_STALE_SEC + 1.0))
         t.clock = lambda: 10.0 + turn_hold.OPEN_SEGMENT_STALE_SEC + 1.0
         self.assertFalse(t.candidate_speaking())
+        self.assertFalse(t.needs_hold())
+
+    def test_needs_hold_includes_a_young_open_segment(self):
+        """An open segment always means hold, even before it is 0.3 s old (the
+        first-audio hold must not release into the candidate's next sentence)."""
+        t = self._t()
+        t.on_speech_start(10.0)
+        t.clock = lambda: 10.1
+        self.assertFalse(t.pending(10.1))
+        self.assertTrue(t.candidate_speaking())
+        self.assertTrue(t.needs_hold())
 
     def test_a_blip_after_a_final_is_not_pending(self):
         t = self._t()
@@ -962,21 +976,20 @@ class TestFirstAudioHold(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h.tracker.uncommitted_words(), 3)
         self.assertGreaterEqual(h.frames[0][1], 0.1 + 0.3, "the grace applied")
 
-    async def test_repeated_committable_finals_never_push_past_the_ceiling(self):
-        """Round 2, major: a stream of finals must not extend the hold without
-        limit: cap + endpoint max + 0.3 s is absolute."""
-        h = _TtsHarness(cap=0.2, endpoint_max_sec=lambda: 0.2)  # ceiling 0.2 + 0.5
+    async def test_repeated_committable_finals_hold_one_grace_after_the_last(self):
+        """Each committable final re-opens the commit window (the SDK commits
+        after the LAST one), so the hold ends one grace after the stream does."""
+        h = _TtsHarness(cap=0.2, endpoint_max_sec=lambda: 0.2)  # grace 0.5 s
         _pend(h.tracker)
         loop = asyncio.get_running_loop()
-        for i in range(1, 12):
+        for i in range(1, 6):
             loop.call_later(
                 0.15 * i, lambda: h.tracker.on_final(time.time(), "still talking here"))
         await asyncio.wait_for(h.consume(), timeout=5)
         first = h.frames[0][1]
-        self.assertGreaterEqual(first, 0.2 + 0.5 - 0.05)
-        self.assertLess(first, 0.2 + 0.5 + 0.25, "bounded by the ceiling")
-        meta = h.log.meta("audio_hold_cap_reached")
-        self.assertEqual([m["schema"] for m in meta], ["after_final"])
+        self.assertGreaterEqual(first, 0.75 + 0.5 - 0.05)
+        self.assertLess(first, 0.75 + 0.5 + 0.25)
+        self.assertNotIn("audio_hold_cap_reached", h.log.categories())
 
     async def test_repeated_short_finals_release_when_the_segment_is_covered(self):
         h = _TtsHarness(cap=0.2, endpoint_max_sec=lambda: 0.2)
@@ -1536,32 +1549,48 @@ class TestReplays(unittest.IsolatedAsyncioTestCase):
         self.assertGreaterEqual(len([r for r in rearms if r[0] < 8.0]), 2)
         self.assertTrue(all(r[1] and r[2] for r in rearms))
 
-    async def test_a_monologue_longer_than_the_ceiling_releases_at_the_ceiling(self):
-        frames: list = []
+    async def test_continuing_speech_of_six_to_eight_seconds_is_never_talked_over(self):
+        """No absolute ceiling: the RCA's main pattern is a candidate who keeps
+        going for several seconds.  Both seams hold for as long as the segment
+        is open, and the watchdog is re-armed through the whole talk."""
+        for talk_end in (12.0, 12.5, 13.0):         # 6.3 s .. 8.3 s of speech
+            frames: list = []
+            vc, tracker, hold, log = _virtual(cap=2.0)
+            agent = _build_agent()
+            agent._turn_hold = hold
+            agent.arm_reply_generation(1)
+            rearms: list = []
+
+            async def reply_expected(*, rearm_only=False, hold=False):
+                rearms.append(vc.t)
+
+            agent._on_reply_expected = reply_expected
+            tracker.on_speech_start(4.7)
+            tracker.script.append((talk_end, lambda t=talk_end: tracker.on_speech_end(t)))
+            vc.t = 5.55
+
+            async def src():
+                yield "Nice, tell me about the launch."
+
+            async for frame in agent.tts_node(src(), None):
+                frames.append((frame, vc.t))
+            release = talk_end + turn_hold.PENDING_CLOSED_EXPIRY_SEC
+            self.assertGreaterEqual(frames[0][1], release - 1e-6, talk_end)
+            self.assertLess(frames[0][1], release + 0.1, talk_end)
+            self.assertGreaterEqual(len([t for t in rearms if t < talk_end]), 5)
+            self.assertNotIn("audio_hold_open_segment_stale", log.categories())
+
+    async def test_the_hook_time_hold_also_waits_out_continuing_speech(self):
         vc, tracker, hold, log = _virtual(cap=2.0)
-        agent = _build_agent()
-        agent._turn_hold = hold
-        agent.arm_reply_generation(1)
-        rearms: list = []
-
-        async def reply_expected(*, rearm_only=False, hold=False):
-            rearms.append(vc.t)
-
-        agent._on_reply_expected = reply_expected
-        tracker.on_speech_start(4.7)          # talks for 10 s
-        tracker.script.append((14.0, lambda: tracker.on_speech_end(14.0)))
-        vc.t = 5.55
-
-        async def src():
-            yield "Nice, tell me about the launch."
-
-        async for frame in agent.tts_node(src(), None):
-            frames.append((frame, vc.t))
-        ceiling = 5.55 + turn_hold.HOLD_ABSOLUTE_CEILING_SEC
-        self.assertGreaterEqual(frames[0][1], ceiling - 1e-6)
-        self.assertLess(frames[0][1], ceiling + 0.1)
-        self.assertEqual(log.meta("audio_hold_ceiling_reached")[0]["schema"], "pending")
-        self.assertTrue(rearms and max(rearms) < ceiling, "no re-arm past the ceiling")
+        tracker.on_speech_start(4.0)
+        tracker.script.append((12.0, lambda: tracker.on_speech_end(12.0)))
+        tracker.script.append((13.0, lambda: tracker.on_final(13.0, "and it took about six months")))
+        vc.t = 5.0
+        with self.assertRaises(_Stop):
+            await hold.before_turn(_msg("i led the migration at my last company", 100.0))
+        self.assertAlmostEqual(vc.t, 13.0)
+        self.assertEqual(log.categories(), ["held_yield"])
+        hold.on_close()
 
     async def test_a_mid_speech_final_does_not_start_the_commit_grace_while_they_talk(self):
         vc, tracker, hold, log = _virtual(cap=2.0)
@@ -1573,17 +1602,29 @@ class TestReplays(unittest.IsolatedAsyncioTestCase):
         # Never released during the speech (a grace started by the mid-speech
         # final would have run out at 6.5 + 2.3); at the segment's end the SDK
         # re-runs end-of-turn detection on the banked words, so the commit is
-        # awaited from there (bounded by the ceiling).
-        self.assertGreaterEqual(vc.t, 8.0)
-        self.assertLessEqual(vc.t, 5.55 + turn_hold.HOLD_ABSOLUTE_CEILING_SEC + 0.1)
+        # awaited from there, for one commit grace at most.
+        self.assertGreaterEqual(vc.t, 8.0 + 2.0)
+        self.assertLessEqual(vc.t, 8.0 + 2.3 + 0.1)
 
     async def test_a_stuck_vad_segment_cannot_hold_a_reply_forever(self):
         vc, tracker, hold, log = _virtual(cap=2.0)
         tracker.on_speech_start(0.0)          # the end event never arrives
         vc.t = 1.0
         await hold.before_first_audio()
-        self.assertLessEqual(vc.t, 1.0 + turn_hold.HOLD_ABSOLUTE_CEILING_SEC + 0.1)
-        self.assertIn("audio_hold_ceiling_reached", log.categories())
+        stale_at = turn_hold.OPEN_SEGMENT_STALE_SEC
+        self.assertGreaterEqual(vc.t, stale_at)
+        self.assertLessEqual(vc.t, stale_at + 0.1)
+        self.assertEqual(log.categories().count("audio_hold_open_segment_stale"), 1)
+
+    async def test_a_stuck_vad_segment_releases_the_hook_time_hold_too(self):
+        vc, tracker, hold, log = _virtual(cap=2.0)
+        tracker.on_speech_start(0.0)
+        vc.t = 1.0
+        await hold.before_turn(_msg("an answer", 100.0))
+        self.assertGreaterEqual(vc.t, turn_hold.OPEN_SEGMENT_STALE_SEC)
+        self.assertLessEqual(vc.t, turn_hold.OPEN_SEGMENT_STALE_SEC + 0.1)
+        self.assertEqual(log.categories(), ["held_open_segment_stale"])
+        self.assertIsNone(hold.carry)
 
     async def test_the_hook_time_hold_also_outlasts_the_cap_while_they_talk(self):
         rearms: list = []
@@ -1722,7 +1763,7 @@ class TestReplays(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(vc.t, 7.0)
 
 
-# ── round 5: absolute ceiling, non-interruptible lines, grace re-open ───────
+# ── round 6: no absolute ceiling (an open segment holds; one cumulative budget) ──
 
 def _noise_bursts(tracker, *, first=4.0, on=0.8, off=0.7, until=40.0):
     """Recurring wordless VAD segments (line or background noise), scripted."""
@@ -1733,18 +1774,21 @@ def _noise_bursts(tracker, *, first=4.0, on=0.8, off=0.7, until=40.0):
         t += on + off
 
 
-class TestHoldAbsoluteCeiling(unittest.IsolatedAsyncioTestCase):
-    def test_the_ceiling_is_the_cap_plus_at_most_the_grace_and_never_over_four_seconds(self):
-        _, _, hold, _ = _virtual(cap=2.0)          # endpoint max 2.0 -> grace 2.3
-        self.assertAlmostEqual(hold._ceiling_sec(2.0), 4.0)
-        self.assertAlmostEqual(hold._ceiling_sec(3.0), 4.0)    # the cap itself is a floor
-        self.assertAlmostEqual(hold._ceiling_sec(0.5), 2.8)    # cap + grace when under 4 s
-        for cap in (0.1, 0.5, 1.0, 2.0, 3.0):
-            self.assertGreaterEqual(hold._ceiling_sec(cap), cap)
-            self.assertLessEqual(hold._ceiling_sec(cap), max(cap, turn_hold.HOLD_ABSOLUTE_CEILING_SEC))
+def _burst_overlap(first, on, off, start, end, until=40.0):
+    """Seconds of [start, end] covered by the scripted noise bursts."""
+    total, t = 0.0, first
+    while t < until:
+        total += max(0.0, min(end, t + on) - max(start, t))
+        t += on + off
+    return total
 
-    async def test_recurring_wordless_noise_cannot_hold_the_first_audio_past_the_ceiling(self):
-        for on, off in ((0.8, 0.7), (1.5, 1.0)):
+
+class TestHoldBudget(unittest.IsolatedAsyncioTestCase):
+    """No absolute ceiling: an open segment always holds, the wait for a final
+    after speech ended is one cumulative budget per reply."""
+
+    async def test_recurring_wordless_noise_costs_the_cap_plus_the_bursts_at_the_first_audio(self):
+        for on, off in ((0.8, 0.7), (1.5, 1.0), (0.4, 0.5)):
             vc, tracker, hold, log = _virtual(cap=2.0)
             rearms: list = []
             tracker.on_speech_start(4.9)       # a wordless segment just closed when the line is ready
@@ -1752,29 +1796,85 @@ class TestHoldAbsoluteCeiling(unittest.IsolatedAsyncioTestCase):
             _noise_bursts(tracker, first=6.0, on=on, off=off)
             vc.t = 5.55
             await hold.before_first_audio(rearm=lambda: rearms.append(vc.t))
-            ceiling = 5.55 + turn_hold.HOLD_ABSOLUTE_CEILING_SEC
-            self.assertGreaterEqual(vc.t, ceiling - 0.05, (on, off))
-            self.assertLessEqual(vc.t, ceiling + 0.05, (on, off))
-            self.assertIn("audio_hold_ceiling_reached", log.categories())
+            quiet = (vc.t - 5.55) - _burst_overlap(6.0, on, off, 5.55, vc.t)
+            self.assertAlmostEqual(quiet, 2.0, delta=0.05, msg=(on, off))
+            self.assertIn("audio_hold_cap_reached", log.categories())
             self.assertTrue(rearms)
-            self.assertLess(max(rearms), ceiling, "the watchdog is never re-armed past the ceiling")
 
-    async def test_recurring_wordless_noise_cannot_hold_the_hook_past_the_ceiling(self):
-        for on, off in ((0.8, 0.7), (1.5, 1.0)):
+    async def test_recurring_wordless_noise_costs_the_cap_plus_the_bursts_at_the_hook(self):
+        for on, off in ((0.8, 0.7), (1.5, 1.0), (0.4, 0.5)):
             vc, tracker, hold, log = _virtual(cap=2.0)
-            rearms: list = []
-            hold._rearm = lambda: rearms.append(vc.t)
             tracker.on_speech_start(4.9)
             tracker.on_speech_end(5.5)
             _noise_bursts(tracker, first=6.0, on=on, off=off)
             vc.t = 5.55
             await hold.before_turn(_msg("i led the migration at my last company", 100.0))
-            ceiling = 5.55 + turn_hold.HOLD_ABSOLUTE_CEILING_SEC
-            self.assertGreaterEqual(vc.t, ceiling - 0.05, (on, off))
-            self.assertLessEqual(vc.t, ceiling + 0.05, (on, off))
-            self.assertIn("held_ceiling_reached", log.categories())
+            quiet = (vc.t - 5.55) - _burst_overlap(6.0, on, off, 5.55, vc.t)
+            self.assertAlmostEqual(quiet, 2.0, delta=0.05, msg=(on, off))
+            self.assertEqual(log.categories(), ["held_cap_reached"])
             self.assertIsNone(hold.carry, "released without yielding: no final ever came")
-            self.assertLess(max(rearms), ceiling)
+
+    async def test_the_two_seams_of_one_reply_share_one_budget(self):
+        on, off = 0.8, 0.7
+        vc, tracker, hold, log = _virtual(cap=2.0)
+        tracker.on_speech_start(4.9)
+        tracker.on_speech_end(5.5)
+        _noise_bursts(tracker, first=6.0, on=on, off=off)
+        vc.t = 5.55
+        await hold.before_turn(_msg("i led the migration at my last company", 100.0))
+        await hold.before_first_audio()
+        quiet = (vc.t - 5.55) - _burst_overlap(6.0, on, off, 5.55, vc.t)
+        self.assertAlmostEqual(quiet, 2.0, delta=0.05,
+                               msg="the second hold did not wait another cap")
+        self.assertIn("held_cap_reached", log.categories())
+        self.assertIn("audio_hold_cap_reached", log.categories())
+
+    async def test_the_budget_is_fresh_for_the_next_reply(self):
+        on, off = 0.8, 0.7
+        vc, tracker, hold, log = _virtual(cap=2.0)
+        tracker.on_speech_start(4.9)
+        tracker.on_speech_end(5.5)
+        _noise_bursts(tracker, first=6.0, on=on, off=off)
+        vc.t = 5.55
+        await hold.before_first_audio()                  # reply 1 released
+        mark = vc.t
+        await hold.before_turn(_msg("another answer", 101.0))   # reply 2: new hook
+        quiet = (vc.t - mark) - _burst_overlap(6.0, on, off, mark, vc.t)
+        self.assertAlmostEqual(quiet, 2.0, delta=0.05)
+
+    async def test_the_kill_switch_never_waits_and_never_logs(self):
+        vc, tracker, hold, log = _virtual(cap=0)
+        tracker.on_speech_start(4.0)            # a live open segment
+        vc.t = 5.0
+        await hold.before_turn(_msg("answer", 100.0))
+        await hold.before_first_audio(rearm=lambda: self.fail("no rearm"))
+        await hold.before_first_audio(interruptible=False)   # not even a "skipped" log
+        self.assertEqual(vc.t, 5.0)
+        self.assertEqual(tracker.wait_calls, 0)
+        self.assertEqual(log.rows, [])
+
+    async def test_a_young_open_segment_holds_the_first_audio_when_the_previous_final_lands(self):
+        """The previous sentence's final lands 0.1 s into the next sentence:
+        the first-audio hold must keep holding (an open segment always holds),
+        not release into it."""
+        vc, tracker, hold, log = _virtual(cap=2.0)
+        tracker.on_speech_start(4.0)
+        tracker.on_speech_end(5.0)
+        tracker.script.append((6.0, lambda: tracker.on_speech_start(6.0)))
+        tracker.script.append((6.1, lambda: tracker.on_final(6.1, "yes")))     # covers 4.0-5.0
+        tracker.script.append((9.0, lambda: tracker.on_speech_end(9.0)))
+        tracker.script.append((9.9, lambda: tracker.on_final(9.9, "and then we shipped it")))
+        vc.t = 5.55
+        await hold.before_first_audio()
+        self.assertGreaterEqual(vc.t, 9.0, "not released into the candidate's next sentence")
+
+    async def test_a_young_open_segment_alone_holds_the_first_audio(self):
+        vc, tracker, hold, log = _virtual(cap=2.0)
+        tracker.on_speech_start(5.5)            # 0.05 s old: not "pending" by the 0.3 s rule
+        tracker.script.append((6.5, lambda: tracker.on_speech_end(6.5)))
+        vc.t = 5.55
+        await hold.before_first_audio()
+        self.assertGreaterEqual(vc.t, 6.5)
 
     async def test_a_cough_without_any_further_speech_is_still_released_by_its_expiry(self):
         vc, tracker, hold, log = _virtual(cap=2.0)
@@ -1783,17 +1883,70 @@ class TestHoldAbsoluteCeiling(unittest.IsolatedAsyncioTestCase):
         vc.t = 5.55
         await hold.before_first_audio()
         self.assertLess(vc.t, 5.55 + 2.0 + 0.1)
-        self.assertNotIn("audio_hold_ceiling_reached", log.categories())
+        self.assertNotIn("audio_hold_cap_reached", log.categories())
 
-    async def test_a_committable_final_grace_cannot_pass_the_ceiling(self):
+    async def test_a_committable_final_grace_is_one_grace_after_the_final(self):
         vc, tracker, hold, log = _virtual(cap=2.0)
         tracker.on_speech_start(4.0)
         tracker.on_speech_end(5.0)
         tracker.script.append((5.9, lambda: tracker.on_final(5.9, "i led the migration at my last company")))
         vc.t = 5.55
         await hold.before_first_audio()
-        self.assertLessEqual(vc.t, 5.55 + turn_hold.HOLD_ABSOLUTE_CEILING_SEC + 0.05)
         self.assertGreaterEqual(vc.t, 5.9 + 2.0, "the SDK's commit window is still waited out")
+        self.assertLessEqual(vc.t, 5.9 + 2.3 + 0.05)
+
+    async def test_noise_after_a_committable_final_cannot_reopen_the_grace_forever(self):
+        """Banked words + recurring wordless noise: every segment end re-opens
+        the commit window, but the quiet time spent in it is cumulative since
+        the last final."""
+        on, off = 0.8, 0.7
+        vc, tracker, hold, log = _virtual(cap=2.0)
+        tracker.on_speech_start(4.0)
+        tracker.on_speech_end(5.0)
+        tracker.script.append((5.6, lambda: tracker.on_final(5.6, "i led the migration at my last company")))
+        _noise_bursts(tracker, first=6.0, on=on, off=off)
+        vc.t = 5.55
+        await hold.before_first_audio()
+        quiet = (vc.t - 5.55) - _burst_overlap(6.0, on, off, 5.55, vc.t)
+        self.assertLessEqual(quiet, 0.05 + 0.05 + 2.3 + 0.05, "one grace of quiet, however many bursts")
+        self.assertLess(vc.t, 20.0)
+
+    async def test_the_orphan_watch_counts_quiet_time_cumulatively(self):
+        """Noise bursts used to reset the quiet deadline forever."""
+        calls: list = []
+        vc, tracker, hold, log = _virtual(cap=2.0, on_orphan=lambda: calls.append(vc.t))
+        _noise_bursts(tracker, first=1.0, on=0.8, off=0.7)
+        hold.carry = ("first part", 100.0)
+        vc.t = 0.0
+        await hold._watch_orphan()
+        bound = hold._orphan_bound()             # endpoint max 2.0 + 2.0
+        self.assertEqual(len(calls), 1)
+        quiet = calls[0] - _burst_overlap(1.0, 0.8, 0.7, 0.0, calls[0])
+        self.assertAlmostEqual(quiet, bound, delta=0.05)
+        self.assertIn("carry_orphaned", log.categories())
+        self.assertIsNone(hold.carry)
+
+    async def test_the_orphan_watch_has_an_absolute_bound_too(self):
+        calls: list = []
+        vc, tracker, hold, log = _virtual(cap=2.0, on_orphan=lambda: calls.append(vc.t))
+        _noise_bursts(tracker, first=0.5, on=5.0, off=0.05)   # almost no quiet time
+        hold.carry = ("first part", 100.0)
+        vc.t = 0.0
+        await hold._watch_orphan()
+        self.assertEqual(len(calls), 1)
+        self.assertGreaterEqual(calls[0], turn_hold.ORPHAN_ABSOLUTE_SEC - 1e-6)
+        self.assertLessEqual(calls[0], turn_hold.ORPHAN_ABSOLUTE_SEC + 1.05)
+
+    async def test_a_stuck_open_segment_does_not_stall_the_orphan_watch(self):
+        calls: list = []
+        vc, tracker, hold, log = _virtual(cap=2.0, on_orphan=lambda: calls.append(vc.t))
+        tracker.on_speech_start(0.0)              # the end event never arrives
+        hold.carry = ("first part", 100.0)
+        vc.t = 1.0
+        await hold._watch_orphan()
+        stale_at = turn_hold.OPEN_SEGMENT_STALE_SEC
+        self.assertGreaterEqual(calls[0], stale_at + hold._orphan_bound() - 0.05)
+        self.assertLess(calls[0], stale_at + hold._orphan_bound() + 1.05)
 
 
 class TestNonInterruptibleLinesAreNeverHeld(unittest.IsolatedAsyncioTestCase):
@@ -1892,7 +2045,7 @@ class TestCommitGraceReopensAfterAWordlessSegment(unittest.IsolatedAsyncioTestCa
         # The SDK re-runs end-of-turn detection at 6.4 and may commit up to the
         # endpoint max (2.0) later: not released at the segment's own expiry (7.9).
         self.assertGreaterEqual(vc.t, 6.4 + 2.0 - 1e-6)
-        self.assertLessEqual(vc.t, 5.55 + turn_hold.HOLD_ABSOLUTE_CEILING_SEC + 0.05)
+        self.assertLessEqual(vc.t, 6.4 + 2.3 + 0.05)
 
     async def test_a_wordless_segment_with_nothing_banked_still_releases_at_its_expiry(self):
         vc, tracker, hold, log = _virtual(cap=2.0)

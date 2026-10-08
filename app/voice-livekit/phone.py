@@ -2458,8 +2458,11 @@ def phone_open_answer_min_delay() -> float:
 
 
 def phone_pending_final_hold_max_sec() -> float:
-    """Longest a reply may be held while candidate speech is still un-finalized.
+    """Longest a reply waits for a final AFTER the candidate stopped speaking.
 
+    Cumulative per reply (the hook-time and the first-audio hold share it) and
+    counted only while no VAD segment is open: a reply is also held for as long
+    as the candidate is audibly speaking (no absolute ceiling; ``turn_hold``).
     Default 2.0s, bounded to [0, 3.0]. ``0`` (or any negative value) is the kill
     switch: no hold, no carry, no re-arm. A non-numeric or non-finite value falls
     back to the default. Read at the call site with the literal name so the

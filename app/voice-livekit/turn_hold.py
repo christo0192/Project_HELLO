@@ -29,10 +29,22 @@ A closed VAD segment that no non-empty final covers stops counting as pending
 ``PENDING_CLOSED_EXPIRY_SEC`` after it ended: the SDK never delivers an empty
 final, so a cough or breath would otherwise hold every reply to the cap.
 
-Every hold has an ABSOLUTE ceiling (``HOLD_ABSOLUTE_CEILING_SEC``), so recurring
-wordless VAD noise can never hold a reply, a hook or the first-audio watchdog
-indefinitely.  A line that cannot be interrupted (the fixed closing goodbye) is
-never held at all.
+HOW LONG A HOLD WAITS.  There is deliberately NO absolute ceiling from the
+start of a hold: a ceiling talks over a candidate who is still answering, which
+is the RCA's main pattern.  Two different kinds of time are treated differently.
+
+* While a VAD segment is OPEN (the candidate is audibly speaking) the hold keeps
+  waiting and costs no dead air.  Only a stuck VAD bounds it: an open segment
+  older than ``OPEN_SEGMENT_STALE_SEC`` stops counting (and is logged).  When the
+  continuation's final (>= 3 words) lands, the SDK itself interrupts the held
+  reply and starts a new turn.
+* Time spent waiting for a final AFTER speech ended (closed, uncovered
+  segments) is capped CUMULATIVELY per reply at ``PHONE_PENDING_FINAL_HOLD_MAX_SEC``
+  and shared by the hook-time and the first-audio hold of that reply.  Recurring
+  wordless noise therefore costs at most that cap of extra waiting plus the
+  noise bursts themselves.
+
+A line that cannot be interrupted (the fixed closing goodbye) is never held.
 
 PURE PYTHON.  No ``livekit`` import at module scope (``StopResponse`` is
 resolved lazily at the one place it is raised), so this unit-tests without the
@@ -83,23 +95,26 @@ DEFAULT_COMMIT_MIN_WORDS = 3
 #: talking over them), but wakes at least this often to re-arm the first-audio
 #: watchdog so its fallback cannot fire into the candidate's speech.
 SPEAKING_REARM_SEC = 1.0
-#: ABSOLUTE ceiling of one hold, wall clock from when the hold starts.  The
-#: quiet-time extension (a hold keeps waiting while a VAD segment is open) is
-#: bounded by it, so recurring wordless VAD activity (line or background noise)
-#: can never hold a reply, a hook or the first-audio watchdog indefinitely.
-#: The effective ceiling is ``min(cap + commit grace, this)``, never below the
-#: cap itself (see ``TurnHold._ceiling_sec``).
-HOLD_ABSOLUTE_CEILING_SEC = 4.0
-#: Orphan-carry backstop bound, on top of the endpointing max delay.
+#: Orphan-carry backstop bound, on top of the endpointing max delay: the QUIET
+#: time (cumulative, candidate not speaking) a yielded turn waits for its
+#: successor before the backstop speaks.
 ORPHAN_EXTRA_SEC = 2.0
+#: Wall-clock bound on the whole orphan watch, speech included, so it is finite
+#: even when the candidate (or noise) keeps a segment open.  Firing then is
+#: safe: the watchdog it arms defers to a speaking candidate on its own.
+ORPHAN_ABSOLUTE_SEC = 30.0
 #: Padding on a wake-up aimed at a segment's expiry, so the re-check lands just
 #: after it.
 _EXPIRY_WAKE_PAD_SEC = 0.02
+#: A remaining wait below this is spent (float residue of the elapsed-time
+#: accounting must not turn into a zero-length wait loop).
+_SPENT_EPSILON_SEC = 1e-6
 #: Two start events this close are one segment seen by two feeds.
 _SAME_SEGMENT_TOLERANCE_SEC = 1.0
 #: An open segment this old lost its end event (a stuck "speaking" signal): it
-#: is ignored rather than holding every later reply to the cap.
-OPEN_SEGMENT_STALE_SEC = 120.0
+#: stops counting as pending / speaking (and the hold logs it) rather than
+#: holding every later reply for as long as the signal is stuck.
+OPEN_SEGMENT_STALE_SEC = 10.0
 
 ERROR_TYPE_HOLD = "phone_turn_hold"
 ERROR_TYPE_PHASE = "phone_endpointing_phase"
@@ -348,6 +363,30 @@ class PendingFinalTracker:
         segment = self._open_segment()
         return segment is not None and self.clock() - segment[0] < OPEN_SEGMENT_STALE_SEC
 
+    def open_segment_stale(self, now: Optional[float] = None) -> bool:
+        """True when the open segment is old enough to be a stuck VAD signal."""
+        if not self.active():
+            return False
+        segment = self._open_segment()
+        if segment is None:
+            return False
+        if now is None:
+            now = self.clock()
+        return now - segment[0] >= OPEN_SEGMENT_STALE_SEC
+
+    def seconds_until_stale(self, now: Optional[float] = None) -> Optional[float]:
+        """Seconds until the live open segment turns stale (nothing else wakes a
+        waiter then), or ``None`` when there is none."""
+        if not self.active():
+            return None
+        segment = self._open_segment()
+        if segment is None:
+            return None
+        if now is None:
+            now = self.clock()
+        left = segment[0] + OPEN_SEGMENT_STALE_SEC - now
+        return left if left > 0 else None
+
     def _closed_pending(self, start: float, end: float, now: float) -> bool:
         covered = self.last_final_wall
         return (
@@ -371,6 +410,12 @@ class PendingFinalTracker:
             elif self._closed_pending(start, end, now):
                 return True
         return False
+
+    def needs_hold(self, now: Optional[float] = None) -> bool:
+        """True while a reply must wait: the candidate is audibly speaking (any
+        live open segment, however young) or speech was heard that no final has
+        covered yet."""
+        return self.candidate_speaking() or self.pending(now)
 
     def seconds_until_release(self, now: Optional[float] = None) -> Optional[float]:
         """Seconds until the nearest pending CLOSED segment expires on its own
@@ -463,6 +508,11 @@ class TurnHold:
         self._mono = monotonic
         self.carry: Optional[tuple[str, Any]] = None
         self._orphan_task: Optional[asyncio.Task] = None
+        # Quiet seconds already spent waiting for a final (closed, uncovered
+        # speech only) on behalf of the reply in flight: ONE budget shared by
+        # its hook-time hold and its first-audio hold.  Reset when the hook
+        # starts a new reply and when a line's first audio is released.
+        self._quiet_spent = 0.0
         # The minimum in force: construction uses the static (short) value.
         self._min_class = SHORT
         self._applied_min: Optional[float] = None
@@ -489,17 +539,15 @@ class TurnHold:
     def _wall(self) -> float:
         return self._tracker.clock()
 
-    def _ceiling_sec(self, cap: float) -> float:
-        """Absolute length of one hold: the cap plus at most the commit grace,
-        never more than ``HOLD_ABSOLUTE_CEILING_SEC``, never less than the cap."""
-        return max(cap, min(cap + self._grace_sec(), HOLD_ABSOLUTE_CEILING_SEC))
-
     async def _wait(self, remaining: float) -> None:
         """Wake on any tracker event, on ``remaining`` or, if sooner, just after
-        a pending closed segment expires (nothing else signals that)."""
-        release = self._tracker.seconds_until_release(self._wall())
-        if release is not None:
-            remaining = min(remaining, max(0.0, release) + _EXPIRY_WAKE_PAD_SEC)
+        a pending closed segment expires or the open segment turns stale
+        (nothing else signals either)."""
+        now = self._wall()
+        for aim in (self._tracker.seconds_until_release(now),
+                    self._tracker.seconds_until_stale(now)):
+            if aim is not None:
+                remaining = min(remaining, max(0.0, aim) + _EXPIRY_WAKE_PAD_SEC)
         await self._tracker.wait_change(remaining)
 
     # ── (a) hook time ─────────────────────────────────────────────────────
@@ -508,17 +556,21 @@ class TurnHold:
         """First statement of ``on_user_turn_completed`` (native turns only).
 
         Merges a carried turn into ``message``; then, only while speech is
-        pending, holds for the late final and yields to it (``StopResponse``).
-        Bounded by the cap (quiet time only: it restarts while the candidate is
-        still talking) and by the absolute ceiling (``_ceiling_sec``, wall clock
-        from the start of the hold); a no-op when nothing is pending.  May raise
-        ``StopResponse``.
+        pending or the candidate is audibly speaking, holds for the late final
+        and yields to it (``StopResponse``).  While a VAD segment is open the
+        hold just keeps waiting (an open segment older than
+        ``OPEN_SEGMENT_STALE_SEC`` is a stuck VAD and is dropped); the time
+        spent waiting for a final after speech ENDED is capped cumulatively at
+        the hold cap (shared with ``before_first_audio``).  A no-op when nothing
+        is pending.  May raise ``StopResponse``.
         """
         tracker = self._tracker
         if not tracker.active():
             return
-        # The SDK committed: the words it had banked belong to this turn.
+        # The SDK committed: the words it had banked belong to this turn, and
+        # this is a new reply with a fresh waiting budget.
         tracker.note_commit()
+        self._quiet_spent = 0.0
         cap = self._cap()
         if cap <= 0 and self.carry is None:
             return
@@ -528,44 +580,34 @@ class TurnHold:
         own_anchor = _read_anchor(message)
         if self.carry is not None:
             own_text, own_anchor = self._merge_carry(message, own_text, own_anchor)
-        if cap <= 0 or not tracker.pending(self._wall()):
+        if cap <= 0 or not tracker.needs_hold(self._wall()):
             return
 
         finals0 = tracker.final_count
         started = self._mono()
-        deadline = started + cap
-        # Absolute ceiling: the quiet-time restarts below can never push the
-        # hold past it, however much wordless VAD activity keeps arriving.
-        ceiling = started + self._ceiling_sec(cap)
         # The previous reply's first-audio watchdog is still counting (this
         # turn's own is armed only after the hook returns): restart it once so
         # it cannot speak its fallback over the candidate while we hold.
         await self._call_rearm()
-        speaking = False
-        extended = False
         while True:
-            # The cap counts QUIET time only: while the candidate is still
-            # talking the hold keeps waiting (a hold costs no dead air then) and
-            # the cap restarts from the moment they stop, up to the ceiling.
-            if tracker.candidate_speaking():
-                speaking = True
-                extended = True
-                deadline = self._mono() + cap
-                if self._mono() < ceiling:
-                    await self._call_rearm()
-            elif speaking:
-                speaking = False
-                deadline = self._mono() + cap
-            remaining = min(deadline, ceiling) - self._mono()
-            if speaking:
-                remaining = min(remaining, SPEAKING_REARM_SEC)
-            if remaining <= 0:
-                self._emit(
-                    ERROR_TYPE_HOLD,
-                    "held_ceiling_reached" if extended else "held_cap_reached",
-                    duration_sec=round(self._mono() - started, 3))
-                return
+            # Open segment: the candidate is talking.  Keep holding (no dead air,
+            # no budget spent) and keep the watchdog from speaking into them.
+            # Otherwise only closed, uncovered speech is pending and the wait for
+            # its final is charged to the shared budget.
+            quiet = not tracker.candidate_speaking()
+            if quiet:
+                remaining = cap - self._quiet_spent
+                if remaining <= _SPENT_EPSILON_SEC:
+                    self._emit(ERROR_TYPE_HOLD, "held_cap_reached",
+                               duration_sec=round(self._mono() - started, 3))
+                    return
+            else:
+                await self._call_rearm()
+                remaining = SPEAKING_REARM_SEC
+            waited_from = self._mono()
             await self._wait(remaining)
+            if quiet:
+                self._quiet_spent += self._mono() - waited_from
             if tracker.final_count > finals0:
                 self.carry = (own_text, own_anchor)
                 self._emit(ERROR_TYPE_HOLD, "held_yield",
@@ -577,9 +619,12 @@ class TurnHold:
                 # the orphan backstop, arms the next one).
                 await self._call_suspend()
                 raise (self._stop_response or _stop_response_class())()
-            if not tracker.pending(self._wall()):
-                self._emit(ERROR_TYPE_HOLD, "held_cleared",
-                           duration_sec=round(self._mono() - started, 3))
+            if not tracker.needs_hold(self._wall()):
+                self._emit(
+                    ERROR_TYPE_HOLD,
+                    "held_open_segment_stale" if tracker.open_segment_stale()
+                    else "held_cleared",
+                    duration_sec=round(self._mono() - started, 3))
                 return
 
     async def _call_suspend(self) -> None:
@@ -666,23 +711,24 @@ class TurnHold:
     async def _watch_orphan(self) -> None:
         """If the yielded turn's successor never reaches the hook, speak.
 
-        The bound runs only while the candidate is NOT speaking: a long
-        resumed answer can take as long as it takes to commit.
+        The bound is the cumulative QUIET time (the candidate not speaking), so
+        a long resumed answer can take as long as it takes to commit while
+        recurring noise bursts cannot keep resetting it; ``ORPHAN_ABSOLUTE_SEC``
+        bounds the watch as a whole, speech included.
         """
         tracker = self._tracker
-        quiet_deadline: Optional[float] = None
+        quiet_left = self._orphan_bound()
+        hard_deadline = self._mono() + ORPHAN_ABSOLUTE_SEC
         try:
             while self.carry is not None:
-                if tracker.candidate_speaking():
-                    quiet_deadline = None
-                    await tracker.wait_change(1.0)
-                    continue
-                if quiet_deadline is None:
-                    quiet_deadline = self._mono() + self._orphan_bound()
-                remaining = quiet_deadline - self._mono()
-                if remaining <= 0:
+                now = self._mono()
+                if now >= hard_deadline or quiet_left <= _SPENT_EPSILON_SEC:
                     break
-                await tracker.wait_change(remaining)
+                if tracker.candidate_speaking():
+                    await tracker.wait_change(min(1.0, hard_deadline - now))
+                    continue
+                await tracker.wait_change(min(quiet_left, hard_deadline - now))
+                quiet_left -= self._mono() - now
             else:
                 return
             if self.carry is None:
@@ -733,18 +779,23 @@ class TurnHold:
     ) -> None:
         """Called before the first TTS frame of a line is yielded.
 
-        Holds while speech is pending; re-arms the first-audio watchdog so it
-        cannot fire a fallback mid-hold.  Bounded by the cap, which counts QUIET
-        time only: while a VAD segment is open the hold keeps waiting (the SDK
-        never re-checks that the candidate is silent once a reply is
-        authorized) and the cap restarts when they stop, BUT never past the
-        absolute ceiling (``_ceiling_sec``: cap + commit grace, at most
-        ``HOLD_ABSOLUTE_CEILING_SEC``, wall clock from the start of this hold),
-        so recurring wordless VAD noise cannot hold a line, or keep the
-        watchdog suppressed, indefinitely.  When a late final arrives that the
-        SDK WILL commit (enough words), keeps holding for that commit (which
-        cancels this reply before any audio) and then releases; a final too
-        short to commit (a backchannel) does not extend the hold.
+        Holds while the candidate is speaking or speech is pending; re-arms the
+        first-audio watchdog so it cannot fire a fallback mid-hold.
+
+        * While a VAD segment is open the hold keeps waiting, however long (the
+          SDK never re-checks that the candidate is silent once a reply is
+          authorized, so this hold is all that keeps a ready reply from playing
+          over a continuing answer).  An open segment older than
+          ``OPEN_SEGMENT_STALE_SEC`` is a stuck VAD and is dropped.  Release
+          never happens while a segment is open, even when the previous
+          sentence's final lands early in the next one.
+        * The wait for a final after speech ended is charged to the cap,
+          cumulatively with the hook-time hold of the same reply.
+        * When a late final arrives that the SDK WILL commit (enough words), the
+          hold keeps waiting for that commit (which cancels this reply before
+          any audio) for at most the commit grace since that final, and then
+          releases; a final too short to commit (a backchannel) does not extend
+          the hold.
 
         A line that cannot be interrupted (``interruptible=False``: the fixed
         closing goodbye, any ``say(..., allow_interruptions=False)``) is never
@@ -752,98 +803,101 @@ class TurnHold:
         cancel it, so holding (or waiting a commit grace) would only push the
         farewell past its playout bound.  Cancellation propagates.
         """
+        try:
+            await self._hold_first_audio(rearm, interruptible)
+        finally:
+            # This line's audio is released (or the line was cancelled): the
+            # next reply starts with a fresh waiting budget.
+            self._quiet_spent = 0.0
+
+    async def _hold_first_audio(
+        self, rearm: Optional[Callable[[], Any]], interruptible: bool,
+    ) -> None:
         tracker = self._tracker
         if not tracker.active():
             return
+        cap = self._cap()
+        if cap <= 0:
+            return              # the kill switch: no hold, no logs
         if not interruptible:
-            if tracker.pending(self._wall()):
+            if tracker.needs_hold(self._wall()):
                 self._emit(ERROR_TYPE_HOLD, "audio_hold_skipped",
                            schema="non_interruptible")
             return
-        cap = self._cap()
-        if cap <= 0 or not tracker.pending(self._wall()):
+        if not tracker.needs_hold(self._wall()):
             return
         started = self._mono()
-        deadline = started + cap
-        # Absolute ceiling: later finals and quiet-time restarts can never push
-        # the hold past it.
-        ceiling = started + self._ceiling_sec(cap)
-        hard_deadline = min(deadline + self._grace_sec(), ceiling)
+        grace = self._grace_sec()
         # Read BEFORE the first await so a final landing during the re-arm is
         # still seen.
         finals_seen = tracker.final_count
         await self._call_first_audio_rearm(rearm)
-        grace_deadline: Optional[float] = None
+        # Quiet seconds still to wait for the SDK's commit of a banked final
+        # (``None``: not waiting for one), and the quiet commit-wait already
+        # spent since the last non-empty final, so wordless noise after a
+        # committable final cannot re-open the grace without end.
+        grace_left: Optional[float] = None
+        grace_used = 0.0
         schema = "pending"
         speaking = False
-        extended = False
         while True:
-            now = self._mono()
-            # The cap counts QUIET time only.  livekit-agents 1.6.4 authorizes a
-            # reply once, right after it is scheduled, and never re-checks that
-            # the candidate is silent before forwarding its audio: this hold is
-            # the only thing keeping a ready reply from playing over a
-            # continuing answer.  So while a VAD segment is open the hold keeps
-            # waiting (no dead air: they are talking) and the deadlines restart
-            # from the moment they stop, all bounded by ``ceiling``.  An open
-            # segment older than ``OPEN_SEGMENT_STALE_SEC`` (a stuck VAD) stops
-            # counting as speech.
-            if tracker.candidate_speaking():
+            quiet = not tracker.candidate_speaking()
+            if not quiet:
                 speaking = True
-                extended = True
-                deadline = now + cap
-                hard_deadline = min(deadline + self._grace_sec(), ceiling)
-                # The banked commit (if any) was cancelled by the VAD start; a
-                # new final after this segment re-opens the grace.
-                grace_deadline = None
+                # The VAD start cancelled the banked commit; a new final after
+                # this segment re-opens the grace.
+                grace_left = None
                 schema = "pending"
-                # Keep the first-audio watchdog from speaking its fallback into
-                # the candidate's speech (stops at the ceiling: from then on the
-                # hold is released and the watchdog runs free).
-                if now < ceiling:
+                # Keep the watchdog from speaking its fallback into the
+                # candidate's speech.
+                await self._call_first_audio_rearm(rearm)
+                remaining = SPEAKING_REARM_SEC
+            else:
+                if speaking:
+                    speaking = False
+                    # Quiet begins: restart the watchdog for the wait ahead.
                     await self._call_first_audio_rearm(rearm)
-                now = self._mono()
-            elif speaking:
-                speaking = False
-                deadline = now + cap
-                hard_deadline = min(deadline + self._grace_sec(), ceiling)
-                # The SDK re-runs end-of-turn detection on the words it still
-                # has banked when this segment ends and commits (cancelling this
-                # reply) up to the endpoint max later: keep waiting for that
-                # commit instead of releasing when the wordless segment expires.
-                if self._commit_expected():
-                    grace_deadline = now + self._grace_sec()
-                    schema = "after_final"
-            # Once a committable final has landed the SDK's commit is due within
-            # the grace (final arrival + endpoint max): that window is NOT cut
-            # short by the overall cap, or a reply could start and then be cut
-            # by the commit.  Only the absolute ceiling bounds it.
-            limit = deadline if grace_deadline is None else min(grace_deadline, hard_deadline)
-            limit = min(limit, ceiling)
-            remaining = limit - now
-            if speaking:
-                remaining = min(remaining, SPEAKING_REARM_SEC)
-            if remaining <= 0:
-                if grace_deadline is None or grace_deadline > hard_deadline:
-                    self._emit(
-                        ERROR_TYPE_HOLD,
-                        "audio_hold_ceiling_reached" if extended
-                        else "audio_hold_cap_reached",
-                        schema=schema)
-                break
+                    # The SDK re-runs end-of-turn detection on the words it still
+                    # has banked when a segment ends and commits (cancelling this
+                    # reply) up to the endpoint max later: keep waiting for that
+                    # commit instead of releasing when a wordless segment expires.
+                    if self._commit_expected():
+                        grace_left = max(0.0, grace - grace_used)
+                        schema = "after_final"
+                # A committable final's commit window is NOT cut short by the
+                # cap, or a reply could start and then be cut by the commit.
+                remaining = grace_left if grace_left is not None else cap - self._quiet_spent
+                if remaining <= _SPENT_EPSILON_SEC:
+                    if grace_left is None:
+                        # (A commit window that simply ran out is the normal end
+                        # of a hold after a final: not logged as a cap.)
+                        self._emit(ERROR_TYPE_HOLD, "audio_hold_cap_reached",
+                                   schema=schema)
+                    break
+            waited_from = self._mono()
             await self._wait(remaining)
+            if quiet:
+                waited = self._mono() - waited_from
+                if grace_left is not None:
+                    grace_left -= waited
+                    grace_used += waited
+                else:
+                    self._quiet_spent += waited
             if tracker.final_count > finals_seen:
                 finals_seen = tracker.final_count
                 if self._commit_expected() and not tracker.candidate_speaking():
                     final_wall = tracker.last_final_wall
                     age = max(0.0, self._wall() - final_wall) if final_wall is not None else 0.0
-                    grace_deadline = self._mono() + max(0.0, self._grace_sec() - age)
+                    grace_used = 0.0
+                    grace_left = max(0.0, grace - age)
                     schema = "after_final"
                     # The commit is now awaited: restart the watchdog so its
                     # fallback cannot replace this reply inside the grace.
-                    if self._mono() < ceiling:
-                        await self._call_first_audio_rearm(rearm)
-            if grace_deadline is None and not tracker.pending(self._wall()):
+                    await self._call_first_audio_rearm(rearm)
+            if grace_left is None and not tracker.needs_hold(self._wall()):
+                if tracker.open_segment_stale():
+                    self._emit(ERROR_TYPE_HOLD, "audio_hold_open_segment_stale",
+                               schema=schema)
                 break
         self._emit(ERROR_TYPE_HOLD, "audio_hold",
                    duration_sec=round(self._mono() - started, 3))
