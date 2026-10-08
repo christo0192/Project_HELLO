@@ -20,8 +20,9 @@ engine only DECIDES, deterministically, what the learner does on each candidate 
     ``plan.scripted_text`` (the owed line) VERBATIM.  ``compose_speech`` builds the final
     text and falls back to the scripted line alone if the LLM failed.
 ``LLM_REPLY``
-    A free, constrained reply using ``plan.reminder`` (surface answers for first probes,
-    deep needs only after release), screened sentence by sentence by ``plan.guard_ctx``.
+    A free, constrained reply using ``plan.reminder`` (a HINT for a first probe, the DEEP
+    need's facts only on the turn that asks about a released topic), screened sentence by
+    sentence by ``plan.guard_ctx``.
 ``EXIT``
     The candidate said goodbye again: the session moves to ROLEPLAY_EXIT.
 
@@ -65,6 +66,7 @@ from enum import Enum
 from typing import Any
 
 from r1_commitment import (
+    COMMIT_STALL_R_SEC,
     AskKind,
     Level,
     classify_learner_commitment,
@@ -92,7 +94,7 @@ from r1_prompts import (
     learner_prefix,
     turn_reminder,
 )
-from r1_scheduler import COMMIT_STALL, F1_COUNTER, TIME_CUE, OwedMoveScheduler
+from r1_scheduler import COMMIT_STALL, F1_COUNTER, OwedMoveScheduler
 from r1_script import LEARNER_FILLER_VARIANTS
 from r1_script import line as script_line
 from r1_text import SpokenMemory, dollar_amounts, fuzzy_contains, pick_variant, word_count
@@ -104,7 +106,7 @@ from r1_tracker import (
 )
 from r1_world import WORLD_VERSION
 
-REVEAL_OFFERS = 2
+STALL_DEFER_GRACE_SEC = 30
 MAX_EARLY_STALLS = 2
 MAX_ASIDES = 3
 MIN_SUBSTANTIVE_TURNS = 8
@@ -187,7 +189,6 @@ class RolePlayEngine:
         self._stalls = 0
         self._commitment_level: Level | None = None
         self._commitment_turn: int | None = None
-        self._offers: dict[str, int] = {}
         self._violations = 0
         self._ai_questions = 0
         self._asides: list[dict[str, Any]] = []
@@ -313,10 +314,14 @@ class RolePlayEngine:
                 level=Level.WEAK,
                 resolves=True,
             )
+        # Disclosure is tied to the turn that asks about the topic: a first probe is answered
+        # with the HINT layer and a follow-up (or a repeat probe of a released need) with the
+        # DEEP layer, in that very reply.  An owed move that is not forced waits one turn.
+        reveal_topics = self.tracker.gate.deep_due(obs.gate)
+        reveal_due = bool(obs.gate.first_probes) or bool(reveal_topics)
         move = self.scheduler.select(r_sec)
         if move is not None:
-            reveal_due = bool(obs.gate.released) or self._reveal_pending()
-            if reveal_due and not move.forced and move.id not in (COMMIT_STALL, TIME_CUE):
+            if reveal_due and self._may_defer(move, r_sec):
                 reasons.append("owed_deferred_for_reveal")
             else:
                 self.scheduler.issue(move)
@@ -337,15 +342,24 @@ class RolePlayEngine:
             TurnMode.LLM_REPLY,
             reasons,
             first_probes=obs.gate.first_probes,
+            reveal_topics=reveal_topics,
             monologue=candidate_seconds,
         )
 
-    def _reveal_pending(self) -> bool:
-        """A released deep need that has been offered fewer than REVEAL_OFFERS times."""
-        return any(
-            self._offers.get(topic, 0) < REVEAL_OFFERS
-            for topic in self.tracker.gate.pending_reveal_topics
-        )
+    @staticmethod
+    def _may_defer(move: Any, r_sec: float) -> bool:
+        """Whether a reveal turn may hold ``move`` back for one turn.
+
+        A forced move (its deadline is near) never waits, so the gate's slip limit holds.
+        The time cue and the COMMIT-STALL wait too (R1-Q: at turn 79 the cue landed on top of
+        a due reveal), except that the stall is the end-game backstop: past
+        ``STALL_DEFER_GRACE_SEC`` it is spoken even on a reveal turn, because the role-play
+        hard-ends at 14:00.
+        """
+        if move.forced:
+            return False
+        past_grace = r_sec >= COMMIT_STALL_R_SEC + STALL_DEFER_GRACE_SEC
+        return not (move.id == COMMIT_STALL and past_grace)
 
     def _wants_aside(self, break_kind: str | None) -> bool:
         """The one-off aside: a coaching request, or the second "are you an AI?" question."""
@@ -412,6 +426,7 @@ class RolePlayEngine:
         level: Level | None = None,
         resolves: bool = False,
         first_probes: tuple[str, ...] = (),
+        reveal_topics: tuple[str, ...] = (),
         monologue: float | None = None,
         voice: str = "learner",
         aside: bool = False,
@@ -430,18 +445,14 @@ class RolePlayEngine:
             )
             ctx = self.guard_context(mode="ack", reminder=reminder)
         elif mode is TurnMode.LLM_REPLY:
-            unlocked = [
-                topic
-                for topic in self.tracker.gate.pending_reveal_topics
-                if self._offers.get(topic, 0) < REVEAL_OFFERS
-            ]
-            for topic in unlocked:
-                self._offers[topic] = self._offers.get(topic, 0) + 1
+            # The layers are handed over only here, on the turn that asked about the topic.
+            self.tracker.gate.mark_hint_offered(first_probes)
+            self.tracker.gate.mark_deep_offered(reveal_topics)
             reminder = turn_reminder(
                 self.persona,
                 r_sec=self.last_r,
                 first_probe_topics=first_probes,
-                unlocked_topics=unlocked,
+                unlocked_topics=reveal_topics,
                 monologue_sec=monologue,
                 character_break=kind is not None,
                 price_wrap=price_wrap,
@@ -630,6 +641,9 @@ class RolePlayEngine:
                 "resolved": self.commitment_resolved,
             },
             "guard": self.ledger.summary(),
+            # Which layer of each need was handed to the model on which role-play turn
+            # (indices only; logged for the rehearsal metrics, not posted).
+            "disclosure": self.tracker.gate.offers_view(),
             "repetition": {
                 "remembered_sentences": len(self._spoken),
                 "repeats_dropped": self.ledger.counts.get(REPEAT, 0),

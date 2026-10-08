@@ -87,6 +87,18 @@ class SentenceTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(is_question_like(text))
 
+    def test_wondering_and_wanting_to_wonder_open_a_question(self):
+        """Turn 25 of b58c7d9c: "So I wanted to wonder what makes you here ..." was no question."""
+        for text in (
+            "So I wanted to wonder what makes you here, bring what makes you come here",
+            "and also I was wondering like what do you want",
+            "I'm wondering what you do for work",
+            "I am wondering how your week looks",
+            "I wonder what made you sign up",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_question_like(text))
+
     def test_statements_are_not_questions(self):
         for text in (
             "Interview Kickstart was founded in 2014.",
@@ -101,6 +113,68 @@ class SentenceTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertFalse(is_question_like(text))
+
+    def test_when_asks_only_in_inverted_order(self):
+        """"When it comes to live classes, you can ask ..." is a subordinate clause (turns 37,
+        45, 51 and 78 of b58c7d9c), while "when can I expect your call back" asks."""
+        for text in (
+            "when can I expect your call back",
+            "so when exactly do you plan to decide",
+            "and when will you hear back",
+            "okay when are you hoping to start",
+            "Uh, when will you get back to me",
+            "when's the next cohort",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_question_like(text), text)
+        for text in (
+            "Like When it comes to live classes, you can ask them any questions you want.",
+            "You will land on something, but when it comes to our programs we really deliver.",
+            "Yeah, we have our own portal, so when you miss the live classes, you can request "
+            "a recording.",
+            "When you call me back, I can also talk to your husband.",
+            "Um, so, uh, when you call me back, in that case, I can also talk to your husband, "
+            "you know, in case if you have any doubts.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_question_like(text), text)
+
+    def test_a_wh_word_inside_an_offer_or_promise_is_not_a_question(self):
+        """Turn 78 of b58c7d9c: the advisor's offer ended "... why the program is $8,500 and
+        what are the packages that we will get" and read as a probe of H2 and H3."""
+        for text in (
+            "I can also help him understand like why the program is $8,500 and what are the "
+            "packages that we will get",
+            "We will explain why it costs this and what you get for it",
+            "I'll walk you through how it works and what the options are",
+            "so what we can do is send you the details",
+            "and what I mean is the cohort is limited",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_question_like(text), text)
+
+    def test_a_run_on_question_after_a_conjunction_is_still_a_question(self):
+        for text in (
+            "okay and what are the packages",
+            "I'm great, thank you, so what do you do for work",
+            "Yeah I just got a call from you and uh so why are you looking at our programs",
+            "that makes sense and how many hours a week can you give it",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_question_like(text), text)
+
+    def test_the_full_turn_78_offer_is_no_probe_at_all(self):
+        from r1_personas import detect_probes
+
+        turn_78 = (
+            "Oh, fine. Um, so, uh, when you call me back, in that case, I can also talk to your "
+            "husband, you know, in case if you have any doubts and, uh, I can also help him "
+            "understand like why the program is $8,500 and what are the packages that we will "
+            "getting. I maybe I will give him the entire curriculum details so that he will "
+            "also understand and, uh, you know, support you in this entire process."
+        )
+        self.assertEqual(detect_probes(turn_78), frozenset())
+        self.assertFalse(any(is_question_like(s) for s in split_sentences(turn_78)))
 
 
 class FuzzyTests(unittest.TestCase):

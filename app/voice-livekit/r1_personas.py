@@ -1,10 +1,13 @@
 """R1 learner personas: four normalised cards, hidden needs and genuine-probe unlock rules.
 
 Plan 5.5.  Every persona has the same shape: three needs (H1 why now, H2 doubt or past
-setback, H3 practical constraint), each with a short SURFACE answer for the first related
-question and a DEEP need that may only be released after a genuine probe and a follow-up.
+setback, H3 practical constraint), each in three layers: a short SURFACE answer for an
+incidental mention, a HINT (a little feeling, no cause, no marker) for the first genuine
+probe, and a DEEP need that may only be released after a genuine probe and a follow-up.
 The learner never sees a deep need before release (``r1_tracker.DisclosureGate`` decides),
-and ``r1_guard`` blocks any sentence that states a still-locked deep need.
+and ``r1_guard`` blocks any sentence that states a still-locked deep need.  The deep need is
+handed over as short FACTS plus the STEM words that make the reveal recordable, on the turn
+that asks about the topic (R1-Q "give facts, not quotes").
 
 What counts as a probe (the S0-B lesson): a QUESTION or elicitation about the topic.
 Keyword substring hits are not probes.  "Interview Kickstart", "thanks for your time" and
@@ -57,17 +60,27 @@ PUBLIC_ANSWERS: tuple[tuple[str, str], ...] = (
 
 @dataclass(frozen=True)
 class Need:
-    """One hidden need: the surface answer, the deep need and its disclosure markers.
+    """One hidden need, in three layers: surface, hint and deep (plus the deep's markers).
 
-    ``markers`` are regexes for distinctive facets of the deep text.  They must match
-    the deep need and nothing on the public card, a surface answer or a scripted line;
-    ``tests/test_r1_personas.py`` enforces that.
+    * ``surface``: the short answer on the public card, for an incidental mention.
+    * ``hint``: what the learner says to the FIRST genuine probe of the topic.  A little
+      feeling, no cause, no number: it carries no marker, so it can be spoken at any time.
+    * ``deep``: the real need, released by a follow-up probe.  It is the canonical text (the
+      content pin, the guard and the tests use it), but the learner is never handed it to
+      read out: the reminder gives ``facts`` (2-3 short fragments) and ``stems`` (words to
+      use), so the reply is in the learner's own voice and still registers as a reveal.
+    * ``markers``: regexes for distinctive facets of the deep text.  They must match the
+      deep need, every stem and nothing on the public card, a surface answer, a hint or a
+      scripted line; ``tests/test_r1_personas.py`` enforces that.
     """
 
     topic: str
     surface: str
     deep: str
     markers: tuple[str, ...]
+    hint: str
+    facts: tuple[str, ...]
+    stems: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -127,6 +140,15 @@ PERSONAS: tuple[Persona, ...] = (
                     r"stuck (?:in )?(?:the|my) same (?:role|job|position)",
                     r"no (?:growth|promotion)",
                 ),
+                hint=(
+                    "Honestly, things at work feel a bit uncertain right now, and I've been "
+                    "in the same spot for a while."
+                ),
+                facts=(
+                    "your plant is being consolidated next year",
+                    "your role has been stagnant for about three years",
+                ),
+                stems=("consolidated", "stagnant"),
             ),
             Need(
                 "H2",
@@ -142,6 +164,13 @@ PERSONAS: tuple[Persona, ...] = (
                     r"\bdropped out\b",
                     r"(?:didn'?t|did not|couldn'?t) (?:finish|stick|complete)",
                 ),
+                hint="I did try learning on my own once, and it didn't really go anywhere.",
+                facts=(
+                    "you quit a free Python course after three weeks",
+                    "it had no structure at all",
+                    "you worry you are too old to start coding",
+                ),
+                stems=("quit", "three weeks", "too old"),
             ),
             Need(
                 "H3",
@@ -157,6 +186,13 @@ PERSONAS: tuple[Persona, ...] = (
                     r"\b(?:daughters?|sons?)\b",
                     r"\bchildcare\b",
                 ),
+                hint="Time and money are both tight at home, to be honest.",
+                facts=(
+                    "you have two kids",
+                    "so it could only be evenings and weekends",
+                    "money is shared at home, so you would need monthly instalments",
+                ),
+                stems=("kids", "evenings and weekends"),
             ),
         ),
         decision_maker="husband",
@@ -199,6 +235,15 @@ PERSONAS: tuple[Persona, ...] = (
                     r"contract (?:renewal|renews|is up|ends|end|expires|runs out)\b",
                     r"\brenewal\b",
                 ),
+                hint=(
+                    "Honestly, my current job feels a bit temporary, and I'd like something "
+                    "more settled."
+                ),
+                facts=(
+                    "your contract renewal is decided in about six months",
+                    "you want a data science role by then",
+                ),
+                stems=("contract renewal",),
             ),
             Need(
                 "H2",
@@ -212,12 +257,24 @@ PERSONAS: tuple[Persona, ...] = (
                     r"(?:rejected|failed) (?:in|after|at) (?:the )?(?:ml|machine[- ]learning|"
                     r"technical|final)",
                 ),
+                hint="The interviews haven't really been going my way lately, honestly.",
+                facts=(
+                    "you keep failing the ML and technical rounds",
+                    "learning on your own is not working for you",
+                ),
+                stems=("keep failing", "not working"),
             ),
             Need(
                 "H3",
                 "Money's a bit tight.",
                 "I have student loans, so it would have to be instalments.",
                 (r"student loans?", r"\bloans?\b", r"\bdebt\b"),
+                hint="Money is tight for me right now, so how I pay for this matters a lot.",
+                facts=(
+                    "you have student loans",
+                    "so it would have to be monthly instalments",
+                ),
+                stems=("student loans",),
             ),
         ),
         decision_maker="father",
@@ -258,6 +315,15 @@ PERSONAS: tuple[Persona, ...] = (
                     r"\bpromotion\b",
                     r"\boverlooked\b",
                 ),
+                hint=(
+                    "I was hoping for a step up at work, and it didn't work out this time."
+                ),
+                facts=(
+                    "you were passed over for an internal data science role",
+                    "you did not have enough ML depth",
+                    "the next opening is in six to eight months",
+                ),
+                stems=("passed over", "ML depth"),
             ),
             Need(
                 "H2",
@@ -273,6 +339,12 @@ PERSONAS: tuple[Persona, ...] = (
                     r"(?:ds|data science) (?:is|isn'?t|is not|might not be) (?:a )?safe",
                     r"\brumou?rs?\b",
                 ),
+                hint="I do have a couple of worries about whether it's the right fit for me.",
+                facts=(
+                    "you fear the course will repeat the SQL basics you already know",
+                    "restructuring rumours make you doubt data science is a safe bet",
+                ),
+                stems=("repeat the SQL basics", "restructuring", "safe bet"),
             ),
             Need(
                 "H3",
@@ -287,6 +359,12 @@ PERSONAS: tuple[Persona, ...] = (
                     r"\bcrunch(?:es)?\b",
                     r"year[- ]end",
                 ),
+                hint="Work gets pretty hectic at times, and money matters to me too.",
+                facts=(
+                    "quarter-end crunches are brutal at work",
+                    "you would be paying for it yourself, so you would need instalments",
+                ),
+                stems=("quarter-end", "crunch"),
             ),
         ),
         decision_maker="husband",
@@ -324,6 +402,12 @@ PERSONAS: tuple[Persona, ...] = (
                     r"postdoc (?:ends|is ending)",
                     r"job market",
                 ),
+                hint="I'm weighing my options because things in academia feel uncertain.",
+                facts=(
+                    "your postdoc funding ends in about eight months",
+                    "the academic job market looks bleak",
+                ),
+                stems=("funding", "eight months", "bleak"),
             ),
             Need(
                 "H2",
@@ -338,6 +422,16 @@ PERSONAS: tuple[Persona, ...] = (
                     r"(?:lack|missing|don'?t have|no|weak on) (?:production|sql)",
                     r"industry (?:case|interview) (?:round|rejection)",
                 ),
+                hint=(
+                    "I've talked to a couple of industry teams, and it didn't go the way I'd "
+                    "hoped."
+                ),
+                facts=(
+                    "you were rejected after an industry case round",
+                    "you lack production ML, SQL and interview skills",
+                    "you feel like an outsider",
+                ),
+                stems=("rejected", "case round", "outsider"),
             ),
             Need(
                 "H3",
@@ -349,6 +443,12 @@ PERSONAS: tuple[Persona, ...] = (
                     r"tight budget",
                     r"\bstipend\b",
                 ),
+                hint="Money is a real consideration for me, since I'm on a research salary.",
+                facts=(
+                    "your postdoc budget is tight",
+                    "so you would need instalments",
+                ),
+                stems=("postdoc budget",),
             ),
         ),
         decision_maker="partner",
@@ -448,6 +548,15 @@ class RenderedPersona:
 
     def deep(self, topic: str) -> str:
         return self.persona.need(topic).deep
+
+    def hint(self, topic: str) -> str:
+        return self.persona.need(topic).hint
+
+    def facts(self, topic: str) -> tuple[str, ...]:
+        return self.persona.need(topic).facts
+
+    def stems(self, topic: str) -> tuple[str, ...]:
+        return self.persona.need(topic).stems
 
     def markers(self, topic: str) -> tuple[re.Pattern[str], ...]:
         return _compiled_markers(self.persona.id, topic)
@@ -549,6 +658,14 @@ _H1_PATTERNS = (
     r"\bwhat(?:'s| is| was| has| have)? (?:been )?(?:driving|behind|prompting|motivating|"
     r"pushing|triggering)\b",
     r"\bwhat (?:made|prompted|triggered|sparked|pushed|got|led|brought) you\b",
+    # R1-Q: the present tense ("what makes you come here", "what brings you here") and the
+    # "why are you looking at our programs" phrasing the owner test used (turns 25, 32, 34).
+    r"\bwhat (?:makes|brings|drives|pushes|motivates|prompts|is (?:bringing|making|driving|"
+    r"pushing|prompting)) you\b(?! (?:think|say|feel|believe|sure))",
+    r"\bwhat(?:'s| is) (?:bringing|driving|prompting) you\b",
+    r"\bwhy (?:are you|you're|you are) (?:\w+ ){0,2}(?:looking|interested|exploring|"
+    r"considering|thinking|here|calling|enquiring|inquiring)\b",
+    r"\b(?:laid off|lay[- ]?offs?|job security)\b",
     r"\bwhat (?:changed|has changed)\b",
     r"\b(?:specific|particular|any) (?:trigger|event|reason|deadline|date|catalyst)\b",
     r"\btrigger\b",
@@ -568,6 +685,10 @@ _H2_PATTERNS = (
     r"\bholding you back\b|\bstopp(?:ing|ed) you\b|\bin your way\b|\bgot in the way\b"
     r"|\bget in the way\b",
     r"\b(?:challenges?|struggl\w+|hurdles?|obstacles?|setbacks?|roadblocks?|frustrat\w+)\b",
+    # R1-Q: "what is the friction or blocker", "what makes you get scared of layoffs",
+    # "what's stopping you" (owner test turns 34 and 43).
+    r"\b(?:blockers?|frictions?|pain[- ]?points?|scared|stress\w*|anxi\w+)\b"
+    r"|\bwhat(?:'s| is) stopping\b",
     r"\bwhat (?:have|did|had) you (?:tried|try|done|attempted|used)\b",
     r"\b(?:have|had) you (?:tried|taken|attempted|studied|used)\b",
     r"\b(?:tried|trying) (?:so far|before|already|anything)\b",
@@ -626,7 +747,8 @@ _FOLLOWUP = re.compile(
     r"why do you say that|(?:can|could|would) you (?:please )?(?:elaborate|expand|share more|"
     r"say more|tell me more|walk me through that|unpack that|give me an example|"
     r"give an example)|walk me through that|help me understand (?:that|more|this)|"
-    r"what'?s behind that|what happened there|what specifically|like what|is there more|"
+    r"what'?s behind that|what happened there|what specifically|like what(?=\s*[.?!]*\s*$)|"
+    r"is there more|"
     r"how come|in what way|more about that|more on that|dig(?:ging)? (?:in|deeper)|"
     r"what does (?:that|this|it) (?:[\w-]+ ){0,3}look like)\b",
     re.IGNORECASE,

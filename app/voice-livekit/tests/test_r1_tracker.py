@@ -136,6 +136,132 @@ class DisclosureGateTests(unittest.TestCase):
         self.assertIn('"probe_turn": 1', text)
 
 
+class DisclosureLayerTests(unittest.TestCase):
+    """R1-Q: the deep layer is tied to the turn that asks about the topic (``deep_due``)."""
+
+    def probed_gate(self) -> DisclosureGate:
+        """H1 probed once (turn 1): in SURFACE, the hint's turn is over."""
+        g = gate()
+        g.observe_candidate_turn(H1_PROBE, 1)
+        return g
+
+    def test_the_update_reports_every_probed_topic_and_a_generic_follow_up(self):
+        g = gate()
+        update = g.observe_candidate_turn(f"{H1_PROBE} {H3_PROBE}", 1)
+        self.assertEqual(update.probed, ("H1", "H3"))
+        self.assertFalse(update.followup)
+        again = g.observe_candidate_turn(H1_PROBE, 2)
+        self.assertEqual(again.probed, ("H1",))  # reported even though H1 is past UNPROBED
+        self.assertEqual(g.observe_candidate_turn(FOLLOWUP, 3).followup, True)
+
+    def test_the_release_turn_makes_the_deep_layer_due(self):
+        g = self.probed_gate()
+        update = g.observe_candidate_turn(FOLLOWUP, 2)
+        self.assertEqual(g.deep_due(update), ("H1",))
+
+    def test_nothing_is_due_while_a_need_is_only_probed_or_unprobed(self):
+        g = gate()
+        update = g.observe_candidate_turn(H1_PROBE, 1)
+        self.assertEqual(g.deep_due(update), ())  # the first probe is the hint's turn
+
+    def test_an_unrelated_turn_never_makes_a_released_need_due(self):
+        g = self.probed_gate()
+        g.observe_candidate_turn(FOLLOWUP, 2)
+        g.mark_deep_offered(("H1",))
+        for turn_number in (3, 4, 5):
+            update = g.observe_candidate_turn("Our mentors are from Google.", turn_number)
+            self.assertEqual(g.deep_due(update), (), turn_number)
+
+    def test_a_repeat_probe_of_a_released_topic_makes_it_due_again(self):
+        g = self.probed_gate()
+        g.observe_candidate_turn(FOLLOWUP, 2)
+        g.mark_deep_offered(("H1",))
+        g.observe_candidate_turn("Our mentors are from Google.", 3)
+        update = g.observe_candidate_turn(H1_PROBE, 4)
+        self.assertEqual(g.deep_due(update), ("H1",))
+
+    def test_a_generic_follow_up_counts_only_right_after_the_reply_that_carried_the_need(self):
+        g = self.probed_gate()
+        g.observe_candidate_turn(FOLLOWUP, 2)
+        g.mark_deep_offered(("H1",))
+        straight_after = g.observe_candidate_turn(FOLLOWUP, 3)
+        self.assertEqual(g.deep_due(straight_after), ("H1",))
+        g.mark_deep_offered(("H1",))
+        g.observe_candidate_turn("Our mentors are from Google.", 4)
+        too_late = g.observe_candidate_turn(FOLLOWUP, 5)
+        self.assertEqual(g.deep_due(too_late), ())
+
+    def test_a_need_is_offered_at_most_max_deep_offers_times(self):
+        from r1_tracker import MAX_DEEP_OFFERS
+
+        g = self.probed_gate()
+        offers = 0
+        for turn_number in range(2, 10):
+            update = g.observe_candidate_turn(H1_PROBE, turn_number)
+            due = g.deep_due(update)
+            if due:
+                g.mark_deep_offered(due)
+                offers += 1
+        self.assertEqual(offers, MAX_DEEP_OFFERS)
+        self.assertEqual(len(g.offers_view()["H1"]["deep_offer_turns"]), MAX_DEEP_OFFERS)
+
+    def test_a_revealed_need_is_never_due(self):
+        g = self.probed_gate()
+        update = g.observe_candidate_turn(FOLLOWUP, 2)
+        self.assertEqual(g.deep_due(update), ("H1",))
+        g.note_learner_text("My plant is being consolidated next year.", 2)
+        self.assertEqual(g.deep_due(g.observe_candidate_turn(H1_PROBE, 3)), ())
+
+    def test_a_judge_release_alone_offers_nothing(self):
+        g = gate()
+        g.observe_candidate_turn("Would you like to hear more?", 1)
+        g.apply_judge_probes({"H3"}, 1, had_question=True)
+        g.observe_candidate_turn("Sounds good?", 2)
+        released = g.apply_judge_probes({"H3"}, 2, had_question=True)
+        self.assertEqual(released.released, ("H3",))
+        quiet = g.observe_candidate_turn("Our mentors are from Google.", 3)
+        self.assertEqual(g.deep_due(quiet), ())
+        asked = g.observe_candidate_turn(H3_PROBE, 4)
+        self.assertEqual(g.deep_due(asked), ("H3",))
+
+    def test_hint_and_deep_offers_are_recorded_as_turn_indices_only(self):
+        g = self.probed_gate()
+        g.mark_hint_offered(("H1",))
+        g.mark_hint_offered(("H1",))  # one hint per need
+        update = g.observe_candidate_turn(FOLLOWUP, 2)
+        g.mark_deep_offered(g.deep_due(update))
+        view = g.offers_view()
+        self.assertEqual(view["H1"], {"hint_turn": 1, "deep_offer_turns": [2]})
+        self.assertEqual(view["H2"], {"hint_turn": None, "deep_offer_turns": []})
+        self.assertNotIn("data science", json.dumps(view))
+
+    def test_the_admin_records_keep_their_contract_keys(self):
+        g = self.probed_gate()
+        g.observe_candidate_turn(FOLLOWUP, 2)
+        g.mark_hint_offered(("H1",))
+        g.mark_deep_offered(("H1",))
+        record = next(r for r in g.records() if r["topic"] == "H1")
+        self.assertEqual(
+            sorted(record),
+            sorted(
+                [
+                    "topic", "state", "probe_turn", "followup_turn", "released_turn",
+                    "revealed_turn", "revealed_without_release", "probe_source",
+                ]
+            ),
+        )
+        self.assertLessEqual(record["probe_turn"], record["released_turn"])
+
+    def test_the_probe_turn_never_follows_the_reveal_turn(self):
+        """The API gate needs probed_turn <= revealed_turn; the layers cannot break it."""
+        g = self.probed_gate()
+        g.observe_candidate_turn(FOLLOWUP, 2)
+        g.note_learner_text("My plant is being consolidated next year.", 2)
+        record = next(r for r in g.records() if r["topic"] == "H1")
+        self.assertLessEqual(record["probe_turn"], record["revealed_turn"])
+        self.assertLess(record["probe_turn"], record["released_turn"])
+
+
 class JudgeProbeTests(unittest.TestCase):
     def test_the_judge_walks_the_same_two_steps(self):
         g = gate()

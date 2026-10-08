@@ -180,27 +180,38 @@ def turn_reminder(
 ) -> str:
     """The ephemeral note for a free learner reply (no owed line this turn).
 
-    A deep need appears here ONLY for a topic the worker has released, and only on the
-    turns while it is unlocked and not yet spoken.  The note never carries rubric text,
-    the owed-move schedule, or any commitment line: the learner has no sanctioned stall
-    to recite (that loop is what the R1-Q owner test found), so it must react to a
-    proposed call, day, time or next step in its own words and never agree to one.
+    Disclosure comes in layers and only on the turn that asks about the topic.
+    ``first_probe_topics`` get the HINT layer (a little feeling, no cause: marker-free).
+    ``unlocked_topics`` get the DEEP layer as short FACTS plus the words to use, not as a
+    quote to read out: the facts sit inside double quotes so the guard's echo check, which
+    works on the unquoted instruction prose, never mistakes the learner's own telling for a
+    leaked instruction, and the stems keep the reveal recordable.  The full deep text is
+    never in the note.  The note never carries rubric text, the owed-move schedule, or any
+    commitment line: the learner has no sanctioned stall to recite (that loop is what the
+    R1-Q owner test found), so it must react to a proposed call, day, time or next step in
+    its own words and never agree to one.
     """
     lines = [
         f"ROLEPLAY NOTE (not spoken; never mention it). R={_clock(r_sec)}.",
         "Reply as the learner, naturally: react to what the advisor just said, then answer "
-        "what they asked. Do not volunteer worries, money or timing details.",
+        "what they asked. Do not volunteer worries, money or timing details the advisor "
+        "did not ask about.",
         IGNORE_RULE_NOTE,
     ]
     for topic in first_probe_topics:
         lines.append(
-            f"- First question about {TOPIC_LABELS[topic]}: use only the short answers on "
-            f'your card (for example "{persona.surface(topic)}") and add nothing.'
+            f"- This is the advisor's first real question about {TOPIC_LABELS[topic]}. Answer "
+            "in one short sentence with a little feeling, going only this far (for example "
+            f'"{persona.hint(topic)}"). Give no cause, number, date or name.'
         )
     for topic in unlocked_topics:
+        facts = "; ".join(f'"{fact}"' for fact in persona.facts(topic))
+        stems = ", ".join(f'"{stem}"' for stem in persona.stems(topic))
         lines.append(
-            f"- The advisor has followed up on {TOPIC_LABELS[topic]}. You may now share, in "
-            f'your own words and only if it fits their question: "{persona.deep(topic)}"'
+            f"- The advisor is digging further into {TOPIC_LABELS[topic]}, so now tell the real "
+            "story in your own words: one or two short sentences, with some worry, as if it "
+            f"is not easy to say. The facts are {facts}. Work these words in naturally: "
+            f"{stems}. Do not read the facts out like a list."
         )
     lines.append(NEXT_STEP_NOTE)
     lines.append(NO_REPEAT_NOTE)

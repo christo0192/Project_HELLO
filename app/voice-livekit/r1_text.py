@@ -60,30 +60,62 @@ _DISCOURSE = (
     r"(?:(?:and|so|but|also|okay|ok|right|well|now|then|great|thanks|thank you|got it|"
     r"i see|sure|cool|alright|perfect|nice|good|like|um+|uh+|er+m?|hmm+)\b[,.\s]*)*"
 )
+# "when" asks a question only in inverted order ("when can I expect your call", "when exactly do
+# you start").  In declarative order it is a subordinator: "when it comes to live classes, you
+# can ask anything", "when you call me back, I can also talk to your husband" (owner test
+# b58c7d9c turns 37, 45, 51 and 78).
+_WHEN_ASKS = (
+    r"when(?=\s+(?:exactly\s+|else\s+|specifically\s+)?(?:can|could|would|will|shall|should|do|"
+    r"does|did|are|is|was|were|have|has|had|may|might|am)\b|'s\b)"
+)
+# "what we can do is ...", "how I can help you" and "so what I mean is" are clefts of a statement:
+# a we/I subject straight after the wh-word.  ("what I'd like to know" below is a real elicitation.)
+_WH_ASKS = r"(?:what|why|how|where|who|whom|which|whose)(?!\s+(?:i|we)\b)"
 _QUESTION_START = re.compile(
-    r"^" + _DISCOURSE + r"(?:what|why|how|when|where|who|whom|which|whose|is|are|was|were|"
+    r"^" + _DISCOURSE + r"(?:" + _WH_ASKS + r"|" + _WHEN_ASKS + r"|is|are|was|were|"
     r"do|does|did|can|could|would|will|shall|should|have|has|had|may|might|"
     r"tell me|walk me through|talk me through|help me understand|share|describe|explain|"
     r"i'?d (?:love|like) to (?:know|understand|hear|learn)|i'?m curious|"
     r"i was (?:wondering|curious)|i wonder|curious (?:about|whether|if)|any (?:concerns?|"
     r"thoughts|questions)|anything (?:that|else)|"
     r"i (?:want|need) to (?:know|understand|hear|learn|find out)|let me (?:ask|understand)|"
-    r"i wanted to (?:know|ask|understand|hear|learn|find out)|"
+    r"i wanted to (?:know|ask|understand|hear|learn|find out|wonder)|"
     r"(?:i'?m |i am )?trying to (?:understand|figure out|find out)|"
+    r"(?:i'?m|i am) wondering|"
     r"i'?m (?:interested|keen) in (?:hearing|knowing|understanding)|"
     r"what i'?d like to (?:know|understand))\b",
 )
+# A wh-word after a conjunction ("so what do you do", "and why is that") is a run-on question,
+# unless a "we/I" subject follows it directly ("so what we can do", "and what I mean"): that is
+# a cleft or an embedded clause of a statement.
 _QUESTION_ANYWHERE = re.compile(
-    r"\b(?:wondering|curious) (?:if|whether|what|why|how|when|about)\b"
-    r"|\b(?:so|and|but|also|now|then|well|okay|ok)\s+(?:what|why|how|when|where|who|which)\b"
+    r"\b(?:wonder|wondering|wondered|curious) (?:like )?(?:if|whether|what|why|how|when|about)\b"
+    r"|\b(?:so|and|but|also|now|then|well|okay|ok)\s+(?:what|why|how|" + _WHEN_ASKS +
+    r"|where|who|which)\b(?!\s+(?:i|we)\b)"
 )
+# An OFFER or PROMISE is a statement even when a wh-word sits inside it: "I can also help him
+# understand why it costs this and what the packages are" (owner test b58c7d9c turn 78) has
+# its wh-words after a first-person modal, so they open embedded clauses, not questions.
+_OFFER_MODAL = re.compile(
+    r"\b(?:i|we)(?:'ll|\s+(?:will|can|could|would|may|might|shall|am going to|are going to))\b"
+)
+
+
+def _asks_run_on_question(plain: str) -> bool:
+    """A conjunction + wh-word (or "wondering what") that is not inside an offer or promise."""
+    return any(
+        not _OFFER_MODAL.search(plain[: match.start()])
+        for match in _QUESTION_ANYWHERE.finditer(plain)
+    )
 
 
 def is_question_like(sentence: object) -> bool:
     """True for an interrogative or an elicitation such as "tell me about ...".
 
     Speech-to-text may drop the question mark, so the test also accepts a leading
-    interrogative or elicitation phrase, optionally after a discourse opener.
+    interrogative or elicitation phrase, optionally after a discourse opener.  A wh-word
+    that only introduces a subordinate clause is not a question: "when" counts only in
+    inverted order, and a wh-word after "I can ..." or "we will ..." is embedded in an offer.
     """
     folded = fold(sentence).strip()
     if "?" in folded:
@@ -92,7 +124,7 @@ def is_question_like(sentence: object) -> bool:
     plain = re.sub(r"\s+", " ", plain).strip()
     if not plain:
         return False
-    return bool(_QUESTION_START.match(plain) or _QUESTION_ANYWHERE.search(plain))
+    return bool(_QUESTION_START.match(plain) or _asks_run_on_question(plain))
 
 
 def _tokens(text: object) -> list[str]:

@@ -31,7 +31,9 @@ import r1_world
 # 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
 # 3: R1-Q learner voice: no verbatim deflection, public backstory, speaking-style prefix,
 #    no "answer exactly" stall rule, 3-variant filler and fallback rotations.
-CONTENT_REVISION = 3
+# 4: R1-Q probe-driven disclosure: a hint layer per need (first probe), the deep need handed
+#    over as facts plus stems on the turn that asks, the first-probe and deep reminder lines.
+CONTENT_REVISION = 4
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -47,7 +49,10 @@ def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
             {
                 "topic": need.topic,
                 "surface": need.surface,
+                "hint": need.hint,
                 "deep": need.deep,
+                "facts": list(need.facts),
+                "stems": list(need.stems),
                 "markers": list(need.markers),
             }
             for need in persona.needs

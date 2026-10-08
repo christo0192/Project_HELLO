@@ -8,10 +8,12 @@ Two cooperating parts:
 
     * UNPROBED -> SURFACE on the candidate's first GENUINE probe of the topic (a question,
       per ``r1_personas.detect_probes``; never a keyword hit).  The learner may then give
-      only the short surface answer.
+      only the HINT layer (a little feeling, no cause, no marker), on that very turn.
     * SURFACE -> UNLOCKED on a LATER turn that follows up: another genuine probe of the
       same topic, or a generic "tell me more" in the very next turn.  Only now does the
-      deep need enter the learner's reminder.
+      deep need enter the learner's reminder, and only on a turn that asks about the topic
+      (``deep_due``): the release turn, then any later turn that probes the topic again or
+      follows up on the learner's reply that carried it.  Never on an unrelated turn.
     * UNLOCKED -> REVEALED when the learner's spoken text carries the deep need's
       markers.  A marker hit while still locked is recorded as an unreleased reveal.
 
@@ -80,6 +82,11 @@ class NeedState(str, Enum):
     REVEALED = "revealed"
 
 
+# How many times the deep layer of one need may be put into a reminder.  The first offer is
+# the release turn; each further offer needs a candidate turn that touches the topic again.
+MAX_DEEP_OFFERS = 3
+
+
 @dataclass
 class NeedRecord:
     topic: str
@@ -90,15 +97,34 @@ class NeedRecord:
     revealed_turn: int | None = None
     revealed_unreleased: bool = False
     probe_source: str | None = None
+    # Layer bookkeeping (turn indices only; never posted as part of ``records``).
+    hint_turn: int | None = None
+    deep_offer_turns: list[int] = field(default_factory=list)
+
+    @property
+    def last_offer_turn(self) -> int | None:
+        turns = list(self.deep_offer_turns)
+        if self.hint_turn is not None:
+            turns.append(self.hint_turn)
+        return max(turns) if turns else None
 
 
 @dataclass(frozen=True)
 class GateUpdate:
-    """Topics newly probed (surface answer due) and newly released at this turn."""
+    """What one candidate turn did to the needs.
+
+    ``first_probes``: topics probed for the first time (the HINT layer is due).
+    ``released``: topics released by a follow-up probe (the DEEP layer is due).
+    ``probed``: every topic the rule probes touched this turn, whatever its state, and
+    ``followup``: whether the turn asked for more generically ("tell me more").  Together they
+    say which already-released needs the candidate is asking about again (``deep_due``).
+    """
 
     first_probes: tuple[str, ...]
     released: tuple[str, ...]
     question: bool
+    probed: tuple[str, ...] = ()
+    followup: bool = False
 
 
 class DisclosureGate:
@@ -132,7 +158,65 @@ class DisclosureGate:
                 if topic in probes or next_turn_generic:
                     self._release(record, "rule")
                     released.append(topic)
-        return GateUpdate(tuple(first), tuple(released), question)
+        return GateUpdate(
+            tuple(first),
+            tuple(released),
+            question,
+            probed=tuple(topic for topic in H_TOPICS if topic in probes),
+            followup=generic,
+        )
+
+    # --------------------------------------------------------------------- the layers
+    def deep_due(self, update: GateUpdate) -> tuple[str, ...]:
+        """Needs whose DEEP layer may go into THIS turn's reminder.
+
+        The deep layer is tied to the turn that asks about the topic: the release turn
+        itself, a turn that probes the topic again, or a generic "tell me more" right after
+        the learner's previous reply carried that need.  On any other turn it is never
+        offered, so the learner cannot dump a need on an unrelated question.  A judge-only
+        release (``apply_judge_probes``) upgrades the state but, by itself, offers nothing.
+        Each need is offered at most ``MAX_DEEP_OFFERS`` times.
+        """
+        due: list[str] = []
+        for topic in H_TOPICS:
+            record = self._records[topic]
+            if record.state is not NeedState.UNLOCKED:
+                continue
+            if len(record.deep_offer_turns) >= MAX_DEEP_OFFERS:
+                continue
+            asked_again = topic in update.released or topic in update.probed
+            follows_last_offer = (
+                update.followup
+                and record.last_offer_turn is not None
+                and record.last_offer_turn == self.turn - 1
+            )
+            if asked_again or follows_last_offer:
+                due.append(topic)
+        return tuple(due)
+
+    def mark_hint_offered(self, topics: Any) -> None:
+        """The HINT layer went into this turn's reminder (once per need, on its probe turn)."""
+        for topic in topics:
+            record = self._records[topic]
+            if record.hint_turn is None:
+                record.hint_turn = self.turn
+
+    def mark_deep_offered(self, topics: Any) -> None:
+        """The DEEP layer went into this turn's reminder."""
+        for topic in topics:
+            record = self._records[topic]
+            if record.state is NeedState.UNLOCKED and self.turn not in record.deep_offer_turns:
+                record.deep_offer_turns.append(self.turn)
+
+    def offers_view(self) -> dict[str, dict[str, Any]]:
+        """Which layer was offered on which role-play turn (indices and counts only)."""
+        return {
+            topic: {
+                "hint_turn": record.hint_turn,
+                "deep_offer_turns": list(record.deep_offer_turns),
+            }
+            for topic, record in self._records.items()
+        }
 
     def apply_judge_probes(
         self, topics: Any, judged_turn: int, *, had_question: bool

@@ -161,6 +161,40 @@ class LearnerVolunteeringTests(unittest.TestCase):
         for topic in ("H1", "H2", "H3"):
             self.assertTrue(guard_text(PERSONA.surface(topic), ctx()).clean)
 
+    def test_every_hint_is_speakable_while_every_need_is_still_locked(self):
+        """The hint layer answers a first probe, before any release: it must pass clean."""
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                for topic in ("H1", "H2", "H3"):
+                    with self.subTest(persona=persona.id, variant=variant.id, topic=topic):
+                        result = guard_text(
+                            rendered.hint(topic), ctx(persona=rendered, released_topics=frozenset())
+                        )
+                        self.assertTrue(result.clean, result.hits)
+                        self.assertEqual(result.text, rendered.hint(topic))
+
+    def test_a_deep_need_told_from_its_facts_is_a_clean_reveal_once_released(self):
+        """Facts in the learner's own words pass the guard when released and still carry a
+        marker (so the reveal is recorded); the same words are a leak while locked."""
+        told = {
+            "p1_career_switcher": {
+                "H1": "My plant is being consolidated next year and my role is stagnant.",
+                "H2": "I quit a free Python course after three weeks, and I worry I'm too old.",
+                "H3": "I have two kids, so it can only be evenings and weekends.",
+            },
+        }
+        from r1_personas import deep_need_topics_in
+
+        rendered = resolve_persona("p1_career_switcher", variant="v1")
+        for topic, text in told["p1_career_switcher"].items():
+            with self.subTest(topic=topic):
+                self.assertIn(topic, deep_need_topics_in(rendered, text))
+                released = guard_text(text, ctx(released_topics=frozenset({topic})))
+                self.assertTrue(released.clean, released.hits)
+                locked = guard_text(text, ctx(released_topics=frozenset()))
+                self.assertIn("volunteered_need", {h.category for h in locked.hits})
+
     def test_an_acknowledgement_may_reveal_nothing_even_when_released(self):
         context = ctx(mode="ack", released_topics=frozenset())
         self.assertIn("volunteered_need", categories("I have two kids.", context))
@@ -686,6 +720,8 @@ class EchoTests(unittest.TestCase):
         )
         for allowed in (
             PERSONA.surface("H1"),
+            PERSONA.hint("H1"),  # the first-probe layer: marker-free, speakable while locked
+            PERSONA.hint("H2"),
             PERSONA.deep("H3"),
             "You can use the email on my form.",
             "Around $500-700 a month.",

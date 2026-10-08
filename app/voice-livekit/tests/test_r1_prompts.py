@@ -179,20 +179,73 @@ class LearnerPrefixTests(unittest.TestCase):
 
 
 class ReminderTests(unittest.TestCase):
-    def test_a_free_reply_reminder_carries_only_released_deep_needs(self):
+    def test_a_free_reply_reminder_carries_only_released_deep_needs_as_facts(self):
         text = turn_reminder(P1, r_sec=75, unlocked_topics=["H3"])
-        self.assertIn(P1.deep("H3"), text)
-        self.assertNotIn(P1.deep("H1"), text)
-        self.assertNotIn(P1.deep("H2"), text)
+        for fact in P1.facts("H3"):
+            self.assertIn(f'"{fact}"', text)
+        # R1-Q "give facts, not quotes": the full deep text is never handed over to be read out.
+        self.assertNotIn(P1.deep("H3"), text)
+        for stem in P1.stems("H3"):
+            self.assertIn(f'"{stem}"', text)
+        for other in ("H1", "H2"):
+            self.assertNotIn(P1.deep(other), text)
+            for fact in P1.facts(other):
+                self.assertNotIn(fact, text)
+            self.assertNotIn(P1.hint(other), text)
         locked = turn_reminder(P1, r_sec=75)
         for topic in ("H1", "H2", "H3"):
             self.assertNotIn(P1.deep(topic), locked)
+            self.assertNotIn(P1.hint(topic), locked)
+            for fact in P1.facts(topic):
+                self.assertNotIn(fact, locked)
 
-    def test_a_first_probe_gets_only_the_surface_answer(self):
+    def test_a_first_probe_gets_only_the_hint_layer(self):
         text = turn_reminder(P1, r_sec=30, first_probe_topics=["H1"])
-        self.assertIn(P1.surface("H1"), text)
-        self.assertIn("use only the short answers on your card", text)
+        self.assertIn(P1.hint("H1"), text)
+        self.assertIn("first real question about", text)
+        self.assertIn("Give no cause, number, date or name", text)
         self.assertNotIn(P1.deep("H1"), text)
+        for fact in P1.facts("H1"):
+            self.assertNotIn(fact, text)
+        # The other needs and the surface answer are not in the note.
+        self.assertNotIn(P1.hint("H2"), text)
+        self.assertNotIn(P1.surface("H1"), text)
+
+    def test_the_deep_facts_and_hint_are_quoted_so_telling_them_is_never_an_echo(self):
+        """The guard's echo check reads the UNQUOTED prose only: the learner's own telling of
+        a fact (or the hint) must never be mistaken for a recited instruction."""
+        from r1_guard import echo_detected
+        from r1_prompts import control_prose
+
+        for persona in PERSONAS:
+            rendered = resolve_persona(persona.id, variant="v1")
+            for topic in ("H1", "H2", "H3"):
+                with self.subTest(persona=persona.id, topic=topic):
+                    reminder = turn_reminder(
+                        rendered, r_sec=60, first_probe_topics=[topic], unlocked_topics=[topic]
+                    )
+                    prose = control_prose(reminder)
+                    for fact in rendered.facts(topic):
+                        self.assertNotIn(fact, prose)
+                    self.assertNotIn(rendered.hint(topic), prose)
+                    spoken = (rendered.hint(topic), rendered.deep(topic), *rendered.facts(topic))
+                    for text in spoken:
+                        self.assertFalse(echo_detected(text, (prose,)), text)
+
+    def test_the_deep_line_asks_for_the_stem_words_in_the_learners_own_voice(self):
+        text = turn_reminder(P1, r_sec=60, unlocked_topics=["H1"])
+        self.assertIn("tell the real story in your own words", text)
+        self.assertIn("Work these words in naturally", text)
+        self.assertIn("Do not read the facts out like a list", text)
+        self.assertIn('"consolidated"', text)
+        self.assertIn('"stagnant"', text)
+
+    def test_the_hint_and_deep_layers_appear_together_when_two_topics_are_asked(self):
+        text = turn_reminder(
+            P1, r_sec=60, first_probe_topics=["H2"], unlocked_topics=["H1"]
+        )
+        self.assertIn(P1.hint("H2"), text)
+        self.assertIn(f'"{P1.facts("H1")[0]}"', text)
 
     def test_the_clock_is_shown_as_minutes_and_seconds(self):
         self.assertIn("R=00:30", turn_reminder(P1, r_sec=30))

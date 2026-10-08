@@ -112,25 +112,81 @@ class PlanModeTests(unittest.TestCase):
         self.assertEqual(plan.scripted_text, "")
         self.assertIn("free_reply", plan.reasons)
 
-    def test_a_first_probe_gets_the_surface_answer_instruction(self):
+    def test_a_first_probe_gets_the_hint_layer_on_that_very_turn(self):
         s = Session(engine())
         plan = s.say(H1_PROBE, 20)
-        self.assertIn(P1.surface("H1"), plan.reminder)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertIn(P1.hint("H1"), plan.reminder)
         self.assertNotIn(P1.deep("H1"), plan.reminder)
+        for fact in P1.facts("H1"):
+            self.assertNotIn(fact, plan.reminder)
+        self.assertEqual(s.eng.tracker.gate.offers_view()["H1"]["hint_turn"], 1)
 
-    def test_the_follow_up_releases_the_deep_need_into_the_next_reminder(self):
+    def test_the_follow_up_releases_the_deep_need_as_facts_into_that_turns_reminder(self):
         s = Session(engine())
         s.say(H1_PROBE, 20)
         plan = s.say(FOLLOWUP, 60)
         self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
-        self.assertIn(P1.deep("H1"), plan.reminder)
+        for fact in P1.facts("H1"):
+            self.assertIn(f'"{fact}"', plan.reminder)
+        self.assertNotIn(P1.deep("H1"), plan.reminder)  # facts, not a quote to read out
+        self.assertNotIn(P1.hint("H1"), plan.reminder)  # the hint was a one-time layer
+        self.assertEqual(s.eng.tracker.gate.offers_view()["H1"]["deep_offer_turns"], [2])
 
-    def test_a_deep_need_is_offered_at_most_twice(self):
+    def test_a_deep_need_is_offered_only_on_turns_that_ask_about_its_topic(self):
+        """R1-Q: REVEAL_OFFERS=2 carried the release to the next two free replies, whatever
+        they were about (turn 83 dumped the need after "Okay, sure, I will do the email")."""
         s = Session(engine())
         s.say(H1_PROBE, 20)
-        offers = [P1.deep("H1") in s.say(text, 60 + 5 * i).reminder
-                  for i, text in enumerate([FOLLOWUP, NEUTRAL, NEUTRAL, NEUTRAL])]
-        self.assertEqual(offers, [True, True, False, False])
+        offers = [
+            P1.facts("H1")[0] in s.say(text, 60 + 5 * i).reminder
+            for i, text in enumerate([FOLLOWUP, NEUTRAL, NEUTRAL, PITCH, NEUTRAL])
+        ]
+        self.assertEqual(offers, [True, False, False, False, False])
+
+    def test_a_missed_reveal_is_offered_again_on_a_probe_or_a_follow_up_right_after(self):
+        s = Session(engine())  # the scripted reply never says the need, so it stays unlocked
+        s.say(H1_PROBE, 20)
+        s.say(FOLLOWUP, 60)
+        again = s.say(FOLLOWUP, 70)  # "tell me more" straight after the reply that missed it
+        self.assertIn(P1.facts("H1")[0], again.reminder)
+        s.say(NEUTRAL, 80)
+        late = s.say(FOLLOWUP, 90)  # the previous reply did not carry the need: no touch
+        self.assertNotIn(P1.facts("H1")[0], late.reminder)
+        probed = s.say(H1_PROBE, 100)  # a probe of the topic always touches it
+        self.assertIn(P1.facts("H1")[0], probed.reminder)
+
+    def test_a_deep_need_is_offered_at_most_three_times(self):
+        s = Session(engine())
+        s.say(H1_PROBE, 20)
+        offers = [
+            P1.facts("H1")[0] in s.say(text, 60 + 5 * i).reminder
+            for i, text in enumerate([FOLLOWUP, H1_PROBE, H1_PROBE, H1_PROBE, H1_PROBE])
+        ]
+        self.assertEqual(offers, [True, True, True, False, False])
+
+    def test_a_revealed_need_is_never_offered_again(self):
+        s = Session(engine(), reply="My plant is being consolidated next year.")
+        s.say(H1_PROBE, 20)
+        s.say(FOLLOWUP, 60)
+        self.assertEqual(s.eng.tracker.gate.state("H1").value, "revealed")
+        again = s.say(H1_PROBE, 70)
+        self.assertNotIn(P1.facts("H1")[0], again.reminder)
+
+    def test_a_judge_only_release_upgrades_the_state_but_offers_nothing_by_itself(self):
+        eng = engine()
+        first = eng.plan_turn(H1_PROBE, 20)  # rule probe: hint offered
+        self.assertIn(P1.hint("H1"), first.reminder)
+        second = eng.plan_turn(NEUTRAL, 60)  # a question the rules do not read as a probe
+        self.assertNotIn(P1.facts("H1")[0], second.reminder)
+        self.assertTrue(eng.apply_judge({"probed_topics": ["H1"]}, second.turn))
+        self.assertEqual(eng.tracker.gate.state("H1").value, "unlocked")
+        unrelated = eng.plan_turn(NEUTRAL, 90)
+        self.assertNotIn(P1.facts("H1")[0], unrelated.reminder)
+        self.assertEqual(eng.tracker.gate.offers_view()["H1"]["deep_offer_turns"], [])
+        # The next turn that actually asks about the topic offers it.
+        asked = eng.plan_turn(H1_PROBE, 120)
+        self.assertIn(P1.facts("H1")[0], asked.reminder)
 
     def test_an_owed_move_is_ack_then_verbatim_and_the_line_is_not_in_the_reminder(self):
         s = Session(engine())
@@ -245,15 +301,57 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
         # the learner answers the advisor properly first.
         self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
         self.assertIn("owed_deferred_for_reveal", plan.reasons)
-        self.assertIn(P1.deep("H3"), plan.reminder)
-        # The need is offered a second time, then the owed line is no longer held back.
-        second = s.say(NEUTRAL, 160)
-        self.assertEqual(second.mode, TurnMode.LLM_REPLY)
-        self.assertIn(P1.deep("H3"), second.reminder)
-        later = s.say(NEUTRAL, 195)
+        self.assertIn(P1.facts("H3")[0], plan.reminder)
+        # The reveal was tied to that turn: the very next turn gets the owed line, and the
+        # deep need is not offered again on an unrelated turn.
+        later = s.say(NEUTRAL, 160)
         self.assertEqual(later.mode, TurnMode.ACK_THEN_SAY)
         self.assertEqual(later.move_id, Q_A)
-        self.assertNotIn(P1.deep("H3"), later.reminder)
+        self.assertNotIn(P1.facts("H3")[0], later.reminder)
+
+    def test_a_first_probe_turn_also_holds_back_a_non_forced_owed_move(self):
+        """R1-Q: the owed objection used to land on the very turn the advisor probed (turn 35)."""
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(NEUTRAL, 60)
+        plan = s.say("How many hours a week could you realistically put in?", 125)
+        # Q-A is owed (R >= 2:00) but not forced (its deadline is 3:30): the learner answers
+        # the advisor's question first, with the hint layer.
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertIn("owed_deferred_for_reveal", plan.reasons)
+        self.assertIn(P1.hint("H3"), plan.reminder)
+        later = s.say(NEUTRAL, 160)
+        self.assertEqual((later.mode, later.move_id), (TurnMode.ACK_THEN_SAY, Q_A))
+
+    def test_a_forced_owed_move_is_not_held_back_by_a_first_probe(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("How many hours a week could you realistically put in?", 200)
+        self.assertEqual(plan.mode, TurnMode.ACK_THEN_SAY)
+        self.assertTrue(plan.reasons[-1].endswith(":forced"))
+
+    def test_the_time_cue_waits_one_turn_for_a_due_reveal_then_comes(self):
+        """R1-Q turn 79: the cue was exempt from the reveal deferral and landed on top of it."""
+        session, r = run_cooperative(40.0)
+        self.assertGreaterEqual(r, 660)
+        self.assertLess(r, 780)
+        plan = session.say(H1_PROBE, r)  # H1 is unlocked and was never said: asked again
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertIn("owed_deferred_for_reveal", plan.reasons)
+        self.assertIn(P1.facts("H1")[0], plan.reminder)
+        nxt = session.say(NEUTRAL, r + 20)
+        self.assertEqual((nxt.mode, nxt.move_id), (TurnMode.ACK_THEN_SAY, TIME_CUE))
+
+    def test_the_stall_waits_for_a_reveal_only_during_the_grace_period(self):
+        early, _ = run_cooperative(40.0)
+        held = early.say(H1_PROBE, 785.0)  # the stall is owed from 13:00; a reveal is due
+        self.assertEqual(held.mode, TurnMode.LLM_REPLY)
+        self.assertIn("owed_deferred_for_reveal", held.reasons)
+        # Past the grace period the stall is the end-game backstop and is spoken regardless
+        # (the role-play hard-ends at 14:00).
+        late, _ = run_cooperative(40.0)
+        spoken = late.say(H1_PROBE, 785.0 + r1_roleplay.STALL_DEFER_GRACE_SEC + 5)
+        self.assertEqual((spoken.mode, spoken.move_id), (TurnMode.ACK_THEN_SAY, COMMIT_STALL))
 
     def test_a_forced_owed_move_is_not_deferred(self):
         eng = engine()
@@ -263,6 +361,147 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
         plan = s.say("And would anyone else be involved in the decision?", 200)
         self.assertEqual(plan.mode, TurnMode.ACK_THEN_SAY)
         self.assertTrue(plan.reasons[-1].endswith(":forced"))
+
+
+class OwnerTestDisclosureTests(unittest.TestCase):
+    """R1-Q owner test b58c7d9c (rated 4/10): its real candidate turns, through the engine.
+
+    The advisor asked "what makes you come here" (turn 25), "what is the friction or blocker"
+    (34) and "what makes you get scared of layoffs" (43): real probes that were all missed, and
+    a turn-78 OFFER ("when you call me back, I can also talk to your husband ...") that was
+    mistaken for a probe and released a need that then came out unprompted at turn 83.
+    """
+
+    T25 = (
+        "I'm great, thank you for asking. So, Yeah, so, um, I just got a call from you and, uh, "
+        "realized that you have been looking through our programs and you got registered to our "
+        "webinar. So I wanted to wonder what makes you here, bring what makes you come here and "
+        "also I was wondering like what do you want. Hello whether are you looking for "
+        "upskilling or like know what you do in your career."
+    )
+    T30 = (
+        "Oh, okay. So, right now I would say AI is trending as you can see like there are "
+        "everywhere. So, do you have any experience in AI?"
+    )
+    T34 = (
+        "Okay, so what brings you here like Do you want? Like I wanted to know like why are you "
+        "looking at our programs, like what is the friction or blocker that you have in your "
+        "career. I am trying to understand like what, like how we can help you fix that gap."
+    )
+    T43 = (
+        "Of course, that's where, that's why we are well known for like. So when it comes to "
+        "layoffs, you know, people will be panicking around, they don't know what to do, but, "
+        "you know, I will do an heavy work for you while you don't have to overthink or panic "
+        "around. So, so tell me Mira, do you think you will be a part of the group that will "
+        "maybe, you know, that will be getting laid off? Like, why do you think so? And what "
+        "makes you get scared of layoffs."
+    )
+    T78 = (
+        "Oh, fine. Um, so, uh, when you call me back, in that case, I can also talk to your "
+        "husband, you know, in case if you have any doubts and, uh, I can also help him "
+        "understand like why the program is $8,500 and what are the packages that we will "
+        "getting. I maybe I will give him the entire curriculum details so that he will also "
+        "understand and, uh, you know, support you in this entire process. What do you think?"
+    )
+
+    def walk(self):
+        s = Session(engine())
+        s.say(OPENER, 15)
+        return s
+
+    def test_turn_25_is_a_first_h1_probe_and_gets_only_the_hint(self):
+        s = self.walk()
+        plan = s.say(self.T25, 46)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertIn(P1.hint("H1"), plan.reminder)
+        self.assertNotIn(P1.facts("H1")[0], plan.reminder)
+        self.assertEqual(s.eng.tracker.gate.state("H1").value, "surface")
+        self.assertEqual(s.eng.tracker.gate.state("H2").value, "unprobed")
+
+    def test_turn_34_asks_again_so_h1_is_released_and_h2_gets_its_hint_the_same_turn(self):
+        s = self.walk()
+        s.say(self.T25, 46)
+        s.say(self.T30, 68)
+        plan = s.say(self.T34, 97)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertNotIn("owed", " ".join(plan.reasons))
+        for fact in P1.facts("H1"):
+            self.assertIn(f'"{fact}"', plan.reminder)
+        self.assertIn(P1.hint("H2"), plan.reminder)
+        gate = s.eng.tracker.gate
+        self.assertEqual((gate.state("H1").value, gate.state("H2").value), ("unlocked", "surface"))
+        self.assertEqual(gate.state("H3").value, "unprobed")
+
+    def test_turn_43_releases_h2_and_asks_h1_again_if_it_was_never_told(self):
+        s = self.walk()
+        s.say(self.T25, 46)
+        s.say(self.T30, 68)
+        s.say(self.T34, 97)
+        plan = s.say(self.T43, 150)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        for topic in ("H1", "H2"):
+            for fact in P1.facts(topic):
+                self.assertIn(f'"{fact}"', plan.reminder, topic)
+        self.assertNotIn(P1.facts("H3")[0], plan.reminder)
+        self.assertEqual(s.eng.tracker.gate.state("H3").value, "unprobed")
+
+    def test_a_learner_that_tells_its_need_at_the_asking_turn_is_recorded_after_the_probe(self):
+        s = self.walk()
+        s.say(self.T25, 46)
+        s.reply = "My plant is being consolidated next year, and honestly my role is stagnant."
+        s.say(self.T34, 97)
+        log = s.eng.admin_log()
+        h1 = next(n for n in log["needs"] if n["topic"] == "H1")
+        self.assertEqual(h1["state"], "revealed")
+        self.assertLess(h1["probe_turn"], h1["revealed_turn"])
+        self.assertEqual(log["disclosure"]["H1"]["deep_offer_turns"], [3])
+        self.assertEqual(log["disclosure"]["H1"]["hint_turn"], 2)
+        self.assertEqual(log["disclosure"]["H2"]["hint_turn"], 3)
+
+    def test_the_posted_reveal_row_keeps_the_probe_before_the_reveal(self):
+        """The API gate fails "unprobed_reveal" when probed_turn is missing or after the reveal."""
+        from r1_replies import fidelity_events
+
+        s = self.walk()
+        s.say(self.T25, 46, turn_index=3)
+        s.reply = "My plant is being consolidated next year, and honestly my role is stagnant."
+        s.say(self.T34, 97, turn_index=5)
+        rows = fidelity_events(s.eng.admin_log(final=True, r_end=900), {})
+        reveals = [row for row in rows if row["event_type"] == "need_revealed"]
+        self.assertEqual(len(reveals), 1)
+        payload = reveals[0]["payload"]
+        self.assertEqual(payload["need"], "H1")
+        self.assertEqual(
+            (payload["probed_turn"], payload["released_turn"], reveals[0]["turn_index"]), (3, 5, 5)
+        )
+        self.assertLessEqual(payload["probed_turn"], reveals[0]["turn_index"])
+        # The layer bookkeeping is logged, never posted.
+        self.assertNotIn("disclosure", json.dumps(rows))
+
+    def test_the_turn_78_offer_is_not_a_probe_and_releases_nothing(self):
+        s = self.walk()
+        s.say(PITCH, 50)
+        plan = s.say(self.T78, 100)
+        gate = s.eng.tracker.gate
+        self.assertEqual({r["state"] for r in gate.records()}, {"unprobed"})
+        self.assertNotIn("owed_deferred_for_reveal", plan.reasons)
+        self.assertNotIn(P1.hint("H2"), plan.reminder)
+        self.assertNotIn(P1.hint("H3"), plan.reminder)
+        for topic in ("H1", "H2", "H3"):
+            self.assertNotIn(P1.facts(topic)[0], plan.reminder)
+
+    def test_a_need_released_by_a_judge_only_is_not_dumped_on_an_unrelated_turn(self):
+        """Turn 83: "Okay, sure, I will do the email. Yeah, thank you." got the whole need."""
+        s = self.walk()
+        s.say(self.T25, 46)
+        second = s.say(self.T30, 68)
+        s.eng.apply_judge({"probed_topics": ["H1"]}, second.turn)  # judge-only release
+        self.assertEqual(s.eng.tracker.gate.state("H1").value, "unlocked")
+        for index, text in enumerate(
+            ("Okay, sure, I will do the email. Yeah, thank you.", "Alright, thank you.", PITCH)
+        ):
+            plan = s.say(text, 100 + 30 * index)
+            self.assertNotIn(P1.facts("H1")[0], plan.reminder or "", text)
 
 
 class AskTests(unittest.TestCase):

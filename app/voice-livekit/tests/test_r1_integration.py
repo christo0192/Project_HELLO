@@ -547,17 +547,26 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
         await rig.converse(OPENER, advance=20)
         await rig.converse(H1_PROBE, advance=30)
         probe_blob = blob_of(rig.last_messages())
-        self.assertIn(rig.persona.surface("H1"), probe_blob)  # the short answer only
+        # The first probe gets the hint layer, in the reminder: a little feeling, no cause.
+        self.assertIn(rig.persona.hint("H1"), rig.last_messages()[-2]["content"])
+        self.assertNotIn(rig.persona.hint("H1"), rig.last_messages()[0]["content"])
         self.assertNotIn(deep, probe_blob)
+        for fact in rig.persona.facts("H1"):
+            self.assertNotIn(fact, probe_blob)
         await rig.converse(FOLLOWUP, advance=30)
         released_blob = blob_of(rig.last_messages())
-        self.assertIn(deep, released_blob)
         self.assertEqual(rig.last_messages()[-2]["role"], "system")
-        self.assertIn(deep, rig.last_messages()[-2]["content"])  # in the reminder, not the prefix
-        self.assertNotIn(deep, rig.last_messages()[0]["content"])
+        reminder = rig.last_messages()[-2]["content"]  # in the reminder, not the prefix
+        for fact in rig.persona.facts("H1"):
+            self.assertIn(fact, reminder)
+            self.assertNotIn(fact, rig.last_messages()[0]["content"])
+        self.assertNotIn(deep, released_blob)  # facts to tell, never a quote to read out
+        self.assertNotIn(rig.persona.hint("H1"), reminder)
         # The other needs stay locked.
         for topic in ("H2", "H3"):
             self.assertNotIn(rig.persona.deep(topic), released_blob)
+            for fact in rig.persona.facts(topic):
+                self.assertNotIn(fact, released_blob)
 
     async def test_an_aside_turn_never_reaches_the_learner(self) -> None:
         rig = Rig()

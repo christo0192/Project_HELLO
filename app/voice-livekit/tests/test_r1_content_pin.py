@@ -31,7 +31,9 @@ import r1_world
 # Revision 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
 # Revision 3 (R1-Q): no verbatim deflection, public backstory, speaking-style prefix, no
 # "answer exactly" stall rule in the reminder, filler and fallback rotations.
-PINNED_CONTENT_SHA256 = "e9e0df89dc4705f5ac8e90a10b087d63f85e47ae24f213e27f74525074614f2a"
+# Revision 4 (R1-Q): disclosure layers (a hint per need, the deep need as facts plus stems) and
+# their reminder lines.
+PINNED_CONTENT_SHA256 = "98e2971016e4a1915757596a8c3c1a4b674a8e897809045d11a6b39800d41fe1"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -127,9 +129,43 @@ class PinTests(unittest.TestCase):
         self.assertEqual(set(manifest["commitment"]["lines"]), {"STRONG", "MEDIUM", "WEAK"})
         self.assertIn("interviewer_prefix", manifest["prompts"])
 
+    def test_the_manifest_covers_the_r1_q_disclosure_layers(self):
+        manifest = r1_content.manifest()
+        self.assertGreaterEqual(manifest["revision"], 4)
+        for persona in r1_personas.PERSONAS:
+            for need, entry in zip(persona.needs, manifest["personas"][persona.id]["needs"]):
+                self.assertEqual(entry["hint"], need.hint)
+                self.assertEqual(entry["facts"], list(need.facts))
+                self.assertEqual(entry["stems"], list(need.stems))
+        reminder = manifest["prompts"]["turn_reminder_sample"]
+        sample = r1_personas.resolve_persona("p1_career_switcher", variant="v1")
+        self.assertIn(sample.hint("H1"), reminder)  # the first-probe line
+        self.assertIn(sample.facts("H2")[0], reminder)  # the deep line carries facts ...
+        self.assertNotIn(sample.deep("H2"), reminder)  # ... never the full deep text
+
+    def test_editing_a_hint_a_fact_or_a_stem_changes_the_sha(self):
+        base = r1_content.content_sha256()
+        original = r1_personas.PERSONAS
+        first = original[0]
+        need = first.needs[0]
+        try:
+            for change in (
+                {"hint": need.hint + " Really."},
+                {"facts": need.facts + ("you are tired",)},
+                {"stems": need.stems + ("same spot",)},
+            ):
+                edited = dataclasses.replace(need, **change)
+                r1_personas.PERSONAS = (
+                    dataclasses.replace(first, needs=(edited,) + first.needs[1:]),
+                ) + original[1:]
+                self.assertNotEqual(r1_content.content_sha256(), base, change)
+        finally:
+            r1_personas.PERSONAS = original
+        self.assertEqual(r1_content.content_sha256(), base)
+
     def test_the_manifest_covers_the_r1_q_learner_voice_texts(self):
         manifest = r1_content.manifest()
-        self.assertEqual(manifest["revision"], 3)
+        self.assertGreaterEqual(manifest["revision"], 3)
         self.assertEqual(manifest["learner_policy"], r1_world.LEARNER_POLICY)
         self.assertEqual(
             manifest["script"]["learner_filler_variants"], list(r1_script.LEARNER_FILLER_VARIANTS)

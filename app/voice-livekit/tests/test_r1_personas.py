@@ -44,6 +44,15 @@ PROBES = {
         "What's your target role and timeline?",
         "I want to understand what's driving your timeline.",
         "I'd love to understand why you're looking now.",
+        # R1-Q owner test b58c7d9c: the present tense and the "looking at our programs" forms.
+        "So what makes you come here?",
+        "Okay, so what brings you here like",
+        "Like I wanted to know like why are you looking at our programs",
+        "Why are you even interested in data science?",
+        "What is bringing you to us right now?",
+        "Do you think you will be a part of the group that will be getting laid off?",
+        "Are you worried about job security at your company?",
+        "So I wanted to wonder what makes you here, what makes you come here",
     ),
     "H2": (
         "What have you tried so far to learn this?",
@@ -58,6 +67,14 @@ PROBES = {
         "Tell me about any past attempts.",
         "What's the biggest gap you feel in your preparation?",
         "What got in the way last time?",
+        # R1-Q owner test b58c7d9c turns 34 and 43.
+        "What is the friction or blocker that you have in your career?",
+        "And what makes you get scared of layoffs?",
+        "Any pain points with the way you are learning today?",
+        "Does the job search stress you out?",
+        "What's stopping you from making the switch?",
+        "Are you anxious about the switch?",
+        "I am trying to understand what the blockers are for you.",
     ),
     "H3": (
         "How many hours a week could you realistically put in?",
@@ -91,6 +108,10 @@ NEAR_MISSES = {
         "Which cohort would you like?",
         "Can I send you the curriculum?",
         "What are your thoughts on the program?",
+        # R1-Q: "what makes you think" asks for a reason, not a trigger; layoffs as a statement.
+        "What makes you think the course is expensive?",
+        "Layoffs are common in tech these days.",
+        "What brings people to data science these days?",
     ),
     "H2": (
         "We prepare engineers for interviews at top-tier tech companies.",
@@ -98,6 +119,8 @@ NEAR_MISSES = {
         "Our deep learning module is advanced.",
         "What is your experience with Python?",
         "Do you have an interview coming up?",
+        "Our stress-free schedule suits busy professionals.",
+        "There is no friction in the enrolment process.",
         "That's a great background.",
         "Can you tell me about yourself?",
         "How are you doing today?",
@@ -125,6 +148,12 @@ NEAR_MISSES = {
         "Are you available for a call tomorrow?",
         "Can we schedule a call for Thursday?",
         "Are you busy right now?",
+        # R1-Q owner test turn 78: an offer, not a question ("husband" and "doubts" are in it).
+        "Um, so, uh, when you call me back, in that case, I can also talk to your husband, you "
+        "know, in case if you have any doubts and, uh, I can also help him understand like why "
+        "the program is $8,500 and what are the packages that we will get.",
+        "Yeah, we have our own portal, so when you miss the live classes, you can request a "
+        "recording and your family does not need to worry.",
     ),
 }
 
@@ -218,6 +247,84 @@ class MarkerTests(unittest.TestCase):
     def test_marker_patterns_compile_and_are_case_insensitive(self):
         rendered = resolve_persona("p2_recent_grad", variant="v1")
         self.assertIn("H3", deep_need_topics_in(rendered, "I HAVE STUDENT LOANS."))
+
+
+class DisclosureLayerTests(unittest.TestCase):
+    """Surface -> hint -> deep, for every need of every persona (R1-Q item 4)."""
+
+    def each_need(self):
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                for need in persona.needs:
+                    with self.subTest(persona=persona.id, variant=variant.id, topic=need.topic):
+                        yield rendered, need
+
+    def test_every_need_has_a_hint_facts_and_stems(self):
+        for persona in PERSONAS:
+            for need in persona.needs:
+                with self.subTest(persona=persona.id, topic=need.topic):
+                    self.assertTrue(need.hint.strip())
+                    self.assertTrue(need.hint.endswith("."))
+                    self.assertTrue(2 <= len(need.facts) <= 3, need.facts)
+                    self.assertTrue(1 <= len(need.stems) <= 3, need.stems)
+                    self.assertEqual(len({need.surface, need.hint, need.deep}), 3)
+                    self.assertEqual(len(set(need.facts)), len(need.facts))
+
+    def test_a_hint_is_marker_free_so_it_can_be_spoken_before_any_release(self):
+        for rendered, need in self.each_need():
+            self.assertEqual(deep_need_topics_in(rendered, need.hint), frozenset(), need.hint)
+            self.assertEqual(deep_need_topics_in(rendered, need.surface), frozenset())
+
+    def test_a_hint_gives_a_little_feeling_but_no_number_cause_or_deep_text(self):
+        for rendered, need in self.each_need():
+            self.assertLessEqual(len(need.hint.split()), 22, need.hint)
+            self.assertFalse(any(ch.isdigit() for ch in need.hint), need.hint)
+            self.assertNotIn("$", need.hint)
+            self.assertEqual(len(need.hint.split(". ")), 1, need.hint)  # one sentence
+            self.assertNotIn(need.deep.lower(), need.hint.lower())
+            for fact in need.facts:
+                self.assertNotIn(fact.lower(), need.hint.lower())
+
+    def test_hints_stay_off_the_public_card_and_out_of_the_prefix(self):
+        from r1_prompts import learner_prefix
+
+        for rendered, need in self.each_need():
+            self.assertNotIn(need.hint, rendered.public_card_text())
+            self.assertNotIn(need.hint, learner_prefix(rendered))
+
+    def test_the_facts_together_carry_this_needs_markers_and_no_other_topics(self):
+        for rendered, need in self.each_need():
+            told = deep_need_topics_in(rendered, " ".join(need.facts))
+            self.assertEqual(told, {need.topic}, need.facts)
+
+    def test_each_stem_is_a_marker_hit_for_its_own_need_only(self):
+        """The reminder asks for the stem words so the reveal can be recorded."""
+        for rendered, need in self.each_need():
+            for stem in need.stems:
+                self.assertEqual(deep_need_topics_in(rendered, stem), {need.topic}, stem)
+                self.assertIn(stem.lower(), " ".join(need.facts).lower(), stem)
+
+    def test_facts_are_short_fragments_not_the_deep_sentence(self):
+        for rendered, need in self.each_need():
+            for fact in need.facts:
+                self.assertLessEqual(len(fact.split()), 14, fact)
+                self.assertNotEqual(fact.lower(), need.deep.lower())
+                self.assertNotIn(".", fact)
+                self.assertNotIn('"', fact)  # facts travel inside double quotes
+
+    def test_a_telling_built_from_the_stems_alone_registers_as_the_reveal(self):
+        for rendered, need in self.each_need():
+            told = deep_need_topics_in(rendered, "Honestly, " + ", and ".join(need.stems) + ".")
+            self.assertEqual(told, {need.topic}, need.stems)
+
+    def test_the_new_layers_are_ascii_and_the_accessors_agree(self):
+        for rendered, need in self.each_need():
+            for text in (need.hint, *need.facts, *need.stems):
+                self.assertTrue(text.isascii(), text)
+            self.assertEqual(rendered.hint(need.topic), need.hint)
+            self.assertEqual(rendered.facts(need.topic), need.facts)
+            self.assertEqual(rendered.stems(need.topic), need.stems)
 
 
 class PublicCardTests(unittest.TestCase):
@@ -402,6 +509,19 @@ class ProbeMatrixTests(unittest.TestCase):
 
 
 class FollowupTests(unittest.TestCase):
+    def test_like_what_is_a_follow_up_only_as_a_fragment(self):
+        """"Like what?" asks for an example; "like what is the friction ..." is a filler."""
+        for text in ("Like what?", "Okay, like what", "Like what."):
+            with self.subTest(text=text):
+                self.assertTrue(detect_followup(text), text)
+        for text in (
+            "Like I wanted to know like why are you looking at our programs, like what is the "
+            "friction or blocker that you have in your career.",
+            "I was wondering like what do you want.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(detect_followup(text), text)
+
     def test_generic_follow_ups(self):
         for text in (
             "Tell me more about that.",
