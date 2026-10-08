@@ -46,11 +46,15 @@ import {
 import { createLogger } from '../logger.js';
 import { supabase } from '../supabase.js';
 import { getR1Config, type R1Config } from './config.js';
-import { R1_ASSESSMENT_QUEUE, createR1AssessmentHandler } from './assessment-handler.js';
+import {
+  R1_ASSESSMENT_QUEUE,
+  createR1AssessmentHandler,
+  createR1FinalDeferralGuard,
+} from './assessment-handler.js';
 import { lapseOrphanedR1Sessions, type R1OrphanLapseOptions } from './orphan-lapse.js';
 import { agentDispatchClientFor, browserLiveKitEndpoint } from '../livekit-endpoints.js';
 import type { DispatchListerLike } from './worker-gate.js';
-import type { R1AssessmentOptions } from '../../services/r1-assessment.js';
+import { recordR1ScoringFailure, type R1AssessmentOptions } from '../../services/r1-assessment.js';
 
 /** The ONLY queues this runtime registers. A structural test pins it. */
 export const R1_RUNTIME_QUEUES: readonly string[] = [R1_ASSESSMENT_QUEUE];
@@ -157,12 +161,27 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
   let lastOrphansLapsed: number | null = null;
   let orphanLapseErrors = 0;
 
+  // A deferral on the FINAL attempt writes no placeholder (the job is alive), so one that does not
+  // commit would leave HR nothing when the lease expiry dead-letters the job. This records the
+  // placeholder in that case only. Best effort and never throws (assessment-handler.ts).
+  const finalDeferrals = createR1FinalDeferralGuard(async ({ sessionId, code }) => {
+    try {
+      await recordR1ScoringFailure(sessionId, code, { client: client as never, now: clock });
+      logger.warn('unknown_event', { error_category: 'r1_final_defer_uncommitted', rejection_reason: code });
+    } catch {
+      logger.warn('unknown_event', { error_category: 'r1_placeholder_failed' });
+    }
+  });
+
   const runner = createQueueRunner({
-    queue,
+    queue: finalDeferrals.guard(queue),
     handlers: {
       [R1_ASSESSMENT_QUEUE]: createR1AssessmentHandler({
         client: client as never,
         infer: options.infer,
+        // The deferral budget is measured against the same clock as the rest of the runtime.
+        now: () => clock().getTime(),
+        onFinalDeferral: finalDeferrals.note,
       }),
     },
     owner,

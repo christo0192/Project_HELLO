@@ -502,28 +502,60 @@ re-score supersedes the placeholder.
 
 **Provider outages defer.** A DeepSeek timeout, a connection failure, a rate limit
 (429), a server error (5xx) or R1's own open circuit breaker defers the job (reason
-`r1_provider_unavailable`, delay at least the 60 s breaker cooldown) instead of failing
+`r1_provider_unavailable`, delay 65 s, at least the 60 s breaker cooldown) instead of failing
 it: the attempt is refunded, so a short outage does not dead-letter the job. The set of
 deferrable codes is explicit (`R1_DEFERRABLE_CODES` in `lib/r1/assessment-handler.ts`).
-The wait is bounded twice: a deferral streak is capped at 60 minutes, and a job is
-deferred at most 30 times in its life (`job_queue.defer_count`, which a counted failure
-does not reset). Past either bound the failure takes the normal retry, placeholder and
-DLQ path. **A job that defers writes no placeholder**, not even on its last attempt: it
-is alive and will be scored, so HR sees no outcome yet instead of a wrong "scoring
-failed". The placeholder is written only when the job is really ending.
+The wait is bounded, from the job's own `job_queue` columns (which keep no per-code
+count):
 
-**Scoring failure codes (R1-Q).** The DeepSeek HTTP status is no longer dropped. The
-code lands in `job_queue.error_message` and, once dead-lettered, in `job_dlq.error_message`
-and `v_funnel_failures` as `r1:<code>`.
+- a deferral **streak** is capped at 60 minutes (any code);
+- a job is deferred at most **30 times** in its life for a provider failure
+  (`job_queue.defer_count`, which a counted failure does not reset);
+- a **timeout** is deferred only while the job has been deferred fewer than **3** times in
+  total (`R1_TIMEOUT_DEFER_MAX_COUNT`). A timeout is a full billed 300 s reasoning call,
+  and a transcript too long for one call times out every time, so waiting cannot fix it.
+  A job that times out on every call makes about 8 calls (3 deferred, then its 5 attempts,
+  about 45 minutes), not 31 (about 3 hours);
+- the breaker **refusing** a call (`provider_circuit_open`) makes no call and bills
+  nothing, so neither cap stops it, only the streak bound does (each refusal is still a
+  deferral and adds to `defer_count`).
+
+Past a bound the failure takes the normal path: up to 5 counted attempts with the queue's
+retry backoff, a placeholder on the last, then the DLQ. **The refusal stays deferrable past
+the cap on purpose.** By the cap every deferral cycle has been a failing half-open probe,
+so the breaker is open. A terminal refusal would let the five attempts after the cap arrive
+seconds apart inside its 60 s cooldown: one real probe failure and four refusals, so the
+job would dead-letter as `provider_circuit_open`, which names no cause. Deferring the
+refusal makes every counted attempt after the cap a real probe (about 70 s apart, about 6
+minutes in all), so the DLQ row and the placeholder carry the provider's real code. A job
+that sees a 429, a 5xx or a connection failure on every call therefore makes 35 calls (30
+deferred, then its 5 attempts) over about 40 minutes before it dead-letters.
+`r1-scoring-outage.test.ts` drives this with the real breaker.
+
+**A job that defers writes no placeholder**, not even on its last attempt: it is alive and
+will be scored, so HR sees no outcome yet instead of a wrong "scoring failed". The
+placeholder is written only when the job is really ending. If the deferral on the LAST
+attempt cannot be committed (a database error, or the lease is gone), the R1 runtime writes
+the placeholder itself and the job then dead-letters by lease expiry as
+`lease_expired_attempts_exhausted` (see the table).
+
+**Scoring failure codes (R1-Q).** The DeepSeek HTTP status is no longer dropped. The real
+code lands in `job_queue.error_message` on every counted (retried) failure and, once
+dead-lettered, in `job_dlq.error_message` and `v_funnel_failures` as `r1:<code>`. While a
+job defers, `error_message` is empty by design (`defer_job` clears it; `defer_reason =
+r1_provider_unavailable` says it is waiting), and the code is only in the warn log line
+`r1_assessment_failed` (`rejection_reason`, plus `http_status`).
 
 | Code | Cause | Deferred? | What to do |
 |---|---|---|---|
 | `deepseek_insufficient_balance` | HTTP 402: the DeepSeek account balance is exhausted | No (waiting cannot fix it) | Top up the balance, then replay (below) |
 | `deepseek_auth` | HTTP 401 or 403: DeepSeek rejected the API key | No | Fix the `DEEPSEEK_API_KEY` secret, then replay |
-| `deepseek_rate_limited` | HTTP 429 | Yes | None unless it dead-letters (cap reached): replay once the limit clears |
-| `deepseek_server_error` | HTTP 5xx | Yes | Same |
-| `deepseek_timeout`, `deepseek_connection` | The call timed out (300 s) or the network failed | Yes | Same; a repeated timeout on one session means the transcript is too long for one call |
-| `provider_circuit_open` | R1's own breaker is open after repeated provider failures (a side effect, not a cause) | Yes | Look for the failure that opened it in the log lines before it |
+| `deepseek_rate_limited` | HTTP 429 | Yes (up to 30 times) | None unless it dead-letters (cap reached, then 5 real probes): replay once the limit clears |
+| `deepseek_server_error` | HTTP 5xx | Yes (up to 30 times) | Same |
+| `deepseek_connection` | The network failed | Yes (up to 30 times) | Same |
+| `deepseek_timeout` | The call timed out (300 s) | Yes, but only the first 3 deferrals of a job | Same; a repeated timeout on one session means the transcript is too long for one call, so replaying it will time out again |
+| `provider_circuit_open` | R1's own breaker refused a call after repeated provider failures (a side effect, never a cause). It defers; it should not be a DLQ code | Yes (streak bound only) | Look for the failure that opened it in the log lines before it. Seen as a DLQ code only after a refusal streak of over 60 minutes |
+| `lease_expired_attempts_exhausted` | The worker lost its lease on the LAST attempt (a process crash, or the final deferral could not be committed) and the reclaim sweep dead-lettered the job. The queue writes this code, not the scorer | n/a | The placeholder is written when the final deferral fails to commit, but NOT after a crash, so check whether the session has an `assessments` row; if not, HR sees no outcome: replay the job |
 | `deepseek_http_<status>` | Any other non-2xx status (for example 400 or 422) | No | Read the status; usually a request or model-name problem |
 | `deepseek_protocol` | A 200 whose body could not be used | No | Check the provider status page |
 

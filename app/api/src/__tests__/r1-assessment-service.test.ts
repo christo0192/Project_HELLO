@@ -17,7 +17,12 @@ import {
 } from './support/r1-fake-db.js';
 import { METRIC_IDS, cleanLogRows, interviewRows, modelAnswer } from './support/r1-scorer.js';
 import { R1_METRICS, R1_METRIC_KEYS } from '../lib/r1/rubric.js';
-import { runR1Assessment, r1ErrorCode, r1OperatorMessage } from '../services/r1-assessment.js';
+import {
+  recordR1ScoringFailure,
+  runR1Assessment,
+  r1ErrorCode,
+  r1OperatorMessage,
+} from '../services/r1-assessment.js';
 import { createR1DeepseekRunner, createR1Infer } from '../lib/r1/deepseek-runner.js';
 import { DeepseekError } from '../lib/deepseek.js';
 import { BusinessError, ProviderError } from '../lib/provider-resilience.js';
@@ -361,6 +366,76 @@ describe('provider and validation failures', () => {
     await expect(runR1Assessment(SESSION_ID, { client: db.client, infer, now: () => NOW })).rejects.toThrow();
     const line = warn.mock.calls.map((call) => String(call[0])).find((entry) => entry.includes('r1_assessment_failed'));
     expect(JSON.parse(line as string)).not.toHaveProperty('http_status');
+  });
+});
+
+describe('recordR1ScoringFailure (the placeholder when a final-attempt deferral did not commit)', () => {
+  it('writes the same placeholder the final attempt would have, settles the round, and calls no model', async () => {
+    const { db } = setup(tablesWithInterview());
+    await expect(recordR1ScoringFailure(SESSION_ID, 'deepseek_rate_limited', { client: db.client, now: () => NOW }))
+      .resolves.toBe('recorded');
+    expect(db.tables.assessments).toHaveLength(1);
+    const row = db.tables.assessments![0]!;
+    expect(row).toMatchObject({
+      session_id: SESSION_ID, schema_version: 2, revision: 1, recommendation: null,
+      scoring_status: 'incomplete_evidence', overall_score: null,
+      scorecard_version_id: '20000000-0000-4000-8000-000000000001',
+    });
+    expect(row.raw.r1).toMatchObject({
+      outcome: 'scoring_failed', valid: false, code: 'deepseek_rate_limited',
+      gate: { passed: false, failures: ['scoring_failed'] },
+    });
+    expect(row.metric_results).toHaveLength(R1_METRICS.length);
+    expect(db.rpcCalls.map((call) => call.fn)).toEqual(['r1_attach_assessment', 'r1_apply_status_effect']);
+    expect(db.rpcCalls[0]!.args).toMatchObject({ p_recommendation: 'human_review', p_valid: false, p_overall: null });
+  });
+
+  it('is byte-for-byte the placeholder the final-attempt catch writes', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const viaCatch = setup(tablesWithInterview()).db;
+    await expect(runR1Assessment(SESSION_ID, {
+      client: viaCatch.client, infer: vi.fn(async () => { throw new DeepseekError('protocol', 429); }),
+      now: () => NOW, finalAttempt: true,
+    })).rejects.toThrow('deepseek_rate_limited');
+    const viaGuard = setup(tablesWithInterview()).db;
+    await recordR1ScoringFailure(SESSION_ID, 'deepseek_rate_limited', { client: viaGuard.client, now: () => NOW });
+    const strip = (row: Record<string, unknown>) => ({ ...row, id: undefined, created_at: undefined });
+    expect(strip(viaGuard.tables.assessments![0]!)).toEqual(strip(viaCatch.tables.assessments![0]!));
+    // The same two RPCs with the same arguments (the generated row ids differ between the fakes).
+    const withoutIds = (calls: typeof viaCatch.rpcCalls) =>
+      calls.map((call) => ({ fn: call.fn, args: { ...call.args, p_assessment_id: undefined } }));
+    expect(withoutIds(viaGuard.rpcCalls)).toEqual(withoutIds(viaCatch.rpcCalls));
+  });
+
+  it('adds nothing when the session already has an assessment, scored or a placeholder', async () => {
+    const scored = setup(tablesWithInterview()).db;
+    await runR1Assessment(SESSION_ID, { client: scored.client, infer: goodInfer(), now: () => NOW });
+    scored.rpcCalls.length = 0;
+    await expect(recordR1ScoringFailure(SESSION_ID, 'deepseek_timeout', { client: scored.client, now: () => NOW }))
+      .resolves.toBe('exists');
+    expect(scored.tables.assessments).toHaveLength(1);
+    expect(scored.tables.assessments![0]!.raw.r1.outcome).toBe('scored');
+    expect(scored.rpcCalls).toHaveLength(0);
+
+    const twice = setup(tablesWithInterview()).db;
+    await recordR1ScoringFailure(SESSION_ID, 'deepseek_timeout', { client: twice.client, now: () => NOW });
+    await expect(recordR1ScoringFailure(SESSION_ID, 'deepseek_auth', { client: twice.client, now: () => NOW }))
+      .resolves.toBe('exists');
+    expect(twice.tables.assessments).toHaveLength(1);
+    expect(twice.tables.assessments![0]!.raw.r1.code).toBe('deepseek_timeout');
+  });
+
+  it('shows no metrics for a role whose scorecard is not the R1 one, and throws on a session it cannot read', async () => {
+    const tables = tablesWithInterview();
+    tables.role_scorecard_version_metrics![0]!.metric_key = 'accuracy';
+    const { db } = setup(tables);
+    await recordR1ScoringFailure(SESSION_ID, 'deepseek_timeout', { client: db.client, now: () => NOW });
+    expect(db.tables.assessments![0]).toMatchObject({ scorecard_version_id: null, metric_results: [] });
+
+    const empty = setup(baseTables()).db;
+    await expect(recordR1ScoringFailure('40000000-0000-4000-8000-0000000000ff', 'deepseek_timeout', { client: empty.client }))
+      .rejects.toThrow('r1_session_not_found');
+    expect(empty.tables.assessments).toHaveLength(0);
   });
 });
 

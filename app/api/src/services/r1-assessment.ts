@@ -33,7 +33,9 @@
  * nothing, then rethrows so the job lands in the DLQ (`v_funnel_failures`, M3) as the
  * Mission Control alert. The exception is a failure the queue handler is about to DEFER (a
  * provider outage within its deferral budget, `options.willDefer`): that job is still alive, so
- * no placeholder is written for it. A final-attempt failure AFTER a scored row was stored (the
+ * no placeholder is written for it (if the deferral then fails to commit on the final attempt,
+ * the runtime's queue guard records the same placeholder through `recordR1ScoringFailure`).
+ * A final-attempt failure AFTER a scored row was stored (the
  * round settlement threw) records no placeholder: the scored row stays the truth and a DLQ
  * replay re-drives the settlement through the adopt path.
  *
@@ -673,6 +675,39 @@ export async function runR1Assessment(
     }
     throw new Error(code, { cause: err });
   }
+}
+
+/**
+ * Record the `scoring_failed` placeholder for a job that is ending without a score, from OUTSIDE
+ * `runR1Assessment`: the queue guard calls it when a FINAL-attempt deferral did not commit, so the
+ * job is about to be dead-lettered by its lease expiry with nothing for HR to see
+ * (`createR1FinalDeferralGuard`). The same placeholder the final-attempt catch above writes, with
+ * the same `code`.
+ *
+ * No-op (`exists`) when the session already has any v2 assessment, scored or a placeholder: a
+ * stored row is the truth, never stacked over. Throws on a database error; the caller treats this
+ * as best effort. No model call.
+ */
+export async function recordR1ScoringFailure(
+  sessionId: string,
+  code: string,
+  options: { readonly client?: R1DbClient; readonly now?: () => Date } = {},
+): Promise<'recorded' | 'exists'> {
+  const client = options.client ?? (supabase as unknown as R1DbClient);
+  const now = options.now ?? ((): Date => new Date());
+  const session = await loadSession(client, sessionId);
+  const existing = await loadLatestAssessment(client, sessionId);
+  if (existing) return 'exists';
+  const settings = await loadSettings(client);
+  const loaded = session.role_id ? await loadActiveRoleScorecard(client, session.role_id) : null;
+  // Only the exact R1 scorecard is shown on the HR card, as everywhere else in this file.
+  const scorecard = loaded && r1ScorecardMatchesRubric(loaded.metrics) ? loaded : null;
+  await persistPlaceholder({
+    client, session, roundId: session.interview_round_id as string, scorecard, existing: null,
+    revision: 1, supersedes: null, outcome: 'scoring_failed', code, settings,
+    gateFailures: ['scoring_failed'], now: now(),
+  });
+  return 'recorded';
 }
 
 const SCORECARD_MISMATCH_CODE = 'r1_scorecard_mismatch';
