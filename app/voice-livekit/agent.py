@@ -2751,6 +2751,25 @@ def _native_turn_predates_question(message: Any, question_anchor_ms: int | None)
     )
 
 
+def _make_kept_text_persister(
+    assessment_persist_active: list[bool],
+    item_seq: list[int],
+    spawn_item_persist: "Callable[..., Any]",
+) -> "Callable[[str, int | None], None]":
+    """M014 S01: the writer for candidate words the coordinator KEEPS but ends
+    the SDK turn on (StopResponse), for which the SDK writes no conversation
+    item. Same per-item writer and `phone-item-<seq>` key space as
+    `_on_phone_item`; only armed during the assessment phase."""
+
+    def persist(text: str, anchor_ms: int | None) -> None:
+        if not assessment_persist_active[0] or not text:
+            return
+        item_seq[0] += 1
+        spawn_item_persist("candidate", text, anchor_ms, item_seq[0])
+
+    return persist
+
+
 # ── M014 S01: keep overlapped speech, route the cut line truthfully ──────────
 #
 # Live RCA 2026-10-08: 29 of 85 post-opening bot lines were cut by the
@@ -2878,20 +2897,49 @@ _CUT_LEAD_INS = frozenset({
     "and", "so", "then", "now", "but", "also", "okay", "ok", "well", "right",
     "next", "alright",
 })
+# Topic announcements ("Now, about your notice period."): same positional rule
+# as the question words, so "thanks for sharing about it" stays a reaction.
+_CUT_TOPIC_PHRASES: tuple[tuple[str, ...], ...] = (
+    ("about",), ("regarding",), ("coming", "to"), ("moving", "to"),
+    ("turning", "to"), ("on", "to"), ("onto",),
+)
+# "how" followed by one of these is a question ("how did", "how long"); any
+# other word after "how" in a sentence with no "?" is an exclamation ("how nice").
+_CUT_HOW_QUESTION_FOLLOWERS = frozenset({
+    "did", "do", "does", "would", "could", "can", "will", "should", "might",
+    "are", "is", "was", "were", "have", "has", "had", "long", "many", "much",
+    "often", "far", "old", "big", "large", "soon", "well", "come", "about",
+    "was", "were",
+})
 
 
 def _cut_line_question_offset(sentence: str) -> int | None:
     """Word offset in `sentence` where its answerable part starts, else None."""
     raw = sentence.split()
     words = [re.sub(r"[^\w']", "", w.replace("’", "'")).lower() for w in raw]
+    has_mark = "?" in sentence
     for i in range(len(words)):
         for phrase in _CUT_QUESTION_PHRASES:
             if tuple(words[i:i + len(phrase)]) == phrase:
                 return i
-        if words[i] in _CUT_WH_WORDS and (
+        starts_clause = (
             i == 0 or words[i - 1] in _CUT_LEAD_INS or raw[i - 1].endswith(",")
-        ):
+        )
+        if not starts_clause:
+            continue
+        if words[i] in _CUT_WH_WORDS:
+            following = words[i + 1] if i + 1 < len(words) else ""
+            if words[i] == "what" and following in {"a", "an"}:
+                continue  # "What a great journey." is a reaction
+            if (
+                words[i] == "how" and not has_mark
+                and following not in _CUT_HOW_QUESTION_FOLLOWERS
+            ):
+                continue  # "How interesting." is a reaction
             return i
+        for phrase in _CUT_TOPIC_PHRASES:
+            if tuple(words[i:i + len(phrase)]) == phrase:
+                return i
     return None
 
 
@@ -6757,7 +6805,11 @@ async def _run_native_phone_screening(
         # of a long answer, so 30 s into a monologue this loop used to speak
         # "Are you still there?" over the candidate. Before ANY of the five
         # silence actions it now checks the live VAD speaking state.
-        suppress_since: dict[str, float | None] = {"value": None}
+        # `ended` is the end-of-speech stamp seen when the timer started: a
+        # newer end-of-speech proves the candidate spoke and stopped since, so
+        # the old timer belonged to a DIFFERENT episode and must restart
+        # (round 2: a stale timer made the next long answer look stuck).
+        suppress_since: dict[str, Any] = {"value": None, "ended": None}
         # Set once a speaking latch has been declared stuck: that SAME latch
         # (no end-of-speech seen since) stays ignored for the rest of the
         # ladder, so the prompt, second nudge and goodbye still run in turn.
@@ -6778,19 +6830,34 @@ async def _run_native_phone_screening(
             if not (speaking or recent):
                 suppress_since["value"] = None
                 return False
-            now = _monotonic()
-            if suppress_since["value"] is None:
-                suppress_since["value"] = now
-            if now - float(suppress_since["value"]) > PHONE_SILENCE_SPEAKING_MAX_SUPPRESS_SEC:
-                # A lost end-of-speech event must never keep the watchdog
-                # silent for ever: ignore the stuck latch and act.
-                _log.warn(
-                    "unknown_event", error_type="phone_silence",
-                    error_category="speaking_latch_stale", phase=step,
-                )
+            if not speaking:
+                # Only the short post-speech grace remains: bounded by itself,
+                # so it is never a stuck latch and starts no timer (a timer
+                # started here would carry into the NEXT episode, whose
+                # end-of-speech stamp has not changed yet).
                 suppress_since["value"] = None
-                stale_latch.update(active=True, ended=ended)
-                return False
+            else:
+                now = _monotonic()
+                if (
+                    suppress_since["value"] is not None
+                    and suppress_since["ended"] != ended
+                ):
+                    # A real end-of-speech since the timer started: that was
+                    # a different episode, so this one starts afresh.
+                    suppress_since["value"] = None
+                if suppress_since["value"] is None:
+                    suppress_since["value"] = now
+                    suppress_since["ended"] = ended
+                if now - float(suppress_since["value"]) > PHONE_SILENCE_SPEAKING_MAX_SUPPRESS_SEC:
+                    # A lost end-of-speech event must never keep the watchdog
+                    # silent for ever: ignore the stuck latch and act.
+                    _log.warn(
+                        "unknown_event", error_type="phone_silence",
+                        error_category="speaking_latch_stale", phase=step,
+                    )
+                    suppress_since["value"] = None
+                    stale_latch.update(active=True, ended=ended)
+                    return False
             _log.info(
                 "unknown_event", error_type="phone_silence",
                 error_category="suppressed_candidate_speaking", phase=step,
@@ -8104,6 +8171,27 @@ async def _run_native_phone_screening(
         )
         add_turn_instruction(turn_ctx, PHONE_CONTINUATION_WIND_DOWN_INSTRUCTION)
 
+    def _owed_ask_slot_note(question: Any) -> str:
+        """Compensation slots the candidate already gave, so the owed-question
+        ask does not request them again (same guard as the normal advance)."""
+        if not (
+            phone.phone_is_compensation_objective(question.text)
+            and compensation_slots
+        ):
+            return ""
+        missing = [
+            slot for slot in ("current", "expected")
+            if slot not in compensation_slots
+        ]
+        if not missing:
+            return ""
+        return (
+            " The candidate already explicitly supplied these compensation "
+            "slots: " + ", ".join(sorted(compensation_slots))
+            + ". Ask naturally only for the missing slot(s): "
+            + ", ".join(missing) + ". Do not ask for a known slot again."
+        )
+
     async def _route_continuation(turn_ctx: Any, text: str) -> bool:
         """A bridge (or nothing) of the advance reply was cut and the candidate
         went on talking. Keep their words, then ask the owed question once.
@@ -8163,7 +8251,7 @@ async def _run_native_phone_screening(
                 PHONE_CONTINUATION_PRESENCE_INSTRUCTION
                 if merged == "not_merged_filler"
                 else PHONE_CONTINUATION_ASK_INSTRUCTION
-            ) + question.spoken_text,
+            ) + question.spoken_text + _owed_ask_slot_note(question),
         )
         _restamp_owed_ask(target)
         _log.info(
@@ -8221,7 +8309,9 @@ async def _run_native_phone_screening(
             question.spoken_text, control_text=PHONE_OVERLAP_REASK_CONTROL,
         )
         add_turn_instruction(
-            turn_ctx, PHONE_OVERLAP_REASK_INSTRUCTION + question.spoken_text,
+            turn_ctx,
+            PHONE_OVERLAP_REASK_INSTRUCTION + question.spoken_text
+            + _owed_ask_slot_note(question),
         )
         _restamp_owed_ask(target)
         _log.info(
@@ -9006,6 +9096,13 @@ async def _run_native_phone_screening(
             )
         if cut_kind in {CUT_BRIDGE_ONLY, CUT_NOTHING_PLAYED}:
             if await _route_continuation(turn_ctx, text):
+                return
+            # Round 2: with the continuation cap spent, speech that began
+            # BEFORE the cut line must never reach the answer-present credit
+            # below (it would be scored against a question the candidate never
+            # heard, and that question skipped). It takes the overlap re-ask:
+            # words kept, owed question asked again, bounded.
+            if overlap and await _route_overlap_reask(turn_ctx, text):
                 return
         elif overlap:
             if await _route_overlap_reask(turn_ctx, text):
@@ -15434,17 +15531,9 @@ async def _run_phone_session(
             assessment_persist_active[0] = True
             gate_persist_active[0] = False
 
-            def _persist_kept_candidate_text(
-                text: str, anchor_ms: int | None,
-            ) -> None:
-                """M014 S01: write the transcript row for candidate words the
-                coordinator KEEPS but ends the SDK turn on (StopResponse), for
-                which the SDK writes no conversation item. Same per-item
-                writer and `phone-item-<seq>` key as `_on_phone_item`."""
-                if not assessment_persist_active[0] or not text:
-                    return
-                item_seq[0] += 1
-                _spawn_item_persist("candidate", text, anchor_ms, item_seq[0])
+            _persist_kept_candidate_text = _make_kept_text_persister(
+                assessment_persist_active, item_seq, _spawn_item_persist,
+            )
 
             return await _run_native_phone_screening(
                 session=session,

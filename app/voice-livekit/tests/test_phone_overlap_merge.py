@@ -286,6 +286,55 @@ class TestClassifyCutLine(unittest.TestCase):
             self._kind(authored, "Right, that is what I expected. Walk me"),
             agent_mod.CUT_QUESTION_REACHED)
 
+    def test_an_exclamation_is_a_reaction_not_the_question(self):
+        # Round-2 review: "What a ..." / "How <adjective>." are bridges.
+        for authored, played_bridge, played_reached in (
+            ("What a great mix of experience. Tell me about your recent role.",
+             "What a great mix",
+             "What a great mix of experience. Tell me"),
+            ("Wow, what a journey. Which tools do you use day to day?",
+             "Wow, what a",
+             "Wow, what a journey. Which tools"),
+            ("How interesting. Could you tell me about your recent role?",
+             "How interesting.",
+             "How interesting. Could you"),
+            ("Oh, how nice! What drew you to sales?",
+             "Oh, how nice!",
+             "Oh, how nice! What drew"),
+        ):
+            with self.subTest(authored=authored):
+                self.assertEqual(self._kind(authored, played_bridge), agent_mod.CUT_BRIDGE_ONLY)
+                self.assertEqual(self._kind(authored, played_reached), agent_mod.CUT_QUESTION_REACHED)
+
+    def test_a_real_how_question_is_still_a_question(self):
+        for authored, played in (
+            ("Thanks. How did you get into recruiting?", "Thanks. How did"),
+            ("Thanks. How long have you worked there?", "Thanks. How long"),
+            ("Thanks, and how many people were on the team?", "Thanks, and how many"),
+        ):
+            with self.subTest(authored=authored):
+                self.assertEqual(self._kind(authored, played), agent_mod.CUT_QUESTION_REACHED)
+
+    def test_a_topic_announcement_is_the_start_of_the_question(self):
+        # Round-2 review: "Now, about <topic>." is answerable, not a bridge.
+        authored = "Thanks. Now, about your recent role. What did you work on there?"
+        self.assertEqual(self._kind(authored, "Thanks. Now,"), agent_mod.CUT_BRIDGE_ONLY)
+        self.assertEqual(
+            self._kind(authored, "Thanks. Now, about your"), agent_mod.CUT_QUESTION_REACHED)
+        for lead in ("Coming to your notice period.", "Regarding your notice period.",
+                     "Moving to your notice period."):
+            line = f"Okay. {lead} How soon could you join?"
+            self.assertEqual(self._kind(line, "Okay. " + lead), agent_mod.CUT_QUESTION_REACHED)
+            self.assertEqual(self._kind(line, "Okay."), agent_mod.CUT_BRIDGE_ONLY)
+
+    def test_the_word_about_inside_a_reaction_is_not_a_topic(self):
+        authored = "Thanks for sharing about it. Tell me about your recent role."
+        self.assertEqual(
+            self._kind(authored, "Thanks for sharing about it."), agent_mod.CUT_BRIDGE_ONLY)
+        self.assertEqual(
+            self._kind(authored, "Thanks for sharing about it. Tell me"),
+            agent_mod.CUT_QUESTION_REACHED)
+
     def test_no_first_audio_means_nothing_played(self):
         self.assertEqual(
             agent_mod._classify_cut_line(
@@ -564,6 +613,42 @@ class TestContinuationAfterACutBridge(_Rig):
         self.assertEqual(self.agent._interrupted_reask_counts.get("intro", 0), 0)
         self.assertEqual(self.categories("phone_turn_drop"), [])
 
+    async def test_at_the_cap_an_overlapping_continuation_is_not_credited_to_the_unheard_question(self):
+        # Round-2 review (2 reviewers): once the continuation cap is spent, a
+        # SUBSTANTIVE continuation that began before the cut line must be kept
+        # and the owed question asked again, never committed against a
+        # question the candidate has not heard (which would skip it).
+        await self.answer_first_question()
+        self.reply_created()
+        for n, text in enumerate((
+            "I also did a short course on accounting software at college",
+            "and I handled vendor payment files for the finance team there",
+        ), start=1):
+            self.cut_line(
+                first_audio=True, played=BRIDGE_PLAYED, authored=BRIDGE_AUTHORED,
+                anchor_ms=T0 + 6000 + n * 4000, advance=False,
+            )
+            await self.turn(text, T0 + 5500 + n * 4000)
+            self.reply_created()
+        self.cut_line(
+            first_audio=True, played=BRIDGE_PLAYED, authored=BRIDGE_AUTHORED,
+            anchor_ms=T0 + 20000, advance=False,
+        )
+        text = "and I also reconciled the monthly bank statements for three branches"
+        ctx = await self.turn(text, T0 + 19500)  # began BEFORE the cut line
+        rendered = _rendered(ctx)
+        cats = self.categories("phone_turn_overlap")
+        self.assertIn("continuation_capped", cats)
+        self.assertIn("overlap_reask", cats)
+        self.assertIn(agent_mod.PHONE_OVERLAP_REASK_INSTRUCTION, rendered)
+        self.assertIn(self.q[1].spoken_text, rendered)
+        self.assertNotIn(
+            "answer_present_advancing", self.categories("phone_interrupted_recovery"))
+        await asyncio.sleep(0.8)
+        self.assertEqual(self.client.committed_keys, ["intro"])
+        for boundary in self.client.boundaries:
+            self.assertNotIn(text, str(boundary["turns"]))
+
     async def test_a_cut_that_was_not_the_advance_reply_keeps_todays_reask(self):
         # No stamp match (a re-ask / clarification line was cut): there is no
         # previous answer to continue, so the existing branch re-asks once.
@@ -660,6 +745,38 @@ class TestCutLineClassifiedByWhatTheCandidateHeard(_Rig):
         await self.committed(2)
         self.assertEqual(self.client.committed_keys, ["intro", "role"])
 
+    async def test_a_continuation_over_an_exclamation_bridge_is_not_credited(self):
+        await self.answer_first_question()
+        self.reply_created()
+        self.cut_line(
+            first_audio=True, played="What a great mix",
+            authored="What a great mix of experience. Tell me about your recent role.",
+            anchor_ms=T0 + 6000, advance=False,
+        )
+        # A barge-in AFTER the line started (not an overlap) that goes on with
+        # the previous answer.
+        ctx = await self.turn(
+            "and I also maintained the vendor ledger every single month there",
+            T0 + 8000)
+        self.assertIn(agent_mod.PHONE_CONTINUATION_ASK_INSTRUCTION, _rendered(ctx))
+        await asyncio.sleep(0.8)
+        self.assertEqual(self.client.committed_keys, ["intro"])
+
+    async def test_an_answer_to_a_heard_now_about_topic_is_credited(self):
+        await self.answer_first_question()
+        self.cut_line(
+            first_audio=True, played="Thanks. Now, about your recent role.",
+            authored=("Thanks. Now, about your recent role. "
+                      "What did you work on there?"),
+            anchor_ms=T0 + 6000,
+        )
+        ctx = await self.turn(
+            "In my recent role I handled billing reconciliation for a retail "
+            "chain every month.", T0 + 8000)
+        self.assertNotIn(agent_mod.PHONE_CONTINUATION_ASK_INSTRUCTION, _rendered(ctx))
+        await self.committed(2)
+        self.assertEqual(self.client.committed_keys, ["intro", "role"])
+
     async def test_a_continuation_after_an_interjection_with_a_question_mark_is_not_credited(self):
         await self.answer_first_question()
         self.reply_created()
@@ -707,6 +824,88 @@ class TestCommitStillInFlightWhenTheOverlapArrives(_Rig):
         self.assertEqual(self.agent._continuation_counts, {"role": 1})
         await self.committed(1)
         self.assertEqual(self.client.committed_keys, ["intro"])
+
+
+class TestOwedAskKeepsKnownCompensationSlots(_Rig):
+    """Round-2 nit: the owed-question ask must not request a compensation slot
+    the candidate already gave (same guard as the normal advance)."""
+
+    QUESTIONS = staticmethod(lambda: [
+        _questions()[0],
+        {"key": "comp", "text": "What are your current and expected CTC?",
+         "mandatory": False, "hint": None},
+    ])
+
+    async def test_the_continuation_ask_names_only_the_missing_slot(self):
+        await self.answer_first_question()
+        self.cut_line(
+            first_audio=True, played=BRIDGE_PLAYED, authored=BRIDGE_AUTHORED,
+            anchor_ms=T0 + 6000,
+        )
+        ctx = await self.turn(
+            "My current CTC is 12 LPA and I also did vendor payments", T0 + 5500)
+        rendered = _rendered(ctx)
+        self.assertIn(agent_mod.PHONE_CONTINUATION_ASK_INSTRUCTION, rendered)
+        self.assertIn("Ask naturally only for the missing slot(s): expected", rendered)
+        self.assertIn("Do not ask for a known slot again", rendered)
+
+    async def test_the_overlap_reask_names_only_the_missing_slot(self):
+        await self.answer_first_question()
+        self.cut_line(
+            first_audio=True, played=QUESTION_PLAYED,
+            authored="That's a nice mix, thank you. Tell me about your current CTC?",
+            anchor_ms=T0 + 6000,
+        )
+        ctx = await self.turn(
+            "My current CTC is 12 LPA and I also did vendor payments", T0 + 5200)
+        rendered = _rendered(ctx)
+        self.assertIn(agent_mod.PHONE_OVERLAP_REASK_INSTRUCTION, rendered)
+        self.assertIn("only for the missing slot(s): expected", rendered)
+
+    async def test_no_note_when_nothing_was_given(self):
+        await self.answer_first_question()
+        self.cut_line(
+            first_audio=True, played=BRIDGE_PLAYED, authored=BRIDGE_AUTHORED,
+            anchor_ms=T0 + 6000,
+        )
+        ctx = await self.turn("I also did vendor payments for the finance team", T0 + 5500)
+        self.assertNotIn("missing slot", _rendered(ctx))
+
+
+class TestKeptTextPersister(unittest.TestCase):
+    """Round-2 nit: the real closure was never executed by any test."""
+
+    def _make(self, active=True, start=4):
+        calls: list[tuple] = []
+        flag, seq = [active], [start]
+        persist = agent_mod._make_kept_text_persister(
+            flag, seq, lambda *args: calls.append(args))
+        return persist, flag, seq, calls
+
+    def test_writes_a_candidate_row_with_a_fresh_sequence(self):
+        persist, _, seq, calls = self._make()
+        persist("kept words", 123)
+        persist("more words", None)
+        self.assertEqual(calls, [
+            ("candidate", "kept words", 123, 5),
+            ("candidate", "more words", None, 6),
+        ])
+        self.assertEqual(seq, [6])
+
+    def test_writes_nothing_outside_the_assessment_phase_or_for_empty_text(self):
+        persist, flag, seq, calls = self._make(active=False)
+        persist("kept words", 1)
+        flag[0] = True
+        persist("", 1)
+        self.assertEqual(calls, [])
+        self.assertEqual(seq, [4])
+
+    def test_run_phone_session_wires_the_factory_to_the_real_item_writer(self):
+        source = " ".join(inspect.getsource(agent_mod._run_phone_session).split())
+        self.assertIn(
+            "_make_kept_text_persister( assessment_persist_active, item_seq, _spawn_item_persist, )",
+            source)
+        self.assertIn("persist_candidate_text=_persist_kept_candidate_text", source)
 
 
 class TestWindDownAfterOverlap(_Rig):
@@ -1091,6 +1290,88 @@ class TestSilenceNeverSpeaksOverTheCandidate(unittest.IsolatedAsyncioTestCase):
             with patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock):
                 await asyncio.wait_for(hooks["task"], timeout=10)
             hooks["log_patch"].stop()
+
+    async def test_a_later_long_answer_is_not_mistaken_for_a_stuck_latch(self):
+        # Round-2 review: the suppression timer of one speech episode must not
+        # survive into the next, or the next long answer is declared "stuck"
+        # on its first check and the bot speaks over the candidate.
+        speaking = {"value": True}
+        with patch.multiple(agent_mod, **dict(self.FAST)), \
+                patch.object(agent_mod, "PHONE_SILENCE_SPEAKING_MAX_SUPPRESS_SEC", 0.5):
+            agent, session, _, _, hooks = await self._rig(speaking)
+            hooks["agent_listening"].set()
+            await asyncio.sleep(0.2)  # monologue 1: the guard suppresses
+            kinds = [k.get("error_category") for k in self._silence(hooks)]
+            self.assertIn("suppressed_candidate_speaking", kinds)
+            # The candidate stops, the bot replies (the loop parks), and a
+            # long time passes with the guard never run while they are quiet.
+            hooks["agent_listening"].clear()
+            await asyncio.sleep(0.15)  # the loop parks (still "speaking")
+            speaking.update(value=False, ended_mono=agent_mod._monotonic())
+            await asyncio.sleep(0.8)  # longer than the stale bound
+            # Monologue 2: a NEW episode (the end-of-speech stamp differs from
+            # the one the old timer started on).
+            speaking.update(value=True)
+            hooks["agent_listening"].set()
+            await asyncio.sleep(0.3)  # inside the new episode's bound
+            self.assertEqual(self._said(session), [])
+            kinds = [k.get("error_category") for k in self._silence(hooks)]
+            self.assertNotIn("speaking_latch_stale", kinds)
+            self.assertNotIn("prompt_timeout", kinds)
+            hooks["close_event"].set()
+            with patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock):
+                await asyncio.wait_for(hooks["task"], timeout=10)
+            hooks["log_patch"].stop()
+
+    async def test_the_qna_close_waits_for_a_candidate_who_starts_talking_after_the_nudge(self):
+        # Round-2 review: the close guard itself (not the nudge guard) must
+        # hold the call open when the candidate begins a long question in the
+        # window after the nudge.
+        speaking = {"value": False, "ended_mono": agent_mod._monotonic() - 100}
+        client = fixtures._QnaEventClient()
+        state = fixtures._default_state(questions=[
+            {"key": "k1", "text": "First question?", "mandatory": True, "hint": None},
+        ])
+        windows = (
+            ("CANDIDATE_SILENCE_PROMPT_SEC", 0.25),
+            ("CANDIDATE_SILENCE_END_SEC", 0.25),
+            ("CANDIDATE_SILENCE_SECOND_NUDGE_SEC", 0.25),
+        )
+        with patch.multiple(agent_mod, **dict(windows)):
+            agent, session, state, client, hooks = await self._rig(
+                speaking, client=client, state=state)
+            agent._pending.update({
+                "question": state.question_at(0), "prompt": "First question?",
+                "candidate": "A substantive answer.", "message": None,
+                "turn_ctx": types.SimpleNamespace(items=[]), "probe_used": False,
+                "source_event_id": phone.plan_source_event_id("k1"),
+            })
+            await agent._on_advance()
+            hooks["agent_listening"].set()
+            kinds = []
+            for _ in range(200):
+                await asyncio.sleep(0.01)
+                kinds = [k.get("error_category") for k in self._silence(hooks)]
+                if "qna_silence_nudge" in kinds or "qna_silence_close" in kinds:
+                    break
+            self.assertIn("qna_silence_nudge", kinds)
+            self.assertNotIn("qna_silence_close", kinds)
+            speaking.update(value=True)  # a long question begins, no final yet
+            await asyncio.sleep(0.8)  # several windows
+            self.assertFalse(hooks["task"].done())
+            phases = {
+                k.get("phase") for k in self._silence(hooks)
+                if k.get("error_category") == "suppressed_candidate_speaking"
+            }
+            self.assertIn("qna_silence_close", phases)
+            kinds = [k.get("error_category") for k in self._silence(hooks)]
+            self.assertNotIn("qna_silence_close", kinds)
+            speaking.update(value=False, ended_mono=agent_mod._monotonic() - 10)
+            with patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock):
+                await asyncio.wait_for(hooks["task"], timeout=10)
+            hooks["log_patch"].stop()
+            kinds = [k.get("error_category") for k in self._silence(hooks)]
+            self.assertIn("qna_silence_close", kinds)
 
     async def test_the_second_nudge_and_the_goodbye_wait_for_a_talking_candidate(self):
         # The likely live case: the prompt plays, the candidate starts a long
