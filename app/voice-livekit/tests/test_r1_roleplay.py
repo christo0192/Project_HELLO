@@ -2738,6 +2738,22 @@ class PitchNeverEarnsACommitmentTests(unittest.TestCase):
         plan = session.say("Can we schedule a call tomorrow at 7 pm?", r - 20)
         self.assertEqual(plan.commitment_level, Level.MEDIUM)
 
+    def test_a_pitch_before_the_close_window_is_not_answered_with_a_stall_reason(self):
+        """R1-Q round 2 (review 3): at R=220 the mentor-session reassurance was answered with the
+        N-MONEY stall, as if the advisor had asked for a commitment."""
+        from tests.test_r1_negotiation import CALL_PITCHES, EMAIL_PITCHES
+
+        for text in CALL_PITCHES + EMAIL_PITCHES:
+            with self.subTest(text=text):
+                s = Session(engine(seed="early-pitch"))
+                s.say(OPENER, 20)
+                plan = s.say(text, 220)
+                self.assertNotIn("ask_before_close_window", plan.reasons)
+                self.assertFalse(any(r.startswith("stall_reason") for r in plan.reasons), plan.reasons)
+                self.assertNotIn("email_offer", plan.reasons)
+                self.assertIsNone(plan.negotiation_id)
+                self.assertEqual(s.eng.admin_log()["commitment"]["asks"], [])
+
     def test_real_proposals_in_the_close_window_still_earn_the_graded_line(self):
         from tests.test_r1_negotiation import CALL_PROPOSALS
 

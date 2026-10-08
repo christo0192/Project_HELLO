@@ -648,7 +648,8 @@ _EMAIL_OFFER = _compile(
 # you the link to the live class on Monday".  ("details of the program" is information.)
 _CLASS_OBJECT = re.compile(
     r"\b(?:link|links|schedule|timetable|details|notes|materials?|recordings?|invites?|"
-    r"invitations?|reminders?)\s+(?:to|for|of|about)\s+(?:the |your |our |every |each |all )?"
+    r"invitations?|reminders?)\s+(?:to|for|of|about)\s+(?:(?:join|attend|access|watch|view|open|"
+    r"enter)\s+)?(?:the |your |our |every |each |all )?"
     r"(?:live |recorded |weekly |online |upcoming |first )?(?:class|classes|session|sessions|"
     r"lecture|lectures|webinars?|workshops?|zoom|meeting|demo|orientation|induction)\b",
     re.IGNORECASE,

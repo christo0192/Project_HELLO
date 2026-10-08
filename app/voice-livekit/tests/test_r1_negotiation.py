@@ -110,6 +110,9 @@ EMAIL_PITCHES = (
     "We can send you the notes for each class after you enroll.",
     "We will send you the schedule of the live classes on the first day of the program.",
     "I'll send you the link to the orientation session once you join.",
+    "I'll email you a link to join the live session.",
+    "We'll send you the zoom link before the class.",
+    "We will email you the reminders for the weekly session.",
 )
 
 

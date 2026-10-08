@@ -157,6 +157,8 @@ PROGRAMME_TIMED = re.compile(
     r"seventh|eighth|last|final|\d+(?:st|nd|rd|th)) (?:day|week|month|module|phase|semester|"
     r"term|class|session|quarter)s?\b"
     r"|\b(?:at|by) the (?:start|beginning|end) of (?:the|each|every|your|our)\b"
+    r"|\b(?:before|after|during) (?:the |each |every |your |our )(?:live |weekly |first )?(?:class|"
+    r"classes|session|sessions|lecture|lectures|webinar|workshop|orientation)\b"
     r"|\bas part of (?:the|your|our)\b|\bincluded (?:in|with)\b"
     r"|\bpart of (?:the|your|our) (?:program|programme|course|package|plan|fee)\b",
     re.IGNORECASE,
