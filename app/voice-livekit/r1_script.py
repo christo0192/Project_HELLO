@@ -94,6 +94,15 @@ LINES: dict[str, str] = {
     "L-FILLER-LEARNER": "Hmm, one second...",
 }
 
+# The learner's thinking filler rotates through three variants so a slow model never makes the
+# learner say the same words twice in a row.  The first is ``L-FILLER-LEARNER``; the rotation
+# starts at a point derived from the attempt id (``r1_text.pick_variant``).
+LEARNER_FILLER_VARIANTS: tuple[str, ...] = (
+    LINES["L-FILLER-LEARNER"],
+    "Hmm, let me think for a second...",
+    "Hmm, give me a moment...",
+)
+
 # The exit line's first sentence is the cue the LLM must never imitate (``r1_guard``).
 EXIT_CUE = "Let's pause the role-play here."
 _NAME = re.compile(r"^[A-Za-z '-]{1,24}$")
@@ -139,7 +148,7 @@ def line(line_id: str, **values: Any) -> str:
 
 
 def filler_line(voice: str) -> str:
-    """The thinking filler for the interviewer or the learner voice."""
+    """The thinking filler for the interviewer or the learner voice (the first variant)."""
     return LINES["L-FILLER-LEARNER" if voice == "learner" else "L-FILLER-INTERVIEWER"]
 
 

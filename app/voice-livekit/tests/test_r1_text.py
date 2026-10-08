@@ -10,6 +10,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from r1_text import (
+    SpokenMemory,
     canonical_amounts,
     dollar_amounts,
     fold,
@@ -20,6 +21,8 @@ from r1_text import (
     mask_contact,
     negated_before,
     normalize,
+    pick_variant,
+    repeat_kind,
     split_sentences,
     truncate_words,
     word_count,
@@ -66,6 +69,24 @@ class SentenceTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(is_question_like(text))
 
+    def test_speech_to_text_openers_of_the_owner_test_are_questions(self):
+        """Turn 34 of b58c7d9c: "Like I wanted to know like why ..." was read as a pitch."""
+        for text in (
+            "Like I wanted to know like why are you looking at our programs",
+            "like what is the friction or blocker that you have in your career",
+            "I wanted to know what you do in your career",
+            "I wanted to ask how your week looks",
+            "I am trying to understand how we can help you fix that gap",
+            "I'm trying to understand what is stopping you",
+            "Trying to understand what brought you here",
+            "Um, I am trying to understand what you are looking for",
+            "Uh, like, I wanted to know why you signed up",
+            "So tell me what is going on at work",
+            "Hmm, what brings you here",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_question_like(text))
+
     def test_statements_are_not_questions(self):
         for text in (
             "Interview Kickstart was founded in 2014.",
@@ -73,6 +94,10 @@ class SentenceTests(unittest.TestCase):
             "That's a good question.",
             "Our career-transition support is strong",
             "",
+            "Like I said, we help you fix that gap.",
+            "I am trying to get you enrolled today.",
+            "Um, we offer live classes and recordings.",
+            "I wanted the best price for you.",
         ):
             with self.subTest(text=text):
                 self.assertFalse(is_question_like(text))
@@ -92,6 +117,99 @@ class FuzzyTests(unittest.TestCase):
 
     def test_order_matters(self):
         self.assertFalse(fuzzy_contains("recorded classes live or it is", self.LINE))
+
+
+class SpokenMemoryTests(unittest.TestCase):
+    STALL = "Let me think about it. Just email me the details and I'll get back to you."
+
+    def test_it_remembers_sentences_long_enough_to_be_repeated(self):
+        memory = SpokenMemory()
+        self.assertEqual(memory.add(self.STALL), 2)
+        self.assertEqual(len(memory), 2)
+        self.assertEqual(memory.add("Okay. Mm-hmm. That makes sense."), 0)
+        self.assertEqual(len(memory), 2)
+
+    def test_it_keeps_a_normalised_form_and_ignores_duplicates(self):
+        memory = SpokenMemory()
+        memory.add("I've tried a bit of online stuff before.")
+        memory.add("I’ve TRIED a bit of online stuff before!")
+        self.assertEqual(memory.snapshot(), ("ive tried a bit of online stuff before",))
+
+    def test_a_snapshot_is_immutable_and_does_not_follow_later_additions(self):
+        memory = SpokenMemory()
+        before = memory.snapshot()
+        memory.add(self.STALL)
+        self.assertEqual(before, ())
+        self.assertIsInstance(memory.snapshot(), tuple)
+
+    def test_empty_and_odd_input_is_harmless(self):
+        memory = SpokenMemory()
+        for text in ("", None, "   ", "...", 42):
+            memory.add(text)
+        self.assertEqual(len(memory), 0)
+
+
+class RepeatKindTests(unittest.TestCase):
+    SAID = SpokenMemory()
+    SAID.add("Just exploring options. I've tried a bit of online stuff before.")
+    SAID.add("Let me think about it. Just email me the details and I'll get back to you.")
+    SNAP = SAID.snapshot()
+
+    def test_an_exact_repeat_needs_four_words(self):
+        self.assertEqual(repeat_kind("I've tried a bit of online stuff before!", self.SNAP), "exact")
+        self.assertEqual(repeat_kind("Let me think about it.", self.SNAP), "exact")
+        self.assertIsNone(repeat_kind("Just exploring options.", self.SNAP))  # 3 words
+
+    def test_a_sentence_inside_an_earlier_one_is_a_near_repeat(self):
+        self.assertEqual(repeat_kind("Just email me the details.", self.SNAP), "near")
+
+    def test_a_sentence_containing_an_earlier_one_is_a_near_repeat(self):
+        said = SpokenMemory()
+        said.add("I quit a free Python course.")
+        self.assertEqual(
+            repeat_kind("Honestly I quit a free Python course last year.", said.snapshot()), "near"
+        )
+
+    def test_four_content_words_are_needed_for_a_near_repeat(self):
+        said = SpokenMemory()
+        said.add("Fine, that is a good point.")
+        # Only three content words (that, good, point): too little to call it a repeat.
+        self.assertIsNone(repeat_kind("That is a good point.", said.snapshot()))
+        self.assertIsNone(repeat_kind("Good point.", said.snapshot()))
+        self.assertEqual(repeat_kind("Fine, that is a good point.", said.snapshot()), "exact")
+
+    def test_order_matters_and_one_missing_word_in_four_is_not_a_repeat(self):
+        said = SpokenMemory()
+        said.add("I quit a free Python course.")
+        self.assertIsNone(repeat_kind("Course free Python quit.", said.snapshot()))
+        self.assertIsNone(repeat_kind("I quit a paid Python course.", said.snapshot()))
+
+    def test_nothing_said_means_no_repeat(self):
+        self.assertIsNone(repeat_kind("I've tried a bit of online stuff before.", ()))
+        self.assertIsNone(repeat_kind("", self.SNAP))
+
+
+class PickVariantTests(unittest.TestCase):
+    VARIANTS = ("a", "b", "c")
+
+    def test_no_seed_starts_at_the_first_variant_and_walks_the_rotation(self):
+        self.assertEqual([pick_variant(self.VARIANTS, "", n) for n in range(4)], list("abca"))
+
+    def test_the_start_is_deterministic_per_seed_and_varies_across_seeds(self):
+        self.assertEqual(
+            pick_variant(self.VARIANTS, "attempt-1", 0), pick_variant(self.VARIANTS, "attempt-1", 0)
+        )
+        starts = {pick_variant(self.VARIANTS, f"attempt-{n}", 0) for n in range(40)}
+        self.assertEqual(starts, set(self.VARIANTS))
+
+    def test_a_full_rotation_uses_every_variant_once(self):
+        for seed in ("x", "attempt-9", "b58c7d9c"):
+            used = [pick_variant(self.VARIANTS, seed, n) for n in range(3)]
+            self.assertEqual(sorted(used), list("abc"))
+
+    def test_no_variants_and_negative_counts_are_safe(self):
+        self.assertEqual(pick_variant((), "x", 3), "")
+        self.assertEqual(pick_variant(self.VARIANTS, "", -5), "a")
 
 
 class ContactTests(unittest.TestCase):

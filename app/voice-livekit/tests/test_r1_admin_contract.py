@@ -424,6 +424,22 @@ class TestGuardHitKinds(unittest.TestCase):
         self.assertEqual([row["payload"]["kind"] for row in rows], ["control"])
         self.assertNotIn("guard_hits", gate_like_api(parse_like_api(rows)))
 
+    def test_repeat_hygiene_trips_are_not_posted_either(self):
+        """R1-Q: a dropped repeated sentence is hygiene; it must never become a ``guard_hit``."""
+        rows = self.rows("repeat", "repeat", "repeat", "repeat", "control")
+        self.assertEqual([row["payload"]["kind"] for row in rows], ["control"])
+        self.assertNotIn("guard_hits", gate_like_api(parse_like_api(rows)))
+        mixed = self.rows("ack_format", "repeat", "control", "repeat", "ack_format")
+        self.assertEqual([row["payload"]["kind"] for row in mixed], ["control"])
+
+    def test_every_hygiene_category_is_filtered_and_no_leak_category_is(self):
+        from r1_guard import CATEGORIES, HYGIENE_CATEGORIES
+
+        for category in CATEGORIES:
+            posted = self.rows(category)
+            with self.subTest(category=category):
+                self.assertEqual(not posted, category in HYGIENE_CATEGORIES)
+
     def test_three_real_leaks_still_trip_the_hit_budget(self):
         rows = self.rows("control", "persona_secret", "invented_fact")
         self.assertIn("guard_hits", gate_like_api(parse_like_api(rows)))

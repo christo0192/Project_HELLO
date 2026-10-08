@@ -22,7 +22,6 @@ from dataclasses import dataclass
 
 from r1_script import line as script_line
 from r1_text import fold, is_question_like, split_sentences
-from r1_world import LEARNER_DEFLECTION
 
 PERSONA_VERSION = 1
 STATE_NAMES = {
@@ -97,6 +96,10 @@ class Persona:
     prior_learning: str
     variants: tuple[Variant, ...]
     version: int = PERSONA_VERSION
+    # Public, marker-free facts the learner may use for small talk and "tell me about
+    # yourself" questions, so it has true things to say instead of recycling one profile
+    # line.  Nothing here may match a deep-need marker (``tests/test_r1_personas.py``).
+    backstory: tuple[str, ...] = ()
 
     def need(self, topic: str) -> Need:
         for item in self.needs:
@@ -158,6 +161,16 @@ PERSONAS: tuple[Persona, ...] = (
         ),
         decision_maker="husband",
         prior_learning="Just a bit of online stuff.",
+        backstory=(
+            "Your day job is reviewing batch records and chasing deviation paperwork at a "
+            "pharma site.",
+            "You like your team, but the work has become repetitive.",
+            "You already build big Excel trackers and reports, and you enjoy that part.",
+            "You saw the Interview Kickstart webinar announcement on LinkedIn and "
+            "registered.",
+            "You are careful with money and like to compare before you pay for anything.",
+            "You are calling from home after work, a bit tired but friendly.",
+        ),
         variants=(
             Variant("v1", "Meera", "Iyer", "Edison, NJ", "pharma operations and quality"),
             Variant(
@@ -209,6 +222,15 @@ PERSONAS: tuple[Persona, ...] = (
         ),
         decision_maker="father",
         prior_learning="Mostly self-study.",
+        backstory=(
+            "Day to day you build weekly dashboards and clean up spreadsheets with SQL and "
+            "Excel.",
+            "You apply to data science roles every week and tailor each application.",
+            "You went to an Interview Kickstart webinar a few weeks ago and found it "
+            "interesting.",
+            "You watch free data science videos online in your spare time.",
+            "You share an apartment with two roommates.",
+        ),
         variants=(
             Variant("v1", "Ananya", "Rao", "Austin, TX", "reporting"),
             Variant("v2", "Neha", "Singh", "Dallas, TX", "business intelligence"),
@@ -269,6 +291,14 @@ PERSONAS: tuple[Persona, ...] = (
         ),
         decision_maker="husband",
         prior_learning="SQL, Excel, Tableau and some Python at work.",
+        backstory=(
+            "You build Tableau dashboards and write SQL reports for business teams.",
+            "You use Python for small automation scripts, nothing fancy.",
+            "Your manager is friendly and your team is easygoing.",
+            "You registered for an Interview Kickstart webinar after a colleague mentioned "
+            "it.",
+            "You like to understand the details before you decide anything.",
+        ),
         variants=(
             Variant("v1", "Kavya", "Menon", "Charlotte, NC", "a bank"),
             Variant("v2", "Sneha", "Pillai", "Raleigh, NC", "an insurance company"),
@@ -323,6 +353,15 @@ PERSONAS: tuple[Persona, ...] = (
         ),
         decision_maker="partner",
         prior_learning="Python, R and statistics from my research.",
+        backstory=(
+            "You analyse large experimental datasets with Python and R, and you enjoy the "
+            "statistics.",
+            "You have published a few papers and you help supervise two master's students.",
+            "You went to an Interview Kickstart webinar a couple of weeks ago, out of "
+            "curiosity.",
+            "You are curious how data science teams actually work in industry.",
+            "You are thoughtful and tend to ask careful questions.",
+        ),
         variants=(
             Variant("v1", "Shalini", "Verma", "Boston, MA", "computational biology"),
             Variant("v2", "Anjali", "Joshi", "Cambridge, MA", "bioinformatics"),
@@ -421,14 +460,24 @@ class RenderedPersona:
             "You filled in a form on the Interview Kickstart website a few days ago about "
             "the Data Science course. You know only that it is around $9,000 and about "
             "6 months.",
-            "Short answers, to give only when asked and never to expand on:",
         ]
+        if self.persona.backstory:
+            parts.append(
+                "Your backstory (all true; use it in your own words for small talk or when "
+                "the advisor asks about you, and never recite it):"
+            )
+            parts.extend(f"- {fact}" for fact in self.persona.backstory)
+        parts.append("Short answers, to give only when asked and never to expand on:")
         for topic in H_TOPICS:
             parts.append(f'- {TOPIC_LABELS[topic]}: "{self.surface(topic)}"')
         parts.append(f'- what you have studied so far: "{self.persona.prior_learning}"')
         for label, answer in PUBLIC_ANSWERS:
             parts.append(f'- {label}: "{answer}"')
-        parts.append(f'Anything else not listed here: "{LEARNER_DEFLECTION}"')
+        parts.append(
+            "Anything else about yourself that is not listed here: answer in a few vague, "
+            "believable words and invent no numbers, names or dates. Anything else about "
+            "the course: you do not know it, so ask the advisor."
+        )
         return "\n".join(parts)
 
 

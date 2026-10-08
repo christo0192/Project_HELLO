@@ -7,7 +7,9 @@ can load it.
 """
 from __future__ import annotations
 
+import hashlib
 import re
+from typing import Iterable, Sequence
 
 _FOLD = str.maketrans(
     {
@@ -52,9 +54,11 @@ def split_sentences(text: object) -> list[str]:
     return [part.strip() for part in parts if part and part.strip()]
 
 
+# "like", "um", "uh" and "hmm" are speech fillers that speech-to-text keeps ("Like I wanted to
+# know like why ...", "Um, I am trying to understand ..."), so they may open a question.
 _DISCOURSE = (
     r"(?:(?:and|so|but|also|okay|ok|right|well|now|then|great|thanks|thank you|got it|"
-    r"i see|sure|cool|alright|perfect|nice|good)\b[,.\s]*)*"
+    r"i see|sure|cool|alright|perfect|nice|good|like|um+|uh+|er+m?|hmm+)\b[,.\s]*)*"
 )
 _QUESTION_START = re.compile(
     r"^" + _DISCOURSE + r"(?:what|why|how|when|where|who|whom|which|whose|is|are|was|were|"
@@ -64,6 +68,8 @@ _QUESTION_START = re.compile(
     r"i was (?:wondering|curious)|i wonder|curious (?:about|whether|if)|any (?:concerns?|"
     r"thoughts|questions)|anything (?:that|else)|"
     r"i (?:want|need) to (?:know|understand|hear|learn|find out)|let me (?:ask|understand)|"
+    r"i wanted to (?:know|ask|understand|hear|learn|find out)|"
+    r"(?:i'?m |i am )?trying to (?:understand|figure out|find out)|"
     r"i'?m (?:interested|keen) in (?:hearing|knowing|understanding)|"
     r"what i'?d like to (?:know|understand))\b",
 )
@@ -93,12 +99,10 @@ def _tokens(text: object) -> list[str]:
     return [word for word in normalize(text).split() if len(word) > 2]
 
 
-def fuzzy_ratio(actual: object, expected: object) -> float:
-    """Fraction of ``expected``'s content words found in order inside ``actual``."""
-    wanted = _tokens(expected)
+def _ordered_share(haystack: Sequence[str], wanted: Sequence[str]) -> float:
+    """Fraction of ``wanted`` found, in order, inside ``haystack`` (both already tokenised)."""
     if not wanted:
         return 0.0
-    haystack = normalize(actual).split()
     position = 0
     matched = 0
     for word in wanted:
@@ -110,9 +114,112 @@ def fuzzy_ratio(actual: object, expected: object) -> float:
     return matched / len(wanted)
 
 
+def fuzzy_ratio(actual: object, expected: object) -> float:
+    """Fraction of ``expected``'s content words found in order inside ``actual``."""
+    return _ordered_share(normalize(actual).split(), _tokens(expected))
+
+
 def fuzzy_contains(actual: object, expected: object, threshold: float = 0.78) -> bool:
     """Conservative ordered-token check used to confirm that a scripted line was spoken."""
     return fuzzy_ratio(actual, expected) >= threshold
+
+
+# ----------------------------------------------------------------------------------
+# Repetition: has this person already said (nearly) this sentence?
+# ----------------------------------------------------------------------------------
+REPEAT_MIN_WORDS = 4
+REPEAT_MIN_CONTENT_WORDS = 4
+REPEAT_RATIO = 0.8
+REPEAT_EXACT = "exact"
+REPEAT_NEAR = "near"
+
+
+def _repeat_sized(norm: str) -> tuple[bool, bool]:
+    """(long enough for an exact-repeat check, enough content words for a near-repeat check)."""
+    words = norm.split()
+    content = [word for word in words if len(word) > 2]
+    return len(words) >= REPEAT_MIN_WORDS, len(content) >= REPEAT_MIN_CONTENT_WORDS
+
+
+class SpokenMemory:
+    """The normalised sentences a speaker has actually played so far.
+
+    It keeps no timing and no speaker text beyond the normalised form, and only sentences
+    long enough to be repeated in the sense of ``repeat_kind``: a short back-channel
+    ("Mm-hmm.", "Okay.") is never a repeat, so it is not worth remembering.
+    """
+
+    def __init__(self) -> None:
+        self._sentences: dict[str, None] = {}
+
+    def add(self, text: object) -> int:
+        """Remember every sentence of ``text`` that can be repeated; returns how many."""
+        added = 0
+        for sentence in split_sentences(text):
+            norm = normalize(sentence)
+            if not norm or norm in self._sentences:
+                continue
+            if any(_repeat_sized(norm)):
+                self._sentences[norm] = None
+                added += 1
+        return added
+
+    def snapshot(self) -> tuple[str, ...]:
+        """An immutable copy for a guard context (the plan is made before the speech)."""
+        return tuple(self._sentences)
+
+    def __len__(self) -> int:
+        return len(self._sentences)
+
+
+def repeat_kind(sentence: object, said: Iterable[str]) -> str | None:
+    """``"exact"`` or ``"near"`` when ``sentence`` repeats one of ``said``, else ``None``.
+
+    ``said`` holds normalised sentences (``SpokenMemory.snapshot``).  Exact: the same
+    normalised sentence of at least ``REPEAT_MIN_WORDS`` words.  Near: at least
+    ``REPEAT_MIN_CONTENT_WORDS`` content words, and one sentence contains the other's
+    content words in order (``REPEAT_RATIO``), so "Just email me the details." inside
+    "Just email me the details and I'll get back to you." is a repeat.  Pure and
+    deterministic; one-word and two-word back-channels never count.
+    """
+    norm = normalize(sentence)
+    if not norm:
+        return None
+    long_enough, content_enough = _repeat_sized(norm)
+    if not (long_enough or content_enough):
+        return None
+    prior_sentences = [prior for prior in said if prior]
+    if long_enough and norm in prior_sentences:
+        return REPEAT_EXACT
+    if content_enough:
+        words = norm.split()
+        content = [word for word in words if len(word) > 2]
+        for prior in prior_sentences:
+            prior_words = prior.split()
+            if _ordered_share(prior_words, content) >= REPEAT_RATIO:
+                return REPEAT_NEAR  # this sentence sits inside an earlier one
+            prior_content = [word for word in prior_words if len(word) > 2]
+            if (
+                len(prior_content) >= REPEAT_MIN_CONTENT_WORDS
+                and _ordered_share(words, prior_content) >= REPEAT_RATIO
+            ):
+                return REPEAT_NEAR  # an earlier sentence sits inside this one
+    return None
+
+
+def pick_variant(variants: Sequence[str], seed: str, count: int) -> str:
+    """The ``count``-th variant of a rotation whose starting point is derived from ``seed``.
+
+    Deterministic: the same attempt id always starts at the same variant, and successive
+    uses walk the rotation, so a line is not repeated until all variants were used.  An
+    empty ``seed`` starts at the first variant.
+    """
+    if not variants:
+        return ""
+    start = 0
+    if seed:
+        start = int.from_bytes(hashlib.sha256(seed.encode("utf-8")).digest()[:4], "big")
+    return variants[(start + max(0, count)) % len(variants)]
 
 
 _NUMBER_WORD = r"zero|one|two|three|four|five|six|seven|eight|nine|oh"

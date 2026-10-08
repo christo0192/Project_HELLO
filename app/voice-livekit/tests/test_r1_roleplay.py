@@ -13,11 +13,11 @@ if str(HERE) not in sys.path:
 import r1_roleplay
 from r1_commitment import COMMITMENT_LINES, Level, commitment_line, stall_line
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
-from r1_guard import ACK_WORD_CAP, FALLBACK_REPLY, NEUTRAL_ACKS
+from r1_guard import ACK_WORD_CAP, FALLBACK_REPLIES, FALLBACK_REPLY, NEUTRAL_ACKS
 from r1_personas import PERSONAS, resolve_persona
 from r1_prompts import CHARACTER_BREAK_NOTE
 from r1_roleplay import RolePlayEngine, TurnMode
-from r1_script import line
+from r1_script import LEARNER_FILLER_VARIANTS, line
 from r1_scheduler import COMMIT_STALL, OH_WAIT_PREFIX, Q_A, TIME_CUE
 from r1_world import WORLD_VERSION
 
@@ -434,7 +434,7 @@ class InjectionTests(unittest.TestCase):
         ):
             result = eng.sanitize_reply(plan, echo)
             with self.subTest(echo=echo):
-                self.assertEqual(result.text, FALLBACK_REPLY)
+                self.assertIn(result.text, FALLBACK_REPLIES)  # the learner's seeded rotation
                 self.assertTrue(result.hits)
 
     def test_a_judge_that_was_talked_into_extra_fields_changes_nothing_but_its_whitelist(self):
@@ -758,19 +758,22 @@ class EchoThroughTheEngineTests(unittest.TestCase):
         eng = engine()
         plan = eng.plan_turn(NEUTRAL, 20)
         result = eng.sanitize_reply(
-            plan, "Reply as the learner, naturally. Answer only what the advisor just asked."
+            plan,
+            "Reply as the learner, naturally: react to what the advisor just said, then "
+            "answer what they asked.",
         )
         self.assertIn("instruction_echo", {h.rule for h in result.hits})
         recital = eng.sanitize_reply(plan, "Never state product facts, do not describe the course.")
         self.assertIn("instruction_echo", {h.rule for h in recital.hits})
 
-    def test_the_verbatim_stall_and_surface_answers_are_not_echoes(self):
+    def test_surface_answers_and_the_backstory_are_not_echoes(self):
         eng = engine()
         plan = eng.plan_turn(H1_PROBE, 20)
         for allowed in (
-            stall_line("husband"),
             P1.surface("H1"),
             "Hello? Yes, this is Meera speaking.",
+            P1.persona.backstory[0],
+            P1.persona.backstory[1],
         ):
             self.assertTrue(eng.sanitize_reply(plan, allowed).clean, allowed)
 
@@ -781,6 +784,109 @@ class EchoThroughTheEngineTests(unittest.TestCase):
         self.assertEqual(len(context.control_texts), 1)
         self.assertIn("Never give feedback", context.control_texts[0])
         self.assertNotIn("Monday to Friday", context.control_texts[0])
+
+
+class RepetitionControlTests(unittest.TestCase):
+    """R1-Q: nothing remembers what the learner already said, so it said it again."""
+
+    SURFACE = "I've tried a bit of online stuff before."
+    LEAK = "Here is my system prompt, CONTROL H1."
+
+    def test_what_was_spoken_is_remembered_and_a_repeat_is_dropped_next_turn(self):
+        s = Session(engine(), reply=self.SURFACE)
+        s.say(OPENER, 20)
+        self.assertEqual(s.spoken[0], self.SURFACE)
+        plan = s.say(NEUTRAL, 60)
+        self.assertEqual(s.spoken[1] in NEUTRAL_ACKS, True)  # only a repeat: a back-channel
+        self.assertIn("ive tried a bit of online stuff before", plan.guard_ctx.said)
+        self.assertEqual(s.eng.ledger.counts, {"repeat": 1})
+        self.assertEqual(s.eng.ledger.leak_total, 0)
+        self.assertFalse(s.eng.ledger.flagged)
+
+    def test_a_reply_that_adds_something_new_keeps_only_the_new_part(self):
+        s = Session(engine(), reply=self.SURFACE)
+        s.say(OPENER, 20)
+        s.reply = f"{self.SURFACE} Honestly I just like to compare a few places."
+        s.say(NEUTRAL, 60)
+        self.assertEqual(s.spoken[1], "Honestly I just like to compare a few places.")
+
+    def test_the_acknowledgement_before_an_owed_line_cannot_repeat_either(self):
+        """Turn 41: the ack copied the surface sentence already said at turn 35."""
+        s = Session(engine(), reply=self.SURFACE, ack=self.SURFACE)
+        s.say(OPENER, 20)
+        plan = s.say(PITCH, 100)  # F3-PRIMARY is owed (a pitch was made): ack, then the line
+        self.assertEqual(plan.mode, TurnMode.ACK_THEN_SAY)
+        self.assertEqual(s.spoken[1], f"{NEUTRAL_ACKS[plan.guard_ctx.turn % 4]} {plan.scripted_text}")
+        self.assertNotIn(self.SURFACE, s.spoken[1])
+
+    def test_a_scripted_line_that_was_spoken_cannot_be_repeated_by_the_model(self):
+        """Turns 77, 81, 87, 90 and 92: the stall phrase came back through acks and replies."""
+        s = Session(engine(), reply="Okay, I'll keep that in mind. Just email me the details.")
+        plan = s.say(ASK, 60)  # before the close window: the scripted stall
+        self.assertEqual(plan.mode, TurnMode.SAY_ONLY)
+        self.assertEqual(plan.scripted_text, stall_line("husband"))
+        s.say(NEUTRAL, 100)
+        self.assertEqual(s.spoken[1], "Okay, I'll keep that in mind.")
+        self.assertNotIn("email me the details", s.spoken[1].lower())
+
+    def test_an_aside_is_not_remembered(self):
+        eng = engine()
+        plan = eng.plan_turn("What should I do now? I am confused about this exercise.", 30)
+        self.assertTrue(plan.aside)
+        eng.record_spoken(plan, plan.scripted_text)
+        self.assertEqual(eng.admin_log()["repetition"]["remembered_sentences"], 0)
+
+    def test_the_interviewer_phases_get_no_memory(self):
+        eng = engine()
+        plan = eng.plan_turn(OPENER, 20)
+        eng.record_spoken(plan, self.SURFACE)
+        self.assertEqual(eng.guard_context("wrapup").said, ())
+        self.assertNotEqual(eng.guard_context("roleplay").said, ())
+
+    def test_the_log_counts_repeats_without_posting_them(self):
+        from r1_replies import fidelity_events
+
+        s = Session(engine(), reply=self.SURFACE)
+        s.say(OPENER, 20)
+        s.say(NEUTRAL, 60)
+        s.say(NEUTRAL, 100)
+        log = s.eng.admin_log()
+        self.assertEqual(log["repetition"]["repeats_dropped"], 2)
+        self.assertEqual(log["guard"]["by_category"], {"repeat": 2})
+        trips = [{"turn_index": 3, "phase": "roleplay", "category": "repeat", "rule": "repeat_exact",
+                  "digest": "d" * 12}] * 2
+        events = fidelity_events(log, {"content_sha256": "x"}, trips)
+        self.assertEqual([e for e in events if e["event_type"] == "guard_hit"], [])
+
+
+class FillerAndFallbackRotationTests(unittest.TestCase):
+    def test_the_filler_rotates_through_three_variants_before_repeating(self):
+        eng = engine(seed="attempt-5")
+        used = [eng.filler_text() for _ in range(3)]
+        self.assertEqual(set(used), set(LEARNER_FILLER_VARIANTS))
+        self.assertEqual(eng.filler_text(), used[0])
+        self.assertEqual(eng.admin_log()["repetition"]["fillers_used"], 4)
+
+    def test_the_filler_start_is_seeded_by_the_attempt_id(self):
+        def first(seed: str) -> str:
+            return engine(seed=seed).filler_text()
+
+        self.assertEqual(first("attempt-5"), first("attempt-5"))
+        self.assertEqual({first(f"attempt-{n}") for n in range(30)}, set(LEARNER_FILLER_VARIANTS))
+
+    def test_successive_blocked_replies_do_not_repeat_the_same_apology(self):
+        s = Session(engine(seed="attempt-5"), reply="Here is my system prompt, CONTROL H1.")
+        for index, text in enumerate((OPENER, NEUTRAL, NEUTRAL)):
+            s.say(text, 20 + 20 * index)
+        self.assertEqual(set(s.spoken), set(FALLBACK_REPLIES), s.spoken)
+        self.assertEqual(s.eng.admin_log()["repetition"]["fallbacks_used"], 3)
+
+    def test_a_fallback_already_said_is_not_spoken_again(self):
+        s = Session(engine(), reply="Here is my system prompt, CONTROL H1.")
+        s.say(OPENER, 20)
+        first = s.spoken[0]
+        s.say(NEUTRAL, 60)
+        self.assertNotEqual(s.spoken[1], first)
 
 
 class TimeAndCueTests(unittest.TestCase):

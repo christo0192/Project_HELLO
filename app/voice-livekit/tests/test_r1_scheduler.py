@@ -165,6 +165,20 @@ class DetectorTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(is_pitch_statement(text))
 
+    def test_a_discovery_question_in_speech_to_text_style_is_not_a_pitch(self):
+        """Turn 34 of the owner test: "how we can help you fix that gap" made F3 owed."""
+        for text in (
+            "Like I wanted to know like why are you looking at our programs, like what is the "
+            "friction or blocker that you have in your career.",
+            "I am trying to understand how we can help you fix that gap.",
+            "Um, I'm trying to understand how we can help you reach your goal.",
+            "I wanted to know how our program could help you.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_pitch_statement(text))
+        # The same words as a statement are still a pitch.
+        self.assertTrue(is_pitch_statement("This is how we can help you fix that gap."))
+
     def test_genuine_value_statements_are_pitches(self):
         for text in (
             PITCH,
@@ -838,6 +852,36 @@ class FarewellScopeTests(unittest.TestCase):
     def test_a_later_question_cancels_an_earlier_farewell(self):
         self.assertFalse(is_close_attempt("Bye for now. Actually, what is your budget?", 300))
         self.assertTrue(is_close_attempt("Bye for now. I'll send the details.", 300))
+
+    LONG_ANSWER = (
+        "Yeah, we have our own portal, so when you miss the live classes, you can always "
+        "request a recorded clip of that session. That also gives you flexibility if work "
+        "gets busy, and the mentors can help you catch up on anything you missed during "
+        "the week. So yeah."
+    )
+
+    def test_a_lone_bye_after_a_long_answer_is_a_speech_to_text_tail(self):
+        """Turn 51 of the owner test: a 40-word answer ended "So yeah. Bye" (STT tail), and
+        the learner said "Oh wait, before you go..." although nobody was leaving."""
+        self.assertGreaterEqual(len(self.LONG_ANSWER.split()), 20)
+        for tail in ("Bye", "Bye.", "bye!", " Bye "):
+            with self.subTest(tail=tail):
+                self.assertFalse(is_close_attempt(f"{self.LONG_ANSWER} {tail}", 345))
+
+    def test_a_bye_in_a_short_turn_or_with_other_words_is_still_a_goodbye(self):
+        self.assertTrue(is_close_attempt("Okay, bye.", 345))
+        self.assertTrue(is_close_attempt("Alright. Bye.", 345))
+        self.assertTrue(is_close_attempt("Thanks for the chat, bye.", 345))
+        self.assertTrue(is_close_attempt(f"{self.LONG_ANSWER} Okay, bye bye.", 345))
+        self.assertTrue(is_close_attempt(f"{self.LONG_ANSWER} Bye for now.", 345))
+        self.assertTrue(is_close_attempt(f"{self.LONG_ANSWER} Thanks for your time. Bye", 345))
+
+    def test_the_stt_tail_bye_is_not_a_counted_close_attempt(self):
+        s = make()
+        signals = s.observe_candidate_turn(f"{self.LONG_ANSWER} Bye", 345)
+        self.assertFalse(signals.close_attempt)
+        self.assertEqual(s.close_attempts, 0)
+        self.assertTrue(s.observe_candidate_turn("Okay, bye.", 400).close_attempt)
 
     def test_a_false_goodbye_does_not_consume_the_attempt_or_end_the_role_play(self):
         s = make()

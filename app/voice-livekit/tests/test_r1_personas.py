@@ -230,7 +230,12 @@ class PublicCardTests(unittest.TestCase):
                 self.assertIn(need.surface, card)
             self.assertIn("around $9,000", card)
             self.assertIn("6 months", card)
-            self.assertIn("I'm not sure, I haven't thought about that.", card)
+            # No stock deflection line (R1-Q): unknown course questions are asked back,
+            # unknown personal ones answered vaguely.
+            self.assertNotIn("I'm not sure, I haven't thought about that.", card)
+            self.assertNotIn("Anything else not listed here", card)
+            self.assertIn("you do not know it, so ask the advisor", card)
+            self.assertIn("invent no numbers, names or dates", card)
             self.assertIn("You can use the email on my form.", card)
             self.assertIn("A data role within a year.", card)
             self.assertIn("Within a couple of weeks.", card)
@@ -238,6 +243,45 @@ class PublicCardTests(unittest.TestCase):
             for other in PERSONAS:
                 if other.id != persona.id:
                     self.assertNotIn(other.variants[0].full_name, card)
+
+    def test_every_persona_has_a_public_backstory_on_the_card(self):
+        for persona in PERSONAS:
+            self.assertGreaterEqual(len(persona.backstory), 4, persona.id)
+            self.assertEqual(len(set(persona.backstory)), len(persona.backstory))
+            for variant in persona.variants:
+                card = resolve_persona(persona.id, variant=variant.id).public_card_text()
+                self.assertIn("Your backstory (all true", card)
+                for fact in persona.backstory:
+                    self.assertIn(fact, card)
+                # The backstory sits before the "short answers" so it reads as colour,
+                # not as an answer to recite.
+                self.assertLess(card.index(persona.backstory[0]), card.index("Short answers"))
+
+    def test_a_backstory_never_states_a_deep_need_or_matches_a_marker(self):
+        """It is public text: markers must not match it, and the deep text is not in it."""
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                for fact in persona.backstory:
+                    with self.subTest(persona=persona.id, fact=fact):
+                        self.assertEqual(deep_need_topics_in(rendered, fact), frozenset())
+                        for need in persona.needs:
+                            self.assertNotIn(need.deep.lower(), fact.lower())
+                            self.assertNotIn(need.surface.lower(), fact.lower())
+
+    def test_the_meera_backstory_uses_a_pharma_site_not_a_plant(self):
+        """"plant" is the H1 marker (plant consolidation); the public job is a pharma site."""
+        backstory = " ".join(PERSONAS[0].backstory).lower()
+        self.assertIn("batch records", backstory)
+        self.assertIn("pharma site", backstory)
+        self.assertNotRegex(backstory, r"\bplant\b")
+
+    def test_backstories_are_short_plain_sentences_without_numbers_that_invite_amounts(self):
+        for persona in PERSONAS:
+            for fact in persona.backstory:
+                self.assertLessEqual(len(fact.split()), 22, fact)
+                self.assertNotIn("$", fact)
+                self.assertTrue(fact.endswith("."), fact)
 
     def test_decision_timeline_and_switch_timeline_are_separate_facts(self):
         answers = dict(PUBLIC_ANSWERS)

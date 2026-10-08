@@ -25,6 +25,12 @@ engine only DECIDES, deterministically, what the learner does on each candidate 
 ``EXIT``
     The candidate said goodbye again: the session moves to ROLEPLAY_EXIT.
 
+Repetition control (R1-Q): ``record_spoken`` feeds every sentence the learner actually
+played into a ``SpokenMemory``; each plan's guard context carries a snapshot (``said``), so
+the output guard drops a sentence the learner already said (a ``repeat`` hit: hygiene, never
+posted).  The thinking filler and the guard fallback are 3-variant rotations seeded by the
+attempt id (``filler_text``, ``GuardContext.variant``).
+
 Nothing here can change a phase, a grade or the schedule from candidate or model text
 beyond the deterministic rules: the LLM has no tools, the judge's JSON is whitelisted,
 and farewell/ask detection is lexical.  The engine never stores candidate text; its logs
@@ -70,6 +76,7 @@ from r1_commitment import (
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
 from r1_guard import (
     ACK_WORD_CAP,
+    REPEAT,
     GuardContext,
     GuardLedger,
     GuardResult,
@@ -86,8 +93,9 @@ from r1_prompts import (
     turn_reminder,
 )
 from r1_scheduler import COMMIT_STALL, F1_COUNTER, TIME_CUE, OwedMoveScheduler
+from r1_script import LEARNER_FILLER_VARIANTS
 from r1_script import line as script_line
-from r1_text import dollar_amounts, fuzzy_contains, word_count
+from r1_text import SpokenMemory, dollar_amounts, fuzzy_contains, pick_variant, word_count
 from r1_tracker import (
     CoverageTracker,
     build_judge_messages,
@@ -188,6 +196,11 @@ class RolePlayEngine:
         self._learner_control = control_prose(learner_prefix(persona))
         self._interviewer_control = control_prose(interviewer_prefix())
         self.exit_requested = False
+        # Repetition control: every learner sentence actually played, so the guard can drop
+        # a sentence the learner already said; and how often a rotating line was used.
+        self._spoken = SpokenMemory()
+        self._fallbacks = 0
+        self._fillers = 0
 
     # ------------------------------------------------------------------- properties
     @property
@@ -229,7 +242,16 @@ class RolePlayEngine:
             turn=self.turn if turn is None else turn,
             control_texts=control,
             keep_excerpts=self.keep_excerpts,
+            said=self._spoken.snapshot() if phase == "roleplay" else (),
+            seed=self.seed,
+            variant=self._fallbacks,
         )
+
+    def filler_text(self) -> str:
+        """The learner's thinking filler: a 3-variant rotation seeded by the attempt id."""
+        text = pick_variant(LEARNER_FILLER_VARIANTS, self.seed, self._fillers)
+        self._fillers += 1
+        return text
 
     # ------------------------------------------------------------------ the decision
     def plan_turn(
@@ -460,7 +482,7 @@ class RolePlayEngine:
         result: GuardResult | None = None
         if ack_raw.strip():
             result = guard_text(ack_raw, plan.guard_ctx)
-            self.ledger.record(result)
+            self.record_guard(result)
             ack = result.text
         text = f"{ack} {plan.scripted_text}".strip()
         return Speech(text, ack, plan.scripted_text, result, plan.voice)
@@ -472,11 +494,13 @@ class RolePlayEngine:
     def sanitize_reply(self, plan: TurnPlan, raw: str) -> GuardResult:
         """Guard a whole LLM reply at once and count its hits."""
         result = guard_text(raw, plan.guard_ctx)
-        self.ledger.record(result)
+        self.record_guard(result)
         return result
 
     def record_guard(self, result: GuardResult) -> None:
         self.ledger.record(result)
+        if result.fallback_used:
+            self._fallbacks += 1  # the next fallback starts at the next variant
 
     def record_spoken(
         self,
@@ -490,6 +514,7 @@ class RolePlayEngine:
         if plan.aside:
             return  # the interviewer's aside is scripted and excluded from evidence
         when = self.last_r if r_sec is None else r_sec
+        self._spoken.add(spoken_text)
         self.tracker.note_learner_text(spoken_text, plan.turn)
         if plan.move_id is not None:
             self.scheduler.confirm_if_spoken(
@@ -605,6 +630,12 @@ class RolePlayEngine:
                 "resolved": self.commitment_resolved,
             },
             "guard": self.ledger.summary(),
+            "repetition": {
+                "remembered_sentences": len(self._spoken),
+                "repeats_dropped": self.ledger.counts.get(REPEAT, 0),
+                "fallbacks_used": self._fallbacks,
+                "fillers_used": self._fillers,
+            },
             "early_close": {
                 "attempts": self.scheduler.close_attempts,
                 "exit_requested": self.exit_requested,

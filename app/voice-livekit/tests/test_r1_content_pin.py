@@ -9,6 +9,7 @@ alongside, the session integration).
 from __future__ import annotations
 
 import ast
+import dataclasses
 import json
 import sys
 import unittest
@@ -28,7 +29,9 @@ import r1_script
 import r1_world
 
 # Revision 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
-PINNED_CONTENT_SHA256 = "f2f72df832367fc7345c9991cf5bf6c75f16ec9d92ef1bc1e8013fb51193219f"
+# Revision 3 (R1-Q): no verbatim deflection, public backstory, speaking-style prefix, no
+# "answer exactly" stall rule in the reminder, filler and fallback rotations.
+PINNED_CONTENT_SHA256 = "e9e0df89dc4705f5ac8e90a10b087d63f85e47ae24f213e27f74525074614f2a"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -123,6 +126,52 @@ class PinTests(unittest.TestCase):
         )
         self.assertEqual(set(manifest["commitment"]["lines"]), {"STRONG", "MEDIUM", "WEAK"})
         self.assertIn("interviewer_prefix", manifest["prompts"])
+
+    def test_the_manifest_covers_the_r1_q_learner_voice_texts(self):
+        manifest = r1_content.manifest()
+        self.assertEqual(manifest["revision"], 3)
+        self.assertEqual(manifest["learner_policy"], r1_world.LEARNER_POLICY)
+        self.assertEqual(
+            manifest["script"]["learner_filler_variants"], list(r1_script.LEARNER_FILLER_VARIANTS)
+        )
+        self.assertEqual(manifest["guard"]["fallback_replies"], list(r1_guard.FALLBACK_REPLIES))
+        for persona in r1_personas.PERSONAS:
+            self.assertEqual(
+                manifest["personas"][persona.id]["backstory"], list(persona.backstory)
+            )
+            self.assertTrue(manifest["personas"][persona.id]["backstory"])
+        self.assertNotIn("haven't thought about that", json.dumps(manifest))
+
+    def test_editing_the_backstory_a_filler_or_the_policy_changes_the_sha(self):
+        base = r1_content.content_sha256()
+        original_personas = r1_personas.PERSONAS
+        try:
+            first = original_personas[0]
+            r1_personas.PERSONAS = (
+                dataclasses.replace(first, backstory=first.backstory + ("Extra.",)),
+            ) + original_personas[1:]
+            self.assertNotEqual(r1_content.content_sha256(), base)
+        finally:
+            r1_personas.PERSONAS = original_personas
+        original_policy = r1_world.LEARNER_POLICY
+        original_fillers = r1_script.LEARNER_FILLER_VARIANTS
+        original_replies = r1_guard.FALLBACK_REPLIES
+        try:
+            r1_world.LEARNER_POLICY = original_policy + " "
+            self.assertNotEqual(r1_content.content_sha256(), base)
+        finally:
+            r1_world.LEARNER_POLICY = original_policy
+        try:
+            r1_script.LEARNER_FILLER_VARIANTS = original_fillers[:-1] + ("Hmm.",)
+            self.assertNotEqual(r1_content.content_sha256(), base)
+        finally:
+            r1_script.LEARNER_FILLER_VARIANTS = original_fillers
+        try:
+            r1_guard.FALLBACK_REPLIES = original_replies[:-1] + ("Pardon?",)
+            self.assertNotEqual(r1_content.content_sha256(), base)
+        finally:
+            r1_guard.FALLBACK_REPLIES = original_replies
+        self.assertEqual(r1_content.content_sha256(), base)
 
     def test_changing_any_pinned_text_changes_the_sha(self):
         base = r1_content.content_sha256()

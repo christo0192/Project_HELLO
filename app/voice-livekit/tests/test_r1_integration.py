@@ -29,7 +29,7 @@ import r1_llm
 import r1_session
 from r1_commitment import Level, commitment_line, stall_line
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
-from r1_guard import FALLBACK_REPLY, NO_FEEDBACK_LINE
+from r1_guard import FALLBACK_REPLIES, FALLBACK_REPLY, NO_FEEDBACK_LINE
 from r1_persistence import R1TurnWriter
 from r1_personas import PERSONA_IDS, PERSONAS, resolve_persona
 from r1_phases import R1Phase, R1PhaseMachine
@@ -514,11 +514,15 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
                         line("L-TRANSITION", first_name="Asha", **rendered.line_values), blob
                     )
                     self.assertNotIn("I sold courses for six years.", blob)
-                    # Only the WEAK stall is ever pre-stated; never a graded close line.
+                    # No commitment line is ever pre-stated, not even the WEAK stall: the
+                    # learner must react in its own words (R1-Q), and the notes say so.
                     dm = rendered.decision_maker
                     self.assertNotIn(commitment_line(Level.STRONG, dm), blob)
                     self.assertNotIn(commitment_line(Level.MEDIUM, dm), blob)
-                    self.assertIn(stall_line(dm), blob)
+                    self.assertNotIn(stall_line(dm), blob)
+                    self.assertNotIn("answer exactly", blob)
+                    self.assertNotIn("say exactly", blob)
+                    self.assertIn("Never agree to a call, a day, a time", blob)
 
     async def test_the_live_model_call_carries_exactly_that_context(self) -> None:
         rig = Rig()
@@ -892,7 +896,12 @@ class TestOutputGuardInEveryPhase(unittest.IsolatedAsyncioTestCase):
                 reply = self.reply_for(rig, phase)
                 with capture_r1_logs() as lines:
                     spoken = await self.run_reply(rig, reply, self.LEAK)
-                self.assertEqual(spoken, FALLBACK_REPLY)  # a safe line, never a silent drop
+                # A safe line, never a silent drop.  The learner's fallback is a seeded
+                # 3-variant rotation; the interviewer's is one line.
+                if phase == "roleplay":
+                    self.assertIn(spoken, FALLBACK_REPLIES)
+                else:
+                    self.assertEqual(spoken, FALLBACK_REPLY)
                 self.assertNotIn("language model", spoken)
                 self.assertIn("r1_guard_control", error_types(lines))
                 trip = lines[error_types(lines).index("r1_guard_control")]

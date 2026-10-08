@@ -1735,8 +1735,9 @@ class R1Interview:
     def _filler_text(self) -> str:
         """Return the thinking filler for the current voice (learner in role-play)."""
         in_roleplay = self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE)
-        line_id = "L-FILLER-LEARNER" if in_roleplay else "L-FILLER-INTERVIEWER"
-        return self.render_line(line_id) + " "
+        if in_roleplay:
+            return self.engine.filler_text() + " "  # a 3-variant rotation seeded by the attempt
+        return self.render_line("L-FILLER-INTERVIEWER") + " "
 
     async def guard_llm_stream(self, stream: Any) -> AsyncIterator[Any]:
         """Own one reply's deadlines: a 4 s filler and a 12 s wall clock (plan section 5.11).

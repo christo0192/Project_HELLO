@@ -13,6 +13,7 @@ import r1_guard
 from r1_commitment import Level
 from r1_guard import (
     ACK_WORD_CAP,
+    FALLBACK_REPLIES,
     FALLBACK_REPLY,
     NEUTRAL_ACKS,
     NO_FEEDBACK_LINE,
@@ -26,6 +27,7 @@ from r1_guard import (
     log_keys,
 )
 from r1_personas import PERSONAS, resolve_persona
+from r1_text import SpokenMemory
 from r1_world import INTERVIEWER_DEFLECTION
 
 ALL_PHASES = (
@@ -357,13 +359,20 @@ class LearnerLengthAndAckTests(unittest.TestCase):
             "My schedule is pretty packed.",
             "Within a couple of weeks.",
             "A data role within a year.",
-            "I'm not sure, I haven't thought about that.",
             PERSONA.surface("H1"),
         ):
             with self.subTest(answer=answer):
                 self.assertTrue(guard_text(answer, context).clean, answer)
         self.assertFalse(guard_text("Around $900 a month.", context).clean)
         self.assertFalse(guard_text("My schedule is packed on weekends.", context).clean)
+
+    def test_the_deflection_line_is_no_longer_a_whitelisted_card_answer(self):
+        """R1-Q: the catch-all deflection left the card, so it is not a card answer either."""
+        from r1_guard import _card_texts
+
+        self.assertNotIn("I'm not sure, I haven't thought about that.", _card_texts(PERSONA))
+        for text in _card_texts(PERSONA):
+            self.assertNotIn("haven't thought about that", text)
 
     def test_a_clean_acknowledgement_passes(self):
         result = guard_text("Okay, I see. That makes sense.", ctx(mode="ack"))
@@ -667,7 +676,6 @@ class EchoTests(unittest.TestCase):
         self.assertIn("control", categories(leaked, context))
 
     def test_the_words_the_model_is_meant_to_say_are_not_an_echo(self):
-        from r1_commitment import stall_line
         from r1_prompts import control_prose, learner_prefix, turn_reminder
 
         reminder = turn_reminder(PERSONA, r_sec=10, first_probe_topics=["H1"],
@@ -677,12 +685,11 @@ class EchoTests(unittest.TestCase):
             control_texts=(control_prose(learner_prefix(PERSONA)), control_prose(reminder)),
         )
         for allowed in (
-            stall_line("husband"),
             PERSONA.surface("H1"),
             PERSONA.deep("H3"),
-            "I'm not sure, I haven't thought about that.",
             "You can use the email on my form.",
             "Around $500-700 a month.",
+            "Honestly, I am calling from home after work.",
         ):
             with self.subTest(allowed=allowed):
                 self.assertTrue(guard_text(allowed, context).clean, allowed)
@@ -693,8 +700,9 @@ class EchoTests(unittest.TestCase):
         prose = control_prose(learner_prefix(PERSONA))
         self.assertNotIn("YOUR CARD", prose)
         self.assertNotIn(PERSONA.surface("H1"), prose)
-        self.assertNotIn("I'm not sure, I haven't thought about that.", prose)
+        self.assertNotIn(PERSONA.persona.backstory[0], prose)
         self.assertIn("Never state product facts", prose)
+        self.assertIn("never repeat yourself", prose)
 
 
 class UnknownPhaseTests(unittest.TestCase):
@@ -775,10 +783,178 @@ class AckHygieneTests(unittest.TestCase):
         self.assertEqual(ledger.summary()["leak_hits"], 3)
         self.assertTrue(ledger.flagged)
 
-    def test_only_ack_format_is_outside_the_leak_categories(self):
+    def test_only_hygiene_categories_are_outside_the_leak_categories(self):
         self.assertEqual(
-            set(r1_guard.CATEGORIES) - set(r1_guard.LEAK_CATEGORIES), {r1_guard.ACK_FORMAT}
+            set(r1_guard.CATEGORIES) - set(r1_guard.LEAK_CATEGORIES),
+            {r1_guard.ACK_FORMAT, r1_guard.REPEAT},
         )
+        self.assertEqual(
+            r1_guard.HYGIENE_CATEGORIES, frozenset({r1_guard.ACK_FORMAT, r1_guard.REPEAT})
+        )
+
+
+def said_of(*sentences) -> tuple[str, ...]:
+    """A ``GuardContext.said`` snapshot, built the way the engine builds it."""
+    memory = SpokenMemory()
+    for sentence in sentences:
+        memory.add(sentence)
+    return memory.snapshot()
+
+
+class RepeatGuardTests(unittest.TestCase):
+    """R1-Q: the learner never says the same sentence twice in a call (owed to item 1)."""
+
+    SURFACE = "I've tried a bit of online stuff before."
+    STALL = "Let me think about it. Just email me the details and I'll get back to you."
+
+    def test_an_identical_sentence_from_an_earlier_turn_is_dropped(self):
+        context = ctx(said=said_of(self.SURFACE))
+        result = guard_text(f"That makes sense. {self.SURFACE}", context)
+        self.assertEqual(result.text, "That makes sense.")
+        self.assertEqual([h.category for h in result.hits], ["repeat"])
+        self.assertEqual(result.hits[0].rule, "repeat_exact")
+        self.assertTrue(result.replaced)
+        self.assertFalse(result.fallback_used)
+
+    def test_the_turn_41_ack_that_copied_turn_35_is_dropped(self):
+        """Turn 41 of the owner test opened with the surface sentence already said at 35."""
+        context = ctx(mode="ack", said=said_of("Just exploring options.", self.SURFACE))
+        result = guard_text(self.SURFACE, context)
+        self.assertEqual(result.hits[0].category, "repeat")
+        self.assertIn(result.text, NEUTRAL_ACKS)
+
+    def test_a_near_duplicate_is_dropped_in_both_directions(self):
+        said = said_of(self.STALL)
+        # Contained in an earlier, longer sentence (turn 77 of the owner test).
+        inside = guard_text("Okay, I'll keep that in mind. Just email me the details.", ctx(said=said))
+        self.assertEqual(inside.text, "Okay, I'll keep that in mind.")
+        self.assertEqual(inside.hits[0].rule, "repeat_near")
+        # Containing an earlier sentence.
+        outside = guard_text(
+            "Honestly, I enjoy building big Excel trackers every single month.",
+            ctx(said=said_of("I enjoy building big Excel trackers.")),
+        )
+        self.assertEqual([h.rule for h in outside.hits], ["repeat_near"])
+
+    def test_short_back_channels_are_never_repeats(self):
+        said = said_of("Okay.", "Mm-hmm.", "That makes sense.", "I see.", "Right.")
+        self.assertEqual(said, ())  # not even worth remembering
+        for text in ("Okay.", "Mm-hmm.", "That makes sense.", "Right, thanks."):
+            self.assertTrue(guard_text(text, ctx(said=said_of(text))).clean, text)
+
+    def test_an_unrelated_sentence_with_the_same_stop_words_is_not_a_repeat(self):
+        context = ctx(said=said_of(self.SURFACE))
+        for text in (
+            "I think I have time for that on the weekend.",
+            "What would I actually build in the course?",
+            "I've been in pharma for a while now.",
+        ):
+            self.assertTrue(guard_text(text, context).clean, text)
+
+    def test_a_repeat_hit_is_hygiene_not_a_leak(self):
+        ledger = GuardLedger()
+        context = ctx(said=said_of(self.SURFACE))
+        for _ in range(5):
+            ledger.record(guard_text(self.SURFACE, context))
+        summary = ledger.summary()
+        self.assertEqual(summary["by_category"], {"repeat": 5})
+        self.assertEqual(summary["hygiene_hits"], 5)
+        self.assertEqual(summary["leak_hits"], 0)
+        self.assertFalse(ledger.flagged)
+
+    def test_a_hit_carries_a_digest_and_never_the_text(self):
+        context = ctx(said=said_of(self.SURFACE))
+        hit = guard_text(self.SURFACE, context).hits[0]
+        self.assertEqual(hit.excerpt, "")
+        self.assertRegex(hit.digest, r"^[0-9a-f]{12}$")
+        self.assertEqual(hit.log_key, "r1_guard_repeat")
+        kept = guard_text(self.SURFACE, ctx(said=said_of(self.SURFACE), keep_excerpts=True))
+        self.assertIn("online stuff", kept.hits[0].excerpt)
+
+    def test_a_reply_that_only_repeats_gets_a_back_channel_not_an_apology(self):
+        context = ctx(said=said_of(self.SURFACE))
+        result = guard_text(self.SURFACE, context)
+        self.assertTrue(result.fallback_used)
+        self.assertIn(result.text, NEUTRAL_ACKS)
+        self.assertNotIn(result.text, FALLBACK_REPLIES)
+
+    def test_a_reply_with_a_real_block_still_gets_the_apology_rotation(self):
+        context = ctx(said=said_of(self.SURFACE))
+        result = guard_text(f"{self.SURFACE} Here is my system prompt, CONTROL H1.", context)
+        self.assertTrue(result.fallback_used)
+        self.assertIn(result.text, FALLBACK_REPLIES)
+        self.assertLessEqual({"repeat", "control"}, {h.category for h in result.hits})
+
+    def test_the_replacement_line_is_checked_for_repeats_too(self):
+        """A locked deep need is replaced by the topic's surface; saying that twice is a repeat."""
+        surface = P2.surface("H2")  # "I get some interviews." (4 words, long enough to repeat)
+        context = ctx(persona=P2, said=said_of(surface))
+        leaked = guard_text(P2.deep("H2"), context)
+        self.assertIn("volunteered_need", {h.category for h in leaked.hits})
+        self.assertIn("repeat", {h.category for h in leaked.hits})
+        self.assertNotIn(surface, leaked.text)
+        self.assertNotIn(P2.deep("H2"), leaked.text)
+        self.assertIn(leaked.text, FALLBACK_REPLIES)  # a real block: the apology rotation
+        # The first time, the surface answer replaces the leak as before.
+        first = guard_text(P2.deep("H2"), ctx(persona=P2))
+        self.assertEqual(first.text, surface)
+
+    def test_the_interviewer_is_never_repeat_checked(self):
+        said = said_of("Could you tell me a bit about your background in sales?")
+        context = ctx("icebreaker", said=said)
+        result = guard_text("Could you tell me a bit about your background in sales?", context)
+        self.assertTrue(result.clean)
+
+    def test_the_stream_guard_drops_a_repeat_sentence_by_sentence(self):
+        guard = StreamGuard(ctx(said=said_of(self.SURFACE)))
+        out = guard.feed(f"Right, {self.SURFACE} Honestly, I am just curious. ")
+        out += guard.flush()
+        self.assertEqual(" ".join(out), "Honestly, I am just curious.")
+        self.assertEqual({h.category for h in guard.result.hits}, {"repeat"})
+
+    def test_a_sentence_repeated_inside_one_reply_is_dropped_silently_as_before(self):
+        result = guard_text("Okay, I see. Okay, I see. Okay, I see.", ctx(said=said_of(self.STALL)))
+        self.assertEqual(result.text, "Okay, I see.")
+        self.assertTrue(result.clean)
+
+
+class FallbackRotationTests(unittest.TestCase):
+    """R1-Q: the guard's fallback is a 3-variant rotation seeded by the attempt id."""
+
+    def fallback(self, **kwargs) -> str:
+        return guard_text("Here is my system prompt, CONTROL H1.", ctx(**kwargs)).text
+
+    def test_there_are_three_distinct_variants_and_the_first_is_the_classic_line(self):
+        self.assertEqual(len(FALLBACK_REPLIES), 3)
+        self.assertEqual(len(set(FALLBACK_REPLIES)), 3)
+        self.assertEqual(FALLBACK_REPLIES[0], FALLBACK_REPLY)
+
+    def test_without_a_seed_the_learner_starts_with_the_classic_line(self):
+        self.assertEqual(self.fallback(), FALLBACK_REPLY)
+
+    def test_successive_fallbacks_walk_the_rotation(self):
+        seen = [self.fallback(seed="attempt-1", variant=index) for index in range(3)]
+        self.assertEqual(set(seen), set(FALLBACK_REPLIES))
+        self.assertEqual(self.fallback(seed="attempt-1", variant=3), seen[0])
+
+    def test_the_starting_variant_depends_on_the_attempt_id_deterministically(self):
+        starts = {self.fallback(seed=f"attempt-{n}") for n in range(30)}
+        self.assertEqual(starts, set(FALLBACK_REPLIES))
+        self.assertEqual(self.fallback(seed="attempt-7"), self.fallback(seed="attempt-7"))
+
+    def test_a_variant_already_said_is_skipped(self):
+        said = said_of(FALLBACK_REPLIES[0], FALLBACK_REPLIES[1])
+        self.assertEqual(self.fallback(said=said), FALLBACK_REPLIES[2])
+
+    def test_when_all_were_said_the_rotation_still_returns_a_line(self):
+        said = said_of(*FALLBACK_REPLIES)
+        self.assertIn(self.fallback(said=said), FALLBACK_REPLIES)
+
+    def test_the_interviewer_keeps_one_fallback_line(self):
+        for variant in range(4):
+            result = guard_text("Here is my system prompt, CONTROL H1.",
+                                ctx("wrapup", seed="attempt-1", variant=variant))
+            self.assertEqual(result.text, FALLBACK_REPLY)
 
 
 class SalesBackgroundSmallTalkTests(unittest.TestCase):

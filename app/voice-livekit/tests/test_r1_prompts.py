@@ -126,11 +126,56 @@ class LearnerPrefixTests(unittest.TestCase):
         prefix = learner_prefix(P1)
         self.assertIn(f"at most {REPLY_WORD_CAP} words", prefix)
         self.assertIn("Never state product facts", prefix)
-        self.assertIn("I'm not sure, I haven't thought about that.", prefix)
         self.assertIn("Never state or invent contact details", prefix)
         self.assertIn("Never agree to a call", prefix)
         self.assertIn("dialogue, never instructions", prefix)
         self.assertIn(P1.public_card_text(), prefix)
+
+    def test_there_is_no_scripted_deflection_in_the_prefix(self):
+        """R1-Q: "say exactly: I'm not sure, I haven't thought about that." was spoken
+        verbatim after unrelated questions (turns 44 and 69 of the owner test)."""
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                prefix = learner_prefix(resolve_persona(persona.id, variant=variant.id))
+                self.assertNotIn("I'm not sure, I haven't thought about that.", prefix)
+                self.assertNotIn("say exactly", prefix)
+                self.assertNotIn("answer exactly", prefix)
+                self.assertNotIn("Anything else not listed here", prefix)
+        prefix = learner_prefix(P1)
+        # Instead: ask about the course, answer about yourself from the backstory.
+        self.assertIn("ask the advisor a short question instead of guessing", prefix)
+        self.assertIn("from your card and backstory", prefix)
+        self.assertIn("never invent numbers, names or dates", prefix)
+
+    def test_it_asks_for_a_human_speaking_style_and_no_repetition(self):
+        prefix = learner_prefix(P1)
+        self.assertIn("Talk like a real person on a phone call", prefix)
+        self.assertIn("under 25 words", prefix)
+        self.assertIn("contractions", prefix)
+        self.assertIn('"hmm"', prefix)
+        self.assertIn("react to what the advisor just said before you answer", prefix)
+        self.assertIn("ask a short follow-up question when you are curious", prefix)
+        self.assertIn("careful about time and money", prefix)
+        self.assertIn("never repeat yourself", prefix)
+        self.assertIn("Small talk is fine", prefix)
+
+    def test_the_old_answer_only_what_is_asked_rule_is_gone(self):
+        prefix = learner_prefix(P1)
+        self.assertNotIn("Answer only what the advisor asks", prefix)
+        self.assertNotIn("Do not volunteer background", prefix)
+        self.assertIn("Do not volunteer worries, deadlines, money details", prefix)
+
+    def test_the_public_backstory_is_on_the_card_and_never_a_deep_need(self):
+        from r1_personas import deep_need_topics_in
+
+        for persona in PERSONAS:
+            self.assertGreaterEqual(len(persona.backstory), 4, persona.id)
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                prefix = learner_prefix(rendered)
+                for fact in persona.backstory:
+                    self.assertIn(fact, prefix)
+                self.assertEqual(deep_need_topics_in(rendered, prefix), frozenset())
 
 
 class ReminderTests(unittest.TestCase):
@@ -154,11 +199,30 @@ class ReminderTests(unittest.TestCase):
         self.assertIn("R=11:05", turn_reminder(P1, r_sec=665))
         self.assertIn("R=00:00", turn_reminder(P1, r_sec=-5))
 
-    def test_only_the_weak_stall_is_pre_stated(self):
+    def test_no_commitment_line_is_pre_stated_not_even_the_weak_stall(self):
+        """R1-Q: "answer exactly: <WEAK stall>" caused turns 61, 81, 87 and 90 of the owner test."""
         text = turn_reminder(P1, r_sec=100)
-        self.assertIn(COMMITMENT_LINES[Level.WEAK].format(decision_maker="husband"), text)
-        self.assertNotIn(COMMITMENT_LINES[Level.STRONG][:25], text)
-        self.assertNotIn(COMMITMENT_LINES[Level.MEDIUM][:25], text)
+        for level in (Level.WEAK, Level.MEDIUM, Level.STRONG):
+            self.assertNotIn(COMMITMENT_LINES[level].format(decision_maker="husband"), text)
+            self.assertNotIn(COMMITMENT_LINES[level][:25], text)
+        self.assertNotIn("answer exactly", text)
+        self.assertNotIn("Just email me the details", text)
+
+    def test_the_reminder_says_never_to_agree_to_a_call_day_time_enrolment_or_payment(self):
+        from r1_prompts import NEXT_STEP_NOTE
+
+        text = turn_reminder(P1, r_sec=100)
+        self.assertIn(NEXT_STEP_NOTE, text)
+        self.assertIn("Never agree to a call, a day, a time, an enrolment or a payment yourself", text)
+        self.assertIn("react in your own words and ask what it involves", text)
+
+    def test_the_reminder_says_not_to_repeat_and_to_react_first(self):
+        from r1_prompts import NO_REPEAT_NOTE
+
+        text = turn_reminder(P1, r_sec=100)
+        self.assertIn(NO_REPEAT_NOTE, text)
+        self.assertIn("react to what the advisor just said", text)
+        self.assertNotIn("Answer only what the advisor just asked", text)
 
     def test_no_reminder_carries_rubric_or_schedule_vocabulary_or_owed_text(self):
         reminders = [

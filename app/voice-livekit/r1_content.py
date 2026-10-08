@@ -29,7 +29,9 @@ import r1_script
 import r1_world
 
 # 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
-CONTENT_REVISION = 2
+# 3: R1-Q learner voice: no verbatim deflection, public backstory, speaking-style prefix,
+#    no "answer exactly" stall rule, 3-variant filler and fallback rotations.
+CONTENT_REVISION = 3
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -40,6 +42,7 @@ def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
         "profile": persona.profile,
         "decision_maker": persona.decision_maker,
         "prior_learning": persona.prior_learning,
+        "backstory": list(persona.backstory),
         "needs": [
             {
                 "topic": need.topic,
@@ -73,7 +76,9 @@ def manifest() -> dict[str, Any]:
             "interviewer_name": r1_script.INTERVIEWER_NAME,
             "exit_cue": r1_script.EXIT_CUE,
             "lines": dict(r1_script.LINES),
+            "learner_filler_variants": list(r1_script.LEARNER_FILLER_VARIANTS),
         },
+        "learner_policy": r1_world.LEARNER_POLICY,
         "state_names": dict(r1_personas.STATE_NAMES),
         "public_answers": [list(item) for item in r1_personas.PUBLIC_ANSWERS],
         "topic_labels": dict(r1_personas.TOPIC_LABELS),
@@ -108,6 +113,7 @@ def manifest() -> dict[str, Any]:
         },
         "guard": {
             "fallback": r1_guard.FALLBACK_REPLY,
+            "fallback_replies": list(r1_guard.FALLBACK_REPLIES),
             "no_feedback": r1_guard.NO_FEEDBACK_LINE,
             "contact": r1_guard.CONTACT_REPLACEMENT,
             "neutral_acks": list(r1_guard.NEUTRAL_ACKS),

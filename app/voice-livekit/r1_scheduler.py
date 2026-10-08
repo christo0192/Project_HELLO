@@ -52,7 +52,14 @@ from r1_commitment import (
     Level,
 )
 from r1_script import LINES
-from r1_text import fold, fuzzy_contains, is_question_like, split_sentences, word_count
+from r1_text import (
+    fold,
+    fuzzy_contains,
+    is_question_like,
+    normalize,
+    split_sentences,
+    word_count,
+)
 
 PLAN_VERSION = 1
 SLIP_LIMIT_SEC = 60.0
@@ -249,6 +256,7 @@ _CLOSE_THANKS = _compile(
 )
 CLOSE_MIN_R_SEC = 60
 CLOSE_THANKS_MIN_R_SEC = 240
+STT_TAIL_MIN_OTHER_WORDS = 20
 
 
 def _sentences(text: object) -> list[str]:
@@ -310,6 +318,21 @@ def _asks_something(sentence: str) -> bool:
     return is_question_like(sentence)
 
 
+def _is_stt_bye_tail(sentences: list[str], index: int, total_words: int) -> bool:
+    """A lone "Bye" as the last sentence of a long turn: a speech-to-text tail, not a goodbye.
+
+    In the owner test (b58c7d9c) a 90-word answer ended "So yeah. Bye" and the learner
+    answered "Oh wait, before you go..." although nobody was leaving.  A one-word "Bye" after
+    at least ``STT_TAIL_MIN_OTHER_WORDS`` other words is dropped; "Okay, bye." in a short
+    turn is still a farewell.
+    """
+    if index != len(sentences) - 1:
+        return False
+    if normalize(sentences[index]) != "bye":
+        return False
+    return total_words - 1 >= STT_TAIL_MIN_OTHER_WORDS
+
+
 def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
     """A farewell or wrap-up phrase.  Never fires on "end the call" style instructions.
 
@@ -317,16 +340,20 @@ def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
     time" only counts from R = 4:00, so a polite opening is never mistaken for goodbye.
     A sentence counts when it ENDS with the farewell (see ``_FAREWELL_TAIL``) and no later
     sentence of the turn asks something, so a turn that goes on to ask ("Take care of your
-    kids first, any questions?") is never a goodbye.
+    kids first, any questions?") is never a goodbye.  A one-word "Bye" at the end of a long
+    turn is a speech-to-text tail and does not count (``_is_stt_bye_tail``).
     """
     if r_sec is not None and r_sec < CLOSE_MIN_R_SEC:
         return False
     thanks_allowed = r_sec is None or r_sec >= CLOSE_THANKS_MIN_R_SEC
     sentences = _sentences(text)
+    total_words = word_count(text)
     for index, sentence in enumerate(sentences):
         if any(_asks_something(later) for later in sentences[index + 1 :]):
             continue
         if any(pattern.search(sentence) for pattern in _CLOSE_FAREWELL):
+            if _is_stt_bye_tail(sentences, index, total_words):
+                continue
             return True
         if thanks_allowed and any(pattern.search(sentence) for pattern in _CLOSE_THANKS):
             return True

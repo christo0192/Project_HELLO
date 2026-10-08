@@ -53,6 +53,12 @@ What it blocks (each category logs as ``r1_guard_<category>``):
     Hygiene, not a leak: an acknowledgement sentence with a question, a digit or a product
     word that is not a card answer or a paraphrase of one.  The sentence is dropped, but
     the hit does not count toward the 3-hit gate (``LEAK_CATEGORIES``).
+``repeat``
+    Hygiene, not a leak: the learner is about to say a sentence it already said earlier in
+    the call (``GuardContext.said``; ``r1_text.repeat_kind``).  The sentence is dropped
+    and nothing is posted: like ``ack_format`` it is outside ``LEAK_CATEGORIES`` and
+    ``r1_replies.fidelity_events`` does not post it, because the API counts EVERY
+    ``guard_hit`` row toward its 3-hit limit.
 
 The ``control`` category also covers an INSTRUCTION ECHO: six consecutive words copied
 from the private prompt prose (``GuardContext.control_texts``; the phone lane's
@@ -90,13 +96,22 @@ from r1_text import (
     mask_contact,
     negated_before,
     normalize,
+    pick_variant,
+    repeat_kind,
     split_sentences,
     truncate_words,
     word_count,
 )
-from r1_world import INTERVIEWER_DEFLECTION, LEARNER_DEFLECTION
+from r1_world import INTERVIEWER_DEFLECTION
 
 FALLBACK_REPLY = "Sorry, what were you saying?"
+# The learner's fallback rotates (seeded by the attempt id) so a second blocked reply never
+# repeats the first one word for word.  The interviewer keeps ``FALLBACK_REPLY``.
+FALLBACK_REPLIES = (
+    FALLBACK_REPLY,
+    "Sorry, could you say that again?",
+    "Sorry, I missed that. Could you repeat it?",
+)
 NO_FEEDBACK_LINE = LINES["L-NO-FEEDBACK"]
 CONTACT_REPLACEMENT = "You can use the email on my form."
 NEUTRAL_ACKS = ("Okay.", "I see.", "Right.", "Mm-hmm.")
@@ -123,6 +138,7 @@ CONTACT = "contact"
 PROTECTED_QUESTION = "protected_question"
 SCRIPTED_CUE = "scripted_cue"
 ACK_FORMAT = "ack_format"
+REPEAT = "repeat"
 CATEGORIES = (
     CONTROL,
     VENDOR,
@@ -139,9 +155,12 @@ CATEGORIES = (
     PROTECTED_QUESTION,
     SCRIPTED_CUE,
     ACK_FORMAT,
+    REPEAT,
 )
-# Categories that count toward the 3-hit gate: everything except acknowledgement hygiene.
-LEAK_CATEGORIES = frozenset(CATEGORIES) - {ACK_FORMAT}
+# Hygiene is counted and logged but is not a leak and is never posted to the API.
+HYGIENE_CATEGORIES = frozenset({ACK_FORMAT, REPEAT})
+# Categories that count toward the 3-hit gate: everything except hygiene.
+LEAK_CATEGORIES = frozenset(CATEGORIES) - HYGIENE_CATEGORIES
 
 
 def _ci(*patterns: str) -> re.Pattern[str]:
@@ -394,6 +413,12 @@ class GuardContext:
     turn: int = 0
     control_texts: tuple[str, ...] = ()
     keep_excerpts: bool = False
+    # Learner repetition control.  ``said`` is the normalised sentences the learner has
+    # already played (``r1_text.SpokenMemory.snapshot``); ``seed`` and ``variant`` pick which
+    # fallback variant to speak (the attempt id, and how many fallbacks were used so far).
+    said: tuple[str, ...] = ()
+    seed: str = ""
+    variant: int = 0
 
     @property
     def is_learner(self) -> bool:
@@ -429,7 +454,8 @@ class GuardLedger:
     sentence that carries a digit or product word, and that is how a benign paraphrase of
     a card answer ("Money's a bit tight, honestly.") gets removed.  Counting them would
     flag one conversation in four as having broken character for nothing a candidate or
-    HR could see (S0-B defect 7 again).  They are still counted and reported separately.
+    HR could see (S0-B defect 7 again).  ``repeat`` hits (a sentence the learner already
+    said) are hygiene for the same reason.  They are still counted and reported separately.
     """
 
     counts: dict[str, int] = field(default_factory=dict)
@@ -712,7 +738,6 @@ def _is_card_answer(sentence: str, persona: RenderedPersona | None) -> bool:
 
 def _card_texts(persona: RenderedPersona) -> list[str]:
     answers = [answer for _, answer in PUBLIC_ANSWERS]
-    answers.append(LEARNER_DEFLECTION)
     answers.append(persona.persona.prior_learning)
     answers.extend(persona.surface(topic) for topic in H_TOPICS)
     return answers
@@ -796,9 +821,23 @@ def _replacement(hits: list[Hit], ctx: GuardContext) -> str:
     return ""
 
 
-def _fallback(ctx: GuardContext) -> str:
-    if ctx.is_learner and ctx.mode == "ack":
+def _fallback(ctx: GuardContext, *, only_repeats: bool = False) -> str:
+    """The line spoken when a learner or interviewer reply had nothing left to say.
+
+    ``only_repeats`` means every dropped sentence was one the learner already said: the
+    answer has been given, so a neutral back-channel fits ("Mm-hmm.") and "Sorry, what were
+    you saying?" would be wrong.  Otherwise the learner rotates through ``FALLBACK_REPLIES``
+    from a point seeded by the attempt id, skipping any variant it already said, so the same
+    apology is never spoken twice in a row.
+    """
+    if ctx.is_learner and (ctx.mode == "ack" or only_repeats):
         return NEUTRAL_ACKS[ctx.turn % len(NEUTRAL_ACKS)]
+    if ctx.is_learner:
+        for offset in range(len(FALLBACK_REPLIES)):
+            candidate = pick_variant(FALLBACK_REPLIES, ctx.seed, ctx.variant + offset)
+            if repeat_kind(candidate, ctx.said) is None:
+                return candidate
+        return pick_variant(FALLBACK_REPLIES, ctx.seed, ctx.variant)
     return FALLBACK_REPLY
 
 
@@ -821,6 +860,28 @@ class StreamGuard:
         self._fallback_used = False
         self._replacements: set[str] = set()
         self._done = False
+        self._repeat_drops = 0
+        self._other_drops = 0
+
+    def _repeat_hit(self, kind: str, sentence: str) -> Hit:
+        """A ``repeat`` hit for ``sentence`` (digest always; excerpt only if opted in)."""
+        folded = fold(sentence)
+        digest = hashlib.sha256(normalize(folded).encode("utf-8")).hexdigest()[:12]
+        excerpt = ""
+        if self.ctx.keep_excerpts:
+            excerpt = _scrub_name(mask_contact(folded, 60), self.ctx.candidate_first_name)
+        return Hit(REPEAT, f"repeat_{kind}", excerpt, digest)
+
+    def _repeated(self, out: str) -> Hit | None:
+        """A hit when the learner already said ``out`` earlier in the call (``ctx.said``).
+
+        Inside one reply only an identical sentence is dropped (silently, below): two
+        sentences of a single reply that differ by a word are the model's own phrasing.
+        """
+        if not self.ctx.is_learner or not self.ctx.said:
+            return None
+        kind = repeat_kind(out, self.ctx.said)
+        return None if kind is None else self._repeat_hit(kind, out)
 
     def _vet(self, sentence: str) -> list[str]:
         if self._done:
@@ -835,7 +896,19 @@ class StreamGuard:
                 out = ""
             if out:
                 self._replacements.add(out)
+        if out and out not in self._emitted:
+            repeated = self._repeated(out)
+            if repeated is not None:
+                self._hits.append(repeated)
+                self._replaced = True
+                if hits:
+                    self._other_drops += 1  # the model's own sentence was blocked as well
+                else:
+                    self._repeat_drops += 1
+                return []
         if not out or out in self._emitted:
+            if hits:
+                self._other_drops += 1
             return []
         cap = self.ctx.word_cap
         if cap is not None:
@@ -875,7 +948,8 @@ class StreamGuard:
         self._buffer = ""
         if not self._emitted:
             self._fallback_used = True
-            self._emitted.append(_fallback(self.ctx))
+            only_repeats = self._repeat_drops > 0 and self._other_drops == 0
+            self._emitted.append(_fallback(self.ctx, only_repeats=only_repeats))
             out.append(self._emitted[-1])
         return out
 
