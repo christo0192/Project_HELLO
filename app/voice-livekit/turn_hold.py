@@ -99,9 +99,9 @@ SPEAKING_REARM_SEC = 1.0
 #: time (cumulative, candidate not speaking) a yielded turn waits for its
 #: successor before the backstop speaks.
 ORPHAN_EXTRA_SEC = 2.0
-#: Wall-clock bound on the whole orphan watch, speech included, so it is finite
-#: even when the candidate (or noise) keeps a segment open.  Firing then is
-#: safe: the watchdog it arms defers to a speaking candidate on its own.
+#: Wall-clock bound on the orphan watch since the last non-empty final (speech
+#: included), so it is finite even when noise or a stuck VAD keeps a segment
+#: open.  Real words restart it; it never fires into a speaking candidate.
 ORPHAN_ABSOLUTE_SEC = 30.0
 #: Padding on a wake-up aimed at a segment's expiry, so the re-check lands just
 #: after it.
@@ -713,19 +713,35 @@ class TurnHold:
 
         The bound is the cumulative QUIET time (the candidate not speaking), so
         a long resumed answer can take as long as it takes to commit while
-        recurring noise bursts cannot keep resetting it; ``ORPHAN_ABSOLUTE_SEC``
-        bounds the watch as a whole, speech included.
+        recurring noise bursts cannot keep resetting it.  A non-empty final is
+        real speech, i.e. progress: it restarts both the quiet budget and the
+        ``ORPHAN_ABSOLUTE_SEC`` bound, so the watch only ever expires on
+        wordless churn (noise, a stuck VAD) and a long fluent answer is never
+        cut.  The absolute bound never fires into a speaking candidate: it
+        waits for their segment to end (a stuck one goes stale on its own).
+
+        Firing arms the backstop only; the carried text is KEPT, so a successor
+        that still commits later merges the first part of the answer (it is
+        reported as unmerged at close otherwise).
         """
         tracker = self._tracker
         quiet_left = self._orphan_bound()
         hard_deadline = self._mono() + ORPHAN_ABSOLUTE_SEC
+        finals_seen = tracker.final_count
         try:
             while self.carry is not None:
                 now = self._mono()
-                if now >= hard_deadline or quiet_left <= _SPENT_EPSILON_SEC:
+                if tracker.final_count > finals_seen:
+                    finals_seen = tracker.final_count
+                    quiet_left = self._orphan_bound()
+                    hard_deadline = now + ORPHAN_ABSOLUTE_SEC
+                speaking = tracker.candidate_speaking()
+                if not speaking and (
+                    now >= hard_deadline or quiet_left <= _SPENT_EPSILON_SEC
+                ):
                     break
-                if tracker.candidate_speaking():
-                    await tracker.wait_change(min(1.0, hard_deadline - now))
+                if speaking:
+                    await tracker.wait_change(1.0)
                     continue
                 await tracker.wait_change(min(quiet_left, hard_deadline - now))
                 quiet_left -= self._mono() - now
@@ -733,7 +749,6 @@ class TurnHold:
                 return
             if self.carry is None:
                 return
-            self.carry = None
             self._emit(ERROR_TYPE_HOLD, "carry_orphaned")
             if self._on_orphan is not None:
                 await _maybe_await(self._on_orphan())
@@ -807,7 +822,10 @@ class TurnHold:
             await self._hold_first_audio(rearm, interruptible)
         finally:
             # This line's audio is released (or the line was cancelled): the
-            # next reply starts with a fresh waiting budget.
+            # next reply starts with a fresh waiting budget.  Best effort: any
+            # line's release resets it, so a say() line released while another
+            # reply's hook is still spending the budget gives that reply a
+            # second budget (still bounded, at most twice the cap of quiet).
             self._quiet_spent = 0.0
 
     async def _hold_first_audio(
@@ -867,12 +885,24 @@ class TurnHold:
                 # A committable final's commit window is NOT cut short by the
                 # cap, or a reply could start and then be cut by the commit.
                 remaining = grace_left if grace_left is not None else cap - self._quiet_spent
+                if grace_left is not None and remaining <= _SPENT_EPSILON_SEC:
+                    if not tracker.needs_hold(self._wall()):
+                        # The commit window simply ran out with nothing newer
+                        # pending: the normal end of a hold after a final (not
+                        # logged as a cap).
+                        break
+                    # The window ran out while LATER speech is still pending (a
+                    # resumed segment whose final has not landed): the SDK's
+                    # commit of that final would cut the reply we are about to
+                    # start.  Stop treating the window as the bound and fall
+                    # back to the shared quiet budget, so that speech still
+                    # gets its wait; its final re-opens the window.
+                    grace_left = None
+                    schema = "pending"
+                    remaining = cap - self._quiet_spent
                 if remaining <= _SPENT_EPSILON_SEC:
-                    if grace_left is None:
-                        # (A commit window that simply ran out is the normal end
-                        # of a hold after a final: not logged as a cap.)
-                        self._emit(ERROR_TYPE_HOLD, "audio_hold_cap_reached",
-                                   schema=schema)
+                    self._emit(ERROR_TYPE_HOLD, "audio_hold_cap_reached",
+                               schema=schema)
                     break
             waited_from = self._mono()
             await self._wait(remaining)

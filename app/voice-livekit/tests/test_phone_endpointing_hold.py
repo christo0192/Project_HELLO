@@ -675,7 +675,7 @@ class TestHookTimeHold(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.3)
             self.assertEqual(calls, ["orphan"])
             self.assertIn("carry_orphaned", log.categories())
-            self.assertIsNone(hold.carry)
+            self.assertIsNotNone(hold.carry, "the carried answer is kept for the successor")
             await asyncio.sleep(0.3)
             self.assertEqual(calls, ["orphan"])  # exactly once
 
@@ -1908,7 +1908,9 @@ class TestHoldBudget(unittest.IsolatedAsyncioTestCase):
         vc.t = 5.55
         await hold.before_first_audio()
         quiet = (vc.t - 5.55) - _burst_overlap(6.0, on, off, 5.55, vc.t)
-        self.assertLessEqual(quiet, 0.05 + 0.05 + 2.3 + 0.05, "one grace of quiet, however many bursts")
+        # One commit window, then (only because wordless speech is still
+        # pending) the shared 2.0 s quiet budget: bounded however many bursts.
+        self.assertLessEqual(quiet, 0.05 + 2.3 + 2.0 + 0.1, "one grace + one cap of quiet, however many bursts")
         self.assertLess(vc.t, 20.0)
 
     async def test_the_orphan_watch_counts_quiet_time_cumulatively(self):
@@ -1924,7 +1926,7 @@ class TestHoldBudget(unittest.IsolatedAsyncioTestCase):
         quiet = calls[0] - _burst_overlap(1.0, 0.8, 0.7, 0.0, calls[0])
         self.assertAlmostEqual(quiet, bound, delta=0.05)
         self.assertIn("carry_orphaned", log.categories())
-        self.assertIsNone(hold.carry)
+        self.assertIsNotNone(hold.carry, "the carried answer is kept for the successor")
 
     async def test_the_orphan_watch_has_an_absolute_bound_too(self):
         calls: list = []
@@ -1947,6 +1949,107 @@ class TestHoldBudget(unittest.IsolatedAsyncioTestCase):
         stale_at = turn_hold.OPEN_SEGMENT_STALE_SEC
         self.assertGreaterEqual(calls[0], stale_at + hold._orphan_bound() - 0.05)
         self.assertLess(calls[0], stale_at + hold._orphan_bound() + 1.05)
+
+
+class TestOrphanWatchKeepsALiveAnswer(unittest.IsolatedAsyncioTestCase):
+    """Round 7: the watch bounds wordless churn, never a candidate who is still
+    answering, and firing never discards the carried first part."""
+
+    @staticmethod
+    def _phrases(tracker, *, count, first=1.0, length=3.0, gap=1.2, lag=0.95):
+        """Fluent phrases with thinking pauses, each followed by a non-empty final."""
+        t = first
+        last = first
+        for _ in range(count):
+            tracker.script.append((t, lambda t=t: tracker.on_speech_start(t)))
+            tracker.script.append((t + length, lambda t=t + length: tracker.on_speech_end(t)))
+            last = t + length + lag
+            tracker.script.append(
+                (last, lambda t=last: tracker.on_final(t, "and then the next part")))
+            t += length + gap
+        return last
+
+    async def test_a_fluent_answer_with_thinking_pauses_is_never_orphaned_mid_answer(self):
+        calls: list = []
+        vc, tracker, hold, log = _virtual(cap=2.0, on_orphan=lambda: calls.append(vc.t))
+        hold.carry = ("first part", 100.0)
+        last_final = self._phrases(tracker, count=10)           # ~42 s of answer
+        vc.t = 0.0
+        await hold._watch_orphan()
+        self.assertGreater(last_final, turn_hold.ORPHAN_ABSOLUTE_SEC + 5)
+        self.assertEqual(len(calls), 1)
+        self.assertGreaterEqual(calls[0], last_final + hold._orphan_bound() - 0.05,
+                                "only fires once the finals stop coming")
+
+    async def test_firing_keeps_the_carry_and_the_successor_merges_it(self):
+        calls: list = []
+        vc, tracker, hold, log = _virtual(cap=2.0, on_orphan=lambda: calls.append(vc.t))
+        hold.carry = ("first part", 100.0)
+        vc.t = 0.0
+        await hold._watch_orphan()                              # no speech at all
+        self.assertEqual(len(calls), 1)
+        self.assertIsNotNone(hold.carry)
+        successor = _msg("the tail", 200.0)
+        await hold.before_turn(successor)
+        self.assertEqual(successor.content, ["first part the tail"])
+        self.assertIn("carry_merged", log.categories())
+        self.assertIsNone(hold.carry)
+
+    async def test_the_absolute_bound_waits_for_a_speaking_candidate(self):
+        calls: list = []
+        vc, tracker, hold, log = _virtual(cap=2.0, on_orphan=lambda: calls.append(vc.t))
+        hold.carry = ("first part", 100.0)
+        _noise_bursts(tracker, first=0.5, on=7.0, off=0.05)      # almost no quiet time
+        vc.t = 0.0
+        await hold._watch_orphan()
+        self.assertEqual(len(calls), 1)
+        # The 30 s bound lands inside the burst at 28.7-35.7: fired at its end.
+        self.assertGreaterEqual(calls[0], 35.7 - 0.05, "not fired into the live segment")
+
+
+class TestRound7CommitGraceHandOver(unittest.IsolatedAsyncioTestCase):
+    """When the cumulative commit grace runs out while LATER speech is still
+    un-finalized the hold falls back to the shared quiet budget, not a release."""
+
+    async def _run(self, resume_at, final_at):
+        vc, tracker, hold, log = _virtual(cap=2.0)
+        tracker.on_speech_start(4.0)
+        tracker.on_speech_end(5.0)
+        tracker.script.append((5.6, lambda: tracker.on_final(5.6, "i led the migration at my last company")))
+        end = resume_at + 2.5
+        tracker.script.append((resume_at, lambda: tracker.on_speech_start(resume_at)))
+        tracker.script.append((end, lambda: tracker.on_speech_end(end)))
+        if final_at is not None:
+            tracker.script.append((final_at, lambda: tracker.on_final(final_at, "and it took us about six months")))
+        vc.t = 5.55
+        await hold.before_first_audio()
+        return vc, tracker, log, end
+
+    async def test_a_resumed_segment_with_a_slow_final_is_not_released_before_that_final(self):
+        for pause in (1.5, 1.8):
+            resume_at = 5.6 + pause
+            final_at = resume_at + 2.5 + 0.95          # Sarvam latency
+            vc, tracker, log, _ = await self._run(resume_at, final_at)
+            self.assertGreaterEqual(vc.t, final_at, msg=pause)
+
+    async def test_a_resumed_wordless_segment_still_releases_within_the_budget(self):
+        for pause in (1.5, 1.8):
+            vc, tracker, log, end = await self._run(5.6 + pause, None)
+            self.assertLessEqual(vc.t, end + turn_hold.PENDING_CLOSED_EXPIRY_SEC + 0.1, msg=pause)
+            self.assertFalse(tracker.pending(), msg=pause)
+
+    async def test_the_budget_reset_when_a_line_is_released_gives_the_next_hookless_line_a_full_cap(self):
+        on, off = 0.8, 0.7
+        vc, tracker, hold, log = _virtual(cap=2.0)
+        tracker.on_speech_start(4.9)
+        tracker.on_speech_end(5.5)
+        _noise_bursts(tracker, first=6.0, on=on, off=off)
+        vc.t = 5.55
+        await hold.before_first_audio()                     # line 1
+        mark = vc.t
+        await hold.before_first_audio()                     # line 2: no before_turn between
+        quiet = (vc.t - mark) - _burst_overlap(6.0, on, off, mark, vc.t)
+        self.assertAlmostEqual(quiet, 2.0, delta=0.05)
 
 
 class TestNonInterruptibleLinesAreNeverHeld(unittest.IsolatedAsyncioTestCase):

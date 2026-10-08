@@ -418,6 +418,16 @@ class TestNonInterruptibleLinesAreNotGatedOnSilence(_ContractCase):
         self.assertIn("if speech_handle.allow_interruptions:", source)
         self.assertIn("self._user_silence_event.wait()", source)
 
+    def test_source_pin_a_say_line_is_authorized_before_its_tts_inference_starts(self):
+        """So ``current_speech`` is already the say() line when its first frame is
+        synthesized (the first-audio hold reads it there); the polling test above
+        would still pass if a future SDK started synthesis before authorization."""
+        source = inspect.getsource(_SDK["agent_activity"].AgentActivity._tts_task_impl)  # noqa: SLF001
+        authorized = source.find("_wait_for_authorization")
+        inference = source.find("perform_tts_inference")
+        self.assertGreaterEqual(authorized, 0)
+        self.assertGreater(inference, authorized)
+
     def test_source_pin_a_commit_over_a_non_interruptible_line_is_skipped(self):
         source = inspect.getsource(_SDK["agent_activity"].AgentActivity._user_turn_completed_task)  # noqa: SLF001
         self.assertIn("cannot be interrupted", source)
