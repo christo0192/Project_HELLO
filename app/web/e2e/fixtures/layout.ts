@@ -148,3 +148,39 @@ export async function liveLayout(page: Page): Promise<LiveLayout> {
     };
   });
 }
+
+export interface MediaRow {
+  /** The stage scrolls sideways: something in it is wider than the card. */
+  stageScrollWidth: number;
+  stageClientWidth: number;
+  /** The aura lies wholly inside the stage card's width. */
+  auraInside: boolean;
+  auraWidth: number;
+  /** The camera sits to the right of the aura (not under it): the camera costs the stage no height. */
+  sideBySide: boolean;
+}
+
+/**
+ * Where the interviewer aura and the candidate's camera are in the stage: side by side and wholly
+ * inside the card, or stacked / spilling out of it (a narrow stage with a tall aura did both).
+ */
+export function mediaRow(page: Page): Promise<MediaRow> {
+  return page.evaluate(() => {
+    const stage = document.querySelector<HTMLElement>('.r1-live__stage');
+    const aura = document.querySelector<HTMLElement>('.r1-live__media .candidate-aura');
+    const camera = document.querySelector<HTMLElement>('.r1-live__selfview');
+    if (!stage || !aura || !camera) {
+      return { stageScrollWidth: 0, stageClientWidth: 0, auraInside: false, auraWidth: 0, sideBySide: false };
+    }
+    const card = stage.getBoundingClientRect();
+    const a = aura.getBoundingClientRect();
+    const c = camera.getBoundingClientRect();
+    return {
+      stageScrollWidth: stage.scrollWidth,
+      stageClientWidth: stage.clientWidth,
+      auraInside: a.left >= card.left - 0.5 && a.right <= card.right + 0.5,
+      auraWidth: Math.round(a.width),
+      sideBySide: c.left >= a.right - 1 && Math.abs(c.top + c.height / 2 - (a.top + a.height / 2)) < 40,
+    };
+  });
+}

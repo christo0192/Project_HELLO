@@ -11,6 +11,7 @@ import {
   parsePreflight,
   parseStatus,
   R1_CONTRACT,
+  R1_FINAL_REFUSAL_CODES,
   R1_ROUTES,
   R1_SERVER_ERROR_CODES,
   R1_STATUS_VOCABULARY,
@@ -453,6 +454,17 @@ describe('the error codes the web acts on are the ones the server answers', () =
         (code) => !SERVER_SOURCE.includes(`'${code}'`),
       );
       const undocumented = R1_SERVER_ERROR_CODES.filter(
+        (code) => !new RegExp(`\\b${code}\\b`).test(CANDIDATE_SPEC),
+      );
+      expect({ unanswered, undocumented }).toEqual({ unanswered: [], undocumented: [] });
+    },
+  );
+
+  it.skipIf(!SPEC_DOCUMENTS_R1_CANDIDATE_ROUTES || SERVER_SOURCE === '')(
+    'every code that is final for the web (so "I\'m ready" never asks again) is answered and documented',
+    () => {
+      const unanswered = R1_FINAL_REFUSAL_CODES.filter((code) => !SERVER_SOURCE.includes(`'${code}'`));
+      const undocumented = R1_FINAL_REFUSAL_CODES.filter(
         (code) => !new RegExp(`\\b${code}\\b`).test(CANDIDATE_SPEC),
       );
       expect({ unanswered, undocumented }).toEqual({ unanswered: [], undocumented: [] });

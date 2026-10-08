@@ -9,6 +9,7 @@ import { R1ClosedCard, R1EndedCard, R1Shell } from '../components/candidate-r1/R
 import { useCapabilitySupport } from '../lib/capability-check';
 import {
   classifyR1Error,
+  isFinalRefusal,
   r1Api,
   type R1AttemptGrant,
   type R1ConsentTemplate,
@@ -201,6 +202,12 @@ export function R1JoinPage() {
   const nonceRef = useRef<string | null>(null);
   /** The attempt token this tab last held, and until when "I'm ready" may still present it. */
   const attemptTokenRef = useRef<HeldAttemptToken | null>(null);
+  /**
+   * Why a new attempt token was refused for good (a lapsed round, an attempt that is no longer
+   * live), so "I'm ready" does not ask again: it would be refused again and spend the link's start
+   * rate limit that a real rejoin needs.
+   */
+  const mintRefusalRef = useRef<unknown>(null);
   const mountedRef = useRef(false);
   const endedRef = useRef(false);
   /** A withdrawal from the live room is in flight: the room ending is its doing, not news. */
@@ -376,6 +383,7 @@ export function R1JoinPage() {
     phaseRef.current = null;
     nonceRef.current = null;
     attemptTokenRef.current = null;
+    mintRefusalRef.current = null;
     setPhase(null);
     setLeadName(null);
     setRoleplayClock(null);
@@ -453,6 +461,7 @@ export function R1JoinPage() {
       saveNonce(token, attempt.nonce);
       nonceRef.current = attempt.nonce;
       attemptTokenRef.current = holdAttemptToken(attempt);
+      mintRefusalRef.current = null;
       let room = await r1Api.exchange(attempt.attempt_token, attempt.nonce);
       for (let tries = 0; room.status === 'preparing'; tries += 1) {
         if (!mountedRef.current) return;
@@ -532,6 +541,13 @@ export function R1JoinPage() {
    * token in hand is spent or nearly, never because the last press failed, and mint again after
    * a refusal of the token itself (a clock that disagrees with the server's) at most once.
    *
+   * A mint the server refuses for good (the round has lapsed, the attempt is no longer live) is not
+   * asked for again: the next presses fail at once with the same answer and cost the server
+   * nothing, so a button that cannot work never eats the rate limit a real rejoin needs. A mint
+   * that fails for a reason that clears (a rate limit, an outage) is tried again on a later press.
+   * Whether `/api/r1/ready` should take a lapsed token itself, or the rejoin should not be refused
+   * near the end of the round, is the API's to decide (see FIX-ROUND-2 for S03).
+   *
    * Any failure rejects: the button says so, waits a few seconds, and the candidate can say
    * "ready" instead.
    */
@@ -549,7 +565,14 @@ export function R1JoinPage() {
         if (classifyR1Error(error) !== 'link_invalid') throw error;
       }
     }
-    const grant = await r1Api.createAttempt(link, nonce);
+    if (mintRefusalRef.current !== null) throw mintRefusalRef.current;
+    let grant: R1AttemptGrant;
+    try {
+      grant = await r1Api.createAttempt(link, nonce);
+    } catch (error) {
+      if (isFinalRefusal(error)) mintRefusalRef.current = error;
+      throw error;
+    }
     attemptTokenRef.current = holdAttemptToken(grant);
     await r1Api.ready(grant.attempt_token, nonce);
   }

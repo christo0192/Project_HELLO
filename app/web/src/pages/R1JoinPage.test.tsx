@@ -972,6 +972,86 @@ describe('the role-play briefing, clock and "I\'m ready"', () => {
       expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
     });
 
+    // A mint the server refuses for good (the round has lapsed, the attempt is over) would be refused
+    // again, and each ask spends the link's start rate limit that a real rejoin needs.
+    it.each([
+      ['round_expired', 409],
+      ['round_not_admissible', 409],
+      ['r1_attempt_not_live', 409],
+      ['consent_required', 409],
+      ['r1_attempt_invalid', 404],
+    ])('does not ask for a token again once the server refused one for good (%s)', async (code, status) => {
+      await toBriefing(-1_000);
+      const advance = clock();
+      h.createAttempt.mockClear();
+      h.createAttempt.mockRejectedValue(new ApiError(code, status));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByRole('alert')).toHaveTextContent(/couldn't send that/);
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+
+      // Press after press, a minute apart: the button says the same thing and the server hears nothing.
+      for (let press = 0; press < 3; press += 1) {
+        advance(16_000);
+        fireEvent.click(screen.getByRole('button', READY));
+        await waitFor(() => expect(screen.getByRole('alert')).toBeVisible());
+      }
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).not.toHaveBeenCalled();
+      // The interview, the nonce and the spoken "ready" are untouched.
+      expect(screen.getByRole('region', { name: 'Live video interview' })).toBeVisible();
+      expect(readNonce(LINK)).toBe(NONCE);
+    });
+
+    it.each([
+      ['http_429', 429],
+      ['service_unavailable', 503],
+      ['network_unreachable', 0],
+    ])('asks again after a mint that failed for a reason that clears (%s)', async (code, status) => {
+      await toBriefing(-1_000);
+      const advance = clock();
+      h.createAttempt.mockClear();
+      h.createAttempt.mockRejectedValueOnce(new ApiError(code, status));
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByRole('alert');
+      advance(16_000);
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.createAttempt).toHaveBeenCalledTimes(2);
+      expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
+    });
+
+    it('forgets a refusal when the candidate rejoins: that is a new attempt, with its own token', async () => {
+      const live = await toBriefing(-1_000);
+      h.createAttempt.mockClear();
+      h.createAttempt.mockRejectedValueOnce(new ApiError('round_expired', 409));
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByRole('alert');
+      act(() => live.handlers.onEnded('disconnected'));
+      await findH1('The connection to your interview ended.');
+      // The rejoin works (the round is open after all) and hands out a token that has already lapsed.
+      h.createAttempt.mockResolvedValueOnce({
+        ...ATTEMPT,
+        attempt_token: 'rejoin-token',
+        rejoin: true,
+        expires_at: inMs(-1_000),
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Rejoin interview' }));
+      await findH1('Video interview');
+      fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+      await screen.findByRole('region', { name: 'Live video interview' });
+      const again = h.created[h.created.length - 1];
+      act(() => again.handlers.onPhase('transition'));
+      act(() => again.handlers.onAwaitingReady(true));
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByText('Sent — starting the role-play');
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
+    });
+
     it('starts over with the attempt a rejoin gives it, never with the last one\'s token', async () => {
       const live = await toBriefing();
       act(() => live.handlers.onEnded('disconnected'));

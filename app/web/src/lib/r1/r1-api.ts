@@ -147,7 +147,9 @@ export const R1_CONTRACT: Readonly<Record<R1RouteName, R1RouteContract>> = Objec
   // minutes). The page keeps the token it was last given (with its `attempt_token_expires_at`)
   // and asks the rejoin branch of `attempts` for a new one only when that one is spent or about
   // to be (R1JoinPage `sendReady`). That rejoin call is subject to the admission gates (round
-  // expiry, R1 switched off) and to the per-link start rate limit.
+  // expiry, R1 switched off) and to the per-link start rate limit, so a mint the server refuses for
+  // good (`isFinalRefusal`) is not asked for again. The route itself also refuses once the round has
+  // lapsed, so the button cannot work in the last minutes of a link's life: the spoken "ready" does.
   // The 200 body is `{ok:true}`; the page needs only the status, so no response field is
   // declared or parsed.
   ready: route('ready', {
@@ -581,4 +583,29 @@ export function classifyR1Error(error: unknown): R1ErrorKind {
   if ([502, 503, 504].includes(error.status)) return 'unavailable';
   if ([400, 401, 403, 404].includes(error.status)) return 'link_invalid';
   return 'unknown';
+}
+
+/**
+ * Codes the server answers that asking again cannot clear, besides the ones `classifyR1Error`
+ * already sorts as an expired or invalid link: the round was cancelled, completed or is closed to
+ * new work. `r1-contract.test.ts` checks the server still answers them and the spec still names them.
+ */
+export const R1_FINAL_REFUSAL_CODES: readonly string[] = Object.freeze(['round_not_admissible']);
+
+/**
+ * The server refused this request for a reason that will not go away (the round has lapsed or
+ * closed, the attempt is no longer live, the consent is withdrawn, or it does not know the
+ * link or nonce), so repeating it only spends the link's rate limit. False for a rate limit, an
+ * outage and a dropped network: those clear, and a retry is the right answer to them.
+ */
+export function isFinalRefusal(error: unknown): boolean {
+  switch (classifyR1Error(error)) {
+    case 'link_expired':
+    case 'link_invalid':
+    case 'attempt_not_live':
+    case 'consent_required':
+      return true;
+    default:
+      return error instanceof ApiError && R1_FINAL_REFUSAL_CODES.includes(error.message);
+  }
 }

@@ -63,8 +63,10 @@
 .r1-phase:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 3px; }
 .r1-banner { width: min(100%, 520px); padding: 10px 14px; border: 1px solid var(--c-caution); border-radius: 14px; background: var(--c-caution-light); color: var(--c-caution); font-size: 13px; font-weight: 650; line-height: 1.45; text-align: center; }
 /* The interviewer aura and the candidate's own camera sit side by side where the stage is wide
-   enough, so the self-view costs no height; they stack (the aura first) where it is not. Neither
-   shrinks: the camera keeps its 16:9 box and the stage scrolls before it would be crushed. */
+   enough, so the self-view costs no height; they stack (the aura first) where it is not (the
+   one-column layout, on a phone). In the fill layout they never wrap: the aura shrinks to make
+   room. The camera never shrinks: it keeps its 16:9 box and the stage scrolls before it would be
+   crushed. */
 .r1-live__media { display: flex; flex: none; flex-wrap: wrap; align-items: center; justify-content: center; gap: 14px; max-width: 100%; }
 .r1-live__selfview { flex: none; width: 200px; max-width: 100%; margin: 0; }
 .r1-live__selfview.r1-selfview { max-width: 200px; margin-top: 0; border-radius: 14px; }
@@ -111,8 +113,11 @@
 
 /* Desktop: the live view fits the window (the shell is a 100dvh column, see R1Shell `fill`).
    A real browser window is the screen minus the taskbar and the browser's own bars, so a 1080p
-   laptop at 150% scaling gives about 1280x580: the layout is built for that, not for the screen. */
-@media (min-width: 769px) and (min-height: 480px) {
+   laptop at 150% scaling gives about 1280x580: the layout is built for that, not for the screen.
+   It starts at 860px wide: beside the 360px column the stage is then 440px wide, 384px inside its
+   padding, which holds the aura (132px at least) and the 200px camera side by side. A narrower
+   window gets the one-column layout below (a stacked aura and camera overflowed the stage). */
+@media (min-width: 860px) and (min-height: 480px) {
   .candidate-shell--fill { display: flex; flex-direction: column; height: 100vh; height: 100dvh; min-height: 0; padding-bottom: 20px; overflow: hidden; }
   .candidate-shell--fill .candidate-shell__inner { display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; }
   .candidate-shell--fill .r1-live { flex: 1 1 auto; min-height: 0; margin-top: 16px; grid-template-rows: minmax(0, 1fr); align-items: stretch; }
@@ -123,8 +128,10 @@
   .candidate-shell--fill .r1-live__stage > :last-child { margin-bottom: auto; }
   .candidate-shell--fill .r1-live__stage .candidate-interview__controls { margin-top: 6px; }
   .candidate-shell--fill .r1-live__stage .r1-link-button { margin-top: 0; }
-  /* The aura is sized from the window height, not its width, so it gives way to the controls. */
-  .candidate-shell--fill .r1-live .candidate-aura { flex: none; width: clamp(168px, calc(100dvh - 600px), 420px); }
+  /* The aura is sized from the window height, not its width, so it gives way to the controls; and it
+     gives way to the camera too: the row does not wrap, the aura shrinks to what the stage holds. */
+  .candidate-shell--fill .r1-live__media { flex-wrap: nowrap; }
+  .candidate-shell--fill .r1-live .candidate-aura { flex: 0 1 auto; width: clamp(168px, calc(100dvh - 600px), 420px); min-width: 120px; }
   .candidate-shell--fill .r1-live .candidate-aura__logo-plate { width: min(126px, 46%); height: auto; aspect-ratio: 1; border-radius: 28%; }
   .candidate-shell--fill .r1-live .candidate-aura__logo-plate img { width: 70%; height: 70%; }
   /* The side column is not a scroller: its cards have shadows that a clip would cut off. */
@@ -133,7 +140,7 @@
 /* Short desktop windows (a 1366x768 laptop's browser is about 650px high): everything that is not
    the interview itself gives up room, so the controls, a camera-off banner and a failed "I'm ready"
    all stay inside the stage card and the captions keep a usable height. */
-@media (min-width: 769px) and (min-height: 480px) and (max-height: 740px) {
+@media (min-width: 860px) and (min-height: 480px) and (max-height: 740px) {
   .candidate-shell--fill { padding-top: 14px; padding-bottom: 14px; }
   .candidate-shell--fill .candidate-brand img { width: 32px; height: 32px; padding: 3px; border-radius: 10px; }
   .candidate-shell--fill .r1-live { margin-top: 10px; }
@@ -151,14 +158,33 @@
 
 /* A 1080p laptop at 150% scaling gives about 580px: the briefing card and the captions card give up
    their last few pixels so the list still shows a few lines beside the full briefing card. */
-@media (min-width: 769px) and (min-height: 480px) and (max-height: 600px) {
+@media (min-width: 860px) and (min-height: 480px) and (max-height: 600px) {
   .candidate-shell--fill .r1-scenario { padding: 8px 14px; }
   .candidate-shell--fill .r1-scenario__facts { margin: 6px 0; }
   .candidate-shell--fill .r1-captions__body { margin-top: 8px; }
 }
 
+/* Below about 580px (a 1080p laptop at 150% scaling with a bookmarks bar, or a small browser window)
+   the stage's tallest states (camera off, a failed "I'm ready") need more than the card has; a
+   narrow stage (860 to 999px wide) wraps one more line and needs it up to 590px. The aura and the
+   camera give up their last pixels so the controls always stay in the card's visible part; at
+   480px the stage may still scroll a little, below the controls. */
+@media (min-width: 860px) and (min-height: 480px) and (max-height: 579px),
+  (min-width: 860px) and (max-width: 999px) and (min-height: 480px) and (max-height: 589px) {
+  .candidate-shell--fill { padding-top: 10px; padding-bottom: 10px; }
+  .candidate-shell--fill .r1-live { margin-top: 8px; }
+  .candidate-shell--fill .r1-live__stage { gap: 6px; padding: 8px 20px; }
+  .candidate-shell--fill .r1-live__title { font-size: 20px; }
+  .candidate-shell--fill .r1-live__media { gap: 12px; }
+  .candidate-shell--fill .r1-live .candidate-aura { width: 104px; min-width: 96px; }
+  .candidate-shell--fill .r1-live__selfview,
+  .candidate-shell--fill .r1-live__selfview.r1-selfview { width: 168px; max-width: 168px; }
+  .candidate-shell--fill .r1-phase { padding: 6px 12px; }
+  .candidate-shell--fill .r1-banner { padding: 6px 12px; }
+}
+
 /* Phones and very short landscape windows: the page scrolls naturally; the captions card is bounded. */
-@media (max-width: 768px), (max-height: 479px) {
+@media (max-width: 859px), (max-height: 479px) {
   .r1-live { grid-template-columns: minmax(0, 1fr); gap: 12px; }
   .r1-live__stage { min-height: 0; padding: 18px 12px; }
   .r1-live .candidate-aura { width: min(56vw, 220px); }

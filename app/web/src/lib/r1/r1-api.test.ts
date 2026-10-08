@@ -6,12 +6,14 @@ vi.mock('../supabase', () => ({ supabase: { auth: { getSession } } }));
 import { ApiError } from '../api-client';
 import {
   classifyR1Error,
+  isFinalRefusal,
   normalizeLead,
   parseAttempt,
   parseConsentTemplate,
   parseExchange,
   parsePreflight,
   parseStatus,
+  R1_FINAL_REFUSAL_CODES,
   R1_ROUTES,
   R1_SERVER_ERROR_CODES,
   r1Api,
@@ -490,5 +492,44 @@ describe('classifyR1Error', () => {
   it('treats anything that is not an ApiError as unknown', () => {
     expect(classifyR1Error(new Error('boom'))).toBe('unknown');
     expect(classifyR1Error(undefined)).toBe('unknown');
+  });
+});
+
+describe('isFinalRefusal', () => {
+  const final = (code: string, status: number) => isFinalRefusal(new ApiError(code, status));
+
+  it('is true for a refusal that asking again cannot clear', () => {
+    expect(final('round_expired', 409)).toBe(true);
+    expect(final('round_not_admissible', 409)).toBe(true);
+    expect(final('r1_attempt_not_live', 409)).toBe(true);
+    expect(final('consent_required', 409)).toBe(true);
+    expect(final('consent_template_stale', 409)).toBe(true);
+    expect(final('r1_attempt_invalid', 404)).toBe(true);
+    expect(final('r1_link_invalid_or_expired', 404)).toBe(true);
+    expect(final('http_410', 410)).toBe(true);
+    expect(final('http_400', 400)).toBe(true);
+  });
+
+  it('is false for what clears: a rate limit, an outage, a dropped network, a disabled lane', () => {
+    expect(final('http_429', 429)).toBe(false);
+    expect(final('service_unavailable', 503)).toBe(false);
+    expect(final('http_502', 502)).toBe(false);
+    expect(final('r1_unavailable', 503)).toBe(false);
+    expect(final('r1_disabled', 409)).toBe(false);
+    expect(final('r1_paused', 409)).toBe(false);
+    expect(final('r1_capacity_exhausted', 409)).toBe(false);
+    expect(final('network_unreachable', 0)).toBe(false);
+    expect(final('r1_malformed_response', 500)).toBe(false);
+    expect(final('http_418', 418)).toBe(false);
+  });
+
+  it('is false for anything that is not an ApiError', () => {
+    expect(isFinalRefusal(new Error('boom'))).toBe(false);
+    expect(isFinalRefusal(undefined)).toBe(false);
+    expect(isFinalRefusal('round_expired')).toBe(false);
+  });
+
+  it('names the extra final codes it relies on exactly', () => {
+    expect([...R1_FINAL_REFUSAL_CODES]).toEqual(['round_not_admissible']);
   });
 });

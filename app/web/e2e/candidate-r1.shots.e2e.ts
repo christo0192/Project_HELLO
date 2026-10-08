@@ -15,6 +15,7 @@ import { expect, test } from './fixtures/candidate-harness';
 import {
   LEARNER_NAME,
   LIVE_DESKTOP_SIZES,
+  NARROW_WINDOWS,
   REALISTIC_WINDOWS,
   agree,
   backToBriefing,
@@ -125,9 +126,11 @@ test.describe('R1 candidate screenshots @shots', () => {
   /**
    * The windows a candidate really has (the screen minus the taskbar and the browser's bars):
    * the role-play with its facts strip, the briefing with the full card, and the briefing after a
-   * failed press with the camera off, which is the tallest the stage ever gets.
+   * failed press with the camera off, which is the tallest the stage ever gets. Then the corners
+   * of the two-column layout: a narrow short window (900x584) and a short wide one (1100x500),
+   * where the aura and the camera are squeezed so the controls stay in the card.
    */
-  for (const size of REALISTIC_WINDOWS) {
+  for (const size of [...REALISTIC_WINDOWS, { width: 900, height: 584 }, { width: 1100, height: 500 }]) {
     test(`live view, realistic window, ${size.width}x${size.height}`, async ({ r1 }, testInfo) => {
       test.skip(testInfo.project.name !== 'desktop', 'desktop windows run on the desktop project');
       const { page } = r1;
@@ -146,6 +149,33 @@ test.describe('R1 candidate screenshots @shots', () => {
       await backToBriefing(r1);
       await view('briefing');
 
+      r1.state.failures.ready = { status: 503, error: 'service_unavailable' };
+      await page.getByRole('button', { name: "I'm ready" }).click();
+      await expect(page.getByRole('alert')).toContainText("We couldn't send that");
+      r1.consoleErrors.length = 0; // a 503 is logged by the browser's network layer
+      await page.getByRole('button', { name: 'Turn camera off' }).click();
+      await expect(page.getByText(/Your camera is off/)).toBeVisible();
+      await view('briefing-failed-camera-off');
+    });
+  }
+
+  /**
+   * Windows under 860 px wide get the one-column layout (the stage is too narrow for two columns):
+   * the page scrolls, so the shot is the whole page, in the role-play and in the tallest state.
+   */
+  for (const size of NARROW_WINDOWS) {
+    test(`live view, one column, ${size.width}x${size.height}`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop windows run on the desktop project');
+      const { page } = r1;
+      const project = testInfo.project.name;
+      await page.setViewportSize(size);
+      await reachLiveWithConversation(r1);
+      const view = (name: string) => shoot(page, project, `live-narrow-${size.width}x${size.height}-${name}`);
+      const layout = await liveLayout(page);
+      expect(layout.captionsCard!.top).toBeGreaterThanOrEqual(layout.stage!.bottom - 1);
+      await view('roleplay');
+
+      await backToBriefing(r1);
       r1.state.failures.ready = { status: 503, error: 'service_unavailable' };
       await page.getByRole('button', { name: "I'm ready" }).click();
       await expect(page.getByRole('alert')).toContainText("We couldn't send that");

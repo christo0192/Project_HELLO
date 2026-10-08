@@ -120,13 +120,34 @@ export const REALISTIC_WINDOWS = [
 /**
  * Every window the "every state fits" check runs in: the realistic ones, plus the screen sizes the
  * first cut was proven at (where the camera was already being crushed, 1280x720 and 1366x768) and
- * the shortest window of the old two-column rule (1100x600).
+ * the shortest window of the old two-column rule (1100x600). Then the corners of the fill layout:
+ * its narrowest width (860x600), a narrow short window (900x584), a short wide one (1100x500, where
+ * the controls fell out of the card) and tall ones whose big aura needs the stage's whole width
+ * (860x1180, 1024x1366: the aura spilled out of the card and pushed the camera under it).
  */
 export const FIT_WINDOWS = [
   ...REALISTIC_WINDOWS,
   { width: 1280, height: 720 },
   { width: 1366, height: 768 },
   { width: 1100, height: 600 },
+  { width: 860, height: 600 },
+  { width: 900, height: 584 },
+  { width: 1100, height: 500 },
+  { width: 1024, height: 768 },
+  { width: 860, height: 1180 },
+  { width: 1024, height: 1366 },
+] as const;
+
+/**
+ * Windows too narrow (under 860 px) for the two-column fill layout: a half-snapped window, a small
+ * browser, a tablet held upright. They get the one-column layout, where the page scrolls and every
+ * control is reachable. 800x560 and 800x600 are where the two-column layout cut things off.
+ */
+export const NARROW_WINDOWS = [
+  { width: 800, height: 560 },
+  { width: 800, height: 600 },
+  { width: 859, height: 700 },
+  { width: 820, height: 1180 },
 ] as const;
 
 /** The learner the interviewer publishes in the e2e role-play. */

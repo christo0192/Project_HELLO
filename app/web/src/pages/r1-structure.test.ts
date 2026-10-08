@@ -172,8 +172,11 @@ describe('R1 live view fits the window and bounds its captions', () => {
 
   it('locks the desktop shell to the viewport height, with a modifier the page opts into', () => {
     // 480, not 600: a real window is the screen minus the taskbar and the browser's bars, so a
-    // 1080p laptop at 150% is about 1280x580 and must stay two columns.
-    expect(css).toMatch(/@media \(min-width: 769px\) and \(min-height: 480px\) \{/);
+    // 1080p laptop at 150% is about 1280x580 and must stay two columns. 860, not 769: the stage
+    // beside the 360 px column is only 440 px wide there, which is what the aura (at least 132 px)
+    // and the 200 px camera need side by side; narrower windows get the one-column layout.
+    expect(css).toMatch(/@media \(min-width: 860px\) and \(min-height: 480px\) \{/);
+    expect(css).not.toMatch(/min-width: 769px/);
     expect(css).toMatch(/\.candidate-shell--fill \{[^}]*height: 100dvh;[^}]*overflow: hidden/);
     expect(css).toMatch(/\.candidate-shell--fill \.r1-live \{[^}]*grid-template-rows: minmax\(0, 1fr\)/);
     expect(read('src/pages/R1JoinPage.tsx')).toMatch(/<R1Shell fill=\{stage\.name === 'live'\}>/);
@@ -193,8 +196,17 @@ describe('R1 live view fits the window and bounds its captions', () => {
     expect(css).toMatch(/\.candidate-aura \{[^}]*width: clamp\(168px, calc\(100dvh - 600px\), 420px\)/);
   });
 
+  it('lets the aura give way to the camera, so a narrow stage never wraps them or spills the aura out', () => {
+    // The height-derived aura (up to 420 px) is wider than a narrow stage holds beside a 200 px
+    // camera: it shrinks (to no less than 120 px) rather than the row wrapping under it.
+    expect(css).toMatch(/\.candidate-shell--fill \.r1-live__media \{[^}]*flex-wrap: nowrap/);
+    expect(css).toMatch(/\.candidate-aura \{[^}]*flex: 0 1 auto;[^}]*min-width: 120px/);
+    expect(css).not.toMatch(/\.candidate-aura \{[^}]*flex: none/);
+  });
+
   it('lets a phone scroll the page and bounds the captions card instead', () => {
-    expect(css).toMatch(/@media \(max-width: 768px\), \(max-height: 479px\)/);
+    expect(css).toMatch(/@media \(max-width: 859px\), \(max-height: 479px\)/);
+    expect(css).not.toMatch(/max-width: 768px/);
     expect(css).toMatch(/\.r1-live \.candidate-interview__captions \{[^}]*height: clamp\(240px, 45dvh, 440px\)/);
   });
 
@@ -210,9 +222,21 @@ describe('R1 live view fits the window and bounds its captions', () => {
 
   it('has a short-window variant that gives the chrome up before the interview', () => {
     expect(css).toMatch(
-      /@media \(min-width: 769px\) and \(min-height: 480px\) and \(max-height: 740px\) \{[^@]*\.r1-live__stage \{[^}]*gap: 8px/,
+      /@media \(min-width: 860px\) and \(min-height: 480px\) and \(max-height: 740px\) \{[^@]*\.r1-live__stage \{[^}]*gap: 8px/,
     );
     expect(css).toMatch(/\.r1-scenario--compact \{/);
+  });
+
+  it('squeezes the aura and the camera below 580 px so the controls stay in the stage card', () => {
+    // Under 580 px high (590 on a narrow stage, which wraps one more line) the tallest states
+    // (camera off, a failed "I'm ready") need more than the card has: the aura gives up 28 px and
+    // the camera shrinks to 168x95, still whole, and the controls stay inside the card.
+    const block = css.match(
+      /@media \(min-width: 860px\) and \(min-height: 480px\) and \(max-height: 579px\),\s*\(min-width: 860px\) and \(max-width: 999px\) and \(min-height: 480px\) and \(max-height: 589px\) \{([^@]*)\}\s*\n/,
+    );
+    expect(block, 'the squeeze block').not.toBeNull();
+    expect(block![1]).toMatch(/\.candidate-aura \{[^}]*width: 104px/);
+    expect(block![1]).toMatch(/\.r1-live__selfview\.r1-selfview \{[^}]*width: 168px/);
   });
 
   it('clips the decorative blobs of the R1 shell, which would add blank scroll', () => {
