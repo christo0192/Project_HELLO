@@ -41,7 +41,11 @@ import r1_world
 # counter by situation), the MEDIUM line's call slot, the WEAK line at most once with a reaction
 # before the 13:00 stall, offer-on-the-table / check-in / commitment-on-record notes, and
 # "pleasant surprise" only on a new offer (the prefix no longer primes it).
-PINNED_CONTENT_SHA256 = "ef3939cde1d9535316e4c403f5473aa8b46b7c74c45504c6db5e70fc99ed8881"
+# Revision 7 (R1-Q round 1 review fixes): the reaction notes say "how it lands for you" and never a
+# course detail (the old wording invited guard-blocked product statements), the F1 anchor reacts to a
+# price already on the table (three variants per case), the one-word filler fallback, and the
+# next-step / e-mail-yield notes.
+PINNED_CONTENT_SHA256 = "cdd583fb820b37260b19593e633f76a9d8e1572a47daf32e0725cf7fae7d1228"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -336,6 +340,22 @@ class PinTests(unittest.TestCase):
             )
             self.assertTrue(manifest["personas"][persona.id]["backstory"])
         self.assertNotIn("haven't thought about that", json.dumps(manifest))
+
+    def test_the_manifest_covers_the_round_1_review_fixes(self):
+        manifest = r1_content.manifest()
+        self.assertGreaterEqual(manifest["revision"], 7)
+        self.assertEqual(manifest["script"]["learner_filler_short"], r1_script.LEARNER_FILLER_SHORT)
+        anchors = {item["id"]: item for item in manifest["negotiation"]["anchor_after_offer"]}
+        self.assertEqual(set(anchors), {"above", "reached"})
+        for item in anchors.values():
+            self.assertEqual(len(item["variants"]), 3)
+            self.assertIn("$7,000", item["must_say"])
+        prompts = manifest["prompts"]
+        self.assertEqual(prompts["react_how_it_lands"], r1_prompts.REACT_HOW_IT_LANDS)
+        self.assertEqual(prompts["next_step_proposed_note"], r1_prompts.NEXT_STEP_PROPOSED_NOTE)
+        self.assertEqual(prompts["email_offer_note"], r1_prompts.EMAIL_OFFER_NOTE)
+        self.assertIn("how their last point lands for you", prompts["checkin_note"])
+        self.assertNotIn("something you liked", json.dumps(manifest))
 
     def test_editing_the_backstory_a_filler_or_the_policy_changes_the_sha(self):
         base = r1_content.content_sha256()

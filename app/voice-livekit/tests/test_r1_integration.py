@@ -1236,12 +1236,14 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
         # R1-Q: no sanctioned stall line; the learner voices a reason in its own words (one model
         # call, a scripted variant if the reply misses it) and agrees to nothing.
         self.assertIs(plan.mode, TurnMode.INTENT)
-        self.assertEqual(plan.negotiation_id, "N-TIMING")
+        # (Round 1: timing is the owed F4 pair's reason and is not voiced early as well, so the
+        # first reason an early ask meets is money.)
+        self.assertEqual(plan.negotiation_id, "N-MONEY")
         self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
         self.assertEqual(len(rig.provider.calls), calls + 1)
         self.assertFalse(rig.engine.commitment_resolved)
         self.assertIn("ask_before_close_window", plan.reasons)
-        self.assertEqual(rig.engine.negotiation.voiced, {"timing": plan.turn})
+        self.assertEqual(rig.engine.negotiation.voiced, {"money": plan.turn})
         self.assertEqual(rig.engine.ledger.leak_total, 0)
 
     async def test_an_ask_in_the_window_gets_the_graded_line_verbatim(self) -> None:
@@ -1298,7 +1300,7 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
             provider=FakeProvider("Okay."),
         )
         plan = rig.plan()
-        self.assertEqual(plan.negotiation_id, "N-TIMING")
+        self.assertEqual(plan.negotiation_id, "N-MONEY")
         self.assertTrue(spoken.startswith("Okay."))
         self.assertNotIn("tomorrow", spoken.lower())
         self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)

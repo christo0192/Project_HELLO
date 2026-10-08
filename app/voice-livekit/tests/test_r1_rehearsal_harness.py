@@ -343,6 +343,32 @@ class ScheduleAndGuardMetricTests(unittest.TestCase):
     def test_hard_fails_of_a_clean_call_are_empty(self) -> None:
         self.assertEqual(metrics.hard_fails({"weak_line_count": 1, "commitment_earned": True}), [])
 
+    def test_a_stall_reason_voiced_twice_is_found_and_fails_the_call(self) -> None:
+        """R1-Q round 1: "I'd rather wait" (N-TIMING) then "not rush ... next batch" (F4-PRIMARY)
+        is the stall loop in different words; the stall-phrase metric cannot see it."""
+        admin = {"negotiation": {"reason_voicings": {"timing": 2, "decision_maker": 1, "money": 1}}}
+        found = metrics.stall_reason_metrics(admin)
+        self.assertEqual(found["stall_reason_repeats"], 1)
+        self.assertEqual(found["stall_reason_repeated"], ["timing"])
+        self.assertEqual(found["stall_reason_voicings"], {"timing": 2, "decision_maker": 1, "money": 1})
+        self.assertIn("stall_reason_repeated", metrics.hard_fails(found))
+        clean = metrics.stall_reason_metrics({"negotiation": {"reason_voicings": {"timing": 1}}})
+        self.assertEqual((clean["stall_reason_repeats"], clean["stall_reason_repeated"]), (0, []))
+        self.assertNotIn("stall_reason_repeated", metrics.hard_fails(clean))
+        for admin in ({}, {"negotiation": {}}, {"negotiation": {"reason_voicings": None}}):
+            self.assertEqual(metrics.stall_reason_metrics(admin)["stall_reason_repeats"], 0)
+
+    def test_call_metrics_carry_the_stall_reason_counts(self) -> None:
+        record = {
+            "header": {"persona_id": "p1_career_switcher", "persona_variant": "v1", "seed": "x"},
+            "rows": [],
+            "exchanges": [],
+            "admin_log": {"negotiation": {"reason_voicings": {"decision_maker": 3}}},
+        }
+        found = metrics.call_metrics(record)
+        self.assertEqual(found["stall_reason_repeats"], 2)
+        self.assertIn("stall_reason_repeated", metrics.hard_fails(found))
+
 
 class GoodCallTests(unittest.TestCase):
     """A hand-written good call passes every deterministic gate (research 4.7)."""

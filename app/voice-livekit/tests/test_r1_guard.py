@@ -221,9 +221,26 @@ class LearnerCommitmentTests(unittest.TestCase):
     def test_the_weak_stall_is_allowed_and_nothing_stronger_is(self):
         context = ctx()
         self.assertEqual(context.commitment_cap, Level.WEAK)
-        self.assertTrue(
-            guard_text("Let me think about it. Just email me the details.", context).clean
-        )
+        # The stall is not a commitment hit; its two sentences are reserved for the scripted
+        # WEAK line (round 1), so the model's copy is dropped as hygiene, never as a leak.
+        result = guard_text("Let me think about it. Just email me the details.", context)
+        self.assertEqual([h.category for h in result.hits], ["repeat", "repeat"])
+        self.assertEqual(result.hits and {h.rule for h in result.hits}, {"repeat_reserved"})
+        self.assertNotIn("commitment", {h.category for h in result.hits})
+        self.assertTrue(guard_text("I will think this over and check with my husband.", context).clean)
+        self.assertTrue(guard_text("Sure, you can email me. What will it include?", context).clean)
+
+    def test_the_cap_follows_the_commitment_on_record(self):
+        """R1-Q round 1: after the scripted MEDIUM line the learner may confirm the call it
+        booked; it still may not go beyond what is on record."""
+        medium = ctx(commitment_cap=Level.MEDIUM)
+        for text in ("Great, talk to you Thursday then.", "Sounds good, see you Thursday."):
+            with self.subTest(text=text):
+                self.assertNotIn("commitment", categories(text, medium))
+                self.assertIn("commitment", categories(text, ctx()))
+        for text in ("Okay, let's do it.", "Send me the enrolment link.", "Sign me up."):
+            with self.subTest(text=text):
+                self.assertIn("commitment", categories(text, medium))
 
     def test_concession_and_resolution_phrasing_is_blocked(self):
         for text in (
@@ -864,9 +881,11 @@ class RepeatGuardTests(unittest.TestCase):
         self.assertIn(result.text, NEUTRAL_ACKS)
 
     def test_a_near_duplicate_is_dropped_in_both_directions(self):
-        said = said_of(self.STALL)
+        said = said_of("Honestly, I have been looking at a few courses for a couple of months.")
         # Contained in an earlier, longer sentence (turn 77 of the owner test).
-        inside = guard_text("Okay, I'll keep that in mind. Just email me the details.", ctx(said=said))
+        inside = guard_text(
+            "Okay, I'll keep that in mind. I have been looking at a few courses.", ctx(said=said)
+        )
         self.assertEqual(inside.text, "Okay, I'll keep that in mind.")
         self.assertEqual(inside.hits[0].rule, "repeat_near")
         # Containing an earlier sentence.
@@ -875,6 +894,39 @@ class RepeatGuardTests(unittest.TestCase):
             ctx(said=said_of("I enjoy building big Excel trackers.")),
         )
         self.assertEqual([h.rule for h in outside.hits], ["repeat_near"])
+
+    def test_the_scripted_weak_line_is_reserved_for_the_worker(self):
+        """R1-Q round 1: if the model said "Let me think about it." for an earlier objection, the
+        scripted WEAK line at 13:00 repeated it exactly; "just email me the details" accepted
+        the e-mail and the WEAK line then asked for it again."""
+        for text in (
+            "Let me think about it.",
+            "Honestly, let me think about it.",
+            "Sure, just email me the details.",
+            "Just email me the details and I'll get back to you.",
+            "Okay, so email me the details whenever you can.",
+        ):
+            with self.subTest(text=text):
+                result = guard_text(f"That makes sense. {text}", ctx())
+                self.assertEqual(result.text, "That makes sense.")
+                self.assertEqual([h.category for h in result.hits], ["repeat"])
+                self.assertEqual([h.rule for h in result.hits], ["repeat_reserved"])
+                self.assertTrue(result.replaced)
+                self.assertFalse(result.fallback_used)
+        ledger = GuardLedger()
+        ledger.record(guard_text("Let me think about it. Just email me the details.", ctx()))
+        self.assertEqual(ledger.summary()["leak_hits"], 0)  # hygiene: never counted toward the gate
+        self.assertFalse(ledger.flagged)
+
+    def test_the_reserved_weak_sentences_are_only_a_learner_rule(self):
+        result = guard_text("Let me think about it for a moment.", ctx(phase="wrapup"))
+        self.assertEqual([h.rule for h in result.hits if h.category == "repeat"], [])
+
+    def test_a_reply_made_only_of_reserved_sentences_is_an_empty_intent_reply(self):
+        quiet = guard_text("Let me think about it.", ctx(quiet_empty=True))
+        self.assertEqual(quiet.text, "")
+        loud = guard_text("Let me think about it.", ctx())
+        self.assertIn(loud.text, NEUTRAL_ACKS)  # only repeats were dropped: a back-channel
 
     def test_short_back_channels_are_never_repeats(self):
         said = said_of("Okay.", "Mm-hmm.", "That makes sense.", "I see.", "Right.")

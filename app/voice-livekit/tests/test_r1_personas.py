@@ -53,6 +53,8 @@ PROBES = {
         "Do you think you will be a part of the group that will be getting laid off?",
         "Are you worried about job security at your company?",
         "So I wanted to wonder what makes you here, what makes you come here",
+        # Owner test turn 43: the layoffs question is the natural H1 opening (round 1 review).
+        "And what makes you get scared of layoffs?",
     ),
     "H2": (
         "What have you tried so far to learn this?",
@@ -67,9 +69,8 @@ PROBES = {
         "Tell me about any past attempts.",
         "What's the biggest gap you feel in your preparation?",
         "What got in the way last time?",
-        # R1-Q owner test b58c7d9c turns 34 and 43.
+        # R1-Q owner test b58c7d9c turn 34.
         "What is the friction or blocker that you have in your career?",
-        "And what makes you get scared of layoffs?",
         "Any pain points with the way you are learning today?",
         "Does the job search stress you out?",
         "What's stopping you from making the switch?",
@@ -465,6 +466,28 @@ class ProbeMatrixTests(unittest.TestCase):
             for text in texts:
                 with self.subTest(topic=topic, text=text):
                     self.assertEqual(detect_probes(text), frozenset())
+
+    def test_the_layoffs_question_is_h1_and_does_not_probe_h2(self):
+        """R1-Q round 1: "scared" released H2's deep need on an H1 question (owner test turn 43)."""
+        for text in (
+            "And what makes you get scared of layoffs?",
+            "Why do you think so? And what makes you get scared of layoffs.",
+            "Do you think you will be getting laid off? Like, why do you think so?",
+            "Are you stressed about job security at your company?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(detect_probes(text), frozenset({"H1"}))
+        # The fear words on their own are still an H2 probe (what held the learner back).
+        for text in (
+            "Does the job search stress you out?",
+            "Are you anxious about the switch?",
+            "What is it that scares or stresses you about learning this?",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("H2", detect_probes(text))
+        # ... and a sentence of the same turn that is NOT about layoffs still counts for H2.
+        both = detect_probes("What makes you get scared of layoffs? Does the search stress you out?")
+        self.assertEqual(both, frozenset({"H1", "H2"}))
 
     def test_company_name_and_sign_off_never_unlock(self):
         """S0-B: 'Interview Kickstart' unlocked H2 in 71/71 runs, 'time' unlocked H3."""

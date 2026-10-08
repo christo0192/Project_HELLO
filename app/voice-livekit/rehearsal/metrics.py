@@ -571,6 +571,27 @@ def schedule_metrics(admin: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def stall_reason_metrics(admin: Mapping[str, Any]) -> dict[str, Any]:
+    """M3c: a stall reason (timing, money, the decision maker) voiced more than once in a call.
+
+    The worker counts each time it proved a reason was raised, whether by a negotiation intent or
+    by the owed F4 pair.  A second voicing is the stall loop in different words ("I'd rather wait",
+    then "I'll look at the next batch"), which the stall-phrase metric cannot see because it only
+    knows the old wording.  Reads the trusted admin log, so it also works on a replay.
+    """
+    voicings = (admin.get("negotiation") or {}).get("reason_voicings") or {}
+    repeated = {
+        reason: count - 1
+        for reason, count in voicings.items()
+        if isinstance(count, int) and count > 1
+    }
+    return {
+        "stall_reason_voicings": dict(voicings),
+        "stall_reason_repeats": sum(repeated.values()),
+        "stall_reason_repeated": sorted(repeated),
+    }
+
+
 def guard_metrics(
     admin: Mapping[str, Any],
     guard_trips: Sequence[Mapping[str, Any]],
@@ -651,6 +672,7 @@ def call_metrics(record: Mapping[str, Any]) -> dict[str, Any]:
     out.update(commitment_metrics(exchanges, admin))
     out.update(misfire_metrics(exchanges))
     out.update(schedule_metrics(admin))
+    out.update(stall_reason_metrics(admin))
     out.update(guard_metrics(admin, record.get("guard_trips") or [], exchanges))
     out.update(latency_metrics(exchanges))
     out["exchanges"] = len(exchanges)
@@ -669,6 +691,8 @@ def hard_fails(metrics: Mapping[str, Any]) -> list[str]:
         fails.append("weak_stall_repeated")
     if (metrics.get("stall_family_rows") or 0) > STALL_PHRASE_LIMIT:
         fails.append("stall_phrases_repeated")
+    if (metrics.get("stall_reason_repeats") or 0) >= 1:
+        fails.append("stall_reason_repeated")
     if metrics.get("long_exact_repeat"):
         fails.append("exact_repeat_sentence")
     if (metrics.get("deflection_count") or 0) >= 1:

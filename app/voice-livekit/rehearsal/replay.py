@@ -28,7 +28,7 @@ from typing import Any, Callable, Mapping, Sequence
 from rehearsal.call import _plan_summary
 from rehearsal.clock import TimingParams
 from rehearsal.llm import Ledger, RecordingProvider
-from rehearsal.metrics import ROLEPLAY, row_metrics
+from rehearsal.metrics import ROLEPLAY, row_metrics, stall_reason_metrics
 from r1_text import word_count
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "r1_owner_b58c7d9c.json"
@@ -186,7 +186,7 @@ async def replay(
         "rows": saved,
         "admin_log": admin,
         "guard_trips": guard_trips,
-        "metrics": row_metrics(saved),
+        "metrics": {**row_metrics(saved), **stall_reason_metrics(admin)},
     }
 
 

@@ -13,7 +13,13 @@ Invariants (each has a test in ``tests/test_r1_negotiation.py``):
 * It only reads advisor text.  It stores turn indices, integers and normalised slot phrases
   (day, clock, part of day), never an utterance.
 * A stall reason (timing, money, decision maker) is used once, and counts as handled only when
-  the advisor addressed it AFTER the learner voiced it.
+  the advisor addressed it AFTER the learner voiced it.  Timing and the decision maker belong to
+  the owed F4 pair: the negotiation skips them until that pair was delivered, so no reason is
+  voiced twice in a call (``Negotiation.voicings``).
+* Prices are tracked from the first mention, not from the learner's anchor.  The advisor
+  questioning or refusing a figure ("Who told you $7,000?", "$7,000 is too low for us") is not an
+  offer, and a figure the learner itself said (the $7,000 anchor above all) is an offer only when
+  the advisor's own clause promises it ("I can do $7,000").
 * The commitment lines stay scripted and masked (``r1_commitment``); this module only picks the
   slot of the MEDIUM line (the advisor's evening or weekend proposal, else 7 PM) and whether
   the WEAK line was already said.  The WEAK line is said at most once per session.
@@ -24,7 +30,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 from r1_commitment import DEFAULT_SLOT, Level
 from r1_scheduler import has_refusal, markers_match
@@ -32,6 +38,7 @@ from r1_text import (
     canonical_amounts,
     clause_after,
     clause_before,
+    dollar_amounts,
     fold,
     is_question_like,
     negated_before,
@@ -322,6 +329,68 @@ COUNTERS: tuple[CounterSituation, ...] = (
 COUNTER_BY_SITUATION = {item.id: item for item in COUNTERS}
 
 
+@dataclass(frozen=True)
+class AnchorSituation:
+    """The F1 anchor ("$9,000 is a lot, I heard $7,000") when a price is already on the table.
+
+    In the rehearsal sweep the advisor offered "$2,000 off, so $7,000" at 0:10 and "$2,500 off"
+    at 1:05, and the learner still anchored with "I heard people got it for around $7,000".  The
+    anchor keeps its exact figures but reacts to the number the advisor already gave.
+    """
+
+    id: str
+    brief: str
+    must_say: tuple[str, ...]
+    variants: tuple[str, ...]
+
+
+ANCHOR_ABOVE = "above"
+ANCHOR_REACHED = "reached"
+
+
+def _usd(amount: int) -> str:
+    return f"${int(amount):,}"
+
+
+def anchor_after_offer(offer_usd: int) -> AnchorSituation:
+    """The anchor that reacts to ``offer_usd``, the best price already on the table."""
+    amount = _usd(offer_usd)
+    if offer_usd > ANCHOR_USD:
+        return AnchorSituation(
+            ANCHOR_ABOVE,
+            f"the advisor has already come down to {amount}; you say that is still a lot for "
+            "you, that you heard people got it for around $7,000, and you ask if the advisor "
+            "can do that",
+            (amount, "$7,000"),
+            (
+                f"{amount} is still a lot for me, and I heard people got it for around $7,000. "
+                "Can you do that?",
+                f"Honestly {amount} is still a stretch, and I read some people paid about "
+                "$7,000. Is that possible?",
+                f"Okay, but {amount} is still a big number for me, and I heard it went for "
+                "around $7,000. Can you match that?",
+            ),
+        )
+    relation = (
+        "the very price you heard people got it for"
+        if offer_usd == ANCHOR_USD
+        else "below the $7,000 you heard people got it for"
+    )
+    return AnchorSituation(
+        ANCHOR_REACHED,
+        f"the advisor has already put {amount} on the table, {relation}; you sound pleased and "
+        "ask whether that really is the final price",
+        tuple(dict.fromkeys((amount, "$7,000"))),
+        (
+            "That's close to the $7,000 I heard people got it for. Is that really the final "
+            "price?",
+            "Oh, that's in line with the $7,000 I heard about. Is that the best price, then?",
+            "I heard people got it for around $7,000, so that sounds about right. Is that your "
+            "final price?",
+        ),
+    )
+
+
 def fill_decision_maker(text: str, decision_maker: str, *, regex: bool = False) -> str:
     """``text`` with ``{decision_maker}`` filled (escaped when it goes into a regex)."""
     value = re.escape(decision_maker) if regex else decision_maker
@@ -488,10 +557,18 @@ _DAY_WORDS = (
     r"(?:tomorrow|tonight|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"next week|this week|the weekend|this weekend|weekend)"
 )
+# "call you on/at/in/next/this ..." is a callback only when a day, a clock time or a part of the
+# day follows ("call you at 7 pm", "call you on Monday"); "reach you on the next session" is a
+# pitch about the programme, not a proposal (R1-Q round 1, review 2).
+_WHEN_WORD = (
+    r"(?:tomorrow|tonight|today|later|next week|this week|the weekend|this weekend|weekend|"
+    r"(?:on|at|this|next|in|around|by|after|before)\s+(?:the\s+)?(?:monday|tuesday|wednesday|"
+    r"thursday|friday|saturday|sunday|tomorrow|tonight|today|\d|noon|midnight|morning|afternoon|"
+    r"evening|night|(?:a )?(?:few|couple)|one|two|three|four|five|six|seven|eight|nine|ten))"
+)
 _CALLBACK = _compile(
     r"\bcall(?:ing)? (?:you |me )?back\b",
-    r"\b(?:call|ring|phone|ping|text|reach) (?:you|me) (?:back |again )?(?:tomorrow|tonight|"
-    r"today|later|on|at|this|next|in)\b",
+    r"\b(?:call|ring|phone|ping|text) (?:you|me) (?:back |again )?" + _WHEN_WORD + r"\b",
     r"\bwhen (?:you|i|we) (?:call|ring|phone) (?:me|you)\b",
     r"\b(?:schedul\w*|set up|book|arrange|fix|plan|organi[sz]e|pencil in)\b[^.?!]{0,30}\b"
     r"(?:call|chat|meeting|session|follow[- ]?up|catch[- ]?up|conversation|time|slot)\b",
@@ -504,13 +581,37 @@ _CALLBACK = _compile(
     r"\bwhen (?:can|will|should) i expect\b",
     r"\bget back to (?:me|us)\b",
 )
+# An e-mail OFFER is a first-person promise to send information: "I'll email you the details",
+# "let me send you the brochure", "I will mail that once we finish".  A pitch about what the
+# programme sends ("we send you the recordings after every class", "we will send you a
+# certificate", "the platform will send you an email reminder") is not one (R1-Q round 1,
+# review 2): the subject must be I / we / let me with a modal, and the object must be
+# information or a pronoun followed by a "when" cue.
+_OFFER_SUBJECT = (
+    r"(?:(?:i|we)(?:'ll|'d|'m going to| am going to| are going to| will| can| could| shall|"
+    r" would)|let me|let us|let'?s)"
+)
+_MAIL_VERB = r"(?:e-?mail|mail|send)"
+_MAIL_INFO = (
+    r"(?:details|brochure|curriculum|syllabus|information|info|summary|link|everything|"
+    r"overview|outline|breakdown|pricing|fee structure|proposal|document|pdf|schedule|"
+    r"timetable|payment details)"
+)
 _EMAIL_OFFER = _compile(
-    r"\b(?:i|we|let me|let us|let'?s)(?:'ll| will| can| could| shall)? (?:also |then |just )?"
-    r"(?:e-?mail|mail|send)\b[^.?!]{0,40}\b(?:details|brochure|curriculum|information|info|"
-    r"summary|link|everything|that|this|it|them|over|you)\b",
-    r"\bsend (?:you |me )?(?:an? )?(?:e-?mail|mail)\b",
-    r"\bsend (?:it|them|that|this|everything) (?:over|across|to you|on)\b",
-    r"\bi(?:'ll| will) (?:drop|shoot) you (?:an? )?(?:e-?mail|mail|message)\b",
+    r"\b" + _OFFER_SUBJECT + r"\s+(?:also |then |just |happily |gladly |definitely |actually )?"
+    + _MAIL_VERB + r"\b[^.?!]{0,30}\b" + _MAIL_INFO + r"\b",
+    r"\b" + _OFFER_SUBJECT + r"\s+(?:also |then |just )?(?:send|shoot|drop|mail|e-?mail) "
+    r"(?:you |me )?(?:an? )?(?:e-?mail|mail|message)\b"
+    r"(?!\s+(?:reminders?|notifications?|updates?|alerts?|newsletters?|receipts?|"
+    r"confirmations?|invites?)\b)",
+    r"\b" + _OFFER_SUBJECT + r"\s+(?:also |then |just )?" + _MAIL_VERB + r" "
+    r"(?:it|that|this|them|everything)\b[^.?!]{0,15}\b(?:over|across|once|after|later|today|"
+    r"tonight|shortly|right now|right away|when|as soon)\b",
+)
+_RECURRING = re.compile(
+    r"\b(?:every|each) (?:class|week|session|day|month|module|lecture|friday|monday|saturday|"
+    r"sunday)\b",
+    re.IGNORECASE,
 )
 _CHECKIN = _compile(
     r"\bwhat do you think(?: about (?:that|this|it|all (?:of )?(?:this|that)))?(?: so far)?"
@@ -596,6 +697,7 @@ def detect_email_offer(text: object) -> bool:
     return any(
         pattern.search(sentence)
         for sentence in split_sentences(folded)
+        if _RECURRING.search(sentence) is None
         for pattern in _EMAIL_OFFER
     )
 
@@ -679,15 +781,91 @@ _CONDITIONAL = re.compile(
 )
 
 
-def _offered(lowered: str, start: int, end: int) -> bool:
-    """False when the amount at ``start:end`` is the learner's ask echoed, negated or refused."""
+# The advisor questioning or refusing a figure is not offering it (R1-Q round 1): "Where did you
+# hear that $7,000?  That's not something we offer", "$7,000 is too low for us", "Sorry, $7,000 is
+# impossible", "Who told you $7,000?  That was an old promo".
+_PRICE_NO = re.compile(
+    r"\b(?:impossible|too (?:low|much|little|less)|not (?:correct|realistic|true|right|valid|"
+    r"accurate|available)|old promo\w*|needs? (?:to get )?(?:an? )?approval|(?:we|i) don'?t do|"
+    r"don'?t think (?:we|i) can|no longer|expired|never (?:offered|promised))\b",
+    re.IGNORECASE,
+)
+# A figure the LEARNER said (the $7,000 anchor, or any amount it spoke) is only an offer when
+# the advisor's own clause promises it: "I can do $7,000", "let's make it 7000", "7000 then".
+_FIRST_PERSON_OFFER = re.compile(
+    r"\b(?:i|we)(?:'ll|'d|'m (?:able|happy|willing|going) to| am (?:able|happy|willing|going) "
+    r"to| are (?:able|happy|willing|going) to| will| can| could| would| shall)\s+"
+    r"(?:\w+\s+){0,3}?(?:do|make|give|offer|get|bring|take|go|settle|meet|match|put|approve|"
+    r"extend|arrange|keep|say|cut|knock|drop|reduce|lower|close|come)\b"
+    r"|\blet'?s (?:\w+\s+){0,2}?(?:make|do|say|go|settle|keep|call|close|meet)\b"
+    r"|\bhow about\b|\bwhat if (?:i|we)\b|\bmake it\b",
+    re.IGNORECASE,
+)
+_ACCEPTING_AFTER = re.compile(
+    r"^\s*(?:then|it is|it'?s (?:a deal|done|yours)|for you|works|deal|"
+    r"is (?:fine|okay|ok|good|doable|possible|done|a deal|acceptable|alright))\b",
+    re.IGNORECASE,
+)
+# A question can still carry an offer.  "How about $8,000?", "What if I do $8,000?", "Can I do
+# $8,000 for you?" are offers whatever the question word; "Would $8,500 work for you?" and "I can
+# do $8,000, okay?" are offers too, but a wh-question ("Who told you we could do $7,000?", "Where
+# did you hear $7,000 would work?") is the advisor asking about a figure, not making it.
+_OFFER_VERB = (
+    r"(?:do|offer|give|make|bring|take|go|settle|meet|match|put|knock|cut|drop|reduce|lower)"
+)
+_QUESTION_OFFER_ALWAYS = re.compile(
+    r"\b(?:how|what) about\b|\bwhat if (?:i|we)\b|\b(?:want|like) me to\b[^?]{0,20}\b"
+    + _OFFER_VERB + r"\b|\b(?:shall|can|could|may) (?:i|we) (?:\w+ ){0,2}?" + _OFFER_VERB + r"\b",
+    re.IGNORECASE,
+)
+_QUESTION_OFFER_PLAIN = re.compile(
+    r"\b(?:would|will|does|do|is|are)\b[^?]{0,25}\b(?:work|fine|ok|okay|alright|acceptable|"
+    r"good|comfortable|suit\w*)\b",
+    re.IGNORECASE,
+)
+_WH_START = re.compile(
+    r"^\W*(?:(?:and|so|but|um|uh|well|okay|ok|now|then)\W+)*(?:who|whom|whose|where|why|what|"
+    r"which|when|how)\b(?!\s+about\b)",
+    re.IGNORECASE,
+)
+
+
+def _question_is_an_offer(lowered: str) -> bool:
+    """A question sentence phrased as an offer (see the frames above)."""
+    if _QUESTION_OFFER_ALWAYS.search(lowered) is not None:
+        return True
+    if _WH_START.match(lowered) is not None:
+        return False
+    return (
+        _QUESTION_OFFER_PLAIN.search(lowered) is not None
+        or _FIRST_PERSON_OFFER.search(lowered) is not None
+    )
+
+
+def _promised(lowered: str, start: int, end: int) -> bool:
+    """The advisor's own clause promises the amount at ``start:end`` ("I can do $7,000")."""
+    return bool(
+        _FIRST_PERSON_OFFER.search(clause_before(lowered, start))
+        or _ACCEPTING_AFTER.search(clause_after(lowered, end))
+    )
+
+
+def _offered(lowered: str, start: int, end: int, *, learner_said: bool = False) -> bool:
+    """False when the amount at ``start:end`` is the learner's ask echoed, negated or refused.
+
+    ``learner_said`` marks a figure the learner itself spoke (the $7,000 anchor or any amount it
+    said): the advisor repeating it is an offer only when the same clause promises it.
+    """
     before = clause_before(lowered, start)
     cue = _OFFER_CUE.search(before) is not None
     if _ASK_ECHO.search(before) and not cue:
         return False
     if negated_before(lowered, start, 8):
         return False
-    return not (has_refusal(clause_after(lowered, end)) and not cue)
+    after = clause_after(lowered, end)
+    if (has_refusal(after) or _PRICE_NO.search(after)) and not cue:
+        return False
+    return not learner_said or _promised(lowered, start, end)
 
 
 # A sentence is read in pieces of at most this many characters: speech-to-text may run a whole
@@ -713,16 +891,32 @@ def _pieces(sentence: str) -> list[str]:
     return pieces
 
 
-def _piece_offers(piece: str) -> dict[int, bool]:
-    """Net prices (and whether each is conditional) offered in one piece of a sentence."""
+def _piece_offers(piece: str, own: frozenset[int] = frozenset()) -> dict[int, bool]:
+    """Net prices (and whether each is conditional) offered in one piece of a sentence.
+
+    ``own`` are the figures the learner said (the anchor among them): the advisor repeating
+    one is an offer only with a promise in the same clause.  A question offers nothing unless
+    it is phrased as an offer ("How about $8,000?", "Would $8,500 work for you?").
+    """
     lowered = canonical_amounts(piece).lower()
+    # A question phrased as an offer promises the figure itself, so it needs no further promise.
+    asked_as_offer = False
+    if is_question_like(piece):
+        asked_as_offer = _question_is_an_offer(lowered)
+        if not asked_as_offer:
+            return {}
     conditional = _CONDITIONAL.search(lowered) is not None
     found: dict[int, bool] = {}
     discounts: set[int] = set()
     small: set[int] = set()
     for match in _DOLLARS.finditer(lowered):
         value = parse_amount(match.group(1), bool(match.group(2)))
-        if value is None or not _offered(lowered, match.start(), match.end()):
+        if value is None or not _offered(
+            lowered,
+            match.start(),
+            match.end(),
+            learner_said=value in own and not asked_as_offer,
+        ):
             continue
         as_discount = _OFF_AFTER.match(lowered[match.end() :]) is not None
         if _DISCOUNT_BEFORE.search(lowered[: match.start()]) is not None:
@@ -744,7 +938,10 @@ def _piece_offers(piece: str) -> dict[int, bool]:
             for match in pattern.finditer(lowered):
                 value = int(round(float(match.group(1)) * 1000))
                 if MIN_NET_USD <= value < PRICE_USD and _offered(
-                    lowered, match.start(), match.end()
+                    lowered,
+                    match.start(),
+                    match.end(),
+                    learner_said=value in own and not asked_as_offer,
                 ):
                     found[value] = conditional
         for match in _BARE_WHOLE.finditer(lowered):
@@ -752,24 +949,34 @@ def _piece_offers(piece: str) -> dict[int, bool]:
             if (
                 value is not None
                 and MIN_NET_USD <= value < PRICE_USD
-                and _offered(lowered, match.start(), match.end())
+                and _offered(
+                    lowered,
+                    match.start(),
+                    match.end(),
+                    learner_said=value in own and not asked_as_offer,
+                )
             ):
                 found[value] = conditional
     return found
 
 
-def parse_price_offers(text: object) -> list[tuple[int, bool]]:
+def parse_price_offers(
+    text: object, own_amounts: Iterable[int] = ()
+) -> list[tuple[int, bool]]:
     """Net prices the advisor put on the table, as ``(net_usd, conditional)`` pairs.
 
     Reads "$8,500", "8500", "8.5", "8.5k" (a bare number only next to a price cue) and
     "$500 off" / "10% off" (converted to the price they leave).  The learner's own ask
-    echoed back ("you want the deal at 7000"), a refused figure and a LIST of deck discounts
-    ("discounts of $500, $1000 and $1500") are not offers.
+    echoed back ("you want the deal at 7000"), a refused or questioned figure ("$7,000 is too
+    low for us", "Who told you $7,000?") and a LIST of deck discounts ("discounts of $500,
+    $1000 and $1500") are not offers.  The $7,000 anchor, and every figure in ``own_amounts``
+    (what the learner said), counts only when the advisor promises it ("I can do $7,000").
     """
+    own = frozenset({ANCHOR_USD, *own_amounts})
     offers: dict[int, bool] = {}
     for sentence in split_sentences(_tail(text)):
         for piece in _pieces(sentence):
-            offers.update(_piece_offers(piece))
+            offers.update(_piece_offers(piece, own))
     return sorted(offers.items(), reverse=True)
 
 
@@ -802,16 +1009,19 @@ class NegotiationTurn:
     offers: tuple[PriceOffer, ...]
     refusal: bool
     reasons_handled: frozenset[str]
+    # True when the turn put a price on the table that the learner's anchor has already been
+    # delivered against, whether that price is new or a restatement of an earlier one.
+    answered_price: bool = False
 
     @property
     def offer_added(self) -> bool:
-        """A price that was not on the table before was offered this turn."""
+        """A price that was not on the table before (this session) was offered this turn."""
         return bool(self.offers)
 
     @property
     def price_answer(self) -> bool:
-        """The advisor answered the learner's anchor (an offer or a refusal)."""
-        return bool(self.offers) or self.refusal
+        """The advisor answered the learner's anchor (an offer, a restated offer or a refusal)."""
+        return self.answered_price or self.refusal
 
 
 class Negotiation:
@@ -821,6 +1031,12 @@ class Negotiation:
         self.decision_maker = decision_maker
         self.offers: list[PriceOffer] = []
         self.refusals = 0
+        # True once an advisor turn AFTER the learner's anchor put a price on the table (new or
+        # restated); with it the best offer is the answer to the anchor, otherwise a refusal is.
+        self.answer_offer = False
+        # Whole-dollar figures the learner said: the advisor repeating one is not an offer
+        # unless the advisor promises it (``parse_price_offers``).
+        self.own_amounts: set[int] = set()
         self.callbacks: list[dict[str, Any]] = []
         self.last_slot: Slot | None = None
         self.email_offers: list[int] = []
@@ -828,6 +1044,9 @@ class Negotiation:
         self.question_used = False
         self.checkins = 0
         self.voiced: dict[str, int] = {}
+        # How many times each stall reason was voiced (N-* or the owed F4 move): more than one
+        # per reason is the stall loop in different words (R1-Q round 1).
+        self.voicings: dict[str, int] = {}
         self.handled: dict[str, int] = {}
         self.stall_rounds = 0
         self.responses: list[dict[str, Any]] = []
@@ -841,7 +1060,13 @@ class Negotiation:
     def observe(
         self, turn: int, text: object, *, anchor_turn: int | None = None
     ) -> NegotiationTurn:
-        """Read one advisor turn.  ``anchor_turn`` is the learner turn of the $7,000 ask."""
+        """Read one advisor turn.  ``anchor_turn`` is the learner turn of the $7,000 ask.
+
+        Prices are tracked from the first mention, not from the anchor: an offer made before
+        the learner asked for $7,000 is on the table, so the anchor can react to it and a later
+        restatement of it is never "new".  A refusal only answers the anchor, so it counts after
+        it.
+        """
         callback = detect_callback(text)
         if callback is not None:
             self.callbacks.append({"turn": turn, "has_slot": callback.slot is not None})
@@ -856,10 +1081,15 @@ class Negotiation:
         after_anchor = anchor_turn is not None and turn > anchor_turn
         offers: list[PriceOffer] = []
         refusal = False
+        mentioned = False
+        for net, conditional in parse_price_offers(text, self.own_amounts):
+            mentioned = True
+            if all(item.net_usd != net for item in self.offers + offers):
+                offers.append(PriceOffer(turn, net, conditional))
+        answered_price = after_anchor and mentioned
+        if answered_price:
+            self.answer_offer = True
         if after_anchor:
-            for net, conditional in parse_price_offers(text):
-                if all(item.net_usd != net for item in self.offers):
-                    offers.append(PriceOffer(turn, net, conditional))
             refusal = refuses_price(text)
             if refusal:
                 self.refusals += 1
@@ -878,11 +1108,19 @@ class Negotiation:
             offers=tuple(offers),
             refusal=refusal,
             reasons_handled=frozenset(newly),
+            answered_price=answered_price,
         )
+
+    def note_learner_text(self, spoken: object) -> None:
+        """Remember the figures the learner said, so the advisor repeating one is not an offer."""
+        for amount in dollar_amounts(spoken):
+            if 0 < amount <= PRICE_USD:
+                self.own_amounts.add(amount)
 
     def note_reason_voiced(self, reason: str, turn: int) -> None:
         """The learner raised ``reason`` (a stall reason intent, or the owed F4 moves)."""
         self.voiced.setdefault(reason, turn)
+        self.voicings[reason] = self.voicings.get(reason, 0) + 1
 
     def note_spoken(self, spec_id: str, spoken: object, turn: int) -> bool:
         """Record that spec ``spec_id`` was raised, if the played text proves it."""
@@ -920,9 +1158,13 @@ class Negotiation:
         return min((item.net_usd for item in self.offers), default=None)
 
     def price_situation(self) -> str:
-        """How the advisor answered the anchor: short of the ask, met it, refused, or unclear."""
+        """How the advisor answered the anchor: short of the ask, met it, refused, or unclear.
+
+        The best price on the table counts, whenever it was offered; but an advisor who only
+        REFUSED after the anchor (an earlier offer is not repeated) has refused.
+        """
         best = self.best_offer_usd
-        if best is not None:
+        if best is not None and (self.answer_offer or not self.refusals):
             return SITUATION_MET if best <= ANCHOR_USD else SITUATION_SHORT
         if self.refusals:
             return SITUATION_REFUSED
@@ -931,13 +1173,26 @@ class Negotiation:
     def counter_situation(self) -> CounterSituation:
         return COUNTER_BY_SITUATION[self.price_situation()]
 
-    def next_reason(self) -> str | None:
-        """The first stall reason the learner has not raised yet, in ``REASONS`` order."""
-        return next((reason for reason in REASONS if reason not in self.voiced), None)
+    def next_reason(self, skip: Iterable[str] = ()) -> str | None:
+        """The first stall reason the learner has not raised yet, in ``REASONS`` order.
 
-    def can_stall(self) -> bool:
+        ``skip`` are reasons an owed objection will voice in its own right (the F4 pair owns
+        timing and the decision maker): raising them here as well would be the same stall
+        twice, back to back.
+        """
+        skipped = set(skip)
+        return next(
+            (
+                reason
+                for reason in REASONS
+                if reason not in self.voiced and reason not in skipped
+            ),
+            None,
+        )
+
+    def can_stall(self, skip: Iterable[str] = ()) -> bool:
         """Whether an ask inside the close window may still be met with a reason."""
-        return self.stall_rounds < MAX_STALL_ROUNDS and self.next_reason() is not None
+        return self.stall_rounds < MAX_STALL_ROUNDS and self.next_reason(skip) is not None
 
     @property
     def reasons_handled_count(self) -> int:
@@ -964,6 +1219,7 @@ class Negotiation:
             "email_answered": self.email_answered,
             "checkins": self.checkins,
             "reasons_voiced": dict(self.voiced),
+            "reason_voicings": dict(self.voicings),
             "reasons_handled": dict(self.handled),
             "stall_rounds": self.stall_rounds,
             "responses": list(self.responses),

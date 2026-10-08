@@ -1109,11 +1109,46 @@ class FarewellScopeTests(unittest.TestCase):
             with self.subTest(tail=tail):
                 self.assertFalse(is_close_attempt(f"{self.LONG_ANSWER} {tail}", 345))
 
+    def test_the_tail_is_read_on_words_not_on_one_punctuation(self):
+        """R1-Q round 1: only ". Bye" was fixed; "So yeah, bye." / "So yeah. Bye bye." /
+        "So yeah, okay, bye." still redirected with "before you go" and burned the attempt."""
+        for tail in (
+            "So yeah. Bye",
+            "So yeah, bye.",
+            "So yeah. Bye bye.",
+            "So yeah, okay, bye.",
+            "Okay, thank you, bye.",
+            "So yeah, okay, thank you, bye bye!",
+        ):
+            for prefix in ("", "So that is the whole thing. "):
+                with self.subTest(tail=tail, prefix=prefix):
+                    text = f"{self.LONG_ANSWER} {prefix}{tail}"
+                    self.assertFalse(is_close_attempt(text, 345), text)
+        s = make()
+        signals = s.observe_candidate_turn(f"{self.LONG_ANSWER} So yeah, bye.", 345)
+        self.assertFalse(signals.close_attempt)
+        self.assertEqual(s.close_attempts, 0)  # the advisor's next real goodbye still counts once
+
+    def test_a_tail_with_a_real_word_in_it_stays_a_goodbye(self):
+        for tail in (
+            "Take care. Bye.",
+            "So yeah, take care, bye.",
+            "Thanks for your time. Bye.",
+            "Have a great day, bye.",
+            "Bye for now.",
+        ):
+            with self.subTest(tail=tail):
+                self.assertTrue(is_close_attempt(f"{self.LONG_ANSWER} {tail}", 345), tail)
+        # ... and a short turn is never read as a tail.
+        for text in ("So yeah, bye.", "Okay, thank you, bye bye.", "Okay, bye."):
+            with self.subTest(text=text):
+                self.assertTrue(is_close_attempt(text, 345), text)
+
     def test_a_bye_in_a_short_turn_or_with_other_words_is_still_a_goodbye(self):
         self.assertTrue(is_close_attempt("Okay, bye.", 345))
         self.assertTrue(is_close_attempt("Alright. Bye.", 345))
         self.assertTrue(is_close_attempt("Thanks for the chat, bye.", 345))
-        self.assertTrue(is_close_attempt(f"{self.LONG_ANSWER} Okay, bye bye.", 345))
+        self.assertTrue(is_close_attempt("Okay, bye bye.", 345))
         self.assertTrue(is_close_attempt(f"{self.LONG_ANSWER} Bye for now.", 345))
         self.assertTrue(is_close_attempt(f"{self.LONG_ANSWER} Thanks for your time. Bye", 345))
 
@@ -1138,6 +1173,26 @@ class FarewellScopeTests(unittest.TestCase):
         self.assertFalse(is_close_attempt(opener, 100))
         sign_off = "Great, thanks for your time. I'll send the details."
         self.assertTrue(is_close_attempt(sign_off, 300))
+
+    def test_thanks_for_your_time_is_not_a_goodbye_when_the_advisor_goes_on_talking(self):
+        """R1-Q round 1: "Thanks for your time. So, coming to the fees, it's nine thousand."
+        redirected with "before you go" and consumed the attempt."""
+        for text in (
+            "Thanks for your time. So, coming to the fees, it's nine thousand.",
+            "Thanks for your time today. Now the program is six months long and has projects.",
+            "Great, thanks for your time. Let me explain the curriculum in detail now.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_close_attempt(text, 300), text)
+        for text in (
+            "Thanks for your time. Bye.",
+            "Thanks for your time. Take care.",
+            "Thanks for your time. Have a great day.",
+            "Thanks for your time. I'll send the details.",
+            "Thanks for your time. Feel free to reach out if you have questions.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_close_attempt(text, 300), text)
 
 
 class RefusalVocabularyTests(unittest.TestCase):

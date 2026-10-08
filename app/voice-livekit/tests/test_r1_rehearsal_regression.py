@@ -41,6 +41,7 @@ TURN_52_GROUP = 10  # row 51 ends "... So yeah. Bye": a trailing STT tail, not a
 CALLBACK_GROUP = 15  # rows 62-66, "Can we do a schedule to call back tomorrow? ... 10:00 a.m."
 TIME_CUE_GROUP = 18  # rows 78: where the original learner's time cue (turn 79) landed
 STALL_GROUP = 22  # the first group at or after 13:00 in the replay (original stall: turn 92)
+CALLBACK_HUSBAND_GROUP = 18  # rows 78: "when you call me back, I can also talk to your husband ..."
 WEAK = stall_line("")
 FIXTURE = replay.load_fixture()
 
@@ -144,8 +145,16 @@ class ReplayInvariantTests(unittest.TestCase):
         cls.spoken = [turn.spoken for turn in cls.turns if turn.spoken]
 
     def test_the_whole_call_is_replayed(self) -> None:
-        self.assertGreaterEqual(len(self.turns), 20)
+        # Round 1 tightened the e-mail and callback detectors (a pitch about recordings or "the next
+        # session" is no offer or proposal), so the families finish earlier and the advisor's
+        # turn-78 offer to include the husband earns the MEDIUM call at group 18; the role-play
+        # ends there, as it does in a live call.
+        self.assertGreaterEqual(len(self.turns), 17)
         self.assertTrue(all(turn.plan is not None for turn in self.turns))
+        commitment = self.result["admin_log"]["commitment"]
+        self.assertEqual((commitment["level"], commitment["resolved"]), ("MEDIUM", True))
+        self.assertEqual(self.turns[-1].group, CALLBACK_HUSBAND_GROUP)
+        self.assertEqual(self.turns[-1].mode, "say_only")
 
     def test_the_stall_is_never_said_twice(self) -> None:
         self.assertLessEqual(self.found["weak_line_count"], 1)
@@ -193,6 +202,47 @@ class ReplayInvariantTests(unittest.TestCase):
         for word in ("tomorrow", "10:00", "8:00"):
             self.assertNotIn(word, turn.reminder.lower())
         self.assertNotIn("tomorrow", turn.spoken.lower())
+
+    def test_a_callback_that_yields_to_a_forced_move_still_gets_a_reaction(self) -> None:
+        """Round 1: the callback of rows 62-66 was answered with a price question that ignored it.
+
+        Whenever an ask or callback yields to an owed move that is not the F4 stall, the learner is
+        also told to react to the proposal (in a few words, without agreeing)."""
+        seen = 0
+        for turn in self.turns:
+            reasons = turn.plan["reasons"]
+            if "ask_yields_to_owed_move" in reasons and not (turn.plan["move_id"] or "").startswith("F4"):
+                seen += 1
+                self.assertIn("The advisor just proposed a call or a next step", turn.reminder)
+        callback = self.turns[CALLBACK_GROUP - 1]
+        self.assertIn("ask_yields_to_owed_move", callback.plan["reasons"])
+        self.assertTrue((callback.plan["move_id"] or "").startswith("F4") or seen >= 1)
+
+    def test_no_stall_reason_is_voiced_twice(self) -> None:
+        """Round 1: N-TIMING then F4-PRIMARY was "wait a little longer" twice in six turns."""
+        voicings = self.result["admin_log"]["negotiation"]["reason_voicings"]
+        self.assertTrue(voicings, "the F4 pair voices timing and the decision maker")
+        for reason, count in voicings.items():
+            with self.subTest(reason=reason):
+                self.assertEqual(count, 1)
+        self.assertEqual(self.found["stall_reason_repeats"], 0)
+        self.assertNotIn("stall_reason_repeated", metrics.hard_fails(self.found))
+
+    def test_no_pleasant_surprise_for_an_amount_that_was_already_offered(self) -> None:
+        """Round 1: group 18 primed "a better price on the table: $8,500" after $8,500 was offered."""
+        primed: list[str] = []
+        for turn in self.turns:
+            for line in (turn.reminder or "").splitlines():
+                if "put a better price on the table" in line:
+                    primed.append(line)
+        self.assertEqual(len(primed), len(set(primed)), primed)
+        offered = [offer["net_usd"] for offer in self.result["admin_log"]["negotiation"]["offers"]]
+        self.assertEqual(offered, sorted(set(offered), reverse=True))
+
+    def test_the_counter_follows_the_advisors_real_answer(self) -> None:
+        counter = next(t for t in self.turns if t.plan["move_id"] == "F1-COUNTER")
+        self.assertIn("came down a little", counter.reminder)  # $8,500: short of the ask
+        self.assertEqual(self.result["admin_log"]["negotiation"]["price_situation"], "short")
 
     def test_a_trailing_bye_is_not_an_early_farewell(self) -> None:
         turn = self.turns[TURN_52_GROUP - 1]

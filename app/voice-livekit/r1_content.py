@@ -42,7 +42,10 @@ import r1_world
 #    stall reasons / e-mail yes / call question as intents, the price counter by situation, the
 #    WEAK line at most once (a reaction before the 13:00 stall), offer-on-the-table and
 #    check-in notes, "pleasant surprise" only on a new offer.
-CONTENT_REVISION = 6
+# 7: R1-Q round 1 review fixes: the reaction notes say "how it lands for you" and never repeat a
+#    course detail (guard-safe), the anchor reacts to a price already on the table, the filler
+#    falls back to a one-word hum, and the next-step / e-mail-yield notes.
+CONTENT_REVISION = 7
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -92,6 +95,7 @@ def manifest() -> dict[str, Any]:
             "exit_cue": r1_script.EXIT_CUE,
             "lines": dict(r1_script.LINES),
             "learner_filler_variants": list(r1_script.LEARNER_FILLER_VARIANTS),
+            "learner_filler_short": r1_script.LEARNER_FILLER_SHORT,
         },
         "learner_policy": r1_world.LEARNER_POLICY,
         "state_names": dict(r1_personas.STATE_NAMES),
@@ -145,6 +149,18 @@ def manifest() -> dict[str, Any]:
                 for item in r1_negotiation.COUNTERS
             ],
             "commit_reaction_brief": r1_negotiation.COMMIT_REACTION_BRIEF,
+            "anchor_after_offer": [
+                {
+                    "id": item.id,
+                    "brief": item.brief,
+                    "must_say": list(item.must_say),
+                    "variants": list(item.variants),
+                }
+                for item in (
+                    r1_negotiation.anchor_after_offer(8500),
+                    r1_negotiation.anchor_after_offer(7000),
+                )
+            ],
             "reasons": list(r1_negotiation.REASONS),
             "constants": {
                 "max_stall_rounds": r1_negotiation.MAX_STALL_ROUNDS,
@@ -224,6 +240,9 @@ def manifest() -> dict[str, Any]:
             "checkin_note": r1_prompts.CHECKIN_NOTE,
             "checkin_done_note": r1_prompts.CHECKIN_DONE_NOTE,
             "email_again_note": r1_prompts.EMAIL_AGAIN_NOTE,
+            "email_offer_note": r1_prompts.EMAIL_OFFER_NOTE,
+            "next_step_proposed_note": r1_prompts.NEXT_STEP_PROPOSED_NOTE,
+            "react_how_it_lands": r1_prompts.REACT_HOW_IT_LANDS,
             "reaction_only_note": r1_prompts.REACTION_ONLY_NOTE,
             "forced_note": r1_prompts.FORCED_NOTE,
         },

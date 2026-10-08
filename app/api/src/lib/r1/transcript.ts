@@ -92,11 +92,17 @@ export const R1_NAME_MASK = '[CANDIDATE]';
  * husband so we can decide.", or "Daytime is tough for me, so let's book a call ... so we can
  * decide."), so it is recognised by its fixed frame, not by one slot: the worker keeps it ONE
  * sentence that starts the call booking and ends "so we can decide".
+ *
+ * The worker persists the text the SDK actually forwarded, so a barge-in can cut the line off
+ * before "so we can decide" ("Let's book a call tomorrow at 7 PM with my husband so we"). The
+ * opening "let's book a call" is therefore masked on its own: the learner guard blocks that
+ * phrase in free text, so only the scripted line can contain it.
  */
 const COMMITMENT_PATTERNS: readonly RegExp[] = [
   /send me the enrol+ment link/i,
   /pay the deposit today/i,
   /book a call\b[^.!?]*\bso we can decide/i,
+  /\blet['’]?s book a call\b/i,
   /email me the details and i['’]?ll get back to you/i,
 ];
 

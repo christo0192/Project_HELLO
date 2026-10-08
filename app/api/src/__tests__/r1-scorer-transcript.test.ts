@@ -130,6 +130,20 @@ describe('masking', () => {
     }
   });
 
+  it('masks a MEDIUM line a barge-in cut off before "so we can decide"', () => {
+    for (const line of [
+      "Let's book a call on Thursday at 7 PM with my husband",
+      "Let's book a call tomorrow at 7 PM with my husband so we",
+      "Daytime is tough for me, so let's book a call tomorrow at 7 PM with my",
+      "Let's book a call on Saturday at 11 AM with my father so",
+      "Let’s book a call tonight",
+      "Daytime is tough for me, so let's book a call",
+    ]) {
+      expect(maskCommitmentLines(line)).toBe(R1_COMMITMENT_MASK);
+      expect(maskCommitmentLines(`Hmm, okay. ${line}`)).toBe(`Hmm, okay. ${R1_COMMITMENT_MASK}`);
+    }
+  });
+
   it('does not mask ordinary talk about calls, and masks only the one sentence', () => {
     for (const text of [
       'Can we book a call to talk about the price?',

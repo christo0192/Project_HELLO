@@ -14,7 +14,13 @@ from r1_commitment import COMMITMENT_LINES, Level, commitment_line
 from r1_guard import REPLY_WORD_CAP
 from r1_personas import ALL_PERSONA_NAMES, PERSONAS, resolve_persona
 from r1_prompts import (
+    CHECKIN_DONE_NOTE,
+    CHECKIN_NOTE,
+    EMAIL_OFFER_NOTE,
     INTERVIEWER_NAME,
+    NEXT_STEP_PROPOSED_NOTE,
+    REACT_HOW_IT_LANDS,
+    REACTION_ONLY_NOTE,
     WRAPUP_NOTE,
     assemble_messages,
     control_prose,
@@ -393,6 +399,91 @@ class ReminderTests(unittest.TestCase):
             turn_reminder(P1, r_sec=5, first_probe_topics=["H1"]),
             turn_reminder(P1, r_sec=5, first_probe_topics=["H1"]),
         )
+
+
+class ReactionWordingTests(unittest.TestCase):
+    """R1-Q round 1: a reaction is how it lands for the learner, never a course detail said back.
+
+    "I like that the classes are recorded" or "Nice, so the mentors are from Google" are product
+    statements: the output guard blocks them as invented facts, each one counts toward the gate's
+    three-hit limit, and the reply turns into "Sorry, could you say that again?".  The prompts
+    used to ask for "something you liked" on every turn.
+    """
+
+    REACTIONS_INVITED_BY_THE_OLD_WORDING = (
+        "I like that the classes are recorded.",
+        "Oh, live classes on weekends, that's helpful.",
+        "So the program has placement support, okay.",
+        "Oh, so the classes happen in the evenings.",
+        "Nice, so the mentors are from Google.",
+    )
+    REACTIONS_THE_NEW_WORDING_ASKS_FOR = (
+        "Hmm, that's a lot to take in.",
+        "Okay, that makes me a little nervous, honestly.",
+        "That sounds interesting, but I'm still worried about keeping up.",
+        "Honestly, I'm not sure how that fits around my work.",
+        "Right, and what happens if I fall behind?",
+    )
+
+    def texts(self):
+        spec = SPEC_BY_ID[F1_ANCHOR]
+        yield "prefix", learner_prefix(P1)
+        yield "free reply", turn_reminder(P1, r_sec=100)
+        yield "intent reply", turn_reminder(P1, r_sec=100, intent_brief=spec.brief)
+        yield "check-in", turn_reminder(P1, r_sec=100, notes=(CHECKIN_NOTE,))
+        yield "check-in done", turn_reminder(P1, r_sec=100, notes=(CHECKIN_DONE_NOTE,))
+        yield "reaction only", turn_reminder(P1, r_sec=100, reaction_only=True)
+
+    def test_nothing_asks_for_something_the_learner_liked(self):
+        for name, text in self.texts():
+            with self.subTest(name=name):
+                self.assertNotIn("something you liked", text)
+                self.assertNotIn("a concern or something", text)
+
+    def test_every_reaction_instruction_says_how_it_lands_and_forbids_a_course_detail(self):
+        self.assertIn("how it lands for you", REACT_HOW_IT_LANDS)
+        self.assertIn("never by repeating a course detail back to them", REACT_HOW_IT_LANDS)
+        for name in ("free reply", "intent reply"):
+            text = dict(self.texts())[name]
+            with self.subTest(name=name):
+                self.assertIn(REACT_HOW_IT_LANDS, text)
+                self.assertIn("react to what the advisor just said", text)
+        prefix = dict(self.texts())["prefix"]
+        self.assertIn("never repeat a course detail back to them", prefix)
+        self.assertIn("how it lands for you", prefix)
+        self.assertIn("how their last point lands for you", CHECKIN_NOTE)
+        self.assertIn("do not repeat what they told you about the course", CHECKIN_NOTE)
+        self.assertIn("without repeating what they told you about the course", CHECKIN_DONE_NOTE)
+        self.assertIn("how it lands for you", REACTION_ONLY_NOTE)
+        self.assertIn("without repeating any course detail", REACTION_ONLY_NOTE)
+
+    def test_the_old_reactions_are_leaks_the_new_ones_are_clean(self):
+        """The guard did not change: it still blocks the course-detail reactions the old wording
+        invited and passes the feeling-and-question reactions the new wording asks for."""
+        from r1_guard import GuardContext, check_sentence
+
+        context = GuardContext(phase="roleplay", persona=P1, mode="reply")
+        for text in self.REACTIONS_INVITED_BY_THE_OLD_WORDING:
+            with self.subTest(text=text):
+                hits = check_sentence(text, context)
+                self.assertIn("invented_fact", {hit.category for hit in hits}, text)
+        for text in self.REACTIONS_THE_NEW_WORDING_ASKS_FOR:
+            with self.subTest(text=text):
+                self.assertEqual(check_sentence(text, context), [], text)
+
+    def test_the_new_notes_are_worker_authored_and_safe(self):
+        from r1_guard import echo_detected
+
+        for text in (EMAIL_OFFER_NOTE, NEXT_STEP_PROPOSED_NOTE, CHECKIN_NOTE, CHECKIN_DONE_NOTE):
+            text.encode("ascii")
+            for word in RUBRIC_WORDS:
+                self.assertNotRegex(text, rf"\b{re.escape(word)}\b", word)
+        # Neither names a day, a time or an e-mail address for the learner to repeat.
+        self.assertNotRegex(NEXT_STEP_PROPOSED_NOTE, r"\d")
+        self.assertIn("without agreeing", NEXT_STEP_PROPOSED_NOTE)
+        self.assertIn("without asking what the e-mail will include", EMAIL_OFFER_NOTE)
+        reminder = turn_reminder(P1, r_sec=100, notes=(NEXT_STEP_PROPOSED_NOTE, EMAIL_OFFER_NOTE))
+        self.assertFalse(echo_detected("Honestly, that call sounds fine to me.", (control_prose(reminder),)))
 
 
 class NotesTests(unittest.TestCase):

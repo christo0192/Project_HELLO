@@ -64,7 +64,6 @@ from r1_text import (
     fold,
     fuzzy_contains,
     is_question_like,
-    normalize,
     split_sentences,
     word_count,
 )
@@ -525,6 +524,11 @@ _CLOSING_PROMISE = (
     r"look|keep|check|share|forward|get|text|ping|connect|let you know|talk|speak|catch)\b"
     r"[^?]*"
 )
+_CLOSING_SENTENCE = re.compile(
+    r"^(?:(?:and|so|okay|ok|great|sure|alright)[,\s]+)*(?:" + _CLOSING_COURTESY + r"|"
+    + _CLOSING_PROMISE + r")",
+    re.IGNORECASE,
+)
 _FAREWELL_TAIL = (
     r"(?:\s+for (?:now|today|the day))?"
     + _NAME_TAIL
@@ -552,6 +556,9 @@ _CLOSE_THANKS = _compile(
 CLOSE_MIN_R_SEC = 60
 CLOSE_THANKS_MIN_R_SEC = 240
 STT_TAIL_MIN_OTHER_WORDS = 20
+STT_TAIL_MAX_WORDS = 6
+# After "thanks for your time" only a word or two ("Bye.", "Take care.") may follow.
+THANKS_TRAILING_WORDS = 3
 
 
 def _sentences(text: object) -> list[str]:
@@ -693,19 +700,43 @@ def _asks_something(sentence: str) -> bool:
     return is_question_like(sentence)
 
 
-def _is_stt_bye_tail(sentences: list[str], index: int, total_words: int) -> bool:
-    """A lone "Bye" as the last sentence of a long turn: a speech-to-text tail, not a goodbye.
+_STT_TAIL_WORDS = frozenset(
+    "bye so yeah yes okay ok alright right all well then um uh hmm thanks thank you very much "
+    "again".split()
+)
 
-    In the owner test (b58c7d9c) a 90-word answer ended "So yeah. Bye" and the learner
-    answered "Oh wait, before you go..." although nobody was leaving.  A one-word "Bye" after
-    at least ``STT_TAIL_MIN_OTHER_WORDS`` other words is dropped; "Okay, bye." in a short
-    turn is still a farewell.
+
+_WORD_TOKEN = re.compile(r"[A-Za-z0-9']+")
+
+
+def _strip_stt_bye_tail(text: object) -> str:
+    """``text`` without a trailing speech-to-text "bye" tail (the text itself if there is none).
+
+    In the owner test (b58c7d9c) a 90-word answer ended "So yeah. Bye" and the learner answered
+    "Oh wait, before you go..." although nobody was leaving.  The tail is read on WORDS, not on
+    one punctuation: the last words of a turn that are nothing but fillers ("so yeah", "okay",
+    "thank you") ending in "bye" / "bye bye", at most ``STT_TAIL_MAX_WORDS`` of them, after at
+    least ``STT_TAIL_MIN_OTHER_WORDS`` other words ("So yeah. Bye", "So yeah, bye.", "So yeah.
+    Bye bye.", "So yeah, okay, bye.").  "Okay, bye." in a short turn is still a farewell, and so
+    is anything with a real word in it ("Take care. Bye.": the "Take care." stays).
     """
-    if index != len(sentences) - 1:
-        return False
-    if normalize(sentences[index]) != "bye":
-        return False
-    return total_words - 1 >= STT_TAIL_MIN_OTHER_WORDS
+    folded = fold(text)
+    tokens = list(_WORD_TOKEN.finditer(folded))
+    if not tokens or tokens[-1].group(0).lower() != "bye":
+        return folded
+    first = len(tokens)
+    while (
+        first > 0
+        and len(tokens) - first < STT_TAIL_MAX_WORDS
+        and tokens[first - 1].group(0).lower() in _STT_TAIL_WORDS
+    ):
+        first -= 1
+    if first >= len(tokens) or first < STT_TAIL_MIN_OTHER_WORDS:
+        return folded
+    core = folded[: tokens[first].start()].rstrip(" ,;:-")
+    # The turn now ends where the tail began: close the sentence so "Have a great day," is the
+    # farewell "Have a great day." it was.
+    return core if core.endswith((".", "!", "?")) else core + "."
 
 
 def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
@@ -715,24 +746,43 @@ def is_close_attempt(text: object, r_sec: float | None = None) -> bool:
     time" only counts from R = 4:00, so a polite opening is never mistaken for goodbye.
     A sentence counts when it ENDS with the farewell (see ``_FAREWELL_TAIL``) and no later
     sentence of the turn asks something, so a turn that goes on to ask ("Take care of your
-    kids first, any questions?") is never a goodbye.  A one-word "Bye" at the end of a long
-    turn is a speech-to-text tail and does not count (``_is_stt_bye_tail``).
+    kids first, any questions?") is never a goodbye.  A "Bye" tail of fillers at the end of a
+    long turn is a speech-to-text tail and does not count (``_strip_stt_bye_tail``), and the
+    courtesy "thanks for your time" only counts when the turn stops there: if a statement
+    follows it ("Thanks for your time. So, coming to the fees, it's nine thousand.") the
+    advisor is still talking.
     """
     if r_sec is not None and r_sec < CLOSE_MIN_R_SEC:
         return False
     thanks_allowed = r_sec is None or r_sec >= CLOSE_THANKS_MIN_R_SEC
-    sentences = _sentences(text)
-    total_words = word_count(text)
+    sentences = _sentences(_strip_stt_bye_tail(text))
     for index, sentence in enumerate(sentences):
-        if any(_asks_something(later) for later in sentences[index + 1 :]):
+        later_sentences = sentences[index + 1 :]
+        if any(_asks_something(later) for later in later_sentences):
             continue
         if any(pattern.search(sentence) for pattern in _CLOSE_FAREWELL):
-            if _is_stt_bye_tail(sentences, index, total_words):
-                continue
             return True
-        if thanks_allowed and any(pattern.search(sentence) for pattern in _CLOSE_THANKS):
+        if (
+            thanks_allowed
+            and any(pattern.search(sentence) for pattern in _CLOSE_THANKS)
+            and all(_is_closing_tail(later) for later in later_sentences)
+        ):
             return True
     return False
+
+
+def _is_closing_tail(sentence: str) -> bool:
+    """A sentence that may follow "thanks for your time" in a sign-off.
+
+    A word or two ("Bye.", "Take care."), a farewell, or a closing courtesy or promise ("I'll
+    send the details.", "Feel free to reach out.").  A statement about the programme ("So,
+    coming to the fees, it's nine thousand.") means the advisor is still talking.
+    """
+    return (
+        word_count(sentence) <= THANKS_TRAILING_WORDS
+        or any(pattern.search(sentence) for pattern in _CLOSE_FAREWELL)
+        or _CLOSING_SENTENCE.match(sentence) is not None
+    )
 
 
 @dataclass(frozen=True)
@@ -917,6 +967,11 @@ class OwedMoveScheduler:
 
     def _delivered(self, move_id: str) -> bool:
         return self._states[move_id].status == "delivered"
+
+    def is_delivered(self, move_id: str) -> bool:
+        """True once ``move_id`` was proven spoken (False for an unknown move)."""
+        state = self._states.get(move_id)
+        return state is not None and state.status == "delivered"
 
     def _since(self, move_id: str) -> int | None:
         state = self._states[move_id]

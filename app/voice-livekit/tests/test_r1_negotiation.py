@@ -48,6 +48,21 @@ T80 = (
     "once we finish this call. Anything else you wanted to know about the course or program?"
 )
 NEUTRAL = "That makes sense. What else is on your mind?"
+# Pitch sentences about what the programme sends, schedules or does (R1-Q round 1, review 2).  None
+# is an e-mail offer, a callback or an ask.
+PITCHES = (
+    "We send you the recordings after every class, so you never miss anything.",
+    "We will send you a certificate at the end of the program.",
+    "Every week we mail you a progress report with your scores.",
+    "The platform will send you an email reminder before every class.",
+    "Our team will reach you on the next session to help with the capstone.",
+    "We schedule live sessions every weekend with the mentors.",
+    "You can book mentor slots whenever you need help with your project.",
+    "Mentors are available for one on one sessions every week.",
+    "We will reach out to you on the group chat if there is a new batch.",
+    "Our mentors call you every Saturday to review progress.",
+    "In the live sessions we discuss real projects, and we send the notes right after class.",
+)
 
 
 def variants():
@@ -197,6 +212,33 @@ class CallbackTests(unittest.TestCase):
         self.assertIsNone(neg.detect_callback(T68).slot)
         self.assertIsNone(neg.detect_callback(T78).slot)
 
+    def test_a_pitch_about_the_programme_is_not_a_callback(self):
+        """R1-Q round 1: "reach you on the next session" turned a pitch into a call ask."""
+        for text in PITCHES:
+            with self.subTest(text=text):
+                self.assertIsNone(neg.detect_callback(text), text)
+
+    def test_a_call_you_on_needs_a_day_a_clock_time_or_a_part_of_the_day(self):
+        for text, slot in (
+            ("I'll call you on Monday.", neg.Slot("monday", None, 0, None)),
+            ("I'll call you at 7 pm tonight.", neg.Slot("tonight", 19, 0, None)),
+            ("We can call you back tomorrow at 7 pm.", neg.Slot("tomorrow", 19, 0, None)),
+            ("I will call you in the evening.", neg.Slot(None, None, 0, "evening")),
+            ("I will call you next week.", neg.Slot("next week", None, 0, None)),
+        ):
+            with self.subTest(text=text):
+                callback = neg.detect_callback(text)
+                self.assertIsNotNone(callback, text)
+                self.assertEqual(callback.slot, slot)
+        for text in (
+            "We will call you on the group chat.",
+            "Our mentors call you every Saturday to review progress.",
+            "Our team will reach you on the next session to help with the capstone.",
+            "We will reach out to you on the group chat if there is a new batch.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(neg.detect_callback(text), text)
+
 
 class EmailAndCheckinTests(unittest.TestCase):
     def test_email_offers(self):
@@ -214,6 +256,38 @@ class EmailAndCheckinTests(unittest.TestCase):
                      "What is your email?"):
             with self.subTest(text=text):
                 self.assertFalse(neg.detect_email_offer(text))
+
+    def test_a_pitch_about_what_the_programme_sends_is_not_an_email_offer(self):
+        """R1-Q round 1: format pitches got the learner's e-mail "yes" (an off-topic reply)."""
+        for text in PITCHES:
+            with self.subTest(text=text):
+                self.assertFalse(neg.detect_email_offer(text), text)
+        for text in (
+            "I can send you a sample project to look at.",
+            "I will send you the recordings of the missed classes.",
+            "We will mail you the certificate at the end.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(neg.detect_email_offer(text), text)
+
+    def test_an_offer_needs_a_first_person_promise_and_information_to_send(self):
+        for text in (
+            "I will email you the details once we finish this call.",
+            "Sure, I will email you the details.",
+            "I'll send you the brochure after the call.",
+            "Let me mail you the curriculum.",
+            "We can email you a link to the schedule.",
+            "I will send everything over today.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(neg.detect_email_offer(text), text)
+        for text in (
+            "We send you the details every week.",
+            "You get the details by email.",
+            "The brochure is on our website.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(neg.detect_email_offer(text), text)
 
     def test_checkins(self):
         for text in (
@@ -320,6 +394,70 @@ class PriceOfferTests(unittest.TestCase):
         self.assertEqual(self.offers("$7,000 isn't something we can do."), {})
         self.assertEqual(self.offers("I can't do 7,000 but I can do $8,000."), {8000: False})
 
+    def test_a_questioned_or_refused_anchor_is_never_an_offer(self):
+        """R1-Q round 1 (blocker): the advisor's reply to the $7,000 anchor was read as a $7,000
+        offer, and the learner then thanked them for a price nobody had offered."""
+        for text in (
+            "$7,000? Where did you hear that? That's not something we offer.",
+            "Who told you $7,000? That was an old promo.",
+            "$7,000 is too low for us, I'm afraid.",
+            "Sorry, $7,000 is impossible.",
+            "Um, actually how did you get to know that 7000 USD is the price?",
+            "That is not realistic, $7,000 is not correct.",
+            "We don't do $7,000, sorry.",
+            "I don't think we can do $7,000 on this one.",
+            "$7,000 needs approval from my manager first.",
+            "Hmm, $7,000? That is no longer available.",
+            "Is $7,000 what they told you?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.offers(text), {}, text)
+
+    def test_the_anchor_is_an_offer_only_when_the_advisor_promises_it(self):
+        for text in (
+            "Okay, I can do $7,000 for you.",
+            "Let's make it 7000.",
+            "We can meet you at $7,000.",
+            "Okay, $7,000 then.",
+            "How about $7,000?",
+            "Sure, I can bring it down to 7000 dollars.",
+            "We could do $7,000 if you enrol today.",
+            "I'll give you $7,000.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(set(self.offers(text)), {7000}, text)
+
+    def test_a_figure_the_learner_said_needs_the_same_promise(self):
+        own = {8500}
+        offers = lambda text: dict(neg.parse_price_offers(text, own))  # noqa: E731
+        self.assertEqual(offers("You said $8,500, that is a lot."), {})
+        self.assertEqual(offers("Who told you $8,500?"), {})
+        self.assertEqual(offers("Okay, I can do $8,500 for you."), {8500: False})
+        self.assertEqual(offers("I can do $8,000 for you."), {8000: False})
+
+    def test_a_question_offers_only_when_phrased_as_an_offer(self):
+        self.assertEqual(self.offers("How about $8,000?"), {8000: False})
+        self.assertEqual(self.offers("Would $8,500 work for you?"), {8500: False})
+        self.assertEqual(self.offers("Can I do $8,200 for you?"), {8200: False})
+        self.assertEqual(self.offers("Is $8,500 okay for you?"), {8500: False})
+        self.assertEqual(self.offers("Who told you $8,200? That was an old promo."), {})
+        self.assertEqual(self.offers("Why is the program $8,500?"), {})
+        self.assertEqual(self.offers("What do you think about $8,500 as a price?"), {})
+        # A tag question after an offer is still the offer; a wh-question about a figure is not.
+        self.assertEqual(self.offers("I can do $8,000, okay?"), {8000: False})
+        self.assertEqual(self.offers("Let's make it $8,500, okay?"), {8500: False})
+        self.assertEqual(self.offers("Would $7,000 work for you?"), {7000: False})
+        self.assertEqual(self.offers("Who told you we could do $7,000? That was an old promo."), {})
+        self.assertEqual(self.offers("Where did you hear $7,000 would work?"), {})
+        self.assertEqual(self.offers("Can I ask where you heard $7,000?"), {})
+        self.assertEqual(set(self.offers("What if I do $8,000 for you?")), {8000})
+
+    def test_the_net_price_of_a_discount_is_not_the_anchor_echoed(self):
+        self.assertEqual(self.offers("Today only I can do $2,000 off, so $7,000."), {7000: True})
+        self.assertEqual(self.offers("I can give you $2,000 off."), {7000: False})
+        self.assertEqual(self.offers("Who told you $2,000 off?"), {})
+        self.assertEqual(self.offers("$2,000 off is too much for us."), {})
+
     def test_the_conditional_flag(self):
         self.assertEqual(self.offers("I can do $8,000 if you enrol today."), {8000: True})
         self.assertEqual(self.offers("I can do $8,000 with the upfront plan."), {8000: True})
@@ -361,21 +499,87 @@ class StateTests(unittest.TestCase):
     def state(self, dm="husband"):
         return neg.Negotiation(dm)
 
-    def test_offers_count_only_after_the_anchor_and_only_once(self):
+    def test_offers_are_tracked_from_the_first_price_mention_and_only_once(self):
+        """R1-Q round 1: an offer made BEFORE the anchor is on the table, and a restatement of
+        any offer, before or after the anchor, is never a new one."""
         state = self.state()
         before = state.observe(1, "I can do $8,500 for you.", anchor_turn=None)
-        self.assertFalse(before.offer_added)
-        same_turn = state.observe(2, "I can do $8,500 for you.", anchor_turn=2)
-        self.assertFalse(same_turn.offer_added)
-        seen = state.observe(3, "Okay, I can do $8,500 for you.", anchor_turn=2)
-        self.assertTrue(seen.offer_added)
-        self.assertTrue(seen.price_answer)
-        self.assertEqual([(o.turn, o.net_usd) for o in state.offers], [(3, 8500)])
+        self.assertTrue(before.offer_added)
+        self.assertFalse(before.price_answer)  # there is no anchor yet to answer
+        self.assertEqual([(o.turn, o.net_usd) for o in state.offers], [(1, 8500)])
+        restated = state.observe(2, "Okay, I can do $8,500 for you.", anchor_turn=None)
+        self.assertFalse(restated.offer_added)
+        answer = state.observe(3, "Okay, I can do $8,500 for you.", anchor_turn=2)
+        self.assertFalse(answer.offer_added)  # not new ...
+        self.assertTrue(answer.price_answer)  # ... but it IS the answer to the anchor
         again = state.observe(4, "So the $8,500 is a good deal.", anchor_turn=2)
         self.assertFalse(again.offer_added)
         better = state.observe(5, "Let me do $8,000 then.", anchor_turn=2)
         self.assertEqual(better.offers[0].net_usd, 8000)
         self.assertEqual(state.best_offer_usd, 8000)
+        self.assertEqual([o.net_usd for o in state.offers], [8500, 8000])
+
+    def test_the_turn_78_mention_of_a_price_already_offered_is_not_a_new_offer(self):
+        """R1-Q round 1 (group 18): "why the program is $8,500" while offering to call the
+        husband primed "a better price on the table: $8,500" with no new offer."""
+        state = self.state("husband")
+        first = state.observe(
+            13, "So the price I can do is $8500. I can reduce $500. Is it fine with you?",
+            anchor_turn=None,
+        )
+        self.assertEqual([o.net_usd for o in first.offers], [8500])
+        state.observe(14, "Okay.", anchor_turn=None)
+        seen = state.observe(18, T78, anchor_turn=14)
+        self.assertFalse(seen.offer_added)
+        self.assertEqual([o.net_usd for o in state.offers], [8500])
+
+    def test_a_refusal_only_answers_an_anchor_that_was_delivered(self):
+        state = self.state()
+        early = state.observe(1, "I am sorry, we can't go lower on the price.", anchor_turn=None)
+        self.assertFalse(early.refusal)
+        self.assertEqual(state.refusals, 0)
+        late = state.observe(3, "I am sorry, we can't go lower on the price.", anchor_turn=2)
+        self.assertTrue(late.refusal and late.price_answer)
+
+    def test_an_earlier_offer_does_not_hide_a_later_refusal_of_the_anchor(self):
+        state = self.state()
+        state.observe(1, "I can do $8,500 for you.", anchor_turn=None)
+        state.observe(3, "I'm sorry, that is the best I can do on price.", anchor_turn=2)
+        self.assertEqual(state.price_situation(), neg.SITUATION_REFUSED)
+        quiet = self.state()
+        quiet.observe(1, "I can do $8,500 for you.", anchor_turn=None)
+        quiet.observe(3, "Yeah, we can see what we can do.", anchor_turn=2)
+        self.assertEqual(quiet.price_situation(), neg.SITUATION_SHORT)  # the number stands
+        met = self.state()
+        met.observe(1, "Today only I can do $2,000 off, so $7,000.", anchor_turn=None)
+        self.assertEqual(met.best_offer_usd, 7000)
+        self.assertEqual(met.price_situation(), neg.SITUATION_MET)
+
+    def test_a_figure_the_learner_said_needs_a_promise_to_be_an_offer(self):
+        state = self.state()
+        state.note_learner_text("Honestly $8,500 is still a lot for me.")
+        self.assertEqual(state.own_amounts, {8500})
+        questioned = state.observe(3, "Where did you hear $8,500? That was an old promo.", anchor_turn=2)
+        self.assertFalse(questioned.offer_added)
+        promised = state.observe(4, "Okay, I can do $8,500 for you.", anchor_turn=2)
+        self.assertTrue(promised.offer_added)
+
+    def test_reason_voicings_are_counted_per_reason(self):
+        state = self.state()
+        state.note_reason_voiced(neg.REASON_TIMING, 3)
+        state.note_reason_voiced(neg.REASON_TIMING, 7)
+        state.note_reason_voiced(neg.REASON_MONEY, 8)
+        self.assertEqual(state.voiced[neg.REASON_TIMING], 3)
+        self.assertEqual(state.log()["reason_voicings"], {"timing": 2, "money": 1})
+
+    def test_the_reasons_an_owed_move_owns_can_be_skipped(self):
+        state = self.state()
+        skip = {neg.REASON_TIMING, neg.REASON_DECISION_MAKER}
+        self.assertEqual(state.next_reason(skip), neg.REASON_MONEY)
+        state.note_reason_voiced(neg.REASON_MONEY, 1)
+        self.assertIsNone(state.next_reason(skip))
+        self.assertFalse(state.can_stall(skip))
+        self.assertTrue(state.can_stall())  # nothing is skipped by default
 
     def test_the_price_situation_follows_the_advisors_answer(self):
         def situation(text):
@@ -592,6 +796,56 @@ class SpecContentTests(unittest.TestCase):
         self.assertEqual(neg.SPEC_BY_ID[neg.N_EMAIL].kind, neg.KIND_EMAIL)
         self.assertEqual(neg.SPEC_BY_REASON[neg.REASON_MONEY].id, neg.N_MONEY)
         self.assertEqual(set(neg.SPEC_BY_REASON), set(neg.REASONS))
+
+
+class AnchorAfterOfferTests(unittest.TestCase):
+    """R1-Q round 1: the anchor reacts to a price the advisor already put on the table."""
+
+    OFFERS = (8800, 8500, 8000, 7500, 7000, 6500)
+
+    def test_the_situation_depends_on_where_the_offer_sits_against_the_ask(self):
+        for offer in self.OFFERS:
+            situation = neg.anchor_after_offer(offer)
+            expected = neg.ANCHOR_ABOVE if offer > neg.ANCHOR_USD else neg.ANCHOR_REACHED
+            self.assertEqual(situation.id, expected, offer)
+            self.assertIn(f"${offer:,}", situation.brief)
+            self.assertIn("$7,000", situation.must_say)
+            self.assertEqual(len(situation.variants), 3)
+
+    def test_every_variant_still_raises_the_anchor_move(self):
+        markers = MOVE_BY_ID["F1-ANCHOR"].markers
+        for offer in self.OFFERS:
+            for text in neg.anchor_after_offer(offer).variants:
+                with self.subTest(offer=offer, text=text):
+                    self.assertTrue(markers_match(markers, text))
+
+    def test_the_figures_the_learner_must_write_are_in_every_above_variant(self):
+        for offer in (8800, 8500, 8000, 7500):
+            situation = neg.anchor_after_offer(offer)
+            self.assertEqual(situation.must_say, (f"${offer:,}", "$7,000"))
+            for text in situation.variants:
+                self.assertIn(f"${offer:,}", text)
+                self.assertIn("$7,000", text)
+
+    def test_no_variant_accepts_commits_concedes_or_carries_a_locked_need(self):
+        for rendered in variants():
+            for offer in self.OFFERS:
+                situation = neg.anchor_after_offer(offer)
+                context = GuardContext(
+                    phase="roleplay", persona=rendered, mode="reply",
+                    advisor_amounts=frozenset({offer}),
+                )
+                for text in (situation.brief, *situation.variants):
+                    self.assertEqual(deep_need_topics_in(rendered, text), frozenset(), text)
+                for text in situation.variants:
+                    self.assertLessEqual(classify_learner_commitment(text), Level.WEAK, text)
+                    self.assertFalse(has_concession(text), text)
+                    text.encode("ascii")
+                    self.assertLessEqual(len(text.split()), 30)
+                    for sentence in split_sentences(text):
+                        hits = check_sentence(sentence, context)
+                        self.assertEqual(hits, [], f"{rendered.id}: {sentence!r} -> {hits}")
+                self.assertNotIn('"', situation.brief)
 
 
 if __name__ == "__main__":

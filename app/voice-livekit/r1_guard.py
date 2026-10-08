@@ -706,6 +706,8 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
 
 
 CARD_MATCH_THRESHOLD = 0.75
+# The scripted WEAK line, on normalised text (apostrophes dropped).
+_RESERVED_WEAK_LINE = re.compile(r"\blet me think about it\b|\bemail me the details\b")
 _POSSESSIVE = re.compile(r"(?<=\w)'s\b")
 _DIGITS = re.compile(r"\d+")
 
@@ -880,9 +882,17 @@ class StreamGuard:
         """A hit when the learner already said ``out`` earlier in the call (``ctx.said``).
 
         Inside one reply only an identical sentence is dropped (silently, below): two
-        sentences of a single reply that differ by a word are the model's own phrasing.
+        sentences of a single reply that differ by a word are the model's own phrasing.  The
+        two sentences of the scripted WEAK line ("Let me think about it." / "Just email me the
+        details ...") are reserved for that line: the model saying them earlier would make the
+        scripted line an exact repeat, or ask for the e-mail twice, so they are dropped as
+        hygiene and the intent's own scripted variant is used instead.
         """
-        if not self.ctx.is_learner or not self.ctx.said:
+        if not self.ctx.is_learner:
+            return None
+        if _RESERVED_WEAK_LINE.search(normalize(out)):
+            return self._repeat_hit("reserved", out)
+        if not self.ctx.said:
             return None
         kind = repeat_kind(out, self.ctx.said)
         return None if kind is None else self._repeat_hit(kind, out)

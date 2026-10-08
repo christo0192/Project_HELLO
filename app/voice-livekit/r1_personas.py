@@ -685,10 +685,10 @@ _H2_PATTERNS = (
     r"\bholding you back\b|\bstopp(?:ing|ed) you\b|\bin your way\b|\bgot in the way\b"
     r"|\bget in the way\b",
     r"\b(?:challenges?|struggl\w+|hurdles?|obstacles?|setbacks?|roadblocks?|frustrat\w+)\b",
-    # R1-Q: "what is the friction or blocker", "what makes you get scared of layoffs",
-    # "what's stopping you" (owner test turns 34 and 43).
-    r"\b(?:blockers?|frictions?|pain[- ]?points?|scared|stress\w*|anxi\w+)\b"
-    r"|\bwhat(?:'s| is) stopping\b",
+    # R1-Q: "what is the friction or blocker", "what's stopping you" (owner test turns 34 and
+    # 43).  The generic fear words ("scared", "stress", "anxious") are NOT here: see
+    # ``_H2_FEAR_WORDS``.
+    r"\b(?:blockers?|frictions?|pain[- ]?points?)\b|\bwhat(?:'s| is) stopping\b",
     r"\bwhat (?:have|did|had) you (?:tried|try|done|attempted|used)\b",
     r"\b(?:have|had) you (?:tried|taken|attempted|studied|used)\b",
     r"\b(?:tried|trying) (?:so far|before|already|anything)\b",
@@ -738,6 +738,11 @@ PROBE_RULES: dict[str, tuple[re.Pattern[str], ...]] = {
     topic: tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
     for topic, patterns in _PROBE_PATTERNS.items()
 }
+# "What makes you get scared of layoffs?" asks about the layoffs (H1), not about what held the
+# learner back (H2): a generic fear word counts for H2 only when the same sentence has no H1
+# term (R1-Q round 1: it released H2's deep need on an H1 question and gave the advisor unearned
+# probing credit).
+_H2_FEAR_WORDS = re.compile(r"\b(?:scared|stress\w*|anxi\w+)\b", re.IGNORECASE)
 # A follow-up asks the LEARNER to say more.  It must be a question or an imperative
 # addressed to the learner: "Let me give you an example of a student like you", "I'll
 # elaborate on our curriculum" and "Let me unpack the modules" are the advisor's own
@@ -771,9 +776,13 @@ def detect_probes(text: object) -> frozenset[str]:
         if not is_question_like(sentence):
             continue
         lowered = fold(sentence).lower()
+        in_sentence: set[str] = set()
         for topic, patterns in PROBE_RULES.items():
             if any(pattern.search(lowered) for pattern in patterns):
-                found.add(topic)
+                in_sentence.add(topic)
+        if "H1" not in in_sentence and _H2_FEAR_WORDS.search(lowered):
+            in_sentence.add("H2")
+        found.update(in_sentence)
     return frozenset(found)
 
 

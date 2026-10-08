@@ -43,9 +43,12 @@ every intent.
 Negotiation (R1-Q): ``self.negotiation`` (``r1_negotiation``) remembers what the advisor put on
 the table (prices, callbacks, an e-mail offer, check-ins), which of the learner's stall reasons
 (timing, money, decision maker) were raised and which the advisor handled.  An ask before the
-close window is met with the next unused reason (or the owed F4 move, or any forced move); an
+close window is met with the next unused reason (or the owed F4 move, or any forced move; timing
+and the decision maker are the F4 pair's own reasons and are never voiced early as well); an
 ask inside the window is graded with the handled reasons as evidence.  The price counter
-follows the advisor's actual answer, and the wrap turn reacts to the number on the table.
+follows the advisor's actual answer, the anchor reacts to a price already on the table, and the
+wrap turn reacts to the number on the table.  Once a scripted commitment line is on record, the
+guard's commitment cap is that level, so the learner can confirm the call it booked.
 
 Nothing here can change a phase, a grade or the schedule from candidate or model text
 beyond the deterministic rules: the LLM has no tools, the judge's JSON is whitelisted,
@@ -113,6 +116,7 @@ from r1_negotiation import (
     Negotiation,
     NegotiationSpec,
     NegotiationTurn,
+    anchor_after_offer,
     fill_decision_maker,
     filled_markers,
 )
@@ -121,6 +125,8 @@ from r1_prompts import (
     CHECKIN_DONE_NOTE,
     CHECKIN_NOTE,
     EMAIL_AGAIN_NOTE,
+    EMAIL_OFFER_NOTE,
+    NEXT_STEP_PROPOSED_NOTE,
     RESOLVED_NOTE,
     control_prose,
     interviewer_prefix,
@@ -143,7 +149,7 @@ from r1_scheduler import (
     curiosity_covered,
     markers_match,
 )
-from r1_script import LEARNER_FILLER_VARIANTS
+from r1_script import LEARNER_FILLER_SHORT, LEARNER_FILLER_VARIANTS
 from r1_script import line as script_line
 from r1_text import (
     SpokenMemory,
@@ -314,6 +320,17 @@ class RolePlayEngine:
     def commitment_level(self) -> Level | None:
         return self._commitment_level
 
+    def _commitment_cap(self) -> Level:
+        """The highest commitment level a model sentence may reach.
+
+        The stall (WEAK) until a scripted line is on record; afterwards the recorded level, so
+        the learner can confirm the call it has already booked ("Great, talk to you Thursday
+        then.") instead of being cut off into a guard hit that counts toward the gate.  The
+        scripted lines themselves are never guarded.
+        """
+        on_record = self._commitment_level
+        return Level.WEAK if on_record is None else max(Level.WEAK, on_record)
+
     def guard_context(
         self,
         phase: str = "roleplay",
@@ -345,7 +362,7 @@ class RolePlayEngine:
             released_topics=released,
             advisor_amounts=frozenset(self._advisor_amounts),
             mode=mode,
-            commitment_cap=Level.WEAK,
+            commitment_cap=self._commitment_cap(),
             turn=self.turn if turn is None else turn,
             control_texts=control,
             keep_excerpts=self.keep_excerpts,
@@ -356,8 +373,19 @@ class RolePlayEngine:
         )
 
     def filler_text(self) -> str:
-        """The learner's thinking filler: a 3-variant rotation seeded by the attempt id."""
-        text = pick_variant(LEARNER_FILLER_VARIANTS, self.seed, self._fillers)
+        """The learner's thinking filler: a 3-variant rotation seeded by the attempt id.
+
+        A variant whose sentences the learner already played is skipped (a slow provider makes
+        the fourth filler repeat the first word for word); when all of them were played the
+        filler is the one-word "Hmm...", which can never be a repeat.
+        """
+        said = self._spoken.snapshot()
+        text = LEARNER_FILLER_SHORT
+        for step in range(len(LEARNER_FILLER_VARIANTS)):
+            candidate = pick_variant(LEARNER_FILLER_VARIANTS, self.seed, self._fillers + step)
+            if not _repeats(candidate, said):
+                text = candidate
+                break
         self._fillers += 1
         return text
 
@@ -598,7 +626,11 @@ class RolePlayEngine:
                 if owed is not None and (owed.forced or owed.family == "F4"):
                     # The owed objection lands in context (the advisor just proposed a next
                     # step), and a deadline is never starved by an advisor who asks every turn.
+                    # A forced move that is not the F4 stall is a different topic from the
+                    # proposal, so the learner is also told to react to the proposal.
                     reasons.append("ask_yields_to_owed_move")
+                    if owed.family != "F4":
+                        self._notes.append(NEXT_STEP_PROPOSED_NOTE)
                     return None
                 self._stalls += 1
                 reasons.append("ask_before_close_window")
@@ -607,25 +639,46 @@ class RolePlayEngine:
             reasons.append(f"ask_in_window:grade_{level.name.lower()}")
             if level > Level.WEAK:
                 return self._commit_plan(level, reasons)
-            if negotiation.can_stall():
+            if negotiation.can_stall(self._reasons_owned_by_f4()):
                 negotiation.stall_rounds += 1
                 planned = self._reason_plan(reasons, **layers)
                 if planned is not None:
                     return planned
             return self._commit_plan(Level.WEAK, reasons)
         if seen.email_offer:
-            if not negotiation.email_answered:
-                reasons.append("email_offer")
-                return self._spec_plan(SPEC_BY_ID[N_EMAIL], reasons, **layers)
-            self._notes.append(EMAIL_AGAIN_NOTE)
+            if negotiation.email_answered:
+                self._notes.append(EMAIL_AGAIN_NOTE)
+            else:
+                owed = self.scheduler.select(r_sec)
+                if owed is not None and owed.forced:
+                    # A deadline is never starved by an e-mail offer: the owed move lands now and
+                    # the e-mail is thanked in a few words.
+                    reasons.append("email_yields_to_owed_move")
+                    self._notes.append(EMAIL_OFFER_NOTE)
+                else:
+                    reasons.append("email_offer")
+                    return self._spec_plan(SPEC_BY_ID[N_EMAIL], reasons, **layers)
         if seen.checkin:
             reasons.append("checkin")
             self._force_curiosity = True
         return None
 
+    def _reasons_owned_by_f4(self) -> frozenset[str]:
+        """Stall reasons the owed F4 moves still have to voice (timing, the decision maker).
+
+        Voicing one of them early as well is the same stall twice in a row (R1-Q round 1), so
+        the negotiation skips them until the F4 move that owns them was delivered.
+        """
+        owned: set[str] = set()
+        if not self.scheduler.is_delivered(F4_PRIMARY):
+            owned.add(REASON_TIMING)
+        if not self.scheduler.is_delivered(F4_PUSH):
+            owned.add(REASON_DECISION_MAKER)
+        return frozenset(owned)
+
     def _reason_plan(self, reasons: list[str], **layers: Any) -> TurnPlan | None:
         """Voice the next unused stall reason, else the one question about the call, else None."""
-        reason = self.negotiation.next_reason()
+        reason = self.negotiation.next_reason(self._reasons_owned_by_f4())
         if reason is not None:
             spec = SPEC_BY_REASON[reason]
         elif not self.negotiation.question_used:
@@ -774,6 +827,14 @@ class RolePlayEngine:
             situation = self.negotiation.counter_situation()
             move = replace(move, brief=situation.brief, variants=situation.variants)
             self.negotiation.note_response(self.turn, f"counter:{situation.id}")
+        elif move.id == F1_ANCHOR and self.negotiation.best_offer_usd is not None:
+            # A price is already on the table (the advisor offered before the learner asked):
+            # the anchor keeps its exact $9,000 / $7,000 but reacts to that number.
+            anchor = anchor_after_offer(self.negotiation.best_offer_usd)
+            move = replace(
+                move, brief=anchor.brief, must_say=anchor.must_say, variants=anchor.variants
+            )
+            self.negotiation.note_response(self.turn, f"anchor:{anchor.id}")
         variants = move.variants or (move.text,)
         fallbacks = self._fallback_order(
             move.id, variants, REDIRECT_OPENERS if redirect else ()
@@ -891,7 +952,8 @@ class RolePlayEngine:
                 intent_forced=False if intent is None else intent.forced,
                 curiosity=curiosity,
                 offer_usd=self.negotiation.best_offer_usd,
-                new_offer_usd=self._new_offer_usd,
+                # The anchor already reacts to the price on the table: no "pleasant surprise".
+                new_offer_usd=None if move_id == F1_ANCHOR else self._new_offer_usd,
                 notes=tuple(self._notes),
                 reaction_only=intent is not None and intent.kind == KIND_COMMIT,
             )
@@ -968,8 +1030,10 @@ class RolePlayEngine:
         if plan.aside:
             return  # the interviewer's aside is scripted and excluded from evidence
         when = self.last_r if r_sec is None else r_sec
+        cap = self._commitment_cap()  # the level on record BEFORE this turn's line
         self._spoken.add(spoken_text)
         self.tracker.note_learner_text(spoken_text, plan.turn)
+        self.negotiation.note_learner_text(spoken_text)
         if plan.move_id is not None:
             delivery = self.scheduler.confirm_if_spoken(
                 plan.move_id, spoken_text, when, interrupted=interrupted
@@ -992,9 +1056,7 @@ class RolePlayEngine:
                 if plan.commitment_level is not None:
                     self.negotiation.note_commitment(plan.commitment_level, plan.turn)
         if not scripted_commitment or plan.commitment_level is Level.WEAK:
-            if classify_learner_commitment(spoken_text) > Level.WEAK or has_concession(
-                spoken_text
-            ):
+            if classify_learner_commitment(spoken_text) > cap or has_concession(spoken_text):
                 self._violations += 1
 
     # ------------------------------------------------------------------------ judge

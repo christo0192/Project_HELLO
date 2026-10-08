@@ -102,6 +102,9 @@ LEARNER_FILLER_VARIANTS: tuple[str, ...] = (
     "Hmm, let me think for a second...",
     "Hmm, give me a moment...",
 )
+# When every variant above was already played, the filler is this one-word hum: under four words,
+# so it is never a repeat in the sense of ``r1_text.repeat_kind`` (R1-Q round 1).
+LEARNER_FILLER_SHORT = "Hmm..."
 
 # The exit line's first sentence is the cue the LLM must never imitate (``r1_guard``).
 EXIT_CUE = "Let's pause the role-play here."
