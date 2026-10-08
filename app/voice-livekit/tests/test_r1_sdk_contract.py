@@ -249,6 +249,7 @@ class TestR1SdkContract(unittest.TestCase):
             "track_published",
             "track_unpublished",
             "disconnected",
+            "data_received",
         ):
             self.assertIn(event_name, room_source)
         self.assertIn("participant, publication", room_source)
@@ -257,6 +258,55 @@ class TestR1SdkContract(unittest.TestCase):
         self.assertIn('self.emit("track_unpublished", rpublication, rparticipant)', room_source)
         self.assertTrue(callable(getattr(rtc.Room, "on")))
         self.assertTrue(callable(getattr(rtc.Room, "isconnected")))
+
+    def test_server_sent_data_reaches_the_ready_handler_in_the_sdk_shape(self) -> None:
+        """The "I'm ready" button is a SERVER-sent data message (R1-Q): pin what the SDK delivers.
+
+        ``Room`` emits ``data_received`` with one ``DataPacket`` whose ``participant`` is None
+        when the message was sent by a server SDK (the API relay), and whose ``topic`` is the
+        sender's topic.  The handler accepts exactly that and nothing a participant sent.
+        """
+        import dataclasses
+
+        import r1_session
+        from r1_phases import R1Phase
+
+        room_source = inspect.getsource(rtc.Room)
+        self.assertIn('"data_received"', room_source)
+        self.assertIn("topic=packet.user.topic", room_source)
+        self.assertIn("self._retrieve_remote_participant(packet.participant_identity)", room_source)
+        self.assertEqual(
+            [field.name for field in dataclasses.fields(rtc.DataPacket)],
+            ["data", "kind", "participant", "topic"],
+        )
+        self.assertIn("None when sent by a server SDK", inspect.getsource(rtc.DataPacket))
+
+        interview = r1_session.R1Interview(
+            mock.Mock(room=None, spec_set=["room"]),
+            {"first_name": "Asha", "candidate_identity": "candidate"},
+            _RecordingSession(),
+            _RecordingWriter(),
+        )
+        interview.machine.transition(R1Phase.OPENING)
+        interview.machine.transition(R1Phase.ICEBREAKER)
+        interview._enter(R1Phase.TRANSITION)
+        payload = b'{"v":1,"kind":"ready"}'
+        reliable = rtc.DataPacketKind.KIND_RELIABLE
+
+        def packet(**over):
+            fields = {"data": payload, "kind": reliable, "participant": None, "topic": "r1ready"}
+            return rtc.DataPacket(**{**fields, **over})
+
+        for refused in (
+            packet(participant=mock.Mock(identity="candidate")),
+            packet(topic="lk.chat"),
+            packet(topic=None),
+            packet(data=b'{"v":1,"kind":"ready","x":1}'),
+        ):
+            interview._on_data_received(refused)
+            self.assertFalse(interview._ready_latched)
+        interview._on_data_received(packet())
+        self.assertTrue(interview._ready_latched)
 
     def test_publication_mute_state_and_participant_publications_are_readable(self) -> None:
         self.assertIsInstance(inspect.getattr_static(rtc.TrackPublication, "muted"), property)

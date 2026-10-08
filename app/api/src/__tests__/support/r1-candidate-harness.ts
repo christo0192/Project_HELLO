@@ -225,6 +225,8 @@ export interface Harness {
     createRoom: ReturnType<typeof vi.fn>;
     deleteRoom: ReturnType<typeof vi.fn>;
     updateRoomMetadata: ReturnType<typeof vi.fn>;
+    listParticipants: ReturnType<typeof vi.fn>;
+    sendData: ReturnType<typeof vi.fn>;
   };
   gate: BrowserWorkerGate & {
     ensureReadyWorker: ReturnType<typeof vi.fn>;
@@ -296,6 +298,12 @@ export function buildHarness(
     createRoom: vi.fn(async () => ({})),
     updateRoomMetadata: vi.fn(async () => ({})),
     deleteRoom: vi.fn(async () => ({})),
+    // The "I'm ready" relay: the room holds the candidate (kind 0) and the interviewer (AGENT = 4).
+    listParticipants: vi.fn(async () => [
+      { identity: 'candidate-10000000-30000000', kind: 0 },
+      { identity: 'agent-AJ_test', kind: 4 },
+    ]),
+    sendData: vi.fn(async () => undefined),
   } as unknown as Harness['rooms'];
   const dispatched: DispatchLike[] = [];
   const deleteDispatch = vi.fn(async (id: string) => {

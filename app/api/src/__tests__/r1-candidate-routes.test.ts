@@ -9,9 +9,12 @@
  * `transitionSession` and `provisionRoomForCreatedSession` run unmodified.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import request from 'supertest';
-import { TokenVerifier } from 'livekit-server-sdk';
+import { DataPacket_Kind, TokenVerifier } from 'livekit-server-sdk';
 
 const mocks = vi.hoisted(() => ({
   db: { current: null as any },
@@ -40,11 +43,14 @@ import {
 import {
   CANDIDATE_TOKEN_TTL_SEC,
   PREFLIGHT_HARD_STOP_MS,
+  R1_READY_PAYLOAD,
+  R1_READY_TOPIC,
   STABLE_ATTEMPT_ERROR,
   STABLE_LINK_ERROR,
   UNHEALTHY_RETRY_AFTER_SEC,
   WITHDRAW_RETRY_AFTER_SEC,
 } from '../routes/r1-candidate.js';
+import { R1_READY_LIMIT, createReadyLimiter } from '../lib/r1/ready-limiter.js';
 import {
   CANDIDATE,
   LINK,
@@ -1738,6 +1744,378 @@ describe('POST /api/r1/exchange', () => {
     const secrets = await ready();
     process.env.R1_ENABLED = 'false';
     expect((await exchange(secrets)).body.error).toBe('r1_disabled');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R1-Q: the candidate's "I'm ready" button. The candidate token cannot publish data
+// (canPublishData: false), so the page asks the server, which relays one pinned message.
+
+describe('POST /api/r1/ready', () => {
+  type Secrets = { attempt_token: string; nonce: string; attempt_id: string };
+  const OTHER_SESSION = '30000000-0000-4000-8000-0000000000e2';
+
+  /** A live interview: admitted, and exchanged once (the room is provisioned, session `waiting`). */
+  async function live(): Promise<Secrets> {
+    grantConsent(h.tables);
+    const secrets = await admit();
+    const joined = await post('/exchange', {
+      attempt_token: secrets.attempt_token,
+      nonce: secrets.nonce,
+    });
+    expect(joined.status).toBe(200);
+    return secrets;
+  }
+  const ready = (secrets: Secrets, over: object = {}) =>
+    post('/ready', { attempt_token: secrets.attempt_token, nonce: secrets.nonce, ...over });
+  const roomOf = (secrets: Secrets) => `screening-${secrets.attempt_id}`;
+
+  it('relays one pinned message to the interviewer of the attempt\'s own room', async () => {
+    const secrets = await live();
+    const response = await ready(secrets);
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ ok: true });
+    expect(h.rooms.listParticipants).toHaveBeenCalledWith(roomOf(secrets));
+    expect(h.rooms.sendData).toHaveBeenCalledTimes(1);
+    const [room, bytes, kind, options] = h.rooms.sendData.mock.calls[0]!;
+    expect(room).toBe(roomOf(secrets));
+    expect(Buffer.from(bytes as Uint8Array).toString('utf8')).toBe('{"v":1,"kind":"ready"}');
+    expect(kind).toBe(DataPacket_Kind.RELIABLE);
+    expect(options).toEqual({ topic: 'r1ready', destinationIdentities: ['agent-AJ_test'] });
+  });
+
+  it('pins the topic and the payload the worker accepts, and sends nothing else', () => {
+    expect(R1_READY_TOPIC).toBe('r1ready');
+    expect(R1_READY_PAYLOAD).toEqual({ v: 1, kind: 'ready' });
+    // The worker (app/voice-livekit/r1_session.py) names the same topic and message.
+    const worker = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      '../../../voice-livekit/r1_session.py',
+    );
+    const source = readFileSync(worker, 'utf8');
+    expect(source).toMatch(new RegExp(`^READY_TOPIC = "${R1_READY_TOPIC}"`, 'm'));
+    expect(source).toMatch(/^READY_PAYLOAD_VERSION = 1$/m);
+    expect(source).toMatch(/^READY_PAYLOAD_KIND = "ready"$/m);
+  });
+
+  it('addresses only the agent participants of that room, never the candidate', async () => {
+    const secrets = await live();
+    h.rooms.listParticipants.mockResolvedValue([
+      { identity: 'candidate-x', kind: 0 },
+      { identity: 'agent-one', kind: 4 },
+      { identity: 'egress-1', kind: 2 },
+      { identity: 'agent-json', kind: 'AGENT' },
+      { identity: '', kind: 4 },
+      null,
+    ]);
+    expect((await ready(secrets)).status).toBe(200);
+    expect(h.rooms.sendData.mock.calls[0]![3]).toEqual({
+      topic: 'r1ready',
+      destinationIdentities: ['agent-one', 'agent-json'],
+    });
+  });
+
+  it('broadcasts when the interviewer cannot be found, and still sends only the pinned message', async () => {
+    const secrets = await live();
+    h.rooms.listParticipants.mockResolvedValueOnce([{ identity: 'candidate-x', kind: 0 }]);
+    expect((await ready(secrets)).status).toBe(200);
+    expect(h.rooms.sendData.mock.calls[0]![3]).toEqual({ topic: 'r1ready' });
+
+    h.rooms.listParticipants.mockRejectedValueOnce(new Error('list failed'));
+    expect((await ready(secrets)).status).toBe(200);
+    expect(h.rooms.sendData.mock.calls[1]![3]).toEqual({ topic: 'r1ready' });
+    expect(Buffer.from(h.rooms.sendData.mock.calls[1]![1] as Uint8Array).toString('utf8'))
+      .toBe('{"v":1,"kind":"ready"}');
+  });
+
+  it('takes the room from the verified attempt only: the body names nothing else', async () => {
+    const secrets = await live();
+    // Another live interview exists. Nothing the caller can send reaches its room.
+    addSession(h.tables, {
+      id: OTHER_SESSION,
+      external_call_id: `screening-${OTHER_SESSION}`,
+      status: 'in_progress',
+    });
+    addAttempt(h.tables, 'other-nonce', { session_id: OTHER_SESSION });
+    for (const over of [
+      { room: `screening-${OTHER_SESSION}` },
+      { room_name: `screening-${OTHER_SESSION}` },
+      { attempt_id: OTHER_SESSION },
+      { session_id: OTHER_SESSION },
+      { topic: 'lk.chat' },
+      { payload: 'hello' },
+      { destination: 'agent-other' },
+    ]) {
+      const response = await ready(secrets, over);
+      expect(response.status).toBe(400);
+    }
+    expect(h.rooms.sendData).not.toHaveBeenCalled();
+    expect((await ready(secrets)).status).toBe(200);
+    expect(h.rooms.sendData.mock.calls.map((call) => call[0])).toEqual([roomOf(secrets)]);
+    expect(h.rooms.listParticipants.mock.calls.map((call) => call[0])).toEqual([roomOf(secrets)]);
+  });
+
+  it('gives one stable 404 for a wrong nonce, a foreign or expired token and junk, relaying nothing', async () => {
+    const secrets = await live();
+    addSession(h.tables, {
+      id: OTHER_SESSION,
+      external_call_id: `screening-${OTHER_SESSION}`,
+      status: 'in_progress',
+    });
+    addAttempt(h.tables, 'other-nonce', { session_id: OTHER_SESSION });
+    const stored = h.tables.interview_round_attempts![0]!;
+    const expired = mintAttemptToken(
+      { sessionId: secrets.attempt_id, nonceDigest: stored.nonce_digest },
+      NOW - (ATTEMPT_TOKEN_TTL_SEC + 5) * 1000,
+    )!;
+    // A token minted for the OTHER attempt, redeemed with this attempt's nonce (and the reverse).
+    const foreign = mintAttemptToken({ sessionId: OTHER_SESSION, nonceDigest: sha256('other-nonce') }, NOW)!;
+    const checks = [
+      { nonce: '8'.repeat(64) },
+      { attempt_token: 'junk' },
+      { attempt_token: `${secrets.attempt_id}.9999999999.${'0'.repeat(64)}` },
+      { attempt_token: expired.token },
+      { attempt_token: foreign.token },
+      {
+        attempt_token: `30000000-0000-4000-8000-0000000000ff.${Math.floor(NOW / 1000) + 99}.`
+          + '1'.repeat(64),
+      },
+    ];
+    for (const over of checks) {
+      const response = await ready(secrets, over);
+      expect(response.status, JSON.stringify(over)).toBe(404);
+      expect(response.body).toEqual({ error: STABLE_ATTEMPT_ERROR });
+    }
+    expect((await post('/ready', { attempt_token: secrets.attempt_token })).status).toBe(400);
+    expect((await post('/ready', { nonce: secrets.nonce })).status).toBe(400);
+    expect(h.rooms.listParticipants).not.toHaveBeenCalled();
+    expect(h.rooms.sendData).not.toHaveBeenCalled();
+  });
+
+  it('answers 404 for a session that is not this attempt\'s browser R1 session', async () => {
+    const secrets = await live();
+    h.tables.call_sessions![0]!.mode = 'live';
+    expect((await ready(secrets)).status).toBe(404);
+    h.tables.call_sessions![0]!.mode = 'browser';
+    h.tables.call_sessions![0]!.external_call_id = 'screening-someone-else';
+    expect((await ready(secrets)).status).toBe(404);
+    h.tables.call_sessions![0]!.external_call_id = roomOf(secrets);
+    h.tables.call_sessions![0]!.interview_round_id = '20000000-0000-4000-8000-0000000000a2';
+    expect((await ready(secrets)).status).toBe(404);
+    expect(h.rooms.sendData).not.toHaveBeenCalled();
+  });
+
+  it('answers 409 not_live when the attempt has no live room', async () => {
+    grantConsent(h.tables);
+    const secrets = await admit(); // `created`: no room has been provisioned yet
+    const created = await ready(secrets);
+    expect(created.status).toBe(409);
+    expect(created.body).toEqual({ error: 'not_live' });
+
+    const live1 = await post('/exchange', { attempt_token: secrets.attempt_token, nonce: secrets.nonce });
+    expect(live1.status).toBe(200);
+    for (const status of ['completed', 'failed', 'cancelled']) {
+      h.tables.call_sessions![0]!.status = status;
+      const ended = await ready(secrets);
+      expect(ended.status, status).toBe(409);
+      expect(ended.body).toEqual({ error: 'not_live' });
+    }
+    h.tables.call_sessions![0]!.status = 'waiting';
+    h.tables.call_sessions![0]!.external_call_id = null;
+    expect((await ready(secrets)).body).toEqual({ error: 'not_live' });
+    expect(h.rooms.sendData).not.toHaveBeenCalled();
+  });
+
+  it('works for a waiting attempt and for an in-progress one', async () => {
+    const secrets = await live();
+    expect(h.tables.call_sessions![0]!.status).toBe('waiting');
+    expect((await ready(secrets)).status).toBe(200);
+    h.tables.call_sessions![0]!.status = 'in_progress';
+    expect((await ready(secrets)).status).toBe(200);
+    expect(h.rooms.sendData).toHaveBeenCalledTimes(2);
+  });
+
+  it('answers 409 not_live when LiveKit says the room is gone', async () => {
+    const secrets = await live();
+    h.rooms.listParticipants.mockRejectedValueOnce(Object.assign(new Error('no room'), { code: 'not_found', status: 404 }));
+    expect((await ready(secrets)).body).toEqual({ error: 'not_live' });
+    h.rooms.sendData.mockRejectedValueOnce(Object.assign(new Error('no room'), { code: 'not_found' }));
+    const gone = await ready(secrets);
+    expect(gone.status).toBe(409);
+    expect(gone.body).toEqual({ error: 'not_live' });
+  });
+
+  it('answers 503 r1_room_unavailable when LiveKit cannot take the message, and recovers', async () => {
+    const secrets = await live();
+    h.rooms.sendData.mockRejectedValueOnce(new Error('livekit down'));
+    const down = await ready(secrets);
+    expect(down.status).toBe(503);
+    expect(down.body).toEqual({ error: 'r1_room_unavailable' });
+    expect(JSON.stringify(down.body)).not.toContain('livekit down');
+    expect((await ready(secrets)).status).toBe(200);
+  });
+
+  it('bounds a LiveKit call that never answers instead of holding the request', async () => {
+    const secrets = await live();
+    use(h.tables, { readyRelayTimeoutMs: 25 });
+    h.rooms.sendData.mockImplementation(() => new Promise(() => undefined));
+    const stuck = await ready(secrets);
+    expect(stuck.status).toBe(503);
+    expect(stuck.body).toEqual({ error: 'r1_room_unavailable' });
+    h.rooms.listParticipants.mockImplementation(() => new Promise(() => undefined));
+    h.rooms.sendData.mockImplementation(async () => undefined);
+    // A stuck listing costs only the addressing: the message is broadcast.
+    expect((await ready(secrets)).status).toBe(200);
+    expect(h.rooms.sendData.mock.calls.at(-1)![3]).toEqual({ topic: 'r1ready' });
+  });
+
+  it('stops with the consent: a withdrawal, a lapsed round and the master switch all refuse', async () => {
+    const secrets = await live();
+    h.tables.interview_round_consents![0]!.withdrawn_at = new Date(NOW).toISOString();
+    const withdrawn = await ready(secrets);
+    expect(withdrawn.status).toBe(409);
+    expect(withdrawn.body).toEqual({ error: 'consent_required' });
+    h.tables.interview_round_consents![0]!.withdrawn_at = null;
+
+    h.tables.interview_rounds![0]!.expires_at = new Date(NOW - 1).toISOString();
+    expect((await ready(secrets)).body).toEqual({ error: 'round_not_admissible' });
+    h.tables.interview_rounds![0]!.expires_at = new Date(NOW + 1e9).toISOString();
+
+    process.env.R1_ENABLED = 'false';
+    expect((await ready(secrets)).body).toEqual({ error: 'r1_disabled' });
+    process.env.R1_ENABLED = 'true';
+    expect(h.rooms.sendData).not.toHaveBeenCalled();
+    expect((await ready(secrets)).status).toBe(200);
+  });
+
+  it('is not new work: a pause, maintenance or an unhealthy DeepSeek do not stop a live interview', async () => {
+    const secrets = await live();
+    h.tables.r1_settings![0]!.paused = true;
+    h.health.mockClear();
+    h.health.mockResolvedValue(false);
+    h.gate.ensureReadyWorker.mockClear();
+    h.gate.dispatch.mockClear();
+    expect((await ready(secrets)).status).toBe(200);
+    expect(h.health).not.toHaveBeenCalled();
+    expect(h.gate.ensureReadyWorker).not.toHaveBeenCalled();
+    expect(h.gate.dispatch).not.toHaveBeenCalled();
+    // Maintenance blocks new joins, not a relay for an interview that is already running.
+    use(h.tables, { maintenance: inMaintenance });
+    expect((await ready(secrets)).status).toBe(200);
+    expect(h.rooms.createRoom).not.toHaveBeenCalled();
+    expect(h.rooms.sendData).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers 503 when attempts cannot be verified or the database fails', async () => {
+    const secrets = await live();
+    use(h.tables, {}, true, { interview_round_attempts: { message: 'down' } });
+    expect((await ready(secrets)).body).toEqual({ error: 'service_unavailable' });
+    use(h.tables, {}, true, { call_sessions: { message: 'down' } });
+    expect((await ready(secrets)).body).toEqual({ error: 'service_unavailable' });
+    use(h.tables, {}, true, { interview_rounds: { message: 'down' } });
+    expect((await ready(secrets)).body).toEqual({ error: 'service_unavailable' });
+    use(h.tables);
+    process.env.WORKER_CONTEXT_SECRET = 'short';
+    expect((await ready(secrets)).body).toEqual({ error: 'r1_unavailable' });
+    process.env.WORKER_CONTEXT_SECRET = WORKER_SECRET;
+    expect(h.rooms.sendData).not.toHaveBeenCalled();
+  });
+
+  it('signs nothing and mints nothing: the candidate token keeps canPublishData false', async () => {
+    const secrets = await live();
+    const response = await ready(secrets);
+    expect(Object.keys(response.body)).toEqual(['ok']);
+    // The route file never grants data publishing: both tokens it mints stay data-less.
+    const source = readFileSync(
+      path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../routes/r1-candidate.ts'),
+      'utf8',
+    );
+    expect(source.match(/canPublishData:\s*false/g)).toHaveLength(2);
+    expect(source).not.toMatch(/canPublishData:\s*true/);
+    expect(source).not.toMatch(/canUpdateOwnMetadata:\s*true/);
+    const again = await post('/exchange', { attempt_token: secrets.attempt_token, nonce: secrets.nonce });
+    const cloud = cloudLiveKitEndpoint();
+    const verified = await new TokenVerifier(cloud.apiKey, cloud.apiSecret).verify(again.body.livekit_token);
+    expect(verified.video).toMatchObject({ canPublishData: false, canUpdateOwnMetadata: false });
+  });
+
+  it('limits each attempt, only after authentication, with Retry-After', async () => {
+    const secrets = await live();
+    // Junk and wrong-nonce requests are refused before the allowance is touched.
+    for (let i = 0; i < R1_READY_LIMIT + 2; i += 1) {
+      expect((await ready(secrets, { nonce: 'f1'.repeat(32) })).status).toBe(404);
+    }
+    for (let i = 0; i < R1_READY_LIMIT; i += 1) {
+      expect((await ready(secrets)).status).toBe(200);
+    }
+    const limited = await ready(secrets);
+    expect(limited.status).toBe(429);
+    expect(limited.body.error).toBe('r1_ready_rate_limited');
+    expect(limited.body.retry_after_sec).toBeGreaterThan(0);
+    expect(limited.headers['retry-after']).toBe(String(limited.body.retry_after_sec));
+    expect(h.rooms.sendData).toHaveBeenCalledTimes(R1_READY_LIMIT);
+    // Another attempt has an allowance of its own: the 429 above was charged to the first one.
+    const otherNonce = 'ab'.repeat(32);
+    addSession(h.tables, {
+      id: OTHER_SESSION,
+      external_call_id: `screening-${OTHER_SESSION}`,
+      status: 'in_progress',
+    });
+    addAttempt(h.tables, otherNonce, { session_id: OTHER_SESSION });
+    const other = mintAttemptToken(
+      { sessionId: OTHER_SESSION, nonceDigest: sha256(otherNonce) },
+      NOW,
+    )!;
+    const unrelated = await post('/ready', { attempt_token: other.token, nonce: otherNonce });
+    expect(unrelated.status).toBe(200);
+    expect(h.rooms.sendData.mock.calls.at(-1)![0]).toBe(`screening-${OTHER_SESSION}`);
+    expect((await ready(secrets)).status).toBe(429);
+  });
+
+  it('forgets presses after the window: the limiter is a sliding window', () => {
+    const limiter = createReadyLimiter(2, 10_000);
+    expect(limiter.hit('a', 0)).toEqual({ ok: true });
+    expect(limiter.hit('a', 1_000)).toEqual({ ok: true });
+    expect(limiter.hit('a', 2_000)).toEqual({ ok: false, retryAfterSec: 8 });
+    expect(limiter.hit('b', 2_000)).toEqual({ ok: true });
+    expect(limiter.hit('a', 10_001)).toEqual({ ok: true });
+    expect(limiter.hit('a', 10_002)).toEqual({ ok: false, retryAfterSec: 1 });
+  });
+
+  it('keeps the limiter\'s memory bounded', () => {
+    const limiter = createReadyLimiter(1, 60_000);
+    for (let i = 0; i < 12_000; i += 1) limiter.hit(`attempt-${i}`, i);
+    // The oldest attempts were evicted, so they have a fresh allowance; the newest do not.
+    expect(limiter.hit('attempt-0', 12_001)).toEqual({ ok: true });
+    expect(limiter.hit('attempt-11999', 12_002).ok).toBe(false);
+  });
+
+  it('audits the relay without any secret', async () => {
+    const secrets = await live();
+    audits.length = 0;
+    expect((await ready(secrets)).status).toBe(200);
+    expect(audits).toHaveLength(1);
+    expect(audits[0]!.metadata).toMatchObject({
+      resource: 'interview_round_attempt_ready',
+      round_id: ROUND,
+      attempt_number: 1,
+    });
+    const dump = JSON.stringify(audits);
+    expect(dump).not.toContain(secrets.attempt_token);
+    expect(dump).not.toContain(secrets.nonce);
+    expect(dump).not.toContain(LINK);
+    // A refused press is not an event worth an audit row.
+    audits.length = 0;
+    await ready(secrets, { nonce: 'f1'.repeat(32) });
+    expect(audits).toHaveLength(0);
+  });
+
+  it('survives a failing audit sink', async () => {
+    const secrets = await live();
+    setAuditSink(() => {
+      throw new Error('sink down');
+    });
+    expect((await ready(secrets)).status).toBe(200);
   });
 });
 

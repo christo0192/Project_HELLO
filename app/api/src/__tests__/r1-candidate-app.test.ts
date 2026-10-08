@@ -72,6 +72,7 @@ describe('R1 candidate routes through createApp', () => {
       ['/api/r1/preflight', { token: 'b2'.repeat(32) }],
       ['/api/r1/attempts', { token: 'b2'.repeat(32) }],
       ['/api/r1/exchange', { attempt_token: 'junk', nonce: 'c3'.repeat(32) }],
+      ['/api/r1/ready', { attempt_token: 'junk', nonce: 'c3'.repeat(32) }],
     ] as const) {
       const response = await request(app).post(path).send(body);
       expect(response.status, path).not.toBe(401);
@@ -87,6 +88,8 @@ describe('R1 candidate routes through createApp', () => {
       ['post', '/api/r1/status/extra'],
       ['post', '/api/r1/unknown'],
       ['get', '/api/r1/exchange'],
+      ['get', '/api/r1/ready'],
+      ['post', '/api/r1/ready/extra'],
       ['put', '/api/r1/preflight'],
     ];
     for (const [method, path] of misses) {
@@ -122,6 +125,7 @@ describe('R1 candidate routes through createApp', () => {
       'preflight',
       'attempts',
       'exchange',
+      'ready',
     ];
     for (const path of paths) {
       const response = await request(app).post(`/api/r1/${path}`).send({ token: 'short' });

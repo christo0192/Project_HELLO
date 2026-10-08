@@ -4293,9 +4293,21 @@ class TestPhaseAttribute(R1TestCase):
         self.interview._enter(R1Phase.ROLEPLAY_EXIT)
         self.interview._enter(R1Phase.WRAPUP)
         await self.settle()
+        # The live-UI signals (R1-Q) ride in the same writes: ``leadname`` and ``awaiting`` with the
+        # transition, ``awaiting`` cleared and ``rpleft`` set with the role-play, ``rpleft`` cleared
+        # with the phase after it, and a plain ``phase`` for every phase that touches none of them.
         self.assertEqual(
             self.ctx.room.local_participant.attributes,
-            [{"phase": value} for value in ("transition", "roleplay", "roleplay_exit", "wrapup")],
+            [
+                {
+                    "phase": "transition",
+                    "leadname": self.interview.persona.lead_name,
+                    "awaiting": "ready",
+                },
+                {"phase": "roleplay", "awaiting": "", "rpleft": "840"},
+                {"phase": "roleplay_exit", "rpleft": ""},
+                {"phase": "wrapup"},
+            ],
         )
 
     async def test_mute_aside_and_reconnect_pauses_are_published(self) -> None:
@@ -4333,7 +4345,7 @@ class TestPhaseAttribute(R1TestCase):
         self.assertEqual(sent, [])
         gate.set()
         await self.until(lambda: len(sent) == 2)
-        self.assertEqual(sent, [{"phase": "transition"}, {"phase": "roleplay"}])
+        self.assertEqual([item["phase"] for item in sent], ["transition", "roleplay"])
 
     async def test_a_failing_write_is_logged_by_type_and_swallowed(self) -> None:
         async def broken(_attributes):
@@ -4411,6 +4423,666 @@ class TestPhaseAttribute(R1TestCase):
                 await self.asyncSetUp()
                 await self.interview._exit(outcome)
                 self.assertEqual(self.published(), ["ended"])
+
+
+READY_BYTES = b'{"v":1,"kind":"ready"}'
+
+
+def ready_packet(
+    *,
+    topic: str | None = "r1ready",
+    data: object = READY_BYTES,
+    participant: object = None,
+) -> SimpleNamespace:
+    """A ``DataPacket`` as the SDK delivers it: data, kind, the sending participant, topic.
+
+    ``participant`` is None for a message sent by a server SDK, which is the only kind the
+    "I'm ready" button produces (the API relays it).
+    """
+    return SimpleNamespace(data=data, kind=0, participant=participant, topic=topic)
+
+
+class TestLiveUiSignals(R1TestCase):
+    """``leadname``, ``awaiting`` and ``rpleft`` ride on the one ordered phase writer (R1-Q).
+
+    The contract is in ``.gsd/milestones/R1-Q/IMPLEMENTER-RULES.md``: keys are single plain
+    lowercase words, values are strings, an empty string deletes, and the page reads them only
+    from the agent participant.
+    """
+
+    def writes(self) -> list[dict]:
+        return list(self.ctx.room.local_participant.attributes)
+
+    async def until_writes(self, count: int) -> list[dict]:
+        await self.until(lambda: len(self.writes()) >= count)
+        return self.writes()
+
+    async def test_the_keys_and_values_are_the_contracts(self) -> None:
+        self.assertEqual(
+            (
+                r1_session.LEADNAME_ATTRIBUTE,
+                r1_session.AWAITING_ATTRIBUTE,
+                r1_session.RPLEFT_ATTRIBUTE,
+                r1_session.AWAITING_READY,
+            ),
+            ("leadname", "awaiting", "rpleft", "ready"),
+        )
+        for key in (
+            r1_session.PHASE_ATTRIBUTE,
+            r1_session.LEADNAME_ATTRIBUTE,
+            r1_session.AWAITING_ATTRIBUTE,
+            r1_session.RPLEFT_ATTRIBUTE,
+        ):
+            self.assertRegex(key, r"^[a-z]+$")  # the SDK camel-cases keys with separators (#332)
+        self.assertEqual(r1_session.RPLEFT_HEARTBEAT_SECONDS, 30.0)
+        self.assertEqual(r1_session.RPLEFT_MAX_SECONDS, 3600)
+        self.assertEqual(r1_session.LEADNAME_MAX_CHARS, 40)
+
+    async def test_the_transition_write_carries_the_learner_name_and_awaiting_in_one_call(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        writes = await self.until_writes(1)
+        self.assertEqual(
+            writes,
+            [
+                {
+                    "phase": "transition",
+                    "leadname": self.interview.persona.lead_name,
+                    "awaiting": "ready",
+                }
+            ],
+        )
+        # Every value is a string, and the name is the one the interviewer says aloud.
+        self.assertTrue(all(isinstance(value, str) for value in writes[0].values()))
+        self.assertIn(writes[0]["leadname"], self.spoken_line("L-TRANSITION"))
+
+    async def test_awaiting_is_cleared_once_when_the_transition_is_left_and_leadname_is_kept(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.interview._enter(R1Phase.ROLEPLAY_EXIT)
+        self.interview._enter(R1Phase.WRAPUP)
+        writes = await self.until_writes(4)
+        self.assertEqual(writes[1]["awaiting"], "")
+        for later in writes[2:]:
+            self.assertNotIn("awaiting", later)
+        # `leadname` is written once with the transition and never deleted ("kept afterwards").
+        self.assertEqual(sum("leadname" in write for write in writes), 1)
+        for write in writes:
+            self.assertNotEqual(write.get("leadname"), "")
+
+    async def test_no_awaiting_or_leadname_before_the_transition(self) -> None:
+        self.interview._publish_phase("icebreaker")  # the fixture is in the icebreaker
+        writes = await self.until_writes(1)
+        self.assertEqual(writes, [{"phase": "icebreaker"}])
+
+    async def test_rpleft_goes_with_every_roleplay_phase_write_and_is_the_machines_budget(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.clock.advance(100)  # R = S = 100 s into the role-play
+        self.ctx.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
+        self.clock.advance(50)  # the aside pauses R; S keeps running
+        self.ctx.room.emit("track_unmuted", FakeParticipant("candidate"), FakePublication())
+        writes = await self.until_writes(4)
+        self.assertEqual([write["phase"] for write in writes], ["transition", "roleplay", "aside", "roleplay"])
+        self.assertEqual(writes[1]["rpleft"], "840")
+        self.assertEqual(writes[2]["rpleft"], "740")
+        # The paused clock: the budget has not moved while the aside lasted.
+        self.assertEqual(writes[3]["rpleft"], "740")
+        self.assertNotIn("rpleft", writes[0])
+
+    async def test_rpleft_is_the_shorter_of_the_role_play_and_the_session_cap(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.clock.advance(1100)  # S = 1100 s: only 100 s of the 20:00 session cap are left
+        self.interview._enter(R1Phase.ROLEPLAY)
+        writes = await self.until_writes(2)
+        self.assertEqual(writes[1]["rpleft"], "100")
+        self.assertEqual(
+            writes[1]["rpleft"], str(int(self.interview.machine.remaining_roleplay_seconds()))
+        )
+
+    async def test_rpleft_is_an_integer_string_clamped_to_zero_and_3600(self) -> None:
+        for budget, expected in ((99999.0, "3600"), (-5.0, "0"), (0.4, "0"), (839.9, "839"),
+                                 (float("nan"), "0"), (float("inf"), "0")):
+            with self.subTest(budget=budget):
+                with mock.patch.object(
+                    self.interview.machine, "remaining_roleplay_seconds", return_value=budget
+                ):
+                    self.assertEqual(self.interview._rpleft_value(), expected)
+
+    async def test_a_pause_inside_the_roleplay_keeps_rpleft_and_the_rejoin_refreshes_it(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.clock.advance(30)
+        self.interview._begin_disconnect()
+        self.clock.advance(20)  # R is paused by the disconnect, S is not
+        self.interview._rejoin()
+        writes = await self.until_writes(4)
+        self.assertEqual(
+            [(write["phase"], write.get("rpleft")) for write in writes[1:]],
+            [("roleplay", "840"), ("paused_disconnected", "810"), ("roleplay", "810")],
+        )
+
+    async def test_a_disconnect_before_the_roleplay_publishes_no_rpleft(self) -> None:
+        self.interview._begin_disconnect()
+        self.interview._rejoin()
+        writes = await self.until_writes(2)
+        self.assertEqual(writes, [{"phase": "paused_disconnected"}, {"phase": "icebreaker"}])
+
+    async def test_a_disconnect_in_the_transition_withdraws_awaiting_and_the_rejoin_asks_again(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._begin_disconnect()
+        self.interview._rejoin()
+        writes = await self.until_writes(3)
+        self.assertEqual(
+            writes,
+            [
+                {
+                    "phase": "transition",
+                    "leadname": self.interview.persona.lead_name,
+                    "awaiting": "ready",
+                },
+                {"phase": "paused_disconnected", "awaiting": ""},
+                {
+                    "phase": "transition",
+                    "leadname": self.interview.persona.lead_name,
+                    "awaiting": "ready",
+                },
+            ],
+        )
+
+    async def test_once_the_button_was_pressed_a_rejoin_does_not_ask_again(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.ctx.room.emit("data_received", ready_packet())
+        self.interview._begin_disconnect()
+        self.interview._rejoin()
+        writes = await self.until_writes(3)
+        self.assertEqual(writes[1], {"phase": "paused_disconnected", "awaiting": ""})
+        self.assertEqual(
+            writes[2], {"phase": "transition", "leadname": self.interview.persona.lead_name}
+        )
+
+    async def test_rpleft_is_cleared_once_by_the_first_phase_after_the_roleplay(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.interview._end_roleplay()
+        self.interview._enter(R1Phase.WRAPUP)
+        writes = await self.until_writes(4)
+        self.assertEqual(
+            [(write["phase"], write.get("rpleft")) for write in writes],
+            [("transition", None), ("roleplay", "840"), ("roleplay_exit", ""), ("wrapup", None)],
+        )
+
+    async def test_a_technical_stop_in_the_roleplay_clears_the_signals_with_aborted(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        await self.interview._finish("provider_error", system=True)
+        self.assertEqual(
+            self.writes()[-2:],
+            [{"phase": "aborted", "rpleft": ""}, {"phase": "ended"}],
+        )
+
+    async def test_a_name_the_page_would_refuse_is_not_published(self) -> None:
+        with mock.patch.object(R1Interview, "_lead_name", return_value=""):
+            self.interview._enter(R1Phase.TRANSITION)
+            writes = await self.until_writes(1)
+        self.assertEqual(writes, [{"phase": "transition", "awaiting": "ready"}])
+
+    async def test_a_persona_that_cannot_be_read_costs_only_the_name(self) -> None:
+        with mock.patch.object(
+            R1Interview, "persona", new_callable=mock.PropertyMock, side_effect=RuntimeError(POISON_TEXT)
+        ):
+            with self.capture_logs() as logs:
+                self.interview._enter(R1Phase.TRANSITION)
+                writes = await self.until_writes(1)
+        self.assertEqual(writes, [{"phase": "transition", "awaiting": "ready"}])
+        self.assertEqual(error_types(logs), ["r1_leadname_unavailable"])
+        self.assertNotIn(POISON_TEXT, json.dumps(logs))
+
+
+class TestLeadDisplayName(unittest.TestCase):
+    """The name goes to a page that refuses anything outside letters, spaces, ' and -."""
+
+    def test_the_contracts_names_are_accepted_as_they_are(self) -> None:
+        for name in ("Meera Iyer", "Mary-Ann O'Neil", "Li", "Åsa Öberg", "A" * 40):
+            with self.subTest(name=name):
+                self.assertEqual(r1_session.lead_display_name(name), name)
+
+    def test_whitespace_is_normalised(self) -> None:
+        self.assertEqual(r1_session.lead_display_name("  Meera \t Iyer\n"), "Meera Iyer")
+
+    def test_everything_else_is_not_published(self) -> None:
+        for name in (
+            "", "   ", None, 7, "A" * 41, "-Meera", "'Meera", "Meera1", "Meera_Iyer",
+            "Meera <b>", "Meera, Iyer", "Meera.Iyer", "Meera​Iyer", "Meera (Edison)",
+        ):
+            with self.subTest(name=name):
+                self.assertEqual(r1_session.lead_display_name(name), "")
+
+    def test_every_persona_in_the_pool_is_publishable(self) -> None:
+        from r1_personas import PERSONAS
+
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                with self.subTest(variant=variant.id):
+                    self.assertEqual(r1_session.lead_display_name(variant.full_name), variant.full_name)
+
+
+class TestRpleftHeartbeat(R1TestCase):
+    """``rpleft`` is refreshed every 30 s while the role-play phase itself is running."""
+
+    def writes(self) -> list[dict]:
+        return list(self.ctx.room.local_participant.attributes)
+
+    def heartbeats(self) -> list[dict]:
+        return [write for write in self.writes() if set(write) == {"rpleft"}]
+
+    async def test_it_publishes_only_rpleft_through_the_phase_writer_while_the_roleplay_runs(self) -> None:
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.01):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+            await self.until(lambda: len(self.heartbeats()) >= 2)
+            first = int(self.heartbeats()[0]["rpleft"])
+            self.clock.advance(60)
+            await self.until(lambda: int(self.heartbeats()[-1]["rpleft"]) < first)
+        self.assertLessEqual(int(self.heartbeats()[-1]["rpleft"]), first - 60)
+        for beat in self.heartbeats():
+            self.assertEqual(set(beat), {"rpleft"})
+            self.assertTrue(beat["rpleft"].isdigit())
+            self.assertLessEqual(int(beat["rpleft"]), 3600)
+
+    async def test_the_default_interval_is_thirty_seconds_and_nothing_is_sent_before_it(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        await self.settle()
+        self.assertEqual(self.heartbeats(), [])
+        self.assertIsNotNone(self.interview._rpleft_heartbeat)
+        self.assertFalse(self.interview._rpleft_heartbeat.done())
+
+    async def test_it_is_silent_during_an_aside_and_resumes_after_it(self) -> None:
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.01):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+            await self.until(lambda: len(self.heartbeats()) >= 1)
+            self.ctx.room.emit("track_muted", FakeParticipant("candidate"), FakePublication())
+            await self.settle()
+            frozen = len(self.writes())
+            await asyncio.sleep(0.1)
+            self.assertEqual(len(self.writes()), frozen)  # the aside is a phase of its own
+            self.ctx.room.emit("track_unmuted", FakeParticipant("candidate"), FakePublication())
+            await self.until(lambda: len(self.writes()) > frozen + 1)
+
+    async def test_it_stops_when_the_roleplay_is_over_and_nothing_follows_the_clearing_write(self) -> None:
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.01):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+            await self.until(lambda: len(self.heartbeats()) >= 1)
+            self.interview._end_roleplay()
+            self.interview._enter(R1Phase.WRAPUP)
+            await self.settle()
+            task = self.interview._rpleft_heartbeat
+            self.assertIsNone(task)
+            sent = len(self.writes())
+            await asyncio.sleep(0.1)
+        self.assertEqual(len(self.writes()), sent)
+        self.assertEqual(self.writes()[-1], {"phase": "wrapup"})
+        cleared = [write for write in self.writes() if write.get("rpleft") == ""]
+        self.assertEqual(cleared, [{"phase": "roleplay_exit", "rpleft": ""}])
+
+    async def test_it_does_not_run_before_the_roleplay_or_after_the_end(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.assertIsNone(self.interview._rpleft_heartbeat)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        self.assertIsNotNone(self.interview._rpleft_heartbeat)
+        task = self.interview._rpleft_heartbeat
+        await self.interview._announce_ended()
+        await self.settle()
+        self.assertTrue(task.cancelled() or task.done())
+        self.assertIsNone(self.interview._rpleft_heartbeat)
+
+    async def test_a_reconnect_pause_keeps_the_heartbeat_and_a_pause_before_the_roleplay_never_starts_it(self) -> None:
+        self.interview._begin_disconnect()
+        self.assertIsNone(self.interview._rpleft_heartbeat)
+        self.interview._rejoin()
+        self.interview._enter(R1Phase.TRANSITION)
+        self.interview._enter(R1Phase.ROLEPLAY)
+        task = self.interview._rpleft_heartbeat
+        self.interview._begin_disconnect()
+        self.assertIs(self.interview._rpleft_heartbeat, task)
+        self.interview._rejoin()
+        self.assertIs(self.interview._rpleft_heartbeat, task)
+        self.assertFalse(task.done())
+
+    async def test_a_stuck_writer_is_not_flooded_by_heartbeats(self) -> None:
+        gate = asyncio.Event()
+        sent: list[dict] = []
+
+        async def stuck(attributes):
+            await gate.wait()
+            sent.append(dict(attributes))
+
+        self.ctx.room.local_participant.set_attributes = stuck
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.001):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+            await asyncio.sleep(0.2)  # hundreds of ticks while the first write is stuck
+            queued = list(self.interview._phase_queue)
+        # The roleplay phase write is still queued, followed by at most ONE pending heartbeat.
+        self.assertEqual(queued[0]["phase"], "roleplay")
+        self.assertLessEqual(len(queued), 2)
+        gate.set()
+        await self.until(lambda: len(sent) >= 2)
+        self.assertEqual([item.get("phase") for item in sent[:2]], ["transition", "roleplay"])
+
+    async def test_writes_are_never_concurrent(self) -> None:
+        in_flight = {"now": 0, "max": 0}
+        sent: list[dict] = []
+
+        async def tracked(attributes):
+            in_flight["now"] += 1
+            in_flight["max"] = max(in_flight["max"], in_flight["now"])
+            await asyncio.sleep(0.002)
+            sent.append(dict(attributes))
+            in_flight["now"] -= 1
+
+        self.ctx.room.local_participant.set_attributes = tracked
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.001):
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+            await self.until(lambda: len(sent) >= 6)
+            self.interview._end_roleplay()
+        await self.settle()
+        self.assertEqual(in_flight["max"], 1)
+
+    async def test_a_failing_heartbeat_write_is_swallowed_and_does_not_stop_the_next(self) -> None:
+        calls = {"n": 0}
+        sent: list[dict] = []
+
+        async def flaky(attributes):
+            calls["n"] += 1
+            if "rpleft" in attributes and "phase" not in attributes and calls["n"] == 3:
+                raise RuntimeError(POISON_TEXT)
+            sent.append(dict(attributes))
+
+        self.ctx.room.local_participant.set_attributes = flaky
+        with mock.patch.object(r1_session, "RPLEFT_HEARTBEAT_SECONDS", 0.01):
+            with self.capture_logs() as logs:
+                self.interview._enter(R1Phase.TRANSITION)
+                self.interview._enter(R1Phase.ROLEPLAY)
+                await self.until(lambda: calls["n"] >= 5)
+        self.assertIn("r1_phase_publish_failed", error_types(logs))
+        self.assertNotIn(POISON_TEXT, json.dumps(logs))
+        self.assertGreaterEqual(len([item for item in sent if set(item) == {"rpleft"}]), 1)
+
+
+class TestReadyButton(R1TestCase):
+    """The page's "I'm ready" button reaches the worker as a server-sent ``r1ready`` message."""
+
+    async def start_transition(self) -> asyncio.Task:
+        """Enter the transition and start its driver, as ``run`` does after the briefing."""
+        self.interview._enter(R1Phase.TRANSITION)
+        task = asyncio.create_task(self.interview._run_transition())
+        await self.settle()
+        return task
+
+    def press(self, **over) -> None:
+        self.ctx.room.emit("data_received", ready_packet(**over))
+
+    def rejected(self, logs: list[dict]) -> list[str]:
+        return [
+            line_.get("error_category", "")
+            for line_ in logs
+            if line_.get("error_type") == "r1_ready_rejected"
+        ]
+
+    async def test_the_topic_and_payload_are_the_contracts(self) -> None:
+        self.assertEqual(r1_session.READY_TOPIC, "r1ready")
+        self.assertRegex(r1_session.READY_TOPIC, r"^[a-z0-9]+$")
+        self.assertEqual(
+            (r1_session.READY_PAYLOAD_VERSION, r1_session.READY_PAYLOAD_KIND), (1, "ready")
+        )
+        self.assertIn("data_received", self.ctx.room.handlers)  # wired by wire_events
+
+    async def test_the_topic_and_payload_are_the_ones_the_api_relays(self) -> None:
+        api = HERE.parent / "api" / "src" / "routes" / "r1-candidate.ts"
+        if not api.exists():
+            self.skipTest("the API is not part of this checkout")
+        source = api.read_text(encoding="utf-8")
+        topic = re.search(r"R1_READY_TOPIC = '([^']+)'", source)
+        payload = re.search(r"R1_READY_PAYLOAD = \{ v: (\d+), kind: '([^']+)' \}", source)
+        self.assertIsNotNone(topic)
+        self.assertIsNotNone(payload)
+        self.assertEqual(topic.group(1), r1_session.READY_TOPIC)
+        self.assertEqual(
+            (int(payload.group(1)), payload.group(2)),
+            (r1_session.READY_PAYLOAD_VERSION, r1_session.READY_PAYLOAD_KIND),
+        )
+        # The API sends JSON.stringify of that object; the worker accepts exactly those bytes.
+        self.assertTrue(
+            r1_session.ready_payload_ok(
+                json.dumps(
+                    {"v": int(payload.group(1)), "kind": payload.group(2)}, separators=(",", ":")
+                ).encode("utf-8")
+            )
+        )
+
+    async def test_a_press_while_waiting_picks_up_at_once_without_a_nudge(self) -> None:
+        task = await self.start_transition()
+        self.assertFalse(task.done())
+        self.press()
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+        self.assertNotIn(self.spoken_line("L-TRANSITION-NUDGE"), self.session.spoken)
+
+    async def test_a_press_while_the_briefing_is_still_playing_is_not_lost(self) -> None:
+        # The driver has not started waiting yet: `_run_transition` forgets the turns queued
+        # before it begins, and a queued "ready" would go with them.  The press is latched.
+        self.interview._enter(R1Phase.TRANSITION)
+        self.press()
+        self.interview.note_turn("a stray answer from the briefing")
+        self.assertIsNone(await asyncio.wait_for(self.interview._run_transition(), 10.0))
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+
+    async def test_a_press_during_the_nudge_ends_the_wait_right_after_it(self) -> None:
+        task = await self.start_transition()
+        self.final_transcript("what do I do?")
+        await self.until(lambda: self.session.spoken.count(self.spoken_line("L-TRANSITION-NUDGE")) == 1)
+        self.press()
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-TRANSITION-NUDGE")), 1)
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-PICKUP")), 1)
+
+    async def test_a_press_is_not_a_transcript_row_or_a_turn(self) -> None:
+        task = await self.start_transition()
+        self.press()
+        await asyncio.wait_for(task, 10.0)
+        await self.flush()
+        self.assertEqual([row for row in self.writer.saved if row["speaker"] == "candidate"], [])
+        self.assertTrue(self.interview._turns.empty())
+
+    async def test_the_spoken_ready_still_works_and_is_not_a_button_press(self) -> None:
+        task = await self.start_transition()
+        self.final_transcript("ok, ready")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+
+    async def test_a_message_that_names_a_sender_is_never_the_button(self) -> None:
+        # Server-sent data has no participant.  A candidate's token cannot publish data at all;
+        # if a grant ever changed, a participant's message must still not move the interview.
+        await self.start_transition()
+        with self.capture_logs() as logs:
+            self.press(participant=FakeParticipant("candidate"))
+            self.press(participant=FakeParticipant("someone-else", kind=SIP))
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.rejected(logs), ["sender", "sender"])
+        self.assertTrue(self.interview._awaiting_ready)
+
+    async def test_only_the_exact_payload_is_the_button(self) -> None:
+        await self.start_transition()
+        bad = [
+            b"",
+            b"ready",
+            b"not json",
+            b"\xff\xfe",
+            b'["ready"]',
+            b'"ready"',
+            b"null",
+            b'{"v":1}',
+            b'{"kind":"ready"}',
+            b'{"v":2,"kind":"ready"}',
+            b'{"v":"1","kind":"ready"}',
+            b'{"v":true,"kind":"ready"}',
+            b'{"v":1.0,"kind":"ready"}',
+            b'{"v":1,"kind":"READY"}',
+            b'{"v":1,"kind":"go"}',
+            b'{"v":1,"kind":"ready","extra":1}',
+            b'{"v":1,"kind":"ready","phase":"roleplay"}',
+            b'{"v":1,"kind":"ready"}' + b" " * 200,
+            None,
+            "not bytes",
+            12,
+        ]
+        with self.capture_logs() as logs:
+            for data in bad:
+                self.press(data=data)
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.rejected(logs), ["payload"] * len(bad))
+        for variant in (bytearray(READY_BYTES), memoryview(READY_BYTES), b' {"v": 1, "kind": "ready"} '):
+            with self.subTest(variant=type(variant).__name__):
+                self.assertTrue(r1_session.ready_payload_ok(variant))
+
+    async def test_another_topic_is_ignored_without_a_trace(self) -> None:
+        await self.start_transition()
+        with self.capture_logs() as logs:
+            for topic in (None, "", "lk.chat", "R1READY", "r1ready ", "r1.ready", "ready"):
+                self.press(topic=topic)
+        self.assertEqual(logs, [])
+        self.assertFalse(self.interview._ready_latched)
+
+    async def test_it_is_accepted_only_in_the_transition(self) -> None:
+        def roleplay() -> None:
+            self.interview._enter(R1Phase.TRANSITION)
+            self.interview._enter(R1Phase.ROLEPLAY)
+
+        def aside() -> None:
+            roleplay()
+            self.interview._enter(R1Phase.ASIDE)
+
+        def roleplay_exit() -> None:
+            roleplay()
+            self.interview._end_roleplay()
+
+        def wrapup() -> None:
+            roleplay_exit()
+            self.interview._enter(R1Phase.WRAPUP)
+
+        for name, reach in (
+            ("icebreaker", lambda: None),
+            ("roleplay", roleplay),
+            ("aside", aside),
+            ("roleplay_exit", roleplay_exit),
+            ("wrapup", wrapup),
+        ):
+            with self.subTest(phase=name):
+                await self.asyncSetUp()
+                reach()
+                self.assertEqual(self.interview.machine.phase.value, name)
+                with self.capture_logs() as logs:
+                    self.press()
+                self.assertFalse(self.interview._ready_latched)
+                self.assertEqual(self.rejected(logs), ["not_awaiting"])
+
+    async def test_it_is_not_accepted_before_the_worker_asked(self) -> None:
+        # The fixture is in the icebreaker: the page was never told `awaiting=ready`.
+        with self.capture_logs() as logs:
+            self.press()
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.rejected(logs), ["not_awaiting"])
+
+    async def test_it_is_not_accepted_while_the_candidate_is_disconnected(self) -> None:
+        await self.start_transition()
+        self.interview._begin_disconnect()
+        with self.capture_logs() as logs:
+            self.press()
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.rejected(logs), ["not_awaiting"])
+        self.interview._rejoin()
+        self.press()  # asked again at the rejoin: now it counts
+        self.assertTrue(self.interview._ready_latched)
+
+    async def test_a_press_after_the_wait_is_over_is_ignored(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        with mock.patch.object(r1_session, "TRANSITION_DEADLINE_SECONDS", 0.02):
+            await asyncio.wait_for(self.interview._run_transition(), 10.0)
+        # The learner is picking up; the phase has not moved on yet, but nothing is awaited.
+        self.assertIs(self.interview.machine.phase, R1Phase.TRANSITION)
+        with self.capture_logs() as logs:
+            self.press()
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(self.rejected(logs), ["not_awaiting"])
+
+    async def test_a_second_press_changes_nothing(self) -> None:
+        task = await self.start_transition()
+        with self.capture_logs() as logs:
+            self.press()
+            self.press()
+        await asyncio.wait_for(task, 10.0)
+        self.assertEqual(self.rejected(logs), ["not_awaiting"])
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-PICKUP")), 1)
+
+    async def test_nothing_is_accepted_once_the_exit_has_begun(self) -> None:
+        await self.start_transition()
+        self.interview._begin_exit()
+        with self.capture_logs() as logs:
+            self.press()
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(logs, [])
+
+    async def test_the_press_is_logged_by_label_only(self) -> None:
+        await self.start_transition()
+        with self.capture_logs() as logs:
+            self.press()
+        self.assertEqual(error_types(logs), ["r1_ready_button"])
+        self.assertNotIn(self.interview.persona.lead_name, json.dumps(logs))
+
+    async def test_a_stop_during_the_wait_still_wins(self) -> None:
+        task = await self.start_transition()
+        self.interview._on_residency_deadline()
+        self.assertEqual(await asyncio.wait_for(task, 10.0), "residency_timeout")
+        self.assertNotIn(self.spoken_line("L-PICKUP"), self.session.spoken)
+
+    async def test_await_turn_returns_pressed_when_the_condition_holds(self) -> None:
+        flag = {"on": False}
+        task = asyncio.create_task(
+            self.interview._await_turn(30.0, until=lambda: flag["on"])
+        )
+        await self.settle()
+        self.assertFalse(task.done())
+        flag["on"] = True
+        self.interview._wake()
+        self.assertEqual(await asyncio.wait_for(task, 10.0), (r1_session.PRESSED, None))
+
+    async def test_a_whole_interview_takes_a_press_made_while_the_briefing_plays(self) -> None:
+        # Through ``run``: the press arrives while L-TRANSITION is still being spoken, before
+        # the driver has started waiting for "ready" (and so before it forgets queued turns).
+        run = await self.start_interview()
+        run.session.playout_seconds = 0.2  # the briefing takes a moment to play
+        run.clock.advance(271)
+        run.interview._wake()
+        await self.until(lambda: run.interview.machine.phase is R1Phase.TRANSITION)
+        self.assertFalse(self.spoken_and_played("L-TRANSITION"))
+        run.context.room.emit("data_received", ready_packet())
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ROLEPLAY)
+        self.assertEqual(run.session.spoken.count(self.spoken_line("L-PICKUP")), 1)
+        self.assertNotIn(self.spoken_line("L-TRANSITION-NUDGE"), run.session.spoken)
+        await self.until(lambda: len(run.context.room.local_participant.attributes) >= 2)
+        writes = run.context.room.local_participant.attributes
+        self.assertEqual(
+            [write["phase"] for write in writes if write["phase"] in ("transition", "roleplay")],
+            ["transition", "roleplay"],
+        )
+        self.assertEqual(writes[-1]["awaiting"], "")
+        self.assertTrue(writes[-1]["rpleft"].isdigit())
+        await self.drain_cancel(run)
 
 
 POISON_TEXT = "Quokka-utterance-4417"

@@ -33,6 +33,8 @@ const fixtures = [
   ['/api/r1/preflight', 'post', '200'],
   ['/api/r1/attempts', 'post', '201'],
   ['/api/r1/exchange', 'post', '200'],
+  // R1-Q: the candidate's "I'm ready" button, relayed by the server (the token cannot publish data).
+  ['/api/r1/ready', 'post', '200'],
   ['/api/internal/r1/attempt-outcome', 'post', '201'],
 ] as const;
 
@@ -92,6 +94,10 @@ describe('R1 candidate surface contract', () => {
     }
     expect(sectionFor('/api/r1/preflight')).toMatch(/'429'\s*:/);
     expect(sectionFor('/api/r1/exchange')).toMatch(/'202'\s*:/);
+    const ready = sectionFor('/api/r1/ready');
+    expect(ready).toMatch(/'429'\s*:/);
+    expect(ready).toMatch(/'404'\s*:/);
+    expect(ready).toMatch(/\bnot_live\b/);
   });
 
   it('keeps near misses out of the public allowlist (exact method and path only)', () => {
@@ -101,6 +107,9 @@ describe('R1 candidate surface contract', () => {
       ['GET', '/api/r1/consent-template'],
       ['POST', '/api/r1/status/'],
       ['POST', '/api/r1/exchange/extra'],
+      ['GET', '/api/r1/ready'],
+      ['POST', '/api/r1/ready/'],
+      ['POST', '/api/r1/ready/extra'],
       ['POST', '/api/r1'],
       ['POST', '/api/internal/r1/attempt-outcome'],
       ['GET', '/api/interview-rounds/x/cancel'],

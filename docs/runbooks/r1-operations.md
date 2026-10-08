@@ -1335,6 +1335,66 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   `WRAPUP_REMINDER`); `docs/design/r1/R1-PLAN-final.md` carries the new `L-NO-FEEDBACK` text (a test
   compares it). Nothing else in the lines changed.
 
+### Live-UI signals and the "I'm ready" relay (R1-Q)
+
+The candidate's page follows three more participant attributes of the **agent** (the page trusts only
+an agent-kind participant). They go out on the same single ordered writer as `phase`
+(`R1Interview._enqueue_attributes`), so a slow write can neither reorder them nor stall the interview.
+Keys are single plain lowercase words (the SDK camel-cases keys with separators, #332), values are
+strings, and an empty string deletes the attribute. Only changes are sent; a phase that touches none
+of them is the bare `{"phase": ...}` it always was.
+
+| Key | Value | Written |
+|---|---|---|
+| `leadname` | the simulated learner's name, e.g. `Meera Iyer` (letters, spaces, `'`, `-`, at most 40; anything else is not published) | in the SAME `set_attributes` call as `phase=transition`; kept afterwards |
+| `awaiting` | `ready` | with `phase=transition`; `""` with the next phase write (including a reconnect pause; the rejoin into the transition asks again, unless the button was already pressed) |
+| `rpleft` | whole seconds of role-play budget left (`remaining_roleplay_seconds()`: the shorter of the 14:00 role-play clock and the 20:00 session cap), clamped 0..3600 | with every phase write while the role-play runs or is paused (`roleplay`, `aside`, a reconnect pause inside it, the rejoin); a **30 s heartbeat** while the phase is `roleplay` (`RPLEFT_HEARTBEAT_SECONDS`, refreshed value only, coalesced so a stuck writer is not flooded); `""` with the first phase write after the role-play (`roleplay_exit`, `closing`, `aborted`) |
+
+It is an upper bound, not a promise: the role-play can end early (R >= 10:00 with the commitment
+resolved). An old page ignores all three; a new page with an old worker simply shows no button and no
+clock.
+
+**The "I'm ready" button.** The candidate token has `canPublishData: false` (R1-PLAN threat 13), so the
+browser cannot send anything into the room. It calls `POST /api/r1/ready` with
+`{"attempt_token", "nonce"}` (the exchange's two secrets and nothing else; extra keys are a 400), and
+the API relays one fixed message with the LiveKit server SDK: topic `r1ready`, reliable, bytes
+`{"v":1,"kind":"ready"}`, addressed to the agent participant(s) found with `listParticipants` in that
+attempt's own room (broadcast when none is found or the listing fails: the payload is the same and only
+the worker acts on it). No token grant changed; two tests pin `canPublishData: false` on both tokens.
+
+| Answer | Meaning |
+|---|---|
+| 200 `{"ok": true}` | the message was handed to LiveKit (not a promise the worker acted on it) |
+| 404 `r1_attempt_invalid` | unknown attempt, wrong nonce, **or an attempt token older than 5 minutes**: the page re-mints a token (a rejoin: `POST /api/r1/attempts` with the link and the nonce) and presses again once |
+| 409 `not_live` | no live room for the attempt (not provisioned, ended, or LiveKit says the room is gone) |
+| 409 `consent_required` / `round_not_admissible` / `r1_disabled` | as for the exchange: a withdrawal, a lapsed round or the master switch stops it |
+| 429 `r1_ready_rate_limited` | 6 requests a minute per attempt (sliding window, in memory, counted only after the token and nonce verified, so junk cannot spend a real candidate's allowance) |
+| 503 `r1_room_unavailable` | LiveKit did not take the message (each server call is bounded at 4 s); retry |
+
+The relay is not new work: R1 pause, maintenance and the DeepSeek probe do not stop it. Each accepted
+relay writes one `resource.update` audit event (`resource: interview_round_attempt_ready`, round id,
+attempt number; no secret).
+
+**What the worker accepts** (`R1Interview._on_data_received`): topic `r1ready`; **no sending
+participant** (only server credentials produce a data packet without one, and a message that names a
+participant is never the button, whatever it says); the payload exactly `{"v": 1, "kind": "ready"}`
+(UTF-8 JSON, at most 128 bytes, no extra key); the phase is `transition` and the worker is waiting
+(`awaiting=ready` was sent and the wait has not ended); and it has not been pressed already. The press
+is **latched**, not queued as a turn: the transition driver forgets the turns queued before it starts
+waiting, and the button is usually pressed while the ~30 s briefing is still playing. A latched press
+ends the wait at once (no "Whenever you're ready" nudge) and the learner picks up, exactly as for a
+spoken "ready" (which keeps working). It is not a transcript row.
+
+Logs, all by label (no name, no text): `r1_ready_button` (accepted); `r1_ready_rejected` with
+`error_category` `sender` or `payload` (warning: something other than the relay sent on the topic),
+or `not_awaiting` (info: too late, too early or a repeat, which is normal). In the API,
+`r1_ready_send_failed` and `r1_ready_agent_lookup_failed` are the two LiveKit failure labels.
+
+Triage for "the button did nothing": the audit event says the API relayed it; an `r1_ready_button` line
+in the worker log says the worker took it; `not_awaiting` says it came outside the transition; a `404`
+on the page is a stale attempt token; no worker line at all with an audit event means the message did
+not reach the room (check the interviewer's identity in the room and the R1 SFU's server API).
+
 ## Incident handling and rollback
 
 For any active R1 incident, set `r1_settings.paused = true` first. Preserve

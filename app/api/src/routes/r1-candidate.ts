@@ -8,7 +8,7 @@
  *       the LINK token (256 random bits from the HR link fragment; only its
  *       SHA-256 digest is stored, `interview_rounds.link_token_digest`);
  *   attempts (rejoin)    the link token AND the attempt NONCE;
- *   exchange             an ATTEMPT TOKEN AND the NONCE (lib/r1/attempt-token).
+ *   exchange, ready      an ATTEMPT TOKEN AND the NONCE (lib/r1/attempt-token).
  *
  * Invariants:
  *  1. These routes are public in `auth.ts` by exact method+path and perform
@@ -56,11 +56,17 @@
  *     (no auto-create) a missing room is otherwise a permanent `preparing` loop (on
  *     Cloud the join would auto-create an UNMARKED room). `in_progress` is left
  *     alone: the candidate is already in the room.
+ * 10. The "I'm ready" button (`POST /api/r1/ready`) is a SERVER relay, because the candidate
+ *     token cannot publish data (invariant 4). The route authenticates like the exchange (attempt
+ *     token and nonce), derives the room from the VERIFIED attempt's own session (the body names
+ *     nothing but the two secrets, so one attempt can never signal another's room), and sends one
+ *     fixed, pinned message (`R1_READY_PAYLOAD` on `R1_READY_TOPIC`) to the room's interviewer
+ *     with the server SDK. Nothing the caller sends is relayed.
  */
 
 import { randomUUID } from 'node:crypto';
 import { Router, type NextFunction, type Request, type Response } from 'express';
-import { TrackSource } from 'livekit-server-sdk';
+import { DataPacket_Kind, TrackSource } from 'livekit-server-sdk';
 import { z } from 'zod';
 import { supabase } from '../lib/supabase.js';
 import { validateBody } from '../lib/validation.js';
@@ -117,6 +123,7 @@ import {
   r1ConsentItems,
 } from '../lib/r1/consent-items.js';
 import { r1DeepSeekHealth } from '../lib/r1/deepseek-health.js';
+import { createReadyLimiter, type ReadyLimiter } from '../lib/r1/ready-limiter.js';
 import { runR1WorkerGate, type DispatchListerLike } from '../lib/r1/worker-gate.js';
 
 const log = createLogger('r1-candidate');
@@ -146,6 +153,17 @@ export const WITHDRAW_RETRY_AFTER_SEC = 3;
 /** DeepSeek is unhealthy: the probe is cached for 60 s, so retry after half that. */
 export const UNHEALTHY_RETRY_AFTER_SEC = 30;
 const STARTS_PER_LINK = 3;
+/**
+ * The "I'm ready" relay (R1-Q cross-PR contract, IMPLEMENTER-RULES.md). The topic and the exact
+ * message are pinned on both ends: the worker (`r1_session.READY_TOPIC` / `ready_payload_ok`)
+ * accepts nothing else, and a test in each language reads the other's source for them.
+ */
+export const R1_READY_TOPIC = 'r1ready';
+export const R1_READY_PAYLOAD = { v: 1, kind: 'ready' } as const;
+/** `{"v":1,"kind":"ready"}`: the only bytes this route ever sends. */
+const READY_BYTES = new TextEncoder().encode(JSON.stringify(R1_READY_PAYLOAD));
+/** Each LiveKit server call of the relay is bounded, so a stuck call cannot hold the request. */
+export const READY_RELAY_TIMEOUT_MS = 4_000;
 
 /** What the landing page tells the candidate about the interview (plan 4 step 3). */
 export const R1_FORMAT = {
@@ -201,6 +219,10 @@ export const r1AttemptsSchema = z
 export const r1ExchangeSchema = z
   .object({ attempt_token: z.string().min(1).max(160), nonce: nonceField })
   .strict();
+/** The ready relay takes the exchange's two secrets and nothing else (no room, no payload). */
+export const r1ReadySchema = z
+  .object({ attempt_token: z.string().min(1).max(160), nonce: nonceField })
+  .strict();
 
 // ── Dependencies (injectable for tests) ──────────────────────────────
 
@@ -213,6 +235,14 @@ export interface R1RoomClient extends RoomServiceClientLike {
     metadata: string;
     departureTimeout?: number;
   }): Promise<unknown>;
+  /** The ready relay: who is in the room (to find the interviewer), then one data message. */
+  listParticipants(room: string): Promise<unknown[]>;
+  sendData(
+    room: string,
+    data: Uint8Array,
+    kind: DataPacket_Kind,
+    options: { topic?: string; destinationIdentities?: string[] },
+  ): Promise<void>;
 }
 
 export interface R1CandidateDeps {
@@ -235,11 +265,43 @@ export interface R1CandidateDeps {
   maintenance?: typeof readMaintenanceState;
   /** Runs `work` once after `delayMs`; the default timer never keeps the process alive. */
   schedule?: (work: () => void, delayMs: number) => void;
+  /** The per-attempt limiter of `POST /api/r1/ready` (a fresh one per router by default). */
+  readyLimiter?: ReadyLimiter;
+  /** Bound on each LiveKit server call of the ready relay (`READY_RELAY_TIMEOUT_MS` by default). */
+  readyRelayTimeoutMs?: number;
 }
 
 function defaultSchedule(work: () => void, delayMs: number): void {
   const timer = setTimeout(work, delayMs);
   timer.unref();
+}
+
+/** `ParticipantInfo_Kind.AGENT` (number), or its JSON spelling (see lib/browser-orchestration.ts). */
+function agentIdentities(participants: unknown): string[] {
+  if (!Array.isArray(participants)) return [];
+  const identities: string[] = [];
+  for (const participant of participants) {
+    const { kind, identity } = (participant ?? {}) as { kind?: unknown; identity?: unknown };
+    if ((kind === 4 || kind === 'AGENT') && typeof identity === 'string' && identity !== '') {
+      identities.push(identity);
+    }
+  }
+  return identities;
+}
+
+/** A LiveKit Twirp answer for a room that does not exist (any more). */
+function roomIsMissing(error: unknown): boolean {
+  const { code, status } = (error ?? {}) as { code?: unknown; status?: unknown };
+  return code === 'not_found' || status === 404;
+}
+
+function bounded<T>(work: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error('r1_ready_relay_timeout')), ms);
+    timer.unref();
+  });
+  return Promise.race([work, timeout]).finally(() => clearTimeout(timer));
 }
 
 // ── Router ───────────────────────────────────────────────────────────
@@ -259,6 +321,8 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
   const healthy = deps.health ?? (() => r1DeepSeekHealth.check());
   const readMaintenance = deps.maintenance ?? readMaintenanceState;
   const schedule = deps.schedule ?? defaultSchedule;
+  const readyLimiter = deps.readyLimiter ?? createReadyLimiter();
+  const readyTimeoutMs = deps.readyRelayTimeoutMs ?? READY_RELAY_TIMEOUT_MS;
 
   // Tokens, nonces and consent state must never be cached by a proxy or browser.
   router.use((_req, res, next) => {
@@ -1282,6 +1346,150 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       expires_at: join.expiresAt,
       attempt_id: session.id,
     });
+  }));
+
+  // ── POST /api/r1/ready ─────────────────────────────────────────────
+
+  type ReadyRelay = 'sent' | 'no_room' | 'failed';
+
+  /**
+   * Tell the room's interviewer the candidate pressed "I'm ready": one fixed message on the
+   * pinned topic, addressed to the agent participant(s) found in THIS room. When the room lists no
+   * agent (or cannot be listed) the message is broadcast instead, which is harmless: it carries
+   * nothing but the pinned `{"v":1,"kind":"ready"}`, and only the worker acts on it.
+   */
+  async function relayReady(endpoint: LiveKitEndpoint, roomName: string): Promise<ReadyRelay> {
+    const rooms = roomsFor(endpoint);
+    let identities: string[] = [];
+    try {
+      identities = agentIdentities(
+        await bounded(rooms.listParticipants(roomName), readyTimeoutMs),
+      );
+    } catch (error) {
+      if (roomIsMissing(error)) return 'no_room';
+      log.warn('unknown_event', { error_category: 'r1_ready_agent_lookup_failed' });
+    }
+    try {
+      await bounded(
+        rooms.sendData(roomName, READY_BYTES, DataPacket_Kind.RELIABLE, {
+          topic: R1_READY_TOPIC,
+          ...(identities.length > 0 ? { destinationIdentities: identities } : {}),
+        }),
+        readyTimeoutMs,
+      );
+      return 'sent';
+    } catch (error) {
+      if (roomIsMissing(error)) return 'no_room';
+      log.error('unknown_event', { error_category: 'r1_ready_send_failed' });
+      return 'failed';
+    }
+  }
+
+  router.post('/ready', validateBody(r1ReadySchema), route(async (req, res) => {
+    if (!attemptTokensConfigured()) {
+      refuse(res, 503, 'r1_unavailable');
+      return;
+    }
+    const body = req.body as z.infer<typeof r1ReadySchema>;
+    const named = peekAttemptToken(body.attempt_token);
+    if (!named) {
+      refuse(res, 404, STABLE_ATTEMPT_ERROR);
+      return;
+    }
+    const attempt = await loadAttempt(db, named.sessionId);
+    if (!attempt.ok) {
+      refuse(res, 503, 'service_unavailable');
+      return;
+    }
+    // The same one stable answer as the exchange: unknown attempt, wrong or expired token,
+    // wrong nonce. The token lives five minutes, so the page re-mints one (a rejoin with the
+    // link and its nonce) when the one it holds is old.
+    if (
+      !attempt.value
+      || !verifyAttemptToken(body.attempt_token, attempt.value.nonce_digest, now())
+      || !nonceMatchesDigest(body.nonce, attempt.value.nonce_digest)
+    ) {
+      refuse(res, 404, STABLE_ATTEMPT_ERROR);
+      return;
+    }
+    // Authenticated: only now may the switch be reported, and the attempt be charged.
+    if (!enabledOr409(res)) return;
+    const allowance = readyLimiter.hit(attempt.value.session_id, now());
+    if (!allowance.ok) {
+      res.setHeader('Retry-After', String(allowance.retryAfterSec));
+      refuse(res, 429, 'r1_ready_rate_limited', { retry_after_sec: allowance.retryAfterSec });
+      return;
+    }
+
+    const loaded = await loadSession(db, attempt.value.session_id);
+    const roundRead = await loadRoundById(db, attempt.value.round_id);
+    if (!loaded.ok || !roundRead.ok) {
+      refuse(res, 503, 'service_unavailable');
+      return;
+    }
+    const session = loaded.value;
+    const round = roundRead.value;
+    if (
+      !session
+      || !round
+      || session.mode !== 'browser'
+      || session.interview_round_id !== round.id
+    ) {
+      refuse(res, 404, STABLE_ATTEMPT_ERROR);
+      return;
+    }
+    // The room is the one this attempt's own session names, never anything the caller sent.
+    const roomName = roomNameForSession(session.id);
+    if (session.external_call_id !== null && session.external_call_id !== roomName) {
+      refuse(res, 404, STABLE_ATTEMPT_ERROR);
+      return;
+    }
+    // Live: the room exists (`waiting`: provisioned, `in_progress`: the worker owns it).
+    // `created` has no room yet, and an ended attempt has nobody to tell.
+    if (
+      session.external_call_id === null
+      || !(['waiting', 'in_progress'] as string[]).includes(session.status)
+    ) {
+      refuse(res, 409, 'not_live');
+      return;
+    }
+    if (!roundIsActive(round, now())) {
+      refuse(res, 409, 'round_not_admissible');
+      return;
+    }
+    // A withdrawal stops the relay as it stops the join.
+    const consent = await readRoundConsent(db, round.id, round.consent_locale);
+    if (!consent.ok) {
+      refuse(res, 503, 'service_unavailable');
+      return;
+    }
+    if (consent.value.state !== 'granted') {
+      refuse(res, 409, 'consent_required');
+      return;
+    }
+    let endpoint: LiveKitEndpoint;
+    try {
+      endpoint = requireBrowserLiveKitConfigured();
+    } catch {
+      refuse(res, 503, 'r1_unavailable');
+      return;
+    }
+
+    const relayed = await relayReady(endpoint, roomName);
+    if (relayed === 'no_room') {
+      refuse(res, 409, 'not_live');
+      return;
+    }
+    if (relayed === 'failed') {
+      refuse(res, 503, 'r1_room_unavailable');
+      return;
+    }
+    await audit(req, 'resource.update', 200, {
+      resource: 'interview_round_attempt_ready',
+      round_id: round.id,
+      attempt_number: attempt.value.attempt_number,
+    });
+    res.status(200).json({ ok: true });
   }));
 
   return router;

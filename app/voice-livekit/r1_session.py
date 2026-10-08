@@ -87,12 +87,21 @@ R1-Q (interviewer lines) changes what the scripted lines and the wrap-up say, in
   so the model is not asked to answer it with a goodbye of its own before ``L-CLOSE``.
 * The guard's feedback refusal ends the reply (``r1_guard``), and ``L-NO-FEEDBACK`` is one
   sentence that names the hiring team once.
+
+R1-Q (live-UI signals) tells the candidate's page three more things on the same attribute writer
+as ``phase`` (``LEADNAME_ATTRIBUTE``): the simulated learner's name (``leadname``, with
+``phase=transition``), that the interviewer is waiting for the "I'm ready" button (``awaiting``),
+and how much role-play budget is left (``rpleft``, with every role-play phase write and a 30 s
+heartbeat).  The button itself comes back as a server-sent ``r1ready`` data message that the API
+relays (``_on_data_received``): it is accepted only from the server, only in the transition and
+only while ``awaiting=ready``, and is latched so the driver treats it exactly like a spoken "ready".
 """
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import inspect
+import json
 import math
 import os
 import re
@@ -184,6 +193,27 @@ PHASE_ATTRIBUTE = "phase"
 # because ``_announce_ended`` cancels the writer first.
 PHASE_PUBLISH_SECONDS = 3.0
 _PHASE_QUEUE_MAX = 16
+# R1-Q live-UI signals.  Three more plain lowercase attributes ride on the same writer as ``phase``
+# (cross-PR contract in ``.gsd/milestones/R1-Q/IMPLEMENTER-RULES.md``; the page reads them only from
+# the agent participant).  Values are strings, and an empty string deletes the attribute:
+#   leadname  the simulated learner's display name, in the SAME write as ``phase=transition``, kept;
+#   awaiting  ``ready`` from ``phase=transition`` until the transition is left (the page's
+#             "I'm ready" button);
+#   rpleft    whole seconds of role-play budget left, with every phase write while the role-play is
+#             active or paused and on a heartbeat while it runs, ``""`` once it is over.
+LEADNAME_ATTRIBUTE = "leadname"
+AWAITING_ATTRIBUTE = "awaiting"
+AWAITING_READY = "ready"
+RPLEFT_ATTRIBUTE = "rpleft"
+RPLEFT_HEARTBEAT_SECONDS = 30.0
+RPLEFT_MAX_SECONDS = 3600
+LEADNAME_MAX_CHARS = 40
+# The "I'm ready" button reaches the worker as a SERVER-sent data message (the API relays it; the
+# candidate's token cannot publish data).  Topic and payload are pinned on both ends.
+READY_TOPIC = "r1ready"
+READY_PAYLOAD_VERSION = 1
+READY_PAYLOAD_KIND = "ready"
+READY_PAYLOAD_MAX_BYTES = 128
 # Outcomes that are OUR fault: the candidate's page must say so (``phase=aborted``) rather
 # than "Interview complete".
 _TECHNICAL_OUTCOMES = frozenset(
@@ -417,6 +447,8 @@ TURN = "turn"
 SILENCE = "silence"
 STOP = "stop"
 DEADLINE = "deadline"
+# The caller's own ``until`` condition became true (the "I'm ready" button was pressed).
+PRESSED = "pressed"
 # Plan section 9 fence 10: R1 logs only through StructuredLogger. Its key allowlist and
 # secret scan drop anything else, and every call below names an exception TYPE (never
 # its message), so an utterance, a first name or a presigned URL cannot reach a log.
@@ -565,6 +597,45 @@ def is_no_questions(text: str) -> bool:
         # "Alright."): not next to a "yes".
         return not any(word in _AFFIRMATIONS for word in folded.split())
     return True
+
+
+def lead_display_name(value: object) -> str:
+    """The simulated learner's name for the candidate's scenario card, or "" when it cannot go out.
+
+    The page's contract is letters, spaces, apostrophes and hyphens, at most
+    ``LEADNAME_MAX_CHARS`` characters, starting with a letter; it refuses anything else, so a
+    value outside that is simply not published (the card then reads "A prospective learner").
+    """
+    name = " ".join(str(value or "").split())
+    if not name or len(name) > LEADNAME_MAX_CHARS or not name[0].isalpha():
+        return ""
+    if not all(char.isalpha() or char in " '-" for char in name):
+        return ""
+    return name
+
+
+def ready_payload_ok(data: object) -> bool:
+    """True only for the exact message the API relays: ``{"v": 1, "kind": "ready"}``.
+
+    Nothing else is read from it.  A different version, an extra key, another kind, a payload that
+    is not UTF-8 JSON or is larger than ``READY_PAYLOAD_MAX_BYTES`` is not the button.
+    """
+    if not isinstance(data, (bytes, bytearray, memoryview)):
+        return False
+    raw = bytes(data)
+    if not raw or len(raw) > READY_PAYLOAD_MAX_BYTES:
+        return False
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and set(payload) == {"v", "kind"}
+        and type(payload["v"]) is int
+        and payload["v"] == READY_PAYLOAD_VERSION
+        and payload["kind"] == READY_PAYLOAD_KIND
+    )
 
 
 def _agent_turn_handling() -> dict[str, Any]:
@@ -782,12 +853,22 @@ class R1Interview:
         self._icebreaker_hold_since: float | None = None
         self._replies_cancelled_before_audio = 0
         self._quick_endpointing = False
+        # R1-Q live-UI signals (``LEADNAME_ATTRIBUTE``): the worker is in the transition and has
+        # not had the "I'm ready" press yet (``_awaiting_ready``: what the data handler checks),
+        # the page was told ``awaiting=ready`` and not yet that it is over, the press itself
+        # (latched, so nothing the driver forgets between phases can lose it), whether a non-empty
+        # ``rpleft`` is published, and the heartbeat task that refreshes it.
+        self._awaiting_ready = False
+        self._awaiting_published = False
+        self._ready_latched = False
+        self._rpleft_published = False
+        self._rpleft_heartbeat: asyncio.Future[Any] | None = None
         self._goodbye_spoken = False
         self._ended_announced = False
         # The phase attribute the candidate's page follows: values wait here in order and one
         # background writer sends them, so a slow write can neither reorder them nor stall
         # the interview.  ``aborted`` (a technical stop) is sticky: nothing may follow it.
-        self._phase_queue: deque[str] = deque()
+        self._phase_queue: deque[dict[str, str]] = deque()
         self._phase_task: asyncio.Future[Any] | None = None
         self._phase_last_queued: str | None = None
         self._abort_requested = False
@@ -975,6 +1056,7 @@ class R1Interview:
         self._flush_candidate_row()
         self.machine.transition(phase)
         self._apply_endpointing(phase)
+        self._track_signals(phase)
         if publish:
             self._publish_phase(phase.value)
 
@@ -982,6 +1064,10 @@ class R1Interview:
         """Pause for a disconnect (the page is told ``paused_disconnected``)."""
         self._flush_candidate_row()
         self.machine.begin_disconnect()
+        # Nobody is there to press the button; the rejoin asks again.  The role-play keeps its
+        # signals (paused, not over): ``rpleft`` goes out with the pause.
+        self._awaiting_ready = False
+        self._sync_rpleft_heartbeat()
         self._publish_phase(self.machine.phase.value)
 
     def _rejoin(self) -> None:
@@ -989,7 +1075,169 @@ class R1Interview:
         self._flush_candidate_row()
         resumed = self.machine.rejoin()
         self._apply_endpointing(resumed)
+        self._track_signals(resumed)
         self._publish_phase(resumed.value)
+
+    # ------------------------------------------------------------- live-UI signals (R1-Q)
+
+    def _track_signals(self, phase: R1Phase) -> None:
+        """Follow the phase with the two pieces of state the page's signals depend on.
+
+        The worker waits for the "I'm ready" button only while it is in the transition and has not
+        had the press yet; the role-play heartbeat runs while the role-play does.
+        """
+        self._awaiting_ready = phase is R1Phase.TRANSITION and not self._ready_latched
+        self._sync_rpleft_heartbeat()
+
+    def _lead_name(self) -> str:
+        """The learner's name as the page may show it, or "" (nothing is published then)."""
+        try:
+            return lead_display_name(self.persona.lead_name)
+        except Exception as exc:  # noqa: BLE001 - a card label must never stop an interview
+            _log.warn(
+                "unknown_event",
+                error_type="r1_leadname_unavailable",
+                error_category=_error_type_of(exc),
+            )
+            return ""
+
+    def _rpleft_value(self) -> str:
+        """Whole seconds of role-play budget left (``remaining_roleplay_seconds``), 0..3600."""
+        left = self.machine.remaining_roleplay_seconds()
+        if not math.isfinite(left):
+            left = 0.0
+        return str(min(RPLEFT_MAX_SECONDS, max(0, int(left))))
+
+    def _roleplay_signals_active(self) -> bool:
+        """True while the role-play is running or paused (an aside, or a reconnect pause in it)."""
+        phase = self.machine.phase
+        if phase is R1Phase.PAUSED_DISCONNECTED:
+            phase = self.machine.resume_phase
+        return phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE)
+
+    def _signal_attributes(self, value: str) -> dict[str, str]:
+        """The live-UI attributes that go out in the SAME write as ``phase=value``.
+
+        * ``transition``: ``leadname`` (when the persona's name is publishable) and
+          ``awaiting=ready`` (unless the button was already pressed);
+        * any other phase after that: ``awaiting=""``, once;
+        * ``roleplay``, ``aside`` and a reconnect pause inside the role-play: ``rpleft``;
+        * the first phase after the role-play: ``rpleft=""``, once.
+
+        Only the changes are sent (an attribute that has not changed is not repeated), and a phase
+        that touches none of them is written as the bare ``phase`` it always was.
+        """
+        extra: dict[str, str] = {}
+        if value == R1Phase.TRANSITION.value:
+            name = self._lead_name()
+            if name:
+                extra[LEADNAME_ATTRIBUTE] = name
+            if not self._ready_latched:
+                extra[AWAITING_ATTRIBUTE] = AWAITING_READY
+                self._awaiting_published = True
+        elif self._awaiting_published:
+            extra[AWAITING_ATTRIBUTE] = ""
+            self._awaiting_published = False
+        resume = self.machine.resume_phase
+        in_roleplay = value in (R1Phase.ROLEPLAY.value, R1Phase.ASIDE.value) or (
+            value == R1Phase.PAUSED_DISCONNECTED.value
+            and resume in (R1Phase.ROLEPLAY, R1Phase.ASIDE)
+        )
+        if in_roleplay:
+            extra[RPLEFT_ATTRIBUTE] = self._rpleft_value()
+            self._rpleft_published = True
+        elif self._rpleft_published:
+            extra[RPLEFT_ATTRIBUTE] = ""
+            self._rpleft_published = False
+        return extra
+
+    def _sync_rpleft_heartbeat(self) -> None:
+        """Run the ``rpleft`` heartbeat while the role-play is running or paused, and not after.
+
+        A browser that rejoins restarts its local clock from the last value it read, so the value
+        is refreshed every ``RPLEFT_HEARTBEAT_SECONDS`` while the role-play is the current phase.
+        """
+        task = self._rpleft_heartbeat
+        if not self._roleplay_signals_active() or self._exiting or self._ended_announced:
+            if task is not None:
+                task.cancel()  # a no-op when it already finished
+                self._rpleft_heartbeat = None
+            return
+        if task is not None and not task.done():
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:  # no loop, nobody to publish to (a bare synchronous caller)
+            return
+        task = asyncio.ensure_future(self._rpleft_heartbeat_loop())
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        self._rpleft_heartbeat = task
+
+    async def _rpleft_heartbeat_loop(self) -> None:
+        """Refresh ``rpleft`` on the phase writer while the role-play phase itself is running."""
+        while True:
+            await asyncio.sleep(RPLEFT_HEARTBEAT_SECONDS)
+            if self._exiting or self._ended_announced or not self._roleplay_signals_active():
+                return
+            if self.machine.phase is R1Phase.ROLEPLAY:
+                self._publish_rpleft()
+
+    def _publish_rpleft(self) -> None:
+        """Queue one ``rpleft`` refresh behind whatever the writer still has to send."""
+        if self._ended_announced or self._abort_requested:
+            return
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._rpleft_published = True
+        self._enqueue_attributes({RPLEFT_ATTRIBUTE: self._rpleft_value()}, replace_pending=True)
+
+    # ------------------------------------------------------- the "I'm ready" button (R1-Q)
+
+    def _on_data_received(self, packet: Any) -> None:
+        """Take the candidate's "I'm ready" button: a SERVER-sent message the API relays.
+
+        Accepted only when ALL of these hold, and ignored otherwise:
+
+        * the topic is ``READY_TOPIC`` (every other data message is none of our business);
+        * the packet has NO sending participant: only server credentials produce that, and a
+          candidate's token cannot publish data at all (``canPublishData`` is false), so a message
+          that names a participant is never the button, whatever it says;
+        * the payload is exactly ``{"v": 1, "kind": "ready"}``;
+        * the worker is in the transition, waiting for "ready" (``awaiting=ready`` is what the page
+          was told), and the press has not already been taken.
+
+        The press is LATCHED rather than queued as a turn: the transition driver forgets the turns
+        queued before it starts (``_drop_stale_turns``), and the button may well be pressed while
+        the briefing is still playing.  It is then handled exactly as a spoken "ready" is: the
+        driver stops waiting and the learner picks up.  It is not a transcript row (the candidate
+        said nothing).
+        """
+        if getattr(packet, "topic", None) != READY_TOPIC or self._exiting:
+            return
+        if getattr(packet, "participant", None) is not None:
+            reason = "sender"
+        elif not ready_payload_ok(getattr(packet, "data", None)):
+            reason = "payload"
+        elif not (self._awaiting_ready and self.machine.phase is R1Phase.TRANSITION):
+            reason = "not_awaiting"
+        else:
+            reason = ""
+        if reason:
+            log = _log.info if reason == "not_awaiting" else _log.warn
+            log(
+                "unknown_event",
+                error_type="r1_ready_rejected",
+                error_category=reason,
+                phase=self.machine.transcript_phase(),
+            )
+            return
+        self._ready_latched = True
+        self._awaiting_ready = False
+        _log.info("unknown_event", error_type="r1_ready_button", phase="transition")
+        self._wake()
 
     def _apply_endpointing(self, phase: R1Phase) -> None:
         """Run the transition's quicker endpointing in TRANSITION, the session's own elsewhere.
@@ -1035,7 +1283,26 @@ class R1Interview:
         except RuntimeError:  # no loop, nobody to publish to (a bare synchronous caller)
             return
         self._phase_last_queued = value
-        self._phase_queue.append(value)
+        # The live-UI attributes (R1-Q) ride in the same write as the phase they belong to.
+        self._enqueue_attributes({PHASE_ATTRIBUTE: value, **self._signal_attributes(value)})
+
+    def _enqueue_attributes(
+        self, attributes: dict[str, str], *, replace_pending: bool = False
+    ) -> None:
+        """Queue one ``set_attributes`` write for the background writer (the ONE ordered writer).
+
+        ``replace_pending`` swaps a still-queued write that carries nothing but ``rpleft`` for this
+        one, so a stuck writer cannot be flooded with heartbeats and push a phase write out of the
+        bounded queue.
+        """
+        if (
+            replace_pending
+            and self._phase_queue
+            and set(self._phase_queue[-1]) == {RPLEFT_ATTRIBUTE}
+        ):
+            self._phase_queue[-1] = attributes
+        else:
+            self._phase_queue.append(attributes)
         while len(self._phase_queue) > _PHASE_QUEUE_MAX:
             self._phase_queue.popleft()
         if self._phase_task is None or self._phase_task.done():
@@ -1052,18 +1319,23 @@ class R1Interview:
         self._publish_phase("aborted")
 
     async def _phase_pump(self) -> None:
-        """Send the queued phase values in order, each on its own short bound."""
+        """Send the queued attribute writes in order, each on its own short bound."""
         while self._phase_queue:
-            await self._write_phase(self._phase_queue.popleft(), PHASE_PUBLISH_SECONDS)
+            await self._write_attributes(self._phase_queue.popleft(), PHASE_PUBLISH_SECONDS)
 
     async def _write_phase(self, value: str, bound: float | None) -> bool:
-        """Set the ``phase`` participant attribute once; True when the write was made.
+        """Set the ``phase`` participant attribute alone, once; True when the write was made."""
+        return await self._write_attributes({PHASE_ATTRIBUTE: value}, bound)
+
+    async def _write_attributes(self, attributes: dict[str, str], bound: float | None) -> bool:
+        """Set participant attributes in ONE ``set_attributes`` call; True when the write was made.
 
         A room that is not connected, or that has no local participant yet, is skipped quietly
         (nobody can be listening); a failed write is logged by type and swallowed, because a
         label must never stop an interview or its exit.  ``bound`` None leaves the bound to
         the caller (the ``ended`` write shares one bound with the ``aborted`` write before it).
         """
+        value = attributes.get(PHASE_ATTRIBUTE)
         failure = "r1_phase_ended_failed" if value == "ended" else "r1_phase_publish_failed"
         room = getattr(self.ctx, "room", None)
         try:
@@ -1074,7 +1346,7 @@ class R1Interview:
             set_attributes = getattr(local_participant, "set_attributes", None)
             if not callable(set_attributes):
                 return False
-            write = _maybe_await(set_attributes({PHASE_ATTRIBUTE: value}))
+            write = _maybe_await(set_attributes(dict(attributes)))
             if bound is None:
                 await write
             else:
@@ -1099,6 +1371,7 @@ class R1Interview:
         if self._ended_announced:
             return
         self._ended_announced = True
+        self._sync_rpleft_heartbeat()  # nothing is published after ``ended``: stop the heartbeat
         task, self._phase_task = self._phase_task, None
         if task is not None and not task.done():
             task.cancel()
@@ -1206,6 +1479,7 @@ class R1Interview:
         self._flush_candidate_row()
         self._exiting = True
         self._cancel_deadlines()
+        self._sync_rpleft_heartbeat()
 
     async def _drain_background(self) -> None:
         """Flush queued transcript writes, then cancel anything still running."""
@@ -2495,6 +2769,8 @@ class R1Interview:
             room_on("track_published", self._on_track_published)
             room_on("track_unpublished", self._on_track_unpublished)
             room_on("disconnected", self._on_room_disconnected)
+            # The API relays the page's "I'm ready" button as server-sent data (R1-Q).
+            room_on("data_received", self._on_data_received)
 
     def _reserve_turn_index(self) -> int:
         self._turn_index += 1
@@ -3118,6 +3394,7 @@ class R1Interview:
         timeout: float,
         *,
         hard: Callable[[], float] | None = None,
+        until: Callable[[], bool] | None = None,
     ) -> tuple[str, str | None]:
         """Wait for a candidate turn through any number of attention wake-ups.
 
@@ -3126,12 +3403,14 @@ class R1Interview:
         microphone is not muted, and it restarts whenever any of those changes.
         ``hard`` returns the seconds left in the phase's absolute budget; it is
         re-read on every wake-up (a paused role-play clock moves it) and bounds
-        every wait, muted or not.
+        every wait, muted or not.  ``until`` is the caller's own end condition (the
+        "I'm ready" button): checked on every wake-up, a true value ends the wait.
 
         Returns one of:
         - ``(TURN, text)``: a final transcript (already recorded at event time);
         - ``(SILENCE, None)``: ``timeout`` seconds of candidate silence;
         - ``(DEADLINE, None)``: the phase's hard budget ran out first;
+        - ``(PRESSED, None)``: ``until`` became true;
         - ``(STOP, outcome)``: room loss, deadline, provider abort, or a
           departure that outlived the rejoin grace.
 
@@ -3143,6 +3422,8 @@ class R1Interview:
                 stop = await self._handle_attention()
                 if stop is not None:
                     return (STOP, stop)
+            if until is not None and until():
+                return (PRESSED, None)
             now = loop.time()
             wait: float | None = None
             if hard is not None:
@@ -3493,7 +3774,13 @@ class R1Interview:
                     return value
 
     async def _run_transition(self) -> str | None:
-        """Wait for READY (or 20 s), then let the driver speak the one pickup line."""
+        """Wait for READY (or 20 s), then let the driver speak the one pickup line.
+
+        READY is the candidate saying it, or pressing the page's "I'm ready" button (R1-Q).  The
+        press may come while the briefing is still playing, before this wait starts; it is latched
+        (``_on_data_received``), so the turns forgotten just below cannot lose it, and there is then
+        nothing to wait for.
+        """
         self._drop_stale_turns()
         loop = asyncio.get_running_loop()
         deadline = loop.time() + TRANSITION_DEADLINE_SECONDS
@@ -3501,17 +3788,22 @@ class R1Interview:
         def left() -> float:
             return deadline - loop.time()
 
-        while left() > 0:
-            kind, value = await self._await_turn(left(), hard=left)
+        while not self._ready_latched and left() > 0:
+            kind, value = await self._await_turn(
+                left(), hard=left, until=lambda: self._ready_latched
+            )
             if kind == STOP:
                 return value
-            if kind in (SILENCE, DEADLINE):
+            if kind in (SILENCE, DEADLINE, PRESSED):
                 break
             if self.is_ready(value or ""):
                 break
             if not self._transition_nudged:
                 self._transition_nudged = True
                 await self.say("L-TRANSITION-NUDGE")
+        # Waiting is over, however it ended: a press that arrives from now on is not "ready" for
+        # anything (the learner is picking up), so the page is not asked and the handler ignores it.
+        self._awaiting_ready = False
         if self._candidate_present:
             await self._speak_pickup_once()
         return None

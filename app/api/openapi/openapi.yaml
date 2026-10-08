@@ -706,6 +706,49 @@ paths:
           description: Attempt ended (r1_attempt_ended), consent required (consent_required), round not admissible (round_not_admissible), or R1 disabled or paused (r1_disabled, r1_paused).
         '503':
           description: R1 unavailable (r1_unavailable: DeepSeek unhealthy or unconfigured with retry_after_sec, no worker gate on the R1 SFU, or the Cloud fallback while the legacy browser lane is enabled), maintenance, endpoint mismatch (r1_endpoint_mismatch), room unavailable (r1_room_unavailable, including a failed re-assert of a waiting attempt's room), or service unavailable (service_unavailable); the attempt stays valid.
+  /api/r1/ready:
+    post:
+      tags: [r1]
+      operationId: signalR1Ready
+      summary: Relay the candidate's "I'm ready" button to the live interviewer
+      description: 'The candidate token cannot publish data, so the button goes through the server. Authenticated like the exchange (a current attempt token and the nonce; the token lives five minutes, so the page re-mints one with the link and nonce when it is old). The room is derived from the verified attempt, never from the request: the body carries the two secrets and nothing else, and nothing the caller sends is relayed. The server sends one fixed message ({"v":1,"kind":"ready"} on the topic r1ready, reliable) to the interviewer participant of that room with the LiveKit server SDK (broadcast when the interviewer cannot be found); the interviewer acts on it only while it is waiting for "ready" in the transition. Answers 409 not_live when the attempt has no live room. Rate limited per attempt after authentication (r1_ready_rate_limited, with retry_after_sec).'
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [attempt_token, nonce]
+              properties:
+                attempt_token:
+                  type: string
+                nonce:
+                  type: string
+                  pattern: '^[a-f0-9]{64}$'
+      responses:
+        '200':
+          description: The message was handed to LiveKit for the interview's room.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok]
+                properties:
+                  ok:
+                    type: boolean
+        '400':
+          description: Request validation failed.
+        '404':
+          description: One stable answer for an unknown attempt, wrong or expired token, or wrong nonce (r1_attempt_invalid).
+        '409':
+          description: The attempt has no live room (not_live), consent was withdrawn (consent_required), the round is not admissible (round_not_admissible), or R1 is disabled (r1_disabled).
+        '429':
+          description: Too many presses for this attempt (r1_ready_rate_limited, with retry_after_sec and a Retry-After header).
+        '503':
+          description: R1 unavailable (r1_unavailable), the relay could not reach LiveKit (r1_room_unavailable), or service unavailable (service_unavailable).
   # ── Health ──────────────────────────────────────────────────────────
   /api/health:
     get:
