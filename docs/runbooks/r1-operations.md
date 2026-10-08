@@ -1198,8 +1198,9 @@ candidate turn) and `error_category`. No line holds an utterance or a name.
 | `ack` | The acknowledgement before an owed line, with `error_category` `done`, `cutoff` or `failed` |
 | `eou_to_tts_first_frame`, `tts_ttfb` | To the first audio frame the TTS node produced; and its time from the first text |
 | `eou_to_first_audio` | The headline: end of speech to the agent's audio starting; `error_category` is the turn kind (`llm_reply`, `ack_then_say`, `say_only`, `reply`) |
+| `eou_to_reply_lost` | A reply the SDK cancelled before the candidate heard any of it: end of speech to the cancellation, `error_category` the turn kind. It is a **lower bound** of that turn's wait (the candidate went on waiting for the next reply), and it counts as one more sample in the p95 below and in the `r1_latency.py` report, so the slowest turns cannot drop out of the percentile by never being heard (a turn that reaches its audio is never counted here too) |
 | `say_to_first_audio` | A scripted line, `error_category` the line id |
-| `first_audio_p95` | Logged once at exit: the p95 of `eou_to_first_audio` that the worker posts as `session_facts.first_audio_p95_ms` (here in seconds). `error_category` `gate` = the role-play turns the API gate reads (at least 8, else `unknown` and no `duration_sec`), `all_phases` = every phase, for information; `option_count` is the number of turns behind it |
+| `first_audio_p95` | Logged once at exit: the p95 of `eou_to_first_audio` (and `eou_to_reply_lost`) that the worker posts as `session_facts.first_audio_p95_ms` (here in seconds). `error_category` `gate` = the role-play turns the API gate reads (at least 8, else `unknown` and no `duration_sec`), `all_phases` = every phase, for information; `option_count` is the number of turns behind it. `lost_replies` is a separate line whose `option_count` is how many of the role-play samples are lost replies |
 | `sdk_*` | The SDK's own per-turn timings (`sdk_e2e`, `sdk_end_of_turn`, `sdk_transcription`, ...), to cross-check the stamps above |
 
 Stage A targets (plan 5.15): `eou_to_first_audio` p50 <= 1.8 s and p95 <= 3.0 s, scripted lines
@@ -1248,7 +1249,31 @@ learner off (value 0). Keep 3 unless the first is the worse problem; the variabl
 so a restart switches it. The default was 2 in PR-4c: the owner's 4/10 session (b58c7d9c) showed a
 two-word "Thank you." still cutting a reply, and "Sorry" / "Thank you." / "Hey, are you there?"
 cancelling three replies before any audio (the candidate heard nothing), so R1-Q raised it to 3,
-the value the phone lane uses for the same reason.
+the value the phone lane uses for the same reason. That stops a single short fragment from cutting
+a reply; it does not stop two of them adding up (see the next paragraph).
+
+**What 3 does not fix: fragments that add up.** The SDK keeps the words it refused (its transcript
+is cleared when a turn is committed, not when one is refused) and judges the next final together
+with them. "Sorry" (1 word) is refused and banked; "Thank you." (2) then makes three; the SDK
+commits, and it interrupts the reply it was still thinking of *before* it calls R1's hook. So the
+owner's rows 12-14 ("Sorry", "Thank you.") would still cancel a pending reply at 3, and so would
+"Hmm", "Okay", "Right" said one after the other. `tests/test_r1_core.py`
+`TestBackchannelsOverAPendingReply` reproduces the sequence. R1 cannot stop the SDK committing that
+turn, so it limits what the turn costs the candidate:
+
+* the committed turn is **not counted as an answer** toward the icebreaker's soft exit (only words that
+  are not backchannel count, see below), so noise cannot end the icebreaker;
+* the next reply's **thinking filler is counted from the candidate's real answer**, not restarted
+  with the backchannel: a candidate who has already waited 3.5 s hears the filler about 0.5 s after the
+  new generation starts instead of 4 s later (`FILLER_RESTART_MIN_SECONDS` is the floor, so a reply that
+  is about to arrive is not pre-empted). Anything the candidate hears, a real new answer from them, or a
+  new phase starts the wait afresh;
+* the reply that was lost still **counts in the p95** (`eou_to_reply_lost`, see the latency table).
+
+None of this makes the lost reply come back: item 7 (dead air after short fragments) now depends on
+the latency work above (PR-4c) and on the filler, not on `min_words` alone. At the first smoke, count
+`r1_reply_cancelled_before_audio` and look for a `lost_replies` count above zero in the
+`first_audio_p95` lines.
 
 ### Turn taking and transcript rows (R1-Q)
 
@@ -1272,16 +1297,22 @@ the value the phone lane uses for the same reason.
   loses at most the one open row. A fragment the SDK banked (refused over a reply) joins the next
   committed turn's row, as it joins that turn's text.
 * **The icebreaker exit is decided at a committed turn.** The soft exit (four answers once S >= 3:30)
-  counts the SDK's committed turns of at least three words, not STT finals: one long answer used to
-  count as several turns, and "Sorry" as one more. The driver no longer leaves the icebreaker at a raw
-  final (the transition line is uninterruptible, so that talked over a candidate who was mid-answer):
-  the turn the SDK commits next is suppressed and answered by the transition line, and the hard S=4:30
-  cap waits for a turn in flight (speaking, or a final not yet committed) for at most the endpointing
-  maximum plus one second after the last sign of speech, and never more than 30 s.
+  counts the SDK's committed turns, not STT finals, and only a turn with **at least three words that
+  are not backchannel** (`content_word_count`: apology, thanks, greeting, "are you there", hesitation and
+  acknowledgement words such as sorry, thank you, hello, hey, hmm, okay, right, sure are left out): one
+  long answer used to count as several turns, and "Sorry", then "Thank you.", then "Hey, are you
+  there?" as three more (the SDK commits them as turns of three and four words). The driver no longer
+  leaves the icebreaker at a raw final (the transition line is uninterruptible, so that talked over a
+  candidate who was mid-answer): the turn the SDK commits next is suppressed and answered by the
+  transition line. Both ways out of the phase, the suppressed boundary turn and the hard S=4:30 cap, wait
+  for a turn in flight (the candidate speaking again, or a final not yet committed) for at most the
+  endpointing maximum plus one second after the last sign of speech, and never more than 30 s.
 * **`r1_reply_cancelled_before_audio`** (warning, `option_count` = running total for the session, no
   text): the SDK cancelled a model reply before the candidate heard any of it. A few are normal (the
-  candidate really did start a new turn); a run of them is the owner's "dead air" and means the
-  interruption settings are letting fragments cancel replies. When the icebreaker's exit is due and
+  candidate really did start a new turn, or two short fragments added up to the three words the SDK
+  commits: see "What 3 does not fix" above); a run of them is the owner's "dead air". The cancelled
+  turn's wait is also kept as a lower-bound latency sample (`eou_to_reply_lost`), and the next
+  reply's filler counts from the candidate's real answer. When the icebreaker's exit is due and
   nobody is mid-turn, the turn that lost its reply is answered by the transition line instead of a
   silence window.
 
@@ -1327,13 +1358,25 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   is not asked to answer an acknowledgement any more, and its wrap-up replies carry a note
   (`r1_prompts.WRAPUP_REMINDER`) that forbids thanking, goodbye and "any more questions?": the scripted
   `L-CLOSE` is the only goodbye. Before this, the owner's session heard two.
+  An acknowledgement is also what a candidate says *before* a question ("Okay, so ... [thinking] what
+  are the next steps?"), so the driver believes a refusal only after candidate silence that depends on
+  how final it sounds (`wrapup_settle_seconds`): an explicit "No questions." / "That's all." / "I'm good."
+  1.5 s (`WRAPUP_SETTLE_SECONDS`, as before); a refusal made only of acknowledgements ("Alright.", "Thank
+  you.", "Okay, got it.") twice that, 3 s; one that stops on a lead-in word ("Okay, so", "Thank you, and",
+  a trailing "um") 2.5 times, 3.75 s. Any further final in the window is joined to the turn and judged
+  with it. The price is up to 2.25 s more before the closing line for a candidate who only said "Okay".
 * **The feedback refusal ends the reply.** When the guard swaps a feedback sentence for `L-NO-FEEDBACK`,
   nothing the model says after it is spoken (the owner heard "the hiring team" twice in one turn).
-  `L-NO-FEEDBACK` is one sentence that names the hiring team once: "I'm not able to share feedback, but
-  the hiring team will review your interview and be in touch."
+  `L-NO-FEEDBACK` is one short sentence that does not name the hiring team: "I'm sorry, I can't share any
+  feedback on how it went." `L-CLOSE` then carries the one mention of who reviews the interview ("The
+  hiring team will review your interview and get back to you."), so a candidate who asks for feedback
+  hears it once. (The first R1-Q wording also said "the hiring team will review your interview and be in
+  touch", which put the same sentence twice, a few seconds apart, in front of the close.)
 * **Content pin.** These changed pinned text: `CONTENT_REVISION` is 3 (`L-NO-FEEDBACK`,
-  `WRAPUP_REMINDER`); `docs/design/r1/R1-PLAN-final.md` carries the new `L-NO-FEEDBACK` text (a test
-  compares it). Nothing else in the lines changed.
+  `WRAPUP_REMINDER`; revision 3 has not shipped, main is at 2, so the review round re-pinned it instead
+  of taking a fourth); `docs/design/r1/R1-PLAN-final.md` carries the new `L-NO-FEEDBACK` text (a test
+  compares it). If the learner branch (R1-Q S01) also bumps the revision, the second merge takes one
+  more bump and a recomputed `PINNED_CONTENT_SHA256`. Nothing else in the lines changed.
 
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 
@@ -1387,13 +1430,34 @@ spoken "ready" (which keeps working). It is not a transcript row.
 
 Logs, all by label (no name, no text): `r1_ready_button` (accepted); `r1_ready_rejected` with
 `error_category` `sender` or `payload` (warning: something other than the relay sent on the topic),
-or `not_awaiting` (info: too late, too early or a repeat, which is normal). In the API,
+or `not_awaiting` (info: too late, too early or a repeat, which is normal); `r1_data_ignored` with
+`error_category=topic` (info, **once per session**, only while the button is awaited): a data message
+arrived under another topic, and `schema` is a closed label for it, never the topic itself (the log
+fence allows no runtime string): `none` (no topic), `spelling` (the button's topic with other case,
+punctuation or spacing, the likeliest way for the real SFU to differ from the fakes), `livekit` (an `lk.`
+topic of the SDK) or `other`. In the API,
 `r1_ready_send_failed` and `r1_ready_agent_lookup_failed` are the two LiveKit failure labels.
 
 Triage for "the button did nothing": the audit event says the API relayed it; an `r1_ready_button` line
 in the worker log says the worker took it; `not_awaiting` says it came outside the transition; a `404`
-on the page is a stale attempt token; no worker line at all with an audit event means the message did
+on the page is a stale attempt token; an `r1_data_ignored` line means the message reached the room under
+a topic the worker does not take (`schema=spelling` means a case or punctuation difference from
+`R1_READY_TOPIC` in `app/api/src/routes/r1-candidate.ts`, `other` means look at what the SFU delivers);
+no worker line at all with an audit event means the message did
 not reach the room (check the interviewer's identity in the room and the R1 SFU's server API).
+
+**Smoke it on the real SFU before the owner tests it.** Every test of the relay uses fakes (the API's
+`sendData` and `listParticipants`, and a synthetic packet on the worker side), so that a *server-sent*
+message with `destinationIdentities` reaches the agent's `data_received` with `participant=None` and
+`topic == "r1ready"` rests on the pinned SDK shape (`test_r1_sdk_contract`), not on a live call. After
+the merge and the deploy (merge window rules: after 21:00 IST, ping the phone session, zero live calls),
+run the first R1 smoke through the normal flow and press the button once in the transition. Pass: one
+`interview_round_attempt_ready` audit row, one `r1_ready_button` worker line, the learner picks up
+without the nudge, and no `r1_ready_rejected` or `r1_data_ignored` line. Alternatively, in a throwaway
+room: join with a Python `rtc` client, have `RoomServiceClient.send_data` (the R1 SFU's server API) send
+`{"v":1,"kind":"ready"}` as `RELIABLE` with topic `r1ready` and `destination_identities` = the client,
+and assert `packet.participant is None` and `packet.topic == "r1ready"`. A spoken "ready" works either
+way, so a failure here costs the button only, never the interview.
 
 ## Incident handling and rollback
 

@@ -38,10 +38,7 @@ LINES = {
         "is Christy, your interviewer, again. Thank you, that's the end of the role-play."
     ),
     "L-WRAP": "Before we finish, do you have any questions about the role or the next steps?",
-    "L-NO-FEEDBACK": (
-        "I'm not able to share feedback, but the hiring team will review your interview and "
-        "be in touch."
-    ),
+    "L-NO-FEEDBACK": "I'm sorry, I can't share any feedback on how it went.",
     "L-FAQ-DEFER": "That's a good question for the hiring team; they'll follow up with you on it.",
     "L-CLOSE": (
         "Thank you for your time today, {first_name}. The hiring team will review your "

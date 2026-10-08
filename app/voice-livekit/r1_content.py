@@ -29,8 +29,8 @@ import r1_script
 import r1_world
 
 # 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
-# 3: L-NO-FEEDBACK is one sentence naming the hiring team once; the wrap-up reply note forbids a
-#    goodbye (R1-Q S02 T03).
+# 3: L-NO-FEEDBACK is one short refusal that does not name the hiring team (L-CLOSE is the one
+#    mention of who reviews the interview); the wrap-up reply note forbids a goodbye (R1-Q S02).
 CONTENT_REVISION = 3
 
 

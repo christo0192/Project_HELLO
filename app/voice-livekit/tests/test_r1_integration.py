@@ -991,7 +991,8 @@ class TestOutputGuardInEveryPhase(unittest.IsolatedAsyncioTestCase):
     async def test_the_feedback_refusal_is_the_whole_reply(self) -> None:
         # The owner's turn 97: the guard swapped the feedback sentence for the refusal, and the
         # model's next sentence (a paraphrase of the deferral line) was spoken after it, so the
-        # candidate heard "the hiring team" twice.  The refusal now ends the reply.
+        # candidate heard "the hiring team" twice.  The refusal now ends the reply, and it does
+        # not name the hiring team itself: L-CLOSE is the one place that does.
         for phase in ("roleplay_exit", "wrapup", "closing"):
             with self.subTest(phase=phase):
                 rig = Rig()
@@ -1002,7 +1003,7 @@ class TestOutputGuardInEveryPhase(unittest.IsolatedAsyncioTestCase):
                     "they'll follow up with you on it.",
                 )
                 self.assertEqual(spoken, NO_FEEDBACK_LINE)
-                self.assertEqual(spoken.lower().count("hiring team"), 1)
+                self.assertEqual(spoken.lower().count("hiring team"), 0)
                 self.assertEqual(
                     [trip["category"] for trip in rig.interview._guard_trips], ["feedback"]
                 )
@@ -1914,7 +1915,7 @@ class TestEndToEnd(R1TestCase):
             "I sold courses",
             "to working professionals",
             "mostly by phone",
-            "yes that is right",
+            "yes that is how I work",  # an answer has three words that are not noise
         ):
             await self.answer(answer)
         # The announce line names the chosen persona; then READY, then her pickup.

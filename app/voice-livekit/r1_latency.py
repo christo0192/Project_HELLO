@@ -28,7 +28,9 @@ kind travels with the turn so a reader can tell them apart.
 The tracker also keeps the headline values so the session can report one number to the API gate
 (plan 6.4, ``session_facts.first_audio_p95_ms``): the nearest-rank p95 of the role-play turns,
 in milliseconds, and ``None`` (unknown, which the gate fails closed on) when fewer than 8 role-play
-turns were measured.
+turns were measured.  A turn whose reply was cancelled before any audio never gets a first audio,
+so its wait so far is kept as a lower bound (``reply_lost``): the slowest turns are the ones that
+are cancelled, and the p95 must not be able to leave them out.
 """
 from __future__ import annotations
 
@@ -184,6 +186,13 @@ class _Turn:
     anchor_kind: str
     kind: str
     marks: dict[str, float] = field(default_factory=dict)
+    seq: int = 0  # the tracker's own running number: how a lost reply finds its turn again
+    lost: bool = False  # the reply was cancelled before any audio (``reply_lost``)
+
+
+# How many recent turns ``reply_lost`` can still find.  A reply is cancelled within moments of
+# its turn, so the next turn or two is as far back as it ever looks.
+_RECENT_TURNS = 4
 
 
 class LatencyTracker:
@@ -209,6 +218,12 @@ class LatencyTracker:
         The headline: end of speech to the agent's audio starting.  Its category is the turn
         kind (``llm_reply``, ``ack_then_say``, ``say_only`` or ``reply``).  Every valid value
         is also kept, with its phase, for ``first_audio_p95_ms`` (see below).
+    ``eou_to_reply_lost``
+        A reply the SDK cancelled before the candidate heard any of it: end of speech to the
+        moment it was cancelled.  The turn never reaches ``eou_to_first_audio``, and a turn
+        that outlasts the candidate's patience is exactly the one that must not vanish from the
+        p95, so this is kept as a LOWER BOUND of that turn's latency (the real wait is longer:
+        the candidate was still waiting).  Its category is the turn kind.
     ``say_to_first_audio``
         A scripted line: from ``say`` to its audio starting, the line id as the category.
     """
@@ -220,10 +235,14 @@ class LatencyTracker:
         self._stop_at: float | None = None
         self._final_at: float | None = None
         self._turn: _Turn | None = None
+        self._seq = 0
+        self._recent: deque[_Turn] = deque(maxlen=_RECENT_TURNS)
         self._says: dict[str, tuple[float, str, str]] = {}
         # (phase, seconds) of every headline ``eou_to_first_audio`` that passed the same
-        # validity test as a logged segment: the input of ``first_audio_p95_ms``.
+        # validity test as a logged segment, plus the lower bound of every turn whose reply was
+        # lost: the input of ``first_audio_p95_ms``.
         self._headline: deque[tuple[str, float]] = deque(maxlen=_MAX_HEADLINE_SAMPLES)
+        self._lost: deque[str] = deque(maxlen=_MAX_HEADLINE_SAMPLES)  # the phase of each
 
     # ------------------------------------------------------------------ candidate side
 
@@ -251,15 +270,58 @@ class LatencyTracker:
             anchor, how = now, "hook"
         self._stop_at = None
         self._final_at = None
-        turn = _Turn(index=index, phase=phase, anchor=min(anchor, now), anchor_kind=how, kind=kind)
+        self._seq += 1
+        turn = _Turn(
+            index=index,
+            phase=phase,
+            anchor=min(anchor, now),
+            anchor_kind=how,
+            kind=kind,
+            seq=self._seq,
+        )
         turn.marks["hook"] = now
         self._turn = turn
+        self._recent.append(turn)
         self._report("eou_to_turn_hook", now - turn.anchor, turn, category=how)
 
     def set_kind(self, kind: str) -> None:
         """Record what the turn turned out to be (the engine's mode), for the headline."""
         if self._turn is not None:
             self._turn.kind = kind
+
+    def open_turn_id(self) -> int | None:
+        """The running number of the open turn, for ``reply_lost`` to find it again later."""
+        return None if self._turn is None else self._turn.seq
+
+    def reply_lost(self, turn_id: int | None) -> None:
+        """The reply to turn ``turn_id`` was cancelled before the candidate heard any of it.
+
+        Without this the turn would simply never be measured: ``first_audio`` is the only thing
+        that adds a headline sample, so the turns whose reply was cancelled while the candidate
+        waited (the dead air of the owner's 4/10 session) would be missing from the p95 that the
+        gate compares with 3 s, and a session in which the candidate sat through silence could
+        pass.  The seconds from the end of speech to the cancellation are added as a sample and
+        logged as ``eou_to_reply_lost``.  It is a lower bound (the wait went on after the
+        cancellation, into the next reply), which is the safe side for a percentile.  A turn is
+        counted once, and never together with a first audio of its own.
+        """
+        if turn_id is None:
+            return
+        turn = next((item for item in reversed(self._recent) if item.seq == turn_id), None)
+        if turn is None or turn.lost or "first_audio" in turn.marks:
+            return
+        now = self._clock()
+        turn.lost = True
+        turn.marks["lost"] = now
+        seconds = now - turn.anchor
+        if _valid_segment(seconds):
+            self._headline.append((turn.phase, seconds))
+            self._lost.append(turn.phase)
+            self._report("eou_to_reply_lost", seconds, turn)
+
+    def replies_lost(self, phase: str | None = GATE_PHASE) -> int:
+        """How many of the ``first_audio_samples`` of ``phase`` are lower bounds of a lost reply."""
+        return sum(1 for ph in self._lost if phase is None or ph == phase)
 
     # --------------------------------------------------------------------- reply side
 
@@ -268,6 +330,8 @@ class LatencyTracker:
         turn = self._turn
         if turn is None or stage in turn.marks:
             return
+        if turn.lost and stage == "first_audio":
+            return  # its reply was cancelled: whatever plays now is not that reply
         now = self._clock()
         turn.marks[stage] = now
         marks = turn.marks
@@ -300,7 +364,11 @@ class LatencyTracker:
     # ----------------------------------------------------------------- the session's p95
 
     def first_audio_samples(self, phase: str | None = GATE_PHASE) -> int:
-        """How many headline turns the p95 of ``phase`` is built from (``None``: every phase)."""
+        """How many turns the p95 of ``phase`` is built from (``None``: every phase).
+
+        Turns that reached their first audio, and turns whose reply was cancelled before any
+        audio (``reply_lost``: ``replies_lost`` says how many of them).
+        """
         return sum(1 for ph, _ in self._headline if phase is None or ph == phase)
 
     def first_audio_p95_seconds(
@@ -310,7 +378,9 @@ class LatencyTracker:
 
         ``None`` when fewer than ``min_samples`` turns of ``phase`` were measured (``None`` as
         ``phase`` takes every phase, for information).  An unknown stays unknown: a session
-        that was barely measured must not be able to look fast.
+        that was barely measured must not be able to look fast.  A turn whose reply was
+        cancelled before any audio counts with the seconds it had waited by then (a lower
+        bound), so the slowest turns cannot drop out of the percentile by never being heard.
         """
         values = [seconds for ph, seconds in self._headline if phase is None or ph == phase]
         if len(values) < max(1, min_samples):
@@ -379,6 +449,8 @@ STAGE_A_HEADLINE_P50_SEC = 1.8
 STAGE_A_HEADLINE_P95_SEC = 3.0
 STAGE_A_SCRIPTED_START_SEC = 0.5
 HEADLINE_SCHEMA = "eou_to_first_audio"
+# A reply cancelled before any audio: a lower bound of that turn's wait, counted with the headline.
+LOST_SCHEMA = "eou_to_reply_lost"
 SCRIPTED_SCHEMA = "say_to_first_audio"
 
 
@@ -431,20 +503,27 @@ def stage_a_report(lines: Iterable[Any]) -> dict[str, Any]:
     when it produced none (nothing was measured, which is not a pass).
     """
     headline_values: list[Any] = []
+    lost_values: list[Any] = []
     scripted_values: list[Any] = []
     for record in latency_records(lines):
         schema = record.get("schema")
         if schema == HEADLINE_SCHEMA:
             headline_values.append(record.get("duration_sec"))
+        elif schema == LOST_SCHEMA:
+            lost_values.append(record.get("duration_sec"))
         elif schema == SCRIPTED_SCHEMA:
             scripted_values.append(record.get("duration_sec"))
-    headline = _finite(headline_values)
+    # A cancelled reply is a turn the candidate waited through, measured up to the cancellation:
+    # it counts with the headline (as the session's own p95 does), never instead of it.
+    lost = _finite(lost_values)
+    headline = _finite(headline_values) + lost
     scripted = _finite(scripted_values)
     p50 = percentile(headline, 50)
     p95 = percentile(headline, 95)
     scripted_p95 = percentile(scripted, 95)
     report: dict[str, Any] = {
         "headline_turns": len(headline),
+        "lost_replies": len(lost),
         "headline_p50_sec": p50,
         "headline_p95_sec": p95,
         "headline_p50_ok": None if p50 is None else p50 <= STAGE_A_HEADLINE_P50_SEC,

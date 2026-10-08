@@ -71,12 +71,16 @@ R1-Q (turn taking) changes how the candidate's speech becomes TURNS, in three pl
   bot's rows is unchanged) that is written when the turn commits (``prepare_turn``), when a bot
   speech claims its row, when the phase changes, and when the session exits.
 * The icebreaker's exit is decided at a committed turn.  ``candidate_turns`` counts committed
-  answers of three words or more (not STT finals), the driver no longer leaves the icebreaker on
-  a raw final, and the hard S=4:30 cap waits (bounded) for a turn in flight instead of starting
-  the uninterruptible transition line over a candidate who is mid-answer.
+  answers of three words that are not backchannel (not STT finals, and not "Sorry Thank you."),
+  the driver no longer leaves the icebreaker on a raw final, and the hard S=4:30 cap and the
+  boundary turn both wait (bounded) for a turn in flight instead of starting the uninterruptible
+  transition line over a candidate who is mid-answer.
 * A reply the SDK cancelled before any audio is logged (``r1_reply_cancelled_before_audio``,
   a running count), and when the icebreaker's exit is due it is not left as silence: the
-  boundary line answers the turn that lost its reply.
+  boundary line answers the turn that lost its reply.  min_words cannot stop two short fragments
+  from adding up to a committed turn that cuts the pending reply (the SDK keeps refused words),
+  so the next reply's thinking filler is counted from the candidate's real answer
+  (``_filler_delay``) and the lost reply counts toward the p95 (``LatencyTracker.reply_lost``).
 
 R1-Q (interviewer lines) changes what the scripted lines and the wrap-up say, in three places:
 
@@ -85,8 +89,8 @@ R1-Q (interviewer lines) changes what the scripted lines and the wrap-up say, in
   candidate gives in the opening or the icebreaker ("my name is Cristo") is used from then on.
 * An acknowledgement ("Alright", "Okay, got it") is a refusal in the wrap-up (``is_no_questions``),
   so the model is not asked to answer it with a goodbye of its own before ``L-CLOSE``.
-* The guard's feedback refusal ends the reply (``r1_guard``), and ``L-NO-FEEDBACK`` is one
-  sentence that names the hiring team once.
+* The guard's feedback refusal ends the reply (``r1_guard``), and ``L-NO-FEEDBACK`` is one short
+  sentence that leaves the hiring team to ``L-CLOSE`` (a candidate hears it once, not twice).
 
 R1-Q (live-UI signals) tells the candidate's page three more things on the same attribute writer
 as ``phase`` (``LEADNAME_ATTRIBUTE``): the simulated learner's name (``leadname``, with
@@ -155,6 +159,13 @@ NO_SHOW_SECONDS = 120.0
 ACTIVATION_SECONDS = 15.0
 TURN_DEADLINE_SECONDS = 12.0
 FILLER_AFTER_SECONDS = 4.0
+# A reply the SDK cancelled before any audio, for a candidate who then only made a noise ("Sorry",
+# "Thank you."), leaves the candidate waiting from their real answer.  The next reply's filler is
+# counted from there, not from its own start, but never sooner than this after it starts (a reply
+# that is about to arrive should not be pre-empted by a filler).  See ``_filler_delay``.
+FILLER_RESTART_MIN_SECONDS = 0.5
+# An unvoiced wait older than this is not the candidate's current wait any more.
+FILLER_ANCHOR_MAX_SECONDS = 20.0
 TRANSITION_DEADLINE_SECONDS = 20.0
 SAY_PLAYOUT_SECONDS = 90.0
 # Teardown budget (plan section 7.4). livekit-agents 1.6.4 cancels a still-running
@@ -240,8 +251,10 @@ REPLY_SETTLE_SECONDS = 30.0
 ICEBREAKER_PROMPT_SECONDS = 30.0
 ICEBREAKER_END_SECONDS = 20.0
 # The soft exit (four turns, S >= 3:30) counts a COMMITTED candidate turn only when it is an
-# answer: at least this many words, the floor the SDK applies to an interruption.  "Sorry",
-# "Thank you." and "Hello" are not answers, and neither is a fragment of one.
+# answer: at least this many words that are not backchannel (``_BACKCHANNEL_WORDS``).  The SDK's
+# own floor (``R1_INTERRUPT_MIN_WORDS``) cannot tell an answer from noise: it banks "Sorry" and
+# commits it together with the next "Thank you." (three words), and "Hey, are you there?" is four
+# words.  None of those is an answer, so they are counted by what is left once the noise is out.
 ICEBREAKER_ANSWER_MIN_WORDS = 3
 # The hard S=4:30 cap never starts the (uninterruptible) transition line over a candidate who is
 # mid-answer: it waits for the turn in flight to commit, for the SDK's endpointing maximum plus
@@ -256,6 +269,13 @@ WRAPUP_SILENCE_SECONDS = 20.0
 # I hear back?"), and the driver reads them one at a time.  A refusal is therefore only
 # believed after this much candidate silence, counted from the final that carried it.
 WRAPUP_SETTLE_SECONDS = 1.5
+# ... but "Okay." and "Thank you." are also what a candidate says BEFORE a question ("Okay, so
+# ... what are the next steps?"), so a refusal that is only an acknowledgement waits twice as
+# long (3 s), and one that stops on a lead-in word ("Okay, so") two and a half times (3.75 s).
+# An explicit "no questions" / "that's all" keeps the short window: nothing is left to wait for.
+# They are multiples of ``WRAPUP_SETTLE_SECONDS`` so one number tunes (or, in a test, shrinks) all.
+WRAPUP_SETTLE_ACK_FACTOR = 2.0
+WRAPUP_SETTLE_LEAD_IN_FACTOR = 2.5
 WRAPUP_QUESTION_LIMIT = 2
 # Plan 5.1: role-play may end early once R >= 10:00 and the commitment is resolved.  The
 # phase machine only knows the hard caps, so the session applies the early rule itself.
@@ -599,6 +619,64 @@ def is_no_questions(text: str) -> bool:
     return True
 
 
+# The last word of a turn that is not over: "Okay, so ..." / "Thank you, and ..." is followed by
+# what the candidate came to say.  Only courtesy words can end a refusal (``_COURTESY_WORDS``), so
+# these are the courtesy words that lead into something.
+_LEAD_IN_WORDS = frozenset(
+    {"so", "and", "well", "um", "uh", "oh", "hmm", "hm", "mm", "mhm"}
+)
+
+
+def wrapup_settle_seconds(text: str) -> float:
+    """How long a wrap-up refusal must stand unanswered before it is believed (candidate silence).
+
+    The STT hands over one turn as several finals, and a candidate who says "Okay." or "Thank
+    you." may be about to ask: "Okay, so ... [two seconds of thinking] what are the next steps?".
+    So the window depends on how final the words sound: an explicit refusal ("No questions.",
+    "That's all.") keeps ``WRAPUP_SETTLE_SECONDS``; one made of acknowledgements alone
+    ("Alright.", "Thank you.") waits ``WRAPUP_SETTLE_ACK_FACTOR`` times that (3 s); and one that
+    stops on a lead-in ("Okay, so") ``WRAPUP_SETTLE_LEAD_IN_FACTOR`` times (3.75 s).  The cost of
+    waiting is a second or two before the closing line; the cost of not waiting is the closing
+    line spoken, uninterruptibly, over the candidate's question.
+    """
+    folded = fold_speech(text)
+    words = folded.split()
+    if words and words[-1] in _LEAD_IN_WORDS:
+        return WRAPUP_SETTLE_SECONDS * WRAPUP_SETTLE_LEAD_IN_FACTOR
+    if _NO_QUESTIONS_RE.search(_SOFT_CLOSE_RE.sub(" ", folded)) is None:
+        # only an acknowledgement or a thank-you refuses here
+        return WRAPUP_SETTLE_SECONDS * WRAPUP_SETTLE_ACK_FACTOR
+    return WRAPUP_SETTLE_SECONDS
+
+
+# Words that answer nothing: apology, thanks, greeting, "are you there?", hesitation and
+# acknowledgement.  A committed turn made of nothing else ("Sorry Thank you.", "Hey, are you
+# there?", "Hmm, okay, right") is a backchannel, not an answer.  Deliberately NOT the courtesy list
+# of ``is_no_questions``: that one holds "I", "my", "for", "time" and "today", which an answer is
+# made of.
+_BACKCHANNEL_WORDS = frozenset(
+    {
+        "sorry", "pardon", "excuse", "me", "thanks", "thank", "you", "please", "bye", "goodbye",
+        "hello", "hi", "hey", "are", "there",
+        "hmm", "hm", "mm", "mmm", "mhm", "um", "uh", "oh", "ah", "well", "so",
+        "okay", "ok", "alright", "all", "right", "sure", "yes", "yeah", "yep", "yup", "no", "nope",
+        "great", "cool", "fine", "good", "perfect", "noted", "understood", "got", "it", "sounds",
+        "really", "again", "very", "much",
+    }
+)
+
+
+def content_word_count(text: str) -> int:
+    """How many words of ``text`` are not backchannel (``_BACKCHANNEL_WORDS``), on folded text."""
+    return sum(1 for word in fold_speech(text).split() if word not in _BACKCHANNEL_WORDS)
+
+
+def is_backchannel_turn(text: str) -> bool:
+    """True for a turn of nothing but backchannel words: it answers nothing and asks nothing."""
+    words = fold_speech(text).split()
+    return bool(words) and all(word in _BACKCHANNEL_WORDS for word in words)
+
+
 def lead_display_name(value: object) -> str:
     """The simulated learner's name for the candidate's scenario card, or "" when it cannot go out.
 
@@ -612,6 +690,22 @@ def lead_display_name(value: object) -> str:
     if not all(char.isalpha() or char in " '-" for char in name):
         return ""
     return name
+
+
+def topic_label(topic: object) -> str:
+    """A closed-vocabulary label for a data message's topic, safe to log (never the topic itself).
+
+    ``none``: no topic.  ``spelling``: the button's topic with another case, punctuation or
+    spacing (the likeliest way for the real SFU to differ from the fakes).  ``livekit``: one of
+    the SDK's own ``lk.`` topics.  ``other``: anything else.
+    """
+    if not isinstance(topic, str) or not topic:
+        return "none"
+    if re.sub(r"[^a-z0-9]", "", topic.lower()) == READY_TOPIC:
+        return "spelling"
+    if topic.lower().startswith("lk"):
+        return "livekit"
+    return "other"
 
 
 def ready_payload_ok(data: object) -> bool:
@@ -779,6 +873,9 @@ class _SpeechSlot:
     used: bool = False
     reply: Any = None  # the Reply the hook prepared for this generation (role-play only)
     source: str | None = None  # the SDK's speech source: "say" for a scripted line
+    # The latency tracker's number for the turn this reply answers (``LatencyTracker.open_turn_id``
+    # when the reply was created), so a reply cancelled before any audio finds its own turn.
+    latency_turn: int | None = None
 
 
 @dataclass
@@ -852,6 +949,11 @@ class R1Interview:
         self._candidate_activity_at: float | None = None
         self._icebreaker_hold_since: float | None = None
         self._replies_cancelled_before_audio = 0
+        # When (``_clock``) the candidate began waiting for a reply nobody has heard yet: set when
+        # a generation starts, cleared when any speech begins, when the candidate says something
+        # that is not a backchannel, and with the phase.  A reply cancelled by a "Sorry" / "Thank
+        # you." leaves it set, so the next filler counts from the candidate's real answer.
+        self._unvoiced_since: float | None = None
         self._quick_endpointing = False
         # R1-Q live-UI signals (``LEADNAME_ATTRIBUTE``): the worker is in the transition and has
         # not had the "I'm ready" press yet (``_awaiting_ready``: what the data handler checks),
@@ -859,6 +961,7 @@ class R1Interview:
         # (latched, so nothing the driver forgets between phases can lose it), whether a non-empty
         # ``rpleft`` is published, and the heartbeat task that refreshes it.
         self._awaiting_ready = False
+        self._foreign_data_logged = False  # one line per session: a data message of another topic
         self._awaiting_published = False
         self._ready_latched = False
         self._rpleft_published = False
@@ -1054,6 +1157,7 @@ class R1Interview:
         A candidate row that is still open is written first: a row never straddles a phase.
         """
         self._flush_candidate_row()
+        self._unvoiced_since = None  # a new phase is a new wait
         self.machine.transition(phase)
         self._apply_endpointing(phase)
         self._track_signals(phase)
@@ -1214,8 +1318,26 @@ class R1Interview:
         the briefing is still playing.  It is then handled exactly as a spoken "ready" is: the
         driver stops waiting and the learner picks up.  It is not a transcript row (the candidate
         said nothing).
+
+        Another topic is none of our business, with one exception: while the page's button is
+        being waited for, the first data message of ANY other topic is logged once
+        (``r1_data_ignored``, a closed label from ``topic_label``, never the topic).  The relay
+        has only ever run against fakes; if the real SFU delivers the button under a different
+        topic, this line is the only sign that it arrived at all.
         """
-        if getattr(packet, "topic", None) != READY_TOPIC or self._exiting:
+        if self._exiting:
+            return
+        topic = getattr(packet, "topic", None)
+        if topic != READY_TOPIC:
+            if self._awaiting_ready and not self._foreign_data_logged:
+                self._foreign_data_logged = True
+                _log.info(
+                    "unknown_event",
+                    error_type="r1_data_ignored",
+                    error_category="topic",
+                    schema=topic_label(topic),
+                    phase=self.machine.transcript_phase(),
+                )
             return
         if getattr(packet, "participant", None) is not None:
             reason = "sender"
@@ -1885,10 +2007,14 @@ class R1Interview:
         End of speech to first audio, nearest-rank p95 over the ROLE-PLAY turns (the learner's
         turns; the interviewer's icebreaker and wrap-up are not what the gate prices), in
         milliseconds, or ``None`` when fewer than 8 of them were measured: unknown fails the
-        gate closed, which is right for a session that was barely measured.  The same number is
+        gate closed, which is right for a session that was barely measured.  A turn whose reply
+        was cancelled before any audio counts with the seconds it had waited by then (a lower
+        bound; ``LatencyTracker.reply_lost``), so the turns the candidate sat through cannot be
+        left out of the percentile.  The same number is
         logged (``r1_latency`` schema ``first_audio_p95``, category ``gate``) with the count of
         turns behind it, beside the all-phase figure (category ``all_phases``) for information, so
-        the Stage A report and the posted fact can be compared.  Logging never decides anything.
+        the Stage A report and the posted fact can be compared, and beside the count of lost
+        replies among them (category ``lost_replies``).  Logging never decides anything.
         """
         tracker = self._latency
         try:
@@ -1906,6 +2032,7 @@ class R1Interview:
                     tracker.first_audio_p95_seconds(None, min_samples=1),
                     tracker.first_audio_samples(None),
                 ),
+                ("lost_replies", GATE_PHASE, None, tracker.replies_lost(GATE_PHASE)),
             )
         except Exception as exc:  # noqa: BLE001 - a measurement must never cost the other facts
             _log.warn(
@@ -2044,13 +2171,15 @@ class R1Interview:
 
         The soft exit (``icebreaker_should_end``: four turns once S >= 3:30) used to count STT
         finals, so one long answer that Sarvam split at its pauses was four "turns" and a
-        one-word "Sorry" was one more.  It counts the SDK's committed turns now, and only those of
-        ``ICEBREAKER_ANSWER_MIN_WORDS`` words or more.  An early answer spoken over the opening
-        line still counts, as it did.
+        one-word "Sorry" was one more.  It counts the SDK's committed turns now, and only those
+        with ``ICEBREAKER_ANSWER_MIN_WORDS`` words that are not backchannel.  The SDK's own floor
+        (``min_words``) is not enough: it banks "Sorry" and commits it with the next "Thank you."
+        as one turn of three words, and "Hey, are you there?" is four, and none of them answers
+        the question.  An early answer spoken over the opening line still counts, as it did.
         """
         if self.machine.phase not in (R1Phase.OPENING, R1Phase.ICEBREAKER):
             return
-        if count_words(text) >= ICEBREAKER_ANSWER_MIN_WORDS:
+        if content_word_count(text) >= ICEBREAKER_ANSWER_MIN_WORDS:
             self.machine.candidate_turns += 1
 
     # ----------------------------------------------------- role-play turns
@@ -2173,6 +2302,10 @@ class R1Interview:
         if text:
             self._latency.begin_turn(index, self.machine.transcript_phase())
             self._count_icebreaker_answer(text)
+            if not is_backchannel_turn(text):
+                # The candidate said something: their wait starts again from here.  A backchannel
+                # ("Sorry", "Thank you.") leaves the wait for the reply it cancelled running.
+                self._unvoiced_since = None
         suppressed = self.reply_suppressed(text)
         if suppressed or not text:
             if self.machine.phase in (R1Phase.ICEBREAKER, R1Phase.ROLEPLAY, R1Phase.ASIDE):
@@ -2583,15 +2716,39 @@ class R1Interview:
         line_id = "L-FILLER-LEARNER" if in_roleplay else "L-FILLER-INTERVIEWER"
         return self.render_line(line_id) + " "
 
+    def _filler_delay(self) -> float:
+        """Seconds from the start of a generation to its thinking filler, and note the wait began.
+
+        ``FILLER_AFTER_SECONDS`` for a generation that answers a candidate who has been waiting
+        since just now.  A candidate can also have been waiting longer for a reply nobody has
+        heard: the SDK cancels the reply it is still thinking of when a "Sorry" and a "Thank you."
+        add up to a committed turn (it banks refused words and commits them together), and the
+        reply to THAT starts a new generation.  Counting the filler from the new start would make
+        the candidate sit through the first generation's wait AND a whole new 4 s of silence; the
+        filler is counted from where the wait began instead, never sooner than
+        ``FILLER_RESTART_MIN_SECONDS`` after the new generation starts.
+        """
+        now = self._clock()
+        since = self._unvoiced_since
+        if since is None or not 0.0 <= now - since <= FILLER_ANCHOR_MAX_SECONDS:
+            self._unvoiced_since = now
+            return FILLER_AFTER_SECONDS
+        waited = now - since
+        return min(
+            FILLER_AFTER_SECONDS,
+            max(FILLER_RESTART_MIN_SECONDS, FILLER_AFTER_SECONDS - waited),
+        )
+
     async def guard_llm_stream(self, stream: Any) -> AsyncIterator[Any]:
         """Own one reply's deadlines: a 4 s filler and a 12 s wall clock (plan section 5.11).
 
         Everything here is scoped to THIS generation, so a slow turn can never
         interrupt, reset, or count against another one.  The filler is yielded
-        INTO the reply stream because ``say()`` would queue behind it.  The 12 s
-        deadline is wall clock on purpose: DeepSeek SSE keep-alives defeat read
-        timeouts.  Only an LLM reply (its first chunk) resets the failure count;
-        scripted lines, fillers included, never do.
+        INTO the reply stream because ``say()`` would queue behind it; it is counted from the
+        candidate's real answer when an earlier reply to it was cancelled unheard
+        (``_filler_delay``).  The 12 s deadline is wall clock on purpose: DeepSeek SSE
+        keep-alives defeat read timeouts.  Only an LLM reply (its first chunk) resets the
+        failure count; scripted lines, fillers included, never do.
         """
         from r1_llm import assert_thinking_disabled
 
@@ -2601,7 +2758,7 @@ class R1Interview:
         started_phase = self.machine.phase
         started = loop.time()
         deadline = started + TURN_DEADLINE_SECONDS
-        filler_at = started + FILLER_AFTER_SECONDS
+        filler_at = started + self._filler_delay()
         filler_done = not self._candidate_present
         got_first_chunk = False
         iterator = stream.__aiter__()
@@ -2879,6 +3036,9 @@ class R1Interview:
         if self._exiting or handle is None or speech_id is None:
             return
         slot = _SpeechSlot(handle, source=getattr(event, "source", None))
+        if getattr(event, "source", None) == "generate_reply":
+            # The reply answers the turn the hook has just opened (a lost reply finds it again).
+            slot.latency_turn = self._latency.open_turn_id()
         if getattr(event, "source", None) == "generate_reply" and self._latest_reply is not None:
             # The SDK creates this speech right after the hook that prepared the reply.
             slot.reply, self._latest_reply = self._latest_reply, None
@@ -2895,6 +3055,7 @@ class R1Interview:
         if slot.index is None:
             slot.index = self._reserve_bot_index()
             slot.phase = self.machine.transcript_phase()
+            self._unvoiced_since = None  # the candidate hears something: the wait is over
 
     def _claim_current_speech_slot(self) -> None:
         """The speech that just started speaking owns the next transcript position.
@@ -2943,6 +3104,9 @@ class R1Interview:
             phase=self.machine.transcript_phase(),
             option_count=self._replies_cancelled_before_audio,
         )
+        # The turn it answered never gets a first audio: keep how long the candidate had waited as
+        # a lower bound, so the slowest turns still count toward the p95 the gate reads.
+        self._latency.reply_lost(slot.latency_turn)
         if (
             self.machine.phase is R1Phase.ICEBREAKER
             and self.machine.icebreaker_should_end()
@@ -3717,10 +3881,14 @@ class R1Interview:
         (``prepare_turn`` marks the boundary), not when their first transcript arrives.
 
         The hard S=4:30 cap ends the budget too, except that a turn in flight is given a bounded
-        moment to commit (``_icebreaker_hold_left``).
+        moment to commit (``_icebreaker_hold_left``).  So does the boundary turn: the SDK commits
+        at its endpoint (0.8 s after a sentence that sounds finished), and a candidate who goes on
+        speaking after that is mid-answer again; the transition line is uninterruptible and would
+        talk over them.  Both exits therefore wait the same bounded moment (zero when nobody is
+        mid-turn), and the continued speech is committed, suppressed and answered in its turn.
         """
         if self._icebreaker_boundary_turn:
-            return 0.0
+            return self._icebreaker_hold_left()
         left = self.machine.remaining_icebreaker_seconds()
         if left > 0:
             return left
@@ -3834,12 +4002,14 @@ class R1Interview:
         play L-CLOSE over a question the interviewer is about to answer.  So a refusal
         is believed only after ``WRAPUP_SETTLE_SECONDS`` of candidate silence, counted
         from now (it is not running while the candidate talks, the agent speaks, or the
-        microphone is muted), and every further final is joined and judged together.
+        microphone is muted), and every further final is joined and judged together.  How long
+        depends on how final the words sound (``wrapup_settle_seconds``): "Okay, so" is the
+        start of a question far more often than "No questions."
         """
         while is_no_questions(text):
             self._restart_silence_window()
             kind, more = await self._await_turn(
-                WRAPUP_SETTLE_SECONDS, hard=self.machine.remaining_wrapup_seconds
+                wrapup_settle_seconds(text), hard=self.machine.remaining_wrapup_seconds
             )
             if kind == STOP:
                 return more, text

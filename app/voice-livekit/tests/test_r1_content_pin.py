@@ -28,9 +28,11 @@ import r1_script
 import r1_world
 
 # Revision 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
-# Revision 3 (R1-Q S02 T03): L-NO-FEEDBACK is one sentence naming the hiring team once, and the
-# wrap-up reply note (r1_prompts.WRAPUP_REMINDER) forbids a goodbye.
-PINNED_CONTENT_SHA256 = "906f6bfd14ffeafddc2f0894a5a240bf6311e04e4517a408804a0f87e69fe49a"
+# Revision 3 (R1-Q S02): L-NO-FEEDBACK is one short refusal that does not name the hiring team
+# (L-CLOSE is the one mention of who reviews the interview), and the wrap-up reply note
+# (r1_prompts.WRAPUP_REMINDER) forbids a goodbye.  Revision 3 has not shipped (main is at 2), so
+# the review round's change to L-NO-FEEDBACK re-pins it rather than taking a fourth.
+PINNED_CONTENT_SHA256 = "cc453b15363e8b66470623424bedd4ab4bb6cffef473963e844c26cc0bb886b9"
 
 CONTENT_MODULES = (
     "r1_text",

@@ -567,6 +567,127 @@ class TestFirstAudioP95(unittest.TestCase):
         self.assertEqual(r1_latency.GATE_MIN_SAMPLES, 8)  # R1_GATE_LIMITS.MIN_QUALIFYING_TURNS
 
 
+class TestRepliesLostBeforeAnyAudio(unittest.TestCase):
+    """A reply cancelled before the candidate heard it still counts toward the p95 (as a lower bound).
+
+    The headline sample is added when the first audio plays, so a turn whose reply was cancelled
+    first (the owner's row 26 "Hello": dead air) never entered the percentile the gate compares
+    with 3 s.  The slowest turns are exactly the ones that never reach their first audio.
+    """
+
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.lines = Lines()
+        self.tracker = LatencyTracker(self.clock, self.lines)
+        self.turns = 0
+
+    def turn(self, phase: str, seconds: float | None) -> int | None:
+        """A turn whose audio starts after ``seconds`` (``None``: no audio is ever reported)."""
+        self.turns += 1
+        self.clock.at(self.clock.now + 10.0)
+        self.tracker.begin_turn(self.turns, phase)
+        turn_id = self.tracker.open_turn_id()
+        if seconds is not None:
+            self.clock.at(self.clock.now + seconds)
+            self.tracker.first_audio()
+        return turn_id
+
+    def test_a_lost_reply_adds_the_wait_so_far_as_a_sample(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.0)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)
+        turn_id = self.turn("roleplay", None)
+        self.clock.at(self.clock.now + 6.0)
+        self.tracker.reply_lost(turn_id)
+        self.assertEqual(self.tracker.first_audio_samples(), 9)
+        self.assertEqual(self.tracker.replies_lost(), 1)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 6000)
+        self.assertEqual(self.lines.get("eou_to_reply_lost")[1:], (6.0, "reply", "roleplay", 9))
+
+    def test_the_slowest_turn_cannot_hide_by_never_being_heard(self) -> None:
+        # Ten role-play turns answered in 1 s and one the candidate sat through for 9 s before the
+        # SDK cancelled its reply: the session must not read as a 1 s session.
+        for _ in range(10):
+            self.turn("roleplay", 1.0)
+        turn_id = self.turn("roleplay", None)
+        self.clock.at(self.clock.now + 9.0)
+        self.tracker.reply_lost(turn_id)
+        self.assertGreater(self.tracker.first_audio_p95_ms(), 3000)
+
+    def test_a_lost_turn_counts_once(self) -> None:
+        turn_id = self.turn("roleplay", None)
+        self.clock.at(self.clock.now + 2.0)
+        self.tracker.reply_lost(turn_id)
+        self.tracker.reply_lost(turn_id)
+        self.assertEqual(self.tracker.first_audio_samples(), 1)
+        self.assertEqual(self.tracker.replies_lost(), 1)
+        self.assertEqual(self.lines.schemas().count("eou_to_reply_lost"), 1)
+
+    def test_a_reply_that_reached_its_audio_is_not_lost(self) -> None:
+        turn_id = self.turn("roleplay", 1.0)
+        self.clock.at(self.clock.now + 5.0)
+        self.tracker.reply_lost(turn_id)  # cut while speaking: the candidate heard it
+        self.assertEqual(self.tracker.first_audio_samples(), 1)
+        self.assertEqual(self.tracker.replies_lost(), 0)
+
+    def test_a_lost_turn_ignores_audio_that_plays_afterwards(self) -> None:
+        turn_id = self.turn("roleplay", None)
+        self.clock.at(self.clock.now + 3.0)
+        self.tracker.reply_lost(turn_id)
+        self.clock.at(self.clock.now + 1.0)
+        self.tracker.first_audio()  # some other speech, before the next turn is opened
+        self.assertEqual(self.tracker.first_audio_samples(), 1)
+        self.assertNotIn("eou_to_first_audio", self.lines.schemas())
+
+    def test_a_reply_is_matched_to_its_own_turn_not_the_newest(self) -> None:
+        old = self.turn("roleplay", None)
+        started = self.clock.now
+        self.turn("roleplay", None)  # a newer turn is open now (10 s later)
+        self.clock.at(self.clock.now + 1.0)
+        now = self.clock.now
+        self.tracker.reply_lost(old)
+        (sample,) = list(self.tracker._headline)
+        self.assertAlmostEqual(sample[1], now - started)  # the OLD turn's wait, 11 s
+        self.assertAlmostEqual(now - started, 11.0)
+
+    def test_only_the_role_play_turns_feed_the_gate_number(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.0)
+        turn_id = self.turn("icebreaker", None)
+        self.clock.at(self.clock.now + 20.0)
+        self.tracker.reply_lost(turn_id)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)  # the interviewer's wait is not priced
+        self.assertEqual(self.tracker.first_audio_samples(None), 9)
+        self.assertEqual(self.tracker.replies_lost(), 0)
+        self.assertEqual(self.tracker.replies_lost(None), 1)
+
+    def test_nothing_is_added_for_an_unknown_turn_an_old_turn_or_none(self) -> None:
+        turn_id = self.turn("roleplay", None)
+        for _ in range(6):  # more turns than the tracker remembers
+            self.turn("roleplay", 1.0)
+        samples = self.tracker.first_audio_samples()
+        self.tracker.reply_lost(None)
+        self.tracker.reply_lost(9999)
+        self.tracker.reply_lost(turn_id)
+        self.assertEqual(self.tracker.first_audio_samples(), samples)
+        self.assertEqual(self.tracker.replies_lost(), 0)
+
+    def test_a_clock_artefact_is_not_a_sample(self) -> None:
+        turn_id = self.turn("roleplay", None)
+        self.clock.at(self.clock.now + 10_000.0)
+        self.tracker.reply_lost(turn_id)
+        self.assertEqual(self.tracker.first_audio_samples(), 0)
+
+    def test_a_reply_lost_with_no_turn_open_does_nothing(self) -> None:
+        self.assertIsNone(self.tracker.open_turn_id())
+        self.tracker.reply_lost(self.tracker.open_turn_id())
+        self.assertEqual(self.tracker.first_audio_samples(None), 0)
+
+    def test_the_turn_numbers_are_distinct_and_increasing(self) -> None:
+        ids = [self.turn("roleplay", 1.0) for _ in range(3)]
+        self.assertEqual(ids, sorted(set(ids)))
+
+
 def log_line(schema: str, seconds, *, component: str = "r1", error_type: str = "r1_latency") -> dict:
     return {
         "timestamp": "2026-10-08T00:00:00.000Z",
@@ -642,6 +763,22 @@ class TestStageAReport(unittest.TestCase):
                 report = stage_a_report(lines)
                 self.assertIsNone(report["passes"])
                 self.assertEqual(report["headline_turns"], 0)
+
+    def test_a_cancelled_reply_counts_with_the_headline_as_a_lower_bound(self) -> None:
+        lines = headline(*([1.0] * 9)) + [log_line("eou_to_reply_lost", 7.0)]
+        report = stage_a_report(lines)
+        self.assertEqual((report["headline_turns"], report["lost_replies"]), (10, 1))
+        self.assertEqual(report["headline_p95_sec"], 7.0)
+        self.assertFalse(report["headline_p95_ok"])
+        self.assertFalse(report["passes"])
+        # Without the lost turn the same session reads as a fast one: the point of counting it.
+        self.assertTrue(stage_a_report(headline(*([1.0] * 9)))["passes"])
+        self.assertEqual(stage_a_report(headline(1.0))["lost_replies"], 0)
+
+    def test_a_session_of_nothing_but_lost_replies_was_measured_and_fails(self) -> None:
+        report = stage_a_report([log_line("eou_to_reply_lost", 6.0)] * 3)
+        self.assertEqual((report["headline_turns"], report["lost_replies"]), (3, 3))
+        self.assertFalse(report["passes"])
 
     def test_only_r1_latency_lines_count(self) -> None:
         lines = (

@@ -42,6 +42,7 @@ import re
 import sys
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 HERE = Path(__file__).resolve().parents[1]  # app/voice-livekit
 if str(HERE) not in sys.path:
@@ -340,13 +341,15 @@ def role_play_p95_ms(lines):
     """The expected ``first_audio_p95_ms``, read back from the ``r1_latency`` log lines.
 
     An independent computation: the nearest-rank p95 of the role-play ``eou_to_first_audio``
-    values a session logged, in whole milliseconds (None below the gate's 8 turns).
+    values a session logged, plus the wait so far of every role-play reply that was cancelled
+    before any audio (``eou_to_reply_lost``: a lower bound, so the slowest turns are not left out),
+    in whole milliseconds (None below the gate's 8 turns).
     """
     values = sorted(
         line["duration_sec"]
         for line in lines
         if line.get("error_type") == "r1_latency"
-        and line.get("schema") == "eou_to_first_audio"
+        and line.get("schema") in ("eou_to_first_audio", "eou_to_reply_lost")
         and line.get("phase") == "roleplay"
     )
     if len(values) < 8:
@@ -450,6 +453,39 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         failures = gate_like_api(parse_like_api(posted(rig.writer.admin_events)))
         self.assertIn("latency_p95_exceeded", failures)
         self.assertNotIn("latency_unknown", failures)
+
+    async def test_a_reply_cancelled_before_any_audio_still_counts_toward_the_posted_p95(self):
+        # The owner's row 26 ("Hello"): the candidate sat through dead air and the reply was cut.
+        # Nine prompt turns and one such turn must not post a 1 s session to the gate.
+        from tests.test_r1_core import FakeSpeechHandle  # the SDK-shaped handle of the core fakes
+
+        with capture_r1_logs() as lines:
+            rig = Rig()
+            await rig.start_roleplay()
+            script = cooperative_script()
+            for text in script[:9]:
+                await rig.converse(text, advance=20, first_audio_after=1.0)
+            self.assertEqual(rig.interview._latency.first_audio_p95_ms(), 1000)
+            rig.clock.advance(20)
+            rig.final(script[9])
+            await rig.settle()
+            await rig.agent.on_user_turn_completed(
+                None, SimpleNamespace(text_content=script[9], id="msg_cancelled")
+            )
+            handle = FakeSpeechHandle("the learner's reply")
+            rig.session.emit(
+                "speech_created",
+                SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=True),
+            )
+            rig.clock.advance(7.0)  # seven seconds of silence, then the SDK cuts the reply
+            handle.interrupted = True
+            handle.finish()
+            await rig.settle()
+            payload = await facts_of(rig)
+        self.assertEqual(payload["first_audio_p95_ms"], 7000)
+        self.assertEqual(payload["first_audio_p95_ms"], role_play_p95_ms(lines))
+        failures = gate_like_api(parse_like_api(posted(rig.writer.admin_events)))
+        self.assertIn("latency_p95_exceeded", failures)
 
     async def test_only_role_play_turns_feed_the_posted_p95(self):
         rig = Rig()

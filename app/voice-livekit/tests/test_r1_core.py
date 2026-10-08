@@ -1580,12 +1580,53 @@ class TestReplyPolicy(R1TestCase):
 
     async def test_a_committed_fragment_is_not_an_answer(self) -> None:
         # "Sorry", "Thank you." and "Hello" commit as turns when no reply is pending to protect,
-        # but they are not answers: three words is the floor (the SDK's own interruption floor).
+        # but they are not answers: it takes ICEBREAKER_ANSWER_MIN_WORDS words that are not noise.
         for fragment in ("Sorry.", "Thank you.", "Hello", "Yes please"):
             self.assertFalse(await self.answer(fragment))
         self.assertEqual(self.interview.machine.candidate_turns, 0)
-        self.assertFalse(await self.answer("Hey, are you there?"))
-        self.assertEqual(self.interview.machine.candidate_turns, 1)
+
+    async def test_committed_backchannel_of_three_words_or_more_is_not_an_answer(self) -> None:
+        # The SDK's own floor is the WORD count, and the owner's session had all of these: "Sorry"
+        # banked and committed with the next "Thank you." (three words), "Hey, are you there?"
+        # (four).  None of them answers the question, so none counts toward the soft exit.
+        for noise in (
+            "Sorry Thank you.",
+            "Hey, are you there?",
+            "Sorry. Thank you. Hey, are you there?",
+            "Hmm. Okay. Right.",
+            "Yes. Right, sure.",
+            "Alright, thank you.",
+            "Okay, got it, thanks.",
+            "Hello? Hello? Hello?",
+        ):
+            with self.subTest(noise=noise):
+                self.assertGreaterEqual(r1_session.count_words(noise), 3)  # the SDK commits it
+                self.assertFalse(await self.answer(noise))
+                self.assertEqual(self.interview.machine.candidate_turns, 0)
+
+    async def test_the_real_answers_of_the_owner_session_are_counted(self) -> None:
+        for answer_text in (
+            "Yeah, so my name is Cristo. I have around 11 years of experience.",
+            "I have been, my previous companies are Scalar, Great Learning and Upgrade.",
+            "Sorry, I sell courses to working professionals.",  # a filler inside a real answer
+            "I sell courses",
+            "Yeah I do sales",
+        ):
+            with self.subTest(answer=answer_text):
+                before = self.interview.machine.candidate_turns
+                self.assertFalse(await self.answer(answer_text))
+                self.assertEqual(self.interview.machine.candidate_turns, before + 1)
+
+    def test_the_noise_filter_works_on_folded_text(self) -> None:
+        self.assertEqual(r1_session.content_word_count("Sorry. Thank you!"), 0)
+        self.assertEqual(r1_session.content_word_count("SORRY, thank-you"), 0)
+        self.assertEqual(r1_session.content_word_count("I sell courses"), 3)
+        self.assertEqual(r1_session.content_word_count(""), 0)
+        self.assertTrue(r1_session.is_backchannel_turn("Hey, are you there?"))
+        self.assertTrue(r1_session.is_backchannel_turn("Okay, right."))
+        self.assertFalse(r1_session.is_backchannel_turn("Okay, I sell courses."))
+        self.assertFalse(r1_session.is_backchannel_turn(""))
+        self.assertFalse(r1_session.is_backchannel_turn("..."))
 
     async def test_an_early_answer_spoken_over_the_opening_still_counts_as_a_turn(self) -> None:
         self.interview.machine.phase = R1Phase.OPENING
@@ -1972,6 +2013,101 @@ class TestPhaseDriver(R1TestCase):
             task.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await task
+
+    def test_the_settle_window_depends_on_how_final_the_words_sound(self) -> None:
+        plain = r1_session.WRAPUP_SETTLE_SECONDS
+        for text in (
+            "No questions.", "No, thanks.", "Nothing else.", "That's all, thank you.", "Nope",
+            "I'm good.", "I'm okay.", "No, I don't have any questions.", "Hmm, no.",
+        ):
+            with self.subTest(explicit=text):
+                self.assertTrue(is_no_questions(text))
+                self.assertEqual(r1_session.wrapup_settle_seconds(text), plain)
+        for text in (
+            "Okay.", "Alright.", "Thank you.", "Thanks!", "Okay, got it.", "Great, thanks.",
+            "Sounds good.", "Cool",
+        ):
+            with self.subTest(acknowledgement=text):
+                self.assertTrue(is_no_questions(text))
+                self.assertEqual(r1_session.wrapup_settle_seconds(text), plain * 2.0)
+        for text in (
+            "Okay, so", "Okay, so...", "Thank you, and", "Alright, um", "Okay. Well", "No questions, uh",
+        ):
+            with self.subTest(lead_in=text):
+                self.assertTrue(is_no_questions(text))
+                self.assertEqual(r1_session.wrapup_settle_seconds(text), plain * 2.5)
+        self.assertEqual((plain, plain * 2.0, plain * 2.5), (1.5, 3.0, 3.75))
+
+    def spy_on_waits(self) -> list[float]:
+        """Record the silence window of every ``_await_turn`` the driver opens (then run it)."""
+        waits: list[float] = []
+        real = self.interview._await_turn
+
+        async def spy(timeout, **kwargs):
+            waits.append(timeout)
+            return await real(timeout, **kwargs)
+
+        self.interview._await_turn = spy
+        return waits
+
+    async def test_the_driver_waits_the_window_for_the_words_that_were_said(self) -> None:
+        # The windows themselves are checked by value (no wall-clock race): the first wait is the
+        # 20 s silence window of the wrap-up, the second is the settle window of the refusal.
+        plain = 0.02
+        for text, factor in (
+            ("Nothing else.", 1.0),
+            ("Thank you.", 2.0),
+            ("Okay.", 2.0),
+            ("Okay, so", 2.5),
+            ("Thank you, and", 2.5),
+        ):
+            with self.subTest(text=text):
+                await self.asyncSetUp()
+                self.enter_wrapup()
+                with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", plain):
+                    waits = self.spy_on_waits()
+                    task = asyncio.create_task(self.interview._run_wrapup())
+                    await self.settle()
+                    self.final_transcript(text)
+                    self.assertIsNone(await asyncio.wait_for(task, 10.0))  # and all of them close
+                self.assertEqual(len(waits), 2, waits)
+                self.assertEqual(waits[0], r1_session.WRAPUP_SILENCE_SECONDS)
+                self.assertAlmostEqual(waits[1], plain * factor)
+
+    async def test_okay_so_and_a_pause_does_not_end_the_wrapup_over_the_question_that_follows(
+        self,
+    ) -> None:
+        # The research list for item 8 had no "okay", and the plan added it: "Okay, so ... [two
+        # seconds of thinking] what are the next steps?" must not get L-CLOSE, uninterruptibly,
+        # spoken over the question.  The refusal is not believed for 2.5 settle windows, and a
+        # final that arrives in that time is joined to it and judged with it.
+        self.enter_wrapup()
+        settled = mock.AsyncMock()  # reached only once TWO questions have been counted
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 4.0):  # lead-in: 10 s
+            waits = self.spy_on_waits()
+            with mock.patch.object(self.interview, "_wait_reply_settled", settled):
+                task = asyncio.create_task(self.interview._run_wrapup())
+                await self.settle()
+                self.final_transcript("Okay, so")
+                await self.settle()
+                self.assertFalse(task.done())
+                self.assertEqual(waits[-1], 10.0)  # not the plain 4.0
+                self.final_transcript("what are the next steps")
+                await self.settle()
+                self.assertFalse(task.done())  # ONE question: the wrap-up is still open
+                settled.assert_not_awaited()
+                self.final_transcript("and who is on the team?")
+                self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        settled.assert_awaited_once()
+
+    async def test_a_lone_okay_so_still_closes_once_nothing_follows(self) -> None:
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.02):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            self.final_transcript("Okay, so")
+            self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.session.spoken, [])
 
     async def test_wrapup_ends_after_twenty_seconds_of_silence(self) -> None:
         self.enter_wrapup()
@@ -2866,7 +3002,7 @@ class TestRunFlow(R1TestCase):
             "I sold courses",
             "to working professionals",
             "mostly by phone",
-            "yes that is right",
+            "yes that is how I work",  # an answer has three words that are not noise
         ):
             await self.answer(answer)
 
@@ -3715,6 +3851,98 @@ class TestIcebreakerHardCapWaitsForTheAnswerInFlight(R1TestCase):
         self.assertIsNone(await asyncio.wait_for(task, 5.0))
 
 
+class TestSoftExitBoundaryWaitsForTheAnswerInFlight(R1TestCase):
+    """The boundary turn ends the icebreaker, but not over a candidate who goes on speaking.
+
+    The SDK commits a turn at its endpoint (0.8 s after a sentence that sounds finished); a
+    candidate who pauses that long and goes on is mid-answer again when the commit arrives.  The
+    transition line is uninterruptible and discards their audio, so the boundary waits for them
+    exactly as the hard S=4:30 cap does: until the continued speech is committed (and answered by
+    the transition line in its turn), bounded by the endpointing maximum plus a second, and by 30 s.
+    """
+
+    GRACE = 3.0 + 1.0  # R1_ENDPOINT_MAX_DELAY_SEC default + ICEBREAKER_HOLD_MARGIN_SECONDS
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("R1_ENDPOINT_MIN_DELAY_SEC", "R1_ENDPOINT_MAX_DELAY_SEC"):
+            os.environ.pop(key, None)
+
+    LAST = TestIcebreakerEndRace.ANSWERS[3]
+
+    async def due_and_driving(self) -> asyncio.Task:
+        """The driver waits; the 4th answer's final has landed at S = 205 and S passes 3:30 before
+        the SDK commits it, so that commit is the boundary turn (not yet committed here)."""
+        self.clock.advance(205)
+        task = asyncio.create_task(self.interview._run_icebreaker())
+        await self.settle()
+        for answer in TestIcebreakerEndRace.ANSWERS[:3]:
+            self.assertFalse(await self.answer(answer))
+        self.final_transcript(self.LAST)
+        await self.settle()
+        self.clock.advance(10)  # S = 215
+        self.assertFalse(task.done())
+        return task
+
+    async def test_a_boundary_commit_while_the_candidate_goes_on_speaking_is_not_talked_over(
+        self,
+    ) -> None:
+        task = await self.due_and_driving()
+        self.user_state("speaking")  # they paused 0.8 s, the SDK committed, they went on
+        self.assertTrue(await self.commit_turn(self.LAST))  # suppressed: the boundary turn
+        self.assertTrue(self.interview._icebreaker_boundary_turn)
+        self.assertEqual(self.interview._icebreaker_budget_left(), self.GRACE)
+        await self.settle()
+        self.assertFalse(task.done())
+        self.assertEqual(self.session.spoken, [])  # the transition line has NOT started
+        self.final_transcript("and the other thing I did was")
+        self.user_state("listening")
+        await self.settle()
+        self.assertFalse(task.done())  # half an answer until the SDK commits it
+        self.assertTrue(await self.commit_turn("and the other thing I did was"))
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))  # now the transition line plays
+        self.assertEqual(self.session.spoken, [])
+
+    async def test_a_boundary_commit_with_nobody_mid_turn_still_ends_the_phase_at_once(self) -> None:
+        task = await self.due_and_driving()
+        self.assertTrue(await self.commit_turn(self.LAST))
+        self.assertEqual(self.interview._icebreaker_budget_left(), 0)
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+
+    async def test_a_final_that_the_sdk_has_not_committed_holds_the_boundary_too(self) -> None:
+        task = await self.due_and_driving()
+        self.assertTrue(await self.commit_turn(self.LAST))
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))  # nobody mid-turn: over
+        # Same state, but a final of the continued speech was heard before the driver looked.
+        self.interview._icebreaker_boundary_turn = True
+        self.final_transcript("and one more thing")
+        self.assertEqual(self.interview._icebreaker_budget_left(), self.GRACE)
+
+    async def test_continued_speech_that_is_never_committed_cannot_hold_the_phase_open(self) -> None:
+        task = await self.due_and_driving()
+        self.user_state("speaking")
+        self.assertTrue(await self.commit_turn(self.LAST))
+        self.final_transcript("and one more thing")  # a fragment the SDK banks and never commits
+        self.user_state("listening")
+        await self.settle()
+        self.assertFalse(task.done())
+        self.clock.advance(self.GRACE + 0.1)
+        self.interview._wake()
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+
+    async def test_the_boundary_hold_never_lasts_beyond_its_ceiling(self) -> None:
+        await self.due_and_driving()
+        self.user_state("speaking")
+        self.assertTrue(await self.commit_turn(self.LAST))
+        self.assertEqual(self.interview._icebreaker_budget_left(), self.GRACE)
+        self.clock.advance(29.5)  # still speaking: the window is renewed, up to the ceiling
+        self.assertAlmostEqual(self.interview._icebreaker_budget_left(), 0.5)
+        self.clock.advance(1.0)
+        self.assertEqual(self.interview._icebreaker_budget_left(), 0)
+
+
 class TestRepliesCancelledBeforeAnyAudio(R1TestCase):
     """The owner's 4/10 session lost three replies to "Sorry", "Thank you" and "Hey, are you there?"
 
@@ -3818,6 +4046,278 @@ class TestRepliesCancelledBeforeAnyAudio(R1TestCase):
         handle.interrupted = True
         handle.finish()
         self.assertFalse(self.interview._icebreaker_boundary_turn)
+
+
+class TestBackchannelsOverAPendingReply(R1TestCase):
+    """"Sorry" then "Thank you." is ONE committed turn of three words, and it cancels the pending reply.
+
+    livekit-agents 1.6.4 refuses a turn of fewer than ``min_words`` words only while it can still
+    cut the reply, and it KEEPS the refused words (``AudioRecognition`` clears its transcript when
+    a turn is committed, not when one is refused): the next final is judged together with them
+    (``AgentActivity.on_end_of_turn``).  So "Sorry" (1 word) is banked, "Thank you." (2) makes
+    three, the SDK commits, and ``_user_turn_completed_task`` interrupts the reply it was still
+    thinking of BEFORE it calls R1's hook.  ``min_words=3`` therefore stops one short fragment, not
+    a sequence of them, and the owner's rows 12-14 still end in dead air.  R1 cannot stop the SDK
+    from committing, so these tests pin what it does about the committed turn: it does not count
+    it as an answer, it does not restart the candidate's wait for the next reply, and the reply it
+    cost is counted in the p95.
+    """
+
+    ANSWER = "I have been selling courses to working professionals for eleven years now"
+
+    @staticmethod
+    async def hung_stream():
+        await asyncio.Event().wait()
+        yield "never"
+
+    @staticmethod
+    async def gated(gate: asyncio.Event, *items):
+        await gate.wait()
+        for item in items:
+            yield item
+
+    async def collect(self, stream) -> list:
+        return [item async for item in self.interview.guard_llm_stream(stream)]
+
+    async def reply_pending_for(self, text: str) -> tuple[FakeSpeechHandle, asyncio.Task]:
+        """The candidate's answer is committed and the model starts to think of the reply."""
+        self.final_transcript(text)
+        await self.settle()
+        self.assertFalse(await self.commit_turn(text))
+        handle = FakeSpeechHandle("the reply")
+        self.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=False),
+        )
+        self.session.current_speech = handle
+        generation = asyncio.create_task(self.collect(self.hung_stream()))
+        await self.settle()
+        return handle, generation
+
+    async def sdk_commits(
+        self, handle: FakeSpeechHandle, generation: asyncio.Task, text: str
+    ) -> bool:
+        """``_user_turn_completed_task``: cut the pending reply FIRST, then call the hook."""
+        handle.interrupted = True
+        generation.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await generation
+        handle.finish()
+        self.session.current_speech = None
+        return await self.commit_turn(text)
+
+    async def owner_sequence(self) -> tuple[FakeSpeechHandle, asyncio.Task]:
+        """Rows 12-14 of the owner's session: an answer, its reply pending, "Sorry", "Thank you."."""
+        handle, generation = await self.reply_pending_for(self.ANSWER)
+        self.final_transcript("Sorry")
+        await self.settle()
+        self.assertTrue(self.interview._fragment_held_back())  # one word: refused and banked
+        self.final_transcript("Thank you.")
+        await self.settle()
+        self.assertEqual(self.interview._banked_words, 3)
+        self.assertFalse(self.interview._fragment_held_back())  # three words: the SDK commits
+        return handle, generation
+
+    def lost(self, logs: list[dict]) -> list[dict]:
+        return [e for e in logs if e.get("error_type") == "r1_reply_cancelled_before_audio"]
+
+    async def test_the_sdk_commits_sorry_and_thank_you_together_and_the_pending_reply_is_lost(
+        self,
+    ) -> None:
+        handle, generation = await self.owner_sequence()
+        with self.capture_logs() as logs:
+            self.assertFalse(await self.sdk_commits(handle, generation, "Sorry Thank you."))
+        # The reply was cut before it spoke: that is the owner's dead air, and it is logged.
+        self.assertEqual(len(self.lost(logs)), 1)
+        await self.flush()
+        self.assertEqual(
+            [r["text"] for r in self.writer.saved if r["speaker"] == "candidate"],
+            [self.ANSWER, "Sorry Thank you."],
+        )
+        self.assertEqual(self.bot_rows(), [])  # and the candidate heard nothing
+
+    async def test_that_committed_turn_is_not_an_answer(self) -> None:
+        handle, generation = await self.owner_sequence()
+        self.assertEqual(self.interview.machine.candidate_turns, 1)  # the real answer
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.assertEqual(self.interview.machine.candidate_turns, 1)  # not a second one
+
+    async def test_noise_never_brings_the_soft_exit_closer(self) -> None:
+        # Four turns of noise at S >= 3:30 used to END the icebreaker (each was three words or more).
+        self.clock.advance(215)
+        for noise in ("Sorry Thank you.", "Hey, are you there?", "Hmm. Okay. Right.", "Yes. Right, sure."):
+            self.assertFalse(await self.answer(noise))  # the reply is not suppressed
+        self.assertEqual(self.interview.machine.candidate_turns, 0)
+        self.assertFalse(self.interview.machine.icebreaker_should_end())
+
+    async def test_the_next_replys_filler_is_counted_from_the_real_answer(self) -> None:
+        handle, generation = await self.owner_sequence()
+        self.clock.advance(3.99)  # the candidate has waited this long when the SDK cuts the reply
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        with mock.patch.object(r1_session, "FILLER_RESTART_MIN_SECONDS", 0.02):
+            guard = self.interview.guard_llm_stream(self.gated(asyncio.Event()))
+            # Counted from the start of THIS generation the filler would come 4 s from now.
+            first = await asyncio.wait_for(guard.__anext__(), 3.0)
+            await guard.aclose()
+        self.assertEqual(first, self.spoken_line("L-FILLER-INTERVIEWER") + " ")
+
+    async def test_the_filler_keeps_a_floor_so_a_reply_about_to_arrive_is_not_pre_empted(
+        self,
+    ) -> None:
+        handle, generation = await self.owner_sequence()
+        self.clock.advance(3.99)
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        delay = self.interview._filler_delay()
+        self.assertEqual(delay, r1_session.FILLER_RESTART_MIN_SECONDS)
+        self.assertGreater(delay, 0.0)
+
+    async def test_a_candidate_who_has_waited_only_a_little_gets_the_rest_of_the_four_seconds(
+        self,
+    ) -> None:
+        handle, generation = await self.owner_sequence()
+        self.clock.advance(1.0)
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.assertAlmostEqual(self.interview._filler_delay(), 3.0)
+
+    async def test_without_a_cancelled_reply_the_filler_still_waits_its_full_four_seconds(
+        self,
+    ) -> None:
+        guard = self.interview.guard_llm_stream(self.gated(asyncio.Event()))
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(guard.__anext__(), 0.3)
+        self.assertEqual(r1_session.FILLER_AFTER_SECONDS, 4.0)
+        self.interview._unvoiced_since = None
+        self.assertEqual(self.interview._filler_delay(), 4.0)
+
+    async def test_something_real_said_after_the_noise_starts_the_wait_afresh(self) -> None:
+        handle, generation = await self.owner_sequence()
+        self.clock.advance(3.5)
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.assertIsNotNone(self.interview._unvoiced_since)  # the wait is still the old one
+        await self.answer("Actually I also spent two years in enterprise sales")
+        self.assertIsNone(self.interview._unvoiced_since)
+        self.assertEqual(self.interview._filler_delay(), 4.0)
+
+    async def test_any_speech_that_begins_ends_the_wait(self) -> None:
+        handle, generation = await self.owner_sequence()
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.assertIsNotNone(self.interview._unvoiced_since)
+        self.interview._filler_delay()
+        reply = FakeSpeechHandle("the next reply")
+        self.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=reply, source="generate_reply", user_initiated=False),
+        )
+        self.session.current_speech = reply
+        self.agent_state("speaking")  # the candidate hears something
+        self.assertIsNone(self.interview._unvoiced_since)
+
+    async def test_a_new_phase_is_a_new_wait(self) -> None:
+        handle, generation = await self.owner_sequence()
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.assertIsNotNone(self.interview._unvoiced_since)
+        self.interview._enter(R1Phase.TRANSITION)
+        self.assertIsNone(self.interview._unvoiced_since)
+
+    async def test_an_old_wait_is_not_the_current_one(self) -> None:
+        handle, generation = await self.owner_sequence()
+        await self.sdk_commits(handle, generation, "Sorry Thank you.")
+        self.clock.advance(r1_session.FILLER_ANCHOR_MAX_SECONDS + 1.0)
+        self.assertEqual(self.interview._filler_delay(), 4.0)
+
+    async def test_the_anchor_never_makes_the_filler_later_than_the_plain_four_seconds(self) -> None:
+        self.interview._unvoiced_since = 0.0
+        for waited in (0.0, 0.1, 2.0, 3.9, 4.0, 10.0, 19.9):
+            self.clock.value = waited
+            self.interview._unvoiced_since = 0.0
+            delay = self.interview._filler_delay()
+            self.assertLessEqual(delay, 4.0, waited)
+            self.assertGreaterEqual(delay, min(0.5, 4.0), waited)
+
+    async def test_a_clock_that_stepped_back_is_not_a_wait(self) -> None:
+        self.interview._unvoiced_since = 100.0  # the manual clock reads 0.0
+        self.assertEqual(self.interview._filler_delay(), 4.0)
+
+    # ------------------------------------------------ the p95 does not lose the cancelled turn
+
+    async def roleplay_turn_with_a_reply_pending(self) -> tuple[FakeSpeechHandle, int | None]:
+        self.enter_roleplay()
+        self.final_transcript("Hi Meera, thanks for taking my call today")
+        await self.settle()
+        self.assertFalse(await self.commit_turn("Hi Meera, thanks for taking my call today"))
+        handle = FakeSpeechHandle("the learner's reply")
+        self.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=False),
+        )
+        return handle, self.interview._latency.open_turn_id()
+
+    async def test_a_cancelled_role_play_reply_adds_its_wait_to_the_p95_as_a_lower_bound(self) -> None:
+        tracker = self.interview._latency
+        for number in range(8):  # eight prompt answers, 1 s each
+            self.clock.advance(10.0)
+            tracker.begin_turn(100 + number, "roleplay")
+            self.clock.advance(1.0)
+            tracker.first_audio()
+        self.assertEqual(tracker.first_audio_p95_ms(), 1000)
+        handle, _turn = await self.roleplay_turn_with_a_reply_pending()
+        with self.capture_logs() as logs:
+            self.clock.advance(6.0)  # the candidate has waited 6 s when the reply is cut
+            handle.interrupted = True
+            handle.finish()
+        self.assertEqual(tracker.replies_lost("roleplay"), 1)
+        self.assertEqual(tracker.first_audio_samples(), 9)
+        self.assertEqual(tracker.first_audio_p95_ms(), 6000)  # it can no longer look fast
+        (line_,) = [e for e in logs if e.get("schema") == "eou_to_reply_lost"]
+        self.assertEqual((line_["phase"], line_["duration_sec"]), ("roleplay", 6.0))
+
+    async def test_audio_that_plays_afterwards_is_not_that_turns_first_audio(self) -> None:
+        tracker = self.interview._latency
+        handle, _turn = await self.roleplay_turn_with_a_reply_pending()
+        self.clock.advance(5.0)
+        handle.interrupted = True
+        handle.finish()
+        samples = tracker.first_audio_samples(None)
+        self.clock.advance(1.0)
+        later = FakeSpeechHandle("an unrelated scripted line")
+        self.session.current_speech = later
+        self.agent_state("speaking")  # some speech starts before the next turn is opened
+        self.assertEqual(tracker.first_audio_samples(None), samples)
+
+    async def test_the_session_posts_the_count_of_lost_replies_beside_the_p95(self) -> None:
+        handle, _turn = await self.roleplay_turn_with_a_reply_pending()
+        self.clock.advance(5.0)
+        handle.interrupted = True
+        handle.finish()
+        with self.capture_logs() as logs:
+            self.assertIsNone(self.interview._first_audio_p95_ms())  # one turn: unknown, not a number
+        lost = [e for e in logs if e.get("error_category") == "lost_replies"]
+        self.assertEqual([e["option_count"] for e in lost], [1])
+
+    async def test_a_reply_that_spoke_is_not_counted_as_lost(self) -> None:
+        tracker = self.interview._latency
+        handle, _turn = await self.roleplay_turn_with_a_reply_pending()
+        self.clock.advance(1.0)
+        self.session.current_speech = handle
+        self.agent_state("speaking")  # the candidate hears it
+        handle.interrupted = True  # cut later, while speaking
+        handle.finish()
+        self.assertEqual(tracker.replies_lost(None), 0)
+        self.assertEqual(tracker.first_audio_samples(None), 1)
+
+    async def test_a_lost_reply_does_not_pay_for_another_turns_wait(self) -> None:
+        # The reply is tied to the turn that was open when it was created, not to the newest turn.
+        tracker = self.interview._latency
+        handle, turn = await self.roleplay_turn_with_a_reply_pending()
+        self.clock.advance(2.0)
+        await self.answer("and the second part of my opening pitch")  # a newer turn opens
+        self.clock.advance(1.0)
+        handle.interrupted = True  # the OLD reply is cut afterwards
+        handle.finish()
+        self.assertEqual(tracker.replies_lost(None), 1)
+        (sample,) = [s for s in tracker._headline if s[1] > 2.5]
+        self.assertAlmostEqual(sample[1], 3.0)  # the old turn's own wait, not the new one's
+        self.assertIsNotNone(turn)
 
 
 class TestTransitionRunsQuickerEndpointing(R1TestCase):
@@ -3985,8 +4485,10 @@ class TestCandidateRowCoalescing(R1TestCase):
         self.assertEqual([r["text"] for r in self.writer.saved], ["said just before dropping"])
 
     async def test_words_the_sdk_banked_are_part_of_the_committed_row(self) -> None:
-        # "Sorry" and "Thank you." were refused over a pending reply and banked; the next
-        # committed turn carries them, and so does the one row.
+        # The SDK banks the words it refuses and judges the next final together with them, so
+        # "Sorry" + "Thank you." is already a committed turn of three words (and that commit cuts
+        # a pending reply: TestBackchannelsOverAPendingReply).  Whatever turn commits carries
+        # every banked word, and so does its one row.
         for fragment in ("Sorry", "Thank you.", "Hey, are you there?"):
             self.final_transcript(fragment)
         await self.commit_turn("Sorry Thank you. Hey, are you there?")
@@ -4950,13 +5452,53 @@ class TestReadyButton(R1TestCase):
             with self.subTest(variant=type(variant).__name__):
                 self.assertTrue(r1_session.ready_payload_ok(variant))
 
-    async def test_another_topic_is_ignored_without_a_trace(self) -> None:
+    async def test_another_topic_is_never_the_button_and_leaves_one_line_while_awaited(self) -> None:
+        # Another topic is none of our business.  While the button is awaited, the FIRST message of
+        # another topic is logged once (a closed label for the topic, nothing of the payload): the
+        # relay has only run against fakes, and a topic the real SFU changed would otherwise be
+        # invisible.
+        await self.start_transition()
+        topics = (None, "", "lk.chat", "R1READY", "r1ready ", "r1.ready", "ready")
+        with self.capture_logs() as logs:
+            for topic in topics:
+                self.press(topic=topic)
+        self.assertFalse(self.interview._ready_latched)
+        self.assertEqual(error_types(logs), ["r1_data_ignored"])
+        self.assertEqual(logs[0]["error_category"], "topic")
+        self.assertEqual(logs[0]["schema"], "none")  # the first one had no topic at all
+        self.assertEqual(logs[0]["phase"], "transition")
+        self.assertNotIn("data", logs[0])
+        self.assertTrue(self.interview._awaiting_ready)  # and the real button still works
+        self.press()
+        self.assertTrue(self.interview._ready_latched)
+
+    def test_the_topic_label_is_a_closed_vocabulary_never_the_topic(self) -> None:
+        label = r1_session.topic_label
+        for topic, expected in (
+            (None, "none"), ("", "none"), (12, "none"), (b"r1ready", "none"),
+            ("R1READY", "spelling"), ("r1.ready", "spelling"), ("r1ready ", "spelling"),
+            ("R1_Ready", "spelling"),
+            ("lk.chat", "livekit"), ("lk.transcription", "livekit"),
+            ("ready", "other"), ("r1ready2", "other"), ("candidate.secret.name", "other"),
+        ):
+            with self.subTest(topic=topic):
+                self.assertEqual(label(topic), expected)
+        self.assertEqual(label("r1ready"), "spelling")  # only logged when it was rejected anyway
+
+    async def test_a_misspelt_topic_is_labelled_so_a_mismatch_on_the_sfu_can_be_diagnosed(
+        self,
+    ) -> None:
         await self.start_transition()
         with self.capture_logs() as logs:
-            for topic in (None, "", "lk.chat", "R1READY", "r1ready ", "r1.ready", "ready"):
-                self.press(topic=topic)
+            self.press(topic="R1Ready")
+        self.assertEqual(logs[0]["schema"], "spelling")
+        self.assertNotIn("R1Ready", json.dumps(logs))
+
+    async def test_another_topic_is_silent_when_the_button_is_not_awaited(self) -> None:
+        with self.capture_logs() as logs:  # the icebreaker: nobody asked for a press
+            self.press(topic="lk.chat")
+            self.press(topic=None)
         self.assertEqual(logs, [])
-        self.assertFalse(self.interview._ready_latched)
 
     async def test_it_is_accepted_only_in_the_transition(self) -> None:
         def roleplay() -> None:

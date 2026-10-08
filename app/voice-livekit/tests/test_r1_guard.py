@@ -641,12 +641,24 @@ class NoFeedbackIsTerminalTests(unittest.TestCase):
         result = guard_text(text, ctx("icebreaker"))
         self.assertEqual(result.text, text)
 
-    def test_the_refusal_is_one_sentence_that_names_the_hiring_team_once(self):
+    def test_the_refusal_is_one_short_sentence_that_leaves_the_hiring_team_to_the_close(self):
+        from r1_script import LINES
         from r1_text import split_sentences
 
         self.assertEqual(len(split_sentences(NO_FEEDBACK_LINE)), 1)
-        self.assertEqual(NO_FEEDBACK_LINE.lower().count("hiring team"), 1)
-        self.assertLessEqual(len(NO_FEEDBACK_LINE.split()), 22)
+        self.assertLessEqual(len(NO_FEEDBACK_LINE.split()), 14)
+        # The owner heard "the hiring team will review your interview" in the refusal AND in
+        # L-CLOSE a few seconds later: the close is the one place it is said.
+        self.assertNotIn("hiring team", NO_FEEDBACK_LINE.lower())
+        self.assertEqual(LINES["L-CLOSE"].lower().count("hiring team"), 1)
+
+    def test_a_feedback_request_hears_the_hiring_team_once_in_the_whole_wrapup(self):
+        from r1_script import LINES
+
+        wrapup = " ".join(
+            [LINES["L-WRAP"], NO_FEEDBACK_LINE, LINES["L-CLOSE"]]
+        ).lower()
+        self.assertEqual(wrapup.count("hiring team"), 1)
 
 
 class LedgerTests(unittest.TestCase):
