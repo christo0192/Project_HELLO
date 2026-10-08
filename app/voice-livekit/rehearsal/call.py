@@ -39,7 +39,6 @@ from rehearsal.llm import (
     BudgetExceeded,
     InsufficientBalance,
     Ledger,
-    ProviderError,
     RecordingProvider,
     Scrubber,
     describe_error,

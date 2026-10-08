@@ -31,7 +31,7 @@ agreement.  That needs a funded key and is the first live job once the account i
 from __future__ import annotations
 
 import json
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping
 
 from rehearsal.advisor import deck_brief
 from rehearsal.metrics import mean

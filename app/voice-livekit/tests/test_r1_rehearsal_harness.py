@@ -29,7 +29,6 @@ from rehearsal import advisor, clock, judge, llm, metrics, run, scorecard
 from rehearsal import scripted_advisor as sa
 from rehearsal import scripted_learner as sl
 from rehearsal.call import CallDeps, CallSpec, run_call
-from r1_commitment import Level
 from r1_guard import FALLBACK_REPLIES, GuardContext, guard_text
 from r1_negotiation import COUNTERS, SPECS, filled_markers
 from r1_personas import PERSONAS, deep_need_topics_in, detect_followup, detect_probes, resolve_persona
