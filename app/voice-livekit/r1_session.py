@@ -623,7 +623,12 @@ def is_no_questions(text: str) -> bool:
 # what the candidate came to say.  Only courtesy words can end a refusal (``_COURTESY_WORDS``), so
 # these are the courtesy words that lead into something.
 _LEAD_IN_WORDS = frozenset(
-    {"so", "and", "well", "um", "uh", "oh", "hmm", "hm", "mm", "mhm"}
+    {
+        "so", "and", "well", "um", "uh", "oh", "hmm", "hm", "mm", "mhm",
+        # A courtesy word that cannot end a sentence either: "Okay, I think ...", "Thank you
+        # for ...", "Alright, I ...".  "think" is the one that opened a refusal's 3 s window.
+        "i", "think", "for", "your", "my", "from", "a",
+    }
 )
 
 
@@ -635,7 +640,8 @@ def wrapup_settle_seconds(text: str) -> float:
     So the window depends on how final the words sound: an explicit refusal ("No questions.",
     "That's all.") keeps ``WRAPUP_SETTLE_SECONDS``; one made of acknowledgements alone
     ("Alright.", "Thank you.") waits ``WRAPUP_SETTLE_ACK_FACTOR`` times that (3 s); and one that
-    stops on a lead-in ("Okay, so") ``WRAPUP_SETTLE_LEAD_IN_FACTOR`` times (3.75 s).  The cost of
+    stops on a lead-in ("Okay, so", "Okay, I think", "Thank you for") ``WRAPUP_SETTLE_LEAD_IN_FACTOR``
+    times (3.75 s).  The cost of
     waiting is a second or two before the closing line; the cost of not waiting is the closing
     line spoken, uninterruptibly, over the candidate's question.
     """
@@ -666,9 +672,61 @@ _BACKCHANNEL_WORDS = frozenset(
 )
 
 
+# A request to hear it again, or a check that the line works: "Sorry, can you repeat that?", "What
+# did you say?", "I didn't catch that.", "Yes, I can hear you.", "Can you hear me?".  Such a turn
+# answers nothing, and it is the one turn the interviewer must REPEAT its question for, so it never
+# counts as an icebreaker answer: counted as the fourth, it would hand the candidate the
+# uninterruptible transition line instead of the question they asked to hear again.  The phrases
+# are matched on folded text and only the phrase is cut out: whatever else the turn says still
+# counts ("Sorry, can you repeat that? I sell courses to working professionals" is an answer).
+# Each phrase needs its modal, its object or its "again", so a real answer's "I say ...", "we ask
+# ...", "I couldn't get a job" is left whole.
+_REPEAT_OBJECT = (
+    r"(?: that| it| this| you| what you (?:said|asked)| the (?:last |whole )?(?:question|part|bit)"
+    r"| your (?:last )?question)"
+)
+_AGAIN = r"(?: again| once more| one more time)"
+_CLARIFICATION_RE = re.compile(
+    r"\b(?:"
+    # "Can/could you (please) repeat/say/rephrase/explain/clarify (that) (again) (please)"
+    r"(?:can|could|would|will) you (?:please |just |kindly )?"
+    r"(?:repeat|rephrase|say|ask|clarify|explain|go over)" + _REPEAT_OBJECT + r"?" + _AGAIN + r"?"
+    r"(?: please)?|"
+    # "Please repeat (that)", "Repeat the question", "Say that again", "Ask me once more"
+    r"please (?:repeat|rephrase|say|clarify)" + _REPEAT_OBJECT + r"?" + _AGAIN + r"?|"
+    r"(?:repeat|rephrase)" + _REPEAT_OBJECT + _AGAIN + r"?(?: please)?|"
+    r"(?:say|ask)" + _REPEAT_OBJECT + r"?" + _AGAIN + r"(?: please)?|"
+    # "What did you say/ask/mean?", "What was that / the question?", "What does that mean?"
+    r"what (?:did|do) you (?:say|ask|mean)|what (?:was|is) (?:that|the question|your question)|"
+    r"what does (?:that|this|it) mean|"
+    # "I didn't catch/hear (that)", "I couldn't get/understand/follow the question", "I missed it"
+    r"(?:i|we) (?:did not|didn't|didnt|could not|couldn't|couldnt|can not|cannot|can't|cant)"
+    r"(?: quite| really| properly| clearly| fully)? (?:catch|hear)" + _REPEAT_OBJECT + r"?|"
+    r"(?:i|we) (?:did not|didn't|didnt|could not|couldn't|couldnt|can not|cannot|can't|cant)"
+    r"(?: quite| really| properly| clearly| fully)? (?:get|understand|follow)" + _REPEAT_OBJECT + r"|"
+    r"(?:i|we) (?:missed|lost)" + _REPEAT_OBJECT + r"|"
+    # Audio checks: "Can you hear me?", "Yes, I can hear you.", "You are breaking up.", "Speak up."
+    r"(?:can|could) you (?:hear|see) me(?: now| ok| okay| clearly| properly| well)?|"
+    r"(?:i|we) (?:can|could) (?:hear|see) you"
+    r"(?: now| ok| okay| fine| clearly| properly| well| loud and clear)?|"
+    r"(?:you(?:'re| are)|your (?:voice|audio|mic|microphone|sound) (?:is|was)) "
+    r"(?:breaking up|cutting (?:out|off)|muted|very low|too low|too quiet|not (?:audible|clear)|"
+    r"muffled|echoing)|"
+    r"(?:(?:can|could|would) you (?:please )?)?speak(?: a (?:little )?bit| a little)? "
+    r"(?:up|louder|slower|more (?:slowly|clearly|loudly))(?: please)?"
+    r")\b"
+)
+
+
 def content_word_count(text: str) -> int:
-    """How many words of ``text`` are not backchannel (``_BACKCHANNEL_WORDS``), on folded text."""
-    return sum(1 for word in fold_speech(text).split() if word not in _BACKCHANNEL_WORDS)
+    """How many words of ``text`` answer something, on folded text.
+
+    Words of a request to repeat or of an audio check (``_CLARIFICATION_RE``) and backchannel words
+    (``_BACKCHANNEL_WORDS``) are left out, so "Sorry, can you repeat that?" and "Yes, I can hear
+    you" count 0 while "Sorry, I sell courses" counts 3.
+    """
+    folded = _CLARIFICATION_RE.sub(" ", fold_speech(text))
+    return sum(1 for word in folded.split() if word not in _BACKCHANNEL_WORDS)
 
 
 def is_backchannel_turn(text: str) -> bool:
@@ -2175,7 +2233,10 @@ class R1Interview:
         with ``ICEBREAKER_ANSWER_MIN_WORDS`` words that are not backchannel.  The SDK's own floor
         (``min_words``) is not enough: it banks "Sorry" and commits it with the next "Thank you."
         as one turn of three words, and "Hey, are you there?" is four, and none of them answers
-        the question.  An early answer spoken over the opening line still counts, as it did.
+        the question.  Nor does a request to hear the question again ("Sorry, can you repeat
+        that?", "Yes, I can hear you"): that turn is the one the interviewer must answer by
+        repeating, not by moving on.  An early answer spoken over the opening line still counts,
+        as it did.
         """
         if self.machine.phase not in (R1Phase.OPENING, R1Phase.ICEBREAKER):
             return

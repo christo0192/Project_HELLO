@@ -1604,6 +1604,83 @@ class TestReplyPolicy(R1TestCase):
                 self.assertFalse(await self.answer(noise))
                 self.assertEqual(self.interview.machine.candidate_turns, 0)
 
+    # Requests to hear the question again, and audio checks.  Each is three words or more, so the
+    # SDK commits it as a turn, and none of them answers the question.
+    CLARIFICATIONS = (
+        "Sorry, can you repeat that?",
+        "What did you say?",
+        "Yes, I can hear you",
+        "Sorry, I didn't catch that.",
+        "Could you say that again, please?",
+        "Can you hear me?",
+        "Please repeat the question",
+        "Sorry, what was the question again?",
+        "I didn't get the question",
+        "Sorry I couldn't hear you",
+        "You are breaking up",
+        "Can you speak a bit louder",
+        "Pardon, could you repeat what you said?",
+        "What do you mean?",
+        "Can you rephrase that?",
+        "Sorry I missed the last part",
+        "Hello, can you hear me now?",
+    )
+
+    async def test_a_request_to_repeat_or_an_audio_check_is_not_an_answer(self) -> None:
+        for clarification in self.CLARIFICATIONS:
+            with self.subTest(clarification=clarification):
+                self.assertGreaterEqual(r1_session.count_words(clarification), 3)  # the SDK commits it
+                self.assertEqual(r1_session.content_word_count(clarification), 0)
+                self.assertFalse(await self.answer(clarification))  # the model repeats the question
+                self.assertEqual(self.interview.machine.candidate_turns, 0)
+
+    async def test_an_answer_after_a_request_to_repeat_is_still_an_answer(self) -> None:
+        for answer_text in (
+            "Sorry, can you repeat that? I sell courses to working professionals.",
+            "Yes, I can hear you, I sell courses online",
+            "Can you repeat that? I work in sales for three years",
+        ):
+            with self.subTest(answer=answer_text):
+                before = self.interview.machine.candidate_turns
+                self.assertFalse(await self.answer(answer_text))
+                self.assertEqual(self.interview.machine.candidate_turns, before + 1)
+
+    def test_the_words_of_a_real_answer_are_not_cut_as_a_clarification(self) -> None:
+        # The phrases are cut out of the turn, never matched loosely: an answer that merely uses
+        # the same verbs ("say", "ask", "repeat", "hear", "get", "understand") is left whole.
+        for text, words in (
+            ("I couldn't get a job at first", 7),
+            ("I say what I think to every learner", 8),
+            ("We ask learners about their goals", 6),
+            ("I explain the program to the learners", 7),
+            ("I can hear the objection coming from a mile away", 10),
+            ("I repeat the same process every day", 7),
+            ("I understand what customers want", 5),
+            ("I sell courses", 3),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(r1_session.content_word_count(text), words)
+
+    async def test_a_request_to_repeat_at_the_boundary_gets_the_question_repeated(self) -> None:
+        # S >= 3:30 and three answers in: the next committed answer is the boundary, and the
+        # transition line (uninterruptible) answers it.  "Sorry, can you repeat that?" is not an
+        # answer, so the model repeats the question; only a real fourth answer ends the phase.
+        self.clock.advance(215)
+        for answer in ("I sell courses", "mostly by phone", "for three years"):
+            self.assertFalse(await self.answer(answer))
+        self.assertEqual(self.interview.machine.candidate_turns, 3)
+        for clarification in ("Sorry, can you repeat that?", "Yes, I can hear you"):
+            with self.subTest(clarification=clarification):
+                self.final_transcript(clarification)
+                await self.hook(clarification)  # no StopResponse: the SDK generates the reply
+                self.assertEqual(self.interview.machine.candidate_turns, 3)
+                self.assertFalse(self.interview.machine.icebreaker_should_end())
+                self.assertFalse(self.interview._icebreaker_boundary_turn)
+        self.final_transcript("and I enjoy it")
+        with self.assertRaises(r1_session.StopResponse):
+            await self.hook("and I enjoy it")  # the real fourth answer is the boundary
+        self.assertTrue(self.interview._icebreaker_boundary_turn)
+
     async def test_the_real_answers_of_the_owner_session_are_counted(self) -> None:
         for answer_text in (
             "Yeah, so my name is Cristo. I have around 11 years of experience.",
@@ -2032,10 +2109,23 @@ class TestPhaseDriver(R1TestCase):
                 self.assertEqual(r1_session.wrapup_settle_seconds(text), plain * 2.0)
         for text in (
             "Okay, so", "Okay, so...", "Thank you, and", "Alright, um", "Okay. Well", "No questions, uh",
+            # A courtesy word that cannot end a sentence: the candidate is about to say the rest.
+            "Okay, I think", "Okay, I think...", "Okay, I", "Thank you for", "Thanks for your",
+            "Alright, from my", "Okay, a",
         ):
             with self.subTest(lead_in=text):
                 self.assertTrue(is_no_questions(text))
                 self.assertEqual(r1_session.wrapup_settle_seconds(text), plain * 2.5)
+        # ... while the same words, finished, keep the window of what they say.
+        for text, factor in (
+            ("Okay, I think I'm good.", 1.0),
+            ("Okay, I think that's all.", 1.0),
+            ("Thank you for your time.", 2.0),
+            ("Thanks for your time, no questions.", 1.0),
+        ):
+            with self.subTest(finished=text):
+                self.assertTrue(is_no_questions(text))
+                self.assertEqual(r1_session.wrapup_settle_seconds(text), plain * factor)
         self.assertEqual((plain, plain * 2.0, plain * 2.5), (1.5, 3.0, 3.75))
 
     def spy_on_waits(self) -> list[float]:
@@ -2060,6 +2150,8 @@ class TestPhaseDriver(R1TestCase):
             ("Okay.", 2.0),
             ("Okay, so", 2.5),
             ("Thank you, and", 2.5),
+            ("Okay, I think", 2.5),
+            ("Thank you for", 2.5),
         ):
             with self.subTest(text=text):
                 await self.asyncSetUp()
@@ -2093,6 +2185,31 @@ class TestPhaseDriver(R1TestCase):
                 self.assertFalse(task.done())
                 self.assertEqual(waits[-1], 10.0)  # not the plain 4.0
                 self.final_transcript("what are the next steps")
+                await self.settle()
+                self.assertFalse(task.done())  # ONE question: the wrap-up is still open
+                settled.assert_not_awaited()
+                self.final_transcript("and who is on the team?")
+                self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        settled.assert_awaited_once()
+
+    async def test_okay_i_think_and_a_pause_does_not_end_the_wrapup_over_the_question_that_follows(
+        self,
+    ) -> None:
+        # The same race as "Okay, so": "I think" is a courtesy word, so "Okay, I think" read as a
+        # refusal and only got the 3 s window of a bare "Okay".  It stops on a lead-in now: 3.75 s,
+        # and the sentence that follows is joined to it and judged as a question.
+        self.enter_wrapup()
+        settled = mock.AsyncMock()  # reached only once TWO questions have been counted
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 4.0):  # lead-in: 10 s
+            waits = self.spy_on_waits()
+            with mock.patch.object(self.interview, "_wait_reply_settled", settled):
+                task = asyncio.create_task(self.interview._run_wrapup())
+                await self.settle()
+                self.final_transcript("Okay, I think")
+                await self.settle()
+                self.assertFalse(task.done())
+                self.assertEqual(waits[-1], 10.0)  # not the 8.0 of an acknowledgement
+                self.final_transcript("I have one about the next steps")
                 await self.settle()
                 self.assertFalse(task.done())  # ONE question: the wrap-up is still open
                 settled.assert_not_awaited()

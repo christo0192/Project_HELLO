@@ -1301,7 +1301,12 @@ the latency work above (PR-4c) and on the filler, not on `min_words` alone. At t
   are not backchannel** (`content_word_count`: apology, thanks, greeting, "are you there", hesitation and
   acknowledgement words such as sorry, thank you, hello, hey, hmm, okay, right, sure are left out): one
   long answer used to count as several turns, and "Sorry", then "Thank you.", then "Hey, are you
-  there?" as three more (the SDK commits them as turns of three and four words). The driver no longer
+  there?" as three more (the SDK commits them as turns of three and four words). A request to hear the
+  question again or an audio check ("Sorry, can you repeat that?", "What did you say?", "I didn't catch
+  that.", "Yes, I can hear you.", `_CLARIFICATION_RE`) is not an answer either, so it can never be the
+  fourth answer that hands the candidate the transition line instead of the question they asked to hear
+  again; the phrase is cut out of the turn and anything else the turn says still counts ("Can you repeat
+  that? I work in sales" is an answer). The driver no longer
   leaves the icebreaker at a raw final (the transition line is uninterruptible, so that talked over a
   candidate who was mid-answer): the turn the SDK commits next is suppressed and answered by the
   transition line. Both ways out of the phase, the suppressed boundary turn and the hard S=4:30 cap, wait
@@ -1363,7 +1368,7 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   how final it sounds (`wrapup_settle_seconds`): an explicit "No questions." / "That's all." / "I'm good."
   1.5 s (`WRAPUP_SETTLE_SECONDS`, as before); a refusal made only of acknowledgements ("Alright.", "Thank
   you.", "Okay, got it.") twice that, 3 s; one that stops on a lead-in word ("Okay, so", "Thank you, and",
-  a trailing "um") 2.5 times, 3.75 s. Any further final in the window is joined to the turn and judged
+  "Okay, I think", "Thank you for", a trailing "um") 2.5 times, 3.75 s. Any further final in the window is joined to the turn and judged
   with it. The price is up to 2.25 s more before the closing line for a candidate who only said "Okay".
 * **The feedback refusal ends the reply.** When the guard swaps a feedback sentence for `L-NO-FEEDBACK`,
   nothing the model says after it is spoken (the owner heard "the hiring team" twice in one turn).
