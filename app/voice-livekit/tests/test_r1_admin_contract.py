@@ -21,12 +21,18 @@ This module is the crossing:
 * When the API sources are in the checkout, the mirrored key set is compared with what the
   TypeScript actually reads, so a change on either side fails here instead of in production.
 
-What is deliberately NOT worker-side (and is therefore listed, not hidden):
+Two gate failures used to be listed here as "not the worker's" and are gone:
 
-* ``push_missing:f1``: F1 is anchor + counter in the plan (no F1 push line exists), but the
-  API gate requires an F1 push.  That rule is the API's to change (PR-B).
-* ``latency_unknown``: the worker does not measure first-audio latency yet (PR-4c), so
-  ``session_facts.first_audio_p95_ms`` is sent as an explicit null.
+* ``push_missing:f1``: F1 is anchor + counter in the plan (no F1 push line exists).  The API
+  gate stopped requiring an F1 push (#364: only F2-F4 have one), ``gate_like_api`` mirrors that
+  and ``TestMirrorMatchesTheTypeScript`` pins the F2-F4 set.
+* ``latency_unknown``: the worker now measures first-audio latency (the PR-4c tracker) and
+  posts ``session_facts.first_audio_p95_ms``: the nearest-rank p95 of the role-play turns in
+  milliseconds, or an explicit null when fewer than 8 of them were measured.
+
+So a worker-complete session leaves the administration part of the gate with NO failure.  The
+four communication facts the worker does not measure yet (``talk_share_pct``, ``barge_in_count``,
+``question_count``, ``interruption_count``) are sent as null; the gate does not read them.
 """
 from __future__ import annotations
 
@@ -52,10 +58,12 @@ from r1_replies import (
     session_facts_event,
 )
 from tests.test_r1_core import (
+    capture_r1_logs,
     setUpModule,  # noqa: F401 - unittest runs it: silences the loggers' stdout
     tearDownModule,  # noqa: F401
 )
-from tests.test_r1_integration import fidelity_session
+from tests.test_r1_integration import Rig, fidelity_session
+from tests.test_r1_roleplay import cooperative_script
 
 API_ADMIN_LOG = HERE.parent / "api" / "src" / "lib" / "r1" / "admin-log.ts"
 API_ROUTES = HERE.parent / "api" / "src" / "routes" / "r1.ts"
@@ -104,9 +112,8 @@ MIN_ROLEPLAY_SECONDS = 600
 MAX_FAMILY_SLIP_SECONDS = 60
 GUARD_HITS_FAIL_AT = 3
 MAX_FIRST_AUDIO_P95_MS = 3000
-
-# The failures a worker-complete log still has, each owned by someone else (see the docstring).
-KNOWN_OPEN_GATE_FAILURES = frozenset({"push_missing:f1", "latency_unknown"})
+# gate.ts R1_FAMILIES_WITH_PUSH: F1's second move is the counter, so it has no push line.
+API_FAMILIES_WITH_PUSH = ("F2", "F3", "F4")
 
 
 # ------------------------------------------------------------ a port of the API's reads
@@ -204,11 +211,12 @@ def gate_like_api(log):
         failures.append("roleplay_too_short")
     for family in API_FAMILIES:
         entry, name = log["families"][family], family.lower()
+        has_push = family in API_FAMILIES_WITH_PUSH
         if entry["primary"] is None:
             failures.append(f"family_missing:{name}")
-        if entry["push"] is None:
+        if has_push and entry["push"] is None:
             failures.append(f"push_missing:{name}")
-        for delivery in (entry["primary"], entry["push"]):
+        for delivery in (entry["primary"], entry["push"]) if has_push else (entry["primary"],):
             if delivery is None:
                 continue
             if delivery["slip_seconds"] is None:
@@ -294,7 +302,7 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
         for family in API_FAMILIES:
             self.assertIsNotNone(log["families"][family]["primary"], family)
             self.assertIsNotNone(log["families"][family]["primary"]["slip_seconds"], family)
-        for family in ("F2", "F3", "F4"):
+        for family in API_FAMILIES_WITH_PUSH:
             self.assertIsNotNone(log["families"][family]["push"]["slip_seconds"], family)
         self.assertIsNotNone(log["counter"]["slip_seconds"])
         # Discounts: an amount (not "amount not reported").
@@ -311,14 +319,13 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
             log["facts"]["roleplay_seconds"], rig.machine.roleplay_elapsed, delta=0.1
         )
 
-    async def test_the_gate_is_left_with_exactly_the_failures_that_are_not_the_workers(self):
+    async def test_a_worker_complete_session_leaves_the_gate_no_administration_failure(self):
         _, rows = await self.session_rows()
-        failures = set(gate_like_api(parse_like_api(rows)))
         self.assertEqual(
-            failures,
-            KNOWN_OPEN_GATE_FAILURES,
-            "a worker-side contract failure is back (the gate reads unknowns again), or one of "
-            "the two API/PR-4c-owned gaps was closed: update KNOWN_OPEN_GATE_FAILURES",
+            gate_like_api(parse_like_api(rows)),
+            [],
+            "a worker-side contract failure is back: the gate reads an unknown (or a slow "
+            "first-audio p95) where a complete session should have measured values",
         )
 
     async def test_the_guard_trip_of_the_session_is_a_known_kind(self):
@@ -327,6 +334,33 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(hits)
         for row in hits:
             self.assertIn(row["payload"]["kind"], API_GUARD_KINDS)
+
+
+def role_play_p95_ms(lines):
+    """The expected ``first_audio_p95_ms``, read back from the ``r1_latency`` log lines.
+
+    An independent computation: the nearest-rank p95 of the role-play ``eou_to_first_audio``
+    values a session logged, in whole milliseconds (None below the gate's 8 turns).
+    """
+    values = sorted(
+        line["duration_sec"]
+        for line in lines
+        if line.get("error_type") == "r1_latency"
+        and line.get("schema") == "eou_to_first_audio"
+        and line.get("phase") == "roleplay"
+    )
+    if len(values) < 8:
+        return None
+    return int(round(values[math.ceil(0.95 * len(values)) - 1] * 1000))
+
+
+async def facts_of(rig):
+    """Post a rig's fidelity rows and return the one ``session_facts`` payload."""
+    rig.interview._begin_exit()
+    rig.interview._queue_fidelity()
+    await rig.flush()
+    (facts,) = [e for e in posted(rig.writer.admin_events) if e["event_type"] == "session_facts"]
+    return facts["payload"]
 
 
 class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
@@ -352,9 +386,81 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         # user-speaking events, so no turn length was ever measured: null, not a fake 0.0 s.
         self.assertIsNotNone(payload["roleplay_seconds"])
         self.assertIsNone(payload["longest_monologue_seconds"])
-        self.assertIsNone(payload["first_audio_p95_ms"])  # PR-4c: the gate says latency_unknown
+        # PR-4c: the role-play p95 of end of speech to first audio, whole milliseconds.
+        self.assertIsInstance(payload["first_audio_p95_ms"], int)
+        self.assertGreater(payload["first_audio_p95_ms"], 0)
         self.assertEqual(facts[0]["turn_index"], None)
         self.assertEqual(facts[0]["family_id"], None)
+
+    async def test_first_audio_p95_is_the_role_play_p95_of_the_logged_headline_in_ms(self):
+        with capture_r1_logs() as lines:
+            rig = await fidelity_session()
+            payload = await facts_of(rig)
+        expected = role_play_p95_ms(lines)
+        self.assertIsNotNone(expected)
+        self.assertEqual(payload["first_audio_p95_ms"], expected)
+        # The session's one slow reply (2.2 s) is its tail; the typical reply is faster.
+        self.assertEqual(expected, 2200)
+        rows = [e for e in rig.writer.admin_events if e["event_type"] == "session_facts"]
+        self.assertEqual(len(rows), 1)
+
+    async def test_the_p95_is_logged_beside_the_posted_value(self):
+        with capture_r1_logs() as lines:
+            rig = await fidelity_session()
+            payload = await facts_of(rig)
+        (gate_line,) = [
+            line for line in lines
+            if line.get("error_type") == "r1_latency" and line.get("schema") == "first_audio_p95"
+            and line.get("error_category") == "gate"
+        ]
+        self.assertEqual(gate_line["phase"], "roleplay")
+        self.assertEqual(gate_line["duration_sec"], payload["first_audio_p95_ms"] / 1000)
+        self.assertGreaterEqual(gate_line["option_count"], 8)
+        (every_phase,) = [
+            line for line in lines
+            if line.get("schema") == "first_audio_p95" and line.get("error_category") == "all_phases"
+        ]
+        self.assertEqual(every_phase["phase"], "all")
+
+    async def test_too_few_measured_turns_post_null_and_the_gate_says_latency_unknown(self):
+        rig = Rig()
+        await rig.start_roleplay()
+        for text in cooperative_script()[:7]:
+            await rig.converse(text, advance=20, first_audio_after=1.0)
+        payload = await facts_of(rig)
+        self.assertIsNone(payload["first_audio_p95_ms"])
+        rows = posted(rig.writer.admin_events)
+        self.assertIn("latency_unknown", gate_like_api(parse_like_api(rows)))
+
+    async def test_a_session_without_any_audio_event_posts_null_not_zero(self):
+        rig = Rig()
+        await rig.start_roleplay()
+        for text in cooperative_script()[:10]:
+            await rig.converse(text, advance=20)  # the rig emits no agent_state_changed
+        payload = await facts_of(rig)
+        self.assertIsNone(payload["first_audio_p95_ms"])
+
+    async def test_a_slow_session_posts_its_number_and_the_gate_says_p95_exceeded(self):
+        rig = Rig()
+        await rig.start_roleplay()
+        for text in cooperative_script()[:9]:
+            await rig.converse(text, advance=20, first_audio_after=3.5)
+        payload = await facts_of(rig)
+        self.assertEqual(payload["first_audio_p95_ms"], 3500)
+        failures = gate_like_api(parse_like_api(posted(rig.writer.admin_events)))
+        self.assertIn("latency_p95_exceeded", failures)
+        self.assertNotIn("latency_unknown", failures)
+
+    async def test_only_role_play_turns_feed_the_posted_p95(self):
+        rig = Rig()
+        # The icebreaker's turns are slow; they are the interviewer's, not the learner's.
+        for text in ("Hi, I am Asha, I work in logistics.", "I like cricket and cooking."):
+            await rig.converse(text, advance=10, first_audio_after=9.0)
+        await rig.start_roleplay()
+        for text in cooperative_script()[:9]:
+            await rig.converse(text, advance=20, first_audio_after=1.0)
+        payload = await facts_of(rig)
+        self.assertEqual(payload["first_audio_p95_ms"], 1000)
 
     async def test_the_role_play_clock_is_the_role_plays_not_the_sessions(self):
         rig = await fidelity_session()
@@ -380,6 +486,37 @@ class TestSessionFacts(unittest.IsolatedAsyncioTestCase):
         )["payload"]
         self.assertEqual(payload["longest_monologue_seconds"], 41.5)
         self.assertEqual(payload["roleplay_seconds"], 700.0)
+
+    def test_the_first_audio_p95_is_passed_through_only_when_it_is_a_real_measurement(self):
+        def sent(value):
+            return session_facts_event(None, {}, roleplay_seconds=700.0, first_audio_p95_ms=value)[
+                "payload"
+            ]["first_audio_p95_ms"]
+
+        self.assertIsNone(session_facts_event(None, {}, roleplay_seconds=700.0)["payload"][
+            "first_audio_p95_ms"])  # the default is unknown
+        for bad in (None, True, False, -1, -0.5, float("nan"), float("inf"), "1200", [1200]):
+            with self.subTest(value=bad):
+                self.assertIsNone(sent(bad))
+        for good in (0, 1200, 2999.5, 3001):
+            with self.subTest(value=good):
+                self.assertEqual(sent(good), good)
+
+    async def test_a_failing_p95_computation_costs_only_that_one_fact(self):
+        rig = await fidelity_session()
+
+        def broken(*_args, **_kwargs):
+            raise RuntimeError("tracker broke")
+
+        rig.interview._latency.first_audio_p95_ms = broken
+        with capture_r1_logs() as lines:
+            payload = await facts_of(rig)
+        self.assertIsNone(payload["first_audio_p95_ms"])  # unknown fails the gate closed
+        self.assertIsNotNone(payload["roleplay_seconds"])
+        self.assertTrue(
+            [e for e in rig.writer.admin_events if e["event_type"] == "family_delivered"]
+        )  # the other rows still went out
+        self.assertIn("r1_first_audio_p95_failed", [line.get("error_type") for line in lines])
 
 
 # ------------------------------------------------------------------------- guard hits
@@ -466,6 +603,18 @@ class TestMirrorMatchesTheTypeScript(unittest.TestCase):
         block = re.search(r"ADMIN_LOG_EVENTS\s*=\s*\[(.*?)\]", text, re.DOTALL)
         self.assertIsNotNone(block)
         self.assertEqual(set(re.findall(r"'([a-z_]+)'", block.group(1))), set(API_EVENT_TYPES))
+
+    def test_the_families_with_a_push_are_the_mirrored_ones(self):
+        gate = API_ADMIN_LOG.with_name("gate.ts")
+        if not gate.is_file():
+            self.skipTest("gate.ts is not part of this checkout")
+        block = re.search(
+            r"R1_FAMILIES_WITH_PUSH[^=]*=\s*new Set<R1Family>\(\[(.*?)\]\)",
+            gate.read_text(encoding="utf-8"),
+            re.DOTALL,
+        )
+        self.assertIsNotNone(block)
+        self.assertEqual(tuple(re.findall(r"'(F[0-9])'", block.group(1))), API_FAMILIES_WITH_PUSH)
 
     def test_the_gate_limits_are_the_mirrored_ones(self):
         gate = API_ADMIN_LOG.with_name("gate.ts")

@@ -81,7 +81,13 @@ from observability import StructuredLogger
 from r1_content import CONTENT_SHA256
 from r1_context import fetch_context
 from r1_guard import FALLBACK_REPLY, StreamGuard
-from r1_latency import LatencyTracker, count_words, interrupt_min_words, r1_turn_handling
+from r1_latency import (
+    GATE_PHASE,
+    LatencyTracker,
+    count_words,
+    interrupt_min_words,
+    r1_turn_handling,
+)
 from r1_linecache import (
     LANE_R1,
     RATE_LIMITS,
@@ -313,13 +319,16 @@ _LIVE_PHASES = frozenset(
     }
 )
 
-# The scripted lines worth warming, in the order an interview first needs them (L-OPEN is spoken
-# at once and L-FILLER* travel inside a reply stream, so neither can use cached audio).
+# The scripted lines worth warming, in the order an interview first needs them.  Only a line that
+# reaches ``session.say`` can play cached audio, so three kinds are absent on purpose: L-OPEN
+# (spoken at once, before anything could be warm), the lines that travel inside a reply stream
+# (L-FILLER*, L-TIME-CUE, the guard's L-NO-FEEDBACK swap) and L-FAQ-DEFER (no runtime caller).
+# Warming them would spend Sarvam requests, a budget shared with the phone lane, on audio nothing
+# can play (pr4c-rebase.md 4.1).
 _WARM_ORDER = (
     "L-TRANSITION",
     "L-TRANSITION-NUDGE",
     "L-PICKUP",
-    "L-TIME-CUE",
     "L-EXIT",
     "L-WRAP",
     "L-CLOSE",
@@ -330,8 +339,6 @@ _WARM_ORDER = (
     "L-SIL-RP2",
     "L-REJOIN",
     "L-REJOIN-RP",
-    "L-FAQ-DEFER",
-    "L-NO-FEEDBACK",
     "L-SIL-END",
     "L-SYSTEM-STOP",
 )
@@ -1104,7 +1111,10 @@ class R1Interview:
                 # fact too.  ``roleplay_elapsed`` stops at the role-play's end, not the session's.
                 events.append(
                     session_facts_event(
-                        admin, pins, roleplay_seconds=self.machine.roleplay_elapsed
+                        admin,
+                        pins,
+                        roleplay_seconds=self.machine.roleplay_elapsed,
+                        first_audio_p95_ms=self._first_audio_p95_ms(),
                     )
                 )
         except Exception as exc:  # noqa: BLE001 - the record must never block the exit
@@ -1439,6 +1449,53 @@ class R1Interview:
             turn_index=turn_index,
             duration_sec=round(seconds, 3),
         )
+
+    def _first_audio_p95_ms(self) -> int | None:
+        """The number the plan 6.4 gate reads, and its log line (plan 5.15, pr4c-rebase.md 3.3).
+
+        End of speech to first audio, nearest-rank p95 over the ROLE-PLAY turns (the learner's
+        turns; the interviewer's icebreaker and wrap-up are not what the gate prices), in
+        milliseconds, or ``None`` when fewer than 8 of them were measured: unknown fails the
+        gate closed, which is right for a session that was barely measured.  The same number is
+        logged (``r1_latency`` schema ``first_audio_p95``, category ``gate``) with the count of
+        turns behind it, beside the all-phase figure (category ``all_phases``) for information, so
+        the Stage A report and the posted fact can be compared.  Logging never decides anything.
+        """
+        tracker = self._latency
+        try:
+            gate_ms = tracker.first_audio_p95_ms()
+            lines = (
+                (
+                    "gate" if gate_ms is not None else "unknown",
+                    GATE_PHASE,
+                    None if gate_ms is None else gate_ms / 1000.0,
+                    tracker.first_audio_samples(GATE_PHASE),
+                ),
+                (
+                    "all_phases",
+                    "all",
+                    tracker.first_audio_p95_seconds(None, min_samples=1),
+                    tracker.first_audio_samples(None),
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - a measurement must never cost the other facts
+            _log.warn(
+                "unknown_event",
+                error_type="r1_first_audio_p95_failed",
+                error_category=_error_type_of(exc),
+            )
+            return None
+        for category, phase, seconds, count in lines:
+            _log.info(
+                "unknown_event",
+                error_type="r1_latency",
+                schema="first_audio_p95",
+                error_category=category,
+                phase=phase,
+                duration_sec=None if seconds is None else round(seconds, 3),
+                option_count=count,
+            )
+        return gate_ms
 
     def _log_sdk_metrics(self, item: Any) -> None:
         """Log the SDK's own per-turn timings for a chat item, beside R1's stamps.

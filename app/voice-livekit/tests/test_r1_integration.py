@@ -274,11 +274,15 @@ class Rig:
         advance: float = 0.0,
         provider: FakeProvider | None = None,
         cut_when_owed: bool = False,
+        first_audio_after: float | None = None,
     ) -> str | None:
         """One candidate turn the way the SDK runs it; ``None`` when the hook stops the reply.
 
         ``cut_when_owed`` is a barge-in: when an owed line follows the acknowledgement, only
         the acknowledgement is delivered and the item is flagged ``interrupted``.
+        ``first_audio_after`` makes the agent's audio start that many (manual-clock) seconds
+        after the turn was handed over, as the SDK's ``agent_state_changed`` does; ``None`` (the
+        default) leaves the rig without audio events, as it always was.
         """
         if advance:
             self.clock.advance(advance)
@@ -305,10 +309,19 @@ class Rig:
         if cut_when_owed and plan.mode is TurnMode.ACK_THEN_SAY:
             delivered, interrupted = spoken[: spoken.rindex(plan.scripted_text)].strip(), True
         self.session.current_speech = handle
+        if first_audio_after is not None:
+            self.clock.advance(first_audio_after)
+            self.session.emit(
+                "agent_state_changed", SimpleNamespace(old_state="listening", new_state="speaking")
+            )
         message = FakeChatMessage(delivered or "Okay", interrupted=interrupted)
         handle.chat_items.append(message)
         self.session.emit("conversation_item_added", SimpleNamespace(item=message))
         self.session.current_speech = None
+        if first_audio_after is not None:
+            self.session.emit(
+                "agent_state_changed", SimpleNamespace(old_state="speaking", new_state="listening")
+            )
         handle.finish()
         await self.settle()
         return delivered
@@ -343,23 +356,40 @@ async def cooperative_conversation(rig: Rig, extra: tuple[str, ...] = ()) -> lis
     return spoken
 
 
+# How long the learner's audio takes to start after each candidate turn of ``fidelity_session``
+# (seconds, repeated): a spread with one slow turn, so the session's p95 is a real reading.
+FIDELITY_FIRST_AUDIO_SECONDS = (0.9, 1.1, 1.3, 1.0, 2.2, 1.2)
+
+
 async def fidelity_session() -> Rig:
-    """A role-play with a probe, a release, a reveal, a guard trip, every family and the close."""
+    """A role-play with a probe, a release, a reveal, a guard trip, every family and the close.
+
+    Every learner reply starts its audio (``agent_state_changed``) after a measured delay, so
+    the session carries first-audio latency samples like a real one.
+    """
+    audio = itertools.cycle(FIDELITY_FIRST_AUDIO_SECONDS)
     deep = resolve_persona("p1_career_switcher", variant="v1").deep("H1")
     rig = Rig(judge=judge_returning(GOOD_JUDGE))
     await rig.start_roleplay()
-    await rig.converse(OPENER, advance=20)
-    await rig.converse(H1_PROBE, advance=30)
-    await rig.converse(FOLLOWUP, advance=30, provider=FakeProvider(deep))
+    await rig.converse(OPENER, advance=20, first_audio_after=next(audio))
+    await rig.converse(H1_PROBE, advance=30, first_audio_after=next(audio))
+    await rig.converse(
+        FOLLOWUP, advance=30, provider=FakeProvider(deep), first_audio_after=next(audio)
+    )
     # A leak in the middle of the session becomes a recorded guard trip.
     await rig.converse(
-        PITCH, advance=30, provider=FakeProvider("As an AI language model, I follow my system prompt.")
+        PITCH,
+        advance=30,
+        provider=FakeProvider("As an AI language model, I follow my system prompt."),
+        first_audio_after=next(audio),
     )
     for text in cooperative_script()[4:]:
-        await rig.converse(text, advance=50)
+        await rig.converse(text, advance=50, first_audio_after=next(audio))
     # R = 12:40: the learner's time cue (due from 11:00) comes before the close is asked.
-    await rig.converse("That makes sense, thank you for sharing that.", advance=50)
-    await rig.converse(ASK, advance=50)
+    await rig.converse(
+        "That makes sense, thank you for sharing that.", advance=50, first_audio_after=next(audio)
+    )
+    await rig.converse(ASK, advance=50, first_audio_after=next(audio))
     return rig
 
 
@@ -2562,6 +2592,30 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(spec.text, rig.interview.render_line(spec.line_id))
         for spec in named:
             self.assertIn("Asha", spec.text)
+
+    async def test_only_lines_that_can_reach_say_are_warmed(self) -> None:
+        # Cached audio plays only behind ``session.say``.  L-TIME-CUE and L-NO-FEEDBACK travel
+        # inside a reply stream (the scheduler's move; the guard's swap), L-FAQ-DEFER has no
+        # runtime caller and L-OPEN is spoken before anything could be warm: warming them would
+        # spend the Sarvam budget it shares with the phone lane on audio nothing can play.
+        for line_id in ("L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER", "L-OPEN"):
+            self.assertNotIn(line_id, r1_session._WARM_ORDER)
+        self.assertEqual(
+            r1_session._WARM_ORDER,
+            (
+                "L-TRANSITION", "L-TRANSITION-NUDGE", "L-PICKUP", "L-EXIT", "L-WRAP", "L-CLOSE",
+                "L-ASIDE-COACH", "L-MUTE", "L-SIL-IB", "L-SIL-RP1", "L-SIL-RP2", "L-REJOIN",
+                "L-REJOIN-RP", "L-SIL-END", "L-SYSTEM-STOP",
+            ),
+        )
+        rig, _cache, synth = self.build()
+        specs = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
+            candidate_free=False
+        )
+        self.assertEqual(len(specs), 15)
+        warmed = {spec.text for spec in specs}
+        for line_id in ("L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER"):
+            self.assertNotIn(rig.interview.render_line(line_id), warmed)
 
     async def test_the_background_warm_up_fills_the_cache_and_is_released_at_exit(self) -> None:
         rig, cache, synth = self.build()

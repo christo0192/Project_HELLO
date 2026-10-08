@@ -20,6 +20,11 @@ it (``user_state_changed`` leaving ``speaking``).  That is the same anchor the p
 headline uses (``voice_phone_headline_latency``), so the two lanes read the same way.  When
 that event was missed the final transcript is used, and failing that the turn hook; the anchor
 kind travels with the turn so a reader can tell them apart.
+
+The tracker also keeps the headline values so the session can report one number to the API gate
+(plan 6.4, ``session_facts.first_audio_p95_ms``): the nearest-rank p95 of the role-play turns,
+in milliseconds, and ``None`` (unknown, which the gate fails closed on) when fewer than 8 role-play
+turns were measured.
 """
 from __future__ import annotations
 
@@ -28,6 +33,7 @@ import math
 import os
 import re
 import sys
+from collections import deque
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -134,6 +140,17 @@ Emit = Callable[..., None]
 # latency, and would poison a percentile.
 _MAX_SEGMENT_SEC = 600.0
 _MAX_PENDING_SAYS = 16
+# The headline samples kept for the session's p95.  A whole interview is a few dozen turns;
+# the bound only stops a runaway session from growing the list (the newest samples win).
+_MAX_HEADLINE_SAMPLES = 512
+# What the plan 6.4 gate reads (``session_facts.first_audio_p95_ms``): the learner's turns, i.e.
+# the role-play phase, and at least as many of them as the gate's own ``MIN_QUALIFYING_TURNS``.
+GATE_PHASE = "roleplay"
+GATE_MIN_SAMPLES = 8
+
+
+def _valid_segment(seconds: float) -> bool:
+    return math.isfinite(seconds) and 0.0 <= seconds <= _MAX_SEGMENT_SEC
 
 
 @dataclass
@@ -167,7 +184,8 @@ class LatencyTracker:
         To the first audio frame the TTS node produced, and its time from the first text.
     ``eou_to_first_audio``
         The headline: end of speech to the agent's audio starting.  Its category is the turn
-        kind (``llm_reply``, ``ack_then_say``, ``say_only`` or ``reply``).
+        kind (``llm_reply``, ``ack_then_say``, ``say_only`` or ``reply``).  Every valid value
+        is also kept, with its phase, for ``first_audio_p95_ms`` (see below).
     ``say_to_first_audio``
         A scripted line: from ``say`` to its audio starting, the line id as the category.
     """
@@ -180,6 +198,9 @@ class LatencyTracker:
         self._final_at: float | None = None
         self._turn: _Turn | None = None
         self._says: dict[str, tuple[float, str, str]] = {}
+        # (phase, seconds) of every headline ``eou_to_first_audio`` that passed the same
+        # validity test as a logged segment: the input of ``first_audio_p95_ms``.
+        self._headline: deque[tuple[str, float]] = deque(maxlen=_MAX_HEADLINE_SAMPLES)
 
     # ------------------------------------------------------------------ candidate side
 
@@ -244,11 +265,45 @@ class LatencyTracker:
             if "tts_first_text" in marks:
                 self._report("tts_ttfb", now - marks["tts_first_text"], turn)
         elif stage == "first_audio":
-            self._report("eou_to_first_audio", now - turn.anchor, turn)
+            seconds = now - turn.anchor
+            self._report("eou_to_first_audio", seconds, turn)
+            if _valid_segment(seconds):
+                self._headline.append((turn.phase, seconds))
 
     def first_audio(self) -> None:
         """The agent's audio for the open turn started playing."""
         self.mark("first_audio")
+
+    # ----------------------------------------------------------------- the session's p95
+
+    def first_audio_samples(self, phase: str | None = GATE_PHASE) -> int:
+        """How many headline turns the p95 of ``phase`` is built from (``None``: every phase)."""
+        return sum(1 for ph, _ in self._headline if phase is None or ph == phase)
+
+    def first_audio_p95_seconds(
+        self, phase: str | None = GATE_PHASE, *, min_samples: int = GATE_MIN_SAMPLES
+    ) -> float | None:
+        """The nearest-rank p95 of end of speech to first audio, in seconds.
+
+        ``None`` when fewer than ``min_samples`` turns of ``phase`` were measured (``None`` as
+        ``phase`` takes every phase, for information).  An unknown stays unknown: a session
+        that was barely measured must not be able to look fast.
+        """
+        values = [seconds for ph, seconds in self._headline if phase is None or ph == phase]
+        if len(values) < max(1, min_samples):
+            return None
+        return percentile(values, 95)
+
+    def first_audio_p95_ms(
+        self, phase: str | None = GATE_PHASE, *, min_samples: int = GATE_MIN_SAMPLES
+    ) -> int | None:
+        """``first_audio_p95_seconds`` in whole milliseconds: the unit of the API's gate.
+
+        This is the number posted as ``session_facts.first_audio_p95_ms``.  The default is the
+        gate's own reading: role-play turns only, at least 8 of them (``GATE_MIN_SAMPLES``).
+        """
+        seconds = self.first_audio_p95_seconds(phase, min_samples=min_samples)
+        return None if seconds is None else int(round(seconds * 1000.0))
 
     # ------------------------------------------------------------------ scripted lines
 
@@ -289,7 +344,7 @@ class LatencyTracker:
     def _emit_checked(
         self, schema: str, seconds: float, *, category: str, phase: str, index: int | None
     ) -> None:
-        if not math.isfinite(seconds) or seconds < 0.0 or seconds > _MAX_SEGMENT_SEC:
+        if not _valid_segment(seconds):
             return
         self._emit(schema, seconds, category=category, phase=phase, turn_index=index)
 

@@ -394,6 +394,130 @@ class TestLatencyTracker(unittest.TestCase):
         self.assertTrue(all(math.isfinite(item[1]) for item in self.lines.items))
 
 
+class TestFirstAudioP95(unittest.TestCase):
+    """The one number the API gate reads: ``session_facts.first_audio_p95_ms`` (pr4c-rebase 3.3)."""
+
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.lines = Lines()
+        self.tracker = LatencyTracker(self.clock, self.lines)
+        self.turns = 0
+
+    def turn(self, phase: str, seconds: float) -> None:
+        """One candidate turn whose audio starts ``seconds`` after the end of speech."""
+        self.turns += 1
+        base = self.clock.now + 10.0
+        self.clock.at(base)
+        self.tracker.note_user_state("speaking")
+        self.clock.at(base + 1.0)
+        self.tracker.note_user_state("listening")  # the anchor
+        self.tracker.begin_turn(self.turns, phase)
+        self.clock.at(base + 1.0 + seconds)
+        self.tracker.first_audio()
+
+    def test_the_gate_reads_role_play_turns_in_milliseconds(self) -> None:
+        for step in range(1, 21):  # 0.1 s ... 2.0 s
+            self.turn("roleplay", step / 10)
+        self.assertEqual(self.tracker.first_audio_samples(), 20)
+        # nearest rank: the 19th of 20 (a manual clock sums floats, so compare to the millisecond)
+        self.assertAlmostEqual(self.tracker.first_audio_p95_seconds(), 1.9, places=6)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1900)
+        self.assertIsInstance(self.tracker.first_audio_p95_ms(), int)
+
+    def test_the_milliseconds_are_the_headline_lines_not_a_second_measurement(self) -> None:
+        for value in (0.9, 1.2, 1.1, 2.4, 1.0, 0.8, 1.3, 1.6, 0.7, 3.2):
+            self.turn("roleplay", value)
+        logged = [item[1] for item in self.lines.items if item[0] == "eou_to_first_audio"]
+        self.assertEqual(len(logged), 10)
+        expected = percentile(logged, 95)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), int(round(expected * 1000)))
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 3200)
+
+    def test_fewer_than_eight_turns_is_unknown_never_a_number(self) -> None:
+        for _ in range(7):
+            self.turn("roleplay", 1.0)
+        self.assertEqual(self.tracker.first_audio_samples(), 7)
+        self.assertIsNone(self.tracker.first_audio_p95_ms())
+        self.assertIsNone(self.tracker.first_audio_p95_seconds())
+        self.turn("roleplay", 1.0)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)
+
+    def test_no_turn_at_all_is_unknown(self) -> None:
+        self.assertIsNone(self.tracker.first_audio_p95_ms())
+        self.assertIsNone(self.tracker.first_audio_p95_ms(None, min_samples=1))
+        self.assertEqual(self.tracker.first_audio_samples(None), 0)
+
+    def test_only_role_play_turns_count_for_the_gate(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.0)
+        for phase in ("opening", "icebreaker", "wrapup", "aside"):
+            for _ in range(3):
+                self.turn(phase, 9.0)  # the interviewer's turns are slow and must not count
+        self.assertEqual(self.tracker.first_audio_samples(), 8)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)
+        # For information the every-phase figure is available, and it does see them.
+        self.assertEqual(self.tracker.first_audio_samples(None), 20)
+        self.assertEqual(self.tracker.first_audio_p95_ms(None), 9000)
+        self.assertEqual(self.tracker.first_audio_p95_ms("icebreaker", min_samples=3), 9000)
+
+    def test_the_other_phases_cannot_make_a_thin_role_play_look_measured(self) -> None:
+        for _ in range(5):
+            self.turn("roleplay", 1.0)
+        for _ in range(20):
+            self.turn("icebreaker", 1.0)
+        self.assertIsNone(self.tracker.first_audio_p95_ms())
+
+    def test_the_value_is_rounded_to_whole_milliseconds(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.2346)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1235)
+
+    def test_a_turn_counts_once_whatever_stamps_follow(self) -> None:
+        for _ in range(7):
+            self.turn("roleplay", 1.0)
+        self.turn("roleplay", 1.0)
+        self.clock.at(self.clock.now + 5.0)
+        self.tracker.first_audio()  # a later "speaking" event in the same turn
+        self.tracker.first_audio()
+        self.assertEqual(self.tracker.first_audio_samples(), 8)
+
+    def test_a_clock_artefact_is_never_a_sample(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.0)
+        self.turn("roleplay", 700.0)  # a stale anchor: not a latency
+        self.clock.at(self.clock.now + 1.0)
+        self.tracker.note_user_state("speaking")
+        self.clock.at(self.clock.now + 1.0)
+        self.tracker.note_user_state("listening")
+        self.tracker.begin_turn(99, "roleplay")
+        self.clock.at(self.clock.now - 30.0)  # the clock stepped back
+        self.tracker.first_audio()
+        self.assertEqual(self.tracker.first_audio_samples(), 8)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)
+
+    def test_a_scripted_line_and_a_turn_without_audio_add_no_sample(self) -> None:
+        for _ in range(8):
+            self.turn("roleplay", 1.0)
+        self.clock.at(self.clock.now + 5.0)
+        self.tracker.say_created("speech_1", "L-EXIT", "roleplay")
+        self.clock.at(self.clock.now + 0.4)
+        self.assertTrue(self.tracker.say_audio("speech_1"))
+        self.tracker.begin_turn(50, "roleplay")  # a suppressed turn: no reply, no audio
+        self.assertEqual(self.tracker.first_audio_samples(), 8)
+
+    def test_the_samples_are_bounded_and_the_newest_win(self) -> None:
+        for _ in range(600):
+            self.turn("roleplay", 5.0)
+        for _ in range(512):
+            self.turn("roleplay", 1.0)
+        self.assertEqual(self.tracker.first_audio_samples(), 512)
+        self.assertEqual(self.tracker.first_audio_p95_ms(), 1000)
+
+    def test_the_gate_defaults_are_the_apis(self) -> None:
+        self.assertEqual(r1_latency.GATE_PHASE, "roleplay")
+        self.assertEqual(r1_latency.GATE_MIN_SAMPLES, 8)  # R1_GATE_LIMITS.MIN_QUALIFYING_TURNS
+
+
 def log_line(schema: str, seconds, *, component: str = "r1", error_type: str = "r1_latency") -> dict:
     return {
         "timestamp": "2026-10-08T00:00:00.000Z",

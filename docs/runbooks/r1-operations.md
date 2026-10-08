@@ -569,6 +569,16 @@ talk_share_pct, longest_monologue_seconds, barge_in_count, question_count,
 interruption_count, first_audio_p95_ms}`). Until `session_facts` is posted no
 session can pass the gate, which is the safe state while auto-status is off.
 
+`first_audio_p95_ms` is measured by the PR-4c latency tracker (`r1_latency.LatencyTracker`): the
+nearest-rank p95 of candidate end of speech to the agent's first audio over the **role-play** turns
+only, a JSON number in **milliseconds** (the gate's limit is 3000). A session with fewer than 8
+measured role-play turns posts an explicit `null`, so the gate says `latency_unknown` instead of
+reading a number nobody measured. The worker logs the same figure as an `r1_latency` line
+(`schema=first_audio_p95`, `error_category=gate`, `option_count` the turns behind it) beside the
+all-phase figure (`error_category=all_phases`), so a posted value can be compared with the Stage A
+report. The other four communication facts (`talk_share_pct`, `barge_in_count`, `question_count`,
+`interruption_count`) are still sent as `null`; they do not fail the gate.
+
 **Ordering: post everything BEFORE the terminal transition.** The admin-log route
 answers 409 `r1_session` once the session has left `waiting`/`in_progress`, and the
 `r1.assessment` job is enqueued by the 0116 trigger at that same transition. Every
@@ -1189,6 +1199,7 @@ candidate turn) and `error_category`. No line holds an utterance or a name.
 | `eou_to_tts_first_frame`, `tts_ttfb` | To the first audio frame the TTS node produced; and its time from the first text |
 | `eou_to_first_audio` | The headline: end of speech to the agent's audio starting; `error_category` is the turn kind (`llm_reply`, `ack_then_say`, `say_only`, `reply`) |
 | `say_to_first_audio` | A scripted line, `error_category` the line id |
+| `first_audio_p95` | Logged once at exit: the p95 of `eou_to_first_audio` that the worker posts as `session_facts.first_audio_p95_ms` (here in seconds). `error_category` `gate` = the role-play turns the API gate reads (at least 8, else `unknown` and no `duration_sec`), `all_phases` = every phase, for information; `option_count` is the number of turns behind it |
 | `sdk_*` | The SDK's own per-turn timings (`sdk_e2e`, `sdk_end_of_turn`, `sdk_transcription`, ...), to cross-check the stamps above |
 
 Stage A targets (plan 5.15): `eou_to_first_audio` p50 <= 1.8 s and p95 <= 3.0 s, scripted lines
@@ -1245,6 +1256,13 @@ The line cache keeps candidate-free lines on this machine's disk (`r1-line-cache
 directory, keyed by the text and the voice) and the lines that carry the candidate's first name in
 memory only. It is rebuilt after a restart. Listen to one cached and one live line at the first
 smoke: a clip that sounds wrong is removed with `R1_LINE_CACHE=off`.
+
+Only a line that reaches `session.say` can play cached audio, so the warm list (`_WARM_ORDER` in
+`r1_session.py`) holds exactly the lines the driver says: `L-TRANSITION`, `L-TRANSITION-NUDGE`,
+`L-PICKUP`, `L-EXIT`, `L-WRAP`, `L-CLOSE`, `L-ASIDE-COACH`, `L-MUTE`, `L-SIL-IB`, `L-SIL-RP1`,
+`L-SIL-RP2`, `L-REJOIN`, `L-REJOIN-RP`, `L-SIL-END` and `L-SYSTEM-STOP`. `L-OPEN` is spoken at once, and
+`L-TIME-CUE`, `L-NO-FEEDBACK` and `L-FAQ-DEFER` are never passed to `say` (the first two travel inside
+a reply stream; the third has no runtime caller), so they are not synthesised.
 
 ## Incident handling and rollback
 
