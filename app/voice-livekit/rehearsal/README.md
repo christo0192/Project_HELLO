@@ -49,8 +49,10 @@ means a live sweep of 20 or more calls with every applicable gate measured and m
    with JSON mode (the preflight probes it and falls back to `deepseek-flash`).
 4. `--matrix smoke`, then `sweep` (20 calls), then `confirm` (60 calls) with `--baseline <earlier run>`
    to attach a before/after diff to the PR.
-5. Guard hits per call are a gate (mean <= 1, every category) and `scorecard.md` lists them for every
-   call ("Guard hits per call", plus the invented-fact share). The reworded reaction prompts of R1-Q
+5. Guard LEAK hits per call (replies the guard blocked: invented_fact, concession, volunteered_need)
+   are a gate (mean <= 1); hygiene hits (the repetition guard dropping a sentence) are reported with
+   them and never block. `scorecard.md` lists every call ("Guard hits per call", plus the
+   invented-fact share). The reworded reaction prompts of R1-Q
    round 1 (react to how it lands, never repeat a course detail) are proved ONLY by a live sweep: the
    offline harness has a scripted model, so its guard hits say nothing about them. Gate the merge on
    this table.

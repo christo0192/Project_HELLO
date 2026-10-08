@@ -239,7 +239,9 @@ def is_call_proposal(lowered: str, start: int, end: int) -> bool:
         return False
     if _SESSION_NOUN.search(lowered[start:end]) and _LEARNER_CUE.search(lowered) is None:
         return False
-    return _PROPOSAL_FRAME.search(lowered) is not None
+    # A question to the learner ("What time tomorrow works for a quick call?", "Would a quick call
+    # after you've read it help?") is a proposal whatever its wording; a pitch is a statement.
+    return _PROPOSAL_FRAME.search(lowered) is not None or is_question_like(lowered)
 
 
 # What may follow "send you the link": class logistics are not an enrolment link.
@@ -317,6 +319,7 @@ _PROGRAMME_SCHEDULE = re.compile(
 )
 _CALL_ASK = _compile(
     r"\b(?:can|could|shall|should|may|will|i'?ll|let me) (?:i |we )?call (?:you )?back\b",
+    r"\bpencil (?:you|me|us|it|that|this|something) in\b",
     r"\bwhat (?:day|time|date|slot)s?\b[^.?!]{0,30}\b(?:work|works|suit|suits|good|"
     r"convenient|best|free|available)\b",
     r"\bwhen (?:are|would|can|could) you (?:be )?(?:free|available|up for|ok|okay|"
@@ -359,7 +362,9 @@ def _call_hit(lowered: str) -> Ask | None:
         match = pattern.search(lowered)
         if match:
             return Ask(AskKind.CALL, match.group(0)[:40])
-    if is_question_like(lowered):
+    # A question, or a first-person offer of a time ("I could do tomorrow evening or whenever
+    # suits him"); the programme's own statements ("Classes will be on Saturday ...") are neither.
+    if is_question_like(lowered) or _PROPOSAL_FRAME.search(lowered) is not None:
         for pattern in _CALL_ASK_QUESTION:
             for match in pattern.finditer(lowered):
                 if _PROGRAMME_SCHEDULE.search(match.group(0)) is None:

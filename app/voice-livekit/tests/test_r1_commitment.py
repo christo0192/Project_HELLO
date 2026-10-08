@@ -253,6 +253,9 @@ class AskDetectionTests(unittest.TestCase):
         "We can book you a slot in the next batch.",
     )
     CALL_AFTER_ROUND_TWO = (
+        "Can I pencil you in for tomorrow at nine?",
+        "I could do tomorrow evening or whenever suits him.",
+        "What time tomorrow actually works for a quick call, lunch or evening?",
         "Let's schedule a call so I can walk you through how the mentors work.",
         "We can arrange a call with you and your husband whenever it suits you.",
         "Our team will call you tomorrow at 7 pm to finalize the details.",

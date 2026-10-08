@@ -100,6 +100,13 @@ CALL_PITCHES = (
     "I can arrange a session on the weekend if you miss a class.",
     "We'll schedule your onboarding call after you enroll.",
     "We can book you a slot in the next batch.",
+    # questions that are still pitches
+    "Did you know you can book a one-on-one session with a mentor anytime?",
+    "Do you know that students can schedule a call with the coach every week?",
+    "What students love is that they can schedule a call with a coach whenever they want.",
+    "You can book a slot with a mentor, right?",
+    "Want to know the best part? We schedule a career coaching session in the third month.",
+    "Want the link? We will send you the link to the live class on Monday.",
 )
 EMAIL_PITCHES = (
     "We'll send you the schedule once you enroll.",
@@ -167,6 +174,10 @@ CALLBACK_PROPOSALS = (
     "Would it help if we got him on a quick call with me?",
     "Would it help if I set up a short call with both of you so you can ask questions together?",
     "What if we do a quick call with your husband on Saturday?",
+    "What time tomorrow actually works for a quick call, lunch or evening?",
+    "Would a quick call after you've read it help?",
+    "Since mornings don't work, when's better for a quick call?",
+    "Can I pencil you in for tomorrow at nine?",
 )
 
 

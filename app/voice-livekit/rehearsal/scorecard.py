@@ -100,14 +100,24 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
     ),
     # R1-Q round 2: the reworded reaction prompts are proved on a live sweep, where a reply that
     # restates a course detail is blocked as ``invented_fact``.  Offline the model is scripted, so
-    # this only checks the plumbing.
+    # this only checks the plumbing.  The gate counts the replies the guard BLOCKED (leaks:
+    # invented_fact, concession, volunteered_need ...); the repetition guard dropping a sentence
+    # the learner already said (hygiene) is reported with it but never blocks.
     (
-        "guard_per_call",
-        "Guard hits per call (mean, every category)",
-        "guard_hits_per_call",
+        "guard_leak",
+        "Guard leak hits per call (mean; blocked replies)",
+        "guard_leak_hits_per_call",
         "<=",
         {"strong": 1.0, "average": 1.0, "other": 1.0},
         "gate",
+    ),
+    (
+        "guard_per_call",
+        "Guard hits per call (mean, hygiene included) (info)",
+        "guard_hits_per_call",
+        "<=",
+        {"strong": 1.0, "average": 1.0, "other": 1.0},
+        "info",
     ),
     (
         "length_low",
@@ -287,6 +297,8 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "max_slip_sec_by_family": slips,
         "guard_by_category": dict(guard),
         "guard_hits_per_call": mean(_floats(calls, "guard_hits_total")),
+        "guard_leak_hits_per_call": mean(_floats(calls, "guard_leak_hits")),
+        "guard_hygiene_hits_per_call": mean(_floats(calls, "guard_hygiene_hits")),
         "guard_hits_max_per_call": max(_floats(calls, "guard_hits_total"), default=None),
         "invented_fact_hits_per_call": (
             mean([float((m.get("guard_by_category") or {}).get("invented_fact", 0)) for m in calls])
@@ -435,6 +447,8 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
         ("exact repeats / call", "exact_repeat_per_call"),
         ("WEAK line, max per call", "weak_line_max"),
         ("commitment guard hits after commitment", "commitment_hits_after_commitment"),
+        ("guard leak hits / call (mean)", "guard_leak_hits_per_call"),
+        ("guard hygiene hits / call (mean)", "guard_hygiene_hits_per_call"),
         ("guard hits / call (mean)", "guard_hits_per_call"),
         ("guard hits / call (worst)", "guard_hits_max_per_call"),
         ("invented-fact hits / call", "invented_fact_hits_per_call"),

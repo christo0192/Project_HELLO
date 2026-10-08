@@ -726,7 +726,7 @@ def _strip_stt_bye_tail(text: object) -> str:
     bye."), at most ``STT_TAIL_MAX_WORDS`` words in all, after at least ``STT_TAIL_MIN_OTHER_WORDS``
     other words.  Anything else keeps its farewell: "Okay, bye." in a short turn, a sentence with
     a real word in it ("Take care. Bye.", "Talk to you tomorrow, bye.", "Thank you so much,
-    bye.", "Alright then, bye."), and a tail that does not start its sentence.
+    bye.", "Alright then, bye."), and a tail inside a longer sentence ("..., so yeah, bye.").
     """
     folded = fold(text)
     sentences = split_sentences(folded)

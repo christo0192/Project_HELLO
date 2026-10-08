@@ -1373,32 +1373,46 @@ class ScorecardTests(unittest.TestCase):
         reports guard hits per call; one call over the line fails the sweep's mean."""
         clean = [fake_record("strong", commitment="STRONG") for _ in range(2)]
         card = scorecard.build_scorecard(clean, offline=False)
-        by = {(g["level"], g["gate"]): g for g in card["gates"]}
-        self.assertEqual(by[("strong", "guard_per_call")]["status"], "pass")
+        by = {(g["level"], g["gate"]): g["status"] for g in card["gates"]}
+        self.assertEqual(by[("strong", "guard_leak")], "pass")
+        self.assertEqual(by[("strong", "guard_per_call")], "pass")
         self.assertEqual(card["aggregate"]["strong"]["guard_hits_per_call"], 1.0)
+        self.assertEqual(card["aggregate"]["strong"]["guard_leak_hits_per_call"], 0.0)
         noisy = [
-            fake_record("strong", commitment="STRONG", guard_hits_total=4,
-                        guard_by_category={"invented_fact": 3, "repeat": 1}),
-            fake_record("strong", commitment="STRONG", guard_hits_total=0, guard_by_category={}),
+            fake_record("strong", commitment="STRONG", guard_hits_total=4, guard_leak_hits=3,
+                        guard_hygiene_hits=1, guard_by_category={"invented_fact": 3, "repeat": 1}),
+            fake_record("strong", commitment="STRONG", guard_hits_total=0, guard_leak_hits=0,
+                        guard_hygiene_hits=0, guard_by_category={}),
         ]
         card = scorecard.build_scorecard(noisy, offline=False)
         group = card["aggregate"]["strong"]
         self.assertEqual((group["guard_hits_per_call"], group["guard_hits_max_per_call"]), (2.0, 4.0))
+        self.assertEqual(group["guard_leak_hits_per_call"], 1.5)
         self.assertEqual(group["invented_fact_hits_per_call"], 1.5)
         by = {(g["level"], g["gate"]): g["status"] for g in card["gates"]}
-        self.assertEqual(by[("strong", "guard_per_call")], "fail")
+        self.assertEqual(by[("strong", "guard_leak")], "fail")
+        self.assertEqual(by[("strong", "guard_per_call")], "info-fail")
         self.assertFalse(card["readiness"]["ready"])
         text = scorecard.render_markdown(card, noisy)
         self.assertIn("## Guard hits per call", text)
-        self.assertIn("| 4 | 0 | 1 | invented_fact 3, repeat 1 |", text)
+        self.assertIn("| 4 | 3 | 1 | invented_fact 3, repeat 1 |", text)
         self.assertIn("guard hits / call (worst)", text)
+        # Repeats the guard dropped (hygiene) are reported, but only blocked replies are a gate.
+        hygiene = [
+            fake_record("strong", commitment="STRONG", guard_hits_total=5, guard_leak_hits=0,
+                        guard_hygiene_hits=5, guard_by_category={"repeat": 5})
+        ]
+        card = scorecard.build_scorecard(hygiene, offline=False)
+        by = {(g["level"], g["gate"]): g["status"] for g in card["gates"]}
+        self.assertEqual((by[("strong", "guard_leak")], by[("strong", "guard_per_call")]),
+                         ("pass", "info-fail"))
         # An export without guard data is not measured, never a pass.
         bare = fake_record("strong", commitment="STRONG")
         for key in ("guard_hits_total", "guard_leak_hits", "guard_hygiene_hits"):
             del bare["metrics"][key]
         card = scorecard.build_scorecard([bare], offline=False)
         by = {(g["level"], g["gate"]): g["status"] for g in card["gates"]}
-        self.assertEqual(by[("strong", "guard_per_call")], "n/a")
+        self.assertEqual(by[("strong", "guard_leak")], "n/a")
         self.assertNotIn("## Guard hits per call", scorecard.render_markdown(card, [bare]))
 
     def test_the_inversion_rate_is_only_measured_for_a_live_advisor(self) -> None:

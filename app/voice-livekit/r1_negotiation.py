@@ -610,6 +610,7 @@ _CALLBACK_LOOSE = _compile(
 )
 _CALLBACK = _compile(
     r"\bcall(?:ing)? (?:you |me )?back\b",
+    r"\bpencil (?:you|me|us|it|that|this|something) in\b",
     r"\bwhen (?:you|i|we) (?:call|ring|phone) (?:me|you)\b",
     r"\bwhat (?:time|day)s? (?:works?|suits?|is good|is best|would work)\b",
     r"\bwhen (?:can|could|shall|should|would) (?:i|we) (?:call|talk|speak|connect|catch up)\b",
