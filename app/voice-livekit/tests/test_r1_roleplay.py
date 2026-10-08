@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import unittest
 from pathlib import Path
@@ -2713,9 +2714,11 @@ class PitchNeverEarnsACommitmentTests(unittest.TestCase):
     in the close window the learner then answered a pitch with the scripted MEDIUM commitment."""
 
     def test_a_pitch_in_the_close_window_never_yields_a_commitment_line_or_an_email_yes(self):
-        from tests.test_r1_negotiation import PITCHES
+        from tests.test_r1_negotiation import CALL_PITCHES, EMAIL_PITCHES, PITCHES
 
-        for text in PITCHES:
+        # Round 2 (review 3): the singular forms ("book a slot with a mentor") and the "once you
+        # enroll" / "link to the live class" sentences still got the MEDIUM line or the e-mail yes.
+        for text in PITCHES + CALL_PITCHES + EMAIL_PITCHES:
             with self.subTest(text=text):
                 session, r = run_cooperative(40.0)  # the four families are done at 10:20
                 session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
@@ -2734,6 +2737,165 @@ class PitchNeverEarnsACommitmentTests(unittest.TestCase):
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         plan = session.say("Can we schedule a call tomorrow at 7 pm?", r - 20)
         self.assertEqual(plan.commitment_level, Level.MEDIUM)
+
+    def test_real_proposals_in_the_close_window_still_earn_the_graded_line(self):
+        from tests.test_r1_negotiation import CALL_PROPOSALS
+
+        for text in CALL_PROPOSALS:
+            with self.subTest(text=text):
+                session, r = run_cooperative(40.0)
+                session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+                plan = session.say(text, r - 20)
+                self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+
+
+class QuestionOffersThroughTheEngineTests(unittest.TestCase):
+    """R1-Q round 2 (review 3): an offer phrased as a question, or a plain "yes, you can have it for
+    $7,000", was not seen after round 1, so the learner answered a price with "so what would the
+    final price be?" (the UNCLEAR counter) instead of reacting to the number."""
+
+    OFFERS = (
+        ("How does $8,500 sound?", SITUATION_SHORT, 8500),
+        ("What do you say to $8,000?", SITUATION_SHORT, 8000),
+        ("If I give you a $1,000 discount, will you join today?", SITUATION_SHORT, 8000),
+        ("Can we close at $8,000 today?", SITUATION_SHORT, 8000),
+        ("Is $8,000 something you can manage?", SITUATION_SHORT, 8000),
+        ("So $8,500 with the early bird, deal?", SITUATION_SHORT, 8500),
+        ("Yes, you can have it for $7,000.", SITUATION_MET, 7000),
+        ("Sure, it's yours for $7,000.", SITUATION_MET, 7000),
+        ("Okay, I'll match that, $7,000.", SITUATION_MET, 7000),
+        ("Fine, you get it at $7,000 if you enroll today.", SITUATION_MET, 7000),
+        ("For you, $7,000.", SITUATION_MET, 7000),
+    )
+
+    def answered(self, reply):
+        s = Session(engine(seed="q-offer"), ack="Okay, I see.")
+        s.say(OPENER, 20)
+        s.say(PRICE_ONLY, 60)
+        return s, s.say(reply, 100)
+
+    def test_the_counter_reacts_to_the_number_the_advisor_named(self):
+        for reply, situation, net in self.OFFERS:
+            with self.subTest(reply=reply):
+                s, counter = self.answered(reply)
+                self.assertEqual(counter.move_id, F1_COUNTER, counter.reasons)
+                self.assertEqual(s.eng.negotiation.price_situation(), situation)
+                self.assertEqual(s.eng.negotiation.best_offer_usd, net)
+                self.assertNotIn(s.spoken[-1].split("Okay, I see. ", 1)[-1], neg_variants("unclear"))
+                self.assertIn(counter.intent.fallbacks[0], neg_variants(situation))
+                self.assertIn("pleasantly surprised", counter.reminder)
+                self.assertIn(f'"${net:,}"', counter.reminder)
+
+    def test_the_wrap_reacts_to_the_real_number_too(self):
+        s, _counter = self.answered("How does $8,500 sound?")
+        wrap = s.say("Is it fine with you?", 140)
+        self.assertIn('has "$8,500" on the table', wrap.reminder)
+
+    def test_a_question_about_the_source_of_the_anchor_is_still_no_offer(self):
+        for reply in ("Who told you $7,000?", "Where did you hear $7,000 would work?",
+                      "Is $7,000 what they told you?"):
+            with self.subTest(reply=reply):
+                s, plan = self.answered(reply)
+                self.assertEqual(s.eng.negotiation.offers, [])
+                self.assertNotIn("better price on the table", plan.reminder or "")
+
+
+class PitchFiguresThroughTheEngineTests(unittest.TestCase):
+    """R1-Q round 2 (review 3): prices were tracked from the first mention, so a salary figure in
+    the pitch became "an offer"; the anchor then said "the advisor has already come down to $8,000"
+    (a fact error HR sees) and the pitch turn itself primed "a better price on the table"."""
+
+    PITCH_FIGURES = (
+        "After the program our alumni typically see a salary hike of about $8,000 a year.",
+        "You could earn $5,000 more per month as a data scientist.",
+        "Compared with a $6,000 bootcamp, we give you much more.",
+        "Last year one student paid $7,500 with the scholarship.",
+    )
+
+    def play(self, pitch):
+        """The reviewer's call: the pitch figure comes up mid-pitch, the price much later."""
+        s = Session(engine(seed="pitch-fig"), ack="Okay, I see.", reply="Hmm, okay, tell me more.")
+        script = [
+            OPENER, H1_PROBE, FOLLOWUP, PITCH, pitch,
+            "Our curriculum is designed for working professionals and you'll learn a lot.",
+            SCHEDULE_TALK, "Everything is recorded, so you can watch later.",
+            "Our instructors support you all the way.", PRICE_ONLY,
+            "It's the full program with mentorship included.",
+        ]
+        r = 20.0
+        plans = []
+        for index, text in enumerate(script):
+            plans.append(s.say(text, r, turn_index=index, candidate_seconds=20))
+            r += 40
+            if s.eng.scheduler.deliveries_by_id().get(F1_ANCHOR) is not None:
+                break
+        return s, plans
+
+    def test_a_figure_in_the_pitch_is_no_offer_and_the_anchor_stays_plain(self):
+        for pitch in self.PITCH_FIGURES:
+            with self.subTest(pitch=pitch):
+                s, plans = self.play(pitch)
+                pitch_plan = plans[4]
+                self.assertNotIn("better price on the table", pitch_plan.reminder or "")
+                self.assertNotIn("pleasantly surprised", pitch_plan.reminder or "")
+                self.assertEqual(s.eng.negotiation.offers, [])
+                anchor = plans[-1]
+                self.assertEqual(anchor.move_id, F1_ANCHOR)
+                self.assertEqual(anchor.intent.must_say, ("$9,000", "$7,000"))
+                self.assertIn("$9,000 feels like a lot", anchor.intent.brief)
+                self.assertNotIn("already come down", anchor.intent.brief)
+                self.assertNotIn("already put", anchor.intent.brief)
+                for variant in anchor.intent.fallbacks:
+                    self.assertNotRegex(variant, r"still a (?:lot|stretch|big number)")
+                self.assertEqual(s.eng.admin_log()["negotiation"]["responses"], [])
+
+    def test_a_real_offer_in_the_same_pitch_turn_is_kept(self):
+        s, plans = self.play(
+            "Our alumni typically see a salary hike of about $8,000 a year, and today I can do "
+            "$500 off, so $8,500 for you."
+        )
+        self.assertEqual(s.eng.negotiation.best_offer_usd, 8500)
+        self.assertIn("pleasantly surprised", plans[4].reminder)
+        self.assertEqual(plans[-1].move_id, F1_ANCHOR)
+        self.assertIn("$8,500", plans[-1].intent.brief)
+
+
+class ReachedAnchorThenCounterTests(unittest.TestCase):
+    """R1-Q round 2 (review 3): the pleased anchor ("is that really the final price?") and the
+    met counter ("is this the final price?") were voiced back to back with no new advisor price
+    in between.  The anchor now asks what the price includes; the counter keeps the question."""
+
+    FINAL = re.compile(r"(?i)final (?:price|number)|best (?:price|you can)|best offer")
+
+    def play(self, first, second, seed="reached-1"):
+        s = Session(engine(seed=seed), ack="Okay, I see.")
+        s.say(OPENER, 20)
+        anchor = s.say(first, 60)
+        counter = s.say(second, 100)
+        return s, anchor, counter
+
+    def test_the_final_price_is_asked_once(self):
+        for seed in ("reached-1", "reached-2", "reached-3", "reached-4"):
+            for first, second in (
+                ("Today only I can do $2,000 off, so $7,000.", "Yes, the $7,000 is the price for you."),
+                ("Today only I can do $2,500 off, so $6,500.", "As I said, the $6,500 is for you."),
+            ):
+                with self.subTest(seed=seed, first=first):
+                    s, anchor, counter = self.play(first, second, seed)
+                    self.assertEqual((anchor.move_id, counter.move_id), (F1_ANCHOR, F1_COUNTER))
+                    self.assertEqual(s.eng.negotiation.price_situation(), SITUATION_MET)
+                    said = s.spoken[1:3]
+                    asks = [bool(self.FINAL.search(text)) for text in said]
+                    self.assertEqual(asks, [False, True], said)
+
+    def test_the_reached_anchor_names_the_amount_and_keeps_the_ask(self):
+        s, anchor, _counter = self.play(
+            "Today only I can do $2,500 off, so $6,500.", "As I said, the $6,500 is for you."
+        )
+        self.assertIn("$6,500", s.spoken[1])
+        self.assertIn("$7,000", s.spoken[1])
+        self.assertEqual(anchor.intent.must_say, ("$6,500", "$7,000"))
+        self.assertEqual(s.eng.scheduler._states[F1_ANCHOR].status, "delivered")
 
 
 if __name__ == "__main__":

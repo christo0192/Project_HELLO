@@ -369,6 +369,43 @@ class ScheduleAndGuardMetricTests(unittest.TestCase):
         self.assertEqual(found["stall_reason_repeats"], 2)
         self.assertIn("stall_reason_repeated", metrics.hard_fails(found))
 
+    def test_the_final_price_asked_twice_close_together_fails_the_call(self) -> None:
+        """R1-Q round 2: the pleased anchor ("... Is that your final price?") and the met counter
+        ("... Is this the final price?") are one question in different words, with no new advisor
+        price between them; the near-repeat metric compares wording, so it cannot see it."""
+
+        def exchanges(*lines: str):
+            return [{"learner": {"spoken": line}} for line in lines]
+
+        twice = exchanges(
+            "I heard people got it for around $7,000, so that sounds about right. Is that your "
+            "final price?",
+            "Okay.",
+            "Okay, that's closer to what I hoped. Is this the final price?",
+        )
+        found = metrics.final_price_metrics(twice)
+        self.assertEqual(found["final_price_question_exchanges"], [1, 3])
+        self.assertEqual(found["final_price_asked_twice"], 1)
+        self.assertIn("final_price_asked_twice", metrics.hard_fails(found))
+        once = metrics.final_price_metrics(exchanges(
+            "That's right at the $7,000 I heard. What exactly does that price include?",
+            "Okay.",
+            "Oh, that would help a lot. Is that the final price, then?",
+        ))
+        self.assertEqual((once["final_price_questions"], once["final_price_asked_twice"]), (1, 0))
+        self.assertNotIn("final_price_asked_twice", metrics.hard_fails(once))
+        # Far apart, or not a question, is no repeat.
+        far = metrics.final_price_metrics(exchanges(
+            "Is that the final price?", "Hmm.", "Right.", "Mm.", "Sure.", "Is this the best price?",
+        ))
+        self.assertEqual((far["final_price_questions"], far["final_price_asked_twice"]), (2, 0))
+        statement = metrics.final_price_metrics(exchanges(
+            "That is the final price I heard.", "Is that the final price?",
+        ))
+        self.assertEqual(statement["final_price_questions"], 1)
+        for empty in ([], [{}], [{"learner": None}]):
+            self.assertEqual(metrics.final_price_metrics(empty)["final_price_questions"], 0)
+
 
 class GoodCallTests(unittest.TestCase):
     """A hand-written good call passes every deterministic gate (research 4.7)."""
@@ -1235,6 +1272,9 @@ def fake_record(level, *, fails=(), commitment="MEDIUM", slips=None, **extra):
         "intents_fallback_appended": 1,
         "max_slip_sec_by_family": slips or {"F1": 0.0, "F2": 5.0, "F3": 0.0, "F4": 0.0},
         "guard_by_category": {"repeat": 1},
+        "guard_hits_total": 1,
+        "guard_leak_hits": 0,
+        "guard_hygiene_hits": 1,
         "fidelity_passes": True,
         "exchanges": 25,
         "stop_reason": "early_exit",
@@ -1327,6 +1367,39 @@ class ScorecardTests(unittest.TestCase):
         self.assertIn("Ready for an owner test: NO", text)
         diff = scorecard.diff_markdown(card, card)
         self.assertIn("| strong | hard_fail_rate |", diff)
+
+    def test_guard_hits_per_call_are_a_gate_and_a_per_call_table(self) -> None:
+        """R1-Q round 2 (R1-5): the reworded reaction prompts must be proved on a live sweep that
+        reports guard hits per call; one call over the line fails the sweep's mean."""
+        clean = [fake_record("strong", commitment="STRONG") for _ in range(2)]
+        card = scorecard.build_scorecard(clean, offline=False)
+        by = {(g["level"], g["gate"]): g for g in card["gates"]}
+        self.assertEqual(by[("strong", "guard_per_call")]["status"], "pass")
+        self.assertEqual(card["aggregate"]["strong"]["guard_hits_per_call"], 1.0)
+        noisy = [
+            fake_record("strong", commitment="STRONG", guard_hits_total=4,
+                        guard_by_category={"invented_fact": 3, "repeat": 1}),
+            fake_record("strong", commitment="STRONG", guard_hits_total=0, guard_by_category={}),
+        ]
+        card = scorecard.build_scorecard(noisy, offline=False)
+        group = card["aggregate"]["strong"]
+        self.assertEqual((group["guard_hits_per_call"], group["guard_hits_max_per_call"]), (2.0, 4.0))
+        self.assertEqual(group["invented_fact_hits_per_call"], 1.5)
+        by = {(g["level"], g["gate"]): g["status"] for g in card["gates"]}
+        self.assertEqual(by[("strong", "guard_per_call")], "fail")
+        self.assertFalse(card["readiness"]["ready"])
+        text = scorecard.render_markdown(card, noisy)
+        self.assertIn("## Guard hits per call", text)
+        self.assertIn("| 4 | 0 | 1 | invented_fact 3, repeat 1 |", text)
+        self.assertIn("guard hits / call (worst)", text)
+        # An export without guard data is not measured, never a pass.
+        bare = fake_record("strong", commitment="STRONG")
+        for key in ("guard_hits_total", "guard_leak_hits", "guard_hygiene_hits"):
+            del bare["metrics"][key]
+        card = scorecard.build_scorecard([bare], offline=False)
+        by = {(g["level"], g["gate"]): g["status"] for g in card["gates"]}
+        self.assertEqual(by[("strong", "guard_per_call")], "n/a")
+        self.assertNotIn("## Guard hits per call", scorecard.render_markdown(card, [bare]))
 
     def test_the_inversion_rate_is_only_measured_for_a_live_advisor(self) -> None:
         live = fake_record("strong")

@@ -49,6 +49,13 @@ means a live sweep of 20 or more calls with every applicable gate measured and m
    with JSON mode (the preflight probes it and falls back to `deepseek-flash`).
 4. `--matrix smoke`, then `sweep` (20 calls), then `confirm` (60 calls) with `--baseline <earlier run>`
    to attach a before/after diff to the PR.
+5. Guard hits per call are a gate (mean <= 1, every category) and `scorecard.md` lists them for every
+   call ("Guard hits per call", plus the invented-fact share). The reworded reaction prompts of R1-Q
+   round 1 (react to how it lands, never repeat a course detail) are proved ONLY by a live sweep: the
+   offline harness has a scripted model, so its guard hits say nothing about them. Gate the merge on
+   this table.
+6. `final_price_asked_twice` is a hard fail: the learner asking "is that the final price?" twice
+   within three exchanges (the pleased anchor and the met counter used to).
 
 ## Not measured here
 

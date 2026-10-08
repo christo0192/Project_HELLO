@@ -45,7 +45,10 @@ import r1_world
 # course detail (the old wording invited guard-blocked product statements), the F1 anchor reacts to a
 # price already on the table (three variants per case), the one-word filler fallback, and the
 # next-step / e-mail-yield notes.
-PINNED_CONTENT_SHA256 = "cdd583fb820b37260b19593e633f76a9d8e1572a47daf32e0725cf7fae7d1228"
+# Revision 8 (R1-Q round 2 review fixes): the reached anchor (a price at or below $7,000 already on
+# the table) asks what the price includes instead of "is that the final price?" (the counter owns
+# that question) and names the amount in every variant; the manifest samples the below-$7,000 case.
+PINNED_CONTENT_SHA256 = "e60b351d675b59a1007205c680ad48151117bedc9e7a63f218dd8b5f84e13226"
 
 CONTENT_MODULES = (
     "r1_text",

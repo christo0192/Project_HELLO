@@ -45,7 +45,10 @@ import r1_world
 # 7: R1-Q round 1 review fixes: the reaction notes say "how it lands for you" and never repeat a
 #    course detail (guard-safe), the anchor reacts to a price already on the table, the filler
 #    falls back to a one-word hum, and the next-step / e-mail-yield notes.
-CONTENT_REVISION = 7
+# 8: R1-Q round 2 review fixes: the reached anchor (a price at or below $7,000 already on the
+#    table) asks what the price includes instead of "is that the final price?" (the counter owns
+#    that question) and names the amount in every variant.
+CONTENT_REVISION = 8
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -159,6 +162,7 @@ def manifest() -> dict[str, Any]:
                 for item in (
                     r1_negotiation.anchor_after_offer(8500),
                     r1_negotiation.anchor_after_offer(7000),
+                    r1_negotiation.anchor_after_offer(6500),
                 )
             ],
             "reasons": list(r1_negotiation.REASONS),

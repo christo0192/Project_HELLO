@@ -209,6 +209,9 @@ class AskDetectionTests(unittest.TestCase):
         "Let's speak again on Monday.",
         "Can I call you tomorrow?",
         "I'll call you on Thursday.",
+        "Would Monday at 7 pm work?",
+        "Do you think Friday works?",
+        "Does Saturday work for you?",
     )
     NONE = (
         "What made you look into data science now?",
@@ -232,6 +235,29 @@ class AskDetectionTests(unittest.TestCase):
         "I can send you information about the program.",
         "I'll text you the course details.",
         "",
+        # R1-Q round 2: booking and calling wording that describes the programme
+        "You can book a one-on-one session with a mentor anytime.",
+        "Mentors are available, you can book a slot with them every week.",
+        "You can schedule a mock interview session whenever you want.",
+        "We arrange a career coaching session in the third month.",
+        "The coach will call you on the first day of the program.",
+        "We will send you the link to the live class on Monday.",
+        "You can book a slot with a mentor.",
+        "Our mentors will set up a call with you after you enroll.",
+        # the programme's own schedule, with a day and "works" in it
+        "Classes will be on Saturday and that works for most people.",
+        "The weekend batch is on Saturday, which is good for working professionals.",
+        "Is the Saturday batch okay? Most working professionals say it works well.",
+        "Does the Saturday class work for you?",
+        "We can schedule a session on weekends for working professionals.",
+        "We can book you a slot in the next batch.",
+    )
+    CALL_AFTER_ROUND_TWO = (
+        "Let's schedule a call so I can walk you through how the mentors work.",
+        "We can arrange a call with you and your husband whenever it suits you.",
+        "Our team will call you tomorrow at 7 pm to finalize the details.",
+        "Can I book a slot with you for a quick chat on Friday?",
+        "Schedule a call with me and we will go from there.",
     )
 
     def test_enrolment_asks(self):
@@ -243,6 +269,13 @@ class AskDetectionTests(unittest.TestCase):
 
     def test_call_time_and_next_step_asks(self):
         for text in self.CALL:
+            with self.subTest(text=text):
+                ask = detect_ask(text)
+                self.assertIsNotNone(ask)
+                self.assertEqual(ask.kind, AskKind.CALL)
+
+    def test_call_proposals_next_to_programme_words_are_still_asks(self):
+        for text in self.CALL_AFTER_ROUND_TWO:
             with self.subTest(text=text):
                 ask = detect_ask(text)
                 self.assertIsNotNone(ask)

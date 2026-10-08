@@ -515,8 +515,16 @@ _NAME_TAIL = (
     r"(?:[\s,-]+(?!(?:of|to|for|at|with|and|but|on|in|if|so|about|first|before)\b)"
     r"[a-z']{2,15}){0,2}"
 )
+# What may follow "thanks for your time" in a sign-off: well wishes, an invitation to get back
+# ("let me know what you decide", "I hope this helps you decide", "no pressure, take your time",
+# "looking forward to hearing from you").  A statement about the programme is not one.
 _CLOSING_COURTESY = (
-    r"(?:good luck|best of luck|all the best|enjoy|feel free|please (?:reach|feel)|reach out)\b"
+    r"(?:good luck|best of luck|all the best|enjoy|feel free|please (?:reach|feel)|reach out|"
+    r"let me know|let us know|i hope (?:this|that|it) (?:helps|helped|was|makes)|"
+    r"i hope (?:to|we)\b|looking forward|i appreciate (?:your|the) (?:time|chat|call)|"
+    r"it was (?:nice|great|a pleasure|good|lovely)|(?:a )?pleasure|no pressure|no rush|"
+    r"take your time|whenever you(?:'re| are)? ready|when you(?:'re| are) ready|"
+    r"don'?t hesitate|(?:keep|stay) in touch|see you)\b"
     r"[^?]*"
 )
 _CLOSING_PROMISE = (
@@ -556,7 +564,7 @@ _CLOSE_THANKS = _compile(
 CLOSE_MIN_R_SEC = 60
 CLOSE_THANKS_MIN_R_SEC = 240
 STT_TAIL_MIN_OTHER_WORDS = 20
-STT_TAIL_MAX_WORDS = 6
+STT_TAIL_MAX_WORDS = 4
 # After "thanks for your time" only a word or two ("Bye.", "Take care.") may follow.
 THANKS_TRAILING_WORDS = 3
 
@@ -700,10 +708,9 @@ def _asks_something(sentence: str) -> bool:
     return is_question_like(sentence)
 
 
-_STT_TAIL_WORDS = frozenset(
-    "bye so yeah yes okay ok alright right all well then um uh hmm thanks thank you very much "
-    "again".split()
-)
+# Trail-off fillers only.  Courtesies ("thank you", "thanks a lot", "alright then") are not here:
+# "Thank you so much, bye." ends a long wrap-up and is a real goodbye (R1-Q round 2).
+_STT_TAIL_WORDS = frozenset("bye so yeah yes okay ok um uh hmm well".split())
 
 
 _WORD_TOKEN = re.compile(r"[A-Za-z0-9']+")
@@ -714,29 +721,29 @@ def _strip_stt_bye_tail(text: object) -> str:
 
     In the owner test (b58c7d9c) a 90-word answer ended "So yeah. Bye" and the learner answered
     "Oh wait, before you go..." although nobody was leaving.  The tail is read on WORDS, not on
-    one punctuation: the last words of a turn that are nothing but fillers ("so yeah", "okay",
-    "thank you") ending in "bye" / "bye bye", at most ``STT_TAIL_MAX_WORDS`` of them, after at
-    least ``STT_TAIL_MIN_OTHER_WORDS`` other words ("So yeah. Bye", "So yeah, bye.", "So yeah.
-    Bye bye.", "So yeah, okay, bye.").  "Okay, bye." in a short turn is still a farewell, and so
-    is anything with a real word in it ("Take care. Bye.": the "Take care." stays).
+    one punctuation: the final SENTENCE of a turn that is nothing but trail-off fillers ending in
+    "bye" / "bye bye" ("So yeah. Bye", "So yeah, bye.", "So yeah. Bye bye.", "So yeah, okay,
+    bye."), at most ``STT_TAIL_MAX_WORDS`` words in all, after at least ``STT_TAIL_MIN_OTHER_WORDS``
+    other words.  Anything else keeps its farewell: "Okay, bye." in a short turn, a sentence with
+    a real word in it ("Take care. Bye.", "Talk to you tomorrow, bye.", "Thank you so much,
+    bye.", "Alright then, bye."), and a tail that does not start its sentence.
     """
     folded = fold(text)
-    tokens = list(_WORD_TOKEN.finditer(folded))
-    if not tokens or tokens[-1].group(0).lower() != "bye":
+    sentences = split_sentences(folded)
+    if len(sentences) < 2:
         return folded
-    first = len(tokens)
-    while (
-        first > 0
-        and len(tokens) - first < STT_TAIL_MAX_WORDS
-        and tokens[first - 1].group(0).lower() in _STT_TAIL_WORDS
+    words = [match.group(0).lower() for match in _WORD_TOKEN.finditer(sentences[-1])]
+    if (
+        not words
+        or words[-1] != "bye"
+        or len(words) > STT_TAIL_MAX_WORDS
+        or any(word not in _STT_TAIL_WORDS for word in words)
     ):
-        first -= 1
-    if first >= len(tokens) or first < STT_TAIL_MIN_OTHER_WORDS:
         return folded
-    core = folded[: tokens[first].start()].rstrip(" ,;:-")
-    # The turn now ends where the tail began: close the sentence so "Have a great day," is the
-    # farewell "Have a great day." it was.
-    return core if core.endswith((".", "!", "?")) else core + "."
+    head = " ".join(sentences[:-1])
+    if word_count(head) < STT_TAIL_MIN_OTHER_WORDS:
+        return folded
+    return head
 
 
 def is_close_attempt(text: object, r_sec: float | None = None) -> bool:

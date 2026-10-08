@@ -592,6 +592,37 @@ def stall_reason_metrics(admin: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+_FINAL_PRICE_QUESTION = re.compile(
+    r"\bfinal (?:price|number|offer|amount)\b|\bbest (?:price|you can|offer|number|deal)\b"
+    r"|\b(?:is|was) (?:that|this|it)\b[^.?!]{0,25}\b(?:final|last|best)\b|\blowest\b",
+    re.IGNORECASE,
+)
+# Two "is that the final price?" questions this close are one question twice (the pleased anchor
+# and the met counter used to be, with no new advisor price between them).
+FINAL_PRICE_NEAR_EXCHANGES = 3
+
+
+def final_price_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """M3d: the learner asking "is that the final price?" again within a few exchanges.
+
+    The near-repeat metric compares wording, so it cannot see the same question in different
+    words ("Is that your final price?" then "Is this the final price?").  Counts the exchanges
+    whose learner line asks it, and flags two within ``FINAL_PRICE_NEAR_EXCHANGES`` of each other.
+    """
+    asked: list[int] = []
+    for index, ex in enumerate(exchanges):
+        spoken = str(_learner(ex).get("spoken") or "")
+        if any("?" in sentence and _FINAL_PRICE_QUESTION.search(sentence)
+               for sentence in split_sentences(spoken)):
+            asked.append(index + 1)
+    near = [(a, b) for a, b in zip(asked, asked[1:]) if b - a <= FINAL_PRICE_NEAR_EXCHANGES]
+    return {
+        "final_price_questions": len(asked),
+        "final_price_question_exchanges": asked,
+        "final_price_asked_twice": len(near),
+    }
+
+
 def guard_metrics(
     admin: Mapping[str, Any],
     guard_trips: Sequence[Mapping[str, Any]],
@@ -673,6 +704,7 @@ def call_metrics(record: Mapping[str, Any]) -> dict[str, Any]:
     out.update(misfire_metrics(exchanges))
     out.update(schedule_metrics(admin))
     out.update(stall_reason_metrics(admin))
+    out.update(final_price_metrics(exchanges))
     out.update(guard_metrics(admin, record.get("guard_trips") or [], exchanges))
     out.update(latency_metrics(exchanges))
     out["exchanges"] = len(exchanges)
@@ -693,6 +725,8 @@ def hard_fails(metrics: Mapping[str, Any]) -> list[str]:
         fails.append("stall_phrases_repeated")
     if (metrics.get("stall_reason_repeats") or 0) >= 1:
         fails.append("stall_reason_repeated")
+    if (metrics.get("final_price_asked_twice") or 0) >= 1:
+        fails.append("final_price_asked_twice")
     if metrics.get("long_exact_repeat"):
         fails.append("exact_repeat_sentence")
     if (metrics.get("deflection_count") or 0) >= 1:

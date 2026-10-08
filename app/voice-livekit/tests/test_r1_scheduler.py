@@ -1117,8 +1117,8 @@ class FarewellScopeTests(unittest.TestCase):
             "So yeah, bye.",
             "So yeah. Bye bye.",
             "So yeah, okay, bye.",
-            "Okay, thank you, bye.",
-            "So yeah, okay, thank you, bye bye!",
+            "Yeah. Bye.",
+            "Okay. Bye bye.",
         ):
             for prefix in ("", "So that is the whole thing. "):
                 with self.subTest(tail=tail, prefix=prefix):
@@ -1128,6 +1128,43 @@ class FarewellScopeTests(unittest.TestCase):
         signals = s.observe_candidate_turn(f"{self.LONG_ANSWER} So yeah, bye.", 345)
         self.assertFalse(signals.close_attempt)
         self.assertEqual(s.close_attempts, 0)  # the advisor's next real goodbye still counts once
+
+    WRAP_UP = (
+        "So basically the program has live classes on weekends, mentors from top companies, "
+        "mock interviews and a capstone project, and I really think it fits what you told me "
+        "about your career goals and your timeline."
+    )
+
+    def test_a_real_goodbye_at_the_end_of_a_long_wrap_up_is_still_a_goodbye(self):
+        """R1-Q round 2: the round 1 tail stripped up to six filler words (thanks included) from any
+        long turn, so "Thank you so much, bye." ended a wrap-up and nobody heard the goodbye.  Only
+        a final sentence of at most four trail-off words is a speech-to-text tail."""
+        for tail in (
+            "Thank you so much, bye.",
+            "Thanks a lot, bye.",
+            "Okay, thank you, bye bye.",
+            "Okay, thank you, bye.",
+            "So yeah, okay, thank you, bye bye!",
+            "Alright then, bye.",
+            "All right, bye.",
+            "Take care, bye.",
+            "Talk to you tomorrow, bye.",
+            "Thanks for your time. Bye.",
+            "Thanks again, bye.",
+        ):
+            with self.subTest(tail=tail):
+                text = f"{self.WRAP_UP} {tail}"
+                self.assertTrue(is_close_attempt(text, 345), text)
+
+    def test_a_tail_inside_a_longer_sentence_is_a_goodbye(self):
+        """"..., so yeah, bye." is one sentence with real words in it, not a stray tail."""
+        text = f"{self.WRAP_UP.rstrip('.')}, so yeah, bye."
+        self.assertTrue(is_close_attempt(text, 345), text)
+        self.assertFalse(is_close_attempt(f"{self.WRAP_UP} So yeah, bye.", 345))
+
+    def test_the_tail_is_at_most_four_words(self):
+        self.assertFalse(is_close_attempt(f"{self.WRAP_UP} So yeah, okay, bye.", 345))  # four
+        self.assertTrue(is_close_attempt(f"{self.WRAP_UP} Yeah, so yeah, okay, bye.", 345))  # five
 
     def test_a_tail_with_a_real_word_in_it_stays_a_goodbye(self):
         for tail in (
@@ -1190,9 +1227,25 @@ class FarewellScopeTests(unittest.TestCase):
             "Thanks for your time. Have a great day.",
             "Thanks for your time. I'll send the details.",
             "Thanks for your time. Feel free to reach out if you have questions.",
+            # R1-Q round 2: the sign-offs the round 1 whitelist missed
+            "Thanks for your time. Let me know what you decide.",
+            "Thank you for your time. I hope this helps you decide.",
+            "Thanks for your time. No pressure, take your time to decide.",
+            "Thank you for your time. Looking forward to hearing from you.",
+            "Thanks for your time. It was a pleasure talking to you.",
+            "Thanks for your time. Whenever you are ready, just reach out.",
+            "Thank you for your time. Don't hesitate to call me.",
+            "Thanks for your time. Keep in touch.",
         ):
             with self.subTest(text=text):
                 self.assertTrue(is_close_attempt(text, 300), text)
+        for text in (
+            "Thanks for your time. Let me explain the next module.",
+            "Thanks for your time. I hope you remember the fees are nine thousand dollars.",
+            "Thanks for your time. Let me now walk you through the fees.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_close_attempt(text, 300), text)
 
 
 class RefusalVocabularyTests(unittest.TestCase):

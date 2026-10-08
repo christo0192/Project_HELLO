@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from enum import Enum, IntEnum
 from typing import Mapping
 
-from r1_text import fold, fuzzy_contains, split_sentences
+from r1_text import fold, fuzzy_contains, is_question_like, split_sentences
 
 COMMIT_PERMITTED_R_SEC = 540
 COMMIT_STALL_R_SEC = 780
@@ -111,6 +111,143 @@ def _compile(*patterns: str) -> tuple[re.Pattern[str], ...]:
     return tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
 
 
+# ----------------------------------------------------------------------------------
+# A pitch or a proposal?  (R1-Q round 2)
+#
+# "You can book a one-on-one session with a mentor anytime", "We arrange a career coaching session
+# in the third month" and "The coach will call you on the first day of the program" describe the
+# programme.  "Can we schedule a call tomorrow at 7 pm?" and "I'll call you back on Monday"
+# propose a call with the learner.  The booking-style patterns below fire on both, so every hit of
+# a LOOSE pattern must pass ``is_call_proposal`` (also used by ``r1_negotiation`` for callbacks and
+# e-mail offers): the sentence needs an advisor-side proposal frame (I/we with a modal, let's, a
+# question to the learner, an imperative, "our team will"), and the words around the match must
+# not be a cadence ("every week"), a programme timeline ("once you enroll", "in the third month")
+# or a programme feature (mentors, mock interviews, one-on-one sessions, office hours ...).
+# ----------------------------------------------------------------------------------
+_UNITS = (
+    r"(?:week|weeks|day|days|month|months|class|classes|session|sessions|module|modules|"
+    r"lecture|lectures|weekend|weekends|monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"evening|evenings|morning|mornings|fortnight|term|semester|batch|cohort|phase|sprint|"
+    r"quarter|year)"
+)
+CADENCE = re.compile(
+    r"\b(?:every|each) (?:other |single )?(?:\w+ )?" + _UNITS + r"\b"
+    r"|\b(?:weekly|daily|monthly|fortnightly|bi-?weekly|annually|yearly)\b"
+    r"|\b(?:once|twice|thrice|\w+ times) (?:a|per|every|each) (?:week|month|day|fortnight|year)\b"
+    r"|\bper (?:week|month|day|class|session)\b",
+    re.IGNORECASE,
+)
+_JOINED = (
+    r"(?:enrol+(?:ed|ment)?|sign(?:ed|ing)? up|register(?:ed|ing)?|registration|"
+    r"join(?:ed|ing)?(?!\s+(?:the |this |a |our |my )?(?:call|meeting|chat|session|conversation|"
+    r"zoom|link|us for (?:a|the|this) (?:call|chat|session)))|"
+    r"start(?:ed)? (?:the |your |our )?(?:program|programme|course|classes|bootcamp|batch|"
+    r"cohort)|begin (?:the |your )?(?:program|programme|course|classes)|"
+    r"graduat\w+|complet\w+ (?:the |your )?(?:program|programme|course|module|capstone))"
+)
+PROGRAMME_TIMED = re.compile(
+    r"\b(?:once|after|when|as soon as|before|until) (?:you(?:'ve| have|'re| are|'ll| will)? |"
+    r"your |the )?" + _JOINED + r"\b"
+    r"|\b(?:after|upon|post|before) (?:the |your |their )?(?:enrol+ment|registration|joining|"
+    r"sign-?up|graduation|completion)\b"
+    r"|\bduring (?:the|your|our) (?:program|programme|course|bootcamp|cohort|batch|classes|term|"
+    r"six months|6 months|live)\b"
+    r"|\bthroughout (?:the|your|our)\b"
+    r"|\b(?:in|on|at|by|during|within|for) (?:the )?(?:first|second|third|fourth|fifth|sixth|"
+    r"seventh|eighth|last|final|\d+(?:st|nd|rd|th)) (?:day|week|month|module|phase|semester|"
+    r"term|class|session|quarter)s?\b"
+    r"|\b(?:at|by) the (?:start|beginning|end) of (?:the|each|every|your|our)\b"
+    r"|\bas part of (?:the|your|our)\b|\bincluded (?:in|with)\b"
+    r"|\bpart of (?:the|your|our) (?:program|programme|course|package|plan|fee)\b",
+    re.IGNORECASE,
+)
+# What the programme itself provides: a match next to these words is a pitch.
+_FEATURE = re.compile(
+    r"\b(?:mentors?|mentorship|mentoring|coach(?:es)?|coaching|instructors?|trainers?|faculty|"
+    r"teachers?|teaching assistants?|tas?|alumni|experts?|recruiters?|peers?|classmates?|"
+    r"mock interviews?|interview prep\w*|office hours?|one[- ]on[- ]one|1[- ]on[- ]1|1:1|"
+    r"live (?:class|classes|session|sessions|lecture|lectures|q ?& ?a|doubt)|"
+    r"doubts?[- ](?:clearing|solving|resolution|session)|webinars?|workshops?|"
+    r"resume (?:review|workshop)|career services|community|group chat|capstone|"
+    r"onboarding|orientation|induction|kick-?off|welcome (?:call|session)|"
+    r"placement (?:support|team|assistance))\b",
+    re.IGNORECASE,
+)
+# "session" and "slot" are the programme's own words (a class, a mentor session), so a match that
+# ends in one needs a sign that the advisor means a conversation with THIS learner: "with you",
+# the learner's decision maker, a day or a clock time, or a purpose ("a quick session to talk
+# through the fees").  "We can schedule a session on weekends for working professionals" is a
+# pitch about class timings.
+_SESSION_NOUN = re.compile(r"\b(?:session|slot)\W*$", re.IGNORECASE)
+_LEARNER_CUE = re.compile(
+    r"\b(?:with|for) (?:you|me|us)\b|\byou and\b"
+    r"|\byour (?:husband|wife|partner|spouse|father|mother|parents|family|dad|mom)\b"
+    r"|\b(?:tomorrow|tonight|today|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b"
+    r"|\b\d{1,2}(?::\d\d)?\s*(?:am|pm)\b"
+    r"|\b(?:follow[- ]?up|quick|short|brief|another|second|one more|counsel+ing|discussion)\b"
+    r"|\bto (?:talk|discuss|go over|walk you|explain|answer|review|chat)\b",
+    re.IGNORECASE,
+)
+# The advisor's side of the call: I/we with a modal, "let's", a question to the learner, an
+# imperative, or "our team/counsellor ...".  "You can ..." and "the coach will ..." are not.
+_PROPOSAL_FRAME = re.compile(
+    r"\b(?:i|we)(?:'ll|'d|'m|'re|\s+(?:will|would|can|could|shall|should|may|might|am|are|"
+    r"have to|need to|want to|plan to))\b"
+    r"|\b(?:let me|let us|let'?s)\b"
+    r"|\b(?:can|could|shall|should|may|might|would|will|do|did) (?:i|we)\b"
+    r"|\bif (?:i|we)\b|\bwhat if\b|\bwould it (?:help|be (?:ok|okay|better|good|useful|nice))\b"
+    r"|\b(?:how|what) about\b|\bwhy (?:don'?t|not)\b"
+    r"|\b(?:can|could|would|will) you\b"
+    r"|\b(?:do|would) you (?:want|like|prefer|wish)\b|\bwant me to\b"
+    r"|\b(?:would|are) you (?:be )?(?:open|willing|able|free|available|up for|interested)\b"
+    r"|^\W*(?:(?:okay|ok|so|now|then|alright|great|sure|please|and|well)\W+)*"
+    r"(?:schedule|book|set up|arrange|fix|plan|organi[sz]e|pencil in|line up|call|ring|ping|"
+    r"text|give|reach out)\b"
+    r"|\b(?:our|my) (?:\w+ ){0,2}?(?:team|counsel+ors?|advis[eo]rs?|managers?|colleagues?|"
+    r"executives?|representatives?|specialists?|admissions?)\b",
+    re.IGNORECASE,
+)
+_BEFORE_CHARS = 30
+_AFTER_CHARS = 30
+
+
+def around(lowered: str, start: int, end: int) -> str:
+    """The words next to the match at ``start:end``: where a pitch keeps its cadence or timeline.
+
+    Only the neighbourhood counts, so a faraway "every week" or "mentors" in a long sentence
+    cannot cancel a real proposal: "Let's schedule a call so I can walk you through how the
+    mentors work" is still a proposal.
+    """
+    return lowered[max(0, start - _BEFORE_CHARS) : end + _AFTER_CHARS]
+
+
+def describes_programme(near: str) -> bool:
+    """True when ``near`` (``around`` a match) reads as the programme's cadence or timeline."""
+    return CADENCE.search(near) is not None or PROGRAMME_TIMED.search(near) is not None
+
+
+def is_call_proposal(lowered: str, start: int, end: int) -> bool:
+    """True when the booking-style match at ``start:end`` of ``lowered`` proposes a call.
+
+    ``lowered`` is one folded, lower-cased sentence.  False for a pitch about the programme
+    (see the block comment above).
+    """
+    near = around(lowered, start, end)
+    if describes_programme(near) or _FEATURE.search(near):
+        return False
+    if _SESSION_NOUN.search(lowered[start:end]) and _LEARNER_CUE.search(lowered) is None:
+        return False
+    return _PROPOSAL_FRAME.search(lowered) is not None
+
+
+# What may follow "send you the link": class logistics are not an enrolment link.
+_CLASS_LOGISTICS_AFTER = (
+    r"(?!\s+(?:to|for|of)\s+(?:the |your |our |every |each |all )?(?:live |recorded |weekly |"
+    r"online |upcoming |first )?(?:class|classes|session|sessions|lecture|lectures|webinars?|"
+    r"workshops?|zoom|meeting|demo|orientation|induction|community|group|slack|discord|"
+    r"whatsapp|mentors?|recordings?|materials?|notes|batch|cohort)\b)"
+)
+
 _ENROL_ASK = _compile(
     r"\b(?:shall|should|can|could|may|would|will) (?:i|we) (?:\w+ ){0,2}?"
     r"(?:send|share|email|proceed|go ahead|enrol+|register|sign|reserve|lock|secure|"
@@ -131,8 +268,9 @@ _ENROL_ASK = _compile(
     r"\b(?:would you like|do you want) to (?:enrol+|sign up|join|proceed|move forward|"
     r"get started|secure|reserve|lock|go ahead|take (?:it|this|the course|the program))\b",
     r"\b(?:payment|enrol+ment|registration|sign-?up|invoice) link\b",
+    # "send you the link to the live class" is class logistics, not an enrolment link.
     r"\bsend (?:you |me )?(?:the |a |an )?(?:link|invoice|payment|enrol+ment form|"
-    r"registration form)\b",
+    r"registration form)\b" + _CLASS_LOGISTICS_AFTER,
     r"\b(?:pay|put down|make|place) (?:the |a |your |an )?(?:\w+ )?deposit\b"
     r"|\bdeposit (?:today|now)\b",
     r"\b(?:can|could|will|would|shall|should) you (?:\w+ ){0,2}pay (?:today|now|upfront|"
@@ -143,29 +281,45 @@ _ENROL_ASK = _compile(
     r"\bready to (?:enrol+|sign|join|commit|move|proceed)\b",
     r"\bhow (?:would|do) you (?:like|want) to (?:proceed|move forward|go forward|pay|enrol+)\b",
 )
-_CALL_ASK = _compile(
+# LOOSE call patterns are booking-style wording that a pitch uses too ("you can book a slot with
+# a mentor every week", "the coach will call you on the first day"): a hit counts only when
+# ``is_call_proposal`` agrees.  The FIRM ones are questions and promises about a call between
+# the advisor and the learner and need no such check.
+_CALL_ASK_LOOSE = _compile(
     r"\b(?:schedule|set up|book|arrange|line up|fix|plan|organi[sz]e|pencil in)\b"
     r"[^.?!]{0,30}\b(?:call|chat|meeting|session|demo|time|slot|follow[- ]?up|"
     r"catch[- ]?up|conversation)\b",
     r"\b(?:can|could|shall|should|would|will|may|how about|what about|let'?s|want to|"
     r"like to)\b[^.?!]{0,25}\b(?:follow[- ]?up|quick|another|second|short|brief|next) "
     r"(?:call|chat|meeting|conversation)\b",
-    r"\b(?:can|could|shall|should|may|will|i'?ll|let me) (?:i |we )?call (?:you )?back\b",
     r"\b(?:can|could|shall|should|may|will|i'?ll|let me) (?:i |we )?(?:call|ring|ping|text) you "
     r"(?:back|tomorrow|tonight|on|at|later|this|next)\b",
     r"\b(?:talk|speak|connect|chat|catch up)\b (?:again |to you |with you )?(?:on |this |next )?"
     r"(?:" + _DAY + r"|week)\b",
+    r"\b(?:i'?ll|i will|let me|we'?ll|we will) (?:call|ring|ping|reach out|get back|"
+    r"follow up|check in|connect)\b[^.?!]{0,40}\b(?:" + _DAY + r"|next week|this week|"
+    r"later today)\b",
+)
+# A question about a day or a time working ("Does Thursday work for that call?").  Only a QUESTION
+# counts, and not one about the programme's own schedule: "Classes will be on Saturday, which works
+# for most people" and "Is the Saturday batch okay?" are not a call (R1-Q round 2).
+_CALL_ASK_QUESTION = _compile(
     r"\b(?:does|would|will|is|how about|what about|shall we do|can we do|do)\b"
     r"[^.?!]{0,30}\b(?:" + _DAY + r"|next week|this week|" + _CLOCK + r")\b"
     r"[^.?!]{0,30}\b(?:work|works|suit|suits|good|fine|okay|ok|convenient|better)\b",
+)
+_PROGRAMME_SCHEDULE = re.compile(
+    r"\b(?:batch|batches|cohort|class|classes|course|program|programme|bootcamp|lecture|lectures|"
+    r"webinar|workshop|schedule|timings?|curriculum|module)\b",
+    re.IGNORECASE,
+)
+_CALL_ASK = _compile(
+    r"\b(?:can|could|shall|should|may|will|i'?ll|let me) (?:i |we )?call (?:you )?back\b",
     r"\bwhat (?:day|time|date|slot)s?\b[^.?!]{0,30}\b(?:work|works|suit|suits|good|"
     r"convenient|best|free|available)\b",
     r"\bwhen (?:are|would|can|could) you (?:be )?(?:free|available|up for|ok|okay|"
     r"comfortable)\b",
     r"\bare you (?:free|available)\b[^.?!]{0,30}\b(?:" + _DAY + r"|this week|next week|call)\b",
-    r"\b(?:i'?ll|i will|let me|we'?ll|we will) (?:call|ring|ping|reach out|get back|"
-    r"follow up|check in|connect)\b[^.?!]{0,40}\b(?:" + _DAY + r"|next week|this week|"
-    r"later today)\b",
     r"\bwhat(?:'s| is| would be) (?:the |a )?(?:best |good |right )?next step\b",
 )
 
@@ -193,12 +347,26 @@ def detect_ask(text: object) -> Ask | None:
             if match:
                 return Ask(AskKind.ENROL, match.group(0)[:40])
         if call_hit is None:
-            for pattern in _CALL_ASK:
-                match = pattern.search(lowered)
-                if match:
-                    call_hit = Ask(AskKind.CALL, match.group(0)[:40])
-                    break
+            call_hit = _call_hit(lowered)
     return call_hit
+
+
+def _call_hit(lowered: str) -> Ask | None:
+    """The call ask in one folded, lower-cased sentence, or None."""
+    for pattern in _CALL_ASK:
+        match = pattern.search(lowered)
+        if match:
+            return Ask(AskKind.CALL, match.group(0)[:40])
+    if is_question_like(lowered):
+        for pattern in _CALL_ASK_QUESTION:
+            for match in pattern.finditer(lowered):
+                if _PROGRAMME_SCHEDULE.search(match.group(0)) is None:
+                    return Ask(AskKind.CALL, match.group(0)[:40])
+    for pattern in _CALL_ASK_LOOSE:
+        for match in pattern.finditer(lowered):
+            if is_call_proposal(lowered, match.start(), match.end()):
+                return Ask(AskKind.CALL, match.group(0)[:40])
+    return None
 
 
 _JOIN_COURSE = (

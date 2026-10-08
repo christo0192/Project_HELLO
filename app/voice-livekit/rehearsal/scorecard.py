@@ -98,6 +98,17 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
         ALL_GROUPS,
         "gate",
     ),
+    # R1-Q round 2: the reworded reaction prompts are proved on a live sweep, where a reply that
+    # restates a course detail is blocked as ``invented_fact``.  Offline the model is scripted, so
+    # this only checks the plumbing.
+    (
+        "guard_per_call",
+        "Guard hits per call (mean, every category)",
+        "guard_hits_per_call",
+        "<=",
+        {"strong": 1.0, "average": 1.0, "other": 1.0},
+        "gate",
+    ),
     (
         "length_low",
         "Reply length, mean words >= 8",
@@ -275,6 +286,13 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "intent_fallback_rate": _rate(fell, handed),
         "max_slip_sec_by_family": slips,
         "guard_by_category": dict(guard),
+        "guard_hits_per_call": mean(_floats(calls, "guard_hits_total")),
+        "guard_hits_max_per_call": max(_floats(calls, "guard_hits_total"), default=None),
+        "invented_fact_hits_per_call": (
+            mean([float((m.get("guard_by_category") or {}).get("invented_fact", 0)) for m in calls])
+            if any("guard_hits_total" in m for m in calls)
+            else None
+        ),
         "fidelity_pass_rate": _rate(sum(1 for m in calls if m.get("fidelity_passes")), n),
         "exchanges_mean": mean([float(m.get("exchanges") or 0) for m in calls]),
         "roleplay_seconds_mean": mean(_floats(calls, "roleplay_seconds")),
@@ -417,6 +435,9 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
         ("exact repeats / call", "exact_repeat_per_call"),
         ("WEAK line, max per call", "weak_line_max"),
         ("commitment guard hits after commitment", "commitment_hits_after_commitment"),
+        ("guard hits / call (mean)", "guard_hits_per_call"),
+        ("guard hits / call (worst)", "guard_hits_max_per_call"),
+        ("invented-fact hits / call", "invented_fact_hits_per_call"),
         ("reply words, mean", "reply_words_mean"),
         ("reply words, p90 (mean)", "reply_words_p90"),
         ("short replies share", "short_reply_share"),
@@ -462,6 +483,25 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
         "## Ready for an owner test: "
         + ("YES" if ready["ready"] else "NO - " + "; ".join(ready["reasons"]))
     )
+    guarded = [
+        (c, merged_metrics(c)) for c in calls if "guard_hits_total" in (c.get("metrics") or {})
+    ]
+    if guarded:
+        lines.append("")
+        lines.append("## Guard hits per call")
+        lines.append("")
+        lines.append("| call | level | hits | leak | hygiene | categories |")
+        lines.append("|---|---|---|---|---|---|")
+        for call, metrics in guarded:
+            head = call.get("header") or {}
+            categories = ", ".join(
+                f"{name} {count}" for name, count in sorted((metrics.get("guard_by_category") or {}).items())
+            )
+            lines.append(
+                f"| {head.get('seed')} | {head.get('advisor_level')} | "
+                f"{metrics.get('guard_hits_total', 0)} | {metrics.get('guard_leak_hits', 0)} | "
+                f"{metrics.get('guard_hygiene_hits', 0)} | {categories or '-'} |"
+            )
     failing = [c for c in calls if c.get("hard_fails")]
     if failing:
         lines.append("")
