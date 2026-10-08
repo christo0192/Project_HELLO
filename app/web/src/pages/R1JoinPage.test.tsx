@@ -718,6 +718,15 @@ describe('live interview', () => {
     expect(screen.queryByRole('region', { name: 'Your role-play' })).toBeNull();
   });
 
+  it('fits the live interview to the window, and no other screen', async () => {
+    await toLanding();
+    expect(document.querySelector('main.candidate-shell--fill')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+    await screen.findByRole('region', { name: 'Live video interview' });
+    expect(document.querySelector('main.candidate-shell--fill')).not.toBeNull();
+  });
+
   it('hides the card again if the interview paused outside the role-play', async () => {
     const live = await toLive();
     act(() => live.handlers.onPhase('icebreaker'));

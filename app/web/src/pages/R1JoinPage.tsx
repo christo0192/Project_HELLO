@@ -516,8 +516,8 @@ export function R1JoinPage() {
     && template !== null;
 
   return (
-    <R1Shell>
-      {(stage.name === 'loading' || capability === 'checking') && (
+    <R1Shell fill={stage.name === 'live'}>
+      {(stage.name === 'loading'|| capability === 'checking') && (
         <p className="candidate-glass-card candidate-status-card" role="status">
           Checking your interview link…
         </p>

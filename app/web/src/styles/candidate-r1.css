@@ -54,7 +54,7 @@
 .r1-live__stage { display: flex; min-height: min(720px, calc(100vh - 160px)); flex-direction: column; align-items: center; justify-content: center; gap: 14px; padding: 28px; }
 .r1-live__stage .candidate-eyebrow { margin: 0; }
 .r1-live__title { margin: 0; font-size: clamp(22px, 3.4vw, 32px); letter-spacing: -.035em; line-height: 1.1; text-align: center; }
-.r1-live__side { display: grid; gap: 16px; }
+.r1-live__side { display: flex; flex-direction: column; gap: 16px; min-width: 0; min-height: 0; }
 .r1-phase { width: min(100%, 520px); padding: 12px 16px; border: 1px solid var(--c-border); border-radius: 16px; background: rgb(255 255 255 / .66); text-align: center; }
 .r1-phase__label { margin: 0; color: var(--c-ink); font-size: 16px; font-weight: 700; }
 .r1-phase__detail { margin: 2px 0 0; color: var(--c-ink-secondary); font-size: 13px; line-height: 1.45; }
@@ -67,14 +67,48 @@
 .r1-lead__who { margin: 0 0 8px; color: var(--c-ink); font-size: 15px; font-weight: 700; }
 .r1-lead p { margin: 0; color: var(--c-ink-secondary); font-size: 14px; line-height: 1.55; }
 .r1-lead p + p { margin-top: 8px; }
-.r1-live .candidate-interview__captions { min-height: 280px; }
+.r1-live__side .r1-lead { flex: 0 0 auto; }
+
+/* The R1 shell clips the decorative blobs that hang off the page, so they add no blank scroll. */
+.r1-shell { overflow: clip; }
+
+/* Captions: the card is bounded by the live view, and the list inside it is the only scroller. */
+.r1-live .candidate-interview__captions { flex: 1 1 0; min-height: 180px; padding: 20px 22px; overflow: hidden; }
+.r1-captions__body { position: relative; display: flex; flex: 1 1 auto; min-height: 0; margin-top: 14px; }
+.r1-captions__list { flex: 1 1 auto; min-height: 0; margin-top: 0; padding-right: 8px; overflow-y: auto; overscroll-behavior: contain; }
+.r1-captions__list:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 2px; border-radius: 10px; }
+.r1-captions__jump { position: absolute; right: 14px; bottom: 10px; min-height: 40px; padding: 0 16px; border: 0; border-radius: 999px; background: var(--c-accent); color: var(--c-data-label-inside); font: inherit; font-size: 13px; font-weight: 700; box-shadow: 0 6px 16px rgb(78 107 166 / .28); cursor: pointer; }
+.r1-captions__jump:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 3px; }
+
+/* Desktop: the live view fits the window (the shell is a 100dvh column, see R1Shell `fill`). */
+@media (min-width: 769px) and (min-height: 600px) {
+  .candidate-shell--fill { display: flex; flex-direction: column; height: 100vh; height: 100dvh; min-height: 0; padding-bottom: 20px; overflow: hidden; }
+  .candidate-shell--fill .candidate-shell__inner { display: flex; flex: 1 1 auto; flex-direction: column; min-height: 0; }
+  .candidate-shell--fill .r1-live { flex: 1 1 auto; min-height: 0; margin-top: 16px; grid-template-rows: minmax(0, 1fr); align-items: stretch; }
+  /* The stage never clips: if the window is too short for it, it scrolls inside its card.
+     Auto margins centre it when there is room and degrade to start-aligned when there is not. */
+  .candidate-shell--fill .r1-live__stage { min-height: 0; height: 100%; padding: 22px 28px; justify-content: flex-start; overflow-y: auto; }
+  .candidate-shell--fill .r1-live__stage > :first-child { margin-top: auto; }
+  .candidate-shell--fill .r1-live__stage > :last-child { margin-bottom: auto; }
+  /* The aura is sized from the window height, not its width, so it gives way to the controls. */
+  .candidate-shell--fill .r1-live .candidate-aura { flex: none; width: clamp(168px, calc(100dvh - 600px), 420px); }
+  .candidate-shell--fill .r1-live .candidate-aura__logo-plate { width: min(126px, 46%); height: auto; aspect-ratio: 1; border-radius: 28%; }
+  .candidate-shell--fill .r1-live .candidate-aura__logo-plate img { width: 70%; height: 70%; }
+  /* The side column is not a scroller: its cards have shadows that a clip would cut off. At 600px of
+     height the lead card plus the captions minimum still fit. */
+}
+
+/* Phones and short landscape windows: the page scrolls naturally; the captions card is bounded. */
+@media (max-width: 768px), (max-height: 599px) {
+  .r1-live { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .r1-live__stage { min-height: 0; padding: 18px 12px; }
+  .r1-live .candidate-aura { width: min(56vw, 220px); }
+  .r1-live .candidate-interview__captions { flex: none; height: clamp(240px, 45dvh, 440px); }
+}
 
 @media (max-width: 760px) {
   .r1-notice { padding: 24px 18px; }
   .r1-devices { grid-template-columns: 1fr; }
-  .r1-live { grid-template-columns: 1fr; gap: 12px; }
-  .r1-live__stage { min-height: 0; padding: 18px 12px; }
-  .r1-live .candidate-interview__captions { min-height: 220px; }
 }
 @media (prefers-reduced-transparency: reduce), (forced-colors: active) {
   .r1-phase, .r1-notice__body, .r1-secondary-cta { background: #fff; }

@@ -1,12 +1,9 @@
 import { useEffect, useRef, useState } from 'react';
 import type { LocalVideoTrack } from 'livekit-client';
 import type { R1LeadCard } from '../../lib/r1/r1-api';
-import {
-  R1_CAPTION_SPEAKER_LABELS,
-  type R1Caption,
-  type R1Phase,
-} from '../../lib/r1/r1-phase';
+import type { R1Caption, R1Phase } from '../../lib/r1/r1-phase';
 import { InterviewerAura } from '../candidate-join/InterviewerAura';
+import { R1Captions } from './R1Captions';
 import { R1ConsentExit } from './R1ConsentExit';
 import { R1LeadCardView } from './R1LeadCard';
 import { R1PhaseLabel } from './R1PhaseLabel';
@@ -139,26 +136,7 @@ export function R1LiveView({
 
       <div className="r1-live__side">
         {leadVisible && <R1LeadCardView lead={lead} />}
-        <section
-          className="candidate-glass-card candidate-interview__captions"
-          aria-label="Live captions"
-        >
-          <h2>Captions</h2>
-          <div className="candidate-caption-list" aria-live="polite">
-            {captions.length === 0 ? (
-              <p className="candidate-muted">Listening for the interviewer…</p>
-            ) : (
-              captions.map((caption) => (
-                <p className="candidate-caption" key={caption.id}>
-                  <small data-speaker={caption.speaker}>
-                    {R1_CAPTION_SPEAKER_LABELS[caption.speaker]}
-                  </small>
-                  {caption.text}
-                </p>
-              ))
-            )}
-          </div>
-        </section>
+        <R1Captions captions={captions} />
       </div>
     </section>
   );

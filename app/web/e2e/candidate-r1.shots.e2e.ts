@@ -12,7 +12,16 @@ import path from 'node:path';
 import type { Page } from '@playwright/test';
 import { ARTIFACTS_DIR } from './fixtures/axe';
 import { expect, test } from './fixtures/candidate-harness';
-import { agree, heading, openLink, passDeviceCheck, reachLive } from './fixtures/candidate-flows';
+import {
+  LIVE_DESKTOP_SIZES,
+  agree,
+  heading,
+  openLink,
+  passDeviceCheck,
+  reachLive,
+  reachLiveWithConversation,
+} from './fixtures/candidate-flows';
+import { liveLayout } from './fixtures/layout';
 
 const shotPath = (project: string, name: string) =>
   path.join(ARTIFACTS_DIR, 'screenshots', project, `r1-${name}.png`);
@@ -62,6 +71,39 @@ test.describe('R1 candidate screenshots @shots', () => {
     await r1.mock.setPhase('ended');
     await expect(heading(page, 'Your interview is complete.')).toBeVisible();
     await shoot(page, project, 'ended');
+  });
+
+  /**
+   * The live view after a long interview (40 caption lines, role-play on): the window fills at
+   * every desktop size and the captions list is the scroller; on a phone the page scrolls and the
+   * captions card is bounded. The same assertions run in candidate-r1.e2e.ts; here they only
+   * guard that the photograph shows the state it is named for.
+   */
+  for (const size of LIVE_DESKTOP_SIZES) {
+    test(`live view, 40 captions, ${size.width}x${size.height}`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop sizes run on the desktop project');
+      const { page } = r1;
+      await page.setViewportSize(size);
+      await reachLiveWithConversation(r1);
+      const layout = await liveLayout(page);
+      expect(layout.pageScrollHeight).toBeLessThanOrEqual(size.height + 1);
+      expect(layout.list!.scrollHeight).toBeGreaterThan(layout.list!.clientHeight);
+      await page.screenshot({
+        path: shotPath(testInfo.project.name, `live-40-captions-${size.width}x${size.height}`),
+        fullPage: false,
+        animations: 'disabled',
+        caret: 'hide',
+      });
+    });
+  }
+
+  test('live view, 40 captions, 390x844', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'mobile', 'the phone layout runs on the mobile project');
+    const { page } = r1;
+    await reachLiveWithConversation(r1);
+    const layout = await liveLayout(page);
+    expect(layout.list!.scrollHeight).toBeGreaterThan(layout.list!.clientHeight);
+    await shoot(page, testInfo.project.name, 'live-40-captions-390x844');
   });
 
   test('declined and busy states', async ({ r1 }, testInfo) => {

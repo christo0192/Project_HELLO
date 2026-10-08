@@ -27,12 +27,15 @@ import {
   expectCandidateHygiene,
   expectMobileFits,
   heading,
+  LIVE_DESKTOP_SIZES,
   openLink,
   passDeviceCheck,
   reachLive,
+  reachLiveWithConversation,
   storedNonce,
   storedNonceRaw,
 } from './fixtures/candidate-flows';
+import { liveLayout } from './fixtures/layout';
 import { R1_ATTEMPT_TOKEN, R1_LINK_TOKEN, R1_NONCE } from './fixtures/r1-candidate-api';
 
 test.describe('link and notice', () => {
@@ -556,6 +559,128 @@ test.describe('join failures keep the link valid and release the devices', () =>
       { token: R1_LINK_TOKEN },
       { token: R1_LINK_TOKEN, nonce: R1_NONCE },
     ]);
+    r1.expectHealthy();
+  });
+});
+
+/**
+ * The live view in a long interview: forty lines of captions with the lead card on screen.
+ * jsdom has no layout, so this is the only place the viewport fit is proven. On a desktop-sized
+ * window the PAGE must not scroll (the captions list is the scroller); on a phone the page
+ * scrolls naturally and the captions card is bounded.
+ */
+test.describe('live layout with a long interview', () => {
+  for (const size of LIVE_DESKTOP_SIZES) {
+    test(`fits a ${size.width}x${size.height} window and scrolls the captions inside`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop sizes run on the desktop project');
+      const { page } = r1;
+      await page.setViewportSize(size);
+      await reachLiveWithConversation(r1);
+
+      const layout = await liveLayout(page);
+      expect(layout.viewport).toEqual(size);
+      expect(layout.pageScrollHeight, 'the page must not scroll').toBeLessThanOrEqual(size.height + 1);
+      // The window is filled, not just fitted: the stage card runs down to the bottom margin.
+      expect(layout.captionsCard?.bottom).toBeLessThanOrEqual(size.height);
+      expect(layout.stage?.bottom).toBeLessThanOrEqual(size.height);
+      expect(layout.list, 'the captions list').not.toBeNull();
+      expect(layout.list!.scrollHeight, 'forty lines overflow the list').toBeGreaterThan(layout.list!.clientHeight + 100);
+      expect(layout.list!.bottom).toBeLessThanOrEqual(size.height);
+      expect(layout.newestLineInView, 'the list follows the newest line').toBe(true);
+      expect(layout.jumpButton).toBeNull();
+      // The controls never sit below the fold.
+      expect(layout.controlsBottom).not.toBeNull();
+      expect(layout.controlsBottom!).toBeLessThanOrEqual(size.height);
+
+      await auditA11y(page, testInfo, `r1-live-long-${size.width}x${size.height}`, { strict: true });
+      r1.expectHealthy();
+    });
+  }
+
+  test('still fits the shortest window it fills (600 px high), with the stage scrolling inside its card', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'desktop sizes run on the desktop project');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1100, height: 600 });
+    await reachLiveWithConversation(r1);
+
+    const layout = await liveLayout(page);
+    expect(layout.pageScrollHeight, 'the page must not scroll').toBeLessThanOrEqual(601);
+    expect(layout.captionsCard?.bottom).toBeLessThanOrEqual(600);
+    expect(layout.stage?.bottom).toBeLessThanOrEqual(600);
+    expect(layout.list!.clientHeight, 'the lead card leaves the list a usable height').toBeGreaterThanOrEqual(90);
+    // The list is only about one caption tall here, so 'the newest line fits whole' is too strict:
+    // what matters is that it is parked on the end.
+    expect(layout.list!.scrollTop + layout.list!.clientHeight).toBeGreaterThanOrEqual(layout.list!.scrollHeight - 2);
+    // The stage may be taller than the window gives it: then it scrolls in its own card (and the
+    // axe rule for a scrollable region needs something focusable inside, which its controls are).
+    await auditA11y(page, testInfo, 'r1-live-long-1100x600', { strict: true });
+    r1.expectHealthy();
+  });
+
+  test('holds the reader\'s place, offers Jump to latest, and re-pins and refocuses on it', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'one desktop run is enough for the behaviour');
+    const { page } = r1;
+    await reachLiveWithConversation(r1);
+    const log = page.getByRole('log', { name: 'Transcript' });
+    await expect(log).toBeVisible();
+    await expect(page.getByRole('button', { name: /Jump to latest/ })).toHaveCount(0);
+
+    // Scroll to the top to reread; a new line arrives; nothing moves.
+    await log.evaluate((element) => {
+      element.scrollTop = 0;
+    });
+    await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+    await r1.mock.caption('c41', 'A brand new line arrives while the candidate is rereading.', true);
+    await expect(page.getByRole('button', { name: 'Jump to latest (1 new)' })).toBeVisible();
+    expect(await log.evaluate((element) => Math.round(element.scrollTop))).toBe(0);
+    expect((await liveLayout(page)).pageScrollHeight).toBeLessThanOrEqual(901);
+    await auditA11y(page, testInfo, 'r1-live-long-jump', { strict: true });
+
+    await page.getByRole('button', { name: 'Jump to latest (1 new)' }).click();
+    await expect(page.getByRole('button', { name: /Jump to latest/ })).toHaveCount(0);
+    await expect(log).toBeFocused();
+    const after = await liveLayout(page);
+    expect(after.newestLineInView).toBe(true);
+    expect(after.list!.scrollTop + after.list!.clientHeight).toBeGreaterThanOrEqual(after.list!.scrollHeight - 2);
+
+    // Following again: the next line stays in view with no further action.
+    await r1.mock.caption('c42', 'And one more, after the jump.', true);
+    await expect(page.locator('.candidate-caption', { hasText: 'And one more' })).toBeAttached();
+    await expect.poll(async () => (await liveLayout(page)).newestLineInView).toBe(true);
+    r1.expectHealthy();
+  });
+
+  test('keeps the existing caption text findable exactly once', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'text lookups do not depend on the window');
+    const { page } = r1;
+    await reachLiveWithConversation(r1, 12);
+    await expect(page.getByText('Line 3. Honestly')).toHaveCount(1);
+    r1.expectHealthy();
+  });
+
+  test('on a phone the page scrolls naturally, with no dead space, and the captions card is bounded', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'mobile', 'the phone layout runs on the mobile project');
+    const { page } = r1;
+    await reachLiveWithConversation(r1);
+
+    const layout = await liveLayout(page);
+    expect(layout.viewport).toEqual({ width: 390, height: 844 });
+    // The page is allowed to scroll here (stage, lead card and captions stack) ...
+    expect(layout.pageScrollHeight).toBeGreaterThan(layout.viewport.height);
+    // ... but the captions card is its own bounded region: clamp(240px, 45dvh, 440px) = 380px.
+    expect(layout.captionsCard?.height).toBeGreaterThanOrEqual(240);
+    expect(layout.captionsCard?.height).toBeLessThanOrEqual(440);
+    expect(layout.list!.scrollHeight).toBeGreaterThan(layout.list!.clientHeight + 100);
+    expect(layout.newestLineInView).toBe(true);
+    // Nothing hangs below the captions card but the page padding: the decorative blob is clipped.
+    const tail = await page.evaluate(
+      (bottom) => (document.scrollingElement?.scrollHeight ?? 0) - bottom - window.scrollY,
+      layout.captionsCard!.bottom,
+    );
+    expect(tail, 'blank scroll below the last card').toBeLessThanOrEqual(60);
+
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-long-390x844', { strict: true });
     r1.expectHealthy();
   });
 });

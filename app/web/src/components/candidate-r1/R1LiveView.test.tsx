@@ -121,6 +121,23 @@ describe('captions', () => {
     renderLive();
     expect(screen.getByText('Listening for the interviewer…')).toBeVisible();
   });
+
+  it('keeps a long interview in one focusable log inside the captions card', () => {
+    const captions: R1Caption[] = Array.from({ length: 50 }, (_, index) => ({
+      id: `c${index}`,
+      text: `Line ${index} of the interview.`,
+      final: true,
+      speaker: 'interviewer',
+    }));
+    renderLive({ captions, leadVisible: true, phase: 'roleplay' });
+    const region = screen.getByRole('region', { name: 'Live captions' });
+    const log = within(region).getByRole('log', { name: 'Transcript' });
+    expect(log).toHaveAttribute('tabindex', '0');
+    expect(log.querySelectorAll('.candidate-caption')).toHaveLength(50);
+    // The lead card sits above the captions card in the same column, not inside the log.
+    expect(screen.getByRole('region', { name: 'Your role-play' })).not.toContainElement(log);
+    expect(document.querySelectorAll('[role="log"]')).toHaveLength(1);
+  });
 });
 
 describe('controls', () => {

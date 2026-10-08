@@ -143,6 +143,42 @@ describe('R1 trusts only the agent', () => {
   });
 });
 
+describe('R1 live view fits the window and bounds its captions', () => {
+  // jsdom has no layout, so the chain of heights that makes the captions list the only
+  // scroller is pinned here; e2e/candidate-r1.e2e.ts measures it in a real browser.
+  const css = read('src/styles/candidate-r1.css');
+
+  it('locks the desktop shell to the viewport height, with a modifier the page opts into', () => {
+    expect(css).toMatch(/@media \(min-width: 769px\) and \(min-height: 600px\)/);
+    expect(css).toMatch(/\.candidate-shell--fill \{[^}]*height: 100dvh;[^}]*overflow: hidden/);
+    expect(css).toMatch(/\.candidate-shell--fill \.r1-live \{[^}]*grid-template-rows: minmax\(0, 1fr\)/);
+    expect(read('src/pages/R1JoinPage.tsx')).toMatch(/<R1Shell fill=\{stage\.name === 'live'\}>/);
+  });
+
+  it('lets the stage scroll inside its card rather than clip when the window is short', () => {
+    expect(css).toMatch(/\.candidate-shell--fill \.r1-live__stage \{[^}]*overflow-y: auto/);
+  });
+
+  it('makes the captions list, and only the list, the scroller of the right column', () => {
+    expect(css).toMatch(/\.r1-live \.candidate-interview__captions \{[^}]*flex: 1 1 0;[^}]*min-height: 180px/);
+    expect(css).toMatch(/\.r1-captions__body \{[^}]*min-height: 0/);
+    expect(css).toMatch(/\.r1-captions__list \{[^}]*min-height: 0;[^}]*overflow-y: auto/);
+  });
+
+  it('sizes the aura from the window height so the controls keep their room', () => {
+    expect(css).toMatch(/\.candidate-aura \{[^}]*width: clamp\(168px, calc\(100dvh - 600px\), 420px\)/);
+  });
+
+  it('lets a phone scroll the page and bounds the captions card instead', () => {
+    expect(css).toMatch(/@media \(max-width: 768px\), \(max-height: 599px\)/);
+    expect(css).toMatch(/\.r1-live \.candidate-interview__captions \{[^}]*height: clamp\(240px, 45dvh, 440px\)/);
+  });
+
+  it('clips the decorative blobs of the R1 shell, which would add blank scroll', () => {
+    expect(css).toMatch(/\.r1-shell \{ overflow: clip; \}/);
+  });
+});
+
 describe('R1 publishes the plan camera budget and nothing else', () => {
   it('has the 640x360, 15 fps, 500 kbps, no-simulcast numbers in exactly one module', () => {
     const media = read('src/lib/r1/r1-media.ts');

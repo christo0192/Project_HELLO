@@ -92,3 +92,30 @@ export function expectCandidateHygiene(r1: R1Harness): void {
 export function bodiesOf(r1: R1Harness, path: string): Array<Record<string, unknown> | null> {
   return r1.state.requests.filter((request) => request.path === path).map((request) => request.body);
 }
+
+/** The window sizes the live view must fit: three laptop/desktop sizes and a phone. */
+export const LIVE_DESKTOP_SIZES = [
+  { width: 1366, height: 768 },
+  { width: 1440, height: 900 },
+  { width: 1920, height: 1080 },
+] as const;
+
+const LONG_CAPTION =
+  'Honestly I am not sure yet, the price feels high for me right now and I would need to talk it over at home first.';
+
+/**
+ * Consent already on file, straight to the live view, with an interview that has run for a
+ * while: `count` finished caption lines (the last ten in the role-play, so the lead card is on
+ * screen too). Leaves the page in the role-play with the newest line at the end of the log.
+ */
+export async function reachLiveWithConversation(r1: R1Harness, count = 40): Promise<void> {
+  await reachLive(r1);
+  await r1.mock.joinAgent();
+  await r1.mock.setPhase('icebreaker');
+  for (let index = 1; index <= count; index += 1) {
+    if (index === count - 9) await r1.mock.setPhase('roleplay');
+    await r1.mock.caption(`c${index}`, `Line ${index}. ${LONG_CAPTION}`, true);
+  }
+  await expect(r1.page.locator('.candidate-caption', { hasText: `Line ${count}.` })).toBeAttached();
+  await expect(r1.page.getByRole('region', { name: 'Your role-play' })).toBeVisible();
+}
