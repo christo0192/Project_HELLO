@@ -98,6 +98,9 @@ function setup() {
   const media = { audio, video } as unknown as R1LocalMedia;
   const handlers: R1RoomHandlers = {
     onPhase: vi.fn(),
+    onLeadName: vi.fn(),
+    onRoleplayLeft: vi.fn(),
+    onAwaitingReady: vi.fn(),
     onAgentPresent: vi.fn(),
     onAgentLevel: vi.fn(),
     onCaptions: vi.fn(),
@@ -231,6 +234,138 @@ describe('following the interviewer', () => {
     expect(attach).not.toHaveBeenCalled();
     room.emit('trackSubscribed', { kind: 'audio', attach }, {}, { kind: 4 });
     expect(attach).toHaveBeenCalledWith(audioElement);
+  });
+});
+
+describe('what else the interviewer publishes', () => {
+  const FULL_BRIEFING = {
+    phase: 'transition',
+    leadname: 'Meera Iyer',
+    rpleft: '840',
+    awaiting: 'ready',
+  };
+
+  it('reports the name, the clock and the wait that came with the phase, phase first', async () => {
+    const { controller, media, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', media);
+    const order: string[] = [];
+    vi.mocked(handlers.onPhase).mockImplementation(() => void order.push('phase'));
+    vi.mocked(handlers.onLeadName).mockImplementation(() => void order.push('name'));
+    vi.mocked(handlers.onRoleplayLeft).mockImplementation(() => void order.push('clock'));
+    vi.mocked(handlers.onAwaitingReady).mockImplementation(() => void order.push('awaiting'));
+    currentRoom().emit('participantAttributesChanged', FULL_BRIEFING, {
+      kind: 4,
+      attributes: FULL_BRIEFING,
+    });
+    expect(handlers.onPhase).toHaveBeenCalledWith('transition');
+    expect(handlers.onLeadName).toHaveBeenCalledWith('Meera Iyer');
+    expect(handlers.onRoleplayLeft).toHaveBeenCalledWith(840);
+    expect(handlers.onAwaitingReady).toHaveBeenCalledWith(true);
+    // The page must freeze the clock for the OLD phase before it takes the new number.
+    expect(order).toEqual(['phase', 'name', 'clock', 'awaiting']);
+  });
+
+  it('reacts to an attribute change that does not touch the phase', async () => {
+    const { controller, media, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', media);
+    const attributes = { phase: 'roleplay', rpleft: '810' };
+    currentRoom().emit('participantAttributesChanged', { rpleft: '810' }, { kind: 4, attributes });
+    expect(handlers.onRoleplayLeft).toHaveBeenCalledTimes(1);
+    expect(handlers.onRoleplayLeft).toHaveBeenCalledWith(810);
+    // Only what moved is reported: re-reporting the phase or the rest would restart a clock.
+    expect(handlers.onPhase).not.toHaveBeenCalled();
+    expect(handlers.onLeadName).not.toHaveBeenCalled();
+    expect(handlers.onAwaitingReady).not.toHaveBeenCalled();
+  });
+
+  it('reports a cleared attribute as gone', async () => {
+    const { controller, media, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', media);
+    // The server drops an attribute set to the empty string: it is in `changed`, not in the snapshot.
+    currentRoom().emit('participantAttributesChanged', { awaiting: '', rpleft: '' }, {
+      kind: 4,
+      attributes: { phase: 'roleplay', leadname: 'Meera Iyer' },
+    });
+    expect(handlers.onAwaitingReady).toHaveBeenCalledWith(false);
+    expect(handlers.onRoleplayLeft).toHaveBeenCalledWith(null);
+    expect(handlers.onLeadName).not.toHaveBeenCalled();
+  });
+
+  it('reports an invalid value as absent, never as the value', async () => {
+    const { controller, media, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', media);
+    const attributes = { leadname: '<script>', rpleft: '-5', awaiting: 'yes' };
+    currentRoom().emit('participantAttributesChanged', attributes, { kind: 4, attributes });
+    expect(handlers.onLeadName).toHaveBeenCalledWith(null);
+    expect(handlers.onRoleplayLeft).toHaveBeenCalledWith(null);
+    expect(handlers.onAwaitingReady).toHaveBeenCalledWith(false);
+  });
+
+  it('takes none of it from a participant that is not the agent', async () => {
+    const { controller, media, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', media);
+    const room = currentRoom();
+    room.emit('participantAttributesChanged', FULL_BRIEFING, { kind: 0, attributes: FULL_BRIEFING });
+    room.emit('participantConnected', { kind: 0, identity: 'intruder', attributes: FULL_BRIEFING });
+    expect(handlers.onPhase).not.toHaveBeenCalled();
+    expect(handlers.onLeadName).not.toHaveBeenCalled();
+    expect(handlers.onRoleplayLeft).not.toHaveBeenCalled();
+    expect(handlers.onAwaitingReady).not.toHaveBeenCalled();
+  });
+
+  it('ignores attribute changes that touch none of the keys it reads', async () => {
+    const { controller, media, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', media);
+    currentRoom().emit('participantAttributesChanged', { mood: 'calm' }, {
+      kind: 4,
+      attributes: { ...FULL_BRIEFING, mood: 'calm' },
+    });
+    expect(handlers.onPhase).not.toHaveBeenCalled();
+    expect(handlers.onLeadName).not.toHaveBeenCalled();
+    expect(handlers.onRoleplayLeft).not.toHaveBeenCalled();
+    expect(handlers.onAwaitingReady).not.toHaveBeenCalled();
+  });
+
+  it('reads everything an agent already published when the page connects', async () => {
+    const { controller, media, handlers } = setup();
+    const connecting = controller.connect('wss://x.invalid', 't', media);
+    currentRoom().remoteParticipants.set('agent', {
+      kind: 4,
+      identity: 'agent',
+      attributes: { phase: 'roleplay', leadname: 'Meera Iyer', rpleft: '300' },
+    });
+    await connecting;
+    expect(handlers.onPhase).toHaveBeenCalledWith('roleplay');
+    expect(handlers.onLeadName).toHaveBeenCalledWith('Meera Iyer');
+    expect(handlers.onRoleplayLeft).toHaveBeenCalledWith(300);
+    expect(handlers.onAwaitingReady).toHaveBeenCalledWith(false);
+  });
+
+  it('reads everything from an agent that joins after the candidate', async () => {
+    const { controller, media, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', media);
+    currentRoom().emit('participantConnected', {
+      kind: 4,
+      identity: 'agent',
+      attributes: FULL_BRIEFING,
+    });
+    expect(handlers.onLeadName).toHaveBeenCalledWith('Meera Iyer');
+    expect(handlers.onRoleplayLeft).toHaveBeenCalledWith(840);
+    expect(handlers.onAwaitingReady).toHaveBeenCalledWith(true);
+  });
+
+  it('reports nothing once the interview has ended, and nothing after phase=ended', async () => {
+    const { controller, media, handlers } = setup();
+    await controller.connect('wss://x.invalid', 't', media);
+    const room = currentRoom();
+    const ending = { phase: 'ended', leadname: 'Meera Iyer', awaiting: 'ready' };
+    room.emit('participantAttributesChanged', ending, { kind: 4, attributes: ending });
+    expect(handlers.onEnded).toHaveBeenCalledWith('agent_ended');
+    expect(handlers.onLeadName).not.toHaveBeenCalled();
+    expect(handlers.onAwaitingReady).not.toHaveBeenCalled();
+    room.emit('participantAttributesChanged', FULL_BRIEFING, { kind: 4, attributes: FULL_BRIEFING });
+    expect(handlers.onLeadName).not.toHaveBeenCalled();
+    expect(handlers.onRoleplayLeft).not.toHaveBeenCalled();
   });
 });
 

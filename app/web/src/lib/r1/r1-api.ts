@@ -33,6 +33,7 @@ export const R1_ROUTES = Object.freeze({
   preflight: '/api/r1/preflight',
   attempts: '/api/r1/attempts',
   exchange: '/api/r1/exchange',
+  ready: '/api/r1/ready',
 });
 
 /**
@@ -125,11 +126,13 @@ export const R1_CONTRACT: Readonly<Record<R1RouteName, R1RouteContract>> = Objec
   // closed), so the role-play card keeps its generic wording. `parseAttempt` still
   // sanitises a `lead` should a later PR supply one, but nothing here declares it until
   // that PR documents it in openapi.yaml and adds it to this contract.
+  // `attempt_token_expires_at` says when the token stops being accepted (five minutes after it is
+  // minted): the page reads it to know whether the token it holds still serves "I'm ready".
   attempts: route('attempts', {
     request: ['token'],
     requestOptional: ['nonce'],
     response: ['attempt_token'],
-    responseOptional: ['nonce', 'attempt_id', 'rejoin'],
+    responseOptional: ['nonce', 'attempt_id', 'rejoin', 'attempt_token_expires_at'],
   }),
   // `status` is `preparing` on the 202 while a worker boots.
   exchange: route('exchange', {
@@ -137,6 +140,23 @@ export const R1_CONTRACT: Readonly<Record<R1RouteName, R1RouteContract>> = Objec
     requestOptional: [],
     response: ['url', 'livekit_token'],
     responseOptional: ['status', 'expires_at', 'attempt_id'],
+  }),
+  // "I'm ready" during the role-play briefing: the server relays it to the interviewer in the
+  // room (the candidate's room token cannot publish data, so the browser cannot). Same body as
+  // the exchange, and the attempt token it carries must be a current one (they last five
+  // minutes). The page keeps the token it was last given (with its `attempt_token_expires_at`)
+  // and asks the rejoin branch of `attempts` for a new one only when that one is spent or about
+  // to be (R1JoinPage `sendReady`). That rejoin call is subject to the admission gates (round
+  // expiry, R1 switched off) and to the per-link start rate limit, so a mint the server refuses for
+  // good (`isFinalRefusal`) is not asked for again. The route itself also refuses once the round has
+  // lapsed, so the button cannot work in the last minutes of a link's life: the spoken "ready" does.
+  // The 200 body is `{ok:true}`; the page needs only the status, so no response field is
+  // declared or parsed.
+  ready: route('ready', {
+    request: ['attempt_token', 'nonce'],
+    requestOptional: [],
+    response: [],
+    responseOptional: [],
   }),
 });
 
@@ -257,6 +277,8 @@ export interface R1AttemptGrant {
   /** True when this token re-enters the attempt that was already live. */
   rejoin: boolean;
   lead: R1LeadCard | null;
+  /** When `attempt_token` stops being accepted (ISO time), or null when the server did not say. */
+  expires_at: string | null;
 }
 
 /** What `parseAttempt` reads off the wire, before a rejoin's nonce is filled in. */
@@ -308,6 +330,12 @@ function requireString(value: unknown): string {
 
 function optionalString(value: unknown): string | null {
   return typeof value === 'string' && value.trim().length > 0 ? value : null;
+}
+
+/** A string the browser can read as a point in time, or null. */
+function optionalTimestamp(value: unknown): string | null {
+  const text = optionalString(value);
+  return text !== null && Number.isFinite(Date.parse(text)) ? text : null;
 }
 
 function optionalFlag(value: unknown): boolean | null {
@@ -447,6 +475,7 @@ export function parseAttempt(data: unknown): R1AttemptResponse {
     attempt_id: optionalString(body.attempt_id),
     rejoin: body.rejoin === true,
     lead: normalizeLead(body.lead),
+    expires_at: optionalTimestamp(body.attempt_token_expires_at),
   };
 }
 
@@ -505,6 +534,15 @@ export const r1Api = {
 
   exchange: async (attemptToken: string, nonce: string): Promise<R1ExchangeResult> =>
     parseExchange(await call('exchange', { attempt_token: attemptToken, nonce })),
+
+  /**
+   * Tell the interviewer, through the server, that the candidate pressed "I'm ready". Resolves
+   * on any 2xx; a refusal (no live session, rate limit, a stale token) rejects with the error
+   * code. The spoken "ready" keeps working either way, so a failure is never fatal.
+   */
+  ready: async (attemptToken: string, nonce: string): Promise<void> => {
+    await call('ready', { attempt_token: attemptToken, nonce });
+  },
 };
 
 /**
@@ -545,4 +583,29 @@ export function classifyR1Error(error: unknown): R1ErrorKind {
   if ([502, 503, 504].includes(error.status)) return 'unavailable';
   if ([400, 401, 403, 404].includes(error.status)) return 'link_invalid';
   return 'unknown';
+}
+
+/**
+ * Codes the server answers that asking again cannot clear, besides the ones `classifyR1Error`
+ * already sorts as an expired or invalid link: the round was cancelled, completed or is closed to
+ * new work. `r1-contract.test.ts` checks the server still answers them and the spec still names them.
+ */
+export const R1_FINAL_REFUSAL_CODES: readonly string[] = Object.freeze(['round_not_admissible']);
+
+/**
+ * The server refused this request for a reason that will not go away (the round has lapsed or
+ * closed, the attempt is no longer live, the consent is withdrawn, or it does not know the
+ * link or nonce), so repeating it only spends the link's rate limit. False for a rate limit, an
+ * outage and a dropped network: those clear, and a retry is the right answer to them.
+ */
+export function isFinalRefusal(error: unknown): boolean {
+  switch (classifyR1Error(error)) {
+    case 'link_expired':
+    case 'link_invalid':
+    case 'attempt_not_live':
+    case 'consent_required':
+      return true;
+    default:
+      return error instanceof ApiError && R1_FINAL_REFUSAL_CODES.includes(error.message);
+  }
 }

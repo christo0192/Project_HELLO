@@ -12,9 +12,13 @@ const h = vi.hoisted(() => ({
   withdrawConsent: vi.fn(),
   createAttempt: vi.fn(),
   exchange: vi.fn(),
+  ready: vi.fn(),
   created: [] as Array<{
     handlers: {
       onPhase: (phase: string) => void;
+      onLeadName: (name: string | null) => void;
+      onRoleplayLeft: (seconds: number | null) => void;
+      onAwaitingReady: (awaiting: boolean) => void;
       onAgentPresent: (present: boolean) => void;
       onAgentLevel: (level: number) => void;
       onCaptions: (segments: unknown[], phase: string | null) => void;
@@ -46,6 +50,7 @@ vi.mock('../lib/r1/r1-api', async (importOriginal) => ({
     withdrawConsent: h.withdrawConsent,
     createAttempt: h.createAttempt,
     exchange: h.exchange,
+    ready: h.ready,
   },
 }));
 vi.mock('../lib/r1/r1-room', () => ({
@@ -121,6 +126,8 @@ const ATTEMPT = {
   attempt_id: null,
   rejoin: false,
   lead: { name: 'Meera', city: 'Pune' },
+  // The server did not say when the token ends: it is trusted only for a moment.
+  expires_at: null,
 };
 const ROOM = {
   status: 'ready',
@@ -174,6 +181,7 @@ beforeEach(() => {
   h.withdrawConsent.mockResolvedValue(undefined);
   h.createAttempt.mockResolvedValue(ATTEMPT);
   h.exchange.mockResolvedValue(ROOM);
+  h.ready.mockResolvedValue(undefined);
 });
 
 afterEach(() => {
@@ -705,7 +713,11 @@ describe('live interview', () => {
 
     act(() => live.handlers.onPhase('transition'));
     const card = screen.getByRole('region', { name: 'Your role-play' });
-    expect(within(card).getByText('Meera from Pune')).toBeVisible();
+    // The server never names the learner; until the interviewer does, the card is generic.
+    expect(within(card).getByText('A prospective learner')).toBeVisible();
+    act(() => live.handlers.onLeadName('Meera Iyer'));
+    expect(within(card).getByText('Meera Iyer')).toBeVisible();
+    expect(within(card).queryByText('A prospective learner')).toBeNull();
 
     act(() => live.handlers.onPhase('roleplay'));
     expect(screen.getByText('Role-play')).toBeVisible();
@@ -716,6 +728,15 @@ describe('live interview', () => {
 
     act(() => live.handlers.onPhase('roleplay_exit'));
     expect(screen.queryByRole('region', { name: 'Your role-play' })).toBeNull();
+  });
+
+  it('fits the live interview to the window, and no other screen', async () => {
+    await toLanding();
+    expect(document.querySelector('main.candidate-shell--fill')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+    await screen.findByRole('region', { name: 'Live video interview' });
+    expect(document.querySelector('main.candidate-shell--fill')).not.toBeNull();
   });
 
   it('hides the card again if the interview paused outside the role-play', async () => {
@@ -757,6 +778,425 @@ describe('live interview', () => {
     live.controller.setMicMuted.mockRejectedValueOnce(new Error('device busy'));
     fireEvent.click(screen.getByRole('button', { name: 'Mute microphone' }));
     expect(await screen.findByRole('alert')).toHaveTextContent(/could not change your microphone/);
+  });
+});
+
+describe('the role-play briefing, clock and "I\'m ready"', () => {
+  const READY = { name: "I'm ready" };
+
+  it('shows no button, and no clock, from an interviewer that publishes neither', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    expect(screen.queryByRole('button', READY)).toBeNull();
+    act(() => live.handlers.onPhase('roleplay'));
+    expect(screen.queryByRole('timer')).toBeNull();
+  });
+
+  it('shows the button only while the interviewer is waiting in the briefing', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onAwaitingReady(true));
+    expect(screen.getByRole('button', READY)).toBeVisible();
+    act(() => live.handlers.onAwaitingReady(false));
+    expect(screen.queryByRole('button', READY)).toBeNull();
+    act(() => live.handlers.onAwaitingReady(true));
+    act(() => live.handlers.onPhase('roleplay'));
+    expect(screen.queryByRole('button', READY)).toBeNull();
+  });
+
+  // What the attempt token costs. It lasts five minutes (the server says when, as
+  // `attempt_token_expires_at`) and the briefing comes later; a new one is the rejoin branch of
+  // `/api/r1/attempts`, which the server refuses once the round has lapsed or R1 is off and which
+  // spends from the link's start rate limit. So the page mints only when it has to.
+  describe('the attempt token it presents', () => {
+    const inMs = (ms: number) => new Date(Date.now() + ms).toISOString();
+    const FRESH = { ...ATTEMPT, attempt_token: 'fresh-token', rejoin: true };
+
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    /** Joined with a token that lasts `ms` more: the join's own, as old as the briefing makes it. */
+    async function toBriefing(ms = 280_000) {
+      h.createAttempt.mockResolvedValueOnce({ ...ATTEMPT, expires_at: inMs(ms) });
+      const live = await toLive();
+      act(() => live.handlers.onPhase('transition'));
+      act(() => live.handlers.onAwaitingReady(true));
+      return live;
+    }
+
+    /** Time passes in the page without the waits of the test (the retry wait is seconds). */
+    function clock() {
+      vi.useFakeTimers({ shouldAdvanceTime: true });
+      return (ms: number) => act(() => vi.advanceTimersByTime(ms));
+    }
+
+    it('presents the token it already holds while that has time left, and mints nothing', async () => {
+      await toBriefing();
+      h.createAttempt.mockClear();
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.createAttempt).not.toHaveBeenCalled();
+      expect(h.ready).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledWith('attempt-token', NONCE);
+    });
+
+    it('mints a current one, for the same attempt, when the one it holds has lapsed', async () => {
+      await toBriefing(-1_000);
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.createAttempt).toHaveBeenCalledWith(LINK, NONCE);
+      expect(h.ready).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
+    });
+
+    it('does not trust a token that has under a minute left: a request can arrive after it lapses', async () => {
+      await toBriefing(45_000);
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByText('Sent — starting the role-play');
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
+    });
+
+    it('mints once, not on every press: a press after a failure presents the token it minted', async () => {
+      await toBriefing(-1_000);
+      const advance = clock();
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      h.ready.mockRejectedValueOnce(new ApiError('http_503', 503));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        "We couldn't send that. Just say “I'm ready”.",
+      );
+      advance(5_500);
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledTimes(2);
+      expect(h.ready).toHaveBeenNthCalledWith(1, 'fresh-token', NONCE);
+      expect(h.ready).toHaveBeenNthCalledWith(2, 'fresh-token', NONCE);
+    });
+
+    it('never mints because a press failed for some other reason', async () => {
+      await toBriefing();
+      const advance = clock();
+      h.createAttempt.mockClear();
+      h.ready
+        .mockRejectedValueOnce(new ApiError('http_500', 500))
+        .mockRejectedValueOnce(new ApiError('not_live', 409));
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByRole('alert');
+      advance(5_500);
+      fireEvent.click(screen.getByRole('button', READY));
+      await waitFor(() => expect(h.ready).toHaveBeenCalledTimes(2));
+      await screen.findByRole('alert');
+      expect(h.createAttempt).not.toHaveBeenCalled();
+    });
+
+    it('waits before it can be pressed again, whatever the failure, so a refusal is not hammered', async () => {
+      await toBriefing();
+      const advance = clock();
+      h.ready.mockRejectedValueOnce(new ApiError('http_500', 500));
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByRole('alert');
+      fireEvent.click(screen.getByRole('button', READY));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(h.ready).toHaveBeenCalledTimes(1);
+      advance(5_500);
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.ready).toHaveBeenCalledTimes(2);
+    });
+
+    it('says what to do instead when the server is asking it to slow down, and waits longer', async () => {
+      await toBriefing();
+      const advance = clock();
+      h.ready.mockRejectedValueOnce(new ApiError('http_429', 429));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByRole('alert')).toHaveTextContent(
+        "We couldn't send that. Just say “I'm ready”.",
+      );
+      advance(6_000);
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(h.ready).toHaveBeenCalledTimes(1);
+      advance(10_000);
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.ready).toHaveBeenCalledTimes(2);
+    });
+
+    it('tries once more with a new token when the server refuses the one it holds', async () => {
+      await toBriefing();
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      // A browser clock that is behind the server's: the token looked good and was not.
+      h.ready.mockRejectedValueOnce(new ApiError('r1_attempt_invalid', 404));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenNthCalledWith(1, 'attempt-token', NONCE);
+      expect(h.ready).toHaveBeenNthCalledWith(2, 'fresh-token', NONCE);
+    });
+
+    it('gives up after that one new token, and says so the usual way', async () => {
+      await toBriefing();
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      h.ready.mockRejectedValue(new ApiError('r1_attempt_invalid', 404));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByRole('alert')).toHaveTextContent(/couldn't send that/);
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledTimes(2);
+    });
+
+    it('trusts a token the server gave no end time for only for a moment', async () => {
+      // The join's grant carries no `expires_at` (as before the server said it): fine to retry
+      // with straight away, not minutes later.
+      h.createAttempt.mockResolvedValueOnce({ ...ATTEMPT, expires_at: null });
+      const live = await toLive();
+      const advance = clock();
+      act(() => live.handlers.onPhase('transition'));
+      act(() => live.handlers.onAwaitingReady(true));
+      advance(60_000);
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByText('Sent — starting the role-play');
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
+    });
+
+    // A mint the server refuses for good (the round has lapsed, the attempt is over) would be refused
+    // again, and each ask spends the link's start rate limit that a real rejoin needs.
+    it.each([
+      ['round_expired', 409],
+      ['round_not_admissible', 409],
+      ['r1_attempt_not_live', 409],
+      ['consent_required', 409],
+      ['r1_attempt_invalid', 404],
+    ])('does not ask for a token again once the server refused one for good (%s)', async (code, status) => {
+      await toBriefing(-1_000);
+      const advance = clock();
+      h.createAttempt.mockClear();
+      h.createAttempt.mockRejectedValue(new ApiError(code, status));
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByRole('alert')).toHaveTextContent(/couldn't send that/);
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+
+      // Press after press, a minute apart: the button says the same thing and the server hears nothing.
+      for (let press = 0; press < 3; press += 1) {
+        advance(16_000);
+        fireEvent.click(screen.getByRole('button', READY));
+        await waitFor(() => expect(screen.getByRole('alert')).toBeVisible());
+      }
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).not.toHaveBeenCalled();
+      // The interview, the nonce and the spoken "ready" are untouched.
+      expect(screen.getByRole('region', { name: 'Live video interview' })).toBeVisible();
+      expect(readNonce(LINK)).toBe(NONCE);
+    });
+
+    it.each([
+      ['http_429', 429],
+      ['service_unavailable', 503],
+      ['network_unreachable', 0],
+    ])('asks again after a mint that failed for a reason that clears (%s)', async (code, status) => {
+      await toBriefing(-1_000);
+      const advance = clock();
+      h.createAttempt.mockClear();
+      h.createAttempt.mockRejectedValueOnce(new ApiError(code, status));
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByRole('alert');
+      advance(16_000);
+      fireEvent.click(screen.getByRole('button', READY));
+      expect(await screen.findByText('Sent — starting the role-play')).toBeVisible();
+      expect(h.createAttempt).toHaveBeenCalledTimes(2);
+      expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
+    });
+
+    it('forgets a refusal when the candidate rejoins: that is a new attempt, with its own token', async () => {
+      const live = await toBriefing(-1_000);
+      h.createAttempt.mockClear();
+      h.createAttempt.mockRejectedValueOnce(new ApiError('round_expired', 409));
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByRole('alert');
+      act(() => live.handlers.onEnded('disconnected'));
+      await findH1('The connection to your interview ended.');
+      // The rejoin works (the round is open after all) and hands out a token that has already lapsed.
+      h.createAttempt.mockResolvedValueOnce({
+        ...ATTEMPT,
+        attempt_token: 'rejoin-token',
+        rejoin: true,
+        expires_at: inMs(-1_000),
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Rejoin interview' }));
+      await findH1('Video interview');
+      fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+      await screen.findByRole('region', { name: 'Live video interview' });
+      const again = h.created[h.created.length - 1];
+      act(() => again.handlers.onPhase('transition'));
+      act(() => again.handlers.onAwaitingReady(true));
+      h.createAttempt.mockClear();
+      h.createAttempt.mockResolvedValue({ ...FRESH, expires_at: inMs(300_000) });
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByText('Sent — starting the role-play');
+      expect(h.createAttempt).toHaveBeenCalledTimes(1);
+      expect(h.ready).toHaveBeenCalledWith('fresh-token', NONCE);
+    });
+
+    it('starts over with the attempt a rejoin gives it, never with the last one\'s token', async () => {
+      const live = await toBriefing();
+      act(() => live.handlers.onEnded('disconnected'));
+      await findH1('The connection to your interview ended.');
+      h.createAttempt.mockResolvedValueOnce({
+        ...ATTEMPT,
+        attempt_token: 'rejoin-token',
+        rejoin: true,
+        expires_at: inMs(290_000),
+      });
+      fireEvent.click(screen.getByRole('button', { name: 'Rejoin interview' }));
+      await findH1('Video interview');
+      fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+      await screen.findByRole('region', { name: 'Live video interview' });
+      const again = h.created[h.created.length - 1];
+      act(() => again.handlers.onPhase('transition'));
+      act(() => again.handlers.onAwaitingReady(true));
+      h.createAttempt.mockClear();
+      fireEvent.click(screen.getByRole('button', READY));
+      await screen.findByText('Sent — starting the role-play');
+      expect(h.createAttempt).not.toHaveBeenCalled();
+      expect(h.ready).toHaveBeenCalledWith('rejoin-token', NONCE);
+    });
+  });
+
+  it('reports a failure to mint the attempt token the same way, and sends nothing', async () => {
+    h.createAttempt.mockResolvedValueOnce({ ...ATTEMPT, expires_at: new Date(Date.now() - 1_000).toISOString() });
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onAwaitingReady(true));
+    h.createAttempt.mockRejectedValueOnce(new ApiError('r1_attempt_not_live', 409));
+    fireEvent.click(screen.getByRole('button', READY));
+    expect(await screen.findByRole('alert')).toHaveTextContent(/couldn't send that/);
+    expect(h.ready).not.toHaveBeenCalled();
+  });
+
+  it('keeps the interview going, and the nonce, when "I\'m ready" fails', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onAwaitingReady(true));
+    h.ready.mockRejectedValueOnce(new ApiError('not_live', 409));
+    fireEvent.click(screen.getByRole('button', READY));
+    await screen.findByRole('alert');
+    expect(screen.getByRole('region', { name: 'Live video interview' })).toBeVisible();
+    expect(readNonce(LINK)).toBe(NONCE);
+    expect(live.controller.dispose).not.toHaveBeenCalled();
+  });
+
+  it('shows the clock from the interviewer, counted down only while the role-play runs', async () => {
+    const live = await toLive();
+    // Faked only now: the waits above use real timers, and the page measures with performance.now().
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] });
+    try {
+      act(() => live.handlers.onPhase('transition'));
+      act(() => live.handlers.onRoleplayLeft(480));
+      // In the briefing the role-play has not begun: it holds at the full budget.
+      act(() => {
+        vi.advanceTimersByTime(120_000);
+      });
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 8 min left');
+
+      act(() => live.handlers.onPhase('roleplay'));
+      act(() => {
+        vi.advanceTimersByTime(65_000);
+      });
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 7 min left');
+
+      // An aside pauses it at the value it had counted down to, however long the aside is.
+      act(() => live.handlers.onPhase('aside'));
+      act(() => {
+        vi.advanceTimersByTime(300_000);
+      });
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 7 min left');
+
+      // A fresh number from the interviewer wins over the local count.
+      act(() => live.handlers.onRoleplayLeft(200));
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 4 min left');
+      act(() => live.handlers.onPhase('roleplay'));
+      act(() => {
+        vi.advanceTimersByTime(30_000);
+      });
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 3 min left');
+
+      // The interviewer clears it when the role-play is over.
+      act(() => live.handlers.onRoleplayLeft(null));
+      expect(screen.queryByRole('timer')).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('takes the number that arrives with a phase change after freezing the old count', async () => {
+    const live = await toLive();
+    vi.useFakeTimers({ toFake: ['setInterval', 'clearInterval', 'performance'] });
+    try {
+      act(() => live.handlers.onPhase('roleplay'));
+      act(() => live.handlers.onRoleplayLeft(300));
+      act(() => {
+        vi.advanceTimersByTime(40_000);
+      });
+      // The room reports the phase first, then the clock that came with it.
+      act(() => {
+        live.handlers.onPhase('aside');
+        live.handlers.onRoleplayLeft(255);
+      });
+      act(() => {
+        vi.advanceTimersByTime(600_000);
+      });
+      expect(screen.getByRole('timer')).toHaveTextContent('Role-play · 5 min left');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('forgets the name, the clock and the wait when the candidate rejoins', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onLeadName('Meera Iyer'));
+    act(() => live.handlers.onRoleplayLeft(480));
+    act(() => live.handlers.onAwaitingReady(true));
+    expect(screen.getByRole('button', READY)).toBeVisible();
+    act(() => live.handlers.onEnded('disconnected'));
+    await findH1('The connection to your interview ended.');
+    fireEvent.click(screen.getByRole('button', { name: 'Rejoin interview' }));
+    await findH1('Video interview');
+    fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+    await screen.findByRole('region', { name: 'Live video interview' });
+    // The new room starts blank; what the interviewer still publishes arrives from the room.
+    expect(screen.queryByRole('button', READY)).toBeNull();
+    expect(screen.queryByRole('timer')).toBeNull();
+    const again = h.created[h.created.length - 1];
+    act(() => again.handlers.onPhase('transition'));
+    expect(screen.getByText('A prospective learner')).toBeVisible();
+    expect(screen.queryByText('Meera Iyer')).toBeNull();
+  });
+
+  it('sends nothing to the server about "ready" unless the candidate presses the button', async () => {
+    const live = await toLive();
+    act(() => live.handlers.onPhase('transition'));
+    act(() => live.handlers.onAwaitingReady(true));
+    act(() => live.handlers.onPhase('roleplay'));
+    act(() => live.handlers.onAwaitingReady(false));
+    expect(h.ready).not.toHaveBeenCalled();
   });
 });
 

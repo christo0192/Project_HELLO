@@ -11,6 +11,7 @@ import {
   parsePreflight,
   parseStatus,
   R1_CONTRACT,
+  R1_FINAL_REFUSAL_CODES,
   R1_ROUTES,
   R1_SERVER_ERROR_CODES,
   R1_STATUS_VOCABULARY,
@@ -91,6 +92,7 @@ const FULL_RESPONSES: Record<R1RouteName, unknown> = {
     nonce: NONCE,
     attempt_id: 'session',
     rejoin: false,
+    attempt_token_expires_at: '2026-10-07T00:05:00.000Z',
   },
   exchange: {
     status: 'ready',
@@ -99,6 +101,7 @@ const FULL_RESPONSES: Record<R1RouteName, unknown> = {
     expires_at: '2026-10-07T00:10:00Z',
     attempt_id: 's',
   },
+  ready: { ok: true },
 };
 
 interface Invocation {
@@ -128,6 +131,7 @@ const INVOCATIONS: Record<R1RouteName, Invocation[]> = {
     { label: 'rejoin', run: () => r1Api.createAttempt(LINK, NONCE) },
   ],
   exchange: [{ label: 'exchange', run: () => r1Api.exchange('attempt', NONCE) }],
+  ready: [{ label: 'ready', run: () => r1Api.ready('attempt', NONCE) }],
 };
 
 describe('r1-api sends what R1_CONTRACT declares', () => {
@@ -309,8 +313,25 @@ function successResponses(operation: string[]): string[] {
   return entries.length > 0 ? entries.map((entry) => entry.join('\n')) : [responses.join('\n')];
 }
 
-/** Everything wrong between `specText` and R1_CONTRACT, as readable lines. */
-function contractProblems(specText: string): string[] {
+/**
+ * Routes the web calls that the server has not shipped yet. The web may land first: while the
+ * spec does not document the path the route is skipped here (and the page never shows the
+ * feature, because the worker does not raise the signal that reveals it), and the moment the
+ * spec documents it the route is checked like every other one. Nothing to edit when the server
+ * lands; the pending allowance simply stops being used.
+ *
+ *   ready: "I'm ready" during the role-play briefing (R1-Q: the server relays it to the worker).
+ */
+const PENDING_ON_SERVER: ReadonlySet<R1RouteName> = new Set<R1RouteName>(['ready']);
+
+/**
+ * Everything wrong between `specText` and R1_CONTRACT, as readable lines. A route in `pending`
+ * that the spec does not document yet is not a problem; one it does document is checked.
+ */
+function contractProblems(
+  specText: string,
+  pending: ReadonlySet<R1RouteName> = new Set(),
+): string[] {
   const spec = splitLines(specText);
   const paths = nested(spec, 'paths', 0) ?? [];
   const problems: string[] = [];
@@ -320,7 +341,7 @@ function contractProblems(specText: string): string[] {
     const where = `${contract.method} ${contract.path}`;
     const pathBlock = nested(paths, contract.path, 2);
     if (!pathBlock) {
-      problems.push(`${where}: path is not documented`);
+      if (!pending.has(name)) problems.push(`${where}: path is not documented`);
       continue;
     }
     const operation = nested(pathBlock, method, 4);
@@ -368,7 +389,7 @@ describe('openapi.yaml documents the R1 candidate contract', () => {
     'documents every route, request field and required response field the web relies on ' +
       '(SKIPPED while PR-3 has not documented /api/r1/*: the contract is UNVERIFIED)',
     () => {
-      expect(contractProblems(REAL_SPEC)).toEqual([]);
+      expect(contractProblems(REAL_SPEC, PENDING_ON_SERVER)).toEqual([]);
     },
   );
 
@@ -433,6 +454,17 @@ describe('the error codes the web acts on are the ones the server answers', () =
         (code) => !SERVER_SOURCE.includes(`'${code}'`),
       );
       const undocumented = R1_SERVER_ERROR_CODES.filter(
+        (code) => !new RegExp(`\\b${code}\\b`).test(CANDIDATE_SPEC),
+      );
+      expect({ unanswered, undocumented }).toEqual({ unanswered: [], undocumented: [] });
+    },
+  );
+
+  it.skipIf(!SPEC_DOCUMENTS_R1_CANDIDATE_ROUTES || SERVER_SOURCE === '')(
+    'every code that is final for the web (so "I\'m ready" never asks again) is answered and documented',
+    () => {
+      const unanswered = R1_FINAL_REFUSAL_CODES.filter((code) => !SERVER_SOURCE.includes(`'${code}'`));
+      const undocumented = R1_FINAL_REFUSAL_CODES.filter(
         (code) => !new RegExp(`\\b${code}\\b`).test(CANDIDATE_SPEC),
       );
       expect({ unanswered, undocumented }).toEqual({ unanswered: [], undocumented: [] });
@@ -624,5 +656,33 @@ describe('the contract checker', () => {
   it('reports every route for a spec that documents none of them', () => {
     const spec = 'openapi: 3.0.3\npaths:\n  /api/health:\n    get: {}\n';
     expect(contractProblems(spec)).toHaveLength(NAMES.length);
+  });
+
+  it('lets a route the server has not shipped yet be undocumented, and nothing else', () => {
+    const spec = syntheticSpec((name, parts) => {
+      if (name === 'ready') parts.documented = false;
+    });
+    expect(contractProblems(spec)).toEqual(['POST /api/r1/ready: path is not documented']);
+    expect(contractProblems(spec, PENDING_ON_SERVER)).toEqual([]);
+    // Pending covers only the routes named: any other missing route is still a problem.
+    const missing = syntheticSpec((name, parts) => {
+      if (name === 'ready' || name === 'exchange') parts.documented = false;
+    });
+    expect(contractProblems(missing, PENDING_ON_SERVER)).toEqual([
+      'POST /api/r1/exchange: path is not documented',
+    ]);
+  });
+
+  it('checks a pending route in full the moment the spec documents it', () => {
+    const spec = syntheticSpec((name, parts) => {
+      if (name === 'ready') parts.request = without(parts.request, 'nonce');
+    });
+    expect(contractProblems(spec, PENDING_ON_SERVER)).toEqual([
+      'POST /api/r1/ready: request lacks nonce',
+    ]);
+  });
+
+  it('keeps the pending allowance to the one route that is awaiting the server', () => {
+    expect([...PENDING_ON_SERVER]).toEqual(['ready']);
   });
 });

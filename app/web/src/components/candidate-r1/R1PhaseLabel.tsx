@@ -1,4 +1,10 @@
-import { R1_NO_PHASE_LABELS, R1_PHASE_LABELS, type R1Phase } from '../../lib/r1/r1-phase';
+import type { Ref } from 'react';
+import {
+  R1_NO_PHASE_LABELS,
+  R1_PHASE_LABELS,
+  R1_READY_DETAIL,
+  type R1Phase,
+} from '../../lib/r1/r1-phase';
 
 interface R1PhaseLabelProps {
   /** The agent's current phase, or null before the interviewer has announced one. */
@@ -8,6 +14,17 @@ interface R1PhaseLabelProps {
    * announced, this separates "waiting for your interviewer" from "in progress".
    */
   agentPresent: boolean;
+  /**
+   * The interviewer is waiting for the candidate to say they are ready and the "I'm ready"
+   * button is showing: the transition line then says so, which a screen reader announces.
+   */
+  readyHint?: boolean;
+  /**
+   * The panel can be focused by script (never by Tab): when a control that held the keyboard
+   * goes away because the phase moved on, the live view parks the focus here, on the very
+   * panel that announces the change.
+   */
+  regionRef?: Ref<HTMLDivElement>;
 }
 
 /**
@@ -18,11 +35,19 @@ interface R1PhaseLabelProps {
  * candidate reading "Waiting for your interviewer to join" while the interviewer
  * is talking, so presence alone moves the label to a neutral "in progress".
  */
-export function R1PhaseLabel({ phase, agentPresent }: R1PhaseLabelProps) {
+export function R1PhaseLabel({
+  phase,
+  agentPresent,
+  readyHint = false,
+  regionRef,
+}: R1PhaseLabelProps) {
   const unannounced = agentPresent ? 'inProgress' : 'waiting';
   const copy = phase ? R1_PHASE_LABELS[phase] : R1_NO_PHASE_LABELS[unannounced];
+  const detail = phase === 'transition' && readyHint ? R1_READY_DETAIL : copy.detail;
   return (
     <div
+      ref={regionRef}
+      tabIndex={-1}
       className="r1-phase"
       data-phase={phase ?? (agentPresent ? 'unannounced' : 'none')}
       role="status"
@@ -30,7 +55,7 @@ export function R1PhaseLabel({ phase, agentPresent }: R1PhaseLabelProps) {
       aria-atomic="true"
     >
       <p className="r1-phase__label">{copy.label}</p>
-      <p className="r1-phase__detail">{copy.detail}</p>
+      <p className="r1-phase__detail">{detail}</p>
     </div>
   );
 }

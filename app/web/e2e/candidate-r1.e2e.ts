@@ -23,17 +23,30 @@ import { auditA11y } from './fixtures/axe';
 import { expect, test } from './fixtures/candidate-harness';
 import {
   agree,
+  backToBriefing,
   bodiesOf,
   expectCandidateHygiene,
   expectMobileFits,
   heading,
+  LEARNER_NAME,
+  LIVE_DESKTOP_SIZES,
+  NARROW_WINDOWS,
   openLink,
   passDeviceCheck,
+  FIT_WINDOWS,
+  reachBriefing,
   reachLive,
+  reachLiveWithConversation,
   storedNonce,
   storedNonceRaw,
 } from './fixtures/candidate-flows';
-import { R1_ATTEMPT_TOKEN, R1_LINK_TOKEN, R1_NONCE } from './fixtures/r1-candidate-api';
+import { horizontalOverflow, insideStage, liveLayout, mediaRow } from './fixtures/layout';
+import {
+  R1_ATTEMPT_TOKEN,
+  R1_FRESH_ATTEMPT_TOKEN,
+  R1_LINK_TOKEN,
+  R1_NONCE,
+} from './fixtures/r1-candidate-api';
 
 test.describe('link and notice', () => {
   test('a link with no token is refused without a single API call', async ({ r1 }, testInfo) => {
@@ -311,8 +324,13 @@ test.describe('the full interview', () => {
     // The role-play: lead card and label, learner-labelled captions.
     await r1.mock.setPhase('transition');
     const lead = page.getByRole('region', { name: 'Your role-play' });
-    // PR-3 never returns the persona, so the card keeps its generic wording (no name or city).
+    // The server never returns the persona and this interviewer has not named the learner yet,
+    // so the card keeps its generic wording; the course facts do not wait for a name.
     await expect(lead.getByText('A prospective learner')).toBeVisible();
+    await expect(lead).toContainText('$9,000');
+    await r1.mock.setAgentAttributes({ leadname: LEARNER_NAME });
+    await expect(lead.getByText(LEARNER_NAME)).toBeVisible();
+    await expect(lead.getByText('A prospective learner')).toHaveCount(0);
     await r1.mock.setPhase('roleplay');
     await expect(page.getByRole('status').filter({ hasText: 'You are the Program Advisor' })).toBeVisible();
     await r1.mock.caption('c2', 'Hello? Yes, this is Meera speaking.', true);
@@ -555,6 +573,861 @@ test.describe('join failures keep the link valid and release the devices', () =>
     expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
       { token: R1_LINK_TOKEN },
       { token: R1_LINK_TOKEN, nonce: R1_NONCE },
+    ]);
+    r1.expectHealthy();
+  });
+});
+
+/**
+ * The live view in a long interview: forty lines of captions with the lead card on screen.
+ * jsdom has no layout, so this is the only place the viewport fit is proven. On a desktop-sized
+ * window the PAGE must not scroll (the captions list is the scroller); on a phone the page
+ * scrolls naturally and the captions card is bounded.
+ */
+test.describe('live layout with a long interview', () => {
+  for (const size of LIVE_DESKTOP_SIZES) {
+    test(`fits a ${size.width}x${size.height} window and scrolls the captions inside`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop sizes run on the desktop project');
+      const { page } = r1;
+      await page.setViewportSize(size);
+      await reachLiveWithConversation(r1);
+
+      const layout = await liveLayout(page);
+      expect(layout.viewport).toEqual(size);
+      expect(layout.pageScrollHeight, 'the page must not scroll').toBeLessThanOrEqual(size.height + 1);
+      // The window is filled, not just fitted: the stage card runs down to the bottom margin.
+      expect(layout.captionsCard?.bottom).toBeLessThanOrEqual(size.height);
+      expect(layout.stage?.bottom).toBeLessThanOrEqual(size.height);
+      expect(layout.list, 'the captions list').not.toBeNull();
+      expect(layout.list!.scrollHeight, 'forty lines overflow the list').toBeGreaterThan(layout.list!.clientHeight + 100);
+      expect(layout.list!.bottom).toBeLessThanOrEqual(size.height);
+      expect(layout.newestLineInView, 'the list follows the newest line').toBe(true);
+      expect(layout.jumpButton).toBeNull();
+      // The controls never sit below the fold.
+      expect(layout.controlsBottom).not.toBeNull();
+      expect(layout.controlsBottom!).toBeLessThanOrEqual(size.height);
+      // The candidate's own camera keeps its 16:9 box (it was crushed to a sliver, or to nothing,
+      // when it was a shrinkable flex item in the stage column).
+      expect(layout.selfview!.height, 'the camera keeps its box').toBeGreaterThanOrEqual(100);
+
+      await auditA11y(page, testInfo, `r1-live-long-${size.width}x${size.height}`, { strict: true });
+      r1.expectHealthy();
+    });
+  }
+
+  test('still fits the shortest window it fills (480 px high)', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'desktop sizes run on the desktop project');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1100, height: 480 });
+    await reachLiveWithConversation(r1);
+
+    const layout = await liveLayout(page);
+    expect(layout.pageScrollHeight, 'the page must not scroll').toBeLessThanOrEqual(481);
+    expect(layout.captionsCard?.bottom).toBeLessThanOrEqual(480);
+    expect(layout.stage?.bottom).toBeLessThanOrEqual(480);
+    expect(layout.list!.clientHeight, 'the facts strip leaves the list a usable height').toBeGreaterThanOrEqual(110);
+    // The aura and the camera give up their last pixels below 580 px (168x95), but keep a whole 16:9 box.
+    expect(layout.selfview!.height, 'the camera is never crushed').toBeGreaterThanOrEqual(90);
+    // The list is only about one caption tall here, so 'the newest line fits whole' is too strict:
+    // what matters is that it is parked on the end.
+    expect(layout.list!.scrollTop + layout.list!.clientHeight).toBeGreaterThanOrEqual(layout.list!.scrollHeight - 2);
+    // The stage may be taller than the window gives it: then it scrolls in its own card (and the
+    // axe rule for a scrollable region needs something focusable inside, which its controls are).
+    await auditA11y(page, testInfo, 'r1-live-long-1100x480', { strict: true });
+    r1.expectHealthy();
+  });
+
+  test('the briefing (scenario card and ready button) fits a 1366x768 window with the page still, and the button in view', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'desktop sizes run on the desktop project');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await reachLiveWithConversation(r1);
+    // Back to the briefing: the clock is gone (the interviewer clears it), the wait is on.
+    await r1.mock.setAgentAttributes({ phase: 'transition', rpleft: '', awaiting: 'ready' });
+    const ready = page.getByRole('button', { name: "I'm ready" });
+    await expect(ready).toBeVisible();
+    await expect(page.getByRole('timer')).toHaveCount(0);
+
+    const layout = await liveLayout(page);
+    expect(layout.pageScrollHeight, 'the page must not scroll').toBeLessThanOrEqual(769);
+    expect(layout.captionsCard?.bottom).toBeLessThanOrEqual(768);
+    expect(layout.list!.clientHeight, 'the captions keep room beside the scenario card').toBeGreaterThanOrEqual(220);
+    expect(layout.newestLineInView).toBe(true);
+    // The stage holds the clock or the button AND the controls without scrolling inside its card.
+    expect(layout.stage!.scrollHeight).toBeLessThanOrEqual(layout.stage!.clientHeight + 1);
+    const box = await ready.boundingBox();
+    expect(box, 'the ready button is laid out').not.toBeNull();
+    expect(box!.y).toBeGreaterThanOrEqual(0);
+    expect(box!.y + box!.height).toBeLessThanOrEqual(768);
+    expect(box!.height).toBeGreaterThanOrEqual(44);
+    await auditA11y(page, testInfo, 'r1-live-briefing-1366x768', { strict: true });
+    r1.expectHealthy();
+  });
+
+  test('on a phone the ready button is in the first screen, above the scenario card and the captions', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'mobile', 'the phone layout runs on the mobile project');
+    const { page } = r1;
+    await reachBriefing(r1);
+    const ready = page.getByRole('button', { name: "I'm ready" });
+    const box = await ready.boundingBox();
+    expect(box).not.toBeNull();
+    // No scrolling needed: it is in the stage, which comes first on a phone.
+    expect(await page.evaluate(() => window.scrollY)).toBe(0);
+    expect(box!.y + box!.height).toBeLessThanOrEqual(844);
+    expect(box!.height).toBeGreaterThanOrEqual(44);
+    const card = await page.getByRole('region', { name: 'Your role-play' }).boundingBox();
+    expect(card!.y, 'the card follows the stage').toBeGreaterThan(box!.y);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-briefing-390x844', { strict: true });
+    r1.expectHealthy();
+  });
+
+  test('holds the reader\'s place, offers Jump to latest, and re-pins and refocuses on it', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'one desktop run is enough for the behaviour');
+    const { page } = r1;
+    await reachLiveWithConversation(r1);
+    const log = page.getByRole('log', { name: 'Transcript' });
+    await expect(log).toBeVisible();
+    await expect(page.getByRole('button', { name: /Jump to latest/ })).toHaveCount(0);
+
+    // Scroll to the top to reread; a new line arrives; nothing moves.
+    await log.evaluate((element) => {
+      element.scrollTop = 0;
+    });
+    await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+    await r1.mock.caption('c41', 'A brand new line arrives while the candidate is rereading.', true);
+    await expect(page.getByRole('button', { name: 'Jump to latest (1 new)' })).toBeVisible();
+    expect(await log.evaluate((element) => Math.round(element.scrollTop))).toBe(0);
+    expect((await liveLayout(page)).pageScrollHeight).toBeLessThanOrEqual(901);
+    await auditA11y(page, testInfo, 'r1-live-long-jump', { strict: true });
+
+    await page.getByRole('button', { name: 'Jump to latest (1 new)' }).click();
+    await expect(page.getByRole('button', { name: /Jump to latest/ })).toHaveCount(0);
+    await expect(log).toBeFocused();
+    const after = await liveLayout(page);
+    expect(after.newestLineInView).toBe(true);
+    expect(after.list!.scrollTop + after.list!.clientHeight).toBeGreaterThanOrEqual(after.list!.scrollHeight - 2);
+
+    // Following again: the next line stays in view with no further action.
+    await r1.mock.caption('c42', 'And one more, after the jump.', true);
+    await expect(page.locator('.candidate-caption', { hasText: 'And one more' })).toBeAttached();
+    await expect.poll(async () => (await liveLayout(page)).newestLineInView).toBe(true);
+    r1.expectHealthy();
+  });
+
+  test('lines that change size after they are on screen (a web font replacing the fallback) leave the list on the newest line', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'one desktop run is enough for the behaviour');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await reachLiveWithConversation(r1);
+    const log = page.getByRole('log', { name: 'Transcript' });
+    const before = await log.evaluate((element) => ({ height: element.scrollHeight, box: element.clientHeight }));
+    expect(await log.evaluate((element) => element.scrollTop + element.clientHeight)).toBeGreaterThanOrEqual(before.height - 2);
+
+    // A web font arriving after first paint changes every line's metrics at once, with no render of
+    // ours and no change to the list's own box. Larger type does the same here on every platform
+    // (the fallback font differs from machine to machine, so a real swap may not re-wrap anything).
+    await page.addStyleTag({ content: '.r1-captions__list .candidate-caption { font-size: 21px; }' });
+    await expect
+      .poll(() => log.evaluate((element) => element.scrollHeight), { message: 'the lines re-wrapped taller' })
+      .toBeGreaterThan(before.height + 200);
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+
+    const layout = await liveLayout(page);
+    expect(layout.list!.clientHeight, 'the list box did not change').toBe(before.box);
+    expect(layout.newestLineInView, 'the list is still on the newest line').toBe(true);
+    expect(layout.list!.scrollTop + layout.list!.clientHeight).toBeGreaterThanOrEqual(layout.list!.scrollHeight - 2);
+    expect(layout.jumpButton, 'a re-wrap is not the reader scrolling away').toBeNull();
+    r1.expectHealthy();
+  });
+
+  test('the list is on the newest line the moment the briefing card is committed, not a frame later', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'one desktop run is enough for the behaviour');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await reachLiveWithConversation(r1);
+
+    // A ResizeObserver reports in the browser's NEXT rendering step, so the DOM that React has just
+    // committed is, for a while, a list that is shorter but still scrolled to its old place. Anything
+    // that looks at the page in that gap (an assistive tool, a screenshot, a test's evaluate) sees the
+    // newest line cut off, and on a loaded CI runner the gap is long enough for all of them. A
+    // MutationObserver callback runs right after the commit task, before any rendering step: it is the
+    // page as the first thing that can look at it finds it.
+    type AfterCommit = { inView: boolean; height: number };
+    await page.evaluate(() => {
+      const side = document.querySelector('.r1-live__side')!;
+      const list = document.querySelector<HTMLElement>('[role="log"]')!;
+      const seen: AfterCommit[] = [];
+      (window as unknown as { __afterCommit: AfterCommit[] }).__afterCommit = seen;
+      new MutationObserver(() => {
+        const lines = document.querySelectorAll('.candidate-caption');
+        const line = lines[lines.length - 1].getBoundingClientRect();
+        const frame = list.getBoundingClientRect();
+        seen.push({
+          inView: line.bottom <= frame.bottom + 1 && line.top >= frame.top - 1,
+          height: list.clientHeight,
+        });
+      }).observe(side, { childList: true, subtree: true, attributes: true });
+    });
+
+    await backToBriefing(r1);
+    const seen = await page.evaluate(() => (window as unknown as { __afterCommit: AfterCommit[] }).__afterCommit);
+    expect(seen.length, 'the card change was observed').toBeGreaterThan(0);
+    expect(
+      seen.map((entry) => entry.inView),
+      'the newest line was in view right after every commit',
+    ).not.toContain(false);
+
+    // The card is restyled by the commit itself. The global reduced-motion rule (this project runs
+    // under it) turns each property change into a 0.01 ms transition that lands a frame or more later,
+    // and the first style recalculation that sees it done (a measuring script, say) resizes the list a
+    // second time with nothing to say so: the heading of the card was still at the strip's 13 px
+    // while the card was already full.
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => requestAnimationFrame(() => resolve())))));
+    const settled = await page.getByRole('log', { name: 'Transcript' }).evaluate((element) => element.clientHeight);
+    expect(settled, 'the list is no taller or shorter once the frames have run than it was at the commit').toBe(seen[seen.length - 1].height);
+    r1.expectHealthy();
+  });
+
+  test('holds the reader\'s place while the briefing card comes and goes', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'one desktop run is enough for the behaviour');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await reachLiveWithConversation(r1);
+    const log = page.getByRole('log', { name: 'Transcript' });
+    await log.evaluate((element) => {
+      element.scrollTop = 600;
+    });
+    await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+
+    // The list shrinks (the full card) and grows back (the strip) under a reader who is rereading.
+    await backToBriefing(r1);
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    expect(await log.evaluate((element) => Math.round(element.scrollTop))).toBe(600);
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', rpleft: '600', awaiting: '' });
+    await expect(page.getByRole('timer')).toHaveText(/Role-play/);
+    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    expect(await log.evaluate((element) => Math.round(element.scrollTop))).toBe(600);
+    await expect(page.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+
+    // And the way back still lands on the newest line.
+    await page.getByRole('button', { name: 'Jump to latest' }).click();
+    const after = await liveLayout(page);
+    expect(after.newestLineInView).toBe(true);
+    r1.expectHealthy();
+  });
+
+  test('does not undo a scroll the reader has just begun when the interviewer\'s level changes', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'one desktop run is enough for the behaviour');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await reachLiveWithConversation(r1);
+    const log = page.getByRole('log', { name: 'Transcript' });
+    const frames = (count: number) =>
+      page.evaluate(
+        (n) =>
+          new Promise<void>((resolve) => {
+            const step = (left: number) => (left <= 0 ? resolve() : requestAnimationFrame(() => step(left - 1)));
+            step(n);
+          }),
+        count,
+      );
+
+    // The first moments of a keyboard, wheel or trackpad scroll: the reader is 20 px up, inside the
+    // 48 px that still counts as the end, so the list has not (yet) decided they have left.
+    const parked = await log.evaluate((element) => {
+      element.scrollTop = element.scrollHeight - element.clientHeight - 20;
+      return Math.round(element.scrollTop);
+    });
+    await frames(2);
+
+    // The level meter re-renders the live view (and the captions in it) several times a second. None
+    // of that changes the list, so none of it may move the reader.
+    for (const level of [0.2, 0.7, 0.4, 0.9, 0.1]) {
+      await r1.mock.speak(level);
+      await frames(2);
+    }
+    expect(await log.evaluate((element) => Math.round(element.scrollTop)), 'a level update moved the reader').toBe(parked);
+    await expect(page.getByRole('button', { name: /Jump to latest/ })).toHaveCount(0);
+
+    // Still following: a line that arrives takes a reader within a line of the end to it.
+    await r1.mock.caption('c41', 'A new line while the reader is a few pixels from the end.', true);
+    await expect(page.locator('.candidate-caption', { hasText: 'A new line while the reader' })).toBeAttached();
+    await expect.poll(async () => (await liveLayout(page)).newestLineInView).toBe(true);
+    r1.expectHealthy();
+  });
+
+  test('keeps the existing caption text findable exactly once', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'text lookups do not depend on the window');
+    const { page } = r1;
+    await reachLiveWithConversation(r1, 12);
+    await expect(page.getByText('Line 3. Honestly')).toHaveCount(1);
+    r1.expectHealthy();
+  });
+
+  test('on a phone the page scrolls naturally, with no dead space, and the captions card is bounded', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'mobile', 'the phone layout runs on the mobile project');
+    const { page } = r1;
+    await reachLiveWithConversation(r1);
+
+    const layout = await liveLayout(page);
+    expect(layout.viewport).toEqual({ width: 390, height: 844 });
+    // The page is allowed to scroll here (stage, lead card and captions stack) ...
+    expect(layout.pageScrollHeight).toBeGreaterThan(layout.viewport.height);
+    // ... but the captions card is its own bounded region: clamp(240px, 45dvh, 440px) = 380px.
+    expect(layout.captionsCard?.height).toBeGreaterThanOrEqual(240);
+    expect(layout.captionsCard?.height).toBeLessThanOrEqual(440);
+    expect(layout.list!.scrollHeight).toBeGreaterThan(layout.list!.clientHeight + 100);
+    expect(layout.newestLineInView).toBe(true);
+    // Nothing hangs below the captions card but the page padding: the decorative blob is clipped.
+    const tail = await page.evaluate(
+      (bottom) => (document.scrollingElement?.scrollHeight ?? 0) - bottom - window.scrollY,
+      layout.captionsCard!.bottom,
+    );
+    expect(tail, 'blank scroll below the last card').toBeLessThanOrEqual(60);
+
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-long-390x844', { strict: true });
+    r1.expectHealthy();
+  });
+});
+
+/**
+ * The live view in the window a candidate really has. The layout was first proven only at the
+ * screen sizes (1366x768, 1440x900, 1920x1080), but a browser window is the screen minus the
+ * taskbar and the browser's own bars: 1280x584, 1366x632 and 1536x728 are the common ones, and
+ * there the first cut sent the 1280x584 window to the phone layout (captions two screens down) and
+ * crushed the camera to nothing at 1280x720. Every state is measured, because the states that add
+ * a line (the camera-off banner, a failed "I'm ready", a question to confirm) are the ones that
+ * push the controls out of the card.
+ */
+test.describe('live layout in the window a candidate really has', () => {
+  for (const size of FIT_WINDOWS) {
+    test(`${size.width}x${size.height}: every state fits, the controls stay in reach and the camera keeps its box`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop windows run on the desktop project');
+      test.setTimeout(120_000);
+      const { page } = r1;
+      await page.setViewportSize(size);
+      await reachLiveWithConversation(r1);
+
+      // Under 590 px high the aura and the camera give up their last pixels (a camera of 168x95, a
+      // shorter list); the controls, the ready button and the banner stay in the card all the same.
+      const short = size.height < 590;
+      const cameraMin = short ? 90 : 100;
+      const expectFits = async (state: string, minList: number) => {
+        const layout = await liveLayout(page);
+        const where = `${size.width}x${size.height}, ${state}`;
+        expect(layout.pageScrollHeight, `${where}: the page must not scroll`).toBeLessThanOrEqual(size.height + 1);
+        expect(layout.stage, `${where}: the stage`).not.toBeNull();
+        expect(layout.stage!.scrollHeight, `${where}: the stage must not scroll inside its card`).toBeLessThanOrEqual(layout.stage!.clientHeight + 1);
+        expect(layout.controlsBottom, `${where}: the controls are in the stage's visible part`).not.toBeNull();
+        expect(layout.controlsBottom!, `${where}: the controls are in the stage's visible part`).toBeLessThanOrEqual(layout.stage!.bottom);
+        expect(layout.captionsCard!.bottom, `${where}: the captions card ends in the window`).toBeLessThanOrEqual(size.height);
+        expect(layout.selfview!.height, `${where}: the camera keeps its 16:9 box`).toBeGreaterThanOrEqual(cameraMin);
+        // The aura and the camera sit side by side inside the card: a stage too narrow for the
+        // aura's size from the window height used to push the camera under it, or spill the aura out.
+        const row = await mediaRow(page);
+        expect(row.auraInside, `${where}: the aura is inside the stage`).toBe(true);
+        expect(row.sideBySide, `${where}: the camera is beside the aura`).toBe(true);
+        expect(row.stageScrollWidth, `${where}: the stage does not scroll sideways`).toBeLessThanOrEqual(row.stageClientWidth + 1);
+        expect(layout.list!.clientHeight, `${where}: the captions list shows several lines`).toBeGreaterThanOrEqual(minList);
+        expect(layout.newestLineInView, `${where}: the list follows the newest line`).toBe(true);
+        return layout;
+      };
+
+      // The role-play proper: the scenario card is a facts strip, the captions get the column.
+      const roleplay = await expectFits('role-play', short ? 200 : 250);
+      expect(roleplay.scenarioCard!.height, 'the strip is not the full card').toBeLessThan(150);
+
+      await page.getByRole('button', { name: 'Turn camera off' }).click();
+      await expect(page.getByText(/Your camera is off/)).toBeVisible();
+      await expectFits('role-play, camera off', short ? 200 : 250);
+      await page.getByRole('button', { name: 'Turn camera on' }).click();
+      await expect(page.getByText(/Your camera is off/)).toHaveCount(0);
+
+      // The briefing: the full card, the ready button, and no clock.
+      await backToBriefing(r1);
+      await expectFits('briefing', short ? 120 : 200);
+      expect((await insideStage(page, '.r1-ready__button')).inside, 'the ready button is in view').toBe(true);
+
+      // A press that failed adds a line, and the camera-off banner another.
+      r1.state.failures.ready = { status: 503, error: 'service_unavailable' };
+      await page.getByRole('button', { name: "I'm ready" }).click();
+      await expect(page.getByRole('alert')).toContainText("We couldn't send that");
+      r1.consoleErrors.length = 0; // a 503 is logged by the browser's network layer
+      await expectFits('briefing, press failed', short ? 120 : 200);
+      expect((await insideStage(page, '.r1-ready__error')).inside, 'the failure is in view').toBe(true);
+
+      await page.getByRole('button', { name: 'Turn camera off' }).click();
+      await expect(page.getByText(/Your camera is off/)).toBeVisible();
+      await expectFits('briefing, press failed, camera off', short ? 120 : 200);
+      expect((await insideStage(page, '.r1-banner')).inside, 'the banner is in view').toBe(true);
+
+      await auditA11y(page, testInfo, `r1-live-realistic-${size.width}x${size.height}`, { strict: true });
+      r1.expectHealthy();
+    });
+  }
+
+  test('a window that gives the live view 584 px stays two columns, with the captions beside the stage', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'desktop windows run on the desktop project');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1280, height: 584 });
+    await reachLiveWithConversation(r1);
+    const layout = await liveLayout(page);
+    // The first cut fell back to the phone layout under 600 px: the page was 1355 px tall, the
+    // captions began at y=1056, and the right half of the screen was empty.
+    expect(layout.pageScrollHeight).toBeLessThanOrEqual(585);
+    expect(layout.captionsCard!.top, 'the captions card is in the first screen').toBeLessThan(300);
+    const stageRight = await page.evaluate(() => document.querySelector('.r1-live__stage')!.getBoundingClientRect().right);
+    const captionsLeft = await page.evaluate(() => document.querySelector('.candidate-interview__captions')!.getBoundingClientRect().left);
+    expect(captionsLeft, 'the captions are beside the stage').toBeGreaterThanOrEqual(stageRight);
+    r1.expectHealthy();
+  });
+
+  // Under 860 px the stage is under about 440 px wide: too narrow for the aura beside the camera, so
+  // the two-column layout stacked them, and in a short window (800x560) the stage overflowed its card
+  // by 61 to 129 px with the controls below its edge. Those windows get the one-column layout.
+  for (const size of NARROW_WINDOWS) {
+    test(`${size.width}x${size.height}: one column, the page scrolls, and nothing is cut off or out of reach`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop windows run on the desktop project');
+      test.setTimeout(180_000);
+      const { page } = r1;
+      await page.setViewportSize(size);
+      await reachLiveWithConversation(r1);
+
+      const expectReachable = async (state: string, names: readonly string[]) => {
+        const where = `${size.width}x${size.height}, ${state}`;
+        const layout = await liveLayout(page);
+        expect(layout.captionsCard!.top, `${where}: the captions come after the stage`).toBeGreaterThanOrEqual(layout.stage!.bottom - 1);
+        expect(layout.captionsCard!.height, `${where}: the captions card is bounded`).toBeGreaterThanOrEqual(240);
+        expect(layout.captionsCard!.height, `${where}: the captions card is bounded`).toBeLessThanOrEqual(440);
+        expect(layout.list!.scrollHeight, `${where}: the list scrolls inside its card`).toBeGreaterThan(layout.list!.clientHeight);
+        expect(layout.stage!.scrollHeight, `${where}: nothing scrolls inside the stage`).toBeLessThanOrEqual(layout.stage!.clientHeight + 1);
+        expect(layout.selfview!.height, `${where}: the camera keeps its box`).toBeGreaterThanOrEqual(100);
+        expect((await horizontalOverflow(page)).overflowPx, `${where}: the page does not scroll sideways`).toBe(0);
+        const row = await mediaRow(page);
+        expect(row.auraInside, `${where}: the aura is inside the stage`).toBe(true);
+        expect(row.stageScrollWidth, `${where}: the stage does not scroll sideways`).toBeLessThanOrEqual(row.stageClientWidth + 1);
+        // The page is the scroller: bring each control into view, and it is then wholly in the window.
+        for (const name of names) {
+          const control = page.getByRole('button', { name });
+          await control.scrollIntoViewIfNeeded();
+          const box = await control.boundingBox();
+          expect(box, `${where}: ${name} is laid out`).not.toBeNull();
+          expect(box!.y, `${where}: ${name} is in the window`).toBeGreaterThanOrEqual(0);
+          // A pixel of slack: the browser scrolls an element into view to the nearest whole pixel.
+          expect(box!.y + box!.height, `${where}: ${name} is in the window`).toBeLessThanOrEqual(size.height + 1);
+        }
+      };
+
+      const always = ['Mute microphone', 'Leave interview', 'Withdraw my consent'] as const;
+      await expectReachable('role-play', [...always, 'Turn camera off']);
+
+      await page.getByRole('button', { name: 'Turn camera off' }).click();
+      await expect(page.getByText(/Your camera is off/)).toBeVisible();
+      await expectReachable('role-play, camera off', [...always, 'Turn camera on']);
+      await page.getByRole('button', { name: 'Turn camera on' }).click();
+
+      await backToBriefing(r1);
+      await expectReachable('briefing', [...always, 'Turn camera off', "I'm ready"]);
+
+      r1.state.failures.ready = { status: 503, error: 'service_unavailable' };
+      await page.getByRole('button', { name: "I'm ready" }).click();
+      await expect(page.getByRole('alert')).toContainText("We couldn't send that");
+      r1.consoleErrors.length = 0; // a 503 is logged by the browser's network layer
+      await page.getByRole('button', { name: 'Turn camera off' }).click();
+      await expect(page.getByText(/Your camera is off/)).toBeVisible();
+      await expectReachable('briefing, press failed, camera off', [...always, 'Turn camera on', "I'm ready"]);
+      await page.getByRole('alert').scrollIntoViewIfNeeded();
+      const alert = await page.getByRole('alert').boundingBox();
+      expect(alert!.y + alert!.height, 'the failure line is in the window').toBeLessThanOrEqual(size.height);
+
+      await auditA11y(page, testInfo, `r1-live-narrow-${size.width}x${size.height}`, { strict: true });
+      r1.expectHealthy();
+    });
+  }
+
+  // The first width with two columns is 860 px: the stage then has the 384 px inside it that the
+  // aura (at least 132 px) and the camera (200 px) need beside each other.
+  for (const [width, columns] of [[859, false], [860, true]] as const) {
+    test(`${width} px wide is ${columns ? 'two columns, filling the window' : 'one column, with the page scrolling'}`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop windows run on the desktop project');
+      const { page } = r1;
+      await page.setViewportSize({ width, height: 700 });
+      await reachLiveWithConversation(r1);
+      const layout = await liveLayout(page);
+      const stageRight = await page.evaluate(() => document.querySelector('.r1-live__stage')!.getBoundingClientRect().right);
+      const captionsLeft = await page.evaluate(() => document.querySelector('.candidate-interview__captions')!.getBoundingClientRect().left);
+      if (columns) {
+        expect(captionsLeft, 'the captions are beside the stage').toBeGreaterThanOrEqual(stageRight);
+        expect(layout.pageScrollHeight, 'the page must not scroll').toBeLessThanOrEqual(701);
+      } else {
+        expect(captionsLeft, 'the captions are under the stage, not beside it').toBeLessThan(stageRight);
+        expect(layout.captionsCard!.top).toBeGreaterThanOrEqual(layout.stage!.bottom - 1);
+        expect(layout.pageScrollHeight, 'the page scrolls').toBeGreaterThan(701);
+      }
+      expect((await mediaRow(page)).sideBySide, 'the camera is beside the aura').toBe(true);
+      r1.expectHealthy();
+    });
+  }
+
+  test('a question opened inside the stage is brought into view, with the keyboard on the safe choice', async ({ r1 }) => {
+    test.skip(test.info().project.name !== 'desktop', 'desktop windows run on the desktop project');
+    // The tightest window: the withdrawal question is 20 to 30 px more than the stage has room
+    // for, so the stage scrolls, and an unscrolled question would sit cut off below the card's edge
+    // (at 1366x768 it was 711 to 755 in a stage that ends at 748).
+    const { page } = r1;
+    await page.setViewportSize({ width: 1280, height: 584 });
+    await reachLiveWithConversation(r1);
+
+    await page.getByRole('button', { name: 'Withdraw my consent' }).click();
+    const withdraw = page.getByRole('group', { name: 'Withdraw consent' });
+    await expect(withdraw).toBeVisible();
+    expect((await insideStage(page, '[role="group"][aria-label="Withdraw consent"]')).inside, 'the question is wholly in view').toBe(true);
+    await expect(page.getByRole('button', { name: 'Keep my consent' })).toBeFocused();
+    await page.getByRole('button', { name: 'Keep my consent' }).press('Enter');
+    await expect(withdraw).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Withdraw my consent' })).toBeFocused();
+
+    await page.getByRole('button', { name: 'Leave interview' }).click();
+    await expect(page.getByRole('group', { name: 'Leave the interview' })).toBeVisible();
+    expect((await insideStage(page, '[role="group"][aria-label="Leave the interview"]')).inside, 'the question is wholly in view').toBe(true);
+    await expect(page.getByRole('button', { name: 'Stay in the interview' })).toBeFocused();
+    await page.getByRole('button', { name: 'Stay in the interview' }).press('Enter');
+    await expect(page.getByRole('button', { name: 'Leave interview' })).toBeFocused();
+    r1.expectHealthy();
+  });
+});
+
+/**
+ * The role-play briefing and the role-play itself: the scenario card (learner name from the
+ * interviewer, static course facts), the role-play clock, and the "I'm ready" button. The browser
+ * cannot publish to the room (its token has canPublishData: false), so the button goes through
+ * the API, which relays it; every signal here degrades to nothing when the interviewer does not
+ * publish it.
+ */
+test.describe('scenario card, role-play clock and "I\'m ready"', () => {
+  test('the briefing shows the learner, the three course facts, the goal and the ready button', async ({ r1 }, testInfo) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    const card = page.getByRole('region', { name: 'Your role-play' });
+    await expect(card.getByText(LEARNER_NAME)).toBeVisible();
+    await expect(card.getByText('$9,000')).toBeVisible();
+    await expect(card.getByText('6 months')).toBeVisible();
+    await expect(card.getByText('$500, $1,000 or $1,500, depending on the payment plan')).toBeVisible();
+    await expect(card).toContainText('Data Science course');
+    await expect(card).toContainText('understand their needs, handle their concerns, and agree a clear next step');
+    await expect(card).toContainText('stays in character');
+    // What the candidate is assessed on finding out is not on the card.
+    await expect(card).not.toContainText(/7,?000|budget|per month|decision|upfront|installment/i);
+
+    // The phase panel says the button is there (it is a polite region, so that is announced).
+    await expect(page.getByRole('status').filter({ hasText: 'when you want to start, or just say' })).toBeVisible();
+    await expect(page.getByRole('timer')).toHaveCount(0);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-briefing', { strict: true });
+    r1.expectHealthy();
+  });
+
+  test('"I\'m ready" presents the token the join gave it while that is good, confirms, and goes when the role-play starts', async ({ r1 }, testInfo) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+
+    // The join's token says when it ends (`attempt_token_expires_at`) and has time left: nothing is
+    // minted, so a press costs the server one request and none of the link's start rate limit.
+    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([{ token: R1_LINK_TOKEN }]);
+    expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
+      { attempt_token: R1_ATTEMPT_TOKEN, nonce: R1_NONCE },
+    ]);
+
+    // Sent once: the button stays but does nothing more; the briefing carries on.
+    const button = page.getByRole('button', { name: "I'm ready" });
+    await expect(button).toHaveAttribute('aria-disabled', 'true');
+    // Playwright treats aria-disabled as not enabled, so the second press is forced.
+    await button.click({ force: true });
+    expect(bodiesOf(r1, '/api/r1/ready')).toHaveLength(1);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-briefing-sent', { strict: true });
+
+    // The interviewer picks up: the button is gone and the clock starts.
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', awaiting: '', rpleft: '840' });
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await expect(page.getByRole('timer')).toHaveText('Role-play · 14 min left');
+    expectCandidateHygiene(r1);
+    r1.expectHealthy();
+  });
+
+  test('"I\'m ready" mints a current token, once, when the join\'s has lapsed by the time of the briefing', async ({ r1 }) => {
+    // In real life the briefing comes minutes after the join and the token lasts five: here the
+    // join's is already spent when it is minted.
+    r1.state.attemptTokenTtlSec = 0;
+    await reachBriefing(r1);
+    const { page } = r1;
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+
+    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
+      { token: R1_LINK_TOKEN },
+      { token: R1_LINK_TOKEN, nonce: R1_NONCE },
+    ]);
+    expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
+      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
+    ]);
+    expect(JSON.stringify(bodiesOf(r1, '/api/r1/ready'))).not.toContain(R1_ATTEMPT_TOKEN);
+    expectCandidateHygiene(r1);
+    r1.expectHealthy();
+  });
+
+  test('when "I\'m ready" cannot be sent the candidate is told to say it, waits a moment, and can press again', async ({ r1 }, testInfo) => {
+    r1.state.attemptTokenTtlSec = 0;
+    await reachBriefing(r1);
+    const { page } = r1;
+    r1.state.failures.ready = { status: 503, error: 'service_unavailable' };
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByRole('alert')).toContainText("We couldn't send that. Just say “I'm ready”.");
+    await expect(page.getByText('Sent — starting the role-play')).toHaveCount(0);
+    // A refused button is not hammered: it is locked for a few seconds (a rate limit: longer).
+    const button = page.getByRole('button', { name: "I'm ready" });
+    await expect(button).toHaveAttribute('aria-disabled', 'true');
+    await button.click({ force: true });
+    expect(bodiesOf(r1, '/api/r1/ready')).toHaveLength(1);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-briefing-failed', { strict: true });
+
+    await expect(button).not.toHaveAttribute('aria-disabled', 'true', { timeout: 10_000 });
+    await button.click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+    await expect(page.getByRole('alert')).toHaveCount(0);
+    expect(bodiesOf(r1, '/api/r1/ready')).toHaveLength(2);
+    // The press that failed had minted the current token; the press that worked presented it
+    // again instead of minting another: one mint in all, not one per press.
+    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
+      { token: R1_LINK_TOKEN },
+      { token: R1_LINK_TOKEN, nonce: R1_NONCE },
+    ]);
+    expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
+      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
+      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
+    ]);
+    // The interview carried on throughout, and the spoken "ready" was never blocked.
+    await expect(page.getByRole('region', { name: 'Live video interview' })).toBeVisible();
+    r1.consoleErrors.length = 0; // a 503 is logged by the browser's network layer
+    r1.expectHealthy();
+  });
+
+  test('"I\'m ready" asks once for a token the server refuses for good, then says the same without asking again', async ({ r1 }) => {
+    // The join's token has lapsed by the briefing and the rejoin call that would replace it is
+    // refused: the link's round has run out. Every further ask would be refused too, and would
+    // spend the link's start rate limit that a real rejoin needs.
+    r1.state.attemptTokenTtlSec = 0;
+    await reachBriefing(r1);
+    const { page } = r1;
+    const button = page.getByRole('button', { name: "I'm ready" });
+    const refuseMint = () => {
+      r1.state.failures.attempts = { status: 409, error: 'round_expired' };
+    };
+    for (let press = 0; press < 3; press += 1) {
+      await expect(button).not.toHaveAttribute('aria-disabled', 'true', { timeout: 10_000 });
+      refuseMint(); // armed for each press: a second ask would be refused again, and counted
+      await button.click();
+      await expect(button).toHaveAttribute('aria-disabled', 'true');
+      await expect(page.getByRole('alert')).toContainText("We couldn't send that. Just say “I'm ready”.");
+    }
+    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
+      { token: R1_LINK_TOKEN },
+      { token: R1_LINK_TOKEN, nonce: R1_NONCE },
+    ]);
+    expect(bodiesOf(r1, '/api/r1/ready')).toEqual([]);
+
+    // The voice is the way through: the interviewer picks up, the button goes, the interview carries on.
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', awaiting: '', rpleft: '840' });
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await expect(page.getByRole('region', { name: 'Live video interview' })).toBeVisible();
+    r1.consoleErrors.length = 0; // the one refusal is a 409 the browser logs
+    r1.expectHealthy();
+  });
+
+  test('a token the server has stopped accepting gets one new token and one more try', async ({ r1 }) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    // The browser's clock thought the join's token good for minutes yet; the server disagrees.
+    delete r1.state.tokenExpiresAt[R1_ATTEMPT_TOKEN];
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+    expect(bodiesOf(r1, '/api/r1/attempts')).toEqual([
+      { token: R1_LINK_TOKEN },
+      { token: R1_LINK_TOKEN, nonce: R1_NONCE },
+    ]);
+    expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
+      { attempt_token: R1_ATTEMPT_TOKEN, nonce: R1_NONCE },
+      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
+    ]);
+    r1.consoleErrors.length = 0; // the first refusal is a 404 the browser logs
+    r1.expectHealthy();
+  });
+
+  test('keyboard focus is not dropped to the page when the ready button goes away', async ({ r1 }) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    const ready = page.getByRole('button', { name: "I'm ready" });
+    await ready.focus();
+    await page.keyboard.press('Enter');
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+    await expect(ready).toBeFocused();
+
+    // The interviewer picks up: the button unmounts under the keyboard. The focus must land on the
+    // panel that announces the role-play, never on <body> (WCAG 2.4.3).
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', awaiting: '', rpleft: '840' });
+    await expect(ready).toHaveCount(0);
+    await expect(page.locator('.r1-phase')).toBeFocused();
+    expect(await page.evaluate(() => document.activeElement?.tagName)).not.toBe('BODY');
+    // Tab carries on from there: the next stop is a control of the page, not the top of it.
+    await page.keyboard.press('Tab');
+    expect(await page.evaluate(() => document.activeElement?.closest('.r1-live') !== null)).toBe(true);
+    r1.expectHealthy();
+  });
+
+  test('the ready button going away leaves a focus that was elsewhere alone', async ({ r1 }) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    await page.getByRole('button', { name: 'Mute microphone' }).focus();
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', awaiting: '', rpleft: '840' });
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await expect(page.getByRole('button', { name: 'Mute microphone' })).toBeFocused();
+    r1.expectHealthy();
+  });
+
+  test('the ready button is shown only while the interviewer is waiting in the briefing', async ({ r1 }) => {
+    await reachLive(r1);
+    const { page } = r1;
+    const ready = page.getByRole('button', { name: "I'm ready" });
+    await r1.mock.joinAgent();
+    // Before and after the briefing, and a briefing that is not waiting, show no button.
+    await r1.mock.setAgentAttributes({ phase: 'icebreaker', awaiting: 'ready' });
+    await expect(page.getByText('Getting to know you')).toBeVisible();
+    await expect(ready).toHaveCount(0);
+    await r1.mock.setAgentAttributes({ phase: 'transition', awaiting: '' });
+    await expect(page.getByText('Role-play briefing')).toBeVisible();
+    await expect(ready).toHaveCount(0);
+    await r1.mock.setAgentAttributes({ awaiting: 'ready' });
+    await expect(ready).toBeVisible();
+    await r1.mock.setAgentAttributes({ awaiting: '' });
+    await expect(ready).toHaveCount(0);
+    r1.expectHealthy();
+  });
+
+  test('the clock shows the minutes left, holds during an aside, resumes, and goes when the role-play is over', async ({ r1 }, testInfo) => {
+    await reachLive(r1);
+    const { page } = r1;
+    await r1.mock.joinAgent();
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', leadname: LEARNER_NAME, rpleft: '63' });
+    const timer = page.getByRole('timer');
+    await expect(timer).toHaveText('Role-play · 2 min left');
+    // About three seconds on it is under a minute: it counts down by itself.
+    await expect(timer).toHaveText('Role-play · under a minute left', { timeout: 10_000 });
+    // It is not live itself, and it is outside the phase label's polite region.
+    expect(await timer.evaluate((element) => element.closest('[aria-live]'))).toBeNull();
+    const phaseRegion = page.getByRole('status').filter({ hasText: 'You are the Program Advisor' });
+    expect(await phaseRegion.locator('[role="timer"]').count()).toBe(0);
+    await expectMobileFits(page, testInfo);
+    await auditA11y(page, testInfo, 'r1-live-clock', { strict: true });
+
+    // An aside pauses it where the interviewer says: still "3 min" after more than a second.
+    await r1.mock.setAgentAttributes({ phase: 'aside', rpleft: '121' });
+    await expect(timer).toHaveText('Role-play · 3 min left');
+    await page.waitForTimeout(2_500);
+    await expect(timer).toHaveText('Role-play · 3 min left');
+    // Back in the role-play it runs again from there: 121 s is "3 min" until 120 s.
+    await r1.mock.setPhase('roleplay');
+    await expect(timer).toHaveText('Role-play · 2 min left', { timeout: 6_000 });
+
+    // The interviewer clears the clock when the role-play is over.
+    await r1.mock.setAgentAttributes({ phase: 'roleplay_exit', rpleft: '' });
+    await expect(timer).toHaveCount(0);
+    await expect(page.getByRole('region', { name: 'Your role-play' })).toHaveCount(0);
+    r1.expectHealthy();
+  });
+
+  test('reads the name and the clock off an interviewer that joins already mid role-play', async ({ r1 }) => {
+    await reachLive(r1);
+    const { page } = r1;
+    await r1.mock.joinAgent({ phase: 'roleplay', leadname: LEARNER_NAME, rpleft: '300' });
+    await expect(page.getByRole('timer')).toHaveText('Role-play · 5 min left');
+    await expect(page.getByRole('region', { name: 'Your role-play' }).getByText(LEARNER_NAME)).toBeVisible();
+    r1.expectHealthy();
+  });
+
+  test('an interviewer that publishes only the phase gets the card with no name, no clock and no button', async ({ r1 }) => {
+    await reachLive(r1);
+    const { page } = r1;
+    await r1.mock.joinAgent();
+    await r1.mock.setPhase('transition');
+    const card = page.getByRole('region', { name: 'Your role-play' });
+    await expect(card.getByText('A prospective learner')).toBeVisible();
+    await expect(card).toContainText('$9,000');
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await r1.mock.setPhase('roleplay');
+    await expect(page.getByRole('status').filter({ hasText: 'You are the Program Advisor' })).toBeVisible();
+    await expect(page.getByRole('timer')).toHaveCount(0);
+    r1.expectHealthy();
+  });
+
+  test('values the interviewer sends in the wrong shape are ignored, never shown', async ({ r1 }) => {
+    await reachLive(r1);
+    const { page } = r1;
+    await r1.mock.joinAgent();
+    await r1.mock.setAgentAttributes({
+      phase: 'transition',
+      leadname: '<img src=x onerror=alert(1)>',
+      rpleft: 'soon',
+      awaiting: 'yes',
+    });
+    const card = page.getByRole('region', { name: 'Your role-play' });
+    await expect(card.getByText('A prospective learner')).toBeVisible();
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await r1.mock.setPhase('roleplay');
+    await expect(page.getByRole('timer')).toHaveCount(0);
+    expect(await page.locator('img[src="x"]').count()).toBe(0);
+    r1.expectHealthy();
+  });
+
+  test('nobody but the interviewer can name the learner, set the clock or raise the button', async ({ r1 }) => {
+    await reachLive(r1);
+    const { page } = r1;
+    await r1.mock.joinAgent();
+    await r1.mock.setPhase('transition');
+    await r1.mock.intrude({ awaiting: 'ready', leadname: 'Mallory', rpleft: '5', phase: 'roleplay' });
+    const card = page.getByRole('region', { name: 'Your role-play' });
+    await expect(card.getByText('A prospective learner')).toBeVisible();
+    await expect(card.getByText('Mallory')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await expect(page.getByRole('timer')).toHaveCount(0);
+    await expect(page.getByText('Role-play briefing')).toBeVisible();
+    r1.expectHealthy();
+  });
+
+  test('a rejoining candidate starts clean and reads what the interviewer still publishes', async ({ r1 }) => {
+    await reachBriefing(r1);
+    const { page } = r1;
+    await r1.mock.drop();
+    await expect(heading(page, 'The connection to your interview ended.')).toBeVisible();
+    await page.getByRole('button', { name: 'Rejoin interview' }).click();
+    await passDeviceCheck(page);
+    await page.getByRole('button', { name: 'Continue to interview' }).click();
+    await expect(page.getByRole('region', { name: 'Live video interview' })).toBeVisible();
+    // The new room has no interviewer yet: nothing of the old briefing is left on screen.
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
+    await expect(page.getByRole('region', { name: 'Your role-play' })).toHaveCount(0);
+    // The interviewer comes back still waiting, and everything is read from what it published.
+    await r1.mock.joinAgent({ phase: 'transition', leadname: LEARNER_NAME, awaiting: 'ready' });
+    await expect(page.getByRole('region', { name: 'Your role-play' }).getByText(LEARNER_NAME)).toBeVisible();
+    await expect(page.getByRole('button', { name: "I'm ready" })).toBeVisible();
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+    expect(bodiesOf(r1, '/api/r1/ready')).toEqual([
+      { attempt_token: R1_FRESH_ATTEMPT_TOKEN, nonce: R1_NONCE },
     ]);
     r1.expectHealthy();
   });

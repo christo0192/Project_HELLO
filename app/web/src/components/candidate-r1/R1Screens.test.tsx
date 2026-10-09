@@ -267,6 +267,31 @@ describe('R1Shell', () => {
     expect(screen.getByRole('banner', { name: 'Interview Kickstart' })).toBeVisible();
     expect(screen.getByText('inside')).toBeVisible();
   });
+
+  it('clips the page decoration on every R1 screen, so it adds no blank scroll', () => {
+    const { container } = render(
+      <R1Shell>
+        <p>inside</p>
+      </R1Shell>,
+    );
+    expect(container.querySelector('main.r1-shell')).not.toBeNull();
+  });
+
+  it('fits the viewport only when asked to (the live interview)', () => {
+    const { container, rerender } = render(
+      <R1Shell>
+        <p>inside</p>
+      </R1Shell>,
+    );
+    expect(container.querySelector('main.candidate-shell--fill')).toBeNull();
+    rerender(
+      <R1Shell fill>
+        <p>inside</p>
+      </R1Shell>,
+    );
+    expect(container.querySelector('main.candidate-shell--fill.candidate-scope')).not.toBeNull();
+    expect(screen.getByText('inside')).toBeVisible();
+  });
 });
 
 describe('R1Landing', () => {
