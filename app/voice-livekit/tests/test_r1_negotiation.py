@@ -1397,5 +1397,111 @@ class AdvisorTurnReadingsIterationOneTests(unittest.TestCase):
                     self.assertIsNone(pattern.search(text))
 
 
+class IterationTwoNegotiationTests(unittest.TestCase):
+    """R1-Q iteration 2: declined calls, the slot of the MEDIUM line, the form question and the
+    wording of the price reactions (D5, D6, D7, D8, D11, D15)."""
+
+    def test_a_declined_call_is_recognised_in_the_learners_own_words(self):
+        for text in (
+            "I'd rather keep it to email for now.",
+            "I haven't agreed to any date yet.",
+            "I'd prefer email, if that's okay.",
+            "I'll reply to you there.",
+            "No calls for now, please.",
+            "I'm not comfortable with a call yet.",
+            "Let's keep this over text.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(neg.declines_call(text), text)
+        for text in (
+            "Sure, you can email me the details.",
+            "What would the call cover?",
+            "Let me check with my husband first, and then let's book a call, so we can decide.",
+            "Let me think about it. Call me back after I've talked to my father, and I'll let you know.",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(neg.declines_call(text), text)
+
+    def test_a_slot_without_a_clock_time_or_a_part_of_the_day_is_vague(self):
+        for text, vague in (
+            ("I can try you sometime next week.", True),
+            ("Let me know when's good.", True),
+            ("Does Thursday work?", False),
+            ("Would tomorrow evening work?", False),
+            ("How about 10 AM?", False),
+            ("Can we do this weekend?", False),
+        ):
+            slot = neg.parse_slot(text)
+            with self.subTest(text=text):
+                self.assertEqual(slot is None or slot.vague, vague, slot)
+
+    def test_a_vague_slot_is_booked_without_a_time_only_after_the_decision_maker_was_mentioned(self):
+        n = neg.Negotiation("partner")
+        n.observe(
+            3,
+            "No problem at all, take your time with your partner and we'll find a time that "
+            "works. Just let me know when's good, or I can try you sometime next week.",
+        )
+        self.assertTrue(n.last_slot.vague)
+        self.assertFalse(n.slot_choice(4).deferred)  # nothing said about the partner yet
+        n.note_learner_text("Before I commit to any timing, I'd need to talk it over with my partner.", 3)
+        self.assertEqual(n.decider_said_turn, 3)
+        choice = n.slot_choice(4)
+        self.assertTrue(choice.deferred)
+        self.assertEqual(n.log()["slot_deferred"], True)
+        # The memory fades: three turns on, the learner picks a time again.
+        self.assertFalse(n.slot_choice(3 + neg.DEFER_RECENT_TURNS + 1).deferred)
+
+    def test_a_named_time_is_never_deferred(self):
+        n = neg.Negotiation("husband")
+        n.note_reason_voiced(neg.REASON_DECISION_MAKER, 5)
+        n.observe(6, "Would tomorrow evening work for a quick call?")
+        choice = n.slot_choice(7)
+        self.assertFalse(choice.deferred)
+        self.assertEqual(choice.phrase, "tomorrow in the evening")
+
+    def test_the_form_question_is_no_email_offer_but_a_statement_still_is(self):
+        form = (
+            "The next step is just a two-minute enrollment form, then you're in. I'll do $600 a "
+            "month, $6000 total, but only if you submit tonight. Can I send it right now?"
+        )
+        self.assertFalse(neg.detect_email_offer(form))
+        self.assertTrue(neg.detect_email_offer("I'll send it over right after this call."))
+        self.assertTrue(neg.detect_email_offer("I'll email you the form. Can I send it now?"))
+        self.assertTrue(neg.detect_email_offer("Curriculum, deposit details and the deadline. I'll send it right now."))
+
+    def test_the_counter_never_calls_the_same_price_better_or_a_stretch(self):
+        short = neg.COUNTER_BY_SITUATION[neg.SITUATION_SHORT]
+        for text in (short.brief, *short.variants):
+            self.assertNotIn("stretch", text.lower())
+        self.assertIn("do not call it better unless it just dropped", short.brief)
+        self.assertNotIn("better", " ".join(short.variants).replace("a little better", "").replace("better than that", ""))
+
+    def test_the_reached_anchor_is_calm_and_two_variants_are_statements(self):
+        for offer in (7000, 6500):
+            situation = neg.anchor_after_offer(offer)
+            self.assertIn("no surprise and no thanks", situation.brief)
+            self.assertNotIn("pleased", situation.brief)
+            for variant in situation.variants:
+                self.assertIn("$7,000", variant)
+                self.assertNotRegex(variant, r"\b(?:oh|great|wonderful|relief|surprise\w*)\b")
+            statements = [v for v in situation.variants if "?" not in v]
+            self.assertEqual(len(statements), 2)
+
+    def test_the_anchor_brief_tells_the_advisor_it_does_not_say_you(self):
+        from r1_scheduler import SPEC_BY_ID
+
+        brief = SPEC_BY_ID["F1-ANCHOR"].brief
+        self.assertTrue(brief.startswith("tell the advisor that $9,000"))
+        self.assertNotIn("you say", brief)
+        self.assertNotIn("you say", neg.anchor_after_offer(8500).brief)
+
+    def test_the_new_log_key_is_json(self):
+        n = neg.Negotiation("husband")
+        json.dumps(n.log())
+        self.assertIsNone(n.log()["slot_deferred"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1480,7 +1480,8 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   decisions of 2026-10-08) is revision 10: no scripted or prompted "hmm"/"honestly", a rotating
   opening-style note per free reply, a warm confirmation once a call is booked, the decision maker on the
   public card, the $7,000 anchor never an offer, "I can check with my manager" grants nothing, and the
-  time cue is the learner's own next call. `docs/design/r1/R1-PLAN-final.md` carries the `L-NO-FEEDBACK`
+  time cue is the learner's own next call; learner iteration 2 is revision 11 (see the next bullets).
+  `docs/design/r1/R1-PLAN-final.md` carries the `L-NO-FEEDBACK`
   text (a test compares it). Check the pin comment and `CONTENT_REVISION` after every merge of main: a
   second branch that also changed pinned text takes one more bump and a recomputed hash.
 * **Learner speaking style (R1-Q iteration 1).** The guard now also varies the learner's free replies,
@@ -1494,6 +1495,26 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   not posted to the API (`HYGIENE_CATEGORIES`). The rehearsal scorecard gates the tics (no reaction word on
   more than 15 % of the replies, "hmm" and "honestly" on at most 20 % each); reply length is information
   only.
+* **Learner iteration 2 (R1-Q S01, content revision 11).** The second live sweep found 24 defects; the
+  worker side of the fixes, all deterministic and with no extra model call: `classify_learner_commitment`
+  ignores an agreement a negator governs ("tomorrow won't work"); `has_concession` ignores "I want to be sure
+  it's worth it"; the guard's style surgery no longer garbles speech ("to be honest with myself" stays,
+  `, -` and `But,` debris is cleaned, only an adjective or a verb loses a leading "That's"); a connector
+  whose sentence was dropped goes with it; quote marks around a figure are removed; a reply asks at most
+  one question and a free reply none when one of its last two replies asked (a bare "Okay." keeps its
+  question); "a stretch" and "what would it involve" are used once per call (a second "a stretch" is said
+  another way); the price notes know where the price stands (nothing at or below the $7,000 ask is "a
+  stretch" or "better than before" when it did not move); "that matches what I'd heard" about another
+  figure becomes the real $7,000 line; the decision maker never "isn't one for calls"; spelled-out amounts
+  and per-month reactions are checked; a proposed call stays unaccepted until the window opens (a hold
+  note); a call the learner declined is not booked at the farewell; a push the learner already voiced
+  (falling behind) is not owed again; an owed move waits ONE turn when the advisor asks a direct question
+  about the learner or the people in their decision; a deep need takes the reply before another topic's
+  hint; the WEAK stall for a CALL ask says "Call me back after I've talked to my {decision maker}, and
+  I'll let you know" and the MEDIUM line books the call without a slot when none was named
+  (`MEDIUM_DEFER_LINE`). The two new scripted sentences are masked in
+  `app/api/src/lib/r1/transcript.ts` (the call-back WEAK sentence has its own pattern; the deferred MEDIUM
+  line matches the existing "book a call ... so we can decide" frames).
 
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 

@@ -45,6 +45,34 @@ regexes). Misfires now also count `time_cue_reversed`, `decider_alone`, `anchor_
 advisor QUESTION that uses the topic's own words is not an "unprompted dump" even when the
 simulator did not tag the question as a probe (`unprompted_dump_excused` counts those).
 
+Gates and metrics added or changed in R1-Q iteration 2 (the second live sweep):
+
+* `commit_strong` is INFO. A call ask caps the grade at MEDIUM (`r1_commitment.grade`), and every
+  persona names a decision maker, so a strong advisor correctly asks for a call: STRONG was 0 of 8 calls
+  in two sweeps. `commit_medium` (MEDIUM or better >= 90 % for a strong advisor) is the blocking half.
+* The pushy/terse/weak cap `commit_cap` (MEDIUM or better in at most 20 % of the calls) lets a group of
+  fewer than 8 calls exceed it by ONE call (four calls: one booked call is 0.25); the markdown table says
+  "small group: held to 0.25".
+* New gates: `stretch_tic` (replies with "a stretch" per call, mean <= 1.5) and `template_tic` (replies
+  asking "what would that call involve / cover / include" per call, mean <= 1.5). The guard keeps each
+  phrase once per call; the metric counts what was spoken, with the harness's own regexes.
+* A "dig" (the disclosure gate) is read from the advisor's own question (`metrics.dug_topics`): the
+  simulator's `probe` / `followup` tag counts only when a question of the turn carries the topic's
+  vocabulary (a generic "tell me more" keeps its tag), so "What's your current role?" digs at nothing and
+  "Have you tried courses?" is an H2 question whatever it was tagged.
+* An earned commitment (`unearned_commitment`) is read from the advisor's words too
+  (`metrics.advisor_asked_next_step`): a sentence that names a call, a time, an enrolment or a seat and is a
+  question or speaks in the offering voice counts, whatever the simulator tagged the turn.
+* The rubric judge gets 3,600 tokens (was 1,200: the verdict was cut off, `bad_json`, on 10 of 20 calls)
+  and the whole transcript (24,000 characters), is asked once more when its JSON is unreadable
+  (`attempts` in the result), and sees the call's facts: the ANCHOR TURNS, the TIME CUE TURN and the OFFER
+  LEDGER. Every misfire needs a quote that is really in the learner's line, and `anchor_as_offer`,
+  `time_cue_reversed`, `reopened_after_commit` and `decider_inconsistent` count only when the rule
+  detector agrees (`judge.validate_misfires`); the rest are listed as `misfires_rejected`.
+* The advisor simulator is asked once more when it says goodbye before 10:00 (D23: six of 20 calls ended
+  at 6:23 to 9:59). `--max-exchanges` defaults to 60 (the learner now speaks less, so 40 exchanges can end
+  before 13:00).
+
 An OFFLINE scorecard checks the plumbing and the engine's decisions (schedule, negotiation, guard,
 repetition, disclosure layers), never the model: it can never be "ready for an owner test". Ready
 means a live sweep of 20 or more calls with every applicable gate measured and met.

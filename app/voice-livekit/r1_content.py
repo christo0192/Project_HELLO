@@ -27,6 +27,7 @@ import r1_personas
 import r1_prompts
 import r1_scheduler
 import r1_script
+import r1_text
 import r1_world
 
 # 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
@@ -56,7 +57,14 @@ import r1_world
 #    and the guard's style rules), a warm confirmation after a booked call (never a new doubt), the
 #    decision maker on the public card and in a note, the $7,000 anchor is never an offer, "I can
 #    check with my manager" grants nothing, the time cue is the learner's own next call.
-CONTENT_REVISION = 10
+# 11: R1-Q learner iteration 2 (the second live sweep): the learner asks a question only now and
+#    then (prefix, a one-question-per-reply guard and a question diet for free replies), "a stretch"
+#    and "what would that call involve" are used once per call, the price notes know where the price
+#    stands (never "a stretch" at or below the $7,000 ask), the figures are listed without quote
+#    marks, the anchor is told to the advisor (no "you say"), a calm reached anchor, a call-back
+#    WEAK line for a call ask and a MEDIUM line that books without a slot, the F4 push never says
+#    the decision maker dislikes calls, hold / answered-facts notes, wider F3 / F4 delivery markers.
+CONTENT_REVISION = 11
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -130,6 +138,8 @@ def manifest() -> dict[str, Any]:
             ],
             "redirect_openers": list(r1_scheduler.REDIRECT_OPENERS),
             "redirect_brief": r1_scheduler.REDIRECT_BRIEF,
+            "answered_labels": [list(item) for item in r1_scheduler.ANSWERED_LABELS],
+            "f4_push_call_suffix": r1_scheduler.F4_PUSH_CALL_SUFFIX,
             "curiosity_topics": [list(item) for item in r1_scheduler.CURIOSITY_TOPICS],
             "constants": {
                 "slip_limit_sec": r1_scheduler.SLIP_LIMIT_SEC,
@@ -180,12 +190,15 @@ def manifest() -> dict[str, Any]:
                 "min_net_usd": r1_negotiation.MIN_NET_USD,
                 "preferred_time": r1_negotiation.PREFERRED_TIME,
                 "moved_day": r1_negotiation.MOVED_DAY,
+                "defer_recent_turns": r1_negotiation.DEFER_RECENT_TURNS,
             },
         },
         "commitment": {
             "lines": {level.name: text for level, text in r1_commitment.COMMITMENT_LINES.items()},
             "default_slot": r1_commitment.DEFAULT_SLOT,
             "moved_line": r1_commitment.MEDIUM_MOVED_LINE,
+            "defer_line": r1_commitment.MEDIUM_DEFER_LINE,
+            "weak_call_line": r1_commitment.WEAK_CALL_LINE,
             "permitted_r_sec": r1_commitment.COMMIT_PERMITTED_R_SEC,
             "stall_r_sec": r1_commitment.COMMIT_STALL_R_SEC,
             "discount_cap_usd": r1_commitment.DISCOUNT_CAP_USD,
@@ -200,10 +213,16 @@ def manifest() -> dict[str, Any]:
             "anchor_replacement": r1_guard.ANCHOR_REPLACEMENT,
             "gratitude_replacement": r1_guard.GRATITUDE_REPLACEMENT,
             "confirm_fallbacks": list(r1_guard.CONFIRM_FALLBACKS),
+            "anchor_heard_replacement": r1_guard.ANCHOR_HEARD_REPLACEMENT,
+            "anchor_heard_below": r1_guard.ANCHOR_HEARD_BELOW,
             "style": {
                 "tic_window": r1_guard.STYLE_TIC_WINDOW,
                 "opener_window": r1_guard.STYLE_OPENER_WINDOW,
                 "max_chars": r1_guard.STYLE_MAX_CHARS,
+                "phrase_quota": dict(r1_guard.PHRASE_QUOTA),
+                "question_diet_window": r1_guard.QUESTION_DIET_WINDOW,
+                "thin_reply_words": r1_guard.THIN_REPLY_WORDS,
+                "stretch_alternatives": list(r1_text.STRETCH_ALTERNATIVES),
             },
             "reply_word_cap": r1_guard.REPLY_WORD_CAP,
             "ack_word_cap": r1_guard.ACK_WORD_CAP,
@@ -269,6 +288,14 @@ def manifest() -> dict[str, Any]:
             "intent_price_note": r1_prompts.INTENT_PRICE_NOTE,
             "price_wrap_note": r1_prompts.PRICE_WRAP_NOTE,
             "offer_on_table_note": r1_prompts.OFFER_ON_TABLE_NOTE,
+            "offer_met_note": r1_prompts.OFFER_MET_NOTE,
+            "price_met_note": r1_prompts.PRICE_MET_NOTE,
+            "price_unchanged_note": r1_prompts.PRICE_UNCHANGED_NOTE,
+            "hold_note": r1_prompts.HOLD_NOTE,
+            "answered_note": r1_prompts.ANSWERED_NOTE,
+            "stretch_used_note": r1_prompts.STRETCH_USED_NOTE,
+            "template_used_note": r1_prompts.TEMPLATE_USED_NOTE,
+            "next_step_note": r1_prompts.NEXT_STEP_NOTE,
             "new_offer_note": r1_prompts.NEW_OFFER_NOTE,
             "resolved_note": r1_prompts.RESOLVED_NOTE,
             "checkin_note": r1_prompts.CHECKIN_NOTE,

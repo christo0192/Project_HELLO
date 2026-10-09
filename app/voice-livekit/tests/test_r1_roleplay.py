@@ -434,7 +434,9 @@ class PlanModeTests(unittest.TestCase):
         plan = s.say(PRICE_ONLY, 60)
         self.assertEqual(plan.move_id, F1_ANCHOR)
         self.assertEqual(plan.intent.must_say, ("$9,000", "$7,000"))
-        self.assertIn('"$9,000", "$7,000"', plan.reminder)
+        # The figures are listed WITHOUT quote marks: the model copied the marks into its reply.
+        self.assertIn("exactly as shown, without quote marks: $9,000, $7,000.", plan.reminder)
+        self.assertNotIn('"$9,000"', plan.reminder)
         self.assertIn("exactly as shown", plan.reminder)
         for variant in plan.intent.fallbacks:
             self.assertIn("$9,000", variant)
@@ -614,7 +616,10 @@ class OwnerTestDisclosureTests(unittest.TestCase):
         self.assertEqual(s.eng.tracker.gate.state("H1").value, "surface")
         self.assertEqual(s.eng.tracker.gate.state("H2").value, "unprobed")
 
-    def test_turn_34_asks_again_so_h1_is_released_and_h2_gets_its_hint_the_same_turn(self):
+    def test_turn_34_asks_again_so_h1_is_released_and_h2_waits_for_its_hint(self):
+        """One layer of disclosure per reply, the deep need first (R1-Q iteration 2): in the live
+        sweep a reply handed H1's deep need and H2's hint voiced only the hint, and H1 was never
+        told.  H2 is still probed (surface); its hint is not handed over this turn."""
         s = self.walk()
         s.say(self.T25, 46)
         s.say(self.T30, 68)
@@ -623,7 +628,8 @@ class OwnerTestDisclosureTests(unittest.TestCase):
         self.assertNotIn("owed", " ".join(plan.reasons))
         for fact in P1.facts("H1"):
             self.assertIn(f'"{fact}"', plan.reminder)
-        self.assertIn(P1.hint("H2"), plan.reminder)
+        self.assertNotIn(P1.hint("H2"), plan.reminder)
+        self.assertIsNone(s.eng.admin_log()["disclosure"]["H2"]["hint_turn"])
         gate = s.eng.tracker.gate
         self.assertEqual((gate.state("H1").value, gate.state("H2").value), ("unlocked", "surface"))
         self.assertEqual(gate.state("H3").value, "unprobed")
@@ -659,7 +665,7 @@ class OwnerTestDisclosureTests(unittest.TestCase):
         self.assertLess(h1["probe_turn"], h1["revealed_turn"])
         self.assertEqual(log["disclosure"]["H1"]["deep_offer_turns"], [3])
         self.assertEqual(log["disclosure"]["H1"]["hint_turn"], 2)
-        self.assertEqual(log["disclosure"]["H2"]["hint_turn"], 3)
+        self.assertIsNone(log["disclosure"]["H2"]["hint_turn"])  # the deep need took the reply
 
     def test_the_posted_reveal_row_keeps_the_probe_before_the_reveal(self):
         """The API gate fails "unprobed_reveal" when probed_turn is missing or after the reveal."""
@@ -908,7 +914,12 @@ class AskTests(unittest.TestCase):
         session, r = run_cooperative(50.0)
         for index in range(6):
             session.say(ASK if index % 2 == 0 else CALL_ASK, r + 50 * index)
-        weak = [text for text in session.spoken if "email me the details" in text.lower()]
+        # The WEAK line is either the e-mail wording or, after a CALL ask, the call-back wording.
+        weak = [
+            text
+            for text in session.spoken
+            if "email me the details" in text.lower() or "call me back after" in text.lower()
+        ]
         self.assertEqual(len(weak), 1, session.spoken)
         self.assertTrue(session.eng.negotiation.weak_line_said)
         # After it is on record every later ask is a free reply that does not repeat anything.
@@ -2022,8 +2033,10 @@ class PriceNegotiationThroughTheEngineTests(unittest.TestCase):
         s, anchor, counter = self.price_session("Okay, let's make it 8.5, I mean $8500.")
         self.assertEqual((anchor.move_id, counter.move_id), ("F1-ANCHOR", "F1-COUNTER"))
         self.assertEqual(s.eng.negotiation.price_situation(), "short")
-        self.assertIn("came down a little", counter.intent.brief)
-        self.assertIn("still a stretch", counter.intent.brief)
+        self.assertIn("above what you hoped", counter.intent.brief)
+        self.assertIn("do not call it better unless it just dropped", counter.intent.brief)
+        self.assertIn("the advisor's best price so far is $8,500", counter.intent.brief)
+        self.assertNotIn("stretch", counter.intent.brief)
         self.assertIn(counter.intent.fallbacks[0], neg_variants("short"))
         self.assertEqual(s.eng.scheduler._states["F1-COUNTER"].status, "delivered")
         self.assertEqual(
@@ -2082,7 +2095,8 @@ class PriceNegotiationThroughTheEngineTests(unittest.TestCase):
         wrap = s.say("Is it fine with you?", 140)
         self.assertEqual(wrap.mode, TurnMode.LLM_REPLY)
         self.assertIn('has "$8,500" on the table', wrap.reminder)
-        self.assertIn("still a stretch", wrap.reminder)
+        self.assertIn("still more than I planned for", wrap.reminder)
+        self.assertNotIn("stretch", wrap.reminder)  # the phrase tic the live sweep found
         self.assertNotIn("helpful", wrap.reminder)
         self.assertEqual(s.eng.admin_log()["negotiation"]["best_offer_usd"], 8500)
 
@@ -2264,7 +2278,11 @@ class OwnerTestNegotiationTests(unittest.TestCase):
         self.assertIn("decision_maker", session.eng.negotiation.handled)
         self.assertEqual(plan.mode, TurnMode.SAY_ONLY)
         self.assertEqual(plan.commitment_level, Level.MEDIUM)
-        self.assertEqual(plan.scripted_text, commitment_line(Level.MEDIUM, "husband"))
+        # The advisor named no time and the learner had just said it must talk to its husband:
+        # the call is booked without a slot the learner never had (R1-Q iteration 2).
+        self.assertEqual(
+            plan.scripted_text, commitment_line(Level.MEDIUM, "husband", deferred=True)
+        )
         self.assertTrue(session.eng.commitment_resolved)
 
     def test_the_email_turn_gets_one_real_reaction(self):
@@ -2400,7 +2418,10 @@ class PreAnchorOfferThroughTheEngineTests(unittest.TestCase):
         self.assertEqual(s.eng.negotiation.best_offer_usd, 8500)
         self.assertIn("$8,500", anchor.intent.brief)
         self.assertEqual(anchor.intent.must_say, ("$8,500", "$7,000"))
-        self.assertIn('Write these figures exactly as shown: "$8,500", "$7,000".', anchor.reminder)
+        self.assertIn(
+            "Write these figures exactly as shown, without quote marks: $8,500, $7,000.",
+            anchor.reminder,
+        )
         # The exact ask survives in every fallback, and each one names the number on the table.
         for variant in anchor.intent.fallbacks:
             self.assertIn("$8,500", variant)
@@ -2416,7 +2437,7 @@ class PreAnchorOfferThroughTheEngineTests(unittest.TestCase):
         s.say(OPENER, 20)
         anchor = s.say(PRICE_ONLY, 60)
         self.assertEqual(anchor.intent.must_say, ("$9,000", "$7,000"))
-        self.assertIn("$9,000 feels like a lot", anchor.intent.brief)
+        self.assertIn("$9,000, the price on the website, feels like a lot", anchor.intent.brief)
 
     def test_a_restated_offer_answers_the_anchor_but_is_not_news(self):
         s = Session(engine())
@@ -2863,7 +2884,7 @@ class PitchFiguresThroughTheEngineTests(unittest.TestCase):
                 anchor = plans[-1]
                 self.assertEqual(anchor.move_id, F1_ANCHOR)
                 self.assertEqual(anchor.intent.must_say, ("$9,000", "$7,000"))
-                self.assertIn("$9,000 feels like a lot", anchor.intent.brief)
+                self.assertIn("$9,000, the price on the website, feels like a lot", anchor.intent.brief)
                 self.assertNotIn("already come down", anchor.intent.brief)
                 self.assertNotIn("already put", anchor.intent.brief)
                 for variant in anchor.intent.fallbacks:
@@ -3408,6 +3429,295 @@ class TimeCueIsTheLearnersOwnTests(unittest.TestCase):
         s, plan = self.cue_session(ack)
         self.assertEqual(s.spoken[-1], ack)
         self.assertEqual(s.eng.ledger.counts.get("misread", 0), 0)
+
+
+def until_window(ask_text, seed="iter2"):
+    """A cooperative call stopped the turn the close window opens, ``ask_text`` inserted early."""
+    s = Session(engine(seed=seed))
+    script = cooperative_script()
+    script.insert(3, ask_text)
+    r = 20.0
+    for text in script:
+        if s.eng.scheduler.commit_permitted(r):
+            break
+        s.say(text, r)
+        r += 45
+    return s, r
+
+
+class IterationTwoEngineTests(unittest.TestCase):
+    """R1-Q iteration 2: the engine side of the live sweep's defects (D3 to D16)."""
+
+    FAREWELL = "Alright, thanks so much for your time today. Bye for now!"
+
+    # --- D3: a call proposed before the window stays unaccepted
+    def test_an_open_call_proposal_carries_a_hold_note_until_the_window_opens(self):
+        from r1_prompts import HOLD_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        asked = s.say(CALL_ASK, 200)
+        self.assertIn(HOLD_NOTE, asked.reminder)
+        later = s.say(NEUTRAL, 245)
+        self.assertIn(HOLD_NOTE, later.reminder)
+        self.assertIn("do not fix a day or a time", later.reminder)
+        fresh = Session(engine())
+        fresh.say(OPENER, 20)
+        self.assertNotIn(HOLD_NOTE, fresh.say(NEUTRAL, 60).reminder)
+
+    def test_the_hold_note_is_gone_once_the_window_opens_or_a_commitment_is_on_record(self):
+        from r1_prompts import HOLD_NOTE
+
+        s, r = until_window(CALL_ASK)
+        self.assertTrue(s.eng.scheduler.commit_permitted(r))
+        self.assertNotIn(HOLD_NOTE, s.say(NEUTRAL, r).reminder)
+        booked, rb = late_session()
+        booked.eng.apply_judge(GOOD_JUDGE, booked.eng.turn)
+        booked.say(CALL_ASK, rb)
+        self.assertTrue(booked.eng.commitment_resolved)
+        self.assertNotIn(HOLD_NOTE, booked.say(NEUTRAL, rb + 40).reminder)
+
+    # --- D6: a proposal the learner declined is not booked at the farewell
+    def test_a_declined_call_is_not_replayed_when_the_advisor_says_goodbye(self):
+        s = Session(engine(seed="declined"))
+        script = cooperative_script()
+        script.insert(3, CALL_ASK)
+        r = 20.0
+        for index, text in enumerate(script):
+            if s.eng.scheduler.commit_permitted(r):
+                break
+            if index == 4:  # the turn after the proposal: the learner says no
+                s.ack = s.reply = "I'd rather keep it to email for now."
+                s.say(text, r)
+                s.ack, s.reply = "Okay, I see.", "Just exploring options."
+                self.assertIsNone(s.eng._pending_ask)
+                self.assertEqual(s.eng.admin_log()["intents"]["declined_calls"], 1)
+            else:
+                s.say(text, r)
+            r += 45
+        self.assertTrue(s.eng.scheduler.commit_permitted(r))
+        plan = s.say(self.FAREWELL, r)
+        self.assertNotIn("pending_ask_at_farewell", plan.reasons)
+        self.assertIn("close_attempt_stall", plan.reasons)
+        self.assertEqual(plan.commitment_level, Level.WEAK)
+
+    def test_the_same_proposal_unanswered_is_still_booked_at_the_farewell(self):
+        s, r = until_window(CALL_ASK, seed="open")
+        plan = s.say(self.FAREWELL, r)
+        self.assertIn("pending_ask_at_farewell", plan.reasons)
+
+    # --- D5: the call is welcome, and a vague time is not invented
+    def test_the_f4_push_beside_a_call_proposal_never_says_the_decision_maker_dislikes_calls(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = None
+        for r, text in ((60, PITCH), (100, NEUTRAL), (150, SCHEDULE_TALK), (200, NEUTRAL), (250, PRICE_ONLY)):
+            s.say(text, r)
+        for r in range(300, 700, 45):
+            plan = s.say(CALL_ASK, r)
+            if plan.move_id == "F4-PUSH":
+                break
+        self.assertIsNotNone(plan)
+        if plan.move_id != "F4-PUSH":
+            self.skipTest("F4-PUSH was not reached with this script")
+        self.assertIn("never say that they dislike calls", plan.intent.brief)
+
+    def test_a_vague_time_after_the_decision_maker_is_booked_without_a_slot(self):
+        session, r = run_cooperative(50.0)  # the F4 pair is done: "I'd need to talk to my husband"
+        plan = session.say(
+            "No problem at all, take your time with your husband and we'll find a time that works. "
+            "Just let me know when's good, or I can try you sometime next week.",
+            r,
+        )
+        self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+        self.assertEqual(plan.scripted_text, commitment_line(Level.MEDIUM, "husband", deferred=True))
+        self.assertNotRegex(plan.scripted_text, r"\d|Thursday|week")
+        self.assertTrue(session.eng.negotiation.chosen_slot.deferred)
+        self.assertTrue(session.eng.admin_log()["negotiation"]["slot_deferred"])
+
+    def test_a_named_evening_is_still_booked_when_the_decision_maker_was_mentioned(self):
+        session, r = run_cooperative(50.0)
+        plan = session.say("Would tomorrow evening work for a quick call with your husband?", r)
+        self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+        self.assertEqual(
+            plan.scripted_text,
+            commitment_line(Level.MEDIUM, "husband", "tomorrow in the evening"),
+        )
+
+    # --- D16: a stall that answers a call asks for no e-mail
+    def test_a_weak_stall_after_a_call_ask_says_call_me_back(self):
+        session, r = run_cooperative(50.0)
+        plan = None
+        for step in range(5):
+            plan = session.say(CALL_ASK, r + 50 * step)
+            if plan.mode is TurnMode.SAY_ONLY:
+                break
+        self.assertEqual(plan.mode, TurnMode.SAY_ONLY)
+        self.assertEqual(plan.commitment_level, Level.WEAK)
+        self.assertEqual(plan.scripted_text, commitment_line(Level.WEAK, "husband", call=True))
+        self.assertNotIn("email", plan.scripted_text.lower())
+        self.assertTrue(session.eng.negotiation.weak_line_said)
+
+    def test_a_weak_stall_after_an_enrolment_ask_keeps_the_email_wording(self):
+        session, r = run_cooperative(50.0)
+        plan = None
+        for step in range(5):
+            plan = session.say(ASK, r + 50 * step)
+            if plan.mode is TurnMode.SAY_ONLY:
+                break
+        self.assertEqual(plan.scripted_text, stall_line("husband"))
+
+    def test_the_thirteen_minute_stall_keeps_the_email_wording(self):
+        session, _r = run_cooperative(40.0)
+        plan = session.say(NEUTRAL, 800)
+        self.assertEqual(plan.move_id, COMMIT_STALL)
+        self.assertEqual(plan.scripted_text, stall_line("husband"))
+
+    # --- D12: a direct dig is answered before an owed move
+    def test_a_dig_about_the_decision_maker_holds_an_owed_move_back_one_turn(self):
+        dig = PITCH + " Is he more of a sounding board, or does he need to be convinced?"
+        s = Session(engine())
+        s.say(OPENER, 20)
+        held = s.say(dig, 60)
+        self.assertEqual(held.mode, TurnMode.LLM_REPLY)
+        self.assertIn("owed_deferred_for_dig", held.reasons)
+        again = s.say(dig, 100)  # held once, never twice
+        self.assertEqual(again.move_id, F3_PRIMARY)
+        self.assertNotIn("owed_deferred_for_dig", again.reasons)
+
+    def test_a_forced_move_is_never_held_back_for_a_dig(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("Is it more of a sounding board, or does he need to be convinced?", 290)
+        self.assertEqual(plan.move_id, F3_PRIMARY)
+        self.assertTrue(plan.intent.forced)
+
+    def test_a_check_in_or_an_offer_is_not_a_dig(self):
+        for text in (
+            PITCH + " What do you think?",
+            PITCH + " Does that sound good to you?",
+            PITCH + " Would you like me to send you the details?",
+            PITCH + " Anything else on your mind?",
+        ):
+            with self.subTest(text=text):
+                s = Session(engine())
+                s.say(OPENER, 20)
+                plan = s.say(text, 60)
+                self.assertNotIn("owed_deferred_for_dig", plan.reasons)
+
+    # --- D13: a push the learner already voiced is not owed again
+    def test_a_push_voiced_in_a_free_reply_is_not_asked_again(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        r = 60
+        while not s.eng.scheduler.is_delivered("F2-PRIMARY") and r < 600:
+            s.say(PITCH if r == 60 else SCHEDULE_TALK, r)
+            r += 45
+        self.assertTrue(s.eng.scheduler.is_delivered("F2-PRIMARY"))
+        self.assertFalse(s.eng.scheduler.is_delivered("F2-PUSH"))
+        s.reply = "What happens if someone falls behind partway through?"
+        plan = s.say("Okay, got it.", r)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertTrue(s.eng.scheduler.is_delivered("F2-PUSH"))
+        self.assertEqual(s.eng.admin_log()["intents"]["organic_pushes"], ["F2-PUSH"])
+        later = s.say(SCHEDULE_TALK + " Recordings and mentor support help you catch up.", r + 45)
+        self.assertNotEqual(later.move_id, "F2-PUSH")
+
+    def test_the_answered_facts_are_listed_for_a_free_reply(self):
+        from r1_scheduler import ANSWERED_LABELS
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(SCHEDULE_TALK + " It takes about ten hours a week.", 60)
+        self.assertIn("do not ask about them again", plan.reminder)
+        labels = dict(ANSWERED_LABELS)
+        self.assertIn(labels["format"], plan.reminder)
+        self.assertIn(labels["weekly_hours"], plan.reminder)
+        self.assertEqual(sorted(s.eng.admin_log()["style"]["answered"]), ["format", "weekly_hours"])
+        fresh = Session(engine())
+        fresh.say(OPENER, 20)
+        self.assertNotIn("do not ask about them again", fresh.say(NEUTRAL, 60).reminder)
+
+    # --- D14, D15: the question diet and the phrase quotas reach the guard
+    def test_the_guard_knows_which_replies_asked_and_which_phrases_were_used(self):
+        from r1_prompts import STRETCH_USED_NOTE, TEMPLATE_USED_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.reply = "It's a stretch for me. What would that call actually involve?"
+        second = s.say(NEUTRAL, 60)
+        self.assertTrue(second.guard_ctx.free_reply)
+        self.assertEqual(second.guard_ctx.recent_questions, (False,))
+        self.assertNotIn(STRETCH_USED_NOTE, second.reminder)
+        third = s.say(NEUTRAL, 100)
+        self.assertEqual(third.guard_ctx.recent_questions, (False, True))
+        self.assertIn(("stretch", 1), third.guard_ctx.phrase_counts)
+        self.assertIn(("template_q", 1), third.guard_ctx.phrase_counts)
+        self.assertIn(STRETCH_USED_NOTE, third.reminder)
+        self.assertIn(TEMPLATE_USED_NOTE, third.reminder)
+
+    def test_no_curiosity_question_is_handed_over_while_the_question_budget_is_spent(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.reply = "What would I actually build in the course?"
+        s.say(NEUTRAL, 60)
+        self.assertFalse(s.eng._question_budget())
+        s.reply = "Okay, that makes sense."
+        first = s.say(NEUTRAL, 100)
+        self.assertNotIn("You are curious about", first.reminder)
+        s.say(NEUTRAL, 140)
+        self.assertTrue(s.eng._question_budget())  # two replies without a question
+
+    def test_an_intent_reply_is_not_on_the_question_diet(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(PITCH, 60)
+        self.assertEqual(plan.mode, TurnMode.INTENT)
+        self.assertFalse(plan.guard_ctx.free_reply)
+
+    # --- D7: where the price stands
+    def test_a_price_at_or_below_the_ask_is_never_a_stretch(self):
+        from r1_prompts import OFFER_MET_NOTE, PRICE_MET_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PRICE_ONLY, 60)
+        counter = s.say("Fine, let's make it $6,000 for you.", 100)
+        self.assertEqual(counter.move_id, F1_COUNTER)
+        self.assertIn("the advisor's best price so far is $6,000", counter.intent.brief)
+        wrap = s.say("Is it fine with you?", 140)
+        self.assertIn(OFFER_MET_NOTE.format(amount="$6,000"), wrap.reminder)
+        self.assertNotIn("still more than I planned for", wrap.reminder)
+        later = s.say("So the $6,000 includes the mentoring and the capstone.", 190)
+        self.assertIn(PRICE_MET_NOTE.format(amount="$6,000"), later.reminder)
+        self.assertEqual(later.guard_ctx.offer_usd, 6000)
+        said = s.eng.sanitize_reply(later, "That number's better, but it's still a stretch for me.")
+        self.assertNotIn("stretch", said.text)
+        self.assertEqual(s.eng.ledger.leak_total, 0)
+
+    def test_a_price_that_did_not_move_is_not_better_than_before(self):
+        from r1_prompts import PRICE_UNCHANGED_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PRICE_ONLY, 60)
+        s.say("Okay, let's make it $8,500.", 100)
+        s.say("Is it fine with you?", 140)  # the wrap turn names the offer in its own note
+        same = s.say("So that $8,500 covers everything we talked about.", 190)
+        self.assertIn(PRICE_UNCHANGED_NOTE.format(amount="$8,500"), same.reminder)
+        quiet = s.say("What else is on your mind?", 230)
+        self.assertNotIn("has not changed", quiet.reminder)  # the price did not come up
+
+    # --- D12: one layer of disclosure per reply
+    def test_a_deep_need_takes_the_reply_and_the_other_topics_hint_waits(self):
+        walk = OwnerTestDisclosureTests.T25, OwnerTestDisclosureTests.T30, OwnerTestDisclosureTests.T34
+        s = Session(engine())
+        s.say(OPENER, 15)
+        s.say(walk[0], 46)
+        s.say(walk[1], 68)
+        plan = s.say(walk[2], 97)
+        self.assertIn("digging further into", plan.reminder)
+        self.assertNotIn("first real question about", plan.reminder)
 
 
 if __name__ == "__main__":

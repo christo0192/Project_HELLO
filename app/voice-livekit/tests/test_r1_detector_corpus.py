@@ -23,7 +23,7 @@ Corpus entry: ``{id, text, labels, phase_hint, source}``.
 
 A label of ``null`` means "not scored" (a confirmation of a call the learner already agreed to).
 ``phase_hint`` is ``pre_anchor`` (an amount needs a pricing word), ``post_anchor`` or ``any`` (read as
-post-anchor).  ``source`` says where the label comes from: ``review:`` / ``iter1:`` are the phrasings of the
+post-anchor).  ``source`` says where the label comes from: ``review:`` / ``iter1:`` / ``iter2:`` are the phrasings of the
 review and verify rounds and of this iteration's live-sweep findings, ``owner:`` the real advisor turns of the
 owner's test, ``sim:`` the advisor simulator's turns of the live sweeps (its own {intent, topic} JSON is the
 ground truth for the label; the ambiguous ones were checked by hand).
@@ -49,7 +49,7 @@ if str(HERE) not in sys.path:
 from r1_negotiation import AdvisorActs, read_advisor_turn
 
 CORPUS_PATH = HERE / "tests" / "fixtures" / "r1_advisor_corpus.jsonl"
-HAND_PREFIXES = ("review:", "iter1:", "owner:")
+HAND_PREFIXES = ("review:", "iter1:", "iter2:", "owner:")
 SIM_PREFIX = "sim:"
 RECALL_FLOOR = 0.95
 PRECISION_FLOOR = 0.98
@@ -226,7 +226,7 @@ class CorpusShapeTests(unittest.TestCase):
 
     def test_the_sources_are_all_known(self) -> None:
         kinds = {entry["source"].split(":", 1)[0] + ":" for entry in self.entries}
-        self.assertLessEqual(kinds, {"review:", "iter1:", "owner:", "sim:"})
+        self.assertLessEqual(kinds, {"review:", "iter1:", "iter2:", "owner:", "sim:"})
         self.assertGreaterEqual(sum(1 for entry in self.entries if is_hand(entry)), 400)
         self.assertGreaterEqual(sum(1 for entry in self.entries if is_sim(entry)), 800)
 

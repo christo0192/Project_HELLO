@@ -853,3 +853,42 @@ def detect_followup(text: object) -> bool:
 def has_question(text: object) -> bool:
     """True when at least one sentence of ``text`` is question-like."""
     return any(is_question_like(sentence) for sentence in split_sentences(text))
+
+
+# Somebody else in the learner's decision, named by a pronoun or a role ("is he more of a sounding
+# board?", "what would your husband want to know?").
+_THIRD_PARTY = re.compile(
+    r"\b(?:he|she|they|him|her|them|his|their|your (?:husband|wife|partner|spouse|father|mother|"
+    r"dad|mom|parents|family|boss|manager))\b",
+    re.IGNORECASE,
+)
+
+
+def asks_about_learner(text: object) -> bool:
+    """True when the advisor digs: a question about the learner's situation or the people in it.
+
+    A question counts when a probe rule reads it as one (``detect_probes``), when it asks the
+    learner to say more (``detect_followup``), or when it is about somebody else in the learner's
+    decision ("is there anything specific he'd want to know?"), and it is not a check-in on the
+    advisor's own answer, an offer or a choice between plans.  It is wider than the probe rules on
+    purpose: those miss the questions about the husband and the father that two owed objections
+    answered in the live sweep (R1-Q iteration 2).  The engine holds back a move that no deadline
+    forces for ONE turn when this is true.
+    """
+    for sentence in split_sentences(text):
+        if not is_question_like(sentence):
+            continue
+        lowered = fold(sentence).lower()
+        if (
+            _CHECKIN_ON_ANSWER.search(lowered) is not None
+            or _OFFER_QUESTION.search(lowered) is not None
+            or _CHOICE_QUESTION.search(lowered) is not None
+        ):
+            continue
+        if (
+            detect_probes(sentence)
+            or detect_followup(sentence)
+            or _THIRD_PARTY.search(lowered) is not None
+        ):
+            return True
+    return False

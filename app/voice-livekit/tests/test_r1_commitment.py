@@ -175,6 +175,85 @@ class ClassifyTests(unittest.TestCase):
             self.assertEqual(classify_learner_commitment(text), WEAK)
         self.assertEqual(classify_learner_commitment(""), Level.NONE)
 
+    # Learner corpus, R1-Q iteration 2: a negator that governs the agreement turns it round.  The
+    # first two are the live lines that were graded MEDIUM and flagged two calls (the sweep found
+    # them in p2 pushy and p2 terse); the rest keep the polarity honest in both directions.
+    NEGATED = (
+        "And ten tomorrow won't work, I'm at work then, so can you tell me what the callback "
+        "would actually cover?",
+        "I don't think tomorrow works, I'm still weighing it up and might just wait for the next "
+        "cohort.",
+        "Thursday doesn't work for me.",
+        "Tomorrow evening isn't going to work, sorry.",
+        "I can't do Tuesday.",
+        "Friday won't suit me at all.",
+        "I'm not sure that Thursday works.",
+        "7 PM does not work for me.",
+        "No, a call tomorrow wouldn't work.",
+    )
+    AFFIRMED_NEXT_TO_A_NEGATION = (
+        ("I can't do Tuesday, but Thursday works.", MEDIUM),
+        ("Tuesday doesn't work, Thursday works for me.", MEDIUM),
+        ("No problem, Thursday works.", MEDIUM),
+        ("That doesn't sound pushy, so let's book a call.", MEDIUM),
+        ("Don't worry, sign me up.", STRONG),
+        ("I won't say no. Let's do it.", STRONG),
+    )
+
+    def test_a_negated_agreement_is_no_agreement(self):
+        for text in self.NEGATED:
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), Level.NONE)
+
+    def test_an_agreement_after_a_negated_clause_still_counts(self):
+        for text, level in self.AFFIRMED_NEXT_TO_A_NEGATION:
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), level)
+
+    def test_negation_does_not_hide_a_negated_stall_or_a_scripted_line(self):
+        for level in (STRONG, MEDIUM, WEAK):
+            self.assertEqual(
+                classify_learner_commitment(commitment_line(level, "husband")), level
+            )
+        self.assertEqual(
+            classify_learner_commitment(commitment_line(MEDIUM, "partner", deferred=True)), MEDIUM
+        )
+        self.assertEqual(
+            classify_learner_commitment(commitment_line(WEAK, "father", call=True)), WEAK
+        )
+
+
+class IterationTwoLineTests(unittest.TestCase):
+    """The two new scripted lines: a MEDIUM that books the call without a slot, a WEAK for a call ask."""
+
+    def test_the_deferred_medium_line_books_a_call_but_no_slot(self):
+        line = commitment_line(MEDIUM, "partner", deferred=True)
+        self.assertEqual(
+            line, "Let me check with my partner first, and then let's book a call, so we can decide."
+        )
+        self.assertEqual(len(split_sentences(line)), 1)
+        self.assertTrue(line.endswith("so we can decide."))
+        self.assertNotRegex(line, r"\d|Thursday|tomorrow|week")
+        self.assertTrue(is_commitment_line(line, "partner"))
+        self.assertEqual(mask_for_scorer(line, "partner"), MASK_PLACEHOLDER)
+        # The slot arguments are ignored: this line names none.
+        self.assertEqual(commitment_line(MEDIUM, "partner", "tomorrow at 7 PM", deferred=True), line)
+
+    def test_the_call_back_weak_line_does_not_ask_for_an_email(self):
+        line = commitment_line(WEAK, "father", call=True)
+        self.assertEqual(
+            line,
+            "Let me think about it. Call me back after I've talked to my father, and I'll let you "
+            "know.",
+        )
+        self.assertNotIn("email", line.lower())
+        self.assertTrue(is_commitment_line(line, "father"))
+        self.assertEqual(mask_for_scorer(line, "father"), MASK_PLACEHOLDER)
+        self.assertEqual(stall_line("father"), commitment_line(WEAK, "father"))
+        # Only the WEAK level has a call-back wording.
+        self.assertEqual(commitment_line(MEDIUM, "father", call=True), commitment_line(MEDIUM, "father"))
+        self.assertEqual(commitment_line(STRONG, "father", call=True), commitment_line(STRONG, "father"))
+
 
 class AskDetectionTests(unittest.TestCase):
     ENROL = (

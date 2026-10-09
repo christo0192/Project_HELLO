@@ -97,6 +97,12 @@ export const R1_NAME_MASK = '[CANDIDATE]';
  * before "so we can decide" ("Let's book a call tomorrow at 7 PM with my husband so we"). The
  * opening "let's book a call" is therefore masked on its own: the learner guard blocks that
  * phrase in free text, so only the scripted line can contain it.
+ *
+ * R1-Q iteration 2: the WEAK line has a second wording for a call ask ("Let me think about it. Call
+ * me back after I've talked to my husband, and I'll let you know."): its second sentence is
+ * masked by its fixed frame, which a barge-in can cut after "my". The MEDIUM line that books the
+ * call without a slot ("Let me check with my husband first, and then let's book a call, so we can
+ * decide.") already matches the two MEDIUM frames above.
  */
 const COMMITMENT_PATTERNS: readonly RegExp[] = [
   /send me the enrol+ment link/i,
@@ -104,6 +110,7 @@ const COMMITMENT_PATTERNS: readonly RegExp[] = [
   /book a call\b[^.!?]*\bso we can decide/i,
   /\blet['’]?s book a call\b/i,
   /email me the details and i['’]?ll get back to you/i,
+  /\bcall me back after i['’]?ve talked to my\b/i,
 ];
 
 const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/;

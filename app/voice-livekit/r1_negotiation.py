@@ -71,6 +71,9 @@ ANCHOR_USD = 7000
 MIN_NET_USD = 4500
 PREFERRED_TIME = "7 PM"
 MOVED_DAY = "tomorrow"
+# The learner said it had to talk to its decision maker this recently: a vague "let me know when's
+# good" is then answered by booking the call without a slot (``Negotiation.slot_choice``).
+DEFER_RECENT_TURNS = 3
 
 REASON_TIMING = "timing"
 REASON_MONEY = "money"
@@ -299,13 +302,13 @@ class CounterSituation:
 COUNTERS: tuple[CounterSituation, ...] = (
     CounterSituation(
         SITUATION_SHORT,
-        "the advisor came down a little but the number is still a stretch for you, so you ask "
-        "whether they can go a bit lower; you do not accept it",
+        "the price is above what you hoped, so ask if they can go lower; do not accept it, and "
+        "do not call it better unless it just dropped",
         (
-            "That's better, but it's still a stretch for me. Can you go a little lower?",
-            "Okay, that helps a bit, but could you do a little better than that?",
-            "I appreciate that, but it's still a lot for me. Is there any more room on the "
-            "price?",
+            "Okay, thanks, but I was hoping for a bit less. Can you go a little lower?",
+            "I appreciate that, but could you do a little better than that?",
+            "That helps, but it's still more than I planned for. Is there any more room on "
+            "the price?",
         ),
     ),
     CounterSituation(
@@ -372,26 +375,29 @@ def anchor_after_offer(offer_usd: int) -> AnchorSituation:
     if offer_usd > ANCHOR_USD:
         return AnchorSituation(
             ANCHOR_ABOVE,
-            f"the advisor has already come down to {amount}; you say that is still a lot for "
-            "you, that you heard people got it for around $7,000, and you ask if the advisor "
-            "can do that",
+            f"the advisor has already come down to {amount}; tell the advisor that is still a "
+            "lot for you, that you heard people got it for around $7,000, and ask if they can "
+            "do that",
             (amount, "$7,000"),
             (
                 f"{amount} is still a lot for me, and I heard people got it for around $7,000. "
                 "Can you do that?",
-                f"{amount} is still a stretch, and I read some people paid about "
+                f"{amount} is still more than I planned for, and I read some people paid about "
                 "$7,000. Is that possible?",
                 f"Okay, but {amount} is still a big number for me, and I heard it went for "
                 "around $7,000. Can you match that?",
             ),
         )
-    # The price is already at (or below) the ask.  The learner sounds pleased and asks what the
-    # price includes: "is that the final price?" belongs to the counter that follows
-    # (``SITUATION_MET``), and asking it here as well voices the same question twice in a row
-    # (R1-Q round 2).
+    # The price is already at (or below) the ask.  The learner notes calmly that it is in line with
+    # what it heard and may ask what the price includes: "is that the final price?" belongs to the
+    # counter that follows (``SITUATION_MET``), and asking it here as well voices the same question
+    # twice in a row (R1-Q round 2).  No surprise and no thanks: in the live sweep the learner was
+    # "pleasantly surprised" two turns after it had reacted to the very same price.  Two of the
+    # three scripted variants are statements (the question rate of the sweep was above its gate).
     brief_tail = (
-        "you sound pleased that it matches what you heard and ask what is included at that "
-        "price; you do not ask whether it is the final price"
+        "you note calmly that it is in line with what you heard, with no surprise and no thanks, "
+        "and you may ask what is included at that price; you do not ask whether it is the "
+        "final price"
     )
     if offer_usd == ANCHOR_USD:
         return AnchorSituation(
@@ -402,9 +408,8 @@ def anchor_after_offer(offer_usd: int) -> AnchorSituation:
             (
                 "That's right at the $7,000 I heard people got it for. What exactly does that "
                 "price include?",
-                "Oh, $7,000 is what I read people paid. Does that cover the live classes and the "
-                "mentoring?",
-                "That matches the $7,000 I heard about. What would I get for that price?",
+                "That matches the $7,000 I read people paid.",
+                "I heard about $7,000, so that is in line with what I read.",
             ),
         )
     return AnchorSituation(
@@ -415,10 +420,8 @@ def anchor_after_offer(offer_usd: int) -> AnchorSituation:
         (
             f"{amount} is even below the $7,000 I heard people got it for. What exactly does "
             "that price include?",
-            f"Oh, {amount} is less than the $7,000 I read about. Does that cover the live "
-            "classes and the mentoring?",
-            f"I heard people paid about $7,000, so {amount} sounds good. What would I get for "
-            "that price?",
+            f"{amount} is under the $7,000 I read about.",
+            f"I heard people paid about $7,000, so {amount} is in line with that.",
         ),
     )
 
@@ -488,13 +491,27 @@ class Slot:
     def weekend(self) -> bool:
         return self.day in _WEEKEND_DAYS
 
+    @property
+    def vague(self) -> bool:
+        """No clock time and no part of the day, and at most "next week" for a day.
+
+        "I can try you sometime next week" names no slot the learner could book.
+        """
+        return self.hour is None and self.part is None and self.day in (None, "next week")
+
 
 @dataclass(frozen=True)
 class SlotChoice:
-    """The slot the learner books: its phrase, and whether it moved the advisor's proposal."""
+    """The slot the learner books: its phrase, and whether it moved the advisor's proposal.
+
+    ``deferred`` means no slot is named: the advisor offered none that can be booked and the learner
+    had just said it must talk to its decision maker first, so the MEDIUM line books the call
+    without a time (``r1_commitment.MEDIUM_DEFER_LINE``).
+    """
 
     phrase: str
     moved: bool
+    deferred: bool = False
 
 
 def _hour24(hour: int, meridiem: str) -> int | None:
@@ -621,9 +638,6 @@ _EMAIL_OFFER = _compile(
     r"\b" + _OFFER_FRAME + r"\b[^.?!]{0,30}\b(?:send|give|share|forward|put)\b[^.?!]{0,40}\b"
     r"(?:(?:in|on|by|via|over|to|into) (?:an? |your |the |my )?(?:e-?mail|mail|inbox|whatsapp|"
     r"address)|in writing)\b",
-    r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + r"(?:send|forward|share) (?:it|that|this|them|"
-    r"everything) (?:over|across|out|your way|right away|right now|shortly|today|tonight|later|"
-    r"right after|after|once|as soon as|before)\b",
     r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + r"(?:e-?mail|mail) (?:you |me )?(?:the |a |an )?"
     r"(?:[\w-]+ ){0,2}(?:link|form)\b",
     # "I'll also share a course outline beforehand": information handed over between calls
@@ -637,6 +651,21 @@ _EMAIL_OFFER = _compile(
     r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + r"(?:get|have) (?:that |the |an |your |this )?"
     r"(?:[\w-]+ ){0,4}?(?:e-?mails?|mail|details|information|brochure|everything)\b[^.?!]{0,25}"
     r"\b(?:out|sent|over|e-?mailed|mailed|off)\b",
+)
+# "I'll send it over today" is an e-mail offer.  A QUESTION in a turn that is about a form or a link
+# and names no e-mail word is not: the pronoun is the form ("... a two-minute enrollment form. Can
+# I send it right now?"; R1-Q iteration 2: the learner answered "What would that email actually
+# include?").
+_EMAIL_OFFER_PRONOUN = _compile(
+    r"\b" + _OFFER_FRAME + r"\s+" + _ADVERBS + r"(?:send|forward|share) (?:it|that|this|them|"
+    r"everything) (?:over|across|out|your way|right away|right now|shortly|today|tonight|later|"
+    r"right after|after|once|as soon as|before)\b",
+)
+_EMAIL_WORD = re.compile(r"\b(?:e-?mails?|e-?mailed|mail|mailed|inbox|address)\b", re.IGNORECASE)
+_FORM_WORD = re.compile(
+    r"\b(?:forms?|links?|applications?|enrol+ment|registration|payment|deposit|invoice|agreement|"
+    r"paperwork|contract)\b",
+    re.IGNORECASE,
 )
 # The details of a class are class logistics, not the information a learner decides on: "we'll send
 # you the link to the live class on Monday".  ("details of the program" is information.)
@@ -737,14 +766,42 @@ def detect_email_offer(text: object) -> bool:
     programme timeline or class logistics is not an offer.
     """
     folded = _tail(text).lower()
+    form_talk = _EMAIL_WORD.search(folded) is None and _FORM_WORD.search(folded) is not None
     for sentence in split_sentences(folded):
-        for pattern in _EMAIL_OFFER:
+        patterns = _EMAIL_OFFER
+        if not (form_talk and is_question_like(sentence)):
+            patterns = (*_EMAIL_OFFER, *_EMAIL_OFFER_PRONOUN)
+        for pattern in patterns:
             for match in pattern.finditer(sentence):
                 near = around(sentence, match.start(), match.end())
                 if describes_programme(near) or _CLASS_OBJECT.search(near):
                     continue
                 return True
     return False
+
+
+# The learner turned a call down ("I'd rather keep it to email for now", "I haven't agreed to any
+# date yet"): an open proposal it declined is not answered later by booking it (R1-Q iteration 2:
+# the learner declined a call twice and then booked it when the advisor said goodbye).
+_DECLINES_CALL = re.compile(
+    r"\b(?:rather|prefer|better|happier|more comfortable)\b[^.?!]{0,30}\b(?:e-?mail|text|message|"
+    r"writing|chat here)\b"
+    r"|\bkeep (?:it|this|things|us)\b[^.?!]{0,20}\b(?:to|over|by|via)\b[^.?!]{0,10}\b(?:e-?mail|"
+    r"text|message|writing)\b"
+    r"|\b(?:not up for|not comfortable with|don'?t want|do not want|not ready for|not doing|"
+    r"skip)\s+(?:a |any |the )?(?:phone )?calls?\b"
+    r"|\bno (?:phone )?calls?\b"
+    r"|\b(?:haven'?t|have not|not) (?:yet )?agreed to\b"
+    r"|\bnot (?:agreeing|committing) to (?:a |any |the )?(?:call|time|date|day)\b"
+    r"|\bi(?:'ll| will) (?:reply|respond|write|answer) (?:to you )?(?:there|by (?:e-?mail|text)|"
+    r"over (?:e-?mail|text)|in (?:the )?(?:e-?mail|writing))\b",
+    re.IGNORECASE,
+)
+
+
+def declines_call(spoken: object) -> bool:
+    """The learner's own words turn a proposed call down or put it off in favour of e-mail."""
+    return _DECLINES_CALL.search(fold(spoken)) is not None
 
 
 def detect_checkin(text: object) -> bool:
@@ -1561,6 +1618,9 @@ class Negotiation:
         self.resolved = False
         self.commitment_turn: int | None = None
         self.chosen_slot: SlotChoice | None = None
+        # The learner turn on which it last said it had to talk to its decision maker (the MEDIUM
+        # line then books a call without inventing a slot the learner never had).
+        self.decider_said_turn: int | None = None
 
     # ------------------------------------------------------------------ observation
     def observe(
@@ -1623,16 +1683,30 @@ class Negotiation:
             decider_asked=asks_decider(text),
         )
 
-    def note_learner_text(self, spoken: object) -> None:
-        """Remember the figures the learner said, so the advisor repeating one is not an offer."""
+    def note_learner_text(self, spoken: object, turn: int | None = None) -> None:
+        """Remember what the learner said: the figures (so the advisor repeating one is not an
+        offer) and, at ``turn``, that it has to talk to its decision maker first."""
         for amount in dollar_amounts(spoken):
             if 0 < amount <= PRICE_USD:
                 self.own_amounts.add(amount)
+        if turn is not None and self._says_decider_first(spoken):
+            self.decider_said_turn = turn
+
+    def _says_decider_first(self, spoken: object) -> bool:
+        """The learner said it would talk to or check with its decision maker."""
+        pattern = re.compile(
+            r"\b(?:talk|speak|check|discuss|consult|run (?:it|this|that) by|ask|tell)\b[^.?!]{0,40}"
+            r"\b" + re.escape(self.decision_maker.lower()) + r"\b",
+            re.IGNORECASE,
+        )
+        return pattern.search(fold(spoken)) is not None
 
     def note_reason_voiced(self, reason: str, turn: int) -> None:
         """The learner raised ``reason`` (a stall reason intent, or the owed F4 moves)."""
         self.voiced.setdefault(reason, turn)
         self.voicings[reason] = self.voicings.get(reason, 0) + 1
+        if reason == REASON_DECISION_MAKER:
+            self.decider_said_turn = turn
 
     def note_spoken(self, spec_id: str, spoken: object, turn: int) -> bool:
         """Record that spec ``spec_id`` was raised, if the played text proves it."""
@@ -1710,10 +1784,24 @@ class Negotiation:
     def reasons_handled_count(self) -> int:
         return len(self.handled)
 
-    def slot_choice(self) -> SlotChoice:
-        """The slot of the MEDIUM line for the advisor's latest proposal."""
-        self.chosen_slot = choose_slot(self.last_slot)
-        return self.chosen_slot
+    def slot_choice(self, turn: int | None = None) -> SlotChoice:
+        """The slot of the MEDIUM line for the advisor's latest proposal.
+
+        When the advisor named no slot that can be booked (nothing, or "sometime next week") and
+        the learner said within the last ``DEFER_RECENT_TURNS`` turns that it has to talk to its
+        decision maker first, the call is booked without a slot (``SlotChoice.deferred``).
+        """
+        choice = choose_slot(self.last_slot)
+        vague = self.last_slot is None or self.last_slot.vague
+        recent = (
+            turn is not None
+            and self.decider_said_turn is not None
+            and 0 <= turn - self.decider_said_turn <= DEFER_RECENT_TURNS
+        )
+        if vague and recent:
+            choice = SlotChoice(choice.phrase, False, True)
+        self.chosen_slot = choice
+        return choice
 
     # ------------------------------------------------------------------------ log
     def log(self) -> dict[str, Any]:
@@ -1740,4 +1828,5 @@ class Negotiation:
             "commitment_turn": self.commitment_turn,
             "slot": None if self.chosen_slot is None else self.chosen_slot.phrase,
             "slot_moved": None if self.chosen_slot is None else self.chosen_slot.moved,
+            "slot_deferred": None if self.chosen_slot is None else self.chosen_slot.deferred,
         }

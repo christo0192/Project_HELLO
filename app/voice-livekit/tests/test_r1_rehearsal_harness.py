@@ -496,7 +496,9 @@ class GoodCallTests(unittest.TestCase):
                      "length_p90", "question_low", "question_high"):
             with self.subTest(gate=gate):
                 self.assertEqual(by[gate], "pass")
-        self.assertEqual(by["commit_strong"], "fail")  # a MEDIUM call is not the STRONG half
+        # A MEDIUM call is not the STRONG half, but STRONG is info since iteration 2: a call ask
+        # caps at MEDIUM, so the gate measured the simulator's choice of ask.
+        self.assertEqual(by["commit_strong"], "info-fail")
         self.assertEqual(by["style"], "n/a")  # no judge ran
 
 
@@ -1314,10 +1316,46 @@ class ScorecardTests(unittest.TestCase):
         self.assertFalse(any(g["status"] == "fail" for g in card["gates"]))
 
     def test_a_weak_advisor_must_never_earn_a_strong_commitment(self) -> None:
-        card = scorecard.build_scorecard([fake_record("weak", commitment="STRONG")], offline=False)
+        records = [fake_record("weak", commitment="STRONG") for _ in range(10)]
+        card = scorecard.build_scorecard(records, offline=False)
         by = {(g["level"], g["gate"]): g["status"] for g in card["gates"]}
         self.assertEqual(by[("weak", "no_strong")], "fail")
         self.assertEqual(by[("weak", "commit_cap")], "fail")
+
+    def test_a_small_group_may_exceed_a_cap_by_one_call_and_a_large_one_may_not(self) -> None:
+        def pushy(levels):
+            return [fake_record("pushy", commitment=level) for level in levels]
+
+        def cap(levels):
+            card = scorecard.build_scorecard(pushy(levels), offline=False)
+            gate = next(g for g in card["gates"] if g["gate"] == "commit_cap")
+            return gate["status"], gate["held_to"], card
+
+        # Four calls, one MEDIUM: 0.25 > 0.2, but one call is all the group can show (iteration 2, D24).
+        status, held, card = cap(["MEDIUM", "WEAK", "WEAK", "WEAK"])
+        self.assertEqual((status, held), ("pass", 0.25))
+        self.assertIn("small group", scorecard.render_markdown(card))
+        self.assertEqual(cap(["MEDIUM", "MEDIUM", "WEAK", "WEAK"])[0], "fail")
+        self.assertEqual(cap(["WEAK"] * 4)[0], "pass")
+        # Eight calls: 0.2 means one call at most, and two calls are 0.25.
+        self.assertEqual(cap(["MEDIUM", *["WEAK"] * 7])[:2], ("pass", 0.2))
+        self.assertEqual(cap(["MEDIUM", "MEDIUM", *["WEAK"] * 6])[0], "fail")
+        # Only the cap gates have the slack.
+        self.assertEqual(scorecard.effective_threshold("hard_fails", "<=", 0.0, 4), 0.0)
+        self.assertEqual(scorecard.effective_threshold("commit_cap", ">=", 0.5, 4), 0.5)
+
+    def test_the_phrase_tic_gates_count_stretch_and_the_involve_question_per_call(self) -> None:
+        clean = [fake_record("average", reply_stretch_count=1, reply_template_q_count=1) for _ in range(2)]
+        by = {(g["level"], g["gate"]): g["status"] for g in scorecard.build_scorecard(clean, offline=False)["gates"]}
+        self.assertEqual(by[("average", "stretch_tic")], "pass")
+        self.assertEqual(by[("average", "template_tic")], "pass")
+        loop = [fake_record("average", reply_stretch_count=3, reply_template_q_count=4) for _ in range(2)]
+        card = scorecard.build_scorecard(loop, offline=False)
+        by = {(g["level"], g["gate"]): g["status"] for g in card["gates"]}
+        self.assertEqual(by[("average", "stretch_tic")], "fail")
+        self.assertEqual(by[("average", "template_tic")], "fail")
+        self.assertEqual(card["aggregate"]["average"]["stretch_per_call"], 3.0)
+        self.assertFalse(card["readiness"]["ready"])
 
     def test_a_hard_fail_and_a_slow_family_show_up(self) -> None:
         records = [fake_record("average", fails=["weak_stall_repeated"], weak_line_count=2)]
@@ -2032,6 +2070,285 @@ class UnpromptedDumpVocabularyTests(unittest.TestCase):
         ]
         found = metrics.disclosure_metrics(self.persona(), exchanges)
         self.assertEqual(found["unprompted_dump_count"], 1)
+
+
+class IterationTwoHarnessTests(unittest.TestCase):
+    """R1-Q iteration 2: the harness defects of the live sweep (D4, D19 to D24 and the phrase tics)."""
+
+    PERSONA = resolve_persona("p1_career_switcher", variant="v1")
+
+    # --- D21: a dig is read from the advisor's question, not from the simulator's tag
+    def test_a_question_about_courses_is_an_h2_dig_whatever_the_tag_says(self) -> None:
+        mis_tagged = {
+            "intent": "followup",
+            "topic": "H1",
+            "text": "Have you tried anything so far, like courses or self-study?",
+        }
+        self.assertEqual(metrics.dug_topics(mis_tagged), ["H2"])
+
+    def test_a_role_or_field_question_digs_at_nothing(self) -> None:
+        for text in ("What's your current role?", "Academia, I see. What's your field?"):
+            with self.subTest(text=text):
+                self.assertEqual(metrics.dug_topics({"intent": "probe", "topic": "H1", "text": text}), [])
+
+    def test_a_follow_up_to_say_more_keeps_its_tagged_topic(self) -> None:
+        for text in ("Tell me more about that.", "Could you walk me through that a bit?", "When you say that, what do you mean?"):
+            with self.subTest(text=text):
+                self.assertEqual(metrics.dug_topics({"intent": "followup", "topic": "H2", "text": text}), ["H2"])
+        # A probe is never saved by a generic phrase.
+        self.assertEqual(metrics.dug_topics({"intent": "probe", "topic": "H2", "text": "Tell me more about yourself."}), [])
+
+    def test_the_disclosure_gate_does_not_count_the_digs_that_were_never_made(self) -> None:
+        exchanges = [
+            tic_exchange(1, "Academia, I see. What's your field?", "Computational biology.", intent="probe", topic="H1"),
+            tic_exchange(2, "Have you tried anything so far, like courses or self-study?", "I tried a bit online.", intent="followup", topic="H1"),
+        ]
+        found = metrics.disclosure_metrics(self.PERSONA, exchanges)
+        self.assertEqual(found["needs_probed"], [])
+        self.assertEqual(found["needs_dug"], [])
+        self.assertIsNone(found["disclosure_rate"])
+
+    # --- D4: an earned commitment is read from the advisor's words
+    def test_a_call_ask_tagged_as_something_else_still_earns_the_commitment(self) -> None:
+        admin = {"commitment": {"level": "MEDIUM", "resolved": True}}
+        plan = {"resolves": True, "commitment_level": "MEDIUM", "delivered_commitment": True}
+        for tag, text in (
+            ("discount", "I'll call you back with a firm number. Does Thursday evening work for that call?"),
+            ("answer_objection", "Would it make sense to schedule a short call with your partner?"),
+            ("answer_objection", "Would it be easier if I set up a short call with you and your partner?"),
+        ):
+            with self.subTest(text=text):
+                exchanges = [
+                    exchange(1, 560, text, tag),
+                    exchange(2, 580, "Great.", "other", spoken="Let's book a call Thursday.", plan=plan),
+                ]
+                found = metrics.commitment_metrics(exchanges, admin)
+                self.assertTrue(found["commitment_earned"], text)
+                self.assertNotIn("unearned_commitment", metrics.hard_fails(found))
+
+    def test_a_pitch_or_a_statement_about_a_programme_is_no_ask(self) -> None:
+        admin = {"commitment": {"level": "MEDIUM", "resolved": True}}
+        plan = {"resolves": True, "commitment_level": "MEDIUM", "delivered_commitment": True}
+        for text in (
+            "More about the capstone project and the mentors.",
+            "You can book a slot with a mentor every week.",
+            "Thanks, that is all from me.",
+        ):
+            with self.subTest(text=text):
+                exchanges = [
+                    exchange(1, 560, text, "pitch"),
+                    exchange(2, 580, "Great.", "other", spoken="Let's book a call Thursday.", plan=plan),
+                ]
+                self.assertFalse(metrics.commitment_metrics(exchanges, admin)["commitment_earned"], text)
+
+    def test_the_advisor_tag_alone_is_still_enough(self) -> None:
+        self.assertTrue(metrics.advisor_asked_next_step({"intent": "close_ask", "text": "Okay."}))
+        self.assertFalse(metrics.advisor_asked_next_step({"intent": "pitch", "text": "Okay."}))
+
+    # --- D22, D24 are in the scorecard tests; D15 and D14 metrics
+    def test_the_phrase_tics_are_counted_per_reply(self) -> None:
+        found = metrics.style_metrics([
+            "That's better, but it's still a stretch for me.",
+            "A bit of a stretch, honestly. What would that call actually involve?",
+            "What would the program cover week to week?",
+            "Okay, thanks.",
+        ])
+        self.assertEqual(found["reply_stretch_count"], 2)
+        self.assertEqual(found["reply_template_q_count"], 2)
+        self.assertEqual(metrics.style_metrics(["Fine."])["reply_stretch_count"], 0)
+
+    def test_the_harness_does_not_use_the_engines_phrase_detector(self) -> None:
+        import inspect
+
+        source = inspect.getsource(metrics)
+        self.assertNotIn("reply_phrases", source)
+        self.assertNotIn("STRETCH_PHRASE", source)
+
+    def test_the_time_cue_rule_ignores_a_price_said_a_minute_ago(self) -> None:
+        exchanges = [
+            exchange(1, 400, "Okay.", "pitch", spoken="Wait, you just said $7,500 a minute ago - now it's $9,000?"),
+            exchange(2, 420, "Okay.", "pitch", spoken="You mentioned you only have a couple of minutes."),
+        ]
+        kinds = [(m["exchange"], m["kind"]) for m in metrics.misfire_metrics(exchanges)["misfires"]]
+        self.assertEqual(kinds, [(2, "time_cue_reversed")])
+
+    # --- D19: the judge has room and a second try
+    def test_the_judge_asks_for_a_roomy_verdict_and_tries_twice_when_it_is_cut_off(self) -> None:
+        seen = []
+        texts = ['{"objections": [{"family": "F1", "turn": 3, "in_', json.dumps(JudgeTests.GOOD)]
+
+        class Client:
+            async def complete(self, messages, **kwargs):
+                seen.append((messages, kwargs))
+                return SimpleNamespace(text=texts[len(seen) - 1], usage={}, seconds=0.0)
+
+        result = asyncio.run(judge.RubricJudge(Client(), "m").judge(JudgeTests()._record()))
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(seen[0][1]["max_tokens"], judge.JUDGE_MAX_TOKENS)
+        self.assertGreaterEqual(judge.JUDGE_MAX_TOKENS, 3000)
+        self.assertEqual(seen[1][0][-1]["content"], judge.RETRY_NUDGE)
+        self.assertNotIn("error", result["verdict"])
+        self.assertEqual(result["metrics"]["judge_objections"], 2)
+
+    def test_a_second_bad_verdict_is_an_error_not_a_guess(self) -> None:
+        class Client:
+            calls = 0
+
+            async def complete(self, messages, **kwargs):
+                Client.calls += 1
+                return SimpleNamespace(text='{"objections": [1,}', usage={}, seconds=0.0)
+
+        result = asyncio.run(judge.RubricJudge(Client(), "m").judge(JudgeTests()._record()))
+        self.assertEqual(Client.calls, 2)
+        self.assertEqual(result["verdict"]["error"], "bad_json")
+        self.assertEqual(result["metrics"], {})
+
+    def test_the_whole_transcript_of_a_long_call_reaches_the_judge(self) -> None:
+        self.assertGreaterEqual(judge.MAX_TRANSCRIPT_CHARS, 24000)
+        record = {
+            "exchanges": [
+                exchange(n, 10 * n, "word " * 120, "pitch", spoken="Okay.") for n in range(1, 31)
+            ]
+        }
+        text = judge.transcript_for_judge(record)
+        self.assertIn("[30] LEARNER: Okay.", text)
+        self.assertFalse(text.endswith("..."))
+
+    # --- D20: a judged misfire has to be real
+    def _misfire_record(self):
+        plan_anchor = {"move_id": "F1-ANCHOR", "mode": "intent"}
+        return {
+            "header": {"persona_id": "p1_career_switcher", "persona_variant": "v1", "seed": "s", "candidate_name": "Rohan"},
+            "exchanges": [
+                exchange(1, 300, "The course is $9,000.", "price",
+                         spoken="I heard people got it for around $7,000 - can you do that?", plan=plan_anchor),
+                exchange(2, 330, "I can do $7,500.", "discount",
+                         spoken="That's a relief, $7,500 is better than I expected."),
+                exchange(3, 360, "Okay.", "pitch",
+                         spoken="I only have a couple of minutes before my next call."),
+                exchange(4, 390, "Okay.", "pitch",
+                         spoken="Right, you mentioned you only have a couple of minutes."),
+                exchange(5, 420, "Is anyone else involved?", "probe",
+                         spoken="I'd talk it over with my husband first."),
+            ],
+        }
+
+    def test_misfires_that_break_the_rubrics_own_definitions_are_rejected(self) -> None:
+        verdict = {
+            "objections": [], "disclosures": [], "ignored_advisor_offers": [], "stall_loop": False,
+            "style": {key: 4 for key in judge.STYLE_KEYS},
+            "misfires": [
+                {"turn": 1, "kind": "anchor_as_offer", "quote": "can you do that"},   # the learner's own raise
+                {"turn": 2, "kind": "anchor_as_offer", "quote": "better than I expected"},  # a real $7,500 offer
+                {"turn": 3, "kind": "time_cue_reversed", "quote": "my next call"},      # the learner's own cue
+                {"turn": 4, "kind": "time_cue_reversed", "quote": "you mentioned you only have"},  # real
+                {"turn": 5, "kind": "decider_inconsistent", "quote": "talk it over with my husband"},
+                {"turn": 5, "kind": "repeat", "quote": "I never said this"},
+                {"turn": 5, "kind": "ignored_offer", "quote": ""},
+            ],
+        }
+        checked = judge.validate_misfires(verdict, self._misfire_record())
+        kept = [(m["turn"], m["kind"]) for m in checked["misfires"]]
+        rejected = {(m["turn"], m["kind"]): m["rejected"] for m in checked["misfires_rejected"]}
+        self.assertEqual(kept, [(4, "time_cue_reversed"), (5, "ignored_offer")])
+        self.assertEqual(rejected[(1, "anchor_as_offer")], "rule_detector_disagrees")
+        self.assertEqual(rejected[(2, "anchor_as_offer")], "rule_detector_disagrees")
+        self.assertEqual(rejected[(3, "time_cue_reversed")], "rule_detector_disagrees")
+        self.assertEqual(rejected[(5, "decider_inconsistent")], "no_decides_alone_line")
+        self.assertEqual(rejected[(5, "repeat")], "quote_not_found")
+        found = judge.judge_metrics(checked)
+        self.assertEqual((found["judge_misfire_count"], found["judge_misfires_rejected"]), (2, 5))
+
+    def test_the_judge_sees_the_anchor_turns_the_cue_and_the_offer_ledger(self) -> None:
+        record = self._misfire_record()
+        record["exchanges"][2]["learner"]["plan"] = {"move_id": "L-TIME-CUE"}
+        user = judge.judge_messages(record)[1]["content"]
+        self.assertIn("ANCHOR TURNS (the learner raises $7,000 itself): [1]", user)
+        self.assertIn("TIME CUE TURN (the learner says it has little time, which is correct): [3]", user)
+        self.assertIn("turn 2: $7,500", user)
+        self.assertIn("NOT misfires", judge.RUBRIC)
+        self.assertIn("quote", judge.SCHEMA_TEXT)
+
+    def test_a_real_anchor_misfire_is_kept(self) -> None:
+        record = self._misfire_record()
+        record["exchanges"][1]["advisor"]["text"] = "Tell me about your budget."
+        record["exchanges"][1]["learner"]["spoken"] = "Oh, $7,000, that's better than I expected."
+        verdict = {
+            "objections": [], "disclosures": [], "ignored_advisor_offers": [], "stall_loop": False,
+            "style": {key: 4 for key in judge.STYLE_KEYS},
+            "misfires": [{"turn": 2, "kind": "anchor_as_offer", "quote": "better than I expected"}],
+        }
+        checked = judge.validate_misfires(verdict, record)
+        self.assertEqual([(m["turn"], m["kind"]) for m in checked["misfires"]], [(2, "anchor_as_offer")])
+        self.assertEqual(checked["misfires_rejected"], [])
+
+    # --- D23: the simulator does not hang up before 10:00
+    def test_the_simulated_advisor_is_asked_again_when_it_says_goodbye_too_early(self) -> None:
+        completions = [
+            '{"intent": "farewell", "topic": "", "text": "Thanks so much, goodbye!"}',
+            '{"intent": "pitch", "topic": "", "text": "One more thing about the mentors."}',
+        ]
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            async def complete(self, messages, **kwargs):
+                self.calls.append(messages)
+                return SimpleNamespace(text=completions[len(self.calls) - 1], usage={}, seconds=0.0)
+
+        client = Client()
+        live = advisor.LLMAdvisor(client, "m", "terse")
+
+        async def go():
+            await live.start("Hello?")
+            return await live.next_turn("Okay.", 383.5, 12)
+
+        turn = asyncio.run(go())
+        self.assertEqual(turn.text, "One more thing about the mentors.")
+        self.assertEqual(turn.retries, 1)
+        self.assertEqual(len(client.calls), 2)
+        self.assertIn("06:23", client.calls[1][-1]["content"])
+        self.assertIn("never say goodbye or wrap up before 10:00", advisor.advisor_system_prompt("terse"))
+
+    def test_a_goodbye_after_ten_minutes_is_left_alone(self) -> None:
+        text = '{"intent": "farewell", "topic": "", "text": "Take care, bye!"}'
+
+        class Client:
+            calls = 0
+
+            async def complete(self, messages, **kwargs):
+                Client.calls += 1
+                return SimpleNamespace(text=text, usage={}, seconds=0.0)
+
+        live = advisor.LLMAdvisor(Client(), "m", "strong")
+
+        async def go():
+            await live.start("Hello?")
+            return await live.next_turn("Okay.", 640.0, 20)
+
+        turn = asyncio.run(go())
+        self.assertEqual((turn.intent, Client.calls, turn.retries), ("farewell", 1, 0))
+
+    def test_a_goodbye_that_comes_back_too_early_is_kept_not_hidden(self) -> None:
+        text = '{"intent": "farewell", "topic": "", "text": "Okay, bye!"}'
+
+        class Client:
+            calls = 0
+
+            async def complete(self, messages, **kwargs):
+                Client.calls += 1
+                return SimpleNamespace(text=text, usage={}, seconds=0.0)
+
+        live = advisor.LLMAdvisor(Client(), "m", "terse")
+
+        async def go():
+            await live.start("Hello?")
+            return await live.next_turn("Okay.", 300.0, 8)
+
+        turn = asyncio.run(go())
+        self.assertEqual((turn.intent, Client.calls, turn.retries), ("farewell", 2, 1))
 
 
 if __name__ == "__main__":

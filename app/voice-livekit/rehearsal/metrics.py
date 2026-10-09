@@ -18,7 +18,10 @@ commitment, M8 premature commit, M9 misfires, M10 fact errors, M11 reply length,
 and reaction rate, M14 name fallback, M15 farewell rows, M16 repeated phrase in a row, M18
 fragmentation, M19 guard and fidelity, M21 neutral acks, M22 verbal tics (R1-Q iteration 1: a
 reaction word opening more than 15 % of the replies, "hmm" or "honestly" in more than 20 %; the
-tic words have their own regexes here, the engine's tic detector in ``r1_text`` is not imported).
+tic words have their own regexes here, the engine's tic detector in ``r1_text`` is not imported),
+M23 phrase tics ("a stretch" and the "what would it involve" question, per call).  Iteration 2: a
+"dig" (M6) is read from the advisor's own question (``dug_topics``) and an earned commitment (M7) from
+the advisor's own words (``advisor_asked_next_step``), not from the simulator's tags alone.
 """
 from __future__ import annotations
 
@@ -87,6 +90,15 @@ _STOP = frozenset(
 # M22 verbal tics.  Own regexes (anti-circularity): "Mm-hmm" is a back-channel, not the tic.
 _HMM = re.compile(r"(?<![a-z-])hmm+\b|(?<![a-z-])hm\b", re.IGNORECASE)
 _HONESTLY = re.compile(r"\b(?:honestly|to be honest|frankly)\b", re.IGNORECASE)
+# M23 phrase tics (iteration 2): "still a stretch for me" (28 replies in 19 of 20 calls) and the
+# question template "what would that call actually involve / cover / include" (33 in 15 calls).
+_STRETCH = re.compile(r"\b(?:a|quite a|kind of a|a bit of a|a real) stretch\b", re.IGNORECASE)
+_TEMPLATE_QUESTION = re.compile(
+    r"\bwhat (?:would|does|will|do|did|could|is) (?:that|this|the|it|a|an|my|joining|waiting)\b"
+    r"[^?.!]{0,40}?\b(?:involve|involves|cover|covers|include|includes|entail|look like|"
+    r"mean for me)\b",
+    re.IGNORECASE,
+)
 # First words that are a reaction rather than the substance of a reply.
 _TIC_OPENERS = frozenset(
     "okay ok oh right sure hmm hm mm mhm mmhmm yeah yes got ah alright good great nice fair "
@@ -118,7 +130,7 @@ _PROBE_VOCAB = {
 # M9 misfire shapes added in iteration 1 (the live misfires of the sweeps).
 _TIME_CUE_REVERSED = re.compile(
     r"\byou(?:'ve| have)? (?:just |only )?(?:mentioned|said|told me)\b[^.?!]{0,40}"
-    r"\b(?:minutes?|next call|another call)\b"
+    r"\b(?:(?:a couple of|a few|two|five|ten|\d+) minutes\b(?! ago)|next call|another call)"
     r"|\byou(?:'ve| have|'re| are)? (?:only |just )?(?:got|have) (?:a couple of|a few) minutes\b",
     re.IGNORECASE,
 )
@@ -347,6 +359,14 @@ def fact_error_metrics(texts: Sequence[str], advisor_texts: Sequence[str] = ()) 
     return {"fact_error_count": len(errors), "fact_errors": errors}
 
 
+def price_figures(text: object) -> list[int]:
+    """The course prices (not discounts) named in ``text``, highest first."""
+    return sorted(
+        (value for value in _dollar_figures(text) if _NET_PRICE_FLOOR <= value <= PRICE_USD),
+        reverse=True,
+    )
+
+
 def _dollar_figures(text: object) -> set[int]:
     figures: set[int] = set()
     for match in re.finditer(r"\$\s?(\d[\d,]*(?:\.\d+)?)\s*(k\b)?", str(text or ""), re.IGNORECASE):
@@ -389,7 +409,11 @@ def style_metrics(texts: Sequence[str]) -> dict[str, Any]:
     top_word, top_count = openers.most_common(1)[0] if openers else ("", 0)
     hmm = sum(1 for text in texts if _HMM.search(text))
     honestly = sum(1 for text in texts if _HONESTLY.search(text))
+    stretch = sum(1 for text in texts if _STRETCH.search(text))
+    template = sum(1 for text in texts if _TEMPLATE_QUESTION.search(text))
     return {
+        "reply_stretch_count": stretch,
+        "reply_template_q_count": template,
         "opener_counts": dict(openers),
         "opener_top_word": top_word or None,
         "opener_top_share": (top_count / count) if count else None,
@@ -515,9 +539,10 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
     touches: dict[str, list[tuple[int, str]]] = {topic: [] for topic in H_TOPICS}
     for index, ex in enumerate(exchanges):
         advisor = _advisor(ex)
-        topic = str(advisor.get("topic") or "")
         intent = str(advisor.get("intent") or "")
-        if topic in touches and intent in PROBE_INTENTS:
+        if intent not in PROBE_INTENTS:
+            continue
+        for topic in dug_topics(advisor):
             touches[topic].append((index, intent))
     probed: list[str] = []
     dug: list[str] = []
@@ -562,6 +587,44 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
     }
 
 
+# A follow-up that asks the learner to say more about what it just said, whatever the topic.
+_GENERIC_FOLLOWUP = re.compile(
+    r"\b(?:tell me more|say more|elaborate|expand on|what do you mean|how so|why is that|"
+    r"(?:can|could|would|will) you (?:please )?(?:explain|share|walk me|give me an example|tell me)|"
+    r"go on|when you say|you (?:mentioned|said)|what specifically|like what|more about that)\b",
+    re.IGNORECASE,
+)
+
+
+def dug_topics(advisor: Mapping[str, Any]) -> list[str]:
+    """The needs (H1-H3) that the advisor's turn really asks about, read from its own words.
+
+    The simulator tags every turn with an intent and a topic, but the tag is a model's guess: "Have
+    you tried anything so far ... courses or self-study?" came tagged ``followup``/``H1`` (it is an
+    H2 question) and "What's your current role?" came tagged ``probe``/``H1`` (it digs at nothing),
+    which made the disclosure gate fail on digs that were never made (R1-Q iteration 2).  A topic
+    counts when a QUESTION sentence of the turn carries that topic's vocabulary; a ``followup`` also
+    counts for its tagged topic when it plainly asks the learner to say more.  A turn with neither
+    digs at nothing.
+    """
+    text = str(advisor.get("text") or "")
+    tag = str(advisor.get("topic") or "")
+    questions = [sentence for sentence in split_sentences(text) if "?" in sentence]
+    found = [
+        topic
+        for topic in H_TOPICS
+        if any(_PROBE_VOCAB[topic].search(question) for question in questions)
+    ]
+    if (
+        str(advisor.get("intent") or "") == "followup"
+        and tag in H_TOPICS
+        and tag not in found
+        and _GENERIC_FOLLOWUP.search(text) is not None
+    ):
+        found.append(tag)
+    return found
+
+
 def _asked_in_window(topic: str, exchanges: Sequence[Mapping[str, Any]], index: int) -> bool:
     """True when an advisor QUESTION about ``topic`` stands within the deep window before ``index``.
 
@@ -595,7 +658,7 @@ def commitment_metrics(
     earned: bool | None = None
     if level in ("MEDIUM", "STRONG") and commit_exchange is not None:
         window = range(max(0, commit_exchange - 2), commit_exchange + 1)
-        earned = any(str(_advisor(exchanges[i]).get("intent") or "") in ASK_INTENTS for i in window)
+        earned = any(advisor_asked_next_step(_advisor(exchanges[i])) for i in window)
     premature = 0
     for ex in exchanges:
         plan = _learner(ex).get("plan") or {}
@@ -611,6 +674,42 @@ def commitment_metrics(
         "asks_seen": len(commitment.get("asks") or []),
         "stalls_before_window": commitment.get("stalls_before_window"),
     }
+
+
+# The advisor asks for a next step: a call, a time, an enrolment, a seat.  Own regexes (the engine's
+# ``detect_ask`` is not imported here), read on the advisor's WORDS, not on the simulator's tag.
+_NEXT_STEP = re.compile(
+    r"\b(?:schedul\w*|book(?:ing)?|set up|arrange|call (?:you )?back|call you|ring you|"
+    r"follow[- ]?up|(?:short|quick|brief|another|a) (?:call|chat|meeting)|chat with|talk again|"
+    r"enrol+\w*|sign (?:you )?up|reserve|hold (?:your|a|the) (?:seat|spot)|lock (?:in|it|your)|"
+    r"payment link|enrol+ment link|get you started|move forward|next step)\b",
+    re.IGNORECASE,
+)
+_OFFERING_VOICE = re.compile(
+    r"\b(?:let'?s|i(?:'ll| will| can| could| would)|we(?:'ll| will| can| could| would)|shall|"
+    r"how about|would you|do you want|want me to|can i|could i)\b",
+    re.IGNORECASE,
+)
+
+
+def advisor_asked_next_step(advisor: Mapping[str, Any]) -> bool:
+    """True when the advisor turn asks for a next step, by its tag or by its own words.
+
+    The simulator's ``close_ask`` / ``callback`` / ``accept_callback`` tags are one source; the other is
+    the text, because the tag is a model's guess ("... Does Thursday evening work for that call?" came
+    tagged ``discount``, "would it make sense to schedule a short call with your partner?" came tagged
+    ``answer_objection``; R1-Q iteration 2: both made a call that earned its commitment an
+    "unearned_commitment" hard fail).  A sentence counts when it names a next step and is a question or
+    speaks in the offering voice.
+    """
+    if str(advisor.get("intent") or "") in ASK_INTENTS:
+        return True
+    for sentence in split_sentences(str(advisor.get("text") or "")):
+        if _NEXT_STEP.search(sentence) is not None and (
+            "?" in sentence or _OFFERING_VOICE.search(sentence) is not None
+        ):
+            return True
+    return False
 
 
 def _spoke_commitment(ex: Mapping[str, Any]) -> bool:

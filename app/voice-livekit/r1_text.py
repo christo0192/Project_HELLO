@@ -281,6 +281,40 @@ def reply_tics(text: object) -> tuple[str, ...]:
     return tuple(tic for tic, pattern in TIC_PATTERNS.items() if pattern.search(folded))
 
 
+# ----------------------------------------------------------------------------------
+# Phrase tics beyond the filler words (R1-Q iteration 2).  The live sweep of iteration 1 fixed
+# "hmm" and "honestly", and the model moved on to "still a stretch for me" (28 replies in 19 of
+# 20 calls, in consecutive turns in nine) and to one question template ("what would that call
+# actually involve?", 33 times in 15 calls).  Each phrase may be used once per call; the guard
+# rewrites a second "a stretch" and drops a second template question.
+# ----------------------------------------------------------------------------------
+PHRASE_STRETCH = "stretch"
+PHRASE_TEMPLATE_Q = "template_q"
+STRETCH_PHRASE = re.compile(
+    r"\b(?:(?:quite|kind of|sort of|a bit of|a little bit of|a real) )?a stretch\b", re.IGNORECASE
+)
+# Said in place of a second "a stretch"; every one reads right before "for me".
+STRETCH_ALTERNATIVES = ("steep", "a lot", "a big ask", "tight", "too much")
+# "what would that call actually involve / cover / include", "what would joining later mean".
+QUESTION_TEMPLATE = re.compile(
+    r"\bwhat (?:would|does|will|do|did|could|is) (?:that|this|the|it|a|an|my|joining|waiting|"
+    r"those|these|one)\b[^?.!]{0,40}?\b(?:actually |really |exactly |even )?(?:involve|involves|"
+    r"cover|covers|include|includes|entail|entails|look like|commit me to|mean for me)\b",
+    re.IGNORECASE,
+)
+
+
+def reply_phrases(text: object) -> tuple[str, ...]:
+    """The tracked phrase tics ("a stretch", the "what would it involve" template) in ``text``."""
+    folded = fold(text)
+    found = []
+    if STRETCH_PHRASE.search(folded):
+        found.append(PHRASE_STRETCH)
+    if QUESTION_TEMPLATE.search(folded):
+        found.append(PHRASE_TEMPLATE_Q)
+    return tuple(found)
+
+
 _NUMBER_WORD = r"zero|one|two|three|four|five|six|seven|eight|nine|oh"
 # Every quantifier below is bounded, so a long run of word characters (or dots, or
 # digits) cannot trigger quadratic backtracking in these detectors.

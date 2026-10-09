@@ -144,6 +144,41 @@ describe('masking', () => {
     }
   });
 
+  it('masks the call-back WEAK wording and the MEDIUM line that books a call without a slot', () => {
+    for (const husband of ['husband', 'father', 'partner']) {
+      expect(
+        maskCommitmentLines(
+          `Let me think about it. Call me back after I've talked to my ${husband}, and I'll let you know.`,
+        ),
+      ).toBe(`Let me think about it. ${R1_COMMITMENT_MASK}`);
+      expect(
+        maskCommitmentLines(
+          `Let me check with my ${husband} first, and then let's book a call, so we can decide.`,
+        ),
+      ).toBe(R1_COMMITMENT_MASK);
+    }
+    // A barge-in can cut the call-back sentence after "my", and a curly apostrophe is the same.
+    for (const line of [
+      "Call me back after I've talked to my",
+      'Call me back after I’ve talked to my husband, and I’ll let you know.',
+      "Hmm. Call me back after Ive talked to my husband, and I'll let you know.",
+    ]) {
+      expect(maskCommitmentLines(line)).toContain(R1_COMMITMENT_MASK);
+    }
+  });
+
+  it('does not mask the F4 push or an ordinary request to call back', () => {
+    for (const text of [
+      "I'd want to run this by my husband first.",
+      'I should discuss it with my father before deciding.',
+      'Can you call me back tomorrow?',
+      'Call me back when you have the price.',
+      'I talked to my husband last night.',
+    ]) {
+      expect(maskCommitmentLines(text)).toBe(text);
+    }
+  });
+
   it('does not mask ordinary talk about calls, and masks only the one sentence', () => {
     for (const text of [
       'Can we book a call to talk about the price?',

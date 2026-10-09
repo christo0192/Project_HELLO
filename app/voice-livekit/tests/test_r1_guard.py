@@ -1632,5 +1632,280 @@ class MisreadAndReopenGuardTests(unittest.TestCase):
                 self.assertLess(time.perf_counter() - started, 2.0)
 
 
+class IterationTwoGuardTests(unittest.TestCase):
+    """R1-Q iteration 2: the live sweep's guard defects, each from a real learner line.
+
+    Every text below is a raw model line of ``scratchpad/r1q-iter/sweep-1`` (the second live
+    sweep); the expected text is what the guard now speaks.
+    """
+
+    P1 = resolve_persona("p1_career_switcher", variant="v1")
+    HONESTLY = [("honestly", ("honestly",))]
+
+    def ctx(self, styles=(), **kwargs):
+        kwargs.setdefault("turn", 4)
+        return GuardContext(
+            phase="roleplay", persona=self.P1, mode="reply", seed="s",
+            recent_styles=tuple(styles), **kwargs,
+        )
+
+    # --- D2: doubt phrasing is not a concession
+    def test_wanting_to_be_sure_it_is_worth_it_is_doubt_not_a_concession(self):
+        for text in (
+            "Six months is a real commitment, so I want to be sure it's worth it.",
+            "I need to see if the price is fair before I think about it.",
+            "I'm trying to figure out whether it's worth the money.",
+            "I just want to make sure it's worth it for me.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(has_concession(text))
+                self.assertTrue(guard_text(text, self.ctx()).clean, text)
+
+    def test_a_real_concession_is_still_one(self):
+        for text in (
+            "I'm sure it's worth it.",
+            "It's definitely worth the money.",
+            "You've convinced me.",
+            "I know it's worth it, so I'm in.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(has_concession(text), text)
+
+    # --- D10: the tic stripper must not garble speech
+    def test_to_be_honest_with_myself_is_a_sentence_not_a_tic(self):
+        text = "Okay, that's more than I pictured, so I'd need to be honest with myself about it."
+        result = guard_text(text, self.ctx(self.HONESTLY))
+        self.assertEqual(result.text, text)
+
+    def test_i_have_to_be_honest_goes_with_its_whole_clause(self):
+        result = guard_text(
+            "That all sounds good, but I have to be honest, there's so much free material online.",
+            self.ctx(self.HONESTLY),
+        )
+        self.assertEqual(
+            result.text, "That all sounds good, but there's so much free material online."
+        )
+
+    def test_no_comma_or_dash_debris_is_left_behind(self):
+        for text, expected in (
+            (
+                "That's still confusing, honestly - I'm not sure what to think.",
+                "That's still confusing - I'm not sure what to think.",
+            ),
+            (
+                "The part I'm still chewing on, honestly - the cost.",
+                "The part I'm still chewing on - the cost.",
+            ),
+            ("But honestly, there's a lot of free stuff online.", "But there's a lot of free stuff online."),
+            ("My schedule is packed, honestly, and money is tight.", "My schedule is packed, and money is tight."),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx(self.HONESTLY)).text, expected)
+
+    def test_a_demonstrative_is_dropped_only_before_an_adjective_or_a_verb(self):
+        styles = [("that", ())]
+        for text in (
+            "That's the part I'd need to see in writing.",
+            "That's a real chunk of my week, so I don't think I'm ready to decide today.",
+            "That's what worries me most.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx(styles)).text, text)
+        self.assertEqual(
+            guard_text("That's reassuring, thank you.", self.ctx(styles)).text,
+            "Reassuring, thank you.",
+        )
+
+    # --- D18: no quote marks around a figure
+    def test_quote_marks_around_a_figure_are_taken_off(self):
+        result = guard_text(
+            '"$9,000" feels like a lot for me right now. I heard people got it for around "$7,000".',
+            self.ctx(),
+        )
+        self.assertEqual(
+            result.text,
+            "$9,000 feels like a lot for me right now. I heard people got it for around $7,000.",
+        )
+        self.assertEqual(guard_text('What does that "$7,000" cover?', self.ctx()).text, "What does that $7,000 cover?")
+        self.assertEqual(
+            guard_text("The “six months” worry me.", self.ctx()).text, "The six months worry me."
+        )
+        # An ordinary quotation is left alone.
+        self.assertEqual(guard_text('You said "no pressure" earlier.', self.ctx()).text.count('"'), 2)
+
+    # --- D11: a connector whose sentence was dropped goes with it
+    def test_a_dangling_connector_after_a_dropped_sentence_is_removed(self):
+        result = guard_text(
+            "I can guarantee nothing at all about this. And before I commit to anything, I would like to see the form.",
+            self.ctx(),
+        )
+        self.assertEqual(result.text, "Before I commit to anything, I would like to see the form.")
+        # Nothing was dropped before it, so the connector stays.
+        kept = guard_text("And before I commit to anything, I would like to see the form.", self.ctx())
+        self.assertEqual(kept.text, "And before I commit to anything, I would like to see the form.")
+
+    def test_a_price_caught_a_minute_ago_is_not_a_reversed_time_cue(self):
+        context = self.ctx(advisor_amounts=frozenset({7500, 9000}))
+        text = "Wait, you just said $7,500 a minute ago - now it's back to $9,000?"
+        result = guard_text(text, context)
+        self.assertEqual(result.text, text)
+        self.assertEqual(result.hits, ())
+        # The real reversal is still caught.
+        reversed_cue = guard_text("You mentioned you only have a couple of minutes before another call.", self.ctx())
+        self.assertIn("time_cue_reversed", [hit.rule for hit in reversed_cue.hits])
+
+    def test_the_learner_may_repeat_the_hours_the_advisor_said(self):
+        text = "Ten hours a week sounds manageable on paper, though I'm not sure I could keep that up."
+        self.assertTrue(guard_text(text, self.ctx(advisor_hours=frozenset({10.0}))).clean)
+        self.assertIn("own_availability_figure", [h.rule for h in guard_text(text, self.ctx()).hits])
+        self.assertIn(
+            "own_availability_figure",
+            [h.rule for h in guard_text(text, self.ctx(advisor_hours=frozenset({12.0}))).hits],
+        )
+
+    # --- D17: spelled-out amounts and per-month reactions
+    def test_a_spelled_out_amount_is_checked_against_the_card_and_the_advisor(self):
+        text = "Six hundred a month is closer to what I could handle."
+        self.assertIn("amount_off_card", [h.rule for h in guard_text(text, self.ctx()).hits])
+        self.assertIn(
+            "amount_off_card",
+            [h.rule for h in guard_text(text, self.ctx(advisor_amounts=frozenset({966}))).hits],
+        )
+        self.assertTrue(guard_text(text, self.ctx(advisor_amounts=frozenset({600}))).clean)
+        # Seven hundred is on the card; "a hundred applications" is not money.
+        self.assertTrue(guard_text("Seven hundred a month is the most I could do.", self.ctx()).clean)
+        self.assertTrue(guard_text("I have sent a hundred applications this year.", self.ctx()).clean)
+
+    def test_a_per_month_reaction_needs_a_monthly_figure_from_the_advisor(self):
+        text = "That still sounds like a lot per month for me."
+        self.assertIn("monthly_unstated", [h.rule for h in guard_text(text, self.ctx()).hits])
+        self.assertTrue(guard_text(text, self.ctx(monthly_stated=True)).clean)
+        self.assertTrue(guard_text("Around $500-700 a month would be too much for me.", self.ctx()).clean)
+
+    # --- D8: hearsay about a figure that is not the anchor
+    def test_that_matches_what_i_heard_about_another_figure_becomes_the_real_anchor(self):
+        context = self.ctx(advisor_amounts=frozenset({6300}), offer_usd=6300)
+        result = guard_text(
+            "That $6,300 actually matches what I'd heard people got it for, so that's reassuring.",
+            context,
+        )
+        self.assertEqual(result.text, r1_guard.ANCHOR_HEARD_BELOW)
+        self.assertIn("heard_not_anchor", [h.rule for h in result.hits])
+        self.assertTrue(all(h.category in r1_guard.HYGIENE_CATEGORIES for h in result.hits))
+        plain = guard_text(
+            "That $6,300 actually matches what I'd heard people got it for.",
+            self.ctx(advisor_amounts=frozenset({6300})),
+        )
+        self.assertEqual(plain.text, r1_guard.ANCHOR_HEARD_REPLACEMENT)
+        # The anchor itself, and the website's $9,000, are not hearsay.
+        self.assertTrue(guard_text("I've heard people got it for around $7,000.", self.ctx()).clean)
+        self.assertTrue(guard_text("I heard the course is about six months and around $9,000.", self.ctx()).clean)
+
+    # --- D7: a price at or below the ask is never a stretch
+    def test_the_price_is_not_a_stretch_once_the_advisor_is_at_or_below_the_ask(self):
+        text = "That number's better, but it's still a stretch for me."
+        for offer in (6000, 7000):
+            with self.subTest(offer=offer):
+                result = guard_text(text, self.ctx(offer_usd=offer))
+                self.assertIn("strain_after_met", [h.rule for h in result.hits])
+        self.assertTrue(guard_text(text, self.ctx(offer_usd=7500)).clean)
+        self.assertTrue(guard_text(text, self.ctx()).clean)
+        # A time worry is not a price worry.
+        self.assertTrue(guard_text("Six months is a stretch with my work schedule.", self.ctx(offer_usd=6000)).clean)
+
+    # --- D5: the decision maker is on the learner's side of the call
+    def test_the_decision_maker_never_dislikes_calls(self):
+        text = "I'd have to ask my father first, and he's not really one for these things."
+        result = guard_text(text, self.ctx())
+        self.assertEqual(result.text, "I'd have to ask my father first.")
+        self.assertIn("decider_unwilling", [h.rule for h in result.hits])
+        only = guard_text("He's not really one for calls.", self.ctx(quiet_empty=True))
+        self.assertEqual(only.text, "")
+        # The learner's own preference is not the decision maker's.
+        self.assertTrue(guard_text("I'm not really one for phone calls, to be honest.", self.ctx()).clean)
+        self.assertTrue(guard_text("My husband would join a call if we picked an evening.", self.ctx()).clean)
+
+    # --- D15: a phrase tic is used once per call
+    def test_a_stretch_is_kept_once_and_said_another_way_afterwards(self):
+        first = guard_text("It's still a stretch for me.", self.ctx())
+        self.assertEqual(first.text, "It's still a stretch for me.")
+        later = guard_text("It's still a stretch for me.", self.ctx(phrase_counts=(("stretch", 1),)))
+        self.assertNotIn("stretch", later.text)
+        self.assertTrue(later.text.endswith("for me."), later.text)
+        self.assertEqual(later.style_edits, 1)
+        self.assertTrue(later.clean)  # a style edit is never a hit
+
+    def test_the_stretch_alternatives_rotate_with_the_turn(self):
+        seen = {
+            guard_text("It's a stretch.", self.ctx(phrase_counts=(("stretch", 2),), turn=turn)).text
+            for turn in range(1, 6)
+        }
+        self.assertGreater(len(seen), 2)
+
+    # --- D14: the question diet
+    def test_a_reply_asks_at_most_one_question(self):
+        result = guard_text("That helps. How many hours a week is it? And what happens if I fall behind?", self.ctx())
+        self.assertEqual(result.text, "That helps. How many hours a week is it?")
+
+    def test_a_free_reply_asks_nothing_after_a_question_in_its_last_two_replies(self):
+        text = "That helps me a lot. How many hours a week is it?"
+        self.assertEqual(
+            guard_text(text, self.ctx(free_reply=True, recent_questions=(True, False))).text,
+            "That helps me a lot.",
+        )
+        self.assertEqual(
+            guard_text(text, self.ctx(free_reply=True, recent_questions=(False, True))).text,
+            "That helps me a lot.",
+        )
+        self.assertEqual(guard_text(text, self.ctx(free_reply=True, recent_questions=(True, False, False))).text, text)
+        self.assertEqual(guard_text(text, self.ctx(recent_questions=(True, True))).text, text)  # an intent reply
+
+    def test_a_question_that_follows_a_bare_acknowledgement_is_kept(self):
+        for text in ("Okay. How many hours a week is it?", "Right, I see. What about the price?"):
+            with self.subTest(text=text):
+                kept = guard_text(text, self.ctx(free_reply=True, recent_questions=(True, True)))
+                self.assertEqual(kept.text, text)
+        long = "That helps a lot, thank you. How many hours a week is it?"
+        dropped = guard_text(long, self.ctx(free_reply=True, recent_questions=(True, True)))
+        self.assertEqual(dropped.text, "That helps a lot, thank you.")
+
+    def test_a_question_is_kept_when_it_is_all_the_reply_has(self):
+        text = "How many hours a week is it?"
+        self.assertEqual(guard_text(text, self.ctx(free_reply=True, recent_questions=(True, True))).text, text)
+
+    def test_only_a_question_mark_makes_a_question(self):
+        text = "I see what you mean. I'd like to know before I say yes. Is that normal?"
+        self.assertEqual(guard_text(text, self.ctx(free_reply=True)).text, text)
+
+    def test_the_what_would_it_involve_template_is_asked_once_per_call(self):
+        text = "That helps. What would that call actually cover?"
+        self.assertEqual(guard_text(text, self.ctx()).text, text)
+        later = guard_text(text, self.ctx(phrase_counts=(("template_q", 1),)))
+        self.assertEqual(later.text, "That helps.")
+        self.assertTrue(later.clean)
+        # With nothing else to say the reply is a neutral back-channel, not an apology.
+        bare = guard_text("What would that call actually involve?", self.ctx(phrase_counts=(("template_q", 1),)))
+        self.assertIn(bare.text, NEUTRAL_ACKS)
+
+    def test_the_new_regexes_are_fast_on_hostile_text(self):
+        import time
+
+        hostile = (
+            "he " * 4000,
+            "my husband is not " * 2000,
+            "i have to be honest " * 3000,
+            '"' * 20000,
+            "heard " * 4000 + "$",
+            "six hundred " * 3000,
+            "a month " * 4000,
+            "i want to " * 4000,
+        )
+        for text in hostile:
+            with self.subTest(prefix=text[:20]):
+                started = time.perf_counter()
+                guard_text(text, self.ctx(offer_usd=6000, free_reply=True))
+                self.assertLess(time.perf_counter() - started, 2.0)
+
+
 if __name__ == "__main__":
     unittest.main()

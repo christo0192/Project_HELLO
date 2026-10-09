@@ -234,10 +234,19 @@ class MarkerTests(unittest.TestCase):
             F3_PRIMARY: (
                 "Honestly, I can learn most of this on YouTube, so why would I pay for it?",
                 "Is it really worth the money when there are free courses online?",
+                # Live raw lines of the iteration-1 sweep, which got the scripted variant as well:
+                "There's so much free stuff out there - YouTube, Coursera. What does this give me "
+                "that those don't?",
+                "I watch a ton of free stuff on YouTube and Coursera, so what would this give me "
+                "that those don't?",
+                "There's so much free stuff online, so I'm wondering what this gives me that "
+                "YouTube or Coursera doesn't. What's the main difference?",
             ),
             F3_PUSH: (
                 "Hmm, and will it actually help me get hired with all the layoffs?",
                 "Do people really land jobs after this, with the market like this?",
+                "With all the layoffs I keep hearing about, I do wonder whether this would "
+                "actually help me land something.",
             ),
             F2_PRIMARY: (
                 "I'm pretty busy at work, so six months of this worries me.",
@@ -262,6 +271,9 @@ class MarkerTests(unittest.TestCase):
             F4_PUSH: (
                 "I'd have to check with my husband first.",
                 "Let me discuss this with my husband.",
+                "A short call still feels like a lot right now, and I'd want my husband involved "
+                "before anything moves.",
+                "I'd like my husband on board before we do anything.",
             ),
             TIME_CUE: (
                 "By the way, I have to jump on another call soon.",
@@ -293,6 +305,7 @@ class MarkerTests(unittest.TestCase):
             F3_PUSH: (
                 "Oh really? What role does the mentor play?",
                 "Really, that is interesting. Tell me about the career support.",
+                "I could land a seat in the next batch, I guess.",
             ),
             F2_PRIMARY: (
                 "Okay, and what is the time zone of the classes?",
@@ -305,7 +318,11 @@ class MarkerTests(unittest.TestCase):
                 "I think that makes sense.",
                 "Hmm, okay. And what happens next in the course?",
             ),
-            F4_PUSH: ("My husband would like this too.", "We talked about it last night."),
+            F4_PUSH: (
+                "My husband would like this too.",
+                "We talked about it last night.",
+                "My husband would be involved in the payment anyway.",
+            ),
         }
         for move_id, texts in near_misses.items():
             for text in texts:

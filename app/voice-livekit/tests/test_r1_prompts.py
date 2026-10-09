@@ -165,7 +165,10 @@ class LearnerPrefixTests(unittest.TestCase):
         self.assertIn("Vary how you start", prefix)
         self.assertIn("never use two filler words", prefix)
         self.assertIn("react to what the advisor just said before you answer", prefix)
-        self.assertIn("ask a short follow-up question when you are curious", prefix)
+        # R1-Q iteration 2: questions are rare (0.67 to 0.81 of the live replies held one).
+        self.assertIn("Ask a short question only now and then", prefix)
+        self.assertIn("never more than one question", prefix)
+        self.assertNotIn("ask a short follow-up question when you are curious", prefix)
         self.assertIn("careful about time and money", prefix)
         self.assertIn("never repeat yourself", prefix)
         self.assertIn("Small talk is fine", prefix)
@@ -278,7 +281,11 @@ class ReminderTests(unittest.TestCase):
         text = turn_reminder(P1, r_sec=100)
         self.assertIn(NEXT_STEP_NOTE, text)
         self.assertIn("Never agree to a call, a day, a time, an enrolment or a payment yourself", text)
-        self.assertIn("react in your own words and ask what it involves", text)
+        # R1-Q iteration 2: no "ask what it involves" (33 uses of that question template in the
+        # live sweep): the learner says how the proposal lands and agrees to nothing.
+        self.assertIn("react in your own words and say how it lands for you", text)
+        self.assertIn("without agreeing and without naming a day or a time", text)
+        self.assertNotIn("ask what it involves", text)
 
     def test_the_reminder_says_not_to_repeat_and_to_react_first(self):
         from r1_prompts import NO_REPEAT_NOTE
@@ -336,7 +343,9 @@ class ReminderTests(unittest.TestCase):
         self.assertIn("raise something of your own", text)
         self.assertIn("in your own words, as a real person would, without reading it out", text)
         self.assertIn(f'"{spec.brief}"', text)  # quoted: voicing it is never an instruction echo
-        self.assertIn('Write these figures exactly as shown: "$9,000", "$7,000".', text)
+        # No quote marks around the figures: the model copied them into its reply.
+        self.assertIn("Write these figures exactly as shown, without quote marks: $9,000, $7,000.", text)
+        self.assertNotIn('"$9,000"', text)
         self.assertIn("two or three short sentences", text)
         # The free-reply line (do not volunteer worries) would contradict a raised objection.
         self.assertNotIn("Do not volunteer worries, money or timing details", text)
@@ -520,7 +529,8 @@ class NotesTests(unittest.TestCase):
         self.assertIn(OFFER_ON_TABLE_NOTE.format(amount="$8,500"), text)
         self.assertIn('has "$8,500" on the table', text)
         self.assertNotIn(PRICE_WRAP_NOTE, text)
-        self.assertIn("still a stretch", text)
+        self.assertIn("still more than I planned for", text)
+        self.assertNotIn("stretch", text)  # the phrase tic of the live sweep (28 replies in 19 calls)
         self.assertIn("Do not accept it, agree to it or push for more", text)
         self.assertEqual(format_usd(8500), "$8,500")
         # Without a wrap turn the offer is not shown in the wrap note.
@@ -876,6 +886,83 @@ class IterationOneNotesTests(unittest.TestCase):
         self.assertIn("never an offer until the advisor plainly offers it", prefix)
         self.assertIn("who decides, and who you would talk to, always matches your card", prefix)
         self.assertIn(P1.decider_answer, prefix)
+
+
+class IterationTwoNotesTests(unittest.TestCase):
+    """R1-Q iteration 2: the notes that fix the second live sweep, and what they must not teach."""
+
+    NOTES = (
+        "OFFER_ON_TABLE_NOTE",
+        "OFFER_MET_NOTE",
+        "PRICE_MET_NOTE",
+        "PRICE_UNCHANGED_NOTE",
+        "HOLD_NOTE",
+        "ANSWERED_NOTE",
+        "STRETCH_USED_NOTE",
+        "TEMPLATE_USED_NOTE",
+        "NEXT_STEP_NOTE",
+    )
+
+    def texts(self):
+        import r1_prompts
+
+        return {name: getattr(r1_prompts, name) for name in self.NOTES}
+
+    def test_every_new_note_is_plain_ascii_and_free_of_scoring_words(self):
+        for name, text in self.texts().items():
+            with self.subTest(note=name):
+                text.encode("ascii")
+                for word in RUBRIC_WORDS:
+                    self.assertNotRegex(text, rf"\b{re.escape(word)}\b", word)
+
+    def test_no_note_teaches_a_concession_a_commitment_or_the_stretch_tic(self):
+        from r1_commitment import classify_learner_commitment
+        from r1_guard import has_concession
+
+        for name, text in self.texts().items():
+            # The quoted examples are what a model may say back, so they must pass the guard as they are.
+            for quoted in re.findall(r'"([^"]+)"', text):
+                if quoted.startswith("$"):
+                    continue
+                with self.subTest(note=name, quoted=quoted):
+                    self.assertFalse(has_concession(quoted))
+                    self.assertLessEqual(classify_learner_commitment(quoted), Level.WEAK)
+        # Only the note that fires AFTER the phrase was used names it; no other note primes it.
+        for name, text in self.texts().items():
+            if name != "STRETCH_USED_NOTE":
+                self.assertNotIn("stretch", text.lower(), name)
+        # The price-met note never says the price is fine: "the price is fine" is a concession hit.
+        met = self.texts()["OFFER_MET_NOTE"]
+        self.assertIn("never say it is fine, good or acceptable", met)
+        self.assertNotRegex(met, r"(?i)the price (?:itself )?is fine")
+
+    def test_the_price_note_follows_the_ask(self):
+        from r1_prompts import OFFER_MET_NOTE, OFFER_ON_TABLE_NOTE
+
+        above = turn_reminder(P1, r_sec=5, price_wrap=True, offer_usd=7500)
+        at = turn_reminder(P1, r_sec=5, price_wrap=True, offer_usd=7000)
+        below = turn_reminder(P1, r_sec=5, price_wrap=True, offer_usd=6000)
+        self.assertIn(OFFER_ON_TABLE_NOTE.format(amount="$7,500"), above)
+        self.assertIn(OFFER_MET_NOTE.format(amount="$7,000"), at)
+        self.assertIn(OFFER_MET_NOTE.format(amount="$6,000"), below)
+        self.assertNotIn("still more than I planned for", below)
+
+    def test_the_figures_are_listed_without_quote_marks(self):
+        text = turn_reminder(P1, r_sec=5, intent_brief="tell them", must_say=("$9,000", "$7,000"))
+        self.assertIn("without quote marks: $9,000, $7,000.", text)
+        self.assertNotIn('"$9,000"', text)
+
+    def test_the_prefix_makes_questions_rare(self):
+        prefix = learner_prefix(P1)
+        self.assertIn("Ask a short question only now and then", prefix)
+        self.assertIn("most of your replies are plain statements", prefix)
+        self.assertNotIn("ask a short follow-up question when you are curious", prefix)
+
+    def test_the_check_in_note_makes_the_question_optional(self):
+        from r1_prompts import CHECKIN_NOTE
+
+        self.assertIn("if there is something you really still want to know", CHECKIN_NOTE)
+        self.assertNotIn("ask them one real question you still have", CHECKIN_NOTE)
 
 
 if __name__ == "__main__":

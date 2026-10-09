@@ -78,7 +78,18 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
         "gate",
     ),
     ("commit_medium", "Commitment MEDIUM or better", "medium_or_better_rate", ">=", {"strong": 0.9}, "gate"),
-    ("commit_strong", "Commitment STRONG", "strong_rate", ">=", {"strong": 0.5}, "gate"),
+    # Iteration 2 (D22): info.  ``r1_commitment.grade`` caps an ask of kind CALL at MEDIUM, and every
+    # persona names a decision maker, so a strong advisor correctly asks for a call with that person:
+    # in two sweeps every in-window ask was a call and STRONG was 0 of 8.  Gating on it measured the
+    # simulator's choice of ask, not the learner.  The blocking half is ``commit_medium`` above.
+    (
+        "commit_strong",
+        "Commitment STRONG (info: a call ask caps at MEDIUM)",
+        "strong_rate",
+        ">=",
+        {"strong": 0.5},
+        "info",
+    ),
     (
         "commit_cap",
         "Commitment MEDIUM or better (capped)",
@@ -180,6 +191,24 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
         "honestly_share",
         "<=",
         {"strong": TIC_SHARE_LIMIT, "average": TIC_SHARE_LIMIT, "other": TIC_SHARE_LIMIT},
+        "gate",
+    ),
+    # Phrase tics beyond the filler words (iteration 2): "a stretch" and the "what would that call
+    # involve" question may be used about once per call; the guard rewrites and drops the rest.
+    (
+        "stretch_tic",
+        'Replies with "a stretch" per call (mean)',
+        "stretch_per_call",
+        "<=",
+        {"strong": 1.5, "average": 1.5, "other": 1.5},
+        "gate",
+    ),
+    (
+        "template_tic",
+        'Replies asking "what would it involve / cover" per call (mean)',
+        "template_q_per_call",
+        "<=",
+        {"strong": 1.5, "average": 1.5, "other": 1.5},
         "gate",
     ),
     (
@@ -303,6 +332,8 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     return {
         "opener_top_word": top[0][0] if top else None,
         "opener_top_share": _rate(top[0][1], replies) if top else (0.0 if replies else None),
+        "stretch_per_call": mean([float(m.get("reply_stretch_count") or 0) for m in calls]),
+        "template_q_per_call": mean([float(m.get("reply_template_q_count") or 0) for m in calls]),
         "hmm_share": _rate(sum(int(m.get("reply_hmm_count") or 0) for m in calls), replies),
         "honestly_share": _rate(
             sum(int(m.get("reply_honestly_count") or 0) for m in calls), replies
@@ -388,6 +419,20 @@ def _compare(op: str, value: float, threshold: float) -> bool:
     return value >= threshold if op == ">=" else value <= threshold
 
 
+# Iteration 2 (D24): a cap on a rate ("MEDIUM or better in at most 20 % of the calls") cannot be met
+# by a group of fewer than ``CAP_MIN_CALLS`` calls when one call is already more than the cap: with
+# four pushy calls one booked call is 0.25.  A group that small may exceed a cap by that one call.
+CAP_MIN_CALLS = 8
+SMALL_GROUP_CAP_GATES = frozenset({"commit_cap"})
+
+
+def effective_threshold(gate_id: str, op: str, threshold: float, calls: int) -> float:
+    """The threshold a group is held to: a cap gets one call of slack below ``CAP_MIN_CALLS`` calls."""
+    if gate_id in SMALL_GROUP_CAP_GATES and op == "<=" and 0 < calls < CAP_MIN_CALLS:
+        return max(threshold, 1.0 / calls)
+    return threshold
+
+
 def evaluate(agg: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Every gate that applies to a group, with its value and a status."""
     results: list[dict[str, Any]] = []
@@ -400,10 +445,11 @@ def evaluate(agg: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
                 continue
             value = group.get(metric)
             threshold = thresholds[kind]
+            held_to = effective_threshold(gate_id, op, threshold, int(group.get("calls") or 0))
             if value is None:
                 status = "n/a"
             else:
-                passed = _compare(op, float(value), float(threshold))
+                passed = _compare(op, float(value), float(held_to))
                 status = "pass" if passed else ("fail" if severity == "gate" else "info-fail")
             results.append(
                 {
@@ -413,6 +459,7 @@ def evaluate(agg: Mapping[str, Mapping[str, Any]]) -> list[dict[str, Any]]:
                     "metric": metric,
                     "op": op,
                     "threshold": threshold,
+                    "held_to": held_to,
                     "value": None if value is None else round(float(value), 3),
                     "status": status,
                     "severity": severity,
@@ -507,6 +554,8 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
         ("top reaction opener share", "opener_top_share"),
         ("replies with hmm", "hmm_share"),
         ("replies with honestly", "honestly_share"),
+        ('replies with "a stretch" / call', "stretch_per_call"),
+        ('"what would it involve" replies / call', "template_q_per_call"),
         ("style mean (judge)", "style_mean"),
         ("intents needing the scripted variant", "intent_fallback_rate"),
         ("fidelity pass rate", "fidelity_pass_rate"),
@@ -538,9 +587,13 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
     lines.append("| level | gate | value | threshold | status |")
     lines.append("|---|---|---|---|---|")
     for gate in card["gates"]:
+        held = gate.get("held_to", gate["threshold"])
+        threshold = f"{gate['op']} {gate['threshold']}"
+        if held != gate["threshold"]:
+            threshold += f" (small group: held to {held:.2f})"
         lines.append(
             f"| {gate['level']} | {gate['label']} | {_fmt(gate['value'], 3)} | "
-            f"{gate['op']} {gate['threshold']} | {gate['status']} |"
+            f"{threshold} | {gate['status']} |"
         )
     lines.append("")
     ready = card["readiness"]

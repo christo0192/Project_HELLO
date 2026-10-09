@@ -154,6 +154,11 @@ PLAN: tuple[MoveSpec, ...] = (
                 r"\bcost(?:s|ly)?\b",
                 r"\bprice\b",
                 r"\bspend(?:ing)?\b",
+                # "what does this give me that YouTube or Coursera doesn't?" (R1-Q iteration 2: 8
+                # live replies that said it were given the scripted variant as well)
+                r"\b(?:give|gives|giving|offer|offers|get|gets|bring|brings|pick|choose)\b"
+                r"[^.?!]{0,25}\b(?:that|than|over|beyond|instead of)\b",
+                r"\bdifference\b",
             ),
         ),
         variants=(
@@ -179,6 +184,9 @@ PLAN: tuple[MoveSpec, ...] = (
                 r"\bhiring\b",
                 r"\bplace(?:d|ments?)\b",
                 r"\bemploy\w*",
+                # "would this actually help me land something" (no "job" in the sentence)
+                r"\bland\b[^.?!]{0,15}\b(?:something|a role|role|a job|an offer|work|anything|"
+                r"a position|one)\b",
             ),
             (
                 r"\blay ?offs?\b",
@@ -267,8 +275,8 @@ PLAN: tuple[MoveSpec, ...] = (
         570,
         True,
         brief=(
-            "you say $9,000 feels like a lot, that you heard people got it for around "
-            "$7,000, and you ask if the advisor can do that"
+            "tell the advisor that $9,000, the price on the website, feels like a lot, that you "
+            "heard people got it for around $7,000, and ask if they can do that"
         ),
         must_say=("$9,000", "$7,000"),
         markers=((r"(?<![\d,])7,?000\b", r"\bseven thousand\b", r"\b7k\b"),),
@@ -286,7 +294,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "Can you do a little better than that?",
         570,
         True,
-        brief="you push once more for a better price, because the number is still a stretch",
+        brief="you push once more for a better price, because the number is above what you hoped",
         markers=(
             (
                 r"\b(?:little|bit|touch|tad) (?:better|lower|less|more)\b",
@@ -372,6 +380,12 @@ PLAN: tuple[MoveSpec, ...] = (
                 r"\btell\b",
                 r"\bshow\b",
                 r"\bmention\b",
+                # "I'd want my father involved before anything moves" (not "my husband would be
+                # involved in the payment anyway")
+                r"\b(?:want|need|like|have|get|bring|keep)\b[^.?!]{0,20}"
+                r"\b(?:involved|on board|in the loop)\b",
+                r"\b(?:opinion|input|approval|blessing|go-?ahead)\b",
+                r"\bhear from\b",
             ),
         ),
         variants=(
@@ -681,6 +695,41 @@ def curiosity_covered(topic: str, text: object) -> bool:
     """The advisor's text already answered curiosity ``topic``, so the learner need not ask."""
     lowered = fold(text).lower()
     return any(pattern.search(lowered) for pattern in _CURIOSITY_COVERED.get(topic, ()))
+
+
+# R1-Q iteration 2.  What the advisor has answered and the learner must not ask again (the live
+# sweep: "what happens if someone falls behind?" answered with "recordings and mentor catch-up
+# support", then "what actually happens if someone does?"; the weekly hours asked twice).  Only the
+# topics a person remembers being told are listed; "the mentors" in a pitch is not an answer.
+ANSWERED_LABELS: tuple[tuple[str, str], ...] = (
+    ("format", "whether the classes are live or recorded"),
+    ("weekly_hours", "how many hours a week it takes"),
+    ("payment", "whether you can pay in monthly instalments"),
+    ("fall_behind", "what happens if someone falls behind"),
+)
+_FALL_BEHIND_ANSWERED = _compile(
+    r"\bcatch(?:ing)? up\b",
+    r"\b(?:fall|falls|falling|fell|get|gets|getting|got) behind\b",
+    r"\bmiss(?:ed|es|ing)? (?:a |an |some |the |any )?(?:class|classes|session|sessions)\b",
+)
+
+
+def answered_topics(text: object) -> frozenset[str]:
+    """The ``ANSWERED_LABELS`` topics the advisor's ``text`` answers."""
+    lowered = fold(text).lower()
+    found = {topic for topic, _label in ANSWERED_LABELS[:3] if curiosity_covered(topic, text)}
+    if any(pattern.search(lowered) for pattern in _FALL_BEHIND_ANSWERED):
+        found.add("fall_behind")
+    return frozenset(found)
+
+
+# The F4 push when a call was proposed in the same turn: the learner must talk to its decision
+# maker first and is glad for them to join a call, it never says they dislike calls (a model said
+# "he's not really one for these things" and, a turn later, booked a call with him).
+F4_PUSH_CALL_SUFFIX = (
+    "; you are happy for them to join a call once you have talked, and you never say that they "
+    "dislike calls or would not take part"
+)
 
 
 def topics_in(text: object) -> frozenset[str]:
@@ -1011,6 +1060,10 @@ class OwedMoveScheduler:
         """True once ``move_id`` was proven spoken (False for an unknown move)."""
         state = self._states.get(move_id)
         return state is not None and state.status == "delivered"
+
+    def turns_since_delivery(self, move_id: str) -> int | None:
+        """Learner turns since ``move_id`` was delivered (None if it was not)."""
+        return self._since(move_id) if move_id in self._states else None
 
     def _since(self, move_id: str) -> int | None:
         state = self._states[move_id]

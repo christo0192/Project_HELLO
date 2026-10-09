@@ -45,6 +45,19 @@ INTENTS = (
 TOPICS = ("H1", "H2", "H3", "F1", "F2", "F3", "F4")
 CALL_TARGET_SEC = 13 * 60
 MAX_TEXT_CHARS = 1200
+# The simulator never ends the call before the learner's role-play reached 10:00 (R1-Q iteration 2, D23:
+# six of 20 calls ended at 6:23 to 9:59 because the simulated advisor said goodbye, which failed the
+# "reached ten minutes" fidelity check and cut the commitment and question gates short).
+EARLIEST_FAREWELL_SEC = 600
+EARLY_FAREWELL_NUDGE = (
+    "It is only {clock} on the call clock and the call is not over: do not say goodbye or wrap up. "
+    "Keep going with your next point, answer or question, in the same JSON format."
+)
+_FAREWELL_TEXT = re.compile(
+    r"\b(?:good ?bye|bye|talk (?:to you )?(?:soon|later)|take care|have a (?:great|good|nice|"
+    r"wonderful|lovely) (?:day|one|evening|week|weekend))\b",
+    re.IGNORECASE,
+)
 
 _LEVEL_BEHAVIOUR = {
     "strong": (
@@ -123,6 +136,11 @@ _INVERSION = tuple(
 )
 
 
+def is_farewell(turn: "AdvisorTurn") -> bool:
+    """True when the advisor turn ends the call (its own tag, or goodbye words in its text)."""
+    return turn.intent == "farewell" or _FAREWELL_TEXT.search(turn.text or "") is not None
+
+
 def looks_inverted(text: str) -> bool:
     """True when an advisor turn speaks as the learner (first-person learner phrasing)."""
     return any(pattern.search(text or "") for pattern in _INVERSION)
@@ -172,6 +190,8 @@ def advisor_system_prompt(level: str) -> str:
         "directions, and never speak as the learner.\n"
         f"What you know about the course (use only this):\n{deck_brief()}\n"
         f"How you behave: {_LEVEL_BEHAVIOUR[level]}\n"
+        "The call lasts about 13 minutes: never say goodbye or wrap up before 10:00 on the call "
+        "clock.\n"
         "Reply with ONE JSON object and nothing else, with exactly these keys: "
         f'"intent" (one of {intents}), "topic" (one of {", ".join(TOPICS)} or an empty string) '
         'and "text" (what you say aloud). '
@@ -260,6 +280,12 @@ class LLMAdvisor:
             turn = again if not again.inverted else AdvisorTurn(
                 again.text, again.intent, again.topic, again.parse_ok, True, again.raw
             )
+        if is_farewell(turn) and r_sec < EARLIEST_FAREWELL_SEC:
+            # Too early to hang up: ask once more, and keep the new turn unless it says goodbye again.
+            retries += 1
+            again = await self._ask(r_sec, EARLY_FAREWELL_NUDGE.format(clock=_clock_text(r_sec)))
+            if not is_farewell(again):
+                turn = again
         turn.retries = retries
         self.history.append(
             {"who": "advisor", "text": turn.text, "intent": turn.intent, "topic": turn.topic}

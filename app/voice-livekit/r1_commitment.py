@@ -18,9 +18,16 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Mapping
+from typing import Iterable, Mapping
 
-from r1_text import clause_before, fold, fuzzy_contains, is_question_like, split_sentences
+from r1_text import (
+    clause_before,
+    fold,
+    fuzzy_contains,
+    is_question_like,
+    negated_before,
+    split_sentences,
+)
 
 COMMIT_PERMITTED_R_SEC = 540
 COMMIT_STALL_R_SEC = 780
@@ -65,6 +72,20 @@ MEDIUM_MOVED_LINE = (
     "Daytime is tough for me, so let's book a call {slot} with my {decision_maker} so we can "
     "decide."
 )
+# R1-Q iteration 2.  The MEDIUM line when the advisor named no usable time ("let me know when's
+# good", "sometime next week") and the learner had just said it must talk to its decision maker
+# first: it books the call but not a slot it never had ("Before I commit to any timing ..." and
+# then "next week at 7 PM" was the contradiction).  One sentence, ending "so we can decide".
+MEDIUM_DEFER_LINE = (
+    "Let me check with my {decision_maker} first, and then let's book a call, so we can decide."
+)
+# The WEAK line when the stall answers a CALL ask (a callback, a time): it does not ask for an
+# e-mail nobody offered, it says the learner will talk to its decision maker and be called back.
+# Its second sentence is the one the scorer-side mask hides (app/api/src/lib/r1/transcript.ts).
+WEAK_CALL_LINE = (
+    "Let me think about it. Call me back after I've talked to my {decision_maker}, and I'll "
+    "let you know."
+)
 
 
 def commitment_line(
@@ -73,15 +94,25 @@ def commitment_line(
     slot: str = DEFAULT_SLOT,
     *,
     moved: bool = False,
+    deferred: bool = False,
+    call: bool = False,
 ) -> str:
     """The scripted line for ``level``; NONE is not a commitment and has no line.
 
-    ``slot`` and ``moved`` only shape the MEDIUM line: the call slot, and whether the learner
-    moved the advisor's daytime proposal to the evening.
+    ``slot``, ``moved`` and ``deferred`` only shape the MEDIUM line: the call slot, whether the
+    learner moved the advisor's daytime proposal to the evening, and whether it books the call
+    without a slot.  ``call`` shapes the WEAK line: the stall answers a call ask.
     """
     if level is Level.NONE:
         raise ValueError("no commitment line for Level.NONE")
-    template = MEDIUM_MOVED_LINE if (moved and level is Level.MEDIUM) else COMMITMENT_LINES[level]
+    if level is Level.MEDIUM and deferred:
+        template = MEDIUM_DEFER_LINE
+    elif level is Level.MEDIUM and moved:
+        template = MEDIUM_MOVED_LINE
+    elif level is Level.WEAK and call:
+        template = WEAK_CALL_LINE
+    else:
+        template = COMMITMENT_LINES[level]
     return template.format(decision_maker=decision_maker, slot=slot)
 
 
@@ -91,10 +122,16 @@ def stall_line(decision_maker: str) -> str:
 
 
 def is_commitment_line(text: object, decision_maker: str) -> bool:
-    """True when ``text`` is (a fuzzy rendering of) one of the three scripted lines."""
+    """True when ``text`` is (a fuzzy rendering of) one of the scripted lines."""
     return any(
-        fuzzy_contains(text, commitment_line(level, decision_maker))
-        for level in (Level.STRONG, Level.MEDIUM, Level.WEAK)
+        fuzzy_contains(text, commitment_line(level, decision_maker, **variant))
+        for level, variant in (
+            (Level.STRONG, {}),
+            (Level.MEDIUM, {}),
+            (Level.MEDIUM, {"deferred": True}),
+            (Level.WEAK, {}),
+            (Level.WEAK, {"call": True}),
+        )
     )
 
 
@@ -956,27 +993,49 @@ _WEAK = _compile(
 )
 
 
+# How far back a negator may sit from the end of a commitment phrase and still govern it.  A clause
+# break (comma, full stop, "but") ends the reach, so "I can't do Tuesday, but Thursday works" keeps
+# its Thursday.
+_NEGATION_REACH_WORDS = 10
+
+
+def _affirms(patterns: Iterable[re.Pattern[str]], lowered: str) -> bool:
+    """True when one of ``patterns`` matches ``lowered`` without a negator in its own clause.
+
+    "And ten tomorrow won't work" and "I don't think tomorrow works" contain the words of an
+    agreement ("tomorrow ... works") and mean the opposite (R1-Q iteration 2: both were graded
+    MEDIUM and flagged the live call).  A negator inside the match, or earlier in the same clause,
+    turns the phrase round.
+    """
+    for pattern in patterns:
+        for match in pattern.finditer(lowered):
+            if not negated_before(lowered, match.end(), _NEGATION_REACH_WORDS):
+                return True
+    return False
+
+
 def classify_learner_commitment(text: object) -> Level:
     """The highest commitment level expressed in learner ``text``.
 
     STRONG is an enrolment or payment affirmation; MEDIUM is accepting or proposing a
     call, a day or a time; WEAK is the "let me think, email me" stall.  The scripted
     lines classify as their own level, and every scripted objection line classifies at
-    most WEAK.
+    most WEAK.  A phrase a negator governs ("tomorrow won't work", "I don't think Thursday
+    works") agrees to nothing.
     """
     folded = fold(text)
     lowered = folded.lower()
-    if any(pattern.search(lowered) for pattern in _STRONG):
+    if _affirms(_STRONG, lowered):
         return Level.STRONG
     if fuzzy_contains(folded, COMMITMENT_LINES[Level.STRONG]):
         return Level.STRONG
-    if any(pattern.search(lowered) for pattern in _MEDIUM):
+    if _affirms(_MEDIUM, lowered):
         return Level.MEDIUM
     medium_line = COMMITMENT_LINES[Level.MEDIUM].replace("{decision_maker}", "")
     medium_line = medium_line.replace("{slot}", DEFAULT_SLOT)
     if fuzzy_contains(folded, medium_line, 0.7):
         return Level.MEDIUM
-    if any(pattern.search(lowered) for pattern in _WEAK):
+    if _affirms(_WEAK, lowered):
         return Level.WEAK
     return Level.NONE
 

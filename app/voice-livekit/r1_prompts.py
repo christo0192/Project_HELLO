@@ -28,6 +28,8 @@ from r1_script import INTERVIEWER_NAME
 from r1_world import AUDIENCE_INTERVIEWER_FAQ, INTERVIEWER_DEFLECTION, facts_for
 
 MONOLOGUE_THRESHOLD_SEC = 60
+# The learner's own ask ($7,000): a price at or below it is never "a stretch".
+ANCHOR_PRICE_USD = 7000
 WRAPUP_NOTE = f"The role-play has ended. You are {INTERVIEWER_NAME}, the interviewer, again."
 CARD_MARKER = "YOUR CARD (public):\n"
 IGNORE_RULE_NOTE = (
@@ -44,15 +46,54 @@ PRICE_WRAP_NOTE = (
 )
 OFFER_ON_TABLE_NOTE = (
     "- The advisor has now answered you twice on price and has \"{amount}\" on the table. "
-    "React to that real number in your own words, for example \"that is better, but it is "
-    "still a stretch for me\". Do not accept it, agree to it or push for more. If they ask "
-    "whether it is fine with you, say that it is still a stretch and you need to "
-    "think."
+    "React to that real number in your own words, for example \"that is a bit better, but it "
+    "is still more than I planned for\". Do not accept it, agree to it or push for more. If "
+    "they ask whether it is fine with you, say it is still more than you planned for and you "
+    "need to think."
+)
+# R1-Q iteration 2.  The price on the table is at or below the $7,000 the learner asked for: it is
+# never "still a lot" (the live sweep: "that's the number I was hoping for", then, one turn later,
+# "that number's better, but it's still a stretch for me", at the same $6,000).
+OFFER_MET_NOTE = (
+    "- The advisor has now answered you twice on price and has \"{amount}\" on the table, at or "
+    "below the $7,000 you asked for. React to that real number in your own words, for example "
+    "that it is in line with what you heard: never say it is too much, still a lot or out of "
+    "reach, and never say it is fine, good or acceptable. You are still not agreeing to "
+    "anything: you need to think and talk to someone first."
+)
+PRICE_MET_NOTE = (
+    "- The price on the table is \"{amount}\", at or below the $7,000 you asked for. Never "
+    "say it is too much, still a lot or out of reach, and do not push for a lower one."
+)
+# The price came up again but did not move (the live sweep: "that's better than before" at an
+# unchanged $7,500).
+PRICE_UNCHANGED_NOTE = (
+    "- The price has not changed: it is still \"{amount}\". Do not say it is better than "
+    "before; if it comes up, say it is still more than you planned for."
 )
 NEW_OFFER_NOTE = (
     "- The advisor just put a better price on the table: \"{amount}\". You may sound mildly "
     "pleasantly surprised, but do not accept it, thank them into agreement or commit to "
     "anything."
+)
+# A call or next step was proposed before the close window and is still open: the model must not
+# accept it from a later turn ("Since you asked, yes, let's talk tomorrow" two turns after the ask).
+HOLD_NOTE = (
+    "- A call or a next step was proposed earlier and you have not agreed to it. Do not accept "
+    "it now, whoever raises it, and do not fix a day or a time: keep the conversation going "
+    "with what the advisor just said."
+)
+# What the advisor already answered (hours, live or recorded, falling behind ...): not asked again.
+ANSWERED_NOTE = (
+    "- The advisor has already answered these, so do not ask about them again: {topics}."
+)
+# A tracked phrase tic was used (see ``r1_text.reply_phrases``).
+STRETCH_USED_NOTE = (
+    "- You have already said something was \"a stretch\" in this call: say it a different way "
+    "this time, or leave it out."
+)
+TEMPLATE_USED_NOTE = (
+    "- You have already asked what a call or a next step would involve: do not ask that again."
 )
 RESOLVED_NOTE = (
     "- You have already told the advisor where you stand on the next step. Do not repeat it, "
@@ -68,8 +109,9 @@ REACT_HOW_IT_LANDS = (
 CHECKIN_NOTE = (
     "- The advisor is checking in with you. Say how their last point lands for you, or "
     "what still worries you, in your own words; do not repeat what they told you about the "
-    "course. Then ask them one real question you still have. Do not repeat anything you "
-    "already said and do not close the conversation yourself."
+    "course. Then, if there is something you really still want to know, ask one short "
+    "question about it. Do not repeat anything you already said and do not close the "
+    "conversation yourself."
 )
 CHECKIN_DONE_NOTE = (
     "- The advisor is checking in with you. Say how their last point lands for you, "
@@ -148,8 +190,8 @@ def format_usd(amount: int) -> str:
     return f"${int(amount):,}"
 NEXT_STEP_NOTE = (
     "- Never agree to a call, a day, a time, an enrolment or a payment yourself. If the "
-    "advisor proposes one, or asks you to commit, react in your own words and ask what "
-    "it involves."
+    "advisor proposes one, or asks you to commit, react in your own words and say how it "
+    "lands for you, without agreeing and without naming a day or a time."
 )
 NO_REPEAT_NOTE = (
     "- Do not repeat anything you already said earlier in this call: say something new "
@@ -240,8 +282,9 @@ def learner_prefix(persona: RenderedPersona) -> str:
         "Talk like a real person on a phone call: use contractions and everyday words, "
         "react to what the advisor just said before you answer "
         "(say how it lands for you, a feeling, a worry or a short question, and never repeat "
-        "a course detail back to them), and ask a short follow-up question when you are "
-        "curious. Vary how you start: most of the time begin straight with your reaction or "
+        "a course detail back to them). Ask a short question only now and then, when you are "
+        "really curious: most of your replies are plain statements and never more than one "
+        "question. Vary how you start: most of the time begin straight with your reaction or "
         "your point, with no filler word, and never use two filler words in one reply. "
         "Small talk is fine. You are interested but careful about time and money, "
         "and you hesitate believably. Never lecture, never list, and never repeat yourself: "
@@ -382,7 +425,10 @@ def turn_reminder(
         )
         figures = tuple(must_say)
         if figures:
-            lines.append(f"- Write these figures exactly as shown: {_quoted_list(figures)}.")
+            # No quote marks around the figures: the model copied them into its reply ("$7,000"
+            # in quotes was read out as a pause; 5 of 20 calls in the live sweep).
+            shown = ", ".join(figures)
+            lines.append(f"- Write these figures exactly as shown, without quote marks: {shown}.")
         if intent_forced:
             lines.append(FORCED_NOTE)
         lines.append("- Keep the whole reply to two or three short sentences.")
@@ -409,7 +455,8 @@ def turn_reminder(
         if intent_brief:
             lines.append(INTENT_PRICE_NOTE)
         elif offer_usd is not None:
-            lines.append(OFFER_ON_TABLE_NOTE.format(amount=format_usd(offer_usd)))
+            note = OFFER_MET_NOTE if offer_usd <= ANCHOR_PRICE_USD else OFFER_ON_TABLE_NOTE
+            lines.append(note.format(amount=format_usd(offer_usd)))
         else:
             lines.append(PRICE_WRAP_NOTE)
     if new_offer_usd is not None and not reaction_only and not (price_wrap and intent_brief):

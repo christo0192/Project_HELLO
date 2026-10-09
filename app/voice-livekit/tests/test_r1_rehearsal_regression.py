@@ -152,13 +152,25 @@ class ReplayInvariantTests(unittest.TestCase):
         # suggest you enroll tomorrow and sit in this next cohort" (group 17) is an enrolment ask
         # inside the close window, so it earns the MEDIUM call there, one turn before the
         # turn-78 offer to include the husband (group 18); the role-play ends on it, as it does in
-        # a live call.
+        # a live call.  Iteration 2 holds an owed move back one turn when the advisor asks a direct
+        # question about the learner (turn 43: "do you think you will be part of the group that
+        # gets laid off?" ... "what makes you get scared of layoffs?"), so the objections of this
+        # slow advisor land later: the F4 pair is forced at 10:48 and 11:29, the close window
+        # opens after the turn-76 enrolment suggestion (group 17), and the call ends on the 13:00
+        # stall (a reaction, then the WEAK line), the end-game backstop.
         self.assertGreaterEqual(len(self.turns), 17)
         self.assertTrue(all(turn.plan is not None for turn in self.turns))
         commitment = self.result["admin_log"]["commitment"]
-        self.assertEqual((commitment["level"], commitment["resolved"]), ("MEDIUM", True))
-        self.assertEqual(self.turns[-1].group, ENROL_SUGGESTED_GROUP)
-        self.assertEqual(self.turns[-1].mode, "say_only")
+        self.assertEqual((commitment["level"], commitment["resolved"]), ("WEAK", True))
+        self.assertEqual(self.turns[-1].group, STALL_GROUP)
+        self.assertEqual(self.turns[-1].mode, "intent")
+        # The enrolment suggestion still comes before the window: the owed F4 move takes the turn.
+        self.assertIn(
+            "ask_yields_to_owed_move", self.turns[ENROL_SUGGESTED_GROUP - 1].plan["reasons"]
+        )
+        self.assertIn(
+            "owed_deferred_for_dig", " ".join(" ".join(t.plan["reasons"]) for t in self.turns)
+        )
 
     def test_the_stall_is_never_said_twice(self) -> None:
         self.assertLessEqual(self.found["weak_line_count"], 1)
@@ -184,11 +196,13 @@ class ReplayInvariantTests(unittest.TestCase):
         turn = self.turns[TURN_34_GROUP - 1]
         self.assertFalse((turn.plan["move_id"] or "").startswith("F3"), turn.plan)
         self.assertEqual(turn.mode, "llm_reply")
-        # H2 ("friction or blocker") is probed for the first time: the hint layer.
-        self.assertIn("first real question about", turn.reminder)
-        self.assertIn("what has held you back", turn.reminder)
-        # ... and H1 ("why are you looking at our programs") is probed again: the facts.
+        # H1 ("why are you looking at our programs") is probed again: the facts.  H2 ("friction or
+        # blocker") is probed for the first time, but one layer of disclosure goes into a reply and
+        # the deep need comes first (iteration 2: the live model answered with the hint and never
+        # told H1), so H2's hint waits.
         self.assertIn("digging further into", turn.reminder)
+        self.assertNotIn("first real question about", turn.reminder)
+        self.assertNotIn("what has held you back", turn.reminder)
         self.assertTrue(turn.spoken)
         self.assertNotIn("YouTube", turn.spoken)
 
@@ -245,7 +259,8 @@ class ReplayInvariantTests(unittest.TestCase):
 
     def test_the_counter_follows_the_advisors_real_answer(self) -> None:
         counter = next(t for t in self.turns if t.plan["move_id"] == "F1-COUNTER")
-        self.assertIn("came down a little", counter.reminder)  # $8,500: short of the ask
+        self.assertIn("above what you hoped", counter.reminder)  # $8,500: short of the ask
+        self.assertIn("the advisor's best price so far is $8,500", counter.reminder)
         self.assertEqual(self.result["admin_log"]["negotiation"]["price_situation"], "short")
 
     def test_a_trailing_bye_is_not_an_early_farewell(self) -> None:

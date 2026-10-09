@@ -27,6 +27,7 @@ import r1_personas
 import r1_prompts
 import r1_scheduler
 import r1_script
+import r1_text
 import r1_world
 
 # Revision 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
@@ -58,7 +59,15 @@ import r1_world
 # the public card and in DECIDER_ASKED_NOTE, the $7,000 anchor is never an offer
 # (ANCHOR_NOT_OFFERED_NOTE, ANCHOR_REPLACEMENT), "I can check with my manager" grants nothing
 # (TRY_NOT_GRANTED_NOTE, GRATITUDE_REPLACEMENT) and the time cue is the learner's own next call.
-PINNED_CONTENT_SHA256 = "a2f516e8f0b49a83f3d38a3e4d43d69917e4d22666dd1a95237e9ceb7d287d77"
+# Revision 11 (R1-Q learner iteration 2, the second live sweep): a question only now and then
+# (prefix, one question per reply and a question diet in the guard), "a stretch" and the "what would
+# that call involve" template once per call (PHRASE_QUOTA, STRETCH_ALTERNATIVES, STRETCH_USED_NOTE,
+# TEMPLATE_USED_NOTE), price notes that know where the price stands (OFFER_MET_NOTE, PRICE_MET_NOTE,
+# PRICE_UNCHANGED_NOTE), figures listed without quote marks, the anchor told to the advisor
+# (ANCHOR_HEARD_REPLACEMENT, ANCHOR_HEARD_BELOW), a calm reached anchor, a deferred MEDIUM line and
+# a call-back WEAK line (MEDIUM_DEFER_LINE, WEAK_CALL_LINE), the F4 push call suffix, hold and
+# answered-facts notes (HOLD_NOTE, ANSWERED_NOTE) and wider F3 / F4 delivery markers.
+PINNED_CONTENT_SHA256 = "9bed1fc86402ab78cf312c181262ace139e289610278aab3015c4ea578c45224"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -196,7 +205,7 @@ class PinTests(unittest.TestCase):
         prompts = manifest["prompts"]
         brief = r1_scheduler.SPEC_BY_ID[r1_scheduler.F1_ANCHOR].brief
         self.assertIn(brief, prompts["intent_reminder_sample"])
-        self.assertIn('"$9,000", "$7,000"', prompts["intent_reminder_sample"])
+        self.assertIn("without quote marks: $9,000, $7,000.", prompts["intent_reminder_sample"])
         self.assertIn("You are curious about", prompts["curiosity_reminder_sample"])
         self.assertNotIn("ack_reminder_sample", prompts)
         self.assertEqual(prompts["intent_price_note"], r1_prompts.INTENT_PRICE_NOTE)
@@ -411,6 +420,74 @@ class PinTests(unittest.TestCase):
                 self.assertNotEqual(r1_content.content_sha256(), base, name)
             finally:
                 setattr(module, name, original)
+        self.assertEqual(r1_content.content_sha256(), base)
+
+    def test_the_manifest_covers_the_iteration_two_texts(self):
+        manifest = r1_content.manifest()
+        self.assertGreaterEqual(manifest["revision"], 11)
+        prompts = manifest["prompts"]
+        for key, value in (
+            ("offer_met_note", r1_prompts.OFFER_MET_NOTE),
+            ("price_met_note", r1_prompts.PRICE_MET_NOTE),
+            ("price_unchanged_note", r1_prompts.PRICE_UNCHANGED_NOTE),
+            ("hold_note", r1_prompts.HOLD_NOTE),
+            ("answered_note", r1_prompts.ANSWERED_NOTE),
+            ("stretch_used_note", r1_prompts.STRETCH_USED_NOTE),
+            ("template_used_note", r1_prompts.TEMPLATE_USED_NOTE),
+            ("next_step_note", r1_prompts.NEXT_STEP_NOTE),
+        ):
+            self.assertEqual(prompts[key], value, key)
+        commitment = manifest["commitment"]
+        self.assertEqual(commitment["defer_line"], r1_commitment.MEDIUM_DEFER_LINE)
+        self.assertEqual(commitment["weak_call_line"], r1_commitment.WEAK_CALL_LINE)
+        guard = manifest["guard"]
+        self.assertEqual(guard["anchor_heard_replacement"], r1_guard.ANCHOR_HEARD_REPLACEMENT)
+        self.assertEqual(guard["anchor_heard_below"], r1_guard.ANCHOR_HEARD_BELOW)
+        style = guard["style"]
+        self.assertEqual(style["phrase_quota"], dict(r1_guard.PHRASE_QUOTA))
+        self.assertEqual(style["question_diet_window"], r1_guard.QUESTION_DIET_WINDOW)
+        self.assertEqual(style["thin_reply_words"], r1_guard.THIN_REPLY_WORDS)
+        self.assertEqual(style["stretch_alternatives"], list(r1_text.STRETCH_ALTERNATIVES))
+        scheduler = manifest["scheduler"]
+        self.assertEqual(scheduler["f4_push_call_suffix"], r1_scheduler.F4_PUSH_CALL_SUFFIX)
+        self.assertEqual(
+            scheduler["answered_labels"], [list(item) for item in r1_scheduler.ANSWERED_LABELS]
+        )
+
+    def test_editing_an_iteration_two_text_or_constant_changes_the_sha(self):
+        base = r1_content.content_sha256()
+        edits = (
+            (r1_prompts, "OFFER_MET_NOTE", r1_prompts.OFFER_MET_NOTE + " "),
+            (r1_prompts, "PRICE_MET_NOTE", r1_prompts.PRICE_MET_NOTE + " "),
+            (r1_prompts, "HOLD_NOTE", r1_prompts.HOLD_NOTE + " "),
+            (r1_prompts, "ANSWERED_NOTE", r1_prompts.ANSWERED_NOTE + " "),
+            (r1_prompts, "STRETCH_USED_NOTE", r1_prompts.STRETCH_USED_NOTE + " "),
+            (r1_prompts, "TEMPLATE_USED_NOTE", r1_prompts.TEMPLATE_USED_NOTE + " "),
+            (r1_commitment, "MEDIUM_DEFER_LINE", r1_commitment.MEDIUM_DEFER_LINE + " "),
+            (r1_commitment, "WEAK_CALL_LINE", r1_commitment.WEAK_CALL_LINE + " "),
+            (r1_guard, "ANCHOR_HEARD_REPLACEMENT", r1_guard.ANCHOR_HEARD_REPLACEMENT + " "),
+            (r1_guard, "ANCHOR_HEARD_BELOW", r1_guard.ANCHOR_HEARD_BELOW + " "),
+            (r1_guard, "QUESTION_DIET_WINDOW", r1_guard.QUESTION_DIET_WINDOW + 1),
+            (r1_guard, "THIN_REPLY_WORDS", r1_guard.THIN_REPLY_WORDS + 1),
+            (r1_scheduler, "F4_PUSH_CALL_SUFFIX", r1_scheduler.F4_PUSH_CALL_SUFFIX + " "),
+            (r1_negotiation, "DEFER_RECENT_TURNS", r1_negotiation.DEFER_RECENT_TURNS + 1),
+            (r1_text, "STRETCH_ALTERNATIVES", r1_text.STRETCH_ALTERNATIVES[:-1] + ("so-so",)),
+        )
+        for module, name, value in edits:
+            original = getattr(module, name)
+            try:
+                setattr(module, name, value)
+                self.assertNotEqual(r1_content.content_sha256(), base, name)
+            finally:
+                setattr(module, name, original)
+        quota = r1_guard.PHRASE_QUOTA
+        original_quota = dict(quota)
+        try:
+            quota[r1_text.PHRASE_STRETCH] = 2
+            self.assertNotEqual(r1_content.content_sha256(), base, "PHRASE_QUOTA")
+        finally:
+            quota.clear()
+            quota.update(original_quota)
         self.assertEqual(r1_content.content_sha256(), base)
 
     def test_no_pinned_learner_text_teaches_the_tics(self):

@@ -63,7 +63,7 @@ class CallSpec:
     advisor_level: str = "strong"
     rep: int = 0
     candidate_name: str = "Rohan"
-    max_exchanges: int = 40
+    max_exchanges: int = 60
 
     @property
     def seed(self) -> str:
