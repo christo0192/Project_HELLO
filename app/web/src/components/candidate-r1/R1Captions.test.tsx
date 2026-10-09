@@ -379,6 +379,66 @@ describe('R1Captions when the list changes size', () => {
     expect(screen.getByRole('button', { name: 'Jump to latest (1 new)' })).toBeVisible();
   });
 
+  it('does not move a reader who has begun to scroll up when something unrelated renders or the list reports the size it already has', () => {
+    const { rerender, log, scroll, content } = pinnedList();
+
+    // The first moments of a keyboard, smooth-wheel or trackpad scroll: the reader is 20 px up,
+    // still inside the 48 px that counts as the end, so the component has not (and should not
+    // yet) treat them as having left.
+    scroll.scrollTo(1700 - 20);
+    expect(screen.queryByRole('button', { name: /Jump to latest/ })).toBeNull();
+
+    // Unrelated commits: the interviewer's level meter re-renders the live view several times a
+    // second, and the 30 s role-play heartbeat re-renders it too. The captions and the box they
+    // are in are exactly as they were.
+    const same = lines(40);
+    rerender(<R1Captions captions={same} />);
+    rerender(<R1Captions captions={same} />);
+    rerender(<R1Captions captions={lines(40)} />);
+    expect(scroll.top, 'a commit that changed nothing about the list moved the reader').toBe(1680);
+
+    // An observer callback for a size that was already dealt with (the one that follows our own
+    // pin, a frame after the commit) must not move them either.
+    FakeResizeObserver.resize(log);
+    FakeResizeObserver.resize(content);
+    expect(scroll.top, 'an observer report of the same size moved the reader').toBe(1680);
+
+    // The reader carries on, and now they have left: the position is held, the way back offered.
+    scroll.scrollTo(1700 - 80);
+    expect(screen.getByRole('button', { name: 'Jump to latest' })).toBeVisible();
+    rerender(<R1Captions captions={same} />);
+    expect(scroll.top).toBe(1620);
+  });
+
+  it('still catches a reader within a line of the end up with a line that arrives', () => {
+    const { rerender, scroll } = pinnedList();
+    scroll.scrollTo(1700 - 20);
+    rerender(<R1Captions captions={lines(40)} />);
+    expect(scroll.top).toBe(1680);
+
+    // The list did change size this time: a line arrived. Within a line of the end is "reading
+    // the latest", so they are taken to it.
+    scroll.geometry.scrollHeight = 2080;
+    rerender(<R1Captions captions={lines(41)} />);
+    expect(scroll.top).toBe(1780);
+    expect(screen.queryByRole('button', { name: /Jump to latest/ })).toBeNull();
+  });
+
+  it('re-pins once for one change of size, however many commits and reports follow it', () => {
+    const { rerender, log, scroll, content } = pinnedList();
+    scroll.geometry.clientHeight = 150;
+    rerender(<R1Captions captions={lines(40)} />);
+    expect(scroll.top).toBe(1850);
+
+    // The reader nudges up 20 px; the observer reports the change of size that the commit has
+    // already handled, then the level meter renders: neither takes the nudge back.
+    scroll.scrollTo(1850 - 20);
+    FakeResizeObserver.resize(log);
+    FakeResizeObserver.resize(content);
+    rerender(<R1Captions captions={lines(40)} />);
+    expect(scroll.top).toBe(1830);
+  });
+
   it('follows again after the reader returns to the end, through the next resize', () => {
     const { rerender, log, scroll } = pinnedList();
     scroll.scrollTo(0);

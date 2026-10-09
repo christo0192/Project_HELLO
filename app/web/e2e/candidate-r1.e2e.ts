@@ -817,6 +817,46 @@ test.describe('live layout with a long interview', () => {
     r1.expectHealthy();
   });
 
+  test('does not undo a scroll the reader has just begun when the interviewer\'s level changes', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'desktop', 'one desktop run is enough for the behaviour');
+    const { page } = r1;
+    await page.setViewportSize({ width: 1366, height: 768 });
+    await reachLiveWithConversation(r1);
+    const log = page.getByRole('log', { name: 'Transcript' });
+    const frames = (count: number) =>
+      page.evaluate(
+        (n) =>
+          new Promise<void>((resolve) => {
+            const step = (left: number) => (left <= 0 ? resolve() : requestAnimationFrame(() => step(left - 1)));
+            step(n);
+          }),
+        count,
+      );
+
+    // The first moments of a keyboard, wheel or trackpad scroll: the reader is 20 px up, inside the
+    // 48 px that still counts as the end, so the list has not (yet) decided they have left.
+    const parked = await log.evaluate((element) => {
+      element.scrollTop = element.scrollHeight - element.clientHeight - 20;
+      return Math.round(element.scrollTop);
+    });
+    await frames(2);
+
+    // The level meter re-renders the live view (and the captions in it) several times a second. None
+    // of that changes the list, so none of it may move the reader.
+    for (const level of [0.2, 0.7, 0.4, 0.9, 0.1]) {
+      await r1.mock.speak(level);
+      await frames(2);
+    }
+    expect(await log.evaluate((element) => Math.round(element.scrollTop)), 'a level update moved the reader').toBe(parked);
+    await expect(page.getByRole('button', { name: /Jump to latest/ })).toHaveCount(0);
+
+    // Still following: a line that arrives takes a reader within a line of the end to it.
+    await r1.mock.caption('c41', 'A new line while the reader is a few pixels from the end.', true);
+    await expect(page.locator('.candidate-caption', { hasText: 'A new line while the reader' })).toBeAttached();
+    await expect.poll(async () => (await liveLayout(page)).newestLineInView).toBe(true);
+    r1.expectHealthy();
+  });
+
   test('keeps the existing caption text findable exactly once', async ({ r1 }, testInfo) => {
     test.skip(testInfo.project.name !== 'desktop', 'text lookups do not depend on the window');
     const { page } = r1;

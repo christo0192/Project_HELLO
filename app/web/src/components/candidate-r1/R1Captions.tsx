@@ -30,14 +30,20 @@ function countAfter(captions: readonly R1Caption[], anchorId: string | null): nu
  * to its briefing form and takes room from the column), a web font arrives and the lines wrap
  * differently, and the window or the scrollbar changes the width. A list that is pinned must be
  * on the newest line after each of them, so:
- *   - every commit of this component re-pins a pinned list in a layout effect, which is the
- *     moment the DOM is final and before the browser can run any other task or paint. A
- *     ResizeObserver alone is too late for a render caused by a parent: its callback runs in the
- *     next rendering step, and anything that looks at the page in between (a test, an assistive
- *     tool, a screenshot) sees the newest line cut off;
+ *   - after every commit of this component a pinned list whose size changed is re-pinned in a
+ *     layout effect, which is the moment the DOM is final and before the browser can run any
+ *     other task or paint. A ResizeObserver alone is too late for a render caused by a parent:
+ *     its callback runs in the next rendering step, and anything that looks at the page in
+ *     between (a test, an assistive tool, a screenshot) sees the newest line cut off;
  *   - a ResizeObserver on the list (its viewport) AND on its content re-pins for the changes no
  *     render of ours announces (a font swap, a resize of the window, a scroll bar appearing).
  *     Observing the list alone misses content that grows inside a box that keeps its size.
+ *
+ * "Changed size" is the scroll height or the client height differing from what they were when we
+ * last pinned. A commit or an observer callback that finds the same sizes does not touch the
+ * scroll position: the reader may be partway through a scroll that has not yet taken them past
+ * the at-the-end tolerance, and an unrelated render (the interviewer's level meter) must not
+ * undo it.
  *
  * Screen readers. A caption keeps growing while it is interim, and a live region that sees its
  * text change reads the whole paragraph again. So the log is a polite region that announces
@@ -54,6 +60,10 @@ export function R1Captions({ captions }: R1CaptionsProps) {
   // the list got shorter): read against the new geometry that echo would look like the reader
   // scrolling away. It is recognised by its position and ignored while pinned.
   const pinnedTopRef = useRef<number | null>(null);
+  // The size of the list and of what it holds the last time WE put it on the end. Whether the
+  // list needs to be put there again is a question about this, not about whether a commit
+  // happened: see repinIfResized.
+  const pinnedSizeRef = useRef<{ scrollHeight: number; clientHeight: number } | null>(null);
   // The newest caption the reader had seen when they scrolled away; null while pinned.
   const [awayFrom, setAwayFrom] = useState<{ id: string | null } | null>(null);
 
@@ -64,13 +74,40 @@ export function R1Captions({ captions }: R1CaptionsProps) {
     if (!element) return;
     element.scrollTop = element.scrollHeight;
     pinnedTopRef.current = element.scrollTop;
+    pinnedSizeRef.current = { scrollHeight: element.scrollHeight, clientHeight: element.clientHeight };
+  }
+
+  /**
+   * Puts a followed list back on the end, but only if it changed size since we last put it there.
+   * `stuck` stays true until a scroll event shows the reader MORE than STICK_PX from the end, so
+   * for the first moments of a keyboard, smooth-wheel or trackpad scroll the reader is already
+   * moving away while the list still counts as followed. Re-pinning on every commit, or on an
+   * observer callback that reports a size we have already dealt with, undid that scroll whenever
+   * anything unrelated rendered (the interviewer's level meter updates several times a second).
+   * With the size unchanged the list is exactly where we left it plus whatever the reader has
+   * done, and that is theirs to keep.
+   */
+  function repinIfResized(): void {
+    if (!stuckRef.current) return;
+    const element = listRef.current;
+    if (!element) return;
+    const pinned = pinnedSizeRef.current;
+    if (
+      pinned &&
+      pinned.scrollHeight === element.scrollHeight &&
+      pinned.clientHeight === element.clientHeight
+    ) {
+      return;
+    }
+    pinToEnd();
   }
 
   // After EVERY commit, not only one that changed the captions: the parent re-renders this
   // component when the box around it changed (a new caption, the scenario card, the phase), and
-  // the list has then already been given its new height. A reader who scrolled away is left alone.
+  // the list has then already been given its new height. A reader who scrolled away is left alone,
+  // and so is one who is on their way: nothing moves unless the list changed size.
   useLayoutEffect(() => {
-    if (stuckRef.current) pinToEnd();
+    repinIfResized();
   });
 
   // What no render announces: a web font replacing the fallback re-wraps every line, a window
@@ -81,7 +118,7 @@ export function R1Captions({ captions }: R1CaptionsProps) {
     const content = contentRef.current;
     if (!list || !content || typeof ResizeObserver === 'undefined') return undefined;
     const observer = new ResizeObserver(() => {
-      if (stuckRef.current) pinToEnd();
+      repinIfResized();
     });
     observer.observe(list);
     observer.observe(content);
