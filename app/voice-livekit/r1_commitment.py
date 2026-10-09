@@ -318,6 +318,15 @@ _INFO_AFTER = re.compile(
     r"(?:[\w-]+ ){0,2}" + _INFO_NOUN + r"\b",
     re.IGNORECASE,
 )
+# "I'll text you the payment plan comparison tonight": a message that carries information is an
+# information send, not a call (R1-Q ship de-risk: it was read as a call proposal in the close
+# window and booked a call at the farewell; the production detector reads it as nothing).
+_MESSAGE_YOU = re.compile(r"\b(?:text|message|whatsapp|ping)(?:ing)? you$", re.IGNORECASE)
+_INFO_DIRECT = re.compile(
+    r"^\s+(?:the |your |all (?:the |your )?|those |these |some |more |a |an |any |over |across |"
+    r"out )*(?:[\w-]+ ){0,2}" + _INFO_NOUN + r"\b",
+    re.IGNORECASE,
+)
 # Questions ABOUT the programme or knowledge questions: "Did you know you can book ...?".
 _KNOWLEDGE_Q = re.compile(
     r"\b(?:did|do|does|would|can|could|will|should) (?:you|students|learners|people|everyone|"
@@ -681,13 +690,61 @@ def _close_to_batch(lowered: str, start: int, end: int) -> bool:
     return _PROGRAMME_NOUNS.search(near) is not None or _BATCH_SLOT.search(wide) is not None
 
 
+# A schedule PITCH ends in a fit check but proposes nothing with this learner: "Our live classes run
+# on Saturdays at 10 AM, would that work for you?", "The mentor sessions are on Tuesdays and
+# Thursdays, does that suit you?".  R1-Q ship de-risk: read as a call proposal it became a pending
+# ask, and the learner booked "let's book a call" at the farewell (5/5 early pitches) or earned an
+# unearned MEDIUM in the close window (6/6).  The production detector gives a pitch a free reply.
+_PLURAL_WEEKDAY = re.compile(
+    r"\b(?:mondays|tuesdays|wednesdays|thursdays|fridays|saturdays|sundays)\b", re.IGNORECASE
+)
+# A party of THIS learner's, which makes a time question a real proposal ("is that good for you and
+# your husband?", "I'll call you").
+_LEARNER_PARTY = re.compile(
+    r"\byour (?:husband|wife|partner|spouse|father|mother|parents|family|dad|mom)\b|\byou and\b"
+    r"|\byou both\b|\bboth of you\b|\bthe (?:two|three) of (?:you|us)\b|\bwith you\b"
+    r"|\b(?:call|ring|phone|text) you\b",
+    re.IGNORECASE,
+)
+
+
+def _is_schedule_pitch(lowered: str) -> bool:
+    """The sentence describes the programme's own schedule and offers nothing of the advisor's.
+
+    It names the cadence, a programme feature or a plural weekday ("Saturdays") and neither a party
+    of the learner's ("your husband", "you and") nor an "I'll" / "let's" offer.
+    """
+    if _LEARNER_PARTY.search(lowered) is not None or _SINGULAR_OFFER.search(lowered) is not None:
+        return False
+    return (
+        describes_programme(lowered)
+        or _FEATURE.search(lowered) is not None
+        or _PLURAL_WEEKDAY.search(lowered) is not None
+    )
+
+
 def call_proposal_in(sentence: object) -> str | None:
     """The phrase that proposes a call, a time or a follow-up with THIS learner, or None.
 
     ``sentence`` is one sentence of the advisor.  See the block comment above for the four
-    questions it answers; ``tests/test_r1_detector_corpus.py`` holds the labelled cases.
+    questions it answers; ``tests/test_r1_detector_corpus.py`` holds the labelled cases.  A schedule
+    pitch that ends in a fit check ("... on Saturdays, would that work for you?") proposes nothing
+    (``_is_schedule_pitch``), so the learner answers it freely, as in production.
     """
     lowered = fold(sentence).lower().strip()[-_MAX_SENTENCE:]
+    found = _call_proposal_match(lowered)
+    if found is None:
+        return None
+    phrase, from_time_ask = found
+    if _is_schedule_pitch(lowered) and (
+        from_time_ask or _PLURAL_WEEKDAY.search(lowered) is not None
+    ):
+        return None
+    return phrase
+
+
+def _call_proposal_match(lowered: str) -> tuple[str, bool] | None:
+    """The phrase that proposes a call and whether it is a question about a day or a time."""
     if not lowered or _KNOWLEDGE_Q.search(lowered) is not None:
         return None
     if _NOW_CHECK.search(lowered) is not None and _CONCRETE_DAY.search(lowered) is None:
@@ -699,7 +756,7 @@ def call_proposal_in(sentence: object) -> str | None:
         for pattern in _TIME_ASKS:
             match = pattern.search(lowered)
             if match is not None and not _close_to_batch(lowered, match.start(), match.end()):
-                return match.group(0)[:40]
+                return match.group(0)[:40], True
     singular = _SINGULAR_OFFER.search(lowered) is not None
     framed = (
         _FP_OFFER.search(lowered) is not None
@@ -716,9 +773,9 @@ def call_proposal_in(sentence: object) -> str | None:
             near = around(lowered, match.start(), match.end())
             if describes_programme(near) or _close_to_batch(lowered, match.start(), match.end()):
                 continue
-            return match.group(0)[:40]
+            return match.group(0)[:40], False
     if _PICK_TIME.search(lowered) is not None:
-        return "pick a time"
+        return "pick a time", False
     learner_asked = asked and _LEARNER_ASK.search(lowered) is not None
     if not framed and not learner_asked:
         return None
@@ -733,7 +790,7 @@ def call_proposal_in(sentence: object) -> str | None:
             if _object_proposes_call(
                 lowered, match, asked=asked, singular=singular, needs_when=needs_when
             ):
-                return match.group(0)[:40]
+                return match.group(0)[:40], False
     return None
 
 
@@ -751,6 +808,11 @@ def _object_proposes_call(
         return False  # "after the call", "this call": the call we are on, not a new one
     if _INFO_AFTER.match(lowered[end:]) is not None:
         return False
+    if (
+        _MESSAGE_YOU.search(lowered[start:end]) is not None
+        and _INFO_DIRECT.match(lowered[end:]) is not None
+    ):
+        return False  # "I'll text you the details tonight": information, not a call
     if _LEARNER_INITIATED.search(lowered[max(0, start - 30) : end]) is not None:
         return False  # "feel free to reach out": the learner's move, not the advisor's offer
     if needs_when and _WHEN_CUE.search(lowered) is None:
@@ -773,10 +835,11 @@ def _object_proposes_call(
 
 # What: an enrolment, a payment, a seat.
 _ENROL_VERB_SEND = r"(?:send|share|email|e-mail|forward|text|whatsapp|drop|shoot|give)"
+# The things a learner pays or signs up through; only with a link, a form, a page, a portal or an
+# invoice after them are they something to act on (see the send / share pattern in ``_ENROL_ASK``).
 _ENROL_OBJECT = (
     r"(?:payment|enrol+ment|registration|sign-?up|application|booking|invoice|deposit|"
-    r"contract|agreement|paperwork|offer letter|instal+ment (?:link|plan link)|checkout|"
-    r"confirmation)"
+    r"contract|agreement|checkout|instal+ment(?: plan)?)"
 )
 _LINK = r"(?:link|form|page|invoice)"
 # What payment and registration TALK is when it is not the thing to act on: information.
@@ -872,13 +935,15 @@ _ENROL_ASK = _compile(
     r"(?:^|[,;] ?)(?:(?:and|but|so|then|now|just|please|okay|ok) )*(?:" + _SEAT_VERB + r"(?: in)? "
     r"" + _SEAT_OBJECT + r"|(?:enrol+|register|sign up|pay)(?= now| today| tonight)|"
     r"reserve(?= now| today| tonight| right))(?![\w-])",
-    # send / share the payment or enrolment link or form.  The details, options or information of
-    # payment and registration are INFORMATION (R1-Q final review round 1: "I'll email the
-    # curriculum and payment details today" was an enrolment ask and earned a scripted "I'll pay
-    # the deposit today"): only the thing the learner would act on counts.
+    # send / share the payment or enrolment LINK, form, page, portal or invoice.  An e-mail of the
+    # details, the options, a pack, a brochure or "the registration material" is INFORMATION,
+    # however it is phrased (R1-Q final review round 1: "I'll email the curriculum and payment
+    # details today" was an enrolment ask and earned a scripted "I'll pay the deposit today"; ship
+    # de-risk: the declaratives "I'll email you the enrolment pack tonight" did too, an unearned
+    # STRONG on 8/15 information sends against 5/15 in production).  Only the thing the learner
+    # would act on counts, so the object must be followed by the link noun.
     r"\b" + _ENROL_VERB_SEND + r"\b(?: (?:you|me|him|her|them|over|across|out))?"
-    r"(?: [\w'-]+){0,3}? " + _ENROL_OBJECT + _NOT_INFORMATION + r"\b"
-    r"(?: (?:link|form|page))?",
+    r"(?: [\w'-]+){0,3}? " + _ENROL_OBJECT + r"[- ](?:link|form|page|portal|invoice)\b",
     # "go ahead and complete the payment on the link", "please finalise your registration"
     r"(?:^|[,;] ?)(?:(?:and|but|so|then|now|just|please|okay|ok) )*(?:go ahead and |please )?"
     r"(?:complete|finali[sz]e|make|do|submit) (?:the |your |that |this )?(?:payment|registration|"

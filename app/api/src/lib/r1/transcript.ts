@@ -112,18 +112,26 @@ export const R1_NAME_MASK = '[CANDIDATE]';
  * R1-Q final review round 1: the scripted wordings are also masked by SHORT frames. The worker
  * persists the text the SDK actually forwarded, and a barge-in can cut a line at any word boundary
  * ("Daytime is tough for me, so let's book a", "Call me back after I've talked to", "I'll read
- * through the email and"): the short frames still hide the level. The read-through frame needs the
- * sentence to begin with it or to follow "I'll", so "Did you read through the email I sent?" stays.
+ * through the email and"): the short frames still hide the level.
+ *
+ * R1-Q ship de-risk: the short frames are ANCHORED to the sentence, because the learner's own
+ * ordinary talk contains the same words ("Do I have to pay the deposit upfront?", "Daytime is
+ * tough for me because of the kids.", "I'll read through the email when it comes.", "Can you send
+ * me the enrolment requirements first?" were all hidden from the scorer, 14 of 16 ordinary
+ * sentences). Each scripted wording opens its sentence ("Send me the enrolment ...", "Daytime is
+ * tough for me, ...", "Call me back after ...", "I'll read through the email and ..."), so a frame
+ * that starts the sentence, or the whole "I'll pay the deposit", hides the level and nothing else.
+ * The sentence is tested trimmed.
  */
 const COMMITMENT_PATTERNS: readonly RegExp[] = [
-  /send me the enrol+ment\b/i,
-  /\bpay the deposit\b/i,
+  /^(?:okay, let['’]?s do it\.\s*)?send me the enrol+ment\b/i,
+  /\bI['’]?ll pay the deposit\b/i,
   /book a call\b[^.!?]*\bso we can decide/i,
   /\blet['’]?s book a call\b/i,
-  /\bdaytime is tough\b/i,
+  /^daytime is tough for me,/i,
   /\bemail me the details\b/i,
-  /\bcall me back after\b/i,
-  /(?:^|\bi['’]?ll )read through the e-?mail\b/i,
+  /^call me back after\b/i,
+  /^I['’]?ll read through the e-?mail(?: and\b|[.!?]?\s*$)/i,
 ];
 
 const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/;
@@ -131,8 +139,10 @@ const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/;
 export function maskCommitmentLines(text: string): string {
   return text
     .split(SENTENCE_BOUNDARY)
-    .map((sentence) =>
-      COMMITMENT_PATTERNS.some((pattern) => pattern.test(sentence)) ? R1_COMMITMENT_MASK : sentence)
+    .map((sentence) => {
+      const trimmed = sentence.trim();
+      return COMMITMENT_PATTERNS.some((pattern) => pattern.test(trimmed)) ? R1_COMMITMENT_MASK : sentence;
+    })
     .join(' ');
 }
 

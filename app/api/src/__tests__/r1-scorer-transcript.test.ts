@@ -210,6 +210,28 @@ describe('masking', () => {
     }
   });
 
+  it('does not mask ordinary learner talk that shares words with a scripted wording (ship de-risk)', () => {
+    for (const text of [
+      'Do I have to pay the deposit upfront?',
+      'Daytime is tough for me because of the kids.',
+      "I'll read through the email when it comes.",
+      'Can you send me the enrolment requirements first?',
+      'Is the enrolment fee refundable? I would pay the deposit only after that.',
+      'Hmm, daytime is hard for me, can we do evenings?',
+    ]) {
+      expect(maskCommitmentLines(text), text).toBe(text);
+    }
+  });
+
+  it('still masks the scripted wordings when the sentence is padded with whitespace', () => {
+    expect(maskCommitmentLines("  Send me the enrolment link and I'll pay the deposit today.")).toBe(
+      R1_COMMITMENT_MASK,
+    );
+    expect(maskCommitmentLines("Hmm. Daytime is tough for me, so let's book a")).toBe(
+      `Hmm. ${R1_COMMITMENT_MASK}`,
+    );
+  });
+
   it('does not mask the F4 push or an ordinary request to call back', () => {
     for (const text of [
       "I'd want to run this by my husband first.",

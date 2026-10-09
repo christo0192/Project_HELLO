@@ -690,5 +690,113 @@ class FinalReviewRoundOneCommitmentTests(unittest.TestCase):
         self.assertIn("pay the deposit today", line)
 
 
+class ShipDeriskDetectorTests(unittest.TestCase):
+    """R1-Q ship de-risk: the detectors never read an information send or a schedule pitch as an ask.
+
+    Declaratives such as "I'll email you the enrolment pack tonight" were read as an enrolment ask (an
+    unearned STRONG "I'll pay the deposit today" on 8/15 information sends, 5/15 in production), and a
+    programme schedule that ends in a fit check ("... on Saturdays, would that work for you?") as a
+    call proposal (an unearned MEDIUM booking on 6/6 pitches, 1/6 in production).
+    """
+
+    INFORMATION_SENDS = (
+        "I'll email you the payment and enrolment details tonight.",
+        "I'll send you the application guide and the syllabus.",
+        "I'll text you the deposit amount and the instalment dates.",
+        "I'll mail out the registration packet today, no rush on it.",
+        "I'll email over the enrolment pack for you and your husband.",
+        "I'll drop the registration material in your inbox.",
+        "Let me forward you the enrolment brochure so you can read it with him.",
+        "I'll send you a PDF with the payment timeline.",
+        "Can I send you the brochure and the fee sheet by email?",
+        "Shall I email you the curriculum so you can look it over with your husband?",
+        "I'll send across the payment and scholarship details for you two to read.",
+        "I'll email you the payment details after this call.",
+        "Let me share the payment calculator so you can play with the numbers.",
+        # A message that carries information is not a call either.
+        "I'll WhatsApp you the details tomorrow.",
+        "I'll text you the payment plan comparison tonight.",
+    )
+    LINK_ASKS = (
+        "Shall I send you the link to pay the deposit?",
+        "I'll send the payment link now, and you can grab your seat tonight.",
+        "Can you email the instalment link?",
+        "Let me send you the payment link now, okay?",
+        "I'll email you the enrolment link right away.",
+        "Want me to send over the registration form?",
+        "I'll share the checkout page with you now, so you can pay today.",
+        "I'll send you the enrolment portal link tonight, okay?",
+        "Shall I send the payment page?",
+        "I'll email you the invoice now.",
+        "Let me send the instalment plan link.",
+    )
+    SCHEDULE_PITCHES = (
+        "Our mentors run a live call every Saturday, would that work with your schedule?",
+        "We have a live Q&A on Thursdays, does that suit you?",
+        "Live sessions are Tuesday and Thursday at 8 PM, would that work for you?",
+        "Classes are on Saturday mornings, does that work for you?",
+        "The weekly check-in is on Monday evenings, is that okay with your job?",
+        "Doubt-clearing calls happen on weekends, would that suit your routine?",
+        "The live classes run on Sunday mornings, would that suit your week?",
+        "Mentor sessions are every Wednesday at 9 PM, does that time work for you?",
+        "We do a live coding call on Saturdays, is that good for you?",
+        "Most of the cohort meets on weekends, would that be okay?",
+        "Office hours run Friday evenings, would that work with your kids' routine?",
+        "The capstone review call is on Thursdays, is that fine for you?",
+        "Our live classes run on Saturdays at 10 AM, would that work for you?",
+    )
+    CALL_PROPOSALS = (
+        "Since mornings don't work, when's better for a quick call?",
+        "Would a quick follow-up call on Thursday work for you?",
+        "Would Saturdays work for a call with you and your husband?",
+        "Let's schedule a call with your husband for Saturday.",
+        "What time tomorrow suits you for a follow-up?",
+        "Is Thursday at seven good for a quick call with your husband?",
+        "I'll call you on Saturdays at 10, does that work?",
+        "I'll text you tomorrow.",
+    )
+
+    def test_an_information_send_is_neither_an_enrolment_ask_nor_a_call(self):
+        from r1_commitment import ask_acts
+
+        for text in self.INFORMATION_SENDS:
+            with self.subTest(text=text):
+                kinds = ask_acts(text)
+                self.assertNotIn(AskKind.ENROL, kinds, text)
+                self.assertNotIn(AskKind.CALL, kinds, text)
+
+    def test_sending_the_link_form_page_or_invoice_is_still_an_enrolment_ask(self):
+        from r1_commitment import ask_acts
+
+        for text in self.LINK_ASKS:
+            with self.subTest(text=text):
+                self.assertIn(AskKind.ENROL, ask_acts(text), text)
+
+    def test_a_schedule_pitch_that_ends_in_a_fit_check_proposes_no_call(self):
+        from r1_commitment import ask_acts, call_proposal_in
+
+        for text in self.SCHEDULE_PITCHES:
+            with self.subTest(text=text):
+                self.assertIsNone(call_proposal_in(text), text)
+                self.assertNotIn(AskKind.CALL, ask_acts(text), text)
+
+    def test_a_time_question_about_a_call_with_this_learner_is_still_a_proposal(self):
+        from r1_commitment import ask_acts, call_proposal_in
+
+        for text in self.CALL_PROPOSALS:
+            with self.subTest(text=text):
+                self.assertIsNotNone(call_proposal_in(text), text)
+                self.assertIn(AskKind.CALL, ask_acts(text), text)
+
+    def test_the_negotiation_and_persona_modules_share_the_pitch_filter(self):
+        import r1_negotiation
+        import r1_personas
+
+        for module in (r1_negotiation, r1_personas):
+            with self.subTest(module=module.__name__):
+                self.assertIsNone(module.call_proposal_in(self.SCHEDULE_PITCHES[0]))
+                self.assertIsNotNone(module.call_proposal_in(self.CALL_PROPOSALS[0]))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -3219,6 +3219,63 @@ class PendingAskAtFarewellTests(unittest.TestCase):
         self.assertNotIn("pending_ask_at_farewell", plan.reasons)
 
 
+class SchedulePitchThroughTheEngineTests(unittest.TestCase):
+    """R1-Q ship de-risk: a programme schedule that ends in a fit check is a pitch, not a call proposal.
+
+    Read as a proposal it was a pending ask: the learner answered the pitch with a money stall and booked
+    "let's book a call" at the farewell (5/5 probes), and inside the window it earned a MEDIUM (6/6).
+    The production learner ends WEAK in the first case and answers the pitch freely in the second.
+    """
+
+    PITCH_ASK = "Live sessions are Tuesday and Thursday at 8 PM, would that work for you?"
+    FAREWELL = "Alright, thanks so much for your time today. Bye for now!"
+
+    def run_until_window(self, ask_text):
+        s = Session(engine(seed="schedule-pitch"))
+        script = cooperative_script()
+        script.insert(3, ask_text)
+        r = 20.0
+        for text in script:
+            if s.eng.scheduler.commit_permitted(r):
+                break
+            s.say(text, r)
+            r += 45
+        return s, r
+
+    def test_an_early_pitch_is_not_a_pending_ask(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(self.PITCH_ASK, 200)
+        self.assertNotIn("ask_before_close_window", plan.reasons)
+        self.assertFalse(any(r.startswith("stall_reason") for r in plan.reasons), plan.reasons)
+        self.assertIsNone(s.eng._pending_ask)
+        self.assertEqual(s.eng.admin_log()["commitment"]["asks"], [])
+
+    def test_a_farewell_after_an_early_pitch_is_the_weak_stall_not_a_booking(self):
+        s, r = self.run_until_window(self.PITCH_ASK)
+        s.eng.apply_judge(GOOD_JUDGE, s.eng.turn)
+        self.assertTrue(s.eng.scheduler.commit_permitted(r))
+        plan = s.say(self.FAREWELL, r)
+        self.assertNotIn("pending_ask_at_farewell", plan.reasons)
+        self.assertIn("close_attempt_stall", plan.reasons)
+        self.assertNotEqual(plan.commitment_level, Level.MEDIUM)
+        self.assertNotIn("book a call", s.spoken[-1].lower())
+
+    def test_a_pitch_in_the_close_window_earns_no_commitment(self):
+        session, r = run_cooperative(40.0)
+        session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+        plan = session.say(self.PITCH_ASK, r - 20)
+        self.assertIsNone(plan.commitment_level, plan.reasons)
+        self.assertEqual(session.eng.admin_log()["commitment"]["asks"], [])
+        self.assertNotIn("book a call", session.spoken[-1].lower())
+
+    def test_a_real_time_question_about_a_call_is_still_answered_as_a_proposal(self):
+        session, r = run_cooperative(40.0)
+        session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+        plan = session.say("Since mornings don't work, when's better for a quick call?", r - 20)
+        self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+
+
 class SituationNotesThroughTheEngineTests(unittest.TestCase):
     """R1-Q iteration 1 (owner decision b.3, b.4 and the live misfires): who decides, what the
     $7,000 is and what "I can check with my manager" grants."""

@@ -241,11 +241,17 @@ _BEFORE_I_GO = re.compile(
 _ASIDE_BEFORE_I_GO = re.compile(
     r",\s*\bbefore (?:i|we) " + _GOODBYE_VERB + r"\b(?:,? though)?\s*,", re.IGNORECASE
 )
-# "... one more question before I go." at the very end of the sentence.
+# "... one more question before I go." at the very end of the sentence.  R1-Q ship de-risk: only
+# in a "one more / a last / a quick question / thing" sentence, and never for "leave".  A final
+# "before I leave / I go / we wrap up" is otherwise an ordinary clause about the learner's plans
+# ("I'd need to get my visa sorted before I leave." lost its meaning in 7/7 probes), which the
+# production guard speaks as said.
+_TAIL_GOODBYE_VERB = r"(?:go|hang up|wrap up|run|get going)"
 _TAIL_BEFORE_I_GO = re.compile(
-    r",?\s*\bbefore (?:i|we) " + _GOODBYE_VERB + r"\b(?:,? though)?(?=\s*[.?!]*\s*$)",
+    r",?\s*\bbefore (?:i|we) " + _TAIL_GOODBYE_VERB + r"\b(?:,? though)?(?=\s*[.?!]*\s*$)",
     re.IGNORECASE,
 )
+_ONE_MORE_THING = re.compile(r"\b(?:one|a) (?:more|last|quick) (?:thing|question)\b", re.IGNORECASE)
 # "I have to be honest, ..." and "I need to be honest with you: ..." are the "honestly" tic.
 _HONEST_CLAUSE = re.compile(
     r"(?:^|(?<=[\s,;-]))(?:i|we)(?:'d| would)?\s+(?:have|need|got|want|ought)\s+to\s+be\s+"
@@ -437,6 +443,15 @@ _HAS_A_SAY = re.compile(
     re.IGNORECASE,
 )
 _WINDOW_END = re.compile(r"[,;.?!]|\bbut\b|\bwhile\b|\bwhich\b", re.IGNORECASE)
+# R1-Q ship de-risk: "talk to / ask / tell" + a family role is a party to the DECISION only when the
+# clause is about deciding ("run it by my sister first", "talk to my mom before I sign up").  "I'll
+# talk to my husband tonight and my sister can babysit" and "I talk to my mom every day" are
+# ordinary sentences, and the card's decider line must not replace them.
+_DECISION_CUE = re.compile(
+    r"\b(?:first|before|decid\w*|decision|sign(?:s|ed)? off|agree\w*|approv\w*|on board|"
+    r"commit\w*|go ahead|ok(?:ay)? it|blessing|weigh in|have a say)\b",
+    re.IGNORECASE,
+)
 
 
 def _own_roles(decision_maker: str) -> frozenset[str]:
@@ -448,8 +463,10 @@ def names_another_party(sentence: str, decision_maker: str) -> bool:
     """The sentence makes somebody other than the card's decision maker a party to the decision.
 
     "I'd want to run it by my sister first", "talk to my husband and my mom", "my mom usually gets a
-    say too".  A role is a party only after a decision verb (talk to, run it by ...) or beside "a
-    say" and within the same clause, so "my mom watches the kids" is not one.
+    say too".  A role is a party only after a decision verb (talk to, run it by ...) in a clause
+    that is about deciding (``_DECISION_CUE``: "first", "before", "decide", "approve" ...), or
+    beside "a say", and within the same clause, so "my mom watches the kids" and "I talk to my mom
+    every day" are not one.
     """
     own = _own_roles(decision_maker)
     for found in _HAS_A_SAY.finditer(sentence):
@@ -458,7 +475,10 @@ def names_another_party(sentence: str, decision_maker: str) -> bool:
     for verb in _DECISION_VERB.finditer(sentence):
         window = sentence[verb.end() : verb.end() + 70]
         stop = _WINDOW_END.search(window)
-        for role in _ROLE_MENTION.finditer(window[: stop.start()] if stop else window):
+        clause = window[: stop.start()] if stop else window
+        if _DECISION_CUE.search(clause) is None:
+            continue
+        for role in _ROLE_MENTION.finditer(clause):
             if role.group(1).lower() not in own:
                 return True
     return False
@@ -1310,11 +1330,28 @@ def _reopens(sentence: str) -> bool:
     return _DOUBT.search(sentence) is not None and _HOLDS_THE_PLAN.search(sentence) is None
 
 
+# R1-Q ship de-risk: "That's what I heard from a friend." and "Oh, that's better." (about weekend
+# batches) are ordinary sentences.  The two price misread rules below only read a sentence that is
+# about a price: an offer is on the table (``ctx.offer_usd``) or the sentence has a price word.
+_PRICE_TALK_CUE = re.compile(r"\b(?:got it for|paid)\b", re.IGNORECASE)
+
+
+def _price_talk(sentence: str, ctx: GuardContext) -> bool:
+    """Whether ``sentence`` is said in price talk: an offer is on the table, or it names a price."""
+    return (
+        ctx.offer_usd is not None
+        or _PRICE_WORD.search(sentence) is not None
+        or _PRICE_TALK_CUE.search(sentence) is not None
+    )
+
+
 def _iteration_three_misreads(sentence: str, ctx: GuardContext) -> list[Hit]:
     """Misreadings the third live sweep found (hygiene hits: never posted, never a leak)."""
     hits: list[Hit] = []
+    priced = _price_talk(sentence, ctx)
     if (
-        not ctx.fresh_price
+        priced
+        and not ctx.fresh_price
         and _NOT_ABOUT_PRICE.search(sentence) is None
         and (
             _BETTER_PRICE.search(sentence) is not None
@@ -1325,7 +1362,7 @@ def _iteration_three_misreads(sentence: str, ctx: GuardContext) -> list[Hit]:
         )
     ):
         hits.append(_hit(MISREAD, "better_unchanged", sentence))
-    if ctx.offer_usd != 7000 and _HEARD_IN_LINE.search(sentence) is not None:
+    if priced and ctx.offer_usd != 7000 and _HEARD_IN_LINE.search(sentence) is not None:
         hits.append(_hit(MISREAD, "heard_in_line", sentence))
     if ctx.hollow and CLOSER.search(sentence) is not None:
         hits.append(_hit(MISREAD, "closer_again", sentence))
@@ -1776,7 +1813,10 @@ class StreamGuard:
             text = _BEFORE_I_GO.sub("", text, count=1)
         elif _ASIDE_BEFORE_I_GO.search(text) is not None:
             text = _ASIDE_BEFORE_I_GO.sub(",", text, count=1)
-        elif _TAIL_BEFORE_I_GO.search(text) is not None:
+        elif (
+            _ONE_MORE_THING.search(text) is not None
+            and _TAIL_BEFORE_I_GO.search(text) is not None
+        ):
             text = _TAIL_BEFORE_I_GO.sub("", text, count=1)
         if STRETCH_PHRASE.search(text) is not None:
             used = self._phrase_count(PHRASE_STRETCH)

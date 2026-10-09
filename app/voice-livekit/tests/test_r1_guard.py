@@ -2013,8 +2013,40 @@ class IterationThreeGuardTests(unittest.TestCase):
                 self.assertEqual(below.text, ANCHOR_HEARD_BELOW)
                 other = guard_text(text, self.ctx(offer_usd=7500))
                 self.assertEqual(other.text, ANCHOR_HEARD_REPLACEMENT)
-                none = guard_text(text, self.ctx())
-                self.assertEqual(none.text, ANCHOR_HEARD_REPLACEMENT)
+        # Without a price on the table the rule needs a price word in the sentence itself (ship
+        # de-risk): "got it for" and "figure" name one, the bare "in line with what I'd heard" does not.
+        for text in (
+            "That lines up with what I'd heard people got it for, so no surprise there.",
+            "That figure's roughly in line with what I heard.",
+        ):
+            with self.subTest(text=text, offer="none"):
+                self.assertEqual(guard_text(text, self.ctx()).text, ANCHOR_HEARD_REPLACEMENT)
+        bare = "That's in line with what I'd heard, so I'm not shocked."
+        self.assertEqual(guard_text(bare, self.ctx()).text, bare)
+
+    def test_non_price_sentences_are_not_read_as_price_misreads(self):
+        """Ship de-risk: only a sentence about a price is replaced with a canned price line."""
+        for text in (
+            "That's what I heard from a friend.",
+            "That's about what I heard about the workload.",
+            "That lines up with what I'd heard from a colleague.",
+            "Oh, that's better.",
+            "That sounds better for someone like me.",
+            "That's much better.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx()).text, text)
+        # With a price on the table the same words are still caught.
+        from r1_guard import PRICE_UNCHANGED_REPLACEMENT
+
+        self.assertEqual(
+            guard_text("That's a bit better.", self.ctx(offer_usd=7500)).text,
+            PRICE_UNCHANGED_REPLACEMENT,
+        )
+        self.assertEqual(
+            guard_text("That's a bit better than I expected.", self.ctx()).text,
+            PRICE_UNCHANGED_REPLACEMENT,
+        )
 
     def test_in_line_with_what_i_heard_is_true_at_seven_thousand(self):
         text = "That's right at what I'd heard people got it for."
@@ -2180,6 +2212,19 @@ class FinalReviewRoundOneGuardTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(guard_text(text, self.ctx()).text, expected)
 
+    def test_a_sentence_final_before_i_leave_is_the_learners_own_plan(self):
+        """Ship de-risk: the tail strip is for "one more question before I go", nothing else."""
+        for text in (
+            "I'd need to get my visa sorted before I leave.",
+            "I'd want a job lined up before I leave.",
+            "I need to save some money before I go.",
+            "I'd want to finish the first module before we wrap up.",
+            "I have to move my savings around before I go.",
+            "I do have one more thing to ask before I leave.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx(free_reply=True)).text, text)
+
     # --- major: owner point 3, co-decider facts stay consistent
     DENIALS = (
         "Honestly it's really up to me in the end.",
@@ -2219,6 +2264,32 @@ class FinalReviewRoundOneGuardTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertTrue(guard_text(text, self.ctx(free_reply=True)).clean, text)
+
+    def test_ordinary_family_sentences_are_not_a_second_decider(self):
+        """Ship de-risk: a family role after "talk to / ask" is a party only in a clause about deciding."""
+        for text in (
+            "I'll talk to my husband tonight and my sister can babysit.",
+            "I talk to my mom every day, so she already knows about this.",
+            "I'd ask my sister to cover the school run on Thursdays.",
+            "Talking to my parents last night helped me think about the schedule.",
+            "I can tell my mom about the batch dates over the weekend.",
+            "I'd show my brother the curriculum for fun.",
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx(free_reply=True))
+                self.assertEqual(result.text, text, result.hits)
+
+    def test_a_second_decider_in_a_deciding_clause_is_still_replaced(self):
+        for text in (
+            "I'd want to run it by my sister first.",
+            "I'd talk to my mom before I sign up for anything.",
+            "I'd ask my brother to approve it.",
+            "I'd have to check with my parents before deciding.",
+            "My mom usually gets a say too.",
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx(free_reply=True))
+                self.assertEqual(result.text, self.P1.decider_answer)
 
     def test_the_decider_is_whoever_the_persona_card_says(self):
         own = guard_text("I'd talk to my dad first.", self.ctx(self.P2))

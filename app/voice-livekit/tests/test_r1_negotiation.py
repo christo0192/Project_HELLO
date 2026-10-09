@@ -107,6 +107,14 @@ CALL_PITCHES = (
     "You can book a slot with a mentor, right?",
     "Want to know the best part? We schedule a career coaching session in the third month.",
     "Want the link? We will send you the link to the live class on Monday.",
+    # ship de-risk: the programme's own schedule that ends in a fit check proposes no call
+    "Our mentors run a live call every Saturday, would that work with your schedule?",
+    "Live sessions are Tuesday and Thursday at 8 PM, would that work for you?",
+    "Mentor sessions are every Wednesday at 9 PM, does that time work for you?",
+    "We do a live coding call on Saturdays, is that good for you?",
+    "Office hours run Friday evenings, would that work with your kids' routine?",
+    "The weekly check-in is on Monday evenings, is that okay with your job?",
+    "The capstone review call is on Thursdays, is that fine for you?",
 )
 EMAIL_PITCHES = (
     "We'll send you the schedule once you enroll.",
