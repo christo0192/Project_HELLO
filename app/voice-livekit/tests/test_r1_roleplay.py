@@ -1286,7 +1286,9 @@ class RobustnessTests(unittest.TestCase):
         started = time.perf_counter()
         eng.plan_turn("word " * 20000, 20.0)
         eng.plan_turn("a." * 20000, 70.0)
-        self.assertLess(time.perf_counter() - started, 5.0)
+        # Catastrophic-backtracking guard, not a latency budget: 1 to 2 s on an idle box, 6 s on a
+        # loaded one (ship-gate round 1), linear in the text.
+        self.assertLess(time.perf_counter() - started, 15.0)
 
 
 class PriceWrapThroughTheEngineTests(unittest.TestCase):
@@ -3274,6 +3276,47 @@ class SchedulePitchThroughTheEngineTests(unittest.TestCase):
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         plan = session.say("Since mornings don't work, when's better for a quick call?", r - 20)
         self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+
+
+class ResourceLinkThroughTheEngineTests(unittest.TestCase):
+    """R1-Q ship-gate round 1: an offer of a link to a resource is not an ask to pay.
+
+    Read as one, the close window earned the scripted STRONG "Send me the enrolment link and I'll pay the
+    deposit today" for an advisor who had only offered the alumni reviews (12 of 14 resource links, 5 of
+    7 "send it so you can decide" sends).  Main reads 1 of 14 and 0 of 7.
+    """
+
+    NOT_ASKS = (
+        "I'll email you the link to our alumni reviews.",
+        "I can share the link to the curriculum page right now.",
+        "I'll text you the page with the batch timings.",
+        "I'll send everything over so you can decide with your husband.",
+        "I'd recommend you join our free webinar this week.",
+    )
+
+    def test_an_offer_of_a_resource_link_earns_no_commitment_in_the_close_window(self):
+        for text in self.NOT_ASKS:
+            with self.subTest(text=text):
+                session, r = run_cooperative(40.0)
+                session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+                plan = session.say(text, r - 20)
+                self.assertIsNone(plan.commitment_level, plan.reasons)
+                self.assertEqual(session.eng.admin_log()["commitment"]["asks"], [])
+                self.assertNotIn("enrolment link", session.spoken[-1].lower())
+
+    def test_an_early_offer_of_a_resource_link_is_not_a_pending_ask(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say("By the way, I'll email you the link to our alumni reviews after this call.", 200)
+        self.assertNotIn("ask_before_close_window", plan.reasons)
+        self.assertFalse(any(r.startswith("stall_reason") for r in plan.reasons), plan.reasons)
+        self.assertIsNone(s.eng._pending_ask)
+
+    def test_a_real_payment_link_ask_is_still_answered_as_one(self):
+        session, r = run_cooperative(40.0)
+        session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+        plan = session.say("Shall I send you the payment link now?", r - 20)
+        self.assertIsNotNone(plan.commitment_level, plan.reasons)
 
 
 class SituationNotesThroughTheEngineTests(unittest.TestCase):

@@ -122,16 +122,29 @@ export const R1_NAME_MASK = '[CANDIDATE]';
  * tough for me, ...", "Call me back after ...", "I'll read through the email and ..."), so a frame
  * that starts the sentence, or the whole "I'll pay the deposit", hides the level and nothing else.
  * The sentence is tested trimmed.
+ *
+ * R1-Q ship-gate round 1: the frames are anchored to the scripted CONTINUATION as well, because
+ * the ship de-risk frames still hid 12 of 15 ordinary sentences ("Daytime is tough for me, I work
+ * nine to six.", "Call me back after five, that works better.", "I'll read through the email and
+ * let you know if I have questions.", "Send me the enrolment form when it is ready.", "If the
+ * numbers work out, I'll pay the deposit next month."), and the scorer is told that a placeholder
+ * is the learner's own commitment response. A barge-in that cuts a line short ("Call me back
+ * after", "Daytime is tough for me,") ends the sentence without punctuation, so the bare opening
+ * is masked only when it is the whole sentence.
  */
 const COMMITMENT_PATTERNS: readonly RegExp[] = [
-  /^(?:okay, let['’]?s do it\.\s*)?send me the enrol+ment\b/i,
-  /\bI['’]?ll pay the deposit\b/i,
+  /^send me the enrol+ment link\b/i,
+  /^send me the enrol+ment\s*$/i,
+  /\bI['’]?ll pay the deposit today\b/i,
   /book a call\b[^.!?]*\bso we can decide/i,
   /\blet['’]?s book a call\b/i,
-  /^daytime is tough for me,/i,
-  /\bemail me the details\b/i,
-  /^call me back after\b/i,
-  /^I['’]?ll read through the e-?mail(?: and\b|[.!?]?\s*$)/i,
+  /^daytime is tough for me, so\b/i,
+  /^daytime is tough for me,?\s*$/i,
+  /^just email me the details\b/i,
+  /^call me back after I['’]?ve\b/i,
+  /^call me back after(?: I)?\s*$/i,
+  /^I['’]?ll read through the e-?mail and get\b/i,
+  /^I['’]?ll read through the e-?mail(?: and)?\s*$/i,
 ];
 
 const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/;

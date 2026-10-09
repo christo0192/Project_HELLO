@@ -357,21 +357,6 @@ _TIME_TOPIC = re.compile(
     r"\b(?:time|schedule|hours?|weeks?|months?|busy|packed|work|job|evenings?|weekends?)\b",
     re.IGNORECASE,
 )
-# "That still sounds like a lot per month" when the advisor never gave a monthly figure.
-_MONTHLY_REACTION = re.compile(
-    r"\b(?:per month|a month|each month|every month|monthly|/month)\b", re.IGNORECASE
-)
-_STRAIN_PRICE_WORDS = re.compile(
-    r"\b(?:a lot|too much|steep|stretch|expensive|pricey|heavy|big number)\b", re.IGNORECASE
-)
-# An advisor turn that gives a monthly figure (an amount next to "a month") or one that is just
-# about monthly instalments.
-MONTHLY_FIGURE = re.compile(
-    r"\$\s?\d[\d,.]*\s*(?:k\s*)?(?:a|per|each|every|/)\s*(?:month|mo\b)"
-    r"|\b(?:monthly|per month|a month|each month|every month)\b[^.?!]{0,30}\$\s?\d"
-    r"|\$\s?\d[\d,.]*[^.?!]{0,20}\b(?:monthly|per month|a month|each month|every month)\b",
-    re.IGNORECASE,
-)
 # The decision maker stays the persona's whole call ("it's just me deciding" is the contradiction).
 _DECIDES_ALONE = re.compile(
     r"\b(?:it'?s|it is|its) (?:just|only) me\b[^.?!]{0,25}\b(?:decid\w+|decision|who decides)\b"
@@ -484,17 +469,27 @@ def names_another_party(sentence: str, decision_maker: str) -> bool:
     return False
 
 
-def decider_contradiction(sentence: str, decision_maker: str) -> bool:
+def decider_contradiction(sentence: str, decision_maker: str, *, asked: bool = False) -> bool:
     """Whether ``sentence`` contradicts the persona's decision maker (see ``_DENIES_DECIDER``).
 
     A denial that comes with a plain intention to talk to the card's own decision maker ("I'd talk
     to my husband first, but ultimately it's my call") is not one.
+
+    Ship-gate round 1: ``_DECIDER_STEPS_BACK`` and ``_DENIES_DECIDER`` read ordinary talk about the
+    decision maker as a denial ("My husband wouldn't mind if I studied on weekends.", "He trusts me
+    to figure out the schedule", "It's my call which batch I join"; 19 of 25 ordinary sentences
+    were replaced by the card line or, a turn later, by a thinking filler, against 0 on main).  They
+    read a sentence only when the advisor has just asked who else decides (``asked``), the one place
+    where the answer is the card's.  "It's just me deciding" (``_DECIDES_ALONE``) and a second
+    decision maker named in a deciding clause (``names_another_party``) hold anywhere.
     """
     if _DECIDES_ALONE.search(sentence) is not None:
         return True
-    if _DECIDER_STEPS_BACK.search(sentence) is not None:
-        return True
     if names_another_party(sentence, decision_maker):
+        return True
+    if not asked:
+        return False
+    if _DECIDER_STEPS_BACK.search(sentence) is not None:
         return True
     if _DENIES_DECIDER.search(sentence) is None:
         return False
@@ -955,13 +950,12 @@ class GuardContext:
     # R1-Q iteration 2.  Whether each of the learner's last replies held a question (oldest first),
     # how often each tracked phrase tic was already used in the call (``(key, count)`` pairs, see
     # ``r1_text.reply_phrases``), whether this is a free reply (the question diet applies; an
-    # intent reply is built around a question of its own), the hours-a-week figures the advisor
-    # said (the learner may repeat them), and whether the advisor ever gave a monthly figure.
+    # intent reply is built around a question of its own) and the hours-a-week figures the advisor
+    # said (the learner may repeat them).
     recent_questions: tuple[bool, ...] = ()
     phrase_counts: tuple[tuple[str, int], ...] = ()
     free_reply: bool = False
     advisor_hours: frozenset[float] = frozenset()
-    monthly_stated: bool = False
     # R1-Q iteration 3.  The advisor's turn put a LOWER price on the table than any before it ("a
     # bit better" is only true then); the advisor said (almost) nothing after the learner's last
     # goodbye (a second goodbye is dropped); the advisor asked who else decides (the answer is
@@ -1258,19 +1252,25 @@ _MONEY_CUE = re.compile(
 # "a few hundred a month" / "a couple of thousand" name no amount: the persona's own budget
 # answer is "around $500-700 a month", and a vague quantity of hundreds is the same thing said
 # loosely (R1-Q iteration 3: the sentence was dropped as an amount off the card, and the H3 need
-# with it).
+# with it).  Ship-gate round 1: "a couple hundred" and "over a hundred" are as vague.
 _VAGUE_QUANTITY = re.compile(
-    r"\b(?:a few|a couple of|couple of|several|some|a handful of|many|a lot of) "
-    r"(?:hundred|thousand)\b",
+    r"\b(?:(?:a few|(?:a )?couple(?: of)?|several|some|a handful of|many|a lot of) "
+    r"(?:hundred|thousand)|(?:over|more than) (?:a|one) (?:hundred|thousand))\b",
     re.IGNORECASE,
 )
 
 
 def _amounts_spoken(sentence: str) -> list[int]:
-    """Whole-dollar amounts in ``sentence``, written or (next to a money word) spelled out."""
+    """Whole-dollar amounts in ``sentence``, written or (next to a money word) spelled out.
+
+    A spelled number is money only next to a money word, not whenever the sentence holds one
+    anywhere (ship-gate round 1: "I've applied to over a hundred jobs and I'm paying for my own
+    prep." is the persona's own card, and was blocked as an invented amount that counts toward the
+    three-hit gate; main speaks it and posts nothing).
+    """
     sentence = _VAGUE_QUANTITY.sub(" ", sentence)
     if _MONEY_CUE.search(sentence):
-        return dollar_amounts(canonical_amounts(sentence))
+        return dollar_amounts(canonical_amounts(sentence, money_cue=_MONEY_CUE))
     return dollar_amounts(sentence)
 
 
@@ -1279,10 +1279,22 @@ def _amounts_spoken(sentence: str) -> list[int]:
 MISREAD_MAX_CHARS = 1200
 
 
-def _iteration_two_misreads(sentence: str, ctx: GuardContext, question: bool) -> list[Hit]:
-    """Misreadings the second live sweep found (hygiene hits: never posted, never a leak)."""
+def _iteration_two_misreads(sentence: str, ctx: GuardContext) -> list[Hit]:
+    """Misreadings the second live sweep found (hygiene hits: never posted, never a leak).
+
+    Ship-gate round 1 took out ``monthly_unstated`` ("That still sounds like a lot per month" when
+    no monthly figure was named): with a bare "a lot" as a strain word it replaced the learner's
+    reaction to an instalment offer ("Yes, monthly payments would help a lot.": 6 of 6 natural
+    replies, 0 on main) with a thinking filler, right after the advisor handled the objection.
+    """
     hits: list[Hit] = []
-    if ctx.persona is not None and _DECIDER_UNWILLING.search(sentence) is not None:
+    # Like the denials of the decision maker, only as the answer to "who else decides?" (ship-gate
+    # round 1: "My husband isn't a fan of long phone calls, but he'd join this one." was dropped).
+    if (
+        ctx.persona is not None
+        and ctx.decider_asked
+        and _DECIDER_UNWILLING.search(sentence) is not None
+    ):
         hits.append(_hit(MISREAD, "decider_unwilling", sentence))
     if _HEARSAY.search(sentence) is not None:
         # The $9,000 is on the website, so "I heard it is about $9,000" is the card, not hearsay.
@@ -1300,14 +1312,6 @@ def _iteration_two_misreads(sentence: str, ctx: GuardContext, question: bool) ->
         and _TIME_TOPIC.search(sentence) is None
     ):
         hits.append(_hit(MISREAD, "strain_after_met", sentence))
-    if (
-        not ctx.monthly_stated
-        and not question
-        and _MONTHLY_REACTION.search(sentence) is not None
-        and _STRAIN_PRICE_WORDS.search(sentence) is not None
-        and re.search(r"\b(?:500|700)\b", sentence) is None
-    ):
-        hits.append(_hit(MISREAD, "monthly_unstated", sentence))
     return hits
 
 
@@ -1416,10 +1420,10 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     if persona is not None and len(sentence) <= MISREAD_MAX_CHARS:
         if _DECIDES_ALONE.search(sentence) is not None:
             hits.append(_hit(MISREAD, "decider_alone", sentence))
-        elif decider_contradiction(sentence, persona.decision_maker):
+        elif decider_contradiction(sentence, persona.decision_maker, asked=ctx.decider_asked):
             hits.append(_hit(MISREAD, "decider_contradicted", sentence))
     if len(sentence) <= MISREAD_MAX_CHARS:
-        hits.extend(_iteration_two_misreads(sentence, ctx, question))
+        hits.extend(_iteration_two_misreads(sentence, ctx))
     if ctx.nothing_granted and _GRANT_GRATITUDE.search(sentence) is not None:
         hits.append(_hit(MISREAD, "gratitude_for_nothing", sentence))
     if (ctx.offer_usd is None or ctx.offer_usd > 7000) and _anchor_taken_as_offer(sentence, ctx):

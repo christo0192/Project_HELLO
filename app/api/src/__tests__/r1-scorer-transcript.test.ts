@@ -223,6 +223,29 @@ describe('masking', () => {
     }
   });
 
+  it('keeps ordinary learner speech visible even when it opens like a scripted wording (ship-gate round 1)', () => {
+    // The scorer is told that a placeholder is the learner's own commitment response, so a hidden
+    // ordinary sentence would read to it as a close response.
+    for (const text of [
+      'Daytime is tough for me, I work nine to six.',
+      'Daytime is tough for me, especially on weekdays.',
+      'Daytime is tough for me.',
+      'Call me back after five, that works better.',
+      'Call me back after the weekend, please.',
+      "I'll read through the email.",
+      "I'll read through the email and let you know if I have questions.",
+      'Send me the enrolment form when it is ready.',
+      'Send me the enrolment requirements too.',
+      "If the numbers work out, I'll pay the deposit next month.",
+      "I'll pay the deposit when my husband agrees.",
+      'Can you just email me the details first?',
+      'Can you just email me the details of the March batch?',
+    ]) {
+      expect(maskCommitmentLines(text), text).toBe(text);
+      expect(maskCommitmentLines(`Okay. ${text}`), text).toBe(`Okay. ${text}`);
+    }
+  });
+
   it('still masks the scripted wordings when the sentence is padded with whitespace', () => {
     expect(maskCommitmentLines("  Send me the enrolment link and I'll pay the deposit today.")).toBe(
       R1_COMMITMENT_MASK,

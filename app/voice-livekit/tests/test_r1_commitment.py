@@ -798,5 +798,121 @@ class ShipDeriskDetectorTests(unittest.TestCase):
                 self.assertIsNotNone(module.call_proposal_in(self.CALL_PROPOSALS[0]))
 
 
+class ShipGateRoundOneDetectorTests(unittest.TestCase):
+    """R1-Q ship-gate round 1: a link to a RESOURCE, or a send "so you can decide", is no enrolment ask.
+
+    Read as one, the learner spoke the scripted STRONG line ("Send me the enrolment link and I'll pay
+    the deposit today") in the close window without being asked to pay (12 of 14 resource links and 5
+    of 7 "send it so you can decide" sends; main 1 of 14 and 0 of 7).  A bare link, form or page is an
+    ask only with main's verb, "send"; an invoice is one whoever sends it; "so you can decide / review
+    / confirm it" is not the learner acting.
+    """
+
+    RESOURCE_LINKS = (
+        "I'll email you the link to our alumni reviews.",
+        "I can share the link to the curriculum page right now.",
+        "I'll text you the page with the batch timings.",
+        "Let me text you the link to our free webinar recording.",
+        "I'll share the link to the sample class video with you.",
+        "I'll drop you the link to our YouTube channel so you can see the instructors.",
+        "I'll forward you the link to the curriculum page.",
+        "I'll WhatsApp you the link to the course brochure.",
+        "I'll email you the page with the syllabus.",
+        "I'll text you the form for the free career assessment.",
+        "Let me forward you the form for the free resume review.",
+        "I'll give you the link to our LinkedIn page so you can see alumni.",
+        "I'll email you a page that compares our plans.",
+        "I'll shoot you the link to the reviews on Course Report.",
+        "I'll share the form your husband can use to send us questions.",
+        "I'll drop the link to our YouTube channel in the chat.",
+        "I'll send over the link to the free webinar recording.",
+        "Let me send you the link to the free demo class.",
+        "Would you like me to text you the link to the demo?",
+    )
+    DECIDE_SENDS = (
+        "I'll send everything over so you can decide with your husband.",
+        "I'll send it over so you can review it with your husband.",
+        "I'll email it to you so you can go through it and decide.",
+        "Let me share this so you can review it in your own time.",
+        "I'll forward everything to you so you can confirm the dates.",
+        "I'll text it to you and you can decide later.",
+        "I'll send the details over so you two can decide together.",
+    )
+    RECOMMENDS = (
+        "I'd recommend you join our free webinar this week.",
+        "I'd suggest you register for the free masterclass tomorrow.",
+    )
+    REAL_ASKS = (
+        "Shall I send you the payment link now?",
+        "Would you like me to email you the enrolment form?",
+        "Can I text you the link to pay the deposit?",
+        "I'll send you the link, and you can lock your seat today.",
+        "I'll email you the invoice now.",
+        "I'll send it over so you can sign today.",
+        "I would suggest you enroll tomorrow.",
+    )
+
+    def test_a_link_to_a_resource_or_a_send_to_decide_is_not_an_enrolment_ask(self):
+        from r1_commitment import ask_acts
+
+        for text in (*self.RESOURCE_LINKS, *self.DECIDE_SENDS, *self.RECOMMENDS):
+            with self.subTest(text=text):
+                self.assertNotIn(AskKind.ENROL, ask_acts(text), text)
+                self.assertIsNone(detect_ask(text), text)
+
+    def test_the_real_asks_are_still_asks(self):
+        from r1_commitment import ask_acts
+
+        for text in self.REAL_ASKS:
+            with self.subTest(text=text):
+                self.assertIn(AskKind.ENROL, ask_acts(text), text)
+
+
+class ShipGateRoundOneConditionalTests(unittest.TestCase):
+    """R1-Q ship-gate round 1: only the learner's OWN decision frame is exempt from a commitment level.
+
+    "If you send the link today, I'll pay the deposit" is a conditional offer to commit and keeps the
+    level it has on main: the guard must see it (a STRONG out of level is a posted hit), where the
+    iteration-3 exemption let it through on every condition.
+    """
+
+    OWN_DECISION = (
+        "I'll reach out if I decide I want to move forward.",
+        "I'll reach out if I decide to go ahead.",
+        "If it makes sense, I'll enrol.",
+        "Once I've talked to him, I'll sign up.",
+        "Whenever I'm ready, let's do it.",
+        "If Thursday works for you, great.",
+        "When I'm ready I want to join the next cohort.",
+    )
+    STILL_A_COMMITMENT = (
+        ("If you send the link today, I'll pay the deposit.", Level.STRONG),
+        ("As soon as you send the link, I'll enrol.", Level.STRONG),
+        ("If it's $7,500, count me in.", Level.STRONG),
+        ("If my husband agrees, sign me up.", Level.STRONG),
+        ("Once you confirm the discount, let's do it.", Level.STRONG),
+        ("If you can hold the price, I'm ready to pay.", Level.STRONG),
+        ("If Saturday at 11 is okay, let's book a call.", Level.MEDIUM),
+        ("If that works for my husband, let's book a call on Saturday.", Level.MEDIUM),
+        ("If you can do $7,000, I'll sign up today.", Level.STRONG),
+        ("When you send the link, I'll pay the deposit.", Level.STRONG),
+    )
+
+    def test_the_learners_own_decision_commits_to_nothing(self):
+        for text in self.OWN_DECISION:
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), Level.NONE, text)
+
+    def test_a_condition_the_advisor_or_the_decider_can_meet_keeps_its_level(self):
+        for text, level in self.STILL_A_COMMITMENT:
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), level, text)
+
+    def test_the_weak_stall_with_an_own_condition_is_still_the_stall(self):
+        self.assertEqual(
+            classify_learner_commitment("If I decide, I'll get back to you."), Level.WEAK
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

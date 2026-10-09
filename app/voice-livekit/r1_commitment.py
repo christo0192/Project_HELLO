@@ -322,9 +322,10 @@ _INFO_AFTER = re.compile(
 # information send, not a call (R1-Q ship de-risk: it was read as a call proposal in the close
 # window and booked a call at the farewell; the production detector reads it as nothing).
 _MESSAGE_YOU = re.compile(r"\b(?:text|message|whatsapp|ping)(?:ing)? you$", re.IGNORECASE)
+# (Ship-gate round 1: a link, a page or a form is information too: "text you the link to the demo".)
 _INFO_DIRECT = re.compile(
     r"^\s+(?:the |your |all (?:the |your )?|those |these |some |more |a |an |any |over |across |"
-    r"out )*(?:[\w-]+ ){0,2}" + _INFO_NOUN + r"\b",
+    r"out )*(?:[\w-]+ ){0,2}(?:" + _INFO_NOUN + r"|links?|pages?|forms?)\b",
     re.IGNORECASE,
 )
 # Questions ABOUT the programme or knowledge questions: "Did you know you can book ...?".
@@ -351,8 +352,8 @@ _MAX_SENTENCE = 700
 _CLASS_LOGISTICS_AFTER = (
     r"(?!\s+(?:to|for|of)\s+(?:(?:join|attend|access|watch|view|open|enter)\s+)?"
     r"(?:the |your |our |every |each |all )?(?:live |recorded |weekly |"
-    r"online |upcoming |first )?(?:class|classes|session|sessions|lecture|lectures|webinars?|"
-    r"workshops?|zoom|meeting|demo|orientation|induction|community|group|slack|discord|"
+    r"online |upcoming |first |free |sample )?(?:class|classes|session|sessions|lecture|lectures|"
+    r"webinars?|workshops?|zoom|meeting|demo|orientation|induction|community|group|slack|discord|"
     r"whatsapp|mentors?|recordings?|materials?|notes|batch|cohort)\b)"
 )
 
@@ -948,11 +949,20 @@ _ENROL_ASK = _compile(
     r"(?:^|[,;] ?)(?:(?:and|but|so|then|now|just|please|okay|ok) )*(?:go ahead and |please )?"
     r"(?:complete|finali[sz]e|make|do|submit) (?:the |your |that |this )?(?:payment|registration|"
     r"enrol+ment|booking|deposit|application)\b" + _NOT_INFORMATION,
-    r"\b" + _ENROL_VERB_SEND + r"\b(?: (?:you|me|him|her|them|over|across|out))?"
+    # A bare link, form or page is an ask only with main's verb, "send" ("send me the link"): any
+    # other verb is information far more often ("I'll email you the link to our alumni reviews",
+    # "I can share the link to the curriculum page", "text you the page with the batch timings";
+    # ship-gate round 1: 12 of 14 such sends read as an enrolment ask and earned the scripted STRONG
+    # line, against 1 of 14 on main).  An invoice is the thing to pay whoever sends it.
+    r"\bsend\b(?: (?:you|me|him|her|them|over|across|out))?"
     r"(?: (?:the|a|an|your|that|this|it))? ?" + _LINK + r"\b" + _CLASS_LOGISTICS_AFTER,
+    r"\b" + _ENROL_VERB_SEND + r"\b(?: (?:you|me|him|her|them|over|across|out))?"
+    r"(?: (?:the|a|an|your|that|this|it))? ?invoice\b" + _CLASS_LOGISTICS_AFTER,
+    # "send it over so you can sign": the learner ACTS on it.  "so you can decide / confirm /
+    # review it" is the advisor sending something to read ("I'll send everything over so you can
+    # decide with your husband"), not an ask (ship-gate round 1: 5 of 7 read as one, main 0 of 7).
     r"\b" + _ENROL_VERB_SEND + r" (?:it|that|this|everything) (?:over |across |out )?"
-    r"(?:so|and|to)\b[^.?!]{0,30}\b(?:decide|sign|enrol+|lock|confirm|review it|pay|reserve|"
-    r"secure)\b",
+    r"(?:so|and|to)\b[^.?!]{0,30}\b(?:sign|enrol+|lock|pay|reserve|secure)\b",
     r"\b(?:sign(?:ing)?|enrol+(?:ing)?|register(?:ing)?) (?:you|me) "
     r"(?:up|in|enrolled|registered|started|onboard)\b",
     r"\benrol+ (?:you|me)\b",
@@ -974,9 +984,10 @@ _ENROL_ASK = _compile(
     r"^\W*(?:the |a )?(?:payment |deposit |enrol+ment |instal+ment )?link(?: now| today)?\W*$",
     r"(?:^\W*(?:and |so |okay |ok )*|\b(?:do you|would you) )(?:want|take|grab|accept|like) "
     r"(?:the |this |that )?(?:\$\d[\d,]* )?(?:deal|offer)\b",
-    # a recommendation to enrol at a time ("I would suggest you enroll tomorrow")
+    # a recommendation to enrol at a time ("I would suggest you enroll tomorrow"); not "join": "I'd
+    # recommend you join our free webinar this week" invites a class, not a seat (ship-gate round 1)
     r"\b(?:suggest|recommend|advise|urge|encourage)\w* (?:that )?(?:you|we) (?:to )?(?:enrol+|"
-    r"sign up|register|join|go ahead|pay|get you (?:enrolled|signed up|registered|started))\b"
+    r"sign up|register|go ahead|pay|get you (?:enrolled|signed up|registered|started))\b"
     r"[^.?!]{0,25}\b(?:today|tomorrow|now|tonight|right away|immediately|this week)\b",
 )
 # The first match of these is NOT an enrolment even in an ask frame: class logistics.
@@ -1183,20 +1194,39 @@ _WEAK = _compile(
 # break (comma, full stop, "but") ends the reach, so "I can't do Tuesday, but Thursday works" keeps
 # its Thursday.
 _NEGATION_REACH_WORDS = 10
-# A commitment that hangs on a condition is not made yet (R1-Q iteration 3): "I'll reach out if I
-# decide I want to move forward" holds the words of an enrolment ("I want to move forward") and
-# commits to nothing, and it was graded STRONG and failed a live call as a guard hit.
-_CONDITION_FRAME = re.compile(
-    r"\b(?:if|when|whenever|once|unless|in case|as soon as|until|provided|supposing|suppose|"
-    r"should i decide)\b",
-    re.IGNORECASE,
+# A commitment that hangs on the learner's OWN decision is not made yet (R1-Q iteration 3): "I'll
+# reach out if I decide I want to move forward" holds the words of an enrolment ("I want to move
+# forward") and commits to nothing, and it was graded STRONG and failed a live call as a guard hit.
+# Ship-gate round 1: only that kind of condition is exempt.  A condition the advisor can meet ("if
+# you send the link today, I'll pay the deposit", "once you confirm the discount, let's do it"), a
+# price ("if it's $7,500, count me in") or the decider's approval ("if my husband agrees, sign me
+# up") is a real, conditional offer to commit, and it keeps the level it has on main: the learner
+# must not speak STRONG or MEDIUM out of its level, and the guard counts it only if it is graded.
+_CONDITION_WORD = (
+    r"(?:if|when|whenever|once|unless|in case|as soon as|until|provided|supposing|suppose)"
 )
+_OWN_DECISION = (
+    r"(?:(?:i|we)(?:'ve| have| had)? (?:decid\w*|chose|choose|talked|spoken|discussed|checked|"
+    r"thought|had a chance|made up)\b"
+    r"|(?:i|we)(?:'m| am|'re| are) (?:ready|sure|convinced|comfortable)\b"
+    r"|it (?:all )?makes sense\b)"
+)
+_CONDITION_FRAME = re.compile(
+    r"\b" + _CONDITION_WORD + r"\s+" + _OWN_DECISION + r"|\bshould i decide\b", re.IGNORECASE
+)
+# "If Thursday works for you, great.": the commitment words ARE the condition (nothing sits between
+# the condition word and them), so the sentence asks and commits to nothing.
+_CONDITION_IS_THE_PHRASE = re.compile(r"\b" + _CONDITION_WORD + r"\s*$", re.IGNORECASE)
 
 
 def _conditional_before(lowered: str, pos: int) -> bool:
-    """True when a condition word opens the stretch of the sentence before ``pos``."""
+    """True when the learner's own condition opens the stretch of the sentence before ``pos``."""
     start = max(lowered.rfind(mark, 0, pos) for mark in ".?!") + 1
-    return _CONDITION_FRAME.search(lowered[start:pos]) is not None
+    before = lowered[start:pos]
+    return (
+        _CONDITION_FRAME.search(before) is not None
+        or _CONDITION_IS_THE_PHRASE.search(before) is not None
+    )
 
 
 def _affirms(
@@ -1207,8 +1237,8 @@ def _affirms(
     "And ten tomorrow won't work" and "I don't think tomorrow works" contain the words of an
     agreement ("tomorrow ... works") and mean the opposite (R1-Q iteration 2: both were graded
     MEDIUM and flagged the live call).  A negator inside the match, or earlier in the same clause,
-    turns the phrase round.  So does a condition earlier in the sentence ("if I decide I want to
-    move forward"), unless ``conditional_ok``.
+    turns the phrase round.  So does the learner's own condition earlier in the sentence ("if I
+    decide I want to move forward", ``_CONDITION_FRAME``), unless ``conditional_ok``.
     """
     for pattern in patterns:
         for match in pattern.finditer(lowered):

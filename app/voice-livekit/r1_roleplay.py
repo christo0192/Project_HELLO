@@ -99,7 +99,6 @@ from r1_commitment import (
 )
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
 from r1_guard import (
-    MONTHLY_FIGURE,
     QUESTION_DIET_WINDOW,
     REPEAT,
     GuardContext,
@@ -368,15 +367,13 @@ class RolePlayEngine:
         self._pending_ask: AskKind | None = None
         self._nothing_granted = False
         # R1-Q iteration 2.  Whether each reply held a question and how often each tracked phrase
-        # tic was used (the guard's question diet and phrase quotas); the hours-a-week figures and
-        # the monthly figure the advisor gave (the learner may repeat the first, and must not
-        # react to a monthly amount nobody named); what the advisor already answered; the moves
+        # tic was used (the guard's question diet and phrase quotas); the hours-a-week figures the
+        # advisor gave (the learner may repeat them); what the advisor already answered; the moves
         # held back once for a dig; the call ask of the current turn; the price talk of the turn;
         # and whether the learner turned a proposed call down.
         self._asked: list[bool] = []
         self._phrases: dict[str, int] = {}
         self._advisor_hours: set[float] = set()
-        self._monthly_stated = False
         self._answered: list[str] = []
         self._dig_deferred: set[str] = set()
         self._call_ask_now = False
@@ -487,7 +484,6 @@ class RolePlayEngine:
             phrase_counts=tuple(sorted(self._phrases.items())),
             free_reply=free_reply,
             advisor_hours=frozenset(self._advisor_hours),
-            monthly_stated=self._monthly_stated,
             fresh_price=self._fresh_price,
             hollow=self._hollow_run >= 1 and self._last_reply_closer,
             decider_asked=self._decider_asked_now,
@@ -545,8 +541,6 @@ class RolePlayEngine:
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
         self._advisor_amounts.update(advisor_amounts_in(candidate_text))
         self._advisor_hours.update(hours_said(candidate_text))
-        if MONTHLY_FIGURE.search(canonical_amounts(candidate_text)) is not None:
-            self._monthly_stated = True
         self._price_talk = quotes_price(candidate_text)
         for topic in answered_topics(candidate_text):
             if topic not in self._answered:
