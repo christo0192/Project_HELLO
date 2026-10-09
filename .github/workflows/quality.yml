@@ -148,7 +148,7 @@ jobs:
           path: sbom-artifacts/*.cdx.json
           retention-days: 90
       - name: Compile LiveKit worker
-        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/gate_judge.py app/voice-livekit/noise_suppression.py app/voice-livekit/phone.py app/voice-livekit/phone_canary.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py app/voice-livekit/r1_context.py app/voice-livekit/r1_lines.py app/voice-livekit/r1_llm.py app/voice-livekit/r1_persistence.py app/voice-livekit/r1_phases.py app/voice-livekit/r1_routing.py app/voice-livekit/r1_session.py app/voice-livekit/r1_commitment.py app/voice-livekit/r1_content.py app/voice-livekit/r1_guard.py app/voice-livekit/r1_personas.py app/voice-livekit/r1_prompts.py app/voice-livekit/r1_roleplay.py app/voice-livekit/r1_scheduler.py app/voice-livekit/r1_script.py app/voice-livekit/r1_text.py app/voice-livekit/r1_tracker.py app/voice-livekit/r1_world.py app/voice-livekit/r1_replies.py app/voice-livekit/r1_latency.py app/voice-livekit/r1_linecache.py app/voice-livekit/r1_tts.py
+        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/gate_judge.py app/voice-livekit/noise_suppression.py app/voice-livekit/endpointing_phase.py app/voice-livekit/phone.py app/voice-livekit/phone_canary.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py app/voice-livekit/r1_context.py app/voice-livekit/r1_lines.py app/voice-livekit/r1_llm.py app/voice-livekit/r1_persistence.py app/voice-livekit/r1_phases.py app/voice-livekit/r1_routing.py app/voice-livekit/r1_session.py app/voice-livekit/r1_commitment.py app/voice-livekit/r1_content.py app/voice-livekit/r1_guard.py app/voice-livekit/r1_personas.py app/voice-livekit/r1_prompts.py app/voice-livekit/r1_roleplay.py app/voice-livekit/r1_scheduler.py app/voice-livekit/r1_script.py app/voice-livekit/r1_text.py app/voice-livekit/r1_tracker.py app/voice-livekit/r1_world.py app/voice-livekit/r1_replies.py app/voice-livekit/r1_latency.py app/voice-livekit/r1_linecache.py app/voice-livekit/r1_tts.py
       - name: Test LiveKit worker
         run: cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v
       # Phone RNNoise (noise_suppression.py): the bare-python step above SKIPS
@@ -189,6 +189,17 @@ jobs:
           GATE_SDK_CONTRACT_REQUIRED=1 /tmp/ns-venv/bin/python -m unittest tests.test_gate_sdk_contract -v > /tmp/sdk-contract.log 2>&1 || { cat /tmp/sdk-contract.log; exit 1; }
           cat /tmp/sdk-contract.log
           if grep -Eq "\.\.\. skipped|skipped=" /tmp/sdk-contract.log; then echo "::error::gate SDK contract tests skipped"; exit 1; fi
+      # M014 PR-B per-question minimum endpointing: rests on livekit-agents 1.6.4
+      # behaviours the bare-python step stubs away (per-key update_options reaching
+      # the running recognition, the endpointing values read when the commit task
+      # runs, the reply-start silence gate following the live minimum). Checked
+      # against the REAL pinned SDK in the same venv; a skip is a failure.
+      - name: Endpointing real-SDK contract (livekit-agents 1.6.4)
+        run: |
+          cd app/voice-livekit
+          ENDPOINTING_SDK_CONTRACT_REQUIRED=1 /tmp/ns-venv/bin/python -m unittest tests.test_endpointing_sdk_contract -v > /tmp/ep-contract.log 2>&1 || { cat /tmp/ep-contract.log; exit 1; }
+          cat /tmp/ep-contract.log
+          if grep -Eq "\.\.\. skipped|skipped=" /tmp/ep-contract.log; then echo "::error::endpointing SDK contract tests skipped"; exit 1; fi
       # R1 SDK contract (tests/test_r1_sdk_contract.py): the bare-python step above SKIPS
       # it (no livekit SDK there) and runs test_r1_core against stand-ins, so every
       # livekit-agents 1.6.4 fact the R1 worker relies on (no JobContext.close_room,

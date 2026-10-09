@@ -41,38 +41,118 @@ each represents a distinct decision, and none is allowed to imply another.
 | `PHONE_SIP_TRUNK_ID` | empty | Provider-neutral trunk. **Empty is fail-closed.** |
 | LiveKit credentials | — | Checked independently of the phone flags. |
 
-### 2z. Voice-tuning rollback point — 2026-09-10
+### 2z. Voice-tuning rollback point — rewritten 2026-10-08 (M014)
 
-The phone worker's voice tuning lives in **Fly secrets**, which SHADOW the
-`[env]` values in `fly.phone.toml`. Secrets are opaque — `fly secrets list`
-shows only a digest — so the values below are recorded here BECAUSE THEY CANNOT
-BE READ BACK. Update this block whenever they change, or the next rollback is a
-guess.
+**Verified 2026-10-08:** `fly secrets list -a project-hello-phone-voice` shows
+**no** secret for any voice-tuning name below, and the deployed `fly config show`
+`[env]` equals `fly.phone.toml` `[env]` (zero differences). The 2026-09-10 table
+that used to be here (secrets `1.25` / `40`, toml `2.5` / `60`) was stale and has
+been removed: the toml pins ARE the live values. Do not create a secret for these
+names; change `fly.phone.toml` and deploy. (A Fly secret of the same name would
+SHADOW the toml value. `PHONE_OBJECTIVE_PREEMPTIVE` and `PHONE_TURN_MODE` ARE
+shadowed by secrets whose values cannot be read back; they are out of scope here.)
+
+| Variable (`fly.phone.toml` `[env]`) | Live value | Rollback |
+|---|---|---|
+| `PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC` | `0.3` (reader clamp 0.3-0.5) | n/a |
+| `PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC` | `2.0` (was `1.0` until M014; clamp 0.5-3.0) | `1.0` |
+| `PHONE_OPEN_ANSWER_MIN_DELAY_SEC` | `0.8` (clamp 0.3-1.2, never above the max) | `0.3` makes the per-question minimum a no-op |
+| `PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC` | unset, code default `0.5` (consent turn only) | n/a |
+| `PHONE_TTS_FLUSH_MIN_CHARS` | `35` (unchanged by M014) | `0` is the deep rollback (below) |
+
+**M014 (2026-10-08): what the endpointing change does.** Sarvam is finals-only
+and delivers a final 0.9-1.0 s after the candidate stops, so the SDK used to start
+(or resume) the bot's reply on 0.15-0.25 s of quiet, long before the candidate's
+words existed. Two changes:
+
+1. MAX `1.0` -> `2.0`. It costs up to +1.0 s only on a turn the end-of-utterance
+   model scores incomplete (a bare "yes" can score incomplete), on SCREENING turns
+   only. The identity / pickup / consent gate keeps its decision timing: the
+   session STARTS at the gate max (`min(PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC, 1.0)`,
+   `phone_gate_endpointing_max_delay`), the consent turn tightens to `0.5` and
+   restores to that gate max, and the screening max (`2.0`) is applied only when
+   the screening phase is armed (`_arm_screening_endpointing_max` in `agent.py`,
+   logged as `phone_screening_endpointing` `raised`). The gate's turn-settle (how
+   long finals the SDK never committed wait before the gate closes the turn) is
+   sized from the gate max, so it is unchanged (1250 ms).
+2. Per-question MIN: while the bot waits for an OPEN answer (what / how / tell me,
+   candidate Q&A, resume conflict, patience) the minimum is `0.8`. The SDK's
+   reply-start gate is `min / 2` of quiet, but the deployed Silero VAD ends speech
+   after 0.25 s of silence and the SDK then releases the gate regardless, so the
+   **effective gain is about 0.1 s (the gate moves from 0.15 s to about 0.25 s),
+   not 0.4 s.** A longer gate needs a longer VAD `min_silence_duration`, a VAD
+   change that also touches the consent gate and barge-in; it is an owner
+   decision and is NOT part of this change. Yes/no screening questions,
+   name confirm, callback and every terminal phase keep `0.3`, and the identity,
+   pickup and consent turns are never changed (the minimum is applied only once
+   the screening phase is armed). The class is read from the reply snapshot (the
+   question the reply asks) when that reply STARTS PLAYING (the session's
+   `speaking` state, bound to the reply's own speech handle), never earlier, so
+   the reply to an answer is still gated by that answer's own class, and only
+   when the class actually changes. A reply with no phase keeps the current
+   class. The first planned question is a spoken line,
+   so its class is applied once it has been heard. Fixed-local endpointing only:
+   the opt-in dynamic mode and `PHONE_TURN_DETECTION=stt` are not touched. A
+   failed update is logged and swallowed; the call carries on with the previous
+   minimum.
+
+**Turns that inherit the 2.0 max.** After the screening phase is armed EVERY turn
+runs at max 2.0, including turns whose minimum stays `0.3`: yes/no screening
+questions, name confirm, callback, and the consent-withdrawal / revocation
+confirm ("do you want to stop?" -> "yes"). A bare "yes"/"no" the end-of-utterance
+model scores incomplete can therefore wait up to +1.0 s more than before M014.
+This is the accepted cost (owner decision 2026-10-09); a later change could pair
+the short class with a lower max. The opt-in dynamic mode is built at the gate
+max (1.0) and is not raised. Known edges: a yes/no question that follows an open
+answer drops the minimum back to 0.3 as soon as it starts playing (a candidate
+who keeps talking over it gets the short gate); the `wind_down` "any questions?"
+line is deliberately OPEN.
+
+This change never delays or drops a reply; the next step for the finals-latency
+problem is streaming STT, not more waiting.
+
+**Rollbacks.** Edit `fly.phone.toml` and deploy (the normal path). In an
+emergency, with no deploy:
+
+```
+fly secrets set PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC=1.0 \
+                PHONE_OPEN_ANSWER_MIN_DELAY_SEC=0.3 \
+                --app project-hello-phone-voice
+```
+
+That restarts the worker machines. **Unset the secrets afterwards**
+(`fly secrets unset NAME ... --app project-hello-phone-voice`) once the toml is
+changed and deployed, or the toml stays documentation. `PHONE_TTS_FLUSH_MIN_CHARS=0`
+disables the first-fragment early flush entirely and restores the ~2.9 s
+LLM-invoke-to-first-audio floor that four prior PRs were spent removing.
+
+**Logs to watch after an endpointing deploy (categories and timings only; never
+text):**
+
+- First call after the deploy: `phone_turn_detection` `duration_sec=1.0` (the max
+  the session is CONSTRUCTED with: the gate max) followed, after consent, by
+  `phone_screening_endpointing` `schema=raised` `duration_sec=2.0` (the screening
+  max actually applied). A missing `raised` line, or `raise_failed`, means the
+  screening runs at the old 1.0 max; a `duration_sec` other than the above means a
+  Fly secret is shadowing the toml (`fly secrets list` shows names only).
+- `phone_endpointing_phase`: `open` | `short` (`duration_sec` = the minimum
+  applied, `phase`), `apply_failed`.
+- The headline latency (alarm: median candidate-stop to bot-audio above 3.2 s);
+  the nightly talk-over rate (target 0).
+
+**Historical (2026-09-10, SUPERSEDED, kept for the audit trail).** The previous
+rollback point recorded two voice-tuning values that had been set by hand as Fly
+secrets (secrets are opaque; `fly secrets list` shows names and digests only):
 
 | Secret (`project-hello-phone-voice`) | Before 2026-09-10 | Set 2026-09-10 | toml `[env]` (shadowed) |
 |---|---|---|---|
 | `PHONE_TTS_FLUSH_MIN_CHARS` | `20` | `40` | `60` |
 | `PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC` | `1.5` | `1.25` | `2.5` |
 
-**To roll back to the 2026-09-10 pre-change production setup:**
-
-```
-fly secrets set PHONE_TTS_FLUSH_MIN_CHARS=20 \
-                PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC=1.5 \
-                --app project-hello-phone-voice
-```
-
-That restarts the worker machines; no deploy and no merge is involved, so it
-works even if a code change has since shipped. `PHONE_TTS_FLUSH_MIN_CHARS=0`
-is the deeper rollback — it disables the first-fragment early flush entirely
-and restores the ~2.9 s LLM-invoke→first-audio floor that four prior PRs were
-spent removing, so prefer the table above.
-
-Why these two moved: on the 2026-09-10 live call a word came out cracked at the
-first-fragment join. `tts_node` synthesizes the first fragment and the
-remainder as SEPARATE Sarvam calls, and at a 20-character cap the split lands
-mid-phrase far more often than at 40. The endpointing max is a separate
-complaint — the tail a slow speaker gets before their turn is closed.
+Evidence for superseding it: on 2026-10-08 `fly secrets list` showed none of the
+voice-tuning names, and `fly config show` `[env]` matched `fly.phone.toml`. Re-run
+`fly secrets list -a project-hello-phone-voice` as a pre-deploy check; if any of
+the names in the table above appears, unset it AFTER the deploy.
 
 `PHONE_TTS_PACE` is deliberately NOT set anywhere. The reader exists
 (`phone_tts_pace()`, default `1.0`) so it can be applied as a secret, but the
