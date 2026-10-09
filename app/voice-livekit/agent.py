@@ -30,6 +30,7 @@ import noise_suppression
 import persistence
 import phone
 import phone_canary
+import phone_stt_shadow
 import recording
 import recording_api
 import worker_ready_api
@@ -12497,6 +12498,16 @@ async def _run_phone_session(
     # the server-side idempotency key (it need not agree with turn_index — the
     # server assigns that); it makes a duplicate delivery converge.
     assessment_persist_active: list[bool] = [False]
+    # M015 PR-1: the metrics-only Sarvam Realtime STT SHADOW. None (the default,
+    # PHONE_STT_SHADOW off) means no class change, no socket, no task, no log
+    # line. When on it opens a socket lazily on the first frame AFTER this flag
+    # arms (post-consent) and logs numbers only; nothing it sees or produces
+    # reaches the agent, the LLM, turn detection, persistence or the recording.
+    try:
+        stt_shadow = phone_stt_shadow.build_call_shadow(
+            armed=lambda: bool(assessment_persist_active[0]))
+    except Exception:  # noqa: BLE001 - the shadow never breaks a call
+        stt_shadow = None
     # 0105: the GATE phase is persisted per item too — armed from the first
     # conversation item and disarmed the moment the scored phase arms below.
     # Every gate turn (the disclosure, the identity ask, the consent reply,
@@ -12850,6 +12861,11 @@ async def _run_phone_session(
             pass
         if event_type == "start_of_speech":
             candidate_speaking["value"] = True
+            if stt_shadow is not None:
+                try:
+                    stt_shadow.on_local_vad("start")
+                except Exception:  # noqa: BLE001
+                    pass
             return
         if event_type == "inference_done":
             latency_state["vad_last_inference_duration"] = float(
@@ -12867,6 +12883,11 @@ async def _run_phone_session(
         # treat very recent speech (an inter-clause pause) as still-active.
         candidate_speaking["value"] = False
         candidate_speaking["ended_mono"] = _monotonic()
+        if stt_shadow is not None:
+            try:
+                stt_shadow.on_local_vad("end")
+            except Exception:  # noqa: BLE001
+                pass
         candidate_speech_ended.set()
         now_wall = time.time()
         latency_state["local_vad_end_wall"] = now_wall
@@ -13475,7 +13496,7 @@ async def _run_phone_session(
     # turn-1 will send (a divergent prefix would not cache-hit).
     phone_instructions = _phone_instructions_text(instruction_state)
 
-    agent = phone.phone_agent_class(Agent)(
+    agent = phone.phone_agent_class(Agent, stt_shadow=stt_shadow)(
         phone_instructions,
         client=events,
         attempt_id=attempt_id,
@@ -14790,6 +14811,14 @@ async def _run_phone_session(
         nonlocal recording_settle_started, teardown_deadline
         deadline = teardown_deadline
         recording_settle_started = True
+        # M015 PR-1: backstop close of the metrics-only STT shadow (the stt_node
+        # `finally` normally got there first). Synchronous + idempotent: the
+        # call summary is emitted before anything can be awaited.
+        if stt_shadow is not None:
+            try:
+                stt_shadow.close_nowait()
+            except Exception:  # noqa: BLE001
+                pass
         # The begin-at-answer prepare is cancelled, not drained. It owns the
         # upload URL, so draining it looks attractive — but
         # `recording_settle_started` is latched above and
