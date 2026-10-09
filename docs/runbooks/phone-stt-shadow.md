@@ -34,11 +34,13 @@ Two behaviours worth knowing:
 - The shadow belongs to the **call**, not to the SDK's STT pipeline. The gate's questions rebuild that
   pipeline (`clear_user_turn`) before consent; the shadow survives that, arms at consent and keeps counting.
   It is closed once, by the call's teardown.
-- "Post-consent only" means from the first frame after consent until the call ends. After a mid-call consent
-  **withdrawal** the call runs on for a few seconds (confirmation, goodbye) and the audio still reaches the
-  shadow socket until teardown, exactly as it still reaches the main STT. At that point the job also shuts down
-  within about a second; the shadow's graceful close is bounded (about 3 s hard stop), and a "task was destroyed"
-  / "unclosed client session" warning from the process exit is harmless noise, not a call problem.
+- "Post-consent only" means from the first frame after consent until the call ends **or the candidate
+  withdraws**. The moment a mid-call withdrawal is latched (a decline that triggers the "stop here or carry on?"
+  confirmation, or an opt-out), the shadow is stopped: no further audio reaches the second socket (the main STT
+  still hears the confirmation and goodbye, as today). If the candidate then chooses to carry on, the shadow
+  stays off for the rest of that call (a few lost metrics, by design). The graceful close is bounded (about 3 s
+  hard stop; teardown waits at most 1 s, after the shutdown watchdog is armed), and a "task was destroyed" /
+  "unclosed client session" warning from the process exit is harmless noise, not a call problem.
 
 ## 2. Cost
 
@@ -71,7 +73,10 @@ deploy apply it. A Fly secret of the same name shadows the `[env]` line in `fly.
 
 ## 5. First-call check, in order
 
-Search the call's logs for `error_type=phone_stt_shadow` (the `correlationId` ties the lines to one call):
+Search the logs for `error_type=phone_stt_shadow`. The phone lane sets **no `correlationId`** (it is null on
+every line), so lines of one call are told apart by the Fly machine id (`app[<id>]` in the plain form, `instance`
+in `--json`) and the `config` line that starts each call; the report script does this for you. One machine runs
+one call at a time, so (machine, `config`) is unique:
 
 1. `config` (at build), then `armed` (first frame after consent), then `socket_open` and `session_begin`.
    **`config` with no `armed` after the call got past consent is a red flag** (the shadow should have armed);
@@ -82,12 +87,13 @@ Search the call's logs for `error_type=phone_stt_shadow` (the `correlationId` ti
 | Red flag | Meaning | Action |
 |---|---|---|
 | `connect_failed` (`schema` timeout / handshake / connector; `http_status`) | cannot reach or authenticate | check key, network; leave off |
-| `socket_closed` `close_4000` | Realtime not enabled / bad model, language or parameter | owner check with Sarvam |
-| `socket_closed` `close_1003` | quota or invalid key | **turn off now**, check main STT |
+| `socket_error` `phase=fatal` (with `http_status`), then `socket_closed` `close_4000` `phase=after_death` | Realtime not enabled / bad model, language or parameter (a rejection is a fatal `error` event first; the close code follows, best effort) | owner check with Sarvam |
+| `socket_closed` `close_1003` (or `phase=after_death` with 1003) | quota or invalid key | **turn off now**, check main STT |
 | `socket_closed` `close_1008` | inactivity / max duration | note the session length; report |
 | `socket_closed` `close_1011` | Sarvam server error | report; retry once |
 | `send_stalled` | a send took over 2 s; the shadow stopped | report |
 | `frames_dropped` | the queue overflowed (socket too slow) | report; check CPU |
+| `call_summary` `queue_lag_max_ms` over about 1000 | the shadow fell behind real time (slow connect or slow socket), so its latency metrics (G1, G2) are inflated by that lag; the report prints a WARNING | discount that call; report if frequent |
 | `session_begin` present, `chunks_sent` > 0 in `call_summary`, but `rt_partials` = 0 | the audio wire format is probably wrong (we send JSON base64 `audio_input` per the docs; upstream LiveKit sends raw binary frames) | stop; tell the dev (one constant, `_AUDIO_WIRE`) |
 | `shadow_failed` | an internal error (class name only, per phase) | report |
 
@@ -105,14 +111,14 @@ Only allowlisted keys appear: `schema`, `phase`, `model`, `duration_sec`, `optio
 | `closed_unarmed` | | the call ended and the shadow never armed (no consent, or no frame after it) |
 | `socket_open` / `session_begin` | `duration_sec` | connect time / time to `session.begin` |
 | `socket_error` | `schema` code, `phase` fatal/nonfatal, `http_status` | a Sarvam `error` event (first 5 non-fatal) |
-| `socket_closed` | `schema` `close_<code>`, `phase` expected/unexpected, `duration_sec` session length | |
+| `socket_closed` | `schema` `close_<code>`, `phase` expected / unexpected / `after_death` (the close code that followed a fatal error or stall; informational), `duration_sec` session length | |
 | `session_end` | `duration_sec` | billed audio seconds |
 | `seg_partial_lead` | `turn_index`, `duration_sec` | first partial word after VAD start |
 | `seg_three_word` | `turn_index`, `duration_sec` | 3rd partial word after VAD start |
 | `seg_legacy_final` | `turn_index`, `duration_sec`, `option_count` | main STT final time / words |
 | `seg_rt_final` | `turn_index`, `duration_sec`, `option_count` | realtime final time / words |
 | `seg_summary` | `turn_index`, `schema` class, `option_count` max partial words, `phase`, `duration_sec` | one per segment; class is `both`, `noise_partial`, `rt_missed` or `silent` |
-| `call_summary` | `schema` counter, `option_count` | counters: segments, segments_merged, silence_partials, rt_partials, rt_finals, main_finals, orphan_*, frames_*, chunks_sent, errors_nonfatal, unrecovered_death |
+| `call_summary` | `schema` counter, `option_count` | counters: segments, segments_merged, silence_partials, rt_partials, rt_finals, main_finals, orphan_*, frames_*, queue_lag_max_ms (worst time a frame waited before being sent), chunks_sent, errors_nonfatal, unrecovered_death |
 
 ## 7. Analyse
 
@@ -121,7 +127,16 @@ main STT and the Realtime socket keep one utterance across a pause of up to abou
 one final). The shadow therefore re-opens a segment when local speech restarts within 0.7 s of its end and no
 final has landed on it yet (`segments_merged` in `call_summary` counts these); the segment keeps its first
 start, so the barge-in anchor is unchanged. Without this a clean answer with a clause pause would be
-reported as noise and would bias G1, G3 and G4.
+reported as noise and would bias G1, G3 and G4. The merge window follows
+`PHONE_STT_SHADOW_SILENCE_MS` (default 700 ms = 0.7 s).
+
+**Which segment owns a final.** The pinned Sarvam plugin never emits an empty final, so a noise-only local
+segment (fan, cough) gets **no** final at all. A final is therefore given to the oldest ended segment that
+shows speech (a realtime partial, or the other kind of final); only when nothing shows speech does it go to the
+latest waiting segment. Realtime partials and finals carry Sarvam's `utterance_idx`: every later partial and the
+final of an utterance belong to the segment its first non-empty partial landed in, however late the model
+answers. Without the index the latency of the model (what we measure) would push its late partials into the
+next segment and flatter G1/G2.
 
 Run 5-10 owner test calls (include deliberate fan, TV and second-speaker noise), then, promptly (Fly's log
 buffer is short):
@@ -132,7 +147,9 @@ python app/voice-livekit/tools/stt_shadow_report.py shadow-YYYYMMDD.log
 ```
 
 (`--json` for machine output; also accepts `fly logs --json` files; `--min-calls` / `--min-segments` change
-the sample floor.) The report prints a per-call table, the G1-G6 values with PASS/FAIL, and a verdict. G5 is the strict
+the sample floor. Calls are split per machine and `config` line, see section 5; a log with neither machine ids
+nor correlation ids is one call and the report says so. A death logged **after** the call summary, such as a 1011
+on close, still counts toward G6.) The report prints a per-call table, the G1-G6 values with PASS/FAIL, and a verdict. G5 is the strict
 research rule (+-20 %); the looser "+-1 word allowed" rate is printed under "Also" for information only and
 is not gated.
 

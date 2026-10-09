@@ -467,6 +467,56 @@ class TestParsing(unittest.IsolatedAsyncioTestCase):
         shadow.close_nowait()
 
 
+    async def test_fatal_error_then_close_4000_logs_the_close_code(self):
+        # Review r2 (lens 3): a rejection is an `error` event THEN a close(4000).
+        ws = FakeWs(close_code=4000)
+        shadow, rec, *_ = make_shadow(ws)
+        shadow.offer(Frame())
+        await settle()
+        ws.feed_json({"event": "error", "code": "not_enabled", "is_fatal": True,
+                      "status_code": 403})
+        await settle(0.2)
+        self.assertEqual(rec.of("socket_error")[0]["phase"], "fatal")
+        closed = rec.of("socket_closed")
+        self.assertEqual([(m["schema"], m["phase"]) for m in closed],
+                         [("close_4000", "after_death")])
+        self.assertEqual(shadow.counters["unrecovered_death"], 1)
+
+    async def test_utterance_idx_is_parsed_and_validated(self):
+        ws = FakeWs()
+        shadow, rec, clock, *_ = make_shadow(ws)
+        seen = []
+        shadow._tracker.rt_partial = lambda n, now, utt=None: seen.append((n, utt))
+        shadow.offer(Frame())
+        await settle()
+        ws.feed_json({"event": "transcript.partial", "text": "a b", "utterance_idx": 3})
+        ws.feed_json({"event": "transcript.partial", "text": "a b", "utterance_idx": True})
+        ws.feed_json({"event": "transcript.partial", "text": "a b", "utterance_idx": "3"})
+        ws.feed_json({"event": "transcript.partial", "text": "a b"})
+        await settle()
+        self.assertEqual(seen, [(2, 3), (2, None), (2, None), (2, None)])
+        shadow.close_nowait()
+
+    async def test_queue_lag_is_measured_and_summarised(self):
+        ws = FakeWs()
+        gate = asyncio.Event()
+
+        async def slow_factory(url, headers):
+            await gate.wait()
+            return ws
+
+        shadow, rec, clock, *_ = make_shadow(ws, factory=slow_factory, connect_timeout=5.0)
+        shadow.offer(Frame())
+        await settle()
+        clock.t += 1.5                     # 1.5 s of audio waits for the socket
+        gate.set()
+        await settle()
+        self.assertEqual(shadow.counters["queue_lag_max_ms"], 1500)
+        shadow.close_nowait()
+        lag = [m for m in rec.of("call_summary") if m["schema"] == "queue_lag_max_ms"]
+        self.assertEqual(lag[0]["option_count"], 1500)
+
+
 # ── A7 metric formulas (pure tracker) ────────────────────────────────────────
 
 class TestTracker(unittest.TestCase):
@@ -673,6 +723,110 @@ class TestTracker(unittest.TestCase):
         tr.tick(20.0)
         self.assertEqual(self.values("seg_legacy_final", 0)[0]["option_count"], pss.WORD_CAP)
         self.assertEqual(self.seg_summary(0)["option_count"], pss.WORD_CAP)
+
+
+class TestTrackerFinalAttribution(unittest.TestCase):
+    """Review r2 (lens 2): the pinned Sarvam plugin never sends an empty final, so
+    a noise-only local segment gets NO final and must not steal the next one."""
+
+    def setUp(self):
+        self.rec = Recorder()
+        self.clock = Clock(0.0)
+        self.tr = pss.SegmentTracker(self.clock, self.rec)
+        self.tr.arm()
+
+    def summary(self, k):
+        return [m for c, m in self.rec.events if c == "seg_summary" and m["turn_index"] == k][0]
+
+    def values(self, cat, k):
+        return [m for c, m in self.rec.events if c == cat and m["turn_index"] == k]
+
+    def test_noise_blip_then_answer_does_not_steal_the_finals(self):
+        tr = self.tr
+        tr.vad_start(0.0)
+        tr.vad_end(0.4)                    # noise: no partial, no final ever
+        tr.vad_start(1.2)
+        tr.rt_partial(1, 1.5)
+        tr.rt_partial(3, 1.8)
+        tr.vad_end(2.0)
+        tr.rt_final(3, 2.8)
+        tr.legacy_final(3, 2.9)
+        tr.tick(30.0)
+        self.assertEqual(self.summary(0)["schema"], "silent")
+        self.assertEqual(self.summary(1)["schema"], "both")
+        self.assertEqual(self.values("seg_legacy_final", 1)[0]["option_count"], 3)
+        self.assertEqual(self.values("seg_rt_final", 1)[0]["option_count"], 3)
+        self.assertEqual(self.values("seg_three_word", 1)[0]["duration_sec"], 0.6)
+        self.assertEqual(self.values("seg_legacy_final", 0), [])
+
+    def test_two_answers_before_the_first_final_keep_their_order(self):
+        tr = self.tr
+        tr.vad_start(0.0)
+        tr.rt_partial(2, 0.5)
+        tr.vad_end(1.0)
+        tr.vad_start(1.9)                  # gap > merge gap: a second utterance
+        tr.rt_partial(2, 2.3)
+        tr.vad_end(2.6)
+        tr.legacy_final(2, 3.0)            # first final -> the OLDER answer
+        tr.legacy_final(2, 3.4)
+        tr.tick(30.0)
+        self.assertEqual(self.values("seg_legacy_final", 0)[0]["duration_sec"], 3.0)
+        self.assertEqual(self.values("seg_legacy_final", 1)[0]["duration_sec"], 1.5)
+
+    def test_noise_after_the_answer_does_not_take_its_final(self):
+        tr = self.tr
+        tr.vad_start(0.0)
+        tr.rt_partial(2, 0.5)
+        tr.vad_end(1.0)
+        tr.vad_start(1.9)
+        tr.vad_end(2.1)                    # a cough while the final is in flight
+        tr.legacy_final(2, 2.4)
+        tr.tick(30.0)
+        self.assertEqual(self.summary(0)["schema"], "both")
+        self.assertEqual(self.summary(1)["schema"], "silent")
+
+    def test_with_no_speech_evidence_the_latest_waiting_segment_gets_the_final(self):
+        tr = self.tr
+        tr.vad_start(0.0)
+        tr.vad_end(0.4)                    # noise
+        tr.vad_start(1.2)
+        tr.vad_end(2.0)                    # realtime missed the answer entirely
+        tr.legacy_final(3, 2.9)
+        tr.tick(30.0)
+        self.assertEqual(self.summary(0)["schema"], "silent")
+        self.assertEqual(self.summary(1)["schema"], "rt_missed")
+
+    def test_late_partials_follow_their_utterance_idx(self):
+        tr = self.tr
+        tr.vad_start(0.0)
+        tr.rt_partial(1, 0.9, utt=0)
+        tr.vad_end(1.2)
+        tr.vad_start(2.5)                  # candidate resumes: segment 1 opens
+        tr.rt_partial(2, 2.7, utt=0)       # slow model: still utterance 0
+        tr.rt_partial(3, 2.9, utt=0)
+        tr.vad_end(3.5)
+        tr.rt_final(3, 3.6, utt=0)
+        tr.tick(30.0)
+        self.assertEqual(self.values("seg_three_word", 0)[0]["duration_sec"], 2.9)
+        self.assertEqual(self.values("seg_rt_final", 0)[0]["option_count"], 3)
+        self.assertEqual(self.summary(0)["option_count"], 3)
+        self.assertEqual(self.values("seg_partial_lead", 1), [])
+        self.assertEqual(self.summary(1)["schema"], "silent")
+
+    def test_utterance_map_is_released_when_the_segment_settles(self):
+        tr = self.tr
+        tr.vad_start(0.0)
+        tr.rt_partial(1, 0.5, utt=7)
+        tr.vad_end(1.0)
+        self.assertIn(7, tr._utt)
+        tr.tick(5.0)
+        self.assertEqual(tr._utt, {})
+
+    def test_merge_gap_follows_the_configured_silence(self):
+        shadow, *_ = make_shadow(FakeWs(), cfg=pss.ShadowConfig(silence_ms=1200))
+        self.assertAlmostEqual(shadow._tracker.merge_gap, 1.2)
+        shadow, *_ = make_shadow(FakeWs())
+        self.assertAlmostEqual(shadow._tracker.merge_gap, 0.7)
 
 
 # ── A8 close codes ───────────────────────────────────────────────────────────
@@ -993,6 +1147,37 @@ class TestNoTextEver(unittest.IsolatedAsyncioTestCase):
             root.removeHandler(capture)
             root.setLevel(old_level)
 
+    async def test_identifier_safe_single_token_never_reaches_even_the_raw_meta(self):
+        # Review r2 (lens 3): the logger drops spaced / long values from
+        # identifier-shaped fields, so the multi-word sentinels cannot catch a
+        # regression that logs a ONE-word answer (which is identifier-safe).
+        token = "Zebraquantum"
+        raw = Recorder()
+        ws = FakeWs()
+        shadow, _, clock, *_ = make_shadow(ws, rec=raw)
+        shadow.offer(Frame())
+        await settle()
+        shadow.on_local_vad("start")
+        ws.feed_json({"event": "transcript.partial", "text": token, "language": token})
+        ws.feed_json({"event": "transcript.final", "text": token})
+        ws.feed_json({"event": "error", "code": token, "is_fatal": False, "message": token})
+        await settle()
+        clock.t += 0.8
+        shadow.observe_main(type("E", (), {
+            "type": "final_transcript",
+            "alternatives": [type("A", (), {"text": token})()]})())
+        shadow.on_local_vad("end")
+        shadow.close_nowait()
+        await asyncio.wait_for(shadow._task, 2)
+        self.assertTrue(raw.events)
+        self.assertNotIn(token.lower(), json.dumps(raw.events).lower())
+        texts: list[str] = []
+        _walk(shadow, set(), texts, frozenset({"_ws", "_factory", "_task", "_queue", "_lock",
+                                               "_emit", "_armed", "_clock",
+                                               "_resampler_factory", "_hard_timer",
+                                               "_resampler"}))
+        self.assertNotIn(token, "\n".join(texts))
+
     def test_module_source_has_no_stdlib_logging_or_exc_info(self):
         import ast
         tree = ast.parse((_CTX / "phone_stt_shadow.py").read_text(encoding="utf-8"))
@@ -1111,6 +1296,26 @@ class TestCaps(unittest.IsolatedAsyncioTestCase):
         shadow.close_nowait()
         await shadow.wait_closed(2.0)
         self.assertTrue(shadow._task.done())
+
+    async def test_withdrawal_stop_sends_no_further_audio_and_closes_gracefully(self):
+        # r2 (lens 2): agent.py calls close_nowait() when the candidate withdraws.
+        # From then on no frame is accepted, the socket gets `end` and closes, and
+        # the later teardown close is a no-op (summary written exactly once).
+        ws = FakeWs()
+        shadow, rec, *_ = make_shadow(ws)
+        for _ in range(12):
+            shadow.offer(Frame())
+        await settle()
+        shadow.close_nowait()                       # the withdrawal stop
+        offered = shadow.counters["frames_offered"]
+        for _ in range(50):
+            shadow.offer(Frame())                   # confirmation / goodbye audio
+        self.assertEqual(shadow.counters["frames_offered"], offered)
+        await asyncio.wait_for(shadow._task, 3)
+        self.assertEqual(ws.sent[-1], {"event": "end"})
+        self.assertTrue(ws.closed)
+        shadow.close_nowait()                       # teardown backstop
+        self.assertEqual(len(rec.of("call_summary")), len(pss.COUNTER_NAMES))
 
     def test_constants_match_the_plan(self):
         self.assertEqual(

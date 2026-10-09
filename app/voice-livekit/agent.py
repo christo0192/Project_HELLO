@@ -6165,6 +6165,11 @@ async def _run_native_phone_screening(
     close_room: Callable[[], Awaitable[Any]] | None = None,
     close_room_after_evidence: Callable[[], Awaitable[Any]] | None = None,
     before_terminal: Callable[[], Awaitable[Any]] | None = None,
+    # M015 PR-1: synchronous, never-raising stop for the metrics-only STT
+    # shadow; fired when the candidate withdraws (decline latch / opt-out) so
+    # no audio of a withdrawing candidate reaches the second vendor socket.
+    # None (the default): inert.
+    on_withdrawal: Callable[[], None] | None = None,
     # M013 S01 T07: the call's post-consent revocation window (armed by the
     # gate on a grant in THIS call). None, unarmed, or a reconnect leg: inert.
     revocation_window: "_RevocationWindow | None" = None,
@@ -7547,6 +7552,13 @@ async def _run_native_phone_screening(
             error_category=category,
         )
 
+    def _notify_withdrawal() -> None:
+        if on_withdrawal is not None:
+            try:
+                on_withdrawal()
+            except Exception:  # noqa: BLE001 - never breaks the withdrawal flow
+                pass
+
     def _interrupt_stale_reply() -> None:
         """Cancel the reply a PREVIOUS fragment of this logical turn started."""
         interrupt = getattr(reply_handle[0], "interrupt", None)
@@ -7566,6 +7578,7 @@ async def _run_native_phone_screening(
 
     def _end_midcall_opted_out(turn_ctx: Any, category: str) -> None:
         """Speak the opt-out closing and arm HALT_CANDIDATE_OPTED_OUT."""
+        _notify_withdrawal()
         withdrawal["pending"] = False
         withdrawal["stage"] = None
         # A decline beats a callback: the negotiation is abandoned.
@@ -7707,6 +7720,7 @@ async def _run_native_phone_screening(
             return "reply"
         # A decline beats a callback: abandon any negotiation in progress.
         callback_flow["state"] = None
+        _notify_withdrawal()
         withdrawal["pending"] = True
         withdrawal["stage"] = "latched"
         withdrawal["reasks"] = 0
@@ -7740,6 +7754,7 @@ async def _run_native_phone_screening(
         if not phone.phone_midcall_opt_out_enabled():
             return False
         callback_flow["state"] = None
+        _notify_withdrawal()
         withdrawal["pending"] = True
         withdrawal["stage"] = "judged"
         withdrawal["reasks"] = 0
@@ -12883,11 +12898,6 @@ async def _run_phone_session(
         # treat very recent speech (an inter-clause pause) as still-active.
         candidate_speaking["value"] = False
         candidate_speaking["ended_mono"] = _monotonic()
-        if stt_shadow is not None:
-            try:
-                stt_shadow.on_local_vad("end")
-            except Exception:  # noqa: BLE001
-                pass
         candidate_speech_ended.set()
         now_wall = time.time()
         latency_state["local_vad_end_wall"] = now_wall
@@ -12911,6 +12921,14 @@ async def _run_phone_session(
             histogram_metric, "voice_phone_vad_inference_duration_sec",
             inference_duration, {"channel": "phone"},
         )
+        # M015 PR-1: LAST, after every existing bookkeeping step, so the
+        # shadow's (synchronous, O(1)) hook cannot shift a timestamp or the
+        # turn-taking event the main path uses.
+        if stt_shadow is not None:
+            try:
+                stt_shadow.on_local_vad("end")
+            except Exception:  # noqa: BLE001
+                pass
 
     session = _build_phone_provider_session(
         turn_mode, vad_event_callback=_on_phone_vad_event,
@@ -15074,14 +15092,15 @@ async def _run_phone_session(
             await _run_teardown(result, gate_error)
             # C9-1: the bounded detached-upload wait comes BEFORE the arm.
             await _await_detached_finishes()
+            # Arm FIRST: the watchdog's timing is identical with the shadow on or off.
+            _arm_phone_job_watchdog()
             if stt_shadow is not None:
                 # M015 PR-1: bounded (1 s) wait for the shadow's graceful close;
-                # swallow everything, the watchdog below is not postponed beyond it.
+                # swallow everything. The watchdog is already armed.
                 try:
                     await stt_shadow.wait_closed(1.0)
                 except Exception:  # noqa: BLE001
                     pass
-            _arm_phone_job_watchdog()
 
         add_shutdown_callback(_phone_job_shutdown)
 
@@ -15807,6 +15826,7 @@ async def _run_phone_session(
                 close_room_after_evidence=_close_room_after_evidence,
                 before_terminal=_finish_recording,
                 persist_candidate_text=_persist_kept_candidate_text,
+                on_withdrawal=(stt_shadow.close_nowait if stt_shadow is not None else None),
             )
 
         async def _post_consent_exception(exc: BaseException) -> None:

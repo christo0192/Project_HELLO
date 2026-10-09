@@ -70,9 +70,18 @@ class TestSourcePins(unittest.TestCase):
         self.assertIsNotNone(m)
         self.assertRegex(m.group("body"),
                          r'try:\n\s+stt_shadow\.on_local_vad\("start"\)\n\s+except Exception')
-        end = self.run_src.index('candidate_speaking["ended_mono"] = _monotonic()')
-        window = self.run_src[end:end + 400]
-        self.assertRegex(window, r'try:\n\s+stt_shadow\.on_local_vad\("end"\)\n\s+except Exception')
+        # r2: the end hook runs LAST - after the existing bookkeeping, `set()` and
+        # timestamps - so it cannot shift the turn-taking event or a timestamp.
+        start = self.run_src.index('candidate_speaking["ended_mono"] = _monotonic()')
+        stop = self.run_src.index("session = _build_phone_provider_session(", start)
+        body = self.run_src[start:stop]
+        self.assertRegex(
+            body, r'try:\n\s+stt_shadow\.on_local_vad\("end"\)\n\s+except Exception')
+        hook = body.index('stt_shadow.on_local_vad("end")')
+        self.assertLess(body.index("candidate_speech_ended.set()"), hook)
+        self.assertLess(body.index('latency_state["local_vad_end_wall"]'), hook)
+        self.assertLess(body.index("histogram_metric"), hook)
+        self.assertEqual(body.count("stt_shadow.on_local_vad"), 1)
 
     def test_teardown_backstop_is_guarded(self):
         teardown = self.run_src[self.run_src.index("async def _teardown_impl"):]
@@ -80,6 +89,27 @@ class TestSourcePins(unittest.TestCase):
         self.assertRegex(head, r'try:\n\s+stt_shadow\.close_nowait\(\)\n\s+except Exception')
         self.assertLess(head.index("recording_settle_started = True"),
                         head.index("stt_shadow.close_nowait()"))
+
+    def test_watchdog_is_armed_before_the_bounded_shadow_wait(self):
+        shutdown = self.run_src[self.run_src.index("async def _phone_job_shutdown"):]
+        shutdown = shutdown[:1500]
+        self.assertLess(shutdown.index("_arm_phone_job_watchdog()"),
+                        shutdown.index("stt_shadow.wait_closed(1.0)"))
+
+    def test_withdrawal_stops_the_shadow(self):
+        # r2 (lens 2): a withdrawing candidate's audio must not keep flowing to
+        # the second vendor socket. The three latch points call the notifier.
+        self.assertIn(
+            "on_withdrawal=(stt_shadow.close_nowait if stt_shadow is not None else None),",
+            self.run_src)
+        native = inspect.getsource(agent_mod._run_native_phone_screening)
+        self.assertIn("on_withdrawal: Callable[[], None] | None = None,", native)
+        self.assertEqual(native.count("_notify_withdrawal()"), 4)   # def + 3 call sites
+        for marker in ('withdrawal["stage"] = "latched"', 'withdrawal["stage"] = "judged"'):
+            at = native.index(marker)
+            self.assertIn("_notify_withdrawal()", native[at - 200:at])
+        at = native.index("def _end_midcall_opted_out")
+        self.assertIn("_notify_withdrawal()", native[at:at + 400])
 
     def test_no_session_handler_references_the_shadow(self):
         for m in re.finditer(r"session\.on\(", self.run_src):
@@ -98,10 +128,32 @@ class TestSourcePins(unittest.TestCase):
             self.assertIsNone(pss.build_call_shadow(armed=lambda: True))
 
 
+async def _no_warmup(*_a, **_k):
+    """The harness would otherwise run the real Google warm-up, whose FIRST call
+    imports google.genai synchronously (about 5 s blocking the event loop). That
+    one-off stall made the first (cold) run differ from later ones - the source of
+    the flaky parity result. Both runs of every comparison skip it."""
+    return None
+
+
 class TestSessionParity(unittest.IsolatedAsyncioTestCase):
     """One consented screening, switch off vs on: identical observable output."""
 
+    _warmed = False
+
+    async def _warm(self):
+        """The very first harness run of the process pays one-off lazy imports and
+        compiles that stall the event loop and change the scripted timing; a cold
+        run compared against a warm one was the flaky parity result. Burn it."""
+        if not TestSessionParity._warmed:
+            TestSessionParity._warmed = True
+            await self._run_once(False)
+
     async def _run(self, shadow_on: bool):
+        await self._warm()
+        return await self._run_once(shadow_on)
+
+    async def _run_once(self, shadow_on: bool):
         built: list = []
         classes: list = []
         real_class = phone.phone_agent_class
@@ -113,13 +165,34 @@ class TestSessionParity(unittest.IsolatedAsyncioTestCase):
 
         feeders: list = []
 
+        final_event = type("E", (), {
+            "type": "final_transcript",
+            "alternatives": [type("A", (), {"text": "one two three"})()]})()
+
         async def feed(shadow):
-            # Stands in for the SDK pump that calls shadow.offer() from the
-            # stt_node tee: synthetic frames every few ms until the call's
-            # teardown closes the shadow. This is what ARMS it (at consent).
-            while not shadow._closed:
-                shadow.offer(Frame())
+            # Stands in for the SDK pump: synthetic frames every few ms run through
+            # the INSTALLED stt_node tee (stub main STT underneath, scripted finals)
+            # with the local-VAD hook fired around them, until the call's teardown
+            # closes the shadow. This is what ARMS it (at consent).
+            while not classes and not shadow._closed:
                 await asyncio.sleep(0.005)
+            if not classes:
+                return
+
+            async def frames():
+                i = 0
+                while not shadow._closed:
+                    if i % 20 == 0:
+                        shadow.on_local_vad("start")
+                    elif i % 20 == 10:
+                        shadow.on_local_vad("end")
+                    i += 1
+                    yield Frame()
+                    await asyncio.sleep(0.005)
+
+            node = classes[-1].stt_node(object(), frames(), None)
+            async for _ in node:
+                pass
 
         def build(**kwargs):
             shadow, *_ = make_shadow(FakeWs())
@@ -131,11 +204,18 @@ class TestSessionParity(unittest.IsolatedAsyncioTestCase):
         env = {"PHONE_STT_SHADOW": "on" if shadow_on else "off", "SARVAM_API_KEY": "synthetic-key"}
         patcher = patch.object(pss, "build_call_shadow", side_effect=build) if shadow_on \
             else patch.object(pss, "build_call_shadow", wraps=pss.build_call_shadow)
-        async def stub_stt_node(self, audio, model_settings):   # the SDK stub has none
-            if False:
-                yield None
+        async def stub_stt_node(self, audio, model_settings):
+            # the main STT stand-in: consumes every frame, emits a scripted final
+            n = 0
+            async for _ in audio:
+                n += 1
+                if n % 40 == 0:
+                    yield final_event
 
-        with patch.dict(os.environ, env), patcher,                 patch.object(agent_mod.Agent, "stt_node", new=stub_stt_node, create=True),                 patch.object(phone, "phone_agent_class", side_effect=spy_class):
+        with patch.dict(os.environ, env), patcher, \
+                patch.object(agent_mod.Agent, "stt_node", new=stub_stt_node, create=True), \
+                patch.object(phone, "phone_agent_class", side_effect=spy_class), \
+                patch.object(phone, "phone_warm_google_connection", new=_no_warmup):
             session, client = await _SessionHarness(self).run(
                 replies=["Yes.", "I worked on a billing system.", "Another answer."])
         for task in feeders:
@@ -178,12 +258,19 @@ class TestSessionParity(unittest.IsolatedAsyncioTestCase):
         # observable output above is still identical.
         self.assertTrue(built[0]._latched)
         self.assertGreater(built[0].counters["frames_offered"], 0)
-        self.assertGreaterEqual(built[0].counters["chunks_sent"], 0)
+        # the tee really ran: frames reached the shadow through the installed
+        # stt_node, the main STT's finals were observed, the VAD hook drove segments
+        self.assertGreater(built[0].counters["chunks_sent"], 0)
+        self.assertGreater(built[0].counters["main_finals"], 0)
+        self.assertGreater(built[0].counters["segments"], 0)
+        self.assertEqual(built[0].counters["frames_dropped"], 0)
 
     async def test_a_build_exception_leaves_the_call_unchanged(self):
+        await self._warm()
         off_session, off_client, _, _ = await self._run(False)
         with patch.dict(os.environ, {"PHONE_STT_SHADOW": "on"}), \
-                patch.object(pss, "build_call_shadow", side_effect=RuntimeError("boom")):
+                patch.object(pss, "build_call_shadow", side_effect=RuntimeError("boom")), \
+                patch.object(phone, "phone_warm_google_connection", new=_no_warmup):
             session, client = await _SessionHarness(self).run(
                 replies=["Yes.", "I worked on a billing system.", "Another answer."])
         self.assertEqual(self._observable(off_session, off_client),

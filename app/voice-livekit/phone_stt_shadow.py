@@ -90,6 +90,7 @@ COUNTER_NAMES = (
     "orphan_legacy_finals", "orphan_rt_finals", "main_finals", "main_finals_empty",
     "rt_partials", "rt_finals", "rt_vad_starts", "rt_unparsed", "frames_offered",
     "frames_dropped", "chunks_sent", "errors_nonfatal", "unrecovered_death", "segments_merged",
+    "queue_lag_max_ms",
 )
 
 MSG_TEXT = "text"
@@ -302,6 +303,7 @@ class SegmentTracker:
         for name in COUNTER_NAMES:
             self.counters.setdefault(name, 0)
         self._active: list[_Segment] = []
+        self._utt: dict[int, _Segment] = {}   # Sarvam utterance_idx -> its segment
         self._next_k = 0
         self.armed = False
         self.merge_gap = MERGE_GAP
@@ -349,7 +351,8 @@ class SegmentTracker:
         self._settle(now)
 
     # -- realtime partial
-    def rt_partial(self, words: int, now: Optional[float] = None) -> None:
+    def rt_partial(self, words: int, now: Optional[float] = None,
+                   utt: Optional[int] = None) -> None:
         if not self.armed:
             return
         now = self._clock() if now is None else now
@@ -357,11 +360,19 @@ class SegmentTracker:
         if words < 1:
             self.counters["rt_empty_partials"] += 1
             return
-        seg = self._open_segment()
-        if seg is None and self._active:
-            last = self._active[-1]  # only the LATEST ended segment is eligible
-            if last.end is not None and now <= last.end + TAIL:
-                seg = last
+        # Sarvam's ``utterance_idx`` (when present): every later partial of an
+        # utterance belongs to the segment its FIRST non-empty partial landed in,
+        # however late it arrives - the model's own latency must not push its
+        # partials into the next segment (that would flatter G1 and G2).
+        seg = self._utt.get(utt) if utt is not None else None
+        if seg is None:
+            seg = self._open_segment()
+            if seg is None and self._active:
+                last = self._active[-1]  # only the LATEST ended segment is eligible
+                if last.end is not None and now <= last.end + TAIL:
+                    seg = last
+            if seg is not None and utt is not None:
+                self._utt[utt] = seg
         if seg is None:
             self.counters["silence_partials"] += 1
             self.counters["silence_partial_words"] = _count(
@@ -376,13 +387,38 @@ class SegmentTracker:
 
     # -- finals
     def _pick_final_segment(self, now: float, realtime: bool) -> Optional[_Segment]:
-        for seg in self._active:           # oldest ended segment without a final yet
+        """Which local segment does a final belong to?
+
+        The pinned Sarvam plugin never sends an empty final, so a noise-only
+        local segment (fan, cough, TV) gets NO final at all and must not steal
+        the next real answer's. Hence evidence-first, oldest-first:
+        1. the oldest ended segment still waiting for this kind of final that
+           shows speech (a realtime partial, or the other kind of final);
+        2. else the open segment, if it shows speech (a mid-utterance final);
+        3. else the latest ended segment still waiting (nothing shows speech:
+           the final was probably for the most recent sound);
+        4. else the open segment.
+        """
+        waiting: list[_Segment] = []
+        for seg in self._active:
             if seg.end is None:
                 continue
             has = seg.rf is not None if realtime else seg.f is not None
             if not has and now <= seg.end + SETTLE:
+                waiting.append(seg)
+
+        def speech(seg: _Segment) -> bool:
+            return seg.p1 is not None or seg.f is not None or seg.rf is not None
+
+        for seg in waiting:
+            if speech(seg):
                 return seg
-        return self._open_segment()
+        opened = self._open_segment()
+        if opened is not None and speech(opened):
+            return opened
+        if waiting:
+            return waiting[-1]
+        return opened
 
     def legacy_final(self, words: int, now: Optional[float] = None) -> None:
         if not self.armed:
@@ -401,12 +437,15 @@ class SegmentTracker:
         seg.lw += max(0, words)
         seg.lf += 1
 
-    def rt_final(self, words: int, now: Optional[float] = None) -> None:
+    def rt_final(self, words: int, now: Optional[float] = None,
+                 utt: Optional[int] = None) -> None:
         if not self.armed:
             return
         now = self._clock() if now is None else now
         self._settle(now)
-        seg = self._pick_final_segment(now, realtime=True)
+        seg = self._utt.get(utt) if utt is not None else None
+        if seg is None:
+            seg = self._pick_final_segment(now, realtime=True)
         if seg is None:
             self.counters["orphan_rt_finals"] += 1
             return
@@ -423,12 +462,16 @@ class SegmentTracker:
 
     def _settle(self, now: float) -> None:
         keep: list[_Segment] = []
+        dropped = False
         for seg in self._active:
             if seg.end is not None and now >= seg.end + SETTLE:
                 self._log_segment(seg, "settled")
+                dropped = True
             else:
                 keep.append(seg)
         self._active = keep
+        if dropped and self._utt:
+            self._utt = {u: sg for u, sg in self._utt.items() if sg in keep}
 
     def close(self, now: Optional[float] = None) -> None:
         """Settle what is due, then finalize the rest as ``truncated``."""
@@ -437,6 +480,7 @@ class SegmentTracker:
         for seg in self._active:
             self._log_segment(seg, "truncated")
         self._active = []
+        self._utt = {}
 
     def _log_segment(self, seg: _Segment, phase: str) -> None:
         if seg.k >= MAX_SEGMENTS:
@@ -574,6 +618,8 @@ class PhoneSttShadow:
         self._emit = emitter or _Emitter()
         self.counters: dict[str, int] = {n: 0 for n in COUNTER_NAMES}
         self._tracker = SegmentTracker(clock, self._emit, self.counters)
+        # The merge window follows Sarvam's own silence threshold (default 0.7 s).
+        self._tracker.merge_gap = cfg.silence_ms / 1000.0
 
         # tunables (module constants; tests shrink them)
         self._connect_timeout = CONNECT_TIMEOUT_SEC
@@ -623,7 +669,7 @@ class PhoneSttShadow:
                 self._start()
             self.counters["frames_offered"] += 1
             try:
-                self._queue.put_nowait(frame)  # type: ignore[union-attr]
+                self._queue.put_nowait((self._clock(), frame))  # type: ignore[union-attr]
             except asyncio.QueueFull:
                 self.counters["frames_dropped"] += 1
                 if not self._drop_logged:
@@ -803,6 +849,17 @@ class PhoneSttShadow:
         if not expected:
             self._mark_death()
 
+    def _log_closed_after_death(self, code: Any) -> None:
+        """The close code after the shadow already died (a fatal error event is
+        followed by the server's close, e.g. 4000 = account not enabled). Info
+        only, never a second death."""
+        if self._close_logged:
+            return
+        self._close_logged = True
+        valid = isinstance(code, int) and not isinstance(code, bool) and 1000 <= code <= 4999
+        self._emit("socket_closed", schema=f"close_{code}" if valid else "close_unknown",
+                   phase="after_death")
+
     async def _run(self) -> None:
         ws: Any = None
         subtasks: list[asyncio.Task] = []
@@ -867,8 +924,11 @@ class PhoneSttShadow:
                     await asyncio.wait_for(ws.close(), self._socket_close)
                 except Exception:  # noqa: BLE001
                     pass
+                code = getattr(ws, "close_code", None)
                 if not was_dead:
-                    self._log_closed(getattr(ws, "close_code", None))
+                    self._log_closed(code)
+                else:
+                    self._log_closed_after_death(code)
             self._drain()
 
     def _drain(self) -> None:
@@ -929,6 +989,9 @@ class PhoneSttShadow:
             await self._send({"event": "audio_input",
                               "audio": base64.b64encode(chunk).decode("ascii")})
             self.counters["chunks_sent"] += 1
+            # A backlog (slow connect) is drained without holding the event loop
+            # in one stretch: give the call's own tasks a turn between chunks.
+            await asyncio.sleep(0)
         if final and self._buf:
             chunk = bytes(self._buf)
             self._buf.clear()
@@ -940,9 +1003,14 @@ class PhoneSttShadow:
         q = self._queue
         try:
             while True:
-                item = await q.get()  # type: ignore[union-attr]
-                if item is _SENTINEL:
+                got = await q.get()  # type: ignore[union-attr]
+                if got is _SENTINEL:
                     break
+                queued_at, item = got
+                got = None
+                lag_ms = int(max(0.0, self._clock() - queued_at) * 1000)
+                if lag_ms > self.counters["queue_lag_max_ms"]:
+                    self.counters["queue_lag_max_ms"] = _count(lag_ms)
                 for pcm in self._resample(item):
                     self._buf += pcm
                 item = None
@@ -1030,14 +1098,17 @@ class PhoneSttShadow:
         elif ev in ("transcript.partial", "transcript.final"):
             text = d.get("text")
             n = len(text.split()) if isinstance(text, str) else 0
+            raw_utt = d.get("utterance_idx")
+            utt = (raw_utt if isinstance(raw_utt, int) and not isinstance(raw_utt, bool)
+                   and 0 <= raw_utt <= 1_000_000 else None)
             text = None  # noqa: F841 - text is dropped right here
             d = None  # type: ignore[assignment]
             if ev == "transcript.partial":
                 self.counters["rt_partials"] += 1
-                self._tracker.rt_partial(n, now)
+                self._tracker.rt_partial(n, now, utt)
             else:
                 self.counters["rt_finals"] += 1
-                self._tracker.rt_final(n, now)
+                self._tracker.rt_final(n, now, utt)
         elif ev == "session.end":
             billed = _num(d.get("audio_duration_s"))
             if billed is not None:

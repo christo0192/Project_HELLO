@@ -13,7 +13,12 @@ this report's output belongs in .gsd/milestones/M015/)
 
 (run it promptly after the calls; Fly's log buffer is short), either the plain
 form (``<ts> app[<id>] <region> [info]{json}``) or the ``--json`` form (a JSON
-object whose ``message`` holds the inner JSON line).
+object whose ``message`` holds the inner JSON line and ``instance`` the machine).
+
+Calls are told apart WITHOUT the correlation id (the phone lane never sets one,
+so it is null on every line): per Fly machine, a new call starts at each
+``config`` line (or at a second ``armed``). If a log has neither machine ids nor
+correlation ids, everything is one call and the report says so.
 
 Usage:
     python app/voice-livekit/tools/stt_shadow_report.py LOG [LOG ...]
@@ -42,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import statistics
 import sys
 from collections import Counter, defaultdict
@@ -53,12 +59,18 @@ G3_MAX = 0.05
 G4_MAX = 0.05
 G5_MIN = 0.90
 AGREE_REL = 0.20
+LAG_WARN_MS = 1000
 
 
 # ── parsing ──────────────────────────────────────────────────────────────────
 
+_MACHINE_RE = re.compile(r"\bapp\[([A-Za-z0-9]{4,32})\]")
+_MACHINE_ID_RE = re.compile(r"^[A-Za-z0-9]{4,32}$")
+
+
 def parse_line(line: str) -> Optional[dict]:
-    """The shadow log object in `line`, or None (not a shadow line / malformed)."""
+    """The shadow log object in `line` (plus ``_machine`` when known), or None
+    (not a shadow line / malformed)."""
     start = line.find("{")
     if start < 0:
         return None
@@ -68,6 +80,13 @@ def parse_line(line: str) -> Optional[dict]:
         return None
     if not isinstance(obj, dict):
         return None
+    machine: Optional[str] = None
+    m = _MACHINE_RE.search(line[:start])
+    if m:
+        machine = m.group(1)
+    inst = obj.get("instance")
+    if machine is None and isinstance(inst, str) and _MACHINE_ID_RE.match(inst):
+        machine = inst
     msg = obj.get("message")
     if isinstance(msg, str) and "{" in msg:
         try:
@@ -78,6 +97,8 @@ def parse_line(line: str) -> Optional[dict]:
             obj = inner
     if obj.get("error_type") != "phone_stt_shadow":
         return None
+    if machine is not None:
+        obj["_machine"] = machine
     return obj
 
 
@@ -114,9 +135,11 @@ class Seg:
 
 
 class Call:
-    def __init__(self, cid: str) -> None:
+    def __init__(self, cid: str, label: Optional[str] = None) -> None:
         self.cid = cid
+        self.label = label if label is not None else cid[:8]
         self.armed = False
+        self.ended = False
         self.segs: dict[int, Seg] = {}
         self.summary: dict[str, int] = {}
         self.connect_sec: Optional[float] = None
@@ -130,9 +153,11 @@ class Call:
 
     @property
     def deaths(self) -> int:
-        if "unrecovered_death" in self.summary:
-            return int(self.summary["unrecovered_death"])
-        return 1 if self.derived_death else 0
+        # The summary is written when the call ends, BEFORE the graceful close,
+        # so a death logged after it (e.g. a 1011 on close) only shows up in the
+        # derived value: take the larger of the two.
+        return max(int(self.summary.get("unrecovered_death", 0)),
+                   1 if self.derived_death else 0)
 
 
 def _num(row: dict, key: str) -> Optional[float]:
@@ -142,13 +167,27 @@ def _num(row: dict, key: str) -> Optional[float]:
 
 def build_calls(rows: list[dict]) -> dict[str, Call]:
     calls: dict[str, Call] = {}
+    current: dict[str, Call] = {}     # machine -> its current call (null-cid lines)
+    seq: Counter = Counter()
     for row in rows:
-        cid = row.get("correlationId") or "unknown"
-        call = calls.setdefault(cid, Call(cid))
+        cid = row.get("correlationId")
         cat = row.get("error_category")
         k = row.get("turn_index")
+        if isinstance(cid, str) and cid:
+            call = calls.setdefault(cid, Call(cid))
+        else:
+            machine = row.get("_machine") or "unknown"
+            call = current.get(machine)
+            if (call is None or cat == "config"
+                    or (cat == "armed" and (call.armed or call.ended))):
+                seq[machine] += 1
+                call = Call(f"m:{machine}#{seq[machine]}", f"{machine[:8]}#{seq[machine]}")
+                calls[call.cid] = call
+                current[machine] = call
         if cat == "armed":
             call.armed = True
+        elif cat == "closed_unarmed":
+            call.ended = True
         elif cat == "seg_partial_lead" and isinstance(k, int):
             call.seg(k).p1 = _num(row, "duration_sec")
         elif cat == "seg_three_word" and isinstance(k, int):
@@ -167,6 +206,7 @@ def build_calls(rows: list[dict]) -> dict[str, Call]:
             s.pmax = int(_num(row, "option_count") or 0)
             s.phase = row.get("phase")
         elif cat == "call_summary":
+            call.ended = True
             name = row.get("schema")
             if isinstance(name, str):
                 call.summary[name] = int(_num(row, "option_count") or 0)
@@ -228,7 +268,7 @@ def call_metrics(call: Call) -> dict[str, Any]:
     agree = sum(1 for s in pairs if agrees(s.lw, s.rw))
     agree_loose = sum(1 for s in pairs if agrees_loose(s.lw, s.rw))
     return {
-        "cid": call.cid[:8],
+        "cid": call.label,
         "segments": len(segs),
         "non_silent": len(nonsilent),
         "g1_median": median(leads),
@@ -241,6 +281,7 @@ def call_metrics(call: Call) -> dict[str, Any]:
         "rt_missed": sum(1 for s in segs if s.klass == "rt_missed"),
         "deaths": call.deaths,
         "frames_dropped": call.summary.get("frames_dropped", 0),
+        "queue_lag_max_ms": call.summary.get("queue_lag_max_ms", 0),
         "silence_partials": call.summary.get("silence_partials", 0),
         "billed_audio_sec": call.billed,
         "_leads": leads, "_savings": savings,
@@ -297,7 +338,17 @@ def aggregate(calls: dict[str, Call], min_calls: int, min_segments: int) -> dict
     for m in per_call:
         m.pop("_leads", None)
         m.pop("_savings", None)
+    warnings = []
+    if any(c.cid.startswith("m:unknown#") for c in used):
+        warnings.append("some lines carry neither a correlation id nor a machine id: "
+                        "they are grouped as one call per `config` line, which may merge "
+                        "concurrent calls; save the logs in the plain or --json form")
+    lag = max([m["queue_lag_max_ms"] for m in per_call] or [0])
+    if lag > LAG_WARN_MS:
+        warnings.append(f"the shadow fell up to {lag} ms behind real time in at least one call "
+                        "(queue lag): its latency metrics (G1, G2) are inflated by that lag")
     return {
+        "warnings": warnings,
         "verdict": verdict,
         "calls": len(used),
         "non_silent_segments": nonsilent,
@@ -310,6 +361,7 @@ def aggregate(calls: dict[str, Call], min_calls: int, min_segments: int) -> dict
                                         sum(m["agree_n"] for m in per_call)),
             "rt_missed_rate": _ratio(sum(m["rt_missed"] for m in per_call), nonsilent),
             "frames_dropped": sum(m["frames_dropped"] for m in per_call),
+            "queue_lag_max_ms": max([m["queue_lag_max_ms"] for m in per_call] or [0]),
             "billed_audio_sec": sum(m["billed_audio_sec"] or 0 for m in per_call),
             "connect_sec_median": median(connect),
             "begin_sec_median": median(begin),
@@ -363,11 +415,14 @@ def render(report: dict[str, Any], skipped: int, total: int) -> str:
                f"silence partials/call {_fmt(a['silence_partials_per_call'])}, "
                f"G5 with +-1 word allowed {_fmt(a['g5_loose_pm1_word'], 'pct')}, "
                f"rt_missed {_fmt(a['rt_missed_rate'], 'pct')}, "
-               f"frames dropped {a['frames_dropped']}, billed audio {_fmt(a['billed_audio_sec'])} s, "
+               f"frames dropped {a['frames_dropped']}, "
+               f"max queue lag {a['queue_lag_max_ms']} ms, billed audio {_fmt(a['billed_audio_sec'])} s, "
                f"connect median {_fmt(a['connect_sec_median'])} s, "
                f"begin median {_fmt(a['begin_sec_median'])} s")
     if a["errors"]:
         out.append("Errors/close codes: " + ", ".join(f"{k} x{v}" for k, v in a["errors"].items()))
+    for w in report.get("warnings", []):
+        out.append("WARNING: " + w)
     out.append("")
     out.append(f"VERDICT: {report['verdict']} "
                f"(needs >= {report['min_calls']} calls and >= {report['min_segments']} "

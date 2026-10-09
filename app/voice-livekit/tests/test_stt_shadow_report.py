@@ -176,7 +176,7 @@ class TestReport(unittest.TestCase):
     def test_script_is_stdlib_only_and_reads_no_env(self):
         import ast
         tree = ast.parse((_TOOLS / "stt_shadow_report.py").read_text(encoding="utf-8"))
-        stdlib = {"argparse", "json", "statistics", "sys", "collections", "typing", "__future__"}
+        stdlib = {"argparse", "json", "re", "statistics", "sys", "collections", "typing", "__future__"}
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 self.assertLessEqual({a.name.split(".")[0] for a in node.names}, stdlib)
@@ -185,13 +185,103 @@ class TestReport(unittest.TestCase):
             elif isinstance(node, ast.Attribute):
                 self.assertNotIn(node.attr, ("environ", "getenv"))
 
-    def test_derived_death_from_socket_lines_only_when_no_summary(self):
+    def test_derived_death_counts_even_after_the_summary(self):
         rows = [row(CID_A, "armed"), row(CID_A, "send_stalled", duration_sec=2.0)]
         report = rep.aggregate(rep.build_calls(rows), 1, 0)
         self.assertEqual(report["criteria"]["G6"]["value"], 1)
-        rows.append(row(CID_A, "call_summary", schema="unrecovered_death", option_count=0))
+        # The summary is written BEFORE the graceful close: a death logged after it
+        # (a 1011 on close) must still count - G6 takes the larger of the two.
+        rows = [row(CID_A, "armed"),
+                row(CID_A, "call_summary", schema="unrecovered_death", option_count=0),
+                row(CID_A, "socket_closed", schema="close_1011", phase="unexpected")]
         report = rep.aggregate(rep.build_calls(rows), 1, 0)
-        self.assertEqual(report["criteria"]["G6"]["value"], 0)
+        self.assertEqual(report["criteria"]["G6"]["value"], 1)
+        rows = [row(CID_A, "armed"),
+                row(CID_A, "call_summary", schema="unrecovered_death", option_count=0),
+                row(CID_A, "socket_closed", schema="close_1000", phase="expected")]
+        self.assertEqual(rep.aggregate(rep.build_calls(rows), 1, 0)["criteria"]["G6"]["value"], 0)
+
+    def test_phone_lane_lines_have_a_null_correlation_id(self):
+        # The phone lane never sets a correlation id: calls are told apart per
+        # Fly machine, a new call at each `config` line. Two machines, one of
+        # them with two back-to-back calls and a socket death in the FIRST.
+        def nrow(cat, **meta):
+            return row(None, cat, **meta)
+
+        def line(machine, r):
+            return f"2026-10-09T10:00:00Z app[{machine}] bom [info]{json.dumps(r)}"
+
+        m1c1 = [nrow("config"), nrow("armed")]
+        for k in range(20):
+            m1c1 += [nrow(c, **{**m, "turn_index": k}) for c, m in (
+                ("seg_partial_lead", {"duration_sec": 0.4}),
+                ("seg_three_word", {"duration_sec": 1.0}),
+                ("seg_legacy_final", {"duration_sec": 2.2, "option_count": 6}),
+                ("seg_rt_final", {"duration_sec": 2.3, "option_count": 6}),
+                ("seg_summary", {"schema": "both", "option_count": 4, "phase": "settled"}))]
+        m1c1.append(nrow("call_summary", schema="unrecovered_death", option_count=1))
+        m1c2 = [nrow("config"), nrow("armed")]
+        for k in range(20):
+            m1c2 += [nrow(c, **{**m, "turn_index": k}) for c, m in (
+                ("seg_partial_lead", {"duration_sec": 0.5}),
+                ("seg_legacy_final", {"duration_sec": 2.0, "option_count": 5}),
+                ("seg_rt_final", {"duration_sec": 2.1, "option_count": 5}),
+                ("seg_summary", {"schema": "both", "option_count": 2, "phase": "settled"}))]
+        m1c2.append(nrow("call_summary", schema="unrecovered_death", option_count=0))
+        m2 = [nrow("config"), nrow("armed")]
+        for k in range(20):
+            m2 += [nrow(c, **{**m, "turn_index": k}) for c, m in (
+                ("seg_partial_lead", {"duration_sec": 0.6}),
+                ("seg_summary", {"schema": "both", "option_count": 1, "phase": "settled"}))]
+        m2.append(nrow("call_summary", schema="unrecovered_death", option_count=0))
+        # interleave the two machines
+        stream = [line("aaaa1111", r) for r in m1c1 + m1c2]
+        stream2 = [line("bbbb2222", r) for r in m2]
+        merged = []
+        for i in range(max(len(stream), len(stream2))):
+            if i < len(stream):
+                merged.append(stream[i])
+            if i < len(stream2):
+                merged.append(stream2[i])
+        for fmt_lines in (merged,):
+            code, out, _ = run([write(fmt_lines), "--json", "--min-calls", "3", "--min-segments", "60"])
+            self.assertEqual(code, 0)
+            report = json.loads(out)
+            self.assertEqual(report["calls"], 3)
+            self.assertEqual(report["non_silent_segments"], 60)
+            self.assertEqual(report["criteria"]["G6"]["value"], 1)     # the death is not hidden
+            labels = sorted(m["cid"] for m in report["per_call"])
+            self.assertEqual(labels, ["aaaa1111#1", "aaaa1111#2", "bbbb2222#1"])
+            per = {m["cid"]: m for m in report["per_call"]}
+            self.assertEqual((per["aaaa1111#1"]["segments"], per["aaaa1111#1"]["deaths"]), (20, 1))
+            self.assertEqual((per["aaaa1111#2"]["segments"], per["aaaa1111#2"]["deaths"]), (20, 0))
+            self.assertEqual(per["bbbb2222#1"]["segments"], 20)
+            self.assertIn("NO-GO", report["verdict"])
+            self.assertEqual(report["warnings"], [])
+
+    def test_json_form_instance_is_the_machine(self):
+        rows = [row(None, "config"), row(None, "armed"),
+                row(None, "call_summary", schema="unrecovered_death", option_count=0)]
+        lines = [json.dumps({"timestamp": "t", "level": "info", "message": json.dumps(r),
+                             "instance": "cafe1234"}) for r in rows]
+        rows2 = [row(None, "config"), row(None, "armed")]
+        lines += [json.dumps({"timestamp": "t", "level": "info", "message": json.dumps(r),
+                              "instance": "cafe1234"}) for r in rows2]
+        report = rep.aggregate(rep.build_calls(rep.read_lines([write(lines)])[0]), 1, 0)
+        self.assertEqual(report["calls"], 2)
+
+    def test_lines_with_no_machine_and_no_cid_warn(self):
+        rows = [row(None, "config"), row(None, "armed")]
+        report = rep.aggregate(rep.build_calls(rows), 1, 0)
+        self.assertEqual(len(report["warnings"]), 1)
+        self.assertIn("WARNING", rep.render(report, 0, 2))
+
+    def test_queue_lag_is_reported_and_warned(self):
+        rows = [row(CID_A, "armed"),
+                row(CID_A, "call_summary", schema="queue_lag_max_ms", option_count=2500)]
+        report = rep.aggregate(rep.build_calls(rows), 1, 0)
+        self.assertEqual(report["also"]["queue_lag_max_ms"], 2500)
+        self.assertTrue(any("behind real time" in w for w in report["warnings"]))
 
     def test_agreement_rule(self):
         self.assertTrue(rep.agrees(10, 12))     # 20 %
