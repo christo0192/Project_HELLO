@@ -14811,9 +14811,10 @@ async def _run_phone_session(
         nonlocal recording_settle_started, teardown_deadline
         deadline = teardown_deadline
         recording_settle_started = True
-        # M015 PR-1: backstop close of the metrics-only STT shadow (the stt_node
-        # `finally` normally got there first). Synchronous + idempotent: the
-        # call summary is emitted before anything can be awaited.
+        # M015 PR-1: close of the metrics-only STT shadow, the ONLY close (the
+        # stt_node wrapper does not close it: the SDK re-invokes stt_node on every
+        # clear_user_turn). Synchronous + idempotent: the call summary is emitted
+        # before anything can be awaited.
         if stt_shadow is not None:
             try:
                 stt_shadow.close_nowait()
@@ -15073,6 +15074,13 @@ async def _run_phone_session(
             await _run_teardown(result, gate_error)
             # C9-1: the bounded detached-upload wait comes BEFORE the arm.
             await _await_detached_finishes()
+            if stt_shadow is not None:
+                # M015 PR-1: bounded (1 s) wait for the shadow's graceful close;
+                # swallow everything, the watchdog below is not postponed beyond it.
+                try:
+                    await stt_shadow.wait_closed(1.0)
+                except Exception:  # noqa: BLE001
+                    pass
             _arm_phone_job_watchdog()
 
         add_shutdown_callback(_phone_job_shutdown)

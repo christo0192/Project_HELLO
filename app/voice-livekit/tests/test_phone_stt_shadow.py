@@ -420,9 +420,25 @@ class TestParsing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(c["rt_unparsed"], 4)
         self.assertEqual(c["errors_nonfatal"], 1)
         self.assertEqual(rec.of("session_end")[0]["duration_sec"], 12.5)
+        self.assertEqual(pss._num("42.1"), 42.1)          # Sarvam sends a string
+        self.assertIsNone(pss._num("x"))
+        self.assertIsNone(pss._num(True))
+        self.assertIsNone(pss._num("-1"))
+        self.assertIsNone(pss._num("nan"))
         self.assertEqual(len(rec.of("session_begin")), 1)
         self.assertEqual(rec.of("socket_error")[0], {"schema": "invalid_config", "phase": "nonfatal"})
         self.assertEqual(c["unrecovered_death"], 0)
+        shadow.close_nowait()
+
+    async def test_session_end_duration_as_documented_string(self):
+        ws = FakeWs()
+        shadow, rec, *_ = make_shadow(ws)
+        shadow.offer(Frame())
+        await settle()
+        ws.feed_json({"event": "session.end", "audio_duration_s": "42.1",
+                      "total_duration_s": "43.0"})
+        await settle()
+        self.assertEqual(rec.of("session_end")[0]["duration_sec"], 42.1)
         shadow.close_nowait()
 
     async def test_fatal_error_event_ends_the_shadow(self):
@@ -533,11 +549,49 @@ class TestTracker(unittest.TestCase):
         row = self.values("seg_legacy_final", 0)[0]
         self.assertEqual((row["duration_sec"], row["option_count"]), (0.8, 7))
 
+    def test_clause_pause_inside_one_utterance_is_one_segment(self):
+        # Review r1 (lens 2): the 0.25 s local VAD cuts an 8-word answer with a
+        # 0.4 s pause into two segments; Sarvam / the main STT keep ONE utterance
+        # (cumulative partials, one final each). Must be one `both` segment.
+        tr = self.tr
+        tr.vad_start(0.0)
+        tr.rt_partial(1, 0.6)
+        tr.vad_end(1.5)
+        tr.rt_partial(3, 1.7)
+        tr.vad_start(1.9)            # 0.4 s pause: continues segment 0
+        tr.rt_partial(4, 2.4)
+        tr.vad_end(3.3)
+        tr.rt_partial(6, 3.5)
+        tr.rt_partial(8, 3.8)
+        tr.rt_final(8, 4.0)
+        tr.legacy_final(8, 4.3)
+        tr.tick(30.0)
+        self.assertEqual(tr.counters["segments"], 1)
+        self.assertEqual(tr.counters["segments_merged"], 1)
+        self.assertEqual(self.seg_summary(0)["schema"], "both")
+        self.assertEqual(self.seg_summary(0)["option_count"], 8)
+        self.assertEqual(self.values("seg_three_word", 0)[0]["duration_sec"], 1.7)
+        self.assertEqual(len([c for c, _ in self.rec.events if c == "seg_summary"]), 1)
+        self.assertEqual(tr.counters["silence_partials"], 0)
+
+    def test_restart_after_a_final_or_a_long_gap_is_a_new_segment(self):
+        tr = self.tr
+        tr.vad_start(0.0)
+        tr.vad_end(1.0)
+        tr.legacy_final(3, 1.5)      # a final landed: the next speech is new
+        tr.vad_start(1.6)
+        tr.vad_end(2.0)
+        tr.vad_start(2.8)            # gap 0.8 s > MERGE_GAP: new segment
+        tr.vad_end(3.0)
+        tr.tick(30.0)
+        self.assertEqual(tr.counters["segments"], 3)
+        self.assertEqual(tr.counters["segments_merged"], 0)
+
     def test_legacy_final_after_the_next_vad_start_goes_to_the_older_segment(self):
         tr = self.tr
         tr.vad_start(10.0)
         tr.vad_end(11.0)
-        tr.vad_start(11.5)          # next utterance already started
+        tr.vad_start(11.9)          # next utterance already started (gap > MERGE_GAP)
         tr.legacy_final(6, 12.0)    # belongs to the older, ended segment
         tr.vad_end(13.0)
         tr.legacy_final(2, 14.0)
@@ -798,8 +852,8 @@ class TestClose(unittest.IsolatedAsyncioTestCase):
 
     def test_close_without_a_loop_or_before_arming(self):
         shadow, rec, *_ = make_shadow(FakeWs())
-        shadow.close_nowait()          # never armed: no summary, no error
-        self.assertEqual(rec.events, [])
+        shadow.close_nowait()          # never armed: no summary, one closed_unarmed line
+        self.assertEqual([c for c, _ in rec.events], ["closed_unarmed"])
         shadow.offer(Frame())          # closed: ignored, no loop needed
         self.assertIsNone(shadow._task)
 
@@ -1028,6 +1082,35 @@ class TestCaps(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((row["schema"], row["phase"]), ("close_1000", "expected"))
         self.assertEqual(shadow.counters["unrecovered_death"], 0)
         self.assertEqual(ws.sent[-1], {"event": "end"})
+
+    async def test_after_a_graceful_end_the_audio_path_stops_counting(self):
+        # Review r1: once the supervisor is done (1 h cap), offer() must not keep
+        # filling the queue and counting every frame as dropped.
+        ws = FakeWs()
+        shadow, rec, clock, *_ = make_shadow(ws)
+        shadow.offer(Frame())
+        await settle()
+        clock.t += pss.MAX_SESSION_SEC + 1
+        await asyncio.wait_for(shadow._task, 3)
+        self.assertTrue(shadow._dead)
+        offered = shadow.counters["frames_offered"]
+        for _ in range(pss.QUEUE_MAX + 50):
+            shadow.offer(Frame())
+        self.assertEqual(shadow.counters["frames_offered"], offered)
+        self.assertEqual(shadow.counters["frames_dropped"], 0)
+        self.assertEqual(shadow.counters["unrecovered_death"], 0)
+        shadow.close_nowait()
+        self.assertEqual(len(rec.of("call_summary")), len(pss.COUNTER_NAMES))
+
+    async def test_wait_closed_is_bounded_and_never_raises(self):
+        ws = FakeWs()
+        shadow, rec, *_ = make_shadow(ws)
+        await shadow.wait_closed(0.05)           # no task yet
+        shadow.offer(Frame())
+        await settle()
+        shadow.close_nowait()
+        await shadow.wait_closed(2.0)
+        self.assertTrue(shadow._task.done())
 
     def test_constants_match_the_plan(self):
         self.assertEqual(

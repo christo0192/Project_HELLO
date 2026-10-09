@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 from tests import test_phone_gate as fixtures
 from tests.test_phone_endpointing_phase import _SessionHarness
-from tests.test_phone_stt_shadow import FakeWs, make_shadow
+from tests.test_phone_stt_shadow import FakeWs, Frame, make_shadow
 
 import phone_stt_shadow as pss
 
@@ -111,10 +111,21 @@ class TestSessionParity(unittest.IsolatedAsyncioTestCase):
             classes.append(cls)
             return cls
 
+        feeders: list = []
+
+        async def feed(shadow):
+            # Stands in for the SDK pump that calls shadow.offer() from the
+            # stt_node tee: synthetic frames every few ms until the call's
+            # teardown closes the shadow. This is what ARMS it (at consent).
+            while not shadow._closed:
+                shadow.offer(Frame())
+                await asyncio.sleep(0.005)
+
         def build(**kwargs):
             shadow, *_ = make_shadow(FakeWs())
             shadow._armed = kwargs["armed"]
             built.append(shadow)
+            feeders.append(asyncio.get_running_loop().create_task(feed(shadow)))
             return shadow
 
         env = {"PHONE_STT_SHADOW": "on" if shadow_on else "off", "SARVAM_API_KEY": "synthetic-key"}
@@ -127,6 +138,10 @@ class TestSessionParity(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, env), patcher,                 patch.object(agent_mod.Agent, "stt_node", new=stub_stt_node, create=True),                 patch.object(phone, "phone_agent_class", side_effect=spy_class):
             session, client = await _SessionHarness(self).run(
                 replies=["Yes.", "I worked on a billing system.", "Another answer."])
+        for task in feeders:
+            await asyncio.wait_for(task, 5)
+            if built and built[0]._task is not None:
+                await asyncio.wait_for(asyncio.wait({built[0]._task}), 5)
         return session, client, built, classes
 
     @staticmethod
@@ -158,6 +173,12 @@ class TestSessionParity(unittest.IsolatedAsyncioTestCase):
                          self._observable(on_session, on_client))
         self.assertTrue(off_session.spoken)
         self.assertTrue(built[0]._closed)   # teardown closed the shadow
+        # the ARMED path ran end to end beside the call: it latched at consent,
+        # opened its socket, took frames and emitted its summary - and the call's
+        # observable output above is still identical.
+        self.assertTrue(built[0]._latched)
+        self.assertGreater(built[0].counters["frames_offered"], 0)
+        self.assertGreaterEqual(built[0].counters["chunks_sent"], 0)
 
     async def test_a_build_exception_leaves_the_call_unchanged(self):
         off_session, off_client, _, _ = await self._run(False)

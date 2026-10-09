@@ -58,6 +58,7 @@ _AUDIO_WIRE = "json_b64"
 _USER_AGENT = "hello-phone-stt-shadow/1"
 
 TAIL = 1.0            # a partial up to 1.0 s after E_k still belongs to segment k
+MERGE_GAP = 0.7      # a local-VAD restart within 0.7 s of E_k (no final yet) continues segment k
 SETTLE = 3.0          # a segment stays open for late finals until E_k + 3.0 s
 MAX_SEGMENTS = 2000   # beyond this only the summary counts
 WORD_CAP = 999        # cap on any logged word count
@@ -88,7 +89,7 @@ COUNTER_NAMES = (
     "segments", "silence_partials", "silence_partial_words", "rt_empty_partials",
     "orphan_legacy_finals", "orphan_rt_finals", "main_finals", "main_finals_empty",
     "rt_partials", "rt_finals", "rt_vad_starts", "rt_unparsed", "frames_offered",
-    "frames_dropped", "chunks_sent", "errors_nonfatal", "unrecovered_death",
+    "frames_dropped", "chunks_sent", "errors_nonfatal", "unrecovered_death", "segments_merged",
 )
 
 MSG_TEXT = "text"
@@ -213,6 +214,18 @@ def _r3(value: float) -> float:
         return 0.0
 
 
+def _num(value: Any) -> Optional[float]:
+    """A finite non-negative number from a number or a numeric string (Sarvam
+    sends ``audio_duration_s`` as a string, e.g. "42.1"), else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) and out >= 0 else None
+
+
 def _words(n: int) -> int:
     return max(0, min(WORD_CAP, int(n)))
 
@@ -291,6 +304,7 @@ class SegmentTracker:
         self._active: list[_Segment] = []
         self._next_k = 0
         self.armed = False
+        self.merge_gap = MERGE_GAP
 
     # -- helpers
     def _open_segment(self) -> Optional[_Segment]:
@@ -309,6 +323,18 @@ class SegmentTracker:
         self._settle(now)
         if self._open_segment() is not None:
             return  # duplicate start: keep the open segment
+        # The deployed local VAD cuts at 0.25 s of silence; Sarvam and the main
+        # STT keep one utterance across a ~0.7 s pause (cumulative partials, ONE
+        # final). So a restart within MERGE_GAP of the last end, before any final
+        # landed on that segment, is the same utterance: re-open it (S_k, the
+        # barge-in anchor, is unchanged) instead of opening segment k+1.
+        if self._active:
+            last = self._active[-1]
+            if (last.end is not None and now - last.end <= self.merge_gap
+                    and last.f is None and last.rf is None):
+                last.end = None
+                self.counters["segments_merged"] += 1
+                return
         self._active.append(_Segment(self._next_k, now))
         self._next_k += 1
         self.counters["segments"] += 1
@@ -716,6 +742,10 @@ class PhoneSttShadow:
                 self._emit_summary()
             except Exception:  # noqa: BLE001
                 pass
+        else:
+            # The call ended without the shadow ever arming (no consent, or no
+            # frame after it): say so, so "config but nothing else" is not silent.
+            self._emit("closed_unarmed")
         try:
             task = self._task
             if task is not None and not task.done():
@@ -723,6 +753,17 @@ class PhoneSttShadow:
                     task.cancel()          # still connecting
                 else:
                     self._begin_graceful()
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def wait_closed(self, timeout: float = 1.0) -> None:
+        """Teardown-only courtesy: give the supervisor a short, bounded moment to
+        finish its graceful close so the job does not exit with a pending task
+        and an unclosed client session. Never raises, never cancels it."""
+        try:
+            task = self._task
+            if task is not None and not task.done():
+                await asyncio.wait({task}, timeout=timeout)
         except Exception:  # noqa: BLE001
             pass
 
@@ -797,6 +838,12 @@ class PhoneSttShadow:
         except Exception as exc:  # noqa: BLE001
             self._fail("close", exc)
         finally:
+            # Whatever ended the supervisor, the shadow is finished: offer /
+            # observe_main / on_local_vad stop at once (no queue filling, no
+            # spurious frames_dropped). unrecovered_death stays for unexpected
+            # endings only (_mark_death), so set the flag directly.
+            was_dead = self._dead
+            self._dead = True
             if self._hard_timer is not None:
                 try:
                     self._hard_timer.cancel()
@@ -820,7 +867,7 @@ class PhoneSttShadow:
                     await asyncio.wait_for(ws.close(), self._socket_close)
                 except Exception:  # noqa: BLE001
                     pass
-                if not self._dead:
+                if not was_dead:
                     self._log_closed(getattr(ws, "close_code", None))
             self._drain()
 
@@ -992,9 +1039,8 @@ class PhoneSttShadow:
                 self.counters["rt_finals"] += 1
                 self._tracker.rt_final(n, now)
         elif ev == "session.end":
-            billed = d.get("audio_duration_s")
-            if isinstance(billed, (int, float)) and not isinstance(billed, bool) \
-                    and math.isfinite(billed):
+            billed = _num(d.get("audio_duration_s"))
+            if billed is not None:
                 self._emit("session_end", duration_sec=_r3(billed))
             else:
                 self._emit("session_end")
@@ -1095,10 +1141,11 @@ def wrap_stt_node(base_stt_node: Callable[..., Any], shadow: PhoneSttShadow) -> 
                     pass
                 yield ev
         finally:
-            try:
-                shadow.close_nowait()
-            except Exception:  # noqa: BLE001
-                pass
+            # The shadow belongs to the CALL, not to this invocation: the SDK
+            # rebuilds its STT pipeline (and calls stt_node again) on every
+            # clear_user_turn(), including the gate's pre-consent ones. Closing
+            # here would kill the shadow before it ever arms. The call's end is
+            # closed by agent.py's teardown (close_nowait) instead.
             aclose = getattr(node, "aclose", None)
             if aclose is not None:
                 try:

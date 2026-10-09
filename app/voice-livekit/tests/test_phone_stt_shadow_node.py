@@ -165,7 +165,9 @@ class TestByteIdentical(unittest.IsolatedAsyncioTestCase):
         ws = FakeWs()
         shadow, rec = await self._on_mode(ws)
         self.assertGreater(shadow.counters["frames_offered"], 0)
-        self.assertTrue(shadow._closed)
+        self.assertFalse(shadow._closed)   # the wrapper never closes the shadow
+        shadow.close_nowait()
+        await asyncio.wait_for(shadow._task, 5)
 
     async def test_on_armed_mid_stream(self):
         ws = FakeWs()
@@ -239,7 +241,7 @@ class _Spy:
 
 
 class TestLifecycle(unittest.IsolatedAsyncioTestCase):
-    async def test_cancelling_the_consumer_closes_the_inner_node_and_the_shadow(self):
+    async def test_cancelling_the_consumer_closes_the_inner_node_not_the_shadow(self):
         spy = _Spy()
         received, closed = [], []
 
@@ -266,7 +268,7 @@ class TestLifecycle(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
         self.assertEqual(closed, [True])
-        self.assertEqual(spy.closes, 1)
+        self.assertEqual(spy.closes, 0)
 
     async def test_aclose_on_the_outer_generator_closes_the_inner_node(self):
         spy = _Spy()
@@ -285,13 +287,13 @@ class TestLifecycle(unittest.IsolatedAsyncioTestCase):
         await gen.__anext__()
         await gen.aclose()
         self.assertEqual(closed, [True])
-        self.assertEqual(spy.closes, 1)
+        self.assertEqual(spy.closes, 0)
 
-    async def test_normal_end_closes_once(self):
+    async def test_normal_end_does_not_close_the_shadow(self):
         spy = _Spy()
         cls = phone.phone_agent_class(make_base([], scripted_events(), []), stt_shadow=spy)
         await run_node(cls, [Frame() for _ in range(60)])
-        self.assertEqual(spy.closes, 1)
+        self.assertEqual(spy.closes, 0)
         self.assertEqual(spy.frames, 60)
 
     async def test_base_returning_a_coroutine_or_none(self):
@@ -317,7 +319,38 @@ class TestLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(out, [ev])
         out, _ = await run_node(phone.phone_agent_class(NoneBase, stt_shadow=spy), [Frame()])
         self.assertEqual(out, [])
-        self.assertEqual(spy.closes, 2)
+        self.assertEqual(spy.closes, 0)
+
+
+class TestPipelineRestart(unittest.IsolatedAsyncioTestCase):
+    """The SDK re-invokes stt_node (and cancels the old pump) on every
+    clear_user_turn(); the gate does that BEFORE consent. The shadow must
+    survive it, arm afterwards, and keep counting."""
+
+    async def test_restart_before_consent_does_not_kill_the_shadow(self):
+        flag = [False]
+        shadow, rec, *_ = make_shadow(FakeWs(), armed=flag)
+        cls = phone_cls(make_base([], scripted_events(), []), shadow)
+        # invocation 1: pre-consent, torn down mid-stream (aclose on the outer gen)
+        gen = cls.stt_node(object.__new__(cls), audio_source([Frame() for _ in range(40)]), None)
+        await gen.__anext__()
+        await gen.aclose()
+        self.assertFalse(shadow._closed)
+        self.assertEqual(shadow.counters["frames_offered"], 0)
+        # consent lands; invocation 2 is the rebuilt pipeline
+        flag[0] = True
+        await run_node(cls, [Frame() for _ in range(N_FRAMES)])
+        self.assertTrue(shadow._latched)
+        self.assertGreater(shadow.counters["frames_offered"], 0)
+        self.assertEqual(shadow.counters["main_finals"], 2)
+        self.assertIn("armed", [c for c, _ in rec.events])
+        # a second restart AFTER arming keeps the same shadow too
+        before = shadow.counters["frames_offered"]
+        await run_node(cls, [Frame() for _ in range(20)])
+        self.assertEqual(shadow.counters["frames_offered"], before + 20)
+        shadow.close_nowait()
+        await asyncio.wait_for(shadow._task, 5)
+        self.assertEqual(len(rec.of("call_summary")), len(pss.COUNTER_NAMES))
 
 
 if __name__ == "__main__":

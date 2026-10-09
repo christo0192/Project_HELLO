@@ -316,5 +316,86 @@ class TestLocalFakeSarvam(unittest.IsolatedAsyncioTestCase):
         self.assertIn(failed[0]["schema"], ("connector", "other"))
 
 
+@unittest.skipIf(_SDK is None, "real livekit-agents SDK not installed (bare python)")
+class TestPipelineRestart(unittest.IsolatedAsyncioTestCase):
+    """Review r1 (major): the gate's pre-consent ``clear_user_turn()`` makes the
+    SDK cancel its ``_STTPipeline`` pump and build a new one (which calls
+    ``stt_node`` again). The shadow belongs to the call, so it must survive that,
+    arm after consent, and count frames of the REBUILT pipeline."""
+
+    def test_clear_user_turn_is_a_pipeline_rebuild(self):
+        src = inspect.getsource(_SDK["audio_recognition"].AudioRecognition.clear_user_turn)
+        self.assertIn("self.update_stt(None)", src)
+        self.assertIn("self.update_stt(stt)", src)
+
+    async def test_shadow_survives_pipeline_restarts_before_and_after_arming(self):
+        import phone_stt_shadow as pss
+        rtc = _SDK["rtc"]
+        AudioRecognition = _SDK["audio_recognition"]
+
+        class _Ws:
+            close_code = None
+
+            def __init__(self):
+                self.sent = 0
+
+            async def send_str(self, data):
+                self.sent += 1
+
+            async def receive(self):
+                await asyncio.Event().wait()
+
+            async def close(self):
+                pass
+
+        ws = _Ws()
+        rows: list = []
+
+        async def factory(url, headers):
+            return ws
+
+        flag = [False]
+        shadow = pss.PhoneSttShadow(
+            pss.ShadowConfig(), api_key="synthetic", armed=lambda: flag[0],
+            ws_factory=factory, emitter=lambda cat, **m: rows.append(cat))
+
+        async def base(audio, model_settings):
+            async for _ in audio:
+                pass
+            if False:
+                yield None
+
+        node = pss.wrap_stt_node(lambda self, a, m: base(a, m), shadow)
+
+        def stt_node(audio, model_settings):
+            return node(None, audio, model_settings)
+
+        def frame():
+            return rtc.AudioFrame(data=bytes(960), sample_rate=48000, num_channels=1,
+                                  samples_per_channel=480)
+
+        async def run_pipeline(n):
+            pipe = AudioRecognition._STTPipeline(stt_node)
+            for _ in range(n):
+                pipe.audio_ch.send_nowait(frame())
+            await asyncio.sleep(0.05)
+            await pipe.aclose()                 # what update_stt(None) does
+
+        await run_pipeline(10)                  # pre-consent pipeline, then torn down
+        self.assertFalse(shadow._closed)
+        self.assertEqual(shadow.counters["frames_offered"], 0)
+        flag[0] = True                          # consent
+        await run_pipeline(10)                  # the rebuilt pipeline
+        self.assertTrue(shadow._latched)
+        self.assertEqual(shadow.counters["frames_offered"], 10)
+        await run_pipeline(10)                  # and another restart after arming
+        self.assertEqual(shadow.counters["frames_offered"], 20)
+        self.assertFalse(shadow._closed)
+        shadow.close_nowait()                   # the teardown owner closes it, once
+        await asyncio.wait({shadow._task}, timeout=5)
+        self.assertEqual(rows.count("armed"), 1)
+        self.assertNotIn("closed_unarmed", rows)
+
+
 if __name__ == "__main__":
     unittest.main()

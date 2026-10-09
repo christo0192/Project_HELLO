@@ -116,7 +116,8 @@ class TestReport(unittest.TestCase):
             self.assertAlmostEqual(c["G2"]["value"], 1.0)
             self.assertAlmostEqual(c["G3"]["value"], 1 / 6)
             self.assertAlmostEqual(c["G4"]["value"], 1 / 6)
-            self.assertAlmostEqual(c["G5"]["value"], 0.75)
+            self.assertAlmostEqual(c["G5"]["value"], 0.5)   # strict +-20 %
+            self.assertAlmostEqual(rep_["also"]["g5_loose_pm1_word"], 0.75)  # informational
             self.assertEqual(c["G6"]["value"], 1)
             self.assertEqual({k: v["pass"] for k, v in c.items()},
                              {"G1": True, "G2": True, "G3": False, "G4": False,
@@ -134,7 +135,8 @@ class TestReport(unittest.TestCase):
         self.assertAlmostEqual(a["g1_median"], 0.4)
         self.assertAlmostEqual(a["g2_median"], 1.35)
         self.assertEqual((a["agree"], a["agree_n"], a["deaths"]), (2, 2, 0))
-        self.assertEqual((b["false3"], b["agree"], b["agree_n"], b["deaths"]), (1, 1, 2, 1))
+        self.assertEqual((b["false3"], b["agree"], b["agree_n"], b["deaths"]), (1, 0, 2, 1))
+        self.assertEqual(b["agree_loose"], 1)
 
     def test_a_clean_dataset_is_go(self):
         rows = []
@@ -192,10 +194,15 @@ class TestReport(unittest.TestCase):
         self.assertEqual(report["criteria"]["G6"]["value"], 0)
 
     def test_agreement_rule(self):
-        self.assertTrue(rep.agrees(2, 3))       # +-1 word
         self.assertTrue(rep.agrees(10, 12))     # 20 %
+        self.assertTrue(rep.agrees(5, 5))
+        self.assertFalse(rep.agrees(2, 3))      # strict: 1 word of 3 is 33 %
+        self.assertFalse(rep.agrees(3, 4))
         self.assertFalse(rep.agrees(10, 13))
         self.assertFalse(rep.agrees(3, 6))
+        self.assertTrue(rep.agrees_loose(2, 3))  # informational variant: +-1 word
+        self.assertTrue(rep.agrees_loose(10, 12))
+        self.assertFalse(rep.agrees_loose(3, 6))
 
 
 if __name__ == "__main__":

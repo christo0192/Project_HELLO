@@ -6,7 +6,10 @@ network and is never imported by the worker (it is not in the image).
 
 Input: text saved from
 
-    fly logs -a project-hello-phone-voice --no-tail > shadow-YYYYMMDD.log
+    fly logs -a project-hello-phone-voice --no-tail | grep phone_stt_shadow > shadow-YYYYMMDD.log
+
+(filter on save: the raw dump holds every worker line; only the filtered file or
+this report's output belongs in .gsd/milestones/M015/)
 
 (run it promptly after the calls; Fly's log buffer is short), either the plain
 form (``<ts> app[<id>] <region> [info]{json}``) or the ``--json`` form (a JSON
@@ -26,7 +29,8 @@ computed here. Thresholds are research section 5, "Go criteria for PR-2":
     G2 median 3rd-word saving (legacy final time - 3rd-word time) >= 0.8 s
     G3 noise partials / non-silent segments <= 5 %
     G4 false 3-word (3rd partial word but legacy final < 3 words) / non-silent <= 5 %
-    G5 final word counts agree (+-1 word or +-20 %) on >= 90 % of segments
+    G5 final word counts agree (+-20 %, research section 5) on >= 90 % of segments
+       (the looser "+-1 word or +-20 %" rate is shown next to it, informational only)
     G6 unrecovered socket deaths = 0
 
 GO needs G1-G6 all passing AND at least --min-calls calls with at least
@@ -204,8 +208,13 @@ def median(values: list[float]) -> Optional[float]:
 
 
 def agrees(lw: int, rw: int) -> bool:
-    diff = abs(rw - lw)
-    return diff <= 1 or diff / max(lw, rw) <= AGREE_REL
+    """Research section 5: word counts within +-20 % (G5, gated)."""
+    return abs(rw - lw) / max(lw, rw) <= AGREE_REL
+
+
+def agrees_loose(lw: int, rw: int) -> bool:
+    """Informational only: also accept a one-word difference."""
+    return abs(rw - lw) <= 1 or agrees(lw, rw)
 
 
 def call_metrics(call: Call) -> dict[str, Any]:
@@ -217,6 +226,7 @@ def call_metrics(call: Call) -> dict[str, Any]:
     false3 = sum(1 for s in nonsilent if s.p3 is not None and s.lw < 3)
     pairs = [s for s in segs if s.lw >= 1 and s.rf is not None]
     agree = sum(1 for s in pairs if agrees(s.lw, s.rw))
+    agree_loose = sum(1 for s in pairs if agrees_loose(s.lw, s.rw))
     return {
         "cid": call.cid[:8],
         "segments": len(segs),
@@ -226,6 +236,7 @@ def call_metrics(call: Call) -> dict[str, Any]:
         "noise": noise,
         "false3": false3,
         "agree": agree,
+        "agree_loose": agree_loose,
         "agree_n": len(pairs),
         "rt_missed": sum(1 for s in segs if s.klass == "rt_missed"),
         "deaths": call.deaths,
@@ -295,6 +306,8 @@ def aggregate(calls: dict[str, Call], min_calls: int, min_segments: int) -> dict
         "criteria": criteria,
         "also": {
             "silence_partials_per_call": _ratio(sum(m["silence_partials"] for m in per_call), len(used)),
+            "g5_loose_pm1_word": _ratio(sum(m["agree_loose"] for m in per_call),
+                                        sum(m["agree_n"] for m in per_call)),
             "rt_missed_rate": _ratio(sum(m["rt_missed"] for m in per_call), nonsilent),
             "frames_dropped": sum(m["frames_dropped"] for m in per_call),
             "billed_audio_sec": sum(m["billed_audio_sec"] or 0 for m in per_call),
@@ -348,6 +361,7 @@ def render(report: dict[str, Any], skipped: int, total: int) -> str:
     out.append("")
     out.append("Also (not gated): "
                f"silence partials/call {_fmt(a['silence_partials_per_call'])}, "
+               f"G5 with +-1 word allowed {_fmt(a['g5_loose_pm1_word'], 'pct')}, "
                f"rt_missed {_fmt(a['rt_missed_rate'], 'pct')}, "
                f"frames dropped {a['frames_dropped']}, billed audio {_fmt(a['billed_audio_sec'])} s, "
                f"connect median {_fmt(a['connect_sec_median'])} s, "
