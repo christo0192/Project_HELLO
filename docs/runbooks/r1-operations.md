@@ -1481,7 +1481,7 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   opening-style note per free reply, a warm confirmation once a call is booked, the decision maker on the
   public card, the $7,000 anchor never an offer, "I can check with my manager" grants nothing, and the
   time cue is the learner's own next call; learner iteration 2 is revision 11, iteration 3 revision 12
-  and the final review round 1 revision 13 (see the next bullets).
+  and the final review round 1 revision 13, and the ship restore revision 14 (see the next bullets).
   `docs/design/r1/R1-PLAN-final.md` carries the `L-NO-FEEDBACK`
   text (a test compares it). Check the pin comment and `CONTENT_REVISION` after every merge of main: a
   second branch that also changed pinned text takes one more bump and a recomputed hash.
@@ -1491,8 +1491,8 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   six replies is taken off. Style edits are counted in the guard summary (`style_edits`), never posted and
   never a leak. Two new HYGIENE categories join `ack_format` and `repeat`: `reopen` (a question or a doubt
   after a MEDIUM or STRONG call was booked: the reply becomes a warm confirmation) and `misread` (the
-  $7,000 taken for an offer, thanks for a discount nobody granted, "it's just me deciding", the time cue
-  turned round). They show as `r1_guard_reopen` / `r1_guard_misread` log keys, count toward nothing and are
+  $7,000 taken for an offer, thanks for a discount nobody granted, the time cue turned round; "it's just
+  me deciding" was a rule here too and is gone, see the ship restore). They show as `r1_guard_reopen` / `r1_guard_misread` log keys, count toward nothing and are
   not posted to the API (`HYGIENE_CATEGORIES`). The rehearsal scorecard gates the tics (no reaction word on
   more than 15 % of the replies, "hmm" and "honestly" on at most 20 % each); reply length is information
   only.
@@ -1505,9 +1505,9 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   one question and a free reply none when one of its last two replies asked (a bare "Okay." keeps its
   question); "a stretch" and "what would it involve" are used once per call (a second "a stretch" is said
   another way); the price notes know where the price stands (nothing at or below the $7,000 ask is "a
-  stretch" or "better than before" when it did not move); "that matches what I'd heard" about another
-  figure becomes the real $7,000 line; the decision maker never "isn't one for calls"; spelled-out amounts
-  and per-month reactions are checked; a proposed call stays unaccepted until the window opens (a hold
+  stretch" or "better than before" when it did not move); (the rules that turned "that matches what I'd
+  heard" about another figure into the real $7,000 line, kept the decision maker from "isn't one for calls"
+  and checked spelled-out amounts were removed by the ship restore below); a proposed call stays unaccepted until the window opens (a hold
   note); a call the learner declined is not booked at the farewell; a push the learner already voiced
   (falling behind) is not owed again; an owed move waits ONE turn when the advisor asks a direct question
   about the learner or the people in their decision; a deep need takes the reply before another topic's
@@ -1518,12 +1518,14 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   line matches the existing "book a call ... so we can decide" frames).
 * **Learner final review round 1 (R1-Q S01, content revision 13).** The two Opus reviews of the PR-A head
   and the third live sweep found a regression and several gaps; all fixes are deterministic, no extra
-  model call. (a) "Before I go" is removed only as a closing clause (leading, a comma-bounded aside, or
-  the end of the sentence): "before I go any further / down this road" is an ordinary sentence. (b) The
-  enrolment ask is an invitation to act (pay, reserve, enrol, a payment or enrolment LINK or form):
-  sending the payment, registration or enrolment DETAILS, options or information is an e-mail offer, so
-  a strong advisor's "I'll email the curriculum and payment details" no longer earns a scripted "I'll pay
-  the deposit today". STRONG is also blocked (the grade becomes MEDIUM, and WEAK after a declined call)
+  model call. (Items (a), (b) in part, (c) and (f), the `pending_ask_at_farewell` label and the short mask
+  frames below were rolled back by the ship restore: see the next bullet. They stay listed because the
+  revision 13 text and logs still name them.) (a) "Before I go" is removed only as a closing clause
+  (leading, a comma-bounded aside, or the end of the sentence): "before I go any further / down this road"
+  is an ordinary sentence. (b) The enrolment ask is an invitation to act (pay, reserve, enrol, a payment
+  or enrolment LINK or form): sending the payment, registration or enrolment DETAILS, options or
+  information is an e-mail offer, so a strong advisor's "I'll email the curriculum and payment details" no
+  longer earns a scripted "I'll pay the deposit today". STRONG is also blocked (the grade becomes MEDIUM, and WEAK after a declined call)
   when the learner turned a call down, said it will wait (the last 3 learner turns), or said it must talk
   to its decision maker first and the advisor did not address that afterwards (`strong_blocked:*` in the
   plan reasons). The STRONG line no longer says "for that plan". (c) The persona has ONE decider: a
@@ -1547,10 +1549,52 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   never text. Read them first when a commitment is lower than the advisor seemed to earn. (h) The
   rehearsal harness measures the literal first word of every reply (no whitelist), the decider stall and
   the money line per call and per window, and allows the offer ledger's prices in the fact check.
-  The scorer-side mask (`transcript.ts`) also matches the SHORT frames of the scripted wordings, so a
-  barge-in cut at any word boundary still hides the level. DeepSeek balance: a live sweep needs about 0.31
+  The scorer-side mask (`transcript.ts`) matched the SHORT frames of the scripted wordings (replaced by
+  whole-sentence frames in the ship restore). DeepSeek balance: a live sweep needs about 0.31
   USD and the harness refuses to start below 0.60; the phone scorer shares the account, so top it up before
   a sweep and before the owner test.
+* **Learner ship restore (R1-Q S01 PR-A, content revision 14; owner decision 2026-10-09).** "Ship the
+  improvements now": PR-A ships only what is proven better than production (`origin/main`); anything that
+  was worse behaves exactly like production. Five review rounds of narrowing rules did not converge, so
+  this round only restored production's code or deleted a PR-A-only rule; it added no regex, rule,
+  exemption or guard category. Accepted gaps (not shipped in PR-A): co-decider and timing consistency
+  (owner point 3), the deep need on follow-up digs (owner point 5), wordiness, and every detector miss or
+  false positive production also has. What changed against the final review round 1 text above:
+  * Enrolment ask: `r1_commitment._ENROL_ASK` and the per-sentence reading of `enrol_ask_in` are
+    production's, verbatim (a test pins the pattern fingerprint and production's confusion counts on the
+    detector corpus). "Can I send you the curriculum?" is an enrolment ask again, as in production; the
+    resource-link, look-ahead and question-frame helpers are deleted.
+  * Conditional commitments (`If Thursday works for you, great.`, `I'll reach out if I decide ...`) keep
+    the level they have in production, so the gate sees them; the negation check stays.
+  * Late asks: there is no `late_ask_accepted` exemption (a MEDIUM acceptance in a free reply is a
+    `commitment` hit, as in production) and no `late_asks` admin-log key.
+  * Farewell: no `pending_ask_at_farewell` reason. An early ask no longer turns the goodbye into a
+    booking; a goodbye in the window goes through `register_close_attempt` (the WEAK stall), as in
+    production. `_pending_ask` still feeds the hold note.
+  * Early goodbye: the scripted redirect is production's `Oh wait, before you go... <owed line>` again
+    (`REDIRECT_OPENERS[0]`), not an in-context brief voiced after the model's own "bye".
+  * Call reader (kept, recall 31 of 38 on the triage set against 14 in production): the alternatives
+    `message|whatsapp`, `take`, the part-of-the-day words of the time ask and the `so he/she/you ...` look-ahead
+    were removed, because each added a false positive production does not have.
+  * Guard: the rules `decider_alone`, `decider_contradicted`, `decider_unwilling`, `heard_not_anchor`,
+    `heard_in_line`, `better_unchanged`, the three "before I go" strips and the money-cue/spelled-quantity
+    amount check are deleted (the learner amount check and `r1_text.canonical_amounts` are production's);
+    `anchor_taken_as_offer`, the repeat and tic guards, the stall quota and the confirm-only rule stay. Their
+    canned lines (`ANCHOR_HEARD_REPLACEMENT`, `ANCHOR_HEARD_BELOW`, `PRICE_UNCHANGED_REPLACEMENT`) and the
+    manifest keys that pinned them are gone, so `CONTENT_REVISION` is 14.
+  * Scorer mask (`transcript.ts`): production's four frames, verbatim, plus each new scripted wording as a
+    WHOLE trimmed sentence (the MEDIUM line with the advisor's slot, its moved and deferred forms, the
+    call-back WEAK line, the e-mailed WEAK line). A barge-in cut of a new wording is no longer hidden
+    (production never hid them either); ordinary learner speech is hidden only where production hides it.
+  * Cost bound: `RolePlayEngine.plan_turn` reads at most the last 4,000 characters of an advisor turn
+    (`MAX_CANDIDATE_CHARS`), the identity for every real turn (the longest live turn is about 1,070
+    characters) and for non-strings. It only caps the cost of pathological speech-to-text.
+  Still in force from the earlier rounds (proved better than production): no WEAK stall loop (the WEAK line
+  at most once, a stall quota), no verbatim deflection, intent-voiced in-context objections and topic
+  triggers, the repetition guard, tic control, a confirmation only after a commitment, the $7,000 anchor
+  never read as an offer, no unprompted need dumps, the MEDIUM line with the advisor's slot. One residual is
+  worse than production and needs an owner decision: the call object `talk to your father ...` reads two
+  pushy live turns (of 1,477) as a call proposal.
 
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 

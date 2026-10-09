@@ -88,63 +88,24 @@ export const R1_NAME_MASK = '[CANDIDATE]';
  * worker and is NOT scoring evidence, so the scorer sees a masked placeholder instead of
  * which level the learner chose. Matching is sentence-level so surrounding talk survives.
  *
- * R1-Q: the MEDIUM line carries a call slot ("Let's book a call tomorrow at 7 PM with my
- * husband so we can decide.", or "Daytime is tough for me, so let's book a call ... so we can
- * decide."), so it is recognised by its fixed frame, not by one slot: the worker keeps it ONE
- * sentence that starts the call booking and ends "so we can decide".
- *
- * The worker persists the text the SDK actually forwarded, so a barge-in can cut the line off
- * before "so we can decide" ("Let's book a call tomorrow at 7 PM with my husband so we"). The
- * opening "let's book a call" is therefore masked on its own: the learner guard blocks that
- * phrase in free text, so only the scripted line can contain it.
- *
- * R1-Q iteration 2: the WEAK line has a second wording for a call ask ("Let me think about it. Call
- * me back after I've talked to my husband, and I'll let you know."): its second sentence is
- * masked by its fixed frame, which a barge-in can cut after "my". The MEDIUM line that books the
- * call without a slot ("Let me check with my husband first, and then let's book a call, so we can
- * decide.") already matches the two MEDIUM frames above.
- *
- * R1-Q iteration 3: once the advisor has already e-mailed the details, the WEAK line has a third
- * wording ("Let me think about it. I'll read through the email and get back to you."): its second
- * sentence is masked by the fixed frame "read through the email and get", which a barge-in can cut
- * after "get".
- *
- * R1-Q final review round 1: the scripted wordings are also masked by SHORT frames. The worker
- * persists the text the SDK actually forwarded, and a barge-in can cut a line at any word boundary
- * ("Daytime is tough for me, so let's book a", "Call me back after I've talked to", "I'll read
- * through the email and"): the short frames still hide the level.
- *
- * R1-Q ship de-risk: the short frames are ANCHORED to the sentence, because the learner's own
- * ordinary talk contains the same words ("Do I have to pay the deposit upfront?", "Daytime is
- * tough for me because of the kids.", "I'll read through the email when it comes.", "Can you send
- * me the enrolment requirements first?" were all hidden from the scorer, 14 of 16 ordinary
- * sentences). Each scripted wording opens its sentence ("Send me the enrolment ...", "Daytime is
- * tough for me, ...", "Call me back after ...", "I'll read through the email and ..."), so a frame
- * that starts the sentence, or the whole "I'll pay the deposit", hides the level and nothing else.
- * The sentence is tested trimmed.
- *
- * R1-Q ship-gate round 1: the frames are anchored to the scripted CONTINUATION as well, because
- * the ship de-risk frames still hid 12 of 15 ordinary sentences ("Daytime is tough for me, I work
- * nine to six.", "Call me back after five, that works better.", "I'll read through the email and
- * let you know if I have questions.", "Send me the enrolment form when it is ready.", "If the
- * numbers work out, I'll pay the deposit next month."), and the scorer is told that a placeholder
- * is the learner's own commitment response. A barge-in that cuts a line short ("Call me back
- * after", "Daytime is tough for me,") ends the sentence without punctuation, so the bare opening
- * is masked only when it is the whole sentence.
+ * Ship restore (owner decision 2026-10-09): production's four frames (origin/main), verbatim, so
+ * every sentence production hides is still hidden, barge-in cuts included; plus the scripted
+ * wordings R1-Q added, each matched as the WHOLE sentence (anchored, tested trimmed): the MEDIUM line
+ * with the advisor's slot ("Let's book a call <slot> with my <decision maker> so we can decide."), its
+ * moved and deferred forms, and the two WEAK forms ("Call me back after I've talked to my <decision
+ * maker>, and I'll let you know." / "I'll read through the email and get back to you.").  Nothing
+ * that is not one of those sentences is hidden beyond what production hides.
  */
 const COMMITMENT_PATTERNS: readonly RegExp[] = [
-  /^send me the enrol+ment link\b/i,
-  /^send me the enrol+ment\s*$/i,
-  /\bI['’]?ll pay the deposit today\b/i,
-  /book a call\b[^.!?]*\bso we can decide/i,
-  /\blet['’]?s book a call\b/i,
-  /^daytime is tough for me, so\b/i,
-  /^daytime is tough for me,?\s*$/i,
-  /^just email me the details\b/i,
-  /^call me back after I['’]?ve\b/i,
-  /^call me back after(?: I)?\s*$/i,
-  /^I['’]?ll read through the e-?mail and get\b/i,
-  /^I['’]?ll read through the e-?mail(?: and)?\s*$/i,
+  /send me the enrol+ment link/i,
+  /pay the deposit today/i,
+  /book a call on thursday at 7\s?pm/i,
+  /email me the details and i['’]?ll get back to you/i,
+  /^let['’]?s book a call\b.*\bwith my [\w' -]+ so we can decide[.!]?$/i,
+  /^daytime is tough for me, so let['’]?s book a call\b.*\bwith my [\w' -]+ so we can decide[.!]?$/i,
+  /^let me check with my [\w' -]+ first, and then let['’]?s book a call, so we can decide[.!]?$/i,
+  /^call me back after I['’]?ve talked to my [\w' -]+, and I['’]?ll let you know[.!]?$/i,
+  /^I['’]?ll read through the e-?mail and get back to you[.!]?$/i,
 ];
 
 const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/;

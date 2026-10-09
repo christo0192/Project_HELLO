@@ -81,7 +81,12 @@ import r1_world
 #    STRONG line names no plan, a persona-neutral time cue (scripted variants, wrap-up markers), a
 #    deep layer given back when its reply missed it (MAX_DEEP_MISSES) and a wait window for STRONG
 #    (WAIT_RECENT_TURNS).
-CONTENT_REVISION = 13
+# 14: R1-Q ship restore (owner decision 2026-10-09: ship only what is proven better than
+#    production): the guard rules that were worse than production are deleted (the hearsay, the
+#    "better" and the decider rules, the before-I-go strip) together with their canned lines
+#    (ANCHOR_HEARD_REPLACEMENT, ANCHOR_HEARD_BELOW, PRICE_UNCHANGED_REPLACEMENT); no other pinned
+#    text changed.
+CONTENT_REVISION = 14
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -240,9 +245,6 @@ def manifest() -> dict[str, Any]:
             "anchor_replacement": r1_guard.ANCHOR_REPLACEMENT,
             "gratitude_replacement": r1_guard.GRATITUDE_REPLACEMENT,
             "confirm_fallbacks": list(r1_guard.CONFIRM_FALLBACKS),
-            "anchor_heard_replacement": r1_guard.ANCHOR_HEARD_REPLACEMENT,
-            "anchor_heard_below": r1_guard.ANCHOR_HEARD_BELOW,
-            "price_unchanged_replacement": r1_guard.PRICE_UNCHANGED_REPLACEMENT,
             "style": {
                 "tic_window": r1_guard.STYLE_TIC_WINDOW,
                 "opener_window": r1_guard.STYLE_OPENER_WINDOW,

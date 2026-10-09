@@ -56,7 +56,7 @@ from r1_replies import (
     session_facts_event,
 )
 from r1_roleplay import RolePlayEngine, TurnMode
-from r1_scheduler import F1_COUNTER, PLAN, REDIRECT_OPENERS, SLIP_LIMIT_SEC
+from r1_scheduler import F1_COUNTER, PLAN, SLIP_LIMIT_SEC
 from r1_script import line
 from r1_session import R1Agent, R1Interview, run_r1_session
 from r1_world import FACTS, SCORER_RULE, WORLD_VERSION
@@ -1523,9 +1523,8 @@ class TestRoleplayDriver(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(rig.interview._run_roleplay())
         await rig.settle()
         first = await rig.converse(GOODBYE, advance=100)
-        # Once, in context: the model reacts, and the scripted opener + variant is the fallback.
-        self.assertIs(rig.plan().intent.kind, "redirect")
-        self.assertTrue(any(opener in first for opener in REDIRECT_OPENERS), first)
+        # Once, with a move: production's scripted redirect (ship restore, owner decision 2026-10-09).
+        self.assertTrue(first.startswith("Oh wait, before you go..."), first)
         self.assertFalse(rig.engine.exit_requested)
         self.assertFalse(task.done())
         self.assertIsNone(await rig.converse(GOODBYE, advance=20))  # the second one exits

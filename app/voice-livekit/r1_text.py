@@ -676,31 +676,13 @@ def _spelled_value(words: list[str]) -> int:
     return total + current
 
 
-# How many words either side of a spelled number may hold its money word ("paying around six
-# hundred", "six hundred a month"); a money word further off belongs to another part of the
-# sentence.
-_MONEY_WORD_REACH = 3
-
-
-def _money_word_near(match: re.Match[str], cue: re.Pattern[str]) -> bool:
-    """True when ``cue`` (a money word) sits within a few words of the spelled number ``match``."""
-    text = match.string
-    # A bounded slice: a runaway text of spelled numbers must not cost a split of the whole of it
-    # for every one of them.
-    before = " ".join(text[max(0, match.start() - 60) : match.start()].split()[-_MONEY_WORD_REACH:])
-    after = " ".join(text[match.end() : match.end() + 60].split()[:_MONEY_WORD_REACH])
-    return cue.search(before) is not None or cue.search(after) is not None
-
-
-def _spelled_repl(match: re.Match[str], cue: re.Pattern[str] | None = None) -> str:
+def _spelled_repl(match: re.Match[str]) -> str:
     words = re.findall(r"[a-z]+", match.group(0).lower())
     scale = any(word in _SCALE for word in words)
     if match.group("pct"):
         return f"{_spelled_value(words)}%"
     if not scale:
         return match.group(0)  # "six months": a plain small number is not an amount
-    if cue is not None and not match.group("cur") and not _money_word_near(match, cue):
-        return match.group(0)  # "over a hundred jobs": a quantity, however much is said about pay
     value = _spelled_value(words)
     return f"${value}" if 0 <= value <= MAX_AMOUNT else match.group(0)
 
@@ -714,7 +696,7 @@ def _dollar_repl(match: re.Match[str]) -> str:
     return f"${amount}" + whole[len(whole.rstrip()) :]  # the pattern may eat trailing space
 
 
-def canonical_amounts(text: object, *, money_cue: re.Pattern[str] | None = None) -> str:
+def canonical_amounts(text: object) -> str:
     """Fold ``text`` and rewrite every money expression as ``$N`` (``%`` for percentages).
 
     One grammar for every reader of amounts: ``$1,500``, ``$1.5k``, ``1500 dollars``,
@@ -722,13 +704,8 @@ def canonical_amounts(text: object, *, money_cue: re.Pattern[str] | None = None)
     become ``$1500`` / ``$3000``, and ``ten percent`` becomes ``10%``.  Plain small
     spelled numbers ("six months") are left alone.  Speech-to-text may write an amount
     either way, so no reader should depend on the ``$`` sign being there.
-
-    With ``money_cue`` a spelled number with a scale word ("a hundred", "two thousand") is an
-    amount only next to a money word (``_money_word_near``) or when it names a currency itself
-    ("a hundred dollars"), so "over a hundred jobs and I'm paying for my own prep" has none.
     """
-    folded = fold(text)
-    folded = _SPELLED_RUN.sub(lambda match: _spelled_repl(match, money_cue), folded)
+    folded = _SPELLED_RUN.sub(_spelled_repl, fold(text))
     return _DOLLAR.sub(_dollar_repl, folded)
 
 

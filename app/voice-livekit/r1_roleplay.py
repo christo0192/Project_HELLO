@@ -95,7 +95,6 @@ from r1_commitment import (
     commitment_line,
     detect_ask,
     grade,
-    looks_like_proposal,
 )
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
 from r1_guard import (
@@ -220,6 +219,8 @@ SUBSTANTIVE_WORDS = 3
 STT_SHORT_WORDS = 2
 STT_SHORT_SHARE_LIMIT = 0.10
 FIDELITY_MIN_R_SEC = 600
+# The advisor text one turn's readers parse (its last characters): a cost bound only.
+MAX_CANDIDATE_CHARS = 4000
 
 KIND_OBJECTION = "objection"
 KIND_REDIRECT = "redirect"
@@ -391,12 +392,8 @@ class RolePlayEngine:
         self._decider_asked_now = False
         self._dig_deferred_topics: set[str] = set()
         # R1-Q final review round 1.  The tracked phrases of each reply (the guard's spacing window
-        # for the stall phrases), whether the advisor's turn may hold a proposal the detectors
-        # missed inside the close window (``late_ask_ok``), and how many such late asks the model
-        # accepted (the farewell answers them like any open proposal).
+        # for the stall phrases).
         self._phrase_history: list[tuple[str, ...]] = []
-        self._late_ask_ok = False
-        self._late_asks = 0
 
     # ------------------------------------------------------------------- properties
     @property
@@ -488,7 +485,6 @@ class RolePlayEngine:
             hollow=self._hollow_run >= 1 and self._last_reply_closer,
             decider_asked=self._decider_asked_now,
             recent_phrases=tuple(self._phrase_history[-STYLE_HISTORY:]),
-            late_ask_ok=self._late_ask_ok and free_reply and phase == "roleplay",
         )
 
     def filler_text(self) -> str:
@@ -518,6 +514,11 @@ class RolePlayEngine:
         candidate_seconds: float | None = None,
     ) -> TurnPlan:
         """Decide what the learner does after this candidate turn (see module docstring)."""
+        # Ship restore, a pure cost bound: every reader below is lexical and linear in the text, and
+        # no real advisor turn comes near this (longest live turn 1,072 characters, the owner's
+        # longest grouped turn 1,039), so the bound only shortens pathological speech-to-text.
+        if isinstance(candidate_text, str) and len(candidate_text) > MAX_CANDIDATE_CHARS:
+            candidate_text = candidate_text[-MAX_CANDIDATE_CHARS:]
         break_kind = detect_character_break(candidate_text)
         if self._wants_aside(break_kind):
             return self._aside_plan(break_kind or "ai", r_sec, turn_index)
@@ -556,39 +557,16 @@ class RolePlayEngine:
         if wants is None and negotiated.callback is not None and not early:
             wants = AskKind.CALL  # a concrete callback or time proposal is a call ask
         self._call_ask_now = wants is AskKind.CALL
-        # A turn the detectors read as no ask, inside the close window with nothing on record, that
-        # still looks like a call or time proposal: if the model answers it with an acceptance, that
-        # is a late ask for the farewell to answer, not a commitment leak (see ``r1_guard``).
-        self._late_ask_ok = (
-            wants is None
-            and not early
-            and not (self.negotiation.resolved or self.commitment_resolved)
-            and self.scheduler.commit_permitted(r_sec)
-            and looks_like_proposal(candidate_text)
-        )
         reasons: list[str] = []
         if obs.injection:
             reasons.append("injection_phrase_flagged")
         if break_kind:
             reasons.append(f"character_break:{break_kind}")
         self._break_kind = break_kind
-        # A proposal the learner could not answer before the close window is still open when the
-        # advisor says goodbye inside it: the farewell answers as the ask would have (a strong
-        # advisor closing at 11:20 after an early proposal used to get the WEAK stall).
-        farewell_ask = (
-            wants is None
-            and signals.close_attempt
-            and self._pending_ask is not None
-            and self.scheduler.commit_permitted(r_sec)
-            and not (self.negotiation.resolved or self.commitment_resolved)
-        )
-        if farewell_ask:
-            wants = self._pending_ask
-            reasons.append("pending_ask_at_farewell")
         decision = None
         if signals.close_attempt:
             decision = self.scheduler.register_close_attempt(r_sec)
-            if decision.action == "exit" and not farewell_ask:
+            if decision.action == "exit":
                 self.exit_requested = True
                 reasons.append("close_attempt_exit")
                 return self._plan(TurnMode.EXIT, reasons)
@@ -612,15 +590,11 @@ class RolePlayEngine:
             move = decision.move
             self.scheduler.issue(move)
             if decision.action == "redirect":
+                # Ship restore: production's scripted redirect, "Oh wait, before you go..." and the
+                # owed line (a model-voiced redirect said its goodbye and then the opener).
                 reasons.append("close_attempt_redirect")
-                return self._intent_plan(
-                    move,
-                    reasons,
-                    redirect=True,
-                    first_probes=obs.gate.first_probes,
-                    reveal_topics=reveal_topics,
-                    monologue=candidate_seconds,
-                )
+                text = f"{decision.prefix} {move.text}"
+                return self._plan(TurnMode.SAY_ONLY, reasons, scripted=text, move_id=move.id)
             reasons.append("close_attempt_stall")
             return self._plan(
                 TurnMode.SAY_ONLY,
@@ -1434,16 +1408,6 @@ class RolePlayEngine:
         self.ledger.record(result)
         if result.fallback_used:
             self._fallbacks += 1  # the next fallback starts at the next variant
-        if (
-            any(hit.rule == "late_ask_accepted" for hit in result.hits)
-            and not (self.negotiation.resolved or self.commitment_resolved)
-            and not self.negotiation.call_declined()
-        ):
-            # The model took a proposal the detectors missed as a call it would book: the ask stays
-            # open for the farewell (``pending_ask_at_farewell``), graded like any other.
-            self._late_asks += 1
-            if self._pending_ask is None:
-                self._pending_ask = AskKind.CALL
 
     def record_spoken(
         self,
@@ -1615,7 +1579,6 @@ class RolePlayEngine:
             "commitment": {
                 "asks": list(self._asks),
                 "stalls_before_window": self._stalls,
-                "late_asks": self._late_asks,
                 "level": None if self._commitment_level is None else self._commitment_level.name,
                 "turn": self._commitment_turn,
                 "resolved": self.commitment_resolved,

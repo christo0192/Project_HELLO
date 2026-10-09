@@ -930,12 +930,14 @@ class SlipTests(unittest.TestCase):
 
 
 class EarlyCloseTests(unittest.TestCase):
-    def test_first_early_attempt_redirects_with_the_next_owed_move_and_no_canned_prefix(self):
+    def test_first_early_attempt_redirects_with_oh_wait_and_the_next_owed_move(self):
         s = make()
         turn(s, OPENER, 20)
         decision = s.register_close_attempt(200)
         self.assertEqual(decision.action, "redirect")
-        self.assertEqual(decision.prefix, "")  # the redirect is a brief the model voices
+        # Ship restore (owner decision 2026-10-09): production's scripted redirect, "Oh wait, before
+        # you go..." and the owed line (the in-context brief appended the opener after the model's bye).
+        self.assertEqual(decision.prefix, "Oh wait, before you go...")
         self.assertEqual(decision.move.id, F3_PRIMARY)  # first unfinished move in plan order
         self.assertTrue(decision.move.brief)
         self.assertTrue(decision.move.markers)

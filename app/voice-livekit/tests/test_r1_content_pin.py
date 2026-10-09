@@ -84,7 +84,11 @@ import r1_world
 # the STRONG line names no plan, persona-neutral scripted time cues (and wrap-up markers), a deep layer
 # given back when its reply missed it (MAX_DEEP_MISSES) and a wait window for STRONG
 # (WAIT_RECENT_TURNS).
-PINNED_CONTENT_SHA256 = "fe2d60226219d34136db9dca2aacf1b59308c56009a10299951021486f0408d0"
+# Revision 14 (R1-Q ship restore, owner decision 2026-10-09: ship only what is proven better than
+# production): the guard rules that were worse than production are deleted, and with them their two
+# canned lines and the manifest keys that pinned them (ANCHOR_HEARD_REPLACEMENT, ANCHOR_HEARD_BELOW,
+# PRICE_UNCHANGED_REPLACEMENT).  No other pinned text changed.
+PINNED_CONTENT_SHA256 = "1a091adefe5ff622e39412e97f4df9bdbb76250f9708a9b5ba9494a7018e9d22"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -458,8 +462,6 @@ class PinTests(unittest.TestCase):
         self.assertEqual(commitment["defer_line"], r1_commitment.MEDIUM_DEFER_LINE)
         self.assertEqual(commitment["weak_call_line"], r1_commitment.WEAK_CALL_LINE)
         guard = manifest["guard"]
-        self.assertEqual(guard["anchor_heard_replacement"], r1_guard.ANCHOR_HEARD_REPLACEMENT)
-        self.assertEqual(guard["anchor_heard_below"], r1_guard.ANCHOR_HEARD_BELOW)
         style = guard["style"]
         self.assertEqual(style["phrase_quota"], dict(r1_guard.PHRASE_QUOTA))
         self.assertEqual(style["question_diet_window"], r1_guard.QUESTION_DIET_WINDOW)
@@ -482,8 +484,6 @@ class PinTests(unittest.TestCase):
             (r1_prompts, "TEMPLATE_USED_NOTE", r1_prompts.TEMPLATE_USED_NOTE + " "),
             (r1_commitment, "MEDIUM_DEFER_LINE", r1_commitment.MEDIUM_DEFER_LINE + " "),
             (r1_commitment, "WEAK_CALL_LINE", r1_commitment.WEAK_CALL_LINE + " "),
-            (r1_guard, "ANCHOR_HEARD_REPLACEMENT", r1_guard.ANCHOR_HEARD_REPLACEMENT + " "),
-            (r1_guard, "ANCHOR_HEARD_BELOW", r1_guard.ANCHOR_HEARD_BELOW + " "),
             (r1_guard, "QUESTION_DIET_WINDOW", r1_guard.QUESTION_DIET_WINDOW + 1),
             (r1_guard, "THIN_REPLY_WORDS", r1_guard.THIN_REPLY_WORDS + 1),
             (r1_scheduler, "F4_PUSH_CALL_SUFFIX", r1_scheduler.F4_PUSH_CALL_SUFFIX + " "),
@@ -520,9 +520,6 @@ class PinTests(unittest.TestCase):
         )
         self.assertEqual(commitment["thin_min_turns"], r1_commitment.THIN_MIN_TURNS)
         guard = manifest["guard"]
-        self.assertEqual(
-            guard["price_unchanged_replacement"], r1_guard.PRICE_UNCHANGED_REPLACEMENT
-        )
         self.assertEqual(guard["fallback_replies"], list(r1_guard.FALLBACK_REPLIES))
         self.assertEqual(len(guard["fallback_replies"]), 3)
         style = guard["style"]
@@ -548,11 +545,6 @@ class PinTests(unittest.TestCase):
             (r1_commitment, "WEAK_EMAIL_DONE_LINE", r1_commitment.WEAK_EMAIL_DONE_LINE + " "),
             (r1_commitment, "THIN_ADVISOR_MEAN_WORDS", r1_commitment.THIN_ADVISOR_MEAN_WORDS + 1),
             (r1_commitment, "THIN_MIN_TURNS", r1_commitment.THIN_MIN_TURNS + 1),
-            (
-                r1_guard,
-                "PRICE_UNCHANGED_REPLACEMENT",
-                r1_guard.PRICE_UNCHANGED_REPLACEMENT + " ",
-            ),
             (r1_guard, "FALLBACK_REPLIES", r1_guard.FALLBACK_REPLIES[:-1] + ("Pardon?",)),
             (r1_negotiation, "SLOT_RECENT_TURNS", r1_negotiation.SLOT_RECENT_TURNS + 1),
             (r1_text, "HOLLOW_MAX_WORDS", r1_text.HOLLOW_MAX_WORDS + 1),

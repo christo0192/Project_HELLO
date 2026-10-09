@@ -456,25 +456,6 @@ class CanonicalAmountTests(unittest.TestCase):
                 self.assertEqual(dollar_amounts(canonical_amounts(text)), dollar_amounts(text))
                 self.assertEqual(dollar_amounts(text), [1500])
 
-    def test_a_money_cue_limits_a_spelled_number_to_one_next_to_a_money_word(self):
-        """Ship-gate round 1: "over a hundred jobs and I'm paying for prep" holds no amount."""
-        import re
-
-        cue = re.compile(r"\b(?:pay|paying|paid|price|cost|budget|a month|per month|dollars)\b", re.I)
-        for text, expected in (
-            ("six hundred a month", "$600 a month"),
-            ("I can pay around six hundred", "I can pay around $600"),
-            ("a hundred dollars more", "$100 more"),
-            ("The price is two thousand", "The price is $2000"),
-            ("over a hundred jobs and I'm paying for prep", "over a hundred jobs and I'm paying for prep"),
-            ("a hundred applications, and my budget is tight", "a hundred applications, and my budget is tight"),
-            ("ten percent off", "10% off"),
-        ):
-            with self.subTest(text=text):
-                self.assertEqual(canonical_amounts(text, money_cue=cue), expected)
-        # Without a cue the grammar is unchanged: every scaled spelled number is an amount.
-        self.assertEqual(canonical_amounts("over a hundred jobs"), "over $100 jobs")
-
 
 class SpeakingStyleHelperTests(unittest.TestCase):
     """R1-Q iteration 1: the opener word and the tic words of a reply (shared by the guard and the

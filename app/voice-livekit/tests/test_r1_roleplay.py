@@ -973,40 +973,25 @@ class AskTests(unittest.TestCase):
 
 
 class CloseLadderTests(unittest.TestCase):
-    def test_the_first_early_farewell_redirects_in_context_and_the_second_exits(self):
+    def test_the_first_early_farewell_redirects_with_oh_wait_and_the_second_exits(self):
         s = Session(engine())
         s.say(OPENER, 20)
         first = s.say("Thanks for your time, bye.", 100)
-        # R1-Q: no canned "Oh wait, before you go..." read out; the model is told to stop the
-        # advisor politely and raise the next owed move, and a scripted opener + variant is the
-        # fallback if it does not.
-        self.assertEqual(first.mode, TurnMode.INTENT)
+        # Ship restore (owner decision 2026-10-09): production's scripted redirect, "Oh wait, before
+        # you go..." and the next owed line, spoken as one scripted turn (the in-context brief
+        # appended the opener after the model's own "bye").
+        self.assertEqual(first.mode, TurnMode.SAY_ONLY)
         self.assertIn("close_attempt_redirect", first.reasons)
         self.assertEqual(first.move_id, F3_PRIMARY)
-        self.assertEqual(first.intent.kind, "redirect")
-        self.assertIn("wrapping up", first.intent.brief)
-        self.assertIn(first.intent.brief, first.reminder)
+        self.assertTrue(first.scripted_text.startswith(REDIRECT_OPENERS[0]))
+        self.assertEqual(REDIRECT_OPENERS[0], "Oh wait, before you go...")
+        self.assertEqual(s.spoken[-1], first.scripted_text)
         self.assertFalse(first.exit_roleplay)
-        self.assertTrue(any(first.intent.fallback.startswith(o) for o in REDIRECT_OPENERS))
-        self.assertTrue(s.spoken[-1].endswith(first.intent.fallback))
         self.assertEqual(s.eng.scheduler._states[F3_PRIMARY].status, "delivered")
         second = s.say("Okay, goodbye then.", 150)
         self.assertEqual(second.mode, TurnMode.EXIT)
         self.assertTrue(second.exit_roleplay)
         self.assertTrue(s.eng.exit_requested)
-
-    def test_a_model_that_redirects_in_its_own_words_needs_no_canned_opener(self):
-        s = Session(
-            engine(),
-            ack="Oh, hold on a second. There's so much free stuff online, why would I pay?",
-        )
-        s.say(OPENER, 20)
-        s.say("Thanks for your time, bye.", 100)
-        self.assertEqual(
-            s.spoken[-1],
-            "Oh, hold on a second. There's so much free stuff online, why would I pay?",
-        )
-        self.assertFalse(any(opener in s.spoken[-1] for opener in REDIRECT_OPENERS))
 
     def test_the_early_closer_adversary_is_stalled_then_exits(self):
         """S0-B early_closer: wrap up and send the enrolment link immediately."""
@@ -1016,7 +1001,8 @@ class CloseLadderTests(unittest.TestCase):
         self.assertEqual(first.negotiation_id, "N-MONEY")  # a reason, not the scripted stall
         self.assertNotIn(stall_line("husband"), s.spoken[-1])
         second = s.say("Okay, thanks for your time, bye.", 100)
-        self.assertEqual(second.intent.kind, "redirect")
+        self.assertEqual(second.mode, TurnMode.SAY_ONLY)
+        self.assertTrue(second.scripted_text.startswith(REDIRECT_OPENERS[0]))
         third = s.say("Goodbye.", 140)
         self.assertEqual(third.mode, TurnMode.EXIT)
 
@@ -1286,9 +1272,9 @@ class RobustnessTests(unittest.TestCase):
         started = time.perf_counter()
         eng.plan_turn("word " * 20000, 20.0)
         eng.plan_turn("a." * 20000, 70.0)
-        # Catastrophic-backtracking guard, not a latency budget: 1 to 2 s on an idle box, 6 s on a
-        # loaded one (ship-gate round 1), linear in the text.
-        self.assertLess(time.perf_counter() - started, 15.0)
+        # Ship restore: production's 5 s budget.  plan_turn parses at most MAX_CANDIDATE_CHARS of a
+        # turn (a pure cost bound), so the cost is flat in the text length.
+        self.assertLess(time.perf_counter() - started, 5.0)
 
 
 class PriceWrapThroughTheEngineTests(unittest.TestCase):
@@ -3174,26 +3160,6 @@ class PendingAskAtFarewellTests(unittest.TestCase):
         self.assertIn("ask_before_close_window", plan.reasons)
         self.assertEqual(s.eng._pending_ask, AskKind.CALL)
 
-    def test_a_farewell_inside_the_window_is_answered_as_the_open_proposal(self):
-        s, r = self.run_until_window(CALL_ASK)
-        self.assertTrue(s.eng.scheduler.commit_permitted(r))
-        self.assertTrue(540 <= r < 780, r)
-        self.assertFalse(s.eng.commitment_resolved)
-        plan = s.say(self.FAREWELL, r)
-        self.assertIn("pending_ask_at_farewell", plan.reasons)
-        self.assertNotIn("close_attempt_stall", plan.reasons)
-        self.assertNotEqual(plan.mode, TurnMode.EXIT)
-        self.assertTrue(any(reason.startswith("ask_in_window") for reason in plan.reasons))
-        self.assertFalse(s.eng.exit_requested)
-
-    def test_a_good_advisor_earns_the_graded_line_at_the_farewell(self):
-        s, r = self.run_until_window(CALL_ASK)
-        s.eng.apply_judge(GOOD_JUDGE, s.eng.turn)
-        plan = s.say(self.FAREWELL, r)
-        self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
-        self.assertTrue(plan.resolves_commitment)
-        self.assertEqual(s.eng.commitment_level, Level.MEDIUM)
-
     def test_the_old_behaviour_was_the_weak_stall(self):
         """Without an open proposal the same farewell is still the stall (the fallback path)."""
         s = Session(engine(seed="no-ask"))
@@ -3219,6 +3185,17 @@ class PendingAskAtFarewellTests(unittest.TestCase):
         s.say(CALL_ASK, 200)
         plan = s.say(self.FAREWELL, 230)
         self.assertNotIn("pending_ask_at_farewell", plan.reasons)
+
+    def test_a_farewell_inside_the_window_after_an_early_proposal_is_the_weak_stall_as_on_production(self):
+        """Ship restore (owner decision 2026-10-09): the farewell is answered by the close ladder, as on
+        production, whatever was proposed before the window.  An early ask used to become the
+        farewell's own ask (a MEDIUM or an unearned STRONG at the goodbye); that rule is deleted."""
+        s, r = self.run_until_window(CALL_ASK)
+        self.assertTrue(s.eng.scheduler.commit_permitted(r))
+        plan = s.say(self.FAREWELL, r)
+        self.assertNotIn("pending_ask_at_farewell", plan.reasons)
+        self.assertIn("close_attempt_stall", plan.reasons)
+        self.assertEqual(plan.commitment_level, Level.WEAK)
 
 
 class SchedulePitchThroughTheEngineTests(unittest.TestCase):
@@ -3343,7 +3320,6 @@ class ShareTheLinkThroughTheEngineTests(unittest.TestCase):
         "I can send you the page about the mentors.",
         "I'll send you the form for the free career consultation.",
         "I'll send you the form to request a callback from a mentor.",
-        "Can I email you the link to a sample lecture?",
     )
 
     def strong_session(self):
@@ -3482,21 +3458,6 @@ class DecisionMakerStaysTheSamePersonTests(unittest.TestCase):
                 rendered = resolve_persona(persona.id, variant="v1")
                 self.assertIn(rendered.decider_answer, rendered.public_card_text())
                 self.assertIn(rendered.decision_maker, rendered.decider_answer)
-
-    def test_a_reply_that_decides_alone_is_replaced_by_the_card_answer(self):
-        for persona in PERSONAS:
-            rendered = resolve_persona(persona.id, variant="v1")
-            for reply in (
-                "It's just me deciding, really.",
-                "I don't need to ask anyone about it.",
-                "Nobody else is involved in the decision.",
-            ):
-                with self.subTest(persona=persona.id, reply=reply):
-                    s = Session(engine(rendered), reply=reply)
-                    s.say("Who else is involved in the decision?", 60)
-                    self.assertEqual(s.spoken[-1], rendered.decider_answer)
-                    self.assertEqual(s.eng.ledger.counts.get("misread", 0), 1)
-                    self.assertEqual(s.eng.ledger.leak_total, 0)
 
     def test_the_card_answer_is_not_a_commitment_a_concession_or_a_deep_need(self):
         from r1_commitment import classify_learner_commitment
@@ -3705,11 +3666,6 @@ class IterationTwoEngineTests(unittest.TestCase):
         self.assertNotIn("pending_ask_at_farewell", plan.reasons)
         self.assertIn("close_attempt_stall", plan.reasons)
         self.assertEqual(plan.commitment_level, Level.WEAK)
-
-    def test_the_same_proposal_unanswered_is_still_booked_at_the_farewell(self):
-        s, r = until_window(CALL_ASK, seed="open")
-        plan = s.say(self.FAREWELL, r)
-        self.assertIn("pending_ask_at_farewell", plan.reasons)
 
     # --- D5: the call is welcome, and a vague time is not invented
     def test_the_f4_push_beside_a_call_proposal_never_says_the_decision_maker_dislikes_calls(self):
@@ -4202,15 +4158,6 @@ class IterationThreeEngineTests(unittest.TestCase):
         self.assertNotIn(HOLLOW_NOTE, busy.reminder)
         self.assertFalse(busy.guard_ctx.hollow)
 
-    # --- D10: no "before I go" from the learner
-    def test_before_i_go_is_not_said_by_the_learner_through_the_engine(self):
-        s = Session(engine())
-        s.say(OPENER, 20)
-        s.reply = "Before I go, what would I actually build in the course?"
-        s.say(NEUTRAL, 60)
-        self.assertNotIn("before I go", s.spoken[-1].lower())
-        self.assertIn("What would I actually build", s.spoken[-1])
-
 
 class FinalReviewRoundOneEngineTests(unittest.TestCase):
     """R1-Q final review round 1, through the engine: the STRONG gate, late asks, the deep layers."""
@@ -4280,45 +4227,6 @@ class FinalReviewRoundOneEngineTests(unittest.TestCase):
         plan = session.say(ASK, r)
         self.assertEqual(plan.commitment_level, Level.MEDIUM)
         self.assertIn("strong_blocked:decider_unresolved", plan.reasons)
-
-    # --- major: a proposal the detectors missed is the model's to accept, the farewell's to answer
-    MISSED = "Let me book fifteen minutes with you and your partner on Friday."
-
-    def test_the_missed_proposal_really_is_one_the_detectors_miss(self):
-        from r1_commitment import detect_ask, looks_like_proposal
-
-        # If the grammar learns this phrasing, pick another held-out miss: the point of the tests
-        # below is a proposal the detectors cannot read.
-        self.assertIsNone(detect_ask(self.MISSED), "the grammar now reads it: choose another phrasing")
-        self.assertTrue(looks_like_proposal(self.MISSED))
-
-    def test_a_model_acceptance_of_a_missed_proposal_is_no_leak_and_the_farewell_answers_it(self):
-        session, r = self.window_session()
-        eng = session.eng
-        session.reply = "Sure, Friday works for us, let's do that."
-        plan = session.say(self.MISSED, r)
-        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
-        self.assertTrue(plan.guard_ctx.late_ask_ok)
-        self.assertEqual(eng.ledger.leak_total, 0)
-        self.assertEqual(eng.ledger.counts.get("misread", 0), 1)
-        self.assertEqual(eng.admin_log()["commitment"]["late_asks"], 1)
-        self.assertNotIn("Friday works", session.spoken[-1])
-        farewell = session.say("Wonderful, thanks for your time today. Take care, bye!", r + 40)
-        self.assertIn("pending_ask_at_farewell", farewell.reasons)
-        self.assertIn(farewell.commitment_level, (Level.MEDIUM, Level.STRONG))
-
-    def test_an_acceptance_without_any_proposal_is_still_a_leak(self):
-        session, r = self.window_session()
-        session.reply = "Sure, Friday works for us, let's do that."
-        plan = session.say("The capstone pulls everything together.", r)
-        self.assertFalse(plan.guard_ctx.late_ask_ok)
-        self.assertGreaterEqual(session.eng.ledger.leak_total, 1)
-
-    def test_before_the_close_window_a_missed_proposal_is_not_a_late_ask(self):
-        s = Session(engine())
-        s.say(OPENER, 20)
-        plan = s.say(self.MISSED, 120)
-        self.assertFalse(plan.guard_ctx.late_ask_ok)
 
     # --- the price reaction waits one turn behind a proposed call unless its deadline forces it
     def test_the_anchor_waits_a_turn_behind_a_proposed_call(self):
@@ -4439,6 +4347,22 @@ class FinalReviewRoundOneEngineTests(unittest.TestCase):
         session, r = self.strong_session()
         plan = session.say(ASK, r)
         self.assertTrue(any(reason.startswith("ask_in_window:grade_") for reason in plan.reasons))
+
+    # --- ship restore: no late-ask exemption.  A MEDIUM acceptance in a free reply is a commitment hit
+    # (the gate's out-of-level flag), as on production, whether or not the engine read the proposal.
+    MISSED = "Let me book fifteen minutes with you and your partner on Friday."
+
+    def test_a_model_acceptance_of_a_missed_proposal_is_a_commitment_hit_as_on_production(self):
+        session, r = self.window_session()
+        eng = session.eng
+        session.reply = "Sure, Friday works for us, let's do that."
+        plan = session.say(self.MISSED, r)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertGreaterEqual(eng.ledger.leak_total, 1)
+        self.assertGreaterEqual(eng.ledger.counts.get("commitment", 0), 1)
+        self.assertNotIn("Friday works", session.spoken[-1])
+        farewell = session.say("Wonderful, thanks for your time today. Take care, bye!", r + 40)
+        self.assertNotIn("pending_ask_at_farewell", farewell.reasons)
 
 
 if __name__ == "__main__":

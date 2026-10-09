@@ -319,7 +319,6 @@ class AskDetectionTests(unittest.TestCase):
         "You can schedule a mock interview session whenever you want.",
         "We arrange a career coaching session in the third month.",
         "The coach will call you on the first day of the program.",
-        "We will send you the link to the live class on Monday.",
         "You can book a slot with a mentor.",
         "Our mentors will set up a call with you after you enroll.",
         # the programme's own schedule, with a day and "works" in it
@@ -480,21 +479,6 @@ class JoinNeedsACourseObjectTests(unittest.TestCase):
 class IterationThreeCommitmentTests(unittest.TestCase):
     """R1-Q iteration 3: conditionals, the greeting, the e-mail wording, pressure and thin answers."""
 
-    # --- D7: a condition is not a commitment
-    def test_a_conditional_commitment_commits_to_nothing(self):
-        """The live hard fail: "I'll reach out if I decide I want to move forward" was STRONG."""
-        for text in (
-            "I'll reach out if I decide I want to move forward.",
-            "I'll reach out if I decide to go ahead.",
-            "If it makes sense, I'll enrol.",
-            "Once I've talked to him, I'll sign up.",
-            "Whenever I'm ready, let's do it.",
-            "If Thursday works for you, great.",
-            "When I'm ready I want to join the next cohort.",
-        ):
-            with self.subTest(text=text):
-                self.assertEqual(classify_learner_commitment(text), Level.NONE, text)
-
     def test_the_unconditional_phrases_are_still_commitments(self):
         for text, level in (
             ("I want to move forward.", Level.STRONG),
@@ -592,7 +576,6 @@ class FinalReviewRoundOneCommitmentTests(unittest.TestCase):
         "I'm going to email you the enrolment information and the FAQ, no pressure.",
         "I'll put the payment breakdown in the email so your husband can see it.",
         "Seven thousand learners have taken this programme.",
-        "Do you want me to send over the payment details?",
         "Let me email you the registration process and the deadlines.",
         "I'll send you the enrolment requirements and the fee schedule.",
     )
@@ -600,12 +583,7 @@ class FinalReviewRoundOneCommitmentTests(unittest.TestCase):
         "Shall I send you the link to pay the deposit?",
         "Want me to go ahead and lock in your seat for the March cohort?",
         "Can I get you started on the application today?",
-        "Let's get your registration done before the discount expires.",
-        "How about we finalise your enrolment now?",
         "So, should I reserve your spot?",
-        "Go ahead and complete the payment on the link I just sent.",
-        "Would you be okay paying the first instalment today so the seat is yours?",
-        "If you're happy with that, I can enrol you right now.",
         "Shall we make it official and sign you up?",
         "Let me send you the payment link now, okay?",
     )
@@ -663,26 +641,6 @@ class FinalReviewRoundOneCommitmentTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertNotIn(AskKind.CALL, ask_acts(text), text)
 
-    def test_the_wide_net_flags_a_missed_proposal_and_not_a_pitch(self):
-        from r1_commitment import looks_like_proposal
-
-        for text in (
-            "Let me book fifteen minutes with you and your partner on Friday.",
-            "Could we sync up with your husband this weekend?",
-            "How about we regroup on Thursday evening?",
-        ):
-            with self.subTest(text=text):
-                self.assertTrue(looks_like_proposal(text), text)
-        for text in (
-            "The course has nine modules.",
-            "Our mentors run a live call every Saturday.",
-            "Did you know you can book a session with a mentor anytime?",
-            "Thanks for your time today.",
-            "Is this still a good time?",
-        ):
-            with self.subTest(text=text):
-                self.assertFalse(looks_like_proposal(text), text)
-
     def test_the_strong_line_names_no_plan_the_learner_never_chose(self):
         line = commitment_line(STRONG, "husband")
         self.assertNotIn("plan", line)
@@ -708,8 +666,6 @@ class ShipDeriskDetectorTests(unittest.TestCase):
         "I'll drop the registration material in your inbox.",
         "Let me forward you the enrolment brochure so you can read it with him.",
         "I'll send you a PDF with the payment timeline.",
-        "Can I send you the brochure and the fee sheet by email?",
-        "Shall I email you the curriculum so you can look it over with your husband?",
         "I'll send across the payment and scholarship details for you two to read.",
         "I'll email you the payment details after this call.",
         "Let me share the payment calculator so you can play with the numbers.",
@@ -720,15 +676,11 @@ class ShipDeriskDetectorTests(unittest.TestCase):
     LINK_ASKS = (
         "Shall I send you the link to pay the deposit?",
         "I'll send the payment link now, and you can grab your seat tonight.",
-        "Can you email the instalment link?",
         "Let me send you the payment link now, okay?",
         "I'll email you the enrolment link right away.",
         "Want me to send over the registration form?",
         "I'll share the checkout page with you now, so you can pay today.",
-        "I'll send you the enrolment portal link tonight, okay?",
         "Shall I send the payment page?",
-        "I'll email you the invoice now.",
-        "Let me send the instalment plan link.",
     )
     SCHEDULE_PITCHES = (
         "Our mentors run a live call every Saturday, would that work with your schedule?",
@@ -826,7 +778,6 @@ class ShipGateRoundOneDetectorTests(unittest.TestCase):
         "I'll share the form your husband can use to send us questions.",
         "I'll drop the link to our YouTube channel in the chat.",
         "I'll send over the link to the free webinar recording.",
-        "Let me send you the link to the free demo class.",
         "Would you like me to text you the link to the demo?",
     )
     DECIDE_SENDS = (
@@ -844,12 +795,8 @@ class ShipGateRoundOneDetectorTests(unittest.TestCase):
     )
     REAL_ASKS = (
         "Shall I send you the payment link now?",
-        "Would you like me to email you the enrolment form?",
         "Can I text you the link to pay the deposit?",
         "I'll send you the link, and you can lock your seat today.",
-        "I'll email you the invoice now.",
-        "I'll send it over so you can sign today.",
-        "I would suggest you enroll tomorrow.",
     )
 
     def test_a_link_to_a_resource_or_a_send_to_decide_is_not_an_enrolment_ask(self):
@@ -895,10 +842,8 @@ class ShipGateRoundTwoDetectorTests(unittest.TestCase):
     )
     ACTING_STATEMENTS = (
         "I'll email you the link, and you can pay the deposit whenever you like.",
-        "I'll email you the link so you can lock your seat.",
         "I'll email it over so you can pay the deposit tonight.",
         "I'll send you the form, just fill it in and pay the deposit.",
-        "Send me the form.",
         "Can I send it right now?",
         "Shall I send it?",
     )
@@ -911,14 +856,6 @@ class ShipGateRoundTwoDetectorTests(unittest.TestCase):
         "I'll send you the form to request a callback from a mentor.",
         "I'll send you the form with the batch dates.",
         "Let me send you a form to share your feedback.",
-        "Can I email you the link to a sample lecture?",
-        "Shall I email you the link to the instructor bios?",
-        "Can I email you the form for the scholarship enquiry?",
-        "Shall I share the page about the mentors?",
-        "Can I share the page with the batch dates?",
-        "Should I send it to the email you used on the form?",
-        "Can I send it over so you can review it?",
-        "Should I send that over?",
         "I'll email you the link to our alumni reviews.",
     )
 
@@ -949,9 +886,7 @@ class ShipGateRoundTwoDetectorTests(unittest.TestCase):
 
         for text in (
             "I'll send you the enrolment page now.",
-            "Let me email you the payment page.",
             "I'll send the registration form over.",
-            "I'll email you the invoice now.",
         ):
             with self.subTest(text=text):
                 self.assertIn(AskKind.ENROL, ask_acts(text), text)
@@ -964,16 +899,6 @@ class ShipGateRoundOneConditionalTests(unittest.TestCase):
     level it has on main: the guard must see it (a STRONG out of level is a posted hit), where the
     iteration-3 exemption let it through on every condition.
     """
-
-    OWN_DECISION = (
-        "I'll reach out if I decide I want to move forward.",
-        "I'll reach out if I decide to go ahead.",
-        "If it makes sense, I'll enrol.",
-        "Once I've talked to him, I'll sign up.",
-        "Whenever I'm ready, let's do it.",
-        "If Thursday works for you, great.",
-        "When I'm ready I want to join the next cohort.",
-    )
     STILL_A_COMMITMENT = (
         ("If you send the link today, I'll pay the deposit.", Level.STRONG),
         ("As soon as you send the link, I'll enrol.", Level.STRONG),
@@ -987,11 +912,6 @@ class ShipGateRoundOneConditionalTests(unittest.TestCase):
         ("When you send the link, I'll pay the deposit.", Level.STRONG),
     )
 
-    def test_the_learners_own_decision_commits_to_nothing(self):
-        for text in self.OWN_DECISION:
-            with self.subTest(text=text):
-                self.assertEqual(classify_learner_commitment(text), Level.NONE, text)
-
     def test_a_condition_the_advisor_or_the_decider_can_meet_keeps_its_level(self):
         for text, level in self.STILL_A_COMMITMENT:
             with self.subTest(text=text):
@@ -1001,6 +921,68 @@ class ShipGateRoundOneConditionalTests(unittest.TestCase):
         self.assertEqual(
             classify_learner_commitment("If I decide, I'll get back to you."), Level.WEAK
         )
+
+
+class ShipRestoreReadingTests(unittest.TestCase):
+    """Ship restore (owner decision 2026-10-09: ship only what is proven better than production; anything
+    worse behaves exactly like production).
+
+    The enrolment-ask reading is origin/main's own (``_ENROL_ASK`` verbatim, pinned in
+    ``test_r1_detector_corpus``), and a conditional commitment keeps the level it has on production: the
+    structural enrolment grammar and the learner's-own-decision exemption did not converge in five review
+    rounds.  These are the sentences those rounds flagged, with production's verdicts.
+    """
+
+    def test_the_links_and_pages_the_reviewers_flagged_are_enrolment_asks_as_on_production(self):
+        for text in (
+            "Shall I share the link on WhatsApp?",
+            "May I email the link to you?",
+            "Shall I send it to you?",
+            "Shall I share the link?",
+            "Shall I send you the page?",
+            "You can pay the deposit on the link I send.",
+            "I'll send you the page to pay the deposit.",
+        ):
+            with self.subTest(text=text):
+                ask = detect_ask(text)
+                self.assertIsNotNone(ask, text)
+                self.assertEqual(ask.kind, AskKind.ENROL, text)
+
+    def test_production_s_false_positives_are_back_and_accepted(self):
+        """An information send read as an enrolment ask: an accepted gap, equal to production."""
+        for text in (
+            "Can I send you the curriculum?",
+            "Shall I send you some information?",
+            "Can I send you the brochure and the fee sheet by email?",
+            "Do you want me to send over the payment details?",
+            "We will send you the link to the live class on Monday.",
+        ):
+            with self.subTest(text=text):
+                ask = detect_ask(text)
+                self.assertIsNotNone(ask, text)
+                self.assertEqual(ask.kind, AskKind.ENROL, text)
+
+    def test_production_s_misses_are_back_and_accepted(self):
+        for text in (
+            "I would suggest you enroll tomorrow.",
+            "I'll email you the invoice now.",
+            "Would you like me to email you the enrolment form?",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(detect_ask(text), text)
+
+    def test_a_conditional_commitment_keeps_the_level_it_has_on_production(self):
+        for text, level in (
+            ("If I'm sure, sign me up today.", Level.STRONG),
+            ("If it makes sense, I'll enrol.", Level.STRONG),
+            ("I'll reach out if I decide I want to move forward.", Level.STRONG),
+            ("Once I've talked to him, I'll sign up.", Level.STRONG),
+            ("Whenever I'm ready, let's do it.", Level.STRONG),
+            ("If Thursday works for you, great.", Level.MEDIUM),
+            ("If I decide, I'll get back to you.", Level.WEAK),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), level, text)
 
 
 if __name__ == "__main__":

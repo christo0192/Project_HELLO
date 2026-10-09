@@ -220,38 +220,6 @@ _THAT_VERB = re.compile(
     r"works|does|would|will|could|should|might|may|can|really|actually)\b)",
     re.IGNORECASE,
 )
-# "Before I go, ..." / "One more thing before I go": the learner is not the one leaving (the
-# live sweep: "Before I go" in calls where nobody left).  The advisor's goodbye is answered with
-# "Oh wait, before you go ...", which is a different phrase and stays.
-#
-# R1-Q final review round 1: only the CLOSING clause is ever removed.  "Before I go any further",
-# "before I go down this road", "before we go ahead", "before I go and sign anything" are
-# ordinary sentences about the decision (the iteration-3 inline strip turned them into "...talk to
-# my father any further." and "I'd want to be sure down this road."; 5 replies in 4 live calls), so
-# the phrase has to be punctuated off the rest of its sentence: a leading "Before I go, ...", a
-# comma-bounded aside ", before I go, ...", or a trailing "..., before I go." and nothing else.
-_GOODBYE_VERB = r"(?:go|hang up|wrap up|run|leave|get going)"
-_BEFORE_I_GO = re.compile(
-    r"^\W*(?:(?:and|so|but|oh|well|also)\b[,\s]*)*"
-    r"(?:(?:one|a) (?:more|last|quick) (?:thing|question)[,\s]+)?"
-    r"before (?:i|we) " + _GOODBYE_VERB + r"\b(?:,? though)?(?:\s*[,.:;-]+\s*|\s*$)",
-    re.IGNORECASE,
-)
-# ", before I go, " in the middle of a sentence keeps one comma.
-_ASIDE_BEFORE_I_GO = re.compile(
-    r",\s*\bbefore (?:i|we) " + _GOODBYE_VERB + r"\b(?:,? though)?\s*,", re.IGNORECASE
-)
-# "... one more question before I go." at the very end of the sentence.  R1-Q ship de-risk: only
-# in a "one more / a last / a quick question / thing" sentence, and never for "leave".  A final
-# "before I leave / I go / we wrap up" is otherwise an ordinary clause about the learner's plans
-# ("I'd need to get my visa sorted before I leave." lost its meaning in 7/7 probes), which the
-# production guard speaks as said.
-_TAIL_GOODBYE_VERB = r"(?:go|hang up|wrap up|run|get going)"
-_TAIL_BEFORE_I_GO = re.compile(
-    r",?\s*\bbefore (?:i|we) " + _TAIL_GOODBYE_VERB + r"\b(?:,? though)?(?=\s*[.?!]*\s*$)",
-    re.IGNORECASE,
-)
-_ONE_MORE_THING = re.compile(r"\b(?:one|a) (?:more|last|quick) (?:thing|question)\b", re.IGNORECASE)
 # "I have to be honest, ..." and "I need to be honest with you: ..." are the "honestly" tic.
 _HONEST_CLAUSE = re.compile(
     r"(?:^|(?<=[\s,;-]))(?:i|we)(?:'d| would)?\s+(?:have|need|got|want|ought)\s+to\s+be\s+"
@@ -317,33 +285,6 @@ _TIME_REVERSAL = re.compile(
     r"(?:a couple of|a few|two|five|ten|\d+) minutes\b",
     re.IGNORECASE,
 )
-# The decision maker is on the learner's side of the call: the plan is a call WITH them, so the
-# learner never says they dislike calls or would not take part (a model said "he's not really one
-# for these things" and, a turn later, booked a call with him).
-_THIRD_PERSON = r"(?:he|she|they|my (?:husband|wife|partner|spouse|father|mother|dad|mom|parents))"
-_CALL_WORDS = (
-    r"(?:calls?|phone|talking|meetings?|chats?|speaking|these things|this kind of thing|"
-    r"things like this|that sort of thing)"
-)
-_DECIDER_UNWILLING = re.compile(
-    rf"\b{_THIRD_PERSON}\b[^.?!]{{0,30}}(?:\bnot\b|\bnever\b|n't\b)[^.?!]{{0,16}}"
-    r"\b(?:one for|a fan of|big on|into|keen on|fond of|comfortable with|up for|good with|"
-    r"the type for|a phone person|a call person)\b[^.?!]{0,30}"
-    rf"\b{_CALL_WORDS}\b"
-    rf"|\b{_THIRD_PERSON}\b[^.?!]{{0,25}}"
-    r"\b(?:hates?|dislikes?|avoids?|won'?t (?:join|do|take|be on|come)|wouldn'?t "
-    r"(?:join|do|take|be on|come)|doesn'?t (?:do|like|take|join)|refuses?)\b[^.?!]{0,25}"
-    rf"\b{_CALL_WORDS}\b",
-    re.IGNORECASE,
-)
-# "What I'd heard": hearsay about a figure that is not the $7,000 anchor ("That $6,300 actually
-# matches what I'd heard people got it for", "I heard something like nine thousand").  The anchor
-# is the only price the learner heard; the $9,000 it SAW on the website.
-_HEARSAY = re.compile(
-    r"\b(?:what i(?:'d|'ve| had| have)? (?:heard|read)|i(?:'d|'ve| had| have)? (?:heard|read)"
-    r"|i was told|someone told me|people (?:got|paid|said|told))\b",
-    re.IGNORECASE,
-)
 # Calling the price a stretch once the advisor has put $7,000 or less on the table (the learner's
 # own ask): "That number's better, but it's still a stretch for me" after "six thousand flat".
 _PRICE_STRAIN = re.compile(
@@ -357,150 +298,6 @@ _TIME_TOPIC = re.compile(
     r"\b(?:time|schedule|hours?|weeks?|months?|busy|packed|work|job|evenings?|weekends?)\b",
     re.IGNORECASE,
 )
-# The decision maker stays the persona's whole call ("it's just me deciding" is the contradiction).
-_DECIDES_ALONE = re.compile(
-    r"\b(?:it'?s|it is|its) (?:just|only) me\b[^.?!]{0,25}\b(?:decid\w+|decision|who decides)\b"
-    r"|\b(?:just|only) me (?:deciding|who decides|making (?:the|this) decision)\b"
-    r"|\bi (?:decide|make (?:the|this|my own) decisions?) (?:on my own|alone|by myself|myself)\b"
-    r"|\b(?:no ?one|nobody) else (?:is |will be |has to be )?(?:involved|decides?|deciding|"
-    r"part of|in (?:the|this) decision)\b"
-    r"|\bi don'?t (?:need to|have to) (?:ask|check with|talk to|run (?:it|this) by) "
-    r"(?:any ?one|anybody|someone)\b",
-    re.IGNORECASE,
-)
-# R1-Q final review round 1 (owner point 3, "co-decider facts stay consistent", failed again in the
-# third live sweep: the first rule caught 2 of 11 live and probed phrasings).  The persona decides
-# WITH one person, the one on its card, for the whole call.  The learner contradicts it by
-#   (a) denying that person's part ("it's up to me in the end", "I'm the one who decides", "he'd
-#       just want me to weigh it myself", "my husband doesn't really get involved"), or
-#   (b) naming ANOTHER person as a party to the decision ("my mom usually gets a say too", "I'd
-#       want to run it by my sister first").
-_DENIES_DECIDER = re.compile(
-    r"\b(?:it'?s|it is|that'?s|that is|this is|its) (?:really |all |entirely |ultimately |totally |"
-    r"completely |purely |just |only |pretty much |mostly )*(?:up to me|on me|my call|my decision|"
-    r"my choice|down to me)\b(?!\s+to\b)"
-    r"|\b(?:the )?(?:final |last )?(?:call|decision|choice)(?:'s| is) (?:all |entirely )?"
-    r"(?:mine|up to me|on me)\b"
-    r"|\bi(?:'m| am) the (?:one|only one|person|only person) (?:who|that|to) (?:decides?|"
-    r"makes? (?:the|these|this|those|all|my)\b)"
-    r"|\bi (?:make|take) (?:all )?(?:my own|the|these|those|all my) (?:\w+ )?(?:decisions?|"
-    r"calls?)\b[^.?!]{0,20}\b(?:myself|on my own|alone|by myself|about (?:my )?(?:money|"
-    r"finances|spending))"
-    r"|\bi (?:make|take) my own (?:decisions?|calls?)\b"
-    r"|\bweigh (?:it|this|that|things|the options) (?:up )?(?:myself|on my own|by myself)\b"
-    r"|\bdecid\w+ (?:it |this |that )?(?:on my own|by myself|myself|alone|solo)\b",
-    re.IGNORECASE,
-)
-_DECIDER_STEPS_BACK = re.compile(
-    r"\b(?:he|she|they)(?:'d| would| will|'ll|'s| is)? (?:just |only |really |probably |usually )*"
-    r"(?:want|wants|leave|leaves|let|lets|trust|trusts|expect|expects) (?:me|it|this|that)\b"
-    r"[^.?!]{0,30}\b(?:decid\w+|weigh|myself|my own|to me|up to me|on my own|figure)"
-    r"|\bmy (?:husband|wife|partner|spouse|father|mother|dad|mom|mum)\b[^.?!]{0,30}"
-    r"\b(?:doesn'?t|does not|won'?t|wouldn'?t|isn'?t|is not|never)\b[^.?!]{0,25}"
-    r"\b(?:get(?:s)? involved|involved|care|cares|mind|minds|weigh in|have a say|has a say|"
-    r"decide|decides|interfere|bothered|interested)\b",
-    re.IGNORECASE,
-)
-# Family and partners only: a friend who took the course or a manager who may sponsor it is
-# information or money, not a second decider.
-_ROLES = (
-    r"(?:mom|mum|mother|dad|father|sister|brother|husband|wife|partner|spouse|parents|in-laws|"
-    r"boyfriend|girlfriend|fianc\w+|uncle|aunt|cousin|grandparents?|grandfather|grandmother)"
-)
-# The words that name the SAME person as the card's decision maker.
-_OWN_ROLES = {
-    "husband": frozenset({"husband", "spouse"}),
-    "wife": frozenset({"wife", "spouse"}),
-    "partner": frozenset({"partner", "spouse"}),
-    "father": frozenset({"father", "dad", "parents"}),
-    "mother": frozenset({"mother", "mom", "mum", "parents"}),
-}
-_DECISION_VERB = re.compile(
-    r"\b(?:talk(?:ing)?|speak(?:ing)?|check(?:ing)?|run(?:ning)?|discuss(?:ing)?|consult(?:ing)?|"
-    r"ask(?:ing)?|tell(?:ing)?|show(?:ing)?|clear(?:ing)?|loop(?:ing)? in|bring(?:ing)? in|"
-    r"go(?:ing)? (?:over|through)|hear from|sleep on|sound(?:ing)? (?:it )?out)\b",
-    re.IGNORECASE,
-)
-_ROLE_MENTION = re.compile(r"\b(?:my|our)\s+(" + _ROLES + r")\b", re.IGNORECASE)
-_HAS_A_SAY = re.compile(
-    r"\bmy (" + _ROLES + r")\b[^.?!]{0,25}?\b(?:gets?|has|have|having|wants?|would want|needs?|"
-    r"also gets?)\s+(?:a |some |his |her |their )?(?:say|vote|opinion|input|word|voice)\b",
-    re.IGNORECASE,
-)
-_WINDOW_END = re.compile(r"[,;.?!]|\bbut\b|\bwhile\b|\bwhich\b", re.IGNORECASE)
-# R1-Q ship de-risk: "talk to / ask / tell" + a family role is a party to the DECISION only when the
-# clause is about deciding ("run it by my sister first", "talk to my mom before I sign up").  "I'll
-# talk to my husband tonight and my sister can babysit" and "I talk to my mom every day" are
-# ordinary sentences, and the card's decider line must not replace them.
-_DECISION_CUE = re.compile(
-    r"\b(?:first|before|decid\w*|decision|sign(?:s|ed)? off|agree\w*|approv\w*|on board|"
-    r"commit\w*|go ahead|ok(?:ay)? it|blessing|weigh in|have a say)\b",
-    re.IGNORECASE,
-)
-
-
-def _own_roles(decision_maker: str) -> frozenset[str]:
-    key = (decision_maker or "").strip().lower()
-    return _OWN_ROLES.get(key, frozenset({key}))
-
-
-def names_another_party(sentence: str, decision_maker: str) -> bool:
-    """The sentence makes somebody other than the card's decision maker a party to the decision.
-
-    "I'd want to run it by my sister first", "talk to my husband and my mom", "my mom usually gets a
-    say too".  A role is a party only after a decision verb (talk to, run it by ...) in a clause
-    that is about deciding (``_DECISION_CUE``: "first", "before", "decide", "approve" ...), or
-    beside "a say", and within the same clause, so "my mom watches the kids" and "I talk to my mom
-    every day" are not one.
-    """
-    own = _own_roles(decision_maker)
-    for found in _HAS_A_SAY.finditer(sentence):
-        if found.group(1).lower() not in own:
-            return True
-    for verb in _DECISION_VERB.finditer(sentence):
-        window = sentence[verb.end() : verb.end() + 70]
-        stop = _WINDOW_END.search(window)
-        clause = window[: stop.start()] if stop else window
-        if _DECISION_CUE.search(clause) is None:
-            continue
-        for role in _ROLE_MENTION.finditer(clause):
-            if role.group(1).lower() not in own:
-                return True
-    return False
-
-
-def decider_contradiction(sentence: str, decision_maker: str, *, asked: bool = False) -> bool:
-    """Whether ``sentence`` contradicts the persona's decision maker (see ``_DENIES_DECIDER``).
-
-    A denial that comes with a plain intention to talk to the card's own decision maker ("I'd talk
-    to my husband first, but ultimately it's my call") is not one.
-
-    Ship-gate round 1: ``_DECIDER_STEPS_BACK`` and ``_DENIES_DECIDER`` read ordinary talk about the
-    decision maker as a denial ("My husband wouldn't mind if I studied on weekends.", "He trusts me
-    to figure out the schedule", "It's my call which batch I join"; 19 of 25 ordinary sentences
-    were replaced by the card line or, a turn later, by a thinking filler, against 0 on main).  They
-    read a sentence only when the advisor has just asked who else decides (``asked``), the one place
-    where the answer is the card's.  "It's just me deciding" (``_DECIDES_ALONE``) and a second
-    decision maker named in a deciding clause (``names_another_party``) hold anywhere.
-    """
-    if _DECIDES_ALONE.search(sentence) is not None:
-        return True
-    if names_another_party(sentence, decision_maker):
-        return True
-    if not asked:
-        return False
-    if _DECIDER_STEPS_BACK.search(sentence) is not None:
-        return True
-    if _DENIES_DECIDER.search(sentence) is None:
-        return False
-    own = "|".join(sorted(_own_roles(decision_maker)))
-    consults = re.search(
-        r"\b(?:talk|speak|check|run|discuss|consult|ask|tell)\w*\b[^.?!]{0,40}\b(?:with|to|by)"
-        r"\s+(?:my |our )?(?:" + own + r"|him|her|them)\b",
-        sentence,
-        re.IGNORECASE,
-    )
-    return consults is None
 # Thanks for a discount nobody granted: "I can check with my manager" -> "Thank you, that helps".
 _GRANT_GRATITUDE = re.compile(
     r"\b(?:thank(?:s| you)|appreciate|grateful)\b[^.?!]{0,50}\b(?:discount|reduc\w+|"
@@ -512,51 +309,6 @@ _GRANT_GRATITUDE = re.compile(
 # What the learner says in place of a misreading (never the misreading itself).
 ANCHOR_REPLACEMENT = "So what would the actual price come to?"
 GRATITUDE_REPLACEMENT = "That would be good to know."
-# In place of "that matches what I'd heard" about a figure that is not the $7,000 anchor.
-ANCHOR_HEARD_REPLACEMENT = "I'd heard people got it for around $7,000."
-ANCHOR_HEARD_BELOW = "That's even below the $7,000 I'd heard people got it for."
-# In place of "that's a bit better" when the advisor put no lower price on the table (R1-Q
-# iteration 3: 11 replies in 10 calls called an unchanged or a worse offer better).
-PRICE_UNCHANGED_REPLACEMENT = "That's still more than I had planned for."
-# "That lines up with what I'd heard" / "in line with what I heard" / "that's what I heard": only
-# true of the $7,000 itself.  Said about any other price it contradicts the anchor the learner
-# raised.
-_HEARD_IN_LINE = re.compile(
-    r"\b(?:in line with|lines? up with|matches|consistent with|the same as|right (?:at|around)|"
-    r"about|close to|roughly|just|exactly)\s+(?:what|where)\s+i(?:'d| had| have)?\s+"
-    r"(?:heard|read)\b"
-    r"|\bthat'?s (?:what|about what|roughly what|exactly what|just what) i(?:'d| had| have)?\s+"
-    r"(?:heard|read)\b",
-    re.IGNORECASE,
-)
-# "That's a bit better" / "better than I expected" / "an improvement" / "closer to what I had in
-# mind" said about the price.  A sentence that is plainly about something else is not one.
-_BETTER_PRICE = re.compile(
-    r"\b(?:that|it|this)(?:'s| is| looks| sounds| seems| feels) "
-    r"(?:(?:definitely|certainly|already|actually|a bit|a little|a touch|slightly|much|way|"
-    r"so much|quite a bit|somewhat) )*(?:better|closer)\b"
-    r"|\b(?:more like it|an improvement)\b",
-    re.IGNORECASE,
-)
-# "a bit better than I expected" / "better than before" need a price word in the sentence: the
-# same words are "I'd like to understand it a bit better" and "better than watching videos".
-_BETTER_THAN = re.compile(
-    r"\b(?:(?:a bit|a little|a touch|slightly|much|way|so much|quite a bit|somewhat) "
-    r"(?:better|closer)(?: than| to (?:what|where)| price| number| offer)"
-    r"|better than (?:i|what i|before|the (?:first|last|full|original|list)|expected)"
-    r"|closer to (?:what|where) i)",
-    re.IGNORECASE,
-)
-_PRICE_WORD = re.compile(
-    r"\b(?:price|cost|number|offer|deal|figure|discount|pay|paying|afford\w*|budget|\$\s?\d|"
-    r"expected|hoped|planned)\b",
-    re.IGNORECASE,
-)
-_NOT_ABOUT_PRICE = re.compile(
-    r"\b(?:videos?|youtube|coursera|free|schedule|fit|option|support|mentors?|structure|classes|"
-    r"curriculum|projects?|portfolio|interviews?|career|job|time|hours?|pace|format)\b",
-    re.IGNORECASE,
-)
 _STILL_MORE = re.compile(
     r"\bmore than i (?:had |'d |would have )?(?:planned|hoped|budgeted|expected|wanted)\b",
     re.IGNORECASE,
@@ -964,14 +716,10 @@ class GuardContext:
     hollow: bool = False
     decider_asked: bool = False
     # R1-Q final review round 1.  The tracked phrases (``r1_text.reply_phrases``) of the learner's
-    # last replies, oldest first (the spacing window of ``PHRASE_WINDOW``); whether an earlier
-    # sentence of THIS reply named the $7,000 (set by the stream guard); and whether a proposal the
-    # detectors missed may have been made (inside the close window, no commitment on record, and the
-    # advisor's turn looks like a call or time question): a MEDIUM-level acceptance then is the
-    # model answering a real proposal, which the engine honours at the farewell, not a leak.
+    # last replies, oldest first (the spacing window of ``PHRASE_WINDOW``); and whether an earlier
+    # sentence of THIS reply named the $7,000 (set by the stream guard).
     recent_phrases: tuple[tuple[str, ...], ...] = ()
     anchor_in_reply: bool = False
-    late_ask_ok: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -1240,40 +988,6 @@ def _hours_are_advisors(sentence: str, ctx: GuardContext) -> bool:
     return bool(figures) and figures <= ctx.advisor_hours
 
 
-# Spelled-out amounts ("six hundred a month") are only money next to a money word: "a hundred
-# applications" is not an amount.
-_MONEY_CUE = re.compile(
-    r"\b(?:price|prices|cost|costs|pay|paying|paid|budget|afford|per month|a month|monthly|fee|"
-    r"fees|dollars|bucks|discount|total|spend|spending|instal\w+)\b",
-    re.IGNORECASE,
-)
-
-
-# "a few hundred a month" / "a couple of thousand" name no amount: the persona's own budget
-# answer is "around $500-700 a month", and a vague quantity of hundreds is the same thing said
-# loosely (R1-Q iteration 3: the sentence was dropped as an amount off the card, and the H3 need
-# with it).  Ship-gate round 1: "a couple hundred" and "over a hundred" are as vague.
-_VAGUE_QUANTITY = re.compile(
-    r"\b(?:(?:a few|(?:a )?couple(?: of)?|several|some|a handful of|many|a lot of) "
-    r"(?:hundred|thousand)|(?:over|more than) (?:a|one) (?:hundred|thousand))\b",
-    re.IGNORECASE,
-)
-
-
-def _amounts_spoken(sentence: str) -> list[int]:
-    """Whole-dollar amounts in ``sentence``, written or (next to a money word) spelled out.
-
-    A spelled number is money only next to a money word, not whenever the sentence holds one
-    anywhere (ship-gate round 1: "I've applied to over a hundred jobs and I'm paying for my own
-    prep." is the persona's own card, and was blocked as an invented amount that counts toward the
-    three-hit gate; main speaks it and posts nothing).
-    """
-    sentence = _VAGUE_QUANTITY.sub(" ", sentence)
-    if _MONEY_CUE.search(sentence):
-        return dollar_amounts(canonical_amounts(sentence, money_cue=_MONEY_CUE))
-    return dollar_amounts(sentence)
-
-
 # The R1-Q iteration 2 misread rules read ordinary spoken sentences only (a learner sentence is
 # 45 words at most): a runaway sentence skips them, which also bounds their cost on hostile text.
 MISREAD_MAX_CHARS = 1200
@@ -1288,23 +1002,6 @@ def _iteration_two_misreads(sentence: str, ctx: GuardContext) -> list[Hit]:
     replies, 0 on main) with a thinking filler, right after the advisor handled the objection.
     """
     hits: list[Hit] = []
-    # Like the denials of the decision maker, only as the answer to "who else decides?" (ship-gate
-    # round 1: "My husband isn't a fan of long phone calls, but he'd join this one." was dropped).
-    if (
-        ctx.persona is not None
-        and ctx.decider_asked
-        and _DECIDER_UNWILLING.search(sentence) is not None
-    ):
-        hits.append(_hit(MISREAD, "decider_unwilling", sentence))
-    if _HEARSAY.search(sentence) is not None:
-        # The $9,000 is on the website, so "I heard it is about $9,000" is the card, not hearsay.
-        prices = [
-            value
-            for value in dollar_amounts(canonical_amounts(sentence))
-            if value >= 4500 and value != 9000
-        ]
-        if prices and 7000 not in prices:
-            hits.append(_hit(MISREAD, "heard_not_anchor", sentence))
     if (
         ctx.offer_usd is not None
         and ctx.offer_usd <= 7000
@@ -1334,40 +1031,9 @@ def _reopens(sentence: str) -> bool:
     return _DOUBT.search(sentence) is not None and _HOLDS_THE_PLAN.search(sentence) is None
 
 
-# R1-Q ship de-risk: "That's what I heard from a friend." and "Oh, that's better." (about weekend
-# batches) are ordinary sentences.  The two price misread rules below only read a sentence that is
-# about a price: an offer is on the table (``ctx.offer_usd``) or the sentence has a price word.
-_PRICE_TALK_CUE = re.compile(r"\b(?:got it for|paid)\b", re.IGNORECASE)
-
-
-def _price_talk(sentence: str, ctx: GuardContext) -> bool:
-    """Whether ``sentence`` is said in price talk: an offer is on the table, or it names a price."""
-    return (
-        ctx.offer_usd is not None
-        or _PRICE_WORD.search(sentence) is not None
-        or _PRICE_TALK_CUE.search(sentence) is not None
-    )
-
-
 def _iteration_three_misreads(sentence: str, ctx: GuardContext) -> list[Hit]:
     """Misreadings the third live sweep found (hygiene hits: never posted, never a leak)."""
     hits: list[Hit] = []
-    priced = _price_talk(sentence, ctx)
-    if (
-        priced
-        and not ctx.fresh_price
-        and _NOT_ABOUT_PRICE.search(sentence) is None
-        and (
-            _BETTER_PRICE.search(sentence) is not None
-            or (
-                _BETTER_THAN.search(sentence) is not None
-                and _PRICE_WORD.search(sentence) is not None
-            )
-        )
-    ):
-        hits.append(_hit(MISREAD, "better_unchanged", sentence))
-    if priced and ctx.offer_usd != 7000 and _HEARD_IN_LINE.search(sentence) is not None:
-        hits.append(_hit(MISREAD, "heard_in_line", sentence))
     if ctx.hollow and CLOSER.search(sentence) is not None:
         hits.append(_hit(MISREAD, "closer_again", sentence))
     if _I_CALLED.search(sentence) is not None:
@@ -1392,12 +1058,7 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
                 break
     level = classify_learner_commitment(sentence)
     if level > ctx.commitment_cap:
-        if level is Level.MEDIUM and ctx.late_ask_ok:
-            # The model answered a proposal the detectors did not read (the advisor asked for a
-            # call in new words): the engine keeps the ask open for the farewell.  Not a leak.
-            hits.append(_hit(MISREAD, "late_ask_accepted", sentence))
-        else:
-            hits.append(_hit(COMMITMENT, f"level_{level.name.lower()}", sentence))
+        hits.append(_hit(COMMITMENT, f"level_{level.name.lower()}", sentence))
     if has_concession(sentence):
         hits.append(_hit(CONCESSION, "resolution_phrasing", sentence))
     question = is_question_like(sentence)
@@ -1411,17 +1072,12 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
             hits.append(_hit(INVENTED_FACT, "outcome_or_policy_claim", sentence))
     if _HOURS_A_WEEK.search(sentence) and not question and not _hours_are_advisors(sentence, ctx):
         hits.append(_hit(INVENTED_FACT, "own_availability_figure", sentence))
-    elif any(amount not in allowed for amount in _amounts_spoken(sentence)):
+    elif any(amount not in allowed for amount in dollar_amounts(sentence)):
         hits.append(_hit(INVENTED_FACT, "amount_off_card", sentence))
     if ctx.confirm and (question or _reopens(sentence)):
         hits.append(_hit(REOPEN, "confirm_only", sentence))
     if _TIME_REVERSAL.search(sentence) is not None:
         hits.append(_hit(MISREAD, "time_cue_reversed", sentence))
-    if persona is not None and len(sentence) <= MISREAD_MAX_CHARS:
-        if _DECIDES_ALONE.search(sentence) is not None:
-            hits.append(_hit(MISREAD, "decider_alone", sentence))
-        elif decider_contradiction(sentence, persona.decision_maker, asked=ctx.decider_asked):
-            hits.append(_hit(MISREAD, "decider_contradicted", sentence))
     if len(sentence) <= MISREAD_MAX_CHARS:
         hits.extend(_iteration_two_misreads(sentence, ctx))
     if ctx.nothing_granted and _GRANT_GRATITUDE.search(sentence) is not None:
@@ -1540,33 +1196,6 @@ def _scrub_name(text: str, first_name: str) -> str:
     return re.sub(re.escape(first_name), "[name]", text, flags=re.IGNORECASE)
 
 
-def _without_unwilling_clause(sentence: str) -> str:
-    """``sentence`` up to the clause that says the decision maker dislikes calls, or "".
-
-    "I'd have to ask my father first, and he's not really one for these things." keeps its first
-    half; a sentence that is nothing but the clause is dropped.
-    """
-    found = _DECIDER_UNWILLING.search(sentence)
-    if found is None:
-        return ""
-    # The clause starts at the LAST subject inside the match ("... my father first, and he's not
-    # really one for ..." matches from "my father"; the clause is "he's not really one for ...").
-    subjects = list(re.finditer(r"\b" + _THIRD_PERSON + r"\b", found.group(0), re.IGNORECASE))
-    start = found.start() + (subjects[-1].start() if subjects else 0)
-    kept = re.sub(r"[\s,;-]*(?:and|but|though|so)?[\s,;-]*$", "", sentence[:start])
-    if word_count(kept) < 3:
-        return ""
-    return kept + "."
-
-
-def _heard_replacement(ctx: GuardContext) -> str:
-    """What the learner says in place of hearsay about a figure that is not the $7,000 anchor."""
-    offer = ctx.offer_usd
-    if offer is not None and offer < 7000:
-        return ANCHOR_HEARD_BELOW
-    return ANCHOR_HEARD_REPLACEMENT
-
-
 def _replacement(hits: list[Hit], ctx: GuardContext, sentence: str = "") -> str:
     """The line spoken in place of a blocked sentence, chosen by hit priority.
 
@@ -1594,15 +1223,6 @@ def _replacement(hits: list[Hit], ctx: GuardContext, sentence: str = "") -> str:
             return ANCHOR_REPLACEMENT
         if rule == "gratitude_for_nothing":
             return GRATITUDE_REPLACEMENT
-        if rule in ("decider_alone", "decider_contradicted") and ctx.persona is not None:
-            return ctx.persona.decider_answer
-        if rule in ("heard_not_anchor", "heard_in_line"):
-            return _heard_replacement(ctx)
-        if rule == "decider_unwilling":
-            return _without_unwilling_clause(sentence)
-        if rule == "better_unchanged":
-            at_ask = ctx.offer_usd is not None and ctx.offer_usd <= 7000
-            return "" if at_ask else PRICE_UNCHANGED_REPLACEMENT
     return ""
 
 
@@ -1813,15 +1433,6 @@ class StreamGuard:
             text = _INLINE_FILLER.sub(_filler_gap, text)
         if not self._emitted:
             text = self._vary_opener(text)
-        if _BEFORE_I_GO.match(text) is not None:
-            text = _BEFORE_I_GO.sub("", text, count=1)
-        elif _ASIDE_BEFORE_I_GO.search(text) is not None:
-            text = _ASIDE_BEFORE_I_GO.sub(",", text, count=1)
-        elif (
-            _ONE_MORE_THING.search(text) is not None
-            and _TAIL_BEFORE_I_GO.search(text) is not None
-        ):
-            text = _TAIL_BEFORE_I_GO.sub("", text, count=1)
         if STRETCH_PHRASE.search(text) is not None:
             used = self._phrase_count(PHRASE_STRETCH)
             if used >= PHRASE_QUOTA[PHRASE_STRETCH]:

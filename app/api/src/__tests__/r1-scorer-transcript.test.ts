@@ -130,17 +130,23 @@ describe('masking', () => {
     }
   });
 
-  it('masks a MEDIUM line a barge-in cut off before "so we can decide"', () => {
+  it('masks a cut MEDIUM line only where production\'s frames reach it (ship restore, owner decision 2026-10-09)', () => {
+    // Production\'s frame "book a call on Thursday at 7 PM" still masks the cut that holds it, with or
+    // without what the learner said before.
+    const reached = "Let's book a call on Thursday at 7 PM with my husband";
+    expect(maskCommitmentLines(reached)).toBe(R1_COMMITMENT_MASK);
+    expect(maskCommitmentLines(`Hmm, okay. ${reached}`)).toBe(`Hmm, okay. ${R1_COMMITMENT_MASK}`);
+    // The new wordings are matched as WHOLE sentences: any other cut of them is ordinary speech to the
+    // mask, as on production (the prefix and short frames of the earlier round hid ordinary learner
+    // speech, so they are gone).
     for (const line of [
-      "Let's book a call on Thursday at 7 PM with my husband",
       "Let's book a call tomorrow at 7 PM with my husband so we",
       "Daytime is tough for me, so let's book a call tomorrow at 7 PM with my",
       "Let's book a call on Saturday at 11 AM with my father so",
       "Let’s book a call tonight",
       "Daytime is tough for me, so let's book a call",
     ]) {
-      expect(maskCommitmentLines(line)).toBe(R1_COMMITMENT_MASK);
-      expect(maskCommitmentLines(`Hmm, okay. ${line}`)).toBe(`Hmm, okay. ${R1_COMMITMENT_MASK}`);
+      expect(maskCommitmentLines(line), line).toBe(line);
     }
   });
 
@@ -157,46 +163,57 @@ describe('masking', () => {
         ),
       ).toBe(R1_COMMITMENT_MASK);
     }
-    // A barge-in can cut the call-back sentence after "my", and a curly apostrophe is the same.
+    // A curly apostrophe (or none) is the same; a cut of the sentence is not matched (whole sentences only).
     for (const line of [
-      "Call me back after I've talked to my",
       'Call me back after I’ve talked to my husband, and I’ll let you know.',
       "Hmm. Call me back after Ive talked to my husband, and I'll let you know.",
     ]) {
       expect(maskCommitmentLines(line)).toContain(R1_COMMITMENT_MASK);
     }
+    expect(maskCommitmentLines("Call me back after I've talked to my")).toBe("Call me back after I've talked to my");
   });
 
-  it('masks the e-mailed WEAK wording, also when a barge-in cut it after "get"', () => {
+  it('masks the e-mailed WEAK wording as a whole sentence, not a cut of it', () => {
     expect(
       maskCommitmentLines("Let me think about it. I'll read through the email and get back to you."),
     ).toBe(`Let me think about it. ${R1_COMMITMENT_MASK}`);
     for (const line of [
       'I’ll read through the email and get back to you.',
       "I'll read through the e-mail and get back to you.",
-      "I'll read through the email and get",
     ]) {
       expect(maskCommitmentLines(line)).toBe(R1_COMMITMENT_MASK);
       expect(maskCommitmentLines(`Okay. ${line}`)).toBe(`Okay. ${R1_COMMITMENT_MASK}`);
     }
+    expect(maskCommitmentLines("I'll read through the email and get")).toBe("I'll read through the email and get");
   });
 
-  it('masks the cuts of the scripted wordings that a barge-in persists', () => {
+  it('still masks every cut that production\'s four frames reach (ship restore: nothing production hid is lost)', () => {
     for (const cut of [
-      "Daytime is tough for me, so let's book a",
-      "Daytime is tough for me,",
-      "Let me think about it. Call me back after I've talked to",
-      "Let me think about it. Call me back after",
-      "Let me think about it. I'll read through the email and",
-      "Let me think about it. I'll read through the email",
-      'Let me think about it. Just email me the details and',
-      'Let me think about it. Just email me the details',
-      "Okay, let's do it. Send me the enrolment",
       "Okay, let's do it. Send me the enrolment link and I'll pay the deposit",
+      'Send me the enrolment link',
+      "I'll pay the deposit today",
+      "Let's book a call on Thursday at 7 PM with my husband",
+      "Just email me the details and I'll get back to you",
     ]) {
       const masked = maskCommitmentLines(cut);
       expect(masked, cut).toContain(R1_COMMITMENT_MASK);
-      expect(masked, cut).not.toMatch(/daytime is tough|call me back|read through|email me the details|enrolment|pay the deposit/i);
+      expect(masked, cut).not.toMatch(/enrolment|pay the deposit|book a call|email me the details/i);
+    }
+  });
+
+  it('leaves the other cuts of the new wordings visible, as on production', () => {
+    // Accepted gap: a barge-in that cut a new R1-Q wording short is not hidden (production never knew the
+    // wording either); the cost of hiding it was ordinary learner speech hidden from the scorer.
+    for (const cut of [
+      "Daytime is tough for me, so let's book a",
+      'Daytime is tough for me,',
+      "Let me think about it. Call me back after I've talked to",
+      'Let me think about it. Call me back after',
+      "Let me think about it. I'll read through the email and",
+      'Let me think about it. Just email me the details and',
+      "Okay, let's do it. Send me the enrolment",
+    ]) {
+      expect(maskCommitmentLines(cut), cut).toBe(cut);
     }
   });
 
@@ -250,9 +267,9 @@ describe('masking', () => {
     expect(maskCommitmentLines("  Send me the enrolment link and I'll pay the deposit today.")).toBe(
       R1_COMMITMENT_MASK,
     );
-    expect(maskCommitmentLines("Hmm. Daytime is tough for me, so let's book a")).toBe(
-      `Hmm. ${R1_COMMITMENT_MASK}`,
-    );
+    expect(
+      maskCommitmentLines("Hmm. Daytime is tough for me, so let's book a call tomorrow at 7 PM with my husband so we can decide."),
+    ).toBe(`Hmm. ${R1_COMMITMENT_MASK}`);
   });
 
   it('does not mask the F4 push or an ordinary request to call back', () => {

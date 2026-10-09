@@ -1462,7 +1462,7 @@ class OwedMoveScheduler:
             return CloseDecision("exit", None, "")
         move = self._force_next(r_sec)
         if move is not None:
-            return CloseDecision("redirect", move, "")
+            return CloseDecision("redirect", move, REDIRECT_OPENERS[0])
         if self.commit_permitted(r_sec) and not resolved:
             state = self._states[COMMIT_STALL]
             state.enabled_sec = state.enabled_sec if state.enabled_sec is not None else r_sec

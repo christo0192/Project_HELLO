@@ -147,17 +147,16 @@ class ReplayInvariantTests(unittest.TestCase):
 
     def test_the_whole_call_is_replayed(self) -> None:
         # Round 1 tightened the e-mail and callback detectors (a pitch about recordings or "the next
-        # session" is no offer or proposal), so the families finish earlier.  Iteration 1 reads who
-        # acts and with whom (``r1_commitment.enrol_ask_in``): the advisor's turn-76 "I would
-        # suggest you enroll tomorrow and sit in this next cohort" (group 17) is an enrolment ask
-        # inside the close window, so it earns the MEDIUM call there, one turn before the
-        # turn-78 offer to include the husband (group 18); the role-play ends on it, as it does in
-        # a live call.  Iteration 2 holds an owed move back one turn when the advisor asks a direct
-        # question about the learner (turn 43: "do you think you will be part of the group that
-        # gets laid off?" ... "what makes you get scared of layoffs?"), so the objections of this
-        # slow advisor land later: the F4 pair is forced at 10:48 and 11:29, the close window
-        # opens after the turn-76 enrolment suggestion (group 17), and the call ends on the 13:00
-        # stall (a reaction, then the WEAK line), the end-game backstop.
+        # session" is no offer or proposal), so the families finish earlier.  Iteration 2 holds an
+        # owed move back one turn when the advisor asks a direct question about the learner (turn
+        # 43: "do you think you will be part of the group that gets laid off?" ... "what makes you
+        # get scared of layoffs?"), so the objections of this slow advisor land later: the F4 pair
+        # is forced at 10:48 and 11:29, the close window opens after the turn-76 enrolment
+        # suggestion (group 17), and the call ends on the 13:00 stall (a reaction, then the WEAK
+        # line), the end-game backstop.  Ship restore (owner decision 2026-10-09): the enrolment
+        # reading is production's (``r1_commitment._ENROL_ASK``), which does not read the turn-76
+        # "I would suggest you enroll tomorrow" as an ask, so group 17 logs no ask: the forced F4
+        # move is spoken as before, and the ask reason moves to the turn-78 offer (group 18).
         self.assertGreaterEqual(len(self.turns), 17)
         self.assertTrue(all(turn.plan is not None for turn in self.turns))
         commitment = self.result["admin_log"]["commitment"]
@@ -165,9 +164,9 @@ class ReplayInvariantTests(unittest.TestCase):
         self.assertEqual(self.turns[-1].group, STALL_GROUP)
         self.assertEqual(self.turns[-1].mode, "intent")
         # The enrolment suggestion still comes before the window: the owed F4 move takes the turn.
-        self.assertIn(
-            "ask_yields_to_owed_move", self.turns[ENROL_SUGGESTED_GROUP - 1].plan["reasons"]
-        )
+        suggested = self.turns[ENROL_SUGGESTED_GROUP - 1].plan
+        self.assertEqual(suggested["move_id"], "F4-PRIMARY")
+        self.assertIn("owed:F4-PRIMARY:forced", suggested["reasons"])
         self.assertIn(
             "owed_deferred_for_dig", " ".join(" ".join(t.plan["reasons"]) for t in self.turns)
         )

@@ -106,7 +106,6 @@ CALL_PITCHES = (
     "What students love is that they can schedule a call with a coach whenever they want.",
     "You can book a slot with a mentor, right?",
     "Want to know the best part? We schedule a career coaching session in the third month.",
-    "Want the link? We will send you the link to the live class on Monday.",
     # ship de-risk: the programme's own schedule that ends in a fit check proposes no call
     "Our mentors run a live call every Saturday, would that work with your schedule?",
     "Live sessions are Tuesday and Thursday at 8 PM, would that work for you?",
@@ -118,13 +117,11 @@ CALL_PITCHES = (
 )
 EMAIL_PITCHES = (
     "We'll send you the schedule once you enroll.",
-    "We will send you the link to the live class on Monday.",
     "We'll send you the recordings once you join.",
     "We will email you the class link before every session.",
     "We'll email you the details of the live session every week.",
     "We can send you the notes for each class after you enroll.",
     "We will send you the schedule of the live classes on the first day of the program.",
-    "I'll send you the link to the orientation session once you join.",
     "I'll email you a link to join the live session.",
     "We'll send you the zoom link before the class.",
     "We will email you the reminders for the weekly session.",
@@ -434,14 +431,10 @@ class PitchOrProposalTests(unittest.TestCase):
         self.assertIsNotNone(neg.detect_callback(text))
         self.assertEqual(detect_ask(text).kind, AskKind.CALL)
 
-    def test_the_link_to_a_class_is_not_an_enrolment_link(self):
-        for text in (
-            "We will send you the link to the live class on Monday.",
-            "I'll send you the link for the orientation session.",
-            "We send you the link to the weekly webinar.",
-        ):
-            with self.subTest(text=text):
-                self.assertIsNone(detect_ask(text), text)
+    def test_a_bare_link_is_an_enrolment_ask_as_on_production(self):
+        # Ship restore (owner decision 2026-10-09): "send you the link to the live class" is read as an
+        # enrolment ask, exactly as on production (its three rows moved out of this test: the
+        # structural grammar that exempted them did not converge and is gone).
         for text in ("I'll send you the link.", "Shall I send you the payment link?"):
             with self.subTest(text=text):
                 self.assertIsNotNone(detect_ask(text), text)

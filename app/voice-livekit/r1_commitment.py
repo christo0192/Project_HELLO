@@ -21,7 +21,6 @@ from enum import Enum, IntEnum
 from typing import Iterable, Mapping
 
 from r1_text import (
-    clause_before,
     fold,
     fuzzy_contains,
     is_question_like,
@@ -303,7 +302,6 @@ _WITH_LEARNER = re.compile(
     r"|\bboth of you\b|\bthe two of you\b|\byour (?:husband|wife|partner|spouse|father|mother|"
     r"parents|family|dad|mom|roommates?)\b|\bto (?:talk|discuss|go over|walk|explain|answer|"
     r"review|chat|hear|work out|plan|finali[sz]e|map|confirm|check|see|figure|cover|look)\b"
-    r"|\bso (?:he|she|they|you|i|we|that)\b"
     r"|\b(?:your|any) (?:questions|thoughts|concerns|doubts)\b",
     re.IGNORECASE,
 )
@@ -348,44 +346,6 @@ _ASKS_LEARNER_TO_CONTACT = re.compile(
     re.IGNORECASE,
 )
 _MAX_SENTENCE = 700
-# What may follow "send you the link": class logistics are not an enrolment link.
-_CLASS_LOGISTICS_AFTER = (
-    r"(?!\s+(?:to|for|of)\s+(?:(?:join|attend|access|watch|view|open|enter)\s+)?"
-    r"(?:the |your |our |every |each |all )?(?:live |recorded |weekly |"
-    r"online |upcoming |first |free |sample )?(?:class|classes|session|sessions|lecture|lectures|"
-    r"webinars?|workshops?|zoom|meeting|demo|orientation|induction|community|group|slack|discord|"
-    r"whatsapp|mentors?|recordings?|materials?|notes|batch|cohort)\b)"
-)
-# What a link or a form is FOR, when that is the enrolment, the payment, a seat, or a form to fill.
-_ASK_DESTINATION = (
-    r"enrol\w*|regist\w*|sign[- ]?up|sign\b|pay\w*|deposit|seats?|spots?|admissions?|"
-    r"appl(?:y|ication)\w*|checkout|instal+ments?|reserv\w*|secure\b|lock\w*|fill\w*|"
-    r"complet\w*|submit\w*"
-)
-
-
-def _resource_dest_after(extra: str = "") -> str:
-    """Look-ahead: the link or form just matched LEADS to a resource, not to the enrolment.
-
-    "The link to our alumni reviews", "the form for the free career consultation", "the form to
-    request a callback" are resources unless where they lead is the enrolment, the payment or a
-    seat (``_ASK_DESTINATION``, plus ``extra`` words).  "With you / me" is who gets it, not where
-    it leads.
-    """
-    cues = _ASK_DESTINATION + (r"|" + extra if extra else "")
-    return (
-        r"(?!\s+(?:to|for|about|on|of|that|which|where|"
-        r"with(?! (?:you|me|us|him|her|them|your)\b))\b"
-        r"(?![^.?!]{0,40}?\b(?:" + cues + r")\b))"
-    )
-
-
-# For the form after "send" (a head-only reading: main has none); main's question frame also reads
-# "can I email you the link for the January batch?", so the question keeps a batch / cohort cue.
-_RESOURCE_DEST_AFTER = _resource_dest_after()
-_RESOURCE_DEST_AFTER_QUESTION = _resource_dest_after(r"batch|cohort")
-
-
 # The call we are on: "after the call", "once we finish this call", "on this call".
 _EXISTING_CALL = re.compile(
     r"\b(?:after|before|during|on|at the end of|finish|finishing|end|ending|hang up|wrap up|"
@@ -536,7 +496,7 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
     # call you / ring you / give you a call / call back
     (
         re.compile(
-            r"\b(?:call|ring|phone|ping|buzz|text|message|whatsapp)(?:ing)? " + _PEOPLE + r"\b"
+            r"\b(?:call|ring|phone|ping|buzz|text)(?:ing)? " + _PEOPLE + r"\b"
             r"|\b(?:give|gave|giving) " + _PEOPLE + r" a (?:call|ring|buzz|shout)\b"
             r"|\b(?:call|ring|phone)(?:ing)? (?:you )?back\b",
             re.IGNORECASE,
@@ -577,7 +537,7 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
     # "I could do tomorrow evening", "we can do Thursday at 7", "I'm free on Friday"
     (
         re.compile(
-            r"\b(?:do|make it|manage|go with|say|take|fit you in|squeeze you in)\b"
+            r"\b(?:do|make it|manage|go with|say|fit you in|squeeze you in)\b"
             r"(?: [\w'-]+){0,2}? (?:" + _CONCRETE_DAY.pattern + r")"
             r"|\b(?<!your )(?<!the )(?<!a )(?:call|ring|phone|text|ping)\b(?: you| back)*(?: on| "
             r"at| in| this| next| around| by)? (?:" + _CONCRETE_DAY.pattern + r")"
@@ -642,7 +602,7 @@ _TIME_ASKS = (
         r"\b(?:does|would|will|is|are|do|how about|what about|shall we do|shall we say|"
         r"can we do|could we do|how does|how'?s|if we say)\b[^.?!]{0,50}"
         r"\b(?:" + _DAY + r"|" + _CLOCK_TIME + r"|(?<![\d$,.])\d{1,2}(?![\d,.])|next week|"
-        r"this week|this weekend|weekend|weekday|weekdays|evening|morning|afternoon|noon|"
+        r"this week|this weekend|"
         r"sometime|lunch|same time|(?:one|two|three|four|five|six|seven|\d+) (?:days?|weeks?|"
         r"hours?) from now)\b"
         r"[^.?!]{0,50}\b(?:work|works|suit|suits|fine|ok|okay|good|convenient|better|sound|"
@@ -862,264 +822,55 @@ def _object_proposes_call(
     return _WHEN_CUE.search(lowered) is not None or learner_cue
 
 
-# What: an enrolment, a payment, a seat.
-_ENROL_VERB_SEND = r"(?:send|share|email|e-mail|forward|text|whatsapp|drop|shoot|give)"
-# The things a learner pays or signs up through; only with a link, a form, a page, a portal or an
-# invoice after them are they something to act on (see the send / share pattern in ``_ENROL_ASK``).
-_ENROL_OBJECT = (
-    r"(?:payment|enrol+ment|registration|sign-?up|application|booking|invoice|deposit|"
-    r"contract|agreement|checkout|instal+ment(?: plan)?)"
-)
-# What payment and registration TALK is when it is not the thing to act on: information.
-_NOT_INFORMATION = (
-    r"(?!\s+(?:details?|options?|information|info|plans?|comparison|breakdown|faq|faqs|schedule|"
-    r"terms|process|steps|requirements|polic(?:y|ies)|deadlines?|dates|summary|overview|fees?|"
-    r"costs?|pricing|prices?|structure|methods?|choices|alternatives|instructions|guidelines)\b)"
-)
-_SEAT_VERB = r"(?:hold|reserve|lock|secure|grab|snag|save|book)"
-_SEAT_OBJECT = (
-    r"(?:(?:you |him |her |them |us )?(?:your|a|the|my|that|this) (?:\w+ ){0,2}?(?:spot|"
-    r"seat|place|price|rate|offer|deal|discount|batch slot|cohort slot)|yours|it|one|this|that|"
-    r"(?:(?:a|the|your|my) )?slot in (?:the|a) (?:next |upcoming |coming )?(?:batch|cohort))"
-)
-# Who acts: the advisor asks, offers or invites the learner to act NOW.
-_ENROL_FRAME = (
-    r"(?:(?:shall|should|can|could|may|would|will|do|did) (?:i|we)|(?:i|we)(?:'ll| will| can|"
-    r" could| should| would like to)|let me|let us|let'?s|(?:want|like) me to|do you want|"
-    r"would you like|are you (?:ready|willing|prepared|keen)|ready to|want to|(?:i'?m|we'?re|i am|"
-    r"we are) (?:happy|glad|willing|able) to|how about|what about|why (?:don'?t|not)|please|just|"
-    r"(?:would|will|does) it (?:help|make sense|be (?:ok|okay|better|good|worth))(?: to| if)?)"
-)
-# What they invite: to enrol, to take or hold a seat, to pay.
-_ENROL_ACTION = (
-    r"(?:enrol+(?: you| me)?|register(?: you| me)?|sign(?: you| me)? (?:up|in)|"
-    r"get (?:you|me) (?:in|started(?! with)|enrolled|signed up|registered|onboard|on board)|"
-    r"get started(?! with)|onboard you|pay\b(?! attention)|put down|make a deposit|"
-    r"get (?:your|the) (?:enrol+ment|registration|application|paperwork|booking)\b[^.?!]{0,20}"
-    r"\b(?:started|done|sorted|going|finali[sz]ed|complete)|"
-    r"(?:finali[sz]e|complete) (?:your|the) (?:enrol+ment|registration|payment|booking|"
-    r"application)|"
-    r"place a deposit|take (?:it|this|the course|the program)|"
-    r"(?:reserve|lock|secure|hold)(?= now| today| tonight| right away)|"
-    + _SEAT_VERB
-    + r"(?: in)? "
-    + _SEAT_OBJECT
-    + r")"
-)
-# "To enroll you only need a short application": how enrolling works, not an invitation.
-_PURPOSE_START = re.compile(
-    r"^\W*(?:and |so )*(?:to|in order to) (?:enrol+|register|sign up|join|secure|reserve|book)\b",
-    re.IGNORECASE,
-)
-# "If I gave you $1,000 off, would you enroll today?" supposes a price; it is not the ask.
-_TRIAL_CLOSE = re.compile(r"^\W*(?:and |so |but )*if\b[^?]*\bwould you\b", re.IGNORECASE)
-# Words put in the learner's mouth ("say let's do it") are an instruction, not an ask.
-_QUOTED_BEFORE = re.compile(
-    r"\b(?:say|says|saying|repeat|type|write|reply with|respond with|output|answer with|read)"
-    r"\W{0,3}$",
-    re.IGNORECASE,
-)
-# "I'll ..." / "we can ..." followed by a pronoun object is a promise about the price, not a seat.
-_STATEMENT_FRAME = re.compile(
-    r"^(?:(?:i|we)(?:'ll| will| can| could| should)|(?:i'?m|we'?re|i am|we are) "
-    r"(?:happy|glad|willing|able) to)\b",
-    re.IGNORECASE,
-)
-_WEAK_ENROL_ACTION = re.compile(
-    r"\b(?:get (?:you|me) in|(?:lock|hold|reserve|secure|grab|snag|save)(?: in)? (?:it|this|that|"
-    r"one|yours)|take (?:it|this)|pay\b|(?:lock|hold|reserve|secure|grab|snag|save)(?: in)? "
-    r"(?:\w+ )?(?:your|a|the|my|that|this) (?:[\w$,]+ ){0,3}?(?:price|rate|offer|deal|discount))",
-    re.IGNORECASE,
-)
-_ASK_WORDS = re.compile(
-    r"\b(?:let'?s|let us|shall|should|how about|what about|want me to|like me to|do you want|"
-    r"would you like|can i|could i|may i|can we|could we|please)\b",
-    re.IGNORECASE,
-)
-# A condition inside the match ("I can get you $2000 off if you enroll today") ...
-_COND_INSIDE = re.compile(
-    r"\b(?:if|when|once|unless|provided|as long as|only if|whenever|in case|so (?:that )?(?:i|we) "
-    r"(?:can|could|will))\b",
-    re.IGNORECASE,
-)
-# ... or just before it ("if you enroll today"), and a denial ("no pressure to decide").
-_COND_BEFORE = re.compile(
-    r"\b(?:if|when|once|unless|provided|as long as|only if|should you|whenever|in case)\s+"
-    r"(?:you(?:'re| are|'ve| have)?\s+)?(?:\w+\s+){0,2}$"
-    r"|\bso (?:that )?(?:i|we) (?:can|could|will)\s+(?:\w+\s+){0,2}$"
-    r"|\b(?:no pressure to|no need to|don'?t have to|do not have to|not required to|"
-    r"without having to|needn'?t|no rush to|not asking you to|never have to|before you|"
-    r"feel ready to|feel ready|until you)\s*(?:\w+\s+){0,2}$",
-    re.IGNORECASE,
-)
+# What: an enrolment or a payment.  Ship restore (owner decision 2026-10-09: anything worse than
+# production behaves exactly like production): this is origin/main's own enrolment-ask reading,
+# its ``_ENROL_ASK`` and the per-sentence loop of its ``detect_ask``, verbatim.  The structural
+# grammar that replaced it did not converge in five review rounds (each narrowing either missed
+# an ask main reads or read an information send main does not); its misses and false positives
+# are now production's, which the owner accepted.
 _ENROL_ASK = _compile(
-    # frame + action: "let's get you enrolled", "want me to hold a seat", "would it help to hold"
-    r"\b" + _ENROL_FRAME + r"\b[^.?!]{0,30}?\b" + _ENROL_ACTION + r"(?![\w-])",
-    # "shall we go ahead", "how about we proceed": only a real question about proceeding
-    r"\b(?:(?:shall|should|can|could|may) (?:i|we|you)|would you like to|do you want to|how "
-    r"about|what about|why don'?t we|why not|are you ready to|are you willing to)\b (?:\w+ ){0,2}?"
-    r"(?:proceed|go ahead|move forward|move ahead)\b",
-    # the imperative: "grab the seat now", "just reserve", ", and lock it"
-    r"(?:^|[,;] ?)(?:(?:and|but|so|then|now|just|please|okay|ok) )*(?:" + _SEAT_VERB + r"(?: in)? "
-    r"" + _SEAT_OBJECT + r"|(?:enrol+|register|sign up|pay)(?= now| today| tonight)|"
-    r"reserve(?= now| today| tonight| right))(?![\w-])",
-    # send / share the payment or enrolment LINK, form, page, portal or invoice.  An e-mail of the
-    # details, the options, a pack, a brochure or "the registration material" is INFORMATION,
-    # however it is phrased (R1-Q final review round 1: "I'll email the curriculum and payment
-    # details today" was an enrolment ask and earned a scripted "I'll pay the deposit today"; ship
-    # de-risk: the declaratives "I'll email you the enrolment pack tonight" did too, an unearned
-    # STRONG on 8/15 information sends against 5/15 in production).  Only the thing the learner
-    # would act on counts, so the object must be followed by the link noun.
-    r"\b" + _ENROL_VERB_SEND + r"\b(?: (?:you|me|him|her|them|over|across|out))?"
-    r"(?: [\w'-]+){0,3}? " + _ENROL_OBJECT + r"[- ](?:link|form|page|portal|invoice)\b",
-    # "go ahead and complete the payment on the link", "please finalise your registration"
-    r"(?:^|[,;] ?)(?:(?:and|but|so|then|now|just|please|okay|ok) )*(?:go ahead and |please )?"
-    r"(?:complete|finali[sz]e|make|do|submit) (?:the |your |that |this )?(?:payment|registration|"
-    r"enrol+ment|booking|deposit|application)\b" + _NOT_INFORMATION,
-    # A bare link or form is an ask with main's verb, "send" ("send me the link"); a bare PAGE is
-    # not (main reads only "send the payment / enrolment / registration page", the pattern above):
-    # "I'll send you the page with the batch timings" is information (ship-gate round 2: 7 of 7 read
-    # as an ask, main 0 of 7).  A form that leads somewhere ("the form for the free career
-    # consultation", "the form to request a callback") is information too.
-    r"\bsend\b(?: (?:you|me|him|her|them|over|across|out))?"
-    r"(?: (?:the|a|an|your|that|this|it))? ?(?:link\b" + _CLASS_LOGISTICS_AFTER + r"|form\b"
-    + _RESOURCE_DEST_AFTER + r")",
-    # Any OTHER verb is an ask only as main's question ("shall I share / email you the link?"):
-    # said as a statement it is information far more often ("I'll email you the link to our alumni
-    # reviews", "I can share the link to the curriculum page"; ship-gate round 1: 12 of 14 such
-    # sends read as an enrolment ask and earned the scripted STRONG line, main 1 of 14).  The
-    # question keeps main's reading of the natural close ("Shall I share the link?", "Can I email
-    # you the form?"; ship-gate round 2: head missed all of them, an earned STRONG answered with
-    # "Okay, thanks.") and drops its reading of a link to a resource ("Can I email you the link to
-    # a sample lecture?").
-    r"\b(?:shall|should|can|could|may|would|will) (?:i|we) (?:\w+ ){0,2}?(?:share|email|e-mail)\b"
-    r"(?: (?:you|me|him|her|them|over|across|out))?(?: (?:the|a|an|your|that|this|it))? ?"
-    r"(?:link|form)\b" + _RESOURCE_DEST_AFTER_QUESTION,
-    # "Can I send it right now?" / "Shall I send it?" right after the enrolment form was described
-    # (4 live pushy asks; main reads them): only when "it" ends the question, so "Should I send it
-    # to the email you used on the form?" and "Can I send it over so you can review it?" stay
-    # information.  ("Should I send THAT over?" after an offer of the details by e-mail stays
-    # information too: it is a labelled non-ask of the corpus, and main reads it as an ask.)
-    r"\b(?:shall|should|can|could|may|would|will) (?:i|we) send it(?: over| across| out)?"
-    r"(?: (?:right )?(?:now|today|tonight))?\W*$",
-    # "I'll email you the link, and you can pay the deposit whenever you like", "I'll email it over
-    # so you can pay the deposit tonight": the learner ACTS on it (main reads these through "pay the
-    # deposit"; the look-ahead keeps "pay" out of the match, clear of the weak-"pay" guard).
-    r"\b" + _ENROL_VERB_SEND + r"\b(?: (?:you|me|him|her|them|over|across|out))?"
-    r"(?:(?: (?:the|a|an|your|that|this))? ?(?:link|form)|(?: it| that| this| everything)"
-    r"(?: over| across| out)?)\b(?=[,;]? (?:so|and) (?:you|they) (?:can|could|may|will) "
-    r"(?:then )?(?:sign|enrol+|lock|pay(?! attention)|reserve|secure)\b)",
-    # An invoice is the thing to pay whoever sends it.
-    r"\b" + _ENROL_VERB_SEND + r"\b(?: (?:you|me|him|her|them|over|across|out))?"
-    r"(?: (?:the|a|an|your|that|this|it))? ?invoice\b" + _CLASS_LOGISTICS_AFTER,
-    # "send it over so you can sign": the learner ACTS on it.  "so you can decide / confirm /
-    # review it" is the advisor sending something to read ("I'll send everything over so you can
-    # decide with your husband"), not an ask (ship-gate round 1: 5 of 7 read as one, main 0 of 7).
-    r"\b" + _ENROL_VERB_SEND + r" (?:it|that|this|everything) (?:over |across |out )?"
-    r"(?:so|and|to)\b[^.?!]{0,30}\b(?:sign|enrol+|lock|pay|reserve|secure)\b",
-    r"\b(?:sign(?:ing)?|enrol+(?:ing)?|register(?:ing)?) (?:you|me) "
-    r"(?:up|in|enrolled|registered|started|onboard)\b",
-    r"\benrol+ (?:you|me)\b",
-    r"\b(?:pay|put down|make|place) (?:the |a |your |an )?(?:\w+ )?deposit\b|\bdeposit "
-    r"(?:today|now)\b",
-    # the pushy close
-    r"\bjust say the word and (?:it'?s yours|(?:i|we)(?:'ll| will) (?:lock|hold|reserve|secure|"
-    r"grab|enrol+|register|sign|get you|send (?:you )?the))\b"
-    r"|\bjust (?:say|give me|tell me|reply|text me) (?:yes|a yes|ok|okay|go)\b"
-    r"|\bgive me a yes\b|\bsay yes\b|\bsign (?:now|today|tonight)\b|\b(?:enrol+|register|pay|"
-    r"grab it|lock it in|lock it|sign up) (?:now|today|tonight)\b",
-    r"^\W*(?:and |so |okay |ok )*ready to (?:grab|go|start|join|enrol+|sign|commit|lock|"
-    r"do this|take|move|proceed|pay)\b",
-    r"\blet'?s (?:just )?(?:do it|do this|go for it)(?: now| today| tonight)?\W*(?:$|[!.]|,\s*"
-    r"(?:quick|easy|simple|done|it'?s|now|just))",
-    r"\blet'?s (?:just )?(?:lock|grab|take|secure|hold)\b[^.?!]{0,40}\b(?:before|now|today|"
-    r"tonight|right away)\b",
-    r"\b(?:payment|enrol+ment|registration|sign-?up|invoice|deposit) link\b",
-    r"^\W*(?:the |a )?(?:payment |deposit |enrol+ment |instal+ment )?link(?: now| today)?\W*$",
-    r"(?:^\W*(?:and |so |okay |ok )*|\b(?:do you|would you) )(?:want|take|grab|accept|like) "
-    r"(?:the |this |that )?(?:\$\d[\d,]* )?(?:deal|offer)\b",
-    # a recommendation to enrol at a time ("I would suggest you enroll tomorrow"); not "join": "I'd
-    # recommend you join our free webinar this week" invites a class, not a seat (ship-gate round 1)
-    r"\b(?:suggest|recommend|advise|urge|encourage)\w* (?:that )?(?:you|we) (?:to )?(?:enrol+|"
-    r"sign up|register|go ahead|pay|get you (?:enrolled|signed up|registered|started))\b"
-    r"[^.?!]{0,25}\b(?:today|tomorrow|now|tonight|right away|immediately|this week)\b",
-)
-# The first match of these is NOT an enrolment even in an ask frame: class logistics.
-_ENROL_NOT = re.compile(
-    r"\bsend\b[^.?!]{0,15}\b(?:link|schedule|details)\b[^.?!]{0,12}\b(?:to|for|of) (?:the |your |"
-    r"our |every |each )?(?:live |recorded |weekly |online |upcoming |first )?(?:class|classes|"
-    r"session|sessions|lecture|lectures|webinar|workshop|zoom|meeting|demo|orientation)\b"
-    r"|\b(?:are|were) you (?:ready|willing|prepared|interested|keen) to (?:hear|talk|discuss|dive|"
-    r"get into|speak|share|tell|go through|learn more|know)\b"
-    r"|\bcan we (?:start|talk|go) (?:with|about|through|over)\b",
-    re.IGNORECASE,
-)
-_ENROL_QUESTION_FORMS = _compile(
+    r"\b(?:shall|should|can|could|may|would|will) (?:i|we) (?:\w+ ){0,2}?"
+    r"(?:send|share|email|proceed|go ahead|enrol+|register|sign|reserve|lock|secure|"
+    r"process|get you)\b",
+    r"\b(?:let'?s|let us) (?:get you|go ahead|move forward|proceed|enrol+|sign|register|"
+    r"finali[sz]e|lock|secure|reserve)\b",
     r"\b(?:are|were) you (?:ready|willing|prepared|interested|keen) (?:to|in) "
     r"(?!hear|talk|discuss|dive|get into|speak|share|tell|go through|learn more|know)\w+",
+    r"\b(?:sign(?:ing)?|enrol+(?:ing)?|register(?:ing)?) (?:you|me) "
+    r"(?:up|in|enrolled|registered|started|onboard)\b",
+    r"\b(?:let'?s|shall we|can we|want me to|would you like me to|ready to) (?:\w+ ){0,2}"
+    r"get you (?:started|enrolled|signed up|registered|onboard)\b",
+    r"\b(?:we|i)(?:'ll| will| can| could| should)? get you (?:enrolled|signed up|registered)\b",
+    r"\bsend\b[^.?!]{0,15}\b(?:payment|enrol+ment|registration) (?:details|form|page)\b",
+    r"\benrol+ me\b",
+    r"\b(?:i'?ll|i will|we'?ll|we will|shall i|can i|could i|let me|let us|let'?s) "
+    r"(?:\w+ ){0,2}?enrol+ you\b",
     r"\b(?:would you like|do you want) to (?:enrol+|sign up|join|proceed|move forward|"
     r"get started|secure|reserve|lock|go ahead|take (?:it|this|the course|the program))\b",
-    r"\bhow (?:would|do) you (?:like|want) to (?:proceed|move forward|go forward|pay|enrol+)\b",
+    r"\b(?:payment|enrol+ment|registration|sign-?up|invoice) link\b",
+    r"\bsend (?:you |me )?(?:the |a |an )?(?:link|invoice|payment|enrol+ment form|"
+    r"registration form)\b",
+    r"\b(?:pay|put down|make|place) (?:the |a |your |an )?(?:\w+ )?deposit\b"
+    r"|\bdeposit (?:today|now)\b",
     r"\b(?:can|could|will|would|shall|should) you (?:\w+ ){0,2}pay (?:today|now|upfront|"
-    r"in full)\b"
-    # "Would you be okay paying the first instalment today so the seat is yours?"; a question about
-    # HOW they would pay ("would you be paying upfront or spreading it out?") is discovery
-    r"|\b(?:can|could|will|would|shall|should|are) you (?:\w+ ){0,3}(?:pay|paying)\b[^.?!]{0,30}"
-    r"\b(?:today|now|tonight|right away)\b|\b(?:please )?pay (?:today|now)\b",
-)
-# How enrolling works ("you would just pick a plan"), not an invitation to do it.
-_ENROL_DESCRIBES = re.compile(
-    r"\b(?:you(?:'d| would| will|'ll)? (?:just |only |simply )?(?:need|have|get|pick|choose|fill|"
-    r"start|begin|do)|reserving|holding|booking|it just means|that just means|means we)\b",
-    re.IGNORECASE,
+    r"in full)\b|\b(?:please )?pay (?:today|now)\b",
+    r"\b(?:book|reserve|secure|lock in|hold|save) (?:your|a|the|my) (?:spot|seat|place)\b",
+    r"\b(?:want|like|ready|shall|should|can|could|let'?s|how about|what about|time to|"
+    r"happy to|why don'?t we|why not)\b[^.?!]{0,20}\b(?:move forward|proceed|go ahead)\b",
+    r"\bready to (?:enrol+|sign|join|commit|move|proceed)\b",
+    r"\bhow (?:would|do) you (?:like|want) to (?:proceed|move forward|go forward|pay|enrol+)\b",
 )
 
 
 def enrol_ask_in(sentence: object) -> str | None:
-    """The phrase that asks the learner to enrol, pay or take a seat now, or None.
+    """The phrase that asks the learner to enrol or pay in one advisor sentence, or None.
 
-    An ask is made in the advisor's own voice about THIS moment: a question, an offer or a
-    promise with "I", "let's", an imperative.  A description of how enrolling works ("you would
-    just pick a plan and we would get you enrolled"), a condition ("if you decide ..."), a denial
-    ("no pressure to decide today"), class logistics and a plain e-mail of the details are not
-    asks.
+    Production's reading, verbatim (origin/main ``detect_ask``): the first ``_ENROL_ASK`` match.
     """
-    lowered = fold(sentence).lower().strip()[-_MAX_SENTENCE:]
-    if not lowered or _ENROL_NOT.search(lowered) is not None:
-        return None
-    if _TRIAL_CLOSE.match(lowered) is not None or _PURPOSE_START.match(lowered) is not None:
-        return None
-    asked = is_question_like(lowered)
-    for pattern in _ENROL_QUESTION_FORMS:
-        match = pattern.search(lowered)
-        if match is not None and _COND_BEFORE.search(lowered[max(0, match.start() - 30) :
-                                                              match.start()]) is None:
-            return match.group(0)[:40]
+    lowered = fold(sentence).lower()
     for pattern in _ENROL_ASK:
-        for match in pattern.finditer(lowered):
-            before = lowered[max(0, match.start() - 30) : match.start()]
-            if _COND_BEFORE.search(before) is not None:
-                continue
-            if _QUOTED_BEFORE.search(before) is not None:
-                continue
-            if _COND_INSIDE.search(match.group(0)) is not None:
-                continue
-            if _WEAK_ENROL_ACTION.search(match.group(0)) is not None and (
-                _STATEMENT_FRAME.match(match.group(0)) is not None
-                or not (asked or _ASK_WORDS.search(lowered))
-            ):
-                continue  # a promise about the price, not an invitation to take the seat
-            if not asked and _ENROL_DESCRIBES.search(clause_before(lowered, match.start())):
-                continue
-            near = lowered[max(0, match.start() - 40) : match.end() + 40]
-            # "we can book you a slot in the next batch" (a statement about the programme) is not
-            # an ask; the same words as a question or as a singular "I can" offer are.
-            if _close_to_batch(lowered, match.start(), match.end()) and not (
-                asked or _SINGULAR_OFFER.search(lowered)
-            ):
-                continue
-            if describes_programme(near) and not asked:
-                continue
+        match = pattern.search(lowered)
+        if match:
             return match.group(0)[:40]
     return None
 
@@ -1130,44 +881,6 @@ class Ask:
 
     kind: AskKind
     phrase: str
-
-
-# A wide net, for ONE purpose: telling a missed proposal from a turn that proposes nothing.  It is a
-# question or an offer that names a call-like thing together with a moment or the learner's people
-# ("Could your husband and I have a quick word on Saturday?", "How about we sync tomorrow night?").
-# It never earns a commitment line.  Inside the close window, when the model answers such a turn
-# with an acceptance, the guard counts that as a late ask (hygiene), not as a leak
-# (``r1_guard`` ``late_ask_accepted``); the farewell then answers it like any open proposal.
-_SUSPECT_NOUN = re.compile(
-    r"\b(?:call|chat|word|zoom|meet\w*|talk|catch[- ]?up|reconnect|connect|touch base|buzz|ring|"
-    r"session|conversation|sync|check[- ]?in|follow[- ]?up|huddle|video|slot|appointment|schedule|"
-    r"book|pencil|line up|hop on|speak|regroup|phone|phoned|dial)\b",
-    re.IGNORECASE,
-)
-_SUSPECT_FRAME = re.compile(
-    r"\blet'?s\b|\blet me\b|\bi(?:'ll| will| can| could| would)\b|\bhow about\b"
-    r"|\bwhat about\b|\bshall (?:we|i)\b",
-    re.IGNORECASE,
-)
-
-
-def looks_like_proposal(text: object) -> bool:
-    """True when the advisor's ``text`` plausibly proposes a call or a time (a wide net)."""
-    for sentence in split_sentences(text):
-        lowered = fold(sentence).lower().strip()[-_MAX_SENTENCE:]
-        if not lowered or _KNOWLEDGE_Q.search(lowered) is not None:
-            continue
-        if not (is_question_like(lowered) or _SUSPECT_FRAME.search(lowered) is not None):
-            continue
-        if _SUSPECT_NOUN.search(lowered) is None:
-            continue
-        if (
-            _CONCRETE_DAY.search(lowered) is not None
-            or _WHEN_CUE.search(lowered) is not None
-            or _WITH_LEARNER.search(lowered) is not None
-        ):
-            return True
-    return False
 
 
 def ask_acts(text: object) -> dict[AskKind, Ask]:
@@ -1248,57 +961,17 @@ _WEAK = _compile(
 # break (comma, full stop, "but") ends the reach, so "I can't do Tuesday, but Thursday works" keeps
 # its Thursday.
 _NEGATION_REACH_WORDS = 10
-# A commitment that hangs on the learner's OWN decision is not made yet (R1-Q iteration 3): "I'll
-# reach out if I decide I want to move forward" holds the words of an enrolment ("I want to move
-# forward") and commits to nothing, and it was graded STRONG and failed a live call as a guard hit.
-# Ship-gate round 1: only that kind of condition is exempt.  A condition the advisor can meet ("if
-# you send the link today, I'll pay the deposit", "once you confirm the discount, let's do it"), a
-# price ("if it's $7,500, count me in") or the decider's approval ("if my husband agrees, sign me
-# up") is a real, conditional offer to commit, and it keeps the level it has on main: the learner
-# must not speak STRONG or MEDIUM out of its level, and the guard counts it only if it is graded.
-_CONDITION_WORD = (
-    r"(?:if|when|whenever|once|unless|in case|as soon as|until|provided|supposing|suppose)"
-)
-_OWN_DECISION = (
-    r"(?:(?:i|we)(?:'ve| have| had)? (?:decid\w*|chose|choose|talked|spoken|discussed|checked|"
-    r"thought|had a chance|made up)\b"
-    r"|(?:i|we)(?:'m| am|'re| are) (?:ready|sure|convinced|comfortable)\b"
-    r"|it (?:all )?makes sense\b)"
-)
-_CONDITION_FRAME = re.compile(
-    r"\b" + _CONDITION_WORD + r"\s+" + _OWN_DECISION + r"|\bshould i decide\b", re.IGNORECASE
-)
-# "If Thursday works for you, great.": the commitment words ARE the condition (nothing sits between
-# the condition word and them), so the sentence asks and commits to nothing.
-_CONDITION_IS_THE_PHRASE = re.compile(r"\b" + _CONDITION_WORD + r"\s*$", re.IGNORECASE)
-
-
-def _conditional_before(lowered: str, pos: int) -> bool:
-    """True when the learner's own condition opens the stretch of the sentence before ``pos``."""
-    start = max(lowered.rfind(mark, 0, pos) for mark in ".?!") + 1
-    before = lowered[start:pos]
-    return (
-        _CONDITION_FRAME.search(before) is not None
-        or _CONDITION_IS_THE_PHRASE.search(before) is not None
-    )
-
-
-def _affirms(
-    patterns: Iterable[re.Pattern[str]], lowered: str, *, conditional_ok: bool = False
-) -> bool:
+def _affirms(patterns: Iterable[re.Pattern[str]], lowered: str) -> bool:
     """True when one of ``patterns`` matches ``lowered`` without a negator in its own clause.
 
     "And ten tomorrow won't work" and "I don't think tomorrow works" contain the words of an
     agreement ("tomorrow ... works") and mean the opposite (R1-Q iteration 2: both were graded
     MEDIUM and flagged the live call).  A negator inside the match, or earlier in the same clause,
-    turns the phrase round.  So does the learner's own condition earlier in the sentence ("if I
-    decide I want to move forward", ``_CONDITION_FRAME``), unless ``conditional_ok``.
+    turns the phrase round.
     """
     for pattern in patterns:
         for match in pattern.finditer(lowered):
             if negated_before(lowered, match.end(), _NEGATION_REACH_WORDS):
-                continue
-            if not conditional_ok and _conditional_before(lowered, match.start()):
                 continue
             return True
     return False
@@ -1325,7 +998,7 @@ def classify_learner_commitment(text: object) -> Level:
     medium_line = medium_line.replace("{slot}", DEFAULT_SLOT)
     if fuzzy_contains(folded, medium_line, 0.7):
         return Level.MEDIUM
-    if _affirms(_WEAK, lowered, conditional_ok=True):
+    if _affirms(_WEAK, lowered):
         return Level.WEAK
     return Level.NONE
 

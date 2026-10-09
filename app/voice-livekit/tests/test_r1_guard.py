@@ -1520,26 +1520,6 @@ class MisreadAndReopenGuardTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertNotIn("time_cue_reversed", self.rules(text))
 
-    def test_deciding_alone_contradicts_the_card(self):
-        for text in (
-            "It's just me deciding, really.",
-            "It is only me who decides.",
-            "I decide on my own.",
-            "Nobody else is involved in the decision.",
-            "No one else decides this for me.",
-            "I don't need to ask anyone about it.",
-        ):
-            with self.subTest(text=text):
-                self.assertIn("decider_alone", self.rules(text))
-        for text in (
-            "I'd talk it over with my husband first.",
-            "I'd like to run it by my husband, since we decide together.",
-            "It's my decision in the end, but I'd talk to him first.",
-            "Nobody else has asked me about it yet.",
-        ):
-            with self.subTest(text=text):
-                self.assertNotIn("decider_alone", self.rules(text))
-
     def test_gratitude_for_nothing_only_when_nothing_was_granted(self):
         thanks = "Thank you so much, that helps a lot."
         self.assertNotIn("gratitude_for_nothing", self.rules(thanks))
@@ -1586,7 +1566,6 @@ class MisreadAndReopenGuardTests(unittest.TestCase):
         cases = (
             ("Oh, $7,000, that's better than I expected.", {}, r1_guard.ANCHOR_REPLACEMENT),
             ("Thank you so much, that helps a lot.", {"nothing_granted": True}, r1_guard.GRATITUDE_REPLACEMENT),
-            ("It's just me deciding, really.", {}, self.P1.decider_answer),
             ("You mentioned you only have a couple of minutes.", {}, ""),
         )
         for text, kwargs, expected in cases:
@@ -1789,19 +1768,6 @@ class IterationTwoGuardTests(unittest.TestCase):
             [h.rule for h in guard_text(text, self.ctx(advisor_hours=frozenset({12.0}))).hits],
         )
 
-    # --- D17: spelled-out amounts and per-month reactions
-    def test_a_spelled_out_amount_is_checked_against_the_card_and_the_advisor(self):
-        text = "Six hundred a month is closer to what I could handle."
-        self.assertIn("amount_off_card", [h.rule for h in guard_text(text, self.ctx()).hits])
-        self.assertIn(
-            "amount_off_card",
-            [h.rule for h in guard_text(text, self.ctx(advisor_amounts=frozenset({966}))).hits],
-        )
-        self.assertTrue(guard_text(text, self.ctx(advisor_amounts=frozenset({600}))).clean)
-        # Seven hundred is on the card; "a hundred applications" is not money.
-        self.assertTrue(guard_text("Seven hundred a month is the most I could do.", self.ctx()).clean)
-        self.assertTrue(guard_text("I have sent a hundred applications this year.", self.ctx()).clean)
-
     def test_a_reaction_to_a_monthly_plan_is_spoken_as_said(self):
         """Ship-gate round 1: the ``monthly_unstated`` rule is out.
 
@@ -1824,25 +1790,6 @@ class IterationTwoGuardTests(unittest.TestCase):
                 self.assertEqual(result.text, text, result.hits)
                 self.assertTrue(result.clean, result.hits)
 
-    # --- D8: hearsay about a figure that is not the anchor
-    def test_that_matches_what_i_heard_about_another_figure_becomes_the_real_anchor(self):
-        context = self.ctx(advisor_amounts=frozenset({6300}), offer_usd=6300)
-        result = guard_text(
-            "That $6,300 actually matches what I'd heard people got it for, so that's reassuring.",
-            context,
-        )
-        self.assertEqual(result.text, r1_guard.ANCHOR_HEARD_BELOW)
-        self.assertIn("heard_not_anchor", [h.rule for h in result.hits])
-        self.assertTrue(all(h.category in r1_guard.HYGIENE_CATEGORIES for h in result.hits))
-        plain = guard_text(
-            "That $6,300 actually matches what I'd heard people got it for.",
-            self.ctx(advisor_amounts=frozenset({6300})),
-        )
-        self.assertEqual(plain.text, r1_guard.ANCHOR_HEARD_REPLACEMENT)
-        # The anchor itself, and the website's $9,000, are not hearsay.
-        self.assertTrue(guard_text("I've heard people got it for around $7,000.", self.ctx()).clean)
-        self.assertTrue(guard_text("I heard the course is about six months and around $9,000.", self.ctx()).clean)
-
     # --- D7: a price at or below the ask is never a stretch
     def test_the_price_is_not_a_stretch_once_the_advisor_is_at_or_below_the_ask(self):
         text = "That number's better, but it's still a stretch for me."
@@ -1854,19 +1801,6 @@ class IterationTwoGuardTests(unittest.TestCase):
         self.assertTrue(guard_text(text, self.ctx()).clean)
         # A time worry is not a price worry.
         self.assertTrue(guard_text("Six months is a stretch with my work schedule.", self.ctx(offer_usd=6000)).clean)
-
-    # --- D5: the decision maker is on the learner's side of the call
-    def test_the_decision_maker_never_dislikes_calls(self):
-        """In the answer to "who else decides?" (ship-gate round 1: only there)."""
-        text = "I'd have to ask my husband first, and he's not really one for these things."
-        result = guard_text(text, self.ctx(decider_asked=True))
-        self.assertEqual(result.text, "I'd have to ask my husband first.")
-        self.assertIn("decider_unwilling", [h.rule for h in result.hits])
-        only = guard_text("He's not really one for calls.", self.ctx(quiet_empty=True, decider_asked=True))
-        self.assertEqual(only.text, "")
-        # The learner's own preference is not the decision maker's.
-        self.assertTrue(guard_text("I'm not really one for phone calls, to be honest.", self.ctx()).clean)
-        self.assertTrue(guard_text("My husband would join a call if we picked an evening.", self.ctx()).clean)
 
     def test_a_remark_about_the_decision_makers_phone_habits_is_spoken_as_said_elsewhere(self):
         """Ship-gate round 1: outside the answer to "who else decides?" these were dropped to a
@@ -1983,22 +1917,6 @@ class IterationThreeGuardTests(unittest.TestCase):
             recent_styles=tuple(styles), **kwargs,
         )
 
-    # --- D5: "better" needs a lower price
-    def test_a_bit_better_is_dropped_when_the_advisor_named_no_lower_price(self):
-        from r1_guard import PRICE_UNCHANGED_REPLACEMENT
-
-        for text in (
-            "Hmm. That's a bit better, but it's still more than I had in mind.",
-            "That's a little better than I expected, so it does make me pause.",
-            "That's closer to what I had in mind.",
-            "Okay, that's better than I thought.",
-        ):
-            with self.subTest(text=text):
-                result = guard_text(text, self.ctx(offer_usd=7500))
-                self.assertIn("misread", {h.category for h in result.hits})
-                self.assertIn(PRICE_UNCHANGED_REPLACEMENT, result.text)
-                self.assertNotRegex(result.text.lower(), r"\bbetter\b|\bcloser\b")
-
     def test_better_is_fine_when_the_advisor_just_lowered_the_price(self):
         for text in (
             "That's a bit better, but it's still more than I planned for.",
@@ -2017,66 +1935,12 @@ class IterationThreeGuardTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(guard_text(text, self.ctx(offer_usd=7500)).clean, text)
 
-    def test_a_better_at_or_below_the_ask_is_dropped_without_a_replacement(self):
-        result = guard_text("That's a bit better, honestly. What does it include?", self.ctx(offer_usd=6500))
-        self.assertNotIn("better", result.text)
-        self.assertIn("What does it include?", result.text)
-
     def test_more_than_i_planned_is_said_once_in_a_reply(self):
         result = guard_text(
             "That's a bit better. But it's still more than I planned for.",
             self.ctx(offer_usd=7500),
         )
         self.assertEqual(result.text.lower().count("more than i"), 1)
-
-    # --- D4: the anchor guard replaces, it does not append
-    def test_in_line_with_what_i_heard_is_replaced_for_any_other_price(self):
-        from r1_guard import ANCHOR_HEARD_BELOW, ANCHOR_HEARD_REPLACEMENT
-
-        for text in (
-            "That lines up with what I'd heard people got it for, so no surprise there.",
-            "That figure's roughly in line with what I heard.",
-            "That's in line with what I'd heard, so I'm not shocked.",
-        ):
-            with self.subTest(text=text):
-                below = guard_text(text, self.ctx(offer_usd=4500))
-                self.assertEqual(below.text, ANCHOR_HEARD_BELOW)
-                other = guard_text(text, self.ctx(offer_usd=7500))
-                self.assertEqual(other.text, ANCHOR_HEARD_REPLACEMENT)
-        # Without a price on the table the rule needs a price word in the sentence itself (ship
-        # de-risk): "got it for" and "figure" name one, the bare "in line with what I'd heard" does not.
-        for text in (
-            "That lines up with what I'd heard people got it for, so no surprise there.",
-            "That figure's roughly in line with what I heard.",
-        ):
-            with self.subTest(text=text, offer="none"):
-                self.assertEqual(guard_text(text, self.ctx()).text, ANCHOR_HEARD_REPLACEMENT)
-        bare = "That's in line with what I'd heard, so I'm not shocked."
-        self.assertEqual(guard_text(bare, self.ctx()).text, bare)
-
-    def test_non_price_sentences_are_not_read_as_price_misreads(self):
-        """Ship de-risk: only a sentence about a price is replaced with a canned price line."""
-        for text in (
-            "That's what I heard from a friend.",
-            "That's about what I heard about the workload.",
-            "That lines up with what I'd heard from a colleague.",
-            "Oh, that's better.",
-            "That sounds better for someone like me.",
-            "That's much better.",
-        ):
-            with self.subTest(text=text):
-                self.assertEqual(guard_text(text, self.ctx()).text, text)
-        # With a price on the table the same words are still caught.
-        from r1_guard import PRICE_UNCHANGED_REPLACEMENT
-
-        self.assertEqual(
-            guard_text("That's a bit better.", self.ctx(offer_usd=7500)).text,
-            PRICE_UNCHANGED_REPLACEMENT,
-        )
-        self.assertEqual(
-            guard_text("That's a bit better than I expected.", self.ctx()).text,
-            PRICE_UNCHANGED_REPLACEMENT,
-        )
 
     def test_in_line_with_what_i_heard_is_true_at_seven_thousand(self):
         text = "That's right at what I'd heard people got it for."
@@ -2170,17 +2034,6 @@ class IterationThreeGuardTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(guard_text(text, self.ctx(phrase_counts=used)).text, expected)
 
-    def test_before_i_go_is_taken_out_when_nobody_is_leaving(self):
-        for text, expected in (
-            ("Before I go, what would I actually build?", "What would I actually build?"),
-            ("One more thing before I go - how many hours a week is it?", "How many hours a week is it?"),
-            ("Good to hear, though. Before I go, how many hours is it?", "Good to hear, though. How many hours is it?"),
-        ):
-            with self.subTest(text=text):
-                self.assertEqual(guard_text(text, self.ctx()).text, expected)
-        kept = "Oh wait, before you go, I have one more question."
-        self.assertEqual(guard_text(kept, self.ctx()).text, kept)
-
     def test_a_leading_though_is_not_left_as_debris(self):
         result = guard_text(
             "Honestly though, I'm not ready to decide today.", self.ctx(self.HONESTLY)
@@ -2226,22 +2079,6 @@ class FinalReviewRoundOneGuardTests(unittest.TestCase):
                 result = guard_text(text, self.ctx(free_reply=True))
                 self.assertEqual(result.text, text, result.hits)
 
-    def test_a_closing_before_i_go_clause_is_still_taken_out(self):
-        for text, expected in (
-            ("Before I go, what would I actually build?", "What would I actually build?"),
-            (
-                "One more thing before I go - how many hours a week is it?",
-                "How many hours a week is it?",
-            ),
-            ("I do have one more question before I go.", "I do have one more question."),
-            (
-                "That helps, before I go, though I still want the details.",
-                "That helps, though I still want the details.",
-            ),
-        ):
-            with self.subTest(text=text):
-                self.assertEqual(guard_text(text, self.ctx()).text, expected)
-
     def test_a_sentence_final_before_i_leave_is_the_learners_own_plan(self):
         """Ship de-risk: the tail strip is for "one more question before I go", nothing else."""
         for text in (
@@ -2255,11 +2092,10 @@ class FinalReviewRoundOneGuardTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(guard_text(text, self.ctx(free_reply=True)).text, text)
 
-    # --- major: owner point 3, co-decider facts stay consistent
-    # Ship-gate round 1: the soft denials ("it's my call", "he doesn't get involved", "he trusts me to
-    # figure it out") read ordinary talk about the family as a denial (19 of 25 ordinary sentences were
-    # replaced by the card line, main 0), so they are caught only as the answer to "who else decides?".
-    # Somebody else named as a party to the decision, and "it's just me deciding", hold anywhere.
+    # --- owner point 3 (co-decider consistency) is an accepted gap: ship restore (owner decision
+    # 2026-10-09) deleted the decider_alone / decider_contradicted / decider_unwilling rules, which
+    # still replaced ordinary or consistent sentences when asked.  What the learner says about who
+    # decides is spoken as on production.
     DENIALS_WHEN_ASKED = (
         "Honestly it's really up to me in the end.",
         "I'm the one who decides these things.",
@@ -2269,26 +2105,6 @@ class FinalReviewRoundOneGuardTests(unittest.TestCase):
         "No, nobody else, it's my call alone.",
         "I make my own decisions about money.",
     )
-    DENIALS_ANYWHERE = (
-        "My mom usually gets a say too.",
-        "I'd want to run it by my sister first.",
-        "It's just me deciding, but I'd be paying for it myself.",
-        "Nobody else is involved.",
-        "My husband's the main one I'd talk to, and my mom usually gets a say too.",
-    )
-    DENIALS = DENIALS_WHEN_ASKED + DENIALS_ANYWHERE
-
-    def test_a_denied_decider_or_a_second_decider_is_replaced_by_the_cards_answer(self):
-        for text in self.DENIALS:
-            with self.subTest(text=text, decider_asked=True):
-                result = guard_text(text, self.ctx(free_reply=True, decider_asked=True))
-                self.assertEqual(result.text, self.P1.decider_answer)
-                self.assertEqual({hit.category for hit in result.hits}, {"misread"})
-        for text in self.DENIALS_ANYWHERE:
-            with self.subTest(text=text, decider_asked=False):
-                result = guard_text(text, self.ctx(free_reply=True))
-                self.assertEqual(result.text, self.P1.decider_answer)
-                self.assertEqual({hit.category for hit in result.hits}, {"misread"})
 
     def test_a_soft_denial_is_spoken_as_said_when_nobody_asked_who_decides(self):
         for text in self.DENIALS_WHEN_ASKED:
@@ -2371,25 +2187,6 @@ class FinalReviewRoundOneGuardTests(unittest.TestCase):
             with self.subTest(text=text):
                 result = guard_text(text, self.ctx(free_reply=True))
                 self.assertEqual(result.text, text, result.hits)
-
-    def test_a_second_decider_in_a_deciding_clause_is_still_replaced(self):
-        for text in (
-            "I'd want to run it by my sister first.",
-            "I'd talk to my mom before I sign up for anything.",
-            "I'd ask my brother to approve it.",
-            "I'd have to check with my parents before deciding.",
-            "My mom usually gets a say too.",
-        ):
-            with self.subTest(text=text):
-                result = guard_text(text, self.ctx(free_reply=True))
-                self.assertEqual(result.text, self.P1.decider_answer)
-
-    def test_the_decider_is_whoever_the_persona_card_says(self):
-        own = guard_text("I'd talk to my dad first.", self.ctx(self.P2))
-        self.assertEqual(own.text, "I'd talk to my dad first.")
-        swapped = guard_text("I'd talk to my husband first.", self.ctx(self.P2))
-        self.assertEqual(swapped.text, self.P2.decider_answer)
-        self.assertIn("father", swapped.text)
 
     # --- major: the stall loop has a quota and a spacing window
     def test_the_decider_stall_has_a_quota_and_a_window_in_a_free_reply(self):
@@ -2554,23 +2351,6 @@ class FinalReviewRoundOneGuardTests(unittest.TestCase):
             {hit.rule for hit in guard_text(raised, self.ctx(free_reply=True, offer_usd=9000)).hits},
         )
 
-    # --- a late ask is the model answering a proposal the detectors missed
-    def test_a_medium_acceptance_of_a_missed_proposal_is_hygiene_not_a_leak(self):
-        text = "Sure, Saturday morning works for us, let's do that."
-        leak = guard_text(text, self.ctx(free_reply=True))
-        self.assertEqual({hit.category for hit in leak.hits}, {"commitment"})
-        late = guard_text(text, self.ctx(free_reply=True, late_ask_ok=True))
-        self.assertEqual({hit.category for hit in late.hits}, {"misread"})
-        self.assertEqual({hit.rule for hit in late.hits}, {"late_ask_accepted"})
-        ledger = GuardLedger()
-        ledger.record(late)
-        self.assertEqual(ledger.leak_total, 0)
-        strong = guard_text(
-            "Okay, send me the enrolment link and I'll pay the deposit today.",
-            self.ctx(free_reply=True, late_ask_ok=True),
-        )
-        self.assertIn("commitment", {hit.category for hit in strong.hits})
-
 
 class ShipGateRoundOneGuardTests(unittest.TestCase):
     """R1-Q ship-gate round 1: what the guard speaks and what it posts, against main."""
@@ -2600,16 +2380,6 @@ class ShipGateRoundOneGuardTests(unittest.TestCase):
                 self.assertIn("commitment", {hit.category for hit in result.hits}, result.hits)
                 self.assertNotEqual(result.text, text)
 
-    def test_the_learners_own_decision_frame_is_spoken(self):
-        for text in (
-            "I'll reach out if I decide I want to move forward.",
-            "If it makes sense, I'll enrol after I've talked to him.",
-        ):
-            with self.subTest(text=text):
-                result = guard_text(text, self.ctx(commitment_cap=Level.NONE))
-                self.assertEqual(result.text, text, result.hits)
-                self.assertTrue(result.clean, result.hits)
-
     # --- a spelled quantity next to a money word somewhere else is not an amount
     def test_a_spelled_quantity_that_is_not_money_is_spoken_and_posts_nothing(self):
         for text in (
@@ -2623,27 +2393,12 @@ class ShipGateRoundOneGuardTests(unittest.TestCase):
                 self.assertEqual(result.text, text, result.hits)
                 self.assertTrue(result.clean, result.hits)
 
-    def test_a_spelled_amount_next_to_a_money_word_is_still_an_amount(self):
-        for text in (
-            "We pay about two thousand a month in rent, so money is tight.",
-            "I'm paying around nine hundred for it.",
-            "My budget is about fifteen hundred.",
-            "That is a hundred dollars more than I planned.",
-        ):
-            with self.subTest(text=text):
-                rules = [hit.rule for hit in guard_text(text, self.ctx()).hits]
-                self.assertIn("amount_off_card", rules, text)
-        # The card's own budget, spelled, is not an invented amount.
-        self.assertTrue(guard_text("Seven hundred a month is the most I could do.", self.ctx()).clean)
-
 
 class FinalReviewRoundOneHostileTextTests(unittest.TestCase):
-    """The new patterns (decider, stall quotas, anchor words, the wide proposal net) stay fast."""
+    """The new patterns (stall quotas, anchor words) stay fast."""
 
     def test_the_new_patterns_are_fast_on_hostile_text(self):
         import time
-
-        from r1_commitment import looks_like_proposal
 
         persona = resolve_persona("p1_career_switcher", variant="v1")
         hostile = (
@@ -2667,11 +2422,98 @@ class FinalReviewRoundOneHostileTextTests(unittest.TestCase):
                         phase="roleplay", persona=persona, mode="reply", free_reply=True, turn=3
                     ),
                 )
-                looks_like_proposal(text)
                 # A guard against catastrophic backtracking (a runaway pattern takes minutes), not
                 # a latency budget: a loaded CI box ran the ". " case in 3.4 to 3.9 s against 0.5 s
                 # on an idle one (ship-gate round 1), and the cost is linear in the text.
                 self.assertLess(time.perf_counter() - started, 10.0)
+
+
+class ShipRestoreGuardTests(unittest.TestCase):
+    """Ship restore (owner decision 2026-10-09): the guard speaks and posts these learner sentences as
+    production does.  The decider, hearsay, "better", spelled-amount and "before I go" rules that
+    replaced or posted them were worse than production and are deleted; each sentence is one the review
+    rounds flagged.  Owner point 3 (co-decider consistency) is an accepted gap."""
+
+    P1 = resolve_persona("p1_career_switcher", variant="v1")
+
+    def ctx(self, **kwargs):
+        kwargs.setdefault("turn", 4)
+        return GuardContext(
+            phase="roleplay", persona=self.P1, mode="reply", seed="s", free_reply=True, **kwargs
+        )
+
+    def assert_spoken_as_said(self, text, **kwargs):
+        result = guard_text(text, self.ctx(**kwargs))
+        self.assertEqual(result.text, text, result.hits)
+        self.assertTrue(result.clean, result.hits)
+
+    def test_what_the_learner_says_about_who_decides_is_spoken_as_said(self):
+        for text, kwargs in (
+            ("It's my call which batch I join, but we'd decide the money together.", {}),
+            ("It's my call which batch I join, but we'd decide the money together.", {"decider_asked": True}),
+            ("My husband wouldn't mind if I studied on weekends.", {"decider_asked": True}),
+            ("Nobody else is involved in the decision.", {"decider_asked": True}),
+            ("I'd want to run it by my sister first.", {}),
+            ("It's just me deciding, really.", {}),
+        ):
+            with self.subTest(text=text, **kwargs):
+                self.assert_spoken_as_said(text, **kwargs)
+
+    def test_a_before_i_go_clause_is_spoken_as_said(self):
+        for text in (
+            "Before I leave, I need to sort out my visa.",
+            "Before I go, what would I actually build?",
+        ):
+            with self.subTest(text=text):
+                self.assert_spoken_as_said(text)
+
+    def test_a_better_reaction_is_spoken_as_said(self):
+        for text, kwargs in (
+            ("That's a bit better than I expected.", {}),
+            ("That's a bit better than I expected for the weekend batch timings.", {"offer_usd": 7500}),
+            ("That's a bit better, but it's still a stretch for me.", {"offer_usd": 7500}),
+            ("That's what I heard from my friend, and the mentors are great.", {"offer_usd": 7500}),
+        ):
+            with self.subTest(text=text, **kwargs):
+                self.assert_spoken_as_said(text, **kwargs)
+
+    def test_a_spelled_quantity_is_spoken_as_said_and_posts_nothing(self):
+        for text in (
+            "I could manage around six hundred a month.",
+            "I've applied to a hundred and fifty jobs, and paid for two mock interviews.",
+            "I'm paying around nine hundred for it.",
+            "That is a hundred dollars more than I planned.",
+        ):
+            with self.subTest(text=text):
+                self.assert_spoken_as_said(text)
+
+    def test_a_dollar_figure_off_the_card_is_blocked_and_posted_with_no_anchor_line(self):
+        for text in (
+            "I heard the average salary for data analysts is around $80,000.",
+            "Most bootcamps cost around $15,000.",
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx())
+                self.assertEqual([hit.rule for hit in result.hits], ["amount_off_card"])
+                self.assertEqual({hit.category for hit in result.hits}, {"invented_fact"})
+                self.assertNotEqual(result.text, text)
+                self.assertNotIn("7,000", result.text)
+
+    def test_a_conditional_commitment_out_of_level_is_a_commitment_hit(self):
+        result = guard_text(
+            "If it makes sense, I'll enrol after I've talked to him.", self.ctx(commitment_cap=Level.NONE)
+        )
+        self.assertEqual({hit.category for hit in result.hits}, {"commitment"})
+        self.assertNotIn("enrol", result.text)
+
+    def test_a_medium_acceptance_in_a_free_reply_is_a_commitment_hit(self):
+        """Production books no late ask: an acceptance the engine did not propose is a leak."""
+        text = "Sure, Saturday morning works for us, let's do that."
+        result = guard_text(text, self.ctx())
+        self.assertEqual({hit.category for hit in result.hits}, {"commitment"})
+        ledger = GuardLedger()
+        ledger.record(result)
+        self.assertGreaterEqual(ledger.leak_total, 1)
 
 
 if __name__ == "__main__":
