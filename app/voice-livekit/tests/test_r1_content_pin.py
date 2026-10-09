@@ -67,7 +67,16 @@ import r1_world
 # (ANCHOR_HEARD_REPLACEMENT, ANCHOR_HEARD_BELOW), a calm reached anchor, a deferred MEDIUM line and
 # a call-back WEAK line (MEDIUM_DEFER_LINE, WEAK_CALL_LINE), the F4 push call suffix, hold and
 # answered-facts notes (HOLD_NOTE, ANSWERED_NOTE) and wider F3 / F4 delivery markers.
-PINNED_CONTENT_SHA256 = "9bed1fc86402ab78cf312c181262ace139e289610278aab3015c4ea578c45224"
+# Revision 12 (R1-Q learner iteration 3, the third live sweep): the MEDIUM line books only a slot the
+# learner can stand behind (SLOT_RECENT_TURNS; stale, refused and absent slots lead to the deferred
+# line), an e-mailed WEAK line (WEAK_EMAIL_DONE_LINE), a thin or pressing advisor caps the grade at
+# WEAK (THIN_ADVISOR_MEAN_WORDS, THIN_MIN_TURNS), the e-mail "yes" spec for an offer that listed its
+# contents, an anchor below $7,000 reads "even below the $7,000", the unchanged-price replacement
+# (PRICE_UNCHANGED_REPLACEMENT), three "thinking" fallbacks (FALLBACK_REPLIES), the once-per-call
+# concession tag (PHRASE_QUOTA), the hollow-advisor note (HOLLOW_NOTE, HOLLOW_MAX_WORDS), the H3
+# first-probe reminder (answer only the part that was asked) and three wordings of the time cue
+# (TIME_CUE_BRIEF_ALTERNATIVES).
+PINNED_CONTENT_SHA256 = "7eb073a7e79bea06164d991c9358aa04b66fcc4b2abda8d923985cf7c5e20059"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -485,6 +494,78 @@ class PinTests(unittest.TestCase):
         try:
             quota[r1_text.PHRASE_STRETCH] = 2
             self.assertNotEqual(r1_content.content_sha256(), base, "PHRASE_QUOTA")
+        finally:
+            quota.clear()
+            quota.update(original_quota)
+        self.assertEqual(r1_content.content_sha256(), base)
+
+    def test_the_manifest_covers_the_iteration_three_texts(self):
+        manifest = r1_content.manifest()
+        self.assertGreaterEqual(manifest["revision"], 12)
+        prompts = manifest["prompts"]
+        self.assertEqual(prompts["hollow_note"], r1_prompts.HOLLOW_NOTE)
+        self.assertIn("Answer only the part they asked about", prompts["h3_first_probe_sample"])
+        commitment = manifest["commitment"]
+        self.assertEqual(commitment["weak_email_done_line"], r1_commitment.WEAK_EMAIL_DONE_LINE)
+        self.assertEqual(
+            commitment["thin_advisor_mean_words"], r1_commitment.THIN_ADVISOR_MEAN_WORDS
+        )
+        self.assertEqual(commitment["thin_min_turns"], r1_commitment.THIN_MIN_TURNS)
+        guard = manifest["guard"]
+        self.assertEqual(
+            guard["price_unchanged_replacement"], r1_guard.PRICE_UNCHANGED_REPLACEMENT
+        )
+        self.assertEqual(guard["fallback_replies"], list(r1_guard.FALLBACK_REPLIES))
+        self.assertEqual(len(guard["fallback_replies"]), 3)
+        style = guard["style"]
+        self.assertEqual(style["phrase_quota"], dict(r1_guard.PHRASE_QUOTA))
+        self.assertIn(r1_text.PHRASE_CONCESSION_TAG, style["phrase_quota"])
+        self.assertEqual(style["hollow_max_words"], r1_text.HOLLOW_MAX_WORDS)
+        self.assertEqual(
+            manifest["scheduler"]["time_cue_alternatives"],
+            list(r1_scheduler.TIME_CUE_BRIEF_ALTERNATIVES),
+        )
+        negotiation = manifest["negotiation"]
+        self.assertEqual(
+            negotiation["constants"]["slot_recent_turns"], r1_negotiation.SLOT_RECENT_TURNS
+        )
+        self.assertIn("N-EMAIL-YES", [spec["id"] for spec in negotiation["specs"]])
+        below = {item["id"]: item for item in negotiation["anchor_after_offer"]}["reached"]
+        self.assertTrue(any("below" in variant for variant in below["variants"]))
+
+    def test_editing_an_iteration_three_text_or_constant_changes_the_sha(self):
+        base = r1_content.content_sha256()
+        edits = (
+            (r1_prompts, "HOLLOW_NOTE", r1_prompts.HOLLOW_NOTE + " "),
+            (r1_commitment, "WEAK_EMAIL_DONE_LINE", r1_commitment.WEAK_EMAIL_DONE_LINE + " "),
+            (r1_commitment, "THIN_ADVISOR_MEAN_WORDS", r1_commitment.THIN_ADVISOR_MEAN_WORDS + 1),
+            (r1_commitment, "THIN_MIN_TURNS", r1_commitment.THIN_MIN_TURNS + 1),
+            (
+                r1_guard,
+                "PRICE_UNCHANGED_REPLACEMENT",
+                r1_guard.PRICE_UNCHANGED_REPLACEMENT + " ",
+            ),
+            (r1_guard, "FALLBACK_REPLIES", r1_guard.FALLBACK_REPLIES[:-1] + ("Pardon?",)),
+            (r1_negotiation, "SLOT_RECENT_TURNS", r1_negotiation.SLOT_RECENT_TURNS + 1),
+            (r1_text, "HOLLOW_MAX_WORDS", r1_text.HOLLOW_MAX_WORDS + 1),
+            (
+                r1_scheduler,
+                "TIME_CUE_BRIEF_ALTERNATIVES",
+                r1_scheduler.TIME_CUE_BRIEF_ALTERNATIVES[:-1] + ("you are short on time",),
+            ),
+        )
+        for module, name, value in edits:
+            original = getattr(module, name)
+            try:
+                setattr(module, name, value)
+                self.assertNotEqual(r1_content.content_sha256(), base, name)
+            finally:
+                setattr(module, name, original)
+        quota = r1_guard.PHRASE_QUOTA
+        original_quota = dict(quota)
+        try:
+            quota[r1_text.PHRASE_CONCESSION_TAG] = 2
+            self.assertNotEqual(r1_content.content_sha256(), base, "PHRASE_QUOTA concession")
         finally:
             quota.clear()
             quota.update(original_quota)

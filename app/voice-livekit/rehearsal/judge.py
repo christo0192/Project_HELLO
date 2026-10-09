@@ -74,6 +74,23 @@ RULE_CHECKED_KINDS = {
     "reopened_after_commit": "reopened_after_commit",
     "decider_inconsistent": "decider_alone",
 }
+# Iteration 3 (H2).  Three more kinds the judge got wrong on the offer ledger need a rule to agree:
+# thanks for a price cut nobody made (12 flags were for cuts the pushy advisor really made),
+# "before you go" when nobody leaves, and an offer the learner ignored (it flagged an accepted call,
+# a stall and ordinary questions; the rule only counts a stall or a deflection answering an ask).
+# The value is every rule kind that confirms the judge's kind.
+RULE_CONFIRMED_KINDS = {
+    "unwarranted_gratitude": (
+        "gratitude_unwarranted",
+        "gratitude_after_hedge",
+        "unwarranted_surprise",
+        "anchor_taken_as_offer",
+    ),
+    "no_one_leaving": ("no_one_leaving",),
+    "ignored_offer": ("ignored_offer",),
+}
+# A hollow advisor turn: four words or fewer and no question ("Sure.", "Okay.", "Mm-hmm.").
+HOLLOW_MAX_WORDS = 4
 
 RUBRIC = (
     "You are a strict reviewer of a sales role-play. ADVISOR is a job candidate playing a "
@@ -92,10 +109,14 @@ RUBRIC = (
     "with probe_turn null.\n"
     "3. misfires: LEARNER lines that the conversation did not warrant. Every misfire needs a short "
     "'quote' copied from the LEARNER line it is about. unwarranted_gratitude: "
-    "thanking or being pleasantly surprised about a discount nobody offered. no_one_leaving: "
-    "'before you go' when the advisor was not ending the call. ignored_offer: the advisor made a "
-    "concrete offer (a call time, an e-mail, a price) and the learner did not react to it. repeat: "
-    "the learner repeats something it already said. off_card_fact: the learner states a course "
+    "thanking or being pleasantly surprised about a discount nobody offered; NOT when the OFFER "
+    "LEDGER shows the advisor named a price or a discount in that turn or the one before. "
+    "no_one_leaving: 'before you go' when the advisor was not ending the call (and the learner had "
+    "not announced it was leaving). ignored_offer: the advisor made a "
+    "concrete offer (a call time, an e-mail, a price) and the learner's reply neither accepted nor "
+    "declined it nor asked about it (a question about the offer is a reaction). repeat: "
+    "the learner repeats something IT already said; catching the ADVISOR repeating ('you just said "
+    "$9,000 again') is not a repeat. off_card_fact: the learner states a course "
     "fact it could not know. time_cue_reversed: ONLY when the learner says the ADVISOR has little "
     "time ('you mentioned you only have a couple of minutes'); the learner saying that IT has "
     "little time is its own correct cue and is NOT a misfire. anchor_as_offer: ONLY when the "
@@ -259,6 +280,11 @@ def parse_verdict(raw: str) -> dict[str, Any]:
     return out
 
 
+def _hollow(text: str) -> bool:
+    """An advisor turn with nothing to answer: four words or fewer and no question."""
+    return "?" not in text and 0 < len(norm(text).split()) <= HOLLOW_MAX_WORDS
+
+
 def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> dict[str, Any]:
     """The verdict with the misfires that break the rubric's own definitions taken out (D20).
 
@@ -278,6 +304,10 @@ def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> 
         exchange.get("n"): norm((exchange.get("learner") or {}).get("spoken"))
         for exchange in exchanges
     }
+    advisor_hollow = {
+        exchange.get("n"): _hollow(str((exchange.get("advisor") or {}).get("text") or ""))
+        for exchange in exchanges
+    }
     kept: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
     for item in verdict.get("misfires") or []:
@@ -290,6 +320,19 @@ def validate_misfires(verdict: Mapping[str, Any], record: Mapping[str, Any]) -> 
         elif kind in RULE_CHECKED_KINDS and kind != "decider_inconsistent":
             if (turn, RULE_CHECKED_KINDS[kind]) not in by_rule:
                 reason = "rule_detector_disagrees"
+        elif kind in RULE_CONFIRMED_KINDS:
+            if not any((turn, rule) in by_rule for rule in RULE_CONFIRMED_KINDS[kind]):
+                reason = "rule_detector_disagrees"
+        elif kind == "repeat":
+            if advisor_hollow.get(turn):
+                # The advisor said nothing to answer ("Sure.", "Okay.", "Mm-hmm."): a learner that
+                # repeats itself there is in a loop the simulator forced (H4), not a repeat to score.
+                reason = "simulator_filler"
+            elif quote and not any(
+                quote in text for number, text in spoken.items() if number is not None
+                and turn is not None and number < turn
+            ):
+                reason = "no_earlier_line"  # a catch ("you just said $9,000 again") is not a repeat
         if reason:
             rejected.append({**item, "rejected": reason})
         else:

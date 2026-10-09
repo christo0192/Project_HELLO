@@ -1436,5 +1436,77 @@ class TimeCueBriefIterationOneTests(unittest.TestCase):
                         self.assertIsNone(pattern.search(text))
 
 
+class IterationThreeSchedulerTests(unittest.TestCase):
+    """R1-Q iteration 3: delivery markers, the cue wordings, the spelled-out hours, the stall."""
+
+    def moves(self, decision_maker="husband"):
+        from r1_scheduler import OwedMoveScheduler
+
+        return OwedMoveScheduler(decision_maker)
+
+    def test_run_all_of_this_by_my_husband_delivers_the_f4_push(self):
+        sched = self.moves()
+        state = sched._states["F4-PUSH"]
+        for text in (
+            "That's more than I can picture. And I'd still want to run all of this by my husband.",
+            "I'd want to go over it with my husband before I decide anything.",
+            "I'd need to talk to my husband.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(markers_match(state.markers, text), text)
+        self.assertFalse(markers_match(state.markers, "My husband is great, by the way."))
+
+    def test_what_would_i_end_up_paying_delivers_the_counter_not_the_value_question(self):
+        sched = self.moves()
+        counter = sched._states["F1-COUNTER"]
+        primary = sched._states["F3-PRIMARY"]
+        for text in (
+            "It's still unclear, so what would I actually end up paying?",
+            "So what would that actually come to?",
+            "What's the real number after the discount?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(markers_match(counter.markers, text), text)
+        self.assertFalse(markers_match(counter.markers, "What would I be paying for, then?"))
+        self.assertTrue(markers_match(primary.markers, "Why would I pay for this when it's free?"))
+
+    def test_the_time_cue_has_three_wordings_and_each_is_the_learners_own(self):
+        from r1_scheduler import SPEC_BY_ID, TIME_CUE, TIME_CUE_BRIEF_ALTERNATIVES
+
+        briefs = (SPEC_BY_ID[TIME_CUE].brief, *TIME_CUE_BRIEF_ALTERNATIVES)
+        self.assertEqual(len(set(briefs)), 3)
+        for brief in briefs:
+            with self.subTest(brief=brief):
+                self.assertIn("YOU", brief)
+                self.assertIn("not theirs", brief)
+                self.assertNotIn("next call", " ".join(TIME_CUE_BRIEF_ALTERNATIVES))
+        cue = SPEC_BY_ID[TIME_CUE]
+        for line in (*cue.variants, cue.line, "I can only stay a couple more minutes."):
+            with self.subTest(line=line):
+                self.assertTrue(markers_match(cue.markers, line), line)
+
+    def test_ten_to_fifteen_hours_is_an_answer_about_the_hours(self):
+        from r1_scheduler import answered_topics
+
+        for text in (
+            "About ten to fifteen hours a week.",
+            "Plan for ten hours.",
+            "It takes around twelve hours a week with the live classes.",
+            "Maybe 8 hours.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("weekly_hours", answered_topics(text))
+        self.assertNotIn("weekly_hours", answered_topics("It is a six month program."))
+
+    def test_the_stall_is_proven_by_any_of_its_three_wordings(self):
+        from r1_commitment import Level, commitment_line
+
+        for kwargs in ({}, {"call": True}, {"emailed": True}):
+            sched = self.moves()
+            spoken = commitment_line(Level.WEAK, "husband", **kwargs)
+            self.assertTrue(sched.spoken_proves("COMMIT-STALL", spoken), spoken)
+            self.assertFalse(sched.spoken_proves("COMMIT-STALL", "Sounds good, thanks."))
+
+
 if __name__ == "__main__":
     unittest.main()

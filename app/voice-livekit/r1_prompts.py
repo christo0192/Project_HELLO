@@ -57,9 +57,9 @@ OFFER_ON_TABLE_NOTE = (
 OFFER_MET_NOTE = (
     "- The advisor has now answered you twice on price and has \"{amount}\" on the table, at or "
     "below the $7,000 you asked for. React to that real number in your own words, for example "
-    "that it is in line with what you heard: never say it is too much, still a lot or out of "
-    "reach, and never say it is fine, good or acceptable. You are still not agreeing to "
-    "anything: you need to think and talk to someone first."
+    "that it is no more than the $7,000 you heard people got it for: never say it is too much, "
+    "still a lot or out of reach, and never say it is fine, good or acceptable. You are still "
+    "not agreeing to anything: you need to think and talk to someone first."
 )
 PRICE_MET_NOTE = (
     "- The price on the table is \"{amount}\", at or below the $7,000 you asked for. Never "
@@ -68,8 +68,9 @@ PRICE_MET_NOTE = (
 # The price came up again but did not move (the live sweep: "that's better than before" at an
 # unchanged $7,500).
 PRICE_UNCHANGED_NOTE = (
-    "- The price has not changed: it is still \"{amount}\". Do not say it is better than "
-    "before; if it comes up, say it is still more than you planned for."
+    "- The advisor has not put a lower price on the table: the best is still \"{amount}\". Do not "
+    "call anything better, a bit better or closer than before; if the price comes up, say it is "
+    "still more than you planned for."
 )
 NEW_OFFER_NOTE = (
     "- The advisor just put a better price on the table: \"{amount}\". You may sound mildly "
@@ -86,6 +87,13 @@ HOLD_NOTE = (
 # What the advisor already answered (hours, live or recorded, falling behind ...): not asked again.
 ANSWERED_NOTE = (
     "- The advisor has already answered these, so do not ask about them again: {topics}."
+)
+# R1-Q iteration 3.  The advisor's turn was a bare "Sure." / "Okay." / "Glad it helped." after the
+# learner had already said goodbye (the learner said it nine more times, in different words).
+HOLLOW_NOTE = (
+    "- The advisor said almost nothing. Do not say goodbye, thank them for the call or say that "
+    "you will reach out again: ask them one real question about something you still want to "
+    "know, or say what is still on your mind."
 )
 # A tracked phrase tic was used (see ``r1_text.reply_phrases``).
 STRETCH_USED_NOTE = (
@@ -433,10 +441,18 @@ def turn_reminder(
             lines.append(FORCED_NOTE)
         lines.append("- Keep the whole reply to two or three short sentences.")
     for topic in first_probe_topics:
+        # Topic H3 covers three things (time, money, who else decides): the answer follows the part
+        # the advisor asked about, so a question about hours is not answered with "money is tight".
+        part = (
+            " Answer only the part they asked about (your time, or your money, or who else is "
+            "involved) and say nothing about the others."
+            if topic == "H3"
+            else ""
+        )
         lines.append(
             f"- This is the advisor's first real question about {TOPIC_LABELS[topic]}. Answer "
             "in one short sentence with a little feeling, going only this far (for example "
-            f'"{persona.hint(topic)}"). Give no cause, number, date or name.'
+            f'"{persona.hint(topic)}"). Give no cause, number, date or name.{part}'
         )
     for topic in unlocked_topics:
         facts = "; ".join(f'"{fact}"' for fact in persona.facts(topic))

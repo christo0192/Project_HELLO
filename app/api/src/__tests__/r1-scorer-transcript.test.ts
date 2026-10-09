@@ -167,6 +167,30 @@ describe('masking', () => {
     }
   });
 
+  it('masks the e-mailed WEAK wording, also when a barge-in cut it after "get"', () => {
+    expect(
+      maskCommitmentLines("Let me think about it. I'll read through the email and get back to you."),
+    ).toBe(`Let me think about it. ${R1_COMMITMENT_MASK}`);
+    for (const line of [
+      'I’ll read through the email and get back to you.',
+      "I'll read through the e-mail and get back to you.",
+      "I'll read through the email and get",
+    ]) {
+      expect(maskCommitmentLines(line)).toBe(R1_COMMITMENT_MASK);
+      expect(maskCommitmentLines(`Okay. ${line}`)).toBe(`Okay. ${R1_COMMITMENT_MASK}`);
+    }
+  });
+
+  it('does not mask an ordinary mention of reading an email', () => {
+    for (const text of [
+      'Did you read through the email I sent?',
+      'I read the email you sent this morning.',
+      'Can you read through the details and tell me the price?',
+    ]) {
+      expect(maskCommitmentLines(text)).toBe(text);
+    }
+  });
+
   it('does not mask the F4 push or an ordinary request to call back', () => {
     for (const text of [
       "I'd want to run this by my husband first.",

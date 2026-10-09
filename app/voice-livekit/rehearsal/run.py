@@ -376,6 +376,48 @@ def sweep_pool(
     return records, total
 
 
+# ------------------------------------------------------------------------------ true cost
+def _balance_of(info: Any) -> float | None:
+    """The account balance in a preflight result (``{"preflight": {"balance": {"total": ...}}}``)."""
+    try:
+        value = ((info or {}).get("preflight") or {}).get("balance", {}).get("total")
+        return None if value is None else float(value)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+async def record_true_cost(run: dict[str, Any], settings: Settings, ledger: Ledger) -> None:
+    """Put the account balance before and after the sweep into ``run`` (R1-Q iteration 3, H6).
+
+    The ledger prices the tokens it saw; the sweep-2 ledger said 0.33 USD while the balance fell by
+    0.47 USD (production scoring and uncounted calls take the difference).  The balance is the true
+    cost, so ``run.json`` records it and the gap, and the next sweep's budget is set from the balance,
+    not from the ledger.  Never fails a sweep: a missing balance leaves the keys out.
+    """
+    before = _balance_of(run.get("start") or run.get("preflight"))
+    if before is None:
+        return
+    try:
+        factory = LiveFactory(settings)
+        try:
+            state = await factory.client.balance()
+        finally:
+            await factory.aclose()
+        after = None if state.get("total") is None else float(state["total"])
+    except Exception:  # noqa: BLE001 - bookkeeping must never fail a finished sweep
+        return
+    if after is None:
+        return
+    spent = round(before - after, 5)
+    run["balance"] = {
+        "before": before,
+        "after": after,
+        "spent": spent,
+        "ledger_estimate": round(ledger.cost_usd, 5),
+        "gap": round(spent - ledger.cost_usd, 5),
+    }
+
+
 # --------------------------------------------------------------------------------- driver
 async def run_all(settings: Settings, out: Path, say: Callable[[str], None]) -> int:
     specs = plan_specs(settings.levels, settings.learners, settings.calls, settings.max_exchanges)
@@ -432,6 +474,8 @@ async def run_all(settings: Settings, out: Path, say: Callable[[str], None]) -> 
     run["aborted_calls"] = len(aborted)
     run["wall_seconds"] = round(time.time() - started, 1)
     run["ledger"] = ledger.summary()
+    if not settings.offline and settings.preflight and records:
+        await record_true_cost(run, settings, ledger)
     card = None
     if records:
         card = build_scorecard(
@@ -470,6 +514,13 @@ async def run_all(settings: Settings, out: Path, say: Callable[[str], None]) -> 
         )
     else:
         say(f"Done: {len(records)} calls in {run['wall_seconds']} s. Artifacts: {out}")
+    balance = run.get("balance")
+    if balance:
+        say(
+            f"Account balance {balance['before']:.2f} -> {balance['after']:.2f} USD (spent "
+            f"{balance['spent']:.2f}; the ledger estimated {balance['ledger_estimate']:.2f}). "
+            "Set the next --budget-usd from the balance, not from the ledger."
+        )
     return code
 
 

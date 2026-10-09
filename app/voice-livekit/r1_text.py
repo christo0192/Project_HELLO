@@ -304,6 +304,46 @@ QUESTION_TEMPLATE = re.compile(
 )
 
 
+# Iteration 3.  The next live sweep found the concession tag ("I'll give you that", "I'll admit",
+# "I won't pretend it isn't", "I'll say that": 28 replies in 14 calls, four in a row in one call)
+# and the learner's goodbyes ("I'll reach out", "I'll let you know", "thanks for your time": nine
+# in a row once the advisor only said "Sure." and "Okay.").  The tag is used once per call; a
+# closer is dropped while the advisor has nothing to answer.
+PHRASE_CONCESSION_TAG = "concession_tag"
+_CONCESSION_CLAUSE = (
+    r"i(?:'ll| will) (?:give you that|admit(?: that)?|say that|grant (?:you )?that|"
+    r"concede(?: that)?)"
+    r"|i won't pretend(?: (?:that )?(?:it isn't|it's not|it wasn't|otherwise|i'm not|i wasn't|"
+    r"it doesn't|that isn't the case|it hasn't)|(?=\s*(?:[,.;!]|$)))"
+    r"|i have to admit|i must admit|i can't deny(?: that)?|i'll be fair"
+)
+CONCESSION_TAG = re.compile(r"\b(?:" + _CONCESSION_CLAUSE + r")\b", re.IGNORECASE)
+# The tag as a clause of its own, with the comma or dash that joins it: ", I'll give you that.",
+# " - I won't pretend it isn't", and the tag that opens a sentence ("I'll admit, that's a ...").
+CONCESSION_TAG_TRAILING = re.compile(
+    r"\s*[,;-]*\s*(?:" + _CONCESSION_CLAUSE + r")\b[,.]?", re.IGNORECASE
+)
+CONCESSION_TAG_LEADING = re.compile(
+    r"^\W*(?:" + _CONCESSION_CLAUSE + r")\b[,:]?\s*(?:(?:but|though|and)\b[,]?\s*)?",
+    re.IGNORECASE,
+)
+# A goodbye: the learner closing the call itself.  "I'll let you know" and "I'll get back to you"
+# as the answer to a close are the stall; this is only counted while the advisor has said nothing.
+PHRASE_CLOSER = "closer"
+HOLLOW_MAX_WORDS = 4
+CLOSER = re.compile(
+    r"\bi(?:'ll| will) (?:reach out|let you know|be in touch|get in touch|mull (?:it|this) over|"
+    r"keep an eye out)\b"
+    r"|\bthanks? (?:you )?(?:so much )?(?:again )?for (?:your time|walking me through|the call|"
+    r"taking the time|hearing me out|your help|everything)\b"
+    r"|\bthanks? (?:again|so much)\b[^.?!]{0,20}\b(?:call|time|help)\b"
+    r"|\b(?:i should|let me|i'll) let you go\b|\btake care\b|\b(?:good ?)?bye\b"
+    r"|\bi(?:'ve| have) got what i needed\b"
+    r"|\bi think i(?:'ve| have) got (?:enough|what i needed)\b",
+    re.IGNORECASE,
+)
+
+
 def reply_phrases(text: object) -> tuple[str, ...]:
     """The tracked phrase tics ("a stretch", the "what would it involve" template) in ``text``."""
     folded = fold(text)
@@ -312,7 +352,25 @@ def reply_phrases(text: object) -> tuple[str, ...]:
         found.append(PHRASE_STRETCH)
     if QUESTION_TEMPLATE.search(folded):
         found.append(PHRASE_TEMPLATE_Q)
+    if CONCESSION_TAG.search(folded):
+        found.append(PHRASE_CONCESSION_TAG)
     return tuple(found)
+
+
+def is_closer(text: object) -> bool:
+    """True when ``text`` is the learner closing the call itself (``CLOSER``)."""
+    return CLOSER.search(fold(text)) is not None
+
+
+def is_hollow_turn(text: object) -> bool:
+    """True when an advisor turn has nothing to answer: four words or fewer and no question.
+
+    "Sure.", "Okay.", "Mm-hmm.", "Glad it helped." and "Of course." are hollow; a question, or any
+    turn longer than a short back-channel, is not.  The learner does not say goodbye to a hollow
+    turn twice in a row (``r1_roleplay``, ``r1_guard``).
+    """
+    folded = fold(text)
+    return "?" not in folded and 0 < word_count(folded) <= HOLLOW_MAX_WORDS
 
 
 _NUMBER_WORD = r"zero|one|two|three|four|five|six|seven|eight|nine|oh"

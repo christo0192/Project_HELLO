@@ -686,10 +686,10 @@ _H1_PATTERNS = (
     r"\b(?:your|any|a|an) (?:[\w-]+ ){0,2}deadline\b",
 )
 _H2_PATTERNS = (
-    r"\b(?:concerns?|worr(?:y|ies|ied|ying)|hesitat\w+|doubts?|nervous|afraid|fears?|"
-    r"apprehens\w+|reservations?)\b",
-    r"\bholding you back\b|\bstopp(?:ing|ed) you\b|\bin your way\b|\bgot in the way\b"
-    r"|\bget in the way\b",
+    # The generic worry words (concern, worry, hesitation ...) are ``_H2_GENERIC_WORRY`` below: they
+    # name the topic only when nothing else in the question does.
+    r"\bholding you back\b|\bheld you back\b|\bkept you from\b|\bstopp(?:ing|ed) you\b"
+    r"|\bin your way\b|\bgot in the way\b|\bget in the way\b",
     r"\b(?:challenges?|struggl\w+|hurdles?|obstacles?|setbacks?|roadblocks?|frustrat\w+)\b",
     # R1-Q: "what is the friction or blocker", "what's stopping you" (owner test turns 34 and
     # 43).  The generic fear words ("scared", "stress", "anxious") are NOT here: see
@@ -706,7 +706,7 @@ _H2_PATTERNS = (
     r"\bhow (?:has|have|is|was|did|are) (?:the |your |that |it |this )?(?:job search|search|"
     r"learning|studying|studies|prep|preparation|interviews?|applications?|courses?|"
     r"attempts?|that|it)\b[^?.!]{0,30}\b(?:going|gone|go|worked|working)\b",
-    r"\bbiggest (?:gap|worry|concern|challenge|hurdle|obstacle|weakness|fear)\b",
+    r"\bbiggest (?:gap|challenge|hurdle|obstacle|weakness)\b",
     r"\b(?:gaps?|weak(?:ness|nesses|est)?) (?:in|you|that)\b",
 )
 _H3_PATTERNS = (
@@ -749,6 +749,42 @@ PROBE_RULES: dict[str, tuple[re.Pattern[str], ...]] = {
 # term (R1-Q round 1: it released H2's deep need on an H1 question and gave the advisor unearned
 # probing credit).
 _H2_FEAR_WORDS = re.compile(r"\b(?:scared|stress\w*|anxi\w+)\b", re.IGNORECASE)
+# R1-Q iteration 3.  "What's your biggest hesitation, the cost or the time?" asks about money and
+# time, not about what held the learner back before (the live sweep gave the H2 deep need to it).
+# The generic worry words name the H2 topic only when the question has no other topic's own words;
+# next to a schedule, money or "who else" word the question is about that (H3), and next to an H1
+# term (layoffs, the timeline) it is about that.
+_H2_GENERIC_WORRY = re.compile(
+    r"\b(?:concerns?|worr(?:y|ies|ied|ying)|hesitat\w+|doubts?|nervous|afraid|fears?|apprehens\w+|"
+    r"reservations?|biggest (?:worry|concern|fear)|scared|stress\w*|anxi\w+)\b",
+    re.IGNORECASE,
+)
+_H3_TOPIC_WORDS = re.compile(
+    r"\b(?:cost|costs|price|money|budget|afford\w*|pay|paying|payment|payments|fees?|instal\w+|"
+    r"time|schedule|hours?|weeks?|busy|workload|husband|wife|partner|spouse|family|kids|children|"
+    r"parents?|father|mother)\b",
+    re.IGNORECASE,
+)
+# A question that closes or checks in is not a question about the learner's situation, even when
+# it names the husband or the father: "does this sound like something worth exploring with your
+# father?", "would you want to aim for the upcoming cohort?" (the live sweep released the H3 need
+# on one).  A request to DO something ("can you get your husband on the phone now?") is no probe
+# either.
+_CLOSING_QUESTION = re.compile(
+    r"^\W*(?:(?:and|so|okay|ok|well|now|then)\W+)*(?:what do you think|how does (?:that|this|it) "
+    r"(?:sound|feel|look)|does (?:that|this|it) (?:sound|seem|feel|look)|do you think (?:that|this"
+    r"|it)|would you (?:want|like) to (?:aim|go|move|start|join|explore|look|see|set|book|"
+    r"schedule|pick|enrol+)|are you ready|shall we)\b"
+    r"|\b(?:does|do|would|is|are) (?:this|that|it|the program|the course) (?:sound|seem|feel|"
+    r"look)(?: like)? (?:something|good|right|interesting|worth)\b"
+    r"|\bworth (?:exploring|looking into|considering|discussing)\b",
+    re.IGNORECASE,
+)
+_REQUEST_QUESTION = re.compile(
+    r"^\W*(?:(?:and|so|okay|ok|well|now|then)\W+)*(?:can|could|would|will) you (?:please )?"
+    r"(?:get|put|bring|ask|let|call|text|send|join|hop|connect|pass|take)\b",
+    re.IGNORECASE,
+)
 # A follow-up asks the LEARNER to say more.  It must be a question or an imperative
 # addressed to the learner: "Let me give you an example of a student like you", "I'll
 # elaborate on our curriculum" and "Let me unpack the modules" are the advisor's own
@@ -817,11 +853,7 @@ def detect_probes(text: object) -> frozenset[str]:
         if not is_question_like(sentence):
             continue
         lowered = fold(sentence).lower()
-        if (
-            _CHECKIN_ON_ANSWER.search(lowered) is not None
-            or _OFFER_QUESTION.search(lowered) is not None
-            or _CHOICE_QUESTION.search(lowered) is not None
-        ):
+        if not _is_probe_shaped(lowered):
             continue
         in_sentence: set[str] = set()
         for topic, patterns in PROBE_RULES.items():
@@ -829,8 +861,25 @@ def detect_probes(text: object) -> frozenset[str]:
                 in_sentence.add(topic)
         if "H1" not in in_sentence and _H2_FEAR_WORDS.search(lowered):
             in_sentence.add("H2")
+        if _H2_GENERIC_WORRY.search(lowered) is not None and "H1" not in in_sentence:
+            # The question names a worry; the topic is whatever it is a worry ABOUT.
+            if "H3" in in_sentence or _H3_TOPIC_WORDS.search(lowered) is not None:
+                in_sentence.add("H3")
+            else:
+                in_sentence.add("H2")
         found.update(in_sentence)
     return frozenset(found)
+
+
+def _is_probe_shaped(lowered: str) -> bool:
+    """A question that asks about the learner: no check-in, offer, choice, close or request."""
+    return (
+        _CHECKIN_ON_ANSWER.search(lowered) is None
+        and _OFFER_QUESTION.search(lowered) is None
+        and _CHOICE_QUESTION.search(lowered) is None
+        and _CLOSING_QUESTION.search(lowered) is None
+        and _REQUEST_QUESTION.search(lowered) is None
+    )
 
 
 def detect_followup(text: object) -> bool:
@@ -879,11 +928,7 @@ def asks_about_learner(text: object) -> bool:
         if not is_question_like(sentence):
             continue
         lowered = fold(sentence).lower()
-        if (
-            _CHECKIN_ON_ANSWER.search(lowered) is not None
-            or _OFFER_QUESTION.search(lowered) is not None
-            or _CHOICE_QUESTION.search(lowered) is not None
-        ):
+        if not _is_probe_shaped(lowered):
             continue
         if (
             detect_probes(sentence)

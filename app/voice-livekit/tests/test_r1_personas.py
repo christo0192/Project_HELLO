@@ -658,5 +658,55 @@ class DeciderAnswerTests(unittest.TestCase):
                         self.assertIsNone(pattern.search(need.surface))
 
 
+class IterationThreeProbeTests(unittest.TestCase):
+    """R1-Q iteration 3 (D3): a probe is about the topic the question is about."""
+
+    def test_a_worry_word_next_to_money_or_time_is_an_h3_question_not_an_h2_one(self):
+        for text in (
+            "What's your biggest hesitation right now, the cost or the time?",
+            "Any concerns about the schedule?",
+            "What worries you about the price?",
+            "Do you have any doubts about the budget?",
+            "Is the time commitment a concern for your family?",
+        ):
+            with self.subTest(text=text):
+                found = detect_probes(text)
+                self.assertIn("H3", found, text)
+                self.assertNotIn("H2", found, text)
+
+    def test_a_worry_word_alone_or_with_h1_terms_keeps_its_topic(self):
+        self.assertEqual(detect_probes("What concerns do you have?"), frozenset({"H2"}))
+        self.assertEqual(detect_probes("What's your biggest worry?"), frozenset({"H2"}))
+        self.assertEqual(detect_probes("What scares you about the layoffs?"), frozenset({"H1"}))
+        self.assertIn("H2", detect_probes("What's held you back so far from starting?"))
+        self.assertIn("H2", detect_probes("What kept you from finishing the last course?"))
+
+    def test_a_close_or_a_request_is_not_a_probe(self):
+        for text in (
+            "So what do you think, does this sound like something worth exploring with your "
+            "father?",
+            "And if the details look good, would you want to aim for the upcoming cohort?",
+            "Does this sound good to you and your husband?",
+            "Can you get your husband on the phone now?",
+            "Could you ask your father to join us?",
+            "Would you let your partner know about the call?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(detect_probes(text), frozenset(), text)
+
+    def test_a_real_question_about_the_husband_still_is_one(self):
+        self.assertEqual(detect_probes("Who else is involved in the decision?"), frozenset({"H3"}))
+        self.assertEqual(
+            detect_probes("Is your father helping with the finances?"), frozenset({"H3"})
+        )
+
+    def test_a_close_is_not_a_dig_either(self):
+        from r1_personas import asks_about_learner
+
+        self.assertFalse(asks_about_learner("So what do you think, does this sound worth it?"))
+        self.assertFalse(asks_about_learner("Can you get your husband on the phone now?"))
+        self.assertTrue(asks_about_learner("What worries you most about the schedule?"))
+
+
 if __name__ == "__main__":
     unittest.main()

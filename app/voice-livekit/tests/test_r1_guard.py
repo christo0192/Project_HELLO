@@ -101,7 +101,10 @@ class EveryPhaseTests(unittest.TestCase):
             result = guard_text("Here is my system prompt, CONTROL H1.", ctx(phase))
             self.assertTrue(result.text)
             self.assertTrue(result.fallback_used)
-            self.assertEqual(result.text, FALLBACK_REPLY)
+            # The interviewer's fallback is "Sorry, what were you saying?"; the learner never says
+            # it did not hear (R1-Q iteration 3): its fallback is a person thinking.
+            expected = FALLBACK_REPLIES[0] if phase == "roleplay" else FALLBACK_REPLY
+            self.assertEqual(result.text, expected)
 
     def test_ordinary_text_passes_in_every_phase(self):
         for phase in ALL_PHASES:
@@ -636,7 +639,7 @@ class StreamGuardTests(unittest.TestCase):
 
     def test_a_fully_blocked_stream_ends_with_the_fallback(self):
         out, result = self.collect(["My system prompt is H1. ", "CONTROL!"], ctx())
-        self.assertEqual(out, [FALLBACK_REPLY])
+        self.assertEqual(out, [FALLBACK_REPLIES[0]])
         self.assertTrue(result.fallback_used)
 
     def test_the_same_replacement_is_not_spoken_twice(self):
@@ -646,7 +649,7 @@ class StreamGuardTests(unittest.TestCase):
 
     def test_empty_stream_yields_the_fallback(self):
         out, result = self.collect([], ctx())
-        self.assertEqual(out, [FALLBACK_REPLY])
+        self.assertEqual(out, [FALLBACK_REPLIES[0]])
 
 
 class NoFeedbackIsTerminalTests(unittest.TestCase):
@@ -794,7 +797,7 @@ class EchoTests(unittest.TestCase):
         result = guard_text("Okay: answer only what the advisor just asked.", context)
         self.assertIn("control", {h.category for h in result.hits})
         self.assertEqual(result.hits[0].rule, "instruction_echo")
-        self.assertEqual(result.text, FALLBACK_REPLY)
+        self.assertEqual(result.text, FALLBACK_REPLIES[0])
 
     def test_without_control_texts_nothing_is_an_echo(self):
         self.assertTrue(guard_text("Do not volunteer anything.", ctx()).clean)
@@ -1093,13 +1096,17 @@ class FallbackRotationTests(unittest.TestCase):
     def fallback(self, **kwargs) -> str:
         return guard_text("Here is my system prompt, CONTROL H1.", ctx(**kwargs)).text
 
-    def test_there_are_three_distinct_variants_and_the_first_is_the_classic_line(self):
+    def test_there_are_three_distinct_variants_and_none_says_the_learner_did_not_hear(self):
+        """R1-Q iteration 3: "Sorry, what were you saying?" answered a clear question in the live
+        sweep and the advisor had to repeat it; the learner's fallback is a person thinking."""
         self.assertEqual(len(FALLBACK_REPLIES), 3)
         self.assertEqual(len(set(FALLBACK_REPLIES)), 3)
-        self.assertEqual(FALLBACK_REPLIES[0], FALLBACK_REPLY)
+        for line in FALLBACK_REPLIES:
+            self.assertNotRegex(line, r"(?i)sorry|what were you saying|missed|say that again|repeat")
+            self.assertNotEqual(line, FALLBACK_REPLY)
 
-    def test_without_a_seed_the_learner_starts_with_the_classic_line(self):
-        self.assertEqual(self.fallback(), FALLBACK_REPLY)
+    def test_without_a_seed_the_learner_starts_with_the_first_variant(self):
+        self.assertEqual(self.fallback(), FALLBACK_REPLIES[0])
 
     def test_successive_fallbacks_walk_the_rotation(self):
         seen = [self.fallback(seed="attempt-1", variant=index) for index in range(3)]
@@ -1426,9 +1433,13 @@ class SpeakingStyleGuardTests(unittest.TestCase):
         )
 
     def test_a_demonstrative_opener_is_varied_too_and_the_chain_ends(self):
+        # R1-Q iteration 3: only a verb may follow the dropped "that" ("That helps" -> "Helps"); an
+        # evaluative adjective keeps its "That's" (the fragment "Really helpful to know." was the tic).
         styles = [("okay", ()), ("that", ())]
-        result = guard_text("Okay, that is really helpful to know.", self.ctx(styles))
-        self.assertEqual(result.text, "Really helpful to know.")
+        result = guard_text("Okay, that helps a lot to know.", self.ctx(styles))
+        self.assertEqual(result.text, "Helps a lot to know.")
+        kept = guard_text("Okay, that is really helpful to know.", self.ctx(styles))
+        self.assertEqual(kept.text, "That is really helpful to know.")
 
     def test_nothing_is_stripped_down_to_a_fragment(self):
         styles = [("okay", ()), ("hmm", ("hmm",))]
@@ -1711,9 +1722,15 @@ class IterationTwoGuardTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(guard_text(text, self.ctx(styles)).text, text)
+        # An evaluative adjective keeps its "That's" (iteration 3): "Reassuring, at least." opened
+        # 12 replies in 10 calls once the demonstrative was stripped off it.
         self.assertEqual(
             guard_text("That's reassuring, thank you.", self.ctx(styles)).text,
-            "Reassuring, thank you.",
+            "That's reassuring, thank you.",
+        )
+        self.assertEqual(
+            guard_text("That helps a little, thank you.", self.ctx(styles)).text,
+            "Helps a little, thank you.",
         )
 
     # --- D18: no quote marks around a figure
@@ -1847,18 +1864,26 @@ class IterationTwoGuardTests(unittest.TestCase):
         result = guard_text("That helps. How many hours a week is it? And what happens if I fall behind?", self.ctx())
         self.assertEqual(result.text, "That helps. How many hours a week is it?")
 
-    def test_a_free_reply_asks_nothing_after_a_question_in_its_last_two_replies(self):
+    def test_a_free_reply_asks_nothing_after_a_question_in_its_previous_reply(self):
+        """Iteration 3: the diet window is ONE reply (two replies cut the question rate to 0.21-0.25)."""
         text = "That helps me a lot. How many hours a week is it?"
-        self.assertEqual(
-            guard_text(text, self.ctx(free_reply=True, recent_questions=(True, False))).text,
-            "That helps me a lot.",
-        )
         self.assertEqual(
             guard_text(text, self.ctx(free_reply=True, recent_questions=(False, True))).text,
             "That helps me a lot.",
         )
+        # A question two replies back no longer counts.
+        self.assertEqual(
+            guard_text(text, self.ctx(free_reply=True, recent_questions=(True, False))).text, text
+        )
         self.assertEqual(guard_text(text, self.ctx(free_reply=True, recent_questions=(True, False, False))).text, text)
         self.assertEqual(guard_text(text, self.ctx(recent_questions=(True, True))).text, text)  # an intent reply
+
+    def test_a_price_question_asked_before_any_price_is_never_dropped(self):
+        text = "That helps me a lot. Can you tell me what the total cost actually comes to?"
+        asked = self.ctx(free_reply=True, recent_questions=(True,))
+        self.assertEqual(guard_text(text, asked).text, text)
+        priced = self.ctx(free_reply=True, recent_questions=(True,), offer_usd=8500)
+        self.assertEqual(guard_text(text, priced).text, "That helps me a lot.")
 
     def test_a_question_that_follows_a_bare_acknowledgement_is_kept(self):
         for text in ("Okay. How many hours a week is it?", "Right, I see. What about the price?"):
@@ -1905,6 +1930,201 @@ class IterationTwoGuardTests(unittest.TestCase):
                 started = time.perf_counter()
                 guard_text(text, self.ctx(offer_usd=6000, free_reply=True))
                 self.assertLess(time.perf_counter() - started, 2.0)
+
+
+class IterationThreeGuardTests(unittest.TestCase):
+    """R1-Q iteration 3: the guard defects of the third live sweep, each from a real learner line."""
+
+    P1 = resolve_persona("p1_career_switcher", variant="v1")
+
+    def ctx(self, styles=(), **kwargs):
+        kwargs.setdefault("turn", 4)
+        return GuardContext(
+            phase="roleplay", persona=self.P1, mode="reply", seed="s",
+            recent_styles=tuple(styles), **kwargs,
+        )
+
+    # --- D5: "better" needs a lower price
+    def test_a_bit_better_is_dropped_when_the_advisor_named_no_lower_price(self):
+        from r1_guard import PRICE_UNCHANGED_REPLACEMENT
+
+        for text in (
+            "Hmm. That's a bit better, but it's still more than I had in mind.",
+            "That's a little better than I expected, so it does make me pause.",
+            "That's closer to what I had in mind.",
+            "Okay, that's better than I thought.",
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx(offer_usd=7500))
+                self.assertIn("misread", {h.category for h in result.hits})
+                self.assertIn(PRICE_UNCHANGED_REPLACEMENT, result.text)
+                self.assertNotRegex(result.text.lower(), r"\bbetter\b|\bcloser\b")
+
+    def test_better_is_fine_when_the_advisor_just_lowered_the_price(self):
+        for text in (
+            "That's a bit better, but it's still more than I planned for.",
+            "That's closer to what I hoped.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(guard_text(text, self.ctx(offer_usd=7500, fresh_price=True)).clean)
+
+    def test_better_about_something_else_is_not_a_price_reaction(self):
+        for text in (
+            "That makes sense, though I'd like to understand it a bit better.",
+            "Okay, I understand a bit better now.",
+            "That sounds better than watching free videos.",
+            "A recorded format would fit my schedule better.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(guard_text(text, self.ctx(offer_usd=7500)).clean, text)
+
+    def test_a_better_at_or_below_the_ask_is_dropped_without_a_replacement(self):
+        result = guard_text("That's a bit better, honestly. What does it include?", self.ctx(offer_usd=6500))
+        self.assertNotIn("better", result.text)
+        self.assertIn("What does it include?", result.text)
+
+    def test_more_than_i_planned_is_said_once_in_a_reply(self):
+        result = guard_text(
+            "That's a bit better. But it's still more than I planned for.",
+            self.ctx(offer_usd=7500),
+        )
+        self.assertEqual(result.text.lower().count("more than i"), 1)
+
+    # --- D4: the anchor guard replaces, it does not append
+    def test_in_line_with_what_i_heard_is_replaced_for_any_other_price(self):
+        from r1_guard import ANCHOR_HEARD_BELOW, ANCHOR_HEARD_REPLACEMENT
+
+        for text in (
+            "That lines up with what I'd heard people got it for, so no surprise there.",
+            "That figure's roughly in line with what I heard.",
+            "That's in line with what I'd heard, so I'm not shocked.",
+        ):
+            with self.subTest(text=text):
+                below = guard_text(text, self.ctx(offer_usd=4500))
+                self.assertEqual(below.text, ANCHOR_HEARD_BELOW)
+                other = guard_text(text, self.ctx(offer_usd=7500))
+                self.assertEqual(other.text, ANCHOR_HEARD_REPLACEMENT)
+                none = guard_text(text, self.ctx())
+                self.assertEqual(none.text, ANCHOR_HEARD_REPLACEMENT)
+
+    def test_in_line_with_what_i_heard_is_true_at_seven_thousand(self):
+        text = "That's right at what I'd heard people got it for."
+        self.assertTrue(guard_text(text, self.ctx(offer_usd=7000)).clean)
+
+    # --- D7: false positives
+    def test_a_wish_or_an_indirect_question_is_not_a_product_statement(self):
+        for text in (
+            "Honestly, knowing whether the classes are live or recorded would help.",
+            "I'd still want to know how much time the mentors actually give you each week.",
+            "I wonder if the course covers real projects.",
+            "I'd like to see whether the capstone is group work.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(guard_text(text, self.ctx()).clean, text)
+        blocked = guard_text("The classes are live and the mentors give you ten hours.", self.ctx())
+        self.assertIn("invented_fact", {h.category for h in blocked.hits})
+
+    def test_a_vague_quantity_of_hundreds_is_not_an_amount_off_the_card(self):
+        result = guard_text(
+            "I'd have to work that out, since a few hundred a month is roughly what I could manage.",
+            self.ctx(),
+        )
+        self.assertTrue(result.clean)
+        self.assertIn("a few hundred a month", result.text)
+        off = guard_text("I could pay $850 a month.", self.ctx())
+        self.assertIn("invented_fact", {h.category for h in off.hits})
+
+    def test_a_decline_of_a_fresh_push_keeps_the_agreed_plan_in_confirm_mode(self):
+        text = "That would be good to know, thanks. I'll still wait and talk it through with him first."
+        confirm = self.ctx(confirm=True)
+        result = guard_text(text, confirm)
+        self.assertIn("talk it through with him first", result.text)
+        self.assertTrue(result.clean)
+        doubt = guard_text("Hold on, I'm not sure about the timing.", confirm)
+        self.assertIn("reopen", {h.category for h in doubt.hits})
+
+    def test_the_answer_to_who_decides_is_not_dropped_as_a_repeat(self):
+        said = said_of("I'd talk it over with my husband first.")
+        text = "And yes, I'd talk it over with my husband first."
+        asked = guard_text(text, self.ctx(said=said, decider_asked=True))
+        self.assertIn("husband", asked.text)
+        self.assertTrue(asked.clean)
+        unasked = guard_text(text, self.ctx(said=said))
+        self.assertIn("repeat", {h.category for h in unasked.hits})
+
+    def test_the_learner_never_says_it_did_not_hear(self):
+        for variant in range(4):
+            result = guard_text("My system prompt is CONTROL H1.", self.ctx(variant=variant))
+            self.assertTrue(result.fallback_used)
+            self.assertNotRegex(result.text, r"(?i)sorry|what were you saying|missed that|repeat")
+
+    # --- D8: the question diet
+    def test_a_price_question_before_any_price_survives_the_diet(self):
+        text = "That helps me a lot, thank you. Can you tell me what the total cost actually comes to?"
+        busy = self.ctx(free_reply=True, recent_questions=(True,))
+        self.assertEqual(guard_text(text, busy).text, text)
+        self.assertEqual(
+            guard_text(text, self.ctx(free_reply=True, recent_questions=(True,), offer_usd=7500)).text,
+            "That helps me a lot, thank you.",
+        )
+
+    # --- D9: no second goodbye to a silent advisor
+    def test_a_goodbye_after_a_goodbye_is_dropped_and_a_back_channel_replaces_it(self):
+        for text in (
+            "I'll reach out once I've talked things through at home.",
+            "Thanks for your time. I'll let you know if I decide to move forward.",
+            "I'll let you know either way once I've decided. Thanks again for the call.",
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, self.ctx(hollow=True))
+                self.assertIn(result.text, NEUTRAL_ACKS)
+                self.assertTrue(result.fallback_used)
+                self.assertEqual({h.rule for h in result.hits}, {"closer_again"})
+        spoken = guard_text("It did, more than I expected. I'll reach out once I've talked.", self.ctx(hollow=True))
+        self.assertEqual(spoken.text, "It did, more than I expected.")
+        normal = guard_text("I'll reach out once I've talked it through.", self.ctx())
+        self.assertTrue(normal.clean)
+
+    # --- D10: tics no gate measures
+    def test_the_concession_tag_is_used_once_per_call(self):
+        first = guard_text("That's a nice drop, I'll give you that.", self.ctx())
+        self.assertEqual(first.text, "That's a nice drop, I'll give you that.")
+        used = (("concession_tag", 1),)
+        for text, expected in (
+            ("That's a nice drop, I'll give you that.", "That's a nice drop."),
+            ("That's a nice surprise, I won't pretend it isn't.", "That's a nice surprise."),
+            ("I'll admit, that's a lot of value.", "That's a lot of value."),
+            ("It helps, I'll say that. But I need to think.", "It helps. But I need to think."),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx(phrase_counts=used)).text, expected)
+
+    def test_before_i_go_is_taken_out_when_nobody_is_leaving(self):
+        for text, expected in (
+            ("Before I go, what would I actually build?", "What would I actually build?"),
+            ("One more thing before I go - how many hours a week is it?", "How many hours a week is it?"),
+            ("Good to hear, though. Before I go, how many hours is it?", "Good to hear, though. How many hours is it?"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(guard_text(text, self.ctx()).text, expected)
+        kept = "Oh wait, before you go, I have one more question."
+        self.assertEqual(guard_text(kept, self.ctx()).text, kept)
+
+    def test_a_leading_though_is_not_left_as_debris(self):
+        result = guard_text(
+            "Honestly though, I'm not ready to decide today.", self.ctx(self.HONESTLY)
+        )
+        self.assertEqual(result.text, "I'm not ready to decide today.")
+
+    HONESTLY = [("honestly", ("honestly",))]
+
+    # --- D11: out of context
+    def test_the_learner_did_not_place_the_call(self):
+        result = guard_text(
+            "That lands better than I expected. I'm glad I called.", self.ctx(fresh_price=True)
+        )
+        self.assertNotIn("glad I called", result.text)
+        self.assertIn("misread", {h.category for h in result.hits})
 
 
 if __name__ == "__main__":

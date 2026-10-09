@@ -504,5 +504,68 @@ class SpeakingStyleHelperTests(unittest.TestCase):
         self.assertLess(time.perf_counter() - started, 2.0)
 
 
+class IterationThreeTextTests(unittest.TestCase):
+    """R1-Q iteration 3: the concession tag, the goodbye and the hollow advisor turn."""
+
+    def test_the_concession_tag_is_found_in_its_live_forms(self):
+        from r1_text import PHRASE_CONCESSION_TAG, reply_phrases
+
+        for text in (
+            "That's a nice drop, I'll give you that.",
+            "I'll admit, that's a lot of value.",
+            "That's a nice surprise, I won't pretend it isn't.",
+            "The pedigree sounds impressive, I won't pretend otherwise.",
+            "It helps, I'll say that.",
+            "I have to admit that surprised me.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(PHRASE_CONCESSION_TAG, reply_phrases(text))
+        for text in (
+            "I won't pretend to know the details.",
+            "That's a lot of value for the money.",
+            "I need to be honest with myself about this.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn(PHRASE_CONCESSION_TAG, reply_phrases(text))
+
+    def test_a_goodbye_is_found_and_an_ordinary_stall_is_not(self):
+        from r1_text import is_closer
+
+        for text in (
+            "I'll reach out once I've talked things through at home.",
+            "Thanks for your time.",
+            "I'll let you know either way once I've decided. Thanks again for the call.",
+            "Thanks for walking me through it.",
+            "I think I've got what I needed. Take care.",
+            "Okay, bye.",
+            "I should let you go.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_closer(text), text)
+        for text in (
+            "I'll think it over and get back to you.",
+            "What would I actually build in the course?",
+            "Thanks, that helps with the schedule worry.",
+            "I need to talk to my husband first.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_closer(text), text)
+
+    def test_a_hollow_advisor_turn_has_nothing_to_answer(self):
+        from r1_text import is_hollow_turn
+
+        for text in ("Sure.", "Okay.", "Mm-hmm.", "Glad it helped.", "Of course.", "That's fair."):
+            with self.subTest(text=text):
+                self.assertTrue(is_hollow_turn(text), text)
+        for text in (
+            "",
+            "Any questions before we wrap?",
+            "Take your time and think it over.",
+            "What's holding you back?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_hollow_turn(text), text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -73,6 +73,32 @@ Gates and metrics added or changed in R1-Q iteration 2 (the second live sweep):
   at 6:23 to 9:59). `--max-exchanges` defaults to 60 (the learner now speaks less, so 40 exchanges can end
   before 13:00).
 
+Harness fixes of R1-Q iteration 3 (H1-H6 of the analyst's second sweep):
+
+* H1: a QUESTION is no claim. `metrics.fact_error_metrics` (the `claims_guarantee` family) skips
+  sentences that start as a question ("Is the job guaranteed?"), so asking about a guarantee is not
+  stating one.
+* H2: the judge's misfires are held to the rule detectors. `unwarranted_gratitude`, `no_one_leaving`
+  and `ignored_offer` count only when the rule agrees (`judge.RULE_CONFIRMED_KINDS`), and a `repeat`
+  is rejected as `simulator_filler` (the advisor turn before it was a hollow "Sure.") or
+  `no_earlier_line` (nothing like it was said before). Rejections are listed as `misfires_rejected`.
+* H3: the probe vocabulary (`metrics._PROBE_VOCAB`) covers ordinary probes ("what's prompting you",
+  "what got you interested", "what held you back", "does your employer cover part of it"); a question
+  about WHEN to talk again is not an H3 dig (`_SCHEDULING_QUESTION`); the FIRST question a call asks
+  about a topic is its probe whatever the simulator tagged, and any later one is a dig.
+* H4: the terse advisor used to answer a goodbye with "Sure." / "Okay." / "Mm-hmm." for twelve turns
+  and the learner said goodbye nine times: a loop the simulator made. Its behaviour text now asks for
+  one short thing with content when the learner wraps up, and when its last two turns were hollow
+  (four words or fewer, no question) while the learner was closing, the simulator is asked once more
+  with `HOLLOW_LOOP_NUDGE` (terse level only, `LLMAdvisor._in_hollow_loop`).
+* H5: a price cut is read from the advisor's WORDS (this turn or the one before, `_cut_nearby`), not
+  from the simulator's intent tag: `unwarranted_surprise` no longer fires after a cut tagged
+  `answer_objection`, and `gratitude_unwarranted` is a new misfire kind (thanks for a price cut nobody
+  made).
+* H6: the ledger is an estimate. A live run with a preflight now records the DeepSeek balance before
+  and after (`run.json` -> `balance`: `before`, `after`, `spent`, `ledger_estimate`, `gap`), and the
+  "Done" line prints it, so the budget gate is checked against what the account was really charged.
+
 An OFFLINE scorecard checks the plumbing and the engine's decisions (schedule, negotiation, guard,
 repetition, disclosure layers), never the model: it can never be "ready for an owner test". Ready
 means a live sweep of 20 or more calls with every applicable gate measured and met.

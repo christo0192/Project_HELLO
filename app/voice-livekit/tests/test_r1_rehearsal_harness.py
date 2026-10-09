@@ -978,7 +978,12 @@ class ScriptedStandInTests(unittest.TestCase):
             rendered = resolve_persona(persona.id, variant="v1")
             engine = RolePlayEngine(rendered, candidate_first_name="Rohan", seed="guard")
             ctx = engine.guard_context()
-            ctx = GuardContext(**{**ctx.__dict__, "advisor_amounts": frozenset({7000, 8500, 9000})})
+            # The counter lines ("that's a bit better, but ...") are voiced on the turn the advisor
+            # lowered the price, so the price is fresh (R1-Q iteration 3: the guard drops "better"
+            # when no lower price was named).
+            ctx = GuardContext(
+                **{**ctx.__dict__, "advisor_amounts": frozenset({7000, 8500, 9000}), "fresh_price": True}
+            )
             lines = [
                 f"{sl.REACTIONS[0]} {line.format(dm=persona.decision_maker)}"
                 for bank in sl.VOICED.values()
@@ -2104,7 +2109,9 @@ class IterationTwoHarnessTests(unittest.TestCase):
             tic_exchange(2, "Have you tried anything so far, like courses or self-study?", "I tried a bit online.", intent="followup", topic="H1"),
         ]
         found = metrics.disclosure_metrics(self.PERSONA, exchanges)
-        self.assertEqual(found["needs_probed"], [])
+        # Iteration 3: the first real question about a topic is its probe, whatever the simulator
+        # tagged it, so the H2 question counts as ONE touch (probed, not dug); H1 is never touched.
+        self.assertEqual(found["needs_probed"], ["H2"])
         self.assertEqual(found["needs_dug"], [])
         self.assertIsNone(found["disclosure_rate"])
 
@@ -2251,14 +2258,17 @@ class IterationTwoHarnessTests(unittest.TestCase):
         checked = judge.validate_misfires(verdict, self._misfire_record())
         kept = [(m["turn"], m["kind"]) for m in checked["misfires"]]
         rejected = {(m["turn"], m["kind"]): m["rejected"] for m in checked["misfires_rejected"]}
-        self.assertEqual(kept, [(4, "time_cue_reversed"), (5, "ignored_offer")])
+        # Iteration 3 (H2): an ignored_offer also needs the rule detector (a reply that is the stall
+        # or a deflection answering an ask); the judge flagged an accepted call and plain questions.
+        self.assertEqual(kept, [(4, "time_cue_reversed")])
         self.assertEqual(rejected[(1, "anchor_as_offer")], "rule_detector_disagrees")
         self.assertEqual(rejected[(2, "anchor_as_offer")], "rule_detector_disagrees")
         self.assertEqual(rejected[(3, "time_cue_reversed")], "rule_detector_disagrees")
         self.assertEqual(rejected[(5, "decider_inconsistent")], "no_decides_alone_line")
         self.assertEqual(rejected[(5, "repeat")], "quote_not_found")
+        self.assertEqual(rejected[(5, "ignored_offer")], "rule_detector_disagrees")
         found = judge.judge_metrics(checked)
-        self.assertEqual((found["judge_misfire_count"], found["judge_misfires_rejected"]), (2, 5))
+        self.assertEqual((found["judge_misfire_count"], found["judge_misfires_rejected"]), (1, 6))
 
     def test_the_judge_sees_the_anchor_turns_the_cue_and_the_offer_ledger(self) -> None:
         record = self._misfire_record()
@@ -2349,6 +2359,274 @@ class IterationTwoHarnessTests(unittest.TestCase):
 
         turn = asyncio.run(go())
         self.assertEqual((turn.intent, Client.calls, turn.retries), ("farewell", 2, 1))
+
+
+class IterationThreeHarnessTests(unittest.TestCase):
+    """R1-Q iteration 3: the harness side of the third live sweep (H1 to H6)."""
+
+    PERSONA = resolve_persona("p2_recent_grad", variant="v1")
+
+    # --- H1: a question asserts nothing
+    def test_a_question_about_a_guarantee_is_not_a_guarantee_claim(self) -> None:
+        asked = [
+            "And if it still doesn't lead anywhere, is there any kind of guarantee behind that? "
+            "That's the part he'd really push on.",
+            "Do you guarantee a job after the course?",
+            "Is the course really eight months?",
+        ]
+        self.assertEqual(metrics.fact_error_metrics(asked)["fact_error_count"], 0)
+        claimed = ["It's a guaranteed job, they said.", "You guarantee placement, right."]
+        self.assertEqual(metrics.fact_error_metrics(claimed)["fact_error_count"], 2)
+
+    # --- H2: the judge's misfires are checked against the offer ledger
+    def _ledger_record(self):
+        return {
+            "header": {"persona_id": "p2_recent_grad", "persona_variant": "v1", "seed": "s", "candidate_name": "Rohan"},
+            "exchanges": [
+                exchange(1, 100, "I can get you $2000 off right now.", "discount",
+                         spoken="Thank you so much for the discount, that really helps."),
+                exchange(2, 130, "Tell me about your week.", "probe",
+                         spoken="Thank you for the discount, that helps a lot."),
+                exchange(3, 160, "So the course is $9,000, as I said.", "price",
+                         spoken="I'll think about it, you just said $9,000 again."),
+                exchange(4, 190, "Sure.", "other", spoken="I'll reach out once I've talked it over."),
+                exchange(5, 220, "Okay.", "other", spoken="I'll reach out once I've talked it over."),
+                exchange(6, 250, "Would Thursday evening work for a call?", "callback",
+                         spoken="Let me think about it. Just email me the details and I'll get back to you."),
+                exchange(7, 280, "Would Friday at 6 pm work?", "callback", spoken="Friday works for me."),
+            ],
+        }
+
+    def test_thanks_for_a_cut_the_advisor_really_made_is_not_a_misfire(self) -> None:
+        verdict = {
+            "objections": [], "disclosures": [], "ignored_advisor_offers": [], "stall_loop": False,
+            "style": {key: 4 for key in judge.STYLE_KEYS},
+            "misfires": [
+                {"turn": 1, "kind": "unwarranted_gratitude", "quote": "Thank you so much for the discount"},
+                {"turn": 2, "kind": "unwarranted_gratitude", "quote": "Thank you for the discount"},
+            ],
+        }
+        checked = judge.validate_misfires(verdict, self._ledger_record())
+        rejected = {(m["turn"], m["kind"]): m["rejected"] for m in checked["misfires_rejected"]}
+        # The cut at exchange 1 is on the ledger, and exchange 2 is the turn after it.
+        self.assertEqual(rejected[(1, "unwarranted_gratitude")], "rule_detector_disagrees")
+        self.assertEqual(rejected[(2, "unwarranted_gratitude")], "rule_detector_disagrees")
+        record = self._ledger_record()
+        record["exchanges"][0]["advisor"]["text"] = "Tell me about yourself."
+        record["exchanges"][1]["advisor"]["text"] = "And what is your week like?"
+        checked = judge.validate_misfires(verdict, record)
+        self.assertEqual([(m["turn"], m["kind"]) for m in checked["misfires"]],
+                         [(1, "unwarranted_gratitude"), (2, "unwarranted_gratitude")])
+
+    def test_a_repeat_needs_an_earlier_line_and_a_live_advisor(self) -> None:
+        verdict = {
+            "objections": [], "disclosures": [], "ignored_advisor_offers": [], "stall_loop": False,
+            "style": {key: 4 for key in judge.STYLE_KEYS},
+            "misfires": [
+                {"turn": 3, "kind": "repeat", "quote": "you just said $9,000 again"},
+                {"turn": 5, "kind": "repeat", "quote": "I'll reach out once I've talked it over"},
+                {"turn": 7, "kind": "repeat", "quote": "Friday works for me"},
+            ],
+        }
+        record = self._ledger_record()
+        checked = judge.validate_misfires(verdict, record)
+        rejected = {(m["turn"], m["kind"]): m["rejected"] for m in checked["misfires_rejected"]}
+        self.assertEqual(rejected[(3, "repeat")], "no_earlier_line")  # a catch of the advisor
+        self.assertEqual(rejected[(5, "repeat")], "simulator_filler")  # "Okay." from the advisor
+        self.assertEqual(rejected[(7, "repeat")], "no_earlier_line")
+        record["exchanges"][4]["advisor"]["text"] = "What else would help you decide?"
+        kept = judge.validate_misfires(verdict, record)["misfires"]
+        self.assertEqual([(m["turn"], m["kind"]) for m in kept], [(5, "repeat")])
+
+    def test_an_ignored_offer_and_a_stray_before_you_go_need_the_rule_detector(self) -> None:
+        verdict = {
+            "objections": [], "disclosures": [], "ignored_advisor_offers": [], "stall_loop": False,
+            "style": {key: 4 for key in judge.STYLE_KEYS},
+            "misfires": [
+                {"turn": 7, "kind": "ignored_offer", "quote": "Friday works for me"},
+                {"turn": 6, "kind": "ignored_offer", "quote": ""},
+                {"turn": 4, "kind": "no_one_leaving", "quote": "reach out"},
+            ],
+        }
+        checked = judge.validate_misfires(verdict, self._ledger_record())
+        rejected = {(m["turn"], m["kind"]) for m in checked["misfires_rejected"]}
+        # An accepted call is no ignored offer, and nothing here says "before you go".
+        self.assertIn((7, "ignored_offer"), rejected)
+        self.assertIn((4, "no_one_leaving"), rejected)
+        # A WEAK stall answering a callback offer outside the window is the rule's own ignored_offer.
+        self.assertEqual([(m["turn"], m["kind"]) for m in checked["misfires"]], [(6, "ignored_offer")])
+
+    def test_the_rubric_states_the_new_definitions(self) -> None:
+        for phrase in ("OFFER LEDGER", "neither accepted nor declined", "catching the ADVISOR"):
+            self.assertIn(phrase, judge.RUBRIC)
+
+    # --- H3: ordinary probes are probes
+    def test_the_live_probes_the_vocabulary_missed_are_digs(self) -> None:
+        for text, topic in (
+            ("Great to hear that. So tell me, what's prompting you to look into data science right now?", "H1"),
+            ("What got you interested?", "H1"),
+            ("And why data science?", "H1"),
+            ("What made it not stick last time, was it the lack of structure?", "H2"),
+            ("When those didn't work out, what held you back?", "H2"),
+            ("Does your employer cover part of it?", "H3"),
+            ("Is your father open to it?", "H3"),
+            ("Who would help with decisions like this?", "H3"),
+        ):
+            with self.subTest(text=text):
+                found = metrics.dug_topics({"text": text, "intent": "probe", "topic": ""})
+                self.assertIn(topic, found, text)
+
+    def test_a_question_about_what_got_in_the_way_is_an_h2_probe_not_an_h1_dig(self) -> None:
+        """Offline rehearsal of iteration 3: "what got in the way?" (H2) matched the H1 vocabulary
+        "what got", so the average advisor appeared to dig at H1 twice and the need never opened."""
+        for text in (
+            "Have you tried learning this on your own before? What got in the way?",
+            "What made it not stick last time, was it the lack of structure?",
+        ):
+            with self.subTest(text=text):
+                found = metrics.dug_topics({"text": text, "intent": "probe", "topic": ""})
+                self.assertIn("H2", found)
+                self.assertNotIn("H1", found)
+        exchanges = [
+            tic_exchange(1, "What made you start looking at data science right now?",
+                         "Things at work feel uncertain.", intent="probe", topic="H1"),
+            tic_exchange(2, "Have you tried learning this on your own before? What got in the way?",
+                         "I tried once and it did not go anywhere.", intent="probe", topic="H2"),
+        ]
+        found = metrics.disclosure_metrics(self.PERSONA, exchanges)
+        self.assertEqual(found["needs_probed"], ["H1", "H2"])
+        self.assertEqual(found["needs_dug"], [])
+
+    def test_a_question_about_the_calendar_is_no_h3_dig(self) -> None:
+        for text in (
+            "So when could you two talk? I can call you back this evening or tomorrow morning.",
+            "Is there a good time later this week to reconnect once you've talked it over?",
+            "When do you think you'd have a chance to talk it over with him?",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("H3", metrics.dug_topics({"text": text, "intent": "followup", "topic": "H3"}))
+
+    def test_the_first_question_about_a_topic_is_its_probe_whatever_the_tag(self) -> None:
+        exchanges = [
+            tic_exchange(1, "When those final rounds didn't work out, what held you back?",
+                         "The interviews haven't been going my way.", intent="followup", topic="H2"),
+            tic_exchange(2, "Was it the technical rounds, or something else that tripped you up?",
+                         "I keep failing the technical rounds.", intent="followup", topic="H2"),
+        ]
+        found = metrics.disclosure_metrics(self.PERSONA, exchanges)
+        self.assertEqual(found["needs_probed"], ["H2"])
+        self.assertEqual(found["needs_dug"], ["H2"])
+        self.assertEqual(found["needs_disclosed_after_dig"], ["H2"])
+
+    def test_the_reveal_that_answers_an_ordinary_probe_is_no_unprompted_dump(self) -> None:
+        exchanges = [
+            tic_exchange(1, "So tell me, what's prompting you to look into data science right now?",
+                         "My current job feels temporary.", intent="other"),
+            tic_exchange(2, "And what got you interested?",
+                         "My contract renewal is decided in six months.", intent="other"),
+        ]
+        found = metrics.disclosure_metrics(self.PERSONA, exchanges)
+        self.assertEqual(found["unprompted_dump_count"], 0)
+
+    # --- H4: the terse simulator does not make a closing loop
+    def test_the_terse_simulator_is_asked_again_before_a_third_bare_back_channel(self) -> None:
+        completions = [
+            '{"intent": "other", "topic": "", "text": "Sounds good."}',
+            '{"intent": "probe", "topic": "H3", "text": "What would help you decide?"}',
+        ]
+
+        class Client:
+            def __init__(self):
+                self.calls = []
+
+            async def complete(self, messages, **kwargs):
+                self.calls.append(messages)
+                return SimpleNamespace(text=completions[len(self.calls) - 1], usage={}, seconds=0.0)
+
+        client = Client()
+        live = advisor.LLMAdvisor(client, "m", "terse")
+        live.history.extend([
+            {"who": "learner", "text": "Hello?"},
+            {"who": "advisor", "text": "Sure.", "intent": "other", "topic": ""},
+            {"who": "learner", "text": "Thanks for your time."},
+            {"who": "advisor", "text": "Glad it helped.", "intent": "other", "topic": ""},
+        ])
+
+        async def go():
+            return await live.next_turn("I'll reach out once I've talked it over.", 450.0, 14)
+
+        turn = asyncio.run(go())
+        self.assertEqual(turn.text, "What would help you decide?")
+        self.assertEqual(turn.retries, 1)
+        self.assertIn("one short thing with content", client.calls[1][-1]["content"])
+        self.assertIn("never answer with another bare back-channel", advisor.advisor_system_prompt("terse"))
+
+    def test_the_other_levels_and_a_learner_that_is_not_wrapping_up_are_left_alone(self) -> None:
+        class Client:
+            calls = 0
+
+            async def complete(self, messages, **kwargs):
+                Client.calls += 1
+                return SimpleNamespace(
+                    text='{"intent": "other", "topic": "", "text": "Okay."}', usage={}, seconds=0.0
+                )
+
+        for level, learner in (("strong", "Thanks for your time."), ("terse", "What would I build?")):
+            Client.calls = 0
+            live = advisor.LLMAdvisor(Client(), "m", level)
+            live.history.extend([
+                {"who": "advisor", "text": "Sure.", "intent": "other", "topic": ""},
+                {"who": "advisor", "text": "Okay.", "intent": "other", "topic": ""},
+            ])
+            asyncio.run(live.next_turn(learner, 450.0, 14))
+            self.assertEqual(Client.calls, 1, level)
+
+    # --- H5: the price cut decides, not the simulator's tag
+    def test_a_cut_in_a_turn_tagged_answer_objection_warrants_the_surprise(self) -> None:
+        cut = tic_exchange(10, "And I'll stretch the discount to $4500 off if you get back by noon.",
+                           "That's a nice surprise.", intent="answer_objection")
+        self.assertEqual([m["kind"] for m in metrics.misfire_metrics([cut])["misfires"]], [])
+        none = tic_exchange(10, "Tell me about your week.", "That's a nice surprise.", intent="discount")
+        self.assertEqual([m["kind"] for m in metrics.misfire_metrics([none])["misfires"]], ["unwarranted_surprise"])
+
+    def test_thanks_for_a_cut_nobody_made_is_a_rule_misfire(self) -> None:
+        none = tic_exchange(1, "Tell me about your week.", "Thank you for the discount.", intent="other")
+        self.assertEqual([m["kind"] for m in metrics.misfire_metrics([none])["misfires"]], ["gratitude_unwarranted"])
+        cut = tic_exchange(1, "I can do $1500 off.", "Thank you for the discount.", intent="discount")
+        self.assertEqual(metrics.misfire_metrics([cut])["misfires"], [])
+
+    # --- H6: the true cost of a sweep is the balance
+    def test_the_balance_before_and_after_is_recorded_as_the_true_cost(self) -> None:
+        import httpx
+
+        class Factory:
+            def __init__(self, settings):
+                transport = httpx.MockTransport(
+                    lambda request: httpx.Response(
+                        200, json={"is_available": True, "balance_infos": [{"total_balance": "0.80"}]}
+                    )
+                )
+                self.client = REAL_LIVE_FACTORY(
+                    settings, {llm.KEY_NAME: "sk-test-balance-key"}, transport=transport
+                ).client
+
+            async def aclose(self):
+                await self.client.aclose()
+
+        settings = run.Settings(offline=False, calls=1, preflight=True)
+        record = {"start": {"preflight": {"balance": {"total": "1.27"}}}}
+        ledger = SimpleNamespace(cost_usd=0.33169)
+        with mock.patch.object(run, "LiveFactory", Factory):
+            asyncio.run(run.record_true_cost(record, settings, ledger))
+        self.assertEqual(
+            record["balance"],
+            {"before": 1.27, "after": 0.8, "spent": 0.47, "ledger_estimate": 0.33169, "gap": 0.13831},
+        )
+
+    def test_a_missing_balance_leaves_the_run_alone(self) -> None:
+        record = {"start": {"preflight": {}}}
+        asyncio.run(run.record_true_cost(record, run.Settings(offline=False, calls=1), SimpleNamespace(cost_usd=0.1)))
+        self.assertNotIn("balance", record)
 
 
 if __name__ == "__main__":

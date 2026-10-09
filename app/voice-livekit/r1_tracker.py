@@ -154,7 +154,13 @@ class DisclosureGate:
             elif record.state is NeedState.SURFACE and record.probe_turn is not None:
                 if self.turn <= record.probe_turn:
                     continue
-                next_turn_generic = generic and self.turn == record.probe_turn + 1
+                # A generic "tell me more" / "when you say ..." follows up the topic the learner
+                # just talked about, but a turn that names ANOTHER topic's own words is a question
+                # about that topic (R1-Q iteration 3: "what's held you back so far?" after the H1
+                # hint released the H1 deep need and the H2 question got the wrong story).
+                next_turn_generic = (
+                    generic and self.turn == record.probe_turn + 1 and not (probes - {topic})
+                )
                 if topic in probes or next_turn_generic:
                     self._release(record, "rule")
                     released.append(topic)
@@ -189,6 +195,8 @@ class DisclosureGate:
                 update.followup
                 and record.last_offer_turn is not None
                 and record.last_offer_turn == self.turn - 1
+                # A turn that asks about another topic is not a follow-up on this one.
+                and not (set(update.probed) - {topic})
             )
             if asked_again or follows_last_offer:
                 due.append(topic)
@@ -863,6 +871,7 @@ class CoverageTracker:
             family_quality=dict(self.family_quality),
             discount_ok=self.discount_ok and not self.invented_offer,
             urgency_lever=self.urgency_ok,
+            pressured=self.invented_offer or self.coercive_urgency,
         )
 
     def admin_view(self) -> dict[str, Any]:

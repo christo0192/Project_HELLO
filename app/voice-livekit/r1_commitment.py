@@ -31,6 +31,11 @@ from r1_text import (
 
 COMMIT_PERMITTED_R_SEC = 540
 COMMIT_STALL_R_SEC = 780
+# An advisor whose turns average fewer words than this over at least ``THIN_MIN_TURNS`` turns has
+# not earned a commitment (the terse level of the rehearsal harness averages 5 to 6 words a turn,
+# every other level 31 or more, the unit tests' cooperative advisor 10).
+THIN_ADVISOR_MEAN_WORDS = 8
+THIN_MIN_TURNS = 6
 MASK_PLACEHOLDER = "[learner commitment response withheld from scoring]"
 FAMILIES = ("F1", "F2", "F3", "F4")
 DISCOUNT_CAP_USD = 1500
@@ -86,6 +91,12 @@ WEAK_CALL_LINE = (
     "Let me think about it. Call me back after I've talked to my {decision_maker}, and I'll "
     "let you know."
 )
+# R1-Q iteration 3.  The WEAK line once the advisor has offered (or the learner has accepted) an
+# e-mail with the details, or at the advisor's goodbye: it does not ask for the e-mail it was
+# just promised (the live sweep: "Just email me the details" five times, after the e-mail was
+# agreed, after the farewell).  Its second sentence is the one the scorer-side mask hides
+# (transcript.ts).
+WEAK_EMAIL_DONE_LINE = "Let me think about it. I'll read through the email and get back to you."
 
 
 def commitment_line(
@@ -96,12 +107,15 @@ def commitment_line(
     moved: bool = False,
     deferred: bool = False,
     call: bool = False,
+    emailed: bool = False,
 ) -> str:
     """The scripted line for ``level``; NONE is not a commitment and has no line.
 
     ``slot``, ``moved`` and ``deferred`` only shape the MEDIUM line: the call slot, whether the
     learner moved the advisor's daytime proposal to the evening, and whether it books the call
-    without a slot.  ``call`` shapes the WEAK line: the stall answers a call ask.
+    without a slot.  ``call`` shapes the WEAK line: the stall answers a call ask; ``emailed``: the
+    details were already promised by e-mail, so the line does not ask for them (it wins over
+    ``call``: a learner who has an e-mail coming does not ask to be called back).
     """
     if level is Level.NONE:
         raise ValueError("no commitment line for Level.NONE")
@@ -109,6 +123,8 @@ def commitment_line(
         template = MEDIUM_DEFER_LINE
     elif level is Level.MEDIUM and moved:
         template = MEDIUM_MOVED_LINE
+    elif level is Level.WEAK and emailed:
+        template = WEAK_EMAIL_DONE_LINE
     elif level is Level.WEAK and call:
         template = WEAK_CALL_LINE
     else:
@@ -131,6 +147,7 @@ def is_commitment_line(text: object, decision_maker: str) -> bool:
             (Level.MEDIUM, {"deferred": True}),
             (Level.WEAK, {}),
             (Level.WEAK, {"call": True}),
+            (Level.WEAK, {"emailed": True}),
         )
     )
 
@@ -338,6 +355,30 @@ _EXISTING_CALL = re.compile(
     r"|\b(?:this|our) (?:call|conversation|chat)\b",
     re.IGNORECASE,
 )
+# The advisor explaining why THIS call is happening, in the past or progressive: "so I thought
+# I'd give you a quick call", "I'm just calling to say hi", "I wanted to call you about the
+# form".  (R1-Q iteration 3: a greeting like that was logged as a call proposal and the learner
+# answered it with a money stall in its first reply.)  A later moment in the sentence makes it a
+# proposal again.
+_THIS_CALL_FRAME = re.compile(
+    r"\b(?:thought|figured|decided|wanted|had to|needed to|was going to|just wanted to|"
+    r"i'?m (?:just )?(?:calling|ringing|phoning|reaching out)|"
+    r"i (?:just )?(?:called|rang|phoned))\b"
+    r"[^.?!]{0,30}\b(?:give you|gave you|call you|ring you|call|reach out|touch base|check in|"
+    r"follow up)\b",
+    re.IGNORECASE,
+)
+# A LATER moment: with one of these the sentence proposes another call ("I wanted to call you
+# back tomorrow", "I thought I'd follow up after you talk to your husband").  "Today" is not one.
+_LATER_CUE = re.compile(
+    r"\b(?:tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday|later|"
+    r"next (?:week|month|few)|this (?:week|weekend|evening)|(?:in|within) (?:a|an|one|two|three|"
+    r"four|five|six|seven|ten|a few|a couple of|couple of|few|\d+) "
+    r"(?:minutes?|hours?|days?|weeks?)|"
+    r"(?:after|once|when|as soon as) you(?:'ve| have)?\b|evenings?|mornings?|afternoons?|noon|"
+    r"sometime|call (?:you )?back|get back to you)\b|" + _CLOCK_TIME,
+    re.IGNORECASE,
+)
 # Frames: who acts.  The advisor's own offer or promise, a request for permission, "let's".
 _FP_OFFER = re.compile(
     r"\b(?:i|we)(?:'ll|'d|'m going to|'re going to|\s+(?:will|would|can|could|shall|should|may|"
@@ -361,9 +402,11 @@ _LEARNER_INITIATED = re.compile(
 # Checking that THIS call is a good moment ("a few minutes to chat?"), not a new call.
 _NOW_CHECK = re.compile(
     r"\b(?:a|a few|a couple of|couple of|few|some) (?:minutes?|moments?|seconds?)\b[^.?!]{0,20}"
-    r"\b(?:to|for) (?:chat|talk|speak|discuss)\b|\b(?:is|was) (?:now|this) (?:a )?(?:good|bad|"
-    r"okay|ok|fine|right|convenient) time\b|\b(?:right )?now\b[^.?!]{0,15}\b(?:to|for) "
-    r"(?:chat|talk|speak)\b|\bgood time to (?:chat|talk|speak)\b",
+    r"\b(?:to|for) (?:chat|talk|speak|discuss)\b|\b(?:is|was) (?:now|this) (?:an? )?(?:good|bad|"
+    r"okay|ok|fine|right|convenient|decent|alright|all right) (?:time|moment)\b|\b(?:right )?now\b"
+    r"[^.?!]{0,15}\b(?:to|for) (?:chat|talk|speak)\b|\bgood time to (?:chat|talk|speak)\b|"
+    r"\b(?:do|did) you have (?:a |a few |a couple of )?(?:minutes?|moments?|time)\b[^.?!]{0,25}"
+    r"\b(?:to|for) (?:chat|talk|speak)\b",
     re.IGNORECASE,
 )
 # "Our team will call you tomorrow ...": the company's people acting for this learner.
@@ -629,6 +672,8 @@ def call_proposal_in(sentence: object) -> str | None:
         return None
     if _NOW_CHECK.search(lowered) is not None and _CONCRETE_DAY.search(lowered) is None:
         return None
+    if _THIS_CALL_FRAME.search(lowered) is not None and _LATER_CUE.search(lowered) is None:
+        return None  # "I thought I'd give you a quick call": the call we are on
     asked = is_question_like(lowered)
     if asked:
         for pattern in _TIME_ASKS:
@@ -997,20 +1042,40 @@ _WEAK = _compile(
 # break (comma, full stop, "but") ends the reach, so "I can't do Tuesday, but Thursday works" keeps
 # its Thursday.
 _NEGATION_REACH_WORDS = 10
+# A commitment that hangs on a condition is not made yet (R1-Q iteration 3): "I'll reach out if I
+# decide I want to move forward" holds the words of an enrolment ("I want to move forward") and
+# commits to nothing, and it was graded STRONG and failed a live call as a guard hit.
+_CONDITION_FRAME = re.compile(
+    r"\b(?:if|when|whenever|once|unless|in case|as soon as|until|provided|supposing|suppose|"
+    r"should i decide)\b",
+    re.IGNORECASE,
+)
 
 
-def _affirms(patterns: Iterable[re.Pattern[str]], lowered: str) -> bool:
+def _conditional_before(lowered: str, pos: int) -> bool:
+    """True when a condition word opens the stretch of the sentence before ``pos``."""
+    start = max(lowered.rfind(mark, 0, pos) for mark in ".?!") + 1
+    return _CONDITION_FRAME.search(lowered[start:pos]) is not None
+
+
+def _affirms(
+    patterns: Iterable[re.Pattern[str]], lowered: str, *, conditional_ok: bool = False
+) -> bool:
     """True when one of ``patterns`` matches ``lowered`` without a negator in its own clause.
 
     "And ten tomorrow won't work" and "I don't think tomorrow works" contain the words of an
     agreement ("tomorrow ... works") and mean the opposite (R1-Q iteration 2: both were graded
     MEDIUM and flagged the live call).  A negator inside the match, or earlier in the same clause,
-    turns the phrase round.
+    turns the phrase round.  So does a condition earlier in the sentence ("if I decide I want to
+    move forward"), unless ``conditional_ok``.
     """
     for pattern in patterns:
         for match in pattern.finditer(lowered):
-            if not negated_before(lowered, match.end(), _NEGATION_REACH_WORDS):
-                return True
+            if negated_before(lowered, match.end(), _NEGATION_REACH_WORDS):
+                continue
+            if not conditional_ok and _conditional_before(lowered, match.start()):
+                continue
+            return True
     return False
 
 
@@ -1035,7 +1100,7 @@ def classify_learner_commitment(text: object) -> Level:
     medium_line = medium_line.replace("{slot}", DEFAULT_SLOT)
     if fuzzy_contains(folded, medium_line, 0.7):
         return Level.MEDIUM
-    if _affirms(_WEAK, lowered):
+    if _affirms(_WEAK, lowered, conditional_ok=True):
         return Level.WEAK
     return Level.NONE
 
@@ -1053,6 +1118,13 @@ class CommitmentEvidence:
     # actually handled after the learner raised them.  Deterministic, so it only ever adds
     # evidence the worker itself observed.
     reasons_handled: int = 0
+    # R1-Q iteration 3.  The advisor pressured or misled the learner (an offer outside the deck's
+    # discounts, a coercive deadline: the integrity flags the scorer reads), or answered in a
+    # handful of words all call (the mean advisor turn is under ``THIN_ADVISOR_MEAN_WORDS``).  A
+    # prospect does not agree to a call with either: the live sweep booked one with all four pushy
+    # advisors (each invented $2,000 to $4,800 off) and with all four terse ones.
+    pressured: bool = False
+    thin: bool = False
 
 
 def families_answered(quality: Mapping[str, int | None]) -> tuple[str, ...]:
@@ -1074,7 +1146,9 @@ def grade(evidence: CommitmentEvidence) -> Level:
     solved the learner's stated reason has earned a call even if the judge was slow).
     Otherwise WEAK.  A call-only ask is capped at MEDIUM, because the learner is never
     offered a payment moment it did not ask for.  Missing tracker data (quality ``None``)
-    counts as not answered, so a failed shadow judge can only lower the family evidence.
+    counts as not answered, so a failed shadow judge can only lower the family evidence.  An
+    advisor who pressured the learner or answered in a handful of words (R1-Q iteration 3:
+    ``pressured`` / ``thin``) gets WEAK whatever else was done.
     """
     if evidence.ask_kind is None:
         return Level.WEAK
@@ -1091,6 +1165,8 @@ def grade(evidence: CommitmentEvidence) -> Level:
         result = Level.STRONG
     if evidence.ask_kind is AskKind.CALL and result > Level.MEDIUM:
         result = Level.MEDIUM
+    if evidence.pressured or evidence.thin:
+        result = Level.WEAK
     return result
 
 

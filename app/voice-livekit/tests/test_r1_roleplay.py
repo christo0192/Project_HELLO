@@ -3412,8 +3412,34 @@ class TimeCueIsTheLearnersOwnTests(unittest.TestCase):
 
     def test_the_brief_says_the_time_is_the_learners(self):
         s, plan = self.cue_session("Okay, I see.")
-        self.assertIn("YOU only have a couple of minutes", plan.intent.brief)
+        self.assertIn("YOU", plan.intent.brief)
         self.assertIn("not theirs", plan.intent.brief)
+
+    def test_the_cue_is_worded_three_ways_one_per_attempt(self):
+        """R1-Q iteration 3: "before my own next call" came back verbatim in 8 of 20 calls."""
+        from r1_scheduler import SPEC_BY_ID, TIME_CUE_BRIEF_ALTERNATIVES
+
+        briefs = {SPEC_BY_ID[TIME_CUE].brief, *TIME_CUE_BRIEF_ALTERNATIVES}
+        self.assertEqual(len(briefs), 3)
+        seen = set()
+        for seed in ("cue", "cue-2", "cue-3", "cue-4", "cue-5", "cue-6", "cue-7", "cue-8"):
+            s = Session(engine(seed=seed), ack="Okay, I see.")
+            r = 20.0
+            for text in cooperative_script():
+                plan = s.eng.plan_turn(text, r, turn_index=1, candidate_seconds=20)
+                if plan.mode is TurnMode.SAY_ONLY:
+                    spoken = s.eng.compose_speech(plan).text
+                elif plan.mode is TurnMode.INTENT:
+                    spoken = s.eng.compose_speech(plan, s.ack).text
+                else:
+                    spoken = s.eng.sanitize_reply(plan, s.reply).text
+                s.eng.record_spoken(plan, spoken, r_sec=r)
+                r += 50
+                if plan.move_id == TIME_CUE:
+                    seen.add(plan.intent.brief)
+                    break
+        self.assertGreaterEqual(len(seen), 2)
+        self.assertLessEqual(seen, briefs)
 
     def test_a_reversed_cue_is_dropped_and_the_scripted_cue_follows(self):
         s, plan = self.cue_session("Right, you mentioned you only have a couple of minutes.")
@@ -3718,6 +3744,293 @@ class IterationTwoEngineTests(unittest.TestCase):
         plan = s.say(walk[2], 97)
         self.assertIn("digging further into", plan.reminder)
         self.assertNotIn("first real question about", plan.reminder)
+
+
+GREETING = (
+    "Hi Ananya, this is Rohan from Interview Kickstart. You filled in a form about our Data Science "
+    "course, so I thought I'd give you a quick call. Is now an okay time to talk for a few minutes?"
+)
+
+
+class IterationThreeEngineTests(unittest.TestCase):
+    """R1-Q iteration 3: the engine side of the third live sweep's defects (D1 to D11)."""
+
+    FAREWELL = "Alright, thanks so much for your time today. Bye for now!"
+
+    def ready(self, seed="iter3"):
+        session, r = run_cooperative(50.0, eng=engine(seed=seed))
+        session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+        return session, r
+
+    # --- D11: the greeting is no ask
+    def test_the_first_advisor_turn_is_a_greeting_not_an_ask(self):
+        s = Session(engine(resolve_persona("p2_recent_grad", variant="v1")))
+        plan = s.say(GREETING, 10.2)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertNotIn("ask_before_close_window", plan.reasons)
+        self.assertEqual(s.eng.admin_log()["commitment"]["asks"], [])
+        self.assertEqual(s.eng.negotiation.voicings, {})
+
+    def test_a_proposal_in_the_very_first_turn_is_a_greeting_a_later_one_is_an_ask(self):
+        first = Session(engine())
+        plan = first.say("Hi, shall we set up a call tomorrow at 6 pm to talk it over?", 12)
+        self.assertNotIn("ask_before_close_window", plan.reasons)
+        later = Session(engine())
+        later.say(OPENER, 12)
+        plan = later.say("Shall we set up a call tomorrow at 6 pm to talk it over?", 100)
+        self.assertIn("ask_before_close_window", plan.reasons)
+
+    # --- D1: the slot of the MEDIUM line is the advisor's proposed call time
+    def test_a_few_days_is_not_today(self):
+        session, r = self.ready()
+        plan = session.say(
+            "Will do, I'll send those over today. So what do you think, should we pencil in a "
+            "quick call in a few days once you've reviewed everything and talked it over at home?",
+            r,
+        )
+        self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+        self.assertNotIn("today", plan.scripted_text)
+        self.assertEqual(session.eng.negotiation.last_slot.day, "a few days")
+        # (the F4 pair was just voiced, so the vague slot is booked without a day)
+        self.assertRegex(plan.scripted_text, r"in a few days|check with my husband first")
+
+    def test_the_day_after_tomorrow_is_booked_as_such(self):
+        session, r = self.ready()
+        plan = session.say(
+            "Of course, take your time. I'll call you the day after tomorrow at this same time. "
+            "Sound good?",
+            r,
+        )
+        self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+        self.assertIn("the day after tomorrow", plan.scripted_text)
+        self.assertNotRegex(plan.scripted_text, r"(?<!after )tomorrow")
+
+    def test_a_slot_the_learner_refused_is_never_booked(self):
+        for refusal in ("Tomorrow evening's tricky for me.", "My evenings are unpredictable."):
+            with self.subTest(refusal=refusal):
+                session, r = self.ready()
+                session.eng.negotiation.note_learner_text(refusal, session.eng.turn)
+                plan = session.say("How about I call you tomorrow evening, say around seven?", r)
+                self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+                self.assertTrue(session.eng.negotiation.chosen_slot.deferred)
+                self.assertNotRegex(plan.scripted_text, r"tomorrow|evening|\d")
+
+    def test_a_firm_decline_is_answered_with_the_stall_not_with_a_booking(self):
+        """p1 pushy: "Tomorrow evening's tricky, I'd rather reach out" and, two turns on, a booking."""
+        session, r = self.ready()
+        session.eng.negotiation.note_learner_text("I'd rather reach out myself.", session.eng.turn)
+        plan = session.say(CALL_ASK, r)
+        self.assertIn("call_declined", plan.reasons)
+        self.assertNotEqual(plan.commitment_level, Level.MEDIUM)
+        self.assertNotRegex(plan.scripted_text or session.spoken[-1], r"(?i)let's book a call")
+
+    def test_a_declined_proposal_is_not_replayed_at_the_farewell(self):
+        s = Session(engine(seed="firm"))
+        script = cooperative_script()
+        script.insert(3, CALL_ASK)
+        r = 20.0
+        for index, text in enumerate(script):
+            if s.eng.scheduler.commit_permitted(r):
+                break
+            if index == 4:
+                s.ack = s.reply = "I'd rather reach out myself once I've talked to him."
+                s.say(text, r)
+                s.ack, s.reply = "Okay, I see.", "Just exploring options."
+            else:
+                s.say(text, r)
+            r += 45
+        plan = s.say(self.FAREWELL, r)
+        self.assertNotIn("pending_ask_at_farewell", plan.reasons)
+        self.assertEqual(plan.commitment_level, Level.WEAK)
+
+    def test_an_enrolment_ask_graded_medium_does_not_invent_a_day(self):
+        session, r = run_cooperative(50.0, eng=engine(seed="enrol"))
+        # Three of the four families answered: a MEDIUM, not a STRONG.
+        session.eng.apply_judge({"family_handled_quality": {"F1": 1, "F2": 1, "F3": 1}}, session.eng.turn)
+        plan = session.say("Shall I go ahead and reserve your seat in the next cohort?", r)
+        self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
+        self.assertNotRegex(plan.scripted_text, r"Thursday|\d")
+        self.assertTrue(session.eng.negotiation.chosen_slot.deferred)
+
+    def test_an_advisor_who_invented_an_offer_has_not_earned_a_call(self):
+        """All four pushy advisors of the live sweep invented $2,000 to $4,800 off."""
+        session, r = self.ready()
+        session.eng.tracker.invented_offer = True
+        plan = session.say(CALL_ASK, r)
+        self.assertIn("advisor_pressured", plan.reasons)
+        self.assertIn("ask_in_window:grade_weak", plan.reasons)
+        self.assertNotEqual(plan.commitment_level, Level.MEDIUM)
+
+    def test_an_advisor_who_answers_in_a_handful_of_words_has_not_earned_a_call(self):
+        from r1_commitment import AskKind
+
+        s = Session(engine(seed="terse"))
+        r = 20.0
+        for text in ("Hello.", "Okay.", "Right.", "Mm-hmm.", "Sure.", "Go on.", "I see."):
+            s.say(text, r)
+            r += 5
+        self.assertTrue(s.eng._evidence(AskKind.CALL).thin)
+        short = Session(engine(seed="short"))
+        for text in ("Hello.", "Okay.", "Right."):
+            short.say(text, r)
+        self.assertFalse(short.eng._evidence(AskKind.CALL).thin)  # fewer than six turns
+        thorough, _r = self.ready()
+        self.assertFalse(thorough.eng._evidence(AskKind.CALL).thin)
+
+    # --- D2: the stall reason follows the learner's priority
+    def test_no_money_stall_after_the_learner_called_the_cost_the_lesser_worry(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.ack = s.reply = "My worry is more about time than money, honestly."
+        s.say(PITCH, 60)
+        s.ack, s.reply = "Okay, I see.", "Just exploring options."
+        ids = [s.say(ASK, 100 + 25 * i).negotiation_id for i in range(4)]
+        self.assertNotIn("N-MONEY", ids)
+        self.assertEqual(s.eng.negotiation.voicings.get("money", 0), 0)
+
+    def test_no_money_stall_once_the_price_met_the_ask(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PRICE_ONLY, 60)
+        s.say("Fine, let's make it $6,000 for you.", 100)
+        ids = [s.say(ASK, 140 + 25 * i).negotiation_id for i in range(3)]
+        self.assertNotIn("N-MONEY", ids)
+
+    # --- D5: only a lower price is news
+    def test_a_worse_option_is_no_news_and_is_not_a_pleasant_surprise(self):
+        from r1_prompts import PRICE_UNCHANGED_NOTE
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PRICE_ONLY, 60)
+        s.say("I can do $7,500 with the upfront discount.", 100)
+        self.assertTrue(s.plans[-1].guard_ctx.fresh_price)
+        self.assertEqual(s.eng._new_offer_usd, 7500)
+        s.say("Does that sound good to you?", 140)
+        worse = s.say("On the instalment plan the discount is $1000, so it is $8,000.", 180)
+        self.assertFalse(worse.guard_ctx.fresh_price)
+        self.assertIsNone(s.eng._new_offer_usd)
+        self.assertEqual(s.eng.negotiation.best_offer_usd, 7500)
+        self.assertEqual(s.eng._price_notes, [PRICE_UNCHANGED_NOTE.format(amount="$7,500")])
+
+    def test_the_guard_drops_a_bit_better_on_an_unchanged_price_through_the_engine(self):
+        said = "That's a bit better, but it's still more than I planned for."
+        s = Session(engine(), ack=said, reply=said)
+        s.say(OPENER, 20)
+        s.say("I can do $7,500 with the upfront discount.", 100)
+        s.say("That is the lowest I can offer right now.", 140)
+        self.assertNotIn("That's a bit better", s.spoken[-1])
+        self.assertEqual(s.plans[-1].guard_ctx.fresh_price, False)
+
+    # --- D6: scripted tails
+    def test_the_email_yes_asks_nothing_when_the_offer_listed_the_contents(self):
+        from r1_negotiation import N_EMAIL, N_EMAIL_YES
+
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(
+            "I'll email you the curriculum, the pricing and the payment plan options today.", 60
+        )
+        self.assertEqual(plan.negotiation_id, N_EMAIL_YES)
+        self.assertNotIn("?", s.spoken[-1])
+        bare = Session(engine())
+        bare.say(OPENER, 20)
+        plan = bare.say("Would it help if I sent you some info you could share with him?", 60)
+        self.assertEqual(plan.negotiation_id, N_EMAIL)
+
+    def test_a_model_that_said_yes_to_the_email_gets_no_second_yes(self):
+        said = "Sure, go ahead and send the email, that works for me."
+        s = Session(engine(), ack=said)
+        s.say(OPENER, 20)
+        s.say("I'll send the details to your email today, would that work?", 60)
+        self.assertEqual(s.spoken[-1], said)
+
+    def test_the_weak_line_does_not_ask_for_an_email_that_was_just_promised(self):
+        s = Session(engine(seed="promised"))
+        script = cooperative_script()
+        script.insert(3, "I'll send you the details by email after this call.")
+        r = 20.0
+        for text in script:
+            if s.eng.scheduler.commit_permitted(r):
+                break
+            s.say(text, r)
+            r += 45
+        plan = s.say(self.FAREWELL, r)
+        self.assertIn("close_attempt_stall", plan.reasons)
+        self.assertEqual(plan.scripted_text, commitment_line(Level.WEAK, "husband", emailed=True))
+        self.assertNotIn("email me", plan.scripted_text.lower())
+        self.assertTrue(s.eng.commitment_resolved)
+        self.assertEqual(s.eng.commitment_level, Level.WEAK)
+        self.assertTrue(s.eng.scheduler.is_delivered(COMMIT_STALL))
+
+    def test_the_tail_never_asks_a_second_question_when_the_model_asked_one(self):
+        from dataclasses import replace
+
+        from r1_roleplay import LearnerIntent
+
+        eng = engine()
+        plan = eng.plan_turn(OPENER, 20)
+        both = (
+            "You can pay in parts. How would that work?",
+            "I would like to pay in parts.",
+        )
+        intent = LearnerIntent(
+            "objection", "brief", (), ((r"\bpay\b",),), fallback=both[0], fallbacks=both
+        )
+        fake = replace(plan, intent=intent, move_id="X")
+        self.assertEqual(eng.intent_tail(fake, "What would I end up with?"), both[1])
+        # No statement variant: the tail loses its question if it still proves the move.
+        only = (both[0],)
+        intent = LearnerIntent(
+            "objection", "brief", (), ((r"\bpay\b",),), fallback=only[0], fallbacks=only
+        )
+        fake = replace(plan, intent=intent, move_id="X")
+        self.assertEqual(
+            eng.intent_tail(fake, "What would I end up with?"), "You can pay in parts."
+        )
+        # Nothing was asked: the variant is spoken as written.
+        self.assertEqual(eng.intent_tail(fake, "Okay, I see."), only[0])
+
+    # --- D3: one deferral per topic of dig
+    def test_a_run_of_digs_on_one_topic_holds_back_only_the_first_owed_move(self):
+        dig = PITCH + " Is he more of a sounding board, or does he need to be convinced?"
+        s = Session(engine())
+        s.say(OPENER, 20)
+        held = s.say(dig, 60)
+        self.assertIn("owed_deferred_for_dig", held.reasons)
+        first = s.say(dig, 100)  # the same move is held once, never twice
+        self.assertEqual(first.move_id, F3_PRIMARY)
+        self.assertNotIn("owed_deferred_for_dig", first.reasons)
+        # Iteration 3: the next owed move is not held for a dig of the SAME topic again.
+        second = s.say(dig, 140)
+        self.assertEqual(second.move_id, F3_PUSH)
+        self.assertNotIn("owed_deferred_for_dig", second.reasons)
+
+    # --- D9: no second goodbye to a silent advisor
+    def test_a_silent_advisor_after_a_goodbye_gets_a_question_not_another_goodbye(self):
+        from r1_prompts import HOLLOW_NOTE
+
+        bye = "I'll reach out once I've talked it over at home."
+        s = Session(engine(), ack=bye, reply=bye)
+        s.say(OPENER, 20)
+        self.assertEqual(s.spoken[-1], bye)  # a first goodbye is allowed
+        first = s.say("Sure.", 60)
+        self.assertEqual(first.mode, TurnMode.LLM_REPLY)
+        self.assertTrue(first.guard_ctx.hollow)  # the learner's last reply was a goodbye
+        self.assertIn(HOLLOW_NOTE, first.reminder)
+        self.assertIn(s.spoken[-1], NEUTRAL_ACKS)  # and the model's second goodbye was dropped
+        busy = s.say("So what else would help you decide? Tell me what is on your mind.", 180)
+        self.assertNotIn(HOLLOW_NOTE, busy.reminder)
+        self.assertFalse(busy.guard_ctx.hollow)
+
+    # --- D10: no "before I go" from the learner
+    def test_before_i_go_is_not_said_by_the_learner_through_the_engine(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.reply = "Before I go, what would I actually build in the course?"
+        s.say(NEUTRAL, 60)
+        self.assertNotIn("before I go", s.spoken[-1].lower())
+        self.assertIn("What would I actually build", s.spoken[-1])
 
 
 if __name__ == "__main__":

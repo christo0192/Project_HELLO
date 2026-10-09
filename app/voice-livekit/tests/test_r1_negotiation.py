@@ -1095,7 +1095,11 @@ class SpecContentTests(unittest.TestCase):
     def test_every_variant_passes_the_learner_guard_for_every_persona(self):
         seen = 0
         for rendered, spec, text in self.texts():
-            context = GuardContext(phase="roleplay", persona=rendered, mode="reply")
+            # The counter variants ("that is closer to what I hoped") are spoken on the turn the
+            # advisor lowered the price, so the price is fresh (R1-Q iteration 3).
+            context = GuardContext(
+                phase="roleplay", persona=rendered, mode="reply", fresh_price=True
+            )
             for sentence in split_sentences(text):
                 hits = check_sentence(sentence, context)
                 self.assertEqual(hits, [], f"{rendered.id}/{spec.id}: {sentence!r} -> {hits}")
@@ -1501,6 +1505,202 @@ class IterationTwoNegotiationTests(unittest.TestCase):
         n = neg.Negotiation("husband")
         json.dumps(n.log())
         self.assertIsNone(n.log()["slot_deferred"])
+
+
+class IterationThreeNegotiationTests(unittest.TestCase):
+    """R1-Q iteration 3 (the third live sweep): slots, declined calls, cost priorities, e-mail."""
+
+    # --- D1: only the advisor's proposed call time is a slot
+    def test_a_time_the_advisor_sends_something_is_not_a_call_time(self):
+        for text in (
+            "Will do, I'll send those over today. So what do you think, should we pencil in a "
+            "quick call in a few days once you've reviewed everything and talked it over at home?",
+            "Perfect. I'll send it today. Since you two will be reviewing together, would it help "
+            "to pencil in a short call later this week, maybe with your husband on it?",
+            "I'll send you the summary today, you talk it over, and we pencil in a call with your "
+            "partner for early next week.",
+        ):
+            with self.subTest(text=text):
+                callback = neg.detect_callback(text)
+                self.assertIsNotNone(callback)
+                self.assertNotEqual(callback.slot.day, "today")
+                self.assertTrue(callback.slot.vague, callback.slot)
+
+    def test_loose_days_are_normalised(self):
+        for text, day in (
+            ("a quick call in a few days", "a few days"),
+            ("a call later this week", "this week"),
+            ("a call early next week", "next week"),
+            ("a call in a couple of days", "a few days"),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(neg.parse_slot(text).day, day)
+
+    def test_the_day_after_tomorrow_is_not_tomorrow(self):
+        slot = neg.parse_slot("I'll call you the day after tomorrow at this same time.")
+        self.assertEqual(slot.day, neg.DAY_AFTER_TOMORROW)
+        choice = neg.choose_slot(slot)
+        self.assertEqual(choice.phrase, "the day after tomorrow at 7 PM")
+        self.assertEqual(neg.parse_slot("I'll call you tomorrow.").day, "tomorrow")
+
+    def test_a_call_time_before_a_delivery_word_still_counts(self):
+        slot = neg.parse_slot("I'll call you tomorrow evening and send the details after.")
+        self.assertEqual((slot.day, slot.part), ("tomorrow", "evening"))
+        self.assertIsNone(neg.parse_slot("I'll email you the curriculum tonight."))
+        self.assertEqual(
+            neg.parse_slot("I'll send you the details today, and call you on Friday at 6 pm.").day,
+            "friday",
+        )
+
+    def test_loose_days_make_loose_medium_slots(self):
+        self.assertEqual(neg.choose_slot(neg.parse_slot("later this week")).phrase,
+                         "later this week at 7 PM")
+        self.assertEqual(neg.choose_slot(neg.parse_slot("in a few days")).phrase,
+                         "in a few days at 7 PM")
+
+    # --- D1: a declined call, a refused slot, a stale slot
+    def test_firm_declines_of_a_call_hold_and_pauses_do_not(self):
+        for text in (
+            "Tomorrow evening's tricky for me, I'd rather reach out when I've made up my mind.",
+            "I'd rather reach out myself once we've had a chance to go through it.",
+            "I can't really pin down a time. I'll reach out once I've talked, rather than you calling me.",
+            "I'd rather you didn't. If I decide anything, I'll reach out myself.",
+            "I'd rather not have a check-in hanging over me.",
+            "No need to call, I'll get back to you.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(neg.declines_call(text), text)
+        for text in (
+            "I'm not going to lock in a day right now, though.",
+            "I'd rather not lock in a time yet.",
+            "I'll reach out if I decide to move forward.",
+            "I'll let you know either way.",
+            "Let me talk to my father first and get back to you.",
+            "Evenings usually work, but I'd rather think it over.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(neg.declines_call(text), text)
+
+    def test_the_state_remembers_a_firm_decline_for_the_rest_of_the_call(self):
+        n = neg.Negotiation("husband")
+        self.assertFalse(n.call_declined())
+        n.note_learner_text("I'd rather not lock in a time yet.", 5)
+        self.assertFalse(n.call_declined())
+        n.note_learner_text("I'd rather reach out myself.", 6)
+        self.assertTrue(n.call_declined())
+        self.assertEqual(n.log()["call_declined_turn"], 6)
+        n.note_learner_text("Sounds good.", 30)
+        self.assertTrue(n.call_declined())
+
+    def test_a_day_the_learner_called_difficult_is_never_booked(self):
+        n = neg.Negotiation("husband")
+        n.observe(3, "How about I call you tomorrow evening, say around seven?")
+        self.assertEqual(n.slot_choice(4).phrase, "tomorrow in the evening")
+        n.note_learner_text("Tomorrow evening's tricky for me.", 4)
+        choice = n.slot_choice(5)
+        self.assertTrue(choice.deferred)
+        self.assertEqual(n.log()["refused_slots"], 1)
+        n.observe(6, "No problem. Would Friday at 6 pm work?")
+        later = n.slot_choice(7)
+        self.assertFalse(later.deferred)
+        self.assertEqual(later.phrase, "on Friday at 6 PM")
+
+    def test_evenings_called_unpredictable_are_not_offered_either(self):
+        n = neg.Negotiation("partner")
+        n.note_learner_text("My evenings are unpredictable with lab work.", 3)
+        self.assertTrue(n.slot_choice(4).deferred)  # not even the legacy 7 PM default
+
+    def test_a_proposal_older_than_the_recent_turns_is_no_proposal(self):
+        n = neg.Negotiation("husband")
+        n.observe(3, "Would Thursday at 6 pm work for a call?")
+        self.assertEqual(n.slot_choice(4).phrase, "on Thursday at 6 PM")
+        stale = n.slot_choice(3 + neg.SLOT_RECENT_TURNS + 1)
+        self.assertEqual(stale.phrase, DEFAULT_SLOT)
+
+    def test_an_enrolment_ask_without_a_slot_is_booked_without_one(self):
+        n = neg.Negotiation("husband")
+        self.assertEqual(n.slot_choice(5).phrase, DEFAULT_SLOT)  # a call ask: the learner picks
+        choice = n.slot_choice(5, picks_own=False)
+        self.assertTrue(choice.deferred)
+        line = commitment_line(Level.MEDIUM, "husband", choice.phrase, deferred=choice.deferred)
+        self.assertNotRegex(line, r"Thursday|\d")
+
+    # --- D2: the stall reason follows the learner's priority
+    def test_cost_called_the_lesser_worry_is_remembered(self):
+        for text in (
+            "My worry is more about time than money.",
+            "That's really what worries me more than the cost.",
+            "It's not really the money.",
+            "That part sits easier with me now.",
+            "The cost isn't the main issue for me.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(neg.says_cost_is_secondary(text), text)
+        for text in (
+            "The cost is still my main worry.",
+            "It's a lot of money to commit.",
+            "I worry about the time, and the cost too.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(neg.says_cost_is_secondary(text), text)
+
+    def test_money_is_settled_when_the_ask_was_met_or_cost_was_called_secondary(self):
+        n = neg.Negotiation("husband")
+        self.assertFalse(n.money_is_settled())
+        n.note_learner_text("My worry is more about time than money.", 4)
+        self.assertTrue(n.money_is_settled())
+        met = neg.Negotiation("husband")
+        met.observe(2, "I can do $6,500 for you.", anchor_turn=1)
+        self.assertTrue(met.money_is_settled())
+
+    # --- D5: only a lower price is news
+    def test_a_price_that_is_not_lower_is_no_news(self):
+        n = neg.Negotiation("husband")
+        first = n.observe(2, "I can do $7,500 with the upfront discount.", anchor_turn=1)
+        self.assertEqual(first.lower_offer_usd, 7500)
+        again = n.observe(3, "Like I said, $7,500 is the lowest I can offer.", anchor_turn=1)
+        self.assertIsNone(again.lower_offer_usd)
+        worse = n.observe(4, "On instalments the discount is $1000, so $8,000 a month.", anchor_turn=1)
+        self.assertIsNone(worse.lower_offer_usd)
+        self.assertEqual(n.best_offer_usd, 7500)
+        better = n.observe(5, "Okay, I can go to $7,200.", anchor_turn=1)
+        self.assertEqual(better.lower_offer_usd, 7200)
+
+    # --- D4: the anchor below the ask is not "in line with what you heard"
+    def test_the_anchor_below_seven_thousand_says_below_not_in_line(self):
+        below = neg.anchor_after_offer(4500)
+        self.assertIn("below the $7,000", below.brief)
+        self.assertNotIn("in line with what you heard", below.brief)
+        for variant in below.variants:
+            self.assertNotIn("in line", variant)
+        at = neg.anchor_after_offer(7000)
+        self.assertIn("in line with what you heard", at.brief)
+
+    # --- D6: the e-mail yes asks nothing when the contents were listed
+    def test_an_email_offer_that_lists_its_contents_is_answered_with_a_yes_only(self):
+        listed = (
+            "Sure, I'll send the full curriculum breakdown, pricing, discount options and "
+            "details on the mentorship. Everything you'd need to review together."
+        )
+        bare = "Would it help if I sent you some info you could share with him?"
+        self.assertTrue(neg.lists_email_contents(listed))
+        self.assertFalse(neg.lists_email_contents(bare))
+        n = neg.Negotiation("husband")
+        seen = n.observe(4, "I'll email you the curriculum, the pricing and the payment plan options.")
+        self.assertTrue(seen.email_offer and seen.email_listed)
+        self.assertFalse(n.observe(5, bare).email_listed)
+        yes = neg.SPEC_BY_ID[neg.N_EMAIL_YES]
+        for text in yes.variants:
+            self.assertNotIn("?", text)
+
+    def test_the_email_yes_is_proven_by_the_yes_alone(self):
+        spec = neg.SPEC_BY_ID[neg.N_EMAIL]
+        markers = neg.filled_markers(spec.markers, "husband")
+        from r1_scheduler import markers_match as matches
+
+        self.assertTrue(matches(markers, "Sure, go ahead and send the email, that works for me."))
+        self.assertTrue(matches(markers, "Sure, you can email me. What will the email include?"))
+        self.assertFalse(matches(markers, "I'd rather think it over."))
 
 
 if __name__ == "__main__":

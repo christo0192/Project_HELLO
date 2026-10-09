@@ -108,25 +108,45 @@ _TIC_OPENERS = frozenset(
 # unprompted dump, when the simulator did not tag the question as a probe (a permissive check:
 # the simulator's tag stays the ground truth for everything else).
 _PROBE_VOCAB = {
+    # Iteration 3 (H3): the vocabulary missed ordinary probes of the live sweep ("what's prompting
+    # you to look into data science right now?", "What got you interested?", "And why data
+    # science?", "What made it not stick last time?", "Does your employer cover part of it?",
+    # "Is he open to it?"), which made the reveals that answered them look like dumps and hid the
+    # H3 digs of the terse level.
     "H1": re.compile(
-        r"\b(?:why (?:now|this|are you|did you|do you)|what (?:made|prompted|brought|changed|"
-        r"is driving|'s driving)|timeline|timeframe|deadline|trigger|urgency|how soon|"
-        r"when (?:do|are|would) you (?:want|hope|need|plan)|looking (?:now|into)|interested in)\b",
+        r"\b(?:why (?:now|this|that|are you|did you|do you|data science)|what (?:made (?:you|this|"
+        r"that|now)|prompted|brought|changed|got you|is driving|'s driving|is prompting|"
+        r"'s prompting|is behind|'s behind)|"
+        r"prompt\w*|motivat\w+|interested|got you|brought you|bring you|timeline|timeframe|"
+        r"deadline|trigger|urgency|how soon|"
+        r"when (?:do|are|would) you (?:want|hope|need|plan)|looking (?:now|into)|look into|"
+        r"start(?:ed)? looking|interested in)\b",
         re.IGNORECASE,
     ),
     "H2": re.compile(
-        r"\b(?:concerns?|worr\w+|hesitat\w+|holding you back|stopping you|tried|struggl\w+|"
-        r"challenge\w*|obstacle|didn'?t work|went wrong|so far|biggest|afraid|nervous|doubts?|"
-        r"hurdle|blocker|friction|previous|before)\b",
+        r"\b(?:concerns?|worr\w+|hesitat\w+|holding you back|held you back|stopping you|stopped you|"
+        r"tried|struggl\w+|challenge\w*|obstacle|didn'?t work|not stick|didn'?t stick|stick|"
+        r"went wrong|so far|biggest|afraid|nervous|doubts?|hurdle|blocker|friction|previous|"
+        r"before|keep you from|missing|tripped)\b",
         re.IGNORECASE,
     ),
     "H3": re.compile(
         r"\b(?:hours?|schedule|week|budget|afford\w*|money|pay\w*|instal\w+|husband|wife|partner|"
-        r"spouse|family|kids|parents|decid\w+|anyone else|someone else|time|commitments?|"
-        r"workload|finances?)\b",
+        r"spouse|family|kids|parents|father|mother|decid\w+|anyone else|someone else|time|"
+        r"commitments?|workload|finances?|help (?:with )?decisions?|cover\w* (?:part|some|any)|"
+        r"employer|sponsor\w*|open to (?:it|this|that)|weigh in)\b",
         re.IGNORECASE,
     ),
 }
+# A question about WHEN to talk again is about the calendar, not about the learner's time or money
+# ("when could you two talk?", "is there a good time later this week to reconnect?"); it is no dig
+# at the H3 need (the live sweep counted two such questions as H3 digs).
+_SCHEDULING_QUESTION = re.compile(
+    r"\b(?:reconnect|call (?:you )?back|follow(?:ing)? up|check(?:ing)? in|touch base|"
+    r"set (?:up )?a (?:time|call)|schedule a|a good time|good time to|book a|when (?:could|can|"
+    r"would|do) (?:you|we|i)[^?]{0,20}\b(?:talk|chat|speak|meet|connect))\b",
+    re.IGNORECASE,
+)
 # M9 misfire shapes added in iteration 1 (the live misfires of the sweeps).
 _TIME_CUE_REVERSED = re.compile(
     r"\byou(?:'ve| have)? (?:just |only )?(?:mentioned|said|told me)\b[^.?!]{0,40}"
@@ -341,9 +361,12 @@ def fact_error_metrics(texts: Sequence[str], advisor_texts: Sequence[str] = ()) 
     errors: list[dict[str, Any]] = []
     for index, text in enumerate(texts):
         codes: list[str] = []
-        if claims_guarantee(text):
+        # A question asserts nothing (R1-Q iteration 3, H1): "is there any kind of guarantee behind
+        # that?" was counted as the learner claiming a guarantee and failed a call as a hard fail.
+        statements = [s for s in split_sentences(text) if not _is_question(s)]
+        if claims_guarantee(" ".join(statements)):
             codes.append("guarantee_claim")
-        for sentence in split_sentences(text):
+        for sentence in statements:
             folded = sentence.lower()
             for match in re.finditer(r"\b(\d{1,2})[\s-]*months?\b", folded):
                 if int(match.group(1)) != DURATION_MONTHS and re.search(
@@ -357,6 +380,18 @@ def fact_error_metrics(texts: Sequence[str], advisor_texts: Sequence[str] = ()) 
         if codes:
             errors.append({"reply": index, "codes": sorted(set(codes))})
     return {"fact_error_count": len(errors), "fact_errors": errors}
+
+
+_QUESTION_START = re.compile(
+    r"^\W*(?:(?:and|so|but|also|okay|well)\W+)*(?:is|are|was|were|do|does|did|can|could|will|would|"
+    r"should|has|have|what|why|how|where|when|who|which)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_question(sentence: str) -> bool:
+    """A sentence that asks: it ends in "?" or opens with an interrogative word."""
+    return "?" in sentence or _QUESTION_START.match(sentence) is not None
 
 
 def price_figures(text: object) -> list[int]:
@@ -549,12 +584,16 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
     disclosed: list[str] = []
     deep_on_first_probe: list[str] = []
     for topic, marks in touches.items():
-        if not any(intent == "probe" for _i, intent in marks):
+        # Iteration 3 (H3): the FIRST question the advisor really asks about a topic is the probe,
+        # whatever the simulator tagged it ("followup/H2" for "what do you think held you back?"
+        # was no probe to the old rule, so the next touch counted as the dig of a need that had
+        # only been probed once).  Any later touch is a dig.
+        if not marks:
             continue
         probed.append(topic)
-        first_probe = next(i for i, intent in marks if intent == "probe")
+        first_probe = marks[0][0]
         later = [i for i, _intent in marks if i > first_probe]
-        if later or sum(1 for _i, intent in marks if intent == "probe") >= 2:
+        if later:
             dug.append(topic)
             window_end = max(i for i, _intent in marks) + DEEP_WINDOW_TURNS
             if any(topic in deep_by_turn[i] for i in range(first_probe, min(window_end + 1, len(spoken)))):
@@ -613,7 +652,11 @@ def dug_topics(advisor: Mapping[str, Any]) -> list[str]:
     found = [
         topic
         for topic in H_TOPICS
-        if any(_PROBE_VOCAB[topic].search(question) for question in questions)
+        if any(
+            _PROBE_VOCAB[topic].search(question)
+            and not (topic == "H3" and _SCHEDULING_QUESTION.search(question))
+            for question in questions
+        )
     ]
     if (
         str(advisor.get("intent") or "") == "followup"
@@ -718,6 +761,26 @@ def _spoke_commitment(ex: Mapping[str, Any]) -> bool:
     return bool(plan.get("delivered_commitment"))
 
 
+_GRATITUDE_FOR_PRICE = re.compile(
+    r"\b(?:thank(?:s| you)|appreciate|grateful)\b[^.?!]{0,50}\b(?:discount|reduc\w+|lower price|"
+    r"better price|better deal|the deal|the price|the offer)\b",
+    re.IGNORECASE,
+)
+
+
+def _cut_nearby(exchanges: Sequence[Mapping[str, Any]], index: int) -> bool:
+    """The advisor's turn at ``index`` or the one before put a price or a discount on the table.
+
+    The words decide, not the simulator's intent tag.
+    """
+    for i in (index, index - 1):
+        if i < 0:
+            continue
+        if _DISCOUNT_CUE.search(str(_advisor(exchanges[i]).get("text") or "")):
+            return True
+    return False
+
+
 def misfire_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     """M9: lines the learner said that the preceding advisor turn did not warrant.
 
@@ -754,11 +817,17 @@ def misfire_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             found.append({"exchange": index + 1, "kind": "anchor_taken_as_offer"})
         if _ADVISOR_HEDGE.search(advisor_text) and not figures and _GRATITUDE_FOR_GRANT.search(text):
             found.append({"exchange": index + 1, "kind": "gratitude_after_hedge"})
+        # Thanks (or a "nice surprise") for a price cut nobody made.  A cut in this advisor turn or
+        # the one before is on the OFFER LEDGER (R1-Q iteration 3, H2: the judge flagged 12 thanks
+        # for cuts the advisor really made); the judge's version of this kind needs this rule to
+        # agree.
+        if _GRATITUDE_FOR_PRICE.search(text) and not _cut_nearby(exchanges, index):
+            found.append({"exchange": index + 1, "kind": "gratitude_unwarranted"})
         if committed_at is not None and index > committed_at and _QUESTION_OR_DOUBT.search(text):
             found.append({"exchange": index + 1, "kind": "reopened_after_commit"})
-        if _SURPRISE.search(text) and not (
-            intent in ("discount", "price") and _DISCOUNT_CUE.search(advisor_text)
-        ):
+        # H5: the price cut may sit in a turn the simulator tagged ``answer_objection`` (it was the
+        # $4,500 cut of a pushy advisor); the words of the turn decide, not the tag.
+        if _SURPRISE.search(text) and not _cut_nearby(exchanges, index):
             found.append({"exchange": index + 1, "kind": "unwarranted_surprise"})
         if _BEFORE_YOU_GO.search(text) and not (
             intent == "farewell" or _ADVISOR_FAREWELL.search(advisor_text)

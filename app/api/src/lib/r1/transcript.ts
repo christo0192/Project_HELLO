@@ -103,6 +103,11 @@ export const R1_NAME_MASK = '[CANDIDATE]';
  * masked by its fixed frame, which a barge-in can cut after "my". The MEDIUM line that books the
  * call without a slot ("Let me check with my husband first, and then let's book a call, so we can
  * decide.") already matches the two MEDIUM frames above.
+ *
+ * R1-Q iteration 3: once the advisor has already e-mailed the details, the WEAK line has a third
+ * wording ("Let me think about it. I'll read through the email and get back to you."): its second
+ * sentence is masked by the fixed frame "read through the email and get", which a barge-in can cut
+ * after "get".
  */
 const COMMITMENT_PATTERNS: readonly RegExp[] = [
   /send me the enrol+ment link/i,
@@ -111,6 +116,7 @@ const COMMITMENT_PATTERNS: readonly RegExp[] = [
   /\blet['’]?s book a call\b/i,
   /email me the details and i['’]?ll get back to you/i,
   /\bcall me back after i['’]?ve talked to my\b/i,
+  /\bread through the e-?mail and get\b/i,
 ];
 
 const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/;

@@ -89,6 +89,11 @@ from r1_personas import (
 )
 from r1_script import EXIT_CUE, LINES
 from r1_text import (
+    CLOSER,
+    CONCESSION_TAG,
+    CONCESSION_TAG_LEADING,
+    CONCESSION_TAG_TRAILING,
+    PHRASE_CONCESSION_TAG,
     canonical_amounts,
     TIC_HMM,
     TIC_HONESTLY,
@@ -118,11 +123,14 @@ from r1_world import INTERVIEWER_DEFLECTION
 
 FALLBACK_REPLY = "Sorry, what were you saying?"
 # The learner's fallback rotates (seeded by the attempt id) so a second blocked reply never
-# repeats the first one word for word.  The interviewer keeps ``FALLBACK_REPLY``.
+# repeats the first one word for word.  The interviewer keeps ``FALLBACK_REPLY``.  R1-Q iteration 3:
+# the learner never says it did not hear a clear question ("Sorry, what were you saying?" answered
+# "Is it live or recorded?" in the live sweep and the advisor had to repeat it), so its fallbacks
+# are the sound of a person thinking.
 FALLBACK_REPLIES = (
-    FALLBACK_REPLY,
-    "Sorry, could you say that again?",
-    "Sorry, I missed that. Could you repeat it?",
+    "Give me a second, I'm thinking that over.",
+    "That's something I need to think about for a moment.",
+    "Okay, let me think about that for a second.",
 )
 NO_FEEDBACK_LINE = LINES["L-NO-FEEDBACK"]
 CONTACT_REPLACEMENT = "You can use the email on my form."
@@ -139,8 +147,19 @@ STYLE_OPENER_WINDOW = 6
 # used this often in a call; a free reply asks nothing when one of the last QUESTION_DIET_WINDOW
 # replies already asked (the live sweep: 0.67 to 0.81 of the replies held a question, gate 0.60),
 # and a reply never asks two questions.
-PHRASE_QUOTA = {PHRASE_STRETCH: 1, PHRASE_TEMPLATE_Q: 1}
-QUESTION_DIET_WINDOW = 2
+PHRASE_QUOTA = {PHRASE_STRETCH: 1, PHRASE_TEMPLATE_Q: 1, PHRASE_CONCESSION_TAG: 1}
+# R1-Q iteration 3: the diet over-corrected (the question rate fell to 0.21-0.25 against a floor
+# of 0.25; 17 replies lost their only question), so a free reply may ask unless the PREVIOUS
+# reply did.
+QUESTION_DIET_WINDOW = 1
+# A question about the price asked before the advisor has put any price on the table is never
+# dropped.
+_PRICE_QUESTION = re.compile(
+    r"\b(?:how much|what(?:'s| is| would| will)? (?:the |it |that |this )?(?:\w+ )?(?:price|"
+    r"cost|fee|total)|what would (?:i|it|that) (?:actually )?(?:end up )?(?:cost|pay)|"
+    r"what (?:do|would) i (?:\w+ ){0,3}pay|(?:total|final) (?:cost|price|number|amount))\b",
+    re.IGNORECASE,
+)
 # A reply that has said this many words or fewer ("Okay.", "Right, I see.") still needs its
 # question.
 THIN_REPLY_WORDS = 4
@@ -159,14 +178,27 @@ _LEAD_INTERJECTION = re.compile(
 _INLINE_FILLER = re.compile(r",?\s*\b(?:you know|i mean)\b,?", re.IGNORECASE)
 # A sentence longer than this is left alone: the style rules are for spoken sentences.
 STYLE_MAX_CHARS = 600
-# "that's reassuring" -> "reassuring": only where dropping the demonstrative leaves a sentence.
-# Only an adjective or a verb may follow (R1-Q iteration 2): "That's the part I'd need to see" lost
-# its "That's" to a noun phrase ("The part I'd need ..."), and 79 replies in 19 calls opened with
-# such a fragment ("A real chunk of my week, so ...").
+# "that helps" -> "helps": only where dropping the demonstrative leaves a sentence.  Only a verb
+# may follow (R1-Q iteration 3): "That's reassuring" lost its "That's" and 41 replies in 17
+# calls opened with the fragment ("Reassuring, at least." twelve times in ten calls), so "That's"
+# before an evaluative adjective stays.  (Iteration 2 had narrowed it from noun phrases: "That's
+# the part I'd need to see" became "The part I'd need ...".)
 _LEAD_DEMONSTRATIVE = re.compile(
-    r"^that(?:'s| is)?\s+(?=(?:(?:really|so|very|pretty|quite)\s+)?(?:good|great|fair|true|"
-    r"helpful|reassuring|interesting|nice|useful|clear)\b|(?:helps|makes|sounds|gives|means|"
-    r"feels|seems|covers|explains|answers|eases|works)\b)",
+    r"^that\s+(?=(?:helps|makes|sounds|gives|means|feels|seems|covers|explains|answers|eases|"
+    r"works)\b)",
+    re.IGNORECASE,
+)
+# "Before I go, ..." / "One more thing before I go": the learner is not the one leaving (the
+# live sweep: "Before I go" in calls where nobody left).  The advisor's goodbye is answered with
+# "Oh wait, before you go ...", which is a different phrase and stays.
+_BEFORE_I_GO = re.compile(
+    r"^\W*(?:(?:and|so|but|oh|well|also)\b[,\s]*)*"
+    r"(?:(?:one|a) (?:more|last|quick) (?:thing|question)[,\s]+)?"
+    r"before (?:i|we) (?:go|hang up|wrap up|run|leave|get going)\b(?:,? though)?[,.:\s-]*",
+    re.IGNORECASE,
+)
+_INLINE_BEFORE_I_GO = re.compile(
+    r",?\s*\bbefore (?:i|we) (?:go|hang up|wrap up|run|leave|get going)\b,?(?: though)?",
     re.IGNORECASE,
 )
 # "I have to be honest, ..." and "I need to be honest with you: ..." are the "honestly" tic.
@@ -314,6 +346,58 @@ GRATITUDE_REPLACEMENT = "That would be good to know."
 # In place of "that matches what I'd heard" about a figure that is not the $7,000 anchor.
 ANCHOR_HEARD_REPLACEMENT = "I'd heard people got it for around $7,000."
 ANCHOR_HEARD_BELOW = "That's even below the $7,000 I'd heard people got it for."
+# In place of "that's a bit better" when the advisor put no lower price on the table (R1-Q
+# iteration 3: 11 replies in 10 calls called an unchanged or a worse offer better).
+PRICE_UNCHANGED_REPLACEMENT = "That's still more than I had planned for."
+# "That lines up with what I'd heard" / "in line with what I heard" / "that's what I heard": only
+# true of the $7,000 itself.  Said about any other price it contradicts the anchor the learner
+# raised.
+_HEARD_IN_LINE = re.compile(
+    r"\b(?:in line with|lines? up with|matches|consistent with|the same as|right (?:at|around)|"
+    r"about|close to|roughly|just|exactly)\s+(?:what|where)\s+i(?:'d| had| have)?\s+"
+    r"(?:heard|read)\b"
+    r"|\bthat'?s (?:what|about what|roughly what|exactly what|just what) i(?:'d| had| have)?\s+"
+    r"(?:heard|read)\b",
+    re.IGNORECASE,
+)
+# "That's a bit better" / "better than I expected" / "an improvement" / "closer to what I had in
+# mind" said about the price.  A sentence that is plainly about something else is not one.
+_BETTER_PRICE = re.compile(
+    r"\b(?:that|it|this)(?:'s| is| looks| sounds| seems| feels) "
+    r"(?:(?:definitely|certainly|already|actually|a bit|a little|a touch|slightly|much|way|"
+    r"so much|quite a bit|somewhat) )*(?:better|closer)\b"
+    r"|\b(?:more like it|an improvement)\b",
+    re.IGNORECASE,
+)
+# "a bit better than I expected" / "better than before" need a price word in the sentence: the
+# same words are "I'd like to understand it a bit better" and "better than watching videos".
+_BETTER_THAN = re.compile(
+    r"\b(?:(?:a bit|a little|a touch|slightly|much|way|so much|quite a bit|somewhat) "
+    r"(?:better|closer)(?: than| to (?:what|where)| price| number| offer)"
+    r"|better than (?:i|what i|before|the (?:first|last|full|original|list)|expected)"
+    r"|closer to (?:what|where) i)",
+    re.IGNORECASE,
+)
+_PRICE_WORD = re.compile(
+    r"\b(?:price|cost|number|offer|deal|figure|discount|pay|paying|afford\w*|budget|\$\s?\d|"
+    r"expected|hoped|planned)\b",
+    re.IGNORECASE,
+)
+_NOT_ABOUT_PRICE = re.compile(
+    r"\b(?:videos?|youtube|coursera|free|schedule|fit|option|support|mentors?|structure|classes|"
+    r"curriculum|projects?|portfolio|interviews?|career|job|time|hours?|pace|format)\b",
+    re.IGNORECASE,
+)
+_STILL_MORE = re.compile(
+    r"\bmore than i (?:had |'d |would have )?(?:planned|hoped|budgeted|expected|wanted)\b",
+    re.IGNORECASE,
+)
+# The call was placed by the advisor ("I'm glad I called"): the learner filled in a form.
+_I_CALLED = re.compile(
+    r"\b(?:glad i (?:called|rang|phoned)|when i called|i called (?:because|you|in|about)|"
+    r"my call to you|thanks for taking my call)\b",
+    re.IGNORECASE,
+)
 # A warm confirmation for a reply that held only doubts or questions after a commitment.
 CONFIRM_FALLBACKS = (
     "Sounds good, thank you. I'm looking forward to it.",
@@ -566,6 +650,14 @@ _HOURS_A_WEEK = re.compile(
     re.IGNORECASE,
 )
 _CARD_NOUNS = frozenset({"course", "program", "programme", "bootcamp"})
+# Words before a product subject that make the clause a wish, a doubt or an indirect question and
+# not a claim (R1-Q iteration 3): "I'd still want to know how much time the mentors give you each
+# week", "knowing whether the classes are live or recorded would help".
+_NOT_ASSERTED = re.compile(
+    r"\b(?:whether|if|know|knowing|wonder|wondering|curious|ask|asking|see|check|understand|"
+    r"clarify|find out|figure out|depends on|sure|unsure|unclear|how|what|which|why|when|where)\b",
+    re.IGNORECASE,
+)
 _PRODUCT_SUBJECT = _ci(
     r"\b(?:the|this|your|that) (?P<noun>course|program|programme|curriculum|classes|"
     r"instructors|mentors?|bootcamp|cohort|capstone|certificate)"
@@ -659,6 +751,13 @@ class GuardContext:
     free_reply: bool = False
     advisor_hours: frozenset[float] = frozenset()
     monthly_stated: bool = False
+    # R1-Q iteration 3.  The advisor's turn put a LOWER price on the table than any before it ("a
+    # bit better" is only true then); the advisor said (almost) nothing after the learner's last
+    # goodbye (a second goodbye is dropped); the advisor asked who else decides (the answer is
+    # never dropped as a repeat).
+    fresh_price: bool = False
+    hollow: bool = False
+    decider_asked: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -905,6 +1004,8 @@ def _is_product_statement(sentence: str, allowed: frozenset[int]) -> bool:
         return False
     if match.group("noun").lower() in _CARD_NOUNS and _card_fact_only(sentence, allowed):
         return False
+    if _NOT_ASSERTED.search(clause_before(sentence, match.start())) is not None:
+        return False  # "knowing whether the classes are live would help": a wish, not a claim
     return True
 
 
@@ -934,8 +1035,20 @@ _MONEY_CUE = re.compile(
 )
 
 
+# "a few hundred a month" / "a couple of thousand" name no amount: the persona's own budget
+# answer is "around $500-700 a month", and a vague quantity of hundreds is the same thing said
+# loosely (R1-Q iteration 3: the sentence was dropped as an amount off the card, and the H3 need
+# with it).
+_VAGUE_QUANTITY = re.compile(
+    r"\b(?:a few|a couple of|couple of|several|some|a handful of|many|a lot of) "
+    r"(?:hundred|thousand)\b",
+    re.IGNORECASE,
+)
+
+
 def _amounts_spoken(sentence: str) -> list[int]:
     """Whole-dollar amounts in ``sentence``, written or (next to a money word) spelled out."""
+    sentence = _VAGUE_QUANTITY.sub(" ", sentence)
     if _MONEY_CUE.search(sentence):
         return dollar_amounts(canonical_amounts(sentence))
     return dollar_amounts(sentence)
@@ -978,6 +1091,49 @@ def _iteration_two_misreads(sentence: str, ctx: GuardContext, question: bool) ->
     return hits
 
 
+# A sentence that keeps the agreed plan while it turns down a fresh push ("I'll still talk it
+# through with him first, but I'm looking forward to tomorrow", "I'd rather talk to my husband
+# before I pay anything") is not a doubt about the booked call, and without it a reply to "why
+# not just grab it now?" is "That would be good to know, thanks." (R1-Q iteration 3).
+_HOLDS_THE_PLAN = re.compile(
+    r"\b(?:talk|speak|run|discuss)\w*\b[^.?!]{0,30}\b(?:with|to|by)?\s*(?:him|her|them|my "
+    r"(?:husband|wife|partner|father|mother|dad|mom|spouse|parents|family))\b[^.?!]{0,20}"
+    r"\b(?:first|before)\b"
+    r"|\bwait (?:until|for|till) (?:the|our) call\b"
+    r"|\b(?:stick|sticking) (?:with|to) (?:the|our) (?:plan|call)\b",
+    re.IGNORECASE,
+)
+
+
+def _reopens(sentence: str) -> bool:
+    """A doubt that reopens what was agreed (``_DOUBT``), unless it holds the plan."""
+    return _DOUBT.search(sentence) is not None and _HOLDS_THE_PLAN.search(sentence) is None
+
+
+def _iteration_three_misreads(sentence: str, ctx: GuardContext) -> list[Hit]:
+    """Misreadings the third live sweep found (hygiene hits: never posted, never a leak)."""
+    hits: list[Hit] = []
+    if (
+        not ctx.fresh_price
+        and _NOT_ABOUT_PRICE.search(sentence) is None
+        and (
+            _BETTER_PRICE.search(sentence) is not None
+            or (
+                _BETTER_THAN.search(sentence) is not None
+                and _PRICE_WORD.search(sentence) is not None
+            )
+        )
+    ):
+        hits.append(_hit(MISREAD, "better_unchanged", sentence))
+    if ctx.offer_usd != 7000 and _HEARD_IN_LINE.search(sentence) is not None:
+        hits.append(_hit(MISREAD, "heard_in_line", sentence))
+    if ctx.hollow and CLOSER.search(sentence) is not None:
+        hits.append(_hit(MISREAD, "closer_again", sentence))
+    if _I_CALLED.search(sentence) is not None:
+        hits.append(_hit(MISREAD, "learner_called", sentence))
+    return hits
+
+
 def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     hits: list[Hit] = []
     if _LEARNER_META.search(sentence):
@@ -1008,7 +1164,7 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
         hits.append(_hit(INVENTED_FACT, "own_availability_figure", sentence))
     elif any(amount not in allowed for amount in _amounts_spoken(sentence)):
         hits.append(_hit(INVENTED_FACT, "amount_off_card", sentence))
-    if ctx.confirm and (question or _DOUBT.search(sentence) is not None):
+    if ctx.confirm and (question or _reopens(sentence)):
         hits.append(_hit(REOPEN, "confirm_only", sentence))
     if _TIME_REVERSAL.search(sentence) is not None:
         hits.append(_hit(MISREAD, "time_cue_reversed", sentence))
@@ -1023,6 +1179,8 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
         and _ANCHOR_REACTION.search(canonical_amounts(sentence)) is not None
     ):
         hits.append(_hit(MISREAD, "anchor_taken_as_offer", sentence))
+    if len(sentence) <= MISREAD_MAX_CHARS and not any(hit.category == MISREAD for hit in hits):
+        hits.extend(_iteration_three_misreads(sentence, ctx))  # one misreading per sentence
     if ctx.mode == "ack" and not _is_card_answer(sentence, persona):
         if question:
             hits.append(_hit(ACK_FORMAT, "ack_question", sentence))
@@ -1035,6 +1193,7 @@ CARD_MATCH_THRESHOLD = 0.75
 # The scripted WEAK line, on normalised text (apostrophes dropped).
 _RESERVED_WEAK_LINE = re.compile(
     r"\blet me think about it\b|\bemail me the details\b|\bcall me back after ive talked\b"
+    r"|\bread through the email and ill get back to you\b"
 )
 _POSSESSIVE = re.compile(r"(?<=\w)'s\b")
 _DIGITS = re.compile(r"\d+")
@@ -1188,10 +1347,13 @@ def _replacement(hits: list[Hit], ctx: GuardContext, sentence: str = "") -> str:
             return GRATITUDE_REPLACEMENT
         if rule == "decider_alone" and ctx.persona is not None:
             return ctx.persona.decider_answer
-        if rule == "heard_not_anchor":
+        if rule in ("heard_not_anchor", "heard_in_line"):
             return _heard_replacement(ctx)
         if rule == "decider_unwilling":
             return _without_unwilling_clause(sentence)
+        if rule == "better_unchanged":
+            at_ask = ctx.offer_usd is not None and ctx.offer_usd <= 7000
+            return "" if at_ask else PRICE_UNCHANGED_REPLACEMENT
     return ""
 
 
@@ -1279,6 +1441,9 @@ class StreamGuard:
             # "Okay." and the question is the whole reply: dropping the question would leave a bare
             # acknowledgement, so the question stays.
             and word_count(" ".join(self._emitted)) > THIN_REPLY_WORDS
+            # A question about the price, asked before the advisor has put any price on the table,
+            # always stays (R1-Q iteration 3: "what the total cost actually comes to?" was dropped).
+            and not (ctx.offer_usd is None and _PRICE_QUESTION.search(text) is not None)
         ):
             return True
         self._questions_kept += 1
@@ -1311,6 +1476,13 @@ class StreamGuard:
             return self._repeat_hit("reserved", out)
         if not self.ctx.said:
             return None
+        persona = self.ctx.persona
+        if (
+            self.ctx.decider_asked
+            and persona is not None
+            and re.search(r"\b" + re.escape(persona.decision_maker) + r"\b", out, re.IGNORECASE)
+        ):
+            return None  # the advisor asked who else decides: the same answer is the right answer
         kind = repeat_kind(out, self.ctx.said)
         return None if kind is None else self._repeat_hit(kind, out)
 
@@ -1344,6 +1516,10 @@ class StreamGuard:
             text = _INLINE_FILLER.sub(_filler_gap, text)
         if not self._emitted:
             text = self._vary_opener(text)
+        if _BEFORE_I_GO.match(text) is not None:
+            text = _BEFORE_I_GO.sub("", text, count=1)
+        elif _INLINE_BEFORE_I_GO.search(text) is not None:
+            text = _INLINE_BEFORE_I_GO.sub("", text)
         if STRETCH_PHRASE.search(text) is not None:
             used = self._phrase_count(PHRASE_STRETCH)
             if used >= PHRASE_QUOTA[PHRASE_STRETCH]:
@@ -1352,6 +1528,12 @@ class StreamGuard:
                 )
             else:
                 self._phrases_used[PHRASE_STRETCH] = self._phrases_used.get(PHRASE_STRETCH, 0) + 1
+        if CONCESSION_TAG.search(text) is not None:
+            if self._phrase_count(PHRASE_CONCESSION_TAG) >= PHRASE_QUOTA[PHRASE_CONCESSION_TAG]:
+                text = _strip_concession_tag(text)
+            else:
+                key = PHRASE_CONCESSION_TAG
+                self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
         if text != sentence:
             text = _tidy(text)
             if text and text[0].islower():
@@ -1415,6 +1597,9 @@ class StreamGuard:
                 out = ""
             if out:
                 self._replacements.add(out)
+        if out and self.ctx.is_learner and _STILL_MORE.search(out) is not None:
+            if any(_STILL_MORE.search(said) for said in self._emitted):
+                out = ""  # "more than I planned for" is said once in a reply
         if out and not hits:
             out = self._vary(out)
             if out and self._last_dropped and self.ctx.is_learner:
@@ -1436,7 +1621,9 @@ class StreamGuard:
                 self._last_dropped = True
                 return []
         if not out or out in self._emitted:
-            if hits:
+            if hits and all(hit.rule == "closer_again" for hit in hits):
+                self._repeat_drops += 1  # a second goodbye is a repeat: a back-channel replaces it
+            elif hits:
                 self._other_drops += 1
             self._last_dropped = True
             return []
@@ -1519,9 +1706,26 @@ def _filler_gap(match: re.Match[str]) -> str:
     return "," if match.group(0).lstrip().startswith(",") else " "
 
 
+def _strip_concession_tag(text: str) -> str:
+    """``text`` without the concession tag ("..., I'll give you that.", "I'll admit, ...").
+
+    What is left keeps its closing mark; a tag that is the whole sentence leaves nothing, which
+    ``_vary`` turns into a neutral acknowledgement.
+    """
+    end = text.rstrip()[-1:] if text.rstrip()[-1:] in (".", "?", "!") else ""
+    out = CONCESSION_TAG_LEADING.sub("", text, count=1)
+    out = CONCESSION_TAG_TRAILING.sub("", out).rstrip(" ,;:-")
+    if word_count(out) < 2:
+        return ""
+    if out and out[-1] not in ".?!":
+        out += end or "."
+    return out
+
+
 def _tidy(text: str) -> str:
     """Spacing and commas after a filler was taken out ("packed , , and" -> "packed, and")."""
     text = re.sub(r"\s+([,.?!])", r"\1", text)
+    text = re.sub(r"^\W*(?:though|and|so)\s*,\s+", "", text, flags=re.IGNORECASE)
     text = re.sub(r",(?:\s*,)+", ",", text)
     text = re.sub(r",\s*([.?!])", r"\1", text)
     text = re.sub(r",\s*(-+)(?=\s)", r" \1", text)  # "confusing, - I'm" -> "confusing - I'm"

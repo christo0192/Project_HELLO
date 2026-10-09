@@ -94,9 +94,34 @@ _LEVEL_BEHAVIOUR = {
     "terse": (
         "You answer with one to five words per turn ('Okay.', 'Sure.', 'Hmm, yes.', 'Go on.', "
         "'Right.'). You almost never ask a question and never pitch more than one short "
-        "sentence. Sometimes you say only '...' as if you were silent."
+        "sentence. Sometimes you say only '...' as if you were silent. When the learner starts "
+        "wrapping up ('thanks', 'I'll reach out', 'I'll let you know'), never answer with another "
+        "bare back-channel: say one short thing with content, such as a one-line question about "
+        "what would help them decide."
     ),
 }
+# Iteration 3 (H4).  The terse simulator answered a learner's goodbye with 'Sure.' / 'Okay.' /
+# 'Mm-hmm.' twelve turns in a row, and the learner said goodbye nine times: a loop the simulator made.
+# After two hollow turns in a row (four words or fewer, no question) that follow a learner closer, the
+# next one is asked again with this nudge.
+HOLLOW_LOOP_NUDGE = (
+    "You have only said a few words twice in a row while the learner is wrapping up. Now say one "
+    "short thing with content, for example a one-line question about what would help them decide, "
+    "in the same JSON format. Do not say goodbye."
+)
+HOLLOW_MAX_WORDS = 4
+_LEARNER_CLOSING = re.compile(
+    r"\b(?:i(?:'ll| will) (?:reach out|let you know|be in touch|get in touch)|thanks? (?:you )?"
+    r"(?:so much )?(?:again )?for (?:your time|the call|walking me through)|thanks again|"
+    r"take care|bye|i should let you go)\b",
+    re.IGNORECASE,
+)
+
+
+def is_hollow(text: str) -> bool:
+    """An advisor turn with nothing to answer: four words or fewer, no question."""
+    body = re.sub(r"[^A-Za-z0-9' ]+", " ", text or "").split()
+    return "?" not in (text or "") and 0 < len(body) <= HOLLOW_MAX_WORDS
 
 _INTENT_HELP = (
     "greet = hello and small talk; probe = a genuine question about why the learner is "
@@ -286,11 +311,25 @@ class LLMAdvisor:
             again = await self._ask(r_sec, EARLY_FAREWELL_NUDGE.format(clock=_clock_text(r_sec)))
             if not is_farewell(again):
                 turn = again
+        if self._in_hollow_loop(learner_text, turn):
+            retries += 1
+            again = await self._ask(r_sec, HOLLOW_LOOP_NUDGE)
+            if again.text.strip() and not is_hollow(again.text) and not is_farewell(again):
+                turn = again
         turn.retries = retries
         self.history.append(
             {"who": "advisor", "text": turn.text, "intent": turn.intent, "topic": turn.topic}
         )
         return turn
+
+    def _in_hollow_loop(self, learner_text: str | None, turn: AdvisorTurn) -> bool:
+        """The terse level is about to answer a wrapping-up learner with a third bare back-channel."""
+        if self.level != "terse" or not is_hollow(turn.text):
+            return False
+        if not _LEARNER_CLOSING.search(learner_text or ""):
+            return False
+        recent = [item for item in self.history if item["who"] == "advisor"][-2:]
+        return len(recent) == 2 and all(is_hollow(item["text"]) for item in recent)
 
     async def _ask(self, r_sec: float, nudge: str) -> AdvisorTurn:
         completion = await self.client.complete(

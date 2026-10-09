@@ -74,6 +74,8 @@ MOVED_DAY = "tomorrow"
 # The learner said it had to talk to its decision maker this recently: a vague "let me know when's
 # good" is then answered by booking the call without a slot (``Negotiation.slot_choice``).
 DEFER_RECENT_TURNS = 3
+# An advisor's slot older than this many learner turns is not the proposal the learner answers.
+SLOT_RECENT_TURNS = 6
 
 REASON_TIMING = "timing"
 REASON_MONEY = "money"
@@ -127,6 +129,7 @@ N_MONEY = "N-MONEY"
 N_DECISION_MAKER = "N-DM"
 N_QUESTION = "N-QUESTION"
 N_EMAIL = "N-EMAIL"
+N_EMAIL_YES = "N-EMAIL-YES"
 
 SPECS: tuple[NegotiationSpec, ...] = (
     NegotiationSpec(
@@ -270,12 +273,51 @@ SPECS: tuple[NegotiationSpec, ...] = (
                 r"\bcover\w*",
                 r"\bcontain\w*",
                 r"\bin it\b",
+                # The yes alone proves the move too (R1-Q iteration 3): a model that said "Sure, go
+                # ahead and send the email" and lost its question to the question diet was given
+                # "Yes, please send it over. What are you going to put in it?" on top.
+                r"\bsure\b",
+                r"\byes\b",
+                r"\bplease\b",
+                r"\bgo ahead\b",
+                r"\bworks?\b",
+                r"\bfine\b",
+                r"\bgreat\b",
+                r"\bokay\b",
+                r"\bthanks?\b",
             ),
         ),
         (
             "Sure, you can email me. What will the email include?",
             "Okay, an email works for me. What will be in it, exactly?",
             "Yes, please send it over. What are you going to put in it?",
+        ),
+    ),
+    NegotiationSpec(
+        N_EMAIL_YES,
+        KIND_EMAIL,
+        None,
+        "you say yes to the advisor sending the e-mail; they just told you what is in it, so you "
+        "do not ask what it will include",
+        (
+            (r"\be-?mail\w*", r"\bmail\b", r"\bsend\b", r"\bdetails\b"),
+            (
+                r"\bsure\b",
+                r"\byes\b",
+                r"\bplease\b",
+                r"\bgo ahead\b",
+                r"\bworks?\b",
+                r"\bfine\b",
+                r"\bgreat\b",
+                r"\bokay\b",
+                r"\bthanks?\b",
+                r"\bhelp\w*",
+            ),
+        ),
+        (
+            "Sure, you can email me the details.",
+            "Okay, an email works for me.",
+            "Yes, please send it over.",
         ),
     ),
 )
@@ -412,16 +454,23 @@ def anchor_after_offer(offer_usd: int) -> AnchorSituation:
                 "I heard about $7,000, so that is in line with what I read.",
             ),
         )
+    # Below the $7,000: it is NOT "in line with what you heard" (the live sweep: "That lines up with
+    # what I'd heard ... $4,500 is under the $7,000 I read about", one reply, two opinions).
+    below_tail = (
+        "you note calmly that it is even below the $7,000 you heard, with no surprise and no "
+        "thanks, and you may ask what is included at that price; you do not ask whether it is the "
+        "final price"
+    )
     return AnchorSituation(
         ANCHOR_REACHED,
         f"the advisor has already put {amount} on the table, below the $7,000 you heard people "
-        f"got it for; {brief_tail}",
+        f"got it for; {below_tail}",
         (amount, "$7,000"),
         (
             f"{amount} is even below the $7,000 I heard people got it for. What exactly does "
             "that price include?",
             f"{amount} is under the $7,000 I read about.",
-            f"I heard people paid about $7,000, so {amount} is in line with that.",
+            f"I heard people paid about $7,000, and {amount} is below that.",
         ),
     )
 
@@ -447,9 +496,34 @@ def filled_markers(
 # ----------------------------------------------------------------------------------
 _WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
 _WEEKEND_DAYS = frozenset({"saturday", "sunday", "this weekend", "the weekend", "weekend"})
+# Iteration 3: "the day after tomorrow" is not "tomorrow", and "later this week", "early next week"
+# and "in a few days" are loose days, not "today" (the live sweep booked "today at 7 PM" for a call
+# the advisor proposed "in a few days", "later this week" and "early next week").
+DAY_AFTER_TOMORROW = "day after tomorrow"
+DAY_THIS_WEEK = "this week"
+DAY_A_FEW_DAYS = "a few days"
+LOOSE_DAYS = frozenset({"next week", DAY_THIS_WEEK, DAY_A_FEW_DAYS})
 _DAY = re.compile(
-    r"\b(tomorrow|tonight|today|" + "|".join(_WEEKDAYS) + r"|this weekend|the weekend|weekend"
-    r"|next week)\b",
+    r"\b((?:the )?day after tomorrow|tomorrow|tonight|today|" + "|".join(_WEEKDAYS)
+    + r"|this weekend|the weekend|weekend|early next week|later next week|next week"
+    r"|later this week|later in the week|this week|(?:in )?(?:a few|a couple of|couple of|two|"
+    r"three|2|3) days)\b",
+    re.IGNORECASE,
+)
+_DAY_CANON = {
+    "the day after tomorrow": DAY_AFTER_TOMORROW,
+    "early next week": "next week",
+    "later next week": "next week",
+    "later this week": DAY_THIS_WEEK,
+    "later in the week": DAY_THIS_WEEK,
+}
+# A time that belongs to something the advisor SENDS, not to a call: "I'll send those over today",
+# "I'll email you the summary tonight".  A call word between the verb and the time keeps it.
+_DELIVERY_BEFORE = re.compile(
+    r"\b(?:send|sending|sent|e-?mail|mail|share|forward|text|message|drop|shoot|put together|"
+    r"get (?:that|it|those|them|everything|the [\w ]{1,30}?) out)\b"
+    r"(?:(?!\b(?:call|chat|talk|speak|meet\w*|invite|slot|time|session|catch|check|touch|follow"
+    r"|reconnect|ring|phone)\b)[^.?!]){0,50}$",
     re.IGNORECASE,
 )
 _CLOCK = re.compile(r"\b(\d{1,2})(?:[:.](\d{2}))?\s*([ap])\.?\s?m\b", re.IGNORECASE)
@@ -470,7 +544,7 @@ _HOUR_WORDS = {
 _CLOCK_WORD = re.compile(
     r"\b(" + "|".join(_HOUR_WORDS) + r")\s*(?:o'?clock\s*)?([ap])\.?\s?m\b", re.IGNORECASE
 )
-_PART = re.compile(r"\b(morning|afternoon|evening|night|noon)\b", re.IGNORECASE)
+_PART = re.compile(r"\b(mornings?|afternoons?|evenings?|nights?|noon)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -493,11 +567,13 @@ class Slot:
 
     @property
     def vague(self) -> bool:
-        """No clock time and no part of the day, and at most "next week" for a day.
+        """No clock time and no part of the day, and at most a loose day ("next week") for a day.
 
         "I can try you sometime next week" names no slot the learner could book.
         """
-        return self.hour is None and self.part is None and self.day in (None, "next week")
+        return self.hour is None and self.part is None and (
+            self.day is None or self.day in LOOSE_DAYS
+        )
 
 
 @dataclass(frozen=True)
@@ -523,11 +599,32 @@ def _hour24(hour: int, meridiem: str) -> int | None:
     return base + (12 if meridiem.lower() == "p" else 0)
 
 
+def _call_time(text: str, match: re.Match[str]) -> bool:
+    """The time at ``match`` belongs to a call, not to something the advisor sends or e-mails."""
+    start = max(text.rfind(mark, 0, match.start()) for mark in ".?!") + 1
+    return _DELIVERY_BEFORE.search(text[start : match.start()]) is None
+
+
+def _canonical_day(raw: str) -> str:
+    day = re.sub(r"^in ", "", raw.lower())
+    if day in _DAY_CANON:
+        return _DAY_CANON[day]
+    if re.fullmatch(r"(?:a few|a couple of|couple of|two|three|2|3) days", day):
+        return DAY_A_FEW_DAYS
+    return day
+
+
+def _first_call_time(pattern: re.Pattern[str], text: str) -> re.Match[str] | None:
+    return next((m for m in pattern.finditer(text) if _call_time(text, m)), None)
+
+
 def parse_slot(*texts: object) -> Slot | None:
     """The first day, clock time and part of day found in ``texts``, or None if there is none.
 
     Each component is taken from the first text that has it, so a caller passes the nearest
-    text first ("tomorrow? maybe like 10:00 a.m." before an unrelated "today" earlier on).
+    text first ("tomorrow? maybe like 10:00 a.m." before an unrelated "today" earlier on).  A time
+    that belongs to something the advisor sends ("I'll send those over today") is not a call time,
+    and "the day after tomorrow" is not "tomorrow" (R1-Q iteration 3).
     """
     folded = [_tail(text).lower() for text in texts]
     day: str | None = None
@@ -536,20 +633,20 @@ def parse_slot(*texts: object) -> Slot | None:
     minute = 0
     for text in folded:
         if day is None:
-            day_match = _DAY.search(text)
-            day = day_match.group(1).lower() if day_match else None
+            day_match = _first_call_time(_DAY, text)
+            day = _canonical_day(day_match.group(1)) if day_match else None
         if part is None:
-            part_match = _PART.search(text)
-            part = part_match.group(1).lower() if part_match else None
+            part_match = _first_call_time(_PART, text)
+            part = part_match.group(1).lower().rstrip("s") if part_match else None
         if hour is None:
-            clock = _CLOCK.search(text)
+            clock = _first_call_time(_CLOCK, text)
             if clock is not None:
                 hour = _hour24(int(clock.group(1)), clock.group(3))
                 minute = int(clock.group(2) or 0)
                 if not 0 <= minute <= 59:
                     minute = 0
             else:
-                spoken = _CLOCK_WORD.search(text)
+                spoken = _first_call_time(_CLOCK_WORD, text)
                 if spoken is not None:
                     hour = _hour24(_HOUR_WORDS[spoken.group(1).lower()], spoken.group(2))
     if day is None and hour is None and part is None:
@@ -569,6 +666,12 @@ def _day_text(day: str | None) -> str:
         return ""
     if day in ("tomorrow", "tonight", "today", "next week"):
         return day
+    if day == DAY_AFTER_TOMORROW:
+        return "the day after tomorrow"
+    if day == DAY_THIS_WEEK:
+        return "later this week"
+    if day == DAY_A_FEW_DAYS:
+        return "in a few days"
     if day in _WEEKEND_DAYS and day not in _WEEKDAYS:
         return "this weekend"
     return "on " + day.capitalize()
@@ -780,6 +883,23 @@ def detect_email_offer(text: object) -> bool:
     return False
 
 
+# What an e-mail would hold, named in the advisor's offer ("the curriculum, pricing and discount
+# options"): two of these in the turn mean the advisor already said what is in it.
+_MAIL_CONTENT_NOUN = re.compile(
+    r"\b(curriculum|syllabus|brochure|pricing|prices?|fees?|discounts?|payment (?:plans?|options)|"
+    r"plan options|instal+ments?|schedule|start dates?|cohort (?:dates?|schedule)|outcome data|"
+    r"placement (?:stats|data|numbers)|success stories|testimonials?|modules?|breakdown|"
+    r"capstone|mentorship|career support|guarantee|terms)\b",
+    re.IGNORECASE,
+)
+
+
+def lists_email_contents(text: object) -> bool:
+    """The advisor's turn names what the e-mail holds (two or more of its contents)."""
+    found = {match.group(1).lower() for match in _MAIL_CONTENT_NOUN.finditer(_tail(text))}
+    return len(found) >= 2
+
+
 # The learner turned a call down ("I'd rather keep it to email for now", "I haven't agreed to any
 # date yet"): an open proposal it declined is not answered later by booking it (R1-Q iteration 2:
 # the learner declined a call twice and then booked it when the advisor said goodbye).
@@ -799,9 +919,82 @@ _DECLINES_CALL = re.compile(
 )
 
 
+# R1-Q iteration 3.  The learner turned a call, a check-in or a time down in other words, and
+# the live sweep booked it anyway (nine calls): "I'd rather reach out myself", "I'd rather you
+# didn't", "I'd rather not lock in a time yet", "I'd rather not have a check-in hanging over me",
+# "I can't really pin down a time ... rather than you calling me".  An explicit decline holds
+# for the whole call.
+_DECLINES_CALL_MORE = re.compile(
+    r"\b(?:rather|prefer|better) (?:to )?(?:reach out|get in touch|contact you|call you|"
+    r"get back to you|come back to you|be the one to)\b"
+    r"|\brather than you (?:calling|checking in|reaching out|following up|chasing|ringing)\b"
+    r"|\bi(?:'d| would) rather you (?:didn'?t|did not|not|left it)\b"
+    r"|\bi(?:'d| would) rather not (?:have|get) a (?:check-?in|call|follow-?up)\b"
+    r"|\b(?:no need to|don'?t need you to|please don'?t|you don'?t need to) "
+    r"(?:call|check in|follow up|chase|ring|reach out)\b"
+    r"|\bi(?:'ll| will) (?:reach out|get in touch|contact you|come back to you|call you)\b"
+    r"[^.?!]{0,30}\b(?:myself|on my own|rather than|instead)\b",
+    re.IGNORECASE,
+)
+# A day or a part of the day the learner called difficult: "Tomorrow evening's tricky for me".
+_SLOT_REFUSAL = re.compile(
+    r"\b(?:tricky|awkward|tough|difficult|hard|unpredictable|busy|doesn'?t work|won'?t work|"
+    r"isn'?t great|not great|no good|can'?t do|can'?t make|not possible|not ideal|bad time|"
+    r"not a good time|conflicts?|packed)\b",
+    re.IGNORECASE,
+)
+
+
 def declines_call(spoken: object) -> bool:
-    """The learner's own words turn a proposed call down or put it off in favour of e-mail."""
-    return _DECLINES_CALL.search(fold(spoken)) is not None
+    """The learner's own words turn a proposed call down or put it off in favour of e-mail.
+
+    "I'll reach out / let you know" alone is not a decline: it is how every stall ends.  Only an
+    explicit refusal is ("I'd rather reach out myself", "I'd rather you didn't", "I'd rather keep
+    it to e-mail"), and it holds for the rest of the call.  "I'm not ready to lock in a time
+    yet" is a pause, not a refusal: an advisor who answers the worry may still be booked.
+    """
+    folded = fold(spoken)
+    return (
+        _DECLINES_CALL.search(folded) is not None
+        or _DECLINES_CALL_MORE.search(folded) is not None
+    )
+
+
+# The learner called the cost the lesser worry ("my worry is more about time than money", "that's
+# really what worries me more than the cost", "it's not really the money", "that part sits easier
+# with me"): the money stall is never voiced afterwards ("The cost is still the sticking point for
+# me" came after all of them).
+_COST_SECONDARY = re.compile(
+    r"\b(?:time|schedule|hours?|keeping up|workload|pace)\b[^.?!]{0,30}\bthan (?:the )?(?:money|"
+    r"cost|price|fees?)\b"
+    r"|\bmore than (?:the )?(?:money|cost|price|fees?)\b"
+    r"|\b(?:it'?s|that'?s|this is) not (?:really |so much |just )?(?:about )?(?:the )?(?:money|"
+    r"cost|price)\b"
+    r"|\b(?:money|cost|price)\b[^.?!]{0,12}\b(?:isn'?t|is not|not) (?:really |so much )?"
+    r"(?:the|my|a) (?:main |real |big )?(?:issue|problem|worry|concern|sticking point)\b"
+    r"|\b(?:that|the) (?:part|price|number|cost) sits easier\b|\bsits easier with me\b",
+    re.IGNORECASE,
+)
+
+
+def says_cost_is_secondary(spoken: object) -> bool:
+    """The learner said the cost worries it less than something else."""
+    return _COST_SECONDARY.search(fold(spoken)) is not None
+
+
+def refused_slot(spoken: object) -> Slot | None:
+    """The day or part of the day the learner said it cannot do, or None.
+
+    A sentence that calls a day or a time difficult ("Tomorrow evening's tricky for me", "Evenings
+    are unpredictable with lab work") refuses that slot: a call is never booked there afterwards.
+    """
+    for sentence in split_sentences(fold(spoken)):
+        if _SLOT_REFUSAL.search(sentence) is None:
+            continue
+        slot = parse_slot(sentence)
+        if slot is not None and (slot.day is not None or slot.part is not None):
+            return slot
+    return None
 
 
 def detect_checkin(text: object) -> bool:
@@ -1575,6 +1768,11 @@ class NegotiationTurn:
     anchor_mentioned: bool = False
     tentative: bool = False
     decider_asked: bool = False
+    # R1-Q iteration 3: the e-mail offer already says what is in the e-mail; the turn put a price on
+    # the table that is LOWER than the best one before it (``lower_offer_usd``); every figure the
+    # turn named as a price (an instalment option above the best offer is no better than it).
+    email_listed: bool = False
+    lower_offer_usd: int | None = None
 
     @property
     def offer_added(self) -> bool:
@@ -1621,6 +1819,15 @@ class Negotiation:
         # The learner turn on which it last said it had to talk to its decision maker (the MEDIUM
         # line then books a call without inventing a slot the learner never had).
         self.decider_said_turn: int | None = None
+        # R1-Q iteration 3.  The turn on which the learner first turned a call or a time down in
+        # so many words (an explicit decline holds for the rest of the call), the days and parts
+        # of the day it called difficult (never booked), the turn the advisor's latest slot was
+        # proposed on, and what the learner said about its priorities (cost called secondary: no
+        # money stall).
+        self.call_declined_turn: int | None = None
+        self.refused_slots: list[Slot] = []
+        self.last_slot_turn: int | None = None
+        self.money_secondary = False
 
     # ------------------------------------------------------------------ observation
     def observe(
@@ -1638,6 +1845,7 @@ class Negotiation:
             self.callbacks.append({"turn": turn, "has_slot": callback.slot is not None})
             if callback.slot is not None:
                 self.last_slot = callback.slot
+                self.last_slot_turn = turn
         email = detect_email_offer(text)
         if email:
             self.email_offers.append(turn)
@@ -1648,6 +1856,7 @@ class Negotiation:
         offers: list[PriceOffer] = []
         refusal = False
         mentioned = False
+        prior_best = self.best_offer_usd
         # Before the anchor nobody has asked for a price, so an amount needs a pricing word.
         for net, conditional in parse_price_offers(
             text, self.own_amounts, require_cue=not after_anchor
@@ -1655,6 +1864,10 @@ class Negotiation:
             mentioned = True
             if all(item.net_usd != net for item in self.offers + offers):
                 offers.append(PriceOffer(turn, net, conditional))
+        lowest_now = min((item.net_usd for item in offers), default=None)
+        lower = lowest_now if lowest_now is not None and (
+            prior_best is None or lowest_now < prior_best
+        ) else None
         answered_price = after_anchor and mentioned
         if answered_price:
             self.answer_offer = True
@@ -1681,6 +1894,8 @@ class Negotiation:
             anchor_mentioned=after_anchor and mentions_anchor(text),
             tentative=not mentioned and not refusal and detect_tentative(text),
             decider_asked=asks_decider(text),
+            email_listed=email and lists_email_contents(text),
+            lower_offer_usd=lower,
         )
 
     def note_learner_text(self, spoken: object, turn: int | None = None) -> None:
@@ -1691,6 +1906,13 @@ class Negotiation:
                 self.own_amounts.add(amount)
         if turn is not None and self._says_decider_first(spoken):
             self.decider_said_turn = turn
+        if turn is not None and self.call_declined_turn is None and declines_call(spoken):
+            self.call_declined_turn = turn
+        refused = refused_slot(spoken)
+        if refused is not None and refused not in self.refused_slots:
+            self.refused_slots.append(refused)
+        if says_cost_is_secondary(spoken):
+            self.money_secondary = True
 
     def _says_decider_first(self, spoken: object) -> bool:
         """The learner said it would talk to or check with its decision maker."""
@@ -1784,21 +2006,63 @@ class Negotiation:
     def reasons_handled_count(self) -> int:
         return len(self.handled)
 
-    def slot_choice(self, turn: int | None = None) -> SlotChoice:
+    def money_is_settled(self) -> bool:
+        """The price is no longer the learner's worry: it met the ask, or it called cost secondary.
+
+        The money stall ("The cost is still the sticking point for me") after "my worry is more
+        about time than money" and after the $7,000 was met contradicted the learner itself.
+        """
+        return self.money_secondary or self.price_situation() == SITUATION_MET
+
+    def call_declined(self) -> bool:
+        """The learner turned a call down in so many words (it holds for the rest of the call)."""
+        return self.call_declined_turn is not None
+
+    def slot_refused(self, slot: Slot | None) -> bool:
+        """``slot`` is a day or part of the day the learner said it cannot do."""
+        if slot is None:
+            return False
+        for refused in self.refused_slots:
+            if refused.day is not None and slot.day == refused.day:
+                return True
+            if refused.day is None and refused.part is not None and (
+                slot.part == refused.part or (refused.part in ("evening", "night") and slot.evening)
+            ):
+                return True
+        return False
+
+    def slot_choice(self, turn: int | None = None, *, picks_own: bool = True) -> SlotChoice:
         """The slot of the MEDIUM line for the advisor's latest proposal.
 
         When the advisor named no slot that can be booked (nothing, or "sometime next week") and
         the learner said within the last ``DEFER_RECENT_TURNS`` turns that it has to talk to its
-        decision maker first, the call is booked without a slot (``SlotChoice.deferred``).
+        decision maker first, the call is booked without a slot (``SlotChoice.deferred``).  A slot
+        the learner said it cannot do is never booked (R1-Q iteration 3), and a proposal older than
+        ``SLOT_RECENT_TURNS`` turns is no proposal: the learner does not pick a day the advisor
+        named long ago.  ``picks_own`` is False when the ask was not for a call (an enrolment ask
+        graded MEDIUM): with no recent slot the learner then books the call without one, instead of
+        inventing "Thursday at 7 PM" for a call nobody proposed.
         """
-        choice = choose_slot(self.last_slot)
-        vague = self.last_slot is None or self.last_slot.vague
+        slot = self.last_slot
+        stale = (
+            slot is not None
+            and turn is not None
+            and self.last_slot_turn is not None
+            and turn - self.last_slot_turn > SLOT_RECENT_TURNS
+        )
+        if stale:
+            slot = None
+        choice = choose_slot(slot)
+        vague = slot is None or slot.vague
         recent = (
             turn is not None
             and self.decider_said_turn is not None
             and 0 <= turn - self.decider_said_turn <= DEFER_RECENT_TURNS
         )
-        if vague and recent:
+        refused = self.slot_refused(slot) or (
+            slot is None and self.slot_refused(Slot(None, None, 0, "evening"))
+        )
+        if refused or (vague and recent) or (slot is None and not picks_own):
             choice = SlotChoice(choice.phrase, False, True)
         self.chosen_slot = choice
         return choice
@@ -1829,4 +2093,7 @@ class Negotiation:
             "slot": None if self.chosen_slot is None else self.chosen_slot.phrase,
             "slot_moved": None if self.chosen_slot is None else self.chosen_slot.moved,
             "slot_deferred": None if self.chosen_slot is None else self.chosen_slot.deferred,
+            "call_declined_turn": self.call_declined_turn,
+            "refused_slots": len(self.refused_slots),
+            "money_secondary": self.money_secondary,
         }

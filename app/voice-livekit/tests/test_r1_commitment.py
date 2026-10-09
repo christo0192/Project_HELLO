@@ -25,7 +25,7 @@ from r1_commitment import (
     mask_for_scorer,
     stall_line,
 )
-from r1_commitment import DEFAULT_SLOT
+from r1_commitment import DEFAULT_SLOT, THIN_ADVISOR_MEAN_WORDS, WEAK_EMAIL_DONE_LINE
 from r1_scheduler import PLAN, TIME_CUE_LINE
 from r1_text import split_sentences
 
@@ -476,6 +476,107 @@ class JoinNeedsACourseObjectTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(classify_learner_commitment(text), Level.STRONG)
+
+
+class IterationThreeCommitmentTests(unittest.TestCase):
+    """R1-Q iteration 3: conditionals, the greeting, the e-mail wording, pressure and thin answers."""
+
+    # --- D7: a condition is not a commitment
+    def test_a_conditional_commitment_commits_to_nothing(self):
+        """The live hard fail: "I'll reach out if I decide I want to move forward" was STRONG."""
+        for text in (
+            "I'll reach out if I decide I want to move forward.",
+            "I'll reach out if I decide to go ahead.",
+            "If it makes sense, I'll enrol.",
+            "Once I've talked to him, I'll sign up.",
+            "Whenever I'm ready, let's do it.",
+            "If Thursday works for you, great.",
+            "When I'm ready I want to join the next cohort.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), Level.NONE, text)
+
+    def test_the_unconditional_phrases_are_still_commitments(self):
+        for text, level in (
+            ("I want to move forward.", Level.STRONG),
+            ("Okay, let's do it.", Level.STRONG),
+            ("Let's book a call on Thursday.", Level.MEDIUM),
+            ("Thursday works.", Level.MEDIUM),
+            ("Okay. I'll enrol.", Level.STRONG),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), level, text)
+
+    def test_the_weak_stall_is_still_the_stall_with_a_condition(self):
+        self.assertEqual(
+            classify_learner_commitment("If I decide, I'll get back to you."), Level.WEAK
+        )
+
+    # --- D11: the greeting is not a call proposal
+    def test_the_greeting_is_not_a_call_proposal(self):
+        for text in (
+            "Hi Ananya, this is Rohan from Interview Kickstart. You filled in a form about our "
+            "Data Science course, so I thought I'd give you a quick call. Is now an okay time to "
+            "talk for a few minutes?",
+            "Is now a good time to chat?",
+            "Is this an okay time to talk?",
+            "I'm calling about the form you filled in.",
+            "Do you have a few minutes to talk?",
+            "I wanted to call you about the course you asked about.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(detect_ask(text), text)
+
+    def test_a_real_later_call_is_still_a_proposal(self):
+        for text in (
+            "I thought I'd call you back tomorrow evening.",
+            "I thought I'd follow up after you've talked it over with your husband.",
+            "Is now a good time to chat? If not, I can call you back tomorrow at 6.",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNotNone(detect_ask(text), text)
+
+    # --- D6: the WEAK line that does not ask for an e-mail it was promised
+    def test_the_emailed_weak_line_asks_for_nothing_and_is_masked(self):
+        line = commitment_line(Level.WEAK, "husband", emailed=True)
+        self.assertEqual(line, WEAK_EMAIL_DONE_LINE)
+        self.assertEqual(len(split_sentences(line)), 2)
+        self.assertNotIn("email me", line.lower())
+        self.assertEqual(classify_learner_commitment(line), Level.WEAK)
+        self.assertTrue(is_commitment_line(line, "husband"))
+        self.assertEqual(mask_for_scorer(line, "husband"), MASK_PLACEHOLDER)
+        line.encode("ascii")
+
+    def test_an_emailed_line_wins_over_a_call_back_line(self):
+        self.assertEqual(
+            commitment_line(Level.WEAK, "husband", call=True, emailed=True), WEAK_EMAIL_DONE_LINE
+        )
+        self.assertEqual(
+            commitment_line(Level.WEAK, "husband", call=True),
+            commitment_line(Level.WEAK, "husband", call=True, emailed=False),
+        )
+        self.assertNotEqual(commitment_line(Level.WEAK, "husband", call=True), WEAK_EMAIL_DONE_LINE)
+
+    # --- D1: the advisor must have earned a call
+    def test_an_advisor_who_pressured_the_learner_has_not_earned_a_call(self):
+        """Every pushy advisor of the live sweep invented a discount ($2,000 to $4,800 off)."""
+        self.assertEqual(grade(evidence(kind=AskKind.CALL)), MEDIUM)
+        pressured = CommitmentEvidence(
+            AskKind.CALL, 3, {"F1": 1, "F2": 1, "F3": 2, "F4": 1}, True, True, 2, pressured=True
+        )
+        self.assertEqual(grade(pressured), WEAK)
+        enrol = CommitmentEvidence(
+            AskKind.ENROL, 3, {"F1": 1, "F2": 1, "F3": 2, "F4": 1}, True, True, 0, pressured=True
+        )
+        self.assertEqual(grade(enrol), WEAK)
+
+    def test_an_advisor_who_answered_in_a_handful_of_words_has_not_earned_a_call(self):
+        thin = CommitmentEvidence(
+            AskKind.CALL, 3, {"F1": 1, "F2": 1, "F3": 1, "F4": 1}, True, True, 2, thin=True
+        )
+        self.assertEqual(grade(thin), WEAK)
+        self.assertGreater(THIN_ADVISOR_MEAN_WORDS, 6)  # the terse level: 5 to 6 words a turn
+        self.assertLess(THIN_ADVISOR_MEAN_WORDS, 31)  # every other level: 31 or more
 
 
 if __name__ == "__main__":

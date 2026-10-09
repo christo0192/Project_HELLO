@@ -85,6 +85,8 @@ from typing import Any, Iterable
 
 from r1_commitment import (
     COMMIT_STALL_R_SEC,
+    THIN_ADVISOR_MEAN_WORDS,
+    THIN_MIN_TURNS,
     AskKind,
     CommitmentEvidence,
     Level,
@@ -112,8 +114,10 @@ from r1_negotiation import (
     KIND_COMMIT,
     KIND_STALL,
     N_EMAIL,
+    N_EMAIL_YES,
     N_QUESTION,
     REASON_DECISION_MAKER,
+    REASON_MONEY,
     REASON_TIMING,
     SPEC_BY_ID,
     SPEC_BY_REASON,
@@ -125,7 +129,7 @@ from r1_negotiation import (
     fill_decision_maker,
     filled_markers,
 )
-from r1_personas import H_TOPICS, RenderedPersona, asks_about_learner
+from r1_personas import H_TOPICS, RenderedPersona, asks_about_learner, detect_probes
 from r1_prompts import (
     ANCHOR_NOT_OFFERED_NOTE,
     ANSWERED_NOTE,
@@ -135,6 +139,7 @@ from r1_prompts import (
     EMAIL_AGAIN_NOTE,
     EMAIL_OFFER_NOTE,
     HOLD_NOTE,
+    HOLLOW_NOTE,
     NEXT_STEP_PROPOSED_NOTE,
     PRICE_MET_NOTE,
     PRICE_UNCHANGED_NOTE,
@@ -166,6 +171,7 @@ from r1_scheduler import (
     REDIRECT_BRIEF,
     REDIRECT_OPENERS,
     TIME_CUE,
+    TIME_CUE_BRIEF_ALTERNATIVES,
     OwedMove,
     OwedMoveScheduler,
     answered_topics,
@@ -182,6 +188,8 @@ from r1_text import (
     canonical_amounts,
     dollar_amounts,
     fuzzy_contains,
+    is_closer,
+    is_hollow_turn,
     normalize,
     pick_variant,
     repeat_kind,
@@ -201,6 +209,9 @@ from r1_tracker import (
 from r1_world import WORLD_VERSION
 
 STALL_DEFER_GRACE_SEC = 30
+# An ask in the very first advisor turn is the greeting, not a close (it is not graded, not held
+# open for a farewell, and does not make the learner voice a stall reason).
+EARLY_ASK_IGNORE_SEC = 30
 MAX_ASIDES = 3
 MIN_SUBSTANTIVE_TURNS = 8
 SUBSTANTIVE_WORDS = 3
@@ -369,6 +380,16 @@ class RolePlayEngine:
         self._price_talk = False
         self._declined_calls = 0
         self._organic_pushes: list[str] = []
+        # R1-Q iteration 3.  Whether the advisor's turn put a LOWER price on the table (the only
+        # turn a reaction may call a price better), how many advisor turns in a row said (almost)
+        # nothing, whether the learner's last reply was a goodbye (it is not said twice to a
+        # silent advisor), whether the advisor asked who else decides this turn, and the topics
+        # of the digs that already held an owed move back.
+        self._fresh_price = False
+        self._hollow_run = 0
+        self._last_reply_closer = False
+        self._decider_asked_now = False
+        self._dig_deferred_topics: set[str] = set()
 
     # ------------------------------------------------------------------- properties
     @property
@@ -457,6 +478,9 @@ class RolePlayEngine:
             free_reply=free_reply,
             advisor_hours=frozenset(self._advisor_hours),
             monthly_stated=self._monthly_stated,
+            fresh_price=self._fresh_price,
+            hollow=self._hollow_run >= 1 and self._last_reply_closer,
+            decider_asked=self._decider_asked_now,
         )
 
     def filler_text(self) -> str:
@@ -503,6 +527,8 @@ class RolePlayEngine:
         if candidate_seconds is not None:
             self._longest_turn_sec = max(self._longest_turn_sec, candidate_seconds)
         self._word_counts.append(word_count(candidate_text))
+        self._hollow_run = self._hollow_run + 1 if is_hollow_turn(candidate_text) else 0
+        self._decider_asked_now = False
         signals = self.scheduler.observe_candidate_turn(candidate_text, r_sec)
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
         self._advisor_amounts.update(dollar_amounts(candidate_text))
@@ -516,9 +542,12 @@ class RolePlayEngine:
         negotiated = self._observe_negotiation(candidate_text, turn)
         self._note_situation(negotiated)
         self._note_curiosity_covered(candidate_text)
-        ask = detect_ask(candidate_text)
+        # Nothing in the very first advisor turn is an ask: it is the greeting ("is now a good
+        # time?", "I thought I'd give you a quick call"), and it gets a free reply.
+        early = turn == 1 and r_sec < EARLY_ASK_IGNORE_SEC
+        ask = None if early else detect_ask(candidate_text)
         wants = ask.kind if ask is not None else None
-        if wants is None and negotiated.callback is not None:
+        if wants is None and negotiated.callback is not None and not early:
             wants = AskKind.CALL  # a concrete callback or time proposal is a call ask
         self._call_ask_now = wants is AskKind.CALL
         reasons: list[str] = []
@@ -580,7 +609,7 @@ class RolePlayEngine:
             return self._plan(
                 TurnMode.SAY_ONLY,
                 reasons,
-                scripted=move.text,
+                scripted=self._weak_text(move.text),
                 move_id=move.id,
                 level=Level.WEAK,
                 resolves=True,
@@ -592,6 +621,7 @@ class RolePlayEngine:
                 reasons.append("owed_deferred_for_reveal")
             elif (
                 move.id not in self._dig_deferred
+                and self._dig_key(candidate_text) not in self._dig_deferred_topics
                 and asks_about_learner(candidate_text)
                 and self._may_defer(move, r_sec)
             ):
@@ -599,8 +629,11 @@ class RolePlayEngine:
                 # probe rules did not catch: "is he more of a sounding board, or does he need to be
                 # convinced?"): that question is answered first, the owed move waits ONE turn
                 # (R1-Q iteration 2: F1-ANCHOR and F3-PRIMARY answered a question about the husband
-                # and the father).  A deadline still forces it, so the gate's slip limit holds.
+                # and the father).  A deadline still forces it, so the gate's slip limit holds.  One
+                # deferral per topic of dig (iteration 3): a run of digs on the same topic would
+                # otherwise hold every owed move back in turn.
                 self._dig_deferred.add(move.id)
+                self._dig_deferred_topics.add(self._dig_key(candidate_text))
                 reasons.append("owed_deferred_for_dig")
             else:
                 self.scheduler.issue(move)
@@ -643,6 +676,12 @@ class RolePlayEngine:
             monologue=candidate_seconds,
             curiosity=curiosity,
         )
+
+    @staticmethod
+    def _dig_key(candidate_text: str) -> str:
+        """The topic of a dig: the needs the question probes, else ``other`` (a third party)."""
+        topics = sorted(detect_probes(candidate_text))
+        return ",".join(topics) if topics else "other"
 
     @staticmethod
     def _may_defer(move: Any, r_sec: float) -> bool:
@@ -695,7 +734,10 @@ class RolePlayEngine:
             self.scheduler.note_price_answered()
         for offer in seen.offers:
             self._advisor_amounts.add(offer.net_usd)  # the learner may name a price it heard
-        self._new_offer_usd = seen.offers[-1].net_usd if seen.offers else None
+        # A price that is not LOWER than the best on the table is no news (R1-Q iteration 3: the
+        # $8,000 instalment option, offered after $7,500, was "a little better than I expected").
+        self._new_offer_usd = seen.lower_offer_usd
+        self._fresh_price = seen.lower_offer_usd is not None
         return seen
 
     def _note_situation(self, seen: NegotiationTurn) -> None:
@@ -708,6 +750,7 @@ class RolePlayEngine:
         nothing (the judge flagged the thanks that followed it).
         """
         if seen.decider_asked:
+            self._decider_asked_now = True
             self._notes.append(DECIDER_ASKED_NOTE.format(answer=self.persona.decider_answer))
         best = self.negotiation.best_offer_usd
         if seen.anchor_mentioned and (best is None or best > ANCHOR_USD):
@@ -722,7 +765,7 @@ class RolePlayEngine:
         if best is not None and self._price_talk:
             if best <= ANCHOR_USD:
                 self._price_notes.append(PRICE_MET_NOTE.format(amount=format_usd(best)))
-            elif not seen.offers:
+            elif seen.lower_offer_usd is None:
                 self._price_notes.append(PRICE_UNCHANGED_NOTE.format(amount=format_usd(best)))
 
     def _standing_notes(
@@ -754,6 +797,8 @@ class RolePlayEngine:
             topics = "; ".join(labels[topic] for topic in self._answered if topic in labels)
             if topics:
                 notes.append(ANSWERED_NOTE.format(topics=topics))
+        if mode is TurnMode.LLM_REPLY and self._hollow_run >= 1 and self._last_reply_closer:
+            notes.append(HOLLOW_NOTE)
         if self._phrases.get(PHRASE_STRETCH, 0) >= 1:
             notes.append(STRETCH_USED_NOTE)
         if self._phrases.get(PHRASE_TEMPLATE_Q, 0) >= 1:
@@ -764,9 +809,12 @@ class RolePlayEngine:
 
     def _evidence(self, kind: AskKind) -> CommitmentEvidence:
         """The commitment evidence, with the stall reasons the advisor handled added."""
+        words = self._word_counts
+        thin = len(words) >= THIN_MIN_TURNS and sum(words) / len(words) < THIN_ADVISOR_MEAN_WORDS
         return replace(
             self.tracker.commitment_evidence(kind),
             reasons_handled=self.negotiation.reasons_handled_count,
+            thin=thin,
         )
 
     def _negotiate(
@@ -824,17 +872,29 @@ class RolePlayEngine:
                 reasons.append("ask_before_close_window")
                 return self._reason_plan(reasons, **layers)
             self._pending_ask = None
-            level = grade(self._evidence(wants))
+            evidence = self._evidence(wants)
+            level = grade(evidence)
             reasons.append(f"ask_in_window:grade_{level.name.lower()}")
+            if evidence.pressured:
+                reasons.append("advisor_pressured")  # an invented offer or a coercive deadline
+            if evidence.thin:
+                reasons.append("advisor_thin")  # answers in a handful of words, all call
+            if level is Level.MEDIUM and negotiation.call_declined():
+                # The learner turned a call or a time down in so many words ("I'd rather reach out
+                # myself", "I'd rather not lock in a time yet"): it does not book one now.  In the
+                # live sweep it booked the call anyway in nine of twenty calls, two minutes after
+                # the refusal, and the pushy and terse advisors earned a MEDIUM they had not.
+                level = Level.WEAK
+                reasons.append("call_declined")
             if level > Level.WEAK:
-                return self._commit_plan(level, reasons)
-            if negotiation.can_stall(self._reasons_owned_by_f4()):
+                return self._commit_plan(level, reasons, ask=wants)
+            if negotiation.can_stall(self._stall_skip()):
                 negotiation.stall_rounds += 1
                 planned = self._reason_plan(reasons, **layers)
                 if planned is not None:
                     return planned
             # A stall that answers a CALL ask does not ask for an e-mail nobody offered.
-            return self._commit_plan(Level.WEAK, reasons, call=wants is AskKind.CALL)
+            return self._commit_plan(Level.WEAK, reasons, call=wants is AskKind.CALL, ask=wants)
         if seen.email_offer:
             if negotiation.email_answered:
                 self._notes.append(EMAIL_AGAIN_NOTE)
@@ -847,7 +907,9 @@ class RolePlayEngine:
                     self._notes.append(EMAIL_OFFER_NOTE)
                 else:
                     reasons.append("email_offer")
-                    return self._spec_plan(SPEC_BY_ID[N_EMAIL], reasons, **layers)
+                    # The advisor already said what is in it: the learner says yes and asks nothing.
+                    spec_id = N_EMAIL_YES if seen.email_listed else N_EMAIL
+                    return self._spec_plan(SPEC_BY_ID[spec_id], reasons, **layers)
         if seen.checkin:
             reasons.append("checkin")
             self._force_curiosity = True
@@ -866,9 +928,21 @@ class RolePlayEngine:
             owned.add(REASON_DECISION_MAKER)
         return frozenset(owned)
 
+    def _stall_skip(self) -> frozenset[str]:
+        """Stall reasons the learner does not voice now.
+
+        The F4 pair's own reasons (see above), and the money stall once the price stopped being the
+        worry: the $7,000 was met, or the learner called the cost the lesser worry ("The cost is
+        still the sticking point for me" after "my worry is more about time than money").
+        """
+        skip = set(self._reasons_owned_by_f4())
+        if self.negotiation.money_is_settled():
+            skip.add(REASON_MONEY)
+        return frozenset(skip)
+
     def _reason_plan(self, reasons: list[str], **layers: Any) -> TurnPlan | None:
         """Voice the next unused stall reason, else the one question about the call, else None."""
-        reason = self.negotiation.next_reason(self._reasons_owned_by_f4())
+        reason = self.negotiation.next_reason(self._stall_skip())
         if reason is not None:
             spec = SPEC_BY_REASON[reason]
         elif not self.negotiation.question_used:
@@ -913,15 +987,40 @@ class RolePlayEngine:
             monologue=monologue,
         )
 
+    def _weak_kwargs(self, call: bool = False) -> dict[str, bool]:
+        """Which wording of the WEAK line fits the call so far.
+
+        The e-mail was offered or accepted: "I'll read through the email and get back to you", not a
+        second request for it.  A call ask and no declined call: "call me back after I've talked to
+        my husband".  Otherwise (also after a declined call) the plain "email me the details".
+        """
+        negotiation = self.negotiation
+        emailed = bool(negotiation.email_offers) or negotiation.email_answered
+        return {"emailed": emailed, "call": call and not negotiation.call_declined()}
+
+    def _weak_text(self, default: str) -> str:
+        """The WEAK line of a farewell or the 13:00 stall, in the wording that fits."""
+        kwargs = self._weak_kwargs()
+        if not kwargs["emailed"]:
+            return default
+        return commitment_line(Level.WEAK, self.persona.decision_maker, **kwargs)
+
     def _commit_plan(
-        self, level: Level, reasons: list[str], *, call: bool = False
+        self,
+        level: Level,
+        reasons: list[str],
+        *,
+        call: bool = False,
+        ask: AskKind | None = None,
     ) -> TurnPlan | None:
         """The scripted commitment line for ``level`` (MEDIUM carries the call slot).
 
         ``call`` says the WEAK stall answers a call ask: its second sentence then says the learner
         will talk to its decision maker and be called back, not "e-mail me the details".  A MEDIUM
         line books the call without a slot when the advisor named none and the learner had just
-        said it must talk to its decision maker first.
+        said it must talk to its decision maker first, when the slot is one the learner refused or
+        the advisor named long ago, or when the ask was not for a call at all (``ask`` is the
+        enrolment ask: the learner does not invent "Thursday at 7 PM" for it).
         """
         negotiation = self.negotiation
         dm = self.persona.decision_maker
@@ -929,12 +1028,14 @@ class RolePlayEngine:
             self._notes.append(RESOLVED_NOTE)  # the WEAK line is said at most once
             return None
         if level is Level.MEDIUM:
-            choice = negotiation.slot_choice(self.turn)
+            choice = negotiation.slot_choice(self.turn, picks_own=ask is not AskKind.ENROL)
             text = commitment_line(
                 level, dm, choice.phrase, moved=choice.moved, deferred=choice.deferred
             )
+        elif level is Level.WEAK:
+            text = commitment_line(level, dm, **self._weak_kwargs(call))
         else:
-            text = commitment_line(level, dm, call=call and level is Level.WEAK)
+            text = commitment_line(level, dm)
         negotiation.note_response(self.turn, f"commit:{level.name.lower()}")
         return self._plan(
             TurnMode.SAY_ONLY,
@@ -962,19 +1063,20 @@ class RolePlayEngine:
         if self.negotiation.weak_line_said:
             self._notes.append(RESOLVED_NOTE)
             return None
+        text = self._weak_text(move.text)
         intent = LearnerIntent(
             kind=KIND_COMMIT,
             brief=COMMIT_REACTION_BRIEF,
             must_say=(),
             markers=(),
-            fallback=move.text,
-            fallbacks=(move.text,),
+            fallback=text,
+            fallbacks=(text,),
         )
         self.negotiation.note_response(self.turn, "commit:weak_at_stall")
         return self._plan(
             TurnMode.INTENT,
             reasons,
-            scripted=move.text,
+            scripted=text,
             move_id=move.id,
             level=Level.WEAK,
             resolves=True,
@@ -1045,6 +1147,10 @@ class RolePlayEngine:
             # The advisor just proposed a call: "I'd need to talk to my father" must not turn into
             # "he's not really one for these things", and the call stays welcome.
             move = replace(move, brief=move.brief + F4_PUSH_CALL_SUFFIX)
+        elif move.id == TIME_CUE:
+            # Three wordings of the cue, one per attempt ("before my own next call": 8 of 20).
+            briefs = (move.brief, *TIME_CUE_BRIEF_ALTERNATIVES)
+            move = replace(move, brief=pick_variant(briefs, self.seed, 0))
         variants = move.variants or (move.text,)
         fallbacks = self._fallback_order(
             move.id, variants, REDIRECT_OPENERS if redirect else ()
@@ -1089,6 +1195,16 @@ class RolePlayEngine:
             normalize(sentence) for sentence in split_sentences(spoken_so_far)
         )
         candidates = intent.fallbacks or (intent.fallback,)
+        if "?" in spoken_so_far:
+            # The model already asked something in this reply: a second question in the scripted
+            # tail is the same question twice in other words ("... what would I actually end up
+            # paying? Sorry, so what's the final number you can do for me?").  A statement that
+            # proves the move goes first, then the tail without its question if that still proves
+            # it.
+            quiet = [text for text in candidates if "?" not in text]
+            stripped = [_without_questions(text) for text in candidates if "?" in text]
+            stripped = [text for text in stripped if text and markers_match(intent.markers, text)]
+            candidates = (*quiet, *stripped, *candidates)
         chosen = next((text for text in candidates if not _repeats(text, said)), candidates[0])
         key = plan.move_id or plan.negotiation_id
         if key is not None:
@@ -1290,13 +1406,15 @@ class RolePlayEngine:
         if spoken_text.strip():
             self._styles.append((reply_opener(spoken_text), reply_tics(spoken_text)))
             self._asked.append("?" in spoken_text)
+            self._last_reply_closer = is_closer(spoken_text)
             for key in reply_phrases(spoken_text):
                 self._phrases[key] = self._phrases.get(key, 0) + 1
         self.tracker.note_learner_text(spoken_text, plan.turn)
         self.negotiation.note_learner_text(spoken_text, plan.turn)
         if self._pending_ask is not None and declines_call(spoken_text):
-            # The learner turned the proposed call down in its own words: a farewell inside the
-            # close window must not book it after all (R1-Q iteration 2).
+            # The learner turned the proposed call down in its own words ("I'd rather keep it to
+            # email", "I'd rather reach out myself", "I'd rather you didn't"): a farewell inside the
+            # close window must not book it after all (R1-Q iterations 2 and 3).
             self._pending_ask = None
             self._declined_calls += 1
         if plan.move_id is not None:
@@ -1487,6 +1605,11 @@ class RolePlayEngine:
             "exclusion_reasons": schedule["exclusion_reasons"],
             "fidelity": fidelity,
         }
+
+
+def _without_questions(text: str) -> str:
+    """``text`` without its question sentences ("A statement. A question?" -> "A statement.")."""
+    return " ".join(s for s in split_sentences(text) if "?" not in s).strip()
 
 
 def _repeats(text: str, said: tuple[str, ...]) -> bool:

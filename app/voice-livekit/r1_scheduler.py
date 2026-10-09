@@ -314,6 +314,12 @@ PLAN: tuple[MoveSpec, ...] = (
                 r"\bnothing\b",
                 r"\bpayment plans?\b",
                 r"\banything at all\b",
+                # R1-Q iteration 3: "so what would I actually end up paying?" is the counter asked
+                # as a question (the model's own, then given the scripted "what's the final number
+                # you can do for me?" on top).  ("What would I be paying for?" is F3, not this.)
+                r"\b(?:end up|ending up) paying\b",
+                r"\b(?:actual|real|total) (?:price|number|cost)\b",
+                r"\bwhat (?:would|will) (?:it|that) (?:actually )?(?:come to|cost)\b",
             ),
         ),
         variants=(
@@ -375,6 +381,10 @@ PLAN: tuple[MoveSpec, ...] = (
                 r"\bcheck\w*",
                 r"\bask\w*",
                 r"\brun (?:it|this|that) by\b",
+                # "run all of this by my husband" (R1-Q iteration 3: it missed, and the line was
+                # said again as "I'd also need to talk to my husband.")
+                r"\brun\b[^.?!]{0,20}\bby\b",
+                r"\bgo (?:over|through)\b[^.?!]{0,25}\bwith\b",
                 r"\bspeak\b",
                 r"\bconsult\w*",
                 r"\btell\b",
@@ -423,6 +433,15 @@ PLAN: tuple[MoveSpec, ...] = (
     ),
 )
 FAMILIES = ("F3", "F2", "F1", "F4")
+# R1-Q iteration 3.  "before my (own) next call" came back verbatim in 8 of 20 calls, also from a
+# learner who was at home after work.  The cue is the same move said three ways (rotated by the
+# attempt id); the markers accept all three.
+TIME_CUE_BRIEF_ALTERNATIVES = (
+    "you tell the advisor that YOU can only stay for a couple more minutes because something else "
+    "is coming up for you; it is your time that is short, not theirs",
+    "you tell the advisor that YOU have to wrap up in a few minutes and leave soon; it is your "
+    "time that is short, not theirs",
+)
 # Curiosity topics of the free replies (R1-Q): the two neutral questions that used to be
 # scheduled (Q-A "live or recorded?", Q-B "what would I build?") plus three more.  The engine
 # hands the model one unasked topic every ``CURIOSITY_EVERY`` free replies.
@@ -686,7 +705,14 @@ _CURIOSITY_COVERED = {
         r"\bmentor(?:s|ship|ing)?\b", r"\binstructors?\b", r"\b1[- ]on[- ]1\b"
     ),
     "weekly_hours": _compile(
-        r"\bhours? (?:a|per|each|every) (?:week|day)\b", r"\b\d+ hours?\b", r"\bhours of\b"
+        r"\bhours? (?:a|per|each|every) (?:week|day)\b",
+        r"\b\d+ hours?\b",
+        r"\bhours of\b",
+        # "ten to fifteen hours" (R1-Q iteration 3: the hours were asked again after "ten to
+        # fifteen hours a week" because only digits counted)
+        r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|fifteen|twenty)"
+        r"(?:\s*(?:-|to)\s*(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+        r"fifteen|twenty))?\s+hours?\b",
     ),
 }
 
@@ -1358,7 +1384,19 @@ class OwedMoveScheduler:
             return False
         if state.markers:
             return markers_match(state.markers, spoken_text)
-        return fuzzy_contains(spoken_text, state.text, MATCH_THRESHOLD)
+        if fuzzy_contains(spoken_text, state.text, MATCH_THRESHOLD):
+            return True
+        if move_id == COMMIT_STALL:
+            # The stall has three wordings (e-mail me; call me back; I'll read the e-mail).
+            return any(
+                fuzzy_contains(
+                    spoken_text,
+                    commitment_line(Level.WEAK, self.decision_maker, **variant),
+                    MATCH_THRESHOLD,
+                )
+                for variant in ({"call": True}, {"emailed": True})
+            )
+        return False
 
     def confirm_if_spoken(
         self, move_id: str, spoken_text: object, r_sec: float, *, interrupted: bool = False

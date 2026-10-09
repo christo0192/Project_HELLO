@@ -923,5 +923,49 @@ class CoachScopeTests(unittest.TestCase):
                 self.assertEqual(detect_character_break(text), "coach")
 
 
+class IterationThreeGateTests(unittest.TestCase):
+    """R1-Q iteration 3 (D3): a generic follow-up follows up the topic the learner just talked about,
+    not another topic the same turn asks about."""
+
+    def test_a_question_about_another_topic_does_not_release_the_first(self):
+        g = gate()
+        g.observe_candidate_turn("What's prompting you to look into data science right now?", 1)
+        self.assertEqual(g.state("H1"), NeedState.SURFACE)
+        update = g.observe_candidate_turn(
+            "When you say you've been meaning to look into it, what's held you back so far?", 2
+        )
+        self.assertEqual(update.first_probes, ("H2",))
+        self.assertEqual(update.released, ())
+        self.assertEqual(g.state("H1"), NeedState.SURFACE)
+        self.assertEqual(g.state("H2"), NeedState.SURFACE)
+        self.assertEqual(g.deep_due(update), ())
+
+    def test_a_plain_follow_up_still_releases_the_topic_just_discussed(self):
+        g = gate()
+        g.observe_candidate_turn(H1_PROBE, 1)
+        update = g.observe_candidate_turn("When you say it's stagnant, what do you mean?", 2)
+        self.assertEqual(update.released, ("H1",))
+        self.assertEqual(g.deep_due(update), ("H1",))
+
+    def test_a_follow_up_on_the_deep_layer_does_not_repeat_it_for_another_topic(self):
+        g = gate()
+        g.observe_candidate_turn(H1_PROBE, 1)
+        update = g.observe_candidate_turn("And what's driving the timeline for that?", 2)
+        self.assertEqual(g.deep_due(update), ("H1",))
+        g.mark_deep_offered(("H1",))
+        asks_other = g.observe_candidate_turn("Tell me more. How many hours a week could you give?", 3)
+        self.assertNotIn("H1", g.deep_due(asks_other))
+
+    def test_a_pressured_or_a_thin_advisor_is_caught_by_the_tracker_flags(self):
+        t = CoverageTracker(PERSONA)
+        t.observe_candidate_turn("I can do $4,800 off, only tonight!", 1)
+        evidence = t.commitment_evidence(AskKind.CALL)
+        self.assertTrue(evidence.pressured)
+        self.assertEqual(grade(evidence), Level.WEAK)
+        calm = CoverageTracker(PERSONA)
+        calm.observe_candidate_turn("The course is six months and covers SQL and Python.", 1)
+        self.assertFalse(calm.commitment_evidence(AskKind.CALL).pressured)
+
+
 if __name__ == "__main__":
     unittest.main()

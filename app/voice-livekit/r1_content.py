@@ -64,7 +64,15 @@ import r1_world
 #    marks, the anchor is told to the advisor (no "you say"), a calm reached anchor, a call-back
 #    WEAK line for a call ask and a MEDIUM line that books without a slot, the F4 push never says
 #    the decision maker dislikes calls, hold / answered-facts notes, wider F3 / F4 delivery markers.
-CONTENT_REVISION = 11
+# 12: R1-Q learner iteration 3 (the third live sweep): the MEDIUM line books only a slot the learner
+#    can stand behind (stale, refused and absent slots lead to a deferred line; a firm "I'd rather
+#    reach out myself" downgrades a booking), an e-mailed WEAK line, a thin or pressing advisor
+#    caps the grade at WEAK, the money stall yields once cost is said to be secondary, an "e-mail
+#    yes" spec for an offer that listed its contents, an anchor below $7,000 is "even below the
+#    $7,000", the unchanged-price replacement, three "thinking" fallbacks, a once-per-call
+#    concession tag, a hollow-advisor note (no second goodbye), the H3 first-probe reminder (answer
+#    only the part that was asked) and three wordings of the time cue.
+CONTENT_REVISION = 12
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -139,6 +147,7 @@ def manifest() -> dict[str, Any]:
             "redirect_openers": list(r1_scheduler.REDIRECT_OPENERS),
             "redirect_brief": r1_scheduler.REDIRECT_BRIEF,
             "answered_labels": [list(item) for item in r1_scheduler.ANSWERED_LABELS],
+            "time_cue_alternatives": list(r1_scheduler.TIME_CUE_BRIEF_ALTERNATIVES),
             "f4_push_call_suffix": r1_scheduler.F4_PUSH_CALL_SUFFIX,
             "curiosity_topics": [list(item) for item in r1_scheduler.CURIOSITY_TOPICS],
             "constants": {
@@ -191,6 +200,7 @@ def manifest() -> dict[str, Any]:
                 "preferred_time": r1_negotiation.PREFERRED_TIME,
                 "moved_day": r1_negotiation.MOVED_DAY,
                 "defer_recent_turns": r1_negotiation.DEFER_RECENT_TURNS,
+                "slot_recent_turns": r1_negotiation.SLOT_RECENT_TURNS,
             },
         },
         "commitment": {
@@ -199,6 +209,9 @@ def manifest() -> dict[str, Any]:
             "moved_line": r1_commitment.MEDIUM_MOVED_LINE,
             "defer_line": r1_commitment.MEDIUM_DEFER_LINE,
             "weak_call_line": r1_commitment.WEAK_CALL_LINE,
+            "weak_email_done_line": r1_commitment.WEAK_EMAIL_DONE_LINE,
+            "thin_advisor_mean_words": r1_commitment.THIN_ADVISOR_MEAN_WORDS,
+            "thin_min_turns": r1_commitment.THIN_MIN_TURNS,
             "permitted_r_sec": r1_commitment.COMMIT_PERMITTED_R_SEC,
             "stall_r_sec": r1_commitment.COMMIT_STALL_R_SEC,
             "discount_cap_usd": r1_commitment.DISCOUNT_CAP_USD,
@@ -215,6 +228,7 @@ def manifest() -> dict[str, Any]:
             "confirm_fallbacks": list(r1_guard.CONFIRM_FALLBACKS),
             "anchor_heard_replacement": r1_guard.ANCHOR_HEARD_REPLACEMENT,
             "anchor_heard_below": r1_guard.ANCHOR_HEARD_BELOW,
+            "price_unchanged_replacement": r1_guard.PRICE_UNCHANGED_REPLACEMENT,
             "style": {
                 "tic_window": r1_guard.STYLE_TIC_WINDOW,
                 "opener_window": r1_guard.STYLE_OPENER_WINDOW,
@@ -223,6 +237,7 @@ def manifest() -> dict[str, Any]:
                 "question_diet_window": r1_guard.QUESTION_DIET_WINDOW,
                 "thin_reply_words": r1_guard.THIN_REPLY_WORDS,
                 "stretch_alternatives": list(r1_text.STRETCH_ALTERNATIVES),
+                "hollow_max_words": r1_text.HOLLOW_MAX_WORDS,
             },
             "reply_word_cap": r1_guard.REPLY_WORD_CAP,
             "ack_word_cap": r1_guard.ACK_WORD_CAP,
@@ -277,7 +292,11 @@ def manifest() -> dict[str, Any]:
             "style_reminder_sample": r1_prompts.turn_reminder(
                 sample, r_sec=0, style_note=r1_prompts.STYLE_NOTES[1]
             ),
+            "h3_first_probe_sample": r1_prompts.turn_reminder(
+                sample, r_sec=0, first_probe_topics=("H3",)
+            ),
             "style_notes": list(r1_prompts.STYLE_NOTES),
+            "hollow_note": r1_prompts.HOLLOW_NOTE,
             "confirm_note": r1_prompts.CONFIRM_NOTE,
             "decider_asked_note": r1_prompts.DECIDER_ASKED_NOTE.format(
                 answer=sample.decider_answer
