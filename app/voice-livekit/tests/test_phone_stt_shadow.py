@@ -454,6 +454,24 @@ class TestParsing(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(shadow.counters["unrecovered_death"], 1)
         self.assertTrue(shadow._dead)
 
+    async def test_silence_utterance_counters_via_the_socket(self):
+        # End to end through the parser: indexed partials of one utterance with no
+        # local VAD segment -> call_summary carries the two new counters, no text.
+        ws = FakeWs()
+        shadow, rec, clock, *_ = make_shadow(ws)
+        shadow.offer(Frame())
+        await settle()
+        for i, text in enumerate((SENTINELS[1], f"{SENTINELS[1]} b", f"{SENTINELS[1]} b c",
+                                  f"{SENTINELS[1]} b c d")):
+            clock.t += 0.3
+            ws.feed_json({"event": "transcript.partial", "text": text, "utterance_idx": 2})
+        await settle()
+        shadow.close_nowait()
+        summary = {m["schema"]: m["option_count"] for m in rec.of("call_summary")}
+        self.assertEqual((summary["silence_utts"], summary["silence_utts_3w"]), (1, 1))
+        self.assertEqual((summary["silence_partials"], summary["silence_partial_words"]), (4, 10))
+        self.assertNotIn(SENTINELS[1], json.dumps(rec.events))
+
     async def test_nonfatal_errors_logged_five_times_then_counted(self):
         ws = FakeWs()
         shadow, rec, *_ = make_shadow(ws)
@@ -667,6 +685,99 @@ class TestTracker(unittest.TestCase):
         self.assertEqual(tr.counters["silence_partials"], 1)
         self.assertEqual(tr.counters["rt_empty_partials"], 1)
 
+    # -- round-3 major: interim words outside any local VAD segment ------------
+
+    def test_silence_utterance_reaching_three_words_is_counted(self):
+        # The exact review timeline: 4 cumulative partials (1, 2, 3, 4 words) of
+        # ONE utterance, no local VAD segment at all (TV / second speaker / echo).
+        # The SDK would pause the bot at the 3rd word; PR-2's gate must see that.
+        for utt in (None, 7):
+            rec = Recorder()
+            tr = pss.SegmentTracker(self.clock, rec)
+            tr.arm()
+            for i, (words, t) in enumerate(((1, 5.0), (2, 5.3), (3, 5.6), (4, 5.9)), 1):
+                tr.rt_partial(words, t, utt)
+            c = tr.counters
+            self.assertEqual((c["silence_partials"], c["silence_partial_words"]), (4, 10), utt)
+            self.assertEqual((c["silence_utts"], c["silence_utts_3w"]), (1, 1), utt)
+            self.assertEqual(c["segments"], 0)
+            self.assertEqual(rec.of("seg_summary"), [])
+
+    def test_silence_utterances_are_counted_once_each(self):
+        tr = self.tr
+        # utterance 4: 1, 2 words only; utterance 5: 5 words (jumps over 3); both indexed
+        tr.rt_partial(1, 5.0, 4)
+        tr.rt_partial(2, 5.3, 4)
+        tr.rt_partial(5, 6.0, 5)
+        tr.rt_partial(5, 6.2, 5)               # same max again: not a second 3w event
+        tr.rt_partial(6, 6.4, 5)
+        c = tr.counters
+        self.assertEqual((c["silence_utts"], c["silence_utts_3w"]), (2, 1))
+
+    def test_unindexed_silence_runs_split_on_gap_final_and_local_speech(self):
+        tr = self.tr
+        tr.rt_partial(3, 5.0)
+        tr.rt_partial(4, 5.4)                  # same run: still one utterance
+        tr.rt_partial(1, 9.0)                  # gap > SILENCE_RUN_GAP: new run
+        tr.rt_partial(3, 9.4)
+        self.assertEqual((tr.counters["silence_utts"], tr.counters["silence_utts_3w"]), (2, 2))
+        tr.rt_final(3, 9.8)                    # a realtime final closes the run
+        tr.rt_partial(2, 10.0)
+        self.assertEqual((tr.counters["silence_utts"], tr.counters["silence_utts_3w"]), (3, 2))
+        tr.vad_start(10.5)                     # local speech closes the run too
+        tr.vad_end(10.9)
+        tr.tick(20.0)
+        tr.rt_partial(3, 21.0)
+        self.assertEqual((tr.counters["silence_utts"], tr.counters["silence_utts_3w"]), (4, 3))
+
+    def test_attributed_partials_are_not_silence_utterances(self):
+        tr = self.tr
+        tr.vad_start(10.0)
+        for words, t in ((1, 10.3), (2, 10.6), (3, 10.9), (4, 11.2)):
+            tr.rt_partial(words, t, 0)
+        tr.vad_end(11.5)
+        tr.tick(30.0)
+        self.assertEqual((tr.counters["silence_utts"], tr.counters["silence_utts_3w"]), (0, 0))
+
+    def test_silence_utterance_memory_is_bounded(self):
+        tr = self.tr
+        for i in range(pss.SILENCE_UTT_KEEP * 3):
+            tr.rt_partial(3, 5.0 + i * 0.01, i)
+        self.assertEqual(tr.counters["silence_utts"], pss.SILENCE_UTT_KEEP * 3)
+        self.assertLessEqual(len(tr._sil), pss.SILENCE_UTT_KEEP)
+
+    # -- round-3 minor: a slow first partial is slow, not dropped ---------------
+
+    def test_slow_first_partial_after_tail_counts_as_slow_for_the_segment(self):
+        # 'yes': VAD 20.0-20.6, legacy final 21.5, first realtime partial 21.8,
+        # i.e. 1.2 s after the end (> TAIL). It must land on the segment as P1.
+        tr = self.tr
+        tr.vad_start(20.0)
+        tr.vad_end(20.6)
+        tr.legacy_final(1, 21.5)
+        tr.rt_partial(1, 21.8, 3)
+        tr.rt_partial(1, 22.0, 3)              # later partial of the utterance follows
+        tr.tick(30.0)
+        self.assertEqual(self.values("seg_partial_lead", 0)[0]["duration_sec"], 1.8)
+        self.assertEqual(self.seg_summary(0)["schema"], "both")
+        self.assertEqual(tr.counters["late_first_partials"], 1)
+        self.assertEqual(tr.counters["silence_partials"], 0)
+
+    def test_partial_beyond_settle_or_after_a_first_partial_stays_silence(self):
+        tr = self.tr
+        tr.vad_start(20.0)
+        tr.vad_end(20.6)
+        tr.rt_partial(1, 20.9)                 # first partial, inside TAIL
+        tr.rt_partial(2, 21.9)                 # beyond TAIL but the segment HAS a partial
+        self.assertEqual(tr.counters["silence_partials"], 1)
+        tr.vad_start(30.0)
+        tr.vad_end(30.5)
+        tr.rt_partial(1, 33.6)                 # E + SETTLE passed: segment 1 already settled
+        self.assertEqual(tr.counters["silence_partials"], 2)
+        self.assertEqual(tr.counters["late_first_partials"], 0)
+        tr.tick(40.0)
+        self.assertEqual(self.seg_summary(1)["schema"], "silent")
+
     def test_orphans(self):
         tr = self.tr
         tr.legacy_final(2, 5.0)
@@ -844,7 +955,7 @@ class TestCloseCodes(unittest.IsolatedAsyncioTestCase):
 
     async def test_unexpected_codes_are_deaths(self):
         for code, schema in ((1000, "close_1000"), (1003, "close_1003"), (1008, "close_1008"),
-                             (1011, "close_1011"), (4000, "close_4000"),
+                             (1006, "close_1006"), (1011, "close_1011"), (4000, "close_4000"),
                              (99999, "close_unknown"), (None, "close_unknown")):
             shadow, rec = await self._server_close(code)
             row = rec.of("socket_closed")[0]
@@ -862,6 +973,42 @@ class TestCloseCodes(unittest.IsolatedAsyncioTestCase):
         row = rec.of("socket_closed")[0]
         self.assertEqual((row["schema"], row["phase"]), ("close_1000", "expected"))
         self.assertEqual(shadow.counters["unrecovered_death"], 0)
+
+    async def test_slow_close_reply_after_our_end_is_not_a_death(self):
+        # Review r3 (lens 3): at call end Sarvam answers session.end, then takes
+        # longer than our 2 s close bound to answer the close frame; aiohttp
+        # reports 1006 when its bounded wait is cancelled. That is OUR timeout.
+        class HangCloseWs(FakeWs):
+            async def close(self):
+                await asyncio.Event().wait()
+
+        ws = HangCloseWs(close_code=1006)
+        shadow, rec, *_ = make_shadow(ws)
+        shadow.offer(Frame())
+        await settle()
+        shadow.close_nowait()
+        await settle(0.02)
+        ws.feed_json({"event": "session.end", "audio_duration_s": 1.0})
+        await asyncio.wait_for(shadow._task, 2)
+        row = rec.of("socket_closed")[0]
+        self.assertEqual((row["schema"], row["phase"]), ("close_1006", "close_timeout"))
+        self.assertEqual(shadow.counters["unrecovered_death"], 0)
+
+    async def test_1006_without_our_end_is_still_a_death(self):
+        # A 1006 mid-call (we never asked to end) is a real unexpected death.
+        class HangCloseWs(FakeWs):
+            async def close(self):
+                await asyncio.Event().wait()
+
+        ws = HangCloseWs(close_code=1006)
+        shadow, rec, *_ = make_shadow(ws)
+        shadow.offer(Frame())
+        await settle()
+        ws.feed(pss.MSG_CLOSE)
+        await asyncio.wait_for(shadow._task, 2)
+        row = rec.of("socket_closed")[0]
+        self.assertEqual((row["schema"], row["phase"]), ("close_1006", "unexpected"))
+        self.assertEqual(shadow.counters["unrecovered_death"], 1)
 
     async def test_session_end_after_our_end_finishes_early(self):
         ws = FakeWs()

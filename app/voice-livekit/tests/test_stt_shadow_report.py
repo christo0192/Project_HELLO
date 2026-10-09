@@ -29,7 +29,8 @@ def row(cid, cat, **meta):
     return d
 
 
-def seg(cid, k, klass, pmax, *, p1=None, p3=None, f=None, lw=0, rf=None, rw=0, dur=2.0):
+def seg(cid, k, klass, pmax, *, p1=None, p3=None, f=None, lw=0, rf=None, rw=0, dur=2.0,
+        phase="settled"):
     out = []
     if p1 is not None:
         out.append(row(cid, "seg_partial_lead", turn_index=k, duration_sec=p1))
@@ -40,7 +41,7 @@ def seg(cid, k, klass, pmax, *, p1=None, p3=None, f=None, lw=0, rf=None, rw=0, d
     if rf is not None:
         out.append(row(cid, "seg_rt_final", turn_index=k, duration_sec=rf, option_count=rw))
     out.append(row(cid, "seg_summary", turn_index=k, schema=klass, option_count=pmax,
-                   phase="settled", duration_sec=dur))
+                   phase=phase, duration_sec=dur))
     return out
 
 
@@ -132,7 +133,7 @@ class TestReport(unittest.TestCase):
         per = {m["cid"]: m for m in json.loads(out)["per_call"]}
         a, b = per["aaaaaaaa"], per["bbbbbbbb"]
         self.assertEqual((a["segments"], a["non_silent"], a["noise"], a["false3"]), (5, 4, 1, 0))
-        self.assertAlmostEqual(a["g1_median"], 0.4)
+        self.assertAlmostEqual(a["g1_median"], 0.45)   # 0.3 0.4 0.5 + the rt_missed ceiling 3.0
         self.assertAlmostEqual(a["g2_median"], 1.35)
         self.assertEqual((a["agree"], a["agree_n"], a["deaths"]), (2, 2, 0))
         self.assertEqual((b["false3"], b["agree"], b["agree_n"], b["deaths"]), (1, 0, 2, 1))
@@ -282,6 +283,126 @@ class TestReport(unittest.TestCase):
         report = rep.aggregate(rep.build_calls(rows), 1, 0)
         self.assertEqual(report["also"]["queue_lag_max_ms"], 2500)
         self.assertTrue(any("behind real time" in w for w in report["warnings"]))
+
+    # -- round-3 major: silence utterances reaching 3 words gate G4 ---------------
+
+    def _clean_call(self, cid, n=20, **summary):
+        rows = [row(cid, "armed")]
+        for k in range(n):
+            rows += seg(cid, k, "both", 4, p1=0.4, p3=0.9, f=2.2, lw=6, rf=2.3, rw=6)
+        for name, value in dict(unrecovered_death=0, **summary).items():
+            rows.append(row(cid, "call_summary", schema=name, option_count=value))
+        return rows
+
+    def test_g4_numerator_adds_silence_utts_3w(self):
+        # exact formula: (false3 segments + silence_utts_3w) / counted non-silent
+        # 20 clean segments: 0 false3. silence_utts_3w = 1 -> 1/20 = 5.0 % (pass, <= 5 %)
+        rows = self._clean_call(CID_A, silence_utts=3, silence_utts_3w=1)
+        report = rep.aggregate(rep.build_calls(rows), 1, 0)
+        g4 = report["criteria"]["G4"]
+        self.assertAlmostEqual(g4["value"], 1 / 20)
+        self.assertTrue(g4["pass"])
+        # silence_utts_3w = 2 -> 10 %: NO-GO on G4 although every segment is clean
+        rows = self._clean_call(CID_A, silence_utts=3, silence_utts_3w=2)
+        report = rep.aggregate(rep.build_calls(rows), 1, 0)
+        self.assertAlmostEqual(report["criteria"]["G4"]["value"], 2 / 20)
+        self.assertFalse(report["criteria"]["G4"]["pass"])
+        self.assertEqual(report["verdict"], "NO-GO (G4)")
+        self.assertEqual(report["also"]["silence_utts_3w"], 2)
+        self.assertEqual(report["per_call"][0]["silence_utts_3w"], 2)
+
+    def test_g4_sums_false3_segments_and_silence_utts_over_calls(self):
+        rows = self._clean_call(CID_A, silence_utts_3w=1)
+        rows += [row(CID_B, "armed")]
+        for k in range(20):
+            rows += seg(CID_B, k, "both", 3, p1=0.4, p3=0.9 if k == 0 else None, f=2.2,
+                        lw=2 if k == 0 else 6, rf=2.3, rw=2 if k == 0 else 6)
+        report = rep.aggregate(rep.build_calls(rows), 1, 0)
+        # false3: call B segment 0 (3rd partial word, legacy final of 2 words) = 1;
+        # silence 3w utterances: 1; counted non-silent: 40  ->  2/40 = 5.0 %
+        self.assertAlmostEqual(report["criteria"]["G4"]["value"], 2 / 40)
+        text = rep.render(report, 0, 1)
+        self.assertIn("sil3w", text)
+        self.assertIn("silence utterances/call", text)
+
+    # -- round-3 minor: cut-off segments are not noise ------------------------------
+
+    def test_segments_cut_off_by_call_end_are_not_counted_in_g3_g4(self):
+        rows = self._clean_call(CID_A)
+        # cut off at call end: partials, but the legacy final was still in flight
+        rows += seg(CID_A, 20, "noise_partial", 3, p1=0.3, p3=0.8, dur=1.0, phase="truncated")
+        # truncated but with its final already in: counted like any other segment
+        rows += seg(CID_A, 21, "both", 4, p1=0.3, p3=0.8, f=1.5, lw=5, rf=1.6, rw=5,
+                    phase="truncated")
+        report = rep.aggregate(rep.build_calls(rows), 1, 0)
+        c = report["criteria"]
+        self.assertAlmostEqual(c["G3"]["value"], 0.0)
+        self.assertAlmostEqual(c["G4"]["value"], 0.0)
+        self.assertEqual(report["counted_segments"], 21)
+        self.assertEqual(report["non_silent_segments"], 22)
+        self.assertEqual(report["also"]["cut_off_segments"], 1)
+        self.assertIn("cut-off segments 1", rep.render(report, 0, 1))
+        # the same segment settled normally IS noise
+        rows2 = self._clean_call(CID_A) + seg(CID_A, 20, "noise_partial", 3, p1=0.3, p3=0.8)
+        report2 = rep.aggregate(rep.build_calls(rows2), 1, 0)
+        self.assertAlmostEqual(report2["criteria"]["G3"]["value"], 1 / 21)
+        self.assertAlmostEqual(report2["criteria"]["G4"]["value"], 1 / 21)
+
+    # -- round-3 minor: slow models cannot pass G1 on survivorship ------------------
+
+    def test_settled_rt_missed_segments_count_as_slow_in_g1(self):
+        rows = [row(CID_A, "armed")]
+        for k in range(10):
+            rows += seg(CID_A, k, "both", 3, p1=0.4, p3=0.9, f=2.2, lw=6, rf=2.3, rw=6)
+        for k in range(10, 20):                      # the model never answered these
+            rows += seg(CID_A, k, "rt_missed", 0, f=2.0, lw=4)
+        rows += seg(CID_A, 20, "rt_missed", 0, f=2.0, lw=4, phase="truncated")   # cut off: no ceiling
+        report = rep.aggregate(rep.build_calls(rows), 1, 0)
+        g1 = report["criteria"]["G1"]
+        self.assertEqual(g1["value"], (0.4 + rep.RT_MISSED_LEAD) / 2)
+        self.assertFalse(g1["pass"])
+
+    # -- round-3 minor: the PowerShell save must work -------------------------------
+
+    def _shadow_lines(self):
+        rows = self._clean_call(CID_A, n=3)
+        return [plain(r) for r in rows]
+
+    def test_reads_crlf_utf8_bom_and_utf16_files(self):
+        lines = self._shadow_lines()
+        want = rep.aggregate(rep.build_calls(rep.read_lines([write(lines)])[0]), 1, 0)
+        for encoding, newline in (("utf-8-sig", "\r\n"),      # Set-Content -Encoding utf8
+                                  ("utf-16", "\r\n"),         # `>` in Windows PowerShell 5.1
+                                  ("utf-8", "\r\n")):
+            f = tempfile.NamedTemporaryFile("wb", suffix=".log", delete=False)
+            f.write((newline.join(lines) + newline).encode(encoding))
+            f.close()
+            rows, skipped, total, suspect = rep.read_lines([f.name])
+            self.assertEqual((len(rows), suspect), (len(lines), 0), encoding)
+            got = rep.aggregate(rep.build_calls(rows), 1, 0)
+            self.assertEqual(got["criteria"]["G1"]["value"], want["criteria"]["G1"]["value"], encoding)
+            self.assertEqual(got["calls"], 1, encoding)
+            code, out, _ = run([f.name, "--min-calls", "1", "--min-segments", "1"])
+            self.assertEqual(code, 0, encoding)
+            self.assertNotIn("WARNING", out, encoding)
+
+    def test_console_wrapped_lines_are_reported_not_silently_lost(self):
+        # What `Select-String ... > file` produced: every line cut at the console width.
+        wrapped = []
+        for line in self._shadow_lines():
+            wrapped += [line[i:i + 60] for i in range(0, len(line), 60)]
+        path = write(wrapped)
+        code, out, err = run([path])
+        self.assertEqual(code, 2)
+        self.assertIn("did not parse", err)
+        # a partly wrapped file still reports, with a warning and the count
+        mixed = self._shadow_lines() + wrapped[:4]
+        code, out, _ = run([write(mixed), "--min-calls", "1", "--min-segments", "1"])
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING: ", out)
+        self.assertIn("could not be parsed", out)
+        _, jout, _ = run([write(mixed), "--json"])
+        self.assertGreaterEqual(json.loads(jout)["unparsed_shadow_lines"], 1)
 
     def test_agreement_rule(self):
         self.assertTrue(rep.agrees(10, 12))     # 20 %

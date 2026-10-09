@@ -60,6 +60,8 @@ _USER_AGENT = "hello-phone-stt-shadow/1"
 TAIL = 1.0            # a partial up to 1.0 s after E_k still belongs to segment k
 MERGE_GAP = 0.7      # a local-VAD restart within 0.7 s of E_k (no final yet) continues segment k
 SETTLE = 3.0          # a segment stays open for late finals until E_k + 3.0 s
+SILENCE_RUN_GAP = 2.0  # unindexed partials more than 2.0 s apart are different utterances
+SILENCE_UTT_KEEP = 64  # per-utterance maxima kept at once (only the newest matter)
 MAX_SEGMENTS = 2000   # beyond this only the summary counts
 WORD_CAP = 999        # cap on any logged word count
 COUNT_CAP = 100_000   # cap on any logged counter (observability option_count)
@@ -86,7 +88,8 @@ _IDENT_RE = re.compile(r"^[A-Za-z0-9_]{1,48}$")
 
 # call_summary counters, in emission order.
 COUNTER_NAMES = (
-    "segments", "silence_partials", "silence_partial_words", "rt_empty_partials",
+    "segments", "silence_partials", "silence_partial_words", "silence_utts",
+    "silence_utts_3w", "late_first_partials", "rt_empty_partials",
     "orphan_legacy_finals", "orphan_rt_finals", "main_finals", "main_finals_empty",
     "rt_partials", "rt_finals", "rt_vad_starts", "rt_unparsed", "frames_offered",
     "frames_dropped", "chunks_sent", "errors_nonfatal", "unrecovered_death", "segments_merged",
@@ -304,6 +307,14 @@ class SegmentTracker:
             self.counters.setdefault(name, 0)
         self._active: list[_Segment] = []
         self._utt: dict[int, _Segment] = {}   # Sarvam utterance_idx -> its segment
+        # Partials that belong to NO local segment (TV, a second speaker, echo of
+        # the bot): max cumulative words per utterance, keyed by Sarvam's
+        # ``utterance_idx`` or, without one, by a run of consecutive silence
+        # partials. Numbers only; bounded to the newest SILENCE_UTT_KEEP.
+        self._sil: dict[Any, int] = {}
+        self._sil_run = 0                  # id of the current unindexed run
+        self._sil_run_open = False
+        self._sil_run_last = 0.0           # time of the run's last partial
         self._next_k = 0
         self.armed = False
         self.merge_gap = MERGE_GAP
@@ -323,6 +334,7 @@ class SegmentTracker:
             return
         now = self._clock() if now is None else now
         self._settle(now)
+        self._sil_run_open = False
         if self._open_segment() is not None:
             return  # duplicate start: keep the open segment
         # The deployed local VAD cuts at 0.25 s of silence; Sarvam and the main
@@ -369,21 +381,55 @@ class SegmentTracker:
             seg = self._open_segment()
             if seg is None and self._active:
                 last = self._active[-1]  # only the LATEST ended segment is eligible
-                if last.end is not None and now <= last.end + TAIL:
-                    seg = last
+                if last.end is not None:
+                    if now <= last.end + TAIL:
+                        seg = last
+                    elif last.p1 is None and now < last.end + SETTLE:
+                        # A SLOW first partial (the model answered more than TAIL
+                        # after the speech ended) is still that segment's first
+                        # partial: it must count as slow in G1/G2, not vanish.
+                        seg = last
+                        self.counters["late_first_partials"] += 1
             if seg is not None and utt is not None:
                 self._utt[utt] = seg
         if seg is None:
             self.counters["silence_partials"] += 1
             self.counters["silence_partial_words"] = _count(
                 self.counters["silence_partial_words"] + words)
+            self._silence_utt(words, now, utt)
             return
+        self._sil_run_open = False
         if seg.p1 is None:
             seg.p1 = now
         if words >= 3 and seg.p3 is None:
             seg.p3 = now
         if words > seg.pmax:
             seg.pmax = words
+
+    def _silence_utt(self, words: int, now: float, utt: Optional[int]) -> None:
+        """Track an unattributed partial per utterance: the cumulative word count
+        an utterance reaches with NO local speech is what would pause the bot in
+        PR-2 (the SDK interrupts on any interim of min_words, VAD or not)."""
+        if utt is not None:
+            key: Any = ("u", utt)
+        else:
+            # No utterance index: a run of consecutive silence partials, closed
+            # by local speech, an attributed partial, a realtime final or a gap.
+            if (not self._sil_run_open
+                    or now - self._sil_run_last > SILENCE_RUN_GAP):
+                self._sil_run += 1
+                self._sil_run_open = True
+            self._sil_run_last = now
+            key = ("r", self._sil_run)
+        prev = self._sil.get(key)
+        if prev is None:
+            self.counters["silence_utts"] += 1
+            prev = 0
+            while len(self._sil) >= SILENCE_UTT_KEEP:
+                self._sil.pop(next(iter(self._sil)))
+        if words >= 3 and prev < 3:
+            self.counters["silence_utts_3w"] += 1
+        self._sil[key] = max(prev, words)
 
     # -- finals
     def _pick_final_segment(self, now: float, realtime: bool) -> Optional[_Segment]:
@@ -443,6 +489,7 @@ class SegmentTracker:
             return
         now = self._clock() if now is None else now
         self._settle(now)
+        self._sil_run_open = False
         seg = self._utt.get(utt) if utt is not None else None
         if seg is None:
             seg = self._pick_final_segment(now, realtime=True)
@@ -635,6 +682,8 @@ class PhoneSttShadow:
         self._dead = False           # socket/shadow ended; no more audio accepted
         self._closed = False         # close_nowait ran
         self._closing = False        # WE are ending the session
+        self._end_sent = False       # our 'end' event went out
+        self._session_end_seen = False
         self._queue: Optional[asyncio.Queue] = None
         self._task: Optional[asyncio.Task] = None
         self._ws: Any = None
@@ -839,14 +888,19 @@ class PhoneSttShadow:
         self._close_logged = True
         valid = isinstance(code, int) and not isinstance(code, bool) and 1000 <= code <= 4999
         expected = self._closing and (code is None or code in (1000, 1001))
+        # We ended the session ('end' sent or session.end seen) and Sarvam was
+        # just slow to answer our close frame: aiohttp reports 1006 when its
+        # bounded close wait is cancelled. That is our own timeout, not a death.
+        slow_close = (not expected and self._closing and code == 1006
+                      and (self._end_sent or self._session_end_seen))
         session = 0.0
         if self._opened_at is not None:
             session = self._clock() - self._opened_at
-        self._emit("socket_closed", level="info" if expected else "warn",
+        phase = "expected" if expected else ("close_timeout" if slow_close else "unexpected")
+        self._emit("socket_closed", level="info" if (expected or slow_close) else "warn",
                    schema=f"close_{code}" if valid else "close_unknown",
-                   phase="expected" if expected else "unexpected",
-                   duration_sec=_r3(session))
-        if not expected:
+                   phase=phase, duration_sec=_r3(session))
+        if not (expected or slow_close):
             self._mark_death()
 
     def _log_closed_after_death(self, code: Any) -> None:
@@ -1019,6 +1073,7 @@ class PhoneSttShadow:
                 self._buf += pcm
             await self._send_pcm(final=True)
             await self._send({"event": "end"})
+            self._end_sent = True
         except asyncio.CancelledError:
             raise
         except _Stall:
@@ -1110,6 +1165,7 @@ class PhoneSttShadow:
                 self.counters["rt_finals"] += 1
                 self._tracker.rt_final(n, now, utt)
         elif ev == "session.end":
+            self._session_end_seen = True
             billed = _num(d.get("audio_duration_s"))
             if billed is not None:
                 self._emit("session_end", duration_sec=_r3(billed))

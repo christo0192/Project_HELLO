@@ -111,14 +111,14 @@ Only allowlisted keys appear: `schema`, `phase`, `model`, `duration_sec`, `optio
 | `closed_unarmed` | | the call ended and the shadow never armed (no consent, or no frame after it) |
 | `socket_open` / `session_begin` | `duration_sec` | connect time / time to `session.begin` |
 | `socket_error` | `schema` code, `phase` fatal/nonfatal, `http_status` | a Sarvam `error` event (first 5 non-fatal) |
-| `socket_closed` | `schema` `close_<code>`, `phase` expected / unexpected / `after_death` (the close code that followed a fatal error or stall; informational), `duration_sec` session length | |
+| `socket_closed` | `schema` `close_<code>`, `phase` expected / unexpected / `after_death` (the close code that followed a fatal error or stall; informational) / `close_timeout` (informational: we ended the session, `end` sent or `session.end` seen, and Sarvam was slow to answer our close frame, so aiohttp reports 1006; not a death), `duration_sec` session length | |
 | `session_end` | `duration_sec` | billed audio seconds |
 | `seg_partial_lead` | `turn_index`, `duration_sec` | first partial word after VAD start |
 | `seg_three_word` | `turn_index`, `duration_sec` | 3rd partial word after VAD start |
 | `seg_legacy_final` | `turn_index`, `duration_sec`, `option_count` | main STT final time / words |
 | `seg_rt_final` | `turn_index`, `duration_sec`, `option_count` | realtime final time / words |
 | `seg_summary` | `turn_index`, `schema` class, `option_count` max partial words, `phase`, `duration_sec` | one per segment; class is `both`, `noise_partial`, `rt_missed` or `silent` |
-| `call_summary` | `schema` counter, `option_count` | counters: segments, segments_merged, silence_partials, rt_partials, rt_finals, main_finals, orphan_*, frames_*, queue_lag_max_ms (worst time a frame waited before being sent), chunks_sent, errors_nonfatal, unrecovered_death |
+| `call_summary` | `schema` counter, `option_count` | counters: segments, segments_merged, silence_partials, silence_partial_words, **silence_utts** (realtime utterances that had partials with no local VAD segment at all), **silence_utts_3w** (of those, utterances that reached 3 or more words), late_first_partials (first partials accepted up to 3 s after the segment ended), rt_partials, rt_finals, main_finals, orphan_*, frames_*, queue_lag_max_ms (worst time a frame waited before being sent), chunks_sent, errors_nonfatal, unrecovered_death |
 
 ## 7. Analyse
 
@@ -138,13 +138,41 @@ final of an utterance belong to the segment its first non-empty partial landed i
 answers. Without the index the latency of the model (what we measure) would push its late partials into the
 next segment and flatter G1/G2.
 
+**Words with no local speech at all (TV, a second speaker, echo of the bot).** Realtime partials outside every
+local VAD segment are not attributed to a segment, so G3/G4 on segments alone cannot see them, yet in PR-2 the SDK
+would pause the bot on any interim of 3 or more words, VAD or not. The shadow therefore tracks them per Sarvam
+utterance (`utterance_idx`; without one, a run of consecutive such partials, closed by local speech, an attributed
+partial, a realtime final or a 2 s gap) and logs, in `call_summary`, only numbers: `silence_utts` (utterances with such
+partials) and `silence_utts_3w` (those whose cumulative word count reached 3). `silence_utts_3w` is added to the G4
+numerator (below).
+
+**Slow first partials count as slow.** If the model's first partial for a segment arrives more than 1.0 s after
+the speech ended but before the segment settles (3.0 s), and the segment has no partial yet, it is still that
+segment's first partial (`late_first_partials` counts these), so G1/G2 see the slow value. A segment the main STT
+heard (legacy final with words) but the realtime socket never answered within the window (`rt_missed`, settled) counts
+in G1 as a 3.0 s lead, so a slow model cannot pass G1 on its fast survivors.
+
+**Segments cut off by the call ending or a withdrawal** (`phase=truncated` and no legacy final yet: the main final
+was still in flight) are not noise: they are left out of the G3/G4 numerators and denominators and counted under
+"Also" in the report.
+
 Run 5-10 owner test calls (include deliberate fan, TV and second-speaker noise), then, promptly (Fly's log
 buffer is short):
 
 ```
+# bash / WSL
 fly logs -a project-hello-phone-voice --no-tail | grep phone_stt_shadow > shadow-YYYYMMDD.log
+
+# Windows PowerShell (5.1 or 7): write the raw LINES, not Select-String objects
+fly logs -a project-hello-phone-voice --no-tail | Select-String phone_stt_shadow | ForEach-Object { $_.Line } | Set-Content -Encoding utf8 shadow-YYYYMMDD.log
+
 python app/voice-livekit/tools/stt_shadow_report.py shadow-YYYYMMDD.log
 ```
+
+Do **not** use `Select-String ... > file` in PowerShell: redirecting its objects wraps every line at the console
+width, so no line parses (the report would find nothing). The report reads UTF-8 (with or without BOM), UTF-16 (what
+a plain `>` writes in Windows PowerShell 5.1) and LF or CRLF files, and prints a WARNING with a count when lines look
+like shadow lines but do not parse (wrapped or truncated), so lost data is never silent.
 
 (`--json` for machine output; also accepts `fly logs --json` files; `--min-calls` / `--min-segments` change
 the sample floor. Calls are split per machine and `config` line, see section 5; a log with neither machine ids
@@ -154,8 +182,7 @@ research rule (+-20 %); the looser "+-1 word allowed" rate is printed under "Als
 is not gated.
 
 **Filter on save.** The raw `fly logs` dump holds every worker line for every call in the window, so save only
-the `phone_stt_shadow` lines (as above, or `| Select-String phone_stt_shadow` in PowerShell) and delete the raw
-dump. Only the filtered file or the report output goes into `.gsd/milestones/M015/`.
+the `phone_stt_shadow` lines (as above) and delete the raw dump. Only the filtered file or the report output goes into `.gsd/milestones/M015/`.
 
 **Go criteria for PR-2** (research section 5):
 
@@ -163,10 +190,17 @@ dump. Only the filtered file or the report output goes into `.gsd/milestones/M01
 |---|---|---|
 | G1 | median first-partial lead after VAD start | <= 0.6 s |
 | G2 | median 3rd-word saving (legacy final time minus 3rd-word time) | >= 0.8 s |
-| G3 | noise partials / non-silent segments | <= 5 % |
-| G4 | false 3-word (a 3rd partial word but the legacy final has < 3 words) / non-silent | <= 5 % |
+| G3 | noise partials / counted non-silent segments | <= 5 % |
+| G4 | (false 3-word segments + `silence_utts_3w`) / counted non-silent segments | <= 5 % |
 | G5 | final word counts agree (+-20 %, research section 5) | >= 90 % |
 | G6 | unrecovered socket deaths | 0 |
+
+**Exact G4 formula.** Over all analysed calls: numerator = the number of non-silent segments with a 3rd partial word
+whose legacy final has fewer than 3 words (false 3-word segments) **plus** the sum of each call's `silence_utts_3w`
+(3-word realtime utterances with no local VAD segment); denominator = counted non-silent segments (non-silent segments
+minus those cut off at call end, see above). A call whose `call_summary` is missing (forced exit) contributes 0 to the
+`silence_utts_3w` sum. "Counted" is also the G3 denominator. The sample floor (100 segments) uses all non-silent
+segments.
 
 **GO** needs G1-G6 all passing **and** at least 5 calls with at least 100 non-silent segments; otherwise
 NO-GO (failing criteria named) or INSUFFICIENT DATA. The owner decides PR-2 on these numbers. Record the log
