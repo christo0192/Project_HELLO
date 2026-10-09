@@ -55,6 +55,7 @@ from typing import Any, Awaitable, Callable, Optional
 from zoneinfo import ZoneInfo
 
 import gate_judge
+import phone_stt_shadow
 from observability import StructuredLogger, get_correlation_id
 from provider_resilience import (
     BusinessError,
@@ -16072,7 +16073,7 @@ def _message_text(message: Any) -> str:
     return "".join(parts).strip()
 
 
-def phone_agent_class(agent_base: Any) -> Any:
+def phone_agent_class(agent_base: Any, *, stt_shadow: Any = None) -> Any:
     """Build the phone Agent subclass over the SDK's ``Agent``.
 
     Built through a factory so the class is created against whatever ``Agent``
@@ -17656,5 +17657,26 @@ def phone_agent_class(agent_base: Any) -> Any:
                     from livekit.agents import StopResponse  # noqa: PLC0415
                     raise StopResponse()
             return turn.spoken
+
+    if stt_shadow is not None:
+        # M015 PR-1: the metrics-only STT shadow tee. Installed ONLY when the
+        # shadow is on for this call, so the switched-off class is exactly the
+        # pre-change one (the SDK reuses its STT pipeline across handoffs only
+        # while `stt_node` is not overridden). Any failure leaves the class
+        # untouched.
+        try:
+            PhoneScreeningAgent.stt_node = phone_stt_shadow.wrap_stt_node(
+                agent_base.stt_node, stt_shadow)
+        except Exception as exc:  # noqa: BLE001 - never break the call
+            try:
+                if "stt_node" in vars(PhoneScreeningAgent):
+                    delattr(PhoneScreeningAgent, "stt_node")
+                _log.warn(
+                    "unknown_event", error_type="phone_stt_shadow",
+                    error_category="shadow_failed", schema=type(exc).__name__,
+                    phase="install",
+                )
+            except Exception:  # noqa: BLE001
+                pass
 
     return PhoneScreeningAgent
