@@ -174,21 +174,44 @@ class ClassifyTests(unittest.TestCase):
             self.assertEqual(classify_learner_commitment(text), WEAK)
         self.assertEqual(classify_learner_commitment(""), Level.NONE)
 
-    # Learner corpus, R1-Q iteration 2: a negator that governs the agreement turns it round.  The
-    # first two are the live lines that were graded MEDIUM and flagged two calls (the sweep found
-    # them in p2 pushy and p2 terse); the rest keep the polarity honest in both directions.
+    # Learner corpus, R1-Q iteration 2.  Ship restore round 1 (owner decision 2026-10-09): the negation
+    # check that read these as no agreement is gone, because the same check also dropped an affirmative
+    # commitment behind an unrelated negator ("I have no more questions so count me in.") and let it be
+    # spoken with nothing posted.  Production's plain pattern search is back: the first group below is
+    # what production reads as NONE, the second what it reads as an agreement (its false positive, equal
+    # to production and accepted).
     NEGATED = (
+        "Tomorrow evening isn't going to work, sorry.",
+        "I can't do Tuesday.",
+        "Friday won't suit me at all.",
+    )
+    NEGATED_READ_AS_AGREEMENT_ON_PRODUCTION = (
         "And ten tomorrow won't work, I'm at work then, so can you tell me what the callback "
         "would actually cover?",
         "I don't think tomorrow works, I'm still weighing it up and might just wait for the next "
         "cohort.",
         "Thursday doesn't work for me.",
-        "Tomorrow evening isn't going to work, sorry.",
-        "I can't do Tuesday.",
-        "Friday won't suit me at all.",
         "I'm not sure that Thursday works.",
         "7 PM does not work for me.",
         "No, a call tomorrow wouldn't work.",
+    )
+    # An affirmative commitment behind an unrelated negator in the same clause keeps its level.
+    AFFIRMED_BEHIND_AN_UNRELATED_NEGATOR = (
+        ("I don't need to think about it anymore so let's do it.", STRONG),
+        ("I have no more questions so count me in.", STRONG),
+        ("I don't want to miss the discount so I'll pay the deposit today.", STRONG),
+        ("Nothing else is holding me back so sign me up.", STRONG),
+        ("I can't see a reason to wait so let's do it.", STRONG),
+        ("I don't have any other doubts and I'm ready to enrol.", STRONG),
+        ("There's no reason to delay so let's book a call on Saturday.", MEDIUM),
+        ("I don't have any other questions and Saturday works for me.", MEDIUM),
+        ("I won't keep you waiting any longer so I'll sign up today.", STRONG),
+        ("Nobody else needs to weigh in so I'll go ahead.", STRONG),
+        ("I never expected to say this so soon but let's do it.", STRONG),
+        ("I don't think I need more time so let's set up the call.", MEDIUM),
+        ("No more excuses I'll enrol.", STRONG),
+        ("I don't want to lose my seat so I'll take it.", STRONG),
+        ("Honestly I can't argue with that so you've convinced me.", STRONG),
     )
     AFFIRMED_NEXT_TO_A_NEGATION = (
         ("I can't do Tuesday, but Thursday works.", MEDIUM),
@@ -203,6 +226,18 @@ class ClassifyTests(unittest.TestCase):
         for text in self.NEGATED:
             with self.subTest(text=text):
                 self.assertEqual(classify_learner_commitment(text), Level.NONE)
+
+    def test_a_negated_agreement_is_read_as_an_agreement_as_on_production(self):
+        # Production's plain pattern search (ship restore round 1): an accepted false positive, equal to
+        # production, in return for never dropping an affirmative commitment behind a negator.
+        for text in self.NEGATED_READ_AS_AGREEMENT_ON_PRODUCTION:
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), MEDIUM)
+
+    def test_an_affirmative_commitment_behind_an_unrelated_negator_keeps_its_level(self):
+        for text, level in self.AFFIRMED_BEHIND_AN_UNRELATED_NEGATOR:
+            with self.subTest(text=text):
+                self.assertEqual(classify_learner_commitment(text), level)
 
     def test_an_agreement_after_a_negated_clause_still_counts(self):
         for text, level in self.AFFIRMED_NEXT_TO_A_NEGATION:
@@ -313,7 +348,14 @@ class AskDetectionTests(unittest.TestCase):
         "I can send you information about the program.",
         "I'll text you the course details.",
         "",
-        # R1-Q round 2: booking and calling wording that describes the programme
+    )
+    # Ship restore round 1 (owner decision 2026-10-09): the call reading is the structural reader OR
+    # production's own pattern list, so a programme description that production reads as a call
+    # proposal is read as one again.  These were in NONE (R1-Q round 2: booking and calling wording that
+    # describes the programme, and the programme's own schedule with a day and "works" in it); they are
+    # production's false positives, equal to production and accepted.  The structural reader alone
+    # still reads none of them (``test_the_structural_reader_still_reads_none_of_them``).
+    PRODUCTION_CALL_FALSE_POSITIVES = (
         "You can book a one-on-one session with a mentor anytime.",
         "Mentors are available, you can book a slot with them every week.",
         "You can schedule a mock interview session whenever you want.",
@@ -321,7 +363,6 @@ class AskDetectionTests(unittest.TestCase):
         "The coach will call you on the first day of the program.",
         "You can book a slot with a mentor.",
         "Our mentors will set up a call with you after you enroll.",
-        # the programme's own schedule, with a day and "works" in it
         "Classes will be on Saturday and that works for most people.",
         "The weekend batch is on Saturday, which is good for working professionals.",
         "Is the Saturday batch okay? Most working professionals say it works well.",
@@ -365,6 +406,24 @@ class AskDetectionTests(unittest.TestCase):
         for text in self.NONE:
             with self.subTest(text=text):
                 self.assertIsNone(detect_ask(text))
+
+    def test_production_s_call_false_positives_are_read_as_calls_as_on_production(self):
+        for text in self.PRODUCTION_CALL_FALSE_POSITIVES:
+            with self.subTest(text=text):
+                ask = detect_ask(text)
+                self.assertIsNotNone(ask, text)
+                self.assertEqual(ask.kind, AskKind.CALL, text)
+
+    def test_the_structural_reader_still_reads_none_of_them(self):
+        """The reader kept for the proposals production misses still gives a pitch no call; only
+        production's own pattern list reads these (see ``PRODUCTION_CALL_FALSE_POSITIVES``)."""
+        from r1_commitment import call_proposal_in, production_call_ask_in
+
+        for text in self.PRODUCTION_CALL_FALSE_POSITIVES:
+            with self.subTest(text=text):
+                sentences = split_sentences(text)
+                self.assertTrue(all(call_proposal_in(s) is None for s in sentences), text)
+                self.assertTrue(any(production_call_ask_in(s) is not None for s in sentences), text)
 
     def test_enrolment_outranks_a_call_ask_in_the_same_turn(self):
         ask = detect_ask("Would a call work Thursday? Or shall I send the enrolment link now?")
@@ -687,7 +746,6 @@ class ShipDeriskDetectorTests(unittest.TestCase):
         "We have a live Q&A on Thursdays, does that suit you?",
         "Live sessions are Tuesday and Thursday at 8 PM, would that work for you?",
         "Classes are on Saturday mornings, does that work for you?",
-        "The weekly check-in is on Monday evenings, is that okay with your job?",
         "Doubt-clearing calls happen on weekends, would that suit your routine?",
         "The live classes run on Sunday mornings, would that suit your week?",
         "Mentor sessions are every Wednesday at 9 PM, does that time work for you?",
@@ -696,6 +754,11 @@ class ShipDeriskDetectorTests(unittest.TestCase):
         "Office hours run Friday evenings, would that work with your kids' routine?",
         "The capstone review call is on Thursdays, is that fine for you?",
         "Our live classes run on Saturdays at 10 AM, would that work for you?",
+    )
+    # Production's own pattern list reads this one as a call (ship restore round 1: its false positive is
+    # back, equal to production); the structural reader still gives it none.
+    SCHEDULE_PITCH_PRODUCTION_READS = (
+        "The weekly check-in is on Monday evenings, is that okay with your job?",
     )
     CALL_PROPOSALS = (
         "Since mornings don't work, when's better for a quick call?",
@@ -731,6 +794,14 @@ class ShipDeriskDetectorTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertIsNone(call_proposal_in(text), text)
                 self.assertNotIn(AskKind.CALL, ask_acts(text), text)
+
+    def test_a_schedule_pitch_production_reads_as_a_call_is_read_as_on_production(self):
+        from r1_commitment import ask_acts, call_proposal_in
+
+        for text in self.SCHEDULE_PITCH_PRODUCTION_READS:
+            with self.subTest(text=text):
+                self.assertIsNone(call_proposal_in(text), text)
+                self.assertIn(AskKind.CALL, ask_acts(text), text)
 
     def test_a_time_question_about_a_call_with_this_learner_is_still_a_proposal(self):
         from r1_commitment import ask_acts, call_proposal_in
@@ -983,6 +1054,154 @@ class ShipRestoreReadingTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 self.assertEqual(classify_learner_commitment(text), level, text)
+
+
+class ShipRestoreRoundOneTests(unittest.TestCase):
+    """Ship restore round 1 (owner decision 2026-10-09: anything worse than production behaves exactly
+    like production).
+
+    The engine's call reading is the structural reader OR production's own ``_CALL_ASK``, so it never
+    loses a proposal production reads (the structural reader alone missed third-person callees, bare
+    callbacks and unframed offers: an earned MEDIUM became WEAK and a spoken acceptance failed the gate).
+    Telling the learner to talk to its decider, and a schedule fit check, are read as no call: production
+    reads none of them, so neither does the engine.
+    """
+
+    PRODUCTION_PROPOSALS = (
+        # third-person callees
+        "Let me call your husband tomorrow at 7 and walk him through it.",
+        "I'll ring your father on Sunday to answer his questions.",
+        "We'll call him tomorrow evening, if that's okay.",
+        "I'll call your dad on Saturday morning.",
+        "I will ring her next week once she's back.",
+        "Let me call both of them tomorrow after work.",
+        # a bare callback
+        "I'll call you back.",
+        "I'll call you back later.",
+        "No problem, I'll call you back in a bit.",
+        "Okay, I will call back after you've talked to him.",
+        "Talk it over, and I'll call you back.",
+        # unframed offers
+        "I'm happy to set up a call with your husband whenever suits you both.",
+        "I'm happy to set up a call with your spouse whenever works for both of you.",
+        "Happy to arrange a quick call with your father this week.",
+        "Glad to schedule a follow-up chat with you and your wife.",
+        "It would be great to book a call with your husband on Saturday.",
+        "Maybe we schedule a short call with your dad tomorrow?",
+        # a follow-up with a day
+        "I'll get back to you tomorrow once I check with my manager.",
+        "I'll check in with you on Friday.",
+        "We'll follow up with you and your husband on Monday.",
+        "I'll reach out to your husband tomorrow.",
+    )
+    TALK_TO_THE_DECIDER = (
+        "Talk to your husband tonight and let me know.",
+        "Talk to your husband tonight, and I'll keep the discount open until Friday.",
+        "Please speak to your father, and we can hold this price for you till Monday.",
+        "Discuss it with your husband first, and I'll email you the fee sheet.",
+        "Why don't you talk to your parents about it, and I'll keep your seat warm.",
+        "Take your time, talk to your husband, and I'll be here if you need anything.",
+        "Talk with your dad, and I can extend the offer by a day.",
+        "You should definitely speak with your husband before deciding.",
+        "I'd suggest you talk to your father tonight and see what he thinks.",
+        "Go ahead and talk to your husband, I'll hold the early-bird rate.",
+        "Speak to your wife about the budget, and I'll hold the price.",
+        "I'd recommend you talk with your parents first, and I'll send the brochure.",
+        "Please talk to your dad, and we'll keep the offer open.",
+        "Do talk to your husband, I'll be around if anything comes up.",
+        "I think you should speak with your husband tonight, and we can take it from there.",
+        "Talk to your father tonight and I'll hold the price till tomorrow morning.",
+        "Go and speak with your husband and let me know.",
+        # "have a word / a chat with" the decider is the same advice
+        "Have a word with your wife, and I'll send you the details meanwhile.",
+        "Have a chat with your husband tonight, and I'll keep the seat for you.",
+        "Have a word with your father; I'll text you the fee sheet.",
+    )
+    FIT_CHECKS_PRODUCTION_READS_AS_NONE = (
+        "Most of our learners study on Saturday mornings, would that work for you?",
+        "People usually set aside Sunday afternoons for the assignments, does that work?",
+        "Learners typically revise on Saturday and Sunday, would that suit you?",
+        "Our alumni usually blocked Saturday mornings for this, does that suit you?",
+        "The study plan has you practising on Sunday mornings, would that work?",
+        "Sessions are on Sunday mornings, does that work?",
+        "The program runs Saturday 10 to 1, would that work for you?",
+        "We meet every Saturday at 10, does that work?",
+        "It's Saturday and Sunday, 10 to 1, does that work for you?",
+        "Assignments are due Sunday night, would that work with your job?",
+        "Then on Sunday you'd do the weekly quiz, does that work?",
+    )
+
+    # Other uses of the words of a proposal that production reads as nothing.  Each was read as a call by
+    # a head-only alternative (deleted in restore round 1: "how about / what about <day>", "do you have
+    # <time> <day>", the nouns "chat", "catch-up" and "follow-up" of the call question), none of which
+    # carried a labelled or live proposal that production does not also miss.
+    OTHER_USES_PRODUCTION_READS_AS_NONE = (
+        "How about I email you the brochure tomorrow?",
+        "How about I send the details over tonight?",
+        "How about I hold the discount until tomorrow evening?",
+        "What about I keep your seat until Friday?",
+        "How about we lock the price in until Thursday?",
+        "How about I hold it just until tomorrow morning, and you call me right after you talk to him?",
+        "Do you have time on weekends for assignments?",
+        "Do you have an hour in the mornings?",
+        "Would a mentor chat help you feel more confident?",
+        "Do you want a chat with an alumnus who made the switch?",
+        "Would you be open to a chat with a recent graduate?",
+        "Is a catch-up session something you'd want if you fall behind?",
+        "Would a follow-up with the admissions office help?",
+    )
+
+    def test_other_uses_of_the_words_of_a_proposal_are_no_call_proposal(self):
+        from r1_commitment import call_proposal_in
+
+        for text in self.OTHER_USES_PRODUCTION_READS_AS_NONE:
+            with self.subTest(text=text):
+                self.assertIsNone(detect_ask(text), text)
+                self.assertIsNone(call_proposal_in(text), text)
+
+    def test_every_call_production_reads_is_read(self):
+        for text in self.PRODUCTION_PROPOSALS:
+            with self.subTest(text=text):
+                ask = detect_ask(text)
+                self.assertIsNotNone(ask, text)
+                self.assertEqual(ask.kind, AskKind.CALL, text)
+
+    def test_telling_the_learner_to_talk_to_its_decider_is_no_call_proposal(self):
+        from r1_commitment import call_proposal_in
+
+        for text in self.TALK_TO_THE_DECIDER:
+            with self.subTest(text=text):
+                self.assertIsNone(detect_ask(text), text)
+                self.assertIsNone(call_proposal_in(text), text)
+
+    def test_a_schedule_fit_check_production_reads_as_none_is_no_call_proposal(self):
+        from r1_commitment import call_proposal_in
+
+        for text in self.FIT_CHECKS_PRODUCTION_READS_AS_NONE:
+            with self.subTest(text=text):
+                self.assertIsNone(detect_ask(text), text)
+                self.assertIsNone(call_proposal_in(text), text)
+
+    def test_a_call_the_advisor_makes_with_the_decider_is_still_a_proposal(self):
+        """The deleted object read "talk to your husband" for any speaker; a call the advisor itself
+        proposes is read by the rest of the grammar."""
+        for text in (
+            "Shall I phone you and your father together on Sunday afternoon?",
+            "Would your husband be free for a call on Sunday?",
+            "Let's get on a call with your father this weekend.",
+            "Could we do a three-way call with your father this Sunday?",
+        ):
+            with self.subTest(text=text):
+                ask = detect_ask(text)
+                self.assertIsNotNone(ask, text)
+                self.assertEqual(ask.kind, AskKind.CALL, text)
+
+    def test_the_enrolment_reading_and_the_call_floor_are_productions_verbatim(self):
+        import r1_commitment
+
+        # The fingerprint of the call patterns is pinned in test_r1_detector_corpus (ProductionCallReadingTests).
+        self.assertEqual(len(r1_commitment._CALL_ASK), 11)
+        self.assertEqual(len(r1_commitment._ENROL_ASK), 18)
 
 
 if __name__ == "__main__":

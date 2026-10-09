@@ -1498,7 +1498,8 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   only.
 * **Learner iteration 2 (R1-Q S01, content revision 11).** The second live sweep found 24 defects; the
   worker side of the fixes, all deterministic and with no extra model call: `classify_learner_commitment`
-  ignores an agreement a negator governs ("tomorrow won't work"); `has_concession` ignores "I want to be sure
+  ignores an agreement a negator governs ("tomorrow won't work") (rolled back by ship restore round 1);
+  `has_concession` ignores "I want to be sure
   it's worth it"; the guard's style surgery no longer garbles speech ("to be honest with myself" stays,
   `, -` and `But,` debris is cleaned, only an adjective or a verb loses a leading "That's"); a connector
   whose sentence was dropped goes with it; quote marks around a figure are removed; a reply asks at most
@@ -1565,7 +1566,8 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
     detector corpus). "Can I send you the curriculum?" is an enrolment ask again, as in production; the
     resource-link, look-ahead and question-frame helpers are deleted.
   * Conditional commitments (`If Thursday works for you, great.`, `I'll reach out if I decide ...`) keep
-    the level they have in production, so the gate sees them; the negation check stays.
+    the level they have in production, so the gate sees them. The negation check is gone too (restore
+    round 1, below).
   * Late asks: there is no `late_ask_accepted` exemption (a MEDIUM acceptance in a free reply is a
     `commitment` hit, as in production) and no `late_asks` admin-log key.
   * Farewell: no `pending_ask_at_farewell` reason. An early ask no longer turns the goodbye into a
@@ -1584,17 +1586,55 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
     manifest keys that pinned them are gone, so `CONTENT_REVISION` is 14.
   * Scorer mask (`transcript.ts`): production's four frames, verbatim, plus each new scripted wording as a
     WHOLE trimmed sentence (the MEDIUM line with the advisor's slot, its moved and deferred forms, the
-    call-back WEAK line, the e-mailed WEAK line). A barge-in cut of a new wording is no longer hidden
-    (production never hid them either); ordinary learner speech is hidden only where production hides it.
+    call-back WEAK line, the e-mailed WEAK line). A barge-in cut of the call-back and e-mailed WEAK
+    wordings is not hidden (production never hid them either); ordinary learner speech is hidden only where
+    production hides it, apart from the frame below. Restore round 1 corrected the MEDIUM line (see there).
   * Cost bound: `RolePlayEngine.plan_turn` reads at most the last 4,000 characters of an advisor turn
     (`MAX_CANDIDATE_CHARS`), the identity for every real turn (the longest live turn is about 1,070
     characters) and for non-strings. It only caps the cost of pathological speech-to-text.
   Still in force from the earlier rounds (proved better than production): no WEAK stall loop (the WEAK line
   at most once, a stall quota), no verbatim deflection, intent-voiced in-context objections and topic
   triggers, the repetition guard, tic control, a confirmation only after a commitment, the $7,000 anchor
-  never read as an offer, no unprompted need dumps, the MEDIUM line with the advisor's slot. One residual is
-  worse than production and needs an owner decision: the call object `talk to your father ...` reads two
-  pushy live turns (of 1,477) as a call proposal.
+  never read as an offer, no unprompted need dumps, the MEDIUM line with the advisor's slot.
+* **Learner ship restore, round 1 (R1-Q S01 PR-A; owner decision 2026-10-09).** The two reviews of the
+  restore found five places still worse than production. Same rule: production's code restored or a
+  PR-A-only rule deleted, no new regex, rule, exemption or guard category.
+  * Call reading is a floor: `r1_commitment.ask_acts` reads a CALL when the structural reader
+    (`call_proposal_in`) OR production's own `_CALL_ASK` (verbatim, fingerprint pinned in
+    `test_r1_detector_corpus`) reads it. The structural reader alone missed proposals production books
+    (third-person callees "Let me call your husband tomorrow at 7", a bare "I'll call you back", unframed
+    offers "I'm happy to set up a call with your husband"); a proposal production reads is never lost now.
+    The union keeps production's false positives (a programme description such as "You can book a slot
+    with a mentor." is read as a call proposal again, as in production: accepted); it adds none of its own on
+    any labelled row (`ProductionCallReadingTests`: hand 116/61/3, simulator 91/4/4, held-out 31/2/5 for
+    tp/fp/fn against production's 66/61/53, 54/4/41, 18/2/18). `detect_callback` and the persona probe
+    filter still use the structural reader alone (they only decide the slot and whether a question is a probe).
+  * Deleted from the structural reader (each read, as a call, an advisor sentence production reads as
+    nothing): the `talk|speak to/with your husband ...` call object ("Talk to your father tonight and I'll
+    hold the price" was booked as a call; the owner's turn 78 "I can also talk to your husband" is answered
+    as in production again, with the owed WEAK stall), the `<day or clock> ... works?` time ask and the
+    `are` lead of the day/clock fit-check ("Sessions are on Sunday mornings, does that work?"), the
+    `word` and `chat` alternatives of "a chat" / "have a word" ("Have a word with your father"), and three
+    more alternatives that read other advisor sentences as a call, found with fresh adversarial sentences and
+    each costing no labelled proposal that production reads: `how about` / `what about` + day ("How about I
+    email you the brochure tomorrow?", "How about I hold the discount until tomorrow evening?"), the
+    `do you have <time> <day>` question ("Do you have an hour in the mornings?") and the nouns `chat`,
+    `catch-up` and `follow-up` of the call question ("Would a mentor chat help you feel more confident?").
+    Known residual head-only readings (the proposals they carry outweigh them in the labelled and live data,
+    but they are not zero): `I can do <thing> <day>` ("I can do the paperwork tomorrow."), `Can you join a
+    call with <person>?`, `Can I get a word in about ...?` and `Can we have a conversation about ...?`.
+  * Learner commitment classifier: `classify_learner_commitment` is production's plain pattern search
+    again (the negation exemption `_affirms` is deleted). It dropped an affirmative commitment behind an
+    unrelated negator in the same clause ("I have no more questions so count me in.") and let it be spoken
+    with nothing posted; now it is blocked and posted as in production. The price is production's false
+    positive on a genuine negation ("Thursday doesn't work for me." reads MEDIUM), accepted.
+  * Scorer mask (`transcript.ts`): the frame `let's book a call` of the ship-gate round 2 is back. The MEDIUM
+    line now carries the advisor's slot, so production's frame "book a call on Thursday at 7 PM" no longer
+    reached a barge-in cut of it. Second-half cuts hidden: production's own line 48 of 48, the slot line 114 of
+    570 and the moved form 114 of 786 before the frame, 570 of 570 and 786 of 786 with it; the deferred form
+    (production has none) 30 of 54, the cuts that stop before "a call" stay visible. The frame hides 7 of 41
+    ordinary learner sentences against production's 6, and the extra one ("Let's book a call? I'm not sure
+    that's needed.") is a MEDIUM phrase the learner guard blocks in a free reply anyway.
 
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 

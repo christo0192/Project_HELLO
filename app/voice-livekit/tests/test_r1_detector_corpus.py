@@ -46,6 +46,14 @@ production's, so the ``enrol_ask`` labels are no longer a target.  Every row sta
 is still scored and printed; ``enrol_ask`` is not held to the per-case, recall and precision floors,
 and ``ProductionEnrolmentReadingTests`` pins its confusion counts to production's instead, so the
 reading cannot drift unnoticed.
+
+Ship restore round 1 (owner decision 2026-10-09): the engine's call reading is the structural reader
+(``r1_commitment.call_proposal_in``, kept for the proposals production misses) OR production's own
+``_CALL_ASK`` (verbatim), so a call proposal production reads is never lost.  The ``call_proposal``
+detector below scores the STRUCTURAL reader alone and keeps its floors (its own quality is still
+measured); ``call_engine`` is the engine's union, held to production's confusion counts by
+``ProductionCallReadingTests``, which also pins that the structural reader adds no false positive on a
+labelled row that production lacks.
 """
 from __future__ import annotations
 
@@ -60,7 +68,9 @@ HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+from r1_commitment import call_proposal_in, production_call_ask_in
 from r1_negotiation import AdvisorActs, read_advisor_turn
+from r1_text import split_sentences
 
 CORPUS_PATH = HERE / "tests" / "fixtures" / "r1_advisor_corpus.jsonl"
 HAND_PREFIXES = ("review:", "iter1:", "iter2:", "owner:")
@@ -80,13 +90,28 @@ LABEL_KEYS = (
 # A labelled case the detectors still get wrong (id -> detector names, with the reason in the comment).
 # The list may only shrink.
 #
-# Ship restore (owner decision 2026-10-09): the one case below is a call proposal that production
-# misses too ("Would a weekend slot work better for you both?"): the part-of-the-day alternatives of
-# the head-only time-ask were deleted because they read "a flexible evening and weekend schedule" as
-# a call, so it is an accepted miss equal to production, not a regression.  The enrolment cases the
-# earlier rounds listed here (c0716, c0719) are covered by the production reading below.
+# Ship restore (owner decision 2026-10-09): the cases below are call proposals that production
+# misses too, so each is an accepted miss equal to production, not a regression.  c0976 ("Would a
+# weekend slot work better for you both?"): the part-of-the-day alternatives of the head-only time-ask
+# were deleted because they read "a flexible evening and weekend schedule" as a call.  Ship restore
+# round 1: c0380 and c0840 ("So two o'clock tomorrow works?"), the head-only "<day or clock> ... works?"
+# question, was deleted because it read a programme's schedule pitch ("Most of our learners study on
+# Saturday mornings, would that work for you?") as a call; c1491 (the owner's turn 78, "I can also talk
+# to your husband"), the head-only "talk to your husband" call object, was deleted because it read
+# "Talk to your husband tonight and let me know" as a call.  The enrolment cases the earlier rounds
+# listed here (c0716, c0719) are covered by the production reading below.  c0598 and c0838 ("how about
+# tomorrow morning ...") and c1504 ("Do you have ten minutes on Saturday ...") went with the head-only
+# time-ask alternatives "how about / what about <day>" and "do you have <time> <day>", deleted because
+# they read "How about I email you the brochure tomorrow?" and "Do you have an hour in the mornings?"
+# as calls.  Production misses all of them.
 KNOWN_FAILURES: dict[str, frozenset[str]] = {
     "c0976": frozenset({"call_proposal"}),
+    "c0380": frozenset({"call_proposal"}),
+    "c0840": frozenset({"call_proposal"}),
+    "c1491": frozenset({"call_proposal"}),
+    "c0598": frozenset({"call_proposal"}),
+    "c0838": frozenset({"call_proposal"}),
+    "c1504": frozenset({"call_proposal"}),
 }
 
 
@@ -107,8 +132,21 @@ def _price(entry: dict, acts: AdvisorActs) -> object:
     return acts.best_offer_usd
 
 
+def structural_call(entry: dict, acts: AdvisorActs) -> bool:
+    """The structural reader's own call reading: ``call_proposal_in`` on a sentence, or a callback."""
+    return acts.callback is not None or any(
+        call_proposal_in(sentence) is not None for sentence in split_sentences(entry["text"])
+    )
+
+
+def production_call(entry: dict) -> bool:
+    """Production's reading: a sentence of the turn matches origin/main's ``_CALL_ASK``."""
+    return any(production_call_ask_in(sentence) is not None for sentence in split_sentences(entry["text"]))
+
+
 DETECTORS: tuple[Detector, ...] = (
-    Detector("call_proposal", "call_proposal", lambda e, a: a.call),
+    Detector("call_proposal", "call_proposal", structural_call),
+    Detector("call_engine", "call_proposal", lambda e, a: a.call, production=True),
     Detector("email_offer", "email_offer", lambda e, a: a.email_offer),
     Detector("enrol_ask", "enrol_ask", lambda e, a: a.enrol, production=True),
     Detector("price_offer", "price_offer", _price),
@@ -320,15 +358,16 @@ class DetectorCorpusTests(unittest.TestCase):
         """The worst error: a programme description graded as a proposal earns a commitment line.
 
         The enrolment reading is production's, so its false positives on a pitch are production's
-        (``ProductionEnrolmentReadingTests`` pins their number); the call, e-mail and callback readings
-        are still held to none.
+        (``ProductionEnrolmentReadingTests`` pins their number), and so is the call floor
+        (``ProductionCallReadingTests``); the structural call reader, the e-mail and the callback
+        readings are still held to none.
         """
         offenders = []
         for entry in self.entries:
             if not entry["labels"]["pitch_only"] or not is_hand(entry):
                 continue
             acts = read(entry)
-            if acts.call or acts.email_offer or acts.callback is not None:
+            if structural_call(entry, acts) or acts.email_offer or acts.callback is not None:
                 offenders.append(f"{entry['id']} {entry['text'][:120]!r}")
         self.assertEqual([], offenders, "\n" + "\n".join(offenders[:40]))
 
@@ -399,7 +438,8 @@ class HeldOutCorpusTests(unittest.TestCase):
             if not entry["labels"]["pitch_only"]:
                 continue
             acts = read(entry)
-            if acts.call or acts.email_offer or acts.callback is not None:  # enrol: production's
+            # enrol and the call floor are production's
+            if structural_call(entry, acts) or acts.email_offer or acts.callback is not None:
                 offenders.append(f"{entry['id']} {entry['text'][:100]!r}")
         self.assertEqual([], offenders, "\n" + "\n".join(offenders[:20]))
 
@@ -441,6 +481,105 @@ class ProductionEnrolmentReadingTests(unittest.TestCase):
             score = scores["enrol_ask"]
             with self.subTest(set=name):
                 self.assertEqual((score.tp, score.fp, score.fn), PRODUCTION_ENROL_COUNTS[name])
+
+
+# Production's call reading and learner classifier (ship restore round 1, owner decision 2026-10-09).
+# ``_CALL_ASK`` is origin/main's tuple verbatim and ``ask_acts`` reads a call when the structural reader OR
+# this tuple reads it, so a call proposal production reads is never lost; ``_STRONG`` / ``_MEDIUM`` /
+# ``_WEAK`` are origin/main's, searched plainly (no negation or condition exemption).
+PRODUCTION_CALL_PATTERNS_SHA256 = "53765f1618dc98592528863776d17d78d36a1903b4837f995ec91414f53e271f"
+PRODUCTION_CLASSIFIER_PATTERNS_SHA256 = {
+    "_STRONG": ("f24a87ff07610165e2b66d42d1b17c740e17af271764a60e1b9fc898925d4ad5", 12),
+    "_MEDIUM": ("bd1cfc0ccb128a1dc167cb4bdb63d790f551cfbfe736d174d0ffb561149c2005", 9),
+    "_WEAK": ("bb233211a520f96e41b8552fbd1d70e1b5b4e6d6fd1650d3392ec6b6820de6d3", 5),
+}
+# The engine's call reading (the union) on the labelled fixtures: (tp, fp, fn).  Production's own reading
+# scores hand 66/61/53, simulator 54/4/41, held-out 18/2/18; the union keeps production's false
+# positives and adds only true positives.
+PRODUCTION_CALL_COUNTS = {  # (tp, fp, fn)
+    "hand": (116, 61, 3),
+    "sim": (91, 4, 4),
+    "heldout": (31, 2, 5),
+}
+
+
+class ProductionCallReadingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.corpus = load_corpus()
+        cls.heldout = load_heldout()
+
+    def test_the_call_patterns_are_productions_verbatim(self) -> None:
+        import hashlib
+
+        import r1_commitment
+
+        source = "\n".join(pattern.pattern for pattern in r1_commitment._CALL_ASK)
+        self.assertEqual(len(r1_commitment._CALL_ASK), 11)
+        self.assertEqual(
+            hashlib.sha256(source.encode("utf-8")).hexdigest(),
+            PRODUCTION_CALL_PATTERNS_SHA256,
+            "the call floor is no longer origin/main's _CALL_ASK",
+        )
+
+    def test_the_classifier_patterns_are_productions_verbatim(self) -> None:
+        import hashlib
+
+        import r1_commitment
+
+        for name, (digest, count) in PRODUCTION_CLASSIFIER_PATTERNS_SHA256.items():
+            patterns = getattr(r1_commitment, name)
+            with self.subTest(patterns=name):
+                self.assertEqual(len(patterns), count)
+                source = "\n".join(pattern.pattern for pattern in patterns)
+                self.assertEqual(hashlib.sha256(source.encode("utf-8")).hexdigest(), digest)
+
+    def test_the_engine_reads_every_call_production_reads(self) -> None:
+        missed = [
+            f"{entry['id']} {entry['text'][:100]!r}"
+            for entry in self.corpus + self.heldout
+            if production_call(entry) and not read(entry).call
+        ]
+        self.assertEqual([], missed, "\n" + "\n".join(missed[:20]))
+
+    def test_the_structural_reader_adds_no_false_positive_production_lacks(self) -> None:
+        """The structural reader's extra recall is kept only where it adds no false positive: on every
+        labelled row that is NOT a call proposal, it reads nothing production does not also read."""
+        offenders = [
+            f"{entry['id']} {entry['text'][:100]!r}"
+            for entry in self.corpus + self.heldout
+            if entry["labels"]["call_proposal"] is False
+            and structural_call(entry, read(entry))
+            and not production_call(entry)
+        ]
+        self.assertEqual([], offenders, "\n" + "\n".join(offenders[:20]))
+
+    def test_the_engine_gains_true_positives_and_keeps_production_s_false_positives(self) -> None:
+        sets = {
+            "hand": [e for e in self.corpus if is_hand(e)],
+            "sim": [e for e in self.corpus if is_sim(e)],
+            "heldout": self.heldout,
+        }
+        engine = next(d for d in DETECTORS if d.name == "call_engine")
+        for name, entries in sets.items():
+            with self.subTest(set=name):
+                tp = fp = fn = ptp = pfp = pfn = 0
+                for entry in entries:
+                    label = entry["labels"]["call_proposal"]
+                    if label is None:
+                        continue
+                    ours = bool(engine.predict(entry, read(entry)))
+                    theirs = production_call(entry)
+                    tp += label and ours
+                    fp += (not label) and ours
+                    fn += label and not ours
+                    ptp += label and theirs
+                    pfp += (not label) and theirs
+                    pfn += label and not theirs
+                self.assertEqual(fp, pfp, "the engine reads no false positive production does not")
+                self.assertGreaterEqual(tp, ptp)
+                self.assertLessEqual(fn, pfn)
+                self.assertEqual((tp, fp, fn), PRODUCTION_CALL_COUNTS[name])
 
 
 class HostileTextTests(unittest.TestCase):

@@ -18,13 +18,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Iterable, Mapping
+from typing import Mapping
 
 from r1_text import (
     fold,
     fuzzy_contains,
     is_question_like,
-    negated_before,
     split_sentences,
 )
 
@@ -487,7 +486,7 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
         re.compile(
             r"\b(?:a|an|another|one more|the next|the follow[- ]?up|our next|a second) "
             r"(?:quick |short |brief |follow[- ]?up |second |further |ten[- ]minute |15[- ]minute |"
-            r"20[- ]minute |\d+[- ]minute )?(?:call|chat|meeting|conversation|catch[- ]?up|"
+            r"20[- ]minute |\d+[- ]minute )?(?:call|meeting|conversation|catch[- ]?up|"
             r"check[- ]?in)\b",
             re.IGNORECASE,
         ),
@@ -517,7 +516,7 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
         re.compile(
             r"\b(?:hop|jump|get|dial|log) (?:on|onto|into) (?:a |an |the |our )?(?:[\w-]+ ){0,2}?"
             r"(?:zoom|call|video call|meet|teams|hangout|chat)\b"
-            r"|\bhave a (?:quick |brief |short )?(?:word|chat|natter|catch[- ]?up)\b",
+            r"|\bhave a (?:quick |brief |short )?(?:natter|catch[- ]?up)\b",
             re.IGNORECASE,
         ),
         False,
@@ -555,14 +554,6 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
         ),
         True,
     ),
-    (
-        re.compile(
-            r"\b(?:talk|speak)(?:ing)? (?:to|with) your (?:husband|wife|partner|spouse|"
-            r"father|mother|dad|mom|family|parents)\b",
-            re.IGNORECASE,
-        ),
-        False,
-    ),
 )
 # A question about a day or a time ("What evening works best for you?", "Does 9 work?").
 _TIME_ASKS = (
@@ -599,7 +590,7 @@ _TIME_ASKS = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:does|would|will|is|are|do|how about|what about|shall we do|shall we say|"
+        r"\b(?:does|would|will|is|do|how about|what about|shall we do|shall we say|"
         r"can we do|could we do|how does|how'?s|if we say)\b[^.?!]{0,50}"
         r"\b(?:" + _DAY + r"|" + _CLOCK_TIME + r"|(?<![\d$,.])\d{1,2}(?![\d,.])|next week|"
         r"this week|this weekend|"
@@ -610,25 +601,15 @@ _TIME_ASKS = (
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:how about|what about|shall we (?:do|say|make it)|can we do|could we do|let'?s do|"
+        r"\b(?:shall we (?:do|say|make it)|can we do|could we do|let'?s do|"
         r"let'?s say|let'?s make it|how does|how'?s)\b[^.?!]{0,30}"
         r"\b(?:" + _DAY + r"|" + _CLOCK_TIME + r"|next week|this week|this weekend|weekend|"
         r"evening|morning|afternoon|noon|lunch|sometime)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\bdo you have (?:a |an |some )?(?:\w+ )?(?:minutes?|time|half an hour|an hour|a moment)\b"
-        r"[^.?!]{0,30}\b(?:" + _DAY + r"|weekend|morning|evening|afternoon|" + _CLOCK_TIME + r")",
-        re.IGNORECASE,
-    ),
-    re.compile(
         r"\bare you (?:free|available|around|open)\b[^.?!]{0,40}\b(?:" + _DAY + r"|this week|"
         r"next week|weekend|call|tomorrow|tonight|later|evening|morning)\b",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b(?:" + _CLOCK_TIME + r"|o'?clock|" + _DAY + r")\b[^.?!]{0,25}\b(?:works?|suits?)\b"
-        r"[^.?!]*\?",
         re.IGNORECASE,
     ),
 )
@@ -637,8 +618,8 @@ _CALL_QUESTIONS = (
     re.compile(
         r"\b(?:would|could|can|will|is|does|do|shall we have|can we have|how about|what about|"
         r"are you open to|would you be open to|would you like|do you want|do you prefer)\b"
-        r"[^.?!]{0,50}\b(?:a|an|another)\s+(?:[\w-]+ ){0,2}?(?:call|chat|meeting|"
-        r"conversation|catch[- ]?up|check[- ]?in|follow[- ]?up|word|zoom|buzz|sync|huddle|"
+        r"[^.?!]{0,50}\b(?:a|an|another)\s+(?:[\w-]+ ){0,2}?(?:call|meeting|"
+        r"conversation|check[- ]?in|word|zoom|buzz|sync|huddle|"
         r"video call|three-way)\b",
         re.IGNORECASE,
     ),
@@ -862,6 +843,40 @@ _ENROL_ASK = _compile(
 )
 
 
+# Ship restore round 1 (owner decision 2026-10-09): production's call reading, ``_CALL_ASK``
+# verbatim from origin/main.  ``call_proposal_in`` (the structural reader above) is kept for the
+# proposals it reads and production misses (recall 31 of 38 against 14), but it was not a superset
+# of production: it missed third-person callees ("Let me call your husband tomorrow at 7"), bare
+# callbacks ("I'll call you back later") and unframed offers, and a proposal production reads then
+# got a free reply where production books the call.  ``ask_acts`` therefore reads a call when
+# EITHER reading does, so what production reads is never lost.
+_CALL_ASK = _compile(
+    r"\b(?:schedule|set up|book|arrange|line up|fix|plan|organi[sz]e|pencil in)\b"
+    r"[^.?!]{0,30}\b(?:call|chat|meeting|session|demo|time|slot|follow[- ]?up|"
+    r"catch[- ]?up|conversation)\b",
+    r"\b(?:can|could|shall|should|would|will|may|how about|what about|let'?s|want to|"
+    r"like to)\b[^.?!]{0,25}\b(?:follow[- ]?up|quick|another|second|short|brief|next) "
+    r"(?:call|chat|meeting|conversation)\b",
+    r"\b(?:can|could|shall|should|may|will|i'?ll|let me) (?:i |we )?call (?:you )?back\b",
+    r"\b(?:can|could|shall|should|may|will|i'?ll|let me) (?:i |we )?(?:call|ring|ping|text) you "
+    r"(?:back|tomorrow|tonight|on|at|later|this|next)\b",
+    r"\b(?:talk|speak|connect|chat|catch up)\b (?:again |to you |with you )?(?:on |this |next )?"
+    r"(?:" + _DAY + r"|week)\b",
+    r"\b(?:does|would|will|is|how about|what about|shall we do|can we do|do)\b"
+    r"[^.?!]{0,30}\b(?:" + _DAY + r"|next week|this week|" + _CLOCK + r")\b"
+    r"[^.?!]{0,30}\b(?:work|works|suit|suits|good|fine|okay|ok|convenient|better)\b",
+    r"\bwhat (?:day|time|date|slot)s?\b[^.?!]{0,30}\b(?:work|works|suit|suits|good|"
+    r"convenient|best|free|available)\b",
+    r"\bwhen (?:are|would|can|could) you (?:be )?(?:free|available|up for|ok|okay|"
+    r"comfortable)\b",
+    r"\bare you (?:free|available)\b[^.?!]{0,30}\b(?:" + _DAY + r"|this week|next week|call)\b",
+    r"\b(?:i'?ll|i will|let me|we'?ll|we will) (?:call|ring|ping|reach out|get back|"
+    r"follow up|check in|connect)\b[^.?!]{0,40}\b(?:" + _DAY + r"|next week|this week|"
+    r"later today)\b",
+    r"\bwhat(?:'s| is| would be) (?:the |a )?(?:best |good |right )?next step\b",
+)
+
+
 def enrol_ask_in(sentence: object) -> str | None:
     """The phrase that asks the learner to enrol or pay in one advisor sentence, or None.
 
@@ -869,6 +884,19 @@ def enrol_ask_in(sentence: object) -> str | None:
     """
     lowered = fold(sentence).lower()
     for pattern in _ENROL_ASK:
+        match = pattern.search(lowered)
+        if match:
+            return match.group(0)[:40]
+    return None
+
+
+def production_call_ask_in(sentence: object) -> str | None:
+    """The phrase production reads as a call proposal in one advisor sentence, or None.
+
+    Origin/main's ``detect_ask`` call loop, verbatim: the first ``_CALL_ASK`` match.
+    """
+    lowered = fold(sentence).lower()
+    for pattern in _CALL_ASK:
         match = pattern.search(lowered)
         if match:
             return match.group(0)[:40]
@@ -888,7 +916,9 @@ def ask_acts(text: object) -> dict[AskKind, Ask]:
 
     A turn can hold both ("Let me send you an email, and could we lock in a short call?"); the
     corpus test of the detectors (``tests/test_r1_detector_corpus.py``) scores each kind on its
-    own, while ``detect_ask`` below keeps the engine's single answer.
+    own, while ``detect_ask`` below keeps the engine's single answer.  A call is read when the
+    structural reader (``call_proposal_in``) OR production's own pattern list reads it, so every
+    call production reads is still read (ship restore round 1).
     """
     found: dict[AskKind, Ask] = {}
     for sentence in split_sentences(text):
@@ -897,7 +927,7 @@ def ask_acts(text: object) -> dict[AskKind, Ask]:
             if phrase is not None:
                 found[AskKind.ENROL] = Ask(AskKind.ENROL, phrase)
         if AskKind.CALL not in found:
-            phrase = call_proposal_in(sentence)
+            phrase = call_proposal_in(sentence) or production_call_ask_in(sentence)
             if phrase is not None:
                 found[AskKind.CALL] = Ask(AskKind.CALL, phrase)
     return found
@@ -957,48 +987,27 @@ _WEAK = _compile(
 )
 
 
-# How far back a negator may sit from the end of a commitment phrase and still govern it.  A clause
-# break (comma, full stop, "but") ends the reach, so "I can't do Tuesday, but Thursday works" keeps
-# its Thursday.
-_NEGATION_REACH_WORDS = 10
-def _affirms(patterns: Iterable[re.Pattern[str]], lowered: str) -> bool:
-    """True when one of ``patterns`` matches ``lowered`` without a negator in its own clause.
-
-    "And ten tomorrow won't work" and "I don't think tomorrow works" contain the words of an
-    agreement ("tomorrow ... works") and mean the opposite (R1-Q iteration 2: both were graded
-    MEDIUM and flagged the live call).  A negator inside the match, or earlier in the same clause,
-    turns the phrase round.
-    """
-    for pattern in patterns:
-        for match in pattern.finditer(lowered):
-            if negated_before(lowered, match.end(), _NEGATION_REACH_WORDS):
-                continue
-            return True
-    return False
-
-
 def classify_learner_commitment(text: object) -> Level:
     """The highest commitment level expressed in learner ``text``.
 
     STRONG is an enrolment or payment affirmation; MEDIUM is accepting or proposing a
     call, a day or a time; WEAK is the "let me think, email me" stall.  The scripted
     lines classify as their own level, and every scripted objection line classifies at
-    most WEAK.  A phrase a negator governs ("tomorrow won't work", "I don't think Thursday
-    works") agrees to nothing.
+    most WEAK.
     """
     folded = fold(text)
     lowered = folded.lower()
-    if _affirms(_STRONG, lowered):
+    if any(pattern.search(lowered) for pattern in _STRONG):
         return Level.STRONG
     if fuzzy_contains(folded, COMMITMENT_LINES[Level.STRONG]):
         return Level.STRONG
-    if _affirms(_MEDIUM, lowered):
+    if any(pattern.search(lowered) for pattern in _MEDIUM):
         return Level.MEDIUM
     medium_line = COMMITMENT_LINES[Level.MEDIUM].replace("{decision_maker}", "")
     medium_line = medium_line.replace("{slot}", DEFAULT_SLOT)
     if fuzzy_contains(folded, medium_line, 0.7):
         return Level.MEDIUM
-    if _affirms(_WEAK, lowered):
+    if any(pattern.search(lowered) for pattern in _WEAK):
         return Level.WEAK
     return Level.NONE
 

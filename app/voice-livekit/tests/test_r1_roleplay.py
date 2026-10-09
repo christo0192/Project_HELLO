@@ -2267,21 +2267,22 @@ class OwnerTestNegotiationTests(unittest.TestCase):
         self.assertLessEqual(said.count("email me the details"), 1)
         self.assertNotIn("haven't thought about that", said)
 
-    def test_the_callback_with_the_decision_maker_offer_earns_a_medium_commitment(self):
-        """Turn 78-79: the advisor offered to include the husband: the earned close, not a cue."""
+    def test_the_callback_with_the_decision_maker_offer_is_answered_as_on_production(self):
+        """Turn 78-79: the advisor offered to include the husband.  Ship restore round 1 (owner decision
+        2026-10-09): the head-only "talk to your husband" call object that read this as a call also read
+        "Talk to your husband tonight and let me know" as one, so it is gone and production's reading is
+        back: no ask, the owed commitment stall (the WEAK line, once) exactly as production speaks it."""
         session, r = run_cooperative(50.0)  # F4-PUSH ("I'd need to talk to my husband") is done
         self.assertTrue(session.eng.scheduler.commit_permitted(r))
         plan = session.say(self.T78, r)
+        # The husband mention still counts as the decision maker being handled.
         self.assertEqual(session.eng.negotiation.reasons_handled_count, 1)
         self.assertIn("decision_maker", session.eng.negotiation.handled)
-        self.assertEqual(plan.mode, TurnMode.SAY_ONLY)
-        self.assertEqual(plan.commitment_level, Level.MEDIUM)
-        # The advisor named no time and the learner had just said it must talk to its husband:
-        # the call is booked without a slot the learner never had (R1-Q iteration 2).
-        self.assertEqual(
-            plan.scripted_text, commitment_line(Level.MEDIUM, "husband", deferred=True)
-        )
-        self.assertTrue(session.eng.commitment_resolved)
+        self.assertEqual(plan.move_id, COMMIT_STALL)
+        self.assertEqual(plan.commitment_level, Level.WEAK)
+        self.assertNotEqual(plan.commitment_level, Level.MEDIUM)
+        self.assertIn("Just email me the details", session.spoken[-1])
+        self.assertEqual(session.eng.admin_log()["commitment"]["asks"], [])
 
     def test_the_email_turn_gets_one_real_reaction(self):
         session, r = run_cooperative(50.0)
@@ -2738,11 +2739,16 @@ class PitchNeverEarnsACommitmentTests(unittest.TestCase):
     in the close window the learner then answered a pitch with the scripted MEDIUM commitment."""
 
     def test_a_pitch_in_the_close_window_never_yields_a_commitment_line_or_an_email_yes(self):
-        from tests.test_r1_negotiation import CALL_PITCHES, EMAIL_PITCHES, PITCHES
+        from tests.test_r1_negotiation import CALL_PITCHES, EMAIL_PITCHES, PITCHES, production_reads
 
         # Round 2 (review 3): the singular forms ("book a slot with a mentor") and the "once you
         # enroll" / "link to the live class" sentences still got the MEDIUM line or the e-mail yes.
-        for text in PITCHES + CALL_PITCHES + EMAIL_PITCHES:
+        # Ship restore round 1: a pitch that production's own patterns read as an ask is read as one
+        # again (equal to production, accepted), so only the pitches production reads as nothing are
+        # held to a free reply here.
+        pitches = [text for text in PITCHES + CALL_PITCHES + EMAIL_PITCHES if not production_reads(text)]
+        self.assertGreaterEqual(len(pitches), 20)
+        for text in pitches:
             with self.subTest(text=text):
                 session, r = run_cooperative(40.0)  # the four families are done at 10:20
                 session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
@@ -2765,9 +2771,12 @@ class PitchNeverEarnsACommitmentTests(unittest.TestCase):
     def test_a_pitch_before_the_close_window_is_not_answered_with_a_stall_reason(self):
         """R1-Q round 2 (review 3): at R=220 the mentor-session reassurance was answered with the
         N-MONEY stall, as if the advisor had asked for a commitment."""
-        from tests.test_r1_negotiation import CALL_PITCHES, EMAIL_PITCHES
+        from tests.test_r1_negotiation import CALL_PITCHES, EMAIL_PITCHES, production_reads
 
-        for text in CALL_PITCHES + EMAIL_PITCHES:
+        # Ship restore round 1: only the pitches production reads as nothing (see above).
+        pitches = [text for text in CALL_PITCHES + EMAIL_PITCHES if not production_reads(text)]
+        self.assertGreaterEqual(len(pitches), 10)
+        for text in pitches:
             with self.subTest(text=text):
                 s = Session(engine(seed="early-pitch"))
                 s.say(OPENER, 20)

@@ -130,21 +130,37 @@ describe('masking', () => {
     }
   });
 
-  it('masks a cut MEDIUM line only where production\'s frames reach it (ship restore, owner decision 2026-10-09)', () => {
-    // Production\'s frame "book a call on Thursday at 7 PM" still masks the cut that holds it, with or
-    // without what the learner said before.
-    const reached = "Let's book a call on Thursday at 7 PM with my husband";
-    expect(maskCommitmentLines(reached)).toBe(R1_COMMITMENT_MASK);
-    expect(maskCommitmentLines(`Hmm, okay. ${reached}`)).toBe(`Hmm, okay. ${R1_COMMITMENT_MASK}`);
-    // The new wordings are matched as WHOLE sentences: any other cut of them is ordinary speech to the
-    // mask, as on production (the prefix and short frames of the earlier round hid ordinary learner
-    // speech, so they are gone).
+  it('masks every cut of the MEDIUM line from "let\'s book a call" on, whatever its slot (ship restore round 1)', () => {
+    // Production's own line always says "on Thursday at 7 PM", so its frame masked every cut after the
+    // slot (48 of 48).  The MEDIUM line now carries the advisor's slot (or a deferred booking), so the
+    // frame "let's book a call" keeps every second-half cut hidden, with or without what the learner
+    // said before it.
+    const lines = [
+      "Let's book a call on Thursday at 7 PM with my husband so we can decide.",
+      "Let's book a call tomorrow at 7 PM with my husband so we can decide.",
+      "Let's book a call on Saturday at 11 AM with my father so we can decide.",
+      "Let's book a call tonight with my partner so we can decide.",
+      "Daytime is tough for me, so let's book a call tomorrow at 7 PM with my husband so we can decide.",
+      "Let me check with my husband first, and then let's book a call, so we can decide.",
+    ];
+    let checked = 0;
+    for (const line of lines) {
+      const words = line.split(' ');
+      for (let n = 1; n <= words.length; n += 1) {
+        const cut = words.slice(0, n).join(' ').replace(/[.!?]$/, '');
+        if (!/let['’]?s book a call/i.test(cut)) continue;
+        checked += 1;
+        expect(maskCommitmentLines(cut), cut).toBe(R1_COMMITMENT_MASK);
+        expect(maskCommitmentLines(`Hmm, okay. ${cut}`), cut).toBe(`Hmm, okay. ${R1_COMMITMENT_MASK}`);
+      }
+    }
+    expect(checked).toBeGreaterThan(40);
+    expect(maskCommitmentLines("Let’s book a call tonight")).toBe(R1_COMMITMENT_MASK);
+    // The cuts that stop before "a call" are not hidden, as on production (the first half of the line).
     for (const line of [
-      "Let's book a call tomorrow at 7 PM with my husband so we",
-      "Daytime is tough for me, so let's book a call tomorrow at 7 PM with my",
-      "Let's book a call on Saturday at 11 AM with my father so",
-      "Let’s book a call tonight",
-      "Daytime is tough for me, so let's book a call",
+      "Let's book a",
+      "Daytime is tough for me, so let's book a",
+      "Let me check with my husband first, and then let's book a",
     ]) {
       expect(maskCommitmentLines(line), line).toBe(line);
     }

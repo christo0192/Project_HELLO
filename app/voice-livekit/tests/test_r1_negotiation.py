@@ -22,6 +22,8 @@ from r1_commitment import (
     commitment_line,
     describes_programme,
     detect_ask,
+    enrol_ask_in,
+    production_call_ask_in,
 )
 from r1_guard import GuardContext, check_sentence, has_concession
 from r1_personas import PERSONAS, deep_need_topics_in, resolve_persona
@@ -57,8 +59,19 @@ T80 = (
     "once we finish this call. Anything else you wanted to know about the course or program?"
 )
 NEUTRAL = "That makes sense. What else is on your mind?"
+
+
+def production_reads(text):
+    """Origin/main's reading of an advisor turn: one of its enrolment or call patterns matches a sentence."""
+    return any(
+        enrol_ask_in(sentence) is not None or production_call_ask_in(sentence) is not None
+        for sentence in split_sentences(text)
+    )
+
+
 # Pitch sentences about what the programme sends, schedules or does (R1-Q round 1, review 2).  None
-# is an e-mail offer, a callback or an ask.
+# is an e-mail offer or a callback; none is an ask unless production's own patterns read it as one
+# (ship restore round 1: ``production_reads``).
 PITCHES = (
     "We send you the recordings after every class, so you never miss anything.",
     "We will send you a certificate at the end of the program.",
@@ -303,9 +316,16 @@ class SlotTests(unittest.TestCase):
 
 class CallbackTests(unittest.TestCase):
     def test_the_real_callback_turns_are_found(self):
-        for text in (T62_66, T68, T78):
+        for text in (T62_66, T68):
             with self.subTest(text=text[:40]):
                 self.assertIsNotNone(neg.detect_callback(text))
+
+    def test_the_owner_s_turn_78_offers_a_talk_with_the_husband_and_is_no_callback(self):
+        # Ship restore round 1: "I can also talk to your husband" was read as a call by the head-only
+        # "talk to your husband" call object, which also read "Talk to your husband tonight and let me
+        # know"; production reads neither, and neither does the engine now.
+        self.assertIsNone(neg.detect_callback(T78))
+        self.assertIsNone(detect_ask(T78))
 
     def test_the_slot_comes_from_the_sentences_around_the_proposal(self):
         callback = neg.detect_callback(
@@ -331,7 +351,6 @@ class CallbackTests(unittest.TestCase):
 
     def test_the_slotless_proposals_carry_no_slot(self):
         self.assertIsNone(neg.detect_callback(T68).slot)
-        self.assertIsNone(neg.detect_callback(T78).slot)
 
     def test_a_pitch_about_the_programme_is_not_a_callback(self):
         """R1-Q round 1: "reach you on the next session" turned a pitch into a call ask."""
@@ -369,8 +388,11 @@ class PitchOrProposalTests(unittest.TestCase):
 
     def assert_not_detected(self, text):
         self.assertIsNone(neg.detect_callback(text), text)
-        self.assertIsNone(detect_ask(text), text)
         self.assertFalse(neg.detect_email_offer(text), text)
+        # Ship restore round 1 (owner decision 2026-10-09): the engine's ask is the structural reader OR
+        # production's own pattern list, so a pitch gets an ask exactly where production's patterns read
+        # one (those false positives are back, equal to production); the structural reader adds none.
+        self.assertEqual(detect_ask(text) is not None, production_reads(text), text)
 
     def test_the_reviewers_call_pitches_are_nothing(self):
         for text in CALL_PITCHES:
@@ -395,6 +417,15 @@ class PitchOrProposalTests(unittest.TestCase):
                 self.assert_not_detected(text)
         self.assertGreater(count, 400)
 
+    def test_a_pitch_production_reads_as_a_call_is_read_as_one_as_on_production(self):
+        reads = [text for text in CALL_PITCHES if production_reads(text)]
+        self.assertGreaterEqual(len(reads), 15)
+        for text in reads:
+            with self.subTest(text=text):
+                ask = detect_ask(text)
+                self.assertIsNotNone(ask, text)
+                self.assertIsNone(neg.detect_callback(text), text)
+
     def test_real_proposals_of_a_call_are_still_seen(self):
         for text in CALL_PROPOSALS:
             with self.subTest(text=text):
@@ -414,7 +445,7 @@ class PitchOrProposalTests(unittest.TestCase):
         self.assertIsNone(neg.detect_callback(text))
 
     def test_the_owner_test_turns_are_still_seen(self):
-        for text in (T62_66, T68, T78):
+        for text in (T62_66, T68):
             with self.subTest(text=text[:40]):
                 self.assertIsNotNone(neg.detect_callback(text))
 
