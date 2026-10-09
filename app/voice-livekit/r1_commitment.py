@@ -356,6 +356,34 @@ _CLASS_LOGISTICS_AFTER = (
     r"webinars?|workshops?|zoom|meeting|demo|orientation|induction|community|group|slack|discord|"
     r"whatsapp|mentors?|recordings?|materials?|notes|batch|cohort)\b)"
 )
+# What a link or a form is FOR, when that is the enrolment, the payment, a seat, or a form to fill.
+_ASK_DESTINATION = (
+    r"enrol\w*|regist\w*|sign[- ]?up|sign\b|pay\w*|deposit|seats?|spots?|admissions?|"
+    r"appl(?:y|ication)\w*|checkout|instal+ments?|reserv\w*|secure\b|lock\w*|fill\w*|"
+    r"complet\w*|submit\w*"
+)
+
+
+def _resource_dest_after(extra: str = "") -> str:
+    """Look-ahead: the link or form just matched LEADS to a resource, not to the enrolment.
+
+    "The link to our alumni reviews", "the form for the free career consultation", "the form to
+    request a callback" are resources unless where they lead is the enrolment, the payment or a
+    seat (``_ASK_DESTINATION``, plus ``extra`` words).  "With you / me" is who gets it, not where
+    it leads.
+    """
+    cues = _ASK_DESTINATION + (r"|" + extra if extra else "")
+    return (
+        r"(?!\s+(?:to|for|about|on|of|that|which|where|"
+        r"with(?! (?:you|me|us|him|her|them|your)\b))\b"
+        r"(?![^.?!]{0,40}?\b(?:" + cues + r")\b))"
+    )
+
+
+# For the form after "send" (a head-only reading: main has none); main's question frame also reads
+# "can I email you the link for the January batch?", so the question keeps a batch / cohort cue.
+_RESOURCE_DEST_AFTER = _resource_dest_after()
+_RESOURCE_DEST_AFTER_QUESTION = _resource_dest_after(r"batch|cohort")
 
 
 # The call we are on: "after the call", "once we finish this call", "on this call".
@@ -842,7 +870,6 @@ _ENROL_OBJECT = (
     r"(?:payment|enrol+ment|registration|sign-?up|application|booking|invoice|deposit|"
     r"contract|agreement|checkout|instal+ment(?: plan)?)"
 )
-_LINK = r"(?:link|form|page|invoice)"
 # What payment and registration TALK is when it is not the thing to act on: information.
 _NOT_INFORMATION = (
     r"(?!\s+(?:details?|options?|information|info|plans?|comparison|breakdown|faq|faqs|schedule|"
@@ -949,13 +976,40 @@ _ENROL_ASK = _compile(
     r"(?:^|[,;] ?)(?:(?:and|but|so|then|now|just|please|okay|ok) )*(?:go ahead and |please )?"
     r"(?:complete|finali[sz]e|make|do|submit) (?:the |your |that |this )?(?:payment|registration|"
     r"enrol+ment|booking|deposit|application)\b" + _NOT_INFORMATION,
-    # A bare link, form or page is an ask only with main's verb, "send" ("send me the link"): any
-    # other verb is information far more often ("I'll email you the link to our alumni reviews",
-    # "I can share the link to the curriculum page", "text you the page with the batch timings";
-    # ship-gate round 1: 12 of 14 such sends read as an enrolment ask and earned the scripted STRONG
-    # line, against 1 of 14 on main).  An invoice is the thing to pay whoever sends it.
+    # A bare link or form is an ask with main's verb, "send" ("send me the link"); a bare PAGE is
+    # not (main reads only "send the payment / enrolment / registration page", the pattern above):
+    # "I'll send you the page with the batch timings" is information (ship-gate round 2: 7 of 7 read
+    # as an ask, main 0 of 7).  A form that leads somewhere ("the form for the free career
+    # consultation", "the form to request a callback") is information too.
     r"\bsend\b(?: (?:you|me|him|her|them|over|across|out))?"
-    r"(?: (?:the|a|an|your|that|this|it))? ?" + _LINK + r"\b" + _CLASS_LOGISTICS_AFTER,
+    r"(?: (?:the|a|an|your|that|this|it))? ?(?:link\b" + _CLASS_LOGISTICS_AFTER + r"|form\b"
+    + _RESOURCE_DEST_AFTER + r")",
+    # Any OTHER verb is an ask only as main's question ("shall I share / email you the link?"):
+    # said as a statement it is information far more often ("I'll email you the link to our alumni
+    # reviews", "I can share the link to the curriculum page"; ship-gate round 1: 12 of 14 such
+    # sends read as an enrolment ask and earned the scripted STRONG line, main 1 of 14).  The
+    # question keeps main's reading of the natural close ("Shall I share the link?", "Can I email
+    # you the form?"; ship-gate round 2: head missed all of them, an earned STRONG answered with
+    # "Okay, thanks.") and drops its reading of a link to a resource ("Can I email you the link to
+    # a sample lecture?").
+    r"\b(?:shall|should|can|could|may|would|will) (?:i|we) (?:\w+ ){0,2}?(?:share|email|e-mail)\b"
+    r"(?: (?:you|me|him|her|them|over|across|out))?(?: (?:the|a|an|your|that|this|it))? ?"
+    r"(?:link|form)\b" + _RESOURCE_DEST_AFTER_QUESTION,
+    # "Can I send it right now?" / "Shall I send it?" right after the enrolment form was described
+    # (4 live pushy asks; main reads them): only when "it" ends the question, so "Should I send it
+    # to the email you used on the form?" and "Can I send it over so you can review it?" stay
+    # information.  ("Should I send THAT over?" after an offer of the details by e-mail stays
+    # information too: it is a labelled non-ask of the corpus, and main reads it as an ask.)
+    r"\b(?:shall|should|can|could|may|would|will) (?:i|we) send it(?: over| across| out)?"
+    r"(?: (?:right )?(?:now|today|tonight))?\W*$",
+    # "I'll email you the link, and you can pay the deposit whenever you like", "I'll email it over
+    # so you can pay the deposit tonight": the learner ACTS on it (main reads these through "pay the
+    # deposit"; the look-ahead keeps "pay" out of the match, clear of the weak-"pay" guard).
+    r"\b" + _ENROL_VERB_SEND + r"\b(?: (?:you|me|him|her|them|over|across|out))?"
+    r"(?:(?: (?:the|a|an|your|that|this))? ?(?:link|form)|(?: it| that| this| everything)"
+    r"(?: over| across| out)?)\b(?=[,;]? (?:so|and) (?:you|they) (?:can|could|may|will) "
+    r"(?:then )?(?:sign|enrol+|lock|pay(?! attention)|reserve|secure)\b)",
+    # An invoice is the thing to pay whoever sends it.
     r"\b" + _ENROL_VERB_SEND + r"\b(?: (?:you|me|him|her|them|over|across|out))?"
     r"(?: (?:the|a|an|your|that|this|it))? ?invoice\b" + _CLASS_LOGISTICS_AFTER,
     # "send it over so you can sign": the learner ACTS on it.  "so you can decide / confirm /

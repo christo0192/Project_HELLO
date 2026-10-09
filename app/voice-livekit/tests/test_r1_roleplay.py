@@ -3319,6 +3319,73 @@ class ResourceLinkThroughTheEngineTests(unittest.TestCase):
         self.assertIsNotNone(plan.commitment_level, plan.reasons)
 
 
+class ShareTheLinkThroughTheEngineTests(unittest.TestCase):
+    """R1-Q ship-gate round 2: the close "Shall I share the link?" earns the scripted STRONG line.
+
+    Round 1 dropped main's question frame; "Shall I share the link?", "Can I email you the form?"
+    and the like were missed, and a good candidate's earned close answered "Okay, thanks." and
+    ended WEAK (main: STRONG).  A bare page, or a form for a consultation, is information: no ask
+    (main 0 of 7).
+    """
+
+    ASKS = (
+        "Shall I share the link?",
+        "Shall I email you the link now?",
+        "Can I email you the form?",
+        "Great, so can I share the link with you now?",
+        "Can I email you the link so you can lock your seat?",
+        "I'll email you the link, and you can pay the deposit whenever you like.",
+        "Can I send it right now?",
+    )
+    NOT_ASKS = (
+        "I'll send you the page with the batch timings.",
+        "Let me send you the page that shows our placement numbers.",
+        "I can send you the page about the mentors.",
+        "I'll send you the form for the free career consultation.",
+        "I'll send you the form to request a callback from a mentor.",
+        "Can I email you the link to a sample lecture?",
+    )
+
+    def strong_session(self):
+        """The thorough advisor's call (the decision maker handled): STRONG is earned at the close."""
+        eng = engine()
+        session = Session(eng)
+        r = 20.0
+        for index, text in enumerate(strong_script()):
+            session.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
+            r += 50.0
+        eng.apply_judge(GOOD_JUDGE, eng.turn)
+        return session, r
+
+    def test_a_question_that_offers_the_link_earns_the_strong_line_in_the_close_window(self):
+        for text in self.ASKS:
+            with self.subTest(text=text):
+                session, r = self.strong_session()
+                plan = session.say(text, r)
+                self.assertEqual(plan.commitment_level, Level.STRONG, plan.reasons)
+                self.assertNotIn("strong_blocked", ",".join(plan.reasons))
+                self.assertIn("enrolment link", session.spoken[-1].lower())
+
+    def test_the_same_questions_are_asks_when_the_decider_is_not_handled(self):
+        for text in self.ASKS:
+            with self.subTest(text=text):
+                session, r = run_cooperative(40.0)
+                session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+                plan = session.say(text, r - 20)
+                self.assertIsNotNone(plan.commitment_level, plan.reasons)
+                self.assertIn("ask_in_window:grade_strong", plan.reasons)
+
+    def test_a_page_or_a_form_for_a_resource_earns_no_commitment(self):
+        for text in self.NOT_ASKS:
+            with self.subTest(text=text):
+                session, r = run_cooperative(40.0)
+                session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+                plan = session.say(text, r - 20)
+                self.assertIsNone(plan.commitment_level, plan.reasons)
+                self.assertEqual(session.eng.admin_log()["commitment"]["asks"], [])
+                self.assertNotIn("enrolment link", session.spoken[-1].lower())
+
+
 class SituationNotesThroughTheEngineTests(unittest.TestCase):
     """R1-Q iteration 1 (owner decision b.3, b.4 and the live misfires): who decides, what the
     $7,000 is and what "I can check with my manager" grants."""

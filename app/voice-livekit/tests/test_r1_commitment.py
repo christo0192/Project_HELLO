@@ -868,6 +868,95 @@ class ShipGateRoundOneDetectorTests(unittest.TestCase):
                 self.assertIn(AskKind.ENROL, ask_acts(text), text)
 
 
+class ShipGateRoundTwoDetectorTests(unittest.TestCase):
+    """R1-Q ship-gate round 2: the natural "shall I share the link?" is an ask; a page or a form
+    that leads to a resource is not.
+
+    Round 1 narrowed the bare link rule to "send" and left no question frame, so the closes main
+    reads ("Shall I share the link?", "Can I email you the form?") were missed and an earned STRONG
+    ended WEAK.  A bare PAGE (and a form that leads to a consultation, a callback, the batch dates)
+    read as an enrolment ask with "send" (7 of 7 information sends; main 0 of 7).
+    """
+
+    QUESTION_ASKS = (
+        "Shall I share the link?",
+        "Shall I share the link with you?",
+        "Can I share the link now?",
+        "Should I share the link?",
+        "Shall I email you the link now?",
+        "Can I email you the link?",
+        "Can I email you the form?",
+        "Shall I share the form?",
+        "Great, so can I share the link with you now?",
+        "Can I email you the link so you can lock your seat?",
+        "Can I email you the link to enrol?",
+        "Shall I share the link to pay the deposit?",
+        "Can I email you the link for the January batch?",
+    )
+    ACTING_STATEMENTS = (
+        "I'll email you the link, and you can pay the deposit whenever you like.",
+        "I'll email you the link so you can lock your seat.",
+        "I'll email it over so you can pay the deposit tonight.",
+        "I'll send you the form, just fill it in and pay the deposit.",
+        "Send me the form.",
+        "Can I send it right now?",
+        "Shall I send it?",
+    )
+    INFORMATION = (
+        "I'll send you the page with the batch timings.",
+        "Let me send you the page that shows our placement numbers.",
+        "I can send you the page about the mentors.",
+        "I'll send you the page on the curriculum.",
+        "I'll send you the form for the free career consultation.",
+        "I'll send you the form to request a callback from a mentor.",
+        "I'll send you the form with the batch dates.",
+        "Let me send you a form to share your feedback.",
+        "Can I email you the link to a sample lecture?",
+        "Shall I email you the link to the instructor bios?",
+        "Can I email you the form for the scholarship enquiry?",
+        "Shall I share the page about the mentors?",
+        "Can I share the page with the batch dates?",
+        "Should I send it to the email you used on the form?",
+        "Can I send it over so you can review it?",
+        "Should I send that over?",
+        "I'll email you the link to our alumni reviews.",
+    )
+
+    def test_a_question_that_offers_the_link_or_form_is_an_enrolment_ask(self):
+        from r1_commitment import ask_acts
+
+        for text in self.QUESTION_ASKS:
+            with self.subTest(text=text):
+                self.assertIn(AskKind.ENROL, ask_acts(text), text)
+                self.assertEqual(AskKind.ENROL, detect_ask(text).kind, text)
+
+    def test_a_link_the_learner_will_act_on_is_an_enrolment_ask(self):
+        from r1_commitment import ask_acts
+
+        for text in self.ACTING_STATEMENTS:
+            with self.subTest(text=text):
+                self.assertIn(AskKind.ENROL, ask_acts(text), text)
+
+    def test_a_page_or_a_form_that_leads_to_a_resource_is_not_an_enrolment_ask(self):
+        from r1_commitment import ask_acts
+
+        for text in self.INFORMATION:
+            with self.subTest(text=text):
+                self.assertNotIn(AskKind.ENROL, ask_acts(text), text)
+
+    def test_the_payment_and_enrolment_pages_are_still_asks_whoever_sends_them(self):
+        from r1_commitment import ask_acts
+
+        for text in (
+            "I'll send you the enrolment page now.",
+            "Let me email you the payment page.",
+            "I'll send the registration form over.",
+            "I'll email you the invoice now.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(AskKind.ENROL, ask_acts(text), text)
+
+
 class ShipGateRoundOneConditionalTests(unittest.TestCase):
     """R1-Q ship-gate round 1: only the learner's OWN decision frame is exempt from a commitment level.
 
