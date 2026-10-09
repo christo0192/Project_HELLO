@@ -124,10 +124,10 @@ describe('R1 never touches the legacy or recording paths', () => {
 });
 
 describe('R1 trusts only the agent', () => {
-  it('reads the phase and speaker only through the agent-kind rule', () => {
+  it('reads the phase, the speaker and the other attributes only through the agent-kind rule', () => {
     const room = read('src/lib/r1/r1-room.ts');
     expect(room).toContain('isAgentParticipant');
-    expect(room).toContain('trustedPhase');
+    expect(room).toContain('trustedSignals');
     expect(room).not.toMatch(/\.attributes\b/);
     const agent = read('src/lib/r1/r1-agent.ts');
     expect(agent).toContain('ParticipantKind');
@@ -140,6 +140,122 @@ describe('R1 trusts only the agent', () => {
       const rawPhase = /attributes\??\.\s*phase|\[['"]phase['"]\]/;
       expect(read(file), `${file} reads a raw phase attribute`).not.toMatch(rawPhase);
     }
+  });
+
+  it('reads the learner name, the clock and the ready flag only in the agent module', () => {
+    for (const file of R1_FILES) {
+      if (file === 'src/lib/r1/r1-agent.ts') continue;
+      const code = read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      const raw = /attributes\??\.\s*(leadname|rpleft|awaiting)|\[['"](leadname|rpleft|awaiting)['"]\]/;
+      expect(code, `${file} reads a raw agent attribute`).not.toMatch(raw);
+    }
+  });
+
+  it('sends "I\'m ready" through the one API client, never over the room', () => {
+    // The candidate token cannot publish data (canPublishData: false is a pinned security
+    // control), and the browser must not try: the server relays the signal.
+    for (const file of R1_FILES) {
+      const code = read(file).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+      expect(code, `${file} publishes data from the browser`).not.toMatch(
+        /\b(publishData|performRpc|sendText|sendBytes|setAttributes|setMetadata)\b/,
+      );
+    }
+    expect(read('src/lib/r1/r1-api.ts')).toContain("ready: '/api/r1/ready'");
+    expect(read('src/pages/R1JoinPage.tsx')).toContain('r1Api.ready(');
+  });
+});
+
+describe('R1 live view fits the window and bounds its captions', () => {
+  // jsdom has no layout, so the chain of heights that makes the captions list the only
+  // scroller is pinned here; e2e/candidate-r1.e2e.ts measures it in a real browser.
+  const css = read('src/styles/candidate-r1.css');
+
+  it('locks the desktop shell to the viewport height, with a modifier the page opts into', () => {
+    // 480, not 600: a real window is the screen minus the taskbar and the browser's bars, so a
+    // 1080p laptop at 150% is about 1280x580 and must stay two columns. 860, not 769: the stage
+    // beside the 360 px column is only 440 px wide there, which is what the aura (at least 132 px)
+    // and the 200 px camera need side by side; narrower windows get the one-column layout.
+    expect(css).toMatch(/@media \(min-width: 860px\) and \(min-height: 480px\) \{/);
+    expect(css).not.toMatch(/min-width: 769px/);
+    expect(css).toMatch(/\.candidate-shell--fill \{[^}]*height: 100dvh;[^}]*overflow: hidden/);
+    expect(css).toMatch(/\.candidate-shell--fill \.r1-live \{[^}]*grid-template-rows: minmax\(0, 1fr\)/);
+    expect(read('src/pages/R1JoinPage.tsx')).toMatch(/<R1Shell fill=\{stage\.name === 'live'\}>/);
+  });
+
+  it('lets the stage scroll inside its card rather than clip when the window is short', () => {
+    expect(css).toMatch(/\.candidate-shell--fill \.r1-live__stage \{[^}]*overflow-y: auto/);
+  });
+
+  it('makes the captions list, and only the list, the scroller of the right column', () => {
+    expect(css).toMatch(/\.r1-live \.candidate-interview__captions \{[^}]*flex: 1 1 0;[^}]*min-height: 140px/);
+    expect(css).toMatch(/\.r1-captions__body \{[^}]*min-height: 0/);
+    expect(css).toMatch(/\.r1-captions__list \{[^}]*min-height: 0;[^}]*overflow-y: auto/);
+  });
+
+  it('restyles the scenario card at once, so the captions list is resized once and not again a frame later', () => {
+    // The global reduced-motion rule gives every property a 0.01 ms transition; without this the card
+    // is half restyled at the commit and finishes later, with no render and no observer callback.
+    expect(css).toMatch(/\.r1-scenario, \.r1-scenario \* \{ transition: none !important; \}/);
+  });
+
+  it('keeps the browser from moving the captions list, and gives its content one box to observe', () => {
+    // R1Captions owns the scroll position: scroll anchoring would shift it when a web font re-wraps the
+    // lines above the viewport and report that as the reader scrolling away.
+    expect(css).toMatch(/\.r1-captions__list \{[^}]*overflow-anchor: none/);
+    // The lines' bottom margins stay inside the box R1Captions observes (a margin that collapsed
+    // through it would change the content's height without changing the box).
+    expect(css).toMatch(/\.r1-captions__content \{[^}]*display: flow-root/);
+  });
+
+  it('sizes the aura from the window height so the controls keep their room', () => {
+    expect(css).toMatch(/\.candidate-aura \{[^}]*width: clamp\(168px, calc\(100dvh - 600px\), 420px\)/);
+  });
+
+  it('lets the aura give way to the camera, so a narrow stage never wraps them or spills the aura out', () => {
+    // The height-derived aura (up to 420 px) is wider than a narrow stage holds beside a 200 px
+    // camera: it shrinks (to no less than 120 px) rather than the row wrapping under it.
+    expect(css).toMatch(/\.candidate-shell--fill \.r1-live__media \{[^}]*flex-wrap: nowrap/);
+    expect(css).toMatch(/\.candidate-aura \{[^}]*flex: 0 1 auto;[^}]*min-width: 120px/);
+    expect(css).not.toMatch(/\.candidate-aura \{[^}]*flex: none/);
+  });
+
+  it('lets a phone scroll the page and bounds the captions card instead', () => {
+    expect(css).toMatch(/@media \(max-width: 859px\), \(max-height: 479px\)/);
+    expect(css).not.toMatch(/max-width: 768px/);
+    expect(css).toMatch(/\.r1-live \.candidate-interview__captions \{[^}]*height: clamp\(240px, 45dvh, 440px\)/);
+  });
+
+  it('never crushes the candidate\'s camera: the self-view keeps its box and sits beside the aura', () => {
+    // A flex item that may shrink is squeezed before the stage's scroll valve is used (it was 0 to
+    // 38 px high on a 1280x720 window). It does not shrink, and it costs no height beside the aura.
+    expect(css).toMatch(/\.r1-live__selfview \{[^}]*flex: none;[^}]*width: 200px/);
+    expect(css).toMatch(/\.r1-live__media \{[^}]*display: flex;[^}]*flex-wrap: wrap/);
+    expect(read('src/components/candidate-r1/R1LiveView.tsx')).toMatch(
+      /<div className="r1-live__media">\s*<InterviewerAura[\s\S]*?\/>\s*<div className="r1-selfview r1-live__selfview">/,
+    );
+  });
+
+  it('has a short-window variant that gives the chrome up before the interview', () => {
+    expect(css).toMatch(
+      /@media \(min-width: 860px\) and \(min-height: 480px\) and \(max-height: 740px\) \{[^@]*\.r1-live__stage \{[^}]*gap: 8px/,
+    );
+    expect(css).toMatch(/\.r1-scenario--compact \{/);
+  });
+
+  it('squeezes the aura and the camera below 580 px so the controls stay in the stage card', () => {
+    // Under 580 px high (590 on a narrow stage, which wraps one more line) the tallest states
+    // (camera off, a failed "I'm ready") need more than the card has: the aura gives up 28 px and
+    // the camera shrinks to 168x95, still whole, and the controls stay inside the card.
+    const block = css.match(
+      /@media \(min-width: 860px\) and \(min-height: 480px\) and \(max-height: 579px\),\s*\(min-width: 860px\) and \(max-width: 999px\) and \(min-height: 480px\) and \(max-height: 589px\) \{([^@]*)\}\s*\n/,
+    );
+    expect(block, 'the squeeze block').not.toBeNull();
+    expect(block![1]).toMatch(/\.candidate-aura \{[^}]*width: 104px/);
+    expect(block![1]).toMatch(/\.r1-live__selfview\.r1-selfview \{[^}]*width: 168px/);
+  });
+
+  it('clips the decorative blobs of the R1 shell, which would add blank scroll', () => {
+    expect(css).toMatch(/\.r1-shell \{ overflow: clip; \}/);
   });
 });
 

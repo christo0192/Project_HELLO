@@ -14,10 +14,25 @@ import {
   type R1EndedKind,
 } from './r1-copy';
 
+interface R1ShellProps {
+  children: ReactNode;
+  /**
+   * Fit the page to the viewport (the live interview). On a desktop-sized window the shell
+   * becomes a `100dvh` column whose live view takes the remaining height, so the captions card
+   * is a bounded scroll region instead of a page that keeps growing. On a phone the page scrolls
+   * naturally (the modifier is a no-op there; see candidate-r1.css).
+   */
+  fill?: boolean;
+}
+
 /** The candidate page chrome: brand header and the shared candidate palette scope. */
-export function R1Shell({ children }: { children: ReactNode }) {
+export function R1Shell({ children, fill = false }: R1ShellProps) {
   return (
-    <main className="candidate-experience candidate-shell candidate-scope">
+    <main
+      className={`candidate-experience candidate-shell candidate-scope r1-shell${
+        fill ? ' candidate-shell--fill' : ''
+      }`}
+    >
       <div className="candidate-shell__inner">
         <header className="candidate-brand" aria-label="Interview Kickstart">
           <img src="/ik-logo.png" alt="Interview Kickstart" />

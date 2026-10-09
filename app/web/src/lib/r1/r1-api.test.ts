@@ -6,12 +6,14 @@ vi.mock('../supabase', () => ({ supabase: { auth: { getSession } } }));
 import { ApiError } from '../api-client';
 import {
   classifyR1Error,
+  isFinalRefusal,
   normalizeLead,
   parseAttempt,
   parseConsentTemplate,
   parseExchange,
   parsePreflight,
   parseStatus,
+  R1_FINAL_REFUSAL_CODES,
   R1_ROUTES,
   R1_SERVER_ERROR_CODES,
   r1Api,
@@ -71,6 +73,7 @@ describe('R1 route table', () => {
       preflight: '/api/r1/preflight',
       attempts: '/api/r1/attempts',
       exchange: '/api/r1/exchange',
+      ready: '/api/r1/ready',
     });
   });
 });
@@ -198,6 +201,41 @@ describe('r1Api requests', () => {
       nonce: 'nonce-value',
     });
     expect(result).toEqual({ status: 'preparing' });
+  });
+
+  it('sends "I\'m ready" as the attempt token and nonce, in the body only', async () => {
+    const fetchMock = mockFetch(reply(200, { ok: true }));
+    await expect(r1Api.ready('attempt-token', 'nonce-value')).resolves.toBeUndefined();
+    const { url, init, body } = lastCall(fetchMock);
+    expect(url.endsWith('/api/r1/ready')).toBe(true);
+    expect(url).not.toContain('attempt-token');
+    expect(url).not.toContain('?');
+    expect(init.method).toBe('POST');
+    expect(init.credentials).toBe('omit');
+    expect(body).toEqual({ attempt_token: 'attempt-token', nonce: 'nonce-value' });
+    expect(
+      Object.keys(init.headers as Record<string, string>).map((name) => name.toLowerCase()),
+    ).not.toContain('authorization');
+  });
+
+  it.each([
+    [409, 'not_live'],
+    [429, 'http_429'],
+    [404, 'r1_attempt_invalid'],
+    [503, 'service_unavailable'],
+  ])('rejects a %d answer to "I\'m ready" with its code', async (status, code) => {
+    mockFetch(reply(status, status === 429 ? {} : { error: code }));
+    const error = await r1Api.ready('attempt-token', 'nonce-value').catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ message: code, status });
+  });
+
+  it('rejects "I\'m ready" when the network is down', async () => {
+    mockFetch(new TypeError('Failed to fetch'));
+    await expect(r1Api.ready('attempt-token', 'nonce-value')).rejects.toMatchObject({
+      message: 'network_unreachable',
+      status: 0,
+    });
   });
 
   it('surfaces only the machine code of an error, never server prose', async () => {
@@ -367,7 +405,14 @@ describe('response validation (fail closed)', () => {
         nonce: 'n',
         rejoin: false,
       }),
-    ).toEqual({ attempt_token: 't', nonce: 'n', attempt_id: 'a-1', rejoin: false, lead: null });
+    ).toEqual({
+      attempt_token: 't',
+      nonce: 'n',
+      attempt_id: 'a-1',
+      rejoin: false,
+      lead: null,
+      expires_at: '2026-10-07T00:00:00.000Z',
+    });
     expect(parseAttempt({ attempt_token: 't', rejoin: true }).nonce).toBeNull();
     expect(
       parseExchange({
@@ -386,6 +431,17 @@ describe('response validation (fail closed)', () => {
     expect(parseExchange({ status: 'preparing', retry_after_sec: 3 })).toEqual({
       status: 'preparing',
     });
+  });
+
+  it('reads when an attempt token ends, and only as a time the browser can read', () => {
+    const at = (value: unknown) =>
+      parseAttempt({ attempt_token: 't', attempt_token_expires_at: value }).expires_at;
+    expect(at('2026-10-07T00:05:00.000Z')).toBe('2026-10-07T00:05:00.000Z');
+    // Absent or unreadable means "the server did not say": the page then trusts the token briefly.
+    expect(parseAttempt({ attempt_token: 't' }).expires_at).toBeNull();
+    for (const bad of ['', '   ', 'soon', '2026-99-99', 12, null, {}, []]) {
+      expect(at(bad), String(bad)).toBeNull();
+    }
   });
 });
 
@@ -436,5 +492,44 @@ describe('classifyR1Error', () => {
   it('treats anything that is not an ApiError as unknown', () => {
     expect(classifyR1Error(new Error('boom'))).toBe('unknown');
     expect(classifyR1Error(undefined)).toBe('unknown');
+  });
+});
+
+describe('isFinalRefusal', () => {
+  const final = (code: string, status: number) => isFinalRefusal(new ApiError(code, status));
+
+  it('is true for a refusal that asking again cannot clear', () => {
+    expect(final('round_expired', 409)).toBe(true);
+    expect(final('round_not_admissible', 409)).toBe(true);
+    expect(final('r1_attempt_not_live', 409)).toBe(true);
+    expect(final('consent_required', 409)).toBe(true);
+    expect(final('consent_template_stale', 409)).toBe(true);
+    expect(final('r1_attempt_invalid', 404)).toBe(true);
+    expect(final('r1_link_invalid_or_expired', 404)).toBe(true);
+    expect(final('http_410', 410)).toBe(true);
+    expect(final('http_400', 400)).toBe(true);
+  });
+
+  it('is false for what clears: a rate limit, an outage, a dropped network, a disabled lane', () => {
+    expect(final('http_429', 429)).toBe(false);
+    expect(final('service_unavailable', 503)).toBe(false);
+    expect(final('http_502', 502)).toBe(false);
+    expect(final('r1_unavailable', 503)).toBe(false);
+    expect(final('r1_disabled', 409)).toBe(false);
+    expect(final('r1_paused', 409)).toBe(false);
+    expect(final('r1_capacity_exhausted', 409)).toBe(false);
+    expect(final('network_unreachable', 0)).toBe(false);
+    expect(final('r1_malformed_response', 500)).toBe(false);
+    expect(final('http_418', 418)).toBe(false);
+  });
+
+  it('is false for anything that is not an ApiError', () => {
+    expect(isFinalRefusal(new Error('boom'))).toBe(false);
+    expect(isFinalRefusal(undefined)).toBe(false);
+    expect(isFinalRefusal('round_expired')).toBe(false);
+  });
+
+  it('names the extra final codes it relies on exactly', () => {
+    expect([...R1_FINAL_REFUSAL_CODES]).toEqual(['round_not_admissible']);
   });
 });

@@ -93,6 +93,14 @@ export const R1_PHASE_LABELS: Readonly<Record<R1Phase, R1PhaseLabel>> = Object.f
 });
 
 /**
+ * The line under the `transition` label while the interviewer is waiting for the candidate and
+ * the "I'm ready" button is on screen. It is part of the polite phase region, so the button's
+ * arrival is announced; the spoken "ready" is named as an equal way to start.
+ */
+export const R1_READY_DETAIL =
+  'Press “I’m ready” when you want to start, or just say “ready”.';
+
+/**
  * What the label says while the interviewer has announced no phase: waiting for
  * the interviewer to join, or, once an AGENT-kind participant is in the room,
  * a neutral line that does not claim a phase the page has not been told.

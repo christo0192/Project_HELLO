@@ -118,6 +118,13 @@ export interface R1MockControls {
   agent(): MockParticipant | null;
   joinAgent(attributes?: Record<string, string>): void;
   setPhase(phase: string): void;
+  /**
+   * Write several attributes on the interviewer in ONE update, as the worker's single ordered
+   * `set_attributes` does (`{ phase: 'transition', leadname: 'Meera Iyer', awaiting: 'ready' }`).
+   * An empty string removes the attribute, as on a real server: the key is reported as changed
+   * (with `''`) and is gone from the participant's attributes.
+   */
+  setAgentAttributes(attributes: Record<string, string>): void;
   speak(level: number): void;
   caption(id: string, text: string, final: boolean): void;
   /** A non-agent participant tries to drive the page (must be ignored). */
@@ -310,6 +317,18 @@ function ensureControls(): R1MockControls {
       if (!room || !agent) throw new Error('no agent in the room');
       agent.attributes = { ...agent.attributes, phase };
       room.emit(RoomEvent.ParticipantAttributesChanged, { phase }, agent);
+    },
+    setAgentAttributes(attributes) {
+      const room = controls.current();
+      const agent = controls.agent();
+      if (!room || !agent) throw new Error('no agent in the room');
+      const next = { ...agent.attributes };
+      for (const [key, value] of Object.entries(attributes)) {
+        if (value === '') delete next[key];
+        else next[key] = value;
+      }
+      agent.attributes = next;
+      room.emit(RoomEvent.ParticipantAttributesChanged, { ...attributes }, agent);
     },
     speak(level) {
       const room = controls.current();

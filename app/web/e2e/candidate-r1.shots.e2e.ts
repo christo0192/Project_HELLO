@@ -12,7 +12,20 @@ import path from 'node:path';
 import type { Page } from '@playwright/test';
 import { ARTIFACTS_DIR } from './fixtures/axe';
 import { expect, test } from './fixtures/candidate-harness';
-import { agree, heading, openLink, passDeviceCheck, reachLive } from './fixtures/candidate-flows';
+import {
+  LEARNER_NAME,
+  LIVE_DESKTOP_SIZES,
+  NARROW_WINDOWS,
+  REALISTIC_WINDOWS,
+  agree,
+  backToBriefing,
+  heading,
+  openLink,
+  passDeviceCheck,
+  reachLive,
+  reachLiveWithConversation,
+} from './fixtures/candidate-flows';
+import { liveLayout } from './fixtures/layout';
 
 const shotPath = (project: string, name: string) =>
   path.join(ARTIFACTS_DIR, 'screenshots', project, `r1-${name}.png`);
@@ -50,10 +63,32 @@ test.describe('R1 candidate screenshots @shots', () => {
     await expect(page.getByText('Getting to know you')).toBeVisible();
     await shoot(page, project, 'live-icebreaker');
 
-    await r1.mock.setPhase('roleplay');
+    // The briefing: the interviewer has named the learner and is waiting for "ready".
+    await r1.mock.setAgentAttributes({ phase: 'transition', leadname: LEARNER_NAME, awaiting: 'ready' });
+    await expect(page.getByRole('button', { name: "I'm ready" })).toBeVisible();
+    await expect(page.getByRole('region', { name: 'Your role-play' }).getByText(LEARNER_NAME)).toBeVisible();
+    await shoot(page, project, 'live-briefing');
+
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByText('Sent — starting the role-play')).toBeVisible();
+    await shoot(page, project, 'live-briefing-sent');
+
+    // The role-play: the clock is up, the button is gone.
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', awaiting: '', rpleft: '780' });
     await r1.mock.caption('c2', 'Hello? Yes, this is Meera speaking.', true);
     await expect(page.getByRole('region', { name: 'Your role-play' })).toBeVisible();
+    await expect(page.getByRole('timer')).toHaveText('Role-play · 13 min left');
+    await expect(page.getByRole('button', { name: "I'm ready" })).toHaveCount(0);
     await shoot(page, project, 'live-roleplay');
+
+    // The button failing: the candidate is told to say it instead.
+    await r1.mock.setAgentAttributes({ phase: 'transition', awaiting: 'ready', rpleft: '' });
+    r1.state.failures.ready = { status: 500, error: 'service_unavailable' };
+    await page.getByRole('button', { name: "I'm ready" }).click();
+    await expect(page.getByRole('alert')).toContainText("We couldn't send that");
+    await shoot(page, project, 'live-briefing-failed');
+    r1.consoleErrors.length = 0; // a 500 is logged by the browser's network layer
+    await r1.mock.setAgentAttributes({ phase: 'roleplay', awaiting: '', rpleft: '700' });
 
     await page.getByRole('button', { name: 'Turn camera off' }).click();
     await expect(page.getByText(/Your camera is off/)).toBeVisible();
@@ -62,6 +97,102 @@ test.describe('R1 candidate screenshots @shots', () => {
     await r1.mock.setPhase('ended');
     await expect(heading(page, 'Your interview is complete.')).toBeVisible();
     await shoot(page, project, 'ended');
+  });
+
+  /**
+   * The live view after a long interview (40 caption lines, role-play on): the window fills at
+   * every desktop size and the captions list is the scroller; on a phone the page scrolls and the
+   * captions card is bounded. The same assertions run in candidate-r1.e2e.ts; here they only
+   * guard that the photograph shows the state it is named for.
+   */
+  for (const size of LIVE_DESKTOP_SIZES) {
+    test(`live view, 40 captions, ${size.width}x${size.height}`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop sizes run on the desktop project');
+      const { page } = r1;
+      await page.setViewportSize(size);
+      await reachLiveWithConversation(r1);
+      const layout = await liveLayout(page);
+      expect(layout.pageScrollHeight).toBeLessThanOrEqual(size.height + 1);
+      expect(layout.list!.scrollHeight).toBeGreaterThan(layout.list!.clientHeight);
+      await page.screenshot({
+        path: shotPath(testInfo.project.name, `live-40-captions-${size.width}x${size.height}`),
+        fullPage: false,
+        animations: 'disabled',
+        caret: 'hide',
+      });
+    });
+  }
+
+  /**
+   * The windows a candidate really has (the screen minus the taskbar and the browser's bars):
+   * the role-play with its facts strip, the briefing with the full card, and the briefing after a
+   * failed press with the camera off, which is the tallest the stage ever gets. Then the corners
+   * of the two-column layout: a narrow short window (900x584) and a short wide one (1100x500),
+   * where the aura and the camera are squeezed so the controls stay in the card.
+   */
+  for (const size of [...REALISTIC_WINDOWS, { width: 900, height: 584 }, { width: 1100, height: 500 }]) {
+    test(`live view, realistic window, ${size.width}x${size.height}`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop windows run on the desktop project');
+      const { page } = r1;
+      const project = testInfo.project.name;
+      await page.setViewportSize(size);
+      await reachLiveWithConversation(r1);
+      const view = (name: string) => page.screenshot({
+        path: shotPath(project, `live-realistic-${size.width}x${size.height}-${name}`),
+        fullPage: false,
+        animations: 'disabled',
+        caret: 'hide',
+      });
+      expect((await liveLayout(page)).pageScrollHeight).toBeLessThanOrEqual(size.height + 1);
+      await view('roleplay');
+
+      await backToBriefing(r1);
+      await view('briefing');
+
+      r1.state.failures.ready = { status: 503, error: 'service_unavailable' };
+      await page.getByRole('button', { name: "I'm ready" }).click();
+      await expect(page.getByRole('alert')).toContainText("We couldn't send that");
+      r1.consoleErrors.length = 0; // a 503 is logged by the browser's network layer
+      await page.getByRole('button', { name: 'Turn camera off' }).click();
+      await expect(page.getByText(/Your camera is off/)).toBeVisible();
+      await view('briefing-failed-camera-off');
+    });
+  }
+
+  /**
+   * Windows under 860 px wide get the one-column layout (the stage is too narrow for two columns):
+   * the page scrolls, so the shot is the whole page, in the role-play and in the tallest state.
+   */
+  for (const size of NARROW_WINDOWS) {
+    test(`live view, one column, ${size.width}x${size.height}`, async ({ r1 }, testInfo) => {
+      test.skip(testInfo.project.name !== 'desktop', 'desktop windows run on the desktop project');
+      const { page } = r1;
+      const project = testInfo.project.name;
+      await page.setViewportSize(size);
+      await reachLiveWithConversation(r1);
+      const view = (name: string) => shoot(page, project, `live-narrow-${size.width}x${size.height}-${name}`);
+      const layout = await liveLayout(page);
+      expect(layout.captionsCard!.top).toBeGreaterThanOrEqual(layout.stage!.bottom - 1);
+      await view('roleplay');
+
+      await backToBriefing(r1);
+      r1.state.failures.ready = { status: 503, error: 'service_unavailable' };
+      await page.getByRole('button', { name: "I'm ready" }).click();
+      await expect(page.getByRole('alert')).toContainText("We couldn't send that");
+      r1.consoleErrors.length = 0; // a 503 is logged by the browser's network layer
+      await page.getByRole('button', { name: 'Turn camera off' }).click();
+      await expect(page.getByText(/Your camera is off/)).toBeVisible();
+      await view('briefing-failed-camera-off');
+    });
+  }
+
+  test('live view, 40 captions, 390x844', async ({ r1 }, testInfo) => {
+    test.skip(testInfo.project.name !== 'mobile', 'the phone layout runs on the mobile project');
+    const { page } = r1;
+    await reachLiveWithConversation(r1);
+    const layout = await liveLayout(page);
+    expect(layout.list!.scrollHeight).toBeGreaterThan(layout.list!.clientHeight);
+    await shoot(page, testInfo.project.name, 'live-40-captions-390x844');
   });
 
   test('declined and busy states', async ({ r1 }, testInfo) => {

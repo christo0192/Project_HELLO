@@ -39,3 +39,148 @@ export function horizontalOverflow(page: Page): Promise<Overflow> {
     return { overflowPx, offenders };
   });
 }
+
+export interface Inside {
+  found: boolean;
+  /** The element lies wholly inside the stage card, i.e. a candidate can see all of it. */
+  inside: boolean;
+  top: number;
+  bottom: number;
+  stageTop: number;
+  stageBottom: number;
+}
+
+/**
+ * Whether the first element matching `selector` lies wholly inside the stage card's box. The
+ * stage clips what it overflows (it scrolls), so "inside" is "visible without scrolling".
+ */
+export function insideStage(page: Page, selector: string): Promise<Inside> {
+  return page.evaluate((target) => {
+    const el = document.querySelector<HTMLElement>(target);
+    const stage = document.querySelector<HTMLElement>('.r1-live__stage')?.getBoundingClientRect();
+    if (!el || !stage) return { found: false, inside: false, top: 0, bottom: 0, stageTop: 0, stageBottom: 0 };
+    const rect = el.getBoundingClientRect();
+    return {
+      found: true,
+      inside: rect.top >= stage.top - 0.5 && rect.bottom <= stage.bottom + 0.5,
+      top: Math.round(rect.top),
+      bottom: Math.round(rect.bottom),
+      stageTop: Math.round(stage.top),
+      stageBottom: Math.round(stage.bottom),
+    };
+  }, selector);
+}
+
+export interface Box {
+  top: number;
+  bottom: number;
+  height: number;
+  /** The element's scrollable content height and visible height: they differ when it scrolls inside. */
+  scrollHeight: number;
+  clientHeight: number;
+}
+
+export interface LiveLayout {
+  viewport: { width: number; height: number };
+  /** `document.scrollingElement.scrollHeight`: what the PAGE scrolls through. */
+  pageScrollHeight: number;
+  stage: Box | null;
+  captionsCard: Box | null;
+  /** The role-play card (full in the briefing, a strip in the role-play), when it is on screen. */
+  scenarioCard: Box | null;
+  /** The candidate's own camera box. */
+  selfview: Box | null;
+  list: (Box & { scrollTop: number }) | null;
+  /** The newest caption is inside the visible part of the list. */
+  newestLineInView: boolean | null;
+  /** The lowest of the three controls (mute, camera, leave), in viewport coordinates. */
+  controlsBottom: number | null;
+  jumpButton: string | null;
+}
+
+/**
+ * Where everything of the R1 live view is, measured in the page: the page itself, the stage card,
+ * the captions card and its list. Used to prove the live view fits the window and that the
+ * captions list, not the page, is what scrolls. It waits for the web fonts first: the page is
+ * measured in IBM Plex, whose wider letters wrap lines the fallback font does not.
+ */
+export async function liveLayout(page: Page): Promise<LiveLayout> {
+  await page.evaluate(() => document.fonts.ready.then(() => undefined));
+  return page.evaluate(() => {
+    const q = (selector: string) => document.querySelector<HTMLElement>(selector);
+    const box = (el: HTMLElement | null) => {
+      if (!el) return null;
+      const rect = el.getBoundingClientRect();
+      return {
+        top: Math.round(rect.top),
+        bottom: Math.round(rect.bottom),
+        height: Math.round(rect.height),
+        scrollHeight: el.scrollHeight,
+        clientHeight: el.clientHeight,
+      };
+    };
+    const list = q('[role="log"]');
+    const lines = document.querySelectorAll<HTMLElement>('.candidate-caption');
+    const newest = lines.length > 0 ? lines[lines.length - 1] : null;
+    let newestLineInView: boolean | null = null;
+    if (list && newest) {
+      const line = newest.getBoundingClientRect();
+      const frame = list.getBoundingClientRect();
+      newestLineInView = line.bottom <= frame.bottom + 1 && line.top >= frame.top - 1;
+    }
+    const controls = Array.from(
+      document.querySelectorAll<HTMLElement>('.r1-live__stage .candidate-interview__controls button'),
+    );
+    const listBox = box(list);
+    return {
+      viewport: { width: window.innerWidth, height: window.innerHeight },
+      pageScrollHeight: document.scrollingElement?.scrollHeight ?? 0,
+      stage: box(q('.r1-live__stage')),
+      captionsCard: box(q('.candidate-interview__captions')),
+      scenarioCard: box(q('.r1-scenario')),
+      selfview: box(q('.r1-live__selfview')),
+      list: listBox && list ? { ...listBox, scrollTop: Math.round(list.scrollTop) } : null,
+      newestLineInView,
+      controlsBottom: controls.length
+        ? Math.round(Math.max(...controls.map((button) => button.getBoundingClientRect().bottom)))
+        : null,
+      jumpButton: q('.r1-captions__jump')?.textContent ?? null,
+    };
+  });
+}
+
+export interface MediaRow {
+  /** The stage scrolls sideways: something in it is wider than the card. */
+  stageScrollWidth: number;
+  stageClientWidth: number;
+  /** The aura lies wholly inside the stage card's width. */
+  auraInside: boolean;
+  auraWidth: number;
+  /** The camera sits to the right of the aura (not under it): the camera costs the stage no height. */
+  sideBySide: boolean;
+}
+
+/**
+ * Where the interviewer aura and the candidate's camera are in the stage: side by side and wholly
+ * inside the card, or stacked / spilling out of it (a narrow stage with a tall aura did both).
+ */
+export function mediaRow(page: Page): Promise<MediaRow> {
+  return page.evaluate(() => {
+    const stage = document.querySelector<HTMLElement>('.r1-live__stage');
+    const aura = document.querySelector<HTMLElement>('.r1-live__media .candidate-aura');
+    const camera = document.querySelector<HTMLElement>('.r1-live__selfview');
+    if (!stage || !aura || !camera) {
+      return { stageScrollWidth: 0, stageClientWidth: 0, auraInside: false, auraWidth: 0, sideBySide: false };
+    }
+    const card = stage.getBoundingClientRect();
+    const a = aura.getBoundingClientRect();
+    const c = camera.getBoundingClientRect();
+    return {
+      stageScrollWidth: stage.scrollWidth,
+      stageClientWidth: stage.clientWidth,
+      auraInside: a.left >= card.left - 0.5 && a.right <= card.right + 0.5,
+      auraWidth: Math.round(a.width),
+      sideBySide: c.left >= a.right - 1 && Math.abs(c.top + c.height / 2 - (a.top + a.height / 2)) < 40,
+    };
+  });
+}

@@ -6,8 +6,12 @@
  *
  * Invariants:
  *   - Only the interviewer agent drives the page: speaker level, captions and
- *     the `phase` attribute are all read from a participant whose kind is
- *     AGENT (see r1-agent.ts). Anyone else in the room is ignored.
+ *     the attributes it publishes (`phase`, `leadname`, `rpleft`, `awaiting`) are
+ *     all read from a participant whose kind is AGENT (see r1-agent.ts). Anyone
+ *     else in the room is ignored.
+ *   - Every attribute the page reads is optional. A worker that publishes only
+ *     some of them (or none) leaves the others unreported, and the page shows
+ *     nothing for them rather than a guess.
  *   - `phase=ended` from the agent makes the page leave the room itself. The
  *     worker sets that attribute immediately before it deletes the room, so
  *     the candidate sees a clean end instead of a dropped connection.
@@ -38,7 +42,15 @@ import {
   type Participant,
   type TranscriptionSegment,
 } from 'livekit-client';
-import { isAgentParticipant, trustedPhase } from './r1-agent';
+import {
+  isAgentParticipant,
+  R1_AGENT_ATTRIBUTES,
+  R1_AWAITING_ATTRIBUTE,
+  R1_LEAD_NAME_ATTRIBUTE,
+  R1_ROLEPLAY_LEFT_ATTRIBUTE,
+  trustedSignals,
+  type PhaseSource,
+} from './r1-agent';
 import { publishR1Media, R1_ROOM_OPTIONS, stopR1Media, type R1LocalMedia } from './r1-media';
 import { R1_PHASE_ATTRIBUTE, type CaptionSegment, type R1Phase } from './r1-phase';
 
@@ -46,6 +58,16 @@ export type R1EndReason = 'agent_ended' | 'aborted' | 'left' | 'disconnected';
 
 export interface R1RoomHandlers {
   onPhase: (phase: R1Phase) => void;
+  /** The learner's display name, or null when the interviewer has none (yet, or any more). */
+  onLeadName: (name: string | null) => void;
+  /**
+   * Seconds of role-play budget left, as of this call, or null once the interviewer stops
+   * publishing it. Called AFTER `onPhase` when both arrive together, so the page can freeze
+   * its local count for the old phase before it takes the new number.
+   */
+  onRoleplayLeft: (seconds: number | null) => void;
+  /** Whether the interviewer is waiting for the candidate to say they are ready. */
+  onAwaitingReady: (awaiting: boolean) => void;
   /** Whether at least one AGENT-kind participant is in the room (reported on change). */
   onAgentPresent: (present: boolean) => void;
   onAgentLevel: (level: number) => void;
@@ -127,10 +149,31 @@ export function createR1Room(
     handlers.onEnded(previous === 'aborted' ? 'aborted' : 'agent_ended');
   }
 
+  /**
+   * Report what an agent participant publishes. `changed` names the attributes that moved (an
+   * attributes event); without it every attribute is reported (the agent just appeared, or the
+   * page just connected), absent ones as null. Reporting only what moved matters for the clock:
+   * re-reporting an unchanged `rpleft` later would restart the local count from a stale number.
+   */
+  function applySignals(
+    participant: PhaseSource | null | undefined,
+    changed?: Readonly<Record<string, string>>,
+  ): void {
+    const signals = trustedSignals(participant);
+    if (!signals || finished) return;
+    const moved = (key: string): boolean => changed === undefined || key in changed;
+    if (moved(R1_PHASE_ATTRIBUTE)) applyPhase(signals.phase);
+    // `phase=ended` leaves the room: nothing after it is news.
+    if (finished) return;
+    if (moved(R1_LEAD_NAME_ATTRIBUTE)) handlers.onLeadName(signals.leadName);
+    if (moved(R1_ROLEPLAY_LEFT_ATTRIBUTE)) handlers.onRoleplayLeft(signals.rpleft);
+    if (moved(R1_AWAITING_ATTRIBUTE)) handlers.onAwaitingReady(signals.awaiting === 'ready');
+  }
+
   function syncAgentPhase(target: Room): void {
     for (const participant of target.remoteParticipants.values()) {
       trackAgent(participant, true);
-      applyPhase(trustedPhase(participant));
+      applySignals(participant);
     }
   }
 
@@ -162,7 +205,7 @@ export function createR1Room(
     );
     target.on(RoomEvent.ParticipantConnected, (participant) => {
       trackAgent(participant, true);
-      applyPhase(trustedPhase(participant));
+      applySignals(participant);
     });
     target.on(RoomEvent.ParticipantDisconnected, (participant) => {
       trackAgent(participant, false);
@@ -170,8 +213,8 @@ export function createR1Room(
     target.on(
       RoomEvent.ParticipantAttributesChanged,
       (changed: Record<string, string>, participant: Participant) => {
-        if (!(R1_PHASE_ATTRIBUTE in changed)) return;
-        applyPhase(trustedPhase(participant));
+        if (!R1_AGENT_ATTRIBUTES.some((key) => key in changed)) return;
+        applySignals(participant, changed);
       },
     );
     target.on(RoomEvent.Disconnected, (cause?: DisconnectReason) => {

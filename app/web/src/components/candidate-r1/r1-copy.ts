@@ -3,8 +3,9 @@
  *
  * Kept apart from the components so the copy can be reviewed (and checked for
  * promises the product does not make) without reading markup. None of it
- * states a product fact: the product facts live only in the candidate's
- * preparation guide.
+ * states a product fact: the three course facts on the role-play card live in
+ * r1-scenario.ts, where a test keeps them equal to the interviewer's and the
+ * scorer's, and everything else lives only in the candidate's preparation guide.
  *
  * Two audiences read these screens: a candidate, and a member of staff on an internal
  * dry run. The staff consent notice says no decision is made about them and to tell the
@@ -238,3 +239,14 @@ export const R1_WITHDRAW_QUESTIONS = Object.freeze({
 /** The question asked before a candidate who has not agreed says no. */
 export const R1_DECLINE_QUESTION =
   'Decline the interview? No interview will be held with this link.';
+
+/**
+ * The "I'm ready" button: its label, the two outcomes, and what to do when it fails. The spoken
+ * "ready" always works, so a failure sends the candidate back to it rather than blocking them.
+ */
+export const R1_READY_COPY = Object.freeze({
+  button: "I'm ready",
+  sending: 'Sending…',
+  sent: 'Sent — starting the role-play',
+  failed: "We couldn't send that. Just say “I'm ready”.",
+});
