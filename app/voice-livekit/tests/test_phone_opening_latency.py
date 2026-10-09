@@ -655,7 +655,7 @@ class TestPrefixWarmupCoversTheMainPrompt(unittest.IsolatedAsyncioTestCase):
     def test_the_session_warms_the_exact_prompt_the_agent_runs_on(self):
         src = _session_src()
         self.assertIn("phone_instructions = _phone_instructions_text(instruction_state)", src)
-        self.assertIn("phone.phone_agent_class(Agent)(\n        phone_instructions,", src)
+        self.assertIn("phone.phone_agent_class(Agent, stt_shadow=stt_shadow)(\n        phone_instructions,", src)
         self.assertIn("phone.phone_warm_prefix_cache(phone_instructions)", src)
 
     def test_the_warm_request_sends_the_prompt_as_the_system_message(self):

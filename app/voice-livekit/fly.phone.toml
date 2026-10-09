@@ -185,6 +185,27 @@ kill_timeout = 300
   # Fail-open either way: if the library cannot load, the call proceeds
   # unfiltered (`phone_noise_suppression_unavailable reason=...`).
   PHONE_NOISE_SUPPRESSION = "rnnoise"
+  # ── M015 PR-1: Sarvam Realtime STT SHADOW (metrics only) ──────────────────
+  # OFF. When "on", the candidate's POST-CONSENT audio (the same frames the main
+  # STT receives, after RNNoise) is also sent to a Sarvam Realtime socket and
+  # ONLY timings / word counts / socket errors are logged (`phone_stt_shadow`
+  # lines, never text). The bot's behaviour is byte-identical on or off. Uses the
+  # existing SARVAM_API_KEY. Cost while on: about 0.50 INR per post-consent
+  # minute. A Fly SECRET of the same name SHADOWS this line, so turn it on/off
+  # with a secret (and unset it afterwards so the repo shows the live value):
+  #   fly secrets set PHONE_STT_SHADOW=on -a project-hello-phone-voice
+  #   fly secrets unset PHONE_STT_SHADOW -a project-hello-phone-voice
+  # `fly secrets set` RESTARTS the machines: only when no call is live (voice
+  # changes after 21:00 IST; ping the phone session first) or use --stage.
+  # Runbook: docs/runbooks/phone-stt-shadow.md. Tuning defaults, pinned so the
+  # deploy shows them:
+  PHONE_STT_SHADOW = "off"
+  PHONE_STT_SHADOW_SAMPLE = "1.0"
+  PHONE_STT_SHADOW_MODEL = "saaras:v3-realtime"
+  PHONE_STT_SHADOW_SAMPLE_RATE = "16000"
+  PHONE_STT_SHADOW_STREAM_TYPE = "fast"
+  PHONE_STT_SHADOW_VAD_THRESHOLD = "0.5"
+  PHONE_STT_SHADOW_SILENCE_MS = "700"
   SARVAM_TTS_MODEL = "bulbul:v3"
   SARVAM_TTS_VOICE = "simran"
   # Call G RCA (2026-09-08) — REVERTED "stt" -> "local". The X8 stt experiment
