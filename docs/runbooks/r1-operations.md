@@ -1480,7 +1480,8 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   decisions of 2026-10-08) is revision 10: no scripted or prompted "hmm"/"honestly", a rotating
   opening-style note per free reply, a warm confirmation once a call is booked, the decision maker on the
   public card, the $7,000 anchor never an offer, "I can check with my manager" grants nothing, and the
-  time cue is the learner's own next call; learner iteration 2 is revision 11 (see the next bullets).
+  time cue is the learner's own next call; learner iteration 2 is revision 11, iteration 3 revision 12
+  and the final review round 1 revision 13 (see the next bullets).
   `docs/design/r1/R1-PLAN-final.md` carries the `L-NO-FEEDBACK`
   text (a test compares it). Check the pin comment and `CONTENT_REVISION` after every merge of main: a
   second branch that also changed pinned text takes one more bump and a recomputed hash.
@@ -1515,6 +1516,41 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   (`MEDIUM_DEFER_LINE`). The two new scripted sentences are masked in
   `app/api/src/lib/r1/transcript.ts` (the call-back WEAK sentence has its own pattern; the deferred MEDIUM
   line matches the existing "book a call ... so we can decide" frames).
+* **Learner final review round 1 (R1-Q S01, content revision 13).** The two Opus reviews of the PR-A head
+  and the third live sweep found a regression and several gaps; all fixes are deterministic, no extra
+  model call. (a) "Before I go" is removed only as a closing clause (leading, a comma-bounded aside, or
+  the end of the sentence): "before I go any further / down this road" is an ordinary sentence. (b) The
+  enrolment ask is an invitation to act (pay, reserve, enrol, a payment or enrolment LINK or form):
+  sending the payment, registration or enrolment DETAILS, options or information is an e-mail offer, so
+  a strong advisor's "I'll email the curriculum and payment details" no longer earns a scripted "I'll pay
+  the deposit today". STRONG is also blocked (the grade becomes MEDIUM, and WEAK after a declined call)
+  when the learner turned a call down, said it will wait (the last 3 learner turns), or said it must talk
+  to its decision maker first and the advisor did not address that afterwards (`strong_blocked:*` in the
+  plan reasons). The STRONG line no longer says "for that plan". (c) The persona has ONE decider: a
+  sentence that denies the card's decision maker ("it's up to me", "I'm the one who decides", "he'd just
+  want me to weigh it myself") or names another party to the decision ("my mom gets a say", "run it by my
+  sister") is replaced by the card's own answer (`misread: decider_contradicted`). (d) The decider stall,
+  the "get back to you" closer and "still more than I planned for" have a per-call quota and a spacing
+  window in a free reply (`PHRASE_QUOTA`, `PHRASE_WINDOW`); an owed move and the answer to "who else
+  decides?" are never trimmed. (e) A released deep need is offered on the next OPEN dig ("What would help
+  you two decide?") even if only the shadow judge released it, an offer whose reply missed the need is
+  given back (up to 3 times), and a call or enrolment ask is never answered with a need (a proposed call
+  is not a probe). (f) The call-proposal grammar learned "a quick word", "hop on a Zoom", "give you a
+  buzz", "find twenty minutes", "how's Sunday ..." and "when's a good moment to reconnect"; a proposal it
+  still misses is not a leak: inside the close window the model's acceptance is a hygiene hit
+  (`misread: late_ask_accepted`) and the farewell answers it like any open proposal. The detectors are
+  also scored on a held-out file (`tests/fixtures/r1_advisor_heldout.jsonl`, never tuned on; its first
+  scores were call 0.86, e-mail 0.75, enrolment 0.86, farewell 0.86, price 1.00, anchor reply 0.83).
+  (g) Reasons are logged: every R1 turn writes one `r1_turn_reason` line per reason label of its plan
+  (`owed:*`, `stall_reason:*`, `ask_in_window:grade_*`, `call_declined`, `advisor_thin`,
+  `advisor_pressured`, `strong_blocked:*`, `owed_deferred_*`, `pending_ask_at_farewell` ...): labels only,
+  never text. Read them first when a commitment is lower than the advisor seemed to earn. (h) The
+  rehearsal harness measures the literal first word of every reply (no whitelist), the decider stall and
+  the money line per call and per window, and allows the offer ledger's prices in the fact check.
+  The scorer-side mask (`transcript.ts`) also matches the SHORT frames of the scripted wordings, so a
+  barge-in cut at any word boundary still hides the level. DeepSeek balance: a live sweep needs about 0.31
+  USD and the harness refuses to start below 0.60; the phone scorer shares the account, so top it up before
+  a sweep and before the owner test.
 
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 

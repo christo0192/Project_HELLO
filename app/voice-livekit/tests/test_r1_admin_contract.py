@@ -724,5 +724,29 @@ class TestMirrorMatchesTheTypeScript(unittest.TestCase):
                 self.assertRegex(text, rf"{name}:\s*{value}\b")
 
 
+class TestPlanReasonsAreLoggedForProduction(unittest.IsolatedAsyncioTestCase):
+    """R1-Q final review round 1: production sees WHY a commitment was graded, capped or downgraded."""
+
+    async def test_every_turn_logs_its_plan_reasons_as_safe_labels(self):
+        with capture_r1_logs() as lines:
+            rig = await fidelity_session()
+            plans = [line for line in lines if line.get("error_type") == "r1_turn_plan"]
+            reasons = [line for line in lines if line.get("error_type") == "r1_turn_reason"]
+        self.assertTrue(plans)
+        self.assertTrue(reasons)
+        labels = {line["error_category"] for line in reasons}
+        self.assertTrue(any(label.startswith("owed:") for label in labels), labels)
+        self.assertTrue(any(label.startswith("ask_in_window:grade_") for label in labels), labels)
+        self.assertNotIn("free_reply", labels)
+        for line in reasons:
+            self.assertRegex(line["error_category"], r"^[A-Za-z0-9_:.\-]{1,64}$")
+            self.assertEqual(line["phase"], "roleplay")
+            self.assertIsInstance(line["turn_index"], int)
+        # labels only: nothing the candidate said can be in them
+        blob = " ".join(labels)
+        self.assertNotIn("data science", blob.lower())
+        del rig
+
+
 if __name__ == "__main__":
     unittest.main()

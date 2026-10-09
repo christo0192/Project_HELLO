@@ -10,7 +10,7 @@ measured and met on a LIVE sweep.
 
 ``info`` gates (the intent fallback rate, and since R1-Q iteration 1 the reply-length gates: mean
 <= 22 words, p90 <= 35, short replies >= 30 %) are reported but never block.  Wordiness is the
-owner's accepted trade (2026-10-08); the verbal-tic gates (a reaction word opening more than 15 % of
+owner's accepted trade (2026-10-08); the verbal-tic gates (any first word opening more than 15 % of
 the replies, "hmm" or "honestly" in more than 20 %) block instead.
 """
 from __future__ import annotations
@@ -171,7 +171,7 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
     ),
     (
         "opener_tic",
-        "No reaction word opens more than 15 % of the replies",
+        "No first word opens more than 15 % of the replies",
         "opener_top_share",
         "<=",
         {"strong": OPENER_SHARE_LIMIT, "average": OPENER_SHARE_LIMIT, "other": OPENER_SHARE_LIMIT},
@@ -209,6 +209,40 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
         "template_q_per_call",
         "<=",
         {"strong": 1.5, "average": 1.5, "other": 1.5},
+        "gate",
+    ),
+    # Stall loops (R1-Q final review round 1): the same stall in other words.  The guard keeps a
+    # quota and a spacing window for the decider stall and the money line; these gates prove it live.
+    (
+        "decider_stall",
+        'Replies stalling on the decision maker ("talk it over with my father") per call (mean)',
+        "decider_stall_per_call",
+        "<=",
+        {"strong": 3.0, "average": 3.0, "other": 3.0},
+        "gate",
+    ),
+    (
+        "decider_stall_window",
+        "Decider stall: most replies in any 4 in a row (worst call)",
+        "decider_stall_window_max",
+        "<=",
+        {"strong": 2.0, "average": 2.0, "other": 2.0},
+        "gate",
+    ),
+    (
+        "money_strain",
+        'Replies saying it is "still more than I planned for" per call (mean)',
+        "money_strain_per_call",
+        "<=",
+        {"strong": 3.0, "average": 3.0, "other": 3.0},
+        "gate",
+    ),
+    (
+        "money_strain_window",
+        "Money line: most replies in any 3 in a row (worst call)",
+        "money_strain_window_max",
+        "<=",
+        {"strong": 2.0, "average": 2.0, "other": 2.0},
         "gate",
     ),
     (
@@ -334,6 +368,14 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
         "opener_top_share": _rate(top[0][1], replies) if top else (0.0 if replies else None),
         "stretch_per_call": mean([float(m.get("reply_stretch_count") or 0) for m in calls]),
         "template_q_per_call": mean([float(m.get("reply_template_q_count") or 0) for m in calls]),
+        "decider_stall_per_call": mean([float(m.get("decider_stall_rows") or 0) for m in calls]),
+        "decider_stall_window_max": max(
+            [float(m.get("decider_stall_window_max") or 0) for m in calls], default=None
+        ),
+        "money_strain_per_call": mean([float(m.get("money_strain_rows") or 0) for m in calls]),
+        "money_strain_window_max": max(
+            [float(m.get("money_strain_window_max") or 0) for m in calls], default=None
+        ),
         "hmm_share": _rate(sum(int(m.get("reply_hmm_count") or 0) for m in calls), replies),
         "honestly_share": _rate(
             sum(int(m.get("reply_honestly_count") or 0) for m in calls), replies
@@ -551,11 +593,15 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
         ("short replies share", "short_reply_share"),
         ("question rate", "question_rate"),
         ("reaction-opener rate", "reaction_rate"),
-        ("top reaction opener share", "opener_top_share"),
+        ("top opener (first word) share", "opener_top_share"),
         ("replies with hmm", "hmm_share"),
         ("replies with honestly", "honestly_share"),
         ('replies with "a stretch" / call', "stretch_per_call"),
         ('"what would it involve" replies / call', "template_q_per_call"),
+        ("decider-stall replies / call", "decider_stall_per_call"),
+        ("decider stall, most in 4 replies (worst)", "decider_stall_window_max"),
+        ('"still more than I planned" replies / call', "money_strain_per_call"),
+        ("money line, most in 3 replies (worst)", "money_strain_window_max"),
         ("style mean (judge)", "style_mean"),
         ("intents needing the scripted variant", "intent_fallback_rate"),
         ("fidelity pass rate", "fidelity_pass_rate"),

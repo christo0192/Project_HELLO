@@ -982,6 +982,28 @@ def says_cost_is_secondary(spoken: object) -> bool:
     return _COST_SECONDARY.search(fold(spoken)) is not None
 
 
+# The learner said it will wait: "waiting feels more realistic for me right now", "I'll wait for the
+# next cohort", "I'm not ready to commit yet".  It does not enrol or pay in the same breath.
+WAIT_RECENT_TURNS = 3
+_WILL_WAIT = re.compile(
+    r"\b(?:waiting|wait|hold(?:ing)? off|put(?:ting)? (?:it|this) off|postpon\w+)\b[^.?!]{0,30}"
+    r"\b(?:realistic|better|safer|makes? (?:more )?sense|best|until|for the next|a (?:bit|while|"
+    r"little)|for now|right now|longer)\b"
+    r"|\b(?:maybe|probably|perhaps|rather|better|wait|join|go|do|for|suit|prefer)\b[^.?!]{0,25}"
+    r"\bnext (?:cohort|batch|intake)\b"
+    r"|\bnext (?:cohort|batch|intake)\b[^.?!]{0,25}\b(?:suit|better|works|instead)\b"
+    r"|\bnot (?:ready )?(?:to )?(?:commit|enrol+|sign up|decide|pay|move forward|start)\b"
+    r"[^.?!]{0,12}\b(?:yet|today|now|right now|this)\b"
+    r"|\bi(?:'ll| will|'d| would) (?:rather |probably |prefer to |like to |just )?wait\b",
+    re.IGNORECASE,
+)
+
+
+def says_will_wait(spoken: object) -> bool:
+    """The learner said it will wait before committing (see ``_WILL_WAIT``)."""
+    return _WILL_WAIT.search(fold(spoken)) is not None
+
+
 def refused_slot(spoken: object) -> Slot | None:
     """The day or part of the day the learner said it cannot do, or None.
 
@@ -1118,6 +1140,34 @@ _DISCOUNT_BEFORE = re.compile(
     r"|\b(?:reduc\w+|cut|knock|shave|lower|waive|slash|trim|drop|take|sav(?:e|es|ed|ing))\s+"
     r"(?:the price |it |that |this |the fee |you |your partner )?(?:by |of |down by |off )?"
     r"(?:another |an extra |a further )?\s*$",
+    re.IGNORECASE,
+)
+# A discount DESCRIBED, not granted: "discounts up to $1,500", "some people qualify for up to
+# $1,500 off", "depending on the plan you could save $1,000".  (R1-Q final review round 1: "up to
+# fifteen hundred dollars" was ledgered as a $7,500 offer, and the learner then said "$7,500 is a
+# bit better" to an advisor who had said no such price.)
+_DISCOUNT_DESCRIPTION = re.compile(
+    r"\b(?:up ?to|as (?:high|much|big|large) as|ranging from|anywhere from|between|"
+    r"(?:some|many|most|certain|a few|several) (?:of our )?(?:people|learners|students|folks|"
+    r"candidates)|qualify(?:ing)? for|eligible for|(?:may|might|could) (?:also )?(?:get|"
+    r"receive|qualify|be eligible|save)|typically|usually|generally|sometimes)\b"
+    r"[^.?!;]{0,45}$",
+    re.IGNORECASE,
+)
+def _described_discount(lowered: str, start: int) -> bool:
+    """The discount at ``start`` is described ("discounts up to ..."), not offered by the advisor
+    in the first person ("I can offer up to ...")."""
+    before = clause_before(lowered, start)
+    return (
+        _DISCOUNT_DESCRIPTION.search(before) is not None
+        and _FIRST_PERSON_OFFER.search(before) is None
+    )
+
+
+# A bound, not a price: "under six thousand", "below $7,000", "no more than $7,500".
+_BOUND_BEFORE = re.compile(
+    r"\b(?:under|below|beneath|less than|no more than|not more than|at most|just under|"
+    r"a little under|a bit under|well under|maximum of)\s+(?:about |around |roughly )?$",
     re.IGNORECASE,
 )
 _PRICE_CUE = re.compile(
@@ -1543,6 +1593,8 @@ def _piece_offers(
         said = value in own
         if _not_our_price(lowered, start, end):
             return False
+        if _BOUND_BEFORE.search(lowered[max(0, start - 40) : start]) is not None:
+            return False  # "under six thousand" is a bound, never the price itself
         return _offered(lowered, start, end, learner_said=said and not asked_as_offer)
 
     for match in _DOLLARS.finditer(lowered):
@@ -1552,14 +1604,17 @@ def _piece_offers(
         as_discount = _OFF_AFTER.match(lowered[match.end() :]) is not None
         if _DISCOUNT_BEFORE.search(lowered[: match.start()]) is not None:
             as_discount = True
+        described = _described_discount(lowered, match.start())
         if 0 < value < MIN_NET_USD:
             small.add(value)
-            if as_discount:
+            if as_discount and not described:
                 discounts.add(value)
         elif MIN_NET_USD <= value < PRICE_USD:
             found[value] = conditional
     for match in _PERCENT_OFF.finditer(lowered):
-        if _offered(lowered, match.start(), match.end()):
+        if _offered(lowered, match.start(), match.end()) and not _described_discount(
+            lowered, match.start()
+        ):
             discounts.add(int(round(PRICE_USD * float(match.group(1)) / 100)))
     # Several small amounts in one sentence are a LIST of the deck's discounts, not an offer.
     if len(discounts) == 1 and small <= discounts:
@@ -1658,9 +1713,31 @@ def read_advisor_turn(
     )
 
 
+# The figure is the $7,000 only when it is a price: "seven thousand applications last year" and
+# "7,000 learners" are counts (R1-Q final review round 1: the first read as an answer to the
+# anchor).
+_COUNT_NOUN = (
+    r"(?:months?|students|people|learners|applications?|applicants|alumni|graduates|enrol+ments?|"
+    r"seats|users|candidates|sign-?ups|members|reviews|jobs|hires|companies|mentors|instructors)"
+)
 _ANCHOR_REF = re.compile(
-    r"(?<![\d,.])\$?7,?000\b(?!\s*(?:months?|students|people))|\bseven thousand\b|\b7k\b",
+    r"(?<![\d,.])\$?7,?000\b(?!\s*" + _COUNT_NOUN + r")"
+    r"|\bseven (?:thousand|grand)\b(?!\s*" + _COUNT_NOUN + r")|\b7k\b",
     re.IGNORECASE,
+)
+# "Where did you hear seven?" / "Who told you seven?": the advisor asks about the learner's figure
+# in the learner's own shorthand.
+_ANCHOR_SHORTHAND = re.compile(
+    r"\b(?:where|who|when|how) (?:did|do|have|has|was|were) (?:you|they|that|it)\b[^?.!]{0,25}"
+    r"\b(?:hear|heard|get|got|see|saw|read|find|found|told|said|quote|quoted)\b[^?.!]{0,15}"
+    r"\b(?:seven|7)\b(?!\s*" + _COUNT_NOUN + r")"
+    r"|\bwho (?:told|said|quoted|promised|gave) you\b[^?.!]{0,15}\b(?:seven|7)\b"
+    r"(?!\s*" + _COUNT_NOUN + r")",
+    re.IGNORECASE,
+)
+_PRICE_NOUN_NO = re.compile(
+    r"\bold (?:promo\w*|batch|price|rate|offer|cohort|pricing|deal)\b|\bscholarship\b"
+    r"|\bearly[- ]bird\b|\bpromo(?:tion)? (?:is|was|has) (?:over|gone|ended|expired)\b"
 )
 _LIST_PRICE = re.compile(
     r"(?:\bprice|\bfee|\bcost|\bit'?s|\bis|\bcosts|\bat)\s+(?:is |only |just )?\$?9,?000\b",
@@ -1684,7 +1761,7 @@ def mentions_anchor(text: object) -> bool:
     for sentence in split_sentences(_tail(text).lower()):
         sentence = sentence[-PIECE_CHARS:]  # the amount grammar must stay fast on any input
         canon = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", sentence)).lower()
-        if _ANCHOR_REF.search(canon) is not None:
+        if _ANCHOR_REF.search(canon) is not None or _ANCHOR_SHORTHAND.search(sentence) is not None:
             return True
     return False
 
@@ -1713,23 +1790,28 @@ def refuses_price(text: object) -> bool:
         sentence = sentence[-PIECE_CHARS:]  # the amount grammar must stay fast on any input
         canon = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", sentence)).lower()
         asked = is_question_like(sentence)
-        mentions = _ANCHOR_REF.search(canon) is not None
+        reference = _ANCHOR_REF.search(canon)
+        mentions = reference is not None or _ANCHOR_SHORTHAND.search(sentence) is not None
         anchor_seen = anchor_seen or mentions
         if _LIST_PRICE.search(canon) is not None and not asked:
             list_price = True
         supposes = _SUPPOSES.search(sentence) is not None
         hedged = _HEDGED_REFUSAL.search(sentence) is not None
-        denies = has_refusal(sentence) or _PRICE_NO.search(canon) is not None
+        no_match = _PRICE_NO.search(canon)
+        # "That was an old promotion": a denial that names a price thing is about the price itself.
+        price_noun_denial = no_match is not None and _PRICE_NOUN_NO.search(no_match.group(0))
+        denies = has_refusal(sentence) or no_match is not None
         if not asked and not supposes and not hedged:
             if _FINAL_STATEMENT.search(sentence) is not None:
                 return True
             carried = previous_anchor and (
-                _PRONOUN_OBJECT.search(sentence) is not None
-                or _PRICE_NO.search(canon) is not None
+                _PRONOUN_OBJECT.search(sentence) is not None or no_match is not None
             )
-            if denies and (mentions or carried or _PRICE_TALK.search(sentence)):
+            if denies and (
+                mentions or carried or price_noun_denial or _PRICE_TALK.search(sentence)
+            ):
                 return True
-            if mentions and negated_before(canon, _ANCHOR_REF.search(canon).start(), 8):
+            if reference is not None and negated_before(canon, reference.start(), 8):
                 return True
         if asked and mentions and _INQUIRY.search(canon) is not None:
             return True
@@ -1828,6 +1910,12 @@ class Negotiation:
         self.refused_slots: list[Slot] = []
         self.last_slot_turn: int | None = None
         self.money_secondary = False
+        # R1-Q final review round 1.  The turn on which the learner said it will wait ("waiting
+        # feels more realistic", "the next cohort"), and the latest turn on which the advisor
+        # addressed the decision maker (a STRONG commitment needs the decider stall answered and
+        # no wait said).
+        self.wait_said_turn: int | None = None
+        self.decider_handled_turn: int | None = None
 
     # ------------------------------------------------------------------ observation
     def observe(
@@ -1877,7 +1965,10 @@ class Negotiation:
                 self.refusals += 1
         self.offers.extend(offers)
         newly: set[str] = set()
-        for reason in reasons_handled_in(text, self.decision_maker):
+        addressed = reasons_handled_in(text, self.decision_maker)
+        if REASON_DECISION_MAKER in addressed:
+            self.decider_handled_turn = turn
+        for reason in addressed:
             voiced_at = self.voiced.get(reason)
             if voiced_at is not None and voiced_at < turn and reason not in self.handled:
                 self.handled[reason] = turn
@@ -1898,9 +1989,13 @@ class Negotiation:
             lower_offer_usd=lower,
         )
 
-    def note_learner_text(self, spoken: object, turn: int | None = None) -> None:
+    def note_learner_text(
+        self, spoken: object, turn: int | None = None, *, stall: bool = False
+    ) -> None:
         """Remember what the learner said: the figures (so the advisor repeating one is not an
-        offer) and, at ``turn``, that it has to talk to its decision maker first."""
+        offer) and, at ``turn``, that it has to talk to its decision maker first.  ``stall`` marks
+        the owed timing objection ("maybe the next cohort"): that is the objection the advisor is
+        meant to answer, not a decision to wait."""
         for amount in dollar_amounts(spoken):
             if 0 < amount <= PRICE_USD:
                 self.own_amounts.add(amount)
@@ -1913,6 +2008,8 @@ class Negotiation:
             self.refused_slots.append(refused)
         if says_cost_is_secondary(spoken):
             self.money_secondary = True
+        if turn is not None and not stall and says_will_wait(spoken):
+            self.wait_said_turn = turn
 
     def _says_decider_first(self, spoken: object) -> bool:
         """The learner said it would talk to or check with its decision maker."""
@@ -2012,11 +2109,42 @@ class Negotiation:
         The money stall ("The cost is still the sticking point for me") after "my worry is more
         about time than money" and after the $7,000 was met contradicted the learner itself.
         """
-        return self.money_secondary or self.price_situation() == SITUATION_MET
+        best = self.best_offer_usd
+        return (
+            self.money_secondary
+            or (best is not None and best <= ANCHOR_USD)
+            or self.price_situation() == SITUATION_MET
+        )
 
     def call_declined(self) -> bool:
         """The learner turned a call down in so many words (it holds for the rest of the call)."""
         return self.call_declined_turn is not None
+
+    def decider_unresolved(self) -> bool:
+        """The learner said it must talk to its decision maker first and the advisor did not
+        address that afterwards (the advisor's answer has to come AFTER the learner's words)."""
+        said = self.decider_said_turn
+        if said is None:
+            return False
+        handled = self.decider_handled_turn
+        return handled is None or handled <= said
+
+    def strong_blocked(self, turn: int) -> str | None:
+        """Why a STRONG commitment would contradict the learner's own words, or None.
+
+        R1-Q final review round 1: a strong advisor who was told "I'd want to talk it over with my
+        husband before anything moves forward" and "waiting feels more realistic" got "Okay, let's
+        do it, I'll pay the deposit today" in the live sweep.  STRONG is for a learner who has no
+        decider left to consult, is not waiting and did not turn a call down.
+        """
+        if self.call_declined():
+            return "call_declined"
+        waited = self.wait_said_turn
+        if waited is not None and 0 <= turn - waited <= WAIT_RECENT_TURNS:
+            return "learner_waiting"
+        if self.decider_unresolved():
+            return "decider_unresolved"
+        return None
 
     def slot_refused(self, slot: Slot | None) -> bool:
         """``slot`` is a day or part of the day the learner said it cannot do."""
@@ -2096,4 +2224,7 @@ class Negotiation:
             "call_declined_turn": self.call_declined_turn,
             "refused_slots": len(self.refused_slots),
             "money_secondary": self.money_secondary,
+            "wait_said_turn": self.wait_said_turn,
+            "decider_handled_turn": self.decider_handled_turn,
+            "decider_said_turn": self.decider_said_turn,
         }

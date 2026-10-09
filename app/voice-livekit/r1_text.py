@@ -344,8 +344,44 @@ CLOSER = re.compile(
 )
 
 
+# R1-Q final review round 1.  The stall loop: the same stall said again and again in other words
+# ("talk it over with my father" in 9 of 35 replies of one terse call, "get back to you" four
+# times, "still more than I planned for" three replies in a row).  Three more tracked phrases, each
+# with a per-call quota AND a spacing window (``r1_guard.PHRASE_QUOTA`` / ``PHRASE_WINDOW``).
+PHRASE_DECIDER_STALL = "decider_stall"
+PHRASE_STALL_CLOSER = "stall_closer"
+PHRASE_MONEY_STRAIN = "money_strain"
+_DECIDER_ROLE = (
+    r"(?:husband|wife|partner|spouse|father|mother|dad|mom|mum|parents|family|fianc\w+|boyfriend|"
+    r"girlfriend|him|her|them)"
+)
+# "I'd want to talk it through with my father", "Let me run it by my husband first", "I should
+# check with him before I say yes": the learner stalls on the person who decides with it.
+DECIDER_STALL = re.compile(
+    r"\b(?:talk(?:ing)?|speak(?:ing)?|check(?:ing)?|run(?:ning)?|discuss(?:ing)?|consult(?:ing)?|"
+    r"go(?:ing)? (?:over|through)|sleep on|clear(?:ing)?|loop(?:ing)?)\b[^.?!]{0,40}?\b"
+    r"(?:with|to|by|past)\s+(?:my |our )?" + _DECIDER_ROLE + r"\b",
+    re.IGNORECASE,
+)
+# "I'll get back to you", "let me think about it", "I'll let you know", "I'll be in touch".
+STALL_CLOSER = re.compile(
+    r"\bget(?:ting)? back to you\b|\blet me think (?:about it|it over|this over|on it)\b"
+    r"|\bi(?:'ll| will) (?:think (?:about it|it over|this over)|let you know|be in touch)\b"
+    r"|\bi(?:'ll| will) (?:reach out|come back to you)\b",
+    re.IGNORECASE,
+)
+# "still more than I planned for", "still worried about the cost", "still a lot for me".
+MONEY_STRAIN = re.compile(
+    r"\bstill (?:more than (?:i|we) (?:had |'d |would have )?(?:planned|hoped|budgeted|expected|"
+    r"wanted)|worried about (?:the )?(?:cost|price|money|fees?)|(?:a lot|too much|steep|pricey|"
+    r"expensive) for me|a (?:big|heavy) (?:number|ask))\b"
+    r"|\bmore than (?:i|we) (?:had |'d |would have )?(?:planned|hoped|budgeted) (?:for|on)\b",
+    re.IGNORECASE,
+)
+
+
 def reply_phrases(text: object) -> tuple[str, ...]:
-    """The tracked phrase tics ("a stretch", the "what would it involve" template) in ``text``."""
+    """The tracked phrase tics ("a stretch", the "what would it involve" template ...)."""
     folded = fold(text)
     found = []
     if STRETCH_PHRASE.search(folded):
@@ -354,6 +390,12 @@ def reply_phrases(text: object) -> tuple[str, ...]:
         found.append(PHRASE_TEMPLATE_Q)
     if CONCESSION_TAG.search(folded):
         found.append(PHRASE_CONCESSION_TAG)
+    if DECIDER_STALL.search(folded):
+        found.append(PHRASE_DECIDER_STALL)
+    if STALL_CLOSER.search(folded):
+        found.append(PHRASE_STALL_CLOSER)
+    if MONEY_STRAIN.search(folded):
+        found.append(PHRASE_MONEY_STRAIN)
     return tuple(found)
 
 

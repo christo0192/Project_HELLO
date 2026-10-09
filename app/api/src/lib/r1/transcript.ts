@@ -108,15 +108,22 @@ export const R1_NAME_MASK = '[CANDIDATE]';
  * wording ("Let me think about it. I'll read through the email and get back to you."): its second
  * sentence is masked by the fixed frame "read through the email and get", which a barge-in can cut
  * after "get".
+ *
+ * R1-Q final review round 1: the scripted wordings are also masked by SHORT frames. The worker
+ * persists the text the SDK actually forwarded, and a barge-in can cut a line at any word boundary
+ * ("Daytime is tough for me, so let's book a", "Call me back after I've talked to", "I'll read
+ * through the email and"): the short frames still hide the level. The read-through frame needs the
+ * sentence to begin with it or to follow "I'll", so "Did you read through the email I sent?" stays.
  */
 const COMMITMENT_PATTERNS: readonly RegExp[] = [
-  /send me the enrol+ment link/i,
-  /pay the deposit today/i,
+  /send me the enrol+ment\b/i,
+  /\bpay the deposit\b/i,
   /book a call\b[^.!?]*\bso we can decide/i,
   /\blet['’]?s book a call\b/i,
-  /email me the details and i['’]?ll get back to you/i,
-  /\bcall me back after i['’]?ve talked to my\b/i,
-  /\bread through the e-?mail and get\b/i,
+  /\bdaytime is tough\b/i,
+  /\bemail me the details\b/i,
+  /\bcall me back after\b/i,
+  /(?:^|\bi['’]?ll )read through the e-?mail\b/i,
 ];
 
 const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/;

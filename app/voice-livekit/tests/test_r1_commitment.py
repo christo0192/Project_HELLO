@@ -51,8 +51,7 @@ class LineTests(unittest.TestCase):
     def test_the_three_lines_are_the_plans_text(self):
         self.assertEqual(
             commitment_line(STRONG, "husband"),
-            "Okay, let's do it. Send me the enrolment link for that plan and I'll pay the "
-            "deposit today.",
+            "Okay, let's do it. Send me the enrolment link and I'll pay the deposit today.",
         )
         self.assertEqual(
             commitment_line(MEDIUM, "husband"),
@@ -272,7 +271,7 @@ class AskDetectionTests(unittest.TestCase):
         "Let me put down a deposit for you.",
         "I'd recommend we get you enrolled today.",
         "Why don't we go ahead and register you?",
-        "Do you want me to send over the payment details?",
+        "Do you want me to send over the payment link?",
     )
     CALL = (
         "Would a quick follow-up call this week work?",
@@ -577,6 +576,118 @@ class IterationThreeCommitmentTests(unittest.TestCase):
         self.assertEqual(grade(thin), WEAK)
         self.assertGreater(THIN_ADVISOR_MEAN_WORDS, 6)  # the terse level: 5 to 6 words a turn
         self.assertLess(THIN_ADVISOR_MEAN_WORDS, 31)  # every other level: 31 or more
+
+
+class FinalReviewRoundOneCommitmentTests(unittest.TestCase):
+    """R1-Q final review round 1: the enrolment ask is an invitation to act, not a mail of the details."""
+
+    INFORMATION = (
+        "I'll email the curriculum and payment details today.",
+        "I'll send over the payment options so you can compare them with your husband.",
+        "Let me share the registration details along with the brochure.",
+        "I'll text you the payment plan comparison tonight.",
+        "You can pay in instalments, and the deposit is fully refundable.",
+        "No need to pay anything today, take your time.",
+        "I'll forward the application details to your email so you can read them later.",
+        "I'm going to email you the enrolment information and the FAQ, no pressure.",
+        "I'll put the payment breakdown in the email so your husband can see it.",
+        "Seven thousand learners have taken this programme.",
+        "Do you want me to send over the payment details?",
+        "Let me email you the registration process and the deadlines.",
+        "I'll send you the enrolment requirements and the fee schedule.",
+    )
+    INVITATIONS = (
+        "Shall I send you the link to pay the deposit?",
+        "Want me to go ahead and lock in your seat for the March cohort?",
+        "Can I get you started on the application today?",
+        "Let's get your registration done before the discount expires.",
+        "How about we finalise your enrolment now?",
+        "So, should I reserve your spot?",
+        "Go ahead and complete the payment on the link I just sent.",
+        "Would you be okay paying the first instalment today so the seat is yours?",
+        "If you're happy with that, I can enrol you right now.",
+        "Shall we make it official and sign you up?",
+        "Let me send you the payment link now, okay?",
+    )
+
+    def test_sending_the_details_of_payment_or_registration_is_not_an_enrolment_ask(self):
+        from r1_commitment import AskKind, ask_acts
+
+        for text in self.INFORMATION:
+            with self.subTest(text=text):
+                self.assertNotIn(AskKind.ENROL, ask_acts(text), text)
+
+    def test_an_invitation_to_pay_reserve_or_enrol_is_an_enrolment_ask(self):
+        from r1_commitment import AskKind, ask_acts
+
+        for text in self.INVITATIONS:
+            with self.subTest(text=text):
+                self.assertIn(AskKind.ENROL, ask_acts(text), text)
+
+    def test_a_question_about_how_they_would_pay_is_discovery_not_an_ask(self):
+        from r1_commitment import AskKind, ask_acts
+
+        for text in (
+            "And would you be paying upfront or spreading it out?",
+            "How would you prefer to pay for something like this?",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn(AskKind.ENROL, ask_acts(text), text)
+
+    def test_the_reviewers_call_proposals_are_all_read(self):
+        from r1_commitment import AskKind, ask_acts
+
+        for text in (
+            "Could your husband and I have a quick word on Saturday morning?",
+            "How's Sunday at 11 for a quick three-way chat?",
+            "When's a good moment to reconnect after you've read the email?",
+            "Can we hop on a Zoom with your partner this weekend?",
+            "Would it be alright if I gave you a buzz tomorrow evening?",
+            "Let's find twenty minutes later this week with your dad.",
+            "Let me ring you both on Friday after dinner.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(AskKind.CALL, ask_acts(text), text)
+
+    def test_the_new_call_grammar_still_ignores_the_programme(self):
+        from r1_commitment import AskKind, ask_acts
+
+        for text in (
+            "Every Saturday there's a live doubt-clearing call with your mentor.",
+            "Once you enrol, your success manager schedules a kickoff call with you.",
+            "Our learners book one-on-one calls with mentors whenever they're stuck.",
+            "You get twenty minutes with your mentor every week.",
+            "You can hop on a Zoom with your mentor whenever you are stuck.",
+            "Is now still a good time to talk?",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn(AskKind.CALL, ask_acts(text), text)
+
+    def test_the_wide_net_flags_a_missed_proposal_and_not_a_pitch(self):
+        from r1_commitment import looks_like_proposal
+
+        for text in (
+            "Let me book fifteen minutes with you and your partner on Friday.",
+            "Could we sync up with your husband this weekend?",
+            "How about we regroup on Thursday evening?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(looks_like_proposal(text), text)
+        for text in (
+            "The course has nine modules.",
+            "Our mentors run a live call every Saturday.",
+            "Did you know you can book a session with a mentor anytime?",
+            "Thanks for your time today.",
+            "Is this still a good time?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(looks_like_proposal(text), text)
+
+    def test_the_strong_line_names_no_plan_the_learner_never_chose(self):
+        line = commitment_line(STRONG, "husband")
+        self.assertNotIn("plan", line)
+        self.assertIn("enrolment link", line)
+        self.assertIn("pay the deposit today", line)
 
 
 if __name__ == "__main__":

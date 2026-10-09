@@ -1857,11 +1857,31 @@ class VerbalTicMetricTests(unittest.TestCase):
         self.assertAlmostEqual(found["opener_top_share"], 0.25)
         self.assertEqual(found["opener_counts"]["okay"], 1)
 
-    def test_a_substantive_first_word_is_not_a_reaction_opener(self) -> None:
+    def test_every_first_word_counts_not_only_a_list_of_reaction_words(self) -> None:
+        # R1-Q final review round 1: the owner's rule is "no opener word on more than 15 % of the
+        # replies".  A whitelist of reaction words missed "That's" (17 % of all replies of the third
+        # live sweep, 23 % at two levels: the apostrophe is dropped, so the word read "thats").
         found = metrics.style_metrics(["I would like to know more.", "My schedule is packed.", "What next?"])
-        self.assertEqual(found["opener_counts"], {})
-        self.assertEqual(found["opener_top_share"], 0.0)
+        self.assertEqual(found["opener_counts"], {"i": 1, "my": 1, "what": 1})
+        self.assertAlmostEqual(found["opener_top_share"], 1 / 3)
         self.assertEqual(found["hmm_share"], 0.0)
+
+    def test_thats_is_counted_as_an_opener(self) -> None:
+        texts = ["That's a lot.", "That's still more than I planned for.", "That's fair."] + [
+            "I would like to know more.",
+            "My schedule is packed.",
+            "What does it cover?",
+            "The price is high.",
+            "Six months is long.",
+            "Can you do better?",
+            "It depends on the plan.",
+        ]
+        found = metrics.style_metrics(texts)
+        self.assertEqual(found["opener_top_word"], "thats")
+        self.assertAlmostEqual(found["opener_top_share"], 0.3)
+        records = [fake_record("average", **found)]
+        by = {(g["level"], g["gate"]): g["status"] for g in scorecard.build_scorecard(records, offline=False)["gates"]}
+        self.assertEqual(by[("average", "opener_tic")], "fail")
 
     def test_no_replies_measure_nothing(self) -> None:
         found = metrics.style_metrics([])
@@ -1890,7 +1910,20 @@ class VerbalTicMetricTests(unittest.TestCase):
             ["Hmm, that makes sense."] * 2
             + ["Honestly, I am not sure."] * 2
             + ["Okay, how long is it?"] * 2
-            + ["What does the mentoring look like?", "I would like to know more.", "My schedule is packed."] * 4
+            + [
+                "What does the mentoring look like?",
+                "I would like to know more.",
+                "My schedule is packed.",
+                "The price is high.",
+                "Six months is long.",
+                "Can you do better?",
+                "It depends on the plan.",
+                "Who teaches the classes?",
+                "Is it live or recorded?",
+                "We would need to think.",
+                "Money is tight right now.",
+                "Evenings are best for me.",
+            ]
         )
         records = [fake_record("average", **metrics.style_metrics(texts))]
         card = scorecard.build_scorecard(records, offline=False)
@@ -1899,8 +1932,14 @@ class VerbalTicMetricTests(unittest.TestCase):
             self.assertEqual(by[("average", gate)], "pass", gate)
 
     def test_tics_are_pooled_over_the_replies_of_a_group(self) -> None:
-        heavy = metrics.style_metrics(["Hmm, yes."] * 4 + ["What next?"] * 4)
-        light = metrics.style_metrics(["What next?"] * 12)
+        heavy = metrics.style_metrics(["Hmm, yes."] * 4 + ["Where next?"] * 2 + ["Who teaches?"] * 2)
+        light = metrics.style_metrics(
+            [
+                "What next?", "How long?", "Why that?", "Which plan?", "Is it live?", "Can I pay?",
+                "Do I need Python?", "Are there mentors?", "Will it fit?", "Should I wait?",
+                "Money is tight.", "My week is full.",
+            ]
+        )
         agg = scorecard.aggregate_group(
             [fake_record("strong", **heavy), fake_record("strong", **light)]
         )
@@ -2627,6 +2666,89 @@ class IterationThreeHarnessTests(unittest.TestCase):
         record = {"start": {"preflight": {}}}
         asyncio.run(run.record_true_cost(record, run.Settings(offline=False, calls=1), SimpleNamespace(cost_usd=0.1)))
         self.assertNotIn("balance", record)
+
+
+class FinalReviewRoundOneHarnessTests(unittest.TestCase):
+    """R1-Q final review round 1: the stall-loop gates, the ledger-aware fact check, repeats of a told need."""
+
+    PERSONA = resolve_persona("p1_career_switcher", variant="v1")
+
+    def test_decider_stall_and_money_line_rows_and_windows_are_measured(self) -> None:
+        texts = (
+            ["I'd want to talk it through with my father first."] * 5
+            + ["The syllabus looks good."] * 3
+            + ["That's better, but it's still more than I planned for."] * 3
+            + ["I will run it by my husband.", "Okay."]
+        )
+        found = metrics.style_metrics(texts)
+        self.assertEqual(found["decider_stall_rows"], 6)
+        self.assertEqual(found["decider_stall_window_max"], 4)  # four of five in a row, window of 4
+        self.assertEqual(found["money_strain_rows"], 3)
+        self.assertEqual(found["money_strain_window_max"], 3)
+        quiet = metrics.style_metrics(["Okay.", "What does it cover?", "Mm-hmm."])
+        self.assertEqual(quiet["decider_stall_rows"], 0)
+        self.assertEqual(quiet["money_strain_window_max"], 0)
+
+    def test_the_stall_loop_fails_the_new_gates(self) -> None:
+        looping = ["I'd want to talk it over with my father first."] * 8 + ["Okay."] * 12
+        records = [fake_record("terse", **metrics.style_metrics(looping))]
+        card = scorecard.build_scorecard(records, offline=False)
+        by = {(g["level"], g["gate"]): g["status"] for g in card["gates"]}
+        self.assertEqual(by[("terse", "decider_stall")], "fail")
+        self.assertEqual(by[("terse", "decider_stall_window")], "fail")
+        spaced = (["I'd want to talk it over with my father first.", "Okay.", "Right.", "I see.", "Sure."] * 2)
+        ok = [fake_record("terse", **metrics.style_metrics(spaced))]
+        by_ok = {(g["level"], g["gate"]): g["status"] for g in scorecard.build_scorecard(ok, offline=False)["gates"]}
+        self.assertEqual(by_ok[("terse", "decider_stall")], "pass")
+        self.assertEqual(by_ok[("terse", "decider_stall_window")], "pass")
+
+    def test_a_price_the_advisor_put_on_the_table_in_words_is_no_fact_error(self) -> None:
+        # R1-Q final review round 1, H1: "thirty-five percent off, that's thirty-one fifty off" is
+        # $5,850, the ledger's net; the learner repeating the advisor's own arithmetic is no error.
+        learner = ["Honestly, the price of $5,850 is even below the $7,000 I heard people got it for."]
+        advisor = ["With thirty-five percent off, that's thirty-one fifty off, so you get a great deal."]
+        bare = metrics.fact_error_metrics(learner, advisor)
+        self.assertEqual(bare["fact_error_count"], 1)
+        with_ledger = metrics.fact_error_metrics(learner, advisor, ledger_prices=[5850])
+        self.assertEqual(with_ledger["fact_error_count"], 0)
+        spelled = metrics.fact_error_metrics(
+            ["That price works out to $5,850 then."],
+            ["It comes to five thousand eight hundred and fifty dollars all in."],
+        )
+        self.assertEqual(spelled["fact_error_count"], 0)
+        off_deck = metrics.fact_error_metrics(["The price is $6,123."], advisor, ledger_prices=[5850])
+        self.assertEqual(off_deck["fact_error_count"], 1)
+
+    def test_call_metrics_reads_the_offer_ledger_from_the_admin_log(self) -> None:
+        record = {
+            "header": {"persona_id": "p1_career_switcher", "persona_variant": "v1", "seed": "s"},
+            "rows": [
+                {"turn_index": 1, "phase": "roleplay", "speaker": "candidate", "text": "It is 35 percent off."},
+                {"turn_index": 2, "phase": "roleplay", "speaker": "bot", "text": "So the price is $5,850 then."},
+            ],
+            "exchanges": [],
+            "admin_log": {"negotiation": {"offers": [{"turn": 1, "net_usd": 5850, "conditional": False}]}},
+        }
+        self.assertEqual(metrics.call_metrics(record)["fact_error_count"], 0)
+        record["admin_log"] = {"negotiation": {"offers": []}}
+        self.assertEqual(metrics.call_metrics(record)["fact_error_count"], 1)
+
+    def test_a_need_told_again_later_is_repetition_not_an_unprompted_dump(self) -> None:
+        exchanges = [
+            exchange(1, 10, "What made you look now?", "probe", "H1", "Things feel uncertain."),
+            exchange(2, 30, "Tell me more.", "followup", "H1", "My plant is being consolidated next year."),
+            exchange(3, 50, "Our mentors are from Google.", "pitch", "", "Okay, noted."),
+            exchange(4, 70, "The course is six months.", "pitch", "", "With my plant being consolidated next year, I need to be sure."),
+        ]
+        found = metrics.disclosure_metrics(self.PERSONA, exchanges)
+        self.assertEqual(found["unprompted_dump_count"], 0)
+        self.assertEqual(found["deep_revealed_total"], 1)
+        early = [
+            exchange(1, 10, "Our mentors are from Google.", "pitch", "", "My plant is being consolidated next year."),
+            exchange(2, 30, "The course is six months.", "pitch", "", "My plant is being consolidated next year."),
+        ]
+        first = metrics.disclosure_metrics(self.PERSONA, early)
+        self.assertEqual(first["unprompted_dump_count"], 1)  # only the first telling is a dump
 
 
 if __name__ == "__main__":

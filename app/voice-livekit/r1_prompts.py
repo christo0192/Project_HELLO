@@ -180,6 +180,7 @@ STYLE_NOTES: tuple[str, ...] = (
     '- Do not start with "Hmm", "Honestly" or "Well" this time; start with the substance.',
     "- Keep it plain: no filler words at all in this reply.",
     "- Start with the part of their answer you want to pick up on, in your own words.",
+    '- Do not start with "That" or "That\'s" this time; start with the point itself.',
 )
 REACTION_ONLY_NOTE = (
     "Reply as the learner with ONE short sentence that reacts to what the advisor just said, "
@@ -293,7 +294,9 @@ def learner_prefix(persona: RenderedPersona) -> str:
         "a course detail back to them). Ask a short question only now and then, when you are "
         "really curious: most of your replies are plain statements and never more than one "
         "question. Vary how you start: most of the time begin straight with your reaction or "
-        "your point, with no filler word, and never use two filler words in one reply. "
+        "your point, with no filler word, and never use two filler words in one reply. Do not "
+        "open reply after reply with \"That's\" or \"That\" either: start with the point itself, "
+        "with \"I\" or \"It\", or with a short question. "
         "Small talk is fine. You are interested but careful about time and money, "
         "and you hesitate believably. Never lecture, never list, and never repeat yourself: "
         "if you already made a point, move on.\n"
@@ -302,7 +305,9 @@ def learner_prefix(persona: RenderedPersona) -> str:
         "character and carry on.\n"
         "The $7,000 you heard is only a number someone told you: it is never an offer until "
         "the advisor plainly offers it to you. What you say about who decides, and who you "
-        "would talk to, always matches your card.\n"
+        "would talk to, always matches your card: only the person on your card has a say in "
+        "your decision, so never name anyone else (a parent, a sibling, a friend) as having a "
+        "say, and never say that the decision is yours alone.\n"
         "Never state product facts: do not describe the course, its price or discounts, "
         "its format, schedule, projects, outcomes or any offer, and never correct the "
         "advisor. About the course you know only the price and the length on your card, so "

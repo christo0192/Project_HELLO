@@ -35,7 +35,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from r1_commitment import COMMIT_PERMITTED_R_SEC, stall_line
 from r1_guard import FALLBACK_REPLIES, NEUTRAL_ACKS, REPLY_WORD_CAP
 from r1_personas import H_TOPICS, deep_need_topics_in, resolve_persona
-from r1_text import fuzzy_contains, split_sentences
+from r1_text import canonical_amounts, fuzzy_contains, split_sentences
 from r1_world import DURATION_MONTHS, NET_PRICES_USD, PRICE_USD, DISCOUNTS_USD, claims_guarantee
 
 ROLEPLAY = "roleplay"
@@ -99,10 +99,22 @@ _TEMPLATE_QUESTION = re.compile(
     r"mean for me)\b",
     re.IGNORECASE,
 )
-# First words that are a reaction rather than the substance of a reply.
-_TIC_OPENERS = frozenset(
-    "okay ok oh right sure hmm hm mm mhm mmhmm yeah yes got ah alright good great nice fair "
-    "interesting honestly well wow wait thanks thank that really so actually look true".split()
+# M24 stall loops (R1-Q final review round 1): the same stall said again and again in other words.
+# Own regexes (the engine's tracked phrases are not imported).  "talk it through with my father" was
+# voiced in 9 of 35 replies of one terse call, "still more than I planned for" three replies in a row.
+STALL_WINDOW_DECIDER = 4
+STALL_WINDOW_MONEY = 3
+_DECIDER_STALL = re.compile(
+    r"\b(?:talk|speak|check|run|discuss|consult|go (?:over|through))\w*\b[^.?!]{0,40}?\b"
+    r"(?:with|to|by|past)\s+(?:my |our )?(?:husband|wife|partner|spouse|father|mother|dad|mom|"
+    r"mum|parents|him|her|them)\b",
+    re.IGNORECASE,
+)
+_MONEY_STRAIN = re.compile(
+    r"\bstill (?:more than (?:i|we)|worried about (?:the )?(?:cost|price|money)|(?:a lot|too much|"
+    r"steep|pricey|expensive) for me)\b|\bmore than (?:i|we) (?:had |'d )?(?:planned|hoped|"
+    r"budgeted) (?:for|on)\b",
+    re.IGNORECASE,
 )
 # What the advisor's question must be about for a deep need told soon after it not to count as an
 # unprompted dump, when the simulator did not tag the question as a probe (a permissive check:
@@ -230,6 +242,11 @@ def mean(values: Sequence[float]) -> float | None:
     return None if not values else sum(values) / len(values)
 
 
+def _max_in_window(flags: Sequence[bool], window: int) -> int:
+    """The most ``True`` flags in any ``window`` consecutive replies."""
+    return max((sum(flags[start : start + window]) for start in range(len(flags))), default=0)
+
+
 # ------------------------------------------------------------------------------- row access
 def row_index(row: Mapping[str, Any]) -> int:
     value = row.get("turn_index", row.get("index"))
@@ -349,15 +366,24 @@ def weak_metrics(texts: Sequence[str]) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------------------ fact errors
-def fact_error_metrics(texts: Sequence[str], advisor_texts: Sequence[str] = ()) -> dict[str, Any]:
+def fact_error_metrics(
+    texts: Sequence[str],
+    advisor_texts: Sequence[str] = (),
+    ledger_prices: Iterable[int] = (),
+) -> dict[str, Any]:
     """M10: the learner contradicting the deck (price, duration, a guarantee).
 
     A figure the advisor said earlier, or the $7,000 anchor, is not an error: the learner is
-    allowed to repeat what it heard.  The deck's own numbers are never errors.
+    allowed to repeat what it heard.  The deck's own numbers are never errors.  R1-Q final review
+    round 1 (H1): a price the advisor put on the table in words ("thirty-five percent off, that's
+    thirty-one fifty off") is the net the worker's offer ledger computed ($5,850), so the ledger's
+    prices (``ledger_prices``) and the advisor's spelled-out amounts are allowed too; the p1 pushy
+    call failed as a "fact error" for repeating the advisor's own arithmetic.
     """
-    allowed = {PRICE_USD, 7000, *NET_PRICES_USD, *DISCOUNTS_USD}
+    allowed = {PRICE_USD, 7000, *NET_PRICES_USD, *DISCOUNTS_USD, *ledger_prices}
     for text in advisor_texts:
         allowed.update(_dollar_figures(text))
+        allowed.update(_dollar_figures(canonical_amounts(text)))
     errors: list[dict[str, Any]] = []
     for index, text in enumerate(texts):
         codes: list[str] = []
@@ -436,17 +462,27 @@ def style_metrics(texts: Sequence[str]) -> dict[str, Any]:
             reactions += 1
     neutral = {norm(ack) for ack in NEUTRAL_ACKS}
     count = len(texts)
+    # The LITERAL first word of every reply, whatever it is (R1-Q final review round 1): the owner's
+    # rule is "no opener word on more than 15 % of the replies", and a whitelist of reaction words
+    # missed the dominant opener of the third live sweep ("That's", 17 % of all replies, 23 % at two
+    # levels: ``norm`` drops the apostrophe, so it read "thats" and was never counted).
     openers: Counter[str] = Counter()
     for text in texts:
         tokens = norm(text).split()
-        if tokens and tokens[0] in _TIC_OPENERS:
+        if tokens:
             openers[tokens[0]] += 1
     top_word, top_count = openers.most_common(1)[0] if openers else ("", 0)
     hmm = sum(1 for text in texts if _HMM.search(text))
     honestly = sum(1 for text in texts if _HONESTLY.search(text))
     stretch = sum(1 for text in texts if _STRETCH.search(text))
     template = sum(1 for text in texts if _TEMPLATE_QUESTION.search(text))
+    decider_flags = [_DECIDER_STALL.search(text) is not None for text in texts]
+    money_flags = [_MONEY_STRAIN.search(text) is not None for text in texts]
     return {
+        "decider_stall_rows": sum(decider_flags),
+        "decider_stall_window_max": _max_in_window(decider_flags, STALL_WINDOW_DECIDER),
+        "money_strain_rows": sum(money_flags),
+        "money_strain_window_max": _max_in_window(money_flags, STALL_WINDOW_MONEY),
         "reply_stretch_count": stretch,
         "reply_template_q_count": template,
         "opener_counts": dict(openers),
@@ -538,13 +574,17 @@ def fragmentation_metrics(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     }
 
 
-def row_metrics(rows: Sequence[Mapping[str, Any]], advisor_texts: Sequence[str] = ()) -> dict[str, Any]:
+def row_metrics(
+    rows: Sequence[Mapping[str, Any]],
+    advisor_texts: Sequence[str] = (),
+    ledger_prices: Iterable[int] = (),
+) -> dict[str, Any]:
     """Every metric that needs only the persisted rows (works on a real session export)."""
     texts = reply_texts(rows)
     out: dict[str, Any] = {}
     out.update(repeat_metrics(texts))
     out.update(weak_metrics(texts))
-    out.update(fact_error_metrics(texts, advisor_texts))
+    out.update(fact_error_metrics(texts, advisor_texts, ledger_prices))
     out.update(style_metrics(texts))
     out.update(interviewer_metrics(rows))
     out.update(fragmentation_metrics(rows))
@@ -602,8 +642,13 @@ def disclosure_metrics(persona: Any, exchanges: Sequence[Mapping[str, Any]]) -> 
             deep_on_first_probe.append(topic)
     unprompted: list[dict[str, Any]] = []
     excused = 0
+    told: set[str] = set()
     for index, topics in enumerate(deep_by_turn):
         for topic in sorted(topics):
+            # Said again later: repetition (the repeat metrics see it), not a new disclosure.
+            if topic in told:
+                continue
+            told.add(topic)
             recent = [
                 i for i, _intent in touches.get(topic, []) if index - DEEP_WINDOW_TURNS <= i <= index
             ]
@@ -997,7 +1042,12 @@ def call_metrics(record: Mapping[str, Any]) -> dict[str, Any]:
     exchanges = record.get("exchanges") or []
     admin = record.get("admin_log") or {}
     advisor_texts = [str(_advisor(ex).get("text") or "") for ex in exchanges]
-    out = row_metrics(rows, advisor_texts)
+    ledger_prices = [
+        int(offer["net_usd"])
+        for offer in (admin.get("negotiation") or {}).get("offers") or []
+        if isinstance(offer, Mapping) and isinstance(offer.get("net_usd"), (int, float))
+    ]
+    out = row_metrics(rows, advisor_texts, ledger_prices)
     persona = resolve_persona(
         str(header.get("persona_id")),
         variant=str(header.get("persona_variant") or "default"),

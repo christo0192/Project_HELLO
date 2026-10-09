@@ -62,9 +62,9 @@ class AskKind(str, Enum):
 # the slot when the advisor proposed nothing usable; ``r1_negotiation`` picks the real one.
 DEFAULT_SLOT = "on Thursday at 7 PM"
 COMMITMENT_LINES = {
+    # R1-Q final review round 1: no "for that plan" (the learner never chose one).
     Level.STRONG: (
-        "Okay, let's do it. Send me the enrolment link for that plan and I'll pay the "
-        "deposit today."
+        "Okay, let's do it. Send me the enrolment link and I'll pay the deposit today."
     ),
     Level.MEDIUM: (
         "Let's book a call {slot} with my {decision_maker} so we can decide."
@@ -499,8 +499,27 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
     (
         re.compile(
             r"\b(?:call|ring|phone|ping|buzz|text|message|whatsapp)(?:ing)? " + _PEOPLE + r"\b"
-            r"|\bgive " + _PEOPLE + r" a (?:call|ring|buzz|shout)\b"
+            r"|\b(?:give|gave|giving) " + _PEOPLE + r" a (?:call|ring|buzz|shout)\b"
             r"|\b(?:call|ring|phone)(?:ing)? (?:you )?back\b",
+            re.IGNORECASE,
+        ),
+        False,
+    ),
+    # "find twenty minutes", "carve out half an hour", "grab ten minutes": time for a conversation
+    (
+        re.compile(
+            r"\b(?:find|carve out|set aside|grab|block|free up)\b(?: [\w'-]+){0,3}? "
+            r"(?:minutes?|half an hour|an hour|a few minutes|some time)\b",
+            re.IGNORECASE,
+        ),
+        False,
+    ),
+    # "hop on a Zoom", "jump on a quick video call", "get on a call", "have a quick word"
+    (
+        re.compile(
+            r"\b(?:hop|jump|get|dial|log) (?:on|onto|into) (?:a |an |the |our )?(?:[\w-]+ ){0,2}?"
+            r"(?:zoom|call|video call|meet|teams|hangout|chat)\b"
+            r"|\bhave a (?:quick |brief |short )?(?:word|chat|natter|catch[- ]?up)\b",
             re.IGNORECASE,
         ),
         False,
@@ -577,12 +596,13 @@ _TIME_ASKS = (
     ),
     re.compile(
         r"\bwhen(?:'s| is| would be| works| would work| is better| is best| are you)\b[^.?!]{0,25}"
-        r"\b(?:call|chat|meeting|talk|speak|time|catch up)\b",
+        r"\b(?:call|chat|meeting|talk|speak|time|catch up|moment|reconnect|connect|touch base|"
+        r"follow(?:ing)?[- ]?up|get back|regroup|zoom|word)\b",
         re.IGNORECASE,
     ),
     re.compile(
         r"\b(?:does|would|will|is|are|do|how about|what about|shall we do|shall we say|"
-        r"can we do|could we do|how does|if we say)\b[^.?!]{0,50}"
+        r"can we do|could we do|how does|how'?s|if we say)\b[^.?!]{0,50}"
         r"\b(?:" + _DAY + r"|" + _CLOCK_TIME + r"|(?<![\d$,.])\d{1,2}(?![\d,.])|next week|"
         r"this week|this weekend|weekend|weekday|weekdays|evening|morning|afternoon|noon|"
         r"sometime|lunch|same time|(?:one|two|three|four|five|six|seven|\d+) (?:days?|weeks?|"
@@ -593,7 +613,7 @@ _TIME_ASKS = (
     ),
     re.compile(
         r"\b(?:how about|what about|shall we (?:do|say|make it)|can we do|could we do|let'?s do|"
-        r"let'?s say|let'?s make it|how does)\b[^.?!]{0,30}"
+        r"let'?s say|let'?s make it|how does|how'?s)\b[^.?!]{0,30}"
         r"\b(?:" + _DAY + r"|" + _CLOCK_TIME + r"|next week|this week|this weekend|weekend|"
         r"evening|morning|afternoon|noon|lunch|sometime)\b",
         re.IGNORECASE,
@@ -619,9 +639,9 @@ _CALL_QUESTIONS = (
     re.compile(
         r"\b(?:would|could|can|will|is|does|do|shall we have|can we have|how about|what about|"
         r"are you open to|would you be open to|would you like|do you want|do you prefer)\b"
-        r"[^.?!]{0,50}\b(?:a|an|another)\s+(?:quick |short |brief |follow[- ]?up |second |"
-        r"further |ten[- ]minute |\d+[- ]minute |phone |video |zoom )?(?:call|chat|meeting|"
-        r"conversation|catch[- ]?up|check[- ]?in|follow[- ]?up)\b",
+        r"[^.?!]{0,50}\b(?:a|an|another)\s+(?:[\w-]+ ){0,2}?(?:call|chat|meeting|"
+        r"conversation|catch[- ]?up|check[- ]?in|follow[- ]?up|word|zoom|buzz|sync|huddle|"
+        r"video call|three-way)\b",
         re.IGNORECASE,
     ),
     re.compile(
@@ -759,6 +779,12 @@ _ENROL_OBJECT = (
     r"confirmation)"
 )
 _LINK = r"(?:link|form|page|invoice)"
+# What payment and registration TALK is when it is not the thing to act on: information.
+_NOT_INFORMATION = (
+    r"(?!\s+(?:details?|options?|information|info|plans?|comparison|breakdown|faq|faqs|schedule|"
+    r"terms|process|steps|requirements|polic(?:y|ies)|deadlines?|dates|summary|overview|fees?|"
+    r"costs?|pricing|prices?|structure|methods?|choices|alternatives|instructions|guidelines)\b)"
+)
 _SEAT_VERB = r"(?:hold|reserve|lock|secure|grab|snag|save|book)"
 _SEAT_OBJECT = (
     r"(?:(?:you |him |her |them |us )?(?:your|a|the|my|that|this) (?:\w+ ){0,2}?(?:spot|"
@@ -846,9 +872,17 @@ _ENROL_ASK = _compile(
     r"(?:^|[,;] ?)(?:(?:and|but|so|then|now|just|please|okay|ok) )*(?:" + _SEAT_VERB + r"(?: in)? "
     r"" + _SEAT_OBJECT + r"|(?:enrol+|register|sign up|pay)(?= now| today| tonight)|"
     r"reserve(?= now| today| tonight| right))(?![\w-])",
-    # send / share the payment or enrolment details, link or form
+    # send / share the payment or enrolment link or form.  The details, options or information of
+    # payment and registration are INFORMATION (R1-Q final review round 1: "I'll email the
+    # curriculum and payment details today" was an enrolment ask and earned a scripted "I'll pay
+    # the deposit today"): only the thing the learner would act on counts.
     r"\b" + _ENROL_VERB_SEND + r"\b(?: (?:you|me|him|her|them|over|across|out))?"
-    r"(?: [\w'-]+){0,3}? " + _ENROL_OBJECT + r"\b(?: (?:details|link|form|page|information|info))?",
+    r"(?: [\w'-]+){0,3}? " + _ENROL_OBJECT + _NOT_INFORMATION + r"\b"
+    r"(?: (?:link|form|page))?",
+    # "go ahead and complete the payment on the link", "please finalise your registration"
+    r"(?:^|[,;] ?)(?:(?:and|but|so|then|now|just|please|okay|ok) )*(?:go ahead and |please )?"
+    r"(?:complete|finali[sz]e|make|do|submit) (?:the |your |that |this )?(?:payment|registration|"
+    r"enrol+ment|booking|deposit|application)\b" + _NOT_INFORMATION,
     r"\b" + _ENROL_VERB_SEND + r"\b(?: (?:you|me|him|her|them|over|across|out))?"
     r"(?: (?:the|a|an|your|that|this|it))? ?" + _LINK + r"\b" + _CLASS_LOGISTICS_AFTER,
     r"\b" + _ENROL_VERB_SEND + r" (?:it|that|this|everything) (?:over |across |out )?"
@@ -897,7 +931,11 @@ _ENROL_QUESTION_FORMS = _compile(
     r"get started|secure|reserve|lock|go ahead|take (?:it|this|the course|the program))\b",
     r"\bhow (?:would|do) you (?:like|want) to (?:proceed|move forward|go forward|pay|enrol+)\b",
     r"\b(?:can|could|will|would|shall|should) you (?:\w+ ){0,2}pay (?:today|now|upfront|"
-    r"in full)\b|\b(?:please )?pay (?:today|now)\b",
+    r"in full)\b"
+    # "Would you be okay paying the first instalment today so the seat is yours?"; a question about
+    # HOW they would pay ("would you be paying upfront or spreading it out?") is discovery
+    r"|\b(?:can|could|will|would|shall|should|are) you (?:\w+ ){0,3}(?:pay|paying)\b[^.?!]{0,30}"
+    r"\b(?:today|now|tonight|right away)\b|\b(?:please )?pay (?:today|now)\b",
 )
 # How enrolling works ("you would just pick a plan"), not an invitation to do it.
 _ENROL_DESCRIBES = re.compile(
@@ -962,6 +1000,44 @@ class Ask:
 
     kind: AskKind
     phrase: str
+
+
+# A wide net, for ONE purpose: telling a missed proposal from a turn that proposes nothing.  It is a
+# question or an offer that names a call-like thing together with a moment or the learner's people
+# ("Could your husband and I have a quick word on Saturday?", "How about we sync tomorrow night?").
+# It never earns a commitment line.  Inside the close window, when the model answers such a turn
+# with an acceptance, the guard counts that as a late ask (hygiene), not as a leak
+# (``r1_guard`` ``late_ask_accepted``); the farewell then answers it like any open proposal.
+_SUSPECT_NOUN = re.compile(
+    r"\b(?:call|chat|word|zoom|meet\w*|talk|catch[- ]?up|reconnect|connect|touch base|buzz|ring|"
+    r"session|conversation|sync|check[- ]?in|follow[- ]?up|huddle|video|slot|appointment|schedule|"
+    r"book|pencil|line up|hop on|speak|regroup|phone|phoned|dial)\b",
+    re.IGNORECASE,
+)
+_SUSPECT_FRAME = re.compile(
+    r"\blet'?s\b|\blet me\b|\bi(?:'ll| will| can| could| would)\b|\bhow about\b"
+    r"|\bwhat about\b|\bshall (?:we|i)\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_proposal(text: object) -> bool:
+    """True when the advisor's ``text`` plausibly proposes a call or a time (a wide net)."""
+    for sentence in split_sentences(text):
+        lowered = fold(sentence).lower().strip()[-_MAX_SENTENCE:]
+        if not lowered or _KNOWLEDGE_Q.search(lowered) is not None:
+            continue
+        if not (is_question_like(lowered) or _SUSPECT_FRAME.search(lowered) is not None):
+            continue
+        if _SUSPECT_NOUN.search(lowered) is None:
+            continue
+        if (
+            _CONCRETE_DAY.search(lowered) is not None
+            or _WHEN_CUE.search(lowered) is not None
+            or _WITH_LEARNER.search(lowered) is not None
+        ):
+            return True
+    return False
 
 
 def ask_acts(text: object) -> dict[AskKind, Ask]:

@@ -28,6 +28,12 @@ review and verify rounds and of this iteration's live-sweep findings, ``owner:``
 owner's test, ``sim:`` the advisor simulator's turns of the live sweeps (its own {intent, topic} JSON is the
 ground truth for the label; the ambiguous ones were checked by hand).
 
+Held-out set (R1-Q final review round 1): the tuned corpus above is built from the phrasings the detectors
+were tuned on, so its 1.000 says nothing about wording the engine has not met.
+``tests/fixtures/r1_advisor_heldout.jsonl`` holds fresh phrasings that were never used to tune a detector;
+``HeldOutCorpusTests`` reports their recall and precision and holds recall floors (a miss there is reported,
+never patched in on its own).
+
 Targets: 100 % on the hand-labelled review cases, and at least 95 % recall and 98 % precision on the
 simulator-labelled set for the proposals and offers.  A labelled case that passes may never fail again; a case
 the detectors still get wrong is listed in ``KNOWN_FAILURES`` with the reason, and the list may only shrink
@@ -300,6 +306,75 @@ class DetectorCorpusTests(unittest.TestCase):
             if acts.call or acts.enrol or acts.email_offer or acts.callback is not None:
                 offenders.append(f"{entry['id']} {entry['text'][:120]!r}")
         self.assertEqual([], offenders, "\n" + "\n".join(offenders[:40]))
+
+
+HELDOUT_PATH = HERE / "tests" / "fixtures" / "r1_advisor_heldout.jsonl"
+# The recall floors of the held-out set.  They are REGRESSION floors set just under what the detectors
+# scored the first time they met these phrasings (call 0.861, e-mail 0.750, enrolment 0.857, price
+# 1.000, farewell 0.857, anchor reply 0.833; precision 0.938 at worst): the honest estimate of how the
+# lexical detectors do on wording they were not tuned on.  A miss here is reported, never patched
+# into a grammar by itself; new held-out phrasings are added to a NEW fixture, not tuned on.
+HELDOUT_RECALL_FLOORS = {
+    "call_proposal": 0.80,
+    "email_offer": 0.70,
+    "enrol_ask": 0.80,
+    "price_offer": 0.95,
+    "farewell": 0.80,
+    "anchor_reply": 0.75,
+}
+HELDOUT_PRECISION_FLOOR = 0.90
+
+
+def load_heldout() -> list[dict]:
+    with HELDOUT_PATH.open(encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+class HeldOutCorpusTests(unittest.TestCase):
+    """Fresh advisor phrasings that no detector was tuned on (R1-Q final review round 1).
+
+    The main corpus is built from the phrasings the detectors were tuned on, so its 1.000 precision and
+    recall say nothing about real candidates.  This fixture holds wording written afterwards; its
+    recall is what the engine can expect from a phrasing it has not seen.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.entries = load_heldout()
+        cls.scores, cls.failures = evaluate(cls.entries)
+        print("\n" + report(cls.scores, "held-out phrasings (not tuned on)"))
+        for failure in cls.failures:
+            print("  miss:", describe(failure))
+
+    def test_the_heldout_set_is_well_formed_and_disjoint_from_the_tuned_corpus(self) -> None:
+        ids = [entry["id"] for entry in self.entries]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertGreaterEqual(len(self.entries), 150)
+        tuned = {" ".join(entry["text"].lower().split()) for entry in load_corpus()}
+        for entry in self.entries:
+            self.assertEqual(set(entry["labels"]), set(LABEL_KEYS), entry["id"])
+            self.assertTrue(entry["source"].startswith("heldout:"), entry["id"])
+            self.assertNotIn(" ".join(entry["text"].lower().split()), tuned, entry["id"])
+        for key in ("call_proposal", "email_offer", "enrol_ask", "farewell", "anchor_reply"):
+            self.assertGreaterEqual(sum(1 for e in self.entries if e["labels"][key]), 7, key)
+            self.assertGreaterEqual(sum(1 for e in self.entries if e["labels"][key] is False), 40, key)
+
+    def test_recall_and_precision_stay_above_the_floors(self) -> None:
+        for detector in DETECTORS:
+            score = self.scores[detector.name]
+            with self.subTest(detector=detector.name):
+                self.assertGreaterEqual(score.recall, HELDOUT_RECALL_FLOORS[detector.name], "recall")
+                self.assertGreaterEqual(score.precision, HELDOUT_PRECISION_FLOOR, "precision")
+
+    def test_a_pitch_triggers_no_detector_in_the_heldout_set_either(self) -> None:
+        offenders = []
+        for entry in self.entries:
+            if not entry["labels"]["pitch_only"]:
+                continue
+            acts = read(entry)
+            if acts.call or acts.enrol or acts.email_offer or acts.callback is not None:
+                offenders.append(f"{entry['id']} {entry['text'][:100]!r}")
+        self.assertEqual([], offenders, "\n" + "\n".join(offenders[:20]))
 
 
 class HostileTextTests(unittest.TestCase):

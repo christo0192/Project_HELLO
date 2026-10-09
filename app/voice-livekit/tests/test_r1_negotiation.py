@@ -1703,5 +1703,132 @@ class IterationThreeNegotiationTests(unittest.TestCase):
         self.assertFalse(matches(markers, "I'd rather think it over."))
 
 
+class FinalReviewRoundOneNegotiationTests(unittest.TestCase):
+    """R1-Q final review round 1: the price ledger, the anchor and the STRONG gate."""
+
+    def offers(self, text, own=(), require_cue=False):
+        from r1_negotiation import parse_price_offers
+
+        return dict(parse_price_offers(text, own, require_cue=require_cue))
+
+    # --- a described discount is not an offer; a bound is not a price
+    def test_a_discount_described_with_up_to_is_not_an_offer(self):
+        for text in (
+            "We have discounts up to $1,500.",
+            "Some people qualify for up to $1,500 off.",
+            "There are discounts of up to $1500 depending on the plan.",
+            "Our discounts go as high as fifteen hundred dollars.",
+            "Learners may qualify for up to 20% off.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.offers(text), {}, text)
+
+    def test_a_discount_the_advisor_offers_in_the_first_person_still_counts(self):
+        self.assertEqual(self.offers("I can offer up to $1,500 off for you today."), {7500: True})
+        self.assertEqual(self.offers("I can take $1,500 off."), {7500: False})
+
+    def test_under_six_thousand_is_a_bound_not_the_price(self):
+        for text in (
+            "It's under six thousand with the extra five hundred.",
+            "We can get it below $7,000 for you, I think.",
+            "The total will be no more than $7,500.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(self.offers(text), {}, text)
+
+    # --- the anchor in the learner's shorthand, and counts that look like it
+    def test_where_did_you_hear_seven_challenges_the_anchor(self):
+        from r1_negotiation import refuses_price
+
+        for text in (
+            "Where did you hear seven?",
+            "Who told you seven?",
+            "That was an old promotion, it's not running anymore.",
+            "That price was an early-bird, it ended last year.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(refuses_price(text), text)
+
+    def test_seven_thousand_applications_is_not_the_anchor(self):
+        from r1_negotiation import mentions_anchor, refuses_price
+
+        for text in (
+            "We had seven thousand applications last year.",
+            "More than 7,000 learners have taken it.",
+            "I can send you a sample project from last cohort.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(refuses_price(text), text)
+                self.assertFalse(mentions_anchor(text), text)
+
+    # --- money is settled by the best offer, whatever the advisor refused afterwards
+    def test_money_is_settled_once_a_price_at_or_below_the_ask_was_offered(self):
+        from r1_negotiation import SITUATION_REFUSED, Negotiation
+
+        state = Negotiation("husband")
+        # the advisor offered before the learner anchored and refused after it (the live sweep's p1)
+        state.observe(2, "I can take thirty-five percent off, that is $5,850 for you.", anchor_turn=None)
+        self.assertEqual(state.best_offer_usd, 5850)
+        state.observe(4, "I'm sorry, I can't go lower than that.", anchor_turn=3)
+        self.assertEqual(state.price_situation(), SITUATION_REFUSED)  # the refusal is the last word...
+        self.assertTrue(state.money_is_settled())  # ...but the price is below the $7,000 ask
+        other = Negotiation("husband")
+        other.observe(2, "I can do $8,000 for you.", anchor_turn=1)
+        self.assertFalse(other.money_is_settled())
+
+    # --- STRONG needs a learner with nothing left to consult and nothing to wait for
+    def test_a_wait_is_heard_in_the_learners_own_words(self):
+        from r1_negotiation import says_will_wait
+
+        for text in (
+            "Waiting feels more realistic for me right now.",
+            "I'll wait for the next cohort.",
+            "I'm not ready to commit yet.",
+            "I think I'd rather wait until after the holidays.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(says_will_wait(text), text)
+        for text in ("I can't wait to see the curriculum.", "How long is the wait for a mentor?"):
+            with self.subTest(text=text):
+                self.assertFalse(says_will_wait(text), text)
+
+    def test_the_decider_stall_is_resolved_only_by_an_answer_that_comes_after_it(self):
+        from r1_negotiation import Negotiation
+
+        state = Negotiation("husband")
+        self.assertFalse(state.decider_unresolved())  # the learner never said it
+        state.note_learner_text("I'd want to talk it over with my husband first.", 5)
+        self.assertTrue(state.decider_unresolved())
+        state.observe(5, "Your husband is welcome to join us on a call.", anchor_turn=None)
+        self.assertTrue(state.decider_unresolved())  # said before the learner spoke: no answer
+        state.observe(6, "Your husband is welcome to join us on a call.", anchor_turn=None)
+        self.assertFalse(state.decider_unresolved())
+        state.note_learner_text("I'd still talk it over with my husband first.", 7)
+        self.assertTrue(state.decider_unresolved())  # it came back: not resolved again
+
+    def test_strong_is_blocked_by_a_declined_call_a_recent_wait_or_an_open_decider(self):
+        from r1_negotiation import Negotiation
+
+        state = Negotiation("husband")
+        self.assertIsNone(state.strong_blocked(10))
+        state.note_learner_text("Waiting feels more realistic for me right now.", 8)
+        self.assertEqual(state.strong_blocked(10), "learner_waiting")
+        self.assertIsNone(state.strong_blocked(12))  # three turns later it no longer holds
+        state.note_learner_text("I'd rather reach out myself, thanks.", 9)
+        self.assertEqual(state.strong_blocked(12), "call_declined")
+        fresh = Negotiation("husband")
+        fresh.note_learner_text("I'd want to talk it over with my husband first.", 3)
+        self.assertEqual(fresh.strong_blocked(9), "decider_unresolved")
+
+    def test_the_owed_timing_stall_is_not_a_decision_to_wait(self):
+        from r1_negotiation import Negotiation
+
+        state = Negotiation("husband")
+        state.note_learner_text("Maybe I'll join the next cohort.", 4, stall=True)
+        self.assertIsNone(state.wait_said_turn)
+        state.note_learner_text("Maybe I'll join the next cohort.", 5)
+        self.assertEqual(state.wait_said_turn, 5)
+
+
 if __name__ == "__main__":
     unittest.main()

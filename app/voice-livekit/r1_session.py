@@ -2432,6 +2432,20 @@ class R1Interview:
             phase=self.machine.transcript_phase(),
             turn_index=index,
         )
+        # WHY the plan is what it is (R1-Q final review round 1): production could not see why a
+        # commitment was capped or downgraded (call_declined, advisor_thin, advisor_pressured,
+        # strong_blocked:*, ask_in_window:grade_*, owed_deferred_*).  The labels are a bounded
+        # vocabulary written by the engine, never candidate text.
+        for reason in plan.reasons:
+            if reason == "free_reply":
+                continue
+            _log.info(
+                "unknown_event",
+                error_type="r1_turn_reason",
+                error_category=reason,
+                phase=self.machine.transcript_phase(),
+                turn_index=index,
+            )
         if plan.aside:
             if entry is not None:
                 entry["phase"] = "aside"  # excluded from the learner's context (plan 5.10)

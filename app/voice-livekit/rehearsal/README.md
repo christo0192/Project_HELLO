@@ -37,13 +37,30 @@ Exit codes: 0 ok, 1 usage or unexpected error, 2 no key, 3 no balance (HTTP 402)
 
 Gates added or changed in R1-Q iteration 1 (owner decisions of 2026-10-08): the reply-length gates
 (mean <= 22 words, p90 <= 35, short replies >= 30 %) are INFO only and never block (wordiness is
-accepted; `length_low`, mean >= 8, still gates); the verbal-tic gates block: no reaction word
-(`okay`, `hmm`, `that`, ...) opens more than 15 % of the learner's replies, "hmm" is in at most
+accepted; `length_low`, mean >= 8, still gates); the verbal-tic gates block: no first word of a
+reply (any word: `okay`, `hmm`, `that's`, `i`, ...) opens more than 15 % of the learner's replies
+(the metric counts the literal first word; a whitelist of reaction words missed "That's" in the third
+sweep), "hmm" is in at most
 20 % and "honestly" in at most 20 % (pooled over the group's replies, with the harness's own
 regexes). Misfires now also count `time_cue_reversed`, `decider_alone`, `anchor_taken_as_offer`,
 `gratitude_after_hedge` and `reopened_after_commit`. A deep need told within two exchanges of an
 advisor QUESTION that uses the topic's own words is not an "unprompted dump" even when the
 simulator did not tag the question as a probe (`unprompted_dump_excused` counts those).
+
+Gates and metrics added or changed in R1-Q final review round 1:
+
+* `decider_stall` / `decider_stall_window` (the learner stalling on its decision maker: at most 3
+  replies per call on average and at most 2 in any 4 replies in the worst call) and `money_strain` /
+  `money_strain_window` ("still more than I planned for": 3 per call, 2 in any 3 replies). The guard keeps
+  a quota and a spacing window for each phrase (`PHRASE_QUOTA`, `PHRASE_WINDOW`); the metrics use the
+  harness's own regexes and count what was spoken.
+* The unprompted-dump metric counts the FIRST telling of a deep need only: saying it again later is
+  repetition (the repeat metrics see it), not a new disclosure.
+* The fact check allows the prices of the offer ledger (`admin_log.negotiation.offers[].net_usd`) and
+  the advisor's spelled-out amounts: a net price the advisor reached in words ("thirty-five percent off,
+  that's thirty-one fifty off" = $5,850) was a false `price_not_deck` hard fail.
+* `tests/fixtures/r1_advisor_heldout.jsonl` scores the lexical detectors on advisor phrasings that were
+  never used to tune them (`HeldOutCorpusTests`, recall floors in the test module).
 
 Gates and metrics added or changed in R1-Q iteration 2 (the second live sweep):
 

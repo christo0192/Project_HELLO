@@ -23,6 +23,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 
+from r1_commitment import call_proposal_in
 from r1_script import line as script_line
 from r1_text import fold, is_question_like, split_sentences
 
@@ -855,6 +856,10 @@ def detect_probes(text: object) -> frozenset[str]:
         lowered = fold(sentence).lower()
         if not _is_probe_shaped(lowered):
             continue
+        # A proposed call is not a probe, whoever it names ("Would your husband join a short
+        # call?" released the H3 need in the live sweep and the deep layer was told in reply to it).
+        if call_proposal_in(sentence) is not None:
+            continue
         in_sentence: set[str] = set()
         for topic, patterns in PROBE_RULES.items():
             if any(pattern.search(lowered) for pattern in patterns):
@@ -928,12 +933,47 @@ def asks_about_learner(text: object) -> bool:
         if not is_question_like(sentence):
             continue
         lowered = fold(sentence).lower()
-        if not _is_probe_shaped(lowered):
+        if not _is_probe_shaped(lowered) or call_proposal_in(sentence) is not None:
             continue
         if (
             detect_probes(sentence)
             or detect_followup(sentence)
             or _THIRD_PARTY.search(lowered) is not None
+            or _OPEN_QUESTION.search(lowered) is not None
         ):
+            return True
+    return False
+
+
+# R1-Q final review round 1.  A question that digs without naming a topic: "What would help you two
+# decide?", "What would make it feel right?", "What's on your mind?".  The live sweep dug the same
+# released H3 need six times with questions like these and the rule probes saw none of them, so the
+# deep layer was never offered.  Used only to ask for a need that is already released.
+_OPEN_QUESTION = re.compile(
+    r"\bwhat would (?:help|make|it take|you need|you want|need to)\b"
+    r"|\bwhat (?:do|would) you (?:need|want|expect|hope)\b"
+    r"|\bhow (?:do|would|does) (?:you|it|that|this) (?:feel|sit|land)\b"
+    r"|\bhelp you (?:two |both )?(?:decide|feel|move|get)\b"
+    r"|\bwhat(?:'s| is) (?:on your mind|the main thing|most important|really)\b"
+    r"|\bwhat matters\b",
+    re.IGNORECASE,
+)
+
+
+def asks_open_question(text: object) -> bool:
+    """True when the candidate asks the learner an open question about themselves.
+
+    "What would help you two decide?" names no topic and no keyword, so ``detect_probes`` does not
+    see it; it is still a dig.  A check-in on the advisor's own answer, an offer, a choice between
+    plans, a closing question and a proposed call are not (``_is_probe_shaped``,
+    ``call_proposal_in``).
+    """
+    for sentence in split_sentences(text):
+        if not is_question_like(sentence):
+            continue
+        lowered = fold(sentence).lower()
+        if not _is_probe_shaped(lowered) or call_proposal_in(sentence) is not None:
+            continue
+        if _OPEN_QUESTION.search(lowered) is not None:
             return True
     return False

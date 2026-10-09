@@ -28,6 +28,7 @@ import r1_prompts
 import r1_scheduler
 import r1_script
 import r1_text
+import r1_tracker
 import r1_world
 
 # 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
@@ -72,7 +73,15 @@ import r1_world
 #    $7,000", the unchanged-price replacement, three "thinking" fallbacks, a once-per-call
 #    concession tag, a hollow-advisor note (no second goodbye), the H3 first-probe reminder (answer
 #    only the part that was asked) and three wordings of the time cue.
-CONTENT_REVISION = 12
+# 13: R1-Q final review round 1 (the third live sweep and two Opus reviews): a repeated "That's" is
+#    swapped for "It's" and never cut to a fragment (prefix and style note ask for varied
+#    openers), one decider only (the prefix says nobody else has a say and the decision is never
+#    the learner's alone), a quota and a spacing window for the decider stall, the "get back to
+#    you" closer and the "still more than I planned for" line (PHRASE_QUOTA, PHRASE_WINDOW), the
+#    STRONG line names no plan, a persona-neutral time cue (scripted variants, wrap-up markers), a
+#    deep layer given back when its reply missed it (MAX_DEEP_MISSES) and a wait window for STRONG
+#    (WAIT_RECENT_TURNS).
+CONTENT_REVISION = 13
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -201,7 +210,12 @@ def manifest() -> dict[str, Any]:
                 "moved_day": r1_negotiation.MOVED_DAY,
                 "defer_recent_turns": r1_negotiation.DEFER_RECENT_TURNS,
                 "slot_recent_turns": r1_negotiation.SLOT_RECENT_TURNS,
+                "wait_recent_turns": r1_negotiation.WAIT_RECENT_TURNS,
             },
+        },
+        "tracker": {
+            "max_deep_offers": r1_tracker.MAX_DEEP_OFFERS,
+            "max_deep_misses": r1_tracker.MAX_DEEP_MISSES,
         },
         "commitment": {
             "lines": {level.name: text for level, text in r1_commitment.COMMITMENT_LINES.items()},
@@ -234,6 +248,7 @@ def manifest() -> dict[str, Any]:
                 "opener_window": r1_guard.STYLE_OPENER_WINDOW,
                 "max_chars": r1_guard.STYLE_MAX_CHARS,
                 "phrase_quota": dict(r1_guard.PHRASE_QUOTA),
+                "phrase_window": dict(r1_guard.PHRASE_WINDOW),
                 "question_diet_window": r1_guard.QUESTION_DIET_WINDOW,
                 "thin_reply_words": r1_guard.THIN_REPLY_WORDS,
                 "stretch_alternatives": list(r1_text.STRETCH_ALTERNATIVES),

@@ -53,6 +53,7 @@ from r1_commitment import DISCOUNT_CAP_USD, FAMILIES, AskKind, CommitmentEvidenc
 from r1_personas import (
     H_TOPICS,
     RenderedPersona,
+    asks_open_question,
     deep_need_topics_in,
     detect_followup,
     detect_probes,
@@ -85,6 +86,10 @@ class NeedState(str, Enum):
 # How many times the deep layer of one need may be put into a reminder.  The first offer is
 # the release turn; each further offer needs a candidate turn that touches the topic again.
 MAX_DEEP_OFFERS = 3
+# R1-Q final review round 1.  An offer whose reply did not tell the need (its markers are missing
+# from what the learner said) is not spent: the topic stays due for the next dig.  After this many
+# misses the layer is left alone (a model that will not say it, or a reply cut short each time).
+MAX_DEEP_MISSES = 3
 
 
 @dataclass
@@ -100,12 +105,18 @@ class NeedRecord:
     # Layer bookkeeping (turn indices only; never posted as part of ``records``).
     hint_turn: int | None = None
     deep_offer_turns: list[int] = field(default_factory=list)
+    deep_missed: int = 0
+    last_missed_turn: int | None = None
 
     @property
     def last_offer_turn(self) -> int | None:
+        """The latest turn the learner's reply was about this need (an offer, a missed offer or the
+        hint): a generic "tell me more" on the very next turn follows that reply up."""
         turns = list(self.deep_offer_turns)
         if self.hint_turn is not None:
             turns.append(self.hint_turn)
+        if self.last_missed_turn is not None:
+            turns.append(self.last_missed_turn)
         return max(turns) if turns else None
 
 
@@ -125,6 +136,9 @@ class GateUpdate:
     question: bool
     probed: tuple[str, ...] = ()
     followup: bool = False
+    # R1-Q final review round 1: the turn asks the learner an open question about themselves that
+    # names no topic ("What would help you two decide?"); see ``DisclosureGate.deep_due``.
+    open_question: bool = False
 
 
 class DisclosureGate:
@@ -170,6 +184,7 @@ class DisclosureGate:
             question,
             probed=tuple(topic for topic in H_TOPICS if topic in probes),
             followup=generic,
+            open_question=question and asks_open_question(text),
         )
 
     # --------------------------------------------------------------------- the layers
@@ -179,16 +194,20 @@ class DisclosureGate:
         The deep layer is tied to the turn that asks about the topic: the release turn
         itself, a turn that probes the topic again, or a generic "tell me more" right after
         the learner's previous reply carried that need.  On any other turn it is never
-        offered, so the learner cannot dump a need on an unrelated question.  A judge-only
-        release (``apply_judge_probes``) upgrades the state but, by itself, offers nothing.
-        Each need is offered at most ``MAX_DEEP_OFFERS`` times.
+        offered, so the learner cannot dump a need on an unrelated question.  Each need is
+        offered at most ``MAX_DEEP_OFFERS`` times, and an offer whose reply did not tell the need
+        is given back (``note_learner_text``), up to ``MAX_DEEP_MISSES`` times.
+
+        A need that is released but was never told (a judge-only release, ``apply_judge_probes``,
+        or an offer whose reply missed it) is still earned: the next turn that digs without naming
+        any other topic offers it (``_open_dig_topic``).  R1-Q final review round 1: the third live
+        sweep released H3 for the terse advisor at turn 23 and the layer was never offered although
+        the advisor dug at it five more times ("What would help you two decide?").
         """
         due: list[str] = []
         for topic in H_TOPICS:
             record = self._records[topic]
-            if record.state is not NeedState.UNLOCKED:
-                continue
-            if len(record.deep_offer_turns) >= MAX_DEEP_OFFERS:
+            if not self._may_offer(record):
                 continue
             asked_again = topic in update.released or topic in update.probed
             follows_last_offer = (
@@ -200,7 +219,42 @@ class DisclosureGate:
             )
             if asked_again or follows_last_offer:
                 due.append(topic)
+        if not due:
+            dig = self._open_dig_topic(update)
+            if dig is not None:
+                due.append(dig)
         return tuple(due)
+
+    @staticmethod
+    def _may_offer(record: NeedRecord) -> bool:
+        return (
+            record.state is NeedState.UNLOCKED
+            and len(record.deep_offer_turns) < MAX_DEEP_OFFERS
+            and record.deep_missed < MAX_DEEP_MISSES
+        )
+
+    def _open_dig_topic(self, update: GateUpdate) -> str | None:
+        """The released-but-untold need an open dig asks for, or None.
+
+        Only an open question ("What would make it feel right?") that names no topic of its own (no
+        rule probe, no new first probe) counts.  A bare "tell me more" is the follow-up on whatever
+        the learner just said, not on a need it has not told yet, so it never offers one by itself
+        (``deep_due`` handles the follow-up that comes right after an offer).  The oldest release
+        goes first, and only one need is offered per turn.
+        """
+        if update.probed or update.first_probes or not update.question:
+            return None
+        if not update.open_question:
+            return None
+        waiting = [
+            record
+            for record in self._records.values()
+            if self._may_offer(record) and self.turn not in record.deep_offer_turns
+        ]
+        if not waiting:
+            return None
+        waiting.sort(key=lambda record: (record.released_turn or 0, record.topic))
+        return waiting[0].topic
 
     def mark_hint_offered(self, topics: Any) -> None:
         """The HINT layer went into this turn's reminder (once per need, on its probe turn)."""
@@ -271,6 +325,13 @@ class DisclosureGate:
                     revealed.append(topic)
             else:
                 record.revealed_unreleased = True
+        # An offer whose reply did not tell the need is given back: the layer is still owed, so the
+        # next dig on the topic offers it again (up to ``MAX_DEEP_MISSES`` times).
+        for record in self._records.values():
+            if record.state is NeedState.UNLOCKED and now in record.deep_offer_turns:
+                record.deep_offer_turns.remove(now)
+                record.deep_missed += 1
+                record.last_missed_turn = now
         return tuple(revealed)
 
     # ------------------------------------------------------------------------ views

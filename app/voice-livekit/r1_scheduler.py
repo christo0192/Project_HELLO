@@ -423,12 +423,20 @@ PLAN: tuple[MoveSpec, ...] = (
                 r"\bhop on\b",
                 r"\bshort on time\b",
                 r"\brunning out of time\b",
-                r"\b(?:have|need|got) to (?:go|run|jump)\b",
+                r"\b(?:have|need|got|gotta) to (?:go|run|jump|leave|get going|wrap)\b",
+                # R1-Q final review round 1: the learner's own wording of a persona-true reason
+                # ("I do need to wrap up soon, I've got to get dinner going") was not proof, so the
+                # scripted "before my next call" was appended for a learner who was at home.
+                r"\bwrap(?:ping)? (?:it )?up\b",
+                r"\bget(?:ting)? going\b",
+                r"\bhead(?:ing)? out\b",
+                r"\bget(?:ting)? dinner\b",
+                r"\bleave soon\b",
             ),
         ),
         variants=(
-            "Heads up, I have to hop on another call in a few minutes.",
-            "I should mention I only have a few minutes left before another call.",
+            "Heads up, I can only stay a few more minutes, something is coming up.",
+            "I should mention I only have a few minutes left before I need to get going.",
         ),
     ),
 )

@@ -76,7 +76,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Iterable
 
 from r1_commitment import Level, classify_learner_commitment
@@ -93,7 +93,13 @@ from r1_text import (
     CONCESSION_TAG,
     CONCESSION_TAG_LEADING,
     CONCESSION_TAG_TRAILING,
+    DECIDER_STALL,
+    MONEY_STRAIN,
     PHRASE_CONCESSION_TAG,
+    PHRASE_DECIDER_STALL,
+    PHRASE_MONEY_STRAIN,
+    PHRASE_STALL_CLOSER,
+    STALL_CLOSER,
     canonical_amounts,
     TIC_HMM,
     TIC_HONESTLY,
@@ -147,7 +153,26 @@ STYLE_OPENER_WINDOW = 6
 # used this often in a call; a free reply asks nothing when one of the last QUESTION_DIET_WINDOW
 # replies already asked (the live sweep: 0.67 to 0.81 of the replies held a question, gate 0.60),
 # and a reply never asks two questions.
-PHRASE_QUOTA = {PHRASE_STRETCH: 1, PHRASE_TEMPLATE_Q: 1, PHRASE_CONCESSION_TAG: 1}
+PHRASE_QUOTA = {
+    PHRASE_STRETCH: 1,
+    PHRASE_TEMPLATE_Q: 1,
+    PHRASE_CONCESSION_TAG: 1,
+    # R1-Q final review round 1: the stall loop.  The decider stall ("talk it over with my father"),
+    # the stall closer ("get back to you", "let me think about it") and the money line ("still more
+    # than I planned for") may be used this often in a call (the scripted and owed lines count),
+    # and never again within PHRASE_WINDOW of the learner's replies.  A free reply above the quota
+    # loses the clause; an owed move (an intent reply) and the answer to "who else decides?" are
+    # never touched.
+    PHRASE_DECIDER_STALL: 3,
+    PHRASE_STALL_CLOSER: 2,
+    PHRASE_MONEY_STRAIN: 3,
+}
+PHRASE_WINDOW = {PHRASE_DECIDER_STALL: 4, PHRASE_STALL_CLOSER: 4, PHRASE_MONEY_STRAIN: 3}
+_STALL_PATTERNS = {
+    PHRASE_DECIDER_STALL: DECIDER_STALL,
+    PHRASE_STALL_CLOSER: STALL_CLOSER,
+    PHRASE_MONEY_STRAIN: MONEY_STRAIN,
+}
 # R1-Q iteration 3: the diet over-corrected (the question rate fell to 0.21-0.25 against a floor
 # of 0.25; 17 replies lost their only question), so a free reply may ask unless the PREVIOUS
 # reply did.
@@ -178,27 +203,47 @@ _LEAD_INTERJECTION = re.compile(
 _INLINE_FILLER = re.compile(r",?\s*\b(?:you know|i mean)\b,?", re.IGNORECASE)
 # A sentence longer than this is left alone: the style rules are for spoken sentences.
 STYLE_MAX_CHARS = 600
-# "that helps" -> "helps": only where dropping the demonstrative leaves a sentence.  Only a verb
-# may follow (R1-Q iteration 3): "That's reassuring" lost its "That's" and 41 replies in 17
-# calls opened with the fragment ("Reassuring, at least." twelve times in ten calls), so "That's"
-# before an evaluative adjective stays.  (Iteration 2 had narrowed it from noun phrases: "That's
-# the part I'd need to see" became "The part I'd need ...".)
-_LEAD_DEMONSTRATIVE = re.compile(
+# "That helps" -> "It helps", "That's a lot" -> "It's a lot": a repeated "That's" opener is
+# swapped for the pronoun, never cut (R1-Q final review round 1: stripping "That" left fragments,
+# "Helps a little, though." in 26 replies of 14 live calls, and "That's" still opened 17 % of all
+# replies, 23 % at two levels).  Only where the pronoun fits: "That's what I heard" and "That's the
+# part I keep coming back to" are clefts and stay as they are.
+_THAT_IS = re.compile(
+    r"^that(?P<verb>'s| is)\s+(?=(?:a|an|still|really|quite|very|pretty|so|not|actually|definitely|"
+    r"probably|just|fair|good|great|true|helpful|reassuring|better|worth|more|less|fine|nice|"
+    r"interesting|understandable|encouraging|too|already|much|even|clear|reasonable|honest|"
+    r"tough|hard|big|huge|serious|exciting)\b)",
+    re.IGNORECASE,
+)
+_THAT_VERB = re.compile(
     r"^that\s+(?=(?:helps|makes|sounds|gives|means|feels|seems|covers|explains|answers|eases|"
-    r"works)\b)",
+    r"works|does|would|will|could|should|might|may|can|really|actually)\b)",
     re.IGNORECASE,
 )
 # "Before I go, ..." / "One more thing before I go": the learner is not the one leaving (the
 # live sweep: "Before I go" in calls where nobody left).  The advisor's goodbye is answered with
 # "Oh wait, before you go ...", which is a different phrase and stays.
+#
+# R1-Q final review round 1: only the CLOSING clause is ever removed.  "Before I go any further",
+# "before I go down this road", "before we go ahead", "before I go and sign anything" are
+# ordinary sentences about the decision (the iteration-3 inline strip turned them into "...talk to
+# my father any further." and "I'd want to be sure down this road."; 5 replies in 4 live calls), so
+# the phrase has to be punctuated off the rest of its sentence: a leading "Before I go, ...", a
+# comma-bounded aside ", before I go, ...", or a trailing "..., before I go." and nothing else.
+_GOODBYE_VERB = r"(?:go|hang up|wrap up|run|leave|get going)"
 _BEFORE_I_GO = re.compile(
     r"^\W*(?:(?:and|so|but|oh|well|also)\b[,\s]*)*"
     r"(?:(?:one|a) (?:more|last|quick) (?:thing|question)[,\s]+)?"
-    r"before (?:i|we) (?:go|hang up|wrap up|run|leave|get going)\b(?:,? though)?[,.:\s-]*",
+    r"before (?:i|we) " + _GOODBYE_VERB + r"\b(?:,? though)?(?:\s*[,.:;-]+\s*|\s*$)",
     re.IGNORECASE,
 )
-_INLINE_BEFORE_I_GO = re.compile(
-    r",?\s*\bbefore (?:i|we) (?:go|hang up|wrap up|run|leave|get going)\b,?(?: though)?",
+# ", before I go, " in the middle of a sentence keeps one comma.
+_ASIDE_BEFORE_I_GO = re.compile(
+    r",\s*\bbefore (?:i|we) " + _GOODBYE_VERB + r"\b(?:,? though)?\s*,", re.IGNORECASE
+)
+# "... one more question before I go." at the very end of the sentence.
+_TAIL_BEFORE_I_GO = re.compile(
+    r",?\s*\bbefore (?:i|we) " + _GOODBYE_VERB + r"\b(?:,? though)?(?=\s*[.?!]*\s*$)",
     re.IGNORECASE,
 )
 # "I have to be honest, ..." and "I need to be honest with you: ..." are the "honestly" tic.
@@ -332,6 +377,115 @@ _DECIDES_ALONE = re.compile(
     r"(?:any ?one|anybody|someone)\b",
     re.IGNORECASE,
 )
+# R1-Q final review round 1 (owner point 3, "co-decider facts stay consistent", failed again in the
+# third live sweep: the first rule caught 2 of 11 live and probed phrasings).  The persona decides
+# WITH one person, the one on its card, for the whole call.  The learner contradicts it by
+#   (a) denying that person's part ("it's up to me in the end", "I'm the one who decides", "he'd
+#       just want me to weigh it myself", "my husband doesn't really get involved"), or
+#   (b) naming ANOTHER person as a party to the decision ("my mom usually gets a say too", "I'd
+#       want to run it by my sister first").
+_DENIES_DECIDER = re.compile(
+    r"\b(?:it'?s|it is|that'?s|that is|this is|its) (?:really |all |entirely |ultimately |totally |"
+    r"completely |purely |just |only |pretty much |mostly )*(?:up to me|on me|my call|my decision|"
+    r"my choice|down to me)\b(?!\s+to\b)"
+    r"|\b(?:the )?(?:final |last )?(?:call|decision|choice)(?:'s| is) (?:all |entirely )?"
+    r"(?:mine|up to me|on me)\b"
+    r"|\bi(?:'m| am) the (?:one|only one|person|only person) (?:who|that|to) (?:decides?|"
+    r"makes? (?:the|these|this|those|all|my)\b)"
+    r"|\bi (?:make|take) (?:all )?(?:my own|the|these|those|all my) (?:\w+ )?(?:decisions?|"
+    r"calls?)\b[^.?!]{0,20}\b(?:myself|on my own|alone|by myself|about (?:my )?(?:money|"
+    r"finances|spending))"
+    r"|\bi (?:make|take) my own (?:decisions?|calls?)\b"
+    r"|\bweigh (?:it|this|that|things|the options) (?:up )?(?:myself|on my own|by myself)\b"
+    r"|\bdecid\w+ (?:it |this |that )?(?:on my own|by myself|myself|alone|solo)\b",
+    re.IGNORECASE,
+)
+_DECIDER_STEPS_BACK = re.compile(
+    r"\b(?:he|she|they)(?:'d| would| will|'ll|'s| is)? (?:just |only |really |probably |usually )*"
+    r"(?:want|wants|leave|leaves|let|lets|trust|trusts|expect|expects) (?:me|it|this|that)\b"
+    r"[^.?!]{0,30}\b(?:decid\w+|weigh|myself|my own|to me|up to me|on my own|figure)"
+    r"|\bmy (?:husband|wife|partner|spouse|father|mother|dad|mom|mum)\b[^.?!]{0,30}"
+    r"\b(?:doesn'?t|does not|won'?t|wouldn'?t|isn'?t|is not|never)\b[^.?!]{0,25}"
+    r"\b(?:get(?:s)? involved|involved|care|cares|mind|minds|weigh in|have a say|has a say|"
+    r"decide|decides|interfere|bothered|interested)\b",
+    re.IGNORECASE,
+)
+# Family and partners only: a friend who took the course or a manager who may sponsor it is
+# information or money, not a second decider.
+_ROLES = (
+    r"(?:mom|mum|mother|dad|father|sister|brother|husband|wife|partner|spouse|parents|in-laws|"
+    r"boyfriend|girlfriend|fianc\w+|uncle|aunt|cousin|grandparents?|grandfather|grandmother)"
+)
+# The words that name the SAME person as the card's decision maker.
+_OWN_ROLES = {
+    "husband": frozenset({"husband", "spouse"}),
+    "wife": frozenset({"wife", "spouse"}),
+    "partner": frozenset({"partner", "spouse"}),
+    "father": frozenset({"father", "dad", "parents"}),
+    "mother": frozenset({"mother", "mom", "mum", "parents"}),
+}
+_DECISION_VERB = re.compile(
+    r"\b(?:talk(?:ing)?|speak(?:ing)?|check(?:ing)?|run(?:ning)?|discuss(?:ing)?|consult(?:ing)?|"
+    r"ask(?:ing)?|tell(?:ing)?|show(?:ing)?|clear(?:ing)?|loop(?:ing)? in|bring(?:ing)? in|"
+    r"go(?:ing)? (?:over|through)|hear from|sleep on|sound(?:ing)? (?:it )?out)\b",
+    re.IGNORECASE,
+)
+_ROLE_MENTION = re.compile(r"\b(?:my|our)\s+(" + _ROLES + r")\b", re.IGNORECASE)
+_HAS_A_SAY = re.compile(
+    r"\bmy (" + _ROLES + r")\b[^.?!]{0,25}?\b(?:gets?|has|have|having|wants?|would want|needs?|"
+    r"also gets?)\s+(?:a |some |his |her |their )?(?:say|vote|opinion|input|word|voice)\b",
+    re.IGNORECASE,
+)
+_WINDOW_END = re.compile(r"[,;.?!]|\bbut\b|\bwhile\b|\bwhich\b", re.IGNORECASE)
+
+
+def _own_roles(decision_maker: str) -> frozenset[str]:
+    key = (decision_maker or "").strip().lower()
+    return _OWN_ROLES.get(key, frozenset({key}))
+
+
+def names_another_party(sentence: str, decision_maker: str) -> bool:
+    """The sentence makes somebody other than the card's decision maker a party to the decision.
+
+    "I'd want to run it by my sister first", "talk to my husband and my mom", "my mom usually gets a
+    say too".  A role is a party only after a decision verb (talk to, run it by ...) or beside "a
+    say" and within the same clause, so "my mom watches the kids" is not one.
+    """
+    own = _own_roles(decision_maker)
+    for found in _HAS_A_SAY.finditer(sentence):
+        if found.group(1).lower() not in own:
+            return True
+    for verb in _DECISION_VERB.finditer(sentence):
+        window = sentence[verb.end() : verb.end() + 70]
+        stop = _WINDOW_END.search(window)
+        for role in _ROLE_MENTION.finditer(window[: stop.start()] if stop else window):
+            if role.group(1).lower() not in own:
+                return True
+    return False
+
+
+def decider_contradiction(sentence: str, decision_maker: str) -> bool:
+    """Whether ``sentence`` contradicts the persona's decision maker (see ``_DENIES_DECIDER``).
+
+    A denial that comes with a plain intention to talk to the card's own decision maker ("I'd talk
+    to my husband first, but ultimately it's my call") is not one.
+    """
+    if _DECIDES_ALONE.search(sentence) is not None:
+        return True
+    if _DECIDER_STEPS_BACK.search(sentence) is not None:
+        return True
+    if names_another_party(sentence, decision_maker):
+        return True
+    if _DENIES_DECIDER.search(sentence) is None:
+        return False
+    own = "|".join(sorted(_own_roles(decision_maker)))
+    consults = re.search(
+        r"\b(?:talk|speak|check|run|discuss|consult|ask|tell)\w*\b[^.?!]{0,40}\b(?:with|to|by)"
+        r"\s+(?:my |our )?(?:" + own + r"|him|her|them)\b",
+        sentence,
+        re.IGNORECASE,
+    )
+    return consults is None
 # Thanks for a discount nobody granted: "I can check with my manager" -> "Thank you, that helps".
 _GRANT_GRATITUDE = re.compile(
     r"\b(?:thank(?:s| you)|appreciate|grateful)\b[^.?!]{0,50}\b(?:discount|reduc\w+|"
@@ -409,9 +563,46 @@ _ANCHOR_REACTION = re.compile(
     r"\b7,?000\b[^?]{0,60}\b(?:better than i expected|a relief|great|good news|wonderful|perfect|"
     r"amazing|that works|works for me|sounds good|i'?ll take)\b"
     r"|\b(?:better than i expected|that'?s a relief|great news|good news)\b[^?]{0,40}\b7,?000\b"
-    r"|\bso you can (?:actually |really )?do (?:the |that )?\$?7,?000\b",
+    r"|\bso you can (?:actually |really )?do (?:the |that )?\$?7,?000\b"
+    # "So $7,000 then.", "Oh, so I'd pay $7,000? That works for me." (the question is the proof)
+    r"|\bso (?:i'?d|i would|i will|i'?ll|we'?d) (?:only |just )?pay (?:the |that )?\$?7,?000\b"
+    r"|\b(?:so |then |okay,? )\$?7,?000 (?:then|it is|is doable|is fine|works|is on)\b",
     re.IGNORECASE,
 )
+# R1-Q final review round 1: the same misreading spread over two sentences ("Great, so $7,000 then.
+# That's a relief."), in spelled form ("seven grand"), or as a confirmation ("So seven it is?").
+_SEVEN_GRAND = re.compile(r"\b(?:seven|7) grand\b", re.IGNORECASE)
+_SEVEN_CONFIRMED = re.compile(
+    r"\b(?:so |then |okay,? |great,? )seven (?:it is|then|works|is doable|is fine|is good|is on)\b"
+    r"|\bseven it is\b",
+    re.IGNORECASE,
+)
+_RELIEF = re.compile(
+    r"\b(?:(?:that'?s|it'?s|that is|which is|oh,?|wow,?|so)\s+(?:a |such a |really |so |pretty |"
+    r"actually )*(?:relief|great|wonderful|perfect|amazing|fantastic|excellent|good news|doable|"
+    r"better than i expected)|(?:that|it) (?:works|sounds (?:good|great|perfect|fair|doable))"
+    r"(?: for me)?|better than i expected)\b",
+    re.IGNORECASE,
+)
+_ANCHOR_MENTION = re.compile(r"(?<![\d,.])\$?7,?000\b(?!\s*(?:months?|students|people))")
+
+
+def _anchor_canon(sentence: str) -> str:
+    """The sentence with every spoken form of $7,000 written as "$7000"."""
+    return _SEVEN_GRAND.sub("$7000", canonical_amounts(sentence))
+
+
+def mentions_anchor_figure(sentence: str) -> bool:
+    """The sentence names the $7,000 anchor (digits, "seven thousand" or "seven grand")."""
+    return _ANCHOR_MENTION.search(_anchor_canon(sentence)) is not None
+
+
+def _anchor_taken_as_offer(sentence: str, ctx: "GuardContext") -> bool:
+    """The learner treats the $7,000 as a price the advisor offered (it only raised it itself)."""
+    canon = _anchor_canon(sentence)
+    if _ANCHOR_REACTION.search(canon) is not None or _SEVEN_CONFIRMED.search(sentence) is not None:
+        return True
+    return ctx.anchor_in_reply and _RELIEF.search(sentence) is not None
 
 LEARNER_PHASE = "roleplay"
 FEEDBACK_PHASES = frozenset({"roleplay_exit", "wrapup", "closing"})
@@ -758,6 +949,15 @@ class GuardContext:
     fresh_price: bool = False
     hollow: bool = False
     decider_asked: bool = False
+    # R1-Q final review round 1.  The tracked phrases (``r1_text.reply_phrases``) of the learner's
+    # last replies, oldest first (the spacing window of ``PHRASE_WINDOW``); whether an earlier
+    # sentence of THIS reply named the $7,000 (set by the stream guard); and whether a proposal the
+    # detectors missed may have been made (inside the close window, no commitment on record, and the
+    # advisor's turn looks like a call or time question): a MEDIUM-level acceptance then is the
+    # model answering a real proposal, which the engine honours at the farewell, not a leak.
+    recent_phrases: tuple[tuple[str, ...], ...] = ()
+    anchor_in_reply: bool = False
+    late_ask_ok: bool = False
 
     @property
     def is_learner(self) -> bool:
@@ -1141,14 +1341,22 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
     persona = ctx.persona
     if persona is not None:
         for topic in H_TOPICS:
-            if topic in ctx.released_topics:
+            # A need that was already told is told: saying it again discloses nothing (R1-Q final
+            # review round 1: the sentence about the kids was blocked at ex9 after it had been
+            # revealed at ex8, and the sentence that leaned on it was left dangling).
+            if topic in ctx.released_topics or topic in ctx.spent_topics:
                 continue
             if any(pattern.search(sentence) for pattern in persona.markers(topic)):
                 hits.append(_hit(VOLUNTEERED_NEED, topic, sentence))
                 break
     level = classify_learner_commitment(sentence)
     if level > ctx.commitment_cap:
-        hits.append(_hit(COMMITMENT, f"level_{level.name.lower()}", sentence))
+        if level is Level.MEDIUM and ctx.late_ask_ok:
+            # The model answered a proposal the detectors did not read (the advisor asked for a
+            # call in new words): the engine keeps the ask open for the farewell.  Not a leak.
+            hits.append(_hit(MISREAD, "late_ask_accepted", sentence))
+        else:
+            hits.append(_hit(COMMITMENT, f"level_{level.name.lower()}", sentence))
     if has_concession(sentence):
         hits.append(_hit(CONCESSION, "resolution_phrasing", sentence))
     question = is_question_like(sentence)
@@ -1168,16 +1376,16 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
         hits.append(_hit(REOPEN, "confirm_only", sentence))
     if _TIME_REVERSAL.search(sentence) is not None:
         hits.append(_hit(MISREAD, "time_cue_reversed", sentence))
-    if persona is not None and _DECIDES_ALONE.search(sentence) is not None:
-        hits.append(_hit(MISREAD, "decider_alone", sentence))
+    if persona is not None and len(sentence) <= MISREAD_MAX_CHARS:
+        if _DECIDES_ALONE.search(sentence) is not None:
+            hits.append(_hit(MISREAD, "decider_alone", sentence))
+        elif decider_contradiction(sentence, persona.decision_maker):
+            hits.append(_hit(MISREAD, "decider_contradicted", sentence))
     if len(sentence) <= MISREAD_MAX_CHARS:
         hits.extend(_iteration_two_misreads(sentence, ctx, question))
     if ctx.nothing_granted and _GRANT_GRATITUDE.search(sentence) is not None:
         hits.append(_hit(MISREAD, "gratitude_for_nothing", sentence))
-    if (
-        (ctx.offer_usd is None or ctx.offer_usd > 7000)
-        and _ANCHOR_REACTION.search(canonical_amounts(sentence)) is not None
-    ):
+    if (ctx.offer_usd is None or ctx.offer_usd > 7000) and _anchor_taken_as_offer(sentence, ctx):
         hits.append(_hit(MISREAD, "anchor_taken_as_offer", sentence))
     if len(sentence) <= MISREAD_MAX_CHARS and not any(hit.category == MISREAD for hit in hits):
         hits.extend(_iteration_three_misreads(sentence, ctx))  # one misreading per sentence
@@ -1345,7 +1553,7 @@ def _replacement(hits: list[Hit], ctx: GuardContext, sentence: str = "") -> str:
             return ANCHOR_REPLACEMENT
         if rule == "gratitude_for_nothing":
             return GRATITUDE_REPLACEMENT
-        if rule == "decider_alone" and ctx.persona is not None:
+        if rule in ("decider_alone", "decider_contradicted") and ctx.persona is not None:
             return ctx.persona.decider_answer
         if rule in ("heard_not_anchor", "heard_in_line"):
             return _heard_replacement(ctx)
@@ -1409,10 +1617,43 @@ class StreamGuard:
         self._questions_kept = 0  # question sentences already let through in this reply
         self._phrases_used: dict[str, int] = {}  # tracked phrases used so far in this reply
         self._last_dropped = False  # the sentence before this one was dropped
+        self._anchor_seen = False  # an earlier sentence of this reply named the $7,000
 
     def _phrase_count(self, key: str) -> int:
         """How often the tracked phrase ``key`` was used in the call so far (this reply too)."""
         return dict(self.ctx.phrase_counts).get(key, 0) + self._phrases_used.get(key, 0)
+
+    def _stall_blocked(self, key: str) -> bool:
+        """The stall phrase ``key`` is over its quota, too close to its last use, or used here."""
+        if self._phrases_used.get(key, 0) >= 1:
+            return True  # one voicing of a stall per reply
+        if self._phrase_count(key) >= PHRASE_QUOTA[key]:
+            return True
+        recent = self.ctx.recent_phrases[-PHRASE_WINDOW[key] :]
+        return any(key in phrases for phrases in recent)
+
+    def _stall_quotas(self, text: str) -> str:
+        """``text`` without the stall clauses that are over their quota ("" when nothing is left).
+
+        Only a free reply is held to it: an owed move (an intent reply) voices its reason once by
+        design, and the answer to "who else decides?" is the card's answer whenever it is asked.
+        """
+        ctx = self.ctx
+        if not ctx.free_reply:
+            return text
+        for key, pattern in _STALL_PATTERNS.items():
+            if pattern.search(text) is None:
+                continue
+            if key == PHRASE_DECIDER_STALL and ctx.decider_asked:
+                self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
+                continue
+            if self._stall_blocked(key):
+                text = _without_clauses(text, pattern)
+                if not text:
+                    return ""
+            else:
+                self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
+        return text
 
     def _drop_question(self, text: str) -> bool:
         """True when the question ``text`` must not be asked in this reply.
@@ -1486,6 +1727,21 @@ class StreamGuard:
         kind = repeat_kind(out, self.ctx.said)
         return None if kind is None else self._repeat_hit(kind, out)
 
+    def _drop_repeat(self, hit: Hit, *, blocked: bool) -> list[str]:
+        """Record the ``repeat`` hit of a dropped sentence.
+
+        ``blocked``: the model's own sentence was blocked as well (the fallback is then the
+        "thinking" line, not a back-channel).
+        """
+        self._hits.append(hit)
+        self._replaced = True
+        if blocked:
+            self._other_drops += 1
+        else:
+            self._repeat_drops += 1
+        self._last_dropped = True
+        return []
+
     def _tic_allowed(self, tic: str) -> bool:
         """A tic word may appear in at most one reply in five, and one filler per reply."""
         if self._reply_fillers >= 1:
@@ -1518,8 +1774,10 @@ class StreamGuard:
             text = self._vary_opener(text)
         if _BEFORE_I_GO.match(text) is not None:
             text = _BEFORE_I_GO.sub("", text, count=1)
-        elif _INLINE_BEFORE_I_GO.search(text) is not None:
-            text = _INLINE_BEFORE_I_GO.sub("", text)
+        elif _ASIDE_BEFORE_I_GO.search(text) is not None:
+            text = _ASIDE_BEFORE_I_GO.sub(",", text, count=1)
+        elif _TAIL_BEFORE_I_GO.search(text) is not None:
+            text = _TAIL_BEFORE_I_GO.sub("", text, count=1)
         if STRETCH_PHRASE.search(text) is not None:
             used = self._phrase_count(PHRASE_STRETCH)
             if used >= PHRASE_QUOTA[PHRASE_STRETCH]:
@@ -1534,6 +1792,13 @@ class StreamGuard:
             else:
                 key = PHRASE_CONCESSION_TAG
                 self._phrases_used[key] = self._phrases_used.get(key, 0) + 1
+        text = self._stall_quotas(text)
+        if not text:
+            # Nothing but an over-quota stall was left: dropped like a repeat, so a reply that has
+            # nothing else gets a neutral back-channel and not "I'm thinking that over".
+            self._style_edits += 1
+            self._repeat_drops += 1
+            return ""
         if text != sentence:
             text = _tidy(text)
             if text and text[0].islower():
@@ -1566,15 +1831,20 @@ class StreamGuard:
             text = text[lead.end() :]
 
     def _vary_opener(self, text: str) -> str:
-        """Take an interjection or a "That's" off a reply that opens like one of the last six."""
+        """Vary a reply that opens like one of the last six.
+
+        An interjection ("Okay,", "Oh,") is taken off.  A "That's ..." / "That helps ..." becomes
+        "It's ..." / "It helps ..." (a pronoun swap: cutting the "That" left fragments).
+        """
         recent = [past for past, _tics in self.ctx.recent_styles[-STYLE_OPENER_WINDOW:]]
-        for pattern in (_LEAD_INTERJECTION, _LEAD_DEMONSTRATIVE):
-            opener = reply_opener(text)
-            if not opener or opener not in recent:
-                break
-            match = pattern.match(text)
-            if match is not None and word_count(text[match.end() :]) >= 2:
-                text = text[match.end() :]
+        opener = reply_opener(text)
+        if not opener or opener not in recent:
+            return text
+        match = _LEAD_INTERJECTION.match(text)
+        if match is not None and word_count(text[match.end() :]) >= 2:
+            text = text[match.end() :]
+        if reply_opener(text) == "that" and "that" in recent:
+            text = _swap_that(text)
         return text
 
     def _vet(self, sentence: str) -> list[str]:
@@ -1582,7 +1852,10 @@ class StreamGuard:
             return []
         if self.ctx.is_learner:
             sentence = _unquote_figures(sentence)
-        hits = check_sentence(sentence, self.ctx)
+        ctx = replace(self.ctx, anchor_in_reply=True) if self._anchor_seen else self.ctx
+        hits = check_sentence(sentence, ctx)
+        if self.ctx.is_learner and mentions_anchor_figure(sentence):
+            self._anchor_seen = True  # also when it is swapped: the next sentence reacts to it
         out = sentence
         # The feedback refusal is the whole answer: whatever the model says after it (in the
         # owner's session, a paraphrase of the deferral line, "the hiring team will follow up")
@@ -1601,10 +1874,22 @@ class StreamGuard:
             if any(_STILL_MORE.search(said) for said in self._emitted):
                 out = ""  # "more than I planned for" is said once in a reply
         if out and not hits:
+            # A sentence the learner already said is a repeat in the words it was WRITTEN in: the
+            # style rules below change a few words ("That's" -> "It's"), and a changed copy of an
+            # earlier sentence must not slip past the repeat check as a new one.
+            written = self._repeated(out) if out not in self._emitted else None
+            if written is not None:
+                return self._drop_repeat(written, blocked=False)
             out = self._vary(out)
             if out and self._last_dropped and self.ctx.is_learner:
-                # The sentence before this one was dropped: a connector that leaned on it
-                # ("Also, how many hours ...", "And before I commit ...") goes with it.
+                if _DANGLING_REFERENCE.match(out) is not None:
+                    # The sentence before this one was dropped and this one points back at it
+                    # ("He'd probably ask about that first."): it goes with it.
+                    out = ""
+                    self._style_edits += 1
+            if out and self._last_dropped and self.ctx.is_learner:
+                # A connector that leaned on the dropped sentence ("Also, how many hours ...",
+                # "And before I commit ...") goes with it.
                 stripped = _LEAD_CONNECTOR.sub("", out, count=1)
                 if stripped != out and word_count(stripped) >= 2:
                     out = stripped[0].upper() + stripped[1:]
@@ -1612,14 +1897,7 @@ class StreamGuard:
         if out and out not in self._emitted:
             repeated = self._repeated(out)
             if repeated is not None:
-                self._hits.append(repeated)
-                self._replaced = True
-                if hits:
-                    self._other_drops += 1  # the model's own sentence was blocked as well
-                else:
-                    self._repeat_drops += 1
-                self._last_dropped = True
-                return []
+                return self._drop_repeat(repeated, blocked=bool(hits))
         if not out or out in self._emitted:
             if hits and all(hit.rule == "closer_again" for hit in hits):
                 self._repeat_drops += 1  # a second goodbye is a repeat: a back-channel replaces it
@@ -1704,6 +1982,45 @@ def _filler_gap(match: re.Match[str]) -> str:
     if not following or following[0] in ".?!,;:-)":
         return ""
     return "," if match.group(0).lstrip().startswith(",") else " "
+
+
+# A sentence about "he" or "she" that follows a dropped sentence points back at it.
+_DANGLING_REFERENCE = re.compile(
+    r"^\W*(?:he|she|they)(?:'d|'ll|'s|'re| would| will| is| was| has| had| might| probably)\b",
+    re.IGNORECASE,
+)
+_CLAUSE_SPLIT = re.compile(r"\s*[,;]\s*|\s+-+\s+")
+
+
+def _swap_that(text: str) -> str:
+    """"That's a lot" -> "It's a lot", "That helps" -> "It helps"; other openers are unchanged."""
+    match = _THAT_IS.match(text)
+    if match is not None:
+        return "It" + match.group("verb") + " " + text[match.end() :]
+    match = _THAT_VERB.match(text)
+    if match is not None:
+        return "It " + text[match.end() :]
+    return text
+
+
+def _without_clauses(text: str, pattern: re.Pattern[str]) -> str:
+    """``text`` without the comma-separated clauses that match ``pattern`` ("" if little is left).
+
+    "That helps, but it's still more than I planned for." keeps "That helps."; a sentence whose
+    only substance was the clause (fewer than three words left) is dropped whole.
+    """
+    stripped = text.rstrip()
+    end = stripped[-1:] if stripped[-1:] in (".", "?", "!") else "."
+    body = stripped.rstrip(".?!")
+    kept = [part for part in _CLAUSE_SPLIT.split(body) if part.strip()]
+    kept = [part for part in kept if pattern.search(part) is None]
+    if not kept:
+        return ""
+    out = ", ".join(kept)
+    out = re.sub(r"^(?:but|though|although|and|so|yet|because)\s+", "", out, flags=re.IGNORECASE)
+    if word_count(out) < 3:
+        return ""
+    return out[0].upper() + out[1:] + end
 
 
 def _strip_concession_tag(text: str) -> str:

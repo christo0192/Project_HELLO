@@ -181,6 +181,25 @@ describe('masking', () => {
     }
   });
 
+  it('masks the cuts of the scripted wordings that a barge-in persists', () => {
+    for (const cut of [
+      "Daytime is tough for me, so let's book a",
+      "Daytime is tough for me,",
+      "Let me think about it. Call me back after I've talked to",
+      "Let me think about it. Call me back after",
+      "Let me think about it. I'll read through the email and",
+      "Let me think about it. I'll read through the email",
+      'Let me think about it. Just email me the details and',
+      'Let me think about it. Just email me the details',
+      "Okay, let's do it. Send me the enrolment",
+      "Okay, let's do it. Send me the enrolment link and I'll pay the deposit",
+    ]) {
+      const masked = maskCommitmentLines(cut);
+      expect(masked, cut).toContain(R1_COMMITMENT_MASK);
+      expect(masked, cut).not.toMatch(/daytime is tough|call me back|read through|email me the details|enrolment|pay the deposit/i);
+    }
+  });
+
   it('does not mask an ordinary mention of reading an email', () => {
     for (const text of [
       'Did you read through the email I sent?',

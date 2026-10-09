@@ -965,5 +965,28 @@ class IterationTwoNotesTests(unittest.TestCase):
         self.assertNotIn("ask them one real question you still have", CHECKIN_NOTE)
 
 
+class FinalReviewRoundOnePromptTests(unittest.TestCase):
+    """R1-Q final review round 1: the prefix and the style notes ask for variety and one decider."""
+
+    PERSONA = resolve_persona("p1_career_switcher", variant="v1")
+
+    def test_the_prefix_asks_for_varied_openers_and_a_single_decider(self):
+        prefix = learner_prefix(self.PERSONA)
+        self.assertIn("Do not open reply after reply with", prefix)
+        self.assertIn("That's", prefix)
+        self.assertIn("only the person on your card has a say", prefix)
+        self.assertIn("never say that the decision is yours alone", prefix)
+
+    def test_a_rotating_style_note_steers_the_model_off_that(self):
+        from r1_prompts import STYLE_NOTES
+
+        notes = [note for note in STYLE_NOTES if "That" in note]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("Do not start with", notes[0])
+        self.assertGreaterEqual(len(STYLE_NOTES), 8)
+        for note in STYLE_NOTES:
+            note.encode("ascii")
+
+
 if __name__ == "__main__":
     unittest.main()

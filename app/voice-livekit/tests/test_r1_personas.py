@@ -708,5 +708,54 @@ class IterationThreeProbeTests(unittest.TestCase):
         self.assertTrue(asks_about_learner("What worries you most about the schedule?"))
 
 
+class FinalReviewRoundOneProbeTests(unittest.TestCase):
+    """R1-Q final review round 1: open digs and proposed calls."""
+
+    def test_an_open_question_digs_without_naming_a_topic(self):
+        from r1_personas import asks_open_question, detect_probes
+
+        for text in (
+            "What would help you two decide?",
+            "What would make it feel right?",
+            "What do you need to feel comfortable with this?",
+            "What's on your mind?",
+            "How does that sit with you?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(asks_open_question(text), text)
+                self.assertEqual(detect_probes(text), frozenset(), text)
+
+    def test_a_check_in_an_offer_a_choice_and_a_proposed_call_are_not_open_digs(self):
+        from r1_personas import asks_about_learner, asks_open_question
+
+        for text in (
+            "What do you think?",
+            "Would it help if I sent the syllabus?",
+            "Which plan would you like?",
+            "Does that sound good?",
+            "Would a quick call on Thursday help you decide?",
+            "How did you hear about us?",
+            "The course is six months.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(asks_open_question(text), text)
+        self.assertTrue(asks_about_learner("What would help you two decide?"))
+
+    def test_a_proposed_call_is_no_probe_and_no_dig_even_when_it_names_the_family(self):
+        from r1_personas import asks_about_learner, detect_probes
+
+        for text in (
+            "Would your husband join a short call on Thursday?",
+            "Can we get your husband on a call this weekend?",
+            "Could your partner and I have a quick word on Saturday?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(detect_probes(text), frozenset(), text)
+                self.assertFalse(asks_about_learner(text), text)
+        # a real question about the people in the decision is still one
+        self.assertEqual(detect_probes("Is your husband involved in the decision?"), frozenset({"H3"}))
+        self.assertTrue(asks_about_learner("Is he more of a sounding board, or does he need convincing?"))
+
+
 if __name__ == "__main__":
     unittest.main()

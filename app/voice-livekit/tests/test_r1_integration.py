@@ -78,7 +78,15 @@ from tests.test_r1_core import (
     setUpModule,  # noqa: F401 - unittest runs it: silences the loggers' stdout
     tearDownModule,  # noqa: F401
 )
-from tests.test_r1_roleplay import ASK, FOLLOWUP, H1_PROBE, OPENER, PITCH, cooperative_script
+from tests.test_r1_roleplay import (
+    ASK,
+    FOLLOWUP,
+    H1_PROBE,
+    OPENER,
+    PITCH,
+    cooperative_script,
+    strong_script,
+)
 from tests.test_r1_linecache import FakeSynthesizer, FakeTime, RateLimited, clip
 
 P1_CONTEXT = {
@@ -355,10 +363,12 @@ def owed_lines(decision_maker: str) -> dict[str, tuple[str, ...]]:
     }
 
 
-async def cooperative_conversation(rig: Rig, extra: tuple[str, ...] = ()) -> list[str | None]:
+async def cooperative_conversation(
+    rig: Rig, extra: tuple[str, ...] = (), script: list[str] | None = None
+) -> list[str | None]:
     """Replay the cooperative advisor script (turns 50 s apart) and return what was spoken."""
     spoken: list[str | None] = []
-    for index, text in enumerate((*cooperative_script(), *extra)):
+    for index, text in enumerate((*(script or cooperative_script()), *extra)):
         spoken.append(await rig.converse(text, advance=20 if index == 0 else 50))
     return spoken
 
@@ -1338,7 +1348,7 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
     async def test_an_ask_in_the_window_gets_the_graded_line_verbatim(self) -> None:
         rig = Rig(judge=judge_returning(GOOD_JUDGE))
         await rig.start_roleplay()
-        await cooperative_conversation(rig)
+        await cooperative_conversation(rig, script=strong_script())  # the decider stall is answered
         calls = len(rig.provider.calls)
         spoken = await rig.converse(ASK, advance=50)
         plan = rig.plan()

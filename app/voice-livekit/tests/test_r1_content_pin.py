@@ -28,6 +28,7 @@ import r1_prompts
 import r1_scheduler
 import r1_script
 import r1_text
+import r1_tracker
 import r1_world
 
 # Revision 2: the icebreaker's interviewer note (the model may not start or announce the role-play).
@@ -76,7 +77,14 @@ import r1_world
 # concession tag (PHRASE_QUOTA), the hollow-advisor note (HOLLOW_NOTE, HOLLOW_MAX_WORDS), the H3
 # first-probe reminder (answer only the part that was asked) and three wordings of the time cue
 # (TIME_CUE_BRIEF_ALTERNATIVES).
-PINNED_CONTENT_SHA256 = "7eb073a7e79bea06164d991c9358aa04b66fcc4b2abda8d923985cf7c5e20059"
+# Revision 13 (R1-Q final review round 1): a repeated "That's" is swapped for "It's" (prefix and a
+# rotating style note ask for varied openers), one decider only (the prefix: nobody else has a say,
+# the decision is never the learner's alone), a quota and a spacing window for the decider stall, the
+# "get back to you" closer and the "still more than I planned for" line (PHRASE_QUOTA, PHRASE_WINDOW),
+# the STRONG line names no plan, persona-neutral scripted time cues (and wrap-up markers), a deep layer
+# given back when its reply missed it (MAX_DEEP_MISSES) and a wait window for STRONG
+# (WAIT_RECENT_TURNS).
+PINNED_CONTENT_SHA256 = "fe2d60226219d34136db9dca2aacf1b59308c56009a10299951021486f0408d0"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -809,6 +817,72 @@ class WorkerCoreDriftTests(unittest.TestCase):
         for first_name in ("Arjun", "Mary-Ann", "Bo"):
             self.assertEqual(self.lines.known_first_name(first_name), first_name)
             self.assertEqual(r1_script.known_first_name(first_name), first_name)
+
+
+class FinalReviewRoundOnePinTests(unittest.TestCase):
+    """R1-Q final review round 1 (content revision 13): the new texts and constants are pinned."""
+
+    def test_the_manifest_covers_the_final_review_round_one_texts_and_constants(self):
+        manifest = r1_content.manifest()
+        self.assertGreaterEqual(manifest["revision"], 13)
+        self.assertEqual(
+            manifest["guard"]["style"]["phrase_window"], dict(r1_guard.PHRASE_WINDOW)
+        )
+        for phrase in (r1_text.PHRASE_DECIDER_STALL, r1_text.PHRASE_STALL_CLOSER,
+                       r1_text.PHRASE_MONEY_STRAIN):
+            self.assertIn(phrase, manifest["guard"]["style"]["phrase_quota"])
+            self.assertIn(phrase, manifest["guard"]["style"]["phrase_window"])
+        self.assertEqual(
+            manifest["negotiation"]["constants"]["wait_recent_turns"],
+            r1_negotiation.WAIT_RECENT_TURNS,
+        )
+        self.assertEqual(
+            manifest["tracker"],
+            {
+                "max_deep_offers": r1_tracker.MAX_DEEP_OFFERS,
+                "max_deep_misses": r1_tracker.MAX_DEEP_MISSES,
+            },
+        )
+        self.assertNotIn("for that plan", manifest["commitment"]["lines"]["STRONG"])
+        prefixes = manifest["prompts"]["learner_prefixes"]
+        self.assertTrue(all("only the person on your card has a say" in p for p in prefixes.values()))
+        self.assertTrue(any("That" in note for note in manifest["prompts"]["style_notes"]))
+        cue = next(m for m in manifest["scheduler"]["moves"] if m["id"] == "L-TIME-CUE")
+        self.assertFalse(any("another call" in variant for variant in cue["variants"][1:]))
+
+    def test_editing_a_final_review_text_or_constant_changes_the_sha(self):
+        base = r1_content.content_sha256()
+        edits = (
+            (r1_negotiation, "WAIT_RECENT_TURNS", r1_negotiation.WAIT_RECENT_TURNS + 1),
+            (r1_tracker, "MAX_DEEP_MISSES", r1_tracker.MAX_DEEP_MISSES + 1),
+            (
+                r1_prompts,
+                "STYLE_NOTES",
+                r1_prompts.STYLE_NOTES + ("- Start with a number this time.",),
+            ),
+        )
+        for module, name, value in edits:
+            original = getattr(module, name)
+            try:
+                setattr(module, name, value)
+                self.assertNotEqual(r1_content.content_sha256(), base, name)
+            finally:
+                setattr(module, name, original)
+        for table in (r1_guard.PHRASE_WINDOW, r1_guard.PHRASE_QUOTA):
+            original_table = dict(table)
+            try:
+                table[r1_text.PHRASE_DECIDER_STALL] += 1
+                self.assertNotEqual(r1_content.content_sha256(), base, "decider stall quota/window")
+            finally:
+                table.clear()
+                table.update(original_table)
+        line = r1_commitment.COMMITMENT_LINES[r1_commitment.Level.STRONG]
+        try:
+            r1_commitment.COMMITMENT_LINES[r1_commitment.Level.STRONG] = line + " "
+            self.assertNotEqual(r1_content.content_sha256(), base, "STRONG line")
+        finally:
+            r1_commitment.COMMITMENT_LINES[r1_commitment.Level.STRONG] = line
+        self.assertEqual(r1_content.content_sha256(), base)
 
 
 if __name__ == "__main__":

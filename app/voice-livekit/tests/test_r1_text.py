@@ -567,5 +567,60 @@ class IterationThreeTextTests(unittest.TestCase):
                 self.assertFalse(is_hollow_turn(text), text)
 
 
+class FinalReviewRoundOnePhraseTests(unittest.TestCase):
+    """R1-Q final review round 1: the stall loop's tracked phrases."""
+
+    def test_the_decider_stall_the_closer_and_the_money_line_are_tracked(self):
+        from r1_text import (
+            PHRASE_DECIDER_STALL,
+            PHRASE_MONEY_STRAIN,
+            PHRASE_STALL_CLOSER,
+            reply_phrases,
+        )
+
+        cases = {
+            PHRASE_DECIDER_STALL: (
+                "I'd want to talk it through with my father first.",
+                "Let me run it by my husband before I decide.",
+                "I should check with him before I say yes.",
+                "I'd go over it with my partner.",
+            ),
+            PHRASE_STALL_CLOSER: (
+                "I'll get back to you.",
+                "Let me think about it.",
+                "I'll let you know.",
+                "I'll be in touch.",
+            ),
+            PHRASE_MONEY_STRAIN: (
+                "It's still more than I planned for.",
+                "I'm still worried about the cost.",
+                "That's still a lot for me.",
+                "It was more than I had planned for.",
+            ),
+        }
+        for phrase, texts in cases.items():
+            for text in texts:
+                with self.subTest(text=text):
+                    self.assertIn(phrase, reply_phrases(text))
+        for text in (
+            "My husband is great, by the way.",
+            "The course is six months.",
+            "How much does it cost?",
+            "I think I follow.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(reply_phrases(text), ())
+
+    def test_the_quotas_and_windows_are_declared_for_every_tracked_stall(self):
+        import r1_guard
+        from r1_text import PHRASE_DECIDER_STALL, PHRASE_MONEY_STRAIN, PHRASE_STALL_CLOSER
+
+        for phrase in (PHRASE_DECIDER_STALL, PHRASE_STALL_CLOSER, PHRASE_MONEY_STRAIN):
+            self.assertIn(phrase, r1_guard.PHRASE_QUOTA)
+            self.assertIn(phrase, r1_guard.PHRASE_WINDOW)
+            self.assertGreaterEqual(r1_guard.PHRASE_QUOTA[phrase], 1)
+            self.assertGreaterEqual(r1_guard.PHRASE_WINDOW[phrase], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -79,6 +79,7 @@ transcript in ROLEPLAY, with ``r_sec`` read from the phase machine's role-play c
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Iterable
@@ -94,6 +95,7 @@ from r1_commitment import (
     commitment_line,
     detect_ask,
     grade,
+    looks_like_proposal,
 )
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
 from r1_guard import (
@@ -116,6 +118,7 @@ from r1_negotiation import (
     N_EMAIL,
     N_EMAIL_YES,
     N_QUESTION,
+    N_TIMING,
     REASON_DECISION_MAKER,
     REASON_MONEY,
     REASON_TIMING,
@@ -390,6 +393,13 @@ class RolePlayEngine:
         self._last_reply_closer = False
         self._decider_asked_now = False
         self._dig_deferred_topics: set[str] = set()
+        # R1-Q final review round 1.  The tracked phrases of each reply (the guard's spacing window
+        # for the stall phrases), whether the advisor's turn may hold a proposal the detectors
+        # missed inside the close window (``late_ask_ok``), and how many such late asks the model
+        # accepted (the farewell answers them like any open proposal).
+        self._phrase_history: list[tuple[str, ...]] = []
+        self._late_ask_ok = False
+        self._late_asks = 0
 
     # ------------------------------------------------------------------- properties
     @property
@@ -481,6 +491,8 @@ class RolePlayEngine:
             fresh_price=self._fresh_price,
             hollow=self._hollow_run >= 1 and self._last_reply_closer,
             decider_asked=self._decider_asked_now,
+            recent_phrases=tuple(self._phrase_history[-STYLE_HISTORY:]),
+            late_ask_ok=self._late_ask_ok and free_reply and phase == "roleplay",
         )
 
     def filler_text(self) -> str:
@@ -531,7 +543,7 @@ class RolePlayEngine:
         self._decider_asked_now = False
         signals = self.scheduler.observe_candidate_turn(candidate_text, r_sec)
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
-        self._advisor_amounts.update(dollar_amounts(candidate_text))
+        self._advisor_amounts.update(advisor_amounts_in(candidate_text))
         self._advisor_hours.update(hours_said(candidate_text))
         if MONTHLY_FIGURE.search(canonical_amounts(candidate_text)) is not None:
             self._monthly_stated = True
@@ -550,6 +562,16 @@ class RolePlayEngine:
         if wants is None and negotiated.callback is not None and not early:
             wants = AskKind.CALL  # a concrete callback or time proposal is a call ask
         self._call_ask_now = wants is AskKind.CALL
+        # A turn the detectors read as no ask, inside the close window with nothing on record, that
+        # still looks like a call or time proposal: if the model answers it with an acceptance, that
+        # is a late ask for the farewell to answer, not a commitment leak (see ``r1_guard``).
+        self._late_ask_ok = (
+            wants is None
+            and not early
+            and not (self.negotiation.resolved or self.commitment_resolved)
+            and self.scheduler.commit_permitted(r_sec)
+            and looks_like_proposal(candidate_text)
+        )
         reasons: list[str] = []
         if obs.injection:
             reasons.append("injection_phrase_flagged")
@@ -619,6 +641,15 @@ class RolePlayEngine:
         if move is not None:
             if reveal_due and self._may_defer(move, r_sec):
                 reasons.append("owed_deferred_for_reveal")
+            elif (
+                move.id in (F1_ANCHOR, F1_COUNTER)
+                and wants is not None
+                and self._may_defer(move, r_sec)
+            ):
+                # The advisor proposed a call or a time: that is answered first, and the price
+                # reaction waits one turn unless its deadline forces it (R1-Q final review round 1:
+                # "That's even below the $7,000 ..." answered "Does seven tomorrow work?").
+                reasons.append("owed_deferred_for_ask")
             elif (
                 move.id not in self._dig_deferred
                 and self._dig_key(candidate_text) not in self._dig_deferred_topics
@@ -850,6 +881,12 @@ class RolePlayEngine:
         }
         if wants is not None:
             self._asks.append({"turn": self.turn, "kind": wants.value})
+            # A call or enrolment ask is answered with a stall reason, a question or the commitment
+            # line, not with a need (R1-Q final review round 1: the H3 deep layer was told in reply
+            # to "Would your husband join a short call?").  The layers are not given, so the need
+            # stays released and is offered on the next turn that digs for it.
+            layers["first_probes"] = ()
+            layers["reveal_topics"] = ()
         if negotiation.resolved or self.commitment_resolved:
             if wants is not None or seen.email_offer or seen.checkin:
                 reasons.append("commitment_on_record")
@@ -879,6 +916,14 @@ class RolePlayEngine:
                 reasons.append("advisor_pressured")  # an invented offer or a coercive deadline
             if evidence.thin:
                 reasons.append("advisor_thin")  # answers in a handful of words, all call
+            if level is Level.STRONG:
+                # The learner's own words come first (R1-Q final review round 1): it said it has
+                # a decision maker to consult that the advisor did not answer, it will wait, or it
+                # turned a call down.  It books a call at most, and a declined call is no booking.
+                blocked = negotiation.strong_blocked(self.turn)
+                if blocked is not None:
+                    level = Level.MEDIUM
+                    reasons.append(f"strong_blocked:{blocked}")
             if level is Level.MEDIUM and negotiation.call_declined():
                 # The learner turned a call or a time down in so many words ("I'd rather reach out
                 # myself", "I'd rather not lock in a time yet"): it does not book one now.  In the
@@ -1152,6 +1197,13 @@ class RolePlayEngine:
             briefs = (move.brief, *TIME_CUE_BRIEF_ALTERNATIVES)
             move = replace(move, brief=pick_variant(briefs, self.seed, 0))
         variants = move.variants or (move.text,)
+        if move.id == TIME_CUE:
+            # The scripted cue never puts the learner on another call when a variant without it
+            # exists ("before my next call" was said by a learner who had just got home).
+            neutral = tuple(
+                text for text in variants if "next call" not in text and "another call" not in text
+            )
+            variants = neutral or variants
         fallbacks = self._fallback_order(
             move.id, variants, REDIRECT_OPENERS if redirect else ()
         )
@@ -1388,6 +1440,16 @@ class RolePlayEngine:
         self.ledger.record(result)
         if result.fallback_used:
             self._fallbacks += 1  # the next fallback starts at the next variant
+        if (
+            any(hit.rule == "late_ask_accepted" for hit in result.hits)
+            and not (self.negotiation.resolved or self.commitment_resolved)
+            and not self.negotiation.call_declined()
+        ):
+            # The model took a proposal the detectors missed as a call it would book: the ask stays
+            # open for the farewell (``pending_ask_at_farewell``), graded like any other.
+            self._late_asks += 1
+            if self._pending_ask is None:
+                self._pending_ask = AskKind.CALL
 
     def record_spoken(
         self,
@@ -1407,10 +1469,16 @@ class RolePlayEngine:
             self._styles.append((reply_opener(spoken_text), reply_tics(spoken_text)))
             self._asked.append("?" in spoken_text)
             self._last_reply_closer = is_closer(spoken_text)
-            for key in reply_phrases(spoken_text):
+            phrases = reply_phrases(spoken_text)
+            self._phrase_history.append(phrases)
+            for key in phrases:
                 self._phrases[key] = self._phrases.get(key, 0) + 1
         self.tracker.note_learner_text(spoken_text, plan.turn)
-        self.negotiation.note_learner_text(spoken_text, plan.turn)
+        self.negotiation.note_learner_text(
+            spoken_text,
+            plan.turn,
+            stall=plan.move_id == F4_PRIMARY or plan.negotiation_id == N_TIMING,
+        )
         if self._pending_ask is not None and declines_call(spoken_text):
             # The learner turned the proposed call down in its own words ("I'd rather keep it to
             # email", "I'd rather reach out myself", "I'd rather you didn't"): a farewell inside the
@@ -1553,6 +1621,7 @@ class RolePlayEngine:
             "commitment": {
                 "asks": list(self._asks),
                 "stalls_before_window": self._stalls,
+                "late_asks": self._late_asks,
                 "level": None if self._commitment_level is None else self._commitment_level.name,
                 "turn": self._commitment_turn,
                 "resolved": self.commitment_resolved,
@@ -1605,6 +1674,28 @@ class RolePlayEngine:
             "exclusion_reasons": schedule["exclusion_reasons"],
             "fidelity": fidelity,
         }
+
+
+# "it works out to 200 a month" / "about 150 per month": a bare number next to a monthly cue.
+_BARE_MONTHLY = re.compile(
+    r"(?<![\d$,.])(\d{2,4})(?:\s*(?:dollars|usd|bucks))?\s*(?:a|per|each|every|/)\s*month\b",
+    re.IGNORECASE,
+)
+
+
+def advisor_amounts_in(text: object) -> set[int]:
+    """The whole-dollar amounts the advisor's ``text`` names, however they are written.
+
+    The learner may repeat any of them.  Spoken amounts ("two hundred a month", "fifteen hundred
+    dollars a month") and a bare number beside "a month" count as well as "$N" (R1-Q final review
+    round 1: the guard read the learner's "two hundred a month" in canonical form but only the
+    advisor's digits with a dollar sign, so repeating the advisor's own figure was an "invented"
+    amount and cost the learner its reply).
+    """
+    folded = canonical_amounts(text)
+    amounts = set(dollar_amounts(folded))
+    amounts.update(int(match.group(1)) for match in _BARE_MONTHLY.finditer(folded))
+    return amounts
 
 
 def _without_questions(text: str) -> str:

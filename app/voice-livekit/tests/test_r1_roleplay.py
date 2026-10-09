@@ -55,6 +55,10 @@ LEVER = "We have limited enrollment spots and an application deadline coming up.
 ASK = "Would you like to move forward? Shall I send you the enrolment link?"
 CALL_ASK = "Would a quick follow-up call on Thursday work for you?"
 GOOD_JUDGE = {"family_handled_quality": {"F1": 1, "F2": 1, "F3": 2, "F4": 1}}
+# R1-Q final review round 1: a STRONG commitment needs the learner's "I must talk to my husband
+# first" answered by the advisor (the decider stall is resolved), so the thorough advisors of the
+# STRONG tests end their script with this (``strong_script``).
+HANDLE_DECIDER = "Your husband is welcome to be involved, we are happy to include him in every step."
 
 
 def engine(persona=P1, name="Arjun", seed="sess-1") -> RolePlayEngine:
@@ -114,11 +118,16 @@ def cooperative_script():
     ]
 
 
-def run_cooperative(period=50.0, eng=None, ask_at=None):
+def strong_script():
+    """The cooperative script whose last turn also answers the learner's decider stall."""
+    return [*cooperative_script()[:-1], HANDLE_DECIDER]
+
+
+def run_cooperative(period=50.0, eng=None, ask_at=None, script=None):
     eng = eng or engine()
     session = Session(eng)
     r = 20.0
-    for index, text in enumerate(cooperative_script()):
+    for index, text in enumerate(script or cooperative_script()):
         session.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
         r += period
     return session, r
@@ -145,7 +154,8 @@ class PlanModeTests(unittest.TestCase):
         self.assertEqual(s.eng.tracker.gate.offers_view()["H1"]["hint_turn"], 1)
 
     def test_the_follow_up_releases_the_deep_need_as_facts_into_that_turns_reminder(self):
-        s = Session(engine())
+        # The reply tells the need ("plant ... consolidated"), so the offer is spent.
+        s = Session(engine(), reply="My plant is being consolidated next year, honestly.")
         s.say(H1_PROBE, 20)
         plan = s.say(FOLLOWUP, 60)
         self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
@@ -550,7 +560,7 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
 
     def test_a_forced_owed_move_is_not_deferred_and_carries_the_due_reveal(self):
         eng = engine()
-        s = Session(eng)
+        s = Session(eng, ack="I have two kids, so it would be evenings and weekends only.")
         s.say(OPENER, 20)
         s.say(H3_PROBE, 40)
         plan = s.say("And would anyone else be involved in the decision?", 270)
@@ -847,7 +857,7 @@ class AskTests(unittest.TestCase):
         self.assertNotIn("10", s.spoken[-1])
 
     def test_an_ask_inside_the_window_gets_the_graded_line_and_resolves(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(50.0, script=strong_script())
         eng = session.eng
         eng.apply_judge(GOOD_JUDGE, eng.turn)
         self.assertTrue(eng.scheduler.commit_permitted(r))
@@ -1819,7 +1829,7 @@ class TimeAndCueTests(unittest.TestCase):
 
 class FullRunTests(unittest.TestCase):
     def test_a_cooperative_candidate_gets_every_family_and_passes_fidelity(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(50.0, script=strong_script())
         eng = session.eng
         eng.apply_judge(GOOD_JUDGE, eng.turn)
         session.say(ASK, r)
@@ -3356,15 +3366,17 @@ class NeedsComeOnlyOnTheTurnThatAsksTests(unittest.TestCase):
         self.assertEqual(later.guard_ctx.released_topics, frozenset())
         self.assertEqual(later.guard_ctx.spent_topics, frozenset({"H1"}))
 
-    def test_a_later_unprompted_repeat_of_the_deep_need_is_dropped_not_swapped(self):
+    def test_a_later_repeat_of_a_told_need_is_a_repeat_not_a_volunteered_need(self):
+        # R1-Q final review round 1: a need that was already told is no secret any more.  Saying it
+        # again is not blocked as a volunteered need (that left dangling sentences behind); the
+        # repeat guard drops the sentence when it is the same one again.
         s, _follow = self.released_engine(self.RELEASED)
         before = s.eng.ledger.counts.get("volunteered_need", 0)
         s.reply = "Okay. My plant is being consolidated next year, so I worry."
         s.say(NEUTRAL, 100)
         spoken = s.spoken[-1].lower()
-        self.assertNotIn("plant", spoken)
-        self.assertNotIn(P1.surface("H1").lower(), spoken)  # not swapped for the surface answer
-        self.assertEqual(s.eng.ledger.counts.get("volunteered_need", 0), before + 1)
+        self.assertNotIn(P1.surface("H1").lower(), spoken)  # never swapped for the surface answer
+        self.assertEqual(s.eng.ledger.counts.get("volunteered_need", 0), before)
 
     def test_before_the_follow_up_the_surface_answer_still_replaces_a_dump(self):
         s = Session(engine(), reply=self.RELEASED)
@@ -4031,6 +4043,235 @@ class IterationThreeEngineTests(unittest.TestCase):
         s.say(NEUTRAL, 60)
         self.assertNotIn("before I go", s.spoken[-1].lower())
         self.assertIn("What would I actually build", s.spoken[-1])
+
+
+class FinalReviewRoundOneEngineTests(unittest.TestCase):
+    """R1-Q final review round 1, through the engine: the STRONG gate, late asks, the deep layers."""
+
+    # --- major: STRONG does not contradict the learner's own words
+    def strong_session(self, last_reply=None):
+        """The thorough advisor's call; ``last_reply`` is what the learner says to its last turn."""
+        eng = engine()
+        session = Session(eng)
+        script = strong_script()
+        r = 20.0
+        for index, text in enumerate(script):
+            if last_reply is not None and index == len(script) - 1:
+                session.reply = last_reply
+            session.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
+            r += 50.0
+        eng.apply_judge(GOOD_JUDGE, eng.turn)
+        return session, r
+
+    def window_session(self):
+        """A cooperative call stopped at 12:20 (inside the close window, before the 13:00 stall)."""
+        session, r = run_cooperative(45.0)
+        session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+        self.assertTrue(session.eng.scheduler.commit_permitted(r))
+        return session, r
+
+    def test_an_advisor_who_never_answered_the_decider_stall_cannot_earn_strong(self):
+        session, r = run_cooperative(50.0)
+        session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
+        plan = session.say(ASK, r)
+        self.assertEqual(plan.commitment_level, Level.MEDIUM)
+        self.assertIn("strong_blocked:decider_unresolved", plan.reasons)
+        # the MEDIUM line books a call WITH the husband: it never pays a deposit
+        self.assertNotIn("deposit", plan.scripted_text)
+
+    def test_a_learner_who_said_it_will_wait_is_not_asked_to_pay_the_deposit(self):
+        session, r = self.strong_session("Honestly, waiting feels more realistic for me right now.")
+        plan = session.say(ASK, r)
+        self.assertEqual(plan.commitment_level, Level.MEDIUM)
+        self.assertIn("strong_blocked:learner_waiting", plan.reasons)
+        self.assertNotIn("deposit", plan.scripted_text)
+
+    def test_a_declined_call_ends_in_the_weak_line_not_in_a_payment(self):
+        session, r = self.strong_session("I'd rather reach out myself, thanks.")
+        plan = session.say(ASK, r)
+        # STRONG -> MEDIUM -> WEAK: a declined call books nothing.  The learner may first voice a
+        # stall reason it has left (an intent), but it never says the deposit line.
+        self.assertIn(plan.commitment_level, (None, Level.WEAK))
+        self.assertIn("strong_blocked:call_declined", plan.reasons)
+        self.assertIn("call_declined", plan.reasons)
+        self.assertNotIn("deposit", plan.scripted_text)
+        self.assertNotIn("book a call", plan.scripted_text)
+
+    def test_the_thorough_advisor_who_answered_the_decider_still_earns_strong(self):
+        session, r = self.strong_session()
+        plan = session.say(ASK, r)
+        self.assertEqual(plan.commitment_level, Level.STRONG)
+        self.assertNotIn("strong_blocked", ",".join(plan.reasons))
+
+    def test_the_decider_who_comes_back_after_the_answer_blocks_strong_again(self):
+        session, r = self.strong_session()
+        # the learner comes back to its husband after the advisor answered (a free reply would be
+        # trimmed by the stall quota, so the words are fed to the memory the way record_spoken does)
+        session.eng.negotiation.note_learner_text(
+            "I'd still want to talk it over with my husband first.", session.eng.turn
+        )
+        plan = session.say(ASK, r)
+        self.assertEqual(plan.commitment_level, Level.MEDIUM)
+        self.assertIn("strong_blocked:decider_unresolved", plan.reasons)
+
+    # --- major: a proposal the detectors missed is the model's to accept, the farewell's to answer
+    MISSED = "Let me book fifteen minutes with you and your partner on Friday."
+
+    def test_the_missed_proposal_really_is_one_the_detectors_miss(self):
+        from r1_commitment import detect_ask, looks_like_proposal
+
+        # If the grammar learns this phrasing, pick another held-out miss: the point of the tests
+        # below is a proposal the detectors cannot read.
+        self.assertIsNone(detect_ask(self.MISSED), "the grammar now reads it: choose another phrasing")
+        self.assertTrue(looks_like_proposal(self.MISSED))
+
+    def test_a_model_acceptance_of_a_missed_proposal_is_no_leak_and_the_farewell_answers_it(self):
+        session, r = self.window_session()
+        eng = session.eng
+        session.reply = "Sure, Friday works for us, let's do that."
+        plan = session.say(self.MISSED, r)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertTrue(plan.guard_ctx.late_ask_ok)
+        self.assertEqual(eng.ledger.leak_total, 0)
+        self.assertEqual(eng.ledger.counts.get("misread", 0), 1)
+        self.assertEqual(eng.admin_log()["commitment"]["late_asks"], 1)
+        self.assertNotIn("Friday works", session.spoken[-1])
+        farewell = session.say("Wonderful, thanks for your time today. Take care, bye!", r + 40)
+        self.assertIn("pending_ask_at_farewell", farewell.reasons)
+        self.assertIn(farewell.commitment_level, (Level.MEDIUM, Level.STRONG))
+
+    def test_an_acceptance_without_any_proposal_is_still_a_leak(self):
+        session, r = self.window_session()
+        session.reply = "Sure, Friday works for us, let's do that."
+        plan = session.say("The capstone pulls everything together.", r)
+        self.assertFalse(plan.guard_ctx.late_ask_ok)
+        self.assertGreaterEqual(session.eng.ledger.leak_total, 1)
+
+    def test_before_the_close_window_a_missed_proposal_is_not_a_late_ask(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        plan = s.say(self.MISSED, 120)
+        self.assertFalse(plan.guard_ctx.late_ask_ok)
+
+    # --- the price reaction waits one turn behind a proposed call unless its deadline forces it
+    def test_the_anchor_waits_a_turn_behind_a_proposed_call(self):
+        s = Session(engine())
+        r = 20.0
+        for index, text in enumerate(cooperative_script()[:14]):
+            s.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
+            r += 30.0
+        negotiation = s.eng.negotiation
+        negotiation.voiced.update({"timing": 1, "money": 1, "decision_maker": 1})
+        negotiation.question_used = True  # every stall reason is spent: only the owed move is left
+        ask = s.say("Let's pick this up again Thursday evening, does that work?", r)
+        self.assertIsNone(ask.move_id)
+        self.assertIn("owed_deferred_for_ask", ask.reasons)
+        after = s.say("Our mentors support you through the capstone.", r + 30)
+        self.assertEqual(after.move_id, "F1-ANCHOR")
+
+    # --- owner point 5: a released deep layer reaches the learner, on the turn that digs for it
+    H3_KIDS = "I have two kids, so it would be evenings and weekends only."
+
+    def judged_h3(self, reply):
+        """H3 released by the shadow judge alone (the advisor's words never matched a rule)."""
+        s = Session(engine(), reply=reply)
+        s.say(OPENER, 20)
+        first = s.say("Would you like to hear more about it?", 40)
+        s.eng.apply_judge({"probed_topics": ["H3"]}, first.turn)
+        second = s.say("Does that sound good so far?", 60)
+        s.eng.apply_judge({"probed_topics": ["H3"]}, second.turn)
+        self.assertEqual(s.eng.tracker.gate.state("H3").value, "unlocked")
+        return s
+
+    def test_an_open_dig_offers_the_released_need_and_the_reply_tells_it(self):
+        s = self.judged_h3("It depends on a few things at home.")
+        s.reply = self.H3_KIDS
+        plan = s.say("What would help you two decide?", 90)
+        self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
+        self.assertIn(P1.facts("H3")[0], plan.reminder)
+        self.assertEqual(plan.guard_ctx.released_topics, frozenset({"H3"}))
+        self.assertIn("kids", s.spoken[-1].lower())
+        self.assertEqual(s.eng.tracker.gate.state("H3").value, "revealed")
+
+    def test_a_reply_that_misses_the_need_keeps_it_due_for_the_next_dig(self):
+        s = self.judged_h3("It depends on a few things at home.")
+        first = s.say("What would help you two decide?", 90)
+        self.assertIn(P1.facts("H3")[0], first.reminder)
+        self.assertEqual(s.eng.admin_log()["disclosure"]["H3"]["deep_offer_turns"], [])  # given back
+        self.assertEqual(s.eng.tracker.gate.state("H3").value, "unlocked")
+        s.reply = self.H3_KIDS
+        second = s.say("What would make it feel right?", 120)
+        self.assertIn(P1.facts("H3")[0], second.reminder)
+        self.assertEqual(s.eng.tracker.gate.state("H3").value, "revealed")
+        third = s.say("What would make it feel right?", 150)
+        self.assertNotIn(P1.facts("H3")[0], third.reminder)
+
+    def test_a_general_question_never_offers_the_released_need(self):
+        s = self.judged_h3("It depends on a few things at home.")
+        for index, text in enumerate(
+            ("How did you hear about us?", "Our mentors are from Google.", NEUTRAL, PITCH)
+        ):
+            plan = s.say(text, 90 + 30 * index)
+            self.assertNotIn(P1.facts("H3")[0], plan.reminder, text)
+        self.assertEqual(s.eng.tracker.gate.state("H3").value, "unlocked")
+
+    def test_a_call_question_about_the_husband_neither_probes_nor_reveals(self):
+        s = Session(engine(), reply="Time and money are both tight at home.")
+        s.say(OPENER, 20)
+        s.say(H3_PROBE, 40)  # the hint turn
+        plan = s.say("Would your husband join a short call with us?", 70)
+        self.assertEqual(plan.guard_ctx.released_topics, frozenset())
+        self.assertNotIn(P1.facts("H3")[0], plan.reminder or "")
+        self.assertEqual(s.eng.tracker.gate.state("H3").value, "surface")  # not released by a call ask
+
+    def test_a_released_need_is_not_told_in_reply_to_a_call_ask(self):
+        s = Session(engine(), reply="I am not sure how to put it.")
+        s.say(OPENER, 20)
+        s.say(H3_PROBE, 40)
+        follow = s.say("Tell me more about how that works at home.", 70)
+        self.assertEqual(follow.guard_ctx.released_topics, frozenset({"H3"}))
+        s.eng.tracker.gate  # released, offered once and missed
+        ask = s.say("Tell me more. Would a quick follow-up call on Thursday work for you?", 100)
+        self.assertEqual(ask.guard_ctx.released_topics, frozenset())
+        self.assertNotIn(P1.facts("H3")[0], ask.reminder or "")
+
+    # --- minor: the advisor's own spoken amounts are the learner's to repeat
+    def test_amounts_the_advisor_spoke_in_words_are_the_learners_to_repeat(self):
+        from r1_roleplay import advisor_amounts_in
+
+        self.assertEqual(advisor_amounts_in("It works out to two hundred a month."), {200})
+        self.assertEqual(advisor_amounts_in("That is about 200 a month."), {200})
+        self.assertEqual(advisor_amounts_in("Fifteen hundred dollars a month at the most."), {1500})
+        self.assertEqual(advisor_amounts_in("It is $9,000, or $500 off."), {9000, 500})
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.reply = "Two hundred a month is easier to swallow."
+        s.say("On the plan it works out to two hundred a month.", 60)
+        self.assertIn("Two hundred a month", s.spoken[-1])
+        self.assertEqual(s.eng.ledger.leak_total, 0)
+
+    # --- minor: the time cue in the learner's own persona-true words is proof of the cue
+    def test_a_persona_true_time_cue_is_proof_and_no_other_call_is_scripted(self):
+        from r1_scheduler import SPEC_BY_ID, markers_match
+
+        markers = SPEC_BY_ID[TIME_CUE].markers
+        for text in (
+            "I do need to wrap up soon, I've got to get dinner going and the kids settled.",
+            "I should head out in a few minutes, something's come up.",
+            "I need to get going in a bit.",
+        ):
+            self.assertTrue(markers_match(markers, text), text)
+        self.assertFalse(markers_match(markers, "That makes sense, I'll think about it."))
+        cue = SPEC_BY_ID[TIME_CUE]
+        for text in cue.variants:
+            self.assertNotIn("another call", text)
+            self.assertNotIn("next call", text)
+
+    # --- the reasons of the plan are in the admin trail for production
+    def test_the_plans_reasons_name_why_the_commitment_was_graded(self):
+        session, r = self.strong_session()
+        plan = session.say(ASK, r)
+        self.assertTrue(any(reason.startswith("ask_in_window:grade_") for reason in plan.reasons))
 
 
 if __name__ == "__main__":
