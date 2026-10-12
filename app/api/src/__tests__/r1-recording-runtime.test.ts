@@ -281,11 +281,34 @@ describe('structural fences for the recording lane', () => {
     }
   });
 
-  it('the storage runner is gated on the recording config alone, never on r1_settings.enabled', () => {
+  it('the storage runner is gated on the recording config alone, never on r1_settings.enabled or R1_ENABLED', () => {
     const runtime = read('lib/r1/runtime.ts');
+    // The lane is one function, shared by the full runtime and the standalone one.
     const start = runtime.indexOf('const storageRunner = createQueueRunner');
-    const block = runtime.slice(start, runtime.indexOf('const sweepPendingRejects', start));
+    expect(start).toBeGreaterThan(0);
+    const end = runtime.indexOf('return { runner: storageRunner', start);
+    expect(end).toBeGreaterThan(start);
+    const block = runtime.slice(start, end);
     expect(block).toContain('recordingConfig().enabled');
-    expect(block).not.toMatch(/r1Enabled/);
+    expect(block).not.toMatch(/r1Enabled|getR1Config|config\.enabled/);
+  });
+
+  it('the standalone storage runtime hosts the lane only: no assessment handler, no status loop, no R1 gate', () => {
+    const runtime = read('lib/r1/runtime.ts');
+    const start = runtime.indexOf('export function createR1StorageRuntime');
+    expect(start).toBeGreaterThan(0);
+    const code = runtime.slice(start).replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    expect(code).toContain('if (!recordingConfig().enabled) return null;');
+    expect(code).not.toMatch(/r1Enabled|getR1Config|R1_ASSESSMENT_QUEUE|createR1AssessmentHandler|statusTick|lapseOrphans|r1_settings/);
+  });
+
+  it('index.ts builds the storage runtime only when the full R1 runtime is absent, in its own try/catch, and starts and stops it', () => {
+    const index = read('index.ts');
+    expect(index).toMatch(/let r1StorageRuntime: R1StorageRuntimeHandle \| null = null;\nif \(!r1Runtime\) \{\n  try \{\n    r1StorageRuntime = createR1StorageRuntime\(\);\n  \} catch \{/);
+    expect(index).toContain("error_category: 'r1_storage_runtime_start_failed'");
+    expect(index).toContain('r1StorageRuntime.scheduler.start();');
+    expect(index).toContain('await r1StorageRuntime.stop();');
+    // After the full runtime's own block, so a throw from one never decides the other.
+    expect(index.indexOf('let r1StorageRuntime')).toBeGreaterThan(index.indexOf('let r1Runtime'));
   });
 });

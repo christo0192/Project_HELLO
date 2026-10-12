@@ -457,13 +457,57 @@ describe('eraseRoundRecordings (the { round_id } job)', () => {
 });
 
 describe('eraseSessionRecording (the { session_id } job)', () => {
-  it('erases that recording without a scope test and ignores an unknown session', async () => {
-    const { deps, store, row } = setup();
+  const closed = (decision: string, at: number): Row => ({ id: `c-${decision}-${at}`, round_id: fixtureId('a', 1), withdrawn_at: iso(at), proof: { decision } });
+  // setup()'s recording was made at FIXTURE_NOW_MS - 10 min.
+  const AFTER_THE_RECORDING = FIXTURE_NOW_MS - 60_000;
+  const BEFORE_THE_RECORDING = FIXTURE_NOW_MS - 3_600_000;
+
+  it('erases that recording for a withdrawal at or after it was made, and ignores an unknown session', async () => {
+    const { deps, store, row } = setup({ tables: { interview_round_consents: [closed('withdrawn', AFTER_THE_RECORDING)] } });
     store.putObject(KEYS.stream, mp4(50));
     await expect(eraseSessionRecording(deps, fixtureId('b', 9))).resolves.toMatchObject({ erased: 0 });
     expect(store.has(KEYS.stream)).toBe(true);
     await expect(eraseSessionRecording(deps, fixtureId('b', 1), 'consent_withdrawn')).resolves.toMatchObject({ erased: 1 });
     expect(row()).toMatchObject({ status: 'deleted', delete_reason: 'consent_withdrawn' });
+  });
+
+  it('a declined consent counts too', async () => {
+    const { deps, store, row } = setup({ tables: { interview_round_consents: [closed('declined', AFTER_THE_RECORDING)] } });
+    store.putObject(KEYS.stream, mp4(50));
+    await expect(eraseSessionRecording(deps, fixtureId('b', 1))).resolves.toMatchObject({ erased: 1 });
+    expect(row()).toMatchObject({ status: 'deleted' });
+  });
+
+  it('erases NOTHING for consent_withdrawn when the round only superseded its consent, has none, or withdrew before the recording (review round 1)', async () => {
+    const cases: Array<[string, Row[]]> = [
+      ['a superseded consent', [closed('superseded', AFTER_THE_RECORDING)]],
+      ['no consent rows at all', []],
+      ['a withdrawal from before the recording', [closed('withdrawn', BEFORE_THE_RECORDING)]],
+    ];
+    for (const [label, consents] of cases) {
+      const { deps, store, row } = setup({ tables: { interview_round_consents: consents } });
+      store.putObject(KEYS.stream, mp4(50));
+      store.calls.length = 0;
+      await expect(eraseSessionRecording(deps, fixtureId('b', 1), 'consent_withdrawn'), label).resolves.toMatchObject({ erased: 0, out_of_scope: 1 });
+      expect(row(), label).toMatchObject({ status: 'ready', deleted_at: null, delete_requested_at: null });
+      expect(store.has(KEYS.stream), label).toBe(true);
+      expect(store.calls, label).toEqual([]); // the store is never even listed
+    }
+  });
+
+  it('any other reason is the caller\'s decision and needs no withdrawal', async () => {
+    const { deps, store, row } = setup();
+    store.putObject(KEYS.stream, mp4(50));
+    await expect(eraseSessionRecording(deps, fixtureId('b', 1), 'admin')).resolves.toMatchObject({ erased: 1 });
+    expect(row()).toMatchObject({ status: 'deleted', delete_reason: 'admin' });
+  });
+
+  it('a read error on the consents is an error, never "not withdrawn"', async () => {
+    const { deps, db, store } = setup();
+    store.putObject(KEYS.stream, mp4(50));
+    db.failOn('interview_round_consents', 'select');
+    await expect(eraseSessionRecording(deps, fixtureId('b', 1))).rejects.toThrow('r1_recording_db_error');
+    expect(store.has(KEYS.stream)).toBe(true);
   });
 });
 

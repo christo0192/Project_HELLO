@@ -146,7 +146,7 @@ describe('the gate, in order', () => {
   it('4. a withdrawn consent marks an EXISTING recording for erasure and queues the erase job (and does nothing for a session with no recording)', async () => {
     const h = makeHarness();
     await prepared(h);
-    h.db.tables.interview_round_consents![0]!.withdrawn_at = '2026-10-12T10:30:00.000Z';
+    Object.assign(h.db.tables.interview_round_consents![0]!, { withdrawn_at: '2026-10-12T10:30:00.000Z', proof: { decision: 'withdrawn' } });
     h.setNow(START_MS + 60_000);
     const response = await h.post('part-url', { part_number: 1 });
     expect(response.status).toBe(409);
@@ -163,6 +163,45 @@ describe('the gate, in order', () => {
     await fresh.post('prepare', { mode: 'av' });
     expect(fresh.enqueued).toEqual([]);
     expect(fresh.db.tables.interview_round_recordings).toEqual([]);
+  });
+
+  it('4. a DECLINE after the recording was made erases it the same way', async () => {
+    const h = makeHarness();
+    await prepared(h);
+    Object.assign(h.db.tables.interview_round_consents![0]!, { withdrawn_at: '2026-10-12T10:30:00.000Z', proof: { decision: 'declined' } });
+    expect((await h.post('part-url', { part_number: 1 })).body).toEqual({ error: 'r1_consent_withdrawn' });
+    expect(h.row()).toMatchObject({ delete_reason: 'consent_withdrawn' });
+    expect(h.enqueued.map((e) => e.name)).toEqual(['r1.recording.erase']);
+  });
+
+  it('4. a consent that was only SUPERSEDED answers 409 and stops the worker, but erases NOTHING (review round 1)', async () => {
+    // The retake path closes the old consent (decision superseded) and inserts the new one as a second
+    // write; between the two, or for good when the insert fails, there is no live consent and no withdrawal.
+    const h = makeHarness();
+    await prepared(h);
+    Object.assign(h.db.tables.interview_round_consents![0]!, { withdrawn_at: '2026-10-12T10:30:00.000Z', proof: { decision: 'superseded' } });
+    h.setNow(START_MS + 60_000);
+    for (const route of ['part-url', 'object-url', 'complete'] as const) {
+      const response = await h.post(route, validBody(route));
+      expect(response.status, route).toBe(409);
+      expect(response.body, route).toEqual({ error: 'r1_consent_withdrawn' });
+    }
+    expect(h.row()).toMatchObject({ status: 'uploading', delete_requested_at: null, delete_reason: null });
+    expect(h.enqueued).toEqual([]);
+    expect(h.db.tables.job_queue).toEqual([]);
+  });
+
+  it('4. a withdrawal from BEFORE the recording was made does not erase it either', async () => {
+    const h = makeHarness();
+    await prepared(h);
+    h.db.tables.interview_round_consents!.push({
+      id: 'consent-old', round_id: ROOM_ROUND, consents: ['ai_interview'], withdrawn_at: '2026-10-12T09:00:00.000Z', proof: { decision: 'withdrawn' },
+    });
+    h.db.tables.interview_round_consents![0]!.consents = ['ai_interview'];  // the live (re-)consent no longer lists recording
+    h.setNow(START_MS + 60_000);
+    expect((await h.post('part-url', { part_number: 1 })).body).toEqual({ error: 'r1_consent_withdrawn' });
+    expect(h.row()).toMatchObject({ delete_requested_at: null });
+    expect(h.enqueued).toEqual([]);
   });
 
   it('checks the config before the room, the mode before the consent, and the consent before any row check', async () => {
@@ -797,7 +836,7 @@ describe('complete', () => {
     const h = makeHarness();
     await prepared(h);
     expect((await h.post('part-url', { part_number: 1 })).status).toBe(200);
-    h.db.tables.interview_round_consents![0]!.withdrawn_at = '2026-10-12T10:05:00.000Z';
+    Object.assign(h.db.tables.interview_round_consents![0]!, { withdrawn_at: '2026-10-12T10:05:00.000Z', proof: { decision: 'withdrawn' } });
     const response = await h.post('complete', { layout: 'combined', has_video: true });
     expect(response.status).toBe(409);
     expect(response.body).toEqual({ error: 'r1_consent_withdrawn' });

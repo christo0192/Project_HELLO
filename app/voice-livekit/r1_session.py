@@ -968,6 +968,10 @@ class _CandidateRow:
 _EPOCH_MS_LIMIT = 4_102_444_800_000
 # A speaking event older than this is a different utterance, not the start of the turn.
 _USER_SPEECH_ANCHOR_MAX_AGE_SECONDS = 30.0
+# Speaking events this close together (start to start) are one burst of speech with a pause in it:
+# the candidate paused, the VAD went back to listening, and they carried on before the STT handed
+# over the first final.  Further apart, a bot line or a long silence has come between them.
+_USER_SPEECH_BURST_GAP_SECONDS = 4.0
 _USER_SPEECH_ANCHORS_KEPT = 8
 
 
@@ -3199,19 +3203,29 @@ class R1Interview:
     def _candidate_turn_anchor(self, event: Any) -> int | None:
         """Epoch ms the candidate began speaking, for a row whose first final is ``event``.
 
-        The latest ``user_state_changed -> speaking`` at or before that final, if it is at most
-        30 s earlier (a speaking event older than that belongs to an earlier utterance); otherwise
-        None.  It is the SDK's own event time (``created_at``), never the write time, so the
-        recording's click-to-seek lands where the candidate started.
+        Start from the latest ``user_state_changed -> speaking`` at or before that final, if it is
+        at most 30 s earlier (a speaking event older than that belongs to an earlier utterance;
+        otherwise None).  Then walk back over the speaking events that lead into it with no more
+        than ``_USER_SPEECH_BURST_GAP_SECONDS`` between one and the next (and none older than the
+        same 30 s): they are the same burst of speech with a pause in it.  The STT hands over a
+        segment's final a second or two after the pause, so the VAD may already have gone back to
+        speaking by then; the latest event alone would put the seek a pause's length into the
+        answer and skip its first words.  It is the SDK's own event time (``created_at``), never
+        the write time, so the recording's click-to-seek lands where the candidate started.
         """
         created = getattr(event, "created_at", None)
         final_at = created if isinstance(created, (int, float)) and not isinstance(created, bool) else time.time()
-        for spoke in reversed(self._user_speaking_at):
-            if spoke <= final_at:
-                if final_at - spoke <= _USER_SPEECH_ANCHOR_MAX_AGE_SECONDS:
-                    return _epoch_ms(spoke)
-                return None
-        return None
+        before = sorted(spoke for spoke in self._user_speaking_at if spoke <= final_at)
+        if not before or final_at - before[-1] > _USER_SPEECH_ANCHOR_MAX_AGE_SECONDS:
+            return None
+        start = before[-1]
+        for earlier in reversed(before[:-1]):
+            if start - earlier > _USER_SPEECH_BURST_GAP_SECONDS:
+                break
+            if final_at - earlier > _USER_SPEECH_ANCHOR_MAX_AGE_SECONDS:
+                break
+            start = earlier
+        return _epoch_ms(start)
 
     def _reserve_bot_index(self) -> int:
         """Reserve a transcript position for a bot speech, closing the candidate's open row first.

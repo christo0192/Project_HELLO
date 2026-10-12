@@ -415,6 +415,33 @@ class TestR1RecordingContract(unittest.IsolatedAsyncioTestCase):
         self.assertIn("self.__recording_io.recording", inspect.getsource(rio.RecorderAudioInput.__anext__))
         self.assertIn("self.__recording_io.recording", inspect.getsource(rio.RecorderAudioOutput.capture_frame))
 
+    def test_the_first_input_chunk_is_padded_once_with_silence_the_mixer_can_recognise(self) -> None:
+        """What the tee's trim of a chunk that is ahead of the clock relies on (review round 1).
+
+        The SDK pads the candidate's FIRST input chunk, once, in front, with silence of the length
+        (first microphone frame - end of the last agent line); the mixer has already filled that
+        stretch from the wall clock.  It trims the duplicate, but only samples at or below
+        ``SILENCE_LEVEL`` on both channels: the resampler turns the SDK's digital silence into +-1 LSB
+        of dither, never more.
+        """
+        import numpy as np
+        from livekit.agents.voice.recorder_io import recorder_io as rio
+
+        import r1_recorder
+
+        take = inspect.getsource(rio.RecorderAudioInput.take_buf)
+        self.assertIn("self.__started_time - pad_since", take)
+        self.assertIn("not self.__padded", take)
+        self.assertIn("self.__padded = True", take)
+        self.assertIn("_create_silence_frame(padding, frames[0].sample_rate, frames[0].num_channels)", take)
+        self.assertLessEqual(r1_recorder.SILENCE_LEVEL, 4)
+        silent = rtc.AudioFrame(
+            data=bytes(2 * 24000 * 3), sample_rate=24000, num_channels=1, samples_per_channel=24000 * 3
+        )
+        converted = r1_recorder._ChannelResampler().convert([silent], flush=True)
+        self.assertGreater(len(converted), 2 * 48000)
+        self.assertLessEqual(int(np.abs(converted.astype(np.int32)).max()), r1_recorder.SILENCE_LEVEL)
+
     def test_the_session_accepts_a_replacement_audio_input_and_output_after_start(self) -> None:
         from livekit.agents.voice import io as lk_io
 

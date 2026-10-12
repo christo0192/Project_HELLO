@@ -280,6 +280,20 @@ export async function withdrawalCutoffs(db: R1DbClient, roundIds: readonly strin
   return cutoffs;
 }
 
+/**
+ * True when the round's candidate WITHDREW or DECLINED at or after `recordingCreatedAt`: the one
+ * test (the same as {@link eraseRoundRecordings}' scope and the sweep's backstop) that justifies
+ * erasing a recording because of consent. "The round has no live consent right now" is NOT it: a
+ * retake that needs the latest template supersedes the old consent (UPDATE) and inserts the new one
+ * (INSERT) as two writes, and the insert can fail, so there is a gap, or a round, with no live
+ * consent and no withdrawal. A recording made under the consent then in force stays. Throws on a
+ * read error (a closed `r1_recording_db_error`), never "no".
+ */
+export async function recordingWithdrawn(db: R1DbClient, roundId: string, recordingCreatedAt: string): Promise<boolean> {
+  const cutoff = (await withdrawalCutoffs(db, [roundId])).get(roundId);
+  return cutoff !== undefined && Date.parse(recordingCreatedAt) <= cutoff;
+}
+
 export interface R1EraseBatchResult {
   readonly erased: number;
   readonly blocked: number;
@@ -332,10 +346,18 @@ export async function eraseRoundRecordings(deps: R1EraseDeps, roundId: string, r
   return { ...result, out_of_scope: rows.length - inScope.length };
 }
 
-/** The `{ session_id }` erase job (the worker gate or finalize found the consent gone): that one recording, no scope test. */
+/**
+ * The `{ session_id }` erase job (the worker gate or finalize found a withdrawal): that one recording.
+ * For `consent_withdrawn` it applies the same scope test as {@link eraseRoundRecordings}: a recording is
+ * erased for a withdrawal only when the round withdrew or declined at or after it was made (a superseded
+ * consent, or a round with no live consent, is not a withdrawal). Any other reason is the caller's decision.
+ */
 export async function eraseSessionRecording(deps: R1EraseDeps, sessionId: string, reason: R1EraseReason = 'consent_withdrawn'): Promise<R1EraseBatchResult> {
   const row = await loadRecording(deps.db, sessionId);
   if (!row) return EMPTY_BATCH;
+  if (reason === 'consent_withdrawn' && row.deleted_at === null && !(await recordingWithdrawn(deps.db, row.round_id, row.created_at))) {
+    return { ...EMPTY_BATCH, out_of_scope: 1 };
+  }
   const { result, firstError } = await eraseRows(deps, [row], () => reason);
   if (firstError !== undefined) throw firstError;
   return result;

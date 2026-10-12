@@ -297,8 +297,28 @@ export const ROOM_ROUND = '20000000-0000-4000-8000-000000000001';
 export const ROOM_CANDIDATE = '10000000-0000-4000-8000-000000000001';
 export const ROOM_NAME = `screening-${ROOM_SESSION}`;
 
-/** Tables for one live R1 browser session whose round holds a live recording consent. */
-export function liveRecordingTables(options: { recordingMode?: string; consents?: string[] | null } = {}): Tables {
+/**
+ * Tables for one live R1 browser session whose round holds a live recording consent.
+ *
+ * `withdrawal` adds a CLOSED consent row of the round (`withdrawn_at` set, `proof.decision` as given), as
+ * the candidate routes leave one: `withdrawn` / `declined` are real withdrawals, `superseded` is a
+ * consent replaced by a newer template (two writes: the old one is closed, the new one inserted).
+ * Combine it with `consents: null` for a round with no live consent at all.
+ */
+export function liveRecordingTables(options: {
+  recordingMode?: string;
+  consents?: string[] | null;
+  withdrawal?: { decision: 'withdrawn' | 'declined' | 'superseded'; at: string };
+} = {}): Tables {
+  const closed = options.withdrawal
+    ? [{
+      id: 'consent-0',
+      round_id: ROOM_ROUND,
+      consents: ['ai_interview', 'video_audio_recording', 'ai_evaluation', 'data_processing'],
+      withdrawn_at: options.withdrawal.at,
+      proof: { decision: options.withdrawal.decision },
+    }]
+    : [];
   return {
     call_sessions: [{
       id: ROOM_SESSION,
@@ -310,8 +330,8 @@ export function liveRecordingTables(options: { recordingMode?: string; consents?
     }],
     r1_settings: [{ singleton: true, enabled: true, recording_mode: options.recordingMode ?? 'av' }],
     interview_round_consents: options.consents === null
-      ? []
-      : [{ id: 'consent-1', round_id: ROOM_ROUND, consents: options.consents ?? ['ai_interview', 'video_audio_recording', 'ai_evaluation', 'data_processing'], withdrawn_at: null, proof: null }],
+      ? closed
+      : [{ id: 'consent-1', round_id: ROOM_ROUND, consents: options.consents ?? ['ai_interview', 'video_audio_recording', 'ai_evaluation', 'data_processing'], withdrawn_at: null, proof: null }, ...closed],
     interview_round_recordings: [],
     job_queue: [],
   };

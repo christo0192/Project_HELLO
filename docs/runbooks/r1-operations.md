@@ -1939,12 +1939,21 @@ disabled or deleted: the spool was overwritten and nothing more is sent), `r1_re
 ### Retention, withdrawal, DSAR, legal hold
 
 - **Retention** is per row: `delete_after = created_at + R1_RECORDING_RETENTION_DAYS` (max 90), fixed at prepare.
-  `r1.sweep` (every 15 minutes) erases due rows. **Retention, erase and the sweep run only inside the R1 runtime, which
-  needs `R1_ENABLED=true` on `project-hello-api`.** If it stops, objects outlive their 90 days until the 97-day R2
-  lifecycle rule removes them: `retention_overdue` above 0 is the alarm. Do not turn the runtime off while recordings exist.
+  `r1.sweep` (every 15 minutes) erases due rows. **Finalize, erase and the sweep run whenever the R2 recording secrets
+  (`R1_RECORDING_S3_*`) are set on `project-hello-api`, with `R1_ENABLED` on or off:** with it on they are the `r1-storage`
+  and `r1-sweep` loops of the R1 runtime, with it off the API starts the same lane on its own at boot
+  (`createR1StorageRuntime`, log line `r1_storage_runtime_standalone`), so the env switch an operator flips in an R1
+  incident never strands a consent withdrawal or the retention. Neither `R1_ENABLED` nor `r1_settings.enabled` /
+  `paused` / `recording_mode` stops them. They stop only when the R2 secrets are unset (jobs then wait, no attempt is spent);
+  objects then outlive their 90 days until the 97-day R2 lifecycle rule removes them: `retention_overdue` above 0 is the alarm.
+  Do not unset the R2 secrets while recordings exist.
 - **Withdrawal** of consent (withdrawn or declined, not superseded) enqueues `r1.recording.erase` in the same transaction;
   every worker route then answers 409 `r1_consent_withdrawn` and the worker discards. A recording made after a later
-  re-consent survives. **DSAR** erases every recording of the candidate and verifies it BEFORE any row is deleted; a failure
+  re-consent survives. A consent that is only **superseded** (a retake under a newer template closes the old consent and
+  inserts the new one as two writes) is not a withdrawal: a worker route that finds no live consent still answers 409 and
+  the worker still discards what it holds, but nothing already stored is erased, and finalize keeps a recording made under
+  the consent then in force. Erasure for consent needs a `withdrawn` / `declined` consent at or after the recording was
+  made, in the gate, in finalize and in the session-scoped erase job alike. **DSAR** erases every recording of the candidate and verifies it BEFORE any row is deleted; a failure
   leaves the DSAR `in_progress`. Both use one routine: abort multipart uploads, delete every key under the prefix, verify the
   prefix is empty and each key answers 404, only then tombstone the row (`deleted`, bytes and hash kept as evidence).
 - **Legal hold** blocks erasure (`erasure_blocked_legal_hold`, audited at most daily) for holds on the candidate, the

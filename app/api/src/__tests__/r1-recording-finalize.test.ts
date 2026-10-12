@@ -54,8 +54,9 @@ async function fixture(options: {
   objects?: Partial<Record<'video' | 'stream' | 'audio' | 'audioPartial', Buffer>>;
   maxBytes?: number;
   consents?: string[] | null;
+  withdrawal?: { decision: 'withdrawn' | 'declined' | 'superseded'; at: string };
 } = {}): Promise<Fixture> {
-  const tables = liveRecordingTables({ consents: options.consents });
+  const tables = liveRecordingTables({ consents: options.consents, withdrawal: options.withdrawal });
   const db = createRecordingFakeDb(tables);
   const store = new MemoryR1ObjectStore({ now: () => START_MS });
   let uploadId: string | null = null;
@@ -480,20 +481,51 @@ describe('finalizeRecording: when there is nothing (more) to do', () => {
     expect(leaving.store.calls.slice(leaving.setupCalls)).toEqual([]);
   });
 
-  it('a consent withdrawn since complete: marks the recording for erasure, queues the erase job, verifies and keeps nothing', async () => {
-    for (const consents of [null, ['ai_interview']]) {
-      const f = await fixture({ consents, parts: [mp4(5 * MIB), plain(10)] });
-      expect(await finalizeRecording(f.deps, ROOM_SESSION)).toEqual({ kind: 'erase_requested' });
-      expect(f.db.tables.interview_round_recordings![0]).toMatchObject({ status: 'finishing', delete_reason: 'consent_withdrawn', video_key: null });
-      expect(f.db.tables.interview_round_recordings![0].delete_requested_at).toBe(new Date(START_MS).toISOString());
-      expect(f.enqueued).toEqual([{
-        name: 'r1.recording.erase',
-        payload: { session_id: ROOM_SESSION, reason: 'consent_withdrawn' },
-        options: { dedupKey: `r1.recording.erase:session:${ROOM_SESSION}`, maxAttempts: 5 },
-      }]);
-      expect(f.store.calls.slice(f.setupCalls)).toEqual([]); // not even a HEAD
-      expect(audits).toEqual([]);
+  // The fixture's recording was made at START_MS - 10 min.
+  const WITHDREW_AFTER = new Date(START_MS - 120_000).toISOString();
+  const WITHDREW_BEFORE = new Date(START_MS - 3_600_000).toISOString();
+
+  it('a consent withdrawn or declined since complete: marks the recording for erasure, queues the erase job, verifies and keeps nothing', async () => {
+    for (const decision of ['withdrawn', 'declined'] as const) {
+      for (const consents of [null, ['ai_interview']]) {
+        const f = await fixture({ consents, withdrawal: { decision, at: WITHDREW_AFTER }, parts: [mp4(5 * MIB), plain(10)] });
+        expect(await finalizeRecording(f.deps, ROOM_SESSION), `${decision} ${consents}`).toEqual({ kind: 'erase_requested' });
+        expect(f.db.tables.interview_round_recordings![0]).toMatchObject({ status: 'finishing', delete_reason: 'consent_withdrawn', video_key: null });
+        expect(f.db.tables.interview_round_recordings![0].delete_requested_at).toBe(new Date(START_MS).toISOString());
+        expect(f.enqueued).toEqual([{
+          name: 'r1.recording.erase',
+          payload: { session_id: ROOM_SESSION, reason: 'consent_withdrawn' },
+          options: { dedupKey: `r1.recording.erase:session:${ROOM_SESSION}`, maxAttempts: 5 },
+        }]);
+        expect(f.store.calls.slice(f.setupCalls)).toEqual([]); // not even a HEAD
+        expect(audits).toEqual([]);
+      }
     }
+  });
+
+  it('a consent that was only SUPERSEDED (or is not there yet) is not a withdrawal: the recording is finalized and kept', async () => {
+    // Review round 1: a retake that needs the latest template closes the old consent and inserts the new
+    // one as two writes; between them (or for good when the insert fails) the round has no live consent.
+    const cases: Array<[string, Parameters<typeof fixture>[0]]> = [
+      ['superseded, replacement missing', { consents: null, withdrawal: { decision: 'superseded', at: WITHDREW_AFTER } }],
+      ['no consent row at all', { consents: null }],
+      ['superseded, replacement lacks recording', { consents: ['ai_interview'], withdrawal: { decision: 'superseded', at: WITHDREW_AFTER } }],
+    ];
+    for (const [label, options] of cases) {
+      const f = await fixture({ ...options, parts: [mp4(5 * MIB), plain(1000)] });
+      expect(await finalizeRecording(f.deps, ROOM_SESSION), label).toMatchObject({ kind: 'finalized', status: 'ready' });
+      const row = f.db.tables.interview_round_recordings![0];
+      expect(row, label).toMatchObject({ status: 'ready', delete_reason: null, delete_requested_at: null, video_key: KEYS.stream });
+      expect(f.enqueued, label).toEqual([]);
+      expect(f.store.has(KEYS.stream), label).toBe(true);
+    }
+  });
+
+  it('a withdrawal from BEFORE the recording was made does not erase it (the candidate re-consented after it)', async () => {
+    const f = await fixture({ consents: ['ai_interview'], withdrawal: { decision: 'withdrawn', at: WITHDREW_BEFORE }, parts: [mp4(5 * MIB), plain(1000)] });
+    expect(await finalizeRecording(f.deps, ROOM_SESSION)).toMatchObject({ kind: 'finalized' });
+    expect(f.enqueued).toEqual([]);
+    expect(f.db.tables.interview_round_recordings![0]).toMatchObject({ delete_requested_at: null });
   });
 
   it('loses the compare-and-set cleanly when the recording was erased while it ran: nothing is written or removed', async () => {

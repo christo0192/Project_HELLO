@@ -7,8 +7,9 @@
  * `failed`, and the same code serves a clean finish and crash salvage.
  *
  *   1. Claim: the row must still be `finishing`, not deleted and not awaiting erasure; the round must
- *      still hold a live consent containing `video_audio_recording` (else mark it for erasure, queue
- *      the erase job and stop: nothing is verified or kept for a withdrawn candidate).
+ *      not have WITHDRAWN or DECLINED since the recording was made (else mark it for erasure, queue
+ *      the erase job and stop: nothing is verified or kept for a withdrawn candidate). A round that
+ *      merely has no live consent to recording (a superseded consent) did not withdraw: finalize goes on.
  *   2. Settle the multipart upload: ListParts (all pages), keep the longest contiguous prefix of
  *      UNIFORM parts (R2 needs every part but the last the same size), Complete it, or Abort it when
  *      no part qualifies. A NoSuchUpload means a previous run already did it.
@@ -33,6 +34,7 @@ import { createHash } from 'node:crypto';
 import { loadRoundLiveConsent, type R1DbClient } from '../../../services/r1-assessment.js';
 import { MAX_PARTS, PART_SIZE } from './config.js';
 import { auditSystemEvent } from './audit.js';
+import { recordingWithdrawn } from './erase.js';
 import { R1_RECORDING_CONSENT } from './gate.js';
 import { mp4ContentType, recordingKeys, type R1RecordingKeys } from './keys.js';
 import { R1_RECORDING_ERASE_QUEUE } from './queues.js';
@@ -231,9 +233,13 @@ export async function finalizeRecording(deps: R1FinalizeDeps, sessionId: string)
   if (row.deleted_at !== null || row.status === 'deleted' || row.delete_requested_at !== null) return { kind: 'skipped', reason: 'deleted' };
   if (row.status !== 'finishing') return { kind: 'skipped', reason: 'not_finishing' };
 
-  // 1. The consent may have gone between `complete` and this job.
+  // 1. The candidate may have withdrawn between `complete` and this job. Only a WITHDRAWAL (or a
+  // decline) at or after the recording erases it: a round with no live consent that never withdrew
+  // (a superseded consent whose replacement is not in yet, or never arrives) is not one, and the
+  // recording made under the consent then in force is finalized like any other.
   const consent = await loadRoundLiveConsent(db, row.round_id);
-  if (!consent || !Array.isArray(consent.consents) || !consent.consents.includes(R1_RECORDING_CONSENT)) {
+  const consentLive = !!consent && Array.isArray(consent.consents) && consent.consents.includes(R1_RECORDING_CONSENT);
+  if (!consentLive && await recordingWithdrawn(db, row.round_id, row.created_at)) {
     await markDeleteRequested(db, sessionId, 'consent_withdrawn', clock().toISOString());
     await deps.enqueue(
       R1_RECORDING_ERASE_QUEUE,

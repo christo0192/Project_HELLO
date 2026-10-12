@@ -19,7 +19,7 @@ What it records, and where it goes (binding contract C1-C11, ``IMPLEMENTER-RULES
   transcript drain.  ``finish()`` (async, from ``_exit``) only waits for it.
 
 Failure never reaches the interview: ``start``, ``stop`` and ``finish`` do not raise, nothing
-blocks the event loop (all network and process I/O is on threads), and a recorder that cannot
+blocks the event loop (all network, process and spool-wipe I/O is on threads), and a recorder that cannot
 work switches itself off.  The API can also tell the worker to throw the recording away
 (recording disabled, consent withdrawn, row deleted); then capture stops, the encoder is
 killed and the spool is overwritten and unlinked.
@@ -52,7 +52,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 from urllib.parse import urlsplit
 
 from observability import StructuredLogger
@@ -105,6 +105,9 @@ COMPLETE_RESERVE_SECONDS = 3.0
 FASTSTART_MIN_REMAINING_SECONDS = 8.0
 # A tee gap smaller than this is rounding, not a rejoin gap (see ``TeeMixer``).
 GAP_SLACK_SECONDS = 0.25
+# Peak amplitude (16-bit LSBs) of what counts as silence at the front of a chunk that is ahead of the
+# clock: the SDK's silence frame, once resampled, carries +-1 LSB of dither (measured), never more.
+SILENCE_LEVEL = 2
 MAX_AUDIO_PIECE_SECONDS = 30
 # 30 s of 48 kHz mono s16 may queue for a slow encoder; more means it is stuck.
 ENCODER_AUDIO_BACKLOG_BYTES = 30 * SAMPLE_RATE * 2
@@ -333,12 +336,17 @@ class HttpReply:
 
 
 class HttpClient:
-    """Minimal HTTP/1.1 client with a connect timeout, a total deadline and a hard abort.
+    """Minimal HTTP/1.1 client with a connect timeout, a total deadline and two ways to cut a request.
 
     ``http.client`` rather than ``urllib``: a presigned PUT must go out exactly as signed (no
-    ``Accept-Encoding``, no extra headers), the total time must be bounded, and ``abort()``
-    must be able to cut an in-flight request from another thread when the finish deadline
-    arrives.
+    ``Accept-Encoding``, no extra headers), the total time must be bounded, and the request in
+    flight must be cuttable from another thread.
+
+    * ``abort()`` is the last resort at the finish deadline: this client sends nothing more, ever.
+    * ``cancel_inflight()`` is for one request only.  A request is started with a ``cancel`` event;
+      when the event is set and ``cancel_inflight()`` is called (in that order), that request ends
+      with ``HttpFailure("cancelled")`` and the client stays usable.  The finish uses it so that a
+      slow mid-call part PUT (60 s allowed) cannot hold the finish's jobs up.
     """
 
     _CHUNK = 64 * 1024
@@ -347,18 +355,35 @@ class HttpClient:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._active: http.client.HTTPConnection | None = None
+        self._active_cancel: threading.Event | None = None
         self._aborted = threading.Event()
 
-    def abort(self) -> None:
-        self._aborted.set()
-        with self._lock:
-            conn = self._active
+    @staticmethod
+    def _cut(conn: Any) -> None:
         sock = getattr(conn, "sock", None)
         if sock is not None:
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_RDWR)
             with contextlib.suppress(OSError):
                 sock.close()
+
+    def abort(self) -> None:
+        self._aborted.set()
+        with self._lock:
+            conn = self._active
+        self._cut(conn)
+
+    def cancel_inflight(self) -> None:
+        """Cut the request in flight if it was started cancellable and its event is now set.
+
+        The caller sets the event FIRST.  A request that registers after this call sees the event
+        set (``request`` checks it again once it is registered); one that registered before is cut
+        here.  Nothing happens to a request started without an event (a finish job).
+        """
+        with self._lock:
+            conn, cancel = self._active, self._active_cancel
+        if conn is not None and cancel is not None and cancel.is_set():
+            self._cut(conn)
 
     def request(
         self,
@@ -369,9 +394,12 @@ class HttpClient:
         body: bytes | None,
         connect_timeout: float,
         total_timeout: float,
+        cancel: threading.Event | None = None,
     ) -> HttpReply:
         if self._aborted.is_set():
             raise HttpFailure("aborted")
+        if cancel is not None and cancel.is_set():
+            raise HttpFailure("cancelled")
         parts = urlsplit(url)
         if parts.scheme not in ("http", "https") or not parts.hostname:
             raise HttpFailure("bad_url")
@@ -391,7 +419,9 @@ class HttpClient:
             raise HttpFailure("bad_url") from exc
         with self._lock:
             self._active = conn
+            self._active_cancel = cancel
         try:
+            self._check(deadline, cancel)  # (a cancel that landed before the registration above)
             conn.putrequest(method, target, skip_accept_encoding=True)
             for name, value in headers.items():
                 conn.putheader(name, value)
@@ -399,17 +429,18 @@ class HttpClient:
                 conn.putheader("Content-Length", str(len(body)))
             conn.endheaders()  # connects here, under the connect timeout
             sock = conn.sock
+            self._check(deadline, cancel)  # (a cancel that landed while connecting)
             if body is not None:
                 view = memoryview(body)
                 sent = 0
                 while sent < len(view):
-                    self._check(deadline)
+                    self._check(deadline, cancel)
                     if sock is not None:
                         sock.settimeout(max(0.2, min(30.0, deadline - time.monotonic())))
                     chunk = view[sent : sent + self._CHUNK]
                     conn.send(chunk)
                     sent += len(chunk)
-            self._await_reply(sock, deadline)
+            self._await_reply(sock, deadline, cancel)
             if sock is not None:
                 sock.settimeout(max(0.2, deadline - time.monotonic()))
             response = conn.getresponse()
@@ -422,30 +453,41 @@ class HttpClient:
         except HttpFailure:
             raise
         except socket.timeout as exc:
-            raise HttpFailure("aborted" if self._aborted.is_set() else "timeout") from exc
+            raise HttpFailure(self._interrupted(cancel) or "timeout") from exc
         except (OSError, http.client.HTTPException, ssl.SSLError, ValueError) as exc:
-            raise HttpFailure("aborted" if self._aborted.is_set() else "network") from exc
+            raise HttpFailure(self._interrupted(cancel) or "network") from exc
         finally:
             with self._lock:
                 self._active = None
+                self._active_cancel = None
             with contextlib.suppress(Exception):
                 conn.close()
 
-    def _check(self, deadline: float) -> None:
+    def _interrupted(self, cancel: threading.Event | None) -> str | None:
+        """Why a socket error is really somebody cutting the request: ``aborted``, ``cancelled`` or neither."""
+        if self._aborted.is_set():
+            return "aborted"
+        if cancel is not None and cancel.is_set():
+            return "cancelled"
+        return None
+
+    def _check(self, deadline: float, cancel: threading.Event | None = None) -> None:
         if self._aborted.is_set():
             raise HttpFailure("aborted")
+        if cancel is not None and cancel.is_set():
+            raise HttpFailure("cancelled")
         if time.monotonic() >= deadline:
             raise HttpFailure("timeout")
 
-    def _await_reply(self, sock: Any, deadline: float) -> None:
-        """Wait for the first byte of the answer in short slices, so an abort or the deadline is
-        noticed within a quarter of a second on every platform (a blocking read in another
-        thread is not reliably woken by closing its socket)."""
+    def _await_reply(self, sock: Any, deadline: float, cancel: threading.Event | None = None) -> None:
+        """Wait for the first byte of the answer in short slices, so an abort, a cancel or the
+        deadline is noticed within a quarter of a second on every platform (a blocking read in
+        another thread is not reliably woken by closing its socket)."""
         if sock is None:
-            self._check(deadline)
+            self._check(deadline, cancel)
             return
         while True:
-            self._check(deadline)
+            self._check(deadline, cancel)
             ready, _, _ = select.select([sock], [], [], min(0.25, max(0.0, deadline - time.monotonic())))
             if ready:
                 return
@@ -475,7 +517,15 @@ class RecordingApi:
         self._endpoint = endpoint
         self._secret = secret or (lambda: os.getenv("WORKER_CONTEXT_SECRET"))
 
-    def post(self, op: str, body: Mapping[str, Any], *, connect_timeout: float, total_timeout: float) -> ApiReply:
+    def post(
+        self,
+        op: str,
+        body: Mapping[str, Any],
+        *,
+        connect_timeout: float,
+        total_timeout: float,
+        cancel: threading.Event | None = None,
+    ) -> ApiReply:
         secret = self._secret()
         if not secret:
             raise HttpFailure("no_secret")
@@ -487,6 +537,7 @@ class RecordingApi:
             body=payload,
             connect_timeout=connect_timeout,
             total_timeout=total_timeout,
+            cancel=cancel,
         )
         data: dict[str, Any] = {}
         try:
@@ -499,7 +550,14 @@ class RecordingApi:
         return ApiReply(reply.status, data, code if isinstance(code, str) and _CODE_RE.match(code) else None)
 
     def put(
-        self, url: str, body: bytes, content_type: str, *, connect_timeout: float, total_timeout: float
+        self,
+        url: str,
+        body: bytes,
+        content_type: str,
+        *,
+        connect_timeout: float,
+        total_timeout: float,
+        cancel: threading.Event | None = None,
     ) -> ApiReply:
         reply = self._http.request(
             "PUT",
@@ -508,6 +566,7 @@ class RecordingApi:
             body=body,
             connect_timeout=connect_timeout,
             total_timeout=total_timeout,
+            cancel=cancel,
         )
         return ApiReply(reply.status, {}, None, reply.headers.get("etag"))
 
@@ -831,6 +890,17 @@ class TeeMixer:
     the chunk.  Without that, the SDK's gapless assumption would shift the audio behind the
     wall clock for the rest of the call.  Position inside one chunk (2.5 s) is approximate;
     the total is exact.
+
+    The opposite error is handled too, but only ever by dropping digital silence.  The SDK
+    pads the candidate's FIRST input chunk once, in front, with the time between the end of the
+    last agent line and the first microphone frame (``RecorderAudioInput.take_buf``).  When the
+    microphone starts after an agent line, the wall-clock padding above has already filled that
+    stretch, so the chunk arrives ahead of the clock by the same amount, and without a trim every
+    later sound would sit that much late for the rest of the call.  A chunk that is ahead of the
+    clock by more than the slack gives up the leading samples that are silent on BOTH channels
+    (``SILENCE_LEVEL``: the resampler turns the SDK's digital silence into +-1 LSB of dither),
+    up to the overshoot.  Speech is never cut: a chunk whose first sample is audible is left whole
+    (audio ahead of the clock by a few hundred milliseconds is rounding, not a defect).
     """
 
     def __init__(self, t0: float) -> None:
@@ -854,8 +924,16 @@ class TeeMixer:
         mixed = np.clip(candidate.astype(np.int32) + agent.astype(np.int32), -32768, 32767).astype(np.int16)
         target = int(round((t_mono - self._t0) * SAMPLE_RATE))
         deficit = target - (self.emitted + count)
-        if deficit > int(GAP_SLACK_SECONDS * SAMPLE_RATE):
+        slack = int(GAP_SLACK_SECONDS * SAMPLE_RATE)
+        if deficit > slack:
             mixed = np.concatenate((np.zeros(deficit, dtype=np.int16), mixed))
+        elif -deficit > slack:
+            # "Silent" is what the resampler makes of digital silence: +-1 LSB of dither.
+            audible = (np.abs(candidate.astype(np.int32)) > SILENCE_LEVEL) | (np.abs(agent.astype(np.int32)) > SILENCE_LEVEL)
+            silent = int(audible.argmax()) if audible.any() else count
+            drop = min(-deficit, silent)
+            if drop > 0:
+                mixed = mixed[drop:]
         pieces: list[tuple[int, bytes]] = []
         step = MAX_AUDIO_PIECE_SECONDS * SAMPLE_RATE
         for offset in range(0, len(mixed), step):
@@ -1284,12 +1362,27 @@ def _bounded_int(value: Any, low: int, high: int, default: int) -> int:
     return number if low <= number <= high else default
 
 
+class _Limits(NamedTuple):
+    """What one attempt may use: the two timeouts (a plain ``(connect, total)`` pair to anything
+    that indexes it) and the event that cuts it short, for periodic work only (see ``HttpClient``)."""
+
+    connect: float
+    total: float
+    cancel: threading.Event | None = None
+
+
 class UploadWorker:
     """The one thread that talks to the API and to the presigned URLs.
 
     Periodic work (prepare, 5 MiB parts cut from the growing MP4, the OGG checkpoint) runs on
     its loop; the finish queues jobs onto the same thread, so there is exactly one request in
     flight and one owner of the counters.  A part's bytes stay on disk until its 200.
+
+    The finish must not wait behind periodic work: ``submit`` ends the request periodic work has
+    in flight (``HttpClient.cancel_inflight``; a mid-call PUT may be allowed 60 s) and the loop
+    then picks the job up.  What was cut is not lost: a part advances the cursor only after its
+    200, so the finish's tail job uploads the same part again (a part number can be PUT twice;
+    the second replaces the first).
     """
 
     def __init__(
@@ -1361,7 +1454,8 @@ class UploadWorker:
     def submit(self, job: Callable[[], Any]) -> "concurrent.futures.Future[Any]":
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
         self._jobs.put((job, future))
-        self._interrupt.set()  # cut a retry sleep short: the finish is waiting
+        self._interrupt.set()  # cut a retry sleep short: the finish is waiting ...
+        self._http.cancel_inflight()  # ... and a request in flight (only periodic work is cancellable)
         return future
 
     def _run(self) -> None:
@@ -1417,12 +1511,17 @@ class UploadWorker:
 
     def _attempts(
         self,
-        step: Callable[[tuple[float, float]], tuple[str, Any]],
+        step: Callable[[_Limits], tuple[str, Any]],
         *,
         deadline: float | None,
         interruptible: bool,
     ) -> tuple[str, Any]:
-        """Run ``step`` up to four times (1 s, 3 s, 7 s apart, jittered), within ``deadline``."""
+        """Run ``step`` up to four times (1 s, 3 s, 7 s apart, jittered), within ``deadline``.
+
+        ``interruptible`` (periodic work) also lets the finish cut the request in flight: the step
+        gets the interrupt event to hand to the HTTP client, and a cut request is ``ABORTED``,
+        never retried (the job that cut it needs the thread).
+        """
         attempts = len(RETRY_DELAYS_SECONDS) + 1
         for attempt in range(attempts):
             if self._halt.is_set() or (interruptible and self._interrupt.is_set()):
@@ -1431,9 +1530,9 @@ class UploadWorker:
             if timeouts is None:
                 return FAILED, None
             try:
-                outcome, value = step(timeouts)
+                outcome, value = step(_Limits(timeouts[0], timeouts[1], self._interrupt if interruptible else None))
             except HttpFailure as failure:
-                if failure.kind == "aborted":
+                if failure.kind in ("aborted", "cancelled"):
                     return ABORTED, None
                 if failure.kind in ("no_secret", "bad_url"):
                     outcome, value = STOP, "rejected"  # a request that can never succeed
@@ -1460,9 +1559,10 @@ class UploadWorker:
     # -- prepare
 
     def _prepare(self, *, deadline: float | None, interruptible: bool) -> bool:
-        def step(timeouts: tuple[float, float]) -> tuple[str, Any]:
+        def step(limits: _Limits) -> tuple[str, Any]:
             reply = self._api.post(
-                "prepare", {"mode": self._mode}, connect_timeout=timeouts[0], total_timeout=timeouts[1]
+                "prepare", {"mode": self._mode},
+                connect_timeout=limits.connect, total_timeout=limits.total, cancel=limits.cancel,
             )
             verdict, reason = classify(reply)
             if verdict != OK:
@@ -1540,10 +1640,11 @@ class UploadWorker:
             if not final:
                 size = self._stream_size()
 
-    def _part_step(self, number: int, data: bytes) -> Callable[[tuple[float, float]], tuple[str, Any]]:
-        def step(timeouts: tuple[float, float]) -> tuple[str, Any]:
+    def _part_step(self, number: int, data: bytes) -> Callable[[_Limits], tuple[str, Any]]:
+        def step(limits: _Limits) -> tuple[str, Any]:
             reply = self._api.post(
-                "part-url", {"part_number": number}, connect_timeout=timeouts[0], total_timeout=timeouts[1]
+                "part-url", {"part_number": number},
+                connect_timeout=limits.connect, total_timeout=limits.total, cancel=limits.cancel,
             )
             verdict, reason = classify(reply)
             if verdict != OK:
@@ -1552,7 +1653,8 @@ class UploadWorker:
             if not isinstance(url, str) or not url:
                 return RETRY, "bad_reply"
             put = self._api.put(
-                url, data, "application/octet-stream", connect_timeout=timeouts[0], total_timeout=timeouts[1]
+                url, data, "application/octet-stream",
+                connect_timeout=limits.connect, total_timeout=limits.total, cancel=limits.cancel,
             )
             return (OK, None) if put.status == 200 else (RETRY, "put")
 
@@ -1568,9 +1670,10 @@ class UploadWorker:
         if not data:
             return False
 
-        def step(timeouts: tuple[float, float]) -> tuple[str, Any]:
+        def step(limits: _Limits) -> tuple[str, Any]:
             reply = self._api.post(
-                "object-url", {"kind": kind}, connect_timeout=timeouts[0], total_timeout=timeouts[1]
+                "object-url", {"kind": kind},
+                connect_timeout=limits.connect, total_timeout=limits.total, cancel=limits.cancel,
             )
             verdict, reason = classify(reply)
             if verdict != OK:
@@ -1580,7 +1683,8 @@ class UploadWorker:
             if not isinstance(url, str) or not url or not isinstance(content_type, str) or not content_type:
                 return RETRY, "bad_reply"
             put = self._api.put(
-                url, data, content_type, connect_timeout=timeouts[0], total_timeout=timeouts[1]
+                url, data, content_type,
+                connect_timeout=limits.connect, total_timeout=limits.total, cancel=limits.cancel,
             )
             return (OK, None) if put.status == 200 else (RETRY, "put")
 
@@ -1635,8 +1739,10 @@ class UploadWorker:
         if self.state != "uploading":
             return FAILED
 
-        def step(timeouts: tuple[float, float]) -> tuple[str, Any]:
-            reply = self._api.post("complete", body, connect_timeout=timeouts[0], total_timeout=timeouts[1])
+        def step(limits: _Limits) -> tuple[str, Any]:
+            reply = self._api.post(
+                "complete", body, connect_timeout=limits.connect, total_timeout=limits.total, cancel=limits.cancel
+            )
             verdict, reason = classify(reply)
             return verdict, reason
 
@@ -2156,12 +2262,17 @@ class R1Recorder:
             self._discard_task = asyncio.ensure_future(self._discard_cleanup())
 
     async def _discard_cleanup(self) -> None:
-        """Stop the SDK recorder, then overwrite and unlink everything the spool holds."""
+        """Stop the SDK recorder, then overwrite and unlink everything the spool holds.
+
+        A mid-call discard happens while the interview goes on, and the overwrite writes and
+        fsyncs every spool byte (about 100 MB after a 20-minute call with video): that runs on a
+        thread, never on the loop the live VAD / STT / TTS pipeline shares.
+        """
         try:
             await self._close_io()
         finally:
             self._worker.halt()
-            self._wipe(overwrite=True)
+            await self._wipe_off_loop(overwrite=True)
 
     # -- finish
 
@@ -2189,6 +2300,14 @@ class R1Recorder:
         with contextlib.suppress(Exception):
             self._spool.wipe(overwrite=overwrite)
 
+    async def _wipe_off_loop(self, *, overwrite: bool) -> None:
+        """``_wipe`` on a worker thread.  Cancelling the wait does not stop the wipe, and when no
+        thread can be had (the interpreter is shutting down) it is done inline: it must happen."""
+        try:
+            await asyncio.to_thread(self._wipe, overwrite=overwrite)
+        except RuntimeError:
+            self._wipe(overwrite=overwrite)
+
     async def _finish_steps(self) -> None:
         if self._t0 is None or self._io is None:
             # Never started (no show, configuration failure) or a refused start: nothing was
@@ -2212,7 +2331,7 @@ class R1Recorder:
             return
         if self._stop_reason is not None:
             self._worker.halt()
-            self._wipe(overwrite=False)
+            await self._wipe_off_loop(overwrite=False)
             return
         upload_deadline = deadline - reserve
         mp4_ok = closed and self._encoder_lost is None
@@ -2240,7 +2359,7 @@ class R1Recorder:
             return
         if self._stop_reason is not None:
             self._worker.halt()
-            self._wipe(overwrite=False)
+            await self._wipe_off_loop(overwrite=False)
             return
         if want_fast and tail_ok and enc is not None:
             remaining = upload_deadline - self._clock()
@@ -2266,7 +2385,7 @@ class R1Recorder:
             )
         await self._teardown_child()
         self._worker.halt()
-        self._wipe(overwrite=False)
+        await self._wipe_off_loop(overwrite=False)
 
     def _failure_reason(self, *, uploaded: bool, tail_ok: bool, timed_out: bool) -> str | None:
         """The worker's reason code for a recording that is not fully delivered (vocabulary C11)."""

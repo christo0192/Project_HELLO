@@ -7,7 +7,8 @@
  *   3. r1_settings.recording_mode != 'off'          else 503 r1_recording_disabled
  *   4. the round's LIVE consent contains
  *      `video_audio_recording`                      else 409 r1_consent_withdrawn
- *      (and an existing recording is marked for erasure and an erase job is queued)
+ *      (and, when the round WITHDREW or DECLINED after the recording was made, that recording is
+ *      marked for erasure and an erase job is queued; a superseded consent erases nothing)
  *   5. (row checks are the route's: state, counters, deleted -> 410)
  *
  * Why every route re-checks 3 and 4: the worker keeps calling these routes while it is FINISHING,
@@ -25,6 +26,7 @@
 
 import { loadRoundLiveConsent, type R1DbClient } from '../../../services/r1-assessment.js';
 import type { R1RecordingConfig } from './config.js';
+import { recordingWithdrawn } from './erase.js';
 import { toCanonicalUuid } from './keys.js';
 import { R1_RECORDING_ERASE_QUEUE } from './queues.js';
 import { asRecordingMode, loadRecording, markDeleteRequested } from './service.js';
@@ -158,7 +160,7 @@ export async function runRecordingGate(deps: R1RecordingGateDeps, body: unknown)
     const consent = await loadRoundLiveConsent(deps.db, roundId);
     const granted = consent !== null && Array.isArray(consent.consents) && consent.consents.includes(R1_RECORDING_CONSENT);
     if (!granted) {
-      await onConsentGone(deps, sessionId);
+      await onConsentGone(deps, sessionId, roundId);
       return refuse(409, 'r1_consent_withdrawn');
     }
 
@@ -170,15 +172,19 @@ export async function runRecordingGate(deps: R1RecordingGateDeps, body: unknown)
 }
 
 /**
- * The consent is gone while a worker is (or was) recording: mark an existing recording for erasure
- * and queue the erase job, so anything already written is removed even if the withdrawal trigger's
- * own job was lost. Best effort: the 409 is the answer either way, and the sweep's withdrawal
- * backstop covers a failure here.
+ * The round has no live consent to recording while a worker is (or was) recording. The worker is told
+ * 409 either way (stop, delete what you hold, the interview goes on). But only a WITHDRAWAL erases
+ * what is already stored: then mark the existing recording for erasure and queue the erase job, so it
+ * is removed even if the withdrawal trigger's own job was lost. A consent that was merely SUPERSEDED
+ * by a newer template (two writes: the old one is closed, the new one inserted; the insert can fail)
+ * leaves a round with no live consent and no withdrawal, and nothing is erased for that. Best effort:
+ * the sweep's withdrawal backstop covers a failure here.
  */
-async function onConsentGone(deps: R1RecordingGateDeps, sessionId: string): Promise<void> {
+async function onConsentGone(deps: R1RecordingGateDeps, sessionId: string, roundId: string): Promise<void> {
   try {
     const row = await loadRecording(deps.db, sessionId);
     if (!row || row.deleted_at !== null) return;
+    if (!(await recordingWithdrawn(deps.db, roundId, row.created_at))) return;
     await markDeleteRequested(deps.db, sessionId, 'consent_withdrawn', deps.now().toISOString());
     await deps.enqueue(
       R1_RECORDING_ERASE_QUEUE,

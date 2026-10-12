@@ -431,6 +431,63 @@ class TestTeeMixer(unittest.TestCase):
         mixer.process([frame(tone_samples(2.0))], [], 5.0)  # the next chunk needs no padding
         self.assertAlmostEqual(mixer.emitted / RATE, 5.0, delta=0.05)
 
+    @staticmethod
+    def tone_onset(pcm: np.ndarray, after: float = 0.0, level: int = 1000) -> float | None:
+        """Seconds of the first 20 ms window at or after ``after`` whose peak exceeds ``level``."""
+        window = RATE // 50
+        for start in range(int(after * RATE), len(pcm) - window, window):
+            if int(np.abs(pcm[start : start + window]).max()) > level:
+                return start / RATE
+        return None
+
+    def test_the_sdks_one_time_input_padding_is_not_added_on_top_of_the_wall_clock_padding(self) -> None:
+        """A microphone that starts after the opening line: the SDK pads its first chunk in front.
+
+        The agent speaks 0 - 1.5 s, the tick at 2.5 s has nothing (wall-clock padded by the mixer), the
+        microphone's first frame is at 4.0 s and the tick at 5.0 s carries the SDK's silence frame
+        (4.0 - 1.5 = 2.5 s) followed by 1 s of microphone.  The tone must sit at 4.0 s, not 5.0 s.
+        """
+        mixer = TeeMixer(t0=0.0)
+        pieces = list(mixer.process([], [frame(tone_samples(1.5, freq=800.0))], 1.5))
+        pieces += mixer.process([], [], 2.5)
+        sdk_pad = frame(np.zeros(int(2.5 * 24000), dtype="<i2"))
+        pieces += mixer.process([sdk_pad, frame(tone_samples(1.0, freq=300.0, amp=6000))], [], 5.0)
+        pcm = pcm_of(pieces)
+        self.assertAlmostEqual(len(pcm) / RATE, 5.0, delta=0.1)
+        self.assertAlmostEqual(mixer.emitted / RATE, 5.0, delta=0.1)
+        onset = self.tone_onset(pcm, after=2.0)
+        self.assertIsNotNone(onset)
+        self.assertAlmostEqual(onset, 4.0, delta=0.1)
+        # The later audio stays on the clock too.
+        more = pcm_of(mixer.process([frame(tone_samples(2.5, freq=300.0, amp=6000))], [], 7.5))
+        self.assertAlmostEqual(mixer.emitted / RATE, 7.5, delta=0.1)
+        self.assertGreater(int(np.abs(more[:RATE // 10]).max()), 1000)
+
+    def test_only_leading_digital_silence_is_given_up_when_the_chunk_is_ahead_of_the_clock(self) -> None:
+        mixer = TeeMixer(t0=0.0)
+        mixer.process([], [frame(tone_samples(2.5))], 2.5)  # (an agent line: no resampler tail carried over)
+        # 1 s ahead of the clock, but only 0.2 s of the chunk's front is silent: exactly 0.2 s goes.
+        chunk = [frame(np.zeros(int(0.2 * 24000), dtype="<i2")), frame(tone_samples(3.3, freq=300.0, amp=6000))]
+        pcm = pcm_of(mixer.process(chunk, [], 5.0))
+        self.assertAlmostEqual(len(pcm) / RATE, 3.3, delta=0.1)
+        self.assertGreater(int(np.abs(pcm[: RATE // 50]).max()), 1000, "the tone is the first thing in what is left")
+        # An agent line that starts with a few zero samples keeps them when the audio is not ahead.
+        steady = TeeMixer(t0=0.0)
+        got = pcm_of(steady.process([], [frame(np.concatenate((np.zeros(2400, dtype="<i2"), tone_samples(1.0))))], 1.1))
+        self.assertAlmostEqual(len(got) / RATE, 1.1, delta=0.05)
+
+    def test_a_chunk_of_nothing_but_silence_is_trimmed_to_the_clock_and_can_vanish(self) -> None:
+        mixer = TeeMixer(t0=0.0)
+        mixer.process([], [frame(tone_samples(2.5))], 2.5)
+        silence = pcm_of(mixer.process([frame(np.zeros(int(4.0 * 24000), dtype="<i2"))], [], 3.0))
+        self.assertLessEqual(int(np.abs(silence).max()), r1_recorder.SILENCE_LEVEL)  # (dither, not speech)
+        self.assertAlmostEqual(mixer.emitted / RATE, 3.0, delta=0.1)
+        # Already ahead of the clock by more than the whole chunk: the silent chunk adds nothing.
+        ahead = TeeMixer(t0=0.0)
+        ahead.process([], [frame(tone_samples(2.5))], 2.5)
+        self.assertEqual(ahead.process([frame(np.zeros(24000, dtype="<i2"))], [], 1.0), [])
+        self.assertAlmostEqual(ahead.emitted / RATE, 2.5, delta=0.1)
+
     def test_a_huge_gap_is_split_into_messages_of_at_most_30_seconds(self) -> None:
         mixer = TeeMixer(t0=0.0)
         pieces = mixer.process([], [], 100.0)
@@ -638,6 +695,65 @@ class TestRecorderIoOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(tail.shape[1], stock.shape[1] + int(0.8 * RATE))  # the held-back second
         self.assertGreater(float(np.abs(tail[0, -int(0.5 * RATE) :]).max()), 0.05)
 
+    async def replay_with_a_late_microphone(self, mic_start: float, agent_line: float, stop_at: float):
+        """The real subclass on a controlled clock; the candidate's first frame is at ``mic_start``.
+
+        The agent speaks from 0 to ``agent_line``; the SDK's 2.5 s idle flush is driven by hand (its own
+        ticker is off).  Returns ``(seconds of the first candidate tone in the mixed timeline, found from
+        0.1 s after the line on, and the timeline's length in seconds)``; the candidate speaks a 300 Hz
+        tone from ``max(mic_start, agent_line)``.
+        """
+        clock = {"t": 0.0}
+        source, sink = _Source(), _Sink()
+        rec = r1_recorder.recorder_io_class()(agent_session=SimpleNamespace(), sample_rate=RATE)
+        rec.tee_clock = lambda: clock["t"]
+        tap_in, tap_out = rec.record_input(source), rec.record_output(sink)
+        step = 0.02
+        next_tick = 2.5
+        with mock.patch("time.time", lambda: 1_000_000.0 + clock["t"]), no_forward_ticks():
+            await rec.start(output_path=self.dir / "late-mic.ogg")
+            for _ in range(int(round(agent_line / step))):
+                await tap_out.capture_frame(frame(tone_samples(step, freq=800.0)))
+                if clock["t"] >= mic_start:
+                    source.next_frame = frame(np.zeros(480, dtype="<i2"))  # live, but quiet during the line
+                    await tap_in.__anext__()
+                clock["t"] += step
+            tap_out.flush()
+            tap_out.on_playback_finished(playback_position=agent_line, interrupted=False)
+            while clock["t"] < stop_at - 1e-9:
+                if clock["t"] >= next_tick - 1e-9:
+                    rec.flush_idle_tail()  # what the SDK's own ticker does when the agent is idle
+                    next_tick += 2.5
+                if clock["t"] >= mic_start:
+                    source.next_frame = frame(tone_samples(step, freq=300.0, amp=6000))
+                    await tap_in.__anext__()
+                clock["t"] += step
+            rec.flush_idle_tail()
+            await asyncio.wait_for(rec.aclose(), 20)
+        mixer = TeeMixer(0.0)
+        pieces: list[tuple[int, bytes]] = []
+        while True:
+            stamp_in, input_buf = rec.tee_in.get_nowait()
+            stamp_out, output_buf = rec.tee_out.get_nowait()
+            if input_buf is None or output_buf is None:
+                break
+            pieces.extend(mixer.process(input_buf, output_buf, max(stamp_in, stamp_out)))
+        pcm = pcm_of(pieces)
+        return TestTeeMixer.tone_onset(pcm, after=agent_line + 0.1), len(pcm) / RATE
+
+    async def test_a_microphone_that_starts_after_the_first_agent_line_stays_on_the_wall_clock(self) -> None:
+        """The SDK pads the first input chunk with (mic start - end of the last line) of silence; the
+        mixer has already filled that stretch from the wall clock.  Seen before the fix: the candidate
+        tone at +1.0 s (mic at 4 s), +8.5 s (mic at 12 s) and +17 s (mic at 25 s after an 8 s line), and
+        a timeline 57 s long for 40 s of wall time."""
+        for mic_start, agent_line, stop_at in ((0.0, 1.5, 9.0), (4.0, 1.5, 9.0), (12.0, 1.5, 20.0), (25.0, 8.0, 40.0)):
+            with self.subTest(mic_start=mic_start, agent_line=agent_line):
+                onset, length = await self.replay_with_a_late_microphone(mic_start, agent_line, stop_at)
+                expected = max(mic_start, agent_line + 0.1)  # (the search starts 0.1 s after the line)
+                self.assertIsNotNone(onset)
+                self.assertLess(abs(onset - expected), 0.15, f"candidate tone at {onset}s, spoken at {expected}s")
+                self.assertLess(abs(length - stop_at), 0.3, f"timeline {length}s for {stop_at}s of wall time")
+
     async def test_no_flush_while_the_agent_is_mid_line_and_none_after_capture_closes(self) -> None:
         cls = r1_recorder.recorder_io_class()
         source, sink = _Source(), _Sink()
@@ -679,6 +795,8 @@ class FakeApi:
         self.inflight = 0
         self.max_inflight = 0
         self.put_delay = 0.0
+        # (what, was the request started cancellable): periodic work is, a finish job is not
+        self.cancellable: list[tuple[str, bool]] = []
 
     def script(self, op: str, *replies) -> None:
         self.scripts.setdefault(op, []).extend(replies)
@@ -691,9 +809,10 @@ class FakeApi:
         with self.lock:
             return [body for name, body in self.calls if name == op]
 
-    def post(self, op, body, *, connect_timeout, total_timeout):
+    def post(self, op, body, *, connect_timeout, total_timeout, cancel=None):
         with self.lock:
             self.calls.append((op, dict(body)))
+            self.cancellable.append((op, cancel is not None))
             self.threads.add(threading.current_thread().name)
             scripted = self.scripts.get(op)
             reply = scripted.pop(0) if scripted else None
@@ -722,26 +841,38 @@ class FakeApi:
             return ApiReply(200, {"status": "finishing"}, None)
         raise AssertionError(op)
 
-    def put(self, url, body, content_type, *, connect_timeout, total_timeout):
+    def put(self, url, body, content_type, *, connect_timeout, total_timeout, cancel=None):
         with self.lock:
             self.inflight += 1
             self.max_inflight = max(self.max_inflight, self.inflight)
             status = self.put_statuses.pop(0) if self.put_statuses else 200
-            self.puts.append({"url": url, "body": bytes(body), "content_type": content_type, "status": status})
+            entry = {"url": url, "body": bytes(body), "content_type": content_type, "status": status}
+            self.puts.append(entry)
+            self.cancellable.append(("put", cancel is not None))
         self.events.append("put")
-        if self.put_delay:
-            time.sleep(self.put_delay)
-        with self.lock:
-            self.inflight -= 1
+        try:
+            if self.put_delay:
+                if cancel is None:
+                    time.sleep(self.put_delay)
+                elif cancel.wait(self.put_delay):  # a cancellable request ends when it is cancelled
+                    entry["cancelled"] = True
+                    raise HttpFailure("cancelled")
+        finally:
+            with self.lock:
+                self.inflight -= 1
         return ApiReply(status, {}, None, '"etag"')
 
 
 class StubHttp:
     def __init__(self) -> None:
         self.aborted = False
+        self.cancelled = 0
 
     def abort(self) -> None:
         self.aborted = True
+
+    def cancel_inflight(self) -> None:
+        self.cancelled += 1
 
 
 class FakeIO:
@@ -1071,8 +1202,9 @@ class TestUploadWorker(unittest.TestCase):
         patch = mock.patch.object(r1_recorder, "RETRY_DELAYS_SECONDS", (0.0, 0.0, 0.0))
         patch.start()
         self.addCleanup(patch.stop)
+        self.http = StubHttp()
         self.worker = UploadWorker(
-            api=self.api, http_client=StubHttp(), spool=self.spool, mode="audio", clock=self.clock,
+            api=self.api, http_client=self.http, spool=self.spool, mode="audio", clock=self.clock,
             on_discard=self.discards.append, on_stop=self.stops.append, mp4_enabled=lambda: self.mp4,
             rng=lambda: 0.5,
         )
@@ -1321,6 +1453,50 @@ class TestUploadWorker(unittest.TestCase):
             self.assertEqual(future.result(timeout=5), "r1rec_upload")
             self.assertLess(time.monotonic() - started, 4.0)
 
+    def test_a_finish_job_does_not_wait_behind_a_slow_mid_call_put_and_that_part_goes_again(self) -> None:
+        """Periodic work may be 60 s inside one PUT; the job that submit() queues cuts that PUT, the
+        loop takes the job at once, and the tail job uploads the same part number again."""
+        content = self.lay(65536 * 2 + 100)
+        self.api.put_delay = 30.0  # the first (mid-call) part PUT hangs ...
+        self.worker.start()
+        wait_until(lambda: "put" in self.api.events)
+        self.api.put_delay = 0.0  # ... the ones the finish makes are instant
+        started = time.monotonic()
+        future = self.worker.submit(lambda: self.worker.job_tail(mp4=True, final_ogg=False, deadline=100.0))
+        result = future.result(timeout=5)
+        self.assertLess(time.monotonic() - started, 3.0, "the job did not sit behind the 30 s PUT")
+        self.assertEqual(result, {"uploading": True, "mp4": True, "ogg": False})
+        self.assertGreaterEqual(self.http.cancelled, 1, "the in-flight request was cut")
+        self.assertEqual([b["part_number"] for b in self.api.bodies("part-url")], [1, 1, 2, 3])
+        delivered = [p["body"] for p in self.api.puts if not p.get("cancelled")]
+        self.assertEqual(b"".join(delivered), content, "every byte arrived once, in order")
+        self.assertEqual(self.worker.parts_done, 3)
+        self.assertEqual(self.worker.cut, len(content))
+
+    def test_only_periodic_requests_are_cancellable_never_a_finish_job(self) -> None:
+        self.lay(65536 + 10)
+        self.worker.start()
+        wait_until(lambda: self.worker.parts_done == 1)
+        periodic = list(self.api.cancellable)
+        self.assertTrue(periodic and all(flag for _what, flag in periodic), periodic)
+        self.api.cancellable.clear()
+        self.spool.ogg_path.write_bytes(b"OggS" + b"q" * 200)
+        self.worker.submit(lambda: self.worker.job_tail(mp4=True, final_ogg=True, deadline=100.0)).result(timeout=5)
+        self.worker.submit(lambda: self.worker.job_complete({"layout": "combined", "report": {}}, deadline=100.0)).result(timeout=5)
+        self.assertTrue(self.api.cancellable)
+        self.assertFalse(any(flag for _what, flag in self.api.cancellable), self.api.cancellable)
+
+    def test_a_cut_request_is_not_retried_and_does_not_end_the_upload(self) -> None:
+        self.prepare()
+        self.lay(65536)
+        self.api.script("part-url", HttpFailure("cancelled"))
+        outcome = self.worker._attempts(
+            self.worker._part_step(1, b"x"), deadline=None, interruptible=True
+        )
+        self.assertEqual(outcome, ("aborted", None))
+        self.assertEqual(self.api.bodies("part-url"), [{"part_number": 1}], "no retry")
+        self.assertEqual((self.worker.state, self.discards, self.stops), ("uploading", [], []))
+
     def test_periodic_work_uploads_in_the_background(self) -> None:
         content = self.lay(65536 + 10)
         self.worker.start()
@@ -1370,6 +1546,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     log_message = lambda *a, **k: None  # noqa: E731
 
     def _serve(self) -> None:
+        if self.path.startswith("/noread"):  # never reads the request body: a big upload stalls in send()
+            self.server.release.wait(30)
+            return
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         self.server.seen.append({"method": self.command, "path": self.path, "headers": {k.lower(): v for k, v in self.headers.items()}, "body": body})
@@ -1462,6 +1641,90 @@ class TestHttpClient(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5.0)
         with self.assertRaises(HttpFailure):  # once aborted, nothing else goes out
             self.client.request("GET", self.base + "/ok", headers={}, body=None, connect_timeout=1, total_timeout=2)
+
+    def request_in_a_thread(self, path: str, *, cancel, total_timeout: float = 30, body: bytes | None = None):
+        outcome: dict = {}
+
+        def run() -> None:
+            started = time.monotonic()
+            try:
+                outcome["reply"] = self.client.request(
+                    "PUT" if body is not None else "GET", self.base + path, headers={}, body=body,
+                    connect_timeout=1, total_timeout=total_timeout, cancel=cancel,
+                )
+            except HttpFailure as failure:
+                outcome["failure"] = failure.kind
+            outcome["took"] = time.monotonic() - started
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        return thread, outcome
+
+    def test_cancel_inflight_cuts_a_cancellable_request_and_leaves_the_client_usable(self) -> None:
+        cancel = threading.Event()
+        thread, outcome = self.request_in_a_thread("/hang", cancel=cancel)
+        wait_until(lambda: self.server.seen)  # the server has the request: it is in flight
+        cancel.set()
+        self.client.cancel_inflight()
+        thread.join(5)
+        self.assertEqual(outcome.get("failure"), "cancelled")
+        self.assertLess(outcome["took"], 3.0)
+        # Unlike abort(), the client carries on: the next request goes out and is answered.
+        reply = self.client.request("GET", self.base + "/ok", headers={}, body=None, connect_timeout=1, total_timeout=5)
+        self.assertEqual(reply.status, 200)
+
+    def test_the_event_alone_ends_a_request_waiting_for_its_answer_within_a_quarter_second(self) -> None:
+        cancel = threading.Event()
+        thread, outcome = self.request_in_a_thread("/hang", cancel=cancel)
+        wait_until(lambda: self.server.seen)
+        cancel.set()  # no cancel_inflight(): the wait for the first byte polls the event
+        thread.join(5)
+        self.assertEqual(outcome.get("failure"), "cancelled")
+        self.assertLess(outcome["took"], 3.0)
+
+    def test_cancel_inflight_cuts_an_upload_that_is_stuck_inside_send(self) -> None:
+        cancel = threading.Event()
+        thread, outcome = self.request_in_a_thread("/noread", cancel=cancel, body=b"x" * (96 * 1024 * 1024))
+        time.sleep(0.8)  # the socket buffers are full by now: the thread is blocked in send()
+        self.assertTrue(thread.is_alive())
+        cancel.set()
+        self.client.cancel_inflight()
+        thread.join(8)
+        self.assertEqual(outcome.get("failure"), "cancelled")
+        self.assertLess(outcome["took"], 6.0)
+
+    def test_a_request_started_without_an_event_is_not_cut_by_cancel_inflight(self) -> None:
+        thread, outcome = self.request_in_a_thread("/hang", cancel=None, total_timeout=1.5)
+        wait_until(lambda: self.server.seen)
+        self.client.cancel_inflight()
+        thread.join(6)
+        self.assertEqual(outcome.get("failure"), "timeout", "it ran to its own deadline, uncut")
+
+    def test_an_event_that_is_set_but_not_announced_does_not_cut_a_request_by_cancel_inflight_alone(self) -> None:
+        # (cancel_inflight is the second half of the pair: the caller sets the event first.)
+        cancel = threading.Event()
+        thread, outcome = self.request_in_a_thread("/hang", cancel=cancel, total_timeout=1.5)
+        wait_until(lambda: self.server.seen)
+        self.client.cancel_inflight()  # the event is not set: nothing is cut
+        thread.join(6)
+        self.assertEqual(outcome.get("failure"), "timeout")
+
+    def test_a_cancel_that_is_already_set_stops_a_request_before_anything_goes_out(self) -> None:
+        cancel = threading.Event()
+        cancel.set()
+        with self.assertRaises(HttpFailure) as caught:
+            self.client.request("GET", self.base + "/ok", headers={}, body=None, connect_timeout=1, total_timeout=2, cancel=cancel)
+        self.assertEqual(caught.exception.kind, "cancelled")
+        self.assertEqual(self.server.seen, [])
+
+    def test_abort_still_wins_over_cancel(self) -> None:
+        cancel = threading.Event()
+        thread, outcome = self.request_in_a_thread("/hang", cancel=cancel)
+        wait_until(lambda: self.server.seen)
+        cancel.set()
+        self.client.abort()
+        thread.join(5)
+        self.assertEqual(outcome.get("failure"), "aborted")
 
 
 # ------------------------------------------------------------------------------ lifecycle
@@ -1766,6 +2029,28 @@ class TestFinish(RecorderCase):
         if body is not None:
             self.assertIn(body.get("failure_reason"), ("finish_timeout", "upload_failed"))
 
+    async def test_a_slow_mid_call_part_put_does_not_cost_the_recording_its_tail(self) -> None:
+        """Review round 1: the first (mid-call) part PUT takes 8 s, the finish is allowed 6.  The jobs the
+        finish queues used to wait behind that PUT, so no ``complete`` went out and the tail was lost."""
+        part = self.api.part_size
+        self.encoder.mp4_bytes = 3 * part + 1000
+        self.lay_stream(3 * part)  # three full parts are due while the call is still going
+        self.api.put_delay = 8.0
+        recorder = await self.started(finish_seconds=6.0)
+        await until(lambda: "put" in self.events)  # the slow PUT is in flight
+        self.api.put_delay = 0.0
+        began = time.monotonic()
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        self.assertLess(time.monotonic() - began, 3.0, "the finish did not sit behind the 8 s PUT")
+        (body,) = self.api.bodies("complete")
+        self.assertNotIn("failure_reason", body)
+        self.assertEqual((body["layout"], body["report"]["parts_uploaded"]), ("combined", 4))
+        full = bytes((i * 7) % 251 for i in range(self.encoder.mp4_bytes))
+        delivered = b"".join(p["body"] for p in self.api.puts if p["content_type"] == "application/octet-stream" and not p.get("cancelled"))
+        self.assertEqual(delivered, full, "no part is missing and none is duplicated")
+        self.assertFalse(self.spool.dir.exists())
+
     async def test_a_tail_that_cannot_be_uploaded_says_upload_failed(self) -> None:
         self.lay_stream()
         recorder = await self.started()
@@ -1928,6 +2213,36 @@ class TestDiscardAndStop(RecorderCase):
                 await asyncio.wait_for(recorder.finish(), 10)
                 self.assertEqual(self.api.calls, calls, "no call after a discard, not even complete")
                 self.assertNotIn("api.complete", self.events)
+
+    async def test_the_discard_overwrite_runs_off_the_event_loop_so_the_interview_keeps_ticking(self) -> None:
+        """Review round 1: the zero-fill + fsync of a long call's spool ran on the loop the live pipeline shares."""
+        self.lay_stream()
+        loop_thread = threading.get_ident()
+        filled: list[tuple[str, int]] = []
+
+        def slow_zero_fill(path) -> None:  # a ~100 MB spool takes this long on a slow disk
+            filled.append((Path(path).name, threading.get_ident()))
+            time.sleep(0.5)
+
+        ticks: list[float] = []
+
+        async def ticker() -> None:
+            while True:
+                ticks.append(time.monotonic())
+                await asyncio.sleep(0.01)
+
+        self.api.script("prepare", ApiReply(409, {"error": "r1_consent_withdrawn"}, "r1_consent_withdrawn"))
+        pulse = asyncio.ensure_future(ticker())
+        self.addCleanup(pulse.cancel)
+        with mock.patch.object(r1_recorder, "_zero_fill", slow_zero_fill):
+            recorder = await self.started()
+            await until(lambda: recorder.discarded == "consent_withdrawn")
+            await until(lambda: not self.spool.dir.exists(), timeout=10)
+        pulse.cancel()
+        self.assertEqual({name for name, _ in filled}, {"stream.mp4", "audio.ogg"})
+        self.assertNotIn(loop_thread, {thread for _, thread in filled}, "the overwrite is not on the event loop")
+        self.assertLess(max(b - a for a, b in zip(ticks, ticks[1:])), 0.35, "the loop kept ticking during the 1 s wipe")
+        await asyncio.wait_for(recorder.finish(), 10)
 
     async def test_a_withdrawal_in_the_middle_of_the_call_discards_the_uploaded_work_too(self) -> None:
         self.lay_stream(65536 * 2)

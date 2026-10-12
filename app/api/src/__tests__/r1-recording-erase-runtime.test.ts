@@ -12,7 +12,14 @@ import { Queue } from '../lib/queue/index.js';
 import { MemoryAdapter } from '../lib/queue/memory-adapter.js';
 import type { QueueJob } from '../lib/queue/types.js';
 import { getAuditSink, setAuditSink } from '../lib/audit.js';
-import { R1_RUNTIME_BOUNDS, R1_RUNTIME_QUEUES, createR1Runtime } from '../lib/r1/runtime.js';
+import {
+  R1_RUNTIME_BOUNDS,
+  R1_RUNTIME_QUEUES,
+  R1_STORAGE_RUNTIME_QUEUES,
+  createR1Runtime,
+  createR1StorageRuntime,
+} from '../lib/r1/runtime.js';
+import { getR1RecordingConfig, type R1RecordingConfig } from '../lib/r1/recording/config.js';
 import {
   R1_RECORDING_ERASE_QUEUE,
   R1_STORAGE_DEFER_REASON,
@@ -125,11 +132,21 @@ describe('the erase handler', () => {
     expect(results).toEqual([expect.objectContaining({ erased: 1, errors: 0 })]);
   });
 
-  it('a { session_id } job erases that session', async () => {
-    const { handler, store, tables } = handlerFor({ tables: tablesWithWithdrawal({ interview_round_consents: [] }) });
+  it('a { session_id } job erases that session when its round withdrew', async () => {
+    const { handler, store, tables } = handlerFor();
     store.putObject(KEYS.stream, mp4(100));
     await expect(handler(job({ payload: { session_id: SESSION, reason: 'consent_withdrawn' } }))).resolves.toBeUndefined();
     expect(tables.interview_round_recordings![0]).toMatchObject({ status: 'deleted' });
+  });
+
+  it('a { session_id } consent_withdrawn job for a round that only superseded its consent erases nothing', async () => {
+    const superseded = [{ id: 'c1', round_id: ROUND, consents: [], withdrawn_at: iso(FIXTURE_NOW_MS - 60_000), proof: { decision: 'superseded' } }];
+    const { handler, store, tables, results } = handlerFor({ tables: tablesWithWithdrawal({ interview_round_consents: superseded }) });
+    store.putObject(KEYS.stream, mp4(100));
+    await expect(handler(job({ payload: { session_id: SESSION, reason: 'consent_withdrawn' } }))).resolves.toBeUndefined();
+    expect(tables.interview_round_recordings![0]).toMatchObject({ status: 'ready', deleted_at: null });
+    expect(store.has(KEYS.stream)).toBe(true);
+    expect(results).toEqual([expect.objectContaining({ erased: 0, out_of_scope: 1 })]);
   });
 
   it('is idempotent: a replay finds nothing left to do', async () => {
@@ -296,6 +313,108 @@ describe('the r1-storage runner and the r1-sweep loop', () => {
     await runtime.stop();
     expect(await queue.getById(sweepEnqueues[0]!.id)).toMatchObject({ status: 'completed' });
     expect(tables.interview_round_recordings![0]).toMatchObject({ status: 'deleted' });
+  });
+});
+
+describe('the recording lane on its own: R1_ENABLED off must not strand a withdrawal or the retention (review round 1)', () => {
+  const clockState = { ms: FIXTURE_NOW_MS };
+  const DISABLED = { enabled: false, status: 'disabled' as const };
+
+  function makeQueue(): Queue {
+    const clock = (): string => new Date(clockState.ms).toISOString();
+    return new Queue(new MemoryAdapter({ clock }), { clock });
+  }
+
+  function standalone(options: { recordingEnabled?: boolean; tables?: Tables; store?: MemoryR1ObjectStore } = {}) {
+    clockState.ms = FIXTURE_NOW_MS;
+    const tables = options.tables ?? tablesWithWithdrawal();
+    const db = createRecordingFakeDb(tables, { now: () => clockState.ms });
+    const queue = makeQueue();
+    const store = options.store ?? new MemoryR1ObjectStore({ now: () => clockState.ms });
+    const runtime = createR1StorageRuntime({
+      client: db.client as never,
+      queue,
+      now: () => new Date(clockState.ms),
+      recordingConfig: () => (options.recordingEnabled === false ? { enabled: false, status: 'disabled' } : enabledRecordingConfig()),
+      recordingStore: () => store,
+    });
+    return { runtime, db, queue, store, tables };
+  }
+
+  it('is what index.ts falls back to: the full runtime is null with R1_ENABLED off, the lane is not', () => {
+    const { runtime } = standalone();
+    expect(createR1Runtime({ config: DISABLED })).toBeNull();
+    expect(runtime).not.toBeNull();
+    expect(runtime!.queues).toEqual(['r1.recording.finalize', 'r1.recording.erase', 'r1.sweep']);
+    expect(R1_STORAGE_RUNTIME_QUEUES).toEqual([...runtime!.queues]);
+    expect(Object.keys(runtime!.loopIntervalsMs)).toEqual(['r1-storage', 'r1-sweep']);
+  });
+
+  it('constructs NOTHING while the R2 recording config is not enabled (the shipped default)', () => {
+    const setTimer = vi.fn();
+    const db = createRecordingFakeDb(tablesWithWithdrawal(), { now: () => FIXTURE_NOW_MS });
+    for (const recordingConfig of [
+      (): R1RecordingConfig => ({ enabled: false, status: 'disabled' }),
+      (): R1RecordingConfig => getR1RecordingConfig({ R1_RECORDING_S3_ENDPOINT: 'http://not-r2' }), // invalid
+    ]) {
+      expect(createR1StorageRuntime({ client: db.client as never, queue: makeQueue(), recordingConfig, scheduler: { setTimer } })).toBeNull();
+    }
+    expect(db.ops).toEqual([]);
+    expect(setTimer).not.toHaveBeenCalled();
+  });
+
+  it('erases a withdrawn recording and completes the erase job with no R1 runtime at all', async () => {
+    const { runtime, queue, store, tables } = standalone();
+    store.putObject(KEYS.stream, mp4(100));
+    const queued = await queue.enqueue(R1_RECORDING_ERASE_QUEUE, { round_id: ROUND, reason: 'consent_withdrawn' }, { maxAttempts: 5, dedupKey: 'r1.recording.erase:c1' });
+    await runtime!.tickAll();
+    await runtime!.stop();
+    expect(tables.interview_round_recordings![0]).toMatchObject({ status: 'deleted', delete_reason: 'consent_withdrawn' });
+    expect(store.objectKeys()).toEqual([]);
+    expect(await queue.getById(queued.id)).toMatchObject({ status: 'completed' });
+    expect(runtime!.snapshot().storageJobEvents).toMatchObject({ claimed: 1, completed: 1 });
+  });
+
+  it('runs the retention: one sweep per 15-minute bucket, and the due recording is erased', async () => {
+    const tables = tablesWithWithdrawal({ interview_round_consents: [] });
+    tables.interview_round_recordings = [recordingRow(1, { delete_after: iso(FIXTURE_NOW_MS - 60_000) })];
+    const { runtime, queue, store } = standalone({ tables });
+    store.putObject(KEYS.stream, mp4(100));
+    const enqueued: Array<{ id: string; dedupKey: string | undefined }> = [];
+    const realEnqueue = queue.enqueue.bind(queue);
+    vi.spyOn(queue, 'enqueue').mockImplementation(async (name: string, payload: unknown, o?: { dedupKey?: string; maxAttempts?: number }) => {
+      const job = await realEnqueue(name, payload, o);
+      if (name === R1_SWEEP_QUEUE) enqueued.push({ id: job.id, dedupKey: o?.dedupKey });
+      return job;
+    });
+    const bucket = Math.floor(FIXTURE_NOW_MS / R1_RUNTIME_BOUNDS.sweepBucketMs);
+    await runtime!.tickAll();
+    await runtime!.tickAll();
+    expect(enqueued.map((j) => j.dedupKey)).toEqual([`r1.sweep:${bucket}`]);
+    await vi.waitFor(async () => expect(await queue.getById(enqueued[0]!.id)).toMatchObject({ status: 'completed' }));
+    expect(tables.interview_round_recordings![0]).toMatchObject({ status: 'deleted', delete_reason: 'retention' });
+    expect(store.objectKeys()).toEqual([]);
+    await runtime!.stop();
+  });
+
+  it('never claims a phone job or an assessment job', async () => {
+    const { runtime, queue } = standalone();
+    const phone = await queue.enqueue('phone.dial', { engagement_id: ROUND }, { maxAttempts: 3 });
+    const assessment = await queue.enqueue('r1.assessment', { session_id: SESSION }, { maxAttempts: 3 });
+    await runtime!.tickAll();
+    await runtime!.stop();
+    expect(await queue.getById(phone.id)).toMatchObject({ status: 'pending', attempts: 0 });
+    expect(await queue.getById(assessment.id)).toMatchObject({ status: 'pending', attempts: 0 });
+  });
+
+  it('starts and stops its scheduler cleanly and is the only thing it owns', async () => {
+    const { runtime } = standalone();
+    expect(runtime!.scheduler.running()).toBe(false);
+    runtime!.scheduler.start();
+    expect(runtime!.scheduler.running()).toBe(true);
+    await runtime!.stop();
+    expect(runtime!.scheduler.running()).toBe(false);
+    expect(runtime!.storageRunner.stopped()).toBe(true);
   });
 });
 

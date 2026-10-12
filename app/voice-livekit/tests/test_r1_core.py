@@ -6396,16 +6396,51 @@ class TestTurnAnchors(R1TestCase):
         index = self.say_as_candidate("hello there", spoke_at=self.T0 + 5.0, final_at=self.T0 + 6.4)
         self.assertEqual(await self.anchor_of(index), 1_760_000_005_000)
 
-    async def test_the_latest_speaking_event_at_or_before_the_final_is_the_one_used(self) -> None:
-        for offset in (1.0, 3.0, 5.0):
+    def candidate_speaks(self, *offsets: float) -> None:
+        for offset in offsets:
             self.session.emit(
                 "user_state_changed",
                 SimpleNamespace(old_state="listening", new_state="speaking", created_at=self.T0 + offset),
             )
-        index = self.say_as_candidate("again", final_at=self.T0 + 4.0)  # the 5.0 s event is AFTER it
-        self.assertEqual(await self.anchor_of(index), 1_760_000_003_000)
-        index = self.say_as_candidate("exactly", final_at=self.T0 + 5.0)  # "at or before"
-        self.assertEqual(await self.anchor_of(index), 1_760_000_005_000)
+
+    async def test_the_latest_speaking_event_at_or_before_the_final_is_the_one_used(self) -> None:
+        self.candidate_speaks(1.0, 8.0, 15.0)  # far enough apart to be three separate answers
+        index = self.say_as_candidate("again", final_at=self.T0 + 10.0)  # the 15 s event is AFTER it
+        self.assertEqual(await self.anchor_of(index), 1_760_000_008_000)
+        index = self.say_as_candidate("exactly", final_at=self.T0 + 15.0)  # "at or before"
+        self.assertEqual(await self.anchor_of(index), 1_760_000_015_000)
+
+    async def test_a_pause_and_resume_before_the_first_final_anchors_on_the_start_of_the_answer(self) -> None:
+        """Review round 1: speech from T+10, a 0.6 s pause, speech again at T+12.6, the first segment's
+        final only at T+13.0.  The row used to start at the resumption, 2.6 s into the answer."""
+        self.candidate_speaks(10.0, 12.6)
+        index = self.say_as_candidate("so in my last role", final_at=self.T0 + 13.0)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_010_000)
+
+    async def test_several_pauses_in_a_row_are_still_one_burst(self) -> None:
+        self.candidate_speaks(10.0, 13.5, 16.9, 20.2)  # each resumption within 4 s of the one before
+        index = self.say_as_candidate("a long answer", final_at=self.T0 + 21.0)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_010_000)
+
+    async def test_speaking_events_more_than_the_burst_gap_apart_are_separate_answers(self) -> None:
+        self.candidate_speaks(10.0)
+        self.candidate_speaks(14.0)  # exactly the gap: still the same burst
+        index = self.say_as_candidate("one", final_at=self.T0 + 15.0)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_010_000)
+        self.interview._user_speaking_at.clear()
+        self.candidate_speaks(10.0, 14.001)  # a hair more: the earlier event is another answer
+        index = self.say_as_candidate("two", final_at=self.T0 + 15.0)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_014_001)
+
+    async def test_a_burst_never_reaches_back_past_thirty_seconds_before_the_final(self) -> None:
+        self.candidate_speaks(*[0.0, 3.5, 7.0, 10.5, 14.0, 17.5, 21.0, 24.5])  # (8 kept: all within 4 s of each other)
+        index = self.say_as_candidate("long", final_at=self.T0 + 30.5)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_003_500, "the 0.0 s event is 30.5 s old")
+
+    async def test_events_after_the_final_are_not_part_of_its_burst(self) -> None:
+        self.candidate_speaks(10.0, 12.0)
+        index = self.say_as_candidate("early final", final_at=self.T0 + 11.0)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_010_000)  # (12.0 is a resumption AFTER the final)
 
     async def test_a_speaking_event_more_than_30_seconds_earlier_is_another_utterance(self) -> None:
         index = self.say_as_candidate("late", spoke_at=self.T0, final_at=self.T0 + 30.0)
