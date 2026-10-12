@@ -215,6 +215,7 @@
         "R1_SYNTH_PER_MIN": { "requiredInProduction": false, "secret": false },
         "R1_RECORDING": { "requiredInProduction": false, "secret": false },
         "R1_VIDEO_RECORDING": { "requiredInProduction": false, "secret": false },
+        "R1_VIDEO_X264_PRESET": { "requiredInProduction": false, "secret": false },
         "CANDIDATE_SILENCE_PROMPT_SEC": { "requiredInProduction": true, "secret": false },
         "CANDIDATE_SILENCE_END_SEC": { "requiredInProduction": true, "secret": false },
         "CANDIDATE_SILENCE_SECOND_NUDGE_SEC": { "requiredInProduction": false, "secret": false },

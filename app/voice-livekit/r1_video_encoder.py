@@ -21,8 +21,16 @@ This module never logs: no ``logging``, no ``print``, nothing on stderr (the par
 it to ``/dev/null``).  It imports ``av`` and ``numpy`` only inside functions, so the
 recorder can import the protocol helpers without the media stack.
 
-This build records AUDIO only.  ``VIDEO`` messages are parsed and ignored, and a ``HELLO``
-that asks for video is refused with ``video_unsupported`` (camera capture is a later task).
+Two spool writers share the file name ``stream.mp4``:
+
+* ``AudioSpool``: AAC mono only (``HELLO`` with ``video`` false, or a wheel without libx264).
+* ``AVSpool``: H.264 640x360 at a constant 15 fps plus the same AAC, in one fragmented MP4.
+  The picture clock lives HERE: every 1/15 s tick takes the newest frame received up to half a
+  frame after that time, repeats it when none arrived, and shows black once the camera has been
+  silent for 1.2 s (counted, it is the "camera off" time).  Every size and rotation is normalised onto
+  the fixed canvas, so a 4:3 webcam, a portrait phone and a 320x180 stream all land alike.
+  Both streams count from the same ``t0`` (the ``HELLO`` ``t0_us``), which is what keeps the
+  picture and the voices in step.
 """
 from __future__ import annotations
 
@@ -71,6 +79,32 @@ HEARTBEAT_SECONDS = 1.0
 STREAM_NAME = "stream.mp4"
 VIDEO_NAME = "video.mp4"
 
+# The picture: one fixed canvas at a constant frame rate (roadmap section 8).
+VIDEO_WIDTH = 640
+VIDEO_HEIGHT = 360
+VIDEO_FPS = 15
+# A held picture older than this becomes black: the camera is off (or the track is gone).
+VIDEO_HOLD_US = 1_200_000
+# A tick is produced this long after its time, so a frame that is a little late over the pipe
+# still lands on the tick it belongs to.
+VIDEO_LATENCY_US = 120_000
+# A picture goes to the NEAREST tick: it is eligible for tick ``t`` when it was received up to half a
+# frame after ``t``.  (Taking only pictures at or before ``t`` would show every picture up to one
+# whole frame late, 33 ms on average, which comes straight out of the audio/video sync budget.)
+VIDEO_HALF_TICK_US = 1_000_000 // VIDEO_FPS // 2
+# One keyframe every 2 s: the muxer cuts a fragment on each, so the spool grows every 2 s.
+VIDEO_KEYINT = 30
+VIDEO_MIN_DIM = 16
+VIDEO_MAX_DIM = 4096
+# Frames received but not yet placed on a tick; more than this means the loop fell far behind.
+VIDEO_PENDING_MAX = 12
+ROTATIONS = (0, 90, 180, 270)
+# With a picture the loop wakes at least this often to produce the due ticks.
+VIDEO_POLL_SECONDS = 0.04
+# The parent's ``t0`` is trusted when it is within this of the child's own clock; otherwise (a
+# different clock domain) the child counts from the moment ``HELLO`` arrived.
+ORIGIN_TOLERANCE_US = 120_000_000
+
 PRESETS = frozenset({"ultrafast", "superfast", "veryfast"})
 DEFAULT_PRESET = "superfast"
 
@@ -88,7 +122,6 @@ ERROR_CODES = frozenset(
         "no_av",
         "no_aac",
         "protocol",
-        "video_unsupported",
         "encode_failed",
         "disk_full",
         "remux_failed",
@@ -197,6 +230,21 @@ def parse_video(payload: bytes) -> tuple[int, int, int, bytes]:
         raise FrameError("video")
     width, height, rotation = VIDEO_HEADER.unpack_from(payload)
     return width, height, rotation, payload[VIDEO_HEADER.size :]
+
+
+def i420_size(width: int, height: int) -> int:
+    """Bytes of a tightly packed I420 picture (even dimensions only)."""
+    return width * height * 3 // 2
+
+
+def picture_is_usable(width: int, height: int, rotation: int, data: bytes) -> bool:
+    """A picture the normaliser can take: even sides in range, a known rotation, exact length."""
+    if rotation not in ROTATIONS:
+        return False
+    for side in (width, height):
+        if side < VIDEO_MIN_DIM or side > VIDEO_MAX_DIM or side % 2:
+            return False
+    return len(data) == i420_size(width, height)
 
 
 def pack_eof() -> bytes:
@@ -369,27 +417,44 @@ class AudioSpool:
     pair every ``FRAG_DURATION_US``.
     """
 
+    # What the status lines report about the picture (an audio-only spool has none).
+    has_video = False
+    frames = 0
+    dropped = 0
+    black = 0
+    width = 0
+    height = 0
+    fps = 0
+
     def __init__(self, path: Path) -> None:
         import av
 
         self._av = av
         self.path = path
-        self._container = av.open(
-            str(path),
-            mode="w",
-            format="mp4",
-            options={
-                "movflags": "empty_moov+default_base_moof",
-                "frag_duration": str(FRAG_DURATION_US),
-                "flush_packets": "1",
-            },
-        )
+        self._container = av.open(str(path), mode="w", format="mp4", options=self._container_options())
+        self._add_video_stream()  # before the audio stream, so the picture is stream 0
         self._stream = self._container.add_stream("aac", rate=SAMPLE_RATE, layout="mono")
         self._stream.codec_context.bit_rate = AAC_BIT_RATE
         self._fifo = av.AudioFifo()
         self._pts = 0  # next AAC frame's presentation time, in samples
         self.received_samples = 0  # samples handed to the fifo (silence included)
         self.closed = False
+
+    def _container_options(self) -> dict[str, str]:
+        return {
+            "movflags": "empty_moov+default_base_moof",
+            "frag_duration": str(FRAG_DURATION_US),
+            "flush_packets": "1",
+        }
+
+    def _add_video_stream(self) -> None:
+        """Hook: the audio-only spool has no picture."""
+
+    def advance(self, now_us: int) -> None:
+        """Hook: produce the pictures due by ``now_us`` (microseconds since ``t0``)."""
+
+    def feed_video(self, pts_us: int, payload: bytes) -> None:
+        """Hook: a ``VIDEO`` message for a spool that has no picture is ignored."""
 
     @property
     def media_ms(self) -> int:
@@ -454,6 +519,203 @@ class AudioSpool:
             return self.path.stat().st_size
         except OSError:
             return 0
+
+
+class _Normalizer:
+    """Any I420 picture -> the fixed 640x360 canvas, as a ``(540, 640)`` uint8 array.
+
+    One filter graph per (width, height, rotation): rotate by the frame's rotation (the SDK
+    reports it but never applies it), scale to fit keeping the aspect ratio, pad with black.
+    A picture that already is 640x360 upright skips the graph.  The graph is rebuilt by the
+    caller when the size or rotation changes.
+    """
+
+    def __init__(self, av: Any, width: int, height: int, rotation: int) -> None:
+        self._av = av
+        self.key = (width, height, rotation)
+        self._width, self._height = width, height
+        self._pushed = 0
+        self._graph: Any = None
+        if self.key != (VIDEO_WIDTH, VIDEO_HEIGHT, 0):
+            self._graph = self._build(rotation)
+
+    def _build(self, rotation: int) -> Any:
+        av = self._av
+        graph = av.filter.Graph()
+        last = graph.add_buffer(
+            width=self._width, height=self._height, format="yuv420p", time_base=Fraction(1, VIDEO_FPS)
+        )
+        steps: list[tuple[str, str]] = []
+        if rotation == 90:
+            steps.append(("transpose", "1"))  # clockwise
+        elif rotation == 270:
+            steps.append(("transpose", "2"))  # counter-clockwise
+        elif rotation == 180:
+            steps.extend((("hflip", ""), ("vflip", "")))
+        steps.append(("scale", f"{VIDEO_WIDTH}:{VIDEO_HEIGHT}:force_original_aspect_ratio=decrease"))
+        steps.append(("pad", f"{VIDEO_WIDTH}:{VIDEO_HEIGHT}:(ow-iw)/2:(oh-ih)/2"))
+        for name, args in steps:
+            node = graph.add(name, args) if args else graph.add(name)
+            last.link_to(node)
+            last = node
+        sink = graph.add("buffersink")
+        last.link_to(sink)
+        graph.configure()
+        return graph
+
+    def apply(self, i420: bytes) -> Any:
+        import numpy as np
+
+        picture = np.frombuffer(i420, dtype=np.uint8).reshape(self._height * 3 // 2, self._width)
+        if self._graph is None:
+            return picture
+        # ``from_ndarray`` rather than ``planes[i].update``: the latter raises for widths that are
+        # not aligned to the allocation stride (854x480, 426x240 both do).
+        frame = self._av.VideoFrame.from_ndarray(picture, format="yuv420p")
+        frame.pts = self._pushed
+        frame.time_base = Fraction(1, VIDEO_FPS)
+        self._pushed += 1
+        self._graph.push(frame)
+        return self._graph.pull().to_ndarray()
+
+
+class AVSpool(AudioSpool):
+    """The combined spool: H.264 (``libx264``) on a constant 15 fps clock plus the AAC audio.
+
+    ``feed_video`` only queues the picture; ``advance(now_us)`` produces every tick that is due
+    (``now_us`` counts from ``t0``).  That keeps the 15 fps clock steady whatever the camera
+    does: a late frame is repeated over, a missing one is black after ``VIDEO_HOLD_US``.
+    ``fragment on keyframe`` plus ``flush_packets`` make the file grow every 2 s with a valid
+    prefix at every point (the uploader tails it).
+    """
+
+    has_video = True
+    width = VIDEO_WIDTH
+    height = VIDEO_HEIGHT
+    fps = VIDEO_FPS
+
+    def __init__(self, path: Path, *, preset: str = DEFAULT_PRESET) -> None:
+        self._preset = preset if preset in PRESETS else DEFAULT_PRESET
+        self._pending: list[tuple[int, int, int, int, bytes]] = []
+        self._latest: Any = None  # the normalised newest picture (an array) ...
+        self._latest_pts = 0  # ... and when it was received
+        self._normalizer: _Normalizer | None = None
+        self._black: Any = None
+        self._next_tick = 0
+        self.frames = 0  # ticks encoded (repeated and black ones included)
+        self.dropped = 0  # pictures the child could not use (malformed, or the queue overflowed)
+        self.black = 0  # ticks shown as black
+        super().__init__(path)
+
+    def _container_options(self) -> dict[str, str]:
+        return {"movflags": "frag_keyframe+empty_moov+default_base_moof", "flush_packets": "1"}
+
+    def _add_video_stream(self) -> None:
+        import numpy as np
+
+        stream = self._container.add_stream("libx264", rate=VIDEO_FPS)
+        stream.width, stream.height, stream.pix_fmt = VIDEO_WIDTH, VIDEO_HEIGHT, "yuv420p"
+        stream.codec_context.options = {
+            "preset": self._preset,
+            "tune": "zerolatency",
+            "crf": "28",
+            "maxrate": "500k",
+            "bufsize": "1000k",
+            "threads": "1",
+            "profile": "main",
+            "g": str(VIDEO_KEYINT),
+            "keyint_min": str(VIDEO_KEYINT),
+            "sc_threshold": "0",
+        }
+        self._vstream = stream
+        black = np.empty((VIDEO_HEIGHT * 3 // 2, VIDEO_WIDTH), dtype=np.uint8)
+        black[:VIDEO_HEIGHT] = 16  # limited-range black; chroma neutral
+        black[VIDEO_HEIGHT:] = 128
+        self._black = black
+
+    # -- input
+
+    def feed_video(self, pts_us: int, payload: bytes) -> None:
+        if self.closed:
+            return
+        try:
+            width, height, rotation, i420 = parse_video(payload)
+        except FrameError:
+            self.dropped += 1
+            return
+        if not picture_is_usable(width, height, rotation, i420):
+            self.dropped += 1
+            return
+        self._pending.append((pts_us, width, height, rotation, i420))
+        if len(self._pending) > VIDEO_PENDING_MAX:
+            del self._pending[0]
+            self.dropped += 1
+
+    # -- the clock
+
+    @staticmethod
+    def tick_us(index: int) -> int:
+        """Presentation time of tick ``index`` in microseconds (rounded, no drift)."""
+        return (index * 1_000_000 + VIDEO_FPS // 2) // VIDEO_FPS
+
+    def advance(self, now_us: int) -> None:
+        """Produce every tick whose time is at least ``VIDEO_LATENCY_US`` before ``now_us``."""
+        if self.closed:
+            return
+        limit = now_us - VIDEO_LATENCY_US
+        while self.tick_us(self._next_tick) <= limit:
+            self._emit(self._next_tick)
+            self._next_tick += 1
+
+    def _emit(self, index: int) -> None:
+        at = self.tick_us(index)
+        self._place(at)
+        if self._latest is None or at - self._latest_pts > VIDEO_HOLD_US:
+            picture = self._black
+            self.black += 1
+        else:
+            picture = self._latest
+        frame = self._av.VideoFrame.from_ndarray(picture, format="yuv420p")
+        frame.pts = index
+        frame.time_base = Fraction(1, VIDEO_FPS)
+        for packet in self._vstream.encode(frame):
+            self._container.mux(packet)
+        self.frames += 1
+
+    def _place(self, at_us: int) -> None:
+        """Make the newest picture received up to half a frame after ``at_us`` the one on show."""
+        horizon = at_us + VIDEO_HALF_TICK_US
+        due = [item for item in self._pending if item[0] <= horizon]
+        if not due:
+            return
+        self._pending = [item for item in self._pending if item[0] > horizon]
+        pts_us, width, height, rotation, i420 = max(due, key=lambda item: item[0])
+        try:
+            normalizer = self._normalizer
+            if normalizer is None or normalizer.key != (width, height, rotation):
+                normalizer = self._normalizer = _Normalizer(self._av, width, height, rotation)
+            self._latest = normalizer.apply(i420)
+            self._latest_pts = pts_us
+        except Exception:  # noqa: BLE001 - one bad picture must not end the recording
+            self._normalizer = None
+            self.dropped += 1
+
+    # -- end
+
+    def close(self) -> int:
+        if self.closed:
+            return self.size()
+        try:
+            # Carry the picture to the end of the audio, then flush the video encoder.
+            end_us = self.media_ms * 1000
+            while self.tick_us(self._next_tick) <= end_us:
+                self._emit(self._next_tick)
+                self._next_tick += 1
+            for packet in self._vstream.encode(None):
+                self._container.mux(packet)
+        finally:
+            size = super().close()
+        return size
 
 
 def remux_faststart(source: Path, target: Path) -> int:
@@ -551,6 +813,15 @@ def _serve(
     hello = False
     closed_info: dict[str, int] | None = None
     last_beat = clock()
+    origin_us = 0  # the clock reading, in microseconds, that media time zero is counted from
+
+    def media_now_us() -> int:
+        return int(clock() * 1_000_000) - origin_us
+
+    def counters() -> dict[str, int]:
+        if writer is None:
+            return {"frames": 0, "dropped": 0, "black": 0}
+        return {"frames": writer.frames, "dropped": writer.dropped, "black": writer.black}
 
     def beat(force: bool = False) -> None:
         nonlocal last_beat
@@ -560,10 +831,7 @@ def _serve(
         last_beat = now
         size = writer.size() if writer is not None else 0
         media = writer.media_ms if writer is not None else 0
-        emit(
-            {"s": STATUS_PROGRESS, "frames": 0, "dropped": 0, "black": 0, "bytes": size,
-             "media_ms": media}
-        )
+        emit({"s": STATUS_PROGRESS, **counters(), "bytes": size, "media_ms": media})
 
     def close_output() -> None:
         nonlocal closed_info
@@ -572,17 +840,20 @@ def _serve(
         size = writer.close()
         closed_info = {"bytes": size, "media_ms": writer.media_ms}
         emit(
-            {"s": STATUS_CLOSED, "bytes": size, "media_ms": writer.media_ms, "width": 0,
-             "height": 0, "fps": 0}
+            {"s": STATUS_CLOSED, **counters(), "bytes": size, "media_ms": writer.media_ms,
+             "width": writer.width, "height": writer.height, "fps": writer.fps}
         )
 
     while True:
         if stop.is_set():
             close_output()
             return 0
+        pictured = writer is not None and writer.has_video and closed_info is None
         try:
-            message = inbox.get(timeout=0.25)
+            message = inbox.get(timeout=VIDEO_POLL_SECONDS if pictured else 0.25)
         except queue.Empty:
+            if pictured:
+                writer.advance(media_now_us())
             beat()
             continue
         if message is _END:
@@ -602,10 +873,8 @@ def _serve(
             except FrameError:
                 emit({"s": STATUS_ERROR, "code": "protocol"})
                 return 2
-            if settings["video"]:
-                emit({"s": STATUS_ERROR, "code": "video_unsupported"})
-                return 1
-            writer = AudioSpool(spool / STREAM_NAME)
+            origin_us = pick_origin_us(int(clock() * 1_000_000), settings["t0_us"])
+            writer = _open_writer(spool / STREAM_NAME, settings, probe)
             hello = True
             beat(force=True)
             continue
@@ -613,7 +882,8 @@ def _serve(
             if writer is not None and closed_info is None:
                 writer.write(pts_us, payload)
         elif msg_type == MSG_VIDEO:
-            pass  # parsed by the wire layer, ignored until camera capture exists
+            if writer is not None and closed_info is None:
+                writer.feed_video(pts_us, payload)  # a no-op for an audio-only spool
         elif msg_type == MSG_EOF:
             close_output()
         elif msg_type == MSG_REMUX:
@@ -625,7 +895,37 @@ def _serve(
             emit({"s": STATUS_ERROR, "code": "protocol"})
             close_output()
             return 2
+        if writer is not None and writer.has_video and closed_info is None:
+            writer.advance(media_now_us())
         beat()
+
+
+def pick_origin_us(now_us: int, t0_us: int) -> int:
+    """The clock reading media time zero is counted from.
+
+    The parent's ``t0`` is on the same monotonic clock when both processes run on one machine
+    (always, in production), so it is trusted when it is close to the child's own reading;
+    anything else is another clock domain and time zero is when ``HELLO`` arrived.
+    """
+    if t0_us > 0 and abs(now_us - t0_us) <= ORIGIN_TOLERANCE_US:
+        return t0_us
+    return now_us
+
+
+def _open_writer(path: Path, settings: dict[str, Any], probe: dict[str, Any]) -> AudioSpool:
+    """The spool the ``HELLO`` asked for; a picture request the wheel cannot serve is audio only.
+
+    The parent learns which one it got from ``closed`` (``width`` 0 means no picture) and from
+    the ``x264`` flag of ``ready``.  A disk error is never swallowed here.
+    """
+    if settings["video"] and probe["x264"]:
+        try:
+            return AVSpool(path, preset=settings["preset"])
+        except OSError:
+            raise
+        except Exception:  # noqa: BLE001 - libx264 refused to open: keep the voices, lose the picture
+            pass
+    return AudioSpool(path)
 
 
 def _handle_remux(spool: Path, closed: bool, emit: Emit) -> None:

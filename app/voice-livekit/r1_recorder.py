@@ -6,7 +6,10 @@ What it records, and where it goes (binding contract C1-C11, ``IMPLEMENTER-RULES
   spool file.  A subclass tees each lock-step chunk to a tee thread that resamples to 48 kHz,
   mixes to mono, pads wall-clock gaps with silence and hands the PCM to a niced child
   process (``r1_video_encoder``), which writes a fragmented MP4 (AAC) that grows as the
-  interview goes on.  This build records audio only; camera capture is a later task.
+  interview goes on.  In ``av`` mode the recorder also subscribes to the candidate's camera
+  itself (the session connects audio-only), decimates it to 15 fps and hands the pictures to the
+  same child, which puts them on a constant-rate clock next to the audio.  A watchdog gives the
+  picture up (never the audio) when the machine is struggling.
 * One uploader thread talks to the API (``/api/internal/r1/recording/{prepare,part-url,
   object-url,complete}``) and PUTs to the presigned URLs it returns: 5 MiB parts cut from the
   growing MP4, and the whole OGG every ``checkpoint_interval_sec``.  The worker holds no R2
@@ -29,6 +32,7 @@ allowlisted, fixed values only.
 from __future__ import annotations
 
 import asyncio
+import collections
 import concurrent.futures
 import contextlib
 import http.client
@@ -64,8 +68,10 @@ MODE_OFF = "off"
 MODE_AUDIO = "audio"
 MODE_AV = "av"
 _MODE_RANK = {MODE_OFF: 0, MODE_AUDIO: 1, MODE_AV: 2}
-# Camera capture is not built yet: an ``av`` request is recorded as audio until it is.
-VIDEO_CAPTURE_READY = False
+# Camera capture: with this off an ``av`` request is recorded as audio (a kill switch for tests).
+VIDEO_CAPTURE_READY = True
+PRESETS = ("ultrafast", "superfast", "veryfast")
+DEFAULT_PRESET = "superfast"
 
 SPOOL_ROOT = Path("/tmp/r1-rec")
 STREAM_NAME = "stream.mp4"
@@ -102,6 +108,41 @@ GAP_SLACK_SECONDS = 0.25
 MAX_AUDIO_PIECE_SECONDS = 30
 # 30 s of 48 kHz mono s16 may queue for a slow encoder; more means it is stuck.
 ENCODER_AUDIO_BACKLOG_BYTES = 30 * SAMPLE_RATE * 2
+
+# Camera capture (roadmap section 8).  Numeric SDK values, pinned by ``test_r1_sdk_contract``:
+# ``rtc.TrackKind.KIND_VIDEO``, ``rtc.TrackSource.SOURCE_CAMERA``, ``rtc.ParticipantKind.STANDARD``,
+# ``rtc.VideoBufferType.I420`` and the ``VideoRotation`` enum (0, 1, 2, 3 = 0, 90, 180, 270 degrees).
+KIND_VIDEO = 2
+SOURCE_CAMERA = 1
+PARTICIPANT_STANDARD = 0
+BUFFER_I420 = 5
+ROTATION_DEGREES = {0: 0, 1: 90, 2: 180, 3: 270}
+VIDEO_FPS = 15
+# A picture is taken when it arrives at least this long after the last one taken: a 30 fps camera
+# is halved, a 15 fps one passes untouched.
+VIDEO_MIN_GAP_SECONDS = 0.060
+# The SDK's own ring (drops the oldest) and our queue in front of the child's pipe (likewise).
+VIDEO_STREAM_CAPACITY = 3
+VIDEO_QUEUE_MAX = 3
+VIDEO_MIN_SIDE = 16
+VIDEO_MAX_SIDE = 4096
+
+# Watchdog thresholds (roadmap section 8, "Isolation and degrade").  Level 1 gives up the picture;
+# nothing here ever touches the audio.
+LAG_TICK_SECONDS = 0.05
+LAG_LIMIT_SECONDS = 0.25
+LAG_WINDOW_SECONDS = 5.0
+VAD_LOAD_FRACTION = 0.40  # mean inference time as a share of one VAD window
+VAD_SINGLE_LIMIT_SECONDS = 0.2
+VAD_WINDOW_SECONDS = 0.032
+VAD_CONSECUTIVE_BATCHES = 2
+DROP_RATIO_LIMIT = 0.30
+DROP_WINDOW_SECONDS = 10.0
+DROP_MIN_PICTURES = 30
+BACKLOG_PARTS_LIMIT = 6
+SPOOL_BYTES_LIMIT = 300 * 1024 * 1024
+LOW_FREE_BYTES = 128 * 1024 * 1024
+MAX_DEGRADED_AT_MS = 86_400_000
 
 FORCED_OUTCOMES = frozenset({"shutdown_forced"})
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
@@ -158,6 +199,12 @@ def effective_mode(context: Mapping[str, Any] | None, env: Mapping[str, str] | N
     return capability if _MODE_RANK[capability] <= _MODE_RANK[server] else server
 
 
+def x264_preset(env: Mapping[str, str] | None = None) -> str:
+    """``R1_VIDEO_X264_PRESET``: ``ultrafast``, ``superfast`` or ``veryfast``; anything else is the default."""
+    raw = os.environ.get("R1_VIDEO_X264_PRESET") if env is None else env.get("R1_VIDEO_X264_PRESET")
+    return raw if raw in PRESETS else DEFAULT_PRESET
+
+
 # ---------------------------------------------------------------------------- spool
 
 
@@ -196,6 +243,16 @@ class Spool:
         while not probe.exists() and probe != probe.parent:
             probe = probe.parent
         return shutil.disk_usage(probe).free
+
+    def used_bytes(self) -> int:
+        """Bytes the spool files hold right now (a missing file counts as nothing)."""
+        total = 0
+        for name in _SPOOL_FILES:
+            try:
+                total += (self.dir / name).stat().st_size
+            except OSError:
+                continue
+        return total
 
     def wipe(self, *, overwrite: bool = False) -> bool:
         """Delete the spool files (zero-filling them first when ``overwrite``) and the directory."""
@@ -487,6 +544,12 @@ class EncoderProcess:
 
     All pipe I/O is on two daemon threads, so a stuck child can block only them; the
     recorder's watchdog notices the missing heartbeat and kills it.
+
+    Two queues feed the one writer thread.  The ordered queue carries HELLO, audio and the
+    control messages and is never reordered; the picture queue holds at most
+    ``VIDEO_QUEUE_MAX`` pictures and drops the OLDEST when full (counted), so a slow child can
+    never make the event loop wait or the process grow.  Audio goes first; a barrier message
+    (EOF, REMUX, QUIT) waits until the pictures queued before it have been written.
     """
 
     def __init__(
@@ -504,9 +567,14 @@ class EncoderProcess:
         self._popen = popen
         self._clock = clock
         self._proc: Any = None
-        self._out: queue.Queue[bytes | None] = queue.Queue()
+        self._ordered: collections.deque[tuple[bytes, bool]] = collections.deque()
+        self._pictures: collections.deque[tuple[int, int, int, int, bytes]] = collections.deque()
+        self._wake = threading.Condition()
+        self._writer_stop = False
         self._queued = 0
         self._lock = threading.Lock()
+        self.video_dropped = 0  # pictures pushed out of the queue by newer ones
+        self.video_sent = 0  # pictures written to the pipe
         self.ready = threading.Event()
         self.closed = threading.Event()
         self.remuxed = threading.Event()
@@ -558,14 +626,35 @@ class EncoderProcess:
         proc = self._proc
         return proc is not None and proc.poll() is None
 
+    def can_encode_video(self) -> bool:
+        """The child can take pictures: alive, and (once it has reported) libx264 is there."""
+        if self.dead or self.exited.is_set():
+            return False
+        info = self.ready_info
+        return info is None or bool(info.get("x264"))
+
     # -- sending
 
-    def _send(self, frame: bytes) -> bool:
+    def _send(self, frame: bytes, *, barrier: bool = False) -> bool:
         if self._proc is None or self.exited.is_set() or self._killed:
             return False
         with self._lock:
             self._queued += len(frame)
-        self._out.put(frame)
+        with self._wake:
+            self._ordered.append((frame, barrier))
+            self._wake.notify()
+        return True
+
+    def send_video(self, pts_us: int, width: int, height: int, rotation: int, picture: bytes) -> bool:
+        """Queue one I420 picture (never blocks).  The oldest queued picture goes when it is full."""
+        if self._proc is None or self.exited.is_set() or self._killed:
+            return False
+        with self._wake:
+            if len(self._pictures) >= VIDEO_QUEUE_MAX:
+                self._pictures.popleft()
+                self.video_dropped += 1
+            self._pictures.append((pts_us, width, height, rotation, picture))
+            self._wake.notify()
         return True
 
     def send_hello(self, *, video: bool, preset: str, t0_us: int) -> bool:
@@ -580,14 +669,14 @@ class EncoderProcess:
         return self._send(_wire().pack_audio(pts_us, pcm))
 
     def send_eof(self) -> bool:
-        return self._send(_wire().pack_eof())
+        return self._send(_wire().pack_eof(), barrier=True)
 
     def send_remux(self) -> bool:
-        return self._send(_wire().pack_remux())
+        return self._send(_wire().pack_remux(), barrier=True)
 
     def quit(self) -> bool:
         self._quit_sent = True
-        return self._send(_wire().pack_quit())
+        return self._send(_wire().pack_quit(), barrier=True)
 
     def kill(self) -> None:
         """SIGKILL equivalent; the spool stays valid up to its last fragment."""
@@ -596,18 +685,40 @@ class EncoderProcess:
         if proc is not None:
             with contextlib.suppress(Exception):
                 proc.kill()
-        self._out.put(None)
+        with self._wake:
+            self._writer_stop = True
+            self._ordered.clear()
+            self._pictures.clear()
+            self._wake.notify_all()
 
     # -- threads
+
+    def _next_to_write(self) -> tuple[bytes, bool] | None:
+        """The next message for the pipe: ordered ones first (a barrier waits for the pictures
+        queued ahead of it), else a picture.  ``None`` when the writer must stop."""
+        with self._wake:
+            while True:
+                if self._writer_stop:
+                    return None
+                if self._ordered:
+                    frame, barrier = self._ordered[0]
+                    if not barrier or not self._pictures:
+                        self._ordered.popleft()
+                        return frame, True
+                if self._pictures:
+                    pts_us, width, height, rotation, picture = self._pictures.popleft()
+                    return _wire().pack_video(pts_us, width, height, rotation, picture), False
+                self._wake.wait()
 
     def _write_loop(self) -> None:
         proc = self._proc
         stdin = proc.stdin
         try:
             while True:
-                frame = self._out.get()
-                if frame is None:
+                item = self._next_to_write()
+                if item is None:
                     break
+                frame, ordered = item
                 try:
                     stdin.write(frame)
                     stdin.flush()
@@ -615,8 +726,11 @@ class EncoderProcess:
                     self.exited.set()
                     break
                 finally:
-                    with self._lock:
-                        self._queued -= len(frame)
+                    if ordered:
+                        with self._lock:
+                            self._queued -= len(frame)
+                if not ordered:
+                    self.video_sent += 1
         finally:
             with contextlib.suppress(Exception):
                 stdin.close()
@@ -633,6 +747,9 @@ class EncoderProcess:
             pass
         finally:
             self.exited.set()
+            with self._wake:  # the child is gone: nothing more can be written to it
+                self._writer_stop = True
+                self._wake.notify_all()
             with contextlib.suppress(Exception):
                 proc.wait(timeout=5)  # reap the child so it never lingers as a zombie
 
@@ -816,6 +933,347 @@ def _build_recorder_io_class() -> type:
     return R1RecorderIO
 
 
+# ---------------------------------------------------------------------------- camera
+
+
+def _is_camera(publication: Any) -> bool:
+    return getattr(publication, "kind", None) == KIND_VIDEO and getattr(publication, "source", None) == SOURCE_CAMERA
+
+
+def _default_stream(track: Any) -> Any:
+    """The SDK's decoded-frame stream for ``track``: I420 pictures, the oldest dropped when behind."""
+    from livekit import rtc
+
+    return rtc.VideoStream(track, capacity=VIDEO_STREAM_CAPACITY, format=rtc.VideoBufferType.I420)
+
+
+class CameraCapture:
+    """The candidate's camera, from subscription to a picture handed to the encoder.
+
+    The session connects audio-only, so nothing forwards the camera to the worker until this
+    asks for it (``set_subscribed``).  It follows the candidate across a refresh or a rejoin
+    (every new publication, every ``track_subscribed``), re-creates the frame stream whenever
+    one ends, and treats a camera that never appears as normal: the encoder shows black for it.
+
+    Each picture is taken only when at least ``VIDEO_MIN_GAP_SECONDS`` have passed since the last
+    one taken (receipt time), copied once into ``bytes`` and stamped with ``clock() - t0`` (the same
+    media clock as the audio).  ``unsubscribe()`` is the Level 1 degrade: it gives the camera up
+    for good.  Everything runs on the event loop.
+    """
+
+    _EVENTS = ("participant_connected", "participant_disconnected", "track_published", "track_subscribed", "track_unsubscribed")
+
+    def __init__(
+        self,
+        *,
+        room: Any,
+        identity: str | None,
+        loop: asyncio.AbstractEventLoop,
+        clock: Callable[[], float],
+        t0: float,
+        on_picture: Callable[[int, int, int, int, bytes], None],
+        on_reject: Callable[[], None],
+        make_stream: Callable[[Any], Any] = _default_stream,
+    ) -> None:
+        self._room = room
+        self._identity = identity
+        self._loop = loop
+        self._clock = clock
+        self._t0 = t0
+        self._on_picture = on_picture
+        self._on_reject = on_reject
+        self._make_stream = make_stream
+        self._handlers: dict[str, Callable[..., None]] = {}
+        self._stream: Any = None
+        self._track_sid: str | None = None
+        self._pump: asyncio.Task[Any] | None = None
+        self._last_taken = float("-inf")
+        self._off = False
+        self._pump_error_logged = False
+        self.received = 0  # frames the SDK handed over
+        self.taken = 0  # frames passed on to the encoder
+        self.rejected = 0  # frames we could not use (odd size, bad length, no conversion)
+        self.streams_opened = 0
+
+    # -- lifecycle
+
+    def start(self) -> None:
+        """Register for the room's events and look at who is already there."""
+        for event in self._EVENTS:
+            handler = getattr(self, "_on_" + event)
+            self._handlers[event] = handler
+            with contextlib.suppress(Exception):
+                self._room.on(event, handler)
+        self.scan()
+
+    def _unregister(self) -> None:
+        handlers, self._handlers = self._handlers, {}
+        for event, handler in handlers.items():
+            with contextlib.suppress(Exception):
+                self._room.off(event, handler)
+
+    def stop(self) -> None:
+        """Capture is over (idempotent): no new pictures, the stream is closed."""
+        self._off = True
+        self._unregister()
+        self._close_stream()
+
+    def unsubscribe(self) -> None:
+        """Give the camera up for good: ask the SFU to stop sending it, then ``stop``."""
+        if self._off:
+            return
+        for participant in self._candidates():
+            for publication in self._publications(participant):
+                if _is_camera(publication):
+                    with contextlib.suppress(Exception):
+                        publication.set_subscribed(False)
+        self.stop()
+
+    # -- who and what
+
+    def _is_candidate(self, participant: Any) -> bool:
+        if self._identity:
+            return getattr(participant, "identity", None) == self._identity
+        return getattr(participant, "kind", None) == PARTICIPANT_STANDARD
+
+    def _candidates(self) -> list[Any]:
+        participants = getattr(self._room, "remote_participants", None) or {}
+        values = participants.values() if hasattr(participants, "values") else participants
+        return [p for p in list(values) if self._is_candidate(p)]
+
+    @staticmethod
+    def _publications(participant: Any) -> list[Any]:
+        publications = getattr(participant, "track_publications", None) or {}
+        values = publications.values() if hasattr(publications, "values") else publications
+        return list(values)
+
+    def scan(self) -> None:
+        """Subscribe to every candidate camera and open the stream for a subscribed one.
+
+        Run at start and once a second by the watchdog, so a missed event costs a second, not the
+        picture.
+        """
+        if self._off:
+            return
+        for participant in self._candidates():
+            for publication in self._publications(participant):
+                self._consider(publication)
+
+    def _consider(self, publication: Any) -> None:
+        if self._off or not _is_camera(publication):
+            return
+        try:
+            if not getattr(publication, "subscribed", False):
+                publication.set_subscribed(True)
+            track = getattr(publication, "track", None)
+            if track is not None:
+                self._open(track)
+        except Exception:  # noqa: BLE001 - the camera is optional; the next scan tries again
+            return
+
+    # -- room events
+
+    def _on_participant_connected(self, participant: Any) -> None:
+        if self._is_candidate(participant):
+            self.scan()
+
+    def _on_participant_disconnected(self, participant: Any) -> None:
+        if self._is_candidate(participant):
+            self._close_stream()
+
+    def _on_track_published(self, publication: Any, participant: Any) -> None:
+        if self._is_candidate(participant):
+            self._consider(publication)
+
+    def _on_track_subscribed(self, track: Any, publication: Any, participant: Any) -> None:
+        if self._is_candidate(participant) and _is_camera(publication) and not self._off:
+            self._open(track)
+
+    def _on_track_unsubscribed(self, track: Any, publication: Any, participant: Any) -> None:
+        if self._is_candidate(participant) and _is_camera(publication) and getattr(track, "sid", None) == self._track_sid:
+            self._close_stream()
+
+    # -- the stream
+
+    def _open(self, track: Any) -> None:
+        sid = getattr(track, "sid", None)
+        if self._off or (self._stream is not None and self._track_sid == sid):
+            return
+        self._close_stream()
+        stream = self._make_stream(track)
+        self._stream, self._track_sid = stream, sid
+        self.streams_opened += 1
+        self._pump = self._loop.create_task(self._run(stream))
+
+    def _close_stream(self) -> None:
+        stream, pump = self._stream, self._pump
+        self._stream, self._track_sid, self._pump = None, None, None
+        if pump is not None:
+            pump.cancel()
+        if stream is not None:
+            self._loop.create_task(_close_quietly(stream))
+
+    async def _run(self, stream: Any) -> None:
+        try:
+            async for event in stream:
+                self._on_frame(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a broken stream ends the picture, not the call
+            if not self._pump_error_logged:
+                self._pump_error_logged = True
+                _log.warn("unknown_event", error_type="r1_rec_camera_stream_failed", error_category=_error_type_of(exc))
+        finally:
+            if self._stream is stream:  # it ended by itself (EOS): wait for the next track
+                self._stream, self._track_sid, self._pump = None, None, None
+                self._loop.create_task(_close_quietly(stream))
+
+    def _on_frame(self, event: Any) -> None:
+        if self._off:
+            return
+        now = self._clock()
+        self.received += 1
+        if now - self._last_taken < VIDEO_MIN_GAP_SECONDS:
+            return
+        picture = self._picture(event)
+        if picture is None:
+            self.rejected += 1
+            self._on_reject()
+            return
+        width, height, rotation, data = picture
+        self._last_taken = now
+        self.taken += 1
+        self._on_picture(max(0, int((now - self._t0) * 1_000_000)), width, height, rotation, data)
+
+    @staticmethod
+    def _picture(event: Any) -> tuple[int, int, int, bytes] | None:
+        try:
+            frame = event.frame
+            rotation = ROTATION_DEGREES.get(int(event.rotation))
+            if rotation is None:
+                return None
+            if frame.type != BUFFER_I420:
+                frame = frame.convert(BUFFER_I420)
+            width, height = int(frame.width), int(frame.height)
+            if width % 2 or height % 2 or not (VIDEO_MIN_SIDE <= width <= VIDEO_MAX_SIDE) or not (VIDEO_MIN_SIDE <= height <= VIDEO_MAX_SIDE):
+                return None
+            data = bytes(frame.data)
+            if len(data) != width * height * 3 // 2:
+                return None
+            return width, height, rotation, data
+        except Exception:  # noqa: BLE001 - an odd frame is a rejected frame
+            return None
+
+
+async def _close_quietly(stream: Any) -> None:
+    with contextlib.suppress(BaseException):
+        await asyncio.wait_for(stream.aclose(), 2.0)
+
+
+# ---------------------------------------------------------------------------- watchdog
+
+
+class LagMonitor:
+    """Event-loop lag judged over a sliding window: tripped when the worst lag exceeds the limit."""
+
+    def __init__(self, window: float = LAG_WINDOW_SECONDS, limit: float = LAG_LIMIT_SECONDS) -> None:
+        self._window = window
+        self._limit = limit
+        self._samples: collections.deque[tuple[float, float]] = collections.deque()
+
+    def record(self, now: float, lag: float) -> None:
+        self._samples.append((now, lag))
+        self._prune(now)
+
+    def _prune(self, now: float) -> None:
+        while self._samples and now - self._samples[0][0] > self._window:
+            self._samples.popleft()
+
+    def worst(self, now: float) -> float:
+        self._prune(now)
+        return max((lag for _t, lag in self._samples), default=0.0)
+
+    def tripped(self, now: float) -> bool:
+        return self.worst(now) > self._limit
+
+
+class DropMonitor:
+    """The share of pictures lost over a sliding window.
+
+    ``seen`` counts every picture that reached us (taken or rejected), ``dropped`` the ones lost
+    on the way (rejected, or pushed out of the encoder's queue).  Tripped when more than ``limit``
+    of the pictures seen in the window were lost, and only once there are ``min_pictures`` to judge
+    by (a handful of drops at the start proves nothing).
+    """
+
+    def __init__(
+        self,
+        window: float = DROP_WINDOW_SECONDS,
+        limit: float = DROP_RATIO_LIMIT,
+        min_pictures: int = DROP_MIN_PICTURES,
+    ) -> None:
+        self._window = window
+        self._limit = limit
+        self._min = min_pictures
+        self._buckets: collections.deque[list[float | int]] = collections.deque()  # [second, seen, dropped]
+
+    def record(self, now: float, *, seen: int = 0, dropped: int = 0) -> None:
+        if not seen and not dropped:
+            return
+        second = int(now)
+        if self._buckets and self._buckets[-1][0] == second:
+            self._buckets[-1][1] += seen
+            self._buckets[-1][2] += dropped
+        else:
+            self._buckets.append([second, seen, dropped])
+        self._prune(now)
+
+    def _prune(self, now: float) -> None:
+        while self._buckets and now - self._buckets[0][0] >= self._window:
+            self._buckets.popleft()
+
+    def ratio(self, now: float) -> tuple[float, int]:
+        """``(share lost, pictures seen)`` over the window."""
+        self._prune(now)
+        seen = sum(int(b[1]) for b in self._buckets)
+        dropped = sum(int(b[2]) for b in self._buckets)
+        return (dropped / seen if seen else 0.0), seen
+
+    def tripped(self, now: float) -> bool:
+        share, seen = self.ratio(now)
+        return seen >= self._min and share > self._limit
+
+
+class VadMonitor:
+    """Voice-activity inference running too slow for real time.
+
+    The SDK emits ``metrics_collected`` about once a second with the total time and count of
+    its inferences.  A batch is too slow when the mean inference exceeds ``fraction`` of one VAD
+    window (or a fixed ``single_limit``, which one inference over 200 ms would also push the
+    mean past); ``consecutive`` such batches in a row trip it.
+    """
+
+    def __init__(
+        self,
+        fraction: float = VAD_LOAD_FRACTION,
+        single_limit: float = VAD_SINGLE_LIMIT_SECONDS,
+        consecutive: int = VAD_CONSECUTIVE_BATCHES,
+    ) -> None:
+        self._fraction = fraction
+        self._single = single_limit
+        self._need = consecutive
+        self._run = 0
+
+    def observe(self, total_seconds: float, count: int, window_seconds: float) -> bool:
+        """Feed one batch; ``True`` once enough consecutive batches have been too slow."""
+        if count <= 0 or total_seconds < 0 or window_seconds <= 0:
+            return False
+        mean = total_seconds / count
+        slow = mean > self._fraction * window_seconds or mean > self._single
+        self._run = self._run + 1 if slow else 0
+        return self._run >= self._need
+
+
 # ---------------------------------------------------------------------------- uploader
 
 
@@ -878,8 +1336,18 @@ class UploadWorker:
 
     # -- lifecycle
 
+    def set_mode(self, mode: str) -> None:
+        """The mode ``prepare`` asks for.  Set before ``start``: the recorder decides it once."""
+        self._mode = mode
+
     def start(self) -> None:
         self._thread.start()
+
+    def backlog_parts(self) -> float:
+        """How many parts of the growing MP4 are waiting to be uploaded."""
+        if self.part_size <= 0:
+            return 0.0
+        return max(0, self._stream_size() - self.cut) / self.part_size
 
     def halt(self) -> None:
         self._halt.set()
@@ -1213,9 +1681,15 @@ class R1Recorder:
         io_class: Callable[[], type] = recorder_io_class,
         ctx: Any = None,
         rng: Callable[[], float] = random.random,
+        preset: str = DEFAULT_PRESET,
+        make_stream: Callable[[Any], Any] = _default_stream,
+        mono: Callable[[], float] = time.monotonic,
     ) -> None:
         self._session = session
         self._ctx = ctx
+        self._preset = preset if preset in PRESETS else DEFAULT_PRESET
+        self._make_stream = make_stream
+        self._mono = mono  # the real clock, for event-loop lag (``clock`` may be a test double)
         self._room = room
         self._mode = mode
         self._spool = spool
@@ -1244,15 +1718,27 @@ class R1Recorder:
         self._stop_reason: str | None = None
         self._candidate_identity: str | None = None
         self._tee_failed = False
+        # Picture capture (``av``).  ``_video`` is decided once, at start; Level 1 / Level 2 only
+        # ever take it away.
+        self._video = False
+        self._camera: CameraCapture | None = None
+        self._lag_task: asyncio.Task[Any] | None = None
+        self._lag = LagMonitor()
+        self._drops = DropMonitor()
+        self._vad_monitor = VadMonitor()
+        self._vad: Any = None
+        self._degraded_reason: str | None = None
+        self._degraded_at_ms: int | None = None
+        self._overflow_seen = 0
         self._worker = UploadWorker(
             api=api,
             http_client=http_client,
             spool=spool,
-            mode=MODE_AUDIO if not VIDEO_CAPTURE_READY else mode,
+            mode=MODE_AUDIO,
             clock=clock,
             on_discard=self._on_discard,
             on_stop=self._on_stop,
-            mp4_enabled=lambda: self._encoder_lost is None,
+            mp4_enabled=self._mp4_upload_allowed,
             rng=rng,
         )
         if encoder is None or encoder.exited.is_set():
@@ -1271,6 +1757,16 @@ class R1Recorder:
     @property
     def encoder_lost(self) -> str | None:
         return self._encoder_lost
+
+    @property
+    def video(self) -> bool:
+        """The picture is being recorded (``av`` and the encoder can do it); never comes back once off."""
+        return self._video
+
+    @property
+    def degraded(self) -> str | None:
+        """Why the picture was given up (Level 1), if it was."""
+        return self._degraded_reason
 
     async def start(self, candidate_identity: str | None = None) -> None:
         """Wire the audio tap and begin capturing.  Never raises, never waits on the network."""
@@ -1300,6 +1796,7 @@ class R1Recorder:
                     self._io.flush_idle_tail()
             except Exception as exc:  # noqa: BLE001
                 _log.warn("unknown_event", error_type="r1_rec_stop_failed", error_category=_error_type_of(exc))
+            self._stop_camera()
         self.phase = STOPPED if self.phase == CAPTURING else self.phase
         try:
             loop = asyncio.get_running_loop()
@@ -1339,20 +1836,70 @@ class R1Recorder:
         # t0 is the media clock origin of both spools (C8): sampled the instant start returns.
         self._t0 = self._clock()
         self._facts.started_at_ms = int(round(self._wall() * 1000))
+        self._video = self._decide_video()
+        self._worker.set_mode(MODE_AV if self._video else MODE_AUDIO)
         if self._encoder is not None and not self._encoder.dead:
-            self._encoder.send_hello(video=False, preset="superfast", t0_us=int(self._t0 * 1_000_000))
+            self._encoder.send_hello(video=self._video, preset=self._preset, t0_us=int(self._t0 * 1_000_000))
         self._tee_thread = threading.Thread(target=self._tee_loop, daemon=True, name="r1rec_tee")
         self._tee_thread.start()
         self._worker.start()
         self.phase = CAPTURING
+        if self._video:
+            self._start_video(loop)
         self._watchdog = loop.create_task(self._watch())
-        _log.info("unknown_event", error_type="r1_rec_started", error_category=self._mode)
+        _log.info(
+            "unknown_event",
+            error_type="r1_rec_started",
+            error_category=MODE_AV if self._video else MODE_AUDIO,
+        )
+
+    def _decide_video(self) -> bool:
+        """Record the picture only when asked (``av``), able (libx264) and connected (a room)."""
+        if self._mode != MODE_AV or not VIDEO_CAPTURE_READY:
+            return False
+        encoder = self._encoder
+        if encoder is None or self._encoder_lost is not None or not encoder.can_encode_video():
+            _log.warn("unknown_event", error_type="r1_rec_video_unavailable")
+            return False
+        if getattr(self._ctx, "room", None) is None:
+            _log.warn("unknown_event", error_type="r1_rec_video_unavailable")
+            return False
+        return True
+
+    def _start_video(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Subscribe to the candidate camera, watch the machine, start the lag probe."""
+        try:
+            self._camera = CameraCapture(
+                room=self._ctx.room,
+                identity=self._candidate_identity,
+                loop=loop,
+                clock=self._clock,
+                t0=self._t0 or self._clock(),
+                on_picture=self._forward_picture,
+                on_reject=self._reject_picture,
+                make_stream=self._make_stream,
+            )
+            self._camera.start()
+            self._attach_vad()
+            self._lag_task = loop.create_task(self._lag_probe())
+        except Exception as exc:  # noqa: BLE001 - a camera that cannot be started is a recording without one
+            _log.warn("unknown_event", error_type="r1_rec_camera_start_failed", error_category=_error_type_of(exc))
+
+    def _forward_picture(self, pts_us: int, width: int, height: int, rotation: int, data: bytes) -> None:
+        self._drops.record(self._clock(), seen=1)
+        encoder = self._encoder
+        if encoder is None or self._encoder_lost is not None or not encoder.send_video(pts_us, width, height, rotation, data):
+            self._drops.record(self._clock(), dropped=1)
+
+    def _reject_picture(self) -> None:
+        self._drops.record(self._clock(), seen=1, dropped=1)
 
     def _abort_start(self) -> None:
         """A start that failed or was refused: nothing was promised, so drop everything quietly."""
         self.phase = DONE
         self._stop_called = True
         self._kill_encoder()
+        self._stop_camera()
         io = self._io
         if io is not None:
             with contextlib.suppress(Exception):
@@ -1394,8 +1941,147 @@ class R1Recorder:
             while True:
                 await asyncio.sleep(1.0)
                 self._check_encoder()
+                self._check_video()
         except asyncio.CancelledError:
             raise
+
+    # -- picture watchdog (Level 1: give up the picture, never the audio)
+
+    def _check_video(self) -> None:
+        """Once a second: re-scan for the camera, then judge drops, upload backlog and disk."""
+        camera = self._camera
+        if not self._video or camera is None or self._degraded_reason is not None or self._stop_called:
+            return
+        camera.scan()
+        encoder = self._encoder
+        if encoder is not None:
+            overflowed = encoder.video_dropped
+            if overflowed > self._overflow_seen:
+                self._drops.record(self._clock(), dropped=overflowed - self._overflow_seen)
+                self._overflow_seen = overflowed
+        now = self._clock()
+        if self._drops.tripped(now):
+            self._degrade("frame_drops")
+        elif self._worker.backlog_parts() > BACKLOG_PARTS_LIMIT or self._spool.used_bytes() > SPOOL_BYTES_LIMIT:
+            self._degrade("upload_backlog")
+        elif self._low_disk():
+            self._degrade("upload_backlog")
+
+    def _low_disk(self) -> bool:
+        try:
+            return self._spool.free_bytes() < LOW_FREE_BYTES
+        except OSError:
+            return False
+
+    async def _lag_probe(self) -> None:
+        """A 50 ms ticker: how late it wakes is how far behind the event loop is."""
+        mono = self._mono
+        try:
+            while self._degraded_reason is None:
+                before = mono()
+                await asyncio.sleep(LAG_TICK_SECONDS)
+                now = mono()
+                self.observe_lag(now, now - before - LAG_TICK_SECONDS)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a broken probe must not end as an unretrieved task error
+            _log.warn("unknown_event", error_type="r1_rec_lag_probe_failed", error_category=_error_type_of(exc))
+
+    def observe_lag(self, now: float, lag: float) -> None:
+        """One lag sample; the picture goes when the worst lag in the window exceeds the limit."""
+        self._lag.record(now, max(0.0, lag))
+        if self._lag.tripped(now):
+            self._degrade("cpu_loop_lag")
+
+    def _attach_vad(self) -> None:
+        vad = getattr(self._session, "vad", None)
+        on = getattr(vad, "on", None)
+        if vad is None or not callable(on):
+            return
+        on("metrics_collected", self._on_vad_metrics)
+        self._vad = vad
+
+    def _detach_vad(self) -> None:
+        vad, self._vad = self._vad, None
+        off = getattr(vad, "off", None)
+        if callable(off):
+            with contextlib.suppress(Exception):
+                off("metrics_collected", self._on_vad_metrics)
+
+    def _on_vad_metrics(self, metrics: Any) -> None:
+        total = getattr(metrics, "inference_duration_total", None)
+        count = getattr(metrics, "inference_count", None)
+        if not isinstance(total, (int, float)) or isinstance(count, bool) or not isinstance(count, int):
+            return
+        window = getattr(getattr(self._vad, "capabilities", None), "update_interval", None)
+        if not isinstance(window, (int, float)) or window <= 0:
+            window = VAD_WINDOW_SECONDS
+        try:
+            slow = self._vad_monitor.observe(float(total), count, float(window))
+        except (TypeError, ValueError, OverflowError):
+            return
+        if slow:
+            self._degrade("cpu_vad_slow")
+
+    def _degrade(self, reason: str) -> None:
+        """Level 1: stop the picture for good (the audio is untouched); the encoder shows black."""
+        if not self._video or self._degraded_reason is not None or self._stop_called or self._encoder_lost is not None:
+            return
+        self._degraded_reason = reason
+        if self._t0 is not None:
+            self._degraded_at_ms = min(MAX_DEGRADED_AT_MS, max(0, int((self._clock() - self._t0) * 1000)))
+        _log.warn("unknown_event", error_type="r1_rec_degraded", error_category=reason)
+        camera = self._camera
+        if camera is not None:
+            with contextlib.suppress(Exception):
+                camera.unsubscribe()
+        self._detach_vad()
+        task, self._lag_task = self._lag_task, None  # the probe has nothing left to protect
+        try:
+            running = asyncio.current_task()
+        except RuntimeError:
+            running = None
+        if task is not None and task is not running:
+            task.cancel()
+
+    def _stop_camera(self, *, unsubscribe: bool = False) -> None:
+        """Close the camera stream and the lag probe; safe from any thread.
+
+        ``unsubscribe`` also asks the SFU to stop sending the camera: for a recording that is lost,
+        discarded or abandoned (a normal end needs no such request, the room is closing).
+        """
+        loop = self._loop
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is not None and running is not loop and not loop.is_closed():
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(self._stop_camera_now, unsubscribe)
+                return
+        self._stop_camera_now(unsubscribe)
+
+    def _stop_camera_now(self, unsubscribe: bool = False) -> None:
+        camera = self._camera
+        if camera is not None:
+            with contextlib.suppress(Exception):
+                if unsubscribe:
+                    camera.unsubscribe()
+                else:
+                    camera.stop()
+        task, self._lag_task = self._lag_task, None
+        if task is not None:
+            task.cancel()
+        self._detach_vad()
+
+    def _mp4_upload_allowed(self) -> bool:
+        """Parts of the MP4 keep going while the encoder is healthy, and after it dies when the
+        prefix holds the picture (``split``: the MP4 is still the video half)."""
+        return self._encoder_lost is None or self._prefix_has_picture()
+
+    def _prefix_has_picture(self) -> bool:
+        camera = self._camera
+        return self._video and camera is not None and camera.taken > 0
 
     def _check_encoder(self) -> None:
         enc = self._encoder
@@ -1419,6 +2105,7 @@ class R1Recorder:
         self._encoder_lost = reason
         self._lost_stalled = stalled
         self._kill_encoder()
+        self._stop_camera(unsubscribe=True)
         if reason == "encoder_unavailable":
             _log.error("unknown_event", error_type="r1_rec_encoder_unavailable")
         elif stalled:
@@ -1439,6 +2126,7 @@ class R1Recorder:
             self._discard_reason = reason
         _log.warn("unknown_event", error_type="r1_rec_discarded", error_category=reason)
         self._kill_encoder()
+        self._stop_camera(unsubscribe=True)
         io = self._io
         if io is not None:
             with contextlib.suppress(Exception):
@@ -1457,6 +2145,7 @@ class R1Recorder:
             self._stop_reason = reason
         _log.warn("unknown_event", error_type="r1_rec_abandoned", error_category=reason)
         self._kill_encoder()
+        self._stop_camera(unsubscribe=True)
         io = self._io
         if io is not None:
             with contextlib.suppress(Exception):
@@ -1489,6 +2178,7 @@ class R1Recorder:
             self.phase = DONE
             if self._watchdog is not None:
                 self._watchdog.cancel()
+            self._stop_camera()
 
     def _emergency_cleanup(self) -> None:
         self._kill_encoder()
@@ -1526,6 +2216,9 @@ class R1Recorder:
             return
         upload_deadline = deadline - reserve
         mp4_ok = closed and self._encoder_lost is None
+        # The encoder died but its prefix holds the picture: ship that MP4 as the video half and the
+        # whole OGG as the audio (layout ``split``).  Without a picture the OGG alone carries the call.
+        split = (not mp4_ok) and self._prefix_has_picture() and self._stream_bytes() > 0
         enc = self._encoder
         want_fast = (
             mp4_ok
@@ -1536,7 +2229,7 @@ class R1Recorder:
         if want_fast:
             enc.send_remux()
         tail = await self._run_job(
-            lambda: self._worker.job_tail(mp4=mp4_ok, final_ogg=not mp4_ok, deadline=upload_deadline),
+            lambda: self._worker.job_tail(mp4=mp4_ok or split, final_ogg=not mp4_ok, deadline=upload_deadline),
             upload_deadline,
         )
         timed_out = tail is None
@@ -1554,7 +2247,7 @@ class R1Recorder:
             if remaining > 0.5 and await self._poll(enc.remuxed.is_set, remaining - 0.5) and enc.remux_bytes:
                 await self._run_job(lambda: self._worker.job_video(deadline=upload_deadline), upload_deadline)
         failure = self._failure_reason(uploaded=uploaded, tail_ok=tail_ok, timed_out=timed_out)
-        layout = "combined" if mp4_ok else "audio_only"
+        layout = "combined" if mp4_ok else ("split" if split else "audio_only")
         body = self._complete_body(layout=layout, failure=failure)
         outcome = await self._run_job(
             lambda: self._worker.job_complete(body, deadline=deadline), deadline + 0.5, abort_on_timeout=True
@@ -1580,12 +2273,28 @@ class R1Recorder:
         if self._encoder_lost == "encoder_unavailable":
             return "encoder_unavailable"
         if self._encoder_lost is not None:
+            if self._encoder is not None and self._encoder.error_code == "disk_full":
+                return "spool_disk_full"
             return "encoder_crashed"
         if timed_out:
             return "finish_timeout"
         if not uploaded or not tail_ok:
             return "upload_failed"
         return None
+
+    def _stream_bytes(self) -> int:
+        try:
+            return self._spool.stream_path.stat().st_size
+        except OSError:
+            return 0
+
+    def _has_video(self, layout: str) -> bool:
+        """The deliverable really holds the candidate's picture (not only black)."""
+        camera = self._camera
+        if not self._video or layout == "audio_only" or camera is None or camera.taken <= 0:
+            return False
+        info = self._encoder.closed_info if self._encoder is not None else None
+        return not (info is not None and int(info.get("width", 0) or 0) <= 0)  # the child fell back to audio
 
     def _complete_body(self, *, layout: str, failure: str | None) -> dict[str, Any]:
         facts = self._facts
@@ -1609,12 +2318,44 @@ class R1Recorder:
             report["duration_ms"] = int(media_ms)
         if stream_bytes is not None:
             report["stream_bytes"] = int(stream_bytes)
-        body: dict[str, Any] = {"layout": layout, "has_video": False, "report": report}
+        has_video = self._has_video(layout)
+        if self._video:
+            self._add_picture_facts(report)
+        if self._degraded_at_ms is not None:
+            report["degraded_at_ms"] = self._degraded_at_ms
+        body: dict[str, Any] = {"layout": layout, "has_video": has_video, "report": report}
         if failure:
             body["failure_reason"] = failure
-        if self._lost_stalled:
-            body["degraded_reason"] = "encoder_stalled"
+        degraded = self._degraded_reason
+        if degraded is None and self._lost_stalled:
+            degraded = "encoder_stalled"
+        if degraded is None and self._video and not has_video and self._encoder_lost is None:
+            degraded = "video_unavailable"  # the camera never delivered a picture (or the child could not encode one)
+        if degraded:
+            body["degraded_reason"] = degraded
         return body
+
+    def _add_picture_facts(self, report: dict[str, Any]) -> None:
+        """Size, rate and the counters from the child's last word (closed, else its last heartbeat)."""
+        enc = self._encoder
+        camera = self._camera
+        source: Mapping[str, Any] = {}
+        if enc is not None:
+            source = enc.closed_info or enc.progress or {}
+        frames = source.get("frames")
+        if isinstance(frames, int) and frames > 0:
+            report["frames_encoded"] = frames
+            width, height = int(source.get("width", 0) or 0), int(source.get("height", 0) or 0)
+            if width > 0 and height > 0:
+                report.update(width=width, height=height, fps=int(source.get("fps", 0) or VIDEO_FPS))
+        lost = int(source.get("dropped", 0) or 0)
+        if enc is not None:
+            lost += enc.video_dropped
+        if camera is not None:
+            lost += camera.rejected
+        if isinstance(frames, int) and frames > 0:
+            report["frames_dropped"] = lost
+            report["camera_off_ms"] = int(source.get("black", 0) or 0) * 1000 // VIDEO_FPS
 
     # -- finish helpers
 
@@ -1749,6 +2490,7 @@ def build_r1_recorder(
             wall=wall,
             io_class=io_class,
             ctx=ctx,
+            preset=x264_preset(env),
         )
     except Exception as exc:  # noqa: BLE001 - recording must never stop an interview from starting
         _log.warn("unknown_event", error_type="r1_rec_build_failed", error_category=_error_type_of(exc))

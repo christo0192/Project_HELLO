@@ -458,6 +458,80 @@ class TestR1RecordingContract(unittest.IsolatedAsyncioTestCase):
             inspect.getsource(AgentActivity),
         )
 
+    def test_the_camera_symbols_the_picture_capture_relies_on(self) -> None:
+        import r1_recorder
+
+        # The recorder compares plain numbers (it never imports the enums): they must be the SDK's.
+        self.assertEqual(int(rtc.TrackKind.KIND_VIDEO), r1_recorder.KIND_VIDEO)
+        self.assertEqual(int(rtc.TrackSource.SOURCE_CAMERA), r1_recorder.SOURCE_CAMERA)
+        self.assertEqual(int(rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD), r1_recorder.PARTICIPANT_STANDARD)
+        self.assertEqual(int(rtc.VideoBufferType.I420), r1_recorder.BUFFER_I420)
+        self.assertEqual(
+            {
+                int(rtc.VideoRotation.VIDEO_ROTATION_0): 0,
+                int(rtc.VideoRotation.VIDEO_ROTATION_90): 90,
+                int(rtc.VideoRotation.VIDEO_ROTATION_180): 180,
+                int(rtc.VideoRotation.VIDEO_ROTATION_270): 270,
+            },
+            r1_recorder.ROTATION_DEGREES,
+        )
+        # Publications: readable kind/source/subscribed/track, and a boolean subscription request.
+        for name in ("kind", "source", "sid"):
+            self.assertIsInstance(inspect.getattr_static(rtc.TrackPublication, name), property, name)
+        for name in ("subscribed", "track"):
+            self.assertIsInstance(inspect.getattr_static(rtc.RemoteTrackPublication, name), property, name)
+        self.assertEqual(list(inspect.signature(rtc.RemoteTrackPublication.set_subscribed).parameters), ["self", "subscribed"])
+        self.assertIsInstance(inspect.getattr_static(rtc.Track, "sid"), property)
+        # Room events: the argument ORDER differs between them (track first for subscribe).
+        room_source = inspect.getsource(rtc.Room)
+        self.assertIn('self.emit("track_subscribed", remote_video_track, rpublication, rparticipant)', room_source)
+        self.assertIn('self.emit("track_unsubscribed", rtrack, rpublication, rparticipant)', room_source)
+        self.assertIn('self.emit("participant_connected", rparticipant)', room_source)
+        self.assertIn('self.emit("participant_disconnected", rparticipant)', room_source)
+        self.assertTrue(callable(rtc.Room.on) and callable(rtc.Room.off))
+        # The decoded-frame stream: (track, loop, capacity, format), async iteration, aclose.
+        params = inspect.signature(rtc.VideoStream.__init__).parameters
+        self.assertEqual(list(params)[:5], ["self", "track", "loop", "capacity", "format"])
+        self.assertEqual(params["capacity"].default, 0)
+        self.assertTrue(inspect.iscoroutinefunction(rtc.VideoStream.aclose))
+        self.assertTrue(hasattr(rtc.VideoStream, "__aiter__") and hasattr(rtc.VideoStream, "__anext__"))
+        self.assertEqual(
+            list(typing.get_type_hints(rtc.video_stream.VideoFrameEvent)), ["frame", "timestamp_us", "rotation", "metadata"]
+        )
+        self.assertIn("normalize_stride = True", inspect.getsource(rtc.VideoStream._create_owned_stream))
+
+    def test_a_real_i420_frame_is_taken_as_tightly_packed_bytes_by_the_capture(self) -> None:
+        import r1_recorder
+        from types import SimpleNamespace
+
+        planes = bytes(range(256)) * ((640 * 360 * 3 // 2) // 256 + 1)
+        frame = rtc.VideoFrame(640, 360, rtc.VideoBufferType.I420, bytearray(planes[: 640 * 360 * 3 // 2]))
+        self.assertEqual((frame.width, frame.height, int(frame.type)), (640, 360, r1_recorder.BUFFER_I420))
+        for rotation, degrees in ((rtc.VideoRotation.VIDEO_ROTATION_0, 0), (rtc.VideoRotation.VIDEO_ROTATION_90, 90),
+                                  (rtc.VideoRotation.VIDEO_ROTATION_270, 270)):
+            picture = r1_recorder.CameraCapture._picture(SimpleNamespace(frame=frame, rotation=rotation))
+            self.assertIsNotNone(picture)
+            width, height, turn, data = picture
+            self.assertEqual((width, height, turn), (640, 360, degrees))
+            self.assertIsInstance(data, bytes)
+            self.assertEqual(data, planes[: 640 * 360 * 3 // 2])
+        # A frame in another pixel format is converted, by the SDK, before it is taken.
+        rgba = rtc.VideoFrame(640, 360, rtc.VideoBufferType.RGBA, bytearray(640 * 360 * 4))
+        converted = r1_recorder.CameraCapture._picture(SimpleNamespace(frame=rgba, rotation=rtc.VideoRotation.VIDEO_ROTATION_0))
+        self.assertIsNotNone(converted)
+        self.assertEqual(len(converted[3]), 640 * 360 * 3 // 2)
+
+    def test_the_vad_metrics_the_picture_watchdog_reads_exist(self) -> None:
+        from livekit.agents import vad as lk_vad
+        from livekit.agents.metrics import VADMetrics
+
+        self.assertIsInstance(inspect.getattr_static(AgentSession, "vad"), property)
+        self.assertTrue(callable(lk_vad.VAD.on) and callable(lk_vad.VAD.off))
+        for field in ("inference_duration_total", "inference_count"):
+            self.assertIn(field, VADMetrics.model_fields, field)
+        self.assertIn("update_interval", lk_vad.VADCapabilities.__dataclass_fields__)
+        self.assertIn('self._vad.emit("metrics_collected", vad_metrics)', inspect.getsource(lk_vad.VADStream))
+
     def test_the_resampler_and_audio_frame_shapes_the_tee_relies_on(self) -> None:
         params = inspect.signature(rtc.AudioResampler.__init__).parameters
         for name in ("input_rate", "output_rate", "num_channels"):

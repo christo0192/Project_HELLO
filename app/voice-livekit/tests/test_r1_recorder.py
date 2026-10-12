@@ -799,7 +799,9 @@ class FakeIO:
 class FakeEncoder:
     """The EncoderProcess surface; EOF/REMUX are answered from files the test lays down."""
 
-    def __init__(self, events: list, spool_dir: Path, *, usable: bool = True, mp4_bytes: int = 150_000) -> None:
+    def __init__(
+        self, events: list, spool_dir: Path, *, usable: bool = True, mp4_bytes: int = 150_000, x264: bool = True
+    ) -> None:
         self.events = events
         self.spool_dir = Path(spool_dir)
         self.ready = threading.Event()
@@ -823,10 +825,24 @@ class FakeEncoder:
         self.mp4_bytes = mp4_bytes
         self.media_ms = 12_000
         self.remux_bytes_to_write = 120_000
+        self.pictures: list[tuple] = []
+        self.video_dropped = 0
+        self.video_sent = 0
+        self.closed_extra: dict = {}
         if usable:
             self.ready.set()
+            self.ready_info = {"s": "ready", "av": "19.0.1", "x264": x264, "aac": True}
         else:
             self.exited.set()
+
+    def can_encode_video(self) -> bool:
+        if self.dead or self.exited.is_set():
+            return False
+        return self.ready_info is None or bool(self.ready_info.get("x264"))
+
+    def send_video(self, pts_us, width, height, rotation, picture) -> bool:
+        self.pictures.append((pts_us, width, height, rotation, bytes(picture)))
+        return not self.dead
 
     @property
     def dead(self) -> bool:
@@ -850,7 +866,7 @@ class FakeEncoder:
         self.eof_sent = True
         content = bytes((i * 7) % 251 for i in range(self.mp4_bytes))
         (self.spool_dir / "stream.mp4").write_bytes(content)
-        self.closed_info = {"s": "closed", "bytes": self.mp4_bytes, "media_ms": self.media_ms}
+        self.closed_info = {"s": "closed", "bytes": self.mp4_bytes, "media_ms": self.media_ms, **self.closed_extra}
         self.closed.set()
         return True
 
@@ -874,6 +890,122 @@ class FakeEncoder:
 
     def alive(self) -> bool:
         return not self.exited.is_set()
+
+
+class FakeTrack:
+    def __init__(self, sid: str) -> None:
+        self.sid = sid
+
+
+class FakePublication:
+    def __init__(self, sid: str, *, kind: int = 2, source: int = 1, subscribed: bool = False) -> None:
+        self.sid = sid
+        self.kind = kind
+        self.source = source
+        self.subscribed = subscribed
+        self.track = FakeTrack("TR_" + sid) if subscribed else None
+        self.subscribe_calls: list[bool] = []
+
+    def set_subscribed(self, value: bool) -> None:
+        self.subscribe_calls.append(value)
+        self.subscribed = value
+
+
+class FakeParticipant:
+    def __init__(self, identity: str, *, kind: int = 0) -> None:
+        self.identity = identity
+        self.kind = kind
+        self.track_publications: dict[str, FakePublication] = {}
+
+    def add(self, publication: FakePublication) -> FakePublication:
+        self.track_publications[publication.sid] = publication
+        return publication
+
+
+class FakeRoom:
+    def __init__(self) -> None:
+        self.handlers: dict[str, list] = {}
+        self.remote_participants: dict[str, FakeParticipant] = {}
+
+    def on(self, event, handler) -> None:
+        self.handlers.setdefault(event, []).append(handler)
+
+    def off(self, event, handler) -> None:
+        if handler in self.handlers.get(event, []):
+            self.handlers[event].remove(handler)
+
+    def emit(self, event, *args) -> None:
+        for handler in list(self.handlers.get(event, [])):
+            handler(*args)
+
+    def listeners(self) -> int:
+        return sum(len(v) for v in self.handlers.values())
+
+
+class FakeVideoStream:
+    """The SDK ``VideoStream`` surface the capture uses: an async iterator and ``aclose``."""
+
+    def __init__(self, track) -> None:
+        self.track = track
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.closed = False
+        self.fail: BaseException | None = None
+
+    def push(self, event) -> None:
+        self.queue.put_nowait(event)
+
+    def end(self) -> None:
+        self.queue.put_nowait(None)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.fail is not None:
+            raise self.fail
+        item = await self.queue.get()
+        if item is None:
+            raise StopAsyncIteration
+        return item
+
+    async def aclose(self) -> None:
+        self.closed = True
+        self.queue.put_nowait(None)
+
+
+class StreamFactory:
+    def __init__(self) -> None:
+        self.streams: list[FakeVideoStream] = []
+
+    def __call__(self, track) -> FakeVideoStream:
+        stream = FakeVideoStream(track)
+        self.streams.append(stream)
+        return stream
+
+
+def picture_event(width: int = 640, height: int = 360, *, rotation: int = 0, luma: int = 100, kind: int = 5, data: bytes | None = None):
+    payload = data if data is not None else bytes([luma]) * (width * height * 3 // 2)
+    picture = SimpleNamespace(width=width, height=height, type=kind, data=memoryview(payload))
+    return SimpleNamespace(frame=picture, rotation=rotation, timestamp_us=0)
+
+
+class FakeVad:
+    def __init__(self) -> None:
+        self.handlers: list = []
+        self.capabilities = SimpleNamespace(update_interval=0.032)
+
+    def on(self, event, handler) -> None:
+        assert event == "metrics_collected"
+        self.handlers.append(handler)
+
+    def off(self, event, handler) -> None:
+        if handler in self.handlers:
+            self.handlers.remove(handler)
+
+    def emit(self, total: float, count: int) -> None:
+        metrics = SimpleNamespace(inference_duration_total=total, inference_count=count)
+        for handler in list(self.handlers):
+            handler(metrics)
 
 
 class RecorderCase(unittest.IsolatedAsyncioTestCase):
@@ -1362,11 +1494,32 @@ class TestStart(RecorderCase):
         self.assertEqual(recorder._t0, 1000.0)
         await recorder.finish()
 
-    async def test_a_video_mode_request_is_recorded_as_audio_until_camera_capture_exists(self) -> None:
-        recorder = await self.started(mode="av")
+    async def test_a_video_request_without_a_room_or_a_picture_encoder_is_recorded_as_audio(self) -> None:
+        for label in ("no room", "no ctx", "no libx264"):
+            with self.subTest(label):
+                await self.asyncSetUp()
+                overrides: dict = {}
+                if label == "no room":
+                    overrides = dict(ctx=SimpleNamespace(room=None))
+                elif label == "no ctx":
+                    overrides = dict(ctx=None)
+                else:
+                    self.encoder = FakeEncoder(self.events, self.spool.dir, x264=False)
+                    overrides = dict(encoder=self.encoder, ctx=SimpleNamespace(room=FakeRoom()))
+                recorder = await self.started(mode="av", **overrides)
+                await until(lambda: "prepare" in self.api.ops())
+                self.assertEqual(self.api.bodies("prepare"), [{"mode": "audio"}])
+                self.assertFalse(self.encoder.hello["video"])
+                self.assertFalse(recorder.video)
+                await recorder.finish()
+
+    async def test_the_kill_switch_records_a_video_request_as_audio(self) -> None:
+        room = FakeRoom()
+        with mock.patch.object(r1_recorder, "VIDEO_CAPTURE_READY", False):
+            recorder = await self.started(mode="av", ctx=SimpleNamespace(room=room))
         await until(lambda: "prepare" in self.api.ops())
         self.assertEqual(self.api.bodies("prepare"), [{"mode": "audio"}])
-        self.assertEqual(self.encoder.hello["video"], False)
+        self.assertEqual(room.listeners(), 0)
         await recorder.finish()
 
     async def test_a_start_that_fails_never_raises_and_leaves_nothing_behind(self) -> None:
@@ -1920,6 +2073,1130 @@ class TestNothingSensitiveIsLogged(RecorderCase):
         self.assertIs(captured["stderr"], r1_recorder.subprocess.DEVNULL)
 
 
+# ------------------------------------------------------------------------------ picture: encoder queues
+
+
+class _BlockingStdout:
+    """The child's stdout: ``readline`` blocks until the test closes it (a live child writes nothing here)."""
+
+    def __init__(self) -> None:
+        self._lines: queue.Queue = queue.Queue()
+
+    def readline(self, _limit: int = -1) -> bytes:
+        item = self._lines.get()
+        return b"" if item is None else item
+
+    def close(self) -> None:
+        self._lines.put(None)
+
+
+class _GatedStdin:
+    """The child's stdin: every write waits for ``gate``, so a test can hold the writer thread."""
+
+    def __init__(self) -> None:
+        self.gate = threading.Event()
+        self.gate.set()
+        self.writes: list[bytes] = []
+        self.closed = False
+        self._cond = threading.Condition()
+
+    def write(self, data: bytes) -> None:
+        self.gate.wait(10)
+        with self._cond:
+            self.writes.append(bytes(data))
+            self._cond.notify_all()
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        self.closed = True
+
+    def wait_for(self, count: int, timeout: float = 5.0) -> None:
+        end = time.monotonic() + timeout
+        with self._cond:
+            while len(self.writes) < count:
+                remaining = end - time.monotonic()
+                if remaining <= 0:
+                    raise AssertionError(f"only {len(self.writes)} of {count} writes")
+                self._cond.wait(remaining)
+
+    def messages(self) -> list[tuple[int, int, bytes]]:
+        import io
+
+        import r1_video_encoder as wire
+
+        stream = io.BytesIO(b"".join(self.writes))
+        out = []
+        while (message := wire.read_frame(stream)) is not None:
+            out.append(message)
+        return out
+
+
+class _FakeProc:
+    def __init__(self) -> None:
+        self.stdin = _GatedStdin()
+        self.stdout = _BlockingStdout()
+        self.killed = False
+
+    def poll(self):
+        return 0 if self.killed else None
+
+    def kill(self) -> None:
+        self.killed = True
+        self.stdout.close()
+
+    def wait(self, timeout=None) -> int:
+        return 0
+
+
+class TestEncoderQueues(unittest.TestCase):
+    def setUp(self) -> None:
+        import r1_video_encoder as wire
+
+        self.wire = wire
+        self.proc = _FakeProc()
+        self.encoder = r1_recorder.EncoderProcess(Path("."), popen=lambda *_a, **_k: self.proc)
+        self.assertTrue(self.encoder.spawn())
+        self.addCleanup(self.encoder.kill)
+        self.addCleanup(self.proc.stdout.close)
+
+    def hold_the_writer(self) -> None:
+        """Send one message and block the writer inside its write, so later sends queue up."""
+        self.proc.stdin.gate.clear()
+        self.assertTrue(self.encoder.send_hello(video=True, preset="superfast", t0_us=1))
+        end = time.monotonic() + 5
+        while self.encoder._ordered and time.monotonic() < end:
+            time.sleep(0.005)
+        time.sleep(0.05)  # the writer has taken HELLO and is blocked in its write
+
+    def release(self, count: int) -> list[tuple[int, int, bytes]]:
+        self.proc.stdin.gate.set()
+        self.proc.stdin.wait_for(count)
+        return self.proc.stdin.messages()
+
+    def test_the_picture_queue_keeps_the_newest_three_and_counts_what_it_pushed_out(self) -> None:
+        self.hold_the_writer()
+        for index in range(6):
+            self.assertTrue(self.encoder.send_video(index * 1000, 640, 360, 0, b"P%d" % index))
+        self.assertEqual(self.encoder.video_dropped, 3)
+        got = self.release(1 + 3)
+        types = [m[0] for m in got]
+        self.assertEqual(types, [self.wire.MSG_HELLO] + [self.wire.MSG_VIDEO] * 3)
+        self.assertEqual([m[1] for m in got[1:]], [3000, 4000, 5000])  # the newest three, oldest first
+        deadline = time.monotonic() + 5
+        while self.encoder.video_sent < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.encoder.video_sent, 3)
+        header = self.wire.VIDEO_HEADER.size
+        self.assertEqual(self.wire.parse_video(got[1][2])[:3], (640, 360, 0))
+        self.assertEqual(got[1][2][header:], b"P3")
+
+    def test_audio_goes_before_pictures_and_the_ordered_messages_keep_their_order(self) -> None:
+        self.hold_the_writer()
+        self.encoder.send_video(1, 640, 360, 0, b"p1")
+        self.encoder.send_audio(10, b"\x00\x00")
+        self.encoder.send_video(2, 640, 360, 0, b"p2")
+        self.encoder.send_audio(20, b"\x00\x00")
+        got = self.release(5)
+        self.assertEqual(
+            [(m[0], m[1]) for m in got],
+            [(self.wire.MSG_HELLO, 0), (self.wire.MSG_AUDIO, 10), (self.wire.MSG_AUDIO, 20),
+             (self.wire.MSG_VIDEO, 1), (self.wire.MSG_VIDEO, 2)],
+        )
+
+    def test_eof_waits_for_the_pictures_queued_before_it_so_the_tail_is_not_lost(self) -> None:
+        self.hold_the_writer()
+        self.encoder.send_video(1, 640, 360, 0, b"p1")
+        self.encoder.send_video(2, 640, 360, 0, b"p2")
+        self.encoder.send_eof()
+        self.encoder.send_audio(30, b"\x00\x00")  # queued after EOF in the ordered queue
+        got = self.release(5)
+        self.assertEqual(
+            [m[0] for m in got],
+            [self.wire.MSG_HELLO, self.wire.MSG_VIDEO, self.wire.MSG_VIDEO, self.wire.MSG_EOF, self.wire.MSG_AUDIO],
+        )
+
+    def test_pictures_never_count_against_the_audio_backlog(self) -> None:
+        self.hold_the_writer()
+        for index in range(50):
+            self.encoder.send_video(index, 640, 360, 0, b"x" * 1000)
+        self.assertTrue(self.encoder.send_audio(1, b"\x00\x00"))
+        self.assertFalse(self.encoder.overflowed)
+        self.encoder.send_audio(2, b"\x00" * (r1_recorder.ENCODER_AUDIO_BACKLOG_BYTES + 10))
+        self.assertFalse(self.encoder.send_audio(3, b"\x00\x00"))
+        self.assertTrue(self.encoder.overflowed)  # only audio can make the child "stuck"
+        self.proc.stdin.gate.set()
+
+    def test_kill_discards_everything_queued_and_stops_the_writer(self) -> None:
+        self.hold_the_writer()
+        self.encoder.send_video(1, 640, 360, 0, b"p")
+        self.encoder.send_audio(2, b"\x00\x00")
+        self.encoder.kill()
+        self.assertEqual((len(self.encoder._ordered), len(self.encoder._pictures)), (0, 0))
+        self.assertTrue(self.proc.killed)
+        self.proc.stdin.gate.set()
+        deadline = time.monotonic() + 5
+        while not self.proc.stdin.closed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(self.proc.stdin.closed)
+        self.assertFalse(self.encoder.send_video(3, 640, 360, 0, b"p"))
+        self.assertFalse(self.encoder.send_audio(4, b"\x00\x00"))
+
+    def test_the_writer_stops_when_the_child_goes_away(self) -> None:
+        self.proc.stdout.close()  # the child closed its output: it is gone
+        self.assertTrue(self.encoder.exited.wait(5))
+        deadline = time.monotonic() + 5
+        while not self.proc.stdin.closed and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertTrue(self.proc.stdin.closed)
+        self.assertFalse(self.encoder.send_video(1, 640, 360, 0, b"p"))
+
+    def test_the_child_can_take_pictures_only_with_libx264(self) -> None:
+        self.assertTrue(self.encoder.can_encode_video(), "self-test still running: optimistic")
+        self.encoder.ready_info = {"s": "ready", "av": "19", "x264": True, "aac": True}
+        self.assertTrue(self.encoder.can_encode_video())
+        self.encoder.ready_info = {"s": "ready", "av": "19", "x264": False, "aac": True}
+        self.assertFalse(self.encoder.can_encode_video())
+        self.encoder.ready_info = {"s": "ready", "av": "19", "x264": True, "aac": True}
+        self.encoder.exited.set()
+        self.assertFalse(self.encoder.can_encode_video())
+
+
+# ------------------------------------------------------------------------------ picture: camera capture
+
+
+class CameraCase(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.room = FakeRoom()
+        self.clock = ManualClock(1000.0)
+        self.factory = StreamFactory()
+        self.pictures: list[tuple] = []
+        self.rejects = 0
+        self.candidate = FakeParticipant("candidate-identity")
+        self.room.remote_participants["candidate-identity"] = self.candidate
+        self.camera_pub = self.candidate.add(FakePublication("PUB_camera"))
+        self.camera = self.make()
+
+    def make(self, identity: str | None = "candidate-identity") -> r1_recorder.CameraCapture:
+        def rejected() -> None:
+            self.rejects += 1
+
+        camera = r1_recorder.CameraCapture(
+            room=self.room, identity=identity, loop=asyncio.get_running_loop(), clock=self.clock, t0=1000.0,
+            on_picture=lambda *args: self.pictures.append(args), on_reject=rejected, make_stream=self.factory,
+        )
+        self.addCleanup(camera.stop)
+        return camera
+
+    async def subscribed(self, publication: FakePublication | None = None, participant: FakeParticipant | None = None):
+        """The SFU accepted the subscription and the track arrived."""
+        publication = publication or self.camera_pub
+        participant = participant or self.candidate
+        publication.track = FakeTrack("TR_" + publication.sid)
+        publication.subscribed = True
+        self.room.emit("track_subscribed", publication.track, publication, participant)
+        await asyncio.sleep(0)
+        return self.factory.streams[-1]
+
+    async def deliver(self, stream: FakeVideoStream, event, at: float) -> None:
+        self.clock.value = 1000.0 + at
+        stream.push(event)
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+
+class TestCameraCapture(CameraCase):
+    async def test_it_subscribes_to_the_candidate_camera_and_to_nothing_else(self) -> None:
+        microphone = self.candidate.add(FakePublication("PUB_mic", kind=1, source=2))
+        screen = self.candidate.add(FakePublication("PUB_screen", kind=2, source=3))
+        stranger = FakeParticipant("someone-else")
+        stranger_camera = stranger.add(FakePublication("PUB_other"))
+        self.room.remote_participants["someone-else"] = stranger
+        self.camera.start()
+        self.assertEqual(self.camera_pub.subscribe_calls, [True])
+        self.assertEqual((microphone.subscribe_calls, screen.subscribe_calls, stranger_camera.subscribe_calls), ([], [], []))
+
+    async def test_a_camera_that_never_appears_is_not_an_error(self) -> None:
+        self.candidate.track_publications.clear()
+        with captured_logs() as lines:
+            self.camera.start()
+            await asyncio.sleep(0.05)
+            self.camera.scan()
+        self.assertEqual(lines, [])
+        self.assertEqual(self.factory.streams, [])
+
+    async def test_a_camera_published_later_is_subscribed_when_it_appears(self) -> None:
+        self.candidate.track_publications.clear()
+        self.camera.start()
+        late = self.candidate.add(FakePublication("PUB_late"))
+        self.room.emit("track_published", late, self.candidate)
+        self.assertEqual(late.subscribe_calls, [True])
+        self.room.emit("track_published", FakePublication("PUB_other", source=2, kind=1), self.candidate)  # a microphone: ignored
+        self.room.emit("track_published", FakePublication("PUB_x"), FakeParticipant("someone-else"))  # another person: ignored
+        self.assertEqual(self.factory.streams, [])
+
+    async def test_a_rejoin_brings_a_new_participant_and_a_new_camera(self) -> None:
+        self.camera.start()
+        await self.subscribed()
+        self.room.emit("participant_disconnected", self.candidate)
+        await asyncio.sleep(0)
+        self.assertTrue(self.factory.streams[0].closed)
+        again = FakeParticipant("candidate-identity")
+        publication = again.add(FakePublication("PUB_camera_2"))
+        self.room.remote_participants["candidate-identity"] = again
+        self.room.emit("participant_connected", again)
+        self.assertEqual(publication.subscribe_calls, [True])
+        await self.subscribed(publication, again)
+        self.assertEqual(len(self.factory.streams), 2)
+        self.assertEqual(self.camera.streams_opened, 2)
+
+    async def test_a_stream_that_ends_is_reopened_when_the_next_track_arrives(self) -> None:
+        self.camera.start()
+        first = await self.subscribed()
+        first.end()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        self.assertTrue(first.closed)
+        publication = self.candidate.add(FakePublication("PUB_camera_b"))
+        second = await self.subscribed(publication)
+        self.assertIsNot(first, second)
+
+    async def test_the_same_track_is_never_opened_twice(self) -> None:
+        self.camera.start()
+        await self.subscribed()
+        self.camera.scan()
+        self.camera.scan()
+        self.room.emit("track_subscribed", self.camera_pub.track, self.camera_pub, self.candidate)
+        self.assertEqual(len(self.factory.streams), 1)
+
+    async def test_unsubscribing_the_track_closes_the_stream(self) -> None:
+        self.camera.start()
+        stream = await self.subscribed()
+        self.room.emit("track_unsubscribed", self.camera_pub.track, self.camera_pub, self.candidate)
+        await asyncio.sleep(0)
+        self.assertTrue(stream.closed)
+
+    async def test_pictures_carry_the_media_clock_the_size_and_the_turn_in_degrees(self) -> None:
+        self.camera.start()
+        stream = await self.subscribed()
+        await self.deliver(stream, picture_event(640, 360, luma=77), 2.5)
+        await self.deliver(stream, picture_event(360, 640, rotation=1, luma=88), 3.0)
+        await self.deliver(stream, picture_event(360, 640, rotation=3, luma=99), 3.5)
+        await self.deliver(stream, picture_event(640, 360, rotation=2, luma=11), 4.0)
+        self.assertEqual([(p[0], p[1], p[2], p[3]) for p in self.pictures],
+                         [(2_500_000, 640, 360, 0), (3_000_000, 360, 640, 90), (3_500_000, 360, 640, 270), (4_000_000, 640, 360, 180)])
+        self.assertEqual(self.pictures[0][4], bytes([77]) * (640 * 360 * 3 // 2))
+        self.assertIsInstance(self.pictures[0][4], bytes)  # a copy: the SDK buffer is reused
+        self.assertEqual(self.camera.taken, 4)
+
+    async def test_a_30_fps_camera_is_halved_and_a_15_fps_one_is_untouched(self) -> None:
+        self.camera.start()
+        stream = await self.subscribed()
+        for index in range(30):  # 1 s at 30 fps
+            await self.deliver(stream, picture_event(), 10.0 + index / 30)
+        self.assertEqual(self.camera.received, 30)
+        self.assertEqual(self.camera.taken, 15)
+        self.pictures.clear()
+        before = self.camera.taken
+        for index in range(15):  # 1 s at 15 fps
+            await self.deliver(stream, picture_event(), 20.0 + index / 15)
+        self.assertEqual(self.camera.taken - before, 15)
+
+    async def test_the_gap_between_two_pictures_is_at_least_60_milliseconds(self) -> None:
+        self.camera.start()
+        stream = await self.subscribed()
+        await self.deliver(stream, picture_event(), 5.000)
+        await self.deliver(stream, picture_event(), 5.059)  # 59 ms: too soon
+        self.assertEqual(self.camera.taken, 1)
+        await self.deliver(stream, picture_event(), 5.061)  # 61 ms after the one taken
+        self.assertEqual(self.camera.taken, 2)
+
+    async def test_pictures_that_cannot_be_used_are_rejected_and_counted(self) -> None:
+        self.camera.start()
+        stream = await self.subscribed()
+        good = picture_event(640, 360)
+        bad_cases = [
+            picture_event(641, 360, data=bytes(641 * 360 * 3 // 2)),  # odd width
+            picture_event(640, 360, data=bytes(640 * 360 * 3 // 2 - 2)),  # short buffer
+            picture_event(8, 8, data=bytes(8 * 8 * 3 // 2)),  # absurdly small
+            picture_event(8192, 8192, data=b""),  # absurdly large
+            picture_event(640, 360, rotation=7),  # not a turn the SDK defines
+        ]
+        at = 30.0
+        for event in bad_cases:
+            at += 1.0
+            await self.deliver(stream, event, at)
+        self.assertEqual((self.camera.rejected, self.rejects, self.camera.taken), (5, 5, 0))
+        await self.deliver(stream, good, at + 1.0)
+        self.assertEqual(self.camera.taken, 1)
+
+    async def test_a_picture_in_another_pixel_format_is_converted_to_i420(self) -> None:
+        self.camera.start()
+        stream = await self.subscribed()
+        converted = picture_event(640, 360, luma=55).frame
+        event = picture_event(640, 360, luma=1, kind=9)
+        event.frame.convert = lambda kind: converted if kind == 5 else None
+        await self.deliver(stream, event, 40.0)
+        self.assertEqual(self.pictures[0][4][:4], bytes([55]) * 4)
+        broken = picture_event(640, 360, kind=9)
+
+        def explode(_kind):
+            raise RuntimeError("no conversion " + PRESIGNED)
+
+        broken.frame.convert = explode
+        await self.deliver(stream, broken, 41.0)
+        self.assertEqual(self.rejects, 1)
+
+    async def test_a_stream_that_fails_is_logged_once_by_type_and_never_raises(self) -> None:
+        self.camera.start()
+        with captured_logs() as lines:
+            stream = await self.subscribed()
+            stream.fail = ValueError("boom " + PRESIGNED + " candidate-identity")
+            stream.push(picture_event())
+            for _ in range(5):
+                await asyncio.sleep(0)
+            self.camera.scan()  # the next scan reopens it: the second failure stays quiet
+            for _ in range(5):
+                await asyncio.sleep(0)
+        failures = [l for l in lines if l["error_type"] == "r1_rec_camera_stream_failed"]
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["error_category"], "ValueError")
+        self.assertNotIn("boom", json.dumps(lines))
+        self.assertNotIn("candidate-identity", json.dumps(lines))
+
+    async def test_unsubscribe_gives_the_camera_up_for_good(self) -> None:
+        self.camera.start()
+        stream = await self.subscribed()
+        await self.deliver(stream, picture_event(), 50.0)
+        self.camera.unsubscribe()
+        await asyncio.sleep(0)
+        self.assertEqual(self.camera_pub.subscribe_calls, [True, False])
+        self.assertTrue(stream.closed)
+        self.assertEqual(self.room.listeners(), 0)
+        self.camera.scan()  # nothing comes back
+        self.room.emit("track_published", self.camera_pub, self.candidate)
+        self.assertEqual(self.camera_pub.subscribe_calls, [True, False])
+        stream.push(picture_event())
+        await asyncio.sleep(0)
+        self.assertEqual(self.camera.taken, 1)
+        self.camera.unsubscribe()  # idempotent
+        self.assertEqual(self.camera_pub.subscribe_calls, [True, False])
+
+    async def test_stop_closes_the_stream_and_the_listeners_but_leaves_the_subscription(self) -> None:
+        self.camera.start()
+        stream = await self.subscribed()
+        self.camera.stop()
+        self.camera.stop()
+        await asyncio.sleep(0)
+        self.assertTrue(stream.closed)
+        self.assertEqual(self.room.listeners(), 0)
+        self.assertEqual(self.camera_pub.subscribe_calls, [True])
+
+    async def test_without_an_identity_only_standard_participants_are_considered(self) -> None:
+        camera = self.make(identity=None)
+        agent = FakeParticipant("agent-1", kind=4)
+        agent_camera = agent.add(FakePublication("PUB_agent"))
+        self.room.remote_participants["agent-1"] = agent
+        camera.start()
+        self.assertEqual(self.camera_pub.subscribe_calls, [True])
+        self.assertEqual(agent_camera.subscribe_calls, [])
+
+    async def test_a_room_that_refuses_a_subscription_is_not_an_error(self) -> None:
+        def refuse(_value: bool) -> None:
+            raise RuntimeError("no")
+
+        self.camera_pub.set_subscribed = refuse
+        self.camera.start()  # nothing raises
+        self.camera.scan()
+
+
+# ------------------------------------------------------------------------------ picture: the watchdog thresholds
+
+
+class TestMonitors(unittest.TestCase):
+    def test_lag_over_250_ms_in_a_5_second_window_trips_and_below_never_does(self) -> None:
+        monitor = r1_recorder.LagMonitor()
+        for second in range(0, 20):
+            monitor.record(float(second), 0.249)
+            self.assertFalse(monitor.tripped(float(second)))
+        monitor.record(20.0, 0.250)
+        self.assertFalse(monitor.tripped(20.0), "exactly at the limit is not over it")
+        monitor.record(21.0, 0.251)
+        self.assertTrue(monitor.tripped(21.0))
+        self.assertAlmostEqual(monitor.worst(21.0), 0.251)
+
+    def test_a_lag_spike_leaves_the_window_after_five_seconds(self) -> None:
+        monitor = r1_recorder.LagMonitor()
+        monitor.record(0.0, 0.4)
+        self.assertTrue(monitor.tripped(5.0))
+        self.assertFalse(monitor.tripped(5.01))
+
+    def test_more_than_30_percent_of_the_pictures_lost_over_10_seconds_trips_it(self) -> None:
+        monitor = r1_recorder.DropMonitor()
+        monitor.record(100.0, seen=70)
+        monitor.record(100.0, seen=30, dropped=30)  # 100 seen, 30 lost: exactly the limit
+        self.assertFalse(monitor.tripped(105.0))
+        monitor.record(105.0, dropped=1)
+        self.assertTrue(monitor.tripped(105.0))
+
+    def test_a_handful_of_pictures_proves_nothing(self) -> None:
+        monitor = r1_recorder.DropMonitor()
+        monitor.record(10.0, seen=29, dropped=29)
+        self.assertFalse(monitor.tripped(10.0))
+        monitor.record(10.0, seen=1, dropped=1)
+        self.assertTrue(monitor.tripped(10.0))
+
+    def test_losses_age_out_of_the_window(self) -> None:
+        monitor = r1_recorder.DropMonitor()
+        monitor.record(0.0, seen=100, dropped=100)
+        self.assertTrue(monitor.tripped(9.9))
+        self.assertFalse(monitor.tripped(10.0))
+        self.assertEqual(monitor.ratio(10.0), (0.0, 0))
+
+    def test_vad_trips_on_two_slow_batches_in_a_row_and_only_then(self) -> None:
+        monitor = r1_recorder.VadMonitor()
+        window = 0.032
+        slow, fine = 0.0135 * 32, 0.0125 * 32  # means of 13.5 ms and 12.5 ms against a 12.8 ms limit
+        self.assertFalse(monitor.observe(fine, 32, window))
+        self.assertFalse(monitor.observe(slow, 32, window))
+        self.assertFalse(monitor.observe(fine, 32, window), "a good batch resets the run")
+        self.assertFalse(monitor.observe(slow, 32, window))
+        self.assertTrue(monitor.observe(slow, 32, window))
+
+    def test_a_single_slow_inference_batch_also_counts(self) -> None:
+        monitor = r1_recorder.VadMonitor()
+        self.assertFalse(monitor.observe(0.25, 1, 5.0))  # mean 250 ms: slow, whatever the window
+        self.assertTrue(monitor.observe(0.25, 1, 5.0))
+
+    def test_vad_batches_that_make_no_sense_are_ignored(self) -> None:
+        monitor = r1_recorder.VadMonitor()
+        for args in ((1.0, 0, 0.032), (-1.0, 5, 0.032), (1.0, 5, 0.0)):
+            self.assertFalse(monitor.observe(*args))
+            self.assertFalse(monitor.observe(*args))
+
+
+# ------------------------------------------------------------------------------ picture: the recorder
+
+
+class VideoCase(RecorderCase):
+    """An ``av`` recorder with a fake room, a fake camera stream and a fake VAD."""
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.room = FakeRoom()
+        self.factory = StreamFactory()
+        self.candidate = FakeParticipant("candidate-identity")
+        self.room.remote_participants["candidate-identity"] = self.candidate
+        self.pub = self.candidate.add(FakePublication("PUB_camera"))
+        self.vad = FakeVad()
+        self.session.vad = self.vad
+        self.ctx = SimpleNamespace(room=self.room)
+
+    def make(self, **overrides) -> R1Recorder:
+        params = dict(mode="av", ctx=self.ctx, make_stream=self.factory)
+        params.update(overrides)
+        return super().make(**params)
+
+    async def started(self, **overrides) -> R1Recorder:
+        recorder = self.make(**overrides)
+        await recorder.start("candidate-identity")
+        return recorder
+
+    async def camera_on(self) -> FakeVideoStream:
+        self.pub.track = FakeTrack("TR_camera")
+        self.pub.subscribed = True
+        self.room.emit("track_subscribed", self.pub.track, self.pub, self.candidate)
+        await until(lambda: self.factory.streams)
+        return self.factory.streams[-1]
+
+    async def show(self, stream: FakeVideoStream, count: int = 1, **kwargs) -> None:
+        """Deliver ``count`` pictures 70 ms apart on the recorder's clock; wait until each reaches the encoder."""
+        for _ in range(count):
+            self.clock.advance(0.07)
+            before = len(self.encoder.pictures)
+            stream.push(picture_event(**kwargs))
+            await until(lambda: len(self.encoder.pictures) > before)
+
+    async def ready(self, recorder: R1Recorder) -> None:
+        await until(lambda: recorder._worker.state == "uploading")
+
+
+class TestVideoStart(VideoCase):
+    async def test_av_says_video_in_hello_and_prepare_and_asks_for_the_camera(self) -> None:
+        recorder = await self.started()
+        self.assertTrue(recorder.video)
+        self.assertEqual(self.encoder.hello, {"video": True, "preset": "superfast", "t0_us": 1000 * 1_000_000})
+        await until(lambda: "prepare" in self.api.ops())
+        self.assertEqual(self.api.bodies("prepare"), [{"mode": "av"}])
+        self.assertEqual(self.pub.subscribe_calls, [True])
+        self.assertGreater(self.room.listeners(), 0)
+        self.assertEqual(len(self.vad.handlers), 1)
+        await recorder.finish()
+
+    async def test_the_preset_reaches_the_encoder_in_hello(self) -> None:
+        recorder = await self.started(preset="veryfast")
+        self.assertEqual(self.encoder.hello["preset"], "veryfast")
+        await recorder.finish()
+        recorder = self.make(preset="slow")  # not one of the three: the default
+        self.assertEqual(recorder._preset, "superfast")
+
+    async def test_audio_mode_never_touches_the_room_the_vad_or_the_probe(self) -> None:
+        recorder = await self.started(mode="audio")
+        self.assertFalse(recorder.video)
+        self.assertEqual(self.encoder.hello["video"], False)
+        self.assertEqual(self.room.listeners(), 0)
+        self.assertEqual(self.pub.subscribe_calls, [])
+        self.assertEqual(self.vad.handlers, [])
+        self.assertIsNone(recorder._lag_task)
+        self.assertIsNone(recorder._camera)
+        await recorder.finish()
+
+    async def test_a_self_test_that_has_not_answered_yet_is_given_the_benefit_of_the_doubt(self) -> None:
+        self.encoder.ready_info = None
+        recorder = await self.started()
+        self.assertTrue(recorder.video)
+        await recorder.finish()
+
+    async def test_a_camera_that_never_appears_is_a_recording_without_a_picture_not_an_error(self) -> None:
+        self.candidate.track_publications.clear()
+        with captured_logs() as lines:
+            recorder = await self.started()
+            await self.ready(recorder)
+            self.lay_stream()
+            recorder.stop(None)
+            await asyncio.wait_for(recorder.finish(), 20)
+        self.assertEqual([l["error_type"] for l in lines if l["level"] in ("warn", "error")], [])
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["has_video"]), ("combined", False))
+        self.assertEqual(body["degraded_reason"], "video_unavailable")
+        self.assertNotIn("failure_reason", body)
+
+
+class TestPictureFlow(VideoCase):
+    async def test_pictures_reach_the_encoder_stamped_on_the_media_clock(self) -> None:
+        recorder = await self.started()
+        stream = await self.camera_on()
+        self.clock.value = 1002.5
+        stream.push(picture_event(640, 360, luma=66))
+        await until(lambda: self.encoder.pictures)
+        pts, width, height, rotation, data = self.encoder.pictures[0]
+        self.assertEqual((pts, width, height, rotation), (2_500_000, 640, 360, 0))
+        self.assertEqual(data, bytes([66]) * (640 * 360 * 3 // 2))
+        await recorder.finish()
+
+    async def test_a_refresh_keeps_the_pictures_coming(self) -> None:
+        recorder = await self.started()
+        first = await self.camera_on()
+        await self.show(first, 2)
+        first.end()
+        await until(lambda: first.closed)
+        self.pub.track = None
+        self.room.emit("track_unsubscribed", FakeTrack("TR_camera"), self.pub, self.candidate)
+        second_pub = self.candidate.add(FakePublication("PUB_camera_2"))
+        self.room.emit("track_published", second_pub, self.candidate)
+        second_pub.track = FakeTrack("TR_camera_2")
+        second_pub.subscribed = True
+        self.room.emit("track_subscribed", second_pub.track, second_pub, self.candidate)
+        await until(lambda: len(self.factory.streams) == 2)
+        await self.show(self.factory.streams[1], 2)
+        self.assertEqual(len(self.encoder.pictures), 4)
+        self.assertEqual(recorder._camera.streams_opened, 2)
+        await recorder.finish()
+
+    async def test_a_camera_whose_event_was_missed_is_found_by_the_once_a_second_rescan(self) -> None:
+        self.candidate.track_publications.clear()
+        recorder = await self.started()
+        late = self.candidate.add(FakePublication("PUB_late"))  # no track_published event is ever emitted
+        await until(lambda: late.subscribe_calls == [True], timeout=4)
+        late.track = FakeTrack("TR_late")  # ... nor a track_subscribed one
+        await until(lambda: self.factory.streams, timeout=4)
+        await recorder.finish()
+
+    async def test_unusable_pictures_never_reach_the_encoder(self) -> None:
+        recorder = await self.started()
+        stream = await self.camera_on()
+        self.clock.advance(1.0)
+        stream.push(picture_event(641, 360, data=bytes(641 * 360 * 3 // 2)))
+        await until(lambda: recorder._camera.rejected == 1)
+        self.assertEqual(self.encoder.pictures, [])
+        await recorder.finish()
+
+    async def test_pictures_sent_to_a_lost_encoder_are_dropped_not_queued(self) -> None:
+        recorder = await self.started()
+        stream = await self.camera_on()
+        await self.show(stream, 1)
+        self.encoder.exited.set()
+        recorder._check_encoder()
+        self.assertEqual(recorder.encoder_lost, "encoder_crashed")
+        recorder._forward_picture(1, 640, 360, 0, bytes(640 * 360 * 3 // 2))
+        self.assertEqual(len(self.encoder.pictures), 1)
+        await recorder.finish()
+
+
+class TestDegrade(VideoCase):
+    """Level 1: the picture is given up (never the audio) on a numeric trigger, once, for good."""
+
+    async def running(self) -> tuple[R1Recorder, FakeVideoStream]:
+        recorder = await self.started()
+        stream = await self.camera_on()
+        await self.show(stream, 3)
+        await self.ready(recorder)
+        return recorder, stream
+
+    def assert_given_up(self, recorder: R1Recorder, reason: str) -> None:
+        self.assertEqual(recorder.degraded, reason)
+        self.assertEqual(self.pub.subscribe_calls, [True, False])
+        self.assertEqual(self.room.listeners(), 0)
+        self.assertEqual(self.vad.handlers, [])
+
+    async def test_loop_lag_over_250_ms_gives_the_picture_up_and_below_it_does_not(self) -> None:
+        recorder, stream = await self.running()
+        recorder.observe_lag(500.0, 0.249)
+        self.assertIsNone(recorder.degraded)
+        recorder.observe_lag(500.1, 0.251)
+        self.assert_given_up(recorder, "cpu_loop_lag")
+        await recorder.finish()
+
+    async def test_a_really_blocked_event_loop_is_noticed_by_the_probe(self) -> None:
+        recorder, _stream = await self.running()
+        await asyncio.sleep(0.2)
+        time.sleep(0.45)  # the whole loop is stuck
+        await until(lambda: recorder.degraded == "cpu_loop_lag", timeout=5)
+        await recorder.finish()
+
+    async def test_a_healthy_loop_does_not_trip_the_probe(self) -> None:
+        recorder, _stream = await self.running()
+        await asyncio.sleep(0.6)
+        self.assertIsNone(recorder.degraded)
+        await recorder.finish()
+
+    async def test_vad_inference_too_slow_for_two_batches_in_a_row_gives_it_up(self) -> None:
+        recorder, _stream = await self.running()
+        self.vad.emit(0.0125 * 32, 32)
+        self.vad.emit(0.0135 * 32, 32)
+        self.assertIsNone(recorder.degraded)
+        self.vad.emit(0.0135 * 32, 32)
+        self.assert_given_up(recorder, "cpu_vad_slow")
+        await recorder.finish()
+
+    async def test_vad_metrics_of_the_wrong_shape_are_ignored(self) -> None:
+        recorder, _stream = await self.running()
+        for metrics in (SimpleNamespace(), SimpleNamespace(inference_duration_total="x", inference_count=3),
+                        SimpleNamespace(inference_duration_total=1.0, inference_count=True)):
+            for _ in range(3):
+                recorder._on_vad_metrics(metrics)
+        self.assertIsNone(recorder.degraded)
+        await recorder.finish()
+
+    async def test_more_than_30_percent_of_the_pictures_lost_gives_it_up(self) -> None:
+        recorder, _stream = await self.running()
+        recorder._drops.record(self.clock(), seen=40, dropped=12)  # 12 of 43 seen (the 3 above included): under
+        recorder._check_video()
+        self.assertIsNone(recorder.degraded)
+        recorder._drops.record(self.clock(), dropped=3)
+        recorder._check_video()
+        self.assert_given_up(recorder, "frame_drops")
+        await recorder.finish()
+
+    async def test_pictures_pushed_out_of_the_encoder_queue_count_as_lost(self) -> None:
+        recorder, _stream = await self.running()
+        recorder._drops.record(self.clock(), seen=40)
+        self.encoder.video_dropped = 5  # 5 of 43: under the limit
+        recorder._check_video()
+        self.assertIsNone(recorder.degraded)
+        self.encoder.video_dropped = 20  # 20 of 43
+        recorder._check_video()
+        self.assert_given_up(recorder, "frame_drops")
+        await recorder.finish()
+
+    async def test_an_upload_backlog_over_six_parts_gives_it_up_and_six_does_not(self) -> None:
+        recorder, _stream = await self.running()
+        recorder._worker._mp4_enabled = lambda: False  # nothing uploads while the test measures
+        size = recorder._worker.part_size
+        self.lay_stream(size * 6)
+        recorder._check_video()
+        self.assertIsNone(recorder.degraded)
+        self.lay_stream(size * 6 + 1)
+        recorder._check_video()
+        self.assert_given_up(recorder, "upload_backlog")
+        await recorder.finish()
+
+    async def test_a_spool_over_300_megabytes_gives_it_up(self) -> None:
+        recorder, _stream = await self.running()
+        recorder._worker._mp4_enabled = lambda: False
+        with mock.patch.object(r1_recorder, "SPOOL_BYTES_LIMIT", 100_000), mock.patch.object(
+            r1_recorder, "BACKLOG_PARTS_LIMIT", 1000
+        ):
+            ogg = 4 + 256 * 8  # what the FakeIO leaves for the stock OGG
+            self.lay_stream(100_000 - ogg)  # the spool holds exactly the limit
+            recorder._check_video()
+            self.assertIsNone(recorder.degraded)
+            self.lay_stream(100_000 - ogg + 1)  # one byte over
+            recorder._check_video()
+        self.assert_given_up(recorder, "upload_backlog")
+        await recorder.finish()
+
+    async def test_a_nearly_full_disk_gives_it_up(self) -> None:
+        recorder, _stream = await self.running()
+        with mock.patch.object(Spool, "free_bytes", return_value=r1_recorder.LOW_FREE_BYTES):
+            recorder._check_video()
+        self.assertIsNone(recorder.degraded)
+        with mock.patch.object(Spool, "free_bytes", return_value=r1_recorder.LOW_FREE_BYTES - 1):
+            recorder._check_video()
+        self.assert_given_up(recorder, "upload_backlog")
+        await recorder.finish()
+
+    async def test_the_watchdog_task_runs_the_picture_checks_every_second(self) -> None:
+        recorder, _stream = await self.running()
+        with mock.patch.object(Spool, "free_bytes", return_value=0):
+            await until(lambda: recorder.degraded is not None, timeout=4)
+        self.assertEqual(recorder.degraded, "upload_backlog")
+        await recorder.finish()
+
+    async def test_once_given_up_no_picture_reaches_the_encoder_and_nothing_comes_back(self) -> None:
+        recorder, stream = await self.running()
+        self.clock.advance(12.5)
+        recorder.observe_lag(500.0, 0.5)
+        sent = len(self.encoder.pictures)
+        stream.push(picture_event())
+        await asyncio.sleep(0.05)
+        self.assertEqual(len(self.encoder.pictures), sent)
+        self.room.emit("track_published", self.pub, self.candidate)
+        recorder._camera.scan()
+        recorder.observe_lag(501.0, 0.5)  # a second trigger changes nothing ...
+        recorder._degrade("frame_drops")  # ... not even a different one
+        self.assertEqual(recorder.degraded, "cpu_loop_lag")
+        self.vad.emit(10.0, 1)
+        self.assertEqual(recorder.degraded, "cpu_loop_lag")
+        self.assertEqual(self.pub.subscribe_calls, [True, False])
+        self.assertEqual(recorder._degraded_at_ms, int((self.clock() - 1000.0) * 1000))
+        await recorder.finish()
+
+    async def test_the_audio_keeps_flowing_after_the_picture_is_given_up(self) -> None:
+        recorder, _stream = await self.running()
+        recorder.observe_lag(500.0, 0.5)
+        self.io.push(1002.5)
+        await until(lambda: len(self.encoder.audio) >= 1)
+        self.assertIsNone(recorder.encoder_lost)
+        await recorder.finish()
+
+    async def test_the_complete_report_says_when_and_why_and_stays_one_combined_file(self) -> None:
+        recorder, _stream = await self.running()
+        self.lay_stream()
+        self.encoder.closed_extra = {"frames": 150, "dropped": 0, "black": 30, "width": 640, "height": 360, "fps": 15}
+        self.clock.advance(12.5)
+        degraded_at = int((self.clock() - 1000.0) * 1000)
+        recorder.observe_lag(500.0, 0.5)
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["has_video"]), ("combined", True))
+        self.assertEqual(body["degraded_reason"], "cpu_loop_lag")
+        self.assertNotIn("failure_reason", body)
+        self.assertEqual(body["report"]["degraded_at_ms"], degraded_at)
+        self.assertIn({"kind": "video"}, self.api.bodies("object-url"))  # the faststart copy still goes
+
+    async def test_giving_up_in_audio_mode_or_after_stop_does_nothing(self) -> None:
+        audio = await self.started(mode="audio")
+        audio._degrade("cpu_loop_lag")
+        self.assertIsNone(audio.degraded)
+        await audio.finish()
+        await self.asyncSetUp()
+        recorder, _stream = await self.running()
+        recorder.stop(None)
+        recorder._degrade("cpu_loop_lag")
+        self.assertIsNone(recorder.degraded)
+        await recorder.finish()
+
+    async def test_the_log_line_for_a_degrade_is_a_fixed_word(self) -> None:
+        recorder, _stream = await self.running()
+        with captured_logs() as lines:
+            recorder.observe_lag(500.0, 0.5)
+        (line,) = lines
+        self.assertEqual((line["error_type"], line["error_category"]), ("r1_rec_degraded", "cpu_loop_lag"))
+        await recorder.finish()
+
+
+class TestEncoderLossWithPicture(VideoCase):
+    """Level 2: the encoder died.  The MP4 prefix keeps the picture, the OGG carries the whole call."""
+
+    async def running(self, *, pictures: int = 3) -> R1Recorder:
+        recorder = await self.started()
+        stream = await self.camera_on()
+        if pictures:
+            await self.show(stream, pictures)
+        await self.ready(recorder)
+        return recorder
+
+    async def test_a_crash_after_pictures_ships_the_prefix_and_the_whole_ogg_as_split(self) -> None:
+        recorder = await self.running()
+        self.lay_stream(150_000)
+        self.encoder.exited.set()
+        recorder._check_encoder()
+        self.assertEqual(recorder.encoder_lost, "encoder_crashed")
+        self.assertEqual(self.pub.subscribe_calls, [True, False])  # no point decoding a camera nobody records
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["has_video"], body["failure_reason"]), ("split", True, "encoder_crashed"))
+        self.assertTrue(body["report"]["audio_final_uploaded"])
+        self.assertEqual(b"".join(p["body"] for p in self.api.puts if "/part?" in p["url"]),
+                         bytes((i * 7) % 251 for i in range(150_000)))
+        self.assertIn({"kind": "audio"}, self.api.bodies("object-url"))
+        self.assertFalse(self.encoder.eof_sent)
+
+    async def test_a_crash_before_any_picture_is_audio_only(self) -> None:
+        recorder = await self.running(pictures=0)
+        self.encoder.exited.set()
+        recorder._check_encoder()
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["has_video"], body["failure_reason"]), ("audio_only", False, "encoder_crashed"))
+        self.assertNotIn("degraded_reason", body)
+        self.assertEqual([p for p in self.api.puts if "/part?" in p["url"]], [])
+
+    async def test_a_stalled_encoder_with_pictures_is_split_and_says_so(self) -> None:
+        recorder = await self.running()
+        self.lay_stream(100_000)
+        self.encoder.last_status_at = self.clock() - 6.0
+        recorder._check_encoder()
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["failure_reason"], body["degraded_reason"]),
+                         ("split", "encoder_crashed", "encoder_stalled"))
+
+    async def test_the_prefix_keeps_uploading_in_the_background_after_the_crash(self) -> None:
+        recorder = await self.running()
+        self.encoder.exited.set()
+        recorder._check_encoder()
+        self.lay_stream(65536 * 2 + 10)
+        await until(lambda: len([p for p in self.api.puts if "/part?" in p["url"]]) >= 2)
+        await recorder.finish()
+
+    async def test_a_full_disk_is_named_as_such(self) -> None:
+        recorder = await self.running()
+        self.encoder.error_code = "disk_full"
+        self.encoder.exited.set()
+        recorder._check_encoder()
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        (body,) = self.api.bodies("complete")
+        self.assertEqual(body["failure_reason"], "spool_disk_full")
+
+    async def test_a_hung_encoder_that_will_not_close_is_split_too(self) -> None:
+        recorder = await self.running()
+        self.lay_stream(100_000)
+        stuck = self.encoder
+        stuck.send_eof = lambda: stuck.events.append("enc.eof") or True
+        recorder.stop(None)
+        with mock.patch.object(r1_recorder, "ENCODER_CLOSE_WAIT_SECONDS", 0.3):
+            await asyncio.wait_for(recorder.finish(), 20)
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["has_video"]), ("split", True))
+
+
+class TestPictureReport(VideoCase):
+    async def finish_after(self, pictures: int, **closed) -> dict:
+        recorder = await self.started()
+        stream = await self.camera_on()
+        if pictures:
+            await self.show(stream, pictures)
+        await self.ready(recorder)
+        self.lay_stream()
+        self.encoder.closed_extra = closed
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        (body,) = self.api.bodies("complete")
+        return body
+
+    async def test_a_normal_picture_run_reports_size_rate_frames_losses_and_camera_off_time(self) -> None:
+        self.encoder.video_dropped = 1
+        body = await self.finish_after(
+            3, frames=150, dropped=2, black=15, width=640, height=360, fps=15
+        )
+        self.assertEqual((body["layout"], body["has_video"]), ("combined", True))
+        self.assertNotIn("degraded_reason", body)
+        self.assertNotIn("failure_reason", body)
+        report = body["report"]
+        self.assertEqual((report["width"], report["height"], report["fps"]), (640, 360, 15))
+        self.assertEqual(report["frames_encoded"], 150)
+        self.assertEqual(report["frames_dropped"], 3)  # 2 in the child + 1 pushed out of the queue
+        self.assertEqual(report["camera_off_ms"], 1000)
+        self.assertNotIn("degraded_at_ms", report)
+        self.assertTrue(report["faststart_uploaded"])
+
+    async def test_losses_before_the_encoder_are_added_to_the_childs(self) -> None:
+        recorder = await self.started()
+        stream = await self.camera_on()
+        await self.show(stream, 2)
+        self.clock.advance(1.0)
+        stream.push(picture_event(641, 360, data=bytes(641 * 360 * 3 // 2)))
+        await until(lambda: recorder._camera.rejected == 1)
+        await self.ready(recorder)
+        self.lay_stream()
+        self.encoder.video_dropped = 4
+        self.encoder.closed_extra = {"frames": 100, "dropped": 1, "black": 0, "width": 640, "height": 360, "fps": 15}
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        (body,) = self.api.bodies("complete")
+        self.assertEqual(body["report"]["frames_dropped"], 1 + 4 + 1)
+        self.assertEqual(body["report"]["camera_off_ms"], 0)
+
+    async def test_a_camera_that_never_delivered_a_picture_is_video_unavailable(self) -> None:
+        body = await self.finish_after(0, frames=150, dropped=0, black=150, width=640, height=360, fps=15)
+        self.assertEqual((body["layout"], body["has_video"], body["degraded_reason"]), ("combined", False, "video_unavailable"))
+        self.assertNotIn("failure_reason", body)
+        self.assertEqual(body["report"]["camera_off_ms"], 10_000)
+
+    async def test_a_child_that_fell_back_to_audio_is_video_unavailable(self) -> None:
+        body = await self.finish_after(3, frames=0, dropped=0, black=0, width=0, height=0, fps=0)
+        self.assertEqual((body["has_video"], body["degraded_reason"]), (False, "video_unavailable"))
+        self.assertNotIn("width", body["report"])
+        self.assertNotIn("frames_encoded", body["report"])
+
+    async def test_a_forced_exit_skips_the_faststart_but_keeps_the_picture(self) -> None:
+        recorder = await self.started()
+        stream = await self.camera_on()
+        await self.show(stream, 2)
+        await self.ready(recorder)
+        self.lay_stream()
+        self.encoder.closed_extra = {"frames": 40, "dropped": 0, "black": 0, "width": 640, "height": 360, "fps": 15}
+        recorder.stop("shutdown_forced")
+        await asyncio.wait_for(recorder.finish(), 20)
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["has_video"]), ("combined", True))
+        self.assertFalse(body["report"]["faststart_uploaded"])
+
+    async def test_an_audio_recording_reports_no_picture_at_all(self) -> None:
+        recorder = await self.started(mode="audio")
+        await self.ready(recorder)
+        self.lay_stream()
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        (body,) = self.api.bodies("complete")
+        self.assertFalse(body["has_video"])
+        self.assertNotIn("degraded_reason", body)
+        for key in ("width", "height", "fps", "frames_encoded", "frames_dropped", "camera_off_ms", "degraded_at_ms"):
+            self.assertNotIn(key, body["report"])
+
+    async def test_stopping_closes_the_camera_and_the_probe(self) -> None:
+        recorder = await self.started()
+        stream = await self.camera_on()
+        await self.show(stream, 1)
+        recorder.stop(None)
+        # At once, not when the finish gets to it: no picture is taken during the transcript drain.
+        self.assertTrue(recorder._camera._off)
+        self.assertEqual(self.room.listeners(), 0)
+        self.assertEqual(self.vad.handlers, [])
+        await until(lambda: stream.closed)
+        await recorder.finish()
+        self.assertIsNone(recorder._lag_task)
+
+
+class TestPictureDiscard(VideoCase):
+    async def test_a_discard_answer_gives_up_the_camera_too(self) -> None:
+        for reply in (
+            ApiReply(409, {"error": "r1_consent_withdrawn"}, "r1_consent_withdrawn"),
+            ApiReply(410, {"error": "r1_recording_deleted"}, "r1_recording_deleted"),
+        ):
+            with self.subTest(status=reply.status):
+                await self.asyncSetUp()
+                gate = threading.Event()  # the API answers only once the camera is flowing
+                self.api.script("prepare", lambda *_a, _reply=reply: gate.wait(10) and _reply)
+                recorder = await self.started()
+                stream = await self.camera_on()
+                recorder._watchdog.cancel()  # the encoder-loss path would unsubscribe too: take it out
+                gate.set()
+                await until(lambda: recorder.discarded is not None)
+                await until(lambda: stream.closed)
+                self.assertEqual(self.pub.subscribe_calls, [True, False])
+                self.assertEqual(self.room.listeners(), 0)
+                self.assertTrue(self.encoder.killed)
+                await asyncio.wait_for(recorder.finish(), 10)
+                self.assertFalse(self.spool.dir.exists())
+                self.assertEqual(self.encoder.pictures, [])
+
+    async def test_a_stop_answer_gives_up_the_camera_too(self) -> None:
+        gate = threading.Event()
+        self.api.script("prepare", lambda *_a: gate.wait(10) and ApiReply(409, {"error": "r1_session"}, "r1_session"))
+        recorder = await self.started()
+        stream = await self.camera_on()
+        recorder._watchdog.cancel()  # the encoder-loss path would unsubscribe too: take it out
+        gate.set()
+        await until(lambda: stream.closed)
+        self.assertEqual(self.pub.subscribe_calls, [True, False])
+        await asyncio.wait_for(recorder.finish(), 10)
+        self.assertEqual(self.api.bodies("complete"), [])
+
+    async def test_a_start_that_fails_leaves_no_listener_and_no_subscription_behind(self) -> None:
+        self.io = FakeIO(self.events, start_error=RuntimeError("boom"))
+        recorder = await self.started()
+        self.assertEqual(recorder.phase, "done")
+        self.assertEqual(self.room.listeners(), 0)
+        self.assertEqual(self.pub.subscribe_calls, [])
+
+
+class TestPictureLogging(VideoCase):
+    async def test_nothing_about_the_camera_or_the_candidate_reaches_a_log_line(self) -> None:
+        with captured_logs() as lines:
+            recorder = await self.started()
+            stream = await self.camera_on()
+            await self.show(stream, 2)
+            await self.ready(recorder)
+            stream.fail = ValueError("boom candidate-identity TR_camera " + PRESIGNED)
+            stream.push(picture_event())
+            recorder.observe_lag(500.0, 0.6)
+            self.lay_stream()
+            recorder.stop(None)
+            await asyncio.wait_for(recorder.finish(), 20)
+        blob = json.dumps(lines)
+        for poison in POISONS + ("boom", "candidate-identity", "TR_camera", "PUB_camera"):
+            self.assertNotIn(poison, blob)
+        for line in lines:
+            self.assertTrue(line["error_type"].startswith("r1_rec_"), line)
+            self.assertLessEqual(set(line) - {"timestamp", "level", "component", "event", "correlationId"},
+                                 {"error_type", "error_category", "status", "option_count", "duration_sec"})
+
+
+class TestPresetKnob(unittest.TestCase):
+    def test_only_the_three_cheap_presets_are_accepted_and_anything_else_is_the_default(self) -> None:
+        for value, expected in (
+            ("ultrafast", "ultrafast"), ("superfast", "superfast"), ("veryfast", "veryfast"),
+            ("faster", "superfast"), ("medium", "superfast"), ("", "superfast"), (None, "superfast"),
+            ("SUPERFAST", "superfast"), (" veryfast", "superfast"), ("veryfast ", "superfast"),
+        ):
+            env = {} if value is None else {"R1_VIDEO_X264_PRESET": value}
+            self.assertEqual(r1_recorder.x264_preset(env), expected, value)
+
+    def test_the_process_environment_is_read_when_no_env_is_given(self) -> None:
+        with mock.patch.dict(os.environ, {"R1_VIDEO_X264_PRESET": "ultrafast"}):
+            self.assertEqual(r1_recorder.x264_preset(), "ultrafast")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("R1_VIDEO_X264_PRESET", None)
+            self.assertEqual(r1_recorder.x264_preset(), "superfast")
+
+    def test_the_builder_passes_the_preset_on(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="r1rec-preset-") as tmp:
+            class Probe:
+                def __init__(self, directory):
+                    self.exited = threading.Event()
+
+                def spawn(self) -> bool:
+                    return True
+
+            env = {"R1_RECORDING": "on", "R1_VIDEO_RECORDING": "on", "R1_VIDEO_X264_PRESET": "veryfast"}
+            recorder = r1_recorder.build_r1_recorder(
+                SimpleNamespace(room=FakeRoom()), {"recording": {"mode": "av"}}, SimpleNamespace(), ROOM, SESSION_ID,
+                env=env, spool_root=Path(tmp) / "r", encoder_factory=Probe, http_client=HttpClient(),
+            )
+            self.assertEqual(recorder._preset, "veryfast")
+            self.assertEqual(recorder.mode, "av")
+            recorder._worker.halt()
+
+
 # ------------------------------------------------------------------------------ end to end
 
 
@@ -2024,6 +3301,234 @@ class TestWithTheRealEncoder(unittest.IsolatedAsyncioTestCase):
         self.assertLess(boxes.index("moov"), boxes.index("mdat"))
         self.assertFalse(self.spool.dir.exists())
         self.assertTrue(encoder.exited.wait(10) or True)
+
+
+def _loud_onsets(path: Path, *, threshold: float = 0.15, quiet_s: float = 2.0) -> list[float]:
+    """Start of every burst of loud audio in an MP4, bursts being at least ``quiet_s`` apart."""
+    onsets: list[float] = []
+    last_loud = -1e9
+    with av.open(str(path)) as container:
+        for chunk in container.decode(container.streams.audio[0]):
+            samples = np.abs(chunk.to_ndarray().reshape(-1))
+            base = float(chunk.pts * chunk.time_base)
+            loud = np.nonzero(samples > threshold)[0]
+            if loud.size:
+                first = base + float(loud[0]) / RATE
+                if first - last_loud > quiet_s:
+                    onsets.append(first)
+                last_loud = base + float(loud[-1]) / RATE
+    return onsets
+
+
+def _flash_onsets(path: Path, *, level: float = 150.0, quiet_s: float = 1.0) -> list[float]:
+    onsets: list[float] = []
+    last = -1e9
+    with av.open(str(path)) as container:
+        for picture in container.decode(container.streams.video[0]):
+            at = float(picture.pts * picture.time_base)
+            if float(picture.to_ndarray()[: picture.height].mean()) > level:
+                if at - last > quiet_s:
+                    onsets.append(at)
+                last = at
+    return onsets
+
+
+def _pictures(path: Path) -> list[tuple[float, float]]:
+    """``(seconds, mean luma)`` of every decoded picture."""
+    with av.open(str(path)) as container:
+        return [
+            (float(p.pts * p.time_base), float(p.to_ndarray()[: p.height].mean()))
+            for p in container.decode(container.streams.video[0])
+        ]
+
+
+class TestPictureWithTheRealEncoder(unittest.IsolatedAsyncioTestCase):
+    """The real child process, a fake room and camera stream, the real clock: a whole call in real time."""
+
+    async def asyncSetUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory(prefix="r1rec-av-")
+        self.addCleanup(self._tmp.cleanup)
+        self.spool = Spool(Path(self._tmp.name) / "r", SESSION_ID)
+        self.spool.create()
+        self.events: list = []
+        self.api = FakeApi(self.events)
+        self.api.checkpoint = 600
+        self.io = FakeIO(self.events)
+        self.room = FakeRoom()
+        self.factory = StreamFactory()
+        self.candidate = FakeParticipant("candidate-identity")
+        self.room.remote_participants["candidate-identity"] = self.candidate
+        self.pub = self.candidate.add(FakePublication("PUB_camera"))
+        self.vad = FakeVad()
+        self.session = SimpleNamespace(
+            input=SimpleNamespace(audio=object()), output=SimpleNamespace(audio=object()), vad=self.vad
+        )
+        patch = mock.patch.object(r1_recorder, "RETRY_DELAYS_SECONDS", (0.0, 0.0, 0.0))
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    async def start_recorder(self, *, preset: str = "ultrafast") -> tuple[R1Recorder, "r1_recorder.EncoderProcess"]:
+        encoder = r1_recorder.EncoderProcess(self.spool.dir)
+        self.assertTrue(encoder.spawn())
+        self.addCleanup(encoder.kill)
+        recorder = R1Recorder(
+            session=self.session, room=ROOM, session_id=SESSION_ID, mode="av", spool=self.spool,
+            encoder=encoder, api=self.api, http_client=StubHttp(), finish_seconds=18.0,
+            clock=time.monotonic, wall=time.time, io_class=lambda: (lambda **_kw: self.io),
+            ctx=SimpleNamespace(room=self.room), make_stream=self.factory, preset=preset,
+        )
+        self.addCleanup(recorder._worker.halt)
+        await asyncio.get_running_loop().run_in_executor(None, lambda: encoder.ready.wait(60))
+        self.assertTrue(encoder.ready.is_set(), "the child reported ready")
+        await recorder.start("candidate-identity")
+        self.assertTrue(recorder.video)
+        self.pub.track = FakeTrack("TR_camera")
+        self.pub.subscribed = True
+        self.room.emit("track_subscribed", self.pub.track, self.pub, self.candidate)
+        await until(lambda: self.factory.streams)
+        return recorder, encoder
+
+    async def run_call(
+        self,
+        recorder: R1Recorder,
+        seconds: float,
+        *,
+        flashes=(),
+        beeps=(),
+        audio_present=lambda tick: True,
+        stop_pictures_at: float | None = None,
+    ) -> None:
+        """Run ``seconds`` of media time: 15 fps pictures (white during a flash window), a 2.5 s audio
+        tick (a 1 kHz beep in the window it falls in, nothing at all while ``audio_present`` is False)."""
+        t0 = recorder._t0
+        stream = self.factory.streams[-1]
+
+        async def pictures() -> None:
+            index = 0
+            while True:
+                media = time.monotonic() - t0
+                if media >= seconds or (stop_pictures_at is not None and media >= stop_pictures_at):
+                    return
+                lit = any(a <= media < a + 0.2 for a in flashes)
+                stream.push(picture_event(luma=235 if lit else 50))
+                index += 1
+                await asyncio.sleep(max(0.0, t0 + index / 15 - time.monotonic()))
+
+        async def audio() -> None:
+            tick = 0
+            while (tick + 1) * 2.5 <= seconds + 1e-9:
+                tick += 1
+                await asyncio.sleep(max(0.0, t0 + tick * 2.5 - time.monotonic()))
+                stamp = time.monotonic()
+                if audio_present(tick):
+                    samples = np.zeros(int(2.5 * 24000), dtype="<i2")
+                    start_media = tick * 2.5 - 2.5
+                    for beep_at in beeps:
+                        if start_media <= beep_at < start_media + 2.5:
+                            offset = int((beep_at - start_media) * 24000)
+                            samples[offset : offset + 4800] = tone_samples(0.2, 24000, 1000.0, 16000)
+                    self.io.tee_in.put((stamp, [frame(samples)]))
+                else:
+                    self.io.tee_in.put((stamp, []))
+                self.io.tee_out.put((stamp, []))
+
+        await asyncio.gather(pictures(), audio())
+
+    async def finish_and_rebuild(self, recorder: R1Recorder) -> tuple[dict, Path]:
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 60)
+        self.assertEqual(recorder.phase, "done")
+        (body,) = self.api.bodies("complete")
+        parts: dict[int, bytes] = {}
+        for put in self.api.puts:
+            if "/part?" in put["url"]:
+                parts[int(re.search(r"partNumber=(\d+)", put["url"]).group(1))] = put["body"]
+        rebuilt = Path(self._tmp.name) / "rebuilt.mp4"
+        rebuilt.write_bytes(b"".join(parts[n] for n in sorted(parts)))
+        self.assertEqual(sorted(parts), list(range(1, len(parts) + 1)))
+        return body, rebuilt
+
+    async def test_a_beep_and_a_flash_stay_together_across_a_20_second_rejoin_gap(self) -> None:
+        recorder, _encoder = await self.start_recorder()
+        # Candidate audio for the first 5 s, none for 20 s (the candidate left and came back while the
+        # agent was silent), then again; a beep and a white frame at 1.5 s and again at 26.0 s.
+        await self.run_call(
+            recorder, 30.0, flashes=(1.5, 26.0), beeps=(1.5, 26.0),
+            audio_present=lambda tick: tick <= 2 or tick >= 11,
+        )
+        body, rebuilt = await self.finish_and_rebuild(recorder)
+        self.assertEqual((body["layout"], body["has_video"]), ("combined", True))
+        self.assertNotIn("failure_reason", body)
+        self.assertNotIn("degraded_reason", body)
+        with av.open(str(rebuilt)) as container:
+            video, audio = container.streams.video[0], container.streams.audio[0]
+            self.assertEqual((video.width, video.height), (640, 360))
+            self.assertAlmostEqual(float(container.duration) / 1e6, 30.0, delta=1.2)
+            self.assertEqual(audio.codec_context.name, "aac")
+        beeps, flashes = _loud_onsets(rebuilt), _flash_onsets(rebuilt)
+        self.assertEqual((len(beeps), len(flashes)), (2, 2), (beeps, flashes))
+        # Real time on a shared machine: a stalled event loop can add a frame or two of delay to a
+        # picture, so the bound here is 250 ms.  The exact 150 ms acceptance (timestamps controlled) is
+        # ``test_r1_video_encoder.TestAVSync``; this test is for a drift of SECONDS, e.g. a rejoin gap
+        # squeezed out of the audio.
+        for beep_at, flash_at in zip(beeps, flashes):
+            self.assertLess(abs(beep_at - flash_at), 0.25, (beeps, flashes))
+        self.assertAlmostEqual(beeps[0], 1.5, delta=0.3)
+        self.assertAlmostEqual(beeps[1], 26.0, delta=0.3)  # the gap is IN the timeline, not squeezed out
+        report = body["report"]
+        self.assertEqual((report["width"], report["height"], report["fps"]), (640, 360, 15))
+        self.assertGreater(report["frames_encoded"], 30 * 15 - 40)
+        self.assertEqual(report["frames_dropped"], 0)
+        self.assertLess(report["camera_off_ms"], 1500)
+        self.assertTrue(report["faststart_uploaded"])
+        fast = [p for p in self.api.puts if "/video?" in p["url"]]
+        self.assertEqual(len(fast), 1)
+        faststart = Path(self._tmp.name) / "faststart.mp4"
+        faststart.write_bytes(fast[0]["body"])
+        with av.open(str(faststart)) as container:
+            self.assertEqual((len(container.streams.video), len(container.streams.audio)), (1, 1))
+        self.assertEqual(_flash_onsets(faststart), flashes)  # the copy has the very same timeline
+
+    async def test_giving_the_picture_up_keeps_one_combined_file_with_black_video_and_continuous_audio(self) -> None:
+        recorder, _encoder = await self.start_recorder()
+        call = asyncio.ensure_future(
+            self.run_call(recorder, 9.0, beeps=(), audio_present=lambda tick: True)
+        )
+        await asyncio.sleep(3.0)
+        recorder.observe_lag(time.monotonic(), 0.6)  # the machine is struggling: the picture goes
+        self.assertEqual(recorder.degraded, "cpu_loop_lag")
+        await call
+        body, rebuilt = await self.finish_and_rebuild(recorder)
+        self.assertEqual((body["layout"], body["has_video"]), ("combined", True))
+        self.assertEqual(body["degraded_reason"], "cpu_loop_lag")
+        self.assertNotIn("failure_reason", body)
+        self.assertAlmostEqual(body["report"]["degraded_at_ms"], 3000, delta=400)
+        pictures = _pictures(rebuilt)
+        live = [luma for at, luma in pictures if 0.5 < at < 3.0]
+        dark = [luma for at, luma in pictures if at > 5.0]
+        self.assertTrue(live and dark)
+        self.assertGreater(min(live), 40)  # the flat 50-luma picture
+        self.assertLess(max(dark), 25)  # black after the 1.2 s hold
+        with av.open(str(rebuilt)) as container:
+            self.assertAlmostEqual(float(container.duration) / 1e6, 9.0, delta=1.2)
+        self.assertGreater(body["report"]["camera_off_ms"], 2000)
+
+    async def test_a_dead_encoder_mid_call_ships_the_prefix_with_the_picture_and_the_whole_ogg(self) -> None:
+        recorder, encoder = await self.start_recorder()
+        call = asyncio.ensure_future(self.run_call(recorder, 9.0, audio_present=lambda tick: True))
+        await asyncio.sleep(4.0)
+        encoder._proc.kill()  # kill -9 the child
+        await until(lambda: recorder.encoder_lost is not None, timeout=5)
+        await call
+        body, prefix = await self.finish_and_rebuild(recorder)
+        self.assertEqual((body["layout"], body["has_video"], body["failure_reason"]), ("split", True, "encoder_crashed"))
+        self.assertTrue(body["report"]["audio_final_uploaded"])
+        self.assertTrue(any(p["content_type"] == "audio/ogg" and "/audio?" in p["url"] for p in self.api.puts))
+        self.assertEqual(self.pub.subscribe_calls, [True, False])
+        pictures = _pictures(prefix)  # the cut-off file still opens and decodes
+        self.assertGreater(len(pictures), 20)
+        self.assertLess(max(at for at, _ in pictures), 5.5)
+        self.assertFalse(any("/video?" in p["url"] for p in self.api.puts), "no faststart copy of a cut-off file")
 
 
 if __name__ == "__main__":

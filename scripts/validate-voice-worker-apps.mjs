@@ -338,7 +338,7 @@ ok(!hasEnvKey(phoneCfg, "BROWSER_WORKER_ONE_JOB"), "fly.phone.toml must NOT set 
 // at the reviewed enable step, never [env]: a fly.toml value would ship with the next deploy of an
 // image that has not passed the rehearsals, and `fly secrets unset` could no longer turn it off
 // without a deploy. Absent = no RecorderIO, no spool, no encoder, no recording call.
-for (const key of ["R1_RECORDING", "R1_VIDEO_RECORDING"]) {
+for (const key of ["R1_RECORDING", "R1_VIDEO_RECORDING", "R1_VIDEO_X264_PRESET"]) {
   ok(!hasEnvKey(browser, key), `fly.toml must leave ${key} absent: R1 recording is switched on only by a Fly secret at the reviewed enable step (a fly.toml value would ship it with a deploy and defeat the instant rollback)`);
 }
 ok(!hasEnvKey(browser, "R1_READINESS_HOST"), "fly.toml must leave R1_READINESS_HOST absent: the live Cloud browser worker is already named and orchestrated, and this opt-in (post-registration readiness + the livekit_host report) is set only at the reviewed R1 cutover, after the host-aware API is deployed — shipping it in fly.toml would change the live Cloud lane and break it against an older API's strict /ready-machine schema");
