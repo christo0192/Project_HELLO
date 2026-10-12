@@ -674,9 +674,10 @@ class FinalReviewRoundOneCommitmentTests(unittest.TestCase):
     def test_the_reviewers_call_proposals_are_all_read(self):
         from r1_commitment import AskKind, ask_acts
 
+        # Ship restore round 2: "Could your husband and I have a quick word on Saturday morning?" and
+        # "How's Sunday at 11 for a quick three-way chat?" went with the head-only call nouns "word" and
+        # "conversation" and the "how's" lead (see ShipRestoreRoundTwoTests); production misses both.
         for text in (
-            "Could your husband and I have a quick word on Saturday morning?",
-            "How's Sunday at 11 for a quick three-way chat?",
             "When's a good moment to reconnect after you've read the email?",
             "Can we hop on a Zoom with your partner this weekend?",
             "Would it be alright if I gave you a buzz tomorrow evening?",
@@ -1202,6 +1203,195 @@ class ShipRestoreRoundOneTests(unittest.TestCase):
         # The fingerprint of the call patterns is pinned in test_r1_detector_corpus (ProductionCallReadingTests).
         self.assertEqual(len(r1_commitment._CALL_ASK), 11)
         self.assertEqual(len(r1_commitment._ENROL_ASK), 18)
+
+
+class ShipRestoreRoundTwoTests(unittest.TestCase):
+    """Ship restore round 2 (owner decision 2026-10-09: anything worse than production behaves exactly like
+    production; no new rule, only deletions).
+
+    Round 1 left sibling alternatives of the head-only call reader that read ordinary sentences as a call
+    proposal, where production reads none: advice to the learner to talk to its decider with another noun
+    ("a conversation / a word / a meeting / a check-in / a catch-up / a family discussion", "talk together"),
+    the learner's own schedule asked in other words ("Which evenings ...", "When is the best time for you to
+    study?", "How does your weekend usually go?", "Is Saturday best for your assignments?"), the advisor's
+    promise of an answer ("... and get back to you on the discount") and "do <a task> <a day>".  Each
+    alternative below was deleted only because it carried no labelled, live or canonical proposal that
+    production does not also read.  The sentences are production's verdicts: no call.
+    """
+
+    DECIDER_ADVICE = (
+        "Have a conversation with your husband tonight and let me know.",
+        "Could you have a word with your husband tonight?",
+        "I'd recommend a conversation with your husband before Friday.",
+        "Arrange a family discussion tonight and let me know.",
+        "Talk together tonight and let me know what you both think.",
+        "Do a quick check-in with your husband and tell me what he thinks.",
+        "I'd really encourage a conversation with your husband before you decide.",
+        "Sit down with your husband tonight and have a proper conversation about the fees.",
+        "Why don't you have a conversation with your parents over the weekend?",
+        "A conversation with your wife this evening would really help.",
+        "I'd suggest a family meeting tonight, and then let me know.",
+        "Have a word with your dad this evening and tell me what he says.",
+        "Could you have a quick word with your mother tonight?",
+        "Would you be able to have a chat with your husband this weekend?",
+        "Plan a proper discussion with your partner tonight.",
+        "Take the brochure home and have a catch-up with your parents on Saturday.",
+        "You two should talk together tonight and decide.",
+        "Talk it over together this weekend and let me know what you decide.",
+        "Is a conversation with your father something you could manage tonight?",
+        "Could your family have a meeting on Sunday to talk it through?",
+        "Do a quick check-in with your husband this evening and come back to me.",
+        "Can you hold a family discussion tomorrow and let me know the outcome?",
+        "I recommend a discussion with your parents before Friday.",
+        "Please have a meeting with your family tonight about this.",
+        "Arrange a check-in with your sister before you decide.",
+    )
+    STUDY_TIME_QUESTIONS = (
+        "Which evenings are you usually free to study?",
+        "What evenings are you usually available for homework?",
+        "Which mornings are best for you to practise coding?",
+        "When is the best time for you to study?",
+        "When would be the best time for you to do the assignments?",
+        "How does your evening usually look after work?",
+        "How does your weekend usually go?",
+        "Which weekday works best for your study block?",
+        "Which days are you usually free after work?",
+        "Which time works for you to log in to the live sessions?",
+        "What mornings do you usually have free for practice?",
+        "What evenings work for you to finish the assignments?",
+        "When is a good time for you to revise during the week?",
+        "When is the right time for you to start the prep?",
+        "How does your evening look once the kids are in bed?",
+        "How's your weekend routine, do you get time for study?",
+        "How's the morning for you, could you fit in an hour of study?",
+        "Is Saturday best for your practice sessions?",
+        "Is Saturday best for your assignments?",
+        "When's the best time in your day to concentrate on coding?",
+        "Which mornings are best for you to focus on the coursework?",
+        "If evenings are tough, would lunch breaks work for your study?",
+    )
+    ANSWER_PROMISES = (
+        "Let me check with my manager tomorrow and get back to you on the discount.",
+        "I'll find out by Friday and get back to you on the waiver.",
+        "Let me confirm with finance today and get back to you on the fees.",
+        "Let me check with my manager tomorrow and come back to you on the discount.",
+        "I'll find out by Friday and come back to you on the waiver.",
+        "Let me loop back with finance on Thursday and share what they say.",
+    )
+    TASKS_ON_A_DAY = (
+        "I can do the paperwork tomorrow.",
+        "I'll do the comparison tonight and email it.",
+        "I'd love for you to schedule a family discussion this weekend.",
+        "I will WhatsApp you the schedule this evening.",
+        "We will do the paperwork this weekend.",
+        "Let me do the assessment tonight.",
+    )
+    # Proposals production misses and the structural reader still reads: the recall that stays (each one
+    # is a labelled, live or canonical proposal that a kept alternative carries).
+    KEPT_GAINS = (
+        "What evening works best for you?",
+        "When is a good time for me to call you back?",
+        "When's the best time to call you?",
+        "How does Thursday evening sound for a call?",
+        "Would a call with your husband tomorrow evening help?",
+        "Let's get your husband on a call this weekend.",
+        "Can I give you a call on Friday morning?",
+        "We could reconnect on Thursday once you've spoken to your husband.",
+        "Let's do Thursday at 7 PM.",
+        "Can we meet on Saturday?",
+        "Shall we meet tomorrow at 7?",
+        "Let's meet again on Thursday.",
+        "I'll circle back with you on Thursday.",
+        "Let's circle back next week once you've read it.",
+        "Let's hop on a quick Zoom with your husband tomorrow at 7.",
+        "Could I give you a ring on Monday evening to answer his questions?",
+    )
+    # Proposals the head-only alternatives read and production misses: deleted with them, so the engine
+    # misses them exactly as production does (accepted gaps).
+    ACCEPTED_MISSES = (
+        "What does your calendar look like this week for a quick conversation?",
+        "Could your husband and I have a quick word on Saturday morning?",
+        "Would you both be around for a quick conversation Saturday?",
+        "How's Sunday at 11 for a quick three-way chat?",
+        "Which day is better for the call, Friday or Saturday?",
+        "Is Sunday morning best for both of you?",
+        "Let's schedule a check-in for Thursday.",
+        "Let's have a catch-up on Friday.",
+    )
+    # Read by the structural reader and not by production: a call noun that cannot be told from a real
+    # proposal without a rule about who calls whom.  Open, measured (no occurrence in the 3,804 live advisor
+    # sentences), kept because "a call with your husband" is how the advisor offers the decider call.  Remove
+    # a row here when it is fixed.
+    RESIDUAL_FALSE_POSITIVES = (
+        "Have a call with your husband tonight and let me know.",
+        "Could you have a call with your father this evening?",
+        "I'd recommend a call with your parents before Friday.",
+        "Can you join a call with the mentor before you decide?",
+        "Can you join a call with a recent graduate to hear about their experience?",
+    )
+
+    def assert_unread(self, texts):
+        from r1_commitment import call_proposal_in, production_call_ask_in
+
+        for text in texts:
+            with self.subTest(text=text):
+                self.assertIsNone(production_call_ask_in(text), "production reads it: " + text)
+                self.assertIsNone(call_proposal_in(text), text)
+                ask = detect_ask(text)
+                self.assertTrue(ask is None or ask.kind != AskKind.CALL, text)
+
+    def test_advice_to_talk_to_the_decider_with_any_noun_is_no_call_proposal(self):
+        self.assert_unread(self.DECIDER_ADVICE)
+
+    def test_a_question_about_the_learner_s_study_time_is_no_call_proposal(self):
+        self.assert_unread(self.STUDY_TIME_QUESTIONS)
+
+    def test_the_advisor_s_promise_of_an_answer_is_no_call_proposal(self):
+        self.assert_unread(self.ANSWER_PROMISES)
+
+    def test_a_task_on_a_day_is_no_call_proposal(self):
+        self.assert_unread(self.TASKS_ON_A_DAY)
+
+    def test_the_proposals_the_deleted_alternatives_carried_are_missed_as_on_production(self):
+        self.assert_unread(self.ACCEPTED_MISSES)
+
+    def test_the_recall_that_stays_is_still_read(self):
+        from r1_commitment import call_proposal_in, production_call_ask_in
+
+        for text in self.KEPT_GAINS:
+            with self.subTest(text=text):
+                self.assertIsNone(production_call_ask_in(text), "production reads it now: " + text)
+                self.assertIsNotNone(call_proposal_in(text), text)
+                ask = detect_ask(text)
+                self.assertIsNotNone(ask, text)
+                self.assertEqual(ask.kind, AskKind.CALL, text)
+
+    def test_the_documented_residual_false_positives_are_still_read(self):
+        from r1_commitment import call_proposal_in, production_call_ask_in
+
+        for text in self.RESIDUAL_FALSE_POSITIVES:
+            with self.subTest(text=text):
+                self.assertIsNone(production_call_ask_in(text), text)
+                self.assertIsNotNone(call_proposal_in(text), "fixed: remove it from RESIDUAL_FALSE_POSITIVES")
+
+    def test_every_call_production_reads_is_still_read(self):
+        """The union: the deleted alternatives cannot lose a proposal production reads."""
+        for text in (
+            "I'll get back to you tomorrow once I check with my manager.",
+            "Let me get back to you on the refund policy by tomorrow.",
+            "We'll get back to you tomorrow.",
+            "I'll get back to you next week to see how it went.",
+            "Let me get back to you on Thursday after you've spoken to him.",
+            "What day works for you and your husband this week?",
+            "Is Thursday at 7 okay for you?",
+            "I'd be happy to speak with your husband directly, is tomorrow night okay?",
+            "Can we have a quick meeting on Friday?",
+            "Shall we arrange a catch-up for next week?",
+        ):
+            with self.subTest(text=text):
+                ask = detect_ask(text)
+                self.assertIsNotNone(ask, text)
+                self.assertEqual(ask.kind, AskKind.CALL, text)
 
 
 if __name__ == "__main__":

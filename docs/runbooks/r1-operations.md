@@ -1635,6 +1635,39 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
     (production has none) 30 of 54, the cuts that stop before "a call" stay visible. The frame hides 7 of 41
     ordinary learner sentences against production's 6, and the extra one ("Let's book a call? I'm not sure
     that's needed.") is a MEDIUM phrase the learner guard blocks in a free reply anyway.
+* **Learner ship restore, round 2 (R1-Q S01 PR-A; owner decision 2026-10-09).** The round-1 review found the
+  advice-to-the-decider and learner-schedule classes still open through sibling alternatives of the
+  structural call reader. Only deletions, no new regex, rule or exemption. Deleted, each because it read an
+  ordinary sentence as a call proposal that production reads as nothing and none carried a labelled, live
+  or canonical proposal that production does not also miss:
+  * Advice to talk to the decider: the call nouns `conversation`, `word`, `meeting`, `check-in`, `huddle`,
+    `catch-up` and `discussion` (the "a quick call" object, the "have a quick word" call question, the
+    `book ... <noun>` object and the `have a catch-up` object), and `together` in "talk together".
+  * The learner's own schedule: the `which` lead and the plurals `evenings` / `mornings` of "What <day> works
+    ...", the `time` noun of "When is the best time ...", the `how does` / `how's` lead of the day question,
+    the `is` lead of "Is Saturday best for your assignments?", `lunch`, and the `schedule` verb of the
+    "<verb> a time" object ("I will WhatsApp you the schedule this evening").
+  * The advisor's promise of an answer: `get back to you`, `come back to you`, `loop back` ("Let me check with
+    my manager tomorrow and get back to you on the discount"), and the filler words of "do <task> <day>"
+    ("I can do the paperwork tomorrow") and the `-ing` of "meeting tomorrow".
+  Cost, all proposals production misses too (the engine falls back to production's level): four labelled
+  (`c1503`, `c1722`, `c1724`, `c1744`) and one live ("Let's say seven tomorrow evening."); `c0172` and `c1746`
+  are no longer read by the structural reader alone, and still are by the union. Engine counts on the hand
+  set are now 112/61/7 (tp/fp/fn). Fresh non-proposals read as a call by the structural reader but not by
+  production: decider advice 27 of 127 before, 3 now; study-time questions 35 of 174 before, 0 now; other
+  uses (answer promises, tasks on a day) 12 of 182 before, 1 now. 142 of these sentences are now
+  `call_proposal = false` rows of the corpus (`iter2:ship-restore-2/*`), so
+  `test_the_structural_reader_adds_no_false_positive_production_lacks` sees them.
+  * Known residual head-only readings, none removable by a deletion: `Have a call with your husband tonight and
+    let me know.`, `Could you have a call with your father this evening?` (the noun `call` is the proposal
+    too: "Could we have a call with your father on Sunday?"), and `Can you join a call with <a mentor>?`.
+    None occurs in the 3,804 live advisor sentences of sweeps 1-3.
+  * Not changed, needs the owner: with a model that accepts the call ("Sure, tomorrow works for me.") on an
+    early call ask, the intent stall turn blocks the text and posts `commitment`, so `out_of_level_commitment`
+    fails where production (scripted WEAK on every ask) is clean: 21 of 39 fresh early asks. It is the price
+    of the voiced stall reasons. Live: 0 of 87 stall turns of sweeps 1-3 had accepting model text. And the
+    plain classifier (round 1) reads a genuine negation as a commitment: 5 of 3,010 learner turns of sweeps
+    1-3, about 5 of 60 calls would post `commitment` (3 of them on intent turns).
 
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 

@@ -447,13 +447,25 @@ _PICK_TIME = re.compile(
 )
 
 # What: a call.
+#
+# Ship restore round 2 (owner decision 2026-10-09: anything worse than production behaves
+# exactly like production; only deletions).  The alternatives below were deleted from this
+# head-only reader because each read an ordinary sentence as a call proposal that production
+# reads as nothing, and none carried a labelled, live or canonical proposal that production
+# does not also miss.  Advice to the learner to talk to its decider: the nouns "conversation",
+# "word", "meeting", "check-in", "huddle", "catch-up" and "discussion", and "together".  The
+# learner's own schedule: "which <day>", "evenings" / "mornings", "when is the best time",
+# "how does / how's <day>", "is <day> best ...?", "would lunch work", "schedule <a time>".  The
+# advisor's promise of an answer: "get back to you", "come back to you", "loop back".  And the
+# filler words of "do <a task> <a day>" and the "-ing" of "meeting tomorrow".
+# ``ShipRestoreRoundTwoTests`` holds the sentences.
 _BOOK_VERB = (
     r"(?:schedul\w*|set(?:ting)? up|set(?:ting)?|book(?:ing)?|arrang\w*|line(?: up)?|fix|"
     r"plan(?:ning)?|organi[sz]\w*|pencil|lock(?:ing)? in)"
 )
 _CALL_NOUN = (
     r"(?:calls?|chats?|meetings?|conversations?|demo|sessions?|slots?|follow[- ]?ups?|"
-    r"catch[- ]?ups?|check[- ]?ins?|touch ?base|sync|walk[- ]?through|discussions?|"
+    r"catch[- ]?ups?|touch ?base|sync|walk[- ]?through|"
     r"appointments?|consultations?|counsel+ing)"
 )
 _TIME_NOUN = (
@@ -475,7 +487,7 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
     ),
     (
         re.compile(
-            r"\b(?:schedul\w*|set(?:ting)? up|set|book(?:ing)?|arrang\w*|fix|find|pick|pencil in)"
+            r"\b(?:set(?:ting)? up|set|book(?:ing)?|arrang\w*|fix|find|pick|pencil in)"
             r"\b(?: [\w'-]+){0,3}? " + _TIME_NOUN + r"\b",
             re.IGNORECASE,
         ),
@@ -486,8 +498,7 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
         re.compile(
             r"\b(?:a|an|another|one more|the next|the follow[- ]?up|our next|a second) "
             r"(?:quick |short |brief |follow[- ]?up |second |further |ten[- ]minute |15[- ]minute |"
-            r"20[- ]minute |\d+[- ]minute )?(?:call|meeting|conversation|catch[- ]?up|"
-            r"check[- ]?in)\b",
+            r"20[- ]minute |\d+[- ]minute )?call\b",
             re.IGNORECASE,
         ),
         False,
@@ -516,7 +527,7 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
         re.compile(
             r"\b(?:hop|jump|get|dial|log) (?:on|onto|into) (?:a |an |the |our )?(?:[\w-]+ ){0,2}?"
             r"(?:zoom|call|video call|meet|teams|hangout|chat)\b"
-            r"|\bhave a (?:quick |brief |short )?(?:natter|catch[- ]?up)\b",
+            r"|\bhave a (?:quick |brief |short )?natter\b",
             re.IGNORECASE,
         ),
         False,
@@ -525,7 +536,7 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
     (
         re.compile(
             r"\bfollow(?:ing)?[ -]?up\b|\bcheck(?:ing)? (?:back|in)\b|\bcircle back\b"
-            r"|\bloop back\b|\bcome back to you\b|\bget(?:ting)? back to you\b|\btouch base\b"
+            r"|\btouch base\b"
             r"|\breconnect\b|\breach(?:ing)? out\b|\bget in touch\b|\bbe in touch\b"
             r"|\bregroup\b|\breconvene\b|\bpick (?:this|it|that|things) up\b|\bresume\b|\brevisit\b"
             r"|\bcontinue (?:this|the (?:conversation|discussion|chat))\b",
@@ -537,7 +548,7 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
     (
         re.compile(
             r"\b(?:do|make it|manage|go with|say|fit you in|squeeze you in)\b"
-            r"(?: [\w'-]+){0,2}? (?:" + _CONCRETE_DAY.pattern + r")"
+            r" (?:" + _CONCRETE_DAY.pattern + r")"
             r"|\b(?<!your )(?<!the )(?<!a )(?:call|ring|phone|text|ping)\b(?: you| back)*(?: on| "
             r"at| in| this| next| around| by)? (?:" + _CONCRETE_DAY.pattern + r")"
             r"|\bi(?:'m| am) (?:free|available)\b[^.?!]{0,20}(?:" + _CONCRETE_DAY.pattern + r")",
@@ -547,8 +558,8 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
     ),
     (
         re.compile(
-            r"\b(?:talk|speak|chat|connect|catch up|meet|sync)(?:ing)? (?:again|tomorrow|"
-            r"tonight|today|on|at|this|next|in|after|once|with you|to you|together|once more|"
+            r"\b(?:talk|speak|chat|connect|catch up|meet|sync) (?:again|tomorrow|"
+            r"tonight|today|on|at|this|next|in|after|once|with you|to you|once more|"
             r"then)\b",
             re.IGNORECASE,
         ),
@@ -558,8 +569,8 @@ _CALL_OBJECTS: tuple[tuple[re.Pattern[str], bool], ...] = (
 # A question about a day or a time ("What evening works best for you?", "Does 9 work?").
 _TIME_ASKS = (
     re.compile(
-        r"\b(?:what|which) (?:day|time|date|evening|morning|afternoon|weekday|slot|days|times|"
-        r"evenings|mornings)\b[^.?!]{0,50}\b(?:works|work (?:for|best|better|well|out)|suit|suits|"
+        r"\bwhat (?:day|time|date|evening|morning|afternoon|weekday|slot|days|times)\b"
+        r"[^.?!]{0,50}\b(?:works|work (?:for|best|better|well|out)|suit|suits|"
         r"good|convenient|best|better|free|available|preferable|prefer|fine|okay|ok)\b",
         re.IGNORECASE,
     ),
@@ -585,16 +596,16 @@ _TIME_ASKS = (
     ),
     re.compile(
         r"\bwhen(?:'s| is| would be| works| would work| is better| is best| are you)\b[^.?!]{0,25}"
-        r"\b(?:call|chat|meeting|talk|speak|time|catch up|moment|reconnect|connect|touch base|"
+        r"\b(?:call|chat|meeting|talk|speak|catch up|moment|reconnect|connect|touch base|"
         r"follow(?:ing)?[- ]?up|get back|regroup|zoom|word)\b",
         re.IGNORECASE,
     ),
     re.compile(
-        r"\b(?:does|would|will|is|do|how about|what about|shall we do|shall we say|"
+        r"\b(?:does|would|will|do|how about|what about|shall we do|shall we say|"
         r"can we do|could we do|how does|how'?s|if we say)\b[^.?!]{0,50}"
         r"\b(?:" + _DAY + r"|" + _CLOCK_TIME + r"|(?<![\d$,.])\d{1,2}(?![\d,.])|next week|"
         r"this week|this weekend|"
-        r"sometime|lunch|same time|(?:one|two|three|four|five|six|seven|\d+) (?:days?|weeks?|"
+        r"sometime|same time|(?:one|two|three|four|five|six|seven|\d+) (?:days?|weeks?|"
         r"hours?) from now)\b"
         r"[^.?!]{0,50}\b(?:work|works|suit|suits|fine|ok|okay|good|convenient|better|sound|"
         r"sounds|best|alright)\b",
@@ -602,7 +613,7 @@ _TIME_ASKS = (
     ),
     re.compile(
         r"\b(?:shall we (?:do|say|make it)|can we do|could we do|let'?s do|"
-        r"let'?s say|let'?s make it|how does|how'?s)\b[^.?!]{0,30}"
+        r"let'?s say|let'?s make it)\b[^.?!]{0,30}"
         r"\b(?:" + _DAY + r"|" + _CLOCK_TIME + r"|next week|this week|this weekend|weekend|"
         r"evening|morning|afternoon|noon|lunch|sometime)\b",
         re.IGNORECASE,
@@ -618,8 +629,7 @@ _CALL_QUESTIONS = (
     re.compile(
         r"\b(?:would|could|can|will|is|does|do|shall we have|can we have|how about|what about|"
         r"are you open to|would you be open to|would you like|do you want|do you prefer)\b"
-        r"[^.?!]{0,50}\b(?:a|an|another)\s+(?:[\w-]+ ){0,2}?(?:call|meeting|"
-        r"conversation|check[- ]?in|word|zoom|buzz|sync|huddle|"
+        r"[^.?!]{0,50}\b(?:a|an|another)\s+(?:[\w-]+ ){0,2}?(?:call|zoom|buzz|sync|"
         r"video call|three-way)\b",
         re.IGNORECASE,
     ),

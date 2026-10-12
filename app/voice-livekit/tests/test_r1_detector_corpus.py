@@ -104,7 +104,21 @@ LABEL_KEYS = (
 # time-ask alternatives "how about / what about <day>" and "do you have <time> <day>", deleted because
 # they read "How about I email you the brochure tomorrow?" and "Do you have an hour in the mornings?"
 # as calls.  Production misses all of them.
+# Ship restore round 2: c1503 ("... look like this week for a quick conversation?"), c1722 ("... have a
+# quick word on Saturday morning?") and c1744 ("... around for a quick conversation Saturday?") went with the
+# head-only call nouns "conversation" and "word" (and "meeting", "check-in", "huddle", "catch-up",
+# "discussion"), deleted because they read advice to the learner ("Have a conversation with your husband
+# tonight and let me know", "Could you have a word with your husband tonight?") as a call; c1724 ("How's
+# Sunday at 11 for a quick three-way chat?") went with the head-only "how does / how's" lead of the
+# time-ask, deleted because it read "How does your weekend usually go?" as a call.  Production misses all
+# four.  c1746 ("... is tomorrow night okay?") went with the head-only "is <day> ...?" lead of the
+# fit-check question ("Is Saturday best for your assignments?"); c0172 ("We'll get back to you tomorrow.")
+# went with the head-only "get back to you" / "come back to you" / "loop back" follow-ups, deleted because
+# they read the advisor's promise of an ANSWER ("Let me check with my manager tomorrow and get back to you on
+# the discount") as a call.  Production reads c1746 and c0172, so the engine still does and the structural
+# reader alone no longer does.
 KNOWN_FAILURES: dict[str, frozenset[str]] = {
+    "c0172": frozenset({"call_proposal"}),
     "c0976": frozenset({"call_proposal"}),
     "c0380": frozenset({"call_proposal"}),
     "c0840": frozenset({"call_proposal"}),
@@ -112,6 +126,11 @@ KNOWN_FAILURES: dict[str, frozenset[str]] = {
     "c0598": frozenset({"call_proposal"}),
     "c0838": frozenset({"call_proposal"}),
     "c1504": frozenset({"call_proposal"}),
+    "c1503": frozenset({"call_proposal"}),
+    "c1722": frozenset({"call_proposal"}),
+    "c1724": frozenset({"call_proposal"}),
+    "c1744": frozenset({"call_proposal"}),
+    "c1746": frozenset({"call_proposal"}),
 }
 
 
@@ -496,8 +515,8 @@ PRODUCTION_CLASSIFIER_PATTERNS_SHA256 = {
 # The engine's call reading (the union) on the labelled fixtures: (tp, fp, fn).  Production's own reading
 # scores hand 66/61/53, simulator 54/4/41, held-out 18/2/18; the union keeps production's false
 # positives and adds only true positives.
-PRODUCTION_CALL_COUNTS = {  # (tp, fp, fn)
-    "hand": (116, 61, 3),
+PRODUCTION_CALL_COUNTS = {  # (tp, fp, fn); round 2 deleted four head-only gains production misses
+    "hand": (112, 61, 7),
     "sim": (91, 4, 4),
     "heldout": (31, 2, 5),
 }

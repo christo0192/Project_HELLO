@@ -747,11 +747,16 @@ class FinalReviewRoundOneProbeTests(unittest.TestCase):
         for text in (
             "Would your husband join a short call on Thursday?",
             "Can we get your husband on a call this weekend?",
-            "Could your partner and I have a quick word on Saturday?",
         ):
             with self.subTest(text=text):
                 self.assertEqual(detect_probes(text), frozenset(), text)
                 self.assertFalse(asks_about_learner(text), text)
+        # Ship restore round 2: "have a quick word" was a head-only call noun (it read "Could you have a
+        # word with your husband tonight?" as a call); production reads no call here, so the sentence is the
+        # H3 probe it is on production.
+        self.assertEqual(
+            detect_probes("Could your partner and I have a quick word on Saturday?"), frozenset({"H3"})
+        )
         # a real question about the people in the decision is still one
         self.assertEqual(detect_probes("Is your husband involved in the decision?"), frozenset({"H3"}))
         self.assertTrue(asks_about_learner("Is he more of a sounding board, or does he need convincing?"))
