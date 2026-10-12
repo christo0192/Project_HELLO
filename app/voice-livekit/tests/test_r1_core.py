@@ -277,13 +277,15 @@ class FakeContext:
         self.shutdowns: list[str] = []
         self.shutdown_callbacks: list = []
         self.connects = 0
+        self.connect_kwargs: dict = {}
         self.connect_error: BaseException | None = None
         self.connect_hangs = False
         self.delete_error: BaseException | None = None
         self.delete_hangs = False
 
-    async def connect(self) -> None:
+    async def connect(self, **kwargs) -> None:
         self.connects += 1
+        self.connect_kwargs = kwargs
         if self.connect_hangs:
             await asyncio.Event().wait()
         if self.connect_error is not None:
@@ -321,6 +323,10 @@ class FakeWriter:
         self.save_hangs = False
         self.save_gate: asyncio.Event | None = None
         self.terminal_hangs = False
+        # The turn anchor (``started_at_ms``) each saved row was given, by index, and the exact
+        # keyword names every call carried: a row without an anchor must not name one at all.
+        self.anchors: dict[int, int | None] = {}
+        self.save_kwarg_names: list[frozenset[str]] = []
 
     async def activate(self):
         self.activations += 1
@@ -337,6 +343,8 @@ class FakeWriter:
             await self.save_gate.wait()
         if self.save_error is not None:
             raise self.save_error
+        self.anchors[index] = kwargs.get("started_at_ms")
+        self.save_kwarg_names.append(frozenset(kwargs))
         self.order.append(("save", index))
         self.saved.append(
             {
@@ -2900,6 +2908,27 @@ class TestTeardownBudget(R1TestCase):
                 r1_session.shutdown_process_seconds() - r1_session.SDK_ENTRYPOINT_GRACE_SECONDS,
             )
 
+    def test_the_recording_finish_is_carved_out_of_the_shared_exit_budget(self) -> None:
+        """R1-REC: the recorder's 18 s is a share of the 30 s, never added to the 75 s."""
+        self.assertEqual(r1_session.RECORDING_FINISH_SECONDS, 18.0)
+        # The ledger, the terminal write and the outcome keep at least 12 s of the shared 30 s ...
+        self.assertLessEqual(
+            r1_session.RECORDING_FINISH_SECONDS, r1_session.EXIT_STEPS_SECONDS - 12.0
+        )
+        # ... and no bound of the cancel path grew to make room for the recording.
+        self.assertEqual(r1_session.EXIT_STEPS_SECONDS, 30.0)
+        self.assertEqual(self.worst_case_seconds(), r1_session.NOMINAL_TEARDOWN_SECONDS)
+        # Scaled down with every other bound when the shutdown timeout is smaller.
+        for seconds in ("30", "60", "90"):
+            with self.subTest(shutdown=seconds):
+                with mock.patch.dict(os.environ, {"R1_SHUTDOWN_PROCESS_TIMEOUT_SEC": seconds}):
+                    self.assertLessEqual(
+                        r1_session._scaled(r1_session.RECORDING_FINISH_SECONDS),
+                        r1_session._scaled(r1_session.EXIT_STEPS_SECONDS)
+                        - 12.0 * r1_session.teardown_scale()
+                        + 1e-9,
+                    )
+
     def test_the_exit_backstop_covers_every_bound_it_wraps(self) -> None:
         # The backstop only exists for a bug in one of those bounds.  Below their sum it
         # would fire BEFORE the room close and leave the agent in the room.
@@ -3363,6 +3392,53 @@ class TestPersistence(unittest.IsolatedAsyncioTestCase):
 
     def outcome(self, kind: str):
         return persistence.LifecycleOutcome(kind)
+
+    async def test_a_turn_anchor_is_written_only_inside_the_columns_check_window(self) -> None:
+        """``turn_started_at_ms`` has CHECK 0 < ms < 4102444800000 (0026): never risk the insert."""
+        rows: list[dict] = []
+
+        class Table:
+            def insert(self, row):
+                rows.append(dict(row))
+                return SimpleNamespace(execute=lambda: SimpleNamespace(error=None))
+
+        writer = R1TurnWriter(SESSION_ID, ROOM_NAME)
+        cases = [
+            (1_760_000_000_123, True), (1, True), (4_102_444_799_999, True),
+            (None, False), (0, False), (-5, False), (4_102_444_800_000, False),
+            (True, False), (1.76e12, False), ("1760000000123", False),
+        ]
+        with mock.patch.object(persistence, "_table", lambda _name: Table()):
+            for anchor, written in cases:
+                await writer.save_turn(7, "bot", "hello", "opening", started_at_ms=anchor)
+        for (anchor, written), row in zip(cases, rows):
+            with self.subTest(anchor=anchor):
+                if written:
+                    self.assertEqual(row["turn_started_at_ms"], anchor)
+                else:
+                    self.assertNotIn("turn_started_at_ms", row)
+                self.assertEqual(
+                    {k: v for k, v in row.items() if k != "turn_started_at_ms"},
+                    {"session_id": SESSION_ID, "turn_index": 7, "speaker": "bot", "text": "hello",
+                     "phase": "opening", "interrupted": False},
+                )
+
+    async def test_a_turn_without_an_anchor_inserts_exactly_the_old_row(self) -> None:
+        rows: list[dict] = []
+
+        class Table:
+            def insert(self, row):
+                rows.append(dict(row))
+                return SimpleNamespace(execute=lambda: SimpleNamespace(error=None))
+
+        writer = R1TurnWriter(SESSION_ID, ROOM_NAME)
+        with mock.patch.object(persistence, "_table", lambda _name: Table()):
+            await writer.save_turn(2, "candidate", " hi ", "icebreaker", interrupted=True)
+        self.assertEqual(
+            rows,
+            [{"session_id": SESSION_ID, "turn_index": 2, "speaker": "candidate", "text": "hi",
+              "phase": "icebreaker", "interrupted": True}],
+        )
 
     async def test_terminal_source_status_follows_activation(self) -> None:
         writer = R1TurnWriter(SESSION_ID, ROOM_NAME)
@@ -5967,6 +6043,414 @@ class TestEndsAfterTheRoleplay(R1TestCase):
         self.leave()
         self.assertEqual(await self.interview._finish_stop("complete"), "complete")
         self.assertEqual(self.session.spoken, [])
+
+
+class TestRecordingSeams(R1TestCase):
+    """The recorder is optional: three seams, none of which can reach the interview or its exit.
+
+    ``r1_recorder.R1Recorder`` is covered by ``test_r1_recorder``; these tests use plain hooks, so
+    they prove WHERE the interview calls them and that nothing they do can change the interview.
+    """
+
+    def seam_run(self, **hooks) -> SimpleNamespace:
+        ctx = FakeContext(self.order)
+        ctx.room.remote_participants["candidate"] = FakeParticipant("candidate")
+        session = FakeSession(log=self.order)
+        interview = R1Interview(
+            ctx,
+            {"first_name": "Asha", "candidate_identity": "candidate"},
+            session,
+            self.writer,
+            clock=Clock(),
+            **hooks,
+        )
+        task = asyncio.create_task(interview.run())
+        return SimpleNamespace(interview=interview, context=ctx, session=session, task=task)
+
+    async def to_icebreaker(self, run: SimpleNamespace) -> None:
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ICEBREAKER)
+
+    def names(self) -> list:
+        return [item if isinstance(item, str) else item[0] for item in self.order]
+
+    def shared_exit_steps(self) -> list:
+        """The exit steps that share the 30 s budget, in the order they ran."""
+        return [name for name in self.names() if name in ("recording", "ledger", "terminal", "outcome")]
+
+    async def test_the_recorder_starts_after_the_sdk_session_and_before_the_opening_line(self) -> None:
+        async def start(identity):
+            self.order.append(("recorder_start", identity))
+
+        run = self.seam_run(recorder_start=start)
+        await self.to_icebreaker(run)
+        opening = ("play_start", self.spoken_line("L-OPEN"))
+        await self.until(lambda: opening in self.order)
+        order = self.order
+        self.assertLess(order.index(("start", None)), order.index(("recorder_start", "candidate")))
+        self.assertLess(order.index(("recorder_start", "candidate")), order.index(opening))
+        await self.drain_cancel(run)
+
+    async def test_stop_is_the_first_exit_step_and_finish_the_first_shared_one(self) -> None:
+        run = self.seam_run(
+            recorder_stop=lambda outcome: self.order.append(("recorder_stop", outcome)),
+            recorder_finish=lambda: append(self.order, "recording"),
+        )
+        await self.to_icebreaker(run)
+        await self.drain_cancel(run)
+        order = self.order
+        self.assertEqual(self.names().count("recorder_stop"), 1)  # `_begin_exit` runs twice; stop once
+        stop = order.index(("recorder_stop", "shutdown_forced"))  # the outcome rides along
+        self.assertLess(stop, order.index("recording"))
+        self.assertLess(order.index("recording"), order.index("ledger"))
+        self.assertLess(order.index("ledger"), order.index("terminal"))
+
+    async def test_capture_stops_before_the_transcript_drain_so_the_finish_overlaps_it(self) -> None:
+        stamps: dict[str, float] = {}
+
+        def stop(_outcome) -> None:
+            stamps["stop"] = asyncio.get_running_loop().time()
+
+        async def ledger(*_args) -> None:
+            stamps["ledger"] = asyncio.get_running_loop().time()
+
+        self.writer.usage_disconnect = ledger
+        self.writer.save_hangs = True  # a transcript write that never ends: the drain waits it out
+        run = self.seam_run(recorder_stop=stop)
+        await self.to_icebreaker(run)
+        await self.until(lambda: ("play_end", self.spoken_line("L-OPEN")) in self.order)
+        with mock.patch.object(r1_session, "TRANSCRIPT_DRAIN_SECONDS", 0.4):
+            await self.drain_cancel(run)
+        self.assertGreaterEqual(stamps["ledger"] - stamps["stop"], 0.3)
+
+    async def test_a_failing_start_is_logged_by_type_and_the_interview_goes_on(self) -> None:
+        async def start(_identity):
+            raise RuntimeError("boom with a url https://r2.example.test/x?X-Amz-Signature=deadbeef")
+
+        run = self.seam_run(recorder_start=start)
+        with self.capture_logs() as logs:
+            await self.to_icebreaker(run)
+            await self.until(lambda: ("play_end", self.spoken_line("L-OPEN")) in self.order)
+            await self.drain_cancel(run)
+        failed = [l for l in logs if l["error_type"] == "r1_recorder_start_failed"]
+        self.assertEqual([l["error_category"] for l in failed], ["RuntimeError"])
+        self.assertNotIn("X-Amz-Signature", json.dumps(logs))
+        self.assertIn(("play_start", self.spoken_line("L-OPEN")), self.order)
+
+    async def test_a_start_that_never_returns_is_bounded_and_skipped(self) -> None:
+        release = asyncio.Event()
+        self.addCleanup(release.set)
+
+        async def start(_identity):
+            await release.wait()
+
+        with mock.patch.object(r1_session, "RECORDER_START_SECONDS", 0.05):
+            run = self.seam_run(recorder_start=start)
+            with self.capture_logs() as logs:
+                await self.to_icebreaker(run)
+                await self.until(lambda: ("play_end", self.spoken_line("L-OPEN")) in self.order)
+                await self.drain_cancel(run)
+        self.assertIn("r1_recorder_start_failed", error_types(logs))
+
+    async def test_a_failing_stop_never_touches_the_exit(self) -> None:
+        def stop(_outcome) -> None:
+            raise RuntimeError("stop exploded")
+
+        run = self.seam_run(recorder_stop=stop, recorder_finish=lambda: append(self.order, "recording"))
+        with self.capture_logs() as logs:
+            await self.to_icebreaker(run)
+            await self.drain_cancel(run)
+        self.assertEqual(error_types(logs).count("r1_recorder_stop_failed"), 1)
+        for step in ("recording", "ledger", "terminal", "outcome"):
+            self.assertIn(step, self.names())
+        self.assertEqual(run.context.deleted_rooms, [None])
+
+    async def test_a_failing_finish_does_not_skip_the_ledger_the_terminal_write_or_the_outcome(self) -> None:
+        async def finish() -> None:
+            raise RuntimeError("finish exploded")
+
+        run = self.seam_run(recorder_finish=finish)
+        with self.capture_logs() as logs:
+            await self.to_icebreaker(run)
+            await self.drain_cancel(run)
+        failed = [l for l in logs if l["error_type"] == "r1_exit_step_failed" and l["phase"] == "recording"]
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(self.shared_exit_steps(), ["ledger", "terminal", "outcome"])
+
+    async def test_a_finish_that_never_returns_cannot_spend_the_budget_of_the_terminal_write(self) -> None:
+        release = asyncio.Event()
+        self.addCleanup(release.set)
+
+        async def finish() -> None:
+            await release.wait()
+
+        # The recording's cap is its share of the exit budget, not the whole 30 s.
+        with mock.patch.object(r1_session, "RECORDING_FINISH_SECONDS", 0.1):
+            run = self.seam_run(recorder_finish=finish)
+            with self.capture_logs() as logs:
+                await self.to_icebreaker(run)
+                started = asyncio.get_running_loop().time()
+                await self.drain_cancel(run)
+        self.assertLess(asyncio.get_running_loop().time() - started, 5.0)
+        for step in ("ledger", "terminal", "outcome"):
+            self.assertIn(step, self.names())
+        timed_out = [l for l in logs if l["error_type"] == "r1_exit_step_failed" and l["phase"] == "recording"]
+        self.assertEqual([l["error_category"] for l in timed_out], ["TimeoutError"])
+
+    async def test_without_hooks_the_interview_behaves_exactly_as_before(self) -> None:
+        run = self.seam_run()
+        await self.to_icebreaker(run)
+        await self.drain_cancel(run)
+        self.assertEqual(self.shared_exit_steps(), ["ledger", "terminal", "outcome"])
+        self.assertEqual(run.context.deleted_rooms, [None])
+
+class TestRecordingWiringInTheRunner(unittest.IsolatedAsyncioTestCase):
+    """``run_r1_session``: the connect option, and what it hands the interview."""
+
+    def rig(self) -> SimpleNamespace:
+        order: list = []
+        ctx = FakeContext(order)
+        ctx.room.remote_participants["candidate"] = FakeParticipant("candidate")
+        writer = FakeWriter(order, activate_ok=False)  # the run ends at once: only the wiring is tested
+        session = FakeSession(log=order)
+        seen: dict = {}
+        original = R1Interview.__init__
+
+        def spy(self_, *args, **kwargs):
+            seen.update(kwargs)
+            original(self_, *args, **kwargs)
+
+        async def fetch(_room):
+            return {
+                "first_name": "Asha", "candidate_identity": "candidate", "attempt": {}, "settings": {},
+                "recording": {"mode": "audio"},
+            }
+
+        async def factory(_ctx, _context):
+            return session
+
+        return SimpleNamespace(ctx=ctx, writer=writer, seen=seen, spy=spy, fetch=fetch, factory=factory, order=order)
+
+    async def run_it(self, rig: SimpleNamespace):
+        with mock.patch.object(r1_session, "fetch_context", rig.fetch), mock.patch.object(
+            r1_session, "R1TurnWriter", lambda *_a, **_k: rig.writer
+        ), mock.patch.object(R1Interview, "__init__", rig.spy):
+            return await asyncio.wait_for(run_r1_session(rig.ctx, session_factory=rig.factory), 10.0)
+
+    async def test_the_worker_connects_audio_only_so_the_camera_is_not_forwarded(self) -> None:
+        rig = self.rig()
+        await self.run_it(rig)
+        self.assertEqual(rig.ctx.connects, 1)
+        self.assertEqual(list(rig.ctx.connect_kwargs), ["auto_subscribe"])
+        try:
+            from livekit.agents import AutoSubscribe
+        except ImportError:  # bare python: the stand-in is the enum's value
+            self.assertEqual(rig.ctx.connect_kwargs["auto_subscribe"], "audio_only")
+        else:
+            self.assertIs(rig.ctx.connect_kwargs["auto_subscribe"], AutoSubscribe.AUDIO_ONLY)
+
+    async def test_with_the_locks_off_nothing_recording_related_exists(self) -> None:
+        import r1_recorder
+
+        rig = self.rig()
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("R1_RECORDING", None)
+            os.environ.pop("R1_VIDEO_RECORDING", None)
+            with mock.patch.object(r1_recorder, "EncoderProcess", side_effect=AssertionError("encoder")), \
+                    mock.patch.object(r1_recorder.Spool, "create", side_effect=AssertionError("spool")), \
+                    mock.patch.object(r1_recorder.subprocess, "Popen", side_effect=AssertionError("process")), \
+                    mock.patch.object(r1_recorder.HttpClient, "request", side_effect=AssertionError("network")):
+                outcome = await self.run_it(rig)
+        self.assertEqual(outcome, "configuration_failed")
+        self.assertFalse({"recorder_start", "recorder_stop", "recorder_finish"} & set(rig.seen))
+
+    async def test_a_recorder_that_is_built_gets_its_three_seams_and_its_own_finish_budget(self) -> None:
+        import r1_recorder
+
+        rig = self.rig()
+        calls: list = []
+
+        class Recorder:
+            async def start(self, identity):
+                calls.append(("start", identity))
+
+            def stop(self, outcome=None):
+                calls.append(("stop", outcome))
+
+            async def finish(self):
+                calls.append(("finish",))
+
+        recorder = Recorder()
+        builds: list = []
+
+        def build(ctx, context, session, room, session_id, **kwargs):
+            builds.append((context.get("recording"), room, session_id, kwargs))
+            return recorder
+
+        with mock.patch.object(r1_recorder, "build_r1_recorder", build):
+            await self.run_it(rig)
+        self.assertEqual(builds[0][0], {"mode": "audio"})
+        self.assertEqual(builds[0][1:3], (ROOM_NAME, SESSION_ID))
+        self.assertEqual(
+            builds[0][3], {"finish_seconds": r1_session._scaled(r1_session.RECORDING_FINISH_SECONDS)}
+        )
+        self.assertEqual(rig.seen["recorder_start"], recorder.start)
+        self.assertEqual(rig.seen["recorder_stop"], recorder.stop)
+        self.assertEqual(rig.seen["recorder_finish"], recorder.finish)
+        # The run never reached the opening (activation failed): the recorder was stopped and
+        # finished (so it can clean its spool) but never started.
+        self.assertEqual(calls, [("stop", "configuration_failed"), ("finish",)])
+
+    async def test_a_recorder_that_cannot_be_built_is_logged_and_the_interview_still_runs(self) -> None:
+        import r1_recorder
+
+        rig = self.rig()
+
+        def build(*_args, **_kwargs):
+            raise RuntimeError("no encoder " + "https://r2.example.test/x?X-Amz-Signature=deadbeef")
+
+        with mock.patch.object(r1_recorder, "build_r1_recorder", build):
+            with capture_r1_logs() as logs:
+                outcome = await self.run_it(rig)
+        self.assertEqual(outcome, "configuration_failed")
+        self.assertIn("r1_recorder_unavailable", error_types(logs))
+        self.assertNotIn("X-Amz-Signature", json.dumps(logs))
+        self.assertFalse({"recorder_start", "recorder_stop", "recorder_finish"} & set(rig.seen))
+
+
+class TestTurnAnchors(R1TestCase):
+    """Every transcript row can carry the epoch time its turn began, from the SDK's own clocks."""
+
+    T0 = 1_760_000_000.0  # a plausible wall-clock second
+
+    def speak(self, text: str, *, created_at=None, metrics=None, claim: bool = True) -> int:
+        """Play a bot line the way the SDK reports it; returns the row's transcript index."""
+        handle = FakeSpeechHandle(text)
+        self.session.current_speech = handle
+        self.session.emit(
+            "speech_created", SimpleNamespace(speech_handle=handle, source="say", user_initiated=True)
+        )
+        if claim:
+            extra = {} if created_at is None else {"created_at": created_at}
+            self.session.emit(
+                "agent_state_changed",
+                SimpleNamespace(old_state="listening", new_state="speaking", **extra),
+            )
+        message = FakeChatMessage(text)
+        if metrics is not None:
+            message.metrics = metrics
+        handle.chat_items.append(message)
+        self.session.emit("conversation_item_added", SimpleNamespace(item=message))
+        self.session.current_speech = None
+        return self.interview._turn_index
+
+    async def anchor_of(self, index: int):
+        await self.flush()
+        return self.writer.anchors[index]
+
+    async def test_a_bot_row_takes_the_sdks_started_speaking_metric(self) -> None:
+        index = self.speak("one", metrics={"started_speaking_at": self.T0 + 0.25, "stopped_speaking_at": self.T0 + 3})
+        self.assertEqual(await self.anchor_of(index), 1_760_000_000_250)
+
+    async def test_the_metric_wins_over_the_speaking_event(self) -> None:
+        index = self.speak("two", created_at=self.T0 + 9.0, metrics={"started_speaking_at": self.T0 + 1.0})
+        self.assertEqual(await self.anchor_of(index), 1_760_000_001_000)
+
+    async def test_without_a_metric_the_claiming_speaking_event_is_the_anchor(self) -> None:
+        index = self.speak("three", created_at=self.T0 + 2.5)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_002_500)
+
+    async def test_an_unusable_metric_falls_back_to_the_event_and_then_to_nothing(self) -> None:
+        for bad in (None, 0, -5, float("nan"), float("inf"), "soon", True, 5e12, [1]):
+            with self.subTest(metric=bad):
+                index = self.speak("x", created_at=self.T0 + 4.0, metrics={"started_speaking_at": bad})
+                self.assertEqual(await self.anchor_of(index), 1_760_000_004_000)
+        index = self.speak("y", metrics={"started_speaking_at": float("nan")})
+        self.assertIsNone(await self.anchor_of(index))
+
+    async def test_a_row_with_no_anchor_is_written_exactly_as_before_never_with_the_write_time(self) -> None:
+        index = self.speak("bare")  # no metric, and the speaking event carries no created_at
+        await self.flush()
+        self.assertIsNone(self.writer.anchors[index])
+        self.assertIn(frozenset({"interrupted"}), self.writer.save_kwarg_names)
+        self.assertNotIn("started_at_ms", set().union(*self.writer.save_kwarg_names))
+
+    async def test_a_row_that_never_reported_speaking_has_no_event_anchor(self) -> None:
+        index = self.speak("silent claim", claim=False)
+        self.assertIsNone(await self.anchor_of(index))
+
+    def say_as_candidate(self, text: str, *, spoke_at=None, final_at=None) -> int:
+        if spoke_at is not None:
+            self.session.emit(
+                "user_state_changed",
+                SimpleNamespace(old_state="listening", new_state="speaking", created_at=spoke_at),
+            )
+        extra = {} if final_at is None else {"created_at": final_at}
+        self.session.emit(
+            "user_input_transcribed", SimpleNamespace(is_final=True, transcript=text, **extra)
+        )
+        index = self.interview._open_row.index
+        self.interview._flush_candidate_row()
+        return index
+
+    async def test_a_candidate_row_starts_where_the_latest_speaking_event_before_its_final_began(self) -> None:
+        index = self.say_as_candidate("hello there", spoke_at=self.T0 + 5.0, final_at=self.T0 + 6.4)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_005_000)
+
+    async def test_the_latest_speaking_event_at_or_before_the_final_is_the_one_used(self) -> None:
+        for offset in (1.0, 3.0, 5.0):
+            self.session.emit(
+                "user_state_changed",
+                SimpleNamespace(old_state="listening", new_state="speaking", created_at=self.T0 + offset),
+            )
+        index = self.say_as_candidate("again", final_at=self.T0 + 4.0)  # the 5.0 s event is AFTER it
+        self.assertEqual(await self.anchor_of(index), 1_760_000_003_000)
+        index = self.say_as_candidate("exactly", final_at=self.T0 + 5.0)  # "at or before"
+        self.assertEqual(await self.anchor_of(index), 1_760_000_005_000)
+
+    async def test_a_speaking_event_more_than_30_seconds_earlier_is_another_utterance(self) -> None:
+        index = self.say_as_candidate("late", spoke_at=self.T0, final_at=self.T0 + 30.0)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_000_000)  # exactly 30 s: still this turn
+        index = self.say_as_candidate("later", final_at=self.T0 + 30.001)
+        self.assertIsNone(await self.anchor_of(index))
+
+    async def test_no_speaking_event_before_the_final_means_no_anchor(self) -> None:
+        for spoke_at in (self.T0 + 9.0, None):
+            with self.subTest(spoke_at=spoke_at):
+                self.interview._user_speaking_at.clear()
+                index = self.say_as_candidate("x", spoke_at=spoke_at, final_at=self.T0 + 1.0)
+                self.assertIsNone(await self.anchor_of(index))
+
+    async def test_events_without_a_created_at_give_no_anchor(self) -> None:
+        self.session.emit("user_state_changed", SimpleNamespace(old_state="listening", new_state="speaking"))
+        self.assertEqual(len(self.interview._user_speaking_at), 0)
+        index = self.say_as_candidate("plain")
+        self.assertIsNone(await self.anchor_of(index))
+
+    async def test_listening_events_are_not_speech_starts(self) -> None:
+        self.session.emit(
+            "user_state_changed",
+            SimpleNamespace(old_state="speaking", new_state="listening", created_at=self.T0),
+        )
+        self.assertEqual(len(self.interview._user_speaking_at), 0)
+
+    async def test_an_out_of_range_anchor_is_dropped_not_written(self) -> None:
+        index = self.say_as_candidate("far", spoke_at=5e12, final_at=5e12 + 1)  # year 2128
+        self.assertIsNone(await self.anchor_of(index))
+
+    async def test_only_a_few_speaking_events_are_remembered(self) -> None:
+        for i in range(50):
+            self.session.emit(
+                "user_state_changed",
+                SimpleNamespace(old_state="listening", new_state="speaking", created_at=self.T0 + i),
+            )
+        self.assertLessEqual(len(self.interview._user_speaking_at), r1_session._USER_SPEECH_ANCHORS_KEPT)
+
+    def test_the_epoch_helper_accepts_only_the_columns_window(self) -> None:
+        self.assertEqual(r1_session._epoch_ms(1.0), 1000)
+        self.assertEqual(r1_session._epoch_ms(4_102_444_799.9994), 4_102_444_799_999)
+        for bad in (0, 0.0, -1, 4_102_444_800, 4_102_444_800.5, float("nan"), None, "1", True, False, b"1"):
+            with self.subTest(value=bad):
+                self.assertIsNone(r1_session._epoch_ms(bad))
 
 
 class TestPhoneIsolation(unittest.TestCase):

@@ -20,6 +20,9 @@ from r1_context import _request_json
 # anything else); a call names a status or an exception TYPE, never a message or text.
 _log = StructuredLogger("r1")
 
+# ``transcript_turns.turn_started_at_ms`` accepts 0 < ms < this (migration 0026's CHECK).
+TURN_ANCHOR_LIMIT_MS = 4_102_444_800_000
+
 
 @dataclass(frozen=True)
 class TerminalDisposition:
@@ -80,8 +83,15 @@ class R1TurnWriter:
         phase: str,
         *,
         interrupted: bool = False,
+        started_at_ms: int | None = None,
     ) -> None:
-        """Persist only non-empty R1 turns with the additive phase/interrupted fields."""
+        """Persist only non-empty R1 turns with the additive phase/interrupted fields.
+
+        ``started_at_ms`` is the epoch-millisecond anchor of the turn on the worker's wall
+        clock (``turn_started_at_ms``, migration 0026), written only when it lies in the
+        column's CHECK window; it is what the recording player seeks by.  A turn with no
+        anchor is written without the column, exactly as before.
+        """
         if not text.strip():
             return
 
@@ -92,16 +102,21 @@ class R1TurnWriter:
             table = persistence._table("transcript_turns")
             if not table:
                 raise persistence.LifecycleError("r1_persistence_disabled")
-            result = table.insert(
-                {
-                    "session_id": self.session_id,
-                    "turn_index": turn_index,
-                    "speaker": speaker,
-                    "text": text.strip(),
-                    "phase": phase,
-                    "interrupted": interrupted,
-                }
-            ).execute()
+            row: dict[str, Any] = {
+                "session_id": self.session_id,
+                "turn_index": turn_index,
+                "speaker": speaker,
+                "text": text.strip(),
+                "phase": phase,
+                "interrupted": interrupted,
+            }
+            if (
+                isinstance(started_at_ms, int)
+                and not isinstance(started_at_ms, bool)
+                and 0 < started_at_ms < TURN_ANCHOR_LIMIT_MS
+            ):
+                row["turn_started_at_ms"] = started_at_ms
+            result = table.insert(row).execute()
             if getattr(result, "error", None):
                 raise persistence.LifecycleError("r1_turn_write_failed")
 

@@ -334,6 +334,13 @@ ok(phoneApp === "project-hello-phone-voice", `fly.phone.toml app must be project
 ok(!hasEnvKey(browser, "PHONE_AGENT_NAME"), "fly.toml (browser) must NOT set PHONE_AGENT_NAME — the browser worker registers under its own BROWSER_AGENT_NAME; carrying the phone name would misroute phone dispatch");
 ok(!hasEnvKey(browser, "BROWSER_WORKER_ONE_JOB"), "fly.toml must leave BROWSER_WORKER_ONE_JOB absent until the reviewed R1 cutover sets its exact on value");
 ok(!hasEnvKey(phoneCfg, "BROWSER_WORKER_ONE_JOB"), "fly.phone.toml must NOT set BROWSER_WORKER_ONE_JOB — the one-job browser gate is never a phone setting");
+// R1 interview recording (worker capability). Like BROWSER_WORKER_ONE_JOB these are Fly SECRETS set
+// at the reviewed enable step, never [env]: a fly.toml value would ship with the next deploy of an
+// image that has not passed the rehearsals, and `fly secrets unset` could no longer turn it off
+// without a deploy. Absent = no RecorderIO, no spool, no encoder, no recording call.
+for (const key of ["R1_RECORDING", "R1_VIDEO_RECORDING"]) {
+  ok(!hasEnvKey(browser, key), `fly.toml must leave ${key} absent: R1 recording is switched on only by a Fly secret at the reviewed enable step (a fly.toml value would ship it with a deploy and defeat the instant rollback)`);
+}
 ok(!hasEnvKey(browser, "R1_READINESS_HOST"), "fly.toml must leave R1_READINESS_HOST absent: the live Cloud browser worker is already named and orchestrated, and this opt-in (post-registration readiness + the livekit_host report) is set only at the reviewed R1 cutover, after the host-aware API is deployed — shipping it in fly.toml would change the live Cloud lane and break it against an older API's strict /ready-machine schema");
 ok(!hasEnvKey(phoneCfg, "R1_READINESS_HOST"), "fly.phone.toml must NOT set R1_READINESS_HOST — the R1 readiness contract is browser-only and never a phone setting");
 for (const key of envKeys(phoneCfg)) {
@@ -357,6 +364,9 @@ const FORBIDDEN_SECRET_KEYS = [
   "DEEPSEEK_API_KEY",
   "LIVEKIT_URL", "LIVEKIT_API_KEY", "LIVEKIT_API_SECRET",
   "SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "WORKER_CONTEXT_SECRET",
+  // R1 recording: the R2 credential lives on project-hello-api ONLY. The worker receives presigned
+  // URLs from the API and holds no object-store credential (credential-inventory.md).
+  "R1_RECORDING_S3_ACCESS_KEY_ID", "R1_RECORDING_S3_SECRET_ACCESS_KEY",
   // L-1: the SIP trunk is an API-side runtime secret and must never be baked
   // into a worker config. Exact-key, so a real `ST_...` id (no digit run) is
   // caught where the old value-shape regex could not.
