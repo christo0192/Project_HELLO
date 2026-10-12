@@ -2635,6 +2635,7 @@ class IterationThreeHarnessTests(unittest.TestCase):
         self.assertEqual(metrics.misfire_metrics([cut])["misfires"], [])
 
     # --- H6: the true cost of a sweep is the balance
+    @unittest.skipUnless(HAS_HTTPX, "httpx is not installed")
     def test_the_balance_before_and_after_is_recorded_as_the_true_cost(self) -> None:
         import httpx
 
