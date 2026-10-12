@@ -1,0 +1,611 @@
+{
+ "source": "R1 smoke session b58c7d9c (the owner's 4/10 test), exported from transcript_turns. Rows 2-15 (the icebreaker) are omitted; the opening line is kept for the name check.",
+ "persona": {
+  "persona_id": "p1_career_switcher",
+  "persona_variant": "v1"
+ },
+ "rows": [
+  {
+   "turn_index": 1,
+   "phase": "opening",
+   "speaker": "bot",
+   "text": "Hi there, I'm Christy, an AI interviewer from Interview Kickstart, and I'll be running your first-round interview for the Sales Program Advisor role. It takes about twenty minutes. We'll spend a few minutes getting to know you, then I'll switch into a short sales role-play where I play a prospective learner, and we'll finish with a couple of minutes for your questions. Let's start: could you walk me through your background, especially any sales or customer-facing work you've done?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 16,
+   "phase": "transition",
+   "speaker": "bot",
+   "text": "Thank you, there. We'll now move to the role-play. I'll play a prospective learner so we can evaluate how you handle a real sales call. The learner is Meera Iyer from Edison, New Jersey, who filled in a form on our website about the Data Science course a few days ago. You're the Program Advisor calling her back. Your goal is to understand her needs and help her reach a decision, as you would on a real call, using the course details from your preparation guide. It will run for about twelve to fourteen minutes, and I'll stay in character until I say, 'Let's pause the role-play here.' When you're ready, just say 'ready' and she'll pick up.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 17,
+   "phase": "transition",
+   "speaker": "candidate",
+   "text": "Yeah, ready.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 18,
+   "phase": "transition",
+   "speaker": "bot",
+   "text": "Hello? Yes, this is Meera speaking.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 19,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Hey Meera, how are you doing?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 20,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "I think we can test that because we just",
+   "interrupted": false
+  },
+  {
+   "turn_index": 21,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Hey Meera, how are you doing? Are you good?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 22,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "I'm doing well, thanks. How are you?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 23,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "I'm great, thank you for asking. So,",
+   "interrupted": false
+  },
+  {
+   "turn_index": 24,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Yeah, so, um, I just got a call from you and, uh,",
+   "interrupted": false
+  },
+  {
+   "turn_index": 25,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "realized that you have been looking through our programs and you got registered to our webinar. So I wanted to wonder what makes you here, bring what makes you come here and also I was wondering like what do you want.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 26,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Hello",
+   "interrupted": false
+  },
+  {
+   "turn_index": 27,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "whether are you looking for upskilling or like",
+   "interrupted": false
+  },
+  {
+   "turn_index": 28,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "know what you do in your career.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 29,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Just exploring options, really. I've been in pharma operations and quality for a while.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 30,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Oh, okay. So, right now I would say AI is trending as you can see like there are everywhere, AI is almost everywhere in every domain, every profession. So, do you have any experience in AI?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 31,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "No, not really. I'm in pharma operations and quality, so it's mostly Excel-heavy work, no coding.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 32,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Okay, so what brings you here like",
+   "interrupted": false
+  },
+  {
+   "turn_index": 33,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Do you want?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 34,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Like I wanted to know like why are you looking at our programs, like what is the friction or blocker that you have in your career. I am trying to understand like what, like how we can help you fix that gap.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 35,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Just exploring options. I've tried a bit of online stuff before. There's so much free stuff on YouTube and Coursera \u2014 why pay?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 36,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Um yeah, so I I mean, we as an interview kickstart, we have a professionals taking program. So it is not like an other, you know, one program fit and fit all courses you can see in YouTube or Coursera. So in interview kickstart, we customize your programs based on what you wanted to learn and we have you know, Fang and Mang companies working professionals taking. interviews or give helping you prepare for the interviews or you know whatever the program you choose we are directly hiring them to take courses from for what you choose. So if you if you search on YouTube and Coursera maybe you can you know learn some basic stuffs but that doesn't guarantee you to",
+   "interrupted": false
+  },
+  {
+   "turn_index": 37,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "You know, you will land on something where you wanted in your career, but when it comes to our programs, when it comes to the Kickstarter,",
+   "interrupted": false
+  },
+  {
+   "turn_index": 38,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "We really kill it and we have a good conversion rate as well. So that's why it's a bit expensive and we also charge because you know, good.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 39,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Good",
+   "interrupted": false
+  },
+  {
+   "turn_index": 40,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "They don't, we don't give it for free. I mean, usually that's how the world is. So yeah.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 41,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "That makes sense. I've tried a bit of online stuff before. Will this actually get me a job, with all these layoffs?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 42,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Of course, that's where, that's why we are well known for like.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 43,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "So when it comes to layoffs, you know, people will be panicking around, they don't know what to do, but, you know, as a sales program advisor, you know, I'm a program advisor, I will do an heavy work for you while you don't have to overthink or panic around. So, so tell me Mira, do you think you will be a part of the group that will maybe, you know, that will be getting laid off? Like, why do you think so? And what makes you get scared of layoffs.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 44,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "I'm not sure, I haven't thought about that. Is it live classes or recorded?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 45,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "yeah, we provide both live and recorded classes. So let's say if you're really busy in what you do. And let's say if you don't have time or you have a family to maintain and you have a lot of personal things to do and let's say you can't sit in a live class, only for those exceptional people we provide recorded. But considering your experience and your domain, I would prefer you enroll in live classes because no recorded classes can is equal to live, right? Like When it comes to live classes, you can ask them any questions you want, you know, spontaneous questions, and it will feel more interactive and lively. So that's why I am suggesting live class for you, but yeah, we provide both live and recorded.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 46,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Got it, that's good to know. My schedule is already packed; I'm not sure I can keep up for six months.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 47,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Okay",
+   "interrupted": false
+  },
+  {
+   "turn_index": 48,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Okay, that sounds reasonable. What happens if I fall behind?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 49,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Like fall behind, can you please elaborate it?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 50,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "I mean if I miss some live classes or get behind on the coursework. What happens then?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 51,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Yeah, we have our own portal, so when you miss the live classes, you can always request for recorded clip of that session. So that's also flexibility we provide. So you don't have to worry about it. I mean, if you are busy sometime, always and also there are a lot of batches and, you know, sessions going on. Maybe if you really wanted to sit on that again in the live class, we can also schedule you to sit in one of the batches that goes through the same class again. So yeah. Bye",
+   "interrupted": false
+  },
+  {
+   "turn_index": 52,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Oh wait, before you go... $9,000 is a lot. I've heard people got it for around $7,000 \u2014 can you do that?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 53,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Um, actually you, uh, how do you get got to know that 9000 USD is what the program value is? I never said it before.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 54,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "I saw it on the website when I filled in the form. Anyway, can you do around $7,000?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 55,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Um, yeah, I mean we can",
+   "interrupted": false
+  },
+  {
+   "turn_index": 56,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "So, so 9000 like, okay, so you want the deal to be in 7000 and it also include live classes. I'm just want to make sure because when the value gets low, we will provide recorded classes. So that's what we are, I'm trying to understand like.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 57,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Oh, that's a nice surprise, thank you. Can you do a little better than that?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 58,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "So you're saying you need $7000. Okay, let's make it to 8.5, I mean $8500 and that will, I will talk to my manager. I'll make sure you get all the courses and all the premium, premiumship you get in that $9000. I can reduce $500 in that. Is it fine with you?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 59,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Okay, that's helpful. What would I actually build in the course?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 60,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "when it comes to course so again it depends on what program you actually pick up because we have a lot of programs let's say if you are focused on interview preparation or let's say you wanted to jump from one company to other then the program you should take is interview prep or let's say you wanted to jump to other company but also you have to you feel like you have to upgrade your skills then I would say say that there is a package of interview preparation plus program suggestions like let's say if you wanted to learn about AI you can learn AI or if you want to learn about Python because you know nowadays you can automate a lot of stuffs right so Python and a little bit web coding knowledge is necessary so we also provide programs and you can couple up with that so it based on what you really need.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 61,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Let me think about it. Just email me the details and I'll get back to you.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 62,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Yeah, sure. So before you go,",
+   "interrupted": false
+  },
+  {
+   "turn_index": 63,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Can we do a schedule to call back tomorrow?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 64,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "maybe like 10:00 a.m. so that I can I will I will give you all the details in your email today. I mean right after we finish the call and then you will have a good amount of time to review it, you know, think about it and come back to us. So you will we will do one thing, we will schedule a call tomorrow at 8:00 a.m.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 66,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Part 10 whichever you prefer and then we will talk about it and if you if you have any other questions we can discuss and we can get you enrolled.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 67,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Let me think about it. Just email me the details and I'll get back to you.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 68,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Uh, when will you get back to me? Like, when can I expect your call back?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 69,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "I'm not sure, I haven't thought about that. Let me think about it \u2014 maybe I'll join the next cohort.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 70,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Okay, so, um, the thing is, uh, we are planning to",
+   "interrupted": false
+  },
+  {
+   "turn_index": 71,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Hmm",
+   "interrupted": false
+  },
+  {
+   "turn_index": 72,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "You know, take limited seats because when it comes to cohorts, we see a lot of people enrolling up and then we don't have enough slots because every live classes goes for up to 1 hour to 2 to 3 hours based on the candidates and we don't want to hurry up the process just because we want to fill the seats, right? So we have decided to limit the seats that is available for every cohort and we are also reduce the cohorts batching as well. So, Uh, the next cohort comes in 3 days from today. So, uh, my timeline is if you were, if you are able to enroll tomorrow.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 73,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Hmm",
+   "interrupted": false
+  },
+  {
+   "turn_index": 74,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "then",
+   "interrupted": false
+  },
+  {
+   "turn_index": 75,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Okay",
+   "interrupted": false
+  },
+  {
+   "turn_index": 76,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "make all the necessary documents needed and I can make you sit in the coming cohort and but let's say if you miss that cohort then next cohort will be like in a couple of months and you don't really want that right like so I mean it's a waste of time you can always get back your money but you can't get back the time you wasted so I would I would suggest you enroll tomorrow and sit in this next cohort",
+   "interrupted": false
+  },
+  {
+   "turn_index": 77,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Okay, I'll keep that in mind. Just email me the details. I'd also need to talk to my husband.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 78,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Oh, fine. Um, so, uh, when you call me back, in that case, I can also talk to your husband, you know, in case if you have any doubts and, uh, I can also help him understand like why the program is $8,500 and what are the packages that we will getting. I maybe I will give him the entire curriculum details so that he will also understand and, uh, you know, support you in this entire process. What do you think?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 79,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "My schedule is pretty packed. Just so you know, I've only got a couple of minutes before my next call.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 80,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Oh, is that so? Okay, okay. So you wanted me to mail that? Yeah, done. I will mail that once we finish this call. Anything else you wanted to know about the course or program?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 81,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Let me think about it. Just email me the details and I'll get back to you.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 82,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Okay, sure, I will do the email. Yeah, thank you.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 83,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "I quit a free Python course after three weeks without any structure, and I worry I'm too old to start coding.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 84,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Oh, in that case, when it comes to coding, yeah, I mean, we have a pro Python courses. As you said, you have did a Python free course for 3 weeks. So, I mean, you know, now know at least",
+   "interrupted": false
+  },
+  {
+   "turn_index": 85,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "something about Python rather than nothing. So, we also have a basic Python",
+   "interrupted": false
+  },
+  {
+   "turn_index": 86,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "courses that evolves from basic to advanced and advanced to pro. I can also add it in your package as well, but I don't want to increase the price like you said, we will fill it up in $8500 dollars itself. So what do you think?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 87,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Let me think about it. Just email me the details and I'll get back to you.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 88,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Sure, Sure, Sure.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 89,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Is there anything else you wanted to know?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 90,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Let me think about it. Just email me the details and I'll get back to you.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 91,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "Alright, Thank you.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 92,
+   "phase": "roleplay",
+   "speaker": "bot",
+   "text": "Okay, thanks. I'll look out for your email. Let me think about it. Just email me the details and I'll get back to you.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 93,
+   "phase": "roleplay",
+   "speaker": "candidate",
+   "text": "And then I just emailed you the details.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 94,
+   "phase": "roleplay_exit",
+   "speaker": "bot",
+   "text": "Let's pause the role-play here. I'm stepping out of the learner's role now; this is Christy, your interviewer, again. Thank you, that's the end of the role-play.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 95,
+   "phase": "wrapup",
+   "speaker": "bot",
+   "text": "Before we finish, do you have any questions about the role or the next steps?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 96,
+   "phase": "wrapup",
+   "speaker": "candidate",
+   "text": "Can you give me a feedback of how I did in the role play, like is it good?",
+   "interrupted": false
+  },
+  {
+   "turn_index": 97,
+   "phase": "wrapup",
+   "speaker": "bot",
+   "text": "I'm not able to share how it went. The hiring team will review the full interview and get back to you. That's handled by the hiring team, and they'll follow up with you on it.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 98,
+   "phase": "wrapup",
+   "speaker": "candidate",
+   "text": "Alright",
+   "interrupted": false
+  },
+  {
+   "turn_index": 99,
+   "phase": "wrapup",
+   "speaker": "candidate",
+   "text": "Thank you",
+   "interrupted": false
+  },
+  {
+   "turn_index": 100,
+   "phase": "wrapup",
+   "speaker": "bot",
+   "text": "Thank you for your time today. The hiring team will follow up with you on next steps. Have a great day.",
+   "interrupted": false
+  },
+  {
+   "turn_index": 101,
+   "phase": "closing",
+   "speaker": "bot",
+   "text": "Thank you for your time today, there. The hiring team will review your interview and get back to you. You can close this window now. Goodbye.",
+   "interrupted": false
+  }
+ ]
+}

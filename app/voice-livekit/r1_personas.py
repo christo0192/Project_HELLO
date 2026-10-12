@@ -1,10 +1,13 @@
 """R1 learner personas: four normalised cards, hidden needs and genuine-probe unlock rules.
 
 Plan 5.5.  Every persona has the same shape: three needs (H1 why now, H2 doubt or past
-setback, H3 practical constraint), each with a short SURFACE answer for the first related
-question and a DEEP need that may only be released after a genuine probe and a follow-up.
+setback, H3 practical constraint), each in three layers: a short SURFACE answer for an
+incidental mention, a HINT (a little feeling, no cause, no marker) for the first genuine
+probe, and a DEEP need that may only be released after a genuine probe and a follow-up.
 The learner never sees a deep need before release (``r1_tracker.DisclosureGate`` decides),
-and ``r1_guard`` blocks any sentence that states a still-locked deep need.
+and ``r1_guard`` blocks any sentence that states a still-locked deep need.  The deep need is
+handed over as short FACTS plus the STEM words that make the reveal recordable, on the turn
+that asks about the topic (R1-Q "give facts, not quotes").
 
 What counts as a probe (the S0-B lesson): a QUESTION or elicitation about the topic.
 Keyword substring hits are not probes.  "Interview Kickstart", "thanks for your time" and
@@ -20,9 +23,9 @@ import hashlib
 import re
 from dataclasses import dataclass
 
+from r1_commitment import call_proposal_in
 from r1_script import line as script_line
 from r1_text import fold, is_question_like, split_sentences
-from r1_world import LEARNER_DEFLECTION
 
 PERSONA_VERSION = 1
 STATE_NAMES = {
@@ -58,17 +61,27 @@ PUBLIC_ANSWERS: tuple[tuple[str, str], ...] = (
 
 @dataclass(frozen=True)
 class Need:
-    """One hidden need: the surface answer, the deep need and its disclosure markers.
+    """One hidden need, in three layers: surface, hint and deep (plus the deep's markers).
 
-    ``markers`` are regexes for distinctive facets of the deep text.  They must match
-    the deep need and nothing on the public card, a surface answer or a scripted line;
-    ``tests/test_r1_personas.py`` enforces that.
+    * ``surface``: the short answer on the public card, for an incidental mention.
+    * ``hint``: what the learner says to the FIRST genuine probe of the topic.  A little
+      feeling, no cause, no number: it carries no marker, so it can be spoken at any time.
+    * ``deep``: the real need, released by a follow-up probe.  It is the canonical text (the
+      content pin, the guard and the tests use it), but the learner is never handed it to
+      read out: the reminder gives ``facts`` (2-3 short fragments) and ``stems`` (words to
+      use), so the reply is in the learner's own voice and still registers as a reveal.
+    * ``markers``: regexes for distinctive facets of the deep text.  They must match the
+      deep need, every stem and nothing on the public card, a surface answer, a hint or a
+      scripted line; ``tests/test_r1_personas.py`` enforces that.
     """
 
     topic: str
     surface: str
     deep: str
     markers: tuple[str, ...]
+    hint: str
+    facts: tuple[str, ...]
+    stems: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -97,6 +110,10 @@ class Persona:
     prior_learning: str
     variants: tuple[Variant, ...]
     version: int = PERSONA_VERSION
+    # Public, marker-free facts the learner may use for small talk and "tell me about
+    # yourself" questions, so it has true things to say instead of recycling one profile
+    # line.  Nothing here may match a deep-need marker (``tests/test_r1_personas.py``).
+    backstory: tuple[str, ...] = ()
 
     def need(self, topic: str) -> Need:
         for item in self.needs:
@@ -124,6 +141,15 @@ PERSONAS: tuple[Persona, ...] = (
                     r"stuck (?:in )?(?:the|my) same (?:role|job|position)",
                     r"no (?:growth|promotion)",
                 ),
+                hint=(
+                    "Things at work feel a bit uncertain right now, and I've been "
+                    "in the same spot for a while."
+                ),
+                facts=(
+                    "your plant is being consolidated next year",
+                    "your role has been stagnant for about three years",
+                ),
+                stems=("consolidated", "stagnant"),
             ),
             Need(
                 "H2",
@@ -139,6 +165,13 @@ PERSONAS: tuple[Persona, ...] = (
                     r"\bdropped out\b",
                     r"(?:didn'?t|did not|couldn'?t) (?:finish|stick|complete)",
                 ),
+                hint="I did try learning on my own once, and it didn't really go anywhere.",
+                facts=(
+                    "you quit a free Python course after three weeks",
+                    "it had no structure at all",
+                    "you worry you are too old to start coding",
+                ),
+                stems=("quit", "three weeks", "too old"),
             ),
             Need(
                 "H3",
@@ -154,10 +187,27 @@ PERSONAS: tuple[Persona, ...] = (
                     r"\b(?:daughters?|sons?)\b",
                     r"\bchildcare\b",
                 ),
+                hint="Time and money are both tight at home right now.",
+                facts=(
+                    "you have two kids",
+                    "so it could only be evenings and weekends",
+                    "money is shared at home, so you would need monthly instalments",
+                ),
+                stems=("kids", "evenings and weekends"),
             ),
         ),
         decision_maker="husband",
         prior_learning="Just a bit of online stuff.",
+        backstory=(
+            "Your day job is reviewing batch records and chasing deviation paperwork at a "
+            "pharma site.",
+            "You like your team, but the work has become repetitive.",
+            "You already build big Excel trackers and reports, and you enjoy that part.",
+            "You saw the Interview Kickstart webinar announcement on LinkedIn and "
+            "registered.",
+            "You are careful with money and like to compare before you pay for anything.",
+            "You are calling from home after work, a bit tired but friendly.",
+        ),
         variants=(
             Variant("v1", "Meera", "Iyer", "Edison, NJ", "pharma operations and quality"),
             Variant(
@@ -186,6 +236,15 @@ PERSONAS: tuple[Persona, ...] = (
                     r"contract (?:renewal|renews|is up|ends|end|expires|runs out)\b",
                     r"\brenewal\b",
                 ),
+                hint=(
+                    "My current job feels a bit temporary, and I'd like something "
+                    "more settled."
+                ),
+                facts=(
+                    "your contract renewal is decided in about six months",
+                    "you want a data science role by then",
+                ),
+                stems=("contract renewal",),
             ),
             Need(
                 "H2",
@@ -199,16 +258,37 @@ PERSONAS: tuple[Persona, ...] = (
                     r"(?:rejected|failed) (?:in|after|at) (?:the )?(?:ml|machine[- ]learning|"
                     r"technical|final)",
                 ),
+                hint="The interviews haven't really been going my way lately.",
+                facts=(
+                    "you keep failing the ML and technical rounds",
+                    "learning on your own is not working for you",
+                ),
+                stems=("keep failing", "not working"),
             ),
             Need(
                 "H3",
                 "Money's a bit tight.",
                 "I have student loans, so it would have to be instalments.",
                 (r"student loans?", r"\bloans?\b", r"\bdebt\b"),
+                hint="Money is tight for me right now, so how I pay for this matters a lot.",
+                facts=(
+                    "you have student loans",
+                    "so it would have to be monthly instalments",
+                ),
+                stems=("student loans",),
             ),
         ),
         decision_maker="father",
         prior_learning="Mostly self-study.",
+        backstory=(
+            "Day to day you build weekly dashboards and clean up spreadsheets with SQL and "
+            "Excel.",
+            "You apply to data science roles every week and tailor each application.",
+            "You went to an Interview Kickstart webinar a few weeks ago and found it "
+            "interesting.",
+            "You watch free data science videos online in your spare time.",
+            "You share an apartment with two roommates.",
+        ),
         variants=(
             Variant("v1", "Ananya", "Rao", "Austin, TX", "reporting"),
             Variant("v2", "Neha", "Singh", "Dallas, TX", "business intelligence"),
@@ -236,6 +316,15 @@ PERSONAS: tuple[Persona, ...] = (
                     r"\bpromotion\b",
                     r"\boverlooked\b",
                 ),
+                hint=(
+                    "I was hoping for a step up at work, and it didn't work out this time."
+                ),
+                facts=(
+                    "you were passed over for an internal data science role",
+                    "you did not have enough ML depth",
+                    "the next opening is in six to eight months",
+                ),
+                stems=("passed over", "ML depth"),
             ),
             Need(
                 "H2",
@@ -251,6 +340,12 @@ PERSONAS: tuple[Persona, ...] = (
                     r"(?:ds|data science) (?:is|isn'?t|is not|might not be) (?:a )?safe",
                     r"\brumou?rs?\b",
                 ),
+                hint="I do have a couple of worries about whether it's the right fit for me.",
+                facts=(
+                    "you fear the course will repeat the SQL basics you already know",
+                    "restructuring rumours make you doubt data science is a safe bet",
+                ),
+                stems=("repeat the SQL basics", "restructuring", "safe bet"),
             ),
             Need(
                 "H3",
@@ -265,10 +360,24 @@ PERSONAS: tuple[Persona, ...] = (
                     r"\bcrunch(?:es)?\b",
                     r"year[- ]end",
                 ),
+                hint="Work gets pretty hectic at times, and money matters to me too.",
+                facts=(
+                    "quarter-end crunches are brutal at work",
+                    "you would be paying for it yourself, so you would need instalments",
+                ),
+                stems=("quarter-end", "crunch"),
             ),
         ),
         decision_maker="husband",
         prior_learning="SQL, Excel, Tableau and some Python at work.",
+        backstory=(
+            "You build Tableau dashboards and write SQL reports for business teams.",
+            "You use Python for small automation scripts, nothing fancy.",
+            "Your manager is friendly and your team is easygoing.",
+            "You registered for an Interview Kickstart webinar after a colleague mentioned "
+            "it.",
+            "You like to understand the details before you decide anything.",
+        ),
         variants=(
             Variant("v1", "Kavya", "Menon", "Charlotte, NC", "a bank"),
             Variant("v2", "Sneha", "Pillai", "Raleigh, NC", "an insurance company"),
@@ -294,6 +403,12 @@ PERSONAS: tuple[Persona, ...] = (
                     r"postdoc (?:ends|is ending)",
                     r"job market",
                 ),
+                hint="I'm weighing my options because things in academia feel uncertain.",
+                facts=(
+                    "your postdoc funding ends in about eight months",
+                    "the academic job market looks bleak",
+                ),
+                stems=("funding", "eight months", "bleak"),
             ),
             Need(
                 "H2",
@@ -308,6 +423,16 @@ PERSONAS: tuple[Persona, ...] = (
                     r"(?:lack|missing|don'?t have|no|weak on) (?:production|sql)",
                     r"industry (?:case|interview) (?:round|rejection)",
                 ),
+                hint=(
+                    "I've talked to a couple of industry teams, and it didn't go the way I'd "
+                    "hoped."
+                ),
+                facts=(
+                    "you were rejected after an industry case round",
+                    "you lack production ML, SQL and interview skills",
+                    "you feel like an outsider",
+                ),
+                stems=("rejected", "case round", "outsider"),
             ),
             Need(
                 "H3",
@@ -319,10 +444,25 @@ PERSONAS: tuple[Persona, ...] = (
                     r"tight budget",
                     r"\bstipend\b",
                 ),
+                hint="Money is a real consideration for me, since I'm on a research salary.",
+                facts=(
+                    "your postdoc budget is tight",
+                    "so you would need instalments",
+                ),
+                stems=("postdoc budget",),
             ),
         ),
         decision_maker="partner",
         prior_learning="Python, R and statistics from my research.",
+        backstory=(
+            "You analyse large experimental datasets with Python and R, and you enjoy the "
+            "statistics.",
+            "You have published a few papers and you help supervise two master's students.",
+            "You went to an Interview Kickstart webinar a couple of weeks ago, out of "
+            "curiosity.",
+            "You are curious how data science teams actually work in industry.",
+            "You are thoughtful and tend to ask careful questions.",
+        ),
         variants=(
             Variant("v1", "Shalini", "Verma", "Boston, MA", "computational biology"),
             Variant("v2", "Anjali", "Joshi", "Cambridge, MA", "bioinformatics"),
@@ -382,6 +522,11 @@ class RenderedPersona:
         return self.persona.decision_maker
 
     @property
+    def decider_answer(self) -> str:
+        """The public answer to "who else is involved in your decision" (one person, all call)."""
+        return f"I'd talk it over with my {self.persona.decision_maker} first."
+
+    @property
     def spoken_city(self) -> str:
         """The city as TTS should read it: "Edison, New Jersey", not "Edison, NJ"."""
         town, _, state = self.variant.city.partition(", ")
@@ -410,6 +555,15 @@ class RenderedPersona:
     def deep(self, topic: str) -> str:
         return self.persona.need(topic).deep
 
+    def hint(self, topic: str) -> str:
+        return self.persona.need(topic).hint
+
+    def facts(self, topic: str) -> tuple[str, ...]:
+        return self.persona.need(topic).facts
+
+    def stems(self, topic: str) -> tuple[str, ...]:
+        return self.persona.need(topic).stems
+
     def markers(self, topic: str) -> tuple[re.Pattern[str], ...]:
         return _compiled_markers(self.persona.id, topic)
 
@@ -421,14 +575,25 @@ class RenderedPersona:
             "You filled in a form on the Interview Kickstart website a few days ago about "
             "the Data Science course. You know only that it is around $9,000 and about "
             "6 months.",
-            "Short answers, to give only when asked and never to expand on:",
         ]
+        if self.persona.backstory:
+            parts.append(
+                "Your backstory (all true; use it in your own words for small talk or when "
+                "the advisor asks about you, and never recite it):"
+            )
+            parts.extend(f"- {fact}" for fact in self.persona.backstory)
+        parts.append("Short answers, to give only when asked and never to expand on:")
         for topic in H_TOPICS:
             parts.append(f'- {TOPIC_LABELS[topic]}: "{self.surface(topic)}"')
         parts.append(f'- what you have studied so far: "{self.persona.prior_learning}"')
         for label, answer in PUBLIC_ANSWERS:
             parts.append(f'- {label}: "{answer}"')
-        parts.append(f'Anything else not listed here: "{LEARNER_DEFLECTION}"')
+        parts.append(f'- who else is involved in your decision: "{self.decider_answer}"')
+        parts.append(
+            "Anything else about yourself that is not listed here: answer in a few vague, "
+            "believable words and invent no numbers, names or dates. Anything else about "
+            "the course: you do not know it, so ask the advisor."
+        )
         return "\n".join(parts)
 
 
@@ -500,6 +665,14 @@ _H1_PATTERNS = (
     r"\bwhat(?:'s| is| was| has| have)? (?:been )?(?:driving|behind|prompting|motivating|"
     r"pushing|triggering)\b",
     r"\bwhat (?:made|prompted|triggered|sparked|pushed|got|led|brought) you\b",
+    # R1-Q: the present tense ("what makes you come here", "what brings you here") and the
+    # "why are you looking at our programs" phrasing the owner test used (turns 25, 32, 34).
+    r"\bwhat (?:makes|brings|drives|pushes|motivates|prompts|is (?:bringing|making|driving|"
+    r"pushing|prompting)) you\b(?! (?:think|say|feel|believe|sure))",
+    r"\bwhat(?:'s| is) (?:bringing|driving|prompting) you\b",
+    r"\bwhy (?:are you|you're|you are) (?:\w+ ){0,2}(?:looking|interested|exploring|"
+    r"considering|thinking|here|calling|enquiring|inquiring)\b",
+    r"\b(?:laid off|lay[- ]?offs?|job security)\b",
     r"\bwhat (?:changed|has changed)\b",
     r"\b(?:specific|particular|any) (?:trigger|event|reason|deadline|date|catalyst)\b",
     r"\btrigger\b",
@@ -514,11 +687,15 @@ _H1_PATTERNS = (
     r"\b(?:your|any|a|an) (?:[\w-]+ ){0,2}deadline\b",
 )
 _H2_PATTERNS = (
-    r"\b(?:concerns?|worr(?:y|ies|ied|ying)|hesitat\w+|doubts?|nervous|afraid|fears?|"
-    r"apprehens\w+|reservations?)\b",
-    r"\bholding you back\b|\bstopp(?:ing|ed) you\b|\bin your way\b|\bgot in the way\b"
-    r"|\bget in the way\b",
+    # The generic worry words (concern, worry, hesitation ...) are ``_H2_GENERIC_WORRY`` below: they
+    # name the topic only when nothing else in the question does.
+    r"\bholding you back\b|\bheld you back\b|\bkept you from\b|\bstopp(?:ing|ed) you\b"
+    r"|\bin your way\b|\bgot in the way\b|\bget in the way\b",
     r"\b(?:challenges?|struggl\w+|hurdles?|obstacles?|setbacks?|roadblocks?|frustrat\w+)\b",
+    # R1-Q: "what is the friction or blocker", "what's stopping you" (owner test turns 34 and
+    # 43).  The generic fear words ("scared", "stress", "anxious") are NOT here: see
+    # ``_H2_FEAR_WORDS``.
+    r"\b(?:blockers?|frictions?|pain[- ]?points?)\b|\bwhat(?:'s| is) stopping\b",
     r"\bwhat (?:have|did|had) you (?:tried|try|done|attempted|used)\b",
     r"\b(?:have|had) you (?:tried|taken|attempted|studied|used)\b",
     r"\b(?:tried|trying) (?:so far|before|already|anything)\b",
@@ -530,7 +707,7 @@ _H2_PATTERNS = (
     r"\bhow (?:has|have|is|was|did|are) (?:the |your |that |it |this )?(?:job search|search|"
     r"learning|studying|studies|prep|preparation|interviews?|applications?|courses?|"
     r"attempts?|that|it)\b[^?.!]{0,30}\b(?:going|gone|go|worked|working)\b",
-    r"\bbiggest (?:gap|worry|concern|challenge|hurdle|obstacle|weakness|fear)\b",
+    r"\bbiggest (?:gap|challenge|hurdle|obstacle|weakness)\b",
     r"\b(?:gaps?|weak(?:ness|nesses|est)?) (?:in|you|that)\b",
 )
 _H3_PATTERNS = (
@@ -568,6 +745,47 @@ PROBE_RULES: dict[str, tuple[re.Pattern[str], ...]] = {
     topic: tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
     for topic, patterns in _PROBE_PATTERNS.items()
 }
+# "What makes you get scared of layoffs?" asks about the layoffs (H1), not about what held the
+# learner back (H2): a generic fear word counts for H2 only when the same sentence has no H1
+# term (R1-Q round 1: it released H2's deep need on an H1 question and gave the advisor unearned
+# probing credit).
+_H2_FEAR_WORDS = re.compile(r"\b(?:scared|stress\w*|anxi\w+)\b", re.IGNORECASE)
+# R1-Q iteration 3.  "What's your biggest hesitation, the cost or the time?" asks about money and
+# time, not about what held the learner back before (the live sweep gave the H2 deep need to it).
+# The generic worry words name the H2 topic only when the question has no other topic's own words;
+# next to a schedule, money or "who else" word the question is about that (H3), and next to an H1
+# term (layoffs, the timeline) it is about that.
+_H2_GENERIC_WORRY = re.compile(
+    r"\b(?:concerns?|worr(?:y|ies|ied|ying)|hesitat\w+|doubts?|nervous|afraid|fears?|apprehens\w+|"
+    r"reservations?|biggest (?:worry|concern|fear)|scared|stress\w*|anxi\w+)\b",
+    re.IGNORECASE,
+)
+_H3_TOPIC_WORDS = re.compile(
+    r"\b(?:cost|costs|price|money|budget|afford\w*|pay|paying|payment|payments|fees?|instal\w+|"
+    r"time|schedule|hours?|weeks?|busy|workload|husband|wife|partner|spouse|family|kids|children|"
+    r"parents?|father|mother)\b",
+    re.IGNORECASE,
+)
+# A question that closes or checks in is not a question about the learner's situation, even when
+# it names the husband or the father: "does this sound like something worth exploring with your
+# father?", "would you want to aim for the upcoming cohort?" (the live sweep released the H3 need
+# on one).  A request to DO something ("can you get your husband on the phone now?") is no probe
+# either.
+_CLOSING_QUESTION = re.compile(
+    r"^\W*(?:(?:and|so|okay|ok|well|now|then)\W+)*(?:what do you think|how does (?:that|this|it) "
+    r"(?:sound|feel|look)|does (?:that|this|it) (?:sound|seem|feel|look)|do you think (?:that|this"
+    r"|it)|would you (?:want|like) to (?:aim|go|move|start|join|explore|look|see|set|book|"
+    r"schedule|pick|enrol+)|are you ready|shall we)\b"
+    r"|\b(?:does|do|would|is|are) (?:this|that|it|the program|the course) (?:sound|seem|feel|"
+    r"look)(?: like)? (?:something|good|right|interesting|worth)\b"
+    r"|\bworth (?:exploring|looking into|considering|discussing)\b",
+    re.IGNORECASE,
+)
+_REQUEST_QUESTION = re.compile(
+    r"^\W*(?:(?:and|so|okay|ok|well|now|then)\W+)*(?:can|could|would|will) you (?:please )?"
+    r"(?:get|put|bring|ask|let|call|text|send|join|hop|connect|pass|take)\b",
+    re.IGNORECASE,
+)
 # A follow-up asks the LEARNER to say more.  It must be a question or an imperative
 # addressed to the learner: "Let me give you an example of a student like you", "I'll
 # elaborate on our curriculum" and "Let me unpack the modules" are the advisor's own
@@ -577,9 +795,45 @@ _FOLLOWUP = re.compile(
     r"why do you say that|(?:can|could|would) you (?:please )?(?:elaborate|expand|share more|"
     r"say more|tell me more|walk me through that|unpack that|give me an example|"
     r"give an example)|walk me through that|help me understand (?:that|more|this)|"
-    r"what'?s behind that|what happened there|what specifically|like what|is there more|"
+    r"what'?s behind that|what happened there|what specifically|like what(?=\s*[.?!]*\s*$)|"
+    r"is there more|"
     r"how come|in what way|more about that|more on that|dig(?:ging)? (?:in|deeper)|"
     r"what does (?:that|this|it) (?:[\w-]+ ){0,3}look like)\b",
+    re.IGNORECASE,
+)
+# A follow-up also picks up what the learner just said: "When you say it didn't work out, was it
+# the technical rounds or something else?", "What specifically tripped you up?".
+_FOLLOWUP_REFERENCING = re.compile(
+    r"\bwhen you say\b|\byou(?:'ve| have)? (?:mentioned|said|told me)\b|\bsomething else\b"
+    r"|\b(?:was|is) it (?:more|the|that|because)\b|\bwhat (?:tripped|held|stopped|kept) you\b"
+    r"|\bwhat do you think (?:is|was|held|tripped|made|caused)\b|\bwhat(?:'s| is) making\b"
+    r"|\bwhat(?:'s| is) really (?:driving|behind)\b|\bwhy (?:data science|that|this) "
+    r"specifically\b|\band why\b|\bwhat would need to be (?:different|true)\b"
+    r"|\bwhat(?:'s| is) the main thing\b|\bwhere do you feel\b",
+    re.IGNORECASE,
+)
+# The advisor offering or suggesting something is not asking the learner about themselves:
+# "Would it help if I set up a call with you and your father?", "Would a payment plan help?".
+_OFFER_QUESTION = re.compile(
+    r"\bwould (?:it|that|this|a|an|the|some|any)\b[^?]{0,40}\bhelp\b"
+    r"|\bwould it be (?:ok|okay|better|good|helpful|useful|nice)\b|\bwould you like me to\b"
+    r"|\bdo you want me to\b|\bwant me to\b|\b(?:shall|should) (?:i|we)\b"
+    r"|\b(?:can|could) (?:i|we)\b(?! (?:just |quickly )?ask\b)|\bhow about\b|\bwhy don'?t we\b",
+    re.IGNORECASE,
+)
+# A check-in on the advisor's own answer is not a probe of the learner: "Did that answer your
+# concern?", "Does that ease the schedule worry?", "Would that structure work for your budget?".
+_CHECKIN_ON_ANSWER = re.compile(
+    r"^\W*(?:(?:and|so|okay|ok|well|now|then)\W+)*(?:did|does|do|is|was|would|will|could|can)\s+"
+    r"(?:that|this|it|those|these|all (?:of )?that|all this|(?:the|a|an|our|my) [\w' -]{1,40}?)"
+    r"\s+(?:\w+\s+){0,3}?(?:help|ease|address|answer|make sense|sound|feel|work|fit|resolve|"
+    r"cover|clear|settle|reassure|satisfy|speak to|relieve|lighten|take|give|change)\w*\b",
+    re.IGNORECASE,
+)
+# "Which payment plan sounds most realistic for your budget?" asks for a choice, not a situation.
+_CHOICE_QUESTION = re.compile(
+    r"^\W*(?:(?:and|so|okay|ok|well|now|then)\W+)*(?:which|what)\s+(?:\w+\s+){0,2}?"
+    r"(?:plan|option|discount|tier|package|batch|cohort|payment plan)s?\b",
     re.IGNORECASE,
 )
 _FOLLOWUP_IMPERATIVE = re.compile(
@@ -600,10 +854,37 @@ def detect_probes(text: object) -> frozenset[str]:
         if not is_question_like(sentence):
             continue
         lowered = fold(sentence).lower()
+        if not _is_probe_shaped(lowered):
+            continue
+        # A proposed call is not a probe, whoever it names ("Would your husband join a short
+        # call?" released the H3 need in the live sweep and the deep layer was told in reply to it).
+        if call_proposal_in(sentence) is not None:
+            continue
+        in_sentence: set[str] = set()
         for topic, patterns in PROBE_RULES.items():
             if any(pattern.search(lowered) for pattern in patterns):
-                found.add(topic)
+                in_sentence.add(topic)
+        if "H1" not in in_sentence and _H2_FEAR_WORDS.search(lowered):
+            in_sentence.add("H2")
+        if _H2_GENERIC_WORRY.search(lowered) is not None and "H1" not in in_sentence:
+            # The question names a worry; the topic is whatever it is a worry ABOUT.
+            if "H3" in in_sentence or _H3_TOPIC_WORDS.search(lowered) is not None:
+                in_sentence.add("H3")
+            else:
+                in_sentence.add("H2")
+        found.update(in_sentence)
     return frozenset(found)
+
+
+def _is_probe_shaped(lowered: str) -> bool:
+    """A question that asks about the learner: no check-in, offer, choice, close or request."""
+    return (
+        _CHECKIN_ON_ANSWER.search(lowered) is None
+        and _OFFER_QUESTION.search(lowered) is None
+        and _CHOICE_QUESTION.search(lowered) is None
+        and _CLOSING_QUESTION.search(lowered) is None
+        and _REQUEST_QUESTION.search(lowered) is None
+    )
 
 
 def detect_followup(text: object) -> bool:
@@ -616,7 +897,9 @@ def detect_followup(text: object) -> bool:
         folded = fold(sentence)
         if _FOLLOWUP_IMPERATIVE.match(folded.strip()):
             return True
-        if is_question_like(folded) and _FOLLOWUP.search(folded):
+        if is_question_like(folded) and (
+            _FOLLOWUP.search(folded) or _FOLLOWUP_REFERENCING.search(folded)
+        ):
             return True
     return False
 
@@ -624,3 +907,73 @@ def detect_followup(text: object) -> bool:
 def has_question(text: object) -> bool:
     """True when at least one sentence of ``text`` is question-like."""
     return any(is_question_like(sentence) for sentence in split_sentences(text))
+
+
+# Somebody else in the learner's decision, named by a pronoun or a role ("is he more of a sounding
+# board?", "what would your husband want to know?").
+_THIRD_PARTY = re.compile(
+    r"\b(?:he|she|they|him|her|them|his|their|your (?:husband|wife|partner|spouse|father|mother|"
+    r"dad|mom|parents|family|boss|manager))\b",
+    re.IGNORECASE,
+)
+
+
+def asks_about_learner(text: object) -> bool:
+    """True when the advisor digs: a question about the learner's situation or the people in it.
+
+    A question counts when a probe rule reads it as one (``detect_probes``), when it asks the
+    learner to say more (``detect_followup``), or when it is about somebody else in the learner's
+    decision ("is there anything specific he'd want to know?"), and it is not a check-in on the
+    advisor's own answer, an offer or a choice between plans.  It is wider than the probe rules on
+    purpose: those miss the questions about the husband and the father that two owed objections
+    answered in the live sweep (R1-Q iteration 2).  The engine holds back a move that no deadline
+    forces for ONE turn when this is true.
+    """
+    for sentence in split_sentences(text):
+        if not is_question_like(sentence):
+            continue
+        lowered = fold(sentence).lower()
+        if not _is_probe_shaped(lowered) or call_proposal_in(sentence) is not None:
+            continue
+        if (
+            detect_probes(sentence)
+            or detect_followup(sentence)
+            or _THIRD_PARTY.search(lowered) is not None
+            or _OPEN_QUESTION.search(lowered) is not None
+        ):
+            return True
+    return False
+
+
+# R1-Q final review round 1.  A question that digs without naming a topic: "What would help you two
+# decide?", "What would make it feel right?", "What's on your mind?".  The live sweep dug the same
+# released H3 need six times with questions like these and the rule probes saw none of them, so the
+# deep layer was never offered.  Used only to ask for a need that is already released.
+_OPEN_QUESTION = re.compile(
+    r"\bwhat would (?:help|make|it take|you need|you want|need to)\b"
+    r"|\bwhat (?:do|would) you (?:need|want|expect|hope)\b"
+    r"|\bhow (?:do|would|does) (?:you|it|that|this) (?:feel|sit|land)\b"
+    r"|\bhelp you (?:two |both )?(?:decide|feel|move|get)\b"
+    r"|\bwhat(?:'s| is) (?:on your mind|the main thing|most important|really)\b"
+    r"|\bwhat matters\b",
+    re.IGNORECASE,
+)
+
+
+def asks_open_question(text: object) -> bool:
+    """True when the candidate asks the learner an open question about themselves.
+
+    "What would help you two decide?" names no topic and no keyword, so ``detect_probes`` does not
+    see it; it is still a dig.  A check-in on the advisor's own answer, an offer, a choice between
+    plans, a closing question and a proposed call are not (``_is_probe_shaped``,
+    ``call_proposal_in``).
+    """
+    for sentence in split_sentences(text):
+        if not is_question_like(sentence):
+            continue
+        lowered = fold(sentence).lower()
+        if not _is_probe_shaped(lowered) or call_proposal_in(sentence) is not None:
+            continue
+        if _OPEN_QUESTION.search(lowered) is not None:
+            return True
+    return False

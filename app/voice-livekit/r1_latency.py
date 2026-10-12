@@ -210,13 +210,14 @@ class LatencyTracker:
         To the first vetted sentence leaving the output guard, and the time the guard held it
         after the first token (it releases a sentence only once the next one has begun).
     ``ack``
-        The acknowledgement before an owed line: seconds from the model call to its end,
+        The model's voicing of an owed move (an ``intent`` turn; before R1-Q, the
+        acknowledgement before the owed line): seconds from the model call to its end,
         with the outcome (``done``, ``cutoff`` or ``failed``) as the category.
     ``eou_to_tts_first_frame`` / ``tts_ttfb``
         To the first audio frame the TTS node produced, and its time from the first text.
     ``eou_to_first_audio``
         The headline: end of speech to the agent's audio starting.  Its category is the turn
-        kind (``llm_reply``, ``ack_then_say``, ``say_only`` or ``reply``).  Every valid value
+        kind (``llm_reply``, ``intent``, ``say_only`` or ``reply``).  Every valid value
         is also kept, with its phase, for ``first_audio_p95_ms`` (see below).
     ``eou_to_reply_lost``
         A reply the SDK cancelled before the candidate heard any of it: end of speech to the

@@ -7,7 +7,9 @@ can load it.
 """
 from __future__ import annotations
 
+import hashlib
 import re
+from typing import Iterable, Sequence
 
 _FOLD = str.maketrans(
     {
@@ -52,32 +54,68 @@ def split_sentences(text: object) -> list[str]:
     return [part.strip() for part in parts if part and part.strip()]
 
 
+# "like", "um", "uh" and "hmm" are speech fillers that speech-to-text keeps ("Like I wanted to
+# know like why ...", "Um, I am trying to understand ..."), so they may open a question.
 _DISCOURSE = (
     r"(?:(?:and|so|but|also|okay|ok|right|well|now|then|great|thanks|thank you|got it|"
-    r"i see|sure|cool|alright|perfect|nice|good)\b[,.\s]*)*"
+    r"i see|sure|cool|alright|perfect|nice|good|like|um+|uh+|er+m?|hmm+)\b[,.\s]*)*"
 )
+# "when" asks a question only in inverted order ("when can I expect your call", "when exactly do
+# you start").  In declarative order it is a subordinator: "when it comes to live classes, you
+# can ask anything", "when you call me back, I can also talk to your husband" (owner test
+# b58c7d9c turns 37, 45, 51 and 78).
+_WHEN_ASKS = (
+    r"when(?=\s+(?:exactly\s+|else\s+|specifically\s+)?(?:can|could|would|will|shall|should|do|"
+    r"does|did|are|is|was|were|have|has|had|may|might|am)\b|'s\b)"
+)
+# "what we can do is ...", "how I can help you" and "so what I mean is" are clefts of a statement:
+# a we/I subject straight after the wh-word.  ("what I'd like to know" below is a real elicitation.)
+_WH_ASKS = r"(?:what|why|how|where|who|whom|which|whose)(?!\s+(?:i|we)\b)"
 _QUESTION_START = re.compile(
-    r"^" + _DISCOURSE + r"(?:what|why|how|when|where|who|whom|which|whose|is|are|was|were|"
+    r"^" + _DISCOURSE + r"(?:" + _WH_ASKS + r"|" + _WHEN_ASKS + r"|is|are|was|were|"
     r"do|does|did|can|could|would|will|shall|should|have|has|had|may|might|"
     r"tell me|walk me through|talk me through|help me understand|share|describe|explain|"
     r"i'?d (?:love|like) to (?:know|understand|hear|learn)|i'?m curious|"
     r"i was (?:wondering|curious)|i wonder|curious (?:about|whether|if)|any (?:concerns?|"
     r"thoughts|questions)|anything (?:that|else)|"
     r"i (?:want|need) to (?:know|understand|hear|learn|find out)|let me (?:ask|understand)|"
+    r"i wanted to (?:know|ask|understand|hear|learn|find out|wonder)|"
+    r"(?:i'?m |i am )?trying to (?:understand|figure out|find out)|"
+    r"(?:i'?m|i am) wondering|"
     r"i'?m (?:interested|keen) in (?:hearing|knowing|understanding)|"
     r"what i'?d like to (?:know|understand))\b",
 )
+# A wh-word after a conjunction ("so what do you do", "and why is that") is a run-on question,
+# unless a "we/I" subject follows it directly ("so what we can do", "and what I mean"): that is
+# a cleft or an embedded clause of a statement.
 _QUESTION_ANYWHERE = re.compile(
-    r"\b(?:wondering|curious) (?:if|whether|what|why|how|when|about)\b"
-    r"|\b(?:so|and|but|also|now|then|well|okay|ok)\s+(?:what|why|how|when|where|who|which)\b"
+    r"\b(?:wonder|wondering|wondered|curious) (?:like )?(?:if|whether|what|why|how|when|about)\b"
+    r"|\b(?:so|and|but|also|now|then|well|okay|ok)\s+(?:what|why|how|" + _WHEN_ASKS +
+    r"|where|who|which)\b(?!\s+(?:i|we)\b)"
 )
+# An OFFER or PROMISE is a statement even when a wh-word sits inside it: "I can also help him
+# understand why it costs this and what the packages are" (owner test b58c7d9c turn 78) has
+# its wh-words after a first-person modal, so they open embedded clauses, not questions.
+_OFFER_MODAL = re.compile(
+    r"\b(?:i|we)(?:'ll|\s+(?:will|can|could|would|may|might|shall|am going to|are going to))\b"
+)
+
+
+def _asks_run_on_question(plain: str) -> bool:
+    """A conjunction + wh-word (or "wondering what") that is not inside an offer or promise."""
+    return any(
+        not _OFFER_MODAL.search(plain[: match.start()])
+        for match in _QUESTION_ANYWHERE.finditer(plain)
+    )
 
 
 def is_question_like(sentence: object) -> bool:
     """True for an interrogative or an elicitation such as "tell me about ...".
 
     Speech-to-text may drop the question mark, so the test also accepts a leading
-    interrogative or elicitation phrase, optionally after a discourse opener.
+    interrogative or elicitation phrase, optionally after a discourse opener.  A wh-word
+    that only introduces a subordinate clause is not a question: "when" counts only in
+    inverted order, and a wh-word after "I can ..." or "we will ..." is embedded in an offer.
     """
     folded = fold(sentence).strip()
     if "?" in folded:
@@ -86,19 +124,17 @@ def is_question_like(sentence: object) -> bool:
     plain = re.sub(r"\s+", " ", plain).strip()
     if not plain:
         return False
-    return bool(_QUESTION_START.match(plain) or _QUESTION_ANYWHERE.search(plain))
+    return bool(_QUESTION_START.match(plain) or _asks_run_on_question(plain))
 
 
 def _tokens(text: object) -> list[str]:
     return [word for word in normalize(text).split() if len(word) > 2]
 
 
-def fuzzy_ratio(actual: object, expected: object) -> float:
-    """Fraction of ``expected``'s content words found in order inside ``actual``."""
-    wanted = _tokens(expected)
+def _ordered_share(haystack: Sequence[str], wanted: Sequence[str]) -> float:
+    """Fraction of ``wanted`` found, in order, inside ``haystack`` (both already tokenised)."""
     if not wanted:
         return 0.0
-    haystack = normalize(actual).split()
     position = 0
     matched = 0
     for word in wanted:
@@ -110,9 +146,273 @@ def fuzzy_ratio(actual: object, expected: object) -> float:
     return matched / len(wanted)
 
 
+def fuzzy_ratio(actual: object, expected: object) -> float:
+    """Fraction of ``expected``'s content words found in order inside ``actual``."""
+    return _ordered_share(normalize(actual).split(), _tokens(expected))
+
+
 def fuzzy_contains(actual: object, expected: object, threshold: float = 0.78) -> bool:
     """Conservative ordered-token check used to confirm that a scripted line was spoken."""
     return fuzzy_ratio(actual, expected) >= threshold
+
+
+# ----------------------------------------------------------------------------------
+# Repetition: has this person already said (nearly) this sentence?
+# ----------------------------------------------------------------------------------
+REPEAT_MIN_WORDS = 4
+REPEAT_MIN_CONTENT_WORDS = 4
+REPEAT_RATIO = 0.8
+REPEAT_EXACT = "exact"
+REPEAT_NEAR = "near"
+
+
+def _repeat_sized(norm: str) -> tuple[bool, bool]:
+    """(long enough for an exact-repeat check, enough content words for a near-repeat check)."""
+    words = norm.split()
+    content = [word for word in words if len(word) > 2]
+    return len(words) >= REPEAT_MIN_WORDS, len(content) >= REPEAT_MIN_CONTENT_WORDS
+
+
+class SpokenMemory:
+    """The normalised sentences a speaker has actually played so far.
+
+    It keeps no timing and no speaker text beyond the normalised form, and only sentences
+    long enough to be repeated in the sense of ``repeat_kind``: a short back-channel
+    ("Mm-hmm.", "Okay.") is never a repeat, so it is not worth remembering.
+    """
+
+    def __init__(self) -> None:
+        self._sentences: dict[str, None] = {}
+
+    def add(self, text: object) -> int:
+        """Remember every sentence of ``text`` that can be repeated; returns how many."""
+        added = 0
+        for sentence in split_sentences(text):
+            norm = normalize(sentence)
+            if not norm or norm in self._sentences:
+                continue
+            if any(_repeat_sized(norm)):
+                self._sentences[norm] = None
+                added += 1
+        return added
+
+    def snapshot(self) -> tuple[str, ...]:
+        """An immutable copy for a guard context (the plan is made before the speech)."""
+        return tuple(self._sentences)
+
+    def __len__(self) -> int:
+        return len(self._sentences)
+
+
+def repeat_kind(sentence: object, said: Iterable[str]) -> str | None:
+    """``"exact"`` or ``"near"`` when ``sentence`` repeats one of ``said``, else ``None``.
+
+    ``said`` holds normalised sentences (``SpokenMemory.snapshot``).  Exact: the same
+    normalised sentence of at least ``REPEAT_MIN_WORDS`` words.  Near: at least
+    ``REPEAT_MIN_CONTENT_WORDS`` content words, and one sentence contains the other's
+    content words in order (``REPEAT_RATIO``), so "Just email me the details." inside
+    "Just email me the details and I'll get back to you." is a repeat.  Pure and
+    deterministic; one-word and two-word back-channels never count.
+    """
+    norm = normalize(sentence)
+    if not norm:
+        return None
+    long_enough, content_enough = _repeat_sized(norm)
+    if not (long_enough or content_enough):
+        return None
+    prior_sentences = [prior for prior in said if prior]
+    if long_enough and norm in prior_sentences:
+        return REPEAT_EXACT
+    if content_enough:
+        words = norm.split()
+        content = [word for word in words if len(word) > 2]
+        for prior in prior_sentences:
+            prior_words = prior.split()
+            if _ordered_share(prior_words, content) >= REPEAT_RATIO:
+                return REPEAT_NEAR  # this sentence sits inside an earlier one
+            prior_content = [word for word in prior_words if len(word) > 2]
+            if (
+                len(prior_content) >= REPEAT_MIN_CONTENT_WORDS
+                and _ordered_share(words, prior_content) >= REPEAT_RATIO
+            ):
+                return REPEAT_NEAR  # an earlier sentence sits inside this one
+    return None
+
+
+def pick_variant(variants: Sequence[str], seed: str, count: int) -> str:
+    """The ``count``-th variant of a rotation whose starting point is derived from ``seed``.
+
+    Deterministic: the same attempt id always starts at the same variant, and successive
+    uses walk the rotation, so a line is not repeated until all variants were used.  An
+    empty ``seed`` starts at the first variant.
+    """
+    if not variants:
+        return ""
+    start = 0
+    if seed:
+        start = int.from_bytes(hashlib.sha256(seed.encode("utf-8")).digest()[:4], "big")
+    return variants[(start + max(0, count)) % len(variants)]
+
+
+# ----------------------------------------------------------------------------------
+# Speaking style: how a reply opens and which filler words it leans on (R1-Q iteration 1).
+# 44 of 90 live replies started with "Hmm" and 50 of 90 held "Honestly": a person on a phone call
+# does not hum at every turn.  The guard varies a reply with these helpers (``r1_guard``) and the
+# rehearsal harness measures the same words with its own copy.
+# ----------------------------------------------------------------------------------
+TIC_HMM = "hmm"
+TIC_HONESTLY = "honestly"
+TIC_PATTERNS = {
+    TIC_HMM: re.compile(r"(?<![a-z-])hmm+\b|(?<![a-z-])hm\b", re.IGNORECASE),
+    TIC_HONESTLY: re.compile(r"\b(?:honestly|to be honest|frankly)\b", re.IGNORECASE),
+}
+_FIRST_WORD = re.compile(r"[a-z]+")
+
+
+def reply_opener(text: object) -> str:
+    """The first word of ``text``, lower-case ("That's fine" -> "that"); "" for no word."""
+    words = _FIRST_WORD.findall(fold(text).lower())
+    return words[0] if words else ""
+
+
+def reply_tics(text: object) -> tuple[str, ...]:
+    """The tic words ("hmm", "honestly") that ``text`` contains, in a fixed order."""
+    folded = fold(text)
+    return tuple(tic for tic, pattern in TIC_PATTERNS.items() if pattern.search(folded))
+
+
+# ----------------------------------------------------------------------------------
+# Phrase tics beyond the filler words (R1-Q iteration 2).  The live sweep of iteration 1 fixed
+# "hmm" and "honestly", and the model moved on to "still a stretch for me" (28 replies in 19 of
+# 20 calls, in consecutive turns in nine) and to one question template ("what would that call
+# actually involve?", 33 times in 15 calls).  Each phrase may be used once per call; the guard
+# rewrites a second "a stretch" and drops a second template question.
+# ----------------------------------------------------------------------------------
+PHRASE_STRETCH = "stretch"
+PHRASE_TEMPLATE_Q = "template_q"
+STRETCH_PHRASE = re.compile(
+    r"\b(?:(?:quite|kind of|sort of|a bit of|a little bit of|a real) )?a stretch\b", re.IGNORECASE
+)
+# Said in place of a second "a stretch"; every one reads right before "for me".
+STRETCH_ALTERNATIVES = ("steep", "a lot", "a big ask", "tight", "too much")
+# "what would that call actually involve / cover / include", "what would joining later mean".
+QUESTION_TEMPLATE = re.compile(
+    r"\bwhat (?:would|does|will|do|did|could|is) (?:that|this|the|it|a|an|my|joining|waiting|"
+    r"those|these|one)\b[^?.!]{0,40}?\b(?:actually |really |exactly |even )?(?:involve|involves|"
+    r"cover|covers|include|includes|entail|entails|look like|commit me to|mean for me)\b",
+    re.IGNORECASE,
+)
+
+
+# Iteration 3.  The next live sweep found the concession tag ("I'll give you that", "I'll admit",
+# "I won't pretend it isn't", "I'll say that": 28 replies in 14 calls, four in a row in one call)
+# and the learner's goodbyes ("I'll reach out", "I'll let you know", "thanks for your time": nine
+# in a row once the advisor only said "Sure." and "Okay.").  The tag is used once per call; a
+# closer is dropped while the advisor has nothing to answer.
+PHRASE_CONCESSION_TAG = "concession_tag"
+_CONCESSION_CLAUSE = (
+    r"i(?:'ll| will) (?:give you that|admit(?: that)?|say that|grant (?:you )?that|"
+    r"concede(?: that)?)"
+    r"|i won't pretend(?: (?:that )?(?:it isn't|it's not|it wasn't|otherwise|i'm not|i wasn't|"
+    r"it doesn't|that isn't the case|it hasn't)|(?=\s*(?:[,.;!]|$)))"
+    r"|i have to admit|i must admit|i can't deny(?: that)?|i'll be fair"
+)
+CONCESSION_TAG = re.compile(r"\b(?:" + _CONCESSION_CLAUSE + r")\b", re.IGNORECASE)
+# The tag as a clause of its own, with the comma or dash that joins it: ", I'll give you that.",
+# " - I won't pretend it isn't", and the tag that opens a sentence ("I'll admit, that's a ...").
+CONCESSION_TAG_TRAILING = re.compile(
+    r"\s*[,;-]*\s*(?:" + _CONCESSION_CLAUSE + r")\b[,.]?", re.IGNORECASE
+)
+CONCESSION_TAG_LEADING = re.compile(
+    r"^\W*(?:" + _CONCESSION_CLAUSE + r")\b[,:]?\s*(?:(?:but|though|and)\b[,]?\s*)?",
+    re.IGNORECASE,
+)
+# A goodbye: the learner closing the call itself.  "I'll let you know" and "I'll get back to you"
+# as the answer to a close are the stall; this is only counted while the advisor has said nothing.
+PHRASE_CLOSER = "closer"
+HOLLOW_MAX_WORDS = 4
+CLOSER = re.compile(
+    r"\bi(?:'ll| will) (?:reach out|let you know|be in touch|get in touch|mull (?:it|this) over|"
+    r"keep an eye out)\b"
+    r"|\bthanks? (?:you )?(?:so much )?(?:again )?for (?:your time|walking me through|the call|"
+    r"taking the time|hearing me out|your help|everything)\b"
+    r"|\bthanks? (?:again|so much)\b[^.?!]{0,20}\b(?:call|time|help)\b"
+    r"|\b(?:i should|let me|i'll) let you go\b|\btake care\b|\b(?:good ?)?bye\b"
+    r"|\bi(?:'ve| have) got what i needed\b"
+    r"|\bi think i(?:'ve| have) got (?:enough|what i needed)\b",
+    re.IGNORECASE,
+)
+
+
+# R1-Q final review round 1.  The stall loop: the same stall said again and again in other words
+# ("talk it over with my father" in 9 of 35 replies of one terse call, "get back to you" four
+# times, "still more than I planned for" three replies in a row).  Three more tracked phrases, each
+# with a per-call quota AND a spacing window (``r1_guard.PHRASE_QUOTA`` / ``PHRASE_WINDOW``).
+PHRASE_DECIDER_STALL = "decider_stall"
+PHRASE_STALL_CLOSER = "stall_closer"
+PHRASE_MONEY_STRAIN = "money_strain"
+_DECIDER_ROLE = (
+    r"(?:husband|wife|partner|spouse|father|mother|dad|mom|mum|parents|family|fianc\w+|boyfriend|"
+    r"girlfriend|him|her|them)"
+)
+# "I'd want to talk it through with my father", "Let me run it by my husband first", "I should
+# check with him before I say yes": the learner stalls on the person who decides with it.
+DECIDER_STALL = re.compile(
+    r"\b(?:talk(?:ing)?|speak(?:ing)?|check(?:ing)?|run(?:ning)?|discuss(?:ing)?|consult(?:ing)?|"
+    r"go(?:ing)? (?:over|through)|sleep on|clear(?:ing)?|loop(?:ing)?)\b[^.?!]{0,40}?\b"
+    r"(?:with|to|by|past)\s+(?:my |our )?" + _DECIDER_ROLE + r"\b",
+    re.IGNORECASE,
+)
+# "I'll get back to you", "let me think about it", "I'll let you know", "I'll be in touch".
+STALL_CLOSER = re.compile(
+    r"\bget(?:ting)? back to you\b|\blet me think (?:about it|it over|this over|on it)\b"
+    r"|\bi(?:'ll| will) (?:think (?:about it|it over|this over)|let you know|be in touch)\b"
+    r"|\bi(?:'ll| will) (?:reach out|come back to you)\b",
+    re.IGNORECASE,
+)
+# "still more than I planned for", "still worried about the cost", "still a lot for me".
+MONEY_STRAIN = re.compile(
+    r"\bstill (?:more than (?:i|we) (?:had |'d |would have )?(?:planned|hoped|budgeted|expected|"
+    r"wanted)|worried about (?:the )?(?:cost|price|money|fees?)|(?:a lot|too much|steep|pricey|"
+    r"expensive) for me|a (?:big|heavy) (?:number|ask))\b"
+    r"|\bmore than (?:i|we) (?:had |'d |would have )?(?:planned|hoped|budgeted) (?:for|on)\b",
+    re.IGNORECASE,
+)
+
+
+def reply_phrases(text: object) -> tuple[str, ...]:
+    """The tracked phrase tics ("a stretch", the "what would it involve" template ...)."""
+    folded = fold(text)
+    found = []
+    if STRETCH_PHRASE.search(folded):
+        found.append(PHRASE_STRETCH)
+    if QUESTION_TEMPLATE.search(folded):
+        found.append(PHRASE_TEMPLATE_Q)
+    if CONCESSION_TAG.search(folded):
+        found.append(PHRASE_CONCESSION_TAG)
+    if DECIDER_STALL.search(folded):
+        found.append(PHRASE_DECIDER_STALL)
+    if STALL_CLOSER.search(folded):
+        found.append(PHRASE_STALL_CLOSER)
+    if MONEY_STRAIN.search(folded):
+        found.append(PHRASE_MONEY_STRAIN)
+    return tuple(found)
+
+
+def is_closer(text: object) -> bool:
+    """True when ``text`` is the learner closing the call itself (``CLOSER``)."""
+    return CLOSER.search(fold(text)) is not None
+
+
+def is_hollow_turn(text: object) -> bool:
+    """True when an advisor turn has nothing to answer: four words or fewer and no question.
+
+    "Sure.", "Okay.", "Mm-hmm.", "Glad it helped." and "Of course." are hollow; a question, or any
+    turn longer than a short back-channel, is not.  The learner does not say goodbye to a hollow
+    turn twice in a row (``r1_roleplay``, ``r1_guard``).
+    """
+    folded = fold(text)
+    return "?" not in folded and 0 < word_count(folded) <= HOLLOW_MAX_WORDS
 
 
 _NUMBER_WORD = r"zero|one|two|three|four|five|six|seven|eight|nine|oh"

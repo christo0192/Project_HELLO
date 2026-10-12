@@ -116,6 +116,205 @@ describe('masking', () => {
     );
   });
 
+  it('masks the MEDIUM line with any call slot, including the moved-to-the-evening variant', () => {
+    for (const line of [
+      "Let's book a call tomorrow at 7 PM with my husband so we can decide.",
+      "Let's book a call on Saturday at 11 AM with my father so we can decide.",
+      "Let's book a call tonight with my partner so we can decide.",
+      "Let's book a call this weekend with my husband so we can decide.",
+      "Let's book a call on Wednesday at 6:30 PM with my husband so we can decide.",
+      "Daytime is tough for me, so let's book a call tomorrow at 7 PM with my husband so we can decide.",
+    ]) {
+      expect(maskCommitmentLines(line)).toBe(R1_COMMITMENT_MASK);
+      expect(maskCommitmentLines(`Hmm, okay. ${line}`)).toBe(`Hmm, okay. ${R1_COMMITMENT_MASK}`);
+    }
+  });
+
+  it('masks every cut of the MEDIUM line from "let\'s book a call" on, whatever its slot (ship restore round 1)', () => {
+    // Production's own line always says "on Thursday at 7 PM", so its frame masked every cut after the
+    // slot (48 of 48).  The MEDIUM line now carries the advisor's slot (or a deferred booking), so the
+    // frame "let's book a call" keeps every second-half cut hidden, with or without what the learner
+    // said before it.
+    const lines = [
+      "Let's book a call on Thursday at 7 PM with my husband so we can decide.",
+      "Let's book a call tomorrow at 7 PM with my husband so we can decide.",
+      "Let's book a call on Saturday at 11 AM with my father so we can decide.",
+      "Let's book a call tonight with my partner so we can decide.",
+      "Daytime is tough for me, so let's book a call tomorrow at 7 PM with my husband so we can decide.",
+      "Let me check with my husband first, and then let's book a call, so we can decide.",
+    ];
+    let checked = 0;
+    for (const line of lines) {
+      const words = line.split(' ');
+      for (let n = 1; n <= words.length; n += 1) {
+        const cut = words.slice(0, n).join(' ').replace(/[.!?]$/, '');
+        if (!/let['’]?s book a call/i.test(cut)) continue;
+        checked += 1;
+        expect(maskCommitmentLines(cut), cut).toBe(R1_COMMITMENT_MASK);
+        expect(maskCommitmentLines(`Hmm, okay. ${cut}`), cut).toBe(`Hmm, okay. ${R1_COMMITMENT_MASK}`);
+      }
+    }
+    expect(checked).toBeGreaterThan(40);
+    expect(maskCommitmentLines("Let’s book a call tonight")).toBe(R1_COMMITMENT_MASK);
+    // The cuts that stop before "a call" are not hidden, as on production (the first half of the line).
+    for (const line of [
+      "Let's book a",
+      "Daytime is tough for me, so let's book a",
+      "Let me check with my husband first, and then let's book a",
+    ]) {
+      expect(maskCommitmentLines(line), line).toBe(line);
+    }
+  });
+
+  it('masks the call-back WEAK wording and the MEDIUM line that books a call without a slot', () => {
+    for (const husband of ['husband', 'father', 'partner']) {
+      expect(
+        maskCommitmentLines(
+          `Let me think about it. Call me back after I've talked to my ${husband}, and I'll let you know.`,
+        ),
+      ).toBe(`Let me think about it. ${R1_COMMITMENT_MASK}`);
+      expect(
+        maskCommitmentLines(
+          `Let me check with my ${husband} first, and then let's book a call, so we can decide.`,
+        ),
+      ).toBe(R1_COMMITMENT_MASK);
+    }
+    // A curly apostrophe (or none) is the same; a cut of the sentence is not matched (whole sentences only).
+    for (const line of [
+      'Call me back after I’ve talked to my husband, and I’ll let you know.',
+      "Hmm. Call me back after Ive talked to my husband, and I'll let you know.",
+    ]) {
+      expect(maskCommitmentLines(line)).toContain(R1_COMMITMENT_MASK);
+    }
+    expect(maskCommitmentLines("Call me back after I've talked to my")).toBe("Call me back after I've talked to my");
+  });
+
+  it('masks the e-mailed WEAK wording as a whole sentence, not a cut of it', () => {
+    expect(
+      maskCommitmentLines("Let me think about it. I'll read through the email and get back to you."),
+    ).toBe(`Let me think about it. ${R1_COMMITMENT_MASK}`);
+    for (const line of [
+      'I’ll read through the email and get back to you.',
+      "I'll read through the e-mail and get back to you.",
+    ]) {
+      expect(maskCommitmentLines(line)).toBe(R1_COMMITMENT_MASK);
+      expect(maskCommitmentLines(`Okay. ${line}`)).toBe(`Okay. ${R1_COMMITMENT_MASK}`);
+    }
+    expect(maskCommitmentLines("I'll read through the email and get")).toBe("I'll read through the email and get");
+  });
+
+  it('still masks every cut that production\'s four frames reach (ship restore: nothing production hid is lost)', () => {
+    for (const cut of [
+      "Okay, let's do it. Send me the enrolment link and I'll pay the deposit",
+      'Send me the enrolment link',
+      "I'll pay the deposit today",
+      "Let's book a call on Thursday at 7 PM with my husband",
+      "Just email me the details and I'll get back to you",
+    ]) {
+      const masked = maskCommitmentLines(cut);
+      expect(masked, cut).toContain(R1_COMMITMENT_MASK);
+      expect(masked, cut).not.toMatch(/enrolment|pay the deposit|book a call|email me the details/i);
+    }
+  });
+
+  it('leaves the other cuts of the new wordings visible, as on production', () => {
+    // Accepted gap: a barge-in that cut a new R1-Q wording short is not hidden (production never knew the
+    // wording either); the cost of hiding it was ordinary learner speech hidden from the scorer.
+    for (const cut of [
+      "Daytime is tough for me, so let's book a",
+      'Daytime is tough for me,',
+      "Let me think about it. Call me back after I've talked to",
+      'Let me think about it. Call me back after',
+      "Let me think about it. I'll read through the email and",
+      'Let me think about it. Just email me the details and',
+      "Okay, let's do it. Send me the enrolment",
+    ]) {
+      expect(maskCommitmentLines(cut), cut).toBe(cut);
+    }
+  });
+
+  it('does not mask an ordinary mention of reading an email', () => {
+    for (const text of [
+      'Did you read through the email I sent?',
+      'I read the email you sent this morning.',
+      'Can you read through the details and tell me the price?',
+    ]) {
+      expect(maskCommitmentLines(text)).toBe(text);
+    }
+  });
+
+  it('does not mask ordinary learner talk that shares words with a scripted wording (ship de-risk)', () => {
+    for (const text of [
+      'Do I have to pay the deposit upfront?',
+      'Daytime is tough for me because of the kids.',
+      "I'll read through the email when it comes.",
+      'Can you send me the enrolment requirements first?',
+      'Is the enrolment fee refundable? I would pay the deposit only after that.',
+      'Hmm, daytime is hard for me, can we do evenings?',
+    ]) {
+      expect(maskCommitmentLines(text), text).toBe(text);
+    }
+  });
+
+  it('keeps ordinary learner speech visible even when it opens like a scripted wording (ship-gate round 1)', () => {
+    // The scorer is told that a placeholder is the learner's own commitment response, so a hidden
+    // ordinary sentence would read to it as a close response.
+    for (const text of [
+      'Daytime is tough for me, I work nine to six.',
+      'Daytime is tough for me, especially on weekdays.',
+      'Daytime is tough for me.',
+      'Call me back after five, that works better.',
+      'Call me back after the weekend, please.',
+      "I'll read through the email.",
+      "I'll read through the email and let you know if I have questions.",
+      'Send me the enrolment form when it is ready.',
+      'Send me the enrolment requirements too.',
+      "If the numbers work out, I'll pay the deposit next month.",
+      "I'll pay the deposit when my husband agrees.",
+      'Can you just email me the details first?',
+      'Can you just email me the details of the March batch?',
+    ]) {
+      expect(maskCommitmentLines(text), text).toBe(text);
+      expect(maskCommitmentLines(`Okay. ${text}`), text).toBe(`Okay. ${text}`);
+    }
+  });
+
+  it('still masks the scripted wordings when the sentence is padded with whitespace', () => {
+    expect(maskCommitmentLines("  Send me the enrolment link and I'll pay the deposit today.")).toBe(
+      R1_COMMITMENT_MASK,
+    );
+    expect(
+      maskCommitmentLines("Hmm. Daytime is tough for me, so let's book a call tomorrow at 7 PM with my husband so we can decide."),
+    ).toBe(`Hmm. ${R1_COMMITMENT_MASK}`);
+  });
+
+  it('does not mask the F4 push or an ordinary request to call back', () => {
+    for (const text of [
+      "I'd want to run this by my husband first.",
+      'I should discuss it with my father before deciding.',
+      'Can you call me back tomorrow?',
+      'Call me back when you have the price.',
+      'I talked to my husband last night.',
+    ]) {
+      expect(maskCommitmentLines(text)).toBe(text);
+    }
+  });
+
+  it('does not mask ordinary talk about calls, and masks only the one sentence', () => {
+    for (const text of [
+      'Can we book a call to talk about the price?',
+      'I can book a call with you later. Does that work?',
+      'So we can decide together, let us look at the curriculum.',
+      'Let me think about the call.',
+    ]) {
+      expect(maskCommitmentLines(text)).toBe(text);
+    }
+    // The pattern never reaches across a sentence boundary into the next sentence.
+    expect(
+      maskCommitmentLines("I can book a call. Then, so we can decide, let's look at the price."),
+    ).toBe("I can book a call. Then, so we can decide, let's look at the price.");
+  });
+
   it('masks commitment lines only in learner role-play turns', () => {
     const masked = maskR1Turns([
       turn(1, 'bot', 'roleplay', 'Send me the enrolment link for that plan.'),

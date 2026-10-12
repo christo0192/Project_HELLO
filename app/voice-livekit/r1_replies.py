@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
-from r1_guard import ACK_FORMAT
+from r1_guard import HYGIENE_CATEGORIES
 from r1_personas import PERSONA_BY_ID, PERSONA_IDS, RenderedPersona, resolve_persona
 from r1_prompts import (
     ROLEPLAY_PHASE,
@@ -52,8 +52,8 @@ SOURCE_ATTEMPT = "attempt"
 SOURCE_SEED = "session_seed"
 DEFAULT_SEED = "r1"
 
-# The admin-log ``event_type`` CHECK set (migration 0117) has no slot for the neutral
-# questions or the commitment stall, so those moves are logged but never posted.
+# The admin-log ``event_type`` CHECK set (migration 0117) has no slot for the commitment stall,
+# so that move is logged but never posted (the neutral questions are no longer scheduled).
 _MOVE_EVENTS: dict[str, tuple[str, str | None]] = {
     "F3-PRIMARY": ("family_delivered", "F3"),
     "F3-PUSH": ("push_delivered", "F3"),
@@ -240,8 +240,9 @@ def fidelity_events(
     ``probed_turn`` for a reveal, ``slip_seconds`` for a delivery, ``roleplay_seconds`` for the
     time cue, ``amount_usd`` for a discount and ``kind`` for a guard hit.  The worker's own
     finer detail (delivery clocks, release turns, the guard rule) rides along under names the
-    parser ignores.  Acknowledgement-format trips are hygiene, not leaks (``LEAK_CATEGORIES``),
-    and the API counts EVERY guard row toward its three-hit limit, so they are not posted.
+    parser ignores.  Acknowledgement-format and repeat trips are hygiene, not leaks
+    (``HYGIENE_CATEGORIES``, outside ``LEAK_CATEGORIES``), and the API counts EVERY guard row
+    toward its three-hit limit, so they are not posted.
     """
     events: list[dict[str, Any]] = []
     turn_map = {
@@ -308,7 +309,7 @@ def fidelity_events(
             },
         )
     for trip in guard_trips:
-        if trip.get("category") == ACK_FORMAT:
+        if trip.get("category") in HYGIENE_CATEGORIES:
             continue
         add(
             "guard_hit",

@@ -329,6 +329,47 @@ class TestWorkerRowsAgainstTheApiParser(unittest.IsolatedAsyncioTestCase):
             "first-audio p95) where a complete session should have measured values",
         )
 
+    async def test_intent_voiced_moves_post_the_same_rows_and_no_intent_bookkeeping(self):
+        """R1-Q: the model voices the objections, but the rows the API reads are unchanged."""
+        rig, rows = await self.session_rows()
+        families = {
+            (row["event_type"], row["family_id"])
+            for row in rows
+            if row["event_type"] in ("family_delivered", "push_delivered", "counter_delivered")
+        }
+        self.assertEqual(
+            families,
+            {("family_delivered", f) for f in API_FAMILIES}
+            | {("push_delivered", f) for f in ("F2", "F3", "F4")}
+            | {("counter_delivered", "F1")},
+        )
+        moves = {row["payload"].get("move_id") for row in rows} - {None}
+        self.assertTrue({"F3-PRIMARY", "F2-PRIMARY", "F1-ANCHOR", "F4-PRIMARY"} <= moves)
+        self.assertNotIn("Q-A", moves)
+        blob = json.dumps(rows)
+        for private in ("intents", "fallback_appended", "handed_to_model", "curiosity", "brief"):
+            self.assertNotIn(private, blob)
+        # The engine still logs it for the rehearsal metrics.
+        intents = rig.engine.admin_log()["intents"]
+        self.assertGreaterEqual(sum(intents["handed_to_model"].values()), 8)
+
+    async def test_the_negotiation_memory_is_logged_but_never_posted(self):
+        """R1-Q: offers, callbacks, reasons and the slot stay in the worker's own log."""
+        rig, rows = await self.session_rows()
+        negotiation = rig.engine.admin_log()["negotiation"]
+        self.assertIn("reasons_voiced", negotiation)
+        self.assertIn("weak_line_said", negotiation)
+        blob = json.dumps(rows)
+        for private in (
+            "negotiation", "reasons_voiced", "reasons_handled", "weak_line_said", "stall_rounds",
+            "price_situation", "best_offer_usd", "email_answered", "slot_moved", "N-TIMING",
+            "N-MONEY", "N-EMAIL", "counter:",
+        ):
+            self.assertNotIn(private, blob, private)
+        # The only commitment trace is the logged level; no event row carries a level.
+        for row in rows:
+            self.assertNotIn("level", row["payload"])
+
     async def test_the_guard_trip_of_the_session_is_a_known_kind(self):
         _, rows = await self.session_rows()
         hits = [row for row in rows if row["event_type"] == "guard_hit"]
@@ -597,6 +638,22 @@ class TestGuardHitKinds(unittest.TestCase):
         self.assertEqual([row["payload"]["kind"] for row in rows], ["control"])
         self.assertNotIn("guard_hits", gate_like_api(parse_like_api(rows)))
 
+    def test_repeat_hygiene_trips_are_not_posted_either(self):
+        """R1-Q: a dropped repeated sentence is hygiene; it must never become a ``guard_hit``."""
+        rows = self.rows("repeat", "repeat", "repeat", "repeat", "control")
+        self.assertEqual([row["payload"]["kind"] for row in rows], ["control"])
+        self.assertNotIn("guard_hits", gate_like_api(parse_like_api(rows)))
+        mixed = self.rows("ack_format", "repeat", "control", "repeat", "ack_format")
+        self.assertEqual([row["payload"]["kind"] for row in mixed], ["control"])
+
+    def test_every_hygiene_category_is_filtered_and_no_leak_category_is(self):
+        from r1_guard import CATEGORIES, HYGIENE_CATEGORIES
+
+        for category in CATEGORIES:
+            posted = self.rows(category)
+            with self.subTest(category=category):
+                self.assertEqual(not posted, category in HYGIENE_CATEGORIES)
+
     def test_three_real_leaks_still_trip_the_hit_budget(self):
         rows = self.rows("control", "persona_secret", "invented_fact")
         self.assertIn("guard_hits", gate_like_api(parse_like_api(rows)))
@@ -665,6 +722,30 @@ class TestMirrorMatchesTheTypeScript(unittest.TestCase):
         ):
             with self.subTest(limit=name):
                 self.assertRegex(text, rf"{name}:\s*{value}\b")
+
+
+class TestPlanReasonsAreLoggedForProduction(unittest.IsolatedAsyncioTestCase):
+    """R1-Q final review round 1: production sees WHY a commitment was graded, capped or downgraded."""
+
+    async def test_every_turn_logs_its_plan_reasons_as_safe_labels(self):
+        with capture_r1_logs() as lines:
+            rig = await fidelity_session()
+            plans = [line for line in lines if line.get("error_type") == "r1_turn_plan"]
+            reasons = [line for line in lines if line.get("error_type") == "r1_turn_reason"]
+        self.assertTrue(plans)
+        self.assertTrue(reasons)
+        labels = {line["error_category"] for line in reasons}
+        self.assertTrue(any(label.startswith("owed:") for label in labels), labels)
+        self.assertTrue(any(label.startswith("ask_in_window:grade_") for label in labels), labels)
+        self.assertNotIn("free_reply", labels)
+        for line in reasons:
+            self.assertRegex(line["error_category"], r"^[A-Za-z0-9_:.\-]{1,64}$")
+            self.assertEqual(line["phase"], "roleplay")
+            self.assertIsInstance(line["turn_index"], int)
+        # labels only: nothing the candidate said can be in them
+        blob = " ".join(labels)
+        self.assertNotIn("data science", blob.lower())
+        del rig
 
 
 if __name__ == "__main__":

@@ -87,12 +87,36 @@ export const R1_NAME_MASK = '[CANDIDATE]';
  * The three scripted commitment lines (plan 5.5). The commitment outcome is logged by the
  * worker and is NOT scoring evidence, so the scorer sees a masked placeholder instead of
  * which level the learner chose. Matching is sentence-level so surrounding talk survives.
+ *
+ * Ship restore (owner decision 2026-10-09): production's four frames (origin/main), verbatim, so
+ * every sentence production hides is still hidden, barge-in cuts included; plus the scripted
+ * wordings R1-Q added, each matched as the WHOLE sentence (anchored, tested trimmed): the MEDIUM line
+ * with the advisor's slot ("Let's book a call <slot> with my <decision maker> so we can decide."), its
+ * moved and deferred forms, and the two WEAK forms ("Call me back after I've talked to my <decision
+ * maker>, and I'll let you know." / "I'll read through the email and get back to you.").  Nothing
+ * that is not one of those sentences is hidden beyond what production hides.
+ *
+ * Ship restore round 1: the MEDIUM line now carries the advisor's slot, so production's frame
+ * ("book a call on Thursday at 7 PM") no longer reaches a barge-in cut of it (cut at every word of the
+ * second half, production's own line is masked 48 of 48 and the slot lines 114 of 570).  The frame the
+ * ship-gate round 2 had ("let's book a call") is back, so every cut of the MEDIUM line from "let's
+ * book a call" on, whatever its slot, is hidden as production's was (second-half cuts: the slot line
+ * 570 of 570, the moved form 786 of 786).  It costs the scorer no ordinary speech: of the 41 ordinary
+ * learner sentences the reviews collected it hides 7 against production's 6, and the extra one ("Let's
+ * book a call? I'm not sure that's needed.") is a MEDIUM phrase to the learner guard, which blocks it
+ * in a free reply.
  */
 const COMMITMENT_PATTERNS: readonly RegExp[] = [
   /send me the enrol+ment link/i,
   /pay the deposit today/i,
   /book a call on thursday at 7\s?pm/i,
   /email me the details and i['’]?ll get back to you/i,
+  /\blet['’]?s book a call\b/i,
+  /^let['’]?s book a call\b.*\bwith my [\w' -]+ so we can decide[.!]?$/i,
+  /^daytime is tough for me, so let['’]?s book a call\b.*\bwith my [\w' -]+ so we can decide[.!]?$/i,
+  /^let me check with my [\w' -]+ first, and then let['’]?s book a call, so we can decide[.!]?$/i,
+  /^call me back after I['’]?ve talked to my [\w' -]+, and I['’]?ll let you know[.!]?$/i,
+  /^I['’]?ll read through the e-?mail and get back to you[.!]?$/i,
 ];
 
 const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/;
@@ -100,8 +124,10 @@ const SENTENCE_BOUNDARY = /(?<=[.!?])\s+/;
 export function maskCommitmentLines(text: string): string {
   return text
     .split(SENTENCE_BOUNDARY)
-    .map((sentence) =>
-      COMMITMENT_PATTERNS.some((pattern) => pattern.test(sentence)) ? R1_COMMITMENT_MASK : sentence)
+    .map((sentence) => {
+      const trimmed = sentence.trim();
+      return COMMITMENT_PATTERNS.some((pattern) => pattern.test(trimmed)) ? R1_COMMITMENT_MASK : sentence;
+    })
     .join(' ');
 }
 

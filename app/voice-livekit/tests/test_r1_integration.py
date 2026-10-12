@@ -31,7 +31,7 @@ import r1_llm
 import r1_session
 from r1_commitment import Level, commitment_line, stall_line
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
-from r1_guard import FALLBACK_REPLY, NO_FEEDBACK_LINE
+from r1_guard import FALLBACK_REPLIES, FALLBACK_REPLY, NO_FEEDBACK_LINE
 from r1_linecache import (
     LANE_R1,
     LineCache,
@@ -78,7 +78,15 @@ from tests.test_r1_core import (
     setUpModule,  # noqa: F401 - unittest runs it: silences the loggers' stdout
     tearDownModule,  # noqa: F401
 )
-from tests.test_r1_roleplay import ASK, FOLLOWUP, H1_PROBE, OPENER, PITCH, cooperative_script
+from tests.test_r1_roleplay import (
+    ASK,
+    FOLLOWUP,
+    H1_PROBE,
+    OPENER,
+    PITCH,
+    cooperative_script,
+    strong_script,
+)
 from tests.test_r1_linecache import FakeSynthesizer, FakeTime, RateLimited, clip
 
 P1_CONTEXT = {
@@ -174,12 +182,12 @@ class SdkReportingFailure(FakeProvider):
         yield  # pragma: no cover - makes this an async generator
 
 
-class SlowAcknowledgements(FakeProvider):
-    """Free replies are prompt; every acknowledgement hangs past its cutoff."""
+class SlowIntentReplies(FakeProvider):
+    """Free replies are prompt; every reply that owes a move hangs past its cutoff."""
 
     def __call__(self, messages):
         self.calls.append([dict(message) for message in messages])
-        if "MODE: acknowledgement only" in "\n".join(m["content"] for m in messages):
+        if "raise something of your own" in "\n".join(m["content"] for m in messages):
             return self._hang_forever()
         return self._stream("Okay, that makes sense.")
 
@@ -189,7 +197,7 @@ class SlowAcknowledgements(FakeProvider):
 
 
 class FailsAfterFirstSentence(FakeProvider):
-    """An acknowledgement whose first sentence is out before the call breaks."""
+    """A reply whose first sentence is out before the call breaks."""
 
     async def _stream(self, text: str):
         for word in ("Okay,", "that", "makes", "sense.", "Right", "so"):
@@ -278,8 +286,8 @@ class Rig:
     ) -> str | None:
         """One candidate turn the way the SDK runs it; ``None`` when the hook stops the reply.
 
-        ``cut_when_owed`` is a barge-in: when an owed line follows the acknowledgement, only
-        the acknowledgement is delivered and the item is flagged ``interrupted``.
+        ``cut_when_owed`` is a barge-in: when a scripted variant follows the model's reply to an
+        owed move, only the model's part is delivered and the item is flagged ``interrupted``.
         ``first_audio_after`` makes the agent's audio start that many (manual-clock) seconds
         after the turn was handed over, as the SDK's ``agent_state_changed`` does; ``None`` (the
         default) leaves the rig without audio events, as it always was.
@@ -306,8 +314,10 @@ class Rig:
         spoken = "".join([chunk async for chunk in stream]).strip()
         delivered, interrupted = spoken, False
         plan = self.plan()
-        if cut_when_owed and plan.mode is TurnMode.ACK_THEN_SAY:
-            delivered, interrupted = spoken[: spoken.rindex(plan.scripted_text)].strip(), True
+        if cut_when_owed and plan.mode is TurnMode.INTENT:
+            tail = next((v for v in plan.intent.fallbacks if spoken.endswith(v)), None)
+            if tail is not None:
+                delivered, interrupted = spoken[: -len(tail)].strip(), True
         self.session.current_speech = handle
         if first_audio_after is not None:
             self.clock.advance(first_audio_after)
@@ -340,18 +350,25 @@ def blob_of(messages: list[dict[str, str]]) -> str:
     return "\n".join(message["content"] for message in messages)
 
 
-def owed_lines(decision_maker: str) -> dict[str, str]:
+def owed_lines(decision_maker: str) -> dict[str, tuple[str, ...]]:
+    """Every scripted text of every move (the line and its variants, the redirect openers)."""
     return {
-        spec.id: spec.line.format(decision_maker=decision_maker)
+        spec.id: tuple(
+            text.format(decision_maker=decision_maker)
+            for text in (spec.line, *spec.variants)
+            if text
+        )
         for spec in PLAN
         if spec.line
     }
 
 
-async def cooperative_conversation(rig: Rig, extra: tuple[str, ...] = ()) -> list[str | None]:
+async def cooperative_conversation(
+    rig: Rig, extra: tuple[str, ...] = (), script: list[str] | None = None
+) -> list[str | None]:
     """Replay the cooperative advisor script (turns 50 s apart) and return what was spoken."""
     spoken: list[str | None] = []
-    for index, text in enumerate((*cooperative_script(), *extra)):
+    for index, text in enumerate((*(script or cooperative_script()), *extra)):
         spoken.append(await rig.converse(text, advance=20 if index == 0 else 50))
     return spoken
 
@@ -558,11 +575,15 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
                         line("L-TRANSITION", first_name="Asha", **rendered.line_values), blob
                     )
                     self.assertNotIn("I sold courses for six years.", blob)
-                    # Only the WEAK stall is ever pre-stated; never a graded close line.
+                    # No commitment line is ever pre-stated, not even the WEAK stall: the
+                    # learner must react in its own words (R1-Q), and the notes say so.
                     dm = rendered.decision_maker
                     self.assertNotIn(commitment_line(Level.STRONG, dm), blob)
                     self.assertNotIn(commitment_line(Level.MEDIUM, dm), blob)
-                    self.assertIn(stall_line(dm), blob)
+                    self.assertNotIn(stall_line(dm), blob)
+                    self.assertNotIn("answer exactly", blob)
+                    self.assertNotIn("say exactly", blob)
+                    self.assertIn("Never agree to a call, a day, a time", blob)
 
     async def test_the_live_model_call_carries_exactly_that_context(self) -> None:
         rig = Rig()
@@ -587,17 +608,26 @@ class TestLearnerContext(unittest.IsolatedAsyncioTestCase):
         await rig.converse(OPENER, advance=20)
         await rig.converse(H1_PROBE, advance=30)
         probe_blob = blob_of(rig.last_messages())
-        self.assertIn(rig.persona.surface("H1"), probe_blob)  # the short answer only
+        # The first probe gets the hint layer, in the reminder: a little feeling, no cause.
+        self.assertIn(rig.persona.hint("H1"), rig.last_messages()[-2]["content"])
+        self.assertNotIn(rig.persona.hint("H1"), rig.last_messages()[0]["content"])
         self.assertNotIn(deep, probe_blob)
+        for fact in rig.persona.facts("H1"):
+            self.assertNotIn(fact, probe_blob)
         await rig.converse(FOLLOWUP, advance=30)
         released_blob = blob_of(rig.last_messages())
-        self.assertIn(deep, released_blob)
         self.assertEqual(rig.last_messages()[-2]["role"], "system")
-        self.assertIn(deep, rig.last_messages()[-2]["content"])  # in the reminder, not the prefix
-        self.assertNotIn(deep, rig.last_messages()[0]["content"])
+        reminder = rig.last_messages()[-2]["content"]  # in the reminder, not the prefix
+        for fact in rig.persona.facts("H1"):
+            self.assertIn(fact, reminder)
+            self.assertNotIn(fact, rig.last_messages()[0]["content"])
+        self.assertNotIn(deep, released_blob)  # facts to tell, never a quote to read out
+        self.assertNotIn(rig.persona.hint("H1"), reminder)
         # The other needs stay locked.
         for topic in ("H2", "H3"):
             self.assertNotIn(rig.persona.deep(topic), released_blob)
+            for fact in rig.persona.facts(topic):
+                self.assertNotIn(fact, released_blob)
 
     async def test_an_aside_turn_never_reaches_the_learner(self) -> None:
         rig = Rig()
@@ -685,7 +715,9 @@ class TestInterviewerContext(unittest.IsolatedAsyncioTestCase):
 
 
 class TestOwedMoves(unittest.IsolatedAsyncioTestCase):
-    async def test_at_most_one_move_is_injected_per_turn_and_it_is_spoken_verbatim(self) -> None:
+    async def test_at_most_one_move_is_raised_per_turn_and_no_script_is_handed_to_the_model(
+        self,
+    ) -> None:
         rig = Rig()
         await rig.start_roleplay()
         owed = owed_lines(rig.persona.decision_maker)
@@ -694,29 +726,69 @@ class TestOwedMoves(unittest.IsolatedAsyncioTestCase):
         learner_replies = [item for item in replies if item["phase"] == "roleplay"]
         self.assertGreater(len(learner_replies), 10)
         for item in learner_replies:
-            present = [move for move, text in owed.items() if text in item["text"]]
+            present = [
+                move for move, texts in owed.items() if any(text in item["text"] for text in texts)
+            ]
             self.assertLessEqual(len(present), 1, item["text"])
-        # No model call is ever handed an owed line to say: the prefix and the per-turn
-        # reminder hold none of them, because the worker speaks the line itself, verbatim.
+        # No model call is ever handed a scripted line (or a variant) to read out: the prefix and
+        # the per-turn reminder hold a brief, never the fallback text the worker appends.
         for messages in rig.provider.calls:
-            for text in owed.values():
-                self.assertNotIn(text, messages[0]["content"])
-                self.assertNotIn(text, messages[-2]["content"])
+            for texts in owed.values():
+                for text in texts:
+                    self.assertNotIn(text, messages[0]["content"])
+                    self.assertNotIn(text, messages[-2]["content"])
         delivered = rig.engine.scheduler.deliveries()
-        self.assertGreaterEqual(len(delivered), 9)
+        self.assertGreaterEqual(len(delivered), 8)
         self.assertEqual(len({d.turn for d in delivered}), len(delivered))  # one per turn
 
-    async def test_an_acknowledged_move_is_the_ack_then_the_exact_line(self) -> None:
+    async def test_a_move_the_model_misses_is_its_reaction_then_the_scripted_variant(self) -> None:
         rig = Rig(provider=FakeProvider("Okay, I see."))
         await rig.start_roleplay()
         await rig.converse(OPENER, advance=20)
         await rig.converse("What do you do these days?", advance=120)
         spoken = await rig.converse("The curriculum covers python and sql modules.", advance=100)
         plan = rig.plan()
-        self.assertIs(plan.mode, TurnMode.ACK_THEN_SAY)
-        self.assertTrue(spoken.startswith("Okay, I see."))
-        self.assertTrue(spoken.endswith(plan.scripted_text))
+        self.assertIs(plan.mode, TurnMode.INTENT)
+        # The fake model says "Okay, I see." every turn; the style rules take a repeated "Okay," off
+        # (R1-Q iteration 1), so the reaction is either form.
+        self.assertTrue(spoken.startswith(("Okay, I see.", "I see.")), spoken)
+        self.assertTrue(spoken.endswith(plan.intent.fallback))
         self.assertEqual(plan.move_id, rig.engine.scheduler.deliveries()[-1].move_id)
+        self.assertEqual(rig.engine.admin_log()["intents"]["fallback_appended"], {plan.move_id: 1})
+
+    async def test_a_move_the_model_raises_itself_gets_no_tail(self) -> None:
+        reply = "Honestly, I can find most of this free on YouTube, so why would I pay for it?"
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        await rig.converse("What do you do these days?", advance=120)
+        spoken = await rig.converse(
+            "The curriculum covers python and sql modules.", advance=100,
+            provider=FakeProvider(reply),
+        )
+        self.assertEqual(spoken, reply)
+        self.assertEqual(rig.plan().move_id, "F3-PRIMARY")
+        self.assertIn("F3-PRIMARY", rig.engine.scheduler.deliveries_by_id())
+        self.assertEqual(rig.engine.admin_log()["intents"]["fallback_appended"], {})
+
+    async def test_the_reminder_of_an_owed_move_carries_the_brief_and_the_one_call_is_enough(
+        self,
+    ) -> None:
+        rig = Rig(provider=FakeProvider("Okay, I see."))
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        calls = len(rig.provider.calls)
+        await rig.converse("The curriculum covers python and sql modules.", advance=100)
+        await rig.converse(
+            "And it includes mentorship for every learner, with weekly reviews of your projects.",
+            advance=30,
+        )
+        plan = rig.plan()
+        self.assertIs(plan.mode, TurnMode.INTENT)
+        self.assertEqual(len(rig.provider.calls), calls + 2)  # exactly one call per turn
+        reminder = rig.last_messages()[-2]["content"]
+        self.assertIn(f'"{plan.intent.brief}"', reminder)
+        self.assertEqual(rig.last_messages()[-1]["role"], "user")
 
     async def test_a_move_past_its_deadline_is_forced_and_its_slip_excludes_the_session(self) -> None:
         rig = Rig()
@@ -755,7 +827,7 @@ class TestOwedMoves(unittest.IsolatedAsyncioTestCase):
         cut = None
         for index, text in enumerate(cooperative_script()):
             await rig.converse(text, advance=20 if index == 0 else 50, cut_when_owed=True)
-            if rig.plan().mode is TurnMode.ACK_THEN_SAY:
+            if rig.plan().mode is TurnMode.INTENT:
                 cut = rig.plan().move_id
                 break
         self.assertIsNotNone(cut)
@@ -959,7 +1031,12 @@ class TestOutputGuardInEveryPhase(unittest.IsolatedAsyncioTestCase):
                 reply = self.reply_for(rig, phase)
                 with capture_r1_logs() as lines:
                     spoken = await self.run_reply(rig, reply, self.LEAK)
-                self.assertEqual(spoken, FALLBACK_REPLY)  # a safe line, never a silent drop
+                # A safe line, never a silent drop.  The learner's fallback is a seeded
+                # 3-variant rotation; the interviewer's is one line.
+                if phase == "roleplay":
+                    self.assertIn(spoken, FALLBACK_REPLIES)
+                else:
+                    self.assertEqual(spoken, FALLBACK_REPLY)
                 self.assertNotIn("language model", spoken)
                 self.assertIn("r1_guard_control", error_types(lines))
                 trip = lines[error_types(lines).index("r1_guard_control")]
@@ -1074,40 +1151,42 @@ class TestOutputGuardInEveryPhase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rig.interview._failures, 1)
 
 
-class TestAcknowledgementIsOptionalTheOwedLineIsNot(unittest.IsolatedAsyncioTestCase):
+class TestTheScriptedVariantIsTheFallbackOfAnIntent(unittest.IsolatedAsyncioTestCase):
+    """The model voices an owed move, but the move is not lost when the model fails or is slow."""
+
     async def owed_rig(self, provider: FakeProvider) -> tuple[Rig, str]:
         rig = Rig(provider=provider)
         await rig.start_roleplay()
         await rig.converse(OPENER, advance=20)
         await rig.converse("What do you do these days?", advance=120)
-        # 190 s in, Q-A (due 3:30) is forced at this turn.
-        return rig, owed_lines(rig.persona.decision_maker)["Q-A"]
+        # The next turn is a pitch: F3 (the value objection) is owed there.
+        return rig, "F3-PRIMARY"
 
-    async def test_a_model_failure_still_speaks_the_owed_line(self) -> None:
-        rig, owed = await self.owed_rig(FakeProvider("ok"))
+    async def test_a_model_failure_still_speaks_the_owed_move(self) -> None:
+        rig, _owed = await self.owed_rig(FakeProvider("ok"))
         before = rig.interview._failures
         spoken = await rig.converse(
             "Our curriculum covers python modules.", advance=50,
             provider=FakeProvider(error=RuntimeError(POISON)),
         )
-        self.assertEqual(rig.plan().mode, TurnMode.ACK_THEN_SAY)
-        self.assertEqual(spoken, rig.plan().scripted_text)
+        self.assertEqual(rig.plan().mode, TurnMode.INTENT)
+        self.assertEqual(spoken, rig.plan().intent.fallback)
         self.assertIn(rig.plan().move_id, rig.engine.scheduler.deliveries_by_id())
-        # The failed acknowledgement counts as a model failure and the owed line does not
+        # The failed reply counts as a model failure and the scripted variant does not
         # reset it: three in a row must still end the interview.
         self.assertEqual(rig.interview._failures, before + 1)
         self.assertNotIn(POISON, spoken)
 
     async def test_a_failure_the_sdk_reports_counts_once_not_twice(self) -> None:
-        """One failed call is ONE failure: the SDK's own report counts it, not the ack as well."""
+        """One failed call is ONE failure: the SDK's own report counts it, not the reply as well."""
         rig, _owed = await self.owed_rig(FakeProvider("ok"))
         before = rig.interview._failures
         spoken = await rig.converse(
             "Our curriculum covers python modules.", advance=50,
             provider=SdkReportingFailure(rig.session),
         )
-        self.assertEqual(rig.plan().mode, TurnMode.ACK_THEN_SAY)
-        self.assertEqual(spoken, rig.plan().scripted_text)  # the owed line is still spoken
+        self.assertEqual(rig.plan().mode, TurnMode.INTENT)
+        self.assertEqual(spoken, rig.plan().intent.fallback)  # the owed move is still raised
         self.assertEqual(rig.interview._failures, before + 1)
 
     async def test_a_retry_the_sdk_reports_as_recoverable_does_not_hide_the_final_failure(
@@ -1121,11 +1200,15 @@ class TestAcknowledgementIsOptionalTheOwedLineIsNot(unittest.IsolatedAsyncioTest
         )
         self.assertEqual(rig.interview._failures, before + 1)
 
-    async def test_two_failed_acknowledgements_in_a_row_do_not_end_the_interview(self) -> None:
+    async def test_two_failed_intents_in_a_row_do_not_end_the_interview(self) -> None:
         """F3-PRIMARY then F3-PUSH are consecutive in the normal flow: 2 failures, not the abort."""
         rig, _owed = await self.owed_rig(FakeProvider("ok"))
-        for text in ("Our curriculum covers python modules.", "It also covers SQL and statistics."):
+        for text in (
+            "Our curriculum covers python modules.",
+            "It also covers SQL, statistics and machine learning with weekly mentor reviews.",
+        ):
             await rig.converse(text, advance=50, provider=SdkReportingFailure(rig.session))
+            self.assertIs(rig.plan().mode, TurnMode.INTENT)
         self.assertEqual(rig.interview._failures, 2)
         self.assertIsNone(rig.interview._stop_outcome())
 
@@ -1146,10 +1229,10 @@ class TestAcknowledgementIsOptionalTheOwedLineIsNot(unittest.IsolatedAsyncioTest
         spoken = await rig.converse(
             "Our curriculum covers python modules.", advance=50, provider=provider
         )
-        self.assertEqual(spoken, rig.plan().scripted_text)
+        self.assertEqual(spoken, rig.plan().intent.fallback)
         self.assertEqual(rig.interview._failures, before + 1)
 
-    async def test_a_slow_acknowledgement_is_dropped_but_the_owed_line_is_spoken(self) -> None:
+    async def test_a_slow_reply_is_cut_but_the_owed_move_is_still_raised(self) -> None:
         rig, _owed = await self.owed_rig(FakeProvider("ok"))
         with mock.patch.object(r1_session, "ACK_DEADLINE_SECONDS", 0.05):
             spoken = await asyncio.wait_for(
@@ -1159,10 +1242,10 @@ class TestAcknowledgementIsOptionalTheOwedLineIsNot(unittest.IsolatedAsyncioTest
                 ),
                 10.0,
             )
-        self.assertEqual(spoken, rig.plan().scripted_text)
+        self.assertEqual(spoken, rig.plan().intent.fallback)
 
-    async def test_a_slow_acknowledgement_is_logged_but_is_not_a_failure(self) -> None:
-        """Plan 5.11 fails a turn at its 12 s deadline; a 5-12 s acknowledgement is only slow."""
+    async def test_a_slow_reply_is_logged_but_is_not_a_failure(self) -> None:
+        """Plan 5.11 fails a turn at its 12 s deadline; a 5-12 s intent reply is only slow."""
         rig, _owed = await self.owed_rig(FakeProvider("ok"))
         rig.interview._failures = 2  # two earlier failures: a slow ack must neither add nor reset
         with mock.patch.object(r1_session, "ACK_DEADLINE_SECONDS", 0.05), capture_r1_logs() as lines:
@@ -1173,15 +1256,15 @@ class TestAcknowledgementIsOptionalTheOwedLineIsNot(unittest.IsolatedAsyncioTest
                 ),
                 10.0,
             )
-        self.assertEqual(spoken, rig.plan().scripted_text)
+        self.assertEqual(spoken, rig.plan().intent.fallback)
         self.assertEqual(rig.interview._failures, 2)
         self.assertIsNone(rig.interview._stop_outcome())
         failed = [e for e in lines if e["error_type"] == "r1_ack_failed"]
         self.assertEqual([e["error_category"] for e in failed], ["AckCutoff"])
 
-    async def test_slow_acknowledgements_across_the_script_never_reach_the_abort(self) -> None:
-        """A DeepSeek slowdown that only hits acknowledgements must not end the interviews."""
-        rig = Rig(provider=SlowAcknowledgements())
+    async def test_slow_intent_replies_across_the_script_never_reach_the_abort(self) -> None:
+        """A DeepSeek slowdown that only hits owed-move replies must not end the interviews."""
+        rig = Rig(provider=SlowIntentReplies())
         await rig.start_roleplay()
         modes: list[TurnMode] = []
         worst = 0
@@ -1193,7 +1276,7 @@ class TestAcknowledgementIsOptionalTheOwedLineIsNot(unittest.IsolatedAsyncioTest
                 modes.append(rig.plan().mode)
                 worst = max(worst, rig.interview._failures)
                 self.assertIsNone(rig.interview._stop_outcome(), modes)
-        self.assertGreaterEqual(modes.count(TurnMode.ACK_THEN_SAY), 3, modes)  # not vacuous
+        self.assertGreaterEqual(modes.count(TurnMode.INTENT), 3, modes)  # not vacuous
         self.assertEqual(worst, 0)
 
     async def test_a_failure_after_the_first_sentence_does_not_block_the_next_reset(self) -> None:
@@ -1204,24 +1287,36 @@ class TestAcknowledgementIsOptionalTheOwedLineIsNot(unittest.IsolatedAsyncioTest
             provider=FailsAfterFirstSentence(),
         )
         self.assertTrue(spoken.startswith("Okay, that makes sense."), spoken)
-        self.assertTrue(spoken.endswith(rig.plan().scripted_text))
+        self.assertTrue(spoken.endswith(rig.plan().intent.fallback))
         self.assertFalse(rig.interview._skip_failure_reset)  # not left over for the next reply
         self.assertEqual(rig.interview._failures, 1)  # reset by the answer, then this failure
         await rig.converse("What else would you like to know?", advance=5)
         self.assertIsNot(rig.plan().mode, TurnMode.SAY_ONLY)  # a turn the model answers
         self.assertEqual(rig.interview._failures, 0)  # the next real reply resets as usual
 
-    async def test_a_guarded_out_acknowledgement_is_a_neutral_one(self) -> None:
+    async def test_a_guarded_out_reply_leaves_the_scripted_variant_alone_not_an_apology(self) -> None:
         rig, _owed = await self.owed_rig(FakeProvider("ok"))
         spoken = await rig.converse(
             "Our curriculum covers python modules.", advance=50,
             provider=FakeProvider("As an AI language model I cannot say."),
         )
         plan = rig.plan()
-        self.assertTrue(spoken.endswith(plan.scripted_text))
-        head = spoken[: -len(plan.scripted_text)].strip()
-        self.assertNotIn("language model", head)
-        self.assertLessEqual(len(head.split()), 15)
+        self.assertEqual(spoken, plan.intent.fallback)
+        self.assertNotIn("language model", spoken)
+        self.assertNotIn(FALLBACK_REPLY, spoken)  # no "Sorry, what were you saying?" in front
+
+    async def test_a_hostile_model_reply_still_raises_the_move_and_trips_the_guard(self) -> None:
+        rig, _owed = await self.owed_rig(FakeProvider("ok"))
+        spoken = await rig.converse(
+            "Our curriculum covers python modules.", advance=50,
+            provider=FakeProvider("Sure, Thursday works. My email is a.b@gmail.com."),
+        )
+        plan = rig.plan()
+        self.assertTrue(spoken.endswith(plan.intent.fallback))
+        self.assertNotIn("Thursday", spoken)
+        self.assertNotIn("@", spoken)
+        categories = {trip["category"] for trip in rig.interview._guard_trips}
+        self.assertTrue({"commitment", "contact"} <= categories, categories)
 
 
 # ------------------------------------------------------------------------- commitment
@@ -1230,23 +1325,30 @@ class TestAcknowledgementIsOptionalTheOwedLineIsNot(unittest.IsolatedAsyncioTest
 class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
     CALL_ASK = "Shall I send you the enrolment link so you can enrol today?"
 
-    async def test_an_ask_before_the_window_gets_the_stall_and_never_the_model(self) -> None:
+    async def test_an_ask_before_the_window_gets_a_reason_and_never_a_commitment(self) -> None:
         rig = Rig()
         await rig.start_roleplay()
         await rig.converse(OPENER, advance=20)
         calls = len(rig.provider.calls)
         spoken = await rig.converse(self.CALL_ASK, advance=100)
         plan = rig.plan()
-        self.assertIs(plan.mode, TurnMode.SAY_ONLY)
-        self.assertEqual(spoken, stall_line(rig.persona.decision_maker))
-        self.assertEqual(len(rig.provider.calls), calls)  # the model was not called
+        # R1-Q: no sanctioned stall line; the learner voices a reason in its own words (one model
+        # call, a scripted variant if the reply misses it) and agrees to nothing.
+        self.assertIs(plan.mode, TurnMode.INTENT)
+        # (Round 1: timing is the owed F4 pair's reason and is not voiced early as well, so the
+        # first reason an early ask meets is money.)
+        self.assertEqual(plan.negotiation_id, "N-MONEY")
+        self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
+        self.assertEqual(len(rig.provider.calls), calls + 1)
         self.assertFalse(rig.engine.commitment_resolved)
         self.assertIn("ask_before_close_window", plan.reasons)
+        self.assertEqual(rig.engine.negotiation.voiced, {"money": plan.turn})
+        self.assertEqual(rig.engine.ledger.leak_total, 0)
 
     async def test_an_ask_in_the_window_gets_the_graded_line_verbatim(self) -> None:
         rig = Rig(judge=judge_returning(GOOD_JUDGE))
         await rig.start_roleplay()
-        await cooperative_conversation(rig)
+        await cooperative_conversation(rig, script=strong_script())  # the decider stall is answered
         calls = len(rig.provider.calls)
         spoken = await rig.converse(ASK, advance=50)
         plan = rig.plan()
@@ -1258,6 +1360,51 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(rig.provider.calls), calls)
         self.assertTrue(rig.engine.commitment_resolved)
         self.assertEqual(rig.engine.commitment_level, plan.commitment_level)
+
+    async def test_the_thirteen_minute_stall_is_one_model_reaction_then_the_scripted_line(
+        self,
+    ) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        await cooperative_conversation(rig)  # R = 12:50 after the last advisor turn
+        self.assertFalse(rig.engine.commitment_resolved)
+        reaction = FakeProvider("Thanks, that was a helpful walk-through.")
+        spoken = await rig.converse(
+            "That makes sense, thank you for sharing that.", advance=20, provider=reaction
+        )
+        plan = rig.plan()
+        dm = rig.persona.decision_maker
+        self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, "COMMIT-STALL"))
+        self.assertEqual(spoken, f"Thanks, that was a helpful walk-through. {stall_line(dm)}")
+        self.assertEqual(len(reaction.calls), 1)  # one model call, for the reaction only
+        self.assertTrue(rig.engine.commitment_resolved)
+        self.assertEqual(rig.engine.commitment_level, Level.WEAK)
+        # The model was asked for ONE sentence and was not handed the stall wording.
+        reminder = reaction.calls[0][-2]["content"]
+        self.assertIn("ONE short sentence", reminder)
+        self.assertNotIn("Just email me the details", reminder)
+        # The stall is never said again, whatever the advisor does next.
+        later = await rig.converse(ASK, advance=5)
+        self.assertNotIn("email me the details", (later or "").lower())
+
+    async def test_a_callback_proposal_before_the_window_is_met_with_a_reason_through_the_session(
+        self,
+    ) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        spoken = await rig.converse(
+            "Can we schedule a call back tomorrow at 10:00 a.m.? I will email you the details.",
+            advance=100,
+            provider=FakeProvider("Okay."),
+        )
+        plan = rig.plan()
+        self.assertEqual(plan.negotiation_id, "N-MONEY")
+        self.assertTrue(spoken.startswith("Okay."))
+        self.assertNotIn("tomorrow", spoken.lower())
+        self.assertNotIn(stall_line(rig.persona.decision_maker), spoken)
+        self.assertEqual(rig.engine.negotiation.callbacks, [{"turn": 2, "has_slot": True}])
+        self.assertEqual(rig.engine.ledger.leak_total, 0)
 
     async def test_the_same_conversation_gets_the_same_commitment_every_time(self) -> None:
         outcomes = []
@@ -1376,7 +1523,8 @@ class TestRoleplayDriver(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(rig.interview._run_roleplay())
         await rig.settle()
         first = await rig.converse(GOODBYE, advance=100)
-        self.assertTrue(first.startswith("Oh wait, before you go..."))  # once, with a move
+        # Once, with a move: production's scripted redirect (ship restore, owner decision 2026-10-09).
+        self.assertTrue(first.startswith("Oh wait, before you go..."), first)
         self.assertFalse(rig.engine.exit_requested)
         self.assertFalse(task.done())
         self.assertIsNone(await rig.converse(GOODBYE, advance=20))  # the second one exits
@@ -1928,14 +2076,19 @@ class TestEndToEnd(R1TestCase):
         self.assertEqual(self.session.spoken[2], persona.pickup_line)
         # Role-play: the cooperative advisor script, 50 s apart, through the SDK seams.
         spoken = []
-        for index, text in enumerate((*cooperative_script(), ASK)):
-            spoken.append(await self.converse(text, 20 if index == 0 else 50))
+        # With no judge data the grade is WEAK: the first ask meets the one reason left (money),
+        # the second gets the scripted WEAK resolution (R1-Q: stall reasons before the WEAK line).
+        script = cooperative_script()
+        for index, text in enumerate((*script, ASK, ASK)):
+            gap = 20 if index == 0 else (50 if index < len(script) else 5)  # R stays < 14:00
+            spoken.append(await self.converse(text, gap))
         self.assertTrue(all(spoken))
         self.assertIs(interview.machine.phase, R1Phase.ROLEPLAY)
         self.assertGreaterEqual(len(interview.engine.scheduler.deliveries()), 9)
         # The commitment was asked for after R = 9:00, so the role-play is over at the next
         # boundary (R >= 10:00, resolved): the interviewer answers it with L-EXIT.
         self.assertTrue(interview.engine.commitment_resolved)
+        self.assertEqual(spoken[-1], stall_line(interview.persona.decision_maker))
         self.clock.advance(5)
         self.final_transcript("let me summarise the offer")
         with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.05):
@@ -2051,7 +2204,7 @@ async def drive_reply(
 
 
 async def owed_rig(provider: FakeProvider) -> Rig:
-    """A role-play at 190 s, where the next turn forces an owed move (acknowledgement + line)."""
+    """A role-play at 190 s, where the next turn owes a move (the model voices it, R1-Q)."""
     rig = Rig(provider=provider)
     await rig.start_roleplay()
     await rig.converse(OPENER, advance=20)
@@ -2177,7 +2330,7 @@ class TestLatencyLines(unittest.IsolatedAsyncioTestCase):
         cases = (
             ("done", FakeProvider("Okay, that makes sense.")),
             ("failed", FakeProvider(error=RuntimeError(POISON))),
-            ("cutoff", SlowAcknowledgements()),
+            ("cutoff", SlowIntentReplies()),
         )
         for outcome, provider in cases:
             with self.subTest(outcome=outcome):
@@ -2187,17 +2340,20 @@ class TestLatencyLines(unittest.IsolatedAsyncioTestCase):
                         await rig.converse(
                             "Our curriculum covers python modules.", advance=50, provider=provider
                         )
-                self.assertEqual(rig.plan().mode, TurnMode.ACK_THEN_SAY)
+                self.assertEqual(rig.plan().mode, TurnMode.INTENT)
                 acks = [l for l in latency_lines(lines) if l["schema"] == "ack"]
                 self.assertEqual([l["error_category"] for l in acks], [outcome])
                 self.assertNotIn(POISON, json.dumps(lines))
 
     async def test_a_scripted_owed_move_without_a_model_call_still_reports_its_headline(self) -> None:
-        rig = Rig()
+        rig = Rig(judge=judge_returning(GOOD_JUDGE))
         await rig.start_roleplay()
-        await rig.converse(OPENER, advance=20)
+        await cooperative_conversation(rig)
+        rig.clock.advance(50)
         with capture_r1_logs() as lines:
-            # A candidate who asks to commit before the window gets a scripted stall: no LLM.
+            # A candidate who asks to commit inside the close window gets the graded line
+            # verbatim: no LLM.  (Before the window the learner voices a reason, R1-Q: a model
+            # call, so that turn is an intent and not this scripted one.)
             provider = TimedProvider(rig.clock, "unused")
             await drive_reply(rig, ASK, provider)
         stages = [s for s, _ in our_stages(lines)]

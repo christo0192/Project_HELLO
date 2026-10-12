@@ -34,6 +34,7 @@ import r1_persistence
 import r1_routing
 import r1_session
 from r1_guard import FALLBACK_REPLY
+from r1_script import LEARNER_FILLER_VARIANTS
 from r1_lines import INTERVIEWER_NAME, line, safe_first_name
 from r1_persistence import OUTCOME_DISPOSITIONS, R1TurnWriter
 from r1_phases import (
@@ -1365,7 +1366,22 @@ class TestLlmGuard(R1TestCase):
             guard = self.interview.guard_llm_stream(self.gated(gate, "reply"))
             first = await asyncio.wait_for(guard.__anext__(), 10.0)
             await guard.aclose()
-        self.assertEqual(first, self.spoken_line("L-FILLER-LEARNER") + " ")
+        # The learner's filler is a 3-variant rotation seeded by the attempt id (R1-Q), so a
+        # slow model never makes the learner say the same words every time.
+        self.assertIn(first, [variant + " " for variant in LEARNER_FILLER_VARIANTS])
+        self.assertEqual(self.interview.engine.admin_log()["repetition"]["fillers_used"], 1)
+
+    async def test_the_roleplay_filler_rotates_through_its_variants(self) -> None:
+        self.enter_roleplay()
+        fillers = []
+        for _ in range(3):
+            gate = asyncio.Event()
+            with mock.patch.object(r1_session, "FILLER_AFTER_SECONDS", 0.01):
+                guard = self.interview.guard_llm_stream(self.gated(gate, "reply"))
+                fillers.append(await asyncio.wait_for(guard.__anext__(), 10.0))
+                await guard.aclose()
+        self.assertEqual(len(set(fillers)), 3, fillers)
+        self.assertEqual(set(fillers), {v + " " for v in LEARNER_FILLER_VARIANTS})
 
     async def test_no_filler_when_the_reply_is_fast(self) -> None:
         self.assertEqual(await self.collect(self.stream("fast")), ["fast"])

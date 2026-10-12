@@ -1291,9 +1291,9 @@ candidate turn) and `error_category`. No line holds an utterance or a name.
 | `eou_to_turn_hook` | Candidate end of speech to `on_user_turn_completed` (endpointing plus the transcript wait); `error_category` says which anchor was used (`vad`, `final`, `hook`). This is the window a preemptive generation could overlap |
 | `eou_to_llm_first_token`, `llm_ttft` | To the model's first text; and from the model call to it |
 | `eou_to_guard_release`, `guard_hold` | To the first vetted sentence leaving the output guard; and how long the guard held it after the first token (it releases a sentence only once the next has begun) |
-| `ack` | The acknowledgement before an owed line, with `error_category` `done`, `cutoff` or `failed` |
+| `ack` | The model's voicing of an owed move (an `intent` turn; the acknowledgement before the owed line before R1-Q), with `error_category` `done`, `cutoff` or `failed` |
 | `eou_to_tts_first_frame`, `tts_ttfb` | To the first audio frame the TTS node produced; and its time from the first text |
-| `eou_to_first_audio` | The headline: end of speech to the agent's audio starting; `error_category` is the turn kind (`llm_reply`, `ack_then_say`, `say_only`, `reply`) |
+| `eou_to_first_audio` | The headline: end of speech to the agent's audio starting; `error_category` is the turn kind (`llm_reply`, `intent`, `say_only`, `reply`) |
 | `eou_to_reply_lost` | A reply the SDK cancelled before the candidate heard any of it: end of speech to the cancellation, `error_category` the turn kind. It is a **lower bound** of that turn's wait (the candidate went on waiting for the next reply), and it counts as one more sample in the p95 below and in the `r1_latency.py` report, so the slowest turns cannot drop out of the percentile by never being heard (a turn that reaches its audio is never counted here too) |
 | `say_to_first_audio` | A scripted line, `error_category` the line id |
 | `first_audio_p95` | Logged once at exit: the p95 of `eou_to_first_audio` (and `eou_to_reply_lost`) that the worker posts as `session_facts.first_audio_p95_ms` (here in seconds). `error_category` `gate` = the role-play turns the API gate reads (at least 8, else `unknown` and no `duration_sec`), `all_phases` = every phase, for information; `option_count` is the number of turns behind it. `lost_replies` is a separate line whose `option_count` is how many of the role-play samples are lost replies |
@@ -1473,11 +1473,201 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
   hiring team will review your interview and get back to you."), so a candidate who asks for feedback
   hears it once. (The first R1-Q wording also said "the hiring team will review your interview and be in
   touch", which put the same sentence twice, a few seconds apart, in front of the close.)
-* **Content pin.** These changed pinned text: `CONTENT_REVISION` is 3 (`L-NO-FEEDBACK`,
-  `WRAPUP_REMINDER`; revision 3 has not shipped, main is at 2, so the review round re-pinned it instead
-  of taking a fourth); `docs/design/r1/R1-PLAN-final.md` carries the new `L-NO-FEEDBACK` text (a test
-  compares it). If the learner branch (R1-Q S01) also bumps the revision, the second merge takes one
-  more bump and a recomputed `PINNED_CONTENT_SHA256`. Nothing else in the lines changed.
+* **Content pin.** Any pinned text change bumps `CONTENT_REVISION` and the recomputed
+  `PINNED_CONTENT_SHA256` (`tests/test_r1_content_pin.py`; the history of every revision is in the comment
+  blocks of that test and of `r1_content.py`). PR-B's own revision 3 (`L-NO-FEEDBACK`, `WRAPUP_REMINDER`)
+  joined the learner branch's revisions at 9 in the merge of main; learner iteration 1 (R1-Q S01, owner
+  decisions of 2026-10-08) is revision 10: no scripted or prompted "hmm"/"honestly", a rotating
+  opening-style note per free reply, a warm confirmation once a call is booked, the decision maker on the
+  public card, the $7,000 anchor never an offer, "I can check with my manager" grants nothing, and the
+  time cue is the learner's own next call; learner iteration 2 is revision 11, iteration 3 revision 12
+  and the final review round 1 revision 13, and the ship restore revision 14 (see the next bullets).
+  `docs/design/r1/R1-PLAN-final.md` carries the `L-NO-FEEDBACK`
+  text (a test compares it). Check the pin comment and `CONTENT_REVISION` after every merge of main: a
+  second branch that also changed pinned text takes one more bump and a recomputed hash.
+* **Learner speaking style (R1-Q iteration 1).** The guard now also varies the learner's free replies,
+  deterministically and with no extra model call: a tic word ("hmm", "honestly") is kept at most once in
+  five replies and never twice in one, and a reaction opener ("Okay,", "Right,", "That's") used in the last
+  six replies is taken off. Style edits are counted in the guard summary (`style_edits`), never posted and
+  never a leak. Two new HYGIENE categories join `ack_format` and `repeat`: `reopen` (a question or a doubt
+  after a MEDIUM or STRONG call was booked: the reply becomes a warm confirmation) and `misread` (the
+  $7,000 taken for an offer, thanks for a discount nobody granted, the time cue turned round; "it's just
+  me deciding" was a rule here too and is gone, see the ship restore). They show as `r1_guard_reopen` / `r1_guard_misread` log keys, count toward nothing and are
+  not posted to the API (`HYGIENE_CATEGORIES`). The rehearsal scorecard gates the tics (no reaction word on
+  more than 15 % of the replies, "hmm" and "honestly" on at most 20 % each); reply length is information
+  only.
+* **Learner iteration 2 (R1-Q S01, content revision 11).** The second live sweep found 24 defects; the
+  worker side of the fixes, all deterministic and with no extra model call: `classify_learner_commitment`
+  ignores an agreement a negator governs ("tomorrow won't work") (rolled back by ship restore round 1);
+  `has_concession` ignores "I want to be sure
+  it's worth it"; the guard's style surgery no longer garbles speech ("to be honest with myself" stays,
+  `, -` and `But,` debris is cleaned, only an adjective or a verb loses a leading "That's"); a connector
+  whose sentence was dropped goes with it; quote marks around a figure are removed; a reply asks at most
+  one question and a free reply none when one of its last two replies asked (a bare "Okay." keeps its
+  question); "a stretch" and "what would it involve" are used once per call (a second "a stretch" is said
+  another way); the price notes know where the price stands (nothing at or below the $7,000 ask is "a
+  stretch" or "better than before" when it did not move); (the rules that turned "that matches what I'd
+  heard" about another figure into the real $7,000 line, kept the decision maker from "isn't one for calls"
+  and checked spelled-out amounts were removed by the ship restore below); a proposed call stays unaccepted until the window opens (a hold
+  note); a call the learner declined is not booked at the farewell; a push the learner already voiced
+  (falling behind) is not owed again; an owed move waits ONE turn when the advisor asks a direct question
+  about the learner or the people in their decision; a deep need takes the reply before another topic's
+  hint; the WEAK stall for a CALL ask says "Call me back after I've talked to my {decision maker}, and
+  I'll let you know" and the MEDIUM line books the call without a slot when none was named
+  (`MEDIUM_DEFER_LINE`). The two new scripted sentences are masked in
+  `app/api/src/lib/r1/transcript.ts` (the call-back WEAK sentence has its own pattern; the deferred MEDIUM
+  line matches the existing "book a call ... so we can decide" frames).
+* **Learner final review round 1 (R1-Q S01, content revision 13).** The two Opus reviews of the PR-A head
+  and the third live sweep found a regression and several gaps; all fixes are deterministic, no extra
+  model call. (Items (a), (b) in part, (c) and (f), the `pending_ask_at_farewell` label and the short mask
+  frames below were rolled back by the ship restore: see the next bullet. They stay listed because the
+  revision 13 text and logs still name them.) (a) "Before I go" is removed only as a closing clause
+  (leading, a comma-bounded aside, or the end of the sentence): "before I go any further / down this road"
+  is an ordinary sentence. (b) The enrolment ask is an invitation to act (pay, reserve, enrol, a payment
+  or enrolment LINK or form): sending the payment, registration or enrolment DETAILS, options or
+  information is an e-mail offer, so a strong advisor's "I'll email the curriculum and payment details" no
+  longer earns a scripted "I'll pay the deposit today". STRONG is also blocked (the grade becomes MEDIUM, and WEAK after a declined call)
+  when the learner turned a call down, said it will wait (the last 3 learner turns), or said it must talk
+  to its decision maker first and the advisor did not address that afterwards (`strong_blocked:*` in the
+  plan reasons). The STRONG line no longer says "for that plan". (c) The persona has ONE decider: a
+  sentence that denies the card's decision maker ("it's up to me", "I'm the one who decides", "he'd just
+  want me to weigh it myself") or names another party to the decision ("my mom gets a say", "run it by my
+  sister") is replaced by the card's own answer (`misread: decider_contradicted`). (d) The decider stall,
+  the "get back to you" closer and "still more than I planned for" have a per-call quota and a spacing
+  window in a free reply (`PHRASE_QUOTA`, `PHRASE_WINDOW`); an owed move and the answer to "who else
+  decides?" are never trimmed. (e) A released deep need is offered on the next OPEN dig ("What would help
+  you two decide?") even if only the shadow judge released it, an offer whose reply missed the need is
+  given back (up to 3 times), and a call or enrolment ask is never answered with a need (a proposed call
+  is not a probe). (f) The call-proposal grammar learned "a quick word", "hop on a Zoom", "give you a
+  buzz", "find twenty minutes", "how's Sunday ..." and "when's a good moment to reconnect"; a proposal it
+  still misses is not a leak: inside the close window the model's acceptance is a hygiene hit
+  (`misread: late_ask_accepted`) and the farewell answers it like any open proposal. The detectors are
+  also scored on a held-out file (`tests/fixtures/r1_advisor_heldout.jsonl`, never tuned on; its first
+  scores were call 0.86, e-mail 0.75, enrolment 0.86, farewell 0.86, price 1.00, anchor reply 0.83).
+  (g) Reasons are logged: every R1 turn writes one `r1_turn_reason` line per reason label of its plan
+  (`owed:*`, `stall_reason:*`, `ask_in_window:grade_*`, `call_declined`, `advisor_thin`,
+  `advisor_pressured`, `strong_blocked:*`, `owed_deferred_*`, `pending_ask_at_farewell` ...): labels only,
+  never text. Read them first when a commitment is lower than the advisor seemed to earn. (h) The
+  rehearsal harness measures the literal first word of every reply (no whitelist), the decider stall and
+  the money line per call and per window, and allows the offer ledger's prices in the fact check.
+  The scorer-side mask (`transcript.ts`) matched the SHORT frames of the scripted wordings (replaced by
+  whole-sentence frames in the ship restore). DeepSeek balance: a live sweep needs about 0.31
+  USD and the harness refuses to start below 0.60; the phone scorer shares the account, so top it up before
+  a sweep and before the owner test.
+* **Learner ship restore (R1-Q S01 PR-A, content revision 14; owner decision 2026-10-09).** "Ship the
+  improvements now": PR-A ships only what is proven better than production (`origin/main`); anything that
+  was worse behaves exactly like production. Five review rounds of narrowing rules did not converge, so
+  this round only restored production's code or deleted a PR-A-only rule; it added no regex, rule,
+  exemption or guard category. Accepted gaps (not shipped in PR-A): co-decider and timing consistency
+  (owner point 3), the deep need on follow-up digs (owner point 5), wordiness, and every detector miss or
+  false positive production also has. What changed against the final review round 1 text above:
+  * Enrolment ask: `r1_commitment._ENROL_ASK` and the per-sentence reading of `enrol_ask_in` are
+    production's, verbatim (a test pins the pattern fingerprint and production's confusion counts on the
+    detector corpus). "Can I send you the curriculum?" is an enrolment ask again, as in production; the
+    resource-link, look-ahead and question-frame helpers are deleted.
+  * Conditional commitments (`If Thursday works for you, great.`, `I'll reach out if I decide ...`) keep
+    the level they have in production, so the gate sees them. The negation check is gone too (restore
+    round 1, below).
+  * Late asks: there is no `late_ask_accepted` exemption (a MEDIUM acceptance in a free reply is a
+    `commitment` hit, as in production) and no `late_asks` admin-log key.
+  * Farewell: no `pending_ask_at_farewell` reason. An early ask no longer turns the goodbye into a
+    booking; a goodbye in the window goes through `register_close_attempt` (the WEAK stall), as in
+    production. `_pending_ask` still feeds the hold note.
+  * Early goodbye: the scripted redirect is production's `Oh wait, before you go... <owed line>` again
+    (`REDIRECT_OPENERS[0]`), not an in-context brief voiced after the model's own "bye".
+  * Call reader (kept, recall 31 of 38 on the triage set against 14 in production): the alternatives
+    `message|whatsapp`, `take`, the part-of-the-day words of the time ask and the `so he/she/you ...` look-ahead
+    were removed, because each added a false positive production does not have.
+  * Guard: the rules `decider_alone`, `decider_contradicted`, `decider_unwilling`, `heard_not_anchor`,
+    `heard_in_line`, `better_unchanged`, the three "before I go" strips and the money-cue/spelled-quantity
+    amount check are deleted (the learner amount check and `r1_text.canonical_amounts` are production's);
+    `anchor_taken_as_offer`, the repeat and tic guards, the stall quota and the confirm-only rule stay. Their
+    canned lines (`ANCHOR_HEARD_REPLACEMENT`, `ANCHOR_HEARD_BELOW`, `PRICE_UNCHANGED_REPLACEMENT`) and the
+    manifest keys that pinned them are gone, so `CONTENT_REVISION` is 14.
+  * Scorer mask (`transcript.ts`): production's four frames, verbatim, plus each new scripted wording as a
+    WHOLE trimmed sentence (the MEDIUM line with the advisor's slot, its moved and deferred forms, the
+    call-back WEAK line, the e-mailed WEAK line). A barge-in cut of the call-back and e-mailed WEAK
+    wordings is not hidden (production never hid them either); ordinary learner speech is hidden only where
+    production hides it, apart from the frame below. Restore round 1 corrected the MEDIUM line (see there).
+  * Cost bound: `RolePlayEngine.plan_turn` reads at most the last 4,000 characters of an advisor turn
+    (`MAX_CANDIDATE_CHARS`), the identity for every real turn (the longest live turn is about 1,070
+    characters) and for non-strings. It only caps the cost of pathological speech-to-text.
+  Still in force from the earlier rounds (proved better than production): no WEAK stall loop (the WEAK line
+  at most once, a stall quota), no verbatim deflection, intent-voiced in-context objections and topic
+  triggers, the repetition guard, tic control, a confirmation only after a commitment, the $7,000 anchor
+  never read as an offer, no unprompted need dumps, the MEDIUM line with the advisor's slot.
+* **Learner ship restore, round 1 (R1-Q S01 PR-A; owner decision 2026-10-09).** The two reviews of the
+  restore found five places still worse than production. Same rule: production's code restored or a
+  PR-A-only rule deleted, no new regex, rule, exemption or guard category.
+  * Call reading is a floor: `r1_commitment.ask_acts` reads a CALL when the structural reader
+    (`call_proposal_in`) OR production's own `_CALL_ASK` (verbatim, fingerprint pinned in
+    `test_r1_detector_corpus`) reads it. The structural reader alone missed proposals production books
+    (third-person callees "Let me call your husband tomorrow at 7", a bare "I'll call you back", unframed
+    offers "I'm happy to set up a call with your husband"); a proposal production reads is never lost now.
+    The union keeps production's false positives (a programme description such as "You can book a slot
+    with a mentor." is read as a call proposal again, as in production: accepted); it adds none of its own on
+    any labelled row (`ProductionCallReadingTests`: hand 116/61/3, simulator 91/4/4, held-out 31/2/5 for
+    tp/fp/fn against production's 66/61/53, 54/4/41, 18/2/18). `detect_callback` and the persona probe
+    filter still use the structural reader alone (they only decide the slot and whether a question is a probe).
+  * Deleted from the structural reader (each read, as a call, an advisor sentence production reads as
+    nothing): the `talk|speak to/with your husband ...` call object ("Talk to your father tonight and I'll
+    hold the price" was booked as a call; the owner's turn 78 "I can also talk to your husband" is answered
+    as in production again, with the owed WEAK stall), the `<day or clock> ... works?` time ask and the
+    `are` lead of the day/clock fit-check ("Sessions are on Sunday mornings, does that work?"), the
+    `word` and `chat` alternatives of "a chat" / "have a word" ("Have a word with your father"), and three
+    more alternatives that read other advisor sentences as a call, found with fresh adversarial sentences and
+    each costing no labelled proposal that production reads: `how about` / `what about` + day ("How about I
+    email you the brochure tomorrow?", "How about I hold the discount until tomorrow evening?"), the
+    `do you have <time> <day>` question ("Do you have an hour in the mornings?") and the nouns `chat`,
+    `catch-up` and `follow-up` of the call question ("Would a mentor chat help you feel more confident?").
+    Known residual head-only readings (the proposals they carry outweigh them in the labelled and live data,
+    but they are not zero): `I can do <thing> <day>` ("I can do the paperwork tomorrow."), `Can you join a
+    call with <person>?`, `Can I get a word in about ...?` and `Can we have a conversation about ...?`.
+  * Learner commitment classifier: `classify_learner_commitment` is production's plain pattern search
+    again (the negation exemption `_affirms` is deleted). It dropped an affirmative commitment behind an
+    unrelated negator in the same clause ("I have no more questions so count me in.") and let it be spoken
+    with nothing posted; now it is blocked and posted as in production. The price is production's false
+    positive on a genuine negation ("Thursday doesn't work for me." reads MEDIUM), accepted.
+  * Scorer mask (`transcript.ts`): the frame `let's book a call` of the ship-gate round 2 is back. The MEDIUM
+    line now carries the advisor's slot, so production's frame "book a call on Thursday at 7 PM" no longer
+    reached a barge-in cut of it. Second-half cuts hidden: production's own line 48 of 48, the slot line 114 of
+    570 and the moved form 114 of 786 before the frame, 570 of 570 and 786 of 786 with it; the deferred form
+    (production has none) 30 of 54, the cuts that stop before "a call" stay visible. The frame hides 7 of 41
+    ordinary learner sentences against production's 6, and the extra one ("Let's book a call? I'm not sure
+    that's needed.") is a MEDIUM phrase the learner guard blocks in a free reply anyway.
+* **Learner ship restore, round 2 (R1-Q S01 PR-A; owner decision 2026-10-09).** The round-1 review found the
+  advice-to-the-decider and learner-schedule classes still open through sibling alternatives of the
+  structural call reader. Only deletions, no new regex, rule or exemption. Deleted, each because it read an
+  ordinary sentence as a call proposal that production reads as nothing and none carried a labelled, live
+  or canonical proposal that production does not also miss:
+  * Advice to talk to the decider: the call nouns `conversation`, `word`, `meeting`, `check-in`, `huddle`,
+    `catch-up` and `discussion` (the "a quick call" object, the "have a quick word" call question, the
+    `book ... <noun>` object and the `have a catch-up` object), and `together` in "talk together".
+  * The learner's own schedule: the `which` lead and the plurals `evenings` / `mornings` of "What <day> works
+    ...", the `time` noun of "When is the best time ...", the `how does` / `how's` lead of the day question,
+    the `is` lead of "Is Saturday best for your assignments?", `lunch`, and the `schedule` verb of the
+    "<verb> a time" object ("I will WhatsApp you the schedule this evening").
+  * The advisor's promise of an answer: `get back to you`, `come back to you`, `loop back` ("Let me check with
+    my manager tomorrow and get back to you on the discount"), and the filler words of "do <task> <day>"
+    ("I can do the paperwork tomorrow") and the `-ing` of "meeting tomorrow".
+  Cost, all proposals production misses too (the engine falls back to production's level): four labelled
+  (`c1503`, `c1722`, `c1724`, `c1744`) and one live ("Let's say seven tomorrow evening."); `c0172` and `c1746`
+  are no longer read by the structural reader alone, and still are by the union. Engine counts on the hand
+  set are now 112/61/7 (tp/fp/fn). Fresh non-proposals read as a call by the structural reader but not by
+  production: decider advice 27 of 127 before, 3 now; study-time questions 35 of 174 before, 0 now; other
+  uses (answer promises, tasks on a day) 12 of 182 before, 1 now. 142 of these sentences are now
+  `call_proposal = false` rows of the corpus (`iter2:ship-restore-2/*`), so
+  `test_the_structural_reader_adds_no_false_positive_production_lacks` sees them.
+  * Known residual head-only readings, none removable by a deletion: `Have a call with your husband tonight and
+    let me know.`, `Could you have a call with your father this evening?` (the noun `call` is the proposal
+    too: "Could we have a call with your father on Sunday?"), and `Can you join a call with <a mentor>?`.
+    None occurs in the 3,804 live advisor sentences of sweeps 1-3.
+  * Not changed, needs the owner: with a model that accepts the call ("Sure, tomorrow works for me.") on an
+    early call ask, the intent stall turn blocks the text and posts `commitment`, so `out_of_level_commitment`
+    fails where production (scripted WEAK on every ask) is clean: 21 of 39 fresh early asks. It is the price
+    of the voiced stall reasons. Live: 0 of 87 stall turns of sweeps 1-3 had accepting model text. And the
+    plain classifier (round 1) reads a genuine negation as a commitment: 6 of the 3,010 learner turns of
+    sweeps 1-3, in 6 of 60 calls, would post `commitment` (3 of them on intent turns).
 
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 

@@ -17,7 +17,7 @@ from r1_world import (
     DISCOUNTS_USD,
     FACTS,
     INTERVIEWER_DEFLECTION,
-    LEARNER_DEFLECTION,
+    LEARNER_POLICY,
     UNSTATED_TOPICS,
     WORLD_SHA256,
     WORLD_VERSION,
@@ -29,7 +29,8 @@ from r1_world import (
 
 # Review pin: editing any fact changes WORLD_SHA256.  Update this constant, WORLD_REVISION
 # and tests/test_r1_content_pin.py together, in the same reviewed change.
-PINNED_WORLD_SHA256 = "6f3470d8dbb9b0cdcb6aa34fcde1e766b0dd4807e2aba81b3d10d8affd2ca199"
+# Revision 2 (R1-Q): the learner's catch-all deflection line became a policy text.
+PINNED_WORLD_SHA256 = "24e7bdf88197e29b3527fd2df1e29145ce866ce5430d5c6aab92168eb61eb4a2"
 
 
 class DeckFactsTests(unittest.TestCase):
@@ -193,12 +194,20 @@ class PinTests(unittest.TestCase):
 
 class DeflectionTests(unittest.TestCase):
     def test_deflection_lines(self):
-        self.assertEqual(LEARNER_DEFLECTION, "I'm not sure, I haven't thought about that.")
         self.assertEqual(
             INTERVIEWER_DEFLECTION,
             "That's a good question for the hiring team; they'll follow up with you on it.",
         )
         self.assertEqual(set(r1_world.DEFLECTION_POLICY), {"learner", "interviewer", "scorer"})
+
+    def test_the_learner_has_a_policy_and_no_stock_deflection_line(self):
+        """R1-Q: a catch-all line was spoken verbatim after unrelated questions."""
+        self.assertFalse(hasattr(r1_world, "LEARNER_DEFLECTION"))
+        self.assertNotIn("haven't thought about that", LEARNER_POLICY)
+        self.assertIn("ask the advisor", LEARNER_POLICY)
+        self.assertIn("backstory", LEARNER_POLICY)
+        self.assertIn("LEARNER_POLICY", r1_world.DEFLECTION_POLICY["learner"])
+        self.assertNotIn("exactly", r1_world.DEFLECTION_POLICY["learner"])
 
     def test_deck_conflicts_flag_only_what_the_deck_pins_down(self):
         self.assertEqual(

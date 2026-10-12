@@ -9,7 +9,7 @@ HERE = Path(__file__).resolve().parents[1]
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from r1_commitment import COMMITMENT_LINES
+from r1_commitment import COMMITMENT_LINES, Level, commitment_line
 from r1_personas import (
     ALL_PERSONA_NAMES,
     H_TOPICS,
@@ -44,6 +44,17 @@ PROBES = {
         "What's your target role and timeline?",
         "I want to understand what's driving your timeline.",
         "I'd love to understand why you're looking now.",
+        # R1-Q owner test b58c7d9c: the present tense and the "looking at our programs" forms.
+        "So what makes you come here?",
+        "Okay, so what brings you here like",
+        "Like I wanted to know like why are you looking at our programs",
+        "Why are you even interested in data science?",
+        "What is bringing you to us right now?",
+        "Do you think you will be a part of the group that will be getting laid off?",
+        "Are you worried about job security at your company?",
+        "So I wanted to wonder what makes you here, what makes you come here",
+        # Owner test turn 43: the layoffs question is the natural H1 opening (round 1 review).
+        "And what makes you get scared of layoffs?",
     ),
     "H2": (
         "What have you tried so far to learn this?",
@@ -58,6 +69,13 @@ PROBES = {
         "Tell me about any past attempts.",
         "What's the biggest gap you feel in your preparation?",
         "What got in the way last time?",
+        # R1-Q owner test b58c7d9c turn 34.
+        "What is the friction or blocker that you have in your career?",
+        "Any pain points with the way you are learning today?",
+        "Does the job search stress you out?",
+        "What's stopping you from making the switch?",
+        "Are you anxious about the switch?",
+        "I am trying to understand what the blockers are for you.",
     ),
     "H3": (
         "How many hours a week could you realistically put in?",
@@ -91,6 +109,10 @@ NEAR_MISSES = {
         "Which cohort would you like?",
         "Can I send you the curriculum?",
         "What are your thoughts on the program?",
+        # R1-Q: "what makes you think" asks for a reason, not a trigger; layoffs as a statement.
+        "What makes you think the course is expensive?",
+        "Layoffs are common in tech these days.",
+        "What brings people to data science these days?",
     ),
     "H2": (
         "We prepare engineers for interviews at top-tier tech companies.",
@@ -98,6 +120,8 @@ NEAR_MISSES = {
         "Our deep learning module is advanced.",
         "What is your experience with Python?",
         "Do you have an interview coming up?",
+        "Our stress-free schedule suits busy professionals.",
+        "There is no friction in the enrolment process.",
         "That's a great background.",
         "Can you tell me about yourself?",
         "How are you doing today?",
@@ -125,6 +149,12 @@ NEAR_MISSES = {
         "Are you available for a call tomorrow?",
         "Can we schedule a call for Thursday?",
         "Are you busy right now?",
+        # R1-Q owner test turn 78: an offer, not a question ("husband" and "doubts" are in it).
+        "Um, so, uh, when you call me back, in that case, I can also talk to your husband, you "
+        "know, in case if you have any doubts and, uh, I can also help him understand like why "
+        "the program is $8,500 and what are the packages that we will get.",
+        "Yeah, we have our own portal, so when you miss the live classes, you can request a "
+        "recording and your family does not need to worry.",
     ),
 }
 
@@ -192,7 +222,8 @@ class MarkerTests(unittest.TestCase):
     def test_markers_match_their_own_deep_need_and_nothing_public(self):
         scripted = [spec.line.format(decision_maker="husband") for spec in PLAN if spec.line]
         scripted.append(TIME_CUE_LINE)
-        scripted.extend(line.format(decision_maker="husband") for line in COMMITMENT_LINES.values())
+        scripted.extend(commitment_line(level, "husband") for level in COMMITMENT_LINES)
+        scripted.append(commitment_line(Level.MEDIUM, "husband", "tomorrow at 7 PM", moved=True))
         for persona in PERSONAS:
             for variant in persona.variants:
                 rendered = resolve_persona(persona.id, variant=variant.id)
@@ -220,6 +251,84 @@ class MarkerTests(unittest.TestCase):
         self.assertIn("H3", deep_need_topics_in(rendered, "I HAVE STUDENT LOANS."))
 
 
+class DisclosureLayerTests(unittest.TestCase):
+    """Surface -> hint -> deep, for every need of every persona (R1-Q item 4)."""
+
+    def each_need(self):
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                for need in persona.needs:
+                    with self.subTest(persona=persona.id, variant=variant.id, topic=need.topic):
+                        yield rendered, need
+
+    def test_every_need_has_a_hint_facts_and_stems(self):
+        for persona in PERSONAS:
+            for need in persona.needs:
+                with self.subTest(persona=persona.id, topic=need.topic):
+                    self.assertTrue(need.hint.strip())
+                    self.assertTrue(need.hint.endswith("."))
+                    self.assertTrue(2 <= len(need.facts) <= 3, need.facts)
+                    self.assertTrue(1 <= len(need.stems) <= 3, need.stems)
+                    self.assertEqual(len({need.surface, need.hint, need.deep}), 3)
+                    self.assertEqual(len(set(need.facts)), len(need.facts))
+
+    def test_a_hint_is_marker_free_so_it_can_be_spoken_before_any_release(self):
+        for rendered, need in self.each_need():
+            self.assertEqual(deep_need_topics_in(rendered, need.hint), frozenset(), need.hint)
+            self.assertEqual(deep_need_topics_in(rendered, need.surface), frozenset())
+
+    def test_a_hint_gives_a_little_feeling_but_no_number_cause_or_deep_text(self):
+        for rendered, need in self.each_need():
+            self.assertLessEqual(len(need.hint.split()), 22, need.hint)
+            self.assertFalse(any(ch.isdigit() for ch in need.hint), need.hint)
+            self.assertNotIn("$", need.hint)
+            self.assertEqual(len(need.hint.split(". ")), 1, need.hint)  # one sentence
+            self.assertNotIn(need.deep.lower(), need.hint.lower())
+            for fact in need.facts:
+                self.assertNotIn(fact.lower(), need.hint.lower())
+
+    def test_hints_stay_off_the_public_card_and_out_of_the_prefix(self):
+        from r1_prompts import learner_prefix
+
+        for rendered, need in self.each_need():
+            self.assertNotIn(need.hint, rendered.public_card_text())
+            self.assertNotIn(need.hint, learner_prefix(rendered))
+
+    def test_the_facts_together_carry_this_needs_markers_and_no_other_topics(self):
+        for rendered, need in self.each_need():
+            told = deep_need_topics_in(rendered, " ".join(need.facts))
+            self.assertEqual(told, {need.topic}, need.facts)
+
+    def test_each_stem_is_a_marker_hit_for_its_own_need_only(self):
+        """The reminder asks for the stem words so the reveal can be recorded."""
+        for rendered, need in self.each_need():
+            for stem in need.stems:
+                self.assertEqual(deep_need_topics_in(rendered, stem), {need.topic}, stem)
+                self.assertIn(stem.lower(), " ".join(need.facts).lower(), stem)
+
+    def test_facts_are_short_fragments_not_the_deep_sentence(self):
+        for rendered, need in self.each_need():
+            for fact in need.facts:
+                self.assertLessEqual(len(fact.split()), 14, fact)
+                self.assertNotEqual(fact.lower(), need.deep.lower())
+                self.assertNotIn(".", fact)
+                self.assertNotIn('"', fact)  # facts travel inside double quotes
+
+    def test_a_telling_built_from_the_stems_alone_registers_as_the_reveal(self):
+        for rendered, need in self.each_need():
+            told = deep_need_topics_in(rendered, "Honestly, " + ", and ".join(need.stems) + ".")
+            self.assertEqual(told, {need.topic}, need.stems)
+
+    def test_the_new_layers_are_ascii_and_the_accessors_agree(self):
+        for rendered, need in self.each_need():
+            for text in (need.hint, *need.facts, *need.stems):
+                self.assertTrue(text.isascii(), text)
+            self.assertEqual(rendered.hint(need.topic), need.hint)
+            self.assertEqual(rendered.facts(need.topic), need.facts)
+            self.assertEqual(rendered.stems(need.topic), need.stems)
+
+
 class PublicCardTests(unittest.TestCase):
     def test_public_card_never_contains_a_deep_need_or_other_persona(self):
         for persona in PERSONAS:
@@ -230,7 +339,12 @@ class PublicCardTests(unittest.TestCase):
                 self.assertIn(need.surface, card)
             self.assertIn("around $9,000", card)
             self.assertIn("6 months", card)
-            self.assertIn("I'm not sure, I haven't thought about that.", card)
+            # No stock deflection line (R1-Q): unknown course questions are asked back,
+            # unknown personal ones answered vaguely.
+            self.assertNotIn("I'm not sure, I haven't thought about that.", card)
+            self.assertNotIn("Anything else not listed here", card)
+            self.assertIn("you do not know it, so ask the advisor", card)
+            self.assertIn("invent no numbers, names or dates", card)
             self.assertIn("You can use the email on my form.", card)
             self.assertIn("A data role within a year.", card)
             self.assertIn("Within a couple of weeks.", card)
@@ -238,6 +352,45 @@ class PublicCardTests(unittest.TestCase):
             for other in PERSONAS:
                 if other.id != persona.id:
                     self.assertNotIn(other.variants[0].full_name, card)
+
+    def test_every_persona_has_a_public_backstory_on_the_card(self):
+        for persona in PERSONAS:
+            self.assertGreaterEqual(len(persona.backstory), 4, persona.id)
+            self.assertEqual(len(set(persona.backstory)), len(persona.backstory))
+            for variant in persona.variants:
+                card = resolve_persona(persona.id, variant=variant.id).public_card_text()
+                self.assertIn("Your backstory (all true", card)
+                for fact in persona.backstory:
+                    self.assertIn(fact, card)
+                # The backstory sits before the "short answers" so it reads as colour,
+                # not as an answer to recite.
+                self.assertLess(card.index(persona.backstory[0]), card.index("Short answers"))
+
+    def test_a_backstory_never_states_a_deep_need_or_matches_a_marker(self):
+        """It is public text: markers must not match it, and the deep text is not in it."""
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                for fact in persona.backstory:
+                    with self.subTest(persona=persona.id, fact=fact):
+                        self.assertEqual(deep_need_topics_in(rendered, fact), frozenset())
+                        for need in persona.needs:
+                            self.assertNotIn(need.deep.lower(), fact.lower())
+                            self.assertNotIn(need.surface.lower(), fact.lower())
+
+    def test_the_meera_backstory_uses_a_pharma_site_not_a_plant(self):
+        """"plant" is the H1 marker (plant consolidation); the public job is a pharma site."""
+        backstory = " ".join(PERSONAS[0].backstory).lower()
+        self.assertIn("batch records", backstory)
+        self.assertIn("pharma site", backstory)
+        self.assertNotRegex(backstory, r"\bplant\b")
+
+    def test_backstories_are_short_plain_sentences_without_numbers_that_invite_amounts(self):
+        for persona in PERSONAS:
+            for fact in persona.backstory:
+                self.assertLessEqual(len(fact.split()), 22, fact)
+                self.assertNotIn("$", fact)
+                self.assertTrue(fact.endswith("."), fact)
 
     def test_decision_timeline_and_switch_timeline_are_separate_facts(self):
         answers = dict(PUBLIC_ANSWERS)
@@ -314,6 +467,28 @@ class ProbeMatrixTests(unittest.TestCase):
                 with self.subTest(topic=topic, text=text):
                     self.assertEqual(detect_probes(text), frozenset())
 
+    def test_the_layoffs_question_is_h1_and_does_not_probe_h2(self):
+        """R1-Q round 1: "scared" released H2's deep need on an H1 question (owner test turn 43)."""
+        for text in (
+            "And what makes you get scared of layoffs?",
+            "Why do you think so? And what makes you get scared of layoffs.",
+            "Do you think you will be getting laid off? Like, why do you think so?",
+            "Are you stressed about job security at your company?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(detect_probes(text), frozenset({"H1"}))
+        # The fear words on their own are still an H2 probe (what held the learner back).
+        for text in (
+            "Does the job search stress you out?",
+            "Are you anxious about the switch?",
+            "What is it that scares or stresses you about learning this?",
+        ):
+            with self.subTest(text=text):
+                self.assertIn("H2", detect_probes(text))
+        # ... and a sentence of the same turn that is NOT about layoffs still counts for H2.
+        both = detect_probes("What makes you get scared of layoffs? Does the search stress you out?")
+        self.assertEqual(both, frozenset({"H1", "H2"}))
+
     def test_company_name_and_sign_off_never_unlock(self):
         """S0-B: 'Interview Kickstart' unlocked H2 in 71/71 runs, 'time' unlocked H3."""
         for text in (
@@ -358,6 +533,19 @@ class ProbeMatrixTests(unittest.TestCase):
 
 
 class FollowupTests(unittest.TestCase):
+    def test_like_what_is_a_follow_up_only_as_a_fragment(self):
+        """"Like what?" asks for an example; "like what is the friction ..." is a filler."""
+        for text in ("Like what?", "Okay, like what", "Like what."):
+            with self.subTest(text=text):
+                self.assertTrue(detect_followup(text), text)
+        for text in (
+            "Like I wanted to know like why are you looking at our programs, like what is the "
+            "friction or blocker that you have in your career.",
+            "I was wondering like what do you want.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(detect_followup(text), text)
+
     def test_generic_follow_ups(self):
         for text in (
             "Tell me more about that.",
@@ -425,6 +613,153 @@ class FollowUpScopeTests(unittest.TestCase):
                 self.assertEqual(update.released, ())
                 self.assertEqual(gate.state("H1"), NeedState.SURFACE)
                 self.assertEqual(gate.released_count, 0)
+
+
+class DeciderAnswerTests(unittest.TestCase):
+    """R1-Q iteration 1 (owner decision b.3): the card names who else decides, so the learner who is
+    asked never says "it's just me deciding" and later "I'd talk to my husband"."""
+
+    def test_every_card_has_one_public_decider_answer(self):
+        for persona in PERSONAS:
+            with self.subTest(persona=persona.id):
+                rendered = resolve_persona(persona.id, variant="v1")
+                card = rendered.public_card_text()
+                self.assertEqual(card.count(rendered.decider_answer), 1)
+                self.assertIn("who else is involved in your decision", card)
+                self.assertEqual(rendered.decider_answer, f"I'd talk it over with my {persona.decision_maker} first.")
+
+    def test_the_decider_answer_is_not_a_secret_a_number_or_a_commitment(self):
+        for persona in PERSONAS:
+            rendered = resolve_persona(persona.id, variant="v1")
+            with self.subTest(persona=persona.id):
+                self.assertEqual(deep_need_topics_in(rendered, rendered.decider_answer), frozenset())
+                self.assertEqual(detect_probes(rendered.decider_answer), frozenset())
+                self.assertNotRegex(rendered.decider_answer, r"\d")
+                rendered.decider_answer.encode("ascii")
+
+    def test_it_is_the_same_person_in_the_card_and_the_owed_objection(self):
+        from r1_scheduler import F4_PUSH, OwedMoveScheduler
+
+        for persona in PERSONAS:
+            rendered = resolve_persona(persona.id, variant="v1")
+            move = OwedMoveScheduler(rendered.decision_maker)._states[F4_PUSH]
+            with self.subTest(persona=persona.id):
+                self.assertIn(rendered.decision_maker, move.text)
+                self.assertIn(rendered.decision_maker, rendered.decider_answer)
+
+    def test_the_hints_carry_no_tic_word(self):
+        from r1_text import TIC_PATTERNS
+
+        for persona in PERSONAS:
+            for need in persona.needs:
+                for tic, pattern in TIC_PATTERNS.items():
+                    with self.subTest(persona=persona.id, topic=need.topic, tic=tic):
+                        self.assertIsNone(pattern.search(need.hint))
+                        self.assertIsNone(pattern.search(need.surface))
+
+
+class IterationThreeProbeTests(unittest.TestCase):
+    """R1-Q iteration 3 (D3): a probe is about the topic the question is about."""
+
+    def test_a_worry_word_next_to_money_or_time_is_an_h3_question_not_an_h2_one(self):
+        for text in (
+            "What's your biggest hesitation right now, the cost or the time?",
+            "Any concerns about the schedule?",
+            "What worries you about the price?",
+            "Do you have any doubts about the budget?",
+            "Is the time commitment a concern for your family?",
+        ):
+            with self.subTest(text=text):
+                found = detect_probes(text)
+                self.assertIn("H3", found, text)
+                self.assertNotIn("H2", found, text)
+
+    def test_a_worry_word_alone_or_with_h1_terms_keeps_its_topic(self):
+        self.assertEqual(detect_probes("What concerns do you have?"), frozenset({"H2"}))
+        self.assertEqual(detect_probes("What's your biggest worry?"), frozenset({"H2"}))
+        self.assertEqual(detect_probes("What scares you about the layoffs?"), frozenset({"H1"}))
+        self.assertIn("H2", detect_probes("What's held you back so far from starting?"))
+        self.assertIn("H2", detect_probes("What kept you from finishing the last course?"))
+
+    def test_a_close_or_a_request_is_not_a_probe(self):
+        for text in (
+            "So what do you think, does this sound like something worth exploring with your "
+            "father?",
+            "And if the details look good, would you want to aim for the upcoming cohort?",
+            "Does this sound good to you and your husband?",
+            "Can you get your husband on the phone now?",
+            "Could you ask your father to join us?",
+            "Would you let your partner know about the call?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(detect_probes(text), frozenset(), text)
+
+    def test_a_real_question_about_the_husband_still_is_one(self):
+        self.assertEqual(detect_probes("Who else is involved in the decision?"), frozenset({"H3"}))
+        self.assertEqual(
+            detect_probes("Is your father helping with the finances?"), frozenset({"H3"})
+        )
+
+    def test_a_close_is_not_a_dig_either(self):
+        from r1_personas import asks_about_learner
+
+        self.assertFalse(asks_about_learner("So what do you think, does this sound worth it?"))
+        self.assertFalse(asks_about_learner("Can you get your husband on the phone now?"))
+        self.assertTrue(asks_about_learner("What worries you most about the schedule?"))
+
+
+class FinalReviewRoundOneProbeTests(unittest.TestCase):
+    """R1-Q final review round 1: open digs and proposed calls."""
+
+    def test_an_open_question_digs_without_naming_a_topic(self):
+        from r1_personas import asks_open_question, detect_probes
+
+        for text in (
+            "What would help you two decide?",
+            "What would make it feel right?",
+            "What do you need to feel comfortable with this?",
+            "What's on your mind?",
+            "How does that sit with you?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(asks_open_question(text), text)
+                self.assertEqual(detect_probes(text), frozenset(), text)
+
+    def test_a_check_in_an_offer_a_choice_and_a_proposed_call_are_not_open_digs(self):
+        from r1_personas import asks_about_learner, asks_open_question
+
+        for text in (
+            "What do you think?",
+            "Would it help if I sent the syllabus?",
+            "Which plan would you like?",
+            "Does that sound good?",
+            "Would a quick call on Thursday help you decide?",
+            "How did you hear about us?",
+            "The course is six months.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(asks_open_question(text), text)
+        self.assertTrue(asks_about_learner("What would help you two decide?"))
+
+    def test_a_proposed_call_is_no_probe_and_no_dig_even_when_it_names_the_family(self):
+        from r1_personas import asks_about_learner, detect_probes
+
+        for text in (
+            "Would your husband join a short call on Thursday?",
+            "Can we get your husband on a call this weekend?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(detect_probes(text), frozenset(), text)
+                self.assertFalse(asks_about_learner(text), text)
+        # Ship restore round 2: "have a quick word" was a head-only call noun (it read "Could you have a
+        # word with your husband tonight?" as a call); production reads no call here, so the sentence is the
+        # H3 probe it is on production.
+        self.assertEqual(
+            detect_probes("Could your partner and I have a quick word on Saturday?"), frozenset({"H3"})
+        )
+        # a real question about the people in the decision is still one
+        self.assertEqual(detect_probes("Is your husband involved in the decision?"), frozenset({"H3"}))
+        self.assertTrue(asks_about_learner("Is he more of a sounding board, or does he need convincing?"))
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from r1_text import (
+    SpokenMemory,
     canonical_amounts,
     dollar_amounts,
     fold,
@@ -20,6 +21,8 @@ from r1_text import (
     mask_contact,
     negated_before,
     normalize,
+    pick_variant,
+    repeat_kind,
     split_sentences,
     truncate_words,
     word_count,
@@ -66,6 +69,36 @@ class SentenceTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(is_question_like(text))
 
+    def test_speech_to_text_openers_of_the_owner_test_are_questions(self):
+        """Turn 34 of b58c7d9c: "Like I wanted to know like why ..." was read as a pitch."""
+        for text in (
+            "Like I wanted to know like why are you looking at our programs",
+            "like what is the friction or blocker that you have in your career",
+            "I wanted to know what you do in your career",
+            "I wanted to ask how your week looks",
+            "I am trying to understand how we can help you fix that gap",
+            "I'm trying to understand what is stopping you",
+            "Trying to understand what brought you here",
+            "Um, I am trying to understand what you are looking for",
+            "Uh, like, I wanted to know why you signed up",
+            "So tell me what is going on at work",
+            "Hmm, what brings you here",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_question_like(text))
+
+    def test_wondering_and_wanting_to_wonder_open_a_question(self):
+        """Turn 25 of b58c7d9c: "So I wanted to wonder what makes you here ..." was no question."""
+        for text in (
+            "So I wanted to wonder what makes you here, bring what makes you come here",
+            "and also I was wondering like what do you want",
+            "I'm wondering what you do for work",
+            "I am wondering how your week looks",
+            "I wonder what made you sign up",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_question_like(text))
+
     def test_statements_are_not_questions(self):
         for text in (
             "Interview Kickstart was founded in 2014.",
@@ -73,9 +106,75 @@ class SentenceTests(unittest.TestCase):
             "That's a good question.",
             "Our career-transition support is strong",
             "",
+            "Like I said, we help you fix that gap.",
+            "I am trying to get you enrolled today.",
+            "Um, we offer live classes and recordings.",
+            "I wanted the best price for you.",
         ):
             with self.subTest(text=text):
                 self.assertFalse(is_question_like(text))
+
+    def test_when_asks_only_in_inverted_order(self):
+        """"When it comes to live classes, you can ask ..." is a subordinate clause (turns 37,
+        45, 51 and 78 of b58c7d9c), while "when can I expect your call back" asks."""
+        for text in (
+            "when can I expect your call back",
+            "so when exactly do you plan to decide",
+            "and when will you hear back",
+            "okay when are you hoping to start",
+            "Uh, when will you get back to me",
+            "when's the next cohort",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_question_like(text), text)
+        for text in (
+            "Like When it comes to live classes, you can ask them any questions you want.",
+            "You will land on something, but when it comes to our programs we really deliver.",
+            "Yeah, we have our own portal, so when you miss the live classes, you can request "
+            "a recording.",
+            "When you call me back, I can also talk to your husband.",
+            "Um, so, uh, when you call me back, in that case, I can also talk to your husband, "
+            "you know, in case if you have any doubts.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_question_like(text), text)
+
+    def test_a_wh_word_inside_an_offer_or_promise_is_not_a_question(self):
+        """Turn 78 of b58c7d9c: the advisor's offer ended "... why the program is $8,500 and
+        what are the packages that we will get" and read as a probe of H2 and H3."""
+        for text in (
+            "I can also help him understand like why the program is $8,500 and what are the "
+            "packages that we will get",
+            "We will explain why it costs this and what you get for it",
+            "I'll walk you through how it works and what the options are",
+            "so what we can do is send you the details",
+            "and what I mean is the cohort is limited",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_question_like(text), text)
+
+    def test_a_run_on_question_after_a_conjunction_is_still_a_question(self):
+        for text in (
+            "okay and what are the packages",
+            "I'm great, thank you, so what do you do for work",
+            "Yeah I just got a call from you and uh so why are you looking at our programs",
+            "that makes sense and how many hours a week can you give it",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_question_like(text), text)
+
+    def test_the_full_turn_78_offer_is_no_probe_at_all(self):
+        from r1_personas import detect_probes
+
+        turn_78 = (
+            "Oh, fine. Um, so, uh, when you call me back, in that case, I can also talk to your "
+            "husband, you know, in case if you have any doubts and, uh, I can also help him "
+            "understand like why the program is $8,500 and what are the packages that we will "
+            "getting. I maybe I will give him the entire curriculum details so that he will "
+            "also understand and, uh, you know, support you in this entire process."
+        )
+        self.assertEqual(detect_probes(turn_78), frozenset())
+        self.assertFalse(any(is_question_like(s) for s in split_sentences(turn_78)))
 
 
 class FuzzyTests(unittest.TestCase):
@@ -92,6 +191,99 @@ class FuzzyTests(unittest.TestCase):
 
     def test_order_matters(self):
         self.assertFalse(fuzzy_contains("recorded classes live or it is", self.LINE))
+
+
+class SpokenMemoryTests(unittest.TestCase):
+    STALL = "Let me think about it. Just email me the details and I'll get back to you."
+
+    def test_it_remembers_sentences_long_enough_to_be_repeated(self):
+        memory = SpokenMemory()
+        self.assertEqual(memory.add(self.STALL), 2)
+        self.assertEqual(len(memory), 2)
+        self.assertEqual(memory.add("Okay. Mm-hmm. That makes sense."), 0)
+        self.assertEqual(len(memory), 2)
+
+    def test_it_keeps_a_normalised_form_and_ignores_duplicates(self):
+        memory = SpokenMemory()
+        memory.add("I've tried a bit of online stuff before.")
+        memory.add("I’ve TRIED a bit of online stuff before!")
+        self.assertEqual(memory.snapshot(), ("ive tried a bit of online stuff before",))
+
+    def test_a_snapshot_is_immutable_and_does_not_follow_later_additions(self):
+        memory = SpokenMemory()
+        before = memory.snapshot()
+        memory.add(self.STALL)
+        self.assertEqual(before, ())
+        self.assertIsInstance(memory.snapshot(), tuple)
+
+    def test_empty_and_odd_input_is_harmless(self):
+        memory = SpokenMemory()
+        for text in ("", None, "   ", "...", 42):
+            memory.add(text)
+        self.assertEqual(len(memory), 0)
+
+
+class RepeatKindTests(unittest.TestCase):
+    SAID = SpokenMemory()
+    SAID.add("Just exploring options. I've tried a bit of online stuff before.")
+    SAID.add("Let me think about it. Just email me the details and I'll get back to you.")
+    SNAP = SAID.snapshot()
+
+    def test_an_exact_repeat_needs_four_words(self):
+        self.assertEqual(repeat_kind("I've tried a bit of online stuff before!", self.SNAP), "exact")
+        self.assertEqual(repeat_kind("Let me think about it.", self.SNAP), "exact")
+        self.assertIsNone(repeat_kind("Just exploring options.", self.SNAP))  # 3 words
+
+    def test_a_sentence_inside_an_earlier_one_is_a_near_repeat(self):
+        self.assertEqual(repeat_kind("Just email me the details.", self.SNAP), "near")
+
+    def test_a_sentence_containing_an_earlier_one_is_a_near_repeat(self):
+        said = SpokenMemory()
+        said.add("I quit a free Python course.")
+        self.assertEqual(
+            repeat_kind("Honestly I quit a free Python course last year.", said.snapshot()), "near"
+        )
+
+    def test_four_content_words_are_needed_for_a_near_repeat(self):
+        said = SpokenMemory()
+        said.add("Fine, that is a good point.")
+        # Only three content words (that, good, point): too little to call it a repeat.
+        self.assertIsNone(repeat_kind("That is a good point.", said.snapshot()))
+        self.assertIsNone(repeat_kind("Good point.", said.snapshot()))
+        self.assertEqual(repeat_kind("Fine, that is a good point.", said.snapshot()), "exact")
+
+    def test_order_matters_and_one_missing_word_in_four_is_not_a_repeat(self):
+        said = SpokenMemory()
+        said.add("I quit a free Python course.")
+        self.assertIsNone(repeat_kind("Course free Python quit.", said.snapshot()))
+        self.assertIsNone(repeat_kind("I quit a paid Python course.", said.snapshot()))
+
+    def test_nothing_said_means_no_repeat(self):
+        self.assertIsNone(repeat_kind("I've tried a bit of online stuff before.", ()))
+        self.assertIsNone(repeat_kind("", self.SNAP))
+
+
+class PickVariantTests(unittest.TestCase):
+    VARIANTS = ("a", "b", "c")
+
+    def test_no_seed_starts_at_the_first_variant_and_walks_the_rotation(self):
+        self.assertEqual([pick_variant(self.VARIANTS, "", n) for n in range(4)], list("abca"))
+
+    def test_the_start_is_deterministic_per_seed_and_varies_across_seeds(self):
+        self.assertEqual(
+            pick_variant(self.VARIANTS, "attempt-1", 0), pick_variant(self.VARIANTS, "attempt-1", 0)
+        )
+        starts = {pick_variant(self.VARIANTS, f"attempt-{n}", 0) for n in range(40)}
+        self.assertEqual(starts, set(self.VARIANTS))
+
+    def test_a_full_rotation_uses_every_variant_once(self):
+        for seed in ("x", "attempt-9", "b58c7d9c"):
+            used = [pick_variant(self.VARIANTS, seed, n) for n in range(3)]
+            self.assertEqual(sorted(used), list("abc"))
+
+    def test_no_variants_and_negative_counts_are_safe(self):
+        self.assertEqual(pick_variant((), "x", 3), "")
+        self.assertEqual(pick_variant(self.VARIANTS, "", -5), "a")
 
 
 class ContactTests(unittest.TestCase):
@@ -263,6 +455,171 @@ class CanonicalAmountTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(dollar_amounts(canonical_amounts(text)), dollar_amounts(text))
                 self.assertEqual(dollar_amounts(text), [1500])
+
+
+class SpeakingStyleHelperTests(unittest.TestCase):
+    """R1-Q iteration 1: the opener word and the tic words of a reply (shared by the guard and the
+    engine's style memory; the rehearsal harness keeps its own copy of the same idea)."""
+
+    def test_the_opener_is_the_first_word_in_lower_case(self):
+        from r1_text import reply_opener
+
+        for text, expected in (
+            ("Hmm, that makes sense.", "hmm"),
+            ("That's fair.", "that"),
+            ("  \"Okay.\"", "okay"),
+            ("I'm not sure.", "i"),
+            ("Mm-hmm, right.", "mm"),
+            ("...Well, maybe.", "well"),
+            ("", ""),
+            ("$7,000 is a lot.", "is"),  # digits are skipped: the first word is the first letters
+            (None, ""),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(reply_opener(text), expected)
+
+    def test_the_tic_words_a_reply_holds(self):
+        from r1_text import reply_tics
+
+        for text, expected in (
+            ("Hmm, that makes sense.", ("hmm",)),
+            ("Honestly, I am not sure.", ("honestly",)),
+            ("Hmm... to be honest, it is a lot.", ("hmm", "honestly")),
+            ("Frankly, no.", ("honestly",)),
+            ("Mm-hmm, I follow.", ()),
+            ("Whim and hmmm.", ("hmm",)),
+            ("The hmmer is broken.", ()),
+            ("That is an honest question.", ()),
+            ("", ()),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(reply_tics(text), expected)
+
+    def test_the_tic_patterns_are_linear_on_hostile_text(self):
+        import time
+        from r1_text import reply_tics
+
+        started = time.perf_counter()
+        reply_tics("hm" * 40000 + " honest" * 20000)
+        self.assertLess(time.perf_counter() - started, 2.0)
+
+
+class IterationThreeTextTests(unittest.TestCase):
+    """R1-Q iteration 3: the concession tag, the goodbye and the hollow advisor turn."""
+
+    def test_the_concession_tag_is_found_in_its_live_forms(self):
+        from r1_text import PHRASE_CONCESSION_TAG, reply_phrases
+
+        for text in (
+            "That's a nice drop, I'll give you that.",
+            "I'll admit, that's a lot of value.",
+            "That's a nice surprise, I won't pretend it isn't.",
+            "The pedigree sounds impressive, I won't pretend otherwise.",
+            "It helps, I'll say that.",
+            "I have to admit that surprised me.",
+        ):
+            with self.subTest(text=text):
+                self.assertIn(PHRASE_CONCESSION_TAG, reply_phrases(text))
+        for text in (
+            "I won't pretend to know the details.",
+            "That's a lot of value for the money.",
+            "I need to be honest with myself about this.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn(PHRASE_CONCESSION_TAG, reply_phrases(text))
+
+    def test_a_goodbye_is_found_and_an_ordinary_stall_is_not(self):
+        from r1_text import is_closer
+
+        for text in (
+            "I'll reach out once I've talked things through at home.",
+            "Thanks for your time.",
+            "I'll let you know either way once I've decided. Thanks again for the call.",
+            "Thanks for walking me through it.",
+            "I think I've got what I needed. Take care.",
+            "Okay, bye.",
+            "I should let you go.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_closer(text), text)
+        for text in (
+            "I'll think it over and get back to you.",
+            "What would I actually build in the course?",
+            "Thanks, that helps with the schedule worry.",
+            "I need to talk to my husband first.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_closer(text), text)
+
+    def test_a_hollow_advisor_turn_has_nothing_to_answer(self):
+        from r1_text import is_hollow_turn
+
+        for text in ("Sure.", "Okay.", "Mm-hmm.", "Glad it helped.", "Of course.", "That's fair."):
+            with self.subTest(text=text):
+                self.assertTrue(is_hollow_turn(text), text)
+        for text in (
+            "",
+            "Any questions before we wrap?",
+            "Take your time and think it over.",
+            "What's holding you back?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_hollow_turn(text), text)
+
+
+class FinalReviewRoundOnePhraseTests(unittest.TestCase):
+    """R1-Q final review round 1: the stall loop's tracked phrases."""
+
+    def test_the_decider_stall_the_closer_and_the_money_line_are_tracked(self):
+        from r1_text import (
+            PHRASE_DECIDER_STALL,
+            PHRASE_MONEY_STRAIN,
+            PHRASE_STALL_CLOSER,
+            reply_phrases,
+        )
+
+        cases = {
+            PHRASE_DECIDER_STALL: (
+                "I'd want to talk it through with my father first.",
+                "Let me run it by my husband before I decide.",
+                "I should check with him before I say yes.",
+                "I'd go over it with my partner.",
+            ),
+            PHRASE_STALL_CLOSER: (
+                "I'll get back to you.",
+                "Let me think about it.",
+                "I'll let you know.",
+                "I'll be in touch.",
+            ),
+            PHRASE_MONEY_STRAIN: (
+                "It's still more than I planned for.",
+                "I'm still worried about the cost.",
+                "That's still a lot for me.",
+                "It was more than I had planned for.",
+            ),
+        }
+        for phrase, texts in cases.items():
+            for text in texts:
+                with self.subTest(text=text):
+                    self.assertIn(phrase, reply_phrases(text))
+        for text in (
+            "My husband is great, by the way.",
+            "The course is six months.",
+            "How much does it cost?",
+            "I think I follow.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(reply_phrases(text), ())
+
+    def test_the_quotas_and_windows_are_declared_for_every_tracked_stall(self):
+        import r1_guard
+        from r1_text import PHRASE_DECIDER_STALL, PHRASE_MONEY_STRAIN, PHRASE_STALL_CLOSER
+
+        for phrase in (PHRASE_DECIDER_STALL, PHRASE_STALL_CLOSER, PHRASE_MONEY_STRAIN):
+            self.assertIn(phrase, r1_guard.PHRASE_QUOTA)
+            self.assertIn(phrase, r1_guard.PHRASE_WINDOW)
+            self.assertGreaterEqual(r1_guard.PHRASE_QUOTA[phrase], 1)
+            self.assertGreaterEqual(r1_guard.PHRASE_WINDOW[phrase], 3)
 
 
 if __name__ == "__main__":

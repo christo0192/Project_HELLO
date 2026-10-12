@@ -71,6 +71,18 @@ class TableTests(unittest.TestCase):
                 compared += 1
         self.assertGreaterEqual(compared, 14)
 
+    def test_the_learner_filler_is_a_three_variant_rotation_led_by_the_classic_line(self):
+        variants = r1_script.LEARNER_FILLER_VARIANTS
+        self.assertEqual(len(variants), 3)
+        self.assertEqual(len(set(variants)), 3)
+        self.assertEqual(variants[0], LINES["L-FILLER-LEARNER"])
+        self.assertEqual(variants[0], filler_line("learner"))
+        for text in variants:
+            self.assertLessEqual(len(text.split()), 7, text)
+            self.assertTrue(text.endswith("..."), text)
+            self.assertNotEqual(text, LINES["L-FILLER-INTERVIEWER"])
+            self.assertFalse(text.isupper())
+
     def test_the_opening_and_transition_say_what_the_plan_says(self):
         self.assertIn("an AI interviewer from Interview Kickstart", LINES["L-OPEN"])
         self.assertIn("about twenty minutes", LINES["L-OPEN"])
@@ -177,7 +189,7 @@ class RenderTests(unittest.TestCase):
                          "Atlanta, Georgia")
 
     def test_fillers_follow_the_voice(self):
-        self.assertEqual(filler_line("learner"), "Hmm, one second...")
+        self.assertEqual(filler_line("learner"), "One second...")
         self.assertEqual(filler_line("interviewer"), "Let me think about that for a second.")
 
     def test_line_sha_is_the_digest_of_the_exact_text(self):

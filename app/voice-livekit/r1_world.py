@@ -23,7 +23,8 @@ from dataclasses import dataclass
 from r1_script import LINES
 from r1_text import dollar_amounts, fold, negated_before, split_sentences
 
-WORLD_REVISION = 1
+# 2: the learner's catch-all deflection line is replaced by a policy (R1-Q).
+WORLD_REVISION = 2
 DECK_TITLE = "Interview Kickstart (IK) Sales Mock Preparation Guide"
 DECK_FILENAME = "Copy of Sales Mock Call Prep Document_Updated.pdf"
 DECK_PAGES = 3
@@ -222,7 +223,14 @@ UNSTATED_TOPICS: tuple[UnstatedTopic, ...] = (
     UnstatedTopic("role_next_steps", "next-step timelines or hiring decisions"),
 )
 
-LEARNER_DEFLECTION = "I'm not sure, I haven't thought about that."
+# The learner has NO scripted deflection line: a catch-all "I'm not sure, I haven't thought
+# about that." was spoken verbatim after unrelated questions and read as a non-answer
+# (R1-Q).  This policy tells the model what to do instead of what to say.
+LEARNER_POLICY = (
+    "About the course you know only the price and the duration: ask the advisor for "
+    "anything else instead of guessing. About your own life, answer briefly from your "
+    "backstory and never invent numbers, names or dates."
+)
 INTERVIEWER_DEFLECTION = LINES["L-FAQ-DEFER"]
 SCORER_RULE = (
     "Claims consistent with the deck are legitimate. Plausible specifics the deck does "
@@ -233,8 +241,9 @@ SCORER_RULE = (
 DEFLECTION_POLICY = {
     "learner": (
         "Never assert a product fact. If the advisor asks about anything off the public "
-        "card, answer with LEARNER_DEFLECTION. If the advisor asserts something unstated "
-        "or beyond the deck, accept it without correcting it."
+        "card, follow LEARNER_POLICY: ask rather than guess, and never recite a stock "
+        "line. If the advisor asserts something unstated or beyond the deck, accept it "
+        "without correcting it."
     ),
     "interviewer": (
         "Answer only role questions covered by the interviewer FAQ facts. For anything "
@@ -262,7 +271,7 @@ def _canonical() -> bytes:
         "urgency_levers": list(URGENCY_LEVER_IDS),
         "unstated": [{"id": t.id, "label": t.label} for t in UNSTATED_TOPICS],
         "deflections": {
-            "learner": LEARNER_DEFLECTION,
+            "learner_policy": LEARNER_POLICY,
             "interviewer": INTERVIEWER_DEFLECTION,
             "policy": DEFLECTION_POLICY,
         },
