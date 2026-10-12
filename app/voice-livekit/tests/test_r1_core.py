@@ -6442,6 +6442,123 @@ class TestTurnAnchors(R1TestCase):
         index = self.say_as_candidate("early final", final_at=self.T0 + 11.0)
         self.assertEqual(await self.anchor_of(index), 1_760_000_010_000)  # (12.0 is a resumption AFTER the final)
 
+    # ---- Review round 3: a burst stays inside its own turn -------------------------------------
+
+    def final(self, text: str, at: float) -> None:
+        """One more final transcript for the candidate's row (opens it when none is open)."""
+        self.session.emit(
+            "user_input_transcribed",
+            SimpleNamespace(is_final=True, transcript=text, created_at=self.T0 + at),
+        )
+
+    async def test_a_burst_never_reaches_back_into_the_previous_row_across_a_bot_line(self) -> None:
+        """Speech at T+10 and T+12 (an answer with a pause), committed; the bot speaks from T+15; the next
+        answer starts at T+16, within 4 s of the old resumption.  A committed row and a bot line lie
+        between them, so the anchor is T+16, not T+10 in the previous row."""
+        self.candidate_speaks(10.0, 12.0)
+        first = self.say_as_candidate("my first answer", final_at=self.T0 + 13.0)
+        self.speak("And then?", created_at=self.T0 + 15.0)
+        self.candidate_speaks(16.0)
+        second = self.say_as_candidate("my second answer", final_at=self.T0 + 18.0)
+        self.assertEqual(await self.anchor_of(first), 1_760_000_010_000)
+        self.assertEqual(await self.anchor_of(second), 1_760_000_016_000)
+
+    async def test_a_burst_never_reaches_back_past_the_previous_rows_commit(self) -> None:
+        """No bot line in between (the reply was suppressed): the commit of the previous row alone is the wall."""
+        self.candidate_speaks(10.0)
+        first = self.say_as_candidate("one", final_at=self.T0 + 11.5)  # (flushed = committed)
+        self.candidate_speaks(13.0)  # 3 s after the old start: inside the burst gap
+        second = self.say_as_candidate("two", final_at=self.T0 + 15.0)
+        self.assertEqual(await self.anchor_of(first), 1_760_000_010_000)
+        self.assertEqual(await self.anchor_of(second), 1_760_000_013_000)
+
+    async def test_the_previous_rows_commit_is_after_its_last_final_not_its_first(self) -> None:
+        """Row one holds speech from T+10 to T+13.5, finals at T+11 and T+14.  Speech at T+17 is the next
+        answer; T+13.5 is after row one's FIRST final but before its last, so it is still row one's."""
+        self.candidate_speaks(10.0, 13.5)
+        self.final("the first part", 11.0)
+        self.final("and the second part", 14.0)
+        first = self.interview._open_row.index
+        self.interview._flush_candidate_row()
+        self.candidate_speaks(17.0)
+        second = self.say_as_candidate("the next answer", final_at=self.T0 + 19.0)
+        self.assertEqual(await self.anchor_of(first), 1_760_000_010_000)
+        self.assertEqual(await self.anchor_of(second), 1_760_000_017_000)
+
+    async def test_a_burst_never_reaches_back_before_the_start_of_a_bot_line(self) -> None:
+        """A blip of speech (no final, no row), the bot speaks, the candidate answers 2 s later."""
+        self.candidate_speaks(20.0)
+        self.speak("Take your time.", created_at=self.T0 + 21.0)
+        self.candidate_speaks(23.0)
+        index = self.say_as_candidate("here is my answer", final_at=self.T0 + 25.0)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_023_000)
+
+    async def test_a_bot_line_with_no_time_of_its_own_still_walls_off_everything_before_it(self) -> None:
+        """The claim came with the delivered item, no speaking event (so no created_at): the wall is the
+        moment of the claim, never earlier, so nothing already heard can be walked back to."""
+        self.candidate_speaks(10.0, 12.0)
+        self.speak("silent claim", claim=False)
+        self.candidate_speaks(13.0)
+        index = self.say_as_candidate("the answer", final_at=self.T0 + 14.0)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_013_000)
+
+    async def test_a_pause_and_resume_after_a_boundary_is_still_one_burst(self) -> None:
+        """The wall is not a reason to give up the start of an answer that came after it."""
+        self.candidate_speaks(1.0)
+        first = self.say_as_candidate("one", final_at=self.T0 + 2.5)
+        self.speak("Go on.", created_at=self.T0 + 4.0)
+        self.candidate_speaks(10.0, 12.6, 15.0)  # pause, resume, pause, resume: every gap under 4 s
+        second = self.say_as_candidate("so in my last role", final_at=self.T0 + 16.0)
+        self.assertEqual(await self.anchor_of(first), 1_760_000_001_000)
+        self.assertEqual(await self.anchor_of(second), 1_760_000_010_000)
+
+    async def test_speech_at_the_instant_a_bot_line_begins_is_the_candidates_not_behind_the_wall(self) -> None:
+        """The candidate started talking as the line began (talking over it): that start is theirs."""
+        self.candidate_speaks(12.0)
+        self.speak("Let me ask", created_at=self.T0 + 12.0)
+        self.candidate_speaks(15.0)
+        index = self.say_as_candidate("sorry, to answer that", final_at=self.T0 + 16.0)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_012_000)
+
+    async def test_a_bot_line_that_starts_over_an_uncommitted_row_closes_it_and_walls_it_off(self) -> None:
+        """No commit yet (the SDK is still waiting out the pause): the bot's claim closes the row, and
+        what the candidate says next is a new row that cannot be anchored back into the first."""
+        self.candidate_speaks(10.0)
+        self.final("an answer nobody has committed", 11.0)
+        first = self.interview._open_row.index
+        self.speak("If I may.", created_at=self.T0 + 12.0)
+        self.assertIsNone(self.interview._open_row)
+        self.candidate_speaks(13.0)
+        second = self.say_as_candidate("what I mean is", final_at=self.T0 + 15.0)
+        self.assertEqual(await self.anchor_of(first), 1_760_000_010_000)
+        self.assertEqual(await self.anchor_of(second), 1_760_000_013_000)
+
+    async def test_the_wall_only_moves_forward_and_ignores_what_is_not_a_time(self) -> None:
+        self.interview._raise_anchor_floor(self.T0 + 5)
+        for bad in (None, True, "soon", float("nan"), float("inf"), [1]):
+            with self.subTest(value=bad):
+                self.assertFalse(self.interview._raise_anchor_floor(bad))
+                self.assertEqual(self.interview._anchor_floor, self.T0 + 5)
+        self.assertTrue(self.interview._raise_anchor_floor(self.T0 + 2))  # a usable time, but earlier
+        self.assertEqual(self.interview._anchor_floor, self.T0 + 5)
+        self.assertTrue(self.interview._raise_anchor_floor(self.T0 + 9))
+        self.assertEqual(self.interview._anchor_floor, self.T0 + 9)
+
+    async def test_a_bot_line_whose_time_is_garbage_is_walled_at_the_claim_not_ignored(self) -> None:
+        self.candidate_speaks(10.0, 12.0)
+        self.interview._reserve_bot_index(float("nan"))
+        self.candidate_speaks(13.0)
+        index = self.say_as_candidate("the answer", final_at=self.T0 + 14.0)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_013_000)
+
+    async def test_the_wall_only_limits_the_walk_back_the_latest_event_is_still_the_base(self) -> None:
+        """Speech that began just before a bot line and carried on into it (no new speaking event after
+        the line began) still anchors where it began: the base event is the SDK's latest, as before."""
+        self.candidate_speaks(11.9)
+        self.speak("Mm-hm.", created_at=self.T0 + 12.0)
+        index = self.say_as_candidate("and so I decided", final_at=self.T0 + 14.0)
+        self.assertEqual(await self.anchor_of(index), 1_760_000_011_900)
+
     async def test_a_speaking_event_more_than_30_seconds_earlier_is_another_utterance(self) -> None:
         index = self.say_as_candidate("late", spoke_at=self.T0, final_at=self.T0 + 30.0)
         self.assertEqual(await self.anchor_of(index), 1_760_000_000_000)  # exactly 30 s: still this turn

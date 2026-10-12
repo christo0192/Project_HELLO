@@ -1956,6 +1956,15 @@ disabled or deleted: the spool was overwritten and nothing more is sent), `r1_re
   made, in the gate, in finalize and in the session-scoped erase job alike. **DSAR** erases every recording of the candidate and verifies it BEFORE any row is deleted; a failure
   leaves the DSAR `in_progress`. Both use one routine: abort multipart uploads, delete every key under the prefix, verify the
   prefix is empty and each key answers 404, only then tombstone the row (`deleted`, bytes and hash kept as evidence).
+- **Known gap: a retake whose new consent leaves recording out.** A retake under a newer consent template that does not
+  contain `video_audio_recording` closes the old consent as `superseded`, and a supersede is not a withdrawal (see above), so
+  nothing is erased: the earlier attempt's recording stays `ready` and playable by staff until its `delete_after` (at most
+  90 days after it was made) or a DSAR. The retake itself is not recorded (`/context` answers `recording.mode='off'`, every
+  worker route answers 409 `r1_consent_withdrawn`, the worker discards). This is deliberate (a template bump must not erase
+  consented recordings), but it means a candidate who re-consents without recording has NOT asked for the earlier recording
+  to go. If they do ask, record it as a withdrawal or decline of the live consent (that erases every earlier recording of the
+  round) or run a DSAR; this PR has no per-recording staff erase route. Decide before Stage B whether the re-consent step
+  should ask about the earlier recording explicitly.
 - **Legal hold** blocks erasure (`erasure_blocked_legal_hold`, audited at most daily) for holds on the candidate, the
   session or the recording. The copy of held objects to a `legal-hold/` prefix outside the 97-day rule is NOT built: a hold
   placed on an R1 candidate would still lose its objects at 97 days. No hold can exist in Stage A (staff only); build the copy

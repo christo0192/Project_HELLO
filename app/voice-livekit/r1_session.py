@@ -961,6 +961,9 @@ class _CandidateRow:
     # Epoch milliseconds the candidate began speaking this turn (``turn_started_at_ms``), or None
     # when the SDK gave no usable speaking event (``_candidate_turn_anchor``).
     started_at_ms: int | None = None
+    # Wall-clock seconds (the SDK's event clock) of the row's latest final: when the row is
+    # written, nothing the candidate said up to here belongs to a later row (``_anchor_floor``).
+    last_final_at: float | None = None
 
 
 # The recording's turn anchor (``transcript_turns.turn_started_at_ms``, migration 0026) must lie in
@@ -970,7 +973,9 @@ _EPOCH_MS_LIMIT = 4_102_444_800_000
 _USER_SPEECH_ANCHOR_MAX_AGE_SECONDS = 30.0
 # Speaking events this close together (start to start) are one burst of speech with a pause in it:
 # the candidate paused, the VAD went back to listening, and they carried on before the STT handed
-# over the first final.  Further apart, a bot line or a long silence has come between them.
+# over the first final.  Further apart, a bot line or a long silence has come between them.  Close
+# together is not enough on its own: a burst never reaches back past ``R1Interview._anchor_floor``
+# (the previous row's commit, the start of a bot line), however short the gap across it.
 _USER_SPEECH_BURST_GAP_SECONDS = 4.0
 _USER_SPEECH_ANCHORS_KEPT = 8
 
@@ -1051,6 +1056,10 @@ class R1Interview:
         # Wall-clock seconds of the latest ``user_state_changed -> speaking`` events (oldest first):
         # the anchors of the candidate's rows (``_candidate_turn_anchor``).
         self._user_speaking_at: deque[float] = deque(maxlen=_USER_SPEECH_ANCHORS_KEPT)
+        # The wall (wall-clock seconds, the same clock) a candidate row's burst of speaking events
+        # may not be walked back across: the latest of the last final of every candidate row
+        # already written (its commit) and the start of every bot line.  Only ever raised.
+        self._anchor_floor: float = 0.0
         self._candidate_activity_at: float | None = None
         self._icebreaker_hold_since: float | None = None
         self._replies_cancelled_before_audio = 0
@@ -3180,6 +3189,7 @@ class R1Interview:
                 self._candidate_turn_anchor(event),
             )
         row.parts.append(text)
+        row.last_final_at = self._event_seconds(event)
         self._latest_candidate_index = row.index  # the SDK turn that follows is judged at this row
         self._learn_spoken_name(" ".join(row.parts))
         self.note_turn(text)
@@ -3196,6 +3206,8 @@ class R1Interview:
         row, self._open_row = self._open_row, None
         if row is None:
             return
+        # The row is over: speech heard up to its last final is its own, never a later row's.
+        self._raise_anchor_floor(row.last_final_at)
         self._write_turn(
             row.index, "candidate", " ".join(row.parts), row.phase, started_at_ms=row.started_at_ms
         )
@@ -3212,14 +3224,23 @@ class R1Interview:
         speaking by then; the latest event alone would put the seek a pause's length into the
         answer and skip its first words.  It is the SDK's own event time (``created_at``), never
         the write time, so the recording's click-to-seek lands where the candidate started.
+
+        The walk never crosses ``_anchor_floor``: the last final of the previous candidate row
+        (the SDK committed it, so everything it heard is that row's) or the start of a bot line
+        after it.  An answer that begins right after a bot line is within the burst gap of the
+        speech before that line, but it is another turn; reaching back into it would put the seek
+        in the previous row.  The latest event itself is not held to the wall: it is the SDK's
+        own last word on when the candidate started, and a candidate who began speaking just as
+        a line began (or talked over it) owns that start.
         """
-        created = getattr(event, "created_at", None)
-        final_at = created if isinstance(created, (int, float)) and not isinstance(created, bool) else time.time()
+        final_at = self._event_seconds(event)
         before = sorted(spoke for spoke in self._user_speaking_at if spoke <= final_at)
         if not before or final_at - before[-1] > _USER_SPEECH_ANCHOR_MAX_AGE_SECONDS:
             return None
         start = before[-1]
         for earlier in reversed(before[:-1]):
+            if earlier < self._anchor_floor:
+                break  # before the previous row's commit or a bot line: another turn
             if start - earlier > _USER_SPEECH_BURST_GAP_SECONDS:
                 break
             if final_at - earlier > _USER_SPEECH_ANCHOR_MAX_AGE_SECONDS:
@@ -3227,14 +3248,33 @@ class R1Interview:
             start = earlier
         return _epoch_ms(start)
 
-    def _reserve_bot_index(self) -> int:
+    @staticmethod
+    def _event_seconds(event: Any) -> float:
+        """The SDK event's own wall-clock time (``created_at``); now, for an event without one."""
+        created = getattr(event, "created_at", None)
+        return created if isinstance(created, (int, float)) and not isinstance(created, bool) else time.time()
+
+    def _raise_anchor_floor(self, seconds: Any) -> bool:
+        """Move the wall for candidate bursts forward to ``seconds``; False when that is no usable time."""
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
+            return False
+        self._anchor_floor = max(self._anchor_floor, float(seconds))
+        return True
+
+    def _reserve_bot_index(self, started_at: float | None = None) -> int:
         """Reserve a transcript position for a bot speech, closing the candidate's open row first.
 
         The row keeps the (lower) index it reserved at its first final, so closing it here only
         decides that the candidate's NEXT words are a new row after this speech, which is where
-        they were said.
+        they were said.  ``started_at`` is when the speech began (the ``speaking`` event's time):
+        the candidate's speech from before that, even a moment before, is not part of a burst
+        that leads to a later row.  Without a time the claim itself is the latest it can have
+        begun, which errs on the side of the wall (a burst that is cut short, never one that
+        reaches back across the line).
         """
         self._flush_candidate_row()
+        if not self._raise_anchor_floor(started_at):
+            self._raise_anchor_floor(time.time())
         return self._reserve_turn_index()
 
     def _candidate_turn_open(self) -> bool:
@@ -3269,7 +3309,7 @@ class R1Interview:
         bot row's turn anchor when the delivered item carries no metrics of its own.
         """
         if slot.index is None:
-            slot.index = self._reserve_bot_index()
+            slot.index = self._reserve_bot_index(started_at)
             slot.phase = self.machine.transcript_phase()
             slot.started_at = started_at
             self._unvoiced_since = None  # the candidate hears something: the wait is over
