@@ -725,7 +725,9 @@ describe('OpenAPI document integrity', () => {
     // (inline bodies, no new schema). 164 + 1 = 165.
     // R1-REC adds FOUR worker-only paths under /api/internal/r1/recording/ — prepare, part-url,
     // object-url and complete (inline bodies, no new schema). 165 + 4 = 169.
-    expect(Object.keys(paths).length).toBe(169);
+    // R1-REC adds TWO staff paths: GET /api/interview-rounds/{id}/recording (the playback mint) and
+    // GET /api/admin/r1/recording-health (inline bodies, no new schema). 169 + 2 = 171.
+    expect(Object.keys(paths).length).toBe(171);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

@@ -8,6 +8,9 @@
  *    window is rejected with `{ code: '23514' }`, exactly what an un-sanitised report would hit);
  *  - the 0127 `enqueue_r1_recording_finalize` trigger: a status change to `finishing` inserts ONE
  *    `r1.recording.finalize` job (dedup against live jobs, like `uq_job_queue_dedup_active`);
+ *  - the 0127 `purge_on_r1_recording_delete` trigger: deleting a recording row that is not a tombstone
+ *    (`deleted_at` null) leaves an `r1_recording_purge` outbox row;
+ *  - `select(cols, { count: 'exact', head: true })` answers `{ count }` like PostgREST;
  *  - `.update(...).select()` answers exactly the rows it changed, so compare-and-set code can count.
  * `hooks.beforeWrite` lets a test change the world between a read and the write that follows it, to
  * prove a compare-and-set loses cleanly. `failOn` makes the next matching operation answer an error.
@@ -29,8 +32,8 @@ export interface FakeRecordingDb {
   hooks: {
     beforeWrite?: (table: string, op: 'insert' | 'update' | 'delete', patch: Row | undefined, matching: Row[]) => void;
   };
-  /** The next `times` operations on `table` of kind `op` answer a database error. */
-  failOn(table: string, op: 'select' | 'insert' | 'update' | 'delete', times?: number): void;
+  /** The next `times` operations on `table` of kind `op` answer a database error, after letting `skip` pass. */
+  failOn(table: string, op: 'select' | 'insert' | 'update' | 'delete', times?: number, skip?: number): void;
 }
 
 const RECORDING_DEFAULTS: Row = {
@@ -101,16 +104,21 @@ function compare(left: unknown, right: unknown): number {
   return (left as any) > (right as any) ? 1 : (left as any) < (right as any) ? -1 : 0;
 }
 
-export function createRecordingFakeDb(initial: Tables = {}): FakeRecordingDb {
+export function createRecordingFakeDb(initial: Tables = {}, options: { now?: () => number } = {}): FakeRecordingDb {
+  const clockMs = options.now ?? Date.now;
   const tables: Tables = initial;
   const ops: FakeRecordingDb['ops'] = [];
   const hooks: FakeRecordingDb['hooks'] = {};
-  const failures: Array<{ table: string; op: string; times: number }> = [];
+  const failures: Array<{ table: string; op: string; times: number; skip: number }> = [];
   let idCounter = 0;
 
   function takeFailure(table: string, op: string): boolean {
     const f = failures.find((x) => x.table === table && x.op === op && x.times > 0);
     if (!f) return false;
+    if (f.skip > 0) {
+      f.skip -= 1;
+      return false;
+    }
     f.times -= 1;
     return true;
   }
@@ -137,21 +145,35 @@ export function createRecordingFakeDb(initial: Tables = {}): FakeRecordingDb {
     let op: 'select' | 'insert' | 'update' | 'delete' = 'select';
     let payload: any;
     const filters: Array<(row: Row) => boolean> = [];
-    let orderBy: [string, boolean] | null = null;
+    const orderBy: Array<[string, boolean]> = [];
     let limit: number | null = null;
+    let wantCount = false;
+    let headOnly = false;
 
     const matching = (): Row[] => {
       let out = (tables[table] ?? []).filter((row) => filters.every((f) => f(row)));
-      if (orderBy) {
-        const [key, asc] = orderBy;
-        out = [...out].sort((a, b) => (compare(a[key], b[key]) || 0) * (asc ? 1 : -1));
+      if (orderBy.length > 0) {
+        out = [...out].sort((a, b) => {
+          for (const [key, asc] of orderBy) {
+            const c = compare(a[key], b[key]) || 0;
+            if (c !== 0) return c * (asc ? 1 : -1);
+          }
+          return 0;
+        });
       }
       return limit === null ? out : out.slice(0, limit);
     };
 
-    const run = (): { data: any; error: any } => {
+    const run = (): { data: any; error: any; count?: number } => {
       ops.push({ table, op });
       if (takeFailure(table, op)) return { data: null, error: { code: 'XX000', message: 'injected' } };
+      if (op === 'select' && wantCount) {
+        const saved = limit;
+        limit = null;
+        const total = matching().length;
+        limit = saved;
+        return { data: headOnly ? null : matching().map((r) => ({ ...r })), count: total, error: null };
+      }
       if (op === 'select') return { data: matching().map((r) => ({ ...r })), error: null };
       if (op === 'insert') {
         const list = (Array.isArray(payload) ? payload : [payload]) as Row[];
@@ -166,6 +188,8 @@ export function createRecordingFakeDb(initial: Tables = {}): FakeRecordingDb {
             row = { ...RECORDING_DEFAULTS, ...row };
             if (recordingViolation(row)) return { data: null, error: { code: '23514', message: 'check violation' } };
           }
+          // Columns the database stamps itself (`default now()`).
+          if (table === 'governance_audit' && row.created_at === undefined) row.created_at = new Date(clockMs()).toISOString();
           (tables[table] ??= []).push(row);
           inserted.push({ ...row });
         }
@@ -191,12 +215,36 @@ export function createRecordingFakeDb(initial: Tables = {}): FakeRecordingDb {
       }
       const rows = matching();
       hooks.beforeWrite?.(table, 'delete', undefined, rows);
+      if (table === 'interview_round_recordings') {
+        // 0127 purge_on_r1_recording_delete: BEFORE DELETE ... WHEN (old.deleted_at is null).
+        for (const row of rows) {
+          if (row.deleted_at === null || row.deleted_at === undefined) {
+            (tables.r1_recording_purge ??= []).push({
+              id: `purge-${++idCounter}`,
+              bucket: row.bucket,
+              prefix: row.prefix,
+              upload_id: row.upload_id ?? null,
+              reason: 'row_deleted',
+              queued_at: new Date().toISOString(),
+              attempts: 0,
+              last_error_code: null,
+              done_at: null,
+            });
+          }
+        }
+      }
       tables[table] = (tables[table] ?? []).filter((row) => !rows.includes(row));
       return { data: rows.map((r) => ({ ...r })), error: null };
     };
 
     const q: any = {
-      select: () => q,
+      select: (_columns?: string, options?: { count?: string; head?: boolean }) => {
+        if (options?.count) {
+          wantCount = true;
+          headOnly = options.head === true;
+        }
+        return q;
+      },
       eq: (key: string, value: unknown) => { filters.push((row) => (row[key] ?? null) === (value ?? null) && (value !== undefined)); return q; },
       neq: (key: string, value: unknown) => { filters.push((row) => row[key] !== value); return q; },
       is: (key: string, value: unknown) => { filters.push((row) => (row[key] ?? null) === value); return q; },
@@ -209,7 +257,7 @@ export function createRecordingFakeDb(initial: Tables = {}): FakeRecordingDb {
         if (operator === 'is' && value === null) filters.push((row) => row[key] !== null && row[key] !== undefined);
         return q;
       },
-      order: (key: string, options?: { ascending?: boolean }) => { orderBy = [key, options?.ascending !== false]; return q; },
+      order: (key: string, options?: { ascending?: boolean }) => { orderBy.push([key, options?.ascending !== false]); return q; },
       limit: (n: number) => { limit = n; return q; },
       insert: (value: Row | Row[]) => { op = 'insert'; payload = value; return q; },
       update: (value: Row) => { op = 'update'; payload = value; return q; },
@@ -232,8 +280,8 @@ export function createRecordingFakeDb(initial: Tables = {}): FakeRecordingDb {
     tables,
     ops,
     hooks,
-    failOn(table, op, times = 1) {
-      failures.push({ table, op, times });
+    failOn(table, op, times = 1, skip = 0) {
+      failures.push({ table, op, times, skip });
     },
     client: {
       from: (table: string) => query(table),
@@ -266,5 +314,81 @@ export function liveRecordingTables(options: { recordingMode?: string; consents?
       : [{ id: 'consent-1', round_id: ROOM_ROUND, consents: options.consents ?? ['ai_interview', 'video_audio_recording', 'ai_evaluation', 'data_processing'], withdrawn_at: null, proof: null }],
     interview_round_recordings: [],
     job_queue: [],
+  };
+}
+
+// ---------------------------------------------------------------- recording row fixtures
+
+/** 2026-10-12T10:00:00Z, the clock every recording suite starts at. */
+export const FIXTURE_NOW_MS = Date.parse('2026-10-12T10:00:00.000Z');
+const iso = (ms: number): string => new Date(ms).toISOString();
+
+/** `n`-th fixture id: `a` = round, `b` = session, `c` = candidate. */
+export const fixtureId = (kind: 'a' | 'b' | 'c', n: number): string =>
+  `${kind === 'a' ? '20000000' : kind === 'b' ? '30000000' : '10000000'}-0000-4000-8000-${String(n).padStart(12, '0')}`;
+
+/**
+ * A complete `interview_round_recordings` row (every 0127 column). Defaults describe a recording that
+ * was created 10 minutes before {@link FIXTURE_NOW_MS}, is `ready`, and holds one `stream.mp4`.
+ * `n` picks the session/round pair (n = 1 is {@link ROOM_SESSION} / {@link ROOM_ROUND}).
+ */
+export function recordingRow(n = 1, overrides: Row = {}): Row {
+  const round = fixtureId('a', n);
+  const session = fixtureId('b', n);
+  const prefix = `r1/${round}/${session}/`;
+  const created = FIXTURE_NOW_MS - 10 * 60_000;
+  return {
+    session_id: session,
+    round_id: round,
+    bucket: 'ik-r1-recordings',
+    prefix,
+    requested_mode: 'av',
+    status: 'ready',
+    layout: 'combined',
+    has_video: true,
+    upload_id: null,
+    parts_issued: 2,
+    urls_issued: 3,
+    video_key: `${prefix}stream.mp4`,
+    video_bytes: 4096,
+    video_sha256: 'a'.repeat(64),
+    video_etag: '"etag-video"',
+    video_content_type: 'video/mp4',
+    audio_key: null,
+    audio_bytes: null,
+    audio_sha256: null,
+    audio_etag: null,
+    started_at_ms: created,
+    duration_ms: 540_000,
+    width: 640,
+    height: 360,
+    fps: 15,
+    frames_encoded: 8000,
+    frames_dropped: 10,
+    camera_off_ms: 0,
+    degraded_at_ms: null,
+    reported_stream_bytes: 4096,
+    reported_parts: 2,
+    degraded_reason: null,
+    failure_reason: null,
+    finalize_attempts: 1,
+    created_at: iso(created),
+    updated_at: iso(created + 9 * 60_000),
+    finalize_requested_at: iso(created + 9 * 60_000),
+    finalized_at: iso(created + 9 * 60_000 + 5000),
+    delete_after: iso(created + 90 * 86_400_000),
+    delete_requested_at: null,
+    delete_reason: null,
+    deleted_at: null,
+    ...overrides,
+  };
+}
+
+/** The round (+ attempt) rows the staff routes, erase and DSAR read for fixture `n`. */
+export function roundTables(n = 1, options: { candidate?: number; owner?: string | null } = {}): Tables {
+  return {
+    interview_rounds: [{ id: fixtureId('a', n), candidate_id: fixtureId('c', options.candidate ?? 1) }],
+    interview_round_attempts: [{ session_id: fixtureId('b', n), round_id: fixtureId('a', n), attempt_number: 1, counted: true, outcome: 'complete' }],
+    candidates: [{ id: fixtureId('c', options.candidate ?? 1), owner_id: options.owner ?? null }],
   };
 }

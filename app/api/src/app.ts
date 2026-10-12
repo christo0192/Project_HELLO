@@ -31,7 +31,7 @@ import { ashbyMissionControlRouter } from './routes/ashby-mission-control.js';
 import { ashbyReviewRouter } from './routes/ashby-review.js';
 import { phoneApiRouter } from './routes/phone.js';
 import { r1Router, r1InternalRouter } from './routes/r1.js';
-import { r1RecordingInternalRouter } from './routes/r1-recording.js';
+import { r1RecordingInternalRouter, r1RecordingStaffRouter } from './routes/r1-recording.js';
 import { r1HrRouter } from './routes/r1-hr.js';
 import { r1CandidateRouter } from './routes/r1-candidate.js';
 import { ashbyCandidateWorkflowRouter } from './routes/ashby-candidate-workflow.js';
@@ -478,6 +478,9 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/resumes', resumesRouter);
   app.use('/api/candidates', candidatesRouter);
   app.use('/api', r1Router);
+  // R1 recording, staff side (R1-REC): the playback mint under /api/interview-rounds (so it shares
+  // that default rate bucket) and the admin health read. GET only, so viewers pass viewerReadOnly.
+  app.use('/api', r1RecordingStaffRouter);
   // Read-only HR read models (availability, usage); see routes/r1-hr.ts.
   app.use('/api', r1HrRouter);
   // R1 candidate surface (exact public allowlist entries in lib/auth.ts). Each

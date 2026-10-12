@@ -19,8 +19,17 @@
  *    treats as retry and then as recording off; the interview is never affected).
  *
  * The router is built by {@link createR1RecordingInternalRouter} so tests can inject every
- * collaborator; the exported `r1RecordingInternalRouter` is the production instance. The staff
- * playback and health routes join this file in a later task.
+ * collaborator; the exported `r1RecordingInternalRouter` is the production instance.
+ *
+ * STAFF routes (the second router in this file, {@link createR1RecordingStaffRouter}, mounted at
+ * `/api` like `r1Router`), all GET so a viewer passes `viewerReadOnly`:
+ *
+ *   GET /interview-rounds/:id/recording?session_id=<uuid>   (viewer+) mint a playback URL
+ *   GET /admin/r1/recording-health                          (admin)   counts and ages only
+ *
+ * The mint is authorised by the candidate-detail rule (admin and viewer any candidate, interviewer
+ * only their own: lib/r1/recording/access.ts) and answers 200 with a `state` for every expected
+ * condition; see lib/r1/recording/playback.ts. Every answer is `Cache-Control: no-store`.
  */
 
 import { Router, type Request, type RequestHandler, type Response } from 'express';
@@ -28,7 +37,8 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import { workerAuth } from './r1.js';
 import { supabase } from '../lib/supabase.js';
 import { getR1Config } from '../lib/r1/config.js';
-import { recordAudit } from '../lib/audit.js';
+import { auditAccessDenied, recordAudit } from '../lib/audit.js';
+import { requireRole } from '../lib/rbac.js';
 import { createLogger } from '../lib/logger.js';
 import { Queue } from '../lib/queue/index.js';
 import { PgAdapter } from '../lib/queue/pg-adapter.js';
@@ -47,7 +57,9 @@ import {
   type R1RecordingGateDeps,
   type SessionLimiter,
 } from '../lib/r1/recording/gate.js';
-import { isObjectKind, isRecordingMode, mp4ContentType } from '../lib/r1/recording/keys.js';
+import { readRecordingHealth } from '../lib/r1/recording/health.js';
+import { isObjectKind, isRecordingMode, mp4ContentType, toCanonicalUuid } from '../lib/r1/recording/keys.js';
+import { resolvePlayback, type R1PlaybackDeps } from '../lib/r1/recording/playback.js';
 import { degradedReason, sanitizeCompleteReport, workerFailureReason, type R1RecordingLayout } from '../lib/r1/recording/service.js';
 import { getR1RecordingStore } from '../lib/r1/recording/store-factory.js';
 import { isR1StoreError, type R1ObjectStore } from '../lib/r1/recording/store.js';
@@ -207,3 +219,87 @@ export function createR1RecordingInternalRouter(deps: R1RecordingRouteDeps = {})
 }
 
 export const r1RecordingInternalRouter: Router = createR1RecordingInternalRouter();
+
+// ================================================================ staff routes
+
+export interface R1RecordingStaffDeps {
+  readonly db?: R1DbClient;
+  readonly store?: R1PlaybackDeps['store'];
+  readonly recordingConfig?: () => R1RecordingConfig;
+  readonly now?: () => Date;
+}
+
+export function createR1RecordingStaffRouter(deps: R1RecordingStaffDeps = {}): Router {
+  const router = Router();
+  const db = deps.db ?? (supabase as unknown as R1DbClient);
+  const now = deps.now ?? ((): Date => new Date());
+  const recordingConfig = deps.recordingConfig ?? ((): R1RecordingConfig => getR1RecordingConfig());
+  const storeFor = deps.store ?? getR1RecordingStore;
+
+  // Mint a playback URL. A URL is a bearer capability: the answer must never be cached or shared.
+  router.get('/interview-rounds/:id/recording', requireRole('viewer'), async (req, res, next) => {
+    try {
+      res.setHeader('Cache-Control', 'no-store');
+      const roundId = toCanonicalUuid(req.params.id);
+      const rawSession = req.query.session_id;
+      const sessionId = typeof rawSession === 'string' ? toCanonicalUuid(rawSession) : null;
+      if (!roundId || !sessionId) return void res.status(400).json({ error: 'invalid_id' });
+
+      const user = req.authUser!;
+      const result = await resolvePlayback(
+        {
+          db,
+          recordingConfig,
+          store: storeFor,
+          now,
+          log: (category) => logger.warn('unknown_event', { error_category: category }),
+          // A read event: fail-open, and never a URL, key or token in the metadata.
+          auditDownload: (metadata) => recordAudit(req, 'recording.download', 200, {
+            metadata: { ...metadata, requested_by: user.id, role: user.appRole },
+          }),
+          // A security-relevant write: fail-closed (a rejection aborts the quarantine and the request).
+          auditQuarantine: (metadata) => recordAudit(req, 'recording.quarantined', 200, {
+            metadata: { ...metadata, requested_by: user.id, role: user.appRole },
+          }),
+        },
+        { id: user.id, appRole: user.appRole, active: user.active },
+        roundId,
+        sessionId,
+      );
+      switch (result.kind) {
+        case 'ok':
+          return void res.status(200).json(result.body);
+        case 'forbidden':
+          await auditAccessDenied(req, 'recording_access_denied').catch(() => undefined);
+          return void res.status(403).json({ error: 'access_denied' });
+        case 'not_found':
+          return void res.status(404).json({ error: 'not_found' });
+        case 'unavailable':
+          return void res.status(503).json({ error: 'r1_recording_unavailable' });
+        default:
+          return void res.status(503).json({ error: 'service_unavailable' });
+      }
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  router.get('/admin/r1/recording-health', requireRole('admin'), async (_req, res, next) => {
+    try {
+      res.setHeader('Cache-Control', 'no-store');
+      try {
+        res.status(200).json(await readRecordingHealth(db, now().getTime()));
+      } catch {
+        logger.warn('unknown_event', { error_category: 'r1_recording_health_error' });
+        res.status(503).json({ error: 'service_unavailable' });
+      }
+    } catch (error) {
+      next(error);
+    }
+  });
+
+  return router;
+}
+
+export const r1RecordingStaffRouter: Router = createR1RecordingStaffRouter();
+

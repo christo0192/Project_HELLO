@@ -41,6 +41,9 @@ const fixtures = [
   ['/api/internal/r1/recording/part-url', 'post', '200'],
   ['/api/internal/r1/recording/object-url', 'post', '200'],
   ['/api/internal/r1/recording/complete', 'post', '200'],
+  // R1-REC: the staff playback mint (viewer+) and the admin health read.
+  ['/api/interview-rounds/{id}/recording', 'get', '200'],
+  ['/api/admin/r1/recording-health', 'get', '200'],
 ] as const;
 
 describe('R1 OpenAPI route fixtures', () => {

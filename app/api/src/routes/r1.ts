@@ -6,6 +6,7 @@ import { getR1Config } from '../lib/r1/config.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import { projectRecordingContext } from '../lib/r1/recording/context.js';
+import { withRecordingAttempts } from '../lib/r1/recording/summary.js';
 
 export const r1Router = Router();
 export const r1InternalRouter = Router();
@@ -67,7 +68,7 @@ r1Router.get('/candidates/:id/interview-rounds', requireRole('viewer'), async (r
   if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
   if (!(await candidateAccess(req, res, req.params.id, false))) return;
   const { data, error } = await supabase.from('interview_rounds').select('id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,status_write,pending_reject_until,created_at,created_by').eq('candidate_id', req.params.id).order('created_at', { ascending: false });
-  if (error) throw error; res.json({ rounds: data ?? [] });
+  if (error) throw error; res.json({ rounds: await withRecordingAttempts(supabase as never, data ?? []) });
 } catch (e) { next(e); } });
 
 for (const action of ['cancel', 'reissue', 'grant-retake'] as const) r1Router.post(`/interview-rounds/:id/${action}`, requireRole('interviewer'), async (req, res, next) => { try {

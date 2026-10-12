@@ -31,6 +31,7 @@ import {
   governanceCorrelationId,
 } from './retention.js';
 import type { LegalHold } from './retention.js';
+import { eraseCandidateR1Recordings, listCandidateR1Recordings } from './r1/recording/dsar-step.js';
 
 const dsarLogger = createLogger('dsar');
 
@@ -66,6 +67,11 @@ export interface DSARExportResult {
   transcripts: Record<string, unknown>[];
   resumes: Record<string, unknown>[];
   recordings: Record<string, unknown>[];
+  /**
+   * R1 interview recordings (metadata only, never a URL). Present only when the candidate has any,
+   * so an export without R1 is byte-identical to before.
+   */
+  r1_recordings?: Record<string, unknown>[];
   // Recording/outbound data is only included when explicit recording consent exists,
   // not from job_application consent alone.
   recordingDataIncluded: boolean;
@@ -373,6 +379,9 @@ export async function exportDSAR(
     }
   }
 
+  // R1 interview recordings: metadata only (the audited staff playback route is the way to view one).
+  const r1Recordings = await listCandidateR1Recordings(dsar.candidateId, client);
+
   // Build export payload (PII stripped from internal IDs, no tokens/secrets)
   const result: DSARExportResult = {
     requestId: dsarId,
@@ -445,6 +454,7 @@ export async function exportDSAR(
       text_extracted: r.text_extracted,
     })),
     recordings,
+    ...(r1Recordings.length > 0 ? { r1_recordings: r1Recordings } : {}),
     recordingDataIncluded,
     exportedAt: new Date().toISOString(),
   };
@@ -575,6 +585,59 @@ export async function deleteDSAR(
 
   // No blocks — proceed with cascade deletion
   const deletedEntities: string[] = [];
+
+  // R1 interview recordings (R1-REC). The objects in R2 are erased and VERIFIED gone before any row
+  // below is deleted, because the rows are the only index of those objects. A legal hold on a recording
+  // blocks like the gates above; any other failure returns before a single row is deleted and the
+  // request is NOT marked fulfilled (it stays in progress, with a failure audit, until a retry succeeds).
+  const r1Erase = await eraseCandidateR1Recordings(candidateId, client, { actorId });
+  if (!r1Erase.ok && r1Erase.kind === 'blocked') {
+    await client
+      .from('data_subject_requests')
+      .update({
+        legal_hold_blocked: true,
+        request_status: 'pending',
+        notes: `Deletion blocked by ${r1Erase.holds.length} active legal hold(s)`,
+      })
+      .eq('id', dsarId);
+    await recordGovernanceAudit({
+      action: 'erasure_blocked_legal_hold',
+      actorId,
+      entityType: 'candidate',
+      entityId: candidateId,
+      details: { dsar_id: dsarId, stage: 'r1_recordings', hold_ids: r1Erase.holds.map(h => h.id) },
+      outcome: 'blocked',
+      correlationId: corrId,
+    }, clientOverride);
+    return {
+      success: false,
+      deletedEntities: [],
+      blockedByLegalHolds: r1Erase.holds,
+      auditEntryId: null,
+    };
+  }
+  if (!r1Erase.ok) {
+    await client
+      .from('data_subject_requests')
+      .update({ request_status: 'in_progress', notes: `R1 recording erasure incomplete (${r1Erase.code})` })
+      .eq('id', dsarId);
+    await recordGovernanceAudit({
+      action: 'data_deleted',
+      actorId,
+      entityType: 'candidate',
+      entityId: candidateId,
+      details: { dsar_id: dsarId, stage: 'r1_recordings', code: r1Erase.code },
+      outcome: 'failure',
+      correlationId: corrId,
+    }, clientOverride);
+    return {
+      success: false,
+      deletedEntities: [],
+      blockedByLegalHolds: [],
+      auditEntryId: null,
+    };
+  }
+  for (const r1SessionId of r1Erase.erased) deletedEntities.push(`r1_recording:${r1SessionId}`);
 
   // Delete recordings (if any)
   for (const sessionId of sessionIds) {

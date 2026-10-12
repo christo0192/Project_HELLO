@@ -44,6 +44,7 @@ import {
   type R1RecordingLayout,
   type R1RecordingRow,
 } from './service.js';
+import { guardStore, storageError } from './store-errors.js';
 import { isR1StoreError, type R1ObjectHead, type R1ObjectStore, type R1StoredPart } from './store.js';
 
 export interface R1FinalizeDeps {
@@ -217,25 +218,6 @@ async function hashObject(store: R1ObjectStore, key: string, expectedBytes: numb
   }
   if (total !== expectedBytes) throw new Error('r2_short_read');
   return { sha256: hash.digest('hex'), valid: sniffMatches(first, have, kind) };
-}
-
-/** A closed, queue-safe code for an object-store failure. */
-function storageError(error: unknown): Error {
-  if (isR1StoreError(error)) {
-    if (error.code === 'unavailable') return new Error('r1_storage_unavailable');
-    if (error.code === 'access_denied') return new Error('r1_storage_access');
-    if (error.code === 'invalid_request') return new Error('r1_storage_rejected');
-  }
-  return new Error('r1_storage_error');
-}
-
-async function guardStore<T>(operation: () => Promise<T>): Promise<T> {
-  try {
-    return await operation();
-  } catch (error) {
-    if (error instanceof Error && /^r1_/.test(error.message)) throw error;
-    throw storageError(error);
-  }
 }
 
 // ---------------------------------------------------------------- the job

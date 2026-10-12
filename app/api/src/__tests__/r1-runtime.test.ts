@@ -73,11 +73,12 @@ describe('construction gate', () => {
     const db = createFakeDb(baseTables());
     const runtime = createR1Runtime({ config: ENABLED, client: db.client as never, queue: makeQueue() })!;
     expect(runtime).not.toBeNull();
-    // R1-REC: the recording lane (r1.recording.finalize) joined the assessment queue, on a second runner.
-    expect([...runtime.queues]).toEqual(['r1.assessment', 'r1.recording.finalize']);
-    expect(R1_RUNTIME_QUEUES).toEqual(['r1.assessment', 'r1.recording.finalize']);
+    // R1-REC: the recording lane (finalize, erase, sweep) joined the assessment queue, on a second runner,
+    // with a fourth loop (r1-sweep) that enqueues one sweep per 15-minute bucket.
+    expect([...runtime.queues]).toEqual(['r1.assessment', 'r1.recording.finalize', 'r1.recording.erase', 'r1.sweep']);
+    expect(R1_RUNTIME_QUEUES).toEqual(['r1.assessment', 'r1.recording.finalize', 'r1.recording.erase', 'r1.sweep']);
     expect(runtime.scheduler.running()).toBe(false);
-    expect(Object.keys(runtime.loopIntervalsMs)).toEqual(['r1-assessment', 'r1-status', 'r1-storage']);
+    expect(Object.keys(runtime.loopIntervalsMs)).toEqual(['r1-assessment', 'r1-status', 'r1-storage', 'r1-sweep']);
     expect(db.fromCalls).toEqual([]);
   });
 });
@@ -228,7 +229,7 @@ describe('the status loop', () => {
     })!;
     runtime.scheduler.start();
     expect(runtime.scheduler.running()).toBe(true);
-    expect(timers).toHaveLength(3);
+    expect(timers).toHaveLength(4);
     await runtime.stop();
     expect(runtime.scheduler.running()).toBe(false);
     expect(runtime.runner.stopped()).toBe(true);
@@ -757,7 +758,7 @@ describe('structural fences (plan 9, fence 3)', () => {
     }
   });
 
-  it('the R1 runtime registers one handler per runner (assessment, recording finalize) and never a phone queue name', () => {
+  it('the R1 runtime registers the assessment handler on one runner and the recording lane (finalize, erase, sweep) on the other, never a phone queue name', () => {
     const runtime = read('lib/r1/runtime.ts');
     // Every `handlers: { ... owner,` block: the assessment runner first, the r1-storage runner second.
     const blocks: string[][] = [];
@@ -765,7 +766,7 @@ describe('structural fences (plan 9, fence 3)', () => {
       const block = runtime.slice(at, runtime.indexOf('owner', at));
       blocks.push([...block.matchAll(/\[([A-Za-z0-9_]+)\]\s*:/g)].map((match) => match[1]!));
     }
-    expect(blocks).toEqual([['R1_ASSESSMENT_QUEUE'], ['R1_RECORDING_FINALIZE_QUEUE']]);
+    expect(blocks).toEqual([['R1_ASSESSMENT_QUEUE'], ['R1_RECORDING_FINALIZE_QUEUE', 'R1_RECORDING_ERASE_QUEUE', 'R1_SWEEP_QUEUE']]);
     // Code only: the header comment names the phone handlers to explain what R1 must not join.
     const code = runtime.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
     expect(code).not.toMatch(/phone\.|PHONE_|phone-runtime/);
