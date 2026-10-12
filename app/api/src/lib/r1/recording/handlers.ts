@@ -196,4 +196,3 @@ export function createR1SweepHandler(deps: R1SweepHandlerDeps): QueueHandler {
     deps.onResult?.(report);
   };
 }
-
