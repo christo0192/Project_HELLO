@@ -962,7 +962,8 @@ class _CandidateRow:
     # when the SDK gave no usable speaking event (``_candidate_turn_anchor``).
     started_at_ms: int | None = None
     # Wall-clock seconds (the SDK's event clock) of the row's latest final: when the row is
-    # written, nothing the candidate said up to here belongs to a later row (``_anchor_floor``).
+    # written, nothing the candidate said up to here belongs to a later row (``_anchor_floor``,
+    # ``_commit_floor``).
     last_final_at: float | None = None
 
 
@@ -978,6 +979,10 @@ _USER_SPEECH_ANCHOR_MAX_AGE_SECONDS = 30.0
 # (the previous row's commit, the start of a bot line), however short the gap across it.
 _USER_SPEECH_BURST_GAP_SECONDS = 4.0
 _USER_SPEECH_ANCHORS_KEPT = 8
+# The anchor floors only ever rise, so one wrong time would hold a floor up for the rest of the
+# session and end every later walk-back.  A wall-clock time further ahead of now than this is not
+# believed (the SDK's event clock is ``time.time()``: a real skew is milliseconds) and is ignored.
+_ANCHOR_FLOOR_MAX_AHEAD_SECONDS = 60.0
 
 
 def _epoch_ms(seconds: Any) -> int | None:
@@ -1056,10 +1061,14 @@ class R1Interview:
         # Wall-clock seconds of the latest ``user_state_changed -> speaking`` events (oldest first):
         # the anchors of the candidate's rows (``_candidate_turn_anchor``).
         self._user_speaking_at: deque[float] = deque(maxlen=_USER_SPEECH_ANCHORS_KEPT)
-        # The wall (wall-clock seconds, the same clock) a candidate row's burst of speaking events
-        # may not be walked back across: the latest of the last final of every candidate row
-        # already written (its commit) and the start of every bot line.  Only ever raised.
+        # Two walls (wall-clock seconds, the same clock; each only ever raised) for a candidate
+        # row's anchor.  ``_anchor_floor`` is the one its burst of speaking events may not be walked
+        # back across: the latest of the last final of every candidate row already written (its
+        # commit) and the start of every bot line.  ``_commit_floor`` is the commit part of it
+        # alone: the row's base event (the latest speaking event) may not be earlier than that
+        # either, but it may be earlier than the start of a bot line.
         self._anchor_floor: float = 0.0
+        self._commit_floor: float = 0.0
         self._candidate_activity_at: float | None = None
         self._icebreaker_hold_since: float | None = None
         self._replies_cancelled_before_audio = 0
@@ -3207,7 +3216,7 @@ class R1Interview:
         if row is None:
             return
         # The row is over: speech heard up to its last final is its own, never a later row's.
-        self._raise_anchor_floor(row.last_final_at)
+        self._raise_anchor_floor(row.last_final_at, commit=True)
         self._write_turn(
             row.index, "candidate", " ".join(row.parts), row.phase, started_at_ms=row.started_at_ms
         )
@@ -3225,19 +3234,27 @@ class R1Interview:
         answer and skip its first words.  It is the SDK's own event time (``created_at``), never
         the write time, so the recording's click-to-seek lands where the candidate started.
 
-        The walk never crosses ``_anchor_floor``: the last final of the previous candidate row
-        (the SDK committed it, so everything it heard is that row's) or the start of a bot line
-        after it.  An answer that begins right after a bot line is within the burst gap of the
-        speech before that line, but it is another turn; reaching back into it would put the seek
-        in the previous row.  The latest event itself is not held to the wall: it is the SDK's
-        own last word on when the candidate started, and a candidate who began speaking just as
-        a line began (or talked over it) owns that start.
+        Two walls keep it inside its own turn (both on the SDK's event clock).  The walk never
+        crosses ``_anchor_floor``: the last final of the previous candidate row (the SDK committed
+        it, so everything it heard is that row's) or the start of a bot line after it.  An answer
+        that begins right after a bot line is within the burst gap of the speech before that line,
+        but it is another turn; reaching back into it would put the seek in the previous row.
+
+        The latest event itself (the base) is held only to the commit half of that wall,
+        ``_commit_floor``.  Earlier than the previous row's last final, it is that row's own start:
+        the VAD gave no speaking event for this answer at all (a miss, or speech across a scripted
+        line that cannot be interrupted), so the row gets None rather than the previous answer's
+        start.  It is not held to the start of a bot line: it is the SDK's own last word on when
+        the candidate started, and one who began speaking just as a line began (or talked over it)
+        owns that start.
         """
         final_at = self._event_seconds(event)
         before = sorted(spoke for spoke in self._user_speaking_at if spoke <= final_at)
         if not before or final_at - before[-1] > _USER_SPEECH_ANCHOR_MAX_AGE_SECONDS:
             return None
         start = before[-1]
+        if start < self._commit_floor:
+            return None  # the previous answer's start: no speaking event came for this one
         for earlier in reversed(before[:-1]):
             if earlier < self._anchor_floor:
                 break  # before the previous row's commit or a bot line: another turn
@@ -3254,11 +3271,22 @@ class R1Interview:
         created = getattr(event, "created_at", None)
         return created if isinstance(created, (int, float)) and not isinstance(created, bool) else time.time()
 
-    def _raise_anchor_floor(self, seconds: Any) -> bool:
-        """Move the wall for candidate bursts forward to ``seconds``; False when that is no usable time."""
+    def _raise_anchor_floor(self, seconds: Any, *, commit: bool = False) -> bool:
+        """Move the walls for candidate bursts forward to ``seconds``; False when that is no usable time.
+
+        A usable time is a finite number no more than ``_ANCHOR_FLOOR_MAX_AHEAD_SECONDS`` ahead of
+        now (a floor never comes back down, so one far-future time would end the walk-back and the
+        base for the rest of the session).  ``commit`` is a candidate row's last final: it raises
+        ``_commit_floor`` too, the wall the base event is held to.  A time earlier than the floor
+        is usable and changes nothing.
+        """
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
             return False
+        if seconds > time.time() + _ANCHOR_FLOOR_MAX_AHEAD_SECONDS:
+            return False
         self._anchor_floor = max(self._anchor_floor, float(seconds))
+        if commit:
+            self._commit_floor = max(self._commit_floor, float(seconds))
         return True
 
     def _reserve_bot_index(self, started_at: float | None = None) -> int:
