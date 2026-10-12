@@ -1766,6 +1766,208 @@ affected. Additive migrations are disabled rather than dropped; R2 objects are
 kept for retention/DSAR handling. The restored worker must keep R1 routes on
 the R1-only lane; it must not use the legacy session path. (implemented in PR-x)
 
-For video/recording problems, switch `R1_VIDEO_RECORDING` off to continue
-audio-only only when the approved R1 policy permits it; investigate multipart
-and checkpoint state before retrying finalization. (implemented in PR-9a/PR-9b)
+For video/recording problems, set `r1_settings.recording_mode` to `off` (instant), or to
+`audio` to continue audio-only only when the approved R1 policy permits it; unsetting the
+worker secrets `R1_RECORDING` and `R1_VIDEO_RECORDING` needs zero live R1 sessions.
+Investigate multipart and checkpoint state (the Recording section below) before
+retrying finalization. (implemented in R1-REC)
+
+## Recording (R1-REC): camera video and both voices, in the worker, to Cloudflare R2
+
+(implemented in R1-REC, branch `r1/rec`; ADR-0016 and its 2026-10-13 amendment. Recording ships OFF behind
+three independent locks and nothing below turns it on by itself. Real candidates stay out of scope until the
+Legal gates of migration 0123 pass.)
+
+### What it does
+
+The R1 worker (`app/voice-livekit`) records inside the job process: the stock SDK recorder keeps writing the
+stereo OGG (left candidate, right agent), a tee mixes both sides to mono and hands them, with the candidate's
+camera pictures, to a niced child process (`r1_video_encoder`) that writes H.264 640x360 15 fps plus live AAC
+into a fragmented MP4 in `/tmp/r1-rec/<session_id>/`. An uploader thread sends 5 MiB parts of that growing file
+and a 2-minute OGG checkpoint to **presigned URLs the API hands out**; the worker holds no R2 credential. When the
+interview ends the worker flushes, uploads the last part, optionally a faststart copy `video.mp4`, and calls
+`complete`; the API finalizes (completes the multipart upload, verifies size, SHA-256 and file signature) and the
+row becomes `ready`, `partial` or `failed`. Staff play it from the candidate page (all roles; interviewers only for
+their own candidates) and admins can click a transcript turn on the Review tab to seek.
+
+| Object under `r1/<round_id>/<session_id>/` | Written by | Kept |
+|---|---|---|
+| `stream.mp4` | worker, multipart | deliverable when there is no valid `video.mp4` (forced exits, crashes) |
+| `video.mp4` | worker, one PUT (faststart copy), normal exits only | preferred deliverable; `stream.mp4` is then removed |
+| `audio.partial.ogg` | worker, every 120 s | removed by finalize unless it is the only audio |
+| `audio.ogg` | worker, only when the MP4 cannot carry all the audio | kept for `split` / `audio_only` |
+
+Database: `screening_v2.interview_round_recordings` (one row per attempt session), `screening_v2.r1_recording_purge`
+(outbox so a deleted row can never strand objects) and `screening_v2.r1_settings.recording_mode`. Queue names
+`r1.recording.finalize`, `r1.recording.erase` and `r1.sweep` run on a second runner (`r1-storage`) of the R1 runtime.
+
+### The three locks and the effective mode
+
+Recording happens only when ALL of these say yes; with any lock off an R1 interview behaves exactly as before
+(no recorder, no spool, no encoder, no recording call; the only changed behaviour is that the worker connects
+**audio-only** and so no longer receives the camera when video is off).
+
+| Lock | Where | Off means |
+|---|---|---|
+| Storage: `R1_RECORDING_S3_ENDPOINT`, `_REGION` (`auto`), `_BUCKET` (`ik-r1-recordings`), `_ACCESS_KEY_ID`, `_SECRET_ACCESS_KEY` | Fly secrets on `project-hello-api` ONLY (never the voice apps; `validate-voice-worker-apps` refuses the two keys there) | the five unset: routes answer 503 `r1_recording_disabled` and `/context` says `off`; any one set or invalid: config `invalid` (one log line without values), recording off |
+| Worker capability: `R1_RECORDING=on`, `R1_VIDEO_RECORDING=on`, optional `R1_VIDEO_X264_PRESET` (`ultrafast`/`superfast`/`veryfast`) | Fly secrets on `project-hello-voice`; must be ABSENT from `fly.toml` and `fly.phone.toml` (validator) | anything but exactly `on`: no recorder; `R1_VIDEO_RECORDING` not `on`: audio only |
+| Operational switch: `r1_settings.recording_mode` `off` / `audio` / `av` | DB, admin `PUT /api/admin/r1/settings` or SQL | `off` (default), instant, no deploy |
+
+Plus the candidate's live consent containing `video_audio_recording` (checked on every worker call). Effective mode
+= min(worker capability, `recording_mode`) with `off < audio < av`; the encoder self-test can lower it at run
+time (no `libx264`: audio; no `aac` or no encoder: OGG only). API knobs (optional, out of range = config `invalid`):
+`R1_RECORDING_MAX_BYTES` (default 400 MiB), `R1_RECORDING_DOWNLOAD_TTL_SEC` (300), `R1_RECORDING_RETENTION_DAYS`
+(90, max 90). Web (optional): `VITE_R1_RECORDINGS_ORIGIN` for the CSP `media-src`.
+
+### Owner steps in Cloudflare (never paste a key or token into chat)
+
+1. **Jurisdiction first; it is immutable.** Legal confirms (0123: the bucket is created only after their advice).
+   Recommended: no jurisdiction, location hint Asia-Pacific (`apac`). A jurisdiction changes the endpoint host
+   (`<ACCOUNT_ID>.eu.r2.cloudflarestorage.com`).
+2. **Bucket** `ik-r1-recordings`: Standard class, hint `apac`, public access OFF (no r2.dev URL, no custom domain),
+   NO bucket lock (a lock would block withdrawal and DSAR deletes). Optional usage notification.
+3. **Token**: R2, Manage API tokens, **Object Read & Write** on that bucket only, no IP filter (Fly egress is not
+   fixed), TTL forever with a rotation entry. Note the Access Key ID, Secret Access Key (shown once) and
+   `https://<ACCOUNT_ID>.r2.cloudflarestorage.com`.
+4. **Lifecycle** (dashboard login; the bucket token cannot do it): prefix `r1/`, delete after **97 days**; prefix `r1/`,
+   abort incomplete multipart uploads after **1 day**. This is the backstop; the app deletes at 90 days.
+5. **CORS** (plain `<video src>` needs none; this keeps HEAD probes and future captions working):
+   `[{"AllowedOrigins":["https://ib-ik-project-hello.vercel.app"],"AllowedMethods":["GET","HEAD"],"AllowedHeaders":["range","if-none-match","if-modified-since"],"ExposeHeaders":["Content-Length","Content-Range","Accept-Ranges","ETag","Content-Type"],"MaxAgeSeconds":3600}]`
+6. **Stage the API secrets** in your own PowerShell (`--stage`: no restart, applies at the next API deploy):
+   `fly secrets set --stage -a project-hello-api "R1_RECORDING_S3_ENDPOINT=https://<ACCOUNT_ID>.r2.cloudflarestorage.com" "R1_RECORDING_S3_REGION=auto" "R1_RECORDING_S3_BUCKET=ik-r1-recordings" "R1_RECORDING_S3_ACCESS_KEY_ID=<id>" "R1_RECORDING_S3_SECRET_ACCESS_KEY=<secret>"`,
+   then `fly secrets list -a project-hello-api | Select-String "R1_RECORDING"`. Never on `project-hello-voice` or `project-hello-phone-voice`.
+7. **Smoke (S0-D part 1)**, same PowerShell with the five values exported as env vars, from `app/api`:
+   `npx tsx scripts/r1-recording-smoke.ts`. It must print PASS for every item (presigned UploadPart x3 with a bare PUT,
+   part replacement, complete, HEAD, Range GET 206, CORS echo and none for another origin, prefix-complete after a
+   simulated crash, abort and an empty `ListMultipartUploads`, 5 s expiry returning 403, lifecycle read-back, cleanup
+   of `r1/smoke/`). **This is the only proof against real R2; the local S3 used in development differs in details.**
+8. Optional: Vercel env `VITE_R1_RECORDINGS_ORIGIN=https://<ACCOUNT_ID>.r2.cloudflarestorage.com` (Production and Preview).
+9. Record non-secret evidence (token scope screenshot, bucket creation date and hint, the two rules, the CORS JSON) per
+   `docs/security/credential-inventory.md` and flip that row to Provisioned.
+
+### Deploy rules for this PR
+
+- Any change under `app/voice-livekit/` deploys BOTH voice apps (`deploy-fly.yml`). After the merge, watch for the
+  automatic `Deploy (Fly)` run for the merge SHA and **cancel it before `deploy-phone-voice` starts**.
+- At a zero-live moment confirmed with the phone session (zero live phone and R1 sessions by SQL), by day:
+  `gh workflow run "Deploy (Fly)" --ref main -f service=both` (migrations converge first, then `api` and `browser-voice`;
+  the staged API secrets apply on this API deploy; `flyctl deploy` applies the new `[[vm]]`: performance-2x, 2 vCPU, 4096 MB).
+- Verify: both images show `GH_SHA` = merge SHA; `/api/health` 200; `fly machines list -a project-hello-voice` shows
+  `performance-2x:4096MB`, one machine, stopped; `select to_regclass('screening_v2.interview_round_recordings')` is not
+  null; `select recording_mode from screening_v2.r1_settings` is `off`; `fly secrets list -a project-hello-api` shows the
+  five `R1_RECORDING_S3_*` names as deployed.
+- Only after 21:00 IST: `gh workflow run "Deploy (Fly)" --ref main -f service=phone-voice` so both images match `main`,
+  then a phone canary dry run.
+
+### Enable order (staff only; flags change in this order, each step has a gate)
+
+| # | Step | Gate |
+|---|---|---|
+| E1 | Flags off: `a0_retest.py rehearse` against the resized worker | the worker boots and registers; an R1 interview still works with the audio-only subscription (this is the one live-lane change in the PR) |
+| E2 | Bucket, lifecycle, CORS and the smoke above (if not done before the merge) | smoke prints PASS for every item |
+| E3 | Zero-live: `fly secrets set -a project-hello-voice R1_RECORDING=on R1_VIDEO_RECORDING=on`; `recording_mode='audio'`; one staff rehearsal | row `ready`, `layout=combined`, `has_video=false`, it plays |
+| E4 | `recording_mode='av'`; two extended rehearsals (>= 7 min, camera toggled off and on once) | `ready`, `has_video=true`, `frames_dropped/frames_encoded < 2 %`; Chrome and Safari (desktop and iOS) play and seek to 10/50/90 %; an admin click on a Review turn lands within 1 s; a withdrawal test erases; a DSAR test erases |
+| E5 | One 20-minute human staff session on a real laptop camera | loop-lag max < 250 ms, CPU p95 < 60 %, finish < 18 s; append the S0-C and S0-D evidence to ADR-0016 |
+| E6 | Owner test with a FRESH staff R1 link | rule "prove before owner tests" |
+| E7 | Candidates (Stage B) | only after the Legal gates of 0123 |
+
+Setting the mode: `PUT /api/admin/r1/settings {"recording_mode": "audio"}` (admin) or, in the SQL editor,
+`update screening_v2.r1_settings set recording_mode = 'audio' where singleton;`. Flipping a worker secret restarts a
+started machine, so do it only with zero live R1 sessions.
+
+### Reading the state (read-only SQL and the health route)
+
+`GET /api/admin/r1/recording-health` (admin) returns counts only: `counts_by_status`, `oldest_live_seconds`,
+`retention_overdue`, `purge_backlog`, `finalize_failed`. The same from SQL:
+
+```sql
+-- States and their oldest update; nothing should sit in a live state for long.
+select status, count(*) as n, min(updated_at) as oldest_update
+from screening_v2.interview_round_recordings group by status order by status;
+
+-- Stuck: live rows older than 2 h (the sweep moves them on at 2 h) or finishing for over 30 min.
+select session_id, status, requested_mode, updated_at, finalize_attempts, failure_reason
+from screening_v2.interview_round_recordings
+where (status in ('preparing', 'uploading') and updated_at < now() - interval '2 hours')
+   or (status = 'finishing' and updated_at < now() - interval '30 minutes');
+
+-- Retention overdue (the R1 runtime must be running, see the warning below) and the purge backlog.
+select count(*) as retention_overdue from screening_v2.interview_round_recordings
+where deleted_at is null and delete_after <= now();
+select count(*) as purge_backlog, min(queued_at) as oldest from screening_v2.r1_recording_purge where done_at is null;
+
+-- Queue health: live jobs and the dead-letter rows (these also feed v_funnel_failures, stage 'recording').
+select name, status, count(*) from screening_v2.job_queue
+where name in ('r1.recording.finalize', 'r1.recording.erase', 'r1.sweep') group by 1, 2 order by 1, 2;
+select name, error_message, failed_at from screening_v2.job_dlq
+where name like 'r1.recording.%' or name = 'r1.sweep' order by failed_at desc limit 20;
+
+-- One finished recording (E3/E4 gate): no URL, key or hash leaves the database through the API.
+select status, layout, has_video, requested_mode, duration_ms, video_bytes, width, height, fps,
+       frames_encoded, frames_dropped,
+       round(100.0 * frames_dropped / nullif(frames_encoded, 0), 2) as dropped_pct,
+       camera_off_ms, degraded_reason, failure_reason
+from screening_v2.interview_round_recordings where session_id = '<session id>';
+
+-- The table is service-role only.
+select has_table_privilege('anon', 'screening_v2.interview_round_recordings', 'select') as anon_can_read;  -- false
+```
+
+What the columns mean in practice: `ready` = one combined MP4 with both voices (and the picture when `av` was asked
+and nothing degraded). `partial` = something usable but not the whole promise: the picture was given up under load
+(`degraded_reason` `cpu_loop_lag`, `cpu_vad_slow`, `frame_drops`, `upload_backlog`), the camera never delivered
+(`video_unavailable`), the encoder died (`split`: an MP4 prefix plus the whole OGG), or the worker vanished (salvage
+from the uploaded parts and the last OGG checkpoint, `failure_reason='worker_lost'`). `failed` = nothing valid
+(`nothing_uploaded`, `oversize`, `integrity`, `object_missing`, `finalize_exhausted`). A staff mint that finds the object
+missing or changed (HEAD 404 or a different ETag) quarantines the recording (`failed`, audit `recording.quarantined`).
+
+Known limit of `split` (crash-recovered) recordings: the OGG is the audio master and the stock recorder squeezes out any
+stretch in which neither side produced audio (a candidate rejoin gap while the agent was silent), so after such a gap the
+audio runs earlier than the video by the length of the gap (measured: 10 s and 20 s gaps in the local proof) and a
+click-to-seek on a later turn lands early by the same amount. The player labels these recordings "Recovered recording:
+audio and video may drift." A `combined` recording is gap-padded on the wall clock and does not drift (measured: beep and
+flash within 20 ms before and after a 20 s gap). A salvaged recording (`worker_lost`) has no start time, so it plays but
+has no click-to-seek.
+
+Worker log codes (component `r1`, `error_type`; values are never a URL, key or id): `r1_rec_started`, `r1_rec_finished`
+(`error_category` = layout), `r1_rec_degraded` (`error_category` = reason), `r1_rec_discarded` (consent withdrawn,
+disabled or deleted: the spool was overwritten and nothing more is sent), `r1_rec_abandoned` (the API said stop),
+`r1_rec_prepare_failed`, `r1_rec_upload_retry`, `r1_rec_complete_failed`, `r1_rec_finish_timeout`,
+`r1_rec_encoder_unavailable`, `r1_rec_encoder_crashed`, `r1_rec_encoder_stalled`, `r1_rec_disk_low`,
+`r1_rec_video_unavailable`, `r1_rec_camera_*`, `r1_rec_tee_failed`, `r1_rec_io_close_timeout`.
+
+### Retention, withdrawal, DSAR, legal hold
+
+- **Retention** is per row: `delete_after = created_at + R1_RECORDING_RETENTION_DAYS` (max 90), fixed at prepare.
+  `r1.sweep` (every 15 minutes) erases due rows. **Retention, erase and the sweep run only inside the R1 runtime, which
+  needs `R1_ENABLED=true` on `project-hello-api`.** If it stops, objects outlive their 90 days until the 97-day R2
+  lifecycle rule removes them: `retention_overdue` above 0 is the alarm. Do not turn the runtime off while recordings exist.
+- **Withdrawal** of consent (withdrawn or declined, not superseded) enqueues `r1.recording.erase` in the same transaction;
+  every worker route then answers 409 `r1_consent_withdrawn` and the worker discards. A recording made after a later
+  re-consent survives. **DSAR** erases every recording of the candidate and verifies it BEFORE any row is deleted; a failure
+  leaves the DSAR `in_progress`. Both use one routine: abort multipart uploads, delete every key under the prefix, verify the
+  prefix is empty and each key answers 404, only then tombstone the row (`deleted`, bytes and hash kept as evidence).
+- **Legal hold** blocks erasure (`erasure_blocked_legal_hold`, audited at most daily) for holds on the candidate, the
+  session or the recording. The copy of held objects to a `legal-hold/` prefix outside the 97-day rule is NOT built: a hold
+  placed on an R1 candidate would still lose its objects at 97 days. No hold can exist in Stage A (staff only); build the copy
+  step before Stage B.
+
+### Rollback
+
+| Problem | Action | Zero-live needed |
+|---|---|---|
+| Recording misbehaves, interviews fine | `recording_mode = 'off'` (in-flight sessions finish as recorded); then, if needed, `fly secrets unset R1_RECORDING R1_VIDEO_RECORDING -a project-hello-voice` | mode: no; secrets: yes |
+| CPU degradation seen | the picture is given up automatically (`r1_rec_degraded`); set `recording_mode='audio'` or off | no |
+| Any R1 incident | `r1_settings.paused = true` first | no |
+| API cannot presign | `fly secrets unset R1_RECORDING_S3_* -a project-hello-api` restarts the API: gate it; routes then answer 503 and the worker records nothing | yes |
+| VM problem (capacity, boot) | revert `cpus` and `memory_mb` in `fly.toml` (both lines), redeploy `service=browser-voice` (`fly scale vm` is overwritten by the next deploy) | yes |
+| Full revert | squash-revert the PR in a zero-live slot; migration 0127 stays (disabled, never dropped while objects exist) and R2 objects are kept for retention and DSAR | yes |
+
+### What is and is not proven (state at this PR)
+
+Proven in CI and locally: the unit and integration suites of all three layers, the SQL assertions, and a local end-to-end
+run of the real recorder, real API routes and the real S3 adapter against a local S3 (recorder output finalized through
+presigned multipart uploads, played in Chromium, click-to-seek offsets checked against decoded audio; see the PR body).
+**Not proven until the owner steps and E3-E5 are done:** presigned `UploadPart` and signed `Content-Type` against real R2
+(smoke), Safari behaviour, real camera CPU on `performance-2x` (S0-C), real SFU camera subscription under audio-only
+connect, and the first seconds of video being black while the camera subscription is requested (counted in `camera_off_ms`).
