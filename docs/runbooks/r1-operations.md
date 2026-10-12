@@ -1666,8 +1666,8 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
     early call ask, the intent stall turn blocks the text and posts `commitment`, so `out_of_level_commitment`
     fails where production (scripted WEAK on every ask) is clean: 21 of 39 fresh early asks. It is the price
     of the voiced stall reasons. Live: 0 of 87 stall turns of sweeps 1-3 had accepting model text. And the
-    plain classifier (round 1) reads a genuine negation as a commitment: 5 of 3,010 learner turns of sweeps
-    1-3, about 5 of 60 calls would post `commitment` (3 of them on intent turns).
+    plain classifier (round 1) reads a genuine negation as a commitment: 6 of the 3,010 learner turns of
+    sweeps 1-3, in 6 of 60 calls, would post `commitment` (3 of them on intent turns).
 
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 
