@@ -89,6 +89,7 @@ paths:
     put:
       tags: [r1]
       operationId: updateR1Settings
+      description: 'Admin only. recording_mode (R1-REC) is the instant operational switch for interview recording: off (default), audio or av; any other value is 400 invalid_r1_settings. It is one of several locks (the R2 secrets on the API, the worker capability flags, and the candidate''s live consent to video_audio_recording); the audit row carries the new value.'
       responses: { '200': { description: Updated, audited R1 settings } }
   /api/interview-rounds/availability:
     get:
@@ -184,7 +185,7 @@ paths:
       operationId: getR1WorkerContext
       description: 'Worker bearer. FAILS CLOSED: a failed read of the candidate, the attempt or the settings, or a missing attempt row, is 503 service_unavailable with no body of context, so the worker aborts or retries cleanly (context_failed) instead of starting with a seed-picked persona that differs from the one recorded on the attempt.'
       responses:
-        '200': { description: Sanitized R1 worker context, including the server-assigned attempt (persona) }
+        '200': { description: 'Sanitized R1 worker context, including the server-assigned attempt (persona) and a recording block {mode: off|audio|av}. mode is off unless R1 and the R2 recording config are enabled, r1_settings.recording_mode is not off, and the round holds a live consent containing video_audio_recording. It is a separate guarded read: a failure there is mode off, never a 503.' }
         '409': { description: The room is not a waiting or in-progress R1 browser session (r1_session). }
         '503': { description: A required read failed (service_unavailable), or the worker secret is not configured (worker_auth_not_configured). }
   /api/internal/r1/usage:
@@ -245,6 +246,153 @@ paths:
           description: Unknown attempt.
         '409':
           description: A different outcome was already recorded (r1_outcome_conflict), or the attempt's session is not settled yet or does not match (r1_session_not_settled).
+  /api/internal/r1/recording/prepare:
+    post:
+      tags: [r1]
+      operationId: prepareR1Recording
+      summary: Open the multipart upload of one R1 recording (worker bearer; idempotent)
+      description: 'Gate, in order: R1 and the R2 recording config enabled (else 503 r1_recording_disabled); the room is a live R1 browser session (400 invalid_r1_room, 409 r1_session); r1_settings.recording_mode is not off (503 r1_recording_disabled); the round holds a live consent containing video_audio_recording (409 r1_consent_withdrawn; an existing recording is marked for erasure and an erase job is queued). mode above the server mode is 409 r1_recording_state. Success is always HTTP 200 and Cache-Control: no-store. Idempotent: a repeat answers the current state; a recording that is finishing or later is 409 r1_recording_state, a deleted one 410 r1_recording_deleted. The answer never carries the upload id, an object key, the bucket or an ETag. Audited as recording.upload (fail-closed: an audit outage is 503).'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room, mode]
+              properties:
+                room:
+                  type: string
+                  pattern: '^screening-[0-9a-f-]{36}$'
+                mode:
+                  type: string
+                  enum: [audio, av]
+      responses:
+        '200':
+          description: The upload is open (or already was).
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [mode, content_type, part_size, max_parts, next_part, checkpoint_interval_sec, url_ttl_sec]
+                properties:
+                  mode: { type: string, enum: [audio, av] }
+                  content_type: { type: string, enum: [video/mp4, audio/mp4] }
+                  part_size: { type: integer, enum: [5242880] }
+                  max_parts: { type: integer, enum: [60] }
+                  next_part: { type: integer, minimum: 1 }
+                  checkpoint_interval_sec: { type: integer, enum: [120] }
+                  url_ttl_sec: { type: integer, enum: [600] }
+        '400': { description: 'invalid_r1_room or invalid_recording_request.' }
+        '409': { description: 'r1_session, r1_consent_withdrawn or r1_recording_state.' }
+        '410': { description: 'r1_recording_deleted: stop and discard.' }
+        '429': { description: 'rate_limited: the per-session bucket; retry with jitter.' }
+        '503': { description: 'r1_recording_disabled (stop; the interview continues) or service_unavailable (retry).' }
+  /api/internal/r1/recording/part-url:
+    post:
+      tags: [r1]
+      operationId: signR1RecordingPart
+      summary: A presigned UploadPart URL for one 5 MiB part of the streamed MP4 (worker bearer)
+      description: 'Same gate as prepare. The recording must be uploading; 1 <= part_number <= min(60, parts_issued + 1) (no skipping ahead; re-requesting an issued number is allowed, a re-PUT replaces the part); at most 400 URLs are issued per recording. The URL is a bearer capability with a 600 s TTL, signed for host only: the worker PUTs exactly the part bytes with Content-Type application/octet-stream. Success is HTTP 200, no-store. Never logged, never audited.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room, part_number]
+              properties:
+                room: { type: string, pattern: '^screening-[0-9a-f-]{36}$' }
+                part_number: { type: integer, minimum: 1, maximum: 60 }
+      responses:
+        '200':
+          description: The signed URL.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [url, part_number, expires_in_sec]
+                properties:
+                  url: { type: string }
+                  part_number: { type: integer }
+                  expires_in_sec: { type: integer, enum: [600] }
+        '400': { description: 'invalid_r1_room or invalid_recording_request.' }
+        '409': { description: 'r1_session, r1_consent_withdrawn, or r1_recording_state (not uploading, skipped ahead, part above 60, or the URL cap).' }
+        '410': { description: 'r1_recording_deleted.' }
+        '429': { description: 'rate_limited.' }
+        '503': { description: 'r1_recording_disabled or service_unavailable.' }
+  /api/internal/r1/recording/object-url:
+    post:
+      tags: [r1]
+      operationId: signR1RecordingObject
+      summary: A presigned PUT URL for one fixed R1 recording object (worker bearer)
+      description: 'Same gate as part-url. kind selects a FIXED key under the recording prefix, never a caller-chosen name: audio_partial -> audio.partial.ogg and audio -> audio.ogg (Content-Type audio/ogg), video -> video.mp4 (the faststart copy; video/mp4 for an av recording, audio/mp4 for an audio one). The Content-Type is part of the signature: the worker must send exactly the content_type returned. 600 s TTL. Success is HTTP 200, no-store.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room, kind]
+              properties:
+                room: { type: string, pattern: '^screening-[0-9a-f-]{36}$' }
+                kind: { type: string, enum: [audio_partial, audio, video] }
+      responses:
+        '200':
+          description: The signed URL and the Content-Type to send.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [url, kind, content_type, expires_in_sec]
+                properties:
+                  url: { type: string }
+                  kind: { type: string, enum: [audio_partial, audio, video] }
+                  content_type: { type: string, enum: [audio/ogg, video/mp4, audio/mp4] }
+                  expires_in_sec: { type: integer, enum: [600] }
+        '400': { description: 'invalid_r1_room or invalid_recording_request.' }
+        '409': { description: 'r1_session, r1_consent_withdrawn or r1_recording_state.' }
+        '410': { description: 'r1_recording_deleted.' }
+        '429': { description: 'rate_limited.' }
+        '503': { description: 'r1_recording_disabled or service_unavailable.' }
+  /api/internal/r1/recording/complete:
+    post:
+      tags: [r1]
+      operationId: completeR1Recording
+      summary: The worker is done: queue the server-side finalize (worker bearer; idempotent)
+      description: 'Same gate as prepare. Moves the recording preparing|uploading -> finishing (the database trigger queues exactly one r1.recording.finalize job in the same transaction); the multipart upload is completed SERVER-side by that job, never by the worker. layout is the worker''s claim (combined, split or audio_only) and has_video its claim (forced false for an audio recording); the server verifies what was uploaded and decides the final layout and status. failure_reason and degraded_reason outside the worker vocabulary are stored as NULL, and every report value outside its window is stored as NULL: neither is ever a 400. A replay on finishing, ready, partial or failed answers 200 with the current status; a deleted recording is 410. Success is HTTP 200, no-store. Audited as recording.upload (fail-closed).'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [room, layout, has_video]
+              properties:
+                room: { type: string, pattern: '^screening-[0-9a-f-]{36}$' }
+                layout: { type: string, enum: [combined, split, audio_only] }
+                has_video: { type: boolean }
+                failure_reason: { type: string }
+                degraded_reason: { type: string }
+                report: { type: object }
+      responses:
+        '200':
+          description: The recording is finishing (or already at a later status).
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [status]
+                properties:
+                  status: { type: string, enum: [finishing, ready, partial, failed] }
+        '400': { description: 'invalid_r1_room or invalid_recording_request.' }
+        '409': { description: 'r1_session, r1_consent_withdrawn or r1_recording_state (no prepared recording).' }
+        '410': { description: 'r1_recording_deleted.' }
+        '429': { description: 'rate_limited.' }
+        '503': { description: 'r1_recording_disabled or service_unavailable.' }
   /api/r1/status:
     post:
       tags: [r1]

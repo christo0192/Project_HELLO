@@ -176,15 +176,27 @@ async function loadSession(client: R1DbClient, sessionId: string): Promise<Sessi
   return session;
 }
 
-async function roundHasLiveConsent(client: R1DbClient, roundId: string): Promise<boolean> {
+/**
+ * The round's LIVE consent row (`withdrawn_at is null`; at most one exists, 0115), or null. The one
+ * definition of "live" shared by the scorer and the recording gate (R1-REC). A read error throws
+ * `r1_consent_read_error`.
+ */
+export async function loadRoundLiveConsent(
+  client: R1DbClient,
+  roundId: string,
+): Promise<{ readonly id: string; readonly consents: unknown } | null> {
   const { data, error } = await client
     .from('interview_round_consents')
-    .select('id')
+    .select('id,consents')
     .eq('round_id', roundId)
     .is('withdrawn_at', null)
     .limit(1);
   if (error) fail('r1_consent_read_error');
-  return Array.isArray(data) && data.length > 0;
+  return Array.isArray(data) && data.length > 0 ? (data[0] as { id: string; consents: unknown }) : null;
+}
+
+async function roundHasLiveConsent(client: R1DbClient, roundId: string): Promise<boolean> {
+  return (await loadRoundLiveConsent(client, roundId)) !== null;
 }
 
 async function loadLatestAssessment(

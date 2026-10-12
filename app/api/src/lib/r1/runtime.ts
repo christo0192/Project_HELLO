@@ -2,11 +2,14 @@
  * lib/r1/runtime.ts: the composition root for the R1 queue runtime (plan 6.7).
  *
  * ── DEDICATED AND ISOLATED ────────────────────────────────────────────
- * R1 gets its OWN `createQueueRunner` (concurrency 1) and its OWN loop scheduler. It hosts
- * exactly one handler today, `r1.assessment`; `r1.recording.finalize` and `r1.sweep` join it
- * in PR-8. It is NEVER registered in the phone runtime (handlers `{phone.dial,
- * phone.assessment}`, `lib/phone-runtime/runtime.ts`) or the recording runtime, and the phone
- * runtime is never touched: `r1-runtime-structural.test.ts` pins both facts.
+ * R1 gets its OWN `createQueueRunner` (concurrency 1) and its OWN loop scheduler. The assessment
+ * runner hosts exactly one handler, `r1.assessment`. A SECOND runner, `r1-storage` (concurrency 1,
+ * its own loop), hosts the recording lane (R1-REC): `r1.recording.finalize` today, with
+ * `r1.recording.erase` and `r1.sweep` joining it in the privacy-lifecycle task. It is separate so
+ * a ten-minute scoring job can never delay a deletion or a finalize. Neither runner is EVER
+ * registered in the phone runtime (handlers `{phone.dial, phone.assessment}`,
+ * `lib/phone-runtime/runtime.ts`) or the recording runtime, and the phone runtime is never
+ * touched: `r1-runtime.test.ts` ("structural fences") pins both facts.
  *
  * ── WITH THE SHIPPED DEFAULTS THIS CONSTRUCTS NOTHING ─────────────────
  * `R1_ENABLED` is unset/false, so `createR1Runtime` returns null: no runner, no scheduler, no
@@ -15,8 +18,14 @@
  * row that cannot be read means "do not claim"). A paused R1 still scores sessions that
  * already finished ("live sessions finish"); a disabled one scores and applies nothing.
  *
- * ── TWO LOOPS ─────────────────────────────────────────────────────────
+ * ── THREE LOOPS ───────────────────────────────────────────────────────
  *   r1-assessment  drains `r1.assessment` through the handler.
+ *   r1-storage     drains the recording lane (`r1.recording.finalize`). It claims while the R2
+ *                  recording config is `enabled` and is NOT tied to `r1_settings.enabled`: a
+ *                  paused or disabled R1 must still finish a recording already in flight, and the
+ *                  erase and sweep handlers that join it are privacy obligations that a kill
+ *                  switch must never stop. With no R2 config the jobs simply stay `pending`
+ *                  (no attempt is spent).
  *   r1-status      closes due 24 h pending rejects (`r1_apply_due_pending_rejects`) and runs
  *                  the override monitor, which switches auto-status off at >10% over a
  *                  rolling 20. Both are SECURITY DEFINER RPCs that re-check the CAS, so a
@@ -52,12 +61,17 @@ import {
   createR1FinalDeferralGuard,
 } from './assessment-handler.js';
 import { lapseOrphanedR1Sessions, type R1OrphanLapseOptions } from './orphan-lapse.js';
+import { getR1RecordingConfig, type R1RecordingConfig } from './recording/config.js';
+import { createR1RecordingFinalizeHandler } from './recording/handlers.js';
+import { R1_RECORDING_FINALIZE_QUEUE } from './recording/queues.js';
+import { getR1RecordingStore } from './recording/store-factory.js';
+import type { R1ObjectStore } from './recording/store.js';
 import { agentDispatchClientFor, browserLiveKitEndpoint } from '../livekit-endpoints.js';
 import type { DispatchListerLike } from './worker-gate.js';
 import { recordR1ScoringFailure, type R1AssessmentOptions } from '../../services/r1-assessment.js';
 
 /** The ONLY queues this runtime registers. A structural test pins it. */
-export const R1_RUNTIME_QUEUES: readonly string[] = [R1_ASSESSMENT_QUEUE];
+export const R1_RUNTIME_QUEUES: readonly string[] = [R1_ASSESSMENT_QUEUE, R1_RECORDING_FINALIZE_QUEUE];
 
 export const R1_RUNTIME_BOUNDS = {
   /**
@@ -66,6 +80,8 @@ export const R1_RUNTIME_BOUNDS = {
    */
   jobLeaseSeconds: 600,
   queuePollMs: 5_000,
+  /** The recording lane's poll: finalize is not latency-critical, but it should not lag a minute. */
+  storagePollMs: 5_000,
   statusPollMs: 60_000,
   /** How long an `r1_settings.enabled` read is trusted. */
   enabledCacheMs: 5_000,
@@ -80,6 +96,8 @@ export interface R1RuntimeSnapshot {
   /** Lapse reads/writes that failed (the next pass retries). */
   readonly orphanLapseErrors: number;
   readonly jobEvents: Readonly<Record<string, number>>;
+  /** The recording lane's queue events, kept apart from `jobEvents` (scoring). */
+  readonly storageJobEvents: Readonly<Record<string, number>>;
 }
 
 /**
@@ -101,6 +119,10 @@ export interface R1RuntimeOptions {
   readonly queue?: Queue;
   readonly owner?: string;
   readonly infer?: R1AssessmentOptions['infer'];
+  /** Test seam for the recording config; production reads `R1_RECORDING_*` at call time. */
+  readonly recordingConfig?: () => R1RecordingConfig;
+  /** Test seam for the object store; production uses the shared S3 store. */
+  readonly recordingStore?: (config: Extract<R1RecordingConfig, { enabled: true }>) => R1ObjectStore;
   readonly now?: () => Date;
   readonly scheduler?: {
     readonly random?: () => number;
@@ -113,6 +135,8 @@ export interface R1RuntimeOptions {
 export interface R1RuntimeHandle {
   readonly scheduler: LoopSchedulerHandle;
   readonly runner: QueueRunnerHandle;
+  /** The recording lane's runner (`r1-storage`). */
+  readonly storageRunner: QueueRunnerHandle;
   readonly queue: Queue;
   /** The queue names this runtime claims from. */
   readonly queues: readonly string[];
@@ -156,6 +180,8 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
   };
 
   const jobEvents: Record<string, number> = {};
+  const storageJobEvents: Record<string, number> = {};
+  const recordingConfig = options.recordingConfig ?? ((): R1RecordingConfig => getR1RecordingConfig());
   let lastStatusApplied: number | null = null;
   let statusLoopErrors = 0;
   let lastOrphansLapsed: number | null = null;
@@ -195,6 +221,42 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
       // Metadata only: a queue name and a sanitized kind. Never a payload or an id.
       logger.info('unknown_event', {
         error_category: `r1_queue_${event.kind}`,
+        error_type: event.queueName,
+      });
+    },
+  });
+
+  // The recording lane. NOT gated on `r1_settings.enabled`: only on the R2 config, so a paused or
+  // disabled R1 still finalizes a recording in flight. The handler list grows with the privacy lifecycle.
+  const storageRunner = createQueueRunner({
+    queue,
+    handlers: {
+      [R1_RECORDING_FINALIZE_QUEUE]: createR1RecordingFinalizeHandler({
+        db: client as never,
+        recordingConfig,
+        store: options.recordingStore ?? getR1RecordingStore,
+        enqueue: (name, payload, enqueueOptions) => queue.enqueue(name, payload, enqueueOptions),
+        now: clock,
+        // The verdict only: no id, key or size ever reaches a log line.
+        onResult: (outcome) => logger.info('unknown_event', {
+          error_category: outcome.kind === 'finalized' ? `r1_recording_${outcome.status}` : `r1_recording_${outcome.kind}`,
+        }),
+      }),
+    },
+    owner: `${owner}-storage`,
+    shouldClaim: async (queueName: string): Promise<boolean> =>
+      queueName === R1_RECORDING_FINALIZE_QUEUE && recordingConfig().enabled,
+    leaseSeconds: R1_RUNTIME_BOUNDS.jobLeaseSeconds,
+    concurrency: 1,
+    pollMs: R1_RUNTIME_BOUNDS.storagePollMs,
+    onEvent: (event) => {
+      storageJobEvents[event.kind] = (storageJobEvents[event.kind] ?? 0) + 1;
+      // With no R2 config every 5 s tick is `not_admitted`: count it, but do not write a log line
+      // forever for the shipped default (recording off).
+      if (event.kind === 'not_admitted') return;
+      // Metadata only: a queue name and a sanitized kind. Never a payload, an id or a key.
+      logger.info('unknown_event', {
+        error_category: `r1_storage_queue_${event.kind}`,
         error_type: event.queueName,
       });
     },
@@ -247,6 +309,7 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
   const loopIntervalsMs = {
     'r1-assessment': R1_RUNTIME_BOUNDS.queuePollMs,
     'r1-status': R1_RUNTIME_BOUNDS.statusPollMs,
+    'r1-storage': R1_RUNTIME_BOUNDS.storagePollMs,
   } as const;
   const scheduler = createLoopScheduler({
     ...(options.scheduler ?? {}),
@@ -258,12 +321,18 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
         tick: queueRunnerTick(runner),
       },
       { name: 'r1-status', intervalMs: loopIntervalsMs['r1-status'], tick: statusTick },
+      {
+        name: 'r1-storage',
+        intervalMs: loopIntervalsMs['r1-storage'],
+        tick: queueRunnerTick(storageRunner),
+      },
     ],
   });
 
   return {
     scheduler,
     runner,
+    storageRunner,
     queue,
     queues: R1_RUNTIME_QUEUES,
     loopIntervalsMs,
@@ -273,14 +342,17 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
       lastOrphansLapsed,
       orphanLapseErrors,
       jobEvents: { ...jobEvents },
+      storageJobEvents: { ...storageJobEvents },
     }),
     async tickAll(): Promise<void> {
       await runner.tick();
+      await storageRunner.tick();
       await statusTick();
     },
     async stop(): Promise<void> {
       await scheduler.stop();
       await runner.stop();
+      await storageRunner.stop();
     },
   };
 }

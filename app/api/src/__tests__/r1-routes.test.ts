@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import request from 'supertest';
 import { createHash } from 'node:crypto';
@@ -55,6 +55,7 @@ function query(table: string, tables: Tables) {
     is: (key: string, expected: unknown) => { filters.push((row) => row[key] === expected); return q; },
     in: (key: string, expected: unknown[]) => { filters.push((row) => expected.includes(row[key])); return q; },
     order: () => q,
+    limit: () => q,
     update: (next: Row) => { operation = 'update'; value = next; return q; },
     insert: (next: Row | Row[]) => { operation = 'insert'; value = next; return q; },
     maybeSingle: async () => { const r = result(); return { data: Array.isArray(r.data) ? (r.data[0] ?? null) : null, error: r.error }; },
@@ -218,6 +219,47 @@ describe('R1 recruiter routes', () => {
     expect(response.status).toBe(200);
     expect(tables.r1_settings[0]).toMatchObject({ paused: true, livekit_target: 'r1', updated_by: OWNER });
     expect(audits.some((entry) => entry.event === 'resource.update' && entry.metadata?.resource === 'r1_settings')).toBe(true);
+  });
+
+  describe('recording_mode (R1-REC): the instant operational switch for interview recording', () => {
+    it.each(['off', 'audio', 'av'])('accepts %s from an admin, stores it and puts the new value in the audit row', async (mode) => {
+      const tables = baseTables();
+      tables.r1_settings[0].recording_mode = mode === 'off' ? 'av' : 'off';
+      const response = await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ recording_mode: mode });
+      expect(response.status).toBe(200);
+      expect(tables.r1_settings[0]).toMatchObject({ recording_mode: mode, updated_by: OWNER });
+      expect(response.body.recording_mode).toBe(mode);
+      const entry = audits.find((a) => a.event === 'resource.update' && a.metadata?.resource === 'r1_settings');
+      expect(entry?.metadata).toMatchObject({ resource: 'r1_settings', recording_mode: mode });
+    });
+
+    it.each([['video'], ['AV'], [''], [1], [true], [null], [['av']], [{ mode: 'av' }]])('refuses %j with 400 invalid_r1_settings and changes nothing', async (value) => {
+      const tables = baseTables();
+      tables.r1_settings[0].recording_mode = 'off';
+      const response = await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ recording_mode: value });
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({ error: 'invalid_r1_settings' });
+      expect(tables.r1_settings[0].recording_mode).toBe('off');
+    });
+
+    it('is admin-only, and an update that does not name it leaves it (and the audit row) alone', async () => {
+      const tables = baseTables();
+      tables.r1_settings[0].recording_mode = 'av';
+      expect((await request(appFor('interviewer', OWNER, tables).app).put('/api/admin/r1/settings').send({ recording_mode: 'off' })).status).toBe(403);
+      expect((await request(appFor('viewer', OWNER, tables).app).put('/api/admin/r1/settings').send({ recording_mode: 'off' })).status).toBe(403);
+      expect(tables.r1_settings[0].recording_mode).toBe('av');
+      expect((await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ paused: true })).status).toBe(200);
+      expect(tables.r1_settings[0].recording_mode).toBe('av');
+      const entry = audits.filter((a) => a.event === 'resource.update' && a.metadata?.resource === 'r1_settings').at(-1);
+      expect(entry?.metadata).toEqual({ resource: 'r1_settings' });
+    });
+
+    it('is readable by the admin settings GET', async () => {
+      const tables = baseTables();
+      tables.r1_settings[0].recording_mode = 'audio';
+      const response = await request(appFor('admin', OWNER, tables).app).get('/api/admin/r1/settings');
+      expect(response.body.recording_mode).toBe('audio');
+    });
   });
 
   it('stamps a dashboard reading through the database RPC, never in the route', async () => {
@@ -498,6 +540,95 @@ describe('R1 internal worker routes', () => {
       const response = await context(internalApp(tables).app);
       expect(response.status).toBe(409);
       expect(response.body.error).toBe('r1_session');
+    });
+  });
+
+  describe('POST context projects the recording mode (R1-REC), in its own guarded read', () => {
+    const FAKE_R2 = {
+      R1_RECORDING_S3_ENDPOINT: 'https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com',
+      R1_RECORDING_S3_REGION: 'auto',
+      R1_RECORDING_S3_BUCKET: 'ik-r1-recordings',
+      R1_RECORDING_S3_ACCESS_KEY_ID: 'AKIAFAKEFAKEFAKEFAKE',
+      R1_RECORDING_S3_SECRET_ACCESS_KEY: 'fake-secret-0123456789abcdefghijklmnopqrstuvwxyz',
+    };
+    const saved: Record<string, string | undefined> = {};
+    beforeEach(() => {
+      for (const name of [...Object.keys(FAKE_R2), 'R1_ENABLED']) saved[name] = process.env[name];
+    });
+    afterEach(() => {
+      for (const [name, value] of Object.entries(saved)) { if (value === undefined) delete process.env[name]; else process.env[name] = value; }
+    });
+    const recordingTables = (mode: string | undefined, consents: string[] | null = ['ai_interview', 'video_audio_recording']) => {
+      const tables = readyTables();
+      if (mode !== undefined) tables.r1_settings[0].recording_mode = mode;
+      tables.interview_round_consents = consents ? [{ id: 'consent-1', round_id: ROUND, consents, withdrawn_at: null }] : [];
+      return tables;
+    };
+    const context = (app: express.Express) =>
+      request(app).post('/api/internal/r1/context').set('authorization', `Bearer ${SECRET}`).send({ room: `screening-${SESSION}` });
+
+    it('is off by default: the storage secrets are not set', async () => {
+      for (const name of Object.keys(FAKE_R2)) delete process.env[name];
+      const response = await context(internalApp(recordingTables('av')).app);
+      expect(response.status).toBe(200);
+      expect(response.body.recording).toEqual({ mode: 'off' });
+      // The rest of the start context is untouched.
+      expect(response.body.attempt).toMatchObject({ persona_id: 'p1' });
+    });
+
+    it.each([['audio'], ['av']])('answers %s only when every lock is open', async (mode) => {
+      Object.assign(process.env, FAKE_R2);
+      const response = await context(internalApp(recordingTables(mode)).app);
+      expect(response.status).toBe(200);
+      expect(response.body.recording).toEqual({ mode });
+    });
+
+    it.each([
+      ['recording_mode is off', () => recordingTables('off'), undefined],
+      ['recording_mode is not a mode', () => recordingTables('video'), undefined],
+      ['recording_mode is not migrated yet (no column)', () => recordingTables(undefined), undefined],
+      ['the round has no live consent', () => recordingTables('av', null), undefined],
+      ['the live consent lacks video_audio_recording', () => recordingTables('av', ['ai_interview', 'ai_evaluation']), undefined],
+      ['R1 itself is off', () => recordingTables('av'), () => { process.env.R1_ENABLED = 'false'; }],
+      ['the storage config is invalid', () => recordingTables('av'), () => { process.env.R1_RECORDING_S3_REGION = 'nowhere'; }],
+      ['the storage config is partial', () => recordingTables('av'), () => { delete process.env.R1_RECORDING_S3_BUCKET; }],
+    ])('answers off when %s', async (_name, arrange, tweak) => {
+      Object.assign(process.env, FAKE_R2);
+      tweak?.();
+      const response = await context(internalApp(arrange()).app);
+      expect(response.status).toBe(200);
+      expect(response.body.recording).toEqual({ mode: 'off' });
+    });
+
+    it('a withdrawn consent (no live row) is off', async () => {
+      Object.assign(process.env, FAKE_R2);
+      const tables = recordingTables('av');
+      tables.interview_round_consents[0].withdrawn_at = '2026-10-12T09:00:00.000Z';
+      expect((await context(internalApp(tables).app)).body.recording).toEqual({ mode: 'off' });
+    });
+
+    it('a failing recording read leaves /context a 200 with mode off (it never turns into a 503)', async () => {
+      Object.assign(process.env, FAKE_R2);
+      const { app } = internalApp(recordingTables('av'));
+      failingTables.add('interview_round_consents');
+      const response = await context(app);
+      expect(response.status).toBe(200);
+      expect(response.body.recording).toEqual({ mode: 'off' });
+      expect(response.body.attempt).toMatchObject({ persona_id: 'p1' });
+    });
+
+    it('a throwing recording read is off too, and the required reads still fail closed', async () => {
+      Object.assign(process.env, FAKE_R2);
+      const tables = recordingTables('av');
+      from.mockImplementation((table: string) => {
+        if (table === 'interview_round_consents') throw new Error('connection refused');
+        return query(table, tables);
+      });
+      const response = await context(express().use(express.json()).use('/api/internal/r1', r1InternalRouter));
+      expect(response.status).toBe(200);
+      expect(response.body.recording).toEqual({ mode: 'off' });
+      failingTables.add('interview_round_attempts');
+      expect((await context(express().use(express.json()).use('/api/internal/r1', r1InternalRouter))).status).toBe(503);
     });
   });
 
