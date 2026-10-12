@@ -340,18 +340,30 @@ to describe implemented schema only.
 | Phase, scheduled move, delivery/slip, reveal and close-control data | Internal | Deterministic role-play audit data; not scoring text |
 | Candidate-linked administration evidence or free-text exception detail | **Confidential PII** | Restrict to R1 HR/operations access and minimize content |
 
-### `screening_v2.interview_round_recordings` (planned)
+### `screening_v2.interview_round_recordings` and `screening_v2.r1_recording_purge` (0127)
+
+Both tables are service-role-only (RLS on, no policies). A row describes one
+attempt's recording; the media itself lives in the private Cloudflare R2 bucket
+`ik-r1-recordings`.
 
 | Column | Classification | Notes |
 |--------|---------------|-------|
-| `session_id` (PK), `bucket`, `object_key`, `partial_keys`, `upload_id`, `status` | Internal | Planned recording identity, object-location, multipart, and lifecycle state; no access credential is stored |
-| `sha256`, `bytes`, `duration_ms`, `content_type` | Internal | Planned integrity and media-description metadata |
-| `width`, `height`, `fps`, `frames_encoded`, `frames_dropped`, `camera_off_ms` | Internal | Planned video dimensions, encoder, and camera-availability metadata |
-| `started_at_ms`, `finalized_at`, `revoked_at`, `deleted_at`, `legal_hold` | Internal | Planned playback-anchor, finalization, revocation, deletion, and retention-hold metadata |
-| Recording object content (candidate camera, audio, transcript-linked playback) | **Confidential PII** | HR-review-only R1 A/V; 90-day target retention remains subject to Legal approval |
+| `upload_id` | **Secret** | R2 multipart upload id, a bearer handle for the in-progress upload. Never returned by any route, never logged, never placed in an audit row; nulled when the upload completes or the recording is erased |
+| `session_id` (PK), `round_id`, `requested_mode`, `status`, `layout`, `has_video`, `parts_issued`, `urls_issued`, `finalize_attempts`, `created_at`, `updated_at`, `finalize_requested_at`, `finalized_at` | Internal | Attempt identity, lifecycle state machine and upload counters; no access credential is stored |
+| `bucket`, `prefix`, `video_key`, `audio_key` | Internal | Opaque object location (`r1/<round_id>/<session_id>/...`, UUIDs only, derived server-side and never from worker input); never returned to a client |
+| `video_sha256`, `video_etag`, `video_bytes`, `video_content_type`, `audio_sha256`, `audio_etag`, `audio_bytes` | Internal | Server-computed integrity and media-description metadata |
+| `started_at_ms`, `duration_ms`, `width`, `height`, `fps`, `frames_encoded`, `frames_dropped`, `degraded_at_ms`, `reported_stream_bytes`, `reported_parts`, `degraded_reason`, `failure_reason` | Internal | Display-only worker report (an out-of-window value is stored as NULL) and stable failure/degradation codes |
+| `camera_off_ms` | Internal | Candidate behavioural metadata (how long the camera was unavailable); staff-only, never exposed outside the staff roles |
+| `delete_after`, `delete_requested_at`, `delete_reason`, `deleted_at` | Internal | Retention (fixed per row when the recording is prepared, at most 90 days), erasure request and tombstone metadata |
+| `r1_recording_purge` (`bucket`, `prefix`, `upload_id`, `reason`, `attempts`, `last_error_code`, `queued_at`, `done_at`) | Internal (`upload_id` is Secret) | Durable erase outbox filled whenever a recording row is deleted, including by an FK cascade; drained by the `r1.sweep` job |
+| `r1_settings.recording_mode` | Internal | `off` / `audio` / `av`: the operational switch for recording (default `off`) |
+| Recording object content (candidate camera, audio of both sides, transcript-linked playback) | **Confidential PII** | Staff-viewable R1 A/V (admins and viewers: any candidate; interviewers: their own candidates); 90-day retention, erased on consent withdrawal and on DSAR. The candidate notice and the recording go-live remain subject to the Legal gates recorded in migration 0123 |
 
-Presigned review/download URLs are transient, **Secret**-class bearer URLs. They
-are generated on demand and are never persisted or logged.
+Presigned upload and playback URLs are transient, **Secret**-class bearer URLs.
+They are generated on demand and are never persisted, logged or placed in an audit
+row; playback responses are `Cache-Control: no-store`. The R2 access key id and
+secret access key (`R1_RECORDING_S3_*`) are **Secret** credentials held only by
+`project-hello-api`: the R1 worker receives presigned URLs and never holds one.
 
 ## Classification summary
 
