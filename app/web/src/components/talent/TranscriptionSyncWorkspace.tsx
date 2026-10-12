@@ -25,6 +25,14 @@
  *   2. audio timeupdate → nearest turn by start_offset_sec → highlight.
  *   3. Selecting a new session resets everything; stale loads are discarded.
  *
+ * R1 sessions (a session that belongs to an R1 round): the recording is the R1
+ * attempt's own, played by `R1RecordingPlayer` in the same slot, and the legacy
+ * `RecordingPlayer` (and its download call, which R1 sessions have no file for)
+ * is never rendered. The turns are placed on that recording from the attempt's
+ * summary (`started_at_ms`, read from the rounds list) and a click seeks with
+ * `playFromTurn`; a turn without a time stays untimed. A reduced API adapter
+ * without the R1 rounds call degrades to a pointer, never an error.
+ *
  * Phone sessions (M013 S02): a phone session can span several LEGS (the first
  * call, then reconnects after a drop), each with its own recording file. When
  * the host passes `candidateId`, a phone session lists EVERY leg in order —
@@ -60,6 +68,8 @@ import {
 } from './CandidateScorecard';
 import { CandidateScorecardV2 } from './CandidateScorecardV2';
 import { EvidenceHoldNotice } from './EvidenceHoldNotice';
+import { R1RecordingPlayer } from '../r1/R1RecordingPlayer';
+import type { R1RecordingPlayerHandle } from '../r1/R1RecordingPlayer';
 import { RecordingPlayer } from './RecordingPlayer';
 import type { RecordingPlayerHandle } from './RecordingPlayer';
 import { SeekableTranscript } from './SeekableTranscript';
@@ -78,7 +88,18 @@ import {
   sessionStatusTone,
 } from './status';
 import { formatDateTime } from '../../lib/datetime';
+import { turnMediaSec } from '../../lib/r1-recording';
+import type { R1RecordingSummary } from '../../lib/r1-types';
 import { sessionModeLabel } from '../../lib/session-mode';
+
+/** What the Review tab calls an R1 session (it is not a phone screening). */
+const R1_SESSION_LABEL = 'R1 role-play';
+
+/** An R1 session's attempt summary, read from the candidate's rounds. */
+type R1SessionRecording =
+  | { sessionId: string; status: 'loading' }
+  | { sessionId: string; status: 'ready'; roundId: string; summary: R1RecordingSummary }
+  | { sessionId: string; status: 'unavailable' };
 
 /** One leg page is plenty (a session has a handful of legs); follow a few. */
 const LEG_PAGE_SIZE = 50;
@@ -118,6 +139,11 @@ export interface TranscriptionSyncWorkspaceProps {
    * Overview's, so the Review tab never fetches it a second time.
    */
   callRecordings?: React.ReactNode;
+  /**
+   * False pauses an R1 recording: this tab can be hidden while its panel stays
+   * mounted, and a video must not keep playing behind another tab. Default true.
+   */
+  active?: boolean;
 }
 
 /** Résumé conflicts, whether they arrive on the column or (rarely) inside raw. */
@@ -160,6 +186,7 @@ export function TranscriptionSyncWorkspace({
   blocked,
   candidateId,
   callRecordings,
+  active = true,
 }: TranscriptionSyncWorkspaceProps) {
   const selectableSessions = useMemo(
     () => sessions.filter((s) => s.status === 'completed'),
@@ -181,12 +208,17 @@ export function TranscriptionSyncWorkspace({
   const [refreshKey, setRefreshKey] = useState(0);
 
   const playerRef = useRef<RecordingPlayerHandle>(null);
+  const r1PlayerRef = useRef<R1RecordingPlayerHandle>(null);
   const transcriptHeadingId = useId();
 
   const selectedSession = useMemo(
     () => selectableSessions.find((s) => s.id === selectedSessionId) ?? null,
     [selectableSessions, selectedSessionId],
   );
+
+  // An R1 session belongs to a round: its recording is that attempt's own (see the file header).
+  const r1RoundId = selectedSession?.interview_round_id ?? null;
+  const isR1 = r1RoundId !== null;
 
   // Load transcript + assessment + session meta when session/refreshKey changes
   const loadTranscript = useCallback((sessionId: string) => {
@@ -250,6 +282,69 @@ export function TranscriptionSyncWorkspace({
     }
     return loadTranscript(selectedSessionId);
   }, [selectedSessionId, refreshKey, loadTranscript]);
+
+  /* ── R1 recording: THIS session's attempt, from the rounds list ─── */
+
+  const r1Supported = !!candidateId && typeof api.listR1Rounds === 'function';
+  const [r1Rec, setR1Rec] = useState<R1SessionRecording | null>(null);
+  const [r1RefreshKey, setR1RefreshKey] = useState(0);
+  // Read only once the transcript has loaded: someone who cannot read the transcript (403) is
+  // pointed at the Overview tab and costs the API nothing here.
+  const loadedSessionId = loadedSession?.id ?? null;
+
+  useEffect(() => {
+    if (!isR1 || !r1Supported || !candidateId || !r1RoundId || !selectedSessionId || !loadedSessionId) {
+      setR1Rec(null);
+      return;
+    }
+    let cancelled = false;
+    const sessionId = selectedSessionId;
+    // A re-read ("Check again") keeps the player that is on screen until the answer is in.
+    setR1Rec((prev) =>
+      prev && prev.sessionId === sessionId && prev.status === 'ready' ? prev : { sessionId, status: 'loading' },
+    );
+    // `Promise.resolve().then`: an adapter without the call throws synchronously, which must not
+    // unmount the transcript.
+    Promise.resolve()
+      .then(() => api.listR1Rounds(candidateId))
+      .then((result) => {
+        if (cancelled) return;
+        const rounds = Array.isArray(result?.rounds) ? result.rounds : [];
+        const round = rounds.find((r) => r.id === r1RoundId);
+        const attempt =
+          round && Array.isArray(round.attempts)
+            ? round.attempts.find((a) => a?.session_id === sessionId)
+            : undefined;
+        setR1Rec(
+          round && attempt?.recording
+            ? { sessionId, status: 'ready', roundId: round.id, summary: attempt.recording }
+            : { sessionId, status: 'unavailable' },
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setR1Rec({ sessionId, status: 'unavailable' });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isR1, r1Supported, candidateId, r1RoundId, selectedSessionId, loadedSessionId, r1RefreshKey]);
+
+  const r1Ready = r1Rec?.sessionId === selectedSessionId && r1Rec.status === 'ready' ? r1Rec : null;
+  const r1Summary = r1Ready?.summary ?? null;
+
+  // The turns as the transcript shows them. A phone turn comes with its own offset; an R1 turn is
+  // placed on the recording from the attempt's anchor (same worker clock, so exact), and a turn
+  // without a time stays untimed rather than being given a wrong one.
+  const displayTranscript = useMemo<TranscriptLine[]>(
+    () =>
+      !isR1
+        ? transcript
+        : transcript.map((turn) => ({
+            ...turn,
+            start_offset_sec: r1Summary ? turnMediaSec(turn.started_at_ms, r1Summary) : null,
+          })),
+    [isR1, transcript, r1Summary],
+  );
 
   /* ── Phone legs (M013 S02) ─────────────────────────────────── */
 
@@ -332,15 +427,25 @@ export function TranscriptionSyncWorkspace({
         setActiveLegTurn(found);
         return;
       }
-      setActiveTurnIndex(findActiveTurnIndex(transcript, currentTime));
+      setActiveTurnIndex(findActiveTurnIndex(displayTranscript, currentTime));
     },
-    [transcript, legsMode, legGroups],
+    [displayTranscript, legsMode, legGroups],
   );
 
   // click-to-play contract — RecordingPlayer owns mint/wait/seek/play.
-  const handleSeek = useCallback((offsetSec: number) => {
-    playerRef.current?.playFrom(offsetSec);
-  }, []);
+  const handleSeek = useCallback(
+    (offsetSec: number) => {
+      if (isR1) {
+        // The clicked row carries the offset the turn was placed at; find the turn it came from and
+        // seek by ITS own start time, so the lead-in and the anchor are applied in one place.
+        const turn = displayTranscript.find((t) => t.start_offset_sec === offsetSec);
+        if (typeof turn?.started_at_ms === 'number') r1PlayerRef.current?.playFromTurn(turn.started_at_ms);
+        return;
+      }
+      playerRef.current?.playFrom(offsetSec);
+    },
+    [isR1, displayTranscript],
+  );
 
   /** A leg's playhead moved: highlight within that leg's group only. */
   const handleLegTimeUpdate = useCallback(
@@ -542,7 +647,35 @@ export function TranscriptionSyncWorkspace({
             </button>
           </div>
         )}
-        {selectedSessionId && showSessionPlayer && (
+        {selectedSessionId && isR1 && (
+          /* An R1 session: the attempt's own recording, in the slot the legacy player would have
+             had. The legacy player (and its download call) is never rendered for it. */
+          <div>
+            <h3 className="sr-only">{R1_SESSION_LABEL} recording</h3>
+            {r1Ready ? (
+              <R1RecordingPlayer
+                key={selectedSessionId}
+                ref={r1PlayerRef}
+                roundId={r1Ready.roundId}
+                sessionId={selectedSessionId}
+                summary={r1Ready.summary}
+                label={R1_SESSION_LABEL}
+                active={active}
+                onTimeUpdate={handleTimeUpdate}
+                onNeedRefresh={() => setR1RefreshKey((k) => k + 1)}
+              />
+            ) : r1Supported && r1Rec?.status !== 'unavailable' ? (
+              <p role="status" className="text-[13px] text-[var(--c-ink-secondary)]">
+                Loading recording details…
+              </p>
+            ) : (
+              <p className="text-[13px] text-[var(--c-ink-secondary)]">
+                The recording for this R1 session is on the candidate page, under R1 interview.
+              </p>
+            )}
+          </div>
+        )}
+        {selectedSessionId && showSessionPlayer && !isR1 && (
           <div className={legsMode ? 'mt-3 border-t border-[var(--c-border-light)] pt-3' : undefined}>
             {legsMode && (
               <p className="mb-1 text-xs text-[var(--c-ink-secondary)]">
@@ -619,7 +752,7 @@ export function TranscriptionSyncWorkspace({
           })
         ) : (
           <SeekableTranscript
-            transcript={transcript}
+            transcript={displayTranscript}
             activeTurnIndex={activeTurnIndex}
             onSeek={handleSeek}
             recordingReady={true}
@@ -647,6 +780,11 @@ export function TranscriptionSyncWorkspace({
         Detailed transcript playback and recording review require admin
         access. The session scorecard is shown alongside.
       </p>
+      {isR1 && (
+        <p className="mt-2 max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
+          The recording is on the Overview tab.
+        </p>
+      )}
     </SurfaceCard>
   );
 
@@ -678,7 +816,7 @@ export function TranscriptionSyncWorkspace({
                     dropped call whose end was not observed). */}
                 {[
                   formatDateTime(s.created_at),
-                  sessionModeLabel(s.mode),
+                  s.interview_round_id != null ? R1_SESSION_LABEL : sessionModeLabel(s.mode),
                   sessionLengthLabel(s),
                 ]
                   .filter(Boolean)

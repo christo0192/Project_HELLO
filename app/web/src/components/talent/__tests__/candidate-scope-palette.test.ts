@@ -55,6 +55,10 @@ const CANDIDATE_SCOPE_SOURCES = [
   'src/components/r1/SendR1Controls.tsx',
   'src/components/r1/R1RoundsPanel.tsx',
   'src/components/r1/IssuedLink.tsx',
+  // R1-REC: the recording row and player render inside the same Overview card (and the
+  // player inside the Review tab), so they are candidate-scoped too.
+  'src/components/r1/R1RecordingRow.tsx',
+  'src/components/r1/R1RecordingPlayer.tsx',
   // M013 S02: each call leg of a phone session on the Review tab.
   'src/components/talent/SessionLegRow.tsx',
   'src/components/design/SurfaceCard.tsx',

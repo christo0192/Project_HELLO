@@ -1,6 +1,6 @@
 # CSP Lifecycle — SEC-07
 
-**Last updated:** 2026-07-28
+**Last updated:** 2026-10-12
 
 ## Architecture
 
@@ -34,7 +34,31 @@ VITE_CSP_REPORT_ENDPOINT=http://localhost:8787/api/csp-report
 # VITE_API_BASE          → connect-src (canonical)
 # VITE_SUPABASE_URL      → connect-src (https + wss), media-src (signed recording URLs)
 # VITE_LIVEKIT_URL       → connect-src (wss)
+
+# OPTIONAL. Where R1 interview recordings are served from (the R2 S3 host that the
+# presigned links point at; a comma list is allowed). media-src ONLY.
+# Unset or empty = the header above, byte for byte.
+VITE_R1_RECORDINGS_ORIGIN=https://<account>.r2.cloudflarestorage.com
 ```
+
+### R1 interview recordings (`VITE_R1_RECORDINGS_ORIGIN`)
+
+Staff play an R1 recording in a plain `<video src>` / `<audio src>` whose address is a
+short-lived presigned link on the object store's S3 host. A media element is governed by
+`media-src` alone: the player never `fetch`es the object and sets no `crossorigin`, so
+neither `connect-src` nor CORS is involved, and the origin is added to `media-src` and
+nothing else. The host depends on the bucket's jurisdiction (`<account>.r2…`,
+`<account>.eu.r2…`, `<account>.fedramp.r2…`); the API's `R1_RECORDING_S3_ENDPOINT` and this
+variable are set from the same decision. Presigned links use path-style addressing, so the
+host is that single origin.
+
+The value is validated like every other input: each entry must be an exact canonical
+`https://host` origin (no path, query, credentials, wildcard or other scheme), and a bad
+value stops the dev/preview server rather than changing the policy. **Production serves no
+CSP header today** (`vercel.json` has rewrites only; this plugin is dev/preview only), so a
+presigned recording plays in production regardless; the variable keeps dev and preview
+clean and, when a Vercel header is added or the mode is flipped to enforce, that header's
+`media-src` must include this origin or recordings stop playing.
 
 ## Generated Header (Example)
 
@@ -54,7 +78,7 @@ Content-Security-Policy-Report-Only: default-src 'self'; script-src 'self'; styl
 | `img-src` | `'self' data:` | Self-hosted images + inline SVG favicon |
 | `font-src` | `'self'` | Self-hosted fonts |
 | `connect-src` | `'self'` + API + Supabase + LiveKit | API fetch, Supabase REST + Realtime, LiveKit WebSocket signalling |
-| `media-src` | `'self' blob:` + Supabase | Recording playback via blob URLs + signed recording URLs from Supabase Storage |
+| `media-src` | `'self' blob:` + Supabase (+ the R1 recordings origin, when `VITE_R1_RECORDINGS_ORIGIN` is set) | Recording playback via blob URLs + signed recording URLs from Supabase Storage + presigned R1 recording links from the R1 object store |
 | `frame-ancestors` | `'none'` | Matches `X-Frame-Options: DENY` |
 | `form-action` | `'self'` | Forms only submit to same origin |
 | `base-uri` | `'self'` | No base tag hijacking |

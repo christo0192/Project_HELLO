@@ -114,6 +114,7 @@ import type {
 import type {
   R1AvailabilityResponse,
   R1OkResponse,
+  R1RecordingPlayback,
   R1ReissueResponse,
   R1RoundsResponse,
   R1SendInput,
@@ -281,6 +282,14 @@ export const api = {
     request<R1OkResponse>(
       `/api/interview-rounds/${encodeURIComponent(roundId)}/grant-retake`,
       { method: 'POST' },
+    ),
+  // One attempt's recording: a GET (viewers may not POST), so every staff role can mint. The answer
+  // is always 200 with a `state` for the expected conditions (still recording, failed, deleted);
+  // only access, throttling and storage trouble are errors. URLs are short-lived: mint on an
+  // explicit action, never on mount, and never log or render one.
+  getR1Recording: (roundId: string, sessionId: string) =>
+    request<R1RecordingPlayback>(
+      `/api/interview-rounds/${encodeURIComponent(roundId)}/recording?session_id=${encodeURIComponent(sessionId)}`,
     ),
   getR1Settings: () => request<R1SettingsResponse>('/api/admin/r1/settings'),
   updateR1Settings: (patch: R1SettingsPatch) =>

@@ -173,6 +173,7 @@
         "VITE_SSO_PROVIDERS": { "requiredInProduction": false, "secret": false, "external": true },
         "VITE_CSP_MODE": { "requiredInProduction": true, "secret": false, "external": true },
         "VITE_CSP_REPORT_ENDPOINT": { "requiredInProduction": true, "secret": false, "external": true },
+        "VITE_R1_RECORDINGS_ORIGIN": { "requiredInProduction": false, "secret": false, "external": true },
         "VITE_CANDIDATE_WEBRTC_V2": { "requiredInProduction": false, "secret": false, "external": true }
       }
     },

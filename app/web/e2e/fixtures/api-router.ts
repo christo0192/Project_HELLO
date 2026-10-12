@@ -36,8 +36,8 @@ import type {
   ScorecardMetricDraft,
   ScorecardMetricTemplate,
 } from '../../src/types';
-import type { R1SettingsResponse, R1UsageResponse } from '../../src/lib/r1-types';
-import { ADMIN_USER_ID, PHONE_WINDOW, SCOPED_REVIEW_LINK_ID, SEEK_ATTEMPT_IDS, STAR_CANDIDATE_ID, funnelSummary, phoneSlots, type Dataset } from './data';
+import type { R1RecordingPlayback, R1SettingsResponse, R1UsageResponse } from '../../src/lib/r1-types';
+import { ADMIN_USER_ID, PHONE_WINDOW, R1_CANDIDATE_ID, SCOPED_REVIEW_LINK_ID, SEEK_ATTEMPT_IDS, STAR_CANDIDATE_ID, funnelSummary, phoneSlots, type Dataset } from './data';
 import { FROZEN_NOW_MS } from './env';
 
 export interface MockRequest {
@@ -111,6 +111,18 @@ const LONG_SILENT_WAV = (() => {
   buf.writeUInt32LE(samples, 40);
   return `data:audio/wav;base64,${buf.toString('base64')}`;
 })();
+
+/**
+ * What the R1 recording mint serves by default: the long silent WAV, declared as a type every
+ * Chromium build can decode (`video/webm` for a recording with video, `audio/wav` for audio only), so
+ * the e2e proves the player's wiring without depending on H.264 (a CI runner may not decode it; the
+ * real file is checked by hand, R1-REC E4). `expires_in_sec` is the API's default.
+ */
+function r1PlayableMint(has_video: boolean | null | undefined): Partial<R1RecordingPlayback> {
+  return has_video === false
+    ? { url: LONG_SILENT_WAV, content_type: 'audio/wav', expires_in_sec: 300 }
+    : { url: LONG_SILENT_WAV, content_type: 'video/webm', expires_in_sec: 300 };
+}
 
 function summaryOf(db: Dataset): CandidatesSummary {
   const assessed = db.candidates.filter((c) => c.latest_score != null);
@@ -300,6 +312,9 @@ const ROUTES: Array<[string, string, Handler]> = [
   ['POST', '/api/screening/start', () => ok({ session_id: mintId(), message: 'Hello! Could you walk me through your current role?', done: false })],
   ['POST', '/api/screening/:id/turn', () => ok({ message: 'Thank you. What is your notice period?', done: false, assessment: null })],
   ['GET', '/api/screening/:id', ({ params }, db) => {
+    // The real route is admin-only (`screening.ts`); the harness is signed in as an admin unless a
+    // test changes `db.me.role`, and then the transcript is refused exactly as the API refuses it.
+    if (db.me.role !== 'admin') return { status: 403, json: { error: 'Insufficient permissions' } };
     const detail = db.sessionDetails[params.id];
     return detail ? ok(detail) : notFound('session');
   }],
@@ -395,7 +410,21 @@ const ROUTES: Array<[string, string, Handler]> = [
 
   // ── R1 (WebRTC sales role-play) ────────────────────────────────────
   ['GET', '/api/interview-rounds/availability', () => ok({ state: 'disabled', hold_minutes: 55 })],
-  ['GET', '/api/candidates/:id/interview-rounds', () => ok({ rounds: [] })],
+  // Only the R1 candidate has rounds (R1-REC); everyone else's list is empty, as before.
+  ['GET', '/api/candidates/:id/interview-rounds', ({ params }, db) => ok({ rounds: params.id === R1_CANDIDATE_ID ? db.r1.rounds : [] })],
+  // The recording mint (R1-REC): always 200 with a `state` for the expected conditions; a link only
+  // for ready/partial. `db.r1.mints[session]` queues what the link fields are, call by call.
+  ['GET', '/api/interview-rounds/:id/recording', ({ params, query }, db) => {
+    const sessionId = query.get('session_id') ?? '';
+    const round = db.r1.rounds.find((r) => r.id === params.id);
+    const attempt = round?.attempts?.find((a) => a.session_id === sessionId);
+    if (!round || !attempt) return notFound('recording');
+    const summary = attempt.recording;
+    if (summary.state !== 'ready' && summary.state !== 'partial') return ok(summary);
+    const queue = db.r1.mints[sessionId];
+    const queued = queue && queue.length > 0 ? (queue.length > 1 ? queue.shift()! : queue[0]) : null;
+    return ok({ ...summary, ...(queued ?? r1PlayableMint(summary.has_video)) } satisfies R1RecordingPlayback);
+  }],
   ['POST', '/api/candidates/:id/interview-rounds', () => created({ id: mintId(), status: 'invited', expires_at: new Date(FROZEN_NOW_MS + 72 * 3_600_000).toISOString(), join_url: R1_JOIN_URL })],
   ['POST', '/api/interview-rounds/:id/cancel', () => ok({ ok: true })],
   ['POST', '/api/interview-rounds/:id/reissue', ({ params }) => ok({ id: params.id, join_url: R1_JOIN_URL })],

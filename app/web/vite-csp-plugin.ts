@@ -12,6 +12,9 @@
  * There is no fallback to Supabase — if LiveKit is not configured,
  * the plugin refuses to start.
  *
+ * VITE_R1_RECORDINGS_ORIGIN is OPTIONAL: the object store's https origin
+ * (comma list allowed), appended to media-src only. Absent = unchanged policy.
+ *
  * The policy is built once during config resolution and never
  * recomputed at request time.  If construction fails, the dev/preview
  * server refuses to start (fail closed).
@@ -148,6 +151,25 @@ function cspPlugin(): Plugin {
         );
       }
 
+      // ── R1 recordings origin (optional, media-src only) ──────────
+
+      // The object store's S3 host, which the staff recording player's presigned links point at.
+      // OPTIONAL: absent or blank leaves the policy byte-identical. A comma list is allowed (one
+      // per jurisdiction host). Every entry must be a canonical https origin; a bad value stops the
+      // server, like the other inputs, rather than quietly widening or dropping the policy.
+      const mediaOrigins: string[] = [];
+      for (const raw of (env.VITE_R1_RECORDINGS_ORIGIN ?? '').split(',')) {
+        const entry = raw.trim();
+        if (!entry) continue;
+        const canon = entry.includes('*') ? undefined : canonicalizeOrigin(entry);
+        if (!canon || !canon.startsWith('https://')) {
+          throw new Error(
+            'CSP: VITE_R1_RECORDINGS_ORIGIN must be a comma list of canonical https://host origins.',
+          );
+        }
+        if (!mediaOrigins.includes(canon)) mediaOrigins.push(canon);
+      }
+
       // ── Build (fail closed) ─────────────────────────────────────
 
       const config = {
@@ -156,6 +178,7 @@ function cspPlugin(): Plugin {
         livekitOrigin,
         mode: modeVal,
         reportEndpoint,
+        mediaOrigins: mediaOrigins.length > 0 ? mediaOrigins : undefined,
         dev: resolved.mode !== 'production',
         devPort: resolved.server?.port ?? 5173,
       };

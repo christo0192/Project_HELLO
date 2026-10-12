@@ -65,6 +65,7 @@ import type {
   SessionDetail,
   TranscriptLine,
 } from '../../src/types';
+import type { R1RecordingPlayback, R1Round } from '../../src/lib/r1-types';
 import { FROZEN_NOW_MS } from './env';
 
 /* ── Time + id helpers ────────────────────────────────────────────────── */
@@ -417,6 +418,10 @@ const CANDIDATE_SEEDS: CandidateSeed[] = [
   // makes it "Abandoned: no answer". The accented name exercises the
   // diacritic-insensitive search (`?q=lucia`).
   { name: 'Lucía Fernández', status: 'queued', role: 'backend', exp: 4, rec: null, score: null, review: 'ready', daysAgo: 14, skills: ['Python', 'Django', 'PostgreSQL'], phone: { dial_count: 3, phone_state: 'abandoned_no_answer', phone_state_reason: 'no_answer_budget_exhausted', last_dialed_at: ago(2 * DAY) } },
+  // R1-REC: appended LAST (and so also last in every per-role count and index-derived field) so
+  // that every index above keeps its id, phone and sessions. Two R1 attempts, each with a recording
+  // (see the R1 block below). A phone-screened candidate with no phone scorecard of its own.
+  { name: 'Naveen Kapoor', status: 'screened', role: 'sre', exp: 5, rec: null, score: null, review: 'ready', daysAgo: 15, skills: ['Sales', 'English', 'Negotiation'] },
 ];
 
 function emailFor(name: string | null): string | null {
@@ -1402,6 +1407,94 @@ const BINDING_PREVIEW: AshbyScorecardBindingPreviewResponse = {
   },
 };
 
+/*
+ * R1-REC: one candidate with an R1 round and two attempts, each with a recording.
+ *   - attempt 1 (counted): a READY recording WITH video, 130 s long. Its transcript turns carry the
+ *     worker's own epoch-ms start (the same clock as `started_at_ms`), so the Review tab can place
+ *     them on the recording: one early turn, one late turn, and one with no time at all.
+ *   - attempt 2 (retake): a READY recording WITHOUT video (audio only), no transcript of its own.
+ * The mint answers (`api-router.ts`) point at a data: URI so the player runs offline in a real
+ * <video>/<audio>; a test changes `r1.rounds[..].recording` or queues `r1.mints` to reach any state.
+ */
+export const R1_CANDIDATE_ID = CANDIDATES.find((c) => c.name === 'Naveen Kapoor')!.id;
+export const R1_ROUND_ID = uid('9', 1);
+export const R1_SESSION_ATTEMPT_1 = uid('3', 901);
+export const R1_SESSION_ATTEMPT_2 = uid('3', 902);
+/** Epoch ms of media time 0 of attempt 1's recording. */
+export const R1_REC_START_MS = FROZEN_NOW_MS - 3 * DAY;
+/** Where the two timed turns sit in the recording (seconds), and how long the recording is. */
+export const R1_TURN_EARLY_SEC = 5;
+export const R1_TURN_LATE_SEC = 70;
+export const R1_REC_LENGTH_SEC = 130;
+
+(() => {
+  const candidate = CANDIDATES.find((c) => c.id === R1_CANDIDATE_ID)!;
+  for (const [id, n, minutes] of [
+    [R1_SESSION_ATTEMPT_1, 901, 10],
+    [R1_SESSION_ATTEMPT_2, 902, 8],
+  ] as const) {
+    const session = addSession(candidate, n, { mode: 'browser', interview_round_id: R1_ROUND_ID, duration_sec: minutes * 60 });
+    if (session.id !== id) throw new Error('R1 fixture id drifted');
+  }
+  const turn = (speaker: TranscriptLine['speaker'], text: string, atMs: number | null): TranscriptLine => ({
+    speaker,
+    text,
+    start_offset_sec: null,
+    started_at_ms: atMs,
+    is_gate: false,
+  });
+  sessionDetails[R1_SESSION_ATTEMPT_1].transcript = [
+    turn('bot', 'Hi, I am looking at your Program Advisor course. Can you tell me more about it?', R1_REC_START_MS + R1_TURN_EARLY_SEC * 1000),
+    turn('candidate', 'Of course. It is a twelve week program with a live cohort and one-to-one coaching.', R1_REC_START_MS + R1_TURN_LATE_SEC * 1000),
+    turn('bot', 'And what does it cost?', null),
+  ];
+  sessionDetails[R1_SESSION_ATTEMPT_2].transcript = [
+    turn('bot', 'Thanks for the retake. Where shall we start?', null),
+  ];
+})();
+
+const RETENTION_END = iso(FROZEN_NOW_MS + 87 * DAY);
+
+function r1Recording(over: Partial<R1RecordingPlayback>): R1RecordingPlayback {
+  return {
+    state: 'ready',
+    reason: null,
+    mode: 'single',
+    has_video: true,
+    started_at_ms: R1_REC_START_MS,
+    duration_ms: R1_REC_LENGTH_SEC * 1000,
+    camera_off_ms: 0,
+    degraded_at_ms: null,
+    retention_until: RETENTION_END,
+    deleted_at: null,
+    ...over,
+  };
+}
+
+const R1_ROUNDS: R1Round[] = [
+  {
+    id: R1_ROUND_ID,
+    status: 'completed',
+    expires_at: iso(FROZEN_NOW_MS - 1 * DAY),
+    attempts_allowed: 2,
+    attempts_counted: 2,
+    recommendation: null,
+    overall: null,
+    created_at: ago(5 * DAY),
+    created_by: ADMIN_USER_ID,
+    attempts: [
+      { session_id: R1_SESSION_ATTEMPT_1, attempt_number: 1, counted: true, outcome: 'completed', recording: r1Recording({}) },
+      {
+        session_id: R1_SESSION_ATTEMPT_2,
+        attempt_number: 2,
+        counted: true,
+        outcome: 'completed',
+        recording: r1Recording({ has_video: false, started_at_ms: R1_REC_START_MS + DAY, duration_ms: 90_000 }),
+      },
+    ],
+  },
+];
+
 /* ── The dataset ──────────────────────────────────────────────────────── */
 
 export interface Dataset {
@@ -1435,6 +1528,17 @@ export interface Dataset {
     feedbackForm: AshbyFeedbackForm;
     bindingPreview: AshbyScorecardBindingPreviewResponse;
   };
+  /**
+   * R1-REC. `rounds` are the R1 candidate's (every other candidate has none). `mints` queues the
+   * link fields (`url`, `content_type`, ...) the recording mint answers with for a session, one
+   * answer per call and the last one repeating (`null` = the playable default); with none queued
+   * the mint serves the playable default (`api-router.ts`). Change a round's `recording` to reach
+   * any state.
+   */
+  r1: {
+    rounds: R1Round[];
+    mints: Record<string, Array<Partial<R1RecordingPlayback> | null>>;
+  };
 }
 
 /** A fresh, independently mutable copy of the synthetic world. */
@@ -1459,6 +1563,7 @@ export function createDataset(): Dataset {
     quotas: QUOTAS,
     appointments: APPOINTMENTS,
     ashby: { mappings: MAPPINGS, jobs: JOBS, withheld: 3, workflows: WORKFLOWS, feedbackForm: FEEDBACK_FORM, bindingPreview: BINDING_PREVIEW },
+    r1: { rounds: R1_ROUNDS, mints: {} },
   });
   return {
     ...d,

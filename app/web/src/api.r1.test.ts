@@ -67,6 +67,24 @@ describe('R1 api client', () => {
     expect(JSON.parse(init.body as string)).toEqual({ paused: true, monthly_cap_minutes: 3000 });
   });
 
+  it('mints a recording as a GET (a viewer may not POST), encoding both ids', async () => {
+    await api.getR1Recording('round 1/../x', 'sess&ion=2');
+    expect(request).toHaveBeenCalledTimes(1);
+    // A GET: one argument, no init (no method, no body).
+    expect(request).toHaveBeenCalledWith(
+      '/api/interview-rounds/round%201%2F..%2Fx/recording?session_id=sess%26ion%3D2',
+    );
+  });
+
+  it('returns the mint answer untouched and never adds a query of its own', async () => {
+    const answer = { state: 'ready', url: 'https://r2.example.test/x?sig=1', expires_in_sec: 300 };
+    request.mockResolvedValue(answer);
+    await expect(api.getR1Recording('r', 's')).resolves.toBe(answer);
+    const [path] = request.mock.calls[0] as [string];
+    expect(new URL(path, 'http://api.test').searchParams.get('session_id')).toBe('s');
+    expect([...new URL(path, 'http://api.test').searchParams.keys()]).toEqual(['session_id']);
+  });
+
   it('returns what the request returned, untouched', async () => {
     request.mockResolvedValue({ rounds: [{ id: 'r' }] });
     await expect(api.listR1Rounds('c')).resolves.toEqual({ rounds: [{ id: 'r' }] });

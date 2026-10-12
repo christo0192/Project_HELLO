@@ -490,6 +490,52 @@ describe('SessionDetailPage', () => {
     expect(await screen.findByText('link expired')).toBeInTheDocument();
   });
 
+  describe('an R1 session (a WebRTC role-play)', () => {
+    const r1Detail = {
+      ...completedSessionDetail,
+      session: { ...completedSessionDetail.session, mode: 'browser', interview_round_id: 'round-1' },
+    };
+
+    it('points to the candidate page instead of the legacy recording card, which has no file for it', async () => {
+      getSession.mockResolvedValue(r1Detail);
+      renderPage();
+      await screen.findByText('Recording');
+      await act(async () => {});
+      expect(screen.queryByRole('button', { name: /load recording/i })).not.toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: /refresh link/i })).not.toBeInTheDocument();
+      expect(
+        screen.getByText(/R1 interview recordings are on the candidate page, under R1 interview\./),
+      ).toBeInTheDocument();
+      const link = screen.getByRole('link', { name: 'Open the candidate page' });
+      expect(link).toHaveAttribute('href', '/candidates/candidate-1');
+      expect(getRecordingDownloadUrl).not.toHaveBeenCalled();
+    });
+
+    it('says the same for an R1 session that has not completed (no "available once it completes")', async () => {
+      getSession.mockResolvedValue({ ...r1Detail, session: { ...r1Detail.session, status: 'in_progress' } });
+      renderPage();
+      expect(await screen.findByRole('link', { name: 'Open the candidate page' })).toBeInTheDocument();
+      expect(screen.queryByText(/Recording access is available once the session completes/i)).not.toBeInTheDocument();
+    });
+
+    it('a phone or simulation session keeps its recording card', async () => {
+      getSession.mockResolvedValue({
+        ...completedSessionDetail,
+        session: { ...completedSessionDetail.session, interview_round_id: null },
+      });
+      renderPage();
+      expect(await screen.findByRole('button', { name: /load recording/i })).toBeInTheDocument();
+      expect(screen.queryByRole('link', { name: 'Open the candidate page' })).not.toBeInTheDocument();
+    });
+
+    it('has no axe violations', async () => {
+      getSession.mockResolvedValue(r1Detail);
+      const { container } = renderPage();
+      await screen.findByRole('link', { name: 'Open the candidate page' });
+      await expect(container).toHaveNoViolations();
+    });
+  });
+
   it('does not offer recording access before completion', async () => {
     getSession.mockResolvedValue({
       ...completedSessionDetail,

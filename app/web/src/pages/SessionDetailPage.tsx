@@ -246,6 +246,8 @@ export function SessionDetailPage() {
   const meta = pageMeta(session, context);
   const words = typeof session.candidate_words === 'number' ? session.candidate_words : null;
   const phone = session.mode === 'live';
+  // A session that belongs to an R1 round (a WebRTC role-play, not a phone screening).
+  const r1 = session.interview_round_id != null;
   // null = no "Connected time" row (no answered call, an unreadable roll-up,
   // or a complete roll-up with no total).
   const connected = context.connectedComplete === true
@@ -352,7 +354,22 @@ export function SessionDetailPage() {
               </DetailRow>
             </dl>
             <div className="mt-4">
-              {completed ? (
+              {r1 ? (
+                // An R1 session has no file for the legacy recording card to find (it would end in
+                // "Recording not found"). Its recordings, one per attempt, are on the candidate page.
+                <div>
+                  <h3 className="text-label font-medium text-ink">Recording</h3>
+                  <p className="mt-1 text-sm text-ink-secondary">
+                    R1 interview recordings are on the candidate page, under R1 interview.{' '}
+                    <Link
+                      to={`/candidates/${session.candidate_id}`}
+                      className="rounded-sm font-medium text-ink underline underline-offset-2 hover:text-info focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
+                    >
+                      Open the candidate page
+                    </Link>
+                  </p>
+                </div>
+              ) : completed ? (
                 <RecordingCard sessionId={session.id} title="Recording" />
               ) : (
                 <p className="text-sm text-ink-tertiary">
