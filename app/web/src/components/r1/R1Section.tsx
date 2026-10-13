@@ -14,7 +14,9 @@
  *   - admin / interviewer: Send R1 (when the candidate has no live round and
  *     has used no attempt), availability reasons, and the round actions on
  *     their own rounds (an admin: every round);
- *   - viewer: the rounds, read-only; no card at all when there are none;
+ *   - viewer: the rounds, read-only, with each attempt's recording (every staff role
+ *     sees the recording rows; the API decides who may play one); no card at all
+ *     when there are no rounds;
  *   - nobody: a card at all while the server does not run R1 and there is no
  *     round to show.
  *
@@ -46,6 +48,11 @@ export interface R1SectionProps {
   role: MeResponse['role'];
   /** The signed-in user, so round actions are offered only on rounds they may act on. */
   userId: string | null;
+  /**
+   * False pauses the recordings: the Overview tab is hidden but stays mounted, and a video must
+   * not keep playing behind another tab. Default true.
+   */
+  active?: boolean;
 }
 
 type RoundsState =
@@ -53,7 +60,7 @@ type RoundsState =
   | { status: 'error'; message: string; forbidden: boolean }
   | { status: 'ready'; rounds: R1Round[] };
 
-export function R1Section({ candidateId, candidateName, role, userId }: R1SectionProps) {
+export function R1Section({ candidateId, candidateName, role, userId, active = true }: R1SectionProps) {
   const headingId = useId();
   const headingRef = useRef<HTMLHeadingElement | null>(null);
   const canManage = role === 'admin' || role === 'interviewer';
@@ -234,6 +241,7 @@ export function R1Section({ candidateId, candidateName, role, userId }: R1Sectio
                 }}
                 onMessage={setMessage}
                 onSettled={settle}
+                active={active}
               />
             </div>
           ) : (

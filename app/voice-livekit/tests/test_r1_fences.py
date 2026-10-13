@@ -90,7 +90,11 @@ class TestStaticFence(unittest.TestCase):
             {"r1_session.py", "r1_persistence.py", "r1_context.py", "r1_llm.py"}, names
         )
         logging_modules = {path.name for path in R1_MODULES if _log_calls(_parse(path))}
-        self.assertEqual(logging_modules, {"r1_session.py", "r1_persistence.py"})
+        # r1_recorder.py owns its own logger deliberately (the recording runs on threads that have
+        # no r1_session in reach); r1_video_encoder.py must stay out of this set: it never logs.
+        self.assertEqual(
+            logging_modules, {"r1_session.py", "r1_persistence.py", "r1_recorder.py"}
+        )
 
     def test_no_r1_module_uses_stdlib_logging_print_or_tracebacks(self) -> None:
         for path in R1_MODULES:

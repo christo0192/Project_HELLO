@@ -35,7 +35,12 @@ import {
   createFunnelRuntime,
   type FunnelRuntimeHandle,
 } from './lib/funnel/runtime.js';
-import { createR1Runtime, type R1RuntimeHandle } from './lib/r1/runtime.js';
+import {
+  createR1Runtime,
+  createR1StorageRuntime,
+  type R1RuntimeHandle,
+  type R1StorageRuntimeHandle,
+} from './lib/r1/runtime.js';
 
 const startupLogger = createLogger('startup');
 const app = createApp();
@@ -157,6 +162,24 @@ try {
   r1Runtime = null;
 }
 
+// ── R1 recording lane on its own (disabled by default) ─────────────────────────
+// A SEVENTH independent try/catch. Erasing a withdrawn candidate's recording, the 90-day retention
+// sweep and finishing a recording in flight are privacy obligations, so `R1_ENABLED` (the switch
+// an operator flips in an R1 incident) must not stop them. `createR1Runtime` hosts that lane but
+// returns null with the switch off; then this builds the lane alone. It is built only when the full
+// runtime is absent (they never run together), and `createR1StorageRuntime` itself returns null
+// until the R2 recording secrets are configured, so with the shipped default nothing is constructed.
+let r1StorageRuntime: R1StorageRuntimeHandle | null = null;
+if (!r1Runtime) {
+  try {
+    r1StorageRuntime = createR1StorageRuntime();
+  } catch {
+    // Sanitized: the error is not logged verbatim because it can carry config text.
+    startupLogger.warn('unknown_event', { error_category: 'r1_storage_runtime_start_failed' });
+    r1StorageRuntime = null;
+  }
+}
+
 server.listen(env.port, () => {
   if (recordingRuntime) {
     recordingRuntime.scheduler.start();
@@ -209,6 +232,11 @@ server.listen(env.port, () => {
     // Only present when R1_ENABLED is on. Start the assessment queue loop and the
     // pending-reject status loop now that the process is serving.
     r1Runtime.scheduler.start();
+  }
+  if (r1StorageRuntime) {
+    // Only present when R1_ENABLED is off AND the R2 recording secrets are set: the recording
+    // lane's finalize / erase / retention loops, which an env kill switch never stops.
+    r1StorageRuntime.scheduler.start();
   }
   startupLogger.info('startup_listen', {
     port: env.port,
@@ -281,6 +309,15 @@ shutdown.boot(server).then(async (code) => {
       // completes or fails UNDER ITS LEASE (the scorer is idempotent per session), and an
       // abandoned lease is recovered by the reclaim sweep on any machine.
       await r1Runtime.stop();
+    } catch {
+      // Never let a worker-stop failure change the process exit code.
+    }
+  }
+  if (r1StorageRuntime) {
+    try {
+      // Stopped in its own try, like the others. A finalize / erase / sweep job in flight either
+      // completes or fails UNDER ITS LEASE, and every step of each is idempotent and retried.
+      await r1StorageRuntime.stop();
     } catch {
       // Never let a worker-stop failure change the process exit code.
     }

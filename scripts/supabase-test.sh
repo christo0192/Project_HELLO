@@ -806,6 +806,8 @@ if [ "${PIPESTATUS[0]}" -ne 0 ]; then
   exit 1
 fi
 log '0122: PASS — R1 scorer assertions ran against migrations 0001..0122 in supabase-check.'
+# 0127 R1 recordings: constraints, finalize/erase/purge triggers, recording_mode, privileges (set -e + pipefail).
+env SUPABASE_DB_CONTAINER="$SUPABASE_DB_CONTAINER" bash scripts/test-r1-recordings.sh 2>&1 | tee -a "$RESULTS_FILE"
 
 # =====================================================================
 # TST-15 rollback rehearsal — clean reset / roll-forward / restore

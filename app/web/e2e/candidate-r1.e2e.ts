@@ -724,14 +724,32 @@ test.describe('live layout with a long interview', () => {
     const before = await log.evaluate((element) => ({ height: element.scrollHeight, box: element.clientHeight }));
     expect(await log.evaluate((element) => element.scrollTop + element.clientHeight)).toBeGreaterThanOrEqual(before.height - 2);
 
+    // The list is put back on the newest line by a ResizeObserver, and the browser delivers that in
+    // a rendering step of its own. Reading `scrollHeight` is a forced layout that shows the taller
+    // lines BEFORE that delivery, and so do two animation frames (measured on this page with a fast
+    // poller: the page's observer is told 50-80 ms after the frames, so a look taken in between finds
+    // the list still parked at its old place and calls it broken). So wait for the announcement
+    // itself, not for a count of frames. This observer is created after the page's own, and
+    // observers are called in creation order: when it hears the taller content, the page has already
+    // had its turn, and everything below is checked at that moment, as strictly as before.
+    await page.evaluate(() => {
+      const content = document.querySelector('.r1-captions__content');
+      const heard = window as unknown as { __r1ContentHeight?: number };
+      heard.__r1ContentHeight = 0;
+      new ResizeObserver((entries) => {
+        heard.__r1ContentHeight = Math.round(entries[entries.length - 1].contentRect.height);
+      }).observe(content!);
+    });
+
     // A web font arriving after first paint changes every line's metrics at once, with no render of
     // ours and no change to the list's own box. Larger type does the same here on every platform
     // (the fallback font differs from machine to machine, so a real swap may not re-wrap anything).
     await page.addStyleTag({ content: '.r1-captions__list .candidate-caption { font-size: 21px; }' });
     await expect
-      .poll(() => log.evaluate((element) => element.scrollHeight), { message: 'the lines re-wrapped taller' })
+      .poll(() => page.evaluate(() => (window as unknown as { __r1ContentHeight?: number }).__r1ContentHeight ?? 0), {
+        message: 'the page was told the lines re-wrapped taller',
+      })
       .toBeGreaterThan(before.height + 200);
-    await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
 
     const layout = await liveLayout(page);
     expect(layout.list!.clientHeight, 'the list box did not change').toBe(before.box);

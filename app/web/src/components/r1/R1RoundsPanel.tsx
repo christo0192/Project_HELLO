@@ -15,12 +15,17 @@
  * at a time; focus moves to it, Escape closes it and returns focus to the
  * button that opened it, and a finished action hands focus to the card.
  *
+ * Recordings: one row per attempt that has anything to say (a recording in any
+ * state, or, once the round has completed, the fact that none was made), for
+ * EVERY role. It has no write controls; the API decides who may play it.
+ *
  * Renders inside `.candidate-scope` (`--c-*` tokens only, no motion import).
  */
 import { useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { api, ApiError } from '../../api';
 import { CandidateButton, Tag } from '../design/candidate';
+import { R1RecordingRow } from './R1RecordingRow';
 import type { IssuedLinkValue } from './SendR1Controls';
 import { formatDateTime } from '../../lib/datetime';
 import {
@@ -35,6 +40,7 @@ import {
   r1StatusLabel,
   r1StatusTone,
 } from '../../lib/r1';
+import { attemptLabels, showsRecordingRow } from '../../lib/r1-recording';
 import type { R1Round } from '../../lib/r1-types';
 import type { MeResponse } from '../../types';
 
@@ -90,6 +96,11 @@ export interface R1RoundsPanelProps {
   onMessage: (message: string | null) => void;
   /** An action finished: put focus somewhere that still exists. */
   onSettled: () => void;
+  /**
+   * False pauses every recording (the tab this panel is on is hidden but stays mounted).
+   * Default true.
+   */
+  active?: boolean;
 }
 
 export function R1RoundsPanel({
@@ -100,6 +111,7 @@ export function R1RoundsPanel({
   onChanged,
   onMessage,
   onSettled,
+  active: recordingsActive = true,
 }: R1RoundsPanelProps) {
   const uid = useId().replace(/:/g, '');
   const [pending, setPending] = useState<Pending | null>(null);
@@ -190,6 +202,10 @@ export function R1RoundsPanel({
         const showsResult = round.status === 'completed' || round.status === 'in_progress';
         const active = pending?.roundId === round.id ? pending : null;
         const headingId = `r1-round-${uid}-${round.id}`;
+        // One recording row per attempt, in attempt order (the API sends them that way). An older
+        // API sends no `attempts`, and then there is simply nothing to add here.
+        const attempts = Array.isArray(round.attempts) ? round.attempts : [];
+        const labels = attemptLabels(attempts);
         return (
           <li key={round.id} className="py-3 text-sm">
             <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
@@ -223,6 +239,19 @@ export function R1RoundsPanel({
                   'scoring is live.'
                 )}
               </p>
+            )}
+
+            {attempts.map((attempt, index) =>
+              showsRecordingRow(attempt?.recording, round.status === 'completed') ? (
+                <R1RecordingRow
+                  key={attempt.session_id}
+                  roundId={round.id}
+                  attempt={attempt}
+                  label={labels[index]}
+                  active={recordingsActive}
+                  onNeedRefresh={onChanged}
+                />
+              ) : null,
             )}
 
             {canActOnRound(round, role, userId) && (live || canGrantRetake(round)) && (

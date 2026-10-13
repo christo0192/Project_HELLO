@@ -3,8 +3,13 @@
  * selection, transcript load, session context header, session scorecard,
  * seek sync, load-and-seek-before-load, retry, non-admin 403 fallback, axe.
  */
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within, configure } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+
+// The leg tests chain several async steps (list legs, mint a URL, wait for the media, seek). On a
+// loaded CI runner one step can pass the default 1 s wait (seen at 1036-1054 ms); every assertion is
+// unchanged, they only get longer to come true.
+configure({ asyncUtilTimeout: 3000 });
 import { TranscriptionSyncWorkspace } from '../TranscriptionSyncWorkspace';
 import type { Session, Assessment, CandidatePhoneAttempt, TranscriptLine } from '../../../types';
 

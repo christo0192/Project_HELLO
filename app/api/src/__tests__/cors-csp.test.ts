@@ -1085,4 +1085,89 @@ describe('CSP policy construction (SEC-07)', () => {
     const h = buildCspHeader(defaults)!;
     expect(h).toContain("object-src 'none'");
   });
+
+  // ── R1 recordings origin (R1-REC): media-src ONLY, optional ────
+
+  describe('mediaOrigins (the R1 recordings store)', () => {
+    const R2 = 'https://0123456789abcdef0123456789abcdef.r2.cloudflarestorage.com';
+    const R2_EU = 'https://0123456789abcdef0123456789abcdef.eu.r2.cloudflarestorage.com';
+    const directive = (header: string, name: string) =>
+      header.split(';').map((s: string) => s.trim()).find((d: string) => d.startsWith(`${name} `)) ?? '';
+
+    it('absent, undefined or empty leaves the header byte-identical', () => {
+      const base = buildCspHeader(defaults)!;
+      expect(buildCspHeader({ ...defaults, mediaOrigins: undefined })).toBe(base);
+      expect(buildCspHeader({ ...defaults, mediaOrigins: [] })).toBe(base);
+      expect(base).not.toContain('r2.cloudflarestorage.com');
+    });
+
+    it('a configured origin is in media-src and in no other directive', () => {
+      const h = buildCspHeader({ ...defaults, mediaOrigins: [R2] })!;
+      expect(directive(h, 'media-src')).toBe(`media-src 'self' blob: https://project.supabase.co ${R2}`);
+      expect(directive(h, 'connect-src')).not.toContain('r2.cloudflarestorage.com');
+      for (const d of h.split(';').map((s: string) => s.trim())) {
+        if (d.startsWith('media-src ')) continue;
+        expect(d, d).not.toContain('r2.cloudflarestorage.com');
+      }
+      // Everything else is exactly what it was.
+      const base = buildCspHeader(defaults)!;
+      const without = (header: string) =>
+        header.split('; ').filter((d: string) => !d.startsWith('media-src ')).join('; ');
+      expect(without(h)).toBe(without(base));
+    });
+
+    it('takes several origins (a jurisdiction host beside the default one), once each, in order', () => {
+      const h = buildCspHeader({ ...defaults, mediaOrigins: [R2, R2_EU, R2] })!;
+      expect(directive(h, 'media-src')).toBe(
+        `media-src 'self' blob: https://project.supabase.co ${R2} ${R2_EU}`,
+      );
+    });
+
+    it('fails the whole header closed on any origin that is not an exact canonical https origin', () => {
+      for (const bad of [
+        `${R2}/`, // trailing slash is not the canonical form
+        `${R2}/r1/`, // a path
+        `${R2}?x=1`,
+        `${R2}#frag`,
+        `${R2}:443`, // explicit default port: URL.origin drops it
+        R2.toUpperCase(), // case: URL.origin lower-cases
+        R2.replace('https:', 'http:'), // not https
+        R2.replace('https:', 'wss:'),
+        R2.replace('https://', 'https://user:pass@'), // credentials
+        'not a url',
+        '',
+        "'self'",
+        'data:',
+        'blob:',
+      ]) {
+        expect(buildCspHeader({ ...defaults, mediaOrigins: [bad] }), bad).toBeUndefined();
+      }
+    });
+
+    it('rejects wildcards and credentials, and one bad entry spoils the list', () => {
+      for (const bad of ['*', 'https://*', 'https://*.r2.cloudflarestorage.com', 'https://a.*.r2.cloudflarestorage.com']) {
+        expect(buildCspHeader({ ...defaults, mediaOrigins: [bad] }), bad).toBeUndefined();
+        expect(buildCspHeader({ ...defaults, mediaOrigins: [R2, bad] }), bad).toBeUndefined();
+      }
+      expect(buildCspHeader({ ...defaults, mediaOrigins: [R2, 'https://user@x.example'] })).toBeUndefined();
+    });
+
+    it('rejects a value that is not a list of strings', () => {
+      expect(buildCspHeader({ ...defaults, mediaOrigins: R2 as unknown as string[] })).toBeUndefined();
+      expect(buildCspHeader({ ...defaults, mediaOrigins: [42 as unknown as string] })).toBeUndefined();
+      expect(buildCspHeader({ ...defaults, mediaOrigins: [null as unknown as string] })).toBeUndefined();
+      // Not even iterable: fails closed rather than throwing out of the header builder.
+      expect(buildCspHeader({ ...defaults, mediaOrigins: 42 as unknown as string[] })).toBeUndefined();
+      expect(buildCspHeader({ ...defaults, mediaOrigins: { 0: R2, length: 1 } as unknown as string[] })).toBeUndefined();
+      expect(buildCspHeader({ ...defaults, mediaOrigins: null as unknown as string[] })).toBeUndefined();
+    });
+
+    it('never emits a wildcard source, with or without the option', () => {
+      for (const h of [buildCspHeader(defaults)!, buildCspHeader({ ...defaults, mediaOrigins: [R2] })!]) {
+        for (const d of h.split(';').map((s: string) => s.trim())) {
+          for (const source of d.split(/\s+/).slice(1)) expect(source).not.toContain('*');
+        }
+      }
+    });
+  });
 });

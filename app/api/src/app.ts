@@ -31,6 +31,7 @@ import { ashbyMissionControlRouter } from './routes/ashby-mission-control.js';
 import { ashbyReviewRouter } from './routes/ashby-review.js';
 import { phoneApiRouter } from './routes/phone.js';
 import { r1Router, r1InternalRouter } from './routes/r1.js';
+import { r1RecordingInternalRouter, r1RecordingStaffRouter } from './routes/r1-recording.js';
 import { r1HrRouter } from './routes/r1-hr.js';
 import { r1CandidateRouter } from './routes/r1-candidate.js';
 import { ashbyCandidateWorkflowRouter } from './routes/ashby-candidate-workflow.js';
@@ -226,6 +227,11 @@ export function createApp(opts: CreateAppOptions = {}) {
   // Separate worker-only R1 boundary. Its configuration is lazy/never-throwing
   // and it does not share the phone worker-context contract.
   app.use('/api/internal/r1', express.json({ limit: '64kb' }), r1InternalRouter);
+  // R1 interview recording (worker -> API: prepare, part-url, object-url, complete). Same worker
+  // bearer boundary, mounted right after the R1 internal router. Answers 503 r1_recording_disabled
+  // until the R1_RECORDING_S3_* secrets, r1_settings.recording_mode and the candidate's consent are
+  // all in place; the config is lazy and never throws, so this mount cannot affect boot.
+  app.use('/api/internal/r1/recording', express.json({ limit: '64kb' }), r1RecordingInternalRouter);
 
   // Internal phone-worker surface for the named phone voice worker. Mounted
   // beside the scoring callback and for the same reason: it uses the SAME
@@ -472,6 +478,9 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/resumes', resumesRouter);
   app.use('/api/candidates', candidatesRouter);
   app.use('/api', r1Router);
+  // R1 recording, staff side (R1-REC): the playback mint under /api/interview-rounds (so it shares
+  // that default rate bucket) and the admin health read. GET only, so viewers pass viewerReadOnly.
+  app.use('/api', r1RecordingStaffRouter);
   // Read-only HR read models (availability, usage); see routes/r1-hr.ts.
   app.use('/api', r1HrRouter);
   // R1 candidate surface (exact public allowlist entries in lib/auth.ts). Each

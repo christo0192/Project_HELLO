@@ -98,7 +98,16 @@ kill_timeout = 300
 # on a 1006 keepalive timeout, and a live mid-interview room was killed. The
 # machines were scaled to performance-1x live that day; this pins that state so
 # the next deploy does not REVERT them back to `shared`.
+#
+# R1-REC (2026-10-12): performance-2x for in-worker interview recording. With camera video on, the
+# worker also runs a second, niced process that encodes H.264 + AAC (and the job process copies
+# frames and mixes audio), which the single performance vCPU cannot absorb next to VAD, the STT
+# socket and TTS without the starvation above. Fly requires at least 2048 MB per performance vCPU,
+# hence 4096. The extra cost is paid only while a machine runs (about +$0.5 to +$1.6 a month at 25
+# to 80 interviews). This file is the source of truth: `fly scale vm` alone is reset by the next
+# deploy. Rollback of the size = these two lines back to 1 / 2048 and a browser-voice deploy.
+# (fly.phone.toml is NOT changed: the phone app stays performance-1x.)
 [[vm]]
   cpu_kind = "performance"
-  cpus = 1
-  memory_mb = 2048
+  cpus = 2
+  memory_mb = 4096

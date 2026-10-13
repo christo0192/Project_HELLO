@@ -177,6 +177,13 @@ CLOSING_PLAYOUT_SECONDS = 15.0
 ENDED_ATTRIBUTE_SECONDS = 5.0
 TRANSCRIPT_DRAIN_SECONDS = 10.0
 EXIT_STEPS_SECONDS = 30.0  # recording, ledger, terminal and attempt outcome SHARE this
+# The recording's own deadline, counted from the moment capture stops (``_begin_exit``), so it
+# overlaps the transcript drain.  It is carved OUT of the shared exit budget above, not added to
+# it: the ledger, terminal write and attempt outcome keep at least ``EXIT_STEPS_SECONDS`` minus
+# this (12 s).  ``TestTeardownBudget`` pins ``RECORDING_FINISH_SECONDS <= EXIT_STEPS_SECONDS - 12``.
+RECORDING_FINISH_SECONDS = 18.0
+# Starting the recorder (wiring the audio tap) is local work; this only caps a hang.
+RECORDER_START_SECONDS = 5.0
 SESSION_CLOSE_SECONDS = 5.0
 ROOM_DELETE_SECONDS = 10.0
 NOMINAL_TEARDOWN_SECONDS = 75.0
@@ -934,6 +941,9 @@ class _SpeechSlot:
     # The latency tracker's number for the turn this reply answers (``LatencyTracker.open_turn_id``
     # when the reply was created), so a reply cancelled before any audio finds its own turn.
     latency_turn: int | None = None
+    # Wall-clock seconds (``time.time()``) of the ``agent_state_changed -> speaking`` event that
+    # claimed this slot: the fallback anchor when the delivered item carries no metrics.
+    started_at: float | None = None
 
 
 @dataclass
@@ -948,6 +958,41 @@ class _CandidateRow:
     index: int
     phase: str
     parts: list[str]
+    # Epoch milliseconds the candidate began speaking this turn (``turn_started_at_ms``), or None
+    # when the SDK gave no usable speaking event (``_candidate_turn_anchor``).
+    started_at_ms: int | None = None
+    # Wall-clock seconds (the SDK's event clock) of the row's latest final: when the row is
+    # written, nothing the candidate said up to here belongs to a later row (``_anchor_floor``,
+    # ``_commit_floor``).
+    last_final_at: float | None = None
+
+
+# The recording's turn anchor (``transcript_turns.turn_started_at_ms``, migration 0026) must lie in
+# this open interval; anything else is stored as NULL rather than risk the CHECK constraint.
+_EPOCH_MS_LIMIT = 4_102_444_800_000
+# A speaking event older than this is a different utterance, not the start of the turn.
+_USER_SPEECH_ANCHOR_MAX_AGE_SECONDS = 30.0
+# Speaking events this close together (start to start) are one burst of speech with a pause in it:
+# the candidate paused, the VAD went back to listening, and they carried on before the STT handed
+# over the first final.  Further apart, a bot line or a long silence has come between them.  Close
+# together is not enough on its own: a burst never reaches back past ``R1Interview._anchor_floor``
+# (the previous row's commit, the start of a bot line), however short the gap across it.
+_USER_SPEECH_BURST_GAP_SECONDS = 4.0
+_USER_SPEECH_ANCHORS_KEPT = 8
+# The anchor floors only ever rise, so one wrong time would hold a floor up for the rest of the
+# session and end every later walk-back.  A wall-clock time further ahead of now than this is not
+# believed (the SDK's event clock is ``time.time()``: a real skew is milliseconds) and is ignored.
+_ANCHOR_FLOOR_MAX_AHEAD_SECONDS = 60.0
+
+
+def _epoch_ms(seconds: Any) -> int | None:
+    """Wall-clock seconds (``time.time()``) as epoch milliseconds, or None when not usable."""
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        return None
+    if not math.isfinite(seconds):
+        return None
+    millis = int(round(seconds * 1000))
+    return millis if 0 < millis < _EPOCH_MS_LIMIT else None
 
 
 class R1Interview:
@@ -968,6 +1013,8 @@ class R1Interview:
         clock: Callable[[], float] = time.monotonic,
         close_room: Callable[[], Awaitable[Any]] | None = None,
         recorder_finish: Callable[[], Awaitable[Any]] | None = None,
+        recorder_start: Callable[[str | None], Awaitable[Any]] | None = None,
+        recorder_stop: Callable[[str | None], Any] | None = None,
         judge_runner: Callable[[list[dict[str, str]]], Awaitable[Any]] | None = None,
         line_cache: LineCache | None = None,
         rate_limits: RateLimitCounter | None = None,
@@ -980,6 +1027,13 @@ class R1Interview:
         self.machine = R1PhaseMachine(clock)
         self._close_room = close_room or self._close_room_once
         self._recorder_finish = recorder_finish or self._recording_finish_stub
+        # Recording seams (``r1_recorder.R1Recorder``).  ``start`` runs right after the SDK session
+        # starts, ``stop`` at the first exit step (so the recording's own finish overlaps the
+        # transcript drain) and ``finish`` is the first shared exit step.  Each is optional and
+        # none can raise into the interview.
+        self._recorder_start = recorder_start
+        self._recorder_stop = recorder_stop
+        self._recorder_stopped = False
         self._turns: asyncio.Queue[str] = asyncio.Queue()
         self._attention = asyncio.Event()
         self._reply_changed = asyncio.Event()
@@ -1004,6 +1058,17 @@ class R1Interview:
         # flight, how many replies the SDK cancelled before any audio, and whether the session
         # runs the transition's quicker endpointing right now.
         self._open_row: _CandidateRow | None = None
+        # Wall-clock seconds of the latest ``user_state_changed -> speaking`` events (oldest first):
+        # the anchors of the candidate's rows (``_candidate_turn_anchor``).
+        self._user_speaking_at: deque[float] = deque(maxlen=_USER_SPEECH_ANCHORS_KEPT)
+        # Two walls (wall-clock seconds, the same clock; each only ever raised) for a candidate
+        # row's anchor.  ``_anchor_floor`` is the one its burst of speaking events may not be walked
+        # back across: the latest of the last final of every candidate row already written (its
+        # commit) and the start of every bot line.  ``_commit_floor`` is the commit part of it
+        # alone: the row's base event (the latest speaking event) may not be earlier than that
+        # either, but it may be earlier than the start of a bot line.
+        self._anchor_floor: float = 0.0
+        self._commit_floor: float = 0.0
         self._candidate_activity_at: float | None = None
         self._icebreaker_hold_since: float | None = None
         self._replies_cancelled_before_audio = 0
@@ -1650,16 +1715,53 @@ class R1Interview:
         self._residency_handle = None
         self._forced_close_handle = None
 
-    def _begin_exit(self) -> None:
+    def _begin_exit(self, outcome: str | None = None) -> None:
         """Stop recording new speech and suppress replies once the exit has started.
 
         The candidate's open row is written first: it is the last thing they said, and the
-        transcript drain that follows waits for it.
+        transcript drain that follows waits for it.  The audio recorder stops capturing here
+        (idempotent) so its finish overlaps that drain instead of queueing behind it.
         """
         self._flush_candidate_row()
         self._exiting = True
         self._cancel_deadlines()
         self._sync_rpleft_heartbeat()
+        self._stop_recorder(outcome)
+
+    def _stop_recorder(self, outcome: str | None) -> None:
+        """Tell the recorder capture is over; a failure is logged and never reaches the exit."""
+        stop, self._recorder_stop = self._recorder_stop, None
+        if stop is None or self._recorder_stopped:
+            return
+        self._recorder_stopped = True
+        try:
+            stop(outcome)
+        except Exception as exc:  # noqa: BLE001 - the interview's exit must not depend on recording
+            _log.warn(
+                "unknown_event",
+                error_type="r1_recorder_stop_failed",
+                error_category=_error_type_of(exc),
+            )
+
+    async def _start_recorder(self) -> None:
+        """Start capturing right after the SDK session (and its audio I/O) exists.
+
+        Bounded, and a failure or a hang is logged and skipped: the interview goes on without a
+        recording.  The recorder's own network calls run on its threads, never here.
+        """
+        start = self._recorder_start
+        if start is None:
+            return
+        try:
+            await asyncio.wait_for(
+                _maybe_await(start(self._candidate_identity)), RECORDER_START_SECONDS
+            )
+        except Exception as exc:  # noqa: BLE001 - includes the timeout; CancelledError passes
+            _log.warn(
+                "unknown_event",
+                error_type="r1_recorder_start_failed",
+                error_category=_error_type_of(exc),
+            )
 
     async def _drain_background(self) -> None:
         """Flush queued transcript writes, then cancel anything still running."""
@@ -1835,7 +1937,7 @@ class R1Interview:
         if self._exited:
             return
         self._exited = True
-        self._begin_exit()
+        self._begin_exit(outcome)
         if outcome in _TECHNICAL_OUTCOMES:
             # A stop on our side that never reached the closing speech (connect, context or
             # configuration failures) still tells the page, before ``ended`` closes it.
@@ -1843,8 +1945,12 @@ class R1Interview:
         elapsed = max(0, int(self.machine.session_elapsed))
         deadline = asyncio.get_running_loop().time() + _scaled(EXIT_STEPS_SECONDS)
 
-        async def bounded(operation: Awaitable[Any], label: str) -> None:
+        async def bounded(operation: Awaitable[Any], label: str, limit: float | None = None) -> None:
             remaining = deadline - asyncio.get_running_loop().time()
+            if limit is not None:
+                # A step with its own share of the budget can never spend the others' (see
+                # ``RECORDING_FINISH_SECONDS``).
+                remaining = min(remaining, limit)
             if remaining <= 0:
                 _log.warn("unknown_event", error_type="r1_exit_budget_spent", phase=label)
                 if inspect.iscoroutine(operation):
@@ -1860,7 +1966,11 @@ class R1Interview:
                     phase=label,
                 )
 
-        await bounded(self._recorder_finish(), "recording")
+        # The recorder's own deadline (counted from when capture stopped) ends before this cap; the
+        # cap is what keeps the ledger, the terminal write and the outcome their 12 s if it does not.
+        await bounded(
+            self._recorder_finish(), "recording", limit=_scaled(RECORDING_FINISH_SECONDS)
+        )
         await bounded(self.writer.usage_disconnect(elapsed), "ledger")
         await bounded(
             self.writer.terminal(outcome, elapsed, activated=self._activated), "terminal"
@@ -3024,10 +3134,11 @@ class R1Interview:
         phase: str,
         *,
         interrupted: bool = False,
+        started_at_ms: int | None = None,
     ) -> None:
         """Queue one transcript row; a slow or failing write never stalls the interview."""
         task = asyncio.ensure_future(
-            self._save_turn_bounded(index, speaker, text, phase, interrupted)
+            self._save_turn_bounded(index, speaker, text, phase, interrupted, started_at_ms)
         )
         self._turn_writes.add(task)
         task.add_done_callback(self._turn_writes.discard)
@@ -3039,10 +3150,14 @@ class R1Interview:
         text: str,
         phase: str,
         interrupted: bool,
+        started_at_ms: int | None = None,
     ) -> None:
+        # The anchor is passed only when the SDK gave one, so a writer that predates it (and a
+        # row with no anchor) is called exactly as before.
+        extra: dict[str, Any] = {} if started_at_ms is None else {"started_at_ms": started_at_ms}
         try:
             await asyncio.wait_for(
-                self.writer.save_turn(index, speaker, text, phase, interrupted=interrupted),
+                self.writer.save_turn(index, speaker, text, phase, interrupted=interrupted, **extra),
                 TURN_WRITE_SECONDS,
             )
         except Exception as exc:  # noqa: BLE001 - transcript loss must not end the interview
@@ -3077,9 +3192,13 @@ class R1Interview:
         row = self._open_row
         if row is None:
             row = self._open_row = _CandidateRow(
-                self._reserve_turn_index(), self.machine.transcript_phase(), []
+                self._reserve_turn_index(),
+                self.machine.transcript_phase(),
+                [],
+                self._candidate_turn_anchor(event),
             )
         row.parts.append(text)
+        row.last_final_at = self._event_seconds(event)
         self._latest_candidate_index = row.index  # the SDK turn that follows is judged at this row
         self._learn_spoken_name(" ".join(row.parts))
         self.note_turn(text)
@@ -3096,16 +3215,94 @@ class R1Interview:
         row, self._open_row = self._open_row, None
         if row is None:
             return
-        self._write_turn(row.index, "candidate", " ".join(row.parts), row.phase)
+        # The row is over: speech heard up to its last final is its own, never a later row's.
+        self._raise_anchor_floor(row.last_final_at, commit=True)
+        self._write_turn(
+            row.index, "candidate", " ".join(row.parts), row.phase, started_at_ms=row.started_at_ms
+        )
 
-    def _reserve_bot_index(self) -> int:
+    def _candidate_turn_anchor(self, event: Any) -> int | None:
+        """Epoch ms the candidate began speaking, for a row whose first final is ``event``.
+
+        Start from the latest ``user_state_changed -> speaking`` at or before that final, if it is
+        at most 30 s earlier (a speaking event older than that belongs to an earlier utterance;
+        otherwise None).  Then walk back over the speaking events that lead into it with no more
+        than ``_USER_SPEECH_BURST_GAP_SECONDS`` between one and the next (and none older than the
+        same 30 s): they are the same burst of speech with a pause in it.  The STT hands over a
+        segment's final a second or two after the pause, so the VAD may already have gone back to
+        speaking by then; the latest event alone would put the seek a pause's length into the
+        answer and skip its first words.  It is the SDK's own event time (``created_at``), never
+        the write time, so the recording's click-to-seek lands where the candidate started.
+
+        Two walls keep it inside its own turn (both on the SDK's event clock).  The walk never
+        crosses ``_anchor_floor``: the last final of the previous candidate row (the SDK committed
+        it, so everything it heard is that row's) or the start of a bot line after it.  An answer
+        that begins right after a bot line is within the burst gap of the speech before that line,
+        but it is another turn; reaching back into it would put the seek in the previous row.
+
+        The latest event itself (the base) is held only to the commit half of that wall,
+        ``_commit_floor``.  Earlier than the previous row's last final, it is that row's own start:
+        the VAD gave no speaking event for this answer at all (a miss, or speech across a scripted
+        line that cannot be interrupted), so the row gets None rather than the previous answer's
+        start.  It is not held to the start of a bot line: it is the SDK's own last word on when
+        the candidate started, and one who began speaking just as a line began (or talked over it)
+        owns that start.
+        """
+        final_at = self._event_seconds(event)
+        before = sorted(spoke for spoke in self._user_speaking_at if spoke <= final_at)
+        if not before or final_at - before[-1] > _USER_SPEECH_ANCHOR_MAX_AGE_SECONDS:
+            return None
+        start = before[-1]
+        if start < self._commit_floor:
+            return None  # the previous answer's start: no speaking event came for this one
+        for earlier in reversed(before[:-1]):
+            if earlier < self._anchor_floor:
+                break  # before the previous row's commit or a bot line: another turn
+            if start - earlier > _USER_SPEECH_BURST_GAP_SECONDS:
+                break
+            if final_at - earlier > _USER_SPEECH_ANCHOR_MAX_AGE_SECONDS:
+                break
+            start = earlier
+        return _epoch_ms(start)
+
+    @staticmethod
+    def _event_seconds(event: Any) -> float:
+        """The SDK event's own wall-clock time (``created_at``); now, for an event without one."""
+        created = getattr(event, "created_at", None)
+        return created if isinstance(created, (int, float)) and not isinstance(created, bool) else time.time()
+
+    def _raise_anchor_floor(self, seconds: Any, *, commit: bool = False) -> bool:
+        """Move the walls for candidate bursts forward to ``seconds``; False when that is no usable time.
+
+        A usable time is a finite number no more than ``_ANCHOR_FLOOR_MAX_AHEAD_SECONDS`` ahead of
+        now (a floor never comes back down, so one far-future time would end the walk-back and the
+        base for the rest of the session).  ``commit`` is a candidate row's last final: it raises
+        ``_commit_floor`` too, the wall the base event is held to.  A time earlier than the floor
+        is usable and changes nothing.
+        """
+        if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
+            return False
+        if seconds > time.time() + _ANCHOR_FLOOR_MAX_AHEAD_SECONDS:
+            return False
+        self._anchor_floor = max(self._anchor_floor, float(seconds))
+        if commit:
+            self._commit_floor = max(self._commit_floor, float(seconds))
+        return True
+
+    def _reserve_bot_index(self, started_at: float | None = None) -> int:
         """Reserve a transcript position for a bot speech, closing the candidate's open row first.
 
         The row keeps the (lower) index it reserved at its first final, so closing it here only
         decides that the candidate's NEXT words are a new row after this speech, which is where
-        they were said.
+        they were said.  ``started_at`` is when the speech began (the ``speaking`` event's time):
+        the candidate's speech from before that, even a moment before, is not part of a burst
+        that leads to a later row.  Without a time the claim itself is the latest it can have
+        begun, which errs on the side of the wall (a burst that is cut short, never one that
+        reaches back across the line).
         """
         self._flush_candidate_row()
+        if not self._raise_anchor_floor(started_at):
+            self._raise_anchor_floor(time.time())
         return self._reserve_turn_index()
 
     def _candidate_turn_open(self) -> bool:
@@ -3133,14 +3330,19 @@ class R1Interview:
         if callable(add_done_callback):
             add_done_callback(self._on_speech_done)
 
-    def _claim_slot(self, slot: _SpeechSlot) -> None:
-        """Fix a speech's row position and phase now, once."""
+    def _claim_slot(self, slot: _SpeechSlot, started_at: float | None = None) -> None:
+        """Fix a speech's row position and phase now, once.
+
+        ``started_at`` is the wall-clock time of the ``speaking`` event that claims it: the
+        bot row's turn anchor when the delivered item carries no metrics of its own.
+        """
         if slot.index is None:
-            slot.index = self._reserve_bot_index()
+            slot.index = self._reserve_bot_index(started_at)
             slot.phase = self.machine.transcript_phase()
+            slot.started_at = started_at
             self._unvoiced_since = None  # the candidate hears something: the wait is over
 
-    def _claim_current_speech_slot(self) -> None:
+    def _claim_current_speech_slot(self, started_at: float | None = None) -> None:
         """The speech that just started speaking owns the next transcript position.
 
         This is what keeps an interrupted reply ahead of the candidate who interrupted
@@ -3149,7 +3351,22 @@ class R1Interview:
         handle = getattr(self.session, "current_speech", None)
         slot = self._speeches.get(getattr(handle, "id", None))
         if slot is not None:
-            self._claim_slot(slot)
+            self._claim_slot(slot, started_at)
+
+    @staticmethod
+    def _bot_turn_anchor(item: Any, slot: _SpeechSlot | None) -> int | None:
+        """Epoch ms the bot began speaking this row: the SDK's own metric, else the claim event.
+
+        ``ChatMessage.metrics["started_speaking_at"]`` is set when the line finished playing; if
+        the item has none, the ``agent_state_changed -> speaking`` event that claimed the slot
+        is the same moment to within a frame.  Otherwise None: never the row-write time.
+        """
+        metrics = getattr(item, "metrics", None)
+        started = metrics.get("started_speaking_at") if isinstance(metrics, Mapping) else None
+        anchor = _epoch_ms(started)
+        if anchor is None and slot is not None:
+            anchor = _epoch_ms(slot.started_at)
+        return anchor
 
     def _on_speech_done(self, handle: Any) -> None:
         speech_id = getattr(handle, "id", None)
@@ -3265,7 +3482,14 @@ class R1Interview:
             index, phase = slot.index, slot.phase
         interrupted = bool(getattr(item, "interrupted", False))
         self._remember_bot_turn(index, phase, text, slot)
-        self._write_turn(index, "bot", text, phase, interrupted=interrupted)
+        self._write_turn(
+            index,
+            "bot",
+            text,
+            phase,
+            interrupted=interrupted,
+            started_at_ms=self._bot_turn_anchor(item, slot),
+        )
         self._record_learner_speech(slot, text, interrupted)
 
     def _remember_bot_turn(
@@ -3315,7 +3539,10 @@ class R1Interview:
     def _on_agent_state_changed(self, event: Any) -> None:
         self._agent_state = str(getattr(event, "new_state", "") or "")
         if self._agent_state == "speaking":
-            self._claim_current_speech_slot()
+            created = getattr(event, "created_at", None)
+            self._claim_current_speech_slot(
+                created if isinstance(created, (int, float)) and not isinstance(created, bool) else None
+            )
             self._note_audio_started()
         self._refresh_quiet()
 
@@ -3332,6 +3559,9 @@ class R1Interview:
         self._candidate_activity_at = self._clock()
         self._latency.note_user_state(self._user_state)
         if self._user_state == "speaking":
+            spoke = getattr(event, "created_at", None)
+            if isinstance(spoke, (int, float)) and not isinstance(spoke, bool):
+                self._user_speaking_at.append(float(spoke))
             self._dropped_turn_start = None  # new speech: what a fragment dropped stays dropped
             if self._user_turn_started is None:
                 self._user_turn_started = self._clock()
@@ -4144,6 +4374,9 @@ class R1Interview:
             self._enter(R1Phase.OPENING)
             self._schedule_forced_close()
             await self._start()
+            # Capture begins before the opening line, so the first thing the candidate hears is
+            # in the recording.  Never blocks and never raises (bounded, logged, skipped).
+            await self._start_recorder()
             # The driver, not on_enter, speaks the opening so the icebreaker clock and
             # its silence window begin only once the candidate has heard the question.
             await self.say("L-OPEN")
@@ -4191,7 +4424,7 @@ class R1Interview:
             outcome = await self._finish("provider_error", system=True)
             return outcome
         finally:
-            self._begin_exit()
+            self._begin_exit(outcome)
             self._queue_fidelity()
             await self._drain_background()
             try:
@@ -4211,6 +4444,16 @@ class _NoopSession:
 
     def say(self, *_: Any, **__: Any) -> None:
         return None
+
+
+def _audio_only_subscription() -> Any:
+    """``AutoSubscribe.AUDIO_ONLY`` (the bare-python stand-ins have no SDK enum, so fall back to its value)."""
+    try:
+        from livekit.agents import AutoSubscribe
+
+        return AutoSubscribe.AUDIO_ONLY
+    except Exception:  # noqa: BLE001 - ImportError or a stub without the enum
+        return "audio_only"
 
 
 async def run_r1_session(
@@ -4236,7 +4479,10 @@ async def run_r1_session(
 
     try:
         if callable(getattr(ctx, "connect", None)):
-            await _maybe_await(ctx.connect())
+            # R1 reads only microphone publications.  The SDK's default (subscribe to everything)
+            # has the SFU forward the candidate's camera to the worker, which nothing consumes;
+            # a recorder that wants the camera subscribes to it itself.
+            await _maybe_await(ctx.connect(auto_subscribe=_audio_only_subscription()))
     except asyncio.CancelledError:
         await settle_without_context("shutdown_forced")
         raise
@@ -4284,4 +4530,33 @@ async def run_r1_session(
             error_type="r1_line_cache_unavailable",
             error_category=_error_type_of(exc),
         )
-    return await R1Interview(ctx, context, session, writer, line_cache=line_cache).run()
+    recorder_seams: dict[str, Any] = {}
+    try:
+        # Function-local on purpose: with the recording locks off the module is a stdlib-only import
+        # and ``build_r1_recorder`` returns None before it touches anything (no spool, no child
+        # process, no thread, no request), so the interview behaves exactly as without recording.
+        from r1_recorder import build_r1_recorder
+
+        recorder = build_r1_recorder(
+            ctx,
+            context,
+            session,
+            room,
+            session_id,
+            finish_seconds=_scaled(RECORDING_FINISH_SECONDS),
+        )
+        if recorder is not None:
+            recorder_seams = {
+                "recorder_start": recorder.start,
+                "recorder_stop": recorder.stop,
+                "recorder_finish": recorder.finish,
+            }
+    except Exception as exc:  # noqa: BLE001 - recording is optional: the interview runs without it
+        _log.warn(
+            "unknown_event",
+            error_type="r1_recorder_unavailable",
+            error_category=_error_type_of(exc),
+        )
+    return await R1Interview(
+        ctx, context, session, writer, line_cache=line_cache, **recorder_seams
+    ).run()

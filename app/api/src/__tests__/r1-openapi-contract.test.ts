@@ -36,6 +36,14 @@ const fixtures = [
   // R1-Q: the candidate's "I'm ready" button, relayed by the server (the token cannot publish data).
   ['/api/r1/ready', 'post', '200'],
   ['/api/internal/r1/attempt-outcome', 'post', '201'],
+  // R1-REC: the worker-facing recording routes (success is always exactly 200).
+  ['/api/internal/r1/recording/prepare', 'post', '200'],
+  ['/api/internal/r1/recording/part-url', 'post', '200'],
+  ['/api/internal/r1/recording/object-url', 'post', '200'],
+  ['/api/internal/r1/recording/complete', 'post', '200'],
+  // R1-REC: the staff playback mint (viewer+) and the admin health read.
+  ['/api/interview-rounds/{id}/recording', 'get', '200'],
+  ['/api/admin/r1/recording-health', 'get', '200'],
 ] as const;
 
 describe('R1 OpenAPI route fixtures', () => {

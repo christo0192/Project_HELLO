@@ -426,6 +426,9 @@ export function CandidateDetailPage() {
                   blocked={decisionBlocked}
                   // M013 S02: a phone session lists every leg with its own player.
                   candidateId={candidate.id}
+                  // Both tab panels stay mounted: an R1 recording must not keep playing
+                  // behind the other tab.
+                  active={tab === "review"}
                   // Mounted only while Review is the open tab (and the Overview
                   // copy only while Overview is): one player on the page at a
                   // time, and switching tabs unmounts the <audio>, so nothing
@@ -457,6 +460,7 @@ export function CandidateDetailPage() {
                   legacyBrowserScreening={me.legacyBrowserScreeningEnabled !== false}
                   phoneAttempts={phoneAttempts}
                   showPhoneAttempts={tab === "overview"}
+                  r1Active={tab === "overview"}
                   onSessionCompleted={refresh}
                   callInHeader={!reviewable}
                   callRequest={callRequest}
@@ -555,6 +559,7 @@ function OverviewTab({
   legacyBrowserScreening,
   phoneAttempts,
   showPhoneAttempts,
+  r1Active,
   onSessionCompleted,
   callInHeader,
   callRequest,
@@ -578,6 +583,8 @@ function OverviewTab({
   phoneAttempts: PhoneAttemptHistorySource;
   /** False while another tab is open: unmounts the player (see the page). */
   showPhoneAttempts: boolean;
+  /** False while another tab is open: pauses the R1 recordings (the panel stays mounted). */
+  r1Active: boolean;
   onSessionCompleted?: () => void;
   callInHeader: boolean;
   callRequest: number;
@@ -662,6 +669,7 @@ function OverviewTab({
           candidateName={candidate.name}
           role={phoneRole}
           userId={viewerId || null}
+          active={r1Active}
         />
 
         {/* Call attempts and screening sessions: side by side from `xl`, where

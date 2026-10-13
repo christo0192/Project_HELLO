@@ -723,7 +723,11 @@ describe('OpenAPI document integrity', () => {
     // report-audit (inline body, no new schema). 163 + 1 = 164.
     // R1-Q adds ONE candidate path: POST /api/r1/ready, the "I'm ready" button's server relay
     // (inline bodies, no new schema). 164 + 1 = 165.
-    expect(Object.keys(paths).length).toBe(165);
+    // R1-REC adds FOUR worker-only paths under /api/internal/r1/recording/ — prepare, part-url,
+    // object-url and complete (inline bodies, no new schema). 165 + 4 = 169.
+    // R1-REC adds TWO staff paths: GET /api/interview-rounds/{id}/recording (the playback mint) and
+    // GET /api/admin/r1/recording-health (inline bodies, no new schema). 169 + 2 = 171.
+    expect(Object.keys(paths).length).toBe(171);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1149,6 +1153,11 @@ describe('auth boundary vs spec security model', () => {
     'POST /api/internal/r1/usage',
     'POST /api/internal/r1/admin-log',
     'POST /api/internal/r1/attempt-outcome',
+    // R1-REC worker recording routes: same pre-auth worker-bearer boundary as the R1 routes above.
+    'POST /api/internal/r1/recording/prepare',
+    'POST /api/internal/r1/recording/part-url',
+    'POST /api/internal/r1/recording/object-url',
+    'POST /api/internal/r1/recording/complete',
     // P4 internal phone-worker surface. Mounted pre-auth for exactly the same
     // reason as the scoring callback beside it: the trust boundary is the
     // constant-time WORKER_CONTEXT_SECRET comparison, not a recruiter session.

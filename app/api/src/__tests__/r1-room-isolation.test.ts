@@ -329,6 +329,16 @@ describe('R1 source fences', () => {
       'R1_LIVEKIT_URL',
       'R1_LIVEKIT_API_KEY',
       'R1_LIVEKIT_API_SECRET',
+      // R1-REC adds the recording storage surface on purpose, all declared in
+      // config/environment.schema.json (api) and read ONLY by lib/r1/recording/config.ts.
+      'R1_RECORDING_S3_ENDPOINT',
+      'R1_RECORDING_S3_REGION',
+      'R1_RECORDING_S3_BUCKET',
+      'R1_RECORDING_S3_ACCESS_KEY_ID',
+      'R1_RECORDING_S3_SECRET_ACCESS_KEY',
+      'R1_RECORDING_MAX_BYTES',
+      'R1_RECORDING_DOWNLOAD_TTL_SEC',
+      'R1_RECORDING_RETENTION_DAYS',
     ]);
     for (const file of r1Sources) {
       const reads = code(file)

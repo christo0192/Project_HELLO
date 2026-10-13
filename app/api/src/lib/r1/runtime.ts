@@ -2,21 +2,38 @@
  * lib/r1/runtime.ts: the composition root for the R1 queue runtime (plan 6.7).
  *
  * ── DEDICATED AND ISOLATED ────────────────────────────────────────────
- * R1 gets its OWN `createQueueRunner` (concurrency 1) and its OWN loop scheduler. It hosts
- * exactly one handler today, `r1.assessment`; `r1.recording.finalize` and `r1.sweep` join it
- * in PR-8. It is NEVER registered in the phone runtime (handlers `{phone.dial,
- * phone.assessment}`, `lib/phone-runtime/runtime.ts`) or the recording runtime, and the phone
- * runtime is never touched: `r1-runtime-structural.test.ts` pins both facts.
+ * R1 gets its OWN `createQueueRunner` (concurrency 1) and its OWN loop scheduler. The assessment
+ * runner hosts exactly one handler, `r1.assessment`. A SECOND runner, `r1-storage` (concurrency 1,
+ * its own loop), hosts the recording lane (R1-REC): `r1.recording.finalize`, `r1.recording.erase`
+ * (consent withdrawn / declined) and `r1.sweep` (retention, crash salvage, purge outbox). It is
+ * separate so a ten-minute scoring job can never delay a deletion or a finalize. Neither runner is EVER
+ * registered in the phone runtime (handlers `{phone.dial, phone.assessment}`,
+ * `lib/phone-runtime/runtime.ts`) or the recording runtime, and the phone runtime is never
+ * touched: `r1-runtime.test.ts` ("structural fences") pins both facts.
  *
  * ── WITH THE SHIPPED DEFAULTS THIS CONSTRUCTS NOTHING ─────────────────
  * `R1_ENABLED` is unset/false, so `createR1Runtime` returns null: no runner, no scheduler, no
- * timer, no database poll, no provider call. When it is on, a DB gate still applies: the
+ * timer, no database poll, no provider call. (`createR1StorageRuntime`, the recording lane alone,
+ * returns null too until `R1_RECORDING_S3_*` is configured.) When it is on, a DB gate still applies: the
  * runner claims only while `r1_settings.enabled` is true (cached 5 s, FAIL CLOSED: a settings
  * row that cannot be read means "do not claim"). A paused R1 still scores sessions that
  * already finished ("live sessions finish"); a disabled one scores and applies nothing.
  *
- * ── TWO LOOPS ─────────────────────────────────────────────────────────
+ * ── FOUR LOOPS ────────────────────────────────────────────────────────
  *   r1-assessment  drains `r1.assessment` through the handler.
+ *   r1-storage     drains the recording lane (`r1.recording.finalize`, `r1.recording.erase`,
+ *                  `r1.sweep`). It claims while the R2 recording config is `enabled` and is NOT
+ *                  tied to `r1_settings.enabled`: a paused or disabled R1 must still finish a
+ *                  recording already in flight, and erase and sweep are privacy obligations that
+ *                  a kill switch must never stop. With no R2 config the jobs simply stay
+ *                  `pending` (no attempt is spent). Nor is it tied to `R1_ENABLED`: with the env
+ *                  switch off `createR1Runtime` returns null, and `index.ts` then builds the same
+ *                  lane on its own (`createR1StorageRuntime`, below), so a consent withdrawal or the
+ *                  90-day retention is never stranded by flipping the incident switch.
+ *   r1-sweep       enqueues `r1.sweep` once per 15-minute bucket (dedup key `r1.sweep:<bucket>`)
+ *                  while the R2 recording config is `enabled`. The loop scheduler never waits
+ *                  longer than 60 s between ticks, so the tick itself is a cheap in-memory bucket
+ *                  test; the bucket is the cadence.
  *   r1-status      closes due 24 h pending rejects (`r1_apply_due_pending_rejects`) and runs
  *                  the override monitor, which switches auto-status off at >10% over a
  *                  rolling 20. Both are SECURITY DEFINER RPCs that re-check the CAS, so a
@@ -52,12 +69,28 @@ import {
   createR1FinalDeferralGuard,
 } from './assessment-handler.js';
 import { lapseOrphanedR1Sessions, type R1OrphanLapseOptions } from './orphan-lapse.js';
+import { getR1RecordingConfig, type R1RecordingConfig } from './recording/config.js';
+import {
+  createR1RecordingEraseHandler,
+  createR1RecordingFinalizeHandler,
+  createR1SweepHandler,
+} from './recording/handlers.js';
+import { R1_RECORDING_ERASE_QUEUE, R1_RECORDING_FINALIZE_QUEUE, R1_SWEEP_QUEUE } from './recording/queues.js';
+import { getR1RecordingStore } from './recording/store-factory.js';
+import type { R1ObjectStore } from './recording/store.js';
 import { agentDispatchClientFor, browserLiveKitEndpoint } from '../livekit-endpoints.js';
 import type { DispatchListerLike } from './worker-gate.js';
 import { recordR1ScoringFailure, type R1AssessmentOptions } from '../../services/r1-assessment.js';
 
 /** The ONLY queues this runtime registers. A structural test pins it. */
-export const R1_RUNTIME_QUEUES: readonly string[] = [R1_ASSESSMENT_QUEUE];
+export const R1_RUNTIME_QUEUES: readonly string[] = [
+  R1_ASSESSMENT_QUEUE,
+  R1_RECORDING_FINALIZE_QUEUE,
+  R1_RECORDING_ERASE_QUEUE,
+  R1_SWEEP_QUEUE,
+];
+/** The queues the `r1-storage` runner claims (everything but scoring). */
+const R1_STORAGE_QUEUES: ReadonlySet<string> = new Set([R1_RECORDING_FINALIZE_QUEUE, R1_RECORDING_ERASE_QUEUE, R1_SWEEP_QUEUE]);
 
 export const R1_RUNTIME_BOUNDS = {
   /**
@@ -66,6 +99,12 @@ export const R1_RUNTIME_BOUNDS = {
    */
   jobLeaseSeconds: 600,
   queuePollMs: 5_000,
+  /** The recording lane's poll: finalize is not latency-critical, but it should not lag a minute. */
+  storagePollMs: 5_000,
+  /** How often the sweep-enqueue loop wakes (the scheduler caps any loop at 60 s anyway). */
+  sweepPollMs: 60_000,
+  /** The cadence of `r1.sweep`: one job per bucket of this length. */
+  sweepBucketMs: 15 * 60_000,
   statusPollMs: 60_000,
   /** How long an `r1_settings.enabled` read is trusted. */
   enabledCacheMs: 5_000,
@@ -80,6 +119,8 @@ export interface R1RuntimeSnapshot {
   /** Lapse reads/writes that failed (the next pass retries). */
   readonly orphanLapseErrors: number;
   readonly jobEvents: Readonly<Record<string, number>>;
+  /** The recording lane's queue events, kept apart from `jobEvents` (scoring). */
+  readonly storageJobEvents: Readonly<Record<string, number>>;
 }
 
 /**
@@ -101,6 +142,10 @@ export interface R1RuntimeOptions {
   readonly queue?: Queue;
   readonly owner?: string;
   readonly infer?: R1AssessmentOptions['infer'];
+  /** Test seam for the recording config; production reads `R1_RECORDING_*` at call time. */
+  readonly recordingConfig?: () => R1RecordingConfig;
+  /** Test seam for the object store; production uses the shared S3 store. */
+  readonly recordingStore?: (config: Extract<R1RecordingConfig, { enabled: true }>) => R1ObjectStore;
   readonly now?: () => Date;
   readonly scheduler?: {
     readonly random?: () => number;
@@ -113,6 +158,8 @@ export interface R1RuntimeOptions {
 export interface R1RuntimeHandle {
   readonly scheduler: LoopSchedulerHandle;
   readonly runner: QueueRunnerHandle;
+  /** The recording lane's runner (`r1-storage`). */
+  readonly storageRunner: QueueRunnerHandle;
   readonly queue: Queue;
   /** The queue names this runtime claims from. */
   readonly queues: readonly string[];
@@ -156,6 +203,8 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
   };
 
   const jobEvents: Record<string, number> = {};
+  const storageJobEvents: Record<string, number> = {};
+  const recordingConfig = options.recordingConfig ?? ((): R1RecordingConfig => getR1RecordingConfig());
   let lastStatusApplied: number | null = null;
   let statusLoopErrors = 0;
   let lastOrphansLapsed: number | null = null;
@@ -199,6 +248,22 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
       });
     },
   });
+
+  // The recording lane. NOT gated on `r1_settings.enabled`: only on the R2 config, so a paused or
+  // disabled R1 still finalizes a recording in flight, and a withdrawal or the retention sweep is
+  // never stopped by a kill switch. (Nor by `R1_ENABLED` when it is off: see `createR1StorageRuntime`.)
+  const lane = createStorageLane({
+    client,
+    queue,
+    owner,
+    clock,
+    logger,
+    recordingConfig,
+    recordingStore: options.recordingStore ?? getR1RecordingStore,
+    events: storageJobEvents,
+  });
+  const storageRunner = lane.runner;
+  const sweepEnqueueTick = lane.sweepEnqueueTick;
 
   const sweepPendingRejects = async (): Promise<boolean> => {
     try {
@@ -247,6 +312,8 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
   const loopIntervalsMs = {
     'r1-assessment': R1_RUNTIME_BOUNDS.queuePollMs,
     'r1-status': R1_RUNTIME_BOUNDS.statusPollMs,
+    'r1-storage': R1_RUNTIME_BOUNDS.storagePollMs,
+    'r1-sweep': R1_RUNTIME_BOUNDS.sweepPollMs,
   } as const;
   const scheduler = createLoopScheduler({
     ...(options.scheduler ?? {}),
@@ -258,12 +325,19 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
         tick: queueRunnerTick(runner),
       },
       { name: 'r1-status', intervalMs: loopIntervalsMs['r1-status'], tick: statusTick },
+      {
+        name: 'r1-storage',
+        intervalMs: loopIntervalsMs['r1-storage'],
+        tick: queueRunnerTick(storageRunner),
+      },
+      { name: 'r1-sweep', intervalMs: loopIntervalsMs['r1-sweep'], tick: sweepEnqueueTick },
     ],
   });
 
   return {
     scheduler,
     runner,
+    storageRunner,
     queue,
     queues: R1_RUNTIME_QUEUES,
     loopIntervalsMs,
@@ -273,14 +347,231 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
       lastOrphansLapsed,
       orphanLapseErrors,
       jobEvents: { ...jobEvents },
+      storageJobEvents: { ...storageJobEvents },
     }),
     async tickAll(): Promise<void> {
       await runner.tick();
+      await sweepEnqueueTick();
+      await storageRunner.tick();
       await statusTick();
     },
     async stop(): Promise<void> {
       await scheduler.stop();
       await runner.stop();
+      await storageRunner.stop();
+    },
+  };
+}
+
+// ---------------------------------------------------------------- the recording lane
+
+type EnabledRecordingConfig = Extract<R1RecordingConfig, { enabled: true }>;
+
+interface R1StorageLaneDeps {
+  readonly client: SupabaseClient;
+  readonly queue: Queue;
+  /** The runtime's owner id; the lane's runner claims as `<owner>-storage`. */
+  readonly owner: string;
+  readonly clock: () => Date;
+  readonly logger: ReturnType<typeof createLogger>;
+  readonly recordingConfig: () => R1RecordingConfig;
+  readonly recordingStore: (config: EnabledRecordingConfig) => R1ObjectStore;
+  /** Queue-event counters of the lane, filled in place (kept apart from scoring's). */
+  readonly events: Record<string, number>;
+}
+
+interface R1StorageLane {
+  readonly runner: QueueRunnerHandle;
+  /** Enqueue the bucket's `r1.sweep` (once per 15 minutes); resolves true when it enqueued. */
+  readonly sweepEnqueueTick: () => Promise<boolean>;
+}
+
+/**
+ * The `r1-storage` runner (finalize, erase, sweep) and the sweep-enqueue tick, built ONCE and shared by
+ * the full runtime (`R1_ENABLED` on) and the standalone one (`createR1StorageRuntime`, `R1_ENABLED` off),
+ * so the two can never drift apart. Gated on the R2 recording config alone: never on `R1_ENABLED` and
+ * never on `r1_settings.enabled`.
+ */
+function createStorageLane(deps: R1StorageLaneDeps): R1StorageLane {
+  const { client, queue, owner, clock, logger, recordingConfig, recordingStore, events } = deps;
+  const storageEnqueue = (name: string, payload: unknown, enqueueOptions: { dedupKey: string; maxAttempts: number }): Promise<unknown> =>
+    queue.enqueue(name, payload, enqueueOptions);
+  const storageRunner = createQueueRunner({
+    queue,
+    handlers: {
+      [R1_RECORDING_FINALIZE_QUEUE]: createR1RecordingFinalizeHandler({
+        db: client as never,
+        recordingConfig,
+        store: recordingStore,
+        enqueue: storageEnqueue,
+        now: clock,
+        // The verdict only: no id, key or size ever reaches a log line.
+        onResult: (outcome) => logger.info('unknown_event', {
+          error_category: outcome.kind === 'finalized' ? `r1_recording_${outcome.status}` : `r1_recording_${outcome.kind}`,
+        }),
+      }),
+      [R1_RECORDING_ERASE_QUEUE]: createR1RecordingEraseHandler({
+        db: client as never,
+        recordingConfig,
+        store: recordingStore,
+        now: clock,
+        // Counters only: no id, key or size ever reaches a log line.
+        onResult: (result) => logger.info('unknown_event', {
+          error_category: result.errors > 0 ? 'r1_recording_erase_errors' : result.blocked > 0 ? 'r1_recording_erase_blocked' : 'r1_recording_erase_done',
+        }),
+      }),
+      [R1_SWEEP_QUEUE]: createR1SweepHandler({
+        db: client as never,
+        recordingConfig,
+        store: recordingStore,
+        enqueue: storageEnqueue,
+        now: clock,
+        log: (category) => logger.warn('unknown_event', { error_category: category }),
+        onResult: () => logger.info('unknown_event', { error_category: 'r1_sweep_done' }),
+      }),
+    },
+    owner: `${owner}-storage`,
+    shouldClaim: async (queueName: string): Promise<boolean> =>
+      R1_STORAGE_QUEUES.has(queueName) && recordingConfig().enabled,
+    leaseSeconds: R1_RUNTIME_BOUNDS.jobLeaseSeconds,
+    concurrency: 1,
+    pollMs: R1_RUNTIME_BOUNDS.storagePollMs,
+    onEvent: (event) => {
+      events[event.kind] = (events[event.kind] ?? 0) + 1;
+      // With no R2 config every 5 s tick is `not_admitted`: count it, but do not write a log line
+      // forever for the shipped default (recording off).
+      if (event.kind === 'not_admitted') return;
+      // Metadata only: a queue name and a sanitized kind. Never a payload, an id or a key.
+      logger.info('unknown_event', {
+        error_category: `r1_storage_queue_${event.kind}`,
+        error_type: event.queueName,
+      });
+    },
+  });
+
+  // One `r1.sweep` job per 15-minute bucket while the storage config is enabled. The scheduler never
+  // waits more than 60 s between ticks, so this tick must be cheap: the bucket test is in memory and
+  // the queue is touched once per bucket. A second replica may enqueue the same bucket; the dedup key
+  // collapses it while the first job is live, and the sweep is idempotent anyway.
+  let lastSweepBucket = -1;
+  const sweepEnqueueTick = async (): Promise<boolean> => {
+    if (!recordingConfig().enabled) return false;
+    const bucket = Math.floor(clock().getTime() / R1_RUNTIME_BOUNDS.sweepBucketMs);
+    if (bucket === lastSweepBucket) return false;
+    try {
+      await queue.enqueue(R1_SWEEP_QUEUE, { bucket }, { dedupKey: `${R1_SWEEP_QUEUE}:${bucket}`, maxAttempts: 3 });
+      lastSweepBucket = bucket;
+      return true;
+    } catch {
+      logger.warn('unknown_event', { error_category: 'r1_sweep_enqueue_error' });
+      return false;
+    }
+  };
+
+  return { runner: storageRunner, sweepEnqueueTick };
+}
+
+// ---------------------------------------------------------------- the lane on its own (R1_ENABLED off)
+
+/** The ONLY queues the standalone storage runtime claims from. */
+export const R1_STORAGE_RUNTIME_QUEUES: readonly string[] = [
+  R1_RECORDING_FINALIZE_QUEUE,
+  R1_RECORDING_ERASE_QUEUE,
+  R1_SWEEP_QUEUE,
+];
+
+export interface R1StorageRuntimeOptions {
+  readonly client?: SupabaseClient;
+  readonly queue?: Queue;
+  readonly owner?: string;
+  /** Test seam for the recording config; production reads `R1_RECORDING_S3_*` at call time. */
+  readonly recordingConfig?: () => R1RecordingConfig;
+  /** Test seam for the object store; production uses the shared S3 store. */
+  readonly recordingStore?: (config: EnabledRecordingConfig) => R1ObjectStore;
+  readonly now?: () => Date;
+  readonly scheduler?: R1RuntimeOptions['scheduler'];
+}
+
+export interface R1StorageRuntimeSnapshot {
+  readonly storageJobEvents: Readonly<Record<string, number>>;
+}
+
+export interface R1StorageRuntimeHandle {
+  readonly scheduler: LoopSchedulerHandle;
+  /** The recording lane's runner (`r1-storage`). */
+  readonly storageRunner: QueueRunnerHandle;
+  readonly queue: Queue;
+  readonly queues: readonly string[];
+  readonly loopIntervalsMs: Readonly<Record<'r1-storage' | 'r1-sweep', number>>;
+  snapshot(): R1StorageRuntimeSnapshot;
+  /** Drive one pass of every loop (tests; production uses the scheduler). */
+  tickAll(): Promise<void>;
+  stop(): Promise<void>;
+}
+
+/**
+ * The recording lane without the rest of R1: finalize, consent-withdrawal erase and the retention
+ * sweep keep running when `R1_ENABLED` is off. `createR1Runtime` hosts the same lane, but it returns
+ * null with the env kill switch off, and a kill switch an operator flips in an R1 incident must not
+ * strand a consent withdrawal (an erase job nobody claims) or the 90-day retention promise.
+ *
+ * The caller (`index.ts`) builds this ONLY when `createR1Runtime` returned null; the two never run in
+ * one process, so they may share the `r1` metric prefix and the `r1-storage` / `r1-sweep` loop names.
+ *
+ * WITH THE SHIPPED DEFAULTS THIS CONSTRUCTS NOTHING: with no `R1_RECORDING_S3_*` configured
+ * (`disabled`, or `invalid`), it returns null; no runner, no scheduler, no timer, no database poll.
+ * Only a machine that holds R2 credentials can have recordings to finish, erase or sweep.
+ */
+export function createR1StorageRuntime(options: R1StorageRuntimeOptions = {}): R1StorageRuntimeHandle | null {
+  const recordingConfig = options.recordingConfig ?? ((): R1RecordingConfig => getR1RecordingConfig());
+  // THE GATE. Nothing below this line runs unless the R2 recording config is `enabled`.
+  if (!recordingConfig().enabled) return null;
+
+  const logger = createLogger('r1-runtime');
+  const client = options.client ?? (supabase as unknown as SupabaseClient);
+  const queue = options.queue ?? new Queue(new PgAdapter(client), { defaultMaxAttempts: 5 });
+  const owner = options.owner ?? `r1-${process.pid}-${randomUUID().slice(0, 8)}`;
+  const clock = options.now ?? ((): Date => new Date());
+  const storageJobEvents: Record<string, number> = {};
+
+  const lane = createStorageLane({
+    client,
+    queue,
+    owner,
+    clock,
+    logger,
+    recordingConfig,
+    recordingStore: options.recordingStore ?? getR1RecordingStore,
+    events: storageJobEvents,
+  });
+  const loopIntervalsMs = {
+    'r1-storage': R1_RUNTIME_BOUNDS.storagePollMs,
+    'r1-sweep': R1_RUNTIME_BOUNDS.sweepPollMs,
+  } as const;
+  const scheduler = createLoopScheduler({
+    ...(options.scheduler ?? {}),
+    metricPrefix: 'r1',
+    loops: [
+      { name: 'r1-storage', intervalMs: loopIntervalsMs['r1-storage'], tick: queueRunnerTick(lane.runner) },
+      { name: 'r1-sweep', intervalMs: loopIntervalsMs['r1-sweep'], tick: lane.sweepEnqueueTick },
+    ],
+  });
+  logger.info('unknown_event', { error_category: 'r1_storage_runtime_standalone' });
+
+  return {
+    scheduler,
+    storageRunner: lane.runner,
+    queue,
+    queues: R1_STORAGE_RUNTIME_QUEUES,
+    loopIntervalsMs,
+    snapshot: () => ({ storageJobEvents: { ...storageJobEvents } }),
+    async tickAll(): Promise<void> {
+      await lane.sweepEnqueueTick();
+      await lane.runner.tick();
+    },
+    async stop(): Promise<void> {
+      await scheduler.stop();
+      await lane.runner.stop();
     },
   };
 }

@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import inspect
 import sys
+import time
 import typing
 import unittest
 from pathlib import Path
@@ -25,6 +26,7 @@ try:
     from livekit import rtc
     from livekit.agents import APIConnectOptions, Agent, AgentSession, JobContext, StopResponse
     from livekit.agents.llm import ChatContext, ChatMessage
+    from livekit.agents.llm.chat_context import MetricsReport
     from livekit.agents.ipc import job_proc_lazy_main
     from livekit.agents.llm.llm import LLMError
     from livekit.agents.voice.agent_activity import AgentActivity
@@ -32,6 +34,7 @@ try:
     from livekit.agents.voice.agent_session import SessionConnectOptions
     from livekit.agents.voice.events import (
         AgentStateChangedEvent,
+        UserStateChangedEvent,
         CloseEvent,
         ConversationItemAddedEvent,
         ErrorEvent,
@@ -49,6 +52,7 @@ except ImportError:
     ChatMessage = LLMError = AgentActivity = CloseEvent = SpeechCreatedEvent = None
     AudioRecognition = None
     ChatContext = AgentStateChangedEvent = ConversationItemAddedEvent = None
+    MetricsReport = UserStateChangedEvent = None
     UserInputTranscribedEvent = EventTypes = None
     SpeechHandle = AgentServer = job_proc_lazy_main = None
 
@@ -346,6 +350,229 @@ class TestR1SdkContract(unittest.TestCase):
         self.assertTrue(callable(getattr(rtc.LocalParticipant, "set_attributes")))
         attributes = inspect.signature(rtc.LocalParticipant.set_attributes).parameters
         self.assertIn("attributes", attributes)
+
+
+@unittest.skipUnless(AgentSession is not None, "livekit-agents is not installed (bare CI)")
+class TestR1RecordingContract(unittest.IsolatedAsyncioTestCase):
+    """The SDK symbols the in-worker recorder (``r1_recorder``) reaches into.
+
+    ``R1RecorderIO`` subclasses the SDK's ``RecorderIO`` and replaces two of its private queues;
+    the turn anchors read SDK timestamps; the camera is no longer subscribed at connect.  Every
+    one of those is a fact about livekit-agents 1.6.4, pinned here so a bump fails CI instead of
+    silently breaking a recording.
+    """
+
+    async def test_recorder_io_has_the_constructor_methods_and_queues_the_tee_replaces(self) -> None:
+        import queue
+
+        from livekit.agents.voice.recorder_io import recorder_io as rio
+
+        params = inspect.signature(rio.RecorderIO.__init__).parameters
+        self.assertEqual([n for n in params if n != "self"], ["agent_session", "sample_rate", "loop"])
+        self.assertEqual(params["sample_rate"].default, 48000)
+        start = inspect.signature(rio.RecorderIO.start).parameters
+        self.assertIn("output_path", start)
+        self.assertTrue(inspect.iscoroutinefunction(rio.RecorderIO.start))
+        self.assertTrue(inspect.iscoroutinefunction(rio.RecorderIO.aclose))
+        self.assertIsInstance(inspect.getattr_static(rio.RecorderIO, "recording"), property)
+        for name in ("record_input", "record_output", "_write_cb", "_forward_task", "_encode_thread"):
+            self.assertTrue(callable(getattr(rio.RecorderIO, name)), name)
+        recorder = rio.RecorderIO(agent_session=object())
+        # The two private queues the tee swaps for its own subclass, as plain thread queues.
+        self.assertIsInstance(recorder._in_q, queue.Queue)
+        self.assertIsInstance(recorder._out_q, queue.Queue)
+        for attribute in ("_started", "_in_record", "_out_record", "_sample_rate"):
+            self.assertTrue(hasattr(recorder, attribute), attribute)
+        self.assertFalse(recorder.recording)
+        self.assertEqual(rio.WRITE_INTERVAL, 2.5)
+
+    def test_the_stock_recorder_writes_both_queues_in_lock_step_and_ends_them_with_none(self) -> None:
+        from livekit.agents.voice.recorder_io import recorder_io as rio
+
+        write = inspect.getsource(rio.RecorderIO._write_cb)
+        self.assertLess(write.index("self._in_q.put_nowait"), write.index("self._out_q.put_nowait"))
+        forward = inspect.getsource(rio.RecorderIO._forward_task)
+        self.assertIn("self._in_q.put_nowait(input_buf)", forward)
+        self.assertIn("self._out_q.put_nowait([])", forward)
+        close = inspect.getsource(rio.RecorderIO.aclose)
+        self.assertIn("self._in_q.put_nowait(None)", close)
+        self.assertIn("self._out_q.put_nowait(None)", close)
+        # The tee overrides ``put``; the SDK must keep using ``put_nowait`` (which calls it).
+        self.assertNotIn(".put(", write + forward + close)
+
+    def test_the_taps_expose_what_the_idle_tail_flush_and_the_wiring_use(self) -> None:
+        from livekit.agents.voice.recorder_io import recorder_io as rio
+
+        take = inspect.signature(rio.RecorderAudioInput.take_buf).parameters
+        self.assertEqual(list(take), ["self", "pad_since"])
+        self.assertIsInstance(inspect.getattr_static(rio.RecorderAudioOutput, "has_pending_data"), property)
+        finished = inspect.signature(rio.RecorderAudioOutput.on_playback_finished).parameters
+        self.assertEqual(
+            list(finished), ["self", "playback_position", "interrupted", "synchronized_transcript"]
+        )
+        self.assertIn("_last_speech_end_time", inspect.getsource(rio.RecorderAudioOutput.__init__))
+        # Capture stops when ``recording`` reads False.
+        self.assertIn("self.__recording_io.recording", inspect.getsource(rio.RecorderAudioInput.__anext__))
+        self.assertIn("self.__recording_io.recording", inspect.getsource(rio.RecorderAudioOutput.capture_frame))
+
+    def test_the_first_input_chunk_is_padded_once_with_silence_the_mixer_can_recognise(self) -> None:
+        """What the tee's trim of a chunk that is ahead of the clock relies on (review round 1).
+
+        The SDK pads the candidate's FIRST input chunk, once, in front, with silence of the length
+        (first microphone frame - end of the last agent line); the mixer has already filled that
+        stretch from the wall clock.  It trims the duplicate, but only samples at or below
+        ``SILENCE_LEVEL`` on both channels: the resampler turns the SDK's digital silence into +-1 LSB
+        of dither, never more.
+        """
+        import numpy as np
+        from livekit.agents.voice.recorder_io import recorder_io as rio
+
+        import r1_recorder
+
+        take = inspect.getsource(rio.RecorderAudioInput.take_buf)
+        self.assertIn("self.__started_time - pad_since", take)
+        self.assertIn("not self.__padded", take)
+        self.assertIn("self.__padded = True", take)
+        self.assertIn("_create_silence_frame(padding, frames[0].sample_rate, frames[0].num_channels)", take)
+        self.assertLessEqual(r1_recorder.SILENCE_LEVEL, 4)
+        silent = rtc.AudioFrame(
+            data=bytes(2 * 24000 * 3), sample_rate=24000, num_channels=1, samples_per_channel=24000 * 3
+        )
+        converted = r1_recorder._ChannelResampler().convert([silent], flush=True)
+        self.assertGreater(len(converted), 2 * 48000)
+        self.assertLessEqual(int(np.abs(converted.astype(np.int32)).max()), r1_recorder.SILENCE_LEVEL)
+
+    def test_the_session_accepts_a_replacement_audio_input_and_output_after_start(self) -> None:
+        from livekit.agents.voice import io as lk_io
+
+        for container in (lk_io.AgentInput, lk_io.AgentOutput):
+            prop = inspect.getattr_static(container, "audio")
+            self.assertIsInstance(prop, property)
+            self.assertIsNotNone(prop.fset, container.__name__)
+        self.assertIn("record", inspect.signature(AgentSession.start).parameters)
+
+    def test_audio_only_is_the_connect_option_that_stops_the_camera_being_forwarded(self) -> None:
+        from livekit.agents import AutoSubscribe
+        from livekit.agents import job as lk_job
+
+        self.assertEqual(AutoSubscribe.AUDIO_ONLY.value, "audio_only")
+        connect = inspect.signature(JobContext.connect).parameters
+        self.assertEqual(connect["auto_subscribe"].default, AutoSubscribe.SUBSCRIBE_ALL)
+        source = inspect.getsource(JobContext.connect)
+        # Anything but SUBSCRIBE_ALL turns the room's own auto-subscribe off ...
+        self.assertIn("auto_subscribe=auto_subscribe == AutoSubscribe.SUBSCRIBE_ALL", source)
+        self.assertIn("_apply_auto_subscribe_opts(self._room, auto_subscribe)", source)
+        # ... and AUDIO_ONLY then subscribes audio publications (now and when they are published).
+        apply = inspect.getsource(lk_job._apply_auto_subscribe_opts)
+        self.assertIn(
+            "auto_subscribe == AutoSubscribe.AUDIO_ONLY and pub.kind == rtc.TrackKind.KIND_AUDIO", apply
+        )
+        self.assertIn('room.on("track_published")', apply)
+        self.assertTrue(callable(rtc.RemoteTrackPublication.set_subscribed))
+
+    def test_the_speech_timestamps_the_turn_anchors_read_exist(self) -> None:
+        hints = typing.get_type_hints(MetricsReport)
+        self.assertIs(hints["started_speaking_at"], float)
+        self.assertIn("metrics", ChatMessage.model_fields)
+        for event in (UserStateChangedEvent, AgentStateChangedEvent, UserInputTranscribedEvent):
+            self.assertIn("created_at", event.model_fields, event.__name__)
+            self.assertIs(event.model_fields["created_at"].annotation, float)
+        # created_at is the wall clock (time.time()) the recording's start time is taken from.
+        default = UserStateChangedEvent(old_state="listening", new_state="speaking").created_at
+        self.assertLess(abs(default - time.time()), 5.0)
+        self.assertIn(
+            'assistant_metrics["started_speaking_at"] = started_speaking_at',
+            inspect.getsource(AgentActivity),
+        )
+
+    def test_the_camera_symbols_the_picture_capture_relies_on(self) -> None:
+        import r1_recorder
+
+        # The recorder compares plain numbers (it never imports the enums): they must be the SDK's.
+        self.assertEqual(int(rtc.TrackKind.KIND_VIDEO), r1_recorder.KIND_VIDEO)
+        self.assertEqual(int(rtc.TrackSource.SOURCE_CAMERA), r1_recorder.SOURCE_CAMERA)
+        self.assertEqual(int(rtc.ParticipantKind.PARTICIPANT_KIND_STANDARD), r1_recorder.PARTICIPANT_STANDARD)
+        self.assertEqual(int(rtc.VideoBufferType.I420), r1_recorder.BUFFER_I420)
+        self.assertEqual(
+            {
+                int(rtc.VideoRotation.VIDEO_ROTATION_0): 0,
+                int(rtc.VideoRotation.VIDEO_ROTATION_90): 90,
+                int(rtc.VideoRotation.VIDEO_ROTATION_180): 180,
+                int(rtc.VideoRotation.VIDEO_ROTATION_270): 270,
+            },
+            r1_recorder.ROTATION_DEGREES,
+        )
+        # Publications: readable kind/source/subscribed/track, and a boolean subscription request.
+        for name in ("kind", "source", "sid"):
+            self.assertIsInstance(inspect.getattr_static(rtc.TrackPublication, name), property, name)
+        for name in ("subscribed", "track"):
+            self.assertIsInstance(inspect.getattr_static(rtc.RemoteTrackPublication, name), property, name)
+        self.assertEqual(list(inspect.signature(rtc.RemoteTrackPublication.set_subscribed).parameters), ["self", "subscribed"])
+        self.assertIsInstance(inspect.getattr_static(rtc.Track, "sid"), property)
+        # Room events: the argument ORDER differs between them (track first for subscribe).
+        room_source = inspect.getsource(rtc.Room)
+        self.assertIn('self.emit("track_subscribed", remote_video_track, rpublication, rparticipant)', room_source)
+        self.assertIn('self.emit("track_unsubscribed", rtrack, rpublication, rparticipant)', room_source)
+        self.assertIn('self.emit("participant_connected", rparticipant)', room_source)
+        self.assertIn('self.emit("participant_disconnected", rparticipant)', room_source)
+        self.assertTrue(callable(rtc.Room.on) and callable(rtc.Room.off))
+        # The decoded-frame stream: (track, loop, capacity, format), async iteration, aclose.
+        params = inspect.signature(rtc.VideoStream.__init__).parameters
+        self.assertEqual(list(params)[:5], ["self", "track", "loop", "capacity", "format"])
+        self.assertEqual(params["capacity"].default, 0)
+        self.assertTrue(inspect.iscoroutinefunction(rtc.VideoStream.aclose))
+        self.assertTrue(hasattr(rtc.VideoStream, "__aiter__") and hasattr(rtc.VideoStream, "__anext__"))
+        self.assertEqual(
+            list(typing.get_type_hints(rtc.video_stream.VideoFrameEvent)), ["frame", "timestamp_us", "rotation", "metadata"]
+        )
+        self.assertIn("normalize_stride = True", inspect.getsource(rtc.VideoStream._create_owned_stream))
+
+    def test_a_real_i420_frame_is_taken_as_tightly_packed_bytes_by_the_capture(self) -> None:
+        import r1_recorder
+        from types import SimpleNamespace
+
+        planes = bytes(range(256)) * ((640 * 360 * 3 // 2) // 256 + 1)
+        frame = rtc.VideoFrame(640, 360, rtc.VideoBufferType.I420, bytearray(planes[: 640 * 360 * 3 // 2]))
+        self.assertEqual((frame.width, frame.height, int(frame.type)), (640, 360, r1_recorder.BUFFER_I420))
+        for rotation, degrees in ((rtc.VideoRotation.VIDEO_ROTATION_0, 0), (rtc.VideoRotation.VIDEO_ROTATION_90, 90),
+                                  (rtc.VideoRotation.VIDEO_ROTATION_270, 270)):
+            picture = r1_recorder.CameraCapture._picture(SimpleNamespace(frame=frame, rotation=rotation))
+            self.assertIsNotNone(picture)
+            width, height, turn, data = picture
+            self.assertEqual((width, height, turn), (640, 360, degrees))
+            self.assertIsInstance(data, bytes)
+            self.assertEqual(data, planes[: 640 * 360 * 3 // 2])
+        # A frame in another pixel format is converted, by the SDK, before it is taken.
+        rgba = rtc.VideoFrame(640, 360, rtc.VideoBufferType.RGBA, bytearray(640 * 360 * 4))
+        converted = r1_recorder.CameraCapture._picture(SimpleNamespace(frame=rgba, rotation=rtc.VideoRotation.VIDEO_ROTATION_0))
+        self.assertIsNotNone(converted)
+        self.assertEqual(len(converted[3]), 640 * 360 * 3 // 2)
+
+    def test_the_vad_metrics_the_picture_watchdog_reads_exist(self) -> None:
+        from livekit.agents import vad as lk_vad
+        from livekit.agents.metrics import VADMetrics
+
+        self.assertIsInstance(inspect.getattr_static(AgentSession, "vad"), property)
+        self.assertTrue(callable(lk_vad.VAD.on) and callable(lk_vad.VAD.off))
+        for field in ("inference_duration_total", "inference_count"):
+            self.assertIn(field, VADMetrics.model_fields, field)
+        self.assertIn("update_interval", lk_vad.VADCapabilities.__dataclass_fields__)
+        self.assertIn('self._vad.emit("metrics_collected", vad_metrics)', inspect.getsource(lk_vad.VADStream))
+
+    def test_the_resampler_and_audio_frame_shapes_the_tee_relies_on(self) -> None:
+        params = inspect.signature(rtc.AudioResampler.__init__).parameters
+        for name in ("input_rate", "output_rate", "num_channels"):
+            self.assertIn(name, params)
+        self.assertTrue(callable(rtc.AudioResampler.push) and callable(rtc.AudioResampler.flush))
+        frame = rtc.AudioFrame(
+            data=b"\x00\x00" * 480, sample_rate=24000, num_channels=1, samples_per_channel=480
+        )
+        for name in ("sample_rate", "num_channels", "samples_per_channel", "data", "duration"):
+            self.assertTrue(hasattr(frame, name), name)
+        resampler = rtc.AudioResampler(input_rate=24000, output_rate=48000, num_channels=1)
+        produced = list(resampler.push(frame)) + list(resampler.flush())
+        self.assertGreater(sum(f.samples_per_channel for f in produced), 800)
+        self.assertEqual({f.sample_rate for f in produced}, {48000})
 
 
 class _RecordingSession:
@@ -1202,3 +1429,86 @@ class TestR1PipelineOnARealSession(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([l["error_category"] for l in played], ["cached"])
         said = [l for l in lines if l.get("schema") == "say_to_first_audio"]
         self.assertEqual([l["error_category"] for l in said], ["L-WRAP"])
+
+    async def test_the_recorder_taps_a_real_sessions_audio_and_the_candidate_still_hears_everything(
+        self,
+    ) -> None:
+        """R1-REC: wiring the recorder AFTER ``session.start`` (the SDK reassigns ``input.audio`` /
+        ``output.audio``) must not change what reaches the candidate, and must capture both sides."""
+        import tempfile
+        from pathlib import Path
+
+        import numpy as np
+        from livekit.agents.voice import io as vio
+
+        import r1_recorder
+        from tests.test_r1_recorder import FakeApi, FakeEncoder, StubHttp
+
+        class Mic(vio.AudioInput):
+            """The room's microphone stand-in: 20 ms of a 300 Hz tone, in real time."""
+
+            def __init__(self) -> None:
+                super().__init__(label="mic")
+                t = np.arange(480) / 24000
+                self.pcm = (np.sin(2 * np.pi * 300 * t) * 6000).astype("<i2").tobytes()
+
+            async def __anext__(self):
+                await asyncio.sleep(0.02)
+                return rtc.AudioFrame(
+                    data=self.pcm, sample_rate=24000, num_channels=1, samples_per_channel=480
+                )
+
+        interview = self.build()
+        await self.session.start(self.r1_session.R1Agent(interview))
+        original_output = self.session.output.audio
+        self.session.input.audio = Mic()
+        events: list = []
+        with tempfile.TemporaryDirectory(prefix="r1rec-real-", ignore_cleanup_errors=True) as tmp:
+            spool = r1_recorder.Spool(Path(tmp) / "r", "00000000-0000-4000-8000-0000000000aa")
+            spool.create()
+            encoder = FakeEncoder(events, spool.dir)
+            recorder = r1_recorder.R1Recorder(
+                session=self.session,
+                room="screening-00000000-0000-4000-8000-0000000000aa",
+                session_id="00000000-0000-4000-8000-0000000000aa",
+                mode="audio",
+                spool=spool,
+                encoder=encoder,
+                api=FakeApi(events),
+                http_client=StubHttp(),
+                finish_seconds=10.0,
+            )
+            await recorder.start("candidate")
+            chain, node = [], self.session.output.audio
+            while node is not None:  # the SDK wraps what it is given in its own proxy
+                chain.append(type(node).__name__)
+                node = getattr(node, "next_in_chain", None)
+            self.assertIn("RecorderAudioOutput", chain)  # tapped ...
+            self.assertIsNot(self.session.output.audio, original_output)
+            self.assertTrue(chain.index("RecorderAudioOutput") < len(chain) - 1)  # ... in line, not at the end
+            pump_stop = asyncio.Event()
+
+            async def pump() -> None:  # what the SDK's audio recognition does with the input
+                async for _frame in self.session.input.audio:
+                    if pump_stop.is_set():
+                        return
+
+            pump_task = asyncio.ensure_future(pump())
+            await asyncio.sleep(0.3)
+            await self.candidate_turn("I sold courses")
+            await self.until(lambda: self.out.finished >= 1 and self.bot_rows())
+            await interview._drain_background()
+            heard = sum(frame.duration for frame in self.out.frames)
+            self.assertGreater(heard, 0.05)  # the candidate heard the whole reply through the tap
+            self.assertEqual([row["text"].strip() for row in self.bot_rows()], [self.REPLY])
+            pump_stop.set()
+            await asyncio.sleep(0.1)
+            recorder.stop(None)
+            pump_task.cancel()
+            await asyncio.wait_for(recorder.finish(), 30)
+            # Both sides were captured: the agent's line and the candidate's microphone reached the
+            # tee as one timeline at least as long as the reply.
+            total = sum(len(pcm) // 2 for _pts, pcm in encoder.audio)
+            self.assertGreaterEqual(total / 48000, heard - 0.1)
+            self.assertEqual(recorder.phase, "done")
+            self.assertFalse(spool.dir.exists())

@@ -58,6 +58,15 @@ export interface CspConfig {
   dev?: boolean;
   /** Dev server port for HMR (default 5173). */
   devPort?: number;
+  /**
+   * Canonical https origins that serve the R1 interview recordings (the object store's S3 host,
+   * which presigned links point at). Added to `media-src` ONLY: a plain `<video src>` is governed by
+   * `media-src` alone, and the player never `fetch`es the object, so `connect-src` stays as it is.
+   * Absent or empty = the header is byte-identical to one built without it. Any entry that is not an
+   * exact canonical https origin (a path, credentials, a wildcard, another scheme) fails the whole
+   * header closed, like every other input.
+   */
+  mediaOrigins?: string[];
 }
 
 // ── Origin canonicalization (http/https/ws/wss) ──────────────────────
@@ -201,6 +210,7 @@ export function validateReportEndpoint(raw: string | undefined): string | undefi
  *  - LiveKit origin isn't a valid WebSocket / convertible source
  *  - Mode is invalid
  *  - Report endpoint is malformed
+ *  - A media origin is not an exact canonical https origin (see `mediaOrigins`)
  *  - ANY assembled source value fails validation
  */
 export function buildCspHeader(config: CspConfig): string | undefined {
@@ -231,6 +241,20 @@ export function buildCspHeader(config: CspConfig): string | undefined {
     if (!validatedReportEndpoint) return undefined;
   }
 
+  // Extra media origins (R1 recordings). Each must be EXACTLY its canonical https form: no path,
+  // credentials, port games or wildcard. `new URL` accepts `*` in a host, which would be a wildcard
+  // source here, so it is refused by name.
+  const extraMediaOrigins: string[] = [];
+  if (config.mediaOrigins !== undefined) {
+    if (!Array.isArray(config.mediaOrigins)) return undefined;
+    for (const origin of config.mediaOrigins) {
+      if (typeof origin !== 'string' || origin.includes('*')) return undefined;
+      const canon = canonicalizeOrigin(origin);
+      if (!canon || canon !== origin || !origin.startsWith('https://')) return undefined;
+      if (!extraMediaOrigins.includes(origin)) extraMediaOrigins.push(origin);
+    }
+  }
+
   // ── Assemble directives ─────────────────────────────────────────
 
   // connect-src: self + API + Supabase REST/Realtime WSS + LiveKit signalling WSS
@@ -245,7 +269,8 @@ export function buildCspHeader(config: CspConfig): string | undefined {
   }
 
   // media-src: self + blob (recording playback) + Supabase (signed recording URLs)
-  const mediaSrc = ["'self'", 'blob:', config.supabaseOrigin];
+  // + the R1 recordings store, when configured (media-src only, never connect-src).
+  const mediaSrc = ["'self'", 'blob:', config.supabaseOrigin, ...extraMediaOrigins];
 
   const directives: Record<string, string> = {
     'default-src': "'self'",

@@ -5,6 +5,8 @@ import { generateInviteToken, hashInviteToken } from '../lib/invite-token.js';
 import { getR1Config } from '../lib/r1/config.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
+import { projectRecordingContext } from '../lib/r1/recording/context.js';
+import { withRecordingAttempts } from '../lib/r1/recording/summary.js';
 
 export const r1Router = Router();
 export const r1InternalRouter = Router();
@@ -66,7 +68,7 @@ r1Router.get('/candidates/:id/interview-rounds', requireRole('viewer'), async (r
   if (!UUID.test(req.params.id)) return res.status(400).json({ error: 'invalid_id' });
   if (!(await candidateAccess(req, res, req.params.id, false))) return;
   const { data, error } = await supabase.from('interview_rounds').select('id,status,expires_at,attempts_allowed,attempts_counted,recommendation,overall,status_write,pending_reject_until,created_at,created_by').eq('candidate_id', req.params.id).order('created_at', { ascending: false });
-  if (error) throw error; res.json({ rounds: data ?? [] });
+  if (error) throw error; res.json({ rounds: await withRecordingAttempts(supabase as never, data ?? []) });
 } catch (e) { next(e); } });
 
 for (const action of ['cancel', 'reissue', 'grant-retake'] as const) r1Router.post(`/interview-rounds/:id/${action}`, requireRole('interviewer'), async (req, res, next) => { try {
@@ -112,7 +114,7 @@ r1Router.get('/admin/r1/settings', requireRole('admin'), async (_req, res, next)
 // `monthly_cap_minutes` (a deliberate save of 4000 counts); any other write, including a dashboard reading or an
 // empty save, records `updated_by` but does not lift the guard. A client can never supply it.
 const R1_DEFAULT_ALLOCATION_MINUTES = 4000;
-const R1_SETTINGS_FIELDS = ['enabled', 'paused', 'monthly_cap_minutes', 'pause_line_minutes', 'advance_threshold', 'hold_threshold', 'auto_status_enabled', 'livekit_target'] as const;
+const R1_SETTINGS_FIELDS = ['enabled', 'paused', 'monthly_cap_minutes', 'pause_line_minutes', 'advance_threshold', 'hold_threshold', 'auto_status_enabled', 'livekit_target', 'recording_mode'] as const;
 const validMinutes = (v: unknown) => (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v)) && Number(v) >= 0 && Number(v) <= 99999999.99;
 r1Router.put('/admin/r1/settings', requireRole('admin'), async (req, res, next) => { try {
   const body = req.body ?? {};
@@ -122,7 +124,9 @@ r1Router.put('/admin/r1/settings', requireRole('admin'), async (req, res, next) 
   const validInt = (v: unknown) => Number.isInteger(v) && Number(v) > 0;
   const validScore = (v: unknown) => Number.isFinite(v) && Number(v) >= 0 && Number(v) <= 100;
   const dashboard = 'dashboard_minutes' in body;
-  if ((patch.monthly_cap_minutes !== undefined && !validInt(patch.monthly_cap_minutes)) || (patch.pause_line_minutes !== undefined && !validInt(patch.pause_line_minutes)) || (dashboard && !validMinutes(body.dashboard_minutes)) || (patch.advance_threshold !== undefined && !validScore(patch.advance_threshold)) || (patch.hold_threshold !== undefined && !validScore(patch.hold_threshold)) || (patch.livekit_target !== undefined && !['cloud', 'r1'].includes(String(patch.livekit_target))) || (patch.enabled !== undefined && typeof patch.enabled !== 'boolean')) return res.status(400).json({ error: 'invalid_r1_settings' });
+  // The 0115 settings audit trigger does not carry `recording_mode`; the route audit does (R1-REC).
+  const settingsAuditExtra: Record<string, unknown> = patch.recording_mode !== undefined ? { recording_mode: patch.recording_mode } : {};
+  if ((patch.monthly_cap_minutes !== undefined && !validInt(patch.monthly_cap_minutes)) || (patch.pause_line_minutes !== undefined && !validInt(patch.pause_line_minutes)) || (dashboard && !validMinutes(body.dashboard_minutes)) || (patch.advance_threshold !== undefined && !validScore(patch.advance_threshold)) || (patch.hold_threshold !== undefined && !validScore(patch.hold_threshold)) || (patch.livekit_target !== undefined && !['cloud', 'r1'].includes(String(patch.livekit_target))) || (patch.recording_mode !== undefined && !(typeof patch.recording_mode === 'string' && ['off', 'audio', 'av'].includes(patch.recording_mode))) || (patch.enabled !== undefined && typeof patch.enabled !== 'boolean')) return res.status(400).json({ error: 'invalid_r1_settings' });
   if (patch.enabled === true && !('monthly_cap_minutes' in body)) {
     const { data: current, error: currentError } = await supabase.from('r1_settings').select('monthly_cap_minutes,allocation_set_at').eq('singleton', true).single();
     if (currentError || !current) return res.status(503).json({ error: 'service_unavailable' });
@@ -140,16 +144,16 @@ r1Router.put('/admin/r1/settings', requireRole('admin'), async (req, res, next) 
     const { data: stamped, error } = await supabase.rpc('r1_stamp_dashboard_reading', { p_dashboard_minutes: Number(body.dashboard_minutes), p_updated_by: req.authUser!.id });
     if (error || stamped?.status !== 'ok') {
       // Other validated fields may already be saved: keep the audit trail honest before failing.
-      if (applied) await recordAudit(req, 'resource.update', 200, { metadata: { resource: 'r1_settings' } });
+      if (applied) await recordAudit(req, 'resource.update', 200, { metadata: { resource: 'r1_settings', ...settingsAuditExtra } });
       return stamped?.status === 'invalid_request' ? res.status(400).json({ error: 'invalid_r1_settings' }) : res.status(503).json({ error: 'service_unavailable' });
     }
     settings = stamped.settings;
   }
-  await recordAudit(req, 'resource.update', 200, { metadata: { resource: 'r1_settings' } });
+  await recordAudit(req, 'resource.update', 200, { metadata: { resource: 'r1_settings', ...settingsAuditExtra } });
   res.json(settings);
 } catch (e) { next(e); } });
 
-function workerAuth(req: Request, res: Response, next: NextFunction): void { const secret = process.env.WORKER_CONTEXT_SECRET; const token = req.header('authorization')?.replace(/^Bearer /, ''); if (!secret || secret.length < 32) { res.status(503).json({ error: 'worker_auth_not_configured' }); return; } if (!token) { res.status(401).json({ error: 'authentication_required' }); return; } const a = Buffer.from(secret), b = Buffer.from(token); if (a.length !== b.length || !timingSafeEqual(a, b)) { res.status(403).json({ error: 'access_denied' }); return; } next(); }
+export function workerAuth(req: Request, res: Response, next: NextFunction): void { const secret = process.env.WORKER_CONTEXT_SECRET; const token = req.header('authorization')?.replace(/^Bearer /, ''); if (!secret || secret.length < 32) { res.status(503).json({ error: 'worker_auth_not_configured' }); return; } if (!token) { res.status(401).json({ error: 'authentication_required' }); return; } const a = Buffer.from(secret), b = Buffer.from(token); if (a.length !== b.length || !timingSafeEqual(a, b)) { res.status(403).json({ error: 'access_denied' }); return; } next(); }
 async function r1Session(req: Request, res: Response): Promise<any | null> { const room = req.body?.room; if (typeof room !== 'string' || !/^screening-[0-9a-f-]{36}$/i.test(room)) { res.status(400).json({ error: 'invalid_r1_room' }); return null; } const { data, error } = await supabase.from('call_sessions').select('id,candidate_id,interview_round_id,status,external_call_id,mode').eq('external_call_id', room).maybeSingle(); if (error) { res.status(503).json({ error: 'service_unavailable' }); return null; } if (!data || data.mode !== 'browser' || !data.interview_round_id || !['waiting','in_progress'].includes(data.status) || data.external_call_id !== room) { res.status(409).json({ error: 'r1_session' }); return null; } return data; }
 /**
  * The worker's start context. FAIL CLOSED: if any of the three reads fails, or the attempt the
@@ -158,7 +162,7 @@ async function r1Session(req: Request, res: Response): Promise<any | null> { con
  * then falls back to a seed-picked persona that differs from the one recorded in
  * `interview_round_attempts.persona_id`, and persona rotation and least-used accounting drift.
  */
-r1InternalRouter.post('/context', workerAuth, async (req, res, next) => { try { const session = await r1Session(req, res); if (!session) return; const [{ data: candidate, error: candidateError }, { data: attempt, error: attemptError }, { data: settings, error: settingsError }] = await Promise.all([supabase.from('candidates').select('name').eq('id', session.candidate_id).single(), supabase.from('interview_round_attempts').select('round_id,attempt_number,persona_id,persona_version,persona_variant,content_sha').eq('session_id', session.id).single(), supabase.from('r1_settings').select('enabled,paused,advance_threshold,hold_threshold,livekit_target').eq('singleton', true).single()]); if (candidateError || attemptError || settingsError || !attempt || !settings) return res.status(503).json({ error: 'service_unavailable' }); const raw = typeof candidate?.name === 'string' ? candidate.name.trim().split(/\s+/)[0] : ''; const first_name = /^[A-Za-z '-]{1,24}$/.test(raw) ? raw : 'there'; res.json({ first_name, round_id: session.interview_round_id, attempt_id: session.id, attempt, settings }); } catch (e) { next(e); } });
+r1InternalRouter.post('/context', workerAuth, async (req, res, next) => { try { const session = await r1Session(req, res); if (!session) return; const [{ data: candidate, error: candidateError }, { data: attempt, error: attemptError }, { data: settings, error: settingsError }] = await Promise.all([supabase.from('candidates').select('name').eq('id', session.candidate_id).single(), supabase.from('interview_round_attempts').select('round_id,attempt_number,persona_id,persona_version,persona_variant,content_sha').eq('session_id', session.id).single(), supabase.from('r1_settings').select('enabled,paused,advance_threshold,hold_threshold,livekit_target').eq('singleton', true).single()]); if (candidateError || attemptError || settingsError || !attempt || !settings) return res.status(503).json({ error: 'service_unavailable' }); const raw = typeof candidate?.name === 'string' ? candidate.name.trim().split(/\s+/)[0] : ''; const first_name = /^[A-Za-z '-]{1,24}$/.test(raw) ? raw : 'there'; res.json({ first_name, round_id: session.interview_round_id, attempt_id: session.id, attempt, settings, recording: await projectRecordingContext(supabase as never, session.interview_round_id) }); } catch (e) { next(e); } });
 /**
  * The longest a non-preflight ledger row may report (the DB bound `chk_r1_usage_event_bounds`
  * and `r1_record_usage` both enforce it). A session is capped at 1800 s of residency, but the

@@ -575,10 +575,10 @@ describe('the r1-status loop runs it', () => {
     expect(runtime.snapshot()).toMatchObject({ lastOrphansLapsed: 0, orphanLapseErrors: 0 });
   });
 
-  it('adds no loop and no queue: the runtime still has exactly r1-assessment and r1-status', () => {
+  it('adds no loop and no queue of its own: the orphan lapse rides r1-status (R1-REC added r1-storage, r1-sweep and the three recording queues, nothing else)', () => {
     const runtime = createR1Runtime({ config: ENABLED, client: createFakeDb(baseTables()).client as never, queue: makeQueue() })!;
-    expect(Object.keys(runtime.loopIntervalsMs)).toEqual(['r1-assessment', 'r1-status']);
-    expect([...runtime.queues]).toEqual(['r1.assessment']);
+    expect(Object.keys(runtime.loopIntervalsMs)).toEqual(['r1-assessment', 'r1-status', 'r1-storage', 'r1-sweep']);
+    expect([...runtime.queues]).toEqual(['r1.assessment', 'r1.recording.finalize', 'r1.recording.erase', 'r1.sweep']);
   });
 });
 

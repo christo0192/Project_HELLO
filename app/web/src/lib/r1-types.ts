@@ -13,6 +13,71 @@ export type R1RoundStatus = 'invited' | 'in_progress' | 'completed' | 'expired' 
 /** `interview_rounds.recommendation` (0115 CHECK). Written by the scorer (PR-5). */
 export type R1Recommendation = 'advance' | 'hold' | 'reject';
 
+/**
+ * What a recording is, as the API reports it (IMPLEMENTER-RULES C6). `none` is "no row": nothing was
+ * recorded (or nothing is known yet). A value this build does not know is read as unknown and never
+ * becomes a player (see `lib/r1-recording.ts`).
+ */
+export type R1RecordingState =
+  | 'none'
+  | 'recording'
+  | 'processing'
+  | 'ready'
+  | 'partial'
+  | 'failed'
+  | 'deleted';
+
+/**
+ * One attempt's recording as shown WITHOUT minting a URL. Never carries a URL, key, bucket or hash.
+ * Every field the API may add later is optional, so an older or newer API never makes the page throw.
+ */
+export interface R1RecordingSummary {
+  state: R1RecordingState;
+  /** Why the recording is not a plain full one (vocabulary: `lib/r1-recording.ts`); null when nothing to say. */
+  reason?: string | null;
+  /** `split` = a recovered video file plus a separate audio file. Null unless ready or partial. */
+  mode?: 'single' | 'split' | null;
+  /** False = audio only (render an audio element, never a black video box). */
+  has_video?: boolean | null;
+  /** Epoch ms of media time 0, the anchor for transcript click-to-seek. */
+  started_at_ms?: number | null;
+  duration_ms?: number | null;
+  camera_off_ms?: number | null;
+  degraded_at_ms?: number | null;
+  /** ISO. When the recording is deleted for retention. */
+  retention_until?: string | null;
+  /** ISO. */
+  deleted_at?: string | null;
+  /** Reserved: a measured correction to the media timeline, in ms. The API omits it today. */
+  timeline_offset_ms?: number | null;
+}
+
+/** One attempt of an R1 round (`attempts[]` of the rounds list), ordered by attempt number. */
+export interface R1AttemptSummary {
+  session_id: string;
+  attempt_number: number;
+  /** Whether the attempt counts against the candidate's allowance. */
+  counted: boolean;
+  outcome?: string | null;
+  recording: R1RecordingSummary;
+}
+
+/**
+ * 200 body of `GET /api/interview-rounds/:id/recording?session_id=`: the summary, and (only for a
+ * ready or partial recording) short-lived URLs. A single recording has `url`; a recovered pair has
+ * `video_url` (MP4, shown muted) and `audio_url`. `expires_in_sec` is relative on purpose: a staff
+ * laptop's clock cannot expire a link early or late.
+ */
+export interface R1RecordingPlayback extends R1RecordingSummary {
+  url?: string;
+  content_type?: string;
+  video_url?: string;
+  audio_url?: string;
+  video_content_type?: string;
+  audio_content_type?: string;
+  expires_in_sec?: number;
+}
+
 /** One row of `GET /api/candidates/:id/interview-rounds`. */
 export interface R1Round {
   id: string;
@@ -26,6 +91,8 @@ export interface R1Round {
   overall: number | null;
   created_at: string;
   created_by?: string;
+  /** One entry per attempt, each with its recording summary. Absent from an older API. */
+  attempts?: R1AttemptSummary[];
 }
 
 export interface R1RoundsResponse {
