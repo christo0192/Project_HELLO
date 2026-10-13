@@ -946,7 +946,7 @@ class FakeEncoder:
         self.progress: dict = {}
         self.clock = time.monotonic  # RecorderCase binds this to the test clock
         self.spawned_at = time.monotonic()
-        self.last_status_at = time.monotonic()
+        self.last_status_at = None  # a fake never sends heartbeats: fresh unless a test stamps one
         self.overflowed = False
         self.hello = None
         self.audio: list[tuple[int, bytes]] = []
@@ -1165,9 +1165,12 @@ class RecorderCase(unittest.IsolatedAsyncioTestCase):
         )
         self.wall = ManualClock(1_700_000_000.0)
         self.clock = ManualClock(1000.0)
-        # The fake encoder stamps and ages on the SAME test clock (the real one ages on its own clock).
+        # The fake encoder ages on the SAME test clock (the real one ages on its own clock). It never
+        # sends heartbeats, so its last status reads as fresh (None) unless a test stamps one:
+        # otherwise a test that advances the clock past the stall limit would race the 1 s tick.
         self.encoder.clock = self.clock
-        self.encoder.spawned_at = self.encoder.last_status_at = self.clock()
+        self.encoder.spawned_at = self.clock()
+        self.encoder.last_status_at = None
         self.recorder: R1Recorder | None = None
         patch = mock.patch.object(r1_recorder, "RETRY_DELAYS_SECONDS", (0.0, 0.0, 0.0))
         patch.start()
@@ -1912,7 +1915,7 @@ class TestWatchdog(RecorderCase):
 
     async def test_the_encoder_is_aged_on_its_own_clock_never_the_recorders(self) -> None:
         # CI regression (a fresh Linux VM): the recorder's clock far AHEAD of the encoder's must not
-        # read as a stall, nor far BEHIND hide one; the encoder reports its own ages.
+        # read as a stall; the encoder reports its own ages (the BEHIND case has its own test).
         recorder = await self.started()
         self.encoder.clock = time.monotonic
         self.encoder.spawned_at = self.encoder.last_status_at = time.monotonic()
@@ -1920,6 +1923,21 @@ class TestWatchdog(RecorderCase):
         recorder._check_encoder()
         self.assertIsNone(recorder.encoder_lost)
         self.encoder.last_status_at = time.monotonic() - 5.1
+        recorder._check_encoder()
+        self.assertEqual(recorder.encoder_lost, "encoder_crashed")
+        self.assertTrue(recorder._lost_stalled)
+        await recorder.finish()
+
+    async def test_a_stall_is_seen_when_the_recorders_clock_is_far_behind_the_encoders(self) -> None:
+        # The case that HID the bug on Windows: recorder clock behind the encoder's made the old age
+        # negative, so a real stall never fired. The encoder's own age must still trip it.
+        recorder = await self.started()
+        far_ahead = 10_000_000.0
+        self.encoder.clock = lambda: far_ahead + time.monotonic()
+        self.encoder.last_status_at = self.encoder.clock() - 4.9
+        recorder._check_encoder()
+        self.assertIsNone(recorder.encoder_lost)
+        self.encoder.last_status_at = self.encoder.clock() - 5.1
         recorder._check_encoder()
         self.assertEqual(recorder.encoder_lost, "encoder_crashed")
         self.assertTrue(recorder._lost_stalled)
@@ -3561,7 +3579,7 @@ class TestEncoderAges(unittest.TestCase):
         self.assertIsNone(enc.seconds_since_status())
         enc.spawned_at = clock()
         clock.advance(2.0)
-        enc._apply({"s": "hb"})  # any status line stamps last_status_at on the encoder's clock
+        enc._apply({"s": "progress"})  # every status line (here a heartbeat) stamps it on the encoder's clock
         clock.advance(7.5)
         self.assertEqual(enc.seconds_since_spawn(), 9.5)
         self.assertEqual(enc.seconds_since_status(), 7.5)
