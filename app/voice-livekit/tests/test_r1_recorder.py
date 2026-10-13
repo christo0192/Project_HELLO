@@ -944,6 +944,7 @@ class FakeEncoder:
         self.closed_info = None
         self.remux_bytes = None
         self.progress: dict = {}
+        self.clock = time.monotonic  # RecorderCase binds this to the test clock
         self.spawned_at = time.monotonic()
         self.last_status_at = time.monotonic()
         self.overflowed = False
@@ -1021,6 +1022,12 @@ class FakeEncoder:
 
     def alive(self) -> bool:
         return not self.exited.is_set()
+
+    def seconds_since_spawn(self):
+        return None if self.spawned_at is None else self.clock() - self.spawned_at
+
+    def seconds_since_status(self):
+        return None if self.last_status_at is None else self.clock() - self.last_status_at
 
 
 class FakeTrack:
@@ -1158,6 +1165,9 @@ class RecorderCase(unittest.IsolatedAsyncioTestCase):
         )
         self.wall = ManualClock(1_700_000_000.0)
         self.clock = ManualClock(1000.0)
+        # The fake encoder stamps and ages on the SAME test clock (the real one ages on its own clock).
+        self.encoder.clock = self.clock
+        self.encoder.spawned_at = self.encoder.last_status_at = self.clock()
         self.recorder: R1Recorder | None = None
         patch = mock.patch.object(r1_recorder, "RETRY_DELAYS_SECONDS", (0.0, 0.0, 0.0))
         patch.start()
@@ -1898,6 +1908,34 @@ class TestWatchdog(RecorderCase):
         recorder._check_encoder()
         self.assertEqual(recorder.encoder_lost, "encoder_crashed")
         self.assertTrue(recorder._lost_stalled)
+        await recorder.finish()
+
+    async def test_the_encoder_is_aged_on_its_own_clock_never_the_recorders(self) -> None:
+        # CI regression (a fresh Linux VM): the recorder's clock far AHEAD of the encoder's must not
+        # read as a stall, nor far BEHIND hide one; the encoder reports its own ages.
+        recorder = await self.started()
+        self.encoder.clock = time.monotonic
+        self.encoder.spawned_at = self.encoder.last_status_at = time.monotonic()
+        self.clock.advance(10_000_000.0)
+        recorder._check_encoder()
+        self.assertIsNone(recorder.encoder_lost)
+        self.encoder.last_status_at = time.monotonic() - 5.1
+        recorder._check_encoder()
+        self.assertEqual(recorder.encoder_lost, "encoder_crashed")
+        self.assertTrue(recorder._lost_stalled)
+        await recorder.finish()
+
+    async def test_a_starting_encoder_is_aged_on_its_own_clock_too(self) -> None:
+        self.encoder.ready.clear()
+        self.encoder.clock = time.monotonic
+        self.encoder.spawned_at = time.monotonic()
+        recorder = await self.started()
+        self.clock.advance(10_000_000.0)
+        recorder._check_encoder()
+        self.assertIsNone(recorder.encoder_lost)
+        self.encoder.spawned_at = time.monotonic() - (r1_recorder.SELF_TEST_WAIT_SECONDS + 0.5)
+        recorder._check_encoder()
+        self.assertEqual(recorder.encoder_lost, "encoder_unavailable")
         await recorder.finish()
 
     async def test_a_fatal_status_from_the_child_is_a_crash_but_a_failed_remux_is_not(self) -> None:
@@ -3513,6 +3551,20 @@ class TestPresetKnob(unittest.TestCase):
 
 
 # ------------------------------------------------------------------------------ end to end
+
+
+class TestEncoderAges(unittest.TestCase):
+    def test_ages_are_measured_on_the_encoders_own_clock(self) -> None:
+        clock = ManualClock(50.0)
+        enc = r1_recorder.EncoderProcess(Path("."), clock=clock)
+        self.assertIsNone(enc.seconds_since_spawn())
+        self.assertIsNone(enc.seconds_since_status())
+        enc.spawned_at = clock()
+        clock.advance(2.0)
+        enc._apply({"s": "hb"})  # any status line stamps last_status_at on the encoder's clock
+        clock.advance(7.5)
+        self.assertEqual(enc.seconds_since_spawn(), 9.5)
+        self.assertEqual(enc.seconds_since_status(), 7.5)
 
 
 class TestWithTheRealEncoder(unittest.IsolatedAsyncioTestCase):

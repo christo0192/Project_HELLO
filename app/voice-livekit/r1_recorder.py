@@ -681,6 +681,21 @@ class EncoderProcess:
             return True
         return self.exited.is_set() and not (self.closed.is_set() or self._quit_sent)
 
+    def seconds_since_spawn(self) -> float | None:
+        """How long ago the child was started, on THIS process's clock (None before a spawn).
+
+        The watchdog asks the encoder for its own ages rather than subtracting the encoder's stamps
+        from its own clock: the two clocks are injected separately, so mixing them could report a
+        healthy child as stalled (or a stalled one as healthy).
+        """
+        spawned = self.spawned_at
+        return None if spawned is None else self._clock() - spawned
+
+    def seconds_since_status(self) -> float | None:
+        """How long ago the child last reported anything, on THIS process's clock (None before)."""
+        last = self.last_status_at
+        return None if last is None else self._clock() - last
+
     def alive(self) -> bool:
         proc = self._proc
         return proc is not None and proc.poll() is None
@@ -2193,16 +2208,19 @@ class R1Recorder:
         enc = self._encoder
         if enc is None or self._encoder_lost is not None or enc.closed.is_set():
             return
-        now = self._clock()
+        # Ages come from the encoder's own clock (see EncoderProcess.seconds_since_status).
         if enc.dead or enc.exited.is_set():
             self._lose_encoder("encoder_crashed" if enc.ready.is_set() else "encoder_unavailable", stalled=False)
         elif not enc.ready.is_set():
-            if enc.spawned_at is not None and now - enc.spawned_at > SELF_TEST_WAIT_SECONDS:
+            since_spawn = enc.seconds_since_spawn()
+            if since_spawn is not None and since_spawn > SELF_TEST_WAIT_SECONDS:
                 self._lose_encoder("encoder_unavailable", stalled=False)
         elif enc.error_code not in (None, "remux_failed"):
             self._lose_encoder("encoder_crashed", stalled=False)
-        elif enc.last_status_at is not None and now - enc.last_status_at > ENCODER_STALL_SECONDS:
-            self._lose_encoder("encoder_crashed", stalled=True)
+        else:
+            since_status = enc.seconds_since_status()
+            if since_status is not None and since_status > ENCODER_STALL_SECONDS:
+                self._lose_encoder("encoder_crashed", stalled=True)
 
     def _lose_encoder(self, reason: str, *, stalled: bool) -> None:
         """The MP4 can no longer carry the audio: kill the child; the OGG carries it from here."""
