@@ -623,6 +623,12 @@ class TestWatchdogSpeechDefer(_Call2Harness):
             await asyncio.sleep(0.01)
         return predicate()
 
+    async def _settle(self):
+        # After a poll succeeds, keep watching a little: proves the defer HOLDS
+        # and that no second say follows. Flake-free (correct code says nothing
+        # more; a long sleep only makes the check stricter).
+        await asyncio.sleep(0.2)
+
     async def _coordinator(self, speaking, ended):
         agent, session, state, client, hooks = await _make_native_coordinator(
             turn_mode="toolless",
@@ -641,6 +647,7 @@ class TestWatchdogSpeechDefer(_Call2Harness):
                 hooks, "phone_speech_lifecycle",
                 "recovery_deferred_candidate_speaking",
             )))
+            await self._settle()
             # The watchdog FIRED (deadline elapsed) but the say is deferred —
             # nothing was spoken over the candidate.
             self.assertEqual(len(session.spoken), before)
@@ -653,6 +660,7 @@ class TestWatchdogSpeechDefer(_Call2Harness):
             speaking["value"] = False
             ended.set()
             await self._wait_for(lambda: len(session.spoken) > before)
+            await self._settle()
         self.assertEqual(len(session.spoken), before + 1)
         hooks["close_event"].set()
         await hooks["drive_terminal"]()
@@ -666,6 +674,7 @@ class TestWatchdogSpeechDefer(_Call2Harness):
              patch.object(agent_mod, "PHONE_WATCHDOG_SPEECH_DEFER_MAX_SEC", 0.05):
             await agent._on_reply_expected()
             await self._wait_for(lambda: len(session.spoken) > before)
+            await self._settle()
         self.assertEqual(len(session.spoken), before + 1)
         hooks["close_event"].set()
         await hooks["drive_terminal"]()
@@ -678,6 +687,7 @@ class TestWatchdogSpeechDefer(_Call2Harness):
         with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.01):
             await agent._on_reply_expected()
             await self._wait_for(lambda: len(session.spoken) > before)
+            await self._settle()
         self.assertEqual(len(session.spoken), before + 1)
         self.assertFalse(self._logs(
             hooks, "phone_speech_lifecycle",
