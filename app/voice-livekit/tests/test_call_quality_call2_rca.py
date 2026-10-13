@@ -611,6 +611,18 @@ class TestDeterministicConflictTelemetry(_Call2Harness):
 # ── F-Q4a: the watchdog never speaks over the candidate ──────────────────────
 
 class TestWatchdogSpeechDefer(_Call2Harness):
+    # Poll for the watched condition instead of a fixed sleep: the watchdog
+    # floor is 0.05 s, so a fixed 0.08-0.1 s sleep failed whenever the shared
+    # bare-discover event loop paused for more than ~30 ms (CI under load).
+    _WAIT_SEC = 2.0
+
+    async def _wait_for(self, predicate):
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self._WAIT_SEC
+        while not predicate() and loop.time() < deadline:
+            await asyncio.sleep(0.01)
+        return predicate()
+
     async def _coordinator(self, speaking, ended):
         agent, session, state, client, hooks = await _make_native_coordinator(
             turn_mode="toolless",
@@ -625,7 +637,10 @@ class TestWatchdogSpeechDefer(_Call2Harness):
         before = len(session.spoken)
         with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.01):
             await agent._on_reply_expected()
-            await asyncio.sleep(0.1)
+            self.assertTrue(await self._wait_for(lambda: self._logs(
+                hooks, "phone_speech_lifecycle",
+                "recovery_deferred_candidate_speaking",
+            )))
             # The watchdog FIRED (deadline elapsed) but the say is deferred —
             # nothing was spoken over the candidate.
             self.assertEqual(len(session.spoken), before)
@@ -637,7 +652,7 @@ class TestWatchdogSpeechDefer(_Call2Harness):
             # deferred, never dropped (the barge-in lesson).
             speaking["value"] = False
             ended.set()
-            await asyncio.sleep(0.1)
+            await self._wait_for(lambda: len(session.spoken) > before)
         self.assertEqual(len(session.spoken), before + 1)
         hooks["close_event"].set()
         await hooks["drive_terminal"]()
@@ -650,7 +665,7 @@ class TestWatchdogSpeechDefer(_Call2Harness):
         with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.01), \
              patch.object(agent_mod, "PHONE_WATCHDOG_SPEECH_DEFER_MAX_SEC", 0.05):
             await agent._on_reply_expected()
-            await asyncio.sleep(0.3)
+            await self._wait_for(lambda: len(session.spoken) > before)
         self.assertEqual(len(session.spoken), before + 1)
         hooks["close_event"].set()
         await hooks["drive_terminal"]()
@@ -662,7 +677,7 @@ class TestWatchdogSpeechDefer(_Call2Harness):
         before = len(session.spoken)
         with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.01):
             await agent._on_reply_expected()
-            await asyncio.sleep(0.08)
+            await self._wait_for(lambda: len(session.spoken) > before)
         self.assertEqual(len(session.spoken), before + 1)
         self.assertFalse(self._logs(
             hooks, "phone_speech_lifecycle",
