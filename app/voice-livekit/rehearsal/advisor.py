@@ -67,7 +67,7 @@ _LEVEL_BEHAVIOUR = {
         "before, and about their schedule, money and who else decides; follow up on what they "
         "say before you pitch anything. Acknowledge every objection, answer it from the course "
         "facts, then check that you answered it. Never discount before you have shown value. "
-        "Use at most one honest urgency lever. Around 9:30 on the call clock, if the learner "
+        "Use at most one honest urgency lever. Around 13:30 on the call clock, if the learner "
         "seems warm, clearly ask for the next step (a call with whoever else decides, or "
         "enrolment). If the learner proposes or accepts a time for a call, accept it warmly. "
         "Keep every turn under 60 words."

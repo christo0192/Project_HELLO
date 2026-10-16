@@ -16,7 +16,7 @@
 ## 1. Executive summary
 
 ### What we build
-- **A ~20-minute AI interview on the existing WebRTC lane** (Fly app `project-hello-voice`, worker `browser-screener`). The lane becomes **R1-only**. The interview has four parts:
+- **A ~30-minute AI interview on the existing WebRTC lane** (Fly app `project-hello-voice`, worker `browser-screener`). The lane becomes **R1-only**. The interview has four parts:
   - 3-4 min icebreaker;
   - a scripted ~1 min announcement that the bot will now role-play a learner for evaluation, plus a ready check;
   - 20 min sales role-play (owner decision 2026-10-16; it was 12-14 min), announced at its start;
@@ -190,11 +190,11 @@ Metering facts:
 | Auto-pause line | 4,000 (80%), then 4,250 (85%) | 85% only after two monthly dashboard reconciliations agree with our estimate within 5% |
 | Phone allocation | 1,500 × 1.2 = 1,800 | An assumption, **not a ceiling**. Unanswered dials bill agent minutes (`PHONE_PARTICIPANT_WAIT_SEC=60`, `fly.phone.toml:441`), and so do canary rooms. S0-A measures it. |
 | Planned test minutes | Per month (calendar below) | Logged as ledger entries |
-| **R1 cap (sessions)** | **floor((pause line − 1.2 × measured trailing-30-day non-R1 minutes − planned test minutes) / 55)** | Recomputed monthly; the owner approves it |
+| **R1 cap (sessions)** | **floor((pause line − 1.2 × measured trailing-30-day non-R1 minutes − planned test minutes) / 65)** | Recomputed monthly; the owner approves it |
 
 Worked values:
-- non-R1 = 1,500, no tests: (4,000 − 1,800) / 55 = **40**; at 85%, 44;
-- with legacy browser still running at the snapshot level (2,847): (4,000 − 3,416) / 55 = **10**. **That is why legacy cutover comes first.**
+- non-R1 = 1,500, no tests: (4,000 − 1,800) / 65 = **33**; at 85%, 37 (40 and 44 at the 55-minute hold before 0128);
+- with legacy browser still running at the snapshot level (2,847): (4,000 − 3,416) / 65 = **8**. **That is why legacy cutover comes first.**
 
 **Capacity calendar (est.):**
 
@@ -347,7 +347,7 @@ Peak hours are 01:00-04:00 and 06:00-10:00 UTC on weekdays, excluding PRC holida
 
 1. **Send R1.** `POST /api/candidates/:id/interview-rounds` (admin, or the owning interviewer, claimed by CAS) checks:
    - `R1_ENABLED` and the settings;
-   - budget headroom (a 55-minute hold);
+   - budget headroom (a 65-minute hold);
    - no active round;
    - `decision_use_blocked_at IS NULL`;
    - **no non-terminal phone engagement and no pending `phone.assessment`** (a later phone score would overwrite R1, `assessment.ts:718-727`);

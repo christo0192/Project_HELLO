@@ -39,7 +39,7 @@ GATES: tuple[tuple[str, str, str, str, Mapping[str, float], str], ...] = (
     ("hard_fails", "Hard-fail rate", "hard_fail_rate", "<=", ALL_GROUPS, "gate"),
     (
         "families",
-        "Calls reaching 9:00 that raised 3+ of the 4 objection families",
+        "Calls reaching 13:00 that raised 3+ of the 4 objection families",
         "families_3plus_rate",
         ">=",
         {"strong": 0.9, "average": 0.8},
@@ -572,7 +572,7 @@ def render_markdown(card: Mapping[str, Any], calls: Sequence[Mapping[str, Any]] 
         ("hard-fail calls", "hard_fail_calls"),
         ("exchanges (mean)", "exchanges_mean"),
         ("role-play seconds (mean)", "roleplay_seconds_mean"),
-        ("families 3+ at 9:00", "families_3plus_rate"),
+        ("families 3+ at 13:00", "families_3plus_rate"),
         ("objections in context (judge)", "objections_in_context_rate"),
         ("misfires / call", "misfires_per_call"),
         ("need disclosed after a genuine probe", "disclosure_rate"),

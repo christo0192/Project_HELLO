@@ -5,7 +5,7 @@
 metrics, the offline sweep and the regression test run without a network.  It reacts to what
 the learner just said with its own small keyword rules (never the engine's detectors): an
 objection it recognises is answered according to the level, discovery questions are asked in
-a fixed order, the close is asked around 9:30 (strong) or vaguely and late (average), and so
+a fixed order, the close is asked around 13:00 (strong) or vaguely and late (average), and so
 on.  The probes use phrasings the engine's genuine-probe detector accepts, which
 ``tests/test_r1_rehearsal_harness.py`` pins, so the hint and deep layers are exercised.
 

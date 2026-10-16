@@ -278,7 +278,7 @@ Mission Control and the RPCs cannot disagree. For the current month (minutes):
   session with no metering yet counts at least its 65-minute charge (the "live
   floor"). The floor is a **booked charge**, like the Send hold it replaces: it
   counts once and is never multiplied by 1.15 (a session unmetered for more than
-  about 27 minutes counts its elapsed x2 instead, also unmultiplied: a few
+  about 32 minutes counts its elapsed x2 instead, also unmultiplied: a few
   minutes under until the metering replaces it). A metered session counts 1x
   elapsed in the ledger while the fallback for a crashed one counts 2x: the
   ledger stays authoritative when the worker supplies it, so the two
@@ -336,7 +336,7 @@ cancelled one.) The suite pins this in both modes.
 | Retake, or a first start with no hold | a fresh 65 is booked, plus the live floor |
 
 When metered minutes dominate the booked ones (A-dominated: sessions running
-longer than about 48 participant-minutes), the live floor shows on top of
+longer than about 57 participant-minutes), the live floor shows on top of
 1.15 x the metered minutes, so a start can need more than the hold it converts
 once real usage has grown since the Send; that is real growth, not a rule
 mismatch. Above either limit the API must show the candidate "temporarily
@@ -455,7 +455,10 @@ behavior is evidenced. (implemented in PR-2)
 
 - **Pause R1 and wait for zero live R1 sessions.** 0128 refuses to run while any R1 session is
   `created`, `waiting` or `in_progress` (a live session's 55 is booked, its floor would read 65).
-  The merge gate's 40-minute pause covers it; check with the live-session query above.
+  The merge gate's 40-minute pause covers it. Check with the query 0128 itself uses, which also
+  counts `created` sessions (the gate query above does not):
+  `select count(*) from screening_v2.call_sessions where interview_round_id is not null and
+  status in ('created', 'waiting', 'in_progress');` must return 0.
 - **Legal and owner sign-off of the 0129 bodies.** They are 0123's bodies with one sentence
   changed ("for about 30 minutes"); the digests are in 0129's verification block. The 0123
   sign-off does not carry over.
@@ -1706,7 +1709,7 @@ of them is the bare `{"phase": ...}` it always was.
 | `awaiting` | `ready` | with `phase=transition`; `""` with the next phase write (including a reconnect pause; the rejoin into the transition asks again, unless the button was already pressed) |
 | `rpleft` | whole seconds of role-play budget left (`remaining_roleplay_seconds()`: the shorter of the 20:00 role-play clock and the 26:00 session cap), clamped 0..3600 | with every phase write while the role-play runs or is paused (`roleplay`, `aside`, a reconnect pause inside it, the rejoin); a **30 s heartbeat** while the phase is `roleplay` (`RPLEFT_HEARTBEAT_SECONDS`, refreshed value only, coalesced so a stuck writer is not flooded); `""` with the first phase write after the role-play (`roleplay_exit`, `closing`, `aborted`) |
 
-It is an upper bound, not a promise: the role-play can end early (R >= 10:00 with the commitment
+It is an upper bound, not a promise: the role-play can end early (R >= 14:00 with the commitment
 resolved). An old page ignores all three; a new page with an old worker simply shows no button and no
 clock.
 

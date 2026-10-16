@@ -131,7 +131,7 @@ paths:
       tags: [r1]
       operationId: getR1Availability
       summary: Coarse Send R1 availability for the HR card (interviewer+; no figures)
-      description: "capacity_exhausted is returned exactly when the 0119 capacity snapshot (screening_v2.r1_capacity_snapshot), asked with the 55-minute Send hold, does not admit; it is the same test r1_send_round applies, never a second formula. The R1 allocation (monthly_cap_minutes) is checked against R1's own committed minutes in both LiveKit targets; the Cloud pause line (pause_line_minutes) is checked against the whole shared pool only when livekit_target is cloud, so on the self-hosted r1 target phone, legacy-browser and dashboard minutes never gate a Send. A snapshot error is a 5xx, never ready. Earlier states keep their precedence: config_invalid, not_deployed, disabled, paused, role_not_configured, then capacity. not_deployed means R1_ENABLED is off on the API process; disabled means the database switch is off."
+      description: "capacity_exhausted is returned exactly when the 0119 capacity snapshot (screening_v2.r1_capacity_snapshot), asked with the 65-minute Send hold (0128), does not admit; it is the same test r1_send_round applies, never a second formula. The R1 allocation (monthly_cap_minutes) is checked against R1's own committed minutes in both LiveKit targets; the Cloud pause line (pause_line_minutes) is checked against the whole shared pool only when livekit_target is cloud, so on the self-hosted r1 target phone, legacy-browser and dashboard minutes never gate a Send. A snapshot error is a 5xx, never ready. Earlier states keep their precedence: config_invalid, not_deployed, disabled, paused, role_not_configured, then capacity. not_deployed means R1_ENABLED is off on the API process; disabled means the database switch is off."
       responses:
         '200':
           description: One of ready, not_deployed, disabled, paused, capacity_exhausted, role_not_configured, config_invalid
@@ -227,7 +227,7 @@ paths:
     post:
       tags: [r1]
       operationId: writeR1Usage
-      description: 'Worker bearer. A candidate, agent or manual_test row may report at most 1830 seconds (the ledger bound); a larger finite value, for example a residency-timeout exit measured after the closing line, is CLAMPED to 1830 and recorded, never refused. A negative or non-finite value, an unknown participant kind, a bad event key or a stale clock is 400 invalid_usage. A preflight row is capped at 15 seconds and is not clamped.'
+      description: 'Worker bearer. A candidate, agent or manual_test row may report at most 2190 seconds (the ledger bound, 0128); a larger finite value, for example a residency-timeout exit measured after the closing line, is CLAMPED to 2190 and recorded, never refused. A negative or non-finite value, an unknown participant kind, a bad event key or a stale clock is 400 invalid_usage. A preflight row is capped at 15 seconds and is not clamped.'
       responses:
         '201': { description: Append-only R1 usage entry }
         '200': { description: Identical replay of an event key already recorded. }

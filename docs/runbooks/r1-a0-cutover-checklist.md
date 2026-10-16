@@ -562,8 +562,8 @@ Then re-run the select above: one row.
 
 ### 6.2 PRODUCTION CHANGE: allocation, target, enabled (still paused)
 
-Set the allocation yourself: `monthly_cap_minutes` is sessions x 55 (for example
-20 x 55 = 1100). While it is still the default 4000 and never saved, enabling is
+Set the allocation yourself: `monthly_cap_minutes` is sessions x 65 (for example
+20 x 65 = 1300). While it is still the default 4000 and never saved, enabling is
 refused (`r1_allocation_not_set`), and in Mode A nothing else would cap R1.
 Naming `monthly_cap_minutes` in the statement is what stamps `allocation_set_at`.
 In Mode A (target `r1`) `pause_line_minutes` does not gate R1; leave it.
@@ -609,7 +609,7 @@ the repair then is to cancel the round and send a new one.
 2. **PRODUCTION CHANGE**: HR UI: candidate page -> R1 card -> **Send R1** -> tick
    the India-location attestation. **Copy the join link now**: it is shown once
    (`<WEB_ORIGIN>/candidate/r1#<token>`). Do not open it yet. Sending books a
-   55-minute hold against the allocation.
+   65-minute hold against the allocation.
 3. **PRODUCTION CHANGE**: find the round, then mark it staff.
 
 ```powershell
@@ -690,7 +690,7 @@ Look for:
   `worker_crash`, `residency_timeout`, `shutdown_forced` or an infra failure.
 - The attempt is `counted = true` and the round `attempts_counted = 1`.
 - Ledger rows for `candidate` and `agent` (and the preflight), with plausible
-  seconds; `v_r1_budget_month` moved by about one session (the 55-minute hold
+  seconds; `v_r1_budget_month` moved by about one session (the 65-minute hold
   converted to booked minutes).
 - `r1_admin_log` contains `session_facts` (the worker posts it before the terminal
   transition, with every key the API parser reads; `first_audio_p95_ms` is the
@@ -804,7 +804,7 @@ Invoke-R1Sql "update screening_v2.r1_settings set livekit_target = 'cloud', paus
 - Apply the Cloud cap before admitting any session: with target `cloud`, both the
   allocation and the pool pause line apply. Permitted sessions are
   `floor((pause line - 1.2 * measured trailing-30-day non-R1 minutes - planned
-  Cloud test minutes) / 55)`, starting at the 4,000-minute line.
+  Cloud test minutes) / 65)`, starting at the 4,000-minute line.
 - Re-verify: worker registration on Cloud, health, step 1 queries.
 - Resume only on the owner's decision.
 

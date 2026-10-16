@@ -28,7 +28,7 @@
  *                      payload { amount_usd: number, conditional: bool, value_before: bool }
  *   guard_hit          payload { kind: 'commitment'|'concession'|'control'|'persona'|
  *                                'feedback'|'other' }
- *   time_cue           payload { roleplay_seconds: number }, the learner time cue (R about 660).
+ *   time_cue           payload { roleplay_seconds: number }, the learner time cue (R about 1020).
  *   session_facts      once per session. payload { roleplay_seconds, talk_share_pct,
  *                      longest_monologue_seconds, barge_in_count, question_count,
  *                      interruption_count, first_audio_p95_ms }
