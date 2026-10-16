@@ -19,7 +19,7 @@
 - **A ~20-minute AI interview on the existing WebRTC lane** (Fly app `project-hello-voice`, worker `browser-screener`). The lane becomes **R1-only**. The interview has four parts:
   - 3-4 min icebreaker;
   - a scripted ~1 min announcement that the bot will now role-play a learner for evaluation, plus a ready check;
-  - 12-14 min sales role-play;
+  - 20 min sales role-play (owner decision 2026-10-16; it was 12-14 min), announced at its start;
   - ~2 min wrap-up.
 - **The learner** is one of 4 rotating, US-based, calibrated personas.
   - All four objection families are delivered through a deterministic, worker-owned schedule.
@@ -61,7 +61,7 @@
 
 > **Locked decision 14 cannot be met as stated: the free LiveKit plan cannot carry "under 10 R1/day".**
 >
-> - **Per-R1 cost:** each R1 uses about **45 WebRTC participant-minutes** (typical), **55** for planning and about **60** worst case. Both the candidate and our self-hosted agent are billed.
+> - **Per-R1 cost:** each R1 uses about **57-60 WebRTC participant-minutes** (typical), **65** for planning and about **70** worst case (since the 20-minute role-play of 2026-10-16; it was 45 / 55 / 60). Both the candidate and our self-hosted agent are billed.
 > - **The pool:** LiveKit Build has **5,000 minutes a month**, as a hard cap **shared with phone**. When it runs out, the phone agent cannot join calls until the 1st of the next month.
 > - **The demand:** 10 a day is about 220 sessions, roughly 10,000-12,000 minutes, or 2-2.4 times the whole pool.
 > - **Realistic free-plan capacity** after legacy browser screening is switched off:
@@ -120,7 +120,7 @@
 |---|---|---|---|
 | 1 | Replace browser screening. The WebRTC lane becomes R1-only; phone is untouched; `prompting.system_prompt` is kept; leave a seam for coding rounds. | <ul><li>`R1_LANE_MODE=r1_only` on the browser app routes every browser room to a lazily imported `r1_session`, immediately after the phone early return (`agent.py:11854-11861`).</li><li>Legacy `_run_session` stays in the code but is unreachable.</li><li>Legacy creation returns 410 (PR-L).</li><li>Seam: `interview_rounds.kind` and the per-kind worker module.</li></ul> | Legacy retirement moves **before Stage A** (D12), so browser screening is unavailable from early November even if R1 slips. Deleting legacy code later would mean editing phone test pins; we recommend never deleting it. |
 | 2 | Sales Program Advisor only | One new R1 role row (`roles.interview_kind='sales_r1'`) and one kind, `sales_r1` | The R1 role is blocked from Ashby mappings by a DB trigger plus a server 400. |
-| 3 | ~20 min: 3-4 icebreaker / ~1 transition / 12-14 role-play / ~2 wrap-up | Phase machine and timing arithmetic in §5.1. Role-play hard exit 14:00; session hard cap 24:00; residency backstop 1,800 s. | — |
+| 3 | ~30 min: 3-4 icebreaker / ~1 transition / 20 role-play / ~2 wrap-up (2026-10-16; it was ~20 min with a 12-14 min role-play) | Phase machine and timing arithmetic in §5.1. Role-play hard exit 20:00; session hard cap 30:00; residency backstop 2,160 s. | — |
 | 4 | Rotating pool of 3-4 US personas at the same difficulty | 4 normalised persona cards (§5.5), a simulated-candidate equivalence study before Stage B, and surface variants | The single TTS voice is female (`simran`, `fly.toml:23`), so all personas are women (D7). |
 | 5 | All four objection families | Primary line plus an unconditional push for every family, and an F1 counter. Delivered deterministically by the worker (§5.6). Missing any family blocks auto-status. | — |
 | 6 | Earned close; needs revealed only when probed | <ul><li>Progressive disclosure: deep needs reach the LLM only after a probe.</li><li>The commitment level is computed by the worker.</li><li>Commitment lines are spoken by script.</li><li>A commitment and concession guard backs this up (§5.3, §5.8).</li></ul> | — |
@@ -161,7 +161,7 @@
 
 | Meter | Build cap (shared, hard) | Per R1 | Basis |
 |---|---|---|---|
-| WebRTC participant-minutes | 5,000/month | **~45 typical / 55 planning / ~60 worst** | See below |
+| WebRTC participant-minutes | 5,000/month | **~57-60 typical / 65 planning / ~70 worst** | See below |
 | Downstream data | 50 GB | ~0.10 GB (360p15, ≤500 kbps, simulcast off); about 0.016 GB audio-only | The agent subscribes to the camera to record it. A 720p simulcast slip would be about 0.3 GB. |
 | Agent audio recordings (observability) | 1,000 min | **0** | `record=False`, all keys off. Today's browser lane uses `record={"audio":True,"transcript":True,...}` (`agent.py:12227-12231`). |
 | Observability events | 100,000 | 0 | Same |
@@ -171,10 +171,10 @@
 | Concurrent connections / agent sessions | 100 / 5 | 2-3 / 1 | R1 live concurrency **1**. Combined R1 + live phone ≤4, enforced at admission. |
 
 WebRTC participant-minutes, per participant:
-- candidate 20.5-22 min;
-- agent 22-24.5 min. The agent is dispatched before the token, and stays alone in the room for ≤1.5 min while the recording finishes;
+- candidate 26.5-28 min;
+- agent 28-30.5 min. The agent is dispatched before the token, and stays alone in the room for ≤1.5 min while the recording finishes;
 - preflight 0.2-0.5 min (10 s minimum per attempt);
-- worst case adds PRE_JOIN 2 min, the 24:00 hard cap and one rejoin.
+- worst case adds PRE_JOIN 2 min, the 30:00 hard cap and one rejoin.
 
 Metering facts:
 - per-second billing with a 10 s minimum (since 2026-08-24);
@@ -222,7 +222,7 @@ Demand against the pool: 10/day on weekdays is about 220/month, about 9,500-12,0
    - **Phone admission is never gated.**
    - Concurrency test in the `recovery_concurrency_*` style.
 2. **Holds are month-agnostic.**
-   - Send R1 holds 55 minutes. Attempt start converts the hold; expiry or cancellation releases it. A retake holds 55 more when it starts.
+   - Send R1 holds 65 minutes (55 before migration 0128). Attempt start converts the hold; expiry or cancellation releases it. A retake holds 65 more when it starts.
    - Actual minutes are attributed by ledger timestamp.
 3. **Self-metered estimate.** The view `v_webrtc_minutes_estimate` sums:
    - R1 ledger rows (the worker posts agent connect and disconnect plus candidate connected seconds; falls back to session timestamps when rows are missing);
@@ -242,13 +242,13 @@ Demand against the pool: 10/day on weekdays is about 220/month, about 9,500-12,0
      - the R1 allocation;
      - SIP ≥70%;
      - any quota or join failure;
-     - an R1 past 26 min;
+     - an R1 past 32 min;
      - an agent alone in an R1 room for more than 2 min;
      - any egress on an R1 room.
 6. **Savers:**
    - camera and mic acquired before exchange;
    - R1 preflight ≤10 s, at most 10 per link lifetime and 3 per minute;
-   - residency 1,800 s instead of 3,600;
+   - residency 2,160 s instead of 3,600;
    - no live-listen participants;
    - development and S0-C on local or self-hosted `livekit-server`.
 
@@ -365,7 +365,7 @@ Peak hours are 01:00-04:00 and 06:00-10:00 UTC on weekdays, excluding PRC holida
    - `owner_id = round.created_by`;
    - the attempt row with its fixed persona.
 
-   It returns an attempt token plus a per-attempt **nonce** (kept in sessionStorage). A rejoin within 90 s needs the link plus the nonce. If R1 is busy: `409 r1_busy` ("another interview is finishing, try again in about 20 minutes; your link stays valid").
+   It returns an attempt token plus a per-attempt **nonce** (kept in sessionStorage). A rejoin within 90 s needs the link plus the nonce. If R1 is busy: `409 r1_busy` ("another interview is finishing, try again in about 30 minutes; your link stays valid").
 7. **Exchange.** `POST /api/r1/exchange`:
    - DeepSeek health probe (`GET /user/balance` `is_available` plus a 1-token completion, 3 s deadline, cached 60 s). On failure, "temporarily unavailable" at zero LiveKit cost.
    - Create room `screening-<sessionId>` (emptyTimeout 180 s, maxParticipants 3, **no egress**) and CAS created→waiting.
@@ -411,19 +411,19 @@ Clocks:
 | `OPENING` | Candidate present | L-OPEN played | ~40 s |
 | `ICEBREAKER` | After L-OPEN | Soft: S ≥ 3:30 and ≥4 candidate turns, at the next bot-turn boundary. Hard: S = 4:30. | 3-4 min |
 | `TRANSITION` | Icebreaker exit (**attempt counted**, D1) | L-TRANSITION → `READY` (candidate says "ready", or 20 s) → L-PICKUP | ≤90 s |
-| `ROLEPLAY` | After L-PICKUP | Soft: R ≥ 13:00 at a turn boundary. Early: R ≥ 10:00 and commitment resolved. **Hard: R = 14:00 or S = 20:00.** | 12-14 min |
+| `ROLEPLAY` | After L-PICKUP | Soft: R ≥ 19:00 at a turn boundary. Early: R ≥ 14:00 and commitment resolved. **Hard: R = 20:00 or S = 26:00.** | 20 min |
 | `ASIDE` (sub-state) | Coaching, confusion, silence step 2, or mute | Aside played → `ROLEPLAY` | ≤3 per session; R paused |
 | `ROLEPLAY_EXIT` | Role-play exit | L-EXIT played | ~12 s |
 | `WRAPUP` | After L-EXIT | 2 questions answered, "no questions", 2:00 elapsed, or 20 s silence | ≤2:00 |
-| `CLOSING` | Wrap-up exit, or **any forced close** (S = 24:00, residency, drain) | L-CLOSE / L-SYSTEM-STOP played (not interruptible) | ≤15 s |
+| `CLOSING` | Wrap-up exit, or **any forced close** (S = 30:00, residency, drain) | L-CLOSE / L-SYSTEM-STOP played (not interruptible) | ≤15 s |
 | `FINISHING` | Close played, or candidate gone | Recorder finish → ledger → `complete_session` / `fail_session` → room delete | ≤60 s target, 90 s max |
 | `PAUSED_DISCONNECTED` | Candidate left | Rejoin (link + nonce) within 90 s → previous phase; otherwise `FINISHING` (outcome `candidate_left`) | 90 s |
 | `ABORTED` | 3 consecutive LLM/TTS failures, any 401/402, or worker drain | L-SYSTEM-STOP → `FINISHING` → `fail(provider_error \| shutdown_forced)`, not counted | — |
 
-**Timing arithmetic** (pinned by a unit test):
-- Normal path: icebreaker hard 4:30 + transition ≤1:30 → role-play ends by S 20:00 → exit 0:12 + wrap-up 2:00 + close 0:15 = **S ≤ 22:27**.
-- Disconnects pause R; the S = 24:00 hard cap absorbs them.
-- Maximum agent residency = PRE_JOIN 2:00 + 24:00 + CLOSING 0:15 + FINISHING 1:30 = 27:45 < `R1_SESSION_MAX_RESIDENCY_SEC=1800`, leaving 2:15 margin.
+**Timing arithmetic** (pinned by a unit test; revised 2026-10-16 for the 20-minute role-play):
+- Normal path: icebreaker hard 4:30 + transition ≤1:30 → role-play ends by S 26:00 → exit 0:12 + wrap-up 2:00 + close 0:15 = **S ≤ 28:27**.
+- Disconnects pause R; the S = 30:00 hard cap absorbs them.
+- Maximum agent residency = PRE_JOIN 2:00 + 30:00 + CLOSING 0:15 + FINISHING 1:30 = 33:45 < `R1_SESSION_MAX_RESIDENCY_SEC=2160`, leaving 2:15 margin.
 - A residency or hard-cap expiry always goes through CLOSING → FINISHING, never straight to a terminal write.
 - The R1 session never installs the goodbye regex (`agent.py:1060-1065, 12203-12218`).
 
@@ -438,7 +438,7 @@ Clocks:
 | L-OPEN | "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and I'll be running your first-round interview for the Sales Program Advisor role. It takes about thirty minutes. We'll spend a few minutes getting to know you, then I'll switch into a twenty-minute sales role-play where I play a prospective learner, and we'll finish with a couple of minutes for your questions. Let's start: could you walk me through your background, especially any sales or customer-facing work you've done?" |
 | L-TRANSITION | "Thank you, {first_name}. We'll now move to the role-play. I'll play a prospective learner so we can evaluate how you handle a real sales call. The learner is {lead_name} from {lead_city}, who filled in a form on our website about the Data Science course a few days ago. You're the Program Advisor calling her back. The role-play runs for twenty minutes, and within those twenty minutes your goal is to convince her: understand her needs and help her decide to enrol, as you would on a real call, using the course details from your preparation guide. I'll stay in character until I say, 'Let's pause the role-play here.' When you're ready, just say 'ready' and she'll pick up." |
 | L-PICKUP | Per persona, e.g. "Hello? Yes, this is Meera speaking." |
-| L-TIME-CUE (learner, R ≈ 11:00) | "Just so you know, I've only got a couple of minutes before my next call." |
+| L-TIME-CUE (learner, R ≈ 17:00) | "Just so you know, I've only got a couple of minutes before my next call." |
 | L-EXIT | "Let's pause the role-play here. I'm stepping out of the learner's role now; this is Christy, your interviewer, again. Thank you, that's the end of the role-play." |
 | L-WRAP | "Before we finish, do you have any questions about the role or the next steps?" |
 | L-NO-FEEDBACK | "I'm sorry, I can't share any feedback on how it went." |
@@ -583,21 +583,21 @@ Clocks:
 | Move | Opens | Deadline (forced at the next learner turn) |
 |---|---|---|
 | Discovery (protected): the learner answers only what is asked | 0:00 | — |
-| Q-A | 2:00, if format not yet covered | 3:30 |
-| F3 primary, then push (unconditional, next learner turn) | Advisor's first value or pitch statement, or 3:30 | 5:00 |
-| F2 primary, then push | ≥2 candidate turns after the F3 push was answered | 7:00 |
-| F1 anchor, then counter (after the first concession or refusal) | ≥2 candidate turns after F2; immediately if the advisor quotes a price first | 9:00 |
-| Q-B | After F1 resolved, if not covered | 9:45 |
-| F4 primary, then push | ≥2 candidate turns after F1/Q-B | 10:30 |
-| L-TIME-CUE | 11:00 | — |
-| Commitment window | All 4 families (primary + push + counter) delivered **and** R ≥ 9:00 | If no ask by 13:00 → the WEAK line |
+| Q-A | A curiosity topic since R1-Q (no deadline) | — |
+| F3 primary, then push (unconditional, next learner turn) | Advisor's first value or pitch statement, or 5:00 | 7:10 |
+| F2 primary, then push | ≥2 candidate turns after the F3 push was answered | 10:40 |
+| F1 anchor, then counter (after the first concession or refusal) | ≥2 candidate turns after F2; immediately if the advisor quotes a price first | 13:30 |
+| Q-B | A curiosity topic since R1-Q (no deadline) | — |
+| F4 primary, then push | ≥2 candidate turns after F1 | 15:30 |
+| L-TIME-CUE | 17:00 (owed until 19:00) | — |
+| Commitment window | All 4 families (primary + push + counter) delivered **and** R ≥ 13:00 | If no ask by 19:00 → the WEAK line |
 
 Rules:
 - At most **one owed move per learner turn**.
 - Never open a family until the previous exchange is answered; later deadlines shift instead.
 - Delivery is confirmed by fuzzy match of the exact line on the learner text. If it was missed, it stays owed. The delivery time and any slip are logged.
 - **Any family slipping more than 60 s, or never delivered, excludes the session from auto-status.**
-- An early close attempt before R = 10:00 gets "Oh wait, before you go…" plus the next owed move, **once**. On a second attempt the call goes to `ROLEPLAY_EXIT`.
+- An early close attempt before R = 14:00 gets "Oh wait, before you go…" plus the next owed move, **once**. On a second attempt the call goes to `ROLEPLAY_EXIT`.
 
 Escalation if S0-B shows poor adherence: the learner's primaries are spoken verbatim via `session.say` after a short LLM acknowledgement.
 
@@ -1145,7 +1145,7 @@ R1 copies phone patterns and never imports `phone.py` helpers (`PHONE_*` env, mo
 
 **Pre-merge gate for ANY merge touching `app/voice-livekit/`, `app/api/` or migrations — R1 PRs and phone hotfixes alike**
 - Merge in **07:00-08:30 IST**; latest merge 08:00; no Quality re-run or deploy dispatch after 08:15.
-- `r1_settings.paused=true` at least 30 minutes ahead.
+- `r1_settings.paused=true` at least 40 minutes ahead (a session can last up to the 2,160 s residency).
 - Read-only checks, all zero, otherwise abort:
   - live R1 sessions;
   - `phone_call_attempts` in admitted, ringing, answered_unclassified, human or machine state with `lease_expires_at > now()`;
@@ -1410,7 +1410,7 @@ Codes: PI = phone isolation, CA = conversation/assessment, FC = free-plan capaci
 | CA-18 | Test security erosion | Fixed | 3 surface variants per persona; versioning |
 | CA-19 | Hard exit 14:30 exceeds 12-14 | Fixed | R hard exit 14:00 |
 | FC-1 | Concurrency 2 on a shared name (blocker) | Fixed | Concurrency 1; PR-C2; S0-C two-job fault case |
-| FC-2 | Phase maxima exceed the residency cap | Fixed | §5.1 arithmetic plus unit test; residency 1,800 s; expiries go through CLOSING |
+| FC-2 | Phase maxima exceed the residency cap | Fixed | §5.1 arithmetic plus unit test; residency 2,160 s (1,800 s before the 20-minute role-play); expiries go through CLOSING |
 | FC-3 | Non-happy exits skip the finish; no crash recovery | Fixed | §5.12 invariant; shutdown budget; `r1.sweep` recovery; orphan rescue |
 | FC-4 | Durable artifact is silent video; loss window larger than stated | Partially accepted | 5 MiB parts (2-4 min window); 2-minute audio checkpoints; split player. The final remux is kept until S0-D proves fMP4 seeking; live AAC muxing is adopted only if remux is dropped, keeping proven RecorderIO alignment. |
 | FC-5 | Budget guard gaps (legacy, lag, 10 s minimums, atomicity, month boundary) | Fixed | §3.3: ×1.15, daily reconciliation, 80% line, atomic RPC, month-agnostic holds, 12:00 UTC, legacy first |

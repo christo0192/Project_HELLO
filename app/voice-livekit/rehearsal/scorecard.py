@@ -325,7 +325,7 @@ def aggregate_group(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     n = len(calls)
     failing = [record for record in records if record.get("hard_fails")]
     reasons = Counter(reason for record in records for reason in record.get("hard_fails") or [])
-    closing = [m for m in calls if (m.get("roleplay_seconds") or 0) >= 540]
+    closing = [m for m in calls if (m.get("roleplay_seconds") or 0) >= 780]
     in_ctx = sum(m.get("judge_objections_in_context") or 0 for m in calls)
     objections = sum(m.get("judge_objections") or 0 for m in calls)
     dug = sum(len(m.get("needs_dug") or []) for m in calls)

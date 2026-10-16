@@ -20,7 +20,7 @@ docker exec -i "$SUPABASE_DB_CONTAINER" \
 
 # The month row is deliberately absent before this race. A blocker owns the
 # settings row, so two first-of-month callers contend from the same point; after
-# release exactly one may reserve the sole 55-minute hold.
+# release exactly one may reserve the sole 65-minute hold.
 docker exec -i "$SUPABASE_DB_CONTAINER" \
   psql -U postgres -d postgres -q -v ON_ERROR_STOP=1 \
   < "$TESTS/r1_foundation_concurrency_setup.sql"

@@ -90,8 +90,9 @@ import r1_world
 # PRICE_UNCHANGED_REPLACEMENT).  No other pinned text changed.
 # Revision 15 (the 20-minute role-play, owner decision 2026-10-16): L-TRANSITION announces the
 # twenty minutes and the goal (convince the learner), L-OPEN says about thirty minutes and a
-# twenty-minute role-play, and the owed-move deadlines stretch to the longer call (F2 640, F1 810).
-PINNED_CONTENT_SHA256 = "6adb431257e03e4ce668a7873f4e840f7168b8ef88a44688f49d790d8855708e"
+# twenty-minute role-play, and the owed-move deadlines stretch to the longer call (F3 430, F2 640,
+# F1 810, F4 930).
+PINNED_CONTENT_SHA256 = "7064ebec45af365cba4e416c7ac84cf00b366a9b5d983b5a86bad8e4bf3bd5d8"
 
 CONTENT_MODULES = (
     "r1_text",

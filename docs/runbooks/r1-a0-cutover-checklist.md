@@ -637,8 +637,8 @@ Invoke-R1Sql "update screening_v2.r1_settings set paused = false where singleton
 ## Step 7. The A0 smoke (at least 2 sessions)
 
 One live R1 session at a time (admission refuses a second one). Use a real
-device and a network typical of candidates. Each session is about 20 minutes (the
-worker caps residency at 1800 s). Keep these open: the join page with browser
+device and a network typical of candidates. Each session is about 30 minutes (the
+worker caps residency at 2160 s; the role-play alone is 20 minutes). Keep these open: the join page with browser
 devtools, `chrome://webrtc-internals`, and three log tails.
 
 ```powershell

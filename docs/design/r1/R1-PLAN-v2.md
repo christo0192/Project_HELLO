@@ -78,7 +78,7 @@ All D1–D14 in `R1-PLAN-final.md §2.2` remain open with their recommended defa
 
 ### 3.1 Common R1 budget
 
-One R1 is 20.5–22 candidate minutes, 22–24.5 agent minutes, and short preflight/finish residency: approximately 45 typical, 55 planning, and 60 worst participant-minutes. R1 concurrency is one. Camera is 640×360/15fps, simulcast off, maximum 500 kbps; the worker is its only video subscriber.
+One R1 is 26.5–28 candidate minutes, 28–30.5 agent minutes, and short preflight/finish residency: approximately 57–60 typical, 65 planning, and 70 worst participant-minutes (since the 20-minute role-play of 2026-10-16; it was 45 / 55 / 60). R1 concurrency is one. Camera is 640×360/15fps, simulcast off, maximum 500 kbps; the worker is its only video subscriber.
 
 `r1_admit_attempt` remains an atomic `SECURITY DEFINER` RPC. It locks the month row and checks R1 enabled/paused state, holds and cap, live R1 <1, combined live phone + R1 <4 where Cloud mode is selected, starts/retakes, and valid unwithdrawn consent. Phone admission is never gated. Holds reserve 55 minutes; actual use is ledgered from connection/disconnection and session timestamps.
 
@@ -97,9 +97,9 @@ Estimated Fly `sin` costs at 10 weekday sessions/day: on-demand performance-1x/2
 
 Cloud Build is 5,000 shared WebRTC participant-minutes/month. The formula is unchanged:
 
-`floor((pause line − 1.2 × measured trailing-30-day non-R1 minutes − planned Cloud test minutes) / 55)`.
+`floor((pause line − 1.2 × measured trailing-30-day non-R1 minutes − planned Cloud test minutes) / 65)`.
 
-Begin at a 4,000-minute (80%) pause line; move to 4,250 (85%) only after two dashboard reconciliations agree within 5%. With 1,500 measured non-R1 minutes and no tests: `(4,000 − 1,800)/55 = 40` sessions. At 85%, it is 44. Legacy browser traffic at the snapshot level reduces this to roughly 10, which is why PR-L precedes Stage A. Launch Cloud fallback at about 20 in a half month and about 40/month steady state, roughly two per weekday (about 9-10 a week), not 10/day.
+Begin at a 4,000-minute (80%) pause line; move to 4,250 (85%) only after two dashboard reconciliations agree within 5%. With 1,500 measured non-R1 minutes and no tests: `(4,000 − 1,800)/65 = 33` sessions. At 85%, it is 37. Legacy browser traffic at the snapshot level reduces this to roughly 10, which is why PR-L precedes Stage A. Launch Cloud fallback at about 20 in a half month and about 40/month steady state, roughly two per weekday (about 9-10 a week), not 10/day.
 
 The ledger includes R1, phone attempts plus one minute, legacy browser sessions ×2 plus one minute, preflights at ten seconds, and manual tests; apply 1.15 until reconciled. Auto-pause at the line or projected month-end ≥90%; warn at 60/75/90%, SIP ≥70%, quota/join failures, agent-alone >2 minutes, R1 >26 minutes, and any R1 egress. Pause through 12:00 UTC on the first until the reset behavior is evidenced.
 

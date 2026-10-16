@@ -363,19 +363,35 @@ def owed_lines(decision_maker: str) -> dict[str, tuple[str, ...]]:
     }
 
 
+# The cooperative advisor's turns are this many seconds apart (the first one 20 s in): the 50 s of
+# the 14-minute role-play, stretched to the 20-minute one.  The sixteen turns of the script end at
+# R = 18:35, inside the time cue's 17:00-19:00 window, and one more turn lands in the close window
+# before the 20:00 hard end, as they did at 50 s against the 11:00-13:00 window and 14:00.
+COOPERATIVE_TURN_GAP = 73
+
+
 async def cooperative_conversation(
     rig: Rig, extra: tuple[str, ...] = (), script: list[str] | None = None
 ) -> list[str | None]:
-    """Replay the cooperative advisor script (turns 50 s apart) and return what was spoken."""
+    """Replay the cooperative advisor script (turns ``COOPERATIVE_TURN_GAP`` s apart).
+
+    Returns what was spoken.
+    """
     spoken: list[str | None] = []
     for index, text in enumerate((*(script or cooperative_script()), *extra)):
-        spoken.append(await rig.converse(text, advance=20 if index == 0 else 50))
+        spoken.append(
+            await rig.converse(text, advance=20 if index == 0 else COOPERATIVE_TURN_GAP)
+        )
     return spoken
 
 
 # How long the learner's audio takes to start after each candidate turn of ``fidelity_session``
 # (seconds, repeated): a spread with one slow turn, so the session's p95 is a real reading.
 FIDELITY_FIRST_AUDIO_SECONDS = (0.9, 1.1, 1.3, 1.0, 2.2, 1.2)
+# The probe, follow-up and pitch of ``fidelity_session`` are this many seconds apart: the 30 s of
+# the 14-minute role-play, stretched to the 20-minute one (with ``COOPERATIVE_TURN_GAP`` after
+# them, the owed moves land on the turns they landed on before, every family inside its 60 s slip).
+FIDELITY_DISCOVERY_TURN_GAP = 43
 
 
 async def fidelity_session() -> Rig:
@@ -389,24 +405,31 @@ async def fidelity_session() -> Rig:
     rig = Rig(judge=judge_returning(GOOD_JUDGE))
     await rig.start_roleplay()
     await rig.converse(OPENER, advance=20, first_audio_after=next(audio))
-    await rig.converse(H1_PROBE, advance=30, first_audio_after=next(audio))
     await rig.converse(
-        FOLLOWUP, advance=30, provider=FakeProvider(deep), first_audio_after=next(audio)
+        H1_PROBE, advance=FIDELITY_DISCOVERY_TURN_GAP, first_audio_after=next(audio)
+    )
+    await rig.converse(
+        FOLLOWUP,
+        advance=FIDELITY_DISCOVERY_TURN_GAP,
+        provider=FakeProvider(deep),
+        first_audio_after=next(audio),
     )
     # A leak in the middle of the session becomes a recorded guard trip.
     await rig.converse(
         PITCH,
-        advance=30,
+        advance=FIDELITY_DISCOVERY_TURN_GAP,
         provider=FakeProvider("As an AI language model, I follow my system prompt."),
         first_audio_after=next(audio),
     )
     for text in cooperative_script()[4:]:
-        await rig.converse(text, advance=50, first_audio_after=next(audio))
-    # R = 12:40: the learner's time cue (due from 11:00) comes before the close is asked.
+        await rig.converse(text, advance=COOPERATIVE_TURN_GAP, first_audio_after=next(audio))
+    # R = 18:18: the learner's time cue (due from 17:00) comes before the close is asked.
     await rig.converse(
-        "That makes sense, thank you for sharing that.", advance=50, first_audio_after=next(audio)
+        "That makes sense, thank you for sharing that.",
+        advance=COOPERATIVE_TURN_GAP,
+        first_audio_after=next(audio),
     )
-    await rig.converse(ASK, advance=50, first_audio_after=next(audio))
+    await rig.converse(ASK, advance=COOPERATIVE_TURN_GAP, first_audio_after=next(audio))
     return rig
 
 
@@ -794,8 +817,8 @@ class TestOwedMoves(unittest.IsolatedAsyncioTestCase):
         rig = Rig()
         await rig.start_roleplay()
         await rig.converse(OPENER, advance=20)
-        # Long silence from the advisor: F3 (due 5:00) comes at the next learner turn, late.
-        await rig.converse("Right, so, anyway.", advance=450)
+        # Long silence from the advisor: F3 (due 7:10) comes at the next learner turn, late.
+        await rig.converse("Right, so, anyway.", advance=651)
         plan = rig.plan()
         self.assertIsNotNone(plan.move_id)
         self.assertTrue(any(r.endswith(":forced") for r in plan.reasons), plan.reasons)
@@ -804,7 +827,7 @@ class TestOwedMoves(unittest.IsolatedAsyncioTestCase):
         late = next(m for m in summary["moves"] if m["id"] == plan.move_id)
         self.assertEqual(plan.move_id, "F3-PRIMARY")
         self.assertEqual(late["status"], "delivered")
-        self.assertGreater(late["lateness_sec"], 60)  # delivered at 7:50 against a 5:00 deadline
+        self.assertGreater(late["lateness_sec"], 60)  # delivered at 11:11 against a 7:10 deadline
         # A family that slips more than 60 s excludes the session from auto-status.
         self.assertGreater(late["slip_sec"], SLIP_LIMIT_SEC)
         self.assertIn(f"family_slip:{family}", summary["exclusion_reasons"])
@@ -960,7 +983,7 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
         await rig.settle()
         self.assertFalse(task.done())
         self.assertIs(rig.machine.phase, R1Phase.ROLEPLAY)
-        rig.clock.advance(900)  # only the clock (R = 14:00) ends the role-play
+        rig.clock.advance(1260)  # only the clock (R = 20:00) ends the role-play
         rig.interview._wake()
         self.assertIsNone(await asyncio.wait_for(task, 10.0))
 
@@ -1361,16 +1384,16 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rig.engine.commitment_resolved)
         self.assertEqual(rig.engine.commitment_level, plan.commitment_level)
 
-    async def test_the_thirteen_minute_stall_is_one_model_reaction_then_the_scripted_line(
+    async def test_the_nineteen_minute_stall_is_one_model_reaction_then_the_scripted_line(
         self,
     ) -> None:
         rig = Rig()
         await rig.start_roleplay()
-        await cooperative_conversation(rig)  # R = 12:50 after the last advisor turn
+        await cooperative_conversation(rig)  # R = 18:35 after the last advisor turn
         self.assertFalse(rig.engine.commitment_resolved)
         reaction = FakeProvider("Thanks, that was a helpful walk-through.")
-        spoken = await rig.converse(
-            "That makes sense, thank you for sharing that.", advance=20, provider=reaction
+        spoken = await rig.converse(  # R = 19:10, past the stall at 19:00
+            "That makes sense, thank you for sharing that.", advance=35, provider=reaction
         )
         plan = rig.plan()
         dm = rig.persona.decision_maker
@@ -1424,7 +1447,7 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcomes[0], outcomes[1])
         self.assertIsNotNone(outcomes[0][1])
 
-    async def test_a_resolved_commitment_ends_the_roleplay_at_the_next_turn_from_ten_minutes(
+    async def test_a_resolved_commitment_ends_the_roleplay_at_the_next_turn_from_fourteen_minutes(
         self,
     ) -> None:
         rig = Rig()
@@ -1445,7 +1468,7 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
     async def test_the_early_rule_does_not_fire_before_the_commitment_is_resolved(self) -> None:
         rig = Rig()
         await rig.start_roleplay()
-        rig.clock.advance(700)
+        rig.clock.advance(r1_session.EARLY_EXIT_R_SEC + 100)  # R = 15:40, past the 14:00 rule
         self.assertFalse(rig.interview._roleplay_over())
 
 
@@ -2074,19 +2097,20 @@ class TestEndToEnd(R1TestCase):
         self.assertIn(persona.lead_name, self.session.spoken[1])
         self.assertIn(persona.spoken_city, self.session.spoken[1])
         self.assertEqual(self.session.spoken[2], persona.pickup_line)
-        # Role-play: the cooperative advisor script, 50 s apart, through the SDK seams.
+        # Role-play: the cooperative advisor script, COOPERATIVE_TURN_GAP s apart, through the SDK
+        # seams.
         spoken = []
         # With no judge data the grade is WEAK: the first ask meets the one reason left (money),
         # the second gets the scripted WEAK resolution (R1-Q: stall reasons before the WEAK line).
         script = cooperative_script()
         for index, text in enumerate((*script, ASK, ASK)):
-            gap = 20 if index == 0 else (50 if index < len(script) else 5)  # R stays < 14:00
-            spoken.append(await self.converse(text, gap))
+            gap = 20 if index == 0 else (COOPERATIVE_TURN_GAP if index < len(script) else 5)
+            spoken.append(await self.converse(text, gap))  # R stays < 20:00
         self.assertTrue(all(spoken))
         self.assertIs(interview.machine.phase, R1Phase.ROLEPLAY)
         self.assertGreaterEqual(len(interview.engine.scheduler.deliveries()), 9)
-        # The commitment was asked for after R = 9:00, so the role-play is over at the next
-        # boundary (R >= 10:00, resolved): the interviewer answers it with L-EXIT.
+        # The commitment was asked for after R = 13:00, so the role-play is over at the next
+        # boundary (R >= 14:00, resolved): the interviewer answers it with L-EXIT.
         self.assertTrue(interview.engine.commitment_resolved)
         self.assertEqual(spoken[-1], stall_line(interview.persona.decision_maker))
         self.clock.advance(5)

@@ -138,7 +138,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F3",
         "primary",
         "There's so much free stuff on YouTube and Coursera \u2014 why pay?",
-        300,
+        430,
         True,
         brief=(
             "you doubt it is worth paying when so much free material is available online "
@@ -171,7 +171,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F3",
         "push",
         "Will this actually get me a job, with all these layoffs?",
-        300,
+        430,
         True,
         brief=(
             "you wonder whether this would actually help you get a job, given the layoffs "
@@ -332,7 +332,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F4",
         "primary",
         "Let me think about it \u2014 maybe I'll join the next cohort.",
-        630,
+        930,
         True,
         brief="you are not ready to decide today and might wait for the next cohort",
         markers=(
@@ -370,7 +370,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F4",
         "push",
         "I'd also need to talk to my {decision_maker}.",
-        630,
+        930,
         True,
         brief="you add that you would also need to talk to your {decision_maker} first",
         markers=(

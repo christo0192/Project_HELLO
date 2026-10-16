@@ -17,6 +17,10 @@ pinned here:
 The fake model does not say what the real bot said, so the replayed timeline drifts from the
 original after the first divergence; these are invariants, not a line-by-line match.  Offline,
 no network, no key.
+
+The call was made under the 14:00 role-play and the engine now runs the 20:00 one, so every replay
+here stretches the recorded clock onto it (``replay.stretch_14_to_20``, the map the schedule's own
+constants moved by): each turn lands in the window it landed in on the day.
 """
 from __future__ import annotations
 
@@ -40,11 +44,13 @@ TURN_34_GROUP = 4  # rows 32-34, the "friction or blocker" discovery question
 TURN_52_GROUP = 10  # row 51 ends "... So yeah. Bye": a trailing STT tail, not a farewell
 CALLBACK_GROUP = 15  # rows 62-66, "Can we do a schedule to call back tomorrow? ... 10:00 a.m."
 TIME_CUE_GROUP = 18  # rows 78: where the original learner's time cue (turn 79) landed
-STALL_GROUP = 22  # the first group at or after 13:00 in the replay (original stall: turn 92)
+STALL_GROUP = 22  # the first group at or after 19:00 in the replay (original stall: turn 92)
 CALLBACK_HUSBAND_GROUP = 18  # rows 78: "when you call me back, I can also talk to your husband ..."
 ENROL_SUGGESTED_GROUP = 17  # rows 70-76: "... I would suggest you enroll tomorrow and sit in this next cohort"
 WEAK = stall_line("")
 FIXTURE = replay.load_fixture()
+# The owner's call is a 14:00 role-play; the engine runs a 20:00 one (see the module docstring).
+STRETCH = replay.stretch_14_to_20
 
 
 class OwnerSessionCalibrationTests(unittest.TestCase):
@@ -112,7 +118,7 @@ class ReplayTimelineTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.groups = replay.advisor_groups(FIXTURE["rows"])
-        cls.targets = replay.timeline(cls.groups)
+        cls.targets = replay.timeline(cls.groups, clock_map=STRETCH)
 
     def test_the_owner_call_is_23_answered_advisor_turns_and_a_last_one(self) -> None:
         self.assertEqual(len(self.groups), 24)
@@ -124,10 +130,10 @@ class ReplayTimelineTests(unittest.TestCase):
         self.assertEqual(self.groups[CALLBACK_GROUP - 1]["rows"], (62, 63, 64, 66))
         self.assertEqual(self.groups[TURN_52_GROUP - 1]["rows"], (51,))
 
-    def test_the_time_cue_lands_in_its_window_and_the_stall_after_13_00(self) -> None:
-        self.assertTrue(660 <= self.targets[TIME_CUE_GROUP - 1] < 780, self.targets[TIME_CUE_GROUP - 1])
-        self.assertGreaterEqual(self.targets[-1], 780)
-        self.assertGreaterEqual(self.targets[STALL_GROUP - 1], 780)
+    def test_the_time_cue_lands_in_its_window_and_the_stall_after_19_00(self) -> None:
+        self.assertTrue(1020 <= self.targets[TIME_CUE_GROUP - 1] < 1140, self.targets[TIME_CUE_GROUP - 1])
+        self.assertGreaterEqual(self.targets[-1], 1140)
+        self.assertGreaterEqual(self.targets[STALL_GROUP - 1], 1140)
 
     def test_the_timeline_only_moves_forward(self) -> None:
         self.assertEqual(self.targets, sorted(self.targets))
@@ -139,7 +145,7 @@ class ReplayInvariantTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.result = asyncio.run(
-            replay.replay(FIXTURE["rows"], ScriptedLearnerLLM("replay-b58c7d9c"))
+            replay.replay(FIXTURE["rows"], ScriptedLearnerLLM("replay-b58c7d9c"), clock_map=STRETCH)
         )
         cls.turns = cls.result["turns"]
         cls.found = cls.result["metrics"]
@@ -151,12 +157,13 @@ class ReplayInvariantTests(unittest.TestCase):
         # owed move back one turn when the advisor asks a direct question about the learner (turn
         # 43: "do you think you will be part of the group that gets laid off?" ... "what makes you
         # get scared of layoffs?"), so the objections of this slow advisor land later: the F4 pair
-        # is forced at 10:48 and 11:29, the close window opens after the turn-76 enrolment
-        # suggestion (group 17), and the call ends on the 13:00 stall (a reaction, then the WEAK
-        # line), the end-game backstop.  Ship restore (owner decision 2026-10-09): the enrolment
-        # reading is production's (``r1_commitment._ENROL_ASK``), which does not read the turn-76
-        # "I would suggest you enroll tomorrow" as an ask, so group 17 logs no ask: the forced F4
-        # move is spoken as before, and the ask reason moves to the turn-78 offer (group 18).
+        # is forced at 16:25 and 17:29 (10:48 and 11:29 before the 20:00 role-play stretched the
+        # clock), the close window opens after the turn-76 enrolment suggestion (group 17), and the
+        # call ends on the 19:00 stall (a reaction, then the WEAK line), the end-game backstop.
+        # Ship restore (owner decision 2026-10-09): the enrolment reading is production's
+        # (``r1_commitment._ENROL_ASK``), which does not read the turn-76 "I would suggest you
+        # enroll tomorrow" as an ask, so group 17 logs no ask: the forced F4 move is spoken as
+        # before, and the ask reason moves to the turn-78 offer (group 18).
         self.assertGreaterEqual(len(self.turns), 17)
         self.assertTrue(all(turn.plan is not None for turn in self.turns))
         commitment = self.result["admin_log"]["commitment"]
@@ -176,13 +183,13 @@ class ReplayInvariantTests(unittest.TestCase):
         said = [t for t in self.turns if t.spoken and fuzzy_contains(t.spoken, WEAK)]
         self.assertLessEqual(len(said), 1)
         for turn in said:
-            # The one stall is the 13:00 end-game line: a reaction, then the line, resolved.
-            self.assertGreaterEqual(turn.r_sec, 780)
+            # The one stall is the 19:00 end-game line: a reaction, then the line, resolved.
+            self.assertGreaterEqual(turn.r_sec, 1140)
             self.assertTrue(turn.plan["resolves"])
 
     def test_no_stall_phrase_before_the_close_window(self) -> None:
         for turn in self.turns:
-            if turn.r_sec < 540 and turn.spoken:
+            if turn.r_sec < 780 and turn.spoken:
                 with self.subTest(group=turn.group):
                     self.assertFalse(fuzzy_contains(turn.spoken, WEAK))
                     self.assertNotIn("email me the details", turn.spoken.lower())
@@ -292,7 +299,9 @@ class ReplayInvariantTests(unittest.TestCase):
                 self.assertLessEqual(families[family]["max_slip_sec"], 60)
 
     def test_the_replay_is_deterministic(self) -> None:
-        again = asyncio.run(replay.replay(FIXTURE["rows"], ScriptedLearnerLLM("replay-b58c7d9c")))
+        again = asyncio.run(
+            replay.replay(FIXTURE["rows"], ScriptedLearnerLLM("replay-b58c7d9c"), clock_map=STRETCH)
+        )
         self.assertEqual([t.spoken for t in again["turns"]], [t.spoken for t in self.turns])
 
 
@@ -322,7 +331,7 @@ class NegativeControlTests(unittest.TestCase):
     )
 
     def _replay(self, *lines: str) -> dict:
-        return asyncio.run(replay.replay(FIXTURE["rows"], FixedModel(*lines)))
+        return asyncio.run(replay.replay(FIXTURE["rows"], FixedModel(*lines), clock_map=STRETCH))
 
     def test_a_model_that_keeps_stalling_in_new_words_fails_the_call(self) -> None:
         found = self._replay(*self.STALLS)["metrics"]

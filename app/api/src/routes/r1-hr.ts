@@ -15,7 +15,7 @@
  * the merge as api=true and database=true: the API restarts (it hosts the
  * phone queue runtime) and migration convergence runs. It is NOT a web-only
  * merge. Plan §9's pre-merge gate therefore applies in full: merge inside
- * 07:00-08:30 IST, R1 paused 30 minutes ahead, and the read-only zero checks
+ * 07:00-08:30 IST, R1 paused 40 minutes ahead, and the read-only zero checks
  * (live R1 sessions, live phone attempts, `phone.dial` due, active
  * `phone.assessment`) before merging.
  *
@@ -74,8 +74,8 @@ function exact(value: number): number {
   return Math.round(value * 1e6) / 1e6;
 }
 
-/** The hold a send reserves; mirrors the 0115 CHECK on `admission_hold_minutes`. */
-const DEFAULT_HOLD_MINUTES = 55;
+/** The hold a send reserves; mirrors the 0128 CHECK on `admission_hold_minutes`. */
+const DEFAULT_HOLD_MINUTES = 65;
 /** PostgREST caps a response at 1000 rows by default, so the ledger is summed in pages. */
 const LEDGER_PAGE_ROWS = 1000;
 /** A runaway bound (100k rows), far beyond a month of R1 ledger events. */
@@ -95,7 +95,7 @@ type CapacitySnapshot = Row;
 
 /**
  * The one capacity read. `p_extra_hold` is the change in outstanding holds the
- * caller is asking about: the Send hold (55) for "would a Send be admitted", 0
+ * caller is asking about: the Send hold (65) for "would a Send be admitted", 0
  * for "where do we stand". The parameter names are pinned against the 0119 SQL
  * by `r1-hr-routes.test.ts`; PostgREST answers PGRST202 for an unknown name.
  *

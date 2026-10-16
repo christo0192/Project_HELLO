@@ -23,8 +23,8 @@
  *
  *   created      15 min since the row was last touched (the attempt token lives 5 min)
  *   waiting      20 min (the worker's no-show timer is 120 s once it is in the room)
- *   in_progress  45 min since the last row update, transcript turn or ledger row (the worker's own
- *                residency cap is 1800 s and its rejoin grace 90 s, plus the closing line)
+ *   in_progress  50 min since the last row update, transcript turn or ledger row (the worker's own
+ *                residency cap is 2160 s and its rejoin grace 90 s, plus the closing line)
  *
  * A `waiting` row is also spared while its worker is demonstrably alive. A candidate who retries in
  * the same tab late in the window (the runbook's advice after a failed start) gets a worker
@@ -79,7 +79,7 @@ export const R1_ORPHAN_LAPSE_BOUNDS = {
    * deferred, not lapsed, but only up to this much idle time. Past it the row lapses regardless.
    */
   waitingLiveJobCeilingSec: 60 * 60,
-  inProgressIdleSec: 45 * 60,
+  inProgressIdleSec: 50 * 60,
   /** How long one `listDispatch` may take before it counts as unreadable (the pass is 60 s apart). */
   dispatchProbeMs: 8_000,
   /** Live R1 sessions are at most a handful (one per round, one admitted at a time). */

@@ -12,7 +12,14 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import r1_roleplay
-from r1_commitment import COMMITMENT_LINES, Level, commitment_line, stall_line
+from r1_commitment import (
+    COMMIT_PERMITTED_R_SEC,
+    COMMIT_STALL_R_SEC,
+    COMMITMENT_LINES,
+    Level,
+    commitment_line,
+    stall_line,
+)
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
 from r1_guard import CONTACT_REPLACEMENT, FALLBACK_REPLIES, FALLBACK_REPLY, NEUTRAL_ACKS
 from r1_negotiation import (
@@ -34,6 +41,7 @@ from r1_scheduler import (
     F3_PUSH,
     REDIRECT_OPENERS,
     TIME_CUE,
+    TIME_CUE_SEC,
 )
 from r1_world import WORLD_VERSION
 
@@ -123,7 +131,7 @@ def strong_script():
     return [*cooperative_script()[:-1], HANDLE_DECIDER]
 
 
-def run_cooperative(period=50.0, eng=None, ask_at=None, script=None):
+def run_cooperative(period=72.5, eng=None, ask_at=None, script=None):
     eng = eng or engine()
     session = Session(eng)
     r = 20.0
@@ -389,11 +397,11 @@ class PlanModeTests(unittest.TestCase):
                 self.assertEqual(plan.turn, 2)
         self.assertEqual(s.eng.admin_log()["intents"]["handed_to_model"][F3_PRIMARY], 1)
 
-    def test_the_stall_at_thirteen_minutes_is_a_short_reaction_then_the_scripted_line(self):
+    def test_the_stall_at_nineteen_minutes_is_a_short_reaction_then_the_scripted_line(self):
         """R1-Q: the WEAK line is still scripted and masked, but the learner reacts first."""
-        session, _ = run_cooperative(40.0)
+        session, _ = run_cooperative(62.5)
         eng = session.eng
-        r = 790.0
+        r = COMMIT_STALL_R_SEC + 10.0
         plan = session.say(NEUTRAL, r)
         self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, COMMIT_STALL))
         self.assertEqual(plan.scripted_text, stall_line("husband"))
@@ -417,10 +425,10 @@ class PlanModeTests(unittest.TestCase):
         self.assertTrue(eng.negotiation.weak_line_said)
 
     def test_a_model_that_says_the_closing_line_itself_does_not_get_it_twice(self):
-        session, _ = run_cooperative(40.0)
+        session, _ = run_cooperative(62.5)
         said = f"Thanks. {stall_line('husband')}"
         session.ack = said
-        plan = session.say(NEUTRAL, 790.0)
+        plan = session.say(NEUTRAL, COMMIT_STALL_R_SEC + 10.0)
         self.assertEqual(session.spoken[-1], said)
         self.assertEqual(session.spoken[-1].lower().count("email me the details"), 1)
         self.assertTrue(session.eng.commitment_resolved)
@@ -429,7 +437,7 @@ class PlanModeTests(unittest.TestCase):
     def test_a_forced_move_asks_the_model_to_link_it_to_what_was_just_said(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        plan = s.say(NEUTRAL, 270)  # F3 is due at 5:00, so it is forced now
+        plan = s.say(NEUTRAL, 390)  # F3 is due at 7:10, so it is forced now
         self.assertTrue(plan.reasons[-1].endswith(":forced"))
         self.assertTrue(plan.intent.forced)
         self.assertIn("Link it to what the advisor just said", plan.reminder)
@@ -453,8 +461,8 @@ class PlanModeTests(unittest.TestCase):
             self.assertIn("$7,000", variant)
 
     def test_the_time_cue_is_an_intent_of_its_own_kind(self):
-        session, r = run_cooperative(40.0)
-        self.assertGreaterEqual(r, 660)
+        session, r = run_cooperative(62.5)
+        self.assertGreaterEqual(r, TIME_CUE_SEC)
         plan = session.say(NEUTRAL, r)
         self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, TIME_CUE))
         self.assertEqual(plan.intent.kind, "cue")
@@ -516,7 +524,7 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
         s.say(OPENER, 20)
         s.say(NEUTRAL, 60)
         plan = s.say(PITCH + " " + H3_PROBE, 125)
-        # F3 is owed but not forced (its deadline is 5:00): the learner answers the advisor's
+        # F3 is owed but not forced (its deadline is 7:10): the learner answers the advisor's
         # question first, with the hint layer.
         self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
         self.assertIn("owed_deferred_for_reveal", plan.reasons)
@@ -527,7 +535,7 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
     def test_a_forced_owed_move_is_not_held_back_by_a_first_probe(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        plan = s.say(H3_PROBE, 270)
+        plan = s.say(H3_PROBE, 390)
         self.assertEqual(plan.mode, TurnMode.INTENT)
         self.assertTrue(plan.reasons[-1].endswith(":forced"))
         # The hint layer goes into the SAME reply (the old acknowledgement dropped it).
@@ -537,9 +545,9 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
 
     def test_the_time_cue_waits_one_turn_for_a_due_reveal_then_comes(self):
         """R1-Q turn 79: the cue was exempt from the reveal deferral and landed on top of it."""
-        session, r = run_cooperative(40.0)
-        self.assertGreaterEqual(r, 660)
-        self.assertLess(r, 780)
+        session, r = run_cooperative(62.5)
+        self.assertGreaterEqual(r, TIME_CUE_SEC)
+        self.assertLess(r, COMMIT_STALL_R_SEC)
         plan = session.say(H1_PROBE, r)  # H1 is unlocked and was never said: asked again
         self.assertEqual(plan.mode, TurnMode.LLM_REPLY)
         self.assertIn("owed_deferred_for_reveal", plan.reasons)
@@ -548,14 +556,17 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
         self.assertEqual((nxt.mode, nxt.move_id), (TurnMode.INTENT, TIME_CUE))
 
     def test_the_stall_waits_for_a_reveal_only_during_the_grace_period(self):
-        early, _ = run_cooperative(40.0)
-        held = early.say(H1_PROBE, 785.0)  # the stall is owed from 13:00; a reveal is due
+        early, _ = run_cooperative(62.5)
+        # The stall is owed from 19:00; a reveal is due.
+        held = early.say(H1_PROBE, COMMIT_STALL_R_SEC + 5.0)
         self.assertEqual(held.mode, TurnMode.LLM_REPLY)
         self.assertIn("owed_deferred_for_reveal", held.reasons)
         # Past the grace period the stall is the end-game backstop and is spoken regardless
-        # (the role-play hard-ends at 14:00).
-        late, _ = run_cooperative(40.0)
-        spoken = late.say(H1_PROBE, 785.0 + r1_roleplay.STALL_DEFER_GRACE_SEC + 5)
+        # (the role-play hard-ends at 20:00).
+        late, _ = run_cooperative(62.5)
+        spoken = late.say(
+            H1_PROBE, COMMIT_STALL_R_SEC + 5.0 + r1_roleplay.STALL_DEFER_GRACE_SEC + 5
+        )
         self.assertEqual((spoken.mode, spoken.move_id), (TurnMode.INTENT, COMMIT_STALL))
 
     def test_a_forced_owed_move_is_not_deferred_and_carries_the_due_reveal(self):
@@ -563,7 +574,7 @@ class DisclosureThroughTheEngineTests(unittest.TestCase):
         s = Session(eng, ack="I have two kids, so it would be evenings and weekends only.")
         s.say(OPENER, 20)
         s.say(H3_PROBE, 40)
-        plan = s.say("And would anyone else be involved in the decision?", 270)
+        plan = s.say("And would anyone else be involved in the decision?", 390)
         self.assertEqual(plan.mode, TurnMode.INTENT)
         self.assertTrue(plan.reasons[-1].endswith(":forced"))
         # The deep layer is handed over in the same single call, after the reaction.
@@ -780,7 +791,7 @@ class AskTests(unittest.TestCase):
         r = 20.0
         for index, text in enumerate(cooperative_script()[:14]):
             s.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
-            r += 40.0
+            r += 62.5
         for reason in ("timing", "decision_maker"):
             self.assertLessEqual(s.eng.negotiation.voicings.get(reason, 0), 1, reason)
         # Before the pair was delivered the asks went to money and the question.
@@ -792,7 +803,7 @@ class AskTests(unittest.TestCase):
         self.assertEqual(early.eng._reasons_owned_by_f4(), {"timing", "decision_maker"})
 
     def test_every_reason_is_available_once_the_f4_pair_was_delivered(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         eng = session.eng
         self.assertEqual(eng._reasons_owned_by_f4(), frozenset())
         self.assertEqual(eng.negotiation.voicings, {"timing": 1, "decision_maker": 1})
@@ -829,8 +840,9 @@ class AskTests(unittest.TestCase):
         r = 20.0
         for index, text in enumerate(cooperative_script()[:14]):
             s.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
-            r += 40.0
-        # F1, F2 and F3 are done and F4 is next: the advisor proposes a call at 9:40.
+            r += 60.0
+        # F1, F2 and F3 are done and F4 is next (not forced yet: its deadline is 15:30): the
+        # advisor proposes a call at 14:20.
         plan = s.say(CALL_ASK, r)
         self.assertFalse(s.eng.scheduler.commit_permitted(r))
         self.assertIn("ask_yields_to_owed_move", plan.reasons)
@@ -840,12 +852,12 @@ class AskTests(unittest.TestCase):
     def test_a_deadline_is_never_starved_by_an_advisor_who_asks_every_turn(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        modes = [s.say(ASK, 130 + 40 * i) for i in range(4)]
+        modes = [s.say(ASK, 185 + 60 * i) for i in range(4)]
         self.assertEqual(modes[0].mode, TurnMode.INTENT)
         self.assertEqual(modes[0].negotiation_id, "N-MONEY")
         forced = modes[3]
         self.assertEqual((forced.mode, forced.move_id), (TurnMode.INTENT, "F3-PRIMARY"))
-        self.assertIn("ask_yields_to_owed_move", forced.reasons)  # F3 is forced from 4:15
+        self.assertIn("ask_yields_to_owed_move", forced.reasons)  # F3 is forced from about 5:45
 
     def test_a_callback_proposal_is_met_like_an_ask_not_accepted(self):
         s = Session(engine())
@@ -857,7 +869,7 @@ class AskTests(unittest.TestCase):
         self.assertNotIn("10", s.spoken[-1])
 
     def test_an_ask_inside_the_window_gets_the_graded_line_and_resolves(self):
-        session, r = run_cooperative(50.0, script=strong_script())
+        session, r = run_cooperative(72.5, script=strong_script())
         eng = session.eng
         eng.apply_judge(GOOD_JUDGE, eng.turn)
         self.assertTrue(eng.scheduler.commit_permitted(r))
@@ -873,13 +885,13 @@ class AskTests(unittest.TestCase):
     def test_the_grade_depends_only_on_the_evidence_and_is_deterministic(self):
         outcomes = []
         for _ in range(2):
-            session, r = run_cooperative(50.0)
+            session, r = run_cooperative(72.5)
             session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
             outcomes.append(session.say(ASK, r).scripted_text)
         self.assertEqual(outcomes[0], outcomes[1])
 
     def test_missing_judge_data_lowers_the_grade_and_the_learner_first_gives_a_reason(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         # The F4 pair already voiced timing and the decision maker, so money is what is left.
         self.assertEqual(session.eng.negotiation.next_reason(), "money")
         first = session.say(ASK, r)  # no judge result was ever applied: WEAK, one reason left
@@ -897,7 +909,7 @@ class AskTests(unittest.TestCase):
 
     def test_an_advisor_who_handles_the_reason_earns_the_medium_line_without_the_judge(self):
         """MEDIUM is reachable with a released need and a stall reason the advisor handled."""
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         self.assertGreaterEqual(session.eng.tracker.gate.released_count, 1)
         first = session.say(ASK, r)
         self.assertEqual(first.negotiation_id, "N-MONEY")
@@ -921,7 +933,7 @@ class AskTests(unittest.TestCase):
         self.assertEqual(MAX_STALL_ROUNDS, 2)
 
     def test_the_weak_line_is_said_at_most_once_in_a_whole_session(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         for index in range(6):
             session.say(ASK if index % 2 == 0 else CALL_ASK, r + 50 * index)
         # The WEAK line is either the e-mail wording or, after a CALL ask, the call-back wording.
@@ -939,7 +951,7 @@ class AskTests(unittest.TestCase):
         self.assertIn("already told the advisor where you stand", later.reminder)
 
     def test_a_call_only_ask_is_capped_at_the_medium_line(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         plan = session.say(CALL_ASK, r)
         self.assertEqual(plan.commitment_level, Level.MEDIUM)
@@ -951,7 +963,7 @@ class AskTests(unittest.TestCase):
 
     def test_a_second_ask_does_not_repeat_the_first_commitment(self):
         """R1-Q: a scripted line is never said twice; the second ask gets a real reply."""
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         first = session.say(CALL_ASK, r)
         second = session.say(ASK, r + 50)
@@ -966,7 +978,7 @@ class AskTests(unittest.TestCase):
     def test_the_commitment_line_is_masked_for_the_scorer(self):
         from r1_commitment import MASK_PLACEHOLDER, mask_for_scorer
 
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         plan = session.say(ASK, r)
         self.assertEqual(mask_for_scorer(plan.scripted_text, "husband"), MASK_PLACEHOLDER)
@@ -1022,7 +1034,7 @@ class InjectionTests(unittest.TestCase):
     def test_injection_text_cannot_change_a_phase_a_commitment_or_a_disclosure(self):
         control = Session(engine())
         attacked = Session(engine())
-        for index, r in enumerate((20, 70, 120, 170, 220, 270)):
+        for index, r in enumerate((20, 95, 170, 245, 320, 395)):
             control.say(NEUTRAL, r)
             attacked.say(self.ATTACKS[index % len(self.ATTACKS)], r)
         for plan in attacked.plans:
@@ -1192,7 +1204,7 @@ class InvariantFuzzTests(unittest.TestCase):
                     self.assertNotIn(spec.text, plan.reminder)
         if plan.commitment_level in (Level.MEDIUM, Level.STRONG):
             self.assertTrue(eng.scheduler.all_families_complete)
-            self.assertGreaterEqual(r, 540)
+            self.assertGreaterEqual(r, COMMIT_PERMITTED_R_SEC)
         if plan.aside:
             self.assertEqual(plan.voice, "interviewer")
         else:
@@ -1390,8 +1402,8 @@ class CharacterBreakTests(unittest.TestCase):
     def test_a_character_break_on_an_owed_turn_still_delivers_the_owed_move(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        plan = s.say("Are you an AI?", 270)
-        # F3 is due at 5:00 and forced here: the reminder carries the deflection note too.
+        plan = s.say("Are you an AI?", 390)
+        # F3 is due at 7:10 and forced here: the reminder carries the deflection note too.
         self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, F3_PRIMARY))
         self.assertIn(CHARACTER_BREAK_NOTE, plan.reminder)
         self.assertTrue(s.spoken[-1].endswith(plan.intent.fallback))
@@ -1492,7 +1504,7 @@ class RepetitionControlTests(unittest.TestCase):
 
     def test_a_scripted_line_that_was_spoken_cannot_be_repeated_by_the_model(self):
         """Turns 77, 81, 87, 90 and 92: the stall phrase came back through acks and replies."""
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         session.reply = "Okay, I'll keep that in mind. Just email me the details."
         for step in range(2):  # no judge data: one reason left (money), then the WEAK resolution
             plan = session.say(ASK, r + 50 * step)
@@ -1795,9 +1807,9 @@ class CuriosityTests(unittest.TestCase):
 
 class TimeAndCueTests(unittest.TestCase):
     def test_the_time_cue_and_the_stall_arrive_on_the_clock(self):
-        session, r = run_cooperative(40.0)
+        session, r = run_cooperative(62.5)
         eng = session.eng
-        while r < 830:
+        while r < COMMIT_STALL_R_SEC + 50:
             session.say(NEUTRAL, r)
             r += 40
         delivered = {d.move_id for d in eng.scheduler.deliveries()}
@@ -1817,7 +1829,7 @@ class TimeAndCueTests(unittest.TestCase):
 
 class FullRunTests(unittest.TestCase):
     def test_a_cooperative_candidate_gets_every_family_and_passes_fidelity(self):
-        session, r = run_cooperative(50.0, script=strong_script())
+        session, r = run_cooperative(72.5, script=strong_script())
         eng = session.eng
         eng.apply_judge(GOOD_JUDGE, eng.turn)
         session.say(ASK, r)
@@ -1853,7 +1865,7 @@ class FullRunTests(unittest.TestCase):
         self.assertFalse(eng.fidelity(r_end=900)["checks"]["no_commitment_violation"])
 
     def test_the_admin_log_is_json_versioned_and_free_of_candidate_text(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         log = session.eng.admin_log(final=True, r_end=r)
         text = json.dumps(log)
         self.assertEqual(log["content_version"], CONTENT_VERSION)
@@ -1869,7 +1881,7 @@ class FullRunTests(unittest.TestCase):
             self.assertNotIn(phrase, text)
 
     def test_log_indices_are_mapped_to_transcript_turns(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         log = session.eng.admin_log(final=True, r_end=r)
         h1 = next(n for n in log["needs"] if n["topic"] == "H1")
         # H1 was probed on role-play turn 2 and followed up on turn 3 (transcript 3 and 5).
@@ -1887,7 +1899,7 @@ class FullRunTests(unittest.TestCase):
         sequences = []
         for persona in PERSONAS:
             rendered = resolve_persona(persona.id, variant="v1")
-            session, _ = run_cooperative(50.0, eng=engine(rendered))
+            session, _ = run_cooperative(72.5, eng=engine(rendered))
             sequences.append(
                 [(d.move_id, d.delivered_sec) for d in session.eng.scheduler.deliveries()]
             )
@@ -2193,7 +2205,7 @@ class CallbackEmailAndCheckinThroughTheEngineTests(unittest.TestCase):
 
 class MediumSlotThroughTheEngineTests(unittest.TestCase):
     def ready(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         return session, r
 
@@ -2257,7 +2269,7 @@ class OwnerTestNegotiationTests(unittest.TestCase):
     T88 = "Sure, Sure, Sure. Is there anything else you wanted to know?"
 
     def test_the_closing_turns_never_produce_the_stall_line_twice_or_a_deflection(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         for index, text in enumerate(
             (self.T68, self.T78, self.T80, "So what do you think?", self.T88)
@@ -2272,7 +2284,7 @@ class OwnerTestNegotiationTests(unittest.TestCase):
         2026-10-09): the head-only "talk to your husband" call object that read this as a call also read
         "Talk to your husband tonight and let me know" as one, so it is gone and production's reading is
         back: no ask, the owed commitment stall (the WEAK line, once) exactly as production speaks it."""
-        session, r = run_cooperative(50.0)  # F4-PUSH ("I'd need to talk to my husband") is done
+        session, r = run_cooperative(72.5)  # F4-PUSH ("I'd need to talk to my husband") is done
         self.assertTrue(session.eng.scheduler.commit_permitted(r))
         plan = session.say(self.T78, r)
         # The husband mention still counts as the decision maker being handled.
@@ -2285,7 +2297,7 @@ class OwnerTestNegotiationTests(unittest.TestCase):
         self.assertEqual(session.eng.admin_log()["commitment"]["asks"], [])
 
     def test_the_email_turn_gets_one_real_reaction(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         plan = session.say(self.T80, r)
         self.assertEqual(plan.negotiation_id, "N-EMAIL")
@@ -2534,7 +2546,7 @@ class ReasonOnceThroughTheEngineTests(unittest.TestCase):
         texts = cooperative_script()[:12]
         for index, text in enumerate(texts):
             s.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
-            r += 40.0
+            r += 62.5
         plans = [s.say(ASK if i % 2 == 0 else CALL_ASK, r + 25 * i) for i in range(6)]
         kinds = [(p.negotiation_id, p.move_id) for p in plans]
         voiced = [k for p, k in zip(plans, kinds) if k[0] in ("N-TIMING", "N-DM")]
@@ -2550,7 +2562,7 @@ class AskYieldsToAForcedMoveTests(unittest.TestCase):
     def forced_ask_session(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        plans = [s.say(ASK, 130 + 40 * i) for i in range(4)]
+        plans = [s.say(ASK, 185 + 60 * i) for i in range(4)]
         return s, plans[-1]
 
     def test_a_forced_non_f4_move_also_reacts_to_the_proposal(self):
@@ -2566,8 +2578,8 @@ class AskYieldsToAForcedMoveTests(unittest.TestCase):
         r = 20.0
         for index, text in enumerate(cooperative_script()[:14]):
             s.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
-            r += 40.0
-        plan = s.say(CALL_ASK, r)
+            r += 60.0
+        plan = s.say(CALL_ASK, r)  # 14:20: F4 is owed but not forced yet
         self.assertEqual(plan.move_id, "F4-PRIMARY")
         self.assertIn("ask_yields_to_owed_move", plan.reasons)
         self.assertNotIn("The advisor just proposed a call or a next step", plan.reminder)
@@ -2575,7 +2587,7 @@ class AskYieldsToAForcedMoveTests(unittest.TestCase):
     def test_an_email_offer_does_not_pre_empt_a_forced_owed_move(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        plan = s.say("I will email you the details once we finish this call.", 270)
+        plan = s.say("I will email you the details once we finish this call.", 390)
         self.assertEqual((plan.mode, plan.move_id), (TurnMode.INTENT, "F3-PRIMARY"))
         self.assertIn("email_yields_to_owed_move", plan.reasons)
         self.assertIsNone(plan.negotiation_id)
@@ -2598,14 +2610,14 @@ class CommitmentOnRecordThroughTheEngineTests(unittest.TestCase):
     CONFIRM = "Perfect, so I will call you and your husband on Thursday at 7 PM then."
 
     def booked(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         first = session.say(CALL_ASK, r)
         self.assertEqual(first.commitment_level, Level.MEDIUM)
         return session, r
 
     def test_the_cap_is_the_stall_until_a_line_is_on_record_then_the_recorded_level(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         self.assertEqual(session.eng.guard_context().commitment_cap, Level.WEAK)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         session.say(CALL_ASK, r)
@@ -2626,7 +2638,7 @@ class CommitmentOnRecordThroughTheEngineTests(unittest.TestCase):
 
     def test_the_old_behaviour_would_have_posted_a_gate_failing_hit(self):
         """On a fresh engine (cap WEAK) the same sentence IS a commitment hit."""
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         result = session.eng.sanitize_reply(session.plans[-1], "Sounds good, see you Thursday.")
         self.assertIn("commitment", {hit.category for hit in result.hits})
 
@@ -2650,7 +2662,7 @@ class CommitmentOnRecordThroughTheEngineTests(unittest.TestCase):
 
 class ReservedWeakLineThroughTheEngineTests(unittest.TestCase):
     """R1-Q round 1: the WEAK line's own sentences are the worker's; a model that said them earlier
-    would make the 13:00 line an exact repeat, or ask for the e-mail twice."""
+    would make the 19:00 line an exact repeat, or ask for the e-mail twice."""
 
     def sentences(self, spoken):
         from r1_text import normalize, split_sentences
@@ -2664,7 +2676,7 @@ class ReservedWeakLineThroughTheEngineTests(unittest.TestCase):
         r = 20.0
         for index, text in enumerate(cooperative_script()):
             session.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
-            r += 50.0
+            r += 72.5
         weak = session.say(ASK, r)
         weak2 = session.say(ASK, r + 50)
         said = self.sentences(session.spoken)
@@ -2750,7 +2762,7 @@ class PitchNeverEarnsACommitmentTests(unittest.TestCase):
         self.assertGreaterEqual(len(pitches), 20)
         for text in pitches:
             with self.subTest(text=text):
-                session, r = run_cooperative(40.0)  # the four families are done at 10:20
+                session, r = run_cooperative(62.5)  # the four families are done at 15:57
                 session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
                 self.assertTrue(session.eng.scheduler.commit_permitted(r))
                 plan = session.say(text, r - 20)
@@ -2763,7 +2775,7 @@ class PitchNeverEarnsACommitmentTests(unittest.TestCase):
                 self.assertNotIn("book a call", session.spoken[-1].lower())
 
     def test_a_real_callback_in_the_close_window_still_earns_the_graded_line(self):
-        session, r = run_cooperative(40.0)
+        session, r = run_cooperative(62.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         plan = session.say("Can we schedule a call tomorrow at 7 pm?", r - 20)
         self.assertEqual(plan.commitment_level, Level.MEDIUM)
@@ -2792,7 +2804,7 @@ class PitchNeverEarnsACommitmentTests(unittest.TestCase):
 
         for text in CALL_PROPOSALS:
             with self.subTest(text=text):
-                session, r = run_cooperative(40.0)
+                session, r = run_cooperative(62.5)
                 session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
                 plan = session.say(text, r - 20)
                 self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
@@ -2948,9 +2960,9 @@ class ReachedAnchorThenCounterTests(unittest.TestCase):
 
 
 def late_session():
-    """A cooperative call at about 10:40: every family done (the $7,000 anchor included), the close
+    """A cooperative call at about 16:40: every family done (the $7,000 anchor included), the close
     window open, nothing stalled yet, and the model's free reply scripted per test."""
-    session, r = run_cooperative(40.0)
+    session, r = run_cooperative(62.5)
     assert session.eng.scheduler.commit_permitted(r - 20)
     assert session.eng.scheduler.is_delivered(F1_ANCHOR)
     return session, r - 20
@@ -3064,7 +3076,7 @@ class BookedCallConfirmationTests(unittest.TestCase):
     CONFIRM = "Perfect, so I will call you and your husband on Thursday at 7 PM then. Does that work?"
 
     def booked(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         first = session.say(CALL_ASK, r)
         self.assertEqual(first.commitment_level, Level.MEDIUM)
@@ -3125,7 +3137,7 @@ class BookedCallConfirmationTests(unittest.TestCase):
 
     def test_a_weak_line_does_not_switch_to_confirming(self):
         """The stall is not an agreement: nothing was booked, so there is nothing to confirm."""
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         for step in range(2):
             plan = session.say(ASK, r + 50 * step)
         self.assertEqual(plan.mode, TurnMode.SAY_ONLY)
@@ -3143,8 +3155,9 @@ class BookedCallConfirmationTests(unittest.TestCase):
 
 class PendingAskAtFarewellTests(unittest.TestCase):
     """R1-Q iteration 1: a strong advisor proposed the call while the owed F4 objections were still
-    pending, finished them, then closed inside the window (11:20, 12:00) and got the WEAK stall: the
-    learner had forgotten the open proposal.  A farewell inside the window now answers it."""
+    pending, finished them, then closed inside the window (11:20, 12:00 on the 14-minute clock) and
+    got the WEAK stall: the learner had forgotten the open proposal.  A farewell inside the window
+    now answers it."""
 
     FAREWELL = "Alright, thanks so much for your time today. Bye for now!"
 
@@ -3157,7 +3170,7 @@ class PendingAskAtFarewellTests(unittest.TestCase):
             if s.eng.scheduler.commit_permitted(r):
                 break
             s.say(text, r)
-            r += 45
+            r += 67.5
         return s, r
 
     def test_an_early_proposal_is_remembered_until_the_window_opens(self):
@@ -3178,7 +3191,7 @@ class PendingAskAtFarewellTests(unittest.TestCase):
             if s.eng.scheduler.commit_permitted(r):
                 break
             s.say(text, r)
-            r += 45
+            r += 67.5
         plan = s.say(self.FAREWELL, r)
         self.assertIn("close_attempt_stall", plan.reasons)
         self.assertNotIn("pending_ask_at_farewell", plan.reasons)
@@ -3227,7 +3240,7 @@ class SchedulePitchThroughTheEngineTests(unittest.TestCase):
             if s.eng.scheduler.commit_permitted(r):
                 break
             s.say(text, r)
-            r += 45
+            r += 67.5
         return s, r
 
     def test_an_early_pitch_is_not_a_pending_ask(self):
@@ -3250,7 +3263,7 @@ class SchedulePitchThroughTheEngineTests(unittest.TestCase):
         self.assertNotIn("book a call", s.spoken[-1].lower())
 
     def test_a_pitch_in_the_close_window_earns_no_commitment(self):
-        session, r = run_cooperative(40.0)
+        session, r = run_cooperative(62.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         plan = session.say(self.PITCH_ASK, r - 20)
         self.assertIsNone(plan.commitment_level, plan.reasons)
@@ -3258,7 +3271,7 @@ class SchedulePitchThroughTheEngineTests(unittest.TestCase):
         self.assertNotIn("book a call", session.spoken[-1].lower())
 
     def test_a_real_time_question_about_a_call_is_still_answered_as_a_proposal(self):
-        session, r = run_cooperative(40.0)
+        session, r = run_cooperative(62.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         plan = session.say("Since mornings don't work, when's better for a quick call?", r - 20)
         self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
@@ -3283,7 +3296,7 @@ class ResourceLinkThroughTheEngineTests(unittest.TestCase):
     def test_an_offer_of_a_resource_link_earns_no_commitment_in_the_close_window(self):
         for text in self.NOT_ASKS:
             with self.subTest(text=text):
-                session, r = run_cooperative(40.0)
+                session, r = run_cooperative(62.5)
                 session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
                 plan = session.say(text, r - 20)
                 self.assertIsNone(plan.commitment_level, plan.reasons)
@@ -3299,7 +3312,7 @@ class ResourceLinkThroughTheEngineTests(unittest.TestCase):
         self.assertIsNone(s.eng._pending_ask)
 
     def test_a_real_payment_link_ask_is_still_answered_as_one(self):
-        session, r = run_cooperative(40.0)
+        session, r = run_cooperative(62.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         plan = session.say("Shall I send you the payment link now?", r - 20)
         self.assertIsNotNone(plan.commitment_level, plan.reasons)
@@ -3338,7 +3351,7 @@ class ShareTheLinkThroughTheEngineTests(unittest.TestCase):
         r = 20.0
         for index, text in enumerate(strong_script()):
             session.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
-            r += 50.0
+            r += 72.5
         eng.apply_judge(GOOD_JUDGE, eng.turn)
         return session, r
 
@@ -3354,7 +3367,7 @@ class ShareTheLinkThroughTheEngineTests(unittest.TestCase):
     def test_the_same_questions_are_asks_when_the_decider_is_not_handled(self):
         for text in self.ASKS:
             with self.subTest(text=text):
-                session, r = run_cooperative(40.0)
+                session, r = run_cooperative(62.5)
                 session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
                 plan = session.say(text, r - 20)
                 self.assertIsNotNone(plan.commitment_level, plan.reasons)
@@ -3363,7 +3376,7 @@ class ShareTheLinkThroughTheEngineTests(unittest.TestCase):
     def test_a_page_or_a_form_for_a_resource_earns_no_commitment(self):
         for text in self.NOT_ASKS:
             with self.subTest(text=text):
-                session, r = run_cooperative(40.0)
+                session, r = run_cooperative(62.5)
                 session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
                 plan = session.say(text, r - 20)
                 self.assertIsNone(plan.commitment_level, plan.reasons)
@@ -3554,7 +3567,7 @@ class TimeCueIsTheLearnersOwnTests(unittest.TestCase):
                 spoken = s.eng.sanitize_reply(plan, s.reply).text
             s.spoken.append(spoken)
             s.eng.record_spoken(plan, spoken, r_sec=r)
-            r += 50
+            r += 72.5
             if plan.move_id == TIME_CUE:
                 return s, plan
         self.fail("the time cue was never owed")
@@ -3583,7 +3596,7 @@ class TimeCueIsTheLearnersOwnTests(unittest.TestCase):
                 else:
                     spoken = s.eng.sanitize_reply(plan, s.reply).text
                 s.eng.record_spoken(plan, spoken, r_sec=r)
-                r += 50
+                r += 72.5
                 if plan.move_id == TIME_CUE:
                     seen.add(plan.intent.brief)
                     break
@@ -3616,7 +3629,7 @@ def until_window(ask_text, seed="iter2"):
         if s.eng.scheduler.commit_permitted(r):
             break
         s.say(text, r)
-        r += 45
+        r += 67.5
     return s, r
 
 
@@ -3669,7 +3682,7 @@ class IterationTwoEngineTests(unittest.TestCase):
                 self.assertEqual(s.eng.admin_log()["intents"]["declined_calls"], 1)
             else:
                 s.say(text, r)
-            r += 45
+            r += 67.5
         self.assertTrue(s.eng.scheduler.commit_permitted(r))
         plan = s.say(self.FAREWELL, r)
         self.assertNotIn("pending_ask_at_farewell", plan.reasons)
@@ -3683,7 +3696,7 @@ class IterationTwoEngineTests(unittest.TestCase):
         plan = None
         for r, text in ((60, PITCH), (100, NEUTRAL), (150, SCHEDULE_TALK), (200, NEUTRAL), (250, PRICE_ONLY)):
             s.say(text, r)
-        for r in range(300, 700, 45):
+        for r in range(300, 1060, 45):
             plan = s.say(CALL_ASK, r)
             if plan.move_id == "F4-PUSH":
                 break
@@ -3693,7 +3706,7 @@ class IterationTwoEngineTests(unittest.TestCase):
         self.assertIn("never say that they dislike calls", plan.intent.brief)
 
     def test_a_vague_time_after_the_decision_maker_is_booked_without_a_slot(self):
-        session, r = run_cooperative(50.0)  # the F4 pair is done: "I'd need to talk to my husband"
+        session, r = run_cooperative(72.5)  # the F4 pair is done: "I'd need to talk to my husband"
         plan = session.say(
             "No problem at all, take your time with your husband and we'll find a time that works. "
             "Just let me know when's good, or I can try you sometime next week.",
@@ -3706,7 +3719,7 @@ class IterationTwoEngineTests(unittest.TestCase):
         self.assertTrue(session.eng.admin_log()["negotiation"]["slot_deferred"])
 
     def test_a_named_evening_is_still_booked_when_the_decision_maker_was_mentioned(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         plan = session.say("Would tomorrow evening work for a quick call with your husband?", r)
         self.assertEqual(plan.commitment_level, Level.MEDIUM, plan.reasons)
         self.assertEqual(
@@ -3716,7 +3729,7 @@ class IterationTwoEngineTests(unittest.TestCase):
 
     # --- D16: a stall that answers a call asks for no e-mail
     def test_a_weak_stall_after_a_call_ask_says_call_me_back(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         plan = None
         for step in range(5):
             plan = session.say(CALL_ASK, r + 50 * step)
@@ -3729,7 +3742,7 @@ class IterationTwoEngineTests(unittest.TestCase):
         self.assertTrue(session.eng.negotiation.weak_line_said)
 
     def test_a_weak_stall_after_an_enrolment_ask_keeps_the_email_wording(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         plan = None
         for step in range(5):
             plan = session.say(ASK, r + 50 * step)
@@ -3737,9 +3750,9 @@ class IterationTwoEngineTests(unittest.TestCase):
                 break
         self.assertEqual(plan.scripted_text, stall_line("husband"))
 
-    def test_the_thirteen_minute_stall_keeps_the_email_wording(self):
-        session, _r = run_cooperative(40.0)
-        plan = session.say(NEUTRAL, 800)
+    def test_the_nineteen_minute_stall_keeps_the_email_wording(self):
+        session, _r = run_cooperative(62.5)
+        plan = session.say(NEUTRAL, COMMIT_STALL_R_SEC + 20)
         self.assertEqual(plan.move_id, COMMIT_STALL)
         self.assertEqual(plan.scripted_text, stall_line("husband"))
 
@@ -3758,7 +3771,7 @@ class IterationTwoEngineTests(unittest.TestCase):
     def test_a_forced_move_is_never_held_back_for_a_dig(self):
         s = Session(engine())
         s.say(OPENER, 20)
-        plan = s.say("Is it more of a sounding board, or does he need to be convinced?", 290)
+        plan = s.say("Is it more of a sounding board, or does he need to be convinced?", 415)
         self.assertEqual(plan.move_id, F3_PRIMARY)
         self.assertTrue(plan.intent.forced)
 
@@ -3780,7 +3793,7 @@ class IterationTwoEngineTests(unittest.TestCase):
         s = Session(engine())
         s.say(OPENER, 20)
         r = 60
-        while not s.eng.scheduler.is_delivered("F2-PRIMARY") and r < 600:
+        while not s.eng.scheduler.is_delivered("F2-PRIMARY") and r < 840:
             s.say(PITCH if r == 60 else SCHEDULE_TALK, r)
             r += 45
         self.assertTrue(s.eng.scheduler.is_delivered("F2-PRIMARY"))
@@ -3902,7 +3915,7 @@ class IterationThreeEngineTests(unittest.TestCase):
     FAREWELL = "Alright, thanks so much for your time today. Bye for now!"
 
     def ready(self, seed="iter3"):
-        session, r = run_cooperative(50.0, eng=engine(seed=seed))
+        session, r = run_cooperative(72.5, eng=engine(seed=seed))
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         return session, r
 
@@ -3982,13 +3995,13 @@ class IterationThreeEngineTests(unittest.TestCase):
                 s.ack, s.reply = "Okay, I see.", "Just exploring options."
             else:
                 s.say(text, r)
-            r += 45
+            r += 67.5
         plan = s.say(self.FAREWELL, r)
         self.assertNotIn("pending_ask_at_farewell", plan.reasons)
         self.assertEqual(plan.commitment_level, Level.WEAK)
 
     def test_an_enrolment_ask_graded_medium_does_not_invent_a_day(self):
-        session, r = run_cooperative(50.0, eng=engine(seed="enrol"))
+        session, r = run_cooperative(72.5, eng=engine(seed="enrol"))
         # Three of the four families answered: a MEDIUM, not a STRONG.
         session.eng.apply_judge({"family_handled_quality": {"F1": 1, "F2": 1, "F3": 1}}, session.eng.turn)
         plan = session.say("Shall I go ahead and reserve your seat in the next cohort?", r)
@@ -4098,7 +4111,7 @@ class IterationThreeEngineTests(unittest.TestCase):
             if s.eng.scheduler.commit_permitted(r):
                 break
             s.say(text, r)
-            r += 45
+            r += 67.5
         plan = s.say(self.FAREWELL, r)
         self.assertIn("close_attempt_stall", plan.reasons)
         self.assertEqual(plan.scripted_text, commitment_line(Level.WEAK, "husband", emailed=True))
@@ -4182,19 +4195,19 @@ class FinalReviewRoundOneEngineTests(unittest.TestCase):
             if last_reply is not None and index == len(script) - 1:
                 session.reply = last_reply
             session.say(text, r, turn_index=index * 2 + 1, candidate_seconds=20)
-            r += 50.0
+            r += 72.5
         eng.apply_judge(GOOD_JUDGE, eng.turn)
         return session, r
 
     def window_session(self):
-        """A cooperative call stopped at 12:20 (inside the close window, before the 13:00 stall)."""
-        session, r = run_cooperative(45.0)
+        """A cooperative call stopped at 18:20 (inside the close window, before the 19:00 stall)."""
+        session, r = run_cooperative(67.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         self.assertTrue(session.eng.scheduler.commit_permitted(r))
         return session, r
 
     def test_an_advisor_who_never_answered_the_decider_stall_cannot_earn_strong(self):
-        session, r = run_cooperative(50.0)
+        session, r = run_cooperative(72.5)
         session.eng.apply_judge(GOOD_JUDGE, session.eng.turn)
         plan = session.say(ASK, r)
         self.assertEqual(plan.commitment_level, Level.MEDIUM)

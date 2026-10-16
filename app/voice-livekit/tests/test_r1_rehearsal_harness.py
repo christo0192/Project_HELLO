@@ -265,13 +265,13 @@ class CommitmentAndMisfireTests(unittest.TestCase):
     def test_an_earned_commitment_needs_an_ask_just_before(self) -> None:
         admin = {"commitment": {"level": "MEDIUM", "resolved": True, "asks": [{}]}}
         earned = [
-            exchange(1, 560, "Would you like to book a call?", "close_ask"),
-            exchange(2, 580, "Great.", "other", spoken="Let's book a call.", plan=self.commit_plan("MEDIUM")),
+            exchange(1, 800, "Would you like to book a call?", "close_ask"),
+            exchange(2, 820, "Great.", "other", spoken="Let's book a call.", plan=self.commit_plan("MEDIUM")),
         ]
         self.assertTrue(metrics.commitment_metrics(earned, admin)["commitment_earned"])
         unasked = [
-            exchange(1, 560, "More about the capstone.", "pitch"),
-            exchange(2, 580, "Great.", "other", spoken="Let's book a call.", plan=self.commit_plan("MEDIUM")),
+            exchange(1, 800, "More about the capstone.", "pitch"),
+            exchange(2, 820, "Great.", "other", spoken="Let's book a call.", plan=self.commit_plan("MEDIUM")),
         ]
         found = metrics.commitment_metrics(unasked, admin)
         self.assertFalse(found["commitment_earned"])
@@ -282,7 +282,7 @@ class CommitmentAndMisfireTests(unittest.TestCase):
         self.assertIsNone(metrics.commitment_metrics([], admin)["commitment_earned"])
         self.assertIsNone(metrics.commitment_metrics([], {"commitment": {}})["commitment_level"])
 
-    def test_a_commitment_before_9_00_is_premature(self) -> None:
+    def test_a_commitment_before_13_00_is_premature(self) -> None:
         admin = {"commitment": {"level": "STRONG", "resolved": True}}
         early = [exchange(1, 300, "Enrol?", "close_ask", spoken="Send me the link.", plan=self.commit_plan("STRONG"))]
         found = metrics.commitment_metrics(early, admin)
@@ -441,7 +441,7 @@ class GoodCallTests(unittest.TestCase):
                 plan = {"mode": "say_only", "reasons": ["ask_in_window:grade_medium"], "resolves": True,
                         "commitment_level": "MEDIUM", "delivered_commitment": True}
             exchanges.append(exchange(i + 1, 40 * (i + 1) + 40, adv, intents[i], topics[i], lrn, plan))
-        exchanges[-1]["r_sec"] = 600.0
+        exchanges[-1]["r_sec"] = 840.0
         admin = {
             "commitment": {"level": "MEDIUM", "resolved": True, "asks": [{"turn": 14, "kind": "call"}], "turn": 14},
             "turn_map": [{"roleplay_turn": 14, "transcript_turn": 29}],
@@ -460,7 +460,7 @@ class GoodCallTests(unittest.TestCase):
             "exchanges": exchanges,
             "admin_log": admin,
             "guard_trips": [],
-            "roleplay_seconds": 640.0,
+            "roleplay_seconds": 880.0,
             "stop_reason": "early_exit",
             "error": None,
         }
@@ -867,7 +867,7 @@ class AdvisorTests(unittest.TestCase):
         messages = advisor.advisor_messages("strong", history, 442)
         self.assertEqual([m["role"] for m in messages], ["system", "user", "assistant", "user"])
         self.assertEqual(json.loads(messages[2]["content"]), {"intent": "greet", "topic": "", "text": "Hi Meera."})
-        self.assertTrue(messages[3]["content"].endswith("[CALL CLOCK 07:22 of about 13:00]"))
+        self.assertTrue(messages[3]["content"].endswith("[CALL CLOCK 07:22 of about 19:00]"))
         self.assertNotIn("CALL CLOCK", messages[1]["content"])
         nudged = advisor.advisor_messages("strong", history, 0, nudge="be the advisor")
         self.assertEqual(nudged[-1], {"role": "system", "content": "be the advisor"})
@@ -1144,14 +1144,14 @@ class ScriptedStandInTests(unittest.TestCase):
             await a.start("Hello? Yes, this is Meera speaking.")
             await a.next_turn(None, 10, 1)
             commit = "Let's book a call on Thursday at 7 PM with my husband so we can decide."
-            first = await a.next_turn(commit, 560, 2)
-            second = await a.next_turn("Okay.", 580, 3)
-            third = await a.next_turn("Okay.", 610, 4)
+            first = await a.next_turn(commit, 800, 2)
+            second = await a.next_turn("Okay.", 820, 3)
+            third = await a.next_turn("Okay.", 870, 4)
             return first, second, third
 
         first, second, third = asyncio.run(go())
         self.assertEqual(first.intent, "accept_callback")
-        self.assertEqual(second.intent, "other")  # next steps until 10:00
+        self.assertEqual(second.intent, "other")  # next steps until 14:00
         self.assertEqual(third.intent, "farewell")
 
     def test_the_shadow_judge_reads_the_advisors_tags_and_speaks_the_judges_json(self) -> None:
@@ -1260,7 +1260,7 @@ class JudgeTests(unittest.TestCase):
 def fake_record(level, *, fails=(), commitment="MEDIUM", slips=None, **extra):
     base = {
         "weak_line_count": 0,
-        "roleplay_seconds": 620.0,
+        "roleplay_seconds": 860.0,
         "families_delivered_count": 4,
         "commitment_level": commitment,
         "reply_words_mean": 15.0,
@@ -1536,11 +1536,13 @@ class OfflineCallTests(unittest.TestCase):
 
     def test_the_clock_makes_the_schedule_and_the_close_window_happen(self) -> None:
         settings = run.Settings(offline=True)
-        spec = CallSpec("p1_career_switcher", "v1", "average", 0, "Rohan")
+        # The default cap of 60 exchanges was sized for the 14:00 role-play; the scripted call
+        # talks fast (about 17 s an exchange), so the 20:00 one gets the same cap scaled by 20/14.
+        spec = CallSpec("p1_career_switcher", "v1", "average", 0, "Rohan", max_exchanges=86)
         record = asyncio.run(run_call(spec, run.OfflineFactory(settings).make(spec)))
         self.assertGreaterEqual(record["metrics"]["families_delivered_count"], 4)
-        self.assertGreaterEqual(record["roleplay_seconds"], 600)
-        self.assertLessEqual(record["roleplay_seconds"], 840)
+        self.assertGreaterEqual(record["roleplay_seconds"], 840)
+        self.assertLessEqual(record["roleplay_seconds"], 1200)
         self.assertEqual(record["admin_log"]["commitment"]["level"], "WEAK")
 
     def test_a_broken_advisor_is_a_recorded_failure_not_a_crash(self) -> None:
@@ -2165,8 +2167,8 @@ class IterationTwoHarnessTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 exchanges = [
-                    exchange(1, 560, text, tag),
-                    exchange(2, 580, "Great.", "other", spoken="Let's book a call Thursday.", plan=plan),
+                    exchange(1, 800, text, tag),
+                    exchange(2, 820, "Great.", "other", spoken="Let's book a call Thursday.", plan=plan),
                 ]
                 found = metrics.commitment_metrics(exchanges, admin)
                 self.assertTrue(found["commitment_earned"], text)
@@ -2182,8 +2184,8 @@ class IterationTwoHarnessTests(unittest.TestCase):
         ):
             with self.subTest(text=text):
                 exchanges = [
-                    exchange(1, 560, text, "pitch"),
-                    exchange(2, 580, "Great.", "other", spoken="Let's book a call Thursday.", plan=plan),
+                    exchange(1, 800, text, "pitch"),
+                    exchange(2, 820, "Great.", "other", spoken="Let's book a call Thursday.", plan=plan),
                 ]
                 self.assertFalse(metrics.commitment_metrics(exchanges, admin)["commitment_earned"], text)
 
@@ -2332,7 +2334,8 @@ class IterationTwoHarnessTests(unittest.TestCase):
         self.assertEqual([(m["turn"], m["kind"]) for m in checked["misfires"]], [(2, "anchor_as_offer")])
         self.assertEqual(checked["misfires_rejected"], [])
 
-    # --- D23: the simulator does not hang up before 10:00
+    # --- D23: the simulator does not hang up before the early-exit floor (10:00 then, 14:00 since
+    # the 20:00 role-play)
     def test_the_simulated_advisor_is_asked_again_when_it_says_goodbye_too_early(self) -> None:
         completions = [
             '{"intent": "farewell", "topic": "", "text": "Thanks so much, goodbye!"}',
@@ -2359,9 +2362,9 @@ class IterationTwoHarnessTests(unittest.TestCase):
         self.assertEqual(turn.retries, 1)
         self.assertEqual(len(client.calls), 2)
         self.assertIn("06:23", client.calls[1][-1]["content"])
-        self.assertIn("never say goodbye or wrap up before 10:00", advisor.advisor_system_prompt("terse"))
+        self.assertIn("never say goodbye or wrap up before 14:00", advisor.advisor_system_prompt("terse"))
 
-    def test_a_goodbye_after_ten_minutes_is_left_alone(self) -> None:
+    def test_a_goodbye_after_fourteen_minutes_is_left_alone(self) -> None:
         text = '{"intent": "farewell", "topic": "", "text": "Take care, bye!"}'
 
         class Client:
@@ -2375,7 +2378,7 @@ class IterationTwoHarnessTests(unittest.TestCase):
 
         async def go():
             await live.start("Hello?")
-            return await live.next_turn("Okay.", 640.0, 20)
+            return await live.next_turn("Okay.", 880.0, 20)
 
         turn = asyncio.run(go())
         self.assertEqual((turn.intent, Client.calls, turn.retries), ("farewell", 1, 0))

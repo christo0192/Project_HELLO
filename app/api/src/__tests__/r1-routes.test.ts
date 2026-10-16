@@ -82,11 +82,11 @@ function appFor(role: 'admin' | 'interviewer' | 'viewer', id = OWNER, tables = b
     if (fn === 'r1_send_round') {
       const settings = tables.r1_settings[0];
       if (!settings.enabled || settings.paused) return { data: { status: settings.paused ? 'paused' : 'disabled' }, error: null };
-      const committed = (tables.r1_budget_month[0]?.minutes_used ?? 0) + (tables.r1_budget_month[0]?.minutes_reserved ?? 0) + 55; if (committed > settings.monthly_cap_minutes || (settings.livekit_target === 'cloud' && committed > settings.pause_line_minutes)) return { data: { status: 'capacity_exhausted' }, error: null };
+      const committed = (tables.r1_budget_month[0]?.minutes_used ?? 0) + (tables.r1_budget_month[0]?.minutes_reserved ?? 0) + 65; if (committed > settings.monthly_cap_minutes || (settings.livekit_target === 'cloud' && committed > settings.pause_line_minutes)) return { data: { status: 'capacity_exhausted' }, error: null };
       if (tables.phone_engagements.some((x) => ['pending_prereqs', 'eligible', 'scheduled', 'dialing', 'in_call', 'reconnecting', 'awaiting_retry'].includes(x.state))) return { data: { status: 'phone_engagement_active' }, error: null };
       if (tables.call_sessions.some((s) => s.mode === 'live') && tables.job_queue.some((j) => j.name === 'phone.assessment')) return { data: { status: 'phone_assessment_pending' }, error: null };
-      const row = { id: `round-${tables.interview_rounds.length + 1}`, status: 'invited', candidate_id: args.p_candidate_id, role_id: args.p_role_id, created_by: args.p_created_by, link_token_digest: args.p_link_token_digest, expires_at: args.p_expires_at, held_minutes: 55 };
-      tables.interview_rounds.push(row); tables.r1_budget_month[0].minutes_reserved += 55;
+      const row = { id: `round-${tables.interview_rounds.length + 1}`, status: 'invited', candidate_id: args.p_candidate_id, role_id: args.p_role_id, created_by: args.p_created_by, link_token_digest: args.p_link_token_digest, expires_at: args.p_expires_at, held_minutes: 65 };
+      tables.interview_rounds.push(row); tables.r1_budget_month[0].minutes_reserved += 65;
       return { data: { status: 'ok', id: row.id, round_status: row.status, expires_at: row.expires_at }, error: null };
     }
     if (fn === 'r1_transition_round') {
@@ -335,8 +335,8 @@ describe('R1 recruiter routes', () => {
       const tables = baseTables(); arrange(tables);
       return (await request(appFor('admin', OWNER, tables).app).post(`/api/candidates/${CANDIDATE}/interview-rounds`).send({ india_location_attested: true })).status;
     };
-    // Allocation 54 < 55: refused even though the pause line is huge and the target is self-hosted.
-    expect(await outcome((t) => { Object.assign(t.r1_settings[0], { livekit_target: 'r1', monthly_cap_minutes: 54, pause_line_minutes: 100000 }); })).toBe(409);
+    // Allocation 64 < 65: refused even though the pause line is huge and the target is self-hosted.
+    expect(await outcome((t) => { Object.assign(t.r1_settings[0], { livekit_target: 'r1', monthly_cap_minutes: 64, pause_line_minutes: 100000 }); })).toBe(409);
     // A tiny pause line never gates a self-hosted R1 ...
     expect(await outcome((t) => { Object.assign(t.r1_settings[0], { livekit_target: 'r1', monthly_cap_minutes: 1100, pause_line_minutes: 1 }); })).toBe(201);
     // ... but does gate the Cloud fallback.
@@ -344,7 +344,7 @@ describe('R1 recruiter routes', () => {
   });
 
   describe('enabling R1 with the untouched default allocation (0119 repurposed monthly_cap_minutes)', () => {
-    // 0115 created monthly_cap_minutes = 4000 as a total-pool placeholder; it is now the R1 allocation (sessions x 55).
+    // 0115 created monthly_cap_minutes = 4000 as a total-pool placeholder; it is now the R1 allocation (sessions x 65).
     const untouched = () => { const tables = baseTables(); Object.assign(tables.r1_settings[0], { enabled: false }); return tables; };
 
     it('refuses enabled=true while the allocation is still the default 4000 and has never been saved', async () => {
@@ -444,7 +444,7 @@ describe('R1 recruiter routes', () => {
 
   it('reports a reissue refused for capacity as r1_capacity_exhausted, not a generic transition conflict', async () => {
     const tables = baseTables();
-    tables.interview_rounds.push({ id: ROUND, candidate_id: CANDIDATE, created_by: OWNER, status: 'invited', attempts_allowed: 2, attempts_counted: 0, version: 1, expires_at: new Date(Date.now() - 1000).toISOString(), held_minutes: 55 });
+    tables.interview_rounds.push({ id: ROUND, candidate_id: CANDIDATE, created_by: OWNER, status: 'invited', attempts_allowed: 2, attempts_counted: 0, version: 1, expires_at: new Date(Date.now() - 1000).toISOString(), held_minutes: 65 });
     const { app } = appFor('admin', OWNER, tables);
     // A lapsed link's hold stopped counting before any sweep; the database re-checks capacity when it is revived.
     rpc.mockImplementation(async (fn: string) => (fn === 'r1_transition_round' ? { data: { status: 'capacity_exhausted' }, error: null } : { data: null, error: null }));
@@ -642,10 +642,10 @@ describe('R1 internal worker routes', () => {
     };
 
     it.each([
-      [1830, 1830],
-      [1831, 1830],
-      [1845.7, 1830],
-      [3600, 1830],
+      [2190, 2190],
+      [2191, 2190],
+      [2205.7, 2190],
+      [3600, 2190],
       [1799.5, 1799.5],
       [0, 0],
     ])('accepts seconds=%s for a disconnect row and records %s', async (seconds, expected) => {
@@ -662,8 +662,8 @@ describe('R1 internal worker routes', () => {
       for (const participant_kind of ['candidate', 'manual_test']) {
         rpc.mockClear();
         const { app } = internalApp(readyTables());
-        expect((await usage(app, { participant_kind, event: 'disconnect', seconds: 1900, event_key: `k-${participant_kind}` })).status).toBe(201);
-        expect(recorded()!.p_seconds).toBe(1830);
+        expect((await usage(app, { participant_kind, event: 'disconnect', seconds: 2300, event_key: `k-${participant_kind}` })).status).toBe(201);
+        expect(recorded()!.p_seconds).toBe(2190);
       }
     });
 

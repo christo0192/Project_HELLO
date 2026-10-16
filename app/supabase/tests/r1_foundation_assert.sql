@@ -113,11 +113,13 @@ create or replace function _r1_tests.booked(p_month date) returns numeric langua
   select coalesce((select minutes_used from screening_v2.r1_budget_month where month_start = p_month), 0);
 $$;
 -- PR-CT (0123): the shipped staff dry-run and candidate notices. These blocks run FIRST, while the
--- two shipped rows are the only active templates. r1_admit_attempt accepts a consent only to the
+-- shipped rows are the only active templates. r1_admit_attempt accepts a consent only to the
 -- GREATEST active version, so the fixtures of the next block use versions ('9001', '9002') that
 -- sort above any shipped release (those are dates and start with '2') and stay authoritative
 -- there. When a later migration ships a newer release, move `release` below to it and keep
--- proving admission for BOTH audiences.
+-- proving admission for BOTH audiences. 0129 did: its release 2026-10-16.1 is 0123's two bodies
+-- verbatim except "for about 30 minutes" (was 20), so `release` is 2026-10-16.1 and the 0123
+-- release (`superseded`, 2026-10-06.1) is proved to remain, unchanged and no longer admitting.
 --
 -- REBASE RULE. PR-2b (0119) inserts its own helpers at this spot and replaces r1_admit_attempt
 -- with an r1_capacity_snapshot gate. Keep this block FIRST in the file (pinned by
@@ -170,11 +172,15 @@ $$;
 
 do $$
 declare
-  release constant text := '2026-10-06.1';
+  release constant text := '2026-10-16.1';
   candidate_locale constant text := 'en-IN';
   staff_locale constant text := 'en-IN-x-staff';
-  candidate_md5 constant text := '1a24de21b495d24c61484720c2c0dbec';
-  staff_md5 constant text := 'cbb69bcbfd332457d54edfe26c2c8016';
+  candidate_md5 constant text := '6f950eeda8dc15b59f76be0179bf3227';
+  staff_md5 constant text := 'defbb70680828d785179758cfd34606a';
+  -- The 0123 release 0129 superseded, with the digests its sign-off was bound to.
+  superseded constant text := '2026-10-06.1';
+  superseded_md5_candidate constant text := '1a24de21b495d24c61484720c2c0dbec';
+  superseded_md5_staff constant text := 'cbb69bcbfd332457d54edfe26c2c8016';
   contract constant jsonb :=
     '["ai_interview", "video_audio_recording", "ai_evaluation", "data_processing"]'::jsonb;
   owner constant uuid := 'c7000000-0000-4000-8000-000000000001';
@@ -211,6 +217,27 @@ begin
      where t.version = release
        and ((t.locale = candidate_locale and md5(t.body_md) = candidate_md5)
          or (t.locale = staff_locale and md5(t.body_md) = staff_md5))));
+  -- 0129: the superseded 0123 rows stay (immutable, still active) with the text their own
+  -- sign-off was bound to; only the greatest active version (asserted above) admits.
+  perform _r1_tests.assert('PR-CT: the superseded 0123 release keeps both rows, active and unchanged (original md5 digests)', (
+    select count(*) = 2
+       and count(*) filter (where is_active) = 2
+       and count(*) filter (where locale = candidate_locale and md5(body_md) = superseded_md5_candidate) = 1
+       and count(*) filter (where locale = staff_locale and md5(body_md) = superseded_md5_staff) = 1
+      from screening_v2.interview_round_consent_templates
+     where version = superseded));
+  -- The only change is the stated length: each current body says about 30 minutes, none says
+  -- about 20, and putting the 20 back gives the superseded body of the same audience exactly.
+  perform _r1_tests.assert('PR-CT: both current notices say about 30 minutes, neither says about 20 minutes, and nothing else changed', (
+    select count(*) = 2
+       and count(*) filter (where t.body_md like '%speaks with you by voice for about 30 minutes.%') = 2
+       and count(*) filter (where t.body_md like '%about 20 minutes%') = 0
+       and count(*) filter (where replace(t.body_md, 'about 30 minutes', 'about 20 minutes') = o.body_md
+                              and t.title = o.title and t.required_consents = o.required_consents) = 2
+      from screening_v2.interview_round_consent_templates t
+      join screening_v2.interview_round_consent_templates o
+        on o.version = superseded and o.locale = t.locale
+     where t.version = release));
 
   -- The itemised notice. Each element must be stated in each audience's text.
   for audience in
@@ -341,6 +368,14 @@ begin
     status = 'consent_missing', status);
   status := _r1_tests.ct_admit(release, candidate_locale, 5, contract, true);
   perform _r1_tests.assert('PR-CT: a withdrawn consent to the new release refuses admission',
+    status = 'consent_missing', status);
+  -- 0129: a full consent to the superseded release no longer admits, for either audience (the
+  -- person is asked to consent again to the current notice).
+  status := _r1_tests.ct_admit(superseded, candidate_locale, 6, contract);
+  perform _r1_tests.assert('PR-CT: a full consent to the superseded candidate notice refuses admission',
+    status = 'consent_missing', status);
+  status := _r1_tests.ct_admit(superseded, staff_locale, 7, contract);
+  perform _r1_tests.assert('PR-CT: a full consent to the superseded staff notice refuses admission',
     status = 'consent_missing', status);
 
   -- Leave the shared settings exactly as found for the foundation assertions below.
@@ -517,7 +552,7 @@ begin
   update screening_v2.r1_settings set paused = true;
   perform _r1_tests.assert('pause refuses admission',
     (screening_v2.r1_admit_attempt(round_i, repeat('a', 64))->>'status') = 'paused');
-  update screening_v2.r1_settings set paused = false, monthly_cap_minutes = 55, pause_line_minutes = 55;
+  update screening_v2.r1_settings set paused = false, monthly_cap_minutes = 65, pause_line_minutes = 65;
   -- 0117 evaluates the one-live-R1 rule BEFORE capacity: the counted retake above
   -- is still live, so a full cap must not mask the in-flight refusal.
   perform _r1_tests.assert('a live R1 session is refused before the cap is evaluated',
@@ -532,9 +567,9 @@ begin
    where name = 'r1.assessment' and dedup_key = 'r1.assessment:' || sid::text and max_attempts = 5;
   perform _r1_tests.assert('R1 completion enqueues exactly one deduped job', job_count = 1, job_count::text);
 
-  -- No R1 session is live any more, so this isolates the 55-minute capacity hold.
-  update screening_v2.r1_settings set monthly_cap_minutes = 55, pause_line_minutes = 55;
-  perform _r1_tests.assert('55 minute hold enforces cap',
+  -- No R1 session is live any more, so this isolates the 65-minute capacity hold.
+  update screening_v2.r1_settings set monthly_cap_minutes = 65, pause_line_minutes = 65;
+  perform _r1_tests.assert('65 minute hold enforces cap',
     (screening_v2.r1_admit_attempt(round_i, repeat('a', 64))->>'status') = 'capacity_exhausted');
   update screening_v2.r1_settings set monthly_cap_minutes = 1000, pause_line_minutes = 1000;
   insert into screening_v2.call_sessions
@@ -682,9 +717,9 @@ begin
   sent := screening_v2.r1_send_round(candidate,role_r1,owner,repeat('8',64),null,now()+interval '1 hour');
   rid := (sent->>'id')::uuid;
   select minutes_reserved into after_reserved from screening_v2.r1_budget_month where month_start=date_trunc('month',now())::date;
-  perform _r1_tests.assert('Send R1 atomically inserts a round and reserves exactly its hold', sent->>'status'='ok' and (select held_minutes=55 from screening_v2.interview_rounds where id=rid) and after_reserved=before_reserved+55, sent::text);
+  perform _r1_tests.assert('Send R1 atomically inserts a round and reserves exactly its hold', sent->>'status'='ok' and (select held_minutes=65 from screening_v2.interview_rounds where id=rid) and after_reserved=before_reserved+65, sent::text);
   perform screening_v2.r1_transition_round(rid,'cancel',1,null,null);
-  perform _r1_tests.assert('cancel releases the round hold', (select held_minutes=0 from screening_v2.interview_rounds where id=rid) and (select minutes_reserved=after_reserved-55 from screening_v2.r1_budget_month where month_start=date_trunc('month',now())::date));
+  perform _r1_tests.assert('cancel releases the round hold', (select held_minutes=0 from screening_v2.interview_rounds where id=rid) and (select minutes_reserved=after_reserved-65 from screening_v2.r1_budget_month where month_start=date_trunc('month',now())::date));
   -- The view must include sessions with no usage row (session-timestamp fallback).
   perform _r1_tests.assert('estimate has session timestamp fallback', exists(select 1 from screening_v2.v_webrtc_minutes_estimate where month_start=date_trunc('month',now())::date));
   perform _r1_tests.assert('ledger has required idempotency and upper-bound constraints', exists(select 1 from pg_constraint where conrelid='screening_v2.r1_usage_ledger'::regclass and conname='chk_r1_usage_event_bounds') and exists(select 1 from pg_indexes where schemaname='screening_v2' and indexname='uq_r1_usage_ledger_session_event_key'));
@@ -717,21 +752,21 @@ begin
   snap := screening_v2.r1_capacity_snapshot(now(), 0);
   -- Mode B: the pool check refuses the second hold because the first still counts.
   update screening_v2.r1_settings
-     set pause_line_minutes = ceil((snap->>'pool_committed')::numeric) + 54;
+     set pause_line_minutes = ceil((snap->>'pool_committed')::numeric) + 64;
   second_sent := screening_v2.r1_send_round(second_candidate, role_r1, owner,
     encode(sha256('r1-reservation-two'::bytea), 'hex'), null, now() + interval '1 hour');
   -- Mode A: the pause line is irrelevant, the R1 allocation counts the hold.
   update screening_v2.r1_settings
      set livekit_target = 'r1', pause_line_minutes = 1,
-         monthly_cap_minutes = ceil((snap->>'r1_committed')::numeric) + 54;
+         monthly_cap_minutes = ceil((snap->>'r1_committed')::numeric) + 64;
   third_sent := screening_v2.r1_send_round(second_candidate, role_r1, owner,
     encode(sha256('r1-reservation-three'::bytea), 'hex'), null, now() + interval '1 hour');
   update screening_v2.r1_settings
-     set monthly_cap_minutes = ceil((snap->>'r1_committed')::numeric) + 55;
+     set monthly_cap_minutes = ceil((snap->>'r1_committed')::numeric) + 65;
   fourth_sent := screening_v2.r1_send_round(second_candidate, role_r1, owner,
     encode(sha256('r1-reservation-four'::bytea), 'hex'), null, now() + interval '1 hour');
   perform _r1_tests.assert('outstanding holds count on top of a dominant estimate',
-    first_sent->>'status' = 'ok' and (snap->>'outstanding_holds')::numeric >= 55
+    first_sent->>'status' = 'ok' and (snap->>'outstanding_holds')::numeric >= 65
       and (snap->>'pool_guard')::numeric > (snap->>'r1_committed')::numeric
       and second_sent->>'status' = 'capacity_exhausted'
       and third_sent->>'status' = 'capacity_exhausted'
@@ -762,7 +797,7 @@ begin
   rid := (sent->>'id')::uuid;
   select version into version_before from screening_v2.interview_rounds where id=rid;
   perform _r1_tests.assert('Send persists the hold originating month',
-    sent->>'status'='ok' and (select held_minutes=55 and hold_month=month_m from screening_v2.interview_rounds where id=rid), sent::text);
+    sent->>'status'='ok' and (select held_minutes=65 and hold_month=month_m from screening_v2.interview_rounds where id=rid), sent::text);
   perform screening_v2.r1_transition_round(rid,'cancel',version_before,null,null,'2030-02-02T00:00:00Z');
   perform _r1_tests.assert('cross-month cancel releases only the originating month',
     (select held_minutes=0 from screening_v2.interview_rounds where id=rid)
@@ -785,10 +820,10 @@ $$;
 
 -- Finding 1 (P1): the R1 allocation is not expressible under the single rule.
 -- The pool is dominated by 12 h of legacy browser (1441 estimated minutes, x1.15 =
--- 1657.15), far above a December-style 20 x 55 = 1100 allocation. Mode A must
+-- 1657.15), far above a December-style 20 x 65 = 1300 allocation. Mode A must
 -- still admit within its allocation, Mode B must apply the pause line, and the
 -- allocation must bind exactly in both: with no R1 minutes in the month the
--- allocation edge is the outstanding holds + 55.
+-- allocation edge is the outstanding holds + 65.
 do $$
 declare
   m constant timestamptz := '2034-03-15T12:00:00Z';
@@ -800,14 +835,14 @@ begin
   perform _r1_tests.cand(501, 'allocation edge refused');
   perform _r1_tests.cand(502, 'allocation edge ok');
   perform _r1_tests.add_session(_r1_tests.u(301), _r1_tests.u(11), null, '2034-03-05T00:00:00Z', '2034-03-05T12:00:00Z');
-  perform _r1_tests.settings('r1', 1100, 1100);
+  perform _r1_tests.settings('r1', 1300, 1300);
   mode_a := _r1_tests.send(_r1_tests.u(101), 'p1-mode-a', m);
   perform _r1_tests.cancel(mode_a);
-  perform _r1_tests.settings('cloud', 1100, 1100);
+  perform _r1_tests.settings('cloud', 1300, 1300);
   mode_b := _r1_tests.send(_r1_tests.u(102), 'p1-mode-b', m);
-  perform _r1_tests.settings('r1', 54, 100000);
+  perform _r1_tests.settings('r1', 64, 100000);
   too_small := _r1_tests.send(_r1_tests.u(103), 'p1-too-small', m);
-  edge := _r1_tests.snap(m, 55);
+  edge := _r1_tests.snap(m, 65);
   need := ceil(_r1_tests.num(edge, 'r1_committed'));
   perform _r1_tests.settings('r1', need - 1, 1);
   edge_refused := _r1_tests.send(_r1_tests.u(501), 'p1-edge-refused', m);
@@ -816,7 +851,7 @@ begin
   perform _r1_tests.assert('finding 1: R1 allocation is independent of the Cloud pool (Mode A ignores the pause line, Mode B applies both, the allocation binds exactly in both)',
     mode_a->>'status' = 'ok' and mode_b->>'status' = 'capacity_exhausted' and too_small->>'status' = 'capacity_exhausted'
       and edge_refused->>'status' = 'capacity_exhausted' and edge_ok->>'status' = 'ok'
-      and _r1_tests.net(edge, 'r1_committed') = 0 and need = _r1_tests.num(edge, 'outstanding_holds') + 55,
+      and _r1_tests.net(edge, 'r1_committed') = 0 and need = _r1_tests.num(edge, 'outstanding_holds') + 65,
     jsonb_build_array(mode_a, mode_b, too_small, edge_refused, edge_ok, edge)::text);
   perform _r1_tests.cancel(edge_ok);
 end;
@@ -824,10 +859,9 @@ $$;
 
 -- Finding 2 (P2): an admitted-but-unmetered live R1 is masked by
 -- greatest(used, guard) when phone/legacy dominates. One live R1 session with no
--- metering counts at least its 55-minute charge, a booked charge that counts once
--- (never x1.15): 1441 x 1.15 + 55 = 1712.15 (net of holds), so a Send needs
--- 1767.15; 0117 counted that session as 0 (1657.15 net, 1712.15 with the Send's
--- hold).
+-- metering counts at least its 65-minute charge, a booked charge that counts once
+-- (never x1.15): 1441 x 1.15 + 65 = 1722.15 (net of holds), so a Send needs
+-- 1787.15; 0117 counted that session as 0 (1657.15 net of holds).
 do $$
 declare
   owner constant uuid := '10000000-0000-4000-8000-000000000001';
@@ -844,10 +878,10 @@ begin
             encode(sha256('r1-capacity-p2-live-round'::bytea), 'hex'), '2034-04-30T00:00:00Z', owner, 'in_progress');
   perform _r1_tests.add_session(_r1_tests.u(302), _r1_tests.u(11), null, '2034-04-02T00:00:00Z', '2034-04-02T12:00:00Z');
   perform _r1_tests.add_session(_r1_tests.u(303), _r1_tests.u(104), round_live, '2034-04-10T08:00:00Z', null);
-  insert into screening_v2.r1_budget_month(month_start, minutes_used) values ('2034-04-01', 55)
-    on conflict (month_start) do update set minutes_used = 55;
+  insert into screening_v2.r1_budget_month(month_start, minutes_used) values ('2034-04-01', 65)
+    on conflict (month_start) do update set minutes_used = 65;
   before_send := _r1_tests.snap(m, 0);
-  at_send := _r1_tests.snap(m, 55);
+  at_send := _r1_tests.snap(m, 65);
   need := ceil(_r1_tests.num(at_send, 'pool_committed'));
   perform _r1_tests.settings('cloud', 100000, need - 1);
   refused := _r1_tests.send(_r1_tests.u(105), 'p2-refused', m);
@@ -855,9 +889,9 @@ begin
   admitted := _r1_tests.send(_r1_tests.u(106), 'p2-control', m);
   perform _r1_tests.assert('finding 2: a live unmetered R1 session is counted, not masked by the dominant pool estimate',
     refused->>'status' = 'capacity_exhausted' and admitted->>'status' = 'ok'
-      and _r1_tests.num(before_send, 'live_unmetered_minutes') = 55
-      and abs(_r1_tests.net(at_send, 'pool_committed') - 1712.15) < 0.001
-      and abs(_r1_tests.net(at_send, 'r1_committed') - 55) < 0.001,
+      and _r1_tests.num(before_send, 'live_unmetered_minutes') = 65
+      and abs(_r1_tests.net(at_send, 'pool_committed') - 1722.15) < 0.001
+      and abs(_r1_tests.net(at_send, 'r1_committed') - 65) < 0.001,
     jsonb_build_array(refused, admitted, at_send)::text);
   perform _r1_tests.fail_live();
   perform _r1_tests.cancel(admitted);
@@ -886,15 +920,15 @@ begin
       and abs(_r1_tests.num(s, 'r1_test_minutes') - 10 / 60.0) < 0.001
       and abs(_r1_tests.num(s, 'pool_pure') - (44 + 10 / 60.0)) < 0.001,
     s::text);
-  -- A LIVE session with a preflight row and no metering still counts at its 55-minute floor.
+  -- A LIVE session with a preflight row and no metering still counts at its 65-minute floor.
   round_live := _r1_tests.dead_round(605, _r1_tests.u(107));
   perform _r1_tests.add_session(_r1_tests.u(705), _r1_tests.u(107), round_live, '2035-03-12T09:00:00Z', null);
   insert into screening_v2.r1_usage_ledger(session_id, round_id, participant_kind, event, seconds, event_key, occurred_at)
     values (_r1_tests.u(705), round_live, 'preflight', 'usage', 10, 'r1-live-preflight', '2035-03-12T09:00:00Z');
   s_live := _r1_tests.snap('2035-03-15T12:00:00Z', 0);
   perform _r1_tests.assert('finding 2: a preflight row does not replace the live floor of an unmetered live session',
-    abs(_r1_tests.num(s_live, 'live_unmetered_minutes') - 55) < 0.001
-      and abs(_r1_tests.num(s_live, 'r1_actual') - (44 + 55)) < 0.001
+    abs(_r1_tests.num(s_live, 'live_unmetered_minutes') - 65) < 0.001
+      and abs(_r1_tests.num(s_live, 'r1_actual') - (44 + 65)) < 0.001
       and abs(_r1_tests.num(s_live, 'r1_test_minutes') - 20 / 60.0) < 0.001,
     s_live::text);
   perform _r1_tests.fail_live();
@@ -902,15 +936,15 @@ end;
 $$;
 
 -- Finding 3 (P2): converting a Send hold never re-checked the pool. The hold is
--- already counted, and the converted start exchanges it for a booked 55 plus the
--- new live session's 55-minute floor, which count as 55 together (a floor is a
--- booked charge, never x1.15): the start needs exactly the hold it converts, 55
+-- already counted, and the converted start exchanges it for a booked 65 plus the
+-- new live session's 65-minute floor, which count as 65 together (a floor is a
+-- booked charge, never x1.15): the start needs exactly the hold it converts, 65
 -- (net of holds). A start that fits at Send time therefore fits again (see the
 -- first-of-month regression below). Boundaries come from the snapshot of that
 -- exact change: refused one minute below, admitted at it, in Mode A (allocation
 -- only; the pause line of 1 is ignored) and Mode B (pause line, on a second hold
--- so each edge admits once). Mutants killed: no check on the held path, +55 on
--- the held path (needs 110), and Mode A applying the pause line.
+-- so each edge admits once). Mutants killed: no check on the held path, +65 on
+-- the held path (needs 130), and Mode A applying the pause line.
 do $$
 declare
   m constant timestamptz := '2034-05-15T12:00:00Z';
@@ -924,7 +958,7 @@ begin
   sent := _r1_tests.send(_r1_tests.u(108), 'p3-held', m);
   rid := (sent->>'id')::uuid;
   perform _r1_tests.consent(rid);
-  conversion := _r1_tests.snap(m, -55, 55, 55);
+  conversion := _r1_tests.snap(m, -65, 65, 65);
   need := ceil(_r1_tests.num(conversion, 'r1_committed'));
   -- Phone grew after the Send: the pool is above the pause line when the link is used.
   perform _r1_tests.settings('cloud', 100000, need - 1);
@@ -939,7 +973,7 @@ begin
   sent_b := _r1_tests.send(_r1_tests.u(503), 'p3-held-b', m);
   rid_b := (sent_b->>'id')::uuid;
   perform _r1_tests.consent(rid_b);
-  conversion_b := _r1_tests.snap(m, -55, 55, 55);
+  conversion_b := _r1_tests.snap(m, -65, 65, 65);
   need_b := ceil(_r1_tests.num(conversion_b, 'pool_committed'));
   perform _r1_tests.settings('cloud', 100000, need_b - 1);
   cloud_below := _r1_tests.admit(rid_b, 'p3-cloud-below', m);
@@ -949,8 +983,8 @@ begin
     sent->>'status' = 'ok' and cloud->>'status' = 'capacity_exhausted'
       and allocation->>'status' = 'capacity_exhausted' and mode_a->>'status' = 'ok'
       and cloud_below->>'status' = 'capacity_exhausted' and cloud_edge->>'status' = 'ok'
-      and _r1_tests.net(conversion, 'r1_committed') = 55
-      and _r1_tests.net(conversion, 'pool_committed') = 55
+      and _r1_tests.net(conversion, 'r1_committed') = 65
+      and _r1_tests.net(conversion, 'pool_committed') = 65
       and need = _r1_tests.num(conversion, 'outstanding_holds'),
     jsonb_build_array(sent, cloud, allocation, mode_a, cloud_below, cloud_edge, conversion)::text);
   perform _r1_tests.fail_live();
@@ -958,11 +992,11 @@ begin
 end;
 $$;
 
--- Finding 3b: the booked 55 of a start counts when the month is dominated by booked
+-- Finding 3b: the booked 65 of a start counts when the month is dominated by booked
 -- minutes rather than metered ones (U-dominated, the usual case). With 1000
--- booked, converting a hold needs 1000 + 55 = 1055 (net of holds), and a retake
--- after a counted first attempt needs 1055 + 55 = 1110. Mutant killed: a start
--- that books nothing (it would fit at 1000 and 1055).
+-- booked, converting a hold needs 1000 + 65 = 1065 (net of holds), and a retake
+-- after a counted first attempt needs 1065 + 65 = 1130. Mutant killed: a start
+-- that books nothing (it would fit at 1000 and 1065).
 do $$
 declare
   m constant timestamptz := '2037-01-15T12:00:00Z';
@@ -976,7 +1010,7 @@ begin
   sent := _r1_tests.send(_r1_tests.u(514), 'p3b', m);
   rid := (sent->>'id')::uuid;
   perform _r1_tests.consent(rid);
-  conversion := _r1_tests.snap(m, -55, 55, 55);
+  conversion := _r1_tests.snap(m, -65, 65, 65);
   need := ceil(_r1_tests.num(conversion, 'r1_committed'));
   perform _r1_tests.settings('r1', need - 1, 1);
   refused := _r1_tests.admit(rid, 'p3b-refused', m);
@@ -985,18 +1019,18 @@ begin
   perform _r1_tests.fail_live();
   update screening_v2.interview_round_attempts set counted = true where session_id = (admitted->>'session_id')::uuid;
   update screening_v2.interview_rounds set attempts_counted = 1 where id = rid;
-  retake_state := _r1_tests.snap(m, 0, 55, 55);
+  retake_state := _r1_tests.snap(m, 0, 65, 65);
   need_retake := ceil(_r1_tests.num(retake_state, 'r1_committed'));
   perform _r1_tests.settings('r1', need_retake - 1, 1);
   retake_refused := _r1_tests.admit(rid, 'p3b-retake-refused', m);
   perform _r1_tests.settings('r1', need_retake, 1);
   retake_ok := _r1_tests.admit(rid, 'p3b-retake-edge', m);
-  perform _r1_tests.assert('finding 3b: a start books its 55 (conversion and retake) when booked minutes dominate',
+  perform _r1_tests.assert('finding 3b: a start books its 65 (conversion and retake) when booked minutes dominate',
     refused->>'status' = 'capacity_exhausted' and admitted->>'status' = 'ok'
       and retake_refused->>'status' = 'capacity_exhausted' and retake_ok->>'status' = 'ok'
-      and abs(_r1_tests.net(conversion, 'r1_committed') - 1055) < 0.001
-      and abs(_r1_tests.net(retake_state, 'r1_committed') - 1110) < 0.001
-      and _r1_tests.booked('2037-01-01') = 1110,
+      and abs(_r1_tests.net(conversion, 'r1_committed') - 1065) < 0.001
+      and abs(_r1_tests.net(retake_state, 'r1_committed') - 1130) < 0.001
+      and _r1_tests.booked('2037-01-01') = 1130,
     jsonb_build_array(refused, admitted, retake_refused, retake_ok, conversion, retake_state)::text);
   perform _r1_tests.fail_live();
   perform _r1_tests.cancel(sent);
@@ -1004,12 +1038,12 @@ end;
 $$;
 
 -- Finding 1b (P2, restart): an uncounted restart used to be checked at +0 on the
--- state BEFORE it. When metered minutes dominate the booked 55 (A-dominated), the
+-- state BEFORE it. When metered minutes dominate the booked 65 (A-dominated), the
 -- restart's live session then overshot the allocation. A first start that ran 30
 -- minutes and failed without counting leaves 60 metered minutes (x1.15 = 69, over
--- the 55 booked). The restart re-uses the booked 55 (charged once: no second 55,
+-- the 65 booked). The restart re-uses the booked 65 (charged once: no second 65,
 -- no hold left outstanding) and adds its live floor, a booked charge that counts
--- once: 1.15 x 60 + 55 = 124, net of holds. A check on the state before the
+-- once: 1.15 x 60 + 65 = 134, net of holds. A check on the state before the
 -- restart needed only 69.
 do $$
 declare
@@ -1028,41 +1062,41 @@ begin
          status = 'failed', terminal_reason = 'provider_error'
    where id = (first_start->>'session_id')::uuid;
   before_restart := _r1_tests.snap(m, 0);
-  restart_state := _r1_tests.snap(m, -55, 55, 55);
+  restart_state := _r1_tests.snap(m, -65, 65, 65);
   need := ceil(_r1_tests.num(restart_state, 'r1_committed'));
   perform _r1_tests.settings('r1', need - 1, 1);
   refused := _r1_tests.admit(rid, 'e-restart-refused', m);
   perform _r1_tests.settings('r1', need, 1);
   admitted := _r1_tests.admit(rid, 'e-restart-edge', m);
-  perform _r1_tests.assert('finding 1b: an A-dominated restart is checked after its live session starts and charged once (one booked 55, one live floor)',
+  perform _r1_tests.assert('finding 1b: an A-dominated restart is checked after its live session starts and charged once (one booked 65, one live floor)',
     first_start->>'status' = 'ok' and refused->>'status' = 'capacity_exhausted' and admitted->>'status' = 'ok'
       and (admitted->>'attempt_number')::integer = 1
       and _r1_tests.num(before_restart, 'uncounted_charges') = 1
       and abs(_r1_tests.num(before_restart, 'r1_actual') - 60) < 0.001
       and abs(_r1_tests.net(before_restart, 'r1_committed') - 69) < 0.001
-      and abs(_r1_tests.net(restart_state, 'r1_committed') - 124) < 0.001
-      and _r1_tests.booked('2036-03-01') = 55,
+      and abs(_r1_tests.net(restart_state, 'r1_committed') - 134) < 0.001
+      and _r1_tests.booked('2036-03-01') = 65,
     jsonb_build_array(first_start, refused, admitted, before_restart, restart_state)::text);
-  -- The restart ran 30 minutes and ended too; attempt 1 counts. A retake books a fresh 55
-  -- AND adds its live floor; here the metered minutes dominate the booked ones (110), so
-  -- the floor shows on top of them: 1.15 x 120 + 55 = 193.
+  -- The restart ran 30 minutes and ended too; attempt 1 counts. A retake books a fresh 65
+  -- AND adds its live floor; here the metered minutes dominate the booked ones (130), so
+  -- the floor shows on top of them: 1.15 x 120 + 65 = 203.
   update screening_v2.call_sessions
      set started_at = '2036-03-11T09:00:00Z', ended_at = '2036-03-11T09:30:00Z',
          status = 'failed', terminal_reason = 'provider_error'
    where id = (admitted->>'session_id')::uuid;
   update screening_v2.interview_round_attempts set counted = true where session_id = (admitted->>'session_id')::uuid;
   update screening_v2.interview_rounds set attempts_counted = 1 where id = rid;
-  retake_state := _r1_tests.snap(m, 0, 55, 55);
+  retake_state := _r1_tests.snap(m, 0, 65, 65);
   need_retake := ceil(_r1_tests.num(retake_state, 'r1_committed'));
   perform _r1_tests.settings('r1', need_retake - 1, 1);
   retake_refused := _r1_tests.admit(rid, 'e-retake-refused', m);
   perform _r1_tests.settings('r1', need_retake, 1);
   retake_ok := _r1_tests.admit(rid, 'e-retake-edge', m);
-  perform _r1_tests.assert('finding 1b: a retake is checked after its live session starts (fresh 55 booked plus the live floor)',
+  perform _r1_tests.assert('finding 1b: a retake is checked after its live session starts (fresh 65 booked plus the live floor)',
     retake_refused->>'status' = 'capacity_exhausted' and retake_ok->>'status' = 'ok'
       and (retake_ok->>'attempt_number')::integer = 2
-      and abs(_r1_tests.net(retake_state, 'r1_committed') - 193) < 0.001
-      and _r1_tests.booked('2036-03-01') = 110,
+      and abs(_r1_tests.net(retake_state, 'r1_committed') - 203) < 0.001
+      and _r1_tests.booked('2036-03-01') = 130,
     jsonb_build_array(retake_refused, retake_ok, retake_state)::text);
   perform _r1_tests.fail_live();
   perform _r1_tests.cancel(sent);
@@ -1071,10 +1105,10 @@ $$;
 
 -- Finding 4 (P2): outstanding holds are month-agnostic. A July hold whose link is
 -- still alive in September must count against a September Send. A hold whose link
--- has LAPSED must not, even before any sweep (stored held_minutes stays 55): it
+-- has LAPSED must not, even before any sweep (stored held_minutes stays 65): it
 -- would otherwise shrink every later month's allocation until something sweeps.
 -- Reissuing a lapsed link revives its hold, so it re-checks capacity as a fresh
--- 55; reissuing a link that is still alive changes nothing and is not checked.
+-- 65; reissuing a link that is still alive changes nothing and is not checked.
 do $$
 declare
   july constant timestamptz := '2034-07-15T12:00:00Z';
@@ -1094,13 +1128,13 @@ begin
   held_id := (held->>'id')::uuid;
   lapsed_id := (lapsed->>'id')::uuid;
   h1 := _r1_tests.num(_r1_tests.snap(september, 0), 'outstanding_holds');
-  at_send := _r1_tests.snap(september, 55);
+  at_send := _r1_tests.snap(september, 65);
   need := ceil(_r1_tests.num(at_send, 'r1_committed'));
   perform _r1_tests.settings('r1', need - 1, 100000);
   refused := _r1_tests.send(_r1_tests.u(110), 'p4-september-refused', september);
   perform _r1_tests.settings('r1', need, 100000);
   admitted := _r1_tests.send(_r1_tests.u(111), 'p4-september-control', september);
-  at_reissue := _r1_tests.snap(september, 55);
+  at_reissue := _r1_tests.snap(september, 65);
   need_reissue := ceil(_r1_tests.num(at_reissue, 'r1_committed'));
   perform _r1_tests.settings('r1', need_reissue - 1, 100000);
   reissue_refused := screening_v2.r1_transition_round(lapsed_id, 'reissue',
@@ -1115,10 +1149,10 @@ begin
     (select version from screening_v2.interview_rounds where id = held_id),
     encode(sha256('r1-capacity-p4-reissue-c'::bytea), 'hex'), september + interval '5 days', september);
   perform _r1_tests.assert('finding 4: a prior-month hold with a live link is counted, a lapsed link is not (even unswept), and reissuing a lapsed link re-checks capacity',
-    held->>'status' = 'ok' and lapsed->>'status' = 'ok' and h1 - h0 = 55
-      and (select held_minutes = 55 and status = 'invited' from screening_v2.interview_rounds where id = lapsed_id)
+    held->>'status' = 'ok' and lapsed->>'status' = 'ok' and h1 - h0 = 65
+      and (select held_minutes = 65 and status = 'invited' from screening_v2.interview_rounds where id = lapsed_id)
       and refused->>'status' = 'capacity_exhausted' and admitted->>'status' = 'ok'
-      and need = h1 + 55
+      and need = h1 + 65
       and reissue_refused->>'status' = 'capacity_exhausted' and reissue_ok->>'status' = 'ok'
       and live_reissue->>'status' = 'ok',
     jsonb_build_array(held, lapsed, h0, h1, refused, admitted, reissue_refused, reissue_ok, live_reissue)::text);
@@ -1145,7 +1179,7 @@ begin
   update screening_v2.r1_settings
      set dashboard_minutes = 2000, dashboard_read_at = '2034-10-02T00:00:00Z', dashboard_estimate_baseline = 1441;
   perform _r1_tests.add_session(_r1_tests.u(306), _r1_tests.u(11), null, '2034-10-10T00:00:00Z', '2034-10-10T08:00:00Z');
-  at_send := _r1_tests.snap(m, 55);
+  at_send := _r1_tests.snap(m, 65);
   need := ceil(_r1_tests.num(at_send, 'pool_committed'));
   update screening_v2.r1_settings set pause_line_minutes = need - 1;
   refused := _r1_tests.send(_r1_tests.u(112), 'p5-refused', m);
@@ -1161,7 +1195,7 @@ $$;
 
 -- Finding 6 (P3): a prior-month dashboard reading is stale, and the authoritative
 -- dashboard figure is not multiplied by 1.15. The stale November reading of 3990
--- WOULD refuse a December Send at a 4000 line if it applied (3990 + 55 = 4045),
+-- WOULD refuse a December Send at a 4000 line if it applied (3990 + 65 = 4055),
 -- so admitting proves it is ignored (0117 applied it x1.15 = 4588). In the
 -- reading's own month the guard is exactly 3000 (not 3450) with no growth.
 do $$
@@ -1176,14 +1210,14 @@ begin
   perform _r1_tests.settings('cloud', 100000, 4000);
   update screening_v2.r1_settings
      set dashboard_minutes = 3990, dashboard_read_at = '2034-11-20T12:00:00Z', dashboard_estimate_baseline = 0;
-  stale_state := _r1_tests.snap(december, 55);
+  stale_state := _r1_tests.snap(december, 65);
   stale := _r1_tests.send(_r1_tests.u(114), 'p6-stale', december);
   -- Holds are global: release this one before the next scenario counts holds.
   perform _r1_tests.cancel(stale);
   perform _r1_tests.settings('cloud', 100000, 100000);
   update screening_v2.r1_settings
      set dashboard_minutes = 3000, dashboard_read_at = '2035-01-02T12:00:00Z', dashboard_estimate_baseline = 0;
-  at_send := _r1_tests.snap(january, 55);
+  at_send := _r1_tests.snap(january, 65);
   need := ceil(_r1_tests.num(at_send, 'pool_committed'));
   update screening_v2.r1_settings set pause_line_minutes = need;
   exact_fit := _r1_tests.send(_r1_tests.u(115), 'p6-exact', january);
@@ -1218,7 +1252,7 @@ begin
   perform _r1_tests.settings('cloud', 100000, 100000);
   update screening_v2.r1_settings
      set dashboard_minutes = 100, dashboard_read_at = '2035-06-02T00:00:00Z', dashboard_estimate_baseline = 1441;
-  a_state := _r1_tests.snap(m, 55);
+  a_state := _r1_tests.snap(m, 65);
   need_a := ceil(_r1_tests.num(a_state, 'pool_committed'));
   update screening_v2.r1_settings set pause_line_minutes = need_a - 1;
   a_refused := _r1_tests.send(_r1_tests.u(512), 'floor-a-refused', m);
@@ -1242,13 +1276,13 @@ end;
 $$;
 
 -- Dashboard baseline and live floors. A live R1 session that has not metered yet
--- counts at its 55-minute floor, which the metering later REPLACES. If the
+-- counts at its 65-minute floor, which the metering later REPLACES. If the
 -- baseline contained the floor, the replacement would show as negative growth and
 -- pull the guard under the authoritative reading. The baseline is therefore taken
 -- net of live floors: reading 3000 stamped with a live session gives baseline 0
--- and guard 3000 + 55 = 3055 (the floor is a booked charge: counted once, never
+-- and guard 3000 + 65 = 3065 (the floor is a booked charge: counted once, never
 -- x1.15); after 5 + 5 metered minutes it is 3000 + 1.15 x 10 = 3011.5, never under
--- 3000 (the floored baseline gave 2948.25).
+-- 3000 (the floored baseline gave 3000 + 1.15 x (10 - 65) = 2936.75).
 do $$
 declare
   owner constant uuid := '10000000-0000-4000-8000-000000000001';
@@ -1267,7 +1301,7 @@ begin
   select dashboard_estimate_baseline into stored from screening_v2.r1_settings;
   -- A reading with NO stored baseline (entered under 0117 and not migrated, or written around the RPC)
   -- takes "the estimate now, net of live floors" as its baseline, so the live floor still adds on top:
-  -- 3000 + 55. Ignoring the NULL (greatest() skips NULLs) would give 3000.
+  -- 3000 + 65. Ignoring the NULL (greatest() skips NULLs) would give 3000.
   update screening_v2.r1_settings set dashboard_estimate_baseline = null;
   null_state := _r1_tests.snap(m, 0);
   update screening_v2.r1_settings set dashboard_estimate_baseline = stored;
@@ -1277,12 +1311,12 @@ begin
   metered_state := _r1_tests.snap(m, 0);
   perform _r1_tests.assert('dashboard baseline excludes live floors and the guard never falls below the authoritative reading',
     stamp->>'status' = 'ok' and stored = 0
-      and abs(_r1_tests.num(live_state, 'pool_guard') - 3055) < 0.001
+      and abs(_r1_tests.num(live_state, 'pool_guard') - 3065) < 0.001
       and abs(_r1_tests.num(metered_state, 'pool_guard') - 3011.5) < 0.001
       and _r1_tests.num(metered_state, 'pool_guard') >= 3000,
     jsonb_build_array(stamp, stored, live_state, metered_state)::text);
   perform _r1_tests.assert('a reading with no stored baseline takes the estimate now (net of live floors) as its baseline',
-    (null_state->>'dashboard_applies')::boolean and abs(_r1_tests.num(null_state, 'pool_guard') - 3055) < 0.001,
+    (null_state->>'dashboard_applies')::boolean and abs(_r1_tests.num(null_state, 'pool_guard') - 3065) < 0.001,
     null_state::text);
   perform _r1_tests.fail_live();
 end;
@@ -1292,7 +1326,7 @@ $$;
 -- R1 session minutes (the plan formula already subtracts planned tests from the
 -- session cap). 12 x 30 test minutes + 10 s of preflight in a month: the pool
 -- estimate carries them (x1.15), the R1 allocation does not, so a Send fits an
--- allocation of exactly the outstanding holds + 55.
+-- allocation of exactly the outstanding holds + 65.
 do $$
 declare
   m constant timestamptz := '2036-05-15T12:00:00Z';
@@ -1303,7 +1337,7 @@ begin
     select 'manual_test', 'usage', 1800, 'r1-kinds-test-' || n::text, '2036-05-10T10:00:00Z' from generate_series(1, 12) n;
   insert into screening_v2.r1_usage_ledger(participant_kind, event, seconds, event_key, occurred_at)
     values ('preflight', 'usage', 10, 'r1-kinds-preflight', '2036-05-10T10:00:00Z');
-  state := _r1_tests.snap(m, 55);
+  state := _r1_tests.snap(m, 65);
   need := ceil(_r1_tests.num(state, 'r1_committed'));
   perform _r1_tests.settings('r1', need, 1);
   admitted := _r1_tests.send(_r1_tests.u(507), 'kinds', m);
@@ -1313,7 +1347,7 @@ begin
       and abs(_r1_tests.num(state, 'r1_test_minutes') - (360 + 10 / 60.0)) < 0.001
       and abs(_r1_tests.num(state, 'pool_pure') - (360 + 10 / 60.0)) < 0.001
       and abs(_r1_tests.num(state, 'pool_guard') - (360 + 10 / 60.0) * 1.15) < 0.001
-      and need = _r1_tests.num(state, 'outstanding_holds') + 55,
+      and need = _r1_tests.num(state, 'outstanding_holds') + 65,
     jsonb_build_array(admitted, state)::text);
   perform _r1_tests.cancel(admitted);
 end;
@@ -1321,8 +1355,8 @@ $$;
 
 -- r1_committed = greatest(minutes_used, 1.15 x r1_actual) + holds: the booked
 -- minutes and the metered ones describe the SAME sessions, so they must not add.
--- 55 booked and a 10-minute session in the month: 55 (not 66.5). A sum would
--- need 121.5; the edge is exactly holds + 55 + 55.
+-- 65 booked and a 10-minute session in the month: 65 (not 65 + 11.5 = 76.5). A sum
+-- would need 141.5; the edge is exactly holds + 65 + 65.
 do $$
 declare
   m constant timestamptz := '2036-06-15T12:00:00Z';
@@ -1333,9 +1367,9 @@ begin
   perform _r1_tests.add_session(_r1_tests.u(703), _r1_tests.u(11), round_k, '2036-06-10T09:00:00Z', '2036-06-10T09:10:00Z');
   insert into screening_v2.r1_usage_ledger(session_id, round_id, participant_kind, event, seconds, event_key, occurred_at)
     values (_r1_tests.u(703), round_k, 'agent', 'usage', 600, 'r1-greatest-agent', '2036-06-10T09:10:00Z');
-  insert into screening_v2.r1_budget_month(month_start, minutes_used) values ('2036-06-01', 55)
-    on conflict (month_start) do update set minutes_used = 55;
-  state := _r1_tests.snap(m, 55);
+  insert into screening_v2.r1_budget_month(month_start, minutes_used) values ('2036-06-01', 65)
+    on conflict (month_start) do update set minutes_used = 65;
+  state := _r1_tests.snap(m, 65);
   need := ceil(_r1_tests.num(state, 'r1_committed'));
   perform _r1_tests.settings('r1', need - 1, 1);
   refused := _r1_tests.send(_r1_tests.u(508), 'greatest-refused', m);
@@ -1343,8 +1377,8 @@ begin
   admitted := _r1_tests.send(_r1_tests.u(508), 'greatest-ok', m);
   perform _r1_tests.assert('r1_committed takes the greater of booked and 1.15 x metered minutes, never their sum',
     refused->>'status' = 'capacity_exhausted' and admitted->>'status' = 'ok'
-      and abs(_r1_tests.net(state, 'r1_committed') - 55) < 0.001
-      and need = _r1_tests.num(state, 'outstanding_holds') + 55 + 55,
+      and abs(_r1_tests.net(state, 'r1_committed') - 65) < 0.001
+      and need = _r1_tests.num(state, 'outstanding_holds') + 65 + 65,
     jsonb_build_array(refused, admitted, state)::text);
   perform _r1_tests.cancel(admitted);
 end;
@@ -1383,7 +1417,7 @@ begin
     and v.outstanding_holds = (snap->>'outstanding_holds')::numeric
     and v.r1_headroom = (snap->>'r1_headroom')::numeric
     and v.pool_headroom = (snap->>'pool_headroom')::numeric
-    and v.pool_check_applies and v.outstanding_holds >= 55
+    and v.pool_check_applies and v.outstanding_holds >= 65
     and v.r1_headroom = v.monthly_cap_minutes - v.r1_committed
     and v.pool_headroom = v.pause_line_minutes - v.pool_committed,
     snap::text);
@@ -1404,14 +1438,14 @@ end;
 $$;
 
 -- Finding 8 (P3) and the no-show rule (plan 5.11: "not counted; the hold is kept
--- for the link"). The first start converts the Send hold (booked 55). If that
--- attempt ends without counting, the 55 is a HOLD kept for the link, not a
+-- for the link"). The first start converts the Send hold (booked 65). If that
+-- attempt ends without counting, the 65 is a HOLD kept for the link, not a
 -- spend: it leaves minutes_used and joins the outstanding holds, and a restart
--- takes it back (no second 55). The attempt rows are purged before the restart (a
+-- takes it back (no second 65). The attempt rows are purged before the restart (a
 -- retention purge cascades from call_sessions): the marker lives on the round, so
 -- the restart still re-uses the booked charge; a rule derived from the attempt
--- rows would charge again. A counted attempt's 55 stays; a retake is a NEW attempt
--- number and takes a fresh 55; the retake's own uncounted end is refunded exactly
+-- rows would charge again. A counted attempt's 65 stays; a retake is a NEW attempt
+-- number and takes a fresh 65; the retake's own uncounted end is refunded exactly
 -- once when the round is cancelled.
 do $$
 declare
@@ -1441,13 +1475,13 @@ begin
   used_restart := _r1_tests.booked('2035-02-01');
   select starts_admitted into admitted_restart from screening_v2.r1_budget_month where month_start = '2035-02-01';
   perform _r1_tests.fail_live();
-  -- Attempt 1 counts; the retake is attempt 2 and takes a fresh 55.
+  -- Attempt 1 counts; the retake is attempt 2 and takes a fresh 65.
   update screening_v2.interview_round_attempts set counted = true where session_id = (restart->>'session_id')::uuid;
   update screening_v2.interview_rounds set attempts_counted = 1 where id = rid;
   retake := _r1_tests.admit(rid, 'p8-retake', february);
   used_retake := _r1_tests.booked('2035-02-01');
   perform _r1_tests.fail_live();
-  -- The retake ended without counting; cancelling the link gives back exactly that 55, once.
+  -- The retake ended without counting; cancelling the link gives back exactly that 65, once.
   perform _r1_tests.cancel(sent);
   used_cancelled := _r1_tests.booked('2035-02-01');
   refund_again := screening_v2.r1_release_round_hold(rid);
@@ -1457,18 +1491,18 @@ begin
   perform _r1_tests.assert('finding 8: an uncounted restart does not double-charge (also after its attempt rows were deleted), a counted retake does',
     first_start->>'status' = 'ok' and restart->>'status' = 'ok' and retake->>'status' = 'ok'
       and (restart->>'attempt_number')::integer = 1 and (retake->>'attempt_number')::integer = 2
-      and used_first = 55 and used_restart = 55 and admitted_restart = 1 and used_retake = 110,
+      and used_first = 65 and used_restart = 65 and admitted_restart = 1 and used_retake = 130,
     jsonb_build_array(first_start, restart, retake, used_first, used_restart, admitted_restart, used_retake)::text);
   perform _r1_tests.assert('an uncounted restart is subject to the same checks as a converted hold',
     refused_restart->>'status' = 'capacity_exhausted', refused_restart::text);
   perform _r1_tests.assert('no-show: the charge of an attempt that ended uncounted is a hold kept for the link, not a spend',
     _r1_tests.num(noshow_state, 'uncounted_charges') = 1
-      and _r1_tests.num(noshow_state, 'booked_minutes_used') = 55 and _r1_tests.num(noshow_state, 'minutes_used') = 0
-      and _r1_tests.num(noshow_state, 'restored_holds') = 55
-      and _r1_tests.num(noshow_state, 'outstanding_holds') - h_before = 55,
+      and _r1_tests.num(noshow_state, 'booked_minutes_used') = 65 and _r1_tests.num(noshow_state, 'minutes_used') = 0
+      and _r1_tests.num(noshow_state, 'restored_holds') = 65
+      and _r1_tests.num(noshow_state, 'outstanding_holds') - h_before = 65,
     noshow_state::text);
   perform _r1_tests.assert('no-show: cancelling the link refunds the uncounted charge exactly once and leaves the counted attempt booked',
-    used_cancelled = 55 and used_again = 55 and (refund_again->>'refunded')::numeric = 0 and marker_final = 1
+    used_cancelled = 65 and used_again = 65 and (refund_again->>'refunded')::numeric = 0 and marker_final = 1
       and _r1_tests.num(after_cancel_state, 'uncounted_charges') = 0
       and _r1_tests.num(after_cancel_state, 'outstanding_holds') = h_before,
     jsonb_build_array(used_cancelled, used_again, refund_again, marker_final, after_cancel_state)::text);
@@ -1532,8 +1566,8 @@ begin
     noshow->>'status' = 'ok' and unopened->>'status' = 'ok' and first_start->>'status' = 'ok'
       and exhausted->>'status' = 'ok' and ex_starts = array['ok', 'ok', 'ok']
       and (select starts_used = 3 from screening_v2.interview_rounds where id = rid_exhausted)
-      and h_alive - h_alive0 = 110 and h_lapsed = h_lapsed0
-      and reserved_before = 55 and booked_before = 110 and reserved_after = 0 and booked_after = 0
+      and h_alive - h_alive0 = 130 and h_lapsed = h_lapsed0
+      and reserved_before = 65 and booked_before = 130 and reserved_after = 0 and booked_after = 0
       and swept = 3 and swept_again = 0
       and (select status = 'expired' and held_minutes = 0 from screening_v2.interview_rounds where id = rid_unopened)
       and (select count(*) = 2 from screening_v2.interview_rounds
@@ -1559,14 +1593,14 @@ begin
   insert into screening_v2.r1_usage_ledger(session_id, round_id, participant_kind, event, seconds, event_key, occurred_at) values
     (_r1_tests.u(704), round_arith, 'candidate', 'usage', 1800, 'r1-arith-may', '2035-05-10T10:00:00Z'),
     (_r1_tests.u(704), round_arith, 'candidate', 'usage', 1800, 'r1-arith-june', '2035-06-10T10:00:00Z');
-  s := _r1_tests.snap('2035-05-15T12:00:00Z', 55);
+  s := _r1_tests.snap('2035-05-15T12:00:00Z', 65);
   perform _r1_tests.assert('snapshot arithmetic: month-scoped ledger, 1.15 on estimates, headroom, Mode A has no pool check',
     _r1_tests.num(s, 'r1_ledger_minutes') = 30 and _r1_tests.num(s, 'r1_actual') = 30
     and _r1_tests.num(s, 'pool_pure') = 30 and _r1_tests.num(s, 'pool_guard') = 34.5
     and _r1_tests.net(s, 'r1_committed') = 34.5 and _r1_tests.net(s, 'pool_committed') = 34.5
-    and _r1_tests.num(s, 'extra_hold') = 55
+    and _r1_tests.num(s, 'extra_hold') = 65
     and _r1_tests.num(s, 'r1_headroom') = 100000 - _r1_tests.num(s, 'r1_committed')
-    and _r1_tests.num(s, 'r1_headroom') = 100000 - 34.5 - 55 - _r1_tests.num(s, 'outstanding_holds')
+    and _r1_tests.num(s, 'r1_headroom') = 100000 - 34.5 - 65 - _r1_tests.num(s, 'outstanding_holds')
     and not (s->>'pool_check_applies')::boolean and (s->>'admits')::boolean
     and (s->>'dashboard_applies')::boolean = false,
     s::text);
@@ -1636,13 +1670,13 @@ $$;
 -- Gate review of PR-2b. One block per finding; each names the mutant it kills.
 -- ---------------------------------------------------------------------------
 
--- Gate P1: Send and start must agree. A Send reserves 55; the start that converts
--- it exchanges the hold for a booked 55 plus a 55-minute live floor, which count
--- as 55 together (a floor is a booked charge, never x1.15), so a start that fit at
+-- Gate P1: Send and start must agree. A Send reserves 65; the start that converts
+-- it exchanges the hold for a booked 65 plus a 65-minute live floor, which count
+-- as 65 together (a floor is a booked charge, never x1.15), so a start that fit at
 -- Send time fits again. The runbook's December example, scaled down: an allocation
--- of N x 55 on the first of a month (nothing booked, nothing metered), N Sends,
+-- of N x 65 on the first of a month (nothing booked, nothing metered), N Sends,
 -- then every one of the N starts. With the floor multiplied by 1.15 each start
--- needed 63.25 against its 55 hold and ALL N were refused ("temporarily
+-- needed 74.75 against its 65 hold and ALL N were refused ("temporarily
 -- unavailable, your link stays valid") until a link expired. Both modes; the limits
 -- are pinned from the snapshot so stray holds cannot move them. Mutants killed: a
 -- floor (live or p_extra_actual) multiplied by 1.15 in r1_estimate, pool_estimate
@@ -1662,7 +1696,7 @@ begin
   end loop;
   -- Mode A: the allocation is the only check (the pause line of 1 must be irrelevant).
   perform _r1_tests.settings('r1', 100000, 1);
-  line := ceil(_r1_tests.num(_r1_tests.snap(m_a, 0), 'r1_committed')) + c_n * 55;
+  line := ceil(_r1_tests.num(_r1_tests.snap(m_a, 0), 'r1_committed')) + c_n * 65;
   perform _r1_tests.settings('r1', line, 1);
   for i in 1..c_n loop
     s := _r1_tests.send(_r1_tests.u(800 + i), 'fom-a-send-' || i::text, m_a);
@@ -1680,7 +1714,7 @@ begin
   foreach rid in array rounds_a loop perform _r1_tests.cancel(jsonb_build_object('status', 'ok', 'id', rid)); end loop;
   -- Mode B: the pool pause line is pinned the same way and the allocation is out of the way.
   perform _r1_tests.settings('cloud', 100000, 100000);
-  line := ceil(_r1_tests.num(_r1_tests.snap(m_b, 0), 'pool_committed')) + c_n * 55;
+  line := ceil(_r1_tests.num(_r1_tests.snap(m_b, 0), 'pool_committed')) + c_n * 65;
   perform _r1_tests.settings('cloud', 100000, line);
   for i in 1..c_n loop
     s := _r1_tests.send(_r1_tests.u(800 + c_n + 1 + i), 'fom-b-send-' || i::text, m_b);
@@ -1696,24 +1730,24 @@ begin
   end loop;
   booked_b := _r1_tests.booked('2038-04-01');
   foreach rid in array rounds_b loop perform _r1_tests.cancel(jsonb_build_object('status', 'ok', 'id', rid)); end loop;
-  perform _r1_tests.assert('gate P1 (Mode A): an allocation of N x 55 admits N Sends and then all N starts on the first of the month, and refuses the next Send',
-    sends_a = ok_n and extra_a = 'capacity_exhausted' and starts_a = ok_n and booked_a = c_n * 55,
+  perform _r1_tests.assert('gate P1 (Mode A): an allocation of N x 65 admits N Sends and then all N starts on the first of the month, and refuses the next Send',
+    sends_a = ok_n and extra_a = 'capacity_exhausted' and starts_a = ok_n and booked_a = c_n * 65,
     jsonb_build_array(sends_a, extra_a, starts_a, booked_a)::text);
-  perform _r1_tests.assert('gate P1 (Mode B): a pause line of N x 55 admits N Sends and then all N starts on the first of the month, and refuses the next Send',
-    sends_b = ok_n and extra_b = 'capacity_exhausted' and starts_b = ok_n and booked_b = c_n * 55,
+  perform _r1_tests.assert('gate P1 (Mode B): a pause line of N x 65 admits N Sends and then all N starts on the first of the month, and refuses the next Send',
+    sends_b = ok_n and extra_b = 'capacity_exhausted' and starts_b = ok_n and booked_b = c_n * 65,
     jsonb_build_array(sends_b, extra_b, starts_b, booked_b)::text);
 end;
 $$;
 
 -- Gate P3 (cross-month conversion): the chosen semantics, pinned. A hold is a
 -- charge of the month that booked it (0117), so a July 31 Send converted on
--- August 1 books its 55 into JULY and adds NO booked 55 to August's allocation
+-- August 1 books its 65 into JULY and adds NO booked 65 to August's allocation
 -- check (p_extra_used 0 when the hold's month differs from p_now's). While live,
 -- that session is absorbed by August's greatest(booked, estimate): Mode A's
 -- allocation can be exceeded by one session per link that straddles a month end,
 -- a bounded policy overshoot that the runbook states. August is booked-dominated
--- (990 = 18 sessions), allocation edges come from the snapshot of the pinned
--- change. Mutants killed: p_extra_used always 55 (the conversion would need 55
+-- (1170 = 18 sessions x 65), allocation edges come from the snapshot of the pinned
+-- change. Mutants killed: p_extra_used always 65 (the conversion would need 65
 -- more and be refused at its pinned edge), no check on the held path, and a
 -- conversion booked into the conversion month.
 do $$
@@ -1727,13 +1761,13 @@ begin
   perform _r1_tests.cand(851, 'straddling link');
   perform _r1_tests.cand(852, 'later August Send refused');
   perform _r1_tests.cand(853, 'later August Send');
-  insert into screening_v2.r1_budget_month(month_start, minutes_used) values ('2042-08-01', 990)
-    on conflict (month_start) do update set minutes_used = 990;
+  insert into screening_v2.r1_budget_month(month_start, minutes_used) values ('2042-08-01', 1170)
+    on conflict (month_start) do update set minutes_used = 1170;
   perform _r1_tests.settings('r1', 100000, 100000);
   sent := _r1_tests.send_until(_r1_tests.u(851), 'xm-july-send', july, '2042-08-03T10:00:00Z');
   rid := (sent->>'id')::uuid;
   perform _r1_tests.consent(rid);
-  conversion := _r1_tests.snap(august, -55, 0, 55);
+  conversion := _r1_tests.snap(august, -65, 0, 65);
   need := ceil(_r1_tests.num(conversion, 'r1_committed'));
   perform _r1_tests.settings('r1', need - 1, 1);
   refused := _r1_tests.admit(rid, 'xm-refused', august);
@@ -1742,24 +1776,24 @@ begin
   select minutes_used into july_used from screening_v2.r1_budget_month where month_start = '2042-07-01';
   select minutes_used, minutes_reserved into august_used, august_reserved from screening_v2.r1_budget_month where month_start = '2042-08-01';
   -- The session is live and August's allocation does not carry it: one more August Send fits at
-  -- exactly 55 above the pinned conversion edge, and not a minute below.
-  later_state := _r1_tests.snap(august, 55);
+  -- exactly 65 above the pinned conversion edge, and not a minute below.
+  later_state := _r1_tests.snap(august, 65);
   need_later := ceil(_r1_tests.num(later_state, 'r1_committed'));
   perform _r1_tests.settings('r1', need_later - 1, 1);
   later_refused := _r1_tests.send(_r1_tests.u(852), 'xm-later-refused', august);
   perform _r1_tests.settings('r1', need_later, 1);
   later_ok := _r1_tests.send(_r1_tests.u(853), 'xm-later-ok', august);
-  perform _r1_tests.assert('gate P3: a hold converted in a later month is checked without a booked 55 (it is the Send month''s charge), refused one minute below that edge and admitted at it',
+  perform _r1_tests.assert('gate P3: a hold converted in a later month is checked without a booked 65 (it is the Send month''s charge), refused one minute below that edge and admitted at it',
     sent->>'status' = 'ok' and refused->>'status' = 'capacity_exhausted' and admitted->>'status' = 'ok'
-      and abs(_r1_tests.net(conversion, 'r1_committed') - 990) < 0.001
-      and need = _r1_tests.num(conversion, 'outstanding_holds') - 55 + 990,
+      and abs(_r1_tests.net(conversion, 'r1_committed') - 1170) < 0.001
+      and need = _r1_tests.num(conversion, 'outstanding_holds') - 65 + 1170,
     jsonb_build_array(sent, refused, admitted, conversion)::text);
   perform _r1_tests.assert('gate P3: the converted hold is booked into its ORIGINATING month and August''s booked minutes are untouched',
-    july_used = 55 and august_used = 990 and august_reserved = 0
+    july_used = 65 and august_used = 1170 and august_reserved = 0
       and (select held_minutes = 0 and hold_month = '2042-07-01' from screening_v2.interview_rounds where id = rid),
     jsonb_build_array(july_used, august_used, august_reserved)::text);
   perform _r1_tests.assert('gate P3: the straddling session does not consume August''s allocation (documented one-session-per-straddling-link overshoot)',
-    abs(_r1_tests.net(later_state, 'r1_committed') - 990) < 0.001
+    abs(_r1_tests.net(later_state, 'r1_committed') - 1170) < 0.001
       and later_refused->>'status' = 'capacity_exhausted' and later_ok->>'status' = 'ok',
     jsonb_build_array(later_refused, later_ok, later_state)::text);
   perform _r1_tests.fail_live();
@@ -1769,10 +1803,10 @@ end;
 $$;
 
 -- Gate P3 (live-session guard): cancelling a round while its session is LIVE must
--- not refund the attempt's 55. The worker counts the attempt at TRANSITION, while
--- the session is live (plan D1), so a live session's 55 is not yet known to be
+-- not refund the attempt's 65. The worker counts the attempt at TRANSITION, while
+-- the session is live (plan D1), so a live session's 65 is not yet known to be
 -- uncounted; a refund then would reset charged_attempt_number and a real session's
--- 55 would vanish from minutes_used. After the session ends uncounted the sweep
+-- 65 would vanish from minutes_used. After the session ends uncounted the sweep
 -- refunds it, exactly once. Mutant killed: r1_refund_uncounted_charge without its
 -- live-session guard.
 do $$
@@ -1796,7 +1830,7 @@ begin
   released_live := screening_v2.r1_release_round_hold(rid, cancel_at);
   used_live := _r1_tests.booked('2019-03-01');
   select charged_attempt_number into marker_live from screening_v2.interview_rounds where id = rid;
-  -- The session ends without counting: now the 55 is a refundable uncounted charge.
+  -- The session ends without counting: now the 65 is a refundable uncounted charge.
   perform _r1_tests.fail_live();
   perform screening_v2.r1_sweep_expired_rounds(sweep_at, 1000);
   used_swept := _r1_tests.booked('2019-03-01');
@@ -1804,9 +1838,9 @@ begin
   perform screening_v2.r1_sweep_expired_rounds(sweep_at, 1000);
   released_again := screening_v2.r1_release_round_hold(rid, sweep_at);
   used_again := _r1_tests.booked('2019-03-01');
-  perform _r1_tests.assert('gate P3: cancelling during a live session refunds nothing (booked minutes and the charged marker stay), and the sweep refunds the uncounted 55 exactly once after the session ends',
+  perform _r1_tests.assert('gate P3: cancelling during a live session refunds nothing (booked minutes and the charged marker stay), and the sweep refunds the uncounted 65 exactly once after the session ends',
     started->>'status' = 'ok' and cancelled->>'status' = 'ok'
-      and used_started = 55 and used_live = 55 and marker_live = 1 and (released_live->>'refunded')::numeric = 0
+      and used_started = 65 and used_live = 65 and marker_live = 1 and (released_live->>'refunded')::numeric = 0
       and used_swept = 0 and marker_swept = 0 and used_again = 0 and (released_again->>'refunded')::numeric = 0
       and (select status = 'cancelled' and held_minutes = 0 from screening_v2.interview_rounds where id = rid),
     jsonb_build_array(started, cancelled, used_started, used_live, marker_live, released_live, used_swept, marker_swept, used_again, released_again)::text);
@@ -1820,8 +1854,8 @@ $$;
 -- in the same transaction that terminalizes the session (runbook, "Worker
 -- contract"). Round A follows the contract on its THIRD start (the sweep also
 -- selects a round whose three starts are used): counted while live, the session
--- ends, the sweep leaves its 55 booked. Round B breaks it: the session ends
--- uncounted, the sweep refunds, and a late count finds its 55 gone - the loss the
+-- ends, the sweep leaves its 65 booked. Round B breaks it: the session ends
+-- uncounted, the sweep refunds, and a late count finds its 65 gone - the loss the
 -- contract rules out (this assertion documents the consequence; if the database
 -- ever tolerates late counting, replace it with the positive one). Mutant killed:
 -- a refund that ignores attempts_counted.
@@ -1859,11 +1893,11 @@ begin
   update screening_v2.interview_rounds set attempts_counted = 1 where id = rid_b;
   used_b := _r1_tests.booked('2018-06-01');
   select charged_attempt_number, attempts_counted into marker_b, counted_b from screening_v2.interview_rounds where id = rid_b;
-  perform _r1_tests.assert('worker contract: an attempt counted while its session is live keeps its 55 through the sweep, also as a third start',
-    starts_a = array['ok', 'ok'] and third->>'status' = 'ok' and starts_used_a = 3 and counted_a = 1 and marker_a = 1 and used_a = 55,
+  perform _r1_tests.assert('worker contract: an attempt counted while its session is live keeps its 65 through the sweep, also as a third start',
+    starts_a = array['ok', 'ok'] and third->>'status' = 'ok' and starts_used_a = 3 and counted_a = 1 and marker_a = 1 and used_a = 65,
     jsonb_build_array(starts_a, third, starts_used_a, counted_a, marker_a, used_a)::text);
-  perform _r1_tests.assert('worker contract: counting only AFTER the session ended loses the 55 (the sweep already refunded it), which is why the contract forbids it',
-    first_b->>'status' = 'ok' and used_b_before = 55 and used_b = 0 and marker_b = 0 and counted_b = 1,
+  perform _r1_tests.assert('worker contract: counting only AFTER the session ended loses the 65 (the sweep already refunded it), which is why the contract forbids it',
+    first_b->>'status' = 'ok' and used_b_before = 65 and used_b = 0 and marker_b = 0 and counted_b = 1,
     jsonb_build_array(first_b, used_b_before, used_b, marker_b, counted_b)::text);
   perform _r1_tests.cancel(sent_a);
   perform _r1_tests.cancel(sent_b);
@@ -1872,9 +1906,9 @@ $$;
 
 -- Gate P3 (view reconciliation): v_r1_budget_month keeps minutes_used as the BOOKED
 -- column and starts_admitted as CHARGED starts, and appends the derived terms so
--- Mission Control can reconcile its own figures: r1_minutes_used = booked less 55
+-- Mission Control can reconcile its own figures: r1_minutes_used = booked less 65
 -- per uncounted charge, and r1_committed = greatest(r1_minutes_used, r1_estimate)
--- + outstanding_holds. A no-show moves 55 from r1_minutes_used into restored_holds
+-- + outstanding_holds. A no-show moves 65 from r1_minutes_used into restored_holds
 -- while the booked column keeps it; a restart charges nothing, so starts_admitted
 -- does not move. The current month's other-suite state is global (an earlier block
 -- deletes the month's budget row while rounds charged in it still exist, which
@@ -1902,12 +1936,12 @@ begin
   restarted := _r1_tests.admit(rid, 'view-reconcile-restart', now());
   perform _r1_tests.fail_live();
   select * into v2 from screening_v2.v_r1_budget_month where month_start = date_trunc('month', now())::date;
-  perform _r1_tests.assert('view: a no-show moves its 55 from the derived minutes into restored holds while the booked column keeps it',
+  perform _r1_tests.assert('view: a no-show moves its 65 from the derived minutes into restored holds while the booked column keeps it',
     started->>'status' = 'ok'
-      and v1.booked_minutes_used - v0.booked_minutes_used = 55 and v1.minutes_used = v1.booked_minutes_used
-      and v1.uncounted_charges - v0.uncounted_charges = 1 and v1.restored_holds - v0.restored_holds = 55
+      and v1.booked_minutes_used - v0.booked_minutes_used = 65 and v1.minutes_used = v1.booked_minutes_used
+      and v1.uncounted_charges - v0.uncounted_charges = 1 and v1.restored_holds - v0.restored_holds = 65
       and v1.r1_minutes_used = v0.r1_minutes_used
-      and v1.r1_minutes_used = v1.booked_minutes_used - 55 * v1.uncounted_charges and v1.r1_minutes_used > 0
+      and v1.r1_minutes_used = v1.booked_minutes_used - 65 * v1.uncounted_charges and v1.r1_minutes_used > 0
       and v1.starts_admitted - v0.starts_admitted = 1,
     jsonb_build_array(to_jsonb(v0), to_jsonb(v1))::text);
   perform _r1_tests.assert('view: the appended terms reconcile r1_committed, and starts_admitted counts charged starts only (a restart is not charged again)',
@@ -2002,6 +2036,100 @@ begin
     jsonb_build_array(n0, n_retake, n_restart)::text);
   perform _r1_tests.cancel(sent_t);
   perform _r1_tests.cancel(sent_r);
+end;
+$$;
+
+-- 0128 (20-minute role-play): the admission hold is 65 participant-minutes and a candidate or
+-- agent ledger row may report at most 2190 s (residency 2160 + 30). Pinned in the schema: a write
+-- of the old 55 is refused rather than mixed in with 65s, held_minutes takes 0 or 65, the
+-- hold-month CHECK that 0128's constraint swap must not touch is still there and still enforced,
+-- and the usage bound moved in r1_record_usage and in the table CHECK together. Each refusal
+-- catches only check_violation and names the constraint that refused. Its own far-future month
+-- (2044-02) and fixtures; the stand-in hold is given back and the session ends.
+do $$
+declare
+  m constant timestamptz := '2044-02-15T12:00:00Z';
+  round_c uuid; session_c constant uuid := _r1_tests.u(923); res jsonb; refused text;
+begin
+  perform _r1_tests.cand(921, '0128 contract');
+  round_c := _r1_tests.dead_round(922, _r1_tests.u(921));
+
+  -- The setting the API reads and shows. (Each condition below is coalesced to false: the
+  -- assert helper treats a NULL condition as a pass.)
+  perform _r1_tests.assert('0128: admission_hold_minutes is 65, and so is its column default',
+    coalesce((select admission_hold_minutes = 65 from screening_v2.r1_settings where singleton), false)
+    and coalesce((select column_default from information_schema.columns
+                   where table_schema = 'screening_v2' and table_name = 'r1_settings'
+                     and column_name = 'admission_hold_minutes'), '<none>') = '65');
+  refused := null;
+  begin
+    update screening_v2.r1_settings set admission_hold_minutes = 55 where singleton;
+    raise exception '0128 admission_hold_minutes CHECK unexpectedly accepted 55';
+  exception when check_violation then
+    get stacked diagnostics refused = constraint_name;
+  end;
+  perform _r1_tests.assert('0128: a write of the old 55 to admission_hold_minutes is refused by its CHECK',
+    coalesce(refused = 'chk_r1_settings_admission_hold_minutes'
+      and (select admission_hold_minutes = 65 from screening_v2.r1_settings where singleton), false),
+    coalesce(refused, '<none>'));
+
+  -- interview_rounds.held_minutes: 55 refused, 65 accepted (so the 0117 (0, 55) CHECK is gone).
+  refused := null;
+  begin
+    update screening_v2.interview_rounds set held_minutes = 55, hold_month = '2044-02-01' where id = round_c;
+    raise exception '0128 held_minutes CHECK unexpectedly accepted 55';
+  exception when check_violation then
+    get stacked diagnostics refused = constraint_name;
+  end;
+  perform _r1_tests.assert('0128: a held_minutes of the old 55 is refused by chk_interview_round_held_minutes',
+    coalesce(refused = 'chk_interview_round_held_minutes'
+      and (select held_minutes = 0 and hold_month is null from screening_v2.interview_rounds where id = round_c), false),
+    coalesce(refused, '<none>'));
+  update screening_v2.interview_rounds set held_minutes = 65, hold_month = '2044-02-01' where id = round_c;
+  perform _r1_tests.assert('0128: held_minutes accepts 65',
+    coalesce((select held_minutes = 65 and hold_month = '2044-02-01' from screening_v2.interview_rounds where id = round_c), false));
+  refused := null;
+  begin
+    update screening_v2.interview_rounds set hold_month = null where id = round_c;
+    raise exception '0128 lost chk_interview_round_hold_month: a 65 hold without its month was accepted';
+  exception when check_violation then
+    get stacked diagnostics refused = constraint_name;
+  end;
+  perform _r1_tests.assert('0128: chk_interview_round_hold_month still exists and still refuses a hold without its month',
+    coalesce(refused = 'chk_interview_round_hold_month', false)
+      and exists (select 1 from pg_constraint
+                   where conrelid = 'screening_v2.interview_rounds'::regclass
+                     and conname = 'chk_interview_round_hold_month' and contype = 'c' and convalidated),
+    coalesce(refused, '<none>'));
+  -- The fixture round is terminal and booked nothing: give the stand-in hold back.
+  update screening_v2.interview_rounds set held_minutes = 0 where id = round_c;
+
+  -- The usage bound: 2190 s accepted, 2191 s refused before any write, and by the table CHECK.
+  perform _r1_tests.add_session(session_c, _r1_tests.u(921), round_c, m, null);
+  update screening_v2.call_sessions set status = 'waiting' where id = session_c;
+  res := screening_v2.r1_record_usage(session_c, round_c, 'candidate', 'usage', 2190, 'r1-0128-bound-2190', m);
+  perform _r1_tests.assert('0128: r1_record_usage accepts a 2190 s candidate row',
+    coalesce(res->>'status' = 'ok' and res->>'duplicate' = 'false', false)
+      and exists (select 1 from screening_v2.r1_usage_ledger
+                   where session_id = session_c and event_key = 'r1-0128-bound-2190' and seconds = 2190),
+    res::text);
+  res := screening_v2.r1_record_usage(session_c, round_c, 'candidate', 'usage', 2191, 'r1-0128-bound-2191', m);
+  perform _r1_tests.assert('0128: r1_record_usage refuses a 2191 s candidate row as invalid_usage and writes nothing',
+    coalesce(res->>'status' = 'invalid_usage', false)
+      and not exists (select 1 from screening_v2.r1_usage_ledger
+                       where session_id = session_c and event_key = 'r1-0128-bound-2191'),
+    res::text);
+  refused := null;
+  begin
+    insert into screening_v2.r1_usage_ledger(session_id, round_id, participant_kind, event, seconds, event_key, occurred_at)
+    values (session_c, round_c, 'candidate', 'usage', 2191, 'r1-0128-direct-2191', m);
+    raise exception '0128 usage-bound CHECK unexpectedly accepted a 2191 s candidate row';
+  exception when check_violation then
+    get stacked diagnostics refused = constraint_name;
+  end;
+  perform _r1_tests.assert('0128: the ledger CHECK refuses a direct 2191 s candidate row',
+    coalesce(refused = 'chk_r1_usage_event_bounds', false), coalesce(refused, '<none>'));
+  update screening_v2.call_sessions set status = 'failed', terminal_reason = 'provider_error' where id = session_c;
 end;
 $$;
 

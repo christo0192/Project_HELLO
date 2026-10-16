@@ -90,7 +90,7 @@ describe('what lapses, and into what', () => {
     expect(settleCalls(db)[0]!.args).toMatchObject({ p_outcome: 'configuration_failed' });
   });
 
-  it('an `in_progress` session with no activity for over 45 minutes fails (worker_crash), as shutdown_forced', async () => {
+  it('an `in_progress` session with no activity for over 50 minutes fails (worker_crash), as shutdown_forced', async () => {
     const tables = tablesWith(session(1, {
       status: 'in_progress', started_at: minutesAgo(180), waiting_at: minutesAgo(179), updated_at: minutesAgo(178),
     }));
@@ -128,7 +128,7 @@ describe('what never lapses (a healthy session is never touched)', () => {
   it.each([
     ['created', { status: 'created', started_at: minutesAgo(14), updated_at: minutesAgo(14) }],
     ['waiting', { status: 'waiting', started_at: minutesAgo(30), waiting_at: minutesAgo(19), updated_at: minutesAgo(19) }],
-    ['in_progress', { status: 'in_progress', started_at: minutesAgo(120), updated_at: minutesAgo(44) }],
+    ['in_progress', { status: 'in_progress', started_at: minutesAgo(120), updated_at: minutesAgo(49) }],
     ['a fresh in_progress', { status: 'in_progress', started_at: minutesAgo(3), updated_at: minutesAgo(3) }],
   ])('a %s session inside its bound', async (_label, patch) => {
     const tables = tablesWith(session(1, patch as Row));
@@ -177,10 +177,10 @@ describe('what never lapses (a healthy session is never touched)', () => {
   });
 
   it('bounds sit far past the worker timings they must clear', () => {
-    // 90 s rejoin grace, 120 s no-show, 1800 s residency (+ closing), 300 s attempt token.
+    // 90 s rejoin grace, 120 s no-show, 2160 s residency (+ closing), 300 s attempt token.
     expect(R1_ORPHAN_LAPSE_BOUNDS.createdIdleSec).toBeGreaterThan(300 * 2);
     expect(R1_ORPHAN_LAPSE_BOUNDS.waitingIdleSec).toBeGreaterThan(120 * 5);
-    expect(R1_ORPHAN_LAPSE_BOUNDS.inProgressIdleSec).toBeGreaterThan(1800 + 90 + 10 * 60);
+    expect(R1_ORPHAN_LAPSE_BOUNDS.inProgressIdleSec).toBeGreaterThan(2160 + 90 + 10 * 60);
   });
 });
 

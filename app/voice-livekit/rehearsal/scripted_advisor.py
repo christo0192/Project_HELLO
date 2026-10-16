@@ -414,7 +414,7 @@ class ScriptedAdvisor:
         if self._pitched < len(PITCH):
             self._pitched += 1
             return AdvisorTurn(self._take("pitch", PITCH), "pitch", "")
-        if r_sec >= 700 and self._close_asked < 2:
+        if r_sec >= 1060 and self._close_asked < 2:
             self._close_asked += 1
             return AdvisorTurn(self._take("close", CLOSE_AVERAGE), "close_ask", "")
         return AdvisorTurn(self._take("value", VALUE), "pitch", "")

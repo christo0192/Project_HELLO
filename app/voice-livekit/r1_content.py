@@ -88,7 +88,8 @@ import r1_world
 #    text changed.
 # 15: the 20-minute role-play (owner decision 2026-10-16): L-TRANSITION announces twenty minutes and
 #    the goal (convince the learner), L-OPEN says about thirty minutes and a twenty-minute
-#    role-play, and the owed-move deadlines stretch to the longer call (F2 640 / F1 810).
+#    role-play, and the owed-move deadlines stretch to the longer call (F3 430 / F2 640 / F1 810 /
+#    F4 930).
 CONTENT_REVISION = 15
 
 
