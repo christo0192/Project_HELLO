@@ -324,7 +324,7 @@ SPECS: tuple[NegotiationSpec, ...] = (
 SPEC_BY_ID = {spec.id: spec for spec in SPECS}
 SPEC_BY_REASON = {spec.reason: spec for spec in SPECS if spec.reason is not None}
 
-# The reaction before the scripted WEAK line at 13:00 (the line itself stays scripted and masked).
+# The reaction before the scripted WEAK line at 19:00 (the line itself stays scripted and masked).
 COMMIT_REACTION_BRIEF = (
     "react to what the advisor just said in one short, friendly sentence, and say nothing about "
     "thinking it over, e-mail or getting back to them, because the closing line follows "

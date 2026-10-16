@@ -26,13 +26,18 @@ class R1Phase(str, Enum):
     ABORTED = "aborted"
 
 
-# 4:30 icebreaker + 1:30 transition to S=20:00 + 0:12 exit + 2:00 wrap + 0:15 close.
-NORMAL_PATH_MAX_SEC = 20 * 60 + 12 + 120 + 15
-MAX_AGENT_RESIDENCY_SEC = 120 + 24 * 60 + 15 + 90
-# S-clock hard caps (plan section 5.1): icebreaker S=4:30, role-play S=20:00, forced close S=24:00.
+# 4:30 icebreaker + 1:30 transition + 20:00 role-play to S=26:00 + 0:12 exit + 2:00 wrap + 0:15
+# close.
+NORMAL_PATH_MAX_SEC = 26 * 60 + 12 + 120 + 15
+MAX_AGENT_RESIDENCY_SEC = 120 + 30 * 60 + 15 + 90
+# S-clock hard caps (plan section 5.1): icebreaker S=4:30, role-play S=26:00, forced close S=30:00.
 ICEBREAKER_HARD_SEC = 270.0
-ROLEPLAY_RESUME_CAP_SEC = 1200.0
-FORCED_CLOSE_SEC = 1440.0
+ROLEPLAY_RESUME_CAP_SEC = 1560.0
+FORCED_CLOSE_SEC = 1800.0
+# R-clock role-play budgets: a 20:00 hard end (the length L-TRANSITION announces), and a soft end
+# at 19:00 once the commitment is resolved.
+ROLEPLAY_HARD_R_SEC = 1200.0
+ROLEPLAY_SOFT_R_SEC = 1140.0
 
 # The ``transcript_turns.phase`` CHECK set (migration 0116, chk_transcript_turns_phase).
 TRANSCRIPT_PHASES = frozenset(
@@ -262,15 +267,18 @@ class R1PhaseMachine:
         return max(0.0, ICEBREAKER_HARD_SEC - self.session_clock)
 
     def remaining_roleplay_cap_seconds(self) -> float:
-        """Return the S=20:00 role-play cap; S keeps running through every pause."""
+        """Return the S=26:00 role-play cap; S keeps running through every pause."""
         return max(0.0, ROLEPLAY_RESUME_CAP_SEC - self.session_clock)
 
     def remaining_roleplay_seconds(self) -> float:
         """Return min(R budget, S cap); R excludes deliberate pauses, S never pauses."""
-        return max(0.0, min(840.0 - self.roleplay_elapsed, self.remaining_roleplay_cap_seconds()))
+        return max(
+            0.0,
+            min(ROLEPLAY_HARD_R_SEC - self.roleplay_elapsed, self.remaining_roleplay_cap_seconds()),
+        )
 
     def remaining_forced_close_seconds(self) -> float:
-        """Return the time left until the S=24:00 forced close."""
+        """Return the time left until the S=30:00 forced close."""
         return max(0.0, FORCED_CLOSE_SEC - self.session_clock)
 
     def remaining_wrapup_seconds(self) -> float:
@@ -286,11 +294,11 @@ class R1PhaseMachine:
         """Apply role-play's soft, earned-early, and hard phase exits."""
         return (
             self.session_clock >= ROLEPLAY_RESUME_CAP_SEC
-            or self.roleplay_elapsed >= 840
-            or (self.roleplay_elapsed >= 780 and commitment_resolved)
+            or self.roleplay_elapsed >= ROLEPLAY_HARD_R_SEC
+            or (self.roleplay_elapsed >= ROLEPLAY_SOFT_R_SEC and commitment_resolved)
         )
 
-    def forced_close_due(self, residency_cap_sec: float = 1800) -> bool:
+    def forced_close_due(self, residency_cap_sec: float = 2160) -> bool:
         """Retain the pure predicate for tests; production uses a scheduled deadline instead."""
         return self.session_clock >= min(FORCED_CLOSE_SEC, residency_cap_sec)
 

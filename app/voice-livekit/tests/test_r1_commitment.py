@@ -501,10 +501,10 @@ class GradeTests(unittest.TestCase):
 
 
 class WindowTests(unittest.TestCase):
-    def test_close_window_needs_9_minutes_and_all_families(self):
-        self.assertEqual(COMMIT_PERMITTED_R_SEC, 540)
-        self.assertFalse(commitment_permitted(539, True))
-        self.assertTrue(commitment_permitted(540, True))
+    def test_close_window_needs_13_minutes_and_all_families(self):
+        self.assertEqual(COMMIT_PERMITTED_R_SEC, 780)
+        self.assertFalse(commitment_permitted(779, True))
+        self.assertTrue(commitment_permitted(780, True))
         self.assertFalse(commitment_permitted(900, False))
 
 

@@ -24,7 +24,7 @@ engine only DECIDES, deterministically, what the learner does on each candidate 
     the text that was played.  If the model's reply misses them, ``intent_tail`` returns a
     scripted variant (``plan.intent.fallbacks``, vetted by the repetition check) that the
     session appends, so an owed move is never lost to the model.  ``compose_speech`` builds
-    the final text for callers that do not stream.  The 13:00 stall is an INTENT without
+    the final text for callers that do not stream.  The 19:00 stall is an INTENT without
     markers: one short model reaction, then the scripted WEAK line, always.
 ``LLM_REPLY``
     A free, constrained reply using ``plan.reminder`` (a HINT for a first probe, the DEEP
@@ -638,7 +638,7 @@ class RolePlayEngine:
                 self.scheduler.issue(move)
                 reasons.append(f"owed:{move.id}" + (":forced" if move.forced else ""))
                 if move.id == COMMIT_STALL:
-                    # The 13:00 stall: a short reaction, then the scripted WEAK line, spoken
+                    # The 19:00 stall: a short reaction, then the scripted WEAK line, spoken
                     # and masked exactly, and never a second time (``Negotiation``).
                     stall = self._commit_stall_plan(
                         move,
@@ -690,7 +690,7 @@ class RolePlayEngine:
         The time cue and the COMMIT-STALL wait too (R1-Q: at turn 79 the cue landed on top of
         a due reveal), except that the stall is the end-game backstop: past
         ``STALL_DEFER_GRACE_SEC`` it is spoken even on a reveal turn, because the role-play
-        hard-ends at 14:00.
+        hard-ends at 20:00.
         """
         if move.forced:
             return False
@@ -1012,7 +1012,7 @@ class RolePlayEngine:
         return {"emailed": emailed, "call": call and not negotiation.call_declined()}
 
     def _weak_text(self, default: str) -> str:
-        """The WEAK line of a farewell or the 13:00 stall, in the wording that fits."""
+        """The WEAK line of a farewell or the 19:00 stall, in the wording that fits."""
         kwargs = self._weak_kwargs()
         if not kwargs["emailed"]:
             return default
@@ -1067,7 +1067,7 @@ class RolePlayEngine:
         reveal_topics: tuple[str, ...],
         monologue: float | None,
     ) -> TurnPlan | None:
-        """The 13:00 stall: one short reaction by the model, then the scripted WEAK line.
+        """The 19:00 stall: one short reaction by the model, then the scripted WEAK line.
 
         The intent has no markers on purpose: the line is always appended after the reaction
         (``intent_tail``), and the model is told to say nothing about thinking it over, so the

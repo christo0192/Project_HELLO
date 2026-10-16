@@ -86,7 +86,10 @@ import r1_world
 #    "better" and the decider rules, the before-I-go strip) together with their canned lines
 #    (ANCHOR_HEARD_REPLACEMENT, ANCHOR_HEARD_BELOW, PRICE_UNCHANGED_REPLACEMENT); no other pinned
 #    text changed.
-CONTENT_REVISION = 14
+# 15: the 20-minute role-play (owner decision 2026-10-16): L-TRANSITION announces twenty minutes and
+#    the goal (convince the learner), L-OPEN says about thirty minutes and a twenty-minute
+#    role-play, and the owed-move deadlines stretch to the longer call (F2 640 / F1 810).
+CONTENT_REVISION = 15
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
