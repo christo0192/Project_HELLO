@@ -1,5 +1,7 @@
 # R1 WebRTC Interview Bot: Sales Program Advisor Role-Play — Implementation Plan v2
 
+> **Revision** 2026-10-16 (PR #374): 20-minute role-play, ~30-minute session, 65-minute hold (migration 0128). Session counts derived from the hold are restated at 65: about 33 a month in steady state (was 40), 8 with legacy browser traffic (was 10). Monthly minute totals are pool-bound and roughly unchanged (33 x 65 = 2,145 vs 40 x 55 = 2,200), so the storage and cost projections computed "at 40 a month" still bound the monthly spend.
+
 ## 0. Header
 
 | | |
@@ -23,7 +25,7 @@ There are two delivery modes for the browser/R1 lane:
 | Mode | Capacity and cost | Decision |
 |---|---|---|
 | Preferred: self-hosted R1 SFU | R1 uses **zero LiveKit Cloud participant-minutes**. One Fly Singapore (`sin`) server serves only browser R1 rooms. Estimated on-demand cost is about **$9–14/month**, including a required $2 dedicated IPv4; always-on performance-1x is about **$45/month**. | Use only after S0-F proves real joins and media quality from Indian home, mobile, and corporate networks. |
-| Fallback: LiveKit Cloud Build | R1 shares the existing 5,000-minute Cloud pool with phone. The current measured-cap formula remains: roughly **33 R1/month** in steady state (40 at the 55-minute hold before 0128), about **2 per weekday**; less during testing. (The earlier rough ~4/weekday estimate assumed 43 min per R1 and no safety margin; the reviewed formula uses 55 min, an 80% pause line and a 1.2x phone reserve.) | Use immediately if S0-F fails. No LiveKit upgrade is authorized. |
+| Fallback: LiveKit Cloud Build | R1 shares the existing 5,000-minute Cloud pool with phone. The current measured-cap formula remains: roughly **33 R1/month** in steady state (40 at the 55-minute hold before 0128), about **2 per weekday**; less during testing. (The earlier rough ~4/weekday estimate assumed 43 min per R1 and no safety margin; the reviewed formula uses 65 min (55 before 0128), an 80% pause line and a 1.2x phone reserve.) | Use immediately if S0-F fails. No LiveKit upgrade is authorized. |
 
 Self-hosting removes R1's phone-starvation risk entirely, but it adds one-server operations and a Fly UDP risk. If S0-F requires an always-on performance-1x server, choose Cloud Ship ($50/month) or enforce the Cloud cap rather than pay nearly Ship price for a less resilient server.
 
@@ -35,7 +37,7 @@ This week the owner must: (1) approve a dedicated Fly IPv4 and create the SFU/sp
 
 ## 1. Executive summary
 
-R1 is a deterministic, one-at-a-time, browser-only interview: 3–4 minutes of icebreaker, a scripted role-play announcement and ready check, 12–14 minutes of sales role-play, and about two minutes of wrap-up. Four normalized US learner personas rotate. The worker, not the LLM, schedules every objection, controls progressive disclosure and the earned close, and records the administration log. DeepSeek Flash conducts the conversation with thinking disabled; a durable, isolated scorer produces the five-metric recommendation.
+R1 is a deterministic, one-at-a-time, browser-only interview: 3–4 minutes of icebreaker, a scripted role-play announcement and ready check, 20 minutes of sales role-play, and about two minutes of wrap-up. Four normalized US learner personas rotate. The worker, not the LLM, schedules every objection, controls progressive disclosure and the earned close, and records the administration log. DeepSeek Flash conducts the conversation with thinking disabled; a durable, isolated scorer produces the five-metric recommendation.
 
 The worker records candidate camera and call audio to Cloudflare R2; no LiveKit Egress is used for R1. Video is HR-review-only: no bot vision and no avatar. The R1 page, consent, aggregate, queues, scorer, recording table, scorecard, and candidate-detail panel are R1-specific. Legacy browser screening is retired before staff dry runs.
 
@@ -44,7 +46,7 @@ The worker records candidate camera and call audio to Cloudflare R2; no LiveKit 
 Decision 14 is feasible in different ways by mode:
 
 * **Self-hosted SFU:** “under 10/day, no LiveKit upgrade” is technically possible after S0-F, subject to one live R1 at a time and Fly/DeepSeek/Sarvam capacity. R1 has no Cloud-minute consumption and cannot starve phone.
-* **Cloud fallback:** it is not feasible as “10/day.” A typical R1 costs about 57-60 participant-minutes (plan with 65; worst about 70), because both candidate and agent are billable. With phone use protected, the cap is about 40 per month, or about two per weekday. The guard blocks Send R1/starts above the cap.
+* **Cloud fallback:** it is not feasible as “10/day.” A typical R1 costs about 57-60 participant-minutes (plan with 65; worst about 70), because both candidate and agent are billable. With phone use protected, the cap is about 33 per month, or about 1.5 per weekday. The guard blocks Send R1/starts above the cap.
 
 The capacity guard is retained in both modes: in self-hosted mode it controls Fly, DeepSeek, Sarvam and operational load and preserves the immediately usable Cloud fallback cap; in Cloud mode it protects phone's shared quota.
 
@@ -99,13 +101,13 @@ Cloud Build is 5,000 shared WebRTC participant-minutes/month. The formula is unc
 
 `floor((pause line − 1.2 × measured trailing-30-day non-R1 minutes − planned Cloud test minutes) / 65)`.
 
-Begin at a 4,000-minute (80%) pause line; move to 4,250 (85%) only after two dashboard reconciliations agree within 5%. With 1,500 measured non-R1 minutes and no tests: `(4,000 − 1,800)/65 = 33` sessions. At 85%, it is 37. Legacy browser traffic at the snapshot level reduces this to roughly 10, which is why PR-L precedes Stage A. Launch Cloud fallback at about 20 in a half month and about 40/month steady state, roughly two per weekday (about 9-10 a week), not 10/day.
+Begin at a 4,000-minute (80%) pause line; move to 4,250 (85%) only after two dashboard reconciliations agree within 5%. With 1,500 measured non-R1 minutes and no tests: `(4,000 − 1,800)/65 = 33` sessions. At 85%, it is 37. Legacy browser traffic at the snapshot level reduces this to roughly 8, which is why PR-L precedes Stage A. Launch Cloud fallback at about 16 in a half month and about 33/month steady state, roughly 1.5 per weekday (about 7-8 a week), not 10/day.
 
 The ledger includes R1, phone attempts plus one minute, legacy browser sessions ×2 plus one minute, preflights at ten seconds, and manual tests; apply 1.15 until reconciled. Auto-pause at the line or projected month-end ≥90%; warn at 60/75/90%, SIP ≥70%, quota/join failures, agent-alone >2 minutes, R1 >32 minutes, and any R1 egress. Pause through 12:00 UTC on the first until the reset behavior is evidenced.
 
 ### 3.4 Storage and recording cost
 
-Use private R2 bucket `ik-r1-recordings`, bucket-scoped API credentials, 90-day deletion with a 97-day lifecycle backstop, streaming integrity checks, and presigned review/export URLs. At 85MB/R1 and 40/month, 90-day storage is about 10.2GB and essentially free. Do not use shared Supabase spend for R1 video. No R1 Egress is used in either mode.
+Use private R2 bucket `ik-r1-recordings`, bucket-scoped API credentials, 90-day deletion with a 97-day lifecycle backstop, streaming integrity checks, and presigned review/export URLs. At about 120MB/R1 (a ~30-minute session) and 33/month, 90-day storage is about 12GB and essentially free. Do not use shared Supabase spend for R1 video. No R1 Egress is used in either mode.
 
 ---
 
@@ -134,7 +136,7 @@ R1 end-to-end remains: HR Send R1 → fragment token → R1-specific consent →
 
 ## 5. Conversation design
 
-Section 5 of `R1-PLAN-final.md` is adopted without semantic change. It defines the forward-only phase machine and 24-minute hard cap; exact scripted lines; single `simran` voice; separate interviewer/learner contexts; progressive hidden-need disclosure; output guards; the HR-owned SHA-pinned facts sheet; four normalized personas; deterministic owed moves; deterministic negotiation and earned close; shadow tracker; injection/silence/rejoin behavior; fairness/equivalence gates; DeepSeek Flash configuration; and latency targets.
+Section 5 of `R1-PLAN-final.md` is adopted without semantic change. It defines the forward-only phase machine and 30-minute hard cap; exact scripted lines; single `simran` voice; separate interviewer/learner contexts; progressive hidden-need disclosure; output guards; the HR-owned SHA-pinned facts sheet; four normalized personas; deterministic owed moves; deterministic negotiation and earned close; shadow tracker; injection/silence/rejoin behavior; fairness/equivalence gates; DeepSeek Flash configuration; and latency targets.
 
 Implementation constraints remain: R1 uses a lazy, separate module after the phone early return (`agent.py:11854-11861`); it never changes `prompting.system_prompt`, `opening_line`, `DEFAULT_QUESTIONS`, `_build_provider_session`, `phone.py`, `closing.py`, or phone validators. The R1 context route and R1 persistence writer are separate. R1 uses `record=False`: on self-host it would otherwise create a local SDK OGG whose Cloud-observability upload silently does not occur.
 

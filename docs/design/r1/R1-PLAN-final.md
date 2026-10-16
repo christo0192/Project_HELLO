@@ -8,6 +8,7 @@
 | Date | 2026-10-05 |
 | Base commit | `origin/main` @ `eec54af` (#332). Do not base work on the parent checkout `fix/phone-consent-latency-opener`; it is about 50 commits behind. |
 | Status | APPROVED by owner 2026-10-06 (all decisions D1-D18 at recommended defaults); implementation in progress |
+| Revision | 2026-10-16 (PR #374): 20-minute role-play, ~30-minute session, 65-minute hold (migration 0128). Session counts derived from the hold are restated at 65: about 33 a month in steady state (was 40), 8 with legacy browser traffic (was 10). Monthly minute totals are pool-bound and roughly unchanged (33 x 65 = 2,145 vs 40 x 55 = 2,200), so the storage and cost projections computed "at 40 a month" still bound the monthly spend. |
 | Inputs | <ul><li>Scout isolation report, including its §13 corrections.</li><li>Research on four topics: the LiveKit free plan, storage pricing, in-worker A/V recording, and DeepSeek.</li><li>Fact-check dated 2026-10-05. Where it differs from the research, its corrected values are used.</li><li>The draft plan.</li><li>Five adversarial critiques: phone isolation, conversation/assessment, free-plan capacity, security/privacy, and delivery/testability. Every finding is dispositioned in Appendix A.</li></ul> |
 | Conventions | <ul><li>Paths are relative to the repo root at `eec54af`.</li><li>"est." means an estimate, not a measurement.</li><li>"Deploys" values come from the path rules in `deploy-fly.yml:156-174`.</li><li>"IST window" means 09:00-21:00 IST.</li></ul> |
 
@@ -65,17 +66,17 @@
 > - **The pool:** LiveKit Build has **5,000 minutes a month**, as a hard cap **shared with phone**. When it runs out, the phone agent cannot join calls until the 1st of the next month.
 > - **The demand:** 10 a day is about 220 sessions, roughly 10,000-12,000 minutes, or 2-2.4 times the whole pool.
 > - **Realistic free-plan capacity** after legacy browser screening is switched off:
->   - **about 40 R1 sessions a month** (about 2 per weekday, retakes included);
->   - about **20-25** in a month that also carries test sessions;
->   - about **10** if legacy browser screening kept running.
+>   - **about 33 R1 sessions a month** (about 1.5 per weekday, retakes included; 40 at the 55-minute hold before 0128);
+>   - about **17-21** in a month that also carries test sessions;
+>   - about **8** if legacy browser screening kept running.
 > - A second free LiveKit project adds nothing, because free allowances are pooled per user.
 >
 > **Owner choice:**
 >
 > | Option | What it means |
 > |---|---|
-> | **A (recommended default, honours "no upgrade")** | Stay on Build. Derive the monthly cap from measured usage (§3.2), starting at **40 a month in steady state**, and review after 2 months. |
-> | **B** | Move to LiveKit Ship ($50/month, 150,000 minutes) if HR needs more than about 40 a month. This reverses decision 14, so only the owner can choose it. |
+> | **A (recommended default, honours "no upgrade")** | Stay on Build. Derive the monthly cap from measured usage (§3.2), starting at **33 a month in steady state**, and review after 2 months. |
+> | **B** | Move to LiveKit Ship ($50/month, 150,000 minutes) if HR needs more than about 33 a month. This reverses decision 14, so only the owner can choose it. |
 > | **C** | Option A now, plus a written trigger: if HR demand exceeds the cap in 2 consecutive months, the owner revisits B. |
 
 ### Needs the owner this week
@@ -131,7 +132,7 @@
 | 11 | Same TTS voice; only the announcement marks the switch | Single voice; scripted transition and exit lines | Optional on-screen phase label and lead card (D8). |
 | 12 | DeepSeek V4 Flash, reusing existing wiring | `livekit.plugins.openai.LLM` against the official endpoint with `DEEPSEEK_API_KEY` (§5.14), plus the smoke harness (S0-B) | <ul><li>The canonical id is `deepseek-flash`; `deepseek-v4-flash` is a temporary alias for the same model (D9).</li><li>Legal must accept PRC processing (D11).</li></ul> |
 | 13 | Storage: R2 preferred, Supabase Pro acceptable; how much does each give? | Verified numbers in §3.5. **Recommendation: R2.** | — |
-| 14 | Under 10 R1/day at launch; stay on the free Build plan | Budget guard and measured cap (§3) | **Infeasible as stated.** About 40 a month (Option A/B/C, §1). |
+| 14 | Under 10 R1/day at launch; stay on the free Build plan | Budget guard and measured cap (§3) | **Infeasible as stated.** About 33 a month (Option A/B/C, §1). |
 | 15 | Planning only; 3 adversarial reviews per PR; squash-merge on green CI; merge outside the IST window; migrations auto-apply | Merge gate in §10. Additions: a zero-live-phone and zero-live-R1 check before **any** `app/api`, `app/voice-livekit` or migration merge; latest merge 08:00 IST in the 07:00-08:30 slot; CI hygiene first (PR-pre). | — |
 
 ### 2.2 Open decisions (recommended defaults)
@@ -142,7 +143,7 @@
 | D2 | World-facts sheet (sales lead) | <ul><li>Discount↔plan mapping; cohort start; enrolment deadline; seats statement; active seasonal offer (if any); weekly hours; class format.</li><li>A "does NOT offer" list: job guarantee, refunds beyond policy, discounts above $1,500.</li><li>Shared with candidates through the prep guide and with the scorer, never with the learner LLM.</li></ul> | PR-4b |
 | D3 | What R1 writes to `candidates.status` | <ul><li>**Advance** → `advanced` immediately (CAS).</li><li>**Reject** → "R1 reject pending" for **24 h**, which HR can cancel, then `rejected`.</li><li>**Hold** → no write; an "R1 hold" flag.</li><li>Every write goes to `audit_events`.</li><li>Auto-status stays **off** until the calibration in §6.6 passes.</li></ul> | PR-5 |
 | D4 | Retention | <ul><li>Video: 90 days, deleted by the app, with an R2 lifecycle rule at 97 days as backstop.</li><li>R1 transcripts and scores: follow D-009 (indefinite today, not Legal-approved) unless Legal sets a shorter R1 period, which `r1.sweep` would then implement.</li><li>The notice states whichever applies.</li></ul> | PR-3 (notice), PR-8 |
-| D5 | Monthly cap and behaviour when exhausted | <ul><li>Cap = formula in §3.2 (steady state about 40). Auto-pause at 80% of estimated total until two monthly reconciliations agree within 5%, then 85%.</li><li>Send R1 is blocked at the cap.</li><li>A link already sent shows "temporarily unavailable, your link stays valid", and its expiry is extended by the pause (at most +7 days).</li></ul> | PR-2 |
+| D5 | Monthly cap and behaviour when exhausted | <ul><li>Cap = formula in §3.2 (steady state about 33). Auto-pause at 80% of estimated total until two monthly reconciliations agree within 5%, then 85%.</li><li>Send R1 is blocked at the cap.</li><li>A link already sent shows "temporarily unavailable, your link stays valid", and its expiry is extended by the pause (at most +7 days).</li></ul> | PR-2 |
 | D6 | Metric weights | Probing 25 / Objections 25 / Communication 20 / Urgency & close 15 / Negotiation 15. Product knowledge off in v1. | PR-2 seed |
 | D7 | Persona gender | All 4 personas are women (single female voice) | PR-4b |
 | D8 | On-screen phase label and lead card | Yes, for accessibility and task clarity; the voice is unchanged | PR-6 |
@@ -202,10 +203,10 @@ Worked values:
 |---|---|---|---|
 | Oct 2026 | ~150 (S0-E; 1-2 S0-C confirmation runs; S0-C matrix runs on a self-hosted `livekit-server`) | 0 | 0 |
 | Nov 2026 | ~550 (Stage A0 + A, ≥12 sessions) | 0 | 0 |
-| Dec 2026 | ~360 (Stage A2 + PR-9 confirmation) | Stage B from about Dec 14 | 20 (half month; the formula gives 33) |
-| Jan 2027 onward | ~50 | steady | ~40 (from the formula) |
+| Dec 2026 | ~360 (Stage A2 + PR-9 confirmation) | Stage B from about Dec 14 | 20 (half month; the formula gives 28) |
+| Jan 2027 onward | ~50 | steady | ~33 (from the formula) |
 
-Demand against the pool: 10/day on weekdays is about 220/month, about 9,500-12,000 minutes. **The supportable average is about 2 R1 per weekday.**
+Demand against the pool: 10/day on weekdays is about 220/month, about 9,500-12,000 minutes. **The supportable average is about 1.5 R1 per weekday.**
 
 ### 3.3 Budget guard that protects phone (PR-1, PR-2, PR-3)
 
@@ -678,7 +679,7 @@ The silence loop is copied with R1 wording and windows; the shared constants are
   4. `close_room_once`.
 
   The R1 outcome goes on `interview_round_attempts.outcome`.
-- **Counting contract (PR-4a worker, PR-8 `r1.sweep`; capacity model, migration 0119).** The worker writes `attempts_counted` (and `interview_round_attempts.counted`) **while the session is still live**, at TRANSITION (D1), never after the terminal write. The capacity model treats a round with `charged_attempt_number > attempts_counted` and no live session as a hold kept for the link, and the sweep, cancel and expiry refund it for good once the link is dead (three starts used, a lapsed link, or a terminal status). A count written afterwards can lose that race: a counted third start, or a session that ends just before the link expires, is refunded before it is counted and its 55 minutes are lost from `minutes_used`. An **uncount after a system failure** (`worker_crash`, `provider_error`, `shutdown_forced`) is written in the **same transaction** that terminalizes the session; crash recovery below does the same. Cancelling a round during a live session refunds nothing for the same reason. See `docs/runbooks/r1-operations.md`, "Worker contract for counting".
+- **Counting contract (PR-4a worker, PR-8 `r1.sweep`; capacity model, migration 0119).** The worker writes `attempts_counted` (and `interview_round_attempts.counted`) **while the session is still live**, at TRANSITION (D1), never after the terminal write. The capacity model treats a round with `charged_attempt_number > attempts_counted` and no live session as a hold kept for the link, and the sweep, cancel and expiry refund it for good once the link is dead (three starts used, a lapsed link, or a terminal status). A count written afterwards can lose that race: a counted third start, or a session that ends just before the link expires, is refunded before it is counted and its 65 minutes are lost from `minutes_used`. An **uncount after a system failure** (`worker_crash`, `provider_error`, `shutdown_forced`) is written in the **same transaction** that terminalizes the session; crash recovery below does the same. Cancelling a round during a live session refunds nothing for the same reason. See `docs/runbooks/r1-operations.md`, "Worker contract for counting".
 - **Normal close:** L-CLOSE sets the participant attribute `phase=ended`, using a plain lowercase key (camel-casing trap, #332), so the page leaves.
 - **Crash recovery:** `r1.sweep` turns any attempt still `in_progress` after residency + 5 min into `fail(worker_crash)` (not counted; the terminal write and any uncount are one transaction, see the counting contract above). It then:
   - completes the multipart upload;
@@ -1252,14 +1253,14 @@ The S0-E webhook question is already answered (phone uses webhooks) and needs no
   - scorecard complete and 3-run stable ≥90%;
   - realism rated ≥4/5;
   - no phone canary regression;
-  - measured minutes per R1 ≤55.
+  - measured minutes per R1 ≤65.
 - **Stage A2** (≥6 sessions with recording):
   - 100% `ready`; A/V skew <150 ms; finish p95 ≤60 s;
   - 0 VAD-lag warnings; CPU p95 <60%; drops <2%;
   - Chrome and Safari playback and seek;
   - DSAR delete test passes on a staff record.
 - **Stage B** (shadow; ≥30 real candidates; daily review):
-  - average minutes per R1 ≤55;
+  - average minutes per R1 ≤65;
   - budget estimate within 10% of the dashboard;
   - double ratings collected;
   - gold-set and equivalence gates already passed.
@@ -1286,7 +1287,7 @@ The S0-E webhook question is already answered (phone uses webhooks) and needs no
 | # | Risk | Impact | Mitigation |
 |---|---|---|---|
 | 1 | Shared 5,000-minute WebRTC cap exhausted | Phone agents cannot join; phone stops until the 1st | Legacy cutover first; atomic admission; measured cap; 80→85% pause plus run-rate pause; daily reconciliation; S0-C off Cloud |
-| 2 | Demand (10/day) far above capacity (~40/month) | HR frustration | Owner Option A/B/C in writing; budget visible on the card; links extend while paused |
+| 2 | Demand (10/day) far above capacity (~33/month) | HR frustration | Owner Option A/B/C in writing; budget visible on the card; links extend while paused |
 | 3 | Phone reserve not a hard ceiling | Less R1 headroom | Estimate includes phone attempts ×1.2; pause line is the real protection |
 | 4 | Every worker or API merge restarts phone and live R1 | Dropped calls or interviews | Zero-live gate for all merges, automated in the deploy job; 07:00-08:00 slot; drain arithmetic |
 | 5 | R1 code or config crashes the shared worker or API at boot | Phone outage | Lazy imports; non-throwing R1 config; boot tests; no prewarm work |

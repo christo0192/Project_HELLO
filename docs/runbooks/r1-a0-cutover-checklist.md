@@ -39,7 +39,7 @@ Everything else is Fly secrets and database settings, set in the order below.
 ## Order at a glance
 
 ```text
-0  Preconditions (read-only), then PAUSE R1                  (30+ min before the merge)
+0  Preconditions (read-only), then PAUSE R1                  (40+ min before the merge)
 1  Zero-live and zero-browser-session checks (read-only)
 2  Rotate the spike SFU key, verify the SFU
 3  API FIRST: target r1 + R1 triple                          (no browser exchange from here on)
@@ -69,7 +69,7 @@ exchange answers `preparing`), so no candidate may be using the system then.
 - Merge window (runbook "Merge and deploy gate"): merge between 07:00 and 08:30
   IST, latest merge 08:00, no Quality re-run or deploy dispatch after 08:15.
   Steps 3 and 4 belong in that window. If you have waived the time window for
-  deploys, the zero-live checks and the 30 minute pause still apply.
+  deploys, the zero-live checks and the 40 minute pause still apply.
 
 Setup, once, at the start:
 
@@ -190,7 +190,7 @@ gh run list --workflow "Deploy (Fly)" --limit 5       # nothing queued or in_pro
 gh pr list --state open --search "phone in:title"      # a phone PR touching app/voice-livekit must not merge in this window
 ```
 
-### 0.5 PRODUCTION CHANGE: pause R1 (at least 30 minutes before the merge)
+### 0.5 PRODUCTION CHANGE: pause R1 (at least 40 minutes before the merge)
 
 Pausing blocks new R1 attempts and lets live ones finish. R1 is disabled, so
 this is belt and braces, and the runbook requires it for any merge that deploys
@@ -203,7 +203,7 @@ Or SQL:
 Invoke-R1Sql "update screening_v2.r1_settings set paused = true where singleton returning enabled, paused;"
 ```
 
-- [ ] Paused since (IST): __:__ (merge no earlier than 30 minutes after this)
+- [ ] Paused since (IST): __:__ (merge no earlier than 40 minutes after this)
 
 ---
 
@@ -418,7 +418,7 @@ the match closed (`preparing`).
 
 ### 4.2 Final gate, immediately before merging
 
-- [ ] Paused for at least 30 minutes (step 0.5) and inside the merge window.
+- [ ] Paused for at least 40 minutes (step 0.5) and inside the merge window.
 - [ ] Re-run all of step 1: every query empty.
 - [ ] The draft PR's checks are green on the exact commit that will be squashed
       (Quality, `supabase-check`, secret scan), rebased on the current `main`.

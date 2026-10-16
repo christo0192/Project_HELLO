@@ -243,7 +243,7 @@ separately:
 
 | Setting | Meaning | Applies |
 |---|---|---|
-| `monthly_cap_minutes` | The owner-approved **R1 allocation**: sessions x 65 (for example 20 x 65 = 1,300, about 40 x 65 = 2,600 in steady state; the hold was 55 before 0128). | Always, in both targets |
+| `monthly_cap_minutes` | The owner-approved **R1 allocation**: sessions x 65 (for example 20 x 65 = 1,300, about 33 x 65 = 2,145 in steady state; the hold was 55 before 0128). | Always, in both targets |
 | `pause_line_minutes` | The **total Cloud-pool pause line** (4,000 = 80% of the 5,000 free-plan pool). | Only while `livekit_target` is `cloud` (Mode B) |
 
 A self-hosted R1 (Mode A, `livekit_target = r1`) uses no LiveKit Cloud minutes,
@@ -252,7 +252,7 @@ admission is never gated by either check.
 
 **Set the allocation before enabling R1.** `monthly_cap_minutes` defaults to
 4,000, a placeholder from 0115 when it was a total-pool limit. As the R1
-allocation it would mean 72 sessions a month, and in Mode A nothing else would
+allocation it would mean 61 sessions a month (72 at the 55-minute hold), and in Mode A nothing else would
 stop it. The settings API therefore refuses `enabled = true` (409
 `r1_allocation_not_set`) while the stored allocation is still 4,000, it has
 never been saved (`r1_settings.allocation_set_at` is NULL) and the same request

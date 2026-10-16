@@ -20,7 +20,7 @@ python -m rehearsal.replay [--live]                                    # the own
   `tests.test_r1_integration.Rig` (plan, guard, intent tail, `record_spoken`), with the production
   client `r1_llm.build_r1_llm(env_dict)`. Offline: `scripted_learner.py`.
 * CLOCK (`clock.py`): a modelled role-play clock R (about 35 s per exchange, calibrated on the owner's
-  session), so the schedule, the 9:00 close window, the time cue and the 13:00 stall all happen.
+  session), so the schedule, the 13:00 close window, the time cue and the 19:00 stall all happen.
 * METRICS (`metrics.py`, pure, also run on real session exports), JUDGE (`judge.py`, LLM rubric),
   SCORECARD (`scorecard.py`, per advisor level against the pass thresholds).
 
@@ -88,7 +88,7 @@ Gates and metrics added or changed in R1-Q iteration 2 (the second live sweep):
   detector agrees (`judge.validate_misfires`); the rest are listed as `misfires_rejected`.
 * The advisor simulator is asked once more when it says goodbye before 10:00 (D23: six of 20 calls ended
   at 6:23 to 9:59). `--max-exchanges` defaults to 60 (the learner now speaks less, so 40 exchanges can end
-  before 13:00).
+  before 13:00). (Since the 20-minute role-play: before 14:00, and 86 exchanges.)
 
 Harness fixes of R1-Q iteration 3 (H1-H6 of the analyst's second sweep):
 

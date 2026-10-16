@@ -293,7 +293,7 @@ def fidelity_events(
             "interruptions": move.get("interruptions"),
         }
         if event_type == "time_cue":
-            # The learner's time cue is read as the role-play clock R at delivery (about 11:00).
+            # The learner's time cue is read as the role-play clock R at delivery (about 17:00).
             detail["roleplay_seconds"] = move.get("delivered_sec")
         add(event_type, move.get("transcript_turn"), family, detail)
     discounts = admin.get("tracker", {}).get("discounts", {})
