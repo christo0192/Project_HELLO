@@ -83,7 +83,7 @@ class Settings:
     judge_model: str = DEFAULT_JUDGE_MODEL
     judge: bool = True
     preflight: bool = True
-    max_exchanges: int = 60
+    max_exchanges: int = 86
     out: str = ""
     strict: bool = False
     baseline: str = ""
@@ -121,7 +121,7 @@ def parse_learners(text: str) -> tuple[str, ...]:
 
 
 def plan_specs(
-    levels: Sequence[str], learners: Sequence[str], calls: int, max_exchanges: int = 60
+    levels: Sequence[str], learners: Sequence[str], calls: int, max_exchanges: int = 86
 ) -> list[CallSpec]:
     """Advisor level varies fastest, then the learner persona, then the repetition."""
     specs: list[CallSpec] = []
@@ -548,7 +548,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
     parser.add_argument("--no-judge", action="store_true", help="skip the rubric judge")
     parser.add_argument("--no-preflight", action="store_true", help="skip the balance check and model probe")
-    parser.add_argument("--max-exchanges", type=int, default=60)
+    parser.add_argument("--max-exchanges", type=int, default=86)
     parser.add_argument("--baseline", default="", help="a previous run directory: writes diff.md")
     parser.add_argument("--strict", action="store_true", help="exit 5 on any hard fail or failed gate")
     return parser

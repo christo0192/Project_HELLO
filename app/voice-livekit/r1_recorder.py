@@ -2283,7 +2283,7 @@ class R1Recorder:
         """Stop the SDK recorder, then overwrite and unlink everything the spool holds.
 
         A mid-call discard happens while the interview goes on, and the overwrite writes and
-        fsyncs every spool byte (about 100 MB after a 20-minute call with video): that runs on a
+        fsyncs every spool byte (about 150 MB after a 30-minute call with video): that runs on a
         thread, never on the loop the live VAD / STT / TTS pipeline shares.
         """
         try:

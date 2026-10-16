@@ -65,14 +65,36 @@ const ROW = new RegExp(
   'g',
 );
 
-const ROWS: Row[] = [...MIGRATION.matchAll(ROW)].map((m) => ({
-  version: m[1],
-  locale: m[2],
-  title: m[3],
-  body: m[4],
-  requiredConsents: JSON.parse(m[5]) as string[],
-  isActive: m[6] === 'true',
-}));
+function rowsOf(text: string): Row[] {
+  return [...text.matchAll(ROW)].map((m) => ({
+    version: m[1],
+    locale: m[2],
+    title: m[3],
+    body: m[4],
+    requiredConsents: JSON.parse(m[5]) as string[],
+    isActive: m[6] === 'true',
+  }));
+}
+
+const ROWS: Row[] = rowsOf(MIGRATION);
+
+/**
+ * 0129 re-releases both notices for the 20-minute role-play ("about 30 minutes"). 0123's rows stay
+ * (immutable) but 0129's are the greatest active release, the one admission and the SQL assertions
+ * prove.
+ */
+const CURRENT_FILE = '0129_r1_consent_thirty_minutes.sql';
+const CURRENT = lf(readFileSync(path.join(SUPABASE, 'migrations', CURRENT_FILE), 'utf8'));
+const CURRENT_ROWS: Row[] = rowsOf(CURRENT);
+const CURRENT_VERIFY = (CURRENT.match(/\ndo \$verify\$([\s\S]*?)\$verify\$;/) ?? ['', ''])[1];
+const DURATION_BEFORE = 'speaks with you by voice for about 20 minutes.';
+const DURATION_AFTER = 'speaks with you by voice for about 30 minutes.';
+
+function currentRow(locale: string): Row {
+  const found = CURRENT_ROWS.find((r) => r.locale === locale);
+  if (!found) throw new Error(`0129 has no ${locale} row`);
+  return found;
+}
 
 function row(locale: string): Row {
   const found = ROWS.find((r) => r.locale === locale);
@@ -473,11 +495,13 @@ describe('P3 verification block: drift in production fails the migration', () =>
   });
 
   it('is repeated in the SQL assertions, which compare the stored bodies to the digests', () => {
+    // The SQL assertions prove the CURRENT release (0129), whose bodies are 0123's with one
+    // sentence changed (see '0129 re-release' below).
     expect(sqlConstant(/\bcandidate_md5 constant text := '([0-9a-f]{32})'/)).toBe(
-      md5(row(CANDIDATE_LOCALE).body),
+      md5(currentRow(CANDIDATE_LOCALE).body),
     );
     expect(sqlConstant(/\bstaff_md5 constant text := '([0-9a-f]{32})'/)).toBe(
-      md5(row(STAFF_LOCALE).body),
+      md5(currentRow(STAFF_LOCALE).body),
     );
     expect(ASSERT_SQL).toContain('the shipped bodies are the signed-off text (md5 digests)');
   });
@@ -572,11 +596,44 @@ describe('P3 consent items: every key has its own label at the point of consent'
   });
 });
 
+describe('0129 re-release (the 20-minute role-play)', () => {
+  it('ships both audiences at one release that sorts above 0123', () => {
+    expect(CURRENT_ROWS.map((r) => r.locale).sort()).toEqual([CANDIDATE_LOCALE, STAFF_LOCALE]);
+    expect(new Set(CURRENT_ROWS.map((r) => r.version)).size).toBe(1);
+    expect(CURRENT_ROWS[0].version > ROWS[0].version).toBe(true);
+    expect(CURRENT_ROWS.every((r) => r.isActive)).toBe(true);
+  });
+
+  it("changes nothing but the interview length: titles, keys and every other sentence are 0123's", () => {
+    for (const locale of [CANDIDATE_LOCALE, STAFF_LOCALE]) {
+      const before = row(locale);
+      const after = currentRow(locale);
+      expect(after.title).toBe(before.title);
+      expect(after.requiredConsents).toEqual(before.requiredConsents);
+      expect(before.body.split(DURATION_BEFORE)).toHaveLength(2);
+      expect(after.body).toBe(before.body.replace(DURATION_BEFORE, DURATION_AFTER));
+      expect(after.body).not.toContain('about 20 minutes');
+    }
+  });
+
+  it('pins the release, keys and both digests in its own verification block', () => {
+    expect(CURRENT_VERIFY).toContain(`v_release constant text := '${CURRENT_ROWS[0].version}'`);
+    expect(CURRENT_VERIFY).toContain(
+      `v_candidate_md5 constant text := '${md5(currentRow(CANDIDATE_LOCALE).body)}'`,
+    );
+    expect(CURRENT_VERIFY).toContain(
+      `v_staff_md5 constant text := '${md5(currentRow(STAFF_LOCALE).body)}'`,
+    );
+    expect(CURRENT_VERIFY).toMatch(/v_newest is distinct from v_release/);
+    expect(CURRENT_VERIFY.match(/raise exception '0129: /g)).toHaveLength(4);
+  });
+});
+
 describe('0123 versus the SQL assertions', () => {
   const release = sqlConstant(/release constant text := '([^']+)'/);
 
   it('proves the shipped release, locales and keys', () => {
-    expect(release).toBe(ROWS[0].version);
+    expect(release).toBe(CURRENT_ROWS[0].version);
     expect(sqlConstant(/candidate_locale constant text := '([^']+)'/)).toBe(CANDIDATE_LOCALE);
     expect(sqlConstant(/staff_locale constant text := '([^']+)'/)).toBe(STAFF_LOCALE);
     const contract = JSON.parse(

@@ -8,6 +8,7 @@
 | Date | 2026-10-05 |
 | Base commit | `origin/main` @ `eec54af` (#332). Do not base work on the parent checkout `fix/phone-consent-latency-opener`; it is about 50 commits behind. |
 | Status | APPROVED by owner 2026-10-06 (all decisions D1-D18 at recommended defaults); implementation in progress |
+| Revision | 2026-10-16 (PR #374): 20-minute role-play, ~30-minute session, 65-minute hold (migration 0128). Session counts derived from the hold are restated at 65: about 33 a month in steady state (was 40), 8 with legacy browser traffic (was 10). Monthly minute totals are pool-bound and roughly unchanged (33 x 65 = 2,145 vs 40 x 55 = 2,200), so the storage and cost projections computed "at 40 a month" still bound the monthly spend. |
 | Inputs | <ul><li>Scout isolation report, including its §13 corrections.</li><li>Research on four topics: the LiveKit free plan, storage pricing, in-worker A/V recording, and DeepSeek.</li><li>Fact-check dated 2026-10-05. Where it differs from the research, its corrected values are used.</li><li>The draft plan.</li><li>Five adversarial critiques: phone isolation, conversation/assessment, free-plan capacity, security/privacy, and delivery/testability. Every finding is dispositioned in Appendix A.</li></ul> |
 | Conventions | <ul><li>Paths are relative to the repo root at `eec54af`.</li><li>"est." means an estimate, not a measurement.</li><li>"Deploys" values come from the path rules in `deploy-fly.yml:156-174`.</li><li>"IST window" means 09:00-21:00 IST.</li></ul> |
 
@@ -16,10 +17,10 @@
 ## 1. Executive summary
 
 ### What we build
-- **A ~20-minute AI interview on the existing WebRTC lane** (Fly app `project-hello-voice`, worker `browser-screener`). The lane becomes **R1-only**. The interview has four parts:
+- **A ~30-minute AI interview on the existing WebRTC lane** (Fly app `project-hello-voice`, worker `browser-screener`). The lane becomes **R1-only**. The interview has four parts:
   - 3-4 min icebreaker;
   - a scripted ~1 min announcement that the bot will now role-play a learner for evaluation, plus a ready check;
-  - 12-14 min sales role-play;
+  - 20 min sales role-play (owner decision 2026-10-16; it was 12-14 min), announced at its start;
   - ~2 min wrap-up.
 - **The learner** is one of 4 rotating, US-based, calibrated personas.
   - All four objection families are delivered through a deterministic, worker-owned schedule.
@@ -61,21 +62,21 @@
 
 > **Locked decision 14 cannot be met as stated: the free LiveKit plan cannot carry "under 10 R1/day".**
 >
-> - **Per-R1 cost:** each R1 uses about **45 WebRTC participant-minutes** (typical), **55** for planning and about **60** worst case. Both the candidate and our self-hosted agent are billed.
+> - **Per-R1 cost:** each R1 uses about **57-60 WebRTC participant-minutes** (typical), **65** for planning and about **70** worst case (since the 20-minute role-play of 2026-10-16; it was 45 / 55 / 60). Both the candidate and our self-hosted agent are billed.
 > - **The pool:** LiveKit Build has **5,000 minutes a month**, as a hard cap **shared with phone**. When it runs out, the phone agent cannot join calls until the 1st of the next month.
 > - **The demand:** 10 a day is about 220 sessions, roughly 10,000-12,000 minutes, or 2-2.4 times the whole pool.
 > - **Realistic free-plan capacity** after legacy browser screening is switched off:
->   - **about 40 R1 sessions a month** (about 2 per weekday, retakes included);
->   - about **20-25** in a month that also carries test sessions;
->   - about **10** if legacy browser screening kept running.
+>   - **about 33 R1 sessions a month** (about 1.5 per weekday, retakes included; 40 at the 55-minute hold before 0128);
+>   - about **17-21** in a month that also carries test sessions;
+>   - about **8** if legacy browser screening kept running.
 > - A second free LiveKit project adds nothing, because free allowances are pooled per user.
 >
 > **Owner choice:**
 >
 > | Option | What it means |
 > |---|---|
-> | **A (recommended default, honours "no upgrade")** | Stay on Build. Derive the monthly cap from measured usage (§3.2), starting at **40 a month in steady state**, and review after 2 months. |
-> | **B** | Move to LiveKit Ship ($50/month, 150,000 minutes) if HR needs more than about 40 a month. This reverses decision 14, so only the owner can choose it. |
+> | **A (recommended default, honours "no upgrade")** | Stay on Build. Derive the monthly cap from measured usage (§3.2), starting at **33 a month in steady state**, and review after 2 months. |
+> | **B** | Move to LiveKit Ship ($50/month, 150,000 minutes) if HR needs more than about 33 a month. This reverses decision 14, so only the owner can choose it. |
 > | **C** | Option A now, plus a written trigger: if HR demand exceeds the cap in 2 consecutive months, the owner revisits B. |
 
 ### Needs the owner this week
@@ -120,7 +121,7 @@
 |---|---|---|---|
 | 1 | Replace browser screening. The WebRTC lane becomes R1-only; phone is untouched; `prompting.system_prompt` is kept; leave a seam for coding rounds. | <ul><li>`R1_LANE_MODE=r1_only` on the browser app routes every browser room to a lazily imported `r1_session`, immediately after the phone early return (`agent.py:11854-11861`).</li><li>Legacy `_run_session` stays in the code but is unreachable.</li><li>Legacy creation returns 410 (PR-L).</li><li>Seam: `interview_rounds.kind` and the per-kind worker module.</li></ul> | Legacy retirement moves **before Stage A** (D12), so browser screening is unavailable from early November even if R1 slips. Deleting legacy code later would mean editing phone test pins; we recommend never deleting it. |
 | 2 | Sales Program Advisor only | One new R1 role row (`roles.interview_kind='sales_r1'`) and one kind, `sales_r1` | The R1 role is blocked from Ashby mappings by a DB trigger plus a server 400. |
-| 3 | ~20 min: 3-4 icebreaker / ~1 transition / 12-14 role-play / ~2 wrap-up | Phase machine and timing arithmetic in §5.1. Role-play hard exit 14:00; session hard cap 24:00; residency backstop 1,800 s. | — |
+| 3 | ~30 min: 3-4 icebreaker / ~1 transition / 20 role-play / ~2 wrap-up (2026-10-16; it was ~20 min with a 12-14 min role-play) | Phase machine and timing arithmetic in §5.1. Role-play hard exit 20:00; session hard cap 30:00; residency backstop 2,160 s. | — |
 | 4 | Rotating pool of 3-4 US personas at the same difficulty | 4 normalised persona cards (§5.5), a simulated-candidate equivalence study before Stage B, and surface variants | The single TTS voice is female (`simran`, `fly.toml:23`), so all personas are women (D7). |
 | 5 | All four objection families | Primary line plus an unconditional push for every family, and an F1 counter. Delivered deterministically by the worker (§5.6). Missing any family blocks auto-status. | — |
 | 6 | Earned close; needs revealed only when probed | <ul><li>Progressive disclosure: deep needs reach the LLM only after a probe.</li><li>The commitment level is computed by the worker.</li><li>Commitment lines are spoken by script.</li><li>A commitment and concession guard backs this up (§5.3, §5.8).</li></ul> | — |
@@ -131,7 +132,7 @@
 | 11 | Same TTS voice; only the announcement marks the switch | Single voice; scripted transition and exit lines | Optional on-screen phase label and lead card (D8). |
 | 12 | DeepSeek V4 Flash, reusing existing wiring | `livekit.plugins.openai.LLM` against the official endpoint with `DEEPSEEK_API_KEY` (§5.14), plus the smoke harness (S0-B) | <ul><li>The canonical id is `deepseek-flash`; `deepseek-v4-flash` is a temporary alias for the same model (D9).</li><li>Legal must accept PRC processing (D11).</li></ul> |
 | 13 | Storage: R2 preferred, Supabase Pro acceptable; how much does each give? | Verified numbers in §3.5. **Recommendation: R2.** | — |
-| 14 | Under 10 R1/day at launch; stay on the free Build plan | Budget guard and measured cap (§3) | **Infeasible as stated.** About 40 a month (Option A/B/C, §1). |
+| 14 | Under 10 R1/day at launch; stay on the free Build plan | Budget guard and measured cap (§3) | **Infeasible as stated.** About 33 a month (Option A/B/C, §1). |
 | 15 | Planning only; 3 adversarial reviews per PR; squash-merge on green CI; merge outside the IST window; migrations auto-apply | Merge gate in §10. Additions: a zero-live-phone and zero-live-R1 check before **any** `app/api`, `app/voice-livekit` or migration merge; latest merge 08:00 IST in the 07:00-08:30 slot; CI hygiene first (PR-pre). | — |
 
 ### 2.2 Open decisions (recommended defaults)
@@ -142,7 +143,7 @@
 | D2 | World-facts sheet (sales lead) | <ul><li>Discount↔plan mapping; cohort start; enrolment deadline; seats statement; active seasonal offer (if any); weekly hours; class format.</li><li>A "does NOT offer" list: job guarantee, refunds beyond policy, discounts above $1,500.</li><li>Shared with candidates through the prep guide and with the scorer, never with the learner LLM.</li></ul> | PR-4b |
 | D3 | What R1 writes to `candidates.status` | <ul><li>**Advance** → `advanced` immediately (CAS).</li><li>**Reject** → "R1 reject pending" for **24 h**, which HR can cancel, then `rejected`.</li><li>**Hold** → no write; an "R1 hold" flag.</li><li>Every write goes to `audit_events`.</li><li>Auto-status stays **off** until the calibration in §6.6 passes.</li></ul> | PR-5 |
 | D4 | Retention | <ul><li>Video: 90 days, deleted by the app, with an R2 lifecycle rule at 97 days as backstop.</li><li>R1 transcripts and scores: follow D-009 (indefinite today, not Legal-approved) unless Legal sets a shorter R1 period, which `r1.sweep` would then implement.</li><li>The notice states whichever applies.</li></ul> | PR-3 (notice), PR-8 |
-| D5 | Monthly cap and behaviour when exhausted | <ul><li>Cap = formula in §3.2 (steady state about 40). Auto-pause at 80% of estimated total until two monthly reconciliations agree within 5%, then 85%.</li><li>Send R1 is blocked at the cap.</li><li>A link already sent shows "temporarily unavailable, your link stays valid", and its expiry is extended by the pause (at most +7 days).</li></ul> | PR-2 |
+| D5 | Monthly cap and behaviour when exhausted | <ul><li>Cap = formula in §3.2 (steady state about 33). Auto-pause at 80% of estimated total until two monthly reconciliations agree within 5%, then 85%.</li><li>Send R1 is blocked at the cap.</li><li>A link already sent shows "temporarily unavailable, your link stays valid", and its expiry is extended by the pause (at most +7 days).</li></ul> | PR-2 |
 | D6 | Metric weights | Probing 25 / Objections 25 / Communication 20 / Urgency & close 15 / Negotiation 15. Product knowledge off in v1. | PR-2 seed |
 | D7 | Persona gender | All 4 personas are women (single female voice) | PR-4b |
 | D8 | On-screen phase label and lead card | Yes, for accessibility and task clarity; the voice is unchanged | PR-6 |
@@ -161,7 +162,7 @@
 
 | Meter | Build cap (shared, hard) | Per R1 | Basis |
 |---|---|---|---|
-| WebRTC participant-minutes | 5,000/month | **~45 typical / 55 planning / ~60 worst** | See below |
+| WebRTC participant-minutes | 5,000/month | **~57-60 typical / 65 planning / ~70 worst** | See below |
 | Downstream data | 50 GB | ~0.10 GB (360p15, ≤500 kbps, simulcast off); about 0.016 GB audio-only | The agent subscribes to the camera to record it. A 720p simulcast slip would be about 0.3 GB. |
 | Agent audio recordings (observability) | 1,000 min | **0** | `record=False`, all keys off. Today's browser lane uses `record={"audio":True,"transcript":True,...}` (`agent.py:12227-12231`). |
 | Observability events | 100,000 | 0 | Same |
@@ -171,10 +172,10 @@
 | Concurrent connections / agent sessions | 100 / 5 | 2-3 / 1 | R1 live concurrency **1**. Combined R1 + live phone ≤4, enforced at admission. |
 
 WebRTC participant-minutes, per participant:
-- candidate 20.5-22 min;
-- agent 22-24.5 min. The agent is dispatched before the token, and stays alone in the room for ≤1.5 min while the recording finishes;
+- candidate 26.5-28 min;
+- agent 28-30.5 min. The agent is dispatched before the token, and stays alone in the room for ≤1.5 min while the recording finishes;
 - preflight 0.2-0.5 min (10 s minimum per attempt);
-- worst case adds PRE_JOIN 2 min, the 24:00 hard cap and one rejoin.
+- worst case adds PRE_JOIN 2 min, the 30:00 hard cap and one rejoin.
 
 Metering facts:
 - per-second billing with a 10 s minimum (since 2026-08-24);
@@ -190,11 +191,11 @@ Metering facts:
 | Auto-pause line | 4,000 (80%), then 4,250 (85%) | 85% only after two monthly dashboard reconciliations agree with our estimate within 5% |
 | Phone allocation | 1,500 × 1.2 = 1,800 | An assumption, **not a ceiling**. Unanswered dials bill agent minutes (`PHONE_PARTICIPANT_WAIT_SEC=60`, `fly.phone.toml:441`), and so do canary rooms. S0-A measures it. |
 | Planned test minutes | Per month (calendar below) | Logged as ledger entries |
-| **R1 cap (sessions)** | **floor((pause line − 1.2 × measured trailing-30-day non-R1 minutes − planned test minutes) / 55)** | Recomputed monthly; the owner approves it |
+| **R1 cap (sessions)** | **floor((pause line − 1.2 × measured trailing-30-day non-R1 minutes − planned test minutes) / 65)** | Recomputed monthly; the owner approves it |
 
 Worked values:
-- non-R1 = 1,500, no tests: (4,000 − 1,800) / 55 = **40**; at 85%, 44;
-- with legacy browser still running at the snapshot level (2,847): (4,000 − 3,416) / 55 = **10**. **That is why legacy cutover comes first.**
+- non-R1 = 1,500, no tests: (4,000 − 1,800) / 65 = **33**; at 85%, 37 (40 and 44 at the 55-minute hold before 0128);
+- with legacy browser still running at the snapshot level (2,847): (4,000 − 3,416) / 65 = **8**. **That is why legacy cutover comes first.**
 
 **Capacity calendar (est.):**
 
@@ -202,10 +203,10 @@ Worked values:
 |---|---|---|---|
 | Oct 2026 | ~150 (S0-E; 1-2 S0-C confirmation runs; S0-C matrix runs on a self-hosted `livekit-server`) | 0 | 0 |
 | Nov 2026 | ~550 (Stage A0 + A, ≥12 sessions) | 0 | 0 |
-| Dec 2026 | ~360 (Stage A2 + PR-9 confirmation) | Stage B from about Dec 14 | 20 (half month; the formula gives 33) |
-| Jan 2027 onward | ~50 | steady | ~40 (from the formula) |
+| Dec 2026 | ~360 (Stage A2 + PR-9 confirmation) | Stage B from about Dec 14 | 20 (half month; the formula gives 28) |
+| Jan 2027 onward | ~50 | steady | ~33 (from the formula) |
 
-Demand against the pool: 10/day on weekdays is about 220/month, about 9,500-12,000 minutes. **The supportable average is about 2 R1 per weekday.**
+Demand against the pool: 10/day on weekdays is about 220/month, about 9,500-12,000 minutes. **The supportable average is about 1.5 R1 per weekday.**
 
 ### 3.3 Budget guard that protects phone (PR-1, PR-2, PR-3)
 
@@ -222,7 +223,7 @@ Demand against the pool: 10/day on weekdays is about 220/month, about 9,500-12,0
    - **Phone admission is never gated.**
    - Concurrency test in the `recovery_concurrency_*` style.
 2. **Holds are month-agnostic.**
-   - Send R1 holds 55 minutes. Attempt start converts the hold; expiry or cancellation releases it. A retake holds 55 more when it starts.
+   - Send R1 holds 65 minutes (55 before migration 0128). Attempt start converts the hold; expiry or cancellation releases it. A retake holds 65 more when it starts.
    - Actual minutes are attributed by ledger timestamp.
 3. **Self-metered estimate.** The view `v_webrtc_minutes_estimate` sums:
    - R1 ledger rows (the worker posts agent connect and disconnect plus candidate connected seconds; falls back to session timestamps when rows are missing);
@@ -242,13 +243,13 @@ Demand against the pool: 10/day on weekdays is about 220/month, about 9,500-12,0
      - the R1 allocation;
      - SIP ≥70%;
      - any quota or join failure;
-     - an R1 past 26 min;
+     - an R1 past 32 min;
      - an agent alone in an R1 room for more than 2 min;
      - any egress on an R1 room.
 6. **Savers:**
    - camera and mic acquired before exchange;
    - R1 preflight ≤10 s, at most 10 per link lifetime and 3 per minute;
-   - residency 1,800 s instead of 3,600;
+   - residency 2,160 s instead of 3,600;
    - no live-listen participants;
    - development and S0-C on local or self-hosted `livekit-server`.
 
@@ -347,7 +348,7 @@ Peak hours are 01:00-04:00 and 06:00-10:00 UTC on weekdays, excluding PRC holida
 
 1. **Send R1.** `POST /api/candidates/:id/interview-rounds` (admin, or the owning interviewer, claimed by CAS) checks:
    - `R1_ENABLED` and the settings;
-   - budget headroom (a 55-minute hold);
+   - budget headroom (a 65-minute hold);
    - no active round;
    - `decision_use_blocked_at IS NULL`;
    - **no non-terminal phone engagement and no pending `phone.assessment`** (a later phone score would overwrite R1, `assessment.ts:718-727`);
@@ -365,7 +366,7 @@ Peak hours are 01:00-04:00 and 06:00-10:00 UTC on weekdays, excluding PRC holida
    - `owner_id = round.created_by`;
    - the attempt row with its fixed persona.
 
-   It returns an attempt token plus a per-attempt **nonce** (kept in sessionStorage). A rejoin within 90 s needs the link plus the nonce. If R1 is busy: `409 r1_busy` ("another interview is finishing, try again in about 20 minutes; your link stays valid").
+   It returns an attempt token plus a per-attempt **nonce** (kept in sessionStorage). A rejoin within 90 s needs the link plus the nonce. If R1 is busy: `409 r1_busy` ("another interview is finishing, try again in about 30 minutes; your link stays valid").
 7. **Exchange.** `POST /api/r1/exchange`:
    - DeepSeek health probe (`GET /user/balance` `is_available` plus a 1-token completion, 3 s deadline, cached 60 s). On failure, "temporarily unavailable" at zero LiveKit cost.
    - Create room `screening-<sessionId>` (emptyTimeout 180 s, maxParticipants 3, **no egress**) and CAS created→waiting.
@@ -411,19 +412,19 @@ Clocks:
 | `OPENING` | Candidate present | L-OPEN played | ~40 s |
 | `ICEBREAKER` | After L-OPEN | Soft: S ≥ 3:30 and ≥4 candidate turns, at the next bot-turn boundary. Hard: S = 4:30. | 3-4 min |
 | `TRANSITION` | Icebreaker exit (**attempt counted**, D1) | L-TRANSITION → `READY` (candidate says "ready", or 20 s) → L-PICKUP | ≤90 s |
-| `ROLEPLAY` | After L-PICKUP | Soft: R ≥ 13:00 at a turn boundary. Early: R ≥ 10:00 and commitment resolved. **Hard: R = 14:00 or S = 20:00.** | 12-14 min |
+| `ROLEPLAY` | After L-PICKUP | Soft: R ≥ 19:00 at a turn boundary. Early: R ≥ 14:00 and commitment resolved. **Hard: R = 20:00 or S = 26:00.** | 20 min |
 | `ASIDE` (sub-state) | Coaching, confusion, silence step 2, or mute | Aside played → `ROLEPLAY` | ≤3 per session; R paused |
 | `ROLEPLAY_EXIT` | Role-play exit | L-EXIT played | ~12 s |
 | `WRAPUP` | After L-EXIT | 2 questions answered, "no questions", 2:00 elapsed, or 20 s silence | ≤2:00 |
-| `CLOSING` | Wrap-up exit, or **any forced close** (S = 24:00, residency, drain) | L-CLOSE / L-SYSTEM-STOP played (not interruptible) | ≤15 s |
+| `CLOSING` | Wrap-up exit, or **any forced close** (S = 30:00, residency, drain) | L-CLOSE / L-SYSTEM-STOP played (not interruptible) | ≤15 s |
 | `FINISHING` | Close played, or candidate gone | Recorder finish → ledger → `complete_session` / `fail_session` → room delete | ≤60 s target, 90 s max |
 | `PAUSED_DISCONNECTED` | Candidate left | Rejoin (link + nonce) within 90 s → previous phase; otherwise `FINISHING` (outcome `candidate_left`) | 90 s |
 | `ABORTED` | 3 consecutive LLM/TTS failures, any 401/402, or worker drain | L-SYSTEM-STOP → `FINISHING` → `fail(provider_error \| shutdown_forced)`, not counted | — |
 
-**Timing arithmetic** (pinned by a unit test):
-- Normal path: icebreaker hard 4:30 + transition ≤1:30 → role-play ends by S 20:00 → exit 0:12 + wrap-up 2:00 + close 0:15 = **S ≤ 22:27**.
-- Disconnects pause R; the S = 24:00 hard cap absorbs them.
-- Maximum agent residency = PRE_JOIN 2:00 + 24:00 + CLOSING 0:15 + FINISHING 1:30 = 27:45 < `R1_SESSION_MAX_RESIDENCY_SEC=1800`, leaving 2:15 margin.
+**Timing arithmetic** (pinned by a unit test; revised 2026-10-16 for the 20-minute role-play):
+- Normal path: icebreaker hard 4:30 + transition ≤1:30 → role-play ends by S 26:00 → exit 0:12 + wrap-up 2:00 + close 0:15 = **S ≤ 28:27**.
+- Disconnects pause R; the S = 30:00 hard cap absorbs them.
+- Maximum agent residency = PRE_JOIN 2:00 + 30:00 + CLOSING 0:15 + FINISHING 1:30 = 33:45 < `R1_SESSION_MAX_RESIDENCY_SEC=2160`, leaving 2:15 margin.
 - A residency or hard-cap expiry always goes through CLOSING → FINISHING, never straight to a terminal write.
 - The R1 session never installs the goodbye regex (`agent.py:1060-1065, 12203-12218`).
 
@@ -435,10 +436,10 @@ Clocks:
 
 | ID | Exact text |
 |---|---|
-| L-OPEN | "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and I'll be running your first-round interview for the Sales Program Advisor role. It takes about twenty minutes. We'll spend a few minutes getting to know you, then I'll switch into a short sales role-play where I play a prospective learner, and we'll finish with a couple of minutes for your questions. Let's start: could you walk me through your background, especially any sales or customer-facing work you've done?" |
-| L-TRANSITION | "Thank you, {first_name}. We'll now move to the role-play. I'll play a prospective learner so we can evaluate how you handle a real sales call. The learner is {lead_name} from {lead_city}, who filled in a form on our website about the Data Science course a few days ago. You're the Program Advisor calling her back. Your goal is to understand her needs and help her reach a decision, as you would on a real call, using the course details from your preparation guide. It will run for about twelve to fourteen minutes, and I'll stay in character until I say, 'Let's pause the role-play here.' When you're ready, just say 'ready' and she'll pick up." |
+| L-OPEN | "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and I'll be running your first-round interview for the Sales Program Advisor role. It takes about thirty minutes. We'll spend a few minutes getting to know you, then I'll switch into a twenty-minute sales role-play where I play a prospective learner, and we'll finish with a couple of minutes for your questions. Let's start: could you walk me through your background, especially any sales or customer-facing work you've done?" |
+| L-TRANSITION | "Thank you, {first_name}. We'll now move to the role-play. I'll play a prospective learner so we can evaluate how you handle a real sales call. The learner is {lead_name} from {lead_city}, who filled in a form on our website about the Data Science course a few days ago. You're the Program Advisor calling her back. The role-play runs for twenty minutes, and within those twenty minutes your goal is to convince her: understand her needs and help her decide to enrol, as you would on a real call, using the course details from your preparation guide. I'll stay in character until I say, 'Let's pause the role-play here.' When you're ready, just say 'ready' and she'll pick up." |
 | L-PICKUP | Per persona, e.g. "Hello? Yes, this is Meera speaking." |
-| L-TIME-CUE (learner, R ≈ 11:00) | "Just so you know, I've only got a couple of minutes before my next call." |
+| L-TIME-CUE (learner, R ≈ 17:00) | "Just so you know, I've only got a couple of minutes before my next call." |
 | L-EXIT | "Let's pause the role-play here. I'm stepping out of the learner's role now; this is Christy, your interviewer, again. Thank you, that's the end of the role-play." |
 | L-WRAP | "Before we finish, do you have any questions about the role or the next steps?" |
 | L-NO-FEEDBACK | "I'm sorry, I can't share any feedback on how it went." |
@@ -583,21 +584,21 @@ Clocks:
 | Move | Opens | Deadline (forced at the next learner turn) |
 |---|---|---|
 | Discovery (protected): the learner answers only what is asked | 0:00 | — |
-| Q-A | 2:00, if format not yet covered | 3:30 |
-| F3 primary, then push (unconditional, next learner turn) | Advisor's first value or pitch statement, or 3:30 | 5:00 |
-| F2 primary, then push | ≥2 candidate turns after the F3 push was answered | 7:00 |
-| F1 anchor, then counter (after the first concession or refusal) | ≥2 candidate turns after F2; immediately if the advisor quotes a price first | 9:00 |
-| Q-B | After F1 resolved, if not covered | 9:45 |
-| F4 primary, then push | ≥2 candidate turns after F1/Q-B | 10:30 |
-| L-TIME-CUE | 11:00 | — |
-| Commitment window | All 4 families (primary + push + counter) delivered **and** R ≥ 9:00 | If no ask by 13:00 → the WEAK line |
+| Q-A | A curiosity topic since R1-Q (no deadline) | — |
+| F3 primary, then push (unconditional, next learner turn) | Advisor's first value or pitch statement, or 5:00 | 7:10 |
+| F2 primary, then push | ≥2 candidate turns after the F3 push was answered | 10:40 |
+| F1 anchor, then counter (after the first concession or refusal) | ≥2 candidate turns after F2; immediately if the advisor quotes a price first | 13:30 |
+| Q-B | A curiosity topic since R1-Q (no deadline) | — |
+| F4 primary, then push | ≥2 candidate turns after F1 | 15:30 |
+| L-TIME-CUE | 17:00 (owed until 19:00) | — |
+| Commitment window | All 4 families (primary + push + counter) delivered **and** R ≥ 13:00 | If no ask by 19:00 → the WEAK line |
 
 Rules:
 - At most **one owed move per learner turn**.
 - Never open a family until the previous exchange is answered; later deadlines shift instead.
 - Delivery is confirmed by fuzzy match of the exact line on the learner text. If it was missed, it stays owed. The delivery time and any slip are logged.
 - **Any family slipping more than 60 s, or never delivered, excludes the session from auto-status.**
-- An early close attempt before R = 10:00 gets "Oh wait, before you go…" plus the next owed move, **once**. On a second attempt the call goes to `ROLEPLAY_EXIT`.
+- An early close attempt before R = 14:00 gets "Oh wait, before you go…" plus the next owed move, **once**. On a second attempt the call goes to `ROLEPLAY_EXIT`.
 
 Escalation if S0-B shows poor adherence: the learner's primaries are spoken verbatim via `session.say` after a short LLM acknowledgement.
 
@@ -678,7 +679,7 @@ The silence loop is copied with R1 wording and windows; the shared constants are
   4. `close_room_once`.
 
   The R1 outcome goes on `interview_round_attempts.outcome`.
-- **Counting contract (PR-4a worker, PR-8 `r1.sweep`; capacity model, migration 0119).** The worker writes `attempts_counted` (and `interview_round_attempts.counted`) **while the session is still live**, at TRANSITION (D1), never after the terminal write. The capacity model treats a round with `charged_attempt_number > attempts_counted` and no live session as a hold kept for the link, and the sweep, cancel and expiry refund it for good once the link is dead (three starts used, a lapsed link, or a terminal status). A count written afterwards can lose that race: a counted third start, or a session that ends just before the link expires, is refunded before it is counted and its 55 minutes are lost from `minutes_used`. An **uncount after a system failure** (`worker_crash`, `provider_error`, `shutdown_forced`) is written in the **same transaction** that terminalizes the session; crash recovery below does the same. Cancelling a round during a live session refunds nothing for the same reason. See `docs/runbooks/r1-operations.md`, "Worker contract for counting".
+- **Counting contract (PR-4a worker, PR-8 `r1.sweep`; capacity model, migration 0119).** The worker writes `attempts_counted` (and `interview_round_attempts.counted`) **while the session is still live**, at TRANSITION (D1), never after the terminal write. The capacity model treats a round with `charged_attempt_number > attempts_counted` and no live session as a hold kept for the link, and the sweep, cancel and expiry refund it for good once the link is dead (three starts used, a lapsed link, or a terminal status). A count written afterwards can lose that race: a counted third start, or a session that ends just before the link expires, is refunded before it is counted and its 65 minutes are lost from `minutes_used`. An **uncount after a system failure** (`worker_crash`, `provider_error`, `shutdown_forced`) is written in the **same transaction** that terminalizes the session; crash recovery below does the same. Cancelling a round during a live session refunds nothing for the same reason. See `docs/runbooks/r1-operations.md`, "Worker contract for counting".
 - **Normal close:** L-CLOSE sets the participant attribute `phase=ended`, using a plain lowercase key (camel-casing trap, #332), so the page leaves.
 - **Crash recovery:** `r1.sweep` turns any attempt still `in_progress` after residency + 5 min into `fail(worker_crash)` (not counted; the terminal write and any uncount are one transaction, see the counting contract above). It then:
   - completes the multipart upload;
@@ -1145,7 +1146,7 @@ R1 copies phone patterns and never imports `phone.py` helpers (`PHONE_*` env, mo
 
 **Pre-merge gate for ANY merge touching `app/voice-livekit/`, `app/api/` or migrations — R1 PRs and phone hotfixes alike**
 - Merge in **07:00-08:30 IST**; latest merge 08:00; no Quality re-run or deploy dispatch after 08:15.
-- `r1_settings.paused=true` at least 30 minutes ahead.
+- `r1_settings.paused=true` at least 40 minutes ahead (a session can last up to the 2,160 s residency).
 - Read-only checks, all zero, otherwise abort:
   - live R1 sessions;
   - `phone_call_attempts` in admitted, ringing, answered_unclassified, human or machine state with `lease_expires_at > now()`;
@@ -1252,14 +1253,14 @@ The S0-E webhook question is already answered (phone uses webhooks) and needs no
   - scorecard complete and 3-run stable ≥90%;
   - realism rated ≥4/5;
   - no phone canary regression;
-  - measured minutes per R1 ≤55.
+  - measured minutes per R1 ≤65.
 - **Stage A2** (≥6 sessions with recording):
   - 100% `ready`; A/V skew <150 ms; finish p95 ≤60 s;
   - 0 VAD-lag warnings; CPU p95 <60%; drops <2%;
   - Chrome and Safari playback and seek;
   - DSAR delete test passes on a staff record.
 - **Stage B** (shadow; ≥30 real candidates; daily review):
-  - average minutes per R1 ≤55;
+  - average minutes per R1 ≤65;
   - budget estimate within 10% of the dashboard;
   - double ratings collected;
   - gold-set and equivalence gates already passed.
@@ -1286,7 +1287,7 @@ The S0-E webhook question is already answered (phone uses webhooks) and needs no
 | # | Risk | Impact | Mitigation |
 |---|---|---|---|
 | 1 | Shared 5,000-minute WebRTC cap exhausted | Phone agents cannot join; phone stops until the 1st | Legacy cutover first; atomic admission; measured cap; 80→85% pause plus run-rate pause; daily reconciliation; S0-C off Cloud |
-| 2 | Demand (10/day) far above capacity (~40/month) | HR frustration | Owner Option A/B/C in writing; budget visible on the card; links extend while paused |
+| 2 | Demand (10/day) far above capacity (~33/month) | HR frustration | Owner Option A/B/C in writing; budget visible on the card; links extend while paused |
 | 3 | Phone reserve not a hard ceiling | Less R1 headroom | Estimate includes phone attempts ×1.2; pause line is the real protection |
 | 4 | Every worker or API merge restarts phone and live R1 | Dropped calls or interviews | Zero-live gate for all merges, automated in the deploy job; 07:00-08:00 slot; drain arithmetic |
 | 5 | R1 code or config crashes the shared worker or API at boot | Phone outage | Lazy imports; non-throwing R1 config; boot tests; no prewarm work |
@@ -1410,7 +1411,7 @@ Codes: PI = phone isolation, CA = conversation/assessment, FC = free-plan capaci
 | CA-18 | Test security erosion | Fixed | 3 surface variants per persona; versioning |
 | CA-19 | Hard exit 14:30 exceeds 12-14 | Fixed | R hard exit 14:00 |
 | FC-1 | Concurrency 2 on a shared name (blocker) | Fixed | Concurrency 1; PR-C2; S0-C two-job fault case |
-| FC-2 | Phase maxima exceed the residency cap | Fixed | §5.1 arithmetic plus unit test; residency 1,800 s; expiries go through CLOSING |
+| FC-2 | Phase maxima exceed the residency cap | Fixed | §5.1 arithmetic plus unit test; residency 2,160 s (1,800 s before the 20-minute role-play); expiries go through CLOSING |
 | FC-3 | Non-happy exits skip the finish; no crash recovery | Fixed | §5.12 invariant; shutdown budget; `r1.sweep` recovery; orphan rescue |
 | FC-4 | Durable artifact is silent video; loss window larger than stated | Partially accepted | 5 MiB parts (2-4 min window); 2-minute audio checkpoints; split player. The final remux is kept until S0-D proves fMP4 seeking; live AAC muxing is adopted only if remux is dropped, keeping proven RecorderIO alignment. |
 | FC-5 | Budget guard gaps (legacy, lag, 10 s minimums, atomicity, month boundary) | Fixed | §3.3: ×1.15, daily reconciliation, 80% line, atomic RPC, month-agnostic holds, 12:00 UTC, legacy first |

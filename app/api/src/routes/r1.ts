@@ -54,7 +54,7 @@ r1Router.post('/candidates/:id/interview-rounds', requireRole('interviewer'), as
     const { data: role } = await supabase.from('roles').select('id').eq('interview_kind', 'sales_r1').maybeSingle();
     if (!role) return res.status(409).json({ error: 'r1_role_not_configured', message: 'Sales R1 role has not been seeded' });
     const token = generateInviteToken();
-    // DB-backed eligibility and the 55-minute reservation are one transaction.
+    // DB-backed eligibility and the 65-minute reservation are one transaction.
     const { data: created, error } = await supabase.rpc('r1_send_round', { p_candidate_id: candidate.id, p_role_id: role.id, p_created_by: req.authUser!.id, p_link_token_digest: hashInviteToken(token), p_candidate_status_at_send: candidate.status, p_expires_at: new Date(Date.now() + 72 * 3600_000).toISOString() });
     if (error) return res.status(503).json({ error: 'service_unavailable' });
     if (created?.status !== 'ok') { const code = created?.status ?? 'round_create_failed'; return res.status(409).json({ error: ['capacity_exhausted','paused','disabled'].includes(code) ? `r1_${code}` : code }); }
@@ -102,7 +102,7 @@ r1Router.post('/interview-rounds/:id/cancel-pending-reject', requireRole('interv
 } catch (e) { next(e); } });
 
 r1Router.get('/admin/r1/settings', requireRole('admin'), async (_req, res, next) => { try { const { data, error } = await supabase.from('r1_settings').select('*').eq('singleton', true).single(); if (error) throw error; res.json({ ...data, runtime: getR1Config() }); } catch (e) { next(e); } });
-// Settings meaning (0119): `monthly_cap_minutes` is the owner-approved R1 allocation in minutes (sessions x 55)
+// Settings meaning (0119): `monthly_cap_minutes` is the owner-approved R1 allocation in minutes (sessions x 65)
 // and applies in BOTH livekit targets; `pause_line_minutes` is the total Cloud-pool pause line and applies only
 // while `livekit_target` is 'cloud'. A dashboard reading is stamped by the database (its own clock and its own
 // pool estimate, atomically, via r1_stamp_dashboard_reading): this route never computes either value and a
@@ -165,13 +165,13 @@ async function r1Session(req: Request, res: Response): Promise<any | null> { con
 r1InternalRouter.post('/context', workerAuth, async (req, res, next) => { try { const session = await r1Session(req, res); if (!session) return; const [{ data: candidate, error: candidateError }, { data: attempt, error: attemptError }, { data: settings, error: settingsError }] = await Promise.all([supabase.from('candidates').select('name').eq('id', session.candidate_id).single(), supabase.from('interview_round_attempts').select('round_id,attempt_number,persona_id,persona_version,persona_variant,content_sha').eq('session_id', session.id).single(), supabase.from('r1_settings').select('enabled,paused,advance_threshold,hold_threshold,livekit_target').eq('singleton', true).single()]); if (candidateError || attemptError || settingsError || !attempt || !settings) return res.status(503).json({ error: 'service_unavailable' }); const raw = typeof candidate?.name === 'string' ? candidate.name.trim().split(/\s+/)[0] : ''; const first_name = /^[A-Za-z '-]{1,24}$/.test(raw) ? raw : 'there'; res.json({ first_name, round_id: session.interview_round_id, attempt_id: session.id, attempt, settings, recording: await projectRecordingContext(supabase as never, session.interview_round_id) }); } catch (e) { next(e); } });
 /**
  * The longest a non-preflight ledger row may report (the DB bound `chk_r1_usage_event_bounds`
- * and `r1_record_usage` both enforce it). A session is capped at 1800 s of residency, but the
- * worker measures a residency-timeout exit AFTER the closing line, the ended attribute and the
- * transcript drain, so it can legitimately report a little more (about 1830 s plus event-loop
- * lag). Such a row is CLAMPED to the maximum, not refused: refusing it (400) lost the session's
+ * and `r1_record_usage` both enforce it, 0128). A session is capped at 2160 s of residency (the
+ * 20-minute role-play), but the worker measures a residency-timeout exit AFTER the closing line,
+ * the ended attribute and the transcript drain, so it can legitimately report a little more (about
+ * 2190 s plus event-loop lag). Such a row is CLAMPED to the maximum, not refused: refusing it (400) lost the session's
  * agent-minutes ledger row. A negative or non-finite value is still refused.
  */
-const R1_USAGE_MAX_SECONDS = 1830;
+const R1_USAGE_MAX_SECONDS = 2190;
 /** A preflight row is a 10 s reservation made by the API; it is never clamped. */
 const R1_USAGE_PREFLIGHT_MAX_SECONDS = 15;
 r1InternalRouter.post('/usage', workerAuth, async (req, res, next) => { try { const session = await r1Session(req, res); if (!session) return; const body = req.body ?? {}; const key = typeof body.event_key === 'string' ? body.event_key : ''; const preflight = body.participant_kind === 'preflight'; const max = preflight ? R1_USAGE_PREFLIGHT_MAX_SECONDS : R1_USAGE_MAX_SECONDS; const occurred = body.occurred_at ? new Date(body.occurred_at).getTime() : Date.now(); if (!['candidate','agent','preflight','manual_test'].includes(body.participant_kind) || !Number.isFinite(body.seconds) || body.seconds < 0 || (preflight && body.seconds > max) || !/^[A-Za-z0-9:_-]{1,128}$/.test(key) || !Number.isFinite(occurred) || Math.abs(Date.now() - occurred) > 120_000) return res.status(400).json({ error: 'invalid_usage' }); const seconds = Math.min(body.seconds, max); const { data, error } = await supabase.rpc('r1_record_usage', { p_session_id: session.id, p_round_id: session.interview_round_id, p_participant_kind: body.participant_kind, p_event: body.event === 'disconnect' ? 'disconnect' : 'connect', p_seconds: seconds, p_event_key: key }); if (error) return res.status(503).json({ error: 'service_unavailable' }); res.status(data?.duplicate ? 200 : 201).json({ ok: true, duplicate: !!data?.duplicate }); } catch (e) { next(e); } });

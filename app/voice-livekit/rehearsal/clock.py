@@ -1,7 +1,7 @@
 """The modelled call clock: how many seconds one exchange of a rehearsal call takes.
 
-The owed-move schedule, the close window (R >= 9:00), the time cue (11:00 to 13:00) and the
-13:00 stall all depend on the role-play clock R, and the earlier S0-B harness used a fixed
+The owed-move schedule, the close window (R >= 13:00), the time cue (17:00 to 19:00) and the
+19:00 stall all depend on the role-play clock R, and the earlier S0-B harness used a fixed
 105 s per turn, so 18 turns covered 31 minutes and the early-concession rule only covered the
 first five turns.  This model is calibrated on the owner's session b58c7d9c: 23 learner
 replies in about 14 minutes, i.e. about 35 s per exchange, with the advisor doing most of the
@@ -24,7 +24,7 @@ advisor reaction      U(1.5, 5.0) s                              human think tim
 ====================  =========================================  ===========================
 
 The advisor pace is the one calibration that matters.  On the owner's session the learner's time
-cue landed at turn 79 (11:00 to 13:00 window) and the 13:00 stall at turn 92, which a replay of
+cue landed at turn 79 (11:00 to 13:00 window on the 14-minute clock) and the 13:00 stall at turn 92, which a replay of
 that session's own word counts reproduces only at about 3.2 words per second (that advisor
 talked fast, and speech-to-text kept repeated fragments); at 2.6 the same turns land 100 s late.
 ``tests/test_r1_rehearsal_regression.py`` pins both anchors.

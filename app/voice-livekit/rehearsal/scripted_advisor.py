@@ -5,7 +5,7 @@
 metrics, the offline sweep and the regression test run without a network.  It reacts to what
 the learner just said with its own small keyword rules (never the engine's detectors): an
 objection it recognises is answered according to the level, discovery questions are asked in
-a fixed order, the close is asked around 9:30 (strong) or vaguely and late (average), and so
+a fixed order, the close is asked around 13:00 (strong) or vaguely and late (average), and so
 on.  The probes use phrasings the engine's genuine-probe detector accepts, which
 ``tests/test_r1_rehearsal_harness.py`` pins, so the hint and deep layers are exercised.
 
@@ -183,7 +183,7 @@ FAREWELL = (
     "Great, thanks for the conversation, {name}. Have a good day, bye!",
 )
 POST_COMMIT_TURNS = 3
-CLOSE_CALL_SEC = 600
+CLOSE_CALL_SEC = 840
 # ----------------------------------------------------------------------------- weak / pushy
 WEAK_PITCHES = (
     "Hello {name}, so our Data Science course is the best you will find, six months long, "
@@ -314,7 +314,7 @@ class ScriptedAdvisor:
         return found
 
     def _after_commit(self, text: str, r_sec: float) -> AdvisorTurn | None:
-        """Answer the learner's commitment, keep the call going until 10:00, then say goodbye.
+        """Answer the learner's commitment, keep the call going until 14:00, then say goodbye.
 
         A real advisor does not hang up on "send me the link": there are next steps to cover.
         The call is also what lets the role-play reach the 10-minute floor of the gate.
@@ -385,10 +385,10 @@ class ScriptedAdvisor:
             self._pitched += 1
             return AdvisorTurn(self._take("pitch", PITCH), "pitch", "")
         asked_f4 = self._answered.get("F4", 0) + self._answered.get("F4dm", 0) > 0
-        if r_sec >= 540 and (asked_f4 or r_sec >= 660) and self._close_asked < 3:
+        if r_sec >= 780 and (asked_f4 or r_sec >= 1020) and self._close_asked < 3:
             self._close_asked += 1
             return AdvisorTurn(self._take("close", CLOSE_STRONG), "close_ask", "")
-        if r_sec >= 420 and not self._urgency_done:
+        if r_sec >= 600 and not self._urgency_done:
             self._urgency_done = True
             return AdvisorTurn(self._take("urgency", URGENCY), "urgency", "")
         if self._turn % 4 == 0:
@@ -414,7 +414,7 @@ class ScriptedAdvisor:
         if self._pitched < len(PITCH):
             self._pitched += 1
             return AdvisorTurn(self._take("pitch", PITCH), "pitch", "")
-        if r_sec >= 700 and self._close_asked < 2:
+        if r_sec >= 1060 and self._close_asked < 2:
             self._close_asked += 1
             return AdvisorTurn(self._take("close", CLOSE_AVERAGE), "close_ask", "")
         return AdvisorTurn(self._take("value", VALUE), "pitch", "")

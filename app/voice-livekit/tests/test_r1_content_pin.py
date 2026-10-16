@@ -88,7 +88,11 @@ import r1_world
 # production): the guard rules that were worse than production are deleted, and with them their two
 # canned lines and the manifest keys that pinned them (ANCHOR_HEARD_REPLACEMENT, ANCHOR_HEARD_BELOW,
 # PRICE_UNCHANGED_REPLACEMENT).  No other pinned text changed.
-PINNED_CONTENT_SHA256 = "1a091adefe5ff622e39412e97f4df9bdbb76250f9708a9b5ba9494a7018e9d22"
+# Revision 15 (the 20-minute role-play, owner decision 2026-10-16): L-TRANSITION announces the
+# twenty minutes and the goal (convince the learner), L-OPEN says about thirty minutes and a
+# twenty-minute role-play, and the owed-move deadlines stretch to the longer call (F3 430, F2 640,
+# F1 810, F4 930).
+PINNED_CONTENT_SHA256 = "7064ebec45af365cba4e416c7ac84cf00b366a9b5d983b5a86bad8e4bf3bd5d8"
 
 CONTENT_MODULES = (
     "r1_text",

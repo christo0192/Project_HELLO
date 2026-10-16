@@ -39,7 +39,7 @@ Everything else is Fly secrets and database settings, set in the order below.
 ## Order at a glance
 
 ```text
-0  Preconditions (read-only), then PAUSE R1                  (30+ min before the merge)
+0  Preconditions (read-only), then PAUSE R1                  (40+ min before the merge)
 1  Zero-live and zero-browser-session checks (read-only)
 2  Rotate the spike SFU key, verify the SFU
 3  API FIRST: target r1 + R1 triple                          (no browser exchange from here on)
@@ -69,7 +69,7 @@ exchange answers `preparing`), so no candidate may be using the system then.
 - Merge window (runbook "Merge and deploy gate"): merge between 07:00 and 08:30
   IST, latest merge 08:00, no Quality re-run or deploy dispatch after 08:15.
   Steps 3 and 4 belong in that window. If you have waived the time window for
-  deploys, the zero-live checks and the 30 minute pause still apply.
+  deploys, the zero-live checks and the 40 minute pause still apply.
 
 Setup, once, at the start:
 
@@ -190,7 +190,7 @@ gh run list --workflow "Deploy (Fly)" --limit 5       # nothing queued or in_pro
 gh pr list --state open --search "phone in:title"      # a phone PR touching app/voice-livekit must not merge in this window
 ```
 
-### 0.5 PRODUCTION CHANGE: pause R1 (at least 30 minutes before the merge)
+### 0.5 PRODUCTION CHANGE: pause R1 (at least 40 minutes before the merge)
 
 Pausing blocks new R1 attempts and lets live ones finish. R1 is disabled, so
 this is belt and braces, and the runbook requires it for any merge that deploys
@@ -203,7 +203,7 @@ Or SQL:
 Invoke-R1Sql "update screening_v2.r1_settings set paused = true where singleton returning enabled, paused;"
 ```
 
-- [ ] Paused since (IST): __:__ (merge no earlier than 30 minutes after this)
+- [ ] Paused since (IST): __:__ (merge no earlier than 40 minutes after this)
 
 ---
 
@@ -418,7 +418,7 @@ the match closed (`preparing`).
 
 ### 4.2 Final gate, immediately before merging
 
-- [ ] Paused for at least 30 minutes (step 0.5) and inside the merge window.
+- [ ] Paused for at least 40 minutes (step 0.5) and inside the merge window.
 - [ ] Re-run all of step 1: every query empty.
 - [ ] The draft PR's checks are green on the exact commit that will be squashed
       (Quality, `supabase-check`, secret scan), rebased on the current `main`.
@@ -562,8 +562,8 @@ Then re-run the select above: one row.
 
 ### 6.2 PRODUCTION CHANGE: allocation, target, enabled (still paused)
 
-Set the allocation yourself: `monthly_cap_minutes` is sessions x 55 (for example
-20 x 55 = 1100). While it is still the default 4000 and never saved, enabling is
+Set the allocation yourself: `monthly_cap_minutes` is sessions x 65 (for example
+20 x 65 = 1300). While it is still the default 4000 and never saved, enabling is
 refused (`r1_allocation_not_set`), and in Mode A nothing else would cap R1.
 Naming `monthly_cap_minutes` in the statement is what stamps `allocation_set_at`.
 In Mode A (target `r1`) `pause_line_minutes` does not gate R1; leave it.
@@ -609,7 +609,7 @@ the repair then is to cancel the round and send a new one.
 2. **PRODUCTION CHANGE**: HR UI: candidate page -> R1 card -> **Send R1** -> tick
    the India-location attestation. **Copy the join link now**: it is shown once
    (`<WEB_ORIGIN>/candidate/r1#<token>`). Do not open it yet. Sending books a
-   55-minute hold against the allocation.
+   65-minute hold against the allocation.
 3. **PRODUCTION CHANGE**: find the round, then mark it staff.
 
 ```powershell
@@ -637,8 +637,8 @@ Invoke-R1Sql "update screening_v2.r1_settings set paused = false where singleton
 ## Step 7. The A0 smoke (at least 2 sessions)
 
 One live R1 session at a time (admission refuses a second one). Use a real
-device and a network typical of candidates. Each session is about 20 minutes (the
-worker caps residency at 1800 s). Keep these open: the join page with browser
+device and a network typical of candidates. Each session is about 30 minutes (the
+worker caps residency at 2160 s; the role-play alone is 20 minutes). Keep these open: the join page with browser
 devtools, `chrome://webrtc-internals`, and three log tails.
 
 ```powershell
@@ -690,7 +690,7 @@ Look for:
   `worker_crash`, `residency_timeout`, `shutdown_forced` or an infra failure.
 - The attempt is `counted = true` and the round `attempts_counted = 1`.
 - Ledger rows for `candidate` and `agent` (and the preflight), with plausible
-  seconds; `v_r1_budget_month` moved by about one session (the 55-minute hold
+  seconds; `v_r1_budget_month` moved by about one session (the 65-minute hold
   converted to booked minutes).
 - `r1_admin_log` contains `session_facts` (the worker posts it before the terminal
   transition, with every key the API parser reads; `first_audio_p95_ms` is the
@@ -804,7 +804,7 @@ Invoke-R1Sql "update screening_v2.r1_settings set livekit_target = 'cloud', paus
 - Apply the Cloud cap before admitting any session: with target `cloud`, both the
   allocation and the pool pause line apply. Permitted sessions are
   `floor((pause line - 1.2 * measured trailing-30-day non-R1 minutes - planned
-  Cloud test minutes) / 55)`, starting at the 4,000-minute line.
+  Cloud test minutes) / 65)`, starting at the 4,000-minute line.
 - Re-verify: worker registration on Cloud, health, step 1 queries.
 - Resume only on the owner's decision.
 

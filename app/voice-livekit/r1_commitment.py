@@ -27,8 +27,8 @@ from r1_text import (
     split_sentences,
 )
 
-COMMIT_PERMITTED_R_SEC = 540
-COMMIT_STALL_R_SEC = 780
+COMMIT_PERMITTED_R_SEC = 780
+COMMIT_STALL_R_SEC = 1140
 # An advisor whose turns average fewer words than this over at least ``THIN_MIN_TURNS`` turns has
 # not earned a commitment (the terse level of the rehearsal harness averages 5 to 6 words a turn,
 # every other level 31 or more, the unit tests' cooperative advisor 10).
@@ -1088,5 +1088,5 @@ def grade(evidence: CommitmentEvidence) -> Level:
 
 
 def commitment_permitted(r_sec: float, families_complete: bool) -> bool:
-    """A commitment other than the WEAK stall needs R >= 9:00 and all four families done."""
+    """A commitment other than the WEAK stall needs R >= 13:00 and all four families done."""
     return families_complete and r_sec >= COMMIT_PERMITTED_R_SEC

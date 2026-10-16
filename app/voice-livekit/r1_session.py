@@ -284,9 +284,9 @@ WRAPUP_SETTLE_SECONDS = 1.5
 WRAPUP_SETTLE_ACK_FACTOR = 2.0
 WRAPUP_SETTLE_LEAD_IN_FACTOR = 2.5
 WRAPUP_QUESTION_LIMIT = 2
-# Plan 5.1: role-play may end early once R >= 10:00 and the commitment is resolved.  The
+# Plan 5.1: role-play may end early once R >= 14:00 and the commitment is resolved.  The
 # phase machine only knows the hard caps, so the session applies the early rule itself.
-EARLY_EXIT_R_SEC = 600.0
+EARLY_EXIT_R_SEC = 840.0
 # The learner's one-line acknowledgement (plan 5.6 escalation step 1) is optional, the owed
 # line after it is not: an acknowledgement that is not done in time is dropped.  Missing this
 # cutoff is slowness the plan tolerates (5.11 fails a turn at its 12 s deadline or on a provider
@@ -499,8 +499,8 @@ def bounded_seconds(name: str, default: float, minimum: float, maximum: float) -
 
 
 def residency_seconds() -> float:
-    """Return the configured cap, never exceeding the plan's 30-minute residency."""
-    return bounded_seconds("R1_SESSION_MAX_RESIDENCY_SEC", 1800.0, 60.0, 1800.0)
+    """Return the configured cap, never exceeding the plan's 36-minute residency."""
+    return bounded_seconds("R1_SESSION_MAX_RESIDENCY_SEC", 2160.0, 60.0, 2160.0)
 
 
 def rejoin_grace_seconds() -> float:
@@ -1694,7 +1694,7 @@ class R1Interview:
         self._wake()
 
     def _schedule_forced_close(self) -> None:
-        """Schedule the S=24:00 forced close from activation (plan section 5.1)."""
+        """Schedule the S=30:00 forced close from activation (plan section 5.1)."""
         if self._forced_close_handle is not None:
             return
         loop = asyncio.get_running_loop()
@@ -1704,7 +1704,7 @@ class R1Interview:
         )
 
     def _on_forced_close_deadline(self) -> None:
-        """Route the S=24:00 cap through the normal CLOSING exit, like residency."""
+        """Route the S=30:00 cap through the normal CLOSING exit, like residency."""
         self._forced_close_due = True
         self._wake()
 
@@ -2366,7 +2366,7 @@ class R1Interview:
         return engine is not None and engine.exit_requested
 
     def _early_exit_due(self) -> bool:
-        """Plan 5.1's early exit: the commitment is resolved and R >= 10:00.
+        """Plan 5.1's early exit: the commitment is resolved and R >= 14:00.
 
         Evaluated at a candidate-turn boundary only (never when the learner finishes its own
         line), so the advisor's answer to the commitment is the turn L-EXIT then answers.
@@ -4028,7 +4028,7 @@ class R1Interview:
 
         Non-aside steps are bounded by the phase budget and are skipped for the
         phase end when the budget cannot cover their wait.  The aside step
-        (L-SIL-RP2) runs with role-play clock R PAUSED, so only the S=20:00 cap
+        (L-SIL-RP2) runs with role-play clock R PAUSED, so only the S=26:00 cap
         bounds it, not the remaining R budget.
         """
         for line_id, wait_seconds in prompts:
@@ -4290,7 +4290,7 @@ class R1Interview:
         return None
 
     async def _run_roleplay(self) -> str | None:
-        """Run the learner role-play until R=14:00, S=20:00, or a terminal outcome."""
+        """Run the learner role-play until R=20:00, S=26:00, or a terminal outcome."""
         while not self._roleplay_over():
             stop = await self._roleplay_turn()
             if stop == "phase_deadline":

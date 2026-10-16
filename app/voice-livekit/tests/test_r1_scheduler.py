@@ -74,7 +74,7 @@ def advisor_text(s: OwedMoveScheduler, index: int) -> str:
     return "Great question. Our instructors come from Google and the career support is strong."
 
 
-def run(period: float, until: float = 840.0, start: float | None = None):
+def run(period: float, until: float = 1200.0, start: float | None = None):
     s = make()
     r = period / 2 if start is None else start
     index = 0
@@ -99,21 +99,21 @@ class PlanTableTests(unittest.TestCase):
         self.assertEqual(
             deadlines,
             {
-                F3_PRIMARY: 300,
-                F3_PUSH: 300,
-                F2_PRIMARY: 450,
-                F2_PUSH: 450,
-                F1_ANCHOR: 570,
-                F1_COUNTER: 570,
-                F4_PRIMARY: 630,
-                F4_PUSH: 630,
+                F3_PRIMARY: 430,
+                F3_PUSH: 430,
+                F2_PRIMARY: 640,
+                F2_PUSH: 640,
+                F1_ANCHOR: 810,
+                F1_COUNTER: 810,
+                F4_PRIMARY: 930,
+                F4_PUSH: 930,
                 COMMIT_STALL: None,
                 TIME_CUE: None,
             },
         )
         self.assertEqual(sched.PLAN_VERSION, 2)
-        self.assertEqual(sched.F3_FALLBACK_OPEN_SEC, 210)
-        self.assertEqual(sched.TIME_CUE_SEC, 660)
+        self.assertEqual(sched.F3_FALLBACK_OPEN_SEC, 300)
+        self.assertEqual(sched.TIME_CUE_SEC, 1020)
         self.assertEqual(sched.SLIP_LIMIT_SEC, 60.0)
         self.assertEqual(sched.SPACING_TURNS, 2)
         self.assertEqual(sched.IDLE_GAP_TURNS, 3)
@@ -544,12 +544,12 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIsNone(turn(early, PITCH, 20))  # breathing room: one normal turn first
         self.assertEqual(turn(early, NEUTRAL, 60).id, F3_PRIMARY)  # the pitch is still fresh
 
-    def test_f3_primary_opens_at_3_30_without_a_pitch_once_it_has_been_quiet(self):
+    def test_f3_primary_opens_at_5_00_without_a_pitch_once_it_has_been_quiet(self):
         s = make()
         turn(s, OPENER, 20)
-        self.assertIsNone(turn(s, NEUTRAL, 150))
-        self.assertIsNone(turn(s, NEUTRAL, 190))  # before 3:30
-        self.assertEqual(turn(s, NEUTRAL, 215).id, F3_PRIMARY)
+        self.assertIsNone(turn(s, NEUTRAL, 215))
+        self.assertIsNone(turn(s, NEUTRAL, 270))  # before 5:00
+        self.assertEqual(turn(s, NEUTRAL, 305).id, F3_PRIMARY)
 
     def test_a_classical_or_deliver_statement_is_not_format_coverage(self):
         s = make()
@@ -628,7 +628,7 @@ class StaysOwedTests(unittest.TestCase):
             self.assertIsNotNone(s.confirm_if_spoken(move.id, text, 131), text)
 
     def test_the_stall_without_markers_is_proven_by_its_verbatim_line(self):
-        s = run(40.0, until=700)
+        s = run(40.0, until=1060)
         self.assertTrue(
             s.spoken_proves(
                 COMMIT_STALL,
@@ -689,10 +689,10 @@ class FamilyChainTests(unittest.TestCase):
         s = make()
         turn(s, OPENER, 20)
         turn(s, PITCH, 60)  # F3 primary
-        self.assertEqual(turn(s, NEUTRAL, 340).id, F3_PUSH)  # a long gap: the push is late
-        move = turn(s, NEUTRAL, 420)
+        self.assertEqual(turn(s, NEUTRAL, 490).id, F3_PUSH)  # a long gap: the push is late
+        move = turn(s, NEUTRAL, 600)
         # Only one turn has passed since the push (spacing needs two) and the topic never
-        # came up, but F2's deadline (7:30) is within the next learner turn.
+        # came up, but F2's deadline (10:40) is within the next learner turn.
         self.assertEqual(s._since(F3_PUSH), 1)
         self.assertEqual((move.id, move.forced), (F2_PRIMARY, True))
 
@@ -758,8 +758,8 @@ class PriceFamilyTests(unittest.TestCase):
         s = make()
         turn(s, OPENER, 20)
         turn(s, PRICE_ONLY, 60)
-        s.observe_candidate_turn(NEUTRAL, 540)
-        move = s.next_move(540)
+        s.observe_candidate_turn(NEUTRAL, 780)
+        move = s.next_move(780)
         self.assertEqual((move.id, move.forced), (F1_COUNTER, True))
 
     def test_the_price_wrap_turn_is_the_turn_after_the_counter(self):
@@ -794,7 +794,7 @@ class F4Tests(unittest.TestCase):
     def test_f4_needs_f3_f2_and_f1_complete(self):
         s = make()
         turn(s, OPENER, 20)
-        self.assertFalse(s._hard_ready(s._states[F4_PRIMARY], 700))
+        self.assertFalse(s._hard_ready(s._states[F4_PRIMARY], 1060))
 
     def test_f4_follows_the_close_talk_and_then_its_push(self):
         s = make()
@@ -815,47 +815,47 @@ class F4Tests(unittest.TestCase):
 
 
 class CueAndStallTests(unittest.TestCase):
-    def test_time_cue_waits_for_eleven_minutes(self):
+    def test_time_cue_waits_for_seventeen_minutes(self):
         s = make()
         issued = []
-        for text, r in ((OPENER, 20), (NEUTRAL, 400), (NEUTRAL, 440), (NEUTRAL, 640)):
+        for text, r in ((OPENER, 20), (NEUTRAL, 440), (NEUTRAL, 500), (NEUTRAL, 1000)):
             move = turn(s, text, r)
             issued.append(move.id if move else None)
         self.assertNotIn(TIME_CUE, issued)
         self.assertEqual(s._states[TIME_CUE].status, "pending")
 
-    def test_time_cue_is_delivered_after_eleven_minutes_when_idle(self):
-        s = run(40.0, until=700)
+    def test_time_cue_is_delivered_after_seventeen_minutes_when_idle(self):
+        s = run(40.0, until=1060)
         self.assertEqual(s._states[TIME_CUE].status, "delivered")
-        self.assertGreaterEqual(s._states[TIME_CUE].delivered_sec, 660)
+        self.assertGreaterEqual(s._states[TIME_CUE].delivered_sec, 1020)
 
     def test_time_cue_is_not_owed_once_the_close_window_for_the_stall_opens(self):
         s = make()
         turn(s, OPENER, 20)
         cue = s._states[TIME_CUE]
-        self.assertFalse(s._hard_ready(cue, 659))
-        self.assertTrue(s._hard_ready(cue, 660))
-        self.assertTrue(s._hard_ready(cue, 779))
-        self.assertFalse(s._hard_ready(cue, 780))
+        self.assertFalse(s._hard_ready(cue, 1019))
+        self.assertTrue(s._hard_ready(cue, 1020))
+        self.assertTrue(s._hard_ready(cue, 1139))
+        self.assertFalse(s._hard_ready(cue, 1140))
 
-    def test_commit_stall_is_owed_after_13_minutes_if_all_families_are_done(self):
-        s = run(40.0, until=700)
+    def test_commit_stall_is_owed_after_19_minutes_if_all_families_are_done(self):
+        s = run(40.0, until=1060)
         self.assertEqual(s._states[COMMIT_STALL].status, "pending")
-        self.assertTrue(s.commit_permitted(700))
-        move = turn(s, NEUTRAL, 790)
+        self.assertTrue(s.commit_permitted(1060))
+        move = turn(s, NEUTRAL, 1150)
         self.assertEqual(move.id, COMMIT_STALL)
         self.assertTrue(s.commitment_resolved)
 
     def test_commit_stall_is_not_owed_once_commitment_is_resolved(self):
-        s = run(40.0, until=700)
+        s = run(40.0, until=1060)
         s.mark_commitment_resolved()
-        self.assertIsNone(turn(s, NEUTRAL, 800))
+        self.assertIsNone(turn(s, NEUTRAL, 1160))
 
-    def test_commit_stall_is_not_owed_before_13_minutes_or_with_families_open(self):
-        s = run(40.0, until=700)
-        self.assertIsNone(turn(s, NEUTRAL, 770))
-        partial = run(70.0, until=300)
-        self.assertFalse(partial._hard_ready(partial._states[COMMIT_STALL], 800))
+    def test_commit_stall_is_not_owed_before_19_minutes_or_with_families_open(self):
+        s = run(40.0, until=1060)
+        self.assertIsNone(turn(s, NEUTRAL, 1130))
+        partial = run(70.0, until=430)
+        self.assertFalse(partial._hard_ready(partial._states[COMMIT_STALL], 1160))
 
 
 class SlipTests(unittest.TestCase):
@@ -863,19 +863,19 @@ class SlipTests(unittest.TestCase):
         s = make()
         turn(s, OPENER, 20)
         turn(s, PITCH, 60, confirm=False)  # F3 primary is owed and enabled at 60
-        s.observe_candidate_turn(NEUTRAL, 400)  # a long monologue: next turn at 400
-        move = s.next_move(400)
-        delivery = s.confirm_delivered(move.id, 400)
+        s.observe_candidate_turn(NEUTRAL, 530)  # a long monologue: next turn at 530
+        move = s.next_move(530)
+        delivery = s.confirm_delivered(move.id, 530)
         self.assertEqual(move.id, F3_PRIMARY)
-        self.assertEqual(delivery.slip_sec, 100.0)  # due at its 300 s deadline
+        self.assertEqual(delivery.slip_sec, 100.0)  # due at its 430 s deadline
         self.assertEqual(delivery.lateness_sec, 100.0)
 
     def test_a_clock_gated_move_cannot_hide_behind_a_monologue(self):
         s = make()
         turn(s, OPENER, 20)
-        s.observe_candidate_turn(NEUTRAL, 450)  # nothing was said from 20 s to 450 s
-        move = s.next_move(450)
-        delivery = s.confirm_delivered(move.id, 450)
+        s.observe_candidate_turn(NEUTRAL, 580)  # nothing was said from 20 s to 580 s
+        move = s.next_move(580)
+        delivery = s.confirm_delivered(move.id, 580)
         self.assertEqual(move.id, F3_PRIMARY)
         self.assertEqual(delivery.slip_sec, 150.0)
 
@@ -883,9 +883,9 @@ class SlipTests(unittest.TestCase):
         s = make()
         turn(s, OPENER, 20)
         turn(s, PITCH, 60, confirm=False)
-        s.observe_candidate_turn(NEUTRAL, 400)
-        s.confirm_delivered(s.next_move(400).id, 400)  # F3 primary, 100 s late
-        push = turn(s, NEUTRAL, 450)  # the push: next turn, so it is on time
+        s.observe_candidate_turn(NEUTRAL, 530)
+        s.confirm_delivered(s.next_move(530).id, 530)  # F3 primary, 100 s late
+        push = turn(s, NEUTRAL, 580)  # the push: next turn, so it is on time
         self.assertEqual(push.id, F3_PUSH)
         self.assertEqual(s.deliveries_by_id()[F3_PUSH].slip_sec, 0.0)
         self.assertEqual(s.deliveries_by_id()[F3_PUSH].lateness_sec, 150.0)
@@ -894,8 +894,8 @@ class SlipTests(unittest.TestCase):
         s = make()
         turn(s, OPENER, 20)
         turn(s, PITCH, 60, confirm=False)
-        s.observe_candidate_turn(NEUTRAL, 400)
-        s.confirm_delivered(s.next_move(400).id, 400)
+        s.observe_candidate_turn(NEUTRAL, 530)
+        s.confirm_delivered(s.next_move(530).id, 530)
         summary = s.summary()
         self.assertTrue(summary["excluded_from_auto_status"])
         self.assertIn("family_slip:F3", summary["exclusion_reasons"])
@@ -905,8 +905,8 @@ class SlipTests(unittest.TestCase):
         s = make()
         turn(s, OPENER, 20)
         turn(s, PITCH, 60, confirm=False)
-        s.observe_candidate_turn(NEUTRAL, 340)  # 40 s after the 300 s deadline
-        s.confirm_delivered(s.next_move(340).id, 340)
+        s.observe_candidate_turn(NEUTRAL, 470)  # 40 s after the 430 s deadline
+        s.confirm_delivered(s.next_move(470).id, 470)
         self.assertNotIn("family_slip:F3", s.summary()["exclusion_reasons"])
 
     def test_a_family_never_delivered_excludes_the_session_only_when_final(self):
@@ -961,20 +961,20 @@ class EarlyCloseTests(unittest.TestCase):
         decision = s.register_close_attempt(100)
         self.assertEqual(decision.move.id, F3_PUSH)
 
-    def test_attempts_after_ten_minutes_exit_once_commitment_is_resolved(self):
+    def test_attempts_after_fourteen_minutes_exit_once_commitment_is_resolved(self):
         s = make()
         turn(s, OPENER, 20)
         s.mark_commitment_resolved()
-        self.assertEqual(s.register_close_attempt(620).action, "exit")
+        self.assertEqual(s.register_close_attempt(860).action, "exit")
 
-    def test_attempts_after_thirteen_minutes_exit(self):
+    def test_attempts_after_nineteen_minutes_exit(self):
         s = make()
         turn(s, OPENER, 20)
-        self.assertEqual(s.register_close_attempt(800).action, "exit")
+        self.assertEqual(s.register_close_attempt(1160).action, "exit")
 
     def test_with_nothing_left_to_redirect_the_learner_stalls_when_the_window_is_open(self):
-        s = run(40.0, until=700)
-        decision = s.register_close_attempt(595)
+        s = run(40.0, until=1060)
+        decision = s.register_close_attempt(835)
         self.assertEqual(decision.action, "stall")
         self.assertEqual(decision.move.id, COMMIT_STALL)
 
@@ -991,7 +991,7 @@ class EarlyCloseTests(unittest.TestCase):
 
 
 class SchedulabilityTests(unittest.TestCase):
-    """Families must be schedulable in a 12-14 minute role-play (S0-B defects 1-2)."""
+    """Families must be schedulable in an 18-20 minute role-play (S0-B defects 1-2)."""
 
     def test_every_family_is_delivered_with_no_slip_at_realistic_cadences(self):
         for period in (30.0, 40.0, 45.0, 50.0, 55.0, 60.0):
@@ -1003,11 +1003,11 @@ class SchedulabilityTests(unittest.TestCase):
                 for delivery in s.deliveries():
                     if delivery.family is not None:  # the cue's timing is not graded
                         self.assertLessEqual(delivery.slip_sec, 60.0, delivery)
-                self.assertLessEqual(s._states[F4_PUSH].delivered_sec, 800.0)
+                self.assertLessEqual(s._states[F4_PUSH].delivered_sec, 1160.0)
 
     def test_deadlines_hold_when_turns_are_irregular(self):
         s = make()
-        times = [15, 70, 95, 150, 190, 260, 300, 330, 380, 440, 470, 520, 560, 610, 650, 700]
+        times = [21, 100, 136, 214, 271, 372, 430, 472, 542, 626, 671, 749, 800, 870, 990, 1060]
         for index, r in enumerate(times, start=1):
             turn(s, advisor_text(s, index), float(r))
         self.assertTrue(s.all_families_complete)
@@ -1024,7 +1024,7 @@ class SchedulabilityTests(unittest.TestCase):
             with self.subTest(period=period):
                 s = make()
                 r = period / 2
-                while r < 840:
+                while r < 1200:
                     turn(s, SHORT, r)
                     r += period
                 self.assertTrue(s.all_families_complete)

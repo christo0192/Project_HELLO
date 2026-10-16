@@ -205,7 +205,7 @@ export function R1SettingsPage() {
   const dirty = !sameDraft(draft, draftFromSettings(saved));
   const cap = Number(draft.monthly_cap_minutes);
   const allocationKnown = Number.isInteger(cap) && cap > 0;
-  const hold = saved.admission_hold_minutes ?? 55;
+  const hold = saved.admission_hold_minutes ?? 65;
   // The pause line gates sends only on LiveKit Cloud; an unknown target is read as gating,
   // the cautious reading (as in Mission Control).
   const target: 'cloud' | 'r1' = saved.livekit_target === 'r1' ? 'r1' : 'cloud';

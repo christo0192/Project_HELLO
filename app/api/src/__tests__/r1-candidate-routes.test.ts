@@ -191,7 +191,7 @@ describe('POST /api/r1/status', () => {
       can_start: false,
       role_title: 'Sales Program Advisor',
       format: {
-        duration_minutes: 20,
+        duration_minutes: 30,
         camera_required: true,
         microphone_required: true,
         interviewer: 'ai',
@@ -1280,8 +1280,8 @@ describe('POST /api/r1/attempts', () => {
     ]);
     expect([a.status, b.status].sort()).toEqual([201, 409]);
     const busy = a.status === 409 ? a : b;
-    expect(busy.body).toEqual({ error: 'r1_busy', retry_after_sec: 1200 });
-    expect(busy.headers['retry-after']).toBe('1200');
+    expect(busy.body).toEqual({ error: 'r1_busy', retry_after_sec: 1800 });
+    expect(busy.headers['retry-after']).toBe('1800');
     expect(h.tables.call_sessions).toHaveLength(1);
   });
 

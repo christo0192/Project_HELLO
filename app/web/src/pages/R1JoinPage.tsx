@@ -77,7 +77,7 @@ type Stage =
   | { name: 'ended'; kind: R1EndedKind };
 
 const DEFAULT_ROLE_TITLE = 'Sales Program Advisor';
-const DEFAULT_MINUTES = 20;
+const DEFAULT_MINUTES = 30;
 /** A cold worker takes 15-25 s to boot; poll the exchange for at most about 36 s. */
 const PREPARING_ATTEMPTS = 12;
 const PREPARING_RETRY_MS = 3_000;
@@ -150,9 +150,9 @@ function joinErrorMessage(kind: R1ErrorKind, liveElsewhere: boolean): string {
   switch (kind) {
     case 'busy':
       // The link's own interview is live and this tab holds no nonce for it: it is the
-      // person's, not "another interview", and 20 minutes is the wrong thing to wait for.
+      // person's, not "another interview", and 30 minutes is the wrong thing to wait for.
       if (liveElsewhere) return `${OPEN_ELSEWHERE} Your link stays valid.`;
-      return 'Another interview is finishing. Please try again in about 20 minutes. '
+      return 'Another interview is finishing. Please try again in about 30 minutes. '
         + 'Your link stays valid.';
     case 'rate_limited':
       return 'Too many tries in a short time. Please wait a minute and try again.';

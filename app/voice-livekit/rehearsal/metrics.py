@@ -878,7 +878,7 @@ def misfire_metrics(exchanges: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
             intent == "farewell" or _ADVISOR_FAREWELL.search(advisor_text)
         ):
             found.append({"exchange": index + 1, "kind": "no_one_leaving"})
-        if _TIME_CUE_WORDS.search(text) and float(ex.get("r_sec") or 0.0) < 600:
+        if _TIME_CUE_WORDS.search(text) and float(ex.get("r_sec") or 0.0) < 840:
             found.append({"exchange": index + 1, "kind": "time_cue_too_early"})
         if intent in ASK_INTENTS and (
             fuzzy_contains(text, WEAK_LINE) or fuzzy_contains(text, LEGACY_DEFLECTION)

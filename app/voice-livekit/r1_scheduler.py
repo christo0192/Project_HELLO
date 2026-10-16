@@ -16,7 +16,7 @@ curiosity topics of the free replies (``r1_roleplay``).
 Rules enforced here (each has a unit test):
 
 * Discovery is protected: nothing is owed until the advisor makes a genuine value or
-  pitch statement, or R reaches 3:30.  A greeting that merely names "Program Advisor" or
+  pitch statement, or R reaches 5:00.  A greeting that merely names "Program Advisor" or
   "Interview Kickstart" is not a pitch (S0-B defect 3).
 * At most ONE owed move per learner turn.
 * A family is not opened until the previous family's exchange is answered.
@@ -33,7 +33,7 @@ Rules enforced here (each has a unit test):
   effective deadline; lateness against the nominal one is logged as well.
 * A move that was not delivered (interrupted, TTS failure) stays owed.  Delivery is proven
   by the move's markers in the text that was actually played (``confirm_if_spoken``).
-* L-TIME-CUE is only owed between 11:00 and 13:00 (after that the WEAK stall takes the
+* L-TIME-CUE is only owed between 17:00 and 19:00 (after that the WEAK stall takes the
   turn), and a polite "thanks for your time" opener is not a farewell (``is_close_attempt``
   ignores the first minute, and that phrase until 4:00).  A farewell must END its
   sentence (only a name, "for now" or a closing courtesy may follow) and no later sentence
@@ -80,9 +80,9 @@ IDLE_GAP_TURNS = SPACING_TURNS + 1
 # An advisor turn this long (and not a bare "Okay") counts as a substantive answer to a primary.
 SUBSTANTIVE_ANSWER_WORDS = 8
 PUSH_PATIENCE_TURNS = 2
-F3_FALLBACK_OPEN_SEC = 210
-TIME_CUE_SEC = 660
-EARLY_CLOSE_BEFORE_SEC = 600
+F3_FALLBACK_OPEN_SEC = 300
+TIME_CUE_SEC = 1020
+EARLY_CLOSE_BEFORE_SEC = 840
 MATCH_THRESHOLD = 0.78
 
 F3_PRIMARY = "F3-PRIMARY"
@@ -138,7 +138,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F3",
         "primary",
         "There's so much free stuff on YouTube and Coursera \u2014 why pay?",
-        300,
+        430,
         True,
         brief=(
             "you doubt it is worth paying when so much free material is available online "
@@ -171,7 +171,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F3",
         "push",
         "Will this actually get me a job, with all these layoffs?",
-        300,
+        430,
         True,
         brief=(
             "you wonder whether this would actually help you get a job, given the layoffs "
@@ -210,7 +210,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F2",
         "primary",
         "My schedule is already packed; I'm not sure I can keep up for six months.",
-        450,
+        640,
         True,
         brief=(
             "you are worried that your schedule is already packed and that you cannot keep "
@@ -251,7 +251,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F2",
         "push",
         "What happens if I fall behind?",
-        450,
+        640,
         True,
         brief="you ask what happens if you fall behind",
         markers=(
@@ -272,7 +272,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F1",
         "primary",
         "$9,000 is a lot. I've heard people got it for around $7,000 \u2014 can you do that?",
-        570,
+        810,
         True,
         brief=(
             "tell the advisor that $9,000, the price on the website, feels like a lot, that you "
@@ -292,7 +292,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F1",
         "push",
         "Can you do a little better than that?",
-        570,
+        810,
         True,
         brief="you push once more for a better price, because the number is above what you hoped",
         markers=(
@@ -332,7 +332,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F4",
         "primary",
         "Let me think about it \u2014 maybe I'll join the next cohort.",
-        630,
+        930,
         True,
         brief="you are not ready to decide today and might wait for the next cohort",
         markers=(
@@ -370,7 +370,7 @@ PLAN: tuple[MoveSpec, ...] = (
         "F4",
         "push",
         "I'd also need to talk to my {decision_maker}.",
-        630,
+        930,
         True,
         brief="you add that you would also need to talk to your {decision_maker} first",
         markers=(
@@ -1138,11 +1138,11 @@ class OwedMoveScheduler:
         return None if counter.delivered_turn is None else counter.delivered_turn + 1
 
     def commit_permitted(self, r_sec: float) -> bool:
-        """The close window: all four families done and R >= 9:00."""
+        """The close window: all four families done and R >= 13:00."""
         return self.all_families_complete and r_sec >= COMMIT_PERMITTED_R_SEC
 
     def mark_commitment_resolved(self) -> None:
-        """Record that a grade-level commitment line (or the 13:00 stall) was spoken."""
+        """Record that a grade-level commitment line (or the 19:00 stall) was spoken."""
         self.commitment_resolved = True
 
     def note_price_answered(self) -> None:
@@ -1199,7 +1199,7 @@ class OwedMoveScheduler:
         if move_id == F4_PUSH:
             return (since(F4_PRIMARY) or 0) >= 1
         if move_id == TIME_CUE:
-            # Only inside the 11:00-13:00 window: after the close window opens for the
+            # Only inside the 17:00-19:00 window: after the close window opens for the
             # WEAK stall, "I've only got a couple of minutes" would be meaningless.
             in_window = TIME_CUE_SEC <= r_sec < COMMIT_STALL_R_SEC
             return in_window and self.open_family is None
@@ -1259,7 +1259,7 @@ class OwedMoveScheduler:
         """When a move that just became ready could first have been spoken.
 
         A turn-gated move became ready at this learner turn.  A clock-gated move (the F3
-        fallback at 3:30, the cue at 11:00) became ready at its clock time, so a long
+        fallback at 5:00, the cue at 17:00) became ready at its clock time, so a long
         candidate monologue cannot hide a late first learner turn.
         """
         move_id = state.spec.id
@@ -1385,7 +1385,7 @@ class OwedMoveScheduler:
 
         A move with markers is proven by them (the model voices it in its own words, or the
         scripted fallback does: every variant satisfies the markers).  A move without markers
-        (the 13:00 stall) is proven by the verbatim line, as before.
+        (the 19:00 stall) is proven by the verbatim line, as before.
         """
         state = self._states.get(move_id)
         if state is None:
@@ -1446,11 +1446,11 @@ class OwedMoveScheduler:
         return None
 
     def register_close_attempt(self, r_sec: float) -> CloseDecision:
-        """Handle a farewell: redirect once before R = 10:00, otherwise exit.
+        """Handle a farewell: redirect once before R = 14:00, otherwise exit.
 
-        First attempt before 10:00 is answered by the next owed move, once (the learner
+        First attempt before 14:00 is answered by the next owed move, once (the learner
         stops the advisor: the redirect is an intent the model voices).  A second attempt, or
-        any attempt once R >= 10:00 with the commitment resolved (or R >= 13:00), goes to
+        any attempt once R >= 14:00 with the commitment resolved (or R >= 19:00), goes to
         ROLEPLAY_EXIT.  If nothing is left to redirect with, the learner delivers the WEAK
         stall when the close window is open, else the call exits.
         """

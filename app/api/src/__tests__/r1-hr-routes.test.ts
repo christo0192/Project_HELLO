@@ -90,7 +90,7 @@ function baseTables(): Tables {
         paused: false,
         monthly_cap_minutes: 4000,
         pause_line_minutes: 4000,
-        admission_hold_minutes: 55,
+        admission_hold_minutes: 65,
         dashboard_minutes: 0,
         dashboard_read_at: null,
       },
@@ -136,7 +136,10 @@ interface Capacity {
   poolGuard: number;
 }
 
-/** Mode A, 20 sessions allocated (20 x 55 = 1,100), one hold outstanding, an idle pool. */
+/**
+ * Mode A, a 1,100-minute allocation (20 sessions at the old 55-minute hold, 16 at today's 65), one
+ * 55-minute hold outstanding (production, 2026-10-08), an idle pool.
+ */
 function capacityOf(overrides: Partial<Capacity> = {}): Capacity {
   return {
     target: 'r1',
@@ -273,7 +276,7 @@ describe('GET /api/interview-rounds/availability', () => {
 
   it('reports ready, with the hold, when R1 is on and the snapshot admits', async () => {
     const response = await availability('interviewer');
-    expect(response.body).toEqual({ state: 'ready', hold_minutes: 55 });
+    expect(response.body).toEqual({ state: 'ready', hold_minutes: 65 });
   });
 
   it('reports not_deployed when the environment switch is off, reading no table', async () => {
@@ -287,7 +290,7 @@ describe('GET /api/interview-rounds/availability', () => {
   it('reports not_deployed when R1_ENABLED is unset (production today)', async () => {
     delete process.env.R1_ENABLED;
     const response = await availability('interviewer');
-    expect(response.body).toEqual({ state: 'not_deployed', hold_minutes: 55 });
+    expect(response.body).toEqual({ state: 'not_deployed', hold_minutes: 65 });
     expect(mocks.from).not.toHaveBeenCalled();
     expect(mocks.rpc).not.toHaveBeenCalled();
   });
@@ -367,7 +370,7 @@ describe('GET /api/interview-rounds/availability', () => {
         [],
         withCapacity(PRODUCTION_MODE_A),
       );
-      expect(response.body).toEqual({ state: 'ready', hold_minutes: 55 });
+      expect(response.body).toEqual({ state: 'ready', hold_minutes: 65 });
       // The pool is past the line by thousands of minutes, and does not matter here.
       const asked = snapshotFor(PRODUCTION_MODE_A, 0);
       expect(asked.pool_headroom as number).toBeLessThan(0);
@@ -381,14 +384,14 @@ describe('GET /api/interview-rounds/availability', () => {
     });
 
     it('is capacity_exhausted when the R1 allocation has no room for the hold, pool idle', async () => {
-      // 1,046 committed + the 55 hold = 1,101 > the 1,100-minute allocation; the pool is idle.
+      // 1,036 committed + the 65 hold = 1,101 > the 1,100-minute allocation; the pool is idle.
       const response = await availability(
         'interviewer',
         baseTables(),
         [],
-        withCapacity(capacityOf({ cap: 1100, r1Committed: 1046, poolGuard: 0, poolCommitted: 1046 })),
+        withCapacity(capacityOf({ cap: 1100, r1Committed: 1036, poolGuard: 0, poolCommitted: 1036 })),
       );
-      expect(response.body).toEqual({ state: 'capacity_exhausted', hold_minutes: 55 });
+      expect(response.body).toEqual({ state: 'capacity_exhausted', hold_minutes: 65 });
     });
 
     it('is ready when one Send exactly fits the allocation, and not one hair over', async () => {
@@ -396,14 +399,14 @@ describe('GET /api/interview-rounds/availability', () => {
         'interviewer',
         baseTables(),
         [],
-        withCapacity(capacityOf({ cap: 1100, r1Committed: 1045 })),
+        withCapacity(capacityOf({ cap: 1100, r1Committed: 1035 })),
       );
       expect(fits.body.state).toBe('ready');
       const over = await availability(
         'interviewer',
         baseTables(),
         [],
-        withCapacity(capacityOf({ cap: 1100, r1Committed: 1045.01 })),
+        withCapacity(capacityOf({ cap: 1100, r1Committed: 1035.01 })),
       );
       expect(over.body.state).toBe('capacity_exhausted');
     });
@@ -438,7 +441,7 @@ describe('GET /api/interview-rounds/availability', () => {
         'interviewer',
         baseTables(),
         [],
-        withCapacity(cloud({ cap: 1100, r1Committed: 55, line: 4000, poolCommitted: 3945 })),
+        withCapacity(cloud({ cap: 1100, r1Committed: 55, line: 4000, poolCommitted: 3935 })),
       );
       expect(response.body.state).toBe('ready');
     });
@@ -466,7 +469,7 @@ describe('GET /api/interview-rounds/availability', () => {
         data: payload,
         error: null,
       }));
-      expect(response.body).toEqual({ state: 'capacity_exhausted', hold_minutes: 55 });
+      expect(response.body).toEqual({ state: 'capacity_exhausted', hold_minutes: 65 });
     });
 
     it.each([
@@ -510,7 +513,7 @@ describe('GET /api/interview-rounds/availability', () => {
     const [fn, args] = mocks.rpc.mock.calls[0]!;
     expect(fn).toBe('r1_capacity_snapshot');
     expect(Object.keys(args as Row).sort()).toEqual(['p_extra_hold', 'p_now']);
-    expect((args as Row).p_extra_hold).toBe(55);
+    expect((args as Row).p_extra_hold).toBe(65);
     expect(new Date(String((args as Row).p_now)).getTime()).toBeGreaterThanOrEqual(before);
   });
 
@@ -535,10 +538,10 @@ describe('GET /api/interview-rounds/availability', () => {
 
   it('coerces a numeric-string hold from PostgREST', async () => {
     const tables = baseTables();
-    tables.r1_settings[0]!.admission_hold_minutes = '55.00';
+    tables.r1_settings[0]!.admission_hold_minutes = '65.00';
     const response = await availability('interviewer', tables);
-    expect(response.body).toEqual({ state: 'ready', hold_minutes: 55 });
-    expect(mocks.rpc.mock.calls[0]![1]).toMatchObject({ p_extra_hold: 55 });
+    expect(response.body).toEqual({ state: 'ready', hold_minutes: 65 });
+    expect(mocks.rpc.mock.calls[0]![1]).toMatchObject({ p_extra_hold: 65 });
   });
 
   it('exposes no figure beyond the hold and no identifier', async () => {
@@ -554,10 +557,12 @@ describe('GET /api/interview-rounds/availability', () => {
   });
 });
 
-describe('the 0119 contract this file depends on', () => {
+// 0128 re-declares the 0119 capacity functions verbatim except the hold literal (55 -> 65), so the
+// live definitions this file depends on are 0128's.
+describe('the 0119 contract (as re-declared by 0128) this file depends on', () => {
   const here = path.dirname(fileURLToPath(import.meta.url));
   const SQL = readFileSync(
-    path.resolve(here, '../../../supabase/migrations/0119_r1_capacity_model.sql'),
+    path.resolve(here, '../../../supabase/migrations/0128_r1_twenty_minute_roleplay.sql'),
     'utf8',
   ).replace(/\r\n/g, '\n');
   const ROUTE = readFileSync(path.resolve(here, '../routes/r1-hr.ts'), 'utf8');
@@ -603,10 +608,15 @@ describe('the 0119 contract this file depends on', () => {
     }
   });
 
-  it('is the verdict r1_send_round itself uses, with the same 55-minute hold', () => {
+  it('is the verdict r1_send_round itself uses, with the same 65-minute hold', () => {
     expect(SQL).toMatch(
-      /coalesce\(\(screening_v2\.r1_capacity_snapshot\(p_now, 55\)->>'admits'\)::boolean, false\) is not true then return jsonb_build_object\('status','capacity_exhausted'\)/,
+      /coalesce\(\(screening_v2\.r1_capacity_snapshot\(p_now, 65\)->>'admits'\)::boolean, false\) is not true then return jsonb_build_object\('status','capacity_exhausted'\)/,
     );
+  });
+
+  it('defaults to the hold the database enforces (0128 CHECK on admission_hold_minutes)', () => {
+    expect(SQL).toMatch(/check \(admission_hold_minutes = 65\)/);
+    expect(ROUTE).toMatch(/const DEFAULT_HOLD_MINUTES = 65;/);
   });
 
   it('only applies the pause line on the Cloud target and checks the cap against R1 alone', () => {
@@ -632,7 +642,7 @@ describe('GET /api/admin/r1/usage', () => {
     tables.r1_budget_month[0] = {
       month_start: MONTH,
       minutes_used: '110.00',
-      minutes_reserved: '55.00',
+      minutes_reserved: '65.00',
       starts_admitted: 2,
     };
     tables.v_webrtc_minutes_estimate[0] = {
@@ -643,13 +653,13 @@ describe('GET /api/admin/r1/usage', () => {
       estimated_minutes: '1093.575',
     };
     tables.r1_usage_ledger = [{ id: 'a', seconds: '1800.00', occurred_at: AFTER_READING }];
-    // Mode A: cap 4,000 allocated, R1 committed 165 (110 used + 55 held), pool guard 1,415.075.
+    // Mode A: cap 4,000 allocated, R1 committed 175 (110 used + 65 held), pool guard 1,415.075.
     const capacity = capacityOf({
       cap: 4000,
       line: 4000,
-      r1Committed: 165,
+      r1Committed: 175,
       poolGuard: 1415.075,
-      poolCommitted: 1470.075,
+      poolCommitted: 1480.075,
     });
     const response = await usage(tables, capacity);
     expect(response.headers['cache-control']).toContain('no-store');
@@ -657,10 +667,10 @@ describe('GET /api/admin/r1/usage', () => {
       month_start: MONTH,
       monthly_cap_minutes: 4000,
       pause_line_minutes: 4000,
-      hold_minutes: 55,
+      hold_minutes: 65,
       dashboard_minutes: 1200.5,
       dashboard_read_at: READ_AT,
-      minutes_reserved: 55,
+      minutes_reserved: 65,
       minutes_used: 110,
       starts_admitted: 2,
       r1_minutes: 40.5,
@@ -672,14 +682,14 @@ describe('GET /api/admin/r1/usage', () => {
       // The snapshot's pool guard; informational on the r1 target.
       guard_minutes: 1415.075,
       // The snapshot's r1_committed: R1's own committed minutes against the R1 allocation.
-      committed_minutes: 165,
-      // floor((4,000 - 165) / 55) = 69, the R1 allocation alone on the r1 target.
-      sends_left: 69,
+      committed_minutes: 175,
+      // floor((4,000 - 175) / 65) = 58, the R1 allocation alone on the r1 target.
+      sends_left: 58,
       livekit_target: 'r1',
       pool_check_applies: false,
-      r1_headroom_minutes: 3835,
-      pool_committed_minutes: 1470.075,
-      pool_headroom_minutes: 2529.925,
+      r1_headroom_minutes: 3825,
+      pool_committed_minutes: 1480.075,
+      pool_headroom_minutes: 2519.925,
       runtime: { enabled: true, status: 'enabled' },
     });
   });
@@ -697,7 +707,7 @@ describe('GET /api/admin/r1/usage', () => {
   });
 
   describe('Mode A: headroom is the R1 allocation, the pool is informational (production, 2026-10-08)', () => {
-    it('reports 19 sends left from the 1,045-minute allocation headroom while the pool is far past the line', async () => {
+    it('reports 16 sends left (65-minute hold) from the 1,045-minute allocation headroom while the pool is far past the line', async () => {
       const tables = baseTables();
       tables.r1_settings[0]!.monthly_cap_minutes = 1100;
       tables.v_webrtc_minutes_estimate = [estimateOf(0, 412, 6396)];
@@ -707,7 +717,7 @@ describe('GET /api/admin/r1/usage', () => {
         pool_check_applies: false,
         committed_minutes: 55,
         r1_headroom_minutes: 1045,
-        sends_left: 19,
+        sends_left: 16,
         // Still shown, so the owner can see the Cloud pool, but it gates nothing.
         guard_minutes: 7829.2,
         phone_minutes: 412,
@@ -723,13 +733,13 @@ describe('GET /api/admin/r1/usage', () => {
         capacityOf({ cap: 1100, r1Committed: 55, poolCommitted: 9000, poolGuard: 9000 }),
       );
       expect(full.body.sends_left).toBe(idle.body.sends_left);
-      expect(full.body.sends_left).toBe(19);
+      expect(full.body.sends_left).toBe(16);
     });
   });
 
   describe('Mode B: the Cloud pool also limits the sends that fit', () => {
     it('takes the smaller of the allocation headroom and the pool headroom', async () => {
-      // R1: 1,100 - 55 = 1,045 (19 sends). Pool: 4,000 - 3,100 = 900 (16 sends).
+      // R1: 1,100 - 55 = 1,045 (16 sends of 65). Pool: 4,000 - 3,100 = 900 (13 sends of 65).
       const response = await usage(
         baseTables(),
         capacityOf({ target: 'cloud', cap: 1100, line: 4000, r1Committed: 55, poolCommitted: 3100 }),
@@ -739,7 +749,7 @@ describe('GET /api/admin/r1/usage', () => {
         pool_check_applies: true,
         r1_headroom_minutes: 1045,
         pool_headroom_minutes: 900,
-        sends_left: 16,
+        sends_left: 13,
       });
     });
 
@@ -805,14 +815,14 @@ describe('GET /api/admin/r1/usage', () => {
   it('agrees with the availability answer at the boundary, in both targets', async () => {
     // sends_left is the number of Sends the snapshot would admit; availability is ready iff >= 1.
     const cases: Array<[Partial<Capacity>, 'ready' | 'capacity_exhausted']> = [
-      [{ target: 'r1', cap: 1100, r1Committed: 1045 }, 'ready'],
-      [{ target: 'r1', cap: 1100, r1Committed: 1045.01 }, 'capacity_exhausted'],
-      [{ target: 'cloud', cap: 4000, r1Committed: 0, line: 4000, poolCommitted: 3945 }, 'ready'],
+      [{ target: 'r1', cap: 1100, r1Committed: 1035 }, 'ready'],
+      [{ target: 'r1', cap: 1100, r1Committed: 1035.01 }, 'capacity_exhausted'],
+      [{ target: 'cloud', cap: 4000, r1Committed: 0, line: 4000, poolCommitted: 3935 }, 'ready'],
       [
-        { target: 'cloud', cap: 4000, r1Committed: 0, line: 4000, poolCommitted: 3945.01 },
+        { target: 'cloud', cap: 4000, r1Committed: 0, line: 4000, poolCommitted: 3935.01 },
         'capacity_exhausted',
       ],
-      [{ target: 'cloud', cap: 1100, r1Committed: 1046, line: 4000, poolCommitted: 100 }, 'capacity_exhausted'],
+      [{ target: 'cloud', cap: 1100, r1Committed: 1036, line: 4000, poolCommitted: 100 }, 'capacity_exhausted'],
     ];
     for (const [overrides, expected] of cases) {
       const capacity = capacityOf(overrides);
@@ -852,7 +862,8 @@ describe('GET /api/admin/r1/usage', () => {
       ledger_since_minutes: 0,
       guard_minutes: 0,
       committed_minutes: 0,
-      sends_left: 72,
+      // floor(4,000 / 65) = 61.
+      sends_left: 61,
     });
   });
 

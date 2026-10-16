@@ -13,7 +13,7 @@ What it does, call by call:
   ``RolePlayEngine`` and the real guard, with the production DeepSeek client built by
   ``r1_llm.build_r1_llm`` (or a scripted fake model offline);
 * a modelled clock advances the role-play seconds R the way real calls do (about 35 s per
-  exchange), so the owed-move schedule, the close window and the 13:00 stall all fire;
+  exchange), so the owed-move schedule, the close window and the 19:00 stall all fire;
 * every call is written as JSON (rows in the database export schema, the plan of every
   learner turn, the raw model text before the guard, the administration log);
 * deterministic metrics (``metrics``) and an LLM rubric judge (``judge``) score each call, and

@@ -8,7 +8,7 @@ guarded stream, the intent tail), and ``conversation_item_added`` with what was 
 
 1. the advisor simulator speaks (its words become the candidate's final transcript);
 2. the modelled clock advances (``clock.TurnTimingModel``), so the role-play seconds R, and with
-   them the schedule, the close window, the time cue and the 13:00 stall, behave as on a call;
+   them the schedule, the close window, the time cue and the 19:00 stall, behave as on a call;
 3. the learner answers through the production code path with ``deps.provider`` (the production
    DeepSeek client, or the offline fake); the raw model text before the guard is kept;
 4. the call stops on the engine's own end conditions (hard cap, early exit after a resolved
@@ -63,7 +63,7 @@ class CallSpec:
     advisor_level: str = "strong"
     rep: int = 0
     candidate_name: str = "Rohan"
-    max_exchanges: int = 60
+    max_exchanges: int = 86
 
     @property
     def seed(self) -> str:

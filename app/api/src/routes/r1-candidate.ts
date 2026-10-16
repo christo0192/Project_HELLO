@@ -145,8 +145,11 @@ export const PREFLIGHT_POLICY = {
   min_audio_packets: 50,
   min_video_frames: 45,
 } as const;
-/** Plan 4 step 6: "another interview is finishing, try again in about 20 minutes". */
-export const BUSY_RETRY_AFTER_SEC = 20 * 60;
+/**
+ * Plan 4 step 6: "another interview is finishing, try again in about 30 minutes" (an R1 interview
+ * runs about 30 minutes since the 20-minute role-play).
+ */
+export const BUSY_RETRY_AFTER_SEC = 30 * 60;
 export const PREPARING_RETRY_AFTER_SEC = 3;
 /** A withdrawal whose room could not be cut is safe to retry at once. */
 export const WITHDRAW_RETRY_AFTER_SEC = 3;
@@ -167,7 +170,7 @@ export const READY_RELAY_TIMEOUT_MS = 4_000;
 
 /** What the landing page tells the candidate about the interview (plan 4 step 3). */
 export const R1_FORMAT = {
-  duration_minutes: 20,
+  duration_minutes: 30,
   camera_required: true,
   microphone_required: true,
   interviewer: 'ai',
@@ -1053,7 +1056,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
 
     if (!(await maintenanceClear(res))) return;
     if (!(await laneForNewWork(res))) return;
-    // Admission spends one of the link's three starts and moves 55 minutes into
+    // Admission spends one of the link's three starts and moves 65 minutes into
     // the month's used capacity for good, and the orphan `created` session it
     // makes blocks all of R1 until it lapses. The exchange refuses the same way
     // while DeepSeek is down, so refuse BEFORE admission (the probe is cached):

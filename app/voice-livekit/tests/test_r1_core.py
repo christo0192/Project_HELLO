@@ -596,8 +596,8 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         machine.transition(R1Phase.ROLEPLAY)
         clock.advance(20)
         self.assertEqual(machine.roleplay_elapsed, 80)
-        self.assertEqual(NORMAL_PATH_MAX_SEC, 22 * 60 + 27)
-        self.assertEqual(MAX_AGENT_RESIDENCY_SEC, 27 * 60 + 45)
+        self.assertEqual(NORMAL_PATH_MAX_SEC, 28 * 60 + 27)
+        self.assertEqual(MAX_AGENT_RESIDENCY_SEC, 33 * 60 + 45)
 
     def test_manual_clock_exposes_hard_phase_budgets(self) -> None:
         clock = Clock()
@@ -608,7 +608,7 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         self.assertEqual(machine.remaining_icebreaker_seconds(), 0)
         machine.transition(R1Phase.TRANSITION)
         machine.transition(R1Phase.ROLEPLAY)
-        clock.advance(840)
+        clock.advance(1200)
         self.assertEqual(machine.remaining_roleplay_seconds(), 0)
         machine.transition(R1Phase.ROLEPLAY_EXIT)
         machine.transition(R1Phase.WRAPUP)
@@ -695,7 +695,7 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         self.assertEqual(machine.session_elapsed, 150)
         self.assertEqual(machine.session_clock, 50)
         self.assertEqual(machine.remaining_icebreaker_seconds(), 220)
-        self.assertEqual(machine.remaining_forced_close_seconds(), 1440 - 50)
+        self.assertEqual(machine.remaining_forced_close_seconds(), 1800 - 50)
 
     def test_roleplay_budget_is_the_smaller_of_the_r_budget_and_the_s_cap(self) -> None:
         clock = Clock()
@@ -705,7 +705,7 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         clock.advance(600)
         machine.transition(R1Phase.TRANSITION)
         machine.transition(R1Phase.ROLEPLAY)
-        clock.advance(590)  # R = 590 (250 left), S = 1190 (10 left)
+        clock.advance(950)  # R = 950 (250 left), S = 1550 (10 left)
         self.assertEqual(machine.remaining_roleplay_seconds(), 10)
         self.assertEqual(machine.remaining_roleplay_cap_seconds(), 10)
         clock.advance(10)
@@ -754,7 +754,7 @@ class TestPhaseAndConfiguration(unittest.TestCase):
                 os.environ["R1_REJOIN_GRACE_SEC"] = raw
                 os.environ["R1_SESSION_MAX_RESIDENCY_SEC"] = raw
                 self.assertLessEqual(rejoin_grace_seconds(), 90)
-                self.assertLessEqual(residency_seconds(), 1800)
+                self.assertLessEqual(residency_seconds(), 2160)
         finally:
             os.environ.clear()
             os.environ.update(prior)
@@ -1253,8 +1253,8 @@ class TestCandidateAndStopEvents(R1TestCase):
         self.interview._on_residency_deadline()
         self.assertEqual(await asyncio.wait_for(waiter, 10.0), (STOP, "residency_timeout"))
 
-    async def test_forced_close_at_s_24_minutes_is_scheduled_and_stops_the_wait(self) -> None:
-        self.clock.advance(1439.95)  # S: 1439.95 s since activation
+    async def test_forced_close_at_s_30_minutes_is_scheduled_and_stops_the_wait(self) -> None:
+        self.clock.advance(1799.95)  # S: 1799.95 s since activation
         self.interview._schedule_forced_close()
         waiter = asyncio.create_task(self.interview._await_turn(30.0))
         self.assertEqual(await asyncio.wait_for(waiter, 10.0), (STOP, "residency_timeout"))
@@ -1748,7 +1748,7 @@ class TestReplyPolicy(R1TestCase):
     async def test_roleplay_replies_until_the_role_play_ends(self) -> None:
         self.enter_roleplay()
         await self.hook("my pitch")
-        self.clock.advance(841)
+        self.clock.advance(1201)
         with self.assertRaises(r1_session.StopResponse):
             await self.hook("one last thing")
 
@@ -1920,7 +1920,7 @@ class TestSilenceWindows(R1TestCase):
 
     async def test_rp2_is_not_cut_short_by_the_paused_role_play_budget(self) -> None:
         self.enter_roleplay()
-        self.clock.advance(839.0)  # S = 839 s: the S=20:00 cap still has 361 s
+        self.clock.advance(1199.0)  # S = 1199 s: the S=26:00 cap still has 361 s
         # R is paused during the aside, so its budget must NOT bound this step. Make the
         # R budget run out in real time (the manual clock cannot) so that a step wrongly
         # bounded by it would end long before the 60 s silence window.
@@ -1937,14 +1937,14 @@ class TestSilenceWindows(R1TestCase):
 
     async def test_a_non_aside_step_that_the_budget_cannot_cover_ends_the_phase(self) -> None:
         self.enter_roleplay()
-        self.clock.advance(835)  # 5 s of R left
+        self.clock.advance(1195)  # 5 s of R left
         outcome = await self.interview._silence_ladder([("L-SIL-RP1", 20.0)])
         self.assertEqual(outcome, "phase_deadline")
         self.assertEqual(self.session.spoken, [])
 
     async def test_rp2_is_skipped_for_the_phase_end_when_no_role_play_time_is_left(self) -> None:
         self.enter_roleplay()
-        self.clock.advance(840)
+        self.clock.advance(1200)
         outcome = await self.interview._silence_ladder([("L-SIL-RP2", 15.0)])
         self.assertEqual(outcome, "phase_deadline")
         self.assertIs(self.interview.machine.phase, R1Phase.ROLEPLAY)
@@ -3120,8 +3120,8 @@ class TestRunFlow(R1TestCase):
         await self.candidate_replies_after("L-TRANSITION", "ready")
         await self.until(lambda: self.spoken_and_played("L-PICKUP"))
         await self.until(lambda: self._machine_phase() is R1Phase.ROLEPLAY)
-        # ROLEPLAY ends on R = 14:00; the exit and wrap-up lines follow.
-        self.clock.advance(841)
+        # ROLEPLAY ends on R = 20:00; the exit and wrap-up lines follow.
+        self.clock.advance(1201)
         self.final_transcript("let me summarise the offer")
         with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.05):
             await self.candidate_replies_after("L-WRAP", "No questions, thanks")
@@ -3179,7 +3179,7 @@ class TestRunFlow(R1TestCase):
         await self.four_icebreaker_answers()
         await self.candidate_replies_after("L-TRANSITION", "ready")
         await self.until(lambda: self._machine_phase() is R1Phase.ROLEPLAY)
-        self.clock.advance(841)
+        self.clock.advance(1201)
         self.final_transcript("let me summarise the offer")
         await self.until(lambda: self.spoken_and_played("L-WRAP"))
         await self.until(lambda: self._machine_phase() is R1Phase.WRAPUP)
@@ -5016,7 +5016,7 @@ class TestPhaseAttribute(R1TestCase):
                     "leadname": self.interview.persona.lead_name,
                     "awaiting": "ready",
                 },
-                {"phase": "roleplay", "awaiting": "", "rpleft": "840"},
+                {"phase": "roleplay", "awaiting": "", "rpleft": "1200"},
                 {"phase": "roleplay_exit", "rpleft": ""},
                 {"phase": "wrapup"},
             ],
@@ -5235,15 +5235,15 @@ class TestLiveUiSignals(R1TestCase):
         self.ctx.room.emit("track_unmuted", FakeParticipant("candidate"), FakePublication())
         writes = await self.until_writes(4)
         self.assertEqual([write["phase"] for write in writes], ["transition", "roleplay", "aside", "roleplay"])
-        self.assertEqual(writes[1]["rpleft"], "840")
-        self.assertEqual(writes[2]["rpleft"], "740")
+        self.assertEqual(writes[1]["rpleft"], "1200")
+        self.assertEqual(writes[2]["rpleft"], "1100")
         # The paused clock: the budget has not moved while the aside lasted.
-        self.assertEqual(writes[3]["rpleft"], "740")
+        self.assertEqual(writes[3]["rpleft"], "1100")
         self.assertNotIn("rpleft", writes[0])
 
     async def test_rpleft_is_the_shorter_of_the_role_play_and_the_session_cap(self) -> None:
         self.interview._enter(R1Phase.TRANSITION)
-        self.clock.advance(1100)  # S = 1100 s: only 100 s of the 20:00 session cap are left
+        self.clock.advance(1460)  # S = 1460 s: only 100 s of the 26:00 session cap are left
         self.interview._enter(R1Phase.ROLEPLAY)
         writes = await self.until_writes(2)
         self.assertEqual(writes[1]["rpleft"], "100")
@@ -5252,7 +5252,7 @@ class TestLiveUiSignals(R1TestCase):
         )
 
     async def test_rpleft_is_an_integer_string_clamped_to_zero_and_3600(self) -> None:
-        for budget, expected in ((99999.0, "3600"), (-5.0, "0"), (0.4, "0"), (839.9, "839"),
+        for budget, expected in ((99999.0, "3600"), (-5.0, "0"), (0.4, "0"), (1199.9, "1199"),
                                  (float("nan"), "0"), (float("inf"), "0")):
             with self.subTest(budget=budget):
                 with mock.patch.object(
@@ -5270,7 +5270,7 @@ class TestLiveUiSignals(R1TestCase):
         writes = await self.until_writes(4)
         self.assertEqual(
             [(write["phase"], write.get("rpleft")) for write in writes[1:]],
-            [("roleplay", "840"), ("paused_disconnected", "810"), ("roleplay", "810")],
+            [("roleplay", "1200"), ("paused_disconnected", "1170"), ("roleplay", "1170")],
         )
 
     async def test_a_disconnect_before_the_roleplay_publishes_no_rpleft(self) -> None:
@@ -5320,7 +5320,7 @@ class TestLiveUiSignals(R1TestCase):
         writes = await self.until_writes(4)
         self.assertEqual(
             [(write["phase"], write.get("rpleft")) for write in writes],
-            [("transition", None), ("roleplay", "840"), ("roleplay_exit", ""), ("wrapup", None)],
+            [("transition", None), ("roleplay", "1200"), ("roleplay_exit", ""), ("wrapup", None)],
         )
 
     async def test_a_technical_stop_in_the_roleplay_clears_the_signals_with_aborted(self) -> None:

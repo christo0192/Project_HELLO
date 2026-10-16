@@ -85,8 +85,13 @@ class TableTests(unittest.TestCase):
 
     def test_the_opening_and_transition_say_what_the_plan_says(self):
         self.assertIn("an AI interviewer from Interview Kickstart", LINES["L-OPEN"])
-        self.assertIn("about twenty minutes", LINES["L-OPEN"])
-        self.assertIn("twelve to fourteen minutes", LINES["L-TRANSITION"])
+        self.assertIn("about thirty minutes", LINES["L-OPEN"])
+        self.assertIn("a twenty-minute sales role-play", LINES["L-OPEN"])
+        # The owner's ask: the role-play's length and the goal (convince the learner) are said
+        # plainly at its start.
+        self.assertIn("The role-play runs for twenty minutes", LINES["L-TRANSITION"])
+        self.assertIn("within those twenty minutes your goal is to convince her", LINES["L-TRANSITION"])
+        self.assertNotIn("fourteen", LINES["L-TRANSITION"])
         self.assertIn("'Let's pause the role-play here.'", LINES["L-TRANSITION"])
         self.assertIn("just say 'ready'", LINES["L-TRANSITION"])
 

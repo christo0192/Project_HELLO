@@ -9,7 +9,7 @@ Its design follows research/rehearsal-harness.md 4.2 and fixes the S0-B harness 
   and an inversion detector flags a turn that speaks as the learner;
 * every turn is JSON ``{"intent", "topic", "text"}``: the intent and topic are the GROUND TRUTH
   for probes, asks and farewells (the metrics never use the engine's own detectors);
-* a call-clock hint (``CALL CLOCK 07:20 of about 13:00``) is appended to the newest learner
+* a call-clock hint (``CALL CLOCK 07:20 of about 19:00``) is appended to the newest learner
   line each turn, so the simulated advisor paces the call like a real one.
 
 The five levels (``ADVISOR_LEVELS``): strong (discovery first, earns the close), average
@@ -43,12 +43,13 @@ INTENTS = (
     "other",
 )
 TOPICS = ("H1", "H2", "H3", "F1", "F2", "F3", "F4")
-CALL_TARGET_SEC = 13 * 60
+CALL_TARGET_SEC = 19 * 60
 MAX_TEXT_CHARS = 1200
-# The simulator never ends the call before the learner's role-play reached 10:00 (R1-Q iteration 2, D23:
-# six of 20 calls ended at 6:23 to 9:59 because the simulated advisor said goodbye, which failed the
-# "reached ten minutes" fidelity check and cut the commitment and question gates short).
-EARLIEST_FAREWELL_SEC = 600
+# The simulator never ends the call before the learner's role-play reached the early-exit floor
+# (R1-Q iteration 2, D23: six of 20 calls ended at 6:23 to 9:59 because the simulated advisor said
+# goodbye, which failed the "reached ten minutes" fidelity check and cut the commitment and
+# question gates short).  The 20:00 role-play moved that floor from 10:00 to 14:00.
+EARLIEST_FAREWELL_SEC = 840
 EARLY_FAREWELL_NUDGE = (
     "It is only {clock} on the call clock and the call is not over: do not say goodbye or wrap up. "
     "Keep going with your next point, answer or question, in the same JSON format."
@@ -66,7 +67,7 @@ _LEVEL_BEHAVIOUR = {
         "before, and about their schedule, money and who else decides; follow up on what they "
         "say before you pitch anything. Acknowledge every objection, answer it from the course "
         "facts, then check that you answered it. Never discount before you have shown value. "
-        "Use at most one honest urgency lever. Around 9:30 on the call clock, if the learner "
+        "Use at most one honest urgency lever. Around 13:30 on the call clock, if the learner "
         "seems warm, clearly ask for the next step (a call with whoever else decides, or "
         "enrolment). If the learner proposes or accepts a time for a call, accept it warmly. "
         "Keep every turn under 60 words."
@@ -215,8 +216,8 @@ def advisor_system_prompt(level: str) -> str:
         "directions, and never speak as the learner.\n"
         f"What you know about the course (use only this):\n{deck_brief()}\n"
         f"How you behave: {_LEVEL_BEHAVIOUR[level]}\n"
-        "The call lasts about 13 minutes: never say goodbye or wrap up before 10:00 on the call "
-        "clock.\n"
+        f"The call lasts about {CALL_TARGET_SEC // 60} minutes: never say goodbye or wrap up "
+        f"before {_clock_text(EARLIEST_FAREWELL_SEC)} on the call clock.\n"
         "Reply with ONE JSON object and nothing else, with exactly these keys: "
         f'"intent" (one of {intents}), "topic" (one of {", ".join(TOPICS)} or an empty string) '
         'and "text" (what you say aloud). '
