@@ -14,6 +14,12 @@
  * fabricated identity, and carries the sanitized `resume_review` badge that
  * says how far its resume got — and nothing more.
  *
+ * INTAKE (M017, `?intake=`): each row whose API reports an `intake_type`
+ * says "Resume parsing" or "Phone parsing" under its status, and an
+ * "Intake:" facet beside "Resume:" filters by it. A phone-parsing candidate
+ * has no resume, so it never carries the resume badge. A row without the
+ * field (an older API) renders exactly as before.
+ *
  * Surfaces: one glass panel per logical block — the upload form (a disclosure,
  * CLOSED by default since candidates arrive from Ashby rather than by hand),
  * the per-role pipeline chart, the filter bar, the table — floating on the
@@ -107,6 +113,11 @@ import {
   resumeReviewLabel,
   RESUME_REVIEW_ORDER,
 } from "../components/talent";
+import {
+  IntakeBadge,
+  INTAKE_TYPE_ORDER,
+  intakeTypeLabel,
+} from "../components/talent/ResumeReviewBadge";
 import type { StatusTone } from "../components/design/StatusBadge";
 import type { PipelineTone } from "../components/talent";
 import { roleAgentName } from "../lib/role-label";
@@ -458,8 +469,8 @@ export function CandidatesPage() {
   }, [roleId, loadCandidates]);
 
   // Every mutation rebuilds the full filter set from the current URL so no
-  // dimension (status / recommendation / resume review / assessed / role) is
-  // dropped.
+  // dimension (status / recommendation / resume review / intake / assessed /
+  // role) is dropped.
   const applyFilters = useCallback(
     (next: Partial<CandidateFilters>) => {
       setSearchParams(buildCandidateSearch({ ...filters, ...next }));
@@ -487,6 +498,13 @@ export function CandidatesPage() {
   const toggleResumeReview = useCallback(
     (value: string) =>
       applyFilters({ resumeReview: toggleFromList(filters.resumeReview, value) }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [filterKey, applyFilters],
+  );
+
+  const toggleIntakeType = useCallback(
+    (value: string) =>
+      applyFilters({ intakeType: toggleFromList(filters.intakeType, value) }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [filterKey, applyFilters],
   );
@@ -679,6 +697,18 @@ export function CandidatesPage() {
     return counts;
   }, [candidates]);
 
+  // Live count per intake type, from the same loaded set and the same field
+  // the row badge reads.
+  const intakeTypeCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of candidates ?? []) {
+      if (c.intake_type) {
+        counts.set(c.intake_type, (counts.get(c.intake_type) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }, [candidates]);
+
   /**
    * How many loaded candidates carry a recommendation at all.
    *
@@ -696,6 +726,9 @@ export function CandidatesPage() {
   // it visible so its own toggles stay reachable and removable.
   const showResumeFacet =
     resumeReviewCounts.size > 0 || filters.resumeReview.length > 0;
+  // Same rule for intake: hidden on an API without the field.
+  const showIntakeFacet =
+    intakeTypeCounts.size > 0 || filters.intakeType.length > 0;
 
   /**
    * The list panel (search box + live region + rows) stays mounted across
@@ -894,6 +927,41 @@ export function CandidatesPage() {
           />
         )}
 
+        {/* Intake toggles (M017) — the same additive facet shape as the
+            resume-review one below, over the intake type the list already
+            returns, and in the order the row stacks its badges: status,
+            intake, resume. Shown only when the loaded set carries the field
+            (or a deep link selected it). */}
+        {showIntakeFacet && (
+        <div
+          className="mt-2 flex flex-wrap items-center gap-2"
+          role="group"
+          aria-label="Filter by intake"
+        >
+          <span className="text-label font-medium text-[var(--c-ink-secondary)]">
+            Intake:
+          </span>
+          {INTAKE_TYPE_ORDER.map((value) => {
+            const selected = filters.intakeType.includes(value);
+            const count = intakeTypeCounts.get(value) ?? 0;
+            return (
+              <button
+                key={value}
+                type="button"
+                onClick={() => toggleIntakeType(value)}
+                aria-pressed={selected}
+                className={FILTER_PILL_CLASS(selected)}
+              >
+                {intakeTypeLabel(value)}
+                {candidates && (
+                  <span className={PILL_COUNT_CLASS(selected)}>{count}</span>
+                )}
+              </button>
+            );
+          })}
+        </div>
+        )}
+
         {/* Resume-review toggles — additive facet over the sanitized enum the
             list already returns. Never mutates candidate status.
 
@@ -966,6 +1034,13 @@ export function CandidatesPage() {
                 key={r}
                 label={`Rec: ${recommendationLabel(r)}`}
                 onRemove={() => toggleRecommendation(r)}
+              />
+            ))}
+            {filters.intakeType.map((t) => (
+              <FilterChip
+                key={t}
+                label={`Intake: ${intakeTypeLabel(t) ?? t}`}
+                onRemove={() => toggleIntakeType(t)}
               />
             ))}
             {filters.resumeReview.map((r) => (
@@ -1204,8 +1279,12 @@ export function CandidatesPage() {
                                 {ds.detail && <span className="sr-only">{`, ${ds.detail}`}</span>}
                               </StatusBadge>
                               {/* Additive only: the candidate's own status is
-                                  unchanged and still first. */}
-                              <ResumeReviewBadge value={c.resume_review} />
+                                  unchanged and still first. A phone-parsing
+                                  candidate has no resume to review. */}
+                              <IntakeBadge value={c.intake_type} />
+                              {c.intake_type !== "phone_parsing" && (
+                                <ResumeReviewBadge value={c.resume_review} />
+                              )}
                             </div>
                           </Td>
                           <Td className="whitespace-nowrap">

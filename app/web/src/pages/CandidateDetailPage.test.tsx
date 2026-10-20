@@ -482,6 +482,47 @@ describe('CandidateDetailPage', () => {
     expect(screen.queryByRole('button', { name: /retry|reprocess|re-?parse/i })).toBeNull();
   });
 
+  /**
+   * M017: the header names the intake type beside the status, and the Profile
+   * card says where a phone-parsing candidate's facts came from. A payload
+   * without the field (an older API) shows neither.
+   */
+  it('M017: badges a phone-parsing candidate in the header and words its Profile', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: {
+        ...mockCandidateDetail.candidate,
+        name: 'Test Person',
+        email: null,
+        skills: [],
+        experience_years: null,
+        status: 'queued',
+        intake_type: 'phone_parsing',
+        ashby_phone_applied_at: '2026-10-20T10:00:00Z',
+      },
+      sessions: [],
+      assessments: [],
+    });
+    renderDetailPage();
+    expect(await screen.findByRole('heading', { name: 'Test Person' })).toBeInTheDocument();
+    const badge = screen.getByText('Phone parsing');
+    expect(badge.closest('[data-status-badge]')).toHaveAttribute('data-status-badge', 'neutral');
+    expect(
+      screen.getByText('Name and phone from the Ashby application (no usable resume).'),
+    ).toBeInTheDocument();
+    expect(screen.getByText('No resume')).toBeInTheDocument();
+    // The marker is a timestamp only; nothing renders it as a number.
+    expect(document.body.textContent ?? '').not.toContain('2026-10-20T10:00:00Z');
+  });
+
+  it('M017: shows no intake badge for a payload without the field', async () => {
+    renderDetailPage();
+    expect(await screen.findByText('Jane Doe')).toBeInTheDocument();
+    expect(screen.queryByText('Phone parsing')).toBeNull();
+    expect(screen.queryByText('Resume parsing')).toBeNull();
+    expect(screen.getByText('Identity and skills as parsed from the resume.')).toBeInTheDocument();
+  });
+
   it('shows the dial count in the header and the Overview, like the list row', async () => {
     mockApi.getCandidate.mockResolvedValue({
       ...mockCandidateDetail,
@@ -793,6 +834,46 @@ describe('CandidateDetailPage', () => {
       'candidate-1',
       expect.objectContaining({ request_id: expect.stringMatching(/^ui-/), reason: 'technical_issue' }),
     ));
+  });
+
+  it('M017: an identity_unconfirmed cycle offers number verification above the re-screen form', async () => {
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true, enabled: true, current_cycle: 1,
+      cycles: [{
+        cycle_number: 1, state: 'cancelled', state_reason: 'identity_unconfirmed', version: 3,
+        no_answer_attempts: 0, no_answer_limit: 3, reconnects_used: 0, provider_failures: 0,
+        next_eligible_at: null, last_attempt_at: '2026-08-28T10:00:00Z', terminal_at: '2026-08-28T10:05:00Z',
+        created_at: '2026-08-27T09:00:00Z', updated_at: '2026-08-28T10:05:00Z',
+        has_session: false, has_assessment: false, appointment: null,
+      }],
+    });
+    renderDetailPage("candidate-1", "?tab=overview");
+    expect(await screen.findByText(/reached the wrong person twice and was cleared/)).toBeInTheDocument();
+    const input = screen.getByLabelText('Verify the candidate’s Indian mobile');
+    // Re-screen stays available below the verify box.
+    expect(screen.getByRole('button', { name: 'Request re-screen' })).toBeInTheDocument();
+    await userEvent.type(input, '+919812345670');
+    await userEvent.click(screen.getByRole('button', { name: 'Verify number' }));
+    await waitFor(() => expect(mockApi.verifyCandidatePhone).toHaveBeenCalledWith(
+      'candidate-1', { phone_e164: '+919812345670' },
+    ));
+  });
+
+  it('M017: an interviewer sees why an identity_unconfirmed cycle needs an administrator', async () => {
+    mockApi.getMe.mockResolvedValue({ userId: 'u-int', email: null, role: 'interviewer', active: true });
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true, enabled: true, current_cycle: 1,
+      cycles: [{
+        cycle_number: 1, state: 'cancelled', state_reason: 'identity_unconfirmed', version: 3,
+        no_answer_attempts: 0, no_answer_limit: 3, reconnects_used: 0, provider_failures: 0,
+        next_eligible_at: null, last_attempt_at: null, terminal_at: '2026-08-28T10:05:00Z',
+        created_at: '2026-08-27T09:00:00Z', updated_at: '2026-08-28T10:05:00Z',
+        has_session: false, has_assessment: false, appointment: null,
+      }],
+    });
+    renderDetailPage("candidate-1", "?tab=overview");
+    expect(await screen.findByText(/An administrator must verify the candidate.s number/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Verify number' })).not.toBeInTheDocument();
   });
 
   it('C3: recommends a technical_issue re-screen when the newest scorecard is held for evidence', async () => {

@@ -460,6 +460,9 @@ const ENGAGEMENT_REASON_LABELS: Readonly<Record<string, string>> = {
   // 0125 (M013 D1): the call ended before the candidate answered any planned
   // question. Neutral on who dropped; the evidence reason is the detail line.
   screening_abandoned: 'Abandoned: dropped before screening',
+  // 0130 (M017): the cycle was cancelled because the wrong person answered an
+  // Ashby number nobody had verified. HR verifies the number, then rescreens.
+  identity_unconfirmed: 'Wrong person answered the Ashby number',
 };
 
 /** Why a screening cycle is in its state, in a recruiter's words. */

@@ -233,6 +233,92 @@ describe('AshbyWorkflowCard — accessible, colour-independent status', () => {
   });
 });
 
+/**
+ * M017: the intake type and the Ashby profile check's outcome. Both fields are
+ * optional — absent on an older API, which must leave the card unchanged.
+ */
+describe('AshbyWorkflowCard — intake and the phone parsing check', () => {
+  const PHONE: AshbyCandidateWorkflow = {
+    ...WORKFLOW,
+    lifecycle: 'imported',
+    ingestionState: 'queued',
+    operations: [],
+    sessionStatus: null,
+    intakeType: 'phone_parsing',
+    profileOutcome: 'applied',
+  };
+
+  it('shows an Intake row and the check outcome in words, the code one hover away', () => {
+    render(<AshbyWorkflowCardView workflow={PHONE} />);
+    expect(screen.getByText('Intake')).toBeInTheDocument();
+    expect(screen.getByText('Phone parsing')).toBeInTheDocument();
+    expect(screen.getByText('Phone parsing check')).toBeInTheDocument();
+    expect(screen.getByText('Ashby number applied')).toHaveAttribute('title', 'applied');
+    expect(document.body.textContent).not.toMatch(/phone_parsing|profile_outcome/);
+  });
+
+  it('says there is no resume instead of a resume import that will never move', () => {
+    render(<AshbyWorkflowCardView workflow={PHONE} />);
+    expect(screen.getByText('No resume (phone parsing)')).toBeInTheDocument();
+    // The harmless `queued` ingestion row must not read as stuck.
+    expect(screen.queryByText('Queued')).toBeNull();
+  });
+
+  it('says an unreadable resume fell back to phone parsing, not that one needs review', () => {
+    render(<AshbyWorkflowCardView workflow={{ ...PHONE, ingestionState: 'failed_review' }} />);
+    expect(screen.getByText('Resume unreadable, switched to phone parsing')).toBeInTheDocument();
+    expect(screen.queryByText('No resume (phone parsing)')).toBeNull();
+    expect(screen.queryByText('Needs manual review')).toBeNull();
+  });
+
+  it('labels a resume-parsing intake and keeps its real ingestion state', () => {
+    render(
+      <AshbyWorkflowCardView
+        workflow={{ ...WORKFLOW, intakeType: 'resume_parsing', profileOutcome: 'number_invalid' }}
+      />,
+    );
+    expect(screen.getByText('Resume parsing')).toBeInTheDocument();
+    expect(screen.getByText('Scanning resume')).toBeInTheDocument();
+    expect(screen.queryByText('No resume (phone parsing)')).toBeNull();
+    expect(screen.getByText('No valid Indian mobile in Ashby')).toHaveAttribute('title', 'number_invalid');
+  });
+
+  it('adds neither row while the check has not run or the API predates the fields', () => {
+    render(<AshbyWorkflowCardView workflow={{ ...PHONE, profileOutcome: null }} />);
+    expect(screen.getByText('Phone parsing')).toBeInTheDocument();
+    expect(screen.queryByText('Phone parsing check')).toBeNull();
+  });
+
+  it('renders a legacy workflow (no intake fields) exactly as before', () => {
+    render(<AshbyWorkflowCardView workflow={WORKFLOW} />);
+    expect(screen.queryByText('Intake')).toBeNull();
+    expect(screen.queryByText('Phone parsing check')).toBeNull();
+    expect(screen.queryByText(/parsing/)).toBeNull();
+    expect(screen.getByText('Scanning resume')).toBeInTheDocument();
+  });
+
+  it('suppresses an outcome that is not a sanitized code, and words an unknown one plainly', () => {
+    const { unmount } = render(
+      <AshbyWorkflowCardView
+        workflow={{ ...PHONE, profileOutcome: 'Ashby said: <b>no</b>' as never }}
+      />,
+    );
+    expect(screen.queryByText('Phone parsing check')).toBeNull();
+    expect(document.body.textContent).not.toContain('Ashby said');
+    unmount();
+    render(<AshbyWorkflowCardView workflow={{ ...PHONE, profileOutcome: 'some_future_outcome' as never }} />);
+    expect(screen.getByText('Some future outcome')).toHaveAttribute('title', 'some_future_outcome');
+  });
+
+  it('introduces no control and stays axe-clean', async () => {
+    mockApi.getCandidateAshbyWorkflow.mockResolvedValue({ ok: true, workflow: PHONE });
+    const { container } = renderCandidateCard();
+    await screen.findByText('Phone parsing check');
+    expect(document.querySelectorAll('button, a, input, select, textarea')).toHaveLength(0);
+    await expect(container).toHaveNoViolations();
+  });
+});
+
 describe('AshbyWorkflowCard — the two scopes are one surface', () => {
   it('reads through the link-scoped endpoint and renders the identical card', async () => {
     render(<AshbyWorkflowCard source={{ kind: 'applicationLink', applicationLinkId: LINK_ID }} />);

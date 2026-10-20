@@ -252,6 +252,37 @@ export type CandidateStatus = string;
  */
 export type ResumeReview = 'ready' | 'processing' | 'needs_review' | 'cancelled';
 
+/**
+ * M017: how an Ashby application entered screening. `resume_parsing` is the
+ * resume path (and every dashboard upload); `phone_parsing` is an application
+ * with no resume, whose name and number came from Ashby itself.
+ */
+export type IntakeType = 'resume_parsing' | 'phone_parsing';
+
+/**
+ * M017: the closed `profile_outcome` vocabulary of the Ashby profile check
+ * (0130 CHECK) — what the last check did with the application's Ashby number.
+ * Operational only: it names no person and carries no number.
+ */
+export type AshbyProfileOutcome =
+  | 'applied'
+  | 'number_invalid'
+  | 'number_placeholder'
+  | 'number_shared'
+  | 'name_missing'
+  | 'resume_found'
+  | 'resume_shape_unknown'
+  | 'stage_moved'
+  | 'application_inactive'
+  | 'mapping_inactive'
+  | 'subject_request_hold'
+  | 'engagement_active'
+  | 'not_applicable'
+  | 'ashby_unavailable'
+  | 'identity_unconfirmed'
+  | 'application_terminal'
+  | 'candidate_missing';
+
 export interface CandidateResumeFacts {
   current_role?: string | null;
   recent_role?: {
@@ -298,6 +329,17 @@ export interface Candidate {
    * that predate the field; null when the candidate has no Ashby ingestion.
    */
   resume_review?: ResumeReview | null;
+  /**
+   * M017 intake type (list and detail). The newest Ashby link's value, else
+   * `resume_parsing` for a dashboard upload, else null. ABSENT on an API older
+   * than the field: both mean legacy rendering, with no intake badge.
+   */
+  intake_type?: IntakeType | null;
+  /**
+   * M017: when an Ashby number was applied to this candidate (a once-only
+   * marker; it carries no number). Detail only; absent on older APIs.
+   */
+  ashby_phone_applied_at?: string | null;
   /**
    * Status of the (non-archived) Ashby job mapping the candidate's own
    * application link points at: enabled = Live, paused = Paused, drift = Out
@@ -1656,6 +1698,10 @@ export interface AshbyMcWorkflow {
    * null when the server could not read it; absent on older APIs.
    */
   heldForEvidence?: boolean | null;
+  /** M017: the link's intake type; absent on older APIs. */
+  intakeType?: IntakeType | null;
+  /** M017: the last Ashby profile check's outcome; null before any check. */
+  profileOutcome?: AshbyProfileOutcome | null;
   updatedAt: string;
 }
 
@@ -1683,6 +1729,10 @@ export interface AshbyCandidateWorkflow {
   ingestionState: string | null;
   operations: AshbyCandidateWorkflowOperation[];
   sessionStatus: string | null;
+  /** M017: the link's intake type; absent on older APIs. */
+  intakeType?: IntakeType | null;
+  /** M017: the last Ashby profile check's outcome; null before any check. */
+  profileOutcome?: AshbyProfileOutcome | null;
   /** Null when the workflow row carries no usable timestamp. */
   updatedAt: string | null;
 }
