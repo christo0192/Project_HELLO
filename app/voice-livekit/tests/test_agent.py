@@ -787,6 +787,38 @@ class TestPhoneInstructionStateProjection(unittest.TestCase):
         self.assertIsNone(state.role_title)
         self.assertEqual(state.resume_facts, {})
 
+    @staticmethod
+    def _context(evidence):
+        return types.SimpleNamespace(
+            candidate_name="Test Person",
+            role_title="Data Engineer",
+            role_focus=None,
+            role_required_skills=[],
+            interviewer_instructions=None,
+            candidate_evidence=evidence,
+        )
+
+    def test_projection_strips_empty_evidence_values(self):
+        # M017 (ADR-0018): the 0070 projection of a candidate with no parsed
+        # resume (phone parsing) is all null, so it projects to no evidence.
+        state = agent_mod._phone_instruction_state(self._context({
+            "name": None, "current_role": None, "experience_years": None,
+            "skills": None, "summary": "", "recent_role": None,
+            "prior_roles": None, "career_highlights": None,
+            "education": None, "certifications": None,
+        }))
+        self.assertTrue(state.ok)
+        self.assertEqual(state.resume_facts, {})
+
+    def test_projection_keeps_non_empty_values_and_name_only_evidence(self):
+        state = agent_mod._phone_instruction_state(self._context({
+            "name": "Test Person", "current_role": " ", "skills": [],
+            "recent_role": {}, "experience_years": 0,
+        }))
+        self.assertEqual(state.resume_facts, {"name": "Test Person", "experience_years": 0})
+        state = agent_mod._phone_instruction_state(self._context("not a dict"))
+        self.assertEqual(state.resume_facts, {})
+
 
 class TestSingleFinalNameMismatchWireUp(unittest.TestCase):
     """The identity name-mismatch signal must be wired at BOTH turn-hook sites

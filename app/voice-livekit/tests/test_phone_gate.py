@@ -18,6 +18,7 @@ removed, the corresponding test must fail.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
@@ -7866,6 +7867,15 @@ class TestPhoneAnswerDisposition(unittest.TestCase):
 
 # ── PR-8: complete instructions are present at CONSTRUCTION ───────────
 
+#: M017 (ADR-0018): the 0070 `candidate_evidence` of a candidate with no parsed
+#: resume (phone parsing): every key null and a blank summary.
+_NULL_0070_EVIDENCE = {
+    "name": None, "current_role": None, "experience_years": None,
+    "skills": None, "summary": "", "recent_role": None, "prior_roles": None,
+    "career_highlights": None, "education": None, "certifications": None,
+}
+
+
 class TestInstructionConstruction(unittest.TestCase):
     """Prompt delivery is structural: the constructor receives the full text."""
 
@@ -7949,6 +7959,293 @@ class TestInstructionConstruction(unittest.TestCase):
         self.assertNotIn("def _verify_role_instructions_applied", source)
         screening = inspect.getsource(agent_mod._run_native_phone_screening)
         self.assertNotIn("update_instructions", screening)
+
+    # ── M017 (ADR-0018): phone parsing, no resume on file ──────────────
+
+    def _no_resume_state(self, name="Test Person"):
+        # The 0070 projection of a candidate with no parsed resume: every key
+        # null and a blank summary, through the production parser.
+        payload = _plan_payload(name=name)
+        payload["context"]["candidate_evidence"] = dict(_NULL_0070_EVIDENCE)
+        state = phone.PhoneAssessmentState.parse(payload)
+        state.role_title = "Data Engineer"
+        state.role_focus = "Reliable analytics pipelines"
+        self.assertEqual(state.resume_facts, {})
+        return state
+
+    @staticmethod
+    def _render(state):
+        # The REAL shared prompt builders: test_agent reloads `agent` against
+        # stubbed prompting helpers, and discovery imports it first.
+        with patch.object(
+            agent_mod, "system_prompt", wraps=prompting.system_prompt,
+        ) as build, patch.object(
+            agent_mod, "prompting_format_resume_facts",
+            prompting.format_resume_facts,
+        ):
+            return agent_mod._phone_instructions_text(state), build
+
+    def test_no_resume_on_file_renders_the_no_resume_block(self):
+        instructions, build = self._render(self._no_resume_state())
+        self.assertEqual(
+            build.call_args.kwargs["resume_facts"], phone.PHONE_NO_RESUME_FACTS_TEXT,
+        )
+        self.assertIn(phone.PHONE_NO_RESUME_FACTS_TEXT, instructions)
+        self.assertIn(phone.PHONE_NO_RESUME_TEXT, instructions)
+        self.assertNotIn(phone.PHONE_RESUME_CONFLICT_TEXT, instructions)
+        self.assertNotIn("Resume-conflict probing", instructions)
+        self.assertNotIn("- Name: unknown", instructions)
+        self.assertNotIn("untrusted resume claims", instructions)
+        # The record name still reaches the identity lines.
+        self.assertIn("am I speaking with Test?", instructions)
+
+    def test_no_resume_block_is_the_last_policy_block(self):
+        # It replaces the conflict directive in place, so it is read after the
+        # shared prompt's generic resume lines.
+        instructions, _ = self._render(self._no_resume_state())
+        self.assertTrue(instructions.endswith(phone.PHONE_NO_RESUME_TEXT))
+
+    def test_name_only_evidence_keeps_the_resume_block(self):
+        state = self._no_resume_state()
+        state.resume_facts = {"name": "Test Person"}
+        instructions, build = self._render(state)
+        self.assertIn("- Name: Test Person", build.call_args.kwargs["resume_facts"])
+        self.assertIn(phone.PHONE_RESUME_CONFLICT_TEXT, instructions)
+        self.assertIn("- Name: Test Person", instructions)
+        self.assertNotIn(phone.PHONE_NO_RESUME_TEXT, instructions)
+        self.assertNotIn(phone.PHONE_NO_RESUME_FACTS_TEXT, instructions)
+
+    def test_unusable_record_name_renders_the_no_name_lines(self):
+        # `phone_safe_first_name` refuses a name with no usable letters, so the
+        # prompt takes the no-name branch instead of speaking "there".
+        for name in ("12345", None):
+            with self.subTest(name=name):
+                instructions, build = self._render(self._no_resume_state(name=name))
+                self.assertIsNone(build.call_args.kwargs["candidate_name"])
+                self.assertIn("Never guess or invent a name", instructions)
+                self.assertIn(
+                    "ALWAYS ask the candidate if they have any questions",
+                    instructions,
+                )
+                self.assertNotIn("am I speaking with", instructions)
+                self.assertNotIn("12345", instructions)
+
+    def test_resume_context_is_logged_next_to_the_pinned_construction(self):
+        # One fixed-category log per call, beside the line
+        # test_phone_opening_latency pins; it carries no resume value.
+        src = inspect.getsource(agent_mod._run_phone_session)
+        pinned = "phone_instructions = _phone_instructions_text(instruction_state)\n"
+        self.assertEqual(src.count(pinned), 1)
+        after = src[src.index(pinned) + len(pinned):]
+        log = after[:after.index("agent = phone.phone_agent_class(")]
+        self.assertIn('error_type="phone_resume_context"', log)
+        self.assertIn('"resume_on_file"', log)
+        self.assertIn('"no_resume_on_file"', log)
+        self.assertEqual(src.count('error_type="phone_resume_context"'), 1)
+
+
+class TestPerTurnInstructionsWithoutResume(unittest.TestCase):
+    """M017 (ADR-0018): `phone_question_instructions(resume_on_file=False)`."""
+
+    #: sha256 of the origin/main per-turn text for `_question()`, without and
+    #: with a role. The default must keep these bytes.
+    _DEFAULT_SHA256 = "8e2f4ae7dc724f310f158d832cd79d4f5d297cfac59983304935501a8d601b0d"
+    _DEFAULT_WITH_ROLE_SHA256 = "27b9e84a7e2933d5ed788ae74c56f6fe50ee46397a21298bdd790eca31bb9ad1"
+
+    @staticmethod
+    def _question():
+        return phone.PhonePlanQuestion(
+            key="k1", text="Tell me about your last role.",
+            mandatory=True, hint="specifics",
+        )
+
+    @staticmethod
+    def _sha256(text):
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+    def test_default_is_byte_identical(self):
+        q = self._question()
+        self.assertEqual(
+            self._sha256(agent_mod.phone_question_instructions(q)),
+            self._DEFAULT_SHA256,
+        )
+        self.assertEqual(
+            self._sha256(agent_mod.phone_question_instructions(q, "Data Engineer")),
+            self._DEFAULT_WITH_ROLE_SHA256,
+        )
+        self.assertEqual(
+            agent_mod.phone_question_instructions(q, "Data Engineer"),
+            agent_mod.phone_question_instructions(
+                q, "Data Engineer", resume_on_file=True,
+            ),
+        )
+
+    def test_no_resume_drops_the_resume_sentences(self):
+        text = agent_mod.phone_question_instructions(
+            self._question(), "Data Engineer", resume_on_file=False,
+        )
+        self.assertNotIn("Treat resume details as unverified claims", text)
+        self.assertNotIn(phone.PHONE_PER_TURN_STYLE_TEXT, text)
+        self.assertIn(phone.PHONE_PER_TURN_STYLE_NO_RESUME_TEXT, text)
+        self.assertNotIn("resume", text.lower())
+        self.assertNotIn("discrepancy", text.lower())
+        # Everything else still rides the turn.
+        self.assertIn("Authorized objective: " + self._question().spoken_text, text)
+        self.assertIn("If their answer is thin, the thing worth probing is: specifics", text)
+        self.assertIn('The role is exactly: "Data Engineer"', text)
+        self.assertIn("or say goodbye.\n", text)
+
+    def test_no_resume_style_is_the_style_text_without_its_resume_clauses(self):
+        full = phone.PHONE_PER_TURN_STYLE_TEXT
+        short = phone.PHONE_PER_TURN_STYLE_NO_RESUME_TEXT
+        shared = "never during consent, recording disclosure, "
+        self.assertEqual(short[:short.index(shared)], full[:full.index(shared)])
+        self.assertTrue(short.endswith(shared + "or compensation."))
+        self.assertIn("never markdown", short)
+        self.assertIn("ONE question", short)
+        self.assertNotIn("resume", short.lower())
+
+    def test_every_live_call_site_passes_the_resume_context(self):
+        # Only the hesitation re-ask is driven end to end below; this pins the
+        # other call sites, so none silently falls back to the resume wording.
+        src = inspect.getsource(agent_mod._run_native_phone_screening)
+        opener = "phone_question_instructions("
+        calls = []
+        start = src.find(opener)
+        while start != -1:
+            depth = 0
+            for end in range(start + len(opener) - 1, len(src)):
+                depth += {"(": 1, ")": -1}.get(src[end], 0)
+                if depth == 0:
+                    break
+            calls.append(src[start + len(opener):end])
+            start = src.find(opener, end)
+        self.assertEqual(len(calls), 6)
+        for args in calls:
+            with self.subTest(args=" ".join(args.split())):
+                self.assertIn(
+                    "resume_on_file=phone.phone_resume_on_file(state.resume_facts)",
+                    args,
+                )
+
+
+class TestNoResumeCoordinator(unittest.IsolatedAsyncioTestCase):
+    """M017 (ADR-0018): the live coordinator on a call with no resume on file."""
+
+    @staticmethod
+    def _state():
+        payload = _plan_payload(questions=[
+            {"key": "k1", "text": "Tell me about your recent role.",
+             "mandatory": True, "hint": None},
+            {"key": "k2", "text": "What is your notice period?",
+             "mandatory": True, "hint": None},
+        ])
+        payload["context"]["candidate_evidence"] = dict(_NULL_0070_EVIDENCE)
+        return phone.PhoneAssessmentState.parse(payload)
+
+    @staticmethod
+    async def _drain(predicate, tries=300):
+        for _ in range(tries):
+            await asyncio.sleep(0.01)
+            if predicate():
+                return True
+        return False
+
+    async def _coordinator(self, call_metrics=None):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", state=self._state(),
+            coverage_judge_enabled=True, call_metrics=call_metrics,
+        )
+        hooks["latest_assistant"][0] = "Tell me about your recent role."
+        hooks["latest_assistant_anchor"][0] = 1
+        hooks["assistant_delivery_complete"].set()
+        return agent, session, state, client, hooks
+
+    @staticmethod
+    async def _turn(hooks, text):
+        ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            text, types.SimpleNamespace(text_content=text), ctx,
+        )
+        return ctx
+
+    async def _close(self, hooks):
+        hooks["task"].cancel()
+        await asyncio.gather(hooks["task"], return_exceptions=True)
+        hooks["log_patch"].stop()
+
+    async def test_the_judge_is_told_no_resume_is_expected(self):
+        agent, _, state, _, hooks = await self._coordinator()
+        self.assertEqual(state.resume_facts, {})
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(True, None, "model"),
+        ) as judge:
+            await self._turn(hooks, "I have been an operations analyst for four years.")
+            self.assertTrue(await self._drain(lambda: judge.await_count >= 1))
+        kwargs = judge.await_args.kwargs
+        self.assertIs(kwargs["resume_expected"], False)
+        self.assertEqual(kwargs["resume_facts"], {})
+        await self._close(hooks)
+
+    async def test_a_judge_conflict_is_ignored_without_a_resume(self):
+        call_metrics = agent_mod._new_phone_call_metrics()
+        agent, _, _, _, hooks = await self._coordinator(call_metrics)
+        conflict = {
+            "resume_fact": "Resume says data analyst",
+            "spoken_claim": "candidate described operations work",
+        }
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(False, conflict, "model"),
+        ) as judge:
+            await self._turn(hooks, "I have been an operations analyst for four years.")
+            self.assertTrue(await self._drain(lambda: judge.await_count >= 1))
+            await asyncio.sleep(0.05)
+        self.assertFalse(agent._owed_conflict_probe["value"])
+        self.assertEqual(call_metrics["coverage_judge"]["conflict_found"], 0)
+        self.assertNotIn("assessment_only_expired", [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_coverage_conflict"
+        ])
+        await self._close(hooks)
+
+    async def _reask_instruction(self, resume_facts=None):
+        # The pre-X10 hesitation re-ask (patience gate off) is one of the six
+        # `phone_question_instructions` call sites.
+        state = self._state()
+        if resume_facts is not None:
+            state.resume_facts = dict(resume_facts)
+        with patch.dict(phone.os.environ, {"PHONE_PATIENCE_GATE": "off"}):
+            agent, _, _, _, hooks = await _make_native_coordinator(
+                turn_mode="toolless", state=state,
+            )
+            hooks["latest_assistant"][0] = state.questions[0].spoken_text
+            hooks["latest_assistant_anchor"][0] = 1
+            hooks["assistant_delivery_complete"].set()
+            ctx = await self._turn(hooks, "Um")
+        self.assertEqual(getattr(agent, "_turn_policy"), "clarification")
+        await self._close(hooks)
+        return "\n".join(
+            str(item.get("content")) for item in ctx.items if isinstance(item, dict)
+        ), state
+
+    async def test_a_reask_without_a_resume_uses_the_no_resume_turn_text(self):
+        injected, state = await self._reask_instruction()
+        self.assertIn("Authorized objective: " + state.questions[0].spoken_text, injected)
+        self.assertIn(phone.PHONE_PER_TURN_STYLE_NO_RESUME_TEXT, injected)
+        self.assertNotIn(phone.PHONE_PER_TURN_STYLE_TEXT, injected)
+        self.assertNotIn("Treat resume details as unverified claims", injected)
+
+    async def test_a_reask_with_name_only_evidence_is_unchanged(self):
+        injected, state = await self._reask_instruction({"name": "Test Person"})
+        self.assertIn(
+            agent_mod.phone_question_instructions(state.questions[0], state.role_title),
+            injected,
+        )
+        self.assertIn(phone.PHONE_PER_TURN_STYLE_TEXT, injected)
+        self.assertIn("Treat resume details as unverified claims", injected)
 
 
 # ── F3: role-title grounding (phone side only) ─────────────────────────
@@ -12693,6 +12990,10 @@ class TestLlmAuthoredConflictArming(unittest.IsolatedAsyncioTestCase):
                 {"key": "k2", "text": "Second question?", "mandatory": True, "hint": None},
             ],
         )
+        # M017: the LLM-authored arm needs a resume on file. A name-only
+        # projection counts as on file and leaves the deterministic detector
+        # silent for LLM_PROBE.
+        state.resume_facts = {"name": "Asha"}
         agent, session, st, client, hooks = await _make_native_coordinator(
             turn_mode="toolless", coverage_judge_enabled=True, state=state,
         )
@@ -14713,9 +15014,12 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
                 return True
         return False
 
-    async def _coordinator(self, *, enabled=True):
+    async def _coordinator(self, *, enabled=True, resume_facts=None):
+        state = self._state()
+        if resume_facts is not None:
+            state.resume_facts = dict(resume_facts)
         agent, session, state, client, hooks = await _make_native_coordinator(
-            turn_mode="toolless", state=self._state(),
+            turn_mode="toolless", state=state,
             coverage_judge_enabled=enabled,
         )
         hooks["latest_assistant"][0] = "Tell me about your recent role."
@@ -14737,6 +15041,10 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
     async def _close(self, hooks):
         hooks["close_event"].set()
         await hooks["drive_terminal"]()
+
+    #: M017: a judge conflict is acted on only with a resume on file. A
+    #: name-only projection counts as on file and arms no deterministic path.
+    RESUME_ON_FILE = {"name": "Asha"}
 
     def test_background_commit_never_waits_on_current_reply_delivery(self):
         src = inspect.getsource(agent_mod._run_native_phone_screening)
@@ -14838,7 +15146,9 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         # FIX A: an async-detected conflict is DELIVERED as an inline probe on the
         # NEXT authored bot turn — naming the SPECIFIC resume_fact — instead of
         # the planned question. This is the whole point: the old arm fired 0/3.
-        agent, _, _, _, hooks = await self._coordinator()
+        agent, _, _, _, hooks = await self._coordinator(
+            resume_facts=self.RESUME_ON_FILE,
+        )
         await self._arm_via_async_judge(hooks)
         ctx = await self._turn(hooks, "Anyway, my notice period is one month.",
                                assistant_text="What is your notice period?")
@@ -14871,7 +15181,9 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         # bumping the raw counter) still delivers the probe. Simulate several
         # elapsed logical turns before the probe can be delivered; the OLD
         # armed_turn>1 freshness bound would have dropped it stale.
-        agent, _, _, _, hooks = await self._coordinator()
+        agent, _, _, _, hooks = await self._coordinator(
+            resume_facts=self.RESUME_ON_FILE,
+        )
         await self._arm_via_async_judge(hooks)
         # Fast-forward the logical turn counter far past any freshness window.
         agent._native_turn_seq[0] += 5
@@ -14909,7 +15221,9 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         # this call, the owed probe is a no-op (it does not re-probe the same
         # finding). Pre-seed asked_conflicts with the key, then owe + attempt to
         # deliver.
-        agent, _, _, _, hooks = await self._coordinator()
+        agent, _, _, _, hooks = await self._coordinator(
+            resume_facts=self.RESUME_ON_FILE,
+        )
         await self._arm_via_async_judge(hooks)
         agent._asked_conflicts.add(phone.phone_conflict_key(self.ASYNC_CONFLICT))
         ctx = await self._turn(hooks, "One month.",

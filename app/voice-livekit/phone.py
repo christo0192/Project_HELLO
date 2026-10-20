@@ -3895,6 +3895,39 @@ class PhonePlanQuestion:
         self.hint = hint
 
 
+def phone_resume_evidence(facts: Any) -> dict[str, Any]:
+    """The candidate-evidence projection with its empty values dropped.
+
+    M017 (ADR-0018): a phone-parsing candidate has no parsed resume, so the
+    0070 projection arrives with every key present and null (and a blank
+    summary). Kept as is, that dict is truthy and the prompt renders a block
+    of "unknown" resume facts plus the conflict directive. None, blank
+    strings and empty lists or dicts are dropped here, so "no resume" is an
+    empty dict everywhere downstream. Anything that is not a dict is ``{}``.
+    """
+    if not isinstance(facts, dict):
+        return {}
+    evidence: dict[str, Any] = {}
+    for key, value in facts.items():
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        if isinstance(value, (list, dict)) and not value:
+            continue
+        evidence[key] = value
+    return evidence
+
+
+def phone_resume_on_file(evidence: Any) -> bool:
+    """True when the evidence carries any resume detail at all.
+
+    A name-only projection counts as on file (a degraded parse keeps today's
+    behaviour); only an empty projection means the call has no resume.
+    """
+    return bool(phone_resume_evidence(evidence))
+
+
 class PhoneAssessmentState:
     """What ``/assessment/start`` returned.
 
@@ -3973,7 +4006,8 @@ class PhoneAssessmentState:
             if isinstance(facts, dict):
                 # Keep the projection as data; prompting.format_resume_facts
                 # applies the field-specific bounds before model delivery.
-                state.resume_facts = dict(facts)
+                # Empty values are dropped (M017), so no resume is `{}`.
+                state.resume_facts = phone_resume_evidence(facts)
 
         plan = data.get("plan")
         declared = None
@@ -4226,6 +4260,31 @@ PHONE_RESUME_CONFLICT_TEXT = (
     "- At most one such clarification per discrepancy. Never accuse. Never "
     "repeat a clarification you already resolved. If nothing conflicts, say "
     "nothing about the resume and just continue."
+)
+
+
+#: M017 (ADR-0018) phone parsing: the candidate applied without a resume, so
+#: the evidence projection is empty. This replaces the all-"unknown" resume
+#: facts block in the phone prompt (`_phone_instructions_text`).
+PHONE_NO_RESUME_FACTS_TEXT = (
+    "None on file. No resume details are on record for this candidate, so "
+    "there is nothing to cross-check."
+)
+
+
+#: M017 (ADR-0018): appended INSTEAD of `PHONE_RESUME_CONFLICT_TEXT` when no
+#: resume is on file. The shared, sha-pinned `system_prompt` still carries its
+#: generic resume lines, so this block tells the model, after them, that there
+#: is no resume to quote, check or mention. Phone-only.
+PHONE_NO_RESUME_TEXT = (
+    "\n\nNo resume details on file (mandatory):\n"
+    "- There is no resume for this candidate. Never say \"your resume\", "
+    "\"your CV\" or \"your profile shows\", and never refer to resume facts.\n"
+    "- Learn their background only from what they tell you on this call.\n"
+    "- If a question or follow-up mentions a resume, build it on their answers "
+    "from this call instead.\n"
+    "- Do not raise the missing resume yourself. If they ask about it, say the "
+    "team will use this conversation."
 )
 
 
@@ -4555,6 +4614,20 @@ PHONE_PER_TURN_STYLE_TEXT = (
     "clearly conflicts with the resume facts you were given, ask ONE polite "
     "clarifying question about that specific point, then continue — at most "
     "once per discrepancy, never accusing."
+)
+
+
+#: M017 (ADR-0018): the per-turn reminder for a call with no resume on file.
+#: `PHONE_PER_TURN_STYLE_TEXT` without the resume-discrepancy clause and its
+#: conflict sentence, which would otherwise ask the model, on every turn, to
+#: check answers against facts it was never given.
+PHONE_PER_TURN_STYLE_NO_RESUME_TEXT = (
+    "Style (phone line): plain spoken text only — never markdown, asterisks, "
+    "underscores or backticks. Ask at most ONE question this turn, never two. "
+    "React with genuine warmth and light professional humour (the line is "
+    "narrow, so carry the energy in your words), but never joke about the "
+    "candidate or their answers, and never during consent, recording "
+    "disclosure, or compensation."
 )
 
 
