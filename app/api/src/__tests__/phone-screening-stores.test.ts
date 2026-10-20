@@ -981,3 +981,58 @@ describe('0105 — commitItemTurn forwards p_is_gate, and never infers it', () =
     expect(calls[0].args).toMatchObject({ p_turn_started_at_ms: 1723000000123 });
   });
 });
+
+// ── M017: all-empty resume evidence collapses to `{}` ────────────────────
+describe('M017 — the resume evidence of a candidate with no resume is `{}`', () => {
+  // 0070 builds `candidate_evidence` key by key from `candidates.parsed`, so a
+  // candidate with no parse at all arrives as every key null and `summary` ''.
+  const NO_PARSE_EVIDENCE = {
+    name: null, current_role: null, experience_years: null, skills: null,
+    summary: '', recent_role: null, prior_roles: null, career_highlights: null,
+    education: null, certifications: null,
+  };
+
+  async function evidenceFor(candidateEvidence: unknown): Promise<unknown> {
+    const { client } = fakeClient({ status: 'ok', candidate_evidence: candidateEvidence });
+    return (await createPhoneStores(client).assessmentState({ sessionId: 's' })).resumeFacts;
+  }
+
+  it('every key null and a blank summary collapses to `{}`', async () => {
+    expect(await evidenceFor(NO_PARSE_EVIDENCE)).toEqual({});
+  });
+
+  it('blank strings, empty arrays and an all-empty role collapse too', async () => {
+    expect(await evidenceFor({
+      ...NO_PARSE_EVIDENCE,
+      name: '   ',
+      skills: [],
+      recent_role: { title: null, employer: '', period: null, highlights: [] },
+      education: [],
+    })).toEqual({});
+  });
+
+  it('the same collapse runs on the start path', async () => {
+    const { client } = fakeClient({ status: 'ok', candidate_evidence: NO_PARSE_EVIDENCE });
+    const started = await createPhoneStores(client).startAssessment({
+      attemptId: 'a', sessionId: 's', now: NOW,
+    });
+    expect(started.resumeFacts).toEqual({});
+  });
+
+  it('CONTROL — one real value keeps the whole projection, nulls included', async () => {
+    // A name-only parse is still a resume on file to the worker (M017 m9).
+    expect(await evidenceFor({ ...NO_PARSE_EVIDENCE, name: 'Test Person' })).toEqual({
+      ...NO_PARSE_EVIDENCE,
+      name: 'Test Person',
+    });
+  });
+
+  it('CONTROL — zero years and a role with one field are evidence, not empty', async () => {
+    expect(await evidenceFor({ ...NO_PARSE_EVIDENCE, experience_years: 0 }))
+      .toMatchObject({ experience_years: 0 });
+    expect(await evidenceFor({
+      ...NO_PARSE_EVIDENCE,
+      recent_role: { title: 'Advisor', employer: null, period: null, highlights: [] },
+    })).toMatchObject({ recent_role: { title: 'Advisor' } });
+  });
+});

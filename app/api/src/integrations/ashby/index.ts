@@ -279,6 +279,10 @@ export {
   ingestionDedupKey,
   reissuePathFor,
   ASHBY_INGESTION_QUEUE,
+  ASHBY_PROFILE_QUEUE,
+  PROFILE_CLASSIFY_DELAY_MS,
+  profileDedupKey,
+  classifyResumePresence,
   type AshbyWorkers,
 } from './runtime-workers.js';
 export {

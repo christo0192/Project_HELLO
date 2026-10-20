@@ -304,6 +304,13 @@ describe('phone_state_reason allowlist', () => {
     expect(projectPhoneStateReason(42)).toBeNull();
   });
 
+  it('M017: the identity-mismatch release reason (cancelled/identity_unconfirmed) passes through', () => {
+    expect(PHONE_PROGRESS_REASON_ALLOWLIST).toContain('identity_unconfirmed');
+    const m = reducePhoneProgress([engagement('c1', { state: 'cancelled', state_reason: 'identity_unconfirmed' })]);
+    expect(m.get('c1')?.phone_state).toBe('cancelled');
+    expect(m.get('c1')?.phone_state_reason).toBe('identity_unconfirmed');
+  });
+
   it('the reducer applies it to the latest cycle', () => {
     const m = reducePhoneProgress([engagement('c1', { state: 'failed', state_reason: 'sip trunk said: Jane Doe busy' })]);
     expect(m.get('c1')?.phone_state).toBe('failed');

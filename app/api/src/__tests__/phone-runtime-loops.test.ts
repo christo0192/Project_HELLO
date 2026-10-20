@@ -2368,3 +2368,70 @@ describe('G. the admission detail reaches the health view through the real diale
     expect(JSON.stringify(v)).not.toContain('img src');
   });
 });
+
+// ═════════════════════════════════════════════════════════════════════════════
+// H. M017 — THE COMPOSITION ROOT WIRES THE KILL-SWITCH HOLD
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// `runPhoneDuePass` only forwards `holdPhoneParsing`; `runtime.ts` is the one
+// place it is built. Driven through a REAL runtime and a reader that records
+// what it was asked, with `ASHBY_PHONE_PARSING_ENABLED` stubbed on
+// `process.env` — the source `ashbyPhoneParsingEnabled()` reads in production.
+
+describe('H. M017 — the composition root holds phone parsing while the switch is off', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  function recordingRuntime(seen: Array<boolean | undefined>): PhoneRuntimeHandle {
+    const c = counters();
+    return buildRuntime({
+      stores: makeStores(c),
+      queue: makeEmptyQueue(c),
+      reader: makeReader({
+        async listDueEngagements(input) {
+          seen.push(input.excludePhoneParsing);
+          return [];
+        },
+      }),
+      config: { dueMs: 1_000 },
+    });
+  }
+
+  const cases: Array<[string, string | undefined, boolean]> = [
+    ['unset (OFF)', undefined, true],
+    ["'false' (OFF)", 'false', true],
+    ["'TRUE' is not the literal (OFF)", 'TRUE', true],
+    ["'true' (ON)", 'true', false],
+  ];
+
+  for (const [label, value, held] of cases) {
+    it(`switch ${label}: the due read is ${held ? 'held' : 'not held'}`, async () => {
+      vi.stubEnv('ASHBY_PHONE_PARSING_ENABLED', value);
+      const seen: Array<boolean | undefined> = [];
+      const runtime = recordingRuntime(seen);
+      runtime.scheduler.start();
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      expect(seen.length, 'no due pass reached the reader').toBeGreaterThan(0);
+      expect(new Set(seen)).toEqual(new Set([held]));
+    });
+  }
+
+  it('the switch is read per pass, not captured when the runtime is built', async () => {
+    vi.stubEnv('ASHBY_PHONE_PARSING_ENABLED', 'true');
+    const seen: Array<boolean | undefined> = [];
+    const runtime = recordingRuntime(seen);
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(2_000);
+    const passesWhileOn = seen.length;
+    expect(passesWhileOn).toBeGreaterThan(0);
+
+    vi.stubEnv('ASHBY_PHONE_PARSING_ENABLED', 'false');
+    await vi.advanceTimersByTimeAsync(2_000);
+
+    expect(seen.length).toBeGreaterThan(passesWhileOn);
+    expect(seen.slice(0, passesWhileOn).every((v) => v === false)).toBe(true);
+    expect(seen.slice(passesWhileOn).every((v) => v === true)).toBe(true);
+  });
+});

@@ -40,6 +40,14 @@ import {
 } from './invite-delivery.js';
 import { buildScorecard, type ScorecardSource, type ScorecardScale } from './scorecard.js';
 import type { AshbyResult, OpaqueRecord } from './types.js';
+import { createLogger } from '../../lib/logger.js';
+
+/**
+ * Metadata only: fixed categories and codes, never an identifier. The same
+ * channel the runtime handlers log on, so an import's lines sit beside its
+ * queue events.
+ */
+const logger = createLogger('ashby-runtime');
 
 // ── Injected seams ───────────────────────────────────────────────────────────
 
@@ -52,6 +60,70 @@ export interface ApplicationReader {
    * application.info, so imports use this as an authoritative fallback.
    */
   candidateInfo?<T = OpaqueRecord>(candidateId: string): Promise<AshbyResult<T>>;
+}
+
+/**
+ * 0130 (ADR-0018): how an Ashby application is screened. Every link starts as
+ * `resume_parsing`; only `apply_ashby_candidate_profile` stamps
+ * `phone_parsing`, and never flips it back.
+ */
+export type AshbyIntakeType = 'resume_parsing' | 'phone_parsing';
+
+/** 0130 §1: the closed `profile_outcome` vocabulary on the link (a CHECK). */
+export type AshbyProfileOutcome =
+  | 'applied'
+  | 'number_invalid'
+  | 'number_placeholder'
+  | 'number_shared'
+  | 'name_missing'
+  | 'resume_found'
+  | 'resume_shape_unknown'
+  | 'stage_moved'
+  | 'application_inactive'
+  | 'mapping_inactive'
+  | 'subject_request_hold'
+  | 'engagement_active'
+  | 'not_applicable'
+  | 'ashby_unavailable'
+  | 'identity_unconfirmed'
+  | 'application_terminal'
+  | 'candidate_missing';
+
+/** 0130 §5: why the caller sends no number. The RPC refuses any other value. */
+export type AshbyProfileSkipReason = 'number_invalid' | 'number_placeholder' | 'name_missing';
+
+/**
+ * One application of the Ashby candidate profile (0130 §5). Carries contact
+ * data, so it goes to the RPC and nowhere else: never into a log, an error, a
+ * job payload or an audit row.
+ */
+export interface AshbyCandidateProfileInput {
+  applicationLinkId: string;
+  intake: AshbyIntakeType;
+  /** Sanitised name. Sent for `phone_parsing` only. */
+  name?: string | null;
+  /** Bounded email. Sent for `phone_parsing` only. */
+  email?: string | null;
+  /** The Ashby number as written, or null. */
+  phoneRaw: string | null;
+  /** The derived strict +91 number: non-null only for a `dialable` verdict. */
+  phoneE164: string | null;
+  /** Set when no number may be applied; the number is then never sent. */
+  skipReason: AshbyProfileSkipReason | null;
+}
+
+/**
+ * The RPC's answer: its own status, or ensure's, plus four non-PII facts.
+ * `profileOutcome` is null only for the two exits before the link is locked
+ * (`invalid_request`, `application_not_found`).
+ */
+export interface AshbyCandidateProfileResult {
+  status: string;
+  engagementId?: string;
+  profileOutcome: AshbyProfileOutcome | null;
+  numberApplied: boolean;
+  identityApplied: boolean;
+  intakeStamped: boolean;
 }
 
 export interface ExistingLinkRow {
@@ -70,6 +142,8 @@ export interface ExistingLinkRow {
    * opaque identifier; never logged.
    */
   externalCandidateId?: string | null;
+  /** 0130 (ADR-0018): the link's intake, if the store surfaces it. */
+  intakeType?: AshbyIntakeType;
 }
 
 export interface EnqueueResult {
@@ -148,7 +222,8 @@ export interface WorkflowStores {
   /**
    * Backfill the opaque resume handle onto an EXISTING link that has none.
    * Optional so every existing fake keeps compiling; when absent the backfill
-   * is simply skipped. Implementations must never overwrite a non-null handle.
+   * is simply skipped. Implementations must never overwrite a non-null handle,
+   * and must never bind one onto a `phone_parsing` link (ADR-0018).
    */
   bindLinkResumeHandle?(applicationLinkId: string, handle: string): Promise<void>;
   /**
@@ -289,6 +364,21 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
     engagementId: string,
     graceSeconds: number,
   ): Promise<{ status: string }>;
+  /**
+   * 0130 §5 (ADR-0018). Apply the Ashby candidate profile to one link and run
+   * ensure in the same transaction. Every eligibility decision — terminal
+   * link, mapping, DSAR hold, engagement state, intake stamp, the strict,
+   * once-only, never-shared number — is the RPC's. Optional so existing fakes
+   * compile.
+   */
+  applyAshbyCandidateProfile?(input: AshbyCandidateProfileInput): Promise<AshbyCandidateProfileResult>;
+  /** 0130: record a profile outcome the job decided before reaching the RPC. */
+  recordAshbyProfileOutcome?(applicationLinkId: string, outcome: AshbyProfileOutcome): Promise<void>;
+  /**
+   * 0130 §6. Claim the links due for the profile job (SKIP LOCKED, counted
+   * and backed off in SQL), returning their ids only.
+   */
+  claimAshbyProfileDue?(input: { limit: number }): Promise<string[]>;
   /** Enqueue the verified scorecard sink after a durable assessment insert. */
   enqueueScorecardWrite?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
   /**
@@ -323,6 +413,8 @@ export interface WorkflowLinkRow {
   inviteId: string | null;
   lifecycle: string;
   terminalState: 'withdrawn' | 'deleted' | 'manual_stage_cancel' | null;
+  /** 0130 (ADR-0018): the link's intake, if the store surfaces it. */
+  intakeType?: AshbyIntakeType;
 }
 
 /** Mapping activity + tenant config resolved for a job. */
@@ -470,7 +562,17 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
     // re-import: `external_resume_file_handle` stayed null forever, ingestion
     // had nothing to resolve, and the invite went out down the no-resume path
     // with no resume ever ingested. Never overwrites an existing handle.
-    if (resumeHandle && !existing.externalResumeFileHandle && deps.stores.bindLinkResumeHandle) {
+    //
+    // 0130 (ADR-0018): never onto a `phone_parsing` link either. The Ashby
+    // profile was applied, so the application stays phone parsing (owner
+    // decision Q1) and nothing re-parses over it. The store's intake filter
+    // enforces the same rule; this line makes the refusal visible.
+    if (resumeHandle && existing.intakeType === 'phone_parsing') {
+      logger.info('unknown_event', {
+        error_category: 'ashby_late_resume_ignored',
+        error_type: 'phone_parsing',
+      });
+    } else if (resumeHandle && !existing.externalResumeFileHandle && deps.stores.bindLinkResumeHandle) {
       await deps.stores.bindLinkResumeHandle(linkId, resumeHandle);
     }
     if (view.submittedAt && deps.stores.bindLinkSubmittedAt) {

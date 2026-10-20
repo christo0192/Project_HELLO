@@ -141,9 +141,11 @@ describe('listWorkflows — ingestionState projection', () => {
     const { client } = fakeClient([linkRow()]);
     const [w] = await createMissionControlStore(client).listWorkflows(50);
     // C3 (0114) adds exactly one key: `heldForEvidence` (false when not held).
+    // M017 (0130) adds exactly two: `intakeType` and `profileOutcome`.
     expect(Object.keys(w).sort()).toEqual([
       'applicationLinkId', 'externalApplicationId', 'externalJobId', 'heldForEvidence', 'ingestionState',
-      'lifecycle', 'operations', 'sessionId', 'sessionStatus', 'terminalState', 'updatedAt',
+      'intakeType', 'lifecycle', 'operations', 'profileOutcome', 'sessionId', 'sessionStatus', 'terminalState',
+      'updatedAt',
     ]);
     expect(w).toMatchObject({
       applicationLinkId: LINK,
@@ -178,13 +180,47 @@ describe('listWorkflows — the read itself is unchanged', () => {
     const sel = calls.find((c) => c.table === 'ashby_application_links')!.select;
     expect(sel).toContain('ashby_resume_ingestions ( state )');
     expect(sel).toContain('ashby_operations ( id, operation_type, state, error_code )');
-    // Nothing candidate-bearing or provider-bearing was added to the read.
+    // M017 (0130): two link codes, read in the same query.
+    expect(sel).toContain('intake_type, profile_outcome');
+    // Nothing candidate-bearing or provider-bearing was added to the read,
+    // nor the sweep's own bookkeeping.
     for (const forbidden of [
       'external_resume_file_handle', 'candidate', 'resume_id', 'content_sha256',
-      'failed_reason', 'provenance', 'invite', 'token',
+      'failed_reason', 'provenance', 'invite', 'token', 'profile_attempts', 'profile_checked_at',
     ]) {
       expect(sel).not.toContain(forbidden);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// 3b. M017 — intake type and profile outcome
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('listWorkflows — intakeType and profileOutcome (M017)', () => {
+  it('reports both codes as the link holds them', async () => {
+    const { client } = fakeClient([
+      linkRow({ intake_type: 'phone_parsing', profile_outcome: 'applied', ashby_resume_ingestions: { state: 'queued' } }),
+      linkRow({ intake_type: 'resume_parsing', profile_outcome: null }),
+    ]);
+    const out = await createMissionControlStore(client).listWorkflows(50);
+    expect(out.map((w) => [w.intakeType, w.profileOutcome])).toEqual([
+      ['phone_parsing', 'applied'],
+      ['resume_parsing', null],
+    ]);
+  });
+
+  it('a row without the columns (pre-0130) or outside either CHECK reads as null, never echoed', async () => {
+    const { client } = fakeClient([
+      linkRow(),
+      linkRow({ intake_type: 'PHONE', profile_outcome: 'dialled +919812345670' }),
+    ]);
+    const out = await createMissionControlStore(client).listWorkflows(50);
+    for (const w of out) {
+      expect(w.intakeType).toBeNull();
+      expect(w.profileOutcome).toBeNull();
+    }
+    expect(JSON.stringify(out)).not.toContain('919812345670');
   });
 });
 

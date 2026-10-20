@@ -3,7 +3,7 @@ import { runClaudeJSONWithProvenance } from '../lib/claude.js';
 import { env } from '../lib/env.js';
 import { observeAshbyCompletion } from '../integrations/ashby/completion-observer.js';
 import { createAshbyLinkLookup, createWorkflowStores } from '../integrations/ashby/workflow-stores.js';
-import { buildAssessmentPrompt, formatResumeFacts } from '../lib/prompts.js';
+import { buildAssessmentPrompt, formatResumeFacts, NO_RESUME_ON_FILE_FACTS } from '../lib/prompts.js';
 import { insertNotificationIntent } from '../lib/notification-intent.js';
 import type { Assessment, TranscriptTurn } from '../lib/types.js';
 import { scoringProvenance } from '../lib/model-provenance.js';
@@ -285,13 +285,19 @@ async function runAssessmentImpl(
 
   const { data: candidate } = await supabase
     .from('candidates')
-    .select('name,parsed')
+    .select('name,parsed,resume_id')
     .eq('id', session.candidate_id)
     .single();
 
   // Shared candidate context for whichever scoring path runs.
   const candidateName = candidate?.name ?? null;
-  const resumeFacts = formatResumeFacts((candidate?.parsed as any) ?? null);
+  // M017: whether a resume is on file is decided by `resume_id`, never inferred
+  // from the parse. A phone-parsing intake has no resume at all, and scoring it
+  // against an all-"unknown" fact sheet would make every claim look unbacked.
+  const resumeOnFile = candidate?.resume_id != null;
+  const resumeFacts = resumeOnFile
+    ? formatResumeFacts((candidate?.parsed as any) ?? null)
+    : NO_RESUME_ON_FILE_FACTS;
   // Anchor for any relative callback phrase the candidate used. The phone
   // path always has a session start; the browser path never asks for a
   // callback, so a missing anchor there is harmless.
@@ -419,6 +425,10 @@ async function runAssessmentImpl(
           { roleTitle, candidateName, transcript, resumeFacts, callTimestampIso },
         )
       : { roleFit: null, resumeConflicts: [] };
+    // M017: with no resume on file there is nothing to conflict with, so any
+    // conflict the model reports is invented. Forced empty, which omits the
+    // column exactly as an analysis that found none does.
+    const resumeConflicts = resumeOnFile ? integrity.resumeConflicts : [];
     basePayload = {
       session_id: sessionId,
       candidate_id: session.candidate_id,
@@ -456,8 +466,8 @@ async function runAssessmentImpl(
       // the résumé-conflicts and role-fit (matched skills / gaps / red flags)
       // sections for a v2 screening; omitted (columns stay null) when it found none.
       ...(integrity.roleFit ? { role_fit: integrity.roleFit } : {}),
-      ...(integrity.resumeConflicts.length > 0
-        ? { resume_conflicts: integrity.resumeConflicts }
+      ...(resumeConflicts.length > 0
+        ? { resume_conflicts: resumeConflicts }
         : {}),
       raw: scored, // full v2 object (mirrors v1's "raw = full result" contract)
       provenance: scoringProvenanceValue, // LLM-06 provenance — required, fail closed if missing
@@ -484,6 +494,10 @@ async function runAssessmentImpl(
     const { overall, recommendation } = computeOverall(assessment);
     assessment.overall_score = overall;
     assessment.recommendation = recommendation;
+    // M017: no resume on file means no resume conflicts, whatever the model
+    // returned. Set on the object itself so `raw` (the stale-schema fallback
+    // when the column is absent) agrees with the column.
+    if (!resumeOnFile) assessment.resume_conflicts = [];
 
     // Build scoring provenance using the requested model.
     scoringProvenanceValue = scoringProvenance(scoringModel);

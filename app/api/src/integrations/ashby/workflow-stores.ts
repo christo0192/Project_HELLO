@@ -17,8 +17,12 @@ import type {
   EnqueueResult,
   OperationClaimRow,
   WorkflowLinkRow,
+  AshbyCandidateProfileResult,
+  AshbyIntakeType,
+  AshbyProfileOutcome,
 } from './orchestration.js';
 import type { AshbyLinkLookup } from './completion-observer.js';
+import { projectProfileOutcome } from './candidate-workflow.js';
 import { ashbyReviewPath, buildScorecard, type ScorecardSource } from './scorecard.js';
 import {
   isV2AdapterBlocked,
@@ -26,6 +30,7 @@ import {
   type PersistedV2AssessmentRow,
 } from './scorecard-v2-adapter.js';
 import { parseEvidenceGrade, readAssessmentEvidenceGrade } from '../../lib/scorecards/evidence.js';
+import { toCandidateColumns } from '../../lib/candidate-phone.js';
 
 /**
  * The assessment columns BOTH scorecard build sites read. One list, so the
@@ -95,6 +100,20 @@ function statusOf(data: unknown): string {
   return (data as { status?: string } | null)?.status ?? 'error';
 }
 
+/** 0130: the link's `intake_type`, or undefined for anything outside the CHECK. */
+function intakeTypeOf(value: unknown): AshbyIntakeType | undefined {
+  return value === 'resume_parsing' || value === 'phone_parsing' ? value : undefined;
+}
+
+/**
+ * The 0130 §6 claim's fixed parameters (M017 §1.6): a link is due 15 minutes
+ * after it was created (or its engagement last moved), is retried after
+ * 6h·2^(attempts−1), and is claimed at most 4 times.
+ */
+const PROFILE_DUE_MIN_AGE_SECONDS = 900;
+const PROFILE_DUE_RETRY_SECONDS = 21_600;
+const PROFILE_DUE_MAX_ATTEMPTS = 4;
+
 /** Production WorkflowStores backed by the 0029/0031 tables + RPCs. */
 export function createWorkflowStores(client: SupabaseClient, actorId: string = SYSTEM_ACTOR): RuntimeWorkflowStores {
   /**
@@ -124,7 +143,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
     async findLinkByApplicationId(externalApplicationId): Promise<ExistingLinkRow | null> {
       const { data, error } = await client
         .from('ashby_application_links')
-        .select('id, external_application_id, terminal_state, external_resume_file_handle, external_candidate_id')
+        .select('id, external_application_id, terminal_state, external_resume_file_handle, external_candidate_id, intake_type')
         .eq('provider', 'ashby')
         .eq('external_application_id', externalApplicationId)
         .maybeSingle();
@@ -136,19 +155,26 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         terminal_state: string | null;
         external_resume_file_handle: string | null;
         external_candidate_id?: string | null;
+        intake_type?: string | null;
       };
+      const intakeType = intakeTypeOf(row.intake_type);
       return {
         id: row.id,
         externalApplicationId: row.external_application_id,
         terminalState: (row.terminal_state as ExistingLinkRow['terminalState']) ?? null,
         externalResumeFileHandle: row.external_resume_file_handle ?? null,
         externalCandidateId: row.external_candidate_id ?? null,
+        ...(intakeType ? { intakeType } : {}),
       };
     },
     /**
      * Backfill-on-reuse. Guarded in SQL as well as by the caller: the `is`
      * filter means a concurrent writer that already set a handle wins and this
      * update matches no row, so a stored handle is never overwritten.
+     *
+     * 0130 (ADR-0018): the intake filter means a link already stamped
+     * `phone_parsing` matches no row either. A resume that arrives after the
+     * Ashby profile was applied is never bound, so nothing re-parses over it.
      */
     async bindLinkResumeHandle(applicationLinkId, handle): Promise<void> {
       const { error } = await client
@@ -156,6 +182,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         .update({ external_resume_file_handle: handle })
         .eq('provider', 'ashby')
         .eq('id', applicationLinkId)
+        .eq('intake_type', 'resume_parsing')
         .is('external_resume_file_handle', null);
       if (error) throw new Error('ashby_link_handle_backfill_error');
     },
@@ -386,7 +413,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         .select(
           'id, external_application_id, external_job_id, job_mapping_id, ' +
             'candidate_id, session_id, invite_id, lifecycle, terminal_state, ' +
-            'external_resume_file_handle',
+            'external_resume_file_handle, intake_type',
         )
         .eq('provider', 'ashby')
         .eq('id', applicationLinkId)
@@ -394,6 +421,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       if (error) throw new Error('ashby_link_read_error');
       if (!data) return null;
       const r = data as unknown as Record<string, unknown>;
+      const intakeType = intakeTypeOf(r.intake_type);
       return {
         id: String(r.id),
         externalApplicationId: String(r.external_application_id),
@@ -405,6 +433,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         inviteId: (r.invite_id as string | null) ?? null,
         lifecycle: String(r.lifecycle),
         terminalState: (r.terminal_state as WorkflowLinkRow['terminalState']) ?? null,
+        ...(intakeType ? { intakeType } : {}),
       };
     },
     async parkOperationAwaitingDelivery(id, leaseToken, externalAnchor): Promise<'ok' | 'not_owned'> {
@@ -450,6 +479,69 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       });
       if (error) throw new Error('phone_dial_defer_error');
       return { status: statusOf(data) };
+    },
+    async applyAshbyCandidateProfile(input): Promise<AshbyCandidateProfileResult> {
+      // 0130 §5. Every decision — terminal link, mapping, DSAR hold,
+      // engagement state, intake stamp, the once-only, never-shared number —
+      // is the RPC's. This seam only narrows what it is handed: the strict
+      // gate is re-applied at the write (`toCandidateColumns`), no number
+      // travels with a skip reason, and name and email travel only for
+      // phone_parsing, the one intake that may fill them.
+      const phoneParsing = input.intake === 'phone_parsing';
+      const { data, error } = await client.rpc('apply_ashby_candidate_profile', {
+        p_application_link_id: input.applicationLinkId,
+        p_intake: input.intake,
+        p_name: phoneParsing ? input.name ?? null : null,
+        p_email: phoneParsing ? input.email ?? null : null,
+        p_phone_raw: input.phoneRaw,
+        p_phone_e164: input.skipReason === null
+          ? toCandidateColumns({ raw: input.phoneRaw, e164: input.phoneE164, valid: true }).phone_e164
+          : null,
+        p_skip_reason: input.skipReason,
+        p_now: new Date().toISOString(),
+      });
+      // Never `error.message`: a database error can echo the arguments.
+      if (error) throw new Error('ashby_candidate_profile_error');
+      // Codes, flags and an opaque engagement id only; the RPC returns no
+      // contact value and no answer key names one.
+      const row = (data ?? {}) as Record<string, unknown>;
+      const engagementId = typeof row.engagement_id === 'string' ? row.engagement_id : undefined;
+      return {
+        status: statusOf(data),
+        ...(engagementId ? { engagementId } : {}),
+        // Through the closed vocabulary, as every other reader of the column:
+        // the profile job logs this value, so it must only ever be a code.
+        profileOutcome: projectProfileOutcome(row.profile_outcome),
+        numberApplied: row.number_applied === true,
+        identityApplied: row.identity_applied === true,
+        intakeStamped: row.intake_stamped === true,
+      };
+    },
+    async recordAshbyProfileOutcome(applicationLinkId, outcome): Promise<void> {
+      // A plain write of the two columns; the closed vocabulary is a CHECK.
+      const { error } = await client
+        .from('ashby_application_links')
+        .update({ profile_outcome: outcome, profile_checked_at: new Date().toISOString() })
+        .eq('provider', 'ashby')
+        .eq('id', applicationLinkId);
+      if (error) throw new Error('ashby_profile_outcome_write_error');
+    },
+    async claimAshbyProfileDue({ limit }): Promise<string[]> {
+      // 0130 §6. Due-ness, SKIP LOCKED, the attempt count and the backoff are
+      // all decided in SQL, so Ashby polling stays bounded across machines
+      // and restarts whatever happens to the job.
+      const { data, error } = await client.rpc('claim_ashby_profile_due', {
+        p_limit: limit,
+        p_min_age_seconds: PROFILE_DUE_MIN_AGE_SECONDS,
+        p_retry_seconds: PROFILE_DUE_RETRY_SECONDS,
+        p_max_attempts: PROFILE_DUE_MAX_ATTEMPTS,
+        p_now: new Date().toISOString(),
+      });
+      if (error) throw new Error('ashby_profile_due_claim_error');
+      const rows = (Array.isArray(data) ? data : []) as Array<{ application_link_id?: unknown }>;
+      return rows
+        .map((r) => r?.application_link_id)
+        .filter((id): id is string => typeof id === 'string' && id.length > 0);
     },
     async enqueueScorecardWrite(applicationLinkId, sessionId): Promise<{ status: string }> {
       // Cycle writeback is opt-in until the tenant contract is verified to
@@ -679,6 +771,14 @@ export interface MissionControlWorkflow {
    * a diagnostic, never a reason to fail the list.
    */
   heldForEvidence?: boolean | null;
+  /**
+   * M017 (0130): the link's intake type, and the last Ashby profile check's
+   * outcome code (null before any check). Both are codes from closed CHECKs;
+   * anything else reads as null. Optional only so older fakes still compile;
+   * the store always sets both.
+   */
+  intakeType?: AshbyIntakeType | null;
+  profileOutcome?: AshbyProfileOutcome | null;
   updatedAt: string;
 }
 
@@ -964,6 +1064,7 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
         .from('ashby_application_links')
         .select(
           'id, external_application_id, external_job_id, lifecycle, terminal_state, session_id, updated_at, ' +
+            'intake_type, profile_outcome, ' +
             'ashby_resume_ingestions ( state ), ' +
             'ashby_operations ( id, operation_type, state, error_code )',
         )
@@ -1019,6 +1120,8 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
           sessionId: typeof r.session_id === 'string' ? r.session_id : null,
           // `null` (unreadable) must survive — `??` would turn it into false.
           heldForEvidence: heldOf(heldForEvidence, String(r.id)),
+          intakeType: intakeTypeOf(r.intake_type) ?? null,
+          profileOutcome: projectProfileOutcome(r.profile_outcome),
           updatedAt: String(r.updated_at),
         };
       });

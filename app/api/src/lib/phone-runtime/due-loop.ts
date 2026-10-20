@@ -309,6 +309,13 @@ export interface PhoneDueDeps {
   readonly dialer: PhoneDialPort;
   /** The live appointment of an engagement, for the `scheduled` case only. */
   readonly liveAppointmentStart: (engagementId: string) => Promise<string | null>;
+  /**
+   * M017 kill-switch hold: true while `ASHBY_PHONE_PARSING_ENABLED` is off.
+   * Consulted once per pass, so a flipped switch takes effect on the next
+   * pass. Only an explicit `true` holds; absent means no hold, which keeps
+   * every existing test double of this port unchanged.
+   */
+  readonly holdPhoneParsing?: () => boolean;
 }
 
 export interface PhoneDueOptions {
@@ -473,6 +480,11 @@ export async function runPhoneDuePass(
     // that reads rows it then always rejects.
     reconnectBackoffSeconds: deps.config.reconnectBackoffSeconds,
     onlyEngagementId: testGate?.engagementId,
+    // M017. A held `phone_parsing` engagement is dropped by the READ, not by
+    // a check in this loop: the batch is bounded in SQL, so rows filtered
+    // here would keep their slots and starve the lane. Reconnects are never
+    // held — the reader leaves that batch unfiltered.
+    excludePhoneParsing: deps.holdPhoneParsing?.() === true,
   });
 
   const skipped: Record<string, number> = {};

@@ -30,7 +30,10 @@ import {
 } from '../routes/ashby-candidate-workflow.js';
 import { ashbyReviewRouter, createAshbyScopedWorkflowRoute } from '../routes/ashby-review.js';
 import {
+  ASHBY_PROFILE_OUTCOMES,
   projectCandidateWorkflow,
+  projectIntakeType,
+  projectProfileOutcome,
   createCandidateWorkflowStore,
   type CandidateAshbyWorkflowStore,
   type CandidateAshbyWorkflowView,
@@ -60,6 +63,8 @@ const WORKFLOW: CandidateAshbyWorkflowView = {
     { type: 'scorecard_write', state: 'failed', errorCode: 'provider_5xx' },
   ],
   sessionStatus: 'completed',
+  intakeType: 'resume_parsing',
+  profileOutcome: 'applied',
   updatedAt: '2026-08-20T00:00:00.000Z',
 };
 
@@ -295,6 +300,9 @@ const ALLOWED_KEYS = new Set([
   'ingestionState',
   'operations',
   'sessionStatus',
+  // M017 (0130): two codes from closed CHECKs — no id, no name, no number.
+  'intakeType',
+  'profileOutcome',
   'updatedAt',
   'type',
   'state',
@@ -434,6 +442,47 @@ describe('projectCandidateWorkflow', () => {
     expect(view.ingestionState).toBeNull();
     expect(view.terminalState).toBeNull();
     expect(view.operations).toEqual([]);
+    // A row with no intake columns (pre-0130) is the legacy rendering.
+    expect(view.intakeType).toBeNull();
+    expect(view.profileOutcome).toBeNull();
+  });
+
+  it('M017: projects the intake type and the profile outcome', () => {
+    const view = projectCandidateWorkflow(
+      {
+        lifecycle: 'imported',
+        intake_type: 'phone_parsing',
+        profile_outcome: 'applied',
+        ashby_resume_ingestions: [{ state: 'queued' }],
+      },
+      null,
+    );
+    expect(view.intakeType).toBe('phone_parsing');
+    expect(view.profileOutcome).toBe('applied');
+    // The leftover `queued` row is still reported as it is; the card words it.
+    expect(view.ingestionState).toBe('queued');
+  });
+
+  it('M017: every outcome in the closed vocabulary projects as itself', () => {
+    for (const outcome of ASHBY_PROFILE_OUTCOMES) {
+      expect(projectProfileOutcome(outcome)).toBe(outcome);
+    }
+    expect(projectIntakeType('resume_parsing')).toBe('resume_parsing');
+    expect(projectIntakeType('phone_parsing')).toBe('phone_parsing');
+  });
+
+  it('M017: a value outside either closed set is null, never echoed', () => {
+    const view = projectCandidateWorkflow(
+      { lifecycle: 'ready', intake_type: 'Phone Parsing', profile_outcome: 'dialled +919812345670' },
+      null,
+    );
+    expect(view.intakeType).toBeNull();
+    expect(view.profileOutcome).toBeNull();
+    expect(JSON.stringify(view)).not.toContain('919812345670');
+    for (const bad of [undefined, null, '', 7, {}, ['applied'], 'APPLIED']) {
+      expect(projectProfileOutcome(bad)).toBeNull();
+      expect(projectIntakeType(bad)).toBeNull();
+    }
   });
 });
 
@@ -536,6 +585,31 @@ describe('createCandidateWorkflowStore', () => {
     const store = createCandidateWorkflowStore(client);
     await expect(store.getForCandidate(CANDIDATE_ID)).rejects.toThrow('ashby_candidate_workflow_error');
     await expect(store.getForCandidate(CANDIDATE_ID)).rejects.not.toThrow(/connection reset|08006/);
+  });
+
+  it('M017: reads intake_type and profile_outcome, and still no id, handle or sweep bookkeeping', async () => {
+    let selected = '';
+    const client: any = {
+      from: (table: string) => {
+        if (table === 'call_sessions') return chainable({ data: null, error: null });
+        const builder = chainable({
+          data: [{
+            lifecycle: 'imported', terminal_state: null, session_id: null, updated_at: '2026-10-20T00:00:00.000Z',
+            intake_type: 'phone_parsing', profile_outcome: 'name_missing',
+            ashby_resume_ingestions: { state: 'queued' }, ashby_operations: [],
+          }],
+          error: null,
+        });
+        builder.select = (columns: string) => { selected = columns; return builder; };
+        return builder;
+      },
+    };
+    const view = await createCandidateWorkflowStore(client).getForCandidate(CANDIDATE_ID);
+    expect(selected).toContain('intake_type, profile_outcome');
+    for (const forbidden of ['external_', 'candidate_id', 'file_handle', 'profile_attempts', 'profile_checked_at']) {
+      expect(selected, forbidden).not.toContain(forbidden);
+    }
+    expect(view).toMatchObject({ intakeType: 'phone_parsing', profileOutcome: 'name_missing' });
   });
 
   it('returns null — not an error — when the candidate has no Ashby link', async () => {

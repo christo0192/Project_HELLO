@@ -59,6 +59,16 @@ export type PhoneDueState = (typeof PHONE_DUE_STATES)[number];
 /** Explicit column lists. Never `*`, and never a column this file does not use. */
 const DUE_ENGAGEMENT_COLUMNS =
   'id,state,candidate_id,role_id,session_id,next_eligible_at,no_answer_attempts,updated_at';
+/**
+ * M017 (ADR-0018). The due list plus the link's intake type, embedded
+ * `!inner` so the kill-switch hold can filter on it in SQL. Spelled out rather
+ * than built from `DUE_ENGAGEMENT_COLUMNS`, because a column list must be one
+ * plain literal; `phone-runtime-structural.test.ts` pins it to exactly that
+ * list plus the embed. `application_link_id` is NOT NULL with a single FK
+ * (0042), so the inner join drops no engagement that has a link.
+ */
+const DUE_ENGAGEMENT_HOLD_COLUMNS =
+  'id,state,candidate_id,role_id,session_id,next_eligible_at,no_answer_attempts,updated_at,ashby_application_links!inner(intake_type)';
 const PHONE_TEST_GATE_COLUMNS = 'id,candidate_id,engagement_id,expires_at';
 
 /**
@@ -180,6 +190,13 @@ export interface PhoneRuntimeReader {
     reconnectBackoffSeconds: number;
     /** Restrict the due read to the gate's one engagement. */
     onlyEngagementId?: string;
+    /**
+     * M017 kill-switch hold: when true, the ORDINARY batch excludes
+     * engagements whose application link is `phone_parsing`, in SQL. The
+     * reconnect batch is never filtered, so a live call is not abandoned.
+     * Absent or false leaves both reads exactly as they were.
+     */
+    excludePhoneParsing?: boolean;
   }): Promise<readonly DuePhoneEngagement[]>;
 
   /**
@@ -459,12 +476,23 @@ async function readDueBatch(
     onlyState: PhoneDueState | null;
     reconnectBackoffSeconds: number;
     onlyEngagementId?: string;
+    excludePhoneParsing?: boolean;
   },
 ): Promise<DuePhoneEngagement[]> {
-  const base = client
-    .from('phone_engagements')
-    .select(DUE_ENGAGEMENT_COLUMNS)
-    .is('terminal_at', null);
+  const table = client.from('phone_engagements');
+  // ── THE KILL-SWITCH HOLD IS IN SQL, AND ONLY WHEN ASKED FOR (M017) ──
+  // While `ASHBY_PHONE_PARSING_ENABLED` is off, a `phone_parsing` engagement
+  // is not due. It has to be filtered HERE for the reason the reconnect clock
+  // below is: the batch is bounded before any JS filter runs, so held rows
+  // dropped afterwards would stay the oldest rows and fill every slot of
+  // every pass. The embed exists only on this branch, so with the switch on
+  // the read is byte-identical to the one before M017.
+  const selected = input.excludePhoneParsing === true
+    ? table
+      .select(DUE_ENGAGEMENT_HOLD_COLUMNS)
+      .neq('ashby_application_links.intake_type', 'phone_parsing')
+    : table.select(DUE_ENGAGEMENT_COLUMNS);
+  const base = selected.is('terminal_at', null);
   const narrowed = input.onlyState === null
     ? base.in('state', PHONE_DUE_STATES as unknown as string[])
     : base.eq('state', input.onlyState);
@@ -560,6 +588,9 @@ export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeRe
       // `limit` of 1 the reservation is 0 and the ordinary batch is the
       // whole pass — a single-slot pass has no room for a priority lane.
       const reconnectSlots = Math.max(0, limit - 1);
+      // `excludePhoneParsing` is deliberately NOT passed here: a reconnect
+      // has a person on the line, and the kill switch stops new calls, not
+      // live ones (M017, §1.5).
       const reconnecting = reconnectSlots === 0
         ? []
         : await readDueBatch(client, {
@@ -575,6 +606,7 @@ export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeRe
         onlyState: null,
         reconnectBackoffSeconds: input.reconnectBackoffSeconds,
         onlyEngagementId: input.onlyEngagementId,
+        excludePhoneParsing: input.excludePhoneParsing,
       });
 
       const merged: DuePhoneEngagement[] = [];

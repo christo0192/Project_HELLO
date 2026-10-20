@@ -978,6 +978,155 @@ describe('A. listDueEngagements — the query it actually issues', () => {
     // And it came from the RECONNECT read: the ordinary batch was empty.
     expect(fake.dueQueries().reconnects).toBeDefined();
   });
+
+  // ── M017: THE KILL-SWITCH HOLD ──────────────────────────────────────
+  //
+  // While `ASHBY_PHONE_PARSING_ENABLED` is off the due loop passes
+  // `excludePhoneParsing: true`. The ORDINARY batch then embeds the link's
+  // intake type `!inner` and excludes `phone_parsing` IN SQL — in SQL for the
+  // reason the reconnect clock is: the batch is bounded before any JS filter
+  // could drop a row. The RECONNECT batch is never filtered, because a
+  // reconnect has a person on the line. Like `.or`, `.eq` and `.in`, the fake
+  // records `.neq` without applying it, so these are assertions about the
+  // QUERY.
+
+  const DUE_COLUMNS =
+    'id,state,candidate_id,role_id,session_id,next_eligible_at,no_answer_attempts,updated_at';
+  const HOLD_COLUMNS = `${DUE_COLUMNS},ashby_application_links!inner(intake_type)`;
+
+  it('A17: HOLDING — the ordinary batch embeds the link `!inner` and excludes `phone_parsing`; the reconnect batch is untouched', async () => {
+    const fake = fakeClient({ phone_engagements: { data: [] } });
+    await createPhoneRuntimeReader(fake.client).listDueEngagements({
+      nowIso: NOW_ISO,
+      limit: 3,
+      reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      excludePhoneParsing: true,
+    });
+
+    const { reconnects, main } = fake.dueQueries();
+
+    // The ordinary batch: the hold list, and exactly one filter on the
+    // EMBEDDED column. Everything after it is the pre-M017 read unchanged.
+    expect(main.columns).toBe(HOLD_COLUMNS);
+    expect(main.columns).not.toContain('phone_e164');
+    expect(allArgsOf(main, 'neq')).toEqual([
+      ['ashby_application_links.intake_type', 'phone_parsing'],
+    ]);
+    expect(main.calls.map((c) => c.op)).toEqual(['neq', 'is', 'in', 'or', 'order', 'limit']);
+    expect(argsOf(main, 'is')).toEqual(['terminal_at', null]);
+    expect(argsOf(main, 'or')).toEqual([
+      `state.eq.reconnecting,next_eligible_at.is.null,next_eligible_at.lte.${NOW_ISO}`,
+    ]);
+    expect(argsOf(main, 'limit')).toEqual([3]);
+
+    // The reconnect batch: no embed, no filter, the same shape as A10.
+    expect(reconnects.columns).toBe(DUE_COLUMNS);
+    expect(reconnects.columns).not.toContain('ashby_application_links');
+    expect(allArgsOf(reconnects, 'neq')).toEqual([]);
+    expect(reconnects.calls.map((c) => c.op)).toEqual(['is', 'eq', 'lte', 'order', 'limit']);
+  });
+
+  it('A18: NOT holding — `false` and absent issue the pre-M017 reads, with no embed and no filter', async () => {
+    for (const excludePhoneParsing of [false, undefined]) {
+      const fake = fakeClient({ phone_engagements: { data: [] } });
+      await createPhoneRuntimeReader(fake.client).listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+        excludePhoneParsing,
+      });
+
+      const { reconnects, main, both } = fake.dueQueries();
+      for (const q of both) {
+        expect(q.columns, `${String(excludePhoneParsing)}: embed present`).toBe(DUE_COLUMNS);
+        expect(allArgsOf(q, 'neq'), `${String(excludePhoneParsing)}: filter present`).toEqual([]);
+      }
+      expect(main.calls.map((c) => c.op)).toEqual(['is', 'in', 'or', 'order', 'limit']);
+      expect(reconnects.calls.map((c) => c.op)).toEqual(['is', 'eq', 'lte', 'order', 'limit']);
+    }
+  });
+
+  it('A19: HOLDING with a limit of 1 — the one read is the ordinary batch, and it carries the hold', async () => {
+    // No reconnect slot means no reconnect read (A13), so the hold must land
+    // on the only read there is rather than vanish with the skipped one.
+    const fake = fakeClient({ phone_engagements: { data: [] } });
+    await createPhoneRuntimeReader(fake.client).listDueEngagements({
+      nowIso: NOW_ISO,
+      limit: 1,
+      reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+      excludePhoneParsing: true,
+    });
+
+    const reads = fake.all('phone_engagements');
+    expect(reads).toHaveLength(1);
+    expect(reads[0].columns).toBe(HOLD_COLUMNS);
+    expect(allArgsOf(reads[0], 'neq')).toEqual([
+      ['ashby_application_links.intake_type', 'phone_parsing'],
+    ]);
+    expect(argsOf(reads[0], 'in')?.[1]).toEqual(['eligible', 'reconnecting', 'scheduled']);
+  });
+
+  it('A20: HOLDING — a due reconnect still comes back FIRST, and the embed never leaves the reader', async () => {
+    // The reconnect read is unfiltered, so a phone-parsing engagement whose
+    // call dropped is still offered while the switch is off. The ordinary
+    // row arrives carrying the embedded link object, as PostgREST returns
+    // it; the projection must not pass it on.
+    const fake = fakeClient({
+      phone_engagements: [
+        { data: [RECONNECT_ROW] },
+        {
+          data: [{
+            ...eligibleRow(1),
+            ashby_application_links: { intake_type: 'resume_parsing' },
+          }],
+        },
+      ],
+    });
+
+    const out = await createPhoneRuntimeReader(fake.client)
+      .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 3,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+        excludePhoneParsing: true,
+      });
+
+    expect(out.map((e) => e.engagementId)).toEqual(['e-reconnect', 'e-old-1']);
+    expect(out[1]).toEqual({
+      engagementId: 'e-old-1',
+      state: 'eligible',
+      candidateId: 'c-old-1',
+      roleId: null,
+      sessionId: null,
+      nextEligibleAt: null,
+      noAnswerAttempts: 0,
+      updatedAt: '2026-08-20T01:00:00.000Z',
+    });
+  });
+
+  it('A21: HOLDING — a read error is still the bare code, carrying none of the driver payload', async () => {
+    // A limit of 1 issues no reconnect read (A13), so the error is the HELD
+    // read's own and not the unfiltered batch failing first.
+    const fake = fakeClient({ phone_engagements: { error: pgError() } });
+    const thrown = await createPhoneRuntimeReader(fake.client)
+      .listDueEngagements({
+        nowIso: NOW_ISO,
+        limit: 1,
+        reconnectBackoffSeconds: RECONNECT_BACKOFF_SECONDS,
+        excludePhoneParsing: true,
+      })
+      .then(() => null, (e: unknown) => e);
+
+    const reads = fake.all('phone_engagements');
+    expect(reads).toHaveLength(1);
+    expect(reads[0].columns).toBe(HOLD_COLUMNS);
+    expect(thrown).toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe('phone_runtime_due_read_error');
+    const rendered = renderings(thrown);
+    for (const sentinel of PG_ERROR_SENTINELS) {
+      expect(rendered, `driver payload ${sentinel} escaped`).not.toContain(sentinel);
+    }
+  });
 });
 
 // ════════════════════════════════════════════════════════════════════

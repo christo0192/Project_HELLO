@@ -233,5 +233,17 @@ describe('the generation queue has its own runner', () => {
     // The Ashby loops are untouched.
     expect(workers.loopIntervalsMs.signal).toBe(5000);
     expect(workers.loopIntervalsMs.operation).toBe(7000);
+    // And the phone-parsing sweep (ADR-0018) reports its own cadence too.
+    expect(workers.loopIntervalsMs.profile_sweep).toBe(600_000);
+  });
+
+  it('registers the profile sweep as a loop of its own, driving neither runner', async () => {
+    build();
+    const loop = loops.find((l) => l.name === 'profile_sweep');
+    expect(loop, 'no `profile_sweep` loop was registered with the scheduler').toBeDefined();
+    expect(loop?.intervalMs).toBe(600_000);
+    await loop!.tick();
+    expect(captured[0].tick).not.toHaveBeenCalled();
+    expect(captured[1].tick).not.toHaveBeenCalled();
   });
 });

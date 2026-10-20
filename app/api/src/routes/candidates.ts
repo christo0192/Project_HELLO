@@ -28,6 +28,8 @@ import {
   type SessionRecordedFacts,
 } from '../lib/attempt-leg-timing.js';
 import { createLogger } from '../lib/logger.js';
+import { projectIntakeType } from '../integrations/ashby/candidate-workflow.js';
+import type { AshbyIntakeType } from '../integrations/ashby/orchestration.js';
 
 const candidateLogger = createLogger('candidates');
 
@@ -369,27 +371,106 @@ export function projectResumeReview(state: unknown): ResumeReview | null {
   }
 }
 
+/**
+ * M017 (ADR-0018): how a candidate entered screening. The two values of the
+ * Ashby link's `intake_type` CHECK (0130); `phone_parsing` is an application
+ * with no resume, whose name and number came from Ashby itself.
+ */
+export type IntakeType = AshbyIntakeType;
+
+/**
+ * M017 Addendum A: the ONE intake rule, shared by the list and the detail.
+ *   - The candidate has an Ashby link: the NEWEST link's value decides (null
+ *     when it holds anything outside the CHECK).
+ *   - No Ashby link, but a resume on file (`resume_id`, a dashboard upload):
+ *     `resume_parsing`.
+ *   - Otherwise null: legacy rendering, no badge.
+ *
+ * `newestLink` null must mean "read in full, and there is none". A caller
+ * whose links read failed or was truncated reports null instead, so an
+ * unreadable link is never guessed into `resume_parsing` from `resume_id`.
+ */
+export function resolveIntakeType(
+  newestLink: { intakeType: IntakeType | null } | null,
+  resumeId: unknown,
+): IntakeType | null {
+  if (newestLink) return newestLink.intakeType;
+  return typeof resumeId === 'string' && resumeId.length > 0 ? 'resume_parsing' : null;
+}
+
+/**
+ * The detail's `intake_type`: ONE bounded read of the candidate's newest Ashby
+ * link (the same `updated_at` rule as the list), then `resolveIntakeType`.
+ * Never rejects: a failed read degrades to null, the list's contract.
+ *
+ * `applicationLinkId` narrows the read to that one link. The scoped review
+ * shell is addressed by a link and describes THAT application, as its workflow
+ * card does, never the candidate's newest one.
+ *
+ * The caller must already have authorized `candidateId`; this adds no scope.
+ */
+export async function loadCandidateIntakeType(
+  candidateId: string,
+  resumeId: unknown,
+  applicationLinkId?: string,
+): Promise<IntakeType | null> {
+  try {
+    let q = supabase
+      .from('ashby_application_links')
+      .select('intake_type')
+      .eq('provider', 'ashby')
+      .eq('candidate_id', candidateId);
+    if (applicationLinkId) q = q.eq('id', applicationLinkId);
+    const { data, error } = await q
+      .order('updated_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    if (error) return null;
+    const newest = data as { intake_type?: unknown } | null;
+    return resolveIntakeType(newest ? { intakeType: projectIntakeType(newest.intake_type) } : null, resumeId);
+  } catch {
+    return null;
+  }
+}
+
 interface RawLinkRow {
   candidate_id?: unknown;
   updated_at?: unknown;
   job_mapping_id?: unknown;
+  intake_type?: unknown;
   ashby_resume_ingestions?: Array<{ state?: unknown }> | { state?: unknown } | null;
 }
 
+/** What the list reads off a candidate's newest Ashby link. */
+interface LinkFacts {
+  resumeReview: ResumeReview | null;
+  intakeType: IntakeType | null;
+}
+
 /**
- * Reduce link rows (ordered `updated_at` DESC) to one resume-review value per
- * candidate — first seen wins, the same idiom `latestAssessmentByCandidate`
- * uses. A candidate holding more than one Ashby application reports its most
- * recently updated one rather than a list the list view cannot disambiguate.
+ * Reduce link rows (ordered `updated_at` DESC) to one resume-review value and
+ * one intake type per candidate — first seen wins, the same idiom
+ * `latestAssessmentByCandidate` uses. A candidate holding more than one Ashby
+ * application reports its most recently updated one rather than a list the
+ * list view cannot disambiguate.
+ *
+ * Phone parsing has no resume to review, so its `resume_review` is null. Its
+ * link keeps a harmless `queued` ingestion row (M017 §1.2) that must not read
+ * as "processing", and a resume that fell back to phone parsing (Addendum B3)
+ * stops reading as "needs review".
  */
-function resumeReviewByCandidate(rows: RawLinkRow[] | null): Map<string, ResumeReview | null> {
-  const map = new Map<string, ResumeReview | null>();
+function resumeReviewByCandidate(rows: RawLinkRow[] | null): Map<string, LinkFacts> {
+  const map = new Map<string, LinkFacts>();
   for (const row of rows ?? []) {
     const id = row.candidate_id;
     if (typeof id !== 'string' || map.has(id)) continue;
+    const intakeType = projectIntakeType(row.intake_type);
     const embedded = row.ashby_resume_ingestions;
     const ingestion = Array.isArray(embedded) ? embedded[0] : embedded ?? undefined;
-    map.set(id, projectResumeReview(ingestion?.state));
+    map.set(id, {
+      resumeReview: intakeType === 'phone_parsing' ? null : projectResumeReview(ingestion?.state),
+      intakeType,
+    });
   }
   return map;
 }
@@ -432,7 +513,7 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
   let q = supabase
     .from('candidates')
     .select(
-      'id,name,email,phone_e164,phone_valid,skills,experience_years,status,role_id,created_at,decision_use_blocked_at',
+      'id,name,email,phone_e164,phone_valid,skills,experience_years,status,role_id,created_at,decision_use_blocked_at,resume_id',
     )
     .order('created_at', { ascending: false });
 
@@ -471,8 +552,13 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
   // A failure here degrades to `null` rather than failing the list: the
   // resume-review column is strictly additive diagnostic information, and the
   // candidate list must not stop working because the Ashby tables are
-  // unavailable.
-  let resumeReview = new Map<string, ResumeReview | null>();
+  // unavailable. The intake type (M017) rides on the same read and degrades
+  // the same way.
+  let linkFacts = new Map<string, LinkFacts>();
+  // True only when the links read finished, untruncated and without error.
+  // Only then does a candidate missing from it truly have no Ashby link, so
+  // only then may `resume_id` stand in for one (the dashboard-upload rule).
+  let linksComplete = false;
   // Per-candidate Ashby job status: the status of the NON-archived
   // `ashby_job_mappings` row the candidate's application link points at, or
   // null (no link / archived / missing / unreadable). Same additive contract
@@ -495,7 +581,7 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
         const from = page * LINK_PAGE_SIZE;
         const { data: batch, error: linkErr } = await supabase
           .from('ashby_application_links')
-          .select('candidate_id, updated_at, job_mapping_id, ashby_resume_ingestions ( state )')
+          .select('candidate_id, updated_at, job_mapping_id, intake_type, ashby_resume_ingestions ( state )')
           .eq('provider', 'ashby')
           .in('candidate_id', ids)
           .order('updated_at', { ascending: false })
@@ -508,8 +594,9 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
         if (got.length < LINK_PAGE_SIZE) { complete = true; break; }
       }
       if (linkFailed && links.length === 0) return;
-      resumeReview = resumeReviewByCandidate(links);
+      linkFacts = resumeReviewByCandidate(links);
       if (linkFailed || !complete) return;
+      linksComplete = true;
       const byCandidate = jobMappingByCandidate(links);
       const mappingIds = [...new Set(byCandidate.values())];
       const statusByMapping = new Map<string, AshbyJobStatus>();
@@ -551,18 +638,23 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
   const role = req.authUser?.appRole;
 
   const enriched = rows.map((row) => {
-    // Strip the internal block field; it drives suppression only.
-    const { decision_use_blocked_at, ...pub } = redactCandidatePhone(row, role);
+    // Strip the internal block field; it drives suppression only. `resume_id`
+    // drives the intake rule only and is not part of the list row.
+    const { decision_use_blocked_at, resume_id, ...pub } = redactCandidatePhone(row, role);
     const blocked = decision_use_blocked_at != null;
     const la = latest.get(row.id);
+    const link = linkFacts.get(row.id);
     return {
       ...pub,
       latest_recommendation: blocked ? null : la?.recommendation ?? null,
       latest_score: blocked ? null : la?.overall_score ?? null,
       // Nullable by design, and truthfully so: a PII-minimal shell created at
       // import has null `name`/`email` and this is the only field that says
-      // anything about it at all.
-      resume_review: resumeReview.get(row.id) ?? null,
+      // anything about it at all. Null for phone parsing: no resume exists.
+      resume_review: link?.resumeReview ?? null,
+      // resume_parsing | phone_parsing (M017 Addendum A); null = no badge.
+      // Null, never guessed, for a candidate the links read did not reach.
+      intake_type: link || linksComplete ? resolveIntakeType(link ?? null, resume_id) : null,
       // enabled (Live) | paused | drift (Out of sync) of the Ashby job this
       // candidate applied through; null when there is none to report.
       // Omitted entirely (not null) when the status could not be computed.
@@ -1761,6 +1853,13 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
   const candidateId = (candidate as { id?: unknown } | null)?.id;
   const authorizedId = typeof candidateId === 'string' ? candidateId : req.params.id;
   const phoneProgressPromise = loadCandidatePhoneProgress([authorizedId]);
+  // The list's intake rule, from the same helper, for the same candidate.
+  // Never rejects; a failed read is null. `ashby_phone_applied_at` needs no
+  // read: `select('*')` carries it, and it is a time, never a number.
+  const intakeTypePromise = loadCandidateIntakeType(
+    authorizedId,
+    (candidate as { resume_id?: unknown } | null)?.resume_id,
+  );
 
   const { data: sessions } = await supabase
     .from('call_sessions')
@@ -1894,10 +1993,12 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
   // three of which carry the same number. One helper covers all three so a
   // future column cannot be redacted in one route and forgotten in another.
   const phoneProgress = await phoneProgressPromise;
+  const intakeType = await intakeTypePromise;
   res.json({
     candidate: {
       ...redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
       ...phoneProgressFields(phoneProgress, authorizedId, req.authUser?.appRole),
+      intake_type: intakeType,
     },
     sessions: (sessions ?? []).map((session) => {
       const row = session as Record<string, unknown>;

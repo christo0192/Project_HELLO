@@ -108,10 +108,12 @@ export interface MaterializationStore {
    *
    * `name`, `email`, `phone_raw`, `parsed` and `resume_id` stay NULL. A
    * candidate that exists because an application was imported holds no
-   * candidate contact data until a resume has actually been parsed, so a
-   * `failed_review` application is visible without ever having disclosed
-   * anything about the person. No external/provider identifier is written as
-   * identity: the link owns that relationship.
+   * candidate contact data until one of two approved sources writes it: a
+   * resume is actually parsed, or the Ashby candidate profile is applied
+   * (ADR-0018: applied once, never over a valid number, refused under a DSAR
+   * hold). A `failed_review` application is therefore visible without ever
+   * having disclosed anything about the person. No external/provider
+   * identifier is written as identity: the link owns that relationship.
    *
    * Optional ONLY so a store written before this seam existed still type-checks;
    * {@link materializeCandidateShell} FAILS CLOSED when it is absent rather
@@ -129,7 +131,10 @@ export interface MaterializationStore {
    *
    * Implementations MUST NOT write `role_id`, `owner_id`, `status`, or
    * `ats_source`: the shell's ownership and funnel position were decided at
-   * import and a parse is not an event that may change either.
+   * import and a parse is not an event that may change either. Nor may they
+   * overwrite a valid number (HR-verified, or applied from the Ashby
+   * profile): the phone is written first, on its own, only while
+   * `phone_valid = false`.
    */
   updateCandidateFromParse?(input: {
     candidateId: string;

@@ -553,6 +553,16 @@ export interface PhoneWorkerRouterDeps {
   /** Terminal stranger discard hook; only latches an unmaterialized gate artifact. */
   readonly latchDiscardedRecording?: (attemptId: string) => Promise<void>;
   /**
+   * M017 (ADR-0018): after a confirmed wrong person on the default identity
+   * terminal, asks the release RPC whether to end the use of an Ashby-applied
+   * number nobody verified. The RPC re-checks every guard under its locks and
+   * changes nothing for any other candidate. Best effort; production calls
+   * `release_ashby_number_after_identity_mismatch`. Resolves to the RPC's
+   * status code when it has one (Addendum B2: `first_mismatch_retry` on the
+   * first mismatch, which keeps the number for one more try).
+   */
+  readonly releaseAshbyNumberOnMismatch?: (attemptId: string) => Promise<string | null | void>;
+  /**
    * Move the candidate to `screening` when a PHONE assessment starts.
    *
    * The candidate badge was written by the browser paths only
@@ -1078,6 +1088,38 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
           && result.status === 'applied'
           && deps.latchDiscardedRecording !== undefined) {
         await deps.latchDiscardedRecording(parsed.data.attempt_id);
+      }
+
+      // M017 (ADR-0018): the same DEFAULT identity terminal may mean the Ashby
+      // number reached the wrong person. Only the worker's discard flag tells a
+      // confirmed mismatch from an ordinary deferral, so it is required here
+      // too. Best effort, AFTER the latch: the event is durable, and a failed
+      // release must not make the worker re-post a step it has moved past.
+      // Not gated by the phone-parsing switch; old workers already send the
+      // flag, and the RPC is a no-op for a number that did not come from Ashby.
+      // The RPC releases on the SECOND mismatch only (Addendum B2); the first
+      // answers `first_mismatch_retry` and the engagement is tried again.
+      if (parsed.data.event_type === 'candidate.deferred_pre_disclosure'
+          && parsed.data.recording_discarded === true
+          && result.status === 'applied'
+          && deps.releaseAshbyNumberOnMismatch !== undefined) {
+        try {
+          const released = await deps.releaseAshbyNumberOnMismatch(parsed.data.attempt_id);
+          // Addendum B2: the FIRST mismatch keeps the number for one more try
+          // on a later day. A normal answer, not a fault; one fixed-code info
+          // line so the count is visible, and nothing else from the result.
+          if (released === ASHBY_FIRST_MISMATCH_RETRY) {
+            phoneWorkerLog.info('unknown_event', {
+              schema: 'ashby_number_release',
+              error_category: 'ashby_number_first_mismatch_retry',
+            });
+          }
+        } catch {
+          phoneWorkerLog.warn('unknown_event', {
+            schema: 'ashby_number_release',
+            error_category: 'ashby_number_release_failed',
+          });
+        }
       }
 
       // ── `ok` MEANS APPLIED. `ignored` IS NOT `ok`. ──────────────────
@@ -2379,6 +2421,27 @@ export async function latchDiscardedWorkerRecording(
   }
 }
 
+/** §7's answer to a first identity mismatch: kept for one more try (B2). */
+export const ASHBY_FIRST_MISMATCH_RETRY = 'first_mismatch_retry';
+
+// M017 (ADR-0018): the release seam for an unverified Ashby number. Every
+// guard lives in the RPC, so any answer it returns is success; only a failed
+// call throws, with a fixed code because a driver message could quote a row.
+// Resolves to the RPC's status code (code-only by contract), or null.
+export async function releaseAshbyNumberAfterIdentityMismatch(
+  attemptId: string,
+  db: typeof supabase = supabase,
+  now: Date = new Date(),
+): Promise<string | null> {
+  const { data, error } = await db.rpc('release_ashby_number_after_identity_mismatch', {
+    p_attempt_id: attemptId,
+    p_now: now.toISOString(),
+  });
+  if (error) throw new Error('ashby_number_release_error');
+  const status = (data as { status?: unknown } | null)?.status;
+  return typeof status === 'string' ? status : null;
+}
+
 /**
  * How long the candidate-badge write may hold the assessment-start handler.
  * Short on purpose: past this the interview proceeds and the badge is late.
@@ -2466,6 +2529,9 @@ export const phoneWorkerRouter = createPhoneWorkerRouter({
   async latchDiscardedRecording(attemptId) {
     if (env.recordingProvider !== 'worker') return;
     await latchDiscardedWorkerRecording(attemptId);
+  },
+  async releaseAshbyNumberOnMismatch(attemptId) {
+    return releaseAshbyNumberAfterIdentityMismatch(attemptId);
   },
   async purgeRecordings(input) {
     return purgePhoneEngagementRecordings(

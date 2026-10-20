@@ -14,6 +14,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runAssessment, injectAssessmentRunner } from '../services/assessment.js';
+import { formatResumeFacts, NO_RESUME_ON_FILE_FACTS } from '../lib/prompts.js';
 import type { Assessment } from '../lib/types.js';
 import { ScorecardValidationError } from '../lib/scorecards/domain.js';
 import { DeepseekError } from '../lib/deepseek.js';
@@ -92,6 +93,7 @@ mockFrom.mockImplementation((table: string) => {
 const SESSION_ID = '00000000-0000-4000-8000-000000000001';
 const CANDIDATE_ID = '00000000-0000-4000-8000-000000000002';
 const ROLE_ID = '00000000-0000-4000-8000-000000000003';
+const RESUME_ID = '00000000-0000-4000-8000-000000000005';
 
 const rubric = { 1: 'Poor', 2: 'Average', 3: 'Good', 4: 'Excellent' } as const;
 
@@ -161,7 +163,9 @@ beforeEach(() => {
   defaults = new Map();
   setDefault('call_sessions', ok(completedSession()));
   setDefault('transcript_turns', ok([{ speaker: 'candidate', text: 'I led a team of five.' }]));
-  setDefault('candidates', ok({ name: 'Asha', parsed: null, decision_use_blocked_at: null }));
+  // M017: a resume is on file by default (`resume_id` set, the parse empty), so
+  // every case below that is not about the no-resume intake scores as before.
+  setDefault('candidates', ok({ name: 'Asha', parsed: null, resume_id: RESUME_ID, decision_use_blocked_at: null }));
   setDefault('roles', ok({ title: 'Advisor', required_skills: [] }));
   setDefault('assessments', ok({ id: 'fresh-row' }));
   insertNotificationIntent.mockResolvedValue(undefined);
@@ -448,5 +452,111 @@ describe('v1 fallthrough — a role with NO active scorecard is unchanged', () =
     expect(observeAshbyCompletion).toHaveBeenCalledOnce();
     expect(callsFor('candidates', 'update')).toHaveLength(1);
     expect(callsFor('call_sessions', 'update')).toHaveLength(1);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
+describe('M017 — a candidate with no resume on file (phone parsing intake)', () => {
+  // `resume_id` decides "on file", never the parse: the phone-parsing intake
+  // leaves both `parsed` and `resume_id` null.
+  const noResumeCandidate = () =>
+    ok({ name: 'Test Person', parsed: null, resume_id: null, decision_use_blocked_at: null });
+  const inventedConflict = {
+    topic: 'Tenure', resume_says: 'two years', candidate_said: 'five years', resolved: false, note: '',
+  };
+  const prompts = (): string[] =>
+    runClaudeJSONWithProvenance.mock.calls.map((call) => String(call[0]));
+  const integrityAwareInfer = (integrityData: unknown) =>
+    async (prompt: string) => ({
+      data: prompt.includes('"resume_conflicts"') ? integrityData : { results: modelResults([4, 3, 1]) },
+      requestedModel: 'deepseek-v4-pro',
+    });
+
+  it('the no-resume facts say transcript only, no red flag, no conflicts — and nothing is "unknown"', () => {
+    expect(NO_RESUME_ON_FILE_FACTS).toContain('No resume is on file');
+    expect(NO_RESUME_ON_FILE_FACTS).toContain('transcript alone');
+    expect(NO_RESUME_ON_FILE_FACTS).toContain('nor a red flag');
+    expect(NO_RESUME_ON_FILE_FACTS).toContain('never any resume conflicts');
+    expect(NO_RESUME_ON_FILE_FACTS).not.toContain('unknown');
+  });
+
+  it('reads `resume_id` beside the name and the parse', async () => {
+    loadActiveRoleScorecard.mockResolvedValue(null);
+    runClaudeJSONWithProvenance.mockResolvedValue({
+      data: JSON.parse(JSON.stringify(v1Fixture)),
+      requestedModel: 'deepseek-v4-pro',
+    });
+    await runAssessment(SESSION_ID);
+    expect(callsFor('candidates', 'select').map((c) => c.args[0])).toContain('name,parsed,resume_id');
+  });
+
+  describe('v1', () => {
+    beforeEach(() => {
+      loadActiveRoleScorecard.mockResolvedValue(null);
+      runClaudeJSONWithProvenance.mockResolvedValue({
+        data: { ...JSON.parse(JSON.stringify(v1Fixture)), resume_conflicts: [inventedConflict] },
+        requestedModel: 'deepseek-v4-pro',
+      });
+    });
+
+    it('scores against NO_RESUME_ON_FILE_FACTS, with no "- Name: unknown", and drops conflicts', async () => {
+      setDefault('candidates', noResumeCandidate());
+      const result = await runAssessment(SESSION_ID);
+      const [prompt] = prompts();
+      expect(prompt).toContain(NO_RESUME_ON_FILE_FACTS);
+      expect(prompt).not.toContain('- Name: unknown');
+      const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+      expect(payload.resume_conflicts).toEqual([]);
+      // `raw` is the stale-schema fallback for the column, so it agrees.
+      expect((payload.raw as Assessment).resume_conflicts).toEqual([]);
+      expect((result as Assessment).resume_conflicts).toEqual([]);
+    });
+
+    it('CONTROL — a resume on file with an EMPTY parse is unchanged', async () => {
+      const result = await runAssessment(SESSION_ID);
+      const [prompt] = prompts();
+      expect(prompt).toContain(formatResumeFacts(null));
+      expect(prompt).not.toContain(NO_RESUME_ON_FILE_FACTS);
+      const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+      expect(payload.resume_conflicts).toEqual([inventedConflict]);
+      expect((result as Assessment).resume_conflicts).toEqual([inventedConflict]);
+    });
+  });
+
+  describe('v2', () => {
+    beforeEach(() => {
+      loadActiveRoleScorecard.mockResolvedValue(activeScorecard);
+      runClaudeJSONWithProvenance.mockImplementation(
+        integrityAwareInfer({
+          role_fit: { score: 6, matched_skills: ['Client advisory'], gaps: [], red_flags: [], notes: 'Plausible fit.' },
+          resume_conflicts: [inventedConflict],
+        }),
+      );
+    });
+
+    it('both model calls see NO_RESUME_ON_FILE_FACTS; conflicts are dropped, role fit kept', async () => {
+      setDefault('candidates', noResumeCandidate());
+      await runAssessment(SESSION_ID);
+      const sent = prompts();
+      expect(sent).toHaveLength(2); // the metric scorer, then the integrity analysis
+      for (const prompt of sent) {
+        expect(prompt).toContain(NO_RESUME_ON_FILE_FACTS);
+        expect(prompt).not.toContain('- Name: unknown');
+      }
+      const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+      expect(payload.schema_version).toBe(2);
+      expect(Object.keys(payload)).not.toContain('resume_conflicts');
+      expect((payload.role_fit as { matched_skills: string[] }).matched_skills).toEqual(['Client advisory']);
+    });
+
+    it('CONTROL — a resume on file with an EMPTY parse keeps its conflicts', async () => {
+      await runAssessment(SESSION_ID);
+      for (const prompt of prompts()) {
+        expect(prompt).toContain(formatResumeFacts(null));
+        expect(prompt).not.toContain(NO_RESUME_ON_FILE_FACTS);
+      }
+      const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+      expect(payload.resume_conflicts).toEqual([inventedConflict]);
+    });
   });
 });

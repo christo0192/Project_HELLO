@@ -20,7 +20,13 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { createPhoneWorkerRouter, latchDiscardedWorkerRecording, WORKER_PHONE_EVENTS, PURGE_BEFORE_EVENTS } from '../routes/phone-worker.js';
+import {
+  createPhoneWorkerRouter,
+  latchDiscardedWorkerRecording,
+  releaseAshbyNumberAfterIdentityMismatch,
+  WORKER_PHONE_EVENTS,
+  PURGE_BEFORE_EVENTS,
+} from '../routes/phone-worker.js';
 import {
   PHONE_APPOINTMENT_MAX_SECONDS,
   PHONE_APPOINTMENT_MIN_SECONDS,
@@ -95,6 +101,7 @@ interface Harness {
   verifySessionHint: ReturnType<typeof vi.fn>;
   purgeRecordings: ReturnType<typeof vi.fn>;
   latchDiscardedRecording: ReturnType<typeof vi.fn>;
+  releaseAshbyNumberOnMismatch: ReturnType<typeof vi.fn>;
   /** Every store method, so ANY database touch is observable. */
   storeCalls: () => number;
 }
@@ -122,6 +129,8 @@ function build(options: {
   readAnsweredState?: (attemptId: string) => Promise<{ answered: boolean; terminal: boolean }>;
   withAnsweredState?: boolean;
   latchDiscardedRecording?: (attemptId: string) => Promise<void>;
+  /** M017: wire the Ashby-number release seam; absent = not wired. */
+  releaseAshbyNumberOnMismatch?: (attemptId: string) => Promise<string | null | void>;
 } = {}): Harness {
   const applyEvent = vi.fn(
     options.applyEvent ??
@@ -163,6 +172,9 @@ function build(options: {
     safeToAcknowledge: options.purgeSafe ?? true,
   }));
   const latchDiscardedRecording = vi.fn(options.latchDiscardedRecording ?? (async () => undefined));
+  const releaseAshbyNumberOnMismatch = vi.fn(
+    options.releaseAshbyNumberOnMismatch ?? (async () => undefined),
+  );
   const readStore = options.readStore ?? ({
     listAttemptsForEngagement: async () => [],
     listLiveAppointmentsByStart: async () => [],
@@ -192,6 +204,9 @@ function build(options: {
       verifySessionHint: options.withHintVerifier === true ? (verifySessionHint as never) : undefined,
       purgeRecordings: options.withPurge === true ? (purgeRecordings as never) : undefined,
       latchDiscardedRecording: options.latchDiscardedRecording ? (latchDiscardedRecording as never) : undefined,
+      releaseAshbyNumberOnMismatch: options.releaseAshbyNumberOnMismatch
+        ? (releaseAshbyNumberOnMismatch as never)
+        : undefined,
       readAnsweredState:
         options.withAnsweredState === true
           ? (options.readAnsweredState ?? (async () => ({ answered: true, terminal: false })))
@@ -212,6 +227,7 @@ function build(options: {
     verifySessionHint,
     purgeRecordings,
     latchDiscardedRecording,
+    releaseAshbyNumberOnMismatch,
     // EVERY store method, so a "no database work" assertion means it.
     storeCalls: () =>
       applyEvent.mock.calls.length
@@ -1606,6 +1622,227 @@ describe('NO worker event purges the recordings any more (0105)', () => {
       expect(res.status).toBe(200);
       expect(h.purgeRecordings, `${event} triggered a purge`).not.toHaveBeenCalled();
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// M017 (ADR-0018) — releasing an unverified Ashby number after a confirmed
+// wrong person.
+//
+// The DEFAULT identity terminal is `candidate.deferred_pre_disclosure` with
+// `recording_discarded: true`. 0114 returns that engagement to `eligible`, so
+// without the release the same stranger is called again the next day. The
+// route hands the attempt to the release RPC, which decides under its locks
+// whether the number came from Ashby and was never verified. The flag is the
+// only thing that separates a mismatch from an ordinary deferral, so nothing
+// else may trigger it; and a failed release is logged, never reported to the
+// worker, because the event it follows is already durable.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('M017: identity-mismatch release of an unverified Ashby number', () => {
+  const MISMATCH = {
+    attempt_id: ATTEMPT,
+    event_type: 'candidate.deferred_pre_disclosure',
+    recording_discarded: true,
+  } as const;
+  const APPLIED_BODY = { ok: true, status: 'applied', ignored_reason: null, duplicate: false };
+
+  it('releases after an APPLIED deferral that carries the discard flag, after the latch', async () => {
+    const order: string[] = [];
+    const h = build({
+      latchDiscardedRecording: async () => { order.push('latch'); },
+      releaseAshbyNumberOnMismatch: async () => { order.push('release'); },
+    });
+    const res = await post(h, '/events', MISMATCH);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(APPLIED_BODY);
+    expect(h.releaseAshbyNumberOnMismatch).toHaveBeenCalledTimes(1);
+    expect(h.releaseAshbyNumberOnMismatch).toHaveBeenCalledWith(ATTEMPT);
+    expect(order).toEqual(['latch', 'release']);
+  });
+
+  it('releases on an idempotent re-post too; the RPC is replay-safe', async () => {
+    const h = build({
+      applyEvent: async () => ({ status: 'applied', applied: true, duplicate: true }) as ApplyPhoneEventResult,
+      releaseAshbyNumberOnMismatch: async () => undefined,
+    });
+    const res = await post(h, '/events', MISMATCH);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ...APPLIED_BODY, duplicate: true });
+    expect(h.releaseAshbyNumberOnMismatch).toHaveBeenCalledWith(ATTEMPT);
+  });
+
+  it('a failed latch is unacknowledged, and the release runs on the worker retry', async () => {
+    let failed = true;
+    const h = build({
+      latchDiscardedRecording: async () => {
+        if (failed) throw new Error('phone_discard_recording_latch_failed');
+      },
+      releaseAshbyNumberOnMismatch: async () => undefined,
+    });
+    const first = await post(h, '/events', MISMATCH);
+    expect(first.status).toBe(500);
+    expect(h.releaseAshbyNumberOnMismatch).not.toHaveBeenCalled();
+    failed = false;
+    h.applyEvent.mockResolvedValue({ status: 'applied', applied: true, duplicate: true } as ApplyPhoneEventResult);
+    const retry = await post(h, '/events', MISMATCH);
+    expect(retry.status).toBe(200);
+    expect(h.releaseAshbyNumberOnMismatch).toHaveBeenCalledTimes(1);
+  });
+
+  it('does NOT release an ordinary deferral (flag absent or false)', async () => {
+    for (const body of [
+      { attempt_id: ATTEMPT, event_type: 'candidate.deferred_pre_disclosure' },
+      { attempt_id: ATTEMPT, event_type: 'candidate.deferred_pre_disclosure', recording_discarded: false },
+    ]) {
+      const h = build({ releaseAshbyNumberOnMismatch: async () => undefined });
+      const res = await post(h, '/events', body);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(APPLIED_BODY);
+      expect(h.releaseAshbyNumberOnMismatch).not.toHaveBeenCalled();
+    }
+  });
+
+  it('does NOT release on any other event, even one carrying the discard flag', async () => {
+    // `candidate.wrong_number` included: it already ends the cycle, and the
+    // release is for the default terminal only.
+    for (const event of WORKER_PHONE_EVENTS.filter((e) => e !== 'candidate.deferred_pre_disclosure')) {
+      const h = build({
+        latchDiscardedRecording: async () => undefined,
+        releaseAshbyNumberOnMismatch: async () => undefined,
+      });
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event, recording_discarded: true });
+      expect(res.status, event).toBe(200);
+      expect(h.releaseAshbyNumberOnMismatch, `${event} released the number`).not.toHaveBeenCalled();
+    }
+  });
+
+  it('does NOT release when the event was not applied', async () => {
+    for (const ignoredReason of ['terminal', 'stale_epoch', 'unknown_attempt'] as const) {
+      const h = build({
+        applyEvent: async () => ({ status: 'ignored', applied: false, ignoredReason }) as ApplyPhoneEventResult,
+        latchDiscardedRecording: async () => undefined,
+        releaseAshbyNumberOnMismatch: async () => undefined,
+      });
+      const res = await post(h, '/events', MISMATCH);
+      expect(res.status, ignoredReason).toBe(200);
+      expect(res.body.ok, ignoredReason).toBe(false);
+      expect(h.releaseAshbyNumberOnMismatch, ignoredReason).not.toHaveBeenCalled();
+    }
+  });
+
+  it('a failed release is logged with a fixed code and never changes the response', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      const h = build({
+        releaseAshbyNumberOnMismatch: async () => {
+          throw new Error('driver said Test Person +919812345670');
+        },
+      });
+      const res = await post(h, '/events', MISMATCH);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(APPLIED_BODY);
+      const lines = warn.mock.calls.map((c) => String(c[0]));
+      const line = lines.find((l) => l.includes('ashby_number_release_failed'));
+      expect(line).toBeDefined();
+      expect(JSON.parse(line!)).toMatchObject({
+        level: 'warn',
+        component: 'phone-worker',
+        schema: 'ashby_number_release',
+        error_category: 'ashby_number_release_failed',
+      });
+      const all = lines.join('\n');
+      expect(all).not.toContain('9812345670');
+      expect(all).not.toContain('Test Person');
+      expect(all).not.toContain(ATTEMPT);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('B2: a first mismatch (`first_mismatch_retry`) is a normal answer: 200, no warning, one info line', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    const out = vi.spyOn(process.stdout, 'write').mockImplementation((() => true) as typeof process.stdout.write);
+    try {
+      const h = build({ releaseAshbyNumberOnMismatch: async () => 'first_mismatch_retry' });
+      const res = await post(h, '/events', MISMATCH);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual(APPLIED_BODY);
+      expect(h.releaseAshbyNumberOnMismatch).toHaveBeenCalledTimes(1);
+      const warned = warn.mock.calls.map((c) => String(c[0]));
+      expect(warned.filter((l) => l.includes('ashby_number_release'))).toEqual([]);
+      const infos = out.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('ashby_number_release'));
+      expect(infos).toHaveLength(1);
+      expect(JSON.parse(infos[0]!)).toMatchObject({
+        level: 'info',
+        component: 'phone-worker',
+        schema: 'ashby_number_release',
+        error_category: 'ashby_number_first_mismatch_retry',
+      });
+      expect(infos[0]).not.toContain(ATTEMPT);
+    } finally {
+      warn.mockRestore();
+      out.mockRestore();
+    }
+  });
+
+  it('B2: any other answer (released, not_applicable, none) logs nothing and answers the same', async () => {
+    for (const answer of ['released', 'not_applicable', null, undefined]) {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      const out = vi.spyOn(process.stdout, 'write').mockImplementation((() => true) as typeof process.stdout.write);
+      try {
+        const h = build({ releaseAshbyNumberOnMismatch: async () => answer });
+        const res = await post(h, '/events', MISMATCH);
+        expect(res.status, String(answer)).toBe(200);
+        expect(res.body, String(answer)).toEqual(APPLIED_BODY);
+        const lines = [...warn.mock.calls, ...out.mock.calls].map((c) => String(c[0]));
+        expect(lines.filter((l) => l.includes('ashby_number_')), String(answer)).toEqual([]);
+      } finally {
+        warn.mockRestore();
+        out.mockRestore();
+      }
+    }
+  });
+
+  it('without the seam the route answers exactly as before', async () => {
+    const h = build();
+    const res = await post(h, '/events', MISMATCH);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual(APPLIED_BODY);
+    expect(h.releaseAshbyNumberOnMismatch).not.toHaveBeenCalled();
+  });
+
+  it('production seam: calls the §7 RPC with the attempt and the instant', async () => {
+    const rpc = vi.fn(async () => ({ data: { status: 'not_applicable' }, error: null }));
+    await expect(releaseAshbyNumberAfterIdentityMismatch(ATTEMPT, { rpc } as never, NOW))
+      .resolves.toBe('not_applicable');
+    expect(rpc).toHaveBeenCalledTimes(1);
+    expect(rpc).toHaveBeenCalledWith('release_ashby_number_after_identity_mismatch', {
+      p_attempt_id: ATTEMPT,
+      p_now: NOW.toISOString(),
+    });
+  });
+
+  it('production seam: resolves to the status code, or null when there is none', async () => {
+    for (const [data, expected] of [
+      [{ status: 'first_mismatch_retry' }, 'first_mismatch_retry'],
+      [{ status: 'released' }, 'released'],
+      [{ status: 7 }, null],
+      [{}, null],
+      [null, null],
+    ] as const) {
+      const rpc = vi.fn(async () => ({ data, error: null }));
+      await expect(releaseAshbyNumberAfterIdentityMismatch(ATTEMPT, { rpc } as never, NOW))
+        .resolves.toBe(expected);
+    }
+  });
+
+  it('production seam: a driver error becomes the fixed code', async () => {
+    const rpc = vi.fn(async () => ({ data: null, error: { message: 'row Test Person +919812345670' } }));
+    const err = await releaseAshbyNumberAfterIdentityMismatch(ATTEMPT, { rpc } as never, NOW)
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe('ashby_number_release_error');
   });
 });
 

@@ -85,6 +85,21 @@ describe('reads — interviewer+ only', () => {
     expect(JSON.stringify(w.body)).not.toMatch(/token|email|phone|bearer/i);
   });
 
+  it('M017: carries the intake type and the profile-check outcome, both codes only', async () => {
+    const phoneParsing = fakeStore({
+      listWorkflows: async () => [{
+        applicationLinkId: UUID, externalApplicationId: 'app_1', externalJobId: 'job_1',
+        lifecycle: 'imported', terminalState: null, ingestionState: 'queued', operations: [],
+        sessionStatus: null, intakeType: 'phone_parsing', profileOutcome: 'number_placeholder',
+        updatedAt: '2026-10-20T00:00:00Z',
+      }],
+    });
+    const w = await request(appWith('interviewer', phoneParsing)).get('/mc/workflows');
+    expect(w.status).toBe(200);
+    expect(w.body.workflows[0]).toMatchObject({ intakeType: 'phone_parsing', profileOutcome: 'number_placeholder' });
+    expect(JSON.stringify(w.body)).not.toMatch(/token|email|bearer|\+91/i);
+  });
+
   it('fails closed for a viewer and for an unauthenticated caller', async () => {
     expect((await request(appWith('viewer', fakeStore())).get('/mc/mappings')).status).toBe(403);
     expect((await request(appWith(null, fakeStore())).get('/mc/mappings')).status).toBe(403);

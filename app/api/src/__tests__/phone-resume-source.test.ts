@@ -575,7 +575,9 @@ describe('structural boundaries of this change', () => {
       'integrations/ashby/runtime-workers.ts', 'lib/candidate-phone.ts',
       // The two paths added when model structuring was wired in. The first
       // HOLDS the full resume text; the second is where it is handed over.
-      'lib/resume-structurer.ts', 'integrations/ashby/runtime.ts']) {
+      'lib/resume-structurer.ts', 'integrations/ashby/runtime.ts',
+      // The Ashby profile extractor (ADR-0018) HOLDS name, email and numbers.
+      'integrations/ashby/candidate-profile.ts']) {
       const src = read(f);
       const calls = src.match(/(?:Logger|logger)\.(?:info|warn|error|debug)\([^)]*\)|recordAudit\([^)]*\)|recordGovernanceAudit\(\{[^}]*\}/g) ?? [];
       scanned += calls.length;
@@ -590,11 +592,13 @@ describe('structural boundaries of this change', () => {
     expect(scanned).toBeGreaterThanOrEqual(10);
   });
 
-  it('introduces no external contact lookup and no provider call', () => {
-    // The approved SOURCE is the resume structurer and nothing else. An Ashby
-    // contact-field API, an enrichment provider or a bulk backfill would each
-    // be a second source with different consent, and none exists: the only
-    // provider surface this PR touches is the resume file it already fetched.
+  it('the derivation modules make no contact lookup and no provider call', () => {
+    // Two SOURCES are approved: the resume structurer, and the Ashby candidate
+    // profile (ADR-0018). Neither reaches these modules as a request: the
+    // profile job reads the record and hands strings to the derivation, and
+    // the materializer only ever sees a parse. An enrichment provider or a
+    // bulk backfill would be a third source with different consent, and none
+    // exists.
     for (const f of ['lib/candidate-phone.ts', 'integrations/ashby/materialize.ts']) {
       const src = read(f);
       // No provider client, no HTTP, no enrichment vendor is reachable from
@@ -644,13 +648,17 @@ describe('structural boundaries of this change', () => {
   it('the candidate write sites fail closed when no decision was supplied', () => {
     // `phone?: CandidatePhone` is optional so pre-existing stores type-check.
     // Optional must mean UNDIALABLE, not "whatever the parser said".
-    // Both candidate writers spread `toCandidateColumns(...)`, which is the
-    // single function that decides these two columns — and which returns the
+    // Both candidate writers take these two columns from `toCandidateColumns`,
+    // the single function that decides them — and which returns the
     // undialable pair for `undefined`. Neither writer names the columns
     // directly, so neither can drift from the strict gate.
     const runtime = read('integrations/ashby/runtime.ts');
-    expect(runtime.match(/\.\.\.toCandidateColumns\(input\.phone\)/g)?.length).toBe(2);
-    // insertCandidate + updateCandidateFromParse, and nowhere else.
+    // insertCandidate spreads it directly; updateCandidateFromParse spreads it
+    // only when it approves the number (the phone-first write never sends an
+    // undialable pair over a row). Two calls, and nowhere else.
+    expect(runtime.match(/\.\.\.toCandidateColumns\(input\.phone\)/g)?.length).toBe(1);
+    expect(runtime.match(/toCandidateColumns\(input\.phone\)/g)?.length).toBe(2);
+    expect(runtime).toContain('...(phoneColumns.phone_valid ? phoneColumns : {})');
     // The ONLY direct assignments left anywhere in the file are the PII-minimal
     // shell's hard nulls. Any other literal would be a second rule.
     expect(runtime.match(/phone_e164:\s*\S+/g)).toEqual(['phone_e164: null,']);
@@ -659,19 +667,29 @@ describe('structural boundaries of this change', () => {
     expect(read('routes/resumes.ts')).toContain('...toCandidateColumns(phone)');
   });
 
-  it('the populate CAS on `resume_id is null` is preserved verbatim', () => {
+  it('the populate CAS on `resume_id is null` is preserved, behind a phone-first write', () => {
     // The idempotency of the whole ready path rests on this one clause. The
-    // phone columns joined the SAME allowlist inside the SAME update; they did
-    // not get their own write.
+    // phone has its own write (ADR-0018), run FIRST and filtered on
+    // `phone_valid = false` as well, so a valid number is never overwritten;
+    // the parse fields keep the CAS and name no phone column.
     const runtime = read('integrations/ashby/runtime.ts');
     expect(runtime).toContain(".is('resume_id', null)");
     const update = runtime.slice(
       runtime.indexOf('async updateCandidateFromParse'),
       runtime.indexOf('async bindLinkColumn'),
     );
-    expect(update).toContain(".is('resume_id', null)");
-    expect(update).toContain('toCandidateColumns(input.phone)');
-    expect(update).toContain('phone_raw:');
+    const split = update.indexOf("throw new Error('ashby_candidate_phone_write_error')");
+    expect(split).toBeGreaterThan(0);
+    const phoneStep = update.slice(0, split);
+    const parseStep = update.slice(split);
+    expect(phoneStep).toContain('toCandidateColumns(input.phone)');
+    expect(phoneStep).toContain('phone_raw:');
+    expect(phoneStep).toContain(".is('resume_id', null)");
+    expect(phoneStep).toContain(".eq('phone_valid', false)");
+    expect(parseStep).toContain('resume_id: input.resumeId');
+    expect(parseStep).toContain(".is('resume_id', null)");
+    expect(parseStep).not.toMatch(/phone_(raw|e164|valid)/);
+    expect(parseStep).not.toContain('toCandidateColumns');
     // Ownership and funnel position remain unreachable from a parse.
     for (const forbidden of ['role_id:', 'owner_id:', 'status:', 'ats_source:']) {
       expect(update).not.toContain(forbidden);

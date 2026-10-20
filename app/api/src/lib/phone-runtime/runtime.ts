@@ -99,6 +99,10 @@ import {
   createDefaultLiveKitRoomReader,
 } from '../../integrations/livekit-phone/index.js';
 import { env } from '../env.js';
+// M017. The phone-parsing kill switch on its own — not the Ashby runtime
+// config — so the due loop can hold `phone_parsing` engagements while it is
+// off. The module has no imports of its own.
+import { ashbyPhoneParsingEnabled } from '../../integrations/ashby/config.js';
 import {
   PHONE_DIAL_QUEUE,
   PHONE_ASSESSMENT_QUEUE,
@@ -904,6 +908,10 @@ export function createPhoneRuntime(
               const appointment = await readStore.getLiveAppointmentForEngagement(engagementId);
               return appointment?.startsAt ?? null;
             },
+            // M017 kill switch: while it is off, the due read holds
+            // `phone_parsing` engagements (reconnects still flow). Read per
+            // pass rather than captured at construction.
+            holdPhoneParsing: () => !ashbyPhoneParsingEnabled(),
             dialer: {
               dial: async (input) => {
                 if (roomClients === null) {
