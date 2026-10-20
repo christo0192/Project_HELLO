@@ -30,6 +30,7 @@ decision. Proposed ADRs are not authority to deploy their option.
 - [ADR-0015: R1 interview lane (Sales Program Advisor role-play)](0015-r1-interview-lane-sales-program-advisor-role-play.md)
 - [ADR-0016: R1 camera video recording (in-worker A/V to Cloudflare R2)](0016-r1-camera-video-recording-in-worker-av-to-cloudflare-r2.md)
 - [ADR-0017: Self-hosted LiveKit SFU on Fly (sin) for R1 rooms; phone stays on LiveKit Cloud](0017-self-hosted-livekit-sfu-on-fly-sin-for-r1-rooms.md)
+- [ADR-0018: Ashby "phone parsing" intake for applicants without a resume](0018-ashby-phone-parsing-intake.md)
 
 Create new records from [the template](template.md). Never rewrite an accepted
 decision's outcome; supersede it with a new ADR so the history remains legible.
