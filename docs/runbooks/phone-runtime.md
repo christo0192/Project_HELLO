@@ -1005,6 +1005,41 @@ therefore needs a restart:
 **Halt first, then change flags.** The halt takes effect within one `DUE_MS` tick across
 the whole fleet; a flag takes effect when that one replica next boots.
 
+### Phone-parsing engagements (M017, ADR-0018)
+
+An Ashby application with no resume, or with a resume nobody could read, is screened from
+its Ashby candidate record (`ashby_application_links.intake_type = 'phone_parsing'`); a
+resume candidate with no valid +91 mobile can get the Ashby number as a fallback. The
+number is still dialled only through `read.ts` (§9) and admitted by `admit_phone_attempt`,
+which for `phone_parsing` skips only the resume/ingestion gate.
+
+**Their own kill switch, `ASHBY_PHONE_PARSING_ENABLED`** (ON only for the literal `true`;
+production sets it in `fly.toml [env]`, a Fly secret overrides it). While it is OFF the due
+pass passes `excludePhoneParsing` to the ordinary due read, so every `phone_parsing`
+engagement is filtered out **in SQL**: scheduled first calls, HR "Call candidate",
+rescreens and booked appointments are all held. The requests are accepted and stay due,
+and they dial once the switch is back on. The reconnect batch is never filtered, so a call
+that is already live is not abandoned. The hold is consulted once per pass; the value
+changes when the API machines restart with a new secret. It is not a halt: resume-parsing
+engagements keep dialling, and `POST /api/phone/halt` remains the stop for everything.
+Turning it off, the read-back and the health queries are in
+[`ashby-runtime-activation.md`](ashby-runtime-activation.md) §10.
+
+**Wrong person on an unverified Ashby number.** When the worker posts
+`candidate.deferred_pre_disclosure` with `recording_discarded` (set only for a
+not-the-candidate or wrong-number verdict), the events route calls
+`release_ashby_number_after_identity_mismatch`, best effort and not gated by the switch.
+The first confirmed mismatch is recorded on the link and the engagement takes the existing
+path: `eligible / abandoned_pre_disclosure`, deferred to the next IST day's calling window.
+A second confirmed mismatch on a later attempt clears the number and cancels the engagement
+with `identity_unconfirmed`. A number HR verified, or one from a resume, is never released.
+
+**HR recovery** for `identity_unconfirmed`: confirm the right number, have an admin verify
+it (the candidate page's "Verify number" box, shown for `identity_unconfirmed` cycles above
+the re-screen form; `POST /api/candidates/{id}/phone-number-verification`), then request a
+rescreen. The Ashby
+number is never applied to that candidate again.
+
 On shutdown, `clearPhoneRuntimeRegistration()` runs before `phoneRuntime.stop()`, each in
 its own try/catch so a worker-stop failure never changes the process exit code. An
 in-flight `phone.dial` claim either completes or fails under its lease; an abandoned queue

@@ -74,7 +74,8 @@ One merge of this PR does all of the following:
   `voice_worker_leases` under a 10 s `lock_timeout` (a busy table fails the
   migration instead of queueing behind live traffic). The read-only drift check
   then runs three queries: `request_phone_rescreen`, `claim_voice_worker` and
-  `reset_voice_worker`.
+  `reset_voice_worker`. (Since 0130, M017, the script checks eight functions:
+  those three first, then five that 0130 declares.)
 - The API, the browser voice app and the phone voice app all redeploy (the voice
   sources are shared, so a change under `app/voice-livekit/` deploys both apps).
   A live phone call is cut after the 90 s drain; a live screening is ended by
