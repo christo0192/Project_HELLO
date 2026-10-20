@@ -260,8 +260,14 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
     owner: string,
     leaseSeconds: number,
   ): Promise<OperationClaimRow | null>;
-  /** Read the durable ingestion state for a link (null when absent). */
-  readIngestion(applicationLinkId: string): Promise<{ state: string; attempts: number } | null>;
+  /**
+   * Read the durable ingestion state for a link (null when absent).
+   * `failedReason` is the sanitized code a `failed_review` row rests on (the
+   * B3 fallback reads it); optional so older injected stores still type.
+   */
+  readIngestion(
+    applicationLinkId: string,
+  ): Promise<{ state: string; attempts: number; failedReason?: string | null } | null>;
   /** Read the link row needed to materialize an invite (opaque ids only). */
   readLink(applicationLinkId: string): Promise<WorkflowLinkRow | null>;
   /** Read only bounded assessment fields needed for the approved scorecard sink. */

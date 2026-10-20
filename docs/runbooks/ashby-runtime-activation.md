@@ -490,9 +490,17 @@ flag on but a dead scheduler reports `degraded`, not `healthy`.
 ## 10. Phone-parsing intake (M017, ADR-0018)
 
 An Ashby application with no resume, or whose resume could not be read
-(`failed_review`), is screened by phone from its Ashby candidate record: name,
+(`failed_review` on a document verdict: `scan_infected`, `guard_*`,
+`parse_extract_failed`, `parse_no_output`, `parse_output_exceeded` or
+`no_extractable_fields`), is screened by phone from its Ashby candidate record: name,
 email and the primary number. A resume-parsing candidate whose resume has no
-valid +91 mobile gets the Ashby number as a fallback. The decision, its rules
+valid +91 mobile gets the Ashby number as a fallback. A `failed_review` on a
+machine-class reason (a parser, scanner or provider outage, a deferral
+deadline, `materialize_failed`, `unexpected_error`, the legacy `parse_error`
+or `parse_bad_output`) does NOT fall back: recover it with the usual
+requeue, and the resume is read. A `phone_parsing` link whose ingestion
+something requeued anyway logs `ashby_phone_parsing_ingestion_requeued`
+(warn); the ingestion handler never reads it. The decision, its rules
 and its owner choices are in
 [ADR-0018](../adr/0018-ashby-phone-parsing-intake.md); this section is the
 operator's view.
@@ -504,7 +512,7 @@ Production ships ON through `app/api/fly.toml [env]`.
 
 | | ON | OFF |
 |---|---|---|
-| Profile job enqueue at import (15 min later) and on a `phone_invalid` or `failed_review` verdict | Enqueued | Not enqueued |
+| Profile job enqueue at import (15 min later) and on a `phone_invalid` or a document-verdict `failed_review` | Enqueued | Not enqueued |
 | `profile_sweep` loop | Claims due links and enqueues them | Ticks and does nothing. No claim is made, so no link spends a profile attempt |
 | `ashby.profile` job | Classifies, applies the profile, evaluates the prerequisites | Returns without doing anything |
 | Due loop, `phone_parsing` engagements | Dialled like any other engagement | **Every dial is held**, in SQL: scheduled first calls, HR "Call now" ("Call candidate"), rescreens and booked appointments alike. The requests are accepted and stay due; they dial once the switch is back on. Only a reconnect of a call that is already live still flows |
@@ -547,16 +555,16 @@ due costs one RPC and no Ashby read.
 What the claim bounds, per link, whatever happens to the job:
 
 - a link becomes due once 15 minutes have passed since it was created (no
-  resume), since its ingestion came to rest in `failed_review` (unreadable
-  resume), or since its engagement was last updated at
+  resume), since its ingestion came to rest in `failed_review` on a document
+  verdict (unreadable resume), or since its engagement was last updated at
   `pending_prereqs / phone_invalid` (Ashby fallback number);
 - each claim stamps `profile_checked_at` and counts `profile_attempts`; the next
   claim waits 6 h, then 12 h, then 24 h; at most 4 claims per link;
 - at most 25 links per tick, `FOR UPDATE SKIP LOCKED`, never-checked links first.
 
 A link that has spent its 4 claims is never polled by the sweep again. A fresh
-import, or a new `phone_invalid` or `failed_review` verdict, still enqueues its
-own job.
+import, or a new `phone_invalid` or document-verdict `failed_review`, still
+enqueues its own job.
 
 ### `profile_outcome`: what each code means
 

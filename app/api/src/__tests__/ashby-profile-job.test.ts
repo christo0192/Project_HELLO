@@ -72,7 +72,7 @@ interface Enqueued {
 
 interface World {
   link: WorkflowLinkRow | null;
-  ingestion: { state: string; attempts: number } | null;
+  ingestion: { state: string; attempts: number; failedReason?: string | null } | null;
   applicationInfo: Record<string, unknown> | Error;
   candidateInfo: Record<string, unknown> | Error;
   mapping: ResolvedMapping;
@@ -626,10 +626,10 @@ describe('D3: a resume link', () => {
 // B3: an unreadable resume falls back to phone parsing
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('B3: a resume link whose ingestion rests in `failed_review`', () => {
+describe('B3: a resume link whose ingestion rests in `failed_review` on a document verdict', () => {
   const unreadable = (over: Partial<World> = {}) => newWorld({
     link: baseLink({ externalResumeFileHandle: 'handle_1', intakeType: 'resume_parsing' }),
-    ingestion: { state: 'failed_review', attempts: 1 },
+    ingestion: { state: 'failed_review', attempts: 1, failedReason: 'no_extractable_fields' },
     // A candidate.info shape the classifier would call `unknown`: the
     // fallback must not classify, so this must not stop it.
     candidateInfo: { id: 'ashby_cand_1' },
@@ -720,6 +720,33 @@ describe('B3: a resume link whose ingestion rests in `failed_review`', () => {
     expect(browser.outcomes).toEqual(['mapping_inactive']);
     expect(browser.applyCalls).toEqual([]);
   });
+
+  it('every document verdict falls back', async () => {
+    for (const failedReason of ['scan_infected', 'guard_magic_mismatch', 'parse_extract_failed',
+      'parse_no_output', 'parse_output_exceeded', 'no_extractable_fields']) {
+      const w = unreadable({ ingestion: { state: 'failed_review', attempts: 1, failedReason } });
+      await runProfile(w);
+      expect(w.applyCalls.map((c) => c.intake), failedReason).toEqual(['phone_parsing']);
+    }
+  });
+
+  // R1-1: an outage is not an unreadable resume. A parser, scanner, provider
+  // or database failure leaves a resume that may be fine and that a requeue
+  // re-runs; stamping it phone_parsing would screen the candidate as having
+  // no resume, and strand the requeue in `queued` behind the ingestion guard.
+  for (const failedReason of ['parse_overload', 'parse_timeout', 'parse_defer_deadline', 'parse_error',
+    'parse_bad_output', 'materialize_failed', 'unexpected_error', 'scan_unavailable_deadline',
+    'scan_deferral_exhausted', 'fetch_url_unresolved', 'fetch_timeout', 'ingestion_midflight_restart',
+    null]) {
+    it(`a machine-class reason (${String(failedReason)}) does NOT fall back: the resume pipeline keeps the link (M9)`, async () => {
+      const w = unreadable({ ingestion: { state: 'failed_review', attempts: 1, failedReason } });
+      const { lines } = await captureLogs(() => runProfile(w));
+      expect(w.applyCalls).toEqual([]);
+      expect(w.outcomes).toEqual(['resume_found']);
+      expect(w.applicationReads + w.candidateReads).toBe(0);
+      expect(lines.some((l) => l.includes('ashby_profile_classified'))).toBe(false);
+    });
+  }
 
   it('`ready` is unchanged: D3, number only, intake `resume_parsing`', async () => {
     const w = unreadable({ ingestion: { state: 'ready', attempts: 0 } });

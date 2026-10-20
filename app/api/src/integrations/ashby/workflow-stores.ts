@@ -357,17 +357,24 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         sourceSessionId: typeof row?.source_session_id === 'string' ? row.source_session_id : null,
       };
     },
-    async readIngestion(applicationLinkId): Promise<{ state: string; attempts: number } | null> {
+    async readIngestion(
+      applicationLinkId,
+    ): Promise<{ state: string; attempts: number; failedReason: string | null } | null> {
       const { data, error } = await client
         .from('ashby_resume_ingestions')
-        .select('state, attempts')
+        .select('state, attempts, failed_reason')
         .eq('provider', 'ashby')
         .eq('application_link_id', applicationLinkId)
         .maybeSingle();
       if (error) throw new Error('ashby_ingestion_read_error');
       if (!data) return null;
-      const row = data as { state: string; attempts: number };
-      return { state: String(row.state), attempts: Number(row.attempts) || 0 };
+      const row = data as { state: string; attempts: number; failed_reason?: unknown };
+      return {
+        state: String(row.state),
+        attempts: Number(row.attempts) || 0,
+        // A sanitized code (0029 shape), never document text.
+        failedReason: typeof row.failed_reason === 'string' ? row.failed_reason : null,
+      };
     },
     async readScorecardSource(applicationLinkId, sourceSessionId = null): Promise<ScorecardSource | null> {
       const { data: link, error: linkError } = await client

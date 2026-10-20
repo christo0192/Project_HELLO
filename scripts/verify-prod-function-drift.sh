@@ -24,7 +24,10 @@
 # apply_ashby_candidate_profile, claim_ashby_profile_due and
 # release_ashby_number_after_identity_mismatch. A missing function fails the
 # regprocedure cast (an unreadable answer, so the check fails closed), and
-# each token is one its 0130 body must contain.
+# each token is one its 0130 body must contain. 0130 §8 also re-declares
+# verify_candidate_phone as 0099 plus one marked hunk that locks the
+# engagements before the candidate; no earlier body contains its
+# `for update of e`.
 #
 # It issues SELECTs only (pg_get_functiondef). No PII is queried or printed.
 #
@@ -49,6 +52,7 @@ CHECKS=(
   "screening_v2.apply_ashby_candidate_profile(uuid,text,text,text,text,text,text,timestamptz)|ensure_ashby_phone_engagement"
   "screening_v2.claim_ashby_profile_due(integer,integer,integer,integer,timestamptz)|profile_attempts"
   "screening_v2.release_ashby_number_after_identity_mismatch(uuid,timestamptz)|identity_unconfirmed"
+  "screening_v2.verify_candidate_phone(uuid,text,uuid,timestamptz)|for update of e"
 )
 
 if [ -n "${SUPABASE_DB_URL:-}" ]; then

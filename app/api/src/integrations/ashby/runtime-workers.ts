@@ -116,7 +116,7 @@ import {
   populateExistingCandidate,
 } from './materialize.js';
 import { extractFileUrl, type AshbyRuntime } from './runtime.js';
-import { MATERIALIZE_FAILED_REASON } from './resume-ingestion.js';
+import { isUnreadableResumeReason, MATERIALIZE_FAILED_REASON } from './resume-ingestion.js';
 import type { PersistOutcome, StructuredResume } from './resume-ingestion.js';
 import type {
   AshbyIntakeType,
@@ -1095,6 +1095,17 @@ export function buildAshbyHandlers(
             error_category: 'ashby_late_resume_ignored',
             error_type: 'ingestion',
           });
+          // A stamped link with a handle is a B3 fallback, whose ingestion
+          // rests in `failed_review` on a document verdict that neither a
+          // re-import nor an operator recovery requeues. Any other state
+          // means something requeued it anyway; this handler will never read
+          // it, so say so loudly rather than let it sit in `queued` unseen.
+          if (current && current.state !== 'failed_review') {
+            logger.warn('unknown_event', {
+              error_category: 'ashby_phone_parsing_ingestion_requeued',
+              error_type: current.state,
+            });
+          }
         }
         return;
       }
@@ -1106,9 +1117,12 @@ export function buildAshbyHandlers(
       if (!link.externalResumeFileHandle) return;
 
       // ── B3: AN UNREADABLE RESUME FALLS BACK TO PHONE PARSING (ADR-0018) ──
-      // Once this link's ingestion rests in `failed_review`, ask the profile
-      // job to screen the candidate from the Ashby profile instead. The job
-      // and its RPC decide whether it may (switch, mapping, engagement); this
+      // Once this link's ingestion rests in `failed_review` on a verdict about
+      // the DOCUMENT (`isUnreadableResumeReason`), ask the profile job to
+      // screen the candidate from the Ashby profile instead. A machine-class
+      // reason (an outage, a deadline, a failed persist) never asks: the
+      // resume may be fine and a requeue re-runs it. The job and its RPC
+      // decide whether it may (reason, switch, mapping, engagement); this
       // only asks, and only for a phone_primary mapping, so a browser link's
       // failure never costs an Ashby read.
       //
@@ -1118,8 +1132,8 @@ export function buildAshbyHandlers(
       //
       // BEST EFFORT, AND ITS OWN catch: the sweep's arm C is the backstop,
       // and a failed enqueue must not fail an ingestion that already rested.
-      const requestPhoneParsingFallback = async (): Promise<void> => {
-        if (!phoneParsingEnabled) return;
+      const requestPhoneParsingFallback = async (reason: string): Promise<void> => {
+        if (!phoneParsingEnabled || !isUnreadableResumeReason(reason)) return;
         try {
           if (!link.externalJobId) return;
           const mapping = await runtime.resolveMappingByJobId(link.externalJobId);
@@ -1135,7 +1149,8 @@ export function buildAshbyHandlers(
 
       /**
        * Record a durable, sanitized ingestion failure. Best effort. A write
-       * that landed asks for the phone-parsing fallback (B3).
+       * that landed asks for the phone-parsing fallback (B3) — which every
+       * reason this handler writes itself, all machine-class, declines.
        */
       const failIngestion = async (reason: string): Promise<void> => {
         let rested = false;
@@ -1143,7 +1158,7 @@ export function buildAshbyHandlers(
           const outcome = await runtime.stores.advanceIngestion(linkId, 'failed_review', { failedReason: reason });
           rested = outcome.status === 'ok';
         } catch { /* the queue outcome below is the authoritative signal */ }
-        if (rested) await requestPhoneParsingFallback();
+        if (rested) await requestPhoneParsingFallback(reason);
       };
 
       // ── Mid-flight rescue: a previous run of THIS job died in place ──────
@@ -1472,13 +1487,13 @@ export function buildAshbyHandlers(
         } satisfies QueueDeferDirective;
       }
 
-      // The pipeline's own verdict, `materialize_failed` from the persistence
-      // seam included (B3). `onState` throws on a refused write, so the row
-      // says `failed_review` — except on the pipeline's `unexpected_error`
-      // path, which writes it best effort. The profile job re-reads the state
-      // before it acts, so a write that did not land costs one read.
+      // The pipeline's own verdict (B3). Only a document verdict asks;
+      // `materialize_failed` from the persistence seam and `unexpected_error`
+      // are machine-class and do not. `onState` throws on a refused write, so
+      // the row says `failed_review`. The profile job re-reads the state and
+      // reason before it acts, so a write that did not land costs one read.
       if (result.status === 'done' && result.outcome.state === 'failed_review') {
-        await requestPhoneParsingFallback();
+        await requestPhoneParsingFallback(result.outcome.reason);
         return;
       }
 
@@ -1647,12 +1662,16 @@ export function buildAshbyHandlers(
 
       // ── An unreadable resume falls back to phone parsing (B3) ────────────
       // A link with a handle whose ingestion rests in `failed_review` ("Resume
-      // needs review") is screened from the Ashby profile, exactly like a link
-      // with no resume. Read for a stamped link too, so a retry of the
-      // fallback is not mistaken for a late resume.
+      // needs review") on a verdict about the document is screened from the
+      // Ashby profile, exactly like a link with no resume. A machine-class
+      // reason is not unreadable: the resume pipeline still owns that link
+      // (a requeue re-runs it), so it takes the M9 path below. Read for a
+      // stamped link too, so a retry of the fallback is not mistaken for a
+      // late resume.
       const hasHandle = Boolean(link.externalResumeFileHandle);
       const ingestion = hasHandle ? await runtime.stores.readIngestion(linkId) : null;
-      const resumeUnreadable = ingestion?.state === 'failed_review';
+      const resumeUnreadable = ingestion?.state === 'failed_review'
+        && isUnreadableResumeReason(ingestion.failedReason);
 
       // ── A resume link is D3 only once its resume is parsed ───────────────
       // A link that gained a handle after import (a re-import bound it) is

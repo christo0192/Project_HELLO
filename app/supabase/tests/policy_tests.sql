@@ -21115,6 +21115,8 @@ $p130t$;
 --   p_handle     bind a resume file handle;
 --   p_ingestion  advance the ingestion row to this state ('absent' = none;
 --                'failed_review' = fetched, then rested for review);
+--   p_reason     the failed_reason a 'failed_review' row rests on (a
+--                document verdict by default: the B3 fallback's case);
 --   p_phone      a VALID number on the candidate (NULL = none at all);
 --   p_resume     a resume row plus the name and email a parse leaves (else
 --                the candidate has no name, email, raw value or number:
@@ -21131,7 +21133,8 @@ create or replace function _policy_tests.p130_fixture(
   p_resume    boolean default false,
   p_consent   text    default 'none',
   p_state     text    default null,
-  p_ext       text    default null
+  p_ext       text    default null,
+  p_reason    text    default 'no_extractable_fields'
 )
 returns uuid language plpgsql as $p130f$
 declare
@@ -21179,7 +21182,7 @@ begin
     -- The unreadable resume (B3): fetched, then rested for review.
     perform screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
     perform screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
-    perform screening_v2.advance_ashby_ingestion(v_link, 'failed_review', null, null, null, 'parse_error');
+    perform screening_v2.advance_ashby_ingestion(v_link, 'failed_review', null, null, null, p_reason);
   elsif p_ingestion <> 'absent' then
     foreach v_s in array array['queued','fetching','scanning','extracting','structuring','ready'] loop
       perform screening_v2.advance_ashby_ingestion(v_link, v_s, null, null, null, null);
@@ -22532,6 +22535,84 @@ begin
 end;
 $$;
 
+-- ── 0130-10d: apply, only a DOCUMENT verdict is unreadable (R1-1). A
+--    failed_review that rests on a machine-class reason (an outage, a
+--    deadline, a failed persist, the legacy unknown, a stdout protocol
+--    fault) is resume_bound: no stamp, nothing written, and the operator
+--    recovery still re-runs it. Every document verdict, guard_* included,
+--    falls back. A stamped link's ingestion is one that neither the generic
+--    requeue (a re-import) nor the operator recovery moves to `queued`, so
+--    the ingestion guard can never strand it there ──────────────────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_machine text[] := array['parse_overload', 'parse_timeout', 'parse_defer_deadline',
+                            'parse_error', 'parse_bad_output', 'materialize_failed',
+                            'unexpected_error', 'scan_unavailable_deadline',
+                            'scan_deferral_exhausted', 'fetch_timeout',
+                            'fetch_url_unresolved', 'ingestion_midflight_restart'];
+  v_verdict text[] := array['scan_infected', 'guard_magic_mismatch', 'parse_extract_failed',
+                            'parse_no_output', 'parse_output_exceeded', 'no_extractable_fields'];
+  v_reason text; v_link uuid; v_res jsonb; v_rec jsonb; v_req jsonb;
+  v_bad text := ''; v_bad2 text := ''; v_bad3 text := '';
+begin
+  foreach v_reason in array v_machine loop
+    v_link := _policy_tests.p130_fixture('pol130-fm', p_handle => true, p_ingestion => 'failed_review',
+                                         p_reason => v_reason);
+    v_res := screening_v2.apply_ashby_candidate_profile(
+      v_link, 'phone_parsing', 'Test Person', 'pol130-fm.ashby@example.invalid',
+      '+91 98123 45691', '+919812345691', null, v_t);
+    if v_res->>'status' is distinct from 'resume_bound'
+       or v_res->>'profile_outcome' is distinct from 'resume_found'
+       or (v_res->>'intake_stamped')::boolean is not false
+       or (select intake_type from screening_v2.ashby_application_links where id = v_link)
+          is distinct from 'resume_parsing'
+       or (select failed_reason from screening_v2.ashby_resume_ingestions where application_link_id = v_link)
+          is distinct from v_reason
+       or not _policy_tests.p130_untouched(v_link) or _policy_tests.p130_eng(v_link) is not null then
+      v_bad := v_bad || ' ' || v_reason || '=' || _policy_tests.p130_brief(v_res);
+    end if;
+    perform _policy_tests.p130_teardown('pol130-fm');
+  end loop;
+  perform _policy_tests.assert(
+    '0130-10d a failed_review on a machine-class reason is resume_bound/resume_found: not stamped, nothing written, the reason kept for the operator recovery',
+    v_bad = '', v_bad);
+
+  foreach v_reason in array v_verdict loop
+    v_link := _policy_tests.p130_fixture('pol130-fv2', p_handle => true, p_ingestion => 'failed_review',
+                                         p_reason => v_reason);
+    v_res := screening_v2.apply_ashby_candidate_profile(
+      v_link, 'phone_parsing', 'Test Person', 'pol130-fv2.ashby@example.invalid',
+      '+91 98123 45692', '+919812345692', null, v_t);
+    if (v_res->>'intake_stamped')::boolean is not true
+       or v_res->>'profile_outcome' is distinct from 'applied'
+       or (select intake_type from screening_v2.ashby_application_links where id = v_link)
+          is distinct from 'phone_parsing' then
+      v_bad2 := v_bad2 || ' ' || v_reason || '=' || _policy_tests.p130_brief(v_res);
+    end if;
+    -- No door requeues the stamped link's ingestion: the generic requeue a
+    -- re-import performs refuses a verdict, and so does the operator
+    -- recovery. The row stays failed_review, never `queued` with a handle.
+    v_req := screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null, v_t);
+    v_rec := screening_v2.recover_ashby_ingestion_parse(v_link, '00000000-0000-4000-8000-0000000000ad', v_t);
+    if v_req->>'status' is distinct from 'not_requeueable'
+       or v_rec->>'status' is distinct from 'not_a_parse_availability_failure'
+       or (select state from screening_v2.ashby_resume_ingestions where application_link_id = v_link)
+          is distinct from 'failed_review' then
+      v_bad3 := v_bad3 || ' ' || v_reason || ': requeue=' || coalesce(v_req->>'status', '<null>')
+                || ' recover=' || coalesce(v_rec->>'status', '<null>');
+    end if;
+    perform _policy_tests.p130_teardown('pol130-fv2');
+  end loop;
+  perform _policy_tests.assert(
+    '0130-10d every document verdict (scan_infected, guard_*, parse_extract_failed, parse_no_output, parse_output_exceeded, no_extractable_fields) falls back and is stamped phone_parsing',
+    v_bad2 = '', v_bad2);
+  perform _policy_tests.assert(
+    '0130-10d a stamped fallback link cannot be requeued: advance_ashby_ingestion refuses not_requeueable and recover_ashby_ingestion_parse refuses not_a_parse_availability_failure, so the row stays failed_review',
+    v_bad3 = '', v_bad3);
+end;
+$$;
+
 -- ── 0130-11: claim arm C (B3). A resume_parsing link with a handle whose
 --    ingestion has rested in `failed_review` for p_min_age_seconds, with no
 --    engagement or only a live pending_prereqs one, is claimed. Too young,
@@ -22546,11 +22627,13 @@ declare
   v_tags text[] := array['pol130-ca','pol130-cb',
                          'pol130-cy','pol130-cg','pol130-ct','pol130-cp','pol130-cw',
                          'pol130-cv','pol130-cd','pol130-cx','pol130-cs','pol130-cr',
-                         'pol130-ci'];
+                         'pol130-ci',
+                         'pol130-cm','pol130-cn','pol130-cq'];
   v_due  boolean[] := array[true, true,
                             false, false, false, false, false,
                             false, false, false, false, false,
-                            true];
+                            true,
+                            false, false, false];
   v_ids uuid[] := '{}'; v_got uuid[]; v_link uuid; v_i integer; v_s text;
   v_bad text := '';
 begin
@@ -22593,6 +22676,15 @@ begin
      set intake_type = 'phone_parsing', profile_outcome = 'name_missing'
    where id = v_link;
   v_ids := v_ids || v_link;
+  -- Not due (R1-1): a failed_review on a machine-class reason is not an
+  -- unreadable resume: a parser outage, a failed persist, the legacy
+  -- unknown the operator recovery re-runs.
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-cm', p_handle => true, p_ingestion => 'failed_review',
+                                               p_reason => 'parse_overload');
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-cn', p_handle => true, p_ingestion => 'failed_review',
+                                               p_reason => 'materialize_failed');
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-cq', p_handle => true, p_ingestion => 'failed_review',
+                                               p_reason => 'parse_error');
 
   -- Every ingestion is an hour old except the young one's five minutes
   -- (the fixture's advance stamps the wall clock).
@@ -22613,17 +22705,71 @@ begin
               where id = any (v_ids[1:2] || v_ids[13:13])
                 and (profile_attempts <> 1 or profile_checked_at is distinct from v_t))
      or exists (select 1 from screening_v2.ashby_application_links
-                 where id = any (v_ids[3:12])
+                 where id = any (v_ids[3:12] || v_ids[14:16])
                    and (profile_attempts <> 0 or profile_checked_at is not null)) then
     v_bad := v_bad || ' counts';
   end if;
   perform _policy_tests.assert(
-    '0130-11 claim arm C (B3): a failed_review resume link rested p_min_age_seconds with no engagement or a live pending one is claimed, also when an earlier fallback stamped it phone_parsing; too young, an engagement past prerequisites or terminal, a paused or browser_primary mapping, a valid number, a DSAR hold, a withdrawn application and a handle whose ingestion is not failed_review are not',
+    '0130-11 claim arm C (B3): a failed_review resume link rested p_min_age_seconds on a document verdict with no engagement or a live pending one is claimed, also when an earlier fallback stamped it phone_parsing; too young, an engagement past prerequisites or terminal, a paused or browser_primary mapping, a valid number, a DSAR hold, a withdrawn application, a handle whose ingestion is not failed_review and a machine-class reason (parse_overload, materialize_failed, parse_error) are not',
     v_bad = '', v_bad);
 
   foreach v_s in array v_tags loop
     perform _policy_tests.p130_teardown(v_s);
   end loop;
+end;
+$$;
+
+-- ── 0130-12: verify_candidate_phone (§8, M017-d). Locking the engagements
+--    before the candidate changes no answer: HR verifying the number of a
+--    candidate whose D3 engagement waits on phone_invalid still sets it
+--    valid, clears exactly that live phone_invalid label (state, version and
+--    updated_at untouched), leaves a terminal engagement and another reason
+--    alone, and is idempotent. The deadlock it removes needs two sessions;
+--    the order is pinned against the text in phone-0130-intake.test.ts ──
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_link uuid; v_eng uuid; v_cand uuid; v_res jsonb; v_res2 jsonb;
+  v_e screening_v2.phone_engagements%rowtype;
+  v_before screening_v2.phone_engagements%rowtype;
+  v_bad text := '';
+begin
+  v_link := _policy_tests.p130_fixture('pol130-vp', p_handle => true, p_ingestion => 'ready',
+                                       p_resume => true, p_state => 'pending_prereqs');
+  v_eng := _policy_tests.p130_eng(v_link);
+  update screening_v2.phone_engagements set state_reason = 'phone_invalid' where id = v_eng;
+  select * into v_before from screening_v2.phone_engagements where id = v_eng;
+  select candidate_id into v_cand from screening_v2.ashby_application_links where id = v_link;
+
+  v_res := screening_v2.verify_candidate_phone(v_cand, '+919812345693',
+                                                '00000000-0000-4000-8000-0000000000ad', v_t);
+  v_res2 := screening_v2.verify_candidate_phone(v_cand, '+919812345693',
+                                                 '00000000-0000-4000-8000-0000000000ad', v_t);
+  select * into v_e from screening_v2.phone_engagements where id = v_eng;
+  if v_res->>'status' is distinct from 'ok'
+     or (v_res->>'stale_phone_invalid_cleared')::integer is distinct from 1
+     or v_res2->>'status' is distinct from 'ok'
+     or (v_res2->>'stale_phone_invalid_cleared')::integer is distinct from 0
+     or v_e.state_reason is not null
+     or v_e.state is distinct from v_before.state
+     or v_e.version is distinct from v_before.version
+     or v_e.updated_at is distinct from v_before.updated_at
+     or not exists (select 1 from screening_v2.candidates
+                     where id = v_cand and phone_valid and phone_e164 = '+919812345693') then
+    v_bad := v_bad || ' verify=' || coalesce(v_res->>'status', '<null>')
+             || '/' || coalesce(v_res->>'stale_phone_invalid_cleared', '-')
+             || ' again=' || coalesce(v_res2->>'stale_phone_invalid_cleared', '-');
+  end if;
+  if screening_v2.verify_candidate_phone(v_cand, '12345', '00000000-0000-4000-8000-0000000000ad', v_t)->>'status'
+       is distinct from 'invalid_phone'
+     or screening_v2.verify_candidate_phone(v_cand, '+919812345693', null, v_t)->>'status'
+       is distinct from 'actor_required' then
+    v_bad := v_bad || ' refusals';
+  end if;
+  perform _policy_tests.assert(
+    '0130-12 verify_candidate_phone (M017-d, engagements locked before the candidate) answers as 0099: sets the number valid, clears the live phone_invalid label once without touching state, version or updated_at, and keeps its refusals',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-vp');
 end;
 $$;
 
@@ -22640,7 +22786,7 @@ drop function _policy_tests.p130_brief(jsonb);
 drop function _policy_tests.p130_codes_only(jsonb);
 drop function _policy_tests.p130_untouched(uuid);
 drop function _policy_tests.p130_eng(uuid);
-drop function _policy_tests.p130_fixture(text, boolean, text, text, boolean, text, text, text);
+drop function _policy_tests.p130_fixture(text, boolean, text, text, boolean, text, text, text, text);
 drop function _policy_tests.p130_teardown(text);
 -- ==== 0130 END ====
 

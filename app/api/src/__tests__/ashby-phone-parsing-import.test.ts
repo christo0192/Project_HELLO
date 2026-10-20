@@ -287,10 +287,18 @@ interface IngestionWorld {
   /** B3: end the pipeline on a scan verdict, or fail before it starts. */
   scanInfected?: boolean;
   portsStatus?: 'url_unresolved';
+  /** B3: a document verdict from the magic/MIME guard. */
+  guardRejected?: boolean;
+  /** R1-1: machine-class pipeline failures (a transport timeout, a stdout protocol fault). */
+  fetchFails?: boolean;
+  parseBadOutput?: boolean;
+  /** The ingestion row the handler first reads (default `queued`). */
+  initialIngestion?: { state: string; attempts: number; failedReason?: string | null };
 }
 
 function ingestionRuntime(w: IngestionWorld) {
-  let ingestion: { state: string; attempts: number } | null = { state: 'queued', attempts: 0 };
+  let ingestion: { state: string; attempts: number; failedReason?: string | null } | null =
+    w.initialIngestion ?? { state: 'queued', attempts: 0 };
   const parsed = {
     name: 'Test Person', email: 'test.person@example.invalid', phone: null,
     skills: ['Outbound calling'], experience_years: 5,
@@ -339,15 +347,24 @@ function ingestionRuntime(w: IngestionWorld) {
         ports: {
           presignedUrl: 'https://host.example/r.pdf',
           policy: { allowlistEnabled: true, allowedHosts: ['host.example'], allowedPorts: [443] },
-          fetch: async () => ({
-            ok: true as const, bytes: Buffer.from('resume'), sha256: 'a'.repeat(64),
-            contentType: 'application/pdf', finalHost: 'host.example', hops: 0,
-          }),
+          fetch: async () => (w.fetchFails
+            ? { ok: false as const, reason: 'timeout', hops: 0 }
+            : {
+              ok: true as const, bytes: Buffer.from('resume'), sha256: 'a'.repeat(64),
+              contentType: 'application/pdf', finalHost: 'host.example', hops: 0,
+            }),
           scan: async () => (w.scanInfected
             ? { safe: false, status: 'infected' }
             : { safe: true, status: 'clean' }),
-          guard: () => ({ ok: true as const, mime: 'application/pdf' }),
-          parse: async () => ({ text: 'resume text', structurerVersion: 'v1', structured: parsed }),
+          guard: () => (w.guardRejected
+            ? { ok: false as const, reason: 'magic_mismatch' }
+            : { ok: true as const, mime: 'application/pdf' }),
+          parse: async () => {
+            if (w.parseBadOutput) {
+              throw Object.assign(new Error('parser'), { code: 'PARSER_ERROR', detail: 'bad_output' });
+            }
+            return { text: 'resume text', structurerVersion: 'v1', structured: parsed };
+          },
           fallbackFromText: () => parsed,
           persist: async () => ({ status: 'ok' as const }),
           onState: input.onState,
@@ -425,6 +442,26 @@ describe('the ingestion guard: phone parsing owns the application', () => {
       expect(logged(lines, 'ashby_late_resume_ignored').map((e) => e.error_type)).toEqual(['ingestion']);
     });
   }
+
+  it('a B3 link resting in failed_review returns quietly; one that something requeued is reported', async () => {
+    const link = baseLink({ intakeType: 'phone_parsing', externalResumeFileHandle: 'handle_1' });
+    const rested = ingestionWorld({
+      link, initialIngestion: { state: 'failed_review', attempts: 1, failedReason: 'no_extractable_fields' },
+    });
+    const quiet = await captureLogs(() => runIngestion(rested, true));
+    expect(rested.trace).toEqual(['stores.readLink', 'stores.readIngestion']);
+    expect(logged(quiet.lines, 'ashby_phone_parsing_ingestion_requeued')).toEqual([]);
+
+    // The handler never reads it, so a `queued` row would otherwise sit
+    // there unseen: it is never left without a signal.
+    const requeued = ingestionWorld({ link, initialIngestion: { state: 'queued', attempts: 2 } });
+    const loud = await captureLogs(() => runIngestion(requeued, true));
+    expect(requeued.trace).toEqual(['stores.readLink', 'stores.readIngestion']);
+    expect(requeued.scannerCalls).toBe(0);
+    expect(logged(loud.lines, 'ashby_phone_parsing_ingestion_requeued').map((e) => e.error_type))
+      .toEqual(['queued']);
+    expect(loud.lines.join('\n')).not.toContain('handle_1');
+  });
 
   it('a stamped link with no handle returns silently', async () => {
     const w = ingestionWorld({ link: baseLink({ intakeType: 'phone_parsing', externalResumeFileHandle: null }) });
@@ -506,16 +543,34 @@ describe('the B3 trigger: a resume that rests in `failed_review`', () => {
     expect(Object.keys(w.enqueued[0]!.payload as object)).toEqual(['applicationLinkId']);
   });
 
-  it('switch ON, the handler\'s own failure write: the same one job', async () => {
-    const w = ingestionWorld({ portsStatus: 'url_unresolved' });
+  it('switch ON, a guard verdict: the same one job', async () => {
+    const w = ingestionWorld({ guardRejected: true });
     await runIngestion(w, true);
     expect(w.trace).toContain('stores.advanceIngestion:failed_review');
     expect(w.enqueued).toEqual([FALLBACK_ENQUEUE]);
   });
 
+  // R1-1: a machine-class rest is not an unreadable resume. The handler's own
+  // failure writes (all machine-class) and the pipeline's transport or
+  // protocol failures rest the row, but never ask for the fallback, and never
+  // spend a mapping read on it.
+  for (const [label, over] of [
+    ['the handler\'s own failure write (fetch_url_unresolved)', { portsStatus: 'url_unresolved' as const }],
+    ['a transport failure (fetch_timeout)', { fetchFails: true }],
+    ['a stdout protocol fault (parse_bad_output)', { parseBadOutput: true }],
+  ] as const) {
+    it(`switch ON, ${label}: rests the row, no profile job`, async () => {
+      const w = ingestionWorld(over);
+      await runIngestion(w, true);
+      expect(w.trace).toContain('stores.advanceIngestion:failed_review');
+      expect(w.trace).not.toContain('resolveMappingByJobId');
+      expect(profileJobs(w)).toEqual([]);
+    });
+  }
+
   it('switch OFF: no mapping read and no profile job', async () => {
     for (const enabled of [false, undefined]) {
-      for (const over of [{ scanInfected: true }, { portsStatus: 'url_unresolved' as const }]) {
+      for (const over of [{ scanInfected: true }, { guardRejected: true }, { portsStatus: 'url_unresolved' as const }]) {
         const w = ingestionWorld(over);
         await runIngestion(w, enabled);
         expect(w.trace, String(enabled)).toContain('stores.advanceIngestion:failed_review');

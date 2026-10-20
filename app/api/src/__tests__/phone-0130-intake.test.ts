@@ -10,7 +10,7 @@
  * are the whole change.
  *
  * Behaviour is proven in app/supabase/tests/policy_tests.sql (the 0130
- * block); text is not execution. The production drift check for the five
+ * block); text is not execution. The production drift check for the six
  * functions 0130 declares is pinned in phone-0130-prod-drift-check.test.ts.
  */
 import { readdirSync, readFileSync } from 'node:fs';
@@ -18,6 +18,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { describe, it, expect } from 'vitest';
 
+import { isUnreadableResumeReason } from '../integrations/ashby/resume-ingestion.js';
 import {
   MIGRATION_0114,
   MIGRATION_0130,
@@ -32,6 +33,7 @@ const ROOT = fileURLToPath(new URL('../../../../', import.meta.url));
 const MIGRATIONS_DIR = `${ROOT}app/supabase/migrations/`;
 const M0114 = lf(MIGRATION_0114);
 const M0130 = lf(MIGRATION_0130);
+const M0099 = lf(readFileSync(`${MIGRATIONS_DIR}0099_verify_phone_clears_stale_reason.sql`, 'utf8'));
 const DRIFT_SCRIPT = lf(readFileSync(`${ROOT}scripts/verify-prod-function-drift.sh`, 'utf8'));
 
 /** One function declaration (header through the closing `$$;`) from a file. */
@@ -113,6 +115,7 @@ const DECLARED = [
   },
   { name: 'claim_ashby_profile_due', section: 6, sig: 'integer, integer, integer, integer, timestamptz' },
   { name: 'release_ashby_number_after_identity_mismatch', section: 7, sig: 'uuid, timestamptz' },
+  { name: 'verify_candidate_phone', section: 8, sig: 'uuid, text, uuid, timestamptz' },
 ] as const;
 const LIFTED = DECLARED.slice(0, 2);
 
@@ -152,10 +155,10 @@ describe('0130 registration and frame', () => {
     expect(ensure).toContain('-- ▼ 0114 C8-b duplicate hold');
   });
 
-  it('has §1..§7 BEGIN/END markers once each, in order; outside them only the lock timeout and the notify', () => {
+  it('has §1..§8 BEGIN/END markers once each, in order; outside them only the lock timeout and the notify', () => {
     let last = -1;
     let outside = M0130;
-    for (let n = 1; n <= 7; n += 1) {
+    for (let n = 1; n <= 8; n += 1) {
       const begin = `-- ==== 0130 §${n} BEGIN ====`;
       const end = `-- ==== 0130 §${n} END ====`;
       expect(M0130.split(begin).length - 1, begin).toBe(1);
@@ -165,14 +168,14 @@ describe('0130 registration and frame', () => {
       last = M0130.indexOf(end);
       outside = outside.replace(`${begin}${section(n)}${end}`, '');
     }
-    expect(M0130).not.toMatch(/-- ==== 0130 §8 BEGIN ====/);
+    expect(M0130).not.toMatch(/-- ==== 0130 §9 BEGIN ====/);
     expect(code(outside).replace(/\s+/g, ' ').trim()).toBe(
       "set local lock_timeout = '10s'; notify pgrst, 'reload schema';",
     );
     expect(M0130.endsWith("\nnotify pgrst, 'reload schema';\n")).toBe(true);
   });
 
-  it('declares exactly the five drift-checked functions, each once, inside its own section', () => {
+  it('declares exactly the six drift-checked functions, each once, inside its own section', () => {
     expect([...M0130.matchAll(/create or replace function screening_v2\.(\w+)\(/g)].map((m) => m[1])).toEqual(
       DECLARED.map((d) => d.name),
     );
@@ -345,9 +348,9 @@ describe('0130 — no machine clock and no catch-all handler', () => {
     });
   }
 
-  it('the only now() in the code is the signature default admit and ensure keep from 0114', () => {
-    expect(M0130.replace(/--[^\n]*/g, '').match(/now\(\)/g)).toHaveLength(2);
-    for (const { name } of LIFTED) {
+  it('the only now() in the code is the signature default admit, ensure and verify keep from 0114/0099', () => {
+    expect(M0130.replace(/--[^\n]*/g, '').match(/now\(\)/g)).toHaveLength(3);
+    for (const name of [...LIFTED.map((d) => d.name), 'verify_candidate_phone']) {
       expect(header(bodyIn(M0130, name)), name).toMatch(/p_now\s+timestamptz default now\(\)\n\)/);
     }
     expect(code(M0130)).not.toMatch(MACHINE_CLOCK);
@@ -430,28 +433,128 @@ describe('0130 Addendum B — the second-mismatch release (B2) and the unreadabl
     expect(src).toContain('and m.admitted_at >= v_candidate.ashby_phone_applied_at');
   });
 
-  it('§5 step 9 lets phone_parsing through a handle only when its ingestion rests in failed_review', () => {
-    expect(code(APPLY)).toContain(
+  /** The document verdicts B3 falls back on, in SQL; mirrored by `isUnreadableResumeReason`. */
+  const VERDICT_IN =
+    "in ('scan_infected', 'parse_extract_failed',\n%PAD%'parse_no_output', 'parse_output_exceeded',\n%PAD%'no_extractable_fields')";
+
+  it('§5 step 9 lets phone_parsing through a handle only when its ingestion rests in failed_review on a document verdict', () => {
+    const src = code(APPLY);
+    expect(src).toContain('select state, failed_reason into v_ing_state, v_ing_reason');
+    expect(src).toContain(
+      [
+        '  v_unreadable := v_link.external_resume_file_handle is not null',
+        "                  and v_ing_state is not distinct from 'failed_review'",
+        '                  and coalesce(v_ing_reason ' + VERDICT_IN.replaceAll('%PAD%', ' '.repeat(48)),
+        "                               or left(v_ing_reason, 6) = 'guard_', false);",
+      ].join('\n'),
+    );
+    expect(src).toContain(
       [
         '    if (v_link.external_resume_file_handle is not null',
         "        or (v_ing_state is not null and v_ing_state <> 'queued'))",
-        '       and not (v_link.external_resume_file_handle is not null',
-        "                and v_ing_state is not distinct from 'failed_review') then",
+        '       and not v_unreadable then',
       ].join('\n'),
     );
+    // The identity fill keys on the same verdict, never on the bare state.
+    expect(src).toContain('and (v_candidate.resume_id is null or v_unreadable) then');
+    expect(src.split("'failed_review'").length - 1).toBe(1);
+    // No machine-class reason is in the verdict list.
+    for (const machine of ['parse_error', 'parse_bad_output', 'parse_timeout', 'parse_overload',
+      'materialize_failed', 'unexpected_error', 'scan_unavailable_deadline', 'fetch_']) {
+      expect(src, machine).not.toContain(`'${machine}`);
+    }
   });
 
-  it('§6 has arm C: a link with a handle whose ingestion rested in failed_review, stamped or not', () => {
+  it('§6 has arm C: a link with a handle whose ingestion rested in failed_review on a document verdict, stamped or not', () => {
     const src = code(CLAIM);
     expect(src).toContain(
       "(l.intake_type in ('resume_parsing', 'phone_parsing')\n          and l.external_resume_file_handle is not null",
     );
     expect(src).toContain(
-      "and i.state = 'failed_review'\n                         and i.updated_at <= p_now - make_interval(secs => p_min_age_seconds))",
+      [
+        "and i.state = 'failed_review'",
+        '                         and (i.failed_reason ' + VERDICT_IN.replaceAll('%PAD%', ' '.repeat(50)),
+        "                              or left(i.failed_reason, 6) = 'guard_')",
+        '                         and i.updated_at <= p_now - make_interval(secs => p_min_age_seconds))',
+      ].join('\n'),
     );
     // Arms B and C share the "no engagement past pending_prereqs" rule.
     expect(src.split("(e.terminal_at is not null or e.state <> 'pending_prereqs')").length - 1).toBe(2);
     expect(src).toContain('for update of l skip locked');
+  });
+
+  it('the SQL verdict list and the API trigger agree, code for code, and exclude every reason a requeue door re-runs', () => {
+    const listed = (src: string) => {
+      const m = /failed_reason\)? in \(([^)]*)\)|v_ing_reason in \(([^)]*)\)/.exec(src);
+      expect(m).not.toBeNull();
+      return [...(m![1] ?? m![2]).matchAll(/'([a-z_]+)'/g)].map((x) => x[1]).sort();
+    };
+    const sqlApply = listed(code(APPLY));
+    expect(listed(code(CLAIM))).toEqual(sqlApply);
+    for (const reason of sqlApply) expect(isUnreadableResumeReason(reason), reason).toBe(true);
+    expect(isUnreadableResumeReason('guard_magic_mismatch')).toBe(true);
+    // 0040's operator recovery list, 0041's legacy door, and the codes the
+    // generic requeue (re-import) re-runs: none of them falls back.
+    const RECOVERABLE_0040 = /v_recoverable_reasons constant text\[\] := array\[([\s\S]*?)\];/.exec(
+      lf(readFileSync(`${MIGRATIONS_DIR}0040_ashby_recovery_queue_admission.sql`, 'utf8')),
+    );
+    expect(RECOVERABLE_0040).not.toBeNull();
+    const recoverable = [...code(RECOVERABLE_0040![1]).matchAll(/'([a-z_]+)'/g)].map((x) => x[1]);
+    expect(recoverable).toContain('materialize_failed');
+    for (const reason of [...recoverable, 'parse_bad_output', 'unexpected_error', 'scan_unavailable_deadline',
+      'scan_deferral_exhausted', 'scan_scanner_error', 'fetch_timeout', 'fetch_url_unresolved',
+      'fetch_provider_error', 'ingestion_midflight_restart', 'ingestion_midflight_recently_active']) {
+      expect(sqlApply, reason).not.toContain(reason);
+      expect(isUnreadableResumeReason(reason), reason).toBe(false);
+    }
+    expect(isUnreadableResumeReason(null)).toBe(false);
+    expect(isUnreadableResumeReason(undefined)).toBe(false);
+  });
+});
+
+describe('0130 §8 — verify_candidate_phone locks the engagements before the candidate (M017-d)', () => {
+  const VERIFY_0099 = bodyIn(M0099, 'verify_candidate_phone');
+  const VERIFY_0130 = bodyIn(M0130, 'verify_candidate_phone');
+  const VERIFY = stripHunks(VERIFY_0130);
+  const APPLY_BODY = bodyIn(M0130, 'apply_ashby_candidate_profile');
+
+  it('= 0099 + the M017-d hunk only (pure insertion)', () => {
+    expect(VERIFY.tags).toEqual(['M017-d engagements before the candidate']);
+    expect(VERIFY.residue).toBe(VERIFY_0099);
+    expect(statusLiterals(VERIFY.hunks['M017-d engagements before the candidate']!)).toEqual(new Set());
+  });
+
+  it('the hunk locks exactly the rows the 0099 clear rewrites, in id order, before the candidate', () => {
+    const src = code(VERIFY_0130);
+    const at = (s: string) => {
+      const i = src.indexOf(s);
+      expect(i, s).toBeGreaterThan(-1);
+      return i;
+    };
+    const lock = at(
+      [
+        '  perform 1',
+        '    from screening_v2.phone_engagements e',
+        '   where e.candidate_id = p_candidate_id',
+        '     and e.terminal_at is null',
+        "     and e.state_reason = 'phone_invalid'",
+        '   order by e.id',
+        '     for update of e;',
+      ].join('\n'),
+    );
+    const cand = at('select * into v_candidate from screening_v2.candidates\n   where id = p_candidate_id for update;');
+    const clear = at('update screening_v2.phone_engagements\n     set state_reason = null');
+    expect(at("return jsonb_build_object('status', 'invalid_phone');")).toBeLessThan(lock);
+    expect(lock).toBeLessThan(cand);
+    expect(cand).toBeLessThan(clear);
+  });
+
+  it('§5 apply keeps engagement-then-candidate, the order §8 now matches', () => {
+    const src = code(APPLY_BODY);
+    const eng = src.indexOf('from screening_v2.phone_engagements\n   where application_link_id = v_link.id');
+    const cand = src.indexOf('from screening_v2.candidates\n   where id = v_link.candidate_id\n   for update;');
+    expect(eng).toBeGreaterThan(-1);
+    expect(cand).toBeGreaterThan(eng);
   });
 });
 

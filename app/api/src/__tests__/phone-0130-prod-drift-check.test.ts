@@ -1,12 +1,12 @@
 /**
- * 0130 (M017, ADR-0018) — production drift coverage for the five functions it
+ * 0130 (M017, ADR-0018) — production drift coverage for the six functions it
  * declares, asserted against the migration TEXT and the drift script.
  *
  * Supabase never re-runs an applied migration, so a prod database that missed
  * 0130 would keep the 0114 bodies of `admit_phone_attempt` and
  * `ensure_ashby_phone_engagement` and lack the three new RPCs, while every
  * local and CI database looked correct. `scripts/verify-prod-function-drift.sh`
- * proves the LIVE body contains a token. This file proves its five 0130 checks
+ * proves the LIVE body contains a token. This file proves its six 0130 checks
  * are well-formed and DISCRIMINATING:
  *
  *   - each CHECKS signature is exactly the argument list the 0130 CREATE header
@@ -14,7 +14,8 @@
  *     script counts as drift);
  *   - each token is in the 0130 body (so a correct prod passes);
  *   - no earlier declaration of the function carries the token (so a prod still
- *     on the 0114 admit or ensure body fails with position 0). The three new
+ *     on the 0114 admit or ensure body, or the 0099 verify body, fails with
+ *     position 0). The three new
  *     RPCs have no earlier declaration at all, so a prod without 0130 fails the
  *     regprocedure cast, which the script also counts as a failure.
  *
@@ -37,7 +38,7 @@ interface Check {
   token: string;
 }
 
-/** The five lines 0130 adds to CHECKS, and the newest earlier file declaring each function. */
+/** The six lines 0130 adds to CHECKS, and the newest earlier file declaring each function. */
 const CHECKS_0130: ReadonlyArray<Check & { name: string; lastEarlier: string | null }> = [
   {
     name: 'admit_phone_attempt',
@@ -69,6 +70,14 @@ const CHECKS_0130: ReadonlyArray<Check & { name: string; lastEarlier: string | n
     signature: 'screening_v2.release_ashby_number_after_identity_mismatch(uuid,timestamptz)',
     token: 'identity_unconfirmed',
     lastEarlier: null,
+  },
+  {
+    // §8 re-declares it (0099 + the M017-d engagements-first lock); the token
+    // is that hunk's locking clause, which no earlier body carries.
+    name: 'verify_candidate_phone',
+    signature: 'screening_v2.verify_candidate_phone(uuid,text,uuid,timestamptz)',
+    token: 'for update of e',
+    lastEarlier: '0099_verify_phone_clears_stale_reason.sql',
   },
 ];
 const NAMES = CHECKS_0130.map((c) => c.name);
@@ -130,7 +139,7 @@ function earlierDeclarations(name: string): Array<{ file: string; body: string }
 }
 
 describe('verify-prod-function-drift.sh covers the functions 0130 declares', () => {
-  it('lists the five 0130 checks verbatim', () => {
+  it('lists the six 0130 checks verbatim', () => {
     for (const { signature, token } of CHECKS_0130) {
       expect(driftChecks()).toContainEqual({ signature, token });
     }

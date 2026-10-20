@@ -26,6 +26,9 @@
 --       (the same gate skip) and M017-c (the consent proof basis).
 --   §5-§7  apply_ashby_candidate_profile, claim_ashby_profile_due and
 --       release_ashby_number_after_identity_mismatch (new RPCs).
+--   §8  verify_candidate_phone, lifted in full from 0099 with ONE marked
+--       hunk (M017-d): it locks the engagements it clears before the
+--       candidate, the order every other writer of both takes.
 --
 -- COMPATIBILITY. Every new column is nullable or has a default, and a row
 -- the pre-0130 app inserts reads resume_parsing. The admit and ensure hunks
@@ -39,6 +42,7 @@
 --   apply_ashby_candidate_profile ................... new (§5)
 --   claim_ashby_profile_due ......................... new (§6)
 --   release_ashby_number_after_identity_mismatch .... new (§7)
+--   verify_candidate_phone .......................... 0099 (lifted here, §8)
 --
 -- Conventions: `$$` bodies; no machine-clock reads in any function body;
 -- `set search_path = pg_catalog, screening_v2`; execute revoked from the
@@ -62,8 +66,9 @@ set local lock_timeout = '10s';
 --                       apply_ashby_candidate_profile writes phone_parsing,
 --                       and only while the link has no resume handle and its
 --                       ingestion row is absent or `queued`, or (B3) has a
---                       handle whose ingestion rests in `failed_review`, the
---                       unreadable resume. Never flipped back.
+--                       handle whose ingestion rests in `failed_review` on
+--                       a verdict about the document, the unreadable
+--                       resume (§5 step 9). Never flipped back.
 --   profile_checked_at  when the profile sweep last claimed this link, or the
 --                       profile step last recorded an outcome. NULL = never.
 --   profile_attempts    claims so far. The sweep backs off exponentially
@@ -100,7 +105,8 @@ comment on column screening_v2.ashby_application_links.intake_type is
   '0130 (M017, ADR-0018): how this Ashby application is screened. '
   'resume_parsing (the default, and every row the pre-0130 app inserts) is '
   'the resume pipeline. phone_parsing means no usable resume is attached '
-  '(none at all, or one whose ingestion rests in failed_review): the name, '
+  '(none at all, or one whose ingestion rests in failed_review on a '
+  'document verdict): the name, '
   'email and number come from the Ashby candidate record, and admit and '
   'ensure skip only the resume/ingestion gate. Written only by '
   'apply_ashby_candidate_profile, and never flipped back.';
@@ -1237,9 +1243,10 @@ comment on function screening_v2.ensure_ashby_phone_engagement is
 --                                  resume handle and its ingestion row is
 --                                  absent or `queued`, or, B3, it has a
 --                                  handle whose ingestion rests in
---                                  `failed_review`: the resume could not be
---                                  read), fill a NULL name and email, and
---                                  apply the number.
+--                                  `failed_review` on a verdict about the
+--                                  document: the resume could not be read),
+--                                  fill a NULL name and email, and apply
+--                                  the number.
 --                  resume_parsing  (D3) apply the number to a resume link
 --                                  whose ingestion is `ready` and whose
 --                                  candidate has a resume but no dialable
@@ -1270,7 +1277,11 @@ comment on function screening_v2.ensure_ashby_phone_engagement is
 -- re-entrant, so the nested ensure takes it again), the link, the newest
 -- engagement, then the candidate. A started, mid-call or finished engagement
 -- returns before the candidate is touched, so no name, email or number lands
--- behind a row that is already past its prerequisites.
+-- behind a row that is already past its prerequisites. HR's
+-- verify_candidate_phone clears phone_invalid on exactly the engagement a D3
+-- profile holds here, so §8 makes it lock that engagement before the
+-- candidate too; before 0130 it took them the other way round, and the pair
+-- could deadlock.
 --
 -- PRIVACY: the answer carries codes, flags and an engagement id only. No
 -- name, email or number is returned, logged or audited, and no audit row is
@@ -1297,6 +1308,8 @@ declare
   v_eng              screening_v2.phone_engagements%rowtype;
   v_candidate        screening_v2.candidates%rowtype;
   v_ing_state        text;
+  v_ing_reason       text;
+  v_unreadable       boolean;
   v_name             text;
   v_email            text;
   v_ok               boolean;
@@ -1410,19 +1423,31 @@ begin
   -- 9. The intake. phone_parsing is stamped atomically, only while no resume
   --    is bound: a handle, or an ingestion that has left `queued`, means the
   --    resume pipeline owns this application. One exception (B3): a handle
-  --    whose ingestion rests in `failed_review` is a resume nobody could
-  --    read, and it falls back to phone parsing exactly as if none were
-  --    attached. The stamp is never flipped back; the ingestion handler then
+  --    whose ingestion rests in `failed_review` on a verdict about the
+  --    DOCUMENT is a resume nobody can read, and it falls back to phone
+  --    parsing exactly as if none were attached. The verdicts are the class
+  --    advance_ashby_ingestion (0084) refuses to requeue, less parse_error
+  --    (0040's operator recovery re-runs it) and parse_bad_output (a stdout
+  --    fault of ours, 0041). Any other reason is about OUR MACHINE (an
+  --    outage, a deadline, a failed persist): the resume may be fine, a
+  --    re-import or the operator recovery re-runs it, and it stays the
+  --    resume pipeline's. So a stamped link's ingestion is one no door
+  --    requeues. The stamp is never flipped back; the ingestion handler then
   --    leaves the link alone, so a later repair of the file does not re-parse
   --    over the Ashby data.
-  select state into v_ing_state
+  select state, failed_reason into v_ing_state, v_ing_reason
     from screening_v2.ashby_resume_ingestions
    where application_link_id = v_link.id;
+  v_unreadable := v_link.external_resume_file_handle is not null
+                  and v_ing_state is not distinct from 'failed_review'
+                  and coalesce(v_ing_reason in ('scan_infected', 'parse_extract_failed',
+                                                'parse_no_output', 'parse_output_exceeded',
+                                                'no_extractable_fields')
+                               or left(v_ing_reason, 6) = 'guard_', false);
   if p_intake = 'phone_parsing' then
     if (v_link.external_resume_file_handle is not null
         or (v_ing_state is not null and v_ing_state <> 'queued'))
-       and not (v_link.external_resume_file_handle is not null
-                and v_ing_state is not distinct from 'failed_review') then
+       and not v_unreadable then
       v_outcome := 'resume_found';
       update screening_v2.ashby_application_links
          set profile_outcome = v_outcome, profile_checked_at = p_now
@@ -1475,12 +1500,12 @@ begin
 
   -- 11. Identity: phone_parsing only, and only for a candidate with no
   --     resume. A column is filled only while it is NULL, so a parsed or
-  --     HR-corrected value is never overwritten. A `failed_review` (B3)
+  --     HR-corrected value is never overwritten. An unreadable (B3)
   --     candidate is normally the import-time shell (no resume, name, email
   --     or number); one that kept a resume row from an earlier parse is
   --     filled too, but only where that parse left a NULL.
   if p_intake = 'phone_parsing'
-     and (v_candidate.resume_id is null or v_ing_state is not distinct from 'failed_review') then
+     and (v_candidate.resume_id is null or v_unreadable) then
     v_name  := coalesce(v_candidate.name, left(nullif(btrim(p_name), ''), 80));
     v_email := coalesce(v_candidate.email, left(nullif(btrim(p_email), ''), 254));
     if v_name is distinct from v_candidate.name
@@ -1576,7 +1601,10 @@ comment on function screening_v2.apply_ashby_candidate_profile is
   'application link, under the ensure lock order (advisory, link, newest '
   'engagement, candidate). phone_parsing stamps intake_type (only with no '
   'resume handle and an ingestion row absent or queued, or with a handle '
-  'whose ingestion rests in failed_review) and fills a NULL name and email; '
+  'whose ingestion rests in failed_review on a document verdict: '
+  'scan_infected, guard_*, parse_extract_failed, parse_no_output, '
+  'parse_output_exceeded or no_extractable_fields, never a machine-class '
+  'reason) and fills a NULL name and email; '
   'both intakes apply a strict +91 Ashby number at most once '
   'per candidate row (ashby_phone_applied_at), never over a valid number, '
   'never one a different Ashby person holds, never under a DSAR hold, never '
@@ -1609,11 +1637,13 @@ comment on function screening_v2.apply_ashby_candidate_profile is
 --                  ago, with no engagement or only a live pending_prereqs
 --                  one;
 --   C (B3, unreadable resume)  a link with a handle whose ingestion has
---                  rested in `failed_review` for at least p_min_age_seconds
---                  (its updated_at), with no engagement or only a live
---                  pending_prereqs one. The backstop for the best-effort
---                  profile job the ingestion handler enqueues on
---                  `failed_review`; apply then falls back to phone parsing.
+--                  rested in `failed_review` on a document verdict (the
+--                  §5 step 9 reasons; never a machine-class one) for at
+--                  least p_min_age_seconds (its updated_at), with no
+--                  engagement or only a live pending_prereqs one. The
+--                  backstop for the best-effort profile job the ingestion
+--                  handler enqueues on such a verdict; apply then falls
+--                  back to phone parsing.
 --                  It covers a link already stamped phone_parsing too, so a
 --                  fallback that ended name_missing or number_invalid is
 --                  retried with the same backoff as arm B.
@@ -1678,6 +1708,10 @@ as $$
           and l.external_resume_file_handle is not null
           and exists (select 1 from screening_v2.ashby_resume_ingestions i
                        where i.application_link_id = l.id and i.state = 'failed_review'
+                         and (i.failed_reason in ('scan_infected', 'parse_extract_failed',
+                                                  'parse_no_output', 'parse_output_exceeded',
+                                                  'no_extractable_fields')
+                              or left(i.failed_reason, 6) = 'guard_')
                          and i.updated_at <= p_now - make_interval(secs => p_min_age_seconds))
           and not exists (select 1 from screening_v2.phone_engagements e
                            where e.application_link_id = l.id
@@ -1708,7 +1742,8 @@ comment on function screening_v2.claim_ashby_profile_due is
   'backoff from p_retry_seconds; and either a ready resume link whose '
   'engagement has waited on phone_invalid for p_min_age_seconds (D3), a '
   'link with no resume handle at least p_min_age_seconds old, or (B3) a '
-  'link with a handle whose ingestion has rested in failed_review for '
+  'link with a handle whose ingestion has rested in failed_review on a '
+  'document verdict (never a machine-class reason) for '
   'p_min_age_seconds, in both cases with no engagement or only a live '
   'pending_prereqs one. Returns link ids only. Service-role-only.';
 -- ==== 0130 §6 END ====
@@ -1923,6 +1958,109 @@ comment on function screening_v2.release_ashby_number_after_identity_mismatch is
   'advisory, link, engagement, candidate. Returns codes and the engagement '
   'id only. Service-role-only.';
 -- ==== 0130 §7 END ====
+
+
+-- ==== 0130 §8 BEGIN ====
+-- ─────────────────────────────────────────────────────────────────────
+-- §8 — verify_candidate_phone: the lock order (M017-d). Lifted IN FULL
+-- from 0099, its newest declaration, with ONE marked hunk; stripping it
+-- restores the 0099 body exactly.
+--
+-- 0099 locks the candidate and then clears phone_invalid on the
+-- candidate's live engagements. Every other writer of both rows takes the
+-- engagement first: ensure, relabel, §5 apply_ashby_candidate_profile and
+-- §7. Before 0130 the inversion could not bite, because ensure answers
+-- phone_invalid without touching the candidate. §5 changes that: a D3
+-- profile locks a pending_prereqs/phone_invalid engagement and then the
+-- candidate, which is the moment HR is most likely to verify that
+-- candidate's number. M017-d locks the engagements first, so verify
+-- waits behind the profile instead of deadlocking with it.
+-- ─────────────────────────────────────────────────────────────────────
+create or replace function screening_v2.verify_candidate_phone(
+  p_candidate_id uuid,
+  p_phone_e164 text,
+  p_actor_id uuid,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_candidate screening_v2.candidates%rowtype;
+  v_digest text;
+  v_cleared integer := 0;
+begin
+  if p_phone_e164 is null or p_phone_e164 !~ '^\+91[6-9][0-9]{9}$' then
+    return jsonb_build_object('status', 'invalid_phone');
+  end if;
+  -- ▼ 0130 M017-d engagements before the candidate
+  -- The engagements the 0099 clear below rewrites are locked BEFORE the
+  -- candidate. ensure, apply_ashby_candidate_profile, the identity
+  -- release and relabel all lock an engagement before its candidate, and a
+  -- D3 profile holds exactly such a phone_invalid engagement while it
+  -- waits for this candidate: taken the other way round, the pair could
+  -- deadlock. Ordered by id, so two verifies never cross either. The
+  -- predicate is the one the clear uses and nothing is written here, so
+  -- every answer is unchanged.
+  perform 1
+    from screening_v2.phone_engagements e
+   where e.candidate_id = p_candidate_id
+     and e.terminal_at is null
+     and e.state_reason = 'phone_invalid'
+   order by e.id
+     for update of e;
+  -- ▲ 0130 M017-d engagements before the candidate
+  select * into v_candidate from screening_v2.candidates
+   where id = p_candidate_id for update;
+  if not found then return jsonb_build_object('status', 'candidate_not_found'); end if;
+  if p_actor_id is null then return jsonb_build_object('status', 'actor_required'); end if;
+
+  v_digest := screening_v2.sha256_hex(p_phone_e164);
+  update screening_v2.candidates
+     set phone_e164 = p_phone_e164, phone_valid = true, updated_at = p_now
+   where id = p_candidate_id;
+
+  -- ── 0099: the verdict this call just superseded ────────────────────
+  -- See the file header for why this touches neither `state`, `version` nor
+  -- `updated_at`, and why `terminal_at is null` is mandatory rather than
+  -- defensive.
+  update screening_v2.phone_engagements
+     set state_reason = null
+   where candidate_id = p_candidate_id
+     and terminal_at is null
+     and state_reason = 'phone_invalid';
+  get diagnostics v_cleared = row_count;
+
+  insert into screening_v2.phone_number_verifications
+    (candidate_id, phone_sha256, verified_by, verified_at, created_at)
+  values (p_candidate_id, v_digest, p_actor_id, p_now, p_now);
+  insert into screening_v2.audit_events
+    (actor_id, actor_type, action, target_type, target_id, result, metadata)
+  values (p_actor_id, 'recruiter', 'phone_number_reverified', 'candidate',
+          p_candidate_id::text, 'success',
+          -- Counts only. The number never reaches an audit row (0057).
+          jsonb_build_object('verified', true,
+                             'stale_phone_invalid_cleared', v_cleared));
+  return jsonb_build_object('status', 'ok',
+                            'stale_phone_invalid_cleared', v_cleared);
+end;
+$$;
+
+revoke all on function screening_v2.verify_candidate_phone(uuid, text, uuid, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.verify_candidate_phone(uuid, text, uuid, timestamptz)
+  to service_role;
+
+comment on function screening_v2.verify_candidate_phone is
+  '0130 (M017, ADR-0018): the sanctioned HR number correction. Sets the '
+  'candidate number valid, clears phone_invalid on its non-terminal '
+  'engagements (0099; state, version and updated_at untouched), records '
+  'the verification and audits counts only, never the number. Locks those '
+  'engagements before the candidate (M017-d), the order every writer of '
+  'both takes. Service-role-only.';
+-- ==== 0130 §8 END ====
 
 
 notify pgrst, 'reload schema';

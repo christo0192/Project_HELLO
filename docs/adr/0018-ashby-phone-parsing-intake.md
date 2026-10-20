@@ -81,9 +81,15 @@ Owner decisions (2026-10-20):
   +91 mobile (`phone_invalid`), the Ashby number is applied instead, under the
   same rules.
 - **Unreadable resume:** a resume-parsing link whose ingestion rests in
-  `failed_review` ("Resume needs review") falls back to phone parsing, while the
-  switch is on, the mapping is an enabled `phone_primary` and no engagement has
-  gone beyond `pending_prereqs`. Name and email are filled only where null.
+  `failed_review` ("Resume needs review") on a verdict about the document
+  (`scan_infected`, `guard_*`, `parse_extract_failed`, `parse_no_output`,
+  `parse_output_exceeded`, `no_extractable_fields`) falls back to phone
+  parsing, while the switch is on, the mapping is an enabled `phone_primary`
+  and no engagement has gone beyond `pending_prereqs`. Name and email are
+  filled only where null. A machine-class reason (a parser, scanner, provider
+  or database outage, a deadline, a failed persist, the legacy `parse_error`,
+  the `parse_bad_output` protocol fault) never falls back: the resume may be
+  fine, and a re-import or the operator recovery re-runs it.
 - **Wrong person on an unverified Ashby number: one more try.** The first
   confirmed identity mismatch (the worker's `recording_discarded` flag on
   `candidate.deferred_pre_disclosure`, set only for a not-the-candidate or

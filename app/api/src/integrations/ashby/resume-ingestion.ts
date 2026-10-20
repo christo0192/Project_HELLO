@@ -237,6 +237,37 @@ export function classifyParserFailure(err: unknown): ParseFailureCode {
   return 'parse_error';
 }
 
+/**
+ * `failed_review` reasons that are verdicts ABOUT THE DOCUMENT, so the resume
+ * can never be read: the only reasons that fall back to phone parsing (B3,
+ * ADR-0018). Mirrors, code for code, the 0130 SQL predicate that
+ * `apply_ashby_candidate_profile` §5 step 9 and `claim_ashby_profile_due` arm
+ * C enforce under their locks; this copy only decides whether to ask.
+ *
+ * It is the verdict class `advance_ashby_ingestion` (0084) refuses to requeue,
+ * minus two codes that are not about the document:
+ *   - `parse_error`, the legacy unknown, which the operator recovery
+ *     `recover_ashby_ingestion_parse` (0040) re-runs;
+ *   - `parse_bad_output`, a stdout protocol fault of ours (0041), whose
+ *     legacy rows `recover_ashby_legacy_bad_output` re-runs.
+ *
+ * Everything else is a statement about OUR MACHINE (a parser, scanner,
+ * provider or database outage, a deferral deadline, a mid-flight restart, a
+ * failed persist, an unexpected throw): the resume may be fine, a re-import
+ * or an operator recovery re-runs it, and stamping it phone_parsing would
+ * screen a candidate who attached a readable resume as one who did not, and
+ * would strand any later recovery in `queued` behind the ingestion guard.
+ */
+export function isUnreadableResumeReason(reason: string | null | undefined): boolean {
+  if (typeof reason !== 'string') return false;
+  return reason === 'scan_infected'
+    || reason.startsWith('guard_')
+    || reason === 'parse_extract_failed'
+    || reason === 'parse_no_output'
+    || reason === 'parse_output_exceeded'
+    || reason === 'no_extractable_fields';
+}
+
 /** A parsed document: extracted text + structured fields + a structurer tag. */
 export interface ParseOutput {
   text: string;
