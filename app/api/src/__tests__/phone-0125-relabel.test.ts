@@ -102,8 +102,13 @@ describe('0125 §5 — ownership and placement', () => {
     expect(S5).not.toMatch(/create trigger/i);
   });
 
-  it('0125 is the newest registered migration, so the extractors read the 0125 bodies', () => {
-    expect(PHONE_MIGRATIONS[0].name).toBe('0125');
+  it('0125 is the newest registered migration declaring them, so the extractors read the 0125 bodies', () => {
+    // 0130 (M017), the only newer entry, redeclares neither function.
+    expect(PHONE_MIGRATIONS[0].name).toBe('0130');
+    expect(PHONE_MIGRATIONS[1].name).toBe('0125');
+    for (const name of [TRG, RPC]) {
+      expect(PHONE_MIGRATIONS[0].sql, name).not.toContain(`create or replace function screening_v2.${name}(`);
+    }
     const resolved = functionBody(TRG);
     expect(resolved).toContain('-- ▼ 0125 S02-4 zero-answer relabel');
     // The 0114 C2 hunk the phone-0114-ledger pins read survives in it.

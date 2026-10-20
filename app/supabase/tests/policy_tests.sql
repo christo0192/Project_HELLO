@@ -8974,7 +8974,17 @@ begin
                              -- is also the column holding an out-of-hours
                              -- candidate until the IST window opens — so an
                              -- unchecked posture here is a 2am phone call.
-                             'defer_phone_dial_for_questions'))
+                             'defer_phone_dial_for_questions',
+                             -- 0130 (M017): the Ashby profile RPCs. None
+                             -- matches `phone\_%` either. apply writes the
+                             -- number that gets dialled, release takes it
+                             -- away again after a wrong person answers, and
+                             -- claim drives the sweep that polls Ashby. A
+                             -- browser that could call apply or release
+                             -- would decide who is rung.
+                             'apply_ashby_candidate_profile',
+                             'claim_ashby_profile_due',
+                             'release_ashby_number_after_identity_mismatch'))
   loop
     if not v_fn.prosecdef and v_fn.proname not in ('phone_ist_date','phone_ist_window_open',
                                                    'phone_ist_window_open_at',
@@ -21043,6 +21053,1596 @@ select _policy_tests.assert(
 drop function _policy_tests.s8_new(uuid[]);
 drop function _policy_tests.s8_mark();
 -- ==== 0114-§8 END ====
+
+-- ==== 0130 BEGIN ====
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0130 (M017, ADR-0018) — Ashby "phone parsing" intake for applications
+-- without a resume. The new link columns, the admit/ensure intake gates,
+-- apply_ashby_candidate_profile (both intakes and every refusal), the
+-- consent proof basis, the duplicate hold across intakes, the durable sweep
+-- claim, the identity-mismatch release on the second mismatch (B2) and the
+-- unreadable-resume fallback with its claim arm (B3). Synthetic data only: names
+-- 'Test Person …', @example.invalid emails and +91 98123 456xx numbers.
+-- Detail strings carry statuses, codes and flags, never a contact datum.
+-- Every fixture is torn down inside its own block, and every p_now is
+-- explicit: 2026-10-19 06:00Z is a Monday, 11:30 IST.
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- Removes one tagged 0130 fixture and everything hanging off it, in
+-- dependency order. Keyed by the link, not by an email: a phone_parsing
+-- candidate gets its email from the profile under test.
+create or replace function _policy_tests.p130_teardown(p_tag text)
+returns void language plpgsql as $p130t$
+declare v_links uuid[]; v_engs uuid[]; v_cands uuid[]; v_resumes uuid[];
+begin
+  select coalesce(array_agg(id), '{}'),
+         coalesce(array_agg(candidate_id) filter (where candidate_id is not null), '{}')
+    into v_links, v_cands
+    from screening_v2.ashby_application_links where external_application_id = p_tag || '-app';
+  select coalesce(array_agg(id), '{}') into v_engs
+    from screening_v2.phone_engagements where application_link_id = any(v_links);
+  select coalesce(array_agg(resume_id) filter (where resume_id is not null), '{}') into v_resumes
+    from screening_v2.candidates where id = any(v_cands);
+
+  delete from screening_v2.job_queue
+   where dedup_key in (select 'phone.dial:' || id::text
+                         from screening_v2.phone_call_attempts
+                        where engagement_id = any(v_engs));
+  perform set_config('app.allow_phone_event_mutation', 'true', true);
+  delete from screening_v2.phone_call_events
+   where engagement_id = any(v_engs) or attempt_id in (
+     select id from screening_v2.phone_call_attempts where engagement_id = any(v_engs));
+  perform set_config('app.allow_phone_event_mutation', 'false', true);
+  delete from screening_v2.phone_call_attempts where engagement_id = any(v_engs);
+  delete from screening_v2.phone_appointments where engagement_id = any(v_engs);
+  delete from screening_v2.phone_engagements where id = any(v_engs);
+  delete from screening_v2.ashby_resume_ingestions where application_link_id = any(v_links);
+  delete from screening_v2.ashby_operations where application_link_id = any(v_links);
+  delete from screening_v2.ashby_application_links where id = any(v_links);
+  delete from screening_v2.ashby_job_mappings where external_job_id = p_tag || '-job';
+  -- phone_number_verifications is ON DELETE RESTRICT on the candidate.
+  delete from screening_v2.phone_number_verifications where candidate_id = any(v_cands);
+  delete from screening_v2.data_subject_requests where candidate_id = any(v_cands);
+  delete from screening_v2.consent_records where candidate_id = any(v_cands);
+  delete from screening_v2.phone_suppressions where candidate_id = any(v_cands);
+  delete from screening_v2.candidates where id = any(v_cands);
+  delete from screening_v2.resumes where id = any(v_resumes);
+end;
+$p130t$;
+
+-- One Ashby application on its own enabled phone_primary mapping, created
+-- and submitted at 03:00Z, three hours before every p_now below.
+--   p_handle     bind a resume file handle;
+--   p_ingestion  advance the ingestion row to this state ('absent' = none;
+--                'failed_review' = fetched, then rested for review);
+--   p_phone      a VALID number on the candidate (NULL = none at all);
+--   p_resume     a resume row plus the name and email a parse leaves (else
+--                the candidate has no name, email, raw value or number:
+--                the no-resume shape);
+--   p_consent    'full' writes a granted record ('none' lets ensure mint);
+--   p_state      insert an engagement in this state (NULL = none);
+--   p_ext        the Ashby external candidate id.
+-- Returns the link id.
+create or replace function _policy_tests.p130_fixture(
+  p_tag       text,
+  p_handle    boolean default false,
+  p_ingestion text    default 'queued',
+  p_phone     text    default null,
+  p_resume    boolean default false,
+  p_consent   text    default 'none',
+  p_state     text    default null,
+  p_ext       text    default null
+)
+returns uuid language plpgsql as $p130f$
+declare
+  v_role uuid; v_resume uuid; v_cand uuid; v_map uuid; v_link uuid; v_s text;
+begin
+  select id into v_role from screening_v2.roles order by id limit 1;
+  perform _policy_tests.p130_teardown(p_tag);
+
+  if p_resume then
+    insert into screening_v2.resumes (text_extracted, parsed)
+    values (null, jsonb_build_object('src', p_tag)) returning id into v_resume;
+  end if;
+
+  insert into screening_v2.candidates
+    (role_id, resume_id, name, email, phone_raw, phone_e164, phone_valid)
+  values (v_role, v_resume,
+          case when p_resume then 'Test Person ' || p_tag end,
+          case when p_resume then p_tag || '@example.invalid' end,
+          p_phone, p_phone, p_phone is not null)
+  returning id into v_cand;
+
+  if p_consent = 'full' then
+    insert into screening_v2.consent_records (candidate_id, status, consents, version)
+    values (v_cand, 'granted',
+            '{ai_interview,recording,purpose,data_processing,retention,rights}'
+              ::screening_v2.consent_type[], '2026-08-04.1');
+  end if;
+
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id,
+     status, delivery_mode)
+  values (p_tag || '-job', v_role, '00000000-0000-4000-8000-0000000000ad',
+          p_tag || '-ai', p_tag || '-ta', 'enabled', 'manual')
+  returning id into v_map;
+
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_candidate_id, external_job_id, job_mapping_id,
+     external_resume_file_handle, candidate_id, submitted_at, created_at)
+  values (p_tag || '-app', p_ext, p_tag || '-job', v_map,
+          case when p_handle then repeat('h', 64) end, v_cand,
+          '2026-10-19T03:00:00Z', '2026-10-19T03:00:00Z')
+  returning id into v_link;
+
+  if p_ingestion = 'failed_review' then
+    -- The unreadable resume (B3): fetched, then rested for review.
+    perform screening_v2.advance_ashby_ingestion(v_link, 'queued', null, null, null, null);
+    perform screening_v2.advance_ashby_ingestion(v_link, 'fetching', null, null, null, null);
+    perform screening_v2.advance_ashby_ingestion(v_link, 'failed_review', null, null, null, 'parse_error');
+  elsif p_ingestion <> 'absent' then
+    foreach v_s in array array['queued','fetching','scanning','extracting','structuring','ready'] loop
+      perform screening_v2.advance_ashby_ingestion(v_link, v_s, null, null, null, null);
+      exit when v_s = p_ingestion;
+    end loop;
+  end if;
+
+  if p_state is not null then
+    insert into screening_v2.phone_engagements
+      (application_link_id, candidate_id, role_id, state, terminal_at)
+    values (v_link, v_cand, v_role, p_state,
+            case when p_state in ('completed','abandoned_no_answer','opted_out',
+                                  'wrong_number','failed','cancelled')
+                 then '2026-10-19T04:00:00Z'::timestamptz end);
+  end if;
+
+  return v_link;
+end;
+$p130f$;
+
+-- The newest engagement of a link, as ensure selects it (NULL = none).
+create or replace function _policy_tests.p130_eng(p_link uuid)
+returns uuid language sql as $p130e$
+  select id from screening_v2.phone_engagements
+   where application_link_id = p_link
+   order by cycle_number desc, created_at desc, id desc
+   limit 1;
+$p130e$;
+
+-- The no-resume candidate of a link still has no name, email, raw value,
+-- number or marker: nothing was written to it.
+create or replace function _policy_tests.p130_untouched(p_link uuid)
+returns boolean language sql as $p130u$
+  select coalesce((
+    select c.name is null and c.email is null and c.phone_raw is null
+           and c.phone_e164 is null and not c.phone_valid
+           and c.ashby_phone_applied_at is null
+      from screening_v2.candidates c
+      join screening_v2.ashby_application_links l on l.candidate_id = c.id
+     where l.id = p_link), false);
+$p130u$;
+
+-- True when an answer is codes only: no key names a contact datum and no
+-- value is one (no '@', no +91 number, no fixture name).
+create or replace function _policy_tests.p130_codes_only(p_res jsonb)
+returns boolean language sql immutable as $p130c$
+  select p_res is not null
+     and not exists (select 1 from jsonb_object_keys(p_res) k
+                      where k ~ '(phone|email|contact|name)')
+     and p_res::text !~ '(@|\+91|9812345|Person)';
+$p130c$;
+
+-- A detail string for a profile answer: its status, outcome and flags only.
+create or replace function _policy_tests.p130_brief(p_res jsonb)
+returns text language sql immutable as $p130b$
+  select coalesce(p_res->>'status', '<null>') || '/' || coalesce(p_res->>'profile_outcome', '-')
+         || ' number=' || coalesce(p_res->>'number_applied', '-')
+         || ' identity=' || coalesce(p_res->>'identity_applied', '-')
+         || ' stamped=' || coalesce(p_res->>'intake_stamped', '-');
+$p130b$;
+
+-- Dials an eligible engagement, answers the leg, and ends it with the
+-- worker's pre-disclosure deferral, the event the confirmed-identity-
+-- mismatch path posts: the attempt ends abandoned_pre_disclosure and the
+-- engagement is back at eligible/abandoned_pre_disclosure. Returns the
+-- attempt id.
+create or replace function _policy_tests.p130_deferred(p_eng uuid, p_t timestamptz)
+returns uuid language plpgsql as $p130d$
+declare v_res jsonb; v_att uuid;
+begin
+  v_res := screening_v2.admit_phone_attempt(p_eng, 'initial', null, 60, p_t);
+  if v_res->>'status' is distinct from 'ok' then
+    raise exception 'p130_deferred: admission refused: %', v_res->>'status';
+  end if;
+  v_att := (v_res->>'attempt_id')::uuid;
+  perform screening_v2.apply_phone_event('internal', 'call.answered', v_att, null,
+            null, null, null, p_t + interval '20 seconds');
+  v_res := screening_v2.apply_phone_event('internal', 'candidate.deferred_pre_disclosure', v_att, null,
+            null, null, null, p_t + interval '1 minute');
+  if v_res->>'status' is distinct from 'applied' then
+    raise exception 'p130_deferred: deferral not applied: %', v_res->>'status';
+  end if;
+  return v_att;
+end;
+$p130d$;
+
+-- ── 0130-0: posture. The three new RPCs are SECURITY DEFINER with the
+--    pinned search_path and service_role-only (no anon, authenticated or
+--    PUBLIC execute); no body reads the clock or swallows every error; the
+--    claim is VOLATILE and SKIP LOCKED (a second session cannot be opened
+--    here, so the skip is pinned statically). admit's first statement is
+--    still the phone_admission lock, and admit and ensure each carry exactly
+--    one intake gate, admit's between the mapping and the state checks ────
+do $$
+declare
+  v_fn   regprocedure;
+  v_bad  text := '';
+  v_src  text; v_body text; v_first text; v_vol text;
+  v_gate constant text := 'if v_link.intake_type is distinct from ''phone_parsing'' then';
+begin
+  foreach v_fn in array array[
+    'screening_v2.apply_ashby_candidate_profile(uuid,text,text,text,text,text,text,timestamptz)'::regprocedure,
+    'screening_v2.claim_ashby_profile_due(integer,integer,integer,integer,timestamptz)'::regprocedure,
+    'screening_v2.release_ashby_number_after_identity_mismatch(uuid,timestamptz)'::regprocedure]
+  loop
+    if not (select prosecdef from pg_proc where oid = v_fn) then
+      v_bad := v_bad || ' not_definer:' || v_fn::text; end if;
+    if (select proconfig from pg_proc where oid = v_fn)
+       is distinct from array['search_path=pg_catalog, screening_v2'] then
+      v_bad := v_bad || ' search_path:' || v_fn::text; end if;
+    if has_function_privilege('anon', v_fn, 'execute')
+       or has_function_privilege('authenticated', v_fn, 'execute')
+       or not has_function_privilege('service_role', v_fn, 'execute') then
+      v_bad := v_bad || ' acl:' || v_fn::text; end if;
+    if exists (select 1 from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+                where p.oid = v_fn and a.grantee = 0 and a.privilege_type = 'EXECUTE') then
+      v_bad := v_bad || ' public_execute:' || v_fn::text; end if;
+    v_body := regexp_replace((select prosrc from pg_proc where oid = v_fn), '--[^\n]*', '', 'g');
+    if v_body ~* '\mnow\s*\(' or v_body ~* '\mcurrent_timestamp\M'
+       or v_body ~* '\mclock_timestamp\s*\(' or v_body ~* '\mstatement_timestamp\s*\(' then
+      v_bad := v_bad || ' reads_clock:' || v_fn::text; end if;
+    if v_body ~* 'when\s+others' then
+      v_bad := v_bad || ' when_others:' || v_fn::text; end if;
+  end loop;
+
+  select provolatile::text, prosrc into v_vol, v_src from pg_proc
+   where oid = 'screening_v2.claim_ashby_profile_due(integer,integer,integer,integer,timestamptz)'::regprocedure;
+  if v_vol is distinct from 'v' or v_src !~* 'for\s+update\s+of\s+l\s+skip\s+locked' then
+    v_bad := v_bad || ' claim_not_volatile_skip_locked'; end if;
+
+  select prosrc into v_src from pg_proc
+   where oid = 'screening_v2.admit_phone_attempt(uuid,text,text,integer,timestamptz)'::regprocedure;
+  v_body := regexp_replace(v_src, '--[^\n]*', '', 'g');
+  v_first := btrim(regexp_replace(
+               split_part(substr(v_body, strpos(v_body, E'\nbegin') + 6), ';', 1), '\s+', ' ', 'g'));
+  if v_first is distinct from 'perform pg_advisory_xact_lock(hashtext(''phone_admission''))' then
+    v_bad := v_bad || ' admit_first_statement=' || coalesce(left(v_first, 80), '<null>'); end if;
+  if (length(v_body) - length(replace(v_body, v_gate, ''))) / length(v_gate) <> 1 then
+    v_bad := v_bad || ' admit_gate_count'; end if;
+  if not (strpos(v_body, v_gate) > strpos(v_body, '''mapping_not_enabled''')
+          and strpos(v_body, v_gate) < strpos(v_body, '''state_not_admissible''')) then
+    v_bad := v_bad || ' admit_gate_position'; end if;
+
+  select regexp_replace(prosrc, '--[^\n]*', '', 'g') into v_body from pg_proc
+   where oid = 'screening_v2.ensure_ashby_phone_engagement(uuid,timestamptz)'::regprocedure;
+  if (length(v_body) - length(replace(v_body, v_gate, ''))) / length(v_gate) <> 1 then
+    v_bad := v_bad || ' ensure_gate_count'; end if;
+
+  perform _policy_tests.assert(
+    '0130-0 posture: apply/claim/release definer + pinned search_path + service_role only, no clock read, no when-others; claim VOLATILE and SKIP LOCKED; admit still lock-first; one intake gate each in admit (after mapping, before state) and ensure',
+    v_bad = '', v_bad);
+end;
+$$;
+
+-- ── 0130-1: the new columns. intake_type defaults to resume_parsing and
+--    profile_attempts to 0; profile_outcome, profile_checked_at and the
+--    candidate marker start NULL. Each CHECK refuses a value outside its
+--    vocabulary and accepts every value inside it, and every new column
+--    carries its ADR-0018 comment ──────────────────────────────────────────
+do $$
+declare
+  v_link uuid; v_cand uuid; v_s text; v_bad text := '';
+  v_intake text; v_attempts integer; v_outcome text; v_checked timestamptz; v_marker timestamptz;
+begin
+  v_link := _policy_tests.p130_fixture('pol130-col');
+  select intake_type, profile_attempts, profile_outcome, profile_checked_at, candidate_id
+    into v_intake, v_attempts, v_outcome, v_checked, v_cand
+    from screening_v2.ashby_application_links where id = v_link;
+  select ashby_phone_applied_at into v_marker from screening_v2.candidates where id = v_cand;
+  if v_intake is distinct from 'resume_parsing' or v_attempts is distinct from 0
+     or v_outcome is not null or v_checked is not null or v_marker is not null then
+    v_bad := v_bad || ' defaults=' || coalesce(v_intake, '<null>') || '/' || coalesce(v_attempts::text, '<null>')
+             || '/' || coalesce(v_outcome, '<null>') || '/' || coalesce(v_checked::text, '<null>')
+             || '/' || coalesce(v_marker::text, '<null>');
+  end if;
+
+  begin
+    update screening_v2.ashby_application_links set intake_type = 'manual_entry' where id = v_link;
+    v_bad := v_bad || ' intake_type_unknown_accepted';
+  exception when check_violation then null; end;
+  begin
+    update screening_v2.ashby_application_links set intake_type = null where id = v_link;
+    v_bad := v_bad || ' intake_type_null_accepted';
+  exception when not_null_violation then null; end;
+  begin
+    update screening_v2.ashby_application_links set profile_outcome = 'number_found' where id = v_link;
+    v_bad := v_bad || ' profile_outcome_unknown_accepted';
+  exception when check_violation then null; end;
+  begin
+    update screening_v2.ashby_application_links set profile_attempts = -1 where id = v_link;
+    v_bad := v_bad || ' profile_attempts_negative_accepted';
+  exception when check_violation then null; end;
+  begin
+    update screening_v2.ashby_application_links set profile_attempts = 1001 where id = v_link;
+    v_bad := v_bad || ' profile_attempts_over_accepted';
+  exception when check_violation then null; end;
+
+  foreach v_s in array array['resume_parsing', 'phone_parsing'] loop
+    begin
+      update screening_v2.ashby_application_links set intake_type = v_s where id = v_link;
+    exception when check_violation then v_bad := v_bad || ' intake_refused:' || v_s; end;
+  end loop;
+  foreach v_s in array array[
+      'applied','number_invalid','number_placeholder','number_shared','name_missing',
+      'resume_found','resume_shape_unknown','stage_moved','application_inactive','mapping_inactive',
+      'subject_request_hold','engagement_active','not_applicable','ashby_unavailable',
+      'identity_unconfirmed','application_terminal','candidate_missing'] loop
+    begin
+      update screening_v2.ashby_application_links set profile_outcome = v_s where id = v_link;
+    exception when check_violation then v_bad := v_bad || ' outcome_refused:' || v_s; end;
+  end loop;
+
+  if (select count(*) from pg_attribute a
+       where a.attrelid = 'screening_v2.ashby_application_links'::regclass
+         and a.attname in ('intake_type', 'profile_checked_at', 'profile_attempts', 'profile_outcome',
+                           'identity_mismatch_attempt_id')
+         and coalesce(col_description(a.attrelid, a.attnum), '') like '%ADR-0018%') <> 5
+     or coalesce((select col_description(a.attrelid, a.attnum) from pg_attribute a
+                   where a.attrelid = 'screening_v2.candidates'::regclass
+                     and a.attname = 'ashby_phone_applied_at'), '') not like '%ADR-0018%' then
+    v_bad := v_bad || ' column_comments';
+  end if;
+
+  -- B2: the first-mismatch attempt is a nullable uuid with NO foreign key,
+  -- so it can never block an attempt or candidate delete.
+  if (select identity_mismatch_attempt_id from screening_v2.ashby_application_links where id = v_link) is not null
+     or (select format_type(a.atttypid, a.atttypmod) || '/' || a.attnotnull::text from pg_attribute a
+          where a.attrelid = 'screening_v2.ashby_application_links'::regclass
+            and a.attname = 'identity_mismatch_attempt_id' and not a.attisdropped)
+        is distinct from 'uuid/false'
+     or exists (select 1 from pg_constraint k
+                  join pg_attribute a on a.attrelid = k.conrelid and a.attnum = any (k.conkey)
+                 where k.conrelid = 'screening_v2.ashby_application_links'::regclass
+                   and k.contype = 'f' and a.attname = 'identity_mismatch_attempt_id') then
+    v_bad := v_bad || ' identity_mismatch_attempt_id';
+  end if;
+
+  perform _policy_tests.assert(
+    '0130-1 intake_type defaults to resume_parsing and profile_attempts to 0; the CHECKs refuse an unknown intake, outcome or attempt count and accept the whole vocabulary; identity_mismatch_attempt_id is a NULL-default uuid with no foreign key; every new column cites ADR-0018',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-col');
+end;
+$$;
+
+-- ── 0130-2: apply, phone parsing. A link with no handle, a `queued`
+--    ingestion row, a strict number and an active consent template: the link
+--    is stamped, the NULL name and email are filled, the number is applied
+--    once (marker set, Ashby raw value kept), and ensure promotes the row in
+--    the same transaction. A second profile never overwrites anything, and
+--    admit then dials the row inside the window ──────────────────────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_link uuid; v_res jsonb; v_res2 jsonb;
+  v_l screening_v2.ashby_application_links%rowtype;
+  v_c screening_v2.candidates%rowtype;
+  v_e screening_v2.phone_engagements%rowtype;
+  v_bad text := ''; v_bad2 text := ''; v_bad3 text := '';
+begin
+  v_link := _policy_tests.p130_fixture('pol130-pp');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', '  Test Person  ', 'pol130-pp.ashby@example.invalid',
+    '+91 98123 45670', '+919812345670', null, v_t);
+  select * into v_l from screening_v2.ashby_application_links where id = v_link;
+  select * into v_c from screening_v2.candidates where id = v_l.candidate_id;
+  select * into v_e from screening_v2.phone_engagements where id = _policy_tests.p130_eng(v_link);
+  if coalesce(v_res->>'status', '') not in ('eligible', 'scheduled_next_window')
+     or (v_res->>'engagement_id')::uuid is distinct from v_e.id
+     or v_res->>'profile_outcome' is distinct from 'applied'
+     or (v_res->>'number_applied')::boolean is not true
+     or (v_res->>'identity_applied')::boolean is not true
+     or (v_res->>'intake_stamped')::boolean is not true
+     or (select array_agg(k order by k) from jsonb_object_keys(v_res) k)
+        is distinct from array['engagement_id','identity_applied','intake_stamped','next_eligible_at',
+                               'number_applied','profile_outcome','status']
+     or not _policy_tests.p130_codes_only(v_res) then
+    v_bad := v_bad || ' result=' || _policy_tests.p130_brief(v_res)
+             || ' codes_only=' || _policy_tests.p130_codes_only(v_res)::text;
+  end if;
+  if v_l.intake_type is distinct from 'phone_parsing'
+     or v_l.profile_outcome is distinct from 'applied'
+     or v_l.profile_checked_at is distinct from v_t then
+    v_bad := v_bad || ' link=' || coalesce(v_l.intake_type, '<null>') || '/' || coalesce(v_l.profile_outcome, '<null>');
+  end if;
+  if v_c.name is distinct from 'Test Person'
+     or v_c.email is distinct from 'pol130-pp.ashby@example.invalid'
+     or v_c.phone_e164 is distinct from '+919812345670' or v_c.phone_valid is not true
+     or v_c.phone_raw is distinct from '+91 98123 45670'
+     or v_c.ashby_phone_applied_at is distinct from v_t
+     or v_c.resume_id is not null or v_c.parsed is not null then
+    v_bad := v_bad || ' candidate_row';
+  end if;
+  if v_e.state is distinct from 'eligible' or v_e.state_reason is not null
+     or v_e.consent_record_id is null
+     or exists (select 1 from screening_v2.phone_call_attempts where engagement_id = v_e.id)
+     or (select state from screening_v2.ashby_resume_ingestions where application_link_id = v_link)
+        is distinct from 'queued' then
+    v_bad := v_bad || ' engagement=' || coalesce(v_e.state, '<null>') || '/' || coalesce(v_e.state_reason, '<null>');
+  end if;
+  perform _policy_tests.assert(
+    '0130-2 apply phone_parsing: a no-handle link with a queued ingestion is stamped, the NULL name and email are filled (trimmed), the strict number is applied once with its marker and Ashby raw value, and ensure promotes it with no attempt; the answer carries codes only',
+    v_bad = '', v_bad);
+
+  -- A second profile finds the engagement past its prerequisites and
+  -- returns before the candidate row is touched.
+  v_res2 := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Other Person', 'pol130-pp.other@example.invalid',
+    '+91 98123 45671', '+919812345671', null, v_t + interval '1 minute');
+  select * into v_c from screening_v2.candidates where id = v_l.candidate_id;
+  if v_res2->>'status' is distinct from 'engagement_active'
+     or (v_res2->>'engagement_id')::uuid is distinct from v_e.id
+     or v_res2->>'profile_outcome' is distinct from 'engagement_active'
+     or v_c.name is distinct from 'Test Person'
+     or v_c.email is distinct from 'pol130-pp.ashby@example.invalid'
+     or v_c.phone_e164 is distinct from '+919812345670'
+     or v_c.phone_raw is distinct from '+91 98123 45670'
+     or v_c.ashby_phone_applied_at is distinct from v_t
+     or (select version from screening_v2.phone_engagements where id = v_e.id) is distinct from v_e.version then
+    v_bad2 := v_bad2 || ' promoted=' || _policy_tests.p130_brief(v_res2);
+  end if;
+
+  v_res2 := screening_v2.admit_phone_attempt(v_e.id, 'initial', null, 60, v_t + interval '2 minutes');
+  if v_res2->>'status' is distinct from 'ok' then
+    v_bad3 := ' admit=' || coalesce(v_res2->>'status', '<null>');
+  end if;
+  perform _policy_tests.p130_teardown('pol130-pp');
+
+  -- The same while the engagement is still pending (no application time,
+  -- so ensure holds it at consent_evidence_missing): the second profile
+  -- reaches the candidate row and still overwrites nothing.
+  v_link := _policy_tests.p130_fixture('pol130-pq');
+  update screening_v2.ashby_application_links set submitted_at = null where id = v_link;
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-pq.ashby@example.invalid',
+    '+91 98123 45672', '+919812345672', null, v_t);
+  v_res2 := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Other Person', 'pol130-pq.other@example.invalid',
+    '+91 98123 45673', '+919812345673', null, v_t + interval '1 minute');
+  select c.* into v_c from screening_v2.candidates c
+    join screening_v2.ashby_application_links l on l.candidate_id = c.id
+   where l.id = v_link;
+  if v_res->>'status' is distinct from 'consent_evidence_missing'
+     or v_res->>'profile_outcome' is distinct from 'applied'
+     or v_res2->>'status' is distinct from 'consent_evidence_missing'
+     or v_res2->>'profile_outcome' is distinct from 'not_applicable'
+     or (v_res2->>'number_applied')::boolean is not false
+     or (v_res2->>'identity_applied')::boolean is not false
+     or (v_res2->>'intake_stamped')::boolean is not false
+     or v_c.name is distinct from 'Test Person'
+     or v_c.email is distinct from 'pol130-pq.ashby@example.invalid'
+     or v_c.phone_e164 is distinct from '+919812345672'
+     or v_c.phone_raw is distinct from '+91 98123 45672'
+     or v_c.ashby_phone_applied_at is distinct from v_t then
+    v_bad2 := v_bad2 || ' pending=' || _policy_tests.p130_brief(v_res) || '|' || _policy_tests.p130_brief(v_res2);
+  end if;
+  perform _policy_tests.assert(
+    '0130-2b a second profile never overwrites: on a promoted row it is engagement_active and writes nothing; on a pending row the name, email, number and marker stay (not_applicable, no flag set)',
+    v_bad2 = '', v_bad2);
+  perform _policy_tests.assert(
+    '0130-2c admit dials a promoted phone_parsing row inside the window (ok)',
+    v_bad3 = '', v_bad3);
+  perform _policy_tests.p130_teardown('pol130-pq');
+end;
+$$;
+
+-- ── 0130-3: apply refusals. A bound resume, a nameless application, a
+--    number another Ashby person holds, a DSAR hold, a terminal link, a
+--    mapping that is not an enabled phone_primary one, an engagement past its
+--    prerequisites, a missing candidate and a malformed request each answer
+--    their own status, and none stamps or writes what it must not ─────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_link uuid; v_link2 uuid; v_cand uuid; v_eng uuid; v_ver integer;
+  v_res jsonb; v_res2 jsonb; v_res3 jsonb; v_res4 jsonb;
+  v_c screening_v2.candidates%rowtype;
+  v_bad text := '';
+begin
+  -- A bound handle, or an ingestion that has left `queued`: the resume
+  -- pipeline owns the application.
+  v_link := _policy_tests.p130_fixture('pol130-rb', p_handle => true);
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-rb.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, v_t);
+  v_link2 := _policy_tests.p130_fixture('pol130-rf', p_ingestion => 'fetching');
+  v_res2 := screening_v2.apply_ashby_candidate_profile(
+    v_link2, 'phone_parsing', 'Test Person', 'pol130-rf.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, v_t);
+  if v_res->>'status' is distinct from 'resume_bound'
+     or v_res->>'profile_outcome' is distinct from 'resume_found'
+     or (v_res->>'intake_stamped')::boolean is not false
+     or v_res2->>'status' is distinct from 'resume_bound'
+     or v_res2->>'profile_outcome' is distinct from 'resume_found'
+     or exists (select 1 from screening_v2.ashby_application_links
+                 where id in (v_link, v_link2)
+                   and (intake_type <> 'resume_parsing' or profile_outcome is distinct from 'resume_found'))
+     or not _policy_tests.p130_untouched(v_link) or not _policy_tests.p130_untouched(v_link2)
+     or _policy_tests.p130_eng(v_link) is not null or _policy_tests.p130_eng(v_link2) is not null then
+    v_bad := ' handle=' || _policy_tests.p130_brief(v_res) || ' fetching=' || _policy_tests.p130_brief(v_res2);
+  end if;
+  perform _policy_tests.assert(
+    '0130-3a apply refuses phone_parsing behind a bound resume (a handle, or an ingestion past queued): resume_bound/resume_found, no stamp, nothing written, no engagement',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-rb');
+  perform _policy_tests.p130_teardown('pol130-rf');
+
+  -- No usable name: no number, because the identity check could not catch
+  -- the wrong person. The raw value stays for HR's verify flow.
+  v_bad := '';
+  v_link := _policy_tests.p130_fixture('pol130-nm');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', null, 'pol130-nm.ashby@example.invalid',
+    '+91 98123 45674', '+919812345674', null, v_t);
+  select c.* into v_c from screening_v2.candidates c
+    join screening_v2.ashby_application_links l on l.candidate_id = c.id
+   where l.id = v_link;
+  if v_res->>'status' is distinct from 'phone_invalid'
+     or v_res->>'profile_outcome' is distinct from 'name_missing'
+     or (v_res->>'number_applied')::boolean is not false
+     or (v_res->>'intake_stamped')::boolean is not true
+     or v_c.name is not null or v_c.phone_e164 is not null or v_c.phone_valid
+     or v_c.phone_raw is distinct from '+91 98123 45674'
+     or v_c.ashby_phone_applied_at is not null
+     or (select state || '/' || coalesce(state_reason, '') from screening_v2.phone_engagements
+          where id = _policy_tests.p130_eng(v_link)) is distinct from 'pending_prereqs/phone_invalid' then
+    v_bad := ' ' || _policy_tests.p130_brief(v_res);
+  end if;
+  perform _policy_tests.assert(
+    '0130-3b apply with no usable name applies no number (name_missing): the raw value is kept for HR, the link is stamped, and the engagement waits at phone_invalid',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-nm');
+
+  -- A DIFFERENT Ashby person already holds the number as valid; then the
+  -- SAME Ashby person (another application, same external candidate id).
+  v_bad := '';
+  v_link := _policy_tests.p130_fixture('pol130-sa', p_phone => '+919812345675', p_ext => 'pol130-ext-sa');
+  v_link2 := _policy_tests.p130_fixture('pol130-sb', p_ext => 'pol130-ext-sb');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link2, 'phone_parsing', 'Test Person', 'pol130-sb.ashby@example.invalid',
+    '+91 98123 45675', '+919812345675', null, v_t);
+  select c.* into v_c from screening_v2.candidates c
+    join screening_v2.ashby_application_links l on l.candidate_id = c.id
+   where l.id = v_link2;
+  if v_res->>'status' is distinct from 'phone_invalid'
+     or v_res->>'profile_outcome' is distinct from 'number_shared'
+     or (v_res->>'number_applied')::boolean is not false
+     or v_c.phone_e164 is not null or v_c.phone_valid or v_c.ashby_phone_applied_at is not null
+     or v_c.phone_raw is distinct from '+91 98123 45675'
+     or (select c.phone_valid from screening_v2.candidates c
+           join screening_v2.ashby_application_links l on l.candidate_id = c.id
+          where l.id = v_link) is not true then
+    v_bad := v_bad || ' other_person=' || _policy_tests.p130_brief(v_res);
+  end if;
+  v_link := _policy_tests.p130_fixture('pol130-xa', p_phone => '+919812345676', p_ext => 'pol130-ext-x');
+  v_link2 := _policy_tests.p130_fixture('pol130-xb', p_ext => 'pol130-ext-x');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link2, 'phone_parsing', 'Test Person', 'pol130-xb.ashby@example.invalid',
+    '+91 98123 45676', '+919812345676', null, v_t);
+  if coalesce(v_res->>'status', '') not in ('eligible', 'scheduled_next_window')
+     or v_res->>'profile_outcome' is distinct from 'applied'
+     or (v_res->>'number_applied')::boolean is not true then
+    v_bad := v_bad || ' same_person=' || _policy_tests.p130_brief(v_res);
+  end if;
+  perform _policy_tests.assert(
+    '0130-3c a number another Ashby person holds as valid is refused (number_shared, raw kept, phone_invalid); the same Ashby person (same external candidate id) holding it gets it applied',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-sb');
+  perform _policy_tests.p130_teardown('pol130-sa');
+  perform _policy_tests.p130_teardown('pol130-xb');
+  perform _policy_tests.p130_teardown('pol130-xa');
+
+  v_bad := '';
+  -- A restriction request (0012) holds every write.
+  v_link := _policy_tests.p130_fixture('pol130-ds');
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, request_status, requested_by)
+  select candidate_id, 'restrict', 'pending', '00000000-0000-4000-8000-0000000000ad'
+    from screening_v2.ashby_application_links where id = v_link;
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-ds.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, v_t);
+  if v_res->>'status' is distinct from 'subject_request_hold'
+     or v_res->>'profile_outcome' is distinct from 'subject_request_hold'
+     or not _policy_tests.p130_untouched(v_link) or _policy_tests.p130_eng(v_link) is not null
+     or (select intake_type from screening_v2.ashby_application_links where id = v_link)
+        is distinct from 'resume_parsing' then
+    v_bad := v_bad || ' dsar=' || _policy_tests.p130_brief(v_res);
+  end if;
+
+  -- A withdrawn application, then a cancelled one.
+  v_link := _policy_tests.p130_fixture('pol130-tl');
+  update screening_v2.ashby_application_links set terminal_state = 'withdrawn' where id = v_link;
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-tl.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, v_t);
+  update screening_v2.ashby_application_links
+     set terminal_state = null, lifecycle = 'cancelled' where id = v_link;
+  v_res2 := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-tl.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, v_t);
+  if v_res->>'status' is distinct from 'application_terminal'
+     or v_res->>'profile_outcome' is distinct from 'application_terminal'
+     or v_res2->>'status' is distinct from 'application_terminal'
+     or not _policy_tests.p130_untouched(v_link) or _policy_tests.p130_eng(v_link) is not null
+     or (select intake_type from screening_v2.ashby_application_links where id = v_link)
+        is distinct from 'resume_parsing' then
+    v_bad := v_bad || ' terminal=' || _policy_tests.p130_brief(v_res) || '|' || _policy_tests.p130_brief(v_res2);
+  end if;
+
+  -- A paused mapping, then an enabled browser_primary one.
+  v_link := _policy_tests.p130_fixture('pol130-mp');
+  update screening_v2.ashby_job_mappings set status = 'paused' where external_job_id = 'pol130-mp-job';
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-mp.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, v_t);
+  update screening_v2.ashby_job_mappings
+     set status = 'enabled', screening_mode = 'browser_primary' where external_job_id = 'pol130-mp-job';
+  v_res2 := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-mp.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, v_t);
+  if v_res->>'status' is distinct from 'mapping_not_enabled'
+     or v_res->>'profile_outcome' is distinct from 'mapping_inactive'
+     or v_res2->>'status' is distinct from 'mapping_not_enabled'
+     or v_res2->>'profile_outcome' is distinct from 'mapping_inactive'
+     or not _policy_tests.p130_untouched(v_link) or _policy_tests.p130_eng(v_link) is not null
+     or (select intake_type from screening_v2.ashby_application_links where id = v_link)
+        is distinct from 'resume_parsing' then
+    v_bad := v_bad || ' mapping=' || _policy_tests.p130_brief(v_res) || '|' || _policy_tests.p130_brief(v_res2);
+  end if;
+
+  -- An engagement already past its prerequisites is left exactly as it is.
+  v_link := _policy_tests.p130_fixture('pol130-ea', p_state => 'eligible');
+  v_eng := _policy_tests.p130_eng(v_link);
+  select version into v_ver from screening_v2.phone_engagements where id = v_eng;
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-ea.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, v_t);
+  if v_res->>'status' is distinct from 'engagement_active'
+     or (v_res->>'engagement_id')::uuid is distinct from v_eng
+     or v_res->>'profile_outcome' is distinct from 'engagement_active'
+     or not _policy_tests.p130_untouched(v_link)
+     or (select intake_type from screening_v2.ashby_application_links where id = v_link)
+        is distinct from 'resume_parsing'
+     or (select state || '/' || version from screening_v2.phone_engagements where id = v_eng)
+        is distinct from 'eligible/' || v_ver then
+    v_bad := v_bad || ' engagement=' || _policy_tests.p130_brief(v_res);
+  end if;
+
+  -- No candidate row bound to the link yet.
+  v_link := _policy_tests.p130_fixture('pol130-cm');
+  select candidate_id into v_cand from screening_v2.ashby_application_links where id = v_link;
+  update screening_v2.ashby_application_links set candidate_id = null where id = v_link;
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-cm.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, v_t);
+  -- Re-bound so the teardown finds the candidate.
+  update screening_v2.ashby_application_links set candidate_id = v_cand where id = v_link;
+  if v_res->>'status' is distinct from 'candidate_missing'
+     or v_res->>'profile_outcome' is distinct from 'candidate_missing'
+     or not _policy_tests.p130_untouched(v_link) or _policy_tests.p130_eng(v_link) is not null then
+    v_bad := v_bad || ' candidate=' || _policy_tests.p130_brief(v_res);
+  end if;
+  perform _policy_tests.assert(
+    '0130-3d apply refuses, records the outcome and writes nothing else: DSAR hold (subject_request_hold), withdrawn or cancelled application (application_terminal), paused or browser_primary mapping (mapping_not_enabled/mapping_inactive), engagement past prerequisites (engagement_active, row unchanged), no candidate (candidate_missing)',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-ds');
+  perform _policy_tests.p130_teardown('pol130-tl');
+  perform _policy_tests.p130_teardown('pol130-mp');
+  perform _policy_tests.p130_teardown('pol130-ea');
+  perform _policy_tests.p130_teardown('pol130-cm');
+
+  -- A malformed request is refused before any lock and records nothing.
+  v_bad := '';
+  v_link := _policy_tests.p130_fixture('pol130-iv');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-iv.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', 'number_shared', v_t);
+  v_res2 := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'manual_entry', 'Test Person', 'pol130-iv.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, v_t);
+  v_res3 := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-iv.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, null::timestamptz);
+  v_res4 := screening_v2.apply_ashby_candidate_profile(
+    gen_random_uuid(), 'phone_parsing', 'Test Person', 'pol130-iv.ashby@example.invalid',
+    '+91 98123 45677', '+919812345677', null, v_t);
+  if v_res is distinct from '{"status":"invalid_request"}'::jsonb
+     or v_res2 is distinct from '{"status":"invalid_request"}'::jsonb
+     or v_res3 is distinct from '{"status":"invalid_request"}'::jsonb
+     or v_res4 is distinct from '{"status":"application_not_found"}'::jsonb
+     or (select profile_outcome is not null or profile_checked_at is not null
+           from screening_v2.ashby_application_links where id = v_link)
+     or not _policy_tests.p130_untouched(v_link) or _policy_tests.p130_eng(v_link) is not null then
+    v_bad := ' ' || coalesce(v_res->>'status', '<null>') || '/' || coalesce(v_res2->>'status', '<null>')
+             || '/' || coalesce(v_res3->>'status', '<null>') || '/' || coalesce(v_res4->>'status', '<null>');
+  end if;
+  perform _policy_tests.assert(
+    '0130-3e apply answers invalid_request for an unknown skip reason, an unknown intake or no p_now, and application_not_found for an unknown link, recording nothing',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-iv');
+end;
+$$;
+
+-- ── 0130-4: apply, resume parsing (D3). A ready resume row the parse left
+--    without a dialable number gets the Ashby number once and is promoted;
+--    its parsed name and email and its intake stay. Once that number is
+--    cleared it is never applied again, and a row whose ingestion is not
+--    ready, or whose candidate has no resume, is not_applicable ───────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_link uuid; v_link2 uuid; v_cand uuid; v_pre jsonb; v_res jsonb; v_res2 jsonb;
+  v_c screening_v2.candidates%rowtype;
+  v_bad text := ''; v_bad2 text := ''; v_bad3 text := '';
+begin
+  v_link := _policy_tests.p130_fixture('pol130-d3', p_handle => true, p_ingestion => 'ready',
+                                       p_resume => true);
+  select candidate_id into v_cand from screening_v2.ashby_application_links where id = v_link;
+  update screening_v2.candidates set phone_raw = 'see resume' where id = v_cand;
+  v_pre := screening_v2.ensure_ashby_phone_engagement(v_link, v_t - interval '1 hour');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'resume_parsing', 'Other Person', 'pol130-d3.other@example.invalid',
+    '+91 98123 45678', '+919812345678', null, v_t);
+  select * into v_c from screening_v2.candidates where id = v_cand;
+  if v_pre->>'status' is distinct from 'phone_invalid'
+     or coalesce(v_res->>'status', '') not in ('eligible', 'scheduled_next_window')
+     or v_res->>'profile_outcome' is distinct from 'applied'
+     or (v_res->>'number_applied')::boolean is not true
+     or (v_res->>'identity_applied')::boolean is not false
+     or (v_res->>'intake_stamped')::boolean is not false
+     or not _policy_tests.p130_codes_only(v_res)
+     or v_c.phone_e164 is distinct from '+919812345678' or v_c.phone_valid is not true
+     or v_c.phone_raw is distinct from '+91 98123 45678'
+     or v_c.ashby_phone_applied_at is distinct from v_t
+     or v_c.name is distinct from 'Test Person pol130-d3'
+     or v_c.email is distinct from 'pol130-d3@example.invalid'
+     or (select intake_type from screening_v2.ashby_application_links where id = v_link)
+        is distinct from 'resume_parsing'
+     or (select state from screening_v2.phone_engagements where id = _policy_tests.p130_eng(v_link))
+        is distinct from 'eligible' then
+    v_bad := ' pre=' || coalesce(v_pre->>'status', '<null>') || ' apply=' || _policy_tests.p130_brief(v_res)
+             || ' codes_only=' || _policy_tests.p130_codes_only(v_res)::text;
+  end if;
+  perform _policy_tests.assert(
+    '0130-4a apply resume_parsing (D3): a ready resume row at phone_invalid gets the Ashby number (marker set, raw value replaced), keeps its parsed name and email, stays resume_parsing and is promoted; the answer carries no name, email or number',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-d3');
+
+  -- No application time, so ensure holds the row at consent_evidence_missing
+  -- and the profile can run again. The number is then cleared (the shape the
+  -- identity-mismatch release leaves): the marker keeps it from returning.
+  v_link := _policy_tests.p130_fixture('pol130-d3c', p_handle => true, p_ingestion => 'ready',
+                                       p_resume => true);
+  select candidate_id into v_cand from screening_v2.ashby_application_links where id = v_link;
+  update screening_v2.ashby_application_links set submitted_at = null where id = v_link;
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'resume_parsing', null, null, '+91 98123 45679', '+919812345679', null, v_t);
+  update screening_v2.candidates set phone_e164 = null, phone_valid = false where id = v_cand;
+  v_res2 := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'resume_parsing', null, null, '+91 98123 45680', '+919812345680', null,
+    v_t + interval '1 day');
+  select * into v_c from screening_v2.candidates where id = v_cand;
+  if v_res->>'profile_outcome' is distinct from 'applied'
+     or v_res2->>'status' is distinct from 'phone_invalid'
+     or v_res2->>'profile_outcome' is distinct from 'not_applicable'
+     or (v_res2->>'number_applied')::boolean is not false
+     or v_c.phone_e164 is not null or v_c.phone_valid
+     or v_c.ashby_phone_applied_at is distinct from v_t
+     or v_c.phone_raw is distinct from '+91 98123 45679' then
+    v_bad2 := ' ' || _policy_tests.p130_brief(v_res) || '|' || _policy_tests.p130_brief(v_res2);
+  end if;
+  perform _policy_tests.assert(
+    '0130-4b once an applied Ashby number is cleared the marker keeps it from being applied again (not_applicable, phone_invalid)',
+    v_bad2 = '', v_bad2);
+  perform _policy_tests.p130_teardown('pol130-d3c');
+
+  -- An ingestion still in flight, and a ready link whose candidate has no
+  -- resume row.
+  v_link := _policy_tests.p130_fixture('pol130-d3n', p_handle => true, p_ingestion => 'structuring',
+                                       p_resume => true);
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'resume_parsing', null, null, '+91 98123 45681', '+919812345681', null, v_t);
+  v_link2 := _policy_tests.p130_fixture('pol130-d3r', p_handle => true, p_ingestion => 'ready');
+  v_res2 := screening_v2.apply_ashby_candidate_profile(
+    v_link2, 'resume_parsing', null, null, '+91 98123 45681', '+919812345681', null, v_t);
+  if v_res->>'status' is distinct from 'not_applicable'
+     or v_res->>'profile_outcome' is distinct from 'not_applicable'
+     or (v_res->>'number_applied')::boolean is not false
+     or v_res2->>'status' is distinct from 'not_applicable'
+     or v_res2->>'profile_outcome' is distinct from 'not_applicable'
+     or exists (select 1 from screening_v2.candidates c
+                  join screening_v2.ashby_application_links l on l.candidate_id = c.id
+                 where l.id in (v_link, v_link2)
+                   and (c.phone_e164 is not null or c.phone_valid or c.ashby_phone_applied_at is not null))
+     or _policy_tests.p130_eng(v_link) is not null or _policy_tests.p130_eng(v_link2) is not null then
+    v_bad3 := ' ' || _policy_tests.p130_brief(v_res) || '|' || _policy_tests.p130_brief(v_res2);
+  end if;
+  perform _policy_tests.assert(
+    '0130-4c apply resume_parsing is not_applicable, writing nothing, while the ingestion is not ready or when the candidate has no resume',
+    v_bad3 = '', v_bad3);
+  perform _policy_tests.p130_teardown('pol130-d3n');
+  perform _policy_tests.p130_teardown('pol130-d3r');
+end;
+$$;
+
+-- ── 0130-5: the consent proof basis (M017-c). A phone_parsing link mints its
+--    record with basis ashby_ai_stage_application and intake_type
+--    phone_parsing; a resume_parsing link keeps ashby_application_submission
+--    and gains no intake_type. source stays job_application for both ──────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_link uuid; v_cand uuid; v_res jsonb; v_proof jsonb; v_src text; v_rec uuid; v_n integer;
+  v_bad text := '';
+begin
+  v_link := _policy_tests.p130_fixture('pol130-cp');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-cp.ashby@example.invalid',
+    '+91 98123 45682', '+919812345682', null, v_t);
+  select candidate_id into v_cand from screening_v2.ashby_application_links where id = v_link;
+  select count(*) into v_n from screening_v2.consent_records where candidate_id = v_cand;
+  select id, proof, source into v_rec, v_proof, v_src
+    from screening_v2.consent_records where candidate_id = v_cand
+   order by created_at desc, id desc limit 1;
+  if coalesce(v_res->>'status', '') not in ('eligible', 'scheduled_next_window') or v_n <> 1
+     or v_proof->>'basis' is distinct from 'ashby_ai_stage_application'
+     or v_proof->>'intake_type' is distinct from 'phone_parsing'
+     or v_proof->>'application_link_id' is distinct from v_link::text
+     or v_src is distinct from 'job_application'
+     or (select consent_source from screening_v2.candidates where id = v_cand) is distinct from 'job_application'
+     or (select consent_record_id from screening_v2.phone_engagements
+          where id = _policy_tests.p130_eng(v_link)) is distinct from v_rec then
+    v_bad := v_bad || ' phone_parsing=' || coalesce(v_res->>'status', '<null>') || ' records=' || v_n
+             || ' basis=' || coalesce(v_proof->>'basis', '<null>') || '/' || coalesce(v_proof->>'intake_type', '<null>');
+  end if;
+  perform _policy_tests.p130_teardown('pol130-cp');
+
+  v_link := _policy_tests.p130_fixture('pol130-cr', p_handle => true, p_ingestion => 'ready',
+                                       p_phone => '+919812345683', p_resume => true);
+  v_res := screening_v2.ensure_ashby_phone_engagement(v_link, v_t);
+  select candidate_id into v_cand from screening_v2.ashby_application_links where id = v_link;
+  select proof, source into v_proof, v_src
+    from screening_v2.consent_records where candidate_id = v_cand
+   order by created_at desc, id desc limit 1;
+  if coalesce(v_res->>'status', '') not in ('eligible', 'scheduled_next_window')
+     or v_proof->>'basis' is distinct from 'ashby_application_submission'
+     or (v_proof ? 'intake_type') is not false
+     or v_src is distinct from 'job_application' then
+    v_bad := v_bad || ' resume_parsing=' || coalesce(v_res->>'status', '<null>')
+             || ' basis=' || coalesce(v_proof->>'basis', '<null>');
+  end if;
+  perform _policy_tests.assert(
+    '0130-5 consent proof basis: phone_parsing mints ashby_ai_stage_application with intake_type phone_parsing (bound to the engagement); resume_parsing keeps ashby_application_submission with no intake_type; source stays job_application',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-cr');
+end;
+$$;
+
+-- ── 0130-6: the same-role duplicate hold spans the intakes. A phone_parsing
+--    application from the same Ashby person, on the number of a resume row
+--    already being screened, is held; so is a resume row on the number of a
+--    phone_parsing row already being screened. Neither mints consent ──────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_x uuid; v_y uuid; v_p uuid; v_q uuid; v_cand uuid; v_res jsonb; v_res2 jsonb;
+  v_bad text := '';
+begin
+  v_x := _policy_tests.p130_fixture('pol130-hx', p_handle => true, p_ingestion => 'ready',
+                                    p_phone => '+919812345684', p_resume => true,
+                                    p_consent => 'full', p_state => 'eligible',
+                                    p_ext => 'pol130-ext-h');
+  v_y := _policy_tests.p130_fixture('pol130-hy', p_ext => 'pol130-ext-h');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_y, 'phone_parsing', 'Test Person', 'pol130-hy.ashby@example.invalid',
+    '+91 98123 45684', '+919812345684', null, v_t);
+  select candidate_id into v_cand from screening_v2.ashby_application_links where id = v_y;
+  if v_res->>'status' is distinct from 'duplicate_application'
+     or v_res->>'profile_outcome' is distinct from 'applied'
+     or (select state || '/' || coalesce(state_reason, '') from screening_v2.phone_engagements
+          where id = _policy_tests.p130_eng(v_y)) is distinct from 'pending_prereqs/duplicate_application'
+     or exists (select 1 from screening_v2.consent_records where candidate_id = v_cand) then
+    v_bad := v_bad || ' phone_after_resume=' || _policy_tests.p130_brief(v_res);
+  end if;
+
+  v_p := _policy_tests.p130_fixture('pol130-hp');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_p, 'phone_parsing', 'Test Person', 'pol130-hp.ashby@example.invalid',
+    '+91 98123 45685', '+919812345685', null, v_t);
+  v_q := _policy_tests.p130_fixture('pol130-hq', p_handle => true, p_ingestion => 'ready',
+                                    p_phone => '+919812345685', p_resume => true);
+  v_res2 := screening_v2.ensure_ashby_phone_engagement(v_q, v_t + interval '1 minute');
+  select candidate_id into v_cand from screening_v2.ashby_application_links where id = v_q;
+  if coalesce(v_res->>'status', '') not in ('eligible', 'scheduled_next_window')
+     or v_res2->>'status' is distinct from 'duplicate_application'
+     or (select state || '/' || coalesce(state_reason, '') from screening_v2.phone_engagements
+          where id = _policy_tests.p130_eng(v_q)) is distinct from 'pending_prereqs/duplicate_application'
+     or exists (select 1 from screening_v2.consent_records where candidate_id = v_cand) then
+    v_bad := v_bad || ' resume_after_phone=' || _policy_tests.p130_brief(v_res)
+             || '|' || coalesce(v_res2->>'status', '<null>');
+  end if;
+  perform _policy_tests.assert(
+    '0130-6 the same-role duplicate hold spans the intakes: a phone_parsing row on the number of a resume row being screened is held (number applied, no consent), and so is a resume row on the number of a phone_parsing row being screened',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-hy');
+  perform _policy_tests.p130_teardown('pol130-hx');
+  perform _policy_tests.p130_teardown('pol130-hq');
+  perform _policy_tests.p130_teardown('pol130-hp');
+end;
+$$;
+
+-- ── 0130-7: claim_ashby_profile_due. Arm A (D3) and arm B (no resume) are
+--    claimed; everything the claim must skip is skipped; each claim counts
+--    one attempt and stamps the time in the same statement; the backoff
+--    (p_retry_seconds * 2^(attempts - 1)), the attempt ceiling and the limit
+--    hold. Fixtures are three hours old, so they sort ahead of anything
+--    created in this run ─────────────────────────────────────────────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_ka uuid; v_kb uuid; v_kc uuid; v_ke uuid; v_ky uuid; v_kn uuid; v_kv uuid;
+  v_km uuid; v_kd uuid; v_kg uuid; v_kx uuid; v_kk uuid; v_kp uuid; v_kt uuid;
+  v_ids  uuid[];
+  v_tags text[] := array['pol130-ka','pol130-kb','pol130-kc','pol130-ke',
+                         'pol130-ky','pol130-kn','pol130-kv','pol130-km','pol130-kd',
+                         'pol130-kg','pol130-kx','pol130-kk','pol130-kp','pol130-kt'];
+  v_due  boolean[] := array[true, true, true, true,
+                            false, false, false, false, false,
+                            false, false, false, false, false];
+  v_got uuid[]; v_i integer; v_n integer; v_s text;
+  v_bad text := ''; v_bad2 text := ''; v_bad3 text := '';
+begin
+  -- Arm A (D3): a ready resume link whose engagement has waited at
+  -- phone_invalid for an hour, never checked, its marker NULL (critique
+  -- M1); and the same, waiting only five minutes.
+  v_ka := _policy_tests.p130_fixture('pol130-ka', p_handle => true, p_ingestion => 'ready',
+                                     p_resume => true, p_state => 'pending_prereqs');
+  update screening_v2.phone_engagements
+     set state_reason = 'phone_invalid', updated_at = v_t - interval '1 hour'
+   where application_link_id = v_ka;
+  v_ky := _policy_tests.p130_fixture('pol130-ky', p_handle => true, p_ingestion => 'ready',
+                                     p_resume => true, p_state => 'pending_prereqs');
+  update screening_v2.phone_engagements
+     set state_reason = 'phone_invalid', updated_at = v_t - interval '5 minutes'
+   where application_link_id = v_ky;
+  -- Arm B (no resume): no handle and three hours old, with no engagement or
+  -- only a live pending_prereqs one; and the same, five minutes old. An
+  -- export request is not a hold.
+  v_kb := _policy_tests.p130_fixture('pol130-kb');
+  v_kc := _policy_tests.p130_fixture('pol130-kc', p_state => 'pending_prereqs');
+  v_kn := _policy_tests.p130_fixture('pol130-kn');
+  update screening_v2.ashby_application_links set created_at = v_t - interval '5 minutes' where id = v_kn;
+  v_ke := _policy_tests.p130_fixture('pol130-ke');
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, request_status, requested_by)
+  select candidate_id, 'export', 'pending', '00000000-0000-4000-8000-0000000000ad'
+    from screening_v2.ashby_application_links where id = v_ke;
+  -- Never due: a valid number, an applied marker, a correction in progress,
+  -- an engagement past its prerequisites, the attempt ceiling (4 claims),
+  -- a backoff still running (2 claims = 12 h, checked 7 h ago), a paused
+  -- mapping and a withdrawn application.
+  v_kv := _policy_tests.p130_fixture('pol130-kv', p_phone => '+919812345686');
+  v_km := _policy_tests.p130_fixture('pol130-km');
+  update screening_v2.candidates set ashby_phone_applied_at = v_t - interval '1 day'
+   where id = (select candidate_id from screening_v2.ashby_application_links where id = v_km);
+  v_kd := _policy_tests.p130_fixture('pol130-kd');
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, request_status, requested_by)
+  select candidate_id, 'correct', 'in_progress', '00000000-0000-4000-8000-0000000000ad'
+    from screening_v2.ashby_application_links where id = v_kd;
+  v_kg := _policy_tests.p130_fixture('pol130-kg', p_state => 'eligible');
+  v_kx := _policy_tests.p130_fixture('pol130-kx');
+  update screening_v2.ashby_application_links
+     set profile_attempts = 4, profile_checked_at = v_t - interval '30 days' where id = v_kx;
+  v_kk := _policy_tests.p130_fixture('pol130-kk');
+  update screening_v2.ashby_application_links
+     set profile_attempts = 2, profile_checked_at = v_t - interval '7 hours' where id = v_kk;
+  v_kp := _policy_tests.p130_fixture('pol130-kp');
+  update screening_v2.ashby_job_mappings set status = 'paused' where external_job_id = 'pol130-kp-job';
+  v_kt := _policy_tests.p130_fixture('pol130-kt');
+  update screening_v2.ashby_application_links set terminal_state = 'withdrawn' where id = v_kt;
+  v_ids := array[v_ka, v_kb, v_kc, v_ke, v_ky, v_kn, v_kv, v_km, v_kd, v_kg, v_kx, v_kk, v_kp, v_kt];
+
+  select coalesce(array_agg(c.application_link_id), '{}') into v_got
+    from screening_v2.claim_ashby_profile_due(50, 900, 21600, 4, v_t) c;
+  for v_i in 1..array_length(v_ids, 1) loop
+    if (v_ids[v_i] = any (v_got)) is distinct from v_due[v_i] then
+      v_bad := v_bad || ' ' || v_tags[v_i] || '='
+               || case when v_due[v_i] then 'missed' else 'claimed' end;
+    end if;
+  end loop;
+  if exists (select 1 from screening_v2.ashby_application_links
+              where id = any (array[v_ka, v_kb, v_kc, v_ke])
+                and (profile_attempts <> 1 or profile_checked_at is distinct from v_t))
+     or exists (select 1 from screening_v2.ashby_application_links
+                 where id = any (array[v_ky, v_kn, v_kv, v_km, v_kd, v_kg, v_kp, v_kt])
+                   and (profile_attempts <> 0 or profile_checked_at is not null))
+     or (select profile_attempts from screening_v2.ashby_application_links where id = v_kx) is distinct from 4
+     or (select profile_attempts from screening_v2.ashby_application_links where id = v_kk) is distinct from 2 then
+    v_bad := v_bad || ' counts';
+  end if;
+  perform _policy_tests.assert(
+    '0130-7a claim: arm A (D3, marker NULL, never checked) and arm B (no handle; no engagement or a live pending one; an export request) are claimed; too young, a valid number, the marker, a DSAR hold, a started engagement, the attempt ceiling, a running backoff, a paused mapping and a withdrawn application are not; a claim counts one attempt and stamps p_now',
+    v_bad = '', v_bad);
+
+  -- Claimed a moment ago, so nothing of ours is due again at once. Five
+  -- hours on the two-claim backoff (12 h) has run out and the one-claim
+  -- rows (6 h) have not; the attempt ceiling still holds.
+  select coalesce(array_agg(c.application_link_id), '{}') into v_got
+    from screening_v2.claim_ashby_profile_due(50, 900, 21600, 4, v_t) c;
+  if v_got && v_ids then
+    v_bad2 := v_bad2 || ' reclaimed_at_once';
+  end if;
+  select coalesce(array_agg(c.application_link_id), '{}') into v_got
+    from screening_v2.claim_ashby_profile_due(50, 900, 21600, 4, v_t + interval '5 hours') c;
+  if not (v_kk = any (v_got)) or v_got && array[v_ka, v_kb, v_kc, v_ke, v_kx]
+     or (select profile_attempts from screening_v2.ashby_application_links where id = v_kk) is distinct from 3 then
+    v_bad2 := v_bad2 || ' backoff';
+  end if;
+  perform _policy_tests.assert(
+    '0130-7b claim: a claimed row is not due again until p_retry_seconds * 2^(attempts - 1) has passed, the attempt ceiling holds, and attempts increment',
+    v_bad2 = '', v_bad2);
+
+  -- Seven hours on, the one-claim rows are due again: one row per claim at
+  -- p_limit 1, and a p_limit below 1 still claims exactly one.
+  select count(*) into v_n
+    from screening_v2.claim_ashby_profile_due(1, 900, 21600, 4, v_t + interval '7 hours');
+  if v_n <> 1 then v_bad3 := v_bad3 || ' limit1=' || v_n; end if;
+  select count(*) into v_n
+    from screening_v2.claim_ashby_profile_due(0, 900, 21600, 4, v_t + interval '7 hours');
+  if v_n <> 1 then v_bad3 := v_bad3 || ' limit0=' || v_n; end if;
+  if pg_get_function_result(
+       'screening_v2.claim_ashby_profile_due(integer,integer,integer,integer,timestamptz)'::regprocedure)
+     is distinct from 'TABLE(application_link_id uuid)' then
+    v_bad3 := v_bad3 || ' result_shape'; end if;
+  perform _policy_tests.assert(
+    '0130-7c claim: the limit holds (p_limit 1 claims one; p_limit 0 is raised to one) and the claim returns link ids only',
+    v_bad3 = '', v_bad3);
+
+  foreach v_s in array v_tags loop
+    perform _policy_tests.p130_teardown(v_s);
+  end loop;
+end;
+$$;
+
+-- ── 0130-8: release_ashby_number_after_identity_mismatch (B2: one more
+--    try). The FIRST confirmed wrong person on an Ashby-applied number
+--    nobody verified is only recorded on the link (first_mismatch_retry):
+--    the number, the engagement and the link outcome stay, so the
+--    engagement is redialled on the next IST day. The SECOND, on a later
+--    attempt of the same engagement, clears the number (raw value and
+--    marker kept), cancels the engagement identity_unconfirmed and records
+--    it on the link. A replay of either, a mismatch recorded on another
+--    engagement or before the number was applied, an HR-verified number and
+--    a resume number each answer as the rule says ──────────────────────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_link uuid; v_eng uuid; v_att uuid; v_att2 uuid; v_ver integer;
+  v_res jsonb; v_res2 jsonb; v_res3 jsonb; v_res4 jsonb; v_pre text; v_pre2 text;
+  v_l screening_v2.ashby_application_links%rowtype;
+  v_c screening_v2.candidates%rowtype;
+  v_e screening_v2.phone_engagements%rowtype;
+  v_bad text := ''; v_bad2 text := ''; v_bad3 text := '';
+begin
+  -- 0130-8a: the first mismatch, then the second.
+  -- (0130-8c, the stale record, and 0130-8b, the refusals, follow.)
+  v_link := _policy_tests.p130_fixture('pol130-rl');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-rl.ashby@example.invalid',
+    '+91 98123 45687', '+919812345687', null, v_t);
+  v_eng := (v_res->>'engagement_id')::uuid;
+
+  -- The first mismatch, then its replay: recorded once, nothing else moves.
+  v_att := _policy_tests.p130_deferred(v_eng, v_t + interval '1 minute');
+  select state || '/' || coalesce(state_reason, ''), version into v_pre, v_ver
+    from screening_v2.phone_engagements where id = v_eng;
+  v_res := screening_v2.release_ashby_number_after_identity_mismatch(v_att, v_t + interval '3 minutes');
+  v_res2 := screening_v2.release_ashby_number_after_identity_mismatch(v_att, v_t + interval '4 minutes');
+  select * into v_e from screening_v2.phone_engagements where id = v_eng;
+  select * into v_l from screening_v2.ashby_application_links where id = v_link;
+  select * into v_c from screening_v2.candidates where id = v_l.candidate_id;
+  if v_pre is distinct from 'eligible/abandoned_pre_disclosure'
+     or v_res is distinct from '{"status":"first_mismatch_retry"}'::jsonb
+     or v_res2 is distinct from '{"status":"first_mismatch_retry"}'::jsonb
+     or v_l.identity_mismatch_attempt_id is distinct from v_att
+     or v_l.profile_outcome is distinct from 'applied'
+     or v_l.profile_checked_at is distinct from v_t
+     or v_e.state is distinct from 'eligible'
+     or v_e.state_reason is distinct from 'abandoned_pre_disclosure'
+     or v_e.terminal_at is not null or v_e.version is distinct from v_ver
+     or v_c.phone_e164 is distinct from '+919812345687' or v_c.phone_valid is not true
+     or v_c.ashby_phone_applied_at is distinct from v_t then
+    v_bad := v_bad || ' first: pre=' || coalesce(v_pre, '<null>')
+             || ' release=' || coalesce(v_res->>'status', '<null>')
+             || ' replay=' || coalesce(v_res2->>'status', '<null>')
+             || ' engagement=' || coalesce(v_e.state, '<null>') || '/' || coalesce(v_e.state_reason, '<null>');
+  end if;
+
+  -- The deferral moved the engagement to the next IST day: a redial today is
+  -- refused, and the next morning admits it.
+  v_res3 := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t + interval '5 minutes');
+  if v_res3->>'status' is distinct from 'not_yet_eligible' then
+    v_bad := v_bad || ' same_day=' || coalesce(v_res3->>'status', '<null>');
+  end if;
+
+  -- The second mismatch, on the next day's attempt: the first one is no
+  -- longer the latest, and the second releases.
+  v_att2 := _policy_tests.p130_deferred(v_eng, v_t + interval '1 day');
+  select state || '/' || coalesce(state_reason, '') into v_pre2
+    from screening_v2.phone_engagements where id = v_eng;
+  v_res3 := screening_v2.release_ashby_number_after_identity_mismatch(v_att, v_t + interval '1 day 2 minutes');
+  v_res := screening_v2.release_ashby_number_after_identity_mismatch(v_att2, v_t + interval '1 day 3 minutes');
+  v_res2 := screening_v2.release_ashby_number_after_identity_mismatch(v_att2, v_t + interval '1 day 4 minutes');
+  v_res4 := screening_v2.release_ashby_number_after_identity_mismatch(v_att, v_t + interval '1 day 5 minutes');
+  select * into v_e from screening_v2.phone_engagements where id = v_eng;
+  select * into v_l from screening_v2.ashby_application_links where id = v_link;
+  select * into v_c from screening_v2.candidates where id = v_l.candidate_id;
+  if v_pre2 is distinct from 'eligible/abandoned_pre_disclosure'
+     or v_res3 is distinct from '{"status":"not_applicable"}'::jsonb
+     or v_res->>'status' is distinct from 'released'
+     or (v_res->>'engagement_id')::uuid is distinct from v_eng
+     or (select array_agg(k order by k) from jsonb_object_keys(v_res) k)
+        is distinct from array['engagement_id','status']
+     or v_e.state is distinct from 'cancelled'
+     or v_e.state_reason is distinct from 'identity_unconfirmed'
+     or v_e.terminal_at is distinct from v_t + interval '1 day 3 minutes'
+     or v_c.phone_e164 is not null or v_c.phone_valid
+     or v_c.phone_raw is distinct from '+91 98123 45687'
+     or v_c.ashby_phone_applied_at is distinct from v_t
+     or v_l.profile_outcome is distinct from 'identity_unconfirmed'
+     or v_l.profile_checked_at is distinct from v_t + interval '1 day 3 minutes'
+     or v_l.identity_mismatch_attempt_id is distinct from v_att
+     or v_res2 is distinct from '{"status":"not_applicable"}'::jsonb
+     or v_res4 is distinct from '{"status":"not_applicable"}'::jsonb then
+    v_bad := v_bad || ' second: pre=' || coalesce(v_pre2, '<null>')
+             || ' stale_first=' || coalesce(v_res3->>'status', '<null>')
+             || ' release=' || coalesce(v_res->>'status', '<null>')
+             || ' engagement=' || coalesce(v_e.state, '<null>') || '/' || coalesce(v_e.state_reason, '<null>')
+             || ' replay=' || coalesce(v_res2->>'status', '<null>') || '/' || coalesce(v_res4->>'status', '<null>');
+  end if;
+  perform _policy_tests.assert(
+    '0130-8a release (B2): the first mismatch on an unverified Ashby-applied number is recorded on the link and answers first_mismatch_retry (a replay too) with the number, engagement and link outcome unchanged and the redial on the next IST day; the second, on the next attempt, clears the number (raw value and marker kept), cancels the engagement identity_unconfirmed and records it; a replay or an older attempt is then not_applicable',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-rl');
+
+  -- A recorded mismatch counts only while it is another attempt of THIS
+  -- engagement admitted on the number now applied. One that names no
+  -- attempt, another engagement's attempt, or an attempt admitted before the
+  -- number was applied is stale: the mismatch in hand is the first again.
+  v_link := _policy_tests.p130_fixture('pol130-rm');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-rm.ashby@example.invalid',
+    '+91 98123 45693', '+919812345693', null, v_t);
+  v_eng := (v_res->>'engagement_id')::uuid;
+  v_att := _policy_tests.p130_deferred(v_eng, v_t + interval '1 minute');
+  -- Another engagement's attempt, on a resume number.
+  perform _policy_tests.p130_fixture('pol130-ro', p_handle => true, p_ingestion => 'ready',
+                                     p_phone => '+919812345694', p_resume => true,
+                                     p_consent => 'full', p_state => 'eligible');
+  v_att2 := _policy_tests.p130_deferred(
+    _policy_tests.p130_eng((select id from screening_v2.ashby_application_links
+                             where external_application_id = 'pol130-ro-app')),
+    v_t + interval '1 minute');
+
+  update screening_v2.ashby_application_links
+     set identity_mismatch_attempt_id = gen_random_uuid() where id = v_link;
+  v_res := screening_v2.release_ashby_number_after_identity_mismatch(v_att, v_t + interval '3 minutes');
+  if v_res is distinct from '{"status":"first_mismatch_retry"}'::jsonb
+     or (select identity_mismatch_attempt_id from screening_v2.ashby_application_links where id = v_link)
+        is distinct from v_att then
+    v_bad2 := v_bad2 || ' no_attempt=' || coalesce(v_res->>'status', '<null>');
+  end if;
+  update screening_v2.ashby_application_links
+     set identity_mismatch_attempt_id = v_att2 where id = v_link;
+  v_res := screening_v2.release_ashby_number_after_identity_mismatch(v_att, v_t + interval '4 minutes');
+  if v_res is distinct from '{"status":"first_mismatch_retry"}'::jsonb
+     or (select identity_mismatch_attempt_id from screening_v2.ashby_application_links where id = v_link)
+        is distinct from v_att then
+    v_bad2 := v_bad2 || ' other_engagement=' || coalesce(v_res->>'status', '<null>');
+  end if;
+
+  -- The marker moves past the first attempt (a number applied later): the
+  -- next day's mismatch is the first on that number, and the one after it
+  -- releases.
+  update screening_v2.candidates set ashby_phone_applied_at = v_t + interval '12 hours'
+   where id = (select candidate_id from screening_v2.ashby_application_links where id = v_link);
+  v_att2 := _policy_tests.p130_deferred(v_eng, v_t + interval '1 day');
+  v_res := screening_v2.release_ashby_number_after_identity_mismatch(v_att2, v_t + interval '1 day 3 minutes');
+  select * into v_l from screening_v2.ashby_application_links where id = v_link;
+  select * into v_c from screening_v2.candidates where id = v_l.candidate_id;
+  if v_res is distinct from '{"status":"first_mismatch_retry"}'::jsonb
+     or v_l.identity_mismatch_attempt_id is distinct from v_att2
+     or v_c.phone_valid is not true
+     or (select state || '/' || coalesce(state_reason, '') from screening_v2.phone_engagements
+          where id = v_eng) is distinct from 'eligible/abandoned_pre_disclosure' then
+    v_bad2 := v_bad2 || ' before_number=' || coalesce(v_res->>'status', '<null>');
+  end if;
+  v_att := _policy_tests.p130_deferred(v_eng, v_t + interval '2 days');
+  v_res := screening_v2.release_ashby_number_after_identity_mismatch(v_att, v_t + interval '2 days 3 minutes');
+  if v_res->>'status' is distinct from 'released'
+     or (select state || '/' || coalesce(state_reason, '') from screening_v2.phone_engagements
+          where id = v_eng) is distinct from 'cancelled/identity_unconfirmed' then
+    v_bad2 := v_bad2 || ' then=' || coalesce(v_res->>'status', '<null>');
+  end if;
+  perform _policy_tests.assert(
+    '0130-8c release (B2): a recorded mismatch that names no attempt, another engagement''s attempt, or an attempt admitted before the number was applied does not count, so the mismatch in hand is recorded as the first (first_mismatch_retry, number kept); the next one releases',
+    v_bad2 = '', v_bad2);
+  perform _policy_tests.p130_teardown('pol130-rm');
+  perform _policy_tests.p130_teardown('pol130-ro');
+
+  -- HR verified the number: a verification row carries its digest.
+  v_link := _policy_tests.p130_fixture('pol130-rv');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-rv.ashby@example.invalid',
+    '+91 98123 45688', '+919812345688', null, v_t);
+  v_eng := (v_res->>'engagement_id')::uuid;
+  v_att := _policy_tests.p130_deferred(v_eng, v_t + interval '1 minute');
+  insert into screening_v2.phone_number_verifications (candidate_id, phone_sha256, verified_by, verified_at)
+  select c.id, screening_v2.sha256_hex(c.phone_e164), '00000000-0000-4000-8000-0000000000ad',
+         v_t + interval '150 seconds'
+    from screening_v2.candidates c
+    join screening_v2.ashby_application_links l on l.candidate_id = c.id
+   where l.id = v_link;
+  v_res := screening_v2.release_ashby_number_after_identity_mismatch(v_att, v_t + interval '3 minutes');
+  if v_res is distinct from '{"status":"not_applicable"}'::jsonb
+     or (select c.phone_valid from screening_v2.candidates c
+           join screening_v2.ashby_application_links l on l.candidate_id = c.id
+          where l.id = v_link) is not true
+     or (select state || '/' || coalesce(state_reason, '') from screening_v2.phone_engagements
+          where id = v_eng) is distinct from 'eligible/abandoned_pre_disclosure'
+     or (select identity_mismatch_attempt_id from screening_v2.ashby_application_links
+          where id = v_link) is not null then
+    v_bad3 := v_bad3 || ' verified=' || coalesce(v_res->>'status', '<null>');
+  end if;
+  perform _policy_tests.p130_teardown('pol130-rv');
+
+  -- A resume number: no Ashby marker on the candidate.
+  v_link := _policy_tests.p130_fixture('pol130-rs', p_handle => true, p_ingestion => 'ready',
+                                       p_phone => '+919812345689', p_resume => true,
+                                       p_consent => 'full', p_state => 'eligible');
+  v_eng := _policy_tests.p130_eng(v_link);
+  v_att := _policy_tests.p130_deferred(v_eng, v_t + interval '1 minute');
+  v_res := screening_v2.release_ashby_number_after_identity_mismatch(v_att, v_t + interval '3 minutes');
+  if v_res is distinct from '{"status":"not_applicable"}'::jsonb
+     or (select c.phone_valid from screening_v2.candidates c
+           join screening_v2.ashby_application_links l on l.candidate_id = c.id
+          where l.id = v_link) is not true
+     or (select state || '/' || coalesce(state_reason, '') from screening_v2.phone_engagements
+          where id = v_eng) is distinct from 'eligible/abandoned_pre_disclosure'
+     or (select identity_mismatch_attempt_id from screening_v2.ashby_application_links
+          where id = v_link) is not null then
+    v_bad3 := v_bad3 || ' resume=' || coalesce(v_res->>'status', '<null>');
+  end if;
+
+  v_res := screening_v2.release_ashby_number_after_identity_mismatch(gen_random_uuid(), v_t);
+  v_res2 := screening_v2.release_ashby_number_after_identity_mismatch(v_att, null::timestamptz);
+  if v_res is distinct from '{"status":"not_found"}'::jsonb
+     or v_res2 is distinct from '{"status":"invalid_request"}'::jsonb then
+    v_bad3 := v_bad3 || ' refusals=' || coalesce(v_res->>'status', '<null>') || '/' || coalesce(v_res2->>'status', '<null>');
+  end if;
+  perform _policy_tests.assert(
+    '0130-8b release is not_applicable for a number HR verified (matching digest) or a resume number (no marker), leaving both dialable and recording no mismatch; not_found for an unknown attempt; invalid_request without p_now',
+    v_bad3 = '', v_bad3);
+  perform _policy_tests.p130_teardown('pol130-rs');
+end;
+$$;
+
+-- ── 0130-9: the intake gates. On a phone_parsing link admit (M017-a) and
+--    ensure (M017-b) skip only the resume/ingestion gate: a link with no
+--    resume and no number answers phone_invalid where the same link as
+--    resume_parsing answers ingestion_not_ready. No attempt, no consent ────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_link uuid; v_eng uuid; v_cand uuid; v_res jsonb; v_res2 jsonb;
+  v_bad text := '';
+begin
+  v_link := _policy_tests.p130_fixture('pol130-ga', p_ingestion => 'absent', p_consent => 'full',
+                                       p_state => 'eligible');
+  v_eng := _policy_tests.p130_eng(v_link);
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  update screening_v2.ashby_application_links set intake_type = 'phone_parsing' where id = v_link;
+  v_res2 := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  if v_res->>'status' is distinct from 'ingestion_not_ready'
+     or v_res->>'ingestion_state' is distinct from 'absent'
+     or v_res2 is distinct from '{"status":"phone_invalid"}'::jsonb
+     or exists (select 1 from screening_v2.phone_call_attempts where engagement_id = v_eng) then
+    v_bad := v_bad || ' admit=' || coalesce(v_res->>'status', '<null>') || '/' || coalesce(v_res2->>'status', '<null>');
+  end if;
+  perform _policy_tests.p130_teardown('pol130-ga');
+
+  v_link := _policy_tests.p130_fixture('pol130-ge', p_ingestion => 'absent', p_state => 'pending_prereqs');
+  v_res := screening_v2.ensure_ashby_phone_engagement(v_link, v_t);
+  update screening_v2.ashby_application_links set intake_type = 'phone_parsing' where id = v_link;
+  v_res2 := screening_v2.ensure_ashby_phone_engagement(v_link, v_t + interval '1 minute');
+  v_eng := _policy_tests.p130_eng(v_link);
+  select candidate_id into v_cand from screening_v2.ashby_application_links where id = v_link;
+  if v_res->>'status' is distinct from 'ingestion_not_ready'
+     or v_res2->>'status' is distinct from 'phone_invalid'
+     or (select state || '/' || coalesce(state_reason, '') from screening_v2.phone_engagements
+          where id = v_eng) is distinct from 'pending_prereqs/phone_invalid'
+     or exists (select 1 from screening_v2.consent_records where candidate_id = v_cand) then
+    v_bad := v_bad || ' ensure=' || coalesce(v_res->>'status', '<null>') || '/' || coalesce(v_res2->>'status', '<null>');
+  end if;
+  perform _policy_tests.assert(
+    '0130-9 gates: on a phone_parsing link admit and ensure skip only the resume/ingestion gate, so a missing number answers phone_invalid where resume_parsing answers ingestion_not_ready; no attempt, no consent',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-ge');
+end;
+$$;
+
+-- ── 0130-10: apply, the unreadable resume (B3). A resume_parsing link whose
+--    ingestion rests in `failed_review` falls back to phone parsing: the
+--    link is stamped, the import-time shell gets the Ashby name, email and
+--    number (marker set), ensure skips the ingestion gate and admit dials.
+--    A candidate an earlier parse left with a resume, name and email keeps
+--    them; a valid number stays. A handle whose ingestion is in flight or
+--    ready is still resume_bound, and resume_parsing on a failed_review link
+--    is not_applicable ────────────────────────────────────────────────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_link uuid; v_link2 uuid; v_pre jsonb; v_res jsonb; v_res2 jsonb; v_res3 jsonb;
+  v_l screening_v2.ashby_application_links%rowtype;
+  v_c screening_v2.candidates%rowtype;
+  v_bad text := ''; v_bad2 text := ''; v_bad3 text := '';
+begin
+  -- The import-time shell behind an unreadable resume: ensure first holds
+  -- it at ingestion_not_ready, then the profile falls back.
+  v_link := _policy_tests.p130_fixture('pol130-fr', p_handle => true, p_ingestion => 'failed_review');
+  v_pre := screening_v2.ensure_ashby_phone_engagement(v_link, v_t - interval '1 hour');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-fr.ashby@example.invalid',
+    '+91 98123 45695', '+919812345695', null, v_t);
+  select * into v_l from screening_v2.ashby_application_links where id = v_link;
+  select * into v_c from screening_v2.candidates where id = v_l.candidate_id;
+  if v_pre->>'status' is distinct from 'ingestion_not_ready'
+     or coalesce(v_res->>'status', '') not in ('eligible', 'scheduled_next_window')
+     or (v_res->>'engagement_id')::uuid is distinct from (v_pre->>'engagement_id')::uuid
+     or v_res->>'profile_outcome' is distinct from 'applied'
+     or (v_res->>'number_applied')::boolean is not true
+     or (v_res->>'identity_applied')::boolean is not true
+     or (v_res->>'intake_stamped')::boolean is not true
+     or not _policy_tests.p130_codes_only(v_res)
+     or v_l.intake_type is distinct from 'phone_parsing'
+     or v_l.profile_outcome is distinct from 'applied'
+     or v_l.external_resume_file_handle is null
+     or (select state from screening_v2.ashby_resume_ingestions where application_link_id = v_link)
+        is distinct from 'failed_review'
+     or v_c.name is distinct from 'Test Person'
+     or v_c.email is distinct from 'pol130-fr.ashby@example.invalid'
+     or v_c.phone_e164 is distinct from '+919812345695' or v_c.phone_valid is not true
+     or v_c.phone_raw is distinct from '+91 98123 45695'
+     or v_c.ashby_phone_applied_at is distinct from v_t
+     or v_c.resume_id is not null then
+    v_bad := v_bad || ' shell: pre=' || coalesce(v_pre->>'status', '<null>')
+             || ' apply=' || _policy_tests.p130_brief(v_res)
+             || ' codes_only=' || _policy_tests.p130_codes_only(v_res)::text;
+  end if;
+  v_res2 := screening_v2.admit_phone_attempt((v_res->>'engagement_id')::uuid, 'initial', null, 60,
+                                             v_t + interval '2 minutes');
+  if v_res2->>'status' is distinct from 'ok' then
+    v_bad := v_bad || ' admit=' || coalesce(v_res2->>'status', '<null>');
+  end if;
+  perform _policy_tests.assert(
+    '0130-10a apply phone_parsing on a failed_review resume link (B3): the link is stamped, the shell gets the Ashby name, email and number with its marker, the ingestion stays failed_review, ensure promotes it past the ingestion gate and admit dials; the answer carries codes only',
+    v_bad = '', v_bad);
+  perform _policy_tests.p130_teardown('pol130-fr');
+
+  -- A candidate an earlier parse left with a resume, a name and an email
+  -- keeps them; a candidate with a valid number keeps it.
+  v_link := _policy_tests.p130_fixture('pol130-fp', p_handle => true, p_ingestion => 'failed_review',
+                                       p_resume => true);
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Other Person', 'pol130-fp.other@example.invalid',
+    '+91 98123 45696', '+919812345696', null, v_t);
+  select c.* into v_c from screening_v2.candidates c
+    join screening_v2.ashby_application_links l on l.candidate_id = c.id
+   where l.id = v_link;
+  if coalesce(v_res->>'status', '') not in ('eligible', 'scheduled_next_window')
+     or v_res->>'profile_outcome' is distinct from 'applied'
+     or (v_res->>'number_applied')::boolean is not true
+     or (v_res->>'identity_applied')::boolean is not false
+     or (v_res->>'intake_stamped')::boolean is not true
+     or v_c.name is distinct from 'Test Person pol130-fp'
+     or v_c.email is distinct from 'pol130-fp@example.invalid'
+     or v_c.resume_id is null
+     or v_c.phone_e164 is distinct from '+919812345696' then
+    v_bad2 := v_bad2 || ' parsed=' || _policy_tests.p130_brief(v_res);
+  end if;
+  v_link2 := _policy_tests.p130_fixture('pol130-fv', p_handle => true, p_ingestion => 'failed_review',
+                                        p_phone => '+919812345697');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link2, 'phone_parsing', 'Test Person', 'pol130-fv.ashby@example.invalid',
+    '+91 98123 45698', '+919812345698', null, v_t);
+  select c.* into v_c from screening_v2.candidates c
+    join screening_v2.ashby_application_links l on l.candidate_id = c.id
+   where l.id = v_link2;
+  if v_res->>'profile_outcome' is distinct from 'not_applicable'
+     or (v_res->>'number_applied')::boolean is not false
+     or (v_res->>'identity_applied')::boolean is not true
+     or (v_res->>'intake_stamped')::boolean is not true
+     or v_c.phone_e164 is distinct from '+919812345697' or v_c.phone_valid is not true
+     or v_c.phone_raw is distinct from '+919812345697'
+     or v_c.ashby_phone_applied_at is not null
+     or v_c.name is distinct from 'Test Person' then
+    v_bad2 := v_bad2 || ' valid_number=' || _policy_tests.p130_brief(v_res);
+  end if;
+  perform _policy_tests.assert(
+    '0130-10b the failed_review fallback fills only NULL columns: a parsed name and email stay (identity_applied false), and a valid number stays (not_applicable, no marker)',
+    v_bad2 = '', v_bad2);
+  perform _policy_tests.p130_teardown('pol130-fp');
+  perform _policy_tests.p130_teardown('pol130-fv');
+
+  -- Only failed_review falls back: a handle whose ingestion is in flight or
+  -- ready is still owned by the resume pipeline, and resume_parsing (D3)
+  -- needs a ready ingestion.
+  v_link := _policy_tests.p130_fixture('pol130-fs', p_handle => true, p_ingestion => 'structuring');
+  v_res := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'phone_parsing', 'Test Person', 'pol130-fs.ashby@example.invalid',
+    '+91 98123 45699', '+919812345699', null, v_t);
+  v_link2 := _policy_tests.p130_fixture('pol130-fy', p_handle => true, p_ingestion => 'ready');
+  v_res2 := screening_v2.apply_ashby_candidate_profile(
+    v_link2, 'phone_parsing', 'Test Person', 'pol130-fy.ashby@example.invalid',
+    '+91 98123 45699', '+919812345699', null, v_t);
+  if v_res->>'status' is distinct from 'resume_bound'
+     or v_res->>'profile_outcome' is distinct from 'resume_found'
+     or v_res2->>'status' is distinct from 'resume_bound'
+     or v_res2->>'profile_outcome' is distinct from 'resume_found'
+     or exists (select 1 from screening_v2.ashby_application_links
+                 where id in (v_link, v_link2) and intake_type <> 'resume_parsing')
+     or not _policy_tests.p130_untouched(v_link) or not _policy_tests.p130_untouched(v_link2) then
+    v_bad3 := v_bad3 || ' in_flight=' || _policy_tests.p130_brief(v_res)
+              || ' ready=' || _policy_tests.p130_brief(v_res2);
+  end if;
+  perform _policy_tests.p130_teardown('pol130-fs');
+  perform _policy_tests.p130_teardown('pol130-fy');
+  v_link := _policy_tests.p130_fixture('pol130-fd', p_handle => true, p_ingestion => 'failed_review');
+  v_res3 := screening_v2.apply_ashby_candidate_profile(
+    v_link, 'resume_parsing', null, null, '+91 98123 45699', '+919812345699', null, v_t);
+  if v_res3->>'status' is distinct from 'not_applicable'
+     or v_res3->>'profile_outcome' is distinct from 'not_applicable'
+     or (select intake_type from screening_v2.ashby_application_links where id = v_link)
+        is distinct from 'resume_parsing'
+     or not _policy_tests.p130_untouched(v_link) or _policy_tests.p130_eng(v_link) is not null then
+    v_bad3 := v_bad3 || ' resume_parsing=' || _policy_tests.p130_brief(v_res3);
+  end if;
+  perform _policy_tests.assert(
+    '0130-10c only failed_review falls back: phone_parsing behind a handle whose ingestion is in flight or ready is resume_bound/resume_found (no stamp, nothing written), and resume_parsing on a failed_review link is not_applicable',
+    v_bad3 = '', v_bad3);
+  perform _policy_tests.p130_teardown('pol130-fd');
+end;
+$$;
+
+-- ── 0130-11: claim arm C (B3). A resume_parsing link with a handle whose
+--    ingestion has rested in `failed_review` for p_min_age_seconds, with no
+--    engagement or only a live pending_prereqs one, is claimed. Too young,
+--    an engagement past its prerequisites or a terminal one, a paused or
+--    browser_primary mapping, a valid number, a DSAR hold, a withdrawn
+--    application, and a handle whose ingestion is not failed_review are not.
+--    A link already stamped phone_parsing by an earlier fallback that ended
+--    name_missing is claimed again (retry, as arm B) ─
+do $$
+declare
+  v_t constant timestamptz := '2026-10-19T06:00:00Z';
+  v_tags text[] := array['pol130-ca','pol130-cb',
+                         'pol130-cy','pol130-cg','pol130-ct','pol130-cp','pol130-cw',
+                         'pol130-cv','pol130-cd','pol130-cx','pol130-cs','pol130-cr',
+                         'pol130-ci'];
+  v_due  boolean[] := array[true, true,
+                            false, false, false, false, false,
+                            false, false, false, false, false,
+                            true];
+  v_ids uuid[] := '{}'; v_got uuid[]; v_link uuid; v_i integer; v_s text;
+  v_bad text := '';
+begin
+  -- Due: no engagement; a live pending_prereqs one (ensure's
+  -- ingestion_not_ready hold).
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-ca', p_handle => true, p_ingestion => 'failed_review');
+  v_link := _policy_tests.p130_fixture('pol130-cb', p_handle => true, p_ingestion => 'failed_review');
+  perform screening_v2.ensure_ashby_phone_engagement(v_link, v_t - interval '2 hours');
+  v_ids := v_ids || v_link;
+  -- Not due: rested five minutes only; an engagement past its
+  -- prerequisites; a terminal one; a paused mapping; a browser_primary one;
+  -- a valid number; a restriction request; a withdrawn application.
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-cy', p_handle => true, p_ingestion => 'failed_review');
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-cg', p_handle => true, p_ingestion => 'failed_review',
+                                               p_state => 'eligible');
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-ct', p_handle => true, p_ingestion => 'failed_review',
+                                               p_state => 'cancelled');
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-cp', p_handle => true, p_ingestion => 'failed_review');
+  update screening_v2.ashby_job_mappings set status = 'paused' where external_job_id = 'pol130-cp-job';
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-cw', p_handle => true, p_ingestion => 'failed_review');
+  update screening_v2.ashby_job_mappings set screening_mode = 'browser_primary' where external_job_id = 'pol130-cw-job';
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-cv', p_handle => true, p_ingestion => 'failed_review',
+                                               p_phone => '+919812345690');
+  v_link := _policy_tests.p130_fixture('pol130-cd', p_handle => true, p_ingestion => 'failed_review');
+  insert into screening_v2.data_subject_requests (candidate_id, request_type, request_status, requested_by)
+  select candidate_id, 'restrict', 'pending', '00000000-0000-4000-8000-0000000000ad'
+    from screening_v2.ashby_application_links where id = v_link;
+  v_ids := v_ids || v_link;
+  v_link := _policy_tests.p130_fixture('pol130-cx', p_handle => true, p_ingestion => 'failed_review');
+  update screening_v2.ashby_application_links set terminal_state = 'withdrawn' where id = v_link;
+  v_ids := v_ids || v_link;
+  -- A handle whose ingestion is not failed_review: still structuring, and
+  -- ready with no phone_invalid engagement (arm A's own condition).
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-cs', p_handle => true, p_ingestion => 'structuring');
+  v_ids := v_ids || _policy_tests.p130_fixture('pol130-cr', p_handle => true, p_ingestion => 'ready');
+  -- Due again: an earlier fallback stamped phone_parsing and ended
+  -- name_missing; the backoff has not started (never checked).
+  v_link := _policy_tests.p130_fixture('pol130-ci', p_handle => true, p_ingestion => 'failed_review');
+  update screening_v2.ashby_application_links
+     set intake_type = 'phone_parsing', profile_outcome = 'name_missing'
+   where id = v_link;
+  v_ids := v_ids || v_link;
+
+  -- Every ingestion is an hour old except the young one's five minutes
+  -- (the fixture's advance stamps the wall clock).
+  update screening_v2.ashby_resume_ingestions
+     set updated_at = case when application_link_id = v_ids[3]
+                           then v_t - interval '5 minutes' else v_t - interval '1 hour' end
+   where application_link_id = any (v_ids);
+
+  select coalesce(array_agg(c.application_link_id), '{}') into v_got
+    from screening_v2.claim_ashby_profile_due(50, 900, 21600, 4, v_t) c;
+  for v_i in 1..array_length(v_ids, 1) loop
+    if (v_ids[v_i] = any (v_got)) is distinct from v_due[v_i] then
+      v_bad := v_bad || ' ' || v_tags[v_i] || '='
+               || case when v_due[v_i] then 'missed' else 'claimed' end;
+    end if;
+  end loop;
+  if exists (select 1 from screening_v2.ashby_application_links
+              where id = any (v_ids[1:2] || v_ids[13:13])
+                and (profile_attempts <> 1 or profile_checked_at is distinct from v_t))
+     or exists (select 1 from screening_v2.ashby_application_links
+                 where id = any (v_ids[3:12])
+                   and (profile_attempts <> 0 or profile_checked_at is not null)) then
+    v_bad := v_bad || ' counts';
+  end if;
+  perform _policy_tests.assert(
+    '0130-11 claim arm C (B3): a failed_review resume link rested p_min_age_seconds with no engagement or a live pending one is claimed, also when an earlier fallback stamped it phone_parsing; too young, an engagement past prerequisites or terminal, a paused or browser_primary mapping, a valid number, a DSAR hold, a withdrawn application and a handle whose ingestion is not failed_review are not',
+    v_bad = '', v_bad);
+
+  foreach v_s in array v_tags loop
+    perform _policy_tests.p130_teardown(v_s);
+  end loop;
+end;
+$$;
+
+select _policy_tests.assert(
+  '0130 fixtures leave nothing behind',
+  not exists (select 1 from screening_v2.ashby_application_links where external_application_id like 'pol130-%')
+  and not exists (select 1 from screening_v2.ashby_job_mappings where external_job_id like 'pol130-%')
+  and not exists (select 1 from screening_v2.candidates where email like 'pol130-%')
+  and not exists (select 1 from screening_v2.resumes where parsed->>'src' like 'pol130-%'),
+  'a 0130 fixture leaked');
+
+drop function _policy_tests.p130_deferred(uuid, timestamptz);
+drop function _policy_tests.p130_brief(jsonb);
+drop function _policy_tests.p130_codes_only(jsonb);
+drop function _policy_tests.p130_untouched(uuid);
+drop function _policy_tests.p130_eng(uuid);
+drop function _policy_tests.p130_fixture(text, boolean, text, text, boolean, text, text, text);
+drop function _policy_tests.p130_teardown(text);
+-- ==== 0130 END ====
 
 -- C0, suite end for the phone lane: the 0042 invariant re-asserted AFTER every
 -- 0114 block (§8 exercises set_phone_halt / clear_phone_halt), so it stays

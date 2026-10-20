@@ -433,7 +433,24 @@ describe('3. the merge gate for this PR is run by hand, and the record says so',
       /alter table screening_v2\.voice_worker_leases\n\s+add column if not exists livekit_host/,
     );
     const checks = /CHECKS=\(\n([\s\S]*?)\n\)/.exec(DRIFT_SCRIPT)?.[1].split('\n') ?? [];
-    expect(checks).toHaveLength(3);
+    // The gate record's "three queries" are the three checks this PR shipped,
+    // still the first three lines and unchanged. 0130 (M017) appends five
+    // checks for the functions it declares, and nothing else follows them.
+    expect(checks).toHaveLength(3 + 5);
+    expect(checks.slice(0, 3).map((c) => c.trim())).toEqual([
+      '"screening_v2.request_phone_rescreen(uuid,text,text,text,uuid,timestamptz)' +
+        '|ensure_ashby_phone_engagement"',
+      '"screening_v2.claim_voice_worker(text,text,uuid,bigint,timestamptz)|livekit_host"',
+      '"screening_v2.reset_voice_worker(text,text,timestamptz)|livekit_host"',
+    ]);
+    const appended = checks.slice(3).map((c) => /^\s*"screening_v2\.([a-z_]+)\(/.exec(c)?.[1]);
+    expect(appended).toEqual([
+      'admit_phone_attempt',
+      'ensure_ashby_phone_engagement',
+      'apply_ashby_candidate_profile',
+      'claim_ashby_profile_due',
+      'release_ashby_number_after_identity_mismatch',
+    ]);
     expect(DRIFT_SCRIPT).toContain('drift check could not query');
     expect(DRIFT_SCRIPT).toContain('drift check got no readable position');
     expect(DRIFT_SCRIPT).toContain('PROD FUNCTION DRIFT');

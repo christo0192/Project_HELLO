@@ -36,14 +36,29 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+// 0130 (M017, ADR-0018, one migration in numbered sections) lifts
+// admit_phone_attempt and ensure_ashby_phone_engagement IN FULL from 0114 with
+// marked intake-gate hunks, and declares apply_ashby_candidate_profile,
+// claim_ashby_profile_due and release_ashby_number_after_identity_mismatch,
+// which no earlier migration mentions. It must sit FIRST, ahead of 0125, or
+// every extractor reads the superseded 0114 admit and ensure bodies.
+export const MIGRATION_0130_PATH = fileURLToPath(
+  new URL(
+    '../../../../supabase/migrations/0130_ashby_phone_parsing_intake.sql',
+    import.meta.url,
+  ),
+);
+
+export const MIGRATION_0130 = readFileSync(MIGRATION_0130_PATH, 'utf8');
+
 // 0125 (M013 S02, PR-2, one migration in numbered sections) re-declares
 // set_phone_session_duration (0076, never registered here: it is a trigger
 // function, not an RPC) and declares stamp_phone_attempt_room_name and
 // phone_session_leg_duration. Later S02 sections lift
 // finalize_phone_partial_sessions and enforce_phone_engagement_transition from
-// 0114, so it must sit FIRST, ahead of 0114, or every extractor reads a
-// superseded body. If 0125 is ever renumbered, this constant and the head of
-// PHONE_MIGRATIONS are the places to change.
+// 0114, so it must sit ahead of 0114 (directly behind 0130), or every
+// extractor reads a superseded body. If 0125 is ever renumbered, this constant
+// and its PHONE_MIGRATIONS entry are the places to change.
 export const MIGRATION_0125_PATH = fileURLToPath(
   new URL(
     '../../../../supabase/migrations/0125_phone_recording_integrity.sql',
@@ -390,6 +405,11 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0130 — M017 (ADR-0018). admit_phone_attempt and
+    // ensure_ashby_phone_engagement lifted from 0114 plus the phone_parsing
+    // intake hunks, and the three Ashby profile RPCs, so it precedes 0125 and
+    // 0114.
+    { name: '0130', sql: MIGRATION_0130 },
     // 0125 — M013 S02 (PR-2). Leg-timing columns, the room_name stamp and the
     // truthful-duration rule; its later sections lift finalize and the
     // engagement transition trigger from 0114, so it precedes 0114.
