@@ -346,20 +346,41 @@ export function createMaterializationStore(client: SupabaseClient): Materializat
       // and funnel position were decided at import, and a parse completing is
       // not an event that may revise either.
       const p = input.parsed;
+
+      // ── STEP 1: THE PHONE, FIRST, AND NEVER OVER A VALID NUMBER ─────────
+      // A number that is already valid (resume model, HR-verified, or the
+      // Ashby profile applied once under ADR-0018) outranks whatever this
+      // parse found. The phone therefore has its own update, under the same
+      // `resume_id is null` CAS PLUS `phone_valid = false`: a shell already
+      // holding a valid number matches zero rows here and keeps it.
+      //
+      // `phone_raw` follows the parse, fail-closed exactly as `insertCandidate`
+      // above. The dialable pair is written only when `toCandidateColumns`
+      // approves it, so an undialable parse records the raw string and leaves
+      // the row undialable; it can neither invent a number nor downgrade one.
+      //
+      // Running this BEFORE the parse fields makes a retry safe: the step is
+      // idempotent, and step 2's CAS still decides the outcome.
+      const phoneColumns = toCandidateColumns(input.phone);
+      const { error: phoneError } = await client
+        .from('candidates')
+        .update({
+          phone_raw: input.phone ? input.phone.raw : p.phone,
+          ...(phoneColumns.phone_valid ? phoneColumns : {}),
+        })
+        .eq('id', input.candidateId)
+        .is('resume_id', null)
+        .eq('phone_valid', false);
+      if (phoneError) throw new Error('ashby_candidate_phone_write_error');
+
+      // ── STEP 2: THE PARSE FIELDS, UNDER THE CAS ─────────────────────────
+      // No phone key: step 1 owns those columns. A replay matches zero rows.
       const { data, error } = await client
         .from('candidates')
         .update({
           resume_id: input.resumeId,
           name: p.name,
           email: p.email,
-          // Written inside the SAME allowlist and under the SAME
-          // `.is('resume_id', null)` CAS as every other parse-derived field,
-          // so a replay writes zero rows and cannot erase — or invent — a
-          // number. Fail-closed exactly as `insertCandidate` above.
-          phone_raw: input.phone ? input.phone.raw : p.phone,
-          // Same strict re-assertion as `insertCandidate`, inside the SAME
-          // allowlist and under the SAME CAS.
-          ...toCandidateColumns(input.phone),
           skills: p.skills ?? [],
           experience_years: p.experience_years,
           parsed: p,

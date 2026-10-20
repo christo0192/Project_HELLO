@@ -118,6 +118,14 @@ primary_region = "sin"
   ASHBY_RECONCILE_INTERVAL_MS = "900000"
   ASHBY_RECLAIM_INTERVAL_MS = "60000"
   ASHBY_LEASE_SECONDS = "60"
+  # Phone-parsing intake (M017, docs/adr/0018-ashby-phone-parsing-intake.md):
+  # ON. Ashby applicants with no resume are classified from their Ashby
+  # profile and screened by phone. KILL SWITCH, no deploy needed (a Fly secret
+  # overrides [env]):
+  #   fly secrets set ASHBY_PHONE_PARSING_ENABLED=false -a project-hello-api
+  # Read back as runtime.phoneParsingEnabled on the Mission Control health
+  # route. See docs/runbooks/ashby-runtime-activation.md.
+  ASHBY_PHONE_PARSING_ENABLED = "true"
   # Phone canary flip (docs/runbooks/phone-worker-deployment.md §6): the exact
   # name of the dedicated phone worker (fly.phone.toml's PHONE_AGENT_NAME).
   # Non-empty means the API DISPATCHES phone rooms to that worker by name; the

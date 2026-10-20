@@ -8,8 +8,8 @@
  * scripts/test-phone-0125.sh; text is not execution.
  *
  * The migration number lives in ONE constant (N). If S01 or anything else
- * merges a 0125 first, S02 renumbers: change N, the file name, the head of
- * PHONE_MIGRATIONS and MIGRATION in scripts/test-phone-0125.sh.
+ * merges a 0125 first, S02 renumbers: change N, the file name, its
+ * PHONE_MIGRATIONS entry and MIGRATION in scripts/test-phone-0125.sh.
  */
 import { describe, it, expect } from 'vitest';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
@@ -57,25 +57,28 @@ function section(n: number): string {
 }
 
 describe(`${N} registration`, () => {
-  it('is the FIRST (newest) entry of PHONE_MIGRATIONS, directly ahead of 0114', () => {
+  it('is the second entry of PHONE_MIGRATIONS, directly behind 0130 (M017) and ahead of 0114', () => {
     const names = PHONE_MIGRATIONS.map((m) => m.name);
-    expect(names[0]).toBe(N);
-    expect(names[1]).toBe('0114');
+    expect(names[0]).toBe('0130');
+    expect(names[1]).toBe(N);
+    expect(names[2]).toBe('0114');
     expect(names.filter((n) => n === N)).toHaveLength(1);
-    expect(PHONE_MIGRATIONS[0].sql).toBe(MIGRATION_0125);
+    expect(PHONE_MIGRATIONS[1].sql).toBe(MIGRATION_0125);
   });
 
-  it('is the one CI-legal 0125 file and the newest NON-R1 migration file', () => {
+  it('is the one CI-legal 0125 file and the newest NON-R1 migration file before 0130 (M017)', () => {
     const base = path.basename(MIGRATION_0125_PATH);
     expect(base).toMatch(new RegExp(`^${N}_[a-z0-9_]+\\.sql$`));
     const files = readdirSync(MIGRATIONS).filter((f) => /^\d{4}_.*\.sql$/.test(f)).sort();
     expect(files.filter((f) => f.startsWith(`${N}_`))).toEqual([base]);
     // Same relaxation #329 applied to 0113 and 0114: R1-lane migrations (`_r1_` in the name, e.g.
-    // 0126's r1_settle_attempt / r1_transition_round) may follow it; nothing else may.
+    // 0126's r1_settle_attempt / r1_transition_round) may follow it, and so may the M017 Ashby
+    // phone-parsing intake migration (0130), which lifts nothing from 0125; nothing else may.
     const after = files.slice(files.indexOf(base) + 1);
-    expect(after.every((f) => /_r1_/.test(f))).toBe(true);
+    expect(after.every((f) => /_r1_|_ashby_phone_parsing_intake\.sql$/.test(f))).toBe(true);
     const nonR1 = files.filter((f) => !/_r1_/.test(f));
-    expect(nonR1[nonR1.length - 1]).toBe(base);
+    expect(nonR1[nonR1.length - 2]).toBe(base);
+    expect(nonR1[nonR1.length - 1]).toMatch(/^0130_ashby_phone_parsing_intake\.sql$/);
   });
 });
 

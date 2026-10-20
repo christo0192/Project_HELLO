@@ -95,6 +95,9 @@ export const PHONE_PROGRESS_REASON_ALLOWLIST = [
   // 0125 (M013 D1): failed — the candidate answered none of the planned
   // questions (relabel_zero_answer_phone_engagement).
   'screening_abandoned',
+  // 0130 (M017): cancelled — the wrong person answered an Ashby-applied
+  // number nobody verified (release_ashby_number_after_identity_mismatch).
+  'identity_unconfirmed',
 ] as const;
 
 const REASON_SET: ReadonlySet<string> = new Set(PHONE_PROGRESS_REASON_ALLOWLIST);

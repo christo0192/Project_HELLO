@@ -14,7 +14,13 @@ import {
   isBadgedResumeReview,
   resumeReviewLabel,
   RESUME_REVIEW_ORDER,
+  IntakeBadge,
+  INTAKE_TYPE_ORDER,
+  intakeTypeLabel,
+  isIntakeType,
+  PROFILE_OUTCOME_LABELS,
 } from '../ResumeReviewBadge';
+import type { AshbyProfileOutcome, IntakeType } from '../../../types';
 
 describe('candidateDisplayName', () => {
   it('returns the exact neutral shell copy for a null/blank name', () => {
@@ -94,5 +100,97 @@ describe('ResumeReviewBadge', () => {
         /failed_review|fetch_http_error|parse|scan|ashby|application|link|attempt|retry|null|undefined/i,
       );
     }
+  });
+});
+
+/**
+ * M017: the intake badge says which way a candidate came in. Both values are
+ * neutral and told apart by their words; anything else renders nothing, so
+ * an older API (no field) leaves every surface exactly as it was.
+ */
+describe('IntakeBadge', () => {
+  it('labels both intake types, in facet order', () => {
+    expect([...INTAKE_TYPE_ORDER]).toEqual(['resume_parsing', 'phone_parsing']);
+    expect(intakeTypeLabel('resume_parsing')).toBe('Resume parsing');
+    expect(intakeTypeLabel('phone_parsing')).toBe('Phone parsing');
+  });
+
+  it.each([
+    ['resume_parsing', 'Resume parsing'],
+    ['phone_parsing', 'Phone parsing'],
+  ] as const)('renders %s as its own words', (value, label) => {
+    render(<IntakeBadge value={value} />);
+    expect(screen.getByText(label)).toBeInTheDocument();
+  });
+
+  it('renders nothing for null, absent or an unknown value', () => {
+    for (const value of [null, undefined, 'email_parsing' as IntakeType, '' as IntakeType]) {
+      const { container } = render(<IntakeBadge value={value} />);
+      expect(container).toBeEmptyDOMElement();
+    }
+    expect(intakeTypeLabel(null)).toBeNull();
+    expect(intakeTypeLabel('bogus')).toBeNull();
+    expect(isIntakeType(undefined)).toBe(false);
+  });
+
+  it('distinguishes the two by text alone: same neutral tone, same weight', () => {
+    const { container: resume } = render(<IntakeBadge value="resume_parsing" />);
+    const { container: phone } = render(<IntakeBadge value="phone_parsing" />);
+    expect(resume.textContent).not.toBe(phone.textContent);
+    const r = resume.firstElementChild as HTMLElement;
+    const p = phone.firstElementChild as HTMLElement;
+    expect(r.getAttribute('data-status-badge')).toBe('neutral');
+    expect(p.getAttribute('data-status-badge')).toBe('neutral');
+    expect(r.className).toBe(p.className);
+  });
+
+  it('declares no colour of its own — the palette owns colour', () => {
+    for (const value of INTAKE_TYPE_ORDER) {
+      const { container } = render(<IntakeBadge value={value} />);
+      expect(container.innerHTML).not.toMatch(/#[0-9a-fA-F]{3,8}|rgba?\(|hsla?\(/);
+    }
+  });
+});
+
+describe('PROFILE_OUTCOME_LABELS', () => {
+  /** The closed 0130 vocabulary, written out so a missing label fails here. */
+  const VOCABULARY: AshbyProfileOutcome[] = [
+    'applied',
+    'number_invalid',
+    'number_placeholder',
+    'number_shared',
+    'name_missing',
+    'resume_found',
+    'resume_shape_unknown',
+    'stage_moved',
+    'application_inactive',
+    'mapping_inactive',
+    'subject_request_hold',
+    'engagement_active',
+    'not_applicable',
+    'ashby_unavailable',
+    'identity_unconfirmed',
+    'application_terminal',
+    'candidate_missing',
+  ];
+
+  it('labels exactly the closed vocabulary', () => {
+    expect(Object.keys(PROFILE_OUTCOME_LABELS).sort()).toEqual([...VOCABULARY].sort());
+  });
+
+  it('says each outcome in recruiter words, never the raw code', () => {
+    expect(PROFILE_OUTCOME_LABELS.applied).toBe('Ashby number applied');
+    expect(PROFILE_OUTCOME_LABELS.number_invalid).toBe('No valid Indian mobile in Ashby');
+    expect(PROFILE_OUTCOME_LABELS.identity_unconfirmed).toBe(
+      'Wrong person answered the Ashby number',
+    );
+    expect(PROFILE_OUTCOME_LABELS.ashby_unavailable).toBe('Ashby unavailable — will retry');
+    for (const code of VOCABULARY) {
+      const label = PROFILE_OUTCOME_LABELS[code];
+      expect(label.trim().length, code).toBeGreaterThan(0);
+      expect(label, code).not.toContain('_');
+    }
+    // Distinguished by text: no two outcomes share words.
+    expect(new Set(Object.values(PROFILE_OUTCOME_LABELS)).size).toBe(VOCABULARY.length);
   });
 });

@@ -66,6 +66,7 @@ interface TableStore {
   assessments: any[];
   transcriptTurns: any[];
   resumes: any[];
+  ashbyApplicationLinks: any[];
 }
 
 /**
@@ -103,10 +104,17 @@ function freshTables(): TableStore {
     resumes: [
       { id: nextId(), candidate_id: '11111111-1111-4111-8111-111111111111', file_name: 'alice_resume.pdf', mime_type: 'application/pdf', text_extracted: 'Alice Applicant - 5 years experience', created_at: ts() },
     ],
+    ashbyApplicationLinks: [],
   };
 }
 
 let tables: TableStore;
+
+/**
+ * Every write and filter call, in order, per table — so a test can pin WHICH
+ * filters a write carried and WHEN it ran relative to another table's write.
+ */
+let queryLog: Array<{ table: string; method: string; args: unknown[] }> = [];
 
 function makeFrom(tableName: string) {
   const source: any[] = (() => {
@@ -121,6 +129,7 @@ function makeFrom(tableName: string) {
       case 'assessments': return tables.assessments;
       case 'transcript_turns': return tables.transcriptTurns;
       case 'resumes': return tables.resumes;
+      case 'ashby_application_links': return tables.ashbyApplicationLinks;
       default: return [];
     }
   })();
@@ -137,11 +146,13 @@ function makeFrom(tableName: string) {
   let isUpdate = false;
   let updatePayload: any;
   let isDelete = false;
+  const log = (method: string, args: unknown[]) => { queryLog.push({ table: tableName, method, args }); };
 
   const q: any = {
     select() { return q; },
-    eq(f: string, v: unknown) { filters.push((r: any) => r[f] === v); return q; },
+    eq(f: string, v: unknown) { log('eq', [f, v]); filters.push((r: any) => r[f] === v); return q; },
     is(f: string, v: unknown) {
+      log('is', [f, v]);
       if (v === null) filters.push((r: any) => r[f] === null || r[f] === undefined);
       else filters.push((r: any) => r[f] === v);
       return q;
@@ -154,8 +165,8 @@ function makeFrom(tableName: string) {
     single() { single = true; return q; },
     maybeSingle() { maybeSingle = true; return q; },
     insert(p: any) { isInsert = true; insertPayload = p; return q; },
-    update(p: any) { isUpdate = true; updatePayload = p; return q; },
-    delete() { isDelete = true; return q; },
+    update(p: any) { log('update', [p]); isUpdate = true; updatePayload = p; return q; },
+    delete() { log('delete', []); isDelete = true; return q; },
     then(resolve: any, _reject?: any) { return Promise.resolve(exec()).then(resolve); },
 
     // Support both thenable and await
@@ -255,13 +266,14 @@ function createGovApp(user: AuthUser) {
   tables = freshTables();
   mockFromImpl = makeFrom;
   auditEntries = [];
+  queryLog = [];
 
   const app = createApp({
     authDeps: { getUser: mockAuthGetUser(user, JWT_AAL2) },
     auditSinkOverride: async (entry: any) => { auditEntries.push(entry); },
   });
 
-  return { app, auditEntries: () => auditEntries, tables };
+  return { app, auditEntries: () => auditEntries, tables, queryLog };
 }
 
 // ── Tests ────────────────────────────────────────────────────────────
@@ -647,6 +659,102 @@ describe('GOV-05: DSAR Delete (Erasure)', () => {
     const deleteRes = await request(app).post(`/api/dsar/${dsarId}/delete`).set('Authorization', VALID_TOKEN);
     expect(deleteRes.status).toBe(409);
     expect(deleteRes.body.error.holds.length).toBeGreaterThanOrEqual(1);
+  });
+
+  // M017 (ADR-0018): a live Ashby link is what the import and the phone-parsing profile sweep act
+  // on, so erasure terminates it — or the Ashby record would re-collect the erased person's data.
+  it('terminates the candidate\'s live Ashby links BEFORE the candidate row is deleted', async () => {
+    const bob = '33333333-3333-4333-8333-333333333333';
+    const alice = '11111111-1111-4111-8111-111111111111';
+    const { app, tables, queryLog } = createGovApp(makeInterviewer());
+    tables.ashbyApplicationLinks.push(
+      { id: 'link-live', candidate_id: bob, terminal_state: null, terminal_reason: null },
+      { id: 'link-withdrawn', candidate_id: bob, terminal_state: 'withdrawn', terminal_reason: 'terminal_cancel' },
+      { id: 'link-other', candidate_id: alice, terminal_state: null, terminal_reason: null },
+    );
+    const crate = await request(app).post('/api/dsar').set('Authorization', VALID_TOKEN).send({
+      candidate_id: bob, request_type: 'delete',
+    });
+    expect(crate.status).toBe(201);
+
+    const deleteRes = await request(app).post(`/api/dsar/${crate.body.data.id}/delete`).set('Authorization', VALID_TOKEN);
+    expect(deleteRes.status).toBe(200);
+    expect(deleteRes.body.data.deleted_entities).toContain('ashby_link_terminated:1');
+
+    const link = (id: string) => tables.ashbyApplicationLinks.find(l => l.id === id);
+    expect(link('link-live')).toMatchObject({ terminal_state: 'deleted', terminal_reason: 'subject_erasure' });
+    // Already terminal: its own state and reason survive. Another candidate's link is untouched.
+    expect(link('link-withdrawn')).toMatchObject({ terminal_state: 'withdrawn', terminal_reason: 'terminal_cancel' });
+    expect(link('link-other')).toMatchObject({ terminal_state: null, terminal_reason: null });
+
+    // The write itself: scoped to the candidate and to live links only.
+    expect(queryLog.filter(e => e.table === 'ashby_application_links').map(e => [e.method, ...e.args])).toEqual([
+      ['update', { terminal_state: 'deleted', terminal_reason: 'subject_erasure', updated_at: expect.any(String) }],
+      ['eq', 'candidate_id', bob],
+      ['is', 'terminal_state', null],
+    ]);
+    // `candidate_id` is `on delete set null`, so the order is load-bearing.
+    const linkUpdate = queryLog.findIndex(e => e.table === 'ashby_application_links' && e.method === 'update');
+    const candidateDelete = queryLog.findIndex(e => e.table === 'candidates' && e.method === 'delete');
+    expect(linkUpdate).toBeGreaterThanOrEqual(0);
+    expect(candidateDelete).toBeGreaterThan(linkUpdate);
+    expect(tables.candidates.map(c => c.id)).toEqual([alice]);
+  });
+
+  it('a failed link termination keeps the candidate and the request in progress, and a retry completes', async () => {
+    const bob = '33333333-3333-4333-8333-333333333333';
+    const { app, tables } = createGovApp(makeInterviewer());
+    tables.ashbyApplicationLinks.push({ id: 'link-live', candidate_id: bob, terminal_state: null, terminal_reason: null });
+    let failLinks = true;
+    mockFromImpl = (tableName: string) => {
+      const q = makeFrom(tableName);
+      if (tableName === 'ashby_application_links' && failLinks) {
+        q.then = (resolve: any) => Promise.resolve({ data: null, error: { message: 'synthetic failure' } }).then(resolve);
+      }
+      return q;
+    };
+    const crate = await request(app).post('/api/dsar').set('Authorization', VALID_TOKEN).send({
+      candidate_id: bob, request_type: 'delete',
+    });
+    expect(crate.status).toBe(201);
+    const dsarId = crate.body.data.id;
+
+    const failed = await request(app).post(`/api/dsar/${dsarId}/delete`).set('Authorization', VALID_TOKEN);
+    expect(failed.status).toBe(500);
+    // `candidate_id` is `on delete set null`: deleting the row now would orphan a live link.
+    expect(tables.candidates.map(c => c.id)).toContain(bob);
+    expect(tables.ashbyApplicationLinks[0]).toMatchObject({ terminal_state: null });
+    expect(tables.dsarRequests.find(r => r.id === dsarId)).toMatchObject({ request_status: 'in_progress' });
+    expect(tables.governanceAudits).toContainEqual(expect.objectContaining({
+      action: 'data_deleted',
+      outcome: 'failure',
+      entity_id: bob,
+      details: { dsar_id: dsarId, stage: 'ashby_links', code: 'ashby_link_terminate_error' },
+    }));
+
+    failLinks = false;
+    const retried = await request(app).post(`/api/dsar/${dsarId}/delete`).set('Authorization', VALID_TOKEN);
+    expect(retried.status).toBe(200);
+    expect(retried.body.data.deleted_entities).toContain('ashby_link_terminated:1');
+    expect(tables.ashbyApplicationLinks[0]).toMatchObject({ terminal_state: 'deleted', terminal_reason: 'subject_erasure' });
+    expect(tables.candidates.map(c => c.id)).not.toContain(bob);
+    expect(tables.dsarRequests.find(r => r.id === dsarId)).toMatchObject({ request_status: 'fulfilled' });
+  });
+
+  it('a deletion blocked by a legal hold leaves the Ashby links live', async () => {
+    const alice = '11111111-1111-4111-8111-111111111111';
+    const { app, tables } = createGovApp(makeAdmin());
+    tables.ashbyApplicationLinks.push({ id: 'link-live', candidate_id: alice, terminal_state: null, terminal_reason: null });
+    await request(app).post('/api/dsar/legal-holds').set('Authorization', VALID_TOKEN).send({
+      entity_type: 'candidate', entity_id: alice, hold_reason: 'Regulatory investigation', hold_source: 'regulatory',
+    });
+    const dsarRes = await request(app).post('/api/dsar').set('Authorization', VALID_TOKEN).send({
+      candidate_id: alice, request_type: 'delete',
+    });
+
+    const deleteRes = await request(app).post(`/api/dsar/${dsarRes.body.data.id}/delete`).set('Authorization', VALID_TOKEN);
+    expect(deleteRes.status).toBe(409);
+    expect(tables.ashbyApplicationLinks[0]).toMatchObject({ terminal_state: null, terminal_reason: null });
   });
 });
 

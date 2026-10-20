@@ -387,6 +387,41 @@ describe('9. reads are column-explicit and bounded', () => {
     }
   });
 
+  it('M017: the hold list is the due list plus EXACTLY the link embed, and no other list embeds', () => {
+    // The kill-switch hold selects a second list on the same table. A list
+    // must be one plain literal (above), so it cannot be BUILT from the due
+    // list — which leaves two literals free to drift. Pinned here: the hold
+    // list is the due list verbatim plus the one `!inner` embed the SQL
+    // filter needs, and no other declared list reaches across to the link.
+    const { lists } = columnConstants(body(READ_SEAM));
+    const due = lists.get('DUE_ENGAGEMENT_COLUMNS');
+    const hold = lists.get('DUE_ENGAGEMENT_HOLD_COLUMNS');
+    expect(due, 'the due list is not declared').toBeDefined();
+    expect(hold, 'the hold list is not declared').toBeDefined();
+    expect(hold).toBe(`${due},ashby_application_links!inner(intake_type)`);
+    for (const [name, list] of lists) {
+      if (name === 'DUE_ENGAGEMENT_HOLD_COLUMNS') continue;
+      expect(list, `${name} embeds the application link`).not.toContain('ashby_application_links');
+    }
+  });
+
+  it('M017: the hold filter is spelled once, beside the one hold select', () => {
+    // One `.neq(` in the seam, on the embedded intake column, and the hold
+    // list selected exactly once. A second copy of the filter is a second
+    // place the switch could be applied — to the reconnect batch, which must
+    // never be held.
+    const readSeam = body(READ_SEAM);
+    expect([...readSeam.matchAll(/\.neq\(/g)]).toHaveLength(1);
+    expect(readSeam).toContain(".neq('ashby_application_links.intake_type', 'phone_parsing')");
+    expect([...readSeam.matchAll(/\.select\(DUE_ENGAGEMENT_HOLD_COLUMNS\)/g)]).toHaveLength(1);
+    // The intake vocabulary stays inside the read seam: the loop and the
+    // composition root speak only of a boolean hold.
+    const naming = MODULE_FILES
+      .filter((f) => code(f.source).includes("'phone_parsing'"))
+      .map((f) => f.name);
+    expect(naming).toEqual([READ_SEAM]);
+  });
+
   it('every table read is bounded by a `.limit(`', () => {
     // An unbounded read on `phone_engagements` or `candidates` is a table scan
     // that also lands every matching row in process memory — including, on the

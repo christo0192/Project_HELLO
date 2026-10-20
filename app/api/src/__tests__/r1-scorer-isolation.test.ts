@@ -42,7 +42,7 @@ describe('phone scorer byte-identity fence (PR-5)', () => {
     'lib/scorecards/domain.ts': 'da506d335f9050d403d942ca7190a7f60b447e3a211e5aa33d51bdd902cefe94',
     'lib/scorecards/evidence.ts': 'f60697bcb4921363404aa824b17ceb5ea630cf7a9c719afb1c65cabe5b7873f8',
     'lib/scorecards/integrity.ts': '4c2460cd8e90f7b1a0dfc5898fd256defd7da3b2e0bb8ed884218ebf27d9a6c3',
-    'lib/prompts.ts': '4e8ea472b2c3657b0845362ff1edecebe533ef3e36b2230f8d2d3a7ce55b82fd',
+    'lib/prompts.ts': '639765ed9b4a1ae8cfbfc40541ae916609b4cd6b8e2016c070f43d5f35475a2c',
   };
 
   for (const [file, sha] of Object.entries(PINS)) {

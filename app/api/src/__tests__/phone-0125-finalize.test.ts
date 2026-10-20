@@ -95,8 +95,11 @@ describe('0125 §4 — ownership and placement', () => {
     expect(S4).toContain(`create or replace function screening_v2.${NAME}(`);
   });
 
-  it('0125 is the newest registered migration, so the extractors read the 0125 body', () => {
-    expect(PHONE_MIGRATIONS[0].name).toBe('0125');
+  it('0125 is the newest registered migration declaring it, so the extractors read the 0125 body', () => {
+    // 0130 (M017), the only newer entry, does not redeclare finalize.
+    expect(PHONE_MIGRATIONS[0].name).toBe('0130');
+    expect(PHONE_MIGRATIONS[1].name).toBe('0125');
+    expect(PHONE_MIGRATIONS[0].sql).not.toContain(`create or replace function screening_v2.${NAME}(`);
     const resolved = functionBody(NAME);
     expect(resolved).toContain('-- ▼ 0125 S02-4 reconnect guard');
     // ...and every 0114 hunk the phone-0114-outcome pins read survives in it.

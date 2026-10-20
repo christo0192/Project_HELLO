@@ -426,6 +426,76 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     expect(screen.queryByText('Held for evidence')).toBeNull();
   });
 
+  it('M017: says "Intake: Phone parsing" and the check outcome, in place of a resume import', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{
+        ...WORKFLOWS.workflows[0],
+        lifecycle: 'imported',
+        ingestionState: 'queued',
+        operations: [],
+        sessionStatus: null,
+        intakeType: 'phone_parsing',
+        profileOutcome: 'number_shared',
+      }],
+    });
+    renderPage();
+    expect(await screen.findByText('Intake: Phone parsing')).toHaveAttribute('title', 'phone_parsing');
+    expect(screen.getByText('Phone parsing check: Number belongs to another candidate')).toHaveAttribute(
+      'title',
+      'number_shared',
+    );
+    // The harmless `queued` ingestion row of a link with no resume is not
+    // shown as a resume import that never moves.
+    expect(screen.queryByText(/^Resume import:/)).toBeNull();
+    expect(screen.queryByText('number_shared')).toBeNull();
+  });
+
+  it('M017: a resume-parsing row keeps its resume import, plus any check outcome', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{ ...WORKFLOWS.workflows[0], intakeType: 'resume_parsing', profileOutcome: 'applied' }],
+    });
+    renderPage();
+    expect(await screen.findByText('Resume import: Needs manual review')).toBeInTheDocument();
+    expect(screen.getByText('Phone parsing check: Ashby number applied')).toHaveAttribute('title', 'applied');
+    expect(screen.queryByText(/^Intake:/)).toBeNull();
+  });
+
+  it('M017: an unreadable resume that fell back to phone parsing is not a resume to review', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [
+        // The fixture's resume-parsing row still needs review.
+        WORKFLOWS.workflows[0],
+        {
+          ...WORKFLOWS.workflows[0],
+          applicationLinkId: 'l2',
+          externalApplicationId: 'app_2',
+          operations: [],
+          intakeType: 'phone_parsing',
+          profileOutcome: 'applied',
+        },
+      ],
+    });
+    renderPage();
+    expect(await screen.findByText('Resume unreadable, switched to phone parsing')).toHaveAttribute(
+      'title',
+      'failed_review',
+    );
+    expect(screen.getByText('Intake: Phone parsing')).toBeInTheDocument();
+    // Only the resume-parsing row is still a resume import needing review.
+    expect(screen.getAllByText(/^Resume import:/)).toHaveLength(1);
+    expect(screen.getByText('1 with a failed operation and 1 with a resume to review.')).toBeInTheDocument();
+  });
+
+  it('M017: a row from an older API (no intake fields) is unchanged', async () => {
+    renderPage();
+    expect(await screen.findByText('Resume import: Needs manual review')).toBeInTheDocument();
+    expect(screen.queryByText(/^Intake:/)).toBeNull();
+    expect(screen.queryByText(/^Phone parsing check:/)).toBeNull();
+  });
+
   it('does not flag a screening that parked correctly', async () => {
     listAshbyWorkflows.mockResolvedValue({
       ok: true,

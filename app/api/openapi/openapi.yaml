@@ -8546,6 +8546,9 @@ components:
           type: integer
         leaseSeconds:
           type: integer
+        phoneParsingEnabled:
+          description: M017 (ADR-0018). Effective value of the ASHBY_PHONE_PARSING_ENABLED kill switch in THIS process; true only for the literal "true". A Fly secret overrides the fly.toml [env] value, so this is the read-back after a flip. Optional so an older API stays valid.
+          type: boolean
       additionalProperties: false
 
     AshbyScannerState:
@@ -9099,6 +9102,16 @@ components:
           type: string
           nullable: true
           description: Status of the screening session this application was materialized into, or null when none exists yet. A completed session on a non-terminal workflow whose lifecycle is not writeback_pending is a screening whose completion park did not land — the diagnostic the best-effort completion observer requires.
+        intakeType:
+          type: string
+          nullable: true
+          enum: [resume_parsing, phone_parsing]
+          description: M017 (ADR-0018). The link's intake_type (0130 CHECK); null for a value outside it. Optional so an older API stays valid.
+        profileOutcome:
+          type: string
+          nullable: true
+          enum: [applied, number_invalid, number_placeholder, number_shared, name_missing, resume_found, resume_shape_unknown, stage_moved, application_inactive, mapping_inactive, subject_request_hold, engagement_active, not_applicable, ashby_unavailable, identity_unconfirmed, application_terminal, candidate_missing]
+          description: M017 (ADR-0018). The last Ashby profile check's outcome, from the closed 0130 profile_outcome CHECK vocabulary. A code only - never a name, email or number. null before any check. Optional so an older API stays valid.
         updatedAt:
           type: string
           format: date-time
@@ -9157,6 +9170,16 @@ components:
           type: string
           nullable: true
           description: Screening session status, or null when no session exists yet or the additive diagnostic read failed. Not PII, and carries no session id.
+        intakeType:
+          type: string
+          nullable: true
+          enum: [resume_parsing, phone_parsing]
+          description: M017 (ADR-0018). The link's intake_type (0130 CHECK). phone_parsing is an application with no resume, screened from the name and number on the Ashby record. null for a value outside the CHECK. Optional so an older API stays valid; absent means legacy rendering.
+        profileOutcome:
+          type: string
+          nullable: true
+          enum: [applied, number_invalid, number_placeholder, number_shared, name_missing, resume_found, resume_shape_unknown, stage_moved, application_inactive, mapping_inactive, subject_request_hold, engagement_active, not_applicable, ashby_unavailable, identity_unconfirmed, application_terminal, candidate_missing]
+          description: M017 (ADR-0018). The last Ashby profile check's outcome, from the closed 0130 profile_outcome CHECK vocabulary. A code only - never a name, email or number. null before any check. Optional so an older API stays valid.
         updatedAt:
           type: string
           format: date-time
@@ -9458,6 +9481,11 @@ components:
           description: Status of the non-archived Ashby job mapping that the candidate's NEWEST application link points at (enabled = Live, paused = Paused, drift = Out of sync); an older link is never consulted. null when the candidate has no Ashby link or that link's mapping is archived or missing. The field is OMITTED from every row of a response when the links or mappings read failed or was truncated, so clients fall back to the role-level rule. Drives the Candidates Active / Paused filter per candidate rather than per role.
           enum: [enabled, paused, drift]
           nullable: true
+        intake_type:
+          type: string
+          description: M017 (ADR-0018, Addendum A). How the candidate entered screening. The NEWEST Ashby link's intake_type when the candidate has one; resume_parsing for a candidate with no Ashby link but a resume on file (a dashboard upload); otherwise null (no badge). null too when the links read failed or did not reach the candidate - unknown, never guessed. A phone_parsing candidate has no resume, so its resume_review is null. Optional so an older API stays valid; absent means legacy rendering.
+          enum: [resume_parsing, phone_parsing]
+          nullable: true
         dial_count:
           $ref: '#/components/schemas/CandidateDialCount'
         phone_state:
@@ -9482,7 +9510,7 @@ components:
 
     CandidatePhoneStateReason:
       type: string
-      enum: [no_answer_budget_exhausted, reconnect_budget_exhausted, provider_budget_exhausted, window_closed, assessment_aborted, wrong_number, disclosure_refused, candidate_opt_out, hr_cancelled, emergency_stop, ashby_stage_left, prereq_lost, abandoned_pre_disclosure, consent_gate_failed, callback_deferred_in_call, callback_deferral_limit, late_score_after_stranded_abort, screening_abandoned]
+      enum: [no_answer_budget_exhausted, reconnect_budget_exhausted, provider_budget_exhausted, window_closed, assessment_aborted, wrong_number, disclosure_refused, candidate_opt_out, hr_cancelled, emergency_stop, ashby_stage_left, prereq_lost, abandoned_pre_disclosure, consent_gate_failed, callback_deferred_in_call, callback_deferral_limit, late_score_after_stranded_abort, screening_abandoned, identity_unconfirmed]
       nullable: true
       description: Why the latest cycle is in its state, projected server-side through a closed allowlist. The underlying column is not constrained, so any value outside this list - including any free text - is reported as null rather than echoed. Always null for the viewer role (the per-cycle view, /api/candidates/{id}/phone-cycles, is interviewer+).
 
@@ -9586,6 +9614,16 @@ components:
           $ref: '#/components/schemas/CandidatePhoneStateReason'
         last_dialed_at:
           $ref: '#/components/schemas/CandidateLastDialedAt'
+        intake_type:
+          type: string
+          description: M017 (ADR-0018, Addendum A). The same rule as CandidateListItem.intake_type, from the same helper - the newest Ashby link's value, else resume_parsing when resume_id is set, else null. The scoped Ashby review envelope reports the link it is addressed by. null when the read failed. Optional so an older API stays valid.
+          enum: [resume_parsing, phone_parsing]
+          nullable: true
+        ashby_phone_applied_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: M017 (ADR-0018). When an Ashby number was applied to this candidate - a once-only marker that is never cleared. It is a time and carries no number. Optional so an older API stays valid.
       additionalProperties: true
 
     CallSession:

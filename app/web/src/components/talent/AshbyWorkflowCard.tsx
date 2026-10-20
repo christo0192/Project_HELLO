@@ -38,6 +38,7 @@ import { formatDateTime } from '../../lib/datetime';
 import { sessionStatusLabel, sessionStatusTone } from './status';
 import { humanizeEnum } from '../../lib/humanize';
 import { ASHBY_ERROR_CODE_LABELS } from '../../lib/ashby-labels';
+import { IntakeBadge, isIntakeType, PROFILE_OUTCOME_LABELS } from './ResumeReviewBadge';
 
 /** Which scope the card reads through. Both resolve to the same projection. */
 export type AshbyWorkflowSource =
@@ -203,6 +204,13 @@ export interface AshbyWorkflowCardViewProps {
 export function AshbyWorkflowCardView({ workflow }: AshbyWorkflowCardViewProps) {
   const errorCodeOf = (op: AshbyCandidateWorkflowOperation): string | null =>
     op.errorCode && SANITIZED_CODE_RE.test(op.errorCode) ? op.errorCode : null;
+  // M017. Both fields are absent on an older API, which keeps the card as it
+  // was. The outcome is a code, so it passes the same shape check.
+  const phoneParsing = workflow.intakeType === 'phone_parsing';
+  const profileOutcome =
+    workflow.profileOutcome && SANITIZED_CODE_RE.test(workflow.profileOutcome)
+      ? workflow.profileOutcome
+      : null;
 
   return (
     <>
@@ -222,10 +230,29 @@ export function AshbyWorkflowCardView({ workflow }: AshbyWorkflowCardViewProps) 
       )}
 
       <dl className="glass-sunken mt-3 space-y-2 p-3 text-sm">
+        {isIntakeType(workflow.intakeType) && (
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <dt className="text-ink-secondary">Intake</dt>
+            <dd>
+              <IntakeBadge value={workflow.intakeType} />
+            </dd>
+          </div>
+        )}
+
         <div className="flex flex-wrap items-center justify-between gap-2">
           <dt className="text-ink-secondary">Resume ingestion</dt>
           <dd>
-            {workflow.ingestionState ? (
+            {phoneParsing ? (
+              // The link's ingestion row never moves again: the harmless
+              // `queued` row of an application with no resume ("Queued" would
+              // read as stuck), or the `failed_review` of a resume that could
+              // not be read and fell back to phone parsing.
+              <span className="text-ink-tertiary">
+                {workflow.ingestionState === 'failed_review'
+                  ? 'Resume unreadable, switched to phone parsing'
+                  : 'No resume (phone parsing)'}
+              </span>
+            ) : workflow.ingestionState ? (
               <StatusBadge tone={ashbyIngestionTone(workflow.ingestionState)}>
                 {ashbyIngestionLabel(workflow.ingestionState)}
               </StatusBadge>
@@ -234,6 +261,16 @@ export function AshbyWorkflowCardView({ workflow }: AshbyWorkflowCardViewProps) 
             )}
           </dd>
         </div>
+
+        {profileOutcome && (
+          <div className="flex flex-wrap items-start justify-between gap-2">
+            <dt className="text-ink-secondary">Phone parsing check</dt>
+            {/* In words; the exact code stays one hover away for support. */}
+            <dd className="text-right text-ink" title={profileOutcome}>
+              {humanizeEnum(profileOutcome, PROFILE_OUTCOME_LABELS)}
+            </dd>
+          </div>
+        )}
 
         {workflow.operations.map((op) => {
           const code = errorCodeOf(op);

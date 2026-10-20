@@ -19,6 +19,7 @@ import {
   isAshbyRuntimeActive,
   describeAshbyConfig,
   describeAshbyRuntime,
+  ashbyPhoneParsingEnabled,
   parseResumeHosts,
   RUNTIME_BOUNDS,
   MIN_API_KEY_LENGTH,
@@ -102,6 +103,55 @@ describe('loadAshbyRuntimeConfig — fail-closed defaults', () => {
     expect(rc.signalPollMs).toBe(RUNTIME_BOUNDS.signalPollMs.def);
     expect(rc.leaseSeconds).toBe(RUNTIME_BOUNDS.leaseSeconds.def);
     expect(rc.reclaimIntervalMs).toBe(RUNTIME_BOUNDS.reclaimIntervalMs.def);
+  });
+});
+
+describe('ASHBY_PHONE_PARSING_ENABLED — kill switch, OFF unless the literal "true"', () => {
+  it('is OFF when unset, in the runtime config, the describe view and the standalone reader', () => {
+    const src = envMap();
+    const rc = loadAshbyRuntimeConfig(src);
+    expect(rc.phoneParsingEnabled).toBe(false);
+    expect(describeAshbyRuntime(loadAshbyConfig(src), rc).phoneParsingEnabled).toBe(false);
+    expect(ashbyPhoneParsingEnabled(src)).toBe(false);
+    expect(ashbyPhoneParsingEnabled({} as NodeJS.ProcessEnv)).toBe(false);
+  });
+
+  it('treats "false" and every near-miss of "true" as OFF', () => {
+    for (const v of ['false', 'TRUE', 'True', '1', 'yes', 'on', '', ' true', 'true ']) {
+      const src = envMap({ ASHBY_PHONE_PARSING_ENABLED: v });
+      expect(loadAshbyRuntimeConfig(src).phoneParsingEnabled, `value ${JSON.stringify(v)}`).toBe(false);
+      expect(ashbyPhoneParsingEnabled(src), `value ${JSON.stringify(v)}`).toBe(false);
+    }
+  });
+
+  it('is ON for the literal "true", and describeAshbyRuntime reads it back', () => {
+    const src = envMap({ ASHBY_PHONE_PARSING_ENABLED: 'true' });
+    const rc = loadAshbyRuntimeConfig(src);
+    expect(rc.phoneParsingEnabled).toBe(true);
+    expect(describeAshbyRuntime(loadAshbyConfig(src), rc).phoneParsingEnabled).toBe(true);
+    expect(ashbyPhoneParsingEnabled(src)).toBe(true);
+  });
+
+  it('is independent of the runtime gates: it never activates the runtime by itself', () => {
+    const src = envMap({ ASHBY_RUNTIME_ENABLED: 'false', ASHBY_PHONE_PARSING_ENABLED: 'true' });
+    const cfg = loadAshbyConfig(src);
+    const rc = loadAshbyRuntimeConfig(src);
+    expect(rc.phoneParsingEnabled).toBe(true);
+    expect(isAshbyRuntimeActive(cfg, rc)).toBe(false);
+    expect(describeAshbyRuntime(cfg, rc).active).toBe(false);
+  });
+
+  it('the standalone reader defaults to process.env', () => {
+    const prior = process.env.ASHBY_PHONE_PARSING_ENABLED;
+    try {
+      delete process.env.ASHBY_PHONE_PARSING_ENABLED;
+      expect(ashbyPhoneParsingEnabled()).toBe(false);
+      process.env.ASHBY_PHONE_PARSING_ENABLED = 'true';
+      expect(ashbyPhoneParsingEnabled()).toBe(true);
+    } finally {
+      if (prior === undefined) delete process.env.ASHBY_PHONE_PARSING_ENABLED;
+      else process.env.ASHBY_PHONE_PARSING_ENABLED = prior;
+    }
   });
 });
 

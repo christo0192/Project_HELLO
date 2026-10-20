@@ -47,6 +47,8 @@ const _contractVisibleEnvReads = [
   process.env.ASHBY_RECONCILE_SWEEP_MAX_PAGES,
   process.env.ASHBY_RECONCILE_SWEEP_MAX_RESTARTS,
   process.env.ASHBY_RECONCILE_ANCHOR_MAX_AGE_MS,
+  // Phone-parsing intake kill switch (M017, ADR-0018).
+  process.env.ASHBY_PHONE_PARSING_ENABLED,
 ];
 void _contractVisibleEnvReads;
 
@@ -254,6 +256,16 @@ export interface AshbyRuntimeConfig {
    * deploy.
    */
   stagePrefilterEnabled: boolean;
+  /**
+   * KILL SWITCH (`ASHBY_PHONE_PARSING_ENABLED=true`) for the phone-parsing
+   * intake (M017, ADR-0018): Ashby applicants with no resume are classified
+   * from their Ashby profile and screened by phone. Unset or anything but
+   * 'true' is OFF. OFF stops the profile enqueues, the profile sweep and job,
+   * and holds phone-parsing engagements out of the due batch; it does NOT
+   * undo the always-on safety fixes, and HR actions stay available.
+   * Production turns it on through fly.toml [env]; a Fly secret overrides that.
+   */
+  phoneParsingEnabled: boolean;
 }
 
 /** Clamp a raw env integer into [min,max]; any malformed value yields `def`. */
@@ -345,7 +357,17 @@ export function loadAshbyRuntimeConfig(
     reconcileAnchorDisabled: source.ASHBY_RECONCILE_ANCHOR_DISABLED === 'true',
     // Opt-in: absent or anything but 'true' leaves the pre-filter off.
     stagePrefilterEnabled: source.ASHBY_STAGE_PREFILTER_ENABLED === 'true',
+    phoneParsingEnabled: ashbyPhoneParsingEnabled(source),
   };
+}
+
+/**
+ * The phone-parsing kill switch on its own, for callers (the phone runtime)
+ * that need it without loading the whole Ashby runtime config. Read as the
+ * literal 'true' only, so unset means OFF in code and in tests.
+ */
+export function ashbyPhoneParsingEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  return env.ASHBY_PHONE_PARSING_ENABLED === 'true';
 }
 
 /**
@@ -400,6 +422,7 @@ export function describeAshbyRuntime(
   reconcileSweepIntervalMs: number;
   reconcileAnchorDisabled: boolean;
   stagePrefilterEnabled: boolean;
+  phoneParsingEnabled: boolean;
 } {
   return {
     runtimeEnabled: runtime.runtimeEnabled,
@@ -421,5 +444,8 @@ export function describeAshbyRuntime(
     reconcileSweepIntervalMs: runtime.reconcileSweepIntervalMs,
     reconcileAnchorDisabled: runtime.reconcileAnchorDisabled,
     stagePrefilterEnabled: runtime.stagePrefilterEnabled,
+    // Read-back for the kill switch: a Fly secret overrides [env], so the
+    // effective value is only knowable from the running process.
+    phoneParsingEnabled: runtime.phoneParsingEnabled,
   };
 }

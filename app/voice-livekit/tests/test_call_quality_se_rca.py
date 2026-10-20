@@ -504,10 +504,14 @@ class TestCoverageJudgeTelemetryWiring(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _state():
-        return _default_state(questions=[
+        state = _default_state(questions=[
             {"key": "k1", "text": "Tell me about your recent role.", "mandatory": True, "hint": None},
             {"key": "k2", "text": "What is your notice period?", "mandatory": True, "hint": None},
         ])
+        # A resume conflict needs a resume on file: M017 (ADR-0018) drops a
+        # judge conflict on a phone-parsing call with no resume.
+        state.resume_facts = {"recent_role": {"company": "Example Co", "period": "2020-2026"}}
+        return state
 
     async def _coordinator(self, call_metrics):
         agent, session, state, client, hooks = await _make_native_coordinator(

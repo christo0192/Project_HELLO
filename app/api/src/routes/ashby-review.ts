@@ -32,6 +32,7 @@ import {
   type CandidateAshbyWorkflowStore,
 } from '../integrations/ashby/candidate-workflow.js';
 import { respondCandidateWorkflow } from './ashby-candidate-workflow.js';
+import { loadCandidateIntakeType } from './candidates.js';
 
 export const ashbyReviewRouter = Router();
 
@@ -121,7 +122,15 @@ ashbyReviewRouter.get('/:applicationLinkId', requireRole('viewer'), async (req, 
     // same helper, for the candidate this link already resolved to (so the
     // scoped page says "Abandoned: no answer" where the main pages do, not a
     // stale "Queued"). It never rejects and degrades to unknown.
-    const phoneProgress = await loadCandidatePhoneProgress([candidateId]);
+    //
+    // The intake type (M017) comes from the detail's helper too, narrowed to
+    // the link this page is addressed by, so the header and the workflow card
+    // describe the same application. It never rejects and degrades to null.
+    const linkId = uuidSchema.parse(req.params.applicationLinkId);
+    const [phoneProgress, intakeType] = await Promise.all([
+      loadCandidatePhoneProgress([candidateId]),
+      loadCandidateIntakeType(candidateId, (candidate as { resume_id?: unknown }).resume_id, linkId),
+    ]);
 
     // Same envelope as GET /api/candidates/:id, so the SAME redaction. This is
     // a separate code path reading the same `select('*')`: redacting one route
@@ -131,6 +140,7 @@ ashbyReviewRouter.get('/:applicationLinkId', requireRole('viewer'), async (req, 
       candidate: {
         ...redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
         ...phoneProgressFields(phoneProgress, candidateId, req.authUser?.appRole),
+        intake_type: intakeType,
       },
       sessions: sessions ?? [],
       assessments: assessments ?? [],

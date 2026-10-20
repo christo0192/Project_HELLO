@@ -365,6 +365,30 @@ row; playback responses are `Cache-Control: no-store`. The R2 access key id and
 secret access key (`R1_RECORDING_S3_*`) are **Secret** credentials held only by
 `project-hello-api`: the R1 worker receives presigned URLs and never holds one.
 
+### Ashby phone-parsing intake (0130, ADR-0018)
+
+Columns added by `0130_ashby_phone_parsing_intake.sql`. Every one is an operational code,
+counter, timestamp or opaque id: none holds a name, email or number.
+
+| Table / column | Classification | Notes |
+|----------------|---------------|-------|
+| `ashby_application_links.intake_type` | Internal | `resume_parsing` (default) or `phone_parsing`; how the application is screened |
+| `ashby_application_links.profile_checked_at` | Public | Timestamp of the last profile-sweep claim or recorded outcome |
+| `ashby_application_links.profile_attempts` | Internal | Count of profile-sweep claims (bounded) |
+| `ashby_application_links.profile_outcome` | Internal | Last profile-step outcome, from a closed CHECK vocabulary of codes |
+| `ashby_application_links.identity_mismatch_attempt_id` | Public | Opaque UUID of the call attempt that recorded the first confirmed identity mismatch on an unverified Ashby number; no foreign key |
+| `candidates.ashby_phone_applied_at` | Public | Timestamp marker that an Ashby number was applied; never cleared, and holds no number |
+
+**Contact data from Ashby.** `candidates.name`, `email`, `phone_raw` and `phone_e164` may
+now originate from the Ashby candidate record (`candidate.info`) as well as from the parsed
+resume or HR verification. They keep the same **Confidential PII** classification and
+retention as resume-derived contact data. The profile step only fills a NULL name or email
+and applies an Ashby number at most once; it writes no audit row, and no log line, job
+payload, error or RPC answer carries the values. A DSAR delete terminates the candidate's
+live Ashby links (`terminal_state = 'deleted'`, `terminal_reason = 'subject_erasure'`), so
+the data is not re-collected by a later import or sweep, and a pending correction,
+restriction or erasure request holds every profile write.
+
 ## Classification summary
 
 | Level | Count | Examples |

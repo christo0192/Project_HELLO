@@ -471,13 +471,19 @@ export function CandidateProfileCard({
 }: CandidateProfileCardProps) {
   const headingId = useId();
   const displayStatus = candidateDisplayStatus(candidate);
+  // M017: a phone-parsing candidate has no usable resume (none was attached,
+  // or it could not be read and fell back), so nothing here was "parsed from
+  // the resume" — the card says where its facts came from.
+  const phoneParsing = candidate.intake_type === 'phone_parsing';
   return (
     <SurfaceCard as="section" labelledBy={headingId} className={className}>
       <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Profile
       </h2>
       <p className="mb-4 mt-0.5 text-label text-ink-tertiary">
-        Identity and skills as parsed from the resume.
+        {phoneParsing
+          ? 'Name and phone from the Ashby application (no usable resume).'
+          : 'Identity and skills as parsed from the resume.'}
       </p>
       {/* SUMMARY FIRST, ABOVE THE NUMBERS. The ask was to put it "above the
           numbers and experience, because summary is the thing the manager
@@ -533,7 +539,7 @@ export function CandidateProfileCard({
           <dt className="mb-1.5 text-xs font-medium text-ink-secondary">Skills</dt>
           <dd className="flex flex-wrap gap-1.5">
             {candidate.skills.length === 0 ? (
-              <span className="text-ink-tertiary">None parsed</span>
+              <span className="text-ink-tertiary">{phoneParsing ? 'No resume' : 'None parsed'}</span>
             ) : (
               candidate.skills.map((s) => (
                 <Tag key={s} tone="accent" srPrefix="Skill:">

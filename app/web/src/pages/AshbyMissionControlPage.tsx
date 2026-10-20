@@ -36,6 +36,7 @@ import { OverflowMenu } from '../components/design/OverflowMenu';
 import type { OverflowMenuItem } from '../components/design/OverflowMenu';
 import { humanizeEnum } from '../lib/humanize';
 import { ASHBY_ERROR_CODE_LABELS } from '../lib/ashby-labels';
+import { intakeTypeLabel, PROFILE_OUTCOME_LABELS } from '../components/talent/ResumeReviewBadge';
 import {
   isBrowserScreeningRetired,
   RETIRED_INVITE_RECRUITER_MESSAGE,
@@ -1102,7 +1103,13 @@ export function AshbyMissionControlPage() {
         [workflows.filter((w) => w.operations.some((op) => op.state === 'failed')).length, 'with a failed operation'],
         [workflows.filter(notQueuedForWriteback).length, 'not queued for write-back'],
         [workflows.filter((w) => w.heldForEvidence === true).length, 'held for interview evidence'],
-        [workflows.filter((w) => w.ingestionState === 'failed_review').length, 'with a resume to review'],
+        // A phone-parsing link's `failed_review` resume was set aside, not
+        // left for review: it fell back to phone parsing (M017).
+        [
+          workflows.filter((w) => w.ingestionState === 'failed_review' && w.intakeType !== 'phone_parsing')
+            .length,
+          'with a resume to review',
+        ],
       ])
     : null;
 
@@ -1119,6 +1126,12 @@ export function AshbyMissionControlPage() {
           ? 'Reissue invite link'
           : 'Get invite link';
         const lifecycle = LIFECYCLE[w.lifecycle] ?? { label: humanizeEnum(w.lifecycle), tone: 'neutral' };
+        // M017: a phone-parsing application has no resume. It says so in place
+        // of the resume import, whose harmless `queued` row never moves; a
+        // resume that could not be read and fell back says that instead.
+        const phoneParsing = w.intakeType === 'phone_parsing';
+        const resumeUnreadable = phoneParsing && w.ingestionState === 'failed_review';
+        const resumeImport = phoneParsing ? null : w.ingestionState;
         // A closed application has nothing left to do except, perhaps, be
         // reviewed: no invite, no cancel, and so no menu at all.
         const menuItems: OverflowMenuItem[] = terminal
@@ -1196,14 +1209,25 @@ export function AshbyMissionControlPage() {
                   </StatusBadge>
                 )}
               </div>
-              {(w.ingestionState || w.operations.length > 0) && (
+              {(phoneParsing || resumeImport || w.profileOutcome || w.operations.length > 0) && (
                 <ul className="mt-1.5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-label text-ink-secondary">
-                  {w.ingestionState && (
+                  {phoneParsing && (
+                    <li title="phone_parsing">Intake: {intakeTypeLabel(w.intakeType)}</li>
+                  )}
+                  {resumeUnreadable && (
+                    <li title="failed_review">Resume unreadable, switched to phone parsing</li>
+                  )}
+                  {resumeImport && (
                     <li
-                      title={w.ingestionState}
-                      className={w.ingestionState === 'failed_review' ? 'text-warning-text' : undefined}
+                      title={resumeImport}
+                      className={resumeImport === 'failed_review' ? 'text-warning-text' : undefined}
                     >
-                      Resume import: {humanizeEnum(w.ingestionState, INGESTION_LABELS)}
+                      Resume import: {humanizeEnum(resumeImport, INGESTION_LABELS)}
+                    </li>
+                  )}
+                  {w.profileOutcome && (
+                    <li title={w.profileOutcome}>
+                      Phone parsing check: {humanizeEnum(w.profileOutcome, PROFILE_OUTCOME_LABELS)}
                     </li>
                   )}
                   {w.operations.map((op) => {

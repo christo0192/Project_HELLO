@@ -138,8 +138,10 @@ describe('0114 §6 — ownership and lift source', () => {
 
   it('the lift sources are the newest prior declarations (0095, 0057, 0058)', () => {
     // Each file is read ONCE (a bind-mounted tree makes repeated reads slow).
+    // Only files numbered BELOW 0114 are prior: a later migration (0130,
+    // M017) lifts admit and ensure again FROM 0114, which is not a source.
     const texts = readdirSync(MIGRATIONS_DIR)
-      .filter((f) => /^\d{4}_.*\.sql$/.test(f) && f !== '0114_phone_outcome_integrity.sql')
+      .filter((f) => /^\d{4}_.*\.sql$/.test(f) && Number(f.slice(0, 4)) < 114)
       .sort()
       .map((f) => ({ f, sql: readFileSync(MIGRATIONS_DIR + f, 'utf8') }));
     const newestBefore0114 = (name: string) => {

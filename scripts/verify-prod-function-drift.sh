@@ -16,6 +16,19 @@
 # column is added by 0118), so its presence in the live body proves production
 # runs the 0118 definitions and not the 0112 ones.
 #
+# 0130 (M017, ADR-0018) re-declares admit_phone_attempt and
+# ensure_ashby_phone_engagement as 0114 verbatim plus marked intake-gate
+# hunks. No pre-0130 body contains the token `phone_parsing` (the intake type
+# is added by 0130), so its presence proves production runs the 0130 bodies.
+# 0130 also adds three RPCs that no earlier migration declares:
+# apply_ashby_candidate_profile, claim_ashby_profile_due and
+# release_ashby_number_after_identity_mismatch. A missing function fails the
+# regprocedure cast (an unreadable answer, so the check fails closed), and
+# each token is one its 0130 body must contain. 0130 §8 also re-declares
+# verify_candidate_phone as 0099 plus one marked hunk that locks the
+# engagements before the candidate; no earlier body contains its
+# `for update of e`.
+#
 # It issues SELECTs only (pg_get_functiondef). No PII is queried or printed.
 #
 # Target:
@@ -34,6 +47,12 @@ CHECKS=(
   "screening_v2.request_phone_rescreen(uuid,text,text,text,uuid,timestamptz)|ensure_ashby_phone_engagement"
   "screening_v2.claim_voice_worker(text,text,uuid,bigint,timestamptz)|livekit_host"
   "screening_v2.reset_voice_worker(text,text,timestamptz)|livekit_host"
+  "screening_v2.admit_phone_attempt(uuid,text,text,integer,timestamptz)|phone_parsing"
+  "screening_v2.ensure_ashby_phone_engagement(uuid,timestamptz)|phone_parsing"
+  "screening_v2.apply_ashby_candidate_profile(uuid,text,text,text,text,text,text,timestamptz)|ensure_ashby_phone_engagement"
+  "screening_v2.claim_ashby_profile_due(integer,integer,integer,integer,timestamptz)|profile_attempts"
+  "screening_v2.release_ashby_number_after_identity_mismatch(uuid,timestamptz)|identity_unconfirmed"
+  "screening_v2.verify_candidate_phone(uuid,text,uuid,timestamptz)|for update of e"
 )
 
 if [ -n "${SUPABASE_DB_URL:-}" ]; then

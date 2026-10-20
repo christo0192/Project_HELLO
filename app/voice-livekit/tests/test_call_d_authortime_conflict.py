@@ -421,6 +421,52 @@ class TestAuthortimeArming(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(call_metrics["coverage_judge"]["conflict_found"], 1)
             await self._close(hooks)
 
+    # ── M017 (ADR-0018): phone parsing, no resume on file ────────────────
+
+    #: A probe-shaped reply the model could author on its own (the same shape
+    #: TestLlmAuthoredConflictArming arms with a resume on file).
+    LLM_PROBE = (
+        "I noticed that your description of your recent experience differs from "
+        "the resume information we received. Could you clarify the timeline and "
+        "roles for me?"
+    )
+
+    async def test_empty_evidence_arms_nothing(self):
+        # The 0070 projection of a candidate with no parsed resume, set here
+        # WITHOUT the parser's collapse: the arm itself must see no resume.
+        call_metrics = agent_mod._new_phone_call_metrics()
+        state = _default_state(role_title="Software Engineer")
+        state.resume_facts = {
+            "name": None, "current_role": None, "experience_years": None,
+            "skills": None, "summary": "", "recent_role": None,
+        }
+        agent, _, _, _, hooks = await _make_native_coordinator(
+            turn_mode="toolless", state=state,
+            coverage_judge_enabled=False, call_metrics=call_metrics,
+        )
+        self.assertFalse(agent._owed_conflict_probe["value"])
+        self.assertFalse(agent._maybe_arm_llm_authored_conflict(self.LLM_PROBE))
+        self.assertIsNone(agent._conflict_delivery.get("key"))
+        self.assertEqual(call_metrics["coverage_judge"]["conflict_probe_scheduled"], 0)
+        self.assertEqual(len(self._armed_logs(hooks)), 0)
+        await self._close(hooks)
+
+    async def test_name_only_evidence_still_arms(self):
+        # A degraded name-only parse counts as a resume on file, so the
+        # LLM-authored probe arms exactly as before (identity recovery relies
+        # on name-only evidence too: test_call_c_identity_recovery).
+        agent, _, _, _, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+            state=self._state("Software Engineer", {"name": "Test Person"}),
+            coverage_judge_enabled=False,
+            call_metrics=agent_mod._new_phone_call_metrics(),
+        )
+        # A name carries no role class, so there is no author-time delta.
+        self.assertFalse(agent._owed_conflict_probe["value"])
+        self.assertTrue(agent._maybe_arm_llm_authored_conflict(self.LLM_PROBE))
+        self.assertIsNotNone(agent._conflict_delivery.get("key"))
+        await self._close(hooks)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

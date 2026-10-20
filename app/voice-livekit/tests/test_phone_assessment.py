@@ -165,6 +165,59 @@ class TestAssessmentStateParse(unittest.TestCase):
         self.assertTrue(state.plan_complete)
         self.assertIsNone(state.question_at(2))
 
+    # M017 (ADR-0018): a phone-parsing candidate has no parsed resume, so the
+    # 0070 projection arrives with every key null and a blank summary.
+    _NULL_0070_EVIDENCE = {
+        "name": None, "current_role": None, "experience_years": None,
+        "skills": None, "summary": "", "recent_role": None, "prior_roles": None,
+        "career_highlights": None, "education": None, "certifications": None,
+    }
+
+    def test_0070_evidence_filled_with_nulls_parses_to_empty(self):
+        body = _body()
+        body["context"]["candidate_evidence"] = dict(self._NULL_0070_EVIDENCE)
+        state = phone.PhoneAssessmentState.parse(body)
+        self.assertTrue(state.ok)
+        self.assertEqual(state.resume_facts, {})
+        self.assertFalse(phone.phone_resume_on_file(state.resume_facts))
+
+    def test_evidence_drops_only_empty_values(self):
+        body = _body()
+        body["context"]["candidate_evidence"] = {
+            **self._NULL_0070_EVIDENCE,
+            "name": "Test Person",
+            "current_role": "   ",
+            "experience_years": 0,
+            "skills": [],
+            "summary": "Builds data pipelines",
+            "recent_role": {},
+            "prior_roles": ["Analyst"],
+        }
+        state = phone.PhoneAssessmentState.parse(body)
+        self.assertEqual(state.resume_facts, {
+            "name": "Test Person",
+            "experience_years": 0,
+            "summary": "Builds data pipelines",
+            "prior_roles": ["Analyst"],
+        })
+        self.assertTrue(phone.phone_resume_on_file(state.resume_facts))
+
+    def test_name_only_evidence_counts_as_on_file(self):
+        # A degraded name-only parse keeps today's behaviour.
+        body = _body()
+        body["context"]["candidate_evidence"] = {
+            **self._NULL_0070_EVIDENCE, "name": "Test Person",
+        }
+        state = phone.PhoneAssessmentState.parse(body)
+        self.assertEqual(state.resume_facts, {"name": "Test Person"})
+        self.assertTrue(phone.phone_resume_on_file(state.resume_facts))
+
+    def test_resume_evidence_helpers_refuse_non_dicts(self):
+        for value in (None, [], "Test Person", 7):
+            with self.subTest(value=value):
+                self.assertEqual(phone.phone_resume_evidence(value), {})
+                self.assertFalse(phone.phone_resume_on_file(value))
+
 
 # ── The shape rule ────────────────────────────────────────────────────
 

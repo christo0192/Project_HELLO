@@ -52,6 +52,7 @@ import {
   isAppealPending,
 } from "../components/talent/status";
 import { CandidateHeadlineFacts } from "../components/talent/CandidateHeadlineFacts";
+import { IntakeBadge } from "../components/talent/ResumeReviewBadge";
 import { ExportReportButton } from "../components/talent/ExportReportButton";
 import { headlineCallFacts } from "../components/talent/sessionLegs";
 import { evidenceHoldReason, isEvidenceInsufficient } from "../lib/evidence-hold";
@@ -381,6 +382,9 @@ export function CandidateDetailPage() {
                 {displayStatus.detail}
               </span>
             )}
+            {/* M017: "Resume parsing" / "Phone parsing", after the status and
+                its own detail; nothing on an API without the field. */}
+            <IntakeBadge value={candidate.intake_type} />
             <CandidateHeadlineFacts
               roleTitle={roleTitle}
               callSeconds={headline?.callSeconds ?? null}
@@ -848,6 +852,10 @@ function PhoneCycleCard({
     && current.terminal_at != null
     && ["completed", "failed", "abandoned_no_answer", "cancelled", "wrong_number"].includes(current.state);
   const requiresVerification = current?.state === "wrong_number";
+  // M017: cancelled after a second identity mismatch on an Ashby number.
+  // Re-screen stays available, with the verify box above it.
+  const identityUnconfirmed = current?.state === "cancelled"
+    && current.state_reason === "identity_unconfirmed";
   // C8 (0114): held as a same-role duplicate application; never dialled
   // until a recruiter releases it.
   const duplicateHold = isDuplicateApplicationHold(current);
@@ -1008,6 +1016,38 @@ function PhoneCycleCard({
     }
   }
 
+  const verifyNumberCard = (
+    <SurfaceCard level="sunken" className="mt-4 p-3">
+      {identityUnconfirmed && (
+        // M017 (ADR-0018): a second wrong person on an unverified Ashby
+        // number cleared it. A re-screen without a verified number waits
+        // on phone_invalid, so verify first, then re-screen below.
+        <p className="mb-2 text-sm text-ink-secondary">
+          The Ashby number reached the wrong person twice and was cleared. Verify the right number, then request a re-screen.
+        </p>
+      )}
+      <div className="grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+        <div className="min-w-0">
+          <label htmlFor={`${headingId}-phone`} className="block text-label font-medium text-ink-secondary">
+            {identityUnconfirmed ? "Verify the candidate’s Indian mobile" : "Verify replacement Indian mobile"}
+          </label>
+          <CandidateInput
+            id={`${headingId}-phone`}
+            value={phone}
+            onChange={(event) => setPhone(event.target.value)}
+            placeholder="+91…"
+            inputMode="tel"
+            autoComplete="off"
+            className="mt-1 block w-full"
+          />
+        </div>
+        <CandidateButton variant="secondary" onClick={() => void verifyNumber()} loading={verifying} disabled={!phone.trim()}>
+          Verify number
+        </CandidateButton>
+      </div>
+    </SurfaceCard>
+  );
+
   return (
     <>
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
@@ -1136,29 +1176,14 @@ function PhoneCycleCard({
           ) : canRescreen && requiresVerification && !admin ? (
             <p className="mt-3 text-sm text-warning-text">An administrator must verify a replacement number before this cycle can be re-screened.</p>
           ) : canRescreen && requiresVerification && admin ? (
-            <SurfaceCard level="sunken" className="mt-4 p-3">
-              <div className="grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-                <div className="min-w-0">
-                  <label htmlFor={`${headingId}-phone`} className="block text-label font-medium text-ink-secondary">
-                    Verify replacement Indian mobile
-                  </label>
-                  <CandidateInput
-                    id={`${headingId}-phone`}
-                    value={phone}
-                    onChange={(event) => setPhone(event.target.value)}
-                    placeholder="+91…"
-                    inputMode="tel"
-                    autoComplete="off"
-                    className="mt-1 block w-full"
-                  />
-                </div>
-                <CandidateButton variant="secondary" onClick={() => void verifyNumber()} loading={verifying} disabled={!phone.trim()}>
-                  Verify number
-                </CandidateButton>
-              </div>
-            </SurfaceCard>
+            verifyNumberCard
           ) : canRescreen ? (
             <>
+            {identityUnconfirmed && (admin ? verifyNumberCard : (
+              <p className="mt-3 text-sm text-warning-text">
+                An administrator must verify the candidate&apos;s number before a re-screen can dial.
+              </p>
+            ))}
             {rescreenRecommendation && (
               // C3: the newest scorecard is held for thin interview evidence.
               // One click asks for the existing HR re-screen with reason

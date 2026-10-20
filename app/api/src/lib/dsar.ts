@@ -683,6 +683,45 @@ export async function deleteDSAR(
     .eq('candidate_id', candidateId);
   if (!resumeErr) deletedEntities.push(`resume:${candidateId}`);
 
+  // Terminate the candidate's live Ashby links (ADR-0018). A live link is what `runImport` and
+  // the phone-parsing profile sweep act on, so without this the Ashby record would re-create the
+  // erased person. It runs BEFORE the candidate delete because `candidate_id` is `on delete set
+  // null`: afterwards nothing ties the link to this person. A link already terminal keeps its state.
+  // A failure therefore returns BEFORE the candidate delete, like the R1 step: the request stays in
+  // progress, with a failure audit, until a retry succeeds (every step above is idempotent).
+  const { data: terminatedLinks, error: linkErr } = await client
+    .from('ashby_application_links')
+    .update({
+      terminal_state: 'deleted',
+      terminal_reason: 'subject_erasure',
+      updated_at: new Date().toISOString(),
+    })
+    .eq('candidate_id', candidateId)
+    .is('terminal_state', null)
+    .select('id');
+  if (linkErr) {
+    await client
+      .from('data_subject_requests')
+      .update({ request_status: 'in_progress', notes: 'Ashby link termination incomplete (ashby_link_terminate_error)' })
+      .eq('id', dsarId);
+    await recordGovernanceAudit({
+      action: 'data_deleted',
+      actorId,
+      entityType: 'candidate',
+      entityId: candidateId,
+      details: { dsar_id: dsarId, stage: 'ashby_links', code: 'ashby_link_terminate_error' },
+      outcome: 'failure',
+      correlationId: corrId,
+    }, clientOverride);
+    return {
+      success: false,
+      deletedEntities,
+      blockedByLegalHolds: [],
+      auditEntryId: null,
+    };
+  }
+  deletedEntities.push(`ashby_link_terminated:${(terminatedLinks ?? []).length}`);
+
   // Finally, delete the candidate
   const { error: candidateErr } = await client
     .from('candidates')
@@ -731,10 +770,17 @@ const CORRECTABLE_FIELDS = new Set([
  * DSAR CORRECTION MAY ONLY REMOVE DIALABILITY, NEVER CREATE IT.
  *
  * `phone_e164`/`phone_valid` are the admission door of the outbound phone
- * screener. The approved SOURCE for a dialable number is the resume structurer
- * and nothing else — no admin entry, no enrichment, no manual fallback. A
+ * screener. The approved SOURCES for a dialable number are exactly three:
+ *
+ *  - the resume structurer;
+ *  - HR verification (`verify_candidate_phone`: admin only, strict format
+ *    checked at the SQL boundary, audited);
+ *  - the Ashby candidate profile (ADR-0018: applied once, never over a valid
+ *    number, and refused under a DSAR hold).
+ *
+ * There is no other admin entry, no enrichment and no manual fallback. A
  * rectification endpoint that accepted an arbitrary string into `phone_e164`
- * would be exactly that manual source, reachable by any interviewer, and it
+ * would be a fourth, unvalidated source, reachable by any interviewer, and it
  * would also destroy the invariant the opt-out suppression depends on:
  * `apply_phone_event` digests `phone_e164` with NO format check, so a
  * non-strict value stored here writes a suppression that admission — which

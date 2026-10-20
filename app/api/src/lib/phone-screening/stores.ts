@@ -188,7 +188,23 @@ function boundedResumeFacts(row: Row): Readonly<Record<string, unknown>> {
       out[key] = value;
     }
   }
-  return out;
+  // M017: a candidate with no resume (an Ashby "phone parsing" intake) arrives
+  // as 0070's object with every key null and `summary` blank. It collapses to
+  // `{}`, the shape that already means "no resume" to every worker — including
+  // one deployed before M017, which infers a resume from the evidence it gets.
+  return Object.values(out).every(isEmptyEvidence) ? {} : out;
+}
+
+/**
+ * M017: a projected value that carries no evidence — null, a blank string, an
+ * empty array, or an object (a role) whose own values are all empty.
+ */
+function isEmptyEvidence(value: unknown): boolean {
+  if (value === null || value === undefined) return true;
+  if (typeof value === 'string') return value.trim() === '';
+  if (Array.isArray(value)) return value.length === 0;
+  if (typeof value === 'object') return Object.values(value).every(isEmptyEvidence);
+  return false;
 }
 
 /**

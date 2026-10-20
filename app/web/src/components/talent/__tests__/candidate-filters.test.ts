@@ -46,6 +46,7 @@ describe('parseCandidateFilters', () => {
       statuses: ['new', 'screening'],
       recommendations: ['advance'],
       resumeReview: [],
+      intakeType: [],
       assessed: true,
       roleId: 'r1',
       jobState: null,
@@ -80,6 +81,7 @@ describe('buildCandidateSearch / candidatesHref', () => {
       statuses: ['new', 'screening'],
       recommendations: ['advance', 'reject'],
       resumeReview: [],
+      intakeType: [],
       assessed: true,
       roleId: 'r9',
       jobState: null,
@@ -272,6 +274,7 @@ describe('resume-review facet', () => {
       statuses: ['queued'],
       recommendations: ['advance'],
       resumeReview: ['processing', 'cancelled'],
+      intakeType: [],
       assessed: true,
       roleId: 'r9',
       jobState: null,
@@ -350,6 +353,93 @@ describe('resume-review facet', () => {
       label: 'Queued for screening',
       emphasis: false,
     });
+  });
+});
+
+/**
+ * M017 (Addendum A): the intake facet mirrors the resume-review one exactly —
+ * parse, serialize, predicate, active check — and a row with no intake type
+ * (an older API, or a candidate with neither a link nor an upload) never
+ * matches an active intake filter.
+ */
+describe('intake facet', () => {
+  it('parses the intake param in canonical order, dropping unknowns', () => {
+    const parsed = parseCandidateFilters(
+      new URLSearchParams('intake=phone_parsing,bogus,resume_parsing,PHONE_PARSING'),
+    );
+    expect(parsed.intakeType).toEqual(['resume_parsing', 'phone_parsing']);
+    expect(parseCandidateFilters(new URLSearchParams('intake=bogus')).intakeType).toEqual([]);
+    expect(parseCandidateFilters(new URLSearchParams('intake=')).intakeType).toEqual([]);
+  });
+
+  it('round-trips alongside every other dimension, right after resume and before q', () => {
+    const href = candidatesHref({
+      statuses: ['queued'],
+      resumeReview: ['processing'],
+      intakeType: ['phone_parsing', 'resume_parsing'],
+      roleId: 'r9',
+      query: 'sam',
+    });
+    expect(href).toBe(
+      '/candidates?status=queued&resume=processing&intake=resume_parsing%2Cphone_parsing&role=r9&q=sam',
+    );
+    const back = parseCandidateFilters(new URLSearchParams(href.split('?')[1]));
+    expect(back).toEqual({
+      ...EMPTY_CANDIDATE_FILTERS,
+      statuses: ['queued'],
+      resumeReview: ['processing'],
+      intakeType: ['resume_parsing', 'phone_parsing'],
+      roleId: 'r9',
+      query: 'sam',
+    });
+  });
+
+  it('emits no intake param when unselected, so every existing href is unchanged', () => {
+    expect(buildCandidateSearch(f({ statuses: ['queued'] })).has('intake')).toBe(false);
+    expect(candidatesHref({ resumeReview: ['cancelled'] })).toBe('/candidates?resume=cancelled');
+    expect(candidatesHref({ intakeType: ['phone_parsing'] })).toBe('/candidates?intake=phone_parsing');
+  });
+
+  it('narrows to the selected types and excludes a row with no intake type', () => {
+    const filters = f({ intakeType: ['phone_parsing'] });
+    expect(matchesCandidateFilters(cand({ intake_type: 'phone_parsing' }), filters)).toBe(true);
+    expect(matchesCandidateFilters(cand({ intake_type: 'resume_parsing' }), filters)).toBe(false);
+    expect(matchesCandidateFilters(cand({ intake_type: null }), filters)).toBe(false);
+    expect(matchesCandidateFilters(cand({}), filters)).toBe(false);
+    // Both selected is "has an intake type at all", never "every row".
+    const both = f({ intakeType: ['resume_parsing', 'phone_parsing'] });
+    expect(matchesCandidateFilters(cand({ intake_type: 'resume_parsing' }), both)).toBe(true);
+    expect(matchesCandidateFilters(cand({}), both)).toBe(false);
+    // Unselected, the field is ignored entirely.
+    expect(matchesCandidateFilters(cand({}), EMPTY_CANDIDATE_FILTERS)).toBe(true);
+  });
+
+  it('combines with status and resume review rather than replacing them', () => {
+    const filters = f({ statuses: ['queued'], intakeType: ['resume_parsing'], resumeReview: ['processing'] });
+    const match = cand({ status: 'queued', intake_type: 'resume_parsing', resume_review: 'processing' });
+    expect(matchesCandidateFilters(match, filters)).toBe(true);
+    expect(matchesCandidateFilters({ ...match, status: 'new' }, filters)).toBe(false);
+    expect(matchesCandidateFilters({ ...match, intake_type: 'phone_parsing' }, filters)).toBe(false);
+    expect(matchesCandidateFilters({ ...match, resume_review: 'cancelled' }, filters)).toBe(false);
+  });
+
+  it('counts as an active filter and clears with the rest', () => {
+    expect(hasActiveFilters(f({ intakeType: ['phone_parsing'] }))).toBe(true);
+    expect(EMPTY_CANDIDATE_FILTERS.intakeType).toEqual([]);
+    expect(hasActiveFilters(EMPTY_CANDIDATE_FILTERS)).toBe(false);
+  });
+
+  it('leaves the status funnel untouched', () => {
+    expect(
+      candidateFunnel([
+        cand({ status: 'queued', intake_type: 'phone_parsing' }),
+        cand({ status: 'queued', intake_type: 'resume_parsing' }),
+        cand({ status: 'new' }),
+      ]),
+    ).toEqual([
+      { status: 'new', label: 'New', value: 1 },
+      { status: 'queued', label: 'Queued', value: 2 },
+    ]);
   });
 });
 

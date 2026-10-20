@@ -95,6 +95,20 @@ export function formatResumeFacts(parsed: Partial<ParsedResume> | null | undefin
   return lines.join('\n');
 }
 
+/**
+ * M017: the RESUME FACTS block for a candidate with NO resume on file (an Ashby
+ * "phone parsing" intake). `formatResumeFacts(null)` would render a resume
+ * whose every field is "unknown", which a scorer reads as a resume that backs
+ * up nothing the candidate said. The caller decides "on file" from
+ * `candidates.resume_id`, never from the parse, so a degraded parse of a real
+ * resume still renders through `formatResumeFacts` exactly as before.
+ */
+export const NO_RESUME_ON_FILE_FACTS = [
+  'No resume is on file for this candidate, so there are no resume facts. Score from the transcript alone.',
+  'The absence of a resume is neither evidence about the candidate nor a red flag.',
+  'There is nothing to cross-check, so there are never any resume conflicts to report.',
+].join('\n');
+
 // Deterministic opening. The required AI disclosure must not be left to the model.
 export function buildOpeningMessage(args: {
   candidateName: string | null;

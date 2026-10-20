@@ -18,6 +18,9 @@
  *   the list API returns (processing | needs_review | cancelled). Applied
  *   client-side over the already-loaded page: additive, adds no request, and
  *   changes nothing about the status vocabulary.
+ * - `intake` is a comma-separated subset of the intake types the list API
+ *   returns (resume_parsing | phone_parsing). Mirrors `resume` exactly:
+ *   client-side, additive, and a row with no intake type never matches it.
  * - `role` is a role id, applied server-side via `listCandidates(roleId)`.
  * - `ashby` is `active` | `paused`: scope to roles whose Ashby job mapping is
  *   Live (enabled) or Paused in Ashby Live Jobs. Applied client-side from the
@@ -34,7 +37,7 @@
 
 import type { Candidate } from '../../types';
 import { candidateStatusKey, candidateStatusLabel } from './status';
-import { RESUME_REVIEW_ORDER } from './ResumeReviewBadge';
+import { INTAKE_TYPE_ORDER, RESUME_REVIEW_ORDER } from './ResumeReviewBadge';
 import type { AshbyJobState } from '../../lib/mapped-roles';
 
 /**
@@ -94,6 +97,7 @@ export function recommendationLabel(rec: string | null | undefined): string {
 }
 
 const RESUME_REVIEW_SET = new Set<string>(RESUME_REVIEW_ORDER);
+const INTAKE_TYPE_SET = new Set<string>(INTAKE_TYPE_ORDER);
 
 export interface CandidateFilters {
   /** Selected statuses (empty = all). */
@@ -106,6 +110,8 @@ export interface CandidateFilters {
    * or its counts.
    */
   resumeReview: string[];
+  /** Selected intake types (empty = all). Additive, like `resumeReview`. */
+  intakeType: string[];
   /** When true, restrict to candidates with a latest assessment score. */
   assessed: boolean;
   /** Selected role id, or null for all roles. */
@@ -138,6 +144,7 @@ export const EMPTY_CANDIDATE_FILTERS: CandidateFilters = {
   statuses: [],
   recommendations: [],
   resumeReview: [],
+  intakeType: [],
   assessed: false,
   roleId: null,
   jobState: null,
@@ -170,12 +177,19 @@ export function parseCandidateFilters(params: URLSearchParams): CandidateFilters
         rawResume.split(',').map((x) => x.trim()).filter((x) => RESUME_REVIEW_SET.has(x)).includes(r),
       )
     : [];
+  const rawIntake = params.get('intake');
+  const intakeType = rawIntake
+    ? INTAKE_TYPE_ORDER.filter((t) =>
+        rawIntake.split(',').map((x) => x.trim()).filter((x) => INTAKE_TYPE_SET.has(x)).includes(t),
+      )
+    : [];
   const roleId = params.get('role');
   const rawAshby = params.get('ashby');
   return {
     statuses: [...statuses],
     recommendations: [...recommendations],
     resumeReview: [...resumeReview],
+    intakeType: [...intakeType],
     assessed: params.get('assessed') === '1',
     roleId: roleId && roleId.trim() ? roleId.trim() : null,
     jobState: rawAshby === 'active' || rawAshby === 'paused' ? rawAshby : null,
@@ -199,6 +213,12 @@ export function buildCandidateSearch(filters: CandidateFilters): URLSearchParams
     params.set(
       'resume',
       RESUME_REVIEW_ORDER.filter((r) => filters.resumeReview.includes(r)).join(','),
+    );
+  }
+  if (filters.intakeType.length > 0) {
+    params.set(
+      'intake',
+      INTAKE_TYPE_ORDER.filter((t) => filters.intakeType.includes(t)).join(','),
     );
   }
   if (filters.assessed) params.set('assessed', '1');
@@ -250,6 +270,12 @@ export function matchesCandidateFilters(candidate: Candidate, filters: Candidate
   ) {
     return false;
   }
+  if (
+    filters.intakeType.length > 0 &&
+    !(candidate.intake_type && filters.intakeType.includes(candidate.intake_type))
+  ) {
+    return false;
+  }
   if (filters.assessed && candidate.latest_score == null) return false;
   return true;
 }
@@ -260,6 +286,7 @@ export function hasActiveFilters(filters: CandidateFilters): boolean {
     filters.statuses.length > 0 ||
     filters.recommendations.length > 0 ||
     filters.resumeReview.length > 0 ||
+    filters.intakeType.length > 0 ||
     filters.assessed ||
     filters.roleId !== null ||
     filters.jobState !== null ||

@@ -14,6 +14,10 @@
  *   - operation state  — ashby_operations.state
  *                        (pending|running|succeeded|failed|blocked|cancelled)
  *   - `sessionStatus`  — call_sessions.status
+ *   - `intakeType`     — ashby_application_links.intake_type
+ *                        (resume_parsing|phone_parsing; 0130, M017)
+ *   - `profileOutcome` — ashby_application_links.profile_outcome
+ *                        (the closed 0130 CHECK vocabulary, a code only)
  * See `MissionControlWorkflow` in workflow-stores.ts for the operator-facing
  * projection of the same rows.
  *
@@ -40,6 +44,29 @@
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
+import type { AshbyIntakeType, AshbyProfileOutcome } from './orchestration.js';
+
+/**
+ * 0130 §1: the link's closed `profile_outcome` vocabulary, in the CHECK's
+ * order. Pinned to the migration and to both OpenAPI enums by
+ * contract-openapi.test.ts.
+ */
+export const ASHBY_PROFILE_OUTCOMES: readonly AshbyProfileOutcome[] = [
+  'applied', 'number_invalid', 'number_placeholder', 'number_shared', 'name_missing',
+  'resume_found', 'resume_shape_unknown', 'stage_moved', 'application_inactive', 'mapping_inactive',
+  'subject_request_hold', 'engagement_active', 'not_applicable', 'ashby_unavailable',
+  'identity_unconfirmed', 'application_terminal', 'candidate_missing',
+];
+
+/** A link's `intake_type`, or null for anything outside the 0130 CHECK. */
+export function projectIntakeType(value: unknown): AshbyIntakeType | null {
+  return value === 'resume_parsing' || value === 'phone_parsing' ? value : null;
+}
+
+/** A link's `profile_outcome`, or null for anything outside the closed vocabulary. */
+export function projectProfileOutcome(value: unknown): AshbyProfileOutcome | null {
+  return (ASHBY_PROFILE_OUTCOMES as readonly unknown[]).includes(value) ? value as AshbyProfileOutcome : null;
+}
 
 /** The operation legs this surface reports on. `stage_move` is never included. */
 export const CANDIDATE_WORKFLOW_OPERATION_TYPES = ['invite_delivery', 'scorecard_write'] as const;
@@ -59,6 +86,10 @@ export interface CandidateAshbyWorkflowView {
   /** At most one entry per type — the most recently updated row for that leg. */
   operations: CandidateAshbyWorkflowOperation[];
   sessionStatus: string | null;
+  /** M017: how this application is screened; null for a value outside the CHECK. */
+  intakeType: AshbyIntakeType | null;
+  /** M017: the last Ashby profile check's outcome code; null before any check. */
+  profileOutcome: AshbyProfileOutcome | null;
   /** Null when the row carries no usable timestamp — never a fabricated one. */
   updatedAt: string | null;
 }
@@ -94,6 +125,8 @@ export interface RawCandidateWorkflowRow {
   terminal_state?: unknown;
   session_id?: unknown;
   updated_at?: unknown;
+  intake_type?: unknown;
+  profile_outcome?: unknown;
   ashby_resume_ingestions?: Array<{ state?: unknown }> | { state?: unknown } | null;
   ashby_operations?: RawOperation[] | null;
 }
@@ -146,6 +179,8 @@ export function projectCandidateWorkflow(
       (o): o is CandidateAshbyWorkflowOperation => o != null,
     ),
     sessionStatus,
+    intakeType: projectIntakeType(row.intake_type),
+    profileOutcome: projectProfileOutcome(row.profile_outcome),
     updatedAt: typeof row.updated_at === 'string' && row.updated_at.length > 0 ? row.updated_at : null,
   };
 }
@@ -174,7 +209,7 @@ export function createCandidateWorkflowStore(client: SupabaseClient): CandidateA
   // embeds are explicitly bounded so a link that accumulates operations cannot
   // grow this read without limit.
   const SELECT =
-    'lifecycle, terminal_state, session_id, updated_at, ' +
+    'lifecycle, terminal_state, session_id, updated_at, intake_type, profile_outcome, ' +
     'ashby_resume_ingestions ( state ), ' +
     'ashby_operations ( operation_type, state, error_code, updated_at )';
   const OPERATION_LIMIT = 20;

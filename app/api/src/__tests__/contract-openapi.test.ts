@@ -42,6 +42,7 @@ import { getAuditSink, setAuditSink } from '../lib/audit.js';
 import { mockAuthGetUser, type AuthUser } from '../lib/auth.js';
 import { MemoryRateLimitStore, setRateLimitStore } from '../lib/rate-limit.js';
 import { injectAssessmentRunner } from '../services/assessment.js';
+import { ASHBY_PROFILE_OUTCOMES } from '../integrations/ashby/candidate-workflow.js';
 import type { Assessment, TranscriptTurn } from '../lib/types.js';
 import {
   parseYamlDocument,
@@ -3167,5 +3168,160 @@ describe('0045 M-10 — every documented heartbeat status validates against the 
     // CONTROL: the schema the spec now names accepts both.
     expect(validateResponseBody(invalid, 'PhoneAttemptHeartbeatError', spec)).toEqual([]);
     expect(validateResponseBody(failed, 'PhoneAttemptHeartbeatError', spec)).toEqual([]);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  M017 (ADR-0018) — intake_type / intakeType / profileOutcome
+//
+//  Every addition is OPTIONAL (absent = an older API) and nullable, and the
+//  enums are the 0130 CHECK vocabularies, read from the migration itself so
+//  the spec, the projection and the database cannot drift apart.
+// ════════════════════════════════════════════════════════════════════
+
+describe('M017 — intake type and profile outcome contract', () => {
+  const MIGRATION_0130 = resolve(__dirname, '../../../supabase/migrations/0130_ashby_phone_parsing_intake.sql');
+  const migration = readFileSync(MIGRATION_0130, 'utf8');
+
+  /** The quoted values of one inline CHECK in the 0130 migration. */
+  function checkVocabulary(constraint: string, column: string): string[] {
+    const m = new RegExp(`${constraint} check \\((?:${column} is null or )?${column} in \\(([^)]*)\\)\\)`).exec(migration);
+    expect(m, constraint).not.toBeNull();
+    return [...m![1].matchAll(/'([a-z_]+)'/g)].map((x) => x[1]);
+  }
+
+  const schemas = (spec.components as YMap).schemas as YMap;
+  const prop = (schema: string, name: string): YMap =>
+    ((schemas[schema] as YMap).properties as YMap)[name] as YMap;
+
+  const INTAKE = ['resume_parsing', 'phone_parsing'];
+  const PROFILE_OUTCOMES = checkVocabulary('chk_ashby_application_links_profile_outcome', 'profile_outcome');
+
+  it('the enums equal the 0130 CHECK vocabularies, everywhere they appear', () => {
+    expect(checkVocabulary('chk_ashby_application_links_intake_type', 'intake_type')).toEqual(INTAKE);
+    expect(PROFILE_OUTCOMES).toHaveLength(17);
+    for (const [schema, name] of [
+      ['CandidateListItem', 'intake_type'], ['Candidate', 'intake_type'],
+      ['AshbyMcWorkflow', 'intakeType'], ['AshbyCandidateWorkflow', 'intakeType'],
+    ] as const) {
+      expect(prop(schema, name).enum, `${schema}.${name}`).toEqual(INTAKE);
+    }
+    for (const schema of ['AshbyMcWorkflow', 'AshbyCandidateWorkflow']) {
+      expect(prop(schema, 'profileOutcome').enum, schema).toEqual(PROFILE_OUTCOMES);
+    }
+    // The projection's closed list is the same vocabulary, in the same order.
+    expect([...ASHBY_PROFILE_OUTCOMES]).toEqual(PROFILE_OUTCOMES);
+  });
+
+  it('every addition is optional and nullable — nothing joins `required`', () => {
+    for (const [schema, names] of [
+      ['CandidateListItem', ['intake_type']],
+      ['Candidate', ['intake_type', 'ashby_phone_applied_at']],
+      ['AshbyMcWorkflow', ['intakeType', 'profileOutcome']],
+      ['AshbyCandidateWorkflow', ['intakeType', 'profileOutcome']],
+    ] as const) {
+      const required = ((schemas[schema] as YMap).required ?? []) as YValue[];
+      for (const name of names) {
+        expect(required, `${schema}.${name}`).not.toContain(name);
+        expect(prop(schema, name).nullable, `${schema}.${name}`).toBe(true);
+      }
+    }
+    expect(prop('Candidate', 'ashby_phone_applied_at').format).toBe('date-time');
+    // The two workflow schemas stay exact: the additions had to be declared.
+    expect((schemas.AshbyMcWorkflow as YMap).additionalProperties).toBe(false);
+    expect((schemas.AshbyCandidateWorkflow as YMap).additionalProperties).toBe(false);
+  });
+
+  it('GET /api/candidates → CandidateListItem carries intake_type (null, a value, or absent)', async () => {
+    configureTables({
+      candidates: ok([
+        { ...mockCandidateListItem, resume_id: UUID_3 },
+        { ...mockCandidateListItem, id: UUID_1 },
+      ]),
+      ashby_application_links: ok([
+        { candidate_id: UUID_1, updated_at: T_2026, job_mapping_id: null, intake_type: 'phone_parsing', ashby_resume_ingestions: { state: 'queued' } },
+      ]),
+    });
+    const app = createContractApp();
+    const res = await request(app).get('/api/candidates').set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    // UUID_2: no link, a resume on file (dashboard upload). UUID_1: phone parsing.
+    expect(res.body.map((r: { intake_type: unknown }) => r.intake_type)).toEqual(['resume_parsing', 'phone_parsing']);
+    expect(res.body[1].resume_review).toBeNull();
+    for (const row of res.body) expect(validateNamed(row, 'CandidateListItem', spec)).toEqual([]);
+    const { intake_type: _intake, ...withoutIntake } = res.body[0];
+    expect(validateNamed(withoutIntake, 'CandidateListItem', spec)).toEqual([]);
+    expect(validateNamed({ ...res.body[0], intake_type: null }, 'CandidateListItem', spec)).toEqual([]);
+    expect(validateNamed({ ...res.body[0], intake_type: 'bogus' }, 'CandidateListItem', spec)).not.toEqual([]);
+  });
+
+  it('GET /api/candidates/{id} → CandidateDetail carries intake_type and ashby_phone_applied_at', async () => {
+    configureTables({
+      candidates: ok({ ...mockCandidateRow, resume_id: null, ashby_phone_applied_at: T_2026 }),
+      call_sessions: ok([mockSessionRow]),
+      assessments: ok([mockAssessmentRecord]),
+      ashby_application_links: ok({ intake_type: 'phone_parsing' }),
+    });
+    const app = createContractApp();
+    const res = await request(app).get(`/api/candidates/${UUID_2}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.body.candidate).toMatchObject({ intake_type: 'phone_parsing', ashby_phone_applied_at: T_2026 });
+    expect(validateResponseBody(res.body, 'CandidateDetail', spec)).toEqual([]);
+    const bad = { ...res.body, candidate: { ...res.body.candidate, intake_type: 'bogus' } };
+    expect(validateResponseBody(bad, 'CandidateDetail', spec)).not.toEqual([]);
+    const badTime = { ...res.body, candidate: { ...res.body.candidate, ashby_phone_applied_at: 'yesterday' } };
+    expect(validateResponseBody(badTime, 'CandidateDetail', spec)).not.toEqual([]);
+  });
+
+  it('GET /api/integrations/ashby/review/{applicationLinkId} → the same envelope carries intake_type', async () => {
+    configureTables({
+      ashby_application_links: ok({ candidate_id: UUID_2, intake_type: 'resume_parsing' }),
+      candidates: ok(mockCandidateRow),
+      call_sessions: ok([mockSessionRow]),
+      assessments: ok([mockAssessmentRecord]),
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .get(`/api/integrations/ashby/review/${UUID_1}`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.body.candidate.intake_type).toBe('resume_parsing');
+    expect(validateResponseBody(res.body, 'CandidateDetail', spec)).toEqual([]);
+  });
+
+  it('GET /api/candidates/{id}/ashby-workflow → AshbyCandidateWorkflow carries intakeType and profileOutcome', async () => {
+    configureTables({
+      candidates: ok({ id: UUID_2 }),
+      ashby_application_links: ok([
+        {
+          lifecycle: 'imported', terminal_state: null, session_id: null, updated_at: T_2026,
+          intake_type: 'phone_parsing', profile_outcome: 'number_placeholder',
+          ashby_resume_ingestions: [{ state: 'queued' }], ashby_operations: [],
+        },
+      ]),
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .get(`/api/candidates/${UUID_2}/ashby-workflow`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.body.workflow).toMatchObject({ intakeType: 'phone_parsing', profileOutcome: 'number_placeholder' });
+    expect(validateResponseBody(res.body, 'AshbyCandidateWorkflowResponse', spec)).toEqual([]);
+    const { intakeType: _i, profileOutcome: _p, ...older } = res.body.workflow;
+    expect(validateResponseBody({ ...res.body, workflow: older }, 'AshbyCandidateWorkflowResponse', spec)).toEqual([]);
+    const bogus = { ...res.body, workflow: { ...res.body.workflow, profileOutcome: 'dialled' } };
+    expect(validateResponseBody(bogus, 'AshbyCandidateWorkflowResponse', spec)).not.toEqual([]);
+  });
+
+  it('AshbyMcWorkflow documents both fields under additionalProperties:false', () => {
+    const workflow = {
+      applicationLinkId: UUID_1, externalApplicationId: 'app_1', externalJobId: null,
+      lifecycle: 'imported', terminalState: null, ingestionState: 'queued', operations: [],
+      sessionStatus: null, intakeType: 'phone_parsing', profileOutcome: 'applied', updatedAt: T_2026,
+    };
+    expect(validateNamed(workflow, 'AshbyMcWorkflow', spec)).toEqual([]);
+    expect(validateNamed({ ...workflow, intakeType: null, profileOutcome: null }, 'AshbyMcWorkflow', spec)).toEqual([]);
+    expect(validateNamed({ ...workflow, intakeType: 'manual' }, 'AshbyMcWorkflow', spec)).not.toEqual([]);
+    expect(validateNamed({ ...workflow, profileOutcome: 'dialled' }, 'AshbyMcWorkflow', spec)).not.toEqual([]);
   });
 });

@@ -33,7 +33,7 @@ import type { SupabaseClient } from '@supabase/supabase-js';
 import type { AshbySchedulerHandle, SchedulerLoopHealth } from './scheduler.js';
 import { isLoopStale } from '../../lib/scheduler.js';
 import { ASHBY_SIGNAL_QUEUE, ASHBY_IMPORT_QUEUE } from './signal-worker.js';
-import { ASHBY_INGESTION_QUEUE } from './runtime-workers.js';
+import { ASHBY_INGESTION_QUEUE, ASHBY_PROFILE_QUEUE } from './runtime-workers.js';
 import { DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
 import {
   defaultSignatureFreshnessReader,
@@ -66,6 +66,10 @@ export const ASHBY_QUEUE_NAMES: readonly string[] = [
   ASHBY_SIGNAL_QUEUE,
   ASHBY_IMPORT_QUEUE,
   ASHBY_INGESTION_QUEUE,
+  // Phone parsing (ADR-0018). It runs on the main Ashby runner; without it
+  // here, a profile job that exhausts its attempts would never reach the DLQ
+  // depth this surface degrades on.
+  ASHBY_PROFILE_QUEUE,
   // Generation runs on its OWN runner, but it is still a queue this worker
   // owns — and turning a feature on by default while its backlog and its
   // dead-letter depth are invisible is how a silently dead feature stays

@@ -23,11 +23,15 @@
  * declares no colour of its own. Distinction is never hue-only — each state
  * spells out its own meaning in words, and `needs_review` additionally
  * carries more weight than its siblings.
+ *
+ * M017 adds the intake type ("Resume parsing" / "Phone parsing") beside it,
+ * and the words for the Ashby profile check's outcome, for the same reason:
+ * one module owns how a candidate's path in is said.
  */
 
 import { StatusBadge } from '../design';
 import type { StatusTone } from '../design/StatusBadge';
-import type { ResumeReview } from '../../types';
+import type { AshbyProfileOutcome, IntakeType, ResumeReview } from '../../types';
 
 /**
  * The neutral title of a candidate whose identity has not been parsed yet.
@@ -114,3 +118,71 @@ export function ResumeReviewBadge({ value, className }: ResumeReviewBadgeProps) 
     </StatusBadge>
   );
 }
+
+/** Canonical order for the intake facet: the resume path first. */
+export const INTAKE_TYPE_ORDER = ['resume_parsing', 'phone_parsing'] as const;
+
+/**
+ * Both values get a badge. Unlike resume review there is no quiet majority:
+ * the badge exists to say which way the candidate came in.
+ */
+const INTAKE_LABELS: Record<IntakeType, string> = {
+  resume_parsing: 'Resume parsing',
+  phone_parsing: 'Phone parsing',
+};
+
+/** True when the value is one of the two intake types. */
+export function isIntakeType(value: string | null | undefined): value is IntakeType {
+  return value === 'resume_parsing' || value === 'phone_parsing';
+}
+
+/** Human label for an intake type, or null for null/absent/unrecognized. */
+export function intakeTypeLabel(value: string | null | undefined): string | null {
+  return isIntakeType(value) ? INTAKE_LABELS[value] : null;
+}
+
+export interface IntakeBadgeProps {
+  value: IntakeType | null | undefined;
+  className?: string;
+}
+
+/**
+ * The intake badge. One neutral tone for both values, so they are told apart
+ * by their words alone, and no dot: an intake path is a fact about the
+ * candidate, not a status. Renders nothing for null — an older API, or a
+ * candidate with neither an Ashby link nor an upload — or an unknown value.
+ */
+export function IntakeBadge({ value, className }: IntakeBadgeProps) {
+  if (!isIntakeType(value)) return null;
+  return (
+    <StatusBadge tone="neutral" dot={false} className={className}>
+      {INTAKE_LABELS[value]}
+    </StatusBadge>
+  );
+}
+
+/**
+ * What the last Ashby profile check did, in a recruiter's words, for every
+ * value of the closed `profile_outcome` vocabulary. Rendered beside the raw
+ * code (one hover away) on the Ashby card and in Ashby Live Jobs; an unknown
+ * future value falls back to its own words through `humanizeEnum`.
+ */
+export const PROFILE_OUTCOME_LABELS: Readonly<Record<AshbyProfileOutcome, string>> = {
+  applied: 'Ashby number applied',
+  number_invalid: 'No valid Indian mobile in Ashby',
+  number_placeholder: 'Placeholder number in Ashby',
+  number_shared: 'Number belongs to another candidate',
+  name_missing: 'No usable name in Ashby',
+  resume_found: 'Resume found — resume parsing',
+  resume_shape_unknown: 'Could not read resume status from Ashby',
+  stage_moved: 'Left the AI screening stage',
+  application_inactive: 'Application not active in Ashby',
+  mapping_inactive: 'Job not enabled for phone screening',
+  subject_request_hold: 'On hold: data request',
+  engagement_active: 'Call already in progress',
+  not_applicable: 'No change needed',
+  ashby_unavailable: 'Ashby unavailable — will retry',
+  identity_unconfirmed: 'Wrong person answered the Ashby number',
+  application_terminal: 'Application closed',
+  candidate_missing: 'Candidate record missing',
+};

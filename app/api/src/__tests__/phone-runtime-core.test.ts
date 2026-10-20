@@ -508,6 +508,8 @@ interface Harness {
   readonly numberRequests: string[][];
   /** The engagement ids actually dialled, in order. */
   readonly dialled: string[];
+  /** The inputs handed to `listDueEngagements`, in order (M017 hold). */
+  readonly dueInputs: Array<Parameters<PhoneRuntimeReader['listDueEngagements']>[0]>;
 }
 
 function harness(options: {
@@ -524,6 +526,8 @@ function harness(options: {
     engagementId: string,
   ) => { status: 'dialing' | 'refused'; refusal?: string; detail?: string };
   config?: Partial<PhoneScreeningConfig>;
+  /** The M017 kill-switch hold. Absent means the dep is not wired at all. */
+  holdPhoneParsing?: () => boolean;
 } = {}): Harness {
   const calls = {
     listDue: 0,
@@ -537,11 +541,13 @@ function harness(options: {
   };
   const numberRequests: string[][] = [];
   const dialled: string[] = [];
+  const dueInputs: Harness['dueInputs'] = [];
   const due = options.due ?? [];
 
   const reader: PhoneRuntimeReader = {
-    async listDueEngagements() {
+    async listDueEngagements(input) {
       calls.listDue += 1;
+      dueInputs.push(input);
       return due;
     },
     async listDialableNumbers(input) {
@@ -615,9 +621,12 @@ function harness(options: {
       calls.appointment += 1;
       return options.appointmentStart ? options.appointmentStart(engagementId) : iso(-60);
     },
+    ...(options.holdPhoneParsing === undefined
+      ? {}
+      : { holdPhoneParsing: options.holdPhoneParsing }),
   };
 
-  return { deps, calls, numberRequests, dialled };
+  return { deps, calls, numberRequests, dialled, dueInputs };
 }
 
 function options(limit = 10): { now: Date; limit: number } {
@@ -764,6 +773,77 @@ describe('a halted lane mints no session and places no call', () => {
     const result = await runPhoneDuePass(h.deps, options());
     expect(result.status).toBe('ok');
     expect(result.dialing).toBe(1);
+  });
+});
+
+describe('M017: the kill-switch hold is a flag on the due READ, not a filter in the pass', () => {
+  /**
+   * The hold is applied by `listDueEngagements` in SQL, because the batch is
+   * bounded before this pass sees a row. So the pass's whole job is to hand
+   * the reader `excludePhoneParsing` — `true` only when the dep says so — and
+   * to change nothing else about how it treats the rows that come back.
+   */
+  it('no `holdPhoneParsing` dep: the read is not narrowed', async () => {
+    const h = harness({ due: [engagement()] });
+    await runPhoneDuePass(h.deps, options());
+    expect(h.dueInputs).toHaveLength(1);
+    expect(h.dueInputs[0].excludePhoneParsing).toBe(false);
+  });
+
+  it('a hold of `true` narrows the read; `false` does not', async () => {
+    for (const held of [true, false]) {
+      const h = harness({ due: [engagement()], holdPhoneParsing: () => held });
+      await runPhoneDuePass(h.deps, options());
+      expect(h.dueInputs[0].excludePhoneParsing, `hold ${held}`).toBe(held);
+    }
+  });
+
+  it('the hold is consulted once per pass, so a flipped switch lands on the next pass', async () => {
+    let held = true;
+    let consulted = 0;
+    const h = harness({
+      due: [engagement()],
+      holdPhoneParsing: () => { consulted += 1; return held; },
+    });
+    await runPhoneDuePass(h.deps, options());
+    held = false;
+    await runPhoneDuePass(h.deps, options());
+    expect(h.dueInputs.map((i) => i.excludePhoneParsing)).toEqual([true, false]);
+    expect(consulted).toBe(2);
+  });
+
+  it('holding changes nothing else: the rows the reader returns are offered and dialled', async () => {
+    // A second, in-process copy of the hold would have no intake to decide
+    // on and could only drop rows the SQL had already let through.
+    const h = harness({
+      due: [
+        engagement({ engagementId: 'e1', candidateId: 'c1' }),
+        engagement({ engagementId: 'e2', candidateId: 'c2', state: 'reconnecting', updatedAt: iso(-3_600) }),
+      ],
+      holdPhoneParsing: () => true,
+    });
+    const result = await runPhoneDuePass(h.deps, options());
+    expect(result.status).toBe('ok');
+    expect(result.dialing).toBe(2);
+    expect(h.dialled).toEqual(['e1', 'e2']);
+    // The other read inputs are what they were without the hold.
+    expect(h.dueInputs[0]).toEqual({
+      nowIso: NOW.toISOString(),
+      limit: 10,
+      reconnectBackoffSeconds: h.deps.config.reconnectBackoffSeconds,
+      onlyEngagementId: undefined,
+      excludePhoneParsing: true,
+    });
+  });
+
+  it('a disabled or halted pass never consults the hold — it reads nothing past its gates', async () => {
+    let consulted = 0;
+    const hold = (): boolean => { consulted += 1; return true; };
+    const disabled = harness({ config: { runtimeEnabled: false }, due: [engagement()], holdPhoneParsing: hold });
+    expect((await runPhoneDuePass(disabled.deps, options())).status).toBe('disabled');
+    const halted = harness({ backlogThrows: true, due: [engagement()], holdPhoneParsing: hold });
+    expect((await runPhoneDuePass(halted.deps, options())).status).toBe('halted');
+    expect(consulted).toBe(0);
   });
 });
 

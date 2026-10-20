@@ -128,27 +128,147 @@ describe('the exact payload written to `candidates`', () => {
   });
 });
 
+/**
+ * A one-row `candidates` double that APPLIES the filters it is given, so the
+ * never-downgrade rule is asserted as an outcome on the row, not only as the
+ * presence of a filter. `eq`/`is` are the only predicates the populate path
+ * uses; a write lands only when every one of them holds.
+ */
+function rowSupabase(row: Record<string, unknown>) {
+  const client = {
+    from(table: string) {
+      expect(table).toBe('candidates');
+      let payload: Record<string, unknown> | null = null;
+      const preds: Array<[string, unknown]> = [];
+      const b: Record<string, unknown> = {};
+      b.update = (p: Record<string, unknown>) => { payload = p; return b; };
+      b.eq = (c: string, v: unknown) => { preds.push([c, v]); return b; };
+      b.is = (c: string, v: unknown) => { preds.push([c, v]); return b; };
+      b.select = () => b;
+      const settle = () => {
+        const matched = payload !== null && preds.every(([c, v]) => row[c] === v);
+        if (matched) Object.assign(row, payload);
+        return Promise.resolve({ data: matched ? { id: row.id } : null, error: null });
+      };
+      b.maybeSingle = settle;
+      b.then = (ok: (v: unknown) => unknown) => settle().then(ok);
+      return b;
+    },
+  };
+  return client as never;
+}
+
+/** A shell exactly as `insertCandidateShell` leaves it, plus the given phone. */
+function shellRow(phone: { raw: string | null; e164: string | null; valid: boolean }) {
+  return {
+    id: 'c1', resume_id: null, name: null, email: null, parsed: null,
+    phone_raw: phone.raw, phone_e164: phone.e164, phone_valid: phone.valid,
+  } as Record<string, unknown>;
+}
+
 describe('the populate CAS and what a replay may do', () => {
-  it('writes the phone columns inside the SAME update, under the SAME CAS', async () => {
+  it('writes the phone FIRST, in its own update, only while the number is not valid', async () => {
     const { client, calls } = fakeSupabase({ 'candidates:update': { data: { id: 'c1' }, error: null } });
     const res = await createMaterializationStore(client).updateCandidateFromParse!({
       candidateId: 'c1', resumeId: 'r1', parsed: PARSED, phone: DIALABLE,
     });
     expect(res).toEqual({ updated: true });
 
-    const upd = calls.find((c) => c.table === 'candidates' && c.op === 'update')!;
-    expect(upd.payload!.phone_e164).toBe('+919876543210');
-    expect(upd.payload!.phone_valid).toBe(true);
-    // ONE update, guarded by the compare-and-set. Not a second write, not an
-    // upsert, not a follow-up — a phone written outside this clause would be
-    // a write a replay could repeat.
-    expect(upd.filters).toContainEqual(['is', 'resume_id', null]);
-    expect(upd.filters).toContainEqual(['eq', 'id', 'c1']);
-    expect(calls.filter((c) => c.table === 'candidates' && c.op === 'update')).toHaveLength(1);
-    // Ownership and funnel position remain unreachable from a parse.
-    for (const forbidden of ['role_id', 'owner_id', 'status', 'ats_source']) {
-      expect(upd.payload).not.toHaveProperty(forbidden);
+    const updates = calls.filter((c) => c.table === 'candidates' && c.op === 'update');
+    expect(updates).toHaveLength(2);
+    const [phoneUpd, parseUpd] = updates as [Recorded, Recorded];
+
+    // Step 1: the phone and nothing else, under the same CAS PLUS
+    // `phone_valid = false`, so a valid number already on the row (HR
+    // verified, or applied from the Ashby profile) is never overwritten.
+    expect(phoneUpd.payload).toEqual({
+      phone_raw: '9876543210', phone_e164: '+919876543210', phone_valid: true,
+    });
+    expect(phoneUpd.filters).toContainEqual(['eq', 'id', 'c1']);
+    expect(phoneUpd.filters).toContainEqual(['is', 'resume_id', null]);
+    expect(phoneUpd.filters).toContainEqual(['eq', 'phone_valid', false]);
+
+    // Step 2: the parse fields, still guarded by the compare-and-set, and no
+    // phone column at all. A replay matches zero rows here.
+    expect(parseUpd.filters).toContainEqual(['is', 'resume_id', null]);
+    expect(parseUpd.filters).toContainEqual(['eq', 'id', 'c1']);
+    expect(parseUpd.payload!.resume_id).toBe('r1');
+    for (const phoneKey of ['phone_raw', 'phone_e164', 'phone_valid']) {
+      expect(parseUpd.payload).not.toHaveProperty(phoneKey);
     }
+    // Ownership and funnel position remain unreachable from a parse.
+    for (const upd of [phoneUpd, parseUpd]) {
+      for (const forbidden of ['role_id', 'owner_id', 'status', 'ats_source']) {
+        expect(upd.payload).not.toHaveProperty(forbidden);
+      }
+    }
+  });
+
+  it('an undialable parse writes only `phone_raw`', async () => {
+    const { client, calls } = fakeSupabase({ 'candidates:update': { data: { id: 'c1' }, error: null } });
+    await createMaterializationStore(client).updateCandidateFromParse!({
+      candidateId: 'c1', resumeId: 'r1', parsed: PARSED, phone: UNDIALABLE,
+    });
+    const phoneUpd = calls.find((c) => c.table === 'candidates' && c.op === 'update')!;
+    // The recruiter still sees what the document said; the dialable pair is
+    // not named, so the row stays exactly as undialable as it already was.
+    expect(phoneUpd.payload).toEqual({ phone_raw: '9876543210' });
+    expect(phoneUpd.filters).toContainEqual(['eq', 'phone_valid', false]);
+  });
+
+  it('FAILS CLOSED on populate when the caller supplied no decision at all', async () => {
+    const { client, calls } = fakeSupabase({ 'candidates:update': { data: { id: 'c1' }, error: null } });
+    await createMaterializationStore(client).updateCandidateFromParse!({
+      candidateId: 'c1', resumeId: 'r1', parsed: PARSED,
+    });
+    const phoneUpd = calls.find((c) => c.table === 'candidates' && c.op === 'update')!;
+    expect(phoneUpd.payload).toEqual({ phone_raw: '9876543210' });
+  });
+
+  it('a phone write error throws a fixed code and writes no parse field', async () => {
+    const { client, calls } = fakeSupabase({
+      'candidates:update': { data: null, error: { message: 'synthetic failure' } },
+    });
+    const err = await createMaterializationStore(client).updateCandidateFromParse!({
+      candidateId: 'c1', resumeId: 'r1', parsed: PARSED, phone: DIALABLE,
+    }).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toBe('ashby_candidate_phone_write_error');
+    // The parse step never ran, so the CAS is still open for the retry.
+    expect(calls.filter((c) => c.table === 'candidates' && c.op === 'update')).toHaveLength(1);
+  });
+
+  it('a VALID number on the shell survives the parse; the parse fields still land', async () => {
+    // The 0084 re-parse case: HR verified a number (or the Ashby profile was
+    // applied) while the shell was waiting for its resume. The parse found a
+    // different, equally dialable number, and it must not win.
+    const row = shellRow({ raw: '+91 98123 45670', e164: '+919812345670', valid: true });
+    const res = await createMaterializationStore(rowSupabase(row)).updateCandidateFromParse!({
+      candidateId: 'c1', resumeId: 'r1', parsed: PARSED, phone: DIALABLE,
+    });
+    expect(res).toEqual({ updated: true });
+    expect(row.phone_raw).toBe('+91 98123 45670');
+    expect(row.phone_e164).toBe('+919812345670');
+    expect(row.phone_valid).toBe(true);
+    expect(row.resume_id).toBe('r1');
+    expect(row.name).toBe(PARSED.name);
+  });
+
+  it('a shell with no valid number takes the parse number, and a retry changes nothing', async () => {
+    const row = shellRow({ raw: null, e164: null, valid: false });
+    const store = createMaterializationStore(rowSupabase(row));
+    const first = await store.updateCandidateFromParse!({
+      candidateId: 'c1', resumeId: 'r1', parsed: PARSED, phone: DIALABLE,
+    });
+    expect(first).toEqual({ updated: true });
+    expect(row).toMatchObject({ phone_raw: '9876543210', phone_e164: '+919876543210', phone_valid: true });
+
+    const after = { ...row };
+    const retry = await store.updateCandidateFromParse!({
+      candidateId: 'c1', resumeId: 'r2', parsed: { ...PARSED, phone: null }, phone: UNDIALABLE,
+    });
+    expect(retry).toEqual({ updated: false });
+    expect(row).toEqual(after);
   });
 
   it('a REPLAY matches zero rows and reports updated:false', async () => {

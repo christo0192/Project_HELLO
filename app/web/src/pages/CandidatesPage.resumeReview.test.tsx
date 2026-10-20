@@ -276,3 +276,187 @@ describe('CandidatesPage — resume-review facet', () => {
     expect(mockApi.listCandidates).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * M017 (Addendum A): the intake type. An Ashby applicant with no resume is
+ * screened from the name and number on the Ashby application ("Phone
+ * parsing"); everyone else came in by a resume ("Resume parsing"). Recruiters
+ * see which on every row and can filter by it. The ALL fixtures above carry
+ * no `intake_type` — an older API — and must render exactly as they did.
+ */
+const PHONE = {
+  ...SHELL,
+  id: 'c-phone',
+  name: 'Test Person',
+  created_at: '2026-02-04T00:00:00Z',
+  resume_review: null,
+  intake_type: 'phone_parsing',
+};
+const RESUMED = {
+  ...READY,
+  id: 'c-resumed',
+  name: 'Test Resumed',
+  email: 'resumed@example.com',
+  created_at: '2026-02-05T00:00:00Z',
+  intake_type: 'resume_parsing',
+};
+const WITH_INTAKE = [...ALL, PHONE, RESUMED];
+
+describe('CandidatesPage — intake type (M017)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.listCandidates.mockResolvedValue(WITH_INTAKE);
+    mockApi.getScreeningFunnel.mockResolvedValue({ totals: EMPTY_FUNNEL_TOTALS });
+  });
+
+  it('shows a phone-parsing row by its name, "Phone parsing", and no resume badge', async () => {
+    renderPage();
+    await findTable();
+    const cells = within(row('c-phone'));
+    expect(cells.getByRole('link')).toHaveAccessibleName('Test Person');
+    expect(cells.getByText('Queued')).toBeInTheDocument();
+    expect(cells.getByText('Phone parsing')).toBeInTheDocument();
+    expect(cells.queryByText(/^Resume /)).toBeNull();
+    expect(row('c-phone').textContent ?? '').not.toMatch(/null|undefined|phone_parsing/);
+  });
+
+  it('never badges a resume on a phone-parsing row, whatever resume_review says', async () => {
+    mockApi.listCandidates.mockResolvedValue([{ ...PHONE, resume_review: 'processing' }]);
+    renderPage();
+    await findTable();
+    expect(within(row('c-phone')).getByText('Phone parsing')).toBeInTheDocument();
+    expect(within(row('c-phone')).queryByText('Resume processing')).toBeNull();
+  });
+
+  it('stacks status, intake, then resume review in a resume-parsing row', async () => {
+    mockApi.listCandidates.mockResolvedValue([{ ...PROCESSING, intake_type: 'resume_parsing' }]);
+    renderPage();
+    await findTable();
+    const text = row('c-processing').textContent ?? '';
+    expect(text.indexOf('Queued')).toBeGreaterThan(-1);
+    expect(text.indexOf('Queued')).toBeLessThan(text.indexOf('Resume parsing'));
+    expect(text.indexOf('Resume parsing')).toBeLessThan(text.indexOf('Resume processing'));
+  });
+
+  it('leaves a legacy row (no intake_type) exactly as it was', async () => {
+    renderPage();
+    await findTable();
+    for (const id of ['c-shell', 'c-ready', 'candidate-1']) {
+      expect(within(row(id)).queryByText(/parsing$/)).toBeNull();
+    }
+    expect(within(row('c-shell')).getByText('Resume needs review')).toBeInTheDocument();
+    expect(within(row('c-resumed')).getByText('Resume parsing')).toBeInTheDocument();
+  });
+
+  it('offers an Intake facet with per-value counts from the one loaded page', async () => {
+    renderPage();
+    await findTable();
+    const group = screen.getByRole('group', { name: 'Filter by intake' });
+    expect(group).toHaveTextContent(/^Intake:/);
+    const resume = within(group).getByRole('button', { name: /^Resume parsing/ });
+    const phone = within(group).getByRole('button', { name: /^Phone parsing/ });
+    expect(resume).toHaveTextContent('1');
+    expect(phone).toHaveTextContent('1');
+    expect(resume).toHaveAttribute('aria-pressed', 'false');
+    expect(phone).toHaveAttribute('aria-pressed', 'false');
+    expect(mockApi.listCandidates).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the Resume facet counts and the status counts; a phone row never counts as a resume', async () => {
+    renderPage();
+    await findTable();
+    const resumeGroup = screen.getByRole('group', { name: 'Filter by resume review' });
+    expect(within(resumeGroup).getByRole('button', { name: /Resume processing/ })).toHaveTextContent('1');
+    expect(within(resumeGroup).getByRole('button', { name: /Resume needs review/ })).toHaveTextContent('1');
+    expect(within(resumeGroup).getByRole('button', { name: /Resume cancelled/ })).toHaveTextContent('1');
+    // The phone row is a queued candidate like any other: three shells + it.
+    const statuses = screen.getByRole('group', { name: 'Filter by status' });
+    expect(within(statuses).getByRole('button', { name: /^Queued/ })).toHaveTextContent('4');
+    // No intake value has become a status.
+    expect(within(statuses).queryByRole('button', { name: /parsing/ })).toBeNull();
+  });
+
+  it('toggles the facet, shows an "Intake:" chip, and clears with Clear all', async () => {
+    renderPage();
+    await findTable();
+    const group = screen.getByRole('group', { name: 'Filter by intake' });
+    fireEvent.click(within(group).getByRole('button', { name: /^Phone parsing/ }));
+    expect(await screen.findByText('1 of 7')).toBeInTheDocument();
+    expect(row('c-phone')).toBeInTheDocument();
+    expect(screen.queryByText('Jane Doe')).not.toBeInTheDocument();
+    expect(screen.queryByText('Test Resumed')).not.toBeInTheDocument();
+    expect(
+      within(screen.getByRole('group', { name: 'Filter by intake' })).getByRole('button', {
+        name: /^Phone parsing/,
+      }),
+    ).toHaveAttribute('aria-pressed', 'true');
+    expect(
+      screen.getByRole('button', { name: 'Remove filter Intake: Phone parsing' }),
+    ).toBeInTheDocument();
+    expect(mockApi.listCandidates).toHaveBeenCalledTimes(1);
+
+    fireEvent.click(screen.getByRole('button', { name: /clear all/i }));
+    expect(await screen.findByText('Jane Doe')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^Remove filter Intake/ })).toBeNull();
+    expect(mockApi.listCandidates).toHaveBeenCalledTimes(1);
+  });
+
+  it('applies an intake deep link, excluding every row without an intake type', async () => {
+    renderPage('/candidates?intake=resume_parsing,phone_parsing');
+    await findTable();
+    // Two of seven: the five legacy rows carry no intake type.
+    expect(screen.getByText('2 of 7')).toBeInTheDocument();
+    expect(row('c-phone')).toBeInTheDocument();
+    expect(row('c-resumed')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove filter Intake: Resume parsing' })).toBeInTheDocument();
+    // Removing one chip keeps the other.
+    fireEvent.click(screen.getByRole('button', { name: 'Remove filter Intake: Resume parsing' }));
+    expect(await screen.findByText('1 of 7')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove filter Intake: Phone parsing' })).toBeInTheDocument();
+  });
+
+  it('combines with the resume facet rather than replacing it', async () => {
+    renderPage('/candidates?intake=phone_parsing&resume=needs_review');
+    expect(await screen.findByText('No candidates match these filters')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove filter Intake: Phone parsing' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove filter Resume needs review' })).toBeInTheDocument();
+  });
+
+  it('hides the facet when no loaded row has an intake type', async () => {
+    mockApi.listCandidates.mockResolvedValue(ALL);
+    renderPage();
+    await findTable();
+    expect(screen.queryByRole('group', { name: 'Filter by intake' })).toBeNull();
+    // The resume facet it sits beside is unaffected.
+    expect(screen.getByRole('group', { name: 'Filter by resume review' })).toBeInTheDocument();
+  });
+
+  it('keeps the facet reachable from a deep link even when nothing carries the signal', async () => {
+    mockApi.listCandidates.mockResolvedValue([PLAIN]);
+    renderPage('/candidates?intake=phone_parsing');
+    expect(await screen.findByText('No candidates match these filters')).toBeInTheDocument();
+    const group = screen.getByRole('group', { name: 'Filter by intake' });
+    expect(within(group).getByRole('button', { name: /^Phone parsing/ })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
+    fireEvent.click(screen.getByRole('button', { name: /clear filters/i }));
+    expect(await screen.findByText('Jane Doe')).toBeInTheDocument();
+  });
+
+  it('drops an unknown intake value from a deep link', async () => {
+    renderPage('/candidates?intake=bogus');
+    await findTable();
+    expect(screen.queryByText(/ of 7$/)).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Remove filter Intake/ })).toBeNull();
+    expect(row('c-phone')).toBeInTheDocument();
+    expect(row('candidate-1')).toBeInTheDocument();
+  });
+
+  it('has no axe violations with the facet and phone-parsing rows', async () => {
+    const { container: root } = renderPage('/candidates?intake=phone_parsing');
+    await findTable();
+    await expect(root).toHaveNoViolations();
+  });
+});

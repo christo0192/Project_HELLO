@@ -125,6 +125,7 @@
         "ASHBY_SCANNER_DEFER_SECONDS": { "requiredInProduction": false, "secret": false },
         "ASHBY_SCANNER_READINESS_TIMEOUT_MS": { "requiredInProduction": false, "secret": false },
         "ASHBY_SCANNER_DEFER_DEADLINE_MS": { "requiredInProduction": false, "secret": false },
+        "ASHBY_PHONE_PARSING_ENABLED": { "requiredInProduction": false, "secret": false },
         "PHONE_SCREENING_ENABLED": { "requiredInProduction": false, "secret": false },
         "PHONE_RUNTIME_ENABLED": { "requiredInProduction": false, "secret": false },
         "PHONE_DIAL_MODE": { "requiredInProduction": false, "secret": false },

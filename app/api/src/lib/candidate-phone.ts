@@ -1,5 +1,6 @@
 /**
- * candidate-phone.ts — the ONE place a resume-derived number becomes dialable.
+ * candidate-phone.ts — the ONE place an extracted number becomes dialable,
+ * whether it came from a resume or from the Ashby candidate profile.
  *
  * ── WHY THIS FILE EXISTS ────────────────────────────────────────────────────
  *
@@ -25,19 +26,38 @@
  *     admission — a consent control that looks applied and is not. Keeping this
  *     column strict-or-NULL is what makes the two digests the same digest.
  *
- *  2. PROVENANCE — only a MODEL-authored structured field may become dialable.
- *     The deterministic rescue extractor (`lib/resume-fallback.ts`) finds a
- *     phone with `/(?:\+?\d[\d\s().-]{7,}\d)/` over flattened resume text. That
- *     pattern matches employee ids, date ranges, PIN+phone runs and bank
- *     fragments. Until now the value it produced only ever landed in
- *     `phone_raw`, which nothing dials, so a false positive was inert. The
- *     moment these columns are populated, the same false positive becomes a
- *     call to a stranger. So the fallback keeps writing `phone_raw` — nothing
- *     regresses — and is structurally incapable of setting `phone_e164` or
- *     `phone_valid`.
+ *  2. PROVENANCE — a number may become dialable from exactly two approved
+ *     sources, each through its own separately named derivation:
+ *
+ *     a. A MODEL-authored structured resume field ({@link deriveCandidatePhone}).
+ *        The deterministic rescue extractor (`lib/resume-fallback.ts`) finds a
+ *        phone with `/(?:\+?\d[\d\s().-]{7,}\d)/` over flattened resume text.
+ *        That pattern matches employee ids, date ranges, PIN+phone runs and
+ *        bank fragments. Until now the value it produced only ever landed in
+ *        `phone_raw`, which nothing dials, so a false positive was inert. The
+ *        moment these columns are populated, the same false positive becomes
+ *        a call to a stranger. So the fallback keeps writing `phone_raw` —
+ *        nothing regresses — and is structurally incapable of setting
+ *        `phone_e164` or `phone_valid`.
+ *
+ *     b. The Ashby candidate profile, ADR-0018 ({@link deriveAshbyProfilePhone}):
+ *        the phone field of the applicant's own Ashby record, used for a
+ *        "phone parsing" application that has no resume, and as the fallback
+ *        when a resume yields no dialable number. It is a typed contact field,
+ *        not a pattern match over free text, so the false positive above does
+ *        not arise. Its risks are different — a placeholder, a relative's or a
+ *        recruiter's number — and so are its guards: only the designated
+ *        primary is read, a fixed denylist refuses placeholder patterns, and
+ *        the database applies it at most once per candidate and refuses a
+ *        number another Ashby candidate already holds. Reading the record is
+ *        the profile job's business; this module only ever sees the strings.
+ *
+ *     Anything else — an enrichment vendor, a bulk backfill, another ATS
+ *     field — would be a third source with a different consent basis, and
+ *     none exists.
  *
  * `phone_raw` is preserved on every path, dialable or not: it is the audited
- * record of what the document actually said, and a recruiter correcting a
+ * record of what the source actually said, and a recruiter correcting a
  * number needs to see it. It is PII-scoped and role-gated at the API edge; it
  * is never dialed.
  */
@@ -54,7 +74,11 @@ import { normalizePhone } from './phone.js';
  * test can assert them equal.
  *
  * Indian mobile numbers begin 6-9 and carry exactly ten subscriber digits.
- * An Indian fixed-line number (`+91 22 ...`) fails on both counts.
+ * This is a FORMAT gate, not a line-type check: a fixed-line number whose area
+ * code starts 2-5 (`+91 22 ...`) fails it, but one whose area code starts 7
+ * or 8 (Bangalore `80`, Ahmedabad `79`) has a mobile's shape and passes. Every
+ * source shares that gap; the identity check at the start of the call is what
+ * catches the wrong person.
  */
 export const STRICT_IN_MOBILE_E164 = /^\+91[6-9][0-9]{9}$/;
 
@@ -159,6 +183,79 @@ export function deriveCandidatePhone(
   if (!STRICT_IN_MOBILE_E164.test(normalized.e164)) return rawOnly(raw);
 
   return { raw, e164: normalized.e164, valid: true };
+}
+
+// ── Ashby candidate profile (ADR-0018) ──────────────────────────────────────
+
+/** Why an Ashby profile number is, or is not, dialable. */
+export type AshbyProfilePhoneVerdict = 'dialable' | 'invalid' | 'placeholder' | 'absent';
+
+/** The decision for an Ashby profile number. `e164` is non-null only when dialable. */
+export interface AshbyProfilePhone {
+  /** The number as written, trimmed, or null when there was none. */
+  raw: string | null;
+  /** Strict Indian mobile when `verdict` is `dialable`; null otherwise. */
+  e164: string | null;
+  verdict: AshbyProfilePhoneVerdict;
+}
+
+/**
+ * Is this ten-digit local number a placeholder rather than a person's?
+ *
+ * Three fixed patterns, each a value a form or a recruiter types to get past
+ * a required field: all one digit (`9999999999`), a leading digit and nine
+ * zeros (`9000000000`), and an ascending or descending run of consecutive
+ * digits, modulo 10 (`9876543210`, `6789012345`). All of them pass the strict
+ * format gate, which is why they are refused here and not left to it.
+ */
+function isPlaceholderLocalNumber(local: string): boolean {
+  if (/^(\d)\1{9}$/.test(local)) return true;
+  if (/^[6-9]0{9}$/.test(local)) return true;
+  const step = (i: number) => (Number(local[i + 1]) - Number(local[i]) + 10) % 10;
+  const first = step(0);
+  if (first !== 1 && first !== 9) return false;
+  for (let i = 1; i < local.length - 1; i++) {
+    if (step(i) !== first) return false;
+  }
+  return true;
+}
+
+/**
+ * Derive the dialing decision for an Ashby profile number.
+ *
+ * ── WHY THE PRIMARY ONLY ────────────────────────────────────────────────────
+ *
+ * Only the designated primary is evaluated when it is non-empty; another
+ * entry is looked at only when no primary exists at all, and then only the
+ * first one. A primary that fails is NOT replaced by a secondary that passes:
+ * the secondary list is where a relative's or an old work number lives, and
+ * falling through to it would trade an undialable number for a call to the
+ * wrong person.
+ *
+ * The gates mirror {@link deriveCandidatePhone} minus provenance —
+ * libphonenumber validity, then the strict Indian-mobile format — and add the
+ * placeholder denylist. The structurer allowlist does not apply: this value
+ * was never produced by a structurer, and `DIALABLE_STRUCTURERS` is not
+ * widened to admit it. `raw` is returned on every verdict but `absent`, for
+ * the same audit reason `phone_raw` is kept on the resume path.
+ */
+export function deriveAshbyProfilePhone(input: {
+  primary: string | null;
+  others: readonly string[];
+}): AshbyProfilePhone {
+  const nonEmpty = (v: string | null | undefined): v is string =>
+    typeof v === 'string' && v.trim() !== '';
+  const chosen = nonEmpty(input.primary) ? input.primary : input.others.find(nonEmpty);
+  if (chosen === undefined) return { raw: null, e164: null, verdict: 'absent' };
+
+  const normalized = normalizePhone(chosen);
+  const raw = normalized.raw !== '' ? normalized.raw : null;
+  if (!normalized.valid || normalized.e164 === null) return { raw, e164: null, verdict: 'invalid' };
+  if (!STRICT_IN_MOBILE_E164.test(normalized.e164)) return { raw, e164: null, verdict: 'invalid' };
+  if (isPlaceholderLocalNumber(normalized.e164.slice(3))) {
+    return { raw, e164: null, verdict: 'placeholder' };
+  }
+  return { raw, e164: normalized.e164, verdict: 'dialable' };
 }
 
 /**

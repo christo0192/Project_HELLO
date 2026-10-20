@@ -40,7 +40,7 @@ import {
 import { createCandidateQuestionStore } from '../../lib/candidate-question-store.js';
 import { supabase } from '../../lib/supabase.js';
 import { env } from '../../lib/env.js';
-import { deriveCandidatePhone } from '../../lib/candidate-phone.js';
+import { deriveAshbyProfilePhone, deriveCandidatePhone } from '../../lib/candidate-phone.js';
 import {
   createQueueRunner,
   type QueueDeferDirective,
@@ -55,7 +55,9 @@ import {
 } from './signal-worker.js';
 import { runImport, runIngestionJob } from './orchestration.js';
 import { admitStageAfterActivation } from './activation-admission.js';
-import { stageDedupId, CANDIDATE_STAGE_CHANGE_ACTION } from './extractors.js';
+import { stageDedupId, CANDIDATE_STAGE_CHANGE_ACTION, extractApplicationInfo } from './extractors.js';
+import { decideImport } from './workflow.js';
+import { extractAshbyApplicationStatus, extractAshbyCandidateProfile } from './candidate-profile.js';
 import { publishReconcilePass } from './runtime-health.js';
 import {
   checkScannerReadiness,
@@ -114,15 +116,50 @@ import {
   populateExistingCandidate,
 } from './materialize.js';
 import { extractFileUrl, type AshbyRuntime } from './runtime.js';
-import { MATERIALIZE_FAILED_REASON } from './resume-ingestion.js';
+import { isUnreadableResumeReason, MATERIALIZE_FAILED_REASON } from './resume-ingestion.js';
 import type { PersistOutcome, StructuredResume } from './resume-ingestion.js';
-import type { WorkflowLinkRow } from './orchestration.js';
+import type {
+  AshbyIntakeType,
+  AshbyProfileOutcome,
+  AshbyProfileSkipReason,
+  WorkflowLinkRow,
+} from './orchestration.js';
 import { MAX_FILE_HANDLE_LEN } from './client.js';
 import { isAshbyError, type AshbyErrorCategory } from './errors.js';
 import type { AshbySignalPayload, EnabledMappingLoader } from './ports.js';
 
 /** Queue name for the ephemeral resume ingestion of one application link. */
 export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
+
+/**
+ * Queue name for the Ashby profile job of one application link (M017,
+ * ADR-0018): classify an application that arrived with no resume, or whose
+ * resume could not be read (B3), as phone parsing, or fetch the Ashby number
+ * for a resume whose own number was undialable (D3). Runs on the main Ashby
+ * runner; the scanner gate there only ever holds `ashby.ingestion`.
+ */
+export const ASHBY_PROFILE_QUEUE = 'ashby.profile';
+
+/**
+ * How long after import an application with no resume waits before the
+ * profile job classifies it.
+ *
+ * A resume that lands inside the window is bound by a re-import and follows
+ * today's path, and the job re-reads Ashby before deciding anything. The
+ * window also covers the API/worker deploy skew: nothing is classified, and
+ * so nothing is dialled without a resume, until it has passed. The same
+ * delay applies after a resume rests in `failed_review` (B3), for that reason.
+ */
+export const PROFILE_CLASSIFY_DELAY_MS = 15 * 60_000;
+
+/** Bounded retry for one profile job. The sweep is the backstop, not this. */
+const PROFILE_MAX_JOB_ATTEMPTS = 3;
+
+/** Base cadence of the `profile_sweep` loop (see the loop for what it bounds). */
+const PROFILE_SWEEP_INTERVAL_MS = 600_000;
+
+/** Links one sweep tick may claim. */
+const PROFILE_SWEEP_LIMIT = 25;
 
 /**
  * Should a candidate admitted to phone screening get questions written about
@@ -552,6 +589,38 @@ export function ingestionDedupKey(applicationLinkId: string): string {
   return `ashby:ingestion:${applicationLinkId}`;
 }
 
+/**
+ * Deterministic dedup key for one link's profile job. Shared by the import,
+ * the D3 and `failed_review` (B3) triggers and the sweep, so all of them
+ * collapse onto one live job.
+ */
+export function profileDedupKey(applicationLinkId: string): string {
+  return `ashby-profile:${applicationLinkId}`;
+}
+
+/**
+ * Enqueue one link's profile job. The payload is the link id and NOTHING
+ * else: the job re-reads every fact it needs, so no contact value ever sits
+ * in the queue table. One definition for the import, both triggers and the
+ * sweep, so the dedup key and the attempt bound cannot drift between them.
+ */
+function enqueueAshbyProfileJob(
+  queue: AshbyRuntime['queue'],
+  applicationLinkId: string,
+  delayMs: number,
+  nowMs: () => number,
+) {
+  return queue.enqueue(
+    ASHBY_PROFILE_QUEUE,
+    { applicationLinkId },
+    {
+      dedupKey: profileDedupKey(applicationLinkId),
+      maxAttempts: PROFILE_MAX_JOB_ATTEMPTS,
+      ...(delayMs > 0 ? { scheduledAt: new Date(nowMs() + delayMs).toISOString() } : {}),
+    },
+  );
+}
+
 /** Site-relative recruiter reissue path for an Ashby application. */
 export function reissuePathFor(externalApplicationId: string): string {
   return `/ashby-mission-control?application=${encodeURIComponent(externalApplicationId)}`;
@@ -705,6 +774,11 @@ export interface AshbyHandlerDeps {
   stageInterest?: (stageId: string) => Promise<boolean> | boolean;
   /** Override the opt-in skip gate (tests). Production reads the env flag. */
   stagePrefilterEnabled?: boolean;
+  /**
+   * Override the phone-parsing kill switch (tests). Production reads
+   * `ASHBY_PHONE_PARSING_ENABLED` through the runtime config.
+   */
+  phoneParsingEnabled?: boolean;
 }
 
 /**
@@ -736,6 +810,10 @@ export function buildAshbyHandlers(
       : undefined);
   // The SKIP is opt-in and runtime-flippable; the observer is not gated.
   const stagePrefilterEnabled = deps.stagePrefilterEnabled ?? rc?.stagePrefilterEnabled === true;
+  // Phone parsing (ADR-0018). OFF stops every profile ENQUEUE and turns a
+  // queued profile job into a no-op; the always-on guards below (the
+  // ingestion's phone-parsing return, the late-resume refusal) do not read it.
+  const phoneParsingEnabled = deps.phoneParsingEnabled ?? rc?.phoneParsingEnabled === true;
   const scannerGate = deps.scannerGate
     ?? (() => checkScannerReadiness({ timeoutMs: rc?.scannerReadinessTimeoutMs }));
   const scannerDeferSeconds = deps.scannerDeferSeconds
@@ -755,6 +833,18 @@ export function buildAshbyHandlers(
     // verified sending domain exist. Both false here means zero sends.
     email: { providerApproved: false, domainVerified: false },
   };
+
+  /** Enqueue one link's profile job; see {@link enqueueAshbyProfileJob}. */
+  const enqueueProfileJob = (applicationLinkId: string, delayMs: number) =>
+    enqueueAshbyProfileJob(runtime.queue, applicationLinkId, delayMs, nowMs);
+
+  /** Enqueue one link's ingestion, exactly as the import does. */
+  const enqueueIngestionJob = (applicationLinkId: string) =>
+    runtime.queue.enqueue(
+      ASHBY_INGESTION_QUEUE,
+      { provider: 'ashby', applicationLinkId },
+      { dedupKey: ingestionDedupKey(applicationLinkId), maxAttempts: 5 },
+    );
 
   return {
     // ── 1. Signal: re-read authoritative state, gate, and schedule an import ──
@@ -926,6 +1016,35 @@ export function buildAshbyHandlers(
       }
       if (result.status !== 'imported') return;
 
+      // ── Phone parsing (ADR-0018): classify a no-resume application LATER ──
+      // Only while the switch is on, so with it off this handler is exactly
+      // what it was. Delayed by PROFILE_CLASSIFY_DELAY_MS: a resume that lands
+      // inside the window is bound by a re-import and follows today's path,
+      // and the job re-reads Ashby before it decides anything.
+      //
+      // BEST EFFORT. The profile sweep is the backstop, so a failure here must
+      // not fail an import that is otherwise complete — and it must not skip
+      // the ingestion enqueue below, which is unchanged (and a no-op for a
+      // link with no handle).
+      if (phoneParsingEnabled) {
+        try {
+          const link = await runtime.stores.readLink(result.applicationLinkId);
+          if (link && !link.externalResumeFileHandle && link.intakeType !== 'phone_parsing'
+              && result.decision.action === 'import') {
+            const mapping = await runtime.resolveMappingByJobId(result.decision.jobId);
+            if (mapping.screeningMode === 'phone_primary') {
+              await enqueueProfileJob(result.applicationLinkId, PROFILE_CLASSIFY_DELAY_MS);
+            }
+          }
+        } catch {
+          // Sanitized code only, like every other best-effort enqueue here.
+          logger.warn('unknown_event', {
+            error_category: 'ashby_profile_enqueue_failed',
+            error_type: 'import',
+          });
+        }
+      }
+
       // Seed the ephemeral ingestion as durable work — but ONLY when there is
       // ingestion work left to do. `ready` and `cancelled` are terminal states
       // in the 0029 state machine, so a redelivered signal against an
@@ -965,17 +1084,81 @@ export function buildAshbyHandlers(
       const current = await runtime.stores.readIngestion(linkId);
       if (current && TERMINAL_INGESTION_STATES.has(current.state)) return;
 
+      // ── Phone parsing owns this application (ADR-0018) ──────────────────
+      // The Ashby profile was applied, so the resume pipeline must never parse
+      // over it: a resume that arrives later stays unread (owner decision Q1),
+      // and is logged so it is visible. Always on, whatever the kill switch
+      // says — it protects data the profile job already wrote.
+      if (link.intakeType === 'phone_parsing') {
+        if (link.externalResumeFileHandle) {
+          logger.info('unknown_event', {
+            error_category: 'ashby_late_resume_ignored',
+            error_type: 'ingestion',
+          });
+          // A stamped link with a handle is a B3 fallback, whose ingestion
+          // rests in `failed_review` on a document verdict that neither a
+          // re-import nor an operator recovery requeues. Any other state
+          // means something requeued it anyway; this handler will never read
+          // it, so say so loudly rather than let it sit in `queued` unseen.
+          if (current && current.state !== 'failed_review') {
+            logger.warn('unknown_event', {
+              error_category: 'ashby_phone_parsing_ingestion_requeued',
+              error_type: current.state,
+            });
+          }
+        }
+        return;
+      }
+
       // An application that carried no resume handle has nothing to ingest.
       // This is decided from the LINK — the fact itself — and never from
       // "does an ingestion row exist", because `runImport` seeds an ingestion
       // row for every link including this one.
       if (!link.externalResumeFileHandle) return;
 
-      /** Record a durable, sanitized ingestion failure. Best effort. */
-      const failIngestion = async (reason: string): Promise<void> => {
+      // ── B3: AN UNREADABLE RESUME FALLS BACK TO PHONE PARSING (ADR-0018) ──
+      // Once this link's ingestion rests in `failed_review` on a verdict about
+      // the DOCUMENT (`isUnreadableResumeReason`), ask the profile job to
+      // screen the candidate from the Ashby profile instead. A machine-class
+      // reason (an outage, a deadline, a failed persist) never asks: the
+      // resume may be fine and a requeue re-runs it. The job and its RPC
+      // decide whether it may (reason, switch, mapping, engagement); this
+      // only asks, and only for a phone_primary mapping, so a browser link's
+      // failure never costs an Ashby read.
+      //
+      // DELAYED like the import's classification, because this IS a
+      // classification: nothing is dialled without a resume until the window
+      // that covers the API/worker deploy skew has passed (Addendum B1).
+      //
+      // BEST EFFORT, AND ITS OWN catch: the sweep's arm C is the backstop,
+      // and a failed enqueue must not fail an ingestion that already rested.
+      const requestPhoneParsingFallback = async (reason: string): Promise<void> => {
+        if (!phoneParsingEnabled || !isUnreadableResumeReason(reason)) return;
         try {
-          await runtime.stores.advanceIngestion(linkId, 'failed_review', { failedReason: reason });
+          if (!link.externalJobId) return;
+          const mapping = await runtime.resolveMappingByJobId(link.externalJobId);
+          if (mapping.screeningMode !== 'phone_primary') return;
+          await enqueueProfileJob(linkId, PROFILE_CLASSIFY_DELAY_MS);
+        } catch {
+          logger.warn('unknown_event', {
+            error_category: 'ashby_profile_enqueue_failed',
+            error_type: 'ingestion_failed_review',
+          });
+        }
+      };
+
+      /**
+       * Record a durable, sanitized ingestion failure. Best effort. A write
+       * that landed asks for the phone-parsing fallback (B3) — which every
+       * reason this handler writes itself, all machine-class, declines.
+       */
+      const failIngestion = async (reason: string): Promise<void> => {
+        let rested = false;
+        try {
+          const outcome = await runtime.stores.advanceIngestion(linkId, 'failed_review', { failedReason: reason });
+          rested = outcome.status === 'ok';
         } catch { /* the queue outcome below is the authoritative signal */ }
+        if (rested) await requestPhoneParsingFallback(reason);
       };
 
       // ── Mid-flight rescue: a previous run of THIS job died in place ──────
@@ -1304,6 +1487,16 @@ export function buildAshbyHandlers(
         } satisfies QueueDeferDirective;
       }
 
+      // The pipeline's own verdict (B3). Only a document verdict asks;
+      // `materialize_failed` from the persistence seam and `unexpected_error`
+      // are machine-class and do not. `onState` throws on a refused write, so
+      // the row says `failed_review`. The profile job re-reads the state and
+      // reason before it acts, so a write that did not land costs one read.
+      if (result.status === 'done' && result.outcome.state === 'failed_review') {
+        await requestPhoneParsingFallback(result.outcome.reason);
+        return;
+      }
+
       // Nothing is materialized HERE any more. Persistence runs INSIDE the
       // ingestion, through the `persist` port wired above, strictly BEFORE the
       // durable `ready` transition — see `persistParsedCandidate` below and
@@ -1322,6 +1515,24 @@ export function buildAshbyHandlers(
         && runtime.stores.ensurePhoneEngagement) {
         const engagement = await runtime.stores.ensurePhoneEngagement(linkId);
 
+        // ── D3: THE RESUME CARRIED NO DIALABLE NUMBER (ADR-0018) ─────────
+        // Ask the profile job for the candidate's Ashby number now, rather
+        // than leave the engagement parked until the sweep reaches it. The job
+        // and its RPC decide whether a number may be applied; this only asks.
+        //
+        // BEST EFFORT, AND ITS OWN catch: the sweep's arm A is the backstop,
+        // and a failed enqueue must not fail an ingestion that is finished.
+        if (phoneParsingEnabled && engagement?.status === 'phone_invalid') {
+          try {
+            await enqueueProfileJob(linkId, 0);
+          } catch {
+            logger.warn('unknown_event', {
+              error_category: 'ashby_profile_enqueue_failed',
+              error_type: 'ingestion_ready',
+            });
+          }
+        }
+
         // ── AND ASK FOR THIS CANDIDATE'S OWN QUESTIONS ──────────────────
         // HERE, because this is the first moment we know the person will
         // actually be called.
@@ -1337,135 +1548,13 @@ export function buildAshbyHandlers(
         // would pay a provider call for every résumé that lands, most of
         // which never reach a phone screen.
         //
-        // ENQUEUED, NOT RUN. Generation is one call of up to two minutes;
-        // running it inline would hold this ingestion lease for that long on
-        // a drain that is tick-rate bound and has a starvation history. The
-        // queue owns the lease, the retry and the crash recovery.
-        //
-        // BEST EFFORT, AND SILENT ON FAILURE. Every outcome of this enqueue —
-        // including not happening at all — leaves the call running the role's
-        // own template. Letting an enqueue fault fail the INGESTION would
-        // trade a working import for a nicer question, which is the wrong way
-        // round.
-        // ── ONLY FOR A CANDIDATE WHO WILL ACTUALLY BE CALLED ────────────
-        // `ensure_ashby_phone_engagement` INSERTS the `pending_prereqs` row
-        // BEFORE it checks any prerequisite, then reports `phone_invalid`,
-        // `consent_evidence_missing`, `mapping_not_enabled` and the rest. So an
-        // engagement row exists, and is NOT terminal, for candidates with an
-        // unusable number or no consent evidence — and this module's whole cost
-        // argument ("the first moment we know the person will actually be
-        // called") was false while the status was discarded. Undialable rows
-        // are a material fraction of imports here.
-        //
-        // THE STATUS STRINGS ARE `0057`'s, READ FROM THE MIGRATION. The first
-        // draft of this guessed `ok`/`engagement_ready`/`already_exists`, none
-        // of which that function has ever returned — which would have left the
-        // enqueue unreachable and the whole feature quietly dead.
-        //   `eligible`              — admitted, due now
-        //   `scheduled_next_window` — admitted, due at the next calling window
-        //   `engagement_active`     — one already exists and is non-terminal.
-        //                             USUALLY a redelivery for a candidate who
-        //                             passed these same checks earlier, but
-        //                             `0057` returns it for ANY state that is
-        //                             not `pending_prereqs`/`eligible` — so it
-        //                             also covers a candidate who is dialing,
-        //                             on the phone right now, or reconnecting.
-        //                             `0104` refuses to move the dial for all
-        //                             of those; the grace only applies to an
-        //                             engagement still waiting for its first
-        //                             dial.
-        // Everything else is a prerequisite failure over a row that exists but
-        // is not dialable.
-        //
-        // 0114 (C8) adds one more of those: `duplicate_application`. The
-        // engagement stays `pending_prereqs` because the same person already
-        // holds a live or completed screen for the SAME role on another
-        // candidate row (matched on phone, normalised email, or Ashby
-        // candidate id + job mapping). Nothing dials it until HR releases the
-        // hold (POST /candidates/:id/phone/release-duplicate-hold), so it is
-        // deliberately NOT a will-be-called status: generating questions for
-        // it would pay a provider call for a screen that may never happen.
-        const willBeCalled = engagement?.status === 'eligible'
-          || engagement?.status === 'scheduled_next_window'
-          || engagement?.status === 'engagement_active';
-        if (willBeCalled && candidateQuestionsEnabled()) {
-          try {
-            await runtime.queue.enqueue(
-              CANDIDATE_QUESTIONS_QUEUE,
-              { applicationLinkId: linkId },
-              {
-                // Keyed on the application, so a redelivery, a reconciliation
-                // recovery and a retried ingestion collapse onto one job.
-                dedupKey: `candidate-questions:${linkId}`,
-                maxAttempts: CANDIDATE_QUESTIONS_MAX_JOB_ATTEMPTS,
-              },
-            );
-            // ── AND HOLD THE DIAL WHILE IT RUNS ─────────────────────
-            // Only after the enqueue SUCCEEDED: holding a call for work that
-            // was never queued is pure latency. `0104` moves the timestamp
-            // LATER and never earlier, so a candidate waiting for the IST
-            // window keeps that time.
-            //
-            // A ONE-TIME PUSH, NOT A WAIT-FOR-READY. If generation fails,
-            // dead-letters or never runs, the candidate is dialled after the
-            // grace on the role's own template — exactly as before any of this
-            // existed. Nothing here can strand a call.
-            //
-            // ITS OWN try/catch, AND A LOG ON EVERY PATH INCLUDING THE ONES
-            // THAT DO NOTHING. Three reviewers landed on the same hole: a hold
-            // that never happens is the race this feature exists to close, so
-            // "no hold" must never be silent. Sharing the enqueue's catch also
-            // reported a failed hold as `candidate_questions_enqueue_failed`,
-            // which is a lie about which half broke.
-            try {
-              if (!runtime.stores.deferPhoneDialForQuestions) {
-                logger.warn('unknown_event', {
-                  error_category: 'candidate_questions_dial_not_held',
-                  error_type: 'store_unavailable',
-                });
-              } else if (!engagement?.engagementId) {
-                // `0057` returns `engagement_id` on all three admitted
-                // branches, so this means the key or its mapping broke.
-                logger.warn('unknown_event', {
-                  error_category: 'candidate_questions_dial_not_held',
-                  error_type: 'engagement_id_missing',
-                });
-              } else {
-                const held = await runtime.stores.deferPhoneDialForQuestions(
-                  engagement.engagementId,
-                  CANDIDATE_QUESTIONS_DIAL_GRACE_SECONDS,
-                );
-                // `deferred` and `unchanged` are the two that mean the call
-                // will wait; every other status means it will NOT, so they are
-                // warnings rather than another line of info nobody reads.
-                const holdWorked = held.status === 'deferred' || held.status === 'unchanged';
-                const emit = holdWorked ? logger.info : logger.warn;
-                emit.call(logger, 'unknown_event', {
-                  error_category: holdWorked
-                    ? 'candidate_questions_dial_held'
-                    : 'candidate_questions_dial_not_held',
-                  error_type: held.status,
-                });
-              }
-            } catch {
-              // Losing the hold means the call races, which is the behaviour
-              // this feature shipped with — not a reason to fail an import.
-              logger.warn('unknown_event', {
-                error_category: 'candidate_questions_dial_not_held',
-                error_type: 'defer_failed',
-              });
-            }
-          } catch (error) {
-            // Sanitized code only: no link id, no candidate, no provider
-            // message — a provider message can carry whatever it was handed.
-            // A failed hold no longer lands here: it has its own catch above,
-            // so this category means what it says — nothing was queued.
-            logger.warn('unknown_event', {
-              error_category: 'candidate_questions_enqueue_failed',
-              error_type: 'ingestion_ready',
-            });
-          }
-        }
+        // The enqueue, the hold and every log line they write live in
+        // `admitCalledCandidate`, so any other path that admits a called
+        // candidate behaves exactly like this one.
+        await admitCalledCandidate(runtime, logger, linkId, engagement, {
+          generateQuestions: candidateQuestionsEnabled(),
+          origin: 'ingestion_ready',
+        });
       }
     },
 
@@ -1498,7 +1587,391 @@ export function buildAshbyHandlers(
         error_type: outcome,
       });
     },
+
+    // ── 5. Profile: phone parsing, and the Ashby number for D3 ─────────────
+    // (M017, ADR-0018.) Three kinds of link reach this job:
+    //   - a link with NO resume handle: classify it from `candidate.info`, and
+    //     screen it by phone from the Ashby profile when it truly has no
+    //     resume ("phone parsing");
+    //   - a link whose resume could not be read (ingestion `failed_review`,
+    //     B3): phone parsing too, with no classification to make;
+    //   - a `resume_parsing` link whose resume was parsed but carried no
+    //     dialable number (D3): fetch the Ashby number for it.
+    // All end in `apply_ashby_candidate_profile`, which re-checks every gate
+    // under its locks. What this job sees is a hint; the RPC decides.
+    //
+    // EVERY EXIT RECORDS AN OUTCOME on the link — the RPC records its own —
+    // except a throw, a switch-off (or missing-seam) return and a link that
+    // no longer exists.
+    // The outcome is what the dashboard shows and what the sweep backs off on.
+    //
+    // PII: the payload is the link id and nothing else. The profile and the
+    // number live in locals that are handed to the RPC and nowhere else; every
+    // log line is a fixed category and a code, and every throw a fixed code.
+    [ASHBY_PROFILE_QUEUE]: async (job) => {
+      const payload = job.payload as { applicationLinkId?: string };
+      const linkId = payload?.applicationLinkId;
+      if (typeof linkId !== 'string' || linkId.length === 0) {
+        throw new Error('malformed_profile_payload');
+      }
+      // OFF turns a job already on the queue into a no-op. Nothing is lost:
+      // the sweep claims the link again once the switch is back on.
+      if (!phoneParsingEnabled) return;
+      if (!runtime.stores.applyAshbyCandidateProfile) {
+        // Test-only in practice: the production store always has the seam.
+        logger.warn('unknown_event', {
+          error_category: 'ashby_profile_skipped',
+          error_type: 'store_unavailable',
+        });
+        return;
+      }
+
+      /** Record a decision this job made before the RPC could make one. */
+      const recordOutcome = async (outcome: AshbyProfileOutcome): Promise<void> => {
+        await runtime.stores.recordAshbyProfileOutcome?.(linkId, outcome);
+        logger.info('unknown_event', {
+          error_category: 'ashby_profile_outcome',
+          error_type: outcome,
+        });
+      };
+      /**
+       * One Ashby read. A failure is recorded as `ashby_unavailable`, best
+       * effort, and rethrown so the queue retries it: the error is an
+       * `AshbyError`, whose message is a fixed category.
+       */
+      const readAshby = async <T>(read: () => Promise<T>): Promise<T> => {
+        try {
+          return await read();
+        } catch (err) {
+          await recordOutcome('ashby_unavailable').catch(() => undefined);
+          throw err;
+        }
+      };
+
+      // ── The link ─────────────────────────────────────────────────────────
+      const link = await runtime.stores.readLink(linkId);
+      if (!link) return;
+      if (link.terminalState) {
+        await recordOutcome('application_terminal');
+        return;
+      }
+      if (!link.candidateId) {
+        await recordOutcome('candidate_missing');
+        return;
+      }
+
+      // ── An unreadable resume falls back to phone parsing (B3) ────────────
+      // A link with a handle whose ingestion rests in `failed_review` ("Resume
+      // needs review") on a verdict about the document is screened from the
+      // Ashby profile, exactly like a link with no resume. A machine-class
+      // reason is not unreadable: the resume pipeline still owns that link
+      // (a requeue re-runs it), so it takes the M9 path below. Read for a
+      // stamped link too, so a retry of the fallback is not mistaken for a
+      // late resume.
+      const hasHandle = Boolean(link.externalResumeFileHandle);
+      const ingestion = hasHandle ? await runtime.stores.readIngestion(linkId) : null;
+      const resumeUnreadable = ingestion?.state === 'failed_review'
+        && isUnreadableResumeReason(ingestion.failedReason);
+
+      // ── A resume link is D3 only once its resume is parsed ───────────────
+      // A link that gained a handle after import (a re-import bound it) is
+      // the resume pipeline's: make sure its ingestion is queued and leave it.
+      // Without the enqueue, a lost race between the import and this job
+      // would strand a resume nobody ingests (critique M9).
+      const resumeLink = link.intakeType !== 'phone_parsing' && hasHandle && !resumeUnreadable;
+      if (resumeLink && ingestion?.state !== 'ready') {
+        if (!ingestion || !TERMINAL_INGESTION_STATES.has(ingestion.state)) {
+          await enqueueIngestionJob(linkId);
+        }
+        await recordOutcome('resume_found');
+        return;
+      }
+      const intake: AshbyIntakeType = resumeLink ? 'resume_parsing' : 'phone_parsing';
+
+      // ── Re-read the application: decide on Ashby's state NOW ─────────────
+      const info = await readAshby(() => runtime.client.applicationInfo(link.externalApplicationId));
+      const view = extractApplicationInfo(info.results);
+      // Still at the AI stage of THIS link's mapping, and that mapping is an
+      // enabled phone_primary one. A candidate moved on by a recruiter, or a
+      // mapping paused or switched away from phone, is not profiled.
+      const mapping = view.jobId ? await runtime.resolveMappingByJobId(view.jobId) : null;
+      const decision = mapping ? decideImport(view, mapping, null) : null;
+      if (!mapping || !decision || decision.action !== 'import') {
+        await recordOutcome(decision?.action === 'skip' && decision.reason === 'stage_not_ai'
+          ? 'stage_moved'
+          : 'mapping_inactive');
+        return;
+      }
+      if (mapping.screeningMode !== 'phone_primary' || mapping.id !== link.jobMappingId) {
+        await recordOutcome('mapping_inactive');
+        return;
+      }
+      // Archived, hired or anything else that is not `Active`. An absent
+      // status is not a reason to stop: older payloads do not carry it.
+      const status = extractAshbyApplicationStatus(info.results);
+      if (status !== null && status !== 'Active') {
+        await recordOutcome('application_inactive');
+        return;
+      }
+
+      // ── Does the candidate have a resume? ────────────────────────────────
+      let candidateResults: unknown;
+      if (resumeUnreadable) {
+        // B3: the link HAS a resume, so there is nothing to classify — only
+        // the Ashby profile to read, from both sources as phone parsing does.
+        if (view.candidateId) {
+          const candidateId = view.candidateId;
+          candidateResults = (await readAshby(() => runtime.client.candidateInfo(candidateId))).results;
+        }
+      } else if (!resumeLink) {
+        // A link with no handle: unstamped, or a sweep retry of a stamped
+        // one. Only a STRICT "no resume" answer classifies it; anything the
+        // job cannot read with certainty leaves it alone.
+        //
+        // `application.info` first, as the import reads it: a resume visible
+        // there must never be classified as "no resume", and needs no second
+        // read to find.
+        let handle = extractResumeHandle(info.results);
+        if (!handle) {
+          if (!view.candidateId) {
+            await recordOutcome('resume_shape_unknown');
+            return;
+          }
+          const candidateId = view.candidateId;
+          candidateResults = (await readAshby(() => runtime.client.candidateInfo(candidateId))).results;
+          handle = extractResumeHandle(candidateResults);
+          // With no handle found, the answer is `absent` or `unknown`.
+          if (!handle && classifyResumePresence(candidateResults) !== 'absent') {
+            await recordOutcome('resume_shape_unknown');
+            return;
+          }
+        }
+        if (handle) {
+          if (link.intakeType !== 'phone_parsing') {
+            // Today's resume path: bind it, ingest it, done. The store binds
+            // only onto a `resume_parsing` link with no handle yet.
+            await runtime.stores.bindLinkResumeHandle?.(linkId, handle);
+            await enqueueIngestionJob(linkId);
+            await recordOutcome('resume_found');
+            return;
+          }
+          // Already phone parsing: it stays that way (owner decision Q1).
+          logger.info('unknown_event', {
+            error_category: 'ashby_late_resume_ignored',
+            error_type: 'profile',
+          });
+        }
+      } else if (
+        view.candidateId
+        && extractAshbyCandidateProfile(info.results).primaryNumber === null
+      ) {
+        // D3: `candidate.info` only when the application carries no primary.
+        const candidateId = view.candidateId;
+        candidateResults = (await readAshby(() => runtime.client.candidateInfo(candidateId))).results;
+      }
+
+      // ── The profile and the number ───────────────────────────────────────
+      // Phone parsing sends the name and email too; D3 sends the number only.
+      // With no usable name, phone parsing sends no number at all: the
+      // identity check the call opens with could not catch the wrong person.
+      const profile = extractAshbyCandidateProfile(info.results, candidateResults);
+      const ashbyNumber = deriveAshbyProfilePhone({
+        primary: profile.primaryNumber,
+        others: profile.otherNumbers,
+      });
+      let skipReason: AshbyProfileSkipReason | null = null;
+      if (intake === 'phone_parsing' && profile.name === null) skipReason = 'name_missing';
+      else if (ashbyNumber.verdict === 'placeholder') skipReason = 'number_placeholder';
+      else if (ashbyNumber.verdict !== 'dialable') skipReason = 'number_invalid';
+      const applied = await runtime.stores.applyAshbyCandidateProfile({
+        applicationLinkId: linkId,
+        intake,
+        ...(intake === 'phone_parsing' ? { name: profile.name, email: profile.email } : {}),
+        phoneRaw: skipReason === 'name_missing' ? null : ashbyNumber.raw,
+        phoneE164: skipReason === null ? ashbyNumber.e164 : null,
+        skipReason,
+      });
+
+      // Codes only. `ashby_profile_classified` is the shape-drift canary: a
+      // sudden rise of `no_resume` means Ashby may have stopped sending the
+      // resume field; `resume_unreadable` counts the B3 fallbacks apart.
+      logger.info('unknown_event', {
+        error_category: 'ashby_profile_applied',
+        error_type: applied.profileOutcome ?? applied.status,
+      });
+      if (applied.intakeStamped) {
+        logger.info('unknown_event', {
+          error_category: 'ashby_profile_classified',
+          error_type: resumeUnreadable ? 'resume_unreadable' : 'no_resume',
+        });
+      }
+
+      // ── A number made the candidate callable: admit them like the ready path
+      // Only when a number was applied NOW, so a re-run never pushes an
+      // already-held dial later (critique m2). Phone parsing has no resume to
+      // write questions from, so it generates none.
+      if (applied.numberApplied
+          && (applied.status === 'eligible' || applied.status === 'scheduled_next_window')) {
+        await admitCalledCandidate(runtime, logger, linkId, applied, {
+          generateQuestions: intake === 'resume_parsing' && candidateQuestionsEnabled(),
+          origin: 'profile_applied',
+        });
+      }
+    },
   };
+}
+
+/**
+ * Which path admitted the candidate. It is the `error_type` of a failed
+ * enqueue, the one line that would otherwise not say where the job was lost.
+ */
+type AdmitCalledCandidateOrigin = 'ingestion_ready' | 'profile_applied';
+
+/**
+ * Ask for a called candidate's own questions, then hold their dial while
+ * generation runs. One helper, so every path that admits a candidate (the
+ * ingestion's `ready` path first) enqueues, holds and logs identically.
+ * Whether to generate at all is the caller's decision.
+ *
+ * ENQUEUED, NOT RUN. Generation is one call of up to two minutes; running it
+ * inline would hold the caller's lease for that long on a drain that is
+ * tick-rate bound and has a starvation history. The queue owns the lease, the
+ * retry and the crash recovery.
+ *
+ * BEST EFFORT, AND SILENT ON FAILURE. Every outcome of this enqueue —
+ * including not happening at all — leaves the call running the role's own
+ * template. Letting an enqueue fault fail the CALLER would trade a working
+ * import for a nicer question, which is the wrong way round.
+ */
+async function admitCalledCandidate(
+  runtime: AshbyRuntime,
+  logger: ReturnType<typeof createLogger>,
+  linkId: string,
+  engagement: { status: string; engagementId?: string },
+  { generateQuestions, origin }: {
+    generateQuestions: boolean;
+    origin: AdmitCalledCandidateOrigin;
+  },
+): Promise<void> {
+  // ── ONLY FOR A CANDIDATE WHO WILL ACTUALLY BE CALLED ────────────
+  // `ensure_ashby_phone_engagement` INSERTS the `pending_prereqs` row
+  // BEFORE it checks any prerequisite, then reports `phone_invalid`,
+  // `consent_evidence_missing`, `mapping_not_enabled` and the rest. So an
+  // engagement row exists, and is NOT terminal, for candidates with an
+  // unusable number or no consent evidence — and this module's whole cost
+  // argument ("the first moment we know the person will actually be
+  // called") was false while the status was discarded. Undialable rows
+  // are a material fraction of imports here.
+  //
+  // THE STATUS STRINGS ARE `0057`'s, READ FROM THE MIGRATION. The first
+  // draft of this guessed `ok`/`engagement_ready`/`already_exists`, none
+  // of which that function has ever returned — which would have left the
+  // enqueue unreachable and the whole feature quietly dead.
+  //   `eligible`              — admitted, due now
+  //   `scheduled_next_window` — admitted, due at the next calling window
+  //   `engagement_active`     — one already exists and is non-terminal.
+  //                             USUALLY a redelivery for a candidate who
+  //                             passed these same checks earlier, but
+  //                             `0057` returns it for ANY state that is
+  //                             not `pending_prereqs`/`eligible` — so it
+  //                             also covers a candidate who is dialing,
+  //                             on the phone right now, or reconnecting.
+  //                             `0104` refuses to move the dial for all
+  //                             of those; the grace only applies to an
+  //                             engagement still waiting for its first
+  //                             dial.
+  // Everything else is a prerequisite failure over a row that exists but
+  // is not dialable.
+  //
+  // 0114 (C8) adds one more of those: `duplicate_application`. The
+  // engagement stays `pending_prereqs` because the same person already
+  // holds a live or completed screen for the SAME role on another
+  // candidate row (matched on phone, normalised email, or Ashby
+  // candidate id + job mapping). Nothing dials it until HR releases the
+  // hold (POST /candidates/:id/phone/release-duplicate-hold), so it is
+  // deliberately NOT a will-be-called status: generating questions for
+  // it would pay a provider call for a screen that may never happen.
+  const willBeCalled = engagement?.status === 'eligible'
+    || engagement?.status === 'scheduled_next_window'
+    || engagement?.status === 'engagement_active';
+  if (willBeCalled && generateQuestions) {
+    try {
+      await runtime.queue.enqueue(
+        CANDIDATE_QUESTIONS_QUEUE,
+        { applicationLinkId: linkId },
+        {
+          // Keyed on the application, so a redelivery, a reconciliation
+          // recovery and a retried ingestion collapse onto one job.
+          dedupKey: `candidate-questions:${linkId}`,
+          maxAttempts: CANDIDATE_QUESTIONS_MAX_JOB_ATTEMPTS,
+        },
+      );
+      // ── AND HOLD THE DIAL WHILE IT RUNS ─────────────────────
+      // Only after the enqueue SUCCEEDED: holding a call for work that
+      // was never queued is pure latency. `0104` moves the timestamp
+      // LATER and never earlier, so a candidate waiting for the IST
+      // window keeps that time.
+      //
+      // A ONE-TIME PUSH, NOT A WAIT-FOR-READY. If generation fails,
+      // dead-letters or never runs, the candidate is dialled after the
+      // grace on the role's own template — exactly as before any of this
+      // existed. Nothing here can strand a call.
+      //
+      // ITS OWN try/catch, AND A LOG ON EVERY PATH INCLUDING THE ONES
+      // THAT DO NOTHING. Three reviewers landed on the same hole: a hold
+      // that never happens is the race this feature exists to close, so
+      // "no hold" must never be silent. Sharing the enqueue's catch also
+      // reported a failed hold as `candidate_questions_enqueue_failed`,
+      // which is a lie about which half broke.
+      try {
+        if (!runtime.stores.deferPhoneDialForQuestions) {
+          logger.warn('unknown_event', {
+            error_category: 'candidate_questions_dial_not_held',
+            error_type: 'store_unavailable',
+          });
+        } else if (!engagement?.engagementId) {
+          // `0057` returns `engagement_id` on all three admitted
+          // branches, so this means the key or its mapping broke.
+          logger.warn('unknown_event', {
+            error_category: 'candidate_questions_dial_not_held',
+            error_type: 'engagement_id_missing',
+          });
+        } else {
+          const held = await runtime.stores.deferPhoneDialForQuestions(
+            engagement.engagementId,
+            CANDIDATE_QUESTIONS_DIAL_GRACE_SECONDS,
+          );
+          // `deferred` and `unchanged` are the two that mean the call
+          // will wait; every other status means it will NOT, so they are
+          // warnings rather than another line of info nobody reads.
+          const holdWorked = held.status === 'deferred' || held.status === 'unchanged';
+          const emit = holdWorked ? logger.info : logger.warn;
+          emit.call(logger, 'unknown_event', {
+            error_category: holdWorked
+              ? 'candidate_questions_dial_held'
+              : 'candidate_questions_dial_not_held',
+            error_type: held.status,
+          });
+        }
+      } catch {
+        // Losing the hold means the call races, which is the behaviour
+        // this feature shipped with — not a reason to fail an import.
+        logger.warn('unknown_event', {
+          error_category: 'candidate_questions_dial_not_held',
+          error_type: 'defer_failed',
+        });
+      }
+    } catch (error) {
+      // Sanitized code only: no link id, no candidate, no provider
+      // message — a provider message can carry whatever it was handed.
+      // A failed hold no longer lands here: it has its own catch above,
+      // so this category means what it says — nothing was queued.
+      logger.warn('unknown_event', {
+        error_category: 'candidate_questions_enqueue_failed',
+        error_type: origin,
+      });
+    }
+  }
 }
 
 /**
@@ -1638,6 +2111,35 @@ export function extractResumeHandle(info: unknown): string | null {
   return null;
 }
 
+/**
+ * Does this `candidate.info` result say the candidate has a resume?
+ *
+ *   - `present` — {@link extractResumeHandle} finds a handle;
+ *   - `absent`  — the object carries its OWN `resumeFileHandle` key, and its
+ *                 value is strictly `null`;
+ *   - `unknown` — anything else: no key, `undefined`, a malformed or
+ *                 oversized handle, a non-object.
+ *
+ * ONLY `absent` may classify an application as phone parsing (ADR-0018). A
+ * missing key is not "no resume": it is a response shape this code does not
+ * know, and guessing "no resume" from it would screen a resume-backed
+ * candidate without their resume. `unknown` leaves the link untouched and is
+ * recorded as `resume_shape_unknown`, so a change in Ashby's shape is visible
+ * rather than silently reclassifying applicants.
+ */
+export function classifyResumePresence(candidateInfoResults: unknown): 'present' | 'absent' | 'unknown' {
+  if (extractResumeHandle(candidateInfoResults)) return 'present';
+  if (
+    candidateInfoResults !== null
+    && typeof candidateInfoResults === 'object'
+    && Object.prototype.hasOwnProperty.call(candidateInfoResults, 'resumeFileHandle')
+    && (candidateInfoResults as Record<string, unknown>).resumeFileHandle === null
+  ) {
+    return 'absent';
+  }
+  return 'unknown';
+}
+
 export { extractFileUrl };
 
 /**
@@ -1648,6 +2150,9 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
   const owner = options.owner ?? `api-${process.pid}`;
   const logger = createLogger('ashby-runtime');
   const rc = runtime.runtimeConfig;
+  // The same reading `buildAshbyHandlers` makes, so the sweep and the job it
+  // enqueues can never disagree about whether phone parsing is on.
+  const phoneParsingEnabled = rc.phoneParsingEnabled === true;
 
   // The ingestion handler needs the async ports factory, which `runIngestionJob`
   // cannot await for us — so build the ports first and pass a sync thunk.
@@ -1973,6 +2478,49 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
           return r.requeued.length + r.deadLettered.length > 0;
         },
       },
+      {
+        // ── Phone parsing: the durable sweep (ADR-0018) ────────────────────
+        // The backstop for every best-effort profile enqueue, and the backfill
+        // for links that predate them. Due-ness, SKIP LOCKED, the attempt
+        // count and the backoff all live in `claim_ashby_profile_due`, so
+        // Ashby polling stays bounded whatever happens to the job; this loop
+        // only enqueues what it was handed. The shared dedup key collapses a
+        // claim onto a job the import or the D3 trigger already queued.
+        //
+        // The 600 s interval bounds the first, staggered tick and sets the
+        // health window. Later ticks follow `lib/scheduler.ts`, whose backoff
+        // is capped at 60 s, so in practice the claim runs every 30-60 s.
+        // That is safe for the same reason: a tick with nothing due costs one
+        // RPC and no Ashby read.
+        //
+        // OFF ticks and does nothing. No claim is made, so no link spends an
+        // attempt while the switch is off.
+        name: 'profile_sweep',
+        intervalMs: PROFILE_SWEEP_INTERVAL_MS,
+        tick: async () => {
+          if (!phoneParsingEnabled || !runtime.stores.claimAshbyProfileDue) return false;
+          const linkIds = await runtime.stores.claimAshbyProfileDue({ limit: PROFILE_SWEEP_LIMIT });
+          let failed = 0;
+          for (const linkId of linkIds) {
+            try {
+              await enqueueAshbyProfileJob(runtime.queue, linkId, 0, Date.now);
+            } catch {
+              failed += 1;
+            }
+          }
+          if (failed > 0) {
+            // Thrown only AFTER the whole batch was tried, so one failed
+            // enqueue cannot strand the links claimed beside it, and the
+            // scheduler still counts the tick as an error on /health.
+            logger.warn('unknown_event', {
+              error_category: 'ashby_profile_enqueue_failed',
+              error_type: 'sweep',
+            });
+            throw new Error('ashby_profile_sweep_enqueue_error');
+          }
+          return linkIds.length > 0;
+        },
+      },
     ],
   });
 
@@ -1985,6 +2533,7 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
       operation: rc.operationPollMs,
       reconcile: rc.reconcileIntervalMs,
       reclaim: rc.reclaimIntervalMs,
+      profile_sweep: PROFILE_SWEEP_INTERVAL_MS,
     },
     async tickAll() {
       await runner.tick();

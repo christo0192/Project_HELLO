@@ -48,6 +48,7 @@ default rather than failing the boot.
 | `ASHBY_RECLAIM_INTERVAL_MS` | `60000` | Expired-lease sweep cadence (clamped 5 000–3 600 000). |
 | `ASHBY_LEASE_SECONDS` | `60` | Visibility window per claim (clamped 5–900). |
 | `RESUME_SCANNER`, `RESUME_SCANNER_MAX_DB_AGE_HOURS`, `AV_UPDATER_*` | see §5a | Malware scanner and its signature-update lifecycle. Stage 5 cannot pass without them. |
+| `ASHBY_PHONE_PARSING_ENABLED` | OFF in code; `"true"` in `fly.toml [env]` | Phone-parsing intake kill switch (ADR-0018). Only the literal `true` is ON. See §10. |
 
 **The runtime starts only when all four of these hold:**
 `ASHBY_INTEGRATION_ENABLED=true` **and** a usable `ASHBY_WEBHOOK_SECRET` **and**
@@ -76,6 +77,9 @@ Four independent, jittered, single-flight loops (see `scheduler.ts`):
 | `operation` | Claims **`invite_delivery` operations and nothing else** (see §7). |
 | `reconcile` | The dropped-webhook safety net, under a DB single-flight lease. |
 | `reclaim` | `reclaimExpired` — requeues or dead-letters jobs whose lease expired. |
+
+M017 (ADR-0018) adds a `profile_sweep` loop beside these, and the main runner
+also claims the `ashby.profile` jobs it enqueues. Both are described in §10.
 
 The chain: signed webhook → receipt + outbox (one transaction) → `ashby.signal`
 → authoritative `application.info` re-read + mapping/stage gate → `ashby.import`
@@ -480,3 +484,184 @@ flag on but a dead scheduler reports `degraded`, not `healthy`.
   not already a stable snake_case code is persisted as `unknown_error`; the
   detail is lost on purpose so a driver message carrying row content can never
   reach `job_queue.error_message` or the DLQ.
+
+---
+
+## 10. Phone-parsing intake (M017, ADR-0018)
+
+An Ashby application with no resume, or whose resume could not be read
+(`failed_review` on a document verdict: `scan_infected`, `guard_*`,
+`parse_extract_failed`, `parse_no_output`, `parse_output_exceeded` or
+`no_extractable_fields`), is screened by phone from its Ashby candidate record: name,
+email and the primary number. A resume-parsing candidate whose resume has no
+valid +91 mobile gets the Ashby number as a fallback. A `failed_review` on a
+machine-class reason (a parser, scanner or provider outage, a deferral
+deadline, `materialize_failed`, `unexpected_error`, the legacy `parse_error`
+or `parse_bad_output`) does NOT fall back: recover it with the usual
+requeue, and the resume is read. A `phone_parsing` link whose ingestion
+something requeued anyway logs `ashby_phone_parsing_ingestion_requeued`
+(warn); the ingestion handler never reads it. The decision, its rules
+and its owner choices are in
+[ADR-0018](../adr/0018-ashby-phone-parsing-intake.md); this section is the
+operator's view.
+
+### The kill switch: `ASHBY_PHONE_PARSING_ENABLED`
+
+Read as the literal `true` only: unset, `TRUE`, `1` or anything else is OFF.
+Production ships ON through `app/api/fly.toml [env]`.
+
+| | ON | OFF |
+|---|---|---|
+| Profile job enqueue at import (15 min later) and on a `phone_invalid` or a document-verdict `failed_review` | Enqueued | Not enqueued |
+| `profile_sweep` loop | Claims due links and enqueues them | Ticks and does nothing. No claim is made, so no link spends a profile attempt |
+| `ashby.profile` job | Classifies, applies the profile, evaluates the prerequisites | Returns without doing anything |
+| Due loop, `phone_parsing` engagements | Dialled like any other engagement | **Every dial is held**, in SQL: scheduled first calls, HR "Call now" ("Call candidate"), rescreens and booked appointments alike. The requests are accepted and stay due; they dial once the switch is back on. Only a reconnect of a call that is already live still flows |
+| Resume-parsing engagements, including ones dialling an Ashby fallback number applied earlier | Unaffected | Unaffected |
+
+Always on, whatever the switch: a resume parse never overwrites a valid number,
+a late resume is never bound to or parsed over a `phone_parsing` link,
+phone-parsing calls render no-resume instructions and are scored without resume
+evidence, the identity-mismatch release runs, and a DSAR delete terminates the
+candidate's live links. The switch is not a phone halt: `POST /api/phone/halt`
+(`set_phone_halt`) remains the fleet-wide emergency stop for every call.
+
+**Turn it off** (no code deploy; a Fly secret overrides `fly.toml [env]`, and
+setting it restarts the API machines with the new value):
+
+```bash
+fly secrets set ASHBY_PHONE_PARSING_ENABLED=false --app project-hello-api
+```
+
+**Turn it back on** by removing the override, so `[env]` applies again:
+
+```bash
+fly secrets unset ASHBY_PHONE_PARSING_ENABLED --app project-hello-api
+```
+
+**Read it back** on `GET /api/integrations/ashby/mission-control/health`:
+`runtime.phoneParsingEnabled`. That is the value the running process sees; the
+file alone cannot tell you, because a secret may override it. The due-loop hold
+is consulted once per due pass, so it follows the process's value on the next
+pass.
+
+### Cadence of the profile sweep
+
+`profile_sweep` is registered with a 600 s interval, which bounds its first,
+staggered tick and sets its health window. `lib/scheduler.ts` caps every loop's
+poll delay at 60 s, so in practice the claim runs every 30-60 s. That is
+harmless: due-ness lives in `claim_ashby_profile_due`, and a tick with nothing
+due costs one RPC and no Ashby read.
+
+What the claim bounds, per link, whatever happens to the job:
+
+- a link becomes due once 15 minutes have passed since it was created (no
+  resume), since its ingestion came to rest in `failed_review` on a document
+  verdict (unreadable resume), or since its engagement was last updated at
+  `pending_prereqs / phone_invalid` (Ashby fallback number);
+- each claim stamps `profile_checked_at` and counts `profile_attempts`; the next
+  claim waits 6 h, then 12 h, then 24 h; at most 4 claims per link;
+- at most 25 links per tick, `FOR UPDATE SKIP LOCKED`, never-checked links first.
+
+A link that has spent its 4 claims is never polled by the sweep again. A fresh
+import, or a new `phone_invalid` or document-verdict `failed_review`, still
+enqueues its own job.
+
+### `profile_outcome`: what each code means
+
+The last outcome of the profile step, on `ashby_application_links`. Codes only;
+NULL means no outcome yet.
+
+| Code | Meaning |
+|---|---|
+| `applied` | The Ashby number was applied and the prerequisites were evaluated. |
+| `number_invalid` | No strict +91 mobile in the Ashby record (missing, malformed or foreign). |
+| `number_placeholder` | The Ashby number matches a placeholder pattern (one repeated digit, `[6-9]` then nine zeros, or a run of consecutive digits). |
+| `number_shared` | Another candidate, who is not the same Ashby person, already holds this number as valid. |
+| `name_missing` | Phone parsing found no usable name, so no number was applied. |
+| `resume_found` | A resume was found on recheck; the application stays on resume parsing. |
+| `resume_shape_unknown` | Ashby's answer did not say clearly whether a resume exists; nothing was classified. |
+| `stage_moved` | The application is no longer at the mapped AI screening stage. |
+| `application_inactive` | Ashby reports the application as not `Active`. |
+| `mapping_inactive` | The job mapping is not an enabled `phone_primary` mapping. |
+| `subject_request_hold` | A correction, restriction or erasure request holds every write for this candidate. |
+| `engagement_active` | The engagement is already past `pending_prereqs` (scheduled, dialling, in a call or finished); nothing changed. |
+| `not_applicable` | Nothing to do: the candidate already has a valid number, already had an Ashby number, or the resume path does not apply. |
+| `ashby_unavailable` | Reading Ashby failed; the job retries and the sweep is the backstop. |
+| `identity_unconfirmed` | The wrong person answered the unverified Ashby number twice; the number was cleared and the engagement cancelled. |
+| `application_terminal` | The application was withdrawn, deleted or finished. |
+| `candidate_missing` | No candidate row is bound to the link yet. |
+
+### HR recovery for `identity_unconfirmed`
+
+The first time a call to an unverified Ashby number reaches someone who is not
+the candidate, the attempt is recorded on the link
+(`identity_mismatch_attempt_id`) and the engagement is redialled no earlier
+than the next IST day's calling window. The second confirmed mismatch, on a
+later attempt of the same engagement, clears the number, cancels the engagement
+with `identity_unconfirmed` and records the same link outcome. The Ashby number
+is never applied to that candidate again (`ashby_phone_applied_at` is never
+cleared), and the sweep no longer picks the link up.
+
+To recover:
+
+1. Confirm the right number with the candidate or the hiring team, outside the
+   system.
+2. An admin verifies it in the "Verify number" box of the candidate page's
+   phone cycle card, which shows for an `identity_unconfirmed` cycle above the
+   re-screen form (`POST /api/candidates/{id}/phone-number-verification`,
+   `verify_candidate_phone`). Interviewers see a note that an admin must do it.
+3. Request a rescreen from the same card (a cancelled cycle allows one).
+   A verified number is never released by a later mismatch.
+
+A rescreen without a verified number lands at `pending_prereqs / phone_invalid`
+and is not dialled.
+
+### Health queries (SELECT only)
+
+Counts and codes only. None of these selects a name, email or number column.
+
+```sql
+-- Live links by intake type and last profile outcome.
+select l.intake_type, l.profile_outcome, count(*) as links
+  from screening_v2.ashby_application_links l
+ where l.provider = 'ashby' and l.terminal_state is null
+ group by l.intake_type, l.profile_outcome
+ order by l.intake_type, l.profile_outcome;
+
+-- Sweep budget: how many claims links have spent (4 = no longer polled).
+select l.profile_attempts, count(*) as links, max(l.profile_checked_at) as last_checked
+  from screening_v2.ashby_application_links l
+ where l.provider = 'ashby' and l.profile_checked_at is not null
+ group by l.profile_attempts
+ order by l.profile_attempts;
+
+-- Engagements by intake type, state and reason.
+select l.intake_type, e.state, e.state_reason, count(*) as engagements
+  from screening_v2.phone_engagements e
+  join screening_v2.ashby_application_links l on l.id = e.application_link_id
+ group by l.intake_type, e.state, e.state_reason
+ order by l.intake_type, e.state, e.state_reason;
+
+-- Engagements waiting for the retry after a first confirmed identity mismatch.
+select count(*) as awaiting_mismatch_retry
+  from screening_v2.phone_engagements e
+  join screening_v2.ashby_application_links l on l.id = e.application_link_id
+ where l.identity_mismatch_attempt_id is not null
+   and e.terminal_at is null
+   and e.state = 'eligible'
+   and e.state_reason = 'abandoned_pre_disclosure';
+```
+
+A climbing `pending_prereqs / phone_invalid` count under `resume_parsing` means
+the fallback is not reaching those links: check the switch read-back, the
+`profile_sweep` heartbeat and the `profile_outcome` breakdown above.
+
+### Rollback caveats
+
+The switch is the rollback for behaviour. Rolling the application back to a
+pre-0130 build on the 0130 database is safe for the schema (0130 is additive and
+forward-only), but stamped `phone_parsing` links still pass the SQL gates, the
+old due loop has no hold (the switch then has no effect), the old events route
+has no mismatch release, and a re-imported late resume could be bound and parsed
+over the Ashby data. If that rollback is needed, halt phone calls first
+(`POST /api/phone/halt`).

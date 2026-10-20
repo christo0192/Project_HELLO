@@ -5430,6 +5430,7 @@ def _role_turn_line(role_title: str | None) -> str | None:
 
 def phone_question_instructions(
     question: "phone.PhonePlanQuestion", role_title: str | None = None,
+    resume_on_file: bool = True,
 ) -> str:
     """The instruction handed to the model for ONE plan question.
 
@@ -5443,20 +5444,31 @@ def phone_question_instructions(
     carries the role as defense in depth, independent of model attention to the
     construction-time system prompt. `role_title` defaults to None (no line) so the browser
     lane and any role-less caller are byte-unchanged.
+
+    M017 (ADR-0018): `resume_on_file=False` (a phone-parsing call with no
+    resume) drops the resume sentence and uses the no-resume style reminder.
+    The default keeps the existing bytes.
     """
-    lines = [
-        "Continue the live phone conversation naturally and stay within the "
-        "authorized objective below.",
-        "Authorized objective: " + question.spoken_text,
-        "",
+    opener = (
         "Open with a SHORT, varied acknowledgement — a quick genuine beat of a "
         "few words tied to a specific thing they just said (\"Oh nice —\", "
         "\"Haha, fair enough —\", \"Mm, got it —\"), never the same opener twice "
         "in a row and never a whole recap sentence. Then ask one clear question "
         "that reaches the authorized objective in your own words; paraphrasing is "
         "allowed and verbatim wording is not required. Do not introduce another "
-        "objective, summarize the call, or say goodbye. Treat resume details as "
-        "unverified claims: never present them as confirmed employment history.",
+        "objective, summarize the call, or say goodbye."
+    )
+    if resume_on_file:
+        opener += (
+            " Treat resume details as "
+            "unverified claims: never present them as confirmed employment history."
+        )
+    lines = [
+        "Continue the live phone conversation naturally and stay within the "
+        "authorized objective below.",
+        "Authorized objective: " + question.spoken_text,
+        "",
+        opener,
     ]
     if question.hint:
         lines.append(f"If their answer is thin, the thing worth probing is: {question.hint}")
@@ -5467,7 +5479,10 @@ def phone_question_instructions(
     # message the model provably reads. PR-8 also puts the full expressiveness /
     # discipline / no-markdown blocks in the construction-time prompt; this
     # short copy remains as cheap, battle-tested defense in depth.
-    lines.append(phone.PHONE_PER_TURN_STYLE_TEXT)
+    lines.append(
+        phone.PHONE_PER_TURN_STYLE_TEXT if resume_on_file
+        else phone.PHONE_PER_TURN_STYLE_NO_RESUME_TEXT
+    )
     return "\n".join(lines)
 
 
@@ -5507,17 +5522,29 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
     shift it. The resume-conflict directive (X10) is added ONLY when compacted
     resume evidence is actually present, so a role-less / resume-less call never
     carries a dangling reference to facts the model was not given.
+
+    M017 (ADR-0018): with no resume on file (phone parsing), the facts block is
+    `PHONE_NO_RESUME_FACTS_TEXT` instead of a list of "unknown" values, and
+    `PHONE_NO_RESUME_TEXT` replaces the conflict directive. The record name is
+    passed through `phone_safe_first_name`, so an unusable name renders the
+    no-name lines rather than a guessed one.
     """
     compact_resume = _compact_phone_resume_evidence(state.resume_facts)
+    resume_on_file = phone.phone_resume_on_file(compact_resume)
+    resume_facts = (
+        prompting_format_resume_facts(compact_resume) if resume_on_file
+        else phone.PHONE_NO_RESUME_FACTS_TEXT
+    )
+    candidate_name = phone.phone_safe_first_name(state.candidate_name) or None
     # PHONE ONLY (owner request): a TTS-prosody primer at the VERY TOP so the
     # speaking model writes expressive, well-punctuated lines the Sarvam voice can
     # render with tone. Prepended (not merged into the sha-pinned `system_prompt`),
     # so the browser prompt surface is byte-identical.
     text = phone.PHONE_PERSONA_TEXT + phone.PHONE_TTS_EMOTION_TEXT + system_prompt(
-        candidate_name=state.candidate_name,
+        candidate_name=candidate_name,
         role_title=state.role_title,
         role_focus=(state.role_focus or ", ".join(state.role_required_skills))[:600],
-        resume_facts=prompting_format_resume_facts(compact_resume),
+        resume_facts=resume_facts,
         questions=(
             "The exact currently owed question is supplied separately for "
             "each response. Never select or advance a question yourself."
@@ -5544,9 +5571,12 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
     )
     # Resume-conflict probing rides the compacted evidence: only offer the
     # directive when there is evidence to reconcile against. Omitting it when
-    # `compact_resume` is empty keeps the reference from dangling.
-    if compact_resume:
+    # `compact_resume` is empty keeps the reference from dangling; the no-resume
+    # block (M017) takes its place.
+    if resume_on_file:
         text = text + phone.PHONE_RESUME_CONFLICT_TEXT
+    else:
+        text = text + phone.PHONE_NO_RESUME_TEXT
     resume = phone.render_resume_context(state.turns)
     return f"{text}\n\n{resume}" if resume else text
 
@@ -5571,7 +5601,7 @@ def _phone_instruction_state(worker_ctx: WorkerContext | None) -> "phone.PhoneAs
     state.role_required_skills = list(worker_ctx.role_required_skills)
     state.interviewer_instructions = worker_ctx.interviewer_instructions
     evidence = getattr(worker_ctx, "candidate_evidence", {})
-    state.resume_facts = dict(evidence) if isinstance(evidence, dict) else {}
+    state.resume_facts = phone.phone_resume_evidence(evidence)
     return state
 
 
@@ -7203,6 +7233,10 @@ async def _run_native_phone_screening(
         key present) or is pending consumption, the reply is not probe-shaped, or
         the synthesized finding was already asked (`asked_conflicts` dedup)."""
         if not phone.phone_conflict_gate_enabled():
+            return False
+        # M017 (ADR-0018): with no resume on file there is nothing a probe
+        # could be reconciled against, so a probe-shaped reply never arms.
+        if not phone.phone_resume_on_file(state.resume_facts):
             return False
         # Do not double-arm: the deterministic / judge path already armed this
         # turn (key present, not yet consumed by on_reply_delivered), or a probe
@@ -8849,7 +8883,10 @@ async def _run_native_phone_screening(
             if question is not None:
                 setattr(agent, "_turn_policy", "clarification")
                 set_question_reply_snapshot(question, text)
-                add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
+                add_turn_instruction(turn_ctx, phone_question_instructions(
+                    question, state.role_title,
+                    resume_on_file=phone.phone_resume_on_file(state.resume_facts),
+                ))
                 return
 
             # Invite once on entry. Acknowledgement after an answer closes;
@@ -9048,7 +9085,10 @@ async def _run_native_phone_screening(
         if silence_prompted["value"]:
             silence_prompted["value"] = False
             if question is not None:
-                add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
+                add_turn_instruction(turn_ctx, phone_question_instructions(
+                    question, state.role_title,
+                    resume_on_file=phone.phone_resume_on_file(state.resume_facts),
+                ))
             return
         # DE-LOOPED (this PR): the old two-turn propose→read-back→confirm
         # callback booking handshake is removed. No proposal is ever made in
@@ -9077,7 +9117,10 @@ async def _run_native_phone_screening(
                 setattr(agent, "_turn_policy", "clarification")
                 if question is not None:
                     set_question_reply_snapshot(question, text)
-                    add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
+                    add_turn_instruction(turn_ctx, phone_question_instructions(
+                        question, state.role_title,
+                        resume_on_file=phone.phone_resume_on_file(state.resume_facts),
+                    ))
                 return
             if route == "callback_deferral":
                 if closing.state in {ClosingState.CANDIDATE_QNA, ClosingState.CLOSING_PENDING}:
@@ -9125,7 +9168,10 @@ async def _run_native_phone_screening(
             conflict_reply_pending["dropped_on_advance"] = False
             if question is not None:
                 set_question_reply_snapshot(question, text)
-                instruction = phone_question_instructions(question, state.role_title)
+                instruction = phone_question_instructions(
+                    question, state.role_title,
+                    resume_on_file=phone.phone_resume_on_file(state.resume_facts),
+                )
                 if conflict_dropped:
                     # W2: a conflict was just dropped UNRESOLVED at cap.
                     # Neutralise the LLM-authored hand-off so it cannot say "no
@@ -9612,7 +9658,10 @@ async def _run_native_phone_screening(
             conflict_dropped = conflict_reply_pending.get("dropped_on_advance")
             conflict_reply_pending["dropped_on_advance"] = False
             if question is not None:
-                instruction = phone_question_instructions(question, state.role_title)
+                instruction = phone_question_instructions(
+                    question, state.role_title,
+                    resume_on_file=phone.phone_resume_on_file(state.resume_facts),
+                )
                 if conflict_dropped:
                     # W2: conflict dropped UNRESOLVED at cap — forbid the
                     # capitulation bridge on this owed-question advance turn.
@@ -9646,7 +9695,10 @@ async def _run_native_phone_screening(
                     "unknown_event", error_type="phone_turn_guard",
                     error_category="malformed_exchange_recovered",
                 )
-                add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
+                add_turn_instruction(turn_ctx, phone_question_instructions(
+                    question, state.role_title,
+                    resume_on_file=phone.phone_resume_on_file(state.resume_facts),
+                ))
                 return
             _log.info(
                 "unknown_event", error_type="phone_turn_guard",
@@ -10910,7 +10962,12 @@ async def _run_native_phone_screening(
         # answer was followed by a stale employment clarification. Obvious
         # conflicts are handled synchronously above; ambiguous/late ones expire
         # from live flow while remaining present in assessment evidence.
-        if isinstance(verdict.conflict, dict):
+        # M017 (ADR-0018): with no resume on file a judge "conflict" has no
+        # resume side, so it is ignored.
+        if (
+            isinstance(verdict.conflict, dict)
+            and phone.phone_resume_on_file(state.resume_facts)
+        ):
             _log.info(
                 "unknown_event", error_type="phone_coverage_conflict",
                 error_category="assessment_only_expired",
@@ -13513,6 +13570,18 @@ async def _run_phone_session(
     # the A2 prefix-cache warm-up below primes the EXACT byte-stable prefix that
     # turn-1 will send (a divergent prefix would not cache-hit).
     phone_instructions = _phone_instructions_text(instruction_state)
+    # M017 (ADR-0018): which resume context the prompt was built with, once
+    # per call. A fixed category only, never a resume value.
+    _log.info(
+        "unknown_event", error_type="phone_resume_context",
+        error_category=(
+            "resume_on_file"
+            if phone.phone_resume_on_file(
+                _compact_phone_resume_evidence(instruction_state.resume_facts)
+            )
+            else "no_resume_on_file"
+        ),
+    )
 
     agent = phone.phone_agent_class(Agent, stt_shadow=stt_shadow)(
         phone_instructions,
