@@ -286,13 +286,28 @@ describe('classifyResumePresence', () => {
     expect(classifyResumePresence({ resume: { fileHandle: 'handle_x' } })).toBe('present');
   });
 
-  it('answers `absent` ONLY for an own `resumeFileHandle` key that is strictly null', () => {
+  it('answers `absent` for a candidate (string id) whose resume fields are all missing or null', () => {
     expect(classifyResumePresence({ id: 'c', resumeFileHandle: null })).toBe('absent');
+    // Ashby documents resumeFileHandle as optional and omits it with no
+    // resume: the first live no-resume applicant (2026-10-21) had no key.
+    expect(classifyResumePresence({ id: 'c' })).toBe('absent');
+    expect(classifyResumePresence({ id: 'c', resumeFileHandle: undefined })).toBe('absent');
+    expect(classifyResumePresence({ id: 'c', resume: null, fileHandle: null, resumeHandle: null })).toBe('absent');
+    expect(classifyResumePresence({ id: 'c', name: 'x', fileHandles: [] })).toBe('absent');
   });
 
   it('answers `unknown` for every other shape', () => {
     for (const shape of [
       {},
+      { id: '' },
+      { id: 42 },
+      { resumeFileHandle: null },
+      { id: 'c', resumeFileHandle: '' },
+      { id: 'c', resumeFileHandle: {} },
+      { id: 'c', resumeFileHandle: { id: 'f', name: 'resume.pdf' } },
+      { id: 'c', resumeFileHandle: 'bad\u0000handle' },
+      { id: 'c', resume: {} },
+      { id: 'c', fileHandle: 0 },
       { resumeFileHandle: undefined },
       { resumeFileHandle: '' },
       { resumeFileHandle: 'bad\u0000handle' },
@@ -473,6 +488,22 @@ describe('classification: does the candidate have a resume?', () => {
     expect(w.applyCalls[0]).toMatchObject({ name: 'Other Person', email: 'other.person@example.com' });
   });
 
+  it('no resume key at all (Ashby omits the optional field): phone parsing', async () => {
+    const w = newWorld({ candidateInfo: { id: 'ashby_cand_1' } });
+    await runProfile(w);
+    expect(w.candidateReads).toBe(1);
+    expect(w.applyCalls).toEqual([{
+      applicationLinkId: LINK_ID,
+      intake: 'phone_parsing',
+      name: NAME,
+      email: EMAIL,
+      phoneRaw: NUMBER_RAW,
+      phoneE164: NUMBER_E164,
+      skipReason: null,
+    }]);
+    expect(w.outcomes).toEqual([]);
+  });
+
   it('strictly null: phone parsing with the name, the email and the number', async () => {
     const w = newWorld();
     await runProfile(w);
@@ -490,10 +521,10 @@ describe('classification: does the candidate have a resume?', () => {
     expect(w.outcomes).toEqual([]);
   });
 
-  it('a missing key, undefined or a bad handle is `resume_shape_unknown`, never phone parsing', async () => {
+  it('a bad handle or a candidate with no id is `resume_shape_unknown`, never phone parsing', async () => {
     for (const candidateInfo of [
-      { id: 'ashby_cand_1' },
-      { id: 'ashby_cand_1', resumeFileHandle: undefined },
+      { resumeFileHandle: null },
+      { id: 'ashby_cand_1', resumeFileHandle: {} },
       { id: 'ashby_cand_1', resumeFileHandle: 'bad\u0007handle' },
       { id: 'ashby_cand_1', resumeFileHandle: 'x'.repeat(600) },
     ]) {

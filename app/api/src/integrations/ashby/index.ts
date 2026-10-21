@@ -283,6 +283,7 @@ export {
   PROFILE_CLASSIFY_DELAY_MS,
   profileDedupKey,
   classifyResumePresence,
+  describeResumeShape,
   type AshbyWorkers,
 } from './runtime-workers.js';
 export {
