@@ -308,6 +308,8 @@ describe('classifyResumePresence', () => {
       { id: 'c', resumeFileHandle: 'bad\u0000handle' },
       { id: 'c', resume: {} },
       { id: 'c', fileHandle: 0 },
+      { id: 'c', resumeHandle: {} },
+      { id: 'c', resumeHandle: 0 },
       // Files attached outside the resume field may be a resume: fail closed.
       { id: 'c', fileHandles: [{ id: 'f', name: 'cv.pdf', handle: 'h' }] },
       { id: 'c', fileHandles: {} },
@@ -574,6 +576,18 @@ describe('classification: does the candidate have a resume?', () => {
     const { lines } = await captureLogs(() => runProfile(ok));
     expect(ok.applyCalls.map((c) => c.intake)).toEqual(['phone_parsing']);
     expect(lines.some((l) => l.includes('ashby_resume_shape_unknown'))).toBe(false);
+  });
+
+  it('a STAMPED phone-parsing link with an unknown shape still re-applies its profile', async () => {
+    const w = newWorld({
+      link: baseLink({ intakeType: 'phone_parsing' }),
+      candidateInfo: { id: 'ashby_cand_1', fileHandles: [{ id: 'f', name: 'cover.pdf', handle: 'h' }] },
+    });
+    const { lines } = await captureLogs(() => runProfile(w));
+    expect(w.outcomes).toEqual([]);
+    expect(w.binds).toEqual([]);
+    expect(w.applyCalls.map((c) => c.intake)).toEqual(['phone_parsing']);
+    expect(lines.some((l) => l.includes('fileHandles.nonempty'))).toBe(true);
   });
 
   it('no candidate id on the application logs `no_candidate_id`', async () => {

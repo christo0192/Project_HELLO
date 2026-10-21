@@ -1752,8 +1752,14 @@ export function buildAshbyHandlers(
               error_category: 'ashby_resume_shape_unknown',
               error_type: describeResumeShape(candidateResults),
             });
-            await recordOutcome('resume_shape_unknown');
-            return;
+            // Failing closed only matters BEFORE classification. A link
+            // already stamped phone parsing stays that way (owner decision
+            // Q1), so a sweep retry still re-applies its profile: a number HR
+            // corrected in Ashby must not be blocked by an attached file.
+            if (link.intakeType !== 'phone_parsing') {
+              await recordOutcome('resume_shape_unknown');
+              return;
+            }
           }
         }
         if (handle) {
