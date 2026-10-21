@@ -1734,6 +1734,10 @@ export function buildAshbyHandlers(
         let handle = extractResumeHandle(info.results);
         if (!handle) {
           if (!view.candidateId) {
+            logger.info('unknown_event', {
+              error_category: 'ashby_resume_shape_unknown',
+              error_type: 'no_candidate_id',
+            });
             await recordOutcome('resume_shape_unknown');
             return;
           }
@@ -2122,19 +2126,21 @@ export function extractResumeHandle(info: unknown): string | null {
  *
  *   - `present` — {@link extractResumeHandle} finds a handle;
  *   - `absent`  — a recognisable candidate (a non-empty string `id`) whose
- *                 resume fields are all missing or `null`;
+ *                 resume fields are all missing or `null`, and who has no
+ *                 attached files at all (`fileHandles` missing, null or empty);
  *   - `unknown` — anything else: a resume field holding a value that is not a
- *                 usable handle (malformed, oversized), a candidate with no
- *                 `id`, a non-object.
+ *                 usable handle (malformed, oversized), attached files with no
+ *                 resume field, a candidate with no `id`, a non-object.
  *
- * ONLY `absent` may classify an application as phone parsing (ADR-0018).
- * Ashby documents `resumeFileHandle` as OPTIONAL and omits it for a candidate
- * with no resume; the first live no-resume applicant (2026-10-21) arrived that
- * way, and requiring an explicit `null` left every such applicant unclassified
- * at `resume_shape_unknown`. A missing key on a real candidate object is
- * therefore "no resume". A resume field that is present but unreadable stays
- * `unknown`: it may be a resume this code cannot parse, and guessing "no
- * resume" from it would screen a resume-backed candidate without it.
+ * ONLY `absent` may classify an application as phone parsing (ADR-0018), and
+ * a phone-parsing link stays that way even if a resume arrives later, so this
+ * fails closed. The API docs read for M017 list `resumeFileHandle` as nullable;
+ * the first live no-resume applicant (2026-10-21) was nevertheless left at
+ * `resume_shape_unknown` by a rule that required an explicit `null`, so the
+ * key evidently arrives OMITTED. Missing and `null` both mean "no resume".
+ * A resume field that is present but unreadable, or files attached outside
+ * the resume field, stay `unknown`: either may be a resume this code cannot
+ * see, and the shape log says which.
  */
 export function classifyResumePresence(candidateInfoResults: unknown): 'present' | 'absent' | 'unknown' {
   if (extractResumeHandle(candidateInfoResults)) return 'present';
@@ -2144,14 +2150,23 @@ export function classifyResumePresence(candidateInfoResults: unknown): 'present'
   // The same fields `extractResumeHandle` reads: each must say nothing.
   const silent = ['resumeFileHandle', 'fileHandle', 'resumeHandle', 'resume']
     .every((key) => rec[key] === undefined || rec[key] === null);
-  return silent ? 'absent' : 'unknown';
+  return silent && !hasAttachedFiles(rec) ? 'absent' : 'unknown';
+}
+
+/** True unless `fileHandles` is missing, null or an empty array. */
+function hasAttachedFiles(rec: Record<string, unknown>): boolean {
+  const files = rec.fileHandles;
+  if (files === undefined || files === null) return false;
+  return !(Array.isArray(files) && files.length === 0);
 }
 
 /**
  * A fixed code for the resume part of a `candidate.info` shape, for the
  * `resume_shape_unknown` log line. Only key names and value TYPES, never a
- * value: `not_object`, `no_id`, or `<key>.<type>` for the first resume field
- * that holds something (`resumeFileHandle.object`, `resume.string`, ...).
+ * value: `not_object`, `no_id`, `<key>.<type>` for the first resume field
+ * that holds something (`resumeFileHandle.object`, `resume.string`, ...),
+ * `fileHandles.nonempty` for attached files with no resume field, else
+ * `all_empty`.
  */
 export function describeResumeShape(candidateInfoResults: unknown): string {
   if (candidateInfoResults === null || typeof candidateInfoResults !== 'object') return 'not_object';
@@ -2161,7 +2176,7 @@ export function describeResumeShape(candidateInfoResults: unknown): string {
     const v = rec[key];
     if (v !== undefined && v !== null) return `${key}.${Array.isArray(v) ? 'array' : typeof v}`;
   }
-  return 'all_empty';
+  return hasAttachedFiles(rec) ? 'fileHandles.nonempty' : 'all_empty';
 }
 
 export { extractFileUrl };

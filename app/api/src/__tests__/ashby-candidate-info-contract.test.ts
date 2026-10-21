@@ -407,6 +407,9 @@ describe('documented envelopes reach the extractor intact', () => {
     expect(describeResumeShape(documentedCandidate({ resumeFileHandle: {} }))).toBe('resumeFileHandle.object');
     expect(describeResumeShape(documentedCandidate({ resumeFileHandle: 'x\u0000' }))).toBe('resumeFileHandle.string');
     expect(describeResumeShape(documentedCandidate({ resumeFileHandle: [] }))).toBe('resumeFileHandle.array');
+    expect(describeResumeShape(documentedCandidate({
+      fileHandles: [{ id: FILE_ID, name: 'cover.pdf', handle: 'synthetic-file-handle-2' }],
+    }))).toBe('fileHandles.nonempty');
     expect(describeResumeShape({ name: 'Synthetic Person' })).toBe('no_id');
     expect(describeResumeShape(null)).toBe('not_object');
     expect(describeResumeShape('a string')).toBe('not_object');

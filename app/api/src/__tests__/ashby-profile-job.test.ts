@@ -308,6 +308,9 @@ describe('classifyResumePresence', () => {
       { id: 'c', resumeFileHandle: 'bad\u0000handle' },
       { id: 'c', resume: {} },
       { id: 'c', fileHandle: 0 },
+      // Files attached outside the resume field may be a resume: fail closed.
+      { id: 'c', fileHandles: [{ id: 'f', name: 'cv.pdf', handle: 'h' }] },
+      { id: 'c', fileHandles: {} },
       { resumeFileHandle: undefined },
       { resumeFileHandle: '' },
       { resumeFileHandle: 'bad\u0000handle' },
@@ -551,6 +554,35 @@ describe('classification: does the candidate have a resume?', () => {
     await expect(runProfile(w)).rejects.toThrow('ashby_rate_limited');
     expect(w.outcomes).toEqual(['ashby_unavailable']);
     expect(w.applyCalls).toEqual([]);
+  });
+
+  it('logs the unknown shape as a fixed code the logger keeps, and nothing on `absent`', async () => {
+    for (const [candidateInfo, code] of [
+      [{ id: 'ashby_cand_1', resumeFileHandle: {} }, 'resumeFileHandle.object'],
+      [{ id: 'ashby_cand_1', fileHandles: [{ id: 'f', name: 'cover.pdf', handle: 'h' }] }, 'fileHandles.nonempty'],
+      [{ resumeFileHandle: null }, 'no_id'],
+    ] as const) {
+      const w = newWorld({ candidateInfo });
+      const { lines } = await captureLogs(() => runProfile(w));
+      expect(w.outcomes).toEqual(['resume_shape_unknown']);
+      const line = lines.find((l) => l.includes('ashby_resume_shape_unknown'));
+      expect(line).toBeDefined();
+      expect(JSON.parse(line!).error_type).toBe(code);
+      expect(line).not.toContain('cover.pdf');
+    }
+    const ok = newWorld({ candidateInfo: { id: 'ashby_cand_1', fileHandles: [] } });
+    const { lines } = await captureLogs(() => runProfile(ok));
+    expect(ok.applyCalls.map((c) => c.intake)).toEqual(['phone_parsing']);
+    expect(lines.some((l) => l.includes('ashby_resume_shape_unknown'))).toBe(false);
+  });
+
+  it('no candidate id on the application logs `no_candidate_id`', async () => {
+    const info = appInfo();
+    delete (info as Record<string, unknown>).candidate;
+    const w = newWorld({ applicationInfo: info });
+    const { lines } = await captureLogs(() => runProfile(w));
+    const line = lines.find((l) => l.includes('ashby_resume_shape_unknown'));
+    expect(JSON.parse(line!).error_type).toBe('no_candidate_id');
   });
 
   it('a stamped phone-parsing link that now shows a resume STAYS phone parsing (Q1)', async () => {
