@@ -20,8 +20,10 @@
  *     createdAt, updatedAt, name, primaryEmailAddress, emailAddresses,
  *     primaryPhoneNumber, phoneNumbers, socialLinks, tags, applicationIds,
  *     resumeFileHandle, fileHandles, profileUrl. `primaryEmailAddress`,
- *     `primaryPhoneNumber` and `resumeFileHandle` are nullable (present as
- *     `null`, never omitted). Contact items are ContactInfo
+ *     `primaryPhoneNumber` and `resumeFileHandle` are nullable. LIVE CORRECTION
+ *     (2026-10-21): the first real no-resume applicant was left at
+ *     `resume_shape_unknown`, which means `resumeFileHandle` arrived OMITTED,
+ *     not `null`. Both must read as "no resume". Contact items are ContactInfo
  *     `{ value: string, type: 'Personal'|'Work'|'Other', isPrimary: boolean }`.
  *     `resumeFileHandle` is a FileHandle `{ id, name, handle }` or null.
  *   - `application.info` results: the application at the ROOT of `results`
@@ -69,6 +71,7 @@ import { deriveAshbyProfilePhone, STRICT_IN_MOBILE_E164 } from '../lib/candidate
 import {
   buildAshbyHandlers,
   classifyResumePresence,
+  describeResumeShape,
   extractResumeHandle,
   ASHBY_PROFILE_QUEUE,
   ASHBY_INGESTION_QUEUE,
@@ -390,6 +393,26 @@ describe('documented envelopes reach the extractor intact', () => {
     expect(extractResumeHandle(withResume)).toBe('synthetic-file-handle-1');
     expect(classifyResumePresence(withResume)).toBe('present');
     expect(classifyResumePresence(documentedCandidate())).toBe('absent');
+    // As seen live: the key omitted entirely on a no-resume candidate.
+    const omitted = documentedCandidate() as Record<string, unknown>;
+    delete omitted.resumeFileHandle;
+    expect(classifyResumePresence(omitted)).toBe('absent');
+  });
+
+  it('describeResumeShape names the shape with fixed codes and never a value', () => {
+    const omitted = documentedCandidate() as Record<string, unknown>;
+    delete omitted.resumeFileHandle;
+    expect(describeResumeShape(omitted)).toBe('all_empty');
+    expect(describeResumeShape(documentedCandidate())).toBe('all_empty');
+    expect(describeResumeShape(documentedCandidate({ resumeFileHandle: {} }))).toBe('resumeFileHandle.object');
+    expect(describeResumeShape(documentedCandidate({ resumeFileHandle: 'x\u0000' }))).toBe('resumeFileHandle.string');
+    expect(describeResumeShape(documentedCandidate({ resumeFileHandle: [] }))).toBe('resumeFileHandle.array');
+    expect(describeResumeShape(documentedCandidate({
+      fileHandles: [{ id: FILE_ID, name: 'cover.pdf', handle: 'synthetic-file-handle-2' }],
+    }))).toBe('fileHandles.nonempty');
+    expect(describeResumeShape({ name: 'Synthetic Person' })).toBe('no_id');
+    expect(describeResumeShape(null)).toBe('not_object');
+    expect(describeResumeShape('a string')).toBe('not_object');
   });
 });
 

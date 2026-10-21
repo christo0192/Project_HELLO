@@ -579,7 +579,7 @@ NULL means no outcome yet.
 | `number_shared` | Another candidate, who is not the same Ashby person, already holds this number as valid. |
 | `name_missing` | Phone parsing found no usable name, so no number was applied. |
 | `resume_found` | A resume was found on recheck; the application stays on resume parsing. |
-| `resume_shape_unknown` | Ashby's answer did not say clearly whether a resume exists; nothing was classified. |
+| `resume_shape_unknown` | Ashby's answer did not say clearly whether a resume exists; nothing was classified. A candidate whose resume fields are missing or `null` and who has no attached files counts as "no resume". This outcome means a resume field held something unreadable, files are attached outside the resume field (`fileHandles.nonempty`: HR should set the resume field in Ashby), or there was no candidate id. The API log line `ashby_resume_shape_unknown` names the shape without values. Recovery: the profile sweep re-checks a link with no resume handle after 6 h, then 12 h and 24 h (4 checks in all); fixing the record in Ashby is picked up at the next check. |
 | `stage_moved` | The application is no longer at the mapped AI screening stage. |
 | `application_inactive` | Ashby reports the application as not `Active`. |
 | `mapping_inactive` | The job mapping is not an enabled `phone_primary` mapping. |
