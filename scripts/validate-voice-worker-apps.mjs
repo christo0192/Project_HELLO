@@ -63,6 +63,13 @@
 //      kill_timeout AND PHONE_DRAIN_TIMEOUT_SEC (30..120), and
 //      drain + 2 x PHONE_SHUTDOWN_PROCESS_TIMEOUT (default 90) + 30 must be
 //      <= kill_timeout. fly.toml (browser) must never carry the drain key.
+//  12. PER-MACHINE BROWSER REGISTRATION (M019). BROWSER_PER_MACHINE_AGENT_NAME
+//      is allowed only in fly.toml, and only absent or exactly "true";
+//      fly.phone.toml must never carry it. "true" also requires the named,
+//      orchestrated browser posture (a non-empty BROWSER_AGENT_NAME the API's
+//      per-machine name pattern accepts, and WORKER_ORCHESTRATION = "worker"),
+//      since without it the worker reads the flag and silently stays on the
+//      shared name.
 
 import { readFileSync } from "node:fs";
 import { APPROVED_WORKER_REGIONS, assertPolicyConsistent, checkPrimaryRegion } from "./fly-region-policy.mjs";
@@ -405,6 +412,40 @@ ok(!hasEnvKey(browser, "PHONE_PER_MACHINE_AGENT_NAME"),
   ok(perMachine === undefined || perMachine === "true",
     `fly.phone.toml PHONE_PER_MACHINE_AGENT_NAME must be absent or exactly "true" (got ${JSON.stringify(perMachine)})`);
   notes.push(`phone_per_machine_agent_name=${perMachine === "true" ? "on" : "off"}`);
+}
+
+// ── 5g. Per-machine BROWSER registration flag (M019) ─────────────────────
+// BROWSER_PER_MACHINE_AGENT_NAME makes the R1 browser worker register as
+// `<BROWSER_AGENT_NAME>-<FLY_MACHINE_ID>` (agent.py
+// `browser_registered_agent_name`), so the API can dispatch each leased R1
+// session to its own machine once several run at once. Browser app: absent
+// (the shared name, today) or exactly "true"; the worker reads only that exact
+// literal, so any other value is a typo that looks like a rollout that never
+// happened. Phone app: never; it has its own flag (5d). The worker also needs
+// R1_READINESS_HOST=on, a per-cutover Fly secret this file cannot see, so
+// "true" here is inert on the Cloud lane.
+{
+  // By KEY, not only by quoted value: an unquoted `= true` is invisible to
+  // envValue and must not pass as "absent".
+  const KEY = "BROWSER_PER_MACHINE_AGENT_NAME";
+  ok(!envKeys(phoneCfg).includes(KEY),
+    `fly.phone.toml must NOT set ${KEY} — per-machine browser registration is a browser-worker-only rollout flag (the phone worker has PHONE_PER_MACHINE_AGENT_NAME)`);
+  const browserPerMachine = envValue(browser, KEY);
+  const browserKeyCount = envKeys(browser).filter((k) => k === KEY).length;
+  ok(browserKeyCount <= 1, `fly.toml declares ${KEY} ${browserKeyCount} times — a duplicate key is invalid TOML`);
+  ok(browserKeyCount === 0 || browserPerMachine === "true",
+    `fly.toml ${KEY} must be absent or exactly "true" (got ${browserPerMachine === undefined ? "a non-string value" : JSON.stringify(browserPerMachine)})`);
+  if (browserPerMachine === "true") {
+    // The base must compose into a name the API's AGENT_NAME_RE (and the 0112
+    // CHECK) accepts, `^[A-Za-z0-9_-]{1,64}-<machine id>$`, or the worker falls
+    // back to the shared name with only a log line to show for it.
+    const base = (envValue(browser, "BROWSER_AGENT_NAME") ?? "").trim();
+    ok(/^[A-Za-z0-9_-]{1,64}$/.test(base),
+      `fly.toml BROWSER_PER_MACHINE_AGENT_NAME = "true" requires a non-empty BROWSER_AGENT_NAME of at most 64 characters from [A-Za-z0-9_-] (got ${JSON.stringify(base)}); otherwise the worker keeps the shared name`);
+    ok(envValue(browser, "WORKER_ORCHESTRATION") === "worker",
+      'fly.toml BROWSER_PER_MACHINE_AGENT_NAME = "true" requires WORKER_ORCHESTRATION = "worker"; an unorchestrated browser worker is not named, so the flag would do nothing');
+  }
+  notes.push(`browser_per_machine_agent_name=${browserPerMachine === "true" ? "on" : "off"}`);
 }
 
 // ── 5e. kill_timeout (E2, M009) ──────────────────────────────────────────

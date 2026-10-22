@@ -561,7 +561,7 @@ describe('2. the phone-impact record (plan section 9) says what the code does', 
     );
   });
 
-  it('the two opt-in options keys are written only behind BROWSER_WORKER_ONE_JOB=on', () => {
+  it('the two opt-in options keys are written only behind one-job or per-machine names', () => {
     const options = between(
       AGENT,
       'def build_worker_options(',
@@ -574,7 +574,10 @@ describe('2. the phone-impact record (plan section 9) says what the code does', 
     expect(branchEnd).toBeLessThan(options.indexOf('agent_name = _phone_agent_name()'));
     const browser = options.slice(0, branchEnd);
     expect(browser.match(/options\["load_(?:fnc|threshold)"\] = /g) ?? []).toHaveLength(2);
-    const gate = browser.indexOf('if _browser_worker_one_job():');
+    // M019: per-machine browser names (concurrent R1) also force one job per worker.
+    const gate = browser.indexOf(
+      'if _browser_worker_one_job() or _browser_per_machine_agent_name_enabled():',
+    );
     expect(gate).toBeGreaterThan(-1);
     for (const key of ['load_fnc', 'load_threshold']) {
       expect(browser.indexOf(`options["${key}"] = `), key).toBeGreaterThan(gate);

@@ -73,6 +73,12 @@ kill_timeout = 300
   cpus = 1
 `;
 
+// M019: the named, orchestrated browser posture BROWSER_PER_MACHINE_AGENT_NAME
+// requires (the shipped fly.toml has it).
+const NAMED_BROWSER = GOOD_BROWSER.replace("[env]\n",
+  '[env]\n  BROWSER_AGENT_NAME = "browser-screener"\n  WORKER_ORCHESTRATION = "worker"\n');
+const withBrowserPerMachine = (browser, line) => browser.replace("[env]\n", `[env]\n  ${line}\n`);
+
 function fixture(browser, phone) {
   const dir = mkdtempSync(path.join(tmpdir(), "voice-apps-"));
   if (browser !== null) writeFileSync(path.join(dir, "fly.toml"), browser);
@@ -176,6 +182,26 @@ const NEG = [
   ["phone PHONE_SHUTDOWN_PROCESS_TIMEOUT = 120 overflows the budget (90 + 240 + 30)", GOOD_BROWSER, GOOD_PHONE.replace('PHONE_DRAIN_TIMEOUT_SEC = "90"', 'PHONE_DRAIN_TIMEOUT_SEC = "90"\n  PHONE_SHUTDOWN_PROCESS_TIMEOUT = "120"')],
   ["phone PHONE_SHUTDOWN_PROCESS_TIMEOUT outside the worker clamp", GOOD_BROWSER, GOOD_PHONE.replace('PHONE_DRAIN_TIMEOUT_SEC = "90"', 'PHONE_DRAIN_TIMEOUT_SEC = "90"\n  PHONE_SHUTDOWN_PROCESS_TIMEOUT = "5"')],
   ["browser carries PHONE_DRAIN_TIMEOUT_SEC", GOOD_BROWSER.replace("[env]\n", '[env]\n  PHONE_DRAIN_TIMEOUT_SEC = "90"\n'), GOOD_PHONE],
+  // ── M019: per-machine BROWSER registration flag ─────────────────────────
+  // fly.toml: absent or exactly "true" (the worker reads only that literal).
+  ["browser BROWSER_PER_MACHINE_AGENT_NAME is TRUE", withBrowserPerMachine(NAMED_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = "TRUE"'), GOOD_PHONE],
+  ["browser BROWSER_PER_MACHINE_AGENT_NAME is 1", withBrowserPerMachine(NAMED_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = "1"'), GOOD_PHONE],
+  ["browser BROWSER_PER_MACHINE_AGENT_NAME is on", withBrowserPerMachine(NAMED_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = "on"'), GOOD_PHONE],
+  ["browser BROWSER_PER_MACHINE_AGENT_NAME is padded", withBrowserPerMachine(NAMED_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = " true"'), GOOD_PHONE],
+  ["browser BROWSER_PER_MACHINE_AGENT_NAME is empty", withBrowserPerMachine(NAMED_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = ""'), GOOD_PHONE],
+  ["browser BROWSER_PER_MACHINE_AGENT_NAME is false (absent is the off state)", withBrowserPerMachine(NAMED_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = "false"'), GOOD_PHONE],
+  ["browser BROWSER_PER_MACHINE_AGENT_NAME is an unquoted TOML boolean", withBrowserPerMachine(NAMED_BROWSER, "BROWSER_PER_MACHINE_AGENT_NAME = true"), GOOD_PHONE],
+  ["browser BROWSER_PER_MACHINE_AGENT_NAME declared twice", withBrowserPerMachine(NAMED_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = "true"\n  BROWSER_PER_MACHINE_AGENT_NAME = "false"'), GOOD_PHONE],
+  // "true" without the named, orchestrated posture would be silently inert.
+  ["browser per-machine flag with no BROWSER_AGENT_NAME", withBrowserPerMachine(GOOD_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = "true"\n  WORKER_ORCHESTRATION = "worker"'), GOOD_PHONE],
+  ["browser per-machine flag with an empty BROWSER_AGENT_NAME", withBrowserPerMachine(NAMED_BROWSER.replace('BROWSER_AGENT_NAME = "browser-screener"', 'BROWSER_AGENT_NAME = ""'), 'BROWSER_PER_MACHINE_AGENT_NAME = "true"'), GOOD_PHONE],
+  ["browser per-machine flag without orchestration", withBrowserPerMachine(NAMED_BROWSER.replace('  WORKER_ORCHESTRATION = "worker"\n', ""), 'BROWSER_PER_MACHINE_AGENT_NAME = "true"'), GOOD_PHONE],
+  ["browser per-machine flag with a 65-character base (API rejects the composed name)", withBrowserPerMachine(NAMED_BROWSER.replace('"browser-screener"', `"${"b".repeat(65)}"`), 'BROWSER_PER_MACHINE_AGENT_NAME = "true"'), GOOD_PHONE],
+  ["browser per-machine flag with a dotted base", withBrowserPerMachine(NAMED_BROWSER.replace('"browser-screener"', '"browser.screener"'), 'BROWSER_PER_MACHINE_AGENT_NAME = "true"'), GOOD_PHONE],
+  // fly.phone.toml: never, in any form.
+  ["phone carries BROWSER_PER_MACHINE_AGENT_NAME", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  BROWSER_PER_MACHINE_AGENT_NAME = "true"\n')],
+  ["phone carries BROWSER_PER_MACHINE_AGENT_NAME even as false", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  BROWSER_PER_MACHINE_AGENT_NAME = "false"\n')],
+  ["phone carries BROWSER_PER_MACHINE_AGENT_NAME unquoted", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", "[env]\n  BROWSER_PER_MACHINE_AGENT_NAME = true\n")],
 ];
 for (const [label, browser, phone] of NEG) {
   const dir = fixture(browser, phone);
@@ -210,6 +236,52 @@ for (const [label, browser, phone] of NEG) {
     if (note) ok(note.test(r.out), `E2 positive control must surface ${note}: ${label}\n${r.out}`);
     rmSync(dir, { recursive: true, force: true });
   }
+}
+// ── M019 positive controls: the per-machine browser flag ──────────────────
+{
+  const POS = [
+    ["browser BROWSER_PER_MACHINE_AGENT_NAME absent (the shipped, inert default)",
+      NAMED_BROWSER, GOOD_PHONE, /browser_per_machine_agent_name=off/],
+    ["browser BROWSER_PER_MACHINE_AGENT_NAME = \"true\" on the named, orchestrated posture",
+      withBrowserPerMachine(NAMED_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = "true"'), GOOD_PHONE,
+      /browser_per_machine_agent_name=on/],
+    ["browser per-machine flag with a 64-character base (the API's bound)",
+      withBrowserPerMachine(NAMED_BROWSER.replace('"browser-screener"', `"${"b".repeat(64)}"`), 'BROWSER_PER_MACHINE_AGENT_NAME = "true"'),
+      GOOD_PHONE, /browser_per_machine_agent_name=on/],
+    // Independent of the phone flag in both directions.
+    ["browser flag on with the phone flag on",
+      withBrowserPerMachine(NAMED_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = "true"'),
+      GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = "true"\n'),
+      /phone_per_machine_agent_name=on[\s\S]*browser_per_machine_agent_name=on/],
+  ];
+  for (const [label, browser, phone, note] of POS) {
+    const dir = fixture(browser, phone);
+    const r = run(dir);
+    ok(r.code === 0, `M019 positive control should PASS: ${label}\n${r.out}`);
+    ok(note.test(r.out), `M019 positive control must surface ${note}: ${label}\n${r.out}`);
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // Mutation isolation: a passing named fixture and one whose ONLY change is
+  // "true" → "TRUE" must differ by EXACTLY the flag failure.
+  const good = fixture(withBrowserPerMachine(NAMED_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = "true"'), GOOD_PHONE);
+  const bad = fixture(withBrowserPerMachine(NAMED_BROWSER, 'BROWSER_PER_MACHINE_AGENT_NAME = "TRUE"'), GOOD_PHONE);
+  const rg = run(good);
+  const rb = run(bad);
+  ok(rg.code === 0 && rb.code !== 0, `a single-character flag change must flip the verdict (good=${rg.code}, bad=${rb.code})`);
+  ok(/voice worker app config contract FAILED \(1\)/.test(rb.out)
+    && /BROWSER_PER_MACHINE_AGENT_NAME must be absent or exactly "true" \(got "TRUE"\)/.test(rb.out),
+  `"TRUE" must produce EXACTLY the flag failure, naming the value, got:\n${rb.out}`);
+  rmSync(good, { recursive: true, force: true });
+  rmSync(bad, { recursive: true, force: true });
+}
+// The SHIPPED browser config keeps the flag ABSENT (M019 ships inert). Turning
+// it on is the reviewed R1 concurrency rollout step, after the API dispatches
+// to reported per-machine names; that PR must update this expectation.
+{
+  const r = spawnSync(process.execPath, [validator], { encoding: "utf8" });
+  const out = (r.stdout || "") + (r.stderr || "");
+  ok(/browser_per_machine_agent_name=off/.test(out),
+    `the shipped fly.toml must leave BROWSER_PER_MACHINE_AGENT_NAME absent (inert), got:\n${out}`);
 }
 // The SHIPPED phone config: PR-B (M009 B6) flips the per-machine flag ON —
 // only after PR-A's API that accepts and stores names is live — and PR-A's

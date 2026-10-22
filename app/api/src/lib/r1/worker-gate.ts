@@ -27,6 +27,19 @@
  *   - no dispatch at all: ready a worker, then dispatch once;
  *   - a dispatch listing that cannot be read defers instead of guessing.
  *
+ * "Our agent" is the shared `gate.agentName` OR a per-machine
+ * `<gate.agentName>-<machineId>` name (M019): once each browser machine
+ * registers its own name, a rejoin must still see the job its first exchange
+ * dispatched, or it would claim a second machine and add a second interviewer.
+ *
+ * Which machine a fresh dispatch goes to is the gate's call
+ * (`gate.dispatchNameFor`, lib/browser-orchestration.ts): on the R1 SFU, the
+ * name the leased worker reported, and only when it is EXACTLY
+ * `<agentName>-<that lease's machine id>`. A name the gate will not trust (or
+ * none, while BROWSER_REQUIRE_MACHINE_AGENT_NAME is on) releases the machine
+ * and defers before anything is dispatched. With no per-machine name reported
+ * and the flag off, the dispatch is today's, to the shared name.
+ *
  * Calls for one session are serialized in-process so two simultaneous
  * exchanges cannot both observe "no dispatch". Across API machines the
  * serialization is best-effort; the young-dispatch rule above closes most of
@@ -42,6 +55,7 @@
  */
 
 import { jobIsLive, type BrowserWorkerGate } from '../browser-orchestration.js';
+import { isMachineAgentNameUnder } from '../worker-agent-name.js';
 
 /** The part of an `AgentDispatch` the gate reads (the SDK type satisfies it). */
 export interface DispatchLike {
@@ -126,6 +140,28 @@ function hasJob(dispatch: DispatchLike): boolean {
   return (dispatch.state?.jobs ?? []).some(jobIsLive);
 }
 
+/**
+ * One of OUR dispatches: the shared name, or a per-machine `<base>-<id>` name
+ * (M019). Another agent's dispatch is never read as ours, nor deleted.
+ */
+function isOurs(dispatch: DispatchLike, base: string): boolean {
+  return dispatch.agentName === base || isMachineAgentNameUnder(base, dispatch.agentName);
+}
+
+/**
+ * The name to dispatch for this ready worker, or null to release and defer. A
+ * gate without `dispatchNameFor` (one built before M019) dispatches the shared
+ * name, exactly as before.
+ */
+function dispatchNameFor(
+  gate: BrowserWorkerGate,
+  ready: { machineId: string; agentName?: string | null },
+): string | null {
+  return typeof gate.dispatchNameFor === 'function'
+    ? gate.dispatchNameFor(ready)
+    : gate.agentName;
+}
+
 /** Young enough that a worker may still pick it up. Unknown age counts as stale. */
 function isInFlight(dispatch: DispatchLike, nowMs: number): boolean {
   const created = epochMs(dispatch.state?.createdAt);
@@ -161,7 +197,7 @@ async function gateOnce(input: R1GateInput): Promise<R1GateVerdict> {
   let mine: DispatchLike[];
   try {
     const existing = await lister.listDispatch(roomName);
-    mine = existing.filter((item) => item.agentName === gate.agentName);
+    mine = existing.filter((item) => isOurs(item, gate.agentName));
   } catch {
     return 'preparing';
   }
@@ -179,9 +215,22 @@ async function gateOnce(input: R1GateInput): Promise<R1GateVerdict> {
   // no_capacity | timeout | error: the service already released what it claimed.
   if (ready.status !== 'ready') return 'preparing';
 
-  // 4. Replace any dropped dispatch, then dispatch once.
+  // 4. Which machine's name to dispatch (M019). An untrusted per-machine name,
+  //    or none while one is required, releases the claim and defers BEFORE the
+  //    room is touched: dispatching the shared name instead would let LiveKit
+  //    hand the job to a machine leased to another interview.
+  const agentName = dispatchNameFor(gate, ready);
+  if (agentName === null) {
+    await gate.releaseWorker({ machineId: ready.machineId, sessionId });
+    return 'preparing';
+  }
+
+  // 5. Replace any dropped dispatch, then dispatch once. The shared name keeps
+  //    today's call exactly; only a per-machine name is passed on.
   await deleteJobless(lister, roomName, mine);
-  const dispatched = await gate.dispatch({ sessionId, roomName });
+  const dispatched = await gate.dispatch(
+    agentName === gate.agentName ? { sessionId, roomName } : { sessionId, roomName, agentName },
+  );
   if (dispatched) return 'proceed';
   // The worker is ready but the room could not be given an agent. Release the
   // claim, clear the job-less record the failed attempt left (it must not pass
@@ -190,7 +239,7 @@ async function gateOnce(input: R1GateInput): Promise<R1GateVerdict> {
   await gate.releaseWorker({ machineId: ready.machineId, sessionId });
   try {
     const left = (await lister.listDispatch(roomName))
-      .filter((item) => item.agentName === gate.agentName && !hasJob(item));
+      .filter((item) => isOurs(item, gate.agentName) && !hasJob(item));
     await deleteJobless(lister, roomName, left);
   } catch {
     /* best effort: the grace window above ages it out regardless */

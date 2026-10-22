@@ -17,6 +17,16 @@
  *     with no listDispatch / deleteDispatch.
  *   - R1: exact durable host match; dispatch-drop verification, retirement and a
  *     single retry that can never put a second agent in the room.
+ *
+ * M019 (R1 concurrency) — per-machine dispatch names, R1 only:
+ *   - `dispatchNameFor` trusts a reported name only when it is EXACTLY
+ *     `<base>-<the lease's machine id>`; no report keeps the shared name unless
+ *     BROWSER_REQUIRE_MACHINE_AGENT_NAME is on (then refused); Cloud always
+ *     answers the shared name.
+ *   - `dispatch` sends the per-machine name on the first dispatch AND the retry,
+ *     refuses a name that is not a per-machine name under the base, and in
+ *     strict mode never dispatches the shared name. Cloud dispatches the shared
+ *     name whatever it is given.
  */
 
 import { describe, it, expect, vi, afterEach } from 'vitest';
@@ -935,5 +945,191 @@ describe('R1 target — dispatch-drop safeguard (never two agents)', () => {
     })!;
     await expect(gate.dispatch({ sessionId: SESSION, roomName: ROOM })).resolves.toBe(false);
     expect(scripted.createDispatch).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── M019: per-machine dispatch names (R1 concurrency) ─────────────────────
+//
+// Machine ids below are synthetic, not identifiers of any real machine.
+const BASE = 'browser-screener';
+const MACHINE_A = 'aaaa1111bbbb22';
+const MACHINE_B = 'cccc3333dddd44';
+const NAME_A = `${BASE}-${MACHINE_A}`;
+const NAME_B = `${BASE}-${MACHINE_B}`;
+
+/** A gate whose dispatch client owns a job as soon as it is dispatched. */
+function namedGate(extra: Partial<BrowserWorkerGateDeps> = {}) {
+  const scripted = scriptedClient({ onCreate: () => 1 });
+  const { gate } = gateWith(scripted.client, extra);
+  return { gate, scripted };
+}
+
+/** The agent name of every createDispatch, in call order. */
+function dispatchedNames(createDispatch: { mock: { calls: unknown[][] } }): unknown[] {
+  return createDispatch.mock.calls.map((call) => call[1]);
+}
+
+/** The dispatch input, with `agentName` only when one is given (today's shape otherwise). */
+function dispatchInput(agentName: string | undefined) {
+  return agentName === undefined
+    ? { sessionId: SESSION, roomName: ROOM }
+    : { sessionId: SESSION, roomName: ROOM, agentName };
+}
+
+describe('M019 dispatchNameFor — which machine a ready lease is dispatched to', () => {
+  /** Every shape a lease can report, trusted ones first. */
+  const REPORTS: Array<[string, string | null | undefined]> = [
+    ['no report (undefined)', undefined],
+    ['no report (null)', null],
+    ['the shared name itself', BASE],
+    ["this lease's own per-machine name", NAME_A],
+    ["another machine's per-machine name", NAME_B],
+    ['a per-machine name under another base', `other-screener-${MACHINE_A}`],
+    ['an uppercase machine id', `${BASE}-${MACHINE_A.toUpperCase()}`],
+    ['an empty string', ''],
+  ];
+  const UNTRUSTED = REPORTS.slice(4);
+
+  it.each(REPORTS)('Cloud: the shared name whatever the lease reported (%s)', (_l, reported) => {
+    for (const requireMachineAgentName of [false, true]) {
+      const { gate } = namedGate({ requireMachineAgentName });
+      expect(gate.dispatchNameFor!({ machineId: MACHINE_A, agentName: reported })).toBe(BASE);
+    }
+  });
+
+  it('R1, flag off: no per-machine report keeps the shared name (today)', () => {
+    selectR1();
+    const { gate } = namedGate({ requireMachineAgentName: false });
+    expect(gate.dispatchNameFor!({ machineId: MACHINE_A })).toBe(BASE);
+    expect(gate.dispatchNameFor!({ machineId: MACHINE_A, agentName: null })).toBe(BASE);
+    expect(gate.dispatchNameFor!({ machineId: MACHINE_A, agentName: BASE })).toBe(BASE);
+  });
+
+  it("R1: the lease's own per-machine name is the dispatch name, flag on or off", () => {
+    selectR1();
+    for (const requireMachineAgentName of [false, true]) {
+      const { gate } = namedGate({ requireMachineAgentName });
+      expect(gate.dispatchNameFor!({ machineId: MACHINE_A, agentName: NAME_A })).toBe(NAME_A);
+      expect(gate.dispatchNameFor!({ machineId: MACHINE_B, agentName: NAME_B })).toBe(NAME_B);
+    }
+  });
+
+  it.each(UNTRUSTED)(
+    'R1: a name that is not exactly <base>-<machineId> is refused, flag on or off (%s)',
+    (_label, reported) => {
+      selectR1();
+      for (const requireMachineAgentName of [false, true]) {
+        const { gate } = namedGate({ requireMachineAgentName });
+        expect(gate.dispatchNameFor!({ machineId: MACHINE_A, agentName: reported })).toBeNull();
+      }
+    },
+  );
+
+  it('R1, flag on: a lease with no per-machine name is refused', () => {
+    selectR1();
+    const { gate } = namedGate({ requireMachineAgentName: true });
+    for (const reported of [undefined, null, BASE]) {
+      expect(gate.dispatchNameFor!({ machineId: MACHINE_A, agentName: reported })).toBeNull();
+    }
+  });
+
+  it('the flag defaults OFF: a gate built without an override keeps the shared name', () => {
+    selectR1();
+    const { gate } = namedGate();
+    expect(gate.dispatchNameFor!({ machineId: MACHINE_A, agentName: null })).toBe(BASE);
+  });
+
+  it('a base that cannot carry a per-machine suffix never trusts a reported name', () => {
+    // BROWSER_AGENT_NAME may contain a dot; the 0112 stored-name pattern may not.
+    selectR1();
+    const scripted = scriptedClient({ onCreate: () => 1 });
+    const { gate } = gateWith(scripted.client, { agentName: 'browser.screener' });
+    const ready = { machineId: MACHINE_A, agentName: `browser.screener-${MACHINE_A}` };
+    expect(gate.dispatchNameFor!(ready)).toBeNull();
+    expect(gate.dispatchNameFor!({ machineId: MACHINE_A })).toBe('browser.screener');
+  });
+});
+
+describe('M019 dispatch — the per-machine name reaches LiveKit; no name is today', () => {
+  it('R1: dispatches the per-machine name it is given, and nothing else', async () => {
+    selectR1();
+    const { gate, scripted } = namedGate();
+    await expect(gate.dispatch(dispatchInput(NAME_A))).resolves.toBe(true);
+    expect(scripted.createDispatch).toHaveBeenCalledTimes(1);
+    expect(scripted.createDispatch.mock.calls[0]).toEqual([
+      ROOM, NAME_A, { metadata: JSON.stringify({ session_id: SESSION, channel: 'browser' }) },
+    ]);
+  });
+
+  it('R1: the RETRY after a dropped dispatch goes to the same per-machine name', async () => {
+    selectR1();
+    const scripted = scriptedClient({ onCreate: (n) => (n === 1 ? 0 : 1) });
+    const { gate } = gateWith(scripted.client);
+    await expect(gate.dispatch(dispatchInput(NAME_B))).resolves.toBe(true);
+    expect(dispatchedNames(scripted.createDispatch)).toEqual([NAME_B, NAME_B]);
+    expect(scripted.deleteDispatch.mock.calls).toEqual([['d1', ROOM]]);
+  });
+
+  it('R1, flag off: no agentName (or the shared one) dispatches the shared name', async () => {
+    selectR1();
+    for (const agentName of [undefined, BASE]) {
+      const { gate, scripted } = namedGate({ requireMachineAgentName: false });
+      await expect(gate.dispatch(dispatchInput(agentName))).resolves.toBe(true);
+      expect(dispatchedNames(scripted.createDispatch)).toEqual([BASE]);
+    }
+  });
+
+  it.each([
+    ['another base', `other-screener-${MACHINE_A}`],
+    ['no machine suffix', `${BASE}-`],
+    ['a malformed suffix', `${BASE}-${MACHINE_A}.x`],
+    ['an unrelated name', 'some-other-agent'],
+  ])('R1: refuses a name that is not a per-machine name under the base (%s)', async (_l, name) => {
+    selectR1();
+    const { gate, scripted } = namedGate();
+    await expect(gate.dispatch(dispatchInput(name))).resolves.toBe(false);
+    expect(scripted.createDispatch).not.toHaveBeenCalled();
+    expect(scripted.listDispatch).not.toHaveBeenCalled();
+  });
+
+  it('R1, flag on: the shared name is never dispatched; a per-machine name is', async () => {
+    selectR1();
+    for (const agentName of [undefined, BASE]) {
+      const { gate, scripted } = namedGate({ requireMachineAgentName: true });
+      await expect(gate.dispatch(dispatchInput(agentName))).resolves.toBe(false);
+      expect(scripted.createDispatch).not.toHaveBeenCalled();
+    }
+    const { gate, scripted } = namedGate({ requireMachineAgentName: true });
+    await expect(gate.dispatch(dispatchInput(NAME_A))).resolves.toBe(true);
+    expect(dispatchedNames(scripted.createDispatch)).toEqual([NAME_A]);
+  });
+
+  it('Cloud: one createDispatch to the SHARED name, whatever name or flag is given', async () => {
+    for (const requireMachineAgentName of [false, true]) {
+      for (const agentName of [undefined, NAME_A, 'some-other-agent']) {
+        const scripted = scriptedClient();
+        const { gate } = gateWith(scripted.client, { requireMachineAgentName });
+        await expect(gate.dispatch(dispatchInput(agentName))).resolves.toBe(true);
+        expect(dispatchedNames(scripted.createDispatch)).toEqual([BASE]);
+        expect(scripted.listDispatch).not.toHaveBeenCalled();
+        expect(scripted.deleteDispatch).not.toHaveBeenCalled();
+      }
+    }
+  });
+
+  it('Cloud: a per-machine ready verdict is returned untouched, never released', async () => {
+    const verdict: EnsureReadyResult = {
+      status: 'ready', machineId: MACHINE_A, epoch: 3, agentName: NAME_B,
+    };
+    const service = fakeService(verdict);
+    const gate = browserOrchestrationGate({
+      enabled: true,
+      agentName: BASE,
+      service,
+      requireMachineAgentName: true,
+      dispatchClient: { createDispatch: vi.fn() },
+    })!;
+    await expect(gate.ensureReadyWorker({ sessionId: SESSION })).resolves.toBe(verdict);
+    expect(service.releaseCalls).toEqual([]);
   });
 });

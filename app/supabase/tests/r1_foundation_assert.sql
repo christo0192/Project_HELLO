@@ -2337,4 +2337,243 @@ begin
 end;
 $$;
 
+-- 0131 (M019): concurrent R1 sessions. r1_settings.max_concurrent_sessions (default 1, CHECK 1..25)
+-- limits live R1 sessions on the self-hosted target to least(max, greatest(P, 1)), where P is the
+-- browser worker pool: voice_worker_leases rows of app project-hello-voice and pipeline browser, in
+-- any state. The Cloud target stays at one slot. Above a limit of 1 a second admission of a live
+-- round is round_live; at 1 it is still r1_in_flight, so the default answers exactly as 0128 did.
+-- Pool rows the browser app already has are parked under another app name for this block and put
+-- back at its end, so every pool size below is exact; the 0118 block's browser rows (other apps)
+-- stay, and with the extra noise rows below prove that other apps and the phone pipeline never
+-- count. Its own far-future month (2046-03), whose time also puts every phone lease out of the
+-- Cloud check; every session it starts is ended, every round cancelled, every lease it adds
+-- removed and the settings restored.
+do $$
+declare
+  m constant timestamptz := '2046-03-15T12:00:00Z';
+  browser_app constant text := 'project-hello-voice';
+  parked_app constant text := 'r1-0131-parked:project-hello-voice';
+  other_app constant text := 'r1-0131-other-app';
+  retire_app constant text := 'r1-0131-retire';
+  retire_fn constant text := 'screening_v2.retire_voice_worker(text,text)';
+  admit_fn constant text := 'screening_v2.r1_admit_attempt(uuid,text,timestamptz)';
+  live constant text[] := array['created', 'waiting', 'in_progress'];
+  prior screening_v2.r1_settings%rowtype;
+  sent jsonb[] := array[]::jsonb[];
+  rounds uuid[] := array[]::uuid[];
+  res jsonb; x1 jsonb; x2 jsonb; x3 jsonb; x4 jsonb; refused text; k integer; v_starts integer; st text;
+begin
+  select * into prior from screening_v2.r1_settings where singleton;
+
+  -- The setting: 1 on the shipped row and as the column default, NOT NULL integer, CHECK 1..25.
+  perform _r1_tests.assert('0131: max_concurrent_sessions defaults to 1 and the shipped row reads 1',
+    coalesce(prior.max_concurrent_sessions = 1, false)
+    and coalesce((select column_default = '1' and is_nullable = 'NO' and data_type = 'integer'
+                    from information_schema.columns
+                   where table_schema = 'screening_v2' and table_name = 'r1_settings'
+                     and column_name = 'max_concurrent_sessions'), false),
+    coalesce(prior.max_concurrent_sessions::text, '<null>'));
+  foreach k in array array[0, 26] loop
+    refused := null;
+    begin
+      update screening_v2.r1_settings set max_concurrent_sessions = k where singleton;
+      raise exception '0131 max_concurrent_sessions CHECK unexpectedly accepted %', k;
+    exception when check_violation then
+      get stacked diagnostics refused = constraint_name;
+    end;
+    perform _r1_tests.assert('0131: the CHECK refuses ' || k,
+      coalesce(refused = 'chk_r1_settings_max_concurrent_sessions'
+        and (select max_concurrent_sessions = 1 from screening_v2.r1_settings where singleton), false),
+      coalesce(refused, '<none>'));
+  end loop;
+  update screening_v2.r1_settings set max_concurrent_sessions = 25 where singleton;
+  perform _r1_tests.assert('0131: the CHECK accepts its upper bound 25',
+    coalesce((select max_concurrent_sessions = 25 from screening_v2.r1_settings where singleton), false));
+  update screening_v2.r1_settings set max_concurrent_sessions = 1 where singleton;
+
+  -- Fixtures: six sent, consented rounds of their own candidates, and the noise lease rows that must
+  -- never count (a phone-pipeline row of the browser app, browser rows of another app).
+  perform _r1_tests.fail_live();
+  update screening_v2.voice_worker_leases set app = parked_app where app = browser_app;
+  insert into screening_v2.voice_worker_leases (app, machine_id, pipeline, state, claimed_session_id, epoch) values
+    (browser_app, 'r10131phone', 'phone', 'stopped', null, 0),
+    (other_app, 'r10131other1', 'browser', 'stopped', null, 0),
+    (other_app, 'r10131other2', 'browser', 'stopped', null, 0),
+    (other_app, 'r10131other3', 'browser', 'stopped', null, 0);
+  perform _r1_tests.settings('r1', 100000, 100000);
+  for k in 1..6 loop
+    perform _r1_tests.cand(1310 + k, '0131 concurrent ' || k);
+    res := _r1_tests.send(_r1_tests.u(1310 + k), '0131-round-' || k, m);
+    if res->>'status' is distinct from 'ok' then raise exception '0131 fixture Send failed: %', res; end if;
+    sent := array_append(sent, res);
+    rounds := array_append(rounds, (res->>'id')::uuid);
+    perform _r1_tests.consent(rounds[k]);
+  end loop;
+
+  -- No registered pool: the limit is never below 1, so a raised setting keeps one slot.
+  update screening_v2.r1_settings set max_concurrent_sessions = 3 where singleton;
+  x1 := _r1_tests.admit(rounds[1], '0131-nopool-1', m);
+  x2 := _r1_tests.admit(rounds[2], '0131-nopool-2', m);
+  perform _r1_tests.assert('0131: max 3 with no registered pool keeps one slot (a phone row and other apps never count)',
+    coalesce(x1->>'status' = 'ok' and x2->>'status' = 'r1_in_flight', false)
+      and (select count(*) = 0 from screening_v2.voice_worker_leases where app = browser_app and pipeline = 'browser')
+      and (select count(*) >= 3 from screening_v2.voice_worker_leases where app <> browser_app and pipeline = 'browser'),
+    jsonb_build_array(x1, x2)::text);
+  perform _r1_tests.fail_live();
+  update screening_v2.r1_settings set max_concurrent_sessions = 1 where singleton;
+
+  -- A pool of three: two stopped machines and one busy (every state counts).
+  insert into screening_v2.voice_worker_leases (app, machine_id, pipeline, state, claimed_session_id, epoch) values
+    (browser_app, 'r10131pool1', 'browser', 'stopped', null, 0),
+    (browser_app, 'r10131pool2', 'browser', 'stopped', null, 0),
+    (browser_app, 'r10131pool3', 'browser', 'busy', _r1_tests.u(1399), 1);
+
+  -- The default of 1 answers exactly as 0128 did, a pool notwithstanding.
+  x1 := _r1_tests.admit(rounds[1], '0131-default-1', m);
+  x2 := _r1_tests.admit(rounds[2], '0131-default-2', m);
+  perform _r1_tests.assert('0131: at the default of 1 a pool of 3 still admits one live R1 session',
+    coalesce(x1->>'status' = 'ok' and x2->>'status' = 'r1_in_flight', false), jsonb_build_array(x1, x2)::text);
+  v_starts := (select starts_used from screening_v2.interview_rounds where id = rounds[1]);
+  x3 := _r1_tests.admit(rounds[1], '0131-default-again', m);
+  perform _r1_tests.assert('0131: at the default of 1 a second admission of a live round is still r1_in_flight',
+    coalesce(x3->>'status' = 'r1_in_flight', false)
+      and (select starts_used = v_starts from screening_v2.interview_rounds where id = rounds[1])
+      and (select count(*) = 1 from screening_v2.call_sessions
+            where interview_round_id = rounds[1] and status = any (live)),
+    x3::text);
+  perform _r1_tests.fail_live();
+
+  -- Raised to 3 with 3 machines: three different rounds are live at once, the 4th is refused.
+  update screening_v2.r1_settings set max_concurrent_sessions = 3 where singleton;
+  x1 := _r1_tests.admit(rounds[3], '0131-three-3', m);
+  x2 := _r1_tests.admit(rounds[4], '0131-three-4', m);
+  x3 := _r1_tests.admit(rounds[5], '0131-three-5', m);
+  x4 := _r1_tests.admit(rounds[6], '0131-three-6', m);
+  perform _r1_tests.assert('0131: max 3 with 3 browser machines admits 3 and refuses the 4th as r1_in_flight',
+    coalesce(x1->>'status' = 'ok' and x2->>'status' = 'ok' and x3->>'status' = 'ok'
+      and x4->>'status' = 'r1_in_flight', false)
+      and (select count(*) = 3 from screening_v2.call_sessions
+            where interview_round_id is not null and status = any (live))
+      and not exists (select 1 from screening_v2.call_sessions where interview_round_id = rounds[6]),
+    jsonb_build_array(x1, x2, x3, x4)::text);
+
+  -- One slot frees up. A second tab of a live round (no rejoin nonce) is refused cleanly: no unique
+  -- violation from uq_call_sessions_interview_round_live, no start, no attempt, no second session.
+  update screening_v2.call_sessions set status = 'failed', terminal_reason = 'provider_error'
+   where interview_round_id = rounds[5] and status = any (live);
+  v_starts := (select starts_used from screening_v2.interview_rounds where id = rounds[3]);
+  x1 := _r1_tests.admit(rounds[3], '0131-round-live', m);
+  perform _r1_tests.assert('0131: a second admission of a live round is round_live with free slots, and starts nothing',
+    coalesce(x1->>'status' = 'round_live', false)
+      and (select starts_used = v_starts from screening_v2.interview_rounds where id = rounds[3])
+      and (select count(*) = 1 from screening_v2.call_sessions
+            where interview_round_id = rounds[3] and status = any (live))
+      and (select count(*) = 1 from screening_v2.interview_round_attempts where round_id = rounds[3])
+      and (select count(*) = 2 from screening_v2.call_sessions
+            where interview_round_id is not null and status = any (live)),
+    x1::text);
+
+  -- Lowering the limit to the live count or below it refuses new admissions; the live ones go on.
+  update screening_v2.r1_settings set max_concurrent_sessions = 2 where singleton;
+  x1 := _r1_tests.admit(rounds[6], '0131-lower-2', m);
+  update screening_v2.r1_settings set max_concurrent_sessions = 1 where singleton;
+  x2 := _r1_tests.admit(rounds[6], '0131-lower-1', m);
+  perform _r1_tests.assert('0131: lowering the limit below the live count refuses new admissions and leaves the live sessions alone',
+    coalesce(x1->>'status' = 'r1_in_flight' and x2->>'status' = 'r1_in_flight', false)
+      and (select count(*) = 2 from screening_v2.call_sessions
+            where interview_round_id in (rounds[3], rounds[4]) and status = 'created'),
+    jsonb_build_array(x1, x2)::text);
+  perform _r1_tests.fail_live();
+
+  -- The Cloud target keeps one slot whatever the setting and the pool say.
+  perform _r1_tests.settings('cloud', 100000, 100000);
+  update screening_v2.r1_settings set max_concurrent_sessions = 3 where singleton;
+  x1 := _r1_tests.admit(rounds[6], '0131-cloud-6', m);
+  x2 := _r1_tests.admit(rounds[2], '0131-cloud-2', m);
+  x3 := _r1_tests.admit(rounds[6], '0131-cloud-again', m);
+  perform _r1_tests.assert('0131: the Cloud target stays at one slot with max 3 and 3 machines',
+    coalesce(x1->>'status' = 'ok' and x2->>'status' = 'r1_in_flight' and x3->>'status' = 'r1_in_flight', false)
+      and (select count(*) = 3 from screening_v2.voice_worker_leases where app = browser_app and pipeline = 'browser')
+      -- No phone lease is live at m, so the refusals are the slot rule, not the phone check.
+      and not exists (select 1 from screening_v2.phone_call_attempts p
+                       where p.state in ('admitted','ringing','answered_unclassified','human','machine')
+                         and p.lease_expires_at > m),
+    jsonb_build_array(x1, x2, x3)::text);
+  perform _r1_tests.fail_live();
+  perform _r1_tests.settings('r1', 100000, 100000);
+
+  -- Pool shrink: retiring a stopped machine removes it from the pool, and the cap follows.
+  res := screening_v2.retire_voice_worker(browser_app, 'r10131pool1');
+  perform _r1_tests.assert('0131: retire deletes a stopped row',
+    coalesce(res->>'status' = 'retired' and res->>'machine_id' = 'r10131pool1', false)
+      and not exists (select 1 from screening_v2.voice_worker_leases
+                       where app = browser_app and machine_id = 'r10131pool1'),
+    res::text);
+  x1 := _r1_tests.admit(rounds[6], '0131-two-6', m);
+  x2 := _r1_tests.admit(rounds[1], '0131-two-1', m);
+  x3 := _r1_tests.admit(rounds[2], '0131-two-2', m);
+  perform _r1_tests.assert('0131: max 3 with 2 browser machines refuses the 3rd',
+    coalesce(x1->>'status' = 'ok' and x2->>'status' = 'ok' and x3->>'status' = 'r1_in_flight', false)
+      and (select count(*) = 2 from screening_v2.voice_worker_leases where app = browser_app and pipeline = 'browser')
+      and (select max_concurrent_sessions = 3 from screening_v2.r1_settings where singleton),
+    jsonb_build_array(x1, x2, x3)::text);
+  perform _r1_tests.fail_live();
+
+  -- retire_voice_worker never removes a claimed row, in any claimed state.
+  insert into screening_v2.voice_worker_leases (app, machine_id, pipeline, state, claimed_session_id, epoch)
+    values (retire_app, 'r10131retire', 'browser', 'stopped', null, 0);
+  foreach st in array array['starting', 'ready', 'busy', 'draining'] loop
+    update screening_v2.voice_worker_leases
+       set state = st, claimed_session_id = _r1_tests.u(1398), epoch = epoch + 1
+     where app = retire_app and machine_id = 'r10131retire';
+    res := screening_v2.retire_voice_worker(retire_app, 'r10131retire');
+    perform _r1_tests.assert('0131: retire refuses a claimed row and keeps it (' || st || ')',
+      coalesce(res->>'status' = 'not_stopped' and res->>'state' = st
+        and res->>'machine_id' = 'r10131retire', false)
+        and exists (select 1 from screening_v2.voice_worker_leases
+                     where app = retire_app and machine_id = 'r10131retire' and state = st),
+      res::text);
+  end loop;
+  update screening_v2.voice_worker_leases set state = 'stopped', claimed_session_id = null
+   where app = retire_app and machine_id = 'r10131retire';
+  res := screening_v2.retire_voice_worker(retire_app, 'r10131retire');
+  x1 := screening_v2.retire_voice_worker(retire_app, 'r10131retire');
+  x2 := screening_v2.retire_voice_worker(null, 'r10131retire');
+  x3 := screening_v2.retire_voice_worker(retire_app, null);
+  perform _r1_tests.assert('0131: retire deletes the row once it is stopped, then answers unknown_machine and invalid_request',
+    coalesce(res->>'status' = 'retired' and x1->>'status' = 'unknown_machine'
+      and x2->>'status' = 'invalid_request' and x3->>'status' = 'invalid_request', false)
+      and not exists (select 1 from screening_v2.voice_worker_leases where app = retire_app),
+    jsonb_build_array(res, x1, x2, x3)::text);
+  perform _r1_tests.assert('0131: retire and admission are security-definer, search-path-pinned, service-role-only',
+    coalesce((select bool_and(p.prosecdef and p.proconfig @> array['search_path=pg_catalog, screening_v2'])
+                from pg_catalog.pg_proc p
+               where p.oid in (to_regprocedure(retire_fn)::oid, to_regprocedure(admit_fn)::oid)), false)
+    and (select count(*) = 2 from pg_catalog.pg_proc p
+          where p.oid in (to_regprocedure(retire_fn)::oid, to_regprocedure(admit_fn)::oid))
+    and has_function_privilege('service_role', retire_fn, 'execute')
+    and not has_function_privilege('anon', retire_fn, 'execute')
+    and not has_function_privilege('authenticated', retire_fn, 'execute')
+    and not has_function_privilege('public', retire_fn, 'execute')
+    and has_function_privilege('service_role', admit_fn, 'execute')
+    and not has_function_privilege('anon', admit_fn, 'execute')
+    and not has_function_privilege('authenticated', admit_fn, 'execute')
+    and not has_function_privilege('public', admit_fn, 'execute'));
+
+  -- Leave everything as found: sessions ended, rounds cancelled (holds and uncounted charges given
+  -- back), this block's leases removed, the parked pool restored, the settings restored.
+  perform _r1_tests.fail_live();
+  for k in 1..6 loop perform _r1_tests.cancel(sent[k]); end loop;
+  delete from screening_v2.voice_worker_leases where app in (browser_app, other_app, retire_app);
+  update screening_v2.voice_worker_leases set app = browser_app where app = parked_app;
+  update screening_v2.r1_settings
+     set enabled = prior.enabled, paused = prior.paused, livekit_target = prior.livekit_target,
+         monthly_cap_minutes = prior.monthly_cap_minutes, pause_line_minutes = prior.pause_line_minutes,
+         dashboard_minutes = prior.dashboard_minutes, dashboard_read_at = prior.dashboard_read_at,
+         dashboard_estimate_baseline = prior.dashboard_estimate_baseline,
+         max_concurrent_sessions = prior.max_concurrent_sessions
+   where singleton;
+end;
+$$;
+
 drop schema _r1_tests cascade;

@@ -40,6 +40,7 @@ const _contractVisibleEnvReads = [
   process.env.WORKER_REAPER_GRACE_SEC,
   process.env.WORKER_ORPHAN_GRACE_SEC,
   process.env.PHONE_WORKER_READY_TIMEOUT_SEC,
+  process.env.BROWSER_REQUIRE_MACHINE_AGENT_NAME,
 ];
 void _contractVisibleEnvReads;
 
@@ -345,4 +346,17 @@ export const env = {
    * naming the browser worker silently stops its auto-dispatch.
    */
   browserAgentName: process.env.BROWSER_AGENT_NAME ?? '',
+  /**
+   * M019 (R1 concurrency): REQUIRE the leased machine's own dispatch name on the
+   * R1 SFU. False (default) is today's behaviour: a ready lease that reported no
+   * per-machine name is dispatched under the shared `browserAgentName`. True, and
+   * only when BROWSER_LIVEKIT_TARGET=r1, such a lease is released and the exchange
+   * answers "preparing", and the shared name is never dispatched: with several
+   * machines registered under one shared name LiveKit may hand the job to a
+   * machine leased to ANOTHER interview, which that interview's release then stops
+   * mid-call. A reported name that is not exactly `<browserAgentName>-<that
+   * machine's id>` is refused whether this is on or off. Ignored on Cloud. Turn it
+   * on only once every browser worker reports its per-machine name.
+   */
+  browserRequireMachineAgentName: booleanEnv('BROWSER_REQUIRE_MACHINE_AGENT_NAME', false),
 };
