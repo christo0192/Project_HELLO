@@ -3646,6 +3646,31 @@ class TestFrozenPrefix(VideoCase):
         (body,) = self.api.bodies("complete")
         self.assertEqual((body["layout"], body["report"]["prefix_uploaded"]), ("split", True))
 
+    async def test_a_healthy_multipart_sends_its_short_tail_before_the_whole_file_prefix_at_the_finish(self) -> None:
+        # Review of #377: the prefix is the whole file again; on a slow link it alone could use the window
+        # and leave the tail (the last minutes of picture) unsent.  The tail goes first; no prefix follows.
+        self.api.put_status = lambda url: 500 if "/video?" in url else None  # the prefix never went up mid-call
+        recorder = await self.running()
+        content, end = self.lay_fmp4(10)  # about 200 KB: whole parts are due mid-call
+        worker = recorder._worker
+        await until(lambda: worker.parts_done >= 1)
+        self.crash(recorder)
+        await until(lambda: worker._prefix_rounds == 1)
+        self.assertFalse(worker.prefix_uploaded)
+        videos_mid_call = len(self.put_indexes("/video?"))
+        self.api.put_status = None
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        self.assertEqual(len(self.put_indexes("/video?")), videos_mid_call, "no prefix at the finish")
+        parts = self.put_indexes("/part?")
+        self.assertLess(self.put_indexes("/audio?")[-1], parts[-1], "the OGG first, then the tail")
+        self.assertEqual(b"".join(self.api.puts[i]["body"] for i in parts), content, "the whole stream went up")
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["has_video"], body["failure_reason"]), ("split", True, "encoder_crashed"))
+        self.assertFalse(body["report"]["prefix_uploaded"])
+        self.assertEqual(body["report"]["parts_uploaded"], len(parts))
+        self.assertTrue(body["report"]["audio_final_uploaded"])
+
     async def test_a_discard_or_stop_answer_to_the_prefix_still_halts_everything(self) -> None:
         for reply, verdict in (
             (ApiReply(409, {"error": "r1_consent_withdrawn"}, "r1_consent_withdrawn"), "discard"),

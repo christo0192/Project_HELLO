@@ -1979,7 +1979,10 @@ Worker log codes (component `r1`, `error_type`; values are never a URL, key or i
 disabled or deleted: the spool was overwritten and nothing more is sent), `r1_rec_abandoned` (the API said stop),
 `r1_rec_prepare_failed`, `r1_rec_upload_retry`, `r1_rec_complete_failed`, `r1_rec_finish_timeout`,
 `r1_rec_encoder_unavailable`, `r1_rec_encoder_crashed`, `r1_rec_encoder_stalled`, `r1_rec_disk_low`,
-`r1_rec_video_unavailable`, `r1_rec_camera_*`, `r1_rec_tee_failed`, `r1_rec_io_close_timeout`.
+`r1_rec_video_unavailable`, `r1_rec_camera_*`, `r1_rec_tee_failed`, `r1_rec_io_close_timeout`,
+`r1_rec_prefix_uploaded` (a lost encoder's frozen MP4 went up as the `video` object; `error_category` = `mid_call` or
+`finish`), `r1_rec_prefix_failed` (a prefix round failed; `option_count` = rounds so far), `r1_rec_prefix_skipped`
+(`error_category` = why it cannot go up on its own), `r1_rec_multipart_gone` (a part URL answered 404: no more parts).
 
 API log codes (`error_category`; never a key, an upload id or a URL): `r1_recording_<status>` per finalize verdict;
 `r1_recording_upload_missing` (warn, component `r1-recording`): finalize found the `stream.mp4` multipart upload gone

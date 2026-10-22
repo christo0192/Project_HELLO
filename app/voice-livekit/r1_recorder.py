@@ -1855,8 +1855,10 @@ class UploadWorker:
         """Last MP4 part and/or the final OGG.  ``{"uploading": bool, "mp4": bool, "ogg": bool}``.
 
         ``split`` (the encoder was lost with the picture): the final OGG goes FIRST, it is the whole
-        call; then the picture half, as the frozen prefix's ``video`` object unless that went up
-        mid-call, and only failing that the multipart tail.  ``mp4`` is True when either delivered it.
+        call; then the picture half.  A healthy multipart that already carries parts sends its short
+        tail first: the prefix is the whole file again, and on a slow link it alone could use up the
+        rest of the window.  Otherwise (or when the tail fails) the frozen prefix's ``video`` object,
+        unless that went up mid-call.  ``mp4`` is True when either delivered it.
         Without ``split``, a multipart upload that is gone also sends the final OGG: the audio must not
         hang on a stream that can no longer be completed.
         """
@@ -1868,11 +1870,18 @@ class UploadWorker:
         if split:
             if final_ogg:
                 result["ogg"] = self._final_ogg(deadline)
+            tail_first = mp4 and self.cut > 0 and not self.multipart_gone and not self.prefix_uploaded
+            if tail_first and self.state == "uploading":
+                if self._upload_ready_parts(final=True, deadline=deadline, interruptible=False):
+                    result["mp4"] = True
+                    return result
             if self.state == "uploading" and self._prefix_wanted():
                 self._upload_prefix(deadline=deadline, interruptible=False)
             if self.state == "uploading":
                 result["mp4"] = self.prefix_uploaded or (
-                    mp4 and self._upload_ready_parts(final=True, deadline=deadline, interruptible=False)
+                    mp4
+                    and not tail_first
+                    and self._upload_ready_parts(final=True, deadline=deadline, interruptible=False)
                 )
             return result
         if mp4:
