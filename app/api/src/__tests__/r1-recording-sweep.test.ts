@@ -5,7 +5,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getAuditSink, setAuditSink } from '../lib/audit.js';
+import { Queue } from '../lib/queue/index.js';
+import { MemoryAdapter } from '../lib/queue/memory-adapter.js';
 import { createR1SweepHandler } from '../lib/r1/recording/handlers.js';
+import { createR1StorageRuntime } from '../lib/r1/runtime.js';
 import { recordingKeys } from '../lib/r1/recording/keys.js';
 import { MemoryR1ObjectStore } from '../lib/r1/recording/memory-store.js';
 import {
@@ -241,19 +244,21 @@ describe('C. stale live recordings and orphan uploads', () => {
   });
 
   describe('orphan multipart uploads under r1/', () => {
-    it('aborts the ones no live row owns, and only those', async () => {
+    // Changed deliberately (incident 2026-10-21, session 482cb480): row 2 used to LOSE its upload here
+    // because the listed id differed from `upload_id`. A live row's upload is now never aborted.
+    it('aborts the ones of no row or a finished row, never a live row\'s, and never a young or foreign one', async () => {
       let clock = FIXTURE_NOW_MS - 30 * MIN;
       const s = sweepSetup(
         [
-          recordingRow(2, { status: 'uploading', layout: null, upload_id: null, updated_at: ago(MIN), video_key: null }), // owns a DIFFERENT id
-          recordingRow(3, { status: 'uploading', layout: null, upload_id: null, updated_at: ago(MIN), video_key: null }), // owns upOwned
+          recordingRow(2, { status: 'uploading', layout: null, upload_id: null, updated_at: ago(MIN), video_key: null }), // names a DIFFERENT id
+          recordingRow(3, { status: 'uploading', layout: null, upload_id: null, updated_at: ago(MIN), video_key: null }), // names upOwned
           recordingRow(4, { status: 'ready' }), // a finished recording with a leftover upload
         ],
         {},
         () => clock,
       );
       const orphanNoRow = await s.store.createMultipart(keysOf(1).stream, 'video/mp4');
-      const loser = await s.store.createMultipart(keysOf(2).stream, 'video/mp4');
+      const liveOther = await s.store.createMultipart(keysOf(2).stream, 'video/mp4');
       const upOwned = await s.store.createMultipart(keysOf(3).stream, 'video/mp4');
       const leftover = await s.store.createMultipart(keysOf(4).stream, 'video/mp4');
       s.row(2).upload_id = 'a-different-upload';
@@ -270,10 +275,73 @@ describe('C. stale live recordings and orphan uploads', () => {
 
       const report = await runR1Sweep(s.deps);
 
-      expect(report.stale.orphan_uploads_aborted).toBe(3);
-      expect(s.store.openUploadIds().sort()).toEqual([upOwned, young, smoke, odd, smokeOld, oddOld].sort());
-      expect([orphanNoRow, loser, leftover].some((id) => s.store.openUploadIds().includes(id))).toBe(false);
+      expect(report.stale.orphan_uploads_aborted).toBe(2);
+      expect(s.store.openUploadIds().sort()).toEqual([liveOther, upOwned, young, smoke, odd, smokeOld, oddOld].sort());
+      expect([orphanNoRow, leftover].some((id) => s.store.openUploadIds().includes(id))).toBe(false);
       expect(ORPHAN_UPLOAD_MIN_AGE_MS).toBe(15 * MIN);
+    });
+
+    it('never aborts a 30-minute-old upload of a live row (preparing, uploading, finishing), whatever id string the row holds', async () => {
+      let clock = FIXTURE_NOW_MS - 30 * MIN;
+      const live = { layout: null, has_video: null, video_key: null, updated_at: ago(MIN) };
+      const s = sweepSetup(
+        [
+          recordingRow(1, { ...live, status: 'preparing' }),
+          recordingRow(2, { ...live, status: 'uploading' }),
+          recordingRow(3, { ...live, status: 'finishing', finalize_requested_at: ago(MIN) }),
+          recordingRow(4, { ...live, status: 'uploading' }),
+          recordingRow(5, { ...live, status: 'preparing' }),
+        ],
+        {},
+        () => clock,
+      );
+      const ids: string[] = [];
+      for (let n = 1; n <= 5; n += 1) ids.push(await s.store.createMultipart(keysOf(n).stream, 'video/mp4'));
+      clock = FIXTURE_NOW_MS;
+      // The listing names each upload under a string that is NOT what the row recorded at prepare
+      // (an encoding difference, say), except row 4, which matches, and row 5, which recorded none yet.
+      s.row(1).upload_id = `${ids[0]}%3D`;
+      s.row(2).upload_id = encodeURIComponent(`${ids[1]}+/=`);
+      s.row(3).upload_id = 'not-the-listed-id';
+      s.row(4).upload_id = ids[3];
+      s.row(5).upload_id = null;
+
+      const report = await runR1Sweep(s.deps);
+
+      expect(report.stale).toMatchObject({ orphan_uploads_aborted: 0, errors: 0 });
+      expect(s.store.openUploadIds().sort()).toEqual([...ids].sort());
+      expect(s.store.callsOf('abortMultipart')).toEqual([]);
+      expect((await runR1Sweep(s.deps)).stale.orphan_uploads_aborted).toBe(0); // and on the next run
+    });
+
+    it('still aborts a true orphan: no row, a deleted row, or a terminal row that names another upload or none', async () => {
+      let clock = FIXTURE_NOW_MS - 30 * MIN;
+      const s = sweepSetup(
+        [
+          // Deleted before the re-verify window (task F), so only the orphan scan can reach its upload.
+          recordingRow(2, { status: 'deleted', deleted_at: ago(3 * HOUR), upload_id: null, video_key: null }),
+          recordingRow(3, { status: 'ready' }),
+          recordingRow(4, { status: 'partial', layout: 'audio_only', has_video: false, upload_id: null }),
+          // A terminal row that still names its own upload (finalize gave up) keeps it for the erase job.
+          recordingRow(5, { status: 'failed', failure_reason: 'finalize_exhausted', layout: null, video_key: null }),
+        ],
+        {},
+        () => clock,
+      );
+      const noRow = await s.store.createMultipart(keysOf(1).stream, 'video/mp4');
+      const ofDeleted = await s.store.createMultipart(keysOf(2).stream, 'video/mp4');
+      const ofReady = await s.store.createMultipart(keysOf(3).stream, 'video/mp4');
+      const ofPartial = await s.store.createMultipart(keysOf(4).stream, 'video/mp4');
+      const ofExhausted = await s.store.createMultipart(keysOf(5).stream, 'video/mp4');
+      clock = FIXTURE_NOW_MS;
+      s.row(3).upload_id = 'not-the-listed-id';
+      s.row(5).upload_id = ofExhausted;
+
+      const report = await runR1Sweep(s.deps);
+
+      expect(report.stale).toMatchObject({ orphan_uploads_aborted: 4, errors: 0 });
+      expect(s.store.openUploadIds()).toEqual([ofExhausted]);
+      for (const id of [noRow, ofDeleted, ofReady, ofPartial]) expect(s.store.openUploadIds()).not.toContain(id);
     });
   });
 });
@@ -491,6 +559,55 @@ describe('isolation and the handler', () => {
       await expect(handler({ id: 'j', name: 'r1.sweep', payload: {} } as never)).resolves.toMatchObject({ outcome: 'defer', reasonCode: 'r1_storage_unconfigured' });
       expect(s.store.calls).toEqual([]);
       expect(s.db.ops).toEqual([]);
+    });
+  });
+
+  describe('the runtime log line (lib/r1/runtime.ts)', () => {
+    /** One sweep through the real `r1-storage` lane; returns the warn lines it wrote. */
+    async function sweepThroughRuntime(s: Setup): Promise<string[]> {
+      const warnings: string[] = [];
+      vi.spyOn(console, 'warn').mockImplementation((line: unknown) => { warnings.push(String(line)); });
+      vi.spyOn(process.stdout, 'write').mockImplementation(() => true); // the info lines (r1_sweep_done, queue events)
+      const clock = (): string => iso(FIXTURE_NOW_MS);
+      const queue = new Queue(new MemoryAdapter({ clock }), { clock });
+      const runtime = createR1StorageRuntime({
+        client: s.db.client as never,
+        queue,
+        now: () => new Date(FIXTURE_NOW_MS),
+        recordingConfig: () => enabledRecordingConfig(),
+        recordingStore: () => s.store,
+      })!;
+      await runtime.tickAll(); // enqueues this bucket's r1.sweep and runs it
+      await runtime.stop();
+      expect(runtime.snapshot().storageJobEvents).toMatchObject({ claimed: 1, completed: 1 });
+      return warnings;
+    }
+
+    it('reports the orphan scan\'s aborts as r1_sweep_orphan_aborted with the count, never a key or an id', async () => {
+      let clock = FIXTURE_NOW_MS - 30 * MIN;
+      const s = sweepSetup([recordingRow(3, { status: 'ready' })], {}, () => clock);
+      const ids = [
+        await s.store.createMultipart(keysOf(1).stream, 'video/mp4'), // no row
+        await s.store.createMultipart(keysOf(3).stream, 'video/mp4'), // a finished row's stray
+      ];
+      clock = FIXTURE_NOW_MS;
+      const warnings = await sweepThroughRuntime(s);
+      expect(s.store.openUploadIds()).toEqual([]);
+      const lines = warnings.map((line) => JSON.parse(line) as Record<string, unknown>).filter((l) => l.error_category === 'r1_sweep_orphan_aborted');
+      expect(lines).toEqual([expect.objectContaining({ level: 'warn', component: 'r1-runtime', error_type: '2' })]);
+      const text = warnings.join('\n');
+      for (const secret of [...ids, 'r1/', fixtureId('b', 1), fixtureId('b', 3)]) expect(text).not.toContain(secret);
+    });
+
+    it('writes no such line when nothing was aborted (a live row\'s upload is left alone)', async () => {
+      let clock = FIXTURE_NOW_MS - 30 * MIN;
+      const s = sweepSetup([recordingRow(1, { status: 'uploading', layout: null, video_key: null, updated_at: ago(MIN) })], {}, () => clock);
+      const id = await s.store.createMultipart(keysOf(1).stream, 'video/mp4');
+      s.row(1).upload_id = `${id}-as-recorded`;
+      clock = FIXTURE_NOW_MS;
+      const warnings = await sweepThroughRuntime(s);
+      expect(s.store.openUploadIds()).toEqual([id]);
+      expect(warnings.join('\n')).not.toContain('r1_sweep_orphan_aborted');
     });
   });
 });

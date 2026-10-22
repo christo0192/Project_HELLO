@@ -13,7 +13,8 @@
  *   C. stale live  `preparing|uploading` untouched for 2 h (the worker is gone): salvage it into
  *                  `finishing` (finalize completes what reached R2, `failure_reason = worker_lost`) or,
  *                  when nothing could have been uploaded, `failed/nothing_uploaded`; plus multipart
- *                  uploads under `r1/` that no live row owns -> abort
+ *                  uploads under `r1/` of a session with no row, a deleted row, or a terminal row that
+ *                  does not name that upload -> abort (a LIVE row's upload is never aborted here)
  *   D. stuck finalize  `finishing` and idle for 30 min: re-enqueue the finalize job (the dedup key
  *                  keeps it to one); after 3 h in `finishing` give up: `failed/finalize_exhausted`
  *                  (every object is kept for the erase job and retention)
@@ -137,6 +138,8 @@ async function sweepRequested(deps: R1SweepDeps): Promise<R1SweepReport['request
 // ---------------------------------------------------------------- C. stale live rows + orphan uploads
 
 const ORPHAN_KEY = /^r1\/([0-9a-f-]{36})\/([0-9a-f-]{36})\/stream\.mp4$/;
+/** A row the worker is still recording or finalize has not settled yet. */
+const LIVE_STATUSES: ReadonlySet<string> = new Set(['preparing', 'uploading', 'finishing']);
 
 async function sweepStale(deps: R1SweepDeps): Promise<R1SweepReport['stale']> {
   const report = { salvaged: 0, failed: 0, orphan_uploads_aborted: 0, errors: 0 };
@@ -182,8 +185,14 @@ async function sweepStale(deps: R1SweepDeps): Promise<R1SweepReport['stale']> {
     }
   }
 
-  // Multipart uploads under r1/ that no live row owns (a prepare CAS loser whose abort failed, a
-  // deleted row's leftover). Foreign keys (anything not r1/<uuid>/<uuid>/stream.mp4) are never touched.
+  // Orphan multipart uploads under r1/ (a session with no row, a deleted row's leftover, a finished
+  // row's stray). Foreign keys (anything not r1/<uuid>/<uuid>/stream.mp4) are never touched.
+  //
+  // The stream.mp4 upload of a LIVE row is never aborted, whatever the listed UploadId string looks
+  // like: comparing it with `upload_id` is what most likely aborted a live recording's upload mid-call
+  // (incident 2026-10-21, session 482cb480: about four minutes of video lost although it was on the
+  // worker's disk). Finalize settles the row's own upload, erase clears everything under the prefix,
+  // and the 1-day lifecycle rule backs both; a prepare loser's stray waits until the row is terminal.
   try {
     const uploads = await takeListing(deps.store.listMultipartUploads('r1/'), MAX_ORPHAN_SCAN);
     for (const upload of uploads) {
@@ -194,8 +203,9 @@ async function sweepStale(deps: R1SweepDeps): Promise<R1SweepReport['stale']> {
       if (now.getTime() - upload.initiatedAt.getTime() < ORPHAN_UPLOAD_MIN_AGE_MS) continue;
       try {
         const row = await loadRecording(deps.db, session);
-        const owned = row !== null && row.deleted_at === null && row.status !== 'deleted' && row.upload_id === upload.uploadId;
-        if (owned) continue;
+        const kept = row !== null && row.deleted_at === null && row.status !== 'deleted'
+          && (LIVE_STATUSES.has(row.status) || row.upload_id === upload.uploadId);
+        if (kept) continue;
         await guardStore(() => deps.store.abortMultipart(upload.key, upload.uploadId));
         report.orphan_uploads_aborted += 1;
       } catch {

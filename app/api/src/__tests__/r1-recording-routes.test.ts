@@ -5,6 +5,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { getR1RecordingConfig } from '../lib/r1/recording/config.js';
+import { finalizeRecording } from '../lib/r1/recording/finalize.js';
 import { createSessionLimiter } from '../lib/r1/recording/gate.js';
 import { sanitizeCompleteReport } from '../lib/r1/recording/service.js';
 import {
@@ -908,5 +909,45 @@ describe('a whole recording through the API, as the worker would drive it', () =
     }
     const everything = JSON.stringify(h.audits) + warnings.join('\n');
     for (const secret of [uploadId, 'https://', 'ik-r1-recordings', '.mp4', '.ogg', etag, 'X-Amz', 'mem-upload']) expect(everything, secret).not.toContain(secret);
+  });
+
+  it('a crashed encoder\'s prefix still goes up as video.mp4 and is kept as split WITH video, even after the multipart upload was lost (incident 2026-10-21, session 482cb480)', async () => {
+    const h = makeHarness();
+    await prepared(h, 'av');
+    const uploadId = h.row()!.upload_id as string;
+    const part = await h.post('part-url', { part_number: 1 });
+    expect((await putTo(h.store, part.body.url, Buffer.alloc(64, 1))).status).toBe(200);
+    // The encoder child is lost mid-call; its fMP4 prefix stays on the worker's disk. Somebody else
+    // aborts the stream.mp4 upload before hang-up (what the sweep most likely did in production).
+    await h.store.abortMultipart(`${PREFIX}stream.mp4`, uploadId);
+
+    // Nothing on the server knows the encoder died before `complete`: the row is `uploading`, so the
+    // `video` object URL is issued like any other, with the server-derived key and Content-Type.
+    const video = await h.post('object-url', { kind: 'video' });
+    expect(video.status).toBe(200);
+    expect(video.body).toMatchObject({ kind: 'video', content_type: 'video/mp4' });
+    expect(parseMemoryUrl(video.body.url)).toMatchObject({ op: 'put', key: `${PREFIX}video.mp4`, contentType: 'video/mp4' });
+    const prefixMp4 = Buffer.alloc(4096, 7);
+    prefixMp4.write('ftyp', 4, 'latin1');
+    expect((await putTo(h.store, video.body.url, prefixMp4, { 'content-type': 'video/mp4' })).status).toBe(200);
+    const audio = await h.post('object-url', { kind: 'audio' });
+    expect((await putTo(h.store, audio.body.url, 'OggS-the-whole-call', { 'content-type': 'audio/ogg' })).status).toBe(200);
+    const done = await h.post('complete', {
+      layout: 'split', has_video: true, failure_reason: 'encoder_crashed', degraded_reason: 'cpu_loop_lag',
+      report: { parts_uploaded: 1, frames_encoded: 4162 },
+    });
+    expect(done.body).toEqual({ status: 'finishing' });
+
+    const logs: string[] = [];
+    const outcome = await finalizeRecording(
+      { db: h.db.client as never, store: h.store, maxBytes: 400 * 1024 * 1024, now: () => new Date(h.nowMs()), enqueue: async () => undefined, log: (c) => { logs.push(c); } },
+      ROOM_SESSION,
+    );
+    expect(outcome).toEqual({ kind: 'finalized', status: 'partial', layout: 'split' });
+    expect(h.row()).toMatchObject({
+      status: 'partial', layout: 'split', has_video: true, failure_reason: 'encoder_crashed', degraded_reason: 'cpu_loop_lag',
+      video_key: `${PREFIX}video.mp4`, video_bytes: 4096, video_content_type: 'video/mp4', audio_key: `${PREFIX}audio.ogg`, upload_id: null,
+    });
+    expect(logs).toEqual(['r1_recording_upload_missing']); // the lost parts are said, not hidden
   });
 });

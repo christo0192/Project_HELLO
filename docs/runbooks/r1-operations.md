@@ -1819,7 +1819,7 @@ their own candidates) and admins can click a transcript turn on the Review tab t
 | Object under `r1/<round_id>/<session_id>/` | Written by | Kept |
 |---|---|---|
 | `stream.mp4` | worker, multipart | deliverable when there is no valid `video.mp4` (forced exits, crashes) |
-| `video.mp4` | worker, one PUT (faststart copy), normal exits only | preferred deliverable; `stream.mp4` is then removed |
+| `video.mp4` | worker, one PUT: the faststart copy at a normal exit, or (since PR #377) the frozen fragmented-MP4 prefix a crashed encoder left, sent while the call goes on (layout `split`) | preferred deliverable; `stream.mp4` is then removed |
 | `audio.partial.ogg` | worker, every 120 s | removed by finalize unless it is the only audio |
 | `audio.ogg` | worker, only when the MP4 cannot carry all the audio | kept for `split` / `audio_only` |
 
@@ -1864,9 +1864,10 @@ time (no `libx264`: audio; no `aac` or no encoder: OGG only). API knobs (optiona
    then `fly secrets list -a project-hello-api | Select-String "R1_RECORDING"`. Never on `project-hello-voice` or `project-hello-phone-voice`.
 7. **Smoke (S0-D part 1)**, same PowerShell with the five values exported as env vars, from `app/api`:
    `npx tsx scripts/r1-recording-smoke.ts`. It must print PASS for every item (presigned UploadPart x3 with a bare PUT,
-   part replacement, complete, HEAD, Range GET 206, CORS echo and none for another origin, prefix-complete after a
-   simulated crash, abort and an empty `ListMultipartUploads`, 5 s expiry returning 403, lifecycle read-back, cleanup
-   of `r1/smoke/`). **This is the only proof against real R2; the local S3 used in development differs in details.**
+   `ListMultipartUploads` naming the open upload by exactly the UploadId `CreateMultipartUpload` returned (a FAIL there
+   means the sweep's ownership test cannot work on R2), part replacement, complete, HEAD, Range GET 206, CORS echo and
+   none for another origin, prefix-complete after a simulated crash, abort and an empty `ListMultipartUploads`, 5 s
+   expiry returning 403, lifecycle read-back, cleanup of `r1/smoke/`). **This is the only proof against real R2; the local S3 used in development differs in details.**
 8. Optional: Vercel env `VITE_R1_RECORDINGS_ORIGIN=https://<ACCOUNT_ID>.r2.cloudflarestorage.com` (Production and Preview).
 9. Record non-secret evidence (token scope screenshot, bucket creation date and hint, the two rules, the CORS JSON) per
    `docs/security/credential-inventory.md` and flip that row to Provisioned.
@@ -1884,6 +1885,24 @@ time (no `libx264`: audio; no `aac` or no encoder: OGG only). API knobs (optiona
   five `R1_RECORDING_S3_*` names as deployed.
 - Only after 21:00 IST: `gh workflow run "Deploy (Fly)" --ref main -f service=phone-voice` so both images match `main`,
   then a phone canary dry run.
+
+### Deploying PR #377 (browser-voice VM to performance-4x; recording upload fixes)
+
+The rules above are the PR #372 record and stay as they were. PR #377 changes `app/voice-livekit/` (the `[[vm]]` of
+`fly.toml`: performance-4x, 4 vCPU, 8192 MB; the recorder) and `app/api/` (the `r1.sweep` orphan scan and finalize), so
+the automatic run would redeploy the API and both voice apps at the merge.
+
+1. Pause R1 (`r1_settings.paused = true`) before the merge; live R1 sessions finish.
+2. Merge. Watch for the automatic `Deploy (Fly)` run for the merge SHA and **cancel it before `deploy-phone-voice`
+   starts**.
+3. At a zero-live moment confirmed with SQL (the gate queries at the top of this runbook return no row), by day:
+   `gh workflow run "Deploy (Fly)" --ref main -f service=both` (api + browser-voice; `service=browser-voice` alone would
+   leave the sweep and finalize fixes undeployed, since the cancelled run deployed nothing).
+4. Verify: `fly machines list -a project-hello-voice` shows `performance-4x:8192MB` (one machine, stopped); the API and
+   browser-voice images show `GH_SHA` = merge SHA; `/api/health` 200.
+5. Later, in the 21:00 IST window: `gh workflow run "Deploy (Fly)" --ref main -f service=phone-voice` so both voice images
+   match `main` (`fly.phone.toml` is unchanged), then a phone canary dry run.
+6. Unpause R1 only after verification and the owner's decision. Rollback of the VM: the "VM problem" row below.
 
 ### Enable order (staff only; flags change in this order, each step has a gate)
 
@@ -1960,7 +1979,18 @@ Worker log codes (component `r1`, `error_type`; values are never a URL, key or i
 disabled or deleted: the spool was overwritten and nothing more is sent), `r1_rec_abandoned` (the API said stop),
 `r1_rec_prepare_failed`, `r1_rec_upload_retry`, `r1_rec_complete_failed`, `r1_rec_finish_timeout`,
 `r1_rec_encoder_unavailable`, `r1_rec_encoder_crashed`, `r1_rec_encoder_stalled`, `r1_rec_disk_low`,
-`r1_rec_video_unavailable`, `r1_rec_camera_*`, `r1_rec_tee_failed`, `r1_rec_io_close_timeout`.
+`r1_rec_video_unavailable`, `r1_rec_camera_*`, `r1_rec_tee_failed`, `r1_rec_io_close_timeout`,
+`r1_rec_prefix_uploaded` (a lost encoder's frozen MP4 went up as the `video` object; `error_category` = `mid_call` or
+`finish`), `r1_rec_prefix_failed` (a prefix round failed; `option_count` = rounds so far), `r1_rec_prefix_skipped`
+(`error_category` = why it cannot go up on its own), `r1_rec_multipart_gone` (a part URL answered 404: no more parts).
+
+API log codes (`error_category`; never a key, an upload id or a URL): `r1_recording_<status>` per finalize verdict;
+`r1_recording_upload_missing` (warn, component `r1-recording`): finalize found the `stream.mp4` multipart upload gone
+and no `stream.mp4`, so every uploaded part was lost to somebody else's abort; the verdict is still decided from what is
+left (a `video.mp4` or the OGG may save the call); `r1_sweep_done`, `r1_sweep_had_errors`, and `r1_sweep_orphan_aborted`
+(warn, `error_type` = how many multipart uploads the orphan scan aborted). Since PR #377 the orphan scan never aborts the
+upload of a live row (`preparing`, `uploading`, `finishing`), whatever UploadId string the listing shows; it aborts only
+the uploads of a session with no row, a deleted row, or a terminal row that does not name that upload.
 
 ### Retention, withdrawal, DSAR, legal hold
 
@@ -2013,5 +2043,6 @@ Proven in CI and locally: the unit and integration suites of all three layers, t
 run of the real recorder, real API routes and the real S3 adapter against a local S3 (recorder output finalized through
 presigned multipart uploads, played in Chromium, click-to-seek offsets checked against decoded audio; see the PR body).
 **Not proven until the owner steps and E3-E5 are done:** presigned `UploadPart` and signed `Content-Type` against real R2
-(smoke), Safari behaviour, real camera CPU on `performance-2x` (S0-C), real SFU camera subscription under audio-only
-connect, and the first seconds of video being black while the camera subscription is requested (counted in `camera_off_ms`).
+(smoke), Safari behaviour, real camera CPU on `performance-4x` (S0-C; it failed on `performance-2x`, ADR-0016), real
+SFU camera subscription under audio-only connect, and the first seconds of video being black while the camera
+subscription is requested (counted in `camera_off_ms`).

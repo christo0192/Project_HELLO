@@ -12,7 +12,9 @@
  *      merely has no live consent to recording (a superseded consent) did not withdraw: finalize goes on.
  *   2. Settle the multipart upload: ListParts (all pages), keep the longest contiguous prefix of
  *      UNIFORM parts (R2 needs every part but the last the same size), Complete it, or Abort it when
- *      no part qualifies. A NoSuchUpload means a previous run already did it.
+ *      no part qualifies. A NoSuchUpload with `stream.mp4` present means a previous run already did
+ *      it; with no `stream.mp4` the parts are LOST (someone else aborted the upload): that logs
+ *      `r1_recording_upload_missing` and the verdict is decided from what is left, as before.
  *   3. HEAD the four fixed keys; an object larger than R1_RECORDING_MAX_BYTES is removed.
  *   4. Verify the deliverable of each kind in one streaming pass: SHA-256, byte count (must equal the
  *      HEAD length, else a retryable `r2_short_read`) and a 12-byte sniff (`ftyp` at 4 for MP4,
@@ -32,6 +34,7 @@
 
 import { createHash } from 'node:crypto';
 import { loadRoundLiveConsent, type R1DbClient } from '../../../services/r1-assessment.js';
+import { createLogger } from '../../logger.js';
 import { MAX_PARTS, PART_SIZE } from './config.js';
 import { auditSystemEvent } from './audit.js';
 import { recordingWithdrawn } from './erase.js';
@@ -56,7 +59,12 @@ export interface R1FinalizeDeps {
   readonly maxBytes: number;
   readonly now?: () => Date;
   readonly enqueue: (name: string, payload: unknown, options: { dedupKey: string; maxAttempts: number }) => Promise<unknown>;
+  /** A fixed category code; never a value. Defaults to a warn line of the `r1-recording` logger. */
+  readonly log?: (category: string) => void;
 }
+
+const logger = createLogger('r1-recording');
+const warnCategory = (category: string): void => logger.warn('unknown_event', { error_category: category });
 
 export type R1FinalizeOutcome =
   | { readonly kind: 'skipped'; readonly reason: 'no_row' | 'not_finishing' | 'deleted' }
@@ -378,8 +386,13 @@ async function settleMultipart(deps: R1FinalizeDeps, row: R1RecordingRow, keys: 
     if (prefix.length === 0) await store.abortMultipart(keys.stream, row.upload_id);
     else await store.completeMultipart(keys.stream, row.upload_id, prefix.map((p) => ({ n: p.n, etag: p.etag })));
   } catch (error) {
-    // NoSuchUpload: an earlier run completed or aborted it (the id is cleared below).
     if (!(isR1StoreError(error) && error.code === 'no_such_upload')) throw error;
+    // NoSuchUpload. A run that completed or aborted the upload also cleared the id (below), so this is
+    // either a lost clear (then `stream.mp4` exists: nothing is missing) or somebody else's abort (the
+    // sweep, the 1-day lifecycle rule) that took every uploaded part with it. Say so rather than
+    // degrade in silence (incident 2026-10-21, session 482cb480). The HEAD runs before the clear, so a
+    // transient failure retries the check; the verdict is still decided from what is left.
+    if (!(await store.head(keys.stream))) (deps.log ?? warnCategory)('r1_recording_upload_missing');
   }
   const { error } = await deps.db
     .from(RECORDINGS_TABLE)

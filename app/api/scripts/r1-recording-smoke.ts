@@ -14,9 +14,11 @@
  * credential or provider message; exit code 0 = no FAIL, 1 = at least one FAIL, 2 = not configured.
  *
  * What it proves about R2 (each item is the unproven assumption the design rests on):
- *   presigned UploadPart x3 with a bare PUT | part replacement | prefix-complete after a simulated
- *   crash (parts 1-3 + a stray part 5, completed with 1-3) | HEAD | Range GET (206) across a part
- *   boundary with a signed response-content-type | CORS echo for the web origin and none for another |
+ *   presigned UploadPart x3 with a bare PUT | ListMultipartUploads names the open upload by exactly
+ *   the UploadId CreateMultipartUpload returned (the sweep's test) | part replacement |
+ *   prefix-complete after a simulated crash (parts 1-3 + a stray part 5, completed with 1-3) | HEAD |
+ *   Range GET (206) across a part boundary with a signed response-content-type | CORS echo for the
+ *   web origin and none for another |
  *   a whole-object presigned PUT that signs Content-Type | abort + empty ListMultipartUploads |
  *   5 s expiry -> 403 | lifecycle read-back (SKIP when the token cannot read it) | cleanup.
  */
@@ -175,6 +177,29 @@ export async function runSmoke(argv: string[], deps: SmokeDeps = {}): Promise<nu
       etags[2] = await putPart(2, part2a);
       etags[3] = await putPart(3, part3);
       return `parts 1-3 stored (${total} bytes)`;
+    });
+    // The r1.sweep orphan scan keeps a recording's open upload only when the listed UploadId string
+    // equals the one CreateMultipartUpload returned (the row's `upload_id`). Session 482cb480 lost its
+    // upload mid-call (2026-10-21); this confirms or rules out a mismatch on real R2. Read-only.
+    await after(uploaded, 'list-multipart-uploads (the open upload is listed under the exact UploadId)', async () => {
+      const listed: Array<{ uploadId: string; initiatedAt: Date }> = [];
+      for await (const u of store.listMultipartUploads(prefix)) if (u.key === streamKey) listed.push(u);
+      expect(listed.length === 1, `${listed.length} open upload(s) listed for the stream key (expected 1)`);
+      const id = listed[0]!.uploadId;
+      if (id !== uploadId) {
+        let decodedEqual = false;
+        try {
+          decodedEqual = decodeURIComponent(id) === uploadId || id === decodeURIComponent(uploadId);
+        } catch {
+          /* not percent-encoded */
+        }
+        throw new SmokeFailure(
+          `the listed UploadId differs from the created one (${decodedEqual ? 'equal after URL-decoding' : `${id.length} vs ${uploadId.length} characters`}): ` +
+          'the r1.sweep orphan scan would abort a live recording\'s upload',
+        );
+      }
+      expect(listed[0]!.initiatedAt.getTime() > 0, 'the listing carries no Initiated time (the sweep would treat the upload as old)');
+      return 'listed UploadId equals the created one; Initiated present';
     });
     const replaced = await after(uploaded, 'part-replacement', async () => {
       const next = await putPart(2, part2b);

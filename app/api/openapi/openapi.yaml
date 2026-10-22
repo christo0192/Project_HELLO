@@ -362,7 +362,7 @@ paths:
       tags: [r1]
       operationId: signR1RecordingObject
       summary: A presigned PUT URL for one fixed R1 recording object (worker bearer)
-      description: 'Same gate as part-url. kind selects a FIXED key under the recording prefix, never a caller-chosen name: audio_partial -> audio.partial.ogg and audio -> audio.ogg (Content-Type audio/ogg), video -> video.mp4 (the faststart copy; video/mp4 for an av recording, audio/mp4 for an audio one). The Content-Type is part of the signature: the worker must send exactly the content_type returned. 600 s TTL. Success is HTTP 200, no-store.'
+      description: 'Same gate as part-url. kind selects a FIXED key under the recording prefix, never a caller-chosen name: audio_partial -> audio.partial.ogg and audio -> audio.ogg (Content-Type audio/ogg), video -> video.mp4 (the faststart copy, or after an encoder loss the frozen picture prefix trimmed to its last whole fragment; video/mp4 for an av recording, audio/mp4 for an audio one). The Content-Type is part of the signature: the worker must send exactly the content_type returned. 600 s TTL. Success is HTTP 200, no-store.'
       requestBody:
         required: true
         content:
