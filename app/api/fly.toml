@@ -171,10 +171,20 @@ primary_region = "sin"
   min_machines_running = 1
   processes = ["app"]
 
+  # M019 (PR #378, up to 25 concurrent R1 interviews): raised from soft 20 /
+  # hard 40. An R1 join exchange is HELD open while a worker machine boots
+  # (up to ~60 s start plus a 30-120 s ready wait), so 25 candidates joining
+  # together are 25 long-lived but idle requests on top of normal traffic and
+  # the 3 s "preparing" polls. Those wait on I/O, not CPU, so one Node process
+  # carries them; at 20/40 the proxy would queue or refuse the burst. The soft
+  # limit is also where the proxy prefers or auto-starts another machine when
+  # the app has one, so 80 keeps that for real load, not one interview wave.
+  # Not yet measured: verify it on the load-test ladder in
+  # docs/runbooks/r1-operations.md ("Concurrent R1 interviews (PR #378)").
   [http_service.concurrency]
     type = "requests"
-    soft_limit = 20
-    hard_limit = 40
+    soft_limit = 80
+    hard_limit = 200
 
 [[vm]]
   cpu_kind = "shared"

@@ -101,7 +101,25 @@ r1Router.post('/interview-rounds/:id/cancel-pending-reject', requireRole('interv
   res.json({ ok: true, auto_status_disabled: data?.override?.disabled === true });
 } catch (e) { next(e); } });
 
-r1Router.get('/admin/r1/settings', requireRole('admin'), async (_req, res, next) => { try { const { data, error } = await supabase.from('r1_settings').select('*').eq('singleton', true).single(); if (error) throw error; res.json({ ...data, runtime: getR1Config() }); } catch (e) { next(e); } });
+/**
+ * The browser worker pool admission counts (0131): every `voice_worker_leases` row of the R1 worker
+ * app and pipeline `browser`, whatever its state, exactly as `r1_admit_attempt` counts it. The app
+ * name is 0131's literal (`BROWSER_FLY_APP` in worker-orchestration-runtime.ts; a test pins the
+ * three together). Null when the read fails or throws: the GET still answers, the PUT fails closed.
+ */
+export const R1_BROWSER_WORKER_APP = 'project-hello-voice';
+async function browserWorkerPoolSize(): Promise<number | null> {
+  try {
+    const { data, error } = await supabase.from('voice_worker_leases').select('machine_id').eq('app', R1_BROWSER_WORKER_APP).eq('pipeline', 'browser');
+    if (error || !Array.isArray(data)) return null;
+    return data.length;
+  } catch { return null; }
+}
+/** The live R1 limit the setting may name (0131's CHECK). */
+const R1_MAX_CONCURRENT_SESSIONS = 25;
+// `browser_worker_pool_size` is read-only and informational: admission caps the setting at it, and
+// the PUT refuses to raise the setting above it. Null when it could not be read.
+r1Router.get('/admin/r1/settings', requireRole('admin'), async (_req, res, next) => { try { const { data, error } = await supabase.from('r1_settings').select('*').eq('singleton', true).single(); if (error) throw error; res.json({ ...data, browser_worker_pool_size: await browserWorkerPoolSize(), runtime: getR1Config() }); } catch (e) { next(e); } });
 // Settings meaning (0119): `monthly_cap_minutes` is the owner-approved R1 allocation in minutes (sessions x 65)
 // and applies in BOTH livekit targets; `pause_line_minutes` is the total Cloud-pool pause line and applies only
 // while `livekit_target` is 'cloud'. A dashboard reading is stamped by the database (its own clock and its own
@@ -114,19 +132,34 @@ r1Router.get('/admin/r1/settings', requireRole('admin'), async (_req, res, next)
 // `monthly_cap_minutes` (a deliberate save of 4000 counts); any other write, including a dashboard reading or an
 // empty save, records `updated_by` but does not lift the guard. A client can never supply it.
 const R1_DEFAULT_ALLOCATION_MINUTES = 4000;
-const R1_SETTINGS_FIELDS = ['enabled', 'paused', 'monthly_cap_minutes', 'pause_line_minutes', 'advance_threshold', 'hold_threshold', 'auto_status_enabled', 'livekit_target', 'recording_mode'] as const;
+const R1_SETTINGS_FIELDS = ['enabled', 'paused', 'monthly_cap_minutes', 'pause_line_minutes', 'advance_threshold', 'hold_threshold', 'auto_status_enabled', 'livekit_target', 'recording_mode', 'max_concurrent_sessions'] as const;
 const validMinutes = (v: unknown) => (typeof v === 'number' || (typeof v === 'string' && v.trim() !== '')) && Number.isFinite(Number(v)) && Number(v) >= 0 && Number(v) <= 99999999.99;
 r1Router.put('/admin/r1/settings', requireRole('admin'), async (req, res, next) => { try {
   const body = req.body ?? {};
-  if ('dashboard_read_at' in body || 'dashboard_estimate_baseline' in body || 'allocation_set_at' in body) return res.status(400).json({ error: 'invalid_r1_settings' });
+  if ('dashboard_read_at' in body || 'dashboard_estimate_baseline' in body || 'allocation_set_at' in body || 'browser_worker_pool_size' in body) return res.status(400).json({ error: 'invalid_r1_settings' });
   const patch: Record<string, unknown> = { updated_by: req.authUser!.id };
   for (const k of R1_SETTINGS_FIELDS) if (k in body) patch[k] = body[k];
   const validInt = (v: unknown) => Number.isInteger(v) && Number(v) > 0;
   const validScore = (v: unknown) => Number.isFinite(v) && Number(v) >= 0 && Number(v) <= 100;
   const dashboard = 'dashboard_minutes' in body;
   // The 0115 settings audit trigger does not carry `recording_mode`; the route audit does (R1-REC).
-  const settingsAuditExtra: Record<string, unknown> = patch.recording_mode !== undefined ? { recording_mode: patch.recording_mode } : {};
-  if ((patch.monthly_cap_minutes !== undefined && !validInt(patch.monthly_cap_minutes)) || (patch.pause_line_minutes !== undefined && !validInt(patch.pause_line_minutes)) || (dashboard && !validMinutes(body.dashboard_minutes)) || (patch.advance_threshold !== undefined && !validScore(patch.advance_threshold)) || (patch.hold_threshold !== undefined && !validScore(patch.hold_threshold)) || (patch.livekit_target !== undefined && !['cloud', 'r1'].includes(String(patch.livekit_target))) || (patch.recording_mode !== undefined && !(typeof patch.recording_mode === 'string' && ['off', 'audio', 'av'].includes(patch.recording_mode))) || (patch.enabled !== undefined && typeof patch.enabled !== 'boolean')) return res.status(400).json({ error: 'invalid_r1_settings' });
+  // Nor `max_concurrent_sessions` (0131): the route audit carries its new value the same way.
+  const settingsAuditExtra: Record<string, unknown> = {
+    ...(patch.recording_mode !== undefined ? { recording_mode: patch.recording_mode } : {}),
+    ...(patch.max_concurrent_sessions !== undefined ? { max_concurrent_sessions: patch.max_concurrent_sessions } : {}),
+  };
+  // A whole number 1..25 (0131's CHECK); a string, a fraction or null is refused, never coerced.
+  const validConcurrency = (v: unknown) => Number.isInteger(v) && Number(v) >= 1 && Number(v) <= R1_MAX_CONCURRENT_SESSIONS;
+  if ((patch.monthly_cap_minutes !== undefined && !validInt(patch.monthly_cap_minutes)) || (patch.pause_line_minutes !== undefined && !validInt(patch.pause_line_minutes)) || (dashboard && !validMinutes(body.dashboard_minutes)) || (patch.advance_threshold !== undefined && !validScore(patch.advance_threshold)) || (patch.hold_threshold !== undefined && !validScore(patch.hold_threshold)) || (patch.livekit_target !== undefined && !['cloud', 'r1'].includes(String(patch.livekit_target))) || (patch.recording_mode !== undefined && !(typeof patch.recording_mode === 'string' && ['off', 'audio', 'av'].includes(patch.recording_mode))) || (patch.enabled !== undefined && typeof patch.enabled !== 'boolean') || (patch.max_concurrent_sessions !== undefined && !validConcurrency(patch.max_concurrent_sessions))) return res.status(400).json({ error: 'invalid_r1_settings' });
+  // More live interviews than there are browser worker machines can never run (one session per
+  // machine, 0079), and admission would cap the setting at the pool anyway (0131). So a value above
+  // 1 is refused while the pool is smaller, and when the pool cannot be read (fail closed). Lowering
+  // to 1 is always allowed: it is the safe direction.
+  if (typeof patch.max_concurrent_sessions === 'number' && patch.max_concurrent_sessions > 1) {
+    const pool = await browserWorkerPoolSize();
+    if (pool === null) return res.status(503).json({ error: 'service_unavailable' });
+    if (patch.max_concurrent_sessions > pool) return res.status(409).json({ error: 'r1_concurrency_above_worker_pool', browser_worker_pool_size: pool });
+  }
   if (patch.enabled === true && !('monthly_cap_minutes' in body)) {
     const { data: current, error: currentError } = await supabase.from('r1_settings').select('monthly_cap_minutes,allocation_set_at').eq('singleton', true).single();
     if (currentError || !current) return res.status(503).json({ error: 'service_unavailable' });

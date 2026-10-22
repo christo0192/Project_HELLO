@@ -31,6 +31,7 @@
         "R1_LIVEKIT_API_KEY": { "requiredInProduction": false, "secret": true },
         "R1_LIVEKIT_API_SECRET": { "requiredInProduction": false, "secret": true },
         "R1_ENABLED": { "requiredInProduction": false, "secret": false },
+        "R1_ASSESSMENT_CONCURRENCY": { "requiredInProduction": false, "secret": false },
         "R1_RECORDING_S3_ENDPOINT": { "requiredInProduction": false, "secret": false },
         "R1_RECORDING_S3_REGION": { "requiredInProduction": false, "secret": false },
         "R1_RECORDING_S3_BUCKET": { "requiredInProduction": false, "secret": false },

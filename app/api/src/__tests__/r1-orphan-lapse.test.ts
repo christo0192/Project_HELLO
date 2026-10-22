@@ -1,6 +1,7 @@
 /**
- * Orphaned R1 sessions lapse. Admission's one-live-R1 rule is GLOBAL (`r1_in_flight`), so a
- * created/waiting/in_progress session that no worker owns blocked every R1 start forever. The
+ * Orphaned R1 sessions lapse. Admission counts every live R1 session, across all rounds, against
+ * the live R1 limit (`r1_in_flight`; 1 by default, so the slot is global; up to 25 since 0131), so
+ * a created/waiting/in_progress session that no worker owns held its slot forever. The
  * lapse runs in the existing r1-status loop, fails or expires the orphan with a terminal reason
  * far past anything a live session takes, writes ended_at as the LAST ACTIVITY (never now(), which
  * would book phantom minutes), and settles the attempt as an UNCOUNTED outcome.
@@ -108,7 +109,7 @@ describe('what lapses, and into what', () => {
     expect(isValidTransition('in_progress', 'failed') && isValidReasonForStatus('worker_crash', 'failed')).toBe(true);
   });
 
-  it('frees the global R1 slot: no live R1 session is left, so admission stops answering r1_in_flight', async () => {
+  it('frees their R1 slots: no live R1 session is left, so admission stops answering r1_in_flight', async () => {
     const tables = tablesWith(
       session(1, { status: 'created' }),
       session(2, { status: 'waiting', waiting_at: minutesAgo(50), updated_at: minutesAgo(50) }),
@@ -579,6 +580,102 @@ describe('the r1-status loop runs it', () => {
     const runtime = createR1Runtime({ config: ENABLED, client: createFakeDb(baseTables()).client as never, queue: makeQueue() })!;
     expect(Object.keys(runtime.loopIntervalsMs)).toEqual(['r1-assessment', 'r1-status', 'r1-storage', 'r1-sweep']);
     expect([...runtime.queues]).toEqual(['r1.assessment', 'r1.recording.finalize', 'r1.recording.erase', 'r1.sweep']);
+  });
+});
+
+describe('a pass stays bounded with many live sessions (0131: up to 25 at once)', () => {
+  /**
+   * A listing that never answers: every probe runs to `dispatchProbeMs`. It records the (fake) time
+   * each probe started, so probes that overlap share a start time: the widest group is the overlap.
+   */
+  function hungLister() {
+    const startedAt: number[] = [];
+    const listDispatch = vi.fn((_room: string) => {
+      startedAt.push(Date.now());
+      return new Promise<never>(() => undefined);
+    });
+    const lister = { listDispatch } as unknown as DispatchListerLike;
+    const max = () => Math.max(0, ...[...new Set(startedAt)].map((t) => startedAt.filter((x) => x === t).length));
+    return { listDispatch, lister, max };
+  }
+
+  it('reads at least 100 live rows a pass', async () => {
+    expect(R1_ORPHAN_LAPSE_BOUNDS.scanLimit).toBeGreaterThanOrEqual(100);
+    const tables = tablesWith(...Array.from({ length: 99 }, (_, i) => session(i + 1, {
+      status: 'waiting', started_at: minutesAgo(5), waiting_at: minutesAgo(5), updated_at: minutesAgo(5),
+    })));
+    const { result } = await lapse(tables);
+    expect(result).toEqual({ scanned: 99, lapsed: 0, settled: 0, errors: 0 });
+  });
+
+  it('lapses 30 stale orphans in one pass, each exactly once', async () => {
+    const tables = tablesWith(...Array.from({ length: 30 }, (_, i) => staleWaiting(i + 1)));
+    const asked = listerOf([]);
+    const { db, result } = await lapseWith(tables, { dispatches: asked.factory });
+    expect(result).toEqual({ scanned: 30, lapsed: 30, settled: 30, errors: 0 });
+    expect(tables.call_sessions!.every((s) => s.status === 'expired')).toBe(true);
+    expect(asked.factory).toHaveBeenCalledTimes(1);
+    expect(asked.listDispatch).toHaveBeenCalledTimes(30);
+    expect(new Set(settleCalls(db).map((c) => c.args.p_session_id)).size).toBe(30);
+  });
+
+  it('probes 30 stale rows whose SFU never answers in parallel, so the pass ends in ~32 s, not ~240 s', async () => {
+    vi.useFakeTimers();
+    try {
+      const tables = tablesWith(...Array.from({ length: 30 }, (_, i) => staleWaiting(i + 1)));
+      const hung = hungLister();
+      let done = false;
+      const pending = lapseWith(tables, { dispatches: () => hung.lister, clock: () => Date.now() })
+        .then((out) => { done = true; return out; });
+      const rounds = Math.ceil(30 / R1_ORPHAN_LAPSE_BOUNDS.rowConcurrency);
+      await vi.advanceTimersByTimeAsync(rounds * R1_ORPHAN_LAPSE_BOUNDS.dispatchProbeMs + 50);
+      expect(done).toBe(true);
+      const { result } = await pending;
+      // Every probe timed out: unreadable, counted, nothing written, retried next pass.
+      expect(result).toEqual({ scanned: 30, lapsed: 0, settled: 0, errors: 30 });
+      expect(hung.listDispatch).toHaveBeenCalledTimes(30);
+      expect(hung.max()).toBe(R1_ORPHAN_LAPSE_BOUNDS.rowConcurrency);
+      expect(tables.call_sessions!.every((s) => s.status === 'waiting')).toBe(true);
+      expect(rounds * R1_ORPHAN_LAPSE_BOUNDS.dispatchProbeMs).toBeLessThan(60_000);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('starts no new row once the pass budget is spent, leaving the rest for the next pass (not an error)', async () => {
+    vi.useFakeTimers();
+    try {
+      const tables = tablesWith(...Array.from({ length: 99 }, (_, i) => staleWaiting(i + 1)));
+      const hung = hungLister();
+      let done = false;
+      const pending = lapseWith(tables, { dispatches: () => hung.lister, clock: () => Date.now() })
+        .then((out) => { done = true; return out; });
+      const worst = R1_ORPHAN_LAPSE_BOUNDS.passBudgetMs + R1_ORPHAN_LAPSE_BOUNDS.dispatchProbeMs;
+      expect(worst).toBeLessThan(60_000);
+      await vi.advanceTimersByTimeAsync(worst + 50);
+      expect(done).toBe(true);
+      const { result } = await pending;
+      const probed = hung.listDispatch.mock.calls.length;
+      expect(probed).toBeGreaterThanOrEqual(R1_ORPHAN_LAPSE_BOUNDS.rowConcurrency);
+      expect(probed).toBeLessThan(99);
+      // Only the probed rows count as errors; the rows never started are untouched, not errors.
+      expect(result).toEqual({ scanned: 99, lapsed: 0, settled: 0, errors: probed });
+      expect(tables.call_sessions!.every((s) => s.status === 'waiting')).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('a budget spent at the start leaves every row untouched and the next pass does them', async () => {
+    const tables = tablesWith(staleWaiting(1), staleWaiting(2));
+    let calls = 0;
+    // The first reading starts the pass; every later one says the budget is gone.
+    const clock = () => (calls++ === 0 ? 0 : R1_ORPHAN_LAPSE_BOUNDS.passBudgetMs);
+    const first = await lapseWith(tables, { dispatches: listerOf([]).factory, clock });
+    expect(first.result).toEqual({ scanned: 2, lapsed: 0, settled: 0, errors: 0 });
+    expect(tables.call_sessions!.map((s) => s.status)).toEqual(['waiting', 'waiting']);
+    const second = await lapseWith(tables, { dispatches: listerOf([]).factory });
+    expect(second.result).toEqual({ scanned: 2, lapsed: 2, settled: 2, errors: 0 });
   });
 });
 

@@ -2,9 +2,9 @@
  * lib/r1/runtime.ts: the composition root for the R1 queue runtime (plan 6.7).
  *
  * ── DEDICATED AND ISOLATED ────────────────────────────────────────────
- * R1 gets its OWN `createQueueRunner` (concurrency 1) and its OWN loop scheduler. The assessment
- * runner hosts exactly one handler, `r1.assessment`. A SECOND runner, `r1-storage` (concurrency 1,
- * its own loop), hosts the recording lane (R1-REC): `r1.recording.finalize`, `r1.recording.erase`
+ * R1 gets its OWN `createQueueRunner` (concurrency `R1_ASSESSMENT_CONCURRENCY`, default 1, at most 8)
+ * and its OWN loop scheduler. The assessment runner hosts exactly one handler, `r1.assessment`. A
+ * SECOND runner, `r1-storage` (concurrency 1, its own loop), hosts the recording lane (R1-REC): `r1.recording.finalize`, `r1.recording.erase`
  * (consent withdrawn / declined) and `r1.sweep` (retention, crash salvage, purge outbox). It is
  * separate so a ten-minute scoring job can never delay a deletion or a finalize. Neither runner is EVER
  * registered in the phone runtime (handlers `{phone.dial, phone.assessment}`,
@@ -20,7 +20,16 @@
  * already finished ("live sessions finish"); a disabled one scores and applies nothing.
  *
  * ── FOUR LOOPS ────────────────────────────────────────────────────────
- *   r1-assessment  drains `r1.assessment` through the handler.
+ *   r1-assessment  drains `r1.assessment` through the handler, up to `R1_ASSESSMENT_CONCURRENCY`
+ *                  jobs at once (M019). Parallel jobs never score one interview twice: the 0116
+ *                  trigger enqueues ONE job per session (dedup key `r1.assessment:<session_id>`,
+ *                  unique while the job is live) and `claim_job` is FOR UPDATE SKIP LOCKED, so
+ *                  two slots never hold the same job. Even a second job for one session (a DLQ
+ *                  replay racing a live one) writes one row: the service adopts a stored scored
+ *                  assessment, and `uq_assessments_v2_session_revision` turns a racing insert
+ *                  into 23505, which adopts the winner. The R1 breaker is shared: a provider
+ *                  outage opens it for every slot, and a half-open breaker admits one probe and
+ *                  refuses the rest (`provider_circuit_open`), which defer at no cost.
  *   r1-storage     drains the recording lane (`r1.recording.finalize`, `r1.recording.erase`,
  *                  `r1.sweep`). It claims while the R2 recording config is `enabled` and is NOT
  *                  tied to `r1_settings.enabled`: a paused or disabled R1 must still finish a
@@ -81,6 +90,7 @@ import type { R1ObjectStore } from './recording/store.js';
 import { agentDispatchClientFor, browserLiveKitEndpoint } from '../livekit-endpoints.js';
 import type { DispatchListerLike } from './worker-gate.js';
 import { recordR1ScoringFailure, type R1AssessmentOptions } from '../../services/r1-assessment.js';
+import { env, r1AssessmentConcurrencyFrom } from '../env.js';
 
 /** The ONLY queues this runtime registers. A structural test pins it. */
 export const R1_RUNTIME_QUEUES: readonly string[] = [
@@ -142,6 +152,11 @@ export interface R1RuntimeOptions {
   readonly queue?: Queue;
   readonly owner?: string;
   readonly infer?: R1AssessmentOptions['infer'];
+  /**
+   * Scoring jobs run at once (test seam). Production reads `R1_ASSESSMENT_CONCURRENCY` through
+   * `env.r1AssessmentConcurrency` (default 1). Clamped to 1..8 either way.
+   */
+  readonly assessmentConcurrency?: number;
   /** Test seam for the recording config; production reads `R1_RECORDING_*` at call time. */
   readonly recordingConfig?: () => R1RecordingConfig;
   /** Test seam for the object store; production uses the shared S3 store. */
@@ -163,6 +178,8 @@ export interface R1RuntimeHandle {
   readonly queue: Queue;
   /** The queue names this runtime claims from. */
   readonly queues: readonly string[];
+  /** The scoring runner's concurrency after the clamp (`R1_ASSESSMENT_CONCURRENCY`). */
+  readonly assessmentConcurrency: number;
   readonly loopIntervalsMs: Readonly<Record<string, number>>;
   snapshot(): R1RuntimeSnapshot;
   /** Drive one pass of every loop (tests; production uses the scheduler). */
@@ -180,6 +197,9 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
   const queue = options.queue ?? new Queue(new PgAdapter(client), { defaultMaxAttempts: 5 });
   const owner = options.owner ?? `r1-${process.pid}-${randomUUID().slice(0, 8)}`;
   const clock = options.now ?? ((): Date => new Date());
+  const assessmentConcurrency = r1AssessmentConcurrencyFrom(
+    options.assessmentConcurrency ?? env.r1AssessmentConcurrency,
+  );
 
   let enabledCheckedAtMs = 0;
   let enabledCached = false;
@@ -237,7 +257,7 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
     shouldClaim: async (queueName: string): Promise<boolean> =>
       queueName === R1_ASSESSMENT_QUEUE && (await r1Enabled()),
     leaseSeconds: R1_RUNTIME_BOUNDS.jobLeaseSeconds,
-    concurrency: 1,
+    concurrency: assessmentConcurrency,
     pollMs: R1_RUNTIME_BOUNDS.queuePollMs,
     onEvent: (event) => {
       jobEvents[event.kind] = (jobEvents[event.kind] ?? 0) + 1;
@@ -340,6 +360,7 @@ export function createR1Runtime(options: R1RuntimeOptions = {}): R1RuntimeHandle
     storageRunner,
     queue,
     queues: R1_RUNTIME_QUEUES,
+    assessmentConcurrency,
     loopIntervalsMs,
     snapshot: () => ({
       lastStatusApplied,

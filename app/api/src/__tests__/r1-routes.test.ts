@@ -262,6 +262,111 @@ describe('R1 recruiter routes', () => {
     });
   });
 
+  describe('max_concurrent_sessions (0131): how many R1 interviews may run at once', () => {
+    const pool = (tables: Tables, machines: number, extra: Row[] = []) => {
+      tables.voice_worker_leases = [
+        ...Array.from({ length: machines }, (_, i) => ({ app: 'project-hello-voice', pipeline: 'browser', machine_id: `m${i}`, state: i === 0 ? 'busy' : 'stopped' })),
+        ...extra,
+      ];
+    };
+
+    it('GET returns the setting and the browser worker pool size admission counts (every state, browser app only)', async () => {
+      const tables = baseTables();
+      tables.r1_settings[0].max_concurrent_sessions = 1;
+      pool(tables, 3, [
+        { app: 'project-hello-phone-voice', pipeline: 'phone', machine_id: 'p0', state: 'stopped' },
+        { app: 'project-hello-voice', pipeline: 'phone', machine_id: 'x0', state: 'stopped' },
+      ]);
+      const response = await request(appFor('admin', OWNER, tables).app).get('/api/admin/r1/settings');
+      expect(response.status).toBe(200);
+      expect(response.body).toMatchObject({ max_concurrent_sessions: 1, browser_worker_pool_size: 3 });
+    });
+
+    it('GET still answers when the pool cannot be read, with a null pool size', async () => {
+      const tables = baseTables();
+      failingTables.add('voice_worker_leases');
+      try {
+        const response = await request(appFor('admin', OWNER, tables).app).get('/api/admin/r1/settings');
+        expect(response.status).toBe(200);
+        expect(response.body.browser_worker_pool_size).toBeNull();
+        expect(response.body.runtime).toBeDefined();
+      } finally { failingTables.delete('voice_worker_leases'); }
+    });
+
+    it.each([[1, 0], [2, 2], [25, 25], [3, 10]])('accepts %i with %i browser machines, stores it and puts the new value in the audit row', async (value, machines) => {
+      const tables = baseTables();
+      tables.r1_settings[0].max_concurrent_sessions = value === 1 ? 4 : 1;
+      pool(tables, machines);
+      const response = await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ max_concurrent_sessions: value });
+      expect(response.status).toBe(200);
+      expect(tables.r1_settings[0]).toMatchObject({ max_concurrent_sessions: value, updated_by: OWNER });
+      const entry = audits.find((a) => a.event === 'resource.update' && a.metadata?.resource === 'r1_settings');
+      expect(entry?.metadata).toEqual({ resource: 'r1_settings', max_concurrent_sessions: value });
+    });
+
+    it.each([[0], [26], [-1], [2.5], ['3'], [''], [null], [true], [[3]], [{ n: 3 }]])('refuses %j with 400 invalid_r1_settings and changes nothing', async (value) => {
+      const tables = baseTables();
+      tables.r1_settings[0].max_concurrent_sessions = 1;
+      pool(tables, 30);
+      const response = await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ max_concurrent_sessions: value });
+      expect(response.status).toBe(400);
+      expect(response.body).toEqual({ error: 'invalid_r1_settings' });
+      expect(tables.r1_settings[0].max_concurrent_sessions).toBe(1);
+      expect(audits).toHaveLength(0);
+    });
+
+    it('refuses a value above the browser worker pool with 409 and the pool size, and changes nothing', async () => {
+      const tables = baseTables();
+      tables.r1_settings[0].max_concurrent_sessions = 1;
+      pool(tables, 2);
+      const response = await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ max_concurrent_sessions: 3, paused: true });
+      expect(response.status).toBe(409);
+      expect(response.body).toEqual({ error: 'r1_concurrency_above_worker_pool', browser_worker_pool_size: 2 });
+      expect(tables.r1_settings[0]).toMatchObject({ max_concurrent_sessions: 1, paused: false });
+      expect(audits).toHaveLength(0);
+    });
+
+    it('fails closed (503) when the pool cannot be read for a value above 1, but always allows lowering to 1', async () => {
+      const tables = baseTables();
+      tables.r1_settings[0].max_concurrent_sessions = 4;
+      failingTables.add('voice_worker_leases');
+      try {
+        const { app } = appFor('admin', OWNER, tables);
+        const raise = await request(app).put('/api/admin/r1/settings').send({ max_concurrent_sessions: 2 });
+        expect(raise.status).toBe(503);
+        expect(raise.body).toEqual({ error: 'service_unavailable' });
+        expect(tables.r1_settings[0].max_concurrent_sessions).toBe(4);
+        const lower = await request(app).put('/api/admin/r1/settings').send({ max_concurrent_sessions: 1 });
+        expect(lower.status).toBe(200);
+        expect(tables.r1_settings[0].max_concurrent_sessions).toBe(1);
+      } finally { failingTables.delete('voice_worker_leases'); }
+    });
+
+    it('is admin-only, a client can never write the pool size, and an update that does not name it leaves it alone', async () => {
+      const tables = baseTables();
+      tables.r1_settings[0].max_concurrent_sessions = 2;
+      pool(tables, 5);
+      expect((await request(appFor('interviewer', OWNER, tables).app).put('/api/admin/r1/settings').send({ max_concurrent_sessions: 1 })).status).toBe(403);
+      expect((await request(appFor('viewer', OWNER, tables).app).get('/api/admin/r1/settings')).status).toBe(403);
+      const forged = await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ browser_worker_pool_size: 25 });
+      expect(forged.status).toBe(400);
+      expect(tables.r1_settings[0].browser_worker_pool_size).toBeUndefined();
+      expect((await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ paused: true })).status).toBe(200);
+      expect(tables.r1_settings[0].max_concurrent_sessions).toBe(2);
+      const entry = audits.filter((a) => a.event === 'resource.update' && a.metadata?.resource === 'r1_settings').at(-1);
+      expect(entry?.metadata).toEqual({ resource: 'r1_settings' });
+    });
+
+    it('counts the pool exactly as 0131 admission does, and names the app the orchestrator manages', async () => {
+      const { R1_BROWSER_WORKER_APP } = await import('../routes/r1.js');
+      const { BROWSER_FLY_APP } = await import('../lib/worker-orchestration-runtime.js');
+      expect(R1_BROWSER_WORKER_APP).toBe(BROWSER_FLY_APP);
+      const migration = readFileSync(path.resolve(here, '../../../supabase/migrations/0131_r1_concurrent_sessions.sql'), 'utf8');
+      expect(migration).toContain(`l.app='${R1_BROWSER_WORKER_APP}' and l.pipeline='browser'`);
+      expect(migration).toContain('check (max_concurrent_sessions between 1 and 25)');
+    });
+  });
+
   it('stamps a dashboard reading through the database RPC, never in the route', async () => {
     const { app, tables } = appFor('admin');
     const response = await request(app).put('/api/admin/r1/settings').send({ dashboard_minutes: 2500 });

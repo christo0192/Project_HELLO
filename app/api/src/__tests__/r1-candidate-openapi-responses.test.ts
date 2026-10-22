@@ -350,6 +350,14 @@ describe('R1 candidate routes: real responses against openapi.yaml', () => {
     h.health.mockResolvedValue(true);
     h.tables.r1_settings![0]!.paused = true;
     await hit('/api/r1/attempts', { token: LINK }, 409, 'r1_paused');
+    // Above a live R1 limit of 1 (0131) the busy answer is shorter and says why.
+    h.tables.r1_settings![0]!.paused = false;
+    const admit = h.db.rpc;
+    h.db.rpc = async (fn: string, args: unknown) => (fn === 'r1_admit_attempt'
+      ? { data: { status: 'round_live' }, error: null }
+      : admit(fn, args));
+    const slots = await hit('/api/r1/attempts', { token: LINK }, 409, 'r1_busy');
+    expect(slots.body).toEqual({ error: 'r1_busy', retry_after_sec: 300, busy_reason: 'slots_full' });
     finish('/api/r1/attempts');
   });
 

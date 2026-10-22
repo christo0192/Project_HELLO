@@ -1285,12 +1285,104 @@ describe('POST /api/r1/attempts', () => {
     expect(h.tables.call_sessions).toHaveLength(1);
   });
 
+  describe('several live R1 sessions at once (0131 max_concurrent_sessions)', () => {
+    /** Another round's live session, holding one of the slots. */
+    function otherLive(n: number): void {
+      h.tables.call_sessions!.push({
+        id: `60000000-0000-4000-8000-00000000000${n}`,
+        status: 'waiting',
+        interview_round_id: `20000000-0000-4000-8000-00000000000${n}`,
+        mode: 'browser',
+      });
+    }
+    function slots(max: number, machines: number): void {
+      selectR1Sfu(h);
+      h.tables.r1_settings![0]!.max_concurrent_sessions = max;
+      h.tables.voice_worker_leases = Array.from({ length: machines }, (_, i) => ({
+        app: 'project-hello-voice', pipeline: 'browser', machine_id: `m${i}`, state: 'stopped',
+      }));
+    }
+
+    it('admits while a slot is free', async () => {
+      slots(3, 3);
+      otherLive(1);
+      otherLive(2);
+      expect((await post('/attempts', { token: LINK })).status).toBe(201);
+      expect(h.tables.call_sessions).toHaveLength(3);
+    });
+
+    it('answers r1_busy with 300 s and busy_reason slots_full once every slot is in use', async () => {
+      slots(3, 3);
+      otherLive(1);
+      otherLive(2);
+      otherLive(3);
+      const busy = await post('/attempts', { token: LINK });
+      expect(busy.status).toBe(409);
+      expect(busy.body).toEqual({ error: 'r1_busy', retry_after_sec: 300, busy_reason: 'slots_full' });
+      expect(busy.headers['retry-after']).toBe('300');
+      expect(h.tables.call_sessions).toHaveLength(3);
+    });
+
+    it('a second tab of the same round is round_live, mapped to r1_busy slots_full, and admits nothing', async () => {
+      slots(2, 2);
+      const [a, b] = await Promise.all([
+        post('/attempts', { token: LINK }),
+        post('/attempts', { token: LINK }),
+      ]);
+      expect([a.status, b.status].sort()).toEqual([201, 409]);
+      const busy = a.status === 409 ? a : b;
+      expect(busy.body).toEqual({ error: 'r1_busy', retry_after_sec: 300, busy_reason: 'slots_full' });
+      expect(busy.headers['retry-after']).toBe('300');
+      expect(h.db.rpcCalls.filter((c) => c.fn === 'r1_admit_attempt')).toHaveLength(2);
+      expect(h.tables.call_sessions).toHaveLength(1);
+    });
+
+    it.each([
+      ['the pool has one machine, so the effective limit is 1', () => slots(5, 1)],
+      ['no pool is registered (floor 1)', () => slots(5, 0)],
+      ['the setting is 1 on the self-hosted target', () => slots(1, 5)],
+      ['the Cloud target ignores the setting', () => {
+        h.tables.r1_settings![0]!.max_concurrent_sessions = 5;
+        h.tables.voice_worker_leases = [
+          { app: 'project-hello-voice', pipeline: 'browser', machine_id: 'm0' },
+          { app: 'project-hello-voice', pipeline: 'browser', machine_id: 'm1' },
+        ];
+      }],
+      ['an older database has no column yet', () => {
+        selectR1Sfu(h);
+        h.tables.voice_worker_leases = [
+          { app: 'project-hello-voice', pipeline: 'browser', machine_id: 'm0' },
+          { app: 'project-hello-voice', pipeline: 'browser', machine_id: 'm1' },
+        ];
+      }],
+    ])('keeps today\'s exact single-slot answer when %s', async (_name, arrange) => {
+      arrange();
+      otherLive(1);
+      const busy = await post('/attempts', { token: LINK });
+      expect(busy.status).toBe(409);
+      expect(busy.body).toEqual({ error: 'r1_busy', retry_after_sec: 1800 });
+      expect(busy.headers['retry-after']).toBe('1800');
+    });
+
+    it('keeps today\'s answer when the pool cannot be read (a busy answer never fails on its wording)', async () => {
+      const tables = seedTables();
+      grantConsent(tables);
+      use(tables, {}, true, { voice_worker_leases: { message: 'down' } });
+      slots(3, 0);
+      h.db.rpc = async () => ({ data: { status: 'r1_in_flight' }, error: null });
+      const busy = await post('/attempts', { token: LINK });
+      expect(busy.status).toBe(409);
+      expect(busy.body).toEqual({ error: 'r1_busy', retry_after_sec: 1800 });
+    });
+  });
+
   it.each([
     ['disabled', 409, 'r1_disabled'],
     ['paused', 409, 'r1_paused'],
     ['capacity_exhausted', 409, 'r1_capacity_exhausted'],
     ['consent_missing', 409, 'consent_required'],
     ['cloud_capacity_exhausted', 409, 'r1_busy'],
+    ['round_live', 409, 'r1_busy'],
     ['round_not_admissible', 409, 'round_not_admissible'],
     ['round_expired', 409, 'round_expired'],
     ['starts_exhausted', 409, 'starts_exhausted'],

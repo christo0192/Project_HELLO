@@ -91,6 +91,22 @@ function positiveInt(name: string, defaultVal: number, min: number, max: number)
  */
 export const DEEPSEEK_TIMEOUT_CEILING_MS = 300_000;
 
+/** The ceiling of `R1_ASSESSMENT_CONCURRENCY` (each scoring job holds up to 2 model calls in flight). */
+export const R1_ASSESSMENT_CONCURRENCY_MAX = 8;
+
+/**
+ * Parse `R1_ASSESSMENT_CONCURRENCY` (or a test seam's number). Never throws: anything that is not
+ * an integer is the default, 1 (today's one-at-a-time scoring); an integer is clamped to 1..8.
+ * Declared above `env` because `env` calls it while it is being built.
+ */
+export function r1AssessmentConcurrencyFrom(raw: unknown): number {
+  const n = typeof raw === 'number'
+    ? raw
+    : typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : Number.NaN;
+  if (!Number.isInteger(n)) return 1;
+  return Math.min(R1_ASSESSMENT_CONCURRENCY_MAX, Math.max(1, n));
+}
+
 export const env = {
   supabaseUrl: required('SUPABASE_URL'),
   supabaseServiceRoleKey: required('SUPABASE_SERVICE_ROLE_KEY'),
@@ -359,4 +375,14 @@ export const env = {
    * on only once every browser worker reports its per-machine name.
    */
   browserRequireMachineAgentName: booleanEnv('BROWSER_REQUIRE_MACHINE_AGENT_NAME', false),
+  /**
+   * M019 (R1 concurrency): how many `r1.assessment` scoring jobs ONE API process
+   * runs at once. 1 (default) is today: interviews are scored one after another.
+   * 25 interviews ending together at 1 queue their scoring for tens of minutes;
+   * up to 8 run in parallel. Read as a literal so the env contract sees it, and
+   * CLAMPED, never thrown (R1 config must never stop the API booting, see
+   * lib/r1/config.ts): unset, empty or not an integer = 1, below 1 = 1, above
+   * 8 = 8. `lib/r1/runtime.ts` applies it to the assessment runner only.
+   */
+  r1AssessmentConcurrency: r1AssessmentConcurrencyFrom(process.env.R1_ASSESSMENT_CONCURRENCY),
 };

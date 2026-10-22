@@ -53,6 +53,12 @@ name: Deploy (Fly)
 #        absent current registration fails closed — a dispatchable phone lane
 #        with no registered worker is dispatch-into-silence, not a policy
 #        exemption.
+#  - M019 (concurrent R1): browser-voice refuses to deploy while any R1 session
+#    is live. migrate-production counts them with a read-only SELECT and hands
+#    ONLY the count (and its timestamp) to deploy-browser-voice, so the database
+#    credential still never reaches an application job. On the on-demand path the
+#    deploy script also converges a multi-machine pool (every machine on the new
+#    image, none left started) and fails the deploy when it cannot.
 #
 # Prerequisite (one-time, owner action — NOT stored in VCS; no secret values):
 #   App-scoped repository secrets must exist, each a `fly tokens create deploy
@@ -194,6 +200,11 @@ jobs:
     concurrency:
       group: supabase-production-migrations
       cancel-in-progress: false
+    # M019: the live-R1 count for the browser-voice guard. Only a number and a
+    # timestamp leave this job; the database credential never does.
+    outputs:
+      r1_live_sessions: ${{ steps.r1live.outputs.count }}
+      r1_live_checked_at: ${{ steps.r1live.outputs.checked_at }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.x
         with:
@@ -213,6 +224,32 @@ jobs:
         env:
           SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
         run: bash scripts/verify-prod-function-drift.sh
+      # M019: a browser-voice deploy restarts started worker machines, so it cuts
+      # every live R1 interview (up to max_concurrent_sessions of them). Count the
+      # live R1 sessions here, where the DB credential already is, with a
+      # read-only SELECT (the same `supabase db query` the drift check uses).
+      # This step never fails the job — the api and phone deploys must not wait
+      # on R1 — it only hands a count to deploy-browser-voice, which refuses
+      # unless the count is exactly 0 and fresh. An unreadable answer is
+      # "unknown", which that guard refuses (fail closed).
+      - name: Count live R1 sessions (read-only, browser-voice deploy guard)
+        id: r1live
+        if: needs.detect.outputs.voice == 'true'
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          set -euo pipefail
+          sql="select count(*)::int as live_r1 from screening_v2.call_sessions where interview_round_id is not null and status in ('created','waiting','in_progress')"
+          n=""
+          if [ -n "${SUPABASE_DB_URL:-}" ] \
+             && out="$(npx --yes supabase@2.118.0 db query --db-url "$SUPABASE_DB_URL" --output-format json "$sql" 2>/dev/null)"; then
+            n="$(printf '%s\n' "$out" | grep -oE '"live_r1"[[:space:]]*:[[:space:]]*[0-9]+' \
+                   | grep -oE '[0-9]+$' | head -n 1 || true)"
+          fi
+          if [ -z "$n" ]; then n="unknown"; fi
+          echo "count=$n" >> "$GITHUB_OUTPUT"
+          echo "checked_at=$(date -u +%s)" >> "$GITHUB_OUTPUT"
+          echo "live R1 sessions (created/waiting/in_progress): $n"
 
   deploy-api:
     needs: [detect, migrate-production]
@@ -249,6 +286,35 @@ jobs:
       group: fly-deploy-browser-voice
       cancel-in-progress: false
     steps:
+      # M019 pre-deploy guard: refuse while any R1 interview is live. The count
+      # comes from migrate-production (this job never sees the DB credential).
+      # It must read exactly 0 and be at most R1_LIVE_MAX_AGE_SEC old: this job
+      # can wait on its concurrency group after the count was taken. It is a
+      # refusal, not a lock — an admission can still land during the deploy, so
+      # pause R1 first for a planned deploy (docs/runbooks/r1-operations.md).
+      - name: Refuse while R1 sessions are live (read-only guard)
+        env:
+          R1_LIVE: ${{ needs.migrate-production.outputs.r1_live_sessions }}
+          R1_LIVE_CHECKED_AT: ${{ needs.migrate-production.outputs.r1_live_checked_at }}
+          R1_LIVE_MAX_AGE_SEC: "900"
+        run: |
+          set -euo pipefail
+          live="${R1_LIVE:-}"
+          checked="${R1_LIVE_CHECKED_AT:-}"
+          if ! printf '%s' "$live" | grep -Eq '^[0-9]+$'; then
+            echo "::error::could not read the live R1 session count ('${live:-empty}'); refusing to deploy browser-voice (fail closed). Re-run once the database is reachable."; exit 1
+          fi
+          if ! printf '%s' "$checked" | grep -Eq '^[0-9]+$'; then
+            echo "::error::the live R1 session count has no timestamp; refusing to deploy browser-voice (fail closed)"; exit 1
+          fi
+          age=$(( $(date -u +%s) - checked ))
+          if [ "$age" -gt "$R1_LIVE_MAX_AGE_SEC" ]; then
+            echo "::error::the live R1 session count is ${age}s old (limit ${R1_LIVE_MAX_AGE_SEC}s; this job waited for an earlier deploy); refusing. Re-run via workflow_dispatch service=browser-voice."; exit 1
+          fi
+          if [ "$live" -ne 0 ]; then
+            echo "::error::$live R1 session(s) are live (created/waiting/in_progress); a browser-voice deploy would cut them. Pause R1, wait for them to end, then re-run via workflow_dispatch service=browser-voice."; exit 1
+          fi
+          echo "no live R1 sessions (count taken ${age}s ago); browser-voice may deploy"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.2.x
         with:
           ref: ${{ needs.detect.outputs.sha }}
@@ -319,6 +385,9 @@ jobs:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_VOICE }}
           APP: project-hello-voice
           FLY_CONFIG: fly.toml
+          # M019: after the proof, every pool machine must be on the new image
+          # and none left started (a one-machine pool is unchanged).
+          VERIFY_POOL: "true"
         run: |
           set -euo pipefail
           # Pre-start watermark: captured BEFORE this script starts the machine,

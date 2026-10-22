@@ -26,6 +26,7 @@ import { BusinessError, ProviderError } from '../lib/provider-resilience.js';
 import { ScorecardValidationError } from '../lib/scorecards/domain.js';
 import { R1_RUNTIME_BOUNDS, R1_RUNTIME_QUEUES, createR1Runtime } from '../lib/r1/runtime.js';
 import { getR1Config } from '../lib/r1/config.js';
+import { R1_ASSESSMENT_CONCURRENCY_MAX, env, r1AssessmentConcurrencyFrom } from '../lib/env.js';
 import { DeepseekError } from '../lib/deepseek.js';
 import { R1_METRICS } from '../lib/r1/rubric.js';
 import {
@@ -234,6 +235,121 @@ describe('the status loop', () => {
     expect(runtime.scheduler.running()).toBe(false);
     expect(runtime.runner.stopped()).toBe(true);
     expect(runtime.storageRunner.stopped()).toBe(true);
+  });
+});
+
+describe('scoring concurrency (M019, R1_ASSESSMENT_CONCURRENCY)', () => {
+  /** A gate every model call waits on, so jobs stay in flight until the test releases them. */
+  function gatedInfer() {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const infer = vi.fn(async () => {
+      await gate;
+      return modelAnswer(rows, allScores(3));
+    });
+    return { infer, release };
+  }
+
+  it('parses the knob without ever throwing: default 1, integers clamped to 1..8', () => {
+    expect(R1_ASSESSMENT_CONCURRENCY_MAX).toBe(8);
+    for (const raw of [undefined, null, '', '   ', 'abc', '2.5', 2.5, Number.NaN, Number.POSITIVE_INFINITY, {}, true]) {
+      expect(r1AssessmentConcurrencyFrom(raw), String(raw)).toBe(1);
+    }
+    expect(r1AssessmentConcurrencyFrom('0')).toBe(1);
+    expect(r1AssessmentConcurrencyFrom('-3')).toBe(1);
+    expect(r1AssessmentConcurrencyFrom('1')).toBe(1);
+    expect(r1AssessmentConcurrencyFrom('3')).toBe(3);
+    expect(r1AssessmentConcurrencyFrom(' 4 ')).toBe(4);
+    expect(r1AssessmentConcurrencyFrom(5)).toBe(5);
+    expect(r1AssessmentConcurrencyFrom('8')).toBe(8);
+    expect(r1AssessmentConcurrencyFrom('9')).toBe(8);
+    expect(r1AssessmentConcurrencyFrom('100')).toBe(8);
+    // The shipped default (unset in the test environment) is today's one-at-a-time scoring.
+    expect(env.r1AssessmentConcurrency).toBe(1);
+  });
+
+  it('defaults to one scoring job at a time (today), and clamps a seam value like the env', () => {
+    const db = createFakeDb(baseTables());
+    const build = (assessmentConcurrency?: number) => createR1Runtime({
+      config: ENABLED, client: db.client as never, queue: makeQueue(), assessmentConcurrency,
+    })!;
+    expect(build().assessmentConcurrency).toBe(1);
+    expect(build(0).assessmentConcurrency).toBe(1);
+    expect(build(3).assessmentConcurrency).toBe(3);
+    expect(build(50).assessmentConcurrency).toBe(8);
+  });
+
+  it('at the default runs the second job only after the first: one in flight at a time', async () => {
+    const db = createFakeDb(tablesWithInterview(), happyRpc());
+    const queue = makeQueue();
+    await queue.enqueue(R1_ASSESSMENT_QUEUE, { session_id: SESSION_ID });
+    await queue.enqueue(R1_ASSESSMENT_QUEUE, { session_id: SESSION_ID });
+    const { infer, release } = gatedInfer();
+    const runtime = createR1Runtime({ config: ENABLED, client: db.client as never, queue, infer })!;
+    await runtime.runner.tick();
+    expect(runtime.runner.inFlight()).toBe(1);
+    release();
+    await runtime.runner.stop();
+    expect(runtime.runner.peakInFlight()).toBe(1);
+  });
+
+  it('runs several jobs in parallel, and parallel jobs for ONE session still store one assessment', async () => {
+    // Two live jobs for one session cannot come from the 0116 trigger (one dedup key per session),
+    // but a DLQ replay can race a live job. Both reach the model before either stores a row; the
+    // second insert answers 23505 and adopts the first: one scored row, both jobs complete.
+    const db = createFakeDb(tablesWithInterview(), happyRpc());
+    const queue = makeQueue();
+    await queue.enqueue(R1_ASSESSMENT_QUEUE, { session_id: SESSION_ID });
+    await queue.enqueue(R1_ASSESSMENT_QUEUE, { session_id: SESSION_ID });
+    const { infer, release } = gatedInfer();
+    const runtime = createR1Runtime({
+      config: ENABLED, client: db.client as never, queue, infer, assessmentConcurrency: 4,
+    })!;
+    await runtime.runner.tick();
+    expect(runtime.runner.inFlight()).toBe(2);
+    release();
+    await runtime.runner.stop();
+    expect(runtime.runner.peakInFlight()).toBe(2);
+    // Each job made its own three runs (the race costs model calls, never a second row).
+    expect(infer).toHaveBeenCalledTimes(6);
+    expect(db.tables.assessments).toHaveLength(1);
+    expect(db.tables.assessments![0]!.recommendation).toBe('advance');
+    expect(runtime.snapshot().jobEvents.completed).toBe(2);
+    expect(await queue.getDlqJobs()).toHaveLength(0);
+  });
+
+  it('the trigger dedup key keeps one live job per session, so parallel slots never double-score it', async () => {
+    const db = createFakeDb(tablesWithInterview(), happyRpc());
+    const queue = makeQueue();
+    const dedupKey = `${R1_ASSESSMENT_QUEUE}:${SESSION_ID}`;
+    await queue.enqueue(R1_ASSESSMENT_QUEUE, { session_id: SESSION_ID }, { dedupKey, maxAttempts: 5 });
+    await queue.enqueue(R1_ASSESSMENT_QUEUE, { session_id: SESSION_ID }, { dedupKey, maxAttempts: 5 });
+    const { infer, release } = gatedInfer();
+    const runtime = createR1Runtime({
+      config: ENABLED, client: db.client as never, queue, infer, assessmentConcurrency: 8,
+    })!;
+    await runtime.runner.tick();
+    expect(runtime.runner.inFlight()).toBe(1);
+    release();
+    await runtime.runner.stop();
+    expect(infer).toHaveBeenCalledTimes(3);
+    expect(db.tables.assessments).toHaveLength(1);
+    // A later job for the same, already scored session adopts the row: the model is not called again.
+    await queue.enqueue(R1_ASSESSMENT_QUEUE, { session_id: SESSION_ID }, { dedupKey, maxAttempts: 5 });
+    const again = createR1Runtime({
+      config: ENABLED, client: db.client as never, queue, infer, assessmentConcurrency: 8,
+    })!;
+    await again.runner.tick();
+    await again.runner.stop();
+    expect(infer).toHaveBeenCalledTimes(3);
+    expect(db.tables.assessments).toHaveLength(1);
+    expect(again.snapshot().jobEvents.completed).toBe(1);
+  });
+
+  it('the 0116 trigger keys the job by session, the invariant the parallel runner relies on', () => {
+    const migration = readFileSync(path.resolve(here, '../../../supabase/migrations/0116_r1_shared_session_fields.sql'), 'utf8');
+    expect(migration).toContain("'r1.assessment:' || new.id::text");
+    expect(migration).toMatch(/on conflict do nothing/);
   });
 });
 

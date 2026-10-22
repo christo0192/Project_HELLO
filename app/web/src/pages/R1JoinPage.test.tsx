@@ -91,6 +91,7 @@ vi.mock('../components/candidate-r1/R1ReadinessStep', () => ({
 }));
 
 import { ApiError } from '../lib/api-client';
+import { R1ApiError } from '../lib/r1/r1-api';
 import { readNonce, saveNonce } from '../lib/r1/r1-link';
 import { R1JoinPage } from './R1JoinPage';
 
@@ -553,6 +554,32 @@ describe('joining', () => {
     expect(h.media?.video.stop).toHaveBeenCalled();
     expect(h.exchange).not.toHaveBeenCalled();
     expect(screen.getByRole('button', { name: 'Check my camera and microphone' })).toBeEnabled();
+  });
+
+  it('says every slot is in use, about 5 minutes, when several interviews run at once (0131)', async () => {
+    h.createAttempt.mockRejectedValue(new R1ApiError('r1_busy', 409, 'slots_full'));
+    await toLanding();
+    fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(
+      'All interview slots are in use. Please try again in about 5 minutes. Your link stays valid.',
+    );
+    expect(alert).not.toHaveTextContent('Another interview is finishing');
+    expect(alert).not.toHaveTextContent('30 minutes');
+    expect(h.media?.audio.stop).toHaveBeenCalled();
+    expect(h.media?.video.stop).toHaveBeenCalled();
+    expect(h.exchange).not.toHaveBeenCalled();
+  });
+
+  it('keeps today’s exact wording for a busy answer without a reason (one interview at a time)', async () => {
+    h.createAttempt.mockRejectedValue(new R1ApiError('r1_busy', 409, null));
+    await toLanding();
+    fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Another interview is finishing. Please try again in about 30 minutes. Your link stays valid.',
+    );
   });
 
   it('keeps the stored nonce through a busy answer but drops it on a refusal', async () => {
@@ -1737,6 +1764,18 @@ describe('a link with nothing left to start', () => {
       openPage();
       expect(await findH1('Video interview')).toBeVisible();
       expect(screen.queryByRole('status')).toBeNull();
+    });
+
+    it('still words a slots-full busy answer as the person’s own open interview', async () => {
+      h.status.mockResolvedValue(ELSEWHERE);
+      h.createAttempt.mockRejectedValue(new R1ApiError('r1_busy', 409, 'slots_full'));
+      openPage();
+      await findH1('Video interview');
+      fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+      fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+      const alert = await screen.findByRole('alert');
+      expect(alert).toHaveTextContent('Your interview is open on another device or browser tab');
+      expect(alert).not.toHaveTextContent('All interview slots are in use');
     });
 
     it('keeps the generic wording when it is somebody else’s interview that is busy', async () => {

@@ -11,6 +11,7 @@ import {
   classifyR1Error,
   isFinalRefusal,
   r1Api,
+  r1BusySlotsFull,
   type R1AttemptGrant,
   type R1ConsentTemplate,
   type R1ErrorKind,
@@ -146,12 +147,18 @@ function closedKindFor(kind: R1ErrorKind): R1ClosedKind {
   return 'unavailable';
 }
 
-function joinErrorMessage(kind: R1ErrorKind, liveElsewhere: boolean): string {
+function joinErrorMessage(kind: R1ErrorKind, liveElsewhere: boolean, slotsFull: boolean): string {
   switch (kind) {
     case 'busy':
       // The link's own interview is live and this tab holds no nonce for it: it is the
       // person's, not "another interview", and 30 minutes is the wrong thing to wait for.
       if (liveElsewhere) return `${OPEN_ELSEWHERE} Your link stays valid.`;
+      // Several interviews run at once (0131) and every slot is taken: one frees far sooner
+      // than an interview's length, and the server said so (busy_reason slots_full).
+      if (slotsFull) {
+        return 'All interview slots are in use. Please try again in about 5 minutes. '
+          + 'Your link stays valid.';
+      }
       return 'Another interview is finishing. Please try again in about 30 minutes. '
         + 'Your link stays valid.';
     case 'rate_limited':
@@ -523,7 +530,7 @@ export function R1JoinPage() {
       // timeout, a failed connect or a 5xx leaves the attempt live, and without the nonce the
       // retry would be refused as busy by this candidate's own session.
       if (kind === 'link_invalid' || kind === 'link_expired') clearNonce();
-      setLandingError(joinErrorMessage(kind, liveElsewhere));
+      setLandingError(joinErrorMessage(kind, liveElsewhere, r1BusySlotsFull(error)));
       setStage({ name: 'landing' });
     }
   }

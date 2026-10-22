@@ -327,7 +327,7 @@ describe('editing', () => {
       return el.textContent?.trim() ?? '';
     };
     const order: string[] = [];
-    for (let i = 0; i < 9; i += 1) {
+    for (let i = 0; i < 10; i += 1) {
       await user.tab();
       order.push(nameOf(document.activeElement as HTMLElement));
     }
@@ -338,6 +338,7 @@ describe('editing', () => {
       'Paused',
       'Monthly cap (minutes)',
       'Pause line (minutes)',
+      'Interviews at the same time',
       'Advance threshold',
       'Hold threshold',
       'Automatic status changes',
@@ -504,6 +505,120 @@ describe('server refusals', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent(words);
     expect(toggle('Paused')).toHaveAttribute('aria-checked', 'true');
     expect(save()).toBeEnabled();
+  });
+});
+
+describe('interviews at the same time (0131 max_concurrent_sessions)', () => {
+  const POOLED = {
+    ...SAVED,
+    enabled: true,
+    livekit_target: 'r1' as const,
+    max_concurrent_sessions: 2,
+    browser_worker_pool_size: 5,
+  };
+  const limit = () => field('Interviews at the same time');
+
+  it('shows the saved limit and the interview machines the server reported', async () => {
+    api.getR1Settings.mockResolvedValue(POOLED);
+    renderPage();
+    await loaded();
+    expect(limit()).toHaveValue('2');
+    expect(screen.getByText('5 interview machines')).toBeInTheDocument();
+    expect(limit()).toHaveAccessibleDescription(/1 to 25\. 5 interview machines are registered\./);
+    expect(limit()).not.toHaveAccessibleDescription(/LiveKit Cloud/);
+  });
+
+  it('reads an older API (no column, no pool) as 1, says nothing about machines, and never sends it', async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await loaded();
+    expect(limit()).toHaveValue('1');
+    expect(screen.queryByText(/interview machines? are registered/)).not.toBeInTheDocument();
+    expect(limit()).toHaveAccessibleDescription(/LiveKit Cloud R1 runs one interview at a time/);
+    await user.click(toggle('Paused'));
+    await user.click(save());
+    expect(api.updateR1Settings).toHaveBeenCalledWith({ paused: true });
+  });
+
+  it('says so when the machine count could not be read', async () => {
+    api.getR1Settings.mockResolvedValue({ ...POOLED, browser_worker_pool_size: null });
+    renderPage();
+    await loaded();
+    expect(limit()).toHaveAccessibleDescription(/could not be read; it is checked when you save/);
+  });
+
+  it('asks before raising it, saying what happens, then sends only the limit', async () => {
+    api.getR1Settings.mockResolvedValue(POOLED);
+    const user = userEvent.setup();
+    renderPage();
+    await loaded();
+    await user.clear(limit());
+    await user.type(limit(), '4');
+    await user.click(save());
+    const group = await screen.findByRole('group', { name: 'Confirm these changes' });
+    expect(group).toHaveTextContent(
+      'Saving will let up to 4 R1 interviews run at the same time (now 2), each on its own ' +
+        'interview machine.',
+    );
+    expect(api.updateR1Settings).not.toHaveBeenCalled();
+    await user.click(within(group).getByRole('button', { name: 'Confirm and save' }));
+    expect(api.updateR1Settings).toHaveBeenCalledWith({ max_concurrent_sessions: 4 });
+    expect(await screen.findByText('Settings saved.')).toBeInTheDocument();
+    expect(limit()).toHaveValue('4');
+    // The PUT answer has no machine count; the last known one stays on the page.
+    expect(screen.getByText('5 interview machines')).toBeInTheDocument();
+  });
+
+  it('lowers it without a second click', async () => {
+    api.getR1Settings.mockResolvedValue(POOLED);
+    const user = userEvent.setup();
+    renderPage();
+    await loaded();
+    await user.clear(limit());
+    await user.type(limit(), '1');
+    await user.click(save());
+    expect(screen.queryByRole('group', { name: 'Confirm these changes' })).not.toBeInTheDocument();
+    expect(api.updateR1Settings).toHaveBeenCalledWith({ max_concurrent_sessions: 1 });
+  });
+
+  it.each([
+    ['26', 'Enter a whole number from 1 to 25.'],
+    ['0', 'Enter a whole number from 1 to 25.'],
+    ['6', 'Only 5 interview machines are registered, so R1 can run at most 5 interviews at a time.'],
+  ])('blocks %j before any request, explains it and focuses the field', async (value, words) => {
+    api.getR1Settings.mockResolvedValue(POOLED);
+    const user = userEvent.setup();
+    renderPage();
+    await loaded();
+    await user.clear(limit());
+    await user.type(limit(), value);
+    await user.click(save());
+    expect(api.updateR1Settings).not.toHaveBeenCalled();
+    expect(limit()).toHaveFocus();
+    expect(limit()).toHaveAttribute('aria-invalid', 'true');
+    expect(limit()).toHaveAccessibleDescription(new RegExp(words.replace(/[.]/g, '\\.')));
+  });
+
+  it('explains the server refusing a limit above the machines, without losing the edit', async () => {
+    api.getR1Settings.mockResolvedValue({ ...POOLED, browser_worker_pool_size: null });
+    api.updateR1Settings.mockRejectedValue(new ApiError('r1_concurrency_above_worker_pool', 409));
+    const user = userEvent.setup();
+    renderPage();
+    await loaded();
+    await user.clear(limit());
+    await user.type(limit(), '3');
+    await user.click(save());
+    await user.click(
+      within(await screen.findByRole('group', { name: 'Confirm these changes' })).getByRole(
+        'button',
+        { name: 'Confirm and save' },
+      ),
+    );
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'There are not enough interview machines registered for that many interviews at once. ' +
+        'Nothing was changed.',
+    );
+    expect(limit()).toHaveValue('3');
   });
 });
 

@@ -155,6 +155,12 @@ export interface R1Settings {
   advance_threshold: number;
   hold_threshold: number;
   livekit_target: 'cloud' | 'r1';
+  /**
+   * The most live R1 interviews the self-hosted target admits at once (0131, 1..25, default 1).
+   * Admission caps it at the browser worker pool; Cloud admits one whatever it says. Absent from
+   * an older API, which is read as 1.
+   */
+  max_concurrent_sessions?: number;
   dashboard_minutes: number;
   dashboard_read_at: string | null;
   updated_at?: string;
@@ -171,6 +177,11 @@ export interface R1RuntimeStatus {
 /** `GET /api/admin/r1/settings` (200) and `PUT` (200, without `runtime`). */
 export interface R1SettingsResponse extends R1Settings {
   runtime?: R1RuntimeStatus;
+  /**
+   * GET only, read-only: the browser worker machines admission counts. Null when the API could
+   * not read it; absent from an older API.
+   */
+  browser_worker_pool_size?: number | null;
 }
 
 /** The fields `PUT /api/admin/r1/settings` accepts; send only what changed. */
@@ -184,6 +195,7 @@ export type R1SettingsPatch = Partial<
     | 'pause_line_minutes'
     | 'advance_threshold'
     | 'hold_threshold'
+    | 'max_concurrent_sessions'
     | 'dashboard_minutes'
     | 'dashboard_read_at'
   >

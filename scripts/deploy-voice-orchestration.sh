@@ -46,6 +46,26 @@
 #   STOP_ATTEMPTS   optional machine-stop-state poll attempts  (default 12)
 #   PREPROOF_ATTEMPTS optional start+register retry rounds     (default 3)
 #   SLEEP_SECONDS   optional per-poll sleep                    (default 5; 0 in tests)
+#   VERIFY_POOL     optional "true" = after the post-deploy proof, converge and
+#                   verify the WHOLE pool (M019, below). Absent/anything else =
+#                   today's behaviour exactly. Set only by the browser-voice job.
+#   POOL_ATTEMPTS   optional pool-convergence poll attempts     (default 24)
+#
+# M019 POOL CONVERGENCE (VERIFY_POOL=true, a pool of MORE than one machine)
+# The registration proof boots ONE pool machine. With N machines that proves the
+# image, not the pool: a machine `flyctl deploy` skipped would boot an old image
+# for the next interview, and a machine the rollout left started burns cost and
+# takes dispatches. So after the post-deploy proof the script:
+#   a. takes the image of the machine it just proved (the new release) as the
+#      reference, and returns that machine to STOPPED;
+#   b. updates every STOPPED pool machine on another image to it, WITHOUT
+#      starting it (`flyctl machine update --skip-start`);
+#   c. lists the machines again until every one is on the reference image and
+#      none is started (stopped/created/suspended only), and FAILS the deploy
+#      otherwise. It never stops a machine it did not start: a started machine
+#      after the deploy may be a live interview admitted during it, so it is
+#      reported, not touched (pause R1 for browser deploys; r1-operations.md).
+# A one-machine pool is left to the registration proof, exactly as before.
 #
 # Idempotent / resumable: safe to re-run. It starts at most one machine, and its
 # cleanup stops only a machine THIS run started, so an interrupted+retried deploy
@@ -68,6 +88,8 @@ STOP_ATTEMPTS="${STOP_ATTEMPTS:-12}"
 # still fails closed after all rounds are exhausted.
 PREPROOF_ATTEMPTS="${PREPROOF_ATTEMPTS:-3}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-5}"
+POOL_ATTEMPTS="${POOL_ATTEMPTS:-24}"
+VERIFY_POOL="${VERIFY_POOL:-}"
 
 if [ -z "${WATERMARK:-}" ]; then
   # Same fail-closed refusal as the always-on job: an empty watermark would let
@@ -152,6 +174,81 @@ start_and_prove() {
     fi
     echo "::warning::$phase proof: no 'registered worker' at/after watermark $WATERMARK on $APP ($phase attempt $attempt/$PREPROOF_ATTEMPTS) - likely a transient mid-boot reap; retrying"
   done
+  return 1
+}
+
+# ── M019: converge + verify the whole pool (VERIFY_POOL=true only) ─────────────
+# Machine states that are not running and that nothing but a claim will start.
+NOT_RUNNING_JQ='(.state == "stopped" or .state == "created" or .state == "suspended")'
+
+# Count the machines of the app (Fly's list omits destroyed ones; filtered anyway).
+pool_count() {
+  printf '%s' "$1" | jq -r '[.[] | select(.state != "destroyed")] | length'
+}
+
+# $1 = the machine THIS run proved on the new image. Returns 0 when every pool
+# machine is on that image and none is started; 1 otherwise (fails the deploy).
+converge_pool() {
+  local proven="$1" list count ref id state="" bad attempt
+  if ! list="$(flyctl machine list -a "$APP" --json 2>/dev/null)"; then
+    echo "::error::could not list the machines of $APP to verify the pool after the deploy"
+    return 1
+  fi
+  if ! count="$(pool_count "$list")" || [ -z "$count" ]; then
+    echo "::error::unreadable machine list for $APP; cannot verify the pool"
+    return 1
+  fi
+  if [ "$count" -le 1 ]; then
+    echo "pool of $APP has $count machine(s); the registration proof above covers it"
+    return 0
+  fi
+  ref="$(printf '%s' "$list" | jq -r --arg id "$proven" '.[] | select(.id==$id) | .config.image // empty' | tail -1 || true)"
+  if [ -z "$ref" ]; then
+    echo "::error::could not read the image of the proven machine $proven on $APP; cannot verify the pool"
+    return 1
+  fi
+  echo "pool of $APP has $count machines: converging every one to $ref, none left started"
+
+  # a. Return the proven machine (ours) to STOPPED before judging the pool.
+  flyctl machine stop "$proven" -a "$APP" || true
+  for _ in $(seq 1 "$STOP_ATTEMPTS"); do
+    state="$(flyctl machine list -a "$APP" --json 2>/dev/null \
+      | jq -r --arg id "$proven" '.[] | select(.id==$id) | .state' | tail -1 || true)"
+    if [ "$state" = "stopped" ]; then break; fi
+    sleep "$SLEEP_SECONDS"
+  done
+  if [ "$state" = "stopped" ]; then
+    # Confirmed stopped: the EXIT trap has nothing left to stop.
+    STARTED_MACHINE=""
+  fi
+
+  # b. A stopped machine the rollout did not update gets the new image in place,
+  #    without being started. A started one is never touched here.
+  for id in $(printf '%s' "$list" | jq -r --arg ref "$ref" \
+      ".[] | select($NOT_RUNNING_JQ) | select((.config.image // \"\") != \$ref) | .id"); do
+    echo "updating stopped pool machine $id on $APP to the new image (not started)"
+    flyctl machine update "$id" -a "$APP" --image "$ref" --skip-start --yes \
+      || echo "::warning::could not update pool machine $id on $APP; the check below will fail on it"
+  done
+
+  # c. Verify: every machine on the reference image, none started.
+  bad="unread"
+  for attempt in $(seq 1 "$POOL_ATTEMPTS"); do
+    if list="$(flyctl machine list -a "$APP" --json 2>/dev/null)" && [ -n "$list" ]; then
+      if bad="$(printf '%s' "$list" | jq -r --arg ref "$ref" \
+          ".[] | select(.state != \"destroyed\") | select(($NOT_RUNNING_JQ | not) or ((.config.image // \"\") != \$ref)) | \"\\(.id) state=\\(.state)\"")"; then
+        if [ -z "$bad" ]; then
+          echo "pool of $APP converged: $count machines on $ref, none started (check $attempt/$POOL_ATTEMPTS)"
+          return 0
+        fi
+      else
+        bad="unreadable machine list"
+      fi
+    fi
+    sleep "$SLEEP_SECONDS"
+  done
+  echo "::error::pool of $APP did not converge after the deploy (want every machine on $ref and none started); offending: $(printf '%s' "$bad" | tr '\n' ' ')"
+  echo "::error::a started machine is NOT stopped by this deploy (it may be a live interview); stop it once it is idle, or wait for the reaper, then re-run the deploy"
   return 1
 }
 
@@ -264,6 +361,13 @@ if [ -n "$STARTED_MACHINE" ]; then
     echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on $APP (deployed image did not register after $PREPROOF_ATTEMPTS attempts)"
     exit 1
   fi
+  # M019: with VERIFY_POOL=true, every OTHER pool machine must be on the image
+  # just proved, and none started. Off (the default) = no change.
+  if [ "$VERIFY_POOL" = "true" ]; then
+    if ! converge_pool "$STARTED_MACHINE"; then
+      exit 1
+    fi
+  fi
 else
   # Rely-on-started branch (e.g. a lane whose sole machine is always-on): there is
   # no pool machine this run controls to reboot, so keep the original proof — a
@@ -272,6 +376,17 @@ else
   if ! verify_current_registration post-deploy; then
     echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on $APP (deployed image did not register)"
     exit 1
+  fi
+  # M019: a multi-machine pool with no stopped machine at all cannot be proved
+  # converged (there is no machine this run controls to take the new image from),
+  # and "every machine started" is itself what VERIFY_POOL forbids.
+  if [ "$VERIFY_POOL" = "true" ]; then
+    rely_list="$(flyctl machine list -a "$APP" --json 2>/dev/null || true)"
+    rely_count="$(pool_count "$rely_list" 2>/dev/null || echo unknown)"
+    if [ "$rely_count" != "1" ]; then
+      echo "::error::pool of $APP has ${rely_count:-unknown} machines and none was stopped; cannot verify the pool converged with none started"
+      exit 1
+    fi
   fi
 fi
 

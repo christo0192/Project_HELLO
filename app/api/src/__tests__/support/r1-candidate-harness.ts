@@ -138,9 +138,20 @@ export function rpcDoubles(tables: Tables, ids: () => string) {
         (c) => c.round_id === round.id && !c.withdrawn_at,
       );
       if (!consented) return { status: 'consent_missing' };
-      if (tables.call_sessions!.some((s) => s.interview_round_id && LIVE.includes(s.status))) {
-        return { status: 'r1_in_flight' };
+      // 0131's limit: least(max_concurrent_sessions, browser pool, floor 1) on the self-hosted
+      // target, 1 on Cloud. Above 1 the round's own live session answers round_live first.
+      const settings = tables.r1_settings?.[0] ?? {};
+      const pool = (tables.voice_worker_leases ?? []).filter(
+        (l) => l.app === 'project-hello-voice' && l.pipeline === 'browser',
+      ).length;
+      const limit = settings.livekit_target === 'r1'
+        ? Math.min(settings.max_concurrent_sessions ?? 1, Math.max(pool, 1))
+        : 1;
+      const live = tables.call_sessions!.filter((s) => s.interview_round_id && LIVE.includes(s.status));
+      if (limit > 1 && live.some((s) => s.interview_round_id === round.id)) {
+        return { status: 'round_live' };
       }
+      if (live.length >= limit) return { status: 'r1_in_flight' };
       if (round.starts_used >= 3) return { status: 'starts_exhausted' };
       const sessionId = ids();
       tables.call_sessions!.push({

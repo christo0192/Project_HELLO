@@ -27,6 +27,7 @@ const fixture = (mutate = {}) => {
   const result = run(path.join(source, "fly.toml"));
   ok(result.code === 0, `real SFU config must pass:\n${result.output}`);
   ok(/external_services=443,80,7881,7882 udp_mux=7882/.test(result.output), "pass result must surface the external port contract");
+  ok(/vm=performance-4x\/8192 signaling=300\/600/.test(result.output), "pass result must surface the 25-room VM size and signaling limits");
 }
 
 const goodToml = readFileSync(path.join(source, "fly.toml"), "utf8");
@@ -76,7 +77,14 @@ const cases = [
   ["baked secret", { "fly.toml": goodToml.replace("  # LIVEKIT_KEYS", '  LIVEKIT_KEYS = "not-a-secret"\n  # LIVEKIT_KEYS') }, /secret-shaped/],
   ["UDP port drift", { "fly.toml": goodToml.replace('port = 7882', 'port = 7883') }, /7882/],
   ["raw TCP handler drift", { "fly.toml": goodToml.replace('handlers = []', 'handlers = ["tls"]') }, /raw TCP/],
-  ["memory drift", { "fly.toml": goodToml.replace("memory_mb = 2048", "memory_mb = 1024") }, /2 GB/],
+  // M019 (PR #378): the SFU is sized for 25 rooms; each drift back (or a partial edit) must fail.
+  ["memory drift", { "fly.toml": goodToml.replace("memory_mb = 8192", "memory_mb = 2048") }, /performance-4x with 8 GB/],
+  ["cpu drift", { "fly.toml": goodToml.replace("cpus = 4", "cpus = 1") }, /performance-4x with 8 GB/],
+  ["cpu prefix drift", { "fly.toml": goodToml.replace("cpus = 4", "cpus = 40") }, /performance-4x with 8 GB/],
+  ["shared CPU", { "fly.toml": goodToml.replace('cpu_kind = "performance"', 'cpu_kind = "shared"') }, /performance-4x with 8 GB/],
+  ["signaling soft limit drift", { "fly.toml": goodToml.replace("soft_limit = 300", "soft_limit = 100") }, /soft 300 \/ hard 600/],
+  ["signaling hard limit drift", { "fly.toml": goodToml.replace("hard_limit = 600", "hard_limit = 250") }, /soft 300 \/ hard 600/],
+  ["signaling limit counts requests", { "fly.toml": goodToml.replace('type = "connections"', 'type = "requests"') }, /soft 300 \/ hard 600/],
   ["unpinned image", { Dockerfile: goodDockerfile.replace("@sha256:5d3dcc475d064536d9948ebe4eeab8e3b24d6f07a46f6d71a3415a2901bbdc52", "") }, /pin livekit/],
   ["trailing-comment service bypass", { "fly.toml": `${goodToml}\n[[services]] # a fourth service must still count\n` }, /exactly three service/],
   ["generic password", { "fly.toml": `${goodToml}\nTURN_PASSWORD = \"not-a-secret\"\n` }, /secret-shaped/],

@@ -346,6 +346,24 @@ function isRoomNotFound(err: unknown): boolean {
     && /requested room does not exist/i.test(e.message);
 }
 
+/** True when a Fly Machines call failed with the client's stable `not_found` (HTTP 404). */
+function isFlyNotFound(err: unknown): boolean {
+  return isFlyMachinesError(err) && err.code === 'not_found';
+}
+
+/**
+ * M019: what `retireGoneMachine` did with a machine whose stop answered `not_found`.
+ *   unconfirmed  — Fly did not prove the machine gone; nothing was touched, and the
+ *                  caller keeps its existing stop-failed behaviour.
+ *   retired      — the row was reset and then deleted (retire_voice_worker, 0131),
+ *                  so no claim can hand the dead machine out again.
+ *   reset_only   — the row was reset to `stopped` but the delete did not happen
+ *                  (RPC error, or a claim took the row in between). The next claim
+ *                  of it hits `not_found` and retires it then.
+ *   reset_failed — the reset itself failed; the row is as it was.
+ */
+type GoneMachineOutcome = 'unconfirmed' | 'retired' | 'reset_only' | 'reset_failed';
+
 /** A metadata-only sweep/lifecycle log line. Never a session id or a token. */
 function logEvent(kind: string, extra: Record<string, unknown> = {}): void {
   log.info('unknown_event', { error_category: `worker_orchestration_${kind}`, ...extra });
@@ -383,6 +401,74 @@ export function createWorkerOrchestrationService(
   };
 
   /**
+   * M019: a stop answered `not_found`. Is the machine really GONE (destroyed on
+   * Fly), and if so, take its lease row out of the pool.
+   *
+   * Before this, a destroyed machine whose row stayed behind was a trap: a claim
+   * handed it out, the start failed `not_found`, the cleanup's stop failed the
+   * same way, and the row stayed `draining` — which the claim's repeat-request
+   * branch (0118) hands back to the SAME session on every retry. A shrink of the
+   * pool done by hand (`fly machine destroy`) produced exactly that.
+   *
+   * A 404 alone is not proof. A token that cannot see the app answers 404 for
+   * every machine, and acting on that would retire the whole pool. So the
+   * machine counts as gone only when a SUCCESSFUL listing of the app does not
+   * carry it (or carries it `destroyed`/`destroying`); any listing failure
+   * answers `unconfirmed` and nothing is touched.
+   *
+   * When gone: `reset_voice_worker` returns the row to `stopped` (the callers
+   * reach here only for a row they proved theirs, or one the reaper already
+   * resets), then `retire_voice_worker` (0131) deletes it — it deletes only a
+   * `stopped` row, so a claim that races in between keeps the row and its own
+   * start hits `not_found` and retires it then.
+   */
+  async function retireGoneMachine(
+    app: string,
+    machineId: string,
+    origin: string,
+  ): Promise<GoneMachineOutcome> {
+    let gone = false;
+    try {
+      const machines = await deps.fly.listMachines(app);
+      if (Array.isArray(machines)) {
+        const m = machines.find((x) => x.id === machineId);
+        gone = m === undefined || m.state === 'destroyed' || m.state === 'destroying';
+      }
+    } catch {
+      gone = false;
+    }
+    if (!gone) {
+      event('machine_gone_unconfirmed', { app, origin });
+      return 'unconfirmed';
+    }
+    try {
+      envelope('reset_voice_worker', await deps.rpc('reset_voice_worker', {
+        p_app: app,
+        p_machine_id: machineId,
+        p_now: new Date(now()).toISOString(),
+      }));
+    } catch {
+      event('machine_gone_reset_failed', { app, origin, machineId });
+      return 'reset_failed';
+    }
+    try {
+      const retired = envelope('retire_voice_worker', await deps.rpc('retire_voice_worker', {
+        p_app: app,
+        p_machine_id: machineId,
+      }));
+      // `unknown_machine`: another actor already removed the row — same end state.
+      if (retired.status === 'retired' || retired.status === 'unknown_machine') {
+        event('machine_gone_retired', { app, origin, machineId });
+        return 'retired';
+      }
+    } catch {
+      /* fall through: the row is reset, which is the pre-0131 best we can do */
+    }
+    event('machine_gone_retire_failed', { app, origin, machineId });
+    return 'reset_only';
+  }
+
+  /**
    * Give a claimed machine back — and ONLY a machine this session still holds.
    *
    * `release_voice_worker` is CAS'd on (app, machine_id, session); the two
@@ -404,7 +490,12 @@ export function createWorkerOrchestrationService(
    * throw — means we cannot prove ownership, and the machine is left to the
    * reaper, which is the designed backstop for exactly this.
    */
-  async function cleanupClaim(app: string, machineId: string, sessionId: string): Promise<void> {
+  async function cleanupClaim(
+    app: string,
+    machineId: string,
+    sessionId: string,
+    opts: { startNotFound?: boolean } = {},
+  ): Promise<void> {
     let held = false;
     try {
       const released = envelope(
@@ -425,9 +516,24 @@ export function createWorkerOrchestrationService(
       event('cleanup_not_held', { app });
       return;
     }
+    let stopped = false;
+    let stopError: unknown = null;
     try {
       await deps.fly.stopMachine(app, machineId);
-    } catch {
+      stopped = true;
+    } catch (err) {
+      stopError = err;
+    }
+    // M019: a machine Fly confirms destroyed is not running and never will be;
+    // take its row out of the pool instead of leaving it `draining` (or, after a
+    // reset, claimable) for the next claim to trip over. Checked when the stop
+    // answered `not_found`, and when the START did (the stop is then expected to
+    // fail the same way, but the start's answer is the one that matters).
+    if ((opts.startNotFound === true || isFlyNotFound(stopError))
+        && (await retireGoneMachine(app, machineId, 'cleanup')) !== 'unconfirmed') {
+      return;
+    }
+    if (!stopped) {
       // Could not stop it; do NOT reset a machine we did not confirm stopped —
       // that would return a still-running machine to the claimable pool.
       event('cleanup_stop_failed', { app });
@@ -497,7 +603,7 @@ export function createWorkerOrchestrationService(
     } catch (err) {
       const code = isFlyMachinesError(err) ? err.code : 'fly_error';
       event('start_failed', { app, code });
-      await cleanupClaim(app, machineId, sessionId);
+      await cleanupClaim(app, machineId, sessionId, { startNotFound: code === 'not_found' });
       // A start timeout is a timeout; any other Fly failure is an error. Both
       // are non-ready, so the caller defers/retries and never dials.
       return code === 'timeout'
@@ -704,7 +810,14 @@ export function createWorkerOrchestrationService(
     if (machineId === null) return { stopped: null };
     try {
       await deps.fly.stopMachine(app, machineId);
-    } catch {
+    } catch (err) {
+      // M019: a destroyed machine is not running — nothing is still burning, so
+      // once its row is reset (and retired) it counts as released.
+      if (isFlyNotFound(err)) {
+        const gone = await retireGoneMachine(app, machineId, 'terminal_release');
+        if (gone === 'retired' || gone === 'reset_only') return { stopped: machineId };
+        if (gone === 'reset_failed') return { stopped: null };
+      }
       // Could not stop — the machine is STILL RUNNING. Do NOT reset a row we did
       // not confirm stopped, and do NOT count it released. Emit a distinct event
       // and hand back the machine id under `stopFailedMachineId` so the pass can
@@ -865,7 +978,11 @@ export function createWorkerOrchestrationService(
       // No live room (or no claim) beyond grace → stop + reset.
       try {
         await deps.fly.stopMachine(app, c.machineId);
-      } catch {
+      } catch (err) {
+        // M019: a machine Fly confirms destroyed leaves the pool (reset +
+        // retire) instead of being retried on every pass for ever. It is not
+        // counted as `stopped`: nothing was running to stop.
+        if (isFlyNotFound(err)) await retireGoneMachine(app, c.machineId, 'reap');
         // Could not stop this one; leave the lease as-is so the next pass
         // retries. Do NOT reset a machine we did not confirm stopped.
         continue;

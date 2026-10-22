@@ -8,6 +8,9 @@
  *   - the monthly cap (R1's own allocation) and the pause line (the shared Cloud
  *     pool's line), in WebRTC minutes;
  *   - the advance and hold score thresholds, and automatic status changes;
+ *   - how many R1 interviews may run at once (0131, 1 to 25), shown with the number of interview
+ *     machines the server reports: admission never runs more than that, the server refuses a
+ *     higher value, and raising it asks for a second click;
  *   - the LiveKit dashboard reading, which the Cloud pool's guard never goes
  *     below.
  * `livekit_target` is shown but not editable: moving R1 to another media
@@ -80,6 +83,7 @@ type Load =
 const FIELD_ORDER: ReadonlyArray<[keyof R1SettingsDraft, string]> = [
   ['monthly_cap_minutes', 'r1-monthly-cap'],
   ['pause_line_minutes', 'r1-pause-line'],
+  ['max_concurrent_sessions', 'r1-max-concurrent'],
   ['advance_threshold', 'r1-advance-threshold'],
   ['hold_threshold', 'r1-hold-threshold'],
 ];
@@ -124,6 +128,26 @@ const ALLOWANCE_NOTE: Record<'cloud' | 'r1', string> = {
   cloud: 'Both limits must have room: R1’s allocation and the Cloud pool’s pause line.',
   r1: 'Only R1’s allocation applies; the Cloud pool’s pause line gates nothing here.',
 };
+
+const CONCURRENCY_DESCRIPTION =
+  'How many R1 interviews may run at the same time. Each one runs on its own interview machine, ' +
+  'so R1 never runs more than the machines registered. Raise it only once per-machine worker ' +
+  'names are on and the media server is sized for it (see the R1 operations runbook).';
+
+/** What the page knows about the machines, for the interview-limit hint. */
+function concurrencyHint(pool: number | null | undefined, target: 'cloud' | 'r1'): string {
+  const machines =
+    typeof pool === 'number'
+      ? `${pool === 1 ? '1 interview machine is' : `${pool} interview machines are`} registered.`
+      : pool === null
+        ? 'The number of interview machines could not be read; it is checked when you save.'
+        : '';
+  const cloud =
+    target === 'cloud'
+      ? ' On LiveKit Cloud R1 runs one interview at a time, whatever this says.'
+      : '';
+  return `1 to 25. ${machines}${cloud}`.replace(/\s+/g, ' ').trim();
+}
 
 const TARGET_LABEL: Record<string, string> = {
   cloud: 'LiveKit Cloud, shared with phone',
@@ -235,13 +259,21 @@ export function R1SettingsPage() {
     setNotice(null);
     try {
       const next = await api.updateR1Settings(patch);
-      setSaved({ ...next, runtime: saved.runtime });
+      // The PUT carries neither the runtime nor the (GET-only) machine count: keep the last known.
+      setSaved({
+        ...next,
+        runtime: saved.runtime,
+        browser_worker_pool_size: saved.browser_worker_pool_size,
+      });
       setDraft(draftFromSettings(next));
       setConfirming(null);
       setNotice('Settings saved.');
     } catch (e) {
       setSaveError(
-        e instanceof ApiError && e.status === 400
+        e instanceof ApiError && e.message === 'r1_concurrency_above_worker_pool'
+          ? 'There are not enough interview machines registered for that many interviews at ' +
+            'once. Nothing was changed.'
+          : e instanceof ApiError && e.status === 400
           ? 'The server rejected those values. Check the numbers and that hold is not above ' +
             'advance.'
           : e instanceof ApiError && e.status === 403
@@ -256,7 +288,7 @@ export function R1SettingsPage() {
   function submit(event: FormEvent) {
     event.preventDefault();
     if (!saved || !draft || saving) return;
-    const found = validateSettingsDraft(draft);
+    const found = validateSettingsDraft(draft, saved);
     setErrors(found);
     const firstBad = FIELD_ORDER.find(([key]) => found[key]);
     if (firstBad) {
@@ -268,7 +300,7 @@ export function R1SettingsPage() {
       setNotice('There are no changes to save.');
       return;
     }
-    const reasons = needsConfirmation(patch);
+    const reasons = needsConfirmation(patch, saved);
     if (reasons.length > 0 && confirming === null) {
       setNotice(null);
       setConfirming(reasons);
@@ -303,7 +335,11 @@ export function R1SettingsPage() {
       if (previous) {
         setDraft((current) => (current ? rebaseDraft(current, previous, next) : current));
       }
-      setSaved((current) => ({ ...next, runtime: current?.runtime }));
+      setSaved((current) => ({
+        ...next,
+        runtime: current?.runtime,
+        browser_worker_pool_size: current?.browser_worker_pool_size,
+      }));
       setConfirming(null);
       setReadingText('');
       setNotice('Dashboard reading recorded.');
@@ -400,6 +436,41 @@ export function R1SettingsPage() {
                   autoComplete="off"
                   value={draft.pause_line_minutes}
                   onChange={(e) => update('pause_line_minutes', e.target.value)}
+                  aria-describedby={describedBy}
+                  aria-invalid={invalid || undefined}
+                />
+              )}
+            </Field>
+          </div>
+        </GlassPanel>
+
+        <GlassPanel as="section" aria-labelledby={`r1-concurrency-${uid}`}>
+          <SectionHeader
+            id={`r1-concurrency-${uid}`}
+            level={2}
+            title="Interviews at the same time"
+            description={CONCURRENCY_DESCRIPTION}
+            meta={
+              typeof saved.browser_worker_pool_size === 'number'
+                ? `${saved.browser_worker_pool_size} interview ` +
+                  `${saved.browser_worker_pool_size === 1 ? 'machine' : 'machines'}`
+                : undefined
+            }
+          />
+          <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <Field
+              id="r1-max-concurrent"
+              label="Interviews at the same time"
+              hint={concurrencyHint(saved.browser_worker_pool_size, target)}
+              error={errors.max_concurrent_sessions}
+            >
+              {({ id, describedBy, invalid }) => (
+                <TextField
+                  id={id}
+                  inputMode="numeric"
+                  autoComplete="off"
+                  value={draft.max_concurrent_sessions}
+                  onChange={(e) => update('max_concurrent_sessions', e.target.value)}
                   aria-describedby={describedBy}
                   aria-invalid={invalid || undefined}
                 />
