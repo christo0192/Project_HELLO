@@ -981,6 +981,121 @@ class TestAVSync(AVCase):
         self.assertAlmostEqual(beeps[1], resume + 2.0, delta=0.15)  # on the wall clock, not shifted
 
 
+def box(kind: bytes, payload: bytes = b"", *, large: bool = False) -> bytes:
+    """One top-level box; ``large`` writes the 64-bit form (size 1, then the real size)."""
+    if large:
+        return struct.pack(">I4sQ", 1, kind, 16 + len(payload)) + payload
+    return struct.pack(">I4s", 8 + len(payload), kind) + payload
+
+
+def box_offsets(data: bytes) -> list[tuple[str, int, int]]:
+    """``(type, start, end)`` of every whole top-level box (32- and 64-bit sizes)."""
+    out: list[tuple[str, int, int]] = []
+    pos = 0
+    while pos + 8 <= len(data):
+        size, kind = struct.unpack(">I4s", data[pos : pos + 8])
+        if size == 1:
+            size = struct.unpack(">Q", data[pos + 8 : pos + 16])[0]
+        if size < 8 or pos + size > len(data):
+            break
+        out.append((kind.decode("latin1"), pos, pos + size))
+        pos += size
+    return out
+
+
+class TestFragmentEnd(SpoolCase):
+    """``mp4_fragment_end``: where the frozen spool of a dead child is cut before it goes up on its own."""
+
+    HEAD = box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2avc1mp41") + box(b"moov", b"\x00" * 300)
+    PAIR = box(b"moof", b"\x11" * 100) + box(b"mdat", b"\x22" * 1000)
+
+    def end_of(self, data: bytes) -> int:
+        path = self.spool / "probe.mp4"
+        path.write_bytes(data)
+        return enc.mp4_fragment_end(path)
+
+    def test_whole_fragments_end_where_the_last_mdat_ends(self) -> None:
+        data = self.HEAD + self.PAIR * 3
+        self.assertEqual(self.end_of(data), len(data))
+        self.assertEqual(self.end_of(data + box(b"mfra", b"\x00" * 40)), len(data), "a trailer is not a fragment")
+
+    def test_a_fragment_cut_off_mid_write_is_left_out(self) -> None:
+        whole = self.HEAD + self.PAIR * 2
+        for cut in (1, 7, 8, 108, 109, 600, len(self.PAIR) - 1):
+            with self.subTest(cut=cut):
+                self.assertEqual(self.end_of(whole + self.PAIR[:cut]), len(whole))
+
+    def test_a_64_bit_size_is_followed(self) -> None:
+        big = box(b"moof", b"\x11" * 100) + box(b"mdat", b"\x33" * 5000, large=True)
+        data = self.HEAD + self.PAIR + big + self.PAIR
+        self.assertEqual(self.end_of(data), len(data))
+        self.assertEqual(self.end_of(self.HEAD + self.PAIR + big[:-1]), len(self.HEAD + self.PAIR))
+        # A 64-bit header cut short (12 of its 16 bytes) stops the walk.
+        short = box(b"moof", b"\x11" * 100) + struct.pack(">I4sI", 1, b"mdat", 0)
+        self.assertEqual(self.end_of(self.HEAD + self.PAIR + short), len(self.HEAD + self.PAIR))
+
+    def test_a_box_of_size_zero_runs_to_the_end_of_the_file_and_proves_nothing(self) -> None:
+        zero = box(b"moof", b"\x11" * 100) + struct.pack(">I4s", 0, b"mdat") + b"\x44" * 900
+        self.assertEqual(self.end_of(self.HEAD + self.PAIR + zero), len(self.HEAD + self.PAIR))
+
+    def test_a_truncated_header_or_a_size_smaller_than_its_header_stops_the_walk(self) -> None:
+        whole = self.HEAD + self.PAIR
+        self.assertEqual(self.end_of(whole + b"\x00\x00\x01"), len(whole))  # 3 bytes of the next header
+        self.assertEqual(self.end_of(whole + struct.pack(">I4s", 4, b"moof") + self.PAIR), len(whole))
+
+    def test_no_whole_fragment_is_zero(self) -> None:
+        for label, data in (
+            ("ftyp and moov only", self.HEAD),
+            ("a moof with no mdat", self.HEAD + box(b"moof", b"\x11" * 100)),
+            ("a moof whose mdat is cut", self.HEAD + self.PAIR[:500]),
+            ("an mdat with no moof (not fragmented)", self.HEAD + box(b"mdat", b"\x22" * 100)),
+            ("a fragment before the moov", box(b"ftyp", b"isom") + self.PAIR + box(b"moov", b"\x00" * 10)),
+            ("no ftyp first", box(b"moov", b"\x00" * 10) + self.PAIR),
+            ("not an MP4 at all", bytes((i * 7) % 251 for i in range(50_000))),
+            ("empty", b""),
+        ):
+            with self.subTest(label):
+                self.assertEqual(self.end_of(data), 0)
+        self.assertEqual(enc.mp4_fragment_end(self.spool / "missing.mp4"), 0)
+
+
+class TestFragmentEndOnARealSpool(AVCase):
+    def test_a_real_spool_cut_mid_fragment_is_trimmed_to_a_prefix_that_decodes_to_its_end(self) -> None:
+        spool = self.make()
+        self.play(
+            spool, end_us=7_000_000, audio=[(0, tone(7.0))],
+            picture=lambda t: flat_picture(640, 360, 60 + int(t / 1_000_000) * 20),
+        )
+        live = self.path.read_bytes()  # the spool as the uploader sees it mid-call (no trailer)
+        spool.close()
+        boxes = box_offsets(live)
+        self.assertEqual([kind for kind, _s, _e in boxes[:2]], ["ftyp", "moov"])
+        moofs = [start for kind, start, _e in boxes if kind == "moof"]
+        self.assertGreaterEqual(len(moofs), 3, "a fragment every 2 s")
+        closed_mdats = [end for kind, _start, end in box_offsets(self.path.read_bytes()) if kind == "mdat"]
+        self.assertEqual(enc.mp4_fragment_end(self.path), closed_mdats[-1], "the closed file: up to its trailer")
+        # kill -9 in the middle of writing the last fragment of ``live``:
+        cut_at = moofs[-1] + (len(live) - moofs[-1]) // 2
+        cut = self.spool / "cut.mp4"
+        cut.write_bytes(live[:cut_at])
+        end = enc.mp4_fragment_end(cut)
+        self.assertEqual(end, moofs[-1], "the cut fragment is left out, the ones before it are whole")
+        trimmed = self.spool / "trimmed.mp4"
+        trimmed.write_bytes(live[:end])
+        self.assertEqual(top_level_boxes(live[:end])[-1], "mdat")
+        pictures = decode_video(trimmed)
+        with av.open(str(trimmed)) as container:
+            packets = sum(1 for p in container.demux(container.streams.video[0]) if p.size)
+        self.assertEqual(len(pictures), packets, "every picture in it decodes")
+        self.assertEqual(len(pictures) % enc.VIDEO_KEYINT, 0, "whole fragments only (one per keyframe)")
+        self.assertGreaterEqual(len(pictures), 2 * enc.VIDEO_KEYINT)
+        pcm, _duration, _stream = decode(trimmed)
+        self.assertGreater(len(pcm) / RATE, 3.0)
+        # The picture follows the clock up to the last whole fragment.
+        last_at, last_plane = pictures[-1]
+        self.assertAlmostEqual(float(last_plane.mean()), 60 + int(last_at) * 20, delta=18)
+
+
 class TestChildPicture(SpoolCase):
     """The real child process with a picture, fed in real time like the recorder does."""
 

@@ -93,6 +93,7 @@ describe('r1-recording-smoke: a full run against a store that behaves like R2', 
     for (const id of [
       'multipart-create',
       'presigned-upload-part x3 (bare PUT)',
+      'list-multipart-uploads (the open upload is listed under the exact UploadId)',
       'part-replacement',
       'prefix-complete-after-crash',
       'head',
@@ -106,7 +107,7 @@ describe('r1-recording-smoke: a full run against a store that behaves like R2', 
       expect(lines.some((l) => l.startsWith(`PASS ${id}`)), id).toBe(true);
     }
     expect(lines.find((l) => l.startsWith('SKIP lifecycle read-back'))).toContain('wrangler r2 bucket lifecycle list');
-    expect(lines[lines.length - 1]).toBe('RESULT: 11 pass, 0 fail, 1 skipped');
+    expect(lines[lines.length - 1]).toBe('RESULT: 12 pass, 0 fail, 1 skipped'); // 11 + the UploadId listing check
     // Everything it wrote is gone, including open uploads.
     expect(store.objectKeys()).toEqual([]);
     expect(store.openUploadIds()).toEqual([]);
@@ -170,6 +171,30 @@ describe('r1-recording-smoke: a full run against a store that behaves like R2', 
     expect(status('cleanup')).toBe('PASS');
     expect(store.objectKeys()).toEqual([]);
     expect(store.openUploadIds()).toEqual([]);
+  });
+
+  it('a listing that names the open upload under another UploadId string is a FAIL naming the sweep, without printing either id', async () => {
+    for (const [label, rewrite, says] of [
+      // The in-memory ids are `mem-upload-<n>`: a percent-encoded `-` stands for an encoding difference.
+      ['percent-encoded', (id: string) => id.replace(/-/g, '%2D'), 'equal after URL-decoding'],
+      ['different', (id: string) => `${id}-other`, 'characters'],
+    ] as const) {
+      const { store, lines, deps } = rig();
+      const list = store.listMultipartUploads.bind(store);
+      store.listMultipartUploads = async function* (prefix: string) {
+        for await (const u of list(prefix)) yield { ...u, uploadId: rewrite(u.uploadId) };
+      };
+      expect(await runSmoke([], deps), label).toBe(1);
+      const line = lines.find((l) => l.includes('list-multipart-uploads'))!;
+      expect(line, label).toMatch(/^FAIL /);
+      expect(line, label).toContain('r1.sweep orphan scan');
+      expect(line, label).toContain(says);
+      expect(lines.join('\n'), label).not.toMatch(/mem-upload|mem%2Dupload/);
+      // Independent of it, the run goes on and still cleans up.
+      expect(lines.find((l) => l.includes('part-replacement')), label).toMatch(/^PASS /);
+      expect(lines.find((l) => l.includes('cleanup')), label).toMatch(/^PASS /);
+      expect(store.openUploadIds(), label).toEqual([]);
+    }
   });
 
   it('a cleanup that cannot finish is a FAIL, never silent', async () => {

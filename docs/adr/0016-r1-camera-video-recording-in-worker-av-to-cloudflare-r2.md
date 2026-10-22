@@ -102,8 +102,16 @@ before the evidence gates below.
 
 | Gate | What must be shown | Status |
 |---|---|---|
-| **S0-D** (R2 recording) | `app/api/scripts/r1-recording-smoke.ts` prints PASS for every item against the real bucket under `r1/smoke/` (presigned `UploadPart` x3 with a bare PUT, part replacement, complete, HEAD, Range GET 206, CORS echo for the web origin and none for another, prefix-complete after a simulated crash, abort and an empty `ListMultipartUploads`, expired URL 403, lifecycle read-back, cleanup), and a recorder-produced MP4 plays and seeks in Chrome and Safari from a presigned URL | **Pending.** Needs the owner's Cloudflare steps (runbook, Recording section). A local S3 emulator was used during development; it is not R2 and is not this evidence. |
-| **S0-C** (A/V CPU) | One 20-minute human staff session on a real laptop camera on `performance-2x`: event-loop lag max < 250 ms, CPU p95 < 60 %, finish < 18 s, `frames_dropped / frames_encoded` < 2 %, zero VAD slower-than-realtime warnings | **Pending.** Needs the flags on at a zero-live moment (runbook enable steps E3-E5). Synthetic-frame CPU numbers from development are not representative of a face on a camera. |
+| **S0-D** (R2 recording) | `app/api/scripts/r1-recording-smoke.ts` prints PASS for every item against the real bucket under `r1/smoke/` (presigned `UploadPart` x3 with a bare PUT, `ListMultipartUploads` naming the open upload by exactly the `UploadId` that `CreateMultipartUpload` returned, part replacement, complete, HEAD, Range GET 206, CORS echo for the web origin and none for another, prefix-complete after a simulated crash, abort and an empty `ListMultipartUploads`, expired URL 403, lifecycle read-back, cleanup), and a recorder-produced MP4 plays and seeks in Chrome and Safari from a presigned URL | **Pending.** Needs the owner's Cloudflare steps (runbook, Recording section). A local S3 emulator was used during development; it is not R2 and is not this evidence. |
+| **S0-C** (A/V CPU) | One 20-minute human staff session on a real laptop camera on `performance-4x` (4 vCPU / 8192 MB, since PR #377): event-loop lag max < 250 ms, CPU p95 < 60 %, finish < 18 s, `frames_dropped / frames_encoded` < 2 %, zero VAD slower-than-realtime warnings | **Pending on `performance-4x`. Failed on `performance-2x`** (2026-10-21, see below). Needs the flags on at a zero-live moment (runbook enable steps E3-E5). Synthetic-frame CPU numbers from development are not representative of a face on a camera. |
 
 S0-C and S0-D results are appended here when they exist, with the date and the command or session ids; until then
 recording stays off in production.
+
+- **2026-10-21, S0-C FAILED on `performance-2x`** (session `482cb480`, owner mock interview, 22.4 min, `requested_mode=av`):
+  the recorder gave the picture up at 240736 ms (`degraded_reason=cpu_loop_lag`), the encoder child was then lost
+  (`failure_reason=encoder_crashed`, `frames_encoded=4162`), and finalize stored the recording `layout=audio_only`,
+  `has_video=false`. The browser-voice VM moved to `performance-4x` in PR #377 and S0-C is re-run there. A second defect
+  lost the roughly four minutes of video that were already on the worker's disk: the `stream.mp4` multipart upload was
+  aborted mid-call (most likely by the `r1.sweep` orphan scan) and finalize treated the missing upload as settled. PR #377
+  also fixes that (the sweep never aborts a live row's upload; finalize logs `r1_recording_upload_missing`).

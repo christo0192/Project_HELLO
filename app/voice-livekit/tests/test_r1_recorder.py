@@ -28,6 +28,7 @@ import json
 import os
 import queue
 import re
+import struct
 import sys
 import tempfile
 import threading
@@ -122,6 +123,24 @@ class ManualClock:
 
     def advance(self, seconds: float) -> None:
         self.value += seconds
+
+
+def box(kind: bytes, payload: bytes = b"") -> bytes:
+    """One top-level ISO-BMFF box (32-bit size)."""
+    return struct.pack(">I4s", 8 + len(payload), kind) + payload
+
+
+def fmp4(fragments: int, *, payload: int = 20_000, tail: int = 3000) -> tuple[bytes, int]:
+    """Bytes laid out like the encoder's spool after a ``kill -9``: ``ftyp``, ``moov``, ``fragments``
+    whole ``moof`` + ``mdat`` pairs, then the first ``tail`` bytes of one more, cut off mid-write.
+    Returns ``(content, end of the last whole fragment)``."""
+    head = box(b"ftyp", b"isom\x00\x00\x02\x00isomiso2avc1mp41") + box(b"moov", b"\x00" * 700)
+    pairs = b"".join(
+        box(b"moof", bytes([n % 251]) * 200) + box(b"mdat", bytes((n * 13 + i) % 251 for i in range(payload)))
+        for n in range(fragments)
+    )
+    cut = (box(b"moof", b"\x01" * 200) + box(b"mdat", b"\x02" * payload))[:tail]
+    return head + pairs + cut, len(head) + len(pairs)
 
 
 # ------------------------------------------------------------------------------ modes
@@ -787,6 +806,8 @@ class FakeApi:
         self.puts: list[dict] = []
         self.scripts: dict[str, list] = {}
         self.put_statuses: list[int] = []
+        # ``url -> status`` for the PUT to that URL, or None for the usual answer (``put_statuses``, then 200)
+        self.put_status = None
         self.part_size = 65536
         self.checkpoint = 10
         self.events = events if events is not None else []
@@ -845,8 +866,12 @@ class FakeApi:
         with self.lock:
             self.inflight += 1
             self.max_inflight = max(self.max_inflight, self.inflight)
-            status = self.put_statuses.pop(0) if self.put_statuses else 200
-            entry = {"url": url, "body": bytes(body), "content_type": content_type, "status": status}
+            hooked = self.put_status(url) if self.put_status is not None else None
+            if hooked is not None:
+                status = hooked
+            else:
+                status = self.put_statuses.pop(0) if self.put_statuses else 200
+            entry = {"url": url, "body": bytes(body), "content_type": content_type, "status": status, "total": total_timeout}
             self.puts.append(entry)
             self.cancellable.append(("put", cancel is not None))
         self.events.append("put")
@@ -1504,7 +1529,7 @@ class TestUploadWorker(unittest.TestCase):
         self.lay(65536)
         self.api.script("part-url", HttpFailure("cancelled"))
         outcome = self.worker._attempts(
-            self.worker._part_step(1, b"x"), deadline=None, interruptible=True
+            self.worker._part_step(1, b"x"), deadline=None, interruptible=True, label="part"
         )
         self.assertEqual(outcome, ("aborted", None))
         self.assertEqual(self.api.bodies("part-url"), [{"part_number": 1}], "no retry")
@@ -1549,6 +1574,134 @@ class TestUploadWorker(unittest.TestCase):
         body = {"layout": "combined", "has_video": False, "report": {}}
         self.assertEqual(self.worker.job_complete(body, deadline=100.0), "ok")
         self.assertEqual(self.api.bodies("complete"), [body])
+
+    def test_a_part_url_that_answers_404_ends_the_multipart_with_no_retry_and_no_stop(self) -> None:
+        """NoSuchUpload (incident 482cb480: the multipart was aborted under a live call).  Retrying the
+        part can never succeed and only eats the finish budget; nor is it the API's stop answer."""
+        self.prepare()
+        self.lay(65536 * 3 + 500)
+        self.api.put_status = lambda url: 404 if "partNumber=2&" in url else None
+        with captured_logs() as lines:
+            self.assertFalse(self.worker._upload_ready_parts(final=False, deadline=None, interruptible=False))
+        self.assertEqual([b["part_number"] for b in self.api.bodies("part-url")], [1, 2], "part 2 once, no part 3")
+        self.assertEqual((self.worker.parts_done, self.worker.cut), (1, 65536))
+        self.assertTrue(self.worker.multipart_gone)
+        self.assertEqual((self.worker.state, self.stops, self.discards), ("uploading", [], []))
+        self.assertEqual([l["error_type"] for l in lines], ["r1_rec_multipart_gone"])
+        calls = len(self.api.calls)
+        self.assertFalse(self.worker._upload_ready_parts(final=True, deadline=100.0, interruptible=False))
+        self.clock.advance(60)
+        self.worker._periodic()
+        self.assertEqual(len(self.api.calls), calls, "no part URL is asked for again")
+        # Everything else goes on: the tail job sends the final OGG instead, and complete.
+        self.spool.ogg_path.write_bytes(b"OggS" + b"q" * 300)
+        result = self.worker.job_tail(mp4=True, final_ogg=False, deadline=self.clock() + 100.0)
+        self.assertEqual(result, {"uploading": True, "mp4": False, "ogg": True})
+        self.assertTrue(self.worker.final_ogg_uploaded)
+        self.assertEqual([b["part_number"] for b in self.api.bodies("part-url")], [1, 2])
+        self.assertEqual(self.worker.job_complete({"layout": "combined"}, deadline=self.clock() + 100.0), "ok")
+
+    def test_the_retry_line_names_the_step_it_retries(self) -> None:
+        self.api.script("prepare", ApiReply(500, {}, None))
+        with captured_logs() as lines:
+            self.prepare()
+            self.lay(65536)
+            self.api.put_statuses = [500]
+            self.worker._upload_ready_parts(final=False, deadline=None, interruptible=False)
+            self.spool.ogg_path.write_bytes(b"OggS" + b"a" * 50)
+            for kind in ("audio", "audio_partial"):
+                self.api.put_statuses = [500]
+                self.assertTrue(self.worker._put_object(kind, self.spool.ogg_path, deadline=None, interruptible=False))
+            self.spool.video_path.write_bytes(b"F" * 50)
+            self.api.put_statuses = [500]
+            self.assertTrue(self.worker.job_video(deadline=100.0))
+            self.api.script("complete", ApiReply(500, {}, None))
+            self.assertEqual(self.worker.job_complete({"layout": "combined"}, deadline=100.0), "ok")
+        retries = [(l["error_category"], l["option_count"]) for l in lines if l["error_type"] == "r1_rec_upload_retry"]
+        self.assertEqual(
+            retries,
+            [("prepare", 1), ("part", 1), ("object_audio", 1), ("object_audio", 1), ("object_video", 1), ("complete", 1)],
+        )
+
+    def test_a_big_body_may_take_longer_but_a_finish_call_never_passes_its_deadline(self) -> None:
+        self.clock.value = 10.0
+        self.assertEqual(self.worker._timeouts(None, 10.0), (5.0, 60.0), "never less than any other call")
+        self.assertEqual(self.worker._timeouts(None, 512.0), (5.0, 512.0))
+        self.assertEqual(self.worker._timeouts(100.0, 1.0), (5.0, 15.0))
+        self.assertEqual(self.worker._timeouts(100.0, 40.0), (5.0, 40.0), "past a finish call's 15 s cap ...")
+        self.assertEqual(self.worker._timeouts(30.0, 40.0), (5.0, 20.0), "... never past the deadline")
+        self.assertIsNone(self.worker._timeouts(10.01, 40.0))
+
+    def frozen_prefix(self, fragments: int = 6, tail: int = 5000) -> tuple[bytes, int]:
+        """The recorder says the MP4 is frozen with a picture in it (the encoder is lost)."""
+        self.worker._prefix_ready = lambda: True
+        content, end = fmp4(fragments, tail=tail)
+        (self.spool.dir / "stream.mp4").write_bytes(content)
+        return content, end
+
+    def test_a_frozen_prefix_goes_up_once_as_the_video_object_and_no_part_follows(self) -> None:
+        self.prepare()
+        content, end = self.frozen_prefix()
+        self.assertGreater(len(content), 65536)  # (a part would be due)
+        with mock.patch.object(r1_recorder, "PREFIX_MIN_BYTES_PER_SECOND", 1000):
+            self.worker._periodic()
+        (put,) = self.api.puts
+        self.assertIn("/video?", put["url"])
+        self.assertEqual(put["body"], content[:end], "cut at the last whole fragment")
+        self.assertEqual(put["total"], end / 1000, "the timeout scales with the size")
+        self.assertEqual(self.api.bodies("object-url"), [{"kind": "video"}])
+        self.assertEqual((self.worker.prefix_uploaded, self.worker.prefix_bytes), (True, end))
+        self.assertFalse(self.worker.faststart_uploaded)
+        for _ in range(3):
+            self.clock.advance(20)
+            self.worker._periodic()
+        self.assertEqual(self.api.bodies("part-url"), [], "no part is cut once the prefix is up")
+        self.spool.ogg_path.write_bytes(b"OggS" + b"q" * 300)
+        result = self.worker.job_tail(mp4=True, final_ogg=True, split=True, deadline=self.clock() + 100.0)
+        self.assertEqual(result, {"uploading": True, "mp4": True, "ogg": True})
+        self.assertEqual(self.api.bodies("part-url"), [], "nor at the finish")
+        self.assertEqual(len([p for p in self.api.puts if "/video?" in p["url"]]), 1)
+
+    def test_a_prefix_over_the_cap_or_without_a_whole_fragment_leaves_the_multipart_as_the_path(self) -> None:
+        for reason in ("too_large", "no_fragment"):
+            with self.subTest(reason):
+                self.setUp()
+                self.prepare()
+                if reason == "too_large":
+                    _content, end = self.frozen_prefix()
+                    patch = mock.patch.object(r1_recorder, "PREFIX_MAX_BYTES", end - 1)
+                else:
+                    self.worker._prefix_ready = lambda: True
+                    self.lay(65536 * 2 + 10)  # no ftyp, no fragment: nothing that opens on its own
+                    patch = contextlib.nullcontext()
+                with patch, captured_logs() as lines:
+                    self.worker._periodic()
+                    self.worker._periodic()
+                self.assertEqual([p for p in self.api.puts if "/video?" in p["url"]], [])
+                self.assertGreaterEqual(self.worker.parts_done, 1)
+                self.assertFalse(self.worker.prefix_uploaded)
+                self.assertEqual([(l["error_type"], l["error_category"]) for l in lines], [("r1_rec_prefix_skipped", reason)])
+
+    def test_a_failing_prefix_waits_the_cooldown_between_rounds_and_the_finish_tries_once_more(self) -> None:
+        self.prepare()
+        content, end = self.frozen_prefix(fragments=1, tail=0)  # smaller than a part: nothing else is due
+        self.api.put_status = lambda url: 500 if "/video?" in url else None
+        self.worker._periodic()
+        self.assertEqual(len(self.api.puts), 4, "one round: a try and three retries")
+        self.worker._periodic()
+        self.assertEqual(len(self.api.puts), 4, "inside the cooldown")
+        for _ in range(r1_recorder.PREFIX_MAX_ROUNDS + 2):
+            self.clock.advance(16)
+            self.worker._periodic()
+        self.assertEqual(len(self.api.puts), 4 * r1_recorder.PREFIX_MAX_ROUNDS, "the rounds are capped mid-call")
+        self.assertEqual(len(self.api.bodies("object-url")), 4 * r1_recorder.PREFIX_MAX_ROUNDS)
+        self.assertFalse(self.worker.prefix_uploaded)
+        self.assertEqual((self.worker.state, self.stops, self.discards), ("uploading", [], []))
+        self.api.put_status = None
+        result = self.worker.job_tail(mp4=True, final_ogg=False, split=True, deadline=self.clock() + 100.0)
+        self.assertEqual(result, {"uploading": True, "mp4": True, "ogg": False})
+        self.assertEqual(self.api.puts[-1]["body"], content[:end])
+        self.assertTrue(self.worker.prefix_uploaded)
 
 
 # ------------------------------------------------------------------------------ http
@@ -2117,6 +2270,24 @@ class TestFinish(RecorderCase):
         (body,) = self.api.bodies("complete")
         self.assertEqual(body["failure_reason"], "upload_failed")
         self.assertEqual(body["layout"], "combined")
+
+    async def test_a_multipart_that_is_gone_still_leaves_the_final_ogg_and_the_faststart_copy(self) -> None:
+        """The multipart upload vanished under a live call: the stream can no longer be completed, so
+        the finish sends the whole OGG as well, and the faststart copy is still the MP4."""
+        self.api.put_status = lambda url: 404 if "/part?" in url and "partNumber=1&" not in url else None
+        self.lay_stream(65536 * 2 + 100)
+        recorder = await self.started()
+        await until(lambda: recorder._worker.multipart_gone)
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        self.assertEqual([b["part_number"] for b in self.api.bodies("part-url")], [1, 2])
+        self.assertEqual(self.api.bodies("object-url"), [{"kind": "audio"}, {"kind": "video"}])
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["failure_reason"]), ("combined", "upload_failed"))
+        self.assertTrue(body["report"]["audio_final_uploaded"])
+        self.assertTrue(body["report"]["faststart_uploaded"])
+        self.assertNotIn("prefix_uploaded", body["report"])
+        self.assertIsNone(recorder._stop_reason)
 
     async def test_stop_and_finish_are_idempotent(self) -> None:
         self.lay_stream()
@@ -3316,6 +3487,10 @@ class TestEncoderLossWithPicture(VideoCase):
                          bytes((i * 7) % 251 for i in range(150_000)))
         self.assertIn({"kind": "audio"}, self.api.bodies("object-url"))
         self.assertFalse(self.encoder.eof_sent)
+        # These bytes hold no whole fragment, so nothing opens on its own: the multipart stays the path.
+        self.assertNotIn({"kind": "video"}, self.api.bodies("object-url"))
+        self.assertIs(body["report"]["prefix_uploaded"], False)
+        self.assertEqual(body["report"]["stream_bytes"], 150_000)  # what the dead child left on disk
 
     async def test_a_crash_before_any_picture_is_audio_only(self) -> None:
         recorder = await self.running(pictures=0)
@@ -3367,6 +3542,149 @@ class TestEncoderLossWithPicture(VideoCase):
             await asyncio.wait_for(recorder.finish(), 20)
         (body,) = self.api.bodies("complete")
         self.assertEqual((body["layout"], body["has_video"]), ("split", True))
+
+
+class TestFrozenPrefix(VideoCase):
+    """Incident 482cb480: the encoder was lost with about four minutes of picture on disk, the multipart
+    upload carrying it was gone by the hang-up, and the recording ended up audio-only.  The frozen
+    prefix, cut at its last whole fragment, now goes up on its own as the ``video`` object."""
+
+    async def running(self) -> R1Recorder:
+        recorder = await self.started()
+        stream = await self.camera_on()
+        await self.show(stream, 3)
+        await self.ready(recorder)
+        return recorder
+
+    def lay_fmp4(self, fragments: int, *, tail: int = 3000) -> tuple[bytes, int]:
+        content, end = fmp4(fragments, tail=tail)
+        (self.spool.dir / "stream.mp4").write_bytes(content)
+        return content, end
+
+    def crash(self, recorder: R1Recorder) -> None:
+        self.encoder.exited.set()
+        recorder._check_encoder()
+        self.assertEqual(recorder.encoder_lost, "encoder_crashed")
+
+    def put_indexes(self, marker: str) -> list[int]:
+        return [index for index, put in enumerate(self.api.puts) if marker in put["url"]]
+
+    async def test_the_frozen_prefix_goes_up_mid_call_as_the_video_object_and_no_tail_part_follows(self) -> None:
+        recorder = await self.running()
+        content, end = self.lay_fmp4(6)
+        await until(lambda: recorder._worker.parts_done == 1)  # part 1 went up while the encoder was well
+        self.crash(recorder)
+        await until(lambda: recorder._worker.prefix_uploaded)  # mid-call: no finish has begun
+        (video,) = [put for put in self.api.puts if "/video?" in put["url"]]
+        self.assertEqual(video["body"], content[:end], "the stream cut at its last whole fragment")
+        self.assertLess(end, len(content))
+        recorder.stop(None)
+        await asyncio.wait_for(recorder.finish(), 20)
+        self.assertEqual(len(self.put_indexes("/part?")), 1, "no tail part at the finish")
+        self.assertEqual([b["part_number"] for b in self.api.bodies("part-url")], [1])
+        self.assertEqual(len(self.put_indexes("/video?")), 1)
+        self.assertLess(self.put_indexes("/video?")[0], self.put_indexes("/audio?")[0])
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["has_video"], body["failure_reason"]), ("split", True, "encoder_crashed"))
+        report = body["report"]
+        self.assertEqual((report["prefix_uploaded"], report["prefix_bytes"]), (True, end))
+        self.assertFalse(report["faststart_uploaded"], "the prefix is not the faststart copy")
+        self.assertEqual((report["stream_bytes"], report["parts_uploaded"]), (len(content), 1))
+        self.assertTrue(report["audio_final_uploaded"])
+        self.assertFalse(self.spool.dir.exists())
+
+    async def test_part_urls_that_answer_404_end_the_multipart_and_the_finish_still_ships_both_halves(self) -> None:
+        self.api.put_status = lambda url: 404 if "/part?" in url and "partNumber=1&" not in url else None
+        with captured_logs() as lines:
+            recorder = await self.running()
+            content, end = self.lay_fmp4(10)  # about 200 KB: three whole parts are due mid-call
+            await until(lambda: recorder._worker.multipart_gone)
+            stuck = self.encoder
+            stuck.send_eof = lambda: stuck.events.append("enc.eof") or True  # ... and the child hangs at the end
+            recorder.stop(None)
+            with mock.patch.object(r1_recorder, "ENCODER_CLOSE_WAIT_SECONDS", 0.3):
+                await asyncio.wait_for(recorder.finish(), 20)
+        self.assertEqual([b["part_number"] for b in self.api.bodies("part-url")], [1, 2], "no retry, no part 3")
+        self.assertEqual(len(self.put_indexes("/part?")), 2)
+        self.assertEqual([l for l in lines if l["error_type"] == "r1_rec_upload_retry"], [], "no retry storm")
+        self.assertNotIn("r1_rec_abandoned", [l["error_type"] for l in lines])
+        self.assertIsNone(recorder._stop_reason)
+        (ogg,) = self.put_indexes("/audio?")
+        (video,) = self.put_indexes("/video?")
+        self.assertLess(ogg, video, "the OGG, the whole call, goes first")
+        self.assertEqual(self.api.puts[video]["body"], content[:end])
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["has_video"], body["failure_reason"]), ("split", True, "encoder_crashed"))
+        self.assertEqual(body["report"]["stream_bytes"], len(content), "what is on disk")
+        self.assertEqual((body["report"]["prefix_uploaded"], body["report"]["prefix_bytes"]), (True, end))
+        self.assertTrue(body["report"]["audio_final_uploaded"])
+
+    async def test_a_failing_prefix_is_tried_again_after_the_cooldown_and_once_more_at_the_finish(self) -> None:
+        failing = {"on": True}
+        self.api.put_status = lambda url: 500 if failing["on"] and "/video?" in url else None
+        recorder = await self.running()
+        content, end = self.lay_fmp4(2)  # smaller than a part: nothing else wants the thread
+        worker = recorder._worker
+        with captured_logs() as lines:
+            self.crash(recorder)
+            await until(lambda: worker._prefix_rounds == 1)  # round 1: a try and three retries
+            self.assertEqual(len(self.put_indexes("/video?")), 4)
+            await asyncio.sleep(1.2)  # a couple of periodic rounds inside the cooldown
+            self.assertEqual(len(self.put_indexes("/video?")), 4)
+            self.clock.advance(16)
+            await until(lambda: worker._prefix_rounds == 2)  # round 2, once the cooldown is over
+            self.assertEqual(len(self.put_indexes("/video?")), 8)
+            failing["on"] = False
+            recorder.stop(None)
+            await asyncio.wait_for(recorder.finish(), 20)
+        videos = self.put_indexes("/video?")
+        self.assertEqual(len(videos), 9, "two rounds mid-call, then one more try at the finish")
+        self.assertLess(self.put_indexes("/audio?")[-1], videos[-1], "at the finish, after the OGG")
+        self.assertEqual(self.api.puts[videos[-1]]["body"], content[:end])
+        retried = {l["error_category"] for l in lines if l["error_type"] == "r1_rec_upload_retry"}
+        self.assertEqual(retried, {"object_video"})
+        (body,) = self.api.bodies("complete")
+        self.assertEqual((body["layout"], body["report"]["prefix_uploaded"]), ("split", True))
+
+    async def test_a_discard_or_stop_answer_to_the_prefix_still_halts_everything(self) -> None:
+        for reply, verdict in (
+            (ApiReply(409, {"error": "r1_consent_withdrawn"}, "r1_consent_withdrawn"), "discard"),
+            (ApiReply(409, {"error": "r1_session"}, "r1_session"), "stop"),
+        ):
+            with self.subTest(verdict=verdict):
+                await self.asyncSetUp()
+                recorder = await self.running()
+                self.lay_fmp4(2)
+                self.api.script("object-url", reply)  # the first object URL asked for is the prefix's
+                self.crash(recorder)
+                if verdict == "discard":
+                    await until(lambda: recorder.discarded == "consent_withdrawn")
+                    await until(lambda: not self.spool.dir.exists())
+                else:
+                    await until(lambda: recorder._stop_reason == "session")
+                calls = list(self.api.calls)
+                recorder.stop(None)
+                await asyncio.wait_for(recorder.finish(), 10)
+                self.assertEqual(self.api.calls, calls, "no call after the verdict, not even complete")
+                self.assertEqual(self.api.bodies("object-url"), [{"kind": "video"}])
+                self.assertEqual(self.api.puts, [])
+                self.assertFalse(recorder._worker.prefix_uploaded)
+                self.assertFalse(self.spool.dir.exists())
+
+    async def test_the_finished_line_counts_the_call_on_the_clock_when_the_child_never_closed(self) -> None:
+        recorder = await self.running()
+        self.lay_fmp4(2)
+        self.crash(recorder)
+        await until(lambda: recorder._worker.prefix_uploaded)
+        self.clock.advance(90.0)
+        with captured_logs() as lines:
+            recorder.stop(None)
+            await asyncio.wait_for(recorder.finish(), 20)
+        (finished,) = [l for l in lines if l["error_type"] == "r1_rec_finished"]
+        (body,) = self.api.bodies("complete")
+        self.assertEqual(finished["error_category"], "split")
+        self.assertEqual(finished["duration_sec"], 90)  # (it used to say 0: the child never closed)
+        self.assertEqual(body["report"]["duration_ms"] // 1000, finished["duration_sec"])
 
 
 class TestPictureReport(VideoCase):
@@ -3899,21 +4217,44 @@ class TestPictureWithTheRealEncoder(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(body["report"]["camera_off_ms"], 2000)
 
     async def test_a_dead_encoder_mid_call_ships_the_prefix_with_the_picture_and_the_whole_ogg(self) -> None:
+        """Changed on purpose (incident 482cb480).  This used to assert that NO ``video`` object went up
+        ("no faststart copy of a cut-off file") and decoded the prefix from the multipart parts alone;
+        the session then lost its picture when that multipart upload was gone by the hang-up.  The
+        frozen prefix, cut at its last whole fragment, now goes up as exactly one ``video`` object while
+        the call is still going (no faststart remux: the cut file is already playable), and no part
+        follows it."""
+        import r1_video_encoder
+
         recorder, encoder = await self.start_recorder()
         call = asyncio.ensure_future(self.run_call(recorder, 9.0, audio_present=lambda tick: True))
         await asyncio.sleep(4.0)
         encoder._proc.kill()  # kill -9 the child
         await until(lambda: recorder.encoder_lost is not None, timeout=5)
+        await until(lambda: recorder._worker.prefix_uploaded, timeout=10)  # mid-call, not at the finish
         await call
-        body, prefix = await self.finish_and_rebuild(recorder)
+        body, _parts = await self.finish_and_rebuild(recorder)
         self.assertEqual((body["layout"], body["has_video"], body["failure_reason"]), ("split", True, "encoder_crashed"))
         self.assertTrue(body["report"]["audio_final_uploaded"])
         self.assertTrue(any(p["content_type"] == "audio/ogg" and "/audio?" in p["url"] for p in self.api.puts))
         self.assertEqual(self.pub.subscribe_calls, [True, False])
-        pictures = _pictures(prefix)  # the cut-off file still opens and decodes
+        indexes = [i for i, p in enumerate(self.api.puts) if "/video?" in p["url"]]
+        self.assertEqual(len(indexes), 1, "exactly one standalone copy of the frozen prefix")
+        self.assertFalse(any("/part?" in p["url"] for p in self.api.puts[indexes[0]:]), "no part after it")
+        data = self.api.puts[indexes[0]]["body"]
+        self.assertEqual((body["report"]["prefix_uploaded"], body["report"]["prefix_bytes"]), (True, len(data)))
+        self.assertGreaterEqual(body["report"]["stream_bytes"], len(data))
+        prefix = Path(self._tmp.name) / "prefix.mp4"
+        prefix.write_bytes(data)
+        self.assertEqual(r1_video_encoder.mp4_fragment_end(prefix), len(data), "it ends on a fragment boundary")
+        pictures = _pictures(prefix)  # the cut-off file opens and decodes ...
         self.assertGreater(len(pictures), 20)
         self.assertLess(max(at for at, _ in pictures), 5.5)
-        self.assertFalse(any("/video?" in p["url"] for p in self.api.puts), "no faststart copy of a cut-off file")
+        with av.open(str(prefix)) as container:  # ... to its very end: every packet, both streams
+            video_packets = sum(1 for p in container.demux(container.streams.video[0]) if p.size)
+        with av.open(str(prefix)) as container:
+            samples = sum(frame.samples for frame in container.decode(container.streams.audio[0]))
+        self.assertEqual(len(pictures), video_packets)
+        self.assertGreater(samples / RATE, 1.5)
 
 
 if __name__ == "__main__":

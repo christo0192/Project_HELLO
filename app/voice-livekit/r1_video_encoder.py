@@ -31,6 +31,9 @@ Two spool writers share the file name ``stream.mp4``:
   the fixed canvas, so a 4:3 webcam, a portrait phone and a 320x180 stream all land alike.
   Both streams count from the same ``t0`` (the ``HELLO`` ``t0_us``), which is what keeps the
   picture and the voices in step.
+
+``mp4_fragment_end`` is for the other end of a ``kill -9``: the recorder uses it to cut the frozen
+spool of a dead child at its last whole fragment before shipping it on its own.
 """
 from __future__ import annotations
 
@@ -744,6 +747,53 @@ def remux_faststart(source: Path, target: Path) -> int:
             outgoing.close()
         incoming.close()
     return target.stat().st_size
+
+
+def mp4_fragment_end(path: str | os.PathLike[str]) -> int:
+    """The byte offset just past the last complete ``moof`` + ``mdat`` pair of a fragmented MP4.
+
+    A spool whose writer died is a valid prefix up to its last flushed fragment, possibly followed by
+    the start of one that never finished; ``data[:mp4_fragment_end(path)]`` is the part that opens and
+    decodes to its end.  Only the top-level box headers are read, never the media: 8 bytes (size,
+    type), a size of 1 meaning a 64-bit size follows.  The walk stops at a size of 0 ("to the end of
+    the file": nothing says that box is complete), at a size smaller than its own header, at a box
+    that runs past the end of the file and at a header cut short.  The file must open with ``ftyp``
+    and a fragment counts only after the ``moov``.  0 means there is no whole fragment to ship.
+    """
+    try:
+        with open(path, "rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            pos = 0
+            end = 0
+            seen_moov = False
+            in_fragment = False
+            while pos + 8 <= size:
+                handle.seek(pos)
+                header = handle.read(16)
+                if len(header) < 8:
+                    break
+                box_size, kind = struct.unpack(">I4s", header[:8])
+                header_size = 8
+                if box_size == 1:
+                    if len(header) < 16:
+                        break
+                    box_size = struct.unpack(">Q", header[8:16])[0]
+                    header_size = 16
+                if box_size < header_size or pos + box_size > size:
+                    break  # (a size of 0 is below any header size, so it stops here too)
+                if pos == 0 and kind != b"ftyp":
+                    return 0
+                if kind == b"moov":
+                    seen_moov = True
+                elif kind == b"moof":
+                    in_fragment = seen_moov
+                elif kind == b"mdat" and in_fragment:
+                    end = pos + box_size
+                    in_fragment = False
+                pos += box_size
+    except OSError:
+        return 0
+    return end
 
 
 # ---------------------------------------------------------------------------- process loop

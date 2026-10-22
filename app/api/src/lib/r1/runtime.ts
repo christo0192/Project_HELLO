@@ -427,7 +427,15 @@ function createStorageLane(deps: R1StorageLaneDeps): R1StorageLane {
         enqueue: storageEnqueue,
         now: clock,
         log: (category) => logger.warn('unknown_event', { error_category: category }),
-        onResult: () => logger.info('unknown_event', { error_category: 'r1_sweep_done' }),
+        onResult: (report) => {
+          logger.info('unknown_event', { error_category: 'r1_sweep_done' });
+          // Every multipart upload the orphan scan aborted, as a count only (never a key or an upload
+          // id; the logger has no count field, so `error_type` carries the number as text). An abort
+          // of an upload a recording still needed is most likely how session 482cb480 lost its video
+          // (2026-10-21).
+          const aborted = report.stale.orphan_uploads_aborted;
+          if (aborted > 0) logger.warn('unknown_event', { error_category: 'r1_sweep_orphan_aborted', error_type: String(aborted) });
+        },
       }),
     },
     owner: `${owner}-storage`,

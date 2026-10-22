@@ -41,6 +41,8 @@ interface Fixture {
   store: MemoryR1ObjectStore;
   deps: R1FinalizeDeps;
   enqueued: Array<{ name: string; payload: any; options: any }>;
+  /** The categories finalize logged (`deps.log`). */
+  logs: string[];
   row: Row;
   uploadId: string | null;
   /** Store calls made by the fixture itself; everything after is the code under test. */
@@ -97,14 +99,16 @@ async function fixture(options: {
   };
   tables.interview_round_recordings!.push(row);
   const enqueued: Fixture['enqueued'] = [];
+  const logs: string[] = [];
   const deps: R1FinalizeDeps = {
     db: db.client as never,
     store,
     maxBytes: options.maxBytes ?? 400 * MIB,
     now: () => new Date(START_MS),
     enqueue: async (name, payload, enqueueOptions) => { enqueued.push({ name, payload, options: enqueueOptions }); },
+    log: (category) => { logs.push(category); },
   };
-  return { db, store, deps, enqueued, row, uploadId, setupCalls: store.calls.length };
+  return { db, store, deps, enqueued, logs, row, uploadId, setupCalls: store.calls.length };
 }
 
 let originalSink: ReturnType<typeof getAuditSink>;
@@ -357,6 +361,7 @@ describe('finalizeRecording: crash salvage and damaged uploads', () => {
     f.row.upload_id = 'mem-upload-already-gone';
     expect(await finalizeRecording(f.deps, ROOM_SESSION)).toMatchObject({ kind: 'finalized', status: 'ready' });
     expect(f.db.tables.interview_round_recordings![0]).toMatchObject({ upload_id: null, video_key: KEYS.stream });
+    expect(f.logs).toEqual([]); // stream.mp4 is there: nothing was lost
   });
 
   it('a stream.mp4 that is not an MP4 is not a deliverable (failed / integrity, objects left for the erase job)', async () => {
@@ -396,6 +401,66 @@ describe('finalizeRecording: crash salvage and damaged uploads', () => {
 
     const exact = await fixture({ parts: [mp4(5 * MIB), plain(2 * MIB)], row: { reported_stream_bytes: 7 * MIB } });
     expect(await finalizeRecording(exact.deps, ROOM_SESSION)).toMatchObject({ status: 'ready' });
+  });
+});
+
+describe('finalizeRecording: the multipart upload was aborted by somebody else (incident 2026-10-21, session 482cb480)', () => {
+  // The incident row: av, the picture given up at 240.7 s, then the encoder lost; part 1 reached R2, the
+  // upload was aborted before hang-up (most likely by the sweep), and the worker claimed `split`.
+  const INCIDENT = { layout: 'split', has_video: true, failure_reason: 'encoder_crashed', degraded_reason: 'cpu_loop_lag', reported_parts: 1 } as const;
+
+  async function abortedUpload(objects: NonNullable<Parameters<typeof fixture>[0]>['objects']): Promise<Fixture> {
+    const f = await fixture({ parts: [mp4(5 * MIB, 1), plain(1 * MIB, 2)], objects, row: INCIDENT });
+    await f.store.abortMultipart(KEYS.stream, f.uploadId!);
+    f.setupCalls = f.store.calls.length;
+    return f;
+  }
+
+  it('a split claim with the crashed encoder\'s prefix as video.mp4 beside audio.ogg finalizes split WITH video, and the loss is logged', async () => {
+    const video = mp4(7 * MIB, 9);
+    const f = await abortedUpload({ video, audio: ogg(4000), audioPartial: ogg(3000) });
+    expect(await finalizeRecording(f.deps, ROOM_SESSION)).toEqual({ kind: 'finalized', status: 'partial', layout: 'split' });
+    expect(f.db.tables.interview_round_recordings![0]).toMatchObject({
+      status: 'partial', layout: 'split', has_video: true, failure_reason: 'encoder_crashed', degraded_reason: 'cpu_loop_lag',
+      upload_id: null,
+      video_key: KEYS.video, video_bytes: 7 * MIB, video_sha256: sha(video), video_content_type: 'video/mp4',
+      audio_key: KEYS.audio, audio_bytes: 4000, audio_sha256: sha(ogg(4000)),
+    });
+    expect(f.store.objectKeys().sort()).toEqual([KEYS.audio, KEYS.video].sort()); // the checkpoint is transient
+    expect(f.store.callsOf('completeMultipart')).toHaveLength(0);
+    // The stream.mp4 parts are gone even though video.mp4 rescued the picture: still worth a line.
+    expect(f.logs).toEqual(['r1_recording_upload_missing']);
+  });
+
+  it('without video.mp4 (what production had) it is still audio_only without video, but no longer silent', async () => {
+    const f = await abortedUpload({ audio: ogg(4000), audioPartial: ogg(3000) });
+    expect(await finalizeRecording(f.deps, ROOM_SESSION)).toEqual({ kind: 'finalized', status: 'partial', layout: 'audio_only' });
+    expect(f.db.tables.interview_round_recordings![0]).toMatchObject({
+      status: 'partial', layout: 'audio_only', has_video: false, failure_reason: 'encoder_crashed',
+      upload_id: null, video_key: null, audio_key: KEYS.audio,
+    });
+    expect(f.logs).toEqual(['r1_recording_upload_missing']);
+  });
+
+  it('checks before it clears the id: a transient HEAD failure retries the check, and the line is written once', async () => {
+    const f = await abortedUpload({ audio: ogg(4000) });
+    f.store.failNext('head', 'unavailable'); // the stream.mp4 HEAD inside the settle step
+    await expect(finalizeRecording(f.deps, ROOM_SESSION)).rejects.toThrow('r1_storage_unavailable');
+    expect(f.db.tables.interview_round_recordings![0]).toMatchObject({ status: 'finishing', upload_id: f.uploadId });
+    expect(f.logs).toEqual([]);
+    expect(await finalizeRecording(f.deps, ROOM_SESSION)).toEqual({ kind: 'finalized', status: 'partial', layout: 'audio_only' });
+    expect(f.logs).toEqual(['r1_recording_upload_missing']);
+  });
+
+  it('by default the line is a warn of the r1-recording logger carrying the category only', async () => {
+    const f = await abortedUpload({ audio: ogg(4000) });
+    const lines: string[] = [];
+    vi.spyOn(console, 'warn').mockImplementation((line: unknown) => { lines.push(String(line)); });
+    const { log: _injected, ...deps } = f.deps;
+    expect(await finalizeRecording(deps, ROOM_SESSION)).toMatchObject({ kind: 'finalized', layout: 'audio_only' });
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0]!)).toMatchObject({ level: 'warn', component: 'r1-recording', error_category: 'r1_recording_upload_missing' });
+    for (const secret of [f.uploadId!, ROOM_SESSION, ROOM_ROUND, 'r1/', 'mem-upload']) expect(lines[0]).not.toContain(secret);
   });
 });
 

@@ -148,7 +148,7 @@
 | D7 | Persona gender | All 4 personas are women (single female voice) | PR-4b |
 | D8 | On-screen phase label and lead card | Yes, for accessibility and task clarity; the voice is unchanged | PR-6 |
 | D9 | Model id | `R1_LLM_MODEL=deepseek-flash` | PR-4a |
-| D10 | Browser VM | **performance-2x mandatory for v1** (about +$1/month at 40 R1); perf-1x only with production evidence | PR-9b |
+| D10 | Browser VM | **performance-2x mandatory for v1** (about +$1/month at 40 R1); perf-1x only with production evidence. *2026-10-22 note:* the browser-voice VM is **performance-4x** (4 vCPU / 8192 MB) since PR #377, because in-worker video recording failed S0-C on performance-2x (session 482cb480, 2026-10-21: `cpu_loop_lag`, then `encoder_crashed`; ADR-0016). Fly has no 3-vCPU performance size; cost still applies only while a machine runs. | PR-9b, PR #377 |
 | D11 | Live R1 transcripts on the official DeepSeek API (PRC processing, no DPA, PRC law) | A **Legal gate**: staff dry-run use is approved before Stage A, candidates before Stage B. If Legal refuses, the owner chooses: a self-hosted or gateway DeepSeek (the original intent of D-004), or a pause. | Stage A |
 | D12 | When legacy browser screening is retired | **Before Stage A** (PR-L, early November). Prerequisite: read-only SQL shows negligible use. | PR-L |
 | D13 | Sarvam plan tier (rate limits are per account and shared with phone) | If on Starter (30 TTS req/min, 20 concurrent STT), upgrade before Stage B, or confirm by measurement that phone plus one R1 fits | Stage B |

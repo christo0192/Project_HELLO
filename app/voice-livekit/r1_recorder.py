@@ -12,8 +12,10 @@ What it records, and where it goes (binding contract C1-C11, ``IMPLEMENTER-RULES
   picture up (never the audio) when the machine is struggling.
 * One uploader thread talks to the API (``/api/internal/r1/recording/{prepare,part-url,
   object-url,complete}``) and PUTs to the presigned URLs it returns: 5 MiB parts cut from the
-  growing MP4, and the whole OGG every ``checkpoint_interval_sec``.  The worker holds no R2
-  credential, ever.
+  growing MP4, and the whole OGG every ``checkpoint_interval_sec``.  When the encoder is lost after
+  the camera delivered, the MP4 it left is frozen: cut at its last whole fragment, it goes up as one
+  ``video`` object while the call is still going, and no further part is cut.  The worker holds no
+  R2 credential, ever.
 * ``stop()`` (sync, from ``_begin_exit``) closes capture and starts the finish, which has its
   own deadline carved out of the interview's shared exit budget, so it overlaps the
   transcript drain.  ``finish()`` (async, from ``_exit``) only waits for it.
@@ -103,6 +105,14 @@ IO_START_WAIT_SECONDS = 3.0
 TEE_DRAIN_WAIT_SECONDS = 2.0
 COMPLETE_RESERVE_SECONDS = 3.0
 FASTSTART_MIN_REMAINING_SECONDS = 8.0
+# The frozen MP4 of a lost encoder goes up as one ``video`` object (the faststart copy's key, which
+# finalize prefers).  It is read into memory whole, so above this the multipart upload stays the path.
+PREFIX_MAX_BYTES = 128 * 1024 * 1024
+# Its PUT may take as long as this slowest acceptable rate needs (never less than any other call) ...
+PREFIX_MIN_BYTES_PER_SECOND = 256 * 1024
+# ... and the call tries it this many rounds, each up to four of the recording's 400 presigned URLs
+# (the API's cap, after which every URL request is a stop); the finish tries once more.
+PREFIX_MAX_ROUNDS = 8
 # A tee gap smaller than this is rounding, not a rejoin gap (see ``TeeMixer``).
 GAP_SLACK_SECONDS = 0.25
 # Peak amplitude (16-bit LSBs) of what counts as silence at the front of a chunk that is ahead of the
@@ -160,6 +170,9 @@ DISCARD = "discard"
 STOP = "stop"
 FAILED = "failed"
 ABORTED = "aborted"
+# A presigned part URL answered 404 (NoSuchUpload): the multipart upload no longer exists.  Terminal
+# for the parts, and for nothing else: it is R2 talking, not the API's stop answer.
+GONE = "gone"
 
 
 def _error_type_of(exc: BaseException) -> str:
@@ -1398,6 +1411,16 @@ class UploadWorker:
     then picks the job up.  What was cut is not lost: a part advances the cursor only after its
     200, so the finish's tail job uploads the same part again (a part number can be PUT twice;
     the second replaces the first).
+
+    Two ways the multipart stops being the MP4's path:
+
+    * ``prefix_ready`` (the encoder is lost, its prefix holds the picture and the child has exited):
+      the file can no longer change, so periodic work PUTs it, cut at its last whole fragment
+      (``mp4_fragment_end``), as the standalone ``video`` object, and cuts no part once that is up.
+      A failed round waits the usual cooldown (at most ``PREFIX_MAX_ROUNDS`` of them); the finish
+      tries once more.  It never depends on the finish window, which a long call cannot rely on.
+    * a part URL that answers 404: the multipart upload is gone (aborted elsewhere).  No part is
+      tried again and no part URL asked for; everything else carries on.
     """
 
     def __init__(
@@ -1412,6 +1435,7 @@ class UploadWorker:
         on_stop: Callable[[str], None],
         mp4_enabled: Callable[[], bool],
         rng: Callable[[], float] = random.random,
+        prefix_ready: Callable[[], bool] | None = None,
     ) -> None:
         self._api = api
         self._http = http_client
@@ -1421,6 +1445,7 @@ class UploadWorker:
         self._on_discard = on_discard
         self._on_stop = on_stop
         self._mp4_enabled = mp4_enabled
+        self._prefix_ready = prefix_ready or (lambda: False)
         self._rng = rng
         self._thread = threading.Thread(target=self._run, daemon=True, name="r1rec_upload")
         self._jobs: queue.Queue[tuple[Callable[[], Any], concurrent.futures.Future[Any]]] = queue.Queue()
@@ -1435,6 +1460,12 @@ class UploadWorker:
         self.checkpoint_uploaded = False
         self.final_ogg_uploaded = False
         self.faststart_uploaded = False
+        self.prefix_uploaded = False
+        self.prefix_bytes = 0
+        self.multipart_gone = False
+        self._prefix_cut: int | None = None  # where the frozen MP4 is cut (None: not worked out yet)
+        self._prefix_rounds = 0
+        self._next_prefix_at = 0.0
         self._next_prepare_at = 0.0
         self._next_parts_at = 0.0
         self._loop_error_logged = False
@@ -1502,9 +1533,12 @@ class UploadWorker:
             if self._clock() >= self._next_prepare_at:
                 self._prepare(deadline=None, interruptible=True)
         elif self.state == "uploading":
-            if self._mp4_enabled() and self._clock() >= self._next_parts_at:
+            if self._prefix_due():
+                self._upload_prefix(deadline=None, interruptible=True)
+            elif self._parts_wanted() and self._clock() >= self._next_parts_at:
                 self._upload_ready_parts(final=False, deadline=None, interruptible=True)
-            self._maybe_checkpoint()
+            if self.state == "uploading":  # (a discard or stop answer above ends everything)
+                self._maybe_checkpoint()
 
     # -- retry machinery
 
@@ -1516,13 +1550,16 @@ class UploadWorker:
         self._halt.wait(delay)
         return self._halt.is_set()
 
-    def _timeouts(self, deadline: float | None) -> tuple[float, float] | None:
+    def _timeouts(self, deadline: float | None, total: float | None = None) -> tuple[float, float] | None:
+        """``(connect, total)`` for one attempt.  ``total`` is what a big body needs (the prefix): it
+        can lengthen a call, never shorten one, and a finish call never runs past ``deadline``."""
+        need = total or 0.0
         if deadline is None:
-            return CONNECT_TIMEOUT_SECONDS, CALL_TIMEOUT_SECONDS
+            return CONNECT_TIMEOUT_SECONDS, max(CALL_TIMEOUT_SECONDS, need)
         remaining = deadline - self._clock()
         if remaining <= 0.05:
             return None
-        return min(CONNECT_TIMEOUT_SECONDS, remaining), min(FINISH_CALL_TIMEOUT_CAP_SECONDS, remaining)
+        return min(CONNECT_TIMEOUT_SECONDS, remaining), min(max(FINISH_CALL_TIMEOUT_CAP_SECONDS, need), remaining)
 
     def _attempts(
         self,
@@ -1530,18 +1567,22 @@ class UploadWorker:
         *,
         deadline: float | None,
         interruptible: bool,
+        label: str,
+        total: float | None = None,
     ) -> tuple[str, Any]:
         """Run ``step`` up to four times (1 s, 3 s, 7 s apart, jittered), within ``deadline``.
 
         ``interruptible`` (periodic work) also lets the finish cut the request in flight: the step
         gets the interrupt event to hand to the HTTP client, and a cut request is ``ABORTED``,
-        never retried (the job that cut it needs the thread).
+        never retried (the job that cut it needs the thread).  ``label`` names the step on the retry
+        line (``prepare``, ``part``, ``object_audio``, ``object_video``, ``complete``); ``total`` is
+        passed to ``_timeouts``.  ``GONE`` is terminal like ``OK``, with no verdict to act on.
         """
         attempts = len(RETRY_DELAYS_SECONDS) + 1
         for attempt in range(attempts):
             if self._halt.is_set() or (interruptible and self._interrupt.is_set()):
                 return ABORTED, None
-            timeouts = self._timeouts(deadline)
+            timeouts = self._timeouts(deadline, total)
             if timeouts is None:
                 return FAILED, None
             try:
@@ -1553,7 +1594,7 @@ class UploadWorker:
                     outcome, value = STOP, "rejected"  # a request that can never succeed
                 else:
                     outcome, value = RETRY, failure.kind
-            if outcome in (OK, DISCARD, STOP):
+            if outcome in (OK, DISCARD, STOP, GONE):
                 if outcome == DISCARD:
                     self._on_discard(value)
                     self.state = "ended"
@@ -1566,7 +1607,7 @@ class UploadWorker:
             delay = RETRY_DELAYS_SECONDS[attempt] * (0.7 + 0.6 * self._rng())
             if deadline is not None and self._clock() + delay >= deadline:
                 break
-            _log.warn("unknown_event", error_type="r1_rec_upload_retry", option_count=attempt + 1)
+            _log.warn("unknown_event", error_type="r1_rec_upload_retry", error_category=label, option_count=attempt + 1)
             if self._wait(delay, interruptible):
                 return ABORTED, None
         return FAILED, None
@@ -1584,7 +1625,7 @@ class UploadWorker:
                 return verdict, reason
             return OK, reply.data
 
-        outcome, value = self._attempts(step, deadline=deadline, interruptible=interruptible)
+        outcome, value = self._attempts(step, deadline=deadline, interruptible=interruptible, label="prepare")
         if outcome != OK:
             if outcome == FAILED:
                 self._next_prepare_at = self._clock() + FAILED_ROUND_COOLDOWN_SECONDS
@@ -1624,11 +1665,12 @@ class UploadWorker:
     def _upload_ready_parts(self, *, final: bool, deadline: float | None, interruptible: bool) -> bool:
         """Upload every complete part (and, when ``final``, the short last one).
 
-        Returns True when nothing is left to upload (always False while the file grows).
+        Returns True when nothing is left to upload (always False while the file grows, and once the
+        multipart upload is gone).
         """
         size = self._stream_size()
         while True:
-            if self.state != "uploading" or self.parts_done >= self.max_parts:
+            if self.state != "uploading" or self.parts_done >= self.max_parts or self.multipart_gone:
                 return False
             available = size - self.cut
             if available >= self.part_size:
@@ -1642,10 +1684,12 @@ class UploadWorker:
                 return False
             number = self.parts_done + 1
             outcome, _ = self._attempts(
-                self._part_step(number, data), deadline=deadline, interruptible=interruptible
+                self._part_step(number, data), deadline=deadline, interruptible=interruptible, label="part"
             )
             if outcome != OK:
-                if outcome == FAILED and not final:
+                if outcome == GONE:
+                    self._lose_multipart()
+                elif outcome == FAILED and not final:
                     # The bytes stay on disk; try again after a pause (the backlog grows meanwhile).
                     self._next_parts_at = self._clock() + FAILED_ROUND_COOLDOWN_SECONDS
                 return False
@@ -1671,19 +1715,98 @@ class UploadWorker:
                 url, data, "application/octet-stream",
                 connect_timeout=limits.connect, total_timeout=limits.total, cancel=limits.cancel,
             )
+            if put.status == 404:
+                return GONE, "no_such_upload"  # no retry can bring the upload id back
             return (OK, None) if put.status == 200 else (RETRY, "put")
 
         return step
 
-    # -- whole objects (OGG checkpoint / final OGG / faststart MP4)
+    def _parts_wanted(self) -> bool:
+        """Periodic work cuts parts: the MP4 is still the multipart's to carry."""
+        return self._mp4_enabled() and not self.prefix_uploaded and not self.multipart_gone
+
+    def _lose_multipart(self) -> None:
+        """A part URL answered 404: the multipart upload no longer exists (aborted elsewhere).
+
+        No part is tried again and no part URL is asked for.  This is not the API's stop answer and
+        does not take its path: the OGG, a ``video`` object and ``complete`` all still go.
+        """
+        if not self.multipart_gone:
+            self.multipart_gone = True
+            _log.warn("unknown_event", error_type="r1_rec_multipart_gone")
+
+    # -- the frozen MP4 prefix (an encoder lost with the picture)
+
+    def _prefix_end(self) -> int:
+        """Where the frozen MP4 is cut: past its last whole fragment (worked out once; the file no
+        longer changes).  0 when it cannot go up on its own: no whole fragment, or over the cap."""
+        if self._prefix_cut is None:
+            end = _wire().mp4_fragment_end(self._spool.stream_path)
+            self._prefix_cut = end if 0 < end <= PREFIX_MAX_BYTES else 0
+            if self._prefix_cut == 0:
+                reason = "too_large" if end > 0 else "no_fragment"
+                _log.warn("unknown_event", error_type="r1_rec_prefix_skipped", error_category=reason)
+        return self._prefix_cut
+
+    def _prefix_wanted(self) -> bool:
+        return not self.prefix_uploaded and self._prefix_ready() and self._prefix_end() > 0
+
+    def _prefix_due(self) -> bool:
+        """Periodic work tries the prefix now: wanted, out of its cooldown, rounds left."""
+        return (
+            self._prefix_rounds < PREFIX_MAX_ROUNDS
+            and self._clock() >= self._next_prefix_at
+            and self._prefix_wanted()
+        )
+
+    def _upload_prefix(self, *, deadline: float | None, interruptible: bool) -> bool:
+        """PUT ``stream.mp4[0:end]`` as the ``video`` object; True once it is up.
+
+        The timeout scales with the size (``PREFIX_MIN_BYTES_PER_SECOND``).  A failed round mid-call
+        waits ``FAILED_ROUND_COOLDOWN_SECONDS``; a request the finish cut costs no round.
+        """
+        end = self._prefix_end()
+        outcome = FAILED
+        if end > 0:
+            data = self._read_range(self._spool.stream_path, 0, end)
+            if len(data) == end:  # (a short read is a failed round like any other)
+                outcome = self._put_data(
+                    "video", data, deadline=deadline, interruptible=interruptible,
+                    total=end / PREFIX_MIN_BYTES_PER_SECOND,
+                )
+        if outcome == OK:
+            self.prefix_uploaded = True
+            self.prefix_bytes = end
+            when = "mid_call" if deadline is None else "finish"
+            _log.info("unknown_event", error_type="r1_rec_prefix_uploaded", error_category=when)
+            return True
+        if outcome == FAILED:
+            self._prefix_rounds += 1
+            self._next_prefix_at = self._clock() + FAILED_ROUND_COOLDOWN_SECONDS
+            _log.warn("unknown_event", error_type="r1_rec_prefix_failed", option_count=self._prefix_rounds)
+        return False
+
+    # -- whole objects (OGG checkpoint / final OGG / faststart MP4 / the frozen prefix)
 
     def _put_object(self, kind: str, path: Path, *, deadline: float | None, interruptible: bool) -> bool:
         try:
             data = path.read_bytes()
         except OSError:
             return False
+        return self._put_data(kind, data, deadline=deadline, interruptible=interruptible) == OK
+
+    def _put_data(
+        self,
+        kind: str,
+        data: bytes,
+        *,
+        deadline: float | None,
+        interruptible: bool,
+        total: float | None = None,
+    ) -> str:
+        """One whole object from memory; the outcome of ``_attempts`` (``FAILED`` for nothing to send)."""
         if not data:
-            return False
+            return FAILED
 
         def step(limits: _Limits) -> tuple[str, Any]:
             reply = self._api.post(
@@ -1703,8 +1826,9 @@ class UploadWorker:
             )
             return (OK, None) if put.status == 200 else (RETRY, "put")
 
-        outcome, _ = self._attempts(step, deadline=deadline, interruptible=interruptible)
-        return outcome == OK
+        label = "object_video" if kind == "video" else "object_audio"
+        outcome, _ = self._attempts(step, deadline=deadline, interruptible=interruptible, label=label, total=total)
+        return outcome
 
     def _maybe_checkpoint(self) -> None:
         now = self._clock()
@@ -1727,20 +1851,40 @@ class UploadWorker:
 
     # -- finish jobs (run on this thread, queued by the recorder's finish)
 
-    def job_tail(self, *, mp4: bool, final_ogg: bool, deadline: float) -> dict[str, Any]:
-        """Last MP4 part and/or the final OGG.  ``{"uploading": bool, "mp4": bool, "ogg": bool}``."""
+    def job_tail(self, *, mp4: bool, final_ogg: bool, deadline: float, split: bool = False) -> dict[str, Any]:
+        """Last MP4 part and/or the final OGG.  ``{"uploading": bool, "mp4": bool, "ogg": bool}``.
+
+        ``split`` (the encoder was lost with the picture): the final OGG goes FIRST, it is the whole
+        call; then the picture half, as the frozen prefix's ``video`` object unless that went up
+        mid-call, and only failing that the multipart tail.  ``mp4`` is True when either delivered it.
+        Without ``split``, a multipart upload that is gone also sends the final OGG: the audio must not
+        hang on a stream that can no longer be completed.
+        """
         if self.state == "preparing":
             self._prepare(deadline=deadline, interruptible=False)
         result = {"uploading": self.state == "uploading", "mp4": False, "ogg": False}
         if self.state != "uploading":
             return result
+        if split:
+            if final_ogg:
+                result["ogg"] = self._final_ogg(deadline)
+            if self.state == "uploading" and self._prefix_wanted():
+                self._upload_prefix(deadline=deadline, interruptible=False)
+            if self.state == "uploading":
+                result["mp4"] = self.prefix_uploaded or (
+                    mp4 and self._upload_ready_parts(final=True, deadline=deadline, interruptible=False)
+                )
+            return result
         if mp4:
             result["mp4"] = self._upload_ready_parts(final=True, deadline=deadline, interruptible=False)
-        if final_ogg and self.state == "uploading":
-            ok = self._put_object("audio", self._spool.ogg_path, deadline=deadline, interruptible=False)
-            self.final_ogg_uploaded = ok
-            result["ogg"] = ok
+        if (final_ogg or (mp4 and self.multipart_gone)) and self.state == "uploading":
+            result["ogg"] = self._final_ogg(deadline)
         return result
+
+    def _final_ogg(self, deadline: float) -> bool:
+        ok = self._put_object("audio", self._spool.ogg_path, deadline=deadline, interruptible=False)
+        self.final_ogg_uploaded = ok
+        return ok
 
     def job_video(self, *, deadline: float) -> bool:
         if self.state != "uploading":
@@ -1761,7 +1905,7 @@ class UploadWorker:
             verdict, reason = classify(reply)
             return verdict, reason
 
-        outcome, _ = self._attempts(step, deadline=deadline, interruptible=False)
+        outcome, _ = self._attempts(step, deadline=deadline, interruptible=False, label="complete")
         return outcome
 
 
@@ -1861,6 +2005,7 @@ class R1Recorder:
             on_stop=self._on_stop,
             mp4_enabled=self._mp4_upload_allowed,
             rng=rng,
+            prefix_ready=self._prefix_ready,
         )
         if encoder is None or encoder.exited.is_set():
             self._encoder_lost = "encoder_unavailable"
@@ -2204,6 +2349,12 @@ class R1Recorder:
         camera = self._camera
         return self._video and camera is not None and camera.taken > 0
 
+    def _prefix_ready(self) -> bool:
+        """The MP4 prefix can go up on its own (asked from the upload thread): the encoder is lost,
+        the prefix holds the picture, and the child has exited, so the file can no longer change."""
+        enc = self._encoder
+        return self._encoder_lost is not None and self._prefix_has_picture() and (enc is None or enc.exited.is_set())
+
     def _check_encoder(self) -> None:
         enc = self._encoder
         if enc is None or self._encoder_lost is not None or enc.closed.is_set():
@@ -2355,6 +2506,8 @@ class R1Recorder:
         mp4_ok = closed and self._encoder_lost is None
         # The encoder died but its prefix holds the picture: ship that MP4 as the video half and the
         # whole OGG as the audio (layout ``split``).  Without a picture the OGG alone carries the call.
+        # The OGG goes first; the video half is the prefix's ``video`` object (usually up since the
+        # loss), else the multipart tail.
         split = (not mp4_ok) and self._prefix_has_picture() and self._stream_bytes() > 0
         enc = self._encoder
         want_fast = (
@@ -2366,7 +2519,9 @@ class R1Recorder:
         if want_fast:
             enc.send_remux()
         tail = await self._run_job(
-            lambda: self._worker.job_tail(mp4=mp4_ok or split, final_ogg=not mp4_ok, deadline=upload_deadline),
+            lambda: self._worker.job_tail(
+                mp4=mp4_ok or split, final_ogg=not mp4_ok, split=split, deadline=upload_deadline
+            ),
             upload_deadline,
         )
         timed_out = tail is None
@@ -2379,7 +2534,9 @@ class R1Recorder:
             self._worker.halt()
             await self._wipe_off_loop(overwrite=False)
             return
-        if want_fast and tail_ok and enc is not None:
+        # A stream whose multipart upload is gone still has its faststart copy to give (the tail job
+        # has sent the final OGG for it too).
+        if want_fast and (tail_ok or self._worker.multipart_gone) and enc is not None:
             remaining = upload_deadline - self._clock()
             if remaining > 0.5 and await self._poll(enc.remuxed.is_set, remaining - 0.5) and enc.remux_bytes:
                 await self._run_job(lambda: self._worker.job_video(deadline=upload_deadline), upload_deadline)
@@ -2399,7 +2556,7 @@ class R1Recorder:
                 "unknown_event",
                 error_type="r1_rec_finished",
                 error_category=layout,
-                duration_sec=int((self._facts.media_ms or 0) // 1000),
+                duration_sec=int((self._media_ms() or 0) // 1000),
             )
         await self._teardown_child()
         self._worker.halt()
@@ -2433,22 +2590,38 @@ class R1Recorder:
         info = self._encoder.closed_info if self._encoder is not None else None
         return not (info is not None and int(info.get("width", 0) or 0) <= 0)  # the child fell back to audio
 
-    def _complete_body(self, *, layout: str, failure: str | None) -> dict[str, Any]:
-        facts = self._facts
+    def _media_ms(self) -> int | None:
+        """The recording's length: what the child said when it closed the MP4, else the call on the
+        clock (``t0`` to the stop), which is what the OGG of a split or audio-only recording holds."""
         enc = self._encoder
-        stream_bytes = facts.stream_bytes
-        media_ms = facts.media_ms
+        media_ms = self._facts.media_ms
         if enc is not None and enc.closed_info:
-            stream_bytes = enc.closed_info.get("bytes", stream_bytes)
             media_ms = enc.closed_info.get("media_ms", media_ms)
         if not media_ms and self._t0 is not None and self._stop_at is not None:
             media_ms = int(max(0.0, self._stop_at - self._t0) * 1000)
+        return media_ms
+
+    def _complete_body(self, *, layout: str, failure: str | None) -> dict[str, Any]:
+        facts = self._facts
+        enc = self._encoder
+        worker = self._worker
+        stream_bytes = facts.stream_bytes
+        media_ms = self._media_ms()
+        if enc is not None and enc.closed_info:
+            stream_bytes = enc.closed_info.get("bytes", stream_bytes)
+        elif stream_bytes is None and (layout == "split" or worker.prefix_uploaded):
+            stream_bytes = self._stream_bytes()  # no closed status (the child died): what it left on disk
         report: dict[str, Any] = {
-            "parts_uploaded": self._worker.parts_done,
-            "faststart_uploaded": self._worker.faststart_uploaded,
-            "audio_final_uploaded": self._worker.final_ogg_uploaded,
-            "audio_partial_uploaded": self._worker.checkpoint_uploaded,
+            "parts_uploaded": worker.parts_done,
+            "faststart_uploaded": worker.faststart_uploaded,
+            "audio_final_uploaded": worker.final_ogg_uploaded,
+            "audio_partial_uploaded": worker.checkpoint_uploaded,
         }
+        if layout == "split":
+            # The video half as one object cut from the frozen MP4 (not the faststart copy).
+            report["prefix_uploaded"] = worker.prefix_uploaded
+            if worker.prefix_uploaded:
+                report["prefix_bytes"] = worker.prefix_bytes
         if facts.started_at_ms:
             report["started_at_ms"] = facts.started_at_ms
         if media_ms and media_ms > 0:
