@@ -107,7 +107,16 @@ kill_timeout = 300
 # to 80 interviews). This file is the source of truth: `fly scale vm` alone is reset by the next
 # deploy. Rollback of the size = these two lines back to 1 / 2048 and a browser-voice deploy.
 # (fly.phone.toml is NOT changed: the phone app stays performance-1x.)
+#
+# performance-4x (2026-10-22): performance-2x was still not enough with camera video on. On the
+# 2026-10-21 owner mock interview (session 482cb480) the recorder's CPU watchdog gave the picture up
+# at 4:00 (`degraded_reason = cpu_loop_lag`), the encoder then crashed (`failure_reason =
+# encoder_crashed`), the partial video never finished uploading, and only the audio was kept; the
+# same call showed a 5.5 s first-audio p95 and replies lost before audio. Fly has no 3-vCPU
+# performance size, so the next step is 4 vCPU at the minimum 2048 MB each (8192). The extra cost
+# again applies only while a machine runs (the app scales to zero between interviews). Rollback =
+# these two lines back to 2 / 4096 and a browser-voice deploy.
 [[vm]]
   cpu_kind = "performance"
-  cpus = 2
-  memory_mb = 4096
+  cpus = 4
+  memory_mb = 8192
