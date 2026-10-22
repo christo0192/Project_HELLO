@@ -1,6 +1,6 @@
 /**
  * Orphaned R1 sessions lapse. Admission counts every live R1 session, across all rounds, against
- * the live R1 limit (`r1_in_flight`; 1 by default, so the slot is global; up to 25 since 0131), so
+ * the live R1 limit (`r1_in_flight`; 1 by default, so the slot is global; up to 15 since 0131), so
  * a created/waiting/in_progress session that no worker owns held its slot forever. The
  * lapse runs in the existing r1-status loop, fails or expires the orphan with a terminal reason
  * far past anything a live session takes, writes ended_at as the LAST ACTIVITY (never now(), which
@@ -583,7 +583,7 @@ describe('the r1-status loop runs it', () => {
   });
 });
 
-describe('a pass stays bounded with many live sessions (0131: up to 25 at once)', () => {
+describe('a pass stays bounded with many live sessions (0131: up to 15 at once)', () => {
   /**
    * A listing that never answers: every probe runs to `dispatchProbeMs`. It records the (fake) time
    * each probe started, so probes that overlap share a start time: the widest group is the overlap.

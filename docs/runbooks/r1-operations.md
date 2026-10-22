@@ -2051,7 +2051,8 @@ subscription is requested (counted in `camera_off_ms`).
 
 ## Concurrent R1 interviews (PR #378)
 
-M019 lets up to 25 R1 interviews run at the same time on the self-hosted SFU. **It ships inert:**
+M019 lets up to 15 R1 interviews run at the same time on the self-hosted SFU (owner cap, 2026-10-22:
+the Sarvam plan's shared STT streams, below, set it; going higher is a new migration plus a plan upgrade). **It ships inert:**
 `max_concurrent_sessions` is 1, both agent-name flags are off and `R1_ASSESSMENT_CONCURRENCY` is 1,
 so admission, dispatch and scoring behave exactly as before until an operator works through the
 rollout below. Every figure here marked "estimate" is unmeasured until the load test.
@@ -2066,7 +2067,7 @@ count is below the **limit**:
 | `r1` (self-hosted SFU) | `least(max_concurrent_sessions, browser worker pool size)`, never below 1 |
 | `cloud` (fallback) | **1**, whatever the setting says (the Cloud Build plan's agent sessions are shared with phone) |
 
-- **The setting.** `r1_settings.max_concurrent_sessions`, 1..25, default 1. Set it with
+- **The setting.** `r1_settings.max_concurrent_sessions`, 1..15, default 1. Set it with
   `PUT /api/admin/r1/settings` and `{"max_concurrent_sessions": N}` (admin; the route audits the
   change). `GET /api/admin/r1/settings` also returns `browser_worker_pool_size`. The settings API
   refuses a limit above 1 (409 `r1_concurrency_needs_machine_names`) until the API env flag
@@ -2126,10 +2127,10 @@ where interview_round_id is not null and status in ('created', 'waiting', 'in_pr
    (`fly deploy infra/livekit-r1 --ha=false --remote-only -a project-hello-r1-rtc-spike`); a
    deploy ends every live room. Pause R1, wait for `live_r1 = 0`, deploy, then run the health,
    UDP-pair, worker-registration and browser smoke checks ("SFU operations and fallback").
-   Signaling at N = 25 is an estimated 100-110 connections (about 3 per room plus one
+   Signaling at N = 15 is an estimated 60-70 connections (about 3 per room plus one
    registration per pool machine). The ICE/TCP 7881 service has no explicit concurrency block,
    so include a forced-TCP client in the load test.
-5. **Load test at 2, 5, 10 and 25.** At each step raise `max_concurrent_sessions` to that number
+5. **Load test at 2, 5, 10 and 15.** At each step raise `max_concurrent_sessions` to that number
    (the pool size caps it anyway), run that many simultaneous staff interviews end to end (join,
    role-play, close, recording, scoring), and hold the step until every gate passes:
 
@@ -2142,16 +2143,16 @@ where interview_round_id is not null and status in ('created', 'waiting', 'in_pr
    | Dispatch | each lease's machine is the one running its job; ending one interview stops only its own machine |
    | API | no proxy queueing or 503 during the joint join (request limit soft 80 / hard 200, `app/api/fly.toml`) |
 
-   Before the 25 step, an SFU-only rehearsal can run synthetic rooms with `lk load-test` (one
+   Before the 15 step, an SFU-only rehearsal can run synthetic rooms with `lk load-test` (one
    640x360 / 500 kbps publisher with audio and one subscriber per room). Rooms are not
    auto-created on this SFU (`auto_create: false`), so create them first (`lk room create`) and
    use load-test room names, never a candidate's.
-6. **Raise `max_concurrent_sessions` stepwise** in production the same way (1, 2, 5, 10, 25), one
+6. **Raise `max_concurrent_sessions` stepwise** in production the same way (1, 2, 5, 10, 15), one
    step per passed load test, and set `R1_ASSESSMENT_CONCURRENCY` (below) from N = 5.
 
 ### Scoring in parallel: `R1_ASSESSMENT_CONCURRENCY`
 
-By default the API scores `r1.assessment` jobs one at a time, so 25 interviews ending together
+By default the API scores `r1.assessment` jobs one at a time, so 15 interviews ending together
 queue their scoring for tens of minutes. `R1_ASSESSMENT_CONCURRENCY` (API secret or `[env]`;
 default 1, clamped to 1..8; a bad value means 1 and never stops the API booting) runs that many
 jobs at once per API process. Parallel jobs never score one interview twice: the 0116 trigger
@@ -2164,12 +2165,15 @@ recording finalize runner still runs one job at a time.
 ### External limits (check before each step up)
 
 - **Sarvam (shared with phone).** The Starter plan allows about 20 concurrent STT streams and
-  30 TTS requests a minute (bulbul:v3) for R1 and phone together. **Upgrade before going above
-  about 15 concurrent R1 interviews**: Pro (₹10,000; 100 STT, 200 TTS a minute) or Business
-  (₹50,000; 1,000 TTS a minute, needed if 25 cold machines fill their line caches at once, about
-  125 TTS requests a minute).
-- **Fly.** (N + 3) x performance-4x is (N + 3) x 4 dedicated vCPU in `sin` (112 at N = 25), plus
-  4 for the SFU and about 12 for the phone pool (about 128 in all). Confirm the org's performance-vCPU quota and machine limit
+  30 TTS requests a minute (bulbul:v3) for R1 and phone together. Each live call holds one STT
+  stream and the phone lane is at most 5 calls (LiveKit Cloud Build plan), which leaves 15 for R1:
+  **that is why the cap is 15.** TTS can bind first: a cold machine fills its line cache with
+  about 5 TTS requests, so more than about 6 interviews STARTING in the same minute can hit the 30
+  a minute; watch `r1_provider_429` at the 10 and 15 steps. If it fires, Pro (₹10,000; 100 STT,
+  200 TTS a minute) removes both limits; going above 15 needs Pro or Business (₹50,000; 1,000 TTS a
+  minute) plus a migration raising the CHECK.
+- **Fly.** (N + 3) x performance-4x is (N + 3) x 4 dedicated vCPU in `sin` (72 at N = 15), plus
+  4 for the SFU and about 12 for the phone pool (about 88 in all). Confirm the org's performance-vCPU quota and machine limit
   (about 50 machines; raised by emailing billing@fly.io) before provisioning.
 - **Budget.** Each admission charges 65 minutes. Set `monthly_cap_minutes` to the intended
   sessions x 65, or admission answers `capacity_exhausted` (see "Capacity settings").
@@ -2186,9 +2190,9 @@ stagger the joins. Real candidates join from their own networks.
 ### Cost per interview (estimate)
 
 - Worker: about 35 minutes of performance-4x in `sin` (about $0.23 an hour), so about $0.13 per
-  interview; 25 at once is about $5.75 an hour.
+  interview; 15 at once is about $3.45 an hour.
 - SFU at performance-4x: about $165-170 a month while it runs (it auto-stops when idle).
-- Stopped pool: disk only, $0.15 per GB per month (about $12.60 a month for 28 machines at 3 GB).
+- Stopped pool: disk only, $0.15 per GB per month (about $8.10 a month for 18 machines at 3 GB).
 - Bandwidth: cents per interview (Asia-Pacific egress $0.04 per GB). DeepSeek scoring and Sarvam
   usage per interview are as today; the Sarvam plan upgrade is the step change.
 

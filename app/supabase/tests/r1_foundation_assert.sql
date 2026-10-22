@@ -2337,7 +2337,7 @@ begin
 end;
 $$;
 
--- 0131 (M019): concurrent R1 sessions. r1_settings.max_concurrent_sessions (default 1, CHECK 1..25)
+-- 0131 (M019): concurrent R1 sessions. r1_settings.max_concurrent_sessions (default 1, CHECK 1..15)
 -- limits live R1 sessions on the self-hosted target to least(max, greatest(P, 1)), where P is the
 -- browser worker pool: voice_worker_leases rows of app project-hello-voice and pipeline browser, in
 -- any state. The Cloud target stays at one slot. Above a limit of 1 a second admission of a live
@@ -2365,7 +2365,7 @@ declare
 begin
   select * into prior from screening_v2.r1_settings where singleton;
 
-  -- The setting: 1 on the shipped row and as the column default, NOT NULL integer, CHECK 1..25.
+  -- The setting: 1 on the shipped row and as the column default, NOT NULL integer, CHECK 1..15.
   perform _r1_tests.assert('0131: max_concurrent_sessions defaults to 1 and the shipped row reads 1',
     coalesce(prior.max_concurrent_sessions = 1, false)
     and coalesce((select column_default = '1' and is_nullable = 'NO' and data_type = 'integer'
@@ -2373,7 +2373,7 @@ begin
                    where table_schema = 'screening_v2' and table_name = 'r1_settings'
                      and column_name = 'max_concurrent_sessions'), false),
     coalesce(prior.max_concurrent_sessions::text, '<null>'));
-  foreach k in array array[0, 26] loop
+  foreach k in array array[0, 16] loop
     refused := null;
     begin
       update screening_v2.r1_settings set max_concurrent_sessions = k where singleton;
@@ -2386,9 +2386,9 @@ begin
         and (select max_concurrent_sessions = 1 from screening_v2.r1_settings where singleton), false),
       coalesce(refused, '<none>'));
   end loop;
-  update screening_v2.r1_settings set max_concurrent_sessions = 25 where singleton;
-  perform _r1_tests.assert('0131: the CHECK accepts its upper bound 25',
-    coalesce((select max_concurrent_sessions = 25 from screening_v2.r1_settings where singleton), false));
+  update screening_v2.r1_settings set max_concurrent_sessions = 15 where singleton;
+  perform _r1_tests.assert('0131: the CHECK accepts its upper bound 15',
+    coalesce((select max_concurrent_sessions = 15 from screening_v2.r1_settings where singleton), false));
   update screening_v2.r1_settings set max_concurrent_sessions = 1 where singleton;
 
   -- Fixtures: six sent, consented rounds of their own candidates, and the noise lease rows that must

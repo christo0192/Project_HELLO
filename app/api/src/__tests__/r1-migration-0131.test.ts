@@ -3,7 +3,7 @@
  * assertions run in supabase-ci (app/supabase/tests/r1_foundation_assert.sql, wired by
  * scripts/test-r1-foundation.sh); these checks keep the migration to exactly what it claims:
  *
- *   - one additive column, r1_settings.max_concurrent_sessions (default 1, CHECK 1..25);
+ *   - one additive column, r1_settings.max_concurrent_sessions (default 1, CHECK 1..15);
  *   - r1_admit_attempt as 0128 VERBATIM except three marked hunks (`-- ▼ 0131 <id>` ...
  *     `-- ▲ 0131 <id>`) and the one 0128 line the gate hunk replaces. Stripping the hunks and
  *     putting that line back must give 0128's body byte for byte (LF-normalised), so a silent
@@ -118,10 +118,10 @@ describe('migration 0131: frame', () => {
 });
 
 describe('migration 0131: the setting', () => {
-  it('adds max_concurrent_sessions as integer NOT NULL default 1 with a named CHECK of 1..25', () => {
+  it('adds max_concurrent_sessions as integer NOT NULL default 1 with a named CHECK of 1..15', () => {
     expect(flat(M0131)).toContain(
       'alter table screening_v2.r1_settings add column if not exists max_concurrent_sessions integer not null default 1 '
-        + 'constraint chk_r1_settings_max_concurrent_sessions check (max_concurrent_sessions between 1 and 25);',
+        + 'constraint chk_r1_settings_max_concurrent_sessions check (max_concurrent_sessions between 1 and 15);',
     );
     expect(M0131).toContain('comment on column screening_v2.r1_settings.max_concurrent_sessions is');
   });
@@ -267,12 +267,12 @@ describe('migration 0131: behavioural assertions', () => {
     const runner = readRepo('../../../../scripts/test-r1-foundation.sh');
     expect(runner).toContain('< "$TESTS/r1_foundation_assert.sql"');
     const assertions = readRepo('../../../supabase/tests/r1_foundation_assert.sql');
-    // The two CHECK refusals share one labelled loop over 0 and 26.
-    expect(assertions).toContain("foreach k in array array[0, 26] loop");
+    // The two CHECK refusals share one labelled loop over 0 and 16.
+    expect(assertions).toContain("foreach k in array array[0, 16] loop");
     expect(assertions).toContain("perform _r1_tests.assert('0131: the CHECK refuses ' || k,");
     for (const label of [
       '0131: max_concurrent_sessions defaults to 1 and the shipped row reads 1',
-      '0131: the CHECK accepts its upper bound 25',
+      '0131: the CHECK accepts its upper bound 15',
       '0131: at the default of 1 a pool of 3 still admits one live R1 session',
       '0131: at the default of 1 a second admission of a live round is still r1_in_flight',
       '0131: max 3 with no registered pool keeps one slot',

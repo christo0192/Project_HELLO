@@ -278,10 +278,10 @@ describe('R1 recruiter routes', () => {
 
     it('refuses a limit above 1 with 409 r1_concurrency_needs_machine_names while BROWSER_REQUIRE_MACHINE_AGENT_NAME is off, and changes nothing', async () => {
       env.browserRequireMachineAgentName = false;
-      for (const value of [2, 25]) {
+      for (const value of [2, 15]) {
         const tables = baseTables();
         tables.r1_settings[0].max_concurrent_sessions = 1;
-        pool(tables, 25);
+        pool(tables, 15);
         const response = await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ max_concurrent_sessions: value, paused: true });
         expect(response.status).toBe(409);
         expect(response.body).toEqual({ error: 'r1_concurrency_needs_machine_names' });
@@ -333,7 +333,7 @@ describe('R1 recruiter routes', () => {
       } finally { failingTables.delete('voice_worker_leases'); }
     });
 
-    it.each([[1, 0], [2, 2], [25, 25], [3, 10]])('accepts %i with %i browser machines, stores it and puts the new value in the audit row', async (value, machines) => {
+    it.each([[1, 0], [2, 2], [15, 15], [3, 10]])('accepts %i with %i browser machines, stores it and puts the new value in the audit row', async (value, machines) => {
       const tables = baseTables();
       tables.r1_settings[0].max_concurrent_sessions = value === 1 ? 4 : 1;
       pool(tables, machines);
@@ -344,7 +344,7 @@ describe('R1 recruiter routes', () => {
       expect(entry?.metadata).toEqual({ resource: 'r1_settings', max_concurrent_sessions: value });
     });
 
-    it.each([[0], [26], [-1], [2.5], ['3'], [''], [null], [true], [[3]], [{ n: 3 }]])('refuses %j with 400 invalid_r1_settings and changes nothing', async (value) => {
+    it.each([[0], [16], [26], [-1], [2.5], ['3'], [''], [null], [true], [[3]], [{ n: 3 }]])('refuses %j with 400 invalid_r1_settings and changes nothing', async (value) => {
       const tables = baseTables();
       tables.r1_settings[0].max_concurrent_sessions = 1;
       pool(tables, 30);
@@ -403,7 +403,7 @@ describe('R1 recruiter routes', () => {
       expect(R1_BROWSER_WORKER_APP).toBe(BROWSER_FLY_APP);
       const migration = readFileSync(path.resolve(here, '../../../supabase/migrations/0131_r1_concurrent_sessions.sql'), 'utf8');
       expect(migration).toContain(`l.app='${R1_BROWSER_WORKER_APP}' and l.pipeline='browser'`);
-      expect(migration).toContain('check (max_concurrent_sessions between 1 and 25)');
+      expect(migration).toContain('check (max_concurrent_sessions between 1 and 15)');
     });
   });
 

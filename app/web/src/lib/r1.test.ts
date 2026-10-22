@@ -275,13 +275,13 @@ describe('settings draft', () => {
   describe('max_concurrent_sessions (0131): interviews at the same time', () => {
     const POOLED = { ...SETTINGS, livekit_target: 'r1' as const, max_concurrent_sessions: 2, browser_worker_pool_size: 5 };
 
-    it.each(['1', '2', '25', ' 10 '])('accepts %j', (value) => {
+    it.each(['1', '2', '15', ' 10 '])('accepts %j', (value) => {
       expect(validateSettingsDraft({ ...draftFromSettings(SETTINGS), max_concurrent_sessions: value })).toEqual({});
     });
 
-    it.each(['', '0', '26', '-1', '2.5', '1e1', 'abc', '100'])('rejects %j with the range', (value) => {
+    it.each(['', '0', '16', '26', '-1', '2.5', '1e1', 'abc', '100'])('rejects %j with the range', (value) => {
       const errors = validateSettingsDraft({ ...draftFromSettings(SETTINGS), max_concurrent_sessions: value });
-      expect(errors.max_concurrent_sessions).toBe('Enter a whole number from 1 to 25.');
+      expect(errors.max_concurrent_sessions).toBe('Enter a whole number from 1 to 15.');
     });
 
     it('refuses a raise past the machines the server reported, before any request', () => {
@@ -304,7 +304,7 @@ describe('settings draft', () => {
       expect(validateSettingsDraft({ ...draftFromSettings(shrunk), max_concurrent_sessions: '1' }, shrunk)).toEqual({});
       for (const pool of [null, undefined]) {
         const unknown = { ...POOLED, browser_worker_pool_size: pool };
-        expect(validateSettingsDraft({ ...draftFromSettings(unknown), max_concurrent_sessions: '20' }, unknown)).toEqual({});
+        expect(validateSettingsDraft({ ...draftFromSettings(unknown), max_concurrent_sessions: '12' }, unknown)).toEqual({});
       }
     });
 

@@ -1,9 +1,9 @@
--- R1 concurrent sessions (M019, PR #378): let up to 25 R1 browser interviews run at the same time.
+-- R1 concurrent sessions (M019, PR #378): let up to 15 R1 browser interviews run at the same time.
 --
 -- SHIPS INERT. The new limit defaults to 1, so admission is exactly 0128's until an operator raises
 -- it, and the Cloud target (livekit_target = 'cloud') keeps 0128's rule whatever the setting says.
 --
---   1. r1_settings.max_concurrent_sessions (integer, default 1, CHECK 1..25): the most live R1
+--   1. r1_settings.max_concurrent_sessions (integer, default 1, CHECK 1..15): the most live R1
 --      sessions the self-hosted target ('r1') admits at once.
 --
 --   2. r1_admit_attempt: 0128 verbatim (its latest definition; 0129 and 0130 do not touch it)
@@ -48,9 +48,9 @@ set local lock_timeout = '10s';
 -- reads 1: 0128's single slot.
 alter table screening_v2.r1_settings
   add column if not exists max_concurrent_sessions integer not null default 1
-    constraint chk_r1_settings_max_concurrent_sessions check (max_concurrent_sessions between 1 and 25);
+    constraint chk_r1_settings_max_concurrent_sessions check (max_concurrent_sessions between 1 and 15);
 comment on column screening_v2.r1_settings.max_concurrent_sessions is
-  'The most live R1 sessions the self-hosted target admits at once (1..25, default 1), capped by '
+  'The most live R1 sessions the self-hosted target admits at once (1..15, default 1), capped by '
   'the browser worker pool size (0131). The Cloud target admits one whatever this says.';
 
 -- 2. Admission. 0128 verbatim except the marked 0131 hunks and the one line concurrent-gate replaces.

@@ -524,7 +524,7 @@ describe('interviews at the same time (0131 max_concurrent_sessions)', () => {
     await loaded();
     expect(limit()).toHaveValue('2');
     expect(screen.getByText('5 interview machines')).toBeInTheDocument();
-    expect(limit()).toHaveAccessibleDescription(/1 to 25\. 5 interview machines are registered\./);
+    expect(limit()).toHaveAccessibleDescription(/1 to 15\. 5 interview machines are registered\./);
     expect(limit()).not.toHaveAccessibleDescription(/LiveKit Cloud/);
   });
 
@@ -582,8 +582,8 @@ describe('interviews at the same time (0131 max_concurrent_sessions)', () => {
   });
 
   it.each([
-    ['26', 'Enter a whole number from 1 to 25.'],
-    ['0', 'Enter a whole number from 1 to 25.'],
+    ['16', 'Enter a whole number from 1 to 15.'],
+    ['0', 'Enter a whole number from 1 to 15.'],
     ['6', 'Only 5 interview machines are registered, so R1 can run at most 5 interviews at a time.'],
   ])('blocks %j before any request, explains it and focuses the field', async (value, words) => {
     api.getR1Settings.mockResolvedValue(POOLED);

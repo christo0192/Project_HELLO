@@ -156,7 +156,7 @@ export interface R1Settings {
   hold_threshold: number;
   livekit_target: 'cloud' | 'r1';
   /**
-   * The most live R1 interviews the self-hosted target admits at once (0131, 1..25, default 1).
+   * The most live R1 interviews the self-hosted target admits at once (0131, 1..15, default 1).
    * Admission caps it at the browser worker pool; Cloud admits one whatever it says. Absent from
    * an older API, which is read as 1.
    */

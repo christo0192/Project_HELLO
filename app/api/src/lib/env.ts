@@ -378,7 +378,7 @@ export const env = {
   /**
    * M019 (R1 concurrency): how many `r1.assessment` scoring jobs ONE API process
    * runs at once. 1 (default) is today: interviews are scored one after another.
-   * 25 interviews ending together at 1 queue their scoring for tens of minutes;
+   * 15 interviews ending together at 1 queue their scoring for tens of minutes;
    * up to 8 run in parallel. Read as a literal so the env contract sees it, and
    * CLAMPED, never thrown (R1 config must never stop the API booting, see
    * lib/r1/config.ts): unset, empty or not an integer = 1, below 1 = 1, above

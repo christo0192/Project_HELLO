@@ -8,7 +8,7 @@
  *   - the monthly cap (R1's own allocation) and the pause line (the shared Cloud
  *     pool's line), in WebRTC minutes;
  *   - the advance and hold score thresholds, and automatic status changes;
- *   - how many R1 interviews may run at once (0131, 1 to 25), shown with the number of interview
+ *   - how many R1 interviews may run at once (0131, 1 to 15), shown with the number of interview
  *     machines the server reports: admission never runs more than that, the server refuses a
  *     higher value, and raising it asks for a second click;
  *   - the LiveKit dashboard reading, which the Cloud pool's guard never goes
@@ -146,7 +146,7 @@ function concurrencyHint(pool: number | null | undefined, target: 'cloud' | 'r1'
     target === 'cloud'
       ? ' On LiveKit Cloud R1 runs one interview at a time, whatever this says.'
       : '';
-  return `1 to 25. ${machines}${cloud}`.replace(/\s+/g, ' ').trim();
+  return `1 to 15. ${machines}${cloud}`.replace(/\s+/g, ' ').trim();
 }
 
 const TARGET_LABEL: Record<string, string> = {

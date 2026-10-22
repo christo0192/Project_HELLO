@@ -117,7 +117,7 @@ async function browserWorkerPoolSize(): Promise<number | null> {
   } catch { return null; }
 }
 /** The live R1 limit the setting may name (0131's CHECK). */
-const R1_MAX_CONCURRENT_SESSIONS = 25;
+const R1_MAX_CONCURRENT_SESSIONS = 15;
 // `browser_worker_pool_size` is read-only and informational: admission caps the setting at it, and
 // the PUT refuses to raise the setting above it. Null when it could not be read.
 r1Router.get('/admin/r1/settings', requireRole('admin'), async (_req, res, next) => { try { const { data, error } = await supabase.from('r1_settings').select('*').eq('singleton', true).single(); if (error) throw error; res.json({ ...data, browser_worker_pool_size: await browserWorkerPoolSize(), runtime: getR1Config() }); } catch (e) { next(e); } });
@@ -149,7 +149,7 @@ r1Router.put('/admin/r1/settings', requireRole('admin'), async (req, res, next) 
     ...(patch.recording_mode !== undefined ? { recording_mode: patch.recording_mode } : {}),
     ...(patch.max_concurrent_sessions !== undefined ? { max_concurrent_sessions: patch.max_concurrent_sessions } : {}),
   };
-  // A whole number 1..25 (0131's CHECK); a string, a fraction or null is refused, never coerced.
+  // A whole number 1..15 (0131's CHECK); a string, a fraction or null is refused, never coerced.
   const validConcurrency = (v: unknown) => Number.isInteger(v) && Number(v) >= 1 && Number(v) <= R1_MAX_CONCURRENT_SESSIONS;
   if ((patch.monthly_cap_minutes !== undefined && !validInt(patch.monthly_cap_minutes)) || (patch.pause_line_minutes !== undefined && !validInt(patch.pause_line_minutes)) || (dashboard && !validMinutes(body.dashboard_minutes)) || (patch.advance_threshold !== undefined && !validScore(patch.advance_threshold)) || (patch.hold_threshold !== undefined && !validScore(patch.hold_threshold)) || (patch.livekit_target !== undefined && !['cloud', 'r1'].includes(String(patch.livekit_target))) || (patch.recording_mode !== undefined && !(typeof patch.recording_mode === 'string' && ['off', 'audio', 'av'].includes(patch.recording_mode))) || (patch.enabled !== undefined && typeof patch.enabled !== 'boolean') || (patch.max_concurrent_sessions !== undefined && !validConcurrency(patch.max_concurrent_sessions))) return res.status(400).json({ error: 'invalid_r1_settings' });
   // More live interviews than there are browser worker machines can never run (one session per

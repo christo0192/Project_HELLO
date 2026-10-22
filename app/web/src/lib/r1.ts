@@ -302,7 +302,7 @@ export function draftFromSettings(settings: R1Settings): R1SettingsDraft {
 }
 
 /** The most live R1 interviews the setting may name (0131's CHECK, mirrored by the API). */
-export const R1_MAX_CONCURRENT_SESSIONS = 25;
+export const R1_MAX_CONCURRENT_SESSIONS = 15;
 
 /** The saved limit; an older API that does not return the column means the 0128 rule, 1. */
 function savedConcurrency(settings: R1Settings): number {
@@ -310,7 +310,7 @@ function savedConcurrency(settings: R1Settings): number {
   return Number.isInteger(value) && value >= 1 ? value : 1;
 }
 
-/** A whole number 1..25, as the server accepts it. */
+/** A whole number 1..15, as the server accepts it. */
 function parseConcurrency(text: string): number | null {
   const trimmed = text.trim();
   if (!/^\d{1,2}$/.test(trimmed)) return null;

@@ -27,7 +27,7 @@ const fixture = (mutate = {}) => {
   const result = run(path.join(source, "fly.toml"));
   ok(result.code === 0, `real SFU config must pass:\n${result.output}`);
   ok(/external_services=443,80,7881,7882 udp_mux=7882/.test(result.output), "pass result must surface the external port contract");
-  ok(/vm=performance-4x\/8192 signaling=300\/600/.test(result.output), "pass result must surface the 25-room VM size and signaling limits");
+  ok(/vm=performance-4x\/8192 signaling=300\/600/.test(result.output), "pass result must surface the VM size (headroom for 25 rooms) and signaling limits");
 }
 
 const goodToml = readFileSync(path.join(source, "fly.toml"), "utf8");
@@ -77,7 +77,7 @@ const cases = [
   ["baked secret", { "fly.toml": goodToml.replace("  # LIVEKIT_KEYS", '  LIVEKIT_KEYS = "not-a-secret"\n  # LIVEKIT_KEYS') }, /secret-shaped/],
   ["UDP port drift", { "fly.toml": goodToml.replace('port = 7882', 'port = 7883') }, /7882/],
   ["raw TCP handler drift", { "fly.toml": goodToml.replace('handlers = []', 'handlers = ["tls"]') }, /raw TCP/],
-  // M019 (PR #378): the SFU is sized for 25 rooms; each drift back (or a partial edit) must fail.
+  // M019 (PR #378): the SFU is sized with headroom for 25 rooms (cap 15); each drift back (or a partial edit) must fail.
   ["memory drift", { "fly.toml": goodToml.replace("memory_mb = 8192", "memory_mb = 2048") }, /performance-4x with 8 GB/],
   ["cpu drift", { "fly.toml": goodToml.replace("cpus = 4", "cpus = 1") }, /performance-4x with 8 GB/],
   ["cpu prefix drift", { "fly.toml": goodToml.replace("cpus = 4", "cpus = 40") }, /performance-4x with 8 GB/],

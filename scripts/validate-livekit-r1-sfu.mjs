@@ -64,7 +64,7 @@ ok(services.filter((s) => s.protocol === "udp").length === 1, "must expose exact
 ok(!/\[http_service\]/.test(toml), "SFU config must use explicit services, not [http_service]");
 
 ok((toml.match(/^\[\[vm\]\]/gm) || []).length === 1, "SFU config must declare exactly one VM shape (deploy with --ha=false for one Machine)");
-// M019 (PR #378): sized for up to 25 concurrent R1 rooms. The size changes only by a reviewed edit
+// M019 (PR #378): cap 15 concurrent R1 rooms, sized with headroom for 25. The size changes only by a reviewed edit
 // here; the SFU itself is resized by a manual, zero-live-room deploy BEFORE the runbook's load test,
 // which then measures this 4x shape.
 const vmLine = (key, value) => new RegExp(`^\\s*${key}\\s*=\\s*${value}\\s*(?:#.*)?$`, "m").test(toml);
@@ -73,7 +73,7 @@ const signalingBlock = signaling?.block ?? "";
 ok(Boolean(signaling)
   && /\[services\.concurrency\][\s\S]*?type\s*=\s*"connections"/.test(signalingBlock)
   && /^\s*soft_limit\s*=\s*300\s*(?:#.*)?$/m.test(signalingBlock)
-  && /^\s*hard_limit\s*=\s*600\s*(?:#.*)?$/m.test(signalingBlock), "signaling service concurrency must be connections, soft 300 / hard 600 (sized for 25 rooms)");
+  && /^\s*hard_limit\s*=\s*600\s*(?:#.*)?$/m.test(signalingBlock), "signaling service concurrency must be connections, soft 300 / hard 600 (sized with headroom for 25 rooms)");
 ok(/min_machines_running\s*=\s*0/.test(toml) && /auto_stop_machines\s*=\s*"stop"/.test(toml), "spike must retain the reviewed on-demand, no-autoscale posture");
 ok(/\[metrics\][\s\S]*?port\s*=\s*6789/.test(toml), "Prometheus metrics must be private on port 6789");
 ok(/http_checks[\s\S]*?method\s*=\s*"get"[\s\S]*?path\s*=\s*"\/"/.test(toml), "signaling service must health-check GET / on 7880");

@@ -3,7 +3,7 @@
  *
  * THE PROBLEM. Admission (`r1_admit_attempt`, 0119; 0131) refuses once the live R1 limit is reached:
  * it counts every R1 session that is `created`, `waiting` or `in_progress`, across all rounds,
- * against `r1_settings.max_concurrent_sessions` (1 by default, up to 25 on the self-hosted target,
+ * against `r1_settings.max_concurrent_sessions` (1 by default, up to 15 on the self-hosted target,
  * capped by the browser worker pool; always 1 on Cloud), answering `r1_in_flight` (409 `r1_busy`).
  * Every live row holds one of those slots, and at the default limit of 1 the slot is global. A
  * session normally settles itself: the worker fails it on a connect or context error, expires it
@@ -59,7 +59,7 @@
  * so closing a 13-hour overnight orphan at `now()` would book about 1,500 phantom minutes against
  * the monthly allocation.
  *
- * THE PASS IS BOUNDED. With up to 25 live sessions, a pass can meet many stale `waiting` rows, each
+ * THE PASS IS BOUNDED. With up to 15 live sessions, a pass can meet many stale `waiting` rows, each
  * with a dispatch probe of up to `dispatchProbeMs`; one after another that was about 200 s on a
  * 60 s loop. Rows are worked through `rowConcurrency` at a time, and no new row is started once
  * `passBudgetMs` has gone by: what is left is simply looked at again by the next pass (nothing is
@@ -93,7 +93,7 @@ export const R1_ORPHAN_LAPSE_BOUNDS = {
   /** How long one `listDispatch` may take before it counts as unreadable (the pass is 60 s apart). */
   dispatchProbeMs: 8_000,
   /**
-   * Live R1 sessions are at most `max_concurrent_sessions` (25) plus the orphans this lapses, one per
+   * Live R1 sessions are at most `max_concurrent_sessions` (15) plus the orphans this lapses, one per
    * round; 100 leaves room for a backlog of orphans without ever reading an unbounded set.
    */
   scanLimit: 100,
