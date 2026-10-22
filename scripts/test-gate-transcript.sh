@@ -46,11 +46,13 @@ docker pull -q "$IMAGE" >/dev/null
 
 log "starting ephemeral ${IMAGE}..."
 docker run -d --name "$CTR" -e POSTGRES_PASSWORD=postgres "$IMAGE" >/dev/null
-for _ in $(seq 1 60); do
-  if docker exec "$CTR" pg_isready -U postgres -q 2>/dev/null; then break; fi
+# Over TCP: the image's first-boot init runs a temporary socket-only server, so a socket
+# pg_isready can pass during init and then fail in the restart gap that follows.
+for _ in $(seq 1 90); do
+  if docker exec "$CTR" pg_isready -h 127.0.0.1 -U postgres -q 2>/dev/null; then break; fi
   sleep 1
 done
-docker exec "$CTR" pg_isready -U postgres -q || { log 'ERROR: postgres never became ready.'; exit 1; }
+docker exec "$CTR" pg_isready -h 127.0.0.1 -U postgres -q || { log 'ERROR: postgres never became ready.'; exit 1; }
 
 # The roles every migration grants to. Supabase provides these; a bare
 # Postgres does not, and a missing one fails the FIRST grant rather than the

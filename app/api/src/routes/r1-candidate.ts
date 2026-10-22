@@ -87,6 +87,7 @@ import {
   type LiveKitEndpoint,
 } from '../lib/livekit-endpoints.js';
 import { browserOrchestrationGate, type BrowserWorkerGate } from '../lib/browser-orchestration.js';
+import { env } from '../lib/env.js';
 import { legacyBrowserScreeningEnabled } from '../lib/legacy-browser-screening.js';
 import { BROWSER_FLY_APP } from '../lib/worker-orchestration-runtime.js';
 import { getR1Config } from '../lib/r1/config.js';
@@ -295,6 +296,8 @@ export interface R1CandidateDeps {
   readyLimiter?: ReadyLimiter;
   /** Bound on each LiveKit server call of the ready relay (`READY_RELAY_TIMEOUT_MS` by default). */
   readyRelayTimeoutMs?: number;
+  /** BROWSER_REQUIRE_MACHINE_AGENT_NAME (env, off by default); read before an R1 dispatch. */
+  requireMachineAgentName?: () => boolean;
 }
 
 function defaultSchedule(work: () => void, delayMs: number): void {
@@ -339,6 +342,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
   const uuid = deps.uuid ?? randomUUID;
   const provisionRoom = deps.provisionRoom ?? provisionRoomForCreatedSession;
   const resolveGate = deps.resolveGate ?? (() => browserOrchestrationGate());
+  const requireMachineAgentName = deps.requireMachineAgentName ?? (() => env.browserRequireMachineAgentName);
   const legacyBrowserEnabled = deps.legacyBrowserEnabled ?? legacyBrowserScreeningEnabled;
   const roomsFor = deps.rooms
     ?? ((endpoint: LiveKitEndpoint) => roomServiceClientFor(endpoint) as unknown as R1RoomClient);
@@ -457,6 +461,37 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * M019 interlock at dispatch time, not only when the limit is saved. With
+   * BROWSER_REQUIRE_MACHINE_AGENT_NAME off, an R1 dispatch may go to the SHARED agent name, which
+   * is safe only while this is the one live R1 session: with another live, LiveKit could hand
+   * this session's job to a machine leased to the other interview, whose release would then stop
+   * it mid-call. So, flag off on the self-hosted target, dispatch only when no OTHER R1 session
+   * is live (0131's live predicate). At limit 1 admission already guarantees that, so today's
+   * behaviour is unchanged; after a misordered rollback (flag off while several were admitted,
+   * or the limit still above 1) every join but one defers instead. An unreadable answer defers
+   * too. Cloud, and the flag on (per-machine names enforced by the gate), skip the read.
+   */
+  async function sharedNameDispatchSafe(endpoint: LiveKitEndpoint, sessionId: string): Promise<boolean> {
+    if (endpoint.target !== 'r1' || requireMachineAgentName()) return true;
+    try {
+      const others = await db
+        .from('call_sessions')
+        .select('id')
+        .not('interview_round_id', 'is', null)
+        .in('status', ['created', 'waiting', 'in_progress'])
+        .neq('id', sessionId)
+        .limit(1);
+      if (!others.error && Array.isArray(others.data) && others.data.length === 0) return true;
+      log.error('unknown_event', {
+        error_category: others.error ? 'r1_live_count_unreadable' : 'r1_concurrency_needs_machine_names',
+      });
+    } catch {
+      log.error('unknown_event', { error_category: 'r1_live_count_unreadable' });
+    }
+    return false;
   }
 
   /** New-work gate: maintenance blocks new joins (503); a read failure fails closed. */
@@ -1375,7 +1410,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     }
 
     if (session.status !== 'in_progress') {
-      const gate = await runR1WorkerGate({
+      const gate = !(await sharedNameDispatchSafe(endpoint, session.id)) ? 'preparing' : await runR1WorkerGate({
         gate: resolveGate(),
         sessionId: session.id,
         roomName,

@@ -86,6 +86,15 @@ export function createFakeDb(options: FakeDbOptions): FakeDb {
         filters.push((row) => (row[column] ?? null) === value);
         return builder;
       },
+      neq: (column: string, value: unknown) => {
+        filters.push((row) => row[column] !== value);
+        return builder;
+      },
+      not: (column: string, operator: string, value: unknown) => {
+        if (operator !== 'is') throw new Error(`fake db: unsupported not(${operator})`);
+        filters.push((row) => (row[column] ?? null) !== value);
+        return builder;
+      },
       in: (column: string, values: unknown[]) => {
         filters.push((row) => values.includes(row[column]));
         return builder;

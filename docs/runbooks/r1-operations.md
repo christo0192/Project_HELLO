@@ -2205,6 +2205,9 @@ stagger the joins. Real candidates join from their own networks.
 3. Flags off in a zero-live window, the reverse of the rollout: the API first
    (`BROWSER_REQUIRE_MACHINE_AGENT_NAME=false`), then remove `BROWSER_PER_MACHINE_AGENT_NAME` from
    `app/voice-livekit/fly.toml` and deploy the worker. Both must be off before any switch to
-   `livekit_target = cloud`.
+   `livekit_target = cloud`. Do step 1 first and turn the API flag off only at zero live: with the
+   flag off, the API dispatches an R1 interview to the shared name only when no other R1 session
+   is live, and otherwise holds the join at "preparing" (log `r1_concurrency_needs_machine_names`)
+   until the others end or lapse.
 4. The pool and the SFU size can stay (the limit caps admission). Shrink the pool with `--retire`
    and revert the SFU size (with its validator pin) only in a zero-live window.
