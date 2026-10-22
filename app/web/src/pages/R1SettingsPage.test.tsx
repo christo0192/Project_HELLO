@@ -599,6 +599,31 @@ describe('interviews at the same time (0131 max_concurrent_sessions)', () => {
     expect(limit()).toHaveAccessibleDescription(new RegExp(words.replace(/[.]/g, '\\.')));
   });
 
+  it('explains the server refusing a limit above 1 until machines have their own names, without losing the edit', async () => {
+    api.getR1Settings.mockResolvedValue(POOLED);
+    api.updateR1Settings.mockRejectedValue(new ApiError('r1_concurrency_needs_machine_names', 409));
+    const user = userEvent.setup();
+    renderPage();
+    await loaded();
+    await user.clear(limit());
+    await user.type(limit(), '3');
+    await user.click(save());
+    await user.click(
+      within(await screen.findByRole('group', { name: 'Confirm these changes' })).getByRole(
+        'button',
+        { name: 'Confirm and save' },
+      ),
+    );
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(
+      'More than one interview at a time needs each interview machine to have its own name ' +
+        '(BROWSER_REQUIRE_MACHINE_AGENT_NAME on the API). Ask an engineer to turn it on first. ' +
+        'Nothing was changed.',
+    );
+    expect(alert).not.toHaveTextContent('not enough interview machines');
+    expect(limit()).toHaveValue('3');
+  });
+
   it('explains the server refusing a limit above the machines, without losing the edit', async () => {
     api.getR1Settings.mockResolvedValue({ ...POOLED, browser_worker_pool_size: null });
     api.updateR1Settings.mockRejectedValue(new ApiError('r1_concurrency_above_worker_pool', 409));

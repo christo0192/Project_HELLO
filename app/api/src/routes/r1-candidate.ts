@@ -163,6 +163,12 @@ export const BUSY_SLOTS_RETRY_AFTER_SEC = 5 * 60;
  * "all interview slots are in use". Absent, the body is exactly today's single-slot answer.
  */
 export const R1_BUSY_SLOTS_FULL = 'slots_full';
+/**
+ * The `busy_reason` a 409 `r1_busy` carries when admission said `round_live`: this candidate's
+ * OWN round already has a live session (a second tab or device without the rejoin nonce). It is
+ * not a full pool, so the page says the interview is open on another device or tab.
+ */
+export const R1_BUSY_OWN_SESSION_LIVE = 'own_session_live';
 export const PREPARING_RETRY_AFTER_SEC = 3;
 /** A withdrawal whose room could not be cut is safe to retry at once. */
 export const WITHDRAW_RETRY_AFTER_SEC = 3;
@@ -199,7 +205,8 @@ const ADMISSION_REFUSALS: Readonly<Record<string, { status: number; error: strin
   r1_in_flight: { status: 409, error: 'r1_busy' },
   cloud_capacity_exhausted: { status: 409, error: 'r1_busy' },
   // 0131: the round already has a live session (a second tab without the rejoin nonce). Only
-  // answered above a limit of 1; the page explains it as the candidate's own open interview.
+  // answered above a limit of 1; the body carries busy_reason own_session_live (not
+  // slots_full), and the page explains it as the candidate's own open interview.
   round_live: { status: 409, error: 'r1_busy' },
   round_not_admissible: { status: 409, error: 'round_not_admissible' },
   round_expired: { status: 409, error: 'round_expired' },
@@ -1139,13 +1146,16 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       const refusal = ADMISSION_REFUSALS[String(admitted.data.status)]
         ?? { status: 503, error: 'service_unavailable' };
       if (refusal.error === 'r1_busy') {
-        // round_live is only ever answered above a limit of 1 (0131), so it needs no read.
-        const slots = admitted.data.status === 'round_live' || (await admitsSeveralLive());
+        // round_live is only ever answered above a limit of 1 (0131), so it needs no read; it is
+        // the candidate's own live session, not a full pool, and says so.
+        const ownLive = admitted.data.status === 'round_live';
+        const slots = ownLive || (await admitsSeveralLive());
         const retryAfter = slots ? BUSY_SLOTS_RETRY_AFTER_SEC : BUSY_RETRY_AFTER_SEC;
         res.setHeader('Retry-After', String(retryAfter));
+        const reason = ownLive ? R1_BUSY_OWN_SESSION_LIVE : slots ? R1_BUSY_SLOTS_FULL : null;
         refuse(res, refusal.status, refusal.error, {
           retry_after_sec: retryAfter,
-          ...(slots ? { busy_reason: R1_BUSY_SLOTS_FULL } : {}),
+          ...(reason ? { busy_reason: reason } : {}),
         });
         return;
       }

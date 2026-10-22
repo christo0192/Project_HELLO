@@ -664,9 +664,12 @@ const posixPath = (p) => p.replace(/\\/g, "/");
 
   // Behaviour against a stateful multi-machine flyctl stub. Each machine is a
   // file "<state> <image>"; deploy moves every machine to the new image except
-  // those listed in `skip`, and leaves those in `leaveStarted` started.
+  // those listed in `skip`, and leaves those in `leaveStarted` started. Each
+  // `claimOn` entry "<stop|update> <id> <target> [n]" starts <target> (an
+  // interview claim) right after the n-th (default first) such flyctl call on
+  // <id>, so the pool changes mid-run.
   const scriptPath = path.join(root, "scripts/deploy-voice-orchestration.sh");
-  const makePool = ({ ids = ["m1", "m2", "m3"], skip = [], leaveStarted = [], updateFails = false, initial = "stopped" } = {}) => {
+  const makePool = ({ ids = ["m1", "m2", "m3"], skip = [], leaveStarted = [], updateFails = false, initial = "stopped", claimOn = [] } = {}) => {
     const dir = mkdtempSync(path.join(tmpdir(), "pool-stub-"));
     const D = posixPath(dir);
     mkdirSync(path.join(dir, "m"));
@@ -674,6 +677,7 @@ const posixPath = (p) => p.replace(/\\/g, "/");
     writeFileSync(path.join(dir, "skip"), skip.map((s) => s + "\n").join(""));
     writeFileSync(path.join(dir, "leave_started"), leaveStarted.map((s) => s + "\n").join(""));
     if (updateFails) writeFileSync(path.join(dir, "update_fails"), "");
+    writeFileSync(path.join(dir, "claim_on"), claimOn.map((s) => s + "\n").join(""));
     const bin = path.join(dir, "flyctl");
     writeFileSync(bin, [
       "#!/usr/bin/env bash",
@@ -695,7 +699,11 @@ const posixPath = (p) => p.replace(/\\/g, "/");
       '        [ -f "$D/update_fails" ] && exit 1',
       '        img=""; prev=""; for a in "$@"; do [ "$prev" = "--image" ] && img="$a"; prev="$a"; done',
       '        read -r st old < "$D/m/$3"; echo "$st $img" > "$D/m/$3" ;;',
-      "    esac ;;",
+      "    esac",
+      '    n=$(( $(cat "$D/n.$2.$3" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$D/n.$2.$3"',
+      '    while read -r verb on target nth; do',
+      '      if [ "$verb" = "$2" ] && [ "$on" = "$3" ] && [ "${nth:-1}" = "$n" ]; then read -r st img < "$D/m/$target"; echo "started $img" > "$D/m/$target"; fi',
+      '    done < "$D/claim_on" ;;',
       "  deploy)",
       '    for f in "$D"/m/*; do id=$(basename "$f"); read -r st img < "$f"',
       '      grep -qx "$id" "$D/skip" || img="registry/app:new"',
@@ -792,6 +800,28 @@ const posixPath = (p) => p.replace(/\\/g, "/");
     ok(!/machine stop m[12]/.test(g.calls), "rely-on-started must never stop a machine it did not start");
     const g1 = runPool(makePool({ ids: ["m1"], initial: "started" }), { VERIFY_POOL: "true" });
     ok(g1.code === 0, `a one-machine started lane must keep today's rely-on-started success, got ${g1.code}:\n${g1.out}`);
+
+    // (h) m3 is stopped and stale in the FIRST list, but an interview claim starts it
+    //     while the proven machine is being stopped (converge step a, m1's second stop;
+    //     the first is the post-deploy proof's restart): it must NOT be updated (that
+    //     would restart a live interview). The deploy fails and says to re-run at zero live.
+    const h = runPool(makePool({ skip: ["m3"], claimOn: ["stop m1 m3 2"] }), { VERIFY_POOL: "true" });
+    ok(!/machine update m3/.test(h.calls), `a machine started after the first list must never be updated, got calls:\n${h.calls}`);
+    ok(h.machines.m3 === "started registry/app:old", `m3 must be left as the claim made it, got ${h.machines.m3}`);
+    ok(h.code !== 0, `a stale machine busy at update time must fail the deploy (never cut the interview), got ${h.code}:\n${h.out}`);
+    ok(/skipping pool machine m3[\s\S]*m3 state=started[\s\S]*m3 on project-hello-voice were busy[\s\S]*re-run the deploy at a zero-live moment/.test(h.out),
+      `the failure must name the busy machine and say to re-run at a zero-live moment, got:\n${h.out}`);
+
+    // (i) m2 and m3 are both stale and stopped at the re-list; updating m2 is when the
+    //     claim starts m3. Its state is re-read right before its own update: skipped.
+    const i = runPool(makePool({ skip: ["m2", "m3"], claimOn: ["update m2 m3"] }), { VERIFY_POOL: "true" });
+    ok(/machine update m2 -a project-hello-voice --image registry\/app:new --skip-start --yes/.test(i.calls),
+      `the still-stopped stale machine must be updated, got calls:\n${i.calls}`);
+    ok(!/machine update m3/.test(i.calls), `a machine started just before its own update must never be updated, got calls:\n${i.calls}`);
+    ok(i.machines.m2 === "stopped registry/app:new" && i.machines.m3 === "started registry/app:old",
+      `m2 must be converged and m3 left alone, got ${JSON.stringify(i.machines)}`);
+    ok(i.code !== 0 && /m3 on project-hello-voice were busy[\s\S]*zero-live moment/.test(i.out),
+      `the deploy must fail naming the busy machine, got ${i.code}:\n${i.out}`);
   }
 }
 

@@ -12,6 +12,7 @@ vi.mock('../lib/supabase.js', () => ({ supabase: { from: mocks.from, rpc: mocks.
 
 import { r1InternalRouter, r1Router } from '../routes/r1.js';
 import { getAuditSink, setAuditSink, type AuditEntry } from '../lib/audit.js';
+import { env } from '../lib/env.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const CANDIDATE = '10000000-0000-4000-8000-000000000001';
@@ -269,6 +270,45 @@ describe('R1 recruiter routes', () => {
         ...extra,
       ];
     };
+    // Raising the limit above 1 needs per-machine dispatch names (the interlock); every case
+    // below runs with the flag on unless it says otherwise.
+    const requireNames = env.browserRequireMachineAgentName;
+    beforeEach(() => { env.browserRequireMachineAgentName = true; });
+    afterEach(() => { env.browserRequireMachineAgentName = requireNames; });
+
+    it('refuses a limit above 1 with 409 r1_concurrency_needs_machine_names while BROWSER_REQUIRE_MACHINE_AGENT_NAME is off, and changes nothing', async () => {
+      env.browserRequireMachineAgentName = false;
+      for (const value of [2, 25]) {
+        const tables = baseTables();
+        tables.r1_settings[0].max_concurrent_sessions = 1;
+        pool(tables, 25);
+        const response = await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ max_concurrent_sessions: value, paused: true });
+        expect(response.status).toBe(409);
+        expect(response.body).toEqual({ error: 'r1_concurrency_needs_machine_names' });
+        expect(tables.r1_settings[0]).toMatchObject({ max_concurrent_sessions: 1, paused: false });
+      }
+      expect(audits).toHaveLength(0);
+    });
+
+    it('accepts a limit above 1 once BROWSER_REQUIRE_MACHINE_AGENT_NAME is on', async () => {
+      env.browserRequireMachineAgentName = true;
+      const tables = baseTables();
+      tables.r1_settings[0].max_concurrent_sessions = 1;
+      pool(tables, 3);
+      const response = await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ max_concurrent_sessions: 3 });
+      expect(response.status).toBe(200);
+      expect(tables.r1_settings[0].max_concurrent_sessions).toBe(3);
+    });
+
+    it.each([[false], [true]])('always allows lowering the limit to 1 (machine names required: %s)', async (flag) => {
+      env.browserRequireMachineAgentName = flag;
+      const tables = baseTables();
+      tables.r1_settings[0].max_concurrent_sessions = 4;
+      pool(tables, 0);
+      const response = await request(appFor('admin', OWNER, tables).app).put('/api/admin/r1/settings').send({ max_concurrent_sessions: 1 });
+      expect(response.status).toBe(200);
+      expect(tables.r1_settings[0].max_concurrent_sessions).toBe(1);
+    });
 
     it('GET returns the setting and the browser worker pool size admission counts (every state, browser app only)', async () => {
       const tables = baseTables();

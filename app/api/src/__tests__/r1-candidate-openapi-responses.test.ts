@@ -356,8 +356,8 @@ describe('R1 candidate routes: real responses against openapi.yaml', () => {
     h.db.rpc = async (fn: string, args: unknown) => (fn === 'r1_admit_attempt'
       ? { data: { status: 'round_live' }, error: null }
       : admit(fn, args));
-    const slots = await hit('/api/r1/attempts', { token: LINK }, 409, 'r1_busy');
-    expect(slots.body).toEqual({ error: 'r1_busy', retry_after_sec: 300, busy_reason: 'slots_full' });
+    const own = await hit('/api/r1/attempts', { token: LINK }, 409, 'r1_busy');
+    expect(own.body).toEqual({ error: 'r1_busy', retry_after_sec: 300, busy_reason: 'own_session_live' });
     finish('/api/r1/attempts');
   });
 

@@ -19,9 +19,10 @@ kill_timeout = 300 # memo §3.7: Fly maximum; deployments require zero live room
 # vCPU of forwarding (~16 Mbps in, ~16 Mbps out, ~8k pps), which would pin a 1x
 # at its ceiling; 4x keeps the S0-C gate (SFU CPU p95 < 60%) in reach. This is an
 # ESTIMATE, not a measurement. The SFU is deployed MANUALLY (never by
-# deploy-fly.yml), and only in a zero-live-room window AFTER the load test in
-# docs/runbooks/r1-operations.md ("Concurrent R1 interviews (PR #378)"): a
-# deploy or resize restarts the one Machine and ends every live interview.
+# deploy-fly.yml), in a zero-live-room window BEFORE the load test in
+# docs/runbooks/r1-operations.md ("Concurrent R1 interviews (PR #378)", step 4),
+# which then measures this 4x shape (step 5): a deploy or resize restarts the
+# one Machine and ends every live interview.
 [[vm]]
   cpu_kind = "performance" # memo §3.2: dedicated CPU avoids shared-CPU media throttling.
   cpus = 4

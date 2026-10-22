@@ -11,6 +11,7 @@ import {
   classifyR1Error,
   isFinalRefusal,
   r1Api,
+  r1BusyOwnSessionLive,
   r1BusySlotsFull,
   type R1AttemptGrant,
   type R1ConsentTemplate,
@@ -530,7 +531,13 @@ export function R1JoinPage() {
       // timeout, a failed connect or a 5xx leaves the attempt live, and without the nonce the
       // retry would be refused as busy by this candidate's own session.
       if (kind === 'link_invalid' || kind === 'link_expired') clearNonce();
-      setLandingError(joinErrorMessage(kind, liveElsewhere, r1BusySlotsFull(error)));
+      // The server may know what this tab does not: the round's own interview is live in another
+      // tab or device (busy_reason own_session_live), which is the open-elsewhere case too.
+      setLandingError(joinErrorMessage(
+        kind,
+        liveElsewhere || r1BusyOwnSessionLive(error),
+        r1BusySlotsFull(error),
+      ));
       setStage({ name: 'landing' });
     }
   }

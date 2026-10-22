@@ -349,11 +349,13 @@ function optionalCount(value: unknown): number | null {
 }
 
 /**
- * Why a 409 `r1_busy` was busy, when the server said: `slots_full` is sent only while admission
- * runs several interviews at once (0131), and the page then words it as "all interview slots are
- * in use". At the default of one interview at a time the body carries no reason.
+ * Why a 409 `r1_busy` was busy, when the server said. Both are sent only while admission runs
+ * several interviews at once (0131): `slots_full` (every slot is taken; the page says "all
+ * interview slots are in use") and `own_session_live` (this link's OWN interview is already live
+ * in another tab or device; the page says it is open elsewhere). At the default of one interview
+ * at a time the body carries no reason.
  */
-export type R1BusyReason = 'slots_full';
+export type R1BusyReason = 'slots_full' | 'own_session_live';
 
 /**
  * A refusal from `/api/r1/*`. It IS an `ApiError` (every check by class and code still holds);
@@ -374,8 +376,16 @@ export function r1BusySlotsFull(error: unknown): boolean {
     && error.busyReason === 'slots_full';
 }
 
+/** True when a thrown `r1_busy` said this link's own interview is live in another tab/device. */
+export function r1BusyOwnSessionLive(error: unknown): boolean {
+  return error instanceof R1ApiError
+    && error.message === 'r1_busy'
+    && error.busyReason === 'own_session_live';
+}
+
 function busyReason(data: unknown): R1BusyReason | null {
-  return record(data)?.busy_reason === 'slots_full' ? 'slots_full' : null;
+  const reason = record(data)?.busy_reason;
+  return reason === 'slots_full' || reason === 'own_session_live' ? reason : null;
 }
 
 function errorCode(data: unknown, status: number): string {

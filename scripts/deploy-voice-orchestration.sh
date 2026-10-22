@@ -186,10 +186,16 @@ pool_count() {
   printf '%s' "$1" | jq -r '[.[] | select(.state != "destroyed")] | length'
 }
 
+# The state of ONE machine right now, from a fresh list (empty when unreadable).
+machine_state_now() {
+  flyctl machine list -a "$APP" --json 2>/dev/null \
+    | jq -r --arg id "$1" '.[] | select(.id==$id) | .state' | tail -1 || true
+}
+
 # $1 = the machine THIS run proved on the new image. Returns 0 when every pool
 # machine is on that image and none is started; 1 otherwise (fails the deploy).
 converge_pool() {
-  local proven="$1" list count ref id state="" bad attempt
+  local proven="$1" list count ref id state="" now bad attempt skipped_busy=""
   if ! list="$(flyctl machine list -a "$APP" --json 2>/dev/null)"; then
     echo "::error::could not list the machines of $APP to verify the pool after the deploy"
     return 1
@@ -223,9 +229,29 @@ converge_pool() {
   fi
 
   # b. A stopped machine the rollout did not update gets the new image in place,
-  #    without being started. A started one is never touched here.
+  #    without being started. A started one is never touched here. The list above
+  #    is up to a minute old by now (the stop poll), and a claim may have started a
+  #    machine for an interview meanwhile: re-list, and re-read each machine's own
+  #    state immediately before its update. One that is no longer stopped / created
+  #    / suspended is skipped (never updated: that would restart a live interview);
+  #    step c then fails and names it, and the deploy is re-run at a zero-live moment.
+  if ! list="$(flyctl machine list -a "$APP" --json 2>/dev/null)" || [ -z "$list" ]; then
+    echo "::error::could not re-list the machines of $APP before converging the pool"
+    return 1
+  fi
+  # Candidates are every stale machine; its state right now decides (a started one
+  # is skipped and named, so step c's failure says which machine was busy).
   for id in $(printf '%s' "$list" | jq -r --arg ref "$ref" \
-      ".[] | select($NOT_RUNNING_JQ) | select((.config.image // \"\") != \$ref) | .id"); do
+      ".[] | select(.state != \"destroyed\") | select((.config.image // \"\") != \$ref) | .id"); do
+    now="$(machine_state_now "$id")"
+    case "$now" in
+      stopped|created|suspended) ;;
+      *)
+        echo "::warning::skipping pool machine $id on $APP: it is '${now:-unreadable}' now, not stopped (it may be a live interview); it is NOT updated"
+        skipped_busy="${skipped_busy:+$skipped_busy }$id"
+        continue
+        ;;
+    esac
     echo "updating stopped pool machine $id on $APP to the new image (not started)"
     flyctl machine update "$id" -a "$APP" --image "$ref" --skip-start --yes \
       || echo "::warning::could not update pool machine $id on $APP; the check below will fail on it"
@@ -249,6 +275,9 @@ converge_pool() {
   done
   echo "::error::pool of $APP did not converge after the deploy (want every machine on $ref and none started); offending: $(printf '%s' "$bad" | tr '\n' ' ')"
   echo "::error::a started machine is NOT stopped by this deploy (it may be a live interview); stop it once it is idle, or wait for the reaper, then re-run the deploy"
+  if [ -n "$skipped_busy" ]; then
+    echo "::error::pool machine(s) $skipped_busy on $APP were busy (started) when this deploy came to update them, so they were NOT updated and may still run the old image; re-run the deploy at a zero-live moment"
+  fi
   return 1
 }
 

@@ -270,7 +270,11 @@ export function R1SettingsPage() {
       setNotice('Settings saved.');
     } catch (e) {
       setSaveError(
-        e instanceof ApiError && e.message === 'r1_concurrency_above_worker_pool'
+        e instanceof ApiError && e.message === 'r1_concurrency_needs_machine_names'
+          ? 'More than one interview at a time needs each interview machine to have its own ' +
+            'name (BROWSER_REQUIRE_MACHINE_AGENT_NAME on the API). Ask an engineer to turn it ' +
+            'on first. Nothing was changed.'
+          : e instanceof ApiError && e.message === 'r1_concurrency_above_worker_pool'
           ? 'There are not enough interview machines registered for that many interviews at ' +
             'once. Nothing was changed.'
           : e instanceof ApiError && e.status === 400

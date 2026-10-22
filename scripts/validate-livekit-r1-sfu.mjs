@@ -65,7 +65,8 @@ ok(!/\[http_service\]/.test(toml), "SFU config must use explicit services, not [
 
 ok((toml.match(/^\[\[vm\]\]/gm) || []).length === 1, "SFU config must declare exactly one VM shape (deploy with --ha=false for one Machine)");
 // M019 (PR #378): sized for up to 25 concurrent R1 rooms. The size changes only by a reviewed edit
-// here; the SFU itself is resized by a manual, zero-live-room deploy after the runbook's load test.
+// here; the SFU itself is resized by a manual, zero-live-room deploy BEFORE the runbook's load test,
+// which then measures this 4x shape.
 const vmLine = (key, value) => new RegExp(`^\\s*${key}\\s*=\\s*${value}\\s*(?:#.*)?$`, "m").test(toml);
 ok(vmLine("cpu_kind", '"performance"') && vmLine("cpus", "4") && vmLine("memory_mb", "8192"), "VM must be performance-4x with 8 GB memory");
 const signalingBlock = signaling?.block ?? "";

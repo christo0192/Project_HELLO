@@ -18,6 +18,7 @@ import {
   R1_SERVER_ERROR_CODES,
   R1ApiError,
   r1Api,
+  r1BusyOwnSessionLive,
   r1BusySlotsFull,
 } from './r1-api';
 
@@ -269,6 +270,24 @@ describe('r1Api requests', () => {
     mockFetch(reply(409, { error: 'r1_paused', busy_reason: 'slots_full' }));
     expect(r1BusySlotsFull(await r1Api.createAttempt(LINK, null).catch((e: unknown) => e))).toBe(false);
     expect(r1BusySlotsFull(new ApiError('r1_busy', 409))).toBe(false);
+  });
+
+  it('carries busy_reason own_session_live (the round’s own interview is live elsewhere)', async () => {
+    mockFetch(reply(409, { error: 'r1_busy', retry_after_sec: 300, busy_reason: 'own_session_live' }));
+    const own = await r1Api.createAttempt(LINK, null).catch((e: unknown) => e);
+    expect(own).toBeInstanceOf(R1ApiError);
+    expect(own).toMatchObject({ message: 'r1_busy', status: 409, busyReason: 'own_session_live' });
+    expect(classifyR1Error(own)).toBe('busy');
+    expect(r1BusyOwnSessionLive(own)).toBe(true);
+    expect(r1BusySlotsFull(own)).toBe(false);
+
+    mockFetch(reply(409, { error: 'r1_busy', retry_after_sec: 300, busy_reason: 'slots_full' }));
+    expect(r1BusyOwnSessionLive(await r1Api.createAttempt(LINK, null).catch((e: unknown) => e))).toBe(false);
+    mockFetch(reply(409, { error: 'r1_busy', retry_after_sec: 1800 }));
+    expect(r1BusyOwnSessionLive(await r1Api.createAttempt(LINK, null).catch((e: unknown) => e))).toBe(false);
+    mockFetch(reply(409, { error: 'r1_paused', busy_reason: 'own_session_live' }));
+    expect(r1BusyOwnSessionLive(await r1Api.createAttempt(LINK, null).catch((e: unknown) => e))).toBe(false);
+    expect(r1BusyOwnSessionLive(new ApiError('r1_busy', 409))).toBe(false);
   });
 
   it('falls back to http_<status> for an unusable error body', async () => {

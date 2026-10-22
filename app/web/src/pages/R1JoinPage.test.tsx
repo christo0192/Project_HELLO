@@ -572,6 +572,23 @@ describe('joining', () => {
     expect(h.exchange).not.toHaveBeenCalled();
   });
 
+  it('says the interview is open elsewhere, not that every slot is in use, for own_session_live (0131)', async () => {
+    // This tab's status did not show the round live (no ELSEWHERE note), but the server did:
+    // the candidate's own interview is live in another tab or device.
+    h.createAttempt.mockRejectedValue(new R1ApiError('r1_busy', 409, 'own_session_live'));
+    await toLanding();
+    fireEvent.click(screen.getByRole('button', { name: 'Check my camera and microphone' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Pass device check' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('Your interview is open on another device or browser tab');
+    expect(alert).toHaveTextContent('Your link stays valid');
+    expect(alert).not.toHaveTextContent('All interview slots are in use');
+    expect(alert).not.toHaveTextContent('Another interview is finishing');
+    expect(h.media?.audio.stop).toHaveBeenCalled();
+    expect(h.media?.video.stop).toHaveBeenCalled();
+    expect(h.exchange).not.toHaveBeenCalled();
+  });
+
   it('keeps today’s exact wording for a busy answer without a reason (one interview at a time)', async () => {
     h.createAttempt.mockRejectedValue(new R1ApiError('r1_busy', 409, null));
     await toLanding();

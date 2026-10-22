@@ -2068,7 +2068,9 @@ count is below the **limit**:
 
 - **The setting.** `r1_settings.max_concurrent_sessions`, 1..25, default 1. Set it with
   `PUT /api/admin/r1/settings` and `{"max_concurrent_sessions": N}` (admin; the route audits the
-  change). `GET /api/admin/r1/settings` also returns `browser_worker_pool_size`.
+  change). `GET /api/admin/r1/settings` also returns `browser_worker_pool_size`. The settings API
+  refuses a limit above 1 (409 `r1_concurrency_needs_machine_names`) until the API env flag
+  `BROWSER_REQUIRE_MACHINE_AGENT_NAME` is on; lowering it to 1 is always accepted.
 - **The pool.** One machine runs one session. The pool size is the number of
   `voice_worker_leases` rows for app `project-hello-voice`, pipeline `browser`, in any state, so
   admission never lets in more sessions than there are machines. With no registered pool the

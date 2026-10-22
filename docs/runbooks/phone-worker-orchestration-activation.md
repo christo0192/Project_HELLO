@@ -155,9 +155,10 @@ What it does, per machine, and what it refuses:
   provisioning mode, which registers it again.
 
 **R1 pool size vs. concurrency.** Admission never lets in more live R1 sessions
-than there are browser lease rows (0131: `least(max_concurrent_sessions, pool,
-1)`). Before shrinking the browser pool, lower `max_concurrent_sessions` to the
-new size or below, and wait until the live count is under it. Retire only
+than there are browser lease rows (0131: `least(coalesce(max_concurrent_sessions, 1),
+greatest(pool, 1))`, so never more than the pool and never below 1). Before
+shrinking the browser pool, lower `max_concurrent_sessions` to the new size or
+below, and wait until the live count is under it. Retire only
 machines that are `stopped` (the script enforces this).
 
 **When the runtime finds a destroyed machine.** If a machine disappears

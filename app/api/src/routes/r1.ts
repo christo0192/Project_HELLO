@@ -3,6 +3,7 @@ import { createHash, timingSafeEqual } from 'node:crypto';
 import { supabase } from '../lib/supabase.js';
 import { generateInviteToken, hashInviteToken } from '../lib/invite-token.js';
 import { getR1Config } from '../lib/r1/config.js';
+import { env } from '../lib/env.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import { projectRecordingContext } from '../lib/r1/recording/context.js';
@@ -155,7 +156,11 @@ r1Router.put('/admin/r1/settings', requireRole('admin'), async (req, res, next) 
   // machine, 0079), and admission would cap the setting at the pool anyway (0131). So a value above
   // 1 is refused while the pool is smaller, and when the pool cannot be read (fail closed). Lowering
   // to 1 is always allowed: it is the safe direction.
+  // Interlock: above 1 also needs BROWSER_REQUIRE_MACHINE_AGENT_NAME on. Without per-machine dispatch
+  // names two concurrent interviews share one agent name, so a job can land on the machine leased to
+  // the OTHER interview, whose release then stops it mid-call.
   if (typeof patch.max_concurrent_sessions === 'number' && patch.max_concurrent_sessions > 1) {
+    if (!env.browserRequireMachineAgentName) return res.status(409).json({ error: 'r1_concurrency_needs_machine_names' });
     const pool = await browserWorkerPoolSize();
     if (pool === null) return res.status(503).json({ error: 'service_unavailable' });
     if (patch.max_concurrent_sessions > pool) return res.status(409).json({ error: 'r1_concurrency_above_worker_pool', browser_worker_pool_size: pool });

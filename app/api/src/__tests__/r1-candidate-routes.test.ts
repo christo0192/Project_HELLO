@@ -1323,7 +1323,7 @@ describe('POST /api/r1/attempts', () => {
       expect(h.tables.call_sessions).toHaveLength(3);
     });
 
-    it('a second tab of the same round is round_live, mapped to r1_busy slots_full, and admits nothing', async () => {
+    it('a second tab of the same round is round_live, mapped to r1_busy own_session_live (not slots_full), and admits nothing', async () => {
       slots(2, 2);
       const [a, b] = await Promise.all([
         post('/attempts', { token: LINK }),
@@ -1331,7 +1331,7 @@ describe('POST /api/r1/attempts', () => {
       ]);
       expect([a.status, b.status].sort()).toEqual([201, 409]);
       const busy = a.status === 409 ? a : b;
-      expect(busy.body).toEqual({ error: 'r1_busy', retry_after_sec: 300, busy_reason: 'slots_full' });
+      expect(busy.body).toEqual({ error: 'r1_busy', retry_after_sec: 300, busy_reason: 'own_session_live' });
       expect(busy.headers['retry-after']).toBe('300');
       expect(h.db.rpcCalls.filter((c) => c.fn === 'r1_admit_attempt')).toHaveLength(2);
       expect(h.tables.call_sessions).toHaveLength(1);
