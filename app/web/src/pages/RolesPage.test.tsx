@@ -862,6 +862,32 @@ describe('The status filter — All / Active / Inactive', () => {
     expect(search()).toBe('?status=inactive');
   });
 
+  it('offers Reactivate only on an inactive agent, and it sends just is_active: true, reloads and says so', async () => {
+    mockApi.listRoles
+      .mockResolvedValueOnce([role(1), role(2, { is_active: false })])
+      .mockResolvedValue([role(1), role(2)]);
+    mockApi.updateRole.mockResolvedValue(role(2));
+    render(<RolesPage />);
+    const button = await screen.findByRole('button', { name: 'Reactivate agent Role number 2' });
+    expect(screen.queryByRole('button', { name: 'Reactivate agent Role number 1' })).toBeNull();
+    expect(screen.getAllByRole('button', { name: /^Reactivate agent/ })).toHaveLength(1);
+    await userEvent.setup().click(button);
+    await waitFor(() => expect(mockApi.updateRole).toHaveBeenCalledTimes(1));
+    expect(mockApi.updateRole).toHaveBeenCalledWith(role(2).id, { is_active: true });
+    await waitFor(() => expect(mockApi.listRoles).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText('"Role number 2" is active again.')).toBeInTheDocument();
+    await waitFor(() => expect(screen.queryByRole('button', { name: /^Reactivate agent/ })).toBeNull());
+  });
+
+  it('a refused reactivation shows the server message and claims nothing', async () => {
+    mockApi.listRoles.mockResolvedValue([role(2, { is_active: false })]);
+    mockApi.updateRole.mockRejectedValue(new ApiError('Role not found', 404));
+    render(<RolesPage />);
+    await userEvent.setup().click(await screen.findByRole('button', { name: 'Reactivate agent Role number 2' }));
+    expect(await screen.findByText('Role not found')).toBeInTheDocument();
+    expect(screen.queryByText(/is active again/)).toBeNull();
+  });
+
   it('is reachable by keyboard and has no axe violations, filtered or not', async () => {
     mockApi.listRoles.mockResolvedValue(mixed());
     const { container } = render(<RolesPage />);

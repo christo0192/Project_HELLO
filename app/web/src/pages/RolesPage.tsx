@@ -144,6 +144,8 @@ export function RolesPage() {
 
   /** The role currently being removed, so only its button says so. */
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  /** The role currently being reactivated, so only its button says so. */
+  const [reactivatingId, setReactivatingId] = useState<string | null>(null);
   /** What the last removal did, in words. Cleared on the next one. */
   const [removalNote, setRemovalNote] = useState<string | null>(null);
 
@@ -163,7 +165,7 @@ export function RolesPage() {
    */
   const removeRole = useCallback(
     async (role: Role) => {
-      if (deletingId) return;
+      if (deletingId || reactivatingId) return;
       // CONFIRMED, because this is destructive and one click from a list.
       // The wording promises only what the server will actually do.
       // Named as the card is — agent first, job in brackets — so the dialog
@@ -196,7 +198,35 @@ export function RolesPage() {
         setDeletingId(null);
       }
     },
-    [deletingId, load],
+    [deletingId, reactivatingId, load],
+  );
+
+  /**
+   * Put an archived (Inactive) agent back into service. Delete archives an
+   * agent that candidates or sessions still reference rather than removing it,
+   * and nothing else on the page could undo that. The server already accepts
+   * `is_active` on `PUT /api/roles/:id` (an interviewer only on their own
+   * agent, as for Edit), and a body of just that flag changes nothing else.
+   * Not confirmed: it is not destructive, and Delete archives it again.
+   */
+  const reactivateRole = useCallback(
+    async (role: Role) => {
+      if (reactivatingId || deletingId) return;
+      const name = agentWithRoleLabel(role);
+      setRemovalNote(null);
+      setError(null);
+      setReactivatingId(role.id);
+      try {
+        await api.updateRole(role.id, { is_active: true });
+        setRemovalNote(`"${name}" is active again.`);
+        load();
+      } catch (e) {
+        setError(e instanceof ApiError ? e.message : "Could not reactivate the agent.");
+      } finally {
+        setReactivatingId(null);
+      }
+    },
+    [reactivatingId, deletingId, load],
   );
 
   // The status filter lives in the URL (?status=active|inactive) so it survives
@@ -379,8 +409,11 @@ export function RolesPage() {
                     role={role}
                     deleting={deletingId === role.id}
                     anyDeleting={deletingId !== null}
+                    reactivating={reactivatingId === role.id}
+                    anyReactivating={reactivatingId !== null}
                     onEdit={() => setEditing(role)}
                     onDelete={() => void removeRole(role)}
+                    onReactivate={() => void reactivateRole(role)}
                   />
                 ))}
               </ul>
@@ -423,16 +456,25 @@ function RoleRow({
   role,
   deleting,
   anyDeleting,
+  reactivating = false,
+  anyReactivating = false,
   onEdit,
   onDelete,
+  onReactivate,
 }: {
   role: Role;
   /** This row's removal is in flight. */
   deleting: boolean;
   /** Some row's removal is in flight; every Delete refuses meanwhile. */
   anyDeleting: boolean;
+  /** This row's reactivation is in flight. */
+  reactivating?: boolean;
+  /** Some row's reactivation is in flight; every Reactivate refuses meanwhile. */
+  anyReactivating?: boolean;
   onEdit: () => void;
   onDelete: () => void;
+  /** Inactive rows only: put the archived agent back into service. */
+  onReactivate?: () => void;
 }) {
   const headingId = useId();
   const label = agentLabel(role);
@@ -538,6 +580,24 @@ function RoleRow({
           desk the buttons are nudged up so their centre sits on the heading's
           line rather than below it. */}
       <div className="col-span-2 row-start-3 flex min-w-0 flex-wrap items-center gap-2 md:col-span-1 md:col-start-3 md:row-start-1 md:-mt-2 md:justify-end xl:col-start-4">
+        {!role.is_active && onReactivate && (
+          // Only on an Inactive row, first, because it is that row's main
+          // action. Named for the role and following the state, as Delete is.
+          <Button
+            variant="primary"
+            className={ROW_CONTROL}
+            onClick={onReactivate}
+            aria-label={
+              reactivating
+                ? `Reactivating agent ${agentWithRoleLabel(role)}…`
+                : `Reactivate agent ${agentWithRoleLabel(role)}`
+            }
+            aria-busy={reactivating}
+            aria-disabled={anyReactivating || anyDeleting}
+          >
+            {reactivating ? "Reactivating…" : "Reactivate"}
+          </Button>
+        )}
         <Button
           variant="secondary"
           className={ROW_CONTROL}
@@ -569,7 +629,7 @@ function RoleRow({
             deleting ? `Deleting agent ${agentWithRoleLabel(role)}…` : `Delete agent ${agentWithRoleLabel(role)}`
           }
           aria-busy={deleting}
-          aria-disabled={anyDeleting}
+          aria-disabled={anyDeleting || anyReactivating}
         >
           {deleting ? "Deleting…" : "Delete"}
         </Button>

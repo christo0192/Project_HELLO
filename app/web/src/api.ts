@@ -189,7 +189,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
-  updateRole: (id: string, body: Partial<RoleInput>) =>
+  // `is_active` is not on the form (RoleInput): only Reactivate sends it.
+  updateRole: (id: string, body: Partial<RoleInput> & { is_active?: boolean }) =>
     request<Role>(`/api/roles/${id}`, {
       method: 'PUT',
       body: JSON.stringify(body),
