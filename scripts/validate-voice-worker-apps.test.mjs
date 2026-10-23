@@ -274,14 +274,15 @@ for (const [label, browser, phone] of NEG) {
   rmSync(good, { recursive: true, force: true });
   rmSync(bad, { recursive: true, force: true });
 }
-// The SHIPPED browser config keeps the flag ABSENT (M019 ships inert). Turning
-// it on is the reviewed R1 concurrency rollout step, after the API dispatches
-// to reported per-machine names; that PR must update this expectation.
+// The SHIPPED browser config turns the flag ON: R1 concurrency rollout step 2
+// (docs/runbooks/r1-operations.md), after #378's API dispatches to reported
+// per-machine names. Rolling it back (API flag off first) must update this
+// expectation again.
 {
   const r = spawnSync(process.execPath, [validator], { encoding: "utf8" });
   const out = (r.stdout || "") + (r.stderr || "");
-  ok(/browser_per_machine_agent_name=off/.test(out),
-    `the shipped fly.toml must leave BROWSER_PER_MACHINE_AGENT_NAME absent (inert), got:\n${out}`);
+  ok(r.status === 0 && /browser_per_machine_agent_name=on/.test(out),
+    `the shipped fly.toml must set BROWSER_PER_MACHINE_AGENT_NAME = "true" (rollout step 2), got:\n${out}`);
 }
 // The SHIPPED phone config: PR-B (M009 B6) flips the per-machine flag ON —
 // only after PR-A's API that accepts and stores names is live — and PR-A's
