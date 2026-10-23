@@ -120,12 +120,17 @@ paths:
     get:
       tags: [r1]
       operationId: getR1Settings
-      responses: { '200': { description: R1 settings and lazy runtime status } }
+      description: 'Admin only. The r1_settings row, the lazy runtime status, and browser_worker_pool_size: the number of browser worker machines admission counts (voice_worker_leases rows of app project-hello-voice and pipeline browser, in any state), or null when it could not be read. Read-only; it is not a setting. max_concurrent_sessions (0131, 1 to 15, default 1) is the most live R1 interviews the self-hosted target admits at once; admission caps it at the pool size, and the Cloud target admits one whatever it says.'
+      responses: { '200': { description: R1 settings, the browser worker pool size and lazy runtime status } }
     put:
       tags: [r1]
       operationId: updateR1Settings
-      description: 'Admin only. recording_mode (R1-REC) is the instant operational switch for interview recording: off (default), audio or av; any other value is 400 invalid_r1_settings. It is one of several locks (the R2 secrets on the API, the worker capability flags, and the candidate''s live consent to video_audio_recording); the audit row carries the new value.'
-      responses: { '200': { description: Updated, audited R1 settings } }
+      description: 'Admin only. recording_mode (R1-REC) is the instant operational switch for interview recording: off (default), audio or av; any other value is 400 invalid_r1_settings. It is one of several locks (the R2 secrets on the API, the worker capability flags, and the candidate''s live consent to video_audio_recording); the audit row carries the new value. max_concurrent_sessions (0131) takes a whole number from 1 to 15 (anything else, a numeric string included, is 400 invalid_r1_settings) and the audit row carries the new value. A value above 1 is refused with 409 r1_concurrency_needs_machine_names while the API flag BROWSER_REQUIRE_MACHINE_AGENT_NAME is off (without per-machine dispatch names two concurrent interviews share one agent name and can land on, or stop, the wrong machine), with 409 r1_concurrency_above_worker_pool (with browser_worker_pool_size) while the browser worker pool has fewer machines, and with 503 service_unavailable when the pool cannot be read; lowering it to 1 is always accepted. browser_worker_pool_size cannot be written (400). Raising the limit above 1 also needs per-machine browser agent names and a provisioned pool (docs/runbooks/r1-operations.md).'
+      responses:
+        '200': { description: Updated, audited R1 settings }
+        '400': { description: 'A field failed validation, or a read-only field was sent (invalid_r1_settings).' }
+        '409': { description: 'max_concurrent_sessions is above 1 while BROWSER_REQUIRE_MACHINE_AGENT_NAME is off (r1_concurrency_needs_machine_names), max_concurrent_sessions is above the browser worker pool (r1_concurrency_above_worker_pool, with browser_worker_pool_size), or enabling R1 while the allocation was never set (r1_allocation_not_set).' }
+        '503': { description: 'A read the change depends on failed (service_unavailable).' }
   /api/interview-rounds/availability:
     get:
       tags: [r1]
@@ -756,7 +761,7 @@ paths:
       tags: [r1]
       operationId: createR1Attempt
       summary: Admit an R1 attempt (link token) or rejoin a live one (link token + nonce)
-      description: 'Without a nonce: runs r1_admit_attempt (budget, concurrency, starts, consent, one live R1) and returns an attempt token plus a per-attempt nonce that only the creating tab keeps; 409 r1_busy when another interview is finishing. Refused with 503 r1_unavailable BEFORE admission while DeepSeek is unhealthy (cached probe), so an outage spends no start and no capacity. With the nonce: re-mints an attempt token for the attempt that is still live and admits nothing. The persona is never returned.'
+      description: 'Without a nonce: runs r1_admit_attempt (budget, concurrency, starts, consent, the live R1 limit) and returns an attempt token plus a per-attempt nonce that only the creating tab keeps. The live R1 limit (0131) is r1_settings.max_concurrent_sessions (1 to 15, default 1), capped by the browser worker pool (one session per machine, floor 1) on the self-hosted target and always 1 on Cloud. 409 r1_busy when every slot is in use (r1_in_flight), the Cloud agent sessions are full (cloud_capacity_exhausted), or, only above a limit of 1, this round already has a live session (round_live, a second tab without the nonce). The busy answer carries a Retry-After header equal to retry_after_sec: 1800 at a limit of 1 ("another interview is finishing, about 30 minutes"; the body is exactly {error, retry_after_sec}), 300 with busy_reason slots_full above it ("all interview slots are in use, about 5 minutes"), and 300 with busy_reason own_session_live for round_live ("your interview is open on another device or tab"). Refused with 503 r1_unavailable BEFORE admission while DeepSeek is unhealthy (cached probe), so an outage spends no start and no capacity. With the nonce: re-mints an attempt token for the attempt that is still live and admits nothing. The persona is never returned.'
       security: []
       requestBody:
         required: true
@@ -823,7 +828,29 @@ paths:
         '404':
           description: Stable unknown-or-expired link (r1_link_invalid_or_expired) or invalid-attempt (r1_attempt_invalid) response.
         '409':
-          description: Refused by admission (r1_busy, consent_required, r1_disabled, r1_paused, r1_capacity_exhausted, starts_exhausted, attempts_exhausted, round_expired, round_not_admissible) or, for a rejoin, because the attempt is no longer live (r1_attempt_not_live).
+          description: Refused by admission (r1_busy, consent_required, r1_disabled, r1_paused, r1_capacity_exhausted, starts_exhausted, attempts_exhausted, round_expired, round_not_admissible) or, for a rejoin, because the attempt is no longer live (r1_attempt_not_live). r1_busy also sends a Retry-After header (seconds) equal to retry_after_sec, and, only when admission runs more than one live R1 at once, busy_reason slots_full (every slot in use) or own_session_live (this round already has a live session, round_live).
+          headers:
+            Retry-After:
+              description: Sent with r1_busy only. 1800 at a live R1 limit of 1; 300 above it.
+              schema:
+                type: integer
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [error]
+                properties:
+                  error:
+                    type: string
+                  retry_after_sec:
+                    type: integer
+                    enum: [300, 1800]
+                    description: r1_busy only; the same value as the Retry-After header.
+                  busy_reason:
+                    type: string
+                    enum: [slots_full, own_session_live]
+                    description: r1_busy only, and only above a live R1 limit of 1. slots_full means every slot is in use (the page says all interview slots are in use); own_session_live means this candidate's own round already has a live session, a second tab or device (the page says the interview is open on another device or tab). Absent at the default limit of 1.
         '503':
           description: Maintenance, endpoint mismatch (r1_endpoint_mismatch), R1 unavailable (r1_unavailable: DeepSeek unhealthy or unconfigured with retry_after_sec, no worker gate on the R1 SFU, or the Cloud fallback while the legacy browser lane is enabled; all refused before admission spends a start), or service unavailable (service_unavailable).
   /api/r1/exchange:

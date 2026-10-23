@@ -1,5 +1,10 @@
-import { describe, expect, it, vi } from 'vitest';
-import type { BrowserWorkerGate } from '../lib/browser-orchestration.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  browserOrchestrationGate,
+  type BrowserAgentDispatchClientLike,
+  type BrowserWorkerGate,
+} from '../lib/browser-orchestration.js';
+import type { EnsureReadyResult, WorkerOrchestrationService } from '../lib/worker-orchestration.js';
 import {
   JOBLESS_DISPATCH_GRACE_MS,
   epochMs,
@@ -431,6 +436,293 @@ describe('R1 worker gate: failClosed (the R1 SFU has no auto-dispatching worker)
     })).toBe('proceed');
     const disabled = gateWith({ ensureReadyWorker: vi.fn(async () => ({ status: 'disabled' })) });
     expect(await run(disabled, lister())).toBe('proceed');
+  });
+});
+
+// ── M019: per-machine dispatch names (R1 concurrency) ─────────────────────
+//
+// Machine ids below are synthetic, not identifiers of any real machine.
+const MACHINE_A = 'aaaa1111bbbb22';
+const MACHINE_B = 'cccc3333dddd44';
+const NAME_A = `browser-screener-${MACHINE_A}`;
+const NAME_B = `browser-screener-${MACHINE_B}`;
+
+describe('R1 worker gate (M019): a per-machine dispatch is one of ours', () => {
+  it('a rejoin with a LIVE per-machine job proceeds and never claims a machine', async () => {
+    const gate = gateWith();
+    const list = lister([running('AD_named', { agentName: NAME_A })]);
+    expect(await run(gate, list)).toBe('proceed');
+    expect(gate.ensureReadyWorker).not.toHaveBeenCalled();
+    expect(gate.dispatch).not.toHaveBeenCalled();
+    expect(gate.releaseWorker).not.toHaveBeenCalled();
+    expect(list.deleteDispatch).not.toHaveBeenCalled();
+  });
+
+  it('a young job-less per-machine dispatch is in flight: defer, no second dispatch', async () => {
+    const gate = gateWith();
+    const list = lister([{ ...jobless(2_000, 'AD_named'), agentName: NAME_B }]);
+    expect(await run(gate, list)).toBe('preparing');
+    expect(gate.ensureReadyWorker).not.toHaveBeenCalled();
+    expect(list.deleteDispatch).not.toHaveBeenCalled();
+  });
+
+  it('a stale job-less per-machine dispatch is deleted and replaced', async () => {
+    const gate = gateWith();
+    const list = lister([{ ...jobless(60_000, 'AD_named'), agentName: NAME_A }]);
+    expect(await run(gate, list)).toBe('proceed');
+    expect(list.deleteDispatch).toHaveBeenCalledWith('AD_named', ROOM);
+    expect(gate.dispatch).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['another base', `other-screener-${MACHINE_A}`],
+    ['a malformed suffix', `browser-screener-${MACHINE_A}.x`],
+    ['an uppercase machine id', `browser-screener-${MACHINE_A.toUpperCase()}`],
+    ['the base with no suffix', 'browser-screener-'],
+  ])('a live dispatch that only LOOKS like ours is not ours (%s)', async (_label, agentName) => {
+    const gate = gateWith();
+    const list = lister([running('AD_foreign', { agentName })]);
+    expect(await run(gate, list)).toBe('proceed');
+    // Exactly as for any other agent: a worker is readied and dispatched, and the
+    // foreign dispatch is never deleted.
+    expect(gate.ensureReadyWorker).toHaveBeenCalledTimes(1);
+    expect(gate.dispatch).toHaveBeenCalledTimes(1);
+    expect(list.deleteDispatch).not.toHaveBeenCalled();
+  });
+
+  it('clears our per-machine job-less record a failed dispatch left behind', async () => {
+    const items: DispatchLike[] = [];
+    const gate = gateWith({
+      dispatchNameFor: vi.fn(() => NAME_A),
+      dispatch: vi.fn(async () => {
+        items.push({ ...jobless(1_000, 'AD_named_dropped'), agentName: NAME_A });
+        return false;
+      }),
+    });
+    const list = lister(items);
+    expect(await run(gate, list)).toBe('preparing');
+    expect(gate.releaseWorker).toHaveBeenCalledWith({ machineId: 'm1', sessionId: SESSION });
+    expect(list.deleteDispatch).toHaveBeenCalledWith('AD_named_dropped', ROOM);
+    expect(items).toEqual([]);
+  });
+});
+
+describe("R1 worker gate (M019): the gate's dispatch name decides the machine", () => {
+  it('passes a per-machine name on to dispatch', async () => {
+    const dispatchNameFor = vi.fn(() => NAME_A);
+    const gate = gateWith({ dispatchNameFor });
+    expect(await run(gate, lister())).toBe('proceed');
+    expect(dispatchNameFor).toHaveBeenCalledWith(
+      expect.objectContaining({ status: 'ready', machineId: 'm1' }),
+    );
+    expect(gate.dispatch).toHaveBeenCalledWith({
+      sessionId: SESSION, roomName: ROOM, agentName: NAME_A,
+    });
+  });
+
+  it('the shared name keeps the dispatch call exactly as today', async () => {
+    const gate = gateWith({ dispatchNameFor: vi.fn(() => 'browser-screener') });
+    expect(await run(gate, lister())).toBe('proceed');
+    expect(gate.dispatch).toHaveBeenCalledWith({ sessionId: SESSION, roomName: ROOM });
+  });
+
+  it('a refused name releases the claimed machine and defers, touching nothing else', async () => {
+    const gate = gateWith({ dispatchNameFor: vi.fn(() => null) });
+    const list = lister([jobless(60_000, 'AD_stale')]);
+    expect(await run(gate, list)).toBe('preparing');
+    expect(gate.releaseWorker).toHaveBeenCalledWith({ machineId: 'm1', sessionId: SESSION });
+    expect(gate.dispatch).not.toHaveBeenCalled();
+    // The room is left as it was for the next exchange to judge.
+    expect(list.deleteDispatch).not.toHaveBeenCalled();
+  });
+});
+
+// The REAL browser gate behind the R1 worker gate, over one fake LiveKit that
+// both lists and creates dispatches, so these assert what reaches LiveKit.
+
+const R1_ENV = ['BROWSER_LIVEKIT_TARGET', 'R1_LIVEKIT_URL', 'R1_LIVEKIT_API_KEY',
+  'R1_LIVEKIT_API_SECRET'] as const;
+
+/** Select the R1 endpoint for one test (cleaned by afterEach). */
+function selectR1(): void {
+  process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+  process.env.R1_LIVEKIT_URL = 'wss://r1.example.test:7880';
+  process.env.R1_LIVEKIT_API_KEY = 'r1-key';
+  process.env.R1_LIVEKIT_API_SECRET = 'r1-secret';
+}
+
+afterEach(() => {
+  for (const key of R1_ENV) delete process.env[key];
+});
+
+/** A ready lease for one machine, on the R1 host, reporting `agentName`. */
+function readyOn(machineId: string, agentName: string | null): EnsureReadyResult {
+  return { status: 'ready', machineId, epoch: 1, agentName, livekitHost: 'r1.example.test' };
+}
+
+/** An orchestration service that leases each session its own ready machine. */
+function poolService(bySession: Record<string, EnsureReadyResult>) {
+  const ensureCalls: string[] = [];
+  const releaseCalls: Array<{ machineId: string; sessionId: string }> = [];
+  const service: WorkerOrchestrationService = {
+    async ensureReadyWorker(input) {
+      ensureCalls.push(input.sessionId);
+      return bySession[input.sessionId] ?? { status: 'no_capacity' };
+    },
+    async releaseWorker(input) {
+      releaseCalls.push({ machineId: input.machineId, sessionId: input.sessionId });
+    },
+    async releaseWorkerBySession() {
+      /* not exercised */
+    },
+    async releaseTerminalSessions() {
+      return { released: 0 };
+    },
+    async markBusy() {
+      /* not exercised */
+    },
+    async reapWorkers() {
+      return { stopped: 0 };
+    },
+  };
+  return { service, ensureCalls, releaseCalls };
+}
+
+/** One fake LiveKit: every created dispatch is accepted by a worker at once. */
+function fakeLiveKit(seed: Record<string, DispatchLike[]> = {}) {
+  const rooms = new Map<string, DispatchLike[]>(Object.entries(seed));
+  let made = 0;
+  const createDispatch = vi.fn(async (roomName: string, agentName: string) => {
+    made += 1;
+    const dispatch: DispatchLike = {
+      id: `AD_made_${made}`,
+      agentName,
+      state: { jobs: [{ id: `AJ_${made}`, state: { status: 1 } }], createdAt: created(0) },
+    };
+    rooms.set(roomName, [...(rooms.get(roomName) ?? []), dispatch]);
+    return { id: dispatch.id };
+  });
+  const listDispatch = vi.fn(async (roomName: string) => [...(rooms.get(roomName) ?? [])]);
+  const deleteDispatch = vi.fn(async (id: string, roomName: string) => {
+    rooms.set(roomName, (rooms.get(roomName) ?? []).filter((item) => item.id !== id));
+  });
+  const client: BrowserAgentDispatchClientLike = { createDispatch, listDispatch, deleteDispatch };
+  return { client, lister: { listDispatch, deleteDispatch }, createDispatch };
+}
+
+function realGate(
+  service: WorkerOrchestrationService,
+  client: BrowserAgentDispatchClientLike,
+  requireMachineAgentName?: boolean,
+) {
+  return browserOrchestrationGate({
+    enabled: true,
+    agentName: 'browser-screener',
+    service,
+    dispatchClient: client,
+    roomHasAgent: async () => false,
+    now: clock,
+    sleep: async () => undefined,
+    ...(requireMachineAgentName === undefined ? {} : { requireMachineAgentName }),
+  })!;
+}
+
+const SESSION_B = '30000000-0000-4000-8000-0000000000e2';
+const ROOM_B = `screening-${SESSION_B}`;
+
+const runReal = (
+  gate: BrowserWorkerGate,
+  livekit: ReturnType<typeof fakeLiveKit>,
+  sessionId = SESSION,
+  roomName = ROOM,
+) => runR1WorkerGate({
+  gate, sessionId, roomName, dispatches: () => livekit.lister, now: clock, failClosed: true,
+});
+
+describe('R1 worker gate (M019) over the real browser gate', () => {
+  it('two sessions on two machines each go to their OWN per-machine name', async () => {
+    selectR1();
+    const pool = poolService({
+      [SESSION]: readyOn(MACHINE_A, NAME_A),
+      [SESSION_B]: readyOn(MACHINE_B, NAME_B),
+    });
+    const livekit = fakeLiveKit();
+    const gate = realGate(pool.service, livekit.client);
+    const verdicts = await Promise.all([
+      runReal(gate, livekit, SESSION, ROOM),
+      runReal(gate, livekit, SESSION_B, ROOM_B),
+    ]);
+    expect(verdicts).toEqual(['proceed', 'proceed']);
+    expect(livekit.createDispatch.mock.calls.map((call) => [call[0], call[1]]).sort())
+      .toEqual([[ROOM, NAME_A], [ROOM_B, NAME_B]].sort());
+    // Nothing went to the shared name, and no machine was let go.
+    expect(livekit.createDispatch.mock.calls.map((call) => call[1]))
+      .not.toContain('browser-screener');
+    expect(pool.releaseCalls).toEqual([]);
+  });
+
+  it("a name for ANOTHER machine releases this lease and defers, dispatching nothing", async () => {
+    selectR1();
+    for (const requireMachineAgentName of [false, true]) {
+      const pool = poolService({ [SESSION]: readyOn(MACHINE_A, NAME_B) });
+      const livekit = fakeLiveKit();
+      const gate = realGate(pool.service, livekit.client, requireMachineAgentName);
+      expect(await runReal(gate, livekit)).toBe('preparing');
+      expect(livekit.createDispatch).not.toHaveBeenCalled();
+      expect(pool.releaseCalls).toEqual([{ machineId: MACHINE_A, sessionId: SESSION }]);
+    }
+  });
+
+  it('flag on: a lease with no per-machine name releases and defers', async () => {
+    selectR1();
+    for (const reported of [null, 'browser-screener']) {
+      const pool = poolService({ [SESSION]: readyOn(MACHINE_A, reported) });
+      const livekit = fakeLiveKit();
+      const gate = realGate(pool.service, livekit.client, true);
+      expect(await runReal(gate, livekit)).toBe('preparing');
+      expect(livekit.createDispatch).not.toHaveBeenCalled();
+      expect(pool.releaseCalls).toEqual([{ machineId: MACHINE_A, sessionId: SESSION }]);
+    }
+  });
+
+  it('flag off (the default): no per-machine name dispatches the shared name (today)', async () => {
+    selectR1();
+    const pool = poolService({ [SESSION]: readyOn(MACHINE_A, null) });
+    const livekit = fakeLiveKit();
+    const gate = realGate(pool.service, livekit.client);
+    expect(await runReal(gate, livekit)).toBe('proceed');
+    expect(livekit.createDispatch.mock.calls.map((call) => [call[0], call[1]]))
+      .toEqual([[ROOM, 'browser-screener']]);
+    expect(pool.releaseCalls).toEqual([]);
+  });
+
+  it('a rejoin with a live per-machine job proceeds, never calling ensureReadyWorker', async () => {
+    selectR1();
+    const pool = poolService({ [SESSION]: readyOn(MACHINE_A, NAME_A) });
+    const livekit = fakeLiveKit();
+    const gate = realGate(pool.service, livekit.client, true);
+    expect(await runReal(gate, livekit)).toBe('proceed');
+    for (let rejoin = 0; rejoin < 3; rejoin += 1) {
+      expect(await runReal(gate, livekit)).toBe('proceed');
+    }
+    expect(pool.ensureCalls).toEqual([SESSION]);
+    expect(livekit.createDispatch).toHaveBeenCalledTimes(1);
+    expect(pool.releaseCalls).toEqual([]);
+  });
+
+  it('Cloud: reported names are ignored and the shared name is dispatched, as today', async () => {
+    // No selectR1(): the Cloud target. The host is never consulted there either.
+    for (const reported of [NAME_A, NAME_B, null]) {
+      const pool = poolService({ [SESSION]: readyOn(MACHINE_A, reported) });
+      const livekit = fakeLiveKit();
+      const gate = realGate(pool.service, livekit.client, true);
+      expect(await runR1WorkerGate({
+        gate, sessionId: SESSION, roomName: ROOM, dispatches: () => livekit.lister, now: clock,
+      })).toBe('proceed');
+      expect(livekit.createDispatch.mock.calls.map((call) => [call[0], call[1]]))
+        .toEqual([[ROOM, 'browser-screener']]);
+      expect(pool.releaseCalls).toEqual([]);
+    }
   });
 });
 

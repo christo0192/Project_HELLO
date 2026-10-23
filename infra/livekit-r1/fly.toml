@@ -14,10 +14,19 @@ kill_timeout = 300 # memo §3.7: Fly maximum; deployments require zero live room
   # NODE_IP = "<dedicated IPv4>"
   # LIVEKIT_KEYS is a Fly secret, never a checked-in environment value.
 
+# M019 (PR #378, up to 15 concurrent R1 interviews): performance-4x / 8 GB, up
+# from performance-1x / 2 GB (sized with headroom for 25 rooms). 25 camera rooms are estimated at about one full
+# vCPU of forwarding (~16 Mbps in, ~16 Mbps out, ~8k pps), which would pin a 1x
+# at its ceiling; 4x keeps the S0-C gate (SFU CPU p95 < 60%) in reach. This is an
+# ESTIMATE, not a measurement. The SFU is deployed MANUALLY (never by
+# deploy-fly.yml), in a zero-live-room window BEFORE the load test in
+# docs/runbooks/r1-operations.md ("Concurrent R1 interviews (PR #378)", step 4),
+# which then measures this 4x shape (step 5): a deploy or resize restarts the
+# one Machine and ends every live interview.
 [[vm]]
-  cpu_kind = "performance" # memo §3.2: performance-1x avoids shared-CPU media throttling.
-  cpus = 1
-  memory_mb = 2048
+  cpu_kind = "performance" # memo §3.2: dedicated CPU avoids shared-CPU media throttling.
+  cpus = 4
+  memory_mb = 8192
 
 [metrics]
   port = 6789 # memo §3.1: metrics are private because no service exposes this port.
@@ -30,10 +39,16 @@ kill_timeout = 300 # memo §3.7: Fly maximum; deployments require zero live room
   auto_start_machines = true # S0-F2 proves a proxy wake reaches UDP on the first join.
   auto_stop_machines = "stop" # v2 D16 default: on-demand; use `fly deploy --ha=false` for one Machine.
   min_machines_running = 0 # no autoscale / no always-on machine during the spike.
+  # M019: cap 15 rooms, sized with headroom for 25. Each room holds about 3 signaling connections
+  # (candidate, agent, a reconnect overlap), plus one worker registration per
+  # browser machine (pool N+3) and the API's Twirp calls: about 100-110 at
+  # N=25. soft 300 / hard 600 leaves room for rejoin storms after a network
+  # blip; with one Machine there is nowhere to shed load, so the soft limit is
+  # only a metric, and the hard limit is the real refusal point.
   [services.concurrency]
     type = "connections"
-    soft_limit = 100
-    hard_limit = 250
+    soft_limit = 300
+    hard_limit = 600
   [[services.ports]]
     port = 443
     handlers = ["tls", "http"] # memo §3.1: public signaling/Twirp/agent endpoint.

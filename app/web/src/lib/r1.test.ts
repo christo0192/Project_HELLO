@@ -265,6 +265,69 @@ describe('settings draft', () => {
       pause_line_minutes: '4000',
       advance_threshold: '65',
       hold_threshold: '45',
+      // 0131: an older API sends no column, which reads as the single slot it means.
+      max_concurrent_sessions: '1',
+    });
+    expect(draftFromSettings({ ...SETTINGS, max_concurrent_sessions: 7 }).max_concurrent_sessions)
+      .toBe('7');
+  });
+
+  describe('max_concurrent_sessions (0131): interviews at the same time', () => {
+    const POOLED = { ...SETTINGS, livekit_target: 'r1' as const, max_concurrent_sessions: 2, browser_worker_pool_size: 5 };
+
+    it.each(['1', '2', '15', ' 10 '])('accepts %j', (value) => {
+      expect(validateSettingsDraft({ ...draftFromSettings(SETTINGS), max_concurrent_sessions: value })).toEqual({});
+    });
+
+    it.each(['', '0', '16', '26', '-1', '2.5', '1e1', 'abc', '100'])('rejects %j with the range', (value) => {
+      const errors = validateSettingsDraft({ ...draftFromSettings(SETTINGS), max_concurrent_sessions: value });
+      expect(errors.max_concurrent_sessions).toBe('Enter a whole number from 1 to 15.');
+    });
+
+    it('refuses a raise past the machines the server reported, before any request', () => {
+      const errors = validateSettingsDraft({ ...draftFromSettings(POOLED), max_concurrent_sessions: '6' }, POOLED);
+      expect(errors.max_concurrent_sessions).toBe(
+        'Only 5 interview machines are registered, so R1 can run at most 5 interviews at a time.',
+      );
+      expect(validateSettingsDraft({ ...draftFromSettings(POOLED), max_concurrent_sessions: '5' }, POOLED)).toEqual({});
+      const one = { ...POOLED, browser_worker_pool_size: 1 };
+      expect(validateSettingsDraft({ ...draftFromSettings(one), max_concurrent_sessions: '3' }, one).max_concurrent_sessions)
+        .toBe('Only 1 interview machine is registered, so R1 runs one interview at a time.');
+      const none = { ...POOLED, browser_worker_pool_size: 0 };
+      expect(validateSettingsDraft({ ...draftFromSettings(none), max_concurrent_sessions: '3' }, none).max_concurrent_sessions)
+        .toBe('No interview machines are registered, so R1 runs one interview at a time.');
+    });
+
+    it('never blocks 1, an unchanged value over a shrunken pool, or an unknown pool (the server checks)', () => {
+      const shrunk = { ...POOLED, max_concurrent_sessions: 4, browser_worker_pool_size: 2 };
+      expect(validateSettingsDraft({ ...draftFromSettings(shrunk), paused: true }, shrunk)).toEqual({});
+      expect(validateSettingsDraft({ ...draftFromSettings(shrunk), max_concurrent_sessions: '1' }, shrunk)).toEqual({});
+      for (const pool of [null, undefined]) {
+        const unknown = { ...POOLED, browser_worker_pool_size: pool };
+        expect(validateSettingsDraft({ ...draftFromSettings(unknown), max_concurrent_sessions: '12' }, unknown)).toEqual({});
+      }
+    });
+
+    it('sends the limit only when it changed, as a number, and never for an older API', () => {
+      expect(settingsPatch({ ...draftFromSettings(POOLED), max_concurrent_sessions: ' 4 ' }, POOLED))
+        .toEqual({ max_concurrent_sessions: 4 });
+      expect(settingsPatch(draftFromSettings(POOLED), POOLED)).toEqual({});
+      // No column on the saved row: the draft reads '1' and nothing is sent.
+      expect(settingsPatch(draftFromSettings(SETTINGS), SETTINGS)).toEqual({});
+      expect(settingsPatch({ ...draftFromSettings(SETTINGS), max_concurrent_sessions: '3' }, SETTINGS))
+        .toEqual({ max_concurrent_sessions: 3 });
+      expect(settingsPatch({ ...draftFromSettings(POOLED), max_concurrent_sessions: '0' }, POOLED)).toEqual({});
+    });
+
+    it('asks before RAISING the limit, never before lowering it', () => {
+      expect(needsConfirmation({ max_concurrent_sessions: 5 }, POOLED)).toEqual([
+        'let up to 5 R1 interviews run at the same time (now 2), each on its own interview machine',
+      ]);
+      expect(needsConfirmation({ max_concurrent_sessions: 1 }, POOLED)).toEqual([]);
+      expect(needsConfirmation({ max_concurrent_sessions: 2 }, POOLED)).toEqual([]);
+      // Without the saved row any limit above 1 is a raise.
+      expect(needsConfirmation({ max_concurrent_sessions: 2 })[0]).toMatch(/up to 2 R1 interviews/);
+      expect(needsConfirmation({ max_concurrent_sessions: 1 })).toEqual([]);
     });
   });
 

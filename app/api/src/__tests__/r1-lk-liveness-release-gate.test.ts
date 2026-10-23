@@ -464,14 +464,16 @@ describe('3. the merge gate for this PR is run by hand, and the record says so',
     expect(DEPLOY).toContain('--include-all');
   });
 
-  it('TRIPWIRE: the doc says no automated zero-live pre-step exists, and none does', () => {
-    // When one lands, this fails: update the runbook (and this test) in that PR.
+  it('TRIPWIRE: the automated zero-live pre-step covers live R1 only, as the doc says', () => {
+    // PR #378 added the R1 count; when phone or screening work is checked too, this fails:
+    // update the runbook (and this test) in that PR.
     expectFlatContains(
       GATE_SECTION,
-      'The automated zero-live pre-step named in the plan (section 9) does not exist yet',
+      'The automated zero-live pre-step named in the plan (section 9) covers live R1 only',
     );
-    const gateTables = ['phone_call_attempts', 'call_sessions', 'job_queue', 'phone_appointments'];
-    for (const table of gateTables) {
+    expect(DEPLOY).toContain('where interview_round_id is not null');
+    expect(DEPLOY.match(/call_sessions/g) ?? []).toHaveLength(1);
+    for (const table of ['phone_call_attempts', 'job_queue', 'phone_appointments']) {
       expect(DEPLOY, `deploy-fly.yml mentions ${table}`).not.toContain(table);
     }
   });
@@ -561,7 +563,7 @@ describe('2. the phone-impact record (plan section 9) says what the code does', 
     );
   });
 
-  it('the two opt-in options keys are written only behind BROWSER_WORKER_ONE_JOB=on', () => {
+  it('the two opt-in options keys are written only behind one-job or per-machine names', () => {
     const options = between(
       AGENT,
       'def build_worker_options(',
@@ -574,7 +576,10 @@ describe('2. the phone-impact record (plan section 9) says what the code does', 
     expect(branchEnd).toBeLessThan(options.indexOf('agent_name = _phone_agent_name()'));
     const browser = options.slice(0, branchEnd);
     expect(browser.match(/options\["load_(?:fnc|threshold)"\] = /g) ?? []).toHaveLength(2);
-    const gate = browser.indexOf('if _browser_worker_one_job():');
+    // M019: per-machine browser names (concurrent R1) also force one job per worker.
+    const gate = browser.indexOf(
+      'if _browser_worker_one_job() or _browser_per_machine_agent_name_enabled():',
+    );
     expect(gate).toBeGreaterThan(-1);
     for (const key of ['load_fnc', 'load_threshold']) {
       expect(browser.indexOf(`options["${key}"] = `), key).toBeGreaterThan(gate);

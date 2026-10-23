@@ -1,6 +1,6 @@
 /**
- * livekit-phone-dial/agent-name.ts — the ONE definition of a per-machine phone
- * worker's LiveKit dispatch name (M009 E2).
+ * livekit-phone-dial/agent-name.ts — the phone lane's names for the per-machine
+ * worker dispatch name (M009 E2).
  *
  * ── WHY A PER-MACHINE NAME EXISTS AT ALL ──────────────────────────────
  * Every phone machine used to register with LiveKit under the same shared
@@ -21,6 +21,13 @@
  * trusts a reported name, and `phoneMachineAgentName` exists for the operator
  * tools (Canary-1 `--machine`) that must spell the same name the worker does.
  *
+ * ── ONE DEFINITION, SHARED WITH THE BROWSER LANE (M019) ───────────────
+ * The patterns and the checks live in `lib/worker-agent-name.ts`, which the
+ * R1 browser gate uses too, so the two lanes can never disagree on what a
+ * valid per-machine name is. This file keeps the phone lane's exported names
+ * and behaviour exactly as they were: every export below is the shared
+ * definition, unchanged.
+ *
  * ── THE TWO PATTERNS ARE A CONTRACT WITH TWO OTHER LANGUAGES ──────────
  * `AGENT_NAME_RE` is the same pattern as the 0112 CHECK constraint on
  * `voice_worker_leases.registered_agent_name` and the `/ready-machine` schema;
@@ -30,23 +37,25 @@
  * ready ping into a 500, and a name the worker registers but the API rejects
  * defers every dial.
  *
- * Importing this module performs NO I/O and reads NO ambient state.
+ * Importing this module performs NO I/O and reads NO ambient state. Its one
+ * import is `lib/worker-agent-name.ts`, which has zero imports of its own, so
+ * a module that imports this file (the Canary-1 entry) gains two leaves and
+ * nothing behind them.
  */
 
-/**
- * A Fly machine id as the per-machine suffix accepts it: lowercase hex/base36,
- * bounded. Deliberately narrower than the route's generic Fly-id pattern — the
- * suffix becomes part of a LiveKit dispatch name, so nothing outside this
- * class (dots, uppercase, separators) is allowed to reach it.
- */
-export const PER_MACHINE_ID_RE = /^[0-9a-z]{8,32}$/;
+import {
+  AGENT_NAME_RE,
+  PER_MACHINE_ID_RE,
+  isReportedMachineAgentName,
+  machineAgentName,
+} from '../../lib/worker-agent-name.js';
 
 /**
- * A reported per-machine agent name: a bounded base, one '-', then a machine
- * id of the `PER_MACHINE_ID_RE` class. Mirrors the 0112 CHECK constraint
- * byte-for-byte.
+ * A Fly machine id as the per-machine suffix accepts it (8-32 of [0-9a-z]),
+ * and a reported per-machine agent name (the 0112 CHECK pattern). Re-exported
+ * from the shared definition; see `lib/worker-agent-name.ts`.
  */
-export const AGENT_NAME_RE = /^[A-Za-z0-9_-]{1,64}-[0-9a-z]{8,32}$/;
+export { AGENT_NAME_RE, PER_MACHINE_ID_RE };
 
 /**
  * The per-machine dispatch name for `machineId` under the shared `base` name,
@@ -59,12 +68,7 @@ export const AGENT_NAME_RE = /^[A-Za-z0-9_-]{1,64}-[0-9a-z]{8,32}$/;
  * refuses the run).
  */
 export function phoneMachineAgentName(base: string, machineId: string): string | null {
-  if (typeof base !== 'string' || typeof machineId !== 'string') return null;
-  if (!PER_MACHINE_ID_RE.test(machineId)) return null;
-  const name = `${base}-${machineId}`;
-  // The composed name must itself satisfy the stored-name contract, so an
-  // empty or over-long base cannot produce a name the database would refuse.
-  return AGENT_NAME_RE.test(name) ? name : null;
+  return machineAgentName(base, machineId);
 }
 
 /**
@@ -82,7 +86,5 @@ export function isReportedAgentNameFor(
   machineId: string,
   reported: string | null | undefined,
 ): boolean {
-  if (typeof reported !== 'string') return false;
-  const expected = phoneMachineAgentName(base, machineId);
-  return expected !== null && reported === expected;
+  return isReportedMachineAgentName(base, machineId, reported);
 }

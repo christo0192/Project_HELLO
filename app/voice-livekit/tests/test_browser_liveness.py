@@ -26,6 +26,7 @@ class _Env:
         "PHONE_AGENT_NAME", "BROWSER_AGENT_NAME", "WORKER_ORCHESTRATION",
         "BROWSER_WORKER_ONE_JOB", "R1_READINESS_HOST", "LIVEKIT_URL",
         "PHONE_PER_MACHINE_AGENT_NAME", "FLY_MACHINE_ID",
+        "BROWSER_PER_MACHINE_AGENT_NAME",
     )
 
     def __init__(self, values: dict[str, str]):
@@ -448,6 +449,10 @@ class TestPhoneAndUnnamedOptionsIgnoreR1Switches(unittest.TestCase):
         "BROWSER_WORKER_ONE_JOB": "on",
         "R1_READINESS_HOST": "on",
         "LIVEKIT_URL": "wss://r1.example.test",
+        # M019: the per-machine browser opt-in (with a well-formed machine id)
+        # must not reach the phone or the unnamed worker either.
+        "BROWSER_PER_MACHINE_AGENT_NAME": "true",
+        "FLY_MACHINE_ID": "d895472c499e38",
     }
 
     def _options(self, values: dict[str, str]) -> dict:
@@ -496,11 +501,25 @@ class TestR1CodeIsReachedOnlyFromTheDocumentedSeams(unittest.TestCase):
     # symbol -> the ONLY top-level definitions allowed to reference it.
     ALLOWED_REFERENCES = {
         # The two pre-existing definitions that gained R1 behaviour, plus the
-        # new launcher: these are the documented seams.
-        "_browser_r1_readiness": {"_prewarm_post_machine_ready", "run_worker_app"},
+        # new launcher: these are the documented seams. M019 adds one reader:
+        # per-machine browser registration is bounded by the R1 switch.
+        "_browser_r1_readiness": {
+            "_prewarm_post_machine_ready", "run_worker_app",
+            "_browser_per_machine_agent_name_enabled",
+        },
         "_browser_worker_one_job": {"build_worker_options"},
         "_browser_one_job_per_machine_load": {"build_worker_options"},
         "run_worker_app": {"<main>"},
+        # M019 per-machine browser name: options, the two readiness posts and
+        # nothing else (never a phone helper or the job entrypoint).
+        "_browser_per_machine_agent_name_enabled": {
+            "build_worker_options", "browser_registered_agent_name",
+        },
+        "browser_registered_agent_name": {
+            "build_worker_options", "_prewarm_post_machine_ready",
+            "_post_browser_machine_ready_after_registration",
+        },
+        "_BROWSER_AGENT_NAME_FALLBACK_LOGGED": {"browser_registered_agent_name"},
         # New helpers: reachable only through the seams above.
         "_on_browser_worker_registered": {"run_worker_app"},
         "_post_browser_machine_ready_after_registration": {"_on_browser_worker_registered"},

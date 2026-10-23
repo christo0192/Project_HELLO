@@ -112,6 +112,94 @@ Repeat for the browser pool if activating that lane too:
 `--app project-hello-voice --pipeline browser --size <N>` (and set
 `BROWSER_AGENT_NAME` per the design doc).
 
+> **Never `fly scale count` a pool.** Machines it adds have no lease row: the
+> orchestrator never claims them and the orphan sweep never reaps them. Grow a
+> pool only with this script.
+
+### 2a. Shrinking a pool (M019): `--retire`, never `fly machine destroy`
+
+`--size` only ever creates. To remove pool machines use `--retire`; do **not**
+destroy them by hand. A hand-destroyed machine leaves its `stopped` lease row
+behind, `claim_voice_worker` hands the dead machine out, its start fails
+`not_found`, and the same session gets it back on every retry.
+
+```bash
+# Dry-run first: lists each machine's Fly state and lease state, changes nothing.
+node scripts/provision-voice-worker-pool.mjs \
+  --app project-hello-voice --retire <machineId> [--retire <machineId> ...] --dry-run
+
+# Then for real (same command without --dry-run).
+node scripts/provision-voice-worker-pool.mjs \
+  --app project-hello-voice --retire <machineId> [--retire <machineId> ...]
+```
+
+What it does, per machine, and what it refuses:
+
+- It acts only on a machine that Fly reports `stopped` (or `created`, meaning
+  provisioned but never started) **and** whose lease row reads `stopped`. If any
+  requested machine fails either check, the whole run is refused and nothing is
+  changed. A machine with no lease row is refused too, because `--retire` only
+  shrinks a registered pool.
+- It refuses to retire every machine of the app. The last machine is the
+  template the next provisioning run clones.
+- It calls `retire_voice_worker` (0131) **first**. That deletes the lease row,
+  but only while it is still `stopped`, so once it returns no claim can hand
+  the machine out. Only after the answer `retired` does the script destroy the
+  Fly machine, and it destroys **without** `force`, so Fly itself refuses a
+  machine that is running. Any other answer (for example a claim that took the
+  row a moment earlier) leaves the machine in the pool. The run then exits
+  non-zero and names it.
+- If the destroy fails after the lease was retired, nothing can claim the
+  machine any more. Finish by hand with
+  `fly machine destroy <id> -a <app>` (no `--force`). Or re-run the
+  provisioning mode, which registers it again.
+
+**R1 pool size vs. concurrency.** Admission never lets in more live R1 sessions
+than there are browser lease rows (0131: `least(coalesce(max_concurrent_sessions, 1),
+greatest(pool, 1))`, so never more than the pool and never below 1). Before
+shrinking the browser pool, lower `max_concurrent_sessions` to the new size or
+below, and wait until the live count is under it. Retire only
+machines that are `stopped` (the script enforces this).
+
+**When the runtime finds a destroyed machine.** If a machine disappears
+outside the script, the API cleans up after it. A start or stop that answers
+`not_found` makes it list the app's machines. When a successful listing does not
+include the machine (or shows it `destroyed`), the API resets the lease row and
+retires it. Log events: `machine_gone_retired`, `machine_gone_retire_failed`,
+`machine_gone_reset_failed`, `machine_gone_unconfirmed`. A 404 alone is never
+treated as proof, because a token that cannot see the app answers 404 too. If
+the listing fails, nothing is changed.
+
+### 2b. Deploying a multi-machine pool (M019)
+
+`flyctl deploy` updates every machine, stopped ones included. The registration
+proof in `scripts/deploy-voice-orchestration.sh` boots only one of them. For the
+browser app the workflow sets `VERIFY_POOL=true`, so after that proof the script
+also:
+
+1. takes the image of the machine it just proved as the reference, and stops
+   that machine again;
+2. updates every **stopped** pool machine on an older image in place, without
+   starting it (`flyctl machine update --skip-start`);
+3. lists the machines again until every one is on the reference image and none
+   is started. Otherwise it fails the deploy.
+
+It never stops a machine it did not start. A started machine after the deploy
+could be an interview admitted during it, so the script names it and fails. Stop
+that machine once it is idle (or let the reaper do it), then re-run
+`workflow_dispatch service=browser-voice`. A one-machine pool, and the phone
+app, keep exactly today's behaviour.
+
+**Live-session guard.** `deploy-browser-voice` refuses to deploy while any R1
+session is live (`call_sessions` with an `interview_round_id`, in `created`,
+`waiting` or `in_progress`). The count comes from a read-only SELECT in
+`migrate-production`, and only the number is passed to the deploy job, never the
+database URL. The count must be exactly 0 and at most 15 minutes old.
+"Unknown" (the database was unreachable) and a stale count are refused as well.
+This is a check, not a lock: an admission can still arrive during the deploy.
+For a planned browser deploy, pause R1 first and wait for live R1 to reach 0
+(`docs/runbooks/r1-operations.md`).
+
 ---
 
 ## 3. Deploy order

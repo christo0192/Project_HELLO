@@ -40,6 +40,7 @@ const _contractVisibleEnvReads = [
   process.env.WORKER_REAPER_GRACE_SEC,
   process.env.WORKER_ORPHAN_GRACE_SEC,
   process.env.PHONE_WORKER_READY_TIMEOUT_SEC,
+  process.env.BROWSER_REQUIRE_MACHINE_AGENT_NAME,
 ];
 void _contractVisibleEnvReads;
 
@@ -89,6 +90,22 @@ function positiveInt(name: string, defaultVal: number, min: number, max: number)
  * green while it was a bare literal in each file.
  */
 export const DEEPSEEK_TIMEOUT_CEILING_MS = 300_000;
+
+/** The ceiling of `R1_ASSESSMENT_CONCURRENCY` (each scoring job holds up to 2 model calls in flight). */
+export const R1_ASSESSMENT_CONCURRENCY_MAX = 8;
+
+/**
+ * Parse `R1_ASSESSMENT_CONCURRENCY` (or a test seam's number). Never throws: anything that is not
+ * an integer is the default, 1 (today's one-at-a-time scoring); an integer is clamped to 1..8.
+ * Declared above `env` because `env` calls it while it is being built.
+ */
+export function r1AssessmentConcurrencyFrom(raw: unknown): number {
+  const n = typeof raw === 'number'
+    ? raw
+    : typeof raw === 'string' && raw.trim() !== '' ? Number(raw) : Number.NaN;
+  if (!Number.isInteger(n)) return 1;
+  return Math.min(R1_ASSESSMENT_CONCURRENCY_MAX, Math.max(1, n));
+}
 
 export const env = {
   supabaseUrl: required('SUPABASE_URL'),
@@ -345,4 +362,27 @@ export const env = {
    * naming the browser worker silently stops its auto-dispatch.
    */
   browserAgentName: process.env.BROWSER_AGENT_NAME ?? '',
+  /**
+   * M019 (R1 concurrency): REQUIRE the leased machine's own dispatch name on the
+   * R1 SFU. False (default) is today's behaviour: a ready lease that reported no
+   * per-machine name is dispatched under the shared `browserAgentName`. True, and
+   * only when BROWSER_LIVEKIT_TARGET=r1, such a lease is released and the exchange
+   * answers "preparing", and the shared name is never dispatched: with several
+   * machines registered under one shared name LiveKit may hand the job to a
+   * machine leased to ANOTHER interview, which that interview's release then stops
+   * mid-call. A reported name that is not exactly `<browserAgentName>-<that
+   * machine's id>` is refused whether this is on or off. Ignored on Cloud. Turn it
+   * on only once every browser worker reports its per-machine name.
+   */
+  browserRequireMachineAgentName: booleanEnv('BROWSER_REQUIRE_MACHINE_AGENT_NAME', false),
+  /**
+   * M019 (R1 concurrency): how many `r1.assessment` scoring jobs ONE API process
+   * runs at once. 1 (default) is today: interviews are scored one after another.
+   * 15 interviews ending together at 1 queue their scoring for tens of minutes;
+   * up to 8 run in parallel. Read as a literal so the env contract sees it, and
+   * CLAMPED, never thrown (R1 config must never stop the API booting, see
+   * lib/r1/config.ts): unset, empty or not an integer = 1, below 1 = 1, above
+   * 8 = 8. `lib/r1/runtime.ts` applies it to the assessment runner only.
+   */
+  r1AssessmentConcurrency: r1AssessmentConcurrencyFrom(process.env.R1_ASSESSMENT_CONCURRENCY),
 };

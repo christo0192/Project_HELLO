@@ -3486,8 +3486,93 @@ def _browser_r1_readiness() -> bool:
     worker. Deploy-order safety follows from that default: a worker never sends
     ``livekit_host`` to an API that predates it unless the operator turned this
     on, and the runbook only turns it on AFTER the host-aware API is live.
-    Never true for the phone worker or the unnamed browser worker."""
+    Never true for the phone worker or the unnamed browser worker.
+
+    M019: it also bounds per-machine browser registration
+    (``_browser_per_machine_agent_name_enabled``), so the Cloud fallback, which
+    unsets this switch, is back on the shared name with no further step."""
     return _browser_worker_named() and os.getenv("R1_READINESS_HOST") == "on"
+
+
+# ── M019: per-machine registration name for the R1 BROWSER worker ─────
+# WHY: the E2 hazard above, on the browser pool. Every browser machine
+# registers the ONE shared BROWSER_AGENT_NAME, so with more than one machine
+# LiveKit can hand session S's job to machine B while S's lease is on machine
+# A; ending S then stops A, which may be running T's interview. Registering as
+# ``<base>-<FLY_MACHINE_ID>`` and reporting that name on the readiness post
+# lets the API dispatch S's job to exactly the machine it leased for S, which
+# is what makes more than one concurrent R1 interview safe.
+#
+# Same id and composed-name patterns as the phone (_PER_MACHINE_ID_RE and
+# _PER_MACHINE_AGENT_NAME_RE): one lease table, one 0112 CHECK, one API
+# contract for both pipelines. browser-agent-name-cross-language.test.ts pins
+# this helper against the API's.
+#
+# Once per process, like the phone fallback line.
+_BROWSER_AGENT_NAME_FALLBACK_LOGGED = False
+
+
+def _browser_per_machine_agent_name_enabled() -> bool:
+    """True iff the R1 browser worker is opted into per-machine registration:
+    the named browser worker on the R1 readiness contract
+    (``_browser_r1_readiness``) AND ``BROWSER_PER_MACHINE_AGENT_NAME`` is
+    EXACTLY "true".
+
+    Exact, like the browser lane's other opt-ins (``BROWSER_WORKER_ONE_JOB``,
+    ``R1_READINESS_HOST``); the validator pins the same literal in fly.toml.
+    ABSENT (the default) ⇒ False ⇒ byte-identical to before.
+
+    Bounded by the R1 readiness switch on purpose. On the Cloud lane (that
+    switch absent, which is also what the Cloud-fallback runbook step leaves)
+    the worker keeps the shared name, the prewarm keeps the legacy body and
+    the load gate stays as configured, even with this key in fly.toml. A
+    per-machine name on Cloud would reach no worker if the Cloud API kept
+    dispatching to the shared name. Read at call time."""
+    return _browser_r1_readiness() and os.getenv("BROWSER_PER_MACHINE_AGENT_NAME") == "true"
+
+
+def browser_registered_agent_name() -> str:
+    """The name THIS named browser worker registers with LiveKit under.
+
+    ``f"{_browser_agent_name()}-{FLY_MACHINE_ID}"`` ONLY when
+    ``_browser_per_machine_agent_name_enabled()`` AND FLY_MACHINE_ID is a
+    well-formed machine id AND the composed name satisfies the API's
+    stored-name contract. Otherwise the BASE name, which is today's name.
+
+    The mirror of ``phone_registered_agent_name``, and deliberately a separate
+    body: the cross-language pin reads the phone helper's source, and the two
+    lanes roll out on separate flags. Same fallback rule: an unusable id or
+    base registers the base name AND (because readiness only reports a name
+    that DIFFERS from the base) reports none, so the worker and an API that
+    dispatches to the base still agree. ``fullmatch`` for the same reason as
+    the phone helper (Python's ``$`` also matches before a trailing newline).
+
+    Used ONLY for ``options["agent_name"]`` on the named browser path and for
+    the readiness posts. ``_browser_agent_name()`` stays the BASE name, which
+    ``_browser_worker_named`` and room ownership key off."""
+    global _BROWSER_AGENT_NAME_FALLBACK_LOGGED
+    base = _browser_agent_name()
+    if not _browser_per_machine_agent_name_enabled():
+        return base
+    machine_id = os.getenv("FLY_MACHINE_ID") or ""
+    if not machine_id:
+        category = "machine_id_missing"
+    elif not _PER_MACHINE_ID_RE.fullmatch(machine_id):
+        category = "machine_id_invalid"
+    else:
+        registered = f"{base}-{machine_id}"
+        if _PER_MACHINE_AGENT_NAME_RE.fullmatch(registered):
+            return registered
+        category = "base_name_invalid"
+    if not _BROWSER_AGENT_NAME_FALLBACK_LOGGED:
+        _BROWSER_AGENT_NAME_FALLBACK_LOGGED = True
+        # Fixed category only — the raw env values are never logged.
+        _log.warn(
+            "unknown_event",
+            error_type="browser_agent_name_fallback",
+            error_category=category,
+        )
+    return base
 
 
 def _browser_livekit_host() -> str | None:
@@ -3551,6 +3636,12 @@ async def _post_browser_machine_ready_after_registration() -> None:
         )
     else:
         ready_kwargs["livekit_host"] = host
+    # M019: report the per-machine registration name ONLY when it differs from
+    # the base. Flag off and every fallback post exactly the pre-M019 body, so
+    # an API that predates browser names never sees the key.
+    registered = browser_registered_agent_name()
+    if registered != _browser_agent_name():
+        ready_kwargs["agent_name"] = registered
     for attempt in range(_REGISTRATION_POST_ATTEMPTS):
         if attempt > 0:
             _log.info(
@@ -3649,6 +3740,15 @@ def _prewarm_post_machine_ready(_proc: Any) -> None:
     if _phone_worker_orchestrated():
         registered = phone_registered_agent_name()
         if registered != _phone_agent_name():
+            ready_kwargs["agent_name"] = registered
+    elif _browser_worker_named():
+        # M019: the same rule for the named browser worker, so the name it
+        # registers and the name it reports come from one helper on every
+        # readiness path. Reaching here means R1 readiness is off (the Cloud
+        # lane), where the browser helper always returns the base: the body
+        # stays exactly {app, machine_id}.
+        registered = browser_registered_agent_name()
+        if registered != _browser_agent_name():
             ready_kwargs["agent_name"] = registered
     try:
         asyncio.run(worker_ready_api.post_worker_ready_machine(**ready_kwargs))
@@ -3768,12 +3868,23 @@ def build_worker_options() -> WorkerOptions:
         # The browser worker becomes NAMED + explicit-dispatch. Its prewarm
         # posts machine-level readiness (ready-before-dispatch). The API
         # dispatches to this EXACT name (env.browserAgentName) — names_agree.
-        options["agent_name"] = _browser_agent_name()
+        # M019: the REGISTERED name may be per-machine (`<base>-<machine id>`,
+        # behind BROWSER_PER_MACHINE_AGENT_NAME on the R1 lane) so the API can
+        # bind each leased session to its own machine; flag off ⇒ the base.
+        options["agent_name"] = browser_registered_agent_name()
         options["prewarm_fnc"] = _prewarm_post_machine_ready
         # The self-hosted OSS scheduler must see a deterministic availability
         # signal, not the SDK's default CPU average. Exact opt-in keeps Cloud
         # browser behaviour byte-identical until R1 cutover.
-        if _browser_worker_one_job():
+        #
+        # M019: per-machine names exist so SEVERAL machines can each run an
+        # interview, which is only safe at ONE job per machine (the recorder's
+        # spool cleanup, the API's whole-machine stop on release and the
+        # measured CPU budget all assume it). So the per-machine opt-in turns
+        # this gate on by itself instead of trusting a second secret to be set
+        # in the same window. It never turns it on for the Cloud lane: the
+        # per-machine predicate is false there.
+        if _browser_worker_one_job() or _browser_per_machine_agent_name_enabled():
             if _worker_options_accepts("load_fnc"):
                 options["load_fnc"] = _browser_one_job_per_machine_load
             if _worker_options_accepts("load_threshold"):

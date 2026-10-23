@@ -64,7 +64,16 @@ ok(services.filter((s) => s.protocol === "udp").length === 1, "must expose exact
 ok(!/\[http_service\]/.test(toml), "SFU config must use explicit services, not [http_service]");
 
 ok((toml.match(/^\[\[vm\]\]/gm) || []).length === 1, "SFU config must declare exactly one VM shape (deploy with --ha=false for one Machine)");
-ok(/cpu_kind\s*=\s*"performance"/.test(toml) && /cpus\s*=\s*1/.test(toml) && /memory_mb\s*=\s*2048/.test(toml), "VM must be performance-1x with 2 GB memory");
+// M019 (PR #378): cap 15 concurrent R1 rooms, sized with headroom for 25. The size changes only by a reviewed edit
+// here; the SFU itself is resized by a manual, zero-live-room deploy BEFORE the runbook's load test,
+// which then measures this 4x shape.
+const vmLine = (key, value) => new RegExp(`^\\s*${key}\\s*=\\s*${value}\\s*(?:#.*)?$`, "m").test(toml);
+ok(vmLine("cpu_kind", '"performance"') && vmLine("cpus", "4") && vmLine("memory_mb", "8192"), "VM must be performance-4x with 8 GB memory");
+const signalingBlock = signaling?.block ?? "";
+ok(Boolean(signaling)
+  && /\[services\.concurrency\][\s\S]*?type\s*=\s*"connections"/.test(signalingBlock)
+  && /^\s*soft_limit\s*=\s*300\s*(?:#.*)?$/m.test(signalingBlock)
+  && /^\s*hard_limit\s*=\s*600\s*(?:#.*)?$/m.test(signalingBlock), "signaling service concurrency must be connections, soft 300 / hard 600 (sized with headroom for 25 rooms)");
 ok(/min_machines_running\s*=\s*0/.test(toml) && /auto_stop_machines\s*=\s*"stop"/.test(toml), "spike must retain the reviewed on-demand, no-autoscale posture");
 ok(/\[metrics\][\s\S]*?port\s*=\s*6789/.test(toml), "Prometheus metrics must be private on port 6789");
 ok(/http_checks[\s\S]*?method\s*=\s*"get"[\s\S]*?path\s*=\s*"\/"/.test(toml), "signaling service must health-check GET / on 7880");
@@ -118,5 +127,5 @@ if (failures.length) {
 } else {
   console.log("livekit-r1 SFU contract OK");
   console.log("region_configs_checked=infra/livekit-r1/fly.toml");
-  console.log("external_services=443,80,7881,7882 udp_mux=7882 vm=performance-1x/2048");
+  console.log("external_services=443,80,7881,7882 udp_mux=7882 vm=performance-4x/8192 signaling=300/600");
 }

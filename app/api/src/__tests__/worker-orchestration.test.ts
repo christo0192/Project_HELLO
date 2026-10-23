@@ -1402,3 +1402,198 @@ describe('ensureReadyWorker — livekit host (0118)', () => {
     expect(r).not.toHaveProperty('livekitHost');
   });
 });
+
+describe('M019: a Fly not_found means the machine is gone, so its lease leaves the pool', () => {
+  const GONE = 'deadbeef0001';
+  const SESS_G = '33333333-3333-4333-8333-333333333333';
+  const notFound = (operation: string) => async () => {
+    throw new FlyMachinesError('not_found', { operation, httpStatus: 404 });
+  };
+  const names = (calls: Array<{ name: string }>) => calls.map((c) => c.name);
+  const resetThenRetire = (calls: Array<{ name: string }>) =>
+    names(calls).filter((n) => n === 'reset_voice_worker' || n === 'retire_voice_worker');
+
+  it('start not_found + a listing without the machine: release, reset, retire; error not_found', async () => {
+    const rec = eventRecorder();
+    const fly = fakeFly({
+      startMachine: notFound('startMachine'),
+      stopMachine: notFound('stopMachine'),
+      listMachines: async () => [{ id: 'other-machine', state: 'stopped', raw: {} }],
+    });
+    const { rpc, calls } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: GONE, epoch: 3 } }],
+      retire_voice_worker: [{ data: { status: 'retired', machine_id: GONE } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc, onEvent: rec.onEvent }));
+    const r = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION });
+    expect(r).toEqual({ status: 'error', code: 'not_found' });
+    // Ownership is proven first (release answers draining), then reset, then retire.
+    const order = names(calls).filter((n) =>
+      ['release_voice_worker', 'reset_voice_worker', 'retire_voice_worker'].includes(n));
+    expect(order).toEqual(['release_voice_worker', 'reset_voice_worker', 'retire_voice_worker']);
+    expect(calls.find((c) => c.name === 'retire_voice_worker')?.args)
+      .toEqual({ p_app: APP, p_machine_id: GONE });
+    expect(fly.calls).toContain(`list:${APP}`);
+    expect(rec.find('machine_gone_retired')).toMatchObject({ app: APP, origin: 'cleanup', machineId: GONE });
+    expect(rec.kinds()).not.toContain('cleanup_stop_failed');
+  });
+
+  it('a listing that carries the machine as destroyed also counts as gone', async () => {
+    const fly = fakeFly({
+      startMachine: notFound('startMachine'),
+      stopMachine: notFound('stopMachine'),
+      listMachines: async () => [{ id: GONE, state: 'destroyed', raw: {} }],
+    });
+    const { rpc, calls } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: GONE, epoch: 3 } }],
+      retire_voice_worker: [{ data: { status: 'retired', machine_id: GONE } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc }));
+    await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION });
+    expect(resetThenRetire(calls)).toEqual(['reset_voice_worker', 'retire_voice_worker']);
+  });
+
+  it('start not_found but the listing still carries the machine: not gone, so the usual cleanup and no retire', async () => {
+    const rec = eventRecorder();
+    const fly = fakeFly({
+      startMachine: notFound('startMachine'),
+      listMachines: async () => [{ id: GONE, state: 'stopped', raw: {} }],
+    });
+    const { rpc, calls } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: GONE, epoch: 3 } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc, onEvent: rec.onEvent }));
+    const r = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION });
+    expect(r).toEqual({ status: 'error', code: 'not_found' });
+    expect(fly.calls).toContain(`stop:${APP}:${GONE}`);
+    expect(resetThenRetire(calls)).toEqual(['reset_voice_worker']); // the stop worked: normal reset
+    expect(rec.kinds()).toContain('machine_gone_unconfirmed');
+  });
+
+  it('stop not_found while the listing THROWS: unconfirmed, so no reset and no retire (a 404 alone is not proof)', async () => {
+    const rec = eventRecorder();
+    const fly = fakeFly({
+      stopMachine: notFound('stopMachine'),
+      listMachines: async () => { throw new FlyMachinesError('not_found', { operation: 'listMachines' }); },
+    });
+    const { rpc, calls } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: GONE, epoch: 1 } }],
+    });
+    let t = 0;
+    const svc = createWorkerOrchestrationService(baseDeps({
+      fly: fly.client,
+      rpc,
+      onEvent: rec.onEvent,
+      readLeaseState: async () => lease('starting'),
+      now: () => (t += 5_000),
+    }));
+    const r = await svc.ensureReadyWorker({
+      app: APP, pipeline: 'phone', sessionId: SESSION, readyTimeoutSec: 5,
+    });
+    expect(r).toEqual({ status: 'timeout' });
+    expect(resetThenRetire(calls)).toEqual([]);
+    expect(rec.kinds()).toContain('cleanup_stop_failed');
+  });
+
+  it('a claim this session no longer holds is never inspected, even on start not_found', async () => {
+    const fly = fakeFly({ startMachine: notFound('startMachine') });
+    const { rpc, calls } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: GONE, epoch: 1 } }],
+      release_voice_worker: [{ data: { status: 'already_released' } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc }));
+    await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION });
+    expect(fly.calls).not.toContain(`list:${APP}`);
+    expect(fly.calls).not.toContain(`stop:${APP}:${GONE}`);
+    expect(resetThenRetire(calls)).toEqual([]);
+  });
+
+  it('terminal release: stop not_found + gone means reset + retire, counted released (nothing is running)', async () => {
+    const rec = eventRecorder();
+    const fly = fakeFly({ stopMachine: notFound('stopMachine'), listMachines: async () => [] });
+    const { rpc, calls } = fakeRpc({
+      list_terminal_session_leases: [{
+        data: [{ machine_id: GONE, claimed_session_id: SESS_G, state: 'busy', epoch: 1 }],
+      }],
+      release_voice_worker_by_session: [{ data: { status: 'draining', machine_id: GONE, epoch: 1 } }],
+      retire_voice_worker: [{ data: { status: 'retired', machine_id: GONE } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc, onEvent: rec.onEvent }));
+    const r = await svc.releaseTerminalSessions({ app: APP });
+    expect(r.released).toBe(1);
+    expect(resetThenRetire(calls)).toEqual(['reset_voice_worker', 'retire_voice_worker']);
+    expect(rec.kinds()).not.toContain('terminal_release_stop_failed');
+    expect(rec.find('terminal_release_swept')).toMatchObject({ released: 1, stopFailed: 0 });
+  });
+
+  it('terminal release: a retire refused (a claim raced in) leaves the row reset, still released, and says so', async () => {
+    const rec = eventRecorder();
+    const fly = fakeFly({ stopMachine: notFound('stopMachine'), listMachines: async () => [] });
+    const { rpc } = fakeRpc({
+      list_terminal_session_leases: [{
+        data: [{ machine_id: GONE, claimed_session_id: SESS_G, state: 'busy', epoch: 1 }],
+      }],
+      release_voice_worker_by_session: [{ data: { status: 'draining', machine_id: GONE, epoch: 1 } }],
+      retire_voice_worker: [{ data: { status: 'not_stopped', machine_id: GONE, state: 'starting' } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc, onEvent: rec.onEvent }));
+    const r = await svc.releaseTerminalSessions({ app: APP });
+    expect(r.released).toBe(1);
+    expect(rec.kinds()).toContain('machine_gone_retire_failed');
+    expect(rec.kinds()).not.toContain('machine_gone_retired');
+  });
+
+  it('terminal release: a failed reset never retires and is not counted released', async () => {
+    const rec = eventRecorder();
+    const fly = fakeFly({ stopMachine: notFound('stopMachine'), listMachines: async () => [] });
+    const seen: string[] = [];
+    const rpc: RpcCaller = async (name) => {
+      seen.push(name);
+      if (name === 'list_terminal_session_leases') {
+        return { data: [{ machine_id: GONE, claimed_session_id: SESS_G, state: 'busy', epoch: 1 }], error: null };
+      }
+      if (name === 'release_voice_worker_by_session') {
+        return { data: { status: 'draining', machine_id: GONE, epoch: 1 }, error: null };
+      }
+      if (name === 'reset_voice_worker') return { data: null, error: { message: 'boom' } };
+      return { data: { status: 'ok' }, error: null };
+    };
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc, onEvent: rec.onEvent }));
+    const r = await svc.releaseTerminalSessions({ app: APP });
+    expect(r.released).toBe(0);
+    expect(seen).not.toContain('retire_voice_worker');
+    expect(rec.kinds()).toContain('machine_gone_reset_failed');
+  });
+
+  it('reaper: stop not_found + gone means reset + retire, and it is not counted as stopped', async () => {
+    const rec = eventRecorder();
+    const fly = fakeFly({ stopMachine: notFound('stopMachine'), listMachines: async () => [] });
+    const { rpc, calls } = fakeRpc({
+      list_reapable_voice_workers: [{
+        data: [{ machine_id: GONE, claimed_session_id: null, state: 'draining' }],
+      }],
+      retire_voice_worker: [{ data: { status: 'retired', machine_id: GONE } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc, onEvent: rec.onEvent }));
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(0);
+    expect(resetThenRetire(calls)).toEqual(['reset_voice_worker', 'retire_voice_worker']);
+    expect(rec.find('machine_gone_retired')).toMatchObject({ origin: 'reap', machineId: GONE });
+  });
+
+  it('reaper: a non-404 stop failure is unchanged (no listing, no reset, no retire)', async () => {
+    const fly = fakeFly({
+      stopMachine: async () => { throw new FlyMachinesError('server', { operation: 'stopMachine' }); },
+    });
+    const { rpc, calls } = fakeRpc({
+      list_reapable_voice_workers: [{
+        data: [{ machine_id: GONE, claimed_session_id: null, state: 'draining' }],
+      }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc }));
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(0);
+    expect(fly.calls).not.toContain(`list:${APP}`);
+    expect(resetThenRetire(calls)).toEqual([]);
+  });
+});

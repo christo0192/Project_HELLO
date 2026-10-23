@@ -313,6 +313,7 @@ to describe implemented schema only.
 |--------|---------------|-------|
 | `id`, `enabled`, `paused`, `auto_status_enabled`, caps, pause line, thresholds, dashboard reading, month, timestamps | Internal | Operational and decision-policy settings; audit all changes |
 | Budget holds, reserved/actual minutes, provider and reconciliation measurements | Internal | R1 capacity and cost controls; no credential values |
+| `r1_settings.max_concurrent_sessions` (0131) | Internal | Non-PII operating config: the most live R1 interviews admitted at once (integer 1 to 15, default 1), capped by the browser worker pool on the self-hosted target and ignored on Cloud. Admin-only; each change is recorded with its new value in the settings route's audit row (the 0115 trigger does not carry it). The `browser_worker_pool_size` the settings GET returns is a count derived from `voice_worker_leases` at read time, not stored |
 
 ### Additions to existing tables (planned)
 

@@ -1,8 +1,11 @@
 /**
  * lib/r1/orphan-lapse.ts: lapse R1 sessions that no worker owns any more.
  *
- * THE PROBLEM. Admission (`r1_admit_attempt`, 0119) refuses while ANY R1 session is `created`,
- * `waiting` or `in_progress`: the slot is global (`r1_in_flight`, surfaced as 409 `r1_busy`). A
+ * THE PROBLEM. Admission (`r1_admit_attempt`, 0119; 0131) refuses once the live R1 limit is reached:
+ * it counts every R1 session that is `created`, `waiting` or `in_progress`, across all rounds,
+ * against `r1_settings.max_concurrent_sessions` (1 by default, up to 15 on the self-hosted target,
+ * capped by the browser worker pool; always 1 on Cloud), answering `r1_in_flight` (409 `r1_busy`).
+ * Every live row holds one of those slots, and at the default limit of 1 the slot is global. A
  * session normally settles itself: the worker fails it on a connect or context error, expires it
  * on a no-show, ends it at the residency cap. But three cases leave no one to settle it:
  *
@@ -14,8 +17,8 @@
  *
  * Nothing in production ever lapsed them (`r1.sweep` is deferred, the phone sweeps look only at
  * `mode = 'live'`, `r1_sweep_expired_rounds` skips a round with a live session), so ONE such row
- * blocked every R1 admission until someone edited the database, and the link kept answering "try
- * again in a few minutes".
+ * held its slot until someone edited the database: at the limit of 1 it blocked every R1
+ * admission, and the link kept answering "try again in a few minutes".
  *
  * THE LAPSE. It runs inside the existing 60 s `r1-status` loop (`runtime.ts`), only while R1 is
  * enabled. A session is lapsed only when its LAST ACTIVITY is older than a bound that is far past
@@ -39,7 +42,7 @@
  *     (`jobIsLive`, the predicate the exchange's own worker gate uses) in its room, nor while that
  *     listing cannot be read. Both only DEFER: past `waitingLiveJobCeilingSec` of idle the row lapses
  *     whatever the SFU says, because a worker that has not activated a session in an hour is a
- *     zombie job or a dead SFU, and the global slot must not stay blocked for either. With no R1 SFU
+ *     zombie job or a dead SFU, and its R1 slot must not stay blocked for either. With no R1 SFU
  *     configured there is nothing to ask and the timestamps alone decide, as they always did.
  *
  * What it writes, per session, compare-and-set on the status it read (a worker that settled the
@@ -55,6 +58,13 @@
  * estimate (`v_webrtc_minutes_estimate`) charges an unmetered session `(ended_at - started_at) x 2`,
  * so closing a 13-hour overnight orphan at `now()` would book about 1,500 phantom minutes against
  * the monthly allocation.
+ *
+ * THE PASS IS BOUNDED. With up to 15 live sessions, a pass can meet many stale `waiting` rows, each
+ * with a dispatch probe of up to `dispatchProbeMs`; one after another that was about 200 s on a
+ * 60 s loop. Rows are worked through `rowConcurrency` at a time, and no new row is started once
+ * `passBudgetMs` has gone by: what is left is simply looked at again by the next pass (nothing is
+ * written for it, so it is not an error). The worst pass is therefore about the budget plus one
+ * probe. Each row is independent and every write is compare-and-set, so the order is immaterial.
  *
  * Metadata only is logged (a status and a count); never an id or a payload.
  */
@@ -82,8 +92,18 @@ export const R1_ORPHAN_LAPSE_BOUNDS = {
   inProgressIdleSec: 50 * 60,
   /** How long one `listDispatch` may take before it counts as unreadable (the pass is 60 s apart). */
   dispatchProbeMs: 8_000,
-  /** Live R1 sessions are at most a handful (one per round, one admitted at a time). */
-  scanLimit: 50,
+  /**
+   * Live R1 sessions are at most `max_concurrent_sessions` (15) plus the orphans this lapses, one per
+   * round; 100 leaves room for a backlog of orphans without ever reading an unbounded set.
+   */
+  scanLimit: 100,
+  /** Rows worked at the same time, so stale `waiting` rows' dispatch probes overlap. */
+  rowConcurrency: 8,
+  /**
+   * No new row is started after this much of a pass (the loop is 60 s apart): the worst pass is
+   * about this plus one `dispatchProbeMs`. The rest waits for the next pass.
+   */
+  passBudgetMs: 40_000,
 } as const;
 
 export interface R1OrphanLapseOptions {
@@ -93,6 +113,8 @@ export interface R1OrphanLapseOptions {
    * which counts as an unreadable listing.
    */
   readonly dispatches?: () => DispatchListerLike | null;
+  /** Test seam: the monotonic clock (ms) the pass budget is measured with. */
+  readonly clock?: () => number;
 }
 
 type LiveStatus = 'created' | 'waiting' | 'in_progress';
@@ -268,17 +290,23 @@ export async function lapseOrphanedR1Sessions(
 
   const rows = (Array.isArray(data) ? data : []) as LiveRow[];
   scanned = rows.length;
-  for (const row of rows) {
+  const clock = options.clock ?? (() => performance.now());
+  const passStarted = clock();
+  let next = 0;
+  let deferred = 0;
+
+  /** One row: the whole check and, when it is an orphan, the lapse. `return` is "leave it". */
+  const lapseRow = async (row: LiveRow): Promise<void> => {
     // The status READ here is the one every write below compares against (compare-and-set).
     const fromStatus = row.status;
     const plan = LIVE_STATUSES.includes(fromStatus) ? PLANS[fromStatus] : undefined;
     const startedAt = ms(row.started_at);
     // An unparseable start can never be proven stale: leave it for a human, never guess.
-    if (!plan || startedAt === null) continue;
+    if (!plan || startedAt === null) return;
 
     // Cheap pass on the row's own timestamps first; the extra reads only for what looks stale.
     let lastActivity = latest([startedAt, ms(row.waiting_at), ms(row.updated_at)]) as number;
-    if (nowMs - lastActivity <= plan.idleSec * 1000) continue;
+    if (nowMs - lastActivity <= plan.idleSec * 1000) return;
 
     if (fromStatus === 'in_progress') {
       // A worker that is alive writes turns and ledger rows; either keeps the session alive.
@@ -286,10 +314,10 @@ export async function lapseOrphanedR1Sessions(
       const usage = await newest(client, 'r1_usage_ledger', 'occurred_at', row.id);
       if (!turn.ok || !usage.ok) {
         errors += 1;
-        continue; // Cannot prove it is idle: do not lapse on a failed read.
+        return; // Cannot prove it is idle: do not lapse on a failed read.
       }
       lastActivity = latest([lastActivity, turn.at, usage.at]) as number;
-      if (nowMs - lastActivity <= plan.idleSec * 1000) continue;
+      if (nowMs - lastActivity <= plan.idleSec * 1000) return;
     }
 
     if (
@@ -301,10 +329,10 @@ export async function lapseOrphanedR1Sessions(
       const asked = listerForPass();
       if (asked !== null) {
         const owner = asked === 'unreadable' ? 'unknown' : await dispatchOwnership(asked, row.id);
-        if (owner === 'live') continue;
+        if (owner === 'live') return;
         if (owner === 'unknown') {
           errors += 1;
-          continue;
+          return;
         }
       }
     }
@@ -312,7 +340,7 @@ export async function lapseOrphanedR1Sessions(
     // Defensive: the constants above must stay a legal transition with a legal reason.
     if (!isValidTransition(fromStatus, plan.to) || !isValidReasonForStatus(plan.reason, plan.to)) {
       errors += 1;
-      continue;
+      return;
     }
 
     // The last evidence of life, never later than now: see the header (phantom minutes).
@@ -332,10 +360,10 @@ export async function lapseOrphanedR1Sessions(
     const { data: moved, error: moveError } = await move.select('id');
     if (moveError) {
       errors += 1;
-      continue;
+      return;
     }
     // Zero rows: a worker or the withdrawal path settled it first. That is the right outcome.
-    if (!Array.isArray(moved) || moved.length !== 1) continue;
+    if (!Array.isArray(moved) || moved.length !== 1) return;
 
     lapsed += 1;
     log.warn('unknown_event', { error_category: 'r1_orphan_session_lapsed', error_type: fromStatus });
@@ -346,6 +374,27 @@ export async function lapseOrphanedR1Sessions(
       errors += 1;
       log.warn('unknown_event', { error_category: 'r1_orphan_settle_failed', error_type: fromStatus });
     }
+  };
+
+  /** A worker: take the next row until none is left or the pass budget is spent. */
+  const worker = async (): Promise<void> => {
+    while (next < rows.length) {
+      if (clock() - passStarted >= R1_ORPHAN_LAPSE_BOUNDS.passBudgetMs) {
+        deferred = rows.length - next;
+        next = rows.length;
+        return;
+      }
+      const row = rows[next]!;
+      next += 1;
+      await lapseRow(row);
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(R1_ORPHAN_LAPSE_BOUNDS.rowConcurrency, rows.length) }, worker),
+  );
+  if (deferred > 0) {
+    // Not an error: nothing was written for them, and the next pass looks at them again.
+    log.warn('unknown_event', { error_category: 'r1_orphan_lapse_budget_spent' });
   }
   return { scanned, lapsed, settled, errors };
 }

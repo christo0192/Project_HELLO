@@ -56,6 +56,25 @@
  *     safeguard cannot verify (no id, no listDispatch, a list error, a dispatch
  *     that vanished) answers false: the machine is released and the exchange
  *     defers; nothing is re-dispatched on an unproven room.
+ *
+ * ── PER-MACHINE DISPATCH NAMES (M019, R1 only) ────────────────────────
+ * With more than one browser machine, a dispatch to the SHARED name can be
+ * taken by any of them, not the one leased for the session, and ending that
+ * session then stops a machine running somebody else's interview (the phone
+ * incident of 2026-10-03, lib/worker-agent-name.ts). On the R1 target the gate
+ * therefore dispatches to the name the leased worker REPORTED on its ready
+ * ping, `<agentName>-<machineId>`, on the first dispatch and on the retry
+ * alike. The API never invents that name (`dispatchNameFor`):
+ *
+ *   - no report, or the shared name itself: the shared name, exactly as
+ *     before, unless BROWSER_REQUIRE_MACHINE_AGENT_NAME is on. Then the lease
+ *     is refused (the caller releases it and defers) and the shared name is
+ *     never dispatched at all;
+ *   - exactly `<agentName>-<the lease's machine id>`: that name;
+ *   - anything else (another machine's name, another base, a malformed value):
+ *     refused, whatever the flag says.
+ *
+ * Cloud ignores reported names and dispatches the shared name, as before.
  */
 
 import { env } from './env.js';
@@ -73,6 +92,7 @@ import {
   requireBrowserLiveKitConfigured,
   roomServiceClientFor,
 } from './livekit-endpoints.js';
+import { isMachineAgentNameUnder, isReportedMachineAgentName } from './worker-agent-name.js';
 
 const log = createLogger('browser-orchestration');
 
@@ -124,8 +144,27 @@ export interface BrowserWorkerGate {
    * mint a token into an agent-less room). On the R1 target true additionally
    * means the dispatch was PROVEN accepted by a worker; an unverifiable dispatch
    * is false. Never throws.
+   *
+   * `agentName` (M019, R1 only) is the leased machine's per-machine name as
+   * `dispatchNameFor` returned it; absent means the shared name, as before. On R1
+   * a value that is not a per-machine name under the shared one, or no value
+   * while BROWSER_REQUIRE_MACHINE_AGENT_NAME is on, dispatches nothing and
+   * answers false. Cloud ignores it and dispatches the shared name.
    */
-  dispatch(input: { sessionId: string; roomName: string }): Promise<boolean>;
+  dispatch(input: { sessionId: string; roomName: string; agentName?: string }): Promise<boolean>;
+  /**
+   * M019: the name to dispatch for a `ready` verdict, or null when the lease must
+   * not be dispatched to (the caller releases the machine and defers). Cloud: the
+   * shared name whatever the lease reported. R1: the reported name when it is
+   * EXACTLY `<agentName>-<machineId>`; the shared name when none was reported (or
+   * the shared name itself) and BROWSER_REQUIRE_MACHINE_AGENT_NAME is off; null
+   * otherwise. Never throws.
+   *
+   * Optional only so hand-built gates that predate M019 still work: a caller
+   * treats an absent method as the shared name, today's behaviour. The real gate
+   * always provides it.
+   */
+  dispatchNameFor?(ready: { machineId: string; agentName?: string | null }): string | null;
   /** Best-effort release of a worker gated onto but then not used. Never throws. */
   releaseWorker(input: { machineId: string; sessionId: string }): Promise<void>;
 }
@@ -135,6 +174,11 @@ export interface BrowserWorkerGateDeps {
   readonly enabled?: boolean;
   /** The configured browser agent name. Defaults to `env.browserAgentName`. */
   readonly agentName?: string;
+  /**
+   * M019, R1 only: refuse a lease with no per-machine name and never dispatch the
+   * shared name. Defaults to `env.browserRequireMachineAgentName` (off).
+   */
+  readonly requireMachineAgentName?: boolean;
   /** The orchestration service (tests inject a fake). */
   readonly service?: WorkerOrchestrationService;
   /** The LiveKit agent-dispatch client (tests inject a fake; absent = lazy real). */
@@ -320,6 +364,8 @@ export function browserOrchestrationGate(
   const dispatchVerifyMs = deps.dispatchVerifyMs ?? boundedDispatchVerifyMs();
   const dispatchPollMs = Math.max(1, deps.dispatchPollMs ?? 1_000);
   const roomHasAgent = deps.roomHasAgent ?? roomHasAgentOnBrowserEndpoint;
+  const requireMachineAgentName =
+    deps.requireMachineAgentName ?? env.browserRequireMachineAgentName;
 
   let dispatchClient = deps.dispatchClient ?? null;
   const dispatchClientFor = async (): Promise<BrowserAgentDispatchClientLike> => {
@@ -432,6 +478,25 @@ export function browserOrchestrationGate(
     }
   };
 
+  /**
+   * M019, R1 only. The name an R1 dispatch goes to: `requested` when it is a
+   * per-machine name under the shared one, the shared name when nothing (or the
+   * shared name) was requested and BROWSER_REQUIRE_MACHINE_AGENT_NAME is off,
+   * null (dispatch nothing) otherwise. The exact match against the LEASE's
+   * machine id is `dispatchNameFor`'s; this only refuses a name that cannot be
+   * one of this deployment's workers, or the shared name in strict mode.
+   */
+  const r1DispatchName = (requested: string | undefined): string | null => {
+    if (requested === undefined || requested === agentName) {
+      if (!requireMachineAgentName) return agentName;
+      log.error('unknown_event', { error_category: 'browser_agent_name_missing' });
+      return null;
+    }
+    if (isMachineAgentNameUnder(agentName, requested)) return requested;
+    log.error('unknown_event', { error_category: 'browser_dispatch_name_invalid' });
+    return null;
+  };
+
   return {
     app,
     agentName,
@@ -461,16 +526,40 @@ export function browserOrchestrationGate(
       }
       return { status: 'timeout' };
     },
+    dispatchNameFor(ready) {
+      // Cloud (the default target): the shared name whatever the lease reported,
+      // exactly as on origin/main.
+      if (browserLiveKitEndpoint().target !== 'r1') return agentName;
+      const reported = ready.agentName ?? null;
+      if (reported === null || reported === agentName) {
+        // No per-machine report: today's shared-name dispatch, unless required.
+        if (!requireMachineAgentName) return agentName;
+        log.error('unknown_event', { error_category: 'browser_agent_name_missing' });
+        return null;
+      }
+      // EXACT equality with this lease's machine: a name for another machine
+      // (a stale row, a wrong boot) or under another base is never downgraded to
+      // the shared name — that worker is not listening on it — and never used.
+      if (isReportedMachineAgentName(agentName, ready.machineId, reported)) return reported;
+      log.error('unknown_event', { error_category: 'browser_agent_name_mismatch' });
+      return null;
+    },
     async dispatch(input) {
       try {
+        const r1 = browserLiveKitEndpoint().target === 'r1';
+        // Cloud dispatches the shared name, as on origin/main. R1 dispatches the
+        // leased machine's own name when one was resolved (M019), on the first
+        // dispatch and the retry alike, and refuses before any LiveKit call.
+        const name = r1 ? r1DispatchName(input.agentName) : agentName;
+        if (name === null) return false;
         const client = await dispatchClientFor();
         // The browser dispatch carries only the session id (opaque), mirroring
         // the room metadata already minted by room-provisioning. No PII.
         const metadata = JSON.stringify({ session_id: input.sessionId, channel: 'browser' });
-        const first = await client.createDispatch(input.roomName, agentName, { metadata });
+        const first = await client.createDispatch(input.roomName, name, { metadata });
         // Cloud (the default target): a single createDispatch and nothing else,
         // exactly as on origin/main — never a listDispatch or deleteDispatch.
-        if (browserLiveKitEndpoint().target !== 'r1') return true;
+        if (!r1) return true;
 
         // FAIL CLOSED. On R1 only an ASSIGNED dispatch (a live job exists in the
         // room) returns true. Anything the safeguard cannot prove (no dispatch
@@ -502,7 +591,7 @@ export function browserOrchestrationGate(
           return false;
         }
 
-        const retry = await client.createDispatch(input.roomName, agentName, { metadata });
+        const retry = await client.createDispatch(input.roomName, name, { metadata });
         const retryId = dispatchIdOf(retry);
         const retryVerdict = await observeDispatch(client, input.roomName, retryId);
         if (retryVerdict === 'assigned') return true;

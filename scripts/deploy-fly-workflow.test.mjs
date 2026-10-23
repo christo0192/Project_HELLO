@@ -542,6 +542,289 @@ ok(!/FLY_API_TOKEN_API/.test(phone) && !/FLY_API_TOKEN_VOICE\b/.test(phone),
   }
 }
 
+// ── 12. M019: browser-voice refuses while R1 sessions are live ─────────────
+// The count is taken where the DB credential already is (migrate-production),
+// read-only, and only the number reaches deploy-browser-voice. These harnesses
+// PREPEND the stub dir to the real PATH (path.delimiter), so they run on Linux
+// CI and in Git Bash on Windows alike.
+const prependPath = (dir) => `${dir}${path.delimiter}${process.env.PATH ?? ""}`;
+const posixPath = (p) => p.replace(/\\/g, "/");
+{
+  // Text: the count step, its outputs, and the credential boundary.
+  ok(/outputs:\s*\n\s*r1_live_sessions:\s*\$\{\{\s*steps\.r1live\.outputs\.count\s*\}\}\s*\n\s*r1_live_checked_at:\s*\$\{\{\s*steps\.r1live\.outputs\.checked_at\s*\}\}/.test(migration),
+    "migrate-production must export the live-R1 count and its timestamp as job outputs");
+  ok(/name: Count live R1 sessions[\s\S]*?id: r1live\s*\n\s*if: needs\.detect\.outputs\.voice == 'true'/.test(migration),
+    "the live-R1 count must run only when browser-voice deploys");
+  const countScript = stepScript(migration, "Count live R1 sessions") || "";
+  ok(/interview_round_id is not null/.test(countScript) && /status in \('created','waiting','in_progress'\)/.test(countScript),
+    "the live-R1 count must count call_sessions with an interview round in created/waiting/in_progress");
+  ok(/^select count\(\*\)/m.test(countScript.replace(/^\s*sql="/m, "")) && !/\b(insert|update|delete|alter|drop|truncate)\b/i.test(countScript.replace(/--db-url|"\$sql"/g, "")),
+    "the live-R1 count must be a read-only SELECT");
+  ok(/supabase@2\.118\.0 db query --db-url "\$SUPABASE_DB_URL"/.test(countScript),
+    "the live-R1 count must reuse the pinned `supabase db query --db-url` read path of the drift check");
+  ok(!/exit 1/.test(countScript),
+    "the live-R1 count must NEVER fail migrate-production (api and phone deploys must not wait on R1)");
+
+  // Behaviour: run the count step against a stub npx.
+  const runCount = (npxMode, dbUrl = "postgres://stub") => {
+    const dir = mkdtempSync(path.join(tmpdir(), "r1count-stub-"));
+    const outFile = path.join(dir, "github_output");
+    writeFileSync(outFile, "");
+    const npx = path.join(dir, "npx");
+    writeFileSync(npx, [
+      "#!/usr/bin/env bash",
+      `echo "$*" >> ${JSON.stringify(posixPath(path.join(dir, "npx.log")))}`,
+      `case ${JSON.stringify(npxMode)} in`,
+      "  three) echo '[{\"live_r1\": 3}]' ;;",
+      "  zero) echo '[{\"live_r1\":0}]' ;;",
+      "  garbage) echo 'connection refused' ;;",
+      "  fail) exit 1 ;;",
+      "esac",
+      "exit 0",
+    ].join("\n"));
+    chmodSync(npx, 0o755);
+    const env = { ...process.env, PATH: prependPath(dir), SUPABASE_DB_URL: dbUrl, GITHUB_OUTPUT: posixPath(outFile) };
+    const which = spawnSync("bash", ["-c", "command -v npx"], { encoding: "utf8", env });
+    const r = spawnSync("bash", ["-c", countScript], { encoding: "utf8", env });
+    const outputs = {};
+    for (const row of readFileSync(outFile, "utf8").split("\n")) {
+      const eq = row.indexOf("=");
+      if (eq > 0) outputs[row.slice(0, eq)] = row.slice(eq + 1).trim();
+    }
+    let npxLog = "";
+    try { npxLog = readFileSync(path.join(dir, "npx.log"), "utf8"); } catch { /* not called */ }
+    rmSync(dir, { recursive: true, force: true });
+    return {
+      code: r.status, out: (r.stdout || "") + (r.stderr || ""), outputs, npxLog,
+      stubbed: posixPath((which.stdout || "").trim()).endsWith(`${path.basename(dir)}/npx`),
+    };
+  };
+  const three = runCount("three");
+  ok(three.stubbed, "the count harness must resolve npx to the stub (it must never reach a database)");
+  ok(three.code === 0 && three.outputs.count === "3" && /^\d+$/.test(three.outputs.checked_at || ""),
+    `three live sessions: count=3 with a timestamp, got ${three.code} ${JSON.stringify(three.outputs)}\n${three.out}`);
+  ok(/select count\(\*\)::int as live_r1/.test(three.npxLog), "the count must send its SELECT through db query");
+  const zero = runCount("zero");
+  ok(zero.code === 0 && zero.outputs.count === "0", `zero live sessions: count=0, got ${JSON.stringify(zero.outputs)}`);
+  for (const mode of ["garbage", "fail"]) {
+    const r = runCount(mode);
+    ok(r.code === 0 && r.outputs.count === "unknown",
+      `an unreadable answer (${mode}) must record count=unknown without failing the job, got ${r.code} ${JSON.stringify(r.outputs)}`);
+  }
+  const noUrl = runCount("three", "");
+  ok(noUrl.code === 0 && noUrl.outputs.count === "unknown" && noUrl.npxLog === "",
+    "with no DB URL the count must be unknown and must not run a query");
+
+  // Text: the guard is the FIRST step of deploy-browser-voice, ahead of any
+  // checkout or deploy, and it reads the count, never the credential.
+  const voiceSteps = voice.split("\n").filter((l) => /^\s*- (name|uses):/.test(l));
+  ok(voiceSteps.length > 0 && /Refuse while R1 sessions are live/.test(voiceSteps[0]),
+    `the live-R1 guard must be the first step of deploy-browser-voice, got: ${voiceSteps[0]}`);
+  ok(/R1_LIVE:\s*\$\{\{\s*needs\.migrate-production\.outputs\.r1_live_sessions\s*\}\}/.test(voice),
+    "the guard must read the count from migrate-production's outputs");
+  ok(!/Refuse while R1 sessions are live/.test(phone) && !/Refuse while R1 sessions are live/.test(api),
+    "only browser-voice carries the R1 guard (phone and api never wait on R1)");
+
+  // Behaviour: the guard refuses anything but a fresh, exact 0.
+  const guard = stepScript(voice, "Refuse while R1 sessions are live") || "";
+  ok(guard !== "", "must be able to extract the live-R1 guard's shell script");
+  const nowSec = Math.floor(Date.now() / 1000);
+  const runGuard = (live, checkedAt) => {
+    const r = spawnSync("bash", ["-c", guard], {
+      encoding: "utf8",
+      env: { ...process.env, R1_LIVE: live, R1_LIVE_CHECKED_AT: checkedAt, R1_LIVE_MAX_AGE_SEC: "900" },
+    });
+    return { code: r.status, out: (r.stdout || "") + (r.stderr || "") };
+  };
+  const pass = runGuard("0", String(nowSec - 30));
+  ok(pass.code === 0 && /no live R1 sessions/.test(pass.out), `a fresh 0 must pass, got ${pass.code}:\n${pass.out}`);
+  const busy = runGuard("2", String(nowSec - 30));
+  ok(busy.code === 1 && /2 R1 session\(s\) are live/.test(busy.out), `live sessions must refuse, got ${busy.code}:\n${busy.out}`);
+  for (const [label, live, at, pattern] of [
+    ["unknown count", "unknown", String(nowSec), /could not read the live R1 session count/],
+    ["empty count", "", String(nowSec), /could not read the live R1 session count/],
+    ["no timestamp", "0", "", /has no timestamp/],
+    ["stale count", "0", String(nowSec - 1000), /is \d+s old/],
+  ]) {
+    const r = runGuard(live, at);
+    ok(r.code === 1 && pattern.test(r.out), `${label}: the guard must refuse (fail closed), got ${r.code}:\n${r.out}`);
+  }
+}
+
+// ── 13. M019: the on-demand deploy converges a multi-machine pool ──────────
+// VERIFY_POOL is set by the browser job only; phone (whose pool may carry live
+// calls on started machines) keeps today's behaviour.
+{
+  const onBrowser = (voice.match(/name: Deploy browser voice worker on-demand[\s\S]*?bash "\$GITHUB_WORKSPACE\/scripts\/deploy-voice-orchestration\.sh"/) || [""])[0];
+  ok(/VERIFY_POOL:\s*"true"/.test(onBrowser), "the browser on-demand deploy must set VERIFY_POOL=\"true\"");
+  ok(!/VERIFY_POOL/.test(phone), "the phone deploy must not turn on pool convergence");
+  const scriptSrc = readFileSync(path.join(root, "scripts/deploy-voice-orchestration.sh"), "utf8");
+  ok(/machine update "\$id" -a "\$APP" --image "\$ref" --skip-start --yes/.test(scriptSrc),
+    "a stale stopped pool machine must be updated WITHOUT being started (--skip-start)");
+
+  // Behaviour against a stateful multi-machine flyctl stub. Each machine is a
+  // file "<state> <image>"; deploy moves every machine to the new image except
+  // those listed in `skip`, and leaves those in `leaveStarted` started. Each
+  // `claimOn` entry "<stop|update> <id> <target> [n]" starts <target> (an
+  // interview claim) right after the n-th (default first) such flyctl call on
+  // <id>, so the pool changes mid-run.
+  const scriptPath = path.join(root, "scripts/deploy-voice-orchestration.sh");
+  const makePool = ({ ids = ["m1", "m2", "m3"], skip = [], leaveStarted = [], updateFails = false, initial = "stopped", claimOn = [] } = {}) => {
+    const dir = mkdtempSync(path.join(tmpdir(), "pool-stub-"));
+    const D = posixPath(dir);
+    mkdirSync(path.join(dir, "m"));
+    for (const id of ids) writeFileSync(path.join(dir, "m", id), `${initial} registry/app:old\n`);
+    writeFileSync(path.join(dir, "skip"), skip.map((s) => s + "\n").join(""));
+    writeFileSync(path.join(dir, "leave_started"), leaveStarted.map((s) => s + "\n").join(""));
+    if (updateFails) writeFileSync(path.join(dir, "update_fails"), "");
+    writeFileSync(path.join(dir, "claim_on"), claimOn.map((s) => s + "\n").join(""));
+    const bin = path.join(dir, "flyctl");
+    writeFileSync(bin, [
+      "#!/usr/bin/env bash",
+      `D=${JSON.stringify(D)}`,
+      'echo "$*" >> "$D/calls.log"',
+      'case "$1" in',
+      "  logs) echo '2099-01-01T00:00:00 registered worker id=stub' ;;",
+      "  machine)",
+      '    case "$2" in',
+      "      list)",
+      "        printf '['; first=1",
+      '        for f in "$D"/m/*; do id=$(basename "$f"); read -r st img < "$f"',
+      "          [ $first = 1 ] || printf ','; first=0",
+      '          printf \'{"id":"%s","state":"%s","region":"sin","config":{"image":"%s"}}\' "$id" "$st" "$img"',
+      "        done; printf ']\\n' ;;",
+      '      start) read -r st img < "$D/m/$3"; echo "started $img" > "$D/m/$3" ;;',
+      '      stop) read -r st img < "$D/m/$3"; echo "stopped $img" > "$D/m/$3" ;;',
+      "      update)",
+      '        [ -f "$D/update_fails" ] && exit 1',
+      '        img=""; prev=""; for a in "$@"; do [ "$prev" = "--image" ] && img="$a"; prev="$a"; done',
+      '        read -r st old < "$D/m/$3"; echo "$st $img" > "$D/m/$3" ;;',
+      "    esac",
+      '    n=$(( $(cat "$D/n.$2.$3" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$D/n.$2.$3"',
+      '    while read -r verb on target nth; do',
+      '      if [ "$verb" = "$2" ] && [ "$on" = "$3" ] && [ "${nth:-1}" = "$n" ]; then read -r st img < "$D/m/$target"; echo "started $img" > "$D/m/$target"; fi',
+      '    done < "$D/claim_on" ;;',
+      "  deploy)",
+      '    for f in "$D"/m/*; do id=$(basename "$f"); read -r st img < "$f"',
+      '      grep -qx "$id" "$D/skip" || img="registry/app:new"',
+      '      grep -qx "$id" "$D/leave_started" && st=started',
+      '      echo "$st $img" > "$f"',
+      "    done ;;",
+      "esac",
+      "exit 0",
+    ].join("\n"));
+    chmodSync(bin, 0o755);
+    const slp = path.join(dir, "sleep"); writeFileSync(slp, "#!/usr/bin/env bash\nexit 0\n"); chmodSync(slp, 0o755);
+    return { dir, D };
+  };
+  const runPool = (pool, env = {}) => {
+    const full = {
+      ...process.env, PATH: prependPath(pool.dir),
+      APP: "project-hello-voice", FLY_CONFIG: "fly.toml", WATERMARK: "2020-01-01T00:00:00",
+      READY_ATTEMPTS: "3", START_ATTEMPTS: "3", STOP_ATTEMPTS: "3", POOL_ATTEMPTS: "3", SLEEP_SECONDS: "0",
+      ...env,
+    };
+    const which = spawnSync("bash", ["-c", "command -v flyctl; command -v jq"], { encoding: "utf8", env: full });
+    const [flyResolved = "", jqResolved = ""] = (which.stdout || "").trim().split("\n");
+    const r = spawnSync("bash", [posixPath(scriptPath)], { encoding: "utf8", env: full });
+    const read = (f) => { try { return readFileSync(path.join(pool.dir, f), "utf8"); } catch { return ""; } };
+    const machines = {};
+    for (const id of ["m1", "m2", "m3"]) {
+      const s = read(path.join("m", id)).trim();
+      if (s) machines[id] = s;
+    }
+    const result = {
+      code: r.status, out: (r.stdout || "") + (r.stderr || ""), calls: read("calls.log"), machines,
+      stubbed: posixPath(flyResolved).endsWith(`${path.basename(pool.dir)}/flyctl`), hasJq: jqResolved !== "",
+    };
+    rmSync(pool.dir, { recursive: true, force: true });
+    return result;
+  };
+
+  // The pool cases need jq, as the script does (ubuntu-latest ships it). Where
+  // it is missing (a bare Windows shell) they are SKIPPED and said so, never
+  // counted as passing.
+  const probe = runPool(makePool({ ids: ["m1"] }));
+  if (!probe.hasJq) {
+    console.log("deploy-fly workflow contract: section 13 pool-convergence behaviour SKIPPED (no jq on PATH)");
+  } else {
+    ok(probe.stubbed, "the pool harness must resolve flyctl to the stub (it must never reach Fly)");
+
+    // (a) Every machine updated by the deploy: converged, all stopped on the new image.
+    const a = runPool(makePool(), { VERIFY_POOL: "true" });
+    ok(a.code === 0, `a pool the deploy fully updated must converge, got ${a.code}:\n${a.out}`);
+    ok(/pool of project-hello-voice converged: 3 machines on registry\/app:new, none started/.test(a.out),
+      `the converged pool must be reported, got:\n${a.out}`);
+    ok(Object.values(a.machines).every((s) => s === "stopped registry/app:new"),
+      `every machine must end stopped on the new image, got ${JSON.stringify(a.machines)}`);
+    ok(!/machine update/.test(a.calls), "an already-converged pool must not be updated");
+
+    // (b) The rollout skipped m3: it is updated in place, never started.
+    const b = runPool(makePool({ skip: ["m3"] }), { VERIFY_POOL: "true" });
+    ok(b.code === 0, `a stale stopped machine must be converged, got ${b.code}:\n${b.out}`);
+    ok(/machine update m3 -a project-hello-voice --image registry\/app:new --skip-start --yes/.test(b.calls),
+      `the stale machine must be updated with --skip-start, got calls:\n${b.calls}`);
+    ok(!/machine start m3/.test(b.calls), "the stale machine must never be started");
+    ok(b.machines.m3 === "stopped registry/app:new", `m3 must end stopped on the new image, got ${b.machines.m3}`);
+
+    // (c) The rollout left m2 started: the deploy FAILS and m2 is not touched.
+    const c = runPool(makePool({ leaveStarted: ["m2"] }), { VERIFY_POOL: "true" });
+    ok(c.code !== 0, `a machine left started must fail the deploy, got ${c.code}:\n${c.out}`);
+    ok(/did not converge[\s\S]*m2 state=started/.test(c.out), `the failure must name the started machine, got:\n${c.out}`);
+    ok(!/machine stop m2/.test(c.calls) && !/machine update m2/.test(c.calls),
+      "a started machine this run did not start must never be stopped or updated (it may be a live interview)");
+
+    // (d) The in-place update fails: the deploy FAILS (no silent stale machine).
+    const d = runPool(makePool({ skip: ["m3"], updateFails: true }), { VERIFY_POOL: "true" });
+    ok(d.code !== 0 && /m3 state=stopped/.test(d.out), `a failed update must fail the deploy naming m3, got ${d.code}:\n${d.out}`);
+
+    // (e) Inert by default: without VERIFY_POOL a stale machine is left exactly as today.
+    const e = runPool(makePool({ skip: ["m3"] }));
+    ok(e.code === 0 && !/machine update/.test(e.calls) && !/converg/.test(e.out),
+      `VERIFY_POOL unset must keep today's behaviour (no update, no pool check), got ${e.code}:\n${e.out}`);
+
+    // (f) A one-machine pool with VERIFY_POOL: the registration proofs carry it, as before.
+    const f = runPool(makePool({ ids: ["m1"] }), { VERIFY_POOL: "true" });
+    ok(f.code === 0 && /pool of project-hello-voice has 1 machine\(s\); the registration proof above covers it/.test(f.out),
+      `a one-machine pool must pass on the registration proofs alone, got ${f.code}:\n${f.out}`);
+    ok(/machine start m1/.test(f.calls) && /deploy --remote-only --config fly\.toml/.test(f.calls) && /machine stop m1/.test(f.calls),
+      "the one-machine path must still start, deploy and stop");
+    ok(!/machine update/.test(f.calls), "a one-machine pool must not be updated in place");
+
+    // (g) No stopped machine at all in a multi-machine pool (rely-on-started):
+    //     convergence cannot be proved, so the deploy FAILS; a one-machine
+    //     always-on lane keeps today's rely-on-started success.
+    const g = runPool(makePool({ ids: ["m1", "m2"], initial: "started" }), { VERIFY_POOL: "true" });
+    ok(g.code !== 0 && /has 2 machines and none was stopped/.test(g.out),
+      `a fully started multi-machine pool must fail the pool check, got ${g.code}:\n${g.out}`);
+    ok(!/machine stop m[12]/.test(g.calls), "rely-on-started must never stop a machine it did not start");
+    const g1 = runPool(makePool({ ids: ["m1"], initial: "started" }), { VERIFY_POOL: "true" });
+    ok(g1.code === 0, `a one-machine started lane must keep today's rely-on-started success, got ${g1.code}:\n${g1.out}`);
+
+    // (h) m3 is stopped and stale in the FIRST list, but an interview claim starts it
+    //     while the proven machine is being stopped (converge step a, m1's second stop;
+    //     the first is the post-deploy proof's restart): it must NOT be updated (that
+    //     would restart a live interview). The deploy fails and says to re-run at zero live.
+    const h = runPool(makePool({ skip: ["m3"], claimOn: ["stop m1 m3 2"] }), { VERIFY_POOL: "true" });
+    ok(!/machine update m3/.test(h.calls), `a machine started after the first list must never be updated, got calls:\n${h.calls}`);
+    ok(h.machines.m3 === "started registry/app:old", `m3 must be left as the claim made it, got ${h.machines.m3}`);
+    ok(h.code !== 0, `a stale machine busy at update time must fail the deploy (never cut the interview), got ${h.code}:\n${h.out}`);
+    ok(/skipping pool machine m3[\s\S]*m3 state=started[\s\S]*m3 on project-hello-voice were busy[\s\S]*re-run the deploy at a zero-live moment/.test(h.out),
+      `the failure must name the busy machine and say to re-run at a zero-live moment, got:\n${h.out}`);
+
+    // (i) m2 and m3 are both stale and stopped at the re-list; updating m2 is when the
+    //     claim starts m3. Its state is re-read right before its own update: skipped.
+    const i = runPool(makePool({ skip: ["m2", "m3"], claimOn: ["update m2 m3"] }), { VERIFY_POOL: "true" });
+    ok(/machine update m2 -a project-hello-voice --image registry\/app:new --skip-start --yes/.test(i.calls),
+      `the still-stopped stale machine must be updated, got calls:\n${i.calls}`);
+    ok(!/machine update m3/.test(i.calls), `a machine started just before its own update must never be updated, got calls:\n${i.calls}`);
+    ok(i.machines.m2 === "stopped registry/app:new" && i.machines.m3 === "started registry/app:old",
+      `m2 must be converged and m3 left alone, got ${JSON.stringify(i.machines)}`);
+    ok(i.code !== 0 && /m3 on project-hello-voice were busy[\s\S]*zero-live moment/.test(i.out),
+      `the deploy must fail naming the busy machine, got ${i.code}:\n${i.out}`);
+  }
+}
+
 // ── 9. A merge that touches app/voice-livekit is ALSO a phone release ──
 // The two voice apps share that source, so ANY such merge redeploys the phone worker from
 // main HEAD. Round-5 review of PR #343 (the R1 worker core): the merge would have shipped

@@ -63,10 +63,11 @@ sessions. (implemented in PR-6/PR-7)
 
 ### PR-LK-liveness (PR #345): the gate for this merge is run by hand
 
-The automated zero-live pre-step named in the plan (section 9) does not exist
-yet: no step in `deploy-fly.yml` queries for live work, so nothing in CI stops a
-merge while a phone call or a screening is live. For this PR the operator runs
-the gate above by hand and records the result on the PR before squashing.
+The automated zero-live pre-step named in the plan (section 9) covers live R1
+only (PR #378): `migrate-production` counts live R1 sessions read-only, and
+`deploy-browser-voice` refuses unless that count is 0 and fresh. Nothing in CI
+checks live phone calls or screenings, so the operator still runs the gate above
+by hand and records the result on the PR before squashing.
 
 One merge of this PR does all of the following:
 
@@ -227,7 +228,8 @@ fails, keep `r1_settings.paused = true` and roll the phone worker back
 
 ## Budget, cap, and reconciliation
 
-R1 permits one live interview. Reserve 65 participant-minutes per attempt;
+R1 permits one live interview by default (M019 can raise it, see "Concurrent R1
+interviews (PR #378)"). Reserve 65 participant-minutes per attempt;
 typical use is about 57-60 and worst case about 70 (the 20-minute role-play). Track candidate/agent time,
 preflight, manual tests, Fly uptime/egress, DeepSeek, Sarvam, failures, and
 active sessions. (implemented in PR-2)
@@ -2046,3 +2048,166 @@ presigned multipart uploads, played in Chromium, click-to-seek offsets checked a
 (smoke), Safari behaviour, real camera CPU on `performance-4x` (S0-C; it failed on `performance-2x`, ADR-0016), real
 SFU camera subscription under audio-only connect, and the first seconds of video being black while the camera
 subscription is requested (counted in `camera_off_ms`).
+
+## Concurrent R1 interviews (PR #378)
+
+M019 lets up to 15 R1 interviews run at the same time on the self-hosted SFU (owner cap, 2026-10-22:
+the Sarvam plan's shared STT streams, below, set it; going higher is a new migration plus a plan upgrade). **It ships inert:**
+`max_concurrent_sessions` is 1, both agent-name flags are off and `R1_ASSESSMENT_CONCURRENCY` is 1,
+so admission, dispatch and scoring behave exactly as before until an operator works through the
+rollout below. Every figure here marked "estimate" is unmeasured until the load test.
+
+### What limits concurrency
+
+Admission (`r1_admit_attempt`, migration 0131) admits a new R1 session only while the live R1
+count is below the **limit**:
+
+| Target (`r1_settings.livekit_target`) | Limit |
+|---|---|
+| `r1` (self-hosted SFU) | `least(max_concurrent_sessions, browser worker pool size)`, never below 1 |
+| `cloud` (fallback) | **1**, whatever the setting says (the Cloud Build plan's agent sessions are shared with phone) |
+
+- **The setting.** `r1_settings.max_concurrent_sessions`, 1..15, default 1. Set it with
+  `PUT /api/admin/r1/settings` and `{"max_concurrent_sessions": N}` (admin; the route audits the
+  change). `GET /api/admin/r1/settings` also returns `browser_worker_pool_size`. The settings API
+  refuses a limit above 1 (409 `r1_concurrency_needs_machine_names`) until the API env flag
+  `BROWSER_REQUIRE_MACHINE_AGENT_NAME` is on; lowering it to 1 is always accepted.
+- **The pool.** One machine runs one session. The pool size is the number of
+  `voice_worker_leases` rows for app `project-hello-voice`, pipeline `browser`, in any state, so
+  admission never lets in more sessions than there are machines. With no registered pool the
+  limit is 1.
+- **Cloud = 1.** On the Cloud fallback only one R1 session is admitted.
+- Above a limit of 1, a second admission for a round that already has a live session answers
+  `round_live`, and `r1_in_flight` means "the limit is reached".
+
+Live R1 sessions right now:
+
+```sql
+select count(*) as live_r1
+from screening_v2.call_sessions
+where interview_round_id is not null and status in ('created', 'waiting', 'in_progress');
+```
+
+### Rollout order (each step has a gate; stop at the first that fails)
+
+1. **Deploy inert.** Migration 0131, the API and the worker ship with the defaults. Nothing
+   changes: limit 1, shared agent name, one scoring job at a time. Confirm
+   `max_concurrent_sessions = 1` and run one normal interview.
+2. **Per-machine agent names, in a zero-live window.** Pause R1 and wait for `live_r1 = 0`
+   (a worker deploy restarts started machines and would cut a live interview).
+   - Worker first: set `BROWSER_PER_MACHINE_AGENT_NAME = "true"` in `app/voice-livekit/fly.toml`
+     `[env]` (the only config allowed to carry it) and deploy `project-hello-voice`. It takes
+     effect only together with `R1_READINESS_HOST=on`, that is on the R1 target.
+   - Gate: every browser lease that has reported carries its own name,
+     `registered_agent_name = 'browser-screener-<machine_id>'`
+     (`select machine_id, state, registered_agent_name from screening_v2.voice_worker_leases
+     where app = 'project-hello-voice' and pipeline = 'browser'`), and one smoke interview is
+     dispatched to its own machine.
+   - Then the API: `fly secrets set BROWSER_REQUIRE_MACHINE_AGENT_NAME=true -a project-hello-api`
+     (it restarts the API). From now on a lease that reported no per-machine name is released
+     (the exchange answers `preparing`) and the shared name is never dispatched.
+   - **Never with `livekit_target = cloud`.** Per-machine names are for the R1 SFU only: the
+     Cloud path dispatches the shared name. Turn both flags OFF (the API first, then the worker,
+     in a zero-live window) BEFORE switching to the Cloud fallback (see "Rollback, R1 to Cloud").
+3. **Provision the pool, N + 3 machines.** The 3 spares cover machines still stopping (up to
+   `kill_timeout` 300 s) and Fly start failures. Dry run first, then for real, from a shell that
+   has `FLY_API_TOKEN`, `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` in its environment:
+
+   ```
+   node scripts/provision-voice-worker-pool.mjs --app project-hello-voice --pipeline browser --size <N+3> --dry-run
+   node scripts/provision-voice-worker-pool.mjs --app project-hello-voice --pipeline browser --size <N+3>
+   ```
+
+   Never `fly scale count`: machines without a lease row are never reaped and would take
+   shared-name dispatches. Shrink only with `--retire <machineId>` (it removes the lease row of a
+   stopped machine; see the script header), never with a hand-run `fly machine destroy`.
+4. **Resize and deploy the SFU, in a zero-live window.** `infra/livekit-r1/fly.toml` is now
+   performance-4x / 8 GB with signaling limits of soft 300 / hard 600 connections (pinned by
+   `scripts/validate-livekit-r1-sfu.mjs`). The SFU is one Machine and deploys manually
+   (`fly deploy infra/livekit-r1 --ha=false --remote-only -a project-hello-r1-rtc-spike`); a
+   deploy ends every live room. Pause R1, wait for `live_r1 = 0`, deploy, then run the health,
+   UDP-pair, worker-registration and browser smoke checks ("SFU operations and fallback").
+   Signaling at N = 15 is an estimated 60-70 connections (about 3 per room plus one
+   registration per pool machine). The ICE/TCP 7881 service has no explicit concurrency block,
+   so include a forced-TCP client in the load test.
+5. **Load test at 2, 5, 10 and 15.** At each step raise `max_concurrent_sessions` to that number
+   (the pool size caps it anyway), run that many simultaneous staff interviews end to end (join,
+   role-play, close, recording, scoring), and hold the step until every gate passes:
+
+   | Gate | Pass |
+   |---|---|
+   | SFU CPU (Fly metrics; Prometheus on :6789) | p95 below 60% (the S0-C gate) |
+   | First audio (`first_audio_p95`, `session_facts.first_audio_p95_ms`) | role-play p95 at or under 3.0 s in every session (Stage A) |
+   | `r1_provider_429` (worker logs) | none sustained; a 429 at a step means a provider plan is the limit (Sarvam below) |
+   | Recording | every session's recording reaches `ready` |
+   | Dispatch | each lease's machine is the one running its job; ending one interview stops only its own machine |
+   | API | no proxy queueing or 503 during the joint join (request limit soft 80 / hard 200, `app/api/fly.toml`) |
+
+   Before the 15 step, an SFU-only rehearsal can run synthetic rooms with `lk load-test` (one
+   640x360 / 500 kbps publisher with audio and one subscriber per room). Rooms are not
+   auto-created on this SFU (`auto_create: false`), so create them first (`lk room create`) and
+   use load-test room names, never a candidate's.
+6. **Raise `max_concurrent_sessions` stepwise** in production the same way (1, 2, 5, 10, 15), one
+   step per passed load test, and set `R1_ASSESSMENT_CONCURRENCY` (below) from N = 5.
+
+### Scoring in parallel: `R1_ASSESSMENT_CONCURRENCY`
+
+By default the API scores `r1.assessment` jobs one at a time, so 15 interviews ending together
+queue their scoring for tens of minutes. `R1_ASSESSMENT_CONCURRENCY` (API secret or `[env]`;
+default 1, clamped to 1..8; a bad value means 1 and never stops the API booting) runs that many
+jobs at once per API process. Parallel jobs never score one interview twice: the 0116 trigger
+keys one live job per session (`r1.assessment:<session_id>`), the claim is `SKIP LOCKED`, and a
+racing insert for one session adopts the stored row (`uq_assessments_v2_session_revision`). Each
+job holds at most 2 DeepSeek calls in flight, so 8 jobs are 16 calls against the account's
+`deepseek-v4-pro` limit of 500. The R1 breaker is shared, so an outage defers every slot. The
+recording finalize runner still runs one job at a time.
+
+### External limits (check before each step up)
+
+- **Sarvam (shared with phone).** The Starter plan allows about 20 concurrent STT streams and
+  30 TTS requests a minute (bulbul:v3) for R1 and phone together. Each live call holds one STT
+  stream and the phone lane is at most 5 calls (LiveKit Cloud Build plan), which leaves 15 for R1:
+  **that is why the cap is 15.** TTS can bind first: a cold machine fills its line cache with
+  about 5 TTS requests, so more than about 6 interviews STARTING in the same minute can hit the 30
+  a minute; watch `r1_provider_429` at the 10 and 15 steps. If it fires, Pro (₹10,000; 100 STT,
+  200 TTS a minute) removes both limits; going above 15 needs Pro or Business (₹50,000; 1,000 TTS a
+  minute) plus a migration raising the CHECK.
+- **Fly.** (N + 3) x performance-4x is (N + 3) x 4 dedicated vCPU in `sin` (72 at N = 15), plus
+  4 for the SFU and about 12 for the phone pool (about 88 in all). Confirm the org's performance-vCPU quota and machine limit
+  (about 50 machines; raised by emailing billing@fly.io) before provisioning.
+- **Budget.** Each admission charges 65 minutes. Set `monthly_cap_minutes` to the intended
+  sessions x 65, or admission answers `capacity_exhausted` (see "Capacity settings").
+
+### Same-office testing: the per-IP rate limit
+
+Every `/api/r1/*` request shares a per-IP bucket of 60 requests a minute
+(`lib/r1/rate-limit.ts`), on top of the global 300 a minute per IP. Testers behind one office
+NAT share both buckets, and a joining candidate polls `preparing` every 3 s while a machine
+boots, so a same-office rehearsal of more than a few interviews gets `429`s that are the rate
+limit, not a capacity failure. Spread testers over separate networks (mobile hotspots) or
+stagger the joins. Real candidates join from their own networks.
+
+### Cost per interview (estimate)
+
+- Worker: about 35 minutes of performance-4x in `sin` (about $0.23 an hour), so about $0.13 per
+  interview; 15 at once is about $3.45 an hour.
+- SFU at performance-4x: about $165-170 a month while it runs (it auto-stops when idle).
+- Stopped pool: disk only, $0.15 per GB per month (about $8.10 a month for 18 machines at 3 GB).
+- Bandwidth: cents per interview (Asia-Pacific egress $0.04 per GB). DeepSeek scoring and Sarvam
+  usage per interview are as today; the Sarvam plan upgrade is the step change.
+
+### Rollback
+
+1. **Set `max_concurrent_sessions` to 1** (`PUT /api/admin/r1/settings`). It applies at once to
+   new admissions; sessions already live finish normally. In an incident, also pause R1.
+2. Unset `R1_ASSESSMENT_CONCURRENCY` (or set it to 1). Running jobs finish; the queue then drains
+   one at a time.
+3. Flags off in a zero-live window, the reverse of the rollout: the API first
+   (`BROWSER_REQUIRE_MACHINE_AGENT_NAME=false`), then remove `BROWSER_PER_MACHINE_AGENT_NAME` from
+   `app/voice-livekit/fly.toml` and deploy the worker. Both must be off before any switch to
+   `livekit_target = cloud`. Do step 1 first and turn the API flag off only at zero live: with the
+   flag off, the API dispatches an R1 interview to the shared name only when no other R1 session
+   is live, and otherwise holds the join at "preparing" (log `r1_concurrency_needs_machine_names`)
+   until the others end or lapse.
+4. The pool and the SFU size can stay (the limit caps admission). Shrink the pool with `--retire`
+   and revert the SFU size (with its validator pin) only in a zero-live window.

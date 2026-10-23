@@ -348,6 +348,46 @@ function optionalCount(value: unknown): number | null {
     : null;
 }
 
+/**
+ * Why a 409 `r1_busy` was busy, when the server said. Both are sent only while admission runs
+ * several interviews at once (0131): `slots_full` (every slot is taken; the page says "all
+ * interview slots are in use") and `own_session_live` (this link's OWN interview is already live
+ * in another tab or device; the page says it is open elsewhere). At the default of one interview
+ * at a time the body carries no reason.
+ */
+export type R1BusyReason = 'slots_full' | 'own_session_live';
+
+/**
+ * A refusal from `/api/r1/*`. It IS an `ApiError` (every check by class and code still holds);
+ * it only adds the busy reason, the one body field beyond the code that the page acts on.
+ */
+export class R1ApiError extends ApiError {
+  readonly busyReason: R1BusyReason | null;
+  constructor(message: string, status: number, busyReason: R1BusyReason | null = null) {
+    super(message, status);
+    this.busyReason = busyReason;
+  }
+}
+
+/** True when a thrown `r1_busy` said that every one of several interview slots is in use. */
+export function r1BusySlotsFull(error: unknown): boolean {
+  return error instanceof R1ApiError
+    && error.message === 'r1_busy'
+    && error.busyReason === 'slots_full';
+}
+
+/** True when a thrown `r1_busy` said this link's own interview is live in another tab/device. */
+export function r1BusyOwnSessionLive(error: unknown): boolean {
+  return error instanceof R1ApiError
+    && error.message === 'r1_busy'
+    && error.busyReason === 'own_session_live';
+}
+
+function busyReason(data: unknown): R1BusyReason | null {
+  const reason = record(data)?.busy_reason;
+  return reason === 'slots_full' || reason === 'own_session_live' ? reason : null;
+}
+
 function errorCode(data: unknown, status: number): string {
   const body = record(data);
   const code = body?.error;
@@ -382,7 +422,9 @@ async function send(
   } catch {
     data = null;
   }
-  if (!response.ok) throw new ApiError(errorCode(data, response.status), response.status);
+  if (!response.ok) {
+    throw new R1ApiError(errorCode(data, response.status), response.status, busyReason(data));
+  }
   return data;
 }
 

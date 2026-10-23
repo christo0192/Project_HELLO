@@ -31,6 +31,7 @@ import type {
   R1RuntimeStatus,
   R1Settings,
   R1SettingsPatch,
+  R1SettingsResponse,
   R1UsageResponse,
 } from './r1-types';
 
@@ -281,6 +282,8 @@ export interface R1SettingsDraft {
   pause_line_minutes: string;
   advance_threshold: string;
   hold_threshold: string;
+  /** Live R1 interviews at once (0131); an older API without the column reads as 1. */
+  max_concurrent_sessions: string;
 }
 
 export type R1SettingsDraftErrors = Partial<Record<keyof R1SettingsDraft, string>>;
@@ -294,7 +297,25 @@ export function draftFromSettings(settings: R1Settings): R1SettingsDraft {
     pause_line_minutes: String(settings.pause_line_minutes),
     advance_threshold: String(settings.advance_threshold),
     hold_threshold: String(settings.hold_threshold),
+    max_concurrent_sessions: String(savedConcurrency(settings)),
   };
+}
+
+/** The most live R1 interviews the setting may name (0131's CHECK, mirrored by the API). */
+export const R1_MAX_CONCURRENT_SESSIONS = 15;
+
+/** The saved limit; an older API that does not return the column means the 0128 rule, 1. */
+function savedConcurrency(settings: R1Settings): number {
+  const value = Number(settings.max_concurrent_sessions ?? 1);
+  return Number.isInteger(value) && value >= 1 ? value : 1;
+}
+
+/** A whole number 1..15, as the server accepts it. */
+function parseConcurrency(text: string): number | null {
+  const trimmed = text.trim();
+  if (!/^\d{1,2}$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return value >= 1 && value <= R1_MAX_CONCURRENT_SESSIONS ? value : null;
 }
 
 /**
@@ -344,8 +365,35 @@ export function parseDashboardMinutes(text: string): number | null {
   return Number(trimmed);
 }
 
-export function validateSettingsDraft(draft: R1SettingsDraft): R1SettingsDraftErrors {
+/**
+ * `saved`, when given, adds the pool check the server makes: raising the interview limit above 1
+ * past the browser worker machines it reported (`browser_worker_pool_size`) is refused here too,
+ * so the person is told before a request. An unchanged value is never re-checked, so a pool that
+ * shrank under a saved limit does not block saving the other fields. Without `saved` (or with an
+ * unknown pool) only the range is checked and the server stays the authority.
+ */
+export function validateSettingsDraft(
+  draft: R1SettingsDraft,
+  saved?: R1SettingsResponse,
+): R1SettingsDraftErrors {
   const errors: R1SettingsDraftErrors = {};
+  const concurrency = parseConcurrency(draft.max_concurrent_sessions);
+  const pool = saved?.browser_worker_pool_size;
+  if (concurrency === null) {
+    errors.max_concurrent_sessions = `Enter a whole number from 1 to ${R1_MAX_CONCURRENT_SESSIONS}.`;
+  } else if (
+    saved
+    && typeof pool === 'number'
+    && concurrency > 1
+    && concurrency > pool
+    && concurrency !== savedConcurrency(saved)
+  ) {
+    errors.max_concurrent_sessions = pool <= 1
+      ? `${pool === 1 ? 'Only 1 interview machine is' : 'No interview machines are'} registered, ` +
+        'so R1 runs one interview at a time.'
+      : `Only ${pool} interview machines are registered, so R1 can run at most ${pool} ` +
+        'interviews at a time.';
+  }
   if (parsePositiveInteger(draft.monthly_cap_minutes) === null) {
     errors.monthly_cap_minutes = 'Enter a whole number of minutes, 1 or more.';
   }
@@ -389,12 +437,28 @@ export function settingsPatch(draft: R1SettingsDraft, saved: R1Settings): R1Sett
   }
   const hold = parseScore(draft.hold_threshold);
   if (hold !== null && hold !== Number(saved.hold_threshold)) patch.hold_threshold = hold;
+  const concurrency = parseConcurrency(draft.max_concurrent_sessions);
+  // Compared with 1 when an older API sent no column, so its draft ('1') sends nothing.
+  if (concurrency !== null && concurrency !== savedConcurrency(saved)) {
+    patch.max_concurrent_sessions = concurrency;
+  }
   return patch;
 }
 
-/** The settings that change real behaviour and so ask for a second click. */
-export function needsConfirmation(patch: R1SettingsPatch): string[] {
+/**
+ * The settings that change real behaviour and so ask for a second click. `saved` tells a raise of
+ * the interview limit from a cut; without it any limit above 1 counts as a raise.
+ */
+export function needsConfirmation(patch: R1SettingsPatch, saved?: R1Settings): string[] {
   const reasons: string[] = [];
+  const before = saved ? savedConcurrency(saved) : 1;
+  if (patch.max_concurrent_sessions !== undefined && patch.max_concurrent_sessions > before) {
+    // Lowering only refuses new starts until enough interviews end, so it needs no second click.
+    reasons.push(
+      `let up to ${patch.max_concurrent_sessions} R1 interviews run at the same time (now ` +
+        `${before}), each on its own interview machine`,
+    );
+  }
   if (patch.enabled === true) reasons.push('switch R1 on, so HR can send candidate links');
   if (patch.auto_status_enabled === true) {
     reasons.push(

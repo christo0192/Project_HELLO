@@ -87,7 +87,9 @@ import {
   type LiveKitEndpoint,
 } from '../lib/livekit-endpoints.js';
 import { browserOrchestrationGate, type BrowserWorkerGate } from '../lib/browser-orchestration.js';
+import { env } from '../lib/env.js';
 import { legacyBrowserScreeningEnabled } from '../lib/legacy-browser-screening.js';
+import { BROWSER_FLY_APP } from '../lib/worker-orchestration-runtime.js';
 import { getR1Config } from '../lib/r1/config.js';
 import {
   generateNonce,
@@ -147,9 +149,27 @@ export const PREFLIGHT_POLICY = {
 } as const;
 /**
  * Plan 4 step 6: "another interview is finishing, try again in about 30 minutes" (an R1 interview
- * runs about 30 minutes since the 20-minute role-play).
+ * runs about 30 minutes since the 20-minute role-play). This is the busy answer while admission
+ * runs one live R1 at a time, the default.
  */
 export const BUSY_RETRY_AFTER_SEC = 30 * 60;
+/**
+ * The busy answer once admission runs several live R1 sessions at once (0131,
+ * `max_concurrent_sessions` above 1 on the self-hosted target): one of many slots frees far
+ * sooner than one interview's length, so the candidate is told about 5 minutes.
+ */
+export const BUSY_SLOTS_RETRY_AFTER_SEC = 5 * 60;
+/**
+ * The `busy_reason` a 409 `r1_busy` carries ONLY when several slots exist; the page then says
+ * "all interview slots are in use". Absent, the body is exactly today's single-slot answer.
+ */
+export const R1_BUSY_SLOTS_FULL = 'slots_full';
+/**
+ * The `busy_reason` a 409 `r1_busy` carries when admission said `round_live`: this candidate's
+ * OWN round already has a live session (a second tab or device without the rejoin nonce). It is
+ * not a full pool, so the page says the interview is open on another device or tab.
+ */
+export const R1_BUSY_OWN_SESSION_LIVE = 'own_session_live';
 export const PREPARING_RETRY_AFTER_SEC = 3;
 /** A withdrawal whose room could not be cut is safe to retry at once. */
 export const WITHDRAW_RETRY_AFTER_SEC = 3;
@@ -185,6 +205,10 @@ const ADMISSION_REFUSALS: Readonly<Record<string, { status: number; error: strin
   consent_missing: { status: 409, error: 'consent_required' },
   r1_in_flight: { status: 409, error: 'r1_busy' },
   cloud_capacity_exhausted: { status: 409, error: 'r1_busy' },
+  // 0131: the round already has a live session (a second tab without the rejoin nonce). Only
+  // answered above a limit of 1; the body carries busy_reason own_session_live (not
+  // slots_full), and the page explains it as the candidate's own open interview.
+  round_live: { status: 409, error: 'r1_busy' },
   round_not_admissible: { status: 409, error: 'round_not_admissible' },
   round_expired: { status: 409, error: 'round_expired' },
   starts_exhausted: { status: 409, error: 'starts_exhausted' },
@@ -272,6 +296,8 @@ export interface R1CandidateDeps {
   readyLimiter?: ReadyLimiter;
   /** Bound on each LiveKit server call of the ready relay (`READY_RELAY_TIMEOUT_MS` by default). */
   readyRelayTimeoutMs?: number;
+  /** BROWSER_REQUIRE_MACHINE_AGENT_NAME (env, off by default); read before an R1 dispatch. */
+  requireMachineAgentName?: () => boolean;
 }
 
 function defaultSchedule(work: () => void, delayMs: number): void {
@@ -316,6 +342,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
   const uuid = deps.uuid ?? randomUUID;
   const provisionRoom = deps.provisionRoom ?? provisionRoomForCreatedSession;
   const resolveGate = deps.resolveGate ?? (() => browserOrchestrationGate());
+  const requireMachineAgentName = deps.requireMachineAgentName ?? (() => env.browserRequireMachineAgentName);
   const legacyBrowserEnabled = deps.legacyBrowserEnabled ?? legacyBrowserScreeningEnabled;
   const roomsFor = deps.rooms
     ?? ((endpoint: LiveKitEndpoint) => roomServiceClientFor(endpoint) as unknown as R1RoomClient);
@@ -405,6 +432,66 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
    */
   function audienceLocale(round: RoundRow): string | null {
     return CONSENT_AUDIENCES.has(round.consent_locale) ? round.consent_locale : null;
+  }
+
+  /**
+   * Does admission run more than one live R1 session at once? 0131's limit, read only to word a
+   * busy answer: on the self-hosted target it is least(max_concurrent_sessions, browser worker
+   * pool, floor 1); on Cloud it is 1. Any failed or odd read answers false, today's single-slot
+   * answer, so an older database (no column yet) words it exactly as before.
+   */
+  async function admitsSeveralLive(): Promise<boolean> {
+    try {
+      const settings = await db
+        .from('r1_settings')
+        .select('livekit_target, max_concurrent_sessions')
+        .eq('singleton', true)
+        .maybeSingle();
+      const row = settings.data as { livekit_target?: unknown; max_concurrent_sessions?: unknown } | null;
+      if (settings.error || !row || row.livekit_target !== 'r1') return false;
+      const max = row.max_concurrent_sessions;
+      if (typeof max !== 'number' || !Number.isInteger(max) || max <= 1) return false;
+      const pool = await db
+        .from('voice_worker_leases')
+        .select('machine_id')
+        .eq('app', BROWSER_FLY_APP)
+        .eq('pipeline', 'browser');
+      if (pool.error || !Array.isArray(pool.data)) return false;
+      return Math.min(max, Math.max(pool.data.length, 1)) > 1;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * M019 interlock at dispatch time, not only when the limit is saved. With
+   * BROWSER_REQUIRE_MACHINE_AGENT_NAME off, an R1 dispatch may go to the SHARED agent name, which
+   * is safe only while this is the one live R1 session: with another live, LiveKit could hand
+   * this session's job to a machine leased to the other interview, whose release would then stop
+   * it mid-call. So, flag off on the self-hosted target, dispatch only when no OTHER R1 session
+   * is live (0131's live predicate). At limit 1 admission already guarantees that, so today's
+   * behaviour is unchanged; after a misordered rollback (flag off while several were admitted,
+   * or the limit still above 1) every join but one defers instead. An unreadable answer defers
+   * too. Cloud, and the flag on (per-machine names enforced by the gate), skip the read.
+   */
+  async function sharedNameDispatchSafe(endpoint: LiveKitEndpoint, sessionId: string): Promise<boolean> {
+    if (endpoint.target !== 'r1' || requireMachineAgentName()) return true;
+    try {
+      const others = await db
+        .from('call_sessions')
+        .select('id')
+        .not('interview_round_id', 'is', null)
+        .in('status', ['created', 'waiting', 'in_progress'])
+        .neq('id', sessionId)
+        .limit(1);
+      if (!others.error && Array.isArray(others.data) && others.data.length === 0) return true;
+      log.error('unknown_event', {
+        error_category: others.error ? 'r1_live_count_unreadable' : 'r1_concurrency_needs_machine_names',
+      });
+    } catch {
+      log.error('unknown_event', { error_category: 'r1_live_count_unreadable' });
+    }
+    return false;
   }
 
   /** New-work gate: maintenance blocks new joins (503); a read failure fails closed. */
@@ -785,7 +872,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     }
     // A worker owns an in-progress session: deleting the room ends its job and
     // it settles its own terminal state. A created/waiting session has no
-    // worker, so cancel it here to free the single R1 slot at once.
+    // worker, so cancel it here to free its R1 slot at once.
     if (session.status === 'created' || session.status === 'waiting') {
       const moved = await transitionSession(
         session.session_id,
@@ -1058,7 +1145,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     if (!(await laneForNewWork(res))) return;
     // Admission spends one of the link's three starts and moves 65 minutes into
     // the month's used capacity for good, and the orphan `created` session it
-    // makes blocks all of R1 until it lapses. The exchange refuses the same way
+    // makes holds an R1 slot (with the default limit of one, all of R1) until it lapses. The exchange refuses the same way
     // while DeepSeek is down, so refuse BEFORE admission (the probe is cached):
     // an outage must not burn starts and capacity on interviews that cannot run.
     if (!(await healthy())) {
@@ -1094,8 +1181,17 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
       const refusal = ADMISSION_REFUSALS[String(admitted.data.status)]
         ?? { status: 503, error: 'service_unavailable' };
       if (refusal.error === 'r1_busy') {
-        res.setHeader('Retry-After', String(BUSY_RETRY_AFTER_SEC));
-        refuse(res, refusal.status, refusal.error, { retry_after_sec: BUSY_RETRY_AFTER_SEC });
+        // round_live is only ever answered above a limit of 1 (0131), so it needs no read; it is
+        // the candidate's own live session, not a full pool, and says so.
+        const ownLive = admitted.data.status === 'round_live';
+        const slots = ownLive || (await admitsSeveralLive());
+        const retryAfter = slots ? BUSY_SLOTS_RETRY_AFTER_SEC : BUSY_RETRY_AFTER_SEC;
+        res.setHeader('Retry-After', String(retryAfter));
+        const reason = ownLive ? R1_BUSY_OWN_SESSION_LIVE : slots ? R1_BUSY_SLOTS_FULL : null;
+        refuse(res, refusal.status, refusal.error, {
+          retry_after_sec: retryAfter,
+          ...(reason ? { busy_reason: reason } : {}),
+        });
         return;
       }
       refuse(res, refusal.status, refusal.error);
@@ -1314,7 +1410,7 @@ export function createR1CandidateRouter(deps: R1CandidateDeps = {}): Router {
     }
 
     if (session.status !== 'in_progress') {
-      const gate = await runR1WorkerGate({
+      const gate = !(await sharedNameDispatchSafe(endpoint, session.id)) ? 'preparing' : await runR1WorkerGate({
         gate: resolveGate(),
         sessionId: session.id,
         roomName,

@@ -13,7 +13,7 @@
 // Plain .mjs, the failures[] harness — NOT vitest, NOT node:test.
 
 import { spawnSync } from "node:child_process";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import path from "node:path";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -86,7 +86,8 @@ const SECRET = "super-secret-token-value";
 }
 
 // ── in-process import of the core + injectable die ──────────────────────
-const mod = await import(script);
+// A file URL, not a bare path: a Windows absolute path ("C:\...") is not an ESM specifier.
+const mod = await import(pathToFileURL(script).href);
 const { provision, parseArgs, setDieHandler, ProvisionDied } = mod;
 
 // A template machine as Fly's GET returns it — a valid config + image + a
@@ -235,9 +236,139 @@ const sink = () => {}; // silent out()
   setDieHandler((msg) => { throw new ProvisionDied(msg); });
 }
 
+// ── 4. --retire (M019 pool shrink) ──────────────────────────────────────
+// 4a. Arg validation via SUBPROCESS: a bad id or --retire with --size exits 1
+//     with a stable message, before any env/network, and never echoes a secret.
+{
+  const env = { FLY_API_TOKEN: SECRET, SUPABASE_URL: SECRET, SUPABASE_SERVICE_ROLE_KEY: SECRET };
+  const badId = run(["--app", "project-hello-voice", "--retire", "NOT_AN_ID!"], env);
+  ok(badId.code === 1, `a bad --retire id must exit 1, got ${badId.code}:\n${badId.out}`);
+  ok(/--retire takes a Fly machine id/.test(badId.out), `bad id must name the id contract, got:\n${badId.out}`);
+  ok(!badId.out.includes(SECRET), `bad-id die path must not echo the secret, got:\n${badId.out}`);
+  const withSize = run(["--app", "project-hello-voice", "--retire", "89122ec60edd28", "--size", "2"], env);
+  ok(withSize.code === 1, `--retire with --size must exit 1, got ${withSize.code}:\n${withSize.out}`);
+  ok(/cannot be combined with --size/.test(withSize.out), `--retire + --size must be refused, got:\n${withSize.out}`);
+  const dup = run(["--app", "project-hello-voice", "--retire", "89122ec60edd28", "--retire", "89122ec60edd28"], env);
+  ok(dup.code === 1 && /same machine more than once/.test(dup.out), `a duplicate --retire must be refused, got:\n${dup.out}`);
+  const parsed = parseArgs(["--app", "project-hello-voice", "--retire", "aaaa1111bbbb22", "--retire", "cccc3333dddd44", "--dry-run"]);
+  ok(JSON.stringify(parsed.retire) === JSON.stringify(["aaaa1111bbbb22", "cccc3333dddd44"]) && parsed.dryRun === true,
+    `parseArgs must collect repeated --retire ids, got ${JSON.stringify(parsed)}`);
+}
+
+// 4b. The retire core, in-process with injected deps. Every side effect is
+//     recorded in ONE ordered log so "lease first, then Fly" is asserted, not
+//     assumed.
+const { retire } = mod;
+const RA = "aaaa1111bbbb22";
+const RB = "cccc3333dddd44";
+const RC = "eeee5555ffff66";
+function makeRetireDeps({
+  machines = [
+    { id: RA, state: "stopped" }, { id: RB, state: "stopped" }, { id: RC, state: "stopped" },
+  ],
+  leases = { [RA]: "stopped", [RB]: "stopped", [RC]: "stopped" },
+  retireStatus = {},
+  destroyOk = true,
+} = {}) {
+  const log = [];
+  return {
+    log,
+    deps: {
+      flyRequest: async (method, p) => { log.push(`fly:${method}:${p}`); return machines; },
+      readLease: async (_app, id) => { log.push(`read:${id}`); return id in leases ? leases[id] : null; },
+      retireLease: async (_app, id) => { log.push(`retire:${id}`); return { status: retireStatus[id] ?? "retired", machine_id: id }; },
+      destroyMachine: async (_app, id) => { log.push(`destroy:${id}`); return { ok: destroyOk, status: destroyOk ? 200 : 412 }; },
+      out: sink,
+    },
+  };
+}
+const dieThrows = () => setDieHandler((msg) => { throw new Error("DIE:" + msg); });
+const acts = (log) => log.filter((l) => l.startsWith("retire:") || l.startsWith("destroy:"));
+async function expectDie(fn, pattern, label) {
+  let caught = null;
+  try { await fn(); } catch (e) { caught = e; }
+  ok(caught && /^DIE:/.test(caught.message) && pattern.test(caught.message),
+    `${label}: expected a die matching ${pattern}, got: ${caught && caught.message}`);
+}
+
+// Happy path: retire FIRST, then destroy, per machine; others untouched.
+{
+  dieThrows();
+  const t = makeRetireDeps();
+  const res = await retire({ app: "project-hello-voice", retire: [RA, RB], dryRun: false }, t.deps);
+  ok(JSON.stringify(res.retired) === JSON.stringify([RA, RB]), `both must be retired, got ${JSON.stringify(res)}`);
+  ok(JSON.stringify(acts(t.log)) === JSON.stringify([`retire:${RA}`, `destroy:${RA}`, `retire:${RB}`, `destroy:${RB}`]),
+    `the lease must be retired BEFORE each destroy, got ${JSON.stringify(acts(t.log))}`);
+  ok(!t.log.includes(`read:${RC}`) && !t.log.includes(`retire:${RC}`), "an unrequested machine must not be touched");
+}
+// A `created` (provisioned, never started) machine is retirable too.
+{
+  const t = makeRetireDeps({ machines: [{ id: RA, state: "created" }, { id: RB, state: "stopped" }] });
+  const res = await retire({ app: "project-hello-voice", retire: [RA], dryRun: false }, t.deps);
+  ok(res.retired.length === 1, "a created (never started) machine must be retirable");
+}
+// Dry-run: reads only — no retire, no destroy.
+{
+  const t = makeRetireDeps();
+  const res = await retire({ app: "project-hello-voice", retire: [RA], dryRun: true }, t.deps);
+  ok(acts(t.log).length === 0, `dry-run must not retire or destroy, got ${JSON.stringify(acts(t.log))}`);
+  ok(t.log.includes(`read:${RA}`) && JSON.stringify(res.planned) === JSON.stringify([RA]), "dry-run must still read and plan");
+}
+// Fly reports it started: the whole run is refused before anything is touched.
+{
+  const t = makeRetireDeps({ machines: [{ id: RA, state: "stopped" }, { id: RB, state: "started" }, { id: RC, state: "stopped" }] });
+  await expectDie(() => retire({ app: "project-hello-voice", retire: [RA, RB], dryRun: false }, t.deps),
+    /not stopped with a stopped lease[\s\S]*nothing was changed/, "a started machine");
+  ok(acts(t.log).length === 0, `a started machine must refuse the WHOLE run (RA untouched too), got ${JSON.stringify(acts(t.log))}`);
+}
+// The lease is claimed (a live session): refused, nothing touched.
+{
+  const t = makeRetireDeps({ leases: { [RA]: "busy", [RB]: "stopped", [RC]: "stopped" } });
+  await expectDie(() => retire({ app: "project-hello-voice", retire: [RA], dryRun: false }, t.deps),
+    /not stopped with a stopped lease/, "a claimed lease");
+  ok(acts(t.log).length === 0, "a claimed lease must not be retired or destroyed");
+}
+// No lease row, or a machine that is not in the app: refused.
+{
+  const t = makeRetireDeps({ leases: { [RB]: "stopped", [RC]: "stopped" } });
+  await expectDie(() => retire({ app: "project-hello-voice", retire: [RA], dryRun: false }, t.deps),
+    /not stopped with a stopped lease/, "no lease row");
+  ok(acts(t.log).length === 0, "an unregistered machine must not be destroyed by --retire");
+  const t2 = makeRetireDeps();
+  await expectDie(() => retire({ app: "project-hello-voice", retire: ["0123456789abcd"], dryRun: false }, t2.deps),
+    /not stopped with a stopped lease/, "a machine of another app");
+  ok(acts(t2.log).length === 0, "a machine absent from the app must not be touched");
+}
+// Retiring every machine of the app is refused (the template must remain).
+{
+  const t = makeRetireDeps({ machines: [{ id: RA, state: "stopped" }] , leases: { [RA]: "stopped" } });
+  await expectDie(() => retire({ app: "project-hello-voice", retire: [RA], dryRun: false }, t.deps),
+    /every machine of the app/, "the last machine");
+  ok(acts(t.log).length === 0, "the last machine must not be retired");
+}
+// A claim races in between plan and retire: retire answers not_stopped, so that
+// machine is NOT destroyed; the others still are; the run ends non-zero.
+{
+  const t = makeRetireDeps({ retireStatus: { [RA]: "not_stopped" } });
+  await expectDie(() => retire({ app: "project-hello-voice", retire: [RA, RB], dryRun: false }, t.deps),
+    /claimed or refused during the run and were kept: aaaa1111bbbb22/, "a raced claim");
+  ok(!t.log.includes(`destroy:${RA}`), "a machine whose retire was refused must NEVER be destroyed");
+  ok(t.log.includes(`retire:${RB}`) && t.log.includes(`destroy:${RB}`), "the other machine is still retired");
+}
+// The destroy fails after the lease was retired: the run dies naming the
+// manual follow-up (and the lease was retired first).
+{
+  const t = makeRetireDeps({ destroyOk: false });
+  await expectDie(() => retire({ app: "project-hello-voice", retire: [RA], dryRun: false }, t.deps),
+    /lease retired for aaaa1111bbbb22 but the Fly destroy failed[\s\S]*fly machine destroy aaaa1111bbbb22 -a project-hello-voice/,
+    "a failed destroy");
+  ok(JSON.stringify(acts(t.log)) === JSON.stringify([`retire:${RA}`, `destroy:${RA}`]), "retire precedes the failed destroy");
+}
+setDieHandler((msg) => { throw new ProvisionDied(msg); });
+
 if (failures.length) {
   console.error(`provision-voice-worker-pool.test FAILED (${failures.length}):`);
   for (const f of failures) console.error(" - " + f);
   process.exit(1);
 }
-console.log(`provision-voice-worker-pool.test OK (subprocess arg/env validation + secret-hygiene + idempotency + orphan self-heal + dry-run + created-machine invariants).`);
+console.log(`provision-voice-worker-pool.test OK (subprocess arg/env validation + secret-hygiene + idempotency + orphan self-heal + dry-run + created-machine invariants + --retire: lease-first order, stopped-only, whole-run refusal, last-machine guard, raced claim, failed destroy)`);
