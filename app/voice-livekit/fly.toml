@@ -84,6 +84,12 @@ kill_timeout = 300
   # UP first (runbook docs/runbooks/phone-worker-orchestration-activation.md §5).
   BROWSER_AGENT_NAME = "browser-screener"
   WORKER_ORCHESTRATION = "worker"
+  # M019 rollout step 2 (docs/runbooks/r1-operations.md, "Rollout order"): each R1
+  # browser worker registers as browser-screener-<FLY_MACHINE_ID> and takes one job, so
+  # the API can dispatch every leased session to its own machine. Effective only with
+  # the R1_READINESS_HOST=on secret (the R1 target). Roll back by removing this line,
+  # API flag BROWSER_REQUIRE_MACHINE_AGENT_NAME off FIRST, in a zero-live window.
+  BROWSER_PER_MACHINE_AGENT_NAME = "true"
   # BROWSER_WORKER_ONE_JOB and R1_READINESS_HOST are deliberately ABSENT: exact
   # `on` is set only at the R1 self-hosted cutover, after the host-aware API
   # readiness deploy. They are per-cutover Fly SECRETS on this app (step 4 of
