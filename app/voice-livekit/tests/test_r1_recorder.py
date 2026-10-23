@@ -2698,7 +2698,8 @@ class TestEncoderQueues(unittest.TestCase):
 
         self.wire = wire
         self.proc = _FakeProc()
-        self.encoder = r1_recorder.EncoderProcess(Path("."), popen=lambda *_a, **_k: self.proc)
+        self.clock = ManualClock(100.0)  # the encoder's own clock: what its backlog is aged on
+        self.encoder = r1_recorder.EncoderProcess(Path("."), popen=lambda *_a, **_k: self.proc, clock=self.clock)
         self.assertTrue(self.encoder.spawn())
         self.addCleanup(self.encoder.kill)
         self.addCleanup(self.proc.stdout.close)
@@ -2760,15 +2761,57 @@ class TestEncoderQueues(unittest.TestCase):
         )
 
     def test_pictures_never_count_against_the_audio_backlog(self) -> None:
-        self.hold_the_writer()
+        self.assertTrue(self.encoder.send_hello(video=True, preset="superfast", t0_us=1))
+        self.proc.stdin.wait_for(1)
+        end = time.monotonic() + 5
+        while self.encoder._writing_since is not None and time.monotonic() < end:
+            time.sleep(0.005)  # the write of HELLO has returned: nothing ordered waits
+        self.proc.stdin.gate.clear()
         for index in range(50):
             self.encoder.send_video(index, 640, 360, 0, b"x" * 1000)
+        self.clock.advance(r1_recorder.ENCODER_BACKLOG_SECONDS * 2)  # a picture stuck in the pipe ...
+        self.assertEqual(self.encoder.backlog_seconds(), 0.0)  # ... is not a backlog by itself
         self.assertTrue(self.encoder.send_audio(1, b"\x00\x00"))
         self.assertFalse(self.encoder.overflowed)
-        self.encoder.send_audio(2, b"\x00" * (r1_recorder.ENCODER_AUDIO_BACKLOG_BYTES + 10))
-        self.assertFalse(self.encoder.send_audio(3, b"\x00\x00"))
-        self.assertTrue(self.encoder.overflowed)  # only audio can make the child "stuck"
+        # The audio now waits behind that picture: once it has waited too long the pipe is stuck.
+        self.clock.advance(r1_recorder.ENCODER_BACKLOG_SECONDS + 0.1)
+        self.assertFalse(self.encoder.send_audio(2, b"\x00\x00"))
+        self.assertTrue(self.encoder.overflowed)  # only waiting audio can make the child "stuck"
         self.proc.stdin.gate.set()
+
+    def test_a_whole_agent_turn_handed_over_at_once_is_a_burst_not_a_stuck_child(self) -> None:
+        # The SDK writes nothing while the agent speaks, so a 35 s turn is ONE chunk, and the mixer
+        # hands it to the encoder at once as a 30 s piece and a 5 s piece.  A healthy child that has
+        # not read the first piece yet (the writer is inside a write) must take the rest too.
+        mixer = r1_recorder.TeeMixer(0.0)
+        pieces = mixer.process([], [frame(tone_samples(35.0, rate=RATE), rate=RATE)], 35.0)
+        self.assertEqual([len(pcm) // 2 for _pts, pcm in pieces], [30 * RATE, 5 * RATE])
+        self.hold_the_writer()
+        for pts_us, pcm in pieces:
+            self.assertTrue(self.encoder.send_audio(pts_us, pcm), "a piece of the turn was refused")
+        self.clock.advance(2.5)  # the next 2.5 s chunk, the child still busy with the turn
+        self.assertTrue(self.encoder.send_audio(35_000_000, b"\x00" * (RATE * 5)))
+        self.assertFalse(self.encoder.overflowed, "a healthy child was taken for a stuck one")
+        got = self.release(1 + 3)
+        self.assertEqual([m[0] for m in got], [self.wire.MSG_HELLO] + [self.wire.MSG_AUDIO] * 3)
+        self.assertEqual(b"".join(m[2] for m in got[1:3]), b"".join(pcm for _pts, pcm in pieces))
+
+    def test_audio_that_waited_longer_than_the_window_means_a_stuck_child(self) -> None:
+        self.hold_the_writer()  # HELLO went in at 100.0 and the pipe takes nothing more
+        self.assertTrue(self.encoder.send_audio(1, b"\x00\x00"))
+        self.clock.advance(r1_recorder.ENCODER_BACKLOG_SECONDS)
+        self.assertEqual(self.encoder.backlog_seconds(), r1_recorder.ENCODER_BACKLOG_SECONDS)
+        self.assertTrue(self.encoder.send_audio(2, b"\x00\x00"), "a slow encoder gets the whole window")
+        self.assertFalse(self.encoder.overflowed)
+        self.clock.advance(0.1)
+        self.assertFalse(self.encoder.send_audio(3, b"\x00\x00"))
+        self.assertTrue(self.encoder.overflowed)
+        self.proc.stdin.gate.set()
+        self.proc.stdin.wait_for(3)  # HELLO and the two accepted pieces; the refused one never queued
+        end = time.monotonic() + 5
+        while self.encoder.backlog_seconds() and time.monotonic() < end:
+            time.sleep(0.005)
+        self.assertEqual(self.encoder.backlog_seconds(), 0.0, "a written message no longer waits")
 
     def test_kill_discards_everything_queued_and_stops_the_writer(self) -> None:
         self.hold_the_writer()
@@ -3981,7 +4024,8 @@ class TestWithTheRealEncoder(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(recorder.finish(), 60)
         self.assertEqual(recorder.phase, "done")
         (body,) = self.api.bodies("complete")
-        self.assertEqual(body["layout"], "combined")
+        why = f"failure_reason={body.get('failure_reason')!r} encoder_lost={recorder.encoder_lost!r}"
+        self.assertEqual(body["layout"], "combined", why)
         self.assertNotIn("failure_reason", body)
         report = body["report"]
         self.assertTrue(report["faststart_uploaded"])
