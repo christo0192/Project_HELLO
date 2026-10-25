@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { zod3Int } from '../lib/zod-compat.js';
 import { uuidSchema } from './common.js';
 
 /**
@@ -51,7 +52,7 @@ export type NoteCreateInput = z.infer<typeof noteCreateSchema>;
 export const noteListQuerySchema = z
   .object({
     candidate_id: uuidSchema,
-    limit: z.coerce.number().int().min(1).max(100).optional(),
+    limit: z.coerce.number().check(zod3Int()).min(1).max(100).optional(),
   })
   .strict();
 

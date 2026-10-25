@@ -1,7 +1,11 @@
 import { z } from 'zod';
+import { zod3Uuid } from '../lib/zod-compat.js';
 
-/** RFC 4122 UUID string validation. */
-export const uuidSchema = z.string().uuid('must be a valid UUID').describe('UUID identifier');
+/**
+ * UUID string validation: 8-4-4-4-12 hex, any version/variant (zod 3's
+ * `.uuid()` and Postgres `uuid` acceptance; see lib/zod-compat.ts).
+ */
+export const uuidSchema = zod3Uuid('must be a valid UUID').describe('UUID identifier');
 
 /** Reusable path-param schema for `:id` patterns. */
 export const idParamSchema = z.object({ id: uuidSchema }).strict();

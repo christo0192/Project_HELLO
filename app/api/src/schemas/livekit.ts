@@ -1,8 +1,9 @@
 import { z } from 'zod';
+import { zod3Uuid } from '../lib/zod-compat.js';
 
 export const livekitStartSchema = z
   .object({
-    candidate_id: z.string().uuid('candidate_id must be a valid UUID'),
+    candidate_id: zod3Uuid('candidate_id must be a valid UUID'),
   })
   .strict();
 
@@ -10,7 +11,7 @@ export type LivekitStartInput = z.infer<typeof livekitStartSchema>;
 
 export const livekitRecordingParamSchema = z
   .object({
-    sessionId: z.string().uuid('sessionId must be a valid UUID'),
+    sessionId: zod3Uuid('sessionId must be a valid UUID'),
   })
   .strict();
 
@@ -23,7 +24,7 @@ export const livekitRecordingBodySchema = z.object({}).strict();
  */
 export const workerContextSchema = z
   .object({
-    session_id: z.string().uuid('session_id must be a valid UUID'),
+    session_id: zod3Uuid('session_id must be a valid UUID'),
     // Browser rooms are `screening-<uuid>`; phone rooms are `phone-<uuid>`.
     // PR #186 made the PHONE worker resolve its prompt context through this
     // route, but the schema still admitted only browser rooms — every phone
@@ -37,7 +38,7 @@ export const workerContextSchema = z
 export const recordingGrantSchema = z
   .object({
     grant_token: z.string().regex(/^[a-f0-9]{64}$/, 'grant_token is invalid'),
-    session_id: z.string().uuid('session_id must be a valid UUID'),
+    session_id: zod3Uuid('session_id must be a valid UUID'),
   })
   .strict();
 

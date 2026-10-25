@@ -26,6 +26,7 @@
  */
 
 import { z } from 'zod';
+import { zod3Int } from '../lib/zod-compat.js';
 import { uuidSchema } from './common.js';
 import {
   PHONE_APPOINTMENT_CANCEL_REASONS,
@@ -99,7 +100,7 @@ export const istDateSchema = z
  */
 export const appointmentVersionSchema = z
   .number()
-  .int('must_be_an_integer')
+  .check(zod3Int('must_be_an_integer'))
   .min(1, 'must_be_at_least_one')
   .describe('Optimistic-concurrency version of the live appointment');
 

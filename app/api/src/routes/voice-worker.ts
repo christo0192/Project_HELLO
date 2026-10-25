@@ -32,6 +32,7 @@
 import { timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
 import { z } from 'zod';
+import { zod3Int } from '../lib/zod-compat.js';
 import { createLogger } from '../lib/logger.js';
 import { env } from '../lib/env.js';
 import { supabase } from '../lib/supabase.js';
@@ -62,7 +63,7 @@ const readySchema = z
     app: z.string().regex(FLY_ID_RE),
     machine_id: z.string().regex(FLY_ID_RE),
     session_id: z.string().regex(UUID_RE),
-    epoch: z.number().int().min(0).max(9_007_199_254_740_991),
+    epoch: z.number().check(zod3Int()).min(0).max(9_007_199_254_740_991),
   })
   .strict();
 
