@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { zod3Uuid } from '../lib/zod-compat.js';
 
 /**
  * MIG-06: Recorder download route parameter schema.
@@ -6,7 +7,7 @@ import { z } from 'zod';
  */
 export const recordingDownloadParamSchema = z
   .object({
-    sessionId: z.string().uuid('sessionId must be a valid UUID'),
+    sessionId: zod3Uuid('sessionId must be a valid UUID'),
   })
   .strict();
 
@@ -15,7 +16,7 @@ export type RecordingDownloadParams = z.infer<typeof recordingDownloadParamSchem
 /** Attempt-scoped download parameters. */
 export const recordingAttemptDownloadParamSchema = z
   .object({
-    attemptId: z.string().uuid('attemptId must be a valid UUID'),
+    attemptId: zod3Uuid('attemptId must be a valid UUID'),
   })
   .strict();
 
@@ -27,7 +28,7 @@ export type RecordingAttemptDownloadParams = z.infer<typeof recordingAttemptDown
  */
 export const recordingUploadParamSchema = z
   .object({
-    sessionId: z.string().uuid('sessionId must be a valid UUID'),
+    sessionId: zod3Uuid('sessionId must be a valid UUID'),
   })
   .strict();
 
@@ -49,7 +50,7 @@ export type RecordingUploadBody = z.infer<typeof recordingUploadBodySchema>;
  */
 export const recordingRevokeParamSchema = z
   .object({
-    sessionId: z.string().uuid('sessionId must be a valid UUID'),
+    sessionId: zod3Uuid('sessionId must be a valid UUID'),
   })
   .strict();
 

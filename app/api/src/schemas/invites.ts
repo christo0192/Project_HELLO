@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { zod3Uuid } from '../lib/zod-compat.js';
 
 /**
  * POST /api/livekit/invite
@@ -7,8 +8,8 @@ import { z } from 'zod';
  */
 export const inviteCreateSchema = z
   .object({
-    candidate_id: z.string().uuid('candidate_id must be a valid UUID'),
-    session_id: z.string().uuid('session_id must be a valid UUID'),
+    candidate_id: zod3Uuid('candidate_id must be a valid UUID'),
+    session_id: zod3Uuid('session_id must be a valid UUID'),
   })
   .strict();
 

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { zod3Int } from '../lib/zod-compat.js';
 import { uuidSchema } from './common.js';
 
 /**
@@ -24,8 +25,19 @@ export const appealGrantCreateSchema = z
     candidate_id: uuidSchema,
     session_id: uuidSchema,
     expires_in_hours: z
-      .number({ invalid_type_error: 'expires_in_hours is required' })
-      .int('expires_in_hours must be an integer')
+      .number({
+        // zod 3 `invalid_type_error`: only a PRESENT non-number. A missing key
+        // keeps the default "Required", and ±Infinity (a number zod 3
+        // accepted) keeps "Number must be finite".
+        error: (issue) => {
+          if (issue.code !== 'invalid_type' || issue.expected !== 'number') return undefined;
+          const input = issue.input;
+          if (input === undefined) return undefined;
+          if (typeof input === 'number' && !Number.isNaN(input)) return undefined;
+          return 'expires_in_hours is required';
+        },
+      })
+      .check(zod3Int('expires_in_hours must be an integer'))
       .min(1, 'expires_in_hours must be 1..72')
       .max(72, 'expires_in_hours must be 1..72'),
   })

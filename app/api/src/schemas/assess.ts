@@ -1,10 +1,11 @@
 import { z } from 'zod';
+import { zod3Uuid } from '../lib/zod-compat.js';
 
 // ── POST /api/assess/:sessionId ───────────────────────────────────
 
 export const assessSessionIdParamSchema = z
   .object({
-    sessionId: z.string().uuid('sessionId must be a valid UUID'),
+    sessionId: zod3Uuid('sessionId must be a valid UUID'),
   })
   .strict();
 
@@ -17,6 +18,6 @@ export const assessSessionIdParamSchema = z
 // rejects any stray keys.
 export const rescoreBodySchema = z
   .object({
-    rescore_request_id: z.string().uuid('rescore_request_id must be a valid UUID'),
+    rescore_request_id: zod3Uuid('rescore_request_id must be a valid UUID'),
   })
   .strict();

@@ -1,11 +1,12 @@
 import { z } from 'zod';
+import { zod3Uuid } from '../lib/zod-compat.js';
 import { idParamSchema } from './common.js';
 
 export const screeningSessionIdParamSchema = idParamSchema;
 
 export const startScreeningSchema = z
   .object({
-    candidate_id: z.string().uuid('candidate_id must be a valid UUID'),
+    candidate_id: zod3Uuid('candidate_id must be a valid UUID'),
   })
   .strict();
 

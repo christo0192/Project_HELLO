@@ -10,6 +10,7 @@
  */
 
 import { z } from 'zod';
+import { zod3Datetime, zod3Ip, zod3Uuid } from '../lib/zod-compat.js';
 
 // ── Consent type enum ───────────────────────────────────────────────
 
@@ -35,7 +36,7 @@ export type ConsentStatus = (typeof CONSENT_STATUSES)[number];
 
 export const consentSubmitSchema = z
   .object({
-    candidate_id: z.string().uuid('candidate_id must be a valid UUID'),
+    candidate_id: zod3Uuid('candidate_id must be a valid UUID'),
     version: z.string().min(1, 'version is required').default('1.0'),
     consents: z
       .array(z.enum(CONSENT_TYPES))
@@ -43,15 +44,15 @@ export const consentSubmitSchema = z
     status: z.enum(CONSENT_STATUSES).default('granted'),
     proof: z
       .object({
-        ip_address: z.string().ip().optional(),
+        ip_address: zod3Ip().optional(),
         user_agent: z.string().max(512).optional(),
-        captured_at: z.string().datetime().optional(),
+        captured_at: zod3Datetime().optional(),
         notice_version: z.string().optional(),
         note: z.string().max(2000).optional(),
       })
       .optional()
       .default({}),
-    expires_at: z.string().datetime().optional(),
+    expires_at: zod3Datetime().optional(),
   })
   .strict();
 
@@ -97,7 +98,7 @@ export interface ConsentStatusResponse {
 
 export const consentCheckSchema = z
   .object({
-    candidate_id: z.string().uuid('candidate_id must be a valid UUID'),
+    candidate_id: zod3Uuid('candidate_id must be a valid UUID'),
     required: z
       .array(z.enum(CONSENT_TYPES))
       .min(1)
@@ -130,7 +131,7 @@ export interface ConsentTemplateResponse {
 
 export const consentWithdrawSchema = z
   .object({
-    candidate_id: z.string().uuid('candidate_id must be a valid UUID'),
+    candidate_id: zod3Uuid('candidate_id must be a valid UUID'),
     consent_types: z.array(z.enum(CONSENT_TYPES)).optional(),
     reason: z.string().max(2000).optional(),
   })

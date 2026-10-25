@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { zod3Int } from '../lib/zod-compat.js';
 import { uuidSchema } from './common.js';
 
 /** Path param schema for PATCH /api/admin/members/:userId */
@@ -16,8 +17,8 @@ export const adminQuotaIdParamSchema = z.object({ id: uuidSchema }).strict();
  */
 export const adminAuditListQuerySchema = z
   .object({
-    limit: z.coerce.number().int().min(1).max(100).optional().default(100),
-    offset: z.coerce.number().int().min(0).max(10_000).optional().default(0),
+    limit: z.coerce.number().check(zod3Int()).min(1).max(100).optional().default(100),
+    offset: z.coerce.number().check(zod3Int()).min(0).max(10_000).optional().default(0),
   })
   .strict();
 
@@ -39,8 +40,8 @@ export const ADMIN_SESSION_STATUSES = [
 export const adminSessionListQuerySchema = z
   .object({
     status: z.enum(ADMIN_SESSION_STATUSES).optional(),
-    limit: z.coerce.number().int().min(1).max(100).optional().default(100),
-    offset: z.coerce.number().int().min(0).max(10_000).optional().default(0),
+    limit: z.coerce.number().check(zod3Int()).min(1).max(100).optional().default(100),
+    offset: z.coerce.number().check(zod3Int()).min(0).max(10_000).optional().default(0),
   })
   .strict();
 
@@ -49,8 +50,8 @@ export type AdminSessionListQueryInput = z.infer<typeof adminSessionListQuerySch
 /** GET /api/admin/quotas — bounded pagination. */
 export const adminQuotaListQuerySchema = z
   .object({
-    limit: z.coerce.number().int().min(1).max(100).optional().default(100),
-    offset: z.coerce.number().int().min(0).max(10_000).optional().default(0),
+    limit: z.coerce.number().check(zod3Int()).min(1).max(100).optional().default(100),
+    offset: z.coerce.number().check(zod3Int()).min(0).max(10_000).optional().default(0),
   })
   .strict();
 
@@ -66,11 +67,11 @@ export const adminQuotaUpsertSchema = z
     scope: z.enum(['global', 'recruiter']),
     scope_id: uuidSchema.nullable().optional(),
     mode: z.enum(['simulation', 'live']).optional().default('simulation'),
-    max_sessions: z.number().int().positive().max(1_000_000).nullable().optional(),
-    max_cost_units: z.number().int().positive().max(1_000_000_000).nullable().optional(),
-    cost_units_per_session: z.number().int().positive().max(1_000_000).nullable().optional(),
-    warning_percentage: z.number().int().min(1).max(100).nullable().optional(),
-    period_days: z.number().int().min(1).max(365).optional().default(1),
+    max_sessions: z.number().check(zod3Int()).positive().max(1_000_000).nullable().optional(),
+    max_cost_units: z.number().check(zod3Int()).positive().max(1_000_000_000).nullable().optional(),
+    cost_units_per_session: z.number().check(zod3Int()).positive().max(1_000_000).nullable().optional(),
+    warning_percentage: z.number().check(zod3Int()).min(1).max(100).nullable().optional(),
+    period_days: z.number().check(zod3Int()).min(1).max(365).optional().default(1),
     enabled: z.boolean().optional().default(false),
   })
   .strict()
