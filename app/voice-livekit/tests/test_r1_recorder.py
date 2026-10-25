@@ -665,9 +665,13 @@ class TestRecorderIoOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         # by up to 2 LSB and decode a few 1e-3 apart, at times past 0.01.  Opus itself is
         # deterministic.  With the resampler swapped for an exact one in both runs the decoded
         # PCM must be bit-identical: the tee adds no sample, drops none and changes none.
+        built: list[tuple[int, int, int]] = []
+
         class ExactResampler:
-            def __init__(self, input_rate: int, output_rate: int, num_channels: int, **_kw: object) -> None:
-                assert output_rate % input_rate == 0, (input_rate, output_rate)
+            def __init__(self, input_rate: int, output_rate: int, *, num_channels: int = 1, **_kw: object) -> None:
+                built.append((input_rate, output_rate, num_channels))
+                if output_rate % input_rate:
+                    raise ValueError(f"no exact resampling from {input_rate} to {output_rate}")
                 self._k, self._rate, self._channels = output_rate // input_rate, output_rate, num_channels
 
             def push(self, f: rtc.AudioFrame) -> list[rtc.AudioFrame]:
@@ -679,9 +683,15 @@ class TestRecorderIoOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
             def flush(self) -> list[rtc.AudioFrame]:
                 return []
 
+        # ``sdk_recorder_io.rtc`` IS the shared ``livekit.rtc`` module, so this swaps the class for
+        # every caller in the process; the encode threads build and finish inside the block
+        # (``aclose`` waits for them), so nothing outlives it.
         with mock.patch.object(sdk_recorder_io.rtc, "AudioResampler", ExactResampler):
             await drive_recorder_io(RecorderIO, self.dir / "stock.ogg")
             await drive_recorder_io(r1_recorder.recorder_io_class(), self.dir / "tee.ogg")
+        # One input and one output resampler per run.  Fewer means the SDK stopped reading
+        # ``rtc.AudioResampler`` and the dithering one is back: fail here, not as a flake.
+        self.assertEqual(len(built), 4, built)
         stock, tee = decode_ogg(self.dir / "stock.ogg"), decode_ogg(self.dir / "tee.ogg")
         self.assertGreater(stock.shape[1], RATE)  # not vacuous: the agent line was written
         self.assertEqual(stock.shape, tee.shape)  # no sample added or lost
