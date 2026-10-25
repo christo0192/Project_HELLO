@@ -656,26 +656,36 @@ class TestRecorderIoOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(b"".join(bytes(f.data) for f in seen_out), bytes_out)
 
     async def test_the_ogg_the_tee_recorder_writes_is_the_stock_one(self) -> None:
+        from livekit import rtc
+        from livekit.agents.voice.recorder_io import recorder_io as sdk_recorder_io
         from livekit.agents.voice.recorder_io.recorder_io import RecorderIO
 
-        await drive_recorder_io(RecorderIO, self.dir / "stock.ogg")
-        await drive_recorder_io(r1_recorder.recorder_io_class(), self.dir / "tee.ogg")
+        # The SDK's rtc.AudioResampler dithers its int16 output with fresh randomness per
+        # instance (zeros in, non-zero out), so two STOCK runs hand the encoder chunks that differ
+        # by up to 2 LSB and decode a few 1e-3 apart, at times past 0.01.  Opus itself is
+        # deterministic.  With the resampler swapped for an exact one in both runs the decoded
+        # PCM must be bit-identical: the tee adds no sample, drops none and changes none.
+        class ExactResampler:
+            def __init__(self, input_rate: int, output_rate: int, num_channels: int, **_kw: object) -> None:
+                assert output_rate % input_rate == 0, (input_rate, output_rate)
+                self._k, self._rate, self._channels = output_rate // input_rate, output_rate, num_channels
+
+            def push(self, f: rtc.AudioFrame) -> list[rtc.AudioFrame]:
+                pcm = np.frombuffer(bytes(f.data), dtype="<i2").reshape(-1, self._channels)
+                out = np.repeat(pcm, self._k, axis=0).astype("<i2")
+                return [rtc.AudioFrame(data=out.tobytes(), sample_rate=self._rate,
+                                       num_channels=self._channels, samples_per_channel=len(out))]
+
+            def flush(self) -> list[rtc.AudioFrame]:
+                return []
+
+        with mock.patch.object(sdk_recorder_io.rtc, "AudioResampler", ExactResampler):
+            await drive_recorder_io(RecorderIO, self.dir / "stock.ogg")
+            await drive_recorder_io(r1_recorder.recorder_io_class(), self.dir / "tee.ogg")
         stock, tee = decode_ogg(self.dir / "stock.ogg"), decode_ogg(self.dir / "tee.ogg")
         self.assertGreater(stock.shape[1], RATE)  # not vacuous: the agent line was written
         self.assertEqual(stock.shape, tee.shape)  # no sample added or lost
-        # Two STOCK runs do not write the same OGG: the SDK's rtc.AudioResampler dithers its int16
-        # output with a per-thread seed (zeros in, non-zero out), so the encoder gets the same
-        # chunks give or take 2 LSB, and Opus turns that into a few 1e-3 of difference, up to
-        # ~0.0127 in the agent channel's first 0.4 ms (the codec onset).  The exact claim is the
-        # chunk test above; here: the same stereo picture, as a per-channel SNR.  Measured over
-        # 320 runs, idle and under load, stock vs stock and stock vs tee alike: 45.9 dB worst,
-        # ~51 dB median.  A real fault sits far below: one sample of shift is 28 dB (left) and
-        # 20 dB (right), a 20 ms dropout 17-19 dB, 10 ms of extra padding about 20 dB.
-        for channel in (0, 1):
-            noise = float(np.sum((stock[channel] - tee[channel]) ** 2))
-            snr_db = 10 * np.log10(float(np.sum(stock[channel] ** 2)) / max(noise, 1e-20))
-            self.assertGreater(snr_db, 35.0, f"channel {channel}")
-        self.assertLess(float(np.abs(stock - tee).max()), 0.05)  # and no local click (4x the onset)
+        self.assertTrue(np.array_equal(stock, tee), f"max diff {float(np.abs(stock - tee).max())}")
         left, right = tee[0], tee[1]
         self.assertGreater(float(np.abs(left).max()), 0.05)   # candidate on the left
         self.assertGreater(float(np.abs(right).max()), 0.05)  # agent on the right
