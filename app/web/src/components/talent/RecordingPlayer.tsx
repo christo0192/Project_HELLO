@@ -14,7 +14,7 @@
  *   that column empty.
  */
 
-import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef } from 'react';
+import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useRef, useState, forwardRef } from 'react';
 import { api, ApiError } from '../../api';
 import { CandidateButton } from '../design/candidate';
 import { cx } from '../design/cx';
@@ -80,7 +80,12 @@ export interface RecordingPlayerProps {
 
 export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayerProps>(
   function RecordingPlayer({ sessionId, attemptId, label, onTimeUpdate, onPlayState, onCanPlay, className }, ref) {
-    const [url, setUrl] = useState<string | null>(null);
+    // The recording this player points at. A minted URL belongs to exactly
+    // one source, so a URL minted for another one is never shown or played,
+    // not even in the commit that re-points the player.
+    const source = attemptId ? `attempt:${attemptId}` : `session:${sessionId}`;
+    const [minted, setMinted] = useState<{ source: string; url: string } | null>(null);
+    const url = minted && minted.source === source ? minted.url : null;
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
@@ -93,6 +98,9 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
     // is still being minted / the <audio> is not yet ready. Applied once the
     // element mounts and reaches loadedmetadata. Latest write wins.
     const pendingSeekRef = useRef<number | null>(null);
+    // Bumped by every playFrom(), so a refresh never restores its saved
+    // position over a seek the user asked for while it was re-minting.
+    const seekGenRef = useRef(0);
 
     useEffect(() => {
       mountedRef.current = true;
@@ -105,17 +113,26 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       [attemptId, sessionId],
     );
 
-    // Invalidate on session (or leg) change
-    useEffect(() => {
+    // Invalidate on a real session (or leg) change, never on mount: there is
+    // nothing to invalidate yet. It is a LAYOUT effect so it runs inside the
+    // commit, before anything can call the handle. As a passive effect it ran
+    // after the commit, and React may yield to the browser in between (a
+    // render from a data load, on a slow device): a turn click in that gap
+    // started a mint, then this bumped reqIdRef and cleared the queued seek,
+    // so the minted URL was dropped as stale and the click did nothing.
+    const sourceRef = useRef(source);
+    useLayoutEffect(() => {
+      if (sourceRef.current === source) return;
+      sourceRef.current = source;
       reqIdRef.current += 1;
       pendingLoadPromise.current = null;
       pendingLoadResolve.current = null;
       // Drop any queued seek so it can never apply to a different session.
       pendingSeekRef.current = null;
-      setUrl(null);
+      setMinted(null);
       setError(null);
       setLoading(false);
-    }, [sessionId, attemptId]);
+    }, [source]);
 
     const fetchUrl = useCallback((): Promise<void> => {
       // If already loaded with a URL, resolve immediately
@@ -136,7 +153,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       mintUrl()
         .then((res) => {
           if (!mountedRef.current || reqId !== reqIdRef.current) return;
-          setUrl(res.url);
+          setMinted({ source, url: res.url });
           setLoading(false);
           pendingLoadPromise.current = null;
           pendingLoadResolve.current?.();
@@ -152,13 +169,14 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
         });
 
       return promise;
-    }, [mintUrl, url, error]);
+    }, [mintUrl, source, url, error]);
 
     // Refresh: capture state, re-mint, restore on canplay
     const refreshUrl = useCallback(() => {
       const el = audioRef.current;
       const wasPlaying = el && !el.paused;
       const savedTime = el?.currentTime ?? 0;
+      const seekGen = seekGenRef.current;
 
       const reqId = ++reqIdRef.current;
       setLoading(true);
@@ -167,12 +185,14 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       mintUrl()
         .then((res) => {
           if (!mountedRef.current || reqId !== reqIdRef.current) return;
-          setUrl(res.url);
+          setMinted({ source, url: res.url });
           setLoading(false);
           // After state commits, restore position
           requestAnimationFrame(() => {
             const a = audioRef.current;
             if (!a || a.src !== res.url) return;
+            // A turn clicked during the re-mint wins over the saved position.
+            if (seekGenRef.current !== seekGen) return;
             const restore = () => {
               if (savedTime > 0.1) { a.currentTime = savedTime; }
               if (wasPlaying) a.play().catch(() => {});
@@ -186,7 +206,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
           setError(e.message || 'Failed to load recording');
           setLoading(false);
         });
-    }, [mintUrl]);
+    }, [mintUrl, source]);
 
     // Apply a queued playFrom() offset against the (now-mounted) <audio>.
     // With preload="none" the element may be at HAVE_NOTHING, so kick a
@@ -212,36 +232,14 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       }
     }, []);
 
-    // Once the signed URL is set (and the <audio> has committed to the DOM),
-    // apply any queued seek. Refresh re-mints set a fresh URL but leave
-    // pendingSeekRef null, so this is a no-op for the refresh path.
+    // Once the signed URL is set and the <audio> is on screen, apply any queued
+    // seek. `loading` is a dependency too: during a "Refresh link" re-mint the
+    // URL is kept but the loading row replaces the <audio>, so a click then
+    // finds no element; it is applied when the player is back, even when the
+    // refreshed URL is unchanged (the url alone would not re-run this).
     useEffect(() => {
-      if (url) applyPendingSeek();
-    }, [url, applyPendingSeek]);
-
-    // Media events
-    useEffect(() => {
-      const el = audioRef.current;
-      if (!el) return;
-      const onPlay = () => onPlayState?.(true);
-      const onPause = () => onPlayState?.(false);
-      const onEnded = () => onPlayState?.(false);
-      const onTimeUp = () => { onTimeUpdate?.(el.currentTime); };
-      const onCp = () => onCanPlay?.();
-
-      el.addEventListener('play', onPlay);
-      el.addEventListener('pause', onPause);
-      el.addEventListener('ended', onEnded);
-      el.addEventListener('timeupdate', onTimeUp);
-      el.addEventListener('canplay', onCp);
-      return () => {
-        el.removeEventListener('play', onPlay);
-        el.removeEventListener('pause', onPause);
-        el.removeEventListener('ended', onEnded);
-        el.removeEventListener('timeupdate', onTimeUp);
-        el.removeEventListener('canplay', onCp);
-      };
-    }, [onPlayState, onTimeUpdate, onCanPlay, url]);
+      if (url && !loading) applyPendingSeek();
+    }, [url, loading, applyPendingSeek]);
 
     // Imperative handle
     useImperativeHandle(ref, () => ({
@@ -260,6 +258,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       playFrom(offsetSec: number) {
         // Latest requested offset wins on rapid clicks.
         pendingSeekRef.current = offsetSec;
+        seekGenRef.current += 1;
         if (url != null && error == null) {
           // URL already minted and <audio> mounted — apply now. (The url
           // effect won't re-fire because url is unchanged.)
@@ -349,6 +348,14 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
           src={url!}
           className="h-9 w-full"
           aria-label={label ? `${label} recording player` : 'Session recording player'}
+          // Media events as props: React wires them when the element is created,
+          // so none is missed between the <audio> appearing and a passive effect
+          // subscribing (the old addEventListener effect ran after the commit).
+          onPlay={() => onPlayState?.(true)}
+          onPause={() => onPlayState?.(false)}
+          onEnded={() => onPlayState?.(false)}
+          onTimeUpdate={(e) => onTimeUpdate?.(e.currentTarget.currentTime)}
+          onCanPlay={() => onCanPlay?.()}
         >
           <a href={url!} target="_blank" rel="noreferrer">
             Download recording
