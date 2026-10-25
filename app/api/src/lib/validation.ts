@@ -1,6 +1,19 @@
 import type { NextFunction, Request, Response } from 'express';
-import { ZodError, type ZodSchema } from 'zod';
+import { ZodError, type ZodType } from 'zod';
 import { createLogger } from './logger.js';
+import { installZod3Messages, toZod3Issues } from './zod-compat.js';
+
+// zod 4 resolves default messages when an issue is raised; keep the zod 3
+// wording clients have always received (see lib/zod-compat.ts).
+installZod3Messages();
+
+/**
+ * `reportInput` lets the zod 3 code mapping see the rejected value (an enum
+ * given a non-string was `invalid_type` in zod 3). The input itself is never
+ * copied into a response or a log line: `formatZodError` emits only field,
+ * code and message.
+ */
+const PARSE_OPTIONS = { reportInput: true } as const;
 
 const validationLogger = createLogger('validation');
 
@@ -19,8 +32,8 @@ export interface ApiErrorBody {
 }
 
 function formatZodError(err: ZodError): ValidationErrorDetail[] {
-  return err.issues.map((issue) => ({
-    field: issue.path.length ? issue.path.join('.') : '(root)',
+  return toZod3Issues(err).map((issue) => ({
+    field: issue.path.length ? issue.path.map(String).join('.') : '(root)',
     code: issue.code,
     message: issue.message,
   }));
@@ -37,9 +50,9 @@ function sendError(
   return res.status(status).json(body);
 }
 
-export function validateBody<T>(schema: ZodSchema<T>) {
+export function validateBody<T>(schema: ZodType<T>) {
   return (req: Request, res: Response, next: NextFunction) => {
-    const result = schema.safeParse(req.body ?? {});
+    const result = schema.safeParse(req.body ?? {}, PARSE_OPTIONS);
     if (!result.success) {
       return sendError(
         res,
@@ -54,9 +67,9 @@ export function validateBody<T>(schema: ZodSchema<T>) {
   };
 }
 
-export function validateParams<T>(schema: ZodSchema<T>) {
+export function validateParams<T>(schema: ZodType<T>) {
   return (req: Request, res: Response, next: NextFunction) => {
-    const result = schema.safeParse(req.params);
+    const result = schema.safeParse(req.params, PARSE_OPTIONS);
     if (!result.success) {
       return sendError(
         res,
@@ -71,9 +84,9 @@ export function validateParams<T>(schema: ZodSchema<T>) {
   };
 }
 
-export function validateQuery<T>(schema: ZodSchema<T>) {
+export function validateQuery<T>(schema: ZodType<T>) {
   return (req: Request, res: Response, next: NextFunction) => {
-    const result = schema.safeParse(req.query);
+    const result = schema.safeParse(req.query, PARSE_OPTIONS);
     if (!result.success) {
       return sendError(
         res,
@@ -88,7 +101,7 @@ export function validateQuery<T>(schema: ZodSchema<T>) {
   };
 }
 
-export function validateBodyFields<T>(schema: ZodSchema<T>) {
+export function validateBodyFields<T>(schema: ZodType<T>) {
   return validateBody(schema);
 }
 

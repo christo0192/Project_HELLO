@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { zod3Int } from '../lib/zod-compat.js';
 import { uuidSchema } from './common.js';
 
 /** A calendar day, YYYY-MM-DD. */
@@ -45,7 +46,7 @@ export const funnelFailuresQuerySchema = z
     from: dayString.optional(),
     to: dayString.optional(),
     stage: z.enum(FUNNEL_FAILURE_STAGES).optional(),
-    limit: z.coerce.number().int().min(1).max(200).optional().default(100),
+    limit: z.coerce.number().check(zod3Int()).min(1).max(200).optional().default(100),
   })
   .strict();
 
@@ -59,8 +60,8 @@ export const funnelCandidatesQuerySchema = z
     // drop_reason can be a dynamic outcome_class (no_answer/busy/...), so bound
     // it as a short stable code rather than a closed enum.
     drop_reason: z.string().regex(/^[a-z0-9_.:-]{1,64}$/).optional(),
-    limit: z.coerce.number().int().min(1).max(100).optional().default(50),
-    offset: z.coerce.number().int().min(0).max(10_000).optional().default(0),
+    limit: z.coerce.number().check(zod3Int()).min(1).max(100).optional().default(50),
+    offset: z.coerce.number().check(zod3Int()).min(0).max(10_000).optional().default(0),
   })
   .strict();
 
@@ -69,7 +70,7 @@ export type FunnelCandidatesQueryInput = z.infer<typeof funnelCandidatesQuerySch
 /** POST /api/admin/funnel/refresh — bounded trailing window (days). */
 export const funnelRefreshSchema = z
   .object({
-    window_days: z.number().int().min(1).max(3650).optional().default(30),
+    window_days: z.number().check(zod3Int()).min(1).max(3650).optional().default(30),
   })
   .strict();
 

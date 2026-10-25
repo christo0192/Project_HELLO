@@ -68,7 +68,10 @@ export const createRoleSchema = z
     agent_name: z
       .string()
       .trim()
-      .max(80)
+      // `abort`: zod 3 skipped the template superRefine below when a
+      // transformed field had already failed; zod 4 would run it. Aborting
+      // here keeps the zod 3 error list.
+      .max(80, { abort: true })
       .transform((v) => (v === '' ? null : v))
       .nullable()
       .optional(),
@@ -81,7 +84,7 @@ export const createRoleSchema = z
   .superRefine((value, ctx) => {
     if (!value.screening_template) return;
     for (const [index, issues] of validatePhoneQuestionTemplate(value.screening_template)) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['screening_template', index, 'question'], message: phoneQuestionIssueMessage(index, issues) });
+      ctx.addIssue({ code: 'custom', path: ['screening_template', index, 'question'], message: phoneQuestionIssueMessage(index, issues) });
     }
   });
 
@@ -98,7 +101,10 @@ export const updateRoleSchema = z
     agent_name: z
       .string()
       .trim()
-      .max(80)
+      // `abort`: zod 3 skipped the template superRefine below when a
+      // transformed field had already failed; zod 4 would run it. Aborting
+      // here keeps the zod 3 error list.
+      .max(80, { abort: true })
       .transform((v) => (v === '' ? null : v))
       .nullable()
       .optional(),
@@ -115,7 +121,7 @@ export const updateRoleSchema = z
   .superRefine((value, ctx) => {
     if (!value.screening_template) return;
     for (const [index, issues] of validatePhoneQuestionTemplate(value.screening_template)) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['screening_template', index, 'question'], message: phoneQuestionIssueMessage(index, issues) });
+      ctx.addIssue({ code: 'custom', path: ['screening_template', index, 'question'], message: phoneQuestionIssueMessage(index, issues) });
     }
   });
 

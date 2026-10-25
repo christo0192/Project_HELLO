@@ -48,6 +48,7 @@ import { timingSafeEqual } from 'node:crypto';
 import { Router } from 'express';
 import { createLogger } from '../lib/logger.js';
 import { z } from 'zod';
+import { zod3Int } from '../lib/zod-compat.js';
 import { runAssessment } from '../services/assessment.js';
 import { transitionSession } from '../lib/session-lifecycle.js';
 import {
@@ -207,7 +208,7 @@ const workerEventSchema = z
   .object({
     attempt_id: z.string().regex(UUID_RE),
     event_type: z.enum(WORKER_PHONE_EVENTS),
-    epoch: z.number().int().min(0).max(2_147_483_647).nullable().optional(),
+    epoch: z.number().check(zod3Int()).min(0).max(2_147_483_647).nullable().optional(),
     // The SESSION HINT (recording ordering fix, 2026-08-26). The recording
     // egress starts when `disclosure.delivered` is applied, but the session is
     // bound to the attempt row only at /assessment/start — later — so the
@@ -253,7 +254,7 @@ const workerScheduleSchema = z
     starts_at: z.string().regex(UTC_ISO_RE),
     duration_seconds: z
       .number()
-      .int()
+      .check(zod3Int())
       .min(PHONE_APPOINTMENT_MIN_SECONDS)
       .max(PHONE_APPOINTMENT_MAX_SECONDS),
   })
@@ -274,7 +275,7 @@ const boundaryTurnSchema = z
     // Optional epoch-ms speech-start anchor. Legacy workers may omit it;
     // current workers pass the SDK's ChatMessage.metrics anchor through the
     // durable boundary so the dashboard can align it with the egress.
-    turn_started_at_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
+    turn_started_at_ms: z.number().check(zod3Int()).positive().lt(4_102_444_800_000).nullable().optional(),
   })
   .strict();
 
@@ -298,7 +299,7 @@ const assessmentProbeSchema = z
   .object({
     session_id: z.string().regex(UUID_RE),
     question_key: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,100}$/),
-    expected_index: z.number().int().min(0).max(99),
+    expected_index: z.number().check(zod3Int()).min(0).max(99),
     source_event_id: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,200}$/),
   })
   .strict();
@@ -307,7 +308,7 @@ const consentStartSchema = z
   .object({
     attempt_id: z.string().regex(UUID_RE),
     session_id: z.string().regex(UUID_RE),
-    epoch: z.number().int().min(0).max(1_000_000),
+    epoch: z.number().check(zod3Int()).min(0).max(1_000_000),
   })
   .strict();
 
@@ -336,7 +337,7 @@ const attemptHeartbeatSchema = z
   .object({
     attempt_id: z.string().regex(UUID_RE),
     session_id: z.string().regex(UUID_RE),
-    epoch: z.number().int().min(0).max(1_000_000),
+    epoch: z.number().check(zod3Int()).min(0).max(1_000_000),
   })
   .strict();
 
@@ -344,7 +345,7 @@ const assessmentTurnSchema = z
   .object({
     session_id: z.string().regex(UUID_RE),
     question_key: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,100}$/),
-    expected_index: z.number().int().min(0).max(99),
+    expected_index: z.number().check(zod3Int()).min(0).max(99),
     source_event_id: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,200}$/),
     turns: z.array(boundaryTurnSchema).min(2).max(12),
     covered_question_keys: z.array(
@@ -376,15 +377,15 @@ const observabilityLatencyBucketSchema = z
     median: z.number().finite().optional(),
     p95: z.number().finite().optional(),
     max: z.number().finite().optional(),
-    count: z.number().int().nonnegative().optional(),
+    count: z.number().check(zod3Int()).nonnegative().optional(),
   })
   .partial()
   .passthrough();
 
 const phoneObservabilitySchema = z
   .object({
-    watchdog_fired_count: z.number().int().nonnegative().optional(),
-    deterministic_fallback_count: z.number().int().nonnegative().optional(),
+    watchdog_fired_count: z.number().check(zod3Int()).nonnegative().optional(),
+    deterministic_fallback_count: z.number().check(zod3Int()).nonnegative().optional(),
     headline_latency_ms: observabilityLatencyBucketSchema.optional(),
     provider_first_signal_ms: z
       .object({
@@ -458,7 +459,7 @@ const itemTurnSchema = z
     speaker: z.enum(['bot', 'candidate']),
     text: z.string().trim().min(1).max(8_000),
     source_item_id: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,200}$/),
-    turn_started_at_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
+    turn_started_at_ms: z.number().check(zod3Int()).positive().lt(4_102_444_800_000).nullable().optional(),
     // 0105. The worker sends `true` for the disclosure/identity/consent
     // exchange so it is persisted as the gate transcript, as it happens.
     is_gate: z.boolean().optional(),
@@ -502,15 +503,15 @@ const recordingCompleteSchema = z
     attempt_id: z.string().regex(UUID_RE),
     session_id: z.string().regex(UUID_RE),
     sha256: z.string().regex(/^[a-f0-9]{64}$/),
-    size_bytes: z.number().int().positive().max(52_428_800),
-    duration_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
+    size_bytes: z.number().check(zod3Int()).positive().max(52_428_800),
+    duration_ms: z.number().check(zod3Int()).positive().lt(4_102_444_800_000).nullable().optional(),
     // M013 S02 (T04): the leg timing the T02 worker reports. All optional, so a
     // legacy body is unchanged. Display-only DATA stamped on the attempt
     // (`stampAttemptLegTiming`): never a state transition, never a ledger
     // event. A value outside the sanity window is DROPPED there with a log
     // line, not rejected here, so the recording is still kept.
-    recording_started_at_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
-    leg_ended_at_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
+    recording_started_at_ms: z.number().check(zod3Int()).positive().lt(4_102_444_800_000).nullable().optional(),
+    leg_ended_at_ms: z.number().check(zod3Int()).positive().lt(4_102_444_800_000).nullable().optional(),
     // Which worker mark leg_ended_at_ms is; only `sip_left` is stamped as the
     // OBSERVED end (adversarial review, S02).
     leg_end_source: z.enum(WORKER_LEG_END_SOURCES).nullable().optional(),

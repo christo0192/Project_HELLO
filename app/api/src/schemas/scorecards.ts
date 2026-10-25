@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { zod3Int } from '../lib/zod-compat.js';
 import { uuidSchema } from './common.js';
 import {
   SCORECARD_MAX_INSTRUCTION_LENGTH,
@@ -96,8 +97,8 @@ const putMetricSchema = z
   .object({
     libraryMetricId: uuidSchema,
     instruction: z.string().trim().min(1).max(SCORECARD_MAX_INSTRUCTION_LENGTH).optional(),
-    weightBps: z.number().int().min(1).max(SCORECARD_WEIGHT_TOTAL_BPS),
-    displayOrder: z.number().int().min(0).max(SCORECARD_MAX_METRICS - 1).optional(),
+    weightBps: z.number().check(zod3Int()).min(1).max(SCORECARD_WEIGHT_TOTAL_BPS),
+    displayOrder: z.number().check(zod3Int()).min(0).max(SCORECARD_MAX_METRICS - 1).optional(),
   })
   .strict();
 
@@ -127,8 +128,8 @@ const previewMetricSchema = z
     name: z.string().trim().min(1).max(SCORECARD_MAX_NAME_LENGTH),
     instruction: z.string().trim().min(1).max(SCORECARD_MAX_INSTRUCTION_LENGTH),
     rubric: rubricSchema,
-    weightBps: z.number().int().min(1).max(SCORECARD_WEIGHT_TOTAL_BPS),
-    displayOrder: z.number().int().min(0),
+    weightBps: z.number().check(zod3Int()).min(1).max(SCORECARD_WEIGHT_TOTAL_BPS),
+    displayOrder: z.number().check(zod3Int()).min(0),
   })
   .strict();
 
@@ -136,7 +137,7 @@ export const redistributeSchema = z
   .object({
     metrics: z.array(previewMetricSchema).min(1).max(SCORECARD_MAX_METRICS),
     editedMetricId: uuidSchema,
-    newWeightBps: z.number().int().min(1).max(SCORECARD_WEIGHT_TOTAL_BPS),
+    newWeightBps: z.number().check(zod3Int()).min(1).max(SCORECARD_WEIGHT_TOTAL_BPS),
   })
   .strict();
 

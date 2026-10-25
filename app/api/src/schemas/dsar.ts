@@ -3,18 +3,19 @@
  */
 
 import { z } from 'zod';
+import { zod3Datetime, zod3Uuid } from '../lib/zod-compat.js';
 
 // ── Common ───────────────────────────────────────────────────────────
 
 export const dsarIdParamSchema = z
   .object({
-    dsarId: z.string().uuid('dsarId must be a valid UUID'),
+    dsarId: zod3Uuid('dsarId must be a valid UUID'),
   })
   .strict();
 
 export const candidateIdParamSchema = z
   .object({
-    candidateId: z.string().uuid('candidateId must be a valid UUID'),
+    candidateId: zod3Uuid('candidateId must be a valid UUID'),
   })
   .strict();
 
@@ -22,13 +23,13 @@ export const candidateIdParamSchema = z
 
 export const createDSARBodySchema = z
   .object({
-    candidate_id: z.string().uuid('candidate_id must be a valid UUID'),
+    candidate_id: zod3Uuid('candidate_id must be a valid UUID'),
     request_type: z.enum(['export', 'delete', 'correct', 'restrict'], {
-      errorMap: () => ({ message: 'request_type must be one of: export, delete, correct, restrict' }),
+      error: 'request_type must be one of: export, delete, correct, restrict',
     }),
     notes: z.string().max(2000, 'notes must not exceed 2000 characters').optional(),
     metadata: z
-      .record(z.unknown())
+      .record(z.string(), z.unknown())
       .refine(
         (val) => JSON.stringify(val).length <= 4096,
         'metadata must not exceed 4KB when serialized',
@@ -69,7 +70,7 @@ export type ListCandidateDSARsQueryInput = z.infer<typeof listCandidateDSARsQuer
 export const fulfillDSARBodySchema = z
   .object({
     status: z.enum(['fulfilled', 'rejected', 'cancelled'], {
-      errorMap: () => ({ message: 'status must be one of: fulfilled, rejected, cancelled' }),
+      error: 'status must be one of: fulfilled, rejected, cancelled',
     }),
     rejection_reason: z
       .string()
@@ -101,7 +102,8 @@ export const correctDSARBodySchema = z
               .string()
               .min(1, 'field must not be empty')
               .max(128, 'field must not exceed 128 characters'),
-            value: z.unknown(),
+            // zod 3 treated an `unknown` key as optional; zod 4 requires it.
+            value: z.unknown().optional(),
           })
           .strict(),
       )
@@ -118,19 +120,19 @@ export const createLegalHoldBodySchema = z
   .object({
     entity_type: z.enum(
       ['candidate', 'session', 'transcript', 'recording', 'assessment', 'resume'],
-      { errorMap: () => ({ message: 'entity_type must be a valid governance entity type' }) },
+      { error: 'entity_type must be a valid governance entity type' },
     ),
-    entity_id: z.string().uuid('entity_id must be a valid UUID'),
+    entity_id: zod3Uuid('entity_id must be a valid UUID'),
     hold_reason: z
       .string()
       .min(1, 'hold_reason is required')
       .max(2000, 'hold_reason must not exceed 2000 characters'),
     hold_source: z.enum(
       ['court_order', 'internal_investigation', 'litigation_hold', 'regulatory', 'other'],
-      { errorMap: () => ({ message: 'hold_source must be a valid hold source' }) },
+      { error: 'hold_source must be a valid hold source' },
     ),
-    expires_at: z.string().datetime().optional(),
-    metadata: z.record(z.unknown()).optional(),
+    expires_at: zod3Datetime().optional(),
+    metadata: z.record(z.string(), z.unknown()).optional(),
   })
   .strict();
 

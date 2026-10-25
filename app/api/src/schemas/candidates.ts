@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { zod3Int, zod3Uuid } from '../lib/zod-compat.js';
 import { idParamSchema, roleIdQuerySchema, uuidSchema } from './common.js';
 import { appointmentVersionSchema, utcInstantSchema } from './phone-api.js';
 
@@ -10,7 +11,7 @@ export const listCandidatesQuerySchema = roleIdQuerySchema;
 
 export const uploadResumeBodySchema = z
   .object({
-    role_id: z.string().uuid('role_id must be a valid UUID').optional(),
+    role_id: zod3Uuid('role_id must be a valid UUID').optional(),
   })
   .strict();
 
@@ -63,7 +64,7 @@ export const candidateIdParamSchema = idParamSchema;
 
 /** Bounded keyset page for candidate phone-attempt evidence. */
 export const candidatePhoneAttemptsQuerySchema = z.object({
-  limit: z.coerce.number().int().min(1).max(50).default(25),
+  limit: z.coerce.number().check(zod3Int()).min(1).max(50).default(25),
   before: z.string().max(256).optional(),
   /** M013 S02: only the legs of this session (`session_id` or `recording_session_id`), oldest first. */
   session_id: uuidSchema.optional(),
