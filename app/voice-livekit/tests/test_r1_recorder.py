@@ -662,10 +662,20 @@ class TestRecorderIoOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         await drive_recorder_io(r1_recorder.recorder_io_class(), self.dir / "tee.ogg")
         stock, tee = decode_ogg(self.dir / "stock.ogg"), decode_ogg(self.dir / "tee.ogg")
         self.assertGreater(stock.shape[1], RATE)  # not vacuous: the agent line was written
-        self.assertEqual(stock.shape, tee.shape)
-        # Opus is not bit-reproducible run to run (two STOCK runs differ by about -54 dB), so the
-        # exact claim is the chunk test above; here: the same stereo picture within codec noise.
-        self.assertLess(float(np.abs(stock - tee).max()), 0.01)
+        self.assertEqual(stock.shape, tee.shape)  # no sample added or lost
+        # Two STOCK runs do not write the same OGG: the SDK's rtc.AudioResampler dithers its int16
+        # output with a per-thread seed (zeros in, non-zero out), so the encoder gets the same
+        # chunks give or take 2 LSB, and Opus turns that into a few 1e-3 of difference, up to
+        # ~0.0127 in the agent channel's first 0.4 ms (the codec onset).  The exact claim is the
+        # chunk test above; here: the same stereo picture, as a per-channel SNR.  Measured over
+        # 320 runs, idle and under load, stock vs stock and stock vs tee alike: 45.9 dB worst,
+        # ~51 dB median.  A real fault sits far below: one sample of shift is 28 dB (left) and
+        # 20 dB (right), a 20 ms dropout 17-19 dB, 10 ms of extra padding about 20 dB.
+        for channel in (0, 1):
+            noise = float(np.sum((stock[channel] - tee[channel]) ** 2))
+            snr_db = 10 * np.log10(float(np.sum(stock[channel] ** 2)) / max(noise, 1e-20))
+            self.assertGreater(snr_db, 35.0, f"channel {channel}")
+        self.assertLess(float(np.abs(stock - tee).max()), 0.05)  # and no local click (4x the onset)
         left, right = tee[0], tee[1]
         self.assertGreater(float(np.abs(left).max()), 0.05)   # candidate on the left
         self.assertGreater(float(np.abs(right).max()), 0.05)  # agent on the right
