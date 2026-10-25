@@ -119,8 +119,14 @@ GAP_SLACK_SECONDS = 0.25
 # clock: the SDK's silence frame, once resampled, carries +-1 LSB of dither (measured), never more.
 SILENCE_LEVEL = 2
 MAX_AUDIO_PIECE_SECONDS = 30
-# 30 s of 48 kHz mono s16 may queue for a slow encoder; more means it is stuck.
-ENCODER_AUDIO_BACKLOG_BYTES = 30 * SAMPLE_RATE * 2
+# A message for the child (audio or control, never a picture) may wait this long for the pipe while
+# the encoder is slow; longer means it is stuck.  It is counted in TIME waited, not bytes queued: the
+# SDK writes nothing while the agent speaks, so one chunk carries a whole agent turn and the mixer
+# hands it over at once as pieces of up to ``MAX_AUDIO_PIECE_SECONDS``.  A byte cap of 30 s of audio
+# was exceeded by one such 30 s piece (plus its header) the instant the next piece was queued, so a
+# healthy child that had not yet read it was killed.  Audio arrives at the real-time rate, so 30 s
+# waited is the same 30 s (about 2.9 MB) of queued audio the byte cap allowed a slow encoder.
+ENCODER_BACKLOG_SECONDS = 30.0
 
 # Camera capture (roadmap section 8).  Numeric SDK values, pinned by ``test_r1_sdk_contract``:
 # ``rtc.TrackKind.KIND_VIDEO``, ``rtc.TrackSource.SOURCE_CAMERA``, ``rtc.ParticipantKind.STANDARD``,
@@ -639,12 +645,12 @@ class EncoderProcess:
         self._popen = popen
         self._clock = clock
         self._proc: Any = None
-        self._ordered: collections.deque[tuple[bytes, bool]] = collections.deque()
+        # (frame, barrier, queued at on ``clock``)
+        self._ordered: collections.deque[tuple[bytes, bool, float]] = collections.deque()
         self._pictures: collections.deque[tuple[int, int, int, int, bytes]] = collections.deque()
         self._wake = threading.Condition()
         self._writer_stop = False
-        self._queued = 0
-        self._lock = threading.Lock()
+        self._writing_since: float | None = None  # queue time of the ordered message being written
         self.video_dropped = 0  # pictures pushed out of the queue by newer ones
         self.video_sent = 0  # pictures written to the pipe
         self.ready = threading.Event()
@@ -725,12 +731,22 @@ class EncoderProcess:
     def _send(self, frame: bytes, *, barrier: bool = False) -> bool:
         if self._proc is None or self.exited.is_set() or self._killed:
             return False
-        with self._lock:
-            self._queued += len(frame)
         with self._wake:
-            self._ordered.append((frame, barrier))
+            self._ordered.append((frame, barrier, self._clock()))
             self._wake.notify()
         return True
+
+    def backlog_seconds(self) -> float:
+        """How long the oldest audio or control message not yet written to the pipe has waited.
+
+        On THIS process's clock; 0 when nothing waits.  Pictures never count: their queue drops
+        the oldest instead of growing.
+        """
+        with self._wake:
+            oldest = self._writing_since
+            if oldest is None and self._ordered:
+                oldest = self._ordered[0][2]
+        return 0.0 if oldest is None else max(0.0, self._clock() - oldest)
 
     def send_video(self, pts_us: int, width: int, height: int, rotation: int, picture: bytes) -> bool:
         """Queue one I420 picture (never blocks).  The oldest queued picture goes when it is full."""
@@ -748,9 +764,7 @@ class EncoderProcess:
         return self._send(_wire().pack_hello(video=video, preset=preset, t0_us=t0_us))
 
     def send_audio(self, pts_us: int, pcm: bytes) -> bool:
-        with self._lock:
-            backlog = self._queued
-        if backlog > ENCODER_AUDIO_BACKLOG_BYTES:
+        if self.backlog_seconds() > ENCODER_BACKLOG_SECONDS:
             self.overflowed = True  # a stuck child: the watchdog turns this into a crash
             return False
         return self._send(_wire().pack_audio(pts_us, pcm))
@@ -788,9 +802,10 @@ class EncoderProcess:
                 if self._writer_stop:
                     return None
                 if self._ordered:
-                    frame, barrier = self._ordered[0]
+                    frame, barrier, queued_at = self._ordered[0]
                     if not barrier or not self._pictures:
                         self._ordered.popleft()
+                        self._writing_since = queued_at  # still waiting until the write returns
                         return frame, True
                 if self._pictures:
                     pts_us, width, height, rotation, picture = self._pictures.popleft()
@@ -814,8 +829,8 @@ class EncoderProcess:
                     break
                 finally:
                     if ordered:
-                        with self._lock:
-                            self._queued -= len(frame)
+                        with self._wake:
+                            self._writing_since = None
                 if not ordered:
                     self.video_sent += 1
         finally:
