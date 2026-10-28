@@ -72,6 +72,17 @@ LINES: dict[str, str] = {
         "Advisor and I'm the learner, {lead_name}. She enquired about the Data Science "
         "course and you're calling her back. Please carry on as you would on a real call."
     ),
+    # Owner test 7f2a25e6: the candidate asked the learner to "disconnect the call".  Asked once,
+    # before R = 14:00, with R paused; saying "end the interview" ends the session as closing the
+    # window does.  Not an either/or question: a bare "yes" would not say which option was meant.
+    "L-ASIDE-END": (
+        "This is Christy, your interviewer. If you want to end the interview now, please say: end "
+        "the interview. Otherwise, just carry on with {lead_name}."
+    ),
+    "L-END-CLOSE": (
+        "All right, we'll end the interview here. Thank you for your time. You can close this "
+        "window now. Goodbye."
+    ),
     "L-MUTE": (
         "This is Christy. It looks like your microphone may be muted. Please unmute when "
         "you're ready."

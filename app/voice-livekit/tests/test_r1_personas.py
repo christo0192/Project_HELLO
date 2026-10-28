@@ -113,6 +113,10 @@ NEAR_MISSES = {
         "What makes you think the course is expensive?",
         "Layoffs are common in tech these days.",
         "What brings people to data science these days?",
+        # Owner test 7f2a25e6 turns 48 and 51: the advisor's OWN layoff is no probe of the learner.
+        "If I get laid off, will you help me to get a job?",
+        "Priya, I am saying that I am not focusing on your POB. I am saying if I get laid off, "
+        "will you help me get a job in your company?",
     ),
     "H2": (
         "We prepare engineers for interviews at top-tier tech companies.",
@@ -488,6 +492,59 @@ class ProbeMatrixTests(unittest.TestCase):
         # ... and a sentence of the same turn that is NOT about layoffs still counts for H2.
         both = detect_probes("What makes you get scared of layoffs? Does the search stress you out?")
         self.assertEqual(both, frozenset({"H1", "H2"}))
+
+    def test_a_layoff_about_the_advisors_own_job_is_no_probe(self):
+        """Owner test 7f2a25e6: the advisor asked for help if HE got laid off (turns 46, 48 and 51),
+        and the layoff word released the learner's H1 hint (47) and then her deep need (49).  A
+        first-person subject in the clause that holds the layoff word is the advisor's own job."""
+        from r1_personas import asks_about_learner
+
+        for text in (
+            # The transcript's own phrasings, verbatim.
+            "So I think I'm also going to get laid off in my company. So, can you give me your "
+            "contact number so that if I get no job and if I get laid off, I can actually contact "
+            "you and you can try and get me a job in your company?",
+            "If I get laid off, will you help me to get a job?",
+            "Priya, I am saying that I am not focusing on your POB. I am saying if I get laid off, "
+            "will you help me get a job in your company?",
+            # The other first-person forms.
+            "If we get laid off, will you hire us?",
+            "I'm going to get laid off, can you help?",
+            "Are there layoffs at my company, do you know?",
+            "What if my company has layoffs, would you hire me?",
+            "Is my job security something you can help with?",
+            # A worry word next to the advisor's own layoff is about that, not an H2 probe.
+            "If I get laid off I'm worried, will you help me?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(detect_probes(text), frozenset())
+                self.assertFalse(asks_about_learner(text))
+
+    def test_a_layoff_question_needs_no_you_to_be_a_probe(self):
+        """Only a first-person subject suppresses the layoff word: a question without "you", or one
+        whose own first-person words sit in another clause, is still the H1 probe."""
+        for text in (
+            "Is job security a concern?",
+            "are layoffs a worry at your end?",
+            "What if you get laid off?",
+            "How would you feel if your company announced layoffs?",
+            "I know layoffs are scary, are you worried?",
+            "I heard you mentioned layoffs, is that worrying you?",
+            "We've seen layoffs hit a lot of people, are you worried?",
+            "Can I ask whether layoffs are on your mind?",
+            "Do you think you will be getting laid off? Like, why do you think so?",
+            "Are layoffs at your plant why you're looking now?",
+            # Reviewed fix: a first-person speech act ("Can I ask", "I'm curious", "We've helped")
+            # is not the advisor being laid off; the natural follow-ups to the learner's own "I
+            # keep hearing about layoffs" (turns 42 and 45).
+            "Can I ask about the layoffs you mentioned?",
+            "I'm curious about the layoffs you mentioned, how are they affecting you?",
+            "I wanted to ask about job security, is that a worry for you?",
+            "We've helped a lot of people worried about layoffs; are you worried too?",
+            "Did the layoffs at our company affect you?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(detect_probes(text), frozenset({"H1"}))
 
     def test_company_name_and_sign_off_never_unlock(self):
         """S0-B: 'Interview Kickstart' unlocked H2 in 71/71 runs, 'time' unlocked H3."""

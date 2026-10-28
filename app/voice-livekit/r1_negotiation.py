@@ -35,7 +35,7 @@ Invariants (each has a test in ``tests/test_r1_negotiation.py``):
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable
 
 from r1_commitment import (
@@ -251,6 +251,13 @@ SPECS: tuple[NegotiationSpec, ...] = (
                 r"\bdiscuss\w*",
                 r"\bhappen\w*",
                 r"\bexpect\w*",
+                # The enrolment wording (``question_spec``): what is included, what it signs up for,
+                # what the learner would get.  "get" only in the learner's own question ("would I
+                # be getting"): "I get what you're saying" or "I'll get back to you" is no question.
+                r"\binclud\w*",
+                r"\bsign(?:ing|ed)? up\b",
+                r"\b(?:would|do|will|could|can|should|am) i (?:actually |really |even |be )*"
+                r"get(?:ting)?\b",
             ),
         ),
         (
@@ -323,6 +330,30 @@ SPECS: tuple[NegotiationSpec, ...] = (
 )
 SPEC_BY_ID = {spec.id: spec for spec in SPECS}
 SPEC_BY_REASON = {spec.reason: spec for spec in SPECS if spec.reason is not None}
+
+# The one question about the next step, worded for an enrolment ask ("Let's lock in the deal"):
+# no call was proposed, so the learner asks what it would be signing up for (owner test 7f2a25e6
+# turn 32 asked "What exactly would that call involve?" about a call nobody had mentioned).  It
+# keeps the N-QUESTION id and markers; ``question_spec`` picks the wording by the advisor's ask.
+N_QUESTION_ENROL_BRIEF = (
+    "you ask the advisor what you would actually be signing up for and what is included, before "
+    "you agree to anything"
+)
+N_QUESTION_ENROL_VARIANTS = (
+    "What exactly would I be signing up for? I'd like to know what's included before I agree to "
+    "anything.",
+    "Before I agree to anything, what's actually included in what I'd be signing up for?",
+    "What would I actually get for that, and what does it include?",
+)
+
+
+def question_spec(ask: AskKind | None) -> NegotiationSpec:
+    """N-QUESTION worded for ``ask``: "the call" only when the advisor proposed a call."""
+    spec = SPEC_BY_ID[N_QUESTION]
+    if ask is AskKind.CALL:
+        return spec
+    return replace(spec, brief=N_QUESTION_ENROL_BRIEF, variants=N_QUESTION_ENROL_VARIANTS)
+
 
 # The reaction before the scripted WEAK line at 19:00 (the line itself stays scripted and masked).
 COMMIT_REACTION_BRIEF = (
@@ -1615,7 +1646,11 @@ def _piece_offers(
         if _offered(lowered, match.start(), match.end()) and not _described_discount(
             lowered, match.start()
         ):
-            discounts.add(int(round(PRICE_USD * float(match.group(1)) / 100)))
+            discount = int(round(PRICE_USD * float(match.group(1)) / 100))
+            # The same floor as a dollar figure: "I gave you more than 90% discount" is no $900
+            # offer (owner test 7f2a25e6 turn 58, the learner then named a price nobody said).
+            if PRICE_USD - discount >= MIN_NET_USD:
+                discounts.add(discount)
     # Several small amounts in one sentence are a LIST of the deck's discounts, not an offer.
     if len(discounts) == 1 and small <= discounts:
         found[PRICE_USD - next(iter(discounts))] = conditional

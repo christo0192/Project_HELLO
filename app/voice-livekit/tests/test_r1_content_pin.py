@@ -92,7 +92,18 @@ import r1_world
 # twenty minutes and the goal (convince the learner), L-OPEN says about thirty minutes and a
 # twenty-minute role-play, and the owed-move deadlines stretch to the longer call (F3 430, F2 640,
 # F1 810, F4 930).
-PINNED_CONTENT_SHA256 = "7064ebec45af365cba4e416c7ac84cf00b366a9b5d983b5a86bad8e4bf3bd5d8"
+# Revision 16 (owner test 7f2a25e6 keyword misfires): the one question about the next step is worded
+# by the advisor's ask (N_QUESTION_ENROL_BRIEF / N_QUESTION_ENROL_VARIANTS after an enrolment ask,
+# "the call" only after a call ask) and its markers also accept "include", "signing up" and "would I
+# get"; a challenge to the learner's own words or questions is answered plainly first
+# (CHALLENGE_NOTE); an out-of-role "end the call" request gets the interviewer's one-off question
+# (L-ASIDE-END: say "end the interview" to stop, otherwise carry on) and, on end words, a short
+# close (L-END-CLOSE).  Voice barge-in (owner decision 2026-10-28): after the advisor cut the learner
+# off, the owed move waits one turn and what they said is answered first (INTERRUPTED_NOTE), and a
+# lone backchannel that cut her gets her point finished in one sentence (BACKCHANNEL_CUT_NOTE), and
+# one that only asked her to say it again ("Sorry?", "Pardon?") or checked she was there gets it
+# said again (CUT_REPEAT_NOTE; reviewed fix, same unreleased revision).
+PINNED_CONTENT_SHA256 = "94c62a50e2ec3f7654eb6b667e7c5d13916938f24d3612cc2d3a11d4324c7fd4"
 
 CONTENT_MODULES = (
     "r1_text",

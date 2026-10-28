@@ -351,11 +351,13 @@ def _suppressed_why(rig: Any) -> str:
     interview = rig.interview
     if rig.engine.exit_requested:
         return "farewell_exit"
+    if rig.engine.end_confirmed:
+        return "end_request"
     if interview._early_exit_due():
         return "early_exit"
     if rig.machine.roleplay_should_end():
         return "time_cap"
-    if getattr(rig.engine, "_asides", None):
+    if getattr(rig.engine, "_asides", None) or getattr(rig.engine, "_end_aside", None):
         return "aside"
     return "other"
 
@@ -364,6 +366,8 @@ def _stop_reason(rig: Any, farewells: int) -> str | None:
     interview = rig.interview
     if rig.engine.exit_requested:
         return "farewell_exit"
+    if rig.engine.end_confirmed:
+        return "end_request"  # the candidate_left close (owner test 7f2a25e6)
     if interview._early_exit_due():
         return "early_exit"
     if rig.machine.roleplay_should_end():

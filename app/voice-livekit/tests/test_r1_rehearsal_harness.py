@@ -30,7 +30,7 @@ from rehearsal import scripted_advisor as sa
 from rehearsal import scripted_learner as sl
 from rehearsal.call import CallDeps, CallSpec, run_call
 from r1_guard import FALLBACK_REPLIES, GuardContext, guard_text
-from r1_negotiation import COUNTERS, SPECS, filled_markers
+from r1_negotiation import COUNTERS, N_QUESTION_ENROL_VARIANTS, SPECS, filled_markers
 from r1_personas import PERSONAS, deep_need_topics_in, detect_followup, detect_probes, resolve_persona
 from r1_prompts import turn_reminder
 from r1_roleplay import RolePlayEngine
@@ -959,8 +959,10 @@ class ScriptedStandInTests(unittest.TestCase):
             scripted.setdefault(spec.id, set()).update(v.replace("{decision_maker}", "{dm}") for v in spec.variants)
         for counter in COUNTERS:
             scripted.setdefault("F1-COUNTER", set()).update(counter.variants)
+        scripted["N-QUESTION"].update(N_QUESTION_ENROL_VARIANTS)
         for bank_id, lines in sl.VOICED.items():
-            base = "F1-COUNTER" if bank_id.startswith("F1-COUNTER") else bank_id
+            # "F1-COUNTER:met", "N-QUESTION:enrol": a wording of the move before the colon.
+            base = bank_id.split(":", 1)[0]
             for line in lines:
                 for dm in sorted({p.decision_maker for p in PERSONAS}):
                     with self.subTest(bank=bank_id, line=line, dm=dm):

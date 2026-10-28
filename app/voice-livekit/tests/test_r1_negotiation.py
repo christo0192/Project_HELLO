@@ -612,6 +612,27 @@ class PriceOfferTests(unittest.TestCase):
         self.assertEqual(self.offers("We can do 10% off if you enrol today."), {8100: True})
         self.assertEqual(self.offers("There is a discount of $1500."), {7500: False})
 
+    def test_a_percent_discount_below_the_floor_is_no_offer(self):
+        """Owner test 7f2a25e6 turn 58: "more than 90% discount" became a $900 offer and the learner
+        said "Nine hundred is easier to hear", a number nobody said.  A percent discount keeps the
+        floor a dollar figure has (``MIN_NET_USD``)."""
+        turn_58 = (
+            "First, I am trying to give you the program for $100 and you are asking too many "
+            "questions like I reduced, I gave you more than 90% discount."
+        )
+        self.assertEqual(self.offers(turn_58), {})
+        self.assertEqual(self.offers("I gave you more than 90% discount"), {})
+        self.assertEqual(self.offers("I can give you 60% off."), {})
+        self.assertEqual(self.offers("Fine, 99 percent off, take it."), {})
+        # A real percent discount is still the price it leaves, up to the floor itself.
+        self.assertEqual(self.offers("I can do 20% off for you."), {7200: False})
+        self.assertEqual(self.offers("I can give you 50% off."), {neg.MIN_NET_USD: False})
+        state = neg.Negotiation("husband")
+        state.observe(21, "I can do $8,000 for you.", anchor_turn=None)
+        seen = state.observe(58, turn_58, anchor_turn=22)
+        self.assertFalse(seen.offer_added)
+        self.assertEqual([o.net_usd for o in state.offers], [8000])
+
     def test_a_list_of_the_decks_discounts_is_not_an_offer(self):
         self.assertEqual(self.offers("We have discounts of $500, $1000 and $1500."), {})
         self.assertEqual(
@@ -1120,6 +1141,8 @@ class SpecContentTests(unittest.TestCase):
             for spec in neg.SPECS:
                 for text in spec.variants:
                     yield rendered, spec, neg.fill_decision_maker(text, dm)
+            for text in neg.N_QUESTION_ENROL_VARIANTS:
+                yield rendered, neg.question_spec(AskKind.ENROL), text
             for item in neg.COUNTERS:
                 for text in item.variants:
                     yield rendered, item, text
@@ -1207,11 +1230,55 @@ class SpecContentTests(unittest.TestCase):
             self.assertNotIn('"', item.brief)
             self.assertNotRegex(item.brief, r"\d")
         self.assertNotIn('"', neg.COMMIT_REACTION_BRIEF)
+        self.assertNotIn('"', neg.N_QUESTION_ENROL_BRIEF)
+        self.assertNotRegex(neg.N_QUESTION_ENROL_BRIEF, r"\d")
 
     def test_specs_are_found_by_id_and_by_reason(self):
         self.assertEqual(neg.SPEC_BY_ID[neg.N_EMAIL].kind, neg.KIND_EMAIL)
         self.assertEqual(neg.SPEC_BY_REASON[neg.REASON_MONEY].id, neg.N_MONEY)
         self.assertEqual(set(neg.SPEC_BY_REASON), set(neg.REASONS))
+
+    def test_the_question_names_the_call_only_after_a_call_ask(self):
+        """Owner test 7f2a25e6 turn 31-32: "Let's lock in the deal" (an enrolment ask) got "What
+        exactly would that call involve?" though nobody had proposed a call."""
+        call = neg.question_spec(AskKind.CALL)
+        self.assertIs(call, neg.SPEC_BY_ID[neg.N_QUESTION])
+        self.assertIn("call", call.brief)
+        for ask in (AskKind.ENROL, None):
+            spec = neg.question_spec(ask)
+            with self.subTest(ask=ask):
+                self.assertEqual(spec.id, neg.N_QUESTION)
+                self.assertEqual(spec.kind, neg.KIND_QUESTION)
+                self.assertEqual(spec.markers, call.markers)  # note_spoken proves either wording
+                for text in (spec.brief, *spec.variants):
+                    self.assertNotRegex(text.lower(), r"\bcall\b|\bnext step")
+                self.assertIn("signing up", spec.brief)
+                self.assertIn("included", spec.brief)
+                for text in spec.variants:
+                    self.assertTrue(markers_match(spec.markers, text), text)
+                    self.assertLessEqual(len(text.split()), 30)
+        # The learner's own words on the owner's call prove the enrolment wording, so no scripted
+        # question is appended to it; a reply without a question word still does not.
+        state = neg.Negotiation("husband")
+        self.assertTrue(state.note_spoken(
+            neg.N_QUESTION, "What exactly would I be getting for it?", 32))
+        self.assertTrue(state.question_used)
+        for text in (
+            "What does the program include?",
+            "What would I actually be signing up for?",
+        ):
+            self.assertTrue(markers_match(call.markers, text), text)
+        for text in (
+            "I'm not locking anything in today.",
+            "I'd get back to you.",
+            # Reviewed fix: a bare "get" next to any wh-word proved the question without one.
+            "I get what you're saying, but I need to think about it.",
+            "What a deal. I'll get back to you.",
+            "That's what I wanted to hear, I'll get my laptop.",
+        ):
+            self.assertFalse(markers_match(call.markers, text), text)
+        for text in ("What do I get for that?", "So what am I getting for the money?"):
+            self.assertTrue(markers_match(call.markers, text), text)
 
 
 class AnchorAfterOfferTests(unittest.TestCase):
