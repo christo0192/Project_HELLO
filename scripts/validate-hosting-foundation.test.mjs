@@ -743,7 +743,9 @@ await checkAsync("current-state invariants unchanged", async () => {
   assert.equal(state.gates.launchGatesTotal, 17);
   assert.equal(state.phases.acceptedPhasesComplete, 0);
   assert.equal(state.phases.acceptedPhasesTotal, 14);
-  assert.equal(state.evidenceDate, "2026-07-30");
+  // Re-dated together with config/current-state.json when its 90-day freshness gate
+  // (check-current-state.mjs) expired on 2026-10-28; the status values above are unchanged.
+  assert.equal(state.evidenceDate, "2026-10-28");
 });
 await checkAsync("check-current-state.mjs passes", async () => {
   const result = spawnSync(process.execPath, ["scripts/check-current-state.mjs"], { cwd: root, encoding: "utf8" });
