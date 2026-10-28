@@ -70,6 +70,7 @@ from r1_text import (
     negated_before,
     parse_amount,
     split_sentences,
+    word_count,
 )
 from r1_world import DISCOUNTS_USD, PRICE_USD, URGENCY_LEVER_IDS, claims_guarantee
 
@@ -707,10 +708,25 @@ _END_OPENER = rf"(?:{_END_FILLER}[,.\s]+|(?!{_END_FILLER}\b)\w+,\s+){{0,8}}"
 # "I want to stop" is a request only as a whole sentence, with nothing after it but now or here,
 # the call, the interview or the role play, and please or thanks (reviewed fix: "I want to stop
 # here and summarise what we discussed" and "Okay Priya, I want to stop here, what's your budget?"
-# are an advisor moving the sale on).
-_I_WANT_TO_STOP = (
-    rf"\b{_I_WANT} (?:leave|quit|stop)(?: (?:the|this) (?:call|interview|{_ROLE_PLAY}))?"
-    r"(?: (?:now|here|right now))?(?:,?\s+(?:please|thanks|thank you))?[\s.!?]*$"
+# are an advisor moving the sale on).  It also opens its sentence (only fillers or a name before
+# it), so "No, I don't think I want to stop", "Who said I want to stop?" and "I never said I want
+# to stop" are not requests, and it is the turn's last word: a later sentence that asks or says
+# more ("I want to stop here. Do you have any questions?") is the advisor moving on (reviewed fix).
+_I_WANT_TO_STOP = re.compile(
+    rf"^{_END_OPENER}{_I_WANT} (?:leave|quit|stop)"
+    rf"(?: (?:the|this) (?:call|interview|{_ROLE_PLAY}))?"
+    r"(?: (?:now|here|right now))?(?:,?\s+(?:please|thanks|thank you))?[\s.!?]*$",
+    re.IGNORECASE,
+)
+# What may follow it in the same turn: a short courtesy ("Thank you.", "Sorry.", "Bye.").
+_COURTESY_TAIL_WORDS = 3
+# A turn that promises a call-back is the advisor closing the sale's call in role ("Let's cut the
+# call now, I'll call you tomorrow.", "Okay can you hang up. I'll call you back."): nobody calls
+# an interview back, so the engine treats such an end request as a farewell, never as the
+# out-of-role stop (reviewed fix: after a declined aside it ended the session as candidate_left).
+_CALL_BACK = re.compile(
+    r"\bi(?:'ll| will| can| shall| would)? (?:call|ring|phone|get back to|reach out to) you\b",
+    re.IGNORECASE,
 )
 _END_REQUEST = tuple(
     re.compile(pattern, re.IGNORECASE)
@@ -724,7 +740,6 @@ _END_REQUEST = tuple(
         rf"\b(?:{_YOU_ASK}|{_END_ASK}) (?:please |just )?hang up"
         rf"(?: (?:the|this) (?:call|phone))?{_CLAUSE_END}",
         rf"^{_END_OPENER}{_END_VERB} {_END_OBJECT}{_CLAUSE_END}",
-        _I_WANT_TO_STOP,
     )
 )
 # A negated end phrase is removed first ("please don't hang up", "can you not end the call", "I
@@ -744,6 +759,11 @@ _END_NEGATED = re.compile(
 )
 
 
+def promises_call_back(text: object) -> bool:
+    """The advisor promises to call the learner back ("I'll call you tomorrow"): a close in role."""
+    return _CALL_BACK.search(fold(text)) is not None
+
+
 def detect_end_request(text: object) -> bool:
     """The candidate asks the bot to end the call or the interview (an out-of-role request).
 
@@ -753,9 +773,15 @@ def detect_end_request(text: object) -> bool:
     (``candidate_left``: a failed session, never ``complete``).  From 14:00, or with a commitment
     on record, the engine treats the request as a farewell: it reaches only what "bye" reaches.
     """
-    for sentence in split_sentences(fold(text)):
+    sentences = split_sentences(fold(text))
+    for index, sentence in enumerate(sentences):
         cleaned = _END_NEGATED.sub(" ", sentence).strip()
         if any(pattern.search(cleaned) for pattern in _END_REQUEST):
+            return True
+        if _I_WANT_TO_STOP.search(cleaned) and all(
+            "?" not in later and word_count(later) <= _COURTESY_TAIL_WORDS
+            for later in sentences[index + 1 :]
+        ):
             return True
     return False
 

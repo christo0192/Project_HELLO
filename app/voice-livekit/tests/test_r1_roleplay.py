@@ -1755,6 +1755,14 @@ class EndRequestTests(unittest.TestCase):
             "Go ahead, Priya.",
             "Yeah, sure, talk to your husband and get back to me.",
             "Yeah, sorry about that. So Priya, the course is nine thousand.",
+            # Reviewed fix: an answer that declines is a no, whatever end words it holds.
+            "No, I don't think I want to stop.",
+            "I'm not sure I want to stop.",
+            "No, why would I want to stop? Let's carry on.",
+            "Who said I want to stop? Carry on.",
+            "Not really. I don't think I want to quit.",
+            "No. Why would you end the interview? Let's carry on.",
+            "No, why would you end the call?",
         ):
             with self.subTest(answer=answer):
                 s = Session(engine())
@@ -1764,6 +1772,31 @@ class EndRequestTests(unittest.TestCase):
                 self.assertFalse(plan.end_interview)
                 self.assertFalse(plan.aside)
                 self.assertFalse(s.eng.end_confirmed)
+
+    def test_a_call_back_close_before_fourteen_is_a_farewell_not_the_stop(self):
+        # Reviewed fix: "Let's cut the call now, I'll call you tomorrow." after a declined
+        # aside ended the session as a failed candidate_left.  A call-back promise is the
+        # advisor closing the sale's call in role: it gets exactly what "bye" gets.
+        closer = "Let's cut the call now, I'll call you tomorrow."
+        for with_question in (False, True):
+            with self.subTest(with_question=with_question):
+                plans = []
+                for text in (closer, "Thank you so much, bye!"):
+                    s = Session(engine())
+                    s.say(OPENER, 20)
+                    if with_question:
+                        s.say(T64_DISCONNECT, 300)
+                        s.say("No no, let's carry on, sorry.", 305)
+                    plans.append((s.say(text, 445), s.eng))
+                (plan, eng), (bye_plan, bye_eng) = plans
+                self.assertFalse(plan.end_interview)
+                self.assertFalse(plan.aside)
+                self.assertFalse(eng.end_confirmed)
+                self.assertEqual(plan.mode, bye_plan.mode)
+                self.assertEqual(plan.move_id, bye_plan.move_id)
+                self.assertEqual(
+                    eng.scheduler.close_attempts, bye_eng.scheduler.close_attempts
+                )
 
     def test_from_fourteen_minutes_the_request_is_a_farewell(self):
         # Deliberate change (reviewed fix M1).  This used to pin "from 14:00 the request is an

@@ -1277,9 +1277,40 @@ class EndRequestTests(unittest.TestCase):
             "let's end this session here",
             "let's finish this session",
             "Sorry, I didn't mean to end the call.",
+            # Reviewed fix: "I want to stop" opens its sentence and ends the turn.
+            "No, I don't think I want to stop.",
+            "Who said I want to stop? Carry on.",
+            "I never said I want to stop",
+            "I want to stop here. Do you have any questions?",
+            "I'd like to stop. Any questions so far?",
+            "Okay so I want to stop here. And summarise what we discussed.",
         ):
             with self.subTest(text=text):
                 self.assertFalse(detect_end_request(text))
+
+    def test_a_call_back_promise_marks_an_in_role_close(self):
+        # Reviewed fix: the engine treats these end requests as farewells, never as the
+        # out-of-role stop (nobody calls an interview back).
+        from r1_tracker import promises_call_back
+
+        for text in (
+            "Can you hang up, I'll call you back in five minutes.",
+            "Please hang up, I will call you back.",
+            "Okay can you hang up. I'll call you back.",
+            "Let's cut the call now, I'll call you tomorrow.",
+            "Thanks Priya, please cut the call, I will call you back in five minutes.",
+            "Okay, I'll get back to you tomorrow with the details.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(promises_call_back(text))
+        for text in (
+            "can you disconnect the call?",
+            "Okay Priya, let's disconnect the call now, I'll send you the email.",
+            "End the interview.",
+            "Can you call me back later?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(promises_call_back(text))
 
     def test_requests_to_the_bot_still_are_end_requests(self):
         from r1_tracker import detect_end_request
@@ -1297,6 +1328,8 @@ class EndRequestTests(unittest.TestCase):
             "i want to leave",
             "i want to stop the call",
             "I want to quit the interview",
+            "I want to stop. Thank you.",
+            "Christy, I want to stop the interview.",
             "I wanna stop now.",
             "end the call",
             "priya, end the call",

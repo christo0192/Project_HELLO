@@ -232,6 +232,7 @@ from r1_tracker import (
     detect_character_break,
     detect_end_request,
     parse_judge_output,
+    promises_call_back,
 )
 from r1_world import WORLD_VERSION
 
@@ -675,8 +676,21 @@ class RolePlayEngine:
         # on the close ladder (the redirect once before 14:00, the WEAK stall in the close window,
         # otherwise the exit) and nothing more, so it stays injection-neutral.
         end_request = detect_end_request(candidate_text)
-        end_words = end_request or (self._end_pending and confirms_end(candidate_text))
-        out_of_role = r_sec < EARLY_CLOSE_BEFORE_SEC and not self.commitment_resolved
+        # Once the aside has been asked, an answer that also declines is a no whatever end words it
+        # holds: "No, I don't think I want to stop", "No, why would you end the call?" (reviewed
+        # fix: these ended the session as a failed candidate_left).
+        declined = self._end_aside is not None and declines_end(candidate_text)
+        end_words = (end_request and not declined) or (
+            self._end_pending and confirms_end(candidate_text)
+        )
+        # "Let's cut the call now, I'll call you tomorrow": a call-back promise is the advisor
+        # closing the sale's call in role, so it is a farewell, never the out-of-role stop (reviewed
+        # fix: after a declined aside it ended the session as candidate_left).
+        out_of_role = (
+            r_sec < EARLY_CLOSE_BEFORE_SEC
+            and not self.commitment_resolved
+            and not promises_call_back(candidate_text)
+        )
         if out_of_role and self._end_aside is not None and end_words:
             return self._end_plan(turn_index)
         farewell_end = end_words and not out_of_role
