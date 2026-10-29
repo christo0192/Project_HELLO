@@ -21,6 +21,7 @@ if str(HERE) not in sys.path:
 
 import r1_commitment
 import r1_content
+import r1_end_intent
 import r1_guard
 import r1_negotiation
 import r1_personas
@@ -106,7 +107,13 @@ import r1_world
 # Revision 17 (owner test 1eb18cd4, owner decision 2026-10-29): a confirmed out-of-role stop ends
 # the role-play into L-EXIT and the interviewer's wrap-up instead of the whole session, so the short
 # close L-END-CLOSE is deleted.  L-ASIDE-END and every other pinned text are unchanged.
-PINNED_CONTENT_SHA256 = "2bbbe573e2630a1b74dd41eb4ef2abc24a4700f42f7ca2694f2a89c98b806423"
+# Revision 18 (owner decision 2026-10-30, meaning-based end detection): the end-intent classifier's
+# system prompt and its two context lines (r1_end_intent END_INTENT_SYSTEM, ROLEPLAY_CONTEXT,
+# AFTER_ASIDE_CONTEXT), its prefilter window and its labels join the manifest (``end_intent``).  No
+# spoken line changed: the brief repeat replays L-TRANSITION, a brief request after the pickup
+# plays L-ASIDE-COACH.  Reviewed fix, same unreleased revision: the prompt's "no" also covers the
+# learner's OWN job interviews, and its tie-break names THIS interview or this role-play.
+PINNED_CONTENT_SHA256 = "95ab3b770accf95c730d0cff4c5fbdbec3708113ea048dd1f641a7f9f18d84ea"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -117,6 +124,7 @@ CONTENT_MODULES = (
     "r1_scheduler",
     "r1_negotiation",
     "r1_tracker",
+    "r1_end_intent",
     "r1_guard",
     "r1_prompts",
     "r1_content",
@@ -284,6 +292,28 @@ class PinTests(unittest.TestCase):
                 self.assertNotEqual(r1_content.content_sha256(), base, name)
             finally:
                 setattr(module, name, original)
+        self.assertEqual(r1_content.content_sha256(), base)
+
+    def test_the_end_intent_prompt_is_pinned_at_revision_18(self):
+        # Owner decision 2026-10-30: the classifier's prompt is content the model reads.
+        self.assertEqual(r1_content.CONTENT_REVISION, 18)
+        pinned = r1_content.manifest()["end_intent"]
+        self.assertEqual(pinned["system"], r1_end_intent.END_INTENT_SYSTEM)
+        self.assertEqual(pinned["labels"], ["no", "maybe", "end"])
+        self.assertEqual(pinned["window_words"], r1_end_intent.END_INTENT_WINDOW_WORDS)
+        base = r1_content.content_sha256()
+        for name, value in (
+            ("END_INTENT_SYSTEM", r1_end_intent.END_INTENT_SYSTEM + " "),
+            ("ROLEPLAY_CONTEXT", "x"),
+            ("AFTER_ASIDE_CONTEXT", "x"),
+            ("END_INTENT_WINDOW_WORDS", 15),
+        ):
+            original = getattr(r1_end_intent, name)
+            try:
+                setattr(r1_end_intent, name, value)
+                self.assertNotEqual(r1_content.content_sha256(), base, name)
+            finally:
+                setattr(r1_end_intent, name, original)
         self.assertEqual(r1_content.content_sha256(), base)
 
     def test_the_manifest_covers_the_r1_q_negotiation(self):

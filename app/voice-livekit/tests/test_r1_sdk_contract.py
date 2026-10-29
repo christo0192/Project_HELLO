@@ -772,14 +772,17 @@ class TestR1SessionFactory(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(r1_session.StopResponse, StopResponse)
         interview = mock.Mock()
-        interview.prepare_turn.side_effect = StopResponse()
+        # The hook awaits the interview's async decision (owner decision 2026-10-30: a role-play
+        # turn may wait for its end-intent verdict), and the SDK awaits the hook.
+        interview.prepare_turn_async = mock.AsyncMock(side_effect=StopResponse())
         agent = r1_session.R1Agent(interview)
         with self.assertRaises(StopResponse):
             await agent.on_user_turn_completed(
                 mock.Mock(), mock.Mock(text_content="ready", id="msg_1")
             )
-        interview.prepare_turn.assert_called_once_with("ready", "msg_1")
-        interview.prepare_turn.side_effect = None
+        interview.prepare_turn_async.assert_awaited_once_with("ready", "msg_1")
+        interview.prepare_turn.assert_not_called()
+        interview.prepare_turn_async.side_effect = None
         await asyncio.wait_for(
             agent.on_user_turn_completed(mock.Mock(), mock.Mock(text_content="hello")), 1.0
         )
@@ -1861,3 +1864,382 @@ class TestR1VoicesOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
             heard["interviewer"], ["Thank you, Asha.", " Let us pause the role-play here."]
         )
         self.assertNotIn("unbound", heard)
+
+# ------------------------------------------------------------------------------------------------
+# Owner decision 2026-10-30 (owner test 1eb18cd4, turns 33-41): an acknowledgement no longer cuts
+# the learner.  R1 holds it back in ``R1Agent.stt_node``; these pin why that is enough on 1.6.4,
+# and drive the REAL ``AgentActivity`` methods with stubs around them to prove it.
+# ------------------------------------------------------------------------------------------------
+class _PocAudio:
+    can_pause = True
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+
+    def pause(self) -> None:
+        self.calls.append("pause")
+
+    def resume(self) -> None:
+        self.calls.append("resume")
+
+
+class _PocSession:
+    """The AgentSession surface the interruption methods touch."""
+
+    def __init__(self, min_words: int, timeout: float) -> None:
+        from types import SimpleNamespace
+
+        self._aec_warmup_remaining = 0
+        self._aec_warmup_timer = None
+        self.options = SimpleNamespace(
+            interruption={
+                "min_words": min_words,
+                "min_duration": 0.8,
+                "resume_false_interruption": True,
+                "false_interruption_timeout": timeout,
+            },
+            endpointing={"min_delay": 0.8, "max_delay": 3.0},
+        )
+        self.output = SimpleNamespace(audio=_PocAudio())
+        self.agent_state = "speaking"
+        self.llm = object()
+        self.stt = object()
+        self._user_speaking_span = None
+        self._loop = asyncio.get_running_loop()
+        self._amd = None
+        self._closing = False
+        self._text_only = False
+        self.transcribed: list[str] = []
+        self.events: list[str] = []
+
+    def _update_agent_state(self, state, otel_context=None) -> None:  # noqa: ANN001
+        self.agent_state = state
+
+    def _update_user_state(self, state, last_speaking_time=None) -> None:  # noqa: ANN001
+        pass
+
+    def _user_input_transcribed(self, ev) -> None:  # noqa: ANN001
+        self.transcribed.append(ev.transcript)
+
+    def emit(self, name, ev) -> None:  # noqa: ANN001
+        self.events.append(name)
+
+
+class _PocRecognition:
+    def __init__(self) -> None:
+        from types import SimpleNamespace
+
+        self.current_transcript = ""
+        self._endpointing = SimpleNamespace(overlapping=False)
+        self.backchannel_boundary_active = False
+
+    def _cancel_backchannel_boundary(self) -> None:
+        pass
+
+    def on_start_of_speech(self, **_kw) -> None:
+        pass
+
+    def on_end_of_speech(self, **_kw) -> None:
+        pass
+
+    def on_end_of_agent_speech(self, **_kw) -> None:
+        pass
+
+    def on_start_of_agent_speech(self, **_kw) -> None:
+        pass
+
+
+@unittest.skipUnless(AgentSession is not None, "livekit-agents is not installed (bare CI)")
+class TestR1AckHoldOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
+    """What a final transcript does to the learner's line, and what holding it back does."""
+
+    def setUp(self) -> None:
+        import r1_session
+
+        writer = r1_session._log._writer
+        r1_session._log._writer = lambda _raw: None  # the r1_ack_held lines
+        self.addCleanup(setattr, r1_session._log, "_writer", writer)
+
+    def test_a_final_pauses_then_cancels_the_pause_which_interrupts(self) -> None:
+        final = inspect.getsource(AgentActivity.on_final_transcript)
+        self.assertLess(
+            final.index("self._interrupt_by_audio_activity()"),
+            final.index("self._cancel_speech_pause(old_task=self._cancel_speech_pause_task)"),
+        )
+        self.assertIn("self._session._user_input_transcribed(", final)
+        barge = inspect.getsource(AgentActivity._interrupt_by_audio_activity)
+        self.assertIn("text = self._audio_recognition.current_transcript", barge)
+        self.assertIn('< interruption_options["min_words"]', barge)
+
+    def test_no_transcript_means_no_turn(self) -> None:
+        eou = inspect.getsource(AudioRecognition._run_eou_detection)
+        self.assertIn(
+            "if self._stt and not self._audio_transcript and self._turn_detection_mode", eou
+        )
+        stt_event = inspect.getsource(AudioRecognition._on_stt_event)
+        self.assertLess(
+            stt_event.index("self._hooks.on_final_transcript("),
+            stt_event.index("self._audio_transcript +="),
+        )
+
+    def test_the_symbols_the_hold_and_the_fast_resume_use(self) -> None:
+        from livekit.agents import stt
+
+        import r1_session
+
+        self.assertTrue(inspect.isasyncgenfunction(Agent.default.stt_node))
+        self.assertEqual(
+            list(inspect.signature(Agent.default.stt_node).parameters),
+            ["agent", "audio", "model_settings"],
+        )
+        self.assertEqual(
+            list(inspect.signature(Agent.stt_node).parameters), ["self", "audio", "model_settings"]
+        )
+        # A custom stt_node only stops the pipeline reuse across a handoff (R1 has none).
+        self.assertIn(
+            "type(self.agent).stt_node is Agent.stt_node", inspect.getsource(AgentActivity)
+        )
+        self.assertIn("self._activity: AgentActivity | None = None", inspect.getsource(
+            AgentSession.__init__
+        ))
+        init = inspect.getsource(AgentActivity.__init__)
+        self.assertIn("self._paused_speech: _PausedSpeechInfo | None = None", init)
+        self.assertIn("self._false_interruption_timer: asyncio.TimerHandle | None = None", init)
+        self.assertEqual(
+            list(inspect.signature(AgentActivity._start_false_interruption_timer).parameters),
+            ["self", "timeout"],
+        )
+        self.assertTrue(callable(getattr(asyncio.TimerHandle, "when", None)))
+        self.assertIn("handle", inspect.getsource(AgentActivity._update_paused_speech))
+        self.assertTrue(
+            r1_session._HELD_STT_EVENTS
+            <= {member.value for member in stt.SpeechEventType}
+        )
+        self.assertIn("agent_false_interruption", typing.get_args(EventTypes))
+        self.assertIn(
+            "agent_false_interruption", inspect.getsource(r1_session.R1Interview.wire_events)
+        )
+
+    def test_r1_agent_overrides_the_stt_node(self) -> None:
+        import r1_session
+
+        self.assertIsNot(r1_session.R1Agent.stt_node, Agent.stt_node)
+        self.assertTrue(inspect.iscoroutinefunction(r1_session.R1Agent.on_user_turn_completed))
+
+    # -------------------------------------------------------------- the real methods, driven
+    def activity(self, min_words: int, timeout: float = 0.3):
+        from livekit.agents.types import NOT_GIVEN
+        from types import SimpleNamespace
+
+        act = AgentActivity.__new__(AgentActivity)
+        act._session = _PocSession(min_words, timeout)
+        act._agent = SimpleNamespace(llm=NOT_GIVEN, stt=NOT_GIVEN)
+        act._interruption_by_audio_activity_enabled = True
+        act._default_interruption_by_audio_activity_enabled = True
+        act._interruption_detection_enabled = False
+        act._interruption_detected = False
+        act._audio_recognition = _PocRecognition()
+        act._rt_session = None
+        act._turn_detection = None
+        act._paused_speech = None
+        act._false_interruption_timer = None
+        act._cancel_speech_pause_task = None
+        act._user_silence_event = asyncio.Event()
+        act._stt_eos_received = False
+        handle = SpeechHandle.create(allow_interruptions=True)
+        act._current_speech = handle
+        return act, handle
+
+    def interview(self, act, handle):
+        """A real R1Interview in the role-play whose session's current speech is ``handle``."""
+        from types import SimpleNamespace
+
+        import r1_session
+        from r1_phases import R1Phase
+
+        session = SimpleNamespace(current_speech=handle, _activity=act)
+        interview = r1_session.R1Interview(
+            SimpleNamespace(room=None), {}, session, SimpleNamespace(), clock=lambda: 0.0
+        )
+        for phase in (R1Phase.OPENING, R1Phase.ICEBREAKER, R1Phase.TRANSITION, R1Phase.ROLEPLAY):
+            interview.machine.transition(phase)
+        return interview
+
+    @staticmethod
+    def final(text: str):
+        from livekit.agents import stt
+
+        return stt.SpeechEvent(
+            type=stt.SpeechEventType.FINAL_TRANSCRIPT,
+            alternatives=[stt.SpeechData(language="en", text=text)],
+        )
+
+    @staticmethod
+    def vad(duration: float, *, speaking: bool = True):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            speech_duration=duration,
+            raw_accumulated_silence=0.0,
+            speaking=speaking,
+            silence_duration=0.0,
+            inference_duration=0.0,
+        )
+
+    def feed(self, interview, act, text: str) -> bool:
+        """What ``R1Agent.stt_node`` does with a final: hold it, or pass it to the SDK."""
+        event = self.final(text)
+        held = interview.hold_ack_transcript(event)
+        if not held:
+            act.on_final_transcript(event)
+        return held
+
+    async def test_today_a_transcribed_okay_cuts_the_learner(self) -> None:
+        act, handle = self.activity(0)
+        act.on_final_transcript(self.final("Okay"))
+        await asyncio.sleep(0.05)
+        self.assertEqual(act._session.output.audio.calls[0], "pause")
+        self.assertTrue(handle.interrupted)
+
+    async def test_a_held_short_okay_never_pauses_her(self) -> None:
+        # A plain "Okay" of about 0.3 s of voice: with the VAD's trailing silence its
+        # speech_duration still stays under min_duration (see the test just below).
+        act, handle = self.activity(0)
+        interview = self.interview(act, handle)
+        act.on_vad_inference_done(self.vad(0.4))
+        self.assertTrue(self.feed(interview, act, "Okay"))
+        await asyncio.sleep(0.4)
+        self.assertEqual(act._session.output.audio.calls, [])
+        self.assertFalse(handle.interrupted)
+        self.assertEqual(act._session.transcribed, [])  # the SDK never saw it
+
+    async def test_the_vad_counts_trailing_silence_so_a_medium_ack_reaches_min_duration(
+        self,
+    ) -> None:
+        # Reviewed 2026-10-30: the default VAD (inference.VAD "silero", what R1 uses) keeps adding
+        # to speech_duration through its 0.25 s min_silence_duration of trailing silence, so about
+        # 0.55 s of voice ("Yeah, okay") reports 0.8 s and pauses her (the module docstring of
+        # r1_session and the R1_ACK_HOLD runbook row say so).  The real state machine, driven by a
+        # fake native model: 17 windows of 32 ms of voice (0.544 s), then silence.
+        try:
+            from livekit import rtc
+            from livekit.agents import vad as base_vad
+            from livekit.agents.inference import vad as inference_vad
+        except ImportError as exc:  # pragma: no cover - no native VAD on this machine
+            self.skipTest(f"inference VAD unavailable: {exc}")
+
+        class Native:
+            calls = 0
+
+            def reset(self) -> None:
+                pass
+
+            def predict(self, _window) -> float:
+                Native.calls += 1
+                return 1.0 if Native.calls <= 17 else 0.0
+
+        self.assertEqual(
+            inspect.signature(inference_vad.VAD).parameters["min_silence_duration"].default, 0.25
+        )
+        with mock.patch.object(inference_vad, "_NativeVAD", Native):
+            stream = inference_vad.VAD(model="silero").stream()
+            for _ in range(40):
+                stream.push_frame(rtc.AudioFrame(
+                    data=bytes(512 * 2), sample_rate=16000, num_channels=1,
+                    samples_per_channel=512,
+                ))
+            stream.end_input()
+            reported, spoken = 0.0, None
+            async for event in stream:
+                if event.type == base_vad.VADEventType.INFERENCE_DONE:
+                    reported = max(reported, event.speech_duration)
+                elif event.type == base_vad.VADEventType.END_OF_SPEECH:
+                    spoken = event.speech_duration
+        self.assertAlmostEqual(spoken, 0.544, places=3)
+        self.assertGreaterEqual(reported, 0.8 - 1e-6)  # the SDK's min_duration: she pauses
+        # Paused, the held final still only brings the same line back (never a cut or restart).
+        act, handle = self.activity(0, timeout=2.0)
+        interview = self.interview(act, handle)
+        act.on_vad_inference_done(self.vad(reported))
+        act.on_end_of_speech(self.vad(0.0, speaking=False))
+        with mock.patch.dict("os.environ", {"R1_ACK_RESUME_SEC": "0.1"}):
+            self.assertTrue(self.feed(interview, act, "Yeah, okay"))
+        await asyncio.sleep(0.3)
+        self.assertEqual(act._session.output.audio.calls, ["pause", "resume"])
+        self.assertFalse(handle.interrupted)
+
+    async def test_a_held_long_ack_pauses_her_and_the_sdk_resumes_the_same_line(self) -> None:
+        act, handle = self.activity(0, timeout=0.3)
+        interview = self.interview(act, handle)
+        with mock.patch.dict("os.environ", {"R1_ACK_RESUME_SEC": "0"}):
+            act.on_vad_inference_done(self.vad(0.9))  # paused at 0.8 s of voice
+            self.assertEqual(act._session.agent_state, "listening")
+            act.on_end_of_speech(self.vad(0.0, speaking=False))
+            self.assertTrue(self.feed(interview, act, "Yeah, okay, continue."))
+            await asyncio.sleep(0.45)
+        self.assertEqual(act._session.output.audio.calls, ["pause", "resume"])
+        self.assertFalse(handle.interrupted)
+        self.assertEqual(act._session.agent_state, "speaking")
+        self.assertIn("agent_false_interruption", act._session.events)
+
+    async def test_the_fast_resume_shortens_the_sdks_countdown(self) -> None:
+        act, handle = self.activity(0, timeout=2.0)
+        interview = self.interview(act, handle)
+        act.on_vad_inference_done(self.vad(0.9))
+        act.on_end_of_speech(self.vad(0.0, speaking=False))
+        self.assertIsNotNone(act._false_interruption_timer)
+        with mock.patch.dict("os.environ", {"R1_ACK_RESUME_SEC": "0.1"}):
+            self.assertTrue(self.feed(interview, act, "Okay, continue."))
+        await asyncio.sleep(0.3)  # far less than the SDK's 2.0 s
+        self.assertEqual(act._session.output.audio.calls, ["pause", "resume"])
+        self.assertFalse(handle.interrupted)
+
+    async def test_a_real_interruption_still_cuts_her(self) -> None:
+        act, handle = self.activity(0)
+        interview = self.interview(act, handle)
+        act.on_vad_inference_done(self.vad(0.9))
+        act.on_end_of_speech(self.vad(0.0, speaking=False))
+        for text in ("Hey, what is your name?",):
+            self.assertFalse(self.feed(interview, act, text))
+        await asyncio.sleep(0.05)
+        self.assertTrue(handle.interrupted)
+
+    async def test_at_three_words_two_acks_add_up_to_a_turn_today(self) -> None:
+        from types import SimpleNamespace
+
+        act, handle = self.activity(3)
+        recognition = act._audio_recognition
+        act.on_final_transcript(self.final("Okay"))  # the SDK checks the words it HOLDS: 0
+        recognition.current_transcript = "Okay"
+        act.on_final_transcript(self.final("Yeah, Okay"))  # 1 held word: still no pause
+        await asyncio.sleep(0.05)
+        self.assertFalse(handle.interrupted)
+        recognition.current_transcript = "Okay Yeah, Okay"
+        committed = []
+
+        def create_speech_task(coro, name=None):  # noqa: ANN001
+            coro.close()
+            committed.append(name)
+
+        act._create_speech_task = create_speech_task
+        act._scheduling_paused = False
+        act._new_turns_blocked = False
+        act._preemptive_generation = None
+        act._user_turn_completed_atask = None
+        self.assertTrue(
+            act.on_end_of_turn(SimpleNamespace(new_transcript="Okay Yeah, Okay", skip_reply=False))
+        )
+        # The committed turn interrupts the line and the hook plans a restart.
+        self.assertEqual(committed, ["AgentActivity._user_turn_completed_task"])
+
+    async def test_at_three_words_held_acks_never_reach_the_sdk(self) -> None:
+        act, handle = self.activity(3)
+        interview = self.interview(act, handle)
+        with mock.patch.dict("os.environ", {"R1_INTERRUPT_MIN_WORDS": "3"}):
+            held = [self.feed(interview, act, text) for text in ("Okay", "Yeah, Okay", "Hmm")]
+        act.on_vad_inference_done(self.vad(1.2))  # nothing banked: the voice path refuses too
+        await asyncio.sleep(0.05)
+        self.assertEqual(held, [True, True, True])
+        self.assertEqual(act._session.transcribed, [])
+        self.assertEqual(act._session.output.audio.calls, [])
+        self.assertFalse(handle.interrupted)

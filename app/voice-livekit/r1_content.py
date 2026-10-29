@@ -21,6 +21,7 @@ import json
 from typing import Any
 
 import r1_commitment
+import r1_end_intent
 import r1_guard
 import r1_negotiation
 import r1_personas
@@ -105,7 +106,13 @@ import r1_world
 #    role-play, not the interview, so L-EXIT and the interviewer's wrap-up follow it and the short
 #    close that ended the whole session (L-END-CLOSE) is deleted.  No other pinned text changed
 #    (L-ASIDE-END is unchanged).
-CONTENT_REVISION = 17
+# 18: owner decision 2026-10-30 (meaning-based end detection): the end-intent classifier's system
+#    prompt and its two context lines (r1_end_intent: END_INTENT_SYSTEM, ROLEPLAY_CONTEXT,
+#    AFTER_ASIDE_CONTEXT) with the prefilter window and the labels.  No spoken line changed: the
+#    brief repeat replays L-TRANSITION and the post-pickup brief request plays L-ASIDE-COACH.
+#    Reviewed fix, same unreleased revision: the prompt's "no" also covers talk about the learner's
+#    OWN job interviews, and its tie-break names THIS interview with Christy or this role-play.
+CONTENT_REVISION = 18
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -369,6 +376,13 @@ def manifest() -> dict[str, Any]:
             "react_how_it_lands": r1_prompts.REACT_HOW_IT_LANDS,
             "reaction_only_note": r1_prompts.REACTION_ONLY_NOTE,
             "forced_note": r1_prompts.FORCED_NOTE,
+        },
+        "end_intent": {
+            "system": r1_end_intent.END_INTENT_SYSTEM,
+            "roleplay_context": r1_end_intent.ROLEPLAY_CONTEXT,
+            "after_aside_context": r1_end_intent.AFTER_ASIDE_CONTEXT,
+            "window_words": r1_end_intent.END_INTENT_WINDOW_WORDS,
+            "labels": list(r1_end_intent.END_INTENT_LABELS),
         },
     }
 

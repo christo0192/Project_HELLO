@@ -2422,6 +2422,8 @@ class TestLatencyLines(unittest.IsolatedAsyncioTestCase):
             our_stages(lines),
             [
                 ("eou_to_turn_hook", 0.7),
+                # The final to the hook: the head start of an end-intent call (2026-10-30).
+                ("final_to_turn_hook", 0.7),
                 ("eou_to_llm_first_token", 1.2),
                 ("llm_ttft", 0.5),
                 ("eou_to_guard_release", 1.6),
@@ -2437,7 +2439,8 @@ class TestLatencyLines(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(line_["turn_index"], reply.candidate_index)
             self.assertEqual(line_["component"], "r1")
         self.assertEqual(latency_lines(lines)[0]["error_category"], "vad")  # the anchor kind
-        kinds = {line_["error_category"] for line_ in latency_lines(lines)[1:]}
+        self.assertEqual(latency_lines(lines)[1]["error_category"], "vad")  # final_to_turn_hook
+        kinds = {line_["error_category"] for line_ in latency_lines(lines)[2:]}
         self.assertEqual(kinds, {reply.plan.mode.value})
 
     async def test_the_headline_is_reported_once_per_turn(self) -> None:
@@ -2483,7 +2486,9 @@ class TestLatencyLines(unittest.IsolatedAsyncioTestCase):
                 await rig.agent.on_user_turn_completed(
                     None, SimpleNamespace(text_content="No questions, thanks", id="m1")
                 )
-        self.assertEqual(our_stages(lines), [("eou_to_turn_hook", 0.6)])
+        self.assertEqual(
+            our_stages(lines), [("eou_to_turn_hook", 0.6), ("final_to_turn_hook", 0.6)]
+        )
         self.assertEqual(latency_lines(lines)[0]["phase"], "wrapup")
 
     async def test_the_sdks_own_timings_are_logged_beside_ours(self) -> None:
