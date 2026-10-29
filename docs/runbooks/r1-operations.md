@@ -1349,6 +1349,9 @@ Switches (all read at use, so a restart is enough; every one is optional):
 | `R1_TTS_FLUSH_MIN_CHARS` | 60 | Early-flush length cap; `0` turns the early-flush `tts_node` off |
 | `R1_LINE_CACHE` | on | `off` speaks every scripted line live, as before PR-4c |
 | `R1_SYNTH_PER_MIN` | 5 | Background Sarvam syntheses started per minute (1-30); raise only after the Sarvam tier is confirmed (D13) |
+| `R1_TTS_PROFILE` | v4 | R1's voices, both at once (read once per session): `v4` is Bulbul v4 Flash (Christy `simran_en_customer`, the learner `zarina_en_conversation`), `v3` is the old voice (`SARVAM_TTS_MODEL` / `SARVAM_TTS_VOICE`) for both; any other value is v3. A Fly **secret** only. **Rollback: `fly secrets set R1_TTS_PROFILE=v3 -a project-hello-voice`** in a zero-live window. See "Voices: Bulbul v4 Flash" below |
+| `R1_TTS_INTERVIEWER_VOICE` / `R1_TTS_LEARNER_VOICE` | empty | v4 only: swap one voice for another id in `r1_tts.V4_SPEAKERS`; anything else is ignored with `r1_tts_setting_rejected`. Fly secrets only |
+| `R1_STT_MODEL` | empty (`saaras:v4`) | R1's STT model: `saaras:v4` (default) or `saaras:v3` (the rollback); anything else falls back to `SARVAM_STT_MODEL` with `r1_stt_setting_rejected` |
 
 ### Interrupting with final-only speech recognition
 
@@ -2007,6 +2010,111 @@ room: join with a Python `rtc` client, have `RoomServiceClient.send_data` (the R
 and assert `packet.participant is None` and `packet.topic == "r1ready"`. A spoken "ready" works either
 way, so a failure here costs the button only, never the interview.
 
+## Voices: Bulbul v4 Flash (owner decision 2026-10-30)
+
+R1 (and only R1: the browser screener and the phone lane are untouched) speaks with Sarvam's
+**Bulbul v4 Flash** (API model id `bulbul:v4-flash`; there is no plain `bulbul:v4`):
+
+| Role | Sarvam persona | Speaker id |
+|---|---|---|
+| Christy, the interviewer (opening, icebreaker, transition, asides, wrap-up, close) | "Simran - A confident and low female voice - Customer support" | `simran_en_customer` |
+| The role-play learner (Priya, Pooja, ...: every role-play reply, L-PICKUP, L-SIL-RP1, the learner filler, L-TIME-CUE) | "Zarina - A deep, full and flowing female voice - Conversational" | `zarina_en_conversation` |
+
+Both ids were confirmed on Sarvam's Voices page and in the live server's own speaker list on
+2026-10-29, and both synthesised live on the pinned plugin (livekit-plugins-sarvam 1.6.4) over the
+two routes R1 uses: the WebSocket stream for live speech, REST for the line cache. No SDK upgrade.
+
+**How it works.** `R1_TTS_PROFILE` (default `v4`) picks a whole voice set, once per session
+(`r1_tts.r1_voice_set`). The session gets ONE Sarvam TTS (`r1_sarvam.R1SarvamTTS`) whose every
+stream speaks the voice bound to its speech: a scripted line by its line table, an LLM reply by the
+plan it was created for (a role-play reply is the learner's even if the phase moves on before it is
+heard). The TTS speaker, the filler, the recovery line and the transcript label all read that one
+value, so they always agree. Under `v3` the session gets the plain `sarvam.TTS(**r1_tts_kwargs())`,
+exactly today's construction, and both roles speak `SARVAM_TTS_VOICE` (`simran`).
+
+**Verify in the logs** (`fly logs -a project-hello-voice`), at the start of each session:
+
+* `r1_tts_profile` with `error_category` `v4` and `model` `bulbul:v4-flash` (or `v3` /
+  `bulbul:v3` after a rollback);
+* two `r1_tts_voice` lines, `error_category` `interviewer` / `learner` and the speaker id as
+  `schema`;
+* the plugin's `Starting TTS WebSocket session` line per segment carries the `speaker` it sent;
+* one benign plugin WARNING `Unknown model 'bulbul:v4-flash', skipping compatibility check` per
+  TTS instance (the session's, plus up to two line-cache synthesizers). It is expected: the plugin
+  predates v4 and skips its speaker check, which is why R1 allowlists its ids itself.
+* Warnings to act on: `r1_tts_setting_rejected` (a refused secret: `profile_unknown`,
+  `interviewer_voice_rejected`, `learner_voice_rejected`), `r1_tts_profile_fallback` (the v4 TTS
+  could not be built; THIS session runs on v3), `r1_tts_voice_unbound` (once per session: a speech
+  R1 could not identify fell back to the phase rule; after an SDK bump this means the speech-handle
+  seam moved, and Christy's lines in role-play would come out in the learner's voice).
+
+**Rollback (no redeploy).** In a zero-live window (a secret change restarts running machines and
+cuts a live interview, as for `R1_RECORDING`):
+
+```
+fly secrets set R1_TTS_PROFILE=v3 -a project-hello-voice
+```
+
+Fly restarts the running machines with the value, and stopped pool machines take it at their next
+start. Confirm the first new session logs `r1_tts_profile` `v3`. Undo (back to v4) with
+`fly secrets unset R1_TTS_PROFILE -a project-hello-voice`. An unknown value (a typo such as `V 3`)
+is v3 too, logged `profile_unknown`: the known-good voice wins.
+
+**Swap one voice** (v4 only): `fly secrets set R1_TTS_LEARNER_VOICE=<id> -a project-hello-voice`
+(or `R1_TTS_INTERVIEWER_VOICE`). The id must be in `r1_tts.V4_SPEAKERS`, the English ids the live
+server listed for bulbul:v4-flash; anything else keeps the default and logs
+`learner_voice_rejected`. Adding an id is a code change on purpose: the plugin does not validate
+v4 ids, and a wrong one is dead air on every line (an in-band 400, retried three times).
+
+**Never split the model from the voice, and never point `SARVAM_TTS_MODEL` at bulbul:v4-flash.**
+Both half-flips fail badly on plugin 1.6.4: bulbul:v3 with a v4 id raises at session start, and
+bulbul:v4-flash with `simran` fails every utterance in-band (dead air). R1's own switch is atomic,
+but under v3 R1 still follows `SARVAM_TTS_MODEL` / `SARVAM_TTS_VOICE` (byte-for-byte today), and
+those are also the browser screener's voice.
+
+**What changes for the candidate.** v4 clips are about 6 dB louder than v3 (REST clips peak near
+0 dBFS; the recorder mixes by int16 sum with clipping, so overlapping speech clips more), and the
+learner (Zarina at pace 1.0) speaks up to about 30% longer per line, which uses more of the
+role-play clock (fewer turns in 20 minutes). The first v4 deploy misses every disk line-cache key
+(the key includes the model and speaker), so each machine re-warms once, at the same request rate
+as today. 1.6.4 cannot send `enable_preprocessing` for v4, so say amounts in words where it
+matters ("nine thousand dollars"); Hindi must be written in Devanagari, never romanised.
+
+**Errors.** Credit exhaustion and a bad speaker reach the TTS WebSocket as an in-band error that
+the plugin raises as status **500** (retryable), not 402: R1's 402 abort does not fire for TTS over
+the socket, the SDK retries, then the 3-failure abort ends the interview. Check the Sarvam credits
+(the Sarvam dashboard) before anything else when TTS fails across sessions.
+
+### Saaras v4 STT (R1 default since 2026-10-30)
+
+R1 runs `saaras:v4` (owner decision 2026-10-30, "directly to production"). `R1_STT_MODEL` (R1 only;
+`agent.py` and the phone lane keep `SARVAM_STT_MODEL`) is the switch, logged per session as
+`r1_stt_model` (`model`). On plugin 1.6.4 `saaras:v4` goes to the LEGACY socket
+`/speech-to-text/ws` with no `mode` parameter. Verified live on 2026-10-30 on the production Sarvam
+account (a one-off machine from the deployed image): exact transcripts, identical to `saaras:v3`
+on the same audio, including "Okay, let's end the interview now."
+
+**Rollback:** `fly secrets set R1_STT_MODEL=saaras:v3 -a project-hello-voice` (zero-live: it
+restarts the machines); undo with `fly secrets unset R1_STT_MODEL -a project-hello-voice`.
+
+To compare the models on real audio later:
+
+1. Top up the Sarvam credits.
+2. A/B, synthetic or consented staff audio only (transcripts are printed), from
+   `app/voice-livekit`:
+   `python tools/r1_stt_ab.py clips/*.wav --env-file .env --json ab-stream.json`
+   (16-bit WAVs at any rate; expected text in a sidecar `CLIP.txt`; the tool prints the audio budget
+   and exits 2 above `--max-audio-seconds`, default 120). Gates for v4: finals are produced, WER no
+   worse than v3, median final latency at most v3 + 0.3 s, no extra fragmentation (finals per clip,
+   `short_finals`).
+3. If v3 is better on real audio: roll back as above.
+4. If v4 fails on the legacy socket: `--transport realtime` measures the realtime endpoint, and only
+   if v4 is clearly better there does a separate PR add an R1 adapter for it (its partial
+   transcripts change barge-in, since `R1_INTERRUPT_MIN_WORDS=0` assumes finals only).
+
+`--transport rest` measures raw model accuracy with no streaming. Exit codes: 0 ok, 2 usage,
+budget or missing key, 3 when a model failed every clip.
+
 ## Incident handling and rollback
 
 For any active R1 incident, set `r1_settings.paused = true` first. Preserve
@@ -2022,6 +2130,10 @@ the merge window, and follow the phone release rollback runbook if phone is
 affected. Additive migrations are disabled rather than dropped; R2 objects are
 kept for retention/DSAR handling. The restored worker must keep R1 routes on
 the R1-only lane; it must not use the legacy session path. (implemented in PR-x)
+
+For a voice problem (the v4 voices, a dead-air TTS), roll the voices back with
+`fly secrets set R1_TTS_PROFILE=v3 -a project-hello-voice` in a zero-live window (see "Voices:
+Bulbul v4 Flash" above).
 
 For video/recording problems, set `r1_settings.recording_mode` to `off` (instant), or to
 `audio` to continue audio-only only when the approved R1 policy permits it; unsetting the

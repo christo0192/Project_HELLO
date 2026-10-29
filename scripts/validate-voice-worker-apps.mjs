@@ -348,6 +348,13 @@ ok(!hasEnvKey(phoneCfg, "BROWSER_WORKER_ONE_JOB"), "fly.phone.toml must NOT set 
 for (const key of ["R1_RECORDING", "R1_VIDEO_RECORDING", "R1_VIDEO_X264_PRESET"]) {
   ok(!hasEnvKey(browser, key), `fly.toml must leave ${key} absent: R1 recording is switched on only by a Fly secret at the reviewed enable step (a fly.toml value would ship it with a deploy and defeat the instant rollback)`);
 }
+// R1 voices and the STT trial (owner decision 2026-10-30). Like R1_RECORDING these are Fly SECRETS,
+// never [env]: the code default (Bulbul v4 Flash) ships with the deploy, and an [env] value would
+// shadow `fly secrets set R1_TTS_PROFILE=v3`, the no-redeploy rollback. R1_STT_MODEL stays unset on
+// project-hello-voice until the Saaras v4 trial passes and the owner decides.
+for (const key of ["R1_TTS_PROFILE", "R1_TTS_INTERVIEWER_VOICE", "R1_TTS_LEARNER_VOICE", "R1_STT_MODEL"]) {
+  ok(!hasEnvKey(browser, key), `fly.toml must leave ${key} absent: R1's voices and STT trial are switched only by a Fly secret (an [env] value would shadow the R1_TTS_PROFILE=v3 rollback secret)`);
+}
 ok(!hasEnvKey(browser, "R1_READINESS_HOST"), "fly.toml must leave R1_READINESS_HOST absent: the live Cloud browser worker is already named and orchestrated, and this opt-in (post-registration readiness + the livekit_host report) is set only at the reviewed R1 cutover, after the host-aware API is deployed — shipping it in fly.toml would change the live Cloud lane and break it against an older API's strict /ready-machine schema");
 ok(!hasEnvKey(phoneCfg, "R1_READINESS_HOST"), "fly.phone.toml must NOT set R1_READINESS_HOST — the R1 readiness contract is browser-only and never a phone setting");
 for (const key of envKeys(phoneCfg)) {

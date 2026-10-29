@@ -404,8 +404,198 @@ class TestModuleSurface(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom):
                 imported.add((node.module or "").split(".")[0])
         self.assertEqual(
-            imported, {"__future__", "contextlib", "inspect", "os", "typing"}
+            imported,
+            {"__future__", "contextlib", "contextvars", "dataclasses", "inspect", "os", "typing"},
         )
+
+
+VOICE_ENV = (
+    "R1_TTS_PROFILE",
+    "R1_TTS_INTERVIEWER_VOICE",
+    "R1_TTS_LEARNER_VOICE",
+    "SARVAM_TTS_MODEL",
+    "SARVAM_TTS_VOICE",
+)
+TODAY = {"model": "bulbul:v3", "speaker": "simran", "pace": 1.0, "temperature": 0.8}
+
+
+class TestVoices(unittest.TestCase):
+    """R1's two voices (owner decision 2026-10-30): one atomic switch, an allowlist, no mixing."""
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in VOICE_ENV:
+            os.environ.pop(key, None)
+
+    def test_the_v3_profile_is_todays_voice_exactly(self) -> None:
+        os.environ["R1_TTS_PROFILE"] = "v3"
+        os.environ["R1_TTS_INTERVIEWER_VOICE"] = "shalini_en_customer"  # ignored under v3
+        os.environ["R1_TTS_LEARNER_VOICE"] = "neha_en_customer"
+        voices = r1_tts.r1_voice_set()
+        self.assertEqual(voices.profile, "v3")
+        self.assertEqual(r1_tts_kwargs(), TODAY)
+        for role in r1_tts.VOICES:
+            self.assertEqual(voices.kwargs(role), TODAY)
+        self.assertEqual(voices.notes, ())
+        self.assertFalse(voices.distinct)
+        # It still follows the browser lane's variables, exactly as today.
+        os.environ["SARVAM_TTS_MODEL"] = "bulbul:v2"
+        os.environ["SARVAM_TTS_VOICE"] = "anushka"
+        voices = r1_tts.r1_voice_set()
+        self.assertEqual(voices.kwargs("learner"), r1_tts_kwargs())
+        self.assertEqual(voices.speaker("interviewer"), "anushka")
+        self.assertEqual(voices.model, "bulbul:v2")
+
+    def test_an_unset_profile_is_v4_with_the_owner_voices(self) -> None:
+        os.environ["SARVAM_TTS_MODEL"] = "bulbul:v3"  # the screener's voice: ignored by v4
+        os.environ["SARVAM_TTS_VOICE"] = "simran"
+        for raw in (None, "", "v4", " V4 ", "v4\n"):
+            with self.subTest(raw=raw):
+                if raw is None:
+                    os.environ.pop("R1_TTS_PROFILE", None)
+                else:
+                    os.environ["R1_TTS_PROFILE"] = raw
+                voices = r1_tts.r1_voice_set()
+                self.assertEqual(voices.profile, "v4")
+                self.assertEqual(
+                    voices.kwargs("interviewer"),
+                    {"model": "bulbul:v4-flash", "speaker": "simran_en_customer", "pace": 1.0},
+                )
+                self.assertEqual(
+                    voices.kwargs("learner"),
+                    {"model": "bulbul:v4-flash", "speaker": "zarina_en_conversation", "pace": 1.0},
+                )
+                self.assertNotIn("temperature", voices.kwargs("learner"))
+                self.assertEqual(voices.notes, ())
+                self.assertTrue(voices.distinct)
+        for raw in ("v3", " V3 ", "v3\n"):
+            with self.subTest(raw=raw):
+                os.environ["R1_TTS_PROFILE"] = raw
+                self.assertEqual(r1_tts.r1_voice_set().profile, "v3")
+
+    def test_an_unknown_profile_falls_back_to_v3_and_says_so(self) -> None:
+        for raw in ("bulbul-v4", "4", "on", "v5", "bulbul:v4-flash"):
+            with self.subTest(raw=raw):
+                os.environ["R1_TTS_PROFILE"] = raw
+                voices = r1_tts.r1_voice_set()
+                self.assertEqual(voices.profile, "v3")
+                self.assertEqual(voices.kwargs("learner"), TODAY)
+                self.assertEqual(voices.notes, ("profile_unknown",))
+
+    def test_voice_overrides_apply_in_v4_only_and_only_from_the_allowlist(self) -> None:
+        os.environ["R1_TTS_LEARNER_VOICE"] = "neha_en_customer"
+        os.environ["R1_TTS_INTERVIEWER_VOICE"] = " shalini_en_customer "
+        voices = r1_tts.r1_voice_set()
+        self.assertEqual(voices.speaker("learner"), "neha_en_customer")
+        self.assertEqual(voices.speaker("interviewer"), "shalini_en_customer")
+        self.assertEqual(voices.notes, ())
+        for bad in ("simran", "nobody_en_test", "  ", "\t", "Zarina_en_conversation"):
+            with self.subTest(bad=bad):
+                os.environ["R1_TTS_LEARNER_VOICE"] = bad
+                os.environ["R1_TTS_INTERVIEWER_VOICE"] = bad
+                voices = r1_tts.r1_voice_set()
+                self.assertEqual(voices.speaker("learner"), "zarina_en_conversation")
+                self.assertEqual(voices.speaker("interviewer"), "simran_en_customer")
+                self.assertEqual(
+                    voices.notes, ("interviewer_voice_rejected", "learner_voice_rejected")
+                )
+        os.environ["R1_TTS_LEARNER_VOICE"] = ""
+        os.environ["R1_TTS_INTERVIEWER_VOICE"] = ""
+        voices = r1_tts.r1_voice_set()
+        self.assertEqual(voices.notes, ())
+        self.assertEqual(voices.speaker("learner"), "zarina_en_conversation")
+
+    def test_both_voices_always_share_one_model(self) -> None:
+        profiles = (None, "", "v4", "v3", "V3", "bogus")
+        overrides = (None, "", "simran", "neha_en_customer", "nobody_en_test")
+        for profile in profiles:
+            for interviewer in overrides:
+                for learner in overrides:
+                    for key, value in (
+                        ("R1_TTS_PROFILE", profile),
+                        ("R1_TTS_INTERVIEWER_VOICE", interviewer),
+                        ("R1_TTS_LEARNER_VOICE", learner),
+                    ):
+                        if value is None:
+                            os.environ.pop(key, None)
+                        else:
+                            os.environ[key] = value
+                    voices = r1_tts.r1_voice_set()
+                    with self.subTest(profile=profile, interviewer=interviewer, learner=learner):
+                        self.assertEqual(
+                            voices.kwargs("interviewer")["model"], voices.kwargs("learner")["model"]
+                        )
+                        if voices.model == "bulbul:v4-flash":
+                            # never a v3 short name on v4, the in-band 400 of a half-flip
+                            for role in r1_tts.VOICES:
+                                self.assertIn(voices.speaker(role), r1_tts.V4_SPEAKERS)
+                        else:
+                            self.assertEqual(voices.kwargs("learner"), r1_tts_kwargs())
+        with self.assertRaises(ValueError):
+            r1_tts.R1VoiceSet(
+                "v4",
+                {"model": "bulbul:v4-flash", "speaker": "simran_en_customer"},
+                {"model": "bulbul:v3", "speaker": "simran"},
+            )
+
+    def test_the_default_ids_are_allowlisted_and_the_v3_short_name_is_not(self) -> None:
+        self.assertEqual(r1_tts.V4_MODEL, "bulbul:v4-flash")
+        self.assertEqual(
+            dict(r1_tts.V4_DEFAULT_SPEAKERS),
+            {"interviewer": "simran_en_customer", "learner": "zarina_en_conversation"},
+        )
+        for speaker in r1_tts.V4_DEFAULT_SPEAKERS.values():
+            self.assertIn(speaker, r1_tts.V4_SPEAKERS)
+        self.assertNotIn("simran", r1_tts.V4_SPEAKERS)
+        self.assertNotIn("nobody_en_test", r1_tts.V4_SPEAKERS)
+        for speaker in r1_tts.V4_SPEAKERS:
+            self.assertRegex(speaker, r"^[a-z]+_en(hi)?_[a-z_]+$")
+
+    def test_a_voice_set_hands_out_copies_and_an_unknown_role_is_the_interviewer(self) -> None:
+        voices = r1_tts.r1_voice_set()
+        copy = voices.kwargs("learner")
+        copy["speaker"] = "mutated"
+        self.assertEqual(voices.speaker("learner"), "zarina_en_conversation")
+        self.assertEqual(voices.kwargs("narrator"), voices.kwargs("interviewer"))
+        self.assertEqual(voices.kwargs(None), voices.kwargs("interviewer"))
+        self.assertEqual(r1_tts.voice_role("learner"), "learner")
+        self.assertEqual(r1_tts.voice_role("Learner"), "interviewer")
+        self.assertEqual(r1_tts.legacy_voice_set().kwargs("learner"), r1_tts_kwargs())
+
+
+class TestBoundVoice(unittest.IsolatedAsyncioTestCase):
+    async def test_a_bound_voice_is_local_to_its_task(self) -> None:
+        self.assertIsNone(r1_tts.current_voice())
+        seen: dict[str, list] = {}
+        gate = asyncio.Event()
+
+        async def speech(name: str, voice: str) -> None:
+            r1_tts.bind_voice(voice)
+            seen.setdefault(name, []).append(r1_tts.current_voice())
+            await gate.wait()  # the other speech binds its own voice meanwhile
+            seen[name].append(r1_tts.current_voice())
+
+            async def child() -> str | None:  # a task the speech starts inherits it
+                return r1_tts.current_voice()
+
+            seen[name].append(await asyncio.create_task(child()))
+
+        first = asyncio.create_task(speech("a", "learner"))
+        second = asyncio.create_task(speech("b", "interviewer"))
+        await asyncio.sleep(0)
+        gate.set()
+        await asyncio.gather(first, second)
+        self.assertEqual(seen, {"a": ["learner"] * 3, "b": ["interviewer"] * 3})
+        self.assertIsNone(r1_tts.current_voice())  # nothing leaked into this task
+
+    async def test_an_unknown_voice_binds_nothing(self) -> None:
+        async def speech() -> str | None:
+            r1_tts.bind_voice("narrator")
+            return r1_tts.current_voice()
+
+        self.assertIsNone(await asyncio.create_task(speech()))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,11 @@ Isolated, throwaway LiveKit Agents worker to test whether migrating off Pipecat
 that remains the rollback path.
 
 Stack: Sarvam STT (`saaras:v3`, en-IN) + Sarvam TTS (`bulbul:v3`, speaker `simran`)
-+ DeepSeek/OpenAI-compatible LLM. Turn handling uses LiveKit Agents defaults.
++ DeepSeek/OpenAI-compatible LLM. Turn handling uses LiveKit Agents defaults. R1 alone
+speaks Bulbul v4 Flash (`bulbul:v4-flash`: Christy `simran_en_customer`, the learner
+`zarina_en_conversation`), switched back to the line above by the secret `R1_TTS_PROFILE=v3`
+(`docs/runbooks/r1-operations.md`, "Voices: Bulbul v4 Flash"); its Saaras v4 STT trial
+(`R1_STT_MODEL`, `tools/r1_stt_ab.py`) stays off in production.
 
 The mature Christy screening prompt from the Pipecat implementation has been ported
 into this worker: on-request AI disclosure, five-minute screening discipline, role-specific
