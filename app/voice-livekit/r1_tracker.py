@@ -693,7 +693,8 @@ _YOU_ASK = r"(?:can|could|would|will) you"
 _END_ASK = rf"(?:please|let'?s|let us|{_I_WANT})"
 # Asking leave to end the exercise (owner test 1eb18cd4, 75: "Can we end this interview? Can we end
 # this role play?").  Only with _META_OBJECT: "can we end the call here, I'll send the details" is
-# the advisor closing the sale's own call.
+# the advisor closing the sale's own call.  It opens its clause (_ASK_OPENER), so a question about
+# ending is no request: "When can we end the interview?", "How can we end the role play?".
 _WE_ASK = r"(?:can|could|shall|may) we"
 # The object ends its clause ("... the call?", "... the call now", "... the call, please"), so "the
 # call recording" or "the call with a quick recap" is not the call being ended.  "For now" and "for
@@ -711,6 +712,13 @@ _END_FILLER = (
     r"please)"
 )
 _END_OPENER = rf"(?:{_END_FILLER}[,.\s]+|(?!{_END_FILLER}\b)\w+,\s+){{0,8}}"
+# What may come before "can we ..." (and before an explicit request, _EXPLICIT_END): the same, and a
+# few words speech-to-text often leaves without their comma ("sorry can we end the interview", "hmm
+# can we stop the role play").  The we-form opens its sentence or follows a comma, so a wh-word or
+# "at what point" before it never matches (reviewed fix: "When can we end the interview?" and "How
+# can we end the role play?" ended the role-play at once, as explicit requests).
+_ASK_FILLER = rf"(?:{_END_FILLER}|sorry|hmm+|and|but|also)"
+_ASK_OPENER = rf"(?:{_ASK_FILLER}[,.\s]+|(?!{_ASK_FILLER}\b)\w+,\s+){{0,8}}"
 # "I want to stop" is a request only as a whole sentence, with nothing after it but now or here,
 # the call, the interview or the role play, and please or thanks (reviewed fix: "I want to stop
 # here and summarise what we discussed" and "Okay Priya, I want to stop here, what's your budget?"
@@ -739,7 +747,8 @@ _END_REQUEST = tuple(
     for pattern in (
         rf"\b{_YOU_ASK} (?:please |just |kindly )?{_END_VERB} {_END_OBJECT}{_CLAUSE_END}",
         rf"\b{_END_ASK} (?:please |just |kindly )?{_END_VERB} {_META_OBJECT}{_CLAUSE_END}",
-        rf"\b{_WE_ASK} (?:please |just |kindly )?{_END_VERB} {_META_OBJECT}{_CLAUSE_END}",
+        rf"(?:^|[,;:]\s*){_ASK_OPENER}{_WE_ASK} (?:please |just |kindly )?{_END_VERB} "
+        rf"{_META_OBJECT}{_CLAUSE_END}",
         rf"\b{_END_ASK} (?:please |just |kindly )?(?:disconnect|terminate|cut) {_END_OBJECT}"
         + _CLAUSE_END,
         # "Hang up" ends its clause too: "can you hang up and I will call you back in five
@@ -767,12 +776,28 @@ _END_NEGATED = re.compile(
 # A request that names the exercise itself with an end verb ("End the interview.", "Let's end this
 # interview for now.", "Can we end this role play?"): owner decision 2026-10-29 (owner test
 # 1eb18cd4, 73-81), such a FIRST request is taken as confirmed, with no L-ASIDE-END question,
-# because the question would only ask the candidate to say exactly that.  Read inside a sentence
-# that is itself an end request, after its negated phrases are removed, so "I'll end the interview
-# prep later" or "Let's not end the interview" never count.  "The call", "the session" and "hang
-# up" are not explicit ("can you end the call?" may be the sale's own call): they get the question.
+# because the question would only ask the candidate to say exactly that.  The turn ENDS on it: its
+# last sentence is the request and nothing else (fillers or a name, then "let's", "please", "I want
+# to", "can we" or "can you", the verb and the interview or the role play, then at most "now",
+# "here", "please", "for now", "thanks" and the like), and a last sentence of courtesy alone ("Thank
+# you.") is passed over.  Anything more may be a candidate who wants something else, so it gets
+# the question, which they can answer "carry on" (reviewed fix: "Please stop the interview, I need
+# a moment.", "Can we stop the role play? I want to restart." and "Let's stop the role play here
+# and start over." ended the role-play with no way back).  Negated phrases ("Let's not end the
+# interview") never match.  "The call", "the session" and "hang up" are not explicit ("can you end
+# the call?" may be the sale's own call): they get the question.  Only "end", "finish" and
+# "terminate" are explicit: "stop" and "close" also mean a pause ("I'm confused. Can we stop the
+# role play?"), so they get the question too, which the candidate can answer "carry on" (reviewed
+# fix).
 _EXPLICIT_END = re.compile(
-    rf"\b(?:end|stop|finish|close|terminate) (?:the|this) (?:interview|{_ROLE_PLAY})\b",
+    rf"^{_ASK_OPENER}(?:(?:{_END_ASK}|{_WE_ASK}|{_YOU_ASK}) (?:please |just |kindly )?)?"
+    rf"(?:end|finish|terminate) (?:the|this) (?:interview|{_ROLE_PLAY})"
+    r"(?:[,\s]+(?:now|here|please|right now|immediately|already|for me|then|for now|for today|"
+    r"thanks|thank you))*[\s.!?]*$",
+    re.IGNORECASE,
+)
+_COURTESY_SENTENCE = re.compile(
+    r"^(?:(?:thanks(?: a lot)?|thank you(?: so much| very much)?|please|bye|goodbye)[,.!\s]*)+$",
     re.IGNORECASE,
 )
 
@@ -813,18 +838,26 @@ def detect_end_request(text: object) -> bool:
 
 
 def explicit_end_request(text: object) -> bool:
-    """An end request that names the interview or the role play, with nothing in it declining.
+    """An end request that names the interview or the role play, and that the turn ends on.
 
     "End the interview.", "Okay, let's end this interview for now.", "Can we end this role
-    play?", "I want to stop the interview.": the engine takes such a FIRST request before 14:00 as
-    confirmed, without asking L-ASIDE-END (owner decision 2026-10-29).  A generic request ("can
-    you end the call?", "disconnect the call", "hang up", "I want to stop") is not explicit and
-    still gets the question, and so is anything that also says no, carry on or stay
-    (``declines_end``), or that holds the phrase only negated ("let's not end the interview").
+    play?", "I want to stop the interview. Thank you.": the engine takes such a FIRST request
+    before 14:00 as confirmed, without asking L-ASIDE-END (owner decision 2026-10-29).  The last
+    sentence (after any courtesy alone) must be the request and nothing more (``_EXPLICIT_END``):
+    "Please stop the interview, I need a moment." or "Can we stop the role play? I have a
+    question." still gets the question, and so does a generic request ("can you end the call?",
+    "disconnect the call", "hang up", "I want to stop"), anything that also says no, carry on or
+    stay (``declines_end``), and a phrase held only negated ("let's not end the interview").
     """
     if declines_end(text):
         return False
-    return any(_EXPLICIT_END.search(sentence) for sentence in _end_request_sentences(text))
+    sentences = split_sentences(fold(text))
+    while sentences and _COURTESY_SENTENCE.match(sentences[-1]):
+        sentences.pop()
+    if not sentences:
+        return False
+    last = sentences[-1]
+    return _EXPLICIT_END.match(last) is not None and bool(_end_request_sentences(last))
 
 
 # The answer to L-ASIDE-END, which asks the candidate to SAY "end the interview" to stop, so only

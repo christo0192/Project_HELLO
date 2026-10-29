@@ -678,8 +678,10 @@ class RolePlayEngine:
         # stretch, confirm the stop; anything else resumes the role-play with this very turn, and a
         # backchannel or a speech-to-text fragment ("Hmm", "Okay.") leaves the question open.  A
         # first request that names the interview or the role play ("End the interview.", "Can we
-        # end this role play?"; ``explicit_end_request``) is confirmed at once, without the
-        # question, which would only ask the candidate to say exactly that (owner test 1eb18cd4).
+        # end this role play?"; ``explicit_end_request``) and that the turn ends on is confirmed
+        # at once, without the question, which would only ask the candidate to say exactly that
+        # (owner test 1eb18cd4); one that says more ("Please stop the interview, I need a
+        # moment.") gets the question, so a candidate who wants something else can carry on.
         # A confirmed stop ends the ROLE-PLAY, not the session (owner decision 2026-10-29): the
         # plan is the role-play exit, and L-EXIT and the interviewer's wrap-up follow, as after a
         # farewell exit.  The session completes normally and is scored only if the fidelity checks
@@ -1226,9 +1228,11 @@ class RolePlayEngine:
         early end is scored (R reached 10:00, every family delivered and the rest), so at 5:00 it
         never is.  No new outcome and no new path: a second "bye" before 14:00 reaches this exit
         too.  The turn is excluded from evidence (the scheduler, the tracker and the word counts
-        never see it) and changes no commitment, disclosure or schedule state.  A FIRST request
-        that names the interview or the role play gets here with no question asked: it is then
-        recorded with ``question_asked`` false and the reason ``end_request_explicit``.
+        never see it; the session writes its row as ``aside``, so the API gate's speech-to-text
+        check leaves it out as well) and changes no commitment, disclosure or schedule state.  A
+        FIRST request that names the interview or the role play, and that the turn ends on, gets
+        here with no question asked: it is then recorded with ``question_asked`` false and the
+        reason ``end_request_explicit``.
         """
         reasons = ["end_confirmed"]
         if self._end_aside is None:

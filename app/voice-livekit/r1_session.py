@@ -1142,6 +1142,9 @@ class R1Interview:
         # flight, how many replies the SDK cancelled before any audio, and whether the session
         # runs the transition's quicker endpointing right now.
         self._open_row: _CandidateRow | None = None
+        # The phase the row of the turn ``prepare_turn`` is deciding is written in, when it is not
+        # the phase it was spoken in (an out-of-role stop: ``aside``); None otherwise.
+        self._candidate_row_phase: str | None = None
         # Wall-clock seconds of the latest ``user_state_changed -> speaking`` events (oldest first):
         # the anchors of the candidate's rows (``_candidate_turn_anchor``).
         self._user_speaking_at: deque[float] = deque(maxlen=_USER_SPEECH_ANCHORS_KEPT)
@@ -2552,9 +2555,22 @@ class R1Interview:
         so the plan is computed exactly once and before any generation (preemptive
         generation is off for this agent).
         """
-        # The SDK committed the candidate's turn: the finals it was made of are ONE row now,
-        # written before anything below can raise ``StopResponse``.
-        self._flush_candidate_row()
+        # The SDK committed the candidate's turn: the finals it was made of are ONE row now.  It is
+        # closed here and written in this same call once the turn is decided, whatever the decision
+        # (``StopResponse`` included).  The turn that confirms an out-of-role stop is said to the
+        # interviewer, so its row is ``aside`` (``_plan_learner_reply``): the API gate's
+        # speech-to-text check then leaves it out of the role-play turns, as the engine's own
+        # ``fidelity`` does (reviewed fix: "End interview." counted as a two-word fragment).
+        row = self._close_candidate_row()
+        self._candidate_row_phase = None
+        try:
+            self._decide_turn(text, message_id)
+        finally:
+            self._write_candidate_row(row, self._candidate_row_phase)
+            self._candidate_row_phase = None
+
+    def _decide_turn(self, text: str, message_id: str | None) -> None:
+        """``prepare_turn`` once the candidate's row is closed (it writes the row afterwards)."""
         index = self._latest_candidate_index
         self._latest_candidate_index = None
         seconds = self._take_user_turn_seconds()
@@ -2660,10 +2676,14 @@ class R1Interview:
             self._spawn(self._play_aside(plan))
             raise StopResponse()
         if plan.exit_roleplay:
-            if "end_confirmed" in plan.reasons and entry is not None:
+            if "end_confirmed" in plan.reasons:
                 # An out-of-role stop is said to the interviewer, not to the learner: like the
-                # turns of an aside it stays out of the learner's context (plan 5.10).
-                entry["phase"] = "aside"
+                # turns of an aside it stays out of the learner's context (plan 5.10), and its
+                # transcript row is written as ``aside`` too (``prepare_turn``), so the API gate
+                # reads the same role-play turns as the engine's ``fidelity``.
+                if entry is not None:
+                    entry["phase"] = "aside"
+                self._candidate_row_phase = "aside"
             self._wake()  # the driver's role-play waits re-read the exit and end now
             raise StopResponse()
         if "replanned_after_lost_reply" not in plan.reasons:
@@ -3323,13 +3343,29 @@ class R1Interview:
         one of those (the SDK banked a short fragment and nothing followed) is written at the
         next of them; a crash before that loses at most that one open row.
         """
+        self._write_candidate_row(self._close_candidate_row())
+
+    def _close_candidate_row(self) -> _CandidateRow | None:
+        """Close the open candidate row, if any, and return it (``_write_candidate_row`` writes it).
+
+        Whatever the candidate says next is a new row from here on.
+        """
         row, self._open_row = self._open_row, None
+        if row is not None:
+            # The row is over: speech heard up to its last final is its own, never a later row's.
+            self._raise_anchor_floor(row.last_final_at, commit=True)
+        return row
+
+    def _write_candidate_row(self, row: _CandidateRow | None, phase: str | None = None) -> None:
+        """Write a closed candidate row once, in ``phase`` if given, else in its spoken phase."""
         if row is None:
             return
-        # The row is over: speech heard up to its last final is its own, never a later row's.
-        self._raise_anchor_floor(row.last_final_at, commit=True)
         self._write_turn(
-            row.index, "candidate", " ".join(row.parts), row.phase, started_at_ms=row.started_at_ms
+            row.index,
+            "candidate",
+            " ".join(row.parts),
+            phase or row.phase,
+            started_at_ms=row.started_at_ms,
         )
 
     def _candidate_turn_anchor(self, event: Any) -> int | None:

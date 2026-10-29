@@ -455,6 +455,28 @@ describe('speech-to-text sanity under voice barge-in (owner test 1eb18cd4)', () 
     expect(icebreaker.candidateRoleplayAcknowledgementTurns).toBe(0);
     expect(icebreaker.suspectShare).toBe(0);
   });
+
+  it('leaves out the out-of-role stop, which the worker writes as an aside row', () => {
+    // A confirmed stop exits into the wrap-up and the session is gated as usual. The worker's own
+    // fidelity never counts the turn that confirms it ("End interview.", "Stop.", "I'm done."),
+    // and it writes that row with phase 'aside' (reviewed fix: it was 'roleplay', so a two-word
+    // confirmation was a suspect fragment here and the two checks could disagree).
+    const long = Array.from({ length: 10 }, (_, i) =>
+      turn(i, 'candidate', 'roleplay', 'Our curriculum covers python, sql and machine learning.'));
+    const fragment = turn(20, 'candidate', 'roleplay', 'the price');
+    const stats = computeTranscriptStats([
+      ...long, fragment, turn(21, 'candidate', 'aside', 'End interview.'),
+    ]);
+    expect(stats.candidateRoleplayTurns).toBe(11);
+    expect(stats.suspectShare).toBeCloseTo(1 / 11);
+    expect(stats.suspectShare).toBeLessThan(FAIL_AT);
+    // Written as a role-play row, the same confirmation would have failed the session.
+    const asRoleplay = computeTranscriptStats([
+      ...long, fragment, turn(21, 'candidate', 'roleplay', 'End interview.'),
+    ]);
+    expect(asRoleplay.suspectShare).toBeCloseTo(2 / 12);
+    expect(asRoleplay.suspectShare).toBeGreaterThanOrEqual(FAIL_AT);
+  });
 });
 
 describe('evidence contract (plan 6.2)', () => {

@@ -1028,6 +1028,42 @@ class TestInjectionCannotMoveAPhase(unittest.IsolatedAsyncioTestCase):
                 asked = rig.interview.render_line("L-ASIDE-END") in rig.session.spoken
                 self.assertEqual(asked, then is not None)
 
+    async def test_the_turn_that_stops_the_roleplay_is_written_as_an_aside(self) -> None:
+        # Reviewed fix.  The engine's fidelity never counts the turn that confirms the stop (it is
+        # said to the interviewer, out of role), but its row was written as ``roleplay``, so the API
+        # gate's speech-to-text check counted a short confirmation ("End interview.", "Stop.", "I'm
+        # done.") as a fragment of two words or fewer.  Now that an early end completes and is
+        # gated, the row is ``aside``, as its history entry is; an ordinary turn keeps its phase.
+        for request, answer in (
+            ("Can you end the call?", "End interview."),
+            ("Can you end the call?", "Stop."),
+            ("Can you end the call?", "I'm done."),
+            ("End the interview.", None),  # explicit: no question, the request is the stop
+        ):
+            with self.subTest(request=request, answer=answer):
+                rig = Rig()
+                await rig.start_roleplay()
+                await rig.converse(OPENER, advance=20)
+                task = asyncio.create_task(rig.interview._run_roleplay())
+                await rig.settle()
+                self.assertIsNone(await rig.converse(request, advance=40))
+                if answer is not None:
+                    await rig.until_spoken("L-ASIDE-END")
+                    await rig.settle()
+                    self.assertIsNone(await rig.converse(answer))
+                self.assertIsNone(await asyncio.wait_for(task, 10.0))
+                self.assertTrue(rig.engine.end_confirmed)
+                await rig.settle()
+                rows = {row["text"]: row["phase"] for row in rig.candidate_rows()}
+                self.assertEqual(rows[OPENER], "roleplay")
+                self.assertEqual(rows[answer or request], "aside")
+                stop = rig.engine.admin_log()["early_close"]["end_request"]
+                stop_rows = [
+                    row for row in rig.candidate_rows()
+                    if row["index"] == stop["answer_transcript_turn"]
+                ]
+                self.assertEqual([row["phase"] for row in stop_rows], ["aside"])
+
     async def test_a_no_to_the_question_resumes_the_roleplay(self) -> None:
         rig = Rig()
         await rig.start_roleplay()

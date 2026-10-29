@@ -1414,6 +1414,38 @@ class EndRequestTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertFalse(detect_end_request(text))
 
+    def test_the_we_form_opens_its_clause_so_a_question_about_ending_is_no_request(self):
+        # Reviewed fix: the we-form matched anywhere, so asking HOW or WHEN to end was a request,
+        # and an explicit one (it names the exercise), and ended the role-play at once.  It now
+        # opens its sentence or follows a comma, as the imperative does; these were ignored before
+        # the we-form existed, and they are again.
+        from r1_tracker import detect_end_request, explicit_end_request
+
+        for text in (
+            "When can we end the interview?",
+            "How can we end the role play?",
+            "Christy, how can we stop the role play?",
+            "So when could we stop the role play?",
+            "At what point can we end the interview?",
+            "how can we end this interview",
+            "Until when can we end the interview?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(detect_end_request(text))
+                self.assertFalse(explicit_end_request(text))
+        # Still a request: at the start, after fillers or a name, after a comma, and after the few
+        # words speech-to-text leaves without one.
+        for text in (
+            "Can we end this interview?",
+            "Okay, so can we end the interview now?",
+            "Christy, can we stop the role play?",
+            "Sorry can we end the interview?",
+            "hmm can we stop the role play now",
+            "If I close the deal, can we end the interview?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(detect_end_request(text))
+
     def test_only_a_request_that_names_the_interview_or_the_role_play_is_explicit(self):
         from r1_tracker import detect_end_request, explicit_end_request
 
@@ -1421,11 +1453,11 @@ class EndRequestTests(unittest.TestCase):
             "End the interview.",
             "Let's end the interview.",
             "Can we end this role play?",
-            "I want to stop the interview.",
+            "I want to end the interview.",
             "Please terminate this interview.",
             "Could you finish the role play now?",
-            "Okay, close the interview.",
-            "Christy, stop the role-play please.",
+            "Okay, finish the interview.",
+            "Christy, end the role-play please.",
         ):
             with self.subTest(text=text):
                 self.assertTrue(explicit_end_request(text))
@@ -1439,6 +1471,11 @@ class EndRequestTests(unittest.TestCase):
             "Can you end the session?",
             "I want to quit the interview.",
             "Could we stop this exercise?",
+            # "stop" and "close" may mean a pause: always the question first.
+            "I want to stop the interview.",
+            "Okay, close the interview.",
+            "Christy, stop the role-play please.",
+            "Can we stop the role play?",
             "No, let's end the interview.",
             "Let's not end the interview, can you end the call?",
             "End the interview? No, carry on.",
@@ -1456,6 +1493,52 @@ class EndRequestTests(unittest.TestCase):
             "",
         ):
             with self.subTest(text=text):
+                self.assertFalse(explicit_end_request(text))
+
+    def test_an_explicit_request_is_one_the_turn_ends_on_and_nothing_more(self):
+        # Reviewed fix: any sentence naming the interview or the role play with an end verb was
+        # explicit, whatever the turn said after it, so a candidate who wanted a pause, a restart
+        # or an answer ended the role-play with no question and no way back.  Now the last
+        # sentence must be the request alone; everything else still gets L-ASIDE-END.
+        from r1_tracker import detect_end_request, explicit_end_request
+
+        for text in (
+            "So the price is 9000 with EMI. Okay, let's end the interview now please.",
+            "Let's end the interview. Thank you.",
+            "I want to end the interview. Thanks a lot.",
+            "End the interview, thank you.",
+            "Never mind, end the interview.",
+            "Sorry can we end the interview?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(explicit_end_request(text))
+        for text in (
+            # Reviewed fix: "stop" also means a pause, so an intent said BEFORE it is
+            # covered too: the candidate gets the question and can carry on.
+            "I have a question. Can we stop the role play?",
+            "I'm confused. Can we stop the role play?",
+            "can we stop the role play here? I have a question",
+            "Can we stop the role play here? I have a question.",
+            "Stop the role play, what was my brief again?",
+            "let's stop the role play here and start over",
+            "Let's stop the role play here, can I start again?",
+            "Stop the role play. I want to restart.",
+            "Can we stop the role play? I want to restart from the beginning.",
+            "can we stop the interview here for a minute my doorbell rang",
+            "Please stop the interview, I need a moment.",
+            "Wait, stop the role play, I misunderstood the brief.",
+            "yeah so can we stop the role play now because i want to restart",
+            "Please end the interview now and move to the wrap-up phase.",
+            "After this objection, can we end the role play?",
+            # In role, about the learner's own job interview: no request the turn ends on.
+            "Can you finish the interview, then decide on the course?",
+            # "Can you" in a question about when or how was a request before (the question); it
+            # still is, but never an explicit one.
+            "When can you end the interview?",
+            "How can you end the role play?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(detect_end_request(text))
                 self.assertFalse(explicit_end_request(text))
 
     def test_the_question_is_answered_as_speech_to_text_hears_end_the_interview(self):
@@ -1482,15 +1565,30 @@ class EndRequestTests(unittest.TestCase):
         # Reviewed fix (BLOCKER): "okay, " was both a filler and a name in the imperative opener,
         # so each one more doubled the time ("okay, " * 20 + "fine" took 1.2 s, synchronously on
         # the agent's event loop, every role-play turn).  The old code would take years on these.
-        from r1_tracker import confirms_end, declines_end, detect_end_request
+        from r1_tracker import (
+            confirms_end,
+            declines_end,
+            detect_end_request,
+            explicit_end_request,
+        )
 
         mixed = (
             "Yes, yes, okay, so, yeah, right, um, uh, alright, well, actually, please, sure, "
             "fine, now, then, just, okay. Yeah. So, "
         ) * 12
         self.assertGreater(len(mixed), 1000)
-        for text in ("okay, " * 200 + "fine", "yeah, " * 200, mixed + "fine"):
-            for detector in (detect_end_request, confirms_end, declines_end):
+        # The explicit reading's tail ("now", "please", ...) has one reading too.
+        tail = "end the interview" + " now" * 900 + " fine"
+        started = time.perf_counter()
+        self.assertFalse(explicit_end_request(tail))
+        self.assertLess(time.perf_counter() - started, 0.5)
+        for text in (
+            "okay, " * 200 + "fine",
+            "yeah, " * 200,
+            mixed + "fine",
+            "sorry, hmm, and, " * 150 + "fine",
+        ):
+            for detector in (detect_end_request, confirms_end, declines_end, explicit_end_request):
                 with self.subTest(detector=detector.__name__, text=text[:12], chars=len(text)):
                     started = time.perf_counter()
                     self.assertFalse(detector(text))

@@ -1840,7 +1840,9 @@ ended nothing. Both are now answered by the interviewer, Christy, outside the pe
   / role play / session", "can / could / shall / may we ... end / stop the interview / role play /
   exercise" (owner test 1eb18cd4, 75: "Can we end this interview? Can we end this role play?"; the
   we-form takes only those objects, since "can we end the call here, I'll send the details" is an
-  in-role close), "let's / please disconnect / cut the call", "... hang up", and "I want to leave /
+  in-role close, and it opens its sentence or follows a comma, so "When can we end the interview?"
+  or "How can we end the role play?" is an ordinary turn), "let's / please disconnect / cut the
+  call", "... hang up", and "I want to leave /
   quit / stop". The object must end its clause ("the call?", "the call now", and "for now" / "for
   today": owner test 1eb18cd4, 73: "Okay, let's end this interview for now."). The advisor's own
   in-role close stays on the farewell ladder and is not matched: "I'll end the call and send you the
@@ -1854,12 +1856,17 @@ ended nothing. Both are now answered by the interviewer, Christy, outside the pe
     either/or question, so a bare "yes" never has to be interpreted. The text is owner-approved.
   * **A first request that names the interview or the role play is confirmed at once, with no
     question** (owner decision 2026-10-29; `r1_tracker.explicit_end_request`): end / stop / finish /
-    close / terminate + the / this + interview / role play, inside a sentence that is itself a
-    request, not negated, and with nothing in the turn that declines ("no", "carry on", "stay"). In
-    owner test 1eb18cd4 the candidate said "End the interview" and was then asked to say "end the
-    interview". Generic requests ("can you end the call?", "disconnect the call", "hang up", "I want
-    to stop", "can you end the session?") still get the question first. Turn reason
-    `end_request_explicit`, and `early_close.end_request.question_asked` is false.
+    close / terminate + the / this + interview / role play, as the turn's last sentence and nothing
+    more (fillers or a name, "let's" / "please" / "I want to" / "can we" / "can you", the request,
+    then at most "now", "here", "please", "for now", "thanks" and the like; a last sentence of
+    courtesy alone, "Thank you.", is passed over), not negated, and with nothing in the turn that
+    declines ("no", "carry on", "stay"). In owner test 1eb18cd4 the candidate said "End the
+    interview" and was then asked to say "end the interview". A request that says more ("Please stop
+    the interview, I need a moment.", "Can we stop the role play? I want to restart.") gets the
+    question, so a candidate who wants a pause or a restart can carry on. Generic requests ("can you
+    end the call?", "disconnect the call", "hang up", "I want to stop", "can you end the session?")
+    still get the question first. Turn reason `end_request_explicit`, and
+    `early_close.end_request.question_asked` is false.
   * **Only end words confirm** after the question (`confirms_end`: "end the interview", "yes, end it",
     "end it", "stop the interview", "I want to stop", "I'm done", and, as the whole answer only, what
     speech-to-text makes of the asked-for words: "and the interview", "and interview", "end
@@ -1874,7 +1881,9 @@ ended nothing. Both are now answered by the interviewer, Christy, outside the pe
     end the interview the role play should end and the finishing part of christy the interviewer
     should come in. it should not abruptly end the whole interview itself."). The engine plans the
     role-play exit (`TurnMode.EXIT`, turn reason `end_confirmed`, `exit_requested`), the turn that
-    confirmed it stays out of evidence and out of the learner's context, and the session goes on
+    confirmed it stays out of evidence and out of the learner's context (its transcript row is
+    written with phase `aside`, so the gate's speech-to-text check does not count a two-word "End
+    interview." as a fragment, just as the worker's `fidelity` never does), and the session goes on
     exactly as after a farewell exit: `L-EXIT` ("Let's pause the role-play here. I'm stepping out of
     the learner's role now; this is Christy, your interviewer, again. ..."), then `L-WRAP`, the
     wrap-up questions, `L-CLOSE` and the normal completion (`complete`, the session `completed`, a
