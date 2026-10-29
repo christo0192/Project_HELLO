@@ -9,6 +9,9 @@ What is proven here, and how:
 * the uploader: uniform parts cut from a growing file, one request in flight, retry with a fresh
   presigned URL, the bytes kept until a 200, the OGG checkpoint cadence, and the worker's reaction to
   every API answer (discard, stop, retry);
+* the lag watchdog against the line cache's 36 s transition line (10-29: the picture was given up at
+  every transition): played through the SDK's own chain it never holds the event loop, and with the
+  SDK's own VAD listening it trips neither the lag probe nor the VAD guard;
 * the lifecycle (start, stop, finish): order of the finish steps, the ``complete`` report, the
   faststart rules, degraded layouts, discard (spool overwritten and unlinked, encoder killed, no
   further calls), a finish that returns by its deadline with a hung API, and that no log line ever
@@ -96,6 +99,30 @@ def tone_samples(seconds: float, rate: int = 24000, freq: float = 440.0, amp: in
 
 def pcm_of(pieces: list[tuple[int, bytes]]) -> np.ndarray:
     return np.frombuffer(b"".join(pcm for _pts, pcm in pieces), dtype="<i2")
+
+
+# What the SDK spends on the event loop per second of provided (``say(audio=...)``) audio: the
+# resampler to the room rate plus the transcript synchroniser's speaking-rate STFT.  Production
+# (Fly performance-4x, 10-29) took 645 ms before the first audio of the 36.15 s L-TRANSITION.
+SDK_SECONDS_PER_AUDIO_SECOND = 0.018
+
+
+def spin(seconds: float) -> None:
+    """Hold the event loop for ``seconds`` of wall time, as CPU-bound SDK work does."""
+    end = time.perf_counter() + seconds
+    while time.perf_counter() < end:
+        pass
+
+
+def speech_like(seconds: float, rate: int) -> bytes:
+    """Voiced harmonics and noise under a 4 Hz syllable envelope, as int16 PCM.  Never silent, so
+    the SDK's speaking-rate detector does its full STFT on every window (silence returns early)."""
+    t = np.arange(int(seconds * rate)) / rate
+    phase = 2 * np.pi * np.cumsum(180 + 30 * np.sin(2 * np.pi * 0.3 * t)) / rate
+    voiced = sum(np.sin(k * phase) / k for k in range(1, 8))
+    noise = np.random.default_rng(1).standard_normal(len(t)) * 0.3
+    signal = (0.6 * voiced + noise) * 0.125 * (1 + np.sin(2 * np.pi * 4.0 * t)) ** 2
+    return (signal / np.abs(signal).max() * 0.6 * 32767).astype("<i2").tobytes()
 
 
 async def until(predicate, timeout: float = 8.0) -> None:
@@ -821,6 +848,83 @@ class TestRecorderIoOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
             await tap_in.__anext__()
             self.assertEqual(tap_in.take_buf(), [])  # nothing accumulates once capture is closed
             await rec.aclose()
+
+
+class _RoomRateSink(_Sink):
+    """The room's audio output stand-in at its 24 kHz: the SDK resamples 22050 Hz cached audio."""
+
+    def __init__(self) -> None:
+        lk_io.AudioOutput.__init__(
+            self,
+            label="Sink",
+            capabilities=lk_io.AudioOutputCapabilities(pause=True),
+            sample_rate=24000,
+        )
+
+
+class TestCachedLineThroughTheRealSdkChain(unittest.IsolatedAsyncioTestCase):
+    """The transition line's path on the real SDK: line-cache frames -> the SDK's own forwarding
+    task (with its resampler) -> the recorder's tap -> the TranscriptSynchronizer (speaking-rate
+    STFT) -> the room output.  The probe is ``R1Recorder._lag_probe`` on a real ``LagMonitor``."""
+
+    async def test_a_long_cached_line_never_holds_the_event_loop(self) -> None:
+        """Before the fix: one loop turn of 0.6 s or more here (0.645 s in production), a trip.
+
+        The heaviest turn is judged on the loop thread's CPU time, so a test machine that is
+        busy with other processes cannot fail it; the probe itself must not trip either.
+        """
+        from livekit.agents.voice.generation import perform_audio_forwarding
+        from livekit.agents.voice.transcription.synchronizer import TranscriptSynchronizer
+
+        from r1_linecache import PcmClip
+
+        tmp = tempfile.TemporaryDirectory(prefix="r1rec-line-")
+        self.addCleanup(tmp.cleanup)
+        line = PcmClip(speech_like(36.15, 22050), 22050)  # L-TRANSITION, at the cache's rate
+        sync = TranscriptSynchronizer(next_in_chain_audio=_RoomRateSink(), next_in_chain_text=None)
+        rec = r1_recorder.recorder_io_class()(agent_session=SimpleNamespace(), sample_rate=RATE)
+        rec.record_input(_Source())
+        head = rec.record_output(sync.audio_output)
+        monitor = r1_recorder.LagMonitor()
+        host = SimpleNamespace(
+            _mono=time.monotonic,
+            _degraded_reason=None,
+            observe_lag=lambda now, lag: monitor.record(now, max(0.0, lag)),
+        )
+        turns: list[float] = []  # loop-thread CPU seconds of each loop turn
+
+        async def turn_meter() -> None:
+            last = time.thread_time()
+            while True:
+                await asyncio.sleep(0)  # once per loop turn
+                now = time.thread_time()
+                turns.append(now - last)
+                last = now
+
+        with no_forward_ticks():
+            await rec.start(output_path=Path(tmp.name) / "line.ogg")
+            probe = asyncio.ensure_future(R1Recorder._lag_probe(host))
+            meter = asyncio.ensure_future(turn_meter())
+            try:
+                await asyncio.sleep(0.2)
+                forwarding, _out = perform_audio_forwarding(
+                    audio_output=head, tts_output=line.frames()
+                )
+                await forwarding
+                await asyncio.sleep(0.5)  # the speaking-rate stream finishes what it was handed
+            finally:
+                probe.cancel()
+                meter.cancel()
+                await asyncio.gather(probe, meter, return_exceptions=True)
+                await sync.aclose()
+                await asyncio.wait_for(rec.aclose(), 20)
+        self.assertAlmostEqual(sync.audio_output._pushed_duration, 36.15, places=1)  # not vacuous
+        self.assertGreater(len(turns), 100)
+        # Half the limit: measured 31-47 ms here (a GC pass included); 0.6-2.6 s before the fix.
+        self.assertLess(
+            max(turns), r1_recorder.LAG_LIMIT_SECONDS / 2, "one loop turn did the whole line's work"
+        )
+        self.assertFalse(monitor.tripped(time.monotonic()))
 
 
 # ------------------------------------------------------------------------------ doubles
@@ -3378,6 +3482,145 @@ class TestDegrade(VideoCase):
         await asyncio.sleep(0.2)
         time.sleep(0.45)  # the whole loop is stuck
         await until(lambda: recorder.degraded == "cpu_loop_lag", timeout=5)
+        await recorder.finish()
+
+    async def test_the_transition_line_from_the_line_cache_does_not_trip_the_probe(self) -> None:
+        """10-29: every session that reached the transition lost its picture within 3 s of it.
+
+        L-TRANSITION (36.15 s) is played from the line cache.  The SDK stand-in below costs what
+        production measured per second of provided audio (the resampler and the speaking-rate
+        STFT: ~18 ms on Fly) and, like the SDK's channels, drains whatever is queued without
+        suspending; the probe and the degrade are the real ones.  Before the fix the clip came in
+        one loop step, so the drain was one ~650 ms step and the picture was given up.  Handed
+        over unpaced here (``speed=0``: the densest the clip can come), so this is the cut into
+        200 ms steps alone; the rate bound and the VAD guard are the next test's.
+        """
+        from r1_linecache import PcmClip
+
+        recorder, _stream = await self.running()
+        await asyncio.sleep(0.2)  # a few healthy ticks first
+        line = PcmClip(bytes(2 * int(36.15 * 22050)), 22050)
+        queued: asyncio.Queue = asyncio.Queue()
+
+        async def speaking_rate() -> None:  # SpeakingRateStream._main_task
+            while True:
+                audio = await queued.get()
+                spin(audio.duration * SDK_SECONDS_PER_AUDIO_SECOND)
+                queued.task_done()
+
+        worker = asyncio.ensure_future(speaking_rate())
+        try:
+            async for audio in line.frames(speed=0):  # _audio_forwarding_task: never suspends
+                queued.put_nowait(audio)
+            await queued.join()
+            await asyncio.sleep(3 * r1_recorder.LAG_TICK_SECONDS)  # the probe wakes and reports
+        finally:
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+        self.assertIsNone(recorder.degraded)
+        # Well below the limit, not just under it (measured 13-29 ms here; 650 ms or more before).
+        self.assertLess(recorder._lag.worst(recorder._mono()), r1_recorder.LAG_LIMIT_SECONDS / 2)
+        await recorder.finish()
+
+    async def test_the_transition_line_through_the_real_sdk_trips_neither_guard(self) -> None:
+        """The picture has two loop-health guards: the lag probe and the VAD guard.  The SDK
+        times each VAD inference around ``await asyncio.to_thread(predict)``, so a loop that is
+        kept busy reads as slow inference (``cpu_vad_slow``).  Cut into 200 ms steps but handed
+        over unpaced, the 36 s transition line kept the loop busy for its whole hand-over and the
+        VAD guard gave the picture up there (laptop: batch means 30-36 ms against the 12.8 ms
+        limit, a trip 2.3 s into the line, four runs of four); the lag probe no longer did.
+
+        Real here: the SDK's own VAD stream (R1 passes no ``vad``, so the session builds
+        ``inference.VAD("silero")``), fed by the candidate's microphone in real time; both guards
+        as the recorder attaches them; the line's path (the SDK's forwarding task and resampler,
+        the recorder's tap, the TranscriptSynchronizer's speaking-rate STFT).  The one stand-in
+        is the native Silero predict, which runs off the loop with the GIL released.
+        """
+        from livekit.agents.inference import vad as inference_vad
+        from livekit.agents.voice.generation import perform_audio_forwarding
+        from livekit.agents.voice.transcription.synchronizer import TranscriptSynchronizer
+
+        import r1_linecache
+        from r1_linecache import PcmClip
+
+        class NativeVad:
+            def predict(self, _window) -> float:
+                time.sleep(0.0005)
+                return 0.01  # silence: the candidate is listening
+
+        with mock.patch.object(inference_vad, "_NativeVAD", NativeVad):
+            vad = inference_vad.VAD(model="silero")
+            listening = vad.stream()
+        means: list[float] = []  # mean inference seconds of each metrics batch (~1 s each)
+        vad.on("metrics_collected", lambda m: means.append(m.inference_duration_total / m.inference_count))
+        # Built before the recorder's probe starts: making 36 s of audio holds the loop ~0.2 s.
+        tmp = tempfile.TemporaryDirectory(prefix="r1rec-vad-")
+        self.addCleanup(tmp.cleanup)
+        line = PcmClip(speech_like(36.15, 22050), 22050)  # L-TRANSITION, at the cache's rate
+        sync = TranscriptSynchronizer(next_in_chain_audio=_RoomRateSink(), next_in_chain_text=None)
+        rec = r1_recorder.recorder_io_class()(agent_session=SimpleNamespace(), sample_rate=RATE)
+        rec.record_input(_Source())
+        head = rec.record_output(sync.audio_output)
+        self.session.vad = vad
+        recorder, _stream = await self.running()
+        self.assertIs(recorder._vad, vad)  # the recorder attached the guard to the real VAD
+        lags: list[tuple[float, float]] = []  # (when, lag) of every probe tick
+        observe = recorder.observe_lag
+
+        def observe_and_keep(now: float, lag: float) -> None:
+            lags.append((now, lag))
+            observe(now, lag)
+
+        recorder.observe_lag = observe_and_keep  # the probe looks it up on every tick
+
+        async def microphone() -> None:  # the room input: 50 ms frames at 24 kHz, in real time
+            noise = np.random.default_rng(3)
+            began, sent = time.monotonic(), 0
+            while True:
+                while sent * 0.05 <= time.monotonic() - began:
+                    pcm = (noise.standard_normal(1200) * 30).astype("<i2").tobytes()
+                    listening.push_frame(
+                        rtc.AudioFrame(data=pcm, sample_rate=24000, num_channels=1, samples_per_channel=1200)
+                    )
+                    sent += 1
+                await asyncio.sleep(0.01)
+
+        async def recognition() -> None:  # the SDK's consumer of the VAD events
+            async for _event in listening:
+                pass
+
+        with no_forward_ticks():
+            await rec.start(output_path=Path(tmp.name) / "line.ogg")
+            tasks = [asyncio.ensure_future(microphone()), asyncio.ensure_future(recognition())]
+            try:
+                await until(lambda: len(means) >= 2, timeout=10)  # healthy batches first
+                before = len(means)
+                began = time.monotonic()
+                forwarding, _out = perform_audio_forwarding(audio_output=head, tts_output=line.frames())
+                await forwarding
+                handed_over = time.monotonic() - began
+                await asyncio.sleep(1.5)  # the batch that covers the end of the hand-over
+                during = means[before:]
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+                await listening.aclose()
+                await sync.aclose()
+                await asyncio.wait_for(rec.aclose(), 20)
+        self.assertAlmostEqual(sync.audio_output._pushed_duration, 36.15, places=1)  # not vacuous
+        # Paced: the hand-over is spread over seconds, not packed into one busy stretch.
+        spread = (36.15 - r1_linecache.FRAME_LEAD_SEC) / r1_linecache.FRAME_SPEED
+        self.assertGreater(handed_over, spread - 0.1)
+        self.assertGreaterEqual(len(during), int(spread))  # the guard judged the whole hand-over
+        self.assertIsNone(recorder.degraded)
+        # Not one batch even slow, where the guard needs two in a row (paced: 3-6.5 ms here;
+        # unpaced: 16.8 ms on an idle laptop, 30-36 ms on a busy one).
+        limit = r1_recorder.VAD_LOAD_FRACTION * r1_recorder.VAD_WINDOW_SECONDS
+        self.assertLess(max(during), limit, [round(mean * 1000, 2) for mean in during])
+        line_lags = [lag for when, lag in lags if when >= began]
+        self.assertGreater(len(line_lags), 50)
+        self.assertLess(max(line_lags), r1_recorder.LAG_LIMIT_SECONDS / 2)
         await recorder.finish()
 
     async def test_a_healthy_loop_does_not_trip_the_probe(self) -> None:

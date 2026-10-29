@@ -11,6 +11,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import time
 import unittest
 import wave
 from pathlib import Path
@@ -284,6 +285,154 @@ class TestPcmClip(unittest.IsolatedAsyncioTestCase):
         source = clip(0.02, channels=2)
         _ = [frame async for frame in source.frames(make)]
         self.assertEqual(built, [(len(source.pcm), len(source.pcm) // 4)])
+
+    @staticmethod
+    async def consumed_by_turn(
+        source: PcmClip, **options
+    ) -> tuple[list[tuple[int, float, bytes]], dict[int, int], float]:
+        """Consume ``source`` as the SDK does (no await of its own) while a ticker counts turns.
+
+        Returns every frame's ``(turn, loop time it was built, data)``, the number of frames built
+        in each loop turn (what the SDK gets to work through in one step) and the wall time the
+        whole clip took.  ``options`` go to ``frames``.
+        """
+        turns = 0
+        loop = asyncio.get_running_loop()
+
+        async def ticker() -> None:
+            nonlocal turns
+            while True:
+                turns += 1
+                await asyncio.sleep(0)
+
+        built: list[tuple[int, float, bytes]] = []
+
+        def make(data, rate, channels, samples):
+            built.append((turns, loop.time(), data))
+            return None
+
+        task = asyncio.ensure_future(ticker())
+        await asyncio.sleep(0)
+        started = time.monotonic()
+        try:
+            _ = [frame async for frame in source.frames(make, **options)]
+        finally:
+            task.cancel()
+        elapsed = time.monotonic() - started
+        per_turn: dict[int, int] = {}
+        for turn, _t, _data in built:
+            per_turn[turn] = per_turn.get(turn, 0) + 1
+        return built, per_turn, elapsed
+
+    async def test_a_long_clip_hands_the_event_loop_back_every_few_frames(self) -> None:
+        """The 10-29 regression: the 36 s L-TRANSITION went to the SDK in ONE loop step (all 1808
+        frames), whose per-frame work then blocked the loop and stopped the recording's video.
+        Unpaced here (``speed=0``), so this is the cut into steps alone, at its densest."""
+        source = clip(36.15)  # L-TRANSITION's length, at the cache's 22050 Hz
+        built, per_turn, elapsed = await self.consumed_by_turn(source, speed=0)
+        self.assertEqual(len(built), 1808)
+        self.assertLessEqual(max(per_turn.values()), r1_linecache.FRAME_YIELD_EVERY)
+        self.assertEqual(b"".join(data for _turn, _t, data in built), source.pcm)  # the same audio
+        self.assertLess(elapsed, 5.0)  # speed 0: no pacing at all
+
+    async def test_a_clip_goes_out_at_a_bounded_rate(self) -> None:
+        """The first ``FRAME_LEAD_SEC`` at once, then never more than ``FRAME_SPEED`` times real
+        time.  Unpaced (cut into steps only), the SDK's per-frame work on the 36 s transition was
+        one back-to-back burst that saturated the loop until the whole line was handed over, and
+        the recorder's VAD guard (``cpu_vad_slow``, which times inference ON the loop) gave the
+        picture up there instead of the lag probe."""
+        lead, speed = r1_linecache.FRAME_LEAD_SEC, r1_linecache.FRAME_SPEED
+        seconds = 5.0
+        source = clip(seconds)
+        built, per_turn, elapsed = await self.consumed_by_turn(source)
+        self.assertEqual(b"".join(data for _turn, _t, data in built), source.pcm)
+        self.assertLessEqual(max(per_turn.values()), r1_linecache.FRAME_YIELD_EVERY)
+        # A timer may fire up to the loop clock's resolution early (15.6 ms on Windows).
+        early = time.get_clock_info("monotonic").resolution + 0.002
+        first = built[0][1]
+        bytes_per_second = 2.0 * RATE
+        offset = 0
+        for index, (_turn, t, data) in enumerate(built):
+            starts_at = offset / bytes_per_second  # audio seconds already out before this frame
+            self.assertLessEqual(starts_at, lead + speed * (t - first + early), f"frame {index}")
+            if starts_at <= lead:
+                self.assertLess(t - first, 0.25, f"frame {index} is in the lead: it goes at once")
+            offset += len(data)
+        last_starts_at = (offset - len(built[-1][2])) / bytes_per_second
+        self.assertGreaterEqual(elapsed, (last_starts_at - lead) / speed - early)
+        self.assertLess(elapsed, 3.0)
+        # The trade the defaults make on the transition line (36.15 s): its audio input ends in
+        # its first quarter (the live captions learn the line's rate then; real time: in its last
+        # second), and the SDK's work on it is spread over more than five VAD metric batches.
+        hand_over = (36.15 - lead) / speed
+        self.assertLess(hand_over, 36.15 / 4)
+        self.assertGreater(hand_over, 5.0)
+
+    async def test_a_clip_without_a_rate_is_not_paced_and_does_not_raise(self) -> None:
+        """The cache never plays one (``valid()`` rejects it); the pacing must not divide by it."""
+        built: list[int] = []
+        source = PcmClip(b"\x01\x00" * 30, 0)
+        _ = [frame async for frame in source.frames(lambda d, r, c, s: built.append(s))]
+        self.assertEqual(sum(built), 30)
+
+    async def test_a_short_clip_goes_out_whole_in_one_step(self) -> None:
+        built, per_turn, _elapsed = await self.consumed_by_turn(clip(0.2))  # 10 frames: one piece
+        self.assertEqual(len(built), r1_linecache.FRAME_YIELD_EVERY)
+        self.assertEqual(len(per_turn), 1)
+
+    async def test_cancelling_a_clip_mid_way_ends_it_cleanly(self) -> None:
+        """What an interruption or a closed session does to the SDK's forwarding task."""
+        built: list[int] = []
+        frames = clip(2.0).frames(lambda data, rate, channels, samples: built.append(samples))
+
+        async def forward() -> None:  # the SDK's _audio_forwarding_task, reduced
+            try:
+                async for _frame in frames:
+                    pass
+            finally:
+                await frames.aclose()
+
+        task = asyncio.ensure_future(forward())
+        await asyncio.sleep(0)  # the task runs up to its first hand-back
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertTrue(0 < len(built) < 100, len(built))  # stopped mid-clip
+        count = len(built)
+        await asyncio.sleep(0.01)
+        self.assertEqual(len(built), count)  # nothing more is built
+        with self.assertRaises(StopAsyncIteration):
+            await frames.__anext__()
+
+    async def test_cancelling_a_clip_while_it_waits_for_its_rate_ends_it_cleanly(self) -> None:
+        """Past the lead the clip spends most of its time waiting for its rate: a barge-in or a
+        closed session lands in that wait, and the generator ends there."""
+        built: list[int] = []
+        source = clip(10.0)  # 500 frames: 50 in the lead, the rest over about 2.25 s
+        frames = source.frames(lambda data, rate, channels, samples: built.append(samples))
+
+        async def forward() -> None:
+            try:
+                async for _frame in frames:
+                    pass
+            finally:
+                await frames.aclose()
+
+        lead_frames = int(r1_linecache.FRAME_LEAD_SEC * 1000 / r1_linecache.FRAME_MS)
+        task = asyncio.ensure_future(forward())
+        deadline = time.monotonic() + 5.0
+        while len(built) <= lead_frames + 5 and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        self.assertGreater(len(built), lead_frames + 5)  # paced now, not in the lead
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        count = len(built)
+        self.assertLess(count, 400)  # stopped mid-clip
+        await asyncio.sleep(0.1)  # longer than any one wait at four times real time
+        self.assertEqual(len(built), count)  # nothing more is built
+        with self.assertRaises(StopAsyncIteration):
+            await frames.__anext__()
 
 
 class TestWavFiles(unittest.TestCase):

@@ -2161,6 +2161,10 @@ class R1Interview:
             error_category="live" if clip is None else "cached",
             schema=marker,
         )
+        # ``frames()`` hands the audio over at a bounded rate (1 s at once, then at most four
+        # times real time).  Handed over in one step, the SDK's per-frame work on the 36 s
+        # L-TRANSITION blocked the loop for ~0.65 s before its first audio, and the recorder gave
+        # the video up at every transition; as one back-to-back burst it tripped the VAD guard.
         return None if clip is None else clip.frames()
 
     def _warm_specs(self, *, candidate_free: bool) -> list[LineSpec]:
