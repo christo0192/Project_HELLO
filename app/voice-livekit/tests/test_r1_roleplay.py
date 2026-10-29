@@ -6597,7 +6597,52 @@ class EndIntentPlanTests(unittest.TestCase):
         s.say(T64_DISCONNECT, 300)
         plan = s.say("Yes.", 305)
         self.assertFalse(ended(plan))
-        self.assertTrue(s.eng.end_question_open)  # a fragment leaves the question open
+        self.assertFalse(plan.aside)
+        # A fragment leaves the question pending (end words still confirm it), but the learner
+        # answered it in role, so it is no longer the question a bare yes answers.
+        self.assertFalse(s.eng.end_question_open)
+        self.assertTrue(ended(s.say("End it.", 310)))
+
+    def test_a_yes_after_the_learner_answered_a_fragment_is_said_to_her(self):
+        # Reviewed fix: "Okay." left L-ASIDE-END open while the learner replied in role, so a plain
+        # "Yes." to her a line later confirmed the stop (unscored before 10:00).
+        for fragment in ("Hmm.", "Okay.", "Uh", "Yeah okay", "Sorry?", "Hello?"):
+            with self.subTest(fragment=fragment):
+                s = self.started()
+                self.assertTrue(s.say(T64_DISCONNECT, 300).aside)
+                self.assertTrue(s.eng.end_question_open)
+                reply = s.say(fragment, 302)
+                self.assertFalse(plan_is_aside_or_end(reply))
+                self.assertFalse(s.eng.end_question_open)
+                plan = s.say("Yes.", 310, confirmed_yes=True)
+                self.assertFalse(ended(plan), plan.reasons)
+                self.assertFalse(s.eng.exit_requested)
+
+    def test_a_model_verdict_after_the_learner_answered_a_fragment_never_exits(self):
+        # Reviewed fix: the in-role turn after "Okay." and her reply still counted a model-only
+        # "maybe" as an answer to the question and ended the role-play.
+        text = "So Priya, once you finish the course you will clear the interview easily."
+        for verdict in ("end", "maybe"):
+            with self.subTest(verdict=verdict):
+                s = self.started()
+                s.say(T64_DISCONNECT, 300)
+                s.say("Okay.", 302)
+                plan = s.say(text, 320, turn_index=50, end_intent=verdict)
+                self.assertFalse(plan_is_aside_or_end(plan), plan.reasons)
+                self.assertNotIn("end_intent_model", plan.reasons)
+                self.assertFalse(s.eng.exit_requested)
+
+    def test_a_learner_reply_lost_before_it_was_heard_leaves_the_question_last(self):
+        # The reply to the fragment was cut before any audio: the candidate heard only Christy, so
+        # their settled yes still answers her question.
+        s = self.started()
+        s.say(T64_DISCONNECT, 300)
+        lost = s.eng.plan_turn("Okay.", 302)
+        self.assertFalse(s.eng.end_question_open)
+        s.eng.reply_lost(lost)
+        self.assertTrue(s.eng.end_question_open)
+        plan = s.eng.plan_turn("Yes.", 303, confirmed_yes=True)
+        self.assertTrue(ended(plan), plan.reasons)
 
     def test_a_decline_always_wins(self):
         for answer in ("yes, carry on", "Yes, continue", "No, let's carry on.", "yeah, no"):

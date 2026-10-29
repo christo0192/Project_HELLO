@@ -501,6 +501,10 @@ class RolePlayEngine:
         # farewell instead and reaches only what "bye" reaches.
         self._end_aside: dict[str, Any] | None = None
         self._end_pending = False
+        # Whether L-ASIDE-END is still the last line said (``end_question_open``), and the plan
+        # that made it stale (a reply lost before it was heard makes it fresh again).
+        self._end_question_last = False
+        self._end_stale_by: TurnPlan | None = None
         self.end_confirmed = False
         # Voice barge-in (owner decision 2026-10-28).  Whether the advisor cut the learner's last
         # line off after part of it was heard, the owed move that line carried and did not
@@ -648,6 +652,49 @@ class RolePlayEngine:
         end_intent: str | None = None,
         confirmed_yes: bool = False,
     ) -> TurnPlan:
+        """Decide what the learner does after this candidate turn (``_decide_plan``).
+
+        Reviewed fix (2026-10-30): L-ASIDE-END stops being the line the candidate answers as soon
+        as anything else is said after it.  A fragment ("Okay.", "Hmm.", "Sorry?") still leaves the
+        question pending (``_end_pending``: end words confirm), but the learner answers it in role,
+        so a plain "Yes." three lines later is said to her: it confirmed the stop, and the model
+        was still told "Christy has just asked" (``end_question_open``).  Any plan but the aside
+        itself and the exit makes the question stale; a reply the candidate never heard
+        (``reply_lost``) makes it fresh again.
+        """
+        plan = self._decide_plan(
+            candidate_text,
+            r_sec,
+            turn_index=turn_index,
+            candidate_seconds=candidate_seconds,
+            backchannel=backchannel,
+            repair=repair,
+            answers_nothing=answers_nothing,
+            end_intent=end_intent,
+            confirmed_yes=confirmed_yes,
+        )
+        if (
+            self._end_question_last
+            and plan.line_id != "L-ASIDE-END"
+            and plan.mode is not TurnMode.EXIT
+        ):
+            self._end_question_last = False
+            self._end_stale_by = plan
+        return plan
+
+    def _decide_plan(
+        self,
+        candidate_text: str,
+        r_sec: float,
+        *,
+        turn_index: int | None = None,
+        candidate_seconds: float | None = None,
+        backchannel: bool = False,
+        repair: bool = False,
+        answers_nothing: bool = False,
+        end_intent: str | None = None,
+        confirmed_yes: bool = False,
+    ) -> TurnPlan:
         """Decide what the learner does after this candidate turn (see module docstring).
 
         The worker's judgement of a short turn (``r1_session``):
@@ -726,12 +773,13 @@ class RolePlayEngine:
         # end of the day, the course pays for itself." with a model "maybe" exited the role-play
         # with no question at all.  A model "end" still counts (``end_intent_level`` lets it
         # through only for a turn that ends on a request to stop the interview or the role play),
-        # and while the question is open a model "maybe" is still an answer to it.
+        # and while the question is open a model "maybe" is still an answer to it (only right
+        # after it: once anything else was said, ``end_question_open`` is False; reviewed fix).
         if (
             end_level == "maybe"
             and lexical_level == "no"
             and self._end_aside is not None
-            and not self._end_pending
+            and not self.end_question_open
         ):
             end_level = lexical_level
         by_model = end_level != lexical_level
@@ -741,12 +789,13 @@ class RolePlayEngine:
         # fix: these ended the session).
         declined = self._end_aside is not None and declines_end(candidate_text)
         # After the question a bare yes confirms too, once the session has let it settle
-        # (``confirmed_yes``; owner decision 2026-10-30): "Yes.", "Yes please.", "Haan ji.".
+        # (``confirmed_yes``; owner decision 2026-10-30): "Yes.", "Yes please.", "Haan ji.".  Only
+        # as the answer to the question itself: a yes after the learner spoke again is said to her.
         end_words = (end_request and not declined) or (
             self._end_pending
             and (
                 confirms_end(candidate_text)
-                or (confirmed_yes and is_bare_yes(candidate_text))
+                or (confirmed_yes and self.end_question_open and is_bare_yes(candidate_text))
             )
         )
         # "Let's cut the call now, I'll call you tomorrow": a call-back promise is the advisor
@@ -1105,7 +1154,13 @@ class RolePlayEngine:
         of ``COMMITMENT_REVOICE_LIMIT``).  The session also reports a reply cut after its first
         audio frame but before any word was heard: that too is a line nobody heard.  Only the
         latest plan counts: a newer turn was already planned otherwise.
+
+        The line that made L-ASIDE-END's question stale was never heard either, so the question is
+        the last line said again (``end_question_open``).
         """
+        if plan is self._end_stale_by:
+            self._end_stale_by = None
+            self._end_question_last = self._end_pending
         if plan.aside or plan.mode is TurnMode.EXIT or plan.turn != self.turn:
             return
         self._lost_plan = plan
@@ -1251,6 +1306,7 @@ class RolePlayEngine:
             "confirmed": False,
         }
         self._end_pending = True
+        self._end_question_last = True
         return self._plan(
             TurnMode.SAY_ONLY,
             ["aside_end_request"] + (["end_intent_model"] if by_model else []),
@@ -1267,11 +1323,19 @@ class RolePlayEngine:
         answer to L-ASIDE-END: the question is no longer pending (a later end request still ends).
         """
         self._end_pending = False
+        self._end_question_last = False
 
     @property
     def end_question_open(self) -> bool:
-        """True while L-ASIDE-END's question waits for its answer (a bare yes may confirm)."""
-        return self._end_pending
+        """True while L-ASIDE-END's question waits for its answer and is the last line said.
+
+        Only then may a bare yes confirm (``confirmed_yes``), a model "maybe" answer it, and the
+        end-intent model be told the question was just asked.  A fragment leaves the question
+        pending, but once the learner answers it in role (``plan_turn``) the next turn is said to
+        her, not to the interviewer (reviewed fix: "Okay.", her reply, then "Yes." ended the
+        role-play).
+        """
+        return self._end_pending and self._end_question_last
 
     def _end_plan(
         self, turn_index: int | None, *, r_sec: float, by_model: bool = False
@@ -1306,6 +1370,7 @@ class RolePlayEngine:
         self._end_aside["confirmed"] = True
         self._end_aside["answer_transcript_turn"] = turn_index
         self._end_pending = False
+        self._end_question_last = False
         self.end_confirmed = True
         self.exit_requested = True
         return self._plan(TurnMode.EXIT, reasons)

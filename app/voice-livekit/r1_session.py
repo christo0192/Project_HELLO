@@ -1523,9 +1523,11 @@ class R1Interview:
         self._turn_finals: list[str] = []
         self._end_intent_call: _EndIntentCall | None = None
         self._end_intent_seq = 0
-        # The bare-yes settle (``_settle_bare_yes``): candidate speech, and an SDK-visible final.
+        # The bare-yes settle (``_settle_bare_yes``): candidate speech, an SDK-visible final, and
+        # any change of either (a final, or the candidate starting or stopping speaking).
         self._settle_speech = asyncio.Event()
         self._settle_final = asyncio.Event()
+        self._settle_change = asyncio.Event()
         # The brief on request: asked for during the transition, and replayed (once per session).
         self._brief_requested = False
         self._brief_repeated = False
@@ -3612,10 +3614,11 @@ class R1Interview:
         (``is_bare_yes``: "yes", "yes please", "sure", "haan ji", "go ahead").  Speech-to-text can
         finalise a lone "Yeah." a second before "... no, let's carry on", so the yes must stand
         ``R1_BARE_YES_SETTLE_SEC`` of candidate silence first.  If the candidate speaks again, the
-        transcript of that speech is awaited (at most the endpointing maximum and a margin): when
-        it comes the yes answers nothing alone (``_BareYesDeferred``) and the next turn decides,
-        with the question still open (a decline continues, end words confirm); when no transcript
-        comes, it was noise and the yes confirms.  The model is never asked about a bare yes.
+        transcript of that speech is awaited for as long as they speak and then at most the
+        endpointing maximum and a margin: when it comes the yes answers nothing alone
+        (``_BareYesDeferred``) and the next turn decides, with the question still open (a decline
+        continues, end words confirm); when no transcript comes after the speech stopped, it was
+        noise and the yes confirms.  The model is never asked about a bare yes.
         """
         engine = self._engine
         if (
@@ -3637,13 +3640,27 @@ class R1Interview:
             except asyncio.TimeoutError:
                 _log.info("unknown_event", error_type="r1_bare_yes", error_category="confirmed")
                 return True
-        if not self._settle_final.is_set():
+        # Reviewed fix: the transcript is waited for from when the speech STOPS, never from when
+        # it started.  Sarvam finalises only after a pause, so a continuation longer than the wait
+        # ("... no wait, I want to carry on with the role play") used to time out as noise and
+        # confirm the stop while the candidate was still speaking.  While they speak the yes never
+        # confirms (bounded by the S cap, and then it is deferred, not confirmed).
+        loop = asyncio.get_running_loop()
+        cap_at = loop.time() + self.machine.remaining_roleplay_cap_seconds()
+        while not self._settle_final.is_set():
+            self._settle_change.clear()
+            speaking = self._user_state == "speaking"
+            if speaking:
+                timeout = cap_at - loop.time()
+                if timeout <= 0:
+                    break
+            else:
+                timeout = endpoint_max_delay_sec() + BARE_YES_FINAL_MARGIN_SECONDS
             try:
-                await asyncio.wait_for(
-                    self._settle_final.wait(),
-                    endpoint_max_delay_sec() + BARE_YES_FINAL_MARGIN_SECONDS,
-                )
+                await asyncio.wait_for(self._settle_change.wait(), timeout)
             except asyncio.TimeoutError:
+                if speaking:
+                    break
                 _log.info("unknown_event", error_type="r1_bare_yes", error_category="noise")
                 return True
         _log.info("unknown_event", error_type="r1_bare_yes", error_category="deferred")
@@ -4217,6 +4234,7 @@ class R1Interview:
         self._turn_finals.append(text)
         self._settle_speech.set()
         self._settle_final.set()
+        self._settle_change.set()
         self._speculate_end_intent()
 
     def _flush_candidate_row(self) -> None:
@@ -4652,6 +4670,7 @@ class R1Interview:
         self._user_state = str(getattr(event, "new_state", "") or "")
         self._candidate_activity_at = self._clock()
         self._latency.note_user_state(self._user_state)
+        self._settle_change.set()  # the speech started or stopped (_settle_bare_yes)
         if self._user_state == "speaking":
             self._settle_speech.set()  # a bare yes the candidate went on from (_settle_bare_yes)
             spoke = getattr(event, "created_at", None)

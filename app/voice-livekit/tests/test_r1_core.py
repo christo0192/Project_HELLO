@@ -8127,6 +8127,72 @@ class TestBareYesConfirmsTheEnd(R1TestCase):
             self.assertTrue(await asyncio.wait_for(hook, 3.0))
         self.assertTrue(self.interview.engine.end_confirmed)
 
+    async def test_a_yes_never_confirms_while_the_candidate_is_still_speaking(self) -> None:
+        # Reviewed fix: the transcript wait ran from when the speech STARTED, so a continuation
+        # longer than it ("... no wait, I want to carry on") timed out as noise and Christy's
+        # wrap-up began mid-sentence.
+        await self.asked()
+        engine = self.interview.engine
+        with mock.patch.dict(os.environ, {"R1_BARE_YES_SETTLE_SEC": "0.2"}), mock.patch.object(
+            r1_session, "endpoint_max_delay_sec", return_value=0.1
+        ), mock.patch.object(r1_session, "BARE_YES_FINAL_MARGIN_SECONDS", 0.1):
+            self.final_transcript("Yes.")
+            await self.settle()
+            hook = asyncio.create_task(self.commit_turn("Yes."))
+            await self.settle()
+            self.user_state("speaking")
+            await asyncio.sleep(0.8)  # four times settle + maximum delay + margin, still speaking
+            self.assertFalse(hook.done())
+            self.assertFalse(engine.end_confirmed)
+            self.assertFalse(self.interview._roleplay_exit_requested())
+            self.user_state("listening")
+            self.final_transcript("no wait, I want to carry on with the role play")
+            self.assertTrue(await asyncio.wait_for(hook, 3.0))  # deferred: no answer alone
+        self.assertFalse(engine.end_confirmed)
+        self.assertTrue(engine.end_question_open)
+        self.assertFalse(await self.commit_turn("no wait, I want to carry on with the role play"))
+        self.assertFalse(engine.end_confirmed)
+        self.assertFalse(self.interview._roleplay_exit_requested())
+
+    async def test_speech_that_stops_with_no_transcript_was_noise_after_it_stopped(self) -> None:
+        # The noise wait starts when the speech stops: a long noise still confirms, only later.
+        await self.asked()
+        with mock.patch.dict(os.environ, {"R1_BARE_YES_SETTLE_SEC": "0.2"}), mock.patch.object(
+            r1_session, "endpoint_max_delay_sec", return_value=0.1
+        ), mock.patch.object(r1_session, "BARE_YES_FINAL_MARGIN_SECONDS", 0.1):
+            hook = asyncio.create_task(self.commit_turn("Yes."))
+            await self.settle()
+            self.user_state("speaking")
+            await asyncio.sleep(0.5)
+            self.assertFalse(hook.done())
+            self.user_state("listening")
+            self.assertTrue(await asyncio.wait_for(hook, 3.0))
+        self.assertTrue(self.interview.engine.end_confirmed)
+
+    async def test_a_yes_to_the_learner_after_a_fragment_never_confirms(self) -> None:
+        # Reviewed fix: "Okay." left the question open while the learner answered in role, so a
+        # "Yes." to her confirmed the stop, and the model was still told "Christy has just asked".
+        await self.asked()
+        engine = self.interview.engine
+        self.assertFalse(await self.commit_turn("Okay."))  # the learner replies
+        self.assertFalse(engine.end_question_open)
+        with mock.patch.dict(os.environ, {"R1_BARE_YES_SETTLE_SEC": "0.05"}):
+            self.final_transcript("Yes.")
+            await self.settle()
+            self.assertFalse(await self.commit_turn("Yes."))
+        self.assertFalse(engine.end_confirmed)
+        self.assertFalse(self.interview._roleplay_exit_requested())
+        runner = EndIntentRunner('{"intent": "end"}')
+        self.interview._end_intent_runner = runner
+        text = "So Priya, once you finish the course you will clear the interview easily."
+        self.final_transcript(text)
+        await self.settle()
+        self.assertFalse(await self.commit_turn(text))
+        self.assertTrue(runner.calls)
+        self.assertNotIn("Christy has just asked", runner.calls[-1][1]["content"])
+        self.assertFalse(engine.end_confirmed)
+        self.assertFalse(self.interview._roleplay_exit_requested())
+
     async def test_a_yes_with_no_question_open_is_an_ordinary_turn(self) -> None:
         self.enter_roleplay()
         loop = asyncio.get_running_loop()
