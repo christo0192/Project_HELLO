@@ -84,9 +84,19 @@ jobs:
       - name: Validate current-state manifest
         run: node scripts/check-current-state.mjs
       - name: Current-state byte-identity vs baseline
+        # Byte-identical to the baseline except the top-level evidenceDate line: the step above
+        # (check-current-state.mjs) requires that date to be re-dated every 90 days, so a strict
+        # whole-file identity could never pass again once it expired (re-dated 2026-10-28).
         run: |
-          git diff --exit-code 2170e6bdad6aa2de63fea346bb40b2ed5cd6a3dc -- config/current-state.json
-          echo "config/current-state.json unchanged from baseline"
+          git show 2170e6bdad6aa2de63fea346bb40b2ed5cd6a3dc:config/current-state.json > "$RUNNER_TEMP/current-state.baseline.json"
+          node -e '
+            const fs = require("fs");
+            const strip = (p) => fs.readFileSync(p, "utf8").replace(/^  "evidenceDate": "[0-9-]{10}",$/m, "");
+            if (strip(process.argv[1]) !== strip("config/current-state.json")) {
+              console.error("config/current-state.json differs from baseline beyond evidenceDate");
+              process.exit(1);
+            }' "$RUNNER_TEMP/current-state.baseline.json"
+          echo "config/current-state.json unchanged from baseline (except the re-dated evidenceDate)"
       - name: Offline deterministic SAST
         run: bash scripts/sast.sh
       - name: Whitespace check

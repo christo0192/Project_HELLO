@@ -3,13 +3,16 @@
 Two independent, SDK-free pieces live here so both are unit-testable without a session:
 
 * ``r1_turn_handling``: the endpointing, interruption and preemptive-generation options R1
-  hands the ``AgentSession``.  The values are endpointing 0.8 / 3.0 s, interruption
-  ``min_duration`` 0.8 s and ``min_words`` 3 (R1-Q: the owner's 4/10 session showed 0.3 s
-  committing a turn on a breath and a two-word "Thank you" cutting a reply; the phone lane
-  settled on the same 0.8 s / 3 words).  The SDK's own defaults are quicker to commit and
-  quicker to cut in: its streaming turn detector (the session default) uses 0.3 / 2.5 s and
-  its interruption defaults are 0.5 s and 0 words, which lets a "yeah" or a cough cut a reply.
-  Each value is bounded and can be tuned from the environment during Stage A.  The
+  hands the ``AgentSession``.  The values are endpointing 0.8 / 3.0 s (R1-Q: the owner's 4/10
+  session showed the SDK's streaming 0.3 / 2.5 s committing a turn on a breath) and VOICE
+  BARGE-IN (owner decision 2026-10-28, "we also want the bot to stop talking when being
+  interrupted"): interruption ``min_words`` 0 and ``min_duration`` 0.8 s, with the SDK's
+  false-interruption resume after 2.0 s.  0.8 s of the candidate's voice pauses an
+  interruptible line, a final transcript cuts it, and a pause that no transcript follows
+  (noise, a cough) resumes it.  ``min_words`` was 3 before (the phone lane's value): with
+  Sarvam's final-only transcripts that meant the learner talked over the candidate until the
+  candidate's turn was committed.  ``R1_INTERRUPT_MIN_WORDS=3`` is the rollback, read at use.
+  Each value is bounded and can be tuned from the environment.  The
   transition phase, where the only thing the candidate says is "ready", runs a quicker pair
   (``r1_transition_endpointing``, 0.4 / 1.2 s, never above the session's own).  Preemptive
   generation stays OFF; ``r1_session`` explains why.
@@ -49,7 +52,11 @@ from typing import Any, Callable
 ENDPOINT_MIN_DELAY_SEC = 0.8
 ENDPOINT_MAX_DELAY_SEC = 3.0
 INTERRUPT_MIN_DURATION_SEC = 0.8
-INTERRUPT_MIN_WORDS = 3
+# Voice barge-in (owner decision 2026-10-28).  3 is the rollback: ``R1_INTERRUPT_MIN_WORDS=3``.
+INTERRUPT_MIN_WORDS = 0
+# How long a pause that no transcript follows (noise, a cough) waits before the paused line
+# resumes.  The SDK's own default: it leaves room for Sarvam's final, which cuts the line instead.
+FALSE_INTERRUPTION_TIMEOUT_SEC = 2.0
 # The transition phase waits for one word ("ready"), so a turn there commits quickly.  These are
 # CEILINGS on the session's own numbers (``r1_transition_endpointing``), never a way to wait longer.
 TRANSITION_ENDPOINT_MIN_DELAY_SEC = 0.4
@@ -89,9 +96,21 @@ def interrupt_min_duration_sec() -> float:
 
 
 def interrupt_min_words() -> int:
-    """Words that must be heard before an interruption counts (SDK default 0)."""
+    """Words that must be heard before an interruption counts (SDK default 0, R1 default 0).
+
+    Above zero the SDK judges the words it already HOLDS, before it adds the new final, and Sarvam
+    sends finals only: the voice then never cuts a reply by itself, the committed turn does, and
+    a shorter turn spoken over an interruptible reply is refused and banked (``r1_session``).
+    """
     return int(
         _bounded_float(os.getenv("R1_INTERRUPT_MIN_WORDS"), float(INTERRUPT_MIN_WORDS), 0.0, 6.0)
+    )
+
+
+def false_interruption_timeout_sec() -> float:
+    """Seconds after a pause with no transcript before the paused line resumes (SDK default 2.0)."""
+    return _bounded_float(
+        os.getenv("R1_FALSE_INTERRUPTION_TIMEOUT_SEC"), FALSE_INTERRUPTION_TIMEOUT_SEC, 0.5, 5.0
     )
 
 
@@ -122,7 +141,9 @@ def r1_turn_handling() -> dict[str, Any]:
     """The ``TurnHandlingOptions`` R1 gives its ``AgentSession`` (a plain dict is accepted).
 
     ``turn_detection`` is deliberately absent: the browser lane's detector stays what the
-    session selects, and only the timings around it are R1's.  Interruption options are read
+    session selects, and only the timings around it are R1's.  ``vad`` is not given to the
+    session either, so the SDK runs its default voice activity detector: that is what applies
+    ``min_duration`` and pauses a line on the candidate's voice.  Interruption options are read
     from the SESSION by livekit-agents 1.6.4 (an agent-level ``interruption`` carries only
     ``enabled`` and ``mode``), which is why these belong on the session and not on ``R1Agent``.
     """
@@ -136,6 +157,12 @@ def r1_turn_handling() -> dict[str, Any]:
         "interruption": {
             "min_duration": interrupt_min_duration_sec(),
             "min_words": interrupt_min_words(),
+            # The SDK pauses a line on voice and resumes it when no transcript follows within the
+            # timeout; it needs an audio output that can pause (the room's and the recorder tee's
+            # both can, ``tests/test_r1_sdk_contract.py``).  Explicit, so an SDK default change
+            # cannot switch it off unnoticed.
+            "resume_false_interruption": True,
+            "false_interruption_timeout": false_interruption_timeout_sec(),
         },
         "preemptive_generation": {"enabled": False},
     }

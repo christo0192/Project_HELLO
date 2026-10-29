@@ -77,10 +77,22 @@ R1-Q (turn taking) changes how the candidate's speech becomes TURNS, in three pl
   transition line over a candidate who is mid-answer.
 * A reply the SDK cancelled before any audio is logged (``r1_reply_cancelled_before_audio``,
   a running count), and when the icebreaker's exit is due it is not left as silence: the
-  boundary line answers the turn that lost its reply.  min_words cannot stop two short fragments
-  from adding up to a committed turn that cuts the pending reply (the SDK keeps refused words),
-  so the next reply's thinking filler is counted from the candidate's real answer
-  (``_filler_delay``) and the lost reply counts toward the p95 (``LatencyTracker.reply_lost``).
+  boundary line answers the turn that lost its reply.  A short fragment can cut the pending reply
+  (at the default ``min_words`` 0 on its own, since the owner chose voice barge-in on 2026-10-28;
+  at the 3-word rollback two of them add up, because the SDK keeps refused words), so the next
+  reply's thinking filler is counted from the candidate's real answer (``_filler_delay``) and the
+  lost reply counts toward the p95 (``LatencyTracker.reply_lost``).
+
+Voice barge-in (owner decision 2026-10-28): the candidate's voice pauses an LLM reply and a final
+transcript cuts it (``r1_latency``).  The cut row is written ``interrupted`` with the played text
+only, the engine is told (``record_spoken(..., interrupted=True)``; ``by_candidate=False`` for a
+speech R1 cut itself, ``_interrupt_session``), and the turn that cut the learner is planned with
+``backchannel=is_acknowledgement_turn(text)`` (a lone "yeah" only gets her point finished) and
+``repair=is_repair_turn(text)`` (a "Sorry?" gets it said again).  A role-play reply cut before
+the candidate heard a word of it (before any audio, or after its first frame but before any
+synchronised word, when the SDK adds no item) is reported to the engine (``reply_lost``), so a
+graded commitment line, the ask and the next-step question it used up are not lost.  Scripted
+``say()`` lines stay uninterruptible.
 
 R1-Q (interviewer lines) changes what the scripted lines and the wrap-up say, in three places:
 
@@ -436,6 +448,8 @@ _WARM_ORDER = (
     "L-WRAP",
     "L-CLOSE",
     "L-ASIDE-COACH",
+    "L-ASIDE-END",
+    "L-END-CLOSE",
     "L-MUTE",
     "L-SIL-IB",
     "L-SIL-RP1",
@@ -742,6 +756,74 @@ def is_backchannel_turn(text: str) -> bool:
     return bool(words) and all(word in _BACKCHANNEL_WORDS for word in words)
 
 
+# Voice barge-in (owner decision 2026-10-28; reviewed fix).  What a candidate says over the learner
+# only to show they are listening, or to hand her the floor back: after it cut her off she just
+# finishes her point.  Much narrower than ``_BACKCHANNEL_WORDS`` on purpose: "No, no." is a denial
+# and "Yes." can answer the question she was asking (both are answered first), and "Sorry?",
+# "Pardon?" or "Hello? Are you there?" ask her to say it again (``is_repair_turn``).  A question
+# mark makes any of it a question ("Okay?", "Right?").  Matched on folded text ("Uh-huh." ->
+# "uh huh").
+_ACK_PHRASE_RE = re.compile(r"\b(?:uh huh|mm hmm|m hmm|got it|i see|all right)\b")
+_YIELD_RE = re.compile(r"\b(?:go ahead|go on|carry on|please continue|continue|you were saying)\b")
+_ACK_WORDS = frozenset(
+    {
+        "yeah", "yep", "yup", "okay", "ok", "alright", "right", "sure",
+        "hmm", "hm", "mm", "mmm", "mhm", "uh", "um", "ah", "oh",
+    }
+)
+# Next to a hand-back ("Sorry, go ahead.", "No, no, please continue.") these only soften it.
+_YIELD_SOFTENERS = frozenset({"sorry", "please", "no"})
+# A request to hear the learner again or a check that she is there.  Every word of the turn must be
+# one of these (or an acknowledgement, or part of a ``_CLARIFICATION_RE`` phrase such as "can you
+# hear me", "say that again"), and at least one cue must be present.
+_REPAIR_CUES = frozenset({"sorry", "pardon", "excuse", "what", "huh", "again", "hello"})
+_STILL_THERE_RE = re.compile(r"\b(?:are )?you (?:still )?there\b")
+_REPAIR_WORDS = _REPAIR_CUES | _ACK_WORDS | frozenset(
+    {"me", "come", "are", "you", "there", "still", "hi", "hey", "please", "yes", "no"}
+)
+
+
+def _has_question_mark(text: str) -> bool:
+    return "?" in text or "？" in text
+
+
+def is_acknowledgement_turn(text: str) -> bool:
+    """True for a turn that only acknowledges or hands the floor back ("Yeah.", "Mm-hmm.", "Go on").
+
+    Voice barge-in: when such a turn cut the learner off she finishes her point and raises nothing
+    new (``RolePlayEngine.plan_turn(backchannel=...)``).  Not "Yes." or "No.", which can answer
+    or deny, not a repair request (``is_repair_turn``), and nothing with a question mark.
+    """
+    if _has_question_mark(text):
+        return False
+    folded = fold_speech(text)
+    if not folded:
+        return False
+    handed_back = _YIELD_RE.search(folded) is not None
+    rest = _YIELD_RE.sub(" ", _ACK_PHRASE_RE.sub(" ", folded))
+    allowed = _ACK_WORDS | _YIELD_SOFTENERS if handed_back else _ACK_WORDS
+    return all(word in allowed for word in rest.split())
+
+
+def is_repair_turn(text: str) -> bool:
+    """True for a turn that only asks to hear the learner again or checks she is there.
+
+    "Sorry?", "Pardon?", "Sorry, what?", "Come again?", "Hello? Are you there?", "Can you hear
+    me?", "Sorry, can you say that again?".  Voice barge-in: when such a turn cut the learner off
+    she says her point again (``RolePlayEngine.plan_turn(repair=...)``) instead of being told not
+    to repeat herself.  A turn with any other word is an answer or a question of its own.
+    """
+    folded = fold_speech(text)
+    if not folded:
+        return False
+    stripped = _CLARIFICATION_RE.sub(" ", folded)
+    cue = stripped != folded or _STILL_THERE_RE.search(folded) is not None
+    words = stripped.split()
+    if not all(word in _REPAIR_WORDS for word in words):
+        return False
+    return cue or any(word in _REPAIR_CUES for word in words)
+
+
 def lead_display_name(value: object) -> str:
     """The simulated learner's name for the candidate's scenario card, or "" when it cannot go out.
 
@@ -944,6 +1026,9 @@ class _SpeechSlot:
     # Wall-clock seconds (``time.time()``) of the ``agent_state_changed -> speaking`` event that
     # claimed this slot: the fallback anchor when the delivered item carries no metrics.
     started_at: float | None = None
+    # R1 cut this speech itself (``_interrupt_session``: a generation hung past its deadline), so
+    # an ``interrupted`` item of it was not cut by the candidate (voice barge-in, reviewed fix).
+    cut_by_r1: bool = False
 
 
 @dataclass
@@ -2365,6 +2450,16 @@ class R1Interview:
         engine = self._engine
         return engine is not None and engine.exit_requested
 
+    def _roleplay_end_confirmed(self) -> bool:
+        """True once the candidate confirmed, after L-ASIDE-END, that they want to stop.
+
+        It ends every role-play wait at once like a farewell, but the driver then says L-END-CLOSE
+        and the session ends as ``candidate_left`` (failed): never L-EXIT, the wrap-up or
+        ``complete``.
+        """
+        engine = self._engine
+        return engine is not None and engine.end_confirmed
+
     def _early_exit_due(self) -> bool:
         """Plan 5.1's early exit: the commitment is resolved and R >= 14:00.
 
@@ -2382,12 +2477,13 @@ class R1Interview:
         return (
             self.machine.roleplay_should_end()
             or self._roleplay_exit_requested()
+            or self._roleplay_end_confirmed()
             or self._early_exit_due()
         )
 
     def _roleplay_budget_left(self) -> float:
         """Seconds of role-play left; zero once the candidate ended it, so every wait ends."""
-        if self._roleplay_exit_requested():
+        if self._roleplay_exit_requested() or self._roleplay_end_confirmed():
             return 0.0
         return self.machine.remaining_roleplay_seconds()
 
@@ -2419,7 +2515,8 @@ class R1Interview:
         words while the reply it would cut is still interruptible and not yet cut; the words
         stay in the SDK's transcript and are prepended to the next committed turn.  The banked
         words are counted the way the SDK counts them, so two one-word fragments reach the
-        limit together.
+        limit together.  At ``min_words`` 0 (the default since 2026-10-28) the SDK refuses
+        nothing, so this is never true and every committed turn has its own monologue clock.
         """
         minimum = interrupt_min_words()
         if minimum <= 0 or self._banked_words >= minimum:
@@ -2525,7 +2622,16 @@ class R1Interview:
         r_sec = self.machine.roleplay_elapsed
         try:
             plan = self.engine.plan_turn(
-                text, r_sec, turn_index=index, candidate_seconds=seconds
+                text,
+                r_sec,
+                turn_index=index,
+                candidate_seconds=seconds,
+                # Voice barge-in: a lone "yeah" that cut the learner off raises nothing new and a
+                # "Sorry?" gets her point again; a turn of courtesy words alone after a reply that
+                # was cancelled before any audio gets that reply's plan again.
+                backchannel=is_acknowledgement_turn(text),
+                repair=is_repair_turn(text),
+                answers_nothing=is_backchannel_turn(text),
             )
         except Exception as exc:  # noqa: BLE001 - a planning bug must not speak for the learner
             _log.error(
@@ -2556,6 +2662,13 @@ class R1Interview:
                 phase=self.machine.transcript_phase(),
                 turn_index=index,
             )
+        if plan.end_interview:
+            # The candidate confirmed they want to stop (L-ASIDE-END): the driver says L-END-CLOSE
+            # and ends the session as ``candidate_left``, as if the window had been closed.
+            if entry is not None:
+                entry["phase"] = "aside"
+            self._wake()
+            raise StopResponse()
         if plan.aside:
             if entry is not None:
                 entry["phase"] = "aside"  # excluded from the learner's context (plan 5.10)
@@ -2564,7 +2677,10 @@ class R1Interview:
         if plan.exit_roleplay:
             self._wake()  # the driver's role-play waits re-read the exit and end now
             raise StopResponse()
-        self._spawn_judge(text, plan)
+        if "replanned_after_lost_reply" not in plan.reasons:
+            # A lost reply's plan voiced again was judged on the turn it answers; a judge of this
+            # "Okay." for that same turn could land first and the real verdict would be dropped.
+            self._spawn_judge(text, plan)
         return Reply(
             phase=ROLEPLAY_PHASE,
             candidate_text=text,
@@ -2575,7 +2691,9 @@ class R1Interview:
         )
 
     async def _play_aside(self, plan: TurnPlan) -> None:
-        """Speak L-ASIDE-COACH as the interviewer: ASIDE pauses R, then role-play resumes.
+        """Speak an interviewer aside (``plan.line_id``): ASIDE pauses R, then role-play resumes.
+
+        L-ASIDE-COACH, or L-ASIDE-END (the role-play resumes for the candidate's answer to it).
 
         This runs off the SDK hook, not in the driver, so it is the one place besides the mute
         event that moves ROLEPLAY -> ASIDE, and it must guarantee the way back.
@@ -2587,7 +2705,7 @@ class R1Interview:
             await self._say_text(
                 plan.scripted_text,
                 interruptible=False,
-                marker="L-ASIDE-COACH",
+                marker=plan.line_id or "L-ASIDE-COACH",
                 voice="interviewer",
             )
         finally:
@@ -3048,6 +3166,10 @@ class R1Interview:
         if not self._uninterruptible_speech_live():
             interrupt = getattr(self.session, "interrupt", None)
             if callable(interrupt):
+                # Every live speech is cut by this, and none of it by the candidate: the filler a
+                # hung reply played is not a line the candidate talked over (voice barge-in).
+                for slot in self._speeches.values():
+                    slot.cut_by_r1 = True
                 try:
                     await _maybe_await(interrupt(force=True))
                 except Exception as exc:  # noqa: BLE001
@@ -3389,31 +3511,67 @@ class R1Interview:
         is said, with one exception that is the point of the log: when the icebreaker's exit is
         due and nobody is mid-turn, the turn that lost its reply is the boundary turn, so the
         transition line answers it now instead of the candidate waiting out a silence window.
+
+        The count, the p95 lower bound and the boundary turn are for a reply cut before any audio
+        (``slot.index`` is None).  The engine is told of a role-play reply cut before any word was
+        heard in either case (``_report_unheard_plan``).
         """
         if (
             slot.source != "generate_reply"
-            or slot.index is not None
             or not bool(getattr(handle, "interrupted", False))
             or self._exiting
         ):
             return
-        self._replies_cancelled_before_audio += 1
-        _log.warn(
-            "unknown_event",
-            error_type="r1_reply_cancelled_before_audio",
-            phase=self.machine.transcript_phase(),
-            option_count=self._replies_cancelled_before_audio,
-        )
-        # The turn it answered never gets a first audio: keep how long the candidate had waited as
-        # a lower bound, so the slowest turns still count toward the p95 the gate reads.
-        self._latency.reply_lost(slot.latency_turn)
+        before_audio = slot.index is None
+        if before_audio:
+            self._replies_cancelled_before_audio += 1
+            _log.warn(
+                "unknown_event",
+                error_type="r1_reply_cancelled_before_audio",
+                phase=self.machine.transcript_phase(),
+                option_count=self._replies_cancelled_before_audio,
+            )
+            # The turn it answered never gets a first audio: keep how long the candidate had
+            # waited as a lower bound, so the slowest turns still count toward the p95 the gate
+            # reads.
+            self._latency.reply_lost(slot.latency_turn)
+        self._report_unheard_plan(slot)
         if (
-            self.machine.phase is R1Phase.ICEBREAKER
+            before_audio
+            and self.machine.phase is R1Phase.ICEBREAKER
             and self.machine.icebreaker_should_end()
             and not self._candidate_turn_open()
         ):
             self._icebreaker_boundary_turn = True
             self._wake()
+
+    def _report_unheard_plan(self, slot: _SpeechSlot) -> None:
+        """Tell the engine that an interrupted role-play reply was not heard (``reply_lost``).
+
+        Voice barge-in (min_words 0): the reply was cut before any audio, or after its first audio
+        frame (the slot was claimed at ``speaking``) but before any word was synchronised, when
+        the SDK adds no assistant item (its forwarded text is empty; reviewed fix: that cut used
+        to reach neither ``reply_lost`` nor ``record_spoken``).  Either way what its planning used
+        up (the ask, the next-step question, a commitment line) is still owed.
+
+        Never both for one plan: a reply with any word heard has its item added inside the SDK's
+        reply task (``_pipeline_reply_task_impl``), before that task ends and the handle is marked
+        done, so its slot is ``used`` and its plan recorded by now; ``recorded`` is set here, and
+        the slot has left ``_speeches``, so no later item can reach ``record_spoken`` for it.
+        """
+        reply = slot.reply
+        plan = None if reply is None else reply.plan
+        if plan is None or self._engine is None or slot.used or reply.recorded:
+            return
+        reply.recorded = True
+        try:
+            self._engine.reply_lost(plan)
+        except Exception as exc:  # noqa: BLE001 - bookkeeping must not stall the interview
+            _log.warn(
+                "unknown_event",
+                error_type="r1_reply_lost_failed",
+                error_category=_error_type_of(exc),
+            )
 
     @staticmethod
     def _item_text(item: Any) -> str:
@@ -3515,7 +3673,12 @@ class R1Interview:
         reply.recorded = True
         try:
             self.engine.record_spoken(
-                reply.plan, text, r_sec=reply.r_sec, interrupted=interrupted
+                reply.plan,
+                text,
+                r_sec=reply.r_sec,
+                interrupted=interrupted,
+                # A line R1 cut itself (a hung reply's filler) is not answered as a barge-in.
+                by_candidate=not slot.cut_by_r1,
             )
         except Exception as exc:  # noqa: BLE001 - bookkeeping must not stall the interview
             _log.warn(
@@ -4079,6 +4242,10 @@ class R1Interview:
         if kind == DEADLINE:
             return "phase_deadline"
         if kind == SILENCE:
+            if self._engine is not None:
+                # Silence after L-ASIDE-END is handled as always; an answer to "Are you still
+                # there?" is not an answer to L-ASIDE-END.
+                self._engine.end_question_lapsed()
             return await self._silence_ladder(
                 [
                     ("L-SIL-RP1", ROLEPLAY_FIRST_STEP_SECONDS),
@@ -4297,7 +4464,23 @@ class R1Interview:
                 break
             if stop is not None:
                 return stop
+        if self._roleplay_end_confirmed():
+            return await self._end_at_candidates_request()
         return None
+
+    async def _end_at_candidates_request(self) -> str:
+        """The candidate confirmed the stop after L-ASIDE-END: L-END-CLOSE, then ``candidate_left``.
+
+        No outcome of its own: the session ends exactly as if the candidate had closed the window
+        (failed; ``_after_roleplay`` never promotes it to ``complete``, because ROLEPLAY_EXIT was
+        never entered), so asking to stop can never earn more than leaving.  The interviewer says
+        the line, so R is paused for it; ``_finish`` then says no L-CLOSE on top of it.
+        """
+        if self.machine.phase is R1Phase.ROLEPLAY:
+            self._enter(R1Phase.ASIDE)
+        self._goodbye_spoken = True
+        await self.say("L-END-CLOSE")
+        return "candidate_left"
 
     def _end_roleplay(self) -> None:
         """Leave role-play for ROLEPLAY_EXIT from whichever role-play phase is current."""

@@ -672,7 +672,8 @@ _H1_PATTERNS = (
     r"\bwhat(?:'s| is) (?:bringing|driving|prompting) you\b",
     r"\bwhy (?:are you|you're|you are) (?:\w+ ){0,2}(?:looking|interested|exploring|"
     r"considering|thinking|here|calling|enquiring|inquiring)\b",
-    r"\b(?:laid off|lay[- ]?offs?|job security)\b",
+    # The layoff words are ``_H1_LAYOFF`` below: they name the topic only when the clause is not
+    # about the advisor's own job.
     r"\bwhat (?:changed|has changed)\b",
     r"\b(?:specific|particular|any) (?:trigger|event|reason|deadline|date|catalyst)\b",
     r"\btrigger\b",
@@ -745,6 +746,52 @@ PROBE_RULES: dict[str, tuple[re.Pattern[str], ...]] = {
     topic: tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
     for topic, patterns in _PROBE_PATTERNS.items()
 }
+# Owner test 7f2a25e6 (turns 46, 48 and 51): "If I get laid off, will you help me get a job?" is
+# about the ADVISOR's job, yet it released the learner's H1 hint and then her deep need.  A layoff
+# word is an H1 probe unless the clause that holds it has a first-person subject ("if I get laid
+# off", "I'm going to get laid off", "layoffs at my company").  No "you" is required: "Is job
+# security a concern?" and "are layoffs a worry at your end?" are probes.  The clause runs from the
+# last break before the word (punctuation, a conjunction, or a verb that opens a clause: "I think
+# you'll be laid off"), and its subject is the nearest subject or possessive pronoun before the
+# word; with none, the clause after it decides, and it is the advisor's own only when every
+# pronoun there is first person ("layoffs at my company", but "did the layoffs at our company
+# affect you?" asks about the learner).  "me" and "us" are no subject.  A first-person speech act
+# opens the clause too (reviewed fix): in "Can I ask about the layoffs you mentioned?", "I'm
+# curious about ...", "I wanted to ask about job security" and "We've helped people worried about
+# layoffs" the advisor is the one asking or helping, not the one laid off.
+_H1_LAYOFF = re.compile(r"\b(?:laid off|lay[- ]?offs?|job security)\b", re.IGNORECASE)
+_CLAUSE_BREAK = re.compile(
+    r"[,;:()]|\s-\s|\b(?:and|but|or|so|if|whether|because|since|when|while|though|although|unless|"
+    r"that|then|think|thought|know|knew|feel|felt|guess|mean|say|said|saying|hear|heard|hearing|"
+    r"see|saw|seen|seeing|read|understand|wonder|wondering|imagine|bet|hope|ask|asked|asking|"
+    r"curious|wanted|want to know|talk about|talking about|help|helped|helping)\b",
+    re.IGNORECASE,
+)
+_SUBJECT_PRONOUN = re.compile(
+    r"\b(?:i|we|my|our|you|your|he|she|they|his|her|their)\b", re.IGNORECASE
+)
+_FIRST_PERSON = frozenset({"i", "we", "my", "our"})
+
+
+def _layoff_probe(lowered: str) -> bool:
+    """True when a question names layoffs or job security about anyone but the advisor."""
+    for match in _H1_LAYOFF.finditer(lowered):
+        before = lowered[: match.start()]
+        breaks = list(_CLAUSE_BREAK.finditer(before))
+        subjects = _SUBJECT_PRONOUN.findall(before[breaks[-1].end() if breaks else 0 :])
+        if not subjects:
+            after = lowered[match.end() :]
+            following = _CLAUSE_BREAK.search(after)
+            clause = after[: following.start() if following else None]
+            subjects = _SUBJECT_PRONOUN.findall(clause)
+            if not subjects or any(word.lower() not in _FIRST_PERSON for word in subjects):
+                return True
+            continue
+        if subjects[-1].lower() not in _FIRST_PERSON:
+            return True
+    return False
+
+
 # "What makes you get scared of layoffs?" asks about the layoffs (H1), not about what held the
 # learner back (H2): a generic fear word counts for H2 only when the same sentence has no H1
 # term (R1-Q round 1: it released H2's deep need on an H1 question and gave the advisor unearned
@@ -864,9 +911,15 @@ def detect_probes(text: object) -> frozenset[str]:
         for topic, patterns in PROBE_RULES.items():
             if any(pattern.search(lowered) for pattern in patterns):
                 in_sentence.add(topic)
-        if "H1" not in in_sentence and _H2_FEAR_WORDS.search(lowered):
+        if _layoff_probe(lowered):
+            in_sentence.add("H1")
+        # A layoff word about the advisor's own job is still what the sentence is about: its fear
+        # or worry word is about that, never an H2 probe ("If I get laid off I'm worried, will you
+        # help me?").
+        h1_term = "H1" in in_sentence or _H1_LAYOFF.search(lowered) is not None
+        if not h1_term and _H2_FEAR_WORDS.search(lowered):
             in_sentence.add("H2")
-        if _H2_GENERIC_WORRY.search(lowered) is not None and "H1" not in in_sentence:
+        if _H2_GENERIC_WORRY.search(lowered) is not None and not h1_term:
             # The question names a worry; the topic is whatever it is a worry ABOUT.
             if "H3" in in_sentence or _H3_TOPIC_WORDS.search(lowered) is not None:
                 in_sentence.add("H3")

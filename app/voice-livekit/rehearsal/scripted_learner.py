@@ -24,7 +24,7 @@ import re
 from types import SimpleNamespace
 from typing import Any, AsyncIterator, Mapping
 
-from r1_negotiation import COMMIT_REACTION_BRIEF, COUNTERS, SPECS
+from r1_negotiation import COMMIT_REACTION_BRIEF, COUNTERS, N_QUESTION_ENROL_BRIEF, SPECS
 from r1_personas import PERSONAS
 from r1_scheduler import PLAN, REDIRECT_BRIEF
 from r1_text import normalize
@@ -100,6 +100,11 @@ VOICED: dict[str, tuple[str, ...]] = {
     "N-QUESTION": (
         "What would that call actually cover? I'd like to know before I say yes.",
         "How long would that take, and what would we discuss on it?",
+    ),
+    # The same question after an enrolment ask (``r1_negotiation.question_spec``): no call.
+    "N-QUESTION:enrol": (
+        "What would I really be signing up for here? I'd want to know before I say yes.",
+        "Hold on, what does the program actually include for that price?",
     ),
     "N-EMAIL": (
         "Sure, an email is fine. What will it include?",
@@ -202,6 +207,7 @@ def _brief_index() -> list[tuple[str, str]]:
             pairs.append((item.brief.replace("{decision_maker}", dm), item.id))
     for counter in COUNTERS:
         pairs.append((counter.brief, f"F1-COUNTER:{counter.id}"))
+    pairs.append((N_QUESTION_ENROL_BRIEF, "N-QUESTION:enrol"))
     pairs.append((COMMIT_REACTION_BRIEF, "COMMIT"))
     return sorted(pairs, key=lambda pair: -len(pair[0]))
 

@@ -38,7 +38,15 @@ _ENV_KEYS = (
     "R1_ENDPOINT_MAX_DELAY_SEC",
     "R1_INTERRUPT_MIN_DURATION_SEC",
     "R1_INTERRUPT_MIN_WORDS",
+    "R1_FALSE_INTERRUPTION_TIMEOUT_SEC",
 )
+# Voice barge-in (owner decision 2026-10-28): 0 words, 0.8 s, false-interruption resume after 2 s.
+_INTERRUPTION_DEFAULTS = {
+    "min_duration": 0.8,
+    "min_words": 0,
+    "resume_false_interruption": True,
+    "false_interruption_timeout": 2.0,
+}
 
 
 class Clock:
@@ -79,25 +87,37 @@ class TestTurnHandling(unittest.TestCase):
             os.environ.pop(key, None)
 
     def test_the_defaults_are_the_turn_taking_numbers(self) -> None:
-        # R1-Q S02 (interviewer-flow.md section 6): endpointing 0.8 / 3.0 s, interruption
-        # min_duration 0.8 s and min_words 3 (the phone lane's pair; PR-4c had 0.7 / 3.5 / 0.7 / 2).
+        # R1-Q S02 (interviewer-flow.md section 6): endpointing 0.8 / 3.0 s.  Owner decision
+        # 2026-10-28: voice barge-in, min_words 0 (was 3) with min_duration 0.8 s and the SDK's
+        # false-interruption resume after 2.0 s, explicit so an SDK default cannot drop it.
         self.assertEqual(
             r1_turn_handling(),
             {
                 "endpointing": {"min_delay": 0.8, "max_delay": 3.0},
-                "interruption": {"min_duration": 0.8, "min_words": 3},
+                "interruption": dict(_INTERRUPTION_DEFAULTS),
                 "preemptive_generation": {"enabled": False},
             },
         )
 
-    def test_a_two_word_courtesy_cannot_interrupt_a_reply(self) -> None:
-        # "Thank you." caused the owner's interrupted turn 4: the default word floor must sit
-        # above it, and above a bare "Sorry" and "Hello" too.
+    def test_by_default_any_words_can_barge_in_but_only_after_the_voice_lasted(self) -> None:
+        interruption = r1_turn_handling()["interruption"]
+        self.assertEqual(interruption["min_words"], 0)
+        self.assertEqual(interruption["min_duration"], 0.8)  # a short "yeah" or cough does not pause
+        self.assertTrue(interruption["resume_false_interruption"])
+        self.assertEqual(interruption["false_interruption_timeout"], 2.0)
+
+    def test_the_rollback_restores_the_three_word_floor_over_a_two_word_courtesy(self) -> None:
+        # R1_INTERRUPT_MIN_WORDS=3 (the runbook's rollback): "Thank you." caused the owner's
+        # interrupted turn 4, so the floor sits above it, and above a bare "Sorry" and "Hello".
+        os.environ["R1_INTERRUPT_MIN_WORDS"] = "3"
         floor = r1_turn_handling()["interruption"]["min_words"]
+        self.assertEqual(floor, 3)
         for words in ("Sorry", "Hello", "Thank you.", "Yes please"):
             with self.subTest(words=words):
                 self.assertLess(count_words(words), floor)
         self.assertGreaterEqual(count_words("Hey, are you there?"), floor)
+        # The rollback touches the word floor only: the resume stays on.
+        self.assertTrue(r1_turn_handling()["interruption"]["resume_false_interruption"])
 
     def test_preemptive_generation_is_off_and_nothing_else_leaks_in(self) -> None:
         # No turn_detection key: the session keeps the browser lane's detector, and R1 only
@@ -115,11 +135,20 @@ class TestTurnHandling(unittest.TestCase):
                 "R1_ENDPOINT_MAX_DELAY_SEC": "4.5",
                 "R1_INTERRUPT_MIN_DURATION_SEC": "1.0",
                 "R1_INTERRUPT_MIN_WORDS": "3",
+                "R1_FALSE_INTERRUPTION_TIMEOUT_SEC": "1.5",
             }
         )
         handling = r1_turn_handling()
         self.assertEqual(handling["endpointing"], {"min_delay": 0.5, "max_delay": 4.5})
-        self.assertEqual(handling["interruption"], {"min_duration": 1.0, "min_words": 3})
+        self.assertEqual(
+            handling["interruption"],
+            {
+                "min_duration": 1.0,
+                "min_words": 3,
+                "resume_false_interruption": True,
+                "false_interruption_timeout": 1.5,
+            },
+        )
 
     def test_every_value_is_bounded(self) -> None:
         os.environ.update(
@@ -128,21 +157,29 @@ class TestTurnHandling(unittest.TestCase):
                 "R1_ENDPOINT_MAX_DELAY_SEC": "99",
                 "R1_INTERRUPT_MIN_DURATION_SEC": "0.0",
                 "R1_INTERRUPT_MIN_WORDS": "99",
+                "R1_FALSE_INTERRUPTION_TIMEOUT_SEC": "0.0",
             }
         )
         handling = r1_turn_handling()
         self.assertEqual(handling["endpointing"], {"min_delay": 0.2, "max_delay": 8.0})
-        self.assertEqual(handling["interruption"], {"min_duration": 0.3, "min_words": 6})
+        interruption = handling["interruption"]
+        self.assertEqual((interruption["min_duration"], interruption["min_words"]), (0.3, 6))
+        # A zero timeout would resume every pause at once: bounded to 0.5 s, never off.
+        self.assertEqual(interruption["false_interruption_timeout"], 0.5)
         os.environ.update(
             {
                 "R1_ENDPOINT_MIN_DELAY_SEC": "50",
                 "R1_INTERRUPT_MIN_DURATION_SEC": "50",
                 "R1_INTERRUPT_MIN_WORDS": "-4",
+                "R1_FALSE_INTERRUPTION_TIMEOUT_SEC": "60",
             }
         )
         handling = r1_turn_handling()
         self.assertEqual(handling["endpointing"]["min_delay"], 2.0)
-        self.assertEqual(handling["interruption"], {"min_duration": 2.0, "min_words": 0})
+        interruption = handling["interruption"]
+        self.assertEqual((interruption["min_duration"], interruption["min_words"]), (2.0, 0))
+        self.assertEqual(interruption["false_interruption_timeout"], 5.0)
+        self.assertTrue(interruption["resume_false_interruption"])
 
     def test_a_malformed_value_falls_back_to_the_default(self) -> None:
         for bad in ("", "  ", "abc", "nan", "inf", "-inf", "1,5"):
@@ -166,7 +203,7 @@ class TestTurnHandling(unittest.TestCase):
     def _defaults() -> dict:
         return {
             "endpointing": {"min_delay": 0.8, "max_delay": 3.0},
-            "interruption": {"min_duration": 0.8, "min_words": 3},
+            "interruption": dict(_INTERRUPTION_DEFAULTS),
             "preemptive_generation": {"enabled": False},
         }
 

@@ -873,8 +873,108 @@ class TestR1LatencyOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(options.endpointing["min_delay"], 0.8)
         self.assertEqual(options.endpointing["max_delay"], 3.0)
         self.assertEqual(options.interruption["min_duration"], 0.8)
-        self.assertEqual(options.interruption["min_words"], 3)
+        # Voice barge-in (owner decision 2026-10-28) and the false-interruption resume.
+        self.assertEqual(options.interruption["min_words"], 0)
+        self.assertTrue(options.interruption["resume_false_interruption"])
+        self.assertEqual(options.interruption["false_interruption_timeout"], 2.0)
         self.assertFalse(options.preemptive_generation["enabled"])
+
+    def test_the_false_interruption_resume_is_configured_through_turn_handling(self) -> None:
+        # 1.6.4 deprecated the session keywords: R1 must pass the two keys in
+        # turn_handling["interruption"] (r1_latency.r1_turn_handling), where InterruptionOptions
+        # declares them.
+        from livekit.agents.voice.turn import InterruptionOptions, _INTERRUPTION_DEFAULTS
+
+        self.assertIn("resume_false_interruption", InterruptionOptions.__annotations__)
+        self.assertIn("false_interruption_timeout", InterruptionOptions.__annotations__)
+        self.assertTrue(_INTERRUPTION_DEFAULTS["resume_false_interruption"])
+        self.assertEqual(_INTERRUPTION_DEFAULTS["false_interruption_timeout"], 2.0)
+        init = inspect.getsource(AgentSession.__init__)
+        for keyword in ("false_interruption_timeout", "resume_false_interruption"):
+            self.assertIn(
+                f'"{keyword}": "Use turn_handling=TurnHandlingOptions(...) instead"', init
+            )
+        self.assertIn("agent_false_interruption", typing.get_args(EventTypes))
+
+    def test_a_pause_needs_the_resume_flag_a_timeout_and_an_output_that_can_pause(self) -> None:
+        pause = inspect.getsource(AgentActivity._pause_enabled)
+        for condition in (
+            'interruption_options["resume_false_interruption"]',
+            'interruption_options["false_interruption_timeout"] is not None',
+            "self._session.output.audio.can_pause",
+        ):
+            self.assertIn(condition, pause)
+        # R1's chain: the recorder tee (r1_recorder wraps the session's audio output) in front of
+        # the room's output.  Both declare pause, and a chain can pause only if every link can.
+        from livekit.agents.voice import io as voice_io
+        from livekit.agents.voice.recorder_io.recorder_io import RecorderAudioOutput
+        from livekit.agents.voice.room_io._output import _ParticipantAudioOutput
+
+        pausable = "capabilities=io.AudioOutputCapabilities(pause=True)"
+        self.assertIn(pausable, inspect.getsource(RecorderAudioOutput.__init__))
+        self.assertIn(pausable, inspect.getsource(_ParticipantAudioOutput.__init__))
+        self.assertIn(
+            "self._capabilities.pause and (not self.next_in_chain or self.next_in_chain.can_pause)",
+            inspect.getsource(voice_io.AudioOutput.can_pause.fget),
+        )
+        for output in (RecorderAudioOutput, _ParticipantAudioOutput):
+            self.assertIn("def pause(", inspect.getsource(output))
+            self.assertIn("def resume(", inspect.getsource(output))
+
+    def test_with_no_vad_given_the_session_runs_the_sdks_default_detector(self) -> None:
+        # R1 passes no vad (browser parity), so a VAD exists and min_duration is applied by it.
+        init = inspect.getsource(AgentSession.__init__)
+        self.assertIn("self._using_default_vad = not is_given(vad)", init)
+        self.assertIn('vad = inference.VAD(model="silero")', init)
+
+    def test_min_duration_gates_the_voice_detector_and_a_final_cuts_whatever_its_length(self) -> None:
+        # The runbook's trade-off: 0.8 s of voice pauses a line (VAD path); a final transcript
+        # always reaches _interrupt_by_audio_activity and then interrupts the paused line, so a
+        # transcribed "yeah" cuts the learner even when it was shorter than 0.8 s.
+        vad = inspect.getsource(AgentActivity.on_vad_inference_done)
+        self.assertIn(
+            'ev.speech_duration >= self._session.options.interruption["min_duration"]', vad
+        )
+        self.assertIn("self._interrupt_by_audio_activity()", vad)
+        final = inspect.getsource(AgentActivity.on_final_transcript)
+        self.assertNotIn("min_duration", final)
+        self.assertLess(
+            final.index("self._interrupt_by_audio_activity()"),
+            final.index("self._cancel_speech_pause("),
+        )
+        cancel = inspect.getsource(AgentActivity._cancel_speech_pause)
+        self.assertIn("interrupt: bool = True", cancel)
+        self.assertIn("self._paused_speech.handle.interrupt()", cancel)
+        # At min_words 0 the word check is skipped entirely; above 0 it reads the HELD transcript.
+        barge = inspect.getsource(AgentActivity._interrupt_by_audio_activity)
+        self.assertIn('interruption_options["min_words"] > 0', barge)
+        # Paused, not cut, when resume is on; cut at once when it is off.
+        self.assertLess(barge.index("if self._pause_enabled():"), barge.index("audio_output.pause()"))
+        self.assertIn("self._current_speech.interrupt()", barge)
+        # Only an interruptible speech that is not already cut is paused or cut.
+        self.assertIn("and self._current_speech.allow_interruptions", barge)
+
+    def test_a_pause_no_transcript_follows_resumes_the_same_line(self) -> None:
+        # The timer starts when the candidate's speech ends and, unless a final or new speech
+        # cancels it, resumes the paused audio of the SAME speech handle.
+        end = inspect.getsource(AgentActivity.on_end_of_speech)
+        self.assertIn("self._start_false_interruption_timer(self._paused_speech.timeout)", end)
+        timer = inspect.getsource(AgentActivity._start_false_interruption_timer)
+        self.assertIn("audio_output.resume()", timer)
+        self.assertIn("not self._paused_speech.handle.done()", timer)
+        self.assertIn('"agent_false_interruption", AgentFalseInterruptionEvent(resumed=resumed)', timer)
+        start = inspect.getsource(AgentActivity.on_start_of_speech)
+        self.assertIn("self._false_interruption_timer.cancel()", start)
+
+    def test_the_cut_line_is_finished_before_r1_plans_the_turn_that_cut_it(self) -> None:
+        # r1_roleplay relies on this: when the hook runs, the interrupted learner line has been
+        # reported (record_spoken(interrupted=True)), so the engine knows the learner was cut.
+        completed = inspect.getsource(AgentActivity._user_turn_completed_task)
+        self.assertLess(
+            completed.index("await current_speech.interrupt()"),
+            completed.index("await self._agent.on_user_turn_completed("),
+        )
+        self.assertIn("await self.wait_for_playout()", inspect.getsource(SpeechHandle.__await__))
 
     def test_the_session_takes_a_new_endpointing_pair_while_it_runs(self) -> None:
         # r1_session._apply_endpointing: the transition phase runs 0.4 / 1.2 s through

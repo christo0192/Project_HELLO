@@ -23,8 +23,10 @@ Rules enforced here (each has a unit test):
 * Topic triggers and spacing (R1-Q).  A primary is raised in context: the advisor's turn
   touched its topic (value, time, price, close) this turn or the last, or no objection was
   raised for ``IDLE_GAP_TURNS`` turns; and never closer than ``SPACING_TURNS`` learner
-  turns after the previous objection of any family.  A push waits for a substantive answer
-  (``SUBSTANTIVE_ANSWER_WORDS`` words) or ``PUSH_PATIENCE_TURNS`` turns.
+  turns after the previous objection of any family.  A push waits for an answer to its
+  primary (the advisor touched the family's topic after it, or said
+  ``SUBSTANTIVE_ANSWER_WORDS`` words that are not mainly a question or a request about the
+  call) or ``PUSH_PATIENCE_TURNS`` turns.
 * A deadline FORCES the move at the last learner turn that still lands on time, so spacing
   and triggers can never make a family unschedulable (S0-B defects 1 and 2).
 * "Later deadlines shift instead": a move's effective deadline is
@@ -77,7 +79,8 @@ LOOKAHEAD_MAX_SEC = 90.0
 SPACING_TURNS = 2
 # A primary whose topic never came up is raised after this many turns without an objection.
 IDLE_GAP_TURNS = SPACING_TURNS + 1
-# An advisor turn this long (and not a bare "Okay") counts as a substantive answer to a primary.
+# An advisor turn this long (and not a bare "Okay", nor mainly a question or a request about the
+# call) counts as a substantive answer to a primary.
 SUBSTANTIVE_ANSWER_WORDS = 8
 PUSH_PATIENCE_TURNS = 2
 F3_FALLBACK_OPEN_SEC = 300
@@ -794,6 +797,63 @@ def topics_in(text: object) -> frozenset[str]:
     return frozenset(found)
 
 
+# A request about the call itself, not an answer to the learner: ending it, or asking whether the
+# learner is the one selling (owner test 7f2a25e6: turn 64 "Okay, never mind, can you disconnect
+# the call?" released the F4 push as if it answered the stall; 41 "are you selling the course to
+# me").
+_META_REQUEST = _compile(
+    r"\b(?:disconnect|end|cut|drop|stop)(?: (?:the|this|our))? (?:call|role[- ]?play|interview)\b",
+    r"\bhang up\b",
+    r"\blet'?s disconnect\b",
+    r"\bselling\b[^.?!]{0,30}\bto me\b",
+)
+# An open invitation hands the learner the floor ("What else is on your mind?"): the push answers
+# it, so it is not a question the push would leave unanswered.
+_OPEN_INVITATION = _compile(
+    r"\bwhat else\b",
+    r"\banything else\b",
+    r"\bon your mind\b",
+    r"\bwhat do you think\b",
+    r"\bany (?:other |more |further )?(?:questions|doubts|concerns|worries)\b",
+)
+
+
+# "What students love is that ...", "What matters most is that ...": a wh-cleft is a statement
+# even though it opens like a question (reviewed fix: a 70-word answer with no "?" was judged as
+# asking, so the push waited its patience out).
+_WH_CLEFT = re.compile(r"^\W*(?:what|how|why|where|who)\s+(?:\w+\s+){1,6}?(?:is|was)\s+that\b")
+
+
+def _asks_the_learner(sentence: str) -> bool:
+    """A sentence that asks: a "?", or a question opening that is not a wh-cleft statement."""
+    if "?" in sentence:
+        return True
+    return is_question_like(sentence) and _WH_CLEFT.search(sentence) is None
+
+
+def answers_substantively(text: object) -> bool:
+    """The advisor said something: ``SUBSTANTIVE_ANSWER_WORDS`` words, mostly not questions.
+
+    At least half of the turn's words are in sentences that neither ask the learner something
+    (an open invitation such as "What else is on your mind?" is not counted as asking) nor
+    request something about the call itself (``_META_REQUEST``), so "Okay, never mind, can
+    you disconnect the call?" (eight words, one question) answers nothing.
+    """
+    if word_count(text) < SUBSTANTIVE_ANSWER_WORDS:
+        return False
+    total = said = 0
+    for sentence in _sentences(text):
+        words = word_count(sentence)
+        total += words
+        if any(pattern.search(sentence) for pattern in _META_REQUEST):
+            continue
+        if not _asks_the_learner(sentence) or any(
+            pattern.search(sentence) for pattern in _OPEN_INVITATION
+        ):
+            said += words
+    return 2 * said >= total
+
+
 def _asks_something(sentence: str) -> bool:
     """A question that is not itself a farewell ("Have a great day." opens like one)."""
     if "?" in sentence:
@@ -1047,7 +1107,7 @@ class OwedMoveScheduler:
         topics = topics_in(text)
         for family in topics:
             self._topic_turn[family] = self.turn
-        self._turn_answered = word_count(text) >= SUBSTANTIVE_ANSWER_WORDS
+        self._turn_answered = answers_substantively(text)
         if pitch and self.pitch_turn is None:
             self.pitch_turn = self.turn
         if price and self.price_quoted_turn is None:
@@ -1233,8 +1293,24 @@ class OwedMoveScheduler:
         return self._topic_fresh(family) or gap >= IDLE_GAP_TURNS
 
     def _push_answered(self, primary_id: str) -> bool:
-        """A push follows a substantive answer to its primary, or waits a couple of turns."""
-        return self._turn_answered or (self._since(primary_id) or 0) >= PUSH_PATIENCE_TURNS
+        """A push follows an answer to its primary, or waits a couple of turns.
+
+        An answer is a turn after the primary that touched the family's topic (``_topic_fresh``,
+        but not the turn that prompted the primary itself), or a substantive turn that is not
+        mainly a question or a request about the call (``answers_substantively``).
+        """
+        state = self._states[primary_id]
+        family = state.spec.family
+        on_topic = (
+            self._topic_fresh(family)
+            and state.delivered_turn is not None
+            and self._topic_turn[family] > state.delivered_turn
+        )
+        return (
+            on_topic
+            or self._turn_answered
+            or (self._since(primary_id) or 0) >= PUSH_PATIENCE_TURNS
+        )
 
     def _soft_ready(self, state: _MoveState) -> bool:
         move_id = state.spec.id

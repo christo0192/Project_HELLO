@@ -1730,6 +1730,38 @@ class TestReplyPolicy(R1TestCase):
         self.assertFalse(r1_session.is_backchannel_turn(""))
         self.assertFalse(r1_session.is_backchannel_turn("..."))
 
+    def test_an_acknowledgement_is_narrower_than_a_backchannel(self) -> None:
+        # Voice barge-in, reviewed fix: after a cut only these get the learner's point finished.
+        for text in (
+            "Yeah.", "Okay.", "Ok", "Hmm.", "Mm-hmm.", "Uh-huh.", "Right, right.", "Sure.",
+            "Got it.", "I see.", "Alright.", "All right.", "Yeah, yeah, okay.", "Go ahead.",
+            "Sorry, go ahead.", "No, no, please continue.", "Go on.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_acknowledgement_turn(text))
+        for text in (
+            "Yes.", "No.", "No, no, no.", "Sorry?", "Pardon?", "Sorry.", "Really?", "Okay?",
+            "Right?", "Hello? Are you there?", "Great.", "Thank you.", "Okay, thank you, bye.",
+            "Yeah, so the course costs nine thousand dollars", "", "...",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_acknowledgement_turn(text))
+
+    def test_a_repair_request_asks_to_hear_it_again_or_checks_the_line(self) -> None:
+        for text in (
+            "Sorry?", "Pardon?", "Sorry, again?", "Sorry, what?", "What?", "Come again?",
+            "Excuse me?", "Hello? Are you there?", "Are you still there?", "Can you hear me?",
+            "Sorry, can you say that again?", "Yes, I can hear you.", "Sorry, sorry.", "Huh?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_repair_turn(text))
+        for text in (
+            "Yeah.", "Okay?", "No, no, no.", "Really?", "So what?", "Okay, thank you, bye.",
+            "Sorry, I sell courses.", "What does the course cost?", "Sorry, go ahead.", "", "...",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_repair_turn(text))
+
     async def test_an_early_answer_spoken_over_the_opening_still_counts_as_a_turn(self) -> None:
         self.interview.machine.phase = R1Phase.OPENING
         self.assertTrue(await self.answer("I have been selling for six years"))
@@ -1909,6 +1941,22 @@ class TestSilenceWindows(R1TestCase):
         self.final_transcript("yes, sorry")
         self.assertIsNone(await asyncio.wait_for(ladder, 10.0))
         self.assertNotIn(self.spoken_line("L-SIL-END"), self.session.spoken)
+
+    async def test_silence_after_the_end_question_is_the_ordinary_ladder(self) -> None:
+        # Owner test 7f2a25e6: an answer to "Hello? Are you still there?" must not be read as the
+        # answer to L-ASIDE-END ("say: end the interview"), so the question lapses when silence
+        # wins.
+        self.enter_roleplay()
+        engine = self.interview.engine
+        engine.plan_turn("Hi, thanks for taking my call.", 20)
+        self.assertTrue(engine.plan_turn("Can you end the call?", 60).aside)
+        ladder = mock.AsyncMock(return_value=None)
+        with mock.patch.object(r1_session, "ROLEPLAY_PROMPT_SECONDS", 0.01), \
+                mock.patch.object(self.interview, "_silence_ladder", ladder):
+            self.assertIsNone(await asyncio.wait_for(self.interview._roleplay_turn(), 10.0))
+        ladder.assert_awaited_once()
+        self.assertFalse(engine.plan_turn("End it.", 100).end_interview)
+        self.assertFalse(engine.end_confirmed)
 
     async def test_rp2_enters_aside_and_stays_there_on_terminal_silence(self) -> None:
         self.enter_roleplay()
@@ -3220,6 +3268,34 @@ class TestRunFlow(R1TestCase):
         self.assertEqual(self.writer.terminals, [("candidate_left", {"activated": True})])
         self.assertEqual(self.writer.outcomes, ["candidate_left"])
 
+    async def test_a_confirmed_request_to_stop_is_the_same_failed_session(self) -> None:
+        # Owner test 7f2a25e6: "can you disconnect the call?" gets the interviewer's question once;
+        # saying "end the interview" ends it exactly as closing the window does (no new outcome).
+        task = asyncio.create_task(
+            run_r1_session(self.ctx, session_factory=self.session_factory)
+        )
+        await self.until(lambda: self._machine_phase() is R1Phase.ICEBREAKER)
+        self.clock.advance(215)
+        await self.four_icebreaker_answers()
+        await self.candidate_replies_after("L-TRANSITION", "ready")
+        await self.until(lambda: self._machine_phase() is R1Phase.ROLEPLAY)
+        await self.until(lambda: self.spoken_and_played("L-PICKUP"))
+        await self.settle()
+        self.clock.advance(60)
+        self.assertTrue(await self.answer("Okay, never mind, can you disconnect the call?"))
+        await self.until(lambda: self.spoken_and_played("L-ASIDE-END"))
+        await self.settle()
+        self.assertTrue(await self.answer("Yes, end the interview."))
+        self.assertEqual(await asyncio.wait_for(task, 10.0), "candidate_left")
+        self.assertEqual(self.writer.terminals, [("candidate_left", {"activated": True})])
+        self.assertEqual(self.writer.outcomes, ["candidate_left"])
+        spoken = self.session.spoken
+        self.assertEqual(spoken.count(self.spoken_line("L-END-CLOSE")), 1)
+        for line_id in ("L-EXIT", "L-WRAP", "L-CLOSE", "L-SYSTEM-STOP"):
+            self.assertNotIn(self.spoken_line(line_id), spoken)
+        # A stop the candidate chose is not announced as a technical one.
+        self.assertNotIn({"phase": "aborted"}, self.ctx.room.local_participant.attributes)
+
     def _machine_phase(self):
         # run_r1_session builds its own interview; the agent holds a reference to it.
         agent = self.session.agent
@@ -4271,9 +4347,18 @@ class TestBackchannelsOverAPendingReply(R1TestCase):
     from committing, so these tests pin what it does about the committed turn: it does not count
     it as an answer, it does not restart the candidate's wait for the next reply, and the reply it
     cost is counted in the p95.
+
+    ``min_words`` 3 is the runbook's ROLLBACK since the owner chose voice barge-in (0 words) on
+    2026-10-28, so the banking cases run at 3; ``TestBackchannelsAtZeroWords`` covers the default,
+    where every one of these fragments is its own committed turn.
     """
 
     ANSWER = "I have been selling courses to working professionals for eleven years now"
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {"R1_INTERRUPT_MIN_WORDS": "3"}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     @staticmethod
     async def hung_stream():
@@ -4528,6 +4613,367 @@ class TestBackchannelsOverAPendingReply(R1TestCase):
         (sample,) = [s for s in tracker._headline if s[1] > 2.5]
         self.assertAlmostEqual(sample[1], 3.0)  # the old turn's own wait, not the new one's
         self.assertIsNotNone(turn)
+
+
+class TestBackchannelsAtZeroWords(R1TestCase):
+    """Voice barge-in (owner decision 2026-10-28): ``min_words`` 0, nothing is refused or banked.
+
+    A lone "Sorry" over a pending reply is committed on its own and cancels the reply (the SDK
+    applies no word floor at 0).  What R1 does about that turn is unchanged from the 3-word case:
+    it is not an answer, the candidate's wait is not restarted, and the lost reply counts in the
+    p95 as a lower bound.
+    """
+
+    ANSWER = TestBackchannelsOverAPendingReply.ANSWER
+    hung_stream = staticmethod(TestBackchannelsOverAPendingReply.hung_stream)
+    collect = TestBackchannelsOverAPendingReply.collect
+    reply_pending_for = TestBackchannelsOverAPendingReply.reply_pending_for
+    sdk_commits = TestBackchannelsOverAPendingReply.sdk_commits
+    lost = TestBackchannelsOverAPendingReply.lost
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("R1_INTERRUPT_MIN_WORDS", None)  # the default
+
+    async def test_a_single_sorry_is_not_held_back_and_its_own_turn_cancels_the_reply(self) -> None:
+        handle, generation = await self.reply_pending_for(self.ANSWER)
+        self.final_transcript("Sorry")
+        await self.settle()
+        self.assertFalse(self.interview._fragment_held_back())  # nothing is banked at 0
+        self.clock.advance(2.0)
+        with self.capture_logs() as logs:
+            self.assertFalse(await self.sdk_commits(handle, generation, "Sorry"))
+        self.assertEqual(len(self.lost(logs)), 1)
+        await self.flush()
+        self.assertEqual(
+            [r["text"] for r in self.writer.saved if r["speaker"] == "candidate"],
+            [self.ANSWER, "Sorry"],  # its own row, not prepended to a later turn
+        )
+        self.assertEqual(self.interview.machine.candidate_turns, 1)  # not an answer
+        self.assertIsNotNone(self.interview._unvoiced_since)  # the old wait keeps running
+        self.assertAlmostEqual(self.interview._filler_delay(), 2.0)
+
+    async def test_the_lost_reply_still_counts_in_the_p95_at_zero_words(self) -> None:
+        tracker = self.interview._latency
+        self.enter_roleplay()
+        for number in range(8):
+            self.clock.advance(10.0)
+            tracker.begin_turn(100 + number, "roleplay")
+            self.clock.advance(1.0)
+            tracker.first_audio()
+        handle, generation = await self.reply_pending_for(self.ANSWER)
+        self.final_transcript("Okay")
+        await self.settle()
+        self.clock.advance(6.0)
+        await self.sdk_commits(handle, generation, "Okay")
+        self.assertEqual(tracker.replies_lost("roleplay"), 1)
+        self.assertEqual(tracker.first_audio_p95_ms(), 6000)
+
+    async def test_a_learner_reply_lost_to_an_okay_is_planned_again(self) -> None:
+        # Reviewed fix: the lost reply's plan (its ask, its commitment line) is the answer still
+        # owed, so the lone "Okay." that cancelled it gets that same plan, not a fresh free reply.
+        self.enter_roleplay()
+        engine = self.interview.engine
+        with mock.patch.object(engine, "reply_lost", wraps=engine.reply_lost) as lost, \
+                mock.patch.object(self.interview, "_spawn_judge") as judge:
+            handle, generation = await self.reply_pending_for(self.ANSWER)
+            planned = self.interview._last_reply.plan
+            self.final_transcript("Okay.")
+            await self.settle()
+            self.assertFalse(await self.sdk_commits(handle, generation, "Okay."))
+        lost.assert_called_once_with(planned)
+        again = self.interview._last_reply.plan
+        self.assertIn("replanned_after_lost_reply", again.reasons)
+        self.assertEqual(again.turn, planned.turn)
+        # The turn was judged on the real answer; the "Okay." is not judged for it a second time.
+        self.assertEqual([c.args[0] for c in judge.call_args_list], [self.ANSWER])
+
+    async def test_a_reply_that_was_heard_or_not_a_role_play_reply_is_not_lost(self) -> None:
+        engine = self.interview.engine
+        with mock.patch.object(engine, "reply_lost") as lost, mock.patch.object(
+            engine, "record_spoken", wraps=engine.record_spoken
+        ) as spoken:
+            # The icebreaker: Christy's reply has no role-play plan.
+            handle, generation = await self.reply_pending_for(self.ANSWER)
+            await self.sdk_commits(handle, generation, "Okay.")
+            self.enter_roleplay()
+            # A learner reply cut after some of its words were heard (a barge-in cut): the SDK
+            # adds the item with the synchronised words inside the reply task, before the handle
+            # is done, so the engine records what was said.
+            handle, generation = await self.reply_pending_for(self.ANSWER)
+            planned = self.interview._last_reply.plan
+            self.agent_state("speaking")
+            message = FakeChatMessage("Honestly I keep wondering whether I could", interrupted=True)
+            self.session.emit("conversation_item_added", SimpleNamespace(item=message))
+            handle.chat_items.append(message)
+            await self.sdk_commits(handle, generation, "Okay.")
+        lost.assert_not_called()
+        self.assertEqual([c.args[0] for c in spoken.call_args_list], [planned])
+        self.assertTrue(spoken.call_args.kwargs["interrupted"])
+
+    async def test_a_learner_reply_cut_after_its_first_audio_but_before_a_word_is_lost(
+        self,
+    ) -> None:
+        # Reviewed fix: the first audio frame claimed the slot ("speaking"), but the candidate's
+        # "Okay." cut the reply before any word was synchronised, so the SDK added no item
+        # (forwarded text ""): neither reply_lost nor record_spoken reached the engine, and the
+        # plan's ask, next-step question and commitment line were used up as if heard.
+        self.enter_roleplay()
+        engine = self.interview.engine
+        tracker = self.interview._latency
+        with mock.patch.object(engine, "reply_lost", wraps=engine.reply_lost) as lost, \
+                mock.patch.object(engine, "record_spoken", wraps=engine.record_spoken) as spoken, \
+                mock.patch.object(self.interview, "_spawn_judge"):
+            handle, generation = await self.reply_pending_for(self.ANSWER)
+            planned = self.interview._last_reply.plan
+            self.session.current_speech = handle
+            self.agent_state("speaking")  # the first audio frame played: the slot is claimed
+            self.final_transcript("Okay.")
+            await self.settle()
+            with self.capture_logs() as logs:
+                self.assertFalse(await self.sdk_commits(handle, generation, "Okay."))
+        lost.assert_called_once_with(planned)
+        spoken.assert_not_called()
+        again = self.interview._last_reply.plan
+        self.assertIn("replanned_after_lost_reply", again.reasons)
+        self.assertEqual(again.turn, planned.turn)
+        # The audio did start: it is not a reply cancelled before audio, for the count or the p95.
+        self.assertEqual(self.lost(logs), [])
+        self.assertEqual(tracker.replies_lost(None), 0)
+        self.assertEqual(self.interview._replies_cancelled_before_audio, 0)
+        await self.flush()
+        self.assertEqual(self.bot_rows(), [])  # and no row: nothing of it was heard
+
+    async def test_an_unheard_cut_is_reported_once_and_never_also_recorded(self) -> None:
+        # The SDK adds an item only inside the reply task, before the handle is done; one that
+        # arrived anyway after the done callback reported the plan lost finds no slot, so
+        # record_spoken can never follow reply_lost for the same plan.
+        self.enter_roleplay()
+        engine = self.interview.engine
+        with mock.patch.object(engine, "reply_lost") as lost, \
+                mock.patch.object(engine, "record_spoken") as spoken:
+            handle, generation = await self.reply_pending_for(self.ANSWER)
+            reply = self.interview._last_reply
+            self.session.current_speech = handle
+            self.agent_state("speaking")
+            await self.sdk_commits(handle, generation, "Okay.")
+            self.assertTrue(reply.recorded)
+            late = FakeChatMessage("Honestly", interrupted=True)
+            self.session.emit("conversation_item_added", SimpleNamespace(item=late))
+            self.interview._record_learner_speech(
+                SimpleNamespace(reply=reply, cut_by_r1=False), "Honestly", True
+            )
+        lost.assert_called_once_with(reply.plan)
+        spoken.assert_not_called()
+
+
+class TestInterruptedLearnerRowKeepsOnlyWhatWasHeard(R1TestCase):
+    """A learner line the candidate cut off is persisted ``interrupted`` with only the played text.
+
+    The SDK hands R1 the assistant item with the text that was synchronised up to the cut and
+    ``interrupted=True``; R1 writes that row, puts that same text in the learner's context, and
+    tells the engine (``record_spoken(..., interrupted=True)``), whose next plan answers the
+    candidate first.  ``backchannel`` reaches the engine from the worker's own judgement.
+    """
+
+    PLAYED = "Honestly I keep wondering whether I could"
+
+    async def cut_learner(self) -> FakeSpeechHandle:
+        if self.interview.machine.phase is not R1Phase.ROLEPLAY:
+            self.enter_roleplay()
+        self.assertFalse(await self.answer("Hi Meera, thanks for taking my call today"))
+        handle = FakeSpeechHandle("the learner's reply")
+        self.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=False),
+        )
+        self.session.current_speech = handle
+        self.agent_state("speaking")
+        return handle
+
+    def deliver_cut(self, handle: FakeSpeechHandle) -> None:
+        message = FakeChatMessage(self.PLAYED, interrupted=True)
+        self.session.emit("conversation_item_added", SimpleNamespace(item=message))
+        handle.chat_items.append(message)
+        handle.interrupted = True
+        handle.finish()
+        self.session.current_speech = None
+        self.agent_state("listening")
+
+    async def test_the_row_is_interrupted_and_holds_only_what_was_played(self) -> None:
+        handle = await self.cut_learner()
+        with mock.patch.object(
+            self.interview.engine, "record_spoken", wraps=self.interview.engine.record_spoken
+        ) as record:
+            self.final_transcript("Wait, can I ask something first?")
+            self.deliver_cut(handle)
+            await self.flush()
+        (row,) = self.bot_rows()
+        self.assertEqual((row["text"], row["interrupted"], row["phase"]), (self.PLAYED, True, "roleplay"))
+        self.assertTrue(record.call_args.kwargs["interrupted"])
+        self.assertEqual(record.call_args.args[1], self.PLAYED)
+        learner = [e for e in self.interview._history if e["role"] == "bot"]
+        self.assertEqual(learner[-1]["text"], self.PLAYED)  # her context sees what was heard
+        # The candidate's turn that cut her is its own row, after hers.
+        self.assertFalse(await self.commit_turn("Wait, can I ask something first?"))
+        await self.flush()
+        rows = sorted(self.writer.saved, key=lambda r: r["index"])
+        self.assertEqual(
+            [(r["speaker"], r["interrupted"]) for r in rows[-2:]],
+            [("bot", True), ("candidate", False)],
+        )
+        from r1_prompts import INTERRUPTED_NOTE
+
+        self.assertIn(INTERRUPTED_NOTE, self.interview._last_reply.plan.reminder)
+
+    async def test_a_lone_yeah_that_cut_her_gets_her_point_finished(self) -> None:
+        handle = await self.cut_learner()
+        self.final_transcript("Yeah.")
+        self.deliver_cut(handle)
+        await self.settle()
+        self.assertFalse(await self.commit_turn("Yeah."))
+        plan = self.interview._last_reply.plan
+        self.assertIn("backchannel_continuation", plan.reasons)
+        self.assertIsNone(plan.move_id)
+
+    async def test_a_line_that_played_out_is_not_a_cut_and_a_yeah_is_a_plain_turn(self) -> None:
+        handle = await self.cut_learner()
+        message = FakeChatMessage("Honestly I keep wondering whether I could do this.")
+        self.session.emit("conversation_item_added", SimpleNamespace(item=message))
+        handle.chat_items.append(message)
+        handle.finish()
+        self.session.current_speech = None
+        await self.flush()
+        self.assertFalse(self.bot_rows()[0]["interrupted"])
+        self.assertFalse(await self.answer("Yeah."))
+        self.assertNotIn("backchannel_continuation", self.interview._last_reply.plan.reasons)
+
+    async def test_a_real_answer_that_cut_her_is_not_a_backchannel(self) -> None:
+        handle = await self.cut_learner()
+        self.final_transcript("Yeah, so the course costs nine thousand dollars")
+        self.deliver_cut(handle)
+        await self.settle()
+        self.assertFalse(await self.commit_turn("Yeah, so the course costs nine thousand dollars"))
+        self.assertNotIn("backchannel_continuation", self.interview._last_reply.plan.reasons)
+
+    async def plan_after_cut_by(self, text: str) -> Any:
+        handle = await self.cut_learner()
+        self.final_transcript(text)
+        self.deliver_cut(handle)
+        await self.settle()
+        self.assertFalse(await self.commit_turn(text))
+        return self.interview._last_reply.plan
+
+    async def test_a_sorry_or_pardon_that_cut_her_gets_her_point_again(self) -> None:
+        # Reviewed fix: "Sorry?" was planned as a backchannel and told not to repeat anything.
+        for text in ("Sorry?", "Pardon?", "Sorry, can you say that again?", "Hello? You there?"):
+            with self.subTest(text=text):
+                plan = await self.plan_after_cut_by(text)
+                self.assertIn("repeat_after_cut", plan.reasons)
+                self.assertNotIn("backchannel_continuation", plan.reasons)
+
+    async def test_an_uh_huh_or_a_hand_back_that_cut_her_gets_her_point_finished(self) -> None:
+        for text in ("Uh-huh.", "Mm-hmm.", "Sorry, go ahead."):
+            with self.subTest(text=text):
+                plan = await self.plan_after_cut_by(text)
+                self.assertIn("backchannel_continuation", plan.reasons)
+
+    async def test_a_denial_or_a_yes_that_cut_her_is_answered_first(self) -> None:
+        from r1_prompts import BACKCHANNEL_CUT_NOTE, INTERRUPTED_NOTE
+
+        for text in ("No, no, no.", "Yes.", "Really?"):
+            with self.subTest(text=text):
+                plan = await self.plan_after_cut_by(text)
+                self.assertNotIn("backchannel_continuation", plan.reasons)
+                self.assertNotIn("repeat_after_cut", plan.reasons)
+                self.assertNotIn(BACKCHANNEL_CUT_NOTE, plan.reminder)
+                self.assertIn(INTERRUPTED_NOTE, plan.reminder)
+
+    async def test_a_hung_reply_r1_cut_itself_is_not_a_cut_by_the_candidate(self) -> None:
+        # Reviewed fix: the filler of a reply that hung past its deadline is cut by R1
+        # (``_interrupt_session``); the candidate's next turn is not answered as a barge-in.
+        handle = await self.cut_learner()
+        filler: list[str] = []
+        with mock.patch.object(
+            self.interview.engine, "record_spoken", wraps=self.interview.engine.record_spoken
+        ) as record:
+            with mock.patch.object(r1_session, "FILLER_AFTER_SECONDS", 0.01), mock.patch.object(
+                r1_session, "TURN_DEADLINE_SECONDS", 0.2
+            ):
+                with self.assertRaises(TimeoutError):
+                    async for item in self.interview.guard_llm_stream(
+                        TestLlmGuard.hung_stream()
+                    ):
+                        filler.append(item)
+            await self.until(lambda: self.session.interrupts >= 1)
+            message = FakeChatMessage(filler[0].strip(), interrupted=True)
+            self.session.emit("conversation_item_added", SimpleNamespace(item=message))
+            handle.chat_items.append(message)
+            handle.interrupted = True
+            handle.finish()
+            self.session.current_speech = None
+            await self.flush()
+        self.assertTrue(record.call_args.kwargs["interrupted"])
+        self.assertFalse(record.call_args.kwargs["by_candidate"])
+        self.assertFalse(self.interview.engine._learner_cut)
+
+    async def test_a_reply_the_candidate_cut_is_a_cut_by_the_candidate(self) -> None:
+        handle = await self.cut_learner()
+        with mock.patch.object(
+            self.interview.engine, "record_spoken", wraps=self.interview.engine.record_spoken
+        ) as record:
+            self.deliver_cut(handle)
+            await self.flush()
+        self.assertTrue(record.call_args.kwargs["by_candidate"])
+        self.assertTrue(self.interview.engine._learner_cut)
+
+
+class TestWhatTheCandidateCanCut(R1TestCase):
+    """Barge-in may cut LLM replies only: every scripted ``say()`` line stays uninterruptible.
+
+    Consent and disclosure (L-OPEN), the transition instructions, the wrap-up and close, the
+    interviewer's asides and the system stop must be heard whole, exactly as before 2026-10-28.
+    """
+
+    MUST_BE_HEARD = (
+        "L-OPEN", "L-PICKUP", "L-TRANSITION", "L-TRANSITION-NUDGE", "L-SIL-IB", "L-SIL-RP1",
+        "L-SIL-RP2", "L-SIL-END", "L-MUTE", "L-REJOIN", "L-REJOIN-RP", "L-EXIT", "L-WRAP",
+        "L-CLOSE", "L-SYSTEM-STOP", "L-END-CLOSE",
+    )
+
+    async def test_every_scripted_line_is_spoken_uninterruptible(self) -> None:
+        for line_id in self.MUST_BE_HEARD:
+            with self.subTest(line=line_id):
+                await self.interview.say(line_id)
+                self.assertFalse(self.session.handles[-1].allow_interruptions)
+
+    async def test_the_interviewers_asides_are_uninterruptible(self) -> None:
+        self.enter_roleplay()
+        for line_id in ("L-ASIDE-COACH", "L-ASIDE-END"):
+            with self.subTest(line=line_id):
+                plan = SimpleNamespace(scripted_text=self.spoken_line(line_id), line_id=line_id)
+                await self.interview._play_aside(plan)
+                self.assertFalse(self.session.handles[-1].allow_interruptions)
+
+    async def test_the_recovery_line_in_place_of_a_reply_may_be_cut(self) -> None:
+        self.enter_roleplay()
+        await self.interview._speak_recovery(R1Phase.ROLEPLAY)
+        self.assertEqual(self.session.spoken[-1], FALLBACK_REPLY)
+        self.assertTrue(self.session.handles[-1].allow_interruptions)
+
+    def test_no_scripted_call_site_asks_for_an_interruptible_line(self) -> None:
+        source = Path(r1_session.__file__).read_text(encoding="utf-8")
+        calls = re.findall(r"await self\.say\((.*?)\)", source, flags=re.S)
+        self.assertGreaterEqual(len(calls), 13)
+        for call in calls:
+            self.assertNotIn("interruptible", call)
+        self.assertIn("interruptible: bool = False", source)  # say()'s own default
+        self.assertEqual(source.count("interruptible=True"), 1)  # the llm_recovery line only
+        self.assertEqual(
+            source.count("interruptible=False"), 1
+        )  # _play_aside: the asides
 
 
 class TestTransitionRunsQuickerEndpointing(R1TestCase):

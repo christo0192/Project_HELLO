@@ -12,9 +12,12 @@ engine only DECIDES, deterministically, what the learner does on each candidate 
 ``SAY_ONLY``
     Speak ``plan.scripted_text`` verbatim and call no LLM: the graded commitment line (STRONG,
     MEDIUM with its call slot, or the WEAK resolution), the close-attempt stall, or
-    (``plan.aside``) the interviewer's one-off L-ASIDE-COACH, which the session speaks in the
-    ASIDE phase with ``plan.voice == "interviewer"`` and which is excluded from evidence
-    (plan 5.10).  The WEAK line is spoken at most once per session (``r1_negotiation``).
+    (``plan.aside``) the interviewer's one-off L-ASIDE-COACH or L-ASIDE-END (``plan.line_id``),
+    which the session speaks in the ASIDE phase with ``plan.voice == "interviewer"`` and which
+    is excluded from evidence (plan 5.10), or (``plan.end_interview``) L-END-CLOSE after the
+    candidate confirmed they want to stop, which ends the session as ``candidate_left`` (only
+    before R = 14:00 with no commitment on record; otherwise an end request is a farewell).  The
+    WEAK line is spoken at most once per session (``r1_negotiation``).
 ``INTENT``
     R1-Q option B, intent-voiced moves.  The worker decides WHAT the learner raises (an owed
     objection, an early-farewell redirect, the time cue, and, from the negotiation, a stall
@@ -23,9 +26,10 @@ engine only DECIDES, deterministically, what the learner does on each candidate 
     ``plan.intent.brief`` in its own words.  Delivery is proven by ``plan.intent.markers`` in
     the text that was played.  If the model's reply misses them, ``intent_tail`` returns a
     scripted variant (``plan.intent.fallbacks``, vetted by the repetition check) that the
-    session appends, so an owed move is never lost to the model.  ``compose_speech`` builds
-    the final text for callers that do not stream.  The 19:00 stall is an INTENT without
-    markers: one short model reaction, then the scripted WEAK line, always.
+    session appends, so an owed move is never lost to the model (a reply that already asked
+    a question gets no second negotiation question: that line then waits).
+    ``compose_speech`` builds the final text for callers that do not stream.  The 19:00 stall
+    is an INTENT without markers: one short model reaction, then the scripted WEAK line, always.
 ``LLM_REPLY``
     A free, constrained reply using ``plan.reminder`` (a HINT for a first probe, the DEEP
     need's facts only on the turn that asks about a released topic, and now and then one
@@ -62,8 +66,17 @@ transcript in ROLEPLAY, with ``r_sec`` read from the phase machine's role-play c
     engine = RolePlayEngine(resolve_persona(pid, variant=v, seed=attempt_id,
                                             avoid_first_name=first_name),
                             candidate_first_name=first_name, seed=attempt_id)
-    plan = engine.plan_turn(text, machine.roleplay_elapsed, turn_index=i)
+    plan = engine.plan_turn(text, machine.roleplay_elapsed, turn_index=i,
+                            backchannel=is_acknowledgement_turn(text),
+                            repair=is_repair_turn(text),
+                            answers_nothing=is_backchannel_turn(text))
+    (after a barge-in cut the learner's line: an owed move it did not deliver waits one turn
+     while the plan has a turn to spare, a lone acknowledgement only gets her point finished and
+     a "Sorry?" gets it again, and a graded commitment line she did not finish is said again;
+     see ``record_spoken``.  A reply cancelled before any audio is reported with
+     ``engine.reply_lost(plan)``)
     if plan.exit_roleplay:            -> machine.transition(ROLEPLAY_EXIT)
+    elif plan.end_interview:          -> say L-END-CLOSE, finish as candidate_left (no wrap-up)
     elif plan.aside:                  -> ASIDE phase, say(plan.scripted_text), back to ROLEPLAY
     elif plan.mode is SAY_ONLY:       -> raise StopResponse; say(plan.scripted_text)
     else (INTENT or LLM_REPLY):       -> add plan.reminder as the ephemeral system message;
@@ -115,7 +128,6 @@ from r1_negotiation import (
     KIND_STALL,
     N_EMAIL,
     N_EMAIL_YES,
-    N_QUESTION,
     N_TIMING,
     REASON_DECISION_MAKER,
     REASON_MONEY,
@@ -129,11 +141,14 @@ from r1_negotiation import (
     declines_call,
     fill_decision_maker,
     filled_markers,
+    question_spec,
 )
 from r1_personas import H_TOPICS, RenderedPersona, asks_about_learner, detect_probes
 from r1_prompts import (
     ANCHOR_NOT_OFFERED_NOTE,
     ANSWERED_NOTE,
+    BACKCHANNEL_CUT_NOTE,
+    CHALLENGE_NOTE,
     CHECKIN_DONE_NOTE,
     CHECKIN_NOTE,
     DECIDER_ASKED_NOTE,
@@ -141,6 +156,8 @@ from r1_prompts import (
     EMAIL_OFFER_NOTE,
     HOLD_NOTE,
     HOLLOW_NOTE,
+    CUT_REPEAT_NOTE,
+    INTERRUPTED_NOTE,
     NEXT_STEP_PROPOSED_NOTE,
     PRICE_MET_NOTE,
     PRICE_UNCHANGED_NOTE,
@@ -160,6 +177,7 @@ from r1_scheduler import (
     COMMIT_STALL,
     CURIOSITY_EVERY,
     CURIOSITY_TOPICS,
+    EARLY_CLOSE_BEFORE_SEC,
     F1_ANCHOR,
     F1_COUNTER,
     F2_PRIMARY,
@@ -169,6 +187,9 @@ from r1_scheduler import (
     F4_PRIMARY,
     F4_PUSH,
     F4_PUSH_CALL_SUFFIX,
+    FAMILIES,
+    IDLE_GAP_TURNS,
+    PLAN,
     REDIRECT_BRIEF,
     REDIRECT_OPENERS,
     TIME_CUE,
@@ -177,6 +198,7 @@ from r1_scheduler import (
     OwedMoveScheduler,
     answered_topics,
     curiosity_covered,
+    is_close_attempt,
     markers_match,
     quotes_price,
 )
@@ -188,6 +210,7 @@ from r1_text import (
     SpokenMemory,
     canonical_amounts,
     dollar_amounts,
+    fold,
     fuzzy_contains,
     is_closer,
     is_hollow_turn,
@@ -204,8 +227,12 @@ from r1_tracker import (
     CoverageTracker,
     NeedState,
     build_judge_messages,
+    confirms_end,
+    declines_end,
     detect_character_break,
+    detect_end_request,
     parse_judge_output,
+    promises_call_back,
 )
 from r1_world import WORLD_VERSION
 
@@ -229,6 +256,52 @@ KIND_CUE = "cue"
 STYLE_HISTORY = 8
 # Situation notes that belong to a free reply: an intent has its own brief to voice.
 _FREE_REPLY_NOTES = frozenset({ANCHOR_NOT_OFFERED_NOTE, TRY_NOT_GRANTED_NOTE})
+# The advisor challenges the learner's own words or how the learner is asking (owner test
+# 7f2a25e6: 56 "where did you get that number?", 58 "you are asking too many questions").  Read
+# sentence by sentence; "where did you get your degree?" is a dig, not a challenge.  A sales point
+# that opens the same way is not one either (reviewed fix): "I didn't mention it earlier, but we
+# also have EMI", "why do you ask? Is budget a big concern?" (a sales technique), "you keep asking
+# great questions".
+_CHALLENGE = re.compile(
+    r"\bwhere did you (?:get|hear|read) (?:that|this|it|those|these|the idea|the number)\b"
+    r"|\bi (?:didn'?t|did not|never) (?:say|said|mention|mentioned|tell you|told you) "
+    r"(?:anything|that|this|it|so)\b(?!.*\b(?:but|earlier|before|yet|however|also)\b)"
+    r"|\bwhy (?:are|do) you keep ask(?:ing)?\b"
+    r"|\bwhy are you (?:still |always )?asking (?:me )?"
+    r"(?:so many|the same|all th(?:is|ese)|again)\b"
+    r"|\btoo many questions\b"
+    r"|\byou keep asking (?:me|so many|the same|all th(?:is|ese)|again|questions)\b",
+    re.IGNORECASE,
+)
+# Owed moves held back for a challenge in one session: a combative advisor cannot stall the plan.
+MAX_CHALLENGE_DEFERRALS = 2
+# A cut or challenged objection waits a turn only while the plan is ahead of its pacing map
+# (``RolePlayEngine._ahead_of_pacing``).  Each objection still owed is given this many turns: the
+# idle gap a primary waits when the advisor never invites it, plus one for a cut.  On the final
+# review's bunching grid (six advisor patterns x 20, 25, 35, 50 and 65 s an exchange) 4 is never
+# worse than the release without holds on forced moves, slip or deliveries; 2.5 forced the F4 pair
+# at 35 s, and 3 or 3.5 delivered the time cue up to 12 s later.
+SLACK_TURNS_PER_MOVE = IDLE_GAP_TURNS + 1
+# Each family's required moves and their shared deadline, in plan order (the pacing map).
+_PACING_MAP: tuple[tuple[int, tuple[str, ...]], ...] = tuple(
+    (
+        max(spec.deadline_sec or 0 for spec in PLAN if spec.family == family and spec.required),
+        tuple(spec.id for spec in PLAN if spec.family == family and spec.required),
+    )
+    for family in FAMILIES
+)
+# A turn this short that says no "no" leaves L-ASIDE-END's question open: speech-to-text finalises
+# a lone "Hmm", "Okay." or "Yeah." about a second before the rest (owner test 7f2a25e6, 43/55/70).
+END_FRAGMENT_WORDS = 2
+# Voice barge-in: how often a graded commitment line that was played and then cut by a barge-in is
+# said again on a later turn, per session.  A line the candidate never heard a word of (cancelled
+# before any audio, ``reply_lost``) is said again as well, without counting.
+COMMITMENT_REVOICE_LIMIT = 2
+
+
+def challenges_learner(text: object) -> bool:
+    """The advisor pushes back on something the learner said or on how the learner asks."""
+    return any(_CHALLENGE.search(fold(sentence)) for sentence in split_sentences(text))
 
 
 class TurnMode(str, Enum):
@@ -277,6 +350,15 @@ class TurnPlan:
     intent: LearnerIntent | None = None
     # R1-Q: the negotiation spec an INTENT plan voices (a stall reason, the e-mail yes ...), if any.
     negotiation_id: str | None = None
+    # The scripted interviewer line an aside speaks (L-ASIDE-COACH, L-ASIDE-END, L-END-CLOSE), and
+    # whether the candidate confirmed they want to stop: the session then says L-END-CLOSE and
+    # ends as ``candidate_left``, exactly as closing the window would (never the wrap-up).
+    line_id: str | None = None
+    end_interview: bool = False
+    # Voice barge-in: an owed move this plan does not voice but may complete.  The advisor cut the
+    # learner off while she was raising it and she is told to finish (or repeat) her point: when the
+    # played text proves the move it counts as delivered then (``record_spoken``), never twice.
+    credit_move_id: str | None = None
 
     @property
     def needs_llm(self) -> bool:
@@ -394,6 +476,40 @@ class RolePlayEngine:
         # R1-Q final review round 1.  The tracked phrases of each reply (the guard's spacing window
         # for the stall phrases).
         self._phrase_history: list[tuple[str, ...]] = []
+        # Owner test 7f2a25e6.  The owed move held back by each turn on which the advisor challenged
+        # the learner, in order (at most ``MAX_CHALLENGE_DEFERRALS`` per session; one move can be
+        # held by two challenges in a row).
+        self._challenge_deferred: list[str] = []
+        # Owner test 7f2a25e6 ("can you disconnect the call?").  The one-off L-ASIDE-END question
+        # (when it played), whether it is still open (a fragment leaves it open), and whether the
+        # candidate confirmed the stop (the session ends as ``candidate_left``; nothing here can
+        # reach the wrap-up, a grade or a disclosure).  From 14:00, or with a commitment on
+        # record, an end request is a farewell instead and reaches only what "bye" reaches.
+        self._end_aside: dict[str, Any] | None = None
+        self._end_pending = False
+        self.end_confirmed = False
+        # Voice barge-in (owner decision 2026-10-28).  Whether the advisor cut the learner's last
+        # line off after part of it was heard, the owed move that line carried and did not
+        # deliver, and the moves already held back once for a cut (at most once per move).  The
+        # first two describe the last line only: the next ``plan_turn`` consumes them.
+        self._learner_cut = False
+        self._cut_move: str | None = None
+        self._interrupt_deferred: set[str] = set()
+        # The graded commitment line the candidate did not hear whole (a barge-in cut it before the
+        # end, or the SDK cancelled it before any word was heard), and whether part of it WAS heard
+        # (a cut): it is said again on the next turn, and only a cut line's revoice counts toward
+        # ``COMMITMENT_REVOICE_LIMIT``.  And the plan whose reply was cancelled before any audio
+        # (``reply_lost``), with what its planning consumed: a turn that answers nothing ("Okay.",
+        # "Sorry?") gets that very plan again; any other turn is planned afresh, with the ask, the
+        # next-step question, the stall counts and the close-ladder count the lost plan used up
+        # given back.
+        self._unheard_commitment: TurnPlan | None = None
+        self._unheard_was_cut = False
+        self._commitment_revoices = 0
+        self._lost_plan: TurnPlan | None = None
+        self._lost_undo: tuple[Any, ...] | None = None
+        self._turn_undo: tuple[Any, ...] | None = None
+        self._turn_ask: AskKind | None = None
 
     # ------------------------------------------------------------------- properties
     @property
@@ -512,18 +628,110 @@ class RolePlayEngine:
         *,
         turn_index: int | None = None,
         candidate_seconds: float | None = None,
+        backchannel: bool = False,
+        repair: bool = False,
+        answers_nothing: bool = False,
     ) -> TurnPlan:
-        """Decide what the learner does after this candidate turn (see module docstring)."""
+        """Decide what the learner does after this candidate turn (see module docstring).
+
+        The worker's judgement of a short turn (``r1_session``):
+
+        * ``backchannel``: nothing but acknowledgement ("yeah", "okay", "mm-hmm";
+          ``is_acknowledgement_turn``).  When this turn cut the learner's last line off
+          (``record_spoken(..., interrupted=True)``) she only finishes her point.
+        * ``repair``: only a request to hear it again or a check that she is there ("Sorry?",
+          "Pardon?", "Hello? Are you there?"; ``is_repair_turn``).  After a cut she says it again.
+        * ``answers_nothing``: courtesy words alone (``is_backchannel_turn``).  With the two above
+          it decides whether a plan whose reply was cancelled before any audio (``reply_lost``)
+          is simply planned again.
+        """
         # Ship restore, a pure cost bound: every reader below is lexical and linear in the text, and
         # no real advisor turn comes near this (longest live turn 1,072 characters, the owner's
         # longest grouped turn 1,039), so the bound only shortens pathological speech-to-text.
         if isinstance(candidate_text, str) and len(candidate_text) > MAX_CANDIDATE_CHARS:
             candidate_text = candidate_text[-MAX_CANDIDATE_CHARS:]
+        # Voice barge-in: whether THIS turn is the one that cut the learner's last line off, and the
+        # owed move that line failed to deliver.  Consumed here, whatever the turn turns out to be.
+        cut, self._learner_cut = self._learner_cut, False
+        cut_move, self._cut_move = self._cut_move, None
+        lone_backchannel = cut and backchannel
+        repeat_request = cut and repair and not backchannel
+        # A plan whose reply the SDK cancelled before any audio, and what its planning consumed.
+        lost, self._lost_plan = self._lost_plan, None
+        lost_undo, self._lost_undo = self._lost_undo, None
+        # An out-of-role request to end the call (owner test 7f2a25e6, turns 64 and 71).  Before
+        # R = 14:00 and with no commitment on record it is answered by the interviewer, never by an
+        # owed move and never by the close ladder: she asks once (L-ASIDE-END: say "end the
+        # interview" to stop).  End words in answer, or the request again at a later turn of that
+        # stretch, end the session as ``candidate_left`` (a failed session, as closing the window);
+        # anything else resumes the role-play with this very turn, and a backchannel or a
+        # speech-to-text fragment ("Hmm", "Okay.") leaves the question open.
+        #
+        # From 14:00, or once a commitment is on record, the role-play has already earned its score
+        # and the request is the advisor's way of saying goodbye (reviewed fix: "Okay Priya, let's
+        # disconnect the call now, I'll send you the email" at 18:20, after a complete role-play,
+        # ended it as a failed candidate_left, and "End the interview." right after a booked call
+        # did too, where "Thank you so much, bye!" exits and is scored).  So the request, or end
+        # words answering a question asked earlier, is a farewell: it gets exactly what "bye" gets
+        # on the close ladder (the redirect once before 14:00, the WEAK stall in the close window,
+        # otherwise the exit) and nothing more, so it stays injection-neutral.
+        end_request = detect_end_request(candidate_text)
+        # Once the aside has been asked, an answer that also declines is a no whatever end words it
+        # holds: "No, I don't think I want to stop", "No, why would you end the call?" (reviewed
+        # fix: these ended the session as a failed candidate_left).
+        declined = self._end_aside is not None and declines_end(candidate_text)
+        end_words = (end_request and not declined) or (
+            self._end_pending and confirms_end(candidate_text)
+        )
+        # "Let's cut the call now, I'll call you tomorrow": a call-back promise is the advisor
+        # closing the sale's call in role, so it is a farewell, never the out-of-role stop (reviewed
+        # fix: after a declined aside it ended the session as candidate_left).
+        out_of_role = (
+            r_sec < EARLY_CLOSE_BEFORE_SEC
+            and not self.commitment_resolved
+            and not promises_call_back(candidate_text)
+        )
+        if out_of_role and self._end_aside is not None and end_words:
+            return self._end_plan(turn_index)
+        farewell_end = end_words and not out_of_role
+        if self._end_pending and (
+            farewell_end
+            or word_count(candidate_text) > END_FRAGMENT_WORDS
+            or declines_end(candidate_text)
+        ):
+            self._end_pending = False
+        if end_request and self._end_aside is None and out_of_role:
+            # The aside is no answer to the lost plan either: what that plan used up is given back.
+            self._restore_lost(lost_undo)
+            return self._end_aside_plan(r_sec, turn_index)
         break_kind = detect_character_break(candidate_text)
+        if lost is not None:
+            if (
+                (backchannel or repair or answers_nothing)
+                and not farewell_end
+                and break_kind is None
+                and not is_close_attempt(candidate_text, r_sec)
+            ):
+                # Voice barge-in (min_words 0): a lone "Okay.", "Sorry" or "Hello?" in the think gap
+                # cancelled the reply before the candidate heard any of it.  That turn answers
+                # nothing, so the lost plan is the answer still owed: the very same plan (its turn,
+                # its ask, its commitment line) is voiced now.  A commitment line the candidate
+                # never heard is no revoice: the replay spends nothing of the revoice limit.
+                if self._unheard_commitment is lost:
+                    self._unheard_commitment = None
+                return replace(lost, reasons=lost.reasons + ("replanned_after_lost_reply",))
+            self._restore_lost(lost_undo)
         if self._wants_aside(break_kind):
             return self._aside_plan(break_kind or "ai", r_sec, turn_index)
         if break_kind == "ai":
             self._ai_questions += 1
+        self._turn_undo = (
+            self._pending_ask,
+            self.negotiation.question_used,
+            self.negotiation.stall_rounds,
+            self._stalls,
+            self.scheduler.close_attempts,
+        )
         self.turn += 1
         turn = self.turn
         self.last_r = r_sec
@@ -557,6 +765,7 @@ class RolePlayEngine:
         if wants is None and negotiated.callback is not None and not early:
             wants = AskKind.CALL  # a concrete callback or time proposal is a call ask
         self._call_ask_now = wants is AskKind.CALL
+        self._turn_ask = wants
         reasons: list[str] = []
         if obs.injection:
             reasons.append("injection_phrase_flagged")
@@ -564,7 +773,13 @@ class RolePlayEngine:
             reasons.append(f"character_break:{break_kind}")
         self._break_kind = break_kind
         decision = None
-        if signals.close_attempt:
+        if farewell_end:
+            reasons.append("end_request_as_farewell")
+        if self._unheard_commitment is not None:
+            revoiced = self._revoice_commitment(r_sec, reasons)
+            if revoiced is not None:
+                return revoiced
+        if signals.close_attempt or farewell_end:
             decision = self.scheduler.register_close_attempt(r_sec)
             if decision.action == "exit":
                 self.exit_requested = True
@@ -605,6 +820,8 @@ class RolePlayEngine:
                 resolves=True,
             )
         reveal_due = bool(obs.gate.first_probes) or bool(reveal_topics)
+        challenged = False
+        held_for_cut = False
         move = self.scheduler.select(r_sec)
         if move is not None:
             if reveal_due and self._may_defer(move, r_sec):
@@ -618,6 +835,45 @@ class RolePlayEngine:
                 # reaction waits one turn unless its deadline forces it (R1-Q final review round 1:
                 # "That's even below the $7,000 ..." answered "Does seven tomorrow work?").
                 reasons.append("owed_deferred_for_ask")
+            elif (
+                (lone_backchannel or repeat_request)
+                and not (repeat_request and move.id == cut_move)
+                and self._may_defer(move, r_sec)
+            ):
+                # Voice barge-in (owner decision 2026-10-28).  A lone "yeah" that cut the learner
+                # off raises no move: she finishes her point, and when that point was the owed move
+                # her continuation completes it (``credit_move_id``).  A "Sorry?" or a "Pardon?"
+                # gets what she was saying said again and no other move (when her cut line WAS the
+                # owed move, the move itself is that repeat, below).  Neither spends the move's one
+                # interrupt deferral, which is for a real answer over her line; however often it
+                # happens, a deadline still forces the move (``_may_defer``).
+                held_for_cut = True
+                reasons.append(
+                    "owed_deferred_for_backchannel"
+                    if lone_backchannel
+                    else "owed_deferred_for_repeat"
+                )
+            elif not repeat_request and move.id == cut_move and self._may_hold_for_cut(move, r_sec):
+                # The advisor said something real over the learner's line: the move it carried is
+                # not started again on the very next turn, she answers what they said first.  The
+                # move waits ONE turn, once per move and only while the plan has a turn to spare
+                # (``_may_hold``), and a deadline still forces it.
+                self._interrupt_deferred.add(move.id)
+                held_for_cut = True
+                reasons.append("owed_deferred_for_interrupt")
+            elif challenges_learner(candidate_text) and self._may_hold_for_challenge(move, r_sec):
+                # The advisor pushed back on the learner's own words or on how it asks (owner test
+                # 7f2a25e6: "where did you get that number?" got a one-line answer and the F2 push).
+                # That is answered first and the owed move waits ONE turn; twice per session and
+                # only while the plan has a turn to spare (``_may_hold``), so a combative advisor
+                # cannot hold the plan back, and a deadline still forces it.  Two challenges in a
+                # row hold the same move twice (reviewed fix: the owner's 56 and 58 were both
+                # challenges, and under a once-per-move rule 58 got the F4 primary on top of "you
+                # are asking too many questions").
+                self._challenge_deferred.append(move.id)
+                challenged = True
+                self._notes.append(CHALLENGE_NOTE)
+                reasons.append("owed_deferred_for_challenge")
             elif (
                 move.id not in self._dig_deferred
                 and self._dig_key(candidate_text) not in self._dig_deferred_topics
@@ -637,6 +893,8 @@ class RolePlayEngine:
             else:
                 self.scheduler.issue(move)
                 reasons.append(f"owed:{move.id}" + (":forced" if move.forced else ""))
+                if repeat_request and move.id == cut_move:
+                    reasons.append("repeat_after_cut")  # her cut line again: the repeat asked for
                 if move.id == COMMIT_STALL:
                     # The 19:00 stall: a short reaction, then the scripted WEAK line, spoken
                     # and masked exactly, and never a second time (``Negotiation``).
@@ -658,14 +916,35 @@ class RolePlayEngine:
                         reveal_topics=reveal_topics,
                         monologue=candidate_seconds,
                     )
+        if lone_backchannel or repeat_request:
+            # "Yeah" said over the learner cut her off: she finishes her point in one sentence and
+            # raises nothing new (no owed move above unless forced, no curiosity, no check-in).  A
+            # "Sorry?" gets her point said again.  Either way the move her cut line carried counts
+            # as delivered if what she says now proves it (``credit_move_id``).
+            reasons.append("backchannel_continuation" if lone_backchannel else "repeat_after_cut")
+            self._notes.append(BACKCHANNEL_CUT_NOTE if lone_backchannel else CUT_REPEAT_NOTE)
+            return self._plan(
+                TurnMode.LLM_REPLY,
+                reasons,
+                first_probes=obs.gate.first_probes,
+                reveal_topics=reveal_topics,
+                monologue=candidate_seconds,
+                credit_move_id=cut_move,
+            )
         reasons.append("free_reply")
+        if cut:
+            # The advisor cut in: what they said is answered, the cut line is not started again.
+            self._notes.append(INTERRUPTED_NOTE)
         curiosity = ""
-        if self._force_curiosity and not reveal_due and break_kind is None:
+        # A challenge is only answered (``CHALLENGE_NOTE``): no curiosity question, no check-in.
+        # Neither is the turn that cut the learner off while she was raising an owed move.
+        quiet = reveal_due or break_kind is not None or challenged or held_for_cut
+        if self._force_curiosity and not quiet:
             # The advisor checked in ("what do you think?", "anything else?"): an honest
             # reaction and one real question, never the stall.
             curiosity = self._curiosity_for_free_reply(force=True)
             self._notes.append(CHECKIN_NOTE if curiosity else CHECKIN_DONE_NOTE)
-        elif not reveal_due and break_kind is None:
+        elif not quiet:
             curiosity = self._curiosity_for_free_reply()
         return self._plan(
             TurnMode.LLM_REPLY,
@@ -675,6 +954,97 @@ class RolePlayEngine:
             monologue=candidate_seconds,
             curiosity=curiosity,
         )
+
+    def _revoice_commitment(self, r_sec: float, reasons: list[str]) -> TurnPlan | None:
+        """The graded commitment line the candidate did not hear whole, said again, or None.
+
+        Voice barge-in: a "Great." over "Okay, let's do it. Send me the ..." cut the line before
+        its end, or an "Okay." cancelled it before any audio.  The learner earned it and was saying
+        it, so the same scripted line (same level, same slot) is said again on this turn, whatever
+        the advisor said over it, instead of the commitment being lost to a free reply that may
+        only stall.  Not once the commitment is on record, and a forced owed move (other than the
+        19:00 stall the line resolves) is spoken first: the line then waits for the following turn.
+
+        Only a line that was played and then cut counts toward ``COMMITMENT_REVOICE_LIMIT`` (and
+        only it is stopped by the limit): a line the candidate never heard a word of
+        (``reply_lost``) was never said, so saying it now is its first hearing, not a revoice
+        (reviewed fix: two lost replays used the limit up, so the first real cut dropped the
+        commitment).
+        """
+        unheard = self._unheard_commitment
+        counts = self._unheard_was_cut
+        if self.commitment_resolved or (
+            counts and self._commitment_revoices >= COMMITMENT_REVOICE_LIMIT
+        ):
+            self._unheard_commitment = None
+            return None
+        owed = self.scheduler.select(r_sec)
+        if (
+            owed is not None
+            and owed.forced
+            and owed.id != COMMIT_STALL
+            and owed.id != unheard.move_id
+        ):
+            return None
+        self._unheard_commitment = None
+        if counts:
+            self._commitment_revoices += 1
+        reasons.append("commitment_revoiced")
+        return self._plan(
+            TurnMode.SAY_ONLY,
+            reasons,
+            scripted=unheard.scripted_text,
+            move_id=unheard.move_id,
+            level=unheard.commitment_level,
+            resolves=True,
+        )
+
+    def _restore_lost(self, undo: tuple[Any, ...] | None) -> None:
+        """Give back what the plan of a reply cancelled before any audio used up when planned.
+
+        Nothing of it was heard: the advisor's ask is still open (that turn's ask, else the one
+        open before it), and the next-step question, the stall rounds inside the close window, the
+        count of stalls before it and the farewells on the close ladder are as they were before
+        that turn.  The last matters for a farewell that speech-to-text split in two ("... have a
+        great day." and "Bye."): the "Bye." cancelled the redirect before any audio, and counting
+        that unheard redirect made the "Bye." the second farewell, so the role-play exited before
+        14:00 without the candidate ever hearing "Oh wait, before you go..." (reviewed fix).  Now
+        the "Bye." is the first farewell again and gets the redirect.
+        """
+        if undo is None:
+            return
+        pending, question_used, stall_rounds, stalls, close_attempts, ask = undo
+        self._pending_ask = ask if ask is not None else pending
+        self.negotiation.question_used = question_used
+        self.negotiation.stall_rounds = stall_rounds
+        self._stalls = stalls
+        self.scheduler.close_attempts = close_attempts
+
+    def reply_lost(self, plan: TurnPlan) -> None:
+        """The SDK cancelled ``plan``'s reply before the candidate heard any of it.
+
+        At ``min_words`` 0 an "Okay.", a "Sorry" or a "Hello?" in the one or two seconds the reply
+        is being thought of is a turn of its own, and it cancels the reply (the session's
+        ``r1_reply_cancelled_before_audio``).  Nothing was heard, so nothing is recorded; the next
+        ``plan_turn`` either plans this very plan again (a turn that answers nothing) or plans
+        afresh with what this plan used up given back.  A graded commitment line is said again
+        either way, and since the candidate heard none of it that is no revoice (it spends nothing
+        of ``COMMITMENT_REVOICE_LIMIT``).  The session also reports a reply cut after its first
+        audio frame but before any word was heard: that too is a line nobody heard.  Only the
+        latest plan counts: a newer turn was already planned otherwise.
+        """
+        if plan.aside or plan.end_interview or plan.mode is TurnMode.EXIT or plan.turn != self.turn:
+            return
+        self._lost_plan = plan
+        self._lost_undo = None if self._turn_undo is None else (*self._turn_undo, self._turn_ask)
+        if (
+            plan.resolves_commitment
+            and plan.commitment_level is not None
+            and plan.scripted_text
+            and not self.commitment_resolved
+        ):
+            self._unheard_commitment = plan
+            self._unheard_was_cut = False
 
     @staticmethod
     def _dig_key(candidate_text: str) -> str:
@@ -696,6 +1066,68 @@ class RolePlayEngine:
             return False
         past_grace = r_sec >= COMMIT_STALL_R_SEC + STALL_DEFER_GRACE_SEC
         return not (move.id == COMMIT_STALL and past_grace)
+
+    def _may_hold_for_cut(self, move: OwedMove, r_sec: float) -> bool:
+        """Whether the owed move a cut line carried may wait one turn (``..._for_interrupt``).
+
+        Once per move, and only while the plan has slack (``_may_hold``).
+        """
+        return move.id not in self._interrupt_deferred and self._may_hold(move, r_sec)
+
+    def _may_hold_for_challenge(self, move: OwedMove, r_sec: float) -> bool:
+        """Whether the owed move may wait one turn for a challenge (``..._for_challenge``).
+
+        Twice per session (two challenges in a row may hold the same move), and only while the plan
+        has slack (``_may_hold``).
+        """
+        return len(self._challenge_deferred) < MAX_CHALLENGE_DEFERRALS and self._may_hold(
+            move, r_sec
+        )
+
+    def _may_hold(self, move: OwedMove, r_sec: float) -> bool:
+        """Whether a cut or a challenge may hold ``move`` back one turn (reviewed fix m4).
+
+        Both holds came with voice barge-in and owner test 7f2a25e6 (before them a cut objection was
+        raised again on the very next turn, and a challenge held nothing back).  Stacked with each
+        other and with spacing they pushed the later families into forced runs the release before
+        them never had: a candidate who cut every objection and challenged the learner every third
+        turn got F1 and F4 forced at 35 s an exchange and the time cue never said, and one who cut
+        at 65 s lost the F4 push (a missing family, so no score).  So a hold needs:
+
+        * a move that is not forced (``_may_defer``): the deadlines and the forced path are
+          unchanged;
+        * a move with a deadline: the time cue and the 19:00 stall have no forced path to fall
+          back on, so a hold can push the cue out of its 17:00-19:00 window; they are raised again
+          at once;
+        * slack in the plan (``_ahead_of_pacing``).
+
+        Without them the move is raised again at once, as before the holds (the model still reacts
+        to what the advisor said first, and the scripted variants rotate, so it is not word for
+        word).
+        """
+        return (
+            move.deadline_sec is not None
+            and self._may_defer(move, r_sec)
+            and self._ahead_of_pacing(r_sec)
+        )
+
+    def _ahead_of_pacing(self, r_sec: float) -> bool:
+        """Whether one more turn now still lets every open family land by its deadline.
+
+        At the current pace (the scheduler's expected turn length), the objections still owed up
+        to and including each family are given ``SLACK_TURNS_PER_MOVE`` turns each, after the one
+        turn the hold costs; every family that is not finished must still make its deadline.  At
+        the owner's pace (20-25 s an exchange) there is slack and a cut objection waits; at 35 s
+        and slower the plan has no turn to spare until most of it is delivered.
+        """
+        pace = self.scheduler.lookahead_sec
+        owed = 0
+        for deadline, move_ids in _PACING_MAP:
+            left = sum(1 for move_id in move_ids if not self.scheduler.is_delivered(move_id))
+            owed += left
+            if left and r_sec + pace * (1 + SLACK_TURNS_PER_MOVE * owed) > deadline:
+                return False
+        return True
 
     def _wants_aside(self, break_kind: str | None) -> bool:
         """The one-off aside: a coaching request, or the second "are you an AI?" question."""
@@ -720,6 +1152,62 @@ class RolePlayEngine:
             scripted=script_line("L-ASIDE-COACH", **self.persona.line_values),
             voice="interviewer",
             aside=True,
+            line_id="L-ASIDE-COACH",
+        )
+
+    def _end_aside_plan(self, r_sec: float, turn_index: int | None) -> TurnPlan:
+        """L-ASIDE-END, once: say "end the interview" to stop, otherwise carry on.
+
+        Like the coach aside it is excluded from evidence (nothing observes the candidate's
+        words, no owed move is issued, the schedule does not move) and the session pauses R.
+        It is asked only before R = 14:00 with no commitment on record.  The next candidate turn
+        that is more than a fragment answers it (``_end_pending``); only end words confirm
+        (``confirms_end``), and so does a later end request, while R < 14:00 and no commitment is
+        on record.  After that both are farewells (the close ladder, see ``plan_turn``).
+        """
+        self._end_aside = {
+            "after_roleplay_turn": self.turn,
+            "transcript_turn": turn_index,
+            "r_sec": round(r_sec, 1),
+            "confirmed": False,
+        }
+        self._end_pending = True
+        return self._plan(
+            TurnMode.SAY_ONLY,
+            ["aside_end_request"],
+            scripted=script_line("L-ASIDE-END", **self.persona.line_values),
+            voice="interviewer",
+            aside=True,
+            line_id="L-ASIDE-END",
+        )
+
+    def end_question_lapsed(self) -> None:
+        """The candidate said nothing after L-ASIDE-END: the silence ladder's prompt comes next.
+
+        Silence is handled as it always was, so an answer to "Are you still there?" is not an
+        answer to L-ASIDE-END: the question is no longer pending (a later end request still ends).
+        """
+        self._end_pending = False
+
+    def _end_plan(self, turn_index: int | None) -> TurnPlan:
+        """The candidate confirmed the stop: L-END-CLOSE, then ``candidate_left`` (the session's).
+
+        No new outcome: the session ends exactly as if the candidate had closed the window
+        (a failed session), so asking to stop can never earn more than leaving would.  The turn
+        is excluded from evidence and changes no commitment, disclosure or schedule state.
+        """
+        self.end_confirmed = True
+        if self._end_aside is not None:
+            self._end_aside["confirmed"] = True
+            self._end_aside["answer_transcript_turn"] = turn_index
+        return self._plan(
+            TurnMode.SAY_ONLY,
+            ["end_confirmed"],
+            scripted=script_line("L-END-CLOSE"),
+            voice="interviewer",
+            aside=True,
+            line_id="L-END-CLOSE",
+            end_interview=True,
         )
 
     # ----------------------------------------------------------------- negotiation
@@ -875,7 +1363,7 @@ class RolePlayEngine:
                     return None
                 self._stalls += 1
                 reasons.append("ask_before_close_window")
-                return self._reason_plan(reasons, **layers)
+                return self._reason_plan(reasons, ask=wants, **layers)
             self._pending_ask = None
             evidence = self._evidence(wants)
             level = grade(evidence)
@@ -903,7 +1391,7 @@ class RolePlayEngine:
                 return self._commit_plan(level, reasons, ask=wants)
             if negotiation.can_stall(self._stall_skip()):
                 negotiation.stall_rounds += 1
-                planned = self._reason_plan(reasons, **layers)
+                planned = self._reason_plan(reasons, ask=wants, **layers)
                 if planned is not None:
                     return planned
             # A stall that answers a CALL ask does not ask for an e-mail nobody offered.
@@ -953,13 +1441,21 @@ class RolePlayEngine:
             skip.add(REASON_MONEY)
         return frozenset(skip)
 
-    def _reason_plan(self, reasons: list[str], **layers: Any) -> TurnPlan | None:
-        """Voice the next unused stall reason, else the one question about the call, else None."""
+    def _reason_plan(
+        self, reasons: list[str], *, ask: AskKind | None = None, **layers: Any
+    ) -> TurnPlan | None:
+        """Voice the next unused stall reason, else the one question about the next step, else None.
+
+        The question is worded for ``ask`` (``question_spec``: "the call" only after a call ask) and
+        is used up when it is planned, so a reply that missed its markers does not bring the same
+        question back on the next early ask.
+        """
         reason = self.negotiation.next_reason(self._stall_skip())
         if reason is not None:
             spec = SPEC_BY_REASON[reason]
         elif not self.negotiation.question_used:
-            spec = SPEC_BY_ID[N_QUESTION]
+            spec = question_spec(ask)
+            self.negotiation.question_used = True
         else:
             return None  # every reason is spent: react in a free reply (the next-step note)
         reasons.append(f"stall_reason:{spec.reason or spec.kind}")
@@ -1204,7 +1700,10 @@ class RolePlayEngine:
         the move (the markers hit) nothing is appended.  Otherwise the first variant that does
         not repeat something the learner already said, in this call or in this very reply,
         is returned (the repetition check; the first one if every variant repeats), so the
-        owed move is never lost to the model and is never said twice word for word.
+        owed move is never lost to the model and is never said twice word for word.  A reply
+        that already asked a question gets no second negotiation question: when no variant
+        proves a negotiation line without its question, nothing is appended (an owed move, the
+        farewell redirect and the WEAK line are always appended).
         """
         intent = plan.intent
         if intent is None or markers_match(intent.markers, spoken_so_far):
@@ -1224,7 +1723,20 @@ class RolePlayEngine:
             quiet = [text for text in candidates if "?" not in text]
             stripped = [_without_questions(text) for text in candidates if "?" in text]
             stripped = [text for text in stripped if text and markers_match(intent.markers, text)]
-            candidates = (*quiet, *stripped, *candidates)
+            if intent.markers and plan.move_id is None and plan.negotiation_id is not None:
+                # When no variant proves a negotiation line without a question, nothing is appended
+                # (owner test 7f2a25e6 turn 32: "What exactly would I be getting for it? What
+                # exactly would that call involve?"); the stall reason stays unused.  A graded owed
+                # move, the farewell redirect and the marker-less WEAK line always keep their tail:
+                # an owed move dropped here was often held until its deadline forced it, which
+                # bunched primaries and pushes there and slipped a family (reviewed fix).
+                proven = [text for text in quiet if markers_match(intent.markers, text)]
+                proven += stripped
+                if not proven:
+                    return ""
+                candidates = tuple(proven)
+            else:
+                candidates = (*quiet, *stripped, *candidates)
         chosen = next((text for text in candidates if not _repeats(text, said)), candidates[0])
         key = plan.move_id or plan.negotiation_id
         if key is not None:
@@ -1287,6 +1799,9 @@ class RolePlayEngine:
         intent: LearnerIntent | None = None,
         curiosity: str = "",
         negotiation_id: str | None = None,
+        line_id: str | None = None,
+        end_interview: bool = False,
+        credit_move_id: str | None = None,
     ) -> TurnPlan:
         reminder: str | None = None
         kind = None if aside else self._break_kind
@@ -1368,6 +1883,9 @@ class RolePlayEngine:
             character_break=kind,
             intent=intent,
             negotiation_id=negotiation_id,
+            line_id=line_id,
+            end_interview=end_interview,
+            credit_move_id=credit_move_id,
         )
 
     # ---------------------------------------------------------------------- speech
@@ -1416,8 +1934,14 @@ class RolePlayEngine:
         *,
         r_sec: float | None = None,
         interrupted: bool = False,
+        by_candidate: bool = True,
     ) -> None:
-        """Record what the learner actually said, so reveals and deliveries are exact."""
+        """Record what the learner actually said, so reveals and deliveries are exact.
+
+        ``interrupted``: the line was cut before its end; ``by_candidate`` is False when R1 cut it
+        itself (a hung generation past its deadline): only a cut by the candidate is answered as one
+        on the next turn, while what was not heard stays owed either way.
+        """
         if plan.aside:
             return  # the interviewer's aside is scripted and excluded from evidence
         when = self.last_r if r_sec is None else r_sec
@@ -1443,9 +1967,10 @@ class RolePlayEngine:
             # close window must not book it after all (R1-Q iterations 2 and 3).
             self._pending_ask = None
             self._declined_calls += 1
-        if plan.move_id is not None:
+        carried = plan.move_id if plan.move_id is not None else plan.credit_move_id
+        if carried is not None:
             delivery = self.scheduler.confirm_if_spoken(
-                plan.move_id, spoken_text, when, interrupted=interrupted
+                carried, spoken_text, when, interrupted=interrupted
             )
             # The owed F4 pair voices two stall reasons; the advisor's answer to them counts
             # as handled evidence for the grade.
@@ -1453,6 +1978,16 @@ class RolePlayEngine:
                 self.negotiation.note_reason_voiced(REASON_TIMING, plan.turn)
             elif delivery is not None and delivery.move_id == F4_PUSH:
                 self.negotiation.note_reason_voiced(REASON_DECISION_MAKER, plan.turn)
+        # Voice barge-in: the next turn is the one that cut her off.  A move the played part
+        # already proved is delivered above (it was heard); one it did not prove stays owed.
+        self._learner_cut = interrupted and by_candidate and bool(spoken_text.strip())
+        self._cut_move = (
+            carried
+            if self._learner_cut
+            and carried is not None
+            and not self.scheduler.is_delivered(carried)
+            else None
+        )
         if not interrupted:
             self._credit_organic_push(plan, spoken_text, when)
         if plan.negotiation_id is not None:
@@ -1466,6 +2001,13 @@ class RolePlayEngine:
                 self.scheduler.mark_commitment_resolved()
                 if plan.commitment_level is not None:
                     self.negotiation.note_commitment(plan.commitment_level, plan.turn)
+                self._unheard_commitment = None
+            elif interrupted and not self.commitment_resolved:
+                # Voice barge-in: the line was cut before the candidate heard it whole, so nothing
+                # is on record; it is said again on the next turn (``_revoice_commitment``), and
+                # that revoice counts toward the limit when some of it was heard.
+                self._unheard_commitment = plan
+                self._unheard_was_cut = bool(spoken_text.strip())
         if not scripted_commitment or plan.commitment_level is Level.WEAK:
             if classify_learner_commitment(spoken_text) > cap or has_concession(spoken_text):
                 self._violations += 1
@@ -1618,6 +2160,8 @@ class RolePlayEngine:
             "early_close": {
                 "attempts": self.scheduler.close_attempts,
                 "exit_requested": self.exit_requested,
+                # The one-off "end the interview now, or carry on?" aside, if it played.
+                "end_request": None if self._end_aside is None else dict(self._end_aside),
             },
             "character_breaks": {
                 "ai_questions": self._ai_questions,

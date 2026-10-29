@@ -1344,37 +1344,142 @@ Switches (all read at use, so a restart is enough; every one is optional):
 | Variable | Default | Effect and rollback |
 |---|---|---|
 | `R1_ENDPOINT_MIN_DELAY_SEC` / `R1_ENDPOINT_MAX_DELAY_SEC` | 0.8 / 3.0 | Endpointing waits (SDK default 0.3 / 2.5 s). Lower the minimum for speed, raise it if candidates are cut off. The transition phase runs a quicker 0.4 / 1.2 s (never above these two): see "Turn taking and transcript rows" below |
-| `R1_INTERRUPT_MIN_DURATION_SEC` / `R1_INTERRUPT_MIN_WORDS` | 0.8 / 3 | How long and how many words an interruption needs (SDK default 0.5 s / 0). With Sarvam only the words count: see "Interrupting with final-only speech recognition" below |
+| `R1_INTERRUPT_MIN_DURATION_SEC` / `R1_INTERRUPT_MIN_WORDS` | 0.8 / 0 | Voice barge-in (owner decision 2026-10-28; SDK default 0.5 s / 0): 0.8 s of the candidate's voice pauses the line, a final transcript cuts it. **Rollback: `R1_INTERRUPT_MIN_WORDS=3`** on `project-hello-voice` and restart (the learner then talks on until the candidate's turn is committed). See "Interrupting with final-only speech recognition" below |
+| `R1_FALSE_INTERRUPTION_TIMEOUT_SEC` | 2.0 | Seconds after a pause with no transcript (noise, a cough) before the paused line resumes where it stopped (0.5-5.0; SDK default 2.0). Below about 1.5 s a late Sarvam final can make the learner resume and then stop again |
 | `R1_TTS_FLUSH_MIN_CHARS` | 60 | Early-flush length cap; `0` turns the early-flush `tts_node` off |
 | `R1_LINE_CACHE` | on | `off` speaks every scripted line live, as before PR-4c |
 | `R1_SYNTH_PER_MIN` | 5 | Background Sarvam syntheses started per minute (1-30); raise only after the Sarvam tier is confirmed (D13) |
 
 ### Interrupting with final-only speech recognition
 
-Sarvam streams final transcripts only; it never sends an interim one. livekit-agents 1.6.4 lets
-the candidate's voice cut the learner's reply early only when the transcript it already holds has
-`R1_INTERRUPT_MIN_WORDS` words, and it makes that check before it adds a new final to the
-transcript. While the candidate speaks that transcript is empty, so with the default of 3 the
-voice never cuts the reply by itself: the learner stops when the candidate's turn is committed
-(a final of at least `R1_INTERRUPT_MIN_WORDS` words, after the endpointing wait), and
-`R1_INTERRUPT_MIN_DURATION_SEC` has no effect. `tests/test_r1_sdk_contract.py` pins the SDK facts
-this rests on.
+**Owner decision 2026-10-28: voice barge-in** ("we also want the bot to stop talking when being
+interrupted"). The defaults are `R1_INTERRUPT_MIN_WORDS=0`, `R1_INTERRUPT_MIN_DURATION_SEC=0.8` and
+the SDK's false-interruption resume (`R1_FALSE_INTERRUPTION_TIMEOUT_SEC=2.0`), all in
+`r1_latency.r1_turn_handling`. Until then the default was 3 words, and because Sarvam streams final
+transcripts only (never an interim one) and livekit-agents 1.6.4 judges the word count on the
+transcript it held BEFORE the new final, the voice never cut the learner by itself: she talked over
+the candidate until the candidate's turn was committed.
 
-The same setting makes the SDK refuse a shorter turn ("Yes.", "Sorry", "Thank you.") that is spoken
-over a reply it may still cut. It keeps the words and prepends them to the next committed turn. R1
-does not count such a fragment as part of the candidate's monologue, so `CANDIDATE_MONOLOGUE` and
-the `longest_candidate_turn_sec` field of the administration log measure the answer alone.
+**Rollback:** set `R1_INTERRUPT_MIN_WORDS=3` on `project-hello-voice` and restart the machines (the
+variable is read at use). Everything under "With 3 words (the rollback)" below then applies again.
+**The rollback restores only the SDK's turn-taking.** The engine-side cut handling below (the
+one-turn wait for a cut objection, the continuation after a lone "yeah", the repeat after "Sorry?",
+the commitment revoice and the lost-reply replay) stays on: it runs whenever the SDK reports a cut
+line or a reply cancelled before any audio, which at 3 words happens less often but still happens.
 
-`R1_INTERRUPT_MIN_WORDS=0` restores the SDK's voice barge-in after `R1_INTERRUPT_MIN_DURATION_SEC`,
-at the price that a "yeah" or a cough cuts the learner. **Stage A decides between 3 and 0**: run
-the smoke session at each value and listen for the two faults, the learner talking over the
-candidate until the candidate's turn is committed (value 3) against a backchannel cutting the
-learner off (value 0). Keep 3 unless the first is the worse problem; the variable is read at use,
-so a restart switches it. The default was 2 in PR-4c: the owner's 4/10 session (b58c7d9c) showed a
-two-word "Thank you." still cutting a reply, and "Sorry" / "Thank you." / "Hey, are you there?"
-cancelling three replies before any audio (the candidate heard nothing), so R1-Q raised it to 3,
-the value the phone lane uses for the same reason. That stops a single short fragment from cutting
-a reply; it does not stop two of them adding up (see the next paragraph).
+How barge-in works on livekit-agents 1.6.4 (`tests/test_r1_sdk_contract.py` pins each fact):
+
+* R1 passes no `vad`, so the session runs the SDK's default voice activity detector. When it has
+  heard `R1_INTERRUPT_MIN_DURATION_SEC` (0.8 s) of the candidate's voice over a line that may be cut,
+  the SDK **pauses** that line's audio (the recorder tee and the room output both support pause). A
+  breath, a cough or a "yeah" shorter than 0.8 s does not pause it.
+* When Sarvam's final transcript arrives, the paused line is **cut for good**. Its transcript row is
+  written with `interrupted = true` and holds only the text that was played before the cut, and the
+  learner's own context sees that same text (`tests/test_r1_core.py`
+  `TestInterruptedLearnerRowKeepsOnlyWhatWasHeard`). The candidate's turn is committed after the
+  endpointing wait as before.
+* When no final arrives within `R1_FALSE_INTERRUPTION_TIMEOUT_SEC` (2.0 s) after the speech ends
+  (noise, a cough or a laugh that Sarvam does not transcribe), the SDK **resumes** the line where it
+  paused. 2.0 s is the SDK's own default and leaves room for Sarvam's final; a much shorter timeout
+  lets a late final make the learner resume and then stop again.
+* **The trade-off: a transcribed backchannel cuts the learner.** The 0.8 s only gates the voice
+  detector. A final transcript cuts the line whatever its length, so a "yeah", "okay" or "hmm" that
+  Sarvam transcribes stops the learner mid-sentence. R1 limits what that costs (the role-play rules
+  below); it cannot prevent it. If this proves worse than the old talking-over, roll back to 3.
+
+What can be cut: **LLM replies only**: the learner's role-play lines (a scripted line the engine
+streams as the learner's reply too; a graded commitment line that is cut is said again, see below),
+Christy's icebreaker questions, and the `llm_recovery` fallback
+line. Every line spoken through `say()` keeps `allow_interruptions=False` exactly as before, so the
+SDK neither pauses nor cuts it: L-OPEN (consent and disclosure), L-PICKUP, L-TRANSITION,
+L-TRANSITION-NUDGE, the silence prompts and L-SIL-END, L-MUTE, L-REJOIN and L-REJOIN-RP, L-EXIT,
+L-WRAP, L-CLOSE, L-SYSTEM-STOP, L-END-CLOSE and the interviewer's asides L-ASIDE-COACH and
+L-ASIDE-END (`tests/test_r1_core.py` `TestWhatTheCandidateCanCut`).
+
+What the role-play does after the candidate cut the learner (`r1_roleplay`):
+
+* **An owed move is not issued again straight away, when the plan has a turn to spare.** A move whose
+  markers were not yet played when the line was cut stays owed (a move counts as delivered only when
+  the played text proves it, as before; a cut line that already raised it counts). On the next turn
+  the learner reacts to what the candidate said first (reason `owed_deferred_for_interrupt`) and the
+  move waits one turn. At most one such wait per move, and a forced move (deadline near) never
+  waits, so the deadlines, the slip limit and the forced path are unchanged.
+  **The slack rule (final review, m4).** The same one-turn wait is used when the advisor challenges
+  the learner ("where did you get that number?", "you are asking too many questions": reason
+  `owed_deferred_for_challenge`, at most twice per session; two challenges in a row may hold the same
+  move twice, as the owner's turns 56 and 58 needed). Stacked with each other and with spacing, these
+  waits pushed later families into forced runs the release before them never had (at 35 s an
+  exchange F1 and F4 were forced and the time cue never said; at 65 s the F4 push was lost, a missing
+  family and no score).
+  So either wait now happens only while the plan is ahead of its pacing map
+  (`RolePlayEngine._ahead_of_pacing`): at the current pace (the scheduler's expected turn length),
+  every family not yet finished must still make its deadline after the one turn the wait costs, with
+  four turns allowed for each objection still owed up to it (`SLACK_TURNS_PER_MOVE`, the idle gap of
+  three plus one cut). The time cue and the 19:00 stall have no deadline and no forced path, so they
+  never wait for a cut or a challenge. Without slack the move is raised again on the very next turn,
+  as before the waits existed; the model still reacts to what the advisor said first and the
+  scripted variants rotate, so it is not word for word. In practice: at the owner's pace (20-25 s an
+  exchange) cut and challenged objections wait; at 35 s and slower they rarely do until most of the
+  plan is delivered. On the final review's bunching grid (six advisor patterns x 20, 25, 35, 50 and
+  65 s) this has no more forced moves than the release without the waits, no larger slip and every
+  move it delivers, with 27 immediate repeats of a cut move against its 92 at 20 and 25 s.
+* **A lone acknowledgement raises nothing new.** When the committed turn that cut the learner only
+  acknowledges or hands the floor back ("yeah", "okay", "hmm", "right", "sure", "mm-hmm", "uh-huh",
+  "got it", "go ahead"; `is_acknowledgement_turn`, deliberately narrower than the icebreaker's
+  `is_backchannel_turn`), the learner finishes her point in one short sentence (reason
+  `backchannel_continuation`): no new objection, no curiosity question. An owed move that may wait
+  waits (`owed_deferred_for_backchannel`), however often that happens and whatever waited before;
+  it does not use up the move's one wait for a real cut, and a forced move is still spoken. When
+  the point she was making WAS the owed move, her continuation completes it: the move counts as
+  delivered when the continuation proves it and is not raised again. "Yes." and "No, no." are not
+  acknowledgements (they can answer or deny): the learner answers them first, as any cut. A
+  farewell, an ask or a negotiation turn is handled exactly as before.
+* **"Sorry?" gets the point again.** A turn that only asks to hear her again or checks she is there
+  ("Sorry?", "Pardon?", "Come again?", "Hello? Are you there?"; `is_repair_turn`) gets her point
+  said again in a sentence or two (reason `repeat_after_cut`). When her cut line was the owed move,
+  that move is the repeat; any other owed move waits (`owed_deferred_for_repeat`).
+* **A graded commitment line is heard whole.** The STRONG and MEDIUM lines, the WEAK line and the
+  19:00 stall are streamed as the learner's reply, so a "Great." can cut them. A commitment counts
+  only when the whole line was heard, so a cut line is **said again** on the next turn, whatever the
+  candidate said over it (reason `commitment_revoiced`; a line that was played and cut is said again
+  at most twice per session, while a line nobody heard a word of is said again without counting; a forced
+  owed move other than the 19:00 stall is spoken first). It is never finished by the model.
+* **A line R1 cut itself is not a barge-in.** When a reply hangs past its 12 s deadline R1 cuts it
+  (and its thinking filler) itself; the candidate's next turn is not treated as having cut the
+  learner. What was not heard stays owed as always.
+
+In the icebreaker a backchannel that cut Christy is answered by Christy as before, and it still
+does not count as an answer toward the soft exit.
+
+**Short turns at 0 words.** The SDK refuses no turn for its length any more, so nothing is banked:
+a "Yes." said over the learner is a committed turn and a transcript row of its own, the monologue
+clock measures each committed turn (`_fragment_held_back` is never true at 0), and a backchannel
+spoken over a reply that has not started yet cancels it (`r1_reply_cancelled_before_audio`; its
+wait still counts in the p95 as a lower bound). In the role-play the engine is told
+(`RolePlayEngine.reply_lost`): when the turn that cancelled it answers nothing ("Okay.", "Sorry",
+"Hello?"), the very same plan is voiced for it (reason `replanned_after_lost_reply`: the commitment
+line, the stall reason or the next-step question the candidate never heard); any other turn is
+planned afresh with what the lost plan used up (the open ask, the next-step question, the stall
+counts and its step on the close ladder) given back, and a lost commitment line is said first. The
+close-ladder step matters for a farewell that speech-to-text splits ("... have a great day." and
+"Bye."): the "Bye." cancels the redirect before any audio, and it is now the first farewell again, so
+it gets "Oh wait, before you go..." instead of exiting the role-play before 14:00 (final review, M4).
+The session also reports a reply cut after its first audio frame but before any word was heard as
+lost. At the first smoke with barge-in, listen for the
+learner stopping on a "yeah", resuming after a cough, and look at the `interrupted` rows and the
+`lost_replies` count in the `first_audio_p95` lines.
+
+**With 3 words (the rollback).** The SDK refuses a turn of fewer than `R1_INTERRUPT_MIN_WORDS` words
+("Yes.", "Sorry", "Thank you.") that is spoken over a reply it may still cut. It keeps the words and
+prepends them to the next committed turn. R1 does not count such a fragment as part of the
+candidate's monologue, so `CANDIDATE_MONOLOGUE` and the `longest_candidate_turn_sec` field of the
+administration log measure the answer alone. `R1_INTERRUPT_MIN_DURATION_SEC` has no effect at 3:
+the voice never cuts the reply, the committed turn does. History: the default was 2 in PR-4c; the
+owner's 4/10 session (b58c7d9c) showed a two-word "Thank you." still cutting a reply, and "Sorry" /
+"Thank you." / "Hey, are you there?" cancelling three replies before any audio (the candidate heard
+nothing), so R1-Q raised it to 3, the value the phone lane uses for the same reason. That stops a
+single short fragment from cutting a reply; it does not stop two of them adding up (see the next
+paragraph). On 2026-10-28 the owner chose barge-in (0) over the learner talking on.
 
 **What 3 does not fix: fragments that add up.** The SDK keeps the words it refused (its transcript
 is cleared when a turn is committed, not when one is refused) and judges the next final together
@@ -1418,8 +1523,9 @@ the latency work above (PR-4c) and on the filler, not on `min_words` alone. At t
   speech starts (what the candidate says next is a new row, after the bot's: barge-in order is kept),
   when the phase changes, and when the session exits. The phase driver still reads every final
   separately (ready and wrap-up matching). A crash between the last final and one of those events
-  loses at most the one open row. A fragment the SDK banked (refused over a reply) joins the next
-  committed turn's row, as it joins that turn's text.
+  loses at most the one open row. With the 3-word rollback, a fragment the SDK banked (refused over
+  a reply) joins the next committed turn's row, as it joins that turn's text; at 0 words nothing is
+  banked and every committed turn is its own row.
 * **The icebreaker exit is decided at a committed turn.** The soft exit (four answers once S >= 3:30)
   counts the SDK's committed turns, not STT finals, and only a turn with **at least three words that
   are not backchannel** (`content_word_count`: apology, thanks, greeting, "are you there", hesitation and
@@ -1457,9 +1563,9 @@ smoke: a clip that sounds wrong is removed with `R1_LINE_CACHE=off`.
 
 Only a line that reaches `session.say` can play cached audio, so the warm list (`_WARM_ORDER` in
 `r1_session.py`) holds exactly the lines the driver says: `L-TRANSITION`, `L-TRANSITION-NUDGE`,
-`L-PICKUP`, `L-EXIT`, `L-WRAP`, `L-CLOSE`, `L-ASIDE-COACH`, `L-MUTE`, `L-SIL-IB`, `L-SIL-RP1`,
-`L-SIL-RP2`, `L-REJOIN`, `L-REJOIN-RP`, `L-SIL-END` and `L-SYSTEM-STOP`. `L-OPEN` is spoken at once, and
-`L-TIME-CUE`, `L-NO-FEEDBACK` and `L-FAQ-DEFER` are never passed to `say` (the first two travel inside
+`L-PICKUP`, `L-EXIT`, `L-WRAP`, `L-CLOSE`, `L-ASIDE-COACH`, `L-ASIDE-END`, `L-END-CLOSE`, `L-MUTE`,
+`L-SIL-IB`, `L-SIL-RP1`, `L-SIL-RP2`, `L-REJOIN`, `L-REJOIN-RP`, `L-SIL-END` and `L-SYSTEM-STOP`. `L-OPEN` is
+spoken at once, and `L-TIME-CUE`, `L-NO-FEEDBACK` and `L-FAQ-DEFER` are never passed to `say` (the first two travel inside
 a reply stream; the third has no runtime caller), so they are not synthesised.
 
 ### Interviewer lines: names, the wrap-up close and the feedback refusal (R1-Q)
@@ -1697,6 +1803,73 @@ a reply stream; the third has no runtime caller), so they are not synthesised.
     plain classifier (round 1) reads a genuine negation as a commitment: 6 of the 3,010 learner turns of
     sweeps 1-3, in 6 of 60 calls, would post `commitment` (3 of them on intent turns).
 
+### Out-of-role requests: role confusion and "end the call" (owner test 7f2a25e6)
+
+The owner played a deliberately chaotic candidate who swapped the roles ("I am the buyer here", "are you
+selling the course to me?") and later asked the learner to "disconnect the call". The learner answered
+the first with a muddled line and the second with an owed objection and an in-character goodbye that
+ended nothing. Both are now answered by the interviewer, Christy, outside the persona:
+
+* **Role confusion** is a coaching request (`r1_tracker._COACH_REQUEST`, read one sentence at a time):
+  "I'm / I am the buyer / customer / learner / student (here)", "I'm the one buying", "you're the
+  seller / advisor / salesperson", "what course are you selling", "are you selling the course" and a
+  sentence that is just "are you selling (to me)?". It plays the existing one-off `L-ASIDE-COACH`
+  (phase `aside`, R paused, excluded from evidence); a later one gets the in-character deflection as
+  before. In-role talk such as "as a buyer, you'd want ..." or "what course are you most interested in?"
+  is not matched.
+* **"End the call"** (`r1_tracker.detect_end_request`, one sentence at a time, negations such as "don't
+  hang up" removed first) matches a request aimed at the bot: "can / could / would / will you ...
+  disconnect / end / stop / hang up / cut / close the call / interview / role play", a sentence that
+  opens with that verb ("End the call now."), "please / let's / I want to ... end / stop the interview
+  / role play / session", "let's / please disconnect / cut the call", "... hang up", and "I want to
+  leave / quit / stop". The object must end its clause ("the call?", "the call now"). The advisor's
+  own in-role close stays on the farewell ladder and is not matched: "I'll end the call and send you
+  the email", "before we end the call", "let's end the call here and I'll send you the details",
+  "let's close this conversation on a positive note", "let's stop here and go over the curriculum",
+  "can you stop the call recording?".
+  * **Before R = 14:00 with no commitment on record, once per session:** no owed move is raised that
+    turn, the turn is excluded from evidence like the coach aside's, and the interviewer asks
+    `L-ASIDE-END` with R paused: "This is Christy, your interviewer. If you want to end the interview
+    now, please say: end the interview. Otherwise, just carry on with <lead>." It is deliberately not an
+    either/or question, so a bare "yes" never has to be interpreted.
+  * **Only end words confirm** (`confirms_end`: "end the interview", "yes, end it", "end it", "stop the
+    interview", "I want to stop", "I'm done"), or the request again at a later turn, **while R is still
+    below 14:00 and no commitment is on record**: the interviewer says `L-END-CLOSE` ("All right, we'll
+    end the interview here. Thank you for your time. You can close this window now. Goodbye.") and the
+    session ends as **`candidate_left`**, exactly as if the candidate had closed the window: no new
+    outcome, a counted attempt, the session `failed`, never the exit line, the wrap-up or `complete`,
+    and the gate can never pass it (see "Attempts that did not complete" above). So a second request
+    after a declined question before 14:00 still ends the session this way (owner-approved). A bare
+    "yes", "sure", "I'd like to stay with Priya", "no", "carry on" or a question to the learner resumes
+    the role-play with that very turn. A fragment of two words or fewer that says no "no" ("Hmm",
+    "Okay.", "Yeah.": speech-to-text finalises the first word about a second before the rest) leaves the
+    question open. If the candidate says nothing, the silence ladder runs as always and the question
+    lapses, so an answer to "Are you still there?" is not read as an answer to it.
+  * **From R = 14:00, or once a commitment is on record (any level), the request is a farewell**
+    (final review, M1 and M2). By then the role-play has earned its score, and the request is how many
+    advisors say goodbye ("Okay Priya, let's disconnect the call now, I'll send you the email"). It
+    goes to the existing close ladder exactly as "bye" does at the same moment, with the same rules:
+    the redirect once before 14:00 ("Oh wait, before you go..." and the owed move), the scripted WEAK
+    stall when the close window is open and nothing is on record, otherwise the role-play exit (L-EXIT,
+    the wrap-up and a score); a second farewell exits. End words answering a question asked earlier
+    ("Yes, end it." at 14:05 after the question at 13:50) are a farewell too. It never plays
+    `L-ASIDE-END` or `L-END-CLOSE` and never ends as `candidate_left`. This replaced two rules the
+    owner's review found failing good sessions: after the question, any later request (even at 18:20
+    after a complete role-play) ended the session as a failed `candidate_left`; and without it, a
+    request from 14:00 was "an ordinary turn" whose owed move waited (`owed_deferred_for_end_request`,
+    removed), so "can you disconnect the call?" got "Mm-hmm." however often it was said. A request
+    right after a booked call at 13:30 used to get the question and then fail the session; it now
+    exits and is scored, as "Thank you so much, bye!" there always did. The deadlines, the forced path
+    and the 14:00 floor are unchanged.
+
+Injection: candidate words can at most produce the question or a `candidate_left` exit before 14:00
+(which the candidate could reach by closing the window anyway), or from 14:00 (or with a commitment on
+record) exactly what a plain "bye" produces at that moment, which any candidate can already say; they
+never change a commitment, a disclosure or a grade. Logs: the turn reasons `aside_end_request`,
+`end_confirmed` and `end_request_as_farewell` (with the ladder's own `close_attempt_redirect`,
+`close_attempt_stall` or `close_attempt_exit`; `r1_turn_reason`), and `early_close.end_request` in the
+admin log (turn indices, R and whether it was confirmed; never the words).
+
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 
 The candidate's page follows three more participant attributes of the **agent** (the page trusts only
@@ -1713,8 +1886,8 @@ of them is the bare `{"phase": ...}` it always was.
 | `rpleft` | whole seconds of role-play budget left (`remaining_roleplay_seconds()`: the shorter of the 20:00 role-play clock and the 26:00 session cap), clamped 0..3600 | with every phase write while the role-play runs or is paused (`roleplay`, `aside`, a reconnect pause inside it, the rejoin); a **30 s heartbeat** while the phase is `roleplay` (`RPLEFT_HEARTBEAT_SECONDS`, refreshed value only, coalesced so a stuck writer is not flooded); `""` with the first phase write after the role-play (`roleplay_exit`, `closing`, `aborted`) |
 
 It is an upper bound, not a promise: the role-play can end early (R >= 14:00 with the commitment
-resolved). An old page ignores all three; a new page with an old worker simply shows no button and no
-clock.
+resolved, or a candidate who confirmed they want to stop: see "Out-of-role requests" above). An old
+page ignores all three; a new page with an old worker simply shows no button and no clock.
 
 **The "I'm ready" button.** The candidate token has `canPublishData: false` (R1-PLAN threat 13), so the
 browser cannot send anything into the room. It calls `POST /api/r1/ready` with

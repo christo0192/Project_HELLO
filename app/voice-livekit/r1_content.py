@@ -90,7 +90,18 @@ import r1_world
 #    the goal (convince the learner), L-OPEN says about thirty minutes and a twenty-minute
 #    role-play, and the owed-move deadlines stretch to the longer call (F3 430 / F2 640 / F1 810 /
 #    F4 930).
-CONTENT_REVISION = 15
+# 16: owner test 7f2a25e6 keyword misfires: the one question about the next step is worded by the
+#    advisor's ask ("what would I be signing up for / what's included" after an enrolment ask, "the
+#    call" only after a call ask; N_QUESTION_ENROL_BRIEF / N_QUESTION_ENROL_VARIANTS) and its
+#    markers also accept "include", "signing up" and "would I get"; a challenge to the learner's own
+#    words or questions is answered plainly first (CHALLENGE_NOTE); an out-of-role "end the call"
+#    request gets the interviewer's one-off question (L-ASIDE-END: say "end the interview" to stop,
+#    otherwise carry on) and, on end words, a short close (L-END-CLOSE).  Voice barge-in (owner
+#    decision 2026-10-28): after the advisor cut the learner off, an owed move waits one turn and is
+#    answered first (INTERRUPTED_NOTE), and a lone backchannel that cut her gets her point finished
+#    in one sentence (BACKCHANNEL_CUT_NOTE), and one that only asked her to say it again ("Sorry?",
+#    "Pardon?") or checked she was there gets it said again (CUT_REPEAT_NOTE).
+CONTENT_REVISION = 16
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -197,6 +208,10 @@ def manifest() -> dict[str, Any]:
                 for item in r1_negotiation.COUNTERS
             ],
             "commit_reaction_brief": r1_negotiation.COMMIT_REACTION_BRIEF,
+            "question_enrol": {
+                "brief": r1_negotiation.N_QUESTION_ENROL_BRIEF,
+                "variants": list(r1_negotiation.N_QUESTION_ENROL_VARIANTS),
+            },
             "anchor_after_offer": [
                 {
                     "id": item.id,
@@ -340,6 +355,10 @@ def manifest() -> dict[str, Any]:
             "resolved_note": r1_prompts.RESOLVED_NOTE,
             "checkin_note": r1_prompts.CHECKIN_NOTE,
             "checkin_done_note": r1_prompts.CHECKIN_DONE_NOTE,
+            "challenge_note": r1_prompts.CHALLENGE_NOTE,
+            "interrupted_note": r1_prompts.INTERRUPTED_NOTE,
+            "backchannel_cut_note": r1_prompts.BACKCHANNEL_CUT_NOTE,
+            "cut_repeat_note": r1_prompts.CUT_REPEAT_NOTE,
             "email_again_note": r1_prompts.EMAIL_AGAIN_NOTE,
             "email_offer_note": r1_prompts.EMAIL_OFFER_NOTE,
             "next_step_proposed_note": r1_prompts.NEXT_STEP_PROPOSED_NOTE,

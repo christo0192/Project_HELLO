@@ -126,6 +126,31 @@ CHECKIN_DONE_NOTE = (
     "without repeating what they told you about the course. If you have no more questions, say "
     "so plainly, once, without repeating anything you already said."
 )
+# Owner test 7f2a25e6: "where did you get that number?" was answered with "Just from what I'd read
+# before calling, that's all." and a new worry in the same breath.
+CHALLENGE_NOTE = (
+    "- They are pushing back on something you said or on how you are asking. Answer that plainly "
+    "in one or two sentences, without defending yourself at length; raise nothing new this turn."
+)
+# Voice barge-in (owner decision 2026-10-28).  The advisor cut the learner off mid-line: what they
+# said is answered first, and the line that was cut is not started again word for word.
+INTERRUPTED_NOTE = (
+    "- The advisor cut in while you were still talking. Respond to what they just said first, in "
+    "your own words; do not start again what you were saying."
+)
+# ... and when all they said over the learner was "yeah", "okay" or "hmm", she finishes her point.
+BACKCHANNEL_CUT_NOTE = (
+    "- The advisor only said a word of acknowledgement while you were talking, and you stopped. "
+    "Finish the point you were making in one short sentence, without repeating what you already "
+    "said; raise nothing new."
+)
+# ... and when they cut in only to ask her to say it again ("Sorry?", "Pardon?") or to check she is
+# still there, she says it again: the opposite of the two notes above, which forbid a restart.
+CUT_REPEAT_NOTE = (
+    "- The advisor cut in only to ask you to say that again, or to check you are still there. If "
+    "they asked whether you are there, say briefly that you are; then say your point again in one "
+    "or two short sentences, in your own words; raise nothing new."
+)
 EMAIL_AGAIN_NOTE = (
     "- You already told the advisor they can e-mail you the details. Do not say it again and "
     "do not ask for the e-mail again: acknowledge in a few words and carry on."
