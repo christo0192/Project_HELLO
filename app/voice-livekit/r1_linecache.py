@@ -15,7 +15,9 @@ per lane.  Three small pieces, all free of the SDK except where a real synthesis
   synthesised once per machine and kept on local disk by the digest of its text and the voice;
   a line that carries the candidate's first name is synthesised per session and kept in memory
   only, never written to disk.  A played line is then ``session.say(text, audio=frames)``:
-  no TTS round trip at all, so it starts as soon as the audio output does.
+  no TTS round trip at all, so it starts as soon as the audio output does.  The frames are
+  handed over at a bounded rate (``PcmClip.frames``: the first second at once, then at most
+  four times real time), never as one event-loop step and never as one back-to-back burst.
 
 Nothing here runs in worker prewarm (plan section 9).  The cache is warmed in the background
 from the interview, and every failure degrades to the live TTS, which is exactly today's
@@ -50,6 +52,12 @@ LANE_R1 = "r1"
 DEFAULT_SYNTHS_PER_MINUTE = 5
 CACHE_VERSION = 1
 FRAME_MS = 20
+# ``PcmClip.frames``: the first FRAME_LEAD_SEC of a clip goes at once, the rest at most
+# FRAME_SPEED times real time; whatever goes at once is cut into FRAME_YIELD_EVERY-frame
+# (200 ms) loop steps.
+FRAME_YIELD_EVERY = 10
+FRAME_SPEED = 4.0
+FRAME_LEAD_SEC = 1.0
 SYNTH_TIMEOUT_SEC = 20.0
 MAX_ATTEMPTS = 3
 MAX_CONSECUTIVE_FAILURES = 3
@@ -219,13 +227,59 @@ class PcmClip:
         )
 
     async def frames(
-        self, make_frame: FrameFactory | None = None, frame_ms: int = FRAME_MS
+        self,
+        make_frame: FrameFactory | None = None,
+        frame_ms: int = FRAME_MS,
+        *,
+        yield_every: int = FRAME_YIELD_EVERY,
+        speed: float = FRAME_SPEED,
+        lead: float = FRAME_LEAD_SEC,
     ) -> AsyncIterator[Any]:
-        """The clip as ``frame_ms`` audio frames, ready for ``session.say(audio=...)``."""
+        """The clip as ``frame_ms`` audio frames, ready for ``session.say(audio=...)``.
+
+        Handed over at a bounded rate: the first ``lead`` seconds of audio at once, then never
+        more than ``speed`` times real time ahead of when the first frame was pulled; and the
+        event loop is handed back (``sleep(0)``) at least every ``yield_every`` frames.
+
+        Why bounded: the SDK pulls provided audio as fast as it comes, every frame costs it work
+        on the loop (the resampler to the room rate and the transcript synchroniser's speaking-
+        rate STFT: about 18 ms per second of audio on Fly), and its channels are drained without
+        suspending.  A clip that never awaited was ONE loop step: about 0.65 s for the 36 s
+        L-TRANSITION, so the recorder's lag probe (0.25 s) gave the video up at every transition
+        (10-29: four sessions of four).  Cut into 200 ms steps but otherwise unpaced, the same
+        work became a back-to-back burst that kept the loop busy until the whole line was handed
+        over, and the recorder's OTHER picture guard tripped instead: the SDK times each VAD
+        inference around ``await asyncio.to_thread(predict)``, so a saturated loop reads as slow
+        inference (``cpu_vad_slow``; laptop: 30-36 ms means against the 12.8 ms limit).  At four
+        times real time the work is spread over about 9 s of the 36 s line (laptop: VAD means
+        2.5-6.5 ms, worst loop lag under 50 ms).
+
+        Why not real time: the synchroniser learns a line's speaking rate only when its audio
+        input ends; a clip fed at real time ends it in its last second, and the candidate's live
+        captions run at the SDK's default rate until then (measured: up to 5 s behind on
+        L-TRANSITION).  At four times real time the input still ends early in the playout, as a
+        live TTS stream's does (captions measured at most 1.2 s off).  The frames are the same,
+        so what the candidate hears and what is recorded are too.  ``speed`` of zero or less
+        hands the clip over unpaced.  A cancel lands in one of the sleeps and ends the generator;
+        the SDK's ``aclose`` after it is then a no-op.
+        """
         build = make_frame or audio_frame
+        every = max(1, yield_every)
         per_frame = max(1, self.sample_rate * frame_ms // 1000)
         step = per_frame * self.channels * 2
-        for start in range(0, len(self.pcm), step):
+        bytes_per_second = 2.0 * self.channels * self.sample_rate
+        loop = asyncio.get_running_loop()
+        began = loop.time()  # the first pull: an async generator's body starts there
+        for index, start in enumerate(range(0, len(self.pcm), step)):
+            # ``start`` bytes are out already: this frame may go once that much audio, past the
+            # lead, has had ``1 / speed`` of its own length in wall time.
+            wait = 0.0
+            if speed > 0 and bytes_per_second > 0:
+                wait = (start / bytes_per_second - lead) / speed - (loop.time() - began)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            elif index and index % every == 0:
+                await asyncio.sleep(0)
             data = self.pcm[start : start + step]
             yield build(data, self.sample_rate, self.channels, len(data) // (2 * self.channels))
 
