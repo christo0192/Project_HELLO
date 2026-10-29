@@ -38,7 +38,10 @@ engine only DECIDES, deterministically, what the learner does on each candidate 
     to ROLEPLAY_EXIT and the interviewer's normal wrap-up follows (owner decision 2026-10-29).  An
     early end is scored only when the normal fidelity checks pass (``fidelity``: R reached 10:00,
     every family delivered, and the rest).  From 14:00, or with a commitment on record, an end
-    request is a farewell on the close ladder instead.
+    request is a farewell on the close ladder instead.  Owner decision 2026-10-30: the session may
+    hand ``plan_turn`` the end-intent model's verdict (``end_intent``), which can only raise the
+    lexical reading ("wrap up the interview", "kindly end the interview", "end the inter view"),
+    and a settled bare yes ("Yes.", "Haan ji.") answers L-ASIDE-END (``confirmed_yes``).
 
 Repetition control (R1-Q): ``record_spoken`` feeds every sentence the learner actually
 played into a ``SpokenMemory``; each plan's guard context carries a snapshot (``said``), so
@@ -232,8 +235,8 @@ from r1_tracker import (
     confirms_end,
     declines_end,
     detect_character_break,
-    detect_end_request,
-    explicit_end_request,
+    end_intent_level,
+    is_bare_yes,
     parse_judge_output,
     promises_call_back,
 )
@@ -642,6 +645,8 @@ class RolePlayEngine:
         backchannel: bool = False,
         repair: bool = False,
         answers_nothing: bool = False,
+        end_intent: str | None = None,
+        confirmed_yes: bool = False,
     ) -> TurnPlan:
         """Decide what the learner does after this candidate turn (see module docstring).
 
@@ -656,6 +661,18 @@ class RolePlayEngine:
         * ``answers_nothing``: courtesy words alone (``is_backchannel_turn``).  With the two above
           it decides whether a plan whose reply was cancelled before any audio (``reply_lost``)
           is simply planned again.
+
+        Owner decisions of 2026-10-30 (meaning-based end detection, ``r1_end_intent``):
+
+        * ``end_intent``: the end-intent model's verdict on this turn ("end", "maybe" or "no"),
+          or None when it was not asked (the prefilter missed, the lexical fast path already
+          decided, the classifier is off) or gave no usable answer in time.  It can only RAISE the
+          lexical reading (``r1_tracker.end_intent_level``): "end" exits before 14:00 like an
+          explicit request, "maybe" gets L-ASIDE-END, and with None every plan is exactly what
+          it was before.
+        * ``confirmed_yes``: the session let a bare yes settle (``is_bare_yes``: "yes", "yes
+          please", "haan ji", "go ahead"; nothing followed it), so it confirms the stop while
+          L-ASIDE-END's question is open.  A decline still wins.
         """
         # Ship restore, a pure cost bound: every reader below is lexical and linear in the text, and
         # no real advisor turn comes near this (longest live turn 1,072 characters, the owner's
@@ -696,13 +713,41 @@ class RolePlayEngine:
         # words answering a question asked earlier, is a farewell: it gets exactly what "bye" gets
         # on the close ladder (the redirect once before 14:00, the WEAK stall in the close window,
         # otherwise the exit) and nothing more, so it stays injection-neutral.
-        end_request = detect_end_request(candidate_text)
+        #
+        # The lexical reading (``detect_end_request``, ``explicit_end_request``) is the floor of
+        # ``end_level``; the end-intent model's verdict (``end_intent``) may raise it within the
+        # rails of ``end_intent_level`` (owner decision 2026-10-30).  A first request at level
+        # "end" is confirmed at once, one at "maybe" gets the question.
+        end_level = end_intent_level(candidate_text, end_intent)
+        lexical_level = end_intent_level(candidate_text, None)
+        # Reviewed fix (2026-10-30): once the question has been asked and has closed (declined, or
+        # answered by talk about the sale), a "later request" that confirms the stop at once must
+        # be the candidate's own words, never a model-only "maybe": after a declined aside, "At the
+        # end of the day, the course pays for itself." with a model "maybe" exited the role-play
+        # with no question at all.  A model "end" still counts (``end_intent_level`` lets it
+        # through only for a turn that ends on a request to stop the interview or the role play),
+        # and while the question is open a model "maybe" is still an answer to it.
+        if (
+            end_level == "maybe"
+            and lexical_level == "no"
+            and self._end_aside is not None
+            and not self._end_pending
+        ):
+            end_level = lexical_level
+        by_model = end_level != lexical_level
+        end_request = end_level != "no"
         # Once the aside has been asked, an answer that also declines is a no whatever end words it
         # holds: "No, I don't think I want to stop", "No, why would you end the call?" (reviewed
         # fix: these ended the session).
         declined = self._end_aside is not None and declines_end(candidate_text)
+        # After the question a bare yes confirms too, once the session has let it settle
+        # (``confirmed_yes``; owner decision 2026-10-30): "Yes.", "Yes please.", "Haan ji.".
         end_words = (end_request and not declined) or (
-            self._end_pending and confirms_end(candidate_text)
+            self._end_pending
+            and (
+                confirms_end(candidate_text)
+                or (confirmed_yes and is_bare_yes(candidate_text))
+            )
         )
         # "Let's cut the call now, I'll call you tomorrow": a call-back promise is the advisor
         # closing the sale's call in role, so it is a farewell, never the out-of-role stop (reviewed
@@ -713,7 +758,7 @@ class RolePlayEngine:
             and not promises_call_back(candidate_text)
         )
         if out_of_role and self._end_aside is not None and end_words:
-            return self._end_plan(turn_index, r_sec=r_sec)
+            return self._end_plan(turn_index, r_sec=r_sec, by_model=by_model)
         farewell_end = end_words and not out_of_role
         if self._end_pending and (
             farewell_end
@@ -724,9 +769,9 @@ class RolePlayEngine:
         if end_request and self._end_aside is None and out_of_role:
             # The aside is no answer to the lost plan either: what that plan used up is given back.
             self._restore_lost(lost_undo)
-            if explicit_end_request(candidate_text):
-                return self._end_plan(turn_index, r_sec=r_sec)
-            return self._end_aside_plan(r_sec, turn_index)
+            if end_level == "end":
+                return self._end_plan(turn_index, r_sec=r_sec, by_model=by_model)
+            return self._end_aside_plan(r_sec, turn_index, by_model=by_model)
         break_kind = detect_character_break(candidate_text)
         if lost is not None:
             if (
@@ -801,6 +846,8 @@ class RolePlayEngine:
         decision = None
         if farewell_end:
             reasons.append("end_request_as_farewell")
+            if by_model:
+                reasons.append("end_intent_model")
         if self._unheard_commitment is not None:
             revoiced = self._revoice_commitment(r_sec, reasons)
             if revoiced is not None:
@@ -1181,7 +1228,9 @@ class RolePlayEngine:
             line_id="L-ASIDE-COACH",
         )
 
-    def _end_aside_plan(self, r_sec: float, turn_index: int | None) -> TurnPlan:
+    def _end_aside_plan(
+        self, r_sec: float, turn_index: int | None, *, by_model: bool = False
+    ) -> TurnPlan:
         """L-ASIDE-END, once: say "end the interview" to stop, otherwise carry on.
 
         Like the coach aside it is excluded from evidence (nothing observes the candidate's
@@ -1191,7 +1240,8 @@ class RolePlayEngine:
         next candidate turn that is more than a fragment answers it (``_end_pending``); only end
         words confirm (``confirms_end``), and so does a later end request, while R < 14:00 and no
         commitment is on record.  After that both are farewells (the close ladder, see
-        ``plan_turn``).
+        ``plan_turn``).  ``by_model``: the end-intent model, not the lexical detector, heard the
+        request (reason ``end_intent_model``).
         """
         self._end_aside = {
             "after_roleplay_turn": self.turn,
@@ -1203,7 +1253,7 @@ class RolePlayEngine:
         self._end_pending = True
         return self._plan(
             TurnMode.SAY_ONLY,
-            ["aside_end_request"],
+            ["aside_end_request"] + (["end_intent_model"] if by_model else []),
             scripted=script_line("L-ASIDE-END", **self.persona.line_values),
             voice="interviewer",
             aside=True,
@@ -1218,7 +1268,14 @@ class RolePlayEngine:
         """
         self._end_pending = False
 
-    def _end_plan(self, turn_index: int | None, *, r_sec: float) -> TurnPlan:
+    @property
+    def end_question_open(self) -> bool:
+        """True while L-ASIDE-END's question waits for its answer (a bare yes may confirm)."""
+        return self._end_pending
+
+    def _end_plan(
+        self, turn_index: int | None, *, r_sec: float, by_model: bool = False
+    ) -> TurnPlan:
         """The candidate confirmed the stop: the role-play exits into the interviewer's wrap-up.
 
         Owner decision 2026-10-29 ("the role play should end and the finishing part of Christy the
@@ -1232,9 +1289,11 @@ class RolePlayEngine:
         check leaves it out as well) and changes no commitment, disclosure or schedule state.  A
         FIRST request that names the interview or the role play, and that the turn ends on, gets
         here with no question asked: it is then recorded with ``question_asked`` false and the
-        reason ``end_request_explicit``.
+        reason ``end_request_explicit``.  So does one the end-intent model judged "end" and that
+        names the interview or the role play (owner decision 2026-10-30; reason
+        ``end_intent_model`` as well, which also marks a confirmation only the model heard).
         """
-        reasons = ["end_confirmed"]
+        reasons = ["end_confirmed"] + (["end_intent_model"] if by_model else [])
         if self._end_aside is None:
             reasons.insert(0, "end_request_explicit")
             self._end_aside = {

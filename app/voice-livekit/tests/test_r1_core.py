@@ -2062,7 +2062,9 @@ class TestPhaseDriver(R1TestCase):
         self.interview.machine.transition(R1Phase.TRANSITION)
         task = asyncio.create_task(self.interview._run_transition())
         await self.settle()
-        self.final_transcript("what do I do?")
+        # Not "what do I do?": since 2026-10-30 that asks for the brief again, which is replayed
+        # (TestBriefRepeatOnRequest).  Any other answer that is not "ready" gets the nudge.
+        self.final_transcript("Hmm, hold on a second.")
         await self.until(lambda: self.spoken_and_played("L-TRANSITION-NUDGE"))
         self.final_transcript("hmm, one more question")
         await self.settle()
@@ -6163,7 +6165,7 @@ class TestReadyButton(R1TestCase):
 
     async def test_a_press_during_the_nudge_ends_the_wait_right_after_it(self) -> None:
         task = await self.start_transition()
-        self.final_transcript("what do I do?")
+        self.final_transcript("Hmm, hold on a second.")  # not a brief request (that is replayed)
         await self.until(lambda: self.session.spoken.count(self.spoken_line("L-TRANSITION-NUDGE")) == 1)
         self.press()
         self.assertIsNone(await asyncio.wait_for(task, 10.0))
@@ -7525,3 +7527,831 @@ class TestVoicePerSpeech(R1TestCase):
         self.assertNotIn(str(reply.id), self.interview._voices)
         await self.interview.say("L-SIL-IB")
         self.assertEqual(self.interview._voices, {})
+
+# ------------------------------------------------------------------------------------------------
+# Owner decisions 2026-10-30 (owner test 1eb18cd4): no "okay" stutter, meaning-based end detection,
+# a bare yes that confirms L-ASIDE-END, and the brief repeated on request.
+# ------------------------------------------------------------------------------------------------
+try:  # The SDK's own speech events when livekit is installed (.r1-venv); shaped fakes otherwise.
+    from livekit.agents import stt as _stt
+except ImportError:  # pragma: no cover - bare CI
+    _stt = None
+
+
+def stt_event(text: str, kind: str = "final_transcript"):
+    """A speech event as ``Agent.default.stt_node`` yields it."""
+    if _stt is not None:
+        return _stt.SpeechEvent(
+            type=_stt.SpeechEventType(kind),
+            alternatives=[_stt.SpeechData(language="en", text=text)],
+        )
+    return SimpleNamespace(
+        type=SimpleNamespace(value=kind), alternatives=[SimpleNamespace(text=text)]
+    )
+
+
+# The owner's turns #33-#41: what was said over the learner's reply, and whether R1 now holds it.
+OWNER_ACK_CUTS = (
+    ("Okay", True),
+    ("Yeah, Okay", True),
+    ("Yeah, okay, perfect.", False),  # not an acknowledgement today (owner decision pending)
+    ("Okay, continue.", True),
+)
+
+
+class AckHoldCase(R1TestCase):
+    """The learner is mid-reply: an interruptible, live speech in the role-play."""
+
+    def learner_speaking(self, **flags) -> FakeSpeechHandle:
+        if self.interview.machine.phase is not R1Phase.ROLEPLAY:
+            self.enter_roleplay()
+        handle = FakeSpeechHandle("My contract keeps me", allow_interruptions=True)
+        for name, value in flags.items():
+            setattr(handle, name, value)
+        self.session.current_speech = handle
+        return handle
+
+
+class TestAcknowledgementsDoNotCutTheLearner(AckHoldCase):
+    """Owner decision 2026-10-30 item 3: an "okay" over the learner no longer cuts her."""
+
+    def test_an_acknowledgement_over_the_learner_is_held(self) -> None:
+        self.learner_speaking()
+        for text, held in OWNER_ACK_CUTS:
+            with self.subTest(text=text):
+                self.assertIs(self.interview.hold_ack_transcript(stt_event(text)), held)
+        for text in ("Hmm", "Mm-hmm.", "Sorry, go ahead", "No, no, please continue"):
+            with self.subTest(text=text):
+                self.assertTrue(self.interview.hold_ack_transcript(stt_event(text)))
+        for kind in ("interim_transcript", "preflight_transcript"):
+            with self.subTest(kind=kind):
+                self.assertTrue(self.interview.hold_ack_transcript(stt_event("Okay", kind)))
+
+    def test_a_real_interruption_still_reaches_the_sdk(self) -> None:
+        self.learner_speaking()
+        for text in (
+            "Okay?", "Sorry?", "what is your name", "Hey, what is your name?", "Yes.", "No, no.",
+            "Okay, but the EMI is the problem.", "Pooja, wait.", "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(self.interview.hold_ack_transcript(stt_event(text)))
+        for kind in ("end_of_speech", "start_of_speech", "recognition_usage"):
+            with self.subTest(kind=kind):
+                self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay", kind)))
+
+    def test_only_a_live_interruptible_learner_speech_is_protected(self) -> None:
+        self.enter_roleplay()
+        self.session.current_speech = None
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+        for flags in (
+            {"allow_interruptions": False},
+            {"interrupted": True},
+            {"done": lambda: True},
+        ):
+            with self.subTest(flags=list(flags)):
+                self.learner_speaking(**flags)
+                self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+        handle = self.learner_speaking()
+        slot = r1_session._SpeechSlot(handle, source="generate_reply")
+        slot.cut_by_r1 = True
+        self.interview._speeches[handle.id] = slot
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+
+    def test_only_the_roleplay_is_covered(self) -> None:
+        self.session.current_speech = FakeSpeechHandle("Tell me more.", allow_interruptions=True)
+        self.assertIs(self.interview.machine.phase, R1Phase.ICEBREAKER)
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+        self.interview.machine.transition(R1Phase.TRANSITION)
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+        self.interview.machine.transition(R1Phase.ROLEPLAY)
+        self.assertTrue(self.interview.hold_ack_transcript(stt_event("Okay")))
+        self.interview.machine.transition(R1Phase.ROLEPLAY_EXIT)
+        self.interview.machine.transition(R1Phase.WRAPUP)
+        self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+
+    def test_the_kill_switch_restores_todays_behaviour(self) -> None:
+        self.learner_speaking()
+        for raw in ("0", "off", "false"):
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {"R1_ACK_HOLD": raw}):
+                self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+        with mock.patch.dict(os.environ, {"R1_ACK_HOLD": "1"}):
+            self.assertTrue(self.interview.hold_ack_transcript(stt_event("Okay")))
+
+    def test_it_holds_at_the_three_word_rollback_too(self) -> None:
+        self.learner_speaking()
+        with mock.patch.dict(os.environ, {"R1_INTERRUPT_MIN_WORDS": "3"}):
+            self.assertEqual(r1_session.interrupt_min_words(), 3)
+            for text in ("Okay", "Yeah, Okay", "Okay, continue."):
+                self.assertTrue(self.interview.hold_ack_transcript(stt_event(text)))
+            # Nothing was banked toward the SDK's 3 words: the acks can never add up to a turn.
+            self.assertEqual(self.interview._banked_words, 0)
+
+    async def test_a_held_ack_is_written_but_counted_for_nothing_else(self) -> None:
+        self.learner_speaking()
+        self.interview._latency._final_at = None
+        self.assertTrue(self.interview.hold_ack_transcript(stt_event("Okay")))
+        self.assertTrue(self.interview._turns.empty())  # the driver is not told
+        self.assertEqual(self.interview._banked_words, 0)  # the SDK banked nothing
+        self.assertIsNone(self.interview._latency._final_at)  # no stale latency anchor
+        self.assertEqual(self.interview._turn_finals, [])  # no end-intent text either
+        self.assertEqual(self.interview._acks_held, 1)
+        row = self.interview._open_row
+        self.assertEqual(row.parts, ["Okay"])
+        self.assertEqual(self.interview._latest_candidate_index, row.index)
+        # The candidate's next real turn joins the row (one row, as the SDK never saw the ack).
+        self.final_transcript("So what is your budget?")
+        await self.settle()
+        self.assertEqual(self.interview._open_row.parts, ["Okay", "So what is your budget?"])
+        await self.commit_turn("So what is your budget?")
+        await self.flush()
+        rows = [row for row in self.writer.saved if row["speaker"] == "candidate"]
+        self.assertEqual([row["text"] for row in rows], ["Okay So what is your budget?"])
+
+    async def test_an_ack_row_alone_is_written_at_the_learners_next_line(self) -> None:
+        self.learner_speaking()
+        self.interview.hold_ack_transcript(stt_event("Okay"))
+        self.interview._flush_candidate_row()
+        await self.flush()
+        self.assertEqual(
+            [(row["text"], row["phase"]) for row in self.writer.saved], [("Okay", "roleplay")]
+        )
+
+    async def test_a_held_ack_never_starts_or_lengthens_the_next_answer(self) -> None:
+        self.learner_speaking()
+        self.user_state("speaking")
+        self.clock.advance(1.0)
+        self.user_state("listening")
+        self.interview.hold_ack_transcript(stt_event("Yeah, okay, continue."))
+        self.assertIsNone(self.interview._user_turn_started)
+        self.clock.advance(10.0)  # the learner finishes her point
+        self.user_state("speaking")
+        self.clock.advance(5.0)
+        self.user_state("listening")
+        self.final_transcript("So how many hours can you give it?")
+        await self.settle()
+        engine = self.interview.engine
+        with mock.patch.object(engine, "plan_turn", wraps=engine.plan_turn) as plan:
+            await self.commit_turn("So how many hours can you give it?")
+        self.assertEqual(plan.call_args.kwargs["candidate_seconds"], 5.0)
+
+    async def test_an_ack_heard_while_the_candidate_still_speaks_is_judged_when_they_stop(
+        self,
+    ) -> None:
+        self.learner_speaking()
+        self.user_state("speaking")
+        self.interview.hold_ack_transcript(stt_event("Okay"))
+        self.assertTrue(self.interview._ack_unjudged)
+        self.clock.advance(1.0)
+        self.user_state("listening")
+        self.assertFalse(self.interview._ack_unjudged)
+        self.assertIsNone(self.interview._user_turn_started)
+
+    async def test_the_agents_stt_node_drops_only_held_events(self) -> None:
+        self.learner_speaking()
+        events = [
+            stt_event("", "start_of_speech"),
+            stt_event("Okay", "interim_transcript"),
+            stt_event("Okay"),
+            stt_event("Yeah, okay, perfect."),
+            stt_event("Hey, what is your name?"),
+            stt_event("", "end_of_speech"),
+        ]
+
+        async def default_stt_node(agent, audio, model_settings):
+            for event in events:
+                yield event
+
+        agent = R1Agent(self.interview)
+        default = getattr(r1_session.Agent, "default", None)
+        if default is None:  # bare CI: the node passes its input through the filter
+            stream = agent.stt_node(default_stt_node(agent, None, None), None)
+        else:
+            with mock.patch.object(default, "stt_node", default_stt_node):
+                stream = agent.stt_node(None, None)
+        seen = [event async for event in stream]
+        self.assertEqual(
+            [(getattr(e.type, "value", e.type), e.alternatives[0].text if e.alternatives else "")
+             for e in seen],
+            [
+                ("start_of_speech", ""),
+                ("final_transcript", "Yeah, okay, perfect."),
+                ("final_transcript", "Hey, what is your name?"),
+                ("end_of_speech", ""),
+            ],
+        )
+
+    async def test_the_owners_turns_33_to_41_no_longer_restart_the_learner(self) -> None:
+        # Owner test 1eb18cd4 #33-#41: "Okay", "Yeah, Okay", "Yeah, okay, perfect." and "Okay,
+        # continue." each cut her and she restarted four times.  Now three of them never reach the
+        # SDK: no cut, no committed turn, no restart; only "Yeah, okay, perfect." still does.
+        self.learner_speaking()
+        reached = [
+            text for text, _ in OWNER_ACK_CUTS
+            if not self.interview.hold_ack_transcript(stt_event(text))
+        ]
+        self.assertEqual(reached, ["Yeah, okay, perfect."])
+        self.assertTrue(self.interview._turns.empty())
+        self.assertEqual(self.interview._acks_held, 3)
+
+    def test_a_failure_passes_the_event_on(self) -> None:
+        self.learner_speaking()
+        with mock.patch.object(
+            r1_session, "is_acknowledgement_turn", side_effect=RuntimeError("boom")
+        ), self.capture_logs() as logs:
+            self.assertFalse(self.interview.hold_ack_transcript(stt_event("Okay")))
+        self.assertIn("r1_ack_hold_failed", error_types(logs))
+
+    async def test_a_failure_writing_the_held_row_never_breaks_the_stt_stream(self) -> None:
+        # Reviewed fix: an exception in ``_note_held_ack`` left ``stt_node_stream`` and ended the
+        # SDK's speech-to-text pump, so the question after the "Okay" was never delivered.
+        self.learner_speaking()
+        events = [stt_event("Okay"), stt_event("What is your name?")]
+
+        async def source():
+            for event in events:
+                yield event
+
+        with mock.patch.object(
+            self.interview, "_candidate_turn_anchor", side_effect=ValueError("anchor failed")
+        ), self.capture_logs() as logs:
+            seen = [event async for event in self.interview.stt_node_stream(source())]
+        self.assertEqual([event.alternatives[0].text for event in seen], ["What is your name?"])
+        self.assertIn("r1_ack_note_failed", error_types(logs))
+        with mock.patch.object(
+            self.interview, "_note_held_ack", side_effect=RuntimeError("boom")
+        ), self.capture_logs() as logs:
+            self.assertTrue(self.interview.hold_ack_transcript(stt_event("Okay")))
+        self.assertIn("r1_ack_note_failed", error_types(logs))
+
+
+class TestHeldAckFastResume(AckHoldCase):
+    """A paused line comes back ``R1_ACK_RESUME_SEC`` after its acknowledgement was held."""
+
+    def activity(self, handle, *, timer=True, when=None, start=None):
+        timer_obj = None
+        if timer:
+            timer_obj = SimpleNamespace(when=when) if when is not None else object()
+        activity = SimpleNamespace(
+            _paused_speech=SimpleNamespace(handle=handle),
+            _current_speech=handle,
+            _false_interruption_timer=timer_obj,
+            _start_false_interruption_timer=start or mock.Mock(),
+        )
+        self.session._activity = activity
+        return activity
+
+    async def test_the_sdks_countdown_is_shortened(self) -> None:
+        handle = self.learner_speaking()
+        activity = self.activity(handle)
+        self.interview.hold_ack_transcript(stt_event("Yeah, okay, continue."))
+        activity._start_false_interruption_timer.assert_called_once_with(0.3)
+
+    async def test_nothing_is_done_without_a_countdown_or_for_another_speech(self) -> None:
+        handle = self.learner_speaking()
+        activity = self.activity(handle, timer=False)
+        self.interview.hold_ack_transcript(stt_event("Okay"))
+        activity._start_false_interruption_timer.assert_not_called()
+        activity = self.activity(handle)
+        activity._current_speech = FakeSpeechHandle("another")
+        self.interview.hold_ack_transcript(stt_event("Okay"))
+        activity._start_false_interruption_timer.assert_not_called()
+        # An interim never resumes anything (only a held final does).
+        activity = self.activity(handle)
+        self.interview.hold_ack_transcript(stt_event("Okay", "interim_transcript"))
+        activity._start_false_interruption_timer.assert_not_called()
+
+    async def test_a_sooner_sdk_resume_is_left_alone(self) -> None:
+        handle = self.learner_speaking()
+        now = asyncio.get_running_loop().time()
+        activity = self.activity(handle, when=lambda: now + 0.1)
+        self.interview.hold_ack_transcript(stt_event("Okay"))
+        activity._start_false_interruption_timer.assert_not_called()
+
+    async def test_zero_turns_it_off_and_a_failure_is_swallowed(self) -> None:
+        handle = self.learner_speaking()
+        activity = self.activity(handle)
+        with mock.patch.dict(os.environ, {"R1_ACK_RESUME_SEC": "0"}):
+            self.interview.hold_ack_transcript(stt_event("Okay"))
+        activity._start_false_interruption_timer.assert_not_called()
+        self.activity(handle, start=mock.Mock(side_effect=RuntimeError("sdk drift")))
+        with self.capture_logs() as logs:
+            self.assertTrue(self.interview.hold_ack_transcript(stt_event("Okay")))
+        self.assertIn("r1_ack_resume_failed", error_types(logs))
+
+    def test_the_bounds(self) -> None:
+        for raw, expected in ((None, 0.3), ("0", 0.0), ("1.0", 1.0), ("9", 2.0), ("x", 0.3)):
+            with self.subTest(raw=raw), mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("R1_ACK_RESUME_SEC", None)
+                if raw is not None:
+                    os.environ["R1_ACK_RESUME_SEC"] = raw
+                self.assertEqual(r1_session.ack_resume_seconds(), expected)
+
+
+class EndIntentRunner:
+    """A fake classifier: records its calls, answers ``verdict`` (or raises, or hangs)."""
+
+    def __init__(self, verdict='{"intent": "end"}', *, hang=False, error=None, gate=None):
+        self.verdict = verdict
+        self.hang = hang
+        self.error = error
+        self.gate = gate
+        self.calls: list[list[dict]] = []
+        self.cancelled = 0
+
+    async def __call__(self, messages):
+        self.calls.append(messages)
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            if self.hang:
+                await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.cancelled += 1
+            raise
+        if self.error is not None:
+            raise self.error
+        return self.verdict
+
+
+class TestEndIntentClassification(R1TestCase):
+    """Owner decision 2026-10-30 item 1: a quick model decides what the lexical detectors miss."""
+
+    def use(self, runner: EndIntentRunner) -> EndIntentRunner:
+        self.interview._end_intent_runner = runner
+        return runner
+
+    async def asyncSetUp(self) -> None:
+        await super().asyncSetUp()
+        self.enter_roleplay()
+        self.interview.engine  # built, as the first role-play turn builds it
+
+    async def test_the_call_starts_at_the_final_and_is_reused_at_the_hook(self) -> None:
+        runner = self.use(EndIntentRunner())
+        text = "Okay, we can wrap up the interview here."
+        self.final_transcript(text)
+        self.assertIsNotNone(self.interview._end_intent_call)  # started at the final
+        await self.settle()
+        self.assertEqual(len(runner.calls), 1)  # before the hook
+        with self.capture_logs() as logs:
+            self.assertTrue(await self.commit_turn(text))
+        self.assertEqual(len(runner.calls), 1)  # reused
+        self.assertTrue(self.interview.engine.end_confirmed)
+        self.assertTrue(self.interview.engine.exit_requested)
+        latency = [line_ for line_ in logs if line_.get("error_type") == "r1_latency"]
+        waits = [line_ for line_ in latency if line_.get("schema") == "end_intent_wait"]
+        self.assertEqual([line_["error_category"] for line_ in waits], ["reused"])
+        await self.flush()
+        rows = [row for row in self.writer.saved if row["speaker"] == "candidate"]
+        self.assertEqual([(row["text"], row["phase"]) for row in rows], [(text, "aside")])
+
+    async def test_the_call_reports_its_own_time_and_verdict(self) -> None:
+        self.use(EndIntentRunner('{"intent": "maybe"}'))
+        with self.capture_logs() as logs:
+            self.final_transcript("Let's call it a day.")
+            await self.settle()
+            self.assertTrue(await self.commit_turn("Let's call it a day."))
+        calls = [line_ for line_ in logs if line_.get("schema") == "end_intent_call"]
+        self.assertEqual([line_["error_category"] for line_ in calls], ["maybe"])
+        self.assertIn(self.spoken_line("L-ASIDE-END"), self.session.spoken)
+        self.assertTrue(self.interview.engine.end_question_open)
+
+    async def test_a_changed_text_starts_a_fresh_call(self) -> None:
+        runner = self.use(EndIntentRunner())
+        self.final_transcript("Okay, so we can wrap up.")
+        first = self.interview._end_intent_call
+        self.final_transcript("The interview, I mean.")
+        self.assertIsNot(self.interview._end_intent_call, first)
+        self.assertTrue(first.task.cancelled() or first.task.cancelling())
+        await self.settle()
+        self.assertEqual(len(runner.calls), 1)  # the first never ran; the joined text's did
+        self.assertIn("The interview, I mean.", runner.calls[0][1]["content"])
+        await self.commit_turn("Okay, so we can wrap up. The interview, I mean.")
+        self.assertEqual(len(runner.calls), 1)  # the hook reused it
+        # The model's "end" reached the plan; the turn does not END on the request (its last
+        # sentence is "The interview, I mean."), so it is asked, not exited (``strictly_names_end``).
+        self.assertFalse(self.interview.engine.end_confirmed)
+        self.assertTrue(self.interview.engine.end_question_open)
+        await self.asyncSetUp()  # a fresh role-play: the hook's text differs from the finals'
+        runner_two = self.use(EndIntentRunner('{"intent": "no"}'))
+        self.final_transcript("Let's close the deal")
+        await self.settle()
+        self.assertFalse(
+            await self.commit_turn("Let's close the deal today, the festival price ends Sunday.")
+        )
+        self.assertEqual(len(runner_two.calls), 2)  # the hook's text differed: a call at the hook
+
+    async def test_a_timeout_an_error_or_nonsense_is_the_lexical_reading(self) -> None:
+        for runner in (
+            EndIntentRunner(hang=True),
+            EndIntentRunner(error=RuntimeError("provider down")),
+            EndIntentRunner("I think they want to stop"),
+        ):
+            with self.subTest(runner=vars(runner)), mock.patch.dict(
+                os.environ, {"R1_END_INTENT_TIMEOUT_SEC": "0.3"}
+            ):
+                self.use(runner)
+                loop = asyncio.get_running_loop()
+                started = loop.time()
+                with self.capture_logs() as logs:
+                    suppressed = await self.commit_turn("Kindly end the interview.")
+                self.assertLess(loop.time() - started, 1.0)
+                self.assertFalse(suppressed)  # "Kindly end the interview." alone: a free reply
+                self.assertFalse(self.interview.engine.exit_requested)
+                categories = [
+                    line_.get("error_category")
+                    for line_ in logs
+                    if line_.get("error_type") == "r1_end_intent"
+                ]
+                self.assertTrue({"timeout", "error", "parse_failed"} & set(categories), categories)
+                self.assertIn("none", categories)
+        self.assertEqual(self.use(EndIntentRunner(hang=True)).cancelled, 0)
+
+    async def test_a_timed_out_call_is_cancelled(self) -> None:
+        runner = self.use(EndIntentRunner(hang=True))
+        with mock.patch.dict(os.environ, {"R1_END_INTENT_TIMEOUT_SEC": "0.3"}):
+            await self.commit_turn("Kindly end the interview.")
+        await self.settle()
+        self.assertEqual(runner.cancelled, 1)
+
+    async def test_turns_the_model_is_never_asked_about(self) -> None:
+        runner = self.use(EndIntentRunner())
+        # A prefilter miss: no call, no wait.
+        self.final_transcript("What's your budget for this?")
+        await self.commit_turn("What's your budget for this?")
+        # The lexical fast path: an explicit request exits without the model.
+        self.final_transcript("End the interview.")
+        self.assertTrue(await self.commit_turn("End the interview."))
+        self.assertTrue(self.interview.engine.end_confirmed)
+        self.assertEqual(runner.calls, [])
+
+    async def test_the_kill_switch_and_a_session_without_a_client(self) -> None:
+        runner = self.use(EndIntentRunner())
+        with mock.patch.dict(os.environ, {"R1_END_INTENT_LLM": "0"}):
+            self.final_transcript("Kindly end the interview.")
+            self.assertFalse(await self.commit_turn("Kindly end the interview."))
+        self.assertEqual(runner.calls, [])
+        self.interview._end_intent_runner = None
+        self.assertIsNone(getattr(self.session, "llm", None))
+        self.assertIsNone(self.interview._end_intent_runner_or_none())
+
+    async def test_an_unbuildable_client_disables_the_classifier_once(self) -> None:
+        self.session.llm = object()
+        self.assertEqual(
+            self.interview._end_intent_runner_or_none(), self.interview._default_end_intent
+        )
+        with mock.patch.object(
+            r1_llm, "build_r1_judge_llm", side_effect=r1_llm.R1LLMConfigurationError("x")
+        ), self.capture_logs() as logs:
+            self.assertFalse(await self.commit_turn("Kindly end the interview."))
+        self.assertIn("r1_end_intent_unusable", error_types(logs))
+        self.assertTrue(self.interview._end_intent_unusable)
+        self.assertIsNone(self.interview._end_intent_runner_or_none())
+
+    async def test_a_final_during_the_wait_opens_the_next_row(self) -> None:
+        gate = asyncio.Event()
+        self.use(EndIntentRunner('{"intent": "no"}', gate=gate))
+        text = "Let's close this deal now, I can hold the price."
+        self.user_state("speaking")
+        self.clock.advance(4.0)
+        self.user_state("listening")
+        self.final_transcript(text)
+        index = self.interview._open_row.index
+        engine = self.interview.engine
+        with mock.patch.object(engine, "plan_turn", wraps=engine.plan_turn) as plan:
+            hook = asyncio.create_task(self.commit_turn(text))
+            await self.settle()
+            self.assertFalse(hook.done())  # waiting for the verdict
+            self.user_state("speaking")
+            self.clock.advance(2.0)
+            self.user_state("listening")
+            self.final_transcript("Hello?")
+            gate.set()
+            await hook
+        kwargs = plan.call_args.kwargs
+        self.assertEqual((kwargs["turn_index"], kwargs["candidate_seconds"]), (index, 4.0))
+        self.assertEqual(kwargs["end_intent"], "no")
+        self.assertEqual(self.interview._open_row.parts, ["Hello?"])
+        self.assertGreater(self.interview._open_row.index, index)
+        self.assertEqual(self.interview._latest_candidate_index, self.interview._open_row.index)
+        await self.flush()
+        self.assertEqual(
+            [row["text"] for row in self.writer.saved if row["speaker"] == "candidate"], [text]
+        )
+
+    async def test_the_owners_missed_phrasings_end_the_roleplay_with_the_model(self) -> None:
+        from tests.test_r1_end_intent import OWNER_MISSED
+
+        for text in OWNER_MISSED:
+            with self.subTest(text=text):
+                await self.asyncSetUp()
+                self.use(EndIntentRunner())
+                self.final_transcript(text)
+                await self.settle()
+                self.assertTrue(await self.commit_turn(text))
+                self.assertTrue(self.interview.engine.end_confirmed, text)
+
+    async def test_the_question_is_the_context_after_the_aside(self) -> None:
+        runner = self.use(EndIntentRunner('{"intent": "maybe"}'))
+        await self.commit_turn("Can you end the call?")  # lexical "maybe": the model may raise it
+        await self.until(lambda: self.spoken_and_played("L-ASIDE-END"))
+        await self.settle()
+        self.assertEqual(len(runner.calls), 1)
+        self.assertNotIn("Christy has just asked", runner.calls[0][1]["content"])
+        self.assertTrue(await self.commit_turn("Okay, let's wrap it up then."))
+        self.assertIn("Christy has just asked", runner.calls[-1][1]["content"])
+        self.assertTrue(self.interview.engine.end_confirmed)
+
+
+class TestBareYesConfirmsTheEnd(R1TestCase):
+    """Owner decision 2026-10-30 item 2: after L-ASIDE-END a bare yes confirms the stop."""
+
+    async def asked(self) -> None:
+        self.enter_roleplay()
+        self.assertTrue(await self.commit_turn("Okay, never mind, can you disconnect the call?"))
+        await self.until(lambda: self.spoken_and_played("L-ASIDE-END"))
+        await self.settle()
+        self.assertTrue(self.interview.engine.end_question_open)
+
+    async def test_a_yes_that_stands_confirms_and_exits_into_the_wrap_up(self) -> None:
+        await self.asked()
+        for answer in ("Yes.",):
+            with mock.patch.dict(os.environ, {"R1_BARE_YES_SETTLE_SEC": "0.2"}):
+                self.final_transcript(answer)
+                await self.settle()
+                self.assertTrue(await self.commit_turn(answer))
+        self.assertTrue(self.interview.engine.end_confirmed)
+        self.assertTrue(self.interview._roleplay_exit_requested())
+        await self.flush()
+        rows = [row for row in self.writer.saved if row["speaker"] == "candidate"]
+        self.assertEqual((rows[-1]["text"], rows[-1]["phase"]), ("Yes.", "aside"))
+
+    async def test_the_owners_answers_confirm(self) -> None:
+        for answer in ("yes please", "sure", "haan", "go ahead", "Haan ji."):
+            with self.subTest(answer=answer):
+                await self.asyncSetUp()
+                await self.asked()
+                with mock.patch.dict(os.environ, {"R1_BARE_YES_SETTLE_SEC": "0.05"}):
+                    self.assertTrue(await self.commit_turn(answer))
+                self.assertTrue(self.interview.engine.end_confirmed)
+
+    async def test_a_yes_the_candidate_goes_on_from_waits_for_the_next_turn(self) -> None:
+        await self.asked()
+        self.final_transcript("Yeah.")
+        await self.settle()
+        with mock.patch.dict(os.environ, {"R1_BARE_YES_SETTLE_SEC": "1.0"}):
+            hook = asyncio.create_task(self.commit_turn("Yeah."))
+            await self.settle()
+            self.user_state("speaking")
+            self.final_transcript("no, let's carry on")
+            self.assertTrue(await asyncio.wait_for(hook, 3.0))  # StopResponse: no answer alone
+        engine = self.interview.engine
+        self.assertFalse(engine.end_confirmed)
+        self.assertTrue(engine.end_question_open)
+        await self.flush()
+        rows = [row for row in self.writer.saved if row["speaker"] == "candidate"]
+        self.assertEqual((rows[-1]["text"], rows[-1]["phase"]), ("Yeah.", "aside"))
+        self.user_state("listening")
+        self.assertFalse(await self.commit_turn("no, let's carry on"))  # declined: role-play on
+        self.assertFalse(engine.end_confirmed)
+        self.assertFalse(engine.end_question_open)
+
+    async def test_speech_without_a_transcript_was_noise_and_the_yes_stands(self) -> None:
+        await self.asked()
+        with mock.patch.dict(os.environ, {"R1_BARE_YES_SETTLE_SEC": "1.0"}), mock.patch.object(
+            r1_session, "endpoint_max_delay_sec", return_value=0.05
+        ), mock.patch.object(r1_session, "BARE_YES_FINAL_MARGIN_SECONDS", 0.05):
+            hook = asyncio.create_task(self.commit_turn("Yes."))
+            await self.settle()
+            self.user_state("speaking")
+            self.user_state("listening")
+            self.assertTrue(await asyncio.wait_for(hook, 3.0))
+        self.assertTrue(self.interview.engine.end_confirmed)
+
+    async def test_a_yes_with_no_question_open_is_an_ordinary_turn(self) -> None:
+        self.enter_roleplay()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        self.assertFalse(await self.commit_turn("Yes."))
+        self.assertLess(loop.time() - started, 0.5)  # no settle wait
+        self.assertFalse(self.interview.engine.end_confirmed)
+
+
+class TestBriefRepeatOnRequest(R1TestCase):
+    """Owner decision 2026-10-30 item 4 (owner test 1eb18cd4 #13-#18): the brief once more."""
+
+    OWNER_14 = (
+        "But yeah, for my personal growth, I wanted to switch so that I'll get a new environment. "
+        "Okay, could you please explain me again like what this round is about, the role play in "
+        "a small brief kind of thing?"
+    )
+
+    def press(self) -> None:
+        self.ctx.room.emit("data_received", ready_packet())
+
+    async def start_transition(self) -> asyncio.Task:
+        task = asyncio.create_task(self.interview._run_transition())
+        await self.settle()
+        return task
+
+    def briefs(self) -> int:
+        return self.session.spoken.count(self.spoken_line("L-TRANSITION"))
+
+    def test_the_detector(self) -> None:
+        for text in (
+            self.OWNER_14,
+            "I wanted to understand this, uh, this round, the role play brief.",
+            "Can you repeat that?",
+            "What should I do?",
+            "Sorry, could you explain the scenario again?",
+            "I didn't understand.",
+            "Who is the learner?",
+            "I'm the advisor?",
+            "Come again?",
+            # Reviewed fix: common phrasings the first cut missed (and the SDK then dropped).
+            "Explain me again.", "Can you tell me again?",
+            "Could you tell me once more what I need to do?", "Please tell me again.",
+            "Repeat please.", "Pardon?", "What is my role?", "what's my role here?",
+            "What exactly do I have to do?", "I didn't get you.", "I'm not clear.",
+            "Brief me again.", "Once again please.", "Sorry, one more time.",
+            "I want to understand what I have to do.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_brief_request(text))
+        for text in (
+            "Ready", "Okay", "Yes", "Sure, let's start", "Thank you", "Okay got it",
+            "Yes, I can hear you", "Alright, I'm ready", "So Bye", "I'm the advisor.",
+            "Okay, ready. Can you repeat that?", "Hmm, hold on a second.",
+            "But yeah, for my personal growth, I wanted to switch so that I'll get a new "
+            "environment.",
+            # Reviewed fix: courtesies and statements that end an icebreaker answer over
+            # L-TRANSITION, which replayed the whole brief nobody asked for.
+            "Thank you once again.", "Okay, thank you once again.",
+            "Yeah, that's it. Thank you once again for this opportunity.",
+            "So I wanted to understand how sales works in edtech.",
+            "That's why I wanted to understand the customer side better.",
+            "And yeah, I would like to understand more about this role.",
+            "I got promoted once again last year.", "Let me try one more time.",
+            "So I need to understand her pain points, right?",
+            "Just to recap everything one more time, the course has six modules.",
+            "I'd like to understand your goals before we talk about enrolment.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_brief_request(text))
+
+    def test_real_advisor_turns_never_ask_for_the_brief(self) -> None:
+        # Reviewed fix: 5 of the 2,136 corpus and held-out turns matched the first cut.
+        fixtures = Path(__file__).resolve().parent / "fixtures"
+        for name in ("r1_advisor_corpus.jsonl", "r1_advisor_heldout.jsonl"):
+            for line in (fixtures / name).read_text(encoding="utf-8").splitlines():
+                if line:
+                    text = json.loads(line)["text"]
+                    with self.subTest(text=text[:80]):
+                        self.assertFalse(r1_session.is_brief_request(text))
+
+    async def test_a_request_during_the_briefing_replays_it_once(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.final_transcript(self.OWNER_14)  # spoken over L-TRANSITION: the SDK drops the turn
+        self.assertTrue(self.interview._brief_requested)
+        with self.capture_logs() as logs:
+            task = await self.start_transition()
+            await self.until(lambda: self.briefs() == 1)
+            await self.until(lambda: self.spoken_and_played("L-TRANSITION"))
+            await self.settle()
+            self.assertFalse(task.done())  # waiting for ready again
+            self.final_transcript("ready")
+            self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.briefs(), 1)
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-PICKUP")), 1)
+        self.assertNotIn(self.spoken_line("L-TRANSITION-NUDGE"), self.session.spoken)
+        self.assertIn("r1_brief_repeat", error_types(logs))
+
+    async def test_a_second_request_gets_the_nudge_and_no_second_replay(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        task = await self.start_transition()
+        self.final_transcript("Can you repeat that?")
+        await self.until(lambda: self.briefs() == 1 and self.spoken_and_played("L-TRANSITION"))
+        await self.settle()
+        self.final_transcript("Sorry, can you repeat that?")
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-NUDGE"))
+        await self.settle()
+        self.final_transcript("Okay, ready.")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.briefs(), 1)
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-TRANSITION-NUDGE")), 1)
+
+    async def test_ready_said_during_the_replay_picks_up_right_after_it(self) -> None:
+        self.session.playout_seconds = 0.2
+        self.interview._enter(R1Phase.TRANSITION)
+        self.final_transcript("What do I do?")
+        task = await self.start_transition()
+        await self.until(lambda: ("play_start", self.spoken_line("L-TRANSITION")) in self.order)
+        self.final_transcript("Okay, ready.")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.briefs(), 1)
+        self.assertEqual(self.session.spoken[-1], self.spoken_line("L-PICKUP"))
+
+    async def test_the_button_during_the_replay_picks_up_after_it(self) -> None:
+        self.session.playout_seconds = 0.2
+        self.interview._enter(R1Phase.TRANSITION)
+        self.final_transcript("What do I do?")
+        task = await self.start_transition()
+        await self.until(lambda: ("play_start", self.spoken_line("L-TRANSITION")) in self.order)
+        self.press()
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertTrue(self.spoken_and_played("L-TRANSITION"))
+        self.assertEqual(self.session.spoken, [
+            self.spoken_line("L-TRANSITION"), self.spoken_line("L-PICKUP")
+        ])
+
+    async def test_a_press_before_the_replay_means_no_replay(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        self.final_transcript("What do I do?")
+        self.press()
+        self.assertIsNone(await asyncio.wait_for(self.interview._run_transition(), 10.0))
+        self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+
+    async def test_the_wait_starts_again_after_the_replay(self) -> None:
+        with mock.patch.object(r1_session, "TRANSITION_DEADLINE_SECONDS", 0.5):
+            self.session.playout_seconds = 0.6  # longer than the whole first wait
+            self.interview._enter(R1Phase.TRANSITION)
+            task = await self.start_transition()
+            self.final_transcript("Can you repeat that?")
+            await self.until(lambda: self.spoken_and_played("L-TRANSITION"))
+            loop = asyncio.get_running_loop()
+            after = loop.time()
+            await asyncio.wait_for(task, 5.0)
+            self.assertGreaterEqual(loop.time() - after, 0.3)  # a fresh 0.5 s window
+        self.assertEqual(self.session.spoken[-1], self.spoken_line("L-PICKUP"))
+
+    async def test_the_wait_after_the_replay_keeps_to_the_transition_budget(self) -> None:
+        # Reviewed fix: a fresh full 20 s after a late request and a ~40 s replay took the
+        # transition to about 1:54, and after a 4:30 icebreaker the S 26:00 cap cut the role-play
+        # short of the twenty minutes the replayed brief had just announced.
+        self.interview._enter(R1Phase.TRANSITION)
+        started = self.interview._transition_started_at
+        self.assertIsNotNone(started)
+        wait = self.interview._wait_after_replay
+        self.assertEqual(wait(started + 45.0), 20.0)  # a request during the brief: 45 s left
+        self.assertEqual(wait(started + 80.0), 10.0)  # what is left of the 1:30
+        self.assertEqual(wait(started + 105.0), 8.0)  # past the budget: the floor
+        with mock.patch.object(r1_session, "TRANSITION_DEADLINE_SECONDS", 0.5):
+            self.assertEqual(wait(started + 105.0), 0.5)  # never more than the deadline
+        self.interview._transition_started_at = None
+        self.assertEqual(wait(started + 105.0), 20.0)  # no start on record: as before
+
+    async def test_a_late_replay_waits_only_for_what_is_left(self) -> None:
+        with mock.patch.object(r1_session, "TRANSITION_BUDGET_SECONDS", 0.6), mock.patch.object(
+            r1_session, "TRANSITION_REPLAY_WAIT_FLOOR_SECONDS", 0.1
+        ):
+            self.session.playout_seconds = 0.6  # the replay alone uses up the budget
+            self.interview._enter(R1Phase.TRANSITION)
+            task = await self.start_transition()
+            self.final_transcript("Can you repeat that?")
+            await self.until(lambda: self.spoken_and_played("L-TRANSITION"))
+            loop = asyncio.get_running_loop()
+            after = loop.time()
+            await asyncio.wait_for(task, 5.0)
+            self.assertLess(loop.time() - after, 2.0)  # the floor, not a fresh 20 s
+        self.assertEqual(self.session.spoken[-1], self.spoken_line("L-PICKUP"))
+
+    async def test_ready_wins_over_a_request_in_the_same_turn(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        task = await self.start_transition()
+        self.final_transcript("Okay, ready. Can you repeat that?")
+        self.assertIsNone(await asyncio.wait_for(task, 10.0))
+        self.assertEqual(self.briefs(), 0)
+
+    async def test_an_audio_check_is_no_request(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        task = await self.start_transition()
+        self.final_transcript("Yes, I can hear you.")
+        await self.until(lambda: self.spoken_and_played("L-TRANSITION-NUDGE"))
+        self.final_transcript("ready")
+        await asyncio.wait_for(task, 10.0)
+        self.assertEqual(self.briefs(), 0)
+
+    async def test_the_owners_transition_through_the_real_driver(self) -> None:
+        run = await self.start_interview()
+        run.clock.advance(271)
+        run.interview._wake()
+        await self.until(lambda: run.interview.machine.phase is R1Phase.TRANSITION)
+        run.session.emit("user_input_transcribed", final_event(self.OWNER_14))
+        await self.until(
+            lambda: run.session.spoken.count(self.spoken_line("L-TRANSITION")) == 2
+        )
+        await self.until(lambda: self.order.count(("play_end", self.spoken_line("L-TRANSITION")))
+                         == 2)
+        await self.settle()
+        run.session.emit("user_input_transcribed", final_event("ready"))
+        await self.until(lambda: run.interview.machine.phase is R1Phase.ROLEPLAY)
+        self.assertEqual(run.session.spoken.count(self.spoken_line("L-PICKUP")), 1)
+        await self.drain_cancel(run)
+
+    async def test_after_the_pickup_the_brief_request_gets_the_coach_aside(self) -> None:
+        # Owner row #18 ("I wanted to understand this, uh, this round, the role play brief."),
+        # already in the role-play: L-TRANSITION cannot follow the pickup, the coach aside does.
+        self.enter_roleplay()
+        text = "I wanted to understand this, uh, this round, the role play brief."
+        self.assertTrue(await self.commit_turn(text))
+        await self.until(lambda: self.spoken_and_played("L-ASIDE-COACH"))
+        self.assertNotIn(self.spoken_line("L-TRANSITION"), self.session.spoken)

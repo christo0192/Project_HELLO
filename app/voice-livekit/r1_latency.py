@@ -254,6 +254,18 @@ class LatencyTracker:
         the candidate was still waiting).  Its category is the turn kind.
     ``say_to_first_audio``
         A scripted line: from ``say`` to its audio starting, the line id as the category.
+    ``final_to_turn_hook``
+        The last final transcript of the turn to ``on_user_turn_completed`` (category: the
+        anchor kind), reported when a final was seen and the anchor is another (with the final
+        as the anchor, ``eou_to_turn_hook`` is this gap).  Owner decision 2026-10-30: this is the
+        head start a speculative end-intent classification gets before the hook waits for it.
+
+    Two more segments of the end-intent classifier are emitted by ``r1_session`` itself, on the
+    same ``emit`` callback and the same schema (stage, seconds, category, phase, turn index):
+    ``end_intent_call`` (one model call, start to verdict; the category is the verdict, or
+    ``timeout``, ``error`` or ``parse_failed``) and ``end_intent_wait`` (how long the turn hook
+    waited for it; ``reused`` for a call started at the final, ``at_hook`` otherwise).  None of
+    the three is read by ``stage_a_report``; the hook's wait already shows in the headline.
     """
 
     def __init__(self, clock: Callable[[], float], emit: Emit) -> None:
@@ -296,6 +308,7 @@ class LatencyTracker:
             anchor, how = self._final_at, "final"
         else:
             anchor, how = now, "hook"
+        final_at = self._final_at
         self._stop_at = None
         self._final_at = None
         self._seq += 1
@@ -311,6 +324,9 @@ class LatencyTracker:
         self._turn = turn
         self._recent.append(turn)
         self._report("eou_to_turn_hook", now - turn.anchor, turn, category=how)
+        if final_at is not None and how != "final":
+            # With the final as the anchor, ``eou_to_turn_hook`` already is this gap.
+            self._report("final_to_turn_hook", now - min(final_at, now), turn, category=how)
 
     def set_kind(self, kind: str) -> None:
         """Record what the turn turned out to be (the engine's mode), for the headline."""

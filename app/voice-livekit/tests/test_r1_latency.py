@@ -281,6 +281,8 @@ class TestLatencyTracker(unittest.TestCase):
             self.lines.items,
             [
                 ("eou_to_turn_hook", 0.9, "vad", "roleplay", 7),
+                # The final at 12.2 s to the hook at 12.9 s (owner decision 2026-10-30).
+                ("final_to_turn_hook", 0.7, "vad", "roleplay", 7),
                 ("eou_to_llm_first_token", 1.5, "llm_reply", "roleplay", 7),
                 ("llm_ttft", 0.5, "llm_reply", "roleplay", 7),
                 ("eou_to_guard_release", 2.0, "llm_reply", "roleplay", 7),
@@ -901,6 +903,41 @@ class TestModuleSurface(unittest.TestCase):
             imported,
             {"__future__", "collections", "dataclasses", "json", "math", "os", "re", "sys", "typing"},
         )
+
+
+class TestEndIntentSegments(unittest.TestCase):
+    """Owner decision 2026-10-30: the end-intent classifier's latency path is measured."""
+
+    def setUp(self) -> None:
+        self.clock = Clock()
+        self.lines = Lines()
+        self.tracker = LatencyTracker(self.clock, self.lines)
+
+    def test_the_head_start_from_the_last_final_to_the_hook(self) -> None:
+        self.clock.at(10.0)
+        self.tracker.note_user_state("speaking")
+        self.clock.at(12.0)
+        self.tracker.note_user_state("listening")
+        self.clock.at(12.4)
+        self.tracker.note_final()
+        self.clock.at(13.3)
+        self.tracker.begin_turn(5, "roleplay")
+        self.assertEqual(self.lines.get("final_to_turn_hook"), ("final_to_turn_hook", 0.9, "vad",
+                                                                "roleplay", 5))
+
+    def test_no_final_no_head_start(self) -> None:
+        self.clock.at(1.0)
+        self.tracker.begin_turn(1, "roleplay")
+        self.assertNotIn("final_to_turn_hook", self.lines.schemas())
+
+    def test_the_new_segments_leave_the_stage_a_report_alone(self) -> None:
+        base = headline(1.2, 1.5, 1.7)
+        extra = [
+            log_line("end_intent_call", 0.8),
+            log_line("end_intent_wait", 0.2),
+            log_line("final_to_turn_hook", 0.6),
+        ]
+        self.assertEqual(stage_a_report(base + extra), stage_a_report(base))
 
 
 if __name__ == "__main__":

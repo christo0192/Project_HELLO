@@ -1928,6 +1928,69 @@ pass. Logs: the turn reasons `aside_end_request`, `end_request_explicit`, `end_c
 `close_attempt_exit`; `r1_turn_reason`), and `early_close.end_request` in the admin log (turn indices,
 R, whether the question was asked and whether it was confirmed; never the words).
 
+### End detection by meaning, the bare yes, no "okay" stutter, the brief on request (owner decisions 2026-10-30)
+
+Owner test 1eb18cd4 showed four things: half of 462 realistic ways to ask for the end were not recognised
+("kindly end the interview", "we can wrap up the interview", "end the interview na", "end the inter view");
+a bare "yes" after L-ASIDE-END did not confirm; every transcribed "okay" over the learner cut her and she
+restarted four times (turns 33-41); and "could you please explain me again" said over L-TRANSITION was
+dropped by the SDK and the role-play just began (turns 13-18). All four are switchable and read at use:
+
+| Variable | Default | Effect and rollback |
+|---|---|---|
+| `R1_END_INTENT_LLM` | 1 | A role-play turn that the keyword prefilter hits (`r1_end_intent.prefilter_hit`: a stop word in its last 25 words, or "and the interview" opening it; about 7% of normal turns) and that the lexical detectors have not already decided is classified by R1's own DeepSeek client (the shadow judge's, temperature 0) as `end`, `maybe` or `no`. The verdict can only raise the lexical reading (`r1_tracker.end_intent_level`): a negated end raises nothing, a turn that also declines is at most asked, and a model `end` exits at once only when the turn ENDS on a request whose end verb governs the interview or the role play (`strictly_names_end`: "Kindly end the interview.", "We can end the interview na."); any other model `end` ("Once you finish the course you'll clear the interview.", "Please stop the interview, I need a moment.") is asked. Once L-ASIDE-END has been asked and closed, a model-only `maybe` no longer counts as the second request that exits at once (only the candidate's own words, or a strict model `end`, do). Every rule of before stays (before 14:00 with no commitment: `end` exits into the wrap-up, `maybe` gets L-ASIDE-END once; otherwise the farewell ladder). **Rollback: `0`** (the lexical detectors alone, exactly as before) |
+| `R1_END_INTENT_TIMEOUT_SEC` | 1.3 | The whole budget of one classification (0.3-3.0), counted from the call's start. The call starts at the final transcript, so most of it hides behind the endpointing; the turn hook never waits past the budget, and a timeout, an error or an unparsable answer is the lexical reading |
+| `R1_BARE_YES_SETTLE_SEC` | 1.0 | After L-ASIDE-END a bare yes ("yes", "yes please", "sure", "haan ji", "go ahead"; `r1_tracker.is_bare_yes`) confirms the end once it has stood this long unanswered (0-3). If the candidate speaks again and a transcript follows, the yes answers nothing alone and the next turn decides (a decline continues, end words confirm). A decline, a question mark or any word about the sale is never a bare yes |
+| `R1_ACK_HOLD` | 1 | An acknowledgement-only transcript ("Okay", "Hmm", "Yeah, okay", "Okay, continue."; `is_acknowledgement_turn`) spoken over the learner's live, interruptible role-play reply is held back in `R1Agent.stt_node`: the SDK never sees it, so nothing cuts her or banks words and she never restarts. A short "Okay" (about 0.5 s of voice or less) does not even pause her; a longer one ("Yeah, okay", "Okay, continue.") does, because the SDK's VAD counts its 0.25 s of trailing silence as speech, so about 0.55 s of voice reaches the 0.8 s minimum: she then resumes the same line at the false-interruption timer (`R1_ACK_RESUME_SEC` after the held final), a gap of about 1 s mid-sentence. Live check: per session, count `r1_ack_held`, `r1_false_interruption` resumed and `r1_ack_resume`; a resumed count close to the held count means most acks are long enough to pause her (consider `R1_ACK_RESUME_SEC=0.1`). Works at `R1_INTERRUPT_MIN_WORDS` 0 and 3. The ack is still written into the candidate's transcript row. Anything else ("what is your name?", "Sorry?", "Okay?", "Yeah, okay, perfect.") still cuts her. **Rollback: `0`** |
+| `R1_ACK_RESUME_SEC` | 0.3 | After a held acknowledgement, a paused line resumes this long after the hold (0-2) instead of the SDK's 2.0 s. Uses private livekit-agents 1.6.4 fields, pinned in `tests/test_r1_sdk_contract.py`; any failure leaves the SDK's own timing. `0` turns it off |
+
+The brief on request needs no switch: a request to hear the role-play brief again during or right after
+L-TRANSITION (`r1_session.is_brief_request`, latched at the transcript event) replays L-TRANSITION word
+for word, once per session, and the ready flow continues (a later request gets the nudge). The wait after
+the replay is what is left of the 1:30 transition budget counted from the first L-TRANSITION (8-20 s), but
+the uninterruptible replay itself (about 36-45 s) can still take the transition past 1:30: after a full
+4:30 icebreaker the S 26:00 cap then trims up to about 25 s off the role-play's last minute (never the
+10:00 or 14:00 gates). A courtesy such as "Thank you once again" or "I wanted to understand this role
+better" is no request; "Explain me again", "Pardon?" and "What is my role?" are. After the
+pickup the same request ("I wanted to understand this round, the role play brief") is a coaching request
+and gets the existing L-ASIDE-COACH. No new spoken line; the classifier's prompt is pinned content
+(CONTENT_REVISION 18).
+
+Logs (labels and counts only, never the words):
+
+* `r1_latency` segments: `end_intent_call` (one model call, start to answer; `error_category` the verdict,
+  `timeout`, `error` or `parse_failed`), `end_intent_wait` (how long the turn hook waited for it; `reused`
+  when the call started at the final, `at_hook` otherwise) and `final_to_turn_hook` (the head start: the
+  last final to the hook). The wait also shows in `sdk_turn_hook` and in the headline.
+* `r1_ack_note_failed`: a held acknowledgement could not be written into the transcript row (the ack
+  stays held; the speech-to-text stream goes on).
+* `r1_end_intent` (`error_category` the verdict or `none`), `r1_end_intent_unusable` (no client: the
+  classifier is off for the session), the turn reason `end_intent_model` (the model, not the lexical
+  detector, raised the turn), `r1_bare_yes` (`confirmed`, `deferred`, `noise`), `r1_ack_held` (running
+  count), `r1_ack_resume`, `r1_false_interruption` (`resumed` / `not_resumed`), `r1_brief_requested`,
+  `r1_brief_repeat`.
+
+Watch after deploy: the gate's `first_audio_p95` was 3.00 s on the owner's session, at the 3000 ms limit.
+Each prefilter-hit turn can add up to the budget (expected 0-0.6 s after the head start). If the p95
+regresses, set `R1_END_INTENT_TIMEOUT_SEC=0.8` or `R1_END_INTENT_LLM=0`.
+
+**Before enabling in production, run the eval with a real key** (from `app/voice-livekit`, with
+`DEEPSEEK_API_KEY` and the R1 LLM settings in the environment):
+
+```
+python tools/r1_end_intent_eval.py --corpus --json end-intent-results.json
+python tools/r1_end_intent_eval.py --offline          # the lexical baseline, for comparison
+```
+
+It prints the accuracy, the confusion matrix, the critical false ends (an in-role turn the worker would end
+the role-play on: must be 0), counted twice: before any question (`critical_false_end`) and as if an
+earlier L-ASIDE-END had been asked and declined, where a request exits at once
+(`critical_false_end_after_closed_aside`); then the false asides, the misses, the call p50 / p95 / max and
+the timeouts at the budget, and the prefilter hit rate on the advisor corpus (6.9%, 136 of 1,969 turns;
+7.8% of the held-out set). While the question is open any end request exits, so an after-aside `maybe`
+is scored as an exit. `--strict` exits 1 on any critical false end in either count.
+The labels (`tests/fixtures/r1_end_intent_labels.jsonl`) are a first draft and want an owner review.
+
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 
 The candidate's page follows three more participant attributes of the **agent** (the page trusts only

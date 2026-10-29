@@ -1761,5 +1761,205 @@ class DeepLayerReachesTheLearnerTests(unittest.TestCase):
         self.assertEqual(asked.first_probes, ("H3",))
 
 
+# ----------------------------------------------------------------------------------------------
+# Owner decisions 2026-10-30: meaning-based end detection (the rails of the model's verdict), a
+# bare yes that confirms L-ASIDE-END, and the brief asked for again after the pickup.
+# ----------------------------------------------------------------------------------------------
+END_INTENT_LABELS = HERE / "tests" / "fixtures" / "r1_end_intent_labels.jsonl"
+
+
+def _labelled_texts() -> list[str]:
+    rows = END_INTENT_LABELS.read_text(encoding="utf-8").splitlines()
+    return [json.loads(row)["text"] for row in rows if row]
+
+
+class EndIntentLevelTests(unittest.TestCase):
+    """``end_intent_level``: the model can raise the lexical reading, within three rails."""
+
+    def test_without_a_verdict_it_is_the_lexical_reading_on_the_whole_sweep(self):
+        from r1_tracker import detect_end_request, end_intent_level, explicit_end_request
+
+        for text in _labelled_texts():
+            expected = (
+                "end"
+                if explicit_end_request(text)
+                else "maybe"
+                if detect_end_request(text)
+                else "no"
+            )
+            for verdict in (None, "", "stop", 1):
+                with self.subTest(text=text, verdict=verdict):
+                    self.assertEqual(end_intent_level(text, verdict), expected)
+
+    def test_the_table(self):
+        from r1_tracker import end_intent_level
+
+        for text, verdict, expected in (
+            # Regex A (explicit): the model is not asked, and cannot lower it.
+            ("End the interview.", "no", "end"),
+            ("Let's end this interview for now.", "maybe", "end"),
+            # Regex B (a request that does not name the exercise): at least the question.
+            ("Can you end the call?", "no", "maybe"),
+            ("Can you end the call?", "maybe", "maybe"),
+            # B + "end" that names nothing: still the question (the exercise rail).
+            ("Can you end the call?", "end", "maybe"),
+            # C (the lexical detectors miss it): only the model hears it.
+            ("Kindly end the interview.", "end", "end"),
+            ("We can wrap up the role play here.", "end", "end"),
+            ("end the inter view", "end", "end"),
+            ("Kindly end the interview.", "no", "no"),
+            ("Kindly end the interview.", None, "no"),
+            ("Let's call it a day.", "end", "maybe"),  # no exercise named
+            ("Let's call it a day.", "maybe", "maybe"),
+            ("Let's close the deal today.", "no", "no"),
+            # A decline caps the model at the question; a negated end raises nothing.
+            ("No, carry on. Actually, end the interview na.", "end", "maybe"),
+            ("I don't want to end the interview.", "end", "no"),
+            ("I'm not done with the role play yet.", "maybe", "no"),
+        ):
+            with self.subTest(text=text, verdict=verdict):
+                self.assertEqual(end_intent_level(text, verdict), expected)
+
+    def test_negates_end(self):
+        from r1_tracker import negates_end
+
+        for text in ("I don't want to end it.", "Let's not stop.", "I'm not done.",
+                     "I won't hang up."):
+            with self.subTest(text=text):
+                self.assertTrue(negates_end(text))
+        for text in ("End it.", "I'm done.", "Not now, carry on.", "We support you end to end."):
+            with self.subTest(text=text):
+                self.assertFalse(negates_end(text))
+
+    # Reviewed fix 2026-10-30: in-role talk about the learner's own interview, with a stop word.  A
+    # model "end" on any of these is at most the question, never an exit.
+    IN_ROLE_INTERVIEW_TALK = (
+        "Once you finish the course you will clear the interview easily.",
+        "Before we end, tell me when is the interview?",
+        "Leave the interview to us, we'll handle it.",
+        "Let's finish this role play strong, Priya, what's your budget?",
+        "Please stop the interview, I need a moment.",
+        "Can we stop the interview for a second? My doorbell is ringing.",
+        "When is your interview? We will help you crack the interview.",
+        "We prepare you right till the end of your interview.",
+        "Before we end the call, when is the interview scheduled?",
+        "Stop worrying about the interview, we have mentors for that.",
+        "At the end of the program you'll crack the interview.",
+        "Is the interview over?",
+        "...when exactly you are planning for the interview number one ... so Bye How many hours"
+        " you can dedicate?",
+    )
+
+    def test_a_model_end_exits_only_on_a_request_the_turn_ends_on(self):
+        from r1_tracker import end_intent_level, strictly_names_end
+
+        for text in self.IN_ROLE_INTERVIEW_TALK:
+            with self.subTest(text=text):
+                self.assertFalse(strictly_names_end(text))
+                self.assertNotEqual(end_intent_level(text, "end"), "end")
+        for text in (
+            "Kindly end the interview.", "We can end the interview.", "You can end the interview.",
+            "End the interview na.", "End the interview, yaar.", "End the interview thank you",
+            "Christy end the interview", "Priya, end the interview.", "end the inter view",
+            "end interview", "let's end the roll play", "Let's wrap up the role play.",
+            "Can we stop the interview?", "Interview khatam karo.", "And the interview.",
+            "I'm done, we can end the interview.", "I'm done with the interview. Thank you.",
+            "I want to end the interview now. Is that okay?", "Sure. Can we end this role play?",
+            "Let's end this interview here itself.", "end end the interview",
+            "Sorry, I have to leave, can we end the interview?", "Interview over.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(strictly_names_end(text))
+                self.assertEqual(end_intent_level(text, "end"), "end")
+
+    def test_the_strict_rail_stays_fast_on_pathological_speech(self):
+        import time
+
+        from r1_tracker import strictly_names_end
+
+        started = time.perf_counter()
+        for text in (
+            "okay " * 300 + "end the interview please now", "so " * 400 + "what is " * 100,
+            "okay, " * 200 + "end the interview", "please " * 300 + "x",
+        ):
+            strictly_names_end(text)
+        self.assertLess(time.perf_counter() - started, 0.5)
+
+
+class BareYesTests(unittest.TestCase):
+    """Owner decision 2026-10-30: after L-ASIDE-END a bare yes confirms (once it settled)."""
+
+    ACCEPTED = (
+        "yes", "Yes.", "Yes, please.", "yes please", "yeah", "Yeah sure", "sure", "haan",
+        "Haan ji.", "ha ji", "hanji", "go ahead", "please go ahead", "yes go ahead", "please do",
+        "yes please do", "yes yes", "Haan haan", "Okay, yes.", "Yes, thank you.", "Yes Christy",
+        "Yes ma'am", "Yeah, sure, go ahead.",
+    )
+    REJECTED = (
+        "no", "yes?", "Yes?", "carry on", "go on", "yes, carry on", "Yes, continue", "okay",
+        "alright", "Okay.", "not now", "yes I'm still here", "Sure, the EMI is six months",
+        "haan, continue", "yes but", "yeah, no", "Yes, no, let's carry on", "wait", "hold on",
+        "ha", "ji", "Haan na", "nahi", "please", "do", "", "Yes, I don't want to end it.",
+        "Yeah, actually", "Sure? I mean",
+    )
+
+    def test_accepted(self):
+        from r1_tracker import is_bare_yes
+
+        for text in self.ACCEPTED:
+            with self.subTest(text=text):
+                self.assertTrue(is_bare_yes(text))
+
+    def test_rejected(self):
+        from r1_tracker import is_bare_yes
+
+        for text in self.REJECTED:
+            with self.subTest(text=text):
+                self.assertFalse(is_bare_yes(text))
+
+    def test_the_end_words_detectors_are_unchanged_by_it(self):
+        # A bare yes is the settle rule's; ``confirms_end`` still reads only end words.
+        from r1_tracker import confirms_end
+
+        for text in ("yes", "Yes, please.", "Haan ji.", "go ahead"):
+            with self.subTest(text=text):
+                self.assertFalse(confirms_end(text))
+
+
+class BriefRequestAfterThePickupTests(unittest.TestCase):
+    """Owner test 1eb18cd4 #18: the brief asked for again once the learner had picked up."""
+
+    OWNER = (
+        "I wanted to understand this, uh, this round, the role play brief.",
+        "Okay, could you please explain me again like what this round is about, the role play "
+        "in a small brief kind of thing?",
+        "Can you please explain the role play again?",
+        "I need to understand the exercise first.",
+    )
+    IN_ROLE = (
+        "Could you explain the EMI options you were asking about?",
+        "I want to understand your goals first.",
+        "Can you tell me what you liked about the webinar?",
+        "We'd like to understand the problem you are solving.",
+        "Please explain what you mean by flexible.",
+    )
+
+    def test_the_owners_requests_are_coach_requests(self):
+        for text in self.OWNER:
+            with self.subTest(text=text):
+                self.assertEqual(detect_character_break(text), "coach")
+
+    def test_in_role_questions_are_not(self):
+        for text in self.IN_ROLE:
+            with self.subTest(text=text):
+                self.assertIsNone(detect_character_break(text))
+
+    def test_no_corpus_pitch_is_a_coach_request(self):
+        corpus = HERE / "tests" / "fixtures" / "r1_advisor_corpus.jsonl"
+        texts = [json.loads(row)["text"] for row in corpus.read_text(encoding="utf-8").splitlines()
+                 if row]
+        self.assertEqual([text for text in texts if detect_character_break(text) == "coach"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -68,6 +68,7 @@ from r1_text import (
     fold,
     is_question_like,
     negated_before,
+    normalize,
     parse_amount,
     split_sentences,
     word_count,
@@ -647,6 +648,17 @@ _COACH_REQUEST = tuple(
         r"\bare you selling (?:the|this|a|that) (?:course|program|programme)\b",
         r"\bare you (?:actually |really )?selling(?: (?:it|this|that|anything|something))?"
         r"(?: to me)?" + _SENTENCE_END,
+        # Owner test 1eb18cd4 (#14-#18, owner decision 2026-10-30): a request to have the brief
+        # explained again once the learner has picked up ("I wanted to understand this, uh, this
+        # round, the role play brief.").  It must name the exercise within 40 characters of the
+        # ask, so "could you explain the EMI?" or "I want to understand your goals" stay in role.
+        r"\b(?:(?:can|could|would|will) you (?:please |kindly )?"
+        r"(?:explain|repeat|clarify|tell me|go over)"
+        r"|please (?:explain|repeat|clarify)"
+        r"|(?:i|we) (?:want(?:ed)? to|need to|would like to|'d like to) understand)\b"
+        r"[^.?!]{0,40}?\b(?:this|the) (?:round|role-? ?play|roleplay|exercise|brief|"
+        r"instructions?)\b",
+        r"\brole-? ?play brief\b",
     )
 )
 
@@ -990,6 +1002,246 @@ def confirms_end(text: object) -> bool:
         if pattern.search(sentence):
             return True
     return False
+
+
+def negates_end(text: object) -> bool:
+    """A negator governs an end word ("I don't want to end", "let's not stop", "I'm not done")."""
+    return _END_NEGATED_ANSWER.search(fold(text)) is not None
+
+
+# Owner decision 2026-10-30 (owner test 1eb18cd4: after L-ASIDE-END a bare "yes" did not end the
+# role-play).  While the interviewer's question is open, a bare yes CONFIRMS the stop.  Matched on
+# ``normalize`` text (lower case, punctuation to spaces, apostrophes dropped: "ma'am" -> "maam").
+# Every word must be a core or a filler, and at least one core must be there, so "yes, carry on",
+# "yes, continue", "sure, the EMI is six months", "yeah, no" and "haan na" are not a bare yes (a
+# word the lists do not know is talk about the sale).  Bare "okay" / "alright" never confirms.
+_BARE_YES_WORDS = frozenset(
+    {
+        "yes", "yeah", "yep", "yup", "ya", "yah", "yea", "yess", "sure",
+        "haan", "han", "haa", "haanji", "hanji",
+    }
+)
+# The phrases that also confirm: "go ahead", "please do", "haan ji", "ji haan".
+_BARE_YES_PHRASE = re.compile(r"\b(?:please go ahead|go ahead|please do|haan ji|ha ji|ji haan)\b")
+_BARE_YES_FILLER = frozenset(
+    {
+        "ok", "okay", "alright", "so", "um", "uh", "hmm", "well", "please", "then", "thank",
+        "thanks", "you", "christy", "christie", "kristy", "maam", "mam", "madam", "sir",
+    }
+)
+# "do" only after a yes word: "yes please do", "sure do".
+_BARE_YES_DO = re.compile(r"\b(?:yes|yeah|sure)(?: please)? do\b")
+
+
+def is_bare_yes(text: object) -> bool:
+    """A bare yes to L-ASIDE-END's question ("Yes.", "Yes, please.", "Haan ji.", "Go ahead.").
+
+    The engine reads it only while the question is open (``RolePlayEngine.end_question_open``)
+    and only after the session let the answer settle (``confirmed_yes``): speech-to-text can hand
+    over "Yeah." a second before "... no, let's carry on".  A question mark, a decline
+    (``declines_end``), a negated end word (``negates_end``) or any word the lists do not know
+    (talk about the sale, "wait", "but", "actually", "na", "nahi") makes it something else.
+    """
+    raw = str(text or "")
+    if "?" in raw or "\uff1f" in raw:
+        return False
+    if declines_end(raw) or negates_end(raw):
+        return False
+    words = normalize(raw)
+    if not words:
+        return False
+    phrase = _BARE_YES_PHRASE.search(words) is not None
+    rest = _BARE_YES_DO.sub(" yes ", _BARE_YES_PHRASE.sub(" ", words)).split()
+    core = phrase or any(word in _BARE_YES_WORDS for word in rest)
+    return core and all(word in _BARE_YES_WORDS or word in _BARE_YES_FILLER for word in rest)
+
+
+# The exercise rail of the end-intent model (owner decision 2026-10-30): a model "end" exits only
+# when the turn names the interview or the role play ("end the interview", "let's wrap up the role
+# play", "interview khatam karo", and speech-to-text's "and the interview", "end the inter view",
+# "roll play", "whole play"); any other "end" is asked first (L-ASIDE-END).  Matched on
+# ``normalize`` text.  "Interview Kickstart", "the interview process", "mock interviews" and "the
+# interview prep" are sales talk and do not name the exercise (the tail lookahead below).
+_EXERCISE_WORD = (
+    r"(?:inter ?views?|role ?play(?:ing)?|roleplay|rollplay|roll ?play|whole play|exercise)"
+)
+_NOT_EXERCISE_TAIL = (
+    r"(?! (?:process|prep|preparation|questions?|kickstart|calls?|rounds? at|at|with|for|"
+    r"skills?|tips|experience)\b)"
+)
+# "And the interview", "let's and the interview": the mishearing of "end the interview" at the
+# start of a turn (owner test 1eb18cd4, 79).
+MISHEARD_END = r"^(?:[a-z0-9]+ ){0,3}(?:and|in|ant) (?:the |this )?inter ?views?\b"
+_EXERCISE_NAMED = re.compile(
+    r"\b(?:the|this|that|our) " + _EXERCISE_WORD + r"\b" + _NOT_EXERCISE_TAIL
+    + "|" + MISHEARD_END
+    + r"|\b(?:end|stop|finish|conclude|wrap up|close|terminate|exit|leave|quit) "
+    + r"(?:the |this )?" + _EXERCISE_WORD + r"\b"
+    + r"|\binter ?views? (?:khatam|khatm|band|end|stop|finish|karo)\b"
+)
+
+
+def names_exercise(text: object) -> bool:
+    """The turn names the interview or the role play itself (the exercise rail of a model END)."""
+    return _EXERCISE_NAMED.search(normalize(text)) is not None
+
+
+# The structural rail of a model END (reviewed fix, 2026-10-30): ``names_exercise`` alone let a
+# model "end" exit on in-role talk about the learner's own interview, which is what an advisor
+# selling interview prep talks about all the time ("Once you finish the course you will clear the
+# interview easily.", "Before we end, tell me when is the interview?", "Leave the interview to us",
+# "Let's finish this role play strong, Priya, what's your budget?", and the pause "Please stop the
+# interview, I need a moment.").  So a model "end" exits at once only when the turn ENDS on a
+# request whose end verb governs the exercise word: the last clause of its last sentence (after
+# any courtesy or closer alone: "Thank you, Christy.", "Is that okay?", ", yaar.") is fillers or a
+# name, an optional ask ("kindly", "let's", "we can", "you can", "can we", "I want to", "I'm done
+# with"), the verb, the interview or the role play, and at most a few closers ("now", "here",
+# "itself", "only", "na", "yaar", "thank you", "for now").  A question must be the ask itself
+# ("Can we stop the interview?"), and speech-to-text's forms count ("end the inter view", "end
+# interview", "roll play", "And the interview", "interview khatam karo", "end end the
+# interview").  Anything else the model calls "end" is asked first (L-ASIDE-END).  Matched on
+# ``normalize`` text of that clause (lower case, no punctuation, apostrophes dropped).
+_STRICT_FILLER = (
+    r"(?:um+|uh+|hmm+|so|okay|ok|well|yeah|yes|yep|right|alright|now|then|just|actually|"
+    r"never mind|please|sorry|and|but|also|hi|hello|hey|fine|thanks|thank you|ji|haan|arre|"
+    r"christy|christie|kristy|cristy|maam|mam|madam|sir|i think|i guess|honestly|basically|"
+    r"i said|i told you|im saying|i am saying)"
+)
+# One word of the learner's (or anybody's) name may open it too ("Priya end the interview", with or
+# without its comma), unless it is a word that makes the clause about something else.
+_STRICT_NOT_NAME = (
+    r"(?!(?:when|once|after|before|if|till|until|to|should|would|will|why|how|who|what|did|do|"
+    r"does|you|they|he|she|we|i|it|not|dont|never|cannot|cant|wont|didnt|lets|let|please|"
+    r"kindly|can|could|shall|may|must|and|in|ant|end|stop|finish|the|this|that|our|is)\b)"
+)
+_STRICT_OPENER = (
+    rf"(?:{_STRICT_FILLER} ){{0,6}}(?:{_STRICT_NOT_NAME}[a-z]+ )?(?:{_STRICT_FILLER} ){{0,2}}"
+)
+_STRICT_ASK = (
+    r"(?:(?:lets|let us|please|kindly|just|go ahead and|so"
+    r"|(?:i|we) (?:would |will )?request you to|request you to"
+    r"|(?:i|we) (?:want to|wanna|would like to|d like to|need to|have to|will|shall|must)"
+    r"|id like to|wed like to|would it be possible to|is it possible to"
+    r"|(?:is it|is that) (?:okay|ok|fine|alright) if (?:we|i|you)"
+    r"|(?:i think |i guess |maybe )?(?:we|you) (?:can|could|should|may|might|will|must)"
+    r"|(?:can|could|would|will|shall|may|should) (?:we|you|i)"
+    r"|(?:i want|i would like|id like) you to) ){0,3}"
+)
+_STRICT_ADVERB = r"(?:(?:please|kindly|just|now|simply|quickly) ){0,2}"
+_STRICT_VERB = (
+    r"(?:end|stop|finish|conclude|wrap up|terminate|close|quit|exit|leave|complete|wind up)"
+)
+_STRICT_EXERCISE = (
+    r"(?:(?:the|this|our|that) ){0,2}(?:inter ?views?|role ?play(?:ing)?|roleplay|rollplay|"
+    r"roll ?play|whole play|exercise|inter)(?: exercise| round| session)?"
+)
+_STRICT_CLOSER = (
+    r"(?: (?:now|here|please|itself|only|na|naa|yaar|ya|yeah|yes|then|already|immediately|"
+    r"right now|right away|at once|asap|fast|quickly|soon|as soon as possible|for now|"
+    r"for today|today|for me|at this point|if possible|thanks|thank you(?: so much| very much)?|"
+    r"thank u|ji|sir|maam|mam|madam|christy|ok|okay|bye|goodbye|bye bye|completely|up))*"
+)
+_STRICT_CLOSER_ONLY = re.compile(_STRICT_CLOSER)
+_STRICT_HINDI = r"(?:khatam|khatm|band|end|stop|finish|complete|samapt)"
+_STRICT_CORE = (
+    rf"(?:{_STRICT_ASK}{_STRICT_ADVERB}(?:{_STRICT_VERB} )?{_STRICT_VERB} {_STRICT_EXERCISE}"
+    rf"|{_STRICT_ASK}{_STRICT_ADVERB}wrap {_STRICT_EXERCISE} up"
+    rf"|(?:im|i am|we are|were) (?:done|finished|through) with {_STRICT_EXERCISE}"
+    rf"|{_STRICT_EXERCISE} {_STRICT_HINDI}(?: (?:karo|kar do|kar dijiye|kijiye|karein|kar lo|"
+    r"kar dete hain|karte hain|ho gaya))?"
+    rf"|{_STRICT_ASK}(?:and|in|ant) (?:the |this )?inter ?views?"
+    rf"|{_STRICT_EXERCISE} (?:is )?over)"
+)
+_STRICT_END = re.compile(
+    rf"^{_STRICT_OPENER}{_STRICT_CORE}(?: {_STRICT_CORE})?{_STRICT_CLOSER}$"
+)
+# A question is one only as the ask itself ("Can we stop the interview?", "Could you end it?").
+_STRICT_QUESTION = re.compile(
+    r"^(?:[a-z]+ ){0,4}?(?:(?:can|could|would|will|shall|may|should) (?:we|you|i)"
+    r"|(?:is it|is that) (?:okay|ok|fine|alright) if|is it possible|would it be possible)\b"
+)
+# What may follow the request on its own: courtesy, the interviewer's name, "is that okay?".
+_STRICT_COURTESY = frozenset(
+    {
+        "thanks", "thank", "you", "u", "so", "much", "very", "a", "lot", "please", "bye",
+        "goodbye", "christy", "christie", "kristy", "maam", "mam", "madam", "sir", "ok", "okay",
+        "ji", "yeah", "for", "your", "time", "is", "that", "it", "fine", "alright",
+    }
+)
+_CLAUSE_SPLIT = re.compile(r"[,;:]")
+
+
+def _courtesy_only(text: str) -> bool:
+    return all(word in _STRICT_COURTESY for word in normalize(text).split())
+
+
+def _closers_only(text: str) -> bool:
+    return _STRICT_CLOSER_ONLY.fullmatch(" " + normalize(text)) is not None
+
+
+def strictly_names_end(text: object) -> bool:
+    """The turn ENDS on a request to stop the interview or the role play (a model END's rail).
+
+    "Kindly end the interview.", "We can end the interview.", "End the interview na.", "Christy end
+    the interview", "end the inter view", "I'm done, we can end the interview.", "Interview khatam
+    karo.", "I want to end the interview now. Is that okay?": True.  "Once you finish the course
+    you will clear the interview easily.", "Before we end, tell me when is the interview?",
+    "Please stop the interview, I need a moment.", "Can we stop the interview for a second? My
+    doorbell is ringing.": False (a model "end" for them is asked first).
+    """
+    sentences = split_sentences(fold(text))
+    while sentences and _courtesy_only(sentences[-1]):
+        sentences.pop()
+    if not sentences:
+        return False
+    last = sentences[-1]
+    clauses = [part for part in _CLAUSE_SPLIT.split(last) if normalize(part)]
+    while len(clauses) > 1 and (_courtesy_only(clauses[-1]) or _closers_only(clauses[-1])):
+        clauses.pop()
+    if not clauses:
+        return False
+    words = normalize(clauses[-1])
+    if _STRICT_END.match(words) is None:
+        return False
+    return "?" not in last or _STRICT_QUESTION.match(words) is not None
+
+
+END_INTENT_LEVELS = ("no", "maybe", "end")
+
+
+def end_intent_level(text: object, verdict: str | None = None) -> str:
+    """How surely this turn asks to stop the interview or the role play: end, maybe or no.
+
+    The regex reading first: an explicit request (``explicit_end_request``) is "end", any other
+    end request (``detect_end_request``) is "maybe", the rest "no".  With no model verdict
+    (``verdict`` None: the classifier was off, missed by the prefilter, timed out or failed) that
+    reading is the answer, exactly as before 2026-10-30.  A verdict ("end", "maybe" or "no", from
+    ``r1_end_intent``) can only RAISE it, never lower it, and only within three rails: a negated
+    end ("I don't want to end", "let's not stop", "I'm not done") raises nothing; a turn that also
+    declines (``declines_end``: "no", "carry on", "continue") is at most "maybe", so it is asked,
+    never exited at once; and a model "end" for a turn that does not END on a request whose end
+    verb governs the interview or the role play (``strictly_names_end``) is "maybe" too, so "Once
+    you finish the course you will clear the interview" or "Please stop the interview, I need a
+    moment." is asked, never exited.  So a model's mistake costs an extra question, and an exit
+    needs the candidate's own request to stop the interview or the role play.  (After that
+    question has been asked and closed, ``RolePlayEngine.plan_turn`` also drops a model-only
+    "maybe": a second request is only one the candidate's words make.)
+    """
+    if explicit_end_request(text):
+        regex = "end"
+    elif detect_end_request(text):
+        regex = "maybe"
+    else:
+        regex = "no"
+    if verdict not in END_INTENT_LEVELS:
+        return regex
+    model = verdict
+    if negates_end(text):
+        model = "no"
+    elif model == "end" and (declines_end(text) or not strictly_names_end(text)):
+        model = "maybe"
+    rank = END_INTENT_LEVELS.index
+    return regex if rank(regex) >= rank(model) else model
 
 
 # ----------------------------------------------------------------------------------

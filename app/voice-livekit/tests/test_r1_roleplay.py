@@ -73,6 +73,24 @@ HANDLE_DECIDER = "Your husband is welcome to be involved, we are happy to includ
 # Owner test 7f2a25e6, verbatim: 64 got the F4 push, 71 an in-character goodbye that ended nothing.
 T64_DISCONNECT = "Okay, never mind, can you disconnect the call?"
 T71_DISCONNECT = "Um, so yeah, um, let's disconnect the call now."
+# In-role talk about the learner's own interview with a stop word (reviewed fix 2026-10-30): a
+# model "end" on any of these must never exit the role-play (``strictly_names_end``).
+IN_ROLE_INTERVIEW_TALK = (
+    "Once you finish the course you will clear the interview easily.",
+    "Before we end, tell me when is the interview?",
+    "Leave the interview to us, we'll handle it.",
+    "When is your interview? We will help you crack the interview.",
+    "We prepare you right till the end of your interview.",
+    "Once you complete the mock rounds, the interview will feel easy.",
+    "Let's close the gaps before the interview, okay?",
+    "Before we end the call, when is the interview scheduled?",
+    "You'll finish the course well before the interview.",
+    "Stop worrying about the interview, we have mentors for that.",
+    "So bye bye to interview fear, right?",
+    "At the end of the program you'll crack the interview.",
+    "We will finish the preparation before the interview.",
+    "Done, I'll book the mock interview for Saturday.",
+)
 # Owner test 1eb18cd4 (2026-10-29), verbatim: every candidate turn of the role-play, as the
 # transcript rows (turn index, text) at R1_INTERRUPT_MIN_WORDS 0.  Eight of the 38 were two words
 # or fewer (21%), seven of those acknowledgements, so ``stt_sanity`` failed a normal session; and
@@ -2954,24 +2972,27 @@ class SttSanityUnderBargeInTests(unittest.TestCase):
         eng, r = self.run_turns(self.TURNS, OWNER_1EB18CD4_ACKNOWLEDGEMENTS)
         fidelity = eng.fidelity(r_end=r)
         self.assertTrue(fidelity["checks"]["stt_sanity"], fidelity)
-        # 33 planned turns, 8 acknowledgements; of the other 25 only "Hi Pooja" is short.
-        self.assertEqual(len(eng._word_counts), 33)
+        # 32 planned turns, 8 acknowledgements; of the other 24 only "Hi Pooja" is short.  Turn 18
+        # ("I wanted to understand this, uh, this round, the role play brief.") is the coach aside
+        # since 2026-10-30 (owner decision: the brief is explained again), so it is not planned.
+        self.assertEqual(len(eng._word_counts), 32)
         self.assertEqual(fidelity["acknowledgement_turns"], 8)
-        self.assertEqual(fidelity["short_turn_share"], round(1 / 25, 3))
+        self.assertEqual(fidelity["short_turn_share"], round(1 / 24, 3))
         self.assertEqual(eng.admin_log()["communication"]["acknowledgement_turns"], 8)
         # The substantive-turn count still reads every turn ("Yeah, okay, sure." has 3 words), as
-        # the API gate's qualifying-turn count reads every role-play row.
+        # the API gate's qualifying-turn count reads every role-play row (less the aside, turn 18).
         self.assertEqual(
             fidelity["substantive_turns"],
-            sum(1 for _, text in self.TURNS if len(text.split()) >= 3),
+            sum(1 for index, text in self.TURNS if len(text.split()) >= 3 and index != 18),
         )
 
     def test_the_same_turns_fail_when_acknowledgements_are_counted(self):
-        # Without the classification (what the check did before this fix): 8 of 33, 24%.
+        # Without the classification (what the check did before this fix): 8 of 32, 25% (turn 18
+        # is the coach aside, see above).
         eng, r = self.run_turns(self.TURNS, frozenset())
         fidelity = eng.fidelity(r_end=r)
         self.assertFalse(fidelity["checks"]["stt_sanity"])
-        self.assertEqual(fidelity["short_turn_share"], round(8 / 33, 3))
+        self.assertEqual(fidelity["short_turn_share"], round(8 / 32, 3))
         self.assertEqual(fidelity["acknowledgement_turns"], 0)
 
     def test_it_holds_at_the_three_word_rollback_too(self):
@@ -6418,6 +6439,222 @@ class SlackGatedHoldTests(unittest.TestCase):
                     {"owed_deferred_for_interrupt", "owed_deferred_for_challenge"}
                     & set(again.reasons)
                 )
+
+
+class EndIntentPlanTests(unittest.TestCase):
+    """Owner decisions 2026-10-30: the end-intent model's verdict and a settled bare yes.
+
+    Every existing rule stays: before 14:00 with no commitment an END exits into the wrap-up and a
+    MAYBE gets L-ASIDE-END once; from 14:00, or with a commitment on record, either is a farewell
+    on the close ladder; with no verdict every plan is the lexical one of before.
+    """
+
+    _booked_call = EndRequestTests._booked_call
+
+    @staticmethod
+    def started():
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(PITCH, 60)
+        return s
+
+    def test_an_end_verdict_on_a_phrasing_the_detectors_miss_exits_into_the_wrap_up(self):
+        for text in (
+            "Kindly end the interview.",
+            "We can end the interview.",
+            "You can end the interview.",
+            "End the interview na.",
+            "Let's wrap up the interview.",
+            "end the inter view",
+            "let's end the roll play",
+        ):
+            with self.subTest(text=text):
+                lexical = self.started().say(text, 300, turn_index=40)
+                self.assertFalse(ended(lexical))  # the owner's sweep: not recognised before
+                s = self.started()
+                plan = s.say(text, 300, turn_index=40, end_intent="end")
+                self.assertTrue(ended(plan), plan.reasons)
+                self.assertTrue(plan.exit_roleplay)
+                self.assertIn("end_intent_model", plan.reasons)
+                self.assertIn("end_request_explicit", plan.reasons)
+                self.assertTrue(s.eng.exit_requested)
+                log = s.eng.admin_log()["early_close"]["end_request"]
+                self.assertEqual((log["question_asked"], log["confirmed"]), (False, True))
+
+    def test_a_maybe_verdict_gets_the_interviewers_question(self):
+        for text in ("Let's call it a day.", "I have to go.", "Bas karo."):
+            with self.subTest(text=text):
+                s = self.started()
+                plan = s.say(text, 300, turn_index=40, end_intent="maybe")
+                self.assertTrue(plan.aside)
+                self.assertEqual(plan.line_id, "L-ASIDE-END")
+                self.assertIn("end_intent_model", plan.reasons)
+                self.assertFalse(s.eng.exit_requested)
+                self.assertTrue(s.eng.end_question_open)
+
+    def test_an_end_verdict_that_names_no_exercise_is_asked_not_exited(self):
+        s = self.started()
+        plan = s.say("Let's call it a day.", 300, end_intent="end")
+        self.assertTrue(plan.aside)
+        self.assertFalse(ended(plan))
+
+    def test_a_wrong_end_verdict_on_talk_about_the_learners_interview_never_exits(self):
+        # Reviewed fix: the exercise rail alone accepted any "the interview" in the turn, so a model
+        # "end" on interview-prep sales talk (or a pause) exited the role-play with no question.
+        for text in IN_ROLE_INTERVIEW_TALK:
+            with self.subTest(text=text):
+                s = self.started()
+                plan = s.say(text, 300, turn_index=40, end_intent="end")
+                self.assertFalse(ended(plan), plan.reasons)
+                self.assertFalse(s.eng.exit_requested)
+        for text in (
+            "Please stop the interview, I need a moment.",
+            "Can we stop the interview for a second? My doorbell is ringing.",
+            "Let's finish this role play strong, Priya, what's your budget?",
+        ):
+            with self.subTest(text=text):
+                s = self.started()
+                plan = s.say(text, 300, turn_index=40, end_intent="end")
+                self.assertTrue(plan.aside, plan.reasons)  # asked, so the candidate can carry on
+                self.assertEqual(plan.line_id, "L-ASIDE-END")
+                self.assertFalse(s.eng.exit_requested)
+
+    def test_after_a_declined_question_a_model_maybe_never_exits(self):
+        # Reviewed fix: once the question was asked and declined, a model-only "maybe" on in-role
+        # talk counted as the confirming "later request" and exited with no question at all.
+        for text in (
+            "At the end of the day, the course pays for itself.",
+            "We support you end to end, right through the interview.",
+            "Once you finish the course you will clear the interview easily.",
+        ):
+            with self.subTest(text=text):
+                s = self.started()
+                aside = s.say("Let's call it a day.", 280, end_intent="maybe")
+                self.assertTrue(aside.aside)
+                carry_on = s.say("No no, let's carry on. So Priya, what is your current role?", 290)
+                self.assertFalse(ended(carry_on))
+                self.assertFalse(s.eng.end_question_open)
+                s.say("Okay, and how many hours a week can you give to it?", 300)
+                plan = s.say(text, 320, turn_index=50, end_intent="maybe")
+                self.assertFalse(ended(plan), plan.reasons)
+                self.assertFalse(plan.aside)
+                self.assertNotIn("end_intent_model", plan.reasons)
+                self.assertFalse(s.eng.exit_requested)
+
+    def test_after_a_declined_question_the_candidates_own_request_still_exits(self):
+        # The lexical second request (PR #385) and a strict model "end" still confirm the stop.
+        for text, verdict in ((T64_DISCONNECT, None), ("Kindly end the interview.", "end")):
+            with self.subTest(text=text):
+                s = self.started()
+                s.say("Let's call it a day.", 280, end_intent="maybe")
+                s.say("No no, let's carry on. So Priya, what is your current role?", 290)
+                plan = s.say(text, 320, turn_index=50, end_intent=verdict)
+                self.assertTrue(ended(plan), plan.reasons)
+                self.assertTrue(s.eng.exit_requested)
+
+    def test_a_no_verdict_leaves_in_role_talk_to_the_learner(self):
+        for text in (
+            "Let's close the deal today, I can hold the festival price for you.",
+            "We support you end to end, from the first class to the job offer.",
+            "At the end of the day it's your career.",
+        ):
+            with self.subTest(text=text):
+                s = self.started()
+                plan = s.say(text, 300, end_intent="no")
+                self.assertFalse(plan.aside)
+                self.assertFalse(ended(plan))
+                self.assertNotIn("end_intent_model", plan.reasons)
+                self.assertIsNone(s.eng.admin_log()["early_close"]["end_request"])
+
+    def test_from_fourteen_minutes_or_with_a_commitment_a_verdict_is_a_farewell(self):
+        s = self.started()
+        late = s.say("Kindly end the interview.", 845, end_intent="end")
+        self.assertFalse(plan_is_aside_or_end(late))
+        self.assertIn("end_request_as_farewell", late.reasons)
+        self.assertIn("end_intent_model", late.reasons)
+        self.assertEqual(s.eng.scheduler.close_attempts, 1)
+        booked = self._booked_call()
+        plan = booked.say("Kindly end the interview.", 810, end_intent="end")
+        self.assertEqual(plan.mode, TurnMode.EXIT)
+        self.assertIn("close_attempt_exit", plan.reasons)
+        self.assertFalse(ended(plan))
+
+    def test_after_the_question_a_settled_bare_yes_confirms(self):
+        for answer in ("yes", "Yes, please.", "Haan ji.", "go ahead", "Sure."):
+            with self.subTest(answer=answer):
+                s = self.started()
+                self.assertTrue(s.say(T64_DISCONNECT, 300).aside)
+                open_question = s.eng.plan_turn(answer, 305, confirmed_yes=False)
+                self.assertFalse(ended(open_question))
+                s = self.started()
+                s.say(T64_DISCONNECT, 300)
+                plan = s.say(answer, 305, turn_index=66, confirmed_yes=True)
+                self.assertTrue(ended(plan), plan.reasons)
+                self.assertNotIn("end_request_explicit", plan.reasons)
+
+    def test_a_bare_yes_with_the_question_still_open_but_unsettled_leaves_it_open(self):
+        s = self.started()
+        s.say(T64_DISCONNECT, 300)
+        plan = s.say("Yes.", 305)
+        self.assertFalse(ended(plan))
+        self.assertTrue(s.eng.end_question_open)  # a fragment leaves the question open
+
+    def test_a_decline_always_wins(self):
+        for answer in ("yes, carry on", "Yes, continue", "No, let's carry on.", "yeah, no"):
+            with self.subTest(answer=answer):
+                s = self.started()
+                s.say(T64_DISCONNECT, 300)
+                plan = s.say(answer, 305, confirmed_yes=True, end_intent="end")
+                self.assertFalse(ended(plan))
+                self.assertFalse(s.eng.exit_requested)
+
+    def test_a_bare_yes_confirms_only_while_the_question_is_open(self):
+        s = self.started()
+        plan = s.say("Yes.", 300, confirmed_yes=True)
+        self.assertFalse(ended(plan))
+        self.assertFalse(plan.aside)
+
+    def test_a_maybe_answer_after_the_question_confirms(self):
+        s = self.started()
+        s.say(T64_DISCONNECT, 300)
+        plan = s.say("Yeah, let's wrap it up.", 305, end_intent="maybe")
+        self.assertTrue(ended(plan))
+        self.assertIn("end_intent_model", plan.reasons)
+
+    def test_a_model_aside_gives_back_what_a_lost_reply_used_up(self):
+        s = Session(engine())
+        s.say(OPENER, 20)
+        s.say(CALL_ASK, 100)
+        question = s.eng.plan_turn(CALL_ASK, 125)
+        self.assertEqual(question.negotiation_id, "N-QUESTION")
+        s.eng.reply_lost(question)
+        aside = s.eng.plan_turn("Let's call it a day.", 130, end_intent="maybe")
+        self.assertTrue(aside.aside)
+        self.assertFalse(s.eng.negotiation.question_used)
+
+    def test_without_a_verdict_every_plan_is_the_lexical_one(self):
+        from r1_tracker import detect_end_request, explicit_end_request
+
+        rows = (HERE / "tests" / "fixtures" / "r1_end_intent_labels.jsonl").read_text(
+            encoding="utf-8"
+        ).splitlines()
+        for row in rows:
+            text = json.loads(row)["text"]
+            with self.subTest(text=text):
+                s = self.started()
+                plan = s.say(text, 300, end_intent=None)
+                if explicit_end_request(text):
+                    self.assertTrue(ended(plan))
+                elif detect_end_request(text):
+                    self.assertEqual((plan.aside, plan.line_id), (True, "L-ASIDE-END"))
+                else:
+                    self.assertFalse(ended(plan))
+                    self.assertNotEqual(plan.line_id, "L-ASIDE-END")
+                self.assertNotIn("end_intent_model", plan.reasons)
+
+
+def plan_is_aside_or_end(plan) -> bool:
+    return bool(plan.aside) or ended(plan)
 
 
 if __name__ == "__main__":
