@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
+import os
 import sys
 import time
 import typing
@@ -672,6 +674,7 @@ class TestR1SessionFactory(unittest.IsolatedAsyncioTestCase):
 
         captured: dict = {}
         tts_kwargs: dict = {}
+        stt_kwargs: dict = {}
 
         class RecordingSession:
             def __init__(self, **kwargs) -> None:
@@ -681,11 +684,21 @@ class TestR1SessionFactory(unittest.IsolatedAsyncioTestCase):
             tts_kwargs.update(kwargs)
             return "tts"
 
-        with mock.patch.object(agents, "AgentSession", RecordingSession), mock.patch.object(
-            sarvam, "STT", lambda **_kwargs: "stt"
-        ), mock.patch.object(sarvam, "TTS", recording_tts), mock.patch.object(
+        def recording_stt(**kwargs):
+            stt_kwargs.update(kwargs)
+            return "stt"
+
+        # The flip at v3 is today's construction exactly (owner decision 2026-10-30).
+        env = {"R1_TTS_PROFILE": "v3"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(
+            agents, "AgentSession", RecordingSession
+        ), mock.patch.object(sarvam, "STT", recording_stt), mock.patch.object(
+            sarvam, "TTS", recording_tts
+        ), mock.patch.object(
             r1_llm, "build_r1_llm", lambda: "llm"
         ):
+            for key in ("R1_STT_MODEL", "SARVAM_STT_MODEL", "SARVAM_LANGUAGE"):
+                os.environ.pop(key, None)
             await r1_session._default_session_factory(None, {})
 
         self.assertEqual(captured["stt"], "stt")
@@ -705,6 +718,11 @@ class TestR1SessionFactory(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("turn_detection", captured["turn_handling"])
         # The session's voice is the one the line cache synthesises with.
         self.assertEqual(tts_kwargs, r1_tts.r1_tts_kwargs())
+        self.assertEqual(
+            tts_kwargs,
+            {"model": "bulbul:v3", "speaker": "simran", "pace": 1.0, "temperature": 0.8},
+        )
+        self.assertEqual(stt_kwargs, {"model": "saaras:v4", "language": "en-IN"})
 
     async def test_r1_agent_builds_on_the_real_agent_and_routes_its_llm_node(self) -> None:
         import r1_session
@@ -1612,3 +1630,234 @@ class TestR1PipelineOnARealSession(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(total / 48000, heard - 0.1)
             self.assertEqual(recorder.phase, "done")
             self.assertFalse(spool.dir.exists())
+
+
+@unittest.skipUnless(
+    AgentSession is not None and _sarvam_plugin is not None,
+    "livekit-agents with the sarvam plugin is not installed (bare CI)",
+)
+class TestR1VoicesOnTheRealSdk(unittest.IsolatedAsyncioTestCase):
+    """R1's two voices (owner decision 2026-10-30) on the pinned SDK and plugin.
+
+    The voiced TTS reads two private seams: the plugin's per-stream copy of its options and the
+    SDK's speech-handle variable.  Both are pinned here, with the order facts that make the
+    per-speech binding race-free, so an SDK or plugin bump that moves them fails CI.
+    """
+
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {"SARVAM_API_KEY": "test-key-not-real"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in (
+            "R1_TTS_PROFILE",
+            "R1_TTS_INTERVIEWER_VOICE",
+            "R1_TTS_LEARNER_VOICE",
+            "R1_STT_MODEL",
+            "SARVAM_STT_MODEL",
+            "SARVAM_TTS_MODEL",
+            "SARVAM_TTS_VOICE",
+        ):
+            os.environ.pop(key, None)
+
+    async def test_default_factory_v4_gives_the_session_one_voiced_tts(self) -> None:
+        import livekit.agents as agents
+        from livekit.plugins import sarvam
+
+        import r1_llm
+        import r1_session
+        from tests.test_r1_core import capture_r1_logs
+
+        captured: dict = {}
+
+        class RecordingSession:
+            def __init__(self, **kwargs) -> None:
+                captured.update(kwargs)
+
+        raw = "learner_typo_value_xyz"
+        os.environ["R1_TTS_LEARNER_VOICE"] = raw
+        with capture_r1_logs() as lines, mock.patch.object(
+            agents, "AgentSession", RecordingSession
+        ), mock.patch.object(sarvam, "STT", lambda **kwargs: ("stt", kwargs)), mock.patch.object(
+            r1_llm, "build_r1_llm", lambda: "llm"
+        ):
+            await r1_session._default_session_factory(None, {})
+        tts = captured["tts"]
+        try:
+            self.assertIsInstance(tts, sarvam.TTS)
+            self.assertEqual(type(tts).__name__, "R1SarvamTTS")
+            self.assertEqual(tts.r1_voice_set.profile, "v4")
+            self.assertEqual(tts.model, "bulbul:v4-flash")
+            self.assertEqual(tts.r1_voice_set.speaker("learner"), "zarina_en_conversation")
+            self.assertEqual(captured["stt"], ("stt", {"model": "saaras:v4", "language": "en-IN"}))
+        finally:
+            await tts.aclose()
+        events = [(line.get("error_type"), line.get("error_category")) for line in lines]
+        self.assertIn(("r1_tts_setting_rejected", "learner_voice_rejected"), events)
+        self.assertIn(("r1_tts_profile", "v4"), events)
+        voices = {
+            line["error_category"]: line.get("schema")
+            for line in lines
+            if line.get("error_type") == "r1_tts_voice"
+        }
+        self.assertEqual(
+            voices, {"interviewer": "simran_en_customer", "learner": "zarina_en_conversation"}
+        )
+        profile = next(line for line in lines if line.get("error_type") == "r1_tts_profile")
+        self.assertEqual(profile.get("model"), "bulbul:v4-flash")
+        self.assertIn(("r1_stt_model", None), events)
+        self.assertNotIn(raw, json.dumps(lines))  # labels only, never a raw environment value
+
+    async def test_a_v4_build_failure_gives_the_session_todays_voice_and_says_so(self) -> None:
+        import livekit.agents as agents
+        from livekit.plugins import sarvam
+
+        import r1_llm
+        import r1_sarvam
+        import r1_session
+        from tests.test_r1_core import capture_r1_logs
+
+        captured: dict = {}
+
+        class RecordingSession:
+            def __init__(self, **kwargs) -> None:
+                captured.update(kwargs)
+
+        def broken(_voice_set):
+            raise ValueError("cannot build")
+
+        with capture_r1_logs() as lines, mock.patch.object(
+            agents, "AgentSession", RecordingSession
+        ), mock.patch.object(sarvam, "STT", lambda **_kwargs: "stt"), mock.patch.object(
+            r1_llm, "build_r1_llm", lambda: "llm"
+        ), mock.patch.object(r1_sarvam, "_voiced_tts_class", lambda: broken):
+            await r1_session._default_session_factory(None, {})
+        tts = captured["tts"]
+        self.assertIs(type(tts), sarvam.TTS)
+        self.assertEqual(tts._opts.speaker, "simran")
+        self.assertEqual(tts.model, "bulbul:v3")
+        events = [(line.get("error_type"), line.get("error_category")) for line in lines]
+        self.assertIn(("r1_tts_profile_fallback", "ValueError"), events)
+        self.assertIn(("r1_tts_profile", "v3"), events)  # what the session really speaks
+        await tts.aclose()
+
+    def test_the_seams_the_voiced_tts_reads_are_pinned(self) -> None:
+        import re
+
+        from livekit.agents import tts as agents_tts
+        from livekit.agents.voice import generation
+        from livekit.plugins.sarvam import tts as plugin_tts
+
+        # Each stream copies the options, so setting its speaker never touches the instance.
+        self.assertIn(
+            "self._opts = replace(tts._opts)",
+            inspect.getsource(plugin_tts.SynthesizeStream.__init__),
+        )
+        # The stream's main task is created in the base __init__, and cannot run before the
+        # synchronous speaker assignment that follows ``super().stream()``.
+        self.assertIn(
+            "asyncio.create_task(", inspect.getsource(agents_tts.SynthesizeStream.__init__)
+        )
+        # Every segment sends the stream's speaker in its config, a pooled socket included.
+        run_ws = inspect.getsource(plugin_tts.SynthesizeStream._run_ws)
+        self.assertIn('"speaker": self._opts.speaker', run_ws)
+        self.assertIn('"model": self._opts.model', run_ws)
+        # Temperature is sent for the v3 names only (v4 ignores it, and R1 never sets it).
+        gate = 'if self._opts.model in ("bulbul:v3", "bulbul:v3-beta"):'
+        self.assertEqual(run_ws.count('data["temperature"]'), 1)
+        self.assertLess(run_ws.index(gate), run_ws.index('data["temperature"]'))
+        # stream() takes only conn_options (the subclass's override matches it).
+        parameters = inspect.signature(plugin_tts.TTS.stream).parameters
+        self.assertEqual(list(parameters), ["self", "conn_options"])
+        self.assertIs(parameters["conn_options"].kind, inspect.Parameter.KEYWORD_ONLY)
+        # bulbul:v4-flash is unknown to the plugin: no compatibility check (R1 allowlists).
+        self.assertNotIn("bulbul:v4-flash", plugin_tts.MODEL_SPEAKER_COMPATIBILITY)
+        # One pool per instance, keyed on the model: both voices must share the model.
+        self.assertIn("?model={self._opts.model}", inspect.getsource(plugin_tts.TTS._connect_ws))
+        init = inspect.signature(plugin_tts.TTS.__init__).parameters
+        self.assertEqual(init["target_language_code"].default, "en-IN")
+        self.assertEqual(init["speech_sample_rate"].default, 22050)
+        # The SDK sets the speech handle for every speech task, and runs a say line's TTS only
+        # after the speech is authorised (the voice is stored right after say() returns).
+        self.assertIn(
+            "_SpeechHandleContextVar.set(speech_handle)",
+            inspect.getsource(AgentActivity._create_speech_task),
+        )
+        impl = inspect.getsource(AgentActivity._tts_task_impl)
+        self.assertLess(
+            impl.index("speech_handle._wait_for_authorization()"),
+            impl.index("perform_tts_inference("),
+        )
+        # The node is called synchronously inside the TTS inference task: the binding R1 makes
+        # at its top is that task's own.
+        source = inspect.getsource(generation._tts_inference_task)
+        self.assertRegex(source, re.escape("tts_node = node(input_tee[1], model_settings)"))
+        self.assertIn(
+            "asyncio.create_task(", inspect.getsource(generation.perform_tts_inference)
+        )
+
+    async def test_the_speech_voice_reaches_the_tts_node_inside_the_sdks_inference(self) -> None:
+        from livekit.agents.voice.agent import ModelSettings
+        from livekit.agents.voice.agent_activity import _SpeechHandleContextVar
+        from livekit.agents.voice.generation import perform_tts_inference
+
+        import r1_session
+        import r1_tts
+        from tests.test_r1_core import FakeContext, FakeSession, FakeWriter
+
+        order: list = []
+        interview = r1_session.R1Interview(
+            FakeContext(order),
+            {"first_name": "Asha", "candidate_identity": "candidate"},
+            FakeSession(log=order),
+            FakeWriter(order),
+        )
+        agent = r1_session.R1Agent(interview)
+        learner, christy = SpeechHandle.create(), SpeechHandle.create()
+        interview._voices[str(learner.id)] = "learner"
+        interview._voices[str(christy.id)] = "interviewer"
+        heard: dict[str, list] = {"learner": [], "interviewer": []}
+        gate = asyncio.Event()
+
+        def inner(_self, text, model_settings):
+            async def frames():
+                voice = r1_tts.current_voice()
+                body = "".join([chunk async for chunk in text])
+                heard[voice or "unbound"].append(body)
+                yield rtc.AudioFrame(b"\x01\x00" * 441, 22050, 1, 441)
+
+            return frames()
+
+        async def text(chunks):
+            for chunk in chunks:
+                await gate.wait()  # both speeches are in flight before any text arrives
+                await asyncio.sleep(0.003)
+                yield chunk
+
+        async def speech(handle, chunks) -> int:
+            _SpeechHandleContextVar.set(handle)  # what _create_speech_task does
+            task, data = perform_tts_inference(
+                node=agent.tts_node, input=text(chunks), model_settings=ModelSettings(),
+                text_transforms=None,
+            )
+            frames = [frame async for frame in data.audio_ch]
+            self.assertTrue(await task)
+            return len(frames)
+
+        with mock.patch.object(Agent, "tts_node", inner):
+            first = asyncio.create_task(
+                speech(learner, ("Hmm, okay then. ", "Nine thousand feels a lot. ", "Why?"))
+            )
+            second = asyncio.create_task(
+                speech(christy, ("Thank you, Asha. ", "Let us pause the role-play here."))
+            )
+            await asyncio.sleep(0.01)
+            gate.set()
+            self.assertEqual(await asyncio.gather(first, second), [2, 2])
+        # Both of each speech's downstream calls (the early flush) in its own voice, never mixed.
+        self.assertEqual(
+            heard["learner"], ["Hmm, okay then.", " Nine thousand feels a lot. Why?"]
+        )
+        self.assertEqual(
+            heard["interviewer"], ["Thank you, Asha.", " Let us pause the role-play here."]
+        )
+        self.assertNotIn("unbound", heard)

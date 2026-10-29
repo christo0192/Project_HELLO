@@ -33,6 +33,13 @@ kill_timeout = 300
   GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
   SARVAM_STT_MODEL = "saaras:v3"
   SARVAM_LANGUAGE = "en-IN"
+  # SARVAM_TTS_* are the browser screener's voice; R1 speaks them only under the v3 rollback.
+  # R1's voices (owner decision 2026-10-30) are Bulbul v4 Flash by default, switched by the
+  # SECRETS R1_TTS_PROFILE / R1_TTS_INTERVIEWER_VOICE / R1_TTS_LEARNER_VOICE (and the STT trial
+  # R1_STT_MODEL), never [env] here (the validator refuses them): an [env] value would shadow
+  # the rollback. Roll back, in a zero-live window, with
+  #   fly secrets set R1_TTS_PROFILE=v3 -a project-hello-voice
+  # Never point SARVAM_TTS_MODEL at bulbul:v4-flash: "simran" is not a v4 voice (dead air).
   SARVAM_TTS_MODEL = "bulbul:v3"
   SARVAM_TTS_VOICE = "simran"
   LIVEKIT_WORKER_DRAIN_SEC = "10"

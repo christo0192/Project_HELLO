@@ -35,6 +35,8 @@ import r1_persistence
 import r1_routing
 import r1_session
 from r1_guard import FALLBACK_REPLY
+from r1_prompts import ROLEPLAY_PHASE, select_context
+from r1_replies import Reply
 from r1_script import LEARNER_FILLER_VARIANTS
 from r1_lines import INTERVIEWER_NAME, line, safe_first_name
 from r1_persistence import OUTCOME_DISPOSITIONS, R1TurnWriter
@@ -836,10 +838,15 @@ class TestPhaseAndConfiguration(unittest.TestCase):
         factory_start = source.index("async def _default_session_factory")
         factory_end = source.index("class _SpeechSlot")
         factory = source[factory_start:factory_end]
-        self.assertIn('os.getenv("SARVAM_STT_MODEL", "saaras:v3")', factory)
         self.assertIn('os.getenv("SARVAM_LANGUAGE", "en-IN")', factory)
-        # The voice is the browser lane's, defined once in r1_tts and shared with the line cache.
-        self.assertIn("sarvam.TTS(**r1_tts_kwargs())", factory)
+        # The providers are built in r1_sarvam (owner decision 2026-10-30): the STT model is
+        # R1's trial switch, today's expression when unset, and the v3 rollback voice is the
+        # browser lane's, defined once in r1_tts and shared with the line cache.
+        self.assertIn("r1_stt_model()", factory)
+        self.assertIn("_build_session_tts(build_r1_tts)", factory)
+        providers = (HERE / "r1_sarvam.py").read_text(encoding="utf-8")
+        self.assertIn('os.getenv("SARVAM_STT_MODEL", "saaras:v3")', providers)
+        self.assertIn("sarvam.TTS(**r1_tts_kwargs())", providers)
         voice = (HERE / "r1_tts.py").read_text(encoding="utf-8")
         self.assertIn('os.getenv("SARVAM_TTS_MODEL", "bulbul:v3")', voice)
         self.assertIn('os.getenv("SARVAM_TTS_VOICE", "simran")', voice)
@@ -7298,3 +7305,223 @@ class TestPhoneIsolation(unittest.TestCase):
         self.assertNotIn("ctx.close_room", source)
         self.assertNotIn('getattr(ctx, "close_room"', source)
         self.assertNotIn("_log.warning", source)
+
+
+class TestVoicePerSpeech(R1TestCase):
+    """One voice per speech, fixed when it is created (owner decision 2026-10-30).
+
+    The TTS speaker, the filler, the recovery line and the transcript label all read the one
+    value stored for the speech.  ``r1_session.current_speech_id`` (the SDK's speech-handle
+    variable) is patched to name the speech whose task is "running".
+    """
+
+    def reply_speech(self, reply=None) -> FakeSpeechHandle:
+        """An LLM reply's speech is created, right after the hook prepared ``reply``."""
+        self.interview._latest_reply = reply
+        handle = FakeSpeechHandle("a reply")
+        self.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=False),
+        )
+        return handle
+
+    def running(self, handle):
+        return mock.patch.object(r1_session, "current_speech_id", lambda: str(handle.id))
+
+    def deliver(self, handle: FakeSpeechHandle, text: str) -> None:
+        self.session.current_speech = handle
+        self.agent_state("speaking")
+        message = FakeChatMessage(text)
+        self.session.emit("conversation_item_added", SimpleNamespace(item=message))
+        handle.chat_items.append(message)
+        handle.finish()
+        self.session.current_speech = None
+
+    async def test_scripted_lines_are_bound_by_the_line_table(self) -> None:
+        self.assertEqual(
+            r1_session._LEARNER_LINES,
+            {"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE"},
+        )
+        for line_id in [*sorted(r1_session._LEARNER_LINES), "L-SIL-IB", "L-EXIT", "L-SIL-RP2"]:
+            with self.subTest(line_id=line_id):
+                await self.interview.say(line_id)
+                expected = "learner" if line_id in r1_session._LEARNER_LINES else "interviewer"
+                self.assertEqual(self.interview._history[-1]["voice"], expected)
+        self.enter_roleplay()
+        for line_id in ("L-ASIDE-COACH", "L-ASIDE-END"):
+            with self.subTest(line_id=line_id):
+                plan = SimpleNamespace(scripted_text=self.spoken_line(line_id), line_id=line_id)
+                with mock.patch.object(self.interview, "_close_coach_aside", lambda: None):
+                    await self.interview._play_aside(plan)
+                self.assertEqual(self.interview._history[-1]["voice"], "interviewer")
+
+    async def test_a_roleplay_reply_is_bound_to_the_learner_at_creation(self) -> None:
+        voices = self.interview._voices
+        icebreaker = self.reply_speech(Reply(phase="icebreaker", candidate_text="hi"))
+        self.assertEqual(voices[icebreaker.id], "interviewer")
+        unplanned = self.reply_speech(None)  # no prepared reply: the phase rule
+        self.assertEqual(voices[unplanned.id], "interviewer")
+        self.enter_roleplay()
+        roleplay = self.reply_speech(Reply(phase=ROLEPLAY_PHASE, candidate_text="hello"))
+        self.assertEqual(voices[roleplay.id], "learner")
+        self.assertEqual(voices[self.reply_speech(None).id], "learner")
+        self.interview.machine.transition(R1Phase.ASIDE)
+        # A reply planned in ASIDE is the learner's (``_plan_learner_reply`` always plans one).
+        aside = self.reply_speech(Reply(phase=ROLEPLAY_PHASE, candidate_text="ok"))
+        self.assertEqual(voices[aside.id], "learner")
+        self.assertEqual(voices[self.reply_speech(None).id], "learner")
+        wrapup = self.reply_speech(Reply(phase="wrapup", candidate_text="a question"))
+        self.assertEqual(voices[wrapup.id], "interviewer")
+
+    async def test_the_bound_voice_is_the_transcript_label(self) -> None:
+        self.enter_roleplay()
+        reply = self.reply_speech(Reply(phase=ROLEPLAY_PHASE, candidate_text="hello"))
+        # The phase moves on before the learner's reply starts speaking (an aside began): its
+        # audio is the learner's, so its label is too.  It used to read "interviewer".
+        self.interview.machine.transition(R1Phase.ASIDE)
+        self.deliver(reply, "Nine thousand still feels like a lot.")
+        item = self.interview._history[-1]
+        self.assertEqual((item["voice"], item["phase"]), ("learner", "aside"))
+        learner_context = select_context(self.interview._history, ROLEPLAY_PHASE)
+        self.assertIn(
+            {"role": "assistant", "content": "Nine thousand still feels like a lot."},
+            learner_context,
+        )
+        wrapup_context = select_context(self.interview._history, "wrapup")
+        self.assertNotIn("Nine thousand", json.dumps(wrapup_context))
+        # A scripted line's label is its line voice; a speech R1 never tagged keeps the rule.
+        await self.interview.say("L-SIL-RP1")
+        self.assertEqual(self.interview._history[-1]["voice"], "learner")
+        self.interview._remember_bot_turn(99, ROLEPLAY_PHASE, "untracked", None)
+        self.assertEqual(self.interview._history[-1]["voice"], "learner")
+        self.interview._remember_bot_turn(100, "wrapup", "untracked", None)
+        self.assertEqual(self.interview._history[-1]["voice"], "interviewer")
+
+    async def test_tts_node_stream_binds_the_voice_of_its_own_speech(self) -> None:
+        import r1_tts
+
+        self.enter_roleplay()
+        # An interviewer say line is the CURRENT speech while a learner reply is already being
+        # synthesised behind it: the reply's TTS must still speak the learner.
+        say_line = FakeSpeechHandle("Are you still there?")
+        self.interview._voices[str(say_line.id)] = "interviewer"
+        self.session.current_speech = say_line
+        reply = self.reply_speech(Reply(phase=ROLEPLAY_PHASE, candidate_text="hello"))
+        seen: list = []
+
+        def synth(stream):
+            async def frames():
+                seen.append(r1_tts.current_voice())
+                async for _ in stream:
+                    pass
+                yield "frame"
+
+            return frames()
+
+        async def tts_task(handle) -> list:
+            with self.running(handle):
+                node = self.interview.tts_node_stream("Hmm, okay. Tell me more about it.", synth)
+                return [frame async for frame in node]
+
+        await asyncio.create_task(tts_task(reply))
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {"learner"})  # every downstream call of the reply
+        seen.clear()
+        await asyncio.create_task(tts_task(say_line))
+        self.assertEqual(set(seen), {"interviewer"})
+        self.assertIsNone(r1_tts.current_voice())  # bound only inside each TTS task
+        self.session.current_speech = None
+
+    async def test_an_untracked_speech_falls_back_to_the_phase_and_is_logged_once(self) -> None:
+        self.enter_roleplay()
+        with self.capture_logs() as lines, mock.patch.object(
+            r1_session, "current_speech_id", lambda: None
+        ):
+            self.assertEqual(self.interview.speech_voice(), "learner")
+            self.interview.machine.transition(R1Phase.ASIDE)
+            self.assertEqual(self.interview.speech_voice(), "learner")
+        self.assertEqual(error_types(lines).count("r1_tts_voice_unbound"), 1)
+
+    async def test_the_filler_is_in_the_replys_voice(self) -> None:
+        # A learner reply whose filler fires after the phase moved still says the learner's.
+        self.enter_roleplay()
+        reply = self.reply_speech(Reply(phase=ROLEPLAY_PHASE, candidate_text="hello"))
+        self.interview.machine.transition(R1Phase.ASIDE)
+        with self.running(reply):
+            self.assertIn(
+                self.interview._filler_text(), [v + " " for v in LEARNER_FILLER_VARIANTS]
+            )
+        # And a Christy reply never gets the learner's filler, whatever the phase.
+        christy = self.reply_speech(Reply(phase="wrapup", candidate_text="a question"))
+        with self.running(christy):
+            self.assertEqual(
+                self.interview._filler_text(), self.spoken_line("L-FILLER-INTERVIEWER") + " "
+            )
+
+    async def test_the_recovery_line_takes_the_hung_replys_voice(self) -> None:
+        self.enter_roleplay()
+        # A reply the hook planned for Christy hangs while the phase says role-play: the
+        # recovery line is Christy's, not the learner's (the phase rule would say learner).
+        reply = self.reply_speech(Reply(phase="roleplay_exit", candidate_text="a question"))
+        self.assertEqual(self.interview._voices[reply.id], "interviewer")
+
+        async def hung():
+            await asyncio.Event().wait()
+            yield "never"
+
+        with mock.patch.object(r1_session, "TURN_DEADLINE_SECONDS", 0.05), mock.patch.object(
+            r1_session, "FILLER_AFTER_SECONDS", 5.0
+        ), self.running(reply):
+            with self.assertRaises(TimeoutError):
+                await self.interview.guard_llm_stream(hung()).__anext__()
+        await self.until(lambda: ("play_end", FALLBACK_REPLY) in self.order)
+        await self.flush()
+        spoken = [item for item in self.interview._history if item["text"] == FALLBACK_REPLY]
+        self.assertEqual([item["voice"] for item in spoken], ["interviewer"])
+
+    async def test_a_cached_learner_line_is_looked_up_in_the_learner_voice(self) -> None:
+        lookups: list = []
+
+        class Cache:
+            def lookup(self, text, voice="interviewer"):
+                lookups.append((text, voice))
+                return None
+
+        self.interview._line_cache = Cache()
+        try:
+            await self.interview.say("L-PICKUP")
+            await self.interview.say("L-SIL-IB")
+        finally:
+            self.interview._line_cache = None
+        self.assertEqual(
+            lookups,
+            [
+                (self.spoken_line("L-PICKUP"), "learner"),
+                (self.spoken_line("L-SIL-IB"), "interviewer"),
+            ],
+        )
+
+    async def test_warm_specs_carry_each_lines_voice(self) -> None:
+        free = self.interview._warm_specs(candidate_free=True)
+        named = self.interview._warm_specs(candidate_free=False)
+        order = list(r1_session._WARM_ORDER)
+        self.assertEqual(sorted(spec.line_id for spec in free + named), sorted(order))
+        for group in (free, named):
+            ids = [spec.line_id for spec in group]
+            self.assertEqual(ids, [line_id for line_id in order if line_id in ids])
+        for spec in free + named:
+            with self.subTest(line_id=spec.line_id):
+                learner = spec.line_id in r1_session._LEARNER_LINES
+                self.assertEqual(spec.voice, "learner" if learner else "interviewer")
+        self.assertEqual(
+            {spec.line_id for spec in free + named if spec.voice == "learner"},
+            {"L-PICKUP", "L-SIL-RP1"},
+        )
+
+    async def test_voices_are_forgotten_when_a_speech_ends(self) -> None:
+        reply = self.reply_speech(Reply(phase="icebreaker", candidate_text="hi"))
+        self.assertIn(str(reply.id), self.interview._voices)
+        reply.finish()
+        self.assertNotIn(str(reply.id), self.interview._voices)
+        await self.interview.say("L-SIL-IB")
+        self.assertEqual(self.interview._voices, {})

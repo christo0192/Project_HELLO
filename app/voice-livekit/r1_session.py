@@ -111,6 +111,13 @@ and how much role-play budget is left (``rpleft``, with every role-play phase wr
 heartbeat).  The button itself comes back as a server-sent ``r1ready`` data message that the API
 relays (``_on_data_received``): it is accepted only from the server, only in the transition and
 only while ``awaiting=ready``, and is latched so the driver treats it exactly like a spoken "ready".
+
+Two voices (owner decision 2026-10-30): Christy and the role-play learner speak with different
+Bulbul v4 Flash speakers (``r1_tts.r1_voice_set``, flipped back to today's single voice by
+``R1_TTS_PROFILE=v3``).  Each speech gets ONE voice when it is created (``_voices``: a ``say`` line
+by ``_LEARNER_LINES``, a reply by the plan it answers), and its TTS (``tts_node_stream`` binds it
+for ``r1_sarvam.R1SarvamTTS``), filler, recovery line, cached clip and transcript label all read
+that value (``speech_voice``).
 """
 from __future__ import annotations
 
@@ -164,7 +171,18 @@ from r1_replies import (
 from r1_prompts import ROLEPLAY_PHASE
 from r1_roleplay import RolePlayEngine, TurnMode, TurnPlan
 from r1_script import INTERVIEWER_NAME, is_candidate_free, known_first_name, line, spoken_first_name
-from r1_tts import flush_min_chars, flush_tts, r1_tts_kwargs
+from r1_sarvam import current_speech_id
+from r1_tts import (
+    INTERVIEWER,
+    LEARNER,
+    VOICES,
+    R1VoiceSet,
+    bind_voice,
+    flush_min_chars,
+    flush_tts,
+    legacy_voice_set,
+    r1_voice_set,
+)
 
 R1_RECORD = False
 NO_SHOW_SECONDS = 120.0
@@ -979,18 +997,26 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
     session's defaults.  PR-4c changes only the TIMINGS around them (``r1_turn_handling``:
     endpointing, interruption length and words; preemptive generation stays off), which the
     SDK reads from the session, and nothing else about turn taking.
+
+    The voices (owner decision 2026-10-30) are read ONCE here (``r1_voice_set``): v4 is one
+    ``R1SarvamTTS`` speaking Christy and the learner per speech, v3 (the rollback) is
+    ``sarvam.TTS(**r1_tts_kwargs())`` exactly as before (``r1_sarvam.build_r1_tts``).  The STT
+    model is R1's own switch (``r1_stt_model``): saaras:v4 unless it is set (saaras:v3 rollback).
     """
     from livekit.agents import APIConnectOptions, AgentSession
     from livekit.agents.voice.agent_session import SessionConnectOptions
     from livekit.plugins import sarvam
     from r1_llm import build_r1_llm
+    from r1_sarvam import build_r1_tts, r1_stt_model
 
+    tts = _build_session_tts(build_r1_tts)
+    stt_model, stt_note = r1_stt_model()
+    if stt_note is not None:
+        _log.warn("unknown_event", error_type="r1_stt_setting_rejected", error_category=stt_note)
+    _log.info("unknown_event", error_type="r1_stt_model", model=stt_model)
     return AgentSession(
-        stt=sarvam.STT(
-            model=os.getenv("SARVAM_STT_MODEL", "saaras:v3"),
-            language=os.getenv("SARVAM_LANGUAGE", "en-IN"),
-        ),
-        tts=sarvam.TTS(**r1_tts_kwargs()),
+        stt=sarvam.STT(model=stt_model, language=os.getenv("SARVAM_LANGUAGE", "en-IN")),
+        tts=tts,
         llm=build_r1_llm(),
         conn_options=SessionConnectOptions(
             llm_conn_options=APIConnectOptions(
@@ -1002,6 +1028,44 @@ async def _default_session_factory(_ctx: Any, _context: dict[str, Any]) -> Any:
         turn_handling=r1_turn_handling(),
         user_away_timeout=None,
     )
+
+
+def _build_session_tts(build: Callable[..., Any]) -> Any:
+    """Build the session's TTS for this session's voice set, and log what it speaks with.
+
+    Labels only: the profile and model, one speaker id per role (a v4 id is allowlisted, so a
+    typo in an override never reaches a log; v3's is the screener's configured voice name), and
+    each refused setting by its note, never the refused value.
+    """
+    requested = r1_voice_set()
+    for note in requested.notes:
+        _log.warn("unknown_event", error_type="r1_tts_setting_rejected", error_category=note)
+
+    def on_fallback(exc: BaseException) -> None:
+        _log.warn(
+            "unknown_event",
+            error_type="r1_tts_profile_fallback",
+            error_category=_error_type_of(exc),
+        )
+
+    tts = build(requested, on_fallback=on_fallback)
+    voice_set = getattr(tts, "r1_voice_set", None)
+    if not isinstance(voice_set, R1VoiceSet):
+        voice_set = legacy_voice_set()  # what a plain TTS speaks, and what the cache keys on
+    _log.info(
+        "unknown_event",
+        error_type="r1_tts_profile",
+        error_category=voice_set.profile,
+        model=voice_set.model,
+    )
+    for role in VOICES:
+        _log.info(
+            "unknown_event",
+            error_type="r1_tts_voice",
+            error_category=role,
+            schema=voice_set.speaker(role),
+        )
+    return tts
 
 
 @dataclass
@@ -1223,7 +1287,11 @@ class R1Interview:
         self._replies: dict[str, Reply] = {}
         self._latest_reply: Reply | None = None  # prepared, not yet bound to a speech
         self._last_reply: Reply | None = None  # the newest prepared reply (lookup fallback)
+        # One voice per speech (str speech id -> ``r1_tts`` role), set when the speech is
+        # created (``_say_text``, ``_on_speech_created``) and read by its TTS, filler, recovery
+        # line and transcript label.
         self._voices: dict[str, str] = {}
+        self._voice_unbound_logged = False
         self._guard_trips: list[dict[str, Any]] = []
         self._logged_moves: set[str] = set()
         self._skip_failure_reset = False
@@ -2091,26 +2159,28 @@ class R1Interview:
         interruptible: bool = True,
         marker: str = "llm",
         timeout: float = SAY_PLAYOUT_SECONDS,
-        voice: str = "interviewer",
+        voice: str = INTERVIEWER,
     ) -> None:
         """Speak one scripted line and wait for its playout.
 
         Persistence is NOT done here: ``say`` adds the assistant message and the SDK
         reports it through ``conversation_item_added``, which is the single source of
         bot transcript rows.  ``voice`` says who is speaking (the learner or the
-        interviewer), which decides which later model call may see the line.
+        interviewer): the TTS speaks the line in it, and it decides which later model call may
+        see the line.  It is stored right after ``say`` returns, which is in time: a ``say``
+        line's TTS starts only once the speech is authorised (1.6.4 ``_tts_task_impl``).
 
         A line the cache holds is played from its stored audio (``say(audio=...)``): same
         text, same transcript row, no TTS round trip.  Anything else is spoken live.
         """
-        audio = self._cached_audio(text, marker)
+        audio = self._cached_audio(text, marker, voice)
         if audio is None:
             handle = self.session.say(text, allow_interruptions=interruptible)
         else:
             handle = self.session.say(text, audio=audio, allow_interruptions=interruptible)
         handle_id = getattr(handle, "id", None)
         if handle_id is not None:
-            self._voices[handle_id] = voice
+            self._voices[str(handle_id)] = voice
             self._latency.say_created(str(handle_id), marker, self.machine.transcript_phase())
         wait_for_playout = getattr(handle, "wait_for_playout", None)
         if not callable(wait_for_playout):
@@ -2144,17 +2214,61 @@ class R1Interview:
             interruptible=interruptible,
             marker=line_id,
             timeout=timeout,
-            voice="learner" if line_id in _LEARNER_LINES else "interviewer",
+            voice=LEARNER if line_id in _LEARNER_LINES else INTERVIEWER,
         )
+
+    # ------------------------------------------------------------ voices
+
+    @staticmethod
+    def _voice_for_phase(phase: R1Phase) -> str:
+        """The voice due in ``phase`` when nothing else says: the learner's in role-play.
+
+        ROLEPLAY and ASIDE are exactly the phases ``_decide_turn`` routes to
+        ``_plan_learner_reply``, so this is the rule a reply planned there follows too.
+        """
+        return LEARNER if phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE) else INTERVIEWER
+
+    def _reply_voice(self, reply: Reply | None) -> str:
+        """The voice of an LLM reply, decided when its speech is created and never again."""
+        if reply is not None:
+            return LEARNER if reply.phase == ROLEPLAY_PHASE else INTERVIEWER
+        return self._voice_for_phase(self.machine.phase)
+
+    def _bound_voice(self) -> str | None:
+        """The voice stored for the speech whose task is running now, or None."""
+        speech_id = current_speech_id()
+        return None if speech_id is None else self._voices.get(speech_id)
+
+    def speech_voice(self) -> str:
+        """Whose line the running speech is: one voice per speech, fixed when it was created.
+
+        The TTS speaker, the filler, the recovery line and the transcript label all read this
+        one value.  The SDK's speech-handle variable (``r1_sarvam.current_speech_id``) names the
+        speech; a speech R1 never tagged (or SDK drift that hides the variable) falls back to
+        the phase rule, and the first such fallback is logged once per session so drift is seen.
+        """
+        voice = self._bound_voice()
+        if voice is not None:
+            return voice
+        # Not during exit: a reply created then is deliberately never tracked (not drift).
+        if not self._voice_unbound_logged and not self._exiting:
+            self._voice_unbound_logged = True
+            _log.warn(
+                "unknown_event",
+                error_type="r1_tts_voice_unbound",
+                phase=self.machine.transcript_phase(),
+            )
+        return self._voice_for_phase(self.machine.phase)
 
     # ------------------------------------------------------------ line cache
 
-    def _cached_audio(self, text: str, marker: str) -> Any:
-        """The stored audio of ``text`` as SDK frames, or None when it must be spoken live."""
+    def _cached_audio(self, text: str, marker: str, voice: str = INTERVIEWER) -> Any:
+        """The stored audio of ``text`` in ``voice`` as SDK frames, or None when it must be
+        spoken live."""
         cache = self._line_cache
         if cache is None:
             return None
-        clip = cache.lookup(text)
+        clip = cache.lookup(text, voice)
         _log.info(
             "unknown_event",
             error_type="r1_line_cache_play",
@@ -2173,7 +2287,8 @@ class R1Interview:
         Only a candidate-free line may be kept on disk (``is_candidate_free``); a line that
         carries the first name is synthesised for this session and stays in memory.  L-OPEN is
         left out: it is spoken the moment the candidate is here, before it could be warmed.
-        ``candidate_free`` picks one group, so the two can be warmed at different times.
+        ``candidate_free`` picks one group, so the two can be warmed at different times.  Each
+        line is warmed in the voice ``say`` speaks it in (the learner's for ``_LEARNER_LINES``).
         """
         specs: list[LineSpec] = []
         for line_id in _WARM_ORDER:
@@ -2183,7 +2298,8 @@ class R1Interview:
                 text = self.render_line(line_id)
             except Exception:  # noqa: BLE001 - a line that cannot be rendered is just not warmed
                 continue
-            specs.append(LineSpec(line_id, text, persist=candidate_free))
+            voice = LEARNER if line_id in _LEARNER_LINES else INTERVIEWER
+            specs.append(LineSpec(line_id, text, persist=candidate_free, voice=voice))
         return specs
 
     def _start_line_warmup(self, *, candidate_free: bool) -> None:
@@ -2349,7 +2465,15 @@ class R1Interview:
         ``r1_tts``).  A ``say`` line arrives complete, where splitting would only cost a
         prosody reset, so it goes to the downstream node in one call, as the SDK does.  Only a
         reply's stages feed the turn's latency record.
+
+        The speech's voice is bound FIRST (``bind_voice``).  The SDK calls this node
+        synchronously inside the speech's own TTS task, so the binding lives in that task's
+        context only: the early flush's two downstream ``stream()`` calls share it, a
+        concurrent speech has its own, and ``R1SarvamTTS.stream`` reads it (a plain TTS ignores
+        it).  ``session.current_speech`` would be wrong here: a reply's TTS starts as soon as
+        it is scheduled, often while another speech is still the current one.
         """
+        bind_voice(self.speech_voice())
         if self._speaking_scripted_line():
             return flush_tts(text, synth, min_chars=0)
         return flush_tts(
@@ -2719,7 +2843,7 @@ class R1Interview:
                 plan.scripted_text,
                 interruptible=False,
                 marker=plan.line_id or "L-ASIDE-COACH",
-                voice="interviewer",
+                voice=INTERVIEWER,
             )
         finally:
             if resume:
@@ -3034,9 +3158,12 @@ class R1Interview:
     # ------------------------------------------------------------ LLM guard
 
     def _filler_text(self) -> str:
-        """Return the thinking filler for the current voice (learner in role-play)."""
-        in_roleplay = self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE)
-        if in_roleplay:
+        """Return the thinking filler in the reply's own voice (``speech_voice``).
+
+        It travels inside the reply's stream, so it must be the words of the voice that reply
+        is spoken in; without a tagged speech that is the phase rule (learner in role-play).
+        """
+        if self.speech_voice() == LEARNER:
             return self.engine.filler_text() + " "  # a 3-variant rotation seeded by the attempt
         return self.render_line("L-FILLER-INTERVIEWER") + " "
 
@@ -3127,8 +3254,13 @@ class R1Interview:
                     and not self._exiting
                     and self._stop_outcome() is None
                 )
+                # This runs inside the hung reply's own LLM task, so the bound voice is the
+                # hung reply's: the recovery line answers in the voice that was due to answer.
                 self._spawn(
-                    self._interrupt_session(recover_in=started_phase if recover else None)
+                    self._interrupt_session(
+                        recover_in=started_phase if recover else None,
+                        recover_voice=self._bound_voice(),
+                    )
                 )
             raise
         finally:
@@ -3169,12 +3301,14 @@ class R1Interview:
             for slot in self._speeches.values()
         )
 
-    async def _interrupt_session(self, *, recover_in: R1Phase | None = None) -> None:
+    async def _interrupt_session(
+        self, *, recover_in: R1Phase | None = None, recover_voice: str | None = None
+    ) -> None:
         """Cut a hung generation's speech, but never a protected scripted line.
 
         ``recover_in`` (the phase the hung reply was for) then speaks the recovery line
-        (``_speak_recovery``): the hung reply never said anything, and the candidate is
-        waiting for an answer.
+        (``_speak_recovery``) in ``recover_voice`` (the hung reply's): the hung reply never
+        said anything, and the candidate is waiting for an answer.
         """
         if not self._uninterruptible_speech_live():
             interrupt = getattr(self.session, "interrupt", None)
@@ -3192,13 +3326,14 @@ class R1Interview:
                         error_category=_error_type_of(exc),
                     )
         if recover_in is not None:
-            await self._speak_recovery(recover_in)
+            await self._speak_recovery(recover_in, voice=recover_voice)
 
-    async def _speak_recovery(self, phase: R1Phase) -> None:
+    async def _speak_recovery(self, phase: R1Phase, voice: str | None = None) -> None:
         """Say the safe fallback after a model reply that never spoke (the timeout path).
 
         The line is the guard's own fallback for a reply with nothing usable, in the voice
-        that was due to answer (the learner in role-play).  It is a scripted ``say``, so it
+        that was due to answer: ``voice`` (the hung reply's own), else the phase rule (the
+        learner in role-play).  It is a scripted ``say``, so it
         never counts as an answer from the provider and the failure count is left alone.
         Nothing is said to a candidate who has gone, once an abort is due, during exit, or when
         the phase the reply was for is over (the boundary line already answered the turn).
@@ -3211,12 +3346,11 @@ class R1Interview:
             or phase not in _REPLY_PHASES
         ):
             return
-        in_roleplay = phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE)
         await self._say_text(
             FALLBACK_REPLY,
             interruptible=True,
             marker="llm_recovery",
-            voice="learner" if in_roleplay else "interviewer",
+            voice=voice if voice in VOICES else self._voice_for_phase(phase),
         )
 
     def _record_generation_failure(self) -> None:
@@ -3473,6 +3607,11 @@ class R1Interview:
         if getattr(event, "source", None) == "generate_reply" and self._latest_reply is not None:
             # The SDK creates this speech right after the hook that prepared the reply.
             slot.reply, self._latest_reply = self._latest_reply, None
+        if getattr(event, "source", None) == "generate_reply":
+            # One voice per speech, fixed now: the learner's for a role-play reply (one planned
+            # in ASIDE included), Christy's otherwise.  Its TTS, filler, recovery line and label
+            # all read this value, so a reply never changes voice if the phase moves on.
+            self._voices[str(speech_id)] = self._reply_voice(slot.reply)
         self._speeches[speech_id] = slot
         if getattr(event, "source", None) == "generate_reply":
             self._open_replies.add(speech_id)
@@ -3524,6 +3663,9 @@ class R1Interview:
         slot = self._speeches.pop(speech_id, None)
         if speech_id is not None:
             self._latency.say_done(str(speech_id))
+            # Forgotten with its slot: an item reported after this finds no slot, so its label
+            # was never going to read this voice anyway.
+            self._voices.pop(str(speech_id), None)
         if slot is not None:
             self._note_reply_lost(slot, handle)
         if speech_id in self._open_replies:
@@ -3682,12 +3824,15 @@ class R1Interview:
     def _remember_bot_turn(
         self, index: int, phase: str, text: str, slot: _SpeechSlot | None
     ) -> None:
-        """Add a delivered bot line, with its voice, to the history the context filter reads."""
+        """Add a delivered bot line, with its voice, to the history the context filter reads.
+
+        The label is the voice the speech was bound to, which is the voice its audio used.
+        """
         handle_id = None if slot is None else getattr(slot.handle, "id", None)
-        voice = self._voices.pop(handle_id, None) if handle_id is not None else None
+        voice = self._voices.pop(str(handle_id), None) if handle_id is not None else None
         if voice is None:
             # A speech nobody tagged is an LLM reply: the learner's in role-play, else Christy's.
-            voice = "learner" if phase == ROLEPLAY_PHASE else "interviewer"
+            voice = LEARNER if phase == ROLEPLAY_PHASE else INTERVIEWER
         self._history.append(
             {"seq": index, "role": "bot", "text": text, "phase": phase, "voice": voice}
         )

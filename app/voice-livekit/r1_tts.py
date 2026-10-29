@@ -28,14 +28,32 @@ A fragment must contain a letter (Sarvam rejects a letter-free text with a 400),
 leading filler ("Mm,") merges forward into the first real clause, because Sarvam re-primes its
 prosody per call and a two-letter first fragment sounds choppy.
 
-This module logs nothing and imports no R1 module: ``r1_session`` supplies the callbacks.
+R1's two voices (owner decision 2026-10-30) are resolved here too, in pure code:
+
+* ``R1_TTS_PROFILE`` picks a WHOLE voice set, atomically.  ``v4`` (the default) is Bulbul v4
+  Flash with Christy as ``simran_en_customer`` and the learner as ``zarina_en_conversation``;
+  ``v3`` is exactly today's voice (``r1_tts_kwargs``, the browser screener's Simran) for both.
+  A model and a speaker are never set apart, because each half-applied flip fails badly on
+  plugin 1.6.4 (measured live 2026-10-29): bulbul:v3 with a v4 id raises ``ValueError`` when
+  the TTS is built, and bulbul:v4-flash with ``simran`` fails EVERY utterance in-band with a
+  400 that the plugin surfaces as a retryable status 500 (dead air, retried three times).
+* The plugin does not validate speakers for a model it does not know (``bulbul:v4-flash`` is
+  not in its compatibility table), so R1 allowlists its v4 ids itself (``V4_SPEAKERS``).
+* Who is speaking is bound per speech, in a ``ContextVar`` of the speech's own TTS task
+  (``bind_voice``): ``r1_sarvam.R1SarvamTTS.stream`` reads it, so concurrent speeches never
+  cross voices and the session's TTS instance is never mutated.
+
+This module logs nothing and imports no R1 module: ``r1_session`` supplies the callbacks, and
+turns the voice set's ``notes`` into log lines.
 """
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import inspect
 import os
-from typing import Any, AsyncIterable, AsyncIterator, Callable
+from dataclasses import dataclass
+from typing import Any, AsyncIterable, AsyncIterator, Callable, Mapping
 
 FLUSH_MIN_CHARS_DEFAULT = 60
 FIRST_FRAGMENT_MIN_ALPHA = 14
@@ -57,10 +75,11 @@ def flush_min_chars() -> int:
 
 
 def r1_tts_kwargs() -> dict[str, Any]:
-    """The Sarvam voice settings of R1: the session's TTS and the line cache share them.
+    """R1's ROLLBACK voice (``R1_TTS_PROFILE=v3``): today's Sarvam settings, for both voices.
 
-    One source, so a cached line is synthesised with exactly the voice a live line has (the
-    browser lane's variables and defaults, ``pace`` 1.0 and ``temperature`` 0.8).
+    The browser lane's variables and defaults, ``pace`` 1.0 and ``temperature`` 0.8.  Under v3
+    the session's TTS is ``sarvam.TTS(**r1_tts_kwargs())`` byte for byte, and the line cache
+    keys and synthesises with the same dict, so a cached line has exactly a live line's voice.
     """
     return {
         "model": os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
@@ -68,6 +87,200 @@ def r1_tts_kwargs() -> dict[str, Any]:
         "pace": 1.0,
         "temperature": 0.8,
     }
+
+
+# ------------------------------------------------------------------------------- voices
+
+INTERVIEWER = "interviewer"
+LEARNER = "learner"
+VOICES = (INTERVIEWER, LEARNER)
+
+PROFILE_V4 = "v4"
+PROFILE_V3 = "v3"
+PROFILE_DEFAULT = PROFILE_V4
+
+# The API model id.  There is no plain "bulbul:v4"; v4 Flash is the only v4 the API serves.
+V4_MODEL = "bulbul:v4-flash"
+V4_PACE = 1.0  # v4 accepts 0.5-2.0; R1 speaks at the v3 voice's pace
+V4_DEFAULT_SPEAKERS: Mapping[str, str] = {
+    INTERVIEWER: "simran_en_customer",  # "Simran - A confident and low female voice"
+    LEARNER: "zarina_en_conversation",  # "Zarina - A deep, full and flowing female voice"
+}
+# Every English id the live server listed for bulbul:v4-flash on 2026-10-29 (the list came back
+# inside a 400 and was cut short after ``simran_en_sales``), plus the server-listed ids the
+# smoke test named beyond that cut.  ``simran`` (the v3 short name) is NOT here: v4 rejects it.
+# A new id is a code change on purpose: the plugin does not validate v4 ids, and a wrong one is
+# dead air on every line (an in-band 400, retried three times).
+V4_SPEAKERS = frozenset(
+    {
+        "aditi_en_stories",
+        "amelia_en_conversational",
+        "aparna_en_companion",
+        "aparna_en_edtech",
+        "ashwin_en_sports",
+        "ashwin_en_sports_energetic",
+        "chandrika_en_stories",
+        "dev_en_conversational",
+        "dev_en_recovery",
+        "deven_en_conversation",
+        "ishita_en_customer",
+        "ishita_en_medical",
+        "ishita_en_numbers",
+        "ishita_en_social",
+        "ishita_en_stories",
+        "kalpit_en_edtech",
+        "nachiket_en_ads",
+        "neha_en_customer",
+        "neha_en_latenight",
+        "nupur_en_kids",
+        "ojas_en_social",
+        "ritu_en_edtech",
+        "ritu_en_latenight",
+        "ritu_en_medical",
+        "ritu_en_reels",
+        "rohan_en_recovery",
+        "roopa_en_conversational",
+        "rustom_en_suspense",
+        "sanchita_en_companion",
+        "sanchita_en_insurance",
+        "sanchita_en_market",
+        "sanchita_en_recovery",
+        "sanchita_en_social",
+        "shabana_en_edtech",
+        "shalini_en_companion",
+        "shalini_en_customer",
+        "shubh_en_ads",
+        "shubh_en_audiobook",
+        "shubh_en_narration",
+        "shubh_en_narration_gentle",
+        "shubh_en_numbers",
+        "shubh_en_recovery",
+        "shubh_en_sports",
+        "simran_en_ads",
+        "simran_en_automobile",
+        "simran_en_conversation",
+        "simran_en_customer",
+        "simran_en_edtech",
+        "simran_en_edtech_bot",
+        "simran_en_narration",
+        "simran_en_recovery",
+        "simran_en_sales",
+        "simran_enhi_customer",
+        "sophia_en_conversational",
+        "zarina_en_conversation",
+    }
+)
+
+NOTE_PROFILE_UNKNOWN = "profile_unknown"
+
+
+def voice_role(voice: Any) -> str:
+    """``voice`` as one of ``VOICES``; anything else is the interviewer (never raises)."""
+    return voice if voice in VOICES else INTERVIEWER
+
+
+@dataclass(frozen=True)
+class R1VoiceSet:
+    """Who R1's two voices are: one Sarvam kwargs dict per role, both on ONE model.
+
+    ``profile`` is ``v4`` or ``v3``; ``notes`` are labels for settings that were refused
+    (``profile_unknown``, ``interviewer_voice_rejected``, ``learner_voice_rejected``).  Two
+    models can never be mixed: the plugin's socket pool is keyed on the model, and a set that
+    tried would be a half-applied flip, so ``__post_init__`` refuses it.
+    """
+
+    profile: str
+    interviewer: Mapping[str, Any]
+    learner: Mapping[str, Any]
+    notes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "interviewer", dict(self.interviewer))
+        object.__setattr__(self, "learner", dict(self.learner))
+        object.__setattr__(self, "notes", tuple(self.notes))
+        if self.interviewer.get("model") != self.learner.get("model"):
+            raise ValueError("both R1 voices must use one TTS model")
+
+    def kwargs(self, voice: Any = INTERVIEWER) -> dict[str, Any]:
+        """A copy of the Sarvam kwargs of ``voice`` (an unknown role is the interviewer)."""
+        return dict(self.learner if voice_role(voice) == LEARNER else self.interviewer)
+
+    def speaker(self, voice: Any = INTERVIEWER) -> str:
+        return str(self.kwargs(voice).get("speaker"))
+
+    @property
+    def model(self) -> str:
+        return str(self.interviewer.get("model"))
+
+    @property
+    def distinct(self) -> bool:
+        """True when the two roles really are two voices (v4), False when they share one (v3)."""
+        return self.interviewer != self.learner
+
+
+def legacy_voice_set(notes: tuple[str, ...] = ()) -> R1VoiceSet:
+    """The v3 set: BOTH roles are exactly ``r1_tts_kwargs()`` (today's voice, the rollback)."""
+    kwargs = r1_tts_kwargs()
+    return R1VoiceSet(PROFILE_V3, kwargs, dict(kwargs), notes)
+
+
+def _v4_speaker(role: str, raw: str | None, notes: list[str]) -> str:
+    """An override of ``role``'s v4 id, if it is allowlisted; otherwise the owner's default.
+
+    Unset or empty is the default with no note.  A value is stripped; one that is blank or not
+    in ``V4_SPEAKERS`` (``simran``, a typo) keeps the default and notes ``<role>_voice_rejected``.
+    """
+    if raw is None or raw == "":
+        return V4_DEFAULT_SPEAKERS[role]
+    value = raw.strip()
+    if value in V4_SPEAKERS:
+        return value
+    notes.append(f"{role}_voice_rejected")
+    return V4_DEFAULT_SPEAKERS[role]
+
+
+def r1_voice_set() -> R1VoiceSet:
+    """R1's voices for this session, read from the environment (once per session).
+
+    ``R1_TTS_PROFILE`` unset, empty or ``v4`` is the v4 set; ``v3`` is the legacy set; any other
+    value is the legacy set too, noted ``profile_unknown`` (an unknown value is most likely a
+    typo made during a rollback, so the known-good voice wins).  The overrides
+    ``R1_TTS_INTERVIEWER_VOICE`` and ``R1_TTS_LEARNER_VOICE`` apply in v4 only, and v4 ignores
+    ``SARVAM_TTS_*`` (those stay the browser screener's voice).  v4 sends no temperature (the
+    plugin never sends one for a non-v3 model) and keeps the plugin's en-IN and 22050 Hz.
+    """
+    profile = (os.getenv("R1_TTS_PROFILE") or "").strip().lower()
+    if profile == PROFILE_V3:
+        return legacy_voice_set()
+    if profile not in ("", PROFILE_V4):
+        return legacy_voice_set((NOTE_PROFILE_UNKNOWN,))
+    notes: list[str] = []
+    interviewer = _v4_speaker(INTERVIEWER, os.getenv("R1_TTS_INTERVIEWER_VOICE"), notes)
+    learner = _v4_speaker(LEARNER, os.getenv("R1_TTS_LEARNER_VOICE"), notes)
+    return R1VoiceSet(
+        PROFILE_V4,
+        {"model": V4_MODEL, "speaker": interviewer, "pace": V4_PACE},
+        {"model": V4_MODEL, "speaker": learner, "pace": V4_PACE},
+        tuple(notes),
+    )
+
+
+# Whose line the TTS of THIS task is speaking.  Set by ``r1_session`` at the top of its
+# ``tts_node`` (which the SDK calls synchronously inside each speech's own TTS task), so it is
+# local to that speech: a concurrent speech has its own task context and its own value.
+_BOUND_VOICE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "r1_tts_voice", default=None
+)
+
+
+def bind_voice(voice: Any) -> None:
+    """Bind ``voice`` (a role, or None) to the current task's context from here on."""
+    _BOUND_VOICE.set(voice if voice in VOICES else None)
+
+
+def current_voice() -> str | None:
+    """The voice bound in this task's context, or None when nothing bound one."""
+    return _BOUND_VOICE.get()
 
 
 def speakable(text: str) -> bool:

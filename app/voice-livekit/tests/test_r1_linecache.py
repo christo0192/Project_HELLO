@@ -842,6 +842,186 @@ class TestBuildLineCache(unittest.TestCase):
                 self.assertEqual(synths_per_minute(), expected)
 
 
+V3 = {"model": "bulbul:v3", "speaker": "simran", "pace": 1.0, "temperature": 0.8}
+V4_CHRISTY = {"model": "bulbul:v4-flash", "speaker": "simran_en_customer", "pace": 1.0}
+V4_LEARNER = {"model": "bulbul:v4-flash", "speaker": "zarina_en_conversation", "pace": 1.0}
+# Today's single-voice key of this text at 22050 Hz mono, computed with the cache before it
+# had voices (2026-10-30).  Under v3 the two-voice cache must keep it byte for byte, or every
+# machine would re-synthesise its disk cache on the deploy.
+GOLDEN_TEXT = "Let's pause the role-play here."
+GOLDEN_V3_DIGEST = "638766b0ce03a2a27f02e11c702f719ed4fd69ba"
+
+
+def two_voice_cache(learner, christy, **options):
+    source = FakeTime()
+    events = Events()
+    bucket = options.pop("bucket", None) or SynthesisBucket(
+        600, burst=100, clock=source, sleep=source.sleep
+    )
+    cache = LineCache(
+        christy,
+        voice=V4_CHRISTY,
+        voices={"interviewer": V4_CHRISTY, "learner": V4_LEARNER},
+        synthesizers={"interviewer": christy, "learner": learner},
+        sample_rate=RATE,
+        bucket=bucket,
+        counter=RateLimitCounter(),
+        on_event=events,
+        clock=source,
+        jitter=lambda: 0.5,
+        **options,
+    )
+    return cache, events, source
+
+
+class TestVoices(unittest.IsolatedAsyncioTestCase):
+    """Each line is keyed and synthesised in its own voice (owner decision 2026-10-30)."""
+
+    async def test_in_v3_both_voices_share_todays_key(self) -> None:
+        cache = LineCache(FakeSynthesizer(), voice=V3, sample_rate=RATE)
+        self.assertEqual(cache.key(GOLDEN_TEXT), GOLDEN_V3_DIGEST)
+        self.assertEqual(cache.key(GOLDEN_TEXT, "learner"), GOLDEN_V3_DIGEST)
+        self.assertEqual(cache.key(GOLDEN_TEXT, "interviewer"), GOLDEN_V3_DIGEST)
+        # What build_line_cache makes of a plain (v3) session TTS keys the same.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            for key in ("SARVAM_TTS_MODEL", "SARVAM_TTS_VOICE", "R1_LINE_CACHE"):
+                os.environ.pop(key, None)
+            built = build_line_cache(
+                SimpleNamespace(tts=SimpleNamespace(sample_rate=RATE, num_channels=1)),
+                synthesizer_factory=lambda _kwargs: FakeSynthesizer(),
+            )
+        self.assertEqual(built.key(GOLDEN_TEXT, "learner"), GOLDEN_V3_DIGEST)
+        # LineSpec keeps its positional shape; the voice defaults to the interviewer.
+        self.assertEqual(LineSpec("L-EXIT", "text", True).voice, "interviewer")
+
+    async def test_a_learner_line_is_keyed_and_synthesised_in_the_learner_voice(self) -> None:
+        learner, christy = FakeSynthesizer(), FakeSynthesizer()
+        cache, _, _ = two_voice_cache(learner, christy)
+        text = "Hello? Who is this?"
+        self.assertNotEqual(cache.key(text, "learner"), cache.key(text, "interviewer"))
+        await cache.warm([LineSpec("L-PICKUP", text, True, voice="learner")])
+        self.assertEqual(learner.texts, [text])
+        self.assertEqual(christy.texts, [])
+        self.assertIsNotNone(cache.lookup(text, "learner"))
+        self.assertIsNone(cache.lookup(text, "interviewer"))
+        self.assertIsNone(cache.lookup(text))  # the default role is the interviewer
+        # An unknown role is the interviewer, so the speech path never raises.
+        self.assertEqual(cache.key(text, "narrator"), cache.key(text, "interviewer"))
+        await cache.warm([LineSpec("L-X", text, True, voice="narrator")])
+        self.assertEqual(christy.texts, [text])
+        self.assertIsNotNone(cache.lookup(text, "interviewer"))
+
+    async def test_one_bucket_paces_both_voices(self) -> None:
+        source = FakeTime()
+        bucket = SynthesisBucket(60, burst=1, clock=source, sleep=source.sleep)
+        stamps: list[tuple[str, float]] = []
+
+        def recorder(name):
+            async def synth(text: str) -> PcmClip:
+                stamps.append((name, source.now))
+                return clip()
+
+            return synth
+
+        cache = LineCache(
+            recorder("christy"),
+            voice=V4_CHRISTY,
+            voices={"learner": V4_LEARNER},
+            synthesizers={"learner": recorder("learner")},
+            sample_rate=RATE,
+            bucket=bucket,
+            counter=RateLimitCounter(),
+            clock=source,
+        )
+        specs = [
+            LineSpec(f"L-{n}", f"line {n}", False, voice="learner" if n % 2 else "interviewer")
+            for n in range(4)
+        ]
+        await cache.warm(specs)
+        self.assertEqual([name for name, _ in stamps], ["christy", "learner"] * 2)
+        gaps = [later - earlier for (_, earlier), (_, later) in zip(stamps, stamps[1:])]
+        self.assertEqual(gaps, [bucket.interval] * 3)  # one interval apart, whatever the voice
+
+    async def test_failures_in_either_voice_count_toward_the_abort(self) -> None:
+        learner = FakeSynthesizer(RuntimeError("down"), RuntimeError("down"))
+        christy = FakeSynthesizer(RuntimeError("down"), clip())
+        cache, events, _ = two_voice_cache(learner, christy)
+        specs = [
+            LineSpec("L-A", "a", True, voice="learner"),
+            LineSpec("L-B", "b", True, voice="interviewer"),
+            LineSpec("L-C", "c", True, voice="learner"),
+            LineSpec("L-D", "d", True, voice="interviewer"),
+        ]
+        await cache.warm(specs)
+        self.assertEqual(learner.texts, ["a", "c"])
+        self.assertEqual(christy.texts, ["b"])  # the third failure in a row stopped the warm-up
+        self.assertIn("warm_aborted", events.kinds())
+
+    async def test_closing_closes_each_synthesizer_once(self) -> None:
+        learner, christy = FakeSynthesizer(), FakeSynthesizer()
+        cache, _, _ = two_voice_cache(learner, christy)
+        await cache.aclose()
+        self.assertEqual((learner.closed, christy.closed), (1, 1))
+        shared = FakeSynthesizer()
+        cache = LineCache(shared, voice=V3, sample_rate=RATE)
+        await cache.aclose()
+        self.assertEqual(shared.closed, 1)
+
+
+class TestBuildLineCacheVoices(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for key in ("R1_LINE_CACHE", "R1_TTS_PROFILE", "SARVAM_TTS_VOICE", "SARVAM_TTS_MODEL"):
+            os.environ.pop(key, None)
+        self.seen: list[dict] = []
+
+    def factory(self, kwargs):
+        self.seen.append(dict(kwargs))
+        return FakeSynthesizer()
+
+    def test_build_line_cache_takes_the_voices_from_the_session_tts(self) -> None:
+        import r1_tts
+
+        voices = r1_tts.r1_voice_set()  # v4: R1_TTS_PROFILE is unset
+        tts = SimpleNamespace(sample_rate=RATE, num_channels=1, r1_voice_set=voices)
+        cache = build_line_cache(SimpleNamespace(tts=tts), synthesizer_factory=self.factory)
+        self.assertEqual(self.seen, [V4_CHRISTY, V4_LEARNER])
+        self.assertEqual(
+            cache.key("x", "learner"),
+            LineCache(FakeSynthesizer(), voice=V4_LEARNER, sample_rate=RATE).key("x"),
+        )
+        # A plain TTS is today's voice, even when the environment says v4 (a build fallback).
+        self.seen.clear()
+        plain = SimpleNamespace(sample_rate=RATE, num_channels=1)
+        cache = build_line_cache(SimpleNamespace(tts=plain), synthesizer_factory=self.factory)
+        self.assertEqual(self.seen, [V3])
+        self.assertEqual(cache.key("x", "learner"), cache.key("x", "interviewer"))
+        # Something that only looks like a voice set is ignored too.
+        self.seen.clear()
+        odd = SimpleNamespace(
+            sample_rate=RATE, num_channels=1, r1_voice_set={"learner": V4_LEARNER}
+        )
+        build_line_cache(SimpleNamespace(tts=odd), synthesizer_factory=self.factory)
+        self.assertEqual(self.seen, [V3])
+
+    def test_the_v4_cache_builds_two_rest_synthesizers_and_v3_one(self) -> None:
+        import r1_tts
+
+        voices = r1_tts.r1_voice_set()
+        tts = SimpleNamespace(sample_rate=RATE, num_channels=1, r1_voice_set=voices)
+        cache = build_line_cache(SimpleNamespace(tts=tts))
+        synths = {role: cache._synthesizers[role] for role in r1_tts.VOICES}
+        self.assertIsInstance(synths["learner"], SarvamSynthesizer)
+        self.assertIsNot(synths["learner"], synths["interviewer"])
+        self.assertEqual(synths["learner"]._kwargs, V4_LEARNER)
+        plain = SimpleNamespace(sample_rate=RATE, num_channels=1)
+        cache = build_line_cache(SimpleNamespace(tts=plain))
+        self.assertIs(cache._synthesizers["learner"], cache._synthesizers["interviewer"])
+        self.assertEqual(cache._synthesizers["learner"]._kwargs, V3)
+
+
 class TestModuleSurface(unittest.TestCase):
     def test_the_module_imports_no_phone_session_or_sdk_code_at_import_time(self) -> None:
         tree = ast.parse(Path(r1_linecache.__file__).read_text(encoding="utf-8"))

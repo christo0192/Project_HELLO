@@ -27,6 +27,15 @@ The synthesis uses a SEPARATE ``sarvam.TTS`` instance.  The session's own TTS re
 error to the session, where three unrecoverable ones end the interview; a failed background
 synthesis must never be able to do that.
 
+Each line is keyed and synthesised in ITS voice (``LineSpec.voice``: the interviewer, or the
+learner for L-PICKUP and L-SIL-RP1).  The voices come from the session's TTS
+(``r1_voice_set``, ``r1_tts.R1VoiceSet``); a plain TTS means the legacy v3 set, never a fresh
+read of the environment, so a cached line and a live line always agree.  Under v3 both roles
+are ``r1_tts_kwargs()`` and every key is byte-identical to the single-voice cache's (no version
+bump); under v4 the keys differ by model and speaker, so a learner clip and a Christy clip of
+the same text never collide.  One synthesizer is built per DISTINCT voice (one under v3, two
+REST ``sarvam.TTS`` under v4) and one request bucket paces them all.
+
 This module logs nothing: ``on_event`` is the single reporting seam and ``r1_session`` turns
 each event into one ``r1`` log line.
 """
@@ -46,7 +55,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Mapping, Sequence
 
 from r1_script import line_sha256
-from r1_tts import r1_tts_kwargs
+from r1_tts import INTERVIEWER, VOICES, R1VoiceSet, legacy_voice_set, voice_role
 
 LANE_R1 = "r1"
 DEFAULT_SYNTHS_PER_MINUTE = 5
@@ -377,12 +386,13 @@ class SarvamSynthesizer:
 
 @dataclass(frozen=True)
 class LineSpec:
-    """One line to warm: its reviewed id, its exact rendered text and whether it may be kept
-    on disk (only a line with no candidate PII may)."""
+    """One line to warm: its reviewed id, its exact rendered text, whether it may be kept
+    on disk (only a line with no candidate PII may) and the voice that speaks it."""
 
     line_id: str
     text: str
     persist: bool
+    voice: str = INTERVIEWER
 
 
 class LineCache:
@@ -392,6 +402,10 @@ class LineCache:
     ``disk_corrupt``, ``disk_write_failed``, ``disk_full``, ``synth_ok`` (``seconds``),
     ``synth_failed`` (``error``), ``rate_limited`` (``count``, ``seconds``), ``gave_up``,
     ``clip_rejected``, ``warm_aborted`` and ``warm_done`` (``count``).
+
+    ``voice`` and ``synthesizer`` serve every role; ``voices`` and ``synthesizers`` (keyed by
+    ``r1_tts.VOICES``) override them per role.  An unknown role is the interviewer, so the
+    speech path never raises.
     """
 
     def __init__(
@@ -399,6 +413,8 @@ class LineCache:
         synthesizer: Synthesizer,
         *,
         voice: Mapping[str, Any],
+        voices: Mapping[str, Mapping[str, Any]] | None = None,
+        synthesizers: Mapping[str, Synthesizer] | None = None,
         sample_rate: int,
         channels: int = 1,
         directory: Path | None = None,
@@ -411,8 +427,14 @@ class LineCache:
         max_clip_seconds: float = MAX_CLIP_SECONDS,
         max_files: int = MAX_CACHE_FILES,
     ) -> None:
-        self._synthesizer = synthesizer
-        self._voice = dict(voice)
+        self._voices: dict[str, dict[str, Any]] = {role: dict(voice) for role in VOICES}
+        self._synthesizers: dict[str, Synthesizer] = {role: synthesizer for role in VOICES}
+        for role, kwargs in (voices or {}).items():
+            if role in VOICES:
+                self._voices[role] = dict(kwargs)
+        for role, synth in (synthesizers or {}).items():
+            if role in VOICES:
+                self._synthesizers[role] = synth
         self._rate = sample_rate
         self._channels = channels
         self._directory = directory
@@ -436,20 +458,25 @@ class LineCache:
     def channels(self) -> int:
         return self._channels
 
-    def key(self, text: str) -> str:
-        """The cache key: the digest of the exact text and of the voice that speaks it."""
+    def key(self, text: str, voice: str = INTERVIEWER) -> str:
+        """The cache key: the digest of the exact text and of the voice that speaks it.
+
+        Only the voice's resolved kwargs enter the key, never the role's name: under v3 both
+        roles are today's single voice and the key is the single-voice cache's, byte for byte.
+        """
         document = {
             "v": CACHE_VERSION,
             "text": line_sha256(text),
-            "voice": self._voice,
+            "voice": self._voices[voice_role(voice)],
             "rate": self._rate,
             "channels": self._channels,
         }
         return sha256(json.dumps(document, sort_keys=True).encode("utf-8")).hexdigest()[:40]
 
-    def lookup(self, text: str) -> PcmClip | None:
-        """The warmed clip for ``text``, from memory only (cheap enough for the speech path)."""
-        return self._memory.get(self.key(text))
+    def lookup(self, text: str, voice: str = INTERVIEWER) -> PcmClip | None:
+        """The warmed clip of ``text`` in ``voice``, from memory only (cheap enough for the
+        speech path)."""
+        return self._memory.get(self.key(text, voice))
 
     @property
     def size(self) -> int:
@@ -467,7 +494,7 @@ class LineCache:
         stats = {"memory": 0, "disk": 0, "synthesized": 0, "failed": 0}
         consecutive = 0
         for spec in specs:
-            key = self.key(spec.text)
+            key = self.key(spec.text, spec.voice)
             if key in self._memory:
                 stats["memory"] += 1
                 continue
@@ -495,10 +522,16 @@ class LineCache:
         return stats
 
     async def aclose(self) -> None:
-        close = getattr(self._synthesizer, "aclose", None)
-        if callable(close):
-            with contextlib.suppress(Exception):
-                await close()
+        """Close each synthesizer once (under v3 both roles share one)."""
+        closed: set[int] = set()
+        for synth in self._synthesizers.values():
+            if id(synth) in closed:
+                continue
+            closed.add(id(synth))
+            close = getattr(synth, "aclose", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    await close()
 
     # ---------------------------------------------------------------------- internals
 
@@ -519,9 +552,8 @@ class LineCache:
             await self._bucket.acquire()
             started = self._clock()  # the synthesis itself, not the wait for the bucket
             try:
-                clip = await asyncio.wait_for(
-                    self._synthesizer(spec.text), self._synth_timeout
-                )
+                synthesizer = self._synthesizers[voice_role(spec.voice)]
+                clip = await asyncio.wait_for(synthesizer(spec.text), self._synth_timeout)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 - every failure is just a cache miss
@@ -595,7 +627,10 @@ def build_line_cache(
     """The cache for ``session``, or None (disabled, no real TTS, or the TTS format is unknown).
 
     The cached audio must be in the format the session's audio output was opened with, so the
-    cache is only built from the session TTS's own ``sample_rate`` and ``num_channels``.
+    cache is only built from the session TTS's own ``sample_rate`` and ``num_channels``.  The
+    voices are the session TTS's own too (``r1_voice_set`` on an ``R1SarvamTTS``); any other
+    TTS is the legacy v3 set.  ``synthesizer_factory(kwargs)`` is called once per DISTINCT
+    voice: once under v3 (today's single synthesizer, shared by both roles), twice under v4.
     """
     if not line_cache_enabled():
         return None
@@ -609,13 +644,27 @@ def build_line_cache(
         or not isinstance(channels, int)
     ):
         return None
-    kwargs = r1_tts_kwargs()
-    synthesizer = (
-        synthesizer_factory(kwargs) if synthesizer_factory is not None else SarvamSynthesizer(kwargs)
-    )
+    voice_set = getattr(tts, "r1_voice_set", None)
+    if not isinstance(voice_set, R1VoiceSet):
+        voice_set = legacy_voice_set()
+    built: list[tuple[dict[str, Any], Synthesizer]] = []
+    synthesizers: dict[str, Synthesizer] = {}
+    for role in VOICES:
+        kwargs = voice_set.kwargs(role)
+        synthesizer = next((synth for seen, synth in built if seen == kwargs), None)
+        if synthesizer is None:
+            synthesizer = (
+                synthesizer_factory(kwargs)
+                if synthesizer_factory is not None
+                else SarvamSynthesizer(kwargs)
+            )
+            built.append((kwargs, synthesizer))
+        synthesizers[role] = synthesizer
     return LineCache(
-        synthesizer,
-        voice=kwargs,
+        synthesizers[INTERVIEWER],
+        voice=voice_set.kwargs(INTERVIEWER),
+        voices={role: voice_set.kwargs(role) for role in VOICES},
+        synthesizers=synthesizers,
         sample_rate=rate,
         channels=channels,
         directory=default_directory() if directory is None else directory,
