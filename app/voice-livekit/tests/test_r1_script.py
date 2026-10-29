@@ -110,21 +110,19 @@ class TableTests(unittest.TestCase):
             self.assertIn("Christy", LINES[line_id])
 
     def test_the_end_request_lines(self):
-        # Owner test 7f2a25e6: the one question after "can you disconnect the call?", and the close
-        # after a yes.  Neither carries the candidate's name, so both are cached across sessions,
-        # and the close promises no review (the session ends as candidate_left, unscored).
+        # Owner test 7f2a25e6: the one question after "can you disconnect the call?".  It carries
+        # no candidate name, so it is cached across sessions, and its text is owner-approved.
+        # Owner decision 2026-10-29 (owner test 1eb18cd4): a confirmed stop ends the role-play and
+        # L-EXIT and the wrap-up follow, so the close that ended the whole session is gone.
         self.assertEqual(
             LINES["L-ASIDE-END"],
             "This is Christy, your interviewer. If you want to end the interview now, please say: "
             "end the interview. Otherwise, just carry on with {lead_name}.",
         )
         self.assertEqual(placeholders("L-ASIDE-END"), {"lead_name"})
-        self.assertEqual(placeholders("L-END-CLOSE"), frozenset())
         self.assertIn("L-ASIDE-END", CANDIDATE_FREE_LINES)
-        self.assertIn("L-END-CLOSE", NAME_FREE_LINES)
-        self.assertIn("Goodbye.", LINES["L-END-CLOSE"])
-        self.assertNotIn("review", LINES["L-END-CLOSE"])
-        self.assertNotIn("role-play", LINES["L-END-CLOSE"])
+        self.assertNotIn("L-END-CLOSE", LINES)
+        self.assertNotIn("L-END-CLOSE", NAME_FREE_LINES)
         for persona in PERSONAS:
             for variant in persona.variants:
                 values = resolve_persona(persona.id, variant=variant.id).line_values

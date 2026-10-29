@@ -103,7 +103,10 @@ import r1_world
 # lone backchannel that cut her gets her point finished in one sentence (BACKCHANNEL_CUT_NOTE), and
 # one that only asked her to say it again ("Sorry?", "Pardon?") or checked she was there gets it
 # said again (CUT_REPEAT_NOTE; reviewed fix, same unreleased revision).
-PINNED_CONTENT_SHA256 = "94c62a50e2ec3f7654eb6b667e7c5d13916938f24d3612cc2d3a11d4324c7fd4"
+# Revision 17 (owner test 1eb18cd4, owner decision 2026-10-29): a confirmed out-of-role stop ends
+# the role-play into L-EXIT and the interviewer's wrap-up instead of the whole session, so the short
+# close L-END-CLOSE is deleted.  L-ASIDE-END and every other pinned text are unchanged.
+PINNED_CONTENT_SHA256 = "2bbbe573e2630a1b74dd41eb4ef2abc24a4700f42f7ca2694f2a89c98b806423"
 
 CONTENT_MODULES = (
     "r1_text",

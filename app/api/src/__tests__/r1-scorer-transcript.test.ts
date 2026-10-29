@@ -24,6 +24,7 @@ import {
   parseEvidenceRef,
 } from '../lib/r1/evidence.js';
 import { parseR1AdministrationLog } from '../lib/r1/admin-log.js';
+import { R1_GATE_LIMITS } from '../lib/r1/gate.js';
 import { cleanLogRows, interviewRows } from './support/r1-scorer.js';
 
 const turn = (
@@ -362,6 +363,119 @@ describe('transcript stats', () => {
     expect(wordCount('  two   words ')).toBe(2);
     expect(isNonLexical('?!')).toBe(true);
     expect(isNonLexical('हाँ')).toBe(false);
+  });
+});
+
+describe('speech-to-text sanity under voice barge-in (owner test 1eb18cd4)', () => {
+  // The owner's 38 role-play candidate turns (rows 18-81). The short ones are verbatim; a long one
+  // is cut to its opening words, since the check reads only how many words a turn has and whether
+  // it only acknowledges. Eight are two words or fewer (21%), seven of them acknowledgements.
+  const OWNER_ROLEPLAY: readonly (readonly [number, string])[] = [
+    [18, 'I wanted to understand this, uh, this round, the role play brief.'],
+    [19, 'Hi Pooja'],
+    [20, 'You filled form on our website for data science.'],
+    [21, 'Of course, are you looking for some kind of upgrade, upgradation, or what exactly'],
+    [23, 'Hey, what is your, what is your name again?'],
+    [25, 'Hey, what is your name?'],
+    [26, 'Okay'],
+    [28, "Oh, it's okay. Uh, yeah, got it, Pooja. So,"],
+    [29, 'Yes, I was asking that you filled form at our website'],
+    [30, 'Could you please let me know like which company you are working right now'],
+    [32, 'Okay, got it. So, do you have any idea about like you know how much time'],
+    [34, 'Okay'],
+    [36, 'Yeah, Okay'],
+    [38, 'Yeah, okay, perfect.'],
+    [40, 'Okay, continue.'],
+    [42, 'Hmm'],
+    [44, 'Okay, one more thing, are you looking for a video kind of course or self-paced'],
+    [46, 'See, YouTube and Coursera are actually good. You can learn from there'],
+    [48, "Yeah, that's true. And because layoffs is there, that's why it's very important"],
+    [49, 'which is not the current requirement. And that you will be getting here.'],
+    [50, 'Uh, the layoff part. See, layoff is happening.'],
+    [52, 'So we have a course plan of around 23 weeks and honestly'],
+    [53, 'Student portal as well from where you can track everything'],
+    [55, 'Yeah, we do have support. So we have We have some instructor dedicated'],
+    [56, "the path, the material, but it's going to be on your own only, to be honest."],
+    [58, 'Yeah, sure. I think I will do one thing. I will be sharing you'],
+    [59, 'the complete curriculum course thing so that you can you know have a look'],
+    [61, "Well, yeah, we, it's it's possible that people got this course in 7000."],
+    [63, 'Yeah, we do. Like, see, 9000 is a is a amount which which you can do.'],
+    [65, 'Yeah, okay, sure.'],
+    [67, 'Okay'],
+    [69, 'Yeah, sure, sure. And also, you know, like, um, Hello'],
+    [71, 'Yeah, okay.'],
+    [73, "Yeah, sure. Okay, let's end this interview for now."],
+    [75, 'Sure. Can we end this interview? Can we end this role play?'],
+    [77, 'End the interview'],
+    [79, 'And the interview'],
+    [81, "Let's end the interview."],
+  ];
+  const ownerTurns = OWNER_ROLEPLAY.map(
+    ([index, text]) => turn(index, 'candidate', 'roleplay', text),
+  );
+  const FAIL_AT = R1_GATE_LIMITS.STT_SUSPECT_SHARE_FAIL_AT;
+
+  it('passes once acknowledgement-only turns are left out (it failed at 21% before)', () => {
+    const stats = computeTranscriptStats(ownerTurns);
+    expect(stats.candidateRoleplayTurns).toBe(38);
+    expect(stats.candidateRoleplayAcknowledgementTurns).toBe(8);
+    expect(stats.suspectShare).toBeCloseTo(1 / 30); // "Hi Pooja" only
+    expect(stats.suspectShare).toBeLessThan(FAIL_AT);
+    // The qualifying-turn count still reads every row ("Yeah, okay, sure." has three words).
+    expect(stats.candidateRoleplayQualifyingTurns).toBe(30);
+    // The old reading (every short row suspect): 8 of 38, which failed the gate.
+    const short = ownerTurns.filter((t) => wordCount(t.text) <= 2).length;
+    expect(short / ownerTurns.length).toBeGreaterThanOrEqual(FAIL_AT);
+  });
+
+  it('still fails real short fragments, and acknowledgements do not water them down', () => {
+    const long = Array.from({ length: 20 }, (_, i) =>
+      turn(i, 'candidate', 'roleplay', 'Our curriculum covers python, sql and machine learning.'));
+    const fragments = ['Hi Pooja', 'the price', 'So bye', 'Yes.'].map((text, i) =>
+      turn(100 + i, 'candidate', 'roleplay', text));
+    const failing = computeTranscriptStats([...long, ...fragments]);
+    expect(failing.suspectShare).toBeCloseTo(4 / 24);
+    expect(failing.suspectShare).toBeGreaterThanOrEqual(FAIL_AT);
+    // Three fragments in 23 turns fail even beside twenty lone "Okay" turns (3 in 43 if counted).
+    const okays = Array.from({ length: 20 }, (_, i) =>
+      turn(200 + i, 'candidate', 'roleplay', 'Okay'));
+    const diluted = computeTranscriptStats([...long, ...fragments.slice(0, 3), ...okays]);
+    expect(diluted.candidateRoleplayAcknowledgementTurns).toBe(20);
+    expect(diluted.suspectShare).toBeCloseTo(3 / 23);
+    expect(diluted.suspectShare).toBeGreaterThanOrEqual(FAIL_AT);
+  });
+
+  it('fails closed on nothing but acknowledgements, and reads only the role-play', () => {
+    const okays = Array.from({ length: 12 }, (_, i) => turn(i, 'candidate', 'roleplay', 'Okay.'));
+    expect(computeTranscriptStats(okays).suspectShare).toBe(1);
+    const icebreaker = computeTranscriptStats([
+      turn(1, 'candidate', 'icebreaker', 'Okay'),
+      turn(2, 'candidate', 'roleplay', 'what is your goal here'),
+    ]);
+    expect(icebreaker.candidateRoleplayAcknowledgementTurns).toBe(0);
+    expect(icebreaker.suspectShare).toBe(0);
+  });
+
+  it('leaves out the out-of-role stop, which the worker writes as an aside row', () => {
+    // A confirmed stop exits into the wrap-up and the session is gated as usual. The worker's own
+    // fidelity never counts the turn that confirms it ("End interview.", "Stop.", "I'm done."),
+    // and it writes that row with phase 'aside' (reviewed fix: it was 'roleplay', so a two-word
+    // confirmation was a suspect fragment here and the two checks could disagree).
+    const long = Array.from({ length: 10 }, (_, i) =>
+      turn(i, 'candidate', 'roleplay', 'Our curriculum covers python, sql and machine learning.'));
+    const fragment = turn(20, 'candidate', 'roleplay', 'the price');
+    const stats = computeTranscriptStats([
+      ...long, fragment, turn(21, 'candidate', 'aside', 'End interview.'),
+    ]);
+    expect(stats.candidateRoleplayTurns).toBe(11);
+    expect(stats.suspectShare).toBeCloseTo(1 / 11);
+    expect(stats.suspectShare).toBeLessThan(FAIL_AT);
+    // Written as a role-play row, the same confirmation would have failed the session.
+    const asRoleplay = computeTranscriptStats([
+      ...long, fragment, turn(21, 'candidate', 'roleplay', 'End interview.'),
+    ]);
+    expect(asRoleplay.suspectShare).toBeCloseTo(2 / 12);
+    expect(asRoleplay.suspectShare).toBeGreaterThanOrEqual(FAIL_AT);
   });
 });
 

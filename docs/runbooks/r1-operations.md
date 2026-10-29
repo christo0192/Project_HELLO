@@ -1393,7 +1393,7 @@ Christy's icebreaker questions, and the `llm_recovery` fallback
 line. Every line spoken through `say()` keeps `allow_interruptions=False` exactly as before, so the
 SDK neither pauses nor cuts it: L-OPEN (consent and disclosure), L-PICKUP, L-TRANSITION,
 L-TRANSITION-NUDGE, the silence prompts and L-SIL-END, L-MUTE, L-REJOIN and L-REJOIN-RP, L-EXIT,
-L-WRAP, L-CLOSE, L-SYSTEM-STOP, L-END-CLOSE and the interviewer's asides L-ASIDE-COACH and
+L-WRAP, L-CLOSE, L-SYSTEM-STOP and the interviewer's asides L-ASIDE-COACH and
 L-ASIDE-END (`tests/test_r1_core.py` `TestWhatTheCandidateCanCut`).
 
 What the role-play does after the candidate cut the learner (`r1_roleplay`):
@@ -1526,6 +1526,22 @@ the latency work above (PR-4c) and on the filler, not on `min_words` alone. At t
   loses at most the one open row. With the 3-word rollback, a fragment the SDK banked (refused over
   a reply) joins the next committed turn's row, as it joins that turn's text; at 0 words nothing is
   banked and every committed turn is its own row.
+* **Speech-to-text sanity leaves acknowledgements out (owner test 1eb18cd4, 2026-10-29).** At 0 words
+  every lone "Okay", "Hmm", "Yeah, okay" or hand-back ("Okay, continue.", "go ahead") is a committed
+  role-play turn of its own, where the SDK used to bank it into the next one: 8 of the owner's 38
+  role-play turns were two words or fewer (21%) and `stt_sanity` failed an otherwise normal session.
+  A turn that only acknowledges or hands the floor back (`r1_session.is_acknowledgement_turn`, the
+  verdict the engine already gets as `backchannel=`) is now neither counted short nor counted in the
+  share's base, in both places that compute the check: the worker's `RolePlayEngine.fidelity`
+  (`acknowledgement_turns` in the fidelity log) and the API gate's `computeTranscriptStats`
+  (`app/api/src/lib/r1/acknowledgement.ts`, a port pinned to the Python by
+  `r1-acknowledgement-cross-language.test.ts` and the shared fixture
+  `app/voice-livekit/tests/fixtures/r1_acknowledgement_turns.json`). Any other short turn ("Hi
+  Pooja", "the price", "So bye", "Yes.") still counts, and acknowledgements beside real fragments do
+  not water the share down. The owner's session reads 1 short turn in 30 (3%) at the gate. The
+  substantive / qualifying-turn counts (three words or more) are unchanged and still read every
+  turn. It holds at the 3-word rollback too (banking only merges turns). **This needs the API
+  deployed as well as the worker**: the gate's check is computed from the transcript rows.
 * **The icebreaker exit is decided at a committed turn.** The soft exit (four answers once S >= 3:30)
   counts the SDK's committed turns, not STT finals, and only a turn with **at least three words that
   are not backchannel** (`content_word_count`: apology, thanks, greeting, "are you there", hesitation and
@@ -1563,7 +1579,7 @@ smoke: a clip that sounds wrong is removed with `R1_LINE_CACHE=off`.
 
 Only a line that reaches `session.say` can play cached audio, so the warm list (`_WARM_ORDER` in
 `r1_session.py`) holds exactly the lines the driver says: `L-TRANSITION`, `L-TRANSITION-NUDGE`,
-`L-PICKUP`, `L-EXIT`, `L-WRAP`, `L-CLOSE`, `L-ASIDE-COACH`, `L-ASIDE-END`, `L-END-CLOSE`, `L-MUTE`,
+`L-PICKUP`, `L-EXIT`, `L-WRAP`, `L-CLOSE`, `L-ASIDE-COACH`, `L-ASIDE-END`, `L-MUTE`,
 `L-SIL-IB`, `L-SIL-RP1`, `L-SIL-RP2`, `L-REJOIN`, `L-REJOIN-RP`, `L-SIL-END` and `L-SYSTEM-STOP`. `L-OPEN` is
 spoken at once, and `L-TIME-CUE`, `L-NO-FEEDBACK` and `L-FAQ-DEFER` are never passed to `say` (the first two travel inside
 a reply stream; the third has no runtime caller), so they are not synthesised.
@@ -1821,54 +1837,93 @@ ended nothing. Both are now answered by the interviewer, Christy, outside the pe
   hang up" removed first) matches a request aimed at the bot: "can / could / would / will you ...
   disconnect / end / stop / hang up / cut / close the call / interview / role play", a sentence that
   opens with that verb ("End the call now."), "please / let's / I want to ... end / stop the interview
-  / role play / session", "let's / please disconnect / cut the call", "... hang up", and "I want to
-  leave / quit / stop". The object must end its clause ("the call?", "the call now"). The advisor's
-  own in-role close stays on the farewell ladder and is not matched: "I'll end the call and send you
-  the email", "before we end the call", "let's end the call here and I'll send you the details",
-  "let's close this conversation on a positive note", "let's stop here and go over the curriculum",
-  "can you stop the call recording?".
+  / role play / session", "can / could / shall / may we ... end / stop the interview / role play /
+  exercise" (owner test 1eb18cd4, 75: "Can we end this interview? Can we end this role play?"; the
+  we-form takes only those objects, since "can we end the call here, I'll send the details" is an
+  in-role close, and it opens its sentence or follows a comma, so "When can we end the interview?"
+  or "How can we end the role play?" is an ordinary turn), "let's / please disconnect / cut the
+  call", "... hang up", and "I want to leave /
+  quit / stop". The object must end its clause ("the call?", "the call now", and "for now" / "for
+  today": owner test 1eb18cd4, 73: "Okay, let's end this interview for now."). The advisor's own
+  in-role close stays on the farewell ladder and is not matched: "I'll end the call and send you the
+  email", "before we end the call", "let's end the call here and I'll send you the details", "let's
+  close this conversation on a positive note", "let's stop here and go over the curriculum", "can you
+  stop the call recording?", "let's end the call for now and I'll send you the details".
   * **Before R = 14:00 with no commitment on record, once per session:** no owed move is raised that
     turn, the turn is excluded from evidence like the coach aside's, and the interviewer asks
     `L-ASIDE-END` with R paused: "This is Christy, your interviewer. If you want to end the interview
     now, please say: end the interview. Otherwise, just carry on with <lead>." It is deliberately not an
-    either/or question, so a bare "yes" never has to be interpreted.
-  * **Only end words confirm** (`confirms_end`: "end the interview", "yes, end it", "end it", "stop the
-    interview", "I want to stop", "I'm done"), or the request again at a later turn, **while R is still
-    below 14:00 and no commitment is on record**: the interviewer says `L-END-CLOSE` ("All right, we'll
-    end the interview here. Thank you for your time. You can close this window now. Goodbye.") and the
-    session ends as **`candidate_left`**, exactly as if the candidate had closed the window: no new
-    outcome, a counted attempt, the session `failed`, never the exit line, the wrap-up or `complete`,
-    and the gate can never pass it (see "Attempts that did not complete" above). So a second request
-    after a declined question before 14:00 still ends the session this way (owner-approved). A bare
-    "yes", "sure", "I'd like to stay with Priya", "no", "carry on" or a question to the learner resumes
-    the role-play with that very turn. A fragment of two words or fewer that says no "no" ("Hmm",
-    "Okay.", "Yeah.": speech-to-text finalises the first word about a second before the rest) leaves the
-    question open. If the candidate says nothing, the silence ladder runs as always and the question
-    lapses, so an answer to "Are you still there?" is not read as an answer to it.
+    either/or question, so a bare "yes" never has to be interpreted. The text is owner-approved.
+  * **A first request that names the interview or the role play is confirmed at once, with no
+    question** (owner decision 2026-10-29; `r1_tracker.explicit_end_request`): end / stop / finish /
+    close / terminate + the / this + interview / role play, as the turn's last sentence and nothing
+    more (fillers or a name, "let's" / "please" / "I want to" / "can we" / "can you", the request,
+    then at most "now", "here", "please", "for now", "thanks" and the like; a last sentence of
+    courtesy alone, "Thank you.", is passed over), not negated, and with nothing in the turn that
+    declines ("no", "carry on", "stay"). In owner test 1eb18cd4 the candidate said "End the
+    interview" and was then asked to say "end the interview". A request that says more ("Please stop
+    the interview, I need a moment.", "Can we stop the role play? I want to restart.") gets the
+    question, so a candidate who wants a pause or a restart can carry on. Generic requests ("can you
+    end the call?", "disconnect the call", "hang up", "I want to stop", "can you end the session?")
+    still get the question first. Turn reason `end_request_explicit`, and
+    `early_close.end_request.question_asked` is false.
+  * **Only end words confirm** after the question (`confirms_end`: "end the interview", "yes, end it",
+    "end it", "stop the interview", "I want to stop", "I'm done", and, as the whole answer only, what
+    speech-to-text makes of the asked-for words: "and the interview", "and interview", "end
+    interview"; owner test 1eb18cd4, 79), or the request again at a later turn, **while R is still
+    below 14:00 and no commitment is on record.** A bare "yes", "sure", "I'd like to stay with Priya",
+    "no", "carry on" or a question to the learner resumes the role-play with that very turn. A
+    fragment of two words or fewer that says no "no" ("Hmm", "Okay.", "Yeah.": speech-to-text
+    finalises the first word about a second before the rest) leaves the question open. If the
+    candidate says nothing, the silence ladder runs as always and the question lapses, so an answer to
+    "Are you still there?" is not read as an answer to it.
+  * **A confirmed stop ends the ROLE-PLAY, not the interview** (owner decision 2026-10-29: "when we
+    end the interview the role play should end and the finishing part of christy the interviewer
+    should come in. it should not abruptly end the whole interview itself."). The engine plans the
+    role-play exit (`TurnMode.EXIT`, turn reason `end_confirmed`, `exit_requested`), the turn that
+    confirmed it stays out of evidence and out of the learner's context (its transcript row is
+    written with phase `aside`, so the gate's speech-to-text check does not count a two-word "End
+    interview." as a fragment, just as the worker's `fidelity` never does), and the session goes on
+    exactly as after a farewell exit: `L-EXIT` ("Let's pause the role-play here. I'm stepping out of
+    the learner's role now; this is Christy, your interviewer, again. ..."), then `L-WRAP`, the
+    wrap-up questions, `L-CLOSE` and the normal completion (`complete`, the session `completed`, a
+    counted attempt). `L-EXIT` is kept: it is Christy's own out-of-role line and the cue
+    `L-TRANSITION` promised ("I'll stay in character until I say, 'Let's pause the role-play here.'"),
+    not the learner's in-character goodbye, so it reads right after an out-of-role stop too. The old
+    close `L-END-CLOSE` ("All right, we'll end the interview here. ... You can close this window now.
+    Goodbye.") and its `candidate_left` ending are gone (content revision 17).
+  * **Scoring: "score it if checks pass"** (owner decision 2026-10-29). The early-ended role-play
+    goes through the normal completion and scoring path, and the normal checks decide: the gate's
+    `roleplay_too_short` (R below 10:00), `family_missing:*`, `counter_missing` and the rest, and the
+    worker's own `fidelity` (`r_reached_10_min`, `all_families_delivered`, ...). So a stop at 5:00 is
+    never scored (`human_review`), and a stop at 12:50 with every family delivered can be. Nothing in
+    the API changed for this: `complete` is an ordinary outcome for `r1_settle_attempt` and the
+    scorer.
   * **From R = 14:00, or once a commitment is on record (any level), the request is a farewell**
-    (final review, M1 and M2). By then the role-play has earned its score, and the request is how many
-    advisors say goodbye ("Okay Priya, let's disconnect the call now, I'll send you the email"). It
-    goes to the existing close ladder exactly as "bye" does at the same moment, with the same rules:
-    the redirect once before 14:00 ("Oh wait, before you go..." and the owed move), the scripted WEAK
-    stall when the close window is open and nothing is on record, otherwise the role-play exit (L-EXIT,
-    the wrap-up and a score); a second farewell exits. End words answering a question asked earlier
-    ("Yes, end it." at 14:05 after the question at 13:50) are a farewell too. It never plays
-    `L-ASIDE-END` or `L-END-CLOSE` and never ends as `candidate_left`. This replaced two rules the
-    owner's review found failing good sessions: after the question, any later request (even at 18:20
-    after a complete role-play) ended the session as a failed `candidate_left`; and without it, a
-    request from 14:00 was "an ordinary turn" whose owed move waited (`owed_deferred_for_end_request`,
-    removed), so "can you disconnect the call?" got "Mm-hmm." however often it was said. A request
-    right after a booked call at 13:30 used to get the question and then fail the session; it now
-    exits and is scored, as "Thank you so much, bye!" there always did. The deadlines, the forced path
-    and the 14:00 floor are unchanged.
+    (final review, M1 and M2), explicit or not. By then the role-play has earned its score, and the
+    request is how many advisors say goodbye ("Okay Priya, let's disconnect the call now, I'll send
+    you the email"). It goes to the existing close ladder exactly as "bye" does at the same moment,
+    with the same rules: the redirect once before 14:00 ("Oh wait, before you go..." and the owed
+    move), the scripted WEAK stall when the close window is open and nothing is on record, otherwise
+    the role-play exit (L-EXIT, the wrap-up and a score); a second farewell exits. End words answering
+    a question asked earlier ("Yes, end it." at 14:05 after the question at 13:50) are a farewell too.
+    It never plays `L-ASIDE-END`. This replaced two rules the owner's review found failing good
+    sessions: after the question, any later request (even at 18:20 after a complete role-play) ended
+    the session as a failed `candidate_left`; and without it, a request from 14:00 was "an ordinary
+    turn" whose owed move waited (`owed_deferred_for_end_request`, removed), so "can you disconnect
+    the call?" got "Mm-hmm." however often it was said. A request right after a booked call at 13:30
+    used to get the question and then fail the session; it now exits and is scored, as "Thank you so
+    much, bye!" there always did. The deadlines, the forced path, `SLIP_LIMIT`, the 14:00 floor
+    (`EARLY_CLOSE_BEFORE_SEC` 840) and `FIDELITY_MIN_R_SEC` 600 are unchanged.
 
-Injection: candidate words can at most produce the question or a `candidate_left` exit before 14:00
-(which the candidate could reach by closing the window anyway), or from 14:00 (or with a commitment on
-record) exactly what a plain "bye" produces at that moment, which any candidate can already say; they
-never change a commitment, a disclosure or a grade. Logs: the turn reasons `aside_end_request`,
-`end_confirmed` and `end_request_as_farewell` (with the ladder's own `close_attempt_redirect`,
-`close_attempt_stall` or `close_attempt_exit`; `r1_turn_reason`), and `early_close.end_request` in the
-admin log (turn indices, R and whether it was confirmed; never the words).
+Injection: candidate words can at most produce the question, or before 14:00 the role-play exit into
+the wrap-up, which two plain "bye"s before 14:00 already reach (the redirect, then the exit), or from
+14:00 (or with a commitment on record) exactly what a plain "bye" produces at that moment; they never
+change a commitment, a disclosure or a grade, and an early end is scored only when the normal checks
+pass. Logs: the turn reasons `aside_end_request`, `end_request_explicit`, `end_confirmed` and
+`end_request_as_farewell` (with the ladder's own `close_attempt_redirect`, `close_attempt_stall` or
+`close_attempt_exit`; `r1_turn_reason`), and `early_close.end_request` in the admin log (turn indices,
+R, whether the question was asked and whether it was confirmed; never the words).
 
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 
@@ -1886,7 +1941,8 @@ of them is the bare `{"phase": ...}` it always was.
 | `rpleft` | whole seconds of role-play budget left (`remaining_roleplay_seconds()`: the shorter of the 20:00 role-play clock and the 26:00 session cap), clamped 0..3600 | with every phase write while the role-play runs or is paused (`roleplay`, `aside`, a reconnect pause inside it, the rejoin); a **30 s heartbeat** while the phase is `roleplay` (`RPLEFT_HEARTBEAT_SECONDS`, refreshed value only, coalesced so a stuck writer is not flooded); `""` with the first phase write after the role-play (`roleplay_exit`, `closing`, `aborted`) |
 
 It is an upper bound, not a promise: the role-play can end early (R >= 14:00 with the commitment
-resolved, or a candidate who confirmed they want to stop: see "Out-of-role requests" above). An old
+resolved, or a candidate who confirmed they want to stop, which ends the role-play into the
+wrap-up: see "Out-of-role requests" above). An old
 page ignores all three; a new page with an old worker simply shows no button and no clock.
 
 **The "I'm ready" button.** The candidate token has `canPublishData: false` (R1-PLAN threat 13), so the

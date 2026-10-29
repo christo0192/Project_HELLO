@@ -73,15 +73,13 @@ LINES: dict[str, str] = {
         "course and you're calling her back. Please carry on as you would on a real call."
     ),
     # Owner test 7f2a25e6: the candidate asked the learner to "disconnect the call".  Asked once,
-    # before R = 14:00, with R paused; saying "end the interview" ends the session as closing the
-    # window does.  Not an either/or question: a bare "yes" would not say which option was meant.
+    # before R = 14:00, with R paused; saying "end the interview" ends the role-play, and L-EXIT and
+    # the wrap-up follow (owner decision 2026-10-29; the close L-END-CLOSE that ended the whole
+    # session is gone).  Not an either/or question: a bare "yes" would not say which option was
+    # meant.  The text is owner-approved and unchanged.
     "L-ASIDE-END": (
         "This is Christy, your interviewer. If you want to end the interview now, please say: end "
         "the interview. Otherwise, just carry on with {lead_name}."
-    ),
-    "L-END-CLOSE": (
-        "All right, we'll end the interview here. Thank you for your time. You can close this "
-        "window now. Goodbye."
     ),
     "L-MUTE": (
         "This is Christy. It looks like your microphone may be muted. Please unmute when "

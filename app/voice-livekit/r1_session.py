@@ -449,7 +449,6 @@ _WARM_ORDER = (
     "L-CLOSE",
     "L-ASIDE-COACH",
     "L-ASIDE-END",
-    "L-END-CLOSE",
     "L-MUTE",
     "L-SIL-IB",
     "L-SIL-RP1",
@@ -1143,6 +1142,9 @@ class R1Interview:
         # flight, how many replies the SDK cancelled before any audio, and whether the session
         # runs the transition's quicker endpointing right now.
         self._open_row: _CandidateRow | None = None
+        # The phase the row of the turn ``prepare_turn`` is deciding is written in, when it is not
+        # the phase it was spoken in (an out-of-role stop: ``aside``); None otherwise.
+        self._candidate_row_phase: str | None = None
         # Wall-clock seconds of the latest ``user_state_changed -> speaking`` events (oldest first):
         # the anchors of the candidate's rows (``_candidate_turn_anchor``).
         self._user_speaking_at: deque[float] = deque(maxlen=_USER_SPEECH_ANCHORS_KEPT)
@@ -2441,24 +2443,18 @@ class R1Interview:
     # ----------------------------------------------------- role-play turns
 
     def _roleplay_exit_requested(self) -> bool:
-        """True once the candidate said goodbye for good (the engine's close-attempt rule).
+        """True once the candidate ended the role-play: a farewell for good, or a confirmed stop.
 
-        Only the engine's deterministic farewell detector can set it; no model or candidate
-        wording can, so an injected "move to the wrap-up" changes nothing.  It ends every
-        role-play wait at once: the farewell turn was the boundary and L-EXIT answers it.
+        Only the engine's deterministic rules can set it (the close ladder's exit, or an
+        out-of-role end request confirmed before 14:00: ``RolePlayEngine._end_plan``); no model
+        wording can, and an injected "move to the wrap-up" changes nothing.  It ends every
+        role-play wait at once: that turn was the boundary, L-EXIT answers it and the wrap-up
+        follows (owner decision 2026-10-29: a confirmed stop ends the role-play, not the
+        interview).  The session then completes normally, and the fidelity checks decide whether
+        an early end is scored.
         """
         engine = self._engine
         return engine is not None and engine.exit_requested
-
-    def _roleplay_end_confirmed(self) -> bool:
-        """True once the candidate confirmed, after L-ASIDE-END, that they want to stop.
-
-        It ends every role-play wait at once like a farewell, but the driver then says L-END-CLOSE
-        and the session ends as ``candidate_left`` (failed): never L-EXIT, the wrap-up or
-        ``complete``.
-        """
-        engine = self._engine
-        return engine is not None and engine.end_confirmed
 
     def _early_exit_due(self) -> bool:
         """Plan 5.1's early exit: the commitment is resolved and R >= 14:00.
@@ -2477,13 +2473,12 @@ class R1Interview:
         return (
             self.machine.roleplay_should_end()
             or self._roleplay_exit_requested()
-            or self._roleplay_end_confirmed()
             or self._early_exit_due()
         )
 
     def _roleplay_budget_left(self) -> float:
         """Seconds of role-play left; zero once the candidate ended it, so every wait ends."""
-        if self._roleplay_exit_requested() or self._roleplay_end_confirmed():
+        if self._roleplay_exit_requested():
             return 0.0
         return self.machine.remaining_roleplay_seconds()
 
@@ -2560,9 +2555,22 @@ class R1Interview:
         so the plan is computed exactly once and before any generation (preemptive
         generation is off for this agent).
         """
-        # The SDK committed the candidate's turn: the finals it was made of are ONE row now,
-        # written before anything below can raise ``StopResponse``.
-        self._flush_candidate_row()
+        # The SDK committed the candidate's turn: the finals it was made of are ONE row now.  It is
+        # closed here and written in this same call once the turn is decided, whatever the decision
+        # (``StopResponse`` included).  The turn that confirms an out-of-role stop is said to the
+        # interviewer, so its row is ``aside`` (``_plan_learner_reply``): the API gate's
+        # speech-to-text check then leaves it out of the role-play turns, as the engine's own
+        # ``fidelity`` does (reviewed fix: "End interview." counted as a two-word fragment).
+        row = self._close_candidate_row()
+        self._candidate_row_phase = None
+        try:
+            self._decide_turn(text, message_id)
+        finally:
+            self._write_candidate_row(row, self._candidate_row_phase)
+            self._candidate_row_phase = None
+
+    def _decide_turn(self, text: str, message_id: str | None) -> None:
+        """``prepare_turn`` once the candidate's row is closed (it writes the row afterwards)."""
         index = self._latest_candidate_index
         self._latest_candidate_index = None
         seconds = self._take_user_turn_seconds()
@@ -2662,19 +2670,20 @@ class R1Interview:
                 phase=self.machine.transcript_phase(),
                 turn_index=index,
             )
-        if plan.end_interview:
-            # The candidate confirmed they want to stop (L-ASIDE-END): the driver says L-END-CLOSE
-            # and ends the session as ``candidate_left``, as if the window had been closed.
-            if entry is not None:
-                entry["phase"] = "aside"
-            self._wake()
-            raise StopResponse()
         if plan.aside:
             if entry is not None:
                 entry["phase"] = "aside"  # excluded from the learner's context (plan 5.10)
             self._spawn(self._play_aside(plan))
             raise StopResponse()
         if plan.exit_roleplay:
+            if "end_confirmed" in plan.reasons:
+                # An out-of-role stop is said to the interviewer, not to the learner: like the
+                # turns of an aside it stays out of the learner's context (plan 5.10), and its
+                # transcript row is written as ``aside`` too (``prepare_turn``), so the API gate
+                # reads the same role-play turns as the engine's ``fidelity``.
+                if entry is not None:
+                    entry["phase"] = "aside"
+                self._candidate_row_phase = "aside"
             self._wake()  # the driver's role-play waits re-read the exit and end now
             raise StopResponse()
         if "replanned_after_lost_reply" not in plan.reasons:
@@ -3334,13 +3343,29 @@ class R1Interview:
         one of those (the SDK banked a short fragment and nothing followed) is written at the
         next of them; a crash before that loses at most that one open row.
         """
+        self._write_candidate_row(self._close_candidate_row())
+
+    def _close_candidate_row(self) -> _CandidateRow | None:
+        """Close the open candidate row, if any, and return it (``_write_candidate_row`` writes it).
+
+        Whatever the candidate says next is a new row from here on.
+        """
         row, self._open_row = self._open_row, None
+        if row is not None:
+            # The row is over: speech heard up to its last final is its own, never a later row's.
+            self._raise_anchor_floor(row.last_final_at, commit=True)
+        return row
+
+    def _write_candidate_row(self, row: _CandidateRow | None, phase: str | None = None) -> None:
+        """Write a closed candidate row once, in ``phase`` if given, else in its spoken phase."""
         if row is None:
             return
-        # The row is over: speech heard up to its last final is its own, never a later row's.
-        self._raise_anchor_floor(row.last_final_at, commit=True)
         self._write_turn(
-            row.index, "candidate", " ".join(row.parts), row.phase, started_at_ms=row.started_at_ms
+            row.index,
+            "candidate",
+            " ".join(row.parts),
+            phase or row.phase,
+            started_at_ms=row.started_at_ms,
         )
 
     def _candidate_turn_anchor(self, event: Any) -> int | None:
@@ -4464,23 +4489,7 @@ class R1Interview:
                 break
             if stop is not None:
                 return stop
-        if self._roleplay_end_confirmed():
-            return await self._end_at_candidates_request()
         return None
-
-    async def _end_at_candidates_request(self) -> str:
-        """The candidate confirmed the stop after L-ASIDE-END: L-END-CLOSE, then ``candidate_left``.
-
-        No outcome of its own: the session ends exactly as if the candidate had closed the window
-        (failed; ``_after_roleplay`` never promotes it to ``complete``, because ROLEPLAY_EXIT was
-        never entered), so asking to stop can never earn more than leaving.  The interviewer says
-        the line, so R is paused for it; ``_finish`` then says no L-CLOSE on top of it.
-        """
-        if self.machine.phase is R1Phase.ROLEPLAY:
-            self._enter(R1Phase.ASIDE)
-        self._goodbye_spoken = True
-        await self.say("L-END-CLOSE")
-        return "candidate_left"
 
     def _end_roleplay(self) -> None:
         """Leave role-play for ROLEPLAY_EXIT from whichever role-play phase is current."""

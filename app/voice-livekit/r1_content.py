@@ -101,7 +101,11 @@ import r1_world
 #    answered first (INTERRUPTED_NOTE), and a lone backchannel that cut her gets her point finished
 #    in one sentence (BACKCHANNEL_CUT_NOTE), and one that only asked her to say it again ("Sorry?",
 #    "Pardon?") or checked she was there gets it said again (CUT_REPEAT_NOTE).
-CONTENT_REVISION = 16
+# 17: owner test 1eb18cd4 (owner decision 2026-10-29): a confirmed out-of-role stop ends the
+#    role-play, not the interview, so L-EXIT and the interviewer's wrap-up follow it and the short
+#    close that ended the whole session (L-END-CLOSE) is deleted.  No other pinned text changed
+#    (L-ASIDE-END is unchanged).
+CONTENT_REVISION = 17
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
