@@ -55,10 +55,6 @@ LINES = {
         "This is Christy, your interviewer. If you want to end the interview now, please say: end "
         "the interview. Otherwise, just carry on with {lead_name}."
     ),
-    "L-END-CLOSE": (
-        "All right, we'll end the interview here. Thank you for your time. You can close this "
-        "window now. Goodbye."
-    ),
     "L-MUTE": (
         "This is Christy. It looks like your microphone may be muted. Please unmute when "
         "you're ready."

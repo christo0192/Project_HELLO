@@ -10,6 +10,7 @@
  * Pure: reads nothing, writes nothing. The label vocabulary is part of the scorer prompt.
  */
 
+import { isAcknowledgementTurn } from './acknowledgement.js';
 import { R1_PHASES, type R1TurnPhase } from './rubric.js';
 
 export interface R1TurnRow {
@@ -190,7 +191,15 @@ export interface R1TranscriptStats {
   readonly candidateRoleplayTurns: number;
   /** Role-play candidate turns of at least MIN_QUALIFYING_WORDS words. */
   readonly candidateRoleplayQualifyingTurns: number;
-  /** Share of role-play candidate turns that are at most two words or non-lexical. */
+  /**
+   * Role-play candidate turns that only acknowledge or hand the floor back ("Okay", "Hmm", "Okay,
+   * continue."; `isAcknowledgementTurn`). The speech-to-text check leaves them out.
+   */
+  readonly candidateRoleplayAcknowledgementTurns: number;
+  /**
+   * Share of the role-play candidate turns that are not acknowledgement-only which are at most two
+   * words or non-lexical (1 when there are none: fail closed).
+   */
   readonly suspectShare: number;
   /** Candidate share of role-play words, 0..100; null with no role-play words at all. */
   readonly roleplayWordSharePct: number | null;
@@ -201,10 +210,18 @@ export interface R1TranscriptStats {
 
 export const MIN_QUALIFYING_WORDS = 3;
 
+/**
+ * Speech-to-text sanity (plan 6.4) catches a long answer chopped into fragments, so a role-play
+ * turn that only acknowledges ("Okay", "Yeah, okay", "Hmm", "Okay, continue.") is neither suspect
+ * nor counted in the share's base: voice barge-in commits each one as its own turn, where the SDK
+ * used to bank it into the next (owner test 1eb18cd4). Any other short turn ("Hi Pooja", "the
+ * price", "So bye", "yes") still counts. The worker's own fidelity check reads the same turns.
+ */
 export function computeTranscriptStats(turns: readonly R1Turn[]): R1TranscriptStats {
   let candidateTurns = 0;
   let roleplay = 0;
   let qualifying = 0;
+  let acknowledgements = 0;
   let suspect = 0;
   let candidateWords = 0;
   let learnerWords = 0;
@@ -221,7 +238,8 @@ export function computeTranscriptStats(turns: readonly R1Turn[]): R1TranscriptSt
         roleplay += 1;
         candidateWords += words;
         if (words >= MIN_QUALIFYING_WORDS) qualifying += 1;
-        if (words <= 2 || isNonLexical(turn.text)) suspect += 1;
+        if (isAcknowledgementTurn(turn.text)) acknowledgements += 1;
+        else if (words <= 2 || isNonLexical(turn.text)) suspect += 1;
         questions += (turn.text.match(/\?/g) ?? []).length;
       }
     } else if (turn.phase === 'roleplay') {
@@ -229,11 +247,13 @@ export function computeTranscriptStats(turns: readonly R1Turn[]): R1TranscriptSt
     }
   }
   const totalWords = candidateWords + learnerWords;
+  const sttTurns = roleplay - acknowledgements;
   return {
     candidateTurns,
     candidateRoleplayTurns: roleplay,
     candidateRoleplayQualifyingTurns: qualifying,
-    suspectShare: roleplay === 0 ? 1 : suspect / roleplay,
+    candidateRoleplayAcknowledgementTurns: acknowledgements,
+    suspectShare: sttTurns === 0 ? 1 : suspect / sttTurns,
     roleplayWordSharePct: totalWords === 0
       ? null
       : Math.round((candidateWords / totalWords) * 1000) / 10,

@@ -349,10 +349,11 @@ def _tokens(calls: list[dict[str, Any]]) -> dict[str, int]:
 
 def _suppressed_why(rig: Any) -> str:
     interview = rig.interview
-    if rig.engine.exit_requested:
-        return "farewell_exit"
+    # A confirmed stop sets ``exit_requested`` too (it exits into the wrap-up), so it is read first.
     if rig.engine.end_confirmed:
         return "end_request"
+    if rig.engine.exit_requested:
+        return "farewell_exit"
     if interview._early_exit_due():
         return "early_exit"
     if rig.machine.roleplay_should_end():
@@ -364,10 +365,11 @@ def _suppressed_why(rig: Any) -> str:
 
 def _stop_reason(rig: Any, farewells: int) -> str | None:
     interview = rig.interview
+    # A confirmed stop (owner test 7f2a25e6) exits into the wrap-up like a farewell; read first.
+    if rig.engine.end_confirmed:
+        return "end_request"
     if rig.engine.exit_requested:
         return "farewell_exit"
-    if rig.engine.end_confirmed:
-        return "end_request"  # the candidate_left close (owner test 7f2a25e6)
     if interview._early_exit_due():
         return "early_exit"
     if rig.machine.roleplay_should_end():

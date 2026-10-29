@@ -16,7 +16,8 @@
  *     than 3 guard hits in total;
  *   - learner end-of-speech to first audio p95 is at most 3.0 seconds;
  *   - speech-to-text sanity: fewer than 10% of candidate role-play turns are at most two
- *     words or non-lexical;
+ *     words or non-lexical, not counting turns that only acknowledge ("Okay", "Hmm", "Okay,
+ *     continue."), which voice barge-in commits on their own (`computeTranscriptStats`);
  *   - scoring is complete, the three runs agree, and the evidence references validated;
  *   - no system-failure outcome, and the session ended cleanly (it completed). A counted
  *     attempt that did NOT complete (the candidate left, or the residency cap hit) is still

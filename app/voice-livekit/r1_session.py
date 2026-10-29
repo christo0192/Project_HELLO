@@ -449,7 +449,6 @@ _WARM_ORDER = (
     "L-CLOSE",
     "L-ASIDE-COACH",
     "L-ASIDE-END",
-    "L-END-CLOSE",
     "L-MUTE",
     "L-SIL-IB",
     "L-SIL-RP1",
@@ -2441,24 +2440,18 @@ class R1Interview:
     # ----------------------------------------------------- role-play turns
 
     def _roleplay_exit_requested(self) -> bool:
-        """True once the candidate said goodbye for good (the engine's close-attempt rule).
+        """True once the candidate ended the role-play: a farewell for good, or a confirmed stop.
 
-        Only the engine's deterministic farewell detector can set it; no model or candidate
-        wording can, so an injected "move to the wrap-up" changes nothing.  It ends every
-        role-play wait at once: the farewell turn was the boundary and L-EXIT answers it.
+        Only the engine's deterministic rules can set it (the close ladder's exit, or an
+        out-of-role end request confirmed before 14:00: ``RolePlayEngine._end_plan``); no model
+        wording can, and an injected "move to the wrap-up" changes nothing.  It ends every
+        role-play wait at once: that turn was the boundary, L-EXIT answers it and the wrap-up
+        follows (owner decision 2026-10-29: a confirmed stop ends the role-play, not the
+        interview).  The session then completes normally, and the fidelity checks decide whether
+        an early end is scored.
         """
         engine = self._engine
         return engine is not None and engine.exit_requested
-
-    def _roleplay_end_confirmed(self) -> bool:
-        """True once the candidate confirmed, after L-ASIDE-END, that they want to stop.
-
-        It ends every role-play wait at once like a farewell, but the driver then says L-END-CLOSE
-        and the session ends as ``candidate_left`` (failed): never L-EXIT, the wrap-up or
-        ``complete``.
-        """
-        engine = self._engine
-        return engine is not None and engine.end_confirmed
 
     def _early_exit_due(self) -> bool:
         """Plan 5.1's early exit: the commitment is resolved and R >= 14:00.
@@ -2477,13 +2470,12 @@ class R1Interview:
         return (
             self.machine.roleplay_should_end()
             or self._roleplay_exit_requested()
-            or self._roleplay_end_confirmed()
             or self._early_exit_due()
         )
 
     def _roleplay_budget_left(self) -> float:
         """Seconds of role-play left; zero once the candidate ended it, so every wait ends."""
-        if self._roleplay_exit_requested() or self._roleplay_end_confirmed():
+        if self._roleplay_exit_requested():
             return 0.0
         return self.machine.remaining_roleplay_seconds()
 
@@ -2662,19 +2654,16 @@ class R1Interview:
                 phase=self.machine.transcript_phase(),
                 turn_index=index,
             )
-        if plan.end_interview:
-            # The candidate confirmed they want to stop (L-ASIDE-END): the driver says L-END-CLOSE
-            # and ends the session as ``candidate_left``, as if the window had been closed.
-            if entry is not None:
-                entry["phase"] = "aside"
-            self._wake()
-            raise StopResponse()
         if plan.aside:
             if entry is not None:
                 entry["phase"] = "aside"  # excluded from the learner's context (plan 5.10)
             self._spawn(self._play_aside(plan))
             raise StopResponse()
         if plan.exit_roleplay:
+            if "end_confirmed" in plan.reasons and entry is not None:
+                # An out-of-role stop is said to the interviewer, not to the learner: like the
+                # turns of an aside it stays out of the learner's context (plan 5.10).
+                entry["phase"] = "aside"
             self._wake()  # the driver's role-play waits re-read the exit and end now
             raise StopResponse()
         if "replanned_after_lost_reply" not in plan.reasons:
@@ -4464,23 +4453,7 @@ class R1Interview:
                 break
             if stop is not None:
                 return stop
-        if self._roleplay_end_confirmed():
-            return await self._end_at_candidates_request()
         return None
-
-    async def _end_at_candidates_request(self) -> str:
-        """The candidate confirmed the stop after L-ASIDE-END: L-END-CLOSE, then ``candidate_left``.
-
-        No outcome of its own: the session ends exactly as if the candidate had closed the window
-        (failed; ``_after_roleplay`` never promotes it to ``complete``, because ROLEPLAY_EXIT was
-        never entered), so asking to stop can never earn more than leaving.  The interviewer says
-        the line, so R is paused for it; ``_finish`` then says no L-CLOSE on top of it.
-        """
-        if self.machine.phase is R1Phase.ROLEPLAY:
-            self._enter(R1Phase.ASIDE)
-        self._goodbye_spoken = True
-        await self.say("L-END-CLOSE")
-        return "candidate_left"
 
     def _end_roleplay(self) -> None:
         """Leave role-play for ROLEPLAY_EXIT from whichever role-play phase is current."""

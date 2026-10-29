@@ -691,10 +691,16 @@ _META_OBJECT = rf"(?:the|this|our) (?:interview|{_ROLE_PLAY}|exercise)"
 _I_WANT = r"i(?: want to| would like to|'d like to| wanna)"
 _YOU_ASK = r"(?:can|could|would|will) you"
 _END_ASK = rf"(?:please|let'?s|let us|{_I_WANT})"
+# Asking leave to end the exercise (owner test 1eb18cd4, 75: "Can we end this interview? Can we end
+# this role play?").  Only with _META_OBJECT: "can we end the call here, I'll send the details" is
+# the advisor closing the sale's own call.
+_WE_ASK = r"(?:can|could|shall|may) we"
 # The object ends its clause ("... the call?", "... the call now", "... the call, please"), so "the
-# call recording" or "the call with a quick recap" is not the call being ended.
+# call recording" or "the call with a quick recap" is not the call being ended.  "For now" and "for
+# today" end it too (owner test 1eb18cd4, 73: "Okay, let's end this interview for now.").
 _CLAUSE_END = (
-    r"(?=\s*(?:[,.!?;:]|$|(?:now|here|please|right now|immediately|already|for me|then)\b))"
+    r"(?=\s*(?:[,.!?;:]|$|(?:now|here|please|right now|immediately|already|for me|then|for now|"
+    r"for today)\b))"
 )
 # What may come before an imperative ("Okay, never mind, end the call."): fillers, or any other
 # word set off by a comma (the learner's name).  At most eight, and a filler is never also read as
@@ -733,6 +739,7 @@ _END_REQUEST = tuple(
     for pattern in (
         rf"\b{_YOU_ASK} (?:please |just |kindly )?{_END_VERB} {_END_OBJECT}{_CLAUSE_END}",
         rf"\b{_END_ASK} (?:please |just |kindly )?{_END_VERB} {_META_OBJECT}{_CLAUSE_END}",
+        rf"\b{_WE_ASK} (?:please |just |kindly )?{_END_VERB} {_META_OBJECT}{_CLAUSE_END}",
         rf"\b{_END_ASK} (?:please |just |kindly )?(?:disconnect|terminate|cut) {_END_OBJECT}"
         + _CLAUSE_END,
         # "Hang up" ends its clause too: "can you hang up and I will call you back in five
@@ -757,6 +764,17 @@ _END_NEGATED = re.compile(
     rf"(?:\s+(?:call|interview|{_ROLE_PLAY}|session|conversation))?",
     re.IGNORECASE,
 )
+# A request that names the exercise itself with an end verb ("End the interview.", "Let's end this
+# interview for now.", "Can we end this role play?"): owner decision 2026-10-29 (owner test
+# 1eb18cd4, 73-81), such a FIRST request is taken as confirmed, with no L-ASIDE-END question,
+# because the question would only ask the candidate to say exactly that.  Read inside a sentence
+# that is itself an end request, after its negated phrases are removed, so "I'll end the interview
+# prep later" or "Let's not end the interview" never count.  "The call", "the session" and "hang
+# up" are not explicit ("can you end the call?" may be the sale's own call): they get the question.
+_EXPLICIT_END = re.compile(
+    rf"\b(?:end|stop|finish|close|terminate) (?:the|this) (?:interview|{_ROLE_PLAY})\b",
+    re.IGNORECASE,
+)
 
 
 def promises_call_back(text: object) -> bool:
@@ -764,26 +782,49 @@ def promises_call_back(text: object) -> bool:
     return _CALL_BACK.search(fold(text)) is not None
 
 
+def _end_request_sentences(text: object) -> list[str]:
+    """The sentences of ``text`` that ask the bot to end, with their negated end phrases removed."""
+    sentences = split_sentences(fold(text))
+    found: list[str] = []
+    for index, sentence in enumerate(sentences):
+        cleaned = _END_NEGATED.sub(" ", sentence).strip()
+        if any(pattern.search(cleaned) for pattern in _END_REQUEST):
+            found.append(cleaned)
+        elif _I_WANT_TO_STOP.search(cleaned) and all(
+            "?" not in later and word_count(later) <= _COURTESY_TAIL_WORDS
+            for later in sentences[index + 1 :]
+        ):
+            found.append(cleaned)
+    return found
+
+
 def detect_end_request(text: object) -> bool:
     """The candidate asks the bot to end the call or the interview (an out-of-role request).
 
     Lexical and sentence by sentence, after negated end phrases are removed.  Before R = 14:00 with
-    no commitment on record it only chooses the interviewer's one-off L-ASIDE-END question
-    (``r1_roleplay``), and a confirmed stop ends the session exactly as closing the window does
-    (``candidate_left``: a failed session, never ``complete``).  From 14:00, or with a commitment
-    on record, the engine treats the request as a farewell: it reaches only what "bye" reaches.
+    no commitment on record it chooses the interviewer's one-off L-ASIDE-END question
+    (``r1_roleplay``), unless it names the interview or the role play (``explicit_end_request``);
+    a confirmed stop ends the ROLE-PLAY through its normal exit, into the interviewer's wrap-up,
+    and the session is scored only if the normal fidelity checks pass (owner decision 2026-10-29).
+    From 14:00, or with a commitment on record, the engine treats the request as a farewell: it
+    reaches only what "bye" reaches.
     """
-    sentences = split_sentences(fold(text))
-    for index, sentence in enumerate(sentences):
-        cleaned = _END_NEGATED.sub(" ", sentence).strip()
-        if any(pattern.search(cleaned) for pattern in _END_REQUEST):
-            return True
-        if _I_WANT_TO_STOP.search(cleaned) and all(
-            "?" not in later and word_count(later) <= _COURTESY_TAIL_WORDS
-            for later in sentences[index + 1 :]
-        ):
-            return True
-    return False
+    return bool(_end_request_sentences(text))
+
+
+def explicit_end_request(text: object) -> bool:
+    """An end request that names the interview or the role play, with nothing in it declining.
+
+    "End the interview.", "Okay, let's end this interview for now.", "Can we end this role
+    play?", "I want to stop the interview.": the engine takes such a FIRST request before 14:00 as
+    confirmed, without asking L-ASIDE-END (owner decision 2026-10-29).  A generic request ("can
+    you end the call?", "disconnect the call", "hang up", "I want to stop") is not explicit and
+    still gets the question, and so is anything that also says no, carry on or stay
+    (``declines_end``), or that holds the phrase only negated ("let's not end the interview").
+    """
+    if declines_end(text):
+        return False
+    return any(_EXPLICIT_END.search(sentence) for sentence in _end_request_sentences(text))
 
 
 # The answer to L-ASIDE-END, which asks the candidate to SAY "end the interview" to stop, so only
@@ -823,12 +864,16 @@ _EXERCISE_OBJECT = rf"(?:the|this) (?:interview|{_ROLE_PLAY})"
 #    "I want to leave.", "Okay, I'm done."), so "we support you end to end", "it's a dead end",
 #    "so yeah, I'm done. So what do you think" and "let's stop here and go over the curriculum"
 #    are not one.  No question mark ("End it?", "Should I end it?").  "The call" is the sale's own
-#    call after "let's" or "we can" ("Let's end the call here." is an advisor's close).
+#    call after "let's" or "we can" ("Let's end the call here." is an advisor's close).  The phrase
+#    the question asks for also counts as speech-to-text hears it (owner test 1eb18cd4, 79: "And
+#    the interview" for "End the interview"): "and the interview", "and interview", "end
+#    interview", as the whole answer only, so "And the interview went well" is not one.
 _END_STANDALONE = re.compile(
     _CONFIRM_OPENER
     + r"(?:(?:end|stop)(?: (?:it|things|"
     + _EXERCISE_OBJECT
     + r"|(?:the|this) call))?"
+    + r"|(?:and(?: the)?|end) interview"
     + r"|(?:let'?s|let us|we can|we could) (?:end|stop)(?: (?:it|things|"
     + _EXERCISE_OBJECT
     + r"))?"
@@ -887,13 +932,16 @@ def declines_end(text: object) -> bool:
 def confirms_end(text: object) -> bool:
     """The candidate says to end it after L-ASIDE-END (the engine takes a second request too).
 
-    A confirmed stop ends the session as ``candidate_left`` (failed and unscored), so this reads
-    only the plainest stop: the whole answer is a stop phrase ("End it.", "Okay, I'm done.",
-    "Let's stop here."), or a clause asks to end the interview or the role play by name ("Yes,
-    please end the interview now.").  Nothing negated ("I don't want it to end."), no decline but
-    "No, that's it, I'm done.", no question but a request ("Can you end the interview?"), and no
-    end word in passing ("we support you end to end", "till the very end", "I'm done explaining,
-    any questions?").  A candidate who meant to stop and was not understood says it again.
+    A confirmed stop ends the role-play early (it exits into the wrap-up, and an early end is
+    scored only when the normal fidelity checks pass), so this reads only the plainest stop: the
+    whole answer is a stop phrase ("End it.", "Okay, I'm done.", "Let's stop here.", and "And the
+    interview" as speech-to-text hears the asked-for "End the interview"), or a clause asks to end
+    the interview or the role play by name ("Yes, please end the interview now.").  The engine
+    reads it only while the question is open.  Nothing negated ("I don't want it to end."), no
+    decline but "No, that's it, I'm done.", no question but a request ("Can you end the
+    interview?"), and no end word in passing ("we support you end to end", "till the very end",
+    "I'm done explaining, any questions?").  A candidate who meant to stop and was not understood
+    says it again.
     """
     folded = fold(text).strip()
     if not folded or _END_NEGATED_ANSWER.search(folded):

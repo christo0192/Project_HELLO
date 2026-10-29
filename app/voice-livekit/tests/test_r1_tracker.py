@@ -1345,6 +1345,139 @@ class EndRequestTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(detect_end_request(text))
 
+    # Owner test 1eb18cd4 (2026-10-29), verbatim: the owner trying to end the interview.
+    T73 = "Yeah, sure. Okay, let's end this interview for now."
+    T75 = "Sure. Can we end this interview? Can we end this role play?"
+    T77 = "End the interview"
+    T79 = "And the interview"
+    T81 = "Let's end the interview."
+
+    def test_the_owners_requests_are_end_requests_that_name_the_interview(self):
+        # 73 was missed ("for now" did not end the clause), 75 too (no "can we" form), and 77 and
+        # 81 got the question that asks the candidate to say exactly that.
+        from r1_tracker import detect_end_request, explicit_end_request
+
+        for text in (self.T73, self.T75, self.T77, self.T81):
+            with self.subTest(text=text):
+                self.assertTrue(detect_end_request(text))
+                self.assertTrue(explicit_end_request(text))
+        self.assertFalse(detect_end_request(self.T79))  # only an answer to the open question
+
+    def test_for_now_and_for_today_end_the_clause(self):
+        from r1_tracker import detect_end_request
+
+        for text in (
+            self.T73,
+            "Let's stop the role play for today.",
+            "Can you end the call for now?",
+            "Please end the interview for today.",
+            "I'd like to end the interview for now.",
+            "Let's disconnect the call for now.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(detect_end_request(text))
+        # The advisor's own close stays on the farewell ladder (the object is the sale's call).
+        for text in (
+            "Okay Priya, let's close the call for today and I'll follow up tomorrow.",
+            "Let's end the call for now and I'll send you the details.",
+            "Let's stop here for today, I'll call you tomorrow.",
+            "Let's end the call for today.",
+            "We can end the interview prep for today.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(detect_end_request(text))
+
+    def test_the_we_form_asks_leave_to_end_the_exercise_only(self):
+        from r1_tracker import detect_end_request
+
+        for text in (
+            "Can we end this interview?",
+            "Can we end this role play?",
+            "Could we stop the role-play now?",
+            "Shall we end the interview here?",
+            "May we finish this exercise?",
+            "Okay, can we please end the interview?",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(detect_end_request(text))
+        # "Can we end the call here, I'll send the details" is an in-role close: the we-form takes
+        # only the interview, the role play or the exercise.
+        for text in (
+            "Can we end the call here, I'll send the details?",
+            "Can we end the call here and talk tomorrow?",
+            "Can we end the session here?",
+            "Shall we close the conversation with a quick recap?",
+            "Can we end the interview on a high note?",
+            "Could we stop the call recording?",
+            "Should we end the interview?",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(detect_end_request(text))
+
+    def test_only_a_request_that_names_the_interview_or_the_role_play_is_explicit(self):
+        from r1_tracker import detect_end_request, explicit_end_request
+
+        for text in (
+            "End the interview.",
+            "Let's end the interview.",
+            "Can we end this role play?",
+            "I want to stop the interview.",
+            "Please terminate this interview.",
+            "Could you finish the role play now?",
+            "Okay, close the interview.",
+            "Christy, stop the role-play please.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(explicit_end_request(text))
+        # Requests that still get the question: a generic object, a verb outside the explicit set,
+        # or anything that also declines or holds the phrase only negated.
+        for text in (
+            "Can you end the call?",
+            "Disconnect the call.",
+            "Can you hang up?",
+            "I want to stop.",
+            "Can you end the session?",
+            "I want to quit the interview.",
+            "Could we stop this exercise?",
+            "No, let's end the interview.",
+            "Let's not end the interview, can you end the call?",
+            "End the interview? No, carry on.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(detect_end_request(text))
+                self.assertFalse(explicit_end_request(text))
+        # And what is no request at all is not explicit either.
+        for text in (
+            "I'll end the interview prep later.",
+            "We coach you to end the interview on a high note.",
+            "Why would I end the interview?",
+            "Before we end the call, can you confirm your email?",
+            "Can you end the call? I'll end the interview prep later.",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(explicit_end_request(text))
+
+    def test_the_question_is_answered_as_speech_to_text_hears_end_the_interview(self):
+        # 79: "And the interview" right after L-ASIDE-END.  The whole answer only, and the
+        # negation and decline vetoes still hold.
+        from r1_tracker import confirms_end
+
+        for text in (self.T79, "and interview", "End interview.", "Yeah, and the interview.",
+                     "end interview please", "Okay. And interview, please."):
+            with self.subTest(text=text):
+                self.assertTrue(confirms_end(text))
+        for text in (
+            "And the interview went well",
+            "And the interview?",
+            "No, and the interview",
+            "And the interview, I don't want to end it.",
+            "and the interviews",
+            "and the interview with your manager is next week",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(confirms_end(text))
+
     def test_the_end_detectors_are_linear_on_long_filler_runs(self):
         # Reviewed fix (BLOCKER): "okay, " was both a filler and a name in the imperative opener,
         # so each one more doubled the time ("okay, " * 20 + "fine" took 1.2 s, synchronously on

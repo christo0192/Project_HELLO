@@ -1955,8 +1955,9 @@ class TestSilenceWindows(R1TestCase):
                 mock.patch.object(self.interview, "_silence_ladder", ladder):
             self.assertIsNone(await asyncio.wait_for(self.interview._roleplay_turn(), 10.0))
         ladder.assert_awaited_once()
-        self.assertFalse(engine.plan_turn("End it.", 100).end_interview)
+        self.assertFalse(engine.plan_turn("End it.", 100).exit_roleplay)
         self.assertFalse(engine.end_confirmed)
+        self.assertFalse(engine.exit_requested)
 
     async def test_rp2_enters_aside_and_stays_there_on_terminal_silence(self) -> None:
         self.enter_roleplay()
@@ -3268,9 +3269,8 @@ class TestRunFlow(R1TestCase):
         self.assertEqual(self.writer.terminals, [("candidate_left", {"activated": True})])
         self.assertEqual(self.writer.outcomes, ["candidate_left"])
 
-    async def test_a_confirmed_request_to_stop_is_the_same_failed_session(self) -> None:
-        # Owner test 7f2a25e6: "can you disconnect the call?" gets the interviewer's question once;
-        # saying "end the interview" ends it exactly as closing the window does (no new outcome).
+    async def drive_to_the_roleplay(self) -> asyncio.Task:
+        """Run the real session until the learner has picked up, at R = 0."""
         task = asyncio.create_task(
             run_r1_session(self.ctx, session_factory=self.session_factory)
         )
@@ -3281,20 +3281,57 @@ class TestRunFlow(R1TestCase):
         await self.until(lambda: self._machine_phase() is R1Phase.ROLEPLAY)
         await self.until(lambda: self.spoken_and_played("L-PICKUP"))
         await self.settle()
+        return task
+
+    async def finish_the_wrapup_after_a_stop(self, task: asyncio.Task) -> None:
+        """The stop ended the role-play: L-EXIT, Christy's wrap-up, then an ordinary completion."""
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.05):
+            await self.candidate_replies_after("L-WRAP", "No questions, thanks")
+            self.assertEqual(await asyncio.wait_for(task, 10.0), "complete")
+        spoken = self.session.spoken
+        tail = ["L-EXIT", "L-WRAP", "L-CLOSE"]
+        self.assertEqual(spoken[-3:], [self.spoken_line(name) for name in tail])
+        phases = {row["text"]: row["phase"] for row in self.bot_rows()}
+        self.assertEqual(
+            [phases[self.spoken_line(name)] for name in tail],
+            ["roleplay_exit", "wrapup", "closing"],
+        )
+        # The normal completion: completed from in_progress (the scorer's trigger fires) and counted
+        # as complete.  Whether it is SCORED is the gate's: R = 1:00 fails ``roleplay_too_short``.
+        self.assertEqual(self.writer.terminals, [("complete", {"activated": True})])
+        self.assertEqual(self.writer.outcomes, ["complete"])
+        self.assertNotIn(self.spoken_line("L-SYSTEM-STOP"), spoken)
+        self.assertNotIn({"phase": "aborted"}, self.ctx.room.local_participant.attributes)
+        interview = self.session.agent.interview
+        self.assertTrue(interview.machine.roleplay_finished)
+        self.assertTrue(interview.engine.end_confirmed)
+        # The worker's own fidelity check fails it too: R stopped at 1:00.
+        fidelity = interview.engine.fidelity(r_end=interview.machine.roleplay_elapsed)
+        self.assertFalse(fidelity["checks"]["r_reached_10_min"])
+        self.assertFalse(fidelity["passes"])
+
+    async def test_a_confirmed_request_to_stop_ends_the_roleplay_into_the_wrapup(self) -> None:
+        # Owner test 7f2a25e6: "can you disconnect the call?" gets the interviewer's question once.
+        # Owner decision 2026-10-29 (owner test 1eb18cd4): "End the interview." then ends the
+        # ROLE-PLAY, and Christy's normal finishing part follows.  This used to end the whole
+        # session at once with L-END-CLOSE as a failed candidate_left.
+        task = await self.drive_to_the_roleplay()
         self.clock.advance(60)
         self.assertTrue(await self.answer("Okay, never mind, can you disconnect the call?"))
         await self.until(lambda: self.spoken_and_played("L-ASIDE-END"))
         await self.settle()
-        self.assertTrue(await self.answer("Yes, end the interview."))
-        self.assertEqual(await asyncio.wait_for(task, 10.0), "candidate_left")
-        self.assertEqual(self.writer.terminals, [("candidate_left", {"activated": True})])
-        self.assertEqual(self.writer.outcomes, ["candidate_left"])
-        spoken = self.session.spoken
-        self.assertEqual(spoken.count(self.spoken_line("L-END-CLOSE")), 1)
-        for line_id in ("L-EXIT", "L-WRAP", "L-CLOSE", "L-SYSTEM-STOP"):
-            self.assertNotIn(self.spoken_line(line_id), spoken)
-        # A stop the candidate chose is not announced as a technical one.
-        self.assertNotIn({"phase": "aborted"}, self.ctx.room.local_participant.attributes)
+        self.assertTrue(await self.answer("End the interview."))
+        await self.finish_the_wrapup_after_a_stop(task)
+        self.assertEqual(self.session.spoken.count(self.spoken_line("L-ASIDE-END")), 1)
+
+    async def test_an_explicit_first_request_ends_the_roleplay_with_no_question(self) -> None:
+        # Owner test 1eb18cd4, 81: "Let's end the interview." names the interview, so it is taken
+        # as confirmed: no L-ASIDE-END (it would only ask the candidate to say exactly that).
+        task = await self.drive_to_the_roleplay()
+        self.clock.advance(60)
+        self.assertTrue(await self.answer("Let's end the interview."))
+        await self.finish_the_wrapup_after_a_stop(task)
+        self.assertNotIn(self.spoken_line("L-ASIDE-END"), self.session.spoken)
 
     def _machine_phase(self):
         # run_r1_session builds its own interview; the agent holds a reference to it.
@@ -4940,7 +4977,7 @@ class TestWhatTheCandidateCanCut(R1TestCase):
     MUST_BE_HEARD = (
         "L-OPEN", "L-PICKUP", "L-TRANSITION", "L-TRANSITION-NUDGE", "L-SIL-IB", "L-SIL-RP1",
         "L-SIL-RP2", "L-SIL-END", "L-MUTE", "L-REJOIN", "L-REJOIN-RP", "L-EXIT", "L-WRAP",
-        "L-CLOSE", "L-SYSTEM-STOP", "L-END-CLOSE",
+        "L-CLOSE", "L-SYSTEM-STOP",
     )
 
     async def test_every_scripted_line_is_spoken_uninterruptible(self) -> None:
@@ -4966,7 +5003,9 @@ class TestWhatTheCandidateCanCut(R1TestCase):
     def test_no_scripted_call_site_asks_for_an_interruptible_line(self) -> None:
         source = Path(r1_session.__file__).read_text(encoding="utf-8")
         calls = re.findall(r"await self\.say\((.*?)\)", source, flags=re.S)
-        self.assertGreaterEqual(len(calls), 13)
+        # 12 since L-END-CLOSE's call site went (owner decision 2026-10-29: a confirmed stop ends
+        # the role-play into L-EXIT and the wrap-up).
+        self.assertGreaterEqual(len(calls), 12)
         for call in calls:
             self.assertNotIn("interruptible", call)
         self.assertIn("interruptible: bool = False", source)  # say()'s own default
@@ -5216,6 +5255,82 @@ class TestCandidateRowCoalescing(R1TestCase):
             1 for fragments in turns for f in fragments if len(f.split()) <= 2
         )
         self.assertGreaterEqual(per_final_short / finals, 0.1)
+
+
+class TestAcknowledgementTurns(R1TestCase):
+    """Owner test 1eb18cd4: speech-to-text sanity leaves acknowledgement-only turns out.
+
+    The session judges each role-play turn with ``is_acknowledgement_turn`` and hands the verdict
+    to the engine (``backchannel=``), whose ``stt_sanity`` then leaves the turn out; the API gate
+    leaves the same turns out of its own check through a TypeScript port of the classifier, pinned
+    by ``r1-acknowledgement-cross-language.test.ts`` on the shared fixture read here.
+    """
+
+    FIXTURE = HERE / "tests" / "fixtures" / "r1_acknowledgement_turns.json"
+
+    def test_the_shared_fixture_is_the_classifiers_verdict(self) -> None:
+        rows = json.loads(self.FIXTURE.read_text(encoding="utf-8"))
+        self.assertGreater(len(rows), 50)
+        for row in rows:
+            with self.subTest(text=row["text"]):
+                self.assertIs(
+                    r1_session.is_acknowledgement_turn(row["text"]), row["acknowledgement"]
+                )
+        # The owner's real short turns: the hand-back "Okay, continue." is one (the classifier's
+        # "continue" / "go on" / "go ahead"), a greeting or a goodbye is not.
+        verdicts = {row["text"]: row["acknowledgement"] for row in rows}
+        for text in ("Okay", "Yeah, Okay", "Okay, continue.", "Hmm", "Yeah, okay."):
+            self.assertTrue(verdicts[text], text)
+        for text in ("Hi Pooja", "So Bye", "the price", "Yes."):
+            self.assertFalse(verdicts[text], text)
+
+    def test_the_engine_tests_are_told_what_the_session_would_tell_them(self) -> None:
+        from tests.test_r1_roleplay import (
+            OWNER_1EB18CD4_ACKNOWLEDGEMENTS,
+            OWNER_1EB18CD4_ROLEPLAY,
+        )
+
+        self.assertEqual(
+            {i for i, text in OWNER_1EB18CD4_ROLEPLAY if r1_session.is_acknowledgement_turn(text)},
+            OWNER_1EB18CD4_ACKNOWLEDGEMENTS,
+        )
+
+    async def replay_the_owners_roleplay(self, min_words: str) -> None:
+        """The owner's role-play turns (before the end requests) through the real session."""
+        from tests.test_r1_roleplay import OWNER_1EB18CD4_ROLEPLAY
+
+        turns = [text for index, text in OWNER_1EB18CD4_ROLEPLAY if index <= 71]
+        with mock.patch.dict(os.environ, {"R1_INTERRUPT_MIN_WORDS": min_words}):
+            self.assertEqual(r1_session.interrupt_min_words(), int(min_words))
+            self.enter_roleplay()
+            engine = self.interview.engine
+            with mock.patch.object(engine, "plan_turn", wraps=engine.plan_turn) as plan:
+                for text in turns:
+                    self.clock.advance(20)
+                    await self.answer(text)
+            told = [call.kwargs["backchannel"] for call in plan.call_args_list]
+        self.assertEqual(sum(told), 8)  # the session told the engine of each acknowledgement
+        fidelity = engine.fidelity(r_end=self.interview.machine.roleplay_elapsed)
+        self.assertTrue(fidelity["checks"]["stt_sanity"], fidelity)
+        self.assertEqual(fidelity["acknowledgement_turns"], 8)
+        await self.flush()
+        rows = [
+            row["text"] for row in self.writer.saved
+            if row["speaker"] == "candidate" and row["phase"] == "roleplay"
+        ]
+        self.assertEqual(len(rows), len(turns))
+        # What the gate's computeTranscriptStats reads: 1 short row of the 25 that are not
+        # acknowledgements (4%) passes R1_GATE_LIMITS.STT_SUSPECT_SHARE_FAIL_AT; counting the
+        # acknowledgements (before this fix) it was 8 of 33 (24%).
+        speech = [text for text in rows if not r1_session.is_acknowledgement_turn(text)]
+        self.assertLess(sum(1 for t in speech if len(t.split()) <= 2) / len(speech), 0.1)
+        self.assertGreaterEqual(sum(1 for t in rows if len(t.split()) <= 2) / len(rows), 0.1)
+
+    async def test_the_owners_roleplay_passes_stt_sanity_at_zero_words(self) -> None:
+        await self.replay_the_owners_roleplay("0")
+
+    async def test_the_owners_roleplay_passes_stt_sanity_at_the_three_word_rollback(self) -> None:
+        await self.replay_the_owners_roleplay("3")
 
 
 class TestIcebreakerNote(unittest.TestCase):

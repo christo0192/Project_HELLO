@@ -36,6 +36,7 @@ four communication facts the worker does not measure yet (``talk_share_pct``, ``
 """
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import re
@@ -63,8 +64,14 @@ from tests.test_r1_core import (
     setUpModule,  # noqa: F401 - unittest runs it: silences the loggers' stdout
     tearDownModule,  # noqa: F401
 )
-from tests.test_r1_integration import Rig, fidelity_session
-from tests.test_r1_roleplay import cooperative_script
+from tests.test_r1_integration import (
+    FIDELITY_FIRST_AUDIO_SECONDS,
+    GOOD_JUDGE,
+    Rig,
+    fidelity_session,
+    judge_returning,
+)
+from tests.test_r1_roleplay import NEUTRAL, OPENER, cooperative_script, strong_script
 
 API_ADMIN_LOG = HERE.parent / "api" / "src" / "lib" / "r1" / "admin-log.ts"
 API_ROUTES = HERE.parent / "api" / "src" / "routes" / "r1.ts"
@@ -405,6 +412,57 @@ async def facts_of(rig):
     await rig.flush()
     (facts,) = [e for e in posted(rig.writer.admin_events) if e["event_type"] == "session_facts"]
     return facts["payload"]
+
+
+class TestAnEarlyEndIsScoredOnlyIfTheChecksPass(unittest.IsolatedAsyncioTestCase):
+    """Owner decision 2026-10-29 ("score it if checks pass"): a confirmed out-of-role stop ends
+    the role-play through its normal exit and the session completes normally, so the gate alone
+    decides.  Ended at R = 5:00 the administration fails it; ended at R = 12:50 with every family
+    delivered it does not.  (The worker's outcome is ``complete`` either way; the API's
+    ``r1_settle_attempt`` and the scorer already handle it, so nothing on the API side changed.)"""
+
+    async def end_at(self, *, families: bool) -> tuple[Rig, list]:
+        audio = itertools.cycle(FIDELITY_FIRST_AUDIO_SECONDS)
+        rig = Rig(judge=judge_returning(GOOD_JUDGE))
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20, first_audio_after=next(audio))
+        if families:
+            for text in strong_script()[1:]:
+                await rig.converse(text, advance=35, first_audio_after=next(audio))
+            while (
+                not rig.engine.scheduler.all_families_complete
+                and rig.machine.roleplay_elapsed < 740
+            ):
+                await rig.converse(NEUTRAL, advance=30, first_audio_after=next(audio))
+            self.assertTrue(rig.engine.scheduler.all_families_complete)
+            rig.clock.advance(770 - rig.machine.roleplay_elapsed)
+        else:
+            for text in strong_script()[1:8]:
+                await rig.converse(text, advance=35, first_audio_after=next(audio))
+            rig.clock.advance(300 - rig.machine.roleplay_elapsed)
+        self.assertFalse(rig.engine.commitment_resolved)
+        self.assertIsNone(await rig.converse("End the interview."))
+        self.assertTrue(rig.engine.end_confirmed and rig.engine.exit_requested)
+        self.assertTrue(rig.interview._roleplay_over())
+        rig.interview._end_roleplay()  # what ``run`` does next: L-EXIT, the wrap-up, complete
+        rig.interview._begin_exit()
+        rig.interview._queue_fidelity()
+        await rig.flush()
+        return rig, posted(rig.writer.admin_events)
+
+    async def test_ended_at_five_minutes_the_gate_fails_it(self):
+        rig, rows = await self.end_at(families=False)
+        self.assertAlmostEqual(rig.machine.roleplay_elapsed, 300, delta=1)
+        failures = gate_like_api(parse_like_api(rows))
+        self.assertIn("roleplay_too_short", failures)
+        self.assertTrue(any(failure.startswith("family_missing") for failure in failures))
+
+    async def test_ended_at_twelve_fifty_with_every_family_the_gate_passes_it(self):
+        rig, rows = await self.end_at(families=True)
+        self.assertAlmostEqual(rig.machine.roleplay_elapsed, 770, delta=1)
+        self.assertEqual(gate_like_api(parse_like_api(rows)), [])
+        fidelity = rig.engine.fidelity(r_end=rig.machine.roleplay_elapsed)
+        self.assertTrue(fidelity["passes"], fidelity)
 
 
 class TestSessionFacts(unittest.IsolatedAsyncioTestCase):

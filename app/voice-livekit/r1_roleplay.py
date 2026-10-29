@@ -14,10 +14,8 @@ engine only DECIDES, deterministically, what the learner does on each candidate 
     MEDIUM with its call slot, or the WEAK resolution), the close-attempt stall, or
     (``plan.aside``) the interviewer's one-off L-ASIDE-COACH or L-ASIDE-END (``plan.line_id``),
     which the session speaks in the ASIDE phase with ``plan.voice == "interviewer"`` and which
-    is excluded from evidence (plan 5.10), or (``plan.end_interview``) L-END-CLOSE after the
-    candidate confirmed they want to stop, which ends the session as ``candidate_left`` (only
-    before R = 14:00 with no commitment on record; otherwise an end request is a farewell).  The
-    WEAK line is spoken at most once per session (``r1_negotiation``).
+    is excluded from evidence (plan 5.10).  The WEAK line is spoken at most once per session
+    (``r1_negotiation``).
 ``INTENT``
     R1-Q option B, intent-voiced moves.  The worker decides WHAT the learner raises (an owed
     objection, an early-farewell redirect, the time cue, and, from the negotiation, a stall
@@ -35,7 +33,12 @@ engine only DECIDES, deterministically, what the learner does on each candidate 
     need's facts only on the turn that asks about a released topic, and now and then one
     curiosity topic), screened sentence by sentence by ``plan.guard_ctx``.
 ``EXIT``
-    The candidate said goodbye again: the session moves to ROLEPLAY_EXIT.
+    The candidate said goodbye again, or (``"end_confirmed"`` in ``plan.reasons``) confirmed an
+    out-of-role request to stop before R = 14:00 with no commitment on record: the session moves
+    to ROLEPLAY_EXIT and the interviewer's normal wrap-up follows (owner decision 2026-10-29).  An
+    early end is scored only when the normal fidelity checks pass (``fidelity``: R reached 10:00,
+    every family delivered, and the rest).  From 14:00, or with a commitment on record, an end
+    request is a farewell on the close ladder instead.
 
 Repetition control (R1-Q): ``record_spoken`` feeds every sentence the learner actually
 played into a ``SpokenMemory``; each plan's guard context carries a snapshot (``said``), so
@@ -75,8 +78,7 @@ transcript in ROLEPLAY, with ``r_sec`` read from the phase machine's role-play c
      a "Sorry?" gets it again, and a graded commitment line she did not finish is said again;
      see ``record_spoken``.  A reply cancelled before any audio is reported with
      ``engine.reply_lost(plan)``)
-    if plan.exit_roleplay:            -> machine.transition(ROLEPLAY_EXIT)
-    elif plan.end_interview:          -> say L-END-CLOSE, finish as candidate_left (no wrap-up)
+    if plan.exit_roleplay:            -> machine.transition(ROLEPLAY_EXIT), L-EXIT, the wrap-up
     elif plan.aside:                  -> ASIDE phase, say(plan.scripted_text), back to ROLEPLAY
     elif plan.mode is SAY_ONLY:       -> raise StopResponse; say(plan.scripted_text)
     else (INTENT or LLM_REPLY):       -> add plan.reminder as the ephemeral system message;
@@ -231,6 +233,7 @@ from r1_tracker import (
     declines_end,
     detect_character_break,
     detect_end_request,
+    explicit_end_request,
     parse_judge_output,
     promises_call_back,
 )
@@ -350,11 +353,8 @@ class TurnPlan:
     intent: LearnerIntent | None = None
     # R1-Q: the negotiation spec an INTENT plan voices (a stall reason, the e-mail yes ...), if any.
     negotiation_id: str | None = None
-    # The scripted interviewer line an aside speaks (L-ASIDE-COACH, L-ASIDE-END, L-END-CLOSE), and
-    # whether the candidate confirmed they want to stop: the session then says L-END-CLOSE and
-    # ends as ``candidate_left``, exactly as closing the window would (never the wrap-up).
+    # The scripted interviewer line an aside speaks (L-ASIDE-COACH or L-ASIDE-END).
     line_id: str | None = None
-    end_interview: bool = False
     # Voice barge-in: an owed move this plan does not voice but may complete.  The advisor cut the
     # learner off while she was raising it and she is told to finish (or repeat) her point: when the
     # played text proves the move it counts as delivered then (``record_spoken``), never twice.
@@ -405,7 +405,16 @@ class RolePlayEngine:
         self.turn = 0
         self.last_r = 0.0
         self._advisor_amounts: set[int] = set()
+        # The word count of every planned turn (the substantive-turn count, the thin-advisor
+        # evidence and the turn count), and of the turns that are not acknowledgement-only
+        # (``plan_turn(backchannel=...)``), which the speech-to-text sanity check reads: a lone
+        # "Okay." or "Yeah, go on." is a whole turn the candidate meant, not a long answer that
+        # speech-to-text chopped into fragments.  Voice barge-in (min_words 0) commits each such
+        # acknowledgement as its own turn, where the SDK used to bank it into the next one (owner
+        # test 1eb18cd4: 7 of its 8 short role-play turns were acknowledgements, 21% short, and
+        # ``stt_sanity`` failed a normal session).
         self._word_counts: list[int] = []
+        self._stt_word_counts: list[int] = []
         self._turn_map: dict[int, int] = {}
         self._longest_turn_sec = 0.0
         self._asks: list[dict[str, Any]] = []
@@ -481,10 +490,12 @@ class RolePlayEngine:
         # held by two challenges in a row).
         self._challenge_deferred: list[str] = []
         # Owner test 7f2a25e6 ("can you disconnect the call?").  The one-off L-ASIDE-END question
-        # (when it played), whether it is still open (a fragment leaves it open), and whether the
-        # candidate confirmed the stop (the session ends as ``candidate_left``; nothing here can
-        # reach the wrap-up, a grade or a disclosure).  From 14:00, or with a commitment on
-        # record, an end request is a farewell instead and reaches only what "bye" reaches.
+        # (when it played) or the explicit request that needed none, whether the question is still
+        # open (a fragment leaves it open), and whether the candidate confirmed the stop.  A
+        # confirmed stop exits the role-play into the wrap-up exactly as a farewell exit does
+        # (``exit_requested``; owner decision 2026-10-29) and changes no grade, disclosure or
+        # schedule state.  From 14:00, or with a commitment on record, an end request is a
+        # farewell instead and reaches only what "bye" reaches.
         self._end_aside: dict[str, Any] | None = None
         self._end_pending = False
         self.end_confirmed = False
@@ -636,9 +647,10 @@ class RolePlayEngine:
 
         The worker's judgement of a short turn (``r1_session``):
 
-        * ``backchannel``: nothing but acknowledgement ("yeah", "okay", "mm-hmm";
-          ``is_acknowledgement_turn``).  When this turn cut the learner's last line off
-          (``record_spoken(..., interrupted=True)``) she only finishes her point.
+        * ``backchannel``: nothing but acknowledgement ("yeah", "okay", "mm-hmm", "okay,
+          continue"; ``is_acknowledgement_turn``).  When this turn cut the learner's last line off
+          (``record_spoken(..., interrupted=True)``) she only finishes her point.  Such a turn is
+          never counted by the speech-to-text sanity check (``fidelity``): it is not a fragment.
         * ``repair``: only a request to hear it again or a check that she is there ("Sorry?",
           "Pardon?", "Hello? Are you there?"; ``is_repair_turn``).  After a cut she says it again.
         * ``answers_nothing``: courtesy words alone (``is_backchannel_turn``).  With the two above
@@ -663,14 +675,21 @@ class RolePlayEngine:
         # R = 14:00 and with no commitment on record it is answered by the interviewer, never by an
         # owed move and never by the close ladder: she asks once (L-ASIDE-END: say "end the
         # interview" to stop).  End words in answer, or the request again at a later turn of that
-        # stretch, end the session as ``candidate_left`` (a failed session, as closing the window);
-        # anything else resumes the role-play with this very turn, and a backchannel or a
-        # speech-to-text fragment ("Hmm", "Okay.") leaves the question open.
+        # stretch, confirm the stop; anything else resumes the role-play with this very turn, and a
+        # backchannel or a speech-to-text fragment ("Hmm", "Okay.") leaves the question open.  A
+        # first request that names the interview or the role play ("End the interview.", "Can we
+        # end this role play?"; ``explicit_end_request``) is confirmed at once, without the
+        # question, which would only ask the candidate to say exactly that (owner test 1eb18cd4).
+        # A confirmed stop ends the ROLE-PLAY, not the session (owner decision 2026-10-29): the
+        # plan is the role-play exit, and L-EXIT and the interviewer's wrap-up follow, as after a
+        # farewell exit.  The session completes normally and is scored only if the fidelity checks
+        # pass (R reached 10:00, every family delivered ...), so asking to stop earns nothing a
+        # second "bye" before 14:00 (the close ladder's exit) would not.
         #
         # From 14:00, or once a commitment is on record, the role-play has already earned its score
         # and the request is the advisor's way of saying goodbye (reviewed fix: "Okay Priya, let's
         # disconnect the call now, I'll send you the email" at 18:20, after a complete role-play,
-        # ended it as a failed candidate_left, and "End the interview." right after a booked call
+        # ended it as a failed session, and "End the interview." right after a booked call
         # did too, where "Thank you so much, bye!" exits and is scored).  So the request, or end
         # words answering a question asked earlier, is a farewell: it gets exactly what "bye" gets
         # on the close ladder (the redirect once before 14:00, the WEAK stall in the close window,
@@ -678,21 +697,21 @@ class RolePlayEngine:
         end_request = detect_end_request(candidate_text)
         # Once the aside has been asked, an answer that also declines is a no whatever end words it
         # holds: "No, I don't think I want to stop", "No, why would you end the call?" (reviewed
-        # fix: these ended the session as a failed candidate_left).
+        # fix: these ended the session).
         declined = self._end_aside is not None and declines_end(candidate_text)
         end_words = (end_request and not declined) or (
             self._end_pending and confirms_end(candidate_text)
         )
         # "Let's cut the call now, I'll call you tomorrow": a call-back promise is the advisor
         # closing the sale's call in role, so it is a farewell, never the out-of-role stop (reviewed
-        # fix: after a declined aside it ended the session as candidate_left).
+        # fix: after a declined aside it ended the session).
         out_of_role = (
             r_sec < EARLY_CLOSE_BEFORE_SEC
             and not self.commitment_resolved
             and not promises_call_back(candidate_text)
         )
         if out_of_role and self._end_aside is not None and end_words:
-            return self._end_plan(turn_index)
+            return self._end_plan(turn_index, r_sec=r_sec)
         farewell_end = end_words and not out_of_role
         if self._end_pending and (
             farewell_end
@@ -703,6 +722,8 @@ class RolePlayEngine:
         if end_request and self._end_aside is None and out_of_role:
             # The aside is no answer to the lost plan either: what that plan used up is given back.
             self._restore_lost(lost_undo)
+            if explicit_end_request(candidate_text):
+                return self._end_plan(turn_index, r_sec=r_sec)
             return self._end_aside_plan(r_sec, turn_index)
         break_kind = detect_character_break(candidate_text)
         if lost is not None:
@@ -743,7 +764,10 @@ class RolePlayEngine:
             self._turn_map[turn] = turn_index
         if candidate_seconds is not None:
             self._longest_turn_sec = max(self._longest_turn_sec, candidate_seconds)
-        self._word_counts.append(word_count(candidate_text))
+        words = word_count(candidate_text)
+        self._word_counts.append(words)
+        if not backchannel:
+            self._stt_word_counts.append(words)
         self._hollow_run = self._hollow_run + 1 if is_hollow_turn(candidate_text) else 0
         self._decider_asked_now = False
         signals = self.scheduler.observe_candidate_turn(candidate_text, r_sec)
@@ -1033,7 +1057,7 @@ class RolePlayEngine:
         audio frame but before any word was heard: that too is a line nobody heard.  Only the
         latest plan counts: a newer turn was already planned otherwise.
         """
-        if plan.aside or plan.end_interview or plan.mode is TurnMode.EXIT or plan.turn != self.turn:
+        if plan.aside or plan.mode is TurnMode.EXIT or plan.turn != self.turn:
             return
         self._lost_plan = plan
         self._lost_undo = None if self._turn_undo is None else (*self._turn_undo, self._turn_ask)
@@ -1160,15 +1184,18 @@ class RolePlayEngine:
 
         Like the coach aside it is excluded from evidence (nothing observes the candidate's
         words, no owed move is issued, the schedule does not move) and the session pauses R.
-        It is asked only before R = 14:00 with no commitment on record.  The next candidate turn
-        that is more than a fragment answers it (``_end_pending``); only end words confirm
-        (``confirms_end``), and so does a later end request, while R < 14:00 and no commitment is
-        on record.  After that both are farewells (the close ladder, see ``plan_turn``).
+        It is asked only before R = 14:00 with no commitment on record, and not for a request that
+        names the interview or the role play (that one is confirmed at once, ``_end_plan``).  The
+        next candidate turn that is more than a fragment answers it (``_end_pending``); only end
+        words confirm (``confirms_end``), and so does a later end request, while R < 14:00 and no
+        commitment is on record.  After that both are farewells (the close ladder, see
+        ``plan_turn``).
         """
         self._end_aside = {
             "after_roleplay_turn": self.turn,
             "transcript_turn": turn_index,
             "r_sec": round(r_sec, 1),
+            "question_asked": True,
             "confirmed": False,
         }
         self._end_pending = True
@@ -1189,26 +1216,36 @@ class RolePlayEngine:
         """
         self._end_pending = False
 
-    def _end_plan(self, turn_index: int | None) -> TurnPlan:
-        """The candidate confirmed the stop: L-END-CLOSE, then ``candidate_left`` (the session's).
+    def _end_plan(self, turn_index: int | None, *, r_sec: float) -> TurnPlan:
+        """The candidate confirmed the stop: the role-play exits into the interviewer's wrap-up.
 
-        No new outcome: the session ends exactly as if the candidate had closed the window
-        (a failed session), so asking to stop can never earn more than leaving would.  The turn
-        is excluded from evidence and changes no commitment, disclosure or schedule state.
+        Owner decision 2026-10-29 ("the role play should end and the finishing part of Christy the
+        interviewer should come in"; "score it if checks pass").  The plan is the role-play exit
+        (``exit_requested``, as the close ladder's exit sets it), so the session says L-EXIT and
+        runs the wrap-up and the ordinary completion; the fidelity checks then decide whether the
+        early end is scored (R reached 10:00, every family delivered and the rest), so at 5:00 it
+        never is.  No new outcome and no new path: a second "bye" before 14:00 reaches this exit
+        too.  The turn is excluded from evidence (the scheduler, the tracker and the word counts
+        never see it) and changes no commitment, disclosure or schedule state.  A FIRST request
+        that names the interview or the role play gets here with no question asked: it is then
+        recorded with ``question_asked`` false and the reason ``end_request_explicit``.
         """
+        reasons = ["end_confirmed"]
+        if self._end_aside is None:
+            reasons.insert(0, "end_request_explicit")
+            self._end_aside = {
+                "after_roleplay_turn": self.turn,
+                "transcript_turn": turn_index,
+                "r_sec": round(r_sec, 1),
+                "question_asked": False,
+                "confirmed": False,
+            }
+        self._end_aside["confirmed"] = True
+        self._end_aside["answer_transcript_turn"] = turn_index
+        self._end_pending = False
         self.end_confirmed = True
-        if self._end_aside is not None:
-            self._end_aside["confirmed"] = True
-            self._end_aside["answer_transcript_turn"] = turn_index
-        return self._plan(
-            TurnMode.SAY_ONLY,
-            ["end_confirmed"],
-            scripted=script_line("L-END-CLOSE"),
-            voice="interviewer",
-            aside=True,
-            line_id="L-END-CLOSE",
-            end_interview=True,
-        )
+        self.exit_requested = True
+        return self._plan(TurnMode.EXIT, reasons)
 
     # ----------------------------------------------------------------- negotiation
     def _observe_negotiation(self, candidate_text: str, turn: int) -> NegotiationTurn:
@@ -1800,7 +1837,6 @@ class RolePlayEngine:
         curiosity: str = "",
         negotiation_id: str | None = None,
         line_id: str | None = None,
-        end_interview: bool = False,
         credit_move_id: str | None = None,
     ) -> TurnPlan:
         reminder: str | None = None
@@ -1884,7 +1920,6 @@ class RolePlayEngine:
             intent=intent,
             negotiation_id=negotiation_id,
             line_id=line_id,
-            end_interview=end_interview,
             credit_move_id=credit_move_id,
         )
 
@@ -2060,13 +2095,21 @@ class RolePlayEngine:
 
     # -------------------------------------------------------------------------- logs
     def fidelity(self, r_end: float | None = None) -> dict[str, Any]:
-        """The plan 6.4 administration checks this module can evaluate."""
+        """The plan 6.4 administration checks this module can evaluate.
+
+        ``stt_sanity`` (fewer than ``STT_SHORT_SHARE_LIMIT`` of the turns of at most
+        ``STT_SHORT_WORDS`` words) reads only the turns that are not acknowledgement-only: an
+        "Okay." or "Okay, continue." is the candidate's whole turn, which voice barge-in commits on
+        its own, not speech-to-text chopping a long answer into fragments.  A short turn that is
+        anything else ("Hi Pooja", "the price", "So bye") still counts, and a role-play of nothing
+        but acknowledgements fails closed, as an empty one does.
+        """
         end = self.last_r if r_end is None else r_end
         schedule = self.scheduler.summary(final=True)
-        words = self._word_counts
-        substantive = sum(1 for count in words if count >= SUBSTANTIVE_WORDS)
+        substantive = sum(1 for count in self._word_counts if count >= SUBSTANTIVE_WORDS)
+        stt = self._stt_word_counts
         short_share = (
-            sum(1 for count in words if count <= STT_SHORT_WORDS) / len(words) if words else 1.0
+            sum(1 for count in stt if count <= STT_SHORT_WORDS) / len(stt) if stt else 1.0
         )
         reasons = list(schedule["exclusion_reasons"])  # type: ignore[arg-type]
         checks = {
@@ -2085,6 +2128,7 @@ class RolePlayEngine:
             "passes": all(checks.values()),
             "substantive_turns": substantive,
             "short_turn_share": round(short_share, 3),
+            "acknowledgement_turns": len(self._word_counts) - len(stt),
         }
 
     def admin_log(self, *, final: bool = False, r_end: float | None = None) -> dict[str, Any]:
@@ -2160,7 +2204,8 @@ class RolePlayEngine:
             "early_close": {
                 "attempts": self.scheduler.close_attempts,
                 "exit_requested": self.exit_requested,
-                # The one-off "end the interview now, or carry on?" aside, if it played.
+                # The one-off out-of-role end request: the "end the interview now, or carry on?"
+                # aside, or an explicit request that needed none (``question_asked`` false).
                 "end_request": None if self._end_aside is None else dict(self._end_aside),
             },
             "character_breaks": {
@@ -2169,6 +2214,7 @@ class RolePlayEngine:
             },
             "communication": {
                 "candidate_turns": len(self._word_counts),
+                "acknowledgement_turns": len(self._word_counts) - len(self._stt_word_counts),
                 "longest_candidate_turn_sec": round(self._longest_turn_sec, 1),
             },
             "excluded_from_auto_status": schedule["excluded_from_auto_status"],
