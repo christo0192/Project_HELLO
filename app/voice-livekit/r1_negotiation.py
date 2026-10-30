@@ -69,6 +69,9 @@ MAX_TEXT_CHARS = 12000
 MAX_STALL_ROUNDS = 2
 ANCHOR_USD = 7000
 MIN_NET_USD = 4500
+# A net price below MIN_NET_USD counts only in an explicit net-price frame ("I will give it to you
+# for $3000", "give the program for 3000"): a bare small figure stays a deck discount.
+MIN_FRAMED_NET_USD = 1000
 PREFERRED_TIME = "7 PM"
 MOVED_DAY = "tomorrow"
 # The learner said it had to talk to its decision maker this recently: a vague "let me know when's
@@ -502,6 +505,34 @@ def anchor_after_offer(offer_usd: int) -> AnchorSituation:
             "that price include?",
             f"{amount} is under the $7,000 I read about.",
             f"I heard people paid about $7,000, and {amount} is below that.",
+        ),
+    )
+
+
+ANCHOR_UNCLEAR = "unclear"
+
+
+def anchor_after_unclear_low(amount_usd: int) -> AnchorSituation:
+    """The anchor when the advisor named ``amount_usd``, under $7,000, in a way not read as a price.
+
+    Owner test 8f5bfefc: the advisor said $3,000 and the learner still asked "$9,000 ... can you do
+    $7,000?".  Whatever the figure was (an offer worded in a way the parser misses, a part payment,
+    a discount), asking for MORE than it is wrong: the learner reacts to that number and asks what
+    the total would be, and still names the $7,000 it heard (the anchor's delivery marker).
+    """
+    amount = _usd(amount_usd)
+    return AnchorSituation(
+        ANCHOR_UNCLEAR,
+        f"the advisor mentioned {amount}, but it is not clear that is the full price you would "
+        "pay; react to that number, say you had heard it was around $7,000, and ask what the "
+        "total would come to for you; do not ask for $7,000 and do not accept anything yet",
+        (amount, "$7,000"),
+        (
+            f"Wait, {amount} for the whole program? I'd heard it was around $7,000, so what would "
+            "I actually pay?",
+            f"Sorry, just so I follow: is {amount} what I'd pay in total? I'd heard around $7,000.",
+            f"Hold on, {amount}? I heard people paid around $7,000. What would the total be for "
+            "me?",
         ),
     )
 
@@ -1198,9 +1229,144 @@ def _described_discount(lowered: str, start: int) -> bool:
 # A bound, not a price: "under six thousand", "below $7,000", "no more than $7,500".
 _BOUND_BEFORE = re.compile(
     r"\b(?:under|below|beneath|less than|no more than|not more than|at most|just under|"
-    r"a little under|a bit under|well under|maximum of)\s+(?:about |around |roughly )?$",
+    r"a little under|a bit under|well under|maximum of|"
+    # "I will do better than 7000" promises a price below the figure, never the figure itself.
+    r"better than|lower than|cheaper than)\s+(?:about |around |roughly )?$",
     re.IGNORECASE,
 )
+# The advisor selling the course for a figure: "I will give it to you for $3000", "I'm giving the
+# program for 3000", "you can have the course at $3,000" (owner test 8f5bfefc).  "get" / "have" /
+# "take" need "you" as the subject: "Most of my students get it for 6000" is someone else's price.
+_ONLY = r"(?:only\s+|just\s+)?"
+_THE_COURSE = r"(?:it|this|that|the (?:whole )?(?:program|programme|course|thing))"
+_NET_FRAME = re.compile(
+    r"\b(?:giv(?:e|es|ing)|gave|sell(?:s|ing)?|sold|offer(?:s|ing)?|let you have|do|doing)\s+"
+    r"(?:you\s+)?" + _THE_COURSE + r"\s+(?:to you\s+)?(?:for|at)\s+" + _ONLY + r"$"
+    r"|\byou(?:'ll| will| would|'d| can| could| may)?\s+(?:also\s+)?(?:get|have|take|grab)\s+"
+    + _THE_COURSE + r"\s+(?:for|at)\s+" + _ONLY + r"$"
+    r"|\byou(?:'ll| will| would|'d| can| could| may)?\s+(?:join|enrol+|sign up|start|get in)\s+"
+    r"(?:the (?:program|programme|course)\s+)?(?:for|at)\s+" + _ONLY + r"$"
+    # A plain "fee is" only: "the booking fee is just $1,000" is a part of the price.
+    r"|(?<!booking )(?<!registration )(?<!reservation )(?<!admission )(?<!application )"
+    r"(?<!token )(?<!seat )(?<!deposit )"
+    r"\b(?:price|cost|fee|total)\s+(?:for you\s+)?(?:is|will be|would be|comes to)\s+" + _ONLY
+    + r"$"
+    r"|\byou(?:'ll| will| would|'d)?\s+" + _ONLY + r"pay\s+" + _ONLY + r"$"
+    r"|\b(?:bring(?:ing)?|take|taking|get(?:ting)?)\s+(?:it|this|that|the price)\s+down\s+to\s+$",
+    re.IGNORECASE,
+)
+# Other ways the advisor names a figure as the learner's price (owner test 8f5bfefc review): "I can
+# offer you $3,000", "I'll make it 3000", "How about $3,000?", "It's yours for $3,000", "For you
+# it's just 3000", "I'll give you a deal at $3,000".  Read in the figure's own clause.
+_LOW_NET_BEFORE = re.compile(
+    r"\boffer(?:s|ing)?\s+(?:you\s+)?(?:a (?:price|deal|rate) of\s+)?" + _ONLY + r"$"
+    r"|\b(?:make|making)\s+it\s+" + _ONLY + r"$"
+    r"|\blet'?s (?:make it|do|say|go with|settle (?:on|at)|close (?:on|at))\s+" + _ONLY + r"$"
+    r"|\b(?:how|what) about\s+" + _ONLY + r"$"
+    r"|\b(?:it'?s|it is|it will be|it would be|that'?s)\s+(?:all\s+)?yours\s+(?:for|at)\s+"
+    + _ONLY + r"$"
+    r"|\bfor you\b[^.?!]{0,20}$"
+    r"|\b(?:deal|price|rate|offer)\s+(?:of|at|for)\s+" + _ONLY + r"$",
+    re.IGNORECASE,
+)
+_LOW_NET_AFTER = re.compile(
+    r"^\s*(?:only\s+)?(?:for you|and it'?s yours|is (?:my |our |the |your )?(?:final|best|last|"
+    r"lowest)|final|flat|all in|in total|total|for the (?:whole|full|entire) "
+    r"(?:program|programme|course))\b",
+    re.IGNORECASE,
+)
+# A lead clause that makes the figure after it a price: "Special price for you, $3,000."
+_LOW_NET_LEAD = re.compile(
+    r"\b(?:special|final|best|lowest|deal|for you|my price|our price|your price)\b",
+    re.IGNORECASE,
+)
+# A figure that is a part of the price, never the price itself (review of the 8f5bfefc fix): a
+# deposit, a booking or registration fee, an instalment, a per-module fee, an add-on, or what is
+# paid now when "the rest" comes later.  ``_PART_LATER`` is the rest of the sentence.
+_PART_AFTER = re.compile(
+    r"^\s*(?:(?:more|extra|additional|on top|cash ?back|back|refund|rebate|voucher|coupon|"
+    r"credit|bonus|scholarship|waiver)\b"
+    r"|(?:per|each|every|a|an|/)\s*(?:\w+\s+)?(?:months?|instal+ments?|emis?|modules?|terms?|"
+    r"semesters?|quarters?|weeks?|years?|class(?:es)?|sessions?|parts?|units?|levels?|"
+    r"subjects?|payments?)\b"
+    r"|(?:as|for|in|is)\s+(?:a |an |the |your |my )?(?:\w+\s+)?(?:deposit|down ?payment|advance|"
+    r"token|booking|registration|reservation|admission|application|first|initial|instal+ment|"
+    r"emi|part)\b"
+    r"|up ?front\b|in advance\b|advance\b|to (?:reserve|block|book|hold|lock|secure) )",
+    re.IGNORECASE,
+)
+_PART_NOW = re.compile(r"^\s*(?:now|today|first|initially|to start|to begin)\b", re.IGNORECASE)
+_PART_LATER = re.compile(
+    r"\b(?:later|the rest|remaining|balance|afterwards|after (?:that|placement|the course)|"
+    r"in (?:two|three|four|\d) (?:parts|payments|instal+ments))\b",
+    re.IGNORECASE,
+)
+_PART_BEFORE = re.compile(
+    r"\b(?:deposit|down ?payment|advance|token|booking|registration|reservation|admission|"
+    r"application|seat|blocking)(?:\s+(?:fee|amount|charge|payment|money))?\b[^.?!]{0,25}$"
+    r"|\b(?:first|initial|each|every|per|monthly|one|an?)\s+(?:instal+ment|emi|part|month)\b"
+    r"[^.?!]{0,25}$"
+    r"|\b(?:instal+ments?|emis?)\s+(?:of|is|are|will be|would be|comes? to)\b[^.?!]{0,15}$"
+    r"|\b(?:an? )?(?:additional|extra|another|further)\s+$",
+    re.IGNORECASE,
+)
+# A discount by any name before the figure, or "by" a figure ("bring it down by 2000"), and someone
+# else's price ("Most of my students get it for 6000", "Other people pay 3000").
+_LOW_DISCOUNT_BEFORE = re.compile(
+    r"\b(?:discount\w*|off|saving\w*|scholarship\w*|waiver|waive\w*|cash ?back|rebate|reduction|"
+    r"concession|less|cheaper|lower)\b[^.?!]{0,30}$"
+    r"|\bby\s+(?:another |an extra |a further )?$",
+    re.IGNORECASE,
+)
+_THIRD_PARTY_BEFORE = re.compile(
+    r"\b(?:students?|people|others|alumni|everyone|everybody|learners?|folks|friends?|"
+    r"colleagues?|candidates?|they|he|she)\b(?:\s+\w+){0,3}?\s+(?:get|gets|pay|pays|take|takes|"
+    r"have|has|buy|buys|join|joins)\b",
+    re.IGNORECASE,
+)
+_YEAR_BEFORE = re.compile(r"\b(?:in|since|from|until|till|by|of|year|the)\s+$", re.IGNORECASE)
+_YEAR_AFTER = re.compile(r"^\s*(?:batch|cohort|intake|session|class|season)\b", re.IGNORECASE)
+
+
+# How far around a figure its frame is read: every frame is a few words, and a bounded window
+# keeps a sentence with many figures linear (the hostile-text bound in test_r1_negotiation).
+_FRAME_CHARS = 120
+_UNIT_WORD = re.compile(r"^\s*(?:dollars?|usd|bucks)\b", re.IGNORECASE)
+
+
+def _part_of_price(lowered: str, start: int, end: int, rest_later: bool) -> bool:
+    """The figure at ``start:end`` is a discount, a part payment, an add-on or someone else's.
+
+    ``rest_later`` says the sentence speaks of a later payment ("and the rest later").
+    """
+    window = lowered[max(0, start - _FRAME_CHARS) : start]
+    before = clause_before(window, len(window))
+    after = _UNIT_WORD.sub("", lowered[end : end + _FRAME_CHARS], count=1)
+    return bool(
+        _OFF_AFTER.match(after)
+        or _DISCOUNT_BEFORE.search(window)
+        or _LOW_DISCOUNT_BEFORE.search(before)
+        or _PART_AFTER.match(after)
+        or (rest_later and _PART_NOW.match(after))
+        or _PART_BEFORE.search(before)
+        or _THIRD_PARTY_BEFORE.search(before)
+        or _described_discount(window, len(window))
+    )
+
+
+def _low_net_cue(lowered: str, start: int, end: int, promised: bool) -> bool:
+    """The advisor names the figure at ``start:end`` as the learner's own price for the course."""
+    if promised:  # a question phrased as an offer, or "Okay, 3000, final."
+        return True
+    window = lowered[max(0, start - _FRAME_CHARS) : start]
+    if _NET_FRAME.search(window) or _LOW_NET_BEFORE.search(clause_before(window, len(window))):
+        return True
+    if _LOW_NET_AFTER.match(_UNIT_WORD.sub("", lowered[end : end + _FRAME_CHARS], count=1)):
+        return True
+    lead = _lead_clause(window, len(window))
+    return bool(lead and _LOW_NET_LEAD.search(lead))
+
+
 _PRICE_CUE = re.compile(
     r"\b(?:deal|price|cost|fee|make it|let'?s (?:make|do|say|go|settle|keep)|lets (?:make|do|"
     r"say|go)|come down|bring (?:it|that|the|this)|go (?:down )?to|settle|special|final|offer|"
@@ -1589,7 +1755,11 @@ def _pieces(sentence: str) -> list[str]:
 
 
 def _piece_offers(
-    piece: str, own: frozenset[int] = frozenset(), *, require_cue: bool = False
+    piece: str,
+    own: frozenset[int] = frozenset(),
+    *,
+    require_cue: bool = False,
+    rest_later: bool = False,
 ) -> dict[int, bool]:
     """Net prices (and whether each is conditional) offered in one piece of a sentence.
 
@@ -1600,6 +1770,7 @@ def _piece_offers(
     ("Who told you $8,000?") offers nothing; any other question that names a new figure
     proposes it.  ``require_cue`` (before the learner's anchor) wants a pricing word in the
     sentence, and an income, a competitor's price or what someone else paid is never an offer.
+    ``rest_later`` says the sentence speaks of paying the rest later: "$2,000 now" is then a part.
     """
     # "$6500, which is ..." keeps its comma: the amount grammar would swallow it, and with it the
     # clause boundary the refusal and hedge checks read.
@@ -1613,7 +1784,62 @@ def _piece_offers(
     if asked and not asked_as_offer:
         return {}
     plain_acceptance = bare_acceptance(lowered)
-    if require_cue and not asked_as_offer and _COURSE_PRICE_CUE.search(lowered) is None:
+
+    def low_net(value: int, start: int, end: int) -> bool:
+        # "I will give it to you for $3000" is a price however low it is and whenever it is said:
+        # the owner test 8f5bfefc lost that offer to the cue gate and the $4,500 floor, and the
+        # learner then asked for $7,000 as if nothing was offered.  A part of the price ("$2,000
+        # upfront", "the booking fee is $1,000", "1500 per instalment") or a discount is not one.
+        return (
+            MIN_FRAMED_NET_USD <= value < MIN_NET_USD
+            and not _part_of_price(lowered, start, end, rest_later)
+            and _low_net_cue(lowered, start, end, asked_as_offer or plain_acceptance)
+        )
+
+    def bare_value(match: re.Match[str], thousands: bool) -> int | None:
+        if thousands:
+            return int(round(float(match.group(1)) * 1000))
+        return parse_amount(match.group(1))
+
+    bare: list[tuple[int, int, int]] = []
+    for pattern, thousands in (
+        (_BARE_THOUSANDS, True), (_BARE_DECIMAL, True), (_BARE_WHOLE, False)
+    ):
+        for match in pattern.finditer(lowered):
+            value = bare_value(match, thousands)
+            # "In 2025 ...", "the 2026 batch": a year is no price.
+            year = not thousands and 1900 <= (value or 0) < 2100 and bool(
+                _YEAR_BEFORE.search(lowered[: match.start()])
+                or _YEAR_AFTER.match(lowered[match.end() :])
+            )
+            if value is not None and not year:
+                bare.append((value, match.start(), match.end()))
+    dollars = [
+        (parse_amount(match.group(1), bool(match.group(2))), match.start(), match.end())
+        for match in _DOLLARS.finditer(lowered)
+    ]
+    # A figure in a net-price frame opens the gates below whatever its size.
+    framed_any = any(
+        value is not None
+        and (
+            low_net(value, start, end)
+            or (
+                _NET_FRAME.search(lowered[max(0, start - _FRAME_CHARS) : start]) is not None
+                and not _part_of_price(lowered, start, end, rest_later)
+            )
+        )
+        for value, start, end in bare + dollars
+    )
+    # A bare figure said as a discount ("for 1000 off", "1500 less") is the discount it is with a
+    # "$": the framed floor read it as a $1,000 price (review of the 8f5bfefc fix).
+    bare_off = any(
+        value < MIN_NET_USD and _OFF_AFTER.match(lowered[end:]) is not None
+        for value, _start, end in bare
+    )
+    if (
+        require_cue and not asked_as_offer and not framed_any and not bare_off
+        and _COURSE_PRICE_CUE.search(lowered) is None
+    ):
         return {}
     conditional = _CONDITIONAL.search(lowered) is not None
     found: dict[int, bool] = {}
@@ -1628,15 +1854,20 @@ def _piece_offers(
             return False  # "under six thousand" is a bound, never the price itself
         return _offered(lowered, start, end, learner_said=said and not asked_as_offer)
 
-    for match in _DOLLARS.finditer(lowered):
-        value = parse_amount(match.group(1), bool(match.group(2)))
-        if value is None or not admitted(value, match.start(), match.end()):
+    def as_discount_at(start: int, end: int) -> bool:
+        return (
+            _OFF_AFTER.match(lowered[end:]) is not None
+            or _DISCOUNT_BEFORE.search(lowered[:start]) is not None
+        )
+
+    for value, start, end in dollars:
+        if value is None or not admitted(value, start, end):
             continue
-        as_discount = _OFF_AFTER.match(lowered[match.end() :]) is not None
-        if _DISCOUNT_BEFORE.search(lowered[: match.start()]) is not None:
-            as_discount = True
-        described = _described_discount(lowered, match.start())
-        if 0 < value < MIN_NET_USD:
+        as_discount = as_discount_at(start, end)
+        described = _described_discount(lowered, start)
+        if low_net(value, start, end):
+            found[value] = conditional
+        elif 0 < value < MIN_NET_USD:
             small.add(value)
             if as_discount and not described:
                 discounts.add(value)
@@ -1651,25 +1882,23 @@ def _piece_offers(
             # offer (owner test 7f2a25e6 turn 58, the learner then named a price nobody said).
             if PRICE_USD - discount >= MIN_NET_USD:
                 discounts.add(discount)
+    if _PRICE_CUE.search(lowered) or asked_as_offer or plain_acceptance or framed_any or bare_off:
+        for value, start, end in bare:
+            if not admitted(value, start, end):
+                continue
+            if low_net(value, start, end):
+                found[value] = conditional
+            elif MIN_NET_USD <= value < PRICE_USD and (
+                _PRICE_CUE.search(lowered) or asked_as_offer or plain_acceptance or framed_any
+            ):
+                found[value] = conditional
+            elif 0 < value < MIN_NET_USD and as_discount_at(start, end):
+                small.add(value)
+                if not _described_discount(lowered, start):
+                    discounts.add(value)
     # Several small amounts in one sentence are a LIST of the deck's discounts, not an offer.
     if len(discounts) == 1 and small <= discounts:
         found[PRICE_USD - next(iter(discounts))] = conditional
-    if _PRICE_CUE.search(lowered) or asked_as_offer or plain_acceptance:
-        for pattern in (_BARE_THOUSANDS, _BARE_DECIMAL):
-            for match in pattern.finditer(lowered):
-                value = int(round(float(match.group(1)) * 1000))
-                if MIN_NET_USD <= value < PRICE_USD and admitted(
-                    value, match.start(), match.end()
-                ):
-                    found[value] = conditional
-        for match in _BARE_WHOLE.finditer(lowered):
-            value = parse_amount(match.group(1))
-            if (
-                value is not None
-                and MIN_NET_USD <= value < PRICE_USD
-                and admitted(value, match.start(), match.end())
-            ):
-                found[value] = conditional
     return found
 
 
@@ -1692,10 +1921,64 @@ def parse_price_offers(
     own = frozenset({ANCHOR_USD, *own_amounts})
     offers: dict[int, bool] = {}
     for sentence in split_sentences(_tail(text)):
+        # "You'll pay $2,000 now, and the rest later": the clause with the figure does not say so.
+        rest_later = _PART_LATER.search(sentence) is not None
         for clause in _clauses(sentence):
             for piece in _pieces(clause):
-                offers.update(_piece_offers(piece, own, require_cue=require_cue))
+                offers.update(
+                    _piece_offers(piece, own, require_cue=require_cue, rest_later=rest_later)
+                )
     return sorted(offers.items(), reverse=True)
+
+
+def unread_low_figures(text: object, own_amounts: Iterable[int] = ()) -> list[int]:
+    """Figures under the $7,000 anchor the advisor named as a possible price, offered or not.
+
+    The anchor's backstop (owner test 8f5bfefc review): a low price worded in a way
+    ``parse_price_offers`` does not read ("Pay me $3,000 and it's yours") must not be answered
+    with "$9,000 ... can you do $7,000?".  A discount, a part payment, an add-on, someone else's
+    price, an income, a bound and a refused or negated figure are none; a bare number counts only
+    next to a pricing word.  The caller drops the figures that were read as offers.
+    """
+    own = frozenset({ANCHOR_USD, *own_amounts})
+    found: list[int] = []
+    for sentence in split_sentences(_tail(text)):
+        rest_later = _PART_LATER.search(sentence) is not None
+        for clause in _clauses(sentence):
+            for piece in _pieces(clause):
+                lowered = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", piece)).lower()
+                if is_question_like(piece) and _INQUIRY.search(lowered):
+                    continue
+                figures = [
+                    (parse_amount(match.group(1), bool(match.group(2))), match)
+                    for match in _DOLLARS.finditer(lowered)
+                ]
+                if (
+                    _COURSE_PRICE_CUE.search(lowered)
+                    or _PRICE_CUE.search(lowered)
+                    or _FIRST_PERSON_OFFER.search(lowered)
+                ):
+                    figures += [
+                        (parse_amount(match.group(1)), match)
+                        for match in _BARE_WHOLE.finditer(lowered)
+                    ]
+                for value, match in figures:
+                    start, end = match.start(), match.end()
+                    if (
+                        value is None
+                        or not MIN_FRAMED_NET_USD <= value < ANCHOR_USD
+                        or value in own
+                        or (1900 <= value < 2100 and not match.group(0).startswith("$"))
+                        or _part_of_price(lowered, start, end, rest_later)
+                        or _not_our_price(lowered, start, end)
+                        or _BOUND_BEFORE.search(lowered[max(0, start - 40) : start])
+                        or negated_before(lowered, start, 8)
+                        or has_refusal(clause_after(lowered, end))
+                        or _PRICE_NO.search(clause_after(lowered, end))
+                    ):
+                        continue
+                    found.append(value)
+    return found
 
 
 @dataclass(frozen=True)
@@ -1951,6 +2234,9 @@ class Negotiation:
         # no wait said).
         self.wait_said_turn: int | None = None
         self.decider_handled_turn: int | None = None
+        # Owner test 8f5bfefc review: figures under the $7,000 the advisor named that were not read
+        # as offers, as (turn, usd); the anchor reacts to the latest instead of asking for more.
+        self.low_mentions: list[tuple[int, int]] = []
 
     # ------------------------------------------------------------------ observation
     def observe(
@@ -1987,6 +2273,10 @@ class Negotiation:
             mentioned = True
             if all(item.net_usd != net for item in self.offers + offers):
                 offers.append(PriceOffer(turn, net, conditional))
+        read = {item.net_usd for item in self.offers + offers}
+        for usd in unread_low_figures(text, self.own_amounts):
+            if usd not in read:
+                self.low_mentions.append((turn, usd))
         lowest_now = min((item.net_usd for item in offers), default=None)
         lower = lowest_now if lowest_now is not None and (
             prior_best is None or lowest_now < prior_best
@@ -2096,6 +2386,14 @@ class Negotiation:
     def best_offer_usd(self) -> int | None:
         """The lowest price the advisor has put on the table since the anchor."""
         return min((item.net_usd for item in self.offers), default=None)
+
+    def unread_low_usd(self) -> int | None:
+        """The latest figure under the $7,000 (and under the best offer) not read as an offer."""
+        best = self.best_offer_usd
+        return next(
+            (usd for _turn, usd in reversed(self.low_mentions) if best is None or usd < best),
+            None,
+        )
 
     def price_situation(self) -> str:
         """How the advisor answered the anchor: short of the ask, met it, refused, or unclear.

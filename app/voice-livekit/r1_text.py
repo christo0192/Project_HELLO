@@ -687,6 +687,20 @@ def _spelled_repl(match: re.Match[str]) -> str:
     return f"${value}" if 0 <= value <= MAX_AMOUNT else match.group(0)
 
 
+# Digits before a spelled scale ("3 thousand", "2.5 thousand dollars"): the spelled-run grammar
+# alone read "3 thousand" as "3 $1000" (owner test 8f5bfefc review: "for 3 thousand" was lost).
+_DIGIT_SCALE = re.compile(
+    r"(?<![\d$.,])(\d{1,3}(?:\.\d{1,2})?)\s*-?\s*(thousand|hundred)\b"
+    r"(?:\s+(?:dollars?|usd|bucks)\b)?",
+    re.IGNORECASE,
+)
+
+
+def _digit_scale_repl(match: re.Match[str]) -> str:
+    value = float(match.group(1)) * _SCALE[match.group(2).lower()]
+    return f"${int(round(value))}" if 0 <= value <= MAX_AMOUNT else match.group(0)
+
+
 def _dollar_repl(match: re.Match[str]) -> str:
     digits = match.group(1) or match.group(3)
     amount = parse_amount(digits, bool(match.group(2) or match.group(4)))
@@ -700,12 +714,12 @@ def canonical_amounts(text: object) -> str:
     """Fold ``text`` and rewrite every money expression as ``$N`` (``%`` for percentages).
 
     One grammar for every reader of amounts: ``$1,500``, ``$1.5k``, ``1500 dollars``,
-    ``USD 1500``, ``1500 bucks``, ``fifteen hundred dollars`` and ``three thousand`` all
-    become ``$1500`` / ``$3000``, and ``ten percent`` becomes ``10%``.  Plain small
-    spelled numbers ("six months") are left alone.  Speech-to-text may write an amount
-    either way, so no reader should depend on the ``$`` sign being there.
+    ``USD 1500``, ``1500 bucks``, ``fifteen hundred dollars``, ``three thousand`` and
+    ``3 thousand`` all become ``$1500`` / ``$3000``, and ``ten percent`` becomes ``10%``.
+    Plain small spelled numbers ("six months") are left alone.  Speech-to-text may write an
+    amount either way, so no reader should depend on the ``$`` sign being there.
     """
-    folded = _SPELLED_RUN.sub(_spelled_repl, fold(text))
+    folded = _SPELLED_RUN.sub(_spelled_repl, _DIGIT_SCALE.sub(_digit_scale_repl, fold(text)))
     return _DOLLAR.sub(_dollar_repl, folded)
 
 

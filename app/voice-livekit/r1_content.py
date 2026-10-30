@@ -112,7 +112,11 @@ import r1_world
 #    brief repeat replays L-TRANSITION and the post-pickup brief request plays L-ASIDE-COACH.
 #    Reviewed fix, same unreleased revision: the prompt's "no" also covers talk about the learner's
 #    OWN job interviews, and its tie-break names THIS interview with Christy or this role-play.
-CONTENT_REVISION = 18
+# 19: owner test 8f5bfefc (the learner asked for $7,000 after the advisor offered $3,000): the F1
+#    anchor for a figure under $7,000 that was not read as a price (``anchor_after_unclear_low``:
+#    react to that number and ask what the total would be, never ask for more) joins the
+#    manifest.  No other pinned text changed.
+CONTENT_REVISION = 19
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -234,6 +238,7 @@ def manifest() -> dict[str, Any]:
                     r1_negotiation.anchor_after_offer(8500),
                     r1_negotiation.anchor_after_offer(7000),
                     r1_negotiation.anchor_after_offer(6500),
+                    r1_negotiation.anchor_after_unclear_low(3000),
                 )
             ],
             "reasons": list(r1_negotiation.REASONS),

@@ -113,7 +113,10 @@ import r1_world
 # spoken line changed: the brief repeat replays L-TRANSITION, a brief request after the pickup
 # plays L-ASIDE-COACH.  Reviewed fix, same unreleased revision: the prompt's "no" also covers the
 # learner's OWN job interviews, and its tie-break names THIS interview or this role-play.
-PINNED_CONTENT_SHA256 = "95ab3b770accf95c730d0cff4c5fbdbec3708113ea048dd1f641a7f9f18d84ea"
+# Revision 19 (owner test 8f5bfefc): the F1 anchor for a figure under $7,000 that was not read as a
+# price (anchor_after_unclear_low) reacts to that number and asks what the total would be, never for
+# more.  No other pinned text changed.
+PINNED_CONTENT_SHA256 = "0a39519fe5d0b99d3e5a62dc7374909e8f1d1c397a46504f671304569689ad53"
 
 CONTENT_MODULES = (
     "r1_text",
@@ -294,9 +297,9 @@ class PinTests(unittest.TestCase):
                 setattr(module, name, original)
         self.assertEqual(r1_content.content_sha256(), base)
 
-    def test_the_end_intent_prompt_is_pinned_at_revision_18(self):
+    def test_the_end_intent_prompt_is_pinned_from_revision_18(self):
         # Owner decision 2026-10-30: the classifier's prompt is content the model reads.
-        self.assertEqual(r1_content.CONTENT_REVISION, 18)
+        self.assertGreaterEqual(r1_content.CONTENT_REVISION, 18)
         pinned = r1_content.manifest()["end_intent"]
         self.assertEqual(pinned["system"], r1_end_intent.END_INTENT_SYSTEM)
         self.assertEqual(pinned["labels"], ["no", "maybe", "end"])
@@ -439,7 +442,8 @@ class PinTests(unittest.TestCase):
         self.assertGreaterEqual(manifest["revision"], 7)
         self.assertEqual(manifest["script"]["learner_filler_short"], r1_script.LEARNER_FILLER_SHORT)
         anchors = {item["id"]: item for item in manifest["negotiation"]["anchor_after_offer"]}
-        self.assertEqual(set(anchors), {"above", "reached"})
+        # Revision 19 (owner test 8f5bfefc): "unclear", a figure under $7,000 not read as a price.
+        self.assertEqual(set(anchors), {"above", "reached", "unclear"})
         for item in anchors.values():
             self.assertEqual(len(item["variants"]), 3)
             self.assertIn("$7,000", item["must_say"])

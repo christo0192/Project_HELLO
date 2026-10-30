@@ -172,6 +172,7 @@ class FakeSession(Emitter):
         self.emit_events = emit_events
         self.log = log if log is not None else []
         self.handles: list[FakeSpeechHandle] = []
+        self.generated: list[FakeSpeechHandle] = []
         self.interrupt_hook = None
         self.interrupt_delay = 0.0
         self.next_interrupted = False
@@ -194,6 +195,16 @@ class FakeSession(Emitter):
             SimpleNamespace(speech_handle=handle, source="say", user_initiated=True),
         )
         self._tasks.append(asyncio.ensure_future(self._play(handle, text)))
+        return handle
+
+    def generate_reply(self, **kwargs) -> FakeSpeechHandle:
+        """A reply the driver asked for (the wrap-up's owed answer): created, not played."""
+        handle = FakeSpeechHandle("reply")
+        self.generated.append(handle)
+        self.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=False),
+        )
         return handle
 
     async def _play(self, handle: FakeSpeechHandle, text: str) -> None:
@@ -3760,6 +3771,244 @@ class TestWrapupAndReadyDriveTheDriver(R1TestCase):
                 # Not the 20 s TRANSITION_DEADLINE_SECONDS: the answer itself is the pickup.
                 self.assertIsNone(await asyncio.wait_for(task, 5.0))
                 self.assertEqual(self.session.spoken, [self.spoken_line("L-PICKUP")])
+
+
+class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
+    """Owner test 8f5bfefc turns 70-73: "Christy, so. How what will be the next step?" got no
+    answer.  The STT split it into two finals (two "questions": the limit), the reply was cut
+    before any audio by "Christie.", and the settled-but-unheard reply was taken for an answer."""
+
+    DEFER = "That's a good question for the hiring team; they'll follow up with you on it."
+
+    def enter_wrapup(self) -> None:
+        self.enter_roleplay()
+        self.interview._end_roleplay()
+        self.interview.machine.transition(R1Phase.WRAPUP)
+
+    def reply_created(self) -> FakeSpeechHandle:
+        handle = FakeSpeechHandle("reply")
+        self.session.emit(
+            "speech_created",
+            SimpleNamespace(speech_handle=handle, source="generate_reply", user_initiated=False),
+        )
+        return handle
+
+    async def lost(self, handle: FakeSpeechHandle) -> None:
+        """The reply is cancelled before any audio (voice barge-in): no item, no row."""
+        handle.interrupted = True
+        handle.finish()
+        await self.settle()
+
+    async def play(self, handle: FakeSpeechHandle, text: str) -> None:
+        self.session.current_speech = handle
+        self.agent_state("speaking")
+        self.session.emit("conversation_item_added", SimpleNamespace(item=FakeChatMessage(text)))
+        self.session.current_speech = None
+        self.agent_state("listening")
+        handle.finish()
+        await self.settle()
+
+    async def ask(self, text: str) -> FakeSpeechHandle:
+        """A wrap-up question: its final, the SDK's commit (answered), and the reply speech."""
+        self.final_transcript(text)
+        await self.settle()
+        self.assertFalse(await self.commit_turn(text))
+        handle = self.reply_created()
+        await self.settle()
+        return handle
+
+    def wrapup_bot_rows(self) -> list[str]:
+        return [
+            r["text"] for r in self.writer.saved if r["speaker"] == "bot" and r["phase"] == "wrapup"
+        ]
+
+    async def test_session_8f5bfefc_the_next_step_question_is_answered_before_the_close(self):
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "REPLY_APPEAR_SECONDS", 0.2), mock.patch.object(
+            r1_session, "WRAPUP_SETTLE_SECONDS", 0.02
+        ):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            self.final_transcript("Christy, so.")
+            await self.settle()
+            self.final_transcript("How what will be the next step?")
+            await self.settle()
+            self.assertFalse(await self.commit_turn("Christy, so. How what will be the next step?"))
+            first = self.reply_created()
+            await self.settle()
+            await self.lost(first)  # "Christie." barges in before any audio
+            self.final_transcript("Christie.")
+            await self.settle()
+            await asyncio.sleep(0.3)  # past REPLY_APPEAR_SECONDS and the settle window
+            self.assertFalse(task.done(), "L-CLOSE would play over an unanswered question")
+            self.assertFalse(await self.commit_turn("Christie."))  # the model answers now
+            await self.play(self.reply_created(), self.DEFER)
+            self.assertEqual(self.wrapup_bot_rows(), [self.DEFER])
+            # ONE question was asked (split by the STT) and answered: room for another.
+            await asyncio.sleep(0.1)
+            self.assertFalse(task.done())
+            self.final_transcript("No, thank you.")
+            self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.session.spoken, [])
+
+    async def retried(self) -> FakeSpeechHandle:
+        """The one reply the driver itself asked for (the owed answer, said again)."""
+        for _ in range(100):
+            if self.session.generated:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(len(self.session.generated), 1, "the owed answer is asked for once")
+        return self.session.generated[0]
+
+    async def cut_after(self, handle: FakeSpeechHandle, words: str) -> None:
+        """A few words of the reply play, then the candidate's barge-in cuts it."""
+        self.session.current_speech = handle
+        self.agent_state("speaking")
+        message = FakeChatMessage(words, interrupted=True)
+        self.session.emit("conversation_item_added", SimpleNamespace(item=message))
+        self.session.current_speech = None
+        self.agent_state("listening")
+        handle.interrupted = True
+        handle.finish()
+        await self.settle()
+
+    async def test_an_answer_cut_before_audio_at_the_question_limit_is_said_again(self):
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "REPLY_APPEAR_SECONDS", 0.2):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            await self.play(await self.ask("What are the shift timings?"), "Monday to Friday.")
+            await self.lost(await self.ask("And how many days a week is that?"))
+            again = await self.retried()
+            self.assertFalse(task.done(), "the second answer was never heard")
+            # It is the owed question's reply: its context still holds the question.
+            self.assertEqual(
+                self.interview._speeches[again.id].reply.candidate_text,
+                "And how many days a week is that?",
+            )
+            await self.play(again, "It is 5.5 days a week.")
+            self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.wrapup_bot_rows(), ["Monday to Friday.", "It is 5.5 days a week."])
+        self.assertIsNone(self.interview._wrapup_answer_owed)
+
+    async def test_a_heard_answer_at_the_question_limit_still_closes(self):
+        self.enter_wrapup()
+        task = asyncio.create_task(self.interview._run_wrapup())
+        await self.settle()
+        await self.play(await self.ask("What are the shift timings?"), "Monday to Friday.")
+        second = await self.ask("And how many days a week is that?")
+        self.assertFalse(task.done())
+        await self.play(second, "It is 5.5 days a week.")
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.session.generated, [])
+
+    async def test_the_owed_answer_is_said_again_once_and_the_wrapup_stays_bounded(self):
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "REPLY_APPEAR_SECONDS", 0.2):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            await self.play(await self.ask("What are the shift timings?"), "Monday to Friday.")
+            await self.lost(await self.ask("And how many days a week is that?"))
+            await self.lost(await self.retried())  # lost again: one retry only, then the close
+            self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(len(self.session.generated), 1)
+
+    async def test_no_retry_once_the_wrapup_budget_is_spent(self):
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "REPLY_APPEAR_SECONDS", 0.2), mock.patch.object(
+            self.interview.machine, "remaining_wrapup_seconds", return_value=0.0
+        ):
+            self.interview._wrapup_answer_owed = r1_session.Reply(
+                phase="wrapup", candidate_text="What will be the next step?"
+            )
+            self.assertIsNone(await asyncio.wait_for(self.interview._end_wrapup(), 5.0))
+        self.assertEqual(self.session.generated, [])
+
+    async def test_thank_you_after_a_lost_answer_gets_the_answer_before_the_close(self):
+        """Review of the 8f5bfefc fix: "Thank you." cancels the reply before any audio (the
+        logged 4/10 pattern), a refusal gets no reply of its own, and L-CLOSE followed."""
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.02):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            await self.lost(await self.ask("What will be the next step?"))
+            self.final_transcript("Thank you.")
+            await self.settle()
+            self.assertTrue(await self.commit_turn("Thank you."))  # no reply to the refusal
+            again = await self.retried()
+            self.assertFalse(task.done(), "L-CLOSE would follow an unanswered question")
+            await self.play(again, self.DEFER)
+            self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.wrapup_bot_rows(), [self.DEFER])
+
+    async def test_silence_after_a_lost_answer_gets_the_answer_before_the_close(self):
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "WRAPUP_SILENCE_SECONDS", 0.1):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            await self.lost(await self.ask("What will be the next step?"))
+            again = await self.retried()
+            self.assertFalse(task.done())
+            await self.play(again, self.DEFER)
+            self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.wrapup_bot_rows(), [self.DEFER])
+
+    async def test_an_answer_cut_after_two_words_at_the_limit_waits_for_the_barge_in(self):
+        """Review of the 8f5bfefc fix: "That's a" counted as the answer, and the wrap-up closed
+        while the candidate's barge-in was still mid-turn."""
+        self.enter_wrapup()
+        task = asyncio.create_task(self.interview._run_wrapup())
+        await self.settle()
+        await self.play(await self.ask("What are the shift timings?"), "Monday to Friday.")
+        await self.cut_after(await self.ask("And what will be the next step?"), "That's a")
+        await asyncio.sleep(0.1)
+        self.assertFalse(task.done(), "L-CLOSE would play over the candidate's barge-in")
+        self.assertIsNotNone(self.interview._wrapup_answer_owed)
+        # Their own turn's reply answers it; it is not said again by the driver.
+        await self.play(await self.ask("Christy, can you hear me?"), self.DEFER)
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.session.generated, [])
+        self.assertEqual(self.wrapup_bot_rows(), ["Monday to Friday.", "That's a", self.DEFER])
+
+    async def test_a_partly_heard_answer_is_not_said_again_after_a_refusal(self):
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.02):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            await self.cut_after(await self.ask("What will be the next step?"), "The hiring team")
+            self.final_transcript("Okay, no more questions, thank you.")
+            await self.settle()
+            self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.session.generated, [])
+
+    async def test_a_lone_lead_in_is_still_a_question_when_nothing_follows(self):
+        self.enter_wrapup()
+        with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.02):
+            task = asyncio.create_task(self.interview._run_wrapup())
+            await self.settle()
+            self.final_transcript("Christy, so.")
+            await asyncio.sleep(0.2)  # past the lead-in window
+            self.assertFalse(task.done())  # not a refusal: the wrap-up stays open
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+    def test_the_classifiers(self):
+        for text in ("Christy, so.", "So.", "Um, and", "Christie, um, so"):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_lead_in_only(text))
+        for text in ("Christy, so?", "How what will be the next step?", "Christie.", "No."):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_lead_in_only(text))
+        for text in ("Christie.", "Christy?", "Hey, Kristy.", "Christy, so."):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_name_only(text))
+                self.assertFalse(r1_session.is_no_questions(text))
+        for text in ("Christy, what's next?", "So.", "Thank you.", ""):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_name_only(text))
+        # The STT's spellings of her name are courtesy around a refusal too.
+        self.assertTrue(r1_session.is_no_questions("No, thank you, Christie."))
 
 
 class TestUnknownAndSpokenFirstName(R1TestCase):

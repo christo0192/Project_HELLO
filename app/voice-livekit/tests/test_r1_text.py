@@ -430,6 +430,10 @@ class CanonicalAmountTests(unittest.TestCase):
             ("one thousand five hundred", "$1500"),
             ("two thousand five hundred dollars", "$2500"),
             ("seven hundred and fifty", "$750"),
+            # Digits before the scale word (review of the 8f5bfefc fix: "3 $1000").
+            ("for 3 thousand.", "for $3000."),
+            ("2.5 thousand dollars off", "$2500 off"),
+            ("5 hundred off", "$500 off"),
             ("ten percent off", "10% off"),
             ("twenty five percent off", "25% off"),
             ("10 percent off", "10 percent off"),

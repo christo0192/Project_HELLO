@@ -3640,6 +3640,148 @@ class PreAnchorOfferThroughTheEngineTests(unittest.TestCase):
             self.assertEqual(len(primed), len(set(primed)), (run, primed))
 
 
+class OwnerTest8f5bfefcPriceOfferTests(unittest.TestCase):
+    """Owner test 8f5bfefc: the advisor offered $3,000 at 09:35 and again later, and at 10:34 the
+    learner still said "$9,000 ... I heard people got it for around $7,000. Can you do that?".
+    The framed offer was never parsed, so the anchor played its default script."""
+
+    # The advisor turns 31..66 of the owner's transcript, with their role-play seconds.
+    ADVISOR = (
+        (31, 4, "Hey Priya, what's up?"),
+        (33, 16, "Yeah, so the next step is. I want to listen to you and see what program you "
+         "sell so that I can buy it from you."),
+        (35, 42, "Yeah, the typical vehicle. So. So yeah, typical week will be like I am trying "
+         "to understand what program are you selling to me."),
+        (37, 71, "Oh sure."),
+        (39, 84, "Oh my God, your voice is too good."),
+        (41, 97, "I am going to change this voice to all the bot. Your voice is very good. Yeah."),
+        (42, 104, "I just can't stop hearing it. Can you keep on talking?"),
+        (44, 118, "Yeah, so the program involves. Day to day, you just, you know, once you get "
+         "the program, you just have to sit. Attend the classes and put in the work."),
+        (46, 165, "See, honestly, YouTube and Coursera is like random half-baked guys taking "
+         "some random classes."),
+        (47, 204, "Have you ever come across someone who said, hey, I took this course on "
+         "YouTube and I got hired in Meta or Amazon? No. But we have."),
+        (49, 225, "Yeah, it will help you land a job."),
+        (51, 232, "Okay. Yeah, it is my."),
+        (53, 246, "Yeah, it was like."),
+        (55, 256, "Okay, you know what? Hey, hey, hey, hey, Priya, I will."),
+        (56, 266, "So the program is for $9000. I will give it to you for $3000."),
+        (58, 280, "You don't have to worry about everything, we will take care of that. Are you "
+         "ready to enroll?"),
+        (60, 297, "Okay."),
+        (62, 310, "Yeah, you do whatever the comparison you want, but this is what we are "
+         "telling, selling it to you. Good luck finding better cost and better program."),
+        (64, 350, "I am telling you that I can give it, give the program for 3000. I will do "
+         "better than 7000. I am giving it to you for 3000."),
+        (66, 368, "Yeah, so once everything's settled, your final final price will be 3000."),
+    )
+
+    def replay(self):
+        s = Session(engine(resolve_persona("p1_career_switcher", variant="v2"), "Christo",
+                           seed="8f5bfefc"))
+        plans = {}
+        for turn, r, text in self.ADVISOR:
+            plans[turn] = s.say(text, r, turn_index=turn)
+        return s, plans
+
+    def test_the_learner_reacts_to_the_three_thousand_and_never_asks_for_more(self):
+        s, plans = self.replay()
+        self.assertEqual(s.eng.negotiation.best_offer_usd, 3000)
+        anchor = next(p for p in plans.values() if p.move_id == F1_ANCHOR)
+        self.assertIn("$3,000", anchor.intent.brief)
+        self.assertIn("below the $7,000", anchor.intent.brief)
+        self.assertEqual(anchor.intent.must_say, ("$3,000", "$7,000"))
+        for variant in anchor.intent.fallbacks:
+            self.assertIn("$3,000", variant)
+            for asked in ("$9,000", "Can you do that", "match that"):
+                self.assertNotIn(asked, variant)
+        responses = s.eng.admin_log()["negotiation"]["responses"]
+        self.assertIn("anchor:reached", [r["response"] for r in responses])
+        self.assertEqual(s.eng.scheduler._states[F1_ANCHOR].status, "delivered")
+        for turn, plan in plans.items():
+            if turn < 56 or plan.intent is None:
+                continue
+            with self.subTest(turn=turn, move=plan.move_id):
+                # No learner line after the $3,000 asks for $9,000 / $7,000 again.
+                self.assertNotIn("$9,000", plan.intent.must_say)
+                self.assertNotIn("$9,000, the price on the website", plan.intent.brief)
+                self.assertNotIn("final price would actually be", plan.intent.brief)
+        counter = next((p for p in plans.values() if p.move_id == F1_COUNTER), None)
+        if counter is not None:
+            self.assertIn("best price so far is $3,000", counter.intent.brief)
+            self.assertEqual(s.eng.negotiation.price_situation(), SITUATION_MET)
+
+    # Advisor turns after the owner's turn 56 that do not answer the price (review of the fix).
+    FILL = (
+        (58, 280, "Our mentors are from top tech companies."),
+        (60, 297, "Okay."),
+        (62, 310, "You will also get mock interviews."),
+        (64, 330, "Any other questions?"),
+        (66, 350, "So what do you think?"),
+        (68, 370, "Okay."),
+    )
+
+    def replay_with(self, offer):
+        s = Session(engine(resolve_persona("p1_career_switcher", variant="v2"), "Christo",
+                           seed="8f5bfefc"))
+        plans = {}
+        for turn, r, text in (
+            *(item for item in self.ADVISOR if item[0] < 56), (56, 266, offer), *self.FILL
+        ):
+            plans[turn] = s.say(text, r, turn_index=turn)
+        anchor = next(p for p in plans.values() if p.move_id == F1_ANCHOR)
+        return s, anchor
+
+    def test_every_way_of_naming_the_low_price_gets_the_reached_anchor(self):
+        """Review of the 8f5bfefc fix: "I can offer you $3,000", "It's yours for $3,000" ...
+        still got "$9,000 feels like a lot ... Can you match that?"."""
+        for offer in (
+            "So the program is $9,000. I can offer you $3,000.",
+            "So the program is $9,000. It's yours for $3,000.",
+            "So the program is $9,000. Special price for you, $3,000.",
+            "So the program is $9,000. I will give it to you for 3 thousand.",
+        ):
+            with self.subTest(offer=offer):
+                s, anchor = self.replay_with(offer)
+                self.assertEqual(s.eng.negotiation.best_offer_usd, 3000)
+                self.assertEqual(anchor.intent.must_say, ("$3,000", "$7,000"))
+                for variant in anchor.intent.fallbacks:
+                    self.assertNotIn("$9,000", variant)
+
+    def test_a_low_figure_not_read_as_a_price_is_never_met_with_a_higher_ask(self):
+        s, anchor = self.replay_with("So the program is $9,000. I can give you 1500.")
+        self.assertIsNone(s.eng.negotiation.best_offer_usd)
+        self.assertEqual(anchor.intent.must_say, ("$1,500", "$7,000"))
+        self.assertIn("ask what the total would come to", anchor.intent.brief)
+        for variant in anchor.intent.fallbacks:
+            self.assertIn("$1,500", variant)
+            for asked in ("$9,000", "Can you do that", "match that", "Is that possible"):
+                self.assertNotIn(asked, variant)
+        responses = s.eng.admin_log()["negotiation"]["responses"]
+        self.assertIn("anchor:unclear", [r["response"] for r in responses])
+        self.assertIn(1500, s.eng._advisor_amounts)  # the learner may name it
+
+    def test_a_part_payment_or_a_discount_keeps_the_default_anchor_and_no_met_price(self):
+        """Review of the fix: "$2,000 upfront" became the best offer ("$2,000 is under the $7,000
+        I read about"), "2000 off" a $2,000 price and the booking fee a $1,000 one."""
+        for offer, best in (
+            ("So the program is $9,000. You'll only pay 2,000 upfront and the rest in easy "
+             "instalments.", None),
+            ("So the program is $9,000. The booking fee is just $1,000 to reserve your seat.",
+             None),
+            ("So the program is $9,000. I can do that for 2000 off.", 7000),
+        ):
+            with self.subTest(offer=offer):
+                s, anchor = self.replay_with(offer)
+                self.assertEqual(s.eng.negotiation.best_offer_usd, best)
+                for figure in ("$1,000", "$2,000"):
+                    self.assertNotIn(figure, anchor.intent.must_say)
+                if best is None:
+                    self.assertEqual(anchor.intent.must_say, ("$9,000", "$7,000"))
+                    self.assertNotEqual(s.eng.negotiation.price_situation(), SITUATION_MET)
+
+
 class ReasonOnceThroughTheEngineTests(unittest.TestCase):
     """R1-Q round 1: no stall reason is voiced twice in a call, whether by a negotiation intent
     or by the owed F4 pair ("I'd rather wait" then "I'll look at the next batch")."""
