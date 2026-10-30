@@ -676,6 +676,31 @@ def _spelled_value(words: list[str]) -> int:
     return total + current
 
 
+# A count, not an amount: "five thousand alumni", "3 thousand students", "2,000 interviews",
+# "1,500 seats" (review of the 8f5bfefc fix: a pitch statistic became a $5,000 offer, and the
+# anchor asked "is $3,000 what I'd pay in total?").  One modifier may sit between the figure and
+# the noun ("5 thousand happy alumni", "3 thousand plus learners"), never a preposition ("3
+# thousand for students" is a price for them).
+COUNT_NOUN_AFTER = re.compile(
+    r"\s*(?:\+\s*|plus\s+)?"
+    r"(?:(?!(?:for|to|per|a|an|the|of|in|on|at|from|by|with|each|every|and|or|dollars?|usd|"
+    r"bucks|rupees?|inr)\b)[a-z][a-z-]*\s+)?"
+    r"(?:students?|learners?|alumni|alumnus|people|persons|members|partners|companies|firms|"
+    r"employers|recruiters|reviews|ratings|hours|days|weeks|months|years|problems|questions|"
+    r"hires|jobs|placements|interviews|engineers|developers|professionals|graduates|mentors|"
+    r"instructors|coaches|seats|candidates|users|customers|clients|participants|"
+    r"enrol+ments|sign-?ups|sessions|classes|lessons|videos|projects|views|followers|"
+    r"subscribers|applications|applicants|offers|calls|careers|stories|batches|cohorts|teams|"
+    r"schools|colleges|universities|cities|countries|times|lines|modules|courses)\b",
+    re.IGNORECASE,
+)
+
+
+def _counts_after(match: re.Match[str]) -> bool:
+    """A count noun follows the spelled or scaled number ``match`` (and no currency word)."""
+    return COUNT_NOUN_AFTER.match(match.string, match.end()) is not None
+
+
 def _spelled_repl(match: re.Match[str]) -> str:
     words = re.findall(r"[a-z]+", match.group(0).lower())
     scale = any(word in _SCALE for word in words)
@@ -683,8 +708,26 @@ def _spelled_repl(match: re.Match[str]) -> str:
         return f"{_spelled_value(words)}%"
     if not scale:
         return match.group(0)  # "six months": a plain small number is not an amount
+    if not match.group("cur") and _counts_after(match):
+        return match.group(0)  # "five thousand alumni" is a count, not an amount
     value = _spelled_value(words)
     return f"${value}" if 0 <= value <= MAX_AMOUNT else match.group(0)
+
+
+# Digits before a spelled scale ("3 thousand", "2.5 thousand dollars"): the spelled-run grammar
+# alone read "3 thousand" as "3 $1000" (owner test 8f5bfefc review: "for 3 thousand" was lost).
+_DIGIT_SCALE = re.compile(
+    r"(?<![\d$.,])(\d{1,3}(?:\.\d{1,2})?)\s*-?\s*(thousand|hundred)\b"
+    r"(?P<cur>\s+(?:dollars?|usd|bucks)\b)?",
+    re.IGNORECASE,
+)
+
+
+def _digit_scale_repl(match: re.Match[str]) -> str:
+    if not match.group("cur") and _counts_after(match):
+        return match.group(0)  # "3 thousand students" is a count (the spelled run skips it too)
+    value = float(match.group(1)) * _SCALE[match.group(2).lower()]
+    return f"${int(round(value))}" if 0 <= value <= MAX_AMOUNT else match.group(0)
 
 
 def _dollar_repl(match: re.Match[str]) -> str:
@@ -700,12 +743,12 @@ def canonical_amounts(text: object) -> str:
     """Fold ``text`` and rewrite every money expression as ``$N`` (``%`` for percentages).
 
     One grammar for every reader of amounts: ``$1,500``, ``$1.5k``, ``1500 dollars``,
-    ``USD 1500``, ``1500 bucks``, ``fifteen hundred dollars`` and ``three thousand`` all
-    become ``$1500`` / ``$3000``, and ``ten percent`` becomes ``10%``.  Plain small
-    spelled numbers ("six months") are left alone.  Speech-to-text may write an amount
-    either way, so no reader should depend on the ``$`` sign being there.
+    ``USD 1500``, ``1500 bucks``, ``fifteen hundred dollars``, ``three thousand`` and
+    ``3 thousand`` all become ``$1500`` / ``$3000``, and ``ten percent`` becomes ``10%``.
+    Plain small spelled numbers ("six months") are left alone.  Speech-to-text may write an
+    amount either way, so no reader should depend on the ``$`` sign being there.
     """
-    folded = _SPELLED_RUN.sub(_spelled_repl, fold(text))
+    folded = _SPELLED_RUN.sub(_spelled_repl, _DIGIT_SCALE.sub(_digit_scale_repl, fold(text)))
     return _DOLLAR.sub(_dollar_repl, folded)
 
 

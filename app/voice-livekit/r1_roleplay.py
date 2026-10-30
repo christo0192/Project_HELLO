@@ -143,6 +143,7 @@ from r1_negotiation import (
     NegotiationSpec,
     NegotiationTurn,
     anchor_after_offer,
+    anchor_after_unclear_low,
     declines_call,
     fill_decision_maker,
     filled_markers,
@@ -1386,6 +1387,10 @@ class RolePlayEngine:
             self.scheduler.note_price_answered()
         for offer in seen.offers:
             self._advisor_amounts.add(offer.net_usd)  # the learner may name a price it heard
+        # ... and a low figure the anchor reacts to, however it was said ("for 3000 only").
+        self._advisor_amounts.update(
+            usd for said, usd in self.negotiation.low_mentions if said == turn
+        )
         # A price that is not LOWER than the best on the table is no news (R1-Q iteration 3: the
         # $8,000 instalment option, offered after $7,500, was "a little better than I expected").
         self._new_offer_usd = seen.lower_offer_usd
@@ -1809,10 +1814,20 @@ class RolePlayEngine:
                 brief += f"; the advisor's best price so far is {format_usd(best)}"
             move = replace(move, brief=brief, variants=situation.variants)
             self.negotiation.note_response(self.turn, f"counter:{situation.id}")
-        elif move.id == F1_ANCHOR and self.negotiation.best_offer_usd is not None:
+        elif move.id == F1_ANCHOR and (
+            self.negotiation.best_offer_usd is not None
+            or self.negotiation.unread_low_usd() is not None
+        ):
             # A price is already on the table (the advisor offered before the learner asked):
-            # the anchor keeps its exact $9,000 / $7,000 but reacts to that number.
-            anchor = anchor_after_offer(self.negotiation.best_offer_usd)
+            # the anchor keeps its exact $9,000 / $7,000 but reacts to that number.  A figure under
+            # the $7,000 that was not read as an offer is never answered by asking for more (owner
+            # test 8f5bfefc): the learner asks what the total would be.
+            best = self.negotiation.best_offer_usd
+            unread = self.negotiation.unread_low_usd()
+            if unread is not None and (best is None or best > ANCHOR_USD):
+                anchor = anchor_after_unclear_low(unread)
+            else:
+                anchor = anchor_after_offer(best)
             move = replace(
                 move, brief=anchor.brief, must_say=anchor.must_say, variants=anchor.variants
             )

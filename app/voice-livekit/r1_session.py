@@ -475,6 +475,10 @@ _SOFT_CLOSE_RE = re.compile(
     r"understood|perfect|cool|noted|great)\b"
 )
 _AFFIRMATIONS = frozenset({"yes", "yeah", "yep", "yup", "sure"})
+# The interviewer's name as the STT spells it (owner test 8f5bfefc: "Christy, so.", "Christie.").
+_INTERVIEWER_NAMES = frozenset(
+    {INTERVIEWER_NAME.lower(), "christy", "christie", "christi", "kristy", "kristie", "cristy"}
+)
 # Courtesy and filler: the ONLY words allowed next to a refusal.  This is an allowlist on
 # purpose.  A list of question words can never be complete ("any feedback for me", "the
 # salary range", "please share my feedback" open with no question word), and the two ways
@@ -490,7 +494,7 @@ _COURTESY_WORDS = frozenset(
         # The usual trimmings of a polite close ("No questions from my side, thank you for
         # your time, sir.", "Hmm, no.", "No, thank you, Christy.", "No, I'm fine.").
         "for", "your", "time", "today", "from", "my", "side", "end", "sir", "maam", "ma'am",
-        "mam", "madam", "hmm", "hm", "mm", "mhm", "none", "fine", INTERVIEWER_NAME.lower(),
+        "mam", "madam", "hmm", "hm", "mm", "mhm", "none", "fine", *_INTERVIEWER_NAMES,
     }
 )
 # Every apostrophe look-alike folds to the ASCII one (Sarvam may emit U+2019).
@@ -786,6 +790,42 @@ def wrapup_settle_seconds(text: str) -> float:
         # only an acknowledgement or a thank-you refuses here
         return WRAPUP_SETTLE_SECONDS * WRAPUP_SETTLE_ACK_FACTOR
     return WRAPUP_SETTLE_SECONDS
+
+
+def is_lead_in_only(text: str) -> bool:
+    """A wrap-up final that only leads into what follows: "Christy, so.", "So.", "Um, and".
+
+    Owner test 8f5bfefc: the STT split "Christy, so. How what will be the next step?" into two
+    finals and the driver counted each as a question, so one spoken question used up the two the
+    wrap-up takes.  Courtesy words (the interviewer's name among them) ending on a lead-in word
+    and no question mark: the driver joins it to the next final (``_complete_wrapup_turn``).
+    """
+    if "?" in text or "？" in text:
+        return False
+    words = fold_speech(text).split()
+    return (
+        bool(words)
+        and words[-1] in _LEAD_IN_WORDS
+        and all(word in _COURTESY_WORDS for word in words)
+    )
+
+
+# What a candidate says to get the interviewer's attention, around her name ("Christie.", "Hey,
+# Christy?"): it asks nothing by itself.
+_CALLING_WORDS = frozenset({"hey", "hi", "hello", "um", "uh", "hmm", "oh", "so", "and"})
+
+
+def is_name_only(text: str) -> bool:
+    """A wrap-up turn that only calls the interviewer by name ("Christie.", "Christy?").
+
+    It is not a question of its own, so it does not count toward ``WRAPUP_QUESTION_LIMIT``; the
+    model still replies to it, and that reply answers the question it follows (owner test
+    8f5bfefc: "Christie." was the candidate asking again after the answer never came).
+    """
+    words = fold_speech(text).split()
+    return any(word in _INTERVIEWER_NAMES for word in words) and all(
+        word in _INTERVIEWER_NAMES or word in _CALLING_WORDS for word in words
+    )
 
 
 # Words that answer nothing: apology, thanks, greeting, "are you there?", hesitation and
@@ -1436,6 +1476,15 @@ class R1Interview:
         # that is not a backchannel, and with the phase.  A reply cancelled by a "Sorry" / "Thank
         # you." leaves it set, so the next filler counts from the candidate's real answer.
         self._unvoiced_since: float | None = None
+        # The wrap-up question whose answer the candidate has not heard in full: the Reply
+        # prepared for it, cleared when a wrap-up reply is delivered (owner test 8f5bfefc: the
+        # answer to "what will be the next step?" was cut before any audio and L-CLOSE followed).
+        # ``_wrapup_answer_cut`` is that reply when the candidate talked over it after some of it
+        # was heard (their own turn's reply answers it; it is never said again), and
+        # ``_wrapup_retried`` the one time the driver itself had the answer said again.
+        self._wrapup_answer_owed: Reply | None = None
+        self._wrapup_answer_cut: Reply | None = None
+        self._wrapup_retried = False
         self._quick_endpointing = False
         # R1-Q live-UI signals (``LEADNAME_ATTRIBUTE``): the worker is in the transition and has
         # not had the "I'm ready" press yet (``_awaiting_ready``: what the data handler checks),
@@ -3199,6 +3248,8 @@ class R1Interview:
                 candidate_index=index,
             )
         self._last_reply = self._latest_reply = reply
+        if self.machine.phase is R1Phase.WRAPUP:
+            self._wrapup_answer_owed = reply
         if message_id:
             self._replies[str(message_id)] = reply
             while len(self._replies) > _REPLIES_KEPT:
@@ -4575,6 +4626,7 @@ class R1Interview:
             slot.used = True
             index, phase = slot.index, slot.phase
         interrupted = bool(getattr(item, "interrupted", False))
+        self._note_wrapup_answer(phase, slot, interrupted)
         self._remember_bot_turn(index, phase, text, slot)
         self._write_turn(
             index,
@@ -4585,6 +4637,28 @@ class R1Interview:
             started_at_ms=self._bot_turn_anchor(item, slot),
         )
         self._record_learner_speech(slot, text, interrupted)
+
+    def _note_wrapup_answer(
+        self, phase: str | None, slot: _SpeechSlot | None, interrupted: bool
+    ) -> None:
+        """A wrap-up reply the candidate heard answers the owed question.
+
+        A scripted line answers nothing, and an older reply heard late is not the answer to a newer
+        question.  A reply the hook never paired (``slot.reply`` None) counts, as it did before the
+        flag existed.  One the candidate cut off after a word or two ("That's a") is still owed
+        (review of the 8f5bfefc fix: the wrap-up closed on it while their barge-in was mid-turn):
+        the reply to their turn answers it.  One R1 cut itself (``cut_by_r1``) counts as heard.
+        """
+        owed = self._wrapup_answer_owed
+        if owed is None or phase != "wrapup" or (slot is not None and slot.source == "say"):
+            return
+        reply = None if slot is None else slot.reply
+        if reply is not None and reply is not owed:
+            return
+        if interrupted and not (slot is not None and slot.cut_by_r1):
+            self._wrapup_answer_cut = owed
+            return
+        self._wrapup_answer_owed = None
 
     def _remember_bot_turn(
         self, index: int, phase: str, text: str, slot: _SpeechSlot | None
@@ -5490,9 +5564,11 @@ class R1Interview:
         from now (it is not running while the candidate talks, the agent speaks, or the
         microphone is muted), and every further final is joined and judged together.  How long
         depends on how final the words sound (``wrapup_settle_seconds``): "Okay, so" is the
-        start of a question far more often than "No questions."
+        start of a question far more often than "No questions."  A final that only leads in
+        ("Christy, so.", ``is_lead_in_only``) is joined the same way: it is the start of the
+        question in the next final, not a question of its own.
         """
-        while is_no_questions(text):
+        while is_no_questions(text) or is_lead_in_only(text):
             self._restart_silence_window()
             kind, more = await self._await_turn(
                 wrapup_settle_seconds(text), hard=self.machine.remaining_wrapup_seconds
@@ -5505,7 +5581,14 @@ class R1Interview:
         return None, text
 
     async def _run_wrapup(self) -> str | None:
-        """Take questions until two are answered, 'no questions', 2:00, or 20 s of silence."""
+        """Take questions until two are answered, 'no questions', 2:00, or 20 s of silence.
+
+        A question is answered when the candidate heard words of its reply: owner test 8f5bfefc's
+        answer to "what will be the next step?" was cancelled before any audio by "Christie.", the
+        settled reply was taken for an answer and L-CLOSE followed.  While an answer is owed the
+        wrap-up stays open (still bounded by the silence window and the 2:00 budget), and the next
+        turn's reply, whose context still holds the question, answers it.
+        """
         self._drop_stale_turns()
         questions = 0
         while True:
@@ -5515,18 +5598,86 @@ class R1Interview:
             if kind == STOP:
                 return value
             if kind in (SILENCE, DEADLINE):
-                return None
+                return await self._end_wrapup()
             stop, text = await self._complete_wrapup_turn(value or "")
             if stop is not None:
                 return stop
             if is_no_questions(text):
-                return None
+                # "Thank you." also cancels a reply before any audio (the logged 4/10 pattern),
+                # and a refusal gets no reply of its own: the owed answer is said first.
+                return await self._end_wrapup()
+            if is_name_only(text):
+                continue  # "Christie.": calling her again, not a new question
             questions += 1
             if questions >= WRAPUP_QUESTION_LIMIT:
                 await self._wait_reply_settled(
                     min(REPLY_SETTLE_SECONDS, self.machine.remaining_wrapup_seconds())
                 )
-                return None
+                owed = self._wrapup_answer_owed
+                if owed is None:
+                    return None
+                if owed is not self._wrapup_answer_cut and not self._candidate_turn_open():
+                    return await self._end_wrapup()  # lost before a word, and nobody is talking
+                questions -= 1  # cut by the candidate's own turn: its reply answers the question
+
+    async def _end_wrapup(self) -> None:
+        """End the wrap-up, after the answer the candidate never heard has been said once.
+
+        Owner test 8f5bfefc review: a refusal or the silence window closed the wrap-up while the
+        answer to the last question had been cancelled before any audio, so L-CLOSE followed a
+        question nobody answered.  The driver asks for that reply once more (the context still
+        holds the question, ``_reply_for`` finds its prepared Reply), bounded by the wrap-up
+        budget; a reply the candidate talked over after hearing part of it is not said again.
+        """
+        if self._wrapup_answer_owed is not None and self._open_replies:
+            # A reply still playing clears the owed answer when its item arrives.
+            await self._wait_reply_settled(
+                min(REPLY_SETTLE_SECONDS, self.machine.remaining_wrapup_seconds())
+            )
+        owed = self._wrapup_answer_owed
+        if owed is None or owed is self._wrapup_answer_cut or self._wrapup_retried:
+            return None
+        await self._wait_turn_committed()  # a pending end of turn would cut the answer at once
+        generate = getattr(self.session, "generate_reply", None)
+        if (
+            not callable(generate)
+            or self.machine.remaining_wrapup_seconds() <= 0
+            or self._stop_outcome() is not None
+            or self._wrapup_answer_owed is not owed
+        ):
+            return None
+        self._wrapup_retried = True
+        _log.info(
+            "unknown_event", error_type="r1_wrapup_answer_retry", error_category="lost_reply"
+        )
+        self._last_reply = self._latest_reply = owed  # the new speech pairs with the owed reply
+        try:
+            generate()  # a SpeechHandle: never awaited (that waits out its whole playout)
+        except Exception as exc:  # noqa: BLE001 - the close must still play
+            self._latest_reply = None
+            _log.warn(
+                "unknown_event",
+                error_type="r1_wrapup_answer_retry_failed",
+                error_category=_error_type_of(exc),
+            )
+            return None
+        await self._wait_reply_settled(
+            min(REPLY_SETTLE_SECONDS, self.machine.remaining_wrapup_seconds())
+        )
+        return None
+
+    async def _wait_turn_committed(self) -> None:
+        """Wait, within the endpointing delay and the wrap-up budget, for an open turn to commit."""
+        loop = asyncio.get_running_loop()
+        limit = min(
+            endpoint_max_delay_sec() + BARE_YES_FINAL_MARGIN_SECONDS,
+            self.machine.remaining_wrapup_seconds(),
+        )
+        deadline = loop.time() + limit
+        while self._candidate_turn_open() and loop.time() < deadline:
+            if self._stop_outcome() is not None:
+                return
+            await asyncio.sleep(0.05)
 
     async def run(self) -> str:
         """Run forward-only phases and funnel cancellation/errors through one exit."""

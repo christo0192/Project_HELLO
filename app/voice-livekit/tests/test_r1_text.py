@@ -430,12 +430,42 @@ class CanonicalAmountTests(unittest.TestCase):
             ("one thousand five hundred", "$1500"),
             ("two thousand five hundred dollars", "$2500"),
             ("seven hundred and fifty", "$750"),
+            # Digits before the scale word (review of the 8f5bfefc fix: "3 $1000").
+            ("for 3 thousand.", "for $3000."),
+            ("2.5 thousand dollars off", "$2500 off"),
+            ("5 hundred off", "$500 off"),
             ("ten percent off", "10% off"),
             ("twenty five percent off", "25% off"),
             ("10 percent off", "10 percent off"),
+            # A currency word or a preposition after the scale keeps it an amount (review round 2).
+            ("3 thousand dollars for students", "$3000 for students"),
+            ("a price of 3 thousand for students", "a price of $3000 for students"),
+            ("3 thousand per month", "$3000 per month"),
+            ("fifteen hundred a month", "$1500 a month"),
         ):
             with self.subTest(text=text):
                 self.assertEqual(canonical_amounts(text), expected)
+
+    def test_a_count_is_not_an_amount(self):
+        """Review round 2 of the 8f5bfefc fix: "5 thousand alumni" became "$5000 alumni", a $5,000
+        offer, and "3 thousand students" the anchor's "is $3,000 what I'd pay in total?"."""
+        for text in (
+            "We have 5 thousand alumni at top companies.",
+            "Over 6 thousand learners placed.",
+            "We have placed 3 thousand students",
+            "five thousand learners",
+            "two thousand interviews",
+            "three thousand five hundred reviews on Google",
+            "5 thousand happy alumni",
+            "3 thousand plus learners",
+            "a thousand hours of content",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(canonical_amounts(text), text)
+        self.assertEqual(
+            canonical_amounts("It costs 9 thousand. We have 4 thousand reviews."),
+            "It costs $9000. We have 4 thousand reviews.",
+        )
 
     def test_plain_small_numbers_and_words_are_left_alone(self):
         for text in ("six months", "I have two kids", "about 10 hours a week", "ten or so"):
