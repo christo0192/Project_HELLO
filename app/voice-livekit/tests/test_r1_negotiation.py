@@ -880,6 +880,26 @@ class PriceOfferTests(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(self.offers(text), {6000: False})
 
+    def test_a_capitalised_price_word_is_not_a_competitors_name(self):
+        """Fuzz pass 2026-10-30: speech-to-text capitalises the first word, and "Best price" or
+        "Mera last price" must read as the advisor's price, as on main, not as "Acme prices it"."""
+        for text, value in (
+            ("Mera best price 7,600 dollars hai.", 7600),
+            ("Last price, 6,500 dollars.", 6500),
+            ("Mera last price 6,000 dollars hai.", 6000),
+            ("Hamara best price 6,800 dollars hai.", 6800),
+            ("Discounted price 6,000 dollars, for you.", 6000),
+            ("Revised price is 5,000 dollars.", 5000),
+            ("Special price is 6,500 dollars.", 6500),
+            ("Course price is 6,500 dollars.", 6500),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual({v for v, _ in neg.parse_price_offers(text)}, {value})
+        # A real name in a seller's role still hands the figure to someone else.
+        for text in ("Acme sells it for 3000.", "Acme charges 3000 for it."):
+            with self.subTest(text=text):
+                self.assertEqual(neg.parse_price_offers(text), [])
+
     def test_review_round_2_a_low_figure_named_before_the_full_price_is_stale(self):
         """"$2,000 in credits" (or any low figure) at turn 56, then "The program costs $9,000":
         the anchor asked "is $2,000 what I'd pay in total?" instead of asking for $7,000."""

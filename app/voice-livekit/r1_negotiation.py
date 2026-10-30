@@ -1793,7 +1793,10 @@ _NOT_A_SELLER = frozenset(
     "the a an for with at on in of to my normally usually basically honestly really currently "
     "right overall typically generally just only again total final plus still otherwise "
     "originally literally frankly definitely obviously clearly great good perfect absolutely "
-    "most many some other others every everyone everybody nobody students people".split()
+    "most many some other others every everyone everybody nobody students people "
+    # Price words that start a sentence ("Best price is $6,500", "Mera last price 6,000 hai"):
+    "best last special lowest discounted revised net new updated reduced offer offers course "
+    "program programme fee fees price prices cost mera hamara apna aapka ma'am sir".split()
 )
 # After the seller's name, "I" / "we" / "our" / "for you" hand the figure back to the advisor:
 # "Scaler sells it for 6000, but I'll give it to you for 3000".
@@ -1818,6 +1821,14 @@ def _role_pattern(alt: str, verbs: str) -> re.Pattern[str]:
 _KNOWN_SELLER = _role_pattern(_KNOWN_SELLERS, r"(?:" + _SELLER_VERB + r"|is|are|has|have)")
 
 
+# An unknown name sells only with a verb that is never a noun after it: "Best price is $6,500" and
+# "Course cost" are not "Acme prices it" (fuzz pass, 2026-10-30).
+_NAMED_SELLER_VERB = (
+    r"(?:sells?|sold|selling|offers|offered|offering|gives|gave|giving|charges?|charged|"
+    r"charging|lists|listed|priced)"
+)
+
+
 def _named_sellers(piece: str) -> re.Pattern[str] | None:
     """Capitalised names in ``piece`` in a seller's role, as a pattern over the lowered text."""
     names: list[str] = []
@@ -1828,7 +1839,7 @@ def _named_sellers(piece: str) -> re.Pattern[str] | None:
         names.append(re.escape(word.lower()))
     if not names:
         return None
-    return _role_pattern("|".join(dict.fromkeys(names)), _SELLER_VERB)
+    return _role_pattern("|".join(dict.fromkeys(names)), _NAMED_SELLER_VERB)
 
 
 def _third_party_seller(lowered: str, start: int, sellers: re.Pattern[str] | None) -> bool:
