@@ -3852,10 +3852,12 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
         self.assertEqual(self.session.spoken, [])
 
     async def retried(self) -> FakeSpeechHandle:
-        """The one reply the driver itself asked for (the owed answer, said again)."""
-        for _ in range(100):
-            if self.session.generated:
-                break
+        """The one reply the driver itself asked for (the owed answer, said again).
+
+        Polled against a loop-time deadline, not a count of sleeps: a loaded CI box may need
+        longer than a second (review round 2: 2 of 30 runs failed under a parallel suite)."""
+        deadline = asyncio.get_running_loop().time() + 5.0
+        while not self.session.generated and asyncio.get_running_loop().time() < deadline:
             await asyncio.sleep(0.01)
         self.assertEqual(len(self.session.generated), 1, "the owed answer is asked for once")
         return self.session.generated[0]
@@ -3941,12 +3943,25 @@ class TestWrapupAnswersTheQuestionBeforeTheClose(R1TestCase):
             self.assertIsNone(await asyncio.wait_for(task, 5.0))
         self.assertEqual(self.wrapup_bot_rows(), [self.DEFER])
 
+    async def spoken_ask(self, text: str) -> FakeSpeechHandle:
+        """``ask`` the way a real turn runs it: the candidate is speaking until the turn commits.
+
+        The silence window then starts after the question, never during it: with a 0.1 s window,
+        a stall of the test process before the commit was "silence" before any question was owed
+        (review round 2: the flaky failure of the silence test)."""
+        self.user_state("speaking")
+        await self.settle()
+        handle = await self.ask(text)
+        self.user_state("listening")
+        await self.settle()
+        return handle
+
     async def test_silence_after_a_lost_answer_gets_the_answer_before_the_close(self):
         self.enter_wrapup()
         with mock.patch.object(r1_session, "WRAPUP_SILENCE_SECONDS", 0.1):
             task = asyncio.create_task(self.interview._run_wrapup())
             await self.settle()
-            await self.lost(await self.ask("What will be the next step?"))
+            await self.lost(await self.spoken_ask("What will be the next step?"))
             again = await self.retried()
             self.assertFalse(task.done())
             await self.play(again, self.DEFER)

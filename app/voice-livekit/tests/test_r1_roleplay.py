@@ -3781,6 +3781,68 @@ class OwnerTest8f5bfefcPriceOfferTests(unittest.TestCase):
                     self.assertEqual(anchor.intent.must_say, ("$9,000", "$7,000"))
                     self.assertNotEqual(s.eng.negotiation.price_situation(), SITUATION_MET)
 
+    def test_review_round_2_a_count_a_competitor_or_an_emi_keeps_the_default_anchor(self):
+        """Review round 2 of the fix: "3 thousand students" became an unclear $3,000 ("is $3,000
+        what I'd pay in total?"), "Scaler sells it for 3000" and "join for 2000 and pay the rest
+        in EMIs" a $3,000 / $2,000 price ("$2,000 is under the $7,000 I read about")."""
+        for offer in (
+            "So the program is $9,000. We have placed 3 thousand students so far.",
+            "Over five thousand learners have been placed through this program. So the program "
+            "is $9,000.",
+            "Our instructors have taken over two thousand interviews at FAANG. So the program is "
+            "$9,000.",
+            "The batch has 1,500 seats and the fee is nine thousand dollars.",
+            "Scaler sells it for 3000, but they have no mentors. Ours is $9,000.",
+            "So the program is $9,000. Coursera's price is $3,000, but it is just videos.",
+            "So the program is $9,000. You can join for 2000 and pay the rest in EMIs.",
+            "So the program is $9,000. You can start for 2000, rest in instalments.",
+            "So the program is $9,000. You'll pay 1500 for 6 months.",
+            "So the program is $9,000. The fee is 1500 rupees a month.",
+            "So the program is $9,000. We have a $2,000 early bird discount right now.",
+            "So the program is $9,000. You get $2,000 in credits for cloud labs.",
+            "So the program is $9,000. EMIs start at $1,500.",
+        ):
+            with self.subTest(offer=offer):
+                s, anchor = self.replay_with(offer)
+                self.assertIsNone(s.eng.negotiation.best_offer_usd)
+                self.assertIsNone(s.eng.negotiation.unread_low_usd())
+                self.assertEqual(anchor.intent.must_say, ("$9,000", "$7,000"))
+                self.assertNotEqual(s.eng.negotiation.price_situation(), SITUATION_MET)
+
+    def replay_lines(self, lines):
+        """The owner's turns before 56, then ``lines`` from turn 56 on, then the filler turns."""
+        s = Session(engine(resolve_persona("p1_career_switcher", variant="v2"), "Christo",
+                           seed="8f5bfefc"))
+        plans = {}
+        turn, r = 56, 266
+        script = [*(item for item in self.ADVISOR if item[0] < 56)]
+        for text in (*lines, *(item[2] for item in self.FILL)):
+            script.append((turn, r, text))
+            turn, r = turn + 2, r + 14
+        for turn, r, text in script:
+            plans[turn] = s.say(text, r, turn_index=turn)
+        return s, plans
+
+    def test_review_round_2_a_low_figure_before_the_stated_price_is_stale(self):
+        s, plans = self.replay_lines(("So, I can give you 1500.", "The program costs $9,000."))
+        anchor = next(p for p in plans.values() if p.move_id == F1_ANCHOR)
+        self.assertEqual(anchor.intent.must_say, ("$9,000", "$7,000"))
+        self.assertIsNone(s.eng.negotiation.unread_low_usd())
+
+    def test_review_round_2_a_pitch_count_after_the_anchor_is_no_offer(self):
+        """"We have 5 thousand alumni at top companies." after the anchor was a $5,000 offer: the
+        price was "met" and the learner dropped its money objection."""
+        s, plans = self.replay_lines((
+            "So the program is $9,000.", "Our mentors are from top tech companies.", "Okay.",
+        ))
+        anchor_turn = next(t for t, p in plans.items() if p.move_id == F1_ANCHOR)
+        s.say("We have 5 thousand alumni at top companies.", 500, turn_index=max(plans) + 2)
+        self.assertGreater(max(plans) + 2, anchor_turn)
+        negotiation = s.eng.negotiation
+        self.assertIsNone(negotiation.best_offer_usd)
+        self.assertNotEqual(negotiation.price_situation(), SITUATION_MET)
+        self.assertFalse(negotiation.money_is_settled())
+
 
 class ReasonOnceThroughTheEngineTests(unittest.TestCase):
     """R1-Q round 1: no stall reason is voiced twice in a call, whether by a negotiation intent

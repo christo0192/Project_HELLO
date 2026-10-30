@@ -711,6 +711,17 @@ class PriceOfferTests(unittest.TestCase):
         "You'll pay 1,500 dollars as a deposit.",
         "The fee is 1500 for the first instalment.",
         "I can bring it down by 2000.",
+        # Review round 2: the rest paid later in other words, a duration or count of payments,
+        # and a per-month figure in rupees.
+        "You can join for 2000 and pay the rest later.",
+        "You can join for 2000 and pay the rest in EMIs.",
+        "You can start for 2000, rest in instalments.",
+        "You can join for $2,000 and pay the balance in instalments.",
+        "You'll pay 1500 for 6 months.",
+        "You'll pay 1500, 6 times.",
+        "You'll pay 1500 twice.",
+        "The fee is 1500 rupees a month.",
+        "The total is 3000 rupees per month.",
     )
 
     def test_a_part_of_the_price_is_no_net_price(self):
@@ -800,6 +811,98 @@ class PriceOfferTests(unittest.TestCase):
                 self.assertIn("$7,000", variant)
                 for asked in ("$9,000", "Can you do that", "match that", "Is that possible"):
                     self.assertNotIn(asked, variant)
+
+    # Review round 2 of the 8f5bfefc fix: pitch figures that were read as the learner's price.
+    PITCH_COUNTS = (
+        "We have 5 thousand alumni at top companies.",
+        "Over 6 thousand learners placed.",
+        "We have placed 3 thousand students so far.",
+        "We have 3 thousand happy alumni.",
+        "Over five thousand learners have been placed through this program.",
+        "Our instructors have taken over two thousand interviews at FAANG.",
+        "We have three thousand five hundred reviews on Google.",
+        "The batch has 1,500 seats and the fee is nine thousand dollars.",
+        "More than 2,500 dollars is the average monthly salary hike for our alumni.",
+    )
+    COMPETITOR_PRICES = (
+        "Scaler sells it for 3000.",
+        "Coursera offers it for 3000.",
+        "Udemy sells the course for 3000.",
+        "Scaler sells it for 6000.",
+        "Coursera's price is $3,000.",
+        "At Scaler the price is $3,000.",
+        "At Scaler the price is $6,000.",
+        "Acme Academy sells it for 3000.",
+        "Scaler sells it for 3000, but they have no mentors.",
+    )
+    ADD_ONS = (
+        "We have a $2,000 early bird discount right now.",
+        "You get $2,000 in credits.",
+        "You'll get $3,000 worth of bonuses.",
+        "EMIs start at $1,500.",
+        "There's a $2,000 referral bonus.",
+        "You get a free 3000 dollar course as a bonus.",
+    )
+
+    def test_review_round_2_a_count_a_competitor_or_an_add_on_is_no_price(self):
+        for text in (*self.PITCH_COUNTS, *self.COMPETITOR_PRICES, *self.ADD_ONS):
+            for require_cue in (True, False):
+                with self.subTest(text=text, require_cue=require_cue):
+                    self.assertEqual(neg.parse_price_offers(text, require_cue=require_cue), [])
+            with self.subTest(text=text, read="unread"):
+                self.assertEqual(neg.unread_low_figures(text), [])
+            with self.subTest(text=text, through="observe"):
+                state = neg.Negotiation("husband")
+                state.observe(4, "So the program is $9,000.")
+                state.observe(6, text, anchor_turn=5)
+                self.assertIsNone(state.best_offer_usd)
+                self.assertNotEqual(state.price_situation(), neg.SITUATION_MET)
+                self.assertFalse(state.money_is_settled())
+                self.assertIsNone(state.unread_low_usd())
+
+    def test_review_round_2_the_advisors_own_low_price_still_counts(self):
+        for text in (
+            "Scaler sells it for 6000, but I'll give it to you for 3000.",
+            "I can give it for $3000 with the discount.",
+            "I'll give it to you for 3000 and send you the link later.",
+            "We are happy to give you the course for 3000.",
+            "Let me give it to you for 3000.",
+            "A special price of 3 thousand for students like you.",
+            "I will give it to you for 3 thousand dollars.",
+        ):
+            for require_cue in (True, False):
+                with self.subTest(text=text, require_cue=require_cue):
+                    self.assertEqual(
+                        {v for v, _ in neg.parse_price_offers(text, require_cue=require_cue)},
+                        {3000},
+                    )
+        for text in ("Basically it costs $6,000.", "Unlike YouTube, the price for you is $6,000."):
+            with self.subTest(text=text):
+                self.assertEqual(self.offers(text), {6000: False})
+
+    def test_review_round_2_a_low_figure_named_before_the_full_price_is_stale(self):
+        """"$2,000 in credits" (or any low figure) at turn 56, then "The program costs $9,000":
+        the anchor asked "is $2,000 what I'd pay in total?" instead of asking for $7,000."""
+        state = neg.Negotiation("husband")
+        state.observe(56, "I can give you 1500.")
+        self.assertEqual(state.unread_low_usd(), 1500)
+        state.observe(58, "The program costs $9,000.")
+        self.assertIsNone(state.unread_low_usd())
+        state.observe(60, "Okay, I can give you 2500.")
+        self.assertEqual(state.unread_low_usd(), 2500)  # named after the price: current again
+        state.observe(62, "I can do $8,000 for you.")
+        self.assertEqual(state.best_offer_usd, 8000)
+        self.assertIsNone(state.unread_low_usd())  # an offer above the anchor clears it too
+        # A low figure in the same turn as the price is still the one the anchor reacts to.
+        same = neg.Negotiation("husband")
+        same.observe(4, "So the program is $9,000. I can give you 1500.")
+        self.assertEqual(same.unread_low_usd(), 1500)
+        for text in ("Scaler costs $9,000.", "I can't do $9,000.", "What's the price, $9,000?"):
+            with self.subTest(text=text):
+                self.assertFalse(neg.states_full_price(text))
+        for text in ("The program costs $9,000.", "The fee is 9000.", "Our price is $8,500."):
+            with self.subTest(text=text):
+                self.assertTrue(neg.states_full_price(text))
 
     def test_owner_test_8f5bfefc_the_three_thousand_is_on_the_table(self):
         state = neg.Negotiation("husband")
