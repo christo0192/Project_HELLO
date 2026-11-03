@@ -1961,5 +1961,125 @@ class BriefRequestAfterThePickupTests(unittest.TestCase):
         self.assertEqual([text for text in texts if detect_character_break(text) == "coach"], [])
 
 
+class WrapOfferAnswerTests(unittest.TestCase):
+    """M2 (2026-11-03): the answer to L-ASIDE-WRAP, "would you like to wrap it up here?"."""
+
+    def test_words_that_ask_to_stop_accept_it(self):
+        from r1_tracker import accepts_wrap_offer
+
+        for text in (
+            "Yes, let's wrap it up here.",
+            "We can stop here, thank you.",
+            "No, I'm done.",
+            "No no, let's wrap it up.",
+            "That's it for me.",
+            "Can we wrap up here?",
+            "I think we can wrap up.",
+            "End the interview.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(accepts_wrap_offer(text))
+
+    def test_a_no_wins_and_a_question_is_no_request(self):
+        from r1_tracker import accepts_wrap_offer, declines_wrap_offer
+
+        for text in (
+            "No.",
+            "Not yet.",
+            "No, let's keep going.",
+            "Yes, let's keep going.",
+            "Let me just add one more thing.",
+            "Before we wrap up, the EMI is 500 a month.",
+            "I'm not done.",
+            "I would like to continue with Shalini.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(declines_wrap_offer(text))
+                self.assertFalse(accepts_wrap_offer(text))
+        for text in ("Why would we stop now?", "Okay, so the EMI is 500.", "Hmm."):
+            with self.subTest(text=text):
+                self.assertFalse(accepts_wrap_offer(text))
+        # Courtesy is not a no.
+        self.assertFalse(declines_wrap_offer("No problem, that sounds good."))
+
+    def test_a_short_yes_is_read_only_whole(self):
+        from r1_tracker import is_short_wrap_yes
+
+        for text in (
+            "Yes.", "Okay.", "Sure, sounds good.", "Yes please.", "Haan ji.", "Okay, sure.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(is_short_wrap_yes(text))
+        for text in (
+            "Okay, so the EMI is 500.",
+            "Yes, let's keep going.",
+            "Yes?",
+            "No.",
+            "Okay, but one more thing.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(is_short_wrap_yes(text))
+
+
+class CoerciveS03Tests(unittest.TestCase):
+    """Mock call aa166f09 (L6): a deadline of today and a higher price later are coercive."""
+
+    def test_only_for_today_and_pay_more_later_are_coercive(self):
+        for text in (
+            "You can speak to your partner, but this discount is available only for today.",
+            "If you wanted to see that later, then you will have to pay $13000.",
+            "Later you'll have to pay $12,000.",
+            "The discount is only for today.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(urgency_levers(text)[1])
+        for text in (
+            "Are you available today?",
+            "You can pay later, you will not have to pay upfront.",
+            "Later on you can pay in instalments.",
+            # Review fix: honest EMI descriptions and reassurances set no deadline and make no
+            # threat (each one capped the commitment at WEAK as "advisor_pressured").
+            "Pay $1,000 now and later you pay $700 a month.",
+            "Later it will cost you nothing extra, there are no hidden fees.",
+            "You can decide later, you will pay the same 9000.",
+            "If you want to upgrade later, you would have to pay $500 extra for the career module.",
+            "Our support team is available only now and then on weekends.",
+            "Our office is open only until today 6 pm, but you can call tomorrow.",
+            "The scholarship is there only for today and tomorrow.",
+            "Later it will cost you nothing more.",
+            # Repair (round 2): the deck's seasonal-discount lever (the list price after the
+            # discount ends) and an honest EMI or add-on surcharge are no threat; each one made
+            # the advisor "pressured" and capped the commitment at WEAK.
+            "This seasonal discount ends Friday; if you join later you will need to pay $9,000.",
+            "The discount is for this batch only. Later you will have to pay the full price.",
+            "Later you will have to pay the full price.",
+            "You can pay the rest later, it costs $500 more in total for the EMI plan.",
+            "If you pay later in EMIs, it costs a little more because of the interest.",
+            "If you add it later, it costs $300 more for the mentoring module.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(urgency_levers(text)[1])
+
+    def test_the_seasonal_lever_said_honestly_keeps_its_credit(self):
+        text = "This seasonal discount ends Friday; if you join later you will need to pay $9,000."
+        self.assertIn("seasonal_discount", urgency_levers(text)[0])
+        tracker = CoverageTracker(PERSONA, seed="x")
+        tracker.observe_candidate_turn(text, 3)
+        evidence = tracker.commitment_evidence(AskKind.ENROL)
+        self.assertFalse(evidence.pressured)
+        self.assertTrue(evidence.urgency_lever)
+
+    def test_a_higher_price_later_said_as_a_comparison_is_coercive(self):
+        for text in (
+            "Later it will cost more.",
+            "Later you will have to pay $9,500.",
+            "if you wanted to see that later then you will have to pay 13000 dollars",
+            "This discount is available only for today, so decide now.",
+            "The offer is valid only until tonight.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(urgency_levers(text)[1])
+
+
 if __name__ == "__main__":
     unittest.main()

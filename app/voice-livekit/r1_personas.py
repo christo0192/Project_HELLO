@@ -25,7 +25,7 @@ from dataclasses import dataclass
 
 from r1_commitment import call_proposal_in
 from r1_script import line as script_line
-from r1_text import fold, is_question_like, split_sentences
+from r1_text import dollar_amounts, fold, is_question_like, split_sentences
 
 PERSONA_VERSION = 1
 STATE_NAMES = {
@@ -57,6 +57,9 @@ PUBLIC_ANSWERS: tuple[tuple[str, str], ...] = (
     ("hours a week you could give it", AVAILABILITY_ANSWER),
     ("your e-mail, phone number or any contact detail", CONTACT_ANSWER),
 )
+# The top of the card's monthly budget ("Around $500-700 a month."): a monthly payment above it is
+# never "workable" for the learner (``r1_guard``: ``over_budget_accepted``).
+MONTHLY_BUDGET_MAX_USD = 700
 
 
 @dataclass(frozen=True)
@@ -86,13 +89,19 @@ class Need:
 
 @dataclass(frozen=True)
 class Variant:
-    """A surface variant: name, city and employer type.  The structure never changes."""
+    """A surface variant: name, city and employer type.  The structure never changes.
+
+    ``workplace`` is where she works, the way a lead who filled in a form would say it when the
+    advisor asks (owner decision 2026-11-03, M4): a kind of employer and a town, never a real
+    organisation's name.
+    """
 
     id: str
     first_name: str
     last_name: str
     city: str
     employer: str
+    workplace: str = ""
 
     @property
     def full_name(self) -> str:
@@ -114,6 +123,12 @@ class Persona:
     # yourself" questions, so it has true things to say instead of recycling one profile
     # line.  Nothing here may match a deep-need marker (``tests/test_r1_personas.py``).
     backstory: tuple[str, ...] = ()
+    # Owner decision 2026-11-03 (M4, mock call aa166f09: the employer and the salary were refused
+    # six times).  Her job and roughly what she earns, as she would answer a polite ask; the
+    # employer is the variant's ``workplace``.  Marker-free like the rest of the card (the salary
+    # line never says "stipend" or "postdoc salary", which are H3 markers of the research scholar).
+    role: str = ""
+    salary: str = ""
 
     def need(self, topic: str) -> Need:
         for item in self.needs:
@@ -198,6 +213,8 @@ PERSONAS: tuple[Persona, ...] = (
         ),
         decision_maker="husband",
         prior_learning="Just a bit of online stuff.",
+        role="I'm a quality operations specialist.",
+        salary="Around $85,000 a year.",
         backstory=(
             "Your day job is reviewing batch records and chasing deviation paperwork at a "
             "pharma site.",
@@ -209,12 +226,29 @@ PERSONAS: tuple[Persona, ...] = (
             "You are calling from home after work, a bit tired but friendly.",
         ),
         variants=(
-            Variant("v1", "Meera", "Iyer", "Edison, NJ", "pharma operations and quality"),
             Variant(
-                "v2", "Priya", "Nair", "Princeton, NJ", "medical device operations and quality"
+                "v1",
+                "Meera",
+                "Iyer",
+                "Edison, NJ",
+                "pharma operations and quality",
+                "a pharmaceutical manufacturing site in Edison",
             ),
             Variant(
-                "v3", "Divya", "Shah", "New Brunswick, NJ", "life sciences operations and quality"
+                "v2",
+                "Priya",
+                "Nair",
+                "Princeton, NJ",
+                "medical device operations and quality",
+                "a medical device company near Princeton",
+            ),
+            Variant(
+                "v3",
+                "Divya",
+                "Shah",
+                "New Brunswick, NJ",
+                "life sciences operations and quality",
+                "a life sciences company in New Brunswick",
             ),
         ),
     ),
@@ -280,6 +314,8 @@ PERSONAS: tuple[Persona, ...] = (
         ),
         decision_maker="father",
         prior_learning="Mostly self-study.",
+        role="I'm a reporting analyst on a contract, since I finished my master's.",
+        salary="About $60,000 a year.",
         backstory=(
             "Day to day you build weekly dashboards and clean up spreadsheets with SQL and "
             "Excel.",
@@ -290,9 +326,25 @@ PERSONAS: tuple[Persona, ...] = (
             "You share an apartment with two roommates.",
         ),
         variants=(
-            Variant("v1", "Ananya", "Rao", "Austin, TX", "reporting"),
-            Variant("v2", "Neha", "Singh", "Dallas, TX", "business intelligence"),
-            Variant("v3", "Pooja", "Gupta", "Houston, TX", "operations reporting"),
+            Variant(
+                "v1", "Ananya", "Rao", "Austin, TX", "reporting", "a logistics company in Austin"
+            ),
+            Variant(
+                "v2",
+                "Neha",
+                "Singh",
+                "Dallas, TX",
+                "business intelligence",
+                "a retail company in Dallas",
+            ),
+            Variant(
+                "v3",
+                "Pooja",
+                "Gupta",
+                "Houston, TX",
+                "operations reporting",
+                "an energy company in Houston",
+            ),
         ),
     ),
     Persona(
@@ -370,6 +422,8 @@ PERSONAS: tuple[Persona, ...] = (
         ),
         decision_maker="husband",
         prior_learning="SQL, Excel, Tableau and some Python at work.",
+        role="I'm a data analyst on the business reporting team.",
+        salary="About $90,000 a year.",
         backstory=(
             "You build Tableau dashboards and write SQL reports for business teams.",
             "You use Python for small automation scripts, nothing fancy.",
@@ -379,9 +433,25 @@ PERSONAS: tuple[Persona, ...] = (
             "You like to understand the details before you decide anything.",
         ),
         variants=(
-            Variant("v1", "Kavya", "Menon", "Charlotte, NC", "a bank"),
-            Variant("v2", "Sneha", "Pillai", "Raleigh, NC", "an insurance company"),
-            Variant("v3", "Ritu", "Kapoor", "Atlanta, GA", "a financial services firm"),
+            Variant(
+                "v1", "Kavya", "Menon", "Charlotte, NC", "a bank", "a regional bank in Charlotte"
+            ),
+            Variant(
+                "v2",
+                "Sneha",
+                "Pillai",
+                "Raleigh, NC",
+                "an insurance company",
+                "an insurance company in Raleigh",
+            ),
+            Variant(
+                "v3",
+                "Ritu",
+                "Kapoor",
+                "Atlanta, GA",
+                "a financial services firm",
+                "a financial services firm in Atlanta",
+            ),
         ),
     ),
     Persona(
@@ -454,6 +524,8 @@ PERSONAS: tuple[Persona, ...] = (
         ),
         decision_maker="partner",
         prior_learning="Python, R and statistics from my research.",
+        role="I'm a postdoctoral researcher, about two years in now.",
+        salary="Around $62,000 a year.",
         backstory=(
             "You analyse large experimental datasets with Python and R, and you enjoy the "
             "statistics.",
@@ -464,9 +536,30 @@ PERSONAS: tuple[Persona, ...] = (
             "You are thoughtful and tend to ask careful questions.",
         ),
         variants=(
-            Variant("v1", "Shalini", "Verma", "Boston, MA", "computational biology"),
-            Variant("v2", "Anjali", "Joshi", "Cambridge, MA", "bioinformatics"),
-            Variant("v3", "Nisha", "Reddy", "Somerville, MA", "computational neuroscience"),
+            Variant(
+                "v1",
+                "Shalini",
+                "Verma",
+                "Boston, MA",
+                "computational biology",
+                "a university research lab in Boston",
+            ),
+            Variant(
+                "v2",
+                "Anjali",
+                "Joshi",
+                "Cambridge, MA",
+                "bioinformatics",
+                "a university genomics lab in Cambridge",
+            ),
+            Variant(
+                "v3",
+                "Nisha",
+                "Reddy",
+                "Somerville, MA",
+                "computational neuroscience",
+                "a university neuroscience lab near Somerville",
+            ),
         ),
     ),
 )
@@ -567,6 +660,25 @@ class RenderedPersona:
     def markers(self, topic: str) -> tuple[re.Pattern[str], ...]:
         return _compiled_markers(self.persona.id, topic)
 
+    @property
+    def work_answers(self) -> tuple[tuple[str, str], ...]:
+        """Her answers about her work (M4): where she works, her job, roughly what she earns."""
+        answers = []
+        if self.variant.workplace:
+            answers.append(("where you work", f"I work at {self.variant.workplace}."))
+        if self.persona.role:
+            answers.append(("your job and how long you have been in it", self.persona.role))
+        if self.persona.salary:
+            answers.append(("roughly what you earn", self.persona.salary))
+        return tuple(answers)
+
+    @property
+    def card_amounts(self) -> frozenset[int]:
+        """The dollar figures of her own work answers (the guard lets her say them)."""
+        return frozenset(
+            amount for _label, answer in self.work_answers for amount in dollar_amounts(answer)
+        )
+
     def public_card_text(self) -> str:
         """Everything the learner prompt may say about the persona; no deep need."""
         parts = [
@@ -575,6 +687,10 @@ class RenderedPersona:
             "You filled in a form on the Interview Kickstart website a few days ago about "
             "the Data Science course. You know only that it is around $9,000 and about "
             "6 months.",
+            # L4 (mock call aa166f09: "I'm calling about the data science course", "I thought I
+            # was the one calling"): she is the one who was called.
+            "The Program Advisor is calling you back about that form, and you answered the "
+            "phone: you did not call them.",
         ]
         if self.persona.backstory:
             parts.append(
@@ -589,6 +705,14 @@ class RenderedPersona:
         for label, answer in PUBLIC_ANSWERS:
             parts.append(f'- {label}: "{answer}"')
         parts.append(f'- who else is involved in your decision: "{self.decider_answer}"')
+        for label, answer in self.work_answers:
+            parts.append(f'- {label}: "{answer}"')
+        if self.work_answers:
+            parts.append(
+                "Where you work, your job and roughly what you earn are what any lead who filled "
+                "in a form would share: when the advisor asks politely, answer plainly from these "
+                "lines, give only the round figure, and do not refuse."
+            )
         parts.append(
             "Anything else about yourself that is not listed here: answer in a few vague, "
             "believable words and invent no numbers, names or dates. Anything else about "
@@ -865,7 +989,16 @@ _OFFER_QUESTION = re.compile(
     r"\bwould (?:it|that|this|a|an|the|some|any)\b[^?]{0,40}\bhelp\b"
     r"|\bwould it be (?:ok|okay|better|good|helpful|useful|nice)\b|\bwould you like me to\b"
     r"|\bdo you want me to\b|\bwant me to\b|\b(?:shall|should) (?:i|we)\b"
-    r"|\b(?:can|could) (?:i|we)\b(?! (?:just |quickly )?ask\b)|\bhow about\b|\bwhy don'?t we\b",
+    # "Can I know your budget?", "can I understand what your challenge is?" ask about the learner
+    # (L3, mock call aa166f09 turns 49 and 115); "Can I send you the link?" offers something.  The
+    # verb is a probe only when the learner ("you", "your") follows within a few words (review
+    # fix): "Can I check the payment options and get back to you?", "Could I find out from my
+    # team ...", "Can I check with our finance team on an EMI plan for you?" offer to look it up.
+    r"|\b(?:can|could) (?:i|we)\b(?! (?:just |quickly |please |also )?(?:ask|know|understand|"
+    r"learn|hear|check|find out|get (?:a sense|an idea|to know))\b"
+    r"(?=[^?]{0,25}\b(?:you|your|yours)\b)"
+    r"(?![^?]{0,40}\b(?:with (?:my|our|the) \w+|from (?:my|our|the) \w+|get back to you)\b))"
+    r"|\bhow about\b|\bwhy don'?t we\b",
     re.IGNORECASE,
 )
 # A check-in on the advisor's own answer is not a probe of the learner: "Did that answer your
@@ -1005,6 +1138,10 @@ def asks_about_learner(text: object) -> bool:
 _OPEN_QUESTION = re.compile(
     r"\bwhat would (?:help|make|it take|you need|you want|need to)\b"
     r"|\bwhat (?:do|would) you (?:need|want|expect|hope)\b"
+    # L3 (mock call aa166f09, turns 51, 59, 68, 70 and 90): "what are you expecting from the
+    # course?", "what are you looking for?".
+    r"|\bwhat(?:'re| are| were) you (?:really |actually |exactly )?(?:expecting|looking for|"
+    r"hoping)\b"
     r"|\bhow (?:do|would|does) (?:you|it|that|this) (?:feel|sit|land)\b"
     r"|\bhelp you (?:two |both )?(?:decide|feel|move|get)\b"
     r"|\bwhat(?:'s| is) (?:on your mind|the main thing|most important|really)\b"

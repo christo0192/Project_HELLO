@@ -173,6 +173,9 @@ class Reply:
     r_sec: float = 0.0
     recorded: bool = False
     guard_recorded: bool = False
+    # A scripted sentence spoken after the model's reply in the same speech (M1: Christy's
+    # L-TRANSITION-ASK after an answer before the role-play); "" for none.
+    tail: str = ""
 
 
 def llm_messages(

@@ -454,8 +454,11 @@ TIME_CUE_BRIEF_ALTERNATIVES = (
     "time that is short, not theirs",
 )
 # Curiosity topics of the free replies (R1-Q): the two neutral questions that used to be
-# scheduled (Q-A "live or recorded?", Q-B "what would I build?") plus three more.  The engine
-# hands the model one unasked topic every ``CURIOSITY_EVERY`` free replies.
+# scheduled (Q-A "live or recorded?", Q-B "what would I build?") plus more.  The engine hands the
+# model one unasked topic every ``CURIOSITY_EVERY`` free replies.  L1 (mock call aa166f09: the pool
+# of five was empty by 6:40, so the 18:30 check-in got "If you have no more questions, say so"): a
+# topic is used up only when the learner's spoken question covers it (``curiosity_asked_in``) or
+# the advisor already answered it, and three more topics joined the pool.
 CURIOSITY_EVERY = 3
 CURIOSITY_TOPICS: tuple[tuple[str, str], ...] = (
     ("format", "whether the classes are live or recorded"),
@@ -463,6 +466,9 @@ CURIOSITY_TOPICS: tuple[tuple[str, str], ...] = (
     ("payment", "whether you could pay in monthly instalments"),
     ("mentor_time", "how much time you would get with mentors"),
     ("weekly_hours", "how many hours a week it takes"),
+    ("class_size", "how many people are in a batch"),
+    ("prerequisites", "whether you need to know anything before you start"),
+    ("job_search", "whether there is any help with the job search afterwards"),
 )
 REQUIRED_MOVES = tuple(spec.id for spec in PLAN if spec.required)
 SPEC_BY_ID = {spec.id: spec for spec in PLAN}
@@ -715,6 +721,22 @@ _CURIOSITY_COVERED = {
     "mentor_time": _compile(
         r"\bmentor(?:s|ship|ing)?\b", r"\binstructors?\b", r"\b1[- ]on[- ]1\b"
     ),
+    "class_size": _compile(
+        r"\b\d+ (?:students|learners|people) (?:in|per) (?:a |each |every |the )?(?:batch|cohort|"
+        r"class)\b",
+        r"\b(?:batch|cohort|class) (?:size|of \d+)\b",
+        r"\bsmall (?:batch|batches|cohorts?|class|classes|groups?)\b",
+    ),
+    "prerequisites": _compile(
+        r"\bprerequisites?\b",
+        r"\bno (?:prior|coding|programming) (?:knowledge|experience|background)\b",
+        r"\bfrom scratch\b|\bbeginner[- ]friendly\b|\bfrom the basics\b",
+    ),
+    "job_search": _compile(
+        r"\bcareer (?:support|services|coach\w*)\b",
+        r"\bjob (?:search|placement|assistance|support)\b",
+        r"\bresume (?:review|reviews|building)\b|\bmock interviews?\b|\breferrals?\b",
+    ),
     "weekly_hours": _compile(
         r"\bhours? (?:a|per|each|every) (?:week|day)\b",
         r"\b\d+ hours?\b",
@@ -732,6 +754,61 @@ def curiosity_covered(topic: str, text: object) -> bool:
     """The advisor's text already answered curiosity ``topic``, so the learner need not ask."""
     lowered = fold(text).lower()
     return any(pattern.search(lowered) for pattern in _CURIOSITY_COVERED.get(topic, ()))
+
+
+# How the learner's own question names a curiosity topic (L1), on top of the words that answer it:
+# "could I pay in monthly instalments?", "What would the weekly time commitment look like?".
+_CURIOSITY_ASKED = {
+    "format": _compile(r"\blive\b", r"\brecord(?:ed|ings?)\b", r"\bself[- ]paced\b"),
+    "build": _compile(r"\bbuild\b", r"\bprojects?\b", r"\bwork on\b", r"\bportfolio\b"),
+    "payment": _compile(
+        r"\bpay (?:in|over|monthly|it (?:in|over|monthly))\b",
+        r"\bpayment (?:plans?|options?)\b",
+        r"\bspread (?:it|the cost|the payments?)\b",
+    ),
+    "mentor_time": _compile(
+        r"\bone[- ]on[- ]one\b", r"\bdoubts?\b", r"\bask (?:someone|a person)\b"
+    ),
+    "weekly_hours": _compile(
+        r"\b(?:weekly|time) commitment\b",
+        r"\bhow (?:much time|many hours)\b(?![^?]{0,40}\bmentor)",
+    ),
+    "class_size": _compile(
+        r"\bhow (?:many|big)\b[^?]{0,30}\b(?:people|students|learners|batch|cohort|class)\b",
+        r"\b(?:batch|cohort|class) size\b",
+    ),
+    "prerequisites": _compile(
+        r"\b(?:need|have) to know\b",
+        r"\bbefore (?:i|you|we) (?:start|begin|join)\b",
+        r"\bbeginners?\b",
+        r"\b(?:enough|right) background\b",
+    ),
+    "job_search": _compile(
+        r"\bjob (?:search|hunt|hunting)\b",
+        r"\bfind(?:ing)? (?:a )?(?:job|role)\b",
+        r"\bland(?:ing)? (?:a )?(?:job|role)\b",
+        r"\bcareer (?:help|support|services)\b",
+        r"\bplacements?\b",
+    ),
+}
+
+
+def curiosity_asked_in(text: object) -> frozenset[str]:
+    """The curiosity topics a question of the LEARNER's ``text`` asks about (L1).
+
+    Only question-like sentences count: "I like that it's live" asks nothing.  A topic is used up
+    once she asked it, whether the engine handed it over or she asked on her own.
+    """
+    found: set[str] = set()
+    for sentence in split_sentences(text):
+        if not is_question_like(sentence):
+            continue
+        lowered = fold(sentence).lower()
+        for topic, _label in CURIOSITY_TOPICS:
+            patterns = (*_CURIOSITY_COVERED.get(topic, ()), *_CURIOSITY_ASKED.get(topic, ()))
+            if any(pattern.search(lowered) for pattern in patterns):
+                found.add(topic)
+    return frozenset(found)
 
 
 # R1-Q iteration 2.  What the advisor has answered and the learner must not ask again (the live
@@ -767,6 +844,25 @@ F4_PUSH_CALL_SUFFIX = (
     "; you are happy for them to join a call once you have talked, and you never say that they "
     "dislike calls or would not take part"
 )
+# L7 (mock call aa166f09: "my partner" at 69 and 71, then the owed F4 push at 82 said it again as
+# news).  When the learner already said she would talk to her decision maker, the push refers back
+# to it in a few words; its markers (the decision maker and a talk verb) are unchanged.
+F4_PUSH_SAID_SUFFIX = (
+    "; you already said earlier that you would talk to your {decision_maker}, so refer back to "
+    'it in a few words (for example "like I said") instead of saying it as news'
+)
+F4_PUSH_SAID_VARIANTS = (
+    "Like I said, I'd need to talk it over with my {decision_maker} first.",
+    "As I mentioned, I'd want to talk to my {decision_maker} before anything moves.",
+)
+
+
+def f4_push_said(decision_maker: str) -> tuple[str, tuple[str, ...]]:
+    """The F4 push brief suffix and variants when the decision maker was already named (L7)."""
+    return (
+        _fill(F4_PUSH_SAID_SUFFIX, decision_maker),
+        tuple(_fill(text, decision_maker) for text in F4_PUSH_SAID_VARIANTS),
+    )
 
 
 def topics_in(text: object) -> frozenset[str]:
@@ -1196,6 +1292,24 @@ class OwedMoveScheduler:
         """
         counter = self._states[F1_COUNTER]
         return None if counter.delivered_turn is None else counter.delivered_turn + 1
+
+    def graded_moves_owed(self, r_sec: float) -> bool:
+        """True while a required move of a graded family (F1-F4) is still to come.
+
+        A required move that is not delivered is owed until its deadline plus
+        ``SLIP_LIMIT_SEC`` (after that the API fidelity gate counts it missing
+        whatever happens).  M2 review fix: the interviewer's "going nowhere" offer to
+        wrap up waits for this, so an accepted offer cannot end the role-play before
+        F4-PRIMARY and F4-PUSH were said (``family_missing:f4`` / ``push_missing:f4``).
+        """
+        for spec in PLAN:
+            if spec.family not in FAMILIES or not spec.required:
+                continue
+            if self._delivered(spec.id):
+                continue
+            if spec.deadline_sec is None or r_sec <= spec.deadline_sec + SLIP_LIMIT_SEC:
+                return True
+        return False
 
     def commit_permitted(self, r_sec: float) -> bool:
         """The close window: all four families done and R >= 13:00."""

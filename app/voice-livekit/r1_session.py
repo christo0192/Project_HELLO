@@ -154,6 +154,29 @@ Owner decisions of 2026-10-30 (owner test 1eb18cd4) add four things:
   a turn spoken over the uninterruptible line, and ``_run_transition`` replays L-TRANSITION word
   for word, once per session; after the pickup the tracker's coach patterns answer it with the
   existing L-ASIDE-COACH.
+
+Owner and manager decisions of 2026-11-03 (mock call aa166f09) change the way into the role-play:
+
+* No auto-start (M1).  L-TRANSITION ends with "Shall we start the role-play now, or do you have any
+  questions first?"; Christy answers up to three questions from the role facts (each answer ends
+  with L-TRANSITION-ASK), re-asks on silence, and the learner picks up only on the candidate's
+  consent or the "I'm ready" button (``_run_transition``).  The role-play's S cap is counted from
+  the pickup (``r1_phases.roleplay_cap_sec``), so question time never shortens the role-play.  The
+  transition keeps the session's own endpointing: a question split at a short pause was answered
+  in halves.
+* The icebreaker's last answer (A1).  Once the soft exit is due, a turn that cut Christy's reply off
+  is answered (it is the candidate's own point going on) and a turn that stops mid-thought waits for
+  the rest of it, briefly (``_icebreaker_deferral``); the hard S=4:30 cap is unchanged.
+* Leaving the role-play is consensual (M2).  A resolved commitment from R = 14:00 no longer ends it
+  at the next candidate turn: Christy OFFERS to wrap up (L-ASIDE-WRAP, R paused) at a natural pause,
+  a candidate turn that asks, digs and pitches nothing (the engine decides) or a quiet of
+  ``WRAP_OFFER_PAUSE_SEC`` after the learner's line (``_roleplay_turn``), when the commitment is
+  resolved or the call is going nowhere, at most twice and not again for three minutes after a no.
+  A yes (a short one settles first, as a bare yes to L-ASIDE-END does) is the role-play exit; a no
+  gets L-ASIDE-WRAP-RESUME.  When the time runs out the closing is gentle as well
+  (``_close_roleplay_on_time``): the candidate's turn in flight is waited for, then the learner's
+  L-TIME-UP, then L-EXIT.  L-ASIDE-END, the bare yes, the end-intent model and the 10:00 scoring
+  gate are unchanged; an end request from 14:00 is still a farewell on the close ladder.
 """
 from __future__ import annotations
 
@@ -188,7 +211,6 @@ from r1_latency import (
     count_words,
     endpoint_max_delay_sec,
     interrupt_min_words,
-    r1_transition_endpointing,
     r1_turn_handling,
 )
 from r1_linecache import (
@@ -200,7 +222,7 @@ from r1_linecache import (
     build_line_cache,
 )
 from r1_persistence import R1TurnWriter
-from r1_phases import R1Phase, R1PhaseMachine
+from r1_phases import ICEBREAKER_HARD_SEC, R1Phase, R1PhaseMachine
 from r1_replies import (
     PersonaChoice,
     Reply,
@@ -212,11 +234,11 @@ from r1_replies import (
     session_facts_event,
 )
 from r1_prompts import ROLEPLAY_PHASE
-from r1_roleplay import RolePlayEngine, TurnMode, TurnPlan
+from r1_roleplay import WRAP_OFFER_PAUSE_SEC, RolePlayEngine, TurnMode, TurnPlan
 from r1_script import INTERVIEWER_NAME, is_candidate_free, known_first_name, line, spoken_first_name
 from r1_sarvam import current_speech_id
 from r1_text import normalize
-from r1_tracker import explicit_end_request, is_bare_yes
+from r1_tracker import explicit_end_request
 from r1_tts import (
     INTERVIEWER,
     LEARNER,
@@ -241,15 +263,18 @@ FILLER_AFTER_SECONDS = 4.0
 FILLER_RESTART_MIN_SECONDS = 0.5
 # An unvoiced wait older than this is not the candidate's current wait any more.
 FILLER_ANCHOR_MAX_SECONDS = 20.0
-TRANSITION_DEADLINE_SECONDS = 20.0
-# The brief on request (reviewed fix, 2026-10-30): the wait after the replay is what is left of the
-# plan's 1:30 transition budget (r1_phases: 4:30 icebreaker + 1:30 transition + 20:00 role-play =
-# S 26:00), counted from the first L-TRANSITION, never more than the usual 20 s and never less than
-# this floor.  The replay itself (about 36-45 s, uninterruptible) can still take the transition past
-# 1:30: after a full 4:30 icebreaker the S 26:00 cap then trims up to about 25 s off the role-play's
-# last minute (never the 10:00 or 14:00 gates).
-TRANSITION_BUDGET_SECONDS = 90.0
-TRANSITION_REPLAY_WAIT_FLOOR_SECONDS = 8.0
+# Owner decision 2026-11-03 (M1, mock call aa166f09): the role-play never starts on a timer.  After
+# the brief Christy asks whether to start or take questions first; she answers up to
+# ``TRANSITION_QUESTION_LIMIT`` of them, and the learner picks up only on the candidate's consent
+# ("ready", "yes, let's start") or the "I'm ready" button.  Candidate silence gets the two re-asks
+# of ``TRANSITION_SILENCE_LADDER`` and then, after ``TRANSITION_SILENCE_END_SECONDS`` more, the lost
+# connection close (L-SIL-END), as in the other phases.  ``TRANSITION_MAX_SECONDS`` after the brief
+# began (a muted microphone, a candidate who never agrees) the interview ends the same way; the
+# role-play's own S cap is counted from the pickup (``r1_phases.roleplay_cap_sec``).
+TRANSITION_QUESTION_LIMIT = 3
+TRANSITION_SILENCE_LADDER = ((20.0, "L-TRANSITION-REASK"), (30.0, "L-TRANSITION-REASK-2"))
+TRANSITION_SILENCE_END_SECONDS = 30.0
+TRANSITION_MAX_SECONDS = 360.0
 SAY_PLAYOUT_SECONDS = 90.0
 # Teardown budget (plan section 7.4). livekit-agents 1.6.4 cancels a still-running
 # entrypoint 15 s after a shutdown request and the parent kills the process once
@@ -351,6 +376,11 @@ ICEBREAKER_ANSWER_MIN_WORDS = 3
 # this margin after the last sign of speech, and never longer than the ceiling.
 ICEBREAKER_HOLD_MARGIN_SECONDS = 1.0
 ICEBREAKER_HOLD_CEILING_SECONDS = 30.0
+# A1 (mock call aa166f09): once the soft exit is due, a committed turn that sounds unfinished
+# ("one more thing to be added is. I.") is not the icebreaker's last answer.  Its reply is held
+# back and the next committed turn is the boundary, or, when the candidate says nothing more, this
+# much quiet after their last sign of speech; the hard S=4:30 cap still bounds the whole wait.
+ICEBREAKER_CONTINUATION_WAIT_SECONDS = 5.0
 ROLEPLAY_PROMPT_SECONDS = 20.0
 ROLEPLAY_FIRST_STEP_SECONDS = 20.0
 ROLEPLAY_ASIDE_STEP_SECONDS = 15.0
@@ -367,9 +397,16 @@ WRAPUP_SETTLE_SECONDS = 1.5
 WRAPUP_SETTLE_ACK_FACTOR = 2.0
 WRAPUP_SETTLE_LEAD_IN_FACTOR = 2.5
 WRAPUP_QUESTION_LIMIT = 2
-# Plan 5.1: role-play may end early once R >= 14:00 and the commitment is resolved.  The
-# phase machine only knows the hard caps, so the session applies the early rule itself.
-EARLY_EXIT_R_SEC = 840.0
+# M2 (owner and manager decisions of 2026-11-03): the role-play never ends by itself before its
+# time.  The early exit of plan 5.1 (commitment resolved and R >= 14:00) is the interviewer's offer
+# to wrap up (``r1_roleplay``: L-ASIDE-WRAP), at a candidate turn that leaves a natural pause or
+# after this much quiet following the learner's line.  When the time does run out (R = 20:00, or the
+# S cap) the closing is never abrupt either: a candidate who is mid-turn is waited for (an
+# endpointing maximum plus the margin after their last sign of speech, at most the ceiling), then
+# the learner closes in role (L-TIME-UP) and L-EXIT follows.  The hold and L-TIME-UP fit in
+# ``r1_phases.ROLEPLAY_CLOSE_ALLOWANCE_SEC``.
+ROLEPLAY_END_HOLD_MARGIN_SECONDS = 1.0
+ROLEPLAY_END_HOLD_CEILING_SECONDS = 8.0
 # The learner's one-line acknowledgement (plan 5.6 escalation step 1) is optional, the owed
 # line after it is not: an acknowledgement that is not done in time is dropped.  Missing this
 # cutoff is slowness the plan tolerates (5.11 fails a turn at its 12 s deadline or on a provider
@@ -397,7 +434,9 @@ BARE_YES_FINAL_MARGIN_SECONDS = 1.0
 _HELD_STT_EVENTS = frozenset({"final_transcript", "interim_transcript", "preflight_transcript"})
 # Scripted lines the LEARNER speaks; every other line is the interviewer's.  The voice decides
 # which model call may later see the line (``r1_prompts.select_context``).
-_LEARNER_LINES = frozenset({"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE"})
+_LEARNER_LINES = frozenset(
+    {"L-PICKUP", "L-SIL-RP1", "L-FILLER-LEARNER", "L-TIME-CUE", "L-TIME-UP"}
+)
 _REPLIES_KEPT = 8
 _SESSION_ID_FROM_ROOM = re.compile(
     r"^screening-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
@@ -504,7 +543,14 @@ _EDGE_APOSTROPHES = re.compile(r"(?<!\w)'+|'+(?!\w)")
 # The phases in which a candidate turn can be answered by the model; every other phase is
 # driver-owned (its lines are scripted), so a model failure never matters there.
 _REPLY_PHASES = frozenset(
-    {R1Phase.OPENING, R1Phase.ICEBREAKER, R1Phase.ROLEPLAY, R1Phase.ASIDE, R1Phase.WRAPUP}
+    {
+        R1Phase.OPENING,
+        R1Phase.ICEBREAKER,
+        R1Phase.TRANSITION,
+        R1Phase.ROLEPLAY,
+        R1Phase.ASIDE,
+        R1Phase.WRAPUP,
+    }
 )
 # The agent is "quiet" in these states; thinking and speaking are agent activity.
 _QUIET_AGENT_STATES = frozenset({"listening", "idle"})
@@ -523,18 +569,25 @@ _LIVE_PHASES = frozenset(
 # The scripted lines worth warming, in the order an interview first needs them.  Only a line that
 # reaches ``session.say`` can play cached audio, so three kinds are absent on purpose: L-OPEN
 # (spoken at once, before anything could be warm), the lines that travel inside a reply stream
-# (L-FILLER*, L-TIME-CUE, the guard's L-NO-FEEDBACK swap) and L-FAQ-DEFER (no runtime caller).
+# (L-FILLER*, L-TIME-CUE, the guard's L-NO-FEEDBACK swap, L-TRANSITION-ASK after Christy's answers
+# before the role-play) and L-FAQ-DEFER (no runtime caller).
 # Warming them would spend Sarvam requests, a budget shared with the phone lane, on audio nothing
 # can play (pr4c-rebase.md 4.1).
 _WARM_ORDER = (
     "L-TRANSITION",
     "L-TRANSITION-NUDGE",
+    "L-TRANSITION-REASK",
+    "L-TRANSITION-STEER",
+    "L-TRANSITION-REASK-2",
     "L-PICKUP",
     "L-EXIT",
     "L-WRAP",
     "L-CLOSE",
     "L-ASIDE-COACH",
     "L-ASIDE-END",
+    "L-ASIDE-WRAP",
+    "L-ASIDE-WRAP-RESUME",
+    "L-TIME-UP",
     "L-MUTE",
     "L-SIL-IB",
     "L-SIL-RP1",
@@ -567,6 +620,37 @@ _SDK_METRICS = (
     ("playback_latency", "sdk_playback"),
     ("e2e_latency", "sdk_e2e"),
 )
+
+# Why a committed icebreaker turn is not the boundary (``R1Interview._icebreaker_deferral``, A1).
+_DEFER_BARGE_IN = "barge_in"
+_DEFER_UNFINISHED = "unfinished"
+# What a committed transition turn gets (``R1Interview._transition_action``, M1).
+_TRANSITION_READY = "ready"
+_TRANSITION_BRIEF = "brief"
+_TRANSITION_QUIET = "quiet"
+_TRANSITION_NUDGE = "nudge"
+_TRANSITION_STEER = "steer"
+_TRANSITION_INVITE = "invite"
+_TRANSITION_ANSWER = "answer"
+# What Christy's last start question asked (``R1Interview._start_question``, M1 review fix): a
+# short yes ("Yes.", "Okay.") agrees to start only after a yes/no question that finished playing
+# (L-TRANSITION-REASK, L-TRANSITION-STEER).  After an either/or one ("Shall we start now, or do
+# you have any questions first?": L-TRANSITION, L-TRANSITION-ASK) it could mean either, so it
+# gets the nudge to say ready.
+_YES_NO = "yes_no"
+_EITHER_OR = "either_or"
+# Repair (round 2): "Just say 'ready'" (L-TRANSITION-REASK-2, L-TRANSITION-NUDGE) asks no yes/no
+# question, so a short yes still answers nothing; a hand-back ("Okay, go ahead.") agrees to start.
+_SAY_READY = "say_ready"
+# Repair (round 2): the words that make a no-questions turn a refusal, not a thank-you.
+_BARE_NO_WORDS = frozenset({"no", "nope", "nah", "none", "nothing"})
+_START_QUESTION_OF_LINE = {
+    "L-TRANSITION": _EITHER_OR,
+    "L-TRANSITION-REASK": _YES_NO,
+    "L-TRANSITION-STEER": _YES_NO,
+    "L-TRANSITION-REASK-2": _SAY_READY,
+    "L-TRANSITION-NUDGE": _SAY_READY,
+}
 
 # Results of ``R1Interview._await_turn``.
 TURN = "turn"
@@ -1036,14 +1120,186 @@ def is_brief_request(text: str) -> bool:
     """True for a request to hear the role-play brief again ("Can you repeat that?", "Could you
     please explain me again ...", "I wanted to understand this round, the role play brief").
 
-    A ready answer wins first (``R1Interview.is_ready``): "Okay, ready, what do I say?" picks up.
+    A consent wins first (``is_transition_consent``): "Okay, ready, let's go." picks up.  A turn
+    that asks something is no consent, so "Okay, ready, what do I say?" is a brief request.
     """
     folded = fold_speech(text)
-    if not folded or R1Interview.is_ready(text):
+    if not folded or is_transition_consent(text):
         return False
     if _BRIEF_REQUEST_RE.search(folded) is not None or _BRIEF_SHORT_RE.match(folded):
         return True
     return _has_question_mark(text) and _BRIEF_ROLE_CHECK_RE.search(folded) is not None
+
+
+# A1: the last word of a turn that stops in the middle of a sentence ("... to be added is. I.",
+# "and the reason was"), after ``fold_speech``.  A false positive costs only the short continuation
+# wait, so the set is generous, but it leaves out words that end real answers ("so", "that", "on",
+# and the "are" of "what the timings are").
+_DANGLING_WORDS = frozenset(
+    {
+        "and", "but", "or", "because", "cause", "the", "a", "an", "to", "of", "is", "was",
+        "with", "for", "my", "our", "your", "their", "i", "we", "if", "than", "as", "plus",
+    }
+)
+# A1: a lead-in to a further point, unfinished when few words follow it ("one more thing").
+_CONTINUATION_RE = re.compile(
+    r"\b(?:one more (?:thing|point)|one last (?:thing|point)|another (?:thing|point)|"
+    r"(?:to|let me|i want to|i'd like to|i would like to|just to) add|be added|and also)\b"
+)
+_CONTINUATION_TAIL_WORDS = 6
+
+
+def is_unfinished_turn(text: str) -> bool:
+    """True when a committed turn stops mid-thought: a dangling last word, or a bare lead-in.
+
+    "But one more thing, one more thing to be added is. I." (aa166f09 turn 15) is both.  The
+    speech-to-text punctuates such a turn as finished, so the folded words decide.
+    """
+    words = fold_speech(text).split()
+    if not words:
+        return False
+    if words[-1] in _DANGLING_WORDS:
+        return True
+    folded = " ".join(words)
+    last = None
+    for last in _CONTINUATION_RE.finditer(folded):
+        pass
+    return last is not None and len(folded[last.end():].split()) < _CONTINUATION_TAIL_WORDS
+
+
+# M1: "Can I ask a couple of questions before we start?" asks for permission and asks nothing: it
+# gets "of course" from Christy without using one of the three answers or the start question.
+_PERMISSION_RE = re.compile(
+    r"\b(?:(?:can|could|may) i (?:\w+ ){0,2}?ask|i have (?:a |some |a few |few |a couple of |"
+    r"couple of |two |three )?(?:\w+ )?questions?|(?:can|could|may) i have (?:a |some )?(?:\w+ )?"
+    r"questions?)\b"
+)
+# Repair (round 2): the only words a permission-only turn may carry besides ``_PERMISSION_RE``'s
+# phrase.  An allowlist, as for a consent: "Can I ask a couple of questions, like the salary and
+# the targets?" or "Can I ask a question? I want to understand about the role." asks the question
+# as well, so it is Christy's to answer (counted, with L-TRANSITION-ASK after it), not an invite.
+_PERMISSION_FILLER = frozenset(
+    {
+        "so", "um", "uh", "well", "okay", "ok", "alright", "yes", "yeah", "sure", "actually",
+        "just", "also", "please", "sorry", "christy", "christie", "ma'am", "madam", "sir",
+        "a", "an", "one", "two", "three", "few", "couple", "of", "some", "any", "more", "other",
+        "another", "quick", "small", "little", "question", "questions", "first", "before", "we",
+        "start", "begin", "get", "started", "the", "this", "that", "it", "role", "play",
+        "roleplay", "if", "you", "don't", "dont", "mind", "here", "now", "then", "can", "could",
+        "may", "i", "ask", "have", "go", "on", "with",
+    }
+)
+
+
+def is_permission_to_ask(text: str) -> bool:
+    """True for a turn that only asks whether the candidate may ask something.
+
+    The permission phrase (``_PERMISSION_RE``) with nothing but ``_PERMISSION_FILLER`` around it:
+    "Can I ask a couple of questions before we start?", "I have a few questions.".  A turn that
+    goes on to the question itself ("I have a question, tell me about the shift timings.") is a
+    question: it is answered, counted, and followed by the start question.
+    """
+    folded = fold_speech(text)
+    if _PERMISSION_RE.search(folded) is None:
+        return False
+    rest = _PERMISSION_RE.sub(" ", folded, count=1)
+    return all(word in _PERMISSION_FILLER for word in rest.split())
+
+
+# M1: "No questions, let's start." and "No, I'm good, let's go." agree to start as plainly as "Yes,
+# let's start."; the start phrase must still be there ("No questions." alone gets the nudge).
+_NO_QUESTIONS_FIRST_RE = re.compile(
+    r"\b(?:(?:i )?(?:do not|don't|dont) have (?:any )?(?:more |other |further )?questions?|"
+    r"(?:i )?have no(?: more| other| further)? questions?|no(?: more| other| further)? questions?|"
+    # "I'm good to go." is a start phrase (``_START_RE``), not "I'm good" + "to go".
+    r"nothing(?: else| more)?|none|i'?m good(?! to go)|i am good(?! to go)|all good|nope|nah|"
+    r"no)\b"
+)
+# M1 review fix: the start phrases of a consent, on folded text.  Wider than ``_READY_ALLOWLIST``
+# ("Yeah, let's start the role play.", "Yes, we can start.", "Let's get started.", "Go for it."),
+# and without its bare acknowledgements: "Okay.", "Yes." or "Sure." is a short yes
+# (``is_short_yes``), never a consent by itself (``R1Interview._transition_consent``).
+_START_RE = re.compile(
+    r"\b(?:get(?:ting)? (?:started|going)|kick (?:it )?off|go for it|go ahead|let's go|lets go|"
+    r"let us go|(?:let's|lets|let us|we can|we could|i can|shall we|can we) do (?:it|this|that)|"
+    # Repair (round 2): "Let's do the role play.", "Let's move to the role play.", "Let's move
+    # on.", "I'm good to go.", "Okay, I'm all set.", "Let's continue."
+    r"do (?:the )?role ?play|do (?:the )?roleplay|move (?:on|ahead|forward)|"
+    r"move (?:on )?to (?:the )?role ?play|move (?:on )?to (?:the )?roleplay|good to go|all set|"
+    r"(?:let's|lets|let us|we can|shall we) continue|"
+    r"start(?:ing)?|begin(?:ning)?|proceed|ready)\b"
+)
+# "Ready when you are." is no question: its "when" is cut out before the question test.
+_WHEN_YOU_ARE_RE = re.compile(r"\b(?:when|whenever) (?:you are|you're|youre)\b")
+# A turn that asks something is never a consent, even with "ready" or "start" in it ("What do I
+# need to have ready?", "Am I ready to talk about the price?"), however it was punctuated.
+_CONSENT_QUESTION_RE = re.compile(
+    r"\b(?:what|what's|whats|how|how's|when|where|why|who|whom|whose|which|whether)\b|"
+    r"^(?:(?:so|and|but|okay|ok|um|uh|well|sorry|yes|yeah) )*"
+    r"(?:am|is|are|do|does|did|will|would|have|has|was|were) (?:i|we|you|she|he|it|there|they)\b"
+)
+# Words a consent may carry besides its start phrase: filler, courtesy, "the role play".
+# Anything else ("but", "question", "ask", "wait", "second", "after") leaves the turn to
+# Christy or the nudge.
+_CONSENT_FILLER = frozenset(
+    {
+        "please", "so", "um", "uh", "well", "then", "now", "right", "thanks", "thank", "you",
+        "yes", "yeah", "yep", "yup", "sure", "okay", "ok", "alright", "all", "of", "course",
+        "i", "i'm", "im", "am", "i'll", "ill", "be", "think", "guess", "we", "we're", "are",
+        "can", "could", "shall", "should", "may", "would", "like", "love", "happy", "to", "let's",
+        "lets", "let", "us", "the", "this", "that", "it", "role", "play", "roleplay", "with",
+        "from", "my", "side", "for", "fine", "good", "great", "perfect", "cool", "absolutely",
+        "definitely", "really", "fully", "totally", "quite", "pretty", "set", "and", "just",
+        "go", "ahead", "christy", "ma'am", "madam", "sir", "oh", "ah", "hmm", "is",
+        # Repair (round 2): a Hindi-English yes ("Haan, let's start.", "Ji, ready.").
+        "haan", "han", "haa", "haanji", "ji", "achha", "acha", "accha",
+    }
+)
+# M1 review fix: a short yes ("Yes.", "Okay.", "Sure.", "Yeah, okay.", "Okay, thank you.") answers
+# a yes/no start question, or only acknowledges what Christy is saying.  Never a question.
+_SHORT_YES_RE = re.compile(
+    r"\b(?:yes|yeah|yep|yup|ya|sure|okay|ok|alright|all right|fine|of course|absolutely|"
+    r"definitely)\b"
+)
+_SHORT_YES_FILLER = frozenset(
+    {"please", "so", "um", "uh", "well", "then", "thanks", "thank", "you", "oh", "ah", "hmm",
+     "sounds", "good", "great", "cool", "perfect", "right", "christy", "ma'am", "madam", "sir"}
+)
+
+
+def is_short_yes(text: str) -> bool:
+    """True for a bare acknowledgement or yes ("Okay.", "Yes.", "Sure, thank you."), on folded
+    text: it says "yes" to a yes/no question and nothing more; with a question mark it asks."""
+    if _has_question_mark(text):
+        return False
+    folded = fold_speech(text)
+    if _SHORT_YES_RE.search(folded) is None:
+        return False
+    rest = _SHORT_YES_RE.sub(" ", folded)
+    return all(word in _SHORT_YES_FILLER for word in rest.split())
+
+
+def is_transition_consent(text: str) -> bool:
+    """The candidate says plainly to start the role-play (folded text, as everywhere).
+
+    A start phrase (``_START_RE``: "ready", "let's start", "we can begin", "let's get started",
+    "go for it") with nothing but filler, courtesy, "the role play" and "no questions" around it.
+    Never a turn that asks something (``_CONSENT_QUESTION_RE``: "What do I need to have ready?"),
+    a negated one ("Not ready yet."), or a short yes alone (``is_short_yes``): that one is
+    ``R1Interview._transition_consent``'s, which knows what Christy asked last.
+    """
+    folded = fold_speech(text)
+    if not folded or is_short_yes(text) or is_acknowledgement_turn(text):
+        return False
+    rest = _NO_QUESTIONS_FIRST_RE.sub(" ", folded)
+    if _READY_NEGATION_RE.search(rest) is not None:
+        return False
+    if _CONSENT_QUESTION_RE.search(_WHEN_YOU_ARE_RE.sub(" ", rest).strip()) is not None:
+        return False
+    if _START_RE.search(rest) is None:
+        return False
+    rest = _WHEN_YOU_ARE_RE.sub(" ", _START_RE.sub(" ", rest))
+    return all(word in _CONSENT_FILLER for word in rest.split())
 
 
 def lead_display_name(value: object) -> str:
@@ -1445,14 +1701,28 @@ class R1Interview:
         self._mute_resume_phase: R1Phase | None = None
         self._mute_announced = False
         self._pickup_spoken = False
-        self._transition_nudged = False
+        # M1 (owner decision 2026-11-03): how many of the candidate's questions Christy answered
+        # before the role-play, whether L-TRANSITION-STEER was said, and the scripted lines the
+        # turn hook decided on for the driver to speak (the nudge, the steer), oldest first.
+        self._transition_answers = 0
+        self._transition_steered = False
+        self._transition_lines: deque[str] = deque()
+        # M1 review fix: the kind of start question Christy asked last (``_START_QUESTION_OF_LINE``;
+        # her answers end with the either/or L-TRANSITION-ASK), and whether the driver took a
+        # spoken consent (so the turn hook agrees with it when that turn commits).
+        self._start_question: str | None = None
+        self._transition_consented = False
         # True once a candidate turn was answered by the icebreaker's end (``prepare_turn``
         # suppressed its reply because the soft exit was due): the boundary line answers it.
         self._icebreaker_boundary_turn = False
+        # A1: an icebreaker reply of Christy's that the candidate cut off while speaking (their
+        # turn goes on with their own point), and when an unfinished turn was held back once the
+        # soft exit was due (``_icebreaker_deferral``; clock seconds, None when none is).
+        self._icebreaker_reply_cut = False
+        self._icebreaker_continuation_at: float | None = None
         # The candidate's open transcript row (``_CandidateRow``), the last sign of candidate
         # activity (clock seconds), when the hard icebreaker cap began to wait for a turn in
-        # flight, how many replies the SDK cancelled before any audio, and whether the session
-        # runs the transition's quicker endpointing right now.
+        # flight, and how many replies the SDK cancelled before any audio.
         self._open_row: _CandidateRow | None = None
         # The phase the row of the turn ``prepare_turn`` is deciding is written in, when it is not
         # the phase it was spoken in (an out-of-role stop: ``aside``); None otherwise.
@@ -1470,6 +1740,7 @@ class R1Interview:
         self._commit_floor: float = 0.0
         self._candidate_activity_at: float | None = None
         self._icebreaker_hold_since: float | None = None
+        self._roleplay_end_hold_since: float | None = None  # M2: the closing's hold
         self._replies_cancelled_before_audio = 0
         # When (``_clock``) the candidate began waiting for a reply nobody has heard yet: set when
         # a generation starts, cleared when any speech begins, when the candidate says something
@@ -1485,7 +1756,6 @@ class R1Interview:
         self._wrapup_answer_owed: Reply | None = None
         self._wrapup_answer_cut: Reply | None = None
         self._wrapup_retried = False
-        self._quick_endpointing = False
         # R1-Q live-UI signals (``LEADNAME_ATTRIBUTE``): the worker is in the transition and has
         # not had the "I'm ready" press yet (``_awaiting_ready``: what the data handler checks),
         # the page was told ``awaiting=ready`` and not yet that it is over, the press itself
@@ -1581,6 +1851,9 @@ class R1Interview:
         self._brief_requested = False
         self._brief_repeated = False
         self._transition_started_at: float | None = None
+        # Repair (round 2): seconds the transition spent in PAUSED_DISCONNECTED.  The 6:00 ceiling
+        # is moved by them, so a candidate who rejoins in time is never closed for being away.
+        self._transition_paused_seconds = 0.0
         # Latency (PR-4c): the stage stamps of the open turn, reported as ``r1_latency`` lines.
         self._latency = LatencyTracker(clock, self._emit_latency)
         # The audio of scripted lines (None: every line is spoken live) and the 429 counter.
@@ -1721,10 +1994,10 @@ class R1Interview:
         self._cancel_end_intent_call()
         self.machine.transition(phase)
         if phase is R1Phase.TRANSITION:
-            # L-TRANSITION starts right after this: the clock of the transition budget.
+            # L-TRANSITION starts right after this: the clock of the transition's ceiling.
             with contextlib.suppress(RuntimeError):
                 self._transition_started_at = asyncio.get_running_loop().time()
-        self._apply_endpointing(phase)
+            self._transition_paused_seconds = 0.0
         self._track_signals(phase)
         if publish:
             self._publish_phase(phase.value)
@@ -1743,7 +2016,6 @@ class R1Interview:
         """Resume the interrupted phase and tell the page which one it is."""
         self._flush_candidate_row()
         resumed = self.machine.rejoin()
-        self._apply_endpointing(resumed)
         self._track_signals(resumed)
         self._publish_phase(resumed.value)
 
@@ -1925,34 +2197,6 @@ class R1Interview:
         self._awaiting_ready = False
         _log.info("unknown_event", error_type="r1_ready_button", phase="transition")
         self._wake()
-
-    def _apply_endpointing(self, phase: R1Phase) -> None:
-        """Run the transition's quicker endpointing in TRANSITION, the session's own elsewhere.
-
-        The candidate's only job in the transition is to say "ready", so a turn there should
-        commit quickly (``r1_transition_endpointing``, 0.4 / 1.2 s, capped at the session's own
-        numbers).  ``AgentSession.update_options`` takes effect on the running activity.  It is
-        called only when the setting changes, so a session that never reaches the transition
-        never calls it; a failure is logged by type and costs only the quicker window.
-        """
-        quick = phase is R1Phase.TRANSITION
-        if quick == self._quick_endpointing:
-            return
-        update = getattr(self.session, "update_options", None)
-        if not callable(update):
-            return
-        options = r1_transition_endpointing() if quick else r1_turn_handling()["endpointing"]
-        try:
-            update(endpointing_opts=dict(options))
-        except Exception as exc:  # noqa: BLE001 - a timing tweak must never stop an interview
-            _log.warn(
-                "unknown_event",
-                error_type="r1_endpointing_update_failed",
-                error_category=_error_type_of(exc),
-                phase=self.machine.transcript_phase(),
-            )
-            return
-        self._quick_endpointing = quick
 
     def _publish_phase(self, value: str) -> None:
         """Queue one phase value for the background writer; never blocks, never raises.
@@ -2503,6 +2747,9 @@ class R1Interview:
             timeout=timeout,
             voice=LEARNER if line_id in _LEARNER_LINES else INTERVIEWER,
         )
+        if line_id in _START_QUESTION_OF_LINE:
+            # Set once the line has played: a short yes said over it answers nothing yet.
+            self._start_question = _START_QUESTION_OF_LINE[line_id]
 
     # ------------------------------------------------------------ voices
 
@@ -2979,12 +3226,104 @@ class R1Interview:
             return True
         phase = self.machine.phase
         if phase is R1Phase.ICEBREAKER:
-            return self.machine.icebreaker_should_end()
+            if not self.machine.icebreaker_should_end():
+                return False
+            # A1: a turn that cut Christy's reply goes on with the candidate's own point, so she
+            # answers it and the icebreaker ends at the turn after it.
+            return self._icebreaker_deferral(text) != _DEFER_BARGE_IN
+        if phase is R1Phase.TRANSITION:
+            # M1: Christy answers the candidate's questions before the role-play; every other
+            # turn there is the driver's (a consent, the brief again, a nudge, the steer).
+            return self._transition_action(text) not in (_TRANSITION_ANSWER, _TRANSITION_INVITE)
         if phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
             return self._roleplay_over()
         if phase is R1Phase.WRAPUP:
             return is_no_questions(text) or self.machine.remaining_wrapup_seconds() <= 0
         return True
+
+    def _icebreaker_deferral(self, text: str) -> str | None:
+        """A1: why a committed turn, once the soft exit is due, is not the icebreaker's last answer.
+
+        ``_DEFER_BARGE_IN``: the turn cut off a reply of Christy's that the candidate was hearing,
+        so it carries on with their own point (aa166f09: "Got it - value first," was cut by "But
+        but but one more thing ...").  ``_DEFER_UNFINISHED``: the turn stops mid-thought
+        (``is_unfinished_turn``).  None: the turn may end the icebreaker.  Only the soft exit is
+        deferred, and only before a boundary turn is on record: once the hard S=4:30 cap is due
+        the bounded hold for a turn in flight (``_icebreaker_hold_left``) is the only wait.
+        """
+        if (
+            not text
+            or self._icebreaker_boundary_turn
+            or self.machine.session_clock >= ICEBREAKER_HARD_SEC
+        ):
+            return None
+        if is_unfinished_turn(text):
+            return _DEFER_UNFINISHED
+        if (
+            self._icebreaker_reply_cut
+            and content_word_count(text) >= ICEBREAKER_ANSWER_MIN_WORDS
+        ):
+            return _DEFER_BARGE_IN  # a lone "Yes." that cut her is no point of their own
+        return None
+
+    def _transition_action(self, text: str) -> str:
+        """M1: what a committed transition turn gets (no side effects; ``_decide_turn`` acts).
+
+        A consent (or the button) is the pickup's, a brief request the replay's, a backchannel or
+        a bare name nothing at all.  "No questions" alone gets the nudge to say ready.  Otherwise
+        Christy answers (``_TRANSITION_ANSWER``, with L-TRANSITION-ASK after it) or, for a turn that
+        only asks whether they may ask, invites the question; past ``TRANSITION_QUESTION_LIMIT``
+        answers the steer (once, then the nudge) takes the place of an answer.
+        """
+        if self._ready_latched or self._transition_consented or self._transition_consent(text):
+            return _TRANSITION_READY
+        if self._brief_due() or (not self._brief_repeated and is_brief_request(text)):
+            return _TRANSITION_BRIEF
+        if (
+            is_short_yes(text)
+            and self._start_question == _EITHER_OR
+            and self._agent_state in _QUIET_AGENT_STATES
+        ):
+            return _TRANSITION_NUDGE  # "Yes." to "now, or questions first?" says neither
+        if (
+            text
+            and self._agent_state in _QUIET_AGENT_STATES
+            and not is_short_yes(text)
+            and is_no_questions(text)
+            and _BARE_NO_WORDS.intersection(fold_speech(text).split())
+        ):
+            # Repair (round 2): "No.", "Nope.", "No, thank you." to "... or do you have any
+            # questions first?" are all backchannel words, and got nothing at all (20 s of dead
+            # air until L-TRANSITION-REASK).  They say "no questions": the nudge to say ready.
+            return _TRANSITION_NUDGE
+        if not text or is_backchannel_turn(text) or is_name_only(text):
+            return _TRANSITION_QUIET
+        if is_no_questions(text) or is_brief_request(text):
+            return _TRANSITION_NUDGE
+        if self._transition_answers >= TRANSITION_QUESTION_LIMIT:
+            return _TRANSITION_NUDGE if self._transition_steered else _TRANSITION_STEER
+        if is_permission_to_ask(text):
+            return _TRANSITION_INVITE
+        return _TRANSITION_ANSWER
+
+    def _transition_consent(self, text: str) -> bool:
+        """M1: does this transition turn agree to start the role-play?
+
+        A plain consent always does (``is_transition_consent``).  A short yes (``is_short_yes``)
+        does only as the answer to a yes/no start question that finished playing, with Christy
+        quiet now: said over her answer or the brief it only acknowledges, and after the
+        either/or question it could mean "yes, a question" (review of aa166f09's fix).
+        """
+        if is_transition_consent(text):
+            return True
+        if self._start_question is None or self._agent_state not in _QUIET_AGENT_STATES:
+            return False
+        if self._start_question == _YES_NO and is_short_yes(text):
+            return True
+        # "Go ahead.", "Sure, go ahead." hand the floor to the learner after either start question
+        # (repair, round 2: main picked them up at once; after L-TRANSITION's either/or question
+        # they were answered as questions, used up the three answers and got the steer).
+        return is_acknowledgement_turn(text) and _YIELD_RE.search(fold_speech(text)) is not None
 
     def _count_icebreaker_answer(self, text: str) -> None:
         """Count one COMMITTED candidate turn toward the icebreaker's soft exit, if it is an answer.
@@ -3021,25 +3360,16 @@ class R1Interview:
         engine = self._engine
         return engine is not None and engine.exit_requested
 
-    def _early_exit_due(self) -> bool:
-        """Plan 5.1's early exit: the commitment is resolved and R >= 14:00.
-
-        Evaluated at a candidate-turn boundary only (never when the learner finishes its own
-        line), so the advisor's answer to the commitment is the turn L-EXIT then answers.
-        """
-        engine = self._engine
-        return (
-            engine is not None
-            and engine.commitment_resolved
-            and self.machine.roleplay_elapsed >= EARLY_EXIT_R_SEC
-        )
-
     def _roleplay_over(self) -> bool:
-        return (
-            self.machine.roleplay_should_end()
-            or self._roleplay_exit_requested()
-            or self._early_exit_due()
-        )
+        """True once the role-play's time is up or the candidate ended it.
+
+        M2 (owner and manager decisions of 2026-11-03): nothing else ends it.  A resolved
+        commitment from R = 14:00 no longer exits at the next candidate turn (mock call aa166f09:
+        L-EXIT cut off "what is your challenge currently?" at 15:42); the interviewer offers to
+        wrap up instead (``r1_roleplay``: L-ASIDE-WRAP), and only a yes to it, a confirmed stop or
+        the close ladder's exit (``_roleplay_exit_requested``) ends the role-play before its time.
+        """
+        return self.machine.roleplay_should_end() or self._roleplay_exit_requested()
 
     def _roleplay_budget_left(self) -> float:
         """Seconds of role-play left; zero once the candidate ended it, so every wait ends."""
@@ -3214,26 +3544,41 @@ class R1Interview:
                 # The candidate said something: their wait starts again from here.  A backchannel
                 # ("Sorry", "Thank you.") leaves the wait for the reply it cancelled running.
                 self._unvoiced_since = None
+        phase = self.machine.phase
+        deferral = self._icebreaker_deferral(text) if phase is R1Phase.ICEBREAKER else None
+        action = self._transition_action(text) if phase is R1Phase.TRANSITION else None
         suppressed = self.reply_suppressed(text)
+        if phase in (R1Phase.OPENING, R1Phase.ICEBREAKER) and text:
+            self._icebreaker_reply_cut = False  # this turn is the one that cut it, if any
         if suppressed or not text:
-            if self.machine.phase in (R1Phase.ICEBREAKER, R1Phase.ROLEPLAY, R1Phase.ASIDE):
+            if phase in (R1Phase.ICEBREAKER, R1Phase.ROLEPLAY, R1Phase.ASIDE):
                 if (
                     suppressed
                     and text
-                    and self.machine.phase is R1Phase.ICEBREAKER
+                    and phase is R1Phase.ICEBREAKER
                     and self.machine.icebreaker_should_end()
                 ):
-                    # THIS turn ended the icebreaker (S crossed 3:30 between its transcript
-                    # and its end of turn): it is the turn the boundary line answers.  Only
-                    # this turn may end the phase early; a later wake-up (the interviewer's
-                    # own question finishing, the candidate starting to answer) must not.
-                    self._icebreaker_boundary_turn = True
+                    if deferral == _DEFER_UNFINISHED:
+                        # A1: not the last answer.  No reply (it would talk over the rest of the
+                        # thought); the next committed turn, or a short quiet, ends the phase.
+                        self._icebreaker_continuation_at = self._clock()
+                        _log.info("unknown_event", error_type="r1_icebreaker_continuation_wait")
+                    else:
+                        # THIS turn ended the icebreaker (S crossed 3:30 between its transcript
+                        # and its end of turn): it is the turn the boundary line answers.  Only
+                        # this turn may end the phase early; a later wake-up (the interviewer's
+                        # own question finishing, the candidate starting to answer) must not.
+                        self._icebreaker_boundary_turn = True
                 # A phase that ended between this turn's transcript and its end of turn (the
                 # driver judged the transcript, this hook judges the end of turn) is over for
                 # the driver too: wake it, so it re-reads its budget and plays the boundary
                 # line now instead of waiting out a silence window for an answer nobody gave.
                 self._wake()
+            elif action is not None and text:
+                self._queue_transition_line(action)
             raise StopResponse()
+        if phase is R1Phase.ICEBREAKER and deferral == _DEFER_BARGE_IN:
+            _log.info("unknown_event", error_type="r1_icebreaker_barge_in_answered")
         if self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
             reply = self._plan_learner_reply(
                 text, entry, index, seconds, end_intent=end_intent, confirmed_yes=confirmed_yes
@@ -3247,6 +3592,14 @@ class R1Interview:
                 entry=entry,
                 candidate_index=index,
             )
+            if action == _TRANSITION_ANSWER:
+                # M1: Christy's answer ends with the start question, in the same speech (so the
+                # candidate can cut in with "ready" or the next question at any point).
+                self._transition_answers += 1
+                reply.tail = self.render_line("L-TRANSITION-ASK")
+                self._start_question = _EITHER_OR
+            elif action == _TRANSITION_INVITE:
+                self._start_question = None  # "of course, go ahead": no start question
         self._last_reply = self._latest_reply = reply
         if self.machine.phase is R1Phase.WRAPUP:
             self._wrapup_answer_owed = reply
@@ -3254,6 +3607,19 @@ class R1Interview:
             self._replies[str(message_id)] = reply
             while len(self._replies) > _REPLIES_KEPT:
                 self._replies.pop(next(iter(self._replies)))
+
+    def _queue_transition_line(self, action: str) -> None:
+        """M1: hand the driver the scripted line a suppressed transition turn gets, if any."""
+        if action == _TRANSITION_STEER:
+            self._transition_steered = True
+            line_id = "L-TRANSITION-STEER"
+        elif action == _TRANSITION_NUDGE:
+            line_id = "L-TRANSITION-NUDGE"
+        else:
+            return  # the pickup, the replay or nothing at all: the driver handles those itself
+        if line_id not in self._transition_lines:
+            self._transition_lines.append(line_id)
+        self._wake()
 
     def _plan_learner_reply(
         self,
@@ -3314,12 +3680,19 @@ class R1Interview:
                 turn_index=index,
             )
         if plan.aside:
-            if entry is not None:
-                entry["phase"] = "aside"  # excluded from the learner's context (plan 5.10)
-            self._spawn(self._play_aside(plan))
+            # M2: the turn the offer to wrap up follows was said to the learner, so it stays a
+            # role-play turn (``wrap_offer:<trigger>``).  An answer to the offer is said to the
+            # interviewer, as the turn that confirms a stop is: its row is ``aside`` too.
+            if not any(reason.startswith("wrap_offer:") for reason in plan.reasons):
+                if entry is not None:
+                    entry["phase"] = "aside"  # excluded from the learner's context (plan 5.10)
+                if any(reason.startswith("wrap_offer_") for reason in plan.reasons):
+                    self._candidate_row_phase = "aside"
+            if plan.scripted_text:  # an answer that leaves the offer open says nothing
+                self._spawn(self._play_aside(plan))
             raise StopResponse()
         if plan.exit_roleplay:
-            if "end_confirmed" in plan.reasons:
+            if "end_confirmed" in plan.reasons or "wrap_offer_accepted" in plan.reasons:
                 # An out-of-role stop is said to the interviewer, not to the learner: like the
                 # turns of an aside it stays out of the learner's context (plan 5.10), and its
                 # transcript row is written as ``aside`` too (``prepare_turn``), so the API gate
@@ -3463,8 +3836,9 @@ class R1Interview:
 
         Not when the classifier is off or unusable, outside the role-play phases, for a turn the
         prefilter misses (``prefilter_hit``: the ~93% of normal turns that never wait), for one the
-        lexical fast path already confirms (``explicit_end_request``), and not for a bare yes
-        while L-ASIDE-END's question is open (the settle rule decides that one).
+        lexical fast path already confirms (``explicit_end_request``), and not for a short yes to
+        an open question, L-ASIDE-END or the offer to wrap up L-ASIDE-WRAP (the settle rule decides
+        that one: ``RolePlayEngine.settles_as_yes``).
         """
         if not text or self._exiting:
             return False
@@ -3475,18 +3849,18 @@ class R1Interview:
         if not prefilter_hit(text) or explicit_end_request(text):
             return False
         engine = self._engine
-        return not (engine is not None and engine.end_question_open and is_bare_yes(text))
+        return not (engine is not None and engine.settles_as_yes(text))
 
     def _end_intent_messages(self, text: str) -> list[dict[str, str]]:
         """The fenced messages for one classification (the question is shown once it was asked)."""
         engine = self.engine
         self._end_intent_seq += 1
-        after_aside = engine.end_question_open
+        question = engine.open_question_line  # L-ASIDE-END, or the offer L-ASIDE-WRAP (M2)
         return build_end_intent_messages(
             text,
-            context="after_aside" if after_aside else "roleplay",
+            context="roleplay" if question is None else "after_aside",
             learner_last=self._learner_last(),
-            question=self.render_line("L-ASIDE-END") if after_aside else "",
+            question="" if question is None else self.render_line(question),
             seed=engine.seed,
             turn=self._end_intent_seq,
         )
@@ -3661,6 +4035,9 @@ class R1Interview:
     async def _settle_bare_yes(self, turn: _OpenTurn) -> bool:
         """True when a bare yes to L-ASIDE-END stood unanswered and so confirms the stop.
 
+        M2: a short yes to the offer to wrap up (L-ASIDE-WRAP: "Yes.", "Okay.", "Sounds good.")
+        settles the same way (``RolePlayEngine.settles_as_yes``) before it ends the role-play.
+
         Owner decision 2026-10-30.  Only while the question is open and only for a bare yes
         (``is_bare_yes``: "yes", "yes please", "sure", "haan ji", "go ahead").  Speech-to-text can
         finalise a lone "Yeah." a second before "... no, let's carry on", so the yes must stand
@@ -3675,8 +4052,7 @@ class R1Interview:
         if (
             self.machine.phase not in (R1Phase.ROLEPLAY, R1Phase.ASIDE)
             or engine is None
-            or not engine.end_question_open
-            or not is_bare_yes(turn.text)
+            or not engine.settles_as_yes(turn.text)
             or self.reply_suppressed(turn.text)
         ):
             return False
@@ -3824,6 +4200,8 @@ class R1Interview:
             # reset the failure count (the 3-failure abort stays reachable).
             self._skip_failure_reset = True
             yield FALLBACK_REPLY + " "
+        elif spoke and reply.tail:
+            yield reply.tail + " "
 
     def _reply_failed(self, exc: BaseException, reported_before: int) -> bool:
         """Count one failed model reply and say whether a recovery line should be spoken.
@@ -4626,6 +5004,15 @@ class R1Interview:
             slot.used = True
             index, phase = slot.index, slot.phase
         interrupted = bool(getattr(item, "interrupted", False))
+        if phase in ("opening", "icebreaker"):
+            # A1: the candidate cut off a reply of Christy's that they were hearing; the turn they
+            # cut it with is theirs to finish (``_icebreaker_deferral``).
+            self._icebreaker_reply_cut = (
+                interrupted
+                and slot is not None
+                and slot.source == "generate_reply"
+                and not slot.cut_by_r1
+            )
         self._note_wrapup_answer(phase, slot, interrupted)
         self._remember_bot_turn(index, phase, text, slot)
         self._write_turn(
@@ -4672,9 +5059,12 @@ class R1Interview:
         if voice is None:
             # A speech nobody tagged is an LLM reply: the learner's in role-play, else Christy's.
             voice = LEARNER if phase == ROLEPLAY_PHASE else INTERVIEWER
-        self._history.append(
-            {"seq": index, "role": "bot", "text": text, "phase": phase, "voice": voice}
-        )
+        entry: dict[str, Any] = {
+            "seq": index, "role": "bot", "text": text, "phase": phase, "voice": voice
+        }
+        if slot is not None and slot.source == "say":
+            entry["scripted"] = True  # a reviewed line (``select_context`` may leave it out)
+        self._history.append(entry)
 
     def _record_learner_speech(
         self, slot: _SpeechSlot | None, text: str, interrupted: bool
@@ -5176,14 +5566,27 @@ class R1Interview:
 
     async def _handle_disconnect(self) -> str | None:
         """Pause the phase clock while only the selected candidate may rejoin."""
+        in_transition = self.machine.phase is R1Phase.TRANSITION
+        away_since = asyncio.get_running_loop().time()
         if self.machine.phase in _LIVE_PHASES:
             self._begin_disconnect()
         if not await self._wait_for_candidate(rejoin_grace_seconds()):
             # A candidate who stays away during the wrap-up has finished the role-play: the
             # session is complete (scorable), not a candidate who walked out of the interview.
             return self._stop_outcome() or self._after_roleplay("candidate_left")
+        if in_transition:
+            # Repair (round 2): the transition's ceiling pauses with the phase (a rejoin after
+            # it would have passed got L-REJOIN and then the lost-connection close).
+            self._transition_paused_seconds += asyncio.get_running_loop().time() - away_since
         if self.machine.phase is R1Phase.PAUSED_DISCONNECTED:
             self._rejoin()
+        if self._engine is not None and self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
+            # Repair (round 2, M2): a question of the interviewer's that was open when the line
+            # dropped is not answered by what the candidate says to L-REJOIN-RP ("Okay.", "Sure."
+            # read as a yes to L-ASIDE-WRAP ended the role-play without consent).  It lapses as
+            # on silence: the offer counts as unanswered and its cooldown applies.
+            self._engine.end_question_lapsed()
+            self._engine.wrap_question_lapsed(self.machine.roleplay_elapsed)
         # The pause may have hidden an unmute: re-check the aside against the room.
         if self._aside_needs_restore():
             self._leave_mute_aside()
@@ -5256,21 +5659,38 @@ class R1Interview:
         return "candidate_left"
 
     async def _roleplay_turn(self) -> str | None:
-        """Wait for one role-play turn; return a terminal outcome, or None to continue."""
+        """Wait for one role-play turn; return a terminal outcome, or None to continue.
+
+        M2: while the interviewer may offer to wrap up (``RolePlayEngine.wrap_pause_due``) a quiet
+        of ``WRAP_OFFER_PAUSE_SEC`` after the learner's line is the natural pause it waits for:
+        the offer is spoken then (R paused), and the wait goes on for the answer.
+        """
         if self._roleplay_budget_left() <= 0:
             return "phase_deadline"
+        engine = self._engine
+        pause = engine is not None and engine.wrap_pause_due(self.machine.roleplay_elapsed)
         kind, value = await self._await_turn(
-            ROLEPLAY_PROMPT_SECONDS, hard=self._roleplay_budget_left
+            WRAP_OFFER_PAUSE_SEC if pause else ROLEPLAY_PROMPT_SECONDS,
+            hard=self._roleplay_budget_left,
         )
         if kind == STOP:
             return value
         if kind == DEADLINE:
             return "phase_deadline"
+        if kind == SILENCE and pause and self._engine is not None:
+            offer = self._engine.wrap_offer_at_pause(self.machine.roleplay_elapsed)
+            if offer is not None:
+                _log.info("unknown_event", error_type="r1_wrap_offer", error_category="pause")
+                await self._play_aside(offer)
+            # Either way the next wait is the ordinary one: the silence window runs from when
+            # the quiet began (``_silence_anchor``), so no prompt is delayed by the offer's check.
+            return None
         if kind == SILENCE:
             if self._engine is not None:
                 # Silence after L-ASIDE-END is handled as always; an answer to "Are you still
-                # there?" is not an answer to L-ASIDE-END.
+                # there?" is not an answer to L-ASIDE-END.  Nor to the offer to wrap up (M2).
                 self._engine.end_question_lapsed()
+                self._engine.wrap_question_lapsed(self.machine.roleplay_elapsed)
             return await self._silence_ladder(
                 [
                     ("L-SIL-RP1", ROLEPLAY_FIRST_STEP_SECONDS),
@@ -5396,8 +5816,23 @@ class R1Interview:
             return self._icebreaker_hold_left()
         left = self.machine.remaining_icebreaker_seconds()
         if left > 0:
+            if self._icebreaker_continuation_at is not None:
+                return min(left, self._icebreaker_continuation_left())
             return left
         return self._icebreaker_hold_left()
+
+    def _icebreaker_continuation_left(self) -> float:
+        """A1: how long an unfinished turn still waits for the candidate to finish the thought.
+
+        While they are mid-turn (speaking, or a final the SDK has not committed) the bounded hold
+        of ``_icebreaker_hold_left`` applies; the commit then decides (``_decide_turn``).  Once
+        they are quiet, ``ICEBREAKER_CONTINUATION_WAIT_SECONDS`` after their last sign of speech.
+        """
+        if self._candidate_turn_open():
+            return self._icebreaker_hold_left()
+        since = self._icebreaker_continuation_at or self._clock()
+        last = max(since, self._candidate_activity_at or since)
+        return max(0.0, last + ICEBREAKER_CONTINUATION_WAIT_SECONDS - self._clock())
 
     def _icebreaker_hold_left(self) -> float:
         """Seconds the hard S=4:30 cap may still wait for the candidate's turn in flight.
@@ -5447,73 +5882,105 @@ class R1Interview:
                     return value
 
     async def _run_transition(self) -> str | None:
-        """Wait for READY (or 20 s), then let the driver speak the one pickup line.
+        """Wait for the candidate's consent, answering their questions, then speak the pickup.
 
-        READY is the candidate saying it, or pressing the page's "I'm ready" button (R1-Q).  The
-        press may come while the briefing is still playing, before this wait starts; it is latched
-        (``_on_data_received``), so the turns forgotten just below cannot lose it, and there is then
-        nothing to wait for.
+        Owner decision 2026-11-03 (M1, mock call aa166f09: the learner picked up on a 20 s timer
+        while the candidate was asking to ask questions).  L-TRANSITION ends by asking whether to
+        start now or take questions first, and nothing here starts the role-play on a timer:
+
+        * Consent is the candidate saying so (``is_transition_consent``: "ready", "yes, let's
+          start", "no questions, let's go"), read at each final as before, or the page's "I'm
+          ready" button.  The press may come while the briefing is still playing, before this wait
+          starts; it is latched (``_on_data_received``), so the turns forgotten just below cannot
+          lose it, and there is then nothing to wait for.
+        * A question is the turn hook's (``_transition_action``): Christy answers up to
+          ``TRANSITION_QUESTION_LIMIT`` of them from the role facts, each answer followed by
+          L-TRANSITION-ASK in the same speech; after that L-TRANSITION-STEER, then the nudge.  The
+          hook queues those scripted lines (``_transition_lines``) and this driver speaks them.
+        * Candidate silence gets L-TRANSITION-REASK, then L-TRANSITION-REASK-2, then the lost
+          connection close (``TRANSITION_SILENCE_LADDER``); ``TRANSITION_MAX_SECONDS`` after the
+          brief began the interview ends the same way (a muted microphone, no consent at all).
 
         The brief on request (owner decision 2026-10-30): a candidate who asks to hear the brief
         again, during L-TRANSITION or while this waits (``is_brief_request``, latched at the
         transcript as ``_brief_requested``), hears L-TRANSITION once more, word for word (its
-        approved text and cached audio), and the wait starts again from there, for what is left of
-        the 1:30 transition budget (``_wait_after_replay``: 8-20 s).  Once per session:
-        a later request gets the nudge as any other answer does.  A ready said during the replay
-        picks up right after it, and so does the button; a press before the replay means no
-        replay.  The request never uses up L-TRANSITION-NUDGE.
+        approved text and cached audio), and the wait goes on from there.  Once per session: a
+        later request gets the nudge.  A consent said during the replay picks up right after it,
+        and so does the button; a press before the replay means no replay.
         """
         self._drop_stale_turns()
+        self._transition_lines.clear()
         loop = asyncio.get_running_loop()
-        deadline = loop.time() + TRANSITION_DEADLINE_SECONDS
+        started = self._transition_started_at
+        ceiling = (loop.time() if started is None else started) + TRANSITION_MAX_SECONDS
 
         def left() -> float:
-            return deadline - loop.time()
+            return ceiling + self._transition_paused_seconds - loop.time()
 
-        while not self._ready_latched and left() > 0:
+        def interrupted() -> bool:
+            return self._ready_latched or self._brief_due() or bool(self._transition_lines)
+
+        step = 0  # the silence steps used since the candidate last spoke
+        while not self._ready_latched:
             if self._brief_due():
                 if await self._repeat_brief():
-                    break  # "ready" during the replay
-                deadline = loop.time() + self._wait_after_replay(loop.time())
+                    break  # a consent during the replay
                 continue
-            kind, value = await self._await_turn(
-                left(), hard=left, until=lambda: self._ready_latched or self._brief_due()
-            )
+            if self._transition_lines:
+                await self.say(self._transition_lines.popleft())
+                continue
+            if step < len(TRANSITION_SILENCE_LADDER):
+                window = TRANSITION_SILENCE_LADDER[step][0]
+            else:
+                window = TRANSITION_SILENCE_END_SECONDS
+            kind, value = await self._await_turn(window, hard=left, until=interrupted)
             if kind == STOP:
                 return value
             if kind == PRESSED:
-                if self._ready_latched:
-                    break
-                continue  # the brief was asked for: replay it
-            if kind in (SILENCE, DEADLINE):
+                continue  # the button, a brief request or a line to say: the loop handles each
+            if kind == DEADLINE:
+                _log.info("unknown_event", error_type="r1_transition_ceiling")
+                return await self._end_transition_unstarted()
+            if kind == SILENCE:
+                if step < len(TRANSITION_SILENCE_LADDER):
+                    await self.say(TRANSITION_SILENCE_LADDER[step][1])
+                    step += 1
+                    continue
+                return await self._end_transition_unstarted()
+            step = 0
+            if self._transition_consent(value or ""):
+                self._transition_consented = True
                 break
-            if self.is_ready(value or ""):
-                break
-            if self._brief_due():
-                continue
-            if not self._transition_nudged:
-                self._transition_nudged = True
-                await self.say("L-TRANSITION-NUDGE")
-        # Waiting is over, however it ended: a press that arrives from now on is not "ready" for
-        # anything (the learner is picking up), so the page is not asked and the handler ignores it.
+            # Anything else is decided when the SDK commits the turn (``_transition_action``).
+        # Waiting is over: a press that arrives from now on is not "ready" for anything (the
+        # learner is picking up), so the page is not asked and the handler ignores it.
         self._awaiting_ready = False
+        self._transition_lines.clear()
+        # The pickup is uninterruptible: a candidate still speaking ("Yes, let's start, and ...")
+        # is not talked over (aa166f09 review), within the endpointing maximum and a margin.
+        await self._wait_while_candidate_speaks(
+            endpoint_max_delay_sec() + ICEBREAKER_HOLD_MARGIN_SECONDS
+        )
         if self._candidate_present:
             await self._speak_pickup_once()
         return None
 
-    def _wait_after_replay(self, now: float) -> float:
-        """How long to wait for ready after the brief was replayed (``TRANSITION_BUDGET_SECONDS``).
+    async def _wait_while_candidate_speaks(self, limit: float) -> None:
+        """Wait, at most ``limit`` seconds, while the candidate is speaking (or a stop fires)."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + limit
+        while self._user_state == "speaking" and loop.time() < deadline:
+            if self._stop_outcome() is not None:
+                return
+            await asyncio.sleep(0.05)
 
-        What is left of the 1:30 transition budget since the first L-TRANSITION started, at most
-        ``TRANSITION_DEADLINE_SECONDS`` and at least ``TRANSITION_REPLAY_WAIT_FLOOR_SECONDS`` (or
-        the deadline, when that is shorter).  Without a start on record it is the usual deadline.
-        """
-        started = self._transition_started_at
-        full = TRANSITION_DEADLINE_SECONDS
-        if started is None:
-            return full
-        left = started + TRANSITION_BUDGET_SECONDS - now
-        return min(full, max(TRANSITION_REPLAY_WAIT_FLOOR_SECONDS, left))
+    async def _end_transition_unstarted(self) -> str:
+        """End an interview whose role-play never started: the silence close (L-SIL-END)."""
+        self._awaiting_ready = False
+        self._transition_lines.clear()
+        self._goodbye_spoken = True
+        await self.say("L-SIL-END")
+        return "candidate_left"
 
     def _brief_due(self) -> bool:
         """The candidate asked to hear the brief again, and it has not been replayed yet."""
@@ -5532,18 +5999,71 @@ class R1Interview:
         await self.say("L-TRANSITION")
         ready = False
         while not self._turns.empty():
-            if self.is_ready(self._turns.get_nowait()):
+            if is_transition_consent(self._turns.get_nowait()):
                 ready = True
         return ready
 
     async def _run_roleplay(self) -> str | None:
-        """Run the learner role-play until R=20:00, S=26:00, or a terminal outcome."""
+        """Run the learner role-play until R=20:00, its S cap, the candidate's end, or a stop.
+
+        M2: when it is the time that ran out (not the candidate who ended it) the role-play
+        closes gently (``_close_roleplay_on_time``) before the driver says L-EXIT.
+        """
         while not self._roleplay_over():
             stop = await self._roleplay_turn()
             if stop == "phase_deadline":
                 break
             if stop is not None:
                 return stop
+        if self._roleplay_exit_requested():
+            return None
+        return await self._close_roleplay_on_time()
+
+    def _roleplay_end_hold_left(self) -> float:
+        """Seconds the end of the role-play's time may still wait for the candidate's turn.
+
+        Like the icebreaker's hard cap (``_icebreaker_hold_left``): while the candidate speaks, or a
+        final was heard whose turn has not committed, the closing waits one endpointing maximum
+        plus a margin after the last sign of speech, never longer than
+        ``ROLEPLAY_END_HOLD_CEILING_SECONDS`` in all.  Zero when nobody is mid-turn.
+        """
+        if not self._candidate_turn_open():
+            return 0.0
+        now = self._clock()
+        if self._roleplay_end_hold_since is None:
+            self._roleplay_end_hold_since = now
+        grace = endpoint_max_delay_sec() + ROLEPLAY_END_HOLD_MARGIN_SECONDS
+        last = now if self._user_state == "speaking" else (self._candidate_activity_at or now)
+        ceiling = self._roleplay_end_hold_since + ROLEPLAY_END_HOLD_CEILING_SECONDS
+        return max(0.0, min(ceiling, last + grace) - now)
+
+    async def _close_roleplay_on_time(self) -> str | None:
+        """M2: the role-play's time is up (R = 20:00 or its S cap): close it, never abruptly.
+
+        The learner's 17:00 time cue was the first lead-in.  Now a candidate who is mid-turn is
+        let finish (``_roleplay_end_hold_left``; the turn is the boundary and gets no reply), and
+        the learner closes in role with L-TIME-UP before the driver's L-EXIT.  Not over a mute or
+        to an empty room (the line would be lost), and not after a stop.  The hold and the line fit
+        in ``r1_phases.ROLEPLAY_CLOSE_ALLOWANCE_SEC``.
+        """
+        _log.info("unknown_event", error_type="r1_roleplay_time_up")
+        self._roleplay_end_hold_since = None
+        while self._roleplay_end_hold_left() > 0:
+            kind, value = await self._await_turn(
+                ROLEPLAY_END_HOLD_CEILING_SECONDS, hard=self._roleplay_end_hold_left
+            )
+            if kind == STOP:
+                return value
+            if kind != TURN:
+                break
+        if (
+            self.machine.phase is R1Phase.ROLEPLAY
+            and self._candidate_present
+            and not self._muted
+            and self._stop_outcome() is None
+            and not self._roleplay_exit_requested()
+        ):
+            await self.say("L-TIME-UP")
         return None
 
     def _end_roleplay(self) -> None:

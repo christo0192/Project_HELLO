@@ -116,7 +116,18 @@ import r1_world
 # Revision 19 (owner test 8f5bfefc): the F1 anchor for a figure under $7,000 that was not read as a
 # price (anchor_after_unclear_low) reacts to that number and asks what the total would be, never for
 # more.  No other pinned text changed.
-PINNED_CONTENT_SHA256 = "0a39519fe5d0b99d3e5a62dc7374909e8f1d1c397a46504f671304569689ad53"
+# Revision 20 (owner and manager decisions of 2026-11-03, mock call aa166f09): L-OPEN and
+# L-TRANSITION say "up to twenty minutes" (M3), L-TRANSITION ends by asking whether to start or
+# take questions first, and the transition lines (L-TRANSITION-ASK, -REASK, -REASK-2, -STEER) and
+# the interviewer's transition note (TRANSITION_REMINDER) join the manifest (M1: no auto-start);
+# the interviewer prefix no longer calls its facts an "approved list" and the wrap-up note takes
+# a complaint gracefully without a second hiring-team mention (A4).  Same revision (M2): the
+# offer to wrap up (L-ASIDE-WRAP), the line when the candidate keeps going (L-ASIDE-WRAP-RESUME)
+# and the learner's closing at the end of the time (L-TIME-UP) join the scripted lines.  Same
+# revision, the learner: the card's call direction and work answers (M4, L4), three more curiosity
+# topics and a check-in-done note that never closes (L1), the intent shapes (L2), the F4 push's
+# refer-back and the decider and budget notes (L5, L7).
+PINNED_CONTENT_SHA256 = "9f5d7bf6a039aca045c1409247b2b693f7acaf57d4fcd621c937b7116e4edabc"
 
 CONTENT_MODULES = (
     "r1_text",

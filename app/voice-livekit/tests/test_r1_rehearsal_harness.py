@@ -1516,7 +1516,9 @@ class OfflineCallTests(unittest.TestCase):
         spec = CallSpec("p2_recent_grad", "v1", "strong", 0, "Rohan")
         record = asyncio.run(run_call(spec, factory.make(spec)))
         self.assertIsNone(record["error"])
-        self.assertEqual(record["stop_reason"], "early_exit")
+        # M2 (2026-11-03): no early exit once the commitment is on record; the advisor's goodbye
+        # after the STRONG close ends the role-play (the close ladder's exit).
+        self.assertEqual(record["stop_reason"], "farewell_exit")
         self.assertEqual(record["header"]["tier"], "rig")
         self.assertTrue(record["header"]["offline"])
         self.assertEqual(record["metrics"]["commitment_level"], "STRONG")

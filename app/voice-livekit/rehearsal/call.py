@@ -52,6 +52,10 @@ from r1_world import WORLD_VERSION
 DEFAULT_CANDIDATE_NAMES = ("Rohan", "Sneha", "Vikram", "Anita", "Arjun", "Divya")
 SILENT_TURN = "Mm-hmm."
 FAREWELL_STOP = 2
+# M2 (2026-11-03): the rehearsed advisor's answer when the interviewer offers to wrap up a call
+# that is going nowhere (no commitment on record yet): it keeps going, so the rest of the plan is
+# still rehearsed.  An offer after the commitment is where the call stops (it used to exit there).
+WRAP_DECLINE = "No, let's keep going."
 
 
 @dataclass(frozen=True)
@@ -258,6 +262,9 @@ async def _play(
         learner_last = spoken if spoken is not None else "..."
         if turn.intent == "farewell":
             farewells += 1
+        if rig.engine.wrap_question_open and not rig.engine.commitment_resolved:
+            await rig.converse(WRAP_DECLINE, advance=timing.endpoint())
+            await rig.flush()
         stop = _stop_reason(rig, farewells)
         if stop:
             record["stop_reason"] = stop
@@ -348,14 +355,13 @@ def _tokens(calls: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def _suppressed_why(rig: Any) -> str:
-    interview = rig.interview
     # A confirmed stop sets ``exit_requested`` too (it exits into the wrap-up), so it is read first.
     if rig.engine.end_confirmed:
         return "end_request"
     if rig.engine.exit_requested:
         return "farewell_exit"
-    if interview._early_exit_due():
-        return "early_exit"
+    if rig.engine.wrap_question_open:
+        return "wrap_offer"  # M2: the interviewer offered to wrap up
     if rig.machine.roleplay_should_end():
         return "time_cap"
     if getattr(rig.engine, "_asides", None) or getattr(rig.engine, "_end_aside", None):
@@ -364,14 +370,15 @@ def _suppressed_why(rig: Any) -> str:
 
 
 def _stop_reason(rig: Any, farewells: int) -> str | None:
-    interview = rig.interview
     # A confirmed stop (owner test 7f2a25e6) exits into the wrap-up like a farewell; read first.
     if rig.engine.end_confirmed:
         return "end_request"
     if rig.engine.exit_requested:
         return "farewell_exit"
-    if interview._early_exit_due():
-        return "early_exit"
+    if rig.engine.wrap_question_open:
+        # M2 (2026-11-03): where the role-play used to end by itself (the early exit) the
+        # interviewer now offers to wrap up; the rehearsal stops there, as it stopped at the exit.
+        return "wrap_offer"
     if rig.machine.roleplay_should_end():
         return "time_cap"
     if farewells >= FAREWELL_STOP:

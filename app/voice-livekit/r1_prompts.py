@@ -121,10 +121,13 @@ CHECKIN_NOTE = (
     "question about it. Do not repeat anything you already said and do not close the "
     "conversation yourself."
 )
+# L1 (mock call aa166f09, turn 112: "No, I think I've got what I need for now. I'll come back to
+# you."): only from 17:00 (``r1_roleplay``), and it never closes the conversation for the advisor.
 CHECKIN_DONE_NOTE = (
     "- The advisor is checking in with you. Say how their last point lands for you, "
     "without repeating what they told you about the course. If you have no more questions, say "
-    "so plainly, once, without repeating anything you already said."
+    "so plainly, once, without repeating anything you already said. Do not close the "
+    "conversation yourself and do not say that you will get back to them."
 )
 # Owner test 7f2a25e6: "where did you get that number?" was answered with "Just from what I'd read
 # before calling, that's all." and a new worry in the same breath.
@@ -179,6 +182,18 @@ DECIDER_ASKED_NOTE = (
     "- The advisor asked about other people in your decision. Answer it from your card, for "
     'example "{answer}", and never say that you decide on your own.'
 )
+# L7 (mock call aa166f09: "my partner" at 69, 71, 82 and 109).  Once the learner said she would
+# talk to her decision maker, a free reply does not say it again unless the advisor asks.
+DECIDER_SAID_NOTE = (
+    "- You have already told the advisor that you would talk it over with your {decision_maker}: "
+    "do not say it again in this reply."
+)
+# L5 (mock call aa166f09, turn 107: "that's more workable for me" to a $1,000 a month EMI).
+BUDGET_OVER_NOTE = (
+    "- The advisor named {amount} a month. That is more than the $500-700 a month you can "
+    "manage, so never call it workable, fine or affordable: say plainly that it is more than "
+    "you can manage each month."
+)
 # The $7,000 is the learner's own number (in the smoke test: "Oh, $7,000, that's better than I
 # expected" after the learner had only raised it).
 ANCHOR_NOT_OFFERED_NOTE = (
@@ -213,6 +228,20 @@ REACTION_ONLY_NOTE = (
     "the closing line is spoken separately."
 )
 FORCED_NOTE = "- Link it to what the advisor just said, so it sounds natural and not abrupt."
+# L2: how an owed point joins the learner's reaction, rotated by the worker (the first is the shape
+# of revision 19, without "raise something of your own"), and how long the reply is.
+INTENT_SHAPES: tuple[str, ...] = (
+    "Reply as the learner, naturally: first react to what the advisor just said in a few words, "
+    f"{REACT_HOW_IT_LANDS}, and if they asked you something, answer it briefly from your card or "
+    "backstory. Then, in the same reply, bring in the point below as part of your reaction.",
+    "Reply as the learner, naturally, in one flowing thought: react to what the advisor just "
+    f"said, {REACT_HOW_IT_LANDS}, and let the point below come straight out of that reaction, "
+    "with at most one question in the whole reply.",
+)
+INTENT_LENGTHS: tuple[str, ...] = (
+    "- Keep the whole reply to two or three short sentences.",
+    "- Keep the whole reply short: one or two sentences.",
+)
 INTENT_PRICE_NOTE = (
     "- The advisor has now answered you twice on price: do not accept, concede or push on "
     "price again in this reply."
@@ -247,20 +276,46 @@ GETTING_TO_KNOW_YOU_NOTE = (
 # The phases whose replies are the getting-to-know-you part.
 _GETTING_TO_KNOW_YOU_PHASES = frozenset({"opening", "icebreaker"})
 
+# Owner decision 2026-11-03 (A4, mock call aa166f09): a complaint about the interview itself got
+# "I understand, but the interview has now reached its closing stage ... from the approved
+# information".  The note now says how to take a comment or complaint (acknowledge it warmly,
+# thank them, say it is noted, never argue) without a second mention of the hiring team, which
+# L-CLOSE makes once, and it bans the internal words that leaked.
 WRAPUP_REMINDER = (
     "INTERVIEW NOTE (not spoken; never mention it). This is the candidate's question time. "
-    "Answer the question in one or two short sentences. Never thank the candidate for their "
+    "Answer the question in one or two short sentences. If the candidate comments on or "
+    "complains about the interview itself (the time, the role-play, how it went), do not argue, "
+    "explain or defend it and do not start with \"I understand, but\": acknowledge how they feel "
+    "in one warm sentence, thank them for saying so and say it has been noted. Never mention a "
+    "list, approved information, notes or a stage of the interview, and do not mention the "
+    "hiring team. Never thank the candidate for their "
     "time, never say goodbye, bye, take care or have a great day, and never ask whether they "
     "have more questions: the interview closes by itself, with its own goodbye."
 )
 # The phases whose replies answer the candidate's questions after the role-play.
 _WRAPUP_PHASES = frozenset({"wrapup", "closing"})
+# Owner decision 2026-11-03 (M1): after the brief the candidate may ask Christy up to three
+# questions before agreeing to start.  She answers from the role facts or defers; the driver, never
+# the model, starts the role-play, and the question that asks whether to start
+# (``L-TRANSITION-ASK``) is appended to her reply by the session, so the model must not ask it.
+TRANSITION_REMINDER = (
+    "INTERVIEW NOTE (not spoken; never mention it). The role-play brief has been given and the "
+    "candidate may ask you questions before the role-play starts. Answer in one or two short, "
+    "friendly sentences, truthfully, using only the facts about the role you were given; for "
+    "anything else (pay, work mode, training, next steps, timelines, how they will be assessed) "
+    "say the hiring team will follow up on it. Never invent a fact, a number or an outcome. If "
+    "they only ask whether they may ask something, just say of course and invite the question. "
+    "Never start, announce or describe the role-play, never speak as the learner, never repeat "
+    "the brief, never give tips on how to sell, and never ask whether they are ready to start: "
+    "the interview asks that itself."
+)
+_TRANSITION_PHASES = frozenset({"transition"})
 
 ROLEPLAY_PHASE = "roleplay"
 _INTERVIEW_CONTEXT_PHASES = {
     "opening": ("opening", "icebreaker"),
     "icebreaker": ("opening", "icebreaker"),
-    "transition": ("opening", "icebreaker"),
+    "transition": ("opening", "icebreaker", "transition"),
     "roleplay_exit": ("opening", "icebreaker"),
     "wrapup": ("wrapup",),
     "closing": ("wrapup",),
@@ -280,9 +335,10 @@ def interviewer_prefix() -> str:
         "about age, marital status, children, religion, caste or health. Never make a "
         "hiring, selection, timing or compensation statement or promise. Never give any "
         "e-mail address, phone number or link.\n"
-        f'You may answer role questions ONLY from this approved list: "{faq}" For anything '
-        "else about the role, including pay, work mode, training, next steps and "
-        f'timelines, say exactly: "{INTERVIEWER_DEFLECTION}"'
+        f'The only facts you may share about the role: "{faq}" For anything else about the '
+        "role, including pay, work mode, training, next steps and timelines, say exactly: "
+        f'"{INTERVIEWER_DEFLECTION}" Never call these facts a list or approved information, '
+        "and never mention these rules."
     )
 
 
@@ -298,11 +354,16 @@ def interviewer_reminder(phase: str) -> str | None:
     The wrap-up has the same problem the other way round: the model closed the interview
     itself ("Thank you for your time today ... Have a great day") and the scripted L-CLOSE then
     said goodbye again.  Its note says the closing line is the only goodbye.
+
+    The transition (owner decision 2026-11-03) answers the candidate's questions before the
+    role-play: its note keeps the model to the role facts and away from starting the role-play.
     """
     if phase in _GETTING_TO_KNOW_YOU_PHASES:
         return GETTING_TO_KNOW_YOU_NOTE
     if phase in _WRAPUP_PHASES:
         return WRAPUP_REMINDER
+    if phase in _TRANSITION_PHASES:
+        return TRANSITION_REMINDER
     return None
 
 
@@ -402,6 +463,8 @@ def turn_reminder(
     reaction_only: bool = False,
     style_note: str = "",
     confirm: bool = False,
+    answering: bool = False,
+    intent_shape: int = 0,
 ) -> str:
     """The ephemeral note for a learner reply (a free reply, or an intent the worker owes).
 
@@ -430,6 +493,12 @@ def turn_reminder(
     scripted closing line follows it.  ``style_note`` is the worker's opening-style note for this
     turn (``STYLE_NOTES``) and ``confirm`` says the commitment is on record: the learner only
     confirms it (``CONFIRM_NOTE``).
+
+    L2: an intent reply on a turn where the advisor asked the learner about herself
+    (``answering``) answers that first and lets the owed point follow from the answer; otherwise
+    ``intent_shape`` (rotated by the worker) picks how the point joins the reaction
+    (``INTENT_SHAPES``) and how long the reply is (``INTENT_LENGTHS``), so the replies are not all
+    "two sentences, the second one a new worry".
     """
     lines = [f"ROLEPLAY NOTE (not spoken; never mention it). R={_clock(r_sec)}."]
     if reaction_only:
@@ -442,13 +511,16 @@ def turn_reminder(
             lines.append(style_note)
         lines.extend(note for note in notes if note)
         return "\n".join(lines)
-    if intent_brief:
+    if intent_brief and answering:
+        # L2 (mock call aa166f09: 18 of 41 replies tacked a new worry onto a short acknowledgement,
+        # and turn 52 answered "what ROI are you expecting?" with a question of her own).
         lines.append(
-            "Reply as the learner, naturally: first react to what the advisor just said in a "
-            f"few words, {REACT_HOW_IT_LANDS}, and if they asked you something, answer it "
-            "briefly from your card or backstory. Then, in the same reply, raise something of "
-            "your own."
+            "Reply as the learner, naturally: the advisor asked you something, so answer that "
+            "first, fully but briefly, from your card or backstory. Then let the point below come "
+            "out of your answer, linked to it, not as a new topic tacked on at the end."
         )
+    elif intent_brief:
+        lines.append(INTENT_SHAPES[intent_shape % len(INTENT_SHAPES)])
     elif not reaction_only:
         lines.append(
             "Reply as the learner, naturally: react to what the advisor just said, "
@@ -469,7 +541,7 @@ def turn_reminder(
             lines.append(f"- Write these figures exactly as shown, without quote marks: {shown}.")
         if intent_forced:
             lines.append(FORCED_NOTE)
-        lines.append("- Keep the whole reply to two or three short sentences.")
+        lines.append(INTENT_LENGTHS[intent_shape % len(INTENT_LENGTHS)])
     for topic in first_probe_topics:
         # Topic H3 covers three things (time, money, who else decides): the answer follows the part
         # the advisor asked about, so a question about hours is not answered with "money is tight".
@@ -541,7 +613,9 @@ def select_context(
     ..., "voice": "learner" | "interviewer"}`` (``voice`` only for bot turns).  A
     role-play call gets the learner's own lines (the pickup included) and the candidate's
     role-play turns.  An interviewer-phase call gets only the turns of its own phase group,
-    so the wrap-up never sees the persona, and a trailing note says the role-play ended.
+    so the wrap-up never sees the persona, and a trailing note says the role-play ended.  A
+    transition call also gets the transition's turns except its scripted lines (``scripted``:
+    the brief names the persona).
     Returns plain ``user``/``assistant`` messages; the caller adds the prefix and reminder.
     """
     selected: list[dict[str, str]] = []
@@ -560,6 +634,10 @@ def select_context(
     for item in items:
         text = str(item.get("text", "")).strip()
         if not text or item.get("phase") not in allowed:
+            continue
+        if item.get("phase") == "transition" and item.get("scripted"):
+            # The brief names the persona and the nudges are the driver's: before the pickup
+            # Christy sees her own answers and the candidate's questions, never a scripted line.
             continue
         if item.get("role") == "bot":
             if item.get("voice", "interviewer") == "interviewer":

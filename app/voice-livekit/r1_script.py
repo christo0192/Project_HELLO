@@ -34,8 +34,8 @@ LINES: dict[str, str] = {
         "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and "
         "I'll be running your first-round interview for the Sales Program Advisor role. "
         "It takes about thirty minutes. We'll spend a few minutes getting to know you, "
-        "then I'll switch into a twenty-minute sales role-play where I play a prospective "
-        "learner, "
+        "then I'll switch into a sales role-play of up to twenty minutes where I play a "
+        "prospective learner, "
         "and we'll finish with a couple of minutes for your questions. Let's start: could "
         "you walk me through your background, especially any sales or customer-facing work "
         "you've done?"
@@ -45,13 +45,29 @@ LINES: dict[str, str] = {
         "learner so we can evaluate how you handle a real sales call. The learner is "
         "{lead_name} from {lead_city}, who filled in a form on our website about the Data "
         "Science course a few days ago. You're the Program Advisor calling her back. The "
-        "role-play runs for twenty minutes, and within those twenty minutes your goal is to "
-        "convince her: understand her needs and help her decide to enrol, as you would on a "
-        "real call, using the course details from your preparation guide. I'll stay in "
-        "character until I say, 'Let's pause the role-play here.' When you're ready, just "
-        "say 'ready' and she'll pick up."
+        "role-play runs for up to twenty minutes, and in that time your goal is to convince "
+        "her: understand her needs and help her decide to enrol, as you would on a real call, "
+        "using the course details from your preparation guide. I'll stay in character until I "
+        "say, 'Let's pause the role-play here.' When you'd like to begin, just say 'ready' and "
+        "she'll pick up. Shall we start the role-play now, or do you have any questions first?"
     ),
     "L-TRANSITION-NUDGE": "Whenever you're ready, just say ready.",
+    # Owner decision 2026-11-03 (M1): no auto-start.  L-TRANSITION-ASK ends every answer Christy
+    # gives before the role-play (it travels inside her reply); the two re-asks follow candidate
+    # silence; L-TRANSITION-STEER answers a question past the limit of three.
+    "L-TRANSITION-ASK": "Shall we start the role-play now, or do you have another question?",
+    "L-TRANSITION-REASK": (
+        "Shall we start the role-play now? Just say 'ready' when you are, or ask me a question "
+        "first if you have one."
+    ),
+    "L-TRANSITION-REASK-2": (
+        "I'm still here whenever you're ready. Just say 'ready', or press the I'm ready button, "
+        "and she'll pick up."
+    ),
+    "L-TRANSITION-STEER": (
+        "Let's keep any other questions for the end of the interview; there'll be time for them "
+        "then. Shall we start the role-play now?"
+    ),
     "L-PICKUP": "Hello? Yes, this is {lead_first_name} speaking.",
     "L-TIME-CUE": "Just so you know, I've only got a couple of minutes before my next call.",
     "L-EXIT": (
@@ -81,6 +97,20 @@ LINES: dict[str, str] = {
         "This is Christy, your interviewer. If you want to end the interview now, please say: end "
         "the interview. Otherwise, just carry on with {lead_name}."
     ),
+    # Owner and manager decisions of 2026-11-03 (M2): leaving the role-play is the candidate's
+    # choice.  From R = 14:00 the interviewer may OFFER to wrap up (R paused, at most twice, never
+    # over a question or a pitch); a yes leads to L-EXIT and the wrap-up, a no gets
+    # L-ASIDE-WRAP-RESUME and the role-play goes on.  Like L-ASIDE-END it is not an either/or
+    # question, so a bare "yes" says which option it means.
+    "L-ASIDE-WRAP": (
+        "This is Christy, your interviewer, stepping in for a moment. We're well into the "
+        "role-play now, so would you like to wrap it up here? If you'd rather keep going, just "
+        "carry on with {lead_first_name}."
+    ),
+    "L-ASIDE-WRAP-RESUME": "Of course, let's keep going. {lead_first_name} is back on the line.",
+    # M2: the end of the role-play's time (R = 20:00, or its S cap) is never abrupt: after the
+    # 17:00 time cue, the learner closes in role with this line, and then L-EXIT follows.
+    "L-TIME-UP": "I'm sorry, I really have to go now. Thank you for your time.",
     "L-MUTE": (
         "This is Christy. It looks like your microphone may be muted. Please unmute when "
         "you're ready."
