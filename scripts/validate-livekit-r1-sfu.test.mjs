@@ -31,7 +31,8 @@ const fixture = (mutate = {}) => {
   ok(/autostop=all-services autostart=7880-only min_machines_running=0/.test(result.output), "pass result must surface the per-service on-demand posture (M025)");
 }
 
-const goodToml = readFileSync(path.join(source, "fly.toml"), "utf8");
+// LF-normalized so the M025 per-service mutations also apply to a CRLF checkout (core.autocrlf=true).
+const goodToml = readFileSync(path.join(source, "fly.toml"), "utf8").replace(/\r\n/g, "\n");
 const goodDockerfile = readFileSync(path.join(source, "Dockerfile"), "utf8");
 const goodTemplate = readFileSync(path.join(source, "livekit.yaml.tmpl"), "utf8");
 const readme = readFileSync(path.join(source, "README.md"), "utf8");
@@ -75,6 +76,13 @@ ok(/≥98%/.test(results) && /≥90%/.test(results) && /≤200ms/.test(results) 
 // The UDP service's own table (its header through the first sub-table), for the M025 per-service cases.
 const udpHead = goodToml.match(/\[\[services\]\]\n  protocol = "udp"[\s\S]*?(?=\n  \[\[services\.ports\]\])/)?.[0] ?? "";
 ok(udpHead.includes('auto_stop_machines = "stop"') && udpHead.includes("auto_start_machines = false"), "test setup: the UDP service table must be found in fly.toml");
+{
+  // A CRLF checkout of the good config must still pass the per-service rules (M025).
+  const dir = fixture({ "fly.toml": goodToml.replace(/\n/g, "\r\n") });
+  const result = run(path.join(dir, "fly.toml"));
+  ok(result.code === 0, `CRLF copy of the real SFU config must pass:\n${result.output}`);
+  rmSync(dir, { recursive: true, force: true });
+}
 const cases = [
   ["wrong region", { "fly.toml": goodToml.replace('primary_region = "sin"', 'primary_region = "bom"') }, /DEPRECATED/],
   ["Cloud host", { "fly.toml": `${goodToml}\n# test-v87uzexo.livekit.cloud\n` }, /LiveKit Cloud/],
@@ -111,6 +119,7 @@ const cases = [
   ["7882 autostop moved under its ports table", { "fly.toml": goodToml.replace(udpHead, udpHead.replace('  auto_stop_machines = "stop"\n', "")).replace("    port = 7882", '    port = 7882\n    auto_stop_machines = "stop"') }, /every SFU service must set auto_stop_machines/],
   ["7882 wakes the Machine", { "fly.toml": goodToml.replace(udpHead, udpHead.replace("auto_start_machines = false", "auto_start_machines = true")) }, /only the 7880 signaling service may auto-start/],
   ["7881 wakes the Machine", { "fly.toml": goodToml.replace("auto_start_machines = false # M025", "auto_start_machines = true # M025") }, /only the 7880 signaling service may auto-start/],
+  ["CRLF copy without 7882 autostop", { "fly.toml": goodToml.replace(udpHead, udpHead.replace('  auto_stop_machines = "stop"\n', "")).replace(/\n/g, "\r\n") }, /every SFU service must set auto_stop_machines/],
   ["7880 cannot wake the Machine", { "fly.toml": goodToml.replace("auto_start_machines = true # The only wake path", "auto_start_machines = false # The only wake path") }, /only the 7880 signaling service may auto-start/],
 ];
 for (const [label, mutation, expected] of cases) {

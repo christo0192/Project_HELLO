@@ -165,7 +165,7 @@ Deploying changes the Machine, so do it with zero live rooms.
 ```sh
 fly machines list -a project-hello-r1-rtc-spike --json | node infra/livekit-r1/preflight.mjs
 fly deploy infra/livekit-r1 --ha=false --remote-only -a project-hello-r1-rtc-spike   # still Config B
-fly secrets set -a project-hello-r1-rtc-spike LIVEKIT_R1_CONFIG=C                    # restarts the Machine
+fly secrets set -a project-hello-r1-rtc-spike LIVEKIT_R1_CONFIG=C                    # restarts the Machine if running; a stopped one applies it at next start
 ```
 
 Roll back with `fly secrets set -a project-hello-r1-rtc-spike LIVEKIT_R1_CONFIG=B`.
