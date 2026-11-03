@@ -28,6 +28,7 @@ const fixture = (mutate = {}) => {
   ok(result.code === 0, `real SFU config must pass:\n${result.output}`);
   ok(/external_services=443,80,7881,7882 udp_mux=7882/.test(result.output), "pass result must surface the external port contract");
   ok(/vm=performance-4x\/8192 signaling=300\/600/.test(result.output), "pass result must surface the VM size (headroom for 25 rooms) and signaling limits");
+  ok(/autostop=all-services autostart=7880-only min_machines_running=0/.test(result.output), "pass result must surface the per-service on-demand posture (M025)");
 }
 
 const goodToml = readFileSync(path.join(source, "fly.toml"), "utf8");
@@ -71,6 +72,9 @@ ok(spikeTools.every((tool) => /assertSpikeUrl|assert_spike_url/.test(tool)) && /
 ok(spikeTools.every((tool) => !/\b(?:R1_)?SPIKE_HOST\b|\bLIVEKIT_HOST\b/.test(tool)), "no spike tool may reference an environment override for the host");
 ok(!/(?:browser-screener|phone-screener)/.test(echo), "echo worker must never use a production agent name");
 ok(/≥98%/.test(results) && /≥90%/.test(results) && /≤200ms/.test(results) && /≥12fps/.test(results) && /NO-GO/.test(results), "results template must preserve v2 S0-F pass thresholds and kill switch");
+// The UDP service's own table (its header through the first sub-table), for the M025 per-service cases.
+const udpHead = goodToml.match(/\[\[services\]\]\n  protocol = "udp"[\s\S]*?(?=\n  \[\[services\.ports\]\])/)?.[0] ?? "";
+ok(udpHead.includes('auto_stop_machines = "stop"') && udpHead.includes("auto_start_machines = false"), "test setup: the UDP service table must be found in fly.toml");
 const cases = [
   ["wrong region", { "fly.toml": goodToml.replace('primary_region = "sin"', 'primary_region = "bom"') }, /DEPRECATED/],
   ["Cloud host", { "fly.toml": `${goodToml}\n# test-v87uzexo.livekit.cloud\n` }, /LiveKit Cloud/],
@@ -97,6 +101,17 @@ const cases = [
   ["interface-table seam allowed on Fly", { "entrypoint.sh": entrypoint.replace('die "LIVEKIT_R1_IF_INET6_FILE is forbidden on Fly"', "true") }, /interface-table test seam/],
   ["Config C accepts any selector", { "entrypoint.sh": entrypoint.replace("A | B | C) ;;", "A | B | C | D) ;;") }, /exactly A, B and C/],
   ["port range bypasses the UDP mux", { "livekit.yaml.tmpl": goodTemplate.replace("  udp_port: 7882", "  udp_port: 7882\n  port_range_start: 50000") }, /port_range/],
+  // M025: Fly autostops a Machine only when EVERY service allows it (the 2026-10 always-on SFU), and only
+  // 7880 signaling may wake it. Each case removes or flips exactly one service's setting.
+  ["7881 autostop missing", { "fly.toml": goodToml.replace(/^  auto_stop_machines = "stop" # M025: see the 7882 note.*\n/m, "") }, /every SFU service must set auto_stop_machines/],
+  ["7882 autostop missing", { "fly.toml": goodToml.replace(udpHead, udpHead.replace('  auto_stop_machines = "stop"\n', "")) }, /every SFU service must set auto_stop_machines/],
+  ["7880 autostop missing", { "fly.toml": goodToml.replace(/^  auto_stop_machines = "stop" # v2 D16.*\n/m, "") }, /every SFU service must set auto_stop_machines/],
+  ["7882 suspend instead of stop", { "fly.toml": goodToml.replace(udpHead, udpHead.replace('auto_stop_machines = "stop"', 'auto_stop_machines = "suspend"')) }, /every SFU service must set auto_stop_machines/],
+  ["7881 keeps a minimum machine", { "fly.toml": goodToml.replace(/(auto_start_machines = false # M025[^\n]*\n  )min_machines_running = 0/, "$1min_machines_running = 1") }, /every SFU service must set auto_stop_machines/],
+  ["7882 autostop moved under its ports table", { "fly.toml": goodToml.replace(udpHead, udpHead.replace('  auto_stop_machines = "stop"\n', "")).replace("    port = 7882", '    port = 7882\n    auto_stop_machines = "stop"') }, /every SFU service must set auto_stop_machines/],
+  ["7882 wakes the Machine", { "fly.toml": goodToml.replace(udpHead, udpHead.replace("auto_start_machines = false", "auto_start_machines = true")) }, /only the 7880 signaling service may auto-start/],
+  ["7881 wakes the Machine", { "fly.toml": goodToml.replace("auto_start_machines = false # M025", "auto_start_machines = true # M025") }, /only the 7880 signaling service may auto-start/],
+  ["7880 cannot wake the Machine", { "fly.toml": goodToml.replace("auto_start_machines = true # The only wake path", "auto_start_machines = false # The only wake path") }, /only the 7880 signaling service may auto-start/],
 ];
 for (const [label, mutation, expected] of cases) {
   const dir = fixture(mutation);

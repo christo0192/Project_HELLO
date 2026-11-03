@@ -217,6 +217,12 @@ NODE_IP=203.0.113.10 LIVEKIT_KEYS="r1-local:$(printf 'a%.0s' $(seq 40))" LIVEKIT
 
 - 6PN media bypasses Fly's proxy, so only the public WSS signaling connections
   keep the Machine from autostopping. They exist for every session already.
+- Autostop needs `auto_stop_machines = "stop"` on ALL three services (M025,
+  2026-11-03). With it on 7880 alone, Fly never stopped the Machine, and it
+  ran 24/7 from 2026-10-08. Only 7880 sets `auto_start_machines = true`; 7881
+  and 7882 must not wake it. `scripts/validate-livekit-r1-sfu.mjs` enforces
+  this, and `docs/runbooks/r1-operations.md` ("On-demand SFU: idle stop and
+  wake (M025)") has the evidence and the post-deploy check.
 - Browsers see an unroutable `fdaa:` candidate: one extra failed ICE pair, and
   the SFU's internal 6PN address appears in their SDP.
 - Config C depends on the worker and the SFU sharing a Fly 6PN. Moving either

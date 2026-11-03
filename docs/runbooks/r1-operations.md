@@ -867,6 +867,89 @@ candidate network data. Deploys, upgrades, cert changes, and secret changes
 are manual, require zero live R1 rooms, and are followed by health, UDP-pair,
 worker-registration, and browser smoke checks. (implemented in PR-SFU-2)
 
+### On-demand SFU: idle stop and wake (M025)
+
+The SFU runs only while R1 is in use. Fly's proxy stops the Machine a few minutes
+after its last connection closes. The next signaling request on 443 starts it again:
+the API's `CreateRoom`, a candidate join or a worker registration.
+
+**Why every service carries the settings.** Fly stops a Machine only when autostop is
+set on EVERY one of its services. Until M025 only the 7880 signaling service had it.
+The SFU therefore never stopped: it ran 24/7 from 2026-10-08, at about $167 a month at
+performance-4x, while it hosted 5 interviews in 11 days (0.47% of the time).
+`infra/livekit-r1/fly.toml` now sets `auto_stop_machines = "stop"` and
+`min_machines_running = 0` on all three services. `auto_start_machines` is `true` on
+7880 only. ICE/TCP 7881 and UDP 7882 never start the Machine: media always follows a
+7880 signaling connection, and internet scanners probing those ports cannot wake it.
+`scripts/validate-livekit-r1-sfu.mjs` fails any config that drops the setting from a
+service, or puts it under a sub-table where TOML would not apply it.
+
+**What keeps it running.** Open WSS signaling connections through the proxy: the
+candidate, the worker's room connection and every running browser worker's
+registration.
+
+- Health checks and the private metrics scrape do not count: the clone stopped with both
+  running.
+- UDP and 6PN media (Config C) are not proxy connections: Fly reports proxy concurrency
+  only for the two TCP services. The WSS signaling that always accompanies media is what
+  holds the Machine.
+
+A Machine that should be idle but stays `started` usually has a running browser worker
+(`fly machine list -a project-hello-voice`) or a client still connected. It does not
+mean the setting is missing; the validator guards the setting.
+
+**Cold start.** The first request after a stop waits about 11 s; the clone measured
+11.4 s. Fly needs about 7-9 s to start a stopped performance-4x Machine, and its proxy may
+time out and retry its first wake call to the Machines API (`could not wake up machine due to a
+timeout requesting from the machines API` in `fly logs`). LiveKit then serves within a second.
+Nothing breaks:
+
+- The API's LiveKit client waits up to 60 s (`livekit-server-sdk` default), so `CreateRoom`
+  simply takes longer.
+- The first SFU request in a candidate's visit is usually the 10-second A/V check
+  (`POST /api/r1/preflight` creates a disposable room), so that response takes about 10 s
+  longer. The exchange that follows normally finds the SFU awake. If the candidate waits
+  more than a few minutes first, the wake happens inside the first exchange call instead.
+  That is before the join page's "preparing" polls begin (12 polls 3 s apart, counted, not
+  timed), so it does not eat the worker's boot budget.
+- If a wake fails outright, the exchange answers 503 `r1_room_unavailable`. The join page
+  shows "temporarily unavailable" with Try again (`R1JoinPage.tsx`), and the next exchange
+  re-creates the room. A room lost to a stop between exchanges is re-created the same way;
+  rooms already lapse after 180 s empty.
+
+**Verify after any SFU deploy** (the deploy itself starts the Machine):
+
+1. Wait about 10 minutes with no R1 interview live. Run
+   `fly machine list -a project-hello-r1-rtc-spike`; the state must be `stopped`.
+   `fly machine status <id> -a project-hello-r1-rtc-spike` shows the stop event.
+2. Wake it with a real join: a staff test interview, or the room-and-token check in
+   "Clone and cold-start evidence" below. The first request wakes the Machine. Audio and
+   video must flow, and the selected ICE pair must be UDP to the dedicated IPv4 on 7882.
+3. After everyone leaves, the Machine must return to `stopped` within about 10 minutes.
+
+**Clone and cold-start evidence (2026-11-03).** The production SFU image
+(`deployment-01M5M9Z2MPMW9WAKC9WYNARR7Y`) was deployed with this `fly.toml` to a throwaway
+app (`project-hello-r1-rtc-autostop-test`). It used its own dedicated IPv4, `LIVEKIT_R1_CONFIG=C`,
+performance-4x / 8 GB, `--ha=false`. The app was destroyed and its IPv4 released afterwards.
+
+| Check | Result |
+|---|---|
+| Fly accepts the settings on all three services, UDP included | yes: `autostop` true on 7880/7881/7882, `autostart` true on 7880 only |
+| Idle stop after boot, no traffic | stopped about 8 min after boot (`stop` event, `source=proxy`) |
+| Raw TCP connects to 7881 and UDP datagrams to 7882 while stopped | stayed `stopped` (no scanner wakes) |
+| Cold wake: `CreateRoom` over Twirp while stopped | 11.4 s, first attempt, no error to the client |
+| First join after the wake (two participants) | both joined in 2.9 s |
+| 16 min of 48 kHz audio plus 640x360 at 15 fps video | 0 stalls; about 100 audio and 15-16 video frames a second throughout |
+| Selected ICE pair | UDP host candidate on the dedicated IPv4, port 7882, `succeeded` for the whole session |
+| Machine during the session | stayed `started` (no stop with WSS signaling open) |
+| Re-stop after both left | stopped 7.4 min later (`source=proxy`) |
+
+The harness used the LiveKit Python SDK (`livekit` 1.2.0), with two participants publishing
+and subscribing from a laptop. One 30-second window showed fewer video frames: the laptop's
+own receive queue overflowed (a client warning), and audio was unaffected. The same check
+can be repeated against production: create a room and mint tokens with the API's
+`R1_LIVEKIT_*` values inside the API Machine, so the secret never leaves Fly.
+
 ### Browser readiness contract (PR-LK-liveness)
 
 The production Cloud browser worker is already a named, orchestrated worker
@@ -2595,7 +2678,11 @@ stagger the joins. Real candidates join from their own networks.
 
 - Worker: about 35 minutes of performance-4x in `sin` (about $0.23 an hour), so about $0.13 per
   interview; 15 at once is about $3.45 an hour.
-- SFU at performance-4x: about $165-170 a month while it runs (it auto-stops when idle).
+- SFU at performance-4x: about $0.23 an hour while it runs, which is $165-170 a month if it
+  never stops. Since M025 (2026-11-03) it stops a few minutes after the last connection
+  closes, so it costs roughly interview hours plus a short idle tail (for example, 60 hours of
+  use a month is about $14). Until M025 it never stopped (autostop was on 1 of its 3
+  services); see "On-demand SFU: idle stop and wake (M025)".
 - Stopped pool: disk only, $0.15 per GB per month (about $8.10 a month for 18 machines at 3 GB).
 - Bandwidth: cents per interview (Asia-Pacific egress $0.04 per GB). DeepSeek scoring and Sarvam
   usage per interview are as today; the Sarvam plan upgrade is the step change.
