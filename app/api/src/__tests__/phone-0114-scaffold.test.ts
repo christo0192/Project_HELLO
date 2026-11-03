@@ -90,11 +90,14 @@ describe('0114 registration', () => {
     // and the M017 Ashby phone-parsing intake migration may follow, and those
     // two are the newest NON-R1 files, in that order (a later R1 migration,
     // e.g. 0126, may sit between or after them).
+    // 0132-style fleet-cap migrations (`_phone_fleet_daily_cap_<n>.sql`) may follow too, and are
+    // set aside like R1 ones: they redeclare only phone_max_daily_dials(), a constant no extractor
+    // reads (phone-0132-daily-cap.test.ts pins that).
     const after = files.slice(files.indexOf('0114_phone_outcome_integrity.sql') + 1);
     expect(
-      after.every((f) => /_r1_|_phone_recording_integrity\.sql$|_ashby_phone_parsing_intake\.sql$/.test(f)),
+      after.every((f) => /_r1_|_phone_recording_integrity\.sql$|_ashby_phone_parsing_intake\.sql$|_phone_fleet_daily_cap_\d+\.sql$/.test(f)),
     ).toBe(true);
-    const nonR1 = files.filter((f) => !/_r1_/.test(f));
+    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$/.test(f));
     expect(nonR1[nonR1.length - 2]).toMatch(/_phone_recording_integrity\.sql$/);
     expect(nonR1[nonR1.length - 1]).toMatch(/_ashby_phone_parsing_intake\.sql$/);
   });

@@ -74,9 +74,11 @@ describe(`${N} registration`, () => {
     // Same relaxation #329 applied to 0113 and 0114: R1-lane migrations (`_r1_` in the name, e.g.
     // 0126's r1_settle_attempt / r1_transition_round) may follow it, and so may the M017 Ashby
     // phone-parsing intake migration (0130), which lifts nothing from 0125; nothing else may.
+    // 0132-style fleet-cap migrations (`_phone_fleet_daily_cap_<n>.sql`) may follow and are set
+    // aside like R1 ones: they redeclare only phone_max_daily_dials() (phone-0132-daily-cap.test.ts).
     const after = files.slice(files.indexOf(base) + 1);
-    expect(after.every((f) => /_r1_|_ashby_phone_parsing_intake\.sql$/.test(f))).toBe(true);
-    const nonR1 = files.filter((f) => !/_r1_/.test(f));
+    expect(after.every((f) => /_r1_|_ashby_phone_parsing_intake\.sql$|_phone_fleet_daily_cap_\d+\.sql$/.test(f))).toBe(true);
+    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$/.test(f));
     expect(nonR1[nonR1.length - 2]).toBe(base);
     expect(nonR1[nonR1.length - 1]).toMatch(/^0130_ashby_phone_parsing_intake\.sql$/);
   });
