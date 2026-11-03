@@ -9,6 +9,7 @@ import {
   auditEventsInWindow,
   countLinkedActiveAdmins,
   formatDateTime,
+  handoverSummary,
   isSelfEntry,
   isTerminalSessionStatus,
   maintenanceMeta,
@@ -169,5 +170,36 @@ describe('display helpers', () => {
     expect(shortId('00000000-0000-4000-8000-000000000001')).toMatch(/^.{13}…$/);
     expect(shortId(null)).toBe('—');
     expect(shortId('short')).toBe('short');
+  });
+});
+
+describe('0133 domain switch — handover copy and invalid_email wording', () => {
+  const ZERO = { roles: 0, candidates: 0, call_sessions: 0, ashby_job_mappings: 0, role_drafts: 0, interview_rounds: 0 };
+
+  it('lists only the non-zero counts, singular and plural, in a fixed order', () => {
+    expect(
+      handoverSummary({ ...ZERO, candidates: 1, roles: 2, ashby_job_mappings: 1 }, 'b@dexity.com'),
+    ).toBe('Handed over 1 candidate, 2 roles, 1 Ashby job to b@dexity.com.');
+    expect(
+      handoverSummary({ roles: 1, candidates: 4, call_sessions: 3, ashby_job_mappings: 2, role_drafts: 5, interview_rounds: 1 }, 'b@dexity.com'),
+    ).toBe('Handed over 4 candidates, 1 role, 3 calls, 1 R1 round, 2 Ashby jobs, 5 drafts to b@dexity.com.');
+  });
+
+  it('says so when there was nothing to move (a repeat handover)', () => {
+    expect(handoverSummary(ZERO, 'b@dexity.com')).toBe(
+      'Nothing to move — the old login owns no records.',
+    );
+  });
+
+  it('names both accepted domains in the invalid_email copy', () => {
+    const text = stableMutationMessage('invalid_email', 'fallback');
+    expect(text).toContain('@interviewkickstart.com');
+    expect(text).toContain('@dexity.com');
+  });
+
+  it('maps every handover refusal to stable copy, never the fallback', () => {
+    for (const code of ['same_entry', 'from_not_linked', 'to_not_linked', 'to_inactive']) {
+      expect(stableMutationMessage(code, 'fallback')).not.toBe('fallback');
+    }
   });
 });

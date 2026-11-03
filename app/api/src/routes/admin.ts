@@ -24,6 +24,7 @@ import {
 import { validateBody, validateParams, validateQuery } from '../lib/validation.js';
 import {
   adminAllowlistAddSchema,
+  adminAllowlistHandoverSchema,
   adminAllowlistIdParamSchema,
   adminAllowlistUpdateSchema,
   adminAuditListQuerySchema,
@@ -494,6 +495,75 @@ adminRouter.patch(
           return res.status(400).json({ error: 'no_changes' });
         default:
           return next(new Error('allowlist update failed'));
+      }
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
+/** Ownership tables the 0133 handover RPC moves (keys of its `moved` counts). */
+const HANDOVER_TABLES = [
+  'roles',
+  'candidates',
+  'call_sessions',
+  'ashby_job_mappings',
+  'role_drafts',
+  'interview_rounds',
+] as const;
+
+/**
+ * POST /api/admin/allowlist/:id/handover
+ * Move the records OWNED by entry :id's login (roles, candidates, call
+ * sessions, Ashby job mappings, settled Ask-Hello drafts, and the R1 rounds
+ * it sent — interview_rounds.created_by is R1's owner) to the login of
+ * `to_entry_id`, via the atomic handover_allowlist_records RPC (0133; audit
+ * row in the same transaction, email digests only). For a person who comes
+ * back on the new company domain as a brand-new login. Audit/history
+ * columns are never rewritten. Idempotent: a repeat moves zero rows.
+ * Stable statuses: 200 ok (+moved counts), 400 same_entry, 404 not_found,
+ * 409 from_not_linked / to_not_linked / to_inactive.
+ */
+adminRouter.post(
+  '/allowlist/:id/handover',
+  validateParams(adminAllowlistIdParamSchema),
+  validateBody(adminAllowlistHandoverSchema),
+  async (req, res, next) => {
+    try {
+      const { data, error } = await supabase.rpc('handover_allowlist_records', {
+        p_from_entry_id: req.params.id as string,
+        p_to_entry_id: req.body.to_entry_id,
+        p_actor_id: req.authUser?.id ?? null,
+      });
+      if (error) return next(new Error('failed to hand over records'));
+
+      const record = data as { status?: string; moved?: Record<string, unknown> } | null;
+      switch (record?.status) {
+        case 'ok': {
+          // Rebuild the counts from the known table list so nothing else the
+          // RPC might return is echoed, and a malformed count fails closed.
+          const moved: Record<string, number> = {};
+          for (const table of HANDOVER_TABLES) {
+            const n = record.moved?.[table];
+            if (typeof n !== 'number' || !Number.isInteger(n) || n < 0) {
+              return next(new Error('handover returned malformed counts'));
+            }
+            moved[table] = n;
+          }
+          return res.json({ ok: true, moved });
+        }
+        case 'same_entry':
+          return res.status(400).json({ error: 'same_entry' });
+        case 'not_found':
+          return res.status(404).json({ error: 'not_found' });
+        case 'from_not_linked':
+          return res.status(409).json({ error: 'from_not_linked' });
+        case 'to_not_linked':
+          return res.status(409).json({ error: 'to_not_linked' });
+        case 'to_inactive':
+          return res.status(409).json({ error: 'to_inactive' });
+        default:
+          return next(new Error('handover failed'));
       }
     } catch (error) {
       next(error);

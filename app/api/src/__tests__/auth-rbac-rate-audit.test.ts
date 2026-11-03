@@ -22,7 +22,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import request from 'supertest';
 import { createApp } from '../app.js';
-import { mockAuthGetUser, normalizeEmailForAccess, type AuthUser, type TokenVerifier } from '../lib/auth.js';
+import { ALLOWED_ACCESS_DOMAINS, mockAuthGetUser, normalizeEmailForAccess, type AuthUser, type TokenVerifier } from '../lib/auth.js';
 import { MemoryRateLimitStore, setRateLimitStore } from '../lib/rate-limit.js';
 import { setAuditSink, minimizeIp } from '../lib/audit.js';
 
@@ -1007,6 +1007,28 @@ describe('normalizeEmailForAccess — strict ASCII company-email gate', () => {
   it('rejects non-string input', () => {
     expect(normalizeEmailForAccess(null as unknown as string)).toBeNull();
     expect(normalizeEmailForAccess(undefined as unknown as string)).toBeNull();
+  });
+
+  // 0133 — the company domain switch. Both domains are accepted exactly; the
+  // new one gets the same near-miss treatment as the old.
+  it('accepts the new company domain dexity.com, normalized the same way', () => {
+    expect(normalizeEmailForAccess('christo.b@dexity.com')).toBe('christo.b@dexity.com');
+    expect(normalizeEmailForAccess('  Christo.B@Dexity.COM ')).toBe('christo.b@dexity.com');
+    expect(normalizeEmailForAccess('Christo B <christo.b@dexity.com>')).toBe('christo.b@dexity.com');
+  });
+
+  it('rejects subdomain, suffix and lookalike tricks on dexity.com', () => {
+    expect(normalizeEmailForAccess('a@mail.dexity.com')).toBeNull();
+    expect(normalizeEmailForAccess('a@dexity.com.evil.test')).toBeNull();
+    expect(normalizeEmailForAccess('a@notdexity.com')).toBeNull();
+    expect(normalizeEmailForAccess('a@dexity.co')).toBeNull();
+    expect(normalizeEmailForAccess('a@dexity.com@extra')).toBeNull();
+    expect(normalizeEmailForAccess('a@dеxity.com')).toBeNull(); // Cyrillic е
+  });
+
+  it('pins the accepted set to exactly the two company domains', () => {
+    expect([...ALLOWED_ACCESS_DOMAINS]).toEqual(['interviewkickstart.com', 'dexity.com']);
+    expect(Object.isFrozen(ALLOWED_ACCESS_DOMAINS)).toBe(true);
   });
 });
 

@@ -16,9 +16,10 @@ boundaries.
 - **Normalization** (strict, identical in the API and the DB RPC):
   trim whitespace → reject any non-ASCII printable character (unicode
   lookalikes) → lowercase → strip a `Display Name <email>` wrapper →
-  require **exactly one `@`** → require the **exact** domain
-  `interviewkickstart.com` (no subdomains, no suffix tricks). Anything else
-  is a denial.
+  require **exactly one `@`** → require one of the **exact** domains
+  `interviewkickstart.com` or `dexity.com` (no subdomains, no suffix tricks;
+  `dexity.com` added by migration 0133 for the company domain switch).
+  Anything else is a denial.
 - **Denials are uniform**: every failure path (wrong domain, not allowlisted,
   disabled entry, missing entry, relink attempt, unverified email) returns
   the identical generic 403
@@ -34,7 +35,7 @@ boundaries.
 |--------|---------|
 | `id` | opaque uuid |
 | `email` | canonical ASCII display form (normalized) |
-| `email_normalized` | canonical key — lowercase ASCII, exactly one `@`, exact company domain; **UNIQUE** |
+| `email_normalized` | canonical key — lowercase ASCII, exactly one `@`, exact company domain (`interviewkickstart.com` or `dexity.com`); **UNIQUE** |
 | `role` | `admin` / `interviewer` / `viewer` (CHECK) |
 | `active` | entry enabled; default `true` |
 | `linked_user_id` | nullable **UNIQUE** auth.users id — set atomically on first verified login |
@@ -68,6 +69,23 @@ pg_catalog, screening_v2`, service-role-only). The RPC:
    membership row never grants access.
 6. Audits the link **once** (`allowlist_linked`) with an email **SHA-256
    digest** in metadata — the full email never reaches audit metadata.
+7. **Same-login continuity (0133).** If this login is already linked to an
+   **active** entry under another accepted address AND the presented address
+   is the verified email of this login's **Google identity**
+   (`auth.identities`, provider `google`), the person is carried over:
+   - no entry for the new address: the entry moves to it (`allowlist_linked`,
+     `change: email_updated`);
+   - an admin had pre-added the new address: the link moves to that entry,
+     the new entry's role applies, and the old entry is **disabled, unlinked
+     and demoted to viewer** so a recycled old address can never inherit
+     access (`change: link_moved`). A move never leaves zero linked active
+     admins: if the old entry was the last one, the new entry keeps admin
+     (`role_kept_admin`).
+
+   The Google-identity proof matters: a user can change their own Supabase
+   email through the public Auth API, but not the email Google reports for
+   their Workspace account. Without the proof, a disabled old entry, or a
+   non-company address, the answer is the same uniform 403.
 
 Consequences:
 
@@ -92,6 +110,7 @@ Consequences:
 | `GET /api/admin/allowlist` | list entries (id, email, role, active, linked_user_id, linked_at) | 200, 403 |
 | `POST /api/admin/allowlist` | add email + role (server-side normalization; new entries **active**) | 201, 400 `invalid_email`/`invalid_role`, 409 `duplicate` |
 | `PATCH /api/admin/allowlist/:id` | change role/active (disable/demote) | 200, 400 `invalid_role`/`no_changes`, 404 `not_found`, 409 `self_modification_denied`/`last_linked_active_admin` |
+| `POST /api/admin/allowlist/:id/handover` | move the records owned by entry `:id`'s login to `to_entry_id`'s login (0133) | 200 (+ per-table counts), 400 `same_entry`, 404 `not_found`, 409 `from_not_linked`/`to_not_linked`/`to_inactive` |
 
 - **Add**: `add_allowlist_entry` normalizes identically to the resolver.
   Duplicate case/whitespace variants conflict via the unique normalized
@@ -144,6 +163,73 @@ remains. Pending admins (emails added but never signed in) do **not** count.
 An admin cannot disable or demote their own linked entry (409
 `self_modification_denied`). A second active linked admin must perform the
 change.
+
+### Company domain switch to `@dexity.com` (0133)
+
+Both domains are accepted until the old one is dropped in a follow-up
+migration. What to do depends on how IT moves each person:
+
+- **Same Google account, renamed** (the Workspace primary domain changes).
+  Nothing to do: they keep their role and everything they own. Two cases:
+  - Supabase keeps reporting the OLD address for the login (it may only
+    refresh the Google identity's data, not `auth.users.email`): the old
+    entry keeps matching, access is unchanged, and the Access list keeps
+    showing the old address.
+  - Supabase reports the NEW address: the resolver moves the entry to it,
+    because the login's Google identity now carries that verified address.
+
+  Do **not** pre-add the new address "just in case": it works (the link
+  moves and the old entry is retired), but the role then comes from the new
+  entry.
+- **Brand-new account** (fresh `@dexity.com` login). Add the new address in
+  Mission Control → Access with the right role, ask the person to sign in
+  once, then use **Hand over a person's records** (old login → new login).
+  That moves `owner_id` on roles, candidates, call sessions, Ashby job
+  mappings and settled Ask-Hello drafts, plus `created_by` on the R1 rounds
+  they sent (R1 uses it as the round's owner). The audit log is not
+  rewritten. Then disable the old entry. Notes:
+  - Run it when no call or interview is live. It updates the candidate and
+    call-session rows the workers also lock, and gives up after 5 s of lock
+    waiting rather than stall live traffic (retry when quiet).
+  - Repeating it is harmless (it reports zeros). Re-run it once in-flight
+    Ashby imports have drained: an import already running when you hand
+    over still lands on the old login.
+  - A running Ask-Hello draft stays with the old login; it settles in
+    minutes, and a re-run moves it.
+  - **Do not delete the old login's Supabase user before the handover.**
+    `owner_id` is `on delete set null`: the records would be orphaned and
+    the handover would have nothing to move from.
+- **Before IT deletes the old Workspace accounts**, make sure at least one
+  admin has signed in on `@dexity.com` and shows as linked; the
+  last-linked-admin guard counts only linked admins.
+- **Ops outside this repo (verify before the cutover):**
+  - if the new accounts live in a different Google Workspace, the Google
+    OAuth client used by Supabase must allow them (an "Internal" consent
+    screen admits only its own Workspace);
+  - production must keep allowing first-time Google sign-in, or brand-new
+    logins can never link;
+  - production Supabase Auth must keep **Confirm email** and **Secure email
+    change** ON and **manual identity linking** OFF. Continuity trusts the
+    Google identity (a company Workspace account: Google's `hd` claim must
+    be an accepted domain); the plain first-login link (unchanged since
+    0016) trusts that Supabase only accepts an email change its owner
+    confirmed;
+  - the resolver is the first code to read `auth.identities`. Confirm once
+    in the production SQL editor that
+    `select has_table_privilege('postgres', 'auth.identities', 'select');`
+    returns `true`. If it does not, continuity fails closed (renamed people
+    keep working only while their old address is accepted);
+  - IT must **never recycle** an old `@interviewkickstart.com` address to a
+    different person: a login that kept the old address would hand that
+    person its access.
+- **Dropping `interviewkickstart.com` later** needs a new migration (narrow
+  `is_access_email_domain` and `chk_email_allowlist_normalized` after the old
+  rows are disabled or renamed) plus the API `ALLOWED_ACCESS_DOMAINS` and web
+  `ALLOWED_EMAIL_DOMAINS` lists; `access-domain-0133-migration.test.ts` pins
+  the four lists equal. Before it, check the Access list for renamed people
+  still showing an old address (the first case above): dropping the domain
+  would lock them out until their login's email is updated (Supabase admin
+  API) or the resolver is taught to use the Google identity's address.
 
 ## 6. Failure modes
 

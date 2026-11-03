@@ -22790,6 +22790,383 @@ drop function _policy_tests.p130_fixture(text, boolean, text, text, boolean, tex
 drop function _policy_tests.p130_teardown(text);
 -- ==== 0130 END ====
 
+-- ==== 0133 BEGIN — dexity.com access domain, login continuity, handover ====
+-- Executes the real 0133 RPCs against the fully migrated schema. Synthetic
+-- ids use the 01330000- prefix; everything except the append-only audit rows
+-- is deleted at the end (auth.identities cascade with auth.users).
+--
+-- SNAPSHOT RULE: every RPC that WRITES is called in its own statement
+-- (`v := ...`) BEFORE the assertion that reads the rows. A subselect in the
+-- same statement as the write sees the pre-write snapshot and would pass
+-- whatever the RPC did.
+--
+--   U1 old login (a.one@interviewkickstart.com)   handover source
+--   U2 new login (b.one@dexity.com)               handover target; also tries
+--                                                 email-change attacks
+--   U3 renamed login (c.three@ -> @dexity.com)    email_updated, Google-proven
+--   U4 renamed login, admin pre-added new address link_moved, Google-proven
+--   U5 disabled login, renamed                    continuity denied (both paths)
+--   U6 stranger with no entry                     denied
+--   U7 granted login, Google proof for ANOTHER address  continuity denied
+--   U8 last linked admin moving to a viewer entry keeps admin
+--   U9 granted login whose matching Google identity is a PERSONAL (no hd,
+--      "unmanaged") account                           continuity denied
+insert into auth.users (
+  instance_id, id, aud, role, email, encrypted_password,
+  email_confirmed_at, raw_app_meta_data, raw_user_meta_data,
+  created_at, updated_at
+)
+select '00000000-0000-0000-0000-000000000000', u.id, 'authenticated', 'authenticated',
+       u.email, '', now(), '{}', '{}', now(), now()
+  from (values
+    ('01330000-0000-4000-a000-000000000001'::uuid, 'a.one@interviewkickstart.com'),
+    ('01330000-0000-4000-a000-000000000002'::uuid, 'b.one@dexity.com'),
+    ('01330000-0000-4000-a000-000000000003'::uuid, 'c.three@dexity.com'),
+    ('01330000-0000-4000-a000-000000000004'::uuid, 'e.four@dexity.com'),
+    ('01330000-0000-4000-a000-000000000005'::uuid, 'd.five@dexity.com'),
+    ('01330000-0000-4000-a000-000000000006'::uuid, 'z.six@dexity.com'),
+    ('01330000-0000-4000-a000-000000000007'::uuid, 'f.seven@dexity.com'),
+    ('01330000-0000-4000-a000-000000000008'::uuid, 'g.eight@dexity.com'),
+    ('01330000-0000-4000-a000-000000000009'::uuid, 'h.nine@dexity.com')
+  ) as u(id, email)
+on conflict (id) do nothing;
+
+-- Google identities, as Supabase writes them from Google's sign-in: a
+-- Workspace account carries Google's hosted-domain claim in custom_claims.hd
+-- (here the OLD primary domain, as for an account renamed inside the same
+-- Workspace). U7's identity carries a DIFFERENT address; U9's is a personal
+-- Google account (no hd) that happens to use the company address.
+insert into auth.identities (
+  id, provider_id, user_id, identity_data, provider, last_sign_in_at, created_at, updated_at
+)
+select gen_random_uuid(), x.sub, x.uid,
+       jsonb_build_object('sub', x.sub, 'email', x.email, 'email_verified', true)
+         || case when x.hd is null then '{}'::jsonb
+                 else jsonb_build_object('custom_claims', jsonb_build_object('hd', x.hd)) end,
+       'google', now(), now(), now()
+  from (values
+    ('01330000-0000-4000-a000-000000000003'::uuid, '0133-google-sub-3', 'c.three@dexity.com', 'interviewkickstart.com'),
+    ('01330000-0000-4000-a000-000000000004'::uuid, '0133-google-sub-4', 'e.four@dexity.com', 'dexity.com'),
+    ('01330000-0000-4000-a000-000000000005'::uuid, '0133-google-sub-5', 'd.five@dexity.com', 'dexity.com'),
+    ('01330000-0000-4000-a000-000000000007'::uuid, '0133-google-sub-7', 'someone.else@dexity.com', 'dexity.com'),
+    ('01330000-0000-4000-a000-000000000008'::uuid, '0133-google-sub-8', 'g.eight@dexity.com', 'dexity.com'),
+    ('01330000-0000-4000-a000-000000000009'::uuid, '0133-google-sub-9', 'h.nine@dexity.com', null)
+  ) as x(uid, sub, email, hd);
+
+do $$
+declare
+  c_actor constant uuid := '01330000-0000-4000-a000-0000000000aa';
+  c_u1 constant uuid := '01330000-0000-4000-a000-000000000001';
+  c_u2 constant uuid := '01330000-0000-4000-a000-000000000002';
+  c_u3 constant uuid := '01330000-0000-4000-a000-000000000003';
+  c_u4 constant uuid := '01330000-0000-4000-a000-000000000004';
+  c_u5 constant uuid := '01330000-0000-4000-a000-000000000005';
+  c_u6 constant uuid := '01330000-0000-4000-a000-000000000006';
+  c_u7 constant uuid := '01330000-0000-4000-a000-000000000007';
+  c_u8 constant uuid := '01330000-0000-4000-a000-000000000008';
+  c_u9 constant uuid := '01330000-0000-4000-a000-000000000009';
+  c_role constant uuid := '01330000-0000-4000-a000-000000000010';
+  c_cand constant uuid := '01330000-0000-4000-a000-000000000020';
+  c_round constant uuid := '01330000-0000-4000-a000-000000000030';
+  v jsonb;
+  v_a uuid; v_b uuid; v_c uuid; v_d uuid; v_d_new uuid; v_e_old uuid; v_e_new uuid;
+  v_f uuid; v_g_old uuid; v_g_new uuid; v_h uuid; v_boss uuid; v_pending uuid;
+  v_sess uuid; v_map uuid; v_draft_done uuid; v_draft_running uuid;
+  v_check_rejected boolean := false;
+begin
+  -- ── Domain acceptance (add path + CHECK) ────────────────────────────
+  v := screening_v2.add_allowlist_entry('B.One@Dexity.com', 'interviewer', c_actor);
+  perform _policy_tests.assert('0133: add_allowlist_entry accepts an exact @dexity.com address',
+    v->>'status' = 'ok', 'a dexity.com address must be addable');
+  v := screening_v2.add_allowlist_entry('a.one@interviewkickstart.com', 'interviewer', c_actor);
+  perform _policy_tests.assert('0133: add_allowlist_entry still accepts @interviewkickstart.com',
+    v->>'status' = 'ok', 'the old domain must stay addable during the transition');
+  perform _policy_tests.assert('0133: add_allowlist_entry refuses a dexity.com suffix trick',
+    (screening_v2.add_allowlist_entry('x@dexity.com.evil.test', 'viewer', c_actor))->>'status' = 'invalid_email',
+    'dexity.com.evil.test must be invalid_email');
+  perform _policy_tests.assert('0133: add_allowlist_entry refuses a dexity.com subdomain',
+    (screening_v2.add_allowlist_entry('x@mail.dexity.com', 'viewer', c_actor))->>'status' = 'invalid_email',
+    'mail.dexity.com must be invalid_email');
+  perform _policy_tests.assert('0133: add_allowlist_entry refuses a personal mailbox',
+    (screening_v2.add_allowlist_entry('x@gmail.com', 'viewer', c_actor))->>'status' = 'invalid_email',
+    'gmail.com must be invalid_email');
+  perform _policy_tests.assert('0133: refused adds created no rows',
+    not exists (select 1 from screening_v2.email_allowlist
+                 where email_normalized in ('x@dexity.com.evil.test', 'x@mail.dexity.com', 'x@gmail.com')),
+    'a refused add must not insert');
+
+  begin
+    insert into screening_v2.email_allowlist (email, email_normalized, role, active)
+    values ('x@gmail.com', 'x@gmail.com', 'viewer', true);
+  exception when check_violation then
+    v_check_rejected := true;
+  end;
+  perform _policy_tests.assert('0133: chk_email_allowlist_normalized rejects a non-company domain on direct insert',
+    v_check_rejected, 'the CHECK must still pin the accepted domains');
+
+  select id into v_a from screening_v2.email_allowlist where email_normalized = 'a.one@interviewkickstart.com';
+  select id into v_b from screening_v2.email_allowlist where email_normalized = 'b.one@dexity.com';
+
+  -- ── First logins: both domains link exactly as 0016 did ─────────────
+  v := screening_v2.resolve_allowlist_access(c_u1, 'a.one@interviewkickstart.com');
+  perform _policy_tests.assert('0133: first login with an old-domain address links (unchanged)',
+    v->>'status' = 'ok'
+    and (select linked_user_id from screening_v2.email_allowlist where id = v_a) = c_u1,
+    'old-domain first login must link');
+  v := screening_v2.resolve_allowlist_access(c_u2, 'b.one@dexity.com');
+  perform _policy_tests.assert('0133: first login with a dexity.com address links with the server-held role',
+    v->>'status' = 'ok' and v->>'role' = 'interviewer'
+    and (select linked_user_id from screening_v2.email_allowlist where id = v_b) = c_u2
+    and exists (select 1 from screening_v2.recruiter_memberships
+                 where user_id = c_u2 and role = 'interviewer' and active),
+    'dexity.com first login must link and create the membership');
+
+  -- ── Outcome A1: same login renamed, no new entry -> email_updated ───
+  perform screening_v2.add_allowlist_entry('c.three@interviewkickstart.com', 'admin', c_actor);
+  select id into v_c from screening_v2.email_allowlist where email_normalized = 'c.three@interviewkickstart.com';
+  perform screening_v2.resolve_allowlist_access(c_u3, 'c.three@interviewkickstart.com');
+  v := screening_v2.resolve_allowlist_access(c_u3, 'c.three@dexity.com');
+  perform _policy_tests.assert('0133: a granted login whose Google identity is now @dexity.com keeps access and role',
+    v->>'status' = 'ok' and v->>'role' = 'admin',
+    'renamed login must stay admin');
+  perform _policy_tests.assert('0133: email_updated moves the SAME entry to the new address, still linked',
+    (select email_normalized = 'c.three@dexity.com' and email = 'c.three@dexity.com'
+            and linked_user_id = c_u3 and active
+       from screening_v2.email_allowlist where id = v_c)
+    and not exists (select 1 from screening_v2.email_allowlist
+                     where email_normalized = 'c.three@interviewkickstart.com'),
+    'the entry must be renamed in place, not duplicated');
+  perform _policy_tests.assert('0133: email_updated is audited once with digests only',
+    (select count(*) from screening_v2.audit_events
+      where action = 'allowlist_linked' and target_id = v_c::text
+        and metadata->>'change' = 'email_updated'
+        and metadata->>'email_digest' = screening_v2.sha256_hex('c.three@dexity.com')
+        and metadata->>'previous_email_digest' = screening_v2.sha256_hex('c.three@interviewkickstart.com')
+        and metadata::text !~ '@') = 1,
+    'one email_updated audit row, no raw email');
+  v := screening_v2.resolve_allowlist_access(c_u3, 'c.three@dexity.com');
+  perform _policy_tests.assert('0133: the next request after email_updated is a plain ok with no new audit row',
+    v->>'status' = 'ok'
+    and (select count(*) from screening_v2.audit_events
+          where action = 'allowlist_linked' and target_id = v_c::text) = 2,
+    'expected exactly the first-link row and the email_updated row');
+
+  -- ── Continuity needs Google's proof, not just the Supabase email ────
+  perform screening_v2.add_allowlist_entry('f.seven@interviewkickstart.com', 'interviewer', c_actor);
+  select id into v_f from screening_v2.email_allowlist where email_normalized = 'f.seven@interviewkickstart.com';
+  perform screening_v2.resolve_allowlist_access(c_u7, 'f.seven@interviewkickstart.com');
+  v := screening_v2.resolve_allowlist_access(c_u7, 'f.seven@dexity.com');
+  perform _policy_tests.assert('0133: a self-changed Supabase email without a matching Google identity is denied (no rename)',
+    v->>'status' = 'denied'
+    and (select email_normalized = 'f.seven@interviewkickstart.com' and linked_user_id = c_u7
+           from screening_v2.email_allowlist where id = v_f),
+    'email_updated must require the Google identity to carry the new address');
+  perform screening_v2.add_allowlist_entry('h.nine@interviewkickstart.com', 'interviewer', c_actor);
+  select id into v_h from screening_v2.email_allowlist where email_normalized = 'h.nine@interviewkickstart.com';
+  perform screening_v2.resolve_allowlist_access(c_u9, 'h.nine@interviewkickstart.com');
+  v := screening_v2.resolve_allowlist_access(c_u9, 'h.nine@dexity.com');
+  perform _policy_tests.assert('0133: a PERSONAL Google account (no Workspace hd claim) is not proof, even with the right address',
+    v->>'status' = 'denied'
+    and (select email_normalized = 'h.nine@interviewkickstart.com' and linked_user_id = c_u9
+           from screening_v2.email_allowlist where id = v_h),
+    'the Google identity must belong to a company Workspace');
+  v := screening_v2.resolve_allowlist_access(c_u2, 'colleague@dexity.com');
+  perform _policy_tests.assert('0133: a granted login cannot rename itself onto a colleague''s unclaimed address',
+    v->>'status' = 'denied'
+    and (select email_normalized from screening_v2.email_allowlist where id = v_b) = 'b.one@dexity.com',
+    'no Google proof for colleague@ -> denied, entry unchanged');
+  perform screening_v2.add_allowlist_entry('boss@dexity.com', 'admin', c_actor);
+  select id into v_boss from screening_v2.email_allowlist where email_normalized = 'boss@dexity.com';
+  v := screening_v2.resolve_allowlist_access(c_u2, 'boss@dexity.com');
+  perform _policy_tests.assert('0133: a linked interviewer cannot take over a pending ADMIN entry by changing their email',
+    v->>'status' = 'denied'
+    and (select linked_user_id is null and active and role = 'admin'
+           from screening_v2.email_allowlist where id = v_boss)
+    and (select linked_user_id = c_u2 and active and role = 'interviewer'
+           from screening_v2.email_allowlist where id = v_b),
+    'link_moved must require Google proof; both entries untouched');
+
+  -- ── Outcome A2: admin pre-added the new address -> link_moved ───────
+  perform screening_v2.add_allowlist_entry('e.four@interviewkickstart.com', 'admin', c_actor);
+  select id into v_e_old from screening_v2.email_allowlist where email_normalized = 'e.four@interviewkickstart.com';
+  perform screening_v2.resolve_allowlist_access(c_u4, 'e.four@interviewkickstart.com');
+  perform screening_v2.add_allowlist_entry('e.four@dexity.com', 'interviewer', c_actor);
+  select id into v_e_new from screening_v2.email_allowlist where email_normalized = 'e.four@dexity.com';
+  v := screening_v2.resolve_allowlist_access(c_u4, 'e.four@dexity.com');
+  perform _policy_tests.assert('0133: link_moved grants the pre-provisioned entry''s role (another linked admin exists)',
+    v->>'status' = 'ok' and v->>'role' = 'interviewer'
+    and (select role from screening_v2.recruiter_memberships where user_id = c_u4) = 'interviewer',
+    'the admin''s newest decision (the new entry) must win');
+  perform _policy_tests.assert('0133: link_moved links the new entry and retires the old one (unlinked, disabled, viewer)',
+    (select linked_user_id = c_u4 and active from screening_v2.email_allowlist where id = v_e_new)
+    and (select linked_user_id is null and linked_at is null and not active and role = 'viewer'
+           from screening_v2.email_allowlist where id = v_e_old),
+    'a recycled old address must never inherit this access or role');
+  perform _policy_tests.assert('0133: link_moved is audited with the previous entry id',
+    (select count(*) from screening_v2.audit_events
+      where action = 'allowlist_linked' and target_id = v_e_new::text
+        and metadata->>'change' = 'link_moved'
+        and metadata->>'previous_entry_id' = v_e_old::text
+        and not (metadata ? 'role_kept_admin')) = 1,
+    'one link_moved audit row');
+  v := screening_v2.resolve_allowlist_access(c_u4, 'e.four@interviewkickstart.com');
+  perform _policy_tests.assert('0133: the retired old address is denied afterwards',
+    v->>'status' = 'denied', 'the disabled old entry must deny');
+
+  -- ── link_moved never leaves zero linked active admins ───────────────
+  -- Disable the other linked admin (c.three) so g.eight is the last one.
+  update screening_v2.email_allowlist set active = false where id = v_c;
+  perform screening_v2.add_allowlist_entry('g.eight@interviewkickstart.com', 'admin', c_actor);
+  select id into v_g_old from screening_v2.email_allowlist where email_normalized = 'g.eight@interviewkickstart.com';
+  perform screening_v2.resolve_allowlist_access(c_u8, 'g.eight@interviewkickstart.com');
+  perform screening_v2.add_allowlist_entry('g.eight@dexity.com', 'viewer', c_actor);
+  select id into v_g_new from screening_v2.email_allowlist where email_normalized = 'g.eight@dexity.com';
+  v := screening_v2.resolve_allowlist_access(c_u8, 'g.eight@dexity.com');
+  perform _policy_tests.assert('0133: the last linked active admin keeps admin when moving to a lower-role entry',
+    v->>'status' = 'ok' and v->>'role' = 'admin'
+    and (select role = 'admin' and linked_user_id = c_u8 and active
+           from screening_v2.email_allowlist where id = v_g_new)
+    and (select count(*) from screening_v2.audit_events
+          where action = 'allowlist_linked' and target_id = v_g_new::text
+            and metadata->>'role_kept_admin' = 'true') = 1,
+    'a move must never leave zero linked active admins');
+
+  -- ── Denials that must survive 0133 ──────────────────────────────────
+  perform screening_v2.add_allowlist_entry('d.five@interviewkickstart.com', 'viewer', c_actor);
+  select id into v_d from screening_v2.email_allowlist where email_normalized = 'd.five@interviewkickstart.com';
+  perform screening_v2.resolve_allowlist_access(c_u5, 'd.five@interviewkickstart.com');
+  update screening_v2.email_allowlist set active = false where id = v_d;
+  v := screening_v2.resolve_allowlist_access(c_u5, 'd.five@dexity.com');
+  perform _policy_tests.assert('0133: continuity never revives a DISABLED login (no new entry)',
+    v->>'status' = 'denied'
+    and (select email_normalized from screening_v2.email_allowlist where id = v_d) = 'd.five@interviewkickstart.com',
+    'a disabled entry must deny and stay unchanged');
+  perform screening_v2.add_allowlist_entry('d.five@dexity.com', 'viewer', c_actor);
+  select id into v_d_new from screening_v2.email_allowlist where email_normalized = 'd.five@dexity.com';
+  v := screening_v2.resolve_allowlist_access(c_u5, 'd.five@dexity.com');
+  perform _policy_tests.assert('0133: continuity never revives a DISABLED login (admin pre-added the new address)',
+    v->>'status' = 'denied'
+    and (select linked_user_id is null from screening_v2.email_allowlist where id = v_d_new)
+    and (select linked_user_id = c_u5 and not active from screening_v2.email_allowlist where id = v_d),
+    'pending new entry + disabled old login must deny and link nothing');
+  v := screening_v2.resolve_allowlist_access(c_u6, 'b.one@dexity.com');
+  perform _policy_tests.assert('0133: relink protection holds for a dexity.com address',
+    v->>'status' = 'denied'
+    and (select linked_user_id from screening_v2.email_allowlist where id = v_b) = c_u2,
+    'an address linked to another login must deny');
+  v := screening_v2.resolve_allowlist_access(c_u6, 'z.six@dexity.com');
+  perform _policy_tests.assert('0133: a login with no entry and no prior link is denied',
+    v->>'status' = 'denied'
+    and not exists (select 1 from screening_v2.email_allowlist where linked_user_id = c_u6),
+    'continuity must never create access');
+  v := screening_v2.resolve_allowlist_access(c_u2, 'b.one@gmail.com');
+  perform _policy_tests.assert('0133: continuity refuses a non-company address for a granted login',
+    v->>'status' = 'denied'
+    and (select email_normalized from screening_v2.email_allowlist where id = v_b) = 'b.one@dexity.com',
+    'a granted login moving to gmail.com must deny and not rename the entry');
+  v := screening_v2.resolve_allowlist_access(c_u2, 'b.one@dexity.com.evil.test');
+  perform _policy_tests.assert('0133: a dexity.com suffix trick is denied by the resolver',
+    v->>'status' = 'denied', 'suffix trick must deny');
+
+  -- ── Outcome B: handover from the old login to the new one ───────────
+  -- One owned row in every table the handover moves, plus a RUNNING draft
+  -- that must stay put (0101: one running draft per owner).
+  insert into screening_v2.roles (id, title, owner_id, created_at, updated_at)
+  values (c_role, '0133 Handover Role', c_u1, now(), now());
+  insert into screening_v2.candidates (id, role_id, name, email, skills, status, owner_id, created_at, updated_at)
+  values (c_cand, c_role, '0133 Handover Candidate', 'handover.0133@example.invalid',
+          '["testing"]'::jsonb, 'new', c_u1, now(), now());
+  insert into screening_v2.call_sessions (candidate_id, role_id, mode, provider, status, owner_id)
+  values (c_cand, c_role, 'live', 'livekit', 'created', c_u1)
+  returning id into v_sess;
+  insert into screening_v2.ashby_job_mappings (external_job_id, role_id, owner_id, status)
+  values ('0133-handover-job', c_role, c_u1, 'paused')
+  returning id into v_map;
+  insert into screening_v2.role_drafts (owner_id, job_role, status)
+  values (c_u1, '0133 settled draft', 'cancelled')
+  returning id into v_draft_done;
+  insert into screening_v2.role_drafts (owner_id, job_role)
+  values (c_u1, '0133 running draft')
+  returning id into v_draft_running;
+  insert into screening_v2.interview_rounds (id, candidate_id, role_id, link_token_digest, expires_at, created_by, status)
+  values (c_round, c_cand, c_role,
+          encode(sha256(convert_to('0133-handover-round', 'UTF8')), 'hex'),
+          '2099-01-01T00:00:00Z', c_u1, 'expired');
+
+  v := screening_v2.handover_allowlist_records(v_a, v_b, c_actor);
+  perform _policy_tests.assert('0133: handover reports one moved row per table and leaves the running draft',
+    v->>'status' = 'ok'
+    and (v->'moved'->>'roles')::int = 1 and (v->'moved'->>'candidates')::int = 1
+    and (v->'moved'->>'call_sessions')::int = 1 and (v->'moved'->>'ashby_job_mappings')::int = 1
+    and (v->'moved'->>'role_drafts')::int = 1 and (v->'moved'->>'interview_rounds')::int = 1,
+    'expected exactly one moved row in each of the six tables');
+  perform _policy_tests.assert('0133: handover moved owner_id / created_by on every table to the new login',
+    (select owner_id from screening_v2.roles where id = c_role) = c_u2
+    and (select owner_id from screening_v2.candidates where id = c_cand) = c_u2
+    and (select owner_id from screening_v2.call_sessions where id = v_sess) = c_u2
+    and (select owner_id from screening_v2.ashby_job_mappings where id = v_map) = c_u2
+    and (select owner_id from screening_v2.role_drafts where id = v_draft_done) = c_u2
+    and (select created_by from screening_v2.interview_rounds where id = c_round) = c_u2,
+    'every owned row must now belong to U2');
+  perform _policy_tests.assert('0133: handover leaves a RUNNING draft with the old login',
+    (select owner_id from screening_v2.role_drafts where id = v_draft_running) = c_u1,
+    'running drafts are excluded (0101 unique index)');
+  perform _policy_tests.assert('0133: handover is audited as admin_member_update with digests only',
+    (select count(*) from screening_v2.audit_events
+      where action = 'admin_member_update' and actor_id = c_actor and target_id = v_a::text
+        and metadata->>'change' = 'records_handover'
+        and metadata->>'to_entry_id' = v_b::text
+        and metadata::text !~ '@') = 1,
+    'one handover audit row, no raw email');
+  v := screening_v2.handover_allowlist_records(v_a, v_b, c_actor);
+  perform _policy_tests.assert('0133: a repeated handover is a no-op that reports zeros',
+    v->>'status' = 'ok' and (v->'moved'->>'candidates')::int = 0 and (v->'moved'->>'roles')::int = 0
+    and (v->'moved'->>'interview_rounds')::int = 0,
+    'second handover must move nothing');
+
+  perform screening_v2.add_allowlist_entry('z.pending@dexity.com', 'viewer', c_actor);
+  select id into v_pending from screening_v2.email_allowlist where email_normalized = 'z.pending@dexity.com';
+  perform _policy_tests.assert('0133: handover refusals are stable',
+    (screening_v2.handover_allowlist_records(v_a, v_a, c_actor))->>'status' = 'same_entry'
+    and (screening_v2.handover_allowlist_records(v_pending, v_b, c_actor))->>'status' = 'from_not_linked'
+    and (screening_v2.handover_allowlist_records(v_a, v_pending, c_actor))->>'status' = 'to_not_linked'
+    and (screening_v2.handover_allowlist_records(v_a, v_d, c_actor))->>'status' = 'to_inactive'
+    and (screening_v2.handover_allowlist_records(v_a, gen_random_uuid(), c_actor))->>'status' = 'not_found'
+    and (screening_v2.handover_allowlist_records(v_a, v_b, null))->>'status' = 'actor_required',
+    'same_entry / from_not_linked / to_not_linked / to_inactive / not_found / actor_required');
+
+  -- ── Exposure: new functions are service-role only ───────────────────
+  perform _policy_tests.assert('0133: handover_allowlist_records and is_access_email_domain are service-role only',
+    not has_function_privilege('anon', 'screening_v2.handover_allowlist_records(uuid, uuid, uuid)', 'execute')
+    and not has_function_privilege('authenticated', 'screening_v2.handover_allowlist_records(uuid, uuid, uuid)', 'execute')
+    and has_function_privilege('service_role', 'screening_v2.handover_allowlist_records(uuid, uuid, uuid)', 'execute')
+    and not has_function_privilege('anon', 'screening_v2.is_access_email_domain(text)', 'execute')
+    and not has_function_privilege('authenticated', 'screening_v2.is_access_email_domain(text)', 'execute')
+    and has_function_privilege('service_role', 'screening_v2.is_access_email_domain(text)', 'execute'),
+    'no browser role may execute the 0133 functions');
+
+  -- ── Teardown (audit rows are append-only and stay) ──────────────────
+  delete from screening_v2.role_drafts where id in (v_draft_done, v_draft_running);
+  delete from screening_v2.ashby_job_mappings where id = v_map;
+  delete from screening_v2.interview_rounds where id = c_round;
+  delete from screening_v2.call_sessions where id = v_sess;
+  delete from screening_v2.candidates where id = c_cand;
+  delete from screening_v2.roles where id = c_role;
+  delete from screening_v2.email_allowlist
+   where email_normalized ~ '^(a\.one|b\.one|c\.three|d\.five|e\.four|f\.seven|g\.eight|h\.nine|boss|z\.pending)@(interviewkickstart|dexity)\.com$';
+  delete from screening_v2.recruiter_memberships
+   where user_id in (c_u1, c_u2, c_u3, c_u4, c_u5, c_u6, c_u7, c_u8, c_u9);
+end;
+$$;
+
+delete from auth.users where id::text like '01330000-0000-4000-a000-%';
+
+select _policy_tests.assert(
+  '0133: teardown leaves exactly the three 0016 bootstrap entries',
+  (select count(*) from screening_v2.email_allowlist) = 3,
+  'the 0133 block must clean up its synthetic allowlist rows');
+-- ==== 0133 END ====
+
 -- C0, suite end for the phone lane: the 0042 invariant re-asserted AFTER every
 -- 0114 block (§8 exercises set_phone_halt / clear_phone_halt), so it stays
 -- the last phone assertion before the verdict.

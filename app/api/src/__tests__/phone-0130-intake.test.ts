@@ -139,7 +139,9 @@ describe('0130 registration and frame', () => {
     // 0132-style fleet-cap migrations (`_phone_fleet_daily_cap_<n>.sql`) are set aside like R1
     // ones: they redeclare only phone_max_daily_dials(), which no extractor reads
     // (phone-0132-daily-cap.test.ts pins that), so 0130 stays the newest body for everything here.
-    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$/.test(f));
+    // 0133_dexity_access_domain.sql (company domain switch) redefines only the dashboard
+    // access-allowlist RPCs — no phone body — so, like the R1 lane, it is exempt by exact name.
+    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$|^0133_dexity_access_domain\.sql$/.test(f));
     expect(nonR1[nonR1.length - 1]).toBe(base);
   });
 

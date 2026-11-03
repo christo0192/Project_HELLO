@@ -126,17 +126,23 @@ function getSsoProviders(): string[] {
 /* ── Company-email access gate (UX helpers — NEVER authorization) ─── */
 
 /**
- * The ONLY accepted email domain for dashboard access (Google Workspace
- * company account). Enforced server-side by the allowlist resolver;
- * these helpers only drive login-page messaging.
+ * The ONLY accepted email domains for dashboard access (Google Workspace
+ * company accounts), matched exactly. Enforced server-side by the allowlist
+ * resolver (migration 0133 + app/api/src/lib/auth.ts ALLOWED_ACCESS_DOMAINS,
+ * pinned equal by access-domain-0133-migration.test.ts); these helpers only
+ * drive messaging. dexity.com is the new company domain; interviewkickstart.com
+ * stays until nobody signs in with it.
  */
-export const ALLOWED_EMAIL_DOMAIN = 'interviewkickstart.com';
+export const ALLOWED_EMAIL_DOMAINS: readonly string[] = Object.freeze(['interviewkickstart.com', 'dexity.com']);
+
+/** "@interviewkickstart.com or @dexity.com" — for login and Access copy. */
+export const COMPANY_EMAIL_DOMAINS_LABEL = ALLOWED_EMAIL_DOMAINS.map((d) => `@${d}`).join(' or ');
 
 /**
  * UX-only company-email check (never authorization — the API enforces the
  * allowlist with the verified Supabase email). Mirrors the server's strict
- * ASCII trim+lower normalization for inline hints: exactly one '@' and the
- * exact domain interviewkickstart.com.
+ * ASCII trim+lower normalization for inline hints: exactly one '@' and one
+ * of the exact domains in ALLOWED_EMAIL_DOMAINS.
  */
 export function isCompanyEmail(raw: string): boolean {
   if (typeof raw !== 'string') return false;
@@ -148,7 +154,7 @@ export function isCompanyEmail(raw: string): boolean {
   const email = (angle ? angle[1] : lower).trim();
   const at = email.indexOf('@');
   if (at === -1 || email.indexOf('@', at + 1) !== -1) return false;
-  return email.slice(at + 1) === ALLOWED_EMAIL_DOMAIN;
+  return ALLOWED_EMAIL_DOMAINS.includes(email.slice(at + 1));
 }
 
 /* ── Helper: get AAL from getAuthenticatorAssuranceLevel ──────────── */

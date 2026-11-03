@@ -728,7 +728,9 @@ describe('OpenAPI document integrity', () => {
     // object-url and complete (inline bodies, no new schema). 165 + 4 = 169.
     // R1-REC adds TWO staff paths: GET /api/interview-rounds/{id}/recording (the playback mint) and
     // GET /api/admin/r1/recording-health (inline bodies, no new schema). 169 + 2 = 171.
-    expect(Object.keys(paths).length).toBe(171);
+    // 0133 adds ONE admin path: POST /api/admin/allowlist/{id}/handover (records handover
+    // for a person who returns on the new company domain as a new login). 171 + 1 = 172.
+    expect(Object.keys(paths).length).toBe(172);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -843,7 +845,9 @@ describe('OpenAPI document integrity', () => {
     // and Candidate (CandidateDialCount, CandidatePhoneState,
     // CandidatePhoneStateReason, CandidateLastDialedAt), defined once so the
     // list and the detail cannot drift. 259 + 4 = 263.
-    expect(Object.keys(schemas).length).toBe(263);
+    // 0133 adds TWO: AdminAllowlistHandoverRequest and AdminAllowlistHandoverResponse,
+    //   both additionalProperties:false (the response's per-table counts too). 263 + 2 = 265.
+    expect(Object.keys(schemas).length).toBe(265);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -2489,6 +2493,28 @@ describe('live handler shapes match documented schemas', () => {
       .send({ active: false });
     expect(res.status).toBe(200);
     expect(validateResponseBody(res.body, 'AdminAllowlistUpdateResponse', spec)).toEqual([]);
+  });
+
+  it('POST /api/admin/allowlist/{id}/handover → AdminAllowlistHandoverResponse (0133, counts only)', async () => {
+    mockRpc.mockResolvedValue({
+      data: {
+        status: 'ok',
+        moved: { roles: 1, candidates: 4, call_sessions: 3, ashby_job_mappings: 0, role_drafts: 2, interview_rounds: 1, extra: 'never-echoed' },
+      },
+      error: null,
+    });
+    const app = createContractApp();
+    const res = await request(app)
+      .post(`/api/admin/allowlist/${UUID_3}/handover`)
+      .set('Authorization', AUTH_HEADER)
+      .send({ to_entry_id: UUID_2 });
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'AdminAllowlistHandoverResponse', spec)).toEqual([]);
+    expect(res.body.moved).toEqual({ roles: 1, candidates: 4, call_sessions: 3, ashby_job_mappings: 0, role_drafts: 2, interview_rounds: 1 });
+    expect(mockRpc).toHaveBeenCalledWith('handover_allowlist_records', expect.objectContaining({
+      p_from_entry_id: UUID_3,
+      p_to_entry_id: UUID_2,
+    }));
   });
 
   it('allowlist routes are protected: unauthenticated → 401, non-admin → 403', async () => {

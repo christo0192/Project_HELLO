@@ -14,6 +14,7 @@
 
 import type {
   AdminAllowlistEntry,
+  AdminAllowlistHandoverResponse,
   AdminAuditRow,
   PublicStatus,
 } from '../../types';
@@ -168,11 +169,36 @@ export function auditEventsInWindow(
   }).length;
 }
 
+/* ── Records handover (0133) ──────────────────────────────────────────── */
+
+/** "4 candidates, 1 role, …" — zero counts are left out; an all-zero move says so. */
+export function handoverSummary(
+  moved: AdminAllowlistHandoverResponse['moved'],
+  toEmail: string,
+): string {
+  const parts: Array<[number, string, string]> = [
+    [moved.candidates, 'candidate', 'candidates'],
+    [moved.roles, 'role', 'roles'],
+    [moved.call_sessions, 'call', 'calls'],
+    [moved.interview_rounds, 'R1 round', 'R1 rounds'],
+    [moved.ashby_job_mappings, 'Ashby job', 'Ashby jobs'],
+    [moved.role_drafts, 'draft', 'drafts'],
+  ];
+  const listed = parts
+    .filter(([n]) => n > 0)
+    .map(([n, one, many]) => `${n} ${n === 1 ? one : many}`);
+  if (listed.length === 0) {
+    // A repeat handover, or a login that never owned anything.
+    return 'Nothing to move — the old login owns no records.';
+  }
+  return `Handed over ${listed.join(', ')} to ${toEmail}.`;
+}
+
 /* ── Stable mutation messages (400/409 etc.) ─────────────────────────── */
 
 const STABLE_MESSAGES: Record<string, string> = {
   invalid_email:
-    'That email address cannot be added to this workspace (only @interviewkickstart.com is accepted).',
+    'That email address cannot be added to this workspace (only @interviewkickstart.com or @dexity.com is accepted).',
   invalid_role: "That role isn't supported here.",
   invalid_reason: 'A reason is required for this change.',
   invalid_target: 'That status change is not allowed.',
@@ -190,6 +216,12 @@ const STABLE_MESSAGES: Record<string, string> = {
   deleted_denied: 'Deleted sessions cannot be changed.',
   allowlist_add_failed: 'The access entry could not be added. Try again.',
   allowlist_update_failed: 'The access entry could not be updated. Try again.',
+  same_entry: 'Pick two different people — records cannot be handed to the same login.',
+  from_not_linked:
+    'That person has never signed in, so they own no records yet. If they kept their login, nothing needs handing over.',
+  to_not_linked:
+    'The new login has not signed in yet. Ask them to sign in once, then hand over.',
+  to_inactive: 'The new login is disabled. Re-enable it before handing records to it.',
 };
 
 /**

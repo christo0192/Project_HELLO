@@ -164,3 +164,14 @@ export const adminAllowlistUpdateSchema = z
   });
 
 export type AdminAllowlistUpdateInput = z.infer<typeof adminAllowlistUpdateSchema>;
+
+/**
+ * POST /api/admin/allowlist/:id/handover body (0133). The target entry is
+ * the person's NEW login; the path id is the old one. Both must be linked
+ * and the target active — the RPC enforces it.
+ */
+export const adminAllowlistHandoverSchema = z
+  .object({ to_entry_id: uuidSchema })
+  .strict();
+
+export type AdminAllowlistHandoverInput = z.infer<typeof adminAllowlistHandoverSchema>;
