@@ -4,8 +4,9 @@
 -- Every assertion RAISEs on violation, so ON_ERROR_STOP makes psql exit
 -- non-zero and the harness fails.
 --
--- WHY THE CAP VALUE IS OVERRIDDEN MID-SUITE: the shipped ceiling is 50.
--- Proving the BOUNDARY at 50 would need fifty eligible engagements — the
+-- WHY THE CAP VALUE IS OVERRIDDEN MID-SUITE: the shipped ceiling is 250
+-- (0132; 0094 shipped 50). Proving the BOUNDARY at 250 would need 250
+-- eligible engagements — the
 -- per-engagement `uq_phone_attempts_one_per_ist_day` index forbids
 -- stacking same-day cold calls onto fewer. The value and the logic are
 -- separable, so this suite proves the shipped VALUE directly (A1), then
@@ -60,10 +61,10 @@ begin
     raise exception 'fleet94: fixtures c and e must share a line for the ownership tests';
   end if;
 
-  -- ── A1. The SHIPPED ceiling ─────────────────────────────────────────
+  -- ── A1. The SHIPPED ceiling (0132 raised it from 0094's 50) ─────────
   v_shipped_cap := screening_v2.phone_max_daily_dials();
-  if screening_v2.phone_max_daily_dials() <> 50 then
-    raise exception 'fleet94 A1: shipped phone_max_daily_dials() is %, expected 50',
+  if screening_v2.phone_max_daily_dials() <> 250 then
+    raise exception 'fleet94 A1: shipped phone_max_daily_dials() is %, expected 250 (0132)',
       screening_v2.phone_max_daily_dials();
   end if;
 

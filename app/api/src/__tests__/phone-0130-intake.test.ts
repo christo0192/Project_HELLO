@@ -136,7 +136,10 @@ describe('0130 registration and frame', () => {
     expect(base).toMatch(/^0130_[a-z0-9_]+\.sql$/);
     const files = readdirSync(MIGRATIONS_DIR).filter((f) => /^\d{4}_.*\.sql$/.test(f)).sort();
     expect(files.filter((f) => f.startsWith('0130_'))).toEqual([base]);
-    const nonR1 = files.filter((f) => !/_r1_/.test(f));
+    // 0132-style fleet-cap migrations (`_phone_fleet_daily_cap_<n>.sql`) are set aside like R1
+    // ones: they redeclare only phone_max_daily_dials(), which no extractor reads
+    // (phone-0132-daily-cap.test.ts pins that), so 0130 stays the newest body for everything here.
+    const nonR1 = files.filter((f) => !/_r1_|_phone_fleet_daily_cap_\d+\.sql$/.test(f));
     expect(nonR1[nonR1.length - 1]).toBe(base);
   });
 
