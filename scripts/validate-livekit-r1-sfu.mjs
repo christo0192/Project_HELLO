@@ -74,7 +74,21 @@ ok(Boolean(signaling)
   && /\[services\.concurrency\][\s\S]*?type\s*=\s*"connections"/.test(signalingBlock)
   && /^\s*soft_limit\s*=\s*300\s*(?:#.*)?$/m.test(signalingBlock)
   && /^\s*hard_limit\s*=\s*600\s*(?:#.*)?$/m.test(signalingBlock), "signaling service concurrency must be connections, soft 300 / hard 600 (sized with headroom for 25 rooms)");
-ok(/min_machines_running\s*=\s*0/.test(toml) && /auto_stop_machines\s*=\s*"stop"/.test(toml), "spike must retain the reviewed on-demand, no-autoscale posture");
+// M025 (2026-11-03): on-demand posture, per service. Fly's proxy stops a Machine only when autostop is
+// set on EVERY one of its services; with it on 7880 alone the SFU ran 24/7 from 2026-10-08. Only the 7880
+// signaling service may start the Machine (media always follows signaling; no scanner wakes via 7881/7882).
+// Keys must sit in the service's own table (before its first sub-table), or TOML assigns them to the sub-table.
+const serviceHead = (block) => {
+  const lines = block.split(/\r?\n/);
+  const end = lines.findIndex((line, i) => i > 0 && /^\s*\[/.test(line));
+  return lines.slice(0, end === -1 ? lines.length : end).join("\n");
+};
+const headLine = (block, key, value) => new RegExp(`^\\s*${key}\\s*=\\s*${value}\\s*(?:#.*)?$`, "m").test(serviceHead(block));
+ok(services.length > 0 && services.every((s) => headLine(s.block, "auto_stop_machines", '"stop"') && headLine(s.block, "min_machines_running", "0")),
+  'every SFU service must set auto_stop_machines = "stop" and min_machines_running = 0 in its own table (Fly autostops a Machine only when every service allows it)');
+ok(Boolean(signaling) && headLine(signaling?.block ?? "", "auto_start_machines", "true")
+  && [iceTcp, iceUdp].every((s) => Boolean(s) && headLine(s.block, "auto_start_machines", "false")),
+  "only the 7880 signaling service may auto-start the Machine (7881 and 7882 must set auto_start_machines = false)");
 ok(/\[metrics\][\s\S]*?port\s*=\s*6789/.test(toml), "Prometheus metrics must be private on port 6789");
 ok(/http_checks[\s\S]*?method\s*=\s*"get"[\s\S]*?path\s*=\s*"\/"/.test(toml), "signaling service must health-check GET / on 7880");
 
@@ -128,4 +142,5 @@ if (failures.length) {
   console.log("livekit-r1 SFU contract OK");
   console.log("region_configs_checked=infra/livekit-r1/fly.toml");
   console.log("external_services=443,80,7881,7882 udp_mux=7882 vm=performance-4x/8192 signaling=300/600");
+  console.log("autostop=all-services autostart=7880-only min_machines_running=0");
 }

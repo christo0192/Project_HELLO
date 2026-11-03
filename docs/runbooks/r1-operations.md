@@ -867,6 +867,136 @@ candidate network data. Deploys, upgrades, cert changes, and secret changes
 are manual, require zero live R1 rooms, and are followed by health, UDP-pair,
 worker-registration, and browser smoke checks. (implemented in PR-SFU-2)
 
+### On-demand SFU: idle stop and wake (M025)
+
+The SFU runs only while R1 is in use. Fly's proxy stops the Machine a few minutes
+after its last connection closes. The next signaling request on 443 starts it again:
+the API's `CreateRoom`, a candidate join or a worker registration.
+
+**Why every service carries the settings.** Fly stops a Machine only when autostop is
+set on EVERY one of its services. Until M025 only the 7880 signaling service had it.
+The SFU therefore never stopped. It ran 24/7 from 2026-10-08: as performance-1x at about
+$42 a month, then as performance-4x at about $167 a month from the 2026-10-23 resize. In the
+11 days after the resize it hosted 5 interviews (0.47% of the time).
+`infra/livekit-r1/fly.toml` now sets `auto_stop_machines = "stop"` and
+`min_machines_running = 0` on all three services. `auto_start_machines` is `true` on
+7880 only. ICE/TCP 7881 and UDP 7882 never start the Machine: media always follows a
+7880 signaling connection, and internet scanners probing those ports cannot wake it.
+`scripts/validate-livekit-r1-sfu.mjs` fails any config that drops the setting from a
+service, or puts it under a sub-table where TOML would not apply it.
+
+**What keeps it running.** Open WSS signaling connections through the proxy: the
+candidate, the worker's room connection and every running browser worker's
+registration.
+
+- Health checks and the private metrics scrape do not count: the clone stopped with both
+  running.
+- UDP and 6PN media (Config C) are not proxy connections: Fly reports proxy concurrency
+  only for the two TCP services. The WSS signaling that always accompanies media is what
+  holds the Machine.
+
+**Other wake sources.** Any API call to the SFU wakes it, and then it idles out again
+about 8 minutes later:
+
+- **The 60 s orphan lapse.** It calls `listDispatch` for an R1 `waiting` row idle 20-60
+  minutes. Its 8 s probe is shorter than a cold start, so the first probe after a stop
+  times out and defers. The next pass finds the SFU awake.
+- **The browser-lease reaper.** It calls `ListParticipants` for a claimed lease.
+- **Withdrawal and the `/ready` relay** for a live session.
+
+**If it should be idle but stays `started`:**
+
+1. Check the LIVE config first. Run `fly machine status <id> -d -a project-hello-r1-rtc-spike`.
+   Every `services[]` entry must show `"autostop": true`, and `"autostart": true` only on
+   internal port 7880. The validator checks only the checked-in `fly.toml`. A deploy from a
+   branch cut before M025 silently restores always-on.
+2. Then look for a running browser worker (`fly machine list -a project-hello-voice`), a
+   client still connected, or one of the API calls above.
+
+**Cold start.** The first request after a stop waits about 11 s; the clone measured
+11.4 s. Fly needs about 7-9 s to start a stopped performance-4x Machine, and its proxy may
+time out and retry its first wake call to the Machines API (`could not wake up machine due to a
+timeout requesting from the machines API` in `fly logs`). LiveKit then serves within a second.
+Nothing breaks:
+
+- The API's LiveKit client waits up to 60 s per call (`livekit-server-sdk` default), so
+  `CreateRoom` simply takes longer.
+- The first SFU request in a candidate's visit is usually the 10-second A/V check
+  (`POST /api/r1/preflight` creates a disposable room), so that response takes about 10 s
+  longer. The exchange that follows normally finds the SFU awake. If the candidate waits
+  more than a few minutes first, the wake happens inside the first exchange call instead.
+  That is before the join page's "preparing" polls begin (12 polls 3 s apart, counted, not
+  timed), so it does not eat the worker's boot budget.
+- **If a wake fails outright,** the request answers 503 `r1_room_unavailable`:
+  - At the A/V check, the page says "The connection test is unavailable right now ..." and
+    offers **Test again**. This spends one of the link's 10 preflights.
+  - At the exchange, the landing card says "The interview service is temporarily
+    unavailable ..." and offers **Check my camera and microphone**. That runs the A/V check
+    again before the next exchange. The attempt is still live, so no start is spent.
+  - A room lost to a stop between exchanges is re-created by the next exchange; rooms
+    already lapse after 180 s empty.
+- **If wakes keep failing,** `fly logs -a project-hello-r1-rtc-spike` repeatedly shows
+  `could not wake up machine` or `insufficient` CPU/memory. Fly reserves nothing for a
+  stopped Machine.
+  1. Run `fly machine start <id> -a project-hello-r1-rtc-spike` to see the error.
+  2. If the host lacks capacity, run
+     `fly machine clone <id> --region sin -a project-hello-r1-rtc-spike`, then destroy the
+     old Machine.
+  3. Re-run `infra/livekit-r1/preflight.mjs`: there must be exactly one Machine.
+  The dedicated IPv4 belongs to the app, and Config C re-reads the new Machine's 6PN address
+  at boot.
+
+**Deploys and secret changes on a stopped Machine.** If the Machine is `started`,
+`fly deploy` and `fly secrets set` restart it and wait on the GET / check. If it is
+`stopped`, which is the normal state now, they update it but do NOT boot it and run no check.
+A bad image, config or secret would then first show at a candidate's wake. So after any
+change made while it is stopped:
+
+1. Run `fly machine start <id> -a project-hello-r1-rtc-spike`.
+2. Confirm the 7880 check passes and that
+   `livekit-r1-entrypoint: Config C; advertising ...` appears in `fly logs`.
+
+**Verify after any SFU deploy:**
+
+1. Live config: as in step 1 of "If it should be idle but stays `started`" above.
+2. Idle stop: wait about 10 minutes with no R1 interview live. The state must be `stopped`,
+   and `fly machine status <id> -a project-hello-r1-rtc-spike` must show a `stop` event with
+   `source=proxy`.
+3. Wake with a real join: a staff test interview, which also exercises the worker's 6PN
+   path. Audio and video must flow, and the selected ICE pair must be UDP to the dedicated
+   IPv4 on 7882 (`chrome://webrtc-internals`).
+4. After everyone leaves, the Machine must return to `stopped` within about 10 minutes.
+
+**Rollback.** Revert the M025 squash commit (the `fly.toml` settings and the validator rules
+together), then redeploy the SFU with the usual command. It is then always-on again. In an
+emergency, deploy the previous `fly.toml` by hand first, then follow with the revert PR.
+
+**Clone and cold-start evidence (2026-11-03).** The production SFU image
+(`deployment-01M5M9Z2MPMW9WAKC9WYNARR7Y`) was deployed with this `fly.toml` to a throwaway
+app (`project-hello-r1-rtc-autostop-test`). It used its own dedicated IPv4, `LIVEKIT_R1_CONFIG=C`,
+performance-4x / 8 GB, `--ha=false`. The app was destroyed and its IPv4 released afterwards.
+
+| Check | Result |
+|---|---|
+| Fly accepts the settings on all three services, UDP included | yes: `autostop` true on 7880/7881/7882, `autostart` true on 7880 only |
+| Idle stop after boot, no traffic | stopped about 8 min after boot (`stop` event, `source=proxy`) |
+| Raw TCP connects to 7881 and UDP datagrams to 7882 while stopped | stayed `stopped` (no scanner wakes) |
+| Cold wake: `CreateRoom` over Twirp while stopped | 11.4 s, first attempt, no error to the client |
+| First join after the wake (two participants) | both joined in 2.9 s |
+| 16 min of 48 kHz audio plus 640x360 at 15 fps video | 0 stalls; about 100 audio and 15-16 video frames a second throughout |
+| Selected ICE pair | UDP host candidate on the dedicated IPv4, port 7882, `succeeded` for the whole session |
+| Machine during the session | stayed `started` (no stop with WSS signaling open) |
+| Re-stop after both left | stopped 7.4 min later (`source=proxy`) |
+
+The harness used the LiveKit Python SDK (`livekit` 1.2.0), with two participants publishing
+and subscribing from a laptop. One 30-second window showed fewer video frames: the laptop's
+own receive queue overflowed (a client warning), and audio was unaffected.
+
+For the production check after the M025 deploy, the same harness joined a room whose two
+tokens were minted inside the API Machine, from its `R1_LIVEKIT_*` values, so the secret
+never left Fly. The harness lives outside the repo, so the standing check is the staff test
+interview in "Verify after any SFU deploy".
+
 ### Browser readiness contract (PR-LK-liveness)
 
 The production Cloud browser worker is already a named, orchestrated worker
@@ -2811,7 +2941,12 @@ stagger the joins. Real candidates join from their own networks.
 
 - Worker: about 35 minutes of performance-4x in `sin` (about $0.23 an hour), so about $0.13 per
   interview; 15 at once is about $3.45 an hour.
-- SFU at performance-4x: about $165-170 a month while it runs (it auto-stops when idle).
+- SFU at performance-4x: about $0.23 an hour while it runs, which is $165-170 a month if it
+  never stops. Since M025 (2026-11-03) it stops a few minutes after the last connection
+  closes. It costs roughly (interview hours + about 8 minutes of idle tail per wake) x $0.23,
+  plus the dedicated IPv4 at $2 a month whether it runs or not. For example, 60 hours of use
+  a month is about $14 + $2. Until M025 it never stopped (autostop was on 1 of its 3
+  services); see "On-demand SFU: idle stop and wake (M025)".
 - Stopped pool: disk only, $0.15 per GB per month (about $8.10 a month for 18 machines at 3 GB).
 - Bandwidth: cents per interview (Asia-Pacific egress $0.04 per GB). DeepSeek scoring and Sarvam
   usage per interview are as today; the Sarvam plan upgrade is the step change.

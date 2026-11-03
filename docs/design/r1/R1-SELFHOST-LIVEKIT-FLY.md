@@ -215,6 +215,17 @@ kill_timeout = 300              # Fly maximum; a deploy still cuts a live room -
 # S0 must confirm: autostop decisions ignore services 2/3, and UDP is live right after a stop->start.
 ```
 
+> **Resolved 2026-11-03 (M025): they do not ignore them.** Fly's proxy stops a Machine
+> only when autostop is set on EVERY service. With it on 7880 alone, the production SFU
+> never stopped: it ran 24/7 from 2026-10-08, including days with zero rooms, so the
+> on-demand posture (D16) was never in effect. Services 2 and 3 now set
+> `auto_stop_machines = "stop"`, `auto_start_machines = false` and
+> `min_machines_running = 0`. Only 7880 signaling wakes the Machine. A throwaway clone of
+> the production image and config proved the behaviour: idle stop, cold wake through Twirp,
+> UDP media on the first join after a stop, and no stop during a long session.
+> `scripts/validate-livekit-r1-sfu.mjs` pins it. The evidence is in
+> `docs/runbooks/r1-operations.md`, "On-demand SFU: idle stop and wake (M025)".
+
 ### 3.8 Reference `livekit.yaml` (sketch; contains no secrets)
 
 ```yaml
@@ -396,12 +407,12 @@ exec /livekit-server --config /tmp/livekit.yaml
   - Pin `livekit-client` exactly for R1 (currently `^2.20.0`, `app/web/package.json:25`).
   - Fly may migrate Machines with no documented advance notice ([machine-migration](https://docs.fly.io/reference/machine-migration)). All room state is in memory, so a migration ends live sessions; the retake/infra-abandon path must cover it.
 - **Who starts the SFU, and cold-start impact:**
-  - **Recommended: Fly Proxy autostart/autostop on the 443 service.** Do not start it from the API through the Machines API: the SFU is a singleton, not a pool, and the API's Fly token is an org token (`fly-machines.ts:36-43`), so giving it the SFU widens the blast radius.
+  - **Recommended: Fly Proxy autostart on the 443 service, with autostop on EVERY service.** M025 (2026-11-03) showed that autostop on the 443 service alone never stops the Machine. 7881 and 7882 now set autostop with `auto_start_machines = false`. Do not start it from the API through the Machines API: the SFU is a singleton, not a pool, and the API's Fly token is an org token (`fly-machines.ts:36-43`), so giving it the SFU widens the blast radius.
   - The first proxied request wakes it: the API's preflight `CreateRoom` (`invites.ts:305-313`), which runs at the candidate's audio-check step before exchange, then provisioning (`room-provisioning.ts:171`) and the worker's WSS registration.
-  - Fly starts a stopped Machine in "well under a second" ([machines overview](https://docs.fly.io/machines/overview/)), plus an estimated 1–3 s for LiveKit to boot (no STUN with an explicit `node_ip`). The candidate sees this once, as extra preflight latency, well inside the existing 15–25 s+ worker cold-boot budget (`env.ts:311-315`).
+  - Fly starts a stopped Machine in "well under a second" ([machines overview](https://docs.fly.io/machines/overview/)), plus an estimated 1–3 s for LiveKit to boot (no STUN with an explicit `node_ip`). The candidate sees this once, as extra preflight latency, well inside the existing 15–25 s+ worker cold-boot budget (`env.ts:311-315`). *Measured in M025 (2026-11-03): a cold wake of the performance-4x Machine took 11.4 s end to end, mostly Fly's start; LiveKit served within a second of boot.*
   - UDP packets do not wake a Machine (community answer, t/18145, 2024-02-08, non-staff). Live rooms always hold WSS connections, which keep proxy load above zero.
   - Anything that calls the SFU wakes it: the reaper's `ListParticipants` and the synthetic check both do.
-  - **Unverified:** whether UDP routing is live immediately after stop→start, and whether sin has capacity at start time. S0.3 tests both. If either fails, switch to always-on (posture B or C, §7).
+  - **Unverified:** whether UDP routing is live immediately after stop→start, and whether sin has capacity at start time. S0.3 tests both. If either fails, switch to always-on (posture B or C, §7). *M025 (2026-11-03) verified UDP right after a stop→start on a clone. sin start capacity remains a risk; the runbook has the recovery.*
 - **Runbook (sketch):**
   1. **Candidate can't join:**
      - Check `curl https://<sfu>/`, `fly status -a project-hello-r1-rtc`, `fly logs`, and the client's selected-pair telemetry.
@@ -520,7 +531,7 @@ The cash saving of A over Ship is about $36–41/mo. Engineering cost: about 5 d
 7. **Single node.** Deploys, secret changes and Fly host migrations end live rooms. `kill_timeout` maximum is 300 s; there is no advance notice of migrations.
 8. **India-to-sin RTT** varies by route (about 32 ms Chennai to 152 ms Mumbai, data-centre to data-centre). How Cloud's nearest edge for India compares is unverified; S0 A/B decides.
 9. **Worker-to-SFU media path:** UDP hairpin to our own anycast IPv4 is unverified; ICE/TCP is the fallback.
-10. **Proxy behaviour:** 60 s TCP idle timeout (t/2373, 2021), the TCP/TLS handler with long-lived WSS, and whether autostop counts connections across the three services. All need checking in S0.
+10. **Proxy behaviour:** 60 s TCP idle timeout (t/2373, 2021), the TCP/TLS handler with long-lived WSS, and whether autostop counts connections across the three services. All need checking in S0. *Autostop resolved 2026-11-03 (M025): it must be set on every service, or the Machine never stops (see section 3.7).*
 11. **MTU:** about 1300 bytes usable on Fly UDP ([udp-and-tcp](https://docs.fly.io/networking/udp-and-tcp)); browser RTP is about 1200 bytes. Unmeasured.
 12. **Ops burden and security surface:** a fast LiveKit release cadence; a public UDP IPv4 with no WAF; client IPs in logs (DPDP); camera video is new personal data, so consent, retention and legal sign-off are owner actions.
 13. **Unverified operational details:** whether staged Fly secrets reach stopped pool Machines; Cloud's own `CreateDispatch` behaviour with no registered worker; `livekit-client` merging of client-supplied `iceServers`.
