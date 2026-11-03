@@ -1299,8 +1299,12 @@ _PART_AFTER = re.compile(
     r"|(?:per|each|every|a|an|/)\s*(?:\w+\s+)?(?:months?|instal+ments?|emis?|modules?|terms?|"
     r"semesters?|quarters?|weeks?|years?|class(?:es)?|sessions?|parts?|units?|levels?|"
     r"subjects?|payments?)\b"
-    # "$1000 EMI option monthly", "$600 monthly" (L5, mock call aa166f09 turn 106).
-    r"|(?:emis?|monthly)\b"
+    # "$1000 EMI option monthly", "$600 monthly" (L5, mock call aa166f09 turn 106).  Not "$6000
+    # EMI is also available" / "$6000 EMI options available" (repair, round 2): that figure is
+    # the total, and EMI is what comes with it (``_MONTHLY_AFTER``'s lookahead).
+    r"|(?:emis?|monthly)\b(?!\s+(?:options?|plans?|facilit(?:y|ies)|available|possible|also|too|"
+    r"is|are|can|could|would|will)\b)"
+    r"|(?:\w+\s+){0,2}(?:emi|instal+ment) (?:option|plan)s? monthly\b"
     r"|(?:as|for|in|is)\s+(?:a |an |the |your |my )?(?:\w+\s+)?(?:deposit|down ?payment|advance|"
     r"token|booking|registration|reservation|admission|application|first|initial|instal+ment|"
     r"emi|part)\b"

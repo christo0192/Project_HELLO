@@ -2047,14 +2047,32 @@ class CoerciveS03Tests(unittest.TestCase):
             "Our office is open only until today 6 pm, but you can call tomorrow.",
             "The scholarship is there only for today and tomorrow.",
             "Later it will cost you nothing more.",
+            # Repair (round 2): the deck's seasonal-discount lever (the list price after the
+            # discount ends) and an honest EMI or add-on surcharge are no threat; each one made
+            # the advisor "pressured" and capped the commitment at WEAK.
+            "This seasonal discount ends Friday; if you join later you will need to pay $9,000.",
+            "The discount is for this batch only. Later you will have to pay the full price.",
+            "Later you will have to pay the full price.",
+            "You can pay the rest later, it costs $500 more in total for the EMI plan.",
+            "If you pay later in EMIs, it costs a little more because of the interest.",
+            "If you add it later, it costs $300 more for the mentoring module.",
         ):
             with self.subTest(text=text):
                 self.assertFalse(urgency_levers(text)[1])
 
+    def test_the_seasonal_lever_said_honestly_keeps_its_credit(self):
+        text = "This seasonal discount ends Friday; if you join later you will need to pay $9,000."
+        self.assertIn("seasonal_discount", urgency_levers(text)[0])
+        tracker = CoverageTracker(PERSONA, seed="x")
+        tracker.observe_candidate_turn(text, 3)
+        evidence = tracker.commitment_evidence(AskKind.ENROL)
+        self.assertFalse(evidence.pressured)
+        self.assertTrue(evidence.urgency_lever)
+
     def test_a_higher_price_later_said_as_a_comparison_is_coercive(self):
         for text in (
             "Later it will cost more.",
-            "Later you will have to pay the full price.",
+            "Later you will have to pay $9,500.",
             "if you wanted to see that later then you will have to pay 13000 dollars",
             "This discount is available only for today, so decide now.",
             "The offer is valid only until tonight.",

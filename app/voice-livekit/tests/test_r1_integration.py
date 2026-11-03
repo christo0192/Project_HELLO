@@ -12,6 +12,7 @@ then ``on_user_turn_completed``, then ``speech_created``, then ``llm_node``, the
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import itertools
 import json
@@ -1754,6 +1755,35 @@ class TestTheRoleplayEndsByConsent(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(rig.candidate_rows()[-1]["phase"], "roleplay")
                 offers = rig.engine.admin_log()["early_close"]["wrap_offers"]
                 self.assertEqual([item["answer"] for item in offers], [answer])
+
+    async def test_an_okay_to_the_learner_back_on_the_line_is_no_yes_to_the_offer(self) -> None:
+        # Repair (round 2, M2): the offer survived a disconnect, and "Okay." to L-REJOIN-RP ("The
+        # learner is back on the line.") settled as a short yes and ended the role-play.
+        rig = await self.offered()
+        rig.interview._drop_stale_turns()
+        turn = asyncio.create_task(rig.interview._roleplay_turn())
+        await rig.settle()
+        rig.ctx.room.emit("participant_disconnected", FakeParticipant("candidate"))
+        await asyncio.wait_for(
+            rig.until(lambda: rig.machine.phase is R1Phase.PAUSED_DISCONNECTED), 10.0
+        )
+        rig.ctx.room.emit(
+            "participant_connected",
+            FakeParticipant("candidate", track_publications={"TR_new": FakePublication()}),
+        )
+        await rig.until_spoken("L-REJOIN-RP")
+        self.assertFalse(rig.engine.wrap_question_open)  # lapsed, as on silence
+        with mock.patch.dict(os.environ, {"R1_BARE_YES_SETTLE_SEC": "0"}):
+            await rig.converse("Okay.", advance=3)
+        await rig.settle()
+        self.assertFalse(rig.engine.wrap_accepted)
+        self.assertFalse(rig.interview._roleplay_over())
+        offers = rig.engine.admin_log()["early_close"]["wrap_offers"]
+        self.assertEqual([item["answer"] for item in offers], ["no_answer"])
+        if not turn.done():
+            turn.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await turn
 
 
 class TestTheTimeRunsOutGently(unittest.IsolatedAsyncioTestCase):

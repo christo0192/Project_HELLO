@@ -1146,6 +1146,13 @@ class PriceOfferTests(unittest.TestCase):
         self.assertEqual(pre("Let's make it $8,500."), {8500: False})
         # After the anchor the learner has asked for a price, so a bare answer is an answer.
         self.assertEqual(dict(neg.parse_price_offers("Okay, $8,500.")), {8500: False})
+        # Repair (round 2): a total with "EMI" right after it, no comma (as the STT writes it),
+        # is still the offer; the EMI is what comes with it.
+        self.assertEqual(pre("I can do it for 6000 dollars EMI is also available"), {6000: False})
+        self.assertEqual(
+            pre("Okay I can give it to you for $6000 EMI options available"), {6000: False}
+        )
+        self.assertEqual(pre("I can do it for $600 EMI."), {})  # an instalment, not the price
 
     def test_the_net_price_of_a_discount_is_not_the_anchor_echoed(self):
         self.assertEqual(self.offers("Today only I can do $2,000 off, so $7,000."), {7000: True})

@@ -472,19 +472,31 @@ _COERCIVE = re.compile(
     re.IGNORECASE,
 )
 # L6 (mock call aa166f09, turn 84): "if you wanted to see that later, then you will have to pay
-# $13000".  A price later is coercive only as a threat or a comparison (review fix): "more",
-# "higher" or "the full price" (never "nothing more" / "no extra"), or "have to / need to / must /
-# end up" paying the list price or above.  "Later you pay $700 a month", "you will pay the same
-# 9000" and "you would have to pay $500 extra for the career module" are honest descriptions.
+# $13000".  A price later is coercive only as a threat or a comparison (review fix): "more" or
+# "higher" about the price (never "nothing more" / "no extra", nor a plan's surcharge), or "have
+# to / need to / must / end up" paying above the list price.  "Later you pay $700 a month", "you
+# will pay the same 9000", "you would have to pay $500 extra for the career module" and "later
+# you will have to pay the full price" (the seasonal discount ending) are honest descriptions.
 _LATER_PRICE = re.compile(
     r"\blater\b[^.?!]{0,40}?\b(?:you|it)\b(?P<verb>[^.?!]{0,20}?)\b"
     r"(?:pay(?:ing)?|cost(?:s|ing)?|charged?)\b(?P<tail>[^.?!]{0,30})",
     re.IGNORECASE,
 )
 _LATER_MUST = re.compile(r"\b(?:have to|has to|need to|must|end up)\b", re.IGNORECASE)
+# Repair (round 2): "the full price" later is the deck's own seasonal-discount lever (the discount
+# ends and the list price applies; rubric.ts lists seasonal discounts as a legitimate urgency
+# lever), so it is no threat, and neither is the list price itself: only a figure ABOVE it is.
 _LATER_MORE = re.compile(
-    r"(?<!\bno )(?<!\bnothing )(?<!\bany )\b(?:more|higher)\b"
-    r"|\b(?:the )?full (?:price|fee|amount)\b",
+    r"(?<!\bno )(?<!\bnothing )(?<!\bany )\b(?:more|higher)\b",
+    re.IGNORECASE,
+)
+# Repair (round 2): "more" about a payment plan or an add-on, not about the course price: "it costs
+# $500 more in total for the EMI plan", "a little more because of the interest", "$300 more for the
+# mentoring module".  An honest surcharge, never a threat.
+_LATER_SURCHARGE = re.compile(
+    r"\b(?:interest|in total|emis?|instal+ments?|add-?ons?|"
+    r"for (?:the |an? |this |that )?(?:\w+ )?(?:plans?|modules?|mentor(?:ing|ship)|options?|"
+    r"add-?ons?|sessions?|packages?|emis?|instal+ments?))\b",
     re.IGNORECASE,
 )
 _LATER_FIGURE = re.compile(r"\$(\d+)")
@@ -492,12 +504,13 @@ _LATER_FIGURE = re.compile(r"\$(\d+)")
 
 def _later_price_threat(sentence: str) -> bool:
     """L6: "decide now or later you will have to pay $13000" (``_LATER_PRICE``)."""
-    for match in _LATER_PRICE.finditer(canonical_amounts(sentence)):
+    canonical = canonical_amounts(sentence)
+    for match in _LATER_PRICE.finditer(canonical):
         tail = match.group("tail")
-        if _LATER_MORE.search(tail):
+        if _LATER_MORE.search(tail) and _LATER_SURCHARGE.search(canonical[match.start():]) is None:
             return True
         if _LATER_MUST.search(match.group("verb")) and any(
-            int(figure) >= PRICE_USD for figure in _LATER_FIGURE.findall(tail)
+            int(figure) > PRICE_USD for figure in _LATER_FIGURE.findall(tail)
         ):
             return True
     return False

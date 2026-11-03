@@ -8936,6 +8936,120 @@ class TestTransitionConsent(R1TestCase):
         self.assertFalse(r1_session.is_permission_to_ask("Can I ask what the shifts are?"))
         self.assertFalse(r1_session.is_permission_to_ask("What are the working days?"))
 
+    def test_owner_style_consents_are_consents(self) -> None:
+        # Repair (round 2): these never matched a start phrase, were answered as questions,
+        # used up the three answers and got L-TRANSITION-STEER.
+        for text in (
+            "Let's do the role play.", "Okay, let's do the role play.",
+            "Let's move to the role play.", "Haan, let's start.", "I'm good to go.",
+            "Okay, I'm all set.", "Let's continue.", "Nope, let's begin.", "Let's get going.",
+            "Let's move on.",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(r1_session.is_transition_consent(text))
+        for text in (
+            "I want to do the role play later, what is the salary?", "Can I continue?",
+            "I'm good.", "Nope.", "Let's move on to the salary.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_transition_consent(text))
+
+    def test_a_permission_that_also_asks_the_question_is_a_question(self) -> None:
+        # Repair (round 2, aa166f09 rows 19+20 merged): invited, not counted, and no start
+        # question after Christy's answer, so dead air until the re-ask.
+        self.interview._enter(R1Phase.TRANSITION)
+        for text in (
+            "Can can I ask a couple of other questions before we start this? I want to "
+            "understand more about the role.",
+            "I have a question, tell me about the shift timings.",
+            "Can I ask a couple of questions, like the salary and the targets?",
+            "Can I ask a question? I want to understand about Interview Kickstart and the "
+            "senior program advisor role.",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(r1_session.is_permission_to_ask(text))
+                self.assertEqual(
+                    self.interview._transition_action(text), r1_session._TRANSITION_ANSWER
+                )
+
+    async def test_a_hand_back_after_the_either_or_question_picks_up(self) -> None:
+        # Repair (round 2): main's is_ready picked these up at once; after L-TRANSITION's
+        # "now, or do you have any questions first?" they went to the model as questions.
+        for text in ("Go ahead.", "Sure, go ahead.", "Okay, go ahead.", "Yes, go ahead."):
+            with self.subTest(text=text):
+                await self.asyncSetUp()
+                self.interview._enter(R1Phase.TRANSITION)
+                await self.interview.say("L-TRANSITION")
+                task = asyncio.create_task(self.interview._run_transition())
+                await self.settle()
+                self.assertTrue(await self.answer(text))  # never the model's to answer
+                self.assertIsNone(await asyncio.wait_for(task, 5.0))
+                self.assertEqual(self.interview._transition_answers, 0)
+                self.assertEqual(self.session.spoken[-1], self.spoken_line("L-PICKUP"))
+
+    async def test_owner_style_consents_pick_up_through_the_driver(self) -> None:
+        for text in (
+            "Okay, let's do the role play.", "Let's move to the role play.",
+            "Haan, let's start.", "I'm good to go.",
+        ):
+            with self.subTest(text=text):
+                await self.asyncSetUp()
+                self.interview._enter(R1Phase.TRANSITION)
+                await self.interview.say("L-TRANSITION")
+                task = asyncio.create_task(self.interview._run_transition())
+                await self.settle()
+                self.assertTrue(await self.answer(text))
+                self.assertIsNone(await asyncio.wait_for(task, 5.0))
+                self.assertEqual(self.interview._transition_answers, 0)
+                self.assertEqual(self.session.spoken[-1], self.spoken_line("L-PICKUP"))
+
+    async def test_a_bare_no_to_any_questions_first_gets_the_nudge(self) -> None:
+        # Repair (round 2): "No." / "Nope." / "No, thank you." are backchannel words and got
+        # nothing at all: 20 s of dead air until L-TRANSITION-REASK.
+        for text in ("No.", "Nope.", "No, thank you."):
+            with self.subTest(text=text):
+                await self.asyncSetUp()
+                self.interview._enter(R1Phase.TRANSITION)
+                await self.interview.say("L-TRANSITION")
+                task = asyncio.create_task(self.interview._run_transition())
+                await self.settle()
+                self.assertTrue(await self.answer(text))
+                await self.until(lambda: self.spoken_and_played("L-TRANSITION-NUDGE"))
+                self.assertFalse(task.done())
+                self.assertNotIn(self.spoken_line("L-PICKUP"), self.session.spoken)
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    async def test_a_no_said_over_christy_is_still_nothing(self) -> None:
+        self.interview._enter(R1Phase.TRANSITION)
+        await self.interview.say("L-TRANSITION")
+        self.agent_state("speaking")
+        self.assertEqual(self.interview._transition_action("No."), r1_session._TRANSITION_QUIET)
+
+    async def test_the_transition_ceiling_pauses_while_the_candidate_is_away(self) -> None:
+        # Repair (round 2): a rejoin after the wall-clock ceiling got L-REJOIN and then the
+        # lost-connection close (L-SIL-END), and the interview ended as candidate_left.
+        self.interview._enter(R1Phase.TRANSITION)
+        with mock.patch.object(r1_session, "TRANSITION_MAX_SECONDS", 1.5), mock.patch.object(
+            r1_session, "rejoin_grace_seconds", return_value=10.0
+        ):
+            task = asyncio.create_task(self.interview._run_transition())
+            await self.settle()
+            self.ctx.room.emit("participant_disconnected", FakeParticipant("candidate"))
+            await self.until(
+                lambda: self.interview.machine.phase is R1Phase.PAUSED_DISCONNECTED
+            )
+            await asyncio.sleep(2.0)  # away for longer than the whole ceiling
+            self.ctx.room.emit("participant_connected", FakeParticipant("candidate"))
+            await self.until(lambda: self.spoken_and_played("L-REJOIN"))
+            await asyncio.sleep(0.2)
+            self.assertFalse(task.done())
+            self.assertNotIn(self.spoken_line("L-SIL-END"), self.session.spoken)
+            self.final_transcript("Ready.")
+            self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(self.session.spoken[-1], self.spoken_line("L-PICKUP"))
+
     async def test_the_owners_transition_answers_the_questions_and_waits(self) -> None:
         # aa166f09 turns 17-20 through the real driver: two requests to ask, then a question.
         # Nothing picks up; Christy answers; the role-play starts on "Yes, let's start".

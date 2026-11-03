@@ -639,12 +639,17 @@ _TRANSITION_ANSWER = "answer"
 # gets the nudge to say ready.
 _YES_NO = "yes_no"
 _EITHER_OR = "either_or"
+# Repair (round 2): "Just say 'ready'" (L-TRANSITION-REASK-2, L-TRANSITION-NUDGE) asks no yes/no
+# question, so a short yes still answers nothing; a hand-back ("Okay, go ahead.") agrees to start.
+_SAY_READY = "say_ready"
+# Repair (round 2): the words that make a no-questions turn a refusal, not a thank-you.
+_BARE_NO_WORDS = frozenset({"no", "nope", "nah", "none", "nothing"})
 _START_QUESTION_OF_LINE = {
     "L-TRANSITION": _EITHER_OR,
     "L-TRANSITION-REASK": _YES_NO,
     "L-TRANSITION-STEER": _YES_NO,
-    "L-TRANSITION-REASK-2": None,
-    "L-TRANSITION-NUDGE": None,
+    "L-TRANSITION-REASK-2": _SAY_READY,
+    "L-TRANSITION-NUDGE": _SAY_READY,
 }
 
 # Results of ``R1Interview._await_turn``.
@@ -1169,19 +1174,36 @@ _PERMISSION_RE = re.compile(
     r"couple of |two |three )?(?:\w+ )?questions?|(?:can|could|may) i have (?:a |some )?(?:\w+ )?"
     r"questions?)\b"
 )
-_ASKS_SOMETHING_RE = re.compile(
-    r"\b(?:what|what's|how|when|where|why|who|which|whether|is it|is there|are there|do you|"
-    r"does|do i|will i|would i|should i)\b"
+# Repair (round 2): the only words a permission-only turn may carry besides ``_PERMISSION_RE``'s
+# phrase.  An allowlist, as for a consent: "Can I ask a couple of questions, like the salary and
+# the targets?" or "Can I ask a question? I want to understand about the role." asks the question
+# as well, so it is Christy's to answer (counted, with L-TRANSITION-ASK after it), not an invite.
+_PERMISSION_FILLER = frozenset(
+    {
+        "so", "um", "uh", "well", "okay", "ok", "alright", "yes", "yeah", "sure", "actually",
+        "just", "also", "please", "sorry", "christy", "christie", "ma'am", "madam", "sir",
+        "a", "an", "one", "two", "three", "few", "couple", "of", "some", "any", "more", "other",
+        "another", "quick", "small", "little", "question", "questions", "first", "before", "we",
+        "start", "begin", "get", "started", "the", "this", "that", "it", "role", "play",
+        "roleplay", "if", "you", "don't", "dont", "mind", "here", "now", "then", "can", "could",
+        "may", "i", "ask", "have", "go", "on", "with",
+    }
 )
 
 
 def is_permission_to_ask(text: str) -> bool:
-    """True for a turn that only asks whether the candidate may ask something."""
+    """True for a turn that only asks whether the candidate may ask something.
+
+    The permission phrase (``_PERMISSION_RE``) with nothing but ``_PERMISSION_FILLER`` around it:
+    "Can I ask a couple of questions before we start?", "I have a few questions.".  A turn that
+    goes on to the question itself ("I have a question, tell me about the shift timings.") is a
+    question: it is answered, counted, and followed by the start question.
+    """
     folded = fold_speech(text)
     if _PERMISSION_RE.search(folded) is None:
         return False
     rest = _PERMISSION_RE.sub(" ", folded, count=1)
-    return _ASKS_SOMETHING_RE.search(rest) is None
+    return all(word in _PERMISSION_FILLER for word in rest.split())
 
 
 # M1: "No questions, let's start." and "No, I'm good, let's go." agree to start as plainly as "Yes,
@@ -1189,15 +1211,22 @@ def is_permission_to_ask(text: str) -> bool:
 _NO_QUESTIONS_FIRST_RE = re.compile(
     r"\b(?:(?:i )?(?:do not|don't|dont) have (?:any )?(?:more |other |further )?questions?|"
     r"(?:i )?have no(?: more| other| further)? questions?|no(?: more| other| further)? questions?|"
-    r"nothing(?: else| more)?|none|i'?m good|i am good|all good|no)\b"
+    # "I'm good to go." is a start phrase (``_START_RE``), not "I'm good" + "to go".
+    r"nothing(?: else| more)?|none|i'?m good(?! to go)|i am good(?! to go)|all good|nope|nah|"
+    r"no)\b"
 )
 # M1 review fix: the start phrases of a consent, on folded text.  Wider than ``_READY_ALLOWLIST``
 # ("Yeah, let's start the role play.", "Yes, we can start.", "Let's get started.", "Go for it."),
 # and without its bare acknowledgements: "Okay.", "Yes." or "Sure." is a short yes
 # (``is_short_yes``), never a consent by itself (``R1Interview._transition_consent``).
 _START_RE = re.compile(
-    r"\b(?:get(?:ting)? started|kick (?:it )?off|go for it|go ahead|let's go|lets go|let us go|"
-    r"(?:let's|lets|let us|we can|we could|i can|shall we|can we) do (?:it|this|that)|"
+    r"\b(?:get(?:ting)? (?:started|going)|kick (?:it )?off|go for it|go ahead|let's go|lets go|"
+    r"let us go|(?:let's|lets|let us|we can|we could|i can|shall we|can we) do (?:it|this|that)|"
+    # Repair (round 2): "Let's do the role play.", "Let's move to the role play.", "Let's move
+    # on.", "I'm good to go.", "Okay, I'm all set.", "Let's continue."
+    r"do (?:the )?role ?play|do (?:the )?roleplay|move (?:on|ahead|forward)|"
+    r"move (?:on )?to (?:the )?role ?play|move (?:on )?to (?:the )?roleplay|good to go|all set|"
+    r"(?:let's|lets|let us|we can|shall we) continue|"
     r"start(?:ing)?|begin(?:ning)?|proceed|ready)\b"
 )
 # "Ready when you are." is no question: its "when" is cut out before the question test.
@@ -1222,6 +1251,8 @@ _CONSENT_FILLER = frozenset(
         "from", "my", "side", "for", "fine", "good", "great", "perfect", "cool", "absolutely",
         "definitely", "really", "fully", "totally", "quite", "pretty", "set", "and", "just",
         "go", "ahead", "christy", "ma'am", "madam", "sir", "oh", "ah", "hmm", "is",
+        # Repair (round 2): a Hindi-English yes ("Haan, let's start.", "Ji, ready.").
+        "haan", "han", "haa", "haanji", "ji", "achha", "acha", "accha",
     }
 )
 # M1 review fix: a short yes ("Yes.", "Okay.", "Sure.", "Yeah, okay.", "Okay, thank you.") answers
@@ -1820,6 +1851,9 @@ class R1Interview:
         self._brief_requested = False
         self._brief_repeated = False
         self._transition_started_at: float | None = None
+        # Repair (round 2): seconds the transition spent in PAUSED_DISCONNECTED.  The 6:00 ceiling
+        # is moved by them, so a candidate who rejoins in time is never closed for being away.
+        self._transition_paused_seconds = 0.0
         # Latency (PR-4c): the stage stamps of the open turn, reported as ``r1_latency`` lines.
         self._latency = LatencyTracker(clock, self._emit_latency)
         # The audio of scripted lines (None: every line is spoken live) and the 429 counter.
@@ -1963,6 +1997,7 @@ class R1Interview:
             # L-TRANSITION starts right after this: the clock of the transition's ceiling.
             with contextlib.suppress(RuntimeError):
                 self._transition_started_at = asyncio.get_running_loop().time()
+            self._transition_paused_seconds = 0.0
         self._track_signals(phase)
         if publish:
             self._publish_phase(phase.value)
@@ -3250,6 +3285,17 @@ class R1Interview:
             and self._agent_state in _QUIET_AGENT_STATES
         ):
             return _TRANSITION_NUDGE  # "Yes." to "now, or questions first?" says neither
+        if (
+            text
+            and self._agent_state in _QUIET_AGENT_STATES
+            and not is_short_yes(text)
+            and is_no_questions(text)
+            and _BARE_NO_WORDS.intersection(fold_speech(text).split())
+        ):
+            # Repair (round 2): "No.", "Nope.", "No, thank you." to "... or do you have any
+            # questions first?" are all backchannel words, and got nothing at all (20 s of dead
+            # air until L-TRANSITION-REASK).  They say "no questions": the nudge to say ready.
+            return _TRANSITION_NUDGE
         if not text or is_backchannel_turn(text) or is_name_only(text):
             return _TRANSITION_QUIET
         if is_no_questions(text) or is_brief_request(text):
@@ -3270,11 +3316,13 @@ class R1Interview:
         """
         if is_transition_consent(text):
             return True
-        if self._start_question != _YES_NO or self._agent_state not in _QUIET_AGENT_STATES:
+        if self._start_question is None or self._agent_state not in _QUIET_AGENT_STATES:
             return False
-        if is_short_yes(text):
+        if self._start_question == _YES_NO and is_short_yes(text):
             return True
-        # "Sure, go ahead." hands the floor to the learner after "Shall we start now?".
+        # "Go ahead.", "Sure, go ahead." hand the floor to the learner after either start question
+        # (repair, round 2: main picked them up at once; after L-TRANSITION's either/or question
+        # they were answered as questions, used up the three answers and got the steer).
         return is_acknowledgement_turn(text) and _YIELD_RE.search(fold_speech(text)) is not None
 
     def _count_icebreaker_answer(self, text: str) -> None:
@@ -5518,14 +5566,27 @@ class R1Interview:
 
     async def _handle_disconnect(self) -> str | None:
         """Pause the phase clock while only the selected candidate may rejoin."""
+        in_transition = self.machine.phase is R1Phase.TRANSITION
+        away_since = asyncio.get_running_loop().time()
         if self.machine.phase in _LIVE_PHASES:
             self._begin_disconnect()
         if not await self._wait_for_candidate(rejoin_grace_seconds()):
             # A candidate who stays away during the wrap-up has finished the role-play: the
             # session is complete (scorable), not a candidate who walked out of the interview.
             return self._stop_outcome() or self._after_roleplay("candidate_left")
+        if in_transition:
+            # Repair (round 2): the transition's ceiling pauses with the phase (a rejoin after
+            # it would have passed got L-REJOIN and then the lost-connection close).
+            self._transition_paused_seconds += asyncio.get_running_loop().time() - away_since
         if self.machine.phase is R1Phase.PAUSED_DISCONNECTED:
             self._rejoin()
+        if self._engine is not None and self.machine.phase in (R1Phase.ROLEPLAY, R1Phase.ASIDE):
+            # Repair (round 2, M2): a question of the interviewer's that was open when the line
+            # dropped is not answered by what the candidate says to L-REJOIN-RP ("Okay.", "Sure."
+            # read as a yes to L-ASIDE-WRAP ended the role-play without consent).  It lapses as
+            # on silence: the offer counts as unanswered and its cooldown applies.
+            self._engine.end_question_lapsed()
+            self._engine.wrap_question_lapsed(self.machine.roleplay_elapsed)
         # The pause may have hidden an unmute: re-check the aside against the room.
         if self._aside_needs_restore():
             self._leave_mute_aside()
@@ -5854,7 +5915,7 @@ class R1Interview:
         ceiling = (loop.time() if started is None else started) + TRANSITION_MAX_SECONDS
 
         def left() -> float:
-            return ceiling - loop.time()
+            return ceiling + self._transition_paused_seconds - loop.time()
 
         def interrupted() -> bool:
             return self._ready_latched or self._brief_due() or bool(self._transition_lines)
