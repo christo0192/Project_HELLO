@@ -13,9 +13,9 @@ Two independent, SDK-free pieces live here so both are unit-testable without a s
   Sarvam's final-only transcripts that meant the learner talked over the candidate until the
   candidate's turn was committed.  ``R1_INTERRUPT_MIN_WORDS=3`` is the rollback, read at use.
   Each value is bounded and can be tuned from the environment.  The
-  transition phase, where the only thing the candidate says is "ready", runs a quicker pair
-  (``r1_transition_endpointing``, 0.4 / 1.2 s, never above the session's own).  Preemptive
-  generation stays OFF; ``r1_session`` explains why.
+  quicker transition pair (``r1_transition_endpointing``, 0.4 / 1.2 s) is no longer applied since
+  the consent transition of 2026-11-03 (the candidate asks questions there now); it is kept for a
+  rollback.  Preemptive generation stays OFF; ``r1_session`` explains why.
 
 * ``LatencyTracker``: stamps the stages of one candidate turn and hands every segment to an
   ``emit`` callback.  ``r1_session`` turns each call into one structured ``r1`` log line
@@ -57,8 +57,9 @@ INTERRUPT_MIN_WORDS = 0
 # How long a pause that no transcript follows (noise, a cough) waits before the paused line
 # resumes.  The SDK's own default: it leaves room for Sarvam's final, which cuts the line instead.
 FALSE_INTERRUPTION_TIMEOUT_SEC = 2.0
-# The transition phase waits for one word ("ready"), so a turn there commits quickly.  These are
-# CEILINGS on the session's own numbers (``r1_transition_endpointing``), never a way to wait longer.
+# The transition phase used to wait for one word ("ready"), so a turn there committed quickly
+# (unused since 2026-11-03, see the module docstring).  CEILINGS on the session's own numbers
+# (``r1_transition_endpointing``), never a way to wait longer.
 TRANSITION_ENDPOINT_MIN_DELAY_SEC = 0.4
 TRANSITION_ENDPOINT_MAX_DELAY_SEC = 1.2
 

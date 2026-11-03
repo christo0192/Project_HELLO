@@ -34,6 +34,7 @@ from rehearsal.call import _plan_summary
 from rehearsal.clock import TimingParams
 from rehearsal.llm import Ledger, RecordingProvider
 from rehearsal.metrics import ROLEPLAY, row_metrics, stall_reason_metrics
+from r1_roleplay import WRAP_OFFER_FROM_R_SEC
 from r1_text import word_count
 
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "r1_owner_b58c7d9c.json"
@@ -58,6 +59,18 @@ ROLEPLAY_14_TO_20: tuple[tuple[float, float], ...] = (
     (780.0, 1140.0),  # the WEAK stall: 13:00 -> 19:00
     (840.0, 1200.0),  # the hard end: 14:00 -> 20:00
 )
+
+
+def _past_the_plan(rig: Any) -> bool:
+    """The commitment is on record from 14:00: the replay ends where the early exit was.
+
+    M2 (2026-11-03): the role-play no longer exits there; the interviewer offers to wrap up at the
+    next pause, and recorded advisor turns cannot answer that offer, so the replay stops.
+    """
+    return (
+        rig.engine.commitment_resolved
+        and float(rig.machine.roleplay_elapsed) >= WRAP_OFFER_FROM_R_SEC
+    )
 
 
 @dataclass
@@ -208,7 +221,7 @@ async def replay(
                     mode=None if plan is None else plan.mode.value,
                 )
             )
-            if rig.interview._roleplay_over() or ledger.fatal:
+            if rig.interview._roleplay_over() or ledger.fatal or _past_the_plan(rig):
                 break
         admin = rig.engine.admin_log(final=True, r_end=float(rig.machine.roleplay_elapsed))
         saved = [

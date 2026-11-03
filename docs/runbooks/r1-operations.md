@@ -1343,7 +1343,7 @@ Switches (all read at use, so a restart is enough; every one is optional):
 
 | Variable | Default | Effect and rollback |
 |---|---|---|
-| `R1_ENDPOINT_MIN_DELAY_SEC` / `R1_ENDPOINT_MAX_DELAY_SEC` | 0.8 / 3.0 | Endpointing waits (SDK default 0.3 / 2.5 s). Lower the minimum for speed, raise it if candidates are cut off. The transition phase runs a quicker 0.4 / 1.2 s (never above these two): see "Turn taking and transcript rows" below |
+| `R1_ENDPOINT_MIN_DELAY_SEC` / `R1_ENDPOINT_MAX_DELAY_SEC` | 0.8 / 3.0 | Endpointing waits (SDK default 0.3 / 2.5 s). Lower the minimum for speed, raise it if candidates are cut off. Every phase, the transition included, uses these two since 2026-11-03 (the transition answers questions now): see "Turn taking and transcript rows" below |
 | `R1_INTERRUPT_MIN_DURATION_SEC` / `R1_INTERRUPT_MIN_WORDS` | 0.8 / 0 | Voice barge-in (owner decision 2026-10-28; SDK default 0.5 s / 0): 0.8 s of the candidate's voice pauses the line, a final transcript cuts it. **Rollback: `R1_INTERRUPT_MIN_WORDS=3`** on `project-hello-voice` and restart (the learner then talks on until the candidate's turn is committed). See "Interrupting with final-only speech recognition" below |
 | `R1_FALSE_INTERRUPTION_TIMEOUT_SEC` | 2.0 | Seconds after a pause with no transcript (noise, a cough) before the paused line resumes where it stopped (0.5-5.0; SDK default 2.0). Below about 1.5 s a late Sarvam final can make the learner resume and then stop again |
 | `R1_TTS_FLUSH_MIN_CHARS` | 60 | Early-flush length cap; `0` turns the early-flush `tts_node` off |
@@ -1511,12 +1511,12 @@ the latency work above (PR-4c) and on the filler, not on `min_words` alone. At t
 
 * **Endpointing 0.8 / 3.0 s** (was 0.7 / 3.5; the SDK's own 0.3 / 2.5 s committed a turn on a
   breath after a sentence-final clause, so a long answer was cut into several turns and several
-  replies). The **transition phase** runs 0.4 / 1.2 s (`r1_transition_endpointing`, sent through
-  `AgentSession.update_options(endpointing_opts=...)` on entering the phase; the session's own pair
-  is sent back on leaving it): the candidate only says "ready" there. The quick pair is a ceiling on
-  the session's numbers, never above them: an operator who sets `R1_ENDPOINT_MIN_DELAY_SEC` below 0.4
-  keeps the lower value. A failed update is logged as `r1_endpointing_update_failed` (type only) and
-  costs only the quicker window.
+  replies). Until 2026-11-03 the transition ran a quicker 0.4 / 1.2 s, because the candidate only
+  said "ready" there; since the consent transition (owner decision 2026-11-03, below) the candidate
+  asks Christy questions there too, and the quick pair split one question into two turns at a pause
+  (mock call aa166f09), so the transition keeps the session's pair. A "ready" is still read at its
+  final transcript, before the SDK commits the turn. `r1_latency.r1_transition_endpointing` is kept
+  but unused.
 * **One transcript row per committed candidate turn.** Sarvam closes an utterance at each of its own
   pauses, and the SDK merges those finals into one turn, so a long answer used to be 5-6
   `transcript_turns` rows, and the short ones ("Hello", "Good", "Okay") made 13.7% of the owner's
@@ -1946,11 +1946,10 @@ dropped by the SDK and the role-play just began (turns 13-18). All four are swit
 
 The brief on request needs no switch: a request to hear the role-play brief again during or right after
 L-TRANSITION (`r1_session.is_brief_request`, latched at the transcript event) replays L-TRANSITION word
-for word, once per session, and the ready flow continues (a later request gets the nudge). The wait after
-the replay is what is left of the 1:30 transition budget counted from the first L-TRANSITION (8-20 s), but
-the uninterruptible replay itself (about 36-45 s) can still take the transition past 1:30: after a full
-4:30 icebreaker the S 26:00 cap then trims up to about 25 s off the role-play's last minute (never the
-10:00 or 14:00 gates). A courtesy such as "Thank you once again" or "I wanted to understand this role
+for word, once per session, and the wait for the candidate's consent goes on (a later request gets
+the nudge). Since 2026-11-03 there is no deadline after the replay either: the role-play's S cap is
+counted from the pickup, so the replay never shortens the role-play (see "Consent transition"
+below). A courtesy such as "Thank you once again" or "I wanted to understand this role
 better" is no request; "Explain me again", "Pardon?" and "What is my role?" are. After the
 pickup the same request ("I wanted to understand this round, the role play brief") is a coaching request
 and gets the existing L-ASIDE-COACH. No new spoken line; the classifier's prompt is pinned content
@@ -1991,6 +1990,222 @@ the timeouts at the budget, and the prefilter hit rate on the advisor corpus (6.
 is scored as an exit. `--strict` exits 1 on any critical false end in either count.
 The labels (`tests/fixtures/r1_end_intent_labels.jsonl`) are a first draft and want an owner review.
 
+### Consent transition, icebreaker's last answer, wrap-up tone (owner decisions 2026-11-03)
+
+Mock call aa166f09 (2026-10-30, 68d84b13): the icebreaker ended on the candidate's unfinished "one
+more thing to be added is. I.", the learner picked up on the 20 s transition timer while the
+candidate was asking twice to ask questions first, and the wrap-up answered a complaint with "I
+understand, but ... from the approved information". The owner and the manager decided (2026-11-03):
+
+* **No auto-start (M1).** L-TRANSITION now ends: "When you'd like to begin, just say 'ready' and
+  she'll pick up. Shall we start the role-play now, or do you have any questions first?" Nothing
+  starts the role-play on a timer. `_run_transition` waits for consent: a start phrase with only
+  filler around it ("ready", "yes, let's start", "yeah, let's start the role play", "yes, we can
+  start", "let's get started", "go for it", "no questions, let's go"; `is_transition_consent`,
+  read at each final) or the "I'm ready" button. A turn that asks something is never consent, even
+  with "ready" in it ("What do I need to have ready?"). A short yes alone ("Yes.", "Okay.",
+  "Sure, go ahead."; `is_short_yes`) starts it only as the answer to a yes/no start question that
+  finished playing (L-TRANSITION-REASK, L-TRANSITION-STEER) with Christy quiet: said over her
+  answer or the brief it only acknowledges, and after the either/or L-TRANSITION or
+  L-TRANSITION-ASK it gets L-TRANSITION-NUDGE ("Yes." could mean "yes, a question").
+  * A question is answered by Christy (an LLM reply in the `transition` phase with
+    `r1_prompts.TRANSITION_REMINDER`: the role facts only, the hiring team for anything else, never
+    start or describe the role-play). Each answer ends with L-TRANSITION-ASK ("Shall we start the
+    role-play now, or do you have another question?") in the same, interruptible speech. A turn that
+    only asks whether they may ask ("can I ask a couple of questions?") gets "of course" and uses no
+    question.
+  * Up to `TRANSITION_QUESTION_LIMIT` (3) answers; the next question gets L-TRANSITION-STEER ("Let's
+    keep any other questions for the end of the interview ...") once, then L-TRANSITION-NUDGE. A
+    bare "No questions." gets the nudge too: it is not consent.
+  * Silence: L-TRANSITION-REASK after 20 s, L-TRANSITION-REASK-2 (which names the button) 30 s
+    later, and after 30 s more the silence close L-SIL-END (`candidate_left`), as in the other
+    phases (`TRANSITION_SILENCE_LADDER`, `TRANSITION_SILENCE_END_SECONDS`). Any candidate speech
+    starts the steps again.
+  * Ceiling: `TRANSITION_MAX_SECONDS` (6:00 from the start of L-TRANSITION; a muted microphone, a
+    candidate who never agrees) ends the interview with L-SIL-END. Log `r1_transition_ceiling`.
+  * The pickup (uninterruptible) waits while the candidate is still speaking, at most the
+    endpointing maximum plus 1 s, so "Yes, let's start, and ..." is not talked over.
+  * Christy's context in the transition holds the opening, the icebreaker and her own answers, never
+    a scripted line (the brief names the persona): history entries of `say` lines carry `scripted`.
+* **The role-play keeps its full time.** The role-play's S cap is counted from the pickup
+  (`r1_phases.roleplay_cap_sec`): pickup S + 20:00 + 1:30 for asides (R pauses in them, S does not),
+  never earlier than the old S = 26:00 and never later than **S = 29:15**
+  (`ROLEPLAY_CAP_CEILING_SEC`; 29:30 until M2 below took 15 s for the gentle closing,
+  `ROLEPLAY_CLOSE_ALLOWANCE_SEC`, so the closing still ends by S = 29:30). A pickup by S = 7:45 gets
+  the whole twenty minutes and 1:30 of asides. The forced close
+  moves from S = 30:00 to **S = 32:00** (`FORCED_CLOSE_SEC`), so the longest normal path is 31:57
+  (`NORMAL_PATH_MAX_SEC`; two participants, 63.9 minutes, still inside the 65-minute admission
+  hold). **The residency cap is unchanged** (`R1_SESSION_MAX_RESIDENCY_SEC` 2160, the ledger's 2190
+  s bound, migration 0128): the 2:00 no-show wait + 32:00 + the 0:15 close + the 1:30 rejoin grace
+  is 35:45 (`MAX_AGENT_RESIDENCY_SEC`). No migration, no API change.
+* **"Up to twenty minutes" (M3).** L-OPEN says "a sales role-play of up to twenty minutes" and
+  L-TRANSITION "The role-play runs for up to twenty minutes, and in that time your goal is to
+  convince her". The consent copy ("about 30 minutes") is unchanged and still true.
+* **The icebreaker's last answer (A1).** Once the soft exit is due (S >= 3:30 and four answers), a
+  committed turn that stops mid-thought (`is_unfinished_turn`: a dangling last word such as "and",
+  "the", "I", or a bare "one more thing") gets no reply and is not the boundary: the next committed
+  turn is, or `ICEBREAKER_CONTINUATION_WAIT_SECONDS` (5 s) of quiet after the candidate's last
+  speech (log `r1_icebreaker_continuation_wait`). A turn that cut off a reply of Christy's the
+  candidate was hearing is the candidate's own point going on: Christy answers it and the turn after
+  it is the boundary (log `r1_icebreaker_barge_in_answered`). The hard S = 4:30 cap and its bounded
+  hold are unchanged and are never deferred. The brief that follows now ends with the consent
+  question, so the candidate can still add their point there.
+* **The wrap-up tone (A4).** The interviewer prefix says "The only facts you may share about the
+  role: ..." and forbids calling them a list or approved information; `WRAPUP_REMINDER` tells
+  Christy to take a comment or complaint about the interview warmly (acknowledge, thank, say it has
+  been noted; never argue, explain or start with "I understand, but") and not to mention the hiring
+  team, which L-CLOSE does once.
+
+Content: `CONTENT_REVISION` 20 (`r1-content-v20+75183ab4e168`), new lines L-TRANSITION-ASK,
+L-TRANSITION-REASK, L-TRANSITION-REASK-2 and L-TRANSITION-STEER (the re-asks and the steer are
+warmed in the line cache; the ask travels inside Christy's reply). The API needs no change:
+transition rows were already a phase of their own and are never evidence (`transcript.ts`), and no
+new row kind or admin-log event exists. No environment variable was added.
+
+Live check (labels only): per session `r1_turn_plan` is absent in the transition (no role-play
+plan), the bot rows of phase `transition` show Christy's answers each ending with the start
+question, and the pickup row follows a candidate row that agrees. A session with
+`r1_transition_ceiling`, or one that ended `candidate_left` in the transition, is worth a look.
+
+### Leaving the role-play by consent (owner decisions 2026-11-03, M2)
+
+Mock call aa166f09: the learner's scripted WEAK line ("Let me think about it. I'll read through the
+email and get back to you.") resolved the commitment at R = 15:42, and plan 5.1's early exit played
+L-EXIT at the next candidate turn, which was a discovery question ("what is your challenge
+currently?"). The owner and the manager decided that leaving the role-play is consensual and never
+abrupt:
+
+* **No early exit; an offer instead.** A resolved commitment no longer ends the role-play
+  (`r1_session._roleplay_over`: only R = 20:00, the S cap, or the candidate's own end). From
+  **R = 14:00** (still the earliest point, `WRAP_OFFER_FROM_R_SEC`) Christy may **offer** to wrap
+  up, an out-of-role aside with R paused (`L-ASIDE-WRAP`): "This is Christy, your interviewer,
+  stepping in for a moment. We're well into the role-play now, so would you like to wrap it up
+  here? If you'd rather keep going, just carry on with <learner>." It is not an either/or question,
+  so a "yes" says which option it means (the rule L-ASIDE-END follows).
+* **When.** The commitment is resolved, or the call is going nowhere: 5 advisor turns in a row
+  that raised nothing new (no topic, figure or probe the advisor had not raised, no reason handled,
+  no call or price proposed; `WRAP_STALE_TURNS`), 3 hollow turns in a row ("Okay.", "Sure.";
+  `WRAP_HOLLOW_TURNS`), or 2 stall reasons from 14:00 on (`WRAP_LATE_STALLS`). "Going nowhere"
+  also waits until no graded move is owed (`OwedMoveScheduler.graded_moves_owed`: every required
+  F1-F4 move said, or its deadline plus `SLIP_LIMIT_SEC` past), so an accepted offer never ends the
+  role-play before F4-PRIMARY / F4-PUSH (due 15:30) and fails the API gate.
+* **Only at a natural pause.** A candidate turn is a pause only when it is made of
+  acknowledgement, courtesy and closing words ("Okay, great.", "Sure, sounds good.", "Got it,
+  thank you."), so a question left without its mark ("And your budget", "Any other doubts you
+  have"), a discovery prompt or a pitch lead-in ("Let me explain how the program works", "Hear me
+  out") never is; any other quiet is the pause path's. And never on a candidate turn that asks
+  something or digs (also without
+  its question mark: "you said ... what is your challenge currently"), pitches (more than 20 words,
+  a sales topic, a price or a figure, a new offer, a next step such as booking, a link, a payment),
+  works the sale (handles a reason, proposes a call or a price), or answers a question the learner
+  just asked. Either the candidate's turn leaves the pause ("Okay, that makes sense.", "Great, I'll
+  send it over.": the offer takes the place of her reply, and the turn stays a role-play turn), or
+  the candidate is quiet for `WRAP_OFFER_PAUSE_SEC` (6 s) after her line (log `r1_wrap_offer`,
+  category `pause`).
+* **At most twice** (`WRAP_OFFER_LIMIT`), never within **3 minutes of R** after a no
+  (`WRAP_OFFER_COOLDOWN_SEC`; a declined L-ASIDE-END counts for the cool-down too), and not from
+  **R = 18:30** (`WRAP_OFFER_UNTIL_R_SEC`: the 17:00 time cue has been said and the closing at time
+  is close).
+* **The answer** (`r1_tracker.accepts_wrap_offer`, `declines_wrap_offer`, `is_short_wrap_yes`):
+  * a yes ("Yes, let's wrap it up.", "We can stop here.", "I'm done.", "End the interview.", a
+    goodbye, or a short "Yes." / "Okay." / "Sounds good." once it has settled
+    `R1_BARE_YES_SETTLE_SEC`, exactly like a bare yes to L-ASIDE-END) ends the role-play: plan
+    reason `wrap_offer_accepted`, the turn's row is `aside`, then L-EXIT, L-WRAP and the normal
+    wrap-up. An end-intent model `end` on the answer counts as a yes too (the model is shown the
+    offer as the question asked);
+  * a short no ("No.", "Let's keep going.", "Not yet.") gets `L-ASIDE-WRAP-RESUME` ("Of course,
+    let's keep going. <learner> is back on the line.") and the role-play goes on in character; a no
+    that goes on to the learner, or the candidate simply carrying on with her, is answered by the
+    learner;
+  * "Sorry?" hears the offer again; a fragment ("Hmm.") or an unsettled short yes leaves it open;
+    silence lets the normal silence ladder run and counts as no answer.
+  Neither answer changes a grade, a disclosure or the schedule; the rows of the answers are `aside`
+  (never evidence, `transcript.ts`), and the admin log records every offer
+  (`early_close.wrap_offers`: R, trigger, answer; `wrap_accepted`).
+* **The time end is gentle.** At R = 20:00 (or the S cap) a candidate who is mid-turn is let finish
+  (an endpointing maximum plus 1 s after their last speech, at most 8 s,
+  `ROLEPLAY_END_HOLD_CEILING_SECONDS`; that turn is the boundary and gets no reply), the learner
+  closes in role with `L-TIME-UP` ("I'm sorry, I really have to go now. Thank you for your time."),
+  and then L-EXIT (log `r1_roleplay_time_up`). Her L-TIME-CUE between 17:00 and 19:00 is unchanged
+  and is the first lead-in. Not after the candidate ended it (a yes, a confirmed stop, the close
+  ladder's exit), not into a mute or an empty room.
+* **Unchanged:** the 10:00 scoring gate (`fidelity`), L-ASIDE-END before 14:00 with its bare yes and
+  the end-intent model, and from 14:00 (or with a commitment on record) an end request or a
+  goodbye is still a farewell on the close ladder (with the commitment on record it exits at once).
+  Only one interviewer question is ever open: the offer is never made while L-ASIDE-END waits.
+
+Scoring note: learner replies after the commitment are not masked (only the scripted commitment
+sentences are, `transcript.ts`), so a free reply in the minutes the role-play now runs on could
+restate the outcome in other words. This was already true between 13:00 and 14:00; the free reply
+after a commitment gets `RESOLVED_NOTE`, which only reacts to what is on record.
+
+Content: same `CONTENT_REVISION` 20 (new lines L-ASIDE-WRAP, L-ASIDE-WRAP-RESUME and L-TIME-UP, all
+warmed in the line cache). No environment variable was added, no migration, no API change: the new
+lines are bot rows in phases that existed (`aside`, `roleplay`), and no new admin-log event type.
+The rehearsal harness stops a call at an offer made after the commitment (stop reason
+`wrap_offer`, where it used to stop at `early_exit`) and answers an offer made to a call that is
+going nowhere with "No, let's keep going."; the owner-session replay stops where the early exit was.
+
+Live check (labels only): `r1_turn_reason` `wrap_offer:commitment_resolved` /
+`wrap_offer:going_nowhere` / `wrap_offer_at_pause`, then `wrap_offer_accepted` or
+`wrap_offer_declined`; `r1_roleplay_time_up` before an L-EXIT that the clock caused. A role-play
+that reached L-EXIT before 20:00 without `wrap_offer_accepted`, `end_confirmed` or
+`close_attempt_exit` is a defect.
+
+### The learner after mock call aa166f09 (owner and manager decisions of 2026-11-03, M4, L1-L7)
+
+The RCA of mock call aa166f09 (Shalini, research scholar) found the learner refusing her employer
+and salary six times, running out of things to ask by 6:40, tacking a new worry onto most replies,
+saying she had placed the call, calling a $1,000-a-month EMI "workable" and naming her partner four
+times. What changed (all learner-side, `CONTENT_REVISION` 20):
+
+* **Her work is on her card (M4).** Each variant has a `workplace` ("a university research lab in
+  Boston", "a regional bank in Charlotte": a kind of employer and a town, never a real name) and
+  each persona a `role` and a round `salary` (p1 $85,000, p2 $60,000, p3 $90,000, p4 $62,000 a
+  year). The card tells her to share them plainly when asked politely, as a lead who filled in a
+  form would. They are marker-free (the research scholar never says "stipend" or "postdoc salary",
+  her H3 markers; `tests/test_r1_personas.py` checks every variant), so the deep-need gate is
+  unchanged. The guard lets her say her own salary figure and no other persona's.
+* **Who called whom (L4).** The card says the Program Advisor is calling her back about her form;
+  the guard's `learner_called` rule also drops "I'm calling about ...", "I thought I was the one
+  calling" and "I'm the one who called".
+* **Probes (L3).** "Can I know your budget?" and "can I understand what your challenge is?" are
+  questions about the learner again (only "can I send / set up / offer ..." is an offer), and "what
+  are you expecting / looking for / hoping" is an open question (the deep layer of a released need
+  can follow it). Salary and CTC words are not added to the money probes: she answers them from
+  the card.
+* **Curiosity (L1).** A topic is used up only when her spoken question covers it (or the advisor
+  answered it), her own questions count, and the pool has 8 topics (batch size, prerequisites and
+  job-search help joined). A topic handed over twice without being asked is not handed over again
+  (`CURIOSITY_OFFER_LIMIT`). Before 17:00 a check-in with nothing left to ask gets the ordinary
+  check-in note; from 17:00 `CHECKIN_DONE_NOTE`, which now also says not to close the call and not
+  to say she will get back to them. Admin log: `intents.curiosity_asked`, `curiosity_offered`.
+* **Fewer tacked-on objections (L2).** The intent note no longer says "raise something of your
+  own": it has two shapes and two lengths (rotated per turn), and on a turn where the advisor asked
+  about her it says to answer that first and let the point follow from the answer. While the advisor
+  is mid-discovery and the plan has slack (`_may_hold`: not forced, has a deadline, ahead of pacing)
+  an owed move waits up to `DISCOVERY_HOLD_LIMIT` (2) more turns after the one dig deferral (plan
+  reason `owed_deferred_for_discovery`, admin log `intents.discovery_holds`). Deadlines, the forced
+  path, the pacing map and the delivery markers are unchanged, so every graded move still lands; at
+  40 s an exchange there is no slack and nothing changes.
+* **Prices (L5).** "Maybe we can offer you $6000" is an offer (a leading maybe/perhaps before "we
+  can offer / I can give" is a filler; "maybe I can try" stays a hedge). A percentage comes off the
+  price the advisor stated in the same turn ("50% ... you would pay $12000" is $6,000, not $4,500).
+  A monthly figure ("$1000 EMI", "$1,000 a month", "EMIs of $1,500") is read (`monthly_amounts`),
+  is never taken as the whole price, and above the card's $500-700 a month
+  (`MONTHLY_BUDGET_MAX_USD`) she is told it is more than she can manage (`BUDGET_OVER_NOTE`); for 3
+  turns the guard replaces "that's workable / doable / works for me" with "That's still more than I
+  can manage each month, though." (`over_budget_accepted`).
+* **Coercion (L6).** `coercive_urgency` also catches "available only for today" and "later you'll
+  have to pay $X".
+* **The decision maker once (L7).** Once she said she would talk to her decision maker (any reply
+  that proves the F4 push's markers), a free reply is told not to say it again unless the advisor
+  asks who else decides, and the owed F4 push refers back to it ("Like I said, I'd need to talk it
+  over with my partner first."), with the same markers, so the graded push is still delivered.
+
+No environment variable, migration, API or transcript-masking change: no new line id, row kind or
+admin-log event type (`app/api/src/lib/r1` is untouched).
+
 ### Live-UI signals and the "I'm ready" relay (R1-Q)
 
 The candidate's page follows three more participant attributes of the **agent** (the page trusts only
@@ -2004,11 +2219,12 @@ of them is the bare `{"phase": ...}` it always was.
 |---|---|---|
 | `leadname` | the simulated learner's name, e.g. `Meera Iyer` (letters, spaces, `'`, `-`, at most 40; anything else is not published) | in the SAME `set_attributes` call as `phase=transition`; kept afterwards |
 | `awaiting` | `ready` | with `phase=transition`; `""` with the next phase write (including a reconnect pause; the rejoin into the transition asks again, unless the button was already pressed) |
-| `rpleft` | whole seconds of role-play budget left (`remaining_roleplay_seconds()`: the shorter of the 20:00 role-play clock and the 26:00 session cap), clamped 0..3600 | with every phase write while the role-play runs or is paused (`roleplay`, `aside`, a reconnect pause inside it, the rejoin); a **30 s heartbeat** while the phase is `roleplay` (`RPLEFT_HEARTBEAT_SECONDS`, refreshed value only, coalesced so a stuck writer is not flooded); `""` with the first phase write after the role-play (`roleplay_exit`, `closing`, `aborted`) |
+| `rpleft` | whole seconds of role-play budget left (`remaining_roleplay_seconds()`: the shorter of the 20:00 role-play clock and the role-play's S cap, `roleplay_cap_sec`), clamped 0..3600 | with every phase write while the role-play runs or is paused (`roleplay`, `aside`, a reconnect pause inside it, the rejoin); a **30 s heartbeat** while the phase is `roleplay` (`RPLEFT_HEARTBEAT_SECONDS`, refreshed value only, coalesced so a stuck writer is not flooded); `""` with the first phase write after the role-play (`roleplay_exit`, `closing`, `aborted`) |
 
-It is an upper bound, not a promise: the role-play can end early (R >= 14:00 with the commitment
-resolved, or a candidate who confirmed they want to stop, which ends the role-play into the
-wrap-up: see "Out-of-role requests" above). An old
+It is an upper bound, not a promise: the role-play can end early when the candidate chooses to
+(a yes to Christy's offer to wrap up from R >= 14:00, see "Leaving the role-play by consent", a
+goodbye, or a confirmed request to stop, which ends the role-play into the wrap-up: see
+"Out-of-role requests" above). An old
 page ignores all three; a new page with an old worker simply shows no button and no clock.
 
 **The "I'm ready" button.** The candidate token has `canPublishData: false` (R1-PLAN threat 13), so the

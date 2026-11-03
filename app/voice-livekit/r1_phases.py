@@ -26,16 +26,32 @@ class R1Phase(str, Enum):
     ABORTED = "aborted"
 
 
-# 4:30 icebreaker + 1:30 transition + 20:00 role-play to S=26:00 + 0:12 exit + 2:00 wrap + 0:15
-# close.
-NORMAL_PATH_MAX_SEC = 26 * 60 + 12 + 120 + 15
-MAX_AGENT_RESIDENCY_SEC = 120 + 30 * 60 + 15 + 90
 # S-clock hard caps (plan section 5.1): icebreaker S=4:30, role-play S=26:00, forced close S=30:00.
+# Owner decision 2026-11-03 (M1): the role-play starts only when the candidate agrees, after any
+# questions they ask Christy first, so the role-play's S cap is counted from the pickup: R=20:00
+# plus ``ROLEPLAY_PAUSE_ALLOWANCE_SEC`` of S for asides and mute pauses (R stops in them, S does
+# not), never earlier than the old S=26:00 and never later than the ceiling S=29:15.  A pickup by
+# S=7:45 therefore still gets the whole twenty minutes.  The forced close moves to S=32:00, so the
+# longest normal path (S=29:15 + 0:15 closing + 0:12 exit + 2:00 wrap + 0:15 close = 31:57) still
+# ends before it and two participants stay inside the 65-minute admission hold.  The residency cap
+# (2160 s, the usage ledger's 2190 s bound) is unchanged: the 2:00 no-show wait + 32:00 + the 0:15
+# close + the 1:30 rejoin grace is 35:45.
+# M2 (same decisions): the role-play's end is never abrupt, so its closing (a hold for a candidate
+# who is mid-turn, then the learner's L-TIME-UP; ``r1_session``) gets
+# ``ROLEPLAY_CLOSE_ALLOWANCE_SEC`` after the cap.  The ceiling is S=29:15 (it was 29:30) so that the
+# closing still ends by S=29:30.
 ICEBREAKER_HARD_SEC = 270.0
 ROLEPLAY_RESUME_CAP_SEC = 1560.0
-FORCED_CLOSE_SEC = 1800.0
-# R-clock role-play budgets: a 20:00 hard end (the length L-TRANSITION announces), and a soft end
-# at 19:00 once the commitment is resolved.
+ROLEPLAY_PAUSE_ALLOWANCE_SEC = 90.0
+ROLEPLAY_CAP_CEILING_SEC = 1755.0
+ROLEPLAY_CLOSE_ALLOWANCE_SEC = 15.0
+FORCED_CLOSE_SEC = 1920.0
+NORMAL_PATH_MAX_SEC = (
+    int(ROLEPLAY_CAP_CEILING_SEC) + int(ROLEPLAY_CLOSE_ALLOWANCE_SEC) + 12 + 120 + 15
+)
+MAX_AGENT_RESIDENCY_SEC = 120 + int(FORCED_CLOSE_SEC) + 15 + 90
+# R-clock role-play budgets: a 20:00 hard end (L-TRANSITION announces "up to twenty minutes"), and a
+# soft end at 19:00 once the commitment is resolved.
 ROLEPLAY_HARD_R_SEC = 1200.0
 ROLEPLAY_SOFT_R_SEC = 1140.0
 
@@ -266,9 +282,24 @@ class R1PhaseMachine:
         """Return the hard icebreaker budget; driver waits may never exceed it."""
         return max(0.0, ICEBREAKER_HARD_SEC - self.session_clock)
 
+    @property
+    def roleplay_cap_sec(self) -> float:
+        """The S value at which the role-play must end (M1: counted from the pickup).
+
+        R=20:00 plus the pause allowance after the S at which the role-play began (before the
+        pickup: as if it began now), never below the old S=26:00 and never above S=29:15.
+        """
+        if self._roleplay_started is None:
+            origin = self.session_clock
+        else:
+            base = self.started_at if self._activated_at is None else self._activated_at
+            origin = max(0.0, self._roleplay_started - base)
+        span = origin + ROLEPLAY_HARD_R_SEC + ROLEPLAY_PAUSE_ALLOWANCE_SEC
+        return min(ROLEPLAY_CAP_CEILING_SEC, max(ROLEPLAY_RESUME_CAP_SEC, span))
+
     def remaining_roleplay_cap_seconds(self) -> float:
-        """Return the S=26:00 role-play cap; S keeps running through every pause."""
-        return max(0.0, ROLEPLAY_RESUME_CAP_SEC - self.session_clock)
+        """Return the time to the role-play's S cap (``roleplay_cap_sec``); S never pauses."""
+        return max(0.0, self.roleplay_cap_sec - self.session_clock)
 
     def remaining_roleplay_seconds(self) -> float:
         """Return min(R budget, S cap); R excludes deliberate pauses, S never pauses."""
@@ -293,7 +324,7 @@ class R1PhaseMachine:
     def roleplay_should_end(self, commitment_resolved: bool = False) -> bool:
         """Apply role-play's soft, earned-early, and hard phase exits."""
         return (
-            self.session_clock >= ROLEPLAY_RESUME_CAP_SEC
+            self.session_clock >= self.roleplay_cap_sec
             or self.roleplay_elapsed >= ROLEPLAY_HARD_R_SEC
             or (self.roleplay_elapsed >= ROLEPLAY_SOFT_R_SEC and commitment_resolved)
         )

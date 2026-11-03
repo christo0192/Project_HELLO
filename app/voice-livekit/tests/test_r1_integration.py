@@ -28,6 +28,8 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 import r1_llm
+import r1_phases
+import r1_roleplay
 import r1_session
 from r1_commitment import Level, commitment_line, stall_line
 from r1_content import CONTENT_SHA256, CONTENT_VERSION
@@ -187,7 +189,9 @@ class SlowIntentReplies(FakeProvider):
 
     def __call__(self, messages):
         self.calls.append([dict(message) for message in messages])
-        if "raise something of your own" in "\n".join(m["content"] for m in messages):
+        # Every intent reminder hands its brief over with this line (L2 changed the shapes).
+        owed = "Raise this in your own words, as a real person would"
+        if owed in "\n".join(m["content"] for m in messages):
             return self._hang_forever()
         return self._stream("Okay, that makes sense.")
 
@@ -1598,29 +1602,200 @@ class TestCommitmentIsDeterministic(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcomes[0], outcomes[1])
         self.assertIsNotNone(outcomes[0][1])
 
-    async def test_a_resolved_commitment_ends_the_roleplay_at_the_next_turn_from_fourteen_minutes(
+    async def test_a_resolved_commitment_from_fourteen_minutes_no_longer_ends_the_roleplay(
         self,
     ) -> None:
+        # M2 (2026-11-03): the early exit is an offer now (``TestTheRoleplayEndsByConsent``).
         rig = Rig()
         await rig.start_roleplay()
         await rig.converse(OPENER, advance=20)
         rig.engine.scheduler.mark_commitment_resolved()
-        rig.clock.advance(r1_session.EARLY_EXIT_R_SEC - 21)
+        rig.clock.advance(r1_roleplay.WRAP_OFFER_FROM_R_SEC + 100)  # R = 15:40
         self.assertFalse(rig.interview._roleplay_over())
-        rig.clock.advance(1.0)
-        self.assertTrue(rig.interview._roleplay_over())
-        # Not while the learner is still finishing its own line: the wait goes on until the
-        # advisor's next turn, which is the boundary L-EXIT then answers.
         self.assertGreater(rig.interview._roleplay_budget_left(), 0.0)
-        self.assertIsNone(await rig.converse("Great, I'll send it over.", advance=1))
-        self.assertIsNone(await rig.interview._roleplay_turn())  # takes that turn from the queue
+        self.assertTrue(await rig.converse("What would help you decide?", advance=1))
+        self.assertFalse(rig.interview._roleplay_over())
+
+
+# Mock call aa166f09 (owner, 2026-11-03), the advisor's turns 111, 113 and 115 verbatim.
+T111 = (
+    "So anything else you want us to be sharing in terms of details or any any other questions "
+    "you have?"
+)
+T113 = (
+    "When we should follow up on this. Do we need to follow up on this? Should we call you "
+    "again? Or you will decide and come back. How much time can we have? Can we have some light "
+    "there?"
+)
+T115 = (
+    "Still, can I can I understand Shreya, like what exactly, so you said you want to move to a "
+    "proper corporate from academia, what is your challenge currently?"
+)
+# The cooperative script at this gap ends at R = 14:50, so the owner's 113 is put off with the
+# scripted WEAK line at R = 15:45, where the owner heard it (R = 15:42).
+OWNER_REPLAY_GAP = 58
+
+
+async def owners_close(rig: Rig) -> None:
+    """The owner's close (aa166f09 turns 110-114) after a cooperative call: WEAK at R = 15:45."""
+    await rig.start_roleplay()
+    for index, text in enumerate(cooperative_script()):
+        await rig.converse(text, advance=20 if index == 0 else OWNER_REPLAY_GAP)
+    await rig.converse("Okay.", advance=15)  # 110
+    await rig.converse(T111, advance=10)  # 111: the learner's reply is 112
+    for _ in range(3):  # 113, as often as she has a stall reason left first; then her 114
+        await rig.converse(T113, advance=15)
+        if rig.engine.commitment_resolved:
+            break
+
+
+class TestTheRoleplayEndsByConsent(unittest.IsolatedAsyncioTestCase):
+    """M2 (owner and manager decisions of 2026-11-03): leaving the role-play is never abrupt.
+
+    Mock call aa166f09: the WEAK line at 114 resolved the commitment at R = 15:42 and L-EXIT cut
+    off the advisor's discovery question at 115.  Now the question gets the learner's answer, and
+    Christy offers to wrap up at the next natural pause; a yes ends the role-play, a no resumes it.
+    """
+
+    async def offered(self, *, at_pause: bool = False) -> Rig:
+        """The owner's 110-115, then the offer (after a pause turn, or a quiet after her line)."""
+        rig = Rig()
+        await owners_close(rig)
+        self.assertEqual(rig.engine.commitment_level, Level.WEAK)
+        self.assertGreaterEqual(rig.machine.roleplay_elapsed, r1_roleplay.WRAP_OFFER_FROM_R_SEC)
+        self.assertTrue(await rig.converse(T115, advance=10))
+        if at_pause:
+            with mock.patch.object(r1_session, "WRAP_OFFER_PAUSE_SEC", 0.05):
+                self.assertIsNone(await asyncio.wait_for(rig.interview._roleplay_turn(), 5.0))
+        else:
+            self.assertIsNone(await rig.converse("Okay, that makes sense.", advance=10))
+        await rig.until_spoken("L-ASIDE-WRAP")
+        self.assertTrue(rig.engine.wrap_question_open)
+        self.assertIs(rig.machine.phase, R1Phase.ROLEPLAY)  # back from the aside
+        return rig
+
+    async def test_the_owners_discovery_question_after_the_commitment_gets_her_answer(
+        self,
+    ) -> None:
+        rig = Rig()
+        await owners_close(rig)
+        self.assertTrue(rig.engine.commitment_resolved)
+        answer = await rig.converse(T115, advance=10)
+        self.assertTrue(answer)  # main: None, and L-EXIT over the question
+        self.assertFalse(rig.interview._roleplay_over())
+        self.assertFalse(rig.engine.wrap_question_open)  # never offered over a question
+        self.assertNotIn(rig.interview.render_line("L-EXIT"), rig.session.spoken)
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "roleplay")
+
+    async def test_the_offer_follows_a_turn_that_leaves_a_pause(self) -> None:
+        rig = await self.offered()
+        offer = rig.interview.render_line("L-ASIDE-WRAP")
+        self.assertIn(rig.persona.first_name, offer)
+        self.assertEqual(rig.session.spoken[-1], offer)
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "roleplay")  # said to the learner
+        offers = rig.engine.admin_log()["early_close"]["wrap_offers"]
+        self.assertEqual([item["trigger"] for item in offers], ["commitment_resolved"])
+
+    async def test_a_quiet_after_her_answer_carries_the_offer(self) -> None:
+        rows = None
+        rig = await self.offered(at_pause=True)
+        rows = len(rig.candidate_rows())
+        offers = rig.engine.admin_log()["early_close"]["wrap_offers"]
+        self.assertEqual(len(offers), 1)
+        self.assertIsNone(offers[0]["transcript_turn"])  # no candidate turn carried it
+        self.assertIsNone(offers[0]["answer"])
+        self.assertEqual(len(rig.candidate_rows()), rows)
+
+    async def test_yes_to_the_offer_ends_the_roleplay_into_the_wrapup(self) -> None:
+        rig = await self.offered()
+        self.assertIsNone(await rig.converse("Yes, let's wrap it up here.", advance=3))
+        self.assertTrue(rig.engine.wrap_accepted)
+        self.assertTrue(rig.interview._roleplay_over())
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "aside")  # said to the interviewer
+        # The candidate ended it, so the driver goes straight on to L-EXIT: no L-TIME-UP.
+        self.assertIsNone(await rig.interview._run_roleplay())
+        self.assertNotIn(rig.interview.render_line("L-TIME-UP"), rig.session.spoken)
+        offers = rig.engine.admin_log(final=True)["early_close"]["wrap_offers"]
+        self.assertEqual([item["answer"] for item in offers], ["yes"])
+
+    async def test_a_bare_yes_to_the_offer_ends_it_once_it_has_settled(self) -> None:
+        rig = await self.offered(at_pause=True)
+        with mock.patch.dict(os.environ, {"R1_BARE_YES_SETTLE_SEC": "0"}):
+            self.assertIsNone(await rig.converse("Yes.", advance=3))
+        self.assertTrue(rig.engine.wrap_accepted)
         self.assertTrue(rig.interview._roleplay_over())
 
-    async def test_the_early_rule_does_not_fire_before_the_commitment_is_resolved(self) -> None:
+    async def test_no_to_the_offer_resumes_the_roleplay_in_character(self) -> None:
+        rig = await self.offered()
+        self.assertIsNone(await rig.converse("No, let's keep going.", advance=3))
+        await rig.until_spoken("L-ASIDE-WRAP-RESUME")
+        self.assertFalse(rig.interview._roleplay_over())
+        self.assertFalse(rig.engine.wrap_question_open)
+        self.assertEqual(rig.candidate_rows()[-1]["phase"], "aside")
+        # The learner answers the next turn, and a pause in the cool-down gets her, not Christy.
+        self.assertTrue(await rig.converse("Tell me more about your current role.", advance=10))
+        self.assertTrue(await rig.converse("Okay, sure.", advance=10))
+        offer = rig.interview.render_line("L-ASIDE-WRAP")
+        self.assertEqual(rig.session.spoken.count(offer), 1)
+        offers = rig.engine.admin_log()["early_close"]["wrap_offers"]
+        self.assertEqual([item["answer"] for item in offers], ["no"])
+
+    async def test_carrying_on_with_the_learner_is_a_no_she_answers(self) -> None:
+        for text, answer in (
+            ("The mentors are all from industry, and they help with your portfolio.", "carried_on"),
+            ("No, let me tell you how the mentors help people move out of academia.", "no"),
+        ):
+            with self.subTest(text=text):
+                rig = await self.offered()
+                self.assertTrue(await rig.converse(text, advance=3))  # the learner answers it
+                self.assertFalse(rig.engine.wrap_question_open)
+                resume = rig.interview.render_line("L-ASIDE-WRAP-RESUME")
+                self.assertNotIn(resume, rig.session.spoken)
+                self.assertEqual(rig.candidate_rows()[-1]["phase"], "roleplay")
+                offers = rig.engine.admin_log()["early_close"]["wrap_offers"]
+                self.assertEqual([item["answer"] for item in offers], [answer])
+
+
+class TestTheTimeRunsOutGently(unittest.IsolatedAsyncioTestCase):
+    """M2: the end of the role-play's time is never abrupt (L-TIME-UP, then L-EXIT)."""
+
+    async def test_at_twenty_minutes_the_learner_closes_in_role_before_the_exit(self) -> None:
         rig = Rig()
         await rig.start_roleplay()
-        rig.clock.advance(r1_session.EARLY_EXIT_R_SEC + 100)  # R = 15:40, past the 14:00 rule
-        self.assertFalse(rig.interview._roleplay_over())
+        await rig.converse(OPENER, advance=20)
+        rig.clock.advance(r1_phases.ROLEPLAY_HARD_R_SEC)
+        self.assertTrue(rig.interview._roleplay_over())
+        self.assertIsNone(await asyncio.wait_for(rig.interview._run_roleplay(), 5.0))
+        self.assertEqual(rig.session.spoken[-1], rig.interview.render_line("L-TIME-UP"))
+        self.assertEqual(rig.writer.saved[-1]["phase"], "roleplay")  # the learner's own line
+
+    async def test_the_closing_waits_for_the_candidate_who_is_mid_turn(self) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        rig.clock.advance(r1_phases.ROLEPLAY_HARD_R_SEC)
+        rig.final("And one more thing about the")  # a final whose turn has not committed yet
+        await rig.settle()
+        task = asyncio.create_task(rig.interview._run_roleplay())
+        await rig.settle()
+        self.assertFalse(task.done())
+        time_up = rig.interview.render_line("L-TIME-UP")
+        self.assertNotIn(time_up, rig.session.spoken)
+        # The turn commits: it is the boundary, it gets no reply, and the closing follows.
+        with self.assertRaises(r1_session.StopResponse):
+            await rig.agent.on_user_turn_completed(
+                None, SimpleNamespace(text_content="And one more thing about the", id="m1")
+            )
+        self.assertIsNone(await asyncio.wait_for(task, 5.0))
+        self.assertEqual(rig.session.spoken[-1], time_up)
+
+    async def test_no_closing_line_after_the_candidate_ended_it(self) -> None:
+        rig = Rig()
+        await rig.start_roleplay()
+        await rig.converse(OPENER, advance=20)
+        rig.engine.exit_requested = True
+        self.assertIsNone(await rig.interview._run_roleplay())
+        self.assertNotIn(rig.interview.render_line("L-TIME-UP"), rig.session.spoken)
 
 
 class TestTheJudgeIsDeterministic(unittest.IsolatedAsyncioTestCase):
@@ -2283,24 +2458,32 @@ class TestEndToEnd(R1TestCase):
         self.assertTrue(all(spoken))
         self.assertIs(interview.machine.phase, R1Phase.ROLEPLAY)
         self.assertGreaterEqual(len(interview.engine.scheduler.deliveries()), 9)
-        # The commitment was asked for after R = 13:00, so the role-play is over at the next
-        # boundary (R >= 14:00, resolved): the interviewer answers it with L-EXIT.
+        # The commitment was asked for after R = 13:00 and is resolved, but M2 (2026-11-03): that
+        # no longer ends the role-play at the next turn.  It is R = 18:50, past the last point for
+        # an offer to wrap up, so the advisor's pitch gets the learner's reply ...
         self.assertTrue(interview.engine.commitment_resolved)
         self.assertEqual(spoken[-1], stall_line(interview.persona.decision_maker))
-        self.clock.advance(5)
-        self.final_transcript("let me summarise the offer")
+        spoken.append(await self.converse("let me summarise the offer", 5))
+        self.assertTrue(spoken[-1])
+        self.assertIs(interview.machine.phase, R1Phase.ROLEPLAY)
+        # ... and at R = 20:00 the turn in flight is the boundary: the learner closes in role
+        # (L-TIME-UP), then L-EXIT and the wrap-up.
+        self.assertIsNone(await self.converse("So the total comes to nine thousand.", 75))
         with mock.patch.object(r1_session, "WRAPUP_SETTLE_SECONDS", 0.05):
             await self.candidate_replies_after("L-WRAP", "No questions, thanks")
             self.assertEqual(await asyncio.wait_for(task, 10.0), "complete")
 
-        expected_lines = ["L-OPEN", "L-TRANSITION", "L-PICKUP", "L-EXIT", "L-WRAP", "L-CLOSE"]
+        expected_lines = [
+            "L-OPEN", "L-TRANSITION", "L-PICKUP", "L-TIME-UP", "L-EXIT", "L-WRAP", "L-CLOSE",
+        ]
         self.assertEqual(self.session.spoken, [self.spoken_line(name) for name in expected_lines])
         rows = self.bot_rows()
         phases = [row["phase"] for row in rows]
-        self.assertEqual(phases.count("roleplay"), len(spoken))
+        self.assertEqual(phases.count("roleplay"), len(spoken) + 1)  # the replies and L-TIME-UP
         self.assertEqual(
             [row["phase"] for row in rows if row["text"] in self.session.spoken],
-            ["opening", "transition", "transition", "roleplay_exit", "wrapup", "closing"],
+            ["opening", "transition", "transition", "roleplay", "roleplay_exit", "wrapup",
+             "closing"],
         )
         # No learner line ever reached an interviewer phase and vice versa.
         for row in rows:
@@ -3075,13 +3258,18 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         # inside a reply stream (the scheduler's move; the guard's swap), L-FAQ-DEFER has no
         # runtime caller and L-OPEN is spoken before anything could be warm: warming them would
         # spend the Sarvam budget it shares with the phone lane on audio nothing can play.
-        for line_id in ("L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER", "L-OPEN"):
+        # M1: L-TRANSITION-ASK travels inside Christy's answers before the role-play, so it is
+        # not warmed either; the re-asks and the steer are ``say`` lines and are.
+        unreachable = ("L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER", "L-OPEN", "L-TRANSITION-ASK")
+        for line_id in unreachable:
             self.assertNotIn(line_id, r1_session._WARM_ORDER)
         self.assertEqual(
             r1_session._WARM_ORDER,
             (
-                "L-TRANSITION", "L-TRANSITION-NUDGE", "L-PICKUP", "L-EXIT", "L-WRAP", "L-CLOSE",
-                "L-ASIDE-COACH", "L-ASIDE-END", "L-MUTE", "L-SIL-IB", "L-SIL-RP1",
+                "L-TRANSITION", "L-TRANSITION-NUDGE", "L-TRANSITION-REASK", "L-TRANSITION-STEER",
+                "L-TRANSITION-REASK-2", "L-PICKUP", "L-EXIT", "L-WRAP", "L-CLOSE",
+                "L-ASIDE-COACH", "L-ASIDE-END", "L-ASIDE-WRAP", "L-ASIDE-WRAP-RESUME",
+                "L-TIME-UP", "L-MUTE", "L-SIL-IB", "L-SIL-RP1",
                 "L-SIL-RP2", "L-REJOIN", "L-REJOIN-RP", "L-SIL-END", "L-SYSTEM-STOP",
             ),
         )
@@ -3089,9 +3277,9 @@ class TestLineCacheInTheSession(unittest.IsolatedAsyncioTestCase):
         specs = rig.interview._warm_specs(candidate_free=True) + rig.interview._warm_specs(
             candidate_free=False
         )
-        self.assertEqual(len(specs), 16)
+        self.assertEqual(len(specs), 22)  # M2 adds the offer, its resume line and L-TIME-UP
         warmed = {spec.text for spec in specs}
-        for line_id in ("L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER"):
+        for line_id in ("L-TIME-CUE", "L-NO-FEEDBACK", "L-FAQ-DEFER", "L-TRANSITION-ASK"):
             self.assertNotIn(rig.interview.render_line(line_id), warmed)
 
     async def test_the_background_warm_up_fills_the_cache_and_is_released_at_exit(self) -> None:

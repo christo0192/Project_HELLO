@@ -819,5 +819,103 @@ class FinalReviewRoundOneProbeTests(unittest.TestCase):
         self.assertTrue(asks_about_learner("Is he more of a sounding board, or does he need convincing?"))
 
 
+class LearnerPublicFactsS03Tests(unittest.TestCase):
+    """Mock call aa166f09 (owner and manager decisions of 2026-11-03): M4, L3 and L4."""
+
+    def test_every_variant_shares_her_workplace_job_and_a_round_salary(self):
+        from r1_personas import H_TOPICS
+
+        for persona in PERSONAS:
+            for variant in persona.variants:
+                rendered = resolve_persona(persona.id, variant=variant.id)
+                with self.subTest(persona=persona.id, variant=variant.id):
+                    labels = [label for label, _answer in rendered.work_answers]
+                    self.assertEqual(
+                        labels,
+                        [
+                            "where you work",
+                            "your job and how long you have been in it",
+                            "roughly what you earn",
+                        ],
+                    )
+                    card = rendered.public_card_text()
+                    for _label, answer in rendered.work_answers:
+                        self.assertIn(f'"{answer}"', card)
+                        self.assertTrue(answer.isascii())
+                        for topic in H_TOPICS:  # the deep-need gate stays intact
+                            for marker in rendered.markers(topic):
+                                self.assertIsNone(marker.search(answer), (answer, marker.pattern))
+                    self.assertIn("do not refuse", card)
+                    self.assertEqual(len(rendered.card_amounts), 1)
+                    self.assertTrue(30000 <= next(iter(rendered.card_amounts)) <= 150000)
+
+    def test_the_research_scholar_never_says_stipend_or_postdoc_salary(self):
+        shalini = resolve_persona("p4_research_scholar", variant="v1")
+        words = " ".join(answer for _label, answer in shalini.work_answers).lower()
+        self.assertNotIn("stipend", words)
+        self.assertNotIn("postdoc salary", words)
+        self.assertNotIn("postdoc budget", words)
+        self.assertIn("university research lab in boston", words)
+
+    def test_the_card_says_the_advisor_is_calling_her_back(self):
+        for persona in PERSONAS:
+            card = resolve_persona(persona.id, variant=persona.variants[0].id).public_card_text()
+            self.assertIn("The Program Advisor is calling you back about that form", card)
+            self.assertIn("you did not call them", card)
+
+    def test_can_i_know_is_a_question_about_the_learner(self):
+        from r1_personas import asks_about_learner
+
+        # L3 (mock call aa166f09, turns 49 and 115).
+        self.assertEqual(detect_probes("Can I know your budget?"), frozenset({"H3"}))
+        self.assertEqual(
+            detect_probes("Can I understand what is your challenge currently?"),
+            frozenset({"H2"}),
+        )
+        self.assertTrue(asks_about_learner("Could I just know your timeline?"))
+        # An offer is still no probe.
+        for text in (
+            "Can I send you the payment link?",
+            "Can we set up a call with your husband?",
+            "Could I offer you a payment plan for your budget?",
+            # Review fix: offering to look something up is no question about her (each moved
+            # H3 from SURFACE to released in the disclosure gate).
+            "Can I check the payment options and get back to you?",
+            "Could I find out from my team whether an instalment plan is possible?",
+            "Can I check with our finance team on an EMI plan for you?",
+            "Can I get a sense of the payment plans our team offers and share them?",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(detect_probes(text), frozenset())
+                self.assertFalse(asks_about_learner(text))
+
+    def test_offering_to_look_up_payment_never_releases_the_money_need(self):
+        from r1_tracker import DisclosureGate
+
+        gate = DisclosureGate(resolve_persona("p4_research_scholar", variant="v1"))
+        for text in (
+            "Can I check the payment options and get back to you?",
+            "Can I check with our finance team on an EMI plan for you?",
+        ):
+            with self.subTest(text=text):
+                observed = gate.observe_candidate_turn(text)
+                self.assertEqual(observed.first_probes, ())
+                self.assertEqual(observed.released, ())
+
+    def test_what_are_you_expecting_is_an_open_question(self):
+        from r1_personas import asks_open_question
+
+        # L3 (mock call aa166f09, turns 51, 59, 68, 70 and 90).
+        for text in (
+            "So what are you expecting from the course?",
+            "What were you hoping to get out of it?",
+            "What are you looking for?",
+            "what're you actually expecting from this call",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(asks_open_question(text))
+        self.assertFalse(asks_open_question("We are expecting a big batch this month."))
+
+
 if __name__ == "__main__":
     unittest.main()

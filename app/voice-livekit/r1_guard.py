@@ -83,6 +83,7 @@ from r1_commitment import Level, classify_learner_commitment
 from r1_personas import (
     ALL_PERSONA_NAMES,
     H_TOPICS,
+    MONTHLY_BUDGET_MAX_USD,
     PERSONAS,
     PUBLIC_ANSWERS,
     RenderedPersona,
@@ -309,14 +310,48 @@ _GRANT_GRATITUDE = re.compile(
 # What the learner says in place of a misreading (never the misreading itself).
 ANCHOR_REPLACEMENT = "So what would the actual price come to?"
 GRATITUDE_REPLACEMENT = "That would be good to know."
+# L5 (mock call aa166f09, turn 107: "Okay, that's more workable for me." to "$1000 EMI option
+# monthly", over the card's $500-700 a month).  A monthly figure above the card's budget is never
+# called workable; the learner says so instead.
+BUDGET_REPLACEMENT = "That's still more than I can manage each month, though."
+_PAYMENT_OK = re.compile(
+    r"\b(?:workable|doable|manageable|affordable)\b"
+    r"|\b(?:that|this|it) (?:works|would work|could work)\b"
+    r"|\bworks for (?:me|us)\b"
+    r"|\b(?:i|we) (?:can|could) (?:manage|afford|swing|handle|do) (?:that|it|this|those)\b",
+    re.IGNORECASE,
+)
+_SUPPOSED = re.compile(r"\b(?:if|unless|as long as|provided)\b", re.IGNORECASE)
+# What the learner agrees to besides a payment: the schedule, a call slot, an e-mail, a talk with
+# her decision maker (review fix: "Thursday at 7 PM works for me.", "That works, send me the
+# details by email." and "I can do that, I will talk to my partner tonight." were rewritten).
+# Without a money word in the sentence such an agreement says nothing about the payment.
+_SCHEDULE_ONLY = re.compile(
+    r"\b(?:schedule|timing|hours?|evenings?|weekends?|pace|mornings?|afternoons?|tonight|today|"
+    r"tomorrow|monday|tuesday|wednesday|thursday|friday|saturday|sunday|weekdays?|o'?clock|"
+    r"\d{1,2}(?::\d{2})?\s*(?:am|pm)|call|slot|time|e-?mail|mail|details|link|brochure|"
+    r"whatsapp|message|partner|husband|wife|spouse|father|mother|dad|mom|parents?|family|boss|"
+    r"manager|talk|speak)\b",
+    re.I,
+)
+_MONEY_WORD = re.compile(
+    r"\b(?:pay\w*|price|cost\w*|month\w*|emis?|instal\w*|dollars?|amount|figure|budget)\b|\$",
+    re.IGNORECASE,
+)
 _STILL_MORE = re.compile(
     r"\bmore than i (?:had |'d |would have )?(?:planned|hoped|budgeted|expected|wanted)\b",
     re.IGNORECASE,
 )
-# The call was placed by the advisor ("I'm glad I called"): the learner filled in a form.
+# The call was placed by the advisor ("I'm glad I called"): the learner filled in a form.  L4 (mock
+# call aa166f09, turns 23 and 25): "I'm calling about the data science course", "I thought I was
+# the one calling".
 _I_CALLED = re.compile(
     r"\b(?:glad i (?:called|rang|phoned)|when i called|i called (?:because|you|in|about)|"
-    r"my call to you|thanks for taking my call)\b",
+    r"my call to you|thanks for taking my call|"
+    r"i'?m (?:just )?calling (?:about|because|regarding|to (?:ask|find out|enquire|inquire))|"
+    r"i am (?:just )?calling (?:about|because|regarding|to (?:ask|find out|enquire|inquire))|"
+    r"(?:i'?m|i am|i was) the one (?:calling|who called|who rang|who phoned)|"
+    r"i (?:thought|think) i (?:was|am) (?:the one )?(?:calling|who called))\b",
     re.IGNORECASE,
 )
 # A warm confirmation for a reply that held only doubts or questions after a commitment.
@@ -720,6 +755,9 @@ class GuardContext:
     # sentence of THIS reply named the $7,000 (set by the stream guard).
     recent_phrases: tuple[tuple[str, ...], ...] = ()
     anchor_in_reply: bool = False
+    # L5 (mock call aa166f09).  The latest monthly payment the advisor named (None: none): above
+    # the card's budget it is never "workable" (``over_budget_accepted``).
+    monthly_quote_usd: int | None = None
 
     @property
     def is_learner(self) -> bool:
@@ -1009,7 +1047,28 @@ def _iteration_two_misreads(sentence: str, ctx: GuardContext) -> list[Hit]:
         and _TIME_TOPIC.search(sentence) is None
     ):
         hits.append(_hit(MISREAD, "strain_after_met", sentence))
+    elif _accepts_over_budget(sentence, ctx):
+        hits.append(_hit(MISREAD, "over_budget_accepted", sentence))
     return hits
+
+
+def _accepts_over_budget(sentence: str, ctx: GuardContext) -> bool:
+    """The learner calls a monthly payment above her card's budget workable (L5).
+
+    Only while the advisor's latest monthly figure is above ``MONTHLY_BUDGET_MAX_USD``, and only a
+    plain statement: a question, a negated one ("that's not really workable"), a supposition ("it
+    would be doable if it were $600") and one about the schedule alone pass.
+    """
+    if ctx.monthly_quote_usd is None or ctx.monthly_quote_usd <= MONTHLY_BUDGET_MAX_USD:
+        return False
+    if is_question_like(sentence) or _SUPPOSED.search(sentence) is not None:
+        return False
+    folded = fold(sentence)
+    if _SCHEDULE_ONLY.search(folded) is not None and _MONEY_WORD.search(folded) is None:
+        return False
+    return any(
+        not negated_before(folded, match.start()) for match in _PAYMENT_OK.finditer(folded)
+    )
 
 
 # A sentence that keeps the agreed plan while it turns down a fresh push ("I'll still talk it
@@ -1063,6 +1122,8 @@ def _learner_hits(sentence: str, ctx: GuardContext) -> list[Hit]:
         hits.append(_hit(CONCESSION, "resolution_phrasing", sentence))
     question = is_question_like(sentence)
     allowed = _CARD_AMOUNTS | ctx.advisor_amounts
+    if persona is not None:
+        allowed = allowed | persona.card_amounts  # her salary (M4)
     if not question:
         if _FORMAT_FACT.search(sentence):
             hits.append(_hit(INVENTED_FACT, "format_or_schedule_claim", sentence))
@@ -1139,6 +1200,7 @@ def _card_texts(persona: RenderedPersona) -> list[str]:
     answers.append(persona.persona.prior_learning)
     answers.extend(persona.surface(topic) for topic in H_TOPICS)
     answers.append(persona.decider_answer)
+    answers.extend(answer for _label, answer in persona.work_answers)
     return answers
 
 
@@ -1223,6 +1285,8 @@ def _replacement(hits: list[Hit], ctx: GuardContext, sentence: str = "") -> str:
             return ANCHOR_REPLACEMENT
         if rule == "gratitude_for_nothing":
             return GRATITUDE_REPLACEMENT
+        if rule == "over_budget_accepted" and repeat_kind(BUDGET_REPLACEMENT, ctx.said) is None:
+            return BUDGET_REPLACEMENT
     return ""
 
 

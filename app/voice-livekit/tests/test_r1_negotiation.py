@@ -2260,5 +2260,93 @@ class FinalReviewRoundOneNegotiationTests(unittest.TestCase):
         self.assertEqual(state.wait_said_turn, 5)
 
 
+class AdvisorPriceS03Tests(unittest.TestCase):
+    """Mock call aa166f09 (L5): the hedge, the percentage base and the monthly figures."""
+
+    def test_maybe_we_can_offer_is_an_offer(self):
+        from r1_negotiation import parse_price_offers
+
+        self.assertEqual(
+            parse_price_offers("Maybe we can offer you $6000 rather than $12000."),
+            [(6000, False)],
+        )
+        self.assertEqual(parse_price_offers("Perhaps I can give you $7,500."), [(7500, False)])
+        # A real hedge stays a hedge.
+        for text in (
+            "Maybe I can try for $8,000.",
+            "Maybe I could check if $8,000 is possible.",
+            "We may be able to do $8,000.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(parse_price_offers(text), [])
+
+    def test_a_percentage_comes_off_the_price_the_advisor_stated(self):
+        from r1_negotiation import parse_price_offers, stated_price_usd
+
+        turn_99 = (
+            "The course which has already been started last week, so that's why the price is now "
+            "it's coming with a 50% discount. If you start with a new batch, you would have to end "
+            "up paying $12000."
+        )
+        self.assertEqual(stated_price_usd(turn_99), 12000)
+        self.assertEqual(parse_price_offers(turn_99), [(6000, False)])
+        self.assertEqual(parse_price_offers("50% off $12,000 for you."), [(6000, False)])
+        # No stated price: the list price, as before.
+        self.assertEqual(parse_price_offers("I can give you 10% off."), [(8100, False)])
+        # A salary is no price to take a percentage off.
+        self.assertIsNone(stated_price_usd("You could earn a salary of $120,000 later."))
+        # Review fix: a saving or an add-on is no stated price either.
+        saving = "You will save $10,000 compared to a masters. And I can give 20% off."
+        self.assertIsNone(stated_price_usd(saving))
+        self.assertEqual(parse_price_offers(saving, ()), [(7200, False)])
+        self.assertNotEqual(
+            stated_price_usd(
+                "With the 30% scholarship you pay $6,300 instead of $9,000, and the $10,000 "
+                "masterclass is included."
+            ),
+            10000,
+        )
+        self.assertEqual(stated_price_usd("The course fee is $12,000 normally."), 12000)
+
+    def test_monthly_payments_are_read_but_incomes_are_not(self):
+        from r1_negotiation import monthly_amounts
+
+        cases = {
+            "I can I can give you a $9000 same price for 9 months, $1000, $1000 EMI option "
+            "monthly.": [1000],
+            "You pay $1,000 a month.": [1000],
+            "EMIs of $1,500 each.": [1500],
+            "It is 600 dollars per month.": [600],
+            "A salary hike of $1,000 a month.": [],
+            "You could earn $5,000 more per month.": [],
+            "The course is $9000 for 6 months.": [],
+            # Review fix: a total price is no monthly rate because "EMI" or "monthly" follows it.
+            "Okay, final price $4,500, EMI options are there.": [],
+            "I can give you $6,000, monthly EMI available.": [],
+            "$6,000 EMI also possible.": [],
+            "I can do $5,000 monthly too if needed": [],
+            "$700 monthly EMI.": [700],
+            "You can pay $750 EMI for 12 months.": [750],
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(monthly_amounts(text), expected)
+
+    def test_a_monthly_figure_is_never_a_low_price_for_the_whole_course(self):
+        from r1_negotiation import parse_price_offers, unread_low_figures
+
+        # Turn 106: the anchor answered "Wait, $1,000 for the whole program?".
+        turn_106 = (
+            "I can give you a $9000 same price for 9 months, $1000, $1000 EMI option monthly."
+        )
+        self.assertEqual(unread_low_figures(turn_106), [])
+        self.assertEqual(parse_price_offers(turn_106), [])
+        self.assertEqual(unread_low_figures("It is just $600 monthly."), [])
+        # Review fix: a total price said before "monthly EMI available" stays a figure to read.
+        self.assertEqual(
+            unread_low_figures("I can give you $6,000, monthly EMI available."), [6000]
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

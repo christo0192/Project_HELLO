@@ -452,14 +452,55 @@ _URGENCY_PATTERNS = {
 URGENCY_RES = {
     lever: re.compile(pattern, re.IGNORECASE) for lever, pattern in _URGENCY_PATTERNS.items()
 }
+# Review fix: "today", "tonight" or "now" ends the phrase (not "now and then", "today 6 pm",
+# "today and tomorrow").
+_DAY_ENDS = r"\b(?!\s*(?:and|or|to|till|until|through|at|after|before|then|\d)\b)"
 _COERCIVE = re.compile(
     r"\blast chance\b|\bonly today\b|\btoday only\b|\bwill (?:be )?gone (?:tomorrow|by)\b"
     r"|\bprice (?:goes|will go) up (?:tomorrow|tonight|today)\b"
     r"|\byou(?:'ll| will) (?:lose|miss) (?:out|your)\b|\bmust (?:decide|sign|enrol+) "
     r"(?:today|now)\b|\bnow or never\b|\bno second chance\b"
-    r"|\boffer expires? (?:tonight|today|tomorrow)\b",
+    r"|\boffer expires? (?:tonight|today|tomorrow)\b"
+    # L6 (mock call aa166f09, turn 83): "this discount is available only for today".  The day
+    # must end the phrase (review fix): "available only now and then", "open only until today 6
+    # pm" and "there only for today and tomorrow" set no deadline.
+    r"|\b(?:available|valid|open|good|there) only (?:for |until |till )?(?:today|tonight|now)"
+    + _DAY_ENDS
+    + r"|\bonly (?:for|until|till) (?:today|tonight)"
+    + _DAY_ENDS
+    + r"|\b(?:available|valid|open|good) (?:for |until |till )?(?:today|tonight) only\b",
     re.IGNORECASE,
 )
+# L6 (mock call aa166f09, turn 84): "if you wanted to see that later, then you will have to pay
+# $13000".  A price later is coercive only as a threat or a comparison (review fix): "more",
+# "higher" or "the full price" (never "nothing more" / "no extra"), or "have to / need to / must /
+# end up" paying the list price or above.  "Later you pay $700 a month", "you will pay the same
+# 9000" and "you would have to pay $500 extra for the career module" are honest descriptions.
+_LATER_PRICE = re.compile(
+    r"\blater\b[^.?!]{0,40}?\b(?:you|it)\b(?P<verb>[^.?!]{0,20}?)\b"
+    r"(?:pay(?:ing)?|cost(?:s|ing)?|charged?)\b(?P<tail>[^.?!]{0,30})",
+    re.IGNORECASE,
+)
+_LATER_MUST = re.compile(r"\b(?:have to|has to|need to|must|end up)\b", re.IGNORECASE)
+_LATER_MORE = re.compile(
+    r"(?<!\bno )(?<!\bnothing )(?<!\bany )\b(?:more|higher)\b"
+    r"|\b(?:the )?full (?:price|fee|amount)\b",
+    re.IGNORECASE,
+)
+_LATER_FIGURE = re.compile(r"\$(\d+)")
+
+
+def _later_price_threat(sentence: str) -> bool:
+    """L6: "decide now or later you will have to pay $13000" (``_LATER_PRICE``)."""
+    for match in _LATER_PRICE.finditer(canonical_amounts(sentence)):
+        tail = match.group("tail")
+        if _LATER_MORE.search(tail):
+            return True
+        if _LATER_MUST.search(match.group("verb")) and any(
+            int(figure) >= PRICE_USD for figure in _LATER_FIGURE.findall(tail)
+        ):
+            return True
+    return False
 _INVENTED = re.compile(
     r"\bfree (?:laptop|course|session|sessions|mentoring|mentorship|access|month|months|"
     r"trial|class|classes|gift|certificate|resume|interview)\b|\bcomplimentary\b|\bbonus\b"
@@ -558,7 +599,7 @@ def urgency_levers(text: object) -> tuple[frozenset[str], bool]:
     levers: set[str] = set()
     coercive = False
     for sentence in split_sentences(text):
-        if _COERCIVE.search(sentence):
+        if _COERCIVE.search(sentence) or _later_price_threat(sentence):
             coercive = True
         if is_question_like(sentence):
             continue
@@ -1054,6 +1095,111 @@ def is_bare_yes(text: object) -> bool:
     rest = _BARE_YES_DO.sub(" yes ", _BARE_YES_PHRASE.sub(" ", words)).split()
     core = phrase or any(word in _BARE_YES_WORDS for word in rest)
     return core and all(word in _BARE_YES_WORDS or word in _BARE_YES_FILLER for word in rest)
+
+
+# Owner and manager decisions of 2026-11-03 (M2, mock call aa166f09).  From R = 14:00 the
+# interviewer may OFFER to wrap the role-play up (L-ASIDE-WRAP: "would you like to wrap it up
+# here?  If you'd rather keep going, just carry on with <learner>.").  Leaving is the candidate's
+# choice, so a yes must say yes: a short yes once it has settled (``is_short_wrap_yes``: "Yes.",
+# "Sure.", "Okay.", "Sounds good.", read like a bare yes to L-ASIDE-END), or words that ask to stop
+# (``accepts_wrap_offer``: "Yes, let's wrap it up.", "We can stop here.", "No, I'm done.").  A no
+# (``declines_wrap_offer``) wins over both: "no", "keep going", "carry on", "one more thing",
+# "let me just add ...", "before we wrap up ...", a negated end word ("I'm not done").
+_WRAP_CONTINUE = re.compile(
+    r"\b(?:keep (?:going|at it|talking)|carry on|continue|go on|not yet|not now|"
+    r"one more (?:thing|question|point|minute)|"
+    r"a (?:few|couple(?: of)?) more (?:minutes?|questions?|things?|points?)|more time|"
+    r"(?:i'?d|i would) (?:like|love|prefer|rather|want) to (?:keep|continue|carry|go on|"
+    r"finish (?:my|the|this) (?:pitch|point|explanation))|"
+    r"let me (?:just |quickly )?(?:continue|finish|add|tell|ask|explain|mention|share|close)|"
+    r"before (?:we|i|you) (?:wrap|stop|end|finish|go)|"
+    r"i (?:still )?(?:have|want|need) (?:to (?:say|ask|tell|add|explain|cover)|one more|"
+    r"a few more|some more))\b",
+    re.IGNORECASE,
+)
+_WRAP_ACCEPT = re.compile(
+    r"\b(?:wrap(?:ping)? (?:it |this |things |the role ?play )?up"
+    r"|(?:let'?s|let us|we can|we could|you can|i'?d like to|i would like to|i want to|"
+    r"happy to|fine to|okay to|ok to) (?:stop|end|finish|close|wrap)"
+    r"|(?:stop|end|finish) (?:it |this |things )?(?:here|now|there)"
+    r"|(?:i'?m|i am|we'?re|we are) done"
+    r"|(?:that'?s|that is) (?:it|all|enough)(?: for (?:me|now|today))?"
+    r"|(?:i'?m|i am) (?:good|fine|happy) to (?:stop|end|finish|wrap))\b",
+    re.IGNORECASE,
+)
+# "No problem", "no worries", "no rush": courtesy, not a no.
+_NOT_A_NO = re.compile(
+    r"\bno (?:problem|problems|worries|worry|issue|issues|rush|hurry|pressure|doubt)\b",
+    re.IGNORECASE,
+)
+# A question accepts only as a request: "Can we wrap up here?", "Could we stop now?".
+_WRAP_ASKED = re.compile(
+    r"^\W*(?:\w+\W+){0,3}?(?:can|could|shall|may) (?:we|you|i)\b", re.IGNORECASE
+)
+# A whole short answer that says yes, on ``normalize`` text (so "that's" is "thats").
+_WRAP_SHORT_YES = re.compile(
+    r"(?:(?:um+|uh+|hmm+|so|well|okay|ok|alright|yes|yeah|yep|sure|christy|christie|kristy|maam|"
+    r"madam|sir|i think|i guess|then)\s+)*"
+    r"(?:yes|yeah|yep|yup|ya|yah|yea|sure|okay|ok|alright|all right|fine|absolutely|definitely|"
+    r"of course|haan|haan ji|hanji|ji haan|go ahead|please do|sounds good|that works|"
+    r"thats fine|that is fine|thats good|lets do that|lets do it|we can|yes we can|"
+    r"that would be (?:good|great|fine)|good idea|perfect|great)"
+    r"(?:\s+(?:please|then|thanks|thank you|christy|christie|kristy|maam|madam|sir|sure|yes|"
+    r"yeah|okay|ok|fine|great))*"
+)
+
+
+def _wrap_accept_words(folded: str) -> bool:
+    """A sentence of ``folded`` asks to stop (a question only as a request)."""
+    for sentence in split_sentences(folded):
+        if _WRAP_ACCEPT.search(sentence) is None:
+            continue
+        if "?" in sentence and _WRAP_ASKED.search(sentence) is None:
+            continue  # "Why would we stop now?", "Should I wrap up?"
+        return True
+    return False
+
+
+def declines_wrap_offer(text: object) -> bool:
+    """The candidate wants to keep going after L-ASIDE-WRAP (a no wins over every yes).
+
+    "No.", "Not yet.", "Let's keep going.", "One more thing first.", "Before we wrap up, ...",
+    "I'm not done.", "I'd like to continue with Priya.".  A plain "no" before words that ask to
+    stop ("No, I'm done.", "No no, let's wrap it up.") answers "or keep going?" and is no decline.
+    """
+    folded = _NOT_A_NO.sub(" ", fold(text))
+    if _WRAP_CONTINUE.search(folded) or _END_NEGATED_ANSWER.search(folded):
+        return True
+    return declines_end(folded) and not _wrap_accept_words(folded)
+
+
+def accepts_wrap_offer(text: object) -> bool:
+    """The candidate asks to stop in answer to L-ASIDE-WRAP, in words (no settle needed).
+
+    "Yes, let's wrap it up.", "We can stop here, thank you.", "I'm done.", "That's it for me.",
+    "Can we wrap up here?", and every answer ``confirms_end`` reads as a stop ("End the
+    interview.").  Not with a no (``declines_wrap_offer``), not as a question that is not a
+    request ("Why would we stop now?"), and not a short yes: that one settles first
+    (``is_short_wrap_yes``).
+    """
+    folded = fold(text).strip()
+    if not folded or declines_wrap_offer(folded):
+        return False
+    return _wrap_accept_words(folded) or confirms_end(folded)
+
+
+def is_short_wrap_yes(text: object) -> bool:
+    """A short yes to L-ASIDE-WRAP ("Yes.", "Sure.", "Okay.", "Sounds good.", "Yes please.").
+
+    The question asks "would you like to wrap it up here?", so a lone "Okay." or "Sounds good." is
+    a yes as well, where it never is to L-ASIDE-END.  The engine takes it only once the session
+    has let it settle (``confirmed_yes``): "Okay." is also how "Okay, so the EMI is ..." begins.
+    """
+    raw = str(text or "")
+    if "?" in raw or "\uff1f" in raw or declines_wrap_offer(raw):
+        return False
+    words = normalize(raw)
+    return bool(words) and (_WRAP_SHORT_YES.fullmatch(words) is not None or is_bare_yes(raw))
 
 
 # The exercise rail of the end-intent model (owner decision 2026-10-30): a model "end" exits only

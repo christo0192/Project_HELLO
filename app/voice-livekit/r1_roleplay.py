@@ -38,10 +38,21 @@ engine only DECIDES, deterministically, what the learner does on each candidate 
     to ROLEPLAY_EXIT and the interviewer's normal wrap-up follows (owner decision 2026-10-29).  An
     early end is scored only when the normal fidelity checks pass (``fidelity``: R reached 10:00,
     every family delivered, and the rest).  From 14:00, or with a commitment on record, an end
-    request is a farewell on the close ladder instead.  Owner decision 2026-10-30: the session may
-    hand ``plan_turn`` the end-intent model's verdict (``end_intent``), which can only raise the
-    lexical reading ("wrap up the interview", "kindly end the interview", "end the inter view"),
-    and a settled bare yes ("Yes.", "Haan ji.") answers L-ASIDE-END (``confirmed_yes``).
+    request is a farewell on the close ladder instead.  ``"wrap_offer_accepted"``: the candidate
+    said yes to the interviewer's offer to wrap up (M2, below).  Owner decision 2026-10-30: the
+    session may hand ``plan_turn`` the end-intent model's verdict (``end_intent``), which can only
+    raise the lexical reading ("wrap up the interview", "kindly end the interview", "end the inter
+    view"), and a settled bare yes ("Yes.", "Haan ji.") answers L-ASIDE-END (``confirmed_yes``).
+
+The wrap-up offer (owner and manager decisions of 2026-11-03, M2): the role-play no longer ends by
+itself once the commitment is resolved.  From R = 14:00, when the commitment is resolved or the
+call is going nowhere, the interviewer OFFERS to wrap up (``plan.aside`` with ``plan.line_id``
+L-ASIDE-WRAP), only at a natural pause: a candidate turn that asks, digs and pitches nothing and
+does not answer a question of the learner's, or (``wrap_offer_at_pause``) a quiet after her line.
+At most ``WRAP_OFFER_LIMIT`` offers, none for ``WRAP_OFFER_COOLDOWN_SEC`` after a no, none from
+``WRAP_OFFER_UNTIL_R_SEC``.  The next turn answers it: a yes is the EXIT (``wrap_offer_accepted``),
+a no gets L-ASIDE-WRAP-RESUME and the role-play goes on, and talk to the learner is a no that she
+answers.  The hard end at 20:00 stays the session's (with the learner's L-TIME-UP before L-EXIT).
 
 Repetition control (R1-Q): ``record_spoken`` feeds every sentence the learner actually
 played into a ``SpokenMemory``; each plan's guard context carries a snapshot (``said``), so
@@ -131,8 +142,10 @@ from r1_negotiation import (
     COMMIT_REACTION_BRIEF,
     KIND_COMMIT,
     KIND_STALL,
+    N_DECISION_MAKER,
     N_EMAIL,
     N_EMAIL_YES,
+    N_MONEY,
     N_TIMING,
     REASON_DECISION_MAKER,
     REASON_MONEY,
@@ -147,17 +160,27 @@ from r1_negotiation import (
     declines_call,
     fill_decision_maker,
     filled_markers,
+    monthly_amounts,
     question_spec,
 )
-from r1_personas import H_TOPICS, RenderedPersona, asks_about_learner, detect_probes
+from r1_personas import (
+    H_TOPICS,
+    MONTHLY_BUDGET_MAX_USD,
+    RenderedPersona,
+    asks_about_learner,
+    detect_probes,
+    has_question,
+)
 from r1_prompts import (
     ANCHOR_NOT_OFFERED_NOTE,
     ANSWERED_NOTE,
     BACKCHANNEL_CUT_NOTE,
     CHALLENGE_NOTE,
     CHECKIN_DONE_NOTE,
+    BUDGET_OVER_NOTE,
     CHECKIN_NOTE,
     DECIDER_ASKED_NOTE,
+    DECIDER_SAID_NOTE,
     EMAIL_AGAIN_NOTE,
     EMAIL_OFFER_NOTE,
     HOLD_NOTE,
@@ -194,6 +217,7 @@ from r1_scheduler import (
     F4_PUSH,
     F4_PUSH_CALL_SUFFIX,
     FAMILIES,
+    TIME_CUE_SEC,
     IDLE_GAP_TURNS,
     PLAN,
     REDIRECT_BRIEF,
@@ -203,8 +227,11 @@ from r1_scheduler import (
     OwedMove,
     OwedMoveScheduler,
     answered_topics,
+    curiosity_asked_in,
     curiosity_covered,
+    f4_push_said,
     is_close_attempt,
+    is_pitch_statement,
     markers_match,
     quotes_price,
 )
@@ -232,12 +259,15 @@ from r1_text import (
 from r1_tracker import (
     CoverageTracker,
     NeedState,
+    accepts_wrap_offer,
     build_judge_messages,
     confirms_end,
     declines_end,
+    declines_wrap_offer,
     detect_character_break,
     end_intent_level,
     is_bare_yes,
+    is_short_wrap_yes,
     parse_judge_output,
     promises_call_back,
 )
@@ -304,6 +334,92 @@ END_FRAGMENT_WORDS = 2
 # said again on a later turn, per session.  A line the candidate never heard a word of (cancelled
 # before any audio, ``reply_lost``) is said again as well, without counting.
 COMMITMENT_REVOICE_LIMIT = 2
+# Owner and manager decisions of 2026-11-03 (M2, mock call aa166f09: L-EXIT cut off a discovery
+# question at 15:42).  Leaving the role-play is the candidate's choice: the early exit (commitment
+# resolved and R >= 14:00, then L-EXIT at the next turn) is now the interviewer's OFFER to wrap up,
+# L-ASIDE-WRAP, an aside with R paused.  14:00 is still the earliest point; the offer is made when
+# the commitment is resolved or the call is going nowhere, never on a turn that asks something,
+# digs or pitches and never right after the learner asked a question (it waits for a natural pause,
+# a candidate turn that only acknowledges or closes, or ``WRAP_OFFER_PAUSE_SEC`` of quiet in the
+# session), at most ``WRAP_OFFER_LIMIT`` times and not again for ``WRAP_OFFER_COOLDOWN_SEC`` of R
+# after a no.  From ``WRAP_OFFER_UNTIL_R_SEC`` on it is not made: the 17:00 time cue has been said
+# and the closing line at 20:00 is close.
+WRAP_OFFER_LINE = "L-ASIDE-WRAP"
+WRAP_RESUME_LINE = "L-ASIDE-WRAP-RESUME"
+WRAP_OFFER_FROM_R_SEC = float(EARLY_CLOSE_BEFORE_SEC)
+WRAP_OFFER_UNTIL_R_SEC = 1110.0
+WRAP_OFFER_LIMIT = 2
+WRAP_OFFER_COOLDOWN_SEC = 180.0
+WRAP_OFFER_PAUSE_SEC = 6.0
+# A no this short (and with no question) is said to the interviewer alone: she hands back with
+# L-ASIDE-WRAP-RESUME.  A longer one goes on to the learner, who answers it.
+WRAP_NO_WORDS = 8
+# A candidate turn longer than this (or one that quotes a price) is a pitch: no offer over it.
+WRAP_PITCH_WORDS = 20
+# A next step put on the table is selling too ("Let me book fifteen minutes with you and your
+# partner on Friday.", "I'll send you the payment link."): no offer over it.
+_WRAP_NEXT_STEP = re.compile(
+    r"\b(?:book|schedule|set up|arrange|enrol+|sign (?:you )?up|register|pay|payment|link|"
+    r"deposit|demo|session|meeting|call (?:you|back)|meet)\b",
+    re.IGNORECASE,
+)
+# Discovery that speech-to-text left without its question mark ("so you said you want to move to
+# a proper corporate from academia what is your challenge currently"): no offer over it either.
+_WRAP_DISCOVERY = re.compile(
+    r"\b(?:what|how|why|when|where|which|who)(?: exactly)? (?:is|are|was|were|do|does|did|would|"
+    r"could|can|should|will|kind|made|makes|about)\b"
+    r"|\b(?:you said|you mentioned|tell me|help me understand|i want to understand|"
+    r"can i (?:ask|understand|know)|may i (?:ask|know))\b",
+    re.IGNORECASE,
+)
+# Review fix: the words a pause turn may be made of (on folded text, apostrophes dropped):
+# acknowledgement, courtesy, a closing and "I'll send it over".  Any other word (a noun, a
+# question word, "explain", "hear", "budget", "your") leaves the turn to the learner.
+_WRAP_PAUSE_WORDS = frozenset(
+    {
+        "okay", "ok", "alright", "all", "right", "sure", "yes", "yeah", "yep", "yup",
+        "great", "good", "perfect", "fine", "cool", "nice", "wonderful", "awesome",
+        "excellent", "lovely", "brilliant", "thanks", "thank", "you", "so", "much",
+        "very", "for", "your", "time", "the", "call", "chat", "talking", "chatting",
+        "speaking", "hmm", "hm", "mm", "mhm", "uh", "um", "oh", "ah", "well", "noted",
+        "got", "it", "understood", "no", "problem", "worries", "absolutely", "definitely",
+        "of", "course", "sounds", "thats", "that", "fair", "enough", "makes", "sense",
+        "i", "ill", "will", "send", "share", "over", "across", "then", "bye", "goodbye",
+        "take", "care", "have", "a", "day", "evening", "appreciate", "glad", "to",
+        "hear", "see", "im", "happy", "is", "was", "really", "indeed", "exactly",
+        "lot",
+    }
+)
+# Only as a whole closing ("glad to hear that", "I'll see"), never as a lead-in: "hear"
+# with "me out" or "about", "your" with anything but "time" are not pause words above,
+# because their neighbours are not.  A turn that stops on one of these is unfinished.
+_WRAP_DANGLING_WORDS = frozenset(
+    {"and", "but", "or", "so", "the", "a", "to", "for", "your", "is", "was", "i",
+     "of", "have", "will", "ill", "very"}
+)
+# A lead-in to a pitch or a question, however short ("Let me explain ...", "Hear me out").
+_WRAP_LEAD_IN = re.compile(
+    r"\b(?:let me|hear me|here's the thing|heres the thing|have you|do you|would you|"
+    r"are you|is it|is that|is there|any|anything)\b"
+)
+# "Going nowhere": this many advisor turns in a row that raised nothing new (no topic the advisor
+# had not covered, no probe, no new figure), this many hollow turns in a row ("Okay.", "Sure."), or
+# this many stall reasons the learner gave from 14:00 on.
+WRAP_STALE_TURNS = 5
+WRAP_HOLLOW_TURNS = 3
+WRAP_LATE_STALLS = 2
+_STALL_REASON_IDS = frozenset({N_TIMING, N_MONEY, N_DECISION_MAKER})
+# L1 (mock call aa166f09).  A curiosity topic handed over this many times without the learner
+# asking it is not handed over again (it is not "asked" either: a check-in may still raise it).
+CURIOSITY_OFFER_LIMIT = 2
+# L2 (mock call aa166f09: 18 of 41 replies tacked a new worry onto a short acknowledgement).  While
+# the advisor is mid-discovery (a question about the learner), an owed move that no deadline forces
+# waits up to this many more turns, beyond the one dig deferral, as long as the plan has slack
+# (``_may_hold``): the forced path and the deadlines are unchanged, so every family still lands.
+DISCOVERY_HOLD_LIMIT = 2
+# L5: a monthly figure above the card's budget is checked by the guard for this many turns after
+# the advisor named it (``GuardContext.monthly_quote_usd``).
+MONTHLY_QUOTE_TURNS = 3
 
 
 def challenges_learner(text: object) -> bool:
@@ -447,6 +563,18 @@ class RolePlayEngine:
         self._curiosity_asked: set[str] = set()
         self._free_replies = 0
         self._free_at_last_curiosity = 0
+        # L1: how often each topic was handed over (a topic is "asked" only once she asked it).
+        self._curiosity_offered: dict[str, int] = {}
+        # L2: the extra mid-discovery holds per owed move, and whether this advisor turn asked the
+        # learner about herself (an intent then answers it first).
+        self._discovery_holds: dict[str, int] = {}
+        self._dig_now = False
+        # L7: the turn the learner first said she would talk to her decision maker (the F4 push's
+        # own markers: "my partner and I usually talk these things through" counts).
+        self._decider_said_turn: int | None = None
+        # L5: the latest monthly payment the advisor named and the turn it was named on.
+        self._monthly_quote_usd: int | None = None
+        self._monthly_quote_turn = 0
         # Negotiation (R1-Q): what is on the table, the stall reasons used and the commitment
         # on record.  ``_notes`` are this turn's situation notes for the reminder, and
         # ``_new_offer_usd`` the price an advisor turn added (the only "pleasant surprise" turn).
@@ -507,6 +635,20 @@ class RolePlayEngine:
         self._end_question_last = False
         self._end_stale_by: TurnPlan | None = None
         self.end_confirmed = False
+        # M2 (owner and manager decisions of 2026-11-03).  Every L-ASIDE-WRAP offer made (R, what
+        # triggered it, how it was answered), whether the latest one still waits for its answer,
+        # the R of the last no (a declined L-ASIDE-END counts for the cool-down too), and whether
+        # the candidate took the offer.  The "going nowhere" counters: advisor turns in a row that
+        # raised nothing new, and the stall reasons the learner gave from 14:00 on.
+        self._wrap_offers: list[dict[str, Any]] = []
+        self._wrap_open = False
+        self._wrap_declined_at: float | None = None
+        self.wrap_accepted = False
+        self._stale_run = 0
+        self._late_stalls = 0
+        # Whether the learner's last line raised something for the advisor to answer (an owed move
+        # or a negotiation line): a quiet after it is the advisor thinking, not a pause to fill.
+        self._raised_last = False
         # Voice barge-in (owner decision 2026-10-28).  Whether the advisor cut the learner's last
         # line off after part of it was heard, the owed move that line carried and did not
         # deliver, and the moves already held back once for a cut (at most once per move).  The
@@ -620,6 +762,11 @@ class RolePlayEngine:
             hollow=self._hollow_run >= 1 and self._last_reply_closer,
             decider_asked=self._decider_asked_now,
             recent_phrases=tuple(self._phrase_history[-STYLE_HISTORY:]),
+            monthly_quote_usd=(
+                self._monthly_quote_usd
+                if self.turn - self._monthly_quote_turn <= MONTHLY_QUOTE_TURNS
+                else None
+            ),
         )
 
     def filler_text(self) -> str:
@@ -681,6 +828,8 @@ class RolePlayEngine:
         ):
             self._end_question_last = False
             self._end_stale_by = plan
+        if r_sec >= WRAP_OFFER_FROM_R_SEC and plan.negotiation_id in _STALL_REASON_IDS:
+            self._late_stalls += 1  # M2: a stall reason from 14:00 on (going nowhere)
         return plan
 
     def _decide_plan(
@@ -736,6 +885,19 @@ class RolePlayEngine:
         # A plan whose reply the SDK cancelled before any audio, and what its planning consumed.
         lost, self._lost_plan = self._lost_plan, None
         lost_undo, self._lost_undo = self._lost_undo, None
+        if self._wrap_open:
+            # M2: this turn answers the interviewer's offer to wrap up (L-ASIDE-WRAP).
+            answer = self._wrap_answer_plan(
+                candidate_text,
+                r_sec,
+                turn_index,
+                repair=repair and not backchannel,
+                end_intent=end_intent,
+                confirmed_yes=confirmed_yes,
+            )
+            if answer is not None:
+                self._restore_lost(lost_undo)
+                return answer
         # An out-of-role request to end the call (owner test 7f2a25e6, turns 64 and 71).  Before
         # R = 14:00 and with no commitment on record it is answered by the interviewer, never by an
         # owed move and never by the close ladder: she asks once (L-ASIDE-END: say "end the
@@ -816,6 +978,9 @@ class RolePlayEngine:
             or declines_end(candidate_text)
         ):
             self._end_pending = False
+            if not farewell_end:
+                # M2: a declined L-ASIDE-END is a no to stopping: no wrap-up offer right after it.
+                self._wrap_declined_at = r_sec
         if end_request and self._end_aside is None and out_of_role:
             # The aside is no answer to the lost plan either: what that plan used up is given back.
             self._restore_lost(lost_undo)
@@ -869,6 +1034,7 @@ class RolePlayEngine:
         self._decider_asked_now = False
         signals = self.scheduler.observe_candidate_turn(candidate_text, r_sec)
         obs = self.tracker.observe_candidate_turn(candidate_text, turn)
+        known = (len(self._advisor_amounts), len(self._answered))
         self._advisor_amounts.update(advisor_amounts_in(candidate_text))
         self._advisor_hours.update(hours_said(candidate_text))
         self._price_talk = quotes_price(candidate_text)
@@ -878,6 +1044,8 @@ class RolePlayEngine:
         negotiated = self._observe_negotiation(candidate_text, turn)
         self._note_situation(negotiated)
         self._note_curiosity_covered(candidate_text)
+        self._note_monthly_quote(candidate_text, turn)
+        self._dig_now = asks_about_learner(candidate_text)
         # Nothing in the very first advisor turn is an ask: it is the greeting ("is now a good
         # time?", "I thought I'd give you a quick call"), and it gets a free reply.
         early = turn == 1 and r_sec < EARLY_ASK_IGNORE_SEC
@@ -912,6 +1080,15 @@ class RolePlayEngine:
         # with the HINT layer and a follow-up (or a repeat probe of a released need) with the
         # DEEP layer, in that very reply.  An owed move that is not forced waits one turn.
         reveal_topics = self.tracker.gate.deep_due(obs.gate)
+        # M2 "going nowhere": did this advisor turn raise anything new (a topic, a figure, a probe)?
+        fresh = (
+            (len(self._advisor_amounts), len(self._answered)) != known
+            or bool(obs.gate.first_probes)
+            or bool(reveal_topics)
+            or asks_about_learner(candidate_text)
+            or self._wrap_engaged(negotiated)
+        )
+        self._stale_run = 0 if fresh else self._stale_run + 1
         if wants is not None or negotiated.email_offer or negotiated.checkin:
             planned = self._negotiate(
                 negotiated,
@@ -1013,6 +1190,16 @@ class RolePlayEngine:
                 self._dig_deferred.add(move.id)
                 self._dig_deferred_topics.add(self._dig_key(candidate_text))
                 reasons.append("owed_deferred_for_dig")
+            elif (
+                self._dig_now
+                and self._discovery_holds.get(move.id, 0) < DISCOVERY_HOLD_LIMIT
+                and self._may_hold(move, r_sec)
+            ):
+                # L2: the advisor is still asking about the learner and the plan has slack: she
+                # answers, and the owed move waits (``DISCOVERY_HOLD_LIMIT``).  A forced move, the
+                # time cue and the 19:00 stall never wait here (``_may_hold``).
+                self._discovery_holds[move.id] = self._discovery_holds.get(move.id, 0) + 1
+                reasons.append("owed_deferred_for_discovery")
             else:
                 self.scheduler.issue(move)
                 reasons.append(f"owed:{move.id}" + (":forced" if move.forced else ""))
@@ -1054,6 +1241,20 @@ class RolePlayEngine:
                 monologue=candidate_seconds,
                 credit_move_id=cut_move,
             )
+        trigger = self._wrap_trigger(r_sec)
+        if (
+            trigger is not None
+            and not cut
+            and not (reveal_due or break_kind is not None or challenged or held_for_cut)
+            and wants is None
+            and not (negotiated.email_offer or negotiated.checkin)
+            and not self._wrap_engaged(negotiated)
+            and self._wrap_turn_is_pause(candidate_text)
+        ):
+            # M2: a natural pause, and an offer is due: the interviewer offers to wrap up in place
+            # of the learner's free reply (this turn was said to her and stays evidence).
+            reasons.append(f"wrap_offer:{trigger}")
+            return self._wrap_offer_plan(r_sec, trigger, turn_index, reasons=reasons)
         reasons.append("free_reply")
         if cut:
             # The advisor cut in: what they said is answered, the cut line is not started again.
@@ -1066,7 +1267,10 @@ class RolePlayEngine:
             # The advisor checked in ("what do you think?", "anything else?"): an honest
             # reaction and one real question, never the stall.
             curiosity = self._curiosity_for_free_reply(force=True)
-            self._notes.append(CHECKIN_NOTE if curiosity else CHECKIN_DONE_NOTE)
+            # L1: before the 17:00 time cue an empty pool still gets the ordinary check-in (an
+            # honest reaction, a question only if she has one), never "say you have no more".
+            done = not curiosity and r_sec >= TIME_CUE_SEC
+            self._notes.append(CHECKIN_DONE_NOTE if done else CHECKIN_NOTE)
         elif not quiet:
             curiosity = self._curiosity_for_free_reply()
         return self._plan(
@@ -1376,6 +1580,236 @@ class RolePlayEngine:
         self.exit_requested = True
         return self._plan(TurnMode.EXIT, reasons)
 
+    # ------------------------------------------------------------- M2: the wrap-up offer
+    @property
+    def wrap_question_open(self) -> bool:
+        """True while L-ASIDE-WRAP waits for its answer (the next candidate turn answers it)."""
+        return self._wrap_open
+
+    @property
+    def open_question_line(self) -> str | None:
+        """The interviewer's question the next candidate turn answers, if any (its line id)."""
+        if self.end_question_open:
+            return "L-ASIDE-END"
+        return WRAP_OFFER_LINE if self._wrap_open else None
+
+    def settles_as_yes(self, text: object) -> bool:
+        """True for a short yes to an open question: the session lets it settle before planning.
+
+        A bare yes to L-ASIDE-END (``is_bare_yes``), or a short yes to L-ASIDE-WRAP
+        (``is_short_wrap_yes``, which also takes "Okay." and "Sounds good.").
+        """
+        if self.end_question_open and is_bare_yes(text):
+            return True
+        return self._wrap_open and is_short_wrap_yes(text)
+
+    def _wrap_trigger(self, r_sec: float) -> str | None:
+        """Why the interviewer may offer to wrap up now, or None (M2, ``WRAP_OFFER_*``).
+
+        Never before 14:00 or from 18:30, never while an interviewer question is open or after the
+        exit, at most ``WRAP_OFFER_LIMIT`` times, and not within ``WRAP_OFFER_COOLDOWN_SEC`` of a
+        no.  Then: the commitment is resolved, or the call is going nowhere (``WRAP_STALE_TURNS``
+        advisor turns in a row that raised nothing new, ``WRAP_HOLLOW_TURNS`` hollow turns in a
+        row, or ``WRAP_LATE_STALLS`` stall reasons from 14:00 on).
+        """
+        if (
+            self.exit_requested
+            or self._wrap_open
+            or self._end_pending
+            or len(self._wrap_offers) >= WRAP_OFFER_LIMIT
+            or not WRAP_OFFER_FROM_R_SEC <= r_sec < WRAP_OFFER_UNTIL_R_SEC
+        ):
+            return None
+        if (
+            self._wrap_declined_at is not None
+            and r_sec - self._wrap_declined_at < WRAP_OFFER_COOLDOWN_SEC
+        ):
+            return None
+        if self.commitment_resolved:
+            return "commitment_resolved"
+        if (
+            self._stale_run >= WRAP_STALE_TURNS
+            or self._hollow_run >= WRAP_HOLLOW_TURNS
+            or self._late_stalls >= WRAP_LATE_STALLS
+        ) and not self.scheduler.graded_moves_owed(r_sec):
+            # Review fix: not while a graded move is owed (F4 is due by 15:30): an
+            # accepted offer would end the role-play before it and fail the gate.
+            return "going_nowhere"
+        return None
+
+    def _learner_asked_last(self) -> bool:
+        """The learner's last line asked the advisor something: the next words are theirs."""
+        return bool(self._asked) and self._asked[-1]
+
+    @staticmethod
+    def _wrap_engaged(negotiated: NegotiationTurn) -> bool:
+        """The advisor worked the sale this turn: handled a reason, proposed a call or a price."""
+        return bool(
+            negotiated.reasons_handled
+            or negotiated.callback is not None
+            or negotiated.offer_added
+            or negotiated.decider_asked
+        )
+
+    def _wrap_turn_is_pause(self, text: str) -> bool:
+        """M2: a candidate turn the offer may follow: it asks, digs and pitches nothing.
+
+        Conservative (review fix): only a turn made of acknowledgement, courtesy and
+        closing words (``_WRAP_PAUSE_WORDS``) is a pause, so a question the speech-to-text
+        left without its mark ("And your budget", "Any other doubts you have"), a
+        statement-question, a discovery prompt or a pitch lead-in ("Let me explain how the
+        program works", "Hear me out") is not; every other quiet is left to the pause
+        path (``wrap_offer_at_pause``).  On top of that it is not a question or a dig (the
+        aa166f09 turn 115, "what is your challenge currently?"), not unfinished, not a
+        pitch (more than ``WRAP_PITCH_WORDS`` words, a sales topic such as the curriculum
+        or the mentors, a price or a figure, a new offer), and not the answer to a question
+        the learner just asked.  "Okay.", "Great, I'll send it over." and "Thank you
+        for your time." are pauses.
+        """
+        words = normalize(text).split()
+        if not words or not all(word in _WRAP_PAUSE_WORDS for word in words):
+            return False
+        if words[-1] in _WRAP_DANGLING_WORDS or _WRAP_LEAD_IN.search(normalize(text)):
+            return False
+        return not (
+            self._learner_asked_last()
+            or has_question(text)
+            or asks_about_learner(text)
+            or _WRAP_DISCOVERY.search(fold(text)) is not None
+            or word_count(text) > WRAP_PITCH_WORDS
+            or bool(answered_topics(text))
+            or is_pitch_statement(text)
+            or _WRAP_NEXT_STEP.search(fold(text)) is not None
+            or quotes_price(text)
+            or bool(advisor_amounts_in(text))
+            or self._new_offer_usd is not None
+        )
+
+    def wrap_pause_due(self, r_sec: float) -> bool:
+        """True when a quiet after the learner's line may carry the offer (``wrap_offer_at_pause``).
+
+        The session then waits ``WRAP_OFFER_PAUSE_SEC`` of quiet instead of the silence window.
+        """
+        return (
+            self.turn > 0
+            and self._wrap_trigger(r_sec) is not None
+            and not self._learner_asked_last()
+            and self._unheard_commitment is None
+            and not self._raised_last
+        )
+
+    def wrap_offer_at_pause(self, r_sec: float) -> TurnPlan | None:
+        """M2: the offer in a natural pause: ``WRAP_OFFER_PAUSE_SEC`` of quiet after her line.
+
+        The session calls it once that quiet has passed (nothing is observed: there is no candidate
+        turn).  None when no offer is due, when her last line asked the advisor something or raised
+        an objection or a stall (the quiet is theirs to think in), or when a commitment line she
+        must say again is pending.
+        """
+        if not self.wrap_pause_due(r_sec):
+            return None
+        trigger = self._wrap_trigger(r_sec) or ""
+        return self._wrap_offer_plan(
+            r_sec, trigger, None, reasons=[f"wrap_offer:{trigger}", "wrap_offer_at_pause"]
+        )
+
+    def _wrap_offer_plan(
+        self, r_sec: float, trigger: str, turn_index: int | None, *, reasons: list[str]
+    ) -> TurnPlan:
+        """L-ASIDE-WRAP, spoken by the interviewer with R paused; the next turn answers it."""
+        self._wrap_open = True
+        self._wrap_offers.append(
+            {
+                "r_sec": round(r_sec, 1),
+                "trigger": trigger,
+                "after_roleplay_turn": self.turn,
+                "transcript_turn": turn_index,
+                "answer": None,
+            }
+        )
+        return self._wrap_line_plan(WRAP_OFFER_LINE, reasons)
+
+    def _wrap_line_plan(self, line_id: str | None, reasons: list[str]) -> TurnPlan:
+        """An interviewer aside of the offer (``line_id`` None: nothing is said, the turn waits)."""
+        return self._plan(
+            TurnMode.SAY_ONLY,
+            reasons,
+            scripted="" if line_id is None else script_line(line_id, **self.persona.line_values),
+            voice="interviewer",
+            aside=True,
+            line_id=line_id,
+        )
+
+    def _wrap_closed(self, answer: str, r_sec: float, turn_index: int | None) -> None:
+        """The offer is answered without a yes: record it, and start the cool-down."""
+        self._wrap_open = False
+        offer = self._wrap_offers[-1]
+        offer["answer"] = answer
+        offer["answer_transcript_turn"] = turn_index
+        self._wrap_declined_at = r_sec
+
+    def _wrap_answer_plan(
+        self,
+        text: str,
+        r_sec: float,
+        turn_index: int | None,
+        *,
+        repair: bool,
+        end_intent: str | None,
+        confirmed_yes: bool,
+    ) -> TurnPlan | None:
+        """M2: what the candidate's answer to L-ASIDE-WRAP gets; None to plan the turn as usual.
+
+        * A yes (words that ask to stop, a short yes that settled, a goodbye, or the end-intent
+          model's "end") is the role-play exit, reason ``wrap_offer_accepted``: L-EXIT and the
+          wrap-up follow, as after a confirmed stop.  The turn is said to the interviewer.
+        * A short no ("No.", "Let's keep going.") gets L-ASIDE-WRAP-RESUME, and the role-play goes
+          on in character with the candidate's next turn; a no that goes on to the learner ("No,
+          let me tell you about the mentors.") is answered by her.
+        * "Sorry?" hears the offer again; a fragment ("Hmm.") or a short yes that has not settled
+          yet says nothing and leaves the question open.
+        * Anything else is the candidate carrying on with the learner: no is the answer, and the
+          learner answers this very turn (None).
+        Neither a no nor carrying on changes a grade, a disclosure or the schedule.
+        """
+        declined = declines_wrap_offer(text)
+        accepted = not declined and (
+            accepts_wrap_offer(text)
+            or (confirmed_yes and is_short_wrap_yes(text))
+            or end_intent == "end"
+            or is_close_attempt(text, r_sec)
+        )
+        if accepted:
+            self._wrap_open = False
+            offer = self._wrap_offers[-1]
+            offer["answer"] = "yes"
+            offer["answer_transcript_turn"] = turn_index
+            self.wrap_accepted = True
+            self.exit_requested = True
+            reasons = ["wrap_offer_accepted"]
+            if end_intent == "end" and not accepts_wrap_offer(text):
+                reasons.append("end_intent_model")
+            return self._plan(TurnMode.EXIT, reasons)
+        if declined and word_count(text) <= WRAP_NO_WORDS and not has_question(text):
+            self._wrap_closed("no", r_sec, turn_index)
+            return self._wrap_line_plan(WRAP_RESUME_LINE, ["wrap_offer_declined"])
+        if declined:
+            # "No, I'd like to continue. What budget did you have in mind?": the no is said and the
+            # rest is for the learner, who answers it (no resume line over the advisor's point).
+            self._wrap_closed("no", r_sec, turn_index)
+            return None
+        if repair:
+            return self._wrap_line_plan(WRAP_OFFER_LINE, ["wrap_offer_repeated"])
+        if word_count(text) <= END_FRAGMENT_WORDS or is_short_wrap_yes(text):
+            return self._wrap_line_plan(None, ["wrap_offer_pending"])
+        self._wrap_closed("carried_on", r_sec, turn_index)
+        return None
+
+    def wrap_question_lapsed(self, r_sec: float | None = None) -> None:
+        """Nobody answered L-ASIDE-WRAP: the silence ladder takes over and the offer is a no."""
+        if self._wrap_open:
+            self._wrap_closed("no_answer", self.last_r if r_sec is None else r_sec, None)
+
     # ----------------------------------------------------------------- negotiation
     def _observe_negotiation(self, candidate_text: str, turn: int) -> NegotiationTurn:
         """Let the negotiation read this advisor turn (offers, callbacks, e-mail, check-ins)."""
@@ -1456,6 +1890,15 @@ class RolePlayEngine:
                 notes.append(ANSWERED_NOTE.format(topics=topics))
         if mode is TurnMode.LLM_REPLY and self._hollow_run >= 1 and self._last_reply_closer:
             notes.append(HOLLOW_NOTE)
+        if (
+            mode is TurnMode.LLM_REPLY
+            and self._decider_said
+            and not self._decider_asked_now
+        ):
+            # L7: said once is said; only a question about who else decides gets it again.
+            notes.append(
+                DECIDER_SAID_NOTE.format(decision_maker=self.persona.decision_maker)
+            )
         if self._phrases.get(PHRASE_STRETCH, 0) >= 1:
             notes.append(STRETCH_USED_NOTE)
         if self._phrases.get(PHRASE_TEMPLATE_Q, 0) >= 1:
@@ -1832,10 +2275,16 @@ class RolePlayEngine:
                 move, brief=anchor.brief, must_say=anchor.must_say, variants=anchor.variants
             )
             self.negotiation.note_response(self.turn, f"anchor:{anchor.id}")
-        elif move.id == F4_PUSH and self._call_ask_now:
-            # The advisor just proposed a call: "I'd need to talk to my father" must not turn into
-            # "he's not really one for these things", and the call stays welcome.
-            move = replace(move, brief=move.brief + F4_PUSH_CALL_SUFFIX)
+        elif move.id == F4_PUSH:
+            if self._decider_said:
+                # L7: she already said she would talk to her decision maker: the push refers back
+                # to it ("Like I said, ...") instead of saying it again as news.
+                suffix, said_variants = f4_push_said(self.persona.decision_maker)
+                move = replace(move, brief=move.brief + suffix, variants=said_variants)
+            if self._call_ask_now:
+                # The advisor just proposed a call: "I'd need to talk to my father" must not turn
+                # into "he's not really one for these things", and the call stays welcome.
+                move = replace(move, brief=move.brief + F4_PUSH_CALL_SUFFIX)
         elif move.id == TIME_CUE:
             # Three wordings of the cue, one per attempt ("before my own next call": 8 of 20).
             briefs = (move.brief, *TIME_CUE_BRIEF_ALTERNATIVES)
@@ -1930,6 +2379,21 @@ class RolePlayEngine:
             if topic not in self._curiosity_asked and curiosity_covered(topic, advisor_text):
                 self._curiosity_asked.add(topic)
 
+    @property
+    def _decider_said(self) -> bool:
+        """L7: the learner already said she would talk to her decision maker."""
+        return self._decider_said_turn is not None or self.negotiation.decider_said_turn is not None
+
+    def _note_monthly_quote(self, advisor_text: str, turn: int) -> None:
+        """L5: a monthly payment the advisor named; above the card's budget she says so."""
+        figures = monthly_amounts(advisor_text)
+        if not figures:
+            return
+        self._monthly_quote_usd = min(figures)
+        self._monthly_quote_turn = turn
+        if self._monthly_quote_usd > MONTHLY_BUDGET_MAX_USD:
+            self._notes.append(BUDGET_OVER_NOTE.format(amount=format_usd(self._monthly_quote_usd)))
+
     def _question_budget(self) -> bool:
         """The learner may ask a question now: none of its last replies held one.
 
@@ -1942,9 +2406,14 @@ class RolePlayEngine:
         """One unasked question topic every ``CURIOSITY_EVERY`` free replies, else "".
 
         These are the neutral questions that used to be scheduled (live or recorded, what
-        would I build) plus three more; the model is only told what it is curious about and
+        would I build) plus more; the model is only told what it is curious about and
         may ask in its own words, so nothing is owed and nothing is graded.  ``force`` (the
         advisor checked in) ignores the cadence, never the question budget.
+
+        L1: handing a topic over does not use it up; her spoken question does (``record_spoken``,
+        ``curiosity_asked_in``), whether the topic was handed over or she asked on her own.  The
+        topic handed over least often comes next (in the attempt's seeded order), and one handed
+        over ``CURIOSITY_OFFER_LIMIT`` times without being asked is not handed over again.
         """
         self._free_replies += 1
         if not self._question_budget():
@@ -1953,13 +2422,19 @@ class RolePlayEngine:
             return ""
         ids = tuple(topic for topic, _label in CURIOSITY_TOPICS)
         labels = dict(CURIOSITY_TOPICS)
-        for step in range(len(ids)):
-            topic = pick_variant(ids, self.seed, step)
-            if topic not in self._curiosity_asked:
-                self._curiosity_asked.add(topic)
-                self._free_at_last_curiosity = self._free_replies
-                return labels[topic]
-        return ""
+        order = [pick_variant(ids, self.seed, step) for step in range(len(ids))]
+        open_topics = [
+            topic
+            for topic in dict.fromkeys(order)
+            if topic not in self._curiosity_asked
+            and self._curiosity_offered.get(topic, 0) < CURIOSITY_OFFER_LIMIT
+        ]
+        if not open_topics:
+            return ""
+        topic = min(open_topics, key=lambda item: self._curiosity_offered.get(item, 0))
+        self._curiosity_offered[topic] = self._curiosity_offered.get(topic, 0) + 1
+        self._free_at_last_curiosity = self._free_replies
+        return labels[topic]
 
     # ------------------------------------------------------------------ the plan
     def _plan(
@@ -2036,6 +2511,8 @@ class RolePlayEngine:
                 reaction_only=intent is not None and intent.kind == KIND_COMMIT,
                 style_note=style_note,
                 confirm=confirm,
+                answering=self._dig_now,
+                intent_shape=pick_variant((0, 1), self.seed, self.turn),
             )
             ctx = self.guard_context(
                 mode="reply",
@@ -2129,11 +2606,15 @@ class RolePlayEngine:
             self._styles.append((reply_opener(spoken_text), reply_tics(spoken_text)))
             self._asked.append("?" in spoken_text)
             self._last_reply_closer = is_closer(spoken_text)
+            self._raised_last = plan.move_id is not None or plan.negotiation_id is not None
             phrases = reply_phrases(spoken_text)
             self._phrase_history.append(phrases)
             for key in phrases:
                 self._phrases[key] = self._phrases.get(key, 0) + 1
         self.tracker.note_learner_text(spoken_text, plan.turn)
+        self._curiosity_asked.update(curiosity_asked_in(spoken_text))  # L1: her own questions
+        if self._decider_said_turn is None and self.scheduler.spoken_proves(F4_PUSH, spoken_text):
+            self._decider_said_turn = plan.turn  # L7: the decision maker is named
         self.negotiation.note_learner_text(
             spoken_text,
             plan.turn,
@@ -2329,6 +2810,8 @@ class RolePlayEngine:
                 "handed_to_model": dict(self._intent_uses),
                 "fallback_appended": dict(self._intent_fallbacks),
                 "curiosity_asked": sorted(self._curiosity_asked),
+                "curiosity_offered": dict(sorted(self._curiosity_offered.items())),
+                "discovery_holds": dict(sorted(self._discovery_holds.items())),
                 # Pushes the learner voiced in a free reply (not owed again), and calls it declined.
                 "organic_pushes": list(self._organic_pushes),
                 "declined_calls": self._declined_calls,
@@ -2350,6 +2833,9 @@ class RolePlayEngine:
                 # The one-off out-of-role end request: the "end the interview now, or carry on?"
                 # aside, or an explicit request that needed none (``question_asked`` false).
                 "end_request": None if self._end_aside is None else dict(self._end_aside),
+                # M2: every offer to wrap up (R, trigger, answer) and whether one was taken.
+                "wrap_offers": [dict(offer) for offer in self._wrap_offers],
+                "wrap_accepted": self.wrap_accepted,
             },
             "character_breaks": {
                 "ai_questions": self._ai_questions,

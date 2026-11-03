@@ -412,7 +412,7 @@ Clocks:
 | `OPENING` | Candidate present | L-OPEN played | ~40 s |
 | `ICEBREAKER` | After L-OPEN | Soft: S ≥ 3:30 and ≥4 candidate turns, at the next bot-turn boundary. Hard: S = 4:30. | 3-4 min |
 | `TRANSITION` | Icebreaker exit (**attempt counted**, D1) | L-TRANSITION → `READY` (candidate says "ready", or 20 s) → L-PICKUP | ≤90 s |
-| `ROLEPLAY` | After L-PICKUP | Soft: R ≥ 19:00 at a turn boundary. Early: R ≥ 14:00 and commitment resolved. **Hard: R = 20:00 or S = 26:00.** | 20 min |
+| `ROLEPLAY` | After L-PICKUP | Soft: R ≥ 19:00 at a turn boundary. Early, only by the candidate's choice (owner and manager decisions 2026-11-03, M2): from R ≥ 14:00, when the commitment is resolved or the call is going nowhere, Christy offers to wrap up at a natural pause (L-ASIDE-WRAP, R paused, at most twice, 3 min cool-down after a no) and a yes exits; a goodbye or a confirmed stop also exits. **Hard: R = 20:00 or the S cap** (from the pickup, S ≤ 29:15), closed gently: the candidate's turn in flight, then L-TIME-UP, then L-EXIT. | up to 20 min |
 | `ASIDE` (sub-state) | Coaching, confusion, silence step 2, or mute | Aside played → `ROLEPLAY` | ≤3 per session; R paused |
 | `ROLEPLAY_EXIT` | Role-play exit | L-EXIT played | ~12 s |
 | `WRAPUP` | After L-EXIT | 2 questions answered, "no questions", 2:00 elapsed, or 20 s silence | ≤2:00 |
@@ -436,10 +436,17 @@ Clocks:
 
 | ID | Exact text |
 |---|---|
-| L-OPEN | "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and I'll be running your first-round interview for the Sales Program Advisor role. It takes about thirty minutes. We'll spend a few minutes getting to know you, then I'll switch into a twenty-minute sales role-play where I play a prospective learner, and we'll finish with a couple of minutes for your questions. Let's start: could you walk me through your background, especially any sales or customer-facing work you've done?" |
-| L-TRANSITION | "Thank you, {first_name}. We'll now move to the role-play. I'll play a prospective learner so we can evaluate how you handle a real sales call. The learner is {lead_name} from {lead_city}, who filled in a form on our website about the Data Science course a few days ago. You're the Program Advisor calling her back. The role-play runs for twenty minutes, and within those twenty minutes your goal is to convince her: understand her needs and help her decide to enrol, as you would on a real call, using the course details from your preparation guide. I'll stay in character until I say, 'Let's pause the role-play here.' When you're ready, just say 'ready' and she'll pick up." |
+| L-OPEN | "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and I'll be running your first-round interview for the Sales Program Advisor role. It takes about thirty minutes. We'll spend a few minutes getting to know you, then I'll switch into a sales role-play of up to twenty minutes where I play a prospective learner, and we'll finish with a couple of minutes for your questions. Let's start: could you walk me through your background, especially any sales or customer-facing work you've done?" |
+| L-TRANSITION | "Thank you, {first_name}. We'll now move to the role-play. I'll play a prospective learner so we can evaluate how you handle a real sales call. The learner is {lead_name} from {lead_city}, who filled in a form on our website about the Data Science course a few days ago. You're the Program Advisor calling her back. The role-play runs for up to twenty minutes, and in that time your goal is to convince her: understand her needs and help her decide to enrol, as you would on a real call, using the course details from your preparation guide. I'll stay in character until I say, 'Let's pause the role-play here.' When you'd like to begin, just say 'ready' and she'll pick up. Shall we start the role-play now, or do you have any questions first?" |
+| L-TRANSITION-ASK | "Shall we start the role-play now, or do you have another question?" |
+| L-TRANSITION-REASK | "Shall we start the role-play now? Just say 'ready' when you are, or ask me a question first if you have one." |
+| L-TRANSITION-REASK-2 | "I'm still here whenever you're ready. Just say 'ready', or press the I'm ready button, and she'll pick up." |
+| L-TRANSITION-STEER | "Let's keep any other questions for the end of the interview; there'll be time for them then. Shall we start the role-play now?" |
 | L-PICKUP | Per persona, e.g. "Hello? Yes, this is Meera speaking." |
 | L-TIME-CUE (learner, R ≈ 17:00) | "Just so you know, I've only got a couple of minutes before my next call." |
+| L-TIME-UP (learner, at the end of the time, M2) | "I'm sorry, I really have to go now. Thank you for your time." |
+| L-ASIDE-WRAP (interviewer aside, R ≥ 14:00, M2) | "This is Christy, your interviewer, stepping in for a moment. We're well into the role-play now, so would you like to wrap it up here? If you'd rather keep going, just carry on with {lead_first_name}." |
+| L-ASIDE-WRAP-RESUME (after a no, M2) | "Of course, let's keep going. {lead_first_name} is back on the line." |
 | L-EXIT | "Let's pause the role-play here. I'm stepping out of the learner's role now; this is Christy, your interviewer, again. Thank you, that's the end of the role-play." |
 | L-WRAP | "Before we finish, do you have any questions about the role or the next steps?" |
 | L-NO-FEEDBACK | "I'm sorry, I can't share any feedback on how it went." |

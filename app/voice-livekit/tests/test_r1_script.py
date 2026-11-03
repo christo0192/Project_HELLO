@@ -86,14 +86,35 @@ class TableTests(unittest.TestCase):
     def test_the_opening_and_transition_say_what_the_plan_says(self):
         self.assertIn("an AI interviewer from Interview Kickstart", LINES["L-OPEN"])
         self.assertIn("about thirty minutes", LINES["L-OPEN"])
-        self.assertIn("a twenty-minute sales role-play", LINES["L-OPEN"])
+        # M3 (owner decision 2026-11-03): the role-play may end before twenty minutes, so both
+        # lines say "up to twenty minutes", never a fixed twenty.
+        self.assertIn("a sales role-play of up to twenty minutes", LINES["L-OPEN"])
+        self.assertNotIn("twenty-minute", LINES["L-OPEN"])
         # The owner's ask: the role-play's length and the goal (convince the learner) are said
         # plainly at its start.
-        self.assertIn("The role-play runs for twenty minutes", LINES["L-TRANSITION"])
-        self.assertIn("within those twenty minutes your goal is to convince her", LINES["L-TRANSITION"])
+        self.assertIn("The role-play runs for up to twenty minutes", LINES["L-TRANSITION"])
+        self.assertIn("in that time your goal is to convince her", LINES["L-TRANSITION"])
+        self.assertNotIn("runs for twenty minutes", LINES["L-TRANSITION"])
         self.assertNotIn("fourteen", LINES["L-TRANSITION"])
         self.assertIn("'Let's pause the role-play here.'", LINES["L-TRANSITION"])
         self.assertIn("just say 'ready'", LINES["L-TRANSITION"])
+        # M1: the brief ends by asking whether to start or take questions first (no auto-start).
+        self.assertTrue(LINES["L-TRANSITION"].endswith(
+            "Shall we start the role-play now, or do you have any questions first?"
+        ))
+
+    def test_the_consent_lines_never_start_the_role_play_themselves(self):
+        # M1: every line of the wait asks; none announces that the role-play is starting.
+        for line_id in (
+            "L-TRANSITION-ASK", "L-TRANSITION-REASK", "L-TRANSITION-REASK-2", "L-TRANSITION-STEER",
+        ):
+            with self.subTest(line=line_id):
+                text = LINES[line_id]
+                self.assertTrue(is_candidate_free(line_id))
+                self.assertNotIn("{", text)
+                self.assertNotIn("let's begin", text.lower())
+                self.assertIn("ready" if line_id == "L-TRANSITION-REASK-2" else "?", text)
+        self.assertNotIn("hiring team", LINES["L-TRANSITION-STEER"])
 
     def test_the_exit_cue_is_the_exit_lines_first_sentence(self):
         self.assertTrue(LINES["L-EXIT"].startswith(EXIT_CUE))
@@ -365,6 +386,29 @@ class SpokenNameTests(unittest.TestCase):
             self.assertEqual(known_first_name(spoken_first_name(text)), spoken_first_name(text))
             self.assertTrue(2 <= len(spoken_first_name(text)) <= 24)
             self.assertTrue(spoken_first_name(text).isalpha())
+
+
+class ConsensualEndLineTests(unittest.TestCase):
+    """M2 (2026-11-03): the offer to wrap up, the hand-back and the learner's closing at time."""
+
+    def test_the_offer_asks_one_question_a_yes_can_answer(self):
+        text = LINES["L-ASIDE-WRAP"]
+        self.assertIn("Christy", text)
+        self.assertIn("would you like to wrap it up here?", text)
+        self.assertNotIn(" or keep going", text)  # not an either/or question (as L-ASIDE-END)
+        self.assertEqual(placeholders("L-ASIDE-WRAP"), {"lead_first_name"})
+        self.assertEqual(placeholders("L-ASIDE-WRAP-RESUME"), {"lead_first_name"})
+        self.assertEqual(placeholders("L-TIME-UP"), frozenset())
+        for line_id in ("L-ASIDE-WRAP", "L-ASIDE-WRAP-RESUME", "L-TIME-UP"):
+            with self.subTest(line=line_id):
+                self.assertIn(line_id, CANDIDATE_FREE_LINES)
+
+    def test_the_closing_at_time_promises_nothing_and_names_nobody(self):
+        text = LINES["L-TIME-UP"].lower()
+        for word in ("hiring team", "enrol", "call you", "book", "email", "pay", "christy"):
+            with self.subTest(word=word):
+                self.assertNotIn(word, text)
+        self.assertNotIn("pause the role-play", LINES["L-ASIDE-WRAP-RESUME"].lower())
 
 
 if __name__ == "__main__":

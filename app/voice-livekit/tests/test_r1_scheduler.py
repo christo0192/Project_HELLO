@@ -1374,9 +1374,59 @@ class CuriosityCoverageTests(unittest.TestCase):
         self.assertFalse(sched.curiosity_covered("format", OPENER))
         self.assertFalse(sched.curiosity_covered("unknown", "The classes are live."))
 
-    def test_the_topics_are_the_two_old_questions_plus_three(self):
+    def test_the_topics_are_the_two_old_questions_plus_six(self):
         ids = [topic for topic, _label in sched.CURIOSITY_TOPICS]
-        self.assertEqual(ids, ["format", "build", "payment", "mentor_time", "weekly_hours"])
+        # L1 (mock call aa166f09): three more topics joined the pool of five.
+        self.assertEqual(
+            ids,
+            [
+                "format",
+                "build",
+                "payment",
+                "mentor_time",
+                "weekly_hours",
+                "class_size",
+                "prerequisites",
+                "job_search",
+            ],
+        )
+
+    def test_the_learners_own_question_names_its_topic(self):
+        """L1: her question uses a topic up, the handed-over topic or one she asked on her own."""
+        cases = {
+            "One thing I'd like to know - could I pay in monthly instalments?": {"payment"},
+            "What would the weekly time commitment realistically look like?": {"weekly_hours"},
+            "I am curious though - are the classes live or recorded?": {"format"},
+            "What would I actually build during the course?": {"build"},
+            "How much time would I get with mentors?": {"mentor_time"},
+            "How many people are in a batch?": {"class_size"},
+            "Do I need to know anything before I start?": {"prerequisites"},
+            "Is there any help with the job search afterwards?": {"job_search"},
+        }
+        for text, topics in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(set(sched.curiosity_asked_in(text)), topics)
+        # A statement asks nothing, and a question about something else names no topic.
+        self.assertEqual(sched.curiosity_asked_in("I like that the classes are live."), frozenset())
+        self.assertEqual(
+            sched.curiosity_asked_in("Can I ask how your past students found the transition?"),
+            frozenset(),
+        )
+
+    def test_the_f4_push_refers_back_to_a_decision_maker_already_named(self):
+        """L7: the refer-back variants still prove the graded F4 push."""
+        suffix, variants = sched.f4_push_said("partner")
+        self.assertIn("refer back", suffix)
+        self.assertNotIn("{decision_maker}", suffix)
+        markers = sched.SPEC_BY_ID[sched.F4_PUSH].markers
+        filled = tuple(
+            tuple(pattern.replace("{decision_maker}", "partner") for pattern in group)
+            for group in markers
+        )
+        for text in variants:
+            with self.subTest(text=text):
+                self.assertIn("partner", text)
+                self.assertTrue(sched.markers_match(filled, text))
 
 
 class CloseScanIsLinearTests(unittest.TestCase):

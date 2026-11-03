@@ -340,7 +340,10 @@ class ReminderTests(unittest.TestCase):
         )
         self.assertIn("first react to what the advisor just said", text)
         self.assertIn("answer it briefly from your card or backstory", text)
-        self.assertIn("raise something of your own", text)
+        # L2 (mock call aa166f09): the point joins the reaction, it is not "something of your own"
+        # tacked on.
+        self.assertIn("bring in the point below as part of your reaction", text)
+        self.assertNotIn("raise something of your own", text)
         self.assertIn("in your own words, as a real person would, without reading it out", text)
         self.assertIn(f'"{spec.brief}"', text)  # quoted: voicing it is never an instruction echo
         # No quote marks around the figures: the model copied them into its reply.
@@ -654,7 +657,14 @@ class CharacterBreakPromptTests(unittest.TestCase):
         from r1_prompts import control_prose
 
         prefix = interviewer_prefix()
-        self.assertIn('approved list: "Working days are 5.5 days a week.', prefix)
+        self.assertIn(
+            'The only facts you may share about the role: "Working days are 5.5 days a week.',
+            prefix,
+        )
+        # A4 (aa166f09 turn 119: "I can answer it from the approved information"): the prefix
+        # no longer names its facts an "approved list", and forbids saying so.
+        self.assertNotIn("approved list", prefix)
+        self.assertIn("Never call these facts a list or approved information", prefix)
         self.assertNotIn("Monday to Friday 10:00 PM", control_prose(prefix))
         self.assertIn("Never give feedback", control_prose(prefix))
 
@@ -761,6 +771,80 @@ class WrapupReminderTests(unittest.TestCase):
             self.assertIsNone(
                 re.search(rf"\b{re.escape(word)}\b", WRAPUP_REMINDER), word
             )
+
+
+class WrapupComplaintTests(unittest.TestCase):
+    """A4 (owner decision 2026-11-03): a complaint in the wrap-up is taken gracefully.
+
+    aa166f09 turn 119 answered "You did not give enough time to complete the role play" with "I
+    understand, but the interview has now reached its closing stage ... from the approved
+    information".  The note says what to do instead, and keeps L-CLOSE the one mention of the
+    hiring team (the comment above L-NO-FEEDBACK in r1_script).
+    """
+
+    def test_the_note_acknowledges_thanks_and_notes_a_complaint(self):
+        from r1_prompts import WRAPUP_REMINDER
+
+        lowered = WRAPUP_REMINDER.lower()
+        for phrase in (
+            "complains about the interview itself",
+            "do not argue, explain or defend",
+            'do not start with "i understand, but"',
+            "thank them for saying so",
+            "it has been noted",
+            "never mention a list, approved information, notes or a stage",
+            "do not mention the hiring team",
+        ):
+            self.assertIn(phrase, lowered)
+
+
+class TransitionReminderTests(unittest.TestCase):
+    """M1 (owner decision 2026-11-03): Christy answers questions before the role-play starts."""
+
+    def test_the_transition_gets_its_own_note(self):
+        from r1_prompts import TRANSITION_REMINDER, interviewer_reminder
+        from r1_replies import Reply, llm_messages
+
+        self.assertEqual(interviewer_reminder("transition"), TRANSITION_REMINDER)
+        messages = llm_messages(
+            Reply(phase="transition", candidate_text="What are the working days?"), P1, []
+        )
+        self.assertEqual(messages[0], {"role": "system", "content": interviewer_prefix()})
+        self.assertEqual(messages[-2], {"role": "system", "content": TRANSITION_REMINDER})
+        lowered = TRANSITION_REMINDER.lower()
+        for phrase in (
+            "one or two short",
+            "only the facts about the role",
+            "hiring team will follow up",
+            "never invent a fact",
+            "never start, announce or describe the role-play",
+            "never ask whether they are ready to start",
+        ):
+            self.assertIn(phrase, lowered)
+        for name in ALL_PERSONA_NAMES:
+            self.assertNotIn(name.lower(), lowered)
+        for word in RUBRIC_WORDS:
+            self.assertIsNone(re.search(rf"\b{re.escape(word)}\b", TRANSITION_REMINDER), word)
+
+    def test_a_transition_call_sees_its_own_questions_but_no_scripted_line(self):
+        items = (
+            {"role": "candidate", "text": "I sold SaaS.", "phase": "icebreaker"},
+            {"role": "bot", "text": "The learner is Meera Iyer from Edison.", "phase": "transition",
+             "voice": "interviewer", "scripted": True},
+            {"role": "candidate", "text": "What are the working days?", "phase": "transition"},
+            {"role": "bot", "text": "Working days are 5.5 a week.", "phase": "transition",
+             "voice": "interviewer"},
+            {"role": "bot", "text": "Hello? Yes, this is Meera speaking.", "phase": "transition",
+             "voice": "learner"},
+        )
+        joined = " ".join(m["content"] for m in select_context(items, "transition"))
+        self.assertIn("I sold SaaS.", joined)
+        self.assertIn("What are the working days?", joined)
+        self.assertIn("Working days are 5.5 a week.", joined)
+        self.assertNotIn("Meera", joined)
+        # The wrap-up still never sees the transition.
+        wrap = " ".join(m["content"] for m in select_context(items, "wrapup"))
+        self.assertNotIn("working days", wrap.lower())
 
 
 class AssembleTests(unittest.TestCase):
@@ -986,6 +1070,61 @@ class FinalReviewRoundOnePromptTests(unittest.TestCase):
         self.assertGreaterEqual(len(STYLE_NOTES), 8)
         for note in STYLE_NOTES:
             note.encode("ascii")
+
+
+class LearnerBehaviourS03Tests(unittest.TestCase):
+    """Mock call aa166f09 (owner and manager decisions of 2026-11-03), the learner's notes."""
+
+    def test_the_check_in_done_note_never_closes_the_call_for_the_advisor(self):
+        # L1: turn 112 "No, I think I've got what I need for now. I'll come back to you."
+        self.assertIn("Do not close the conversation yourself", CHECKIN_DONE_NOTE)
+        self.assertIn("do not say that you will get back to them", CHECKIN_DONE_NOTE)
+
+    def test_an_intent_on_a_dig_answers_the_question_first(self):
+        # L2: turn 52 answered "what ROI are you expecting?" with a question of her own.
+        spec = SPEC_BY_ID[F1_ANCHOR]
+        text = turn_reminder(
+            P1, r_sec=300, intent_brief=spec.brief, must_say=spec.must_say, answering=True
+        )
+        self.assertIn("the advisor asked you something, so answer that first", text)
+        self.assertIn("not as a new topic tacked on at the end", text)
+        self.assertNotIn("raise something of your own", text)
+        self.assertIn(f'"{spec.brief}"', text)  # the owed point is still handed over
+
+    def test_the_intent_shape_and_length_rotate(self):
+        from r1_prompts import INTENT_LENGTHS, INTENT_SHAPES
+
+        spec = SPEC_BY_ID[F1_ANCHOR]
+        texts = [
+            turn_reminder(P1, r_sec=300, intent_brief=spec.brief, intent_shape=shape)
+            for shape in range(2)
+        ]
+        self.assertNotEqual(texts[0], texts[1])
+        for shape, text in enumerate(texts):
+            self.assertIn(INTENT_SHAPES[shape], text)
+            self.assertIn(INTENT_LENGTHS[shape], text)
+        self.assertIn("one or two sentences", texts[1])
+        self.assertIn("at most one question in the whole reply", texts[1])
+
+    def test_the_budget_and_decider_notes_name_the_figure_and_the_person(self):
+        from r1_prompts import BUDGET_OVER_NOTE, DECIDER_SAID_NOTE
+
+        note = BUDGET_OVER_NOTE.format(amount="$1,000")
+        self.assertIn("$1,000 a month", note)
+        self.assertIn("never call it workable", note)
+        self.assertIn("$500-700 a month", note)  # the card's own budget
+        said = DECIDER_SAID_NOTE.format(decision_maker="partner")
+        self.assertIn("talk it over with your partner", said)
+        self.assertIn("do not say it again", said)
+
+    def test_the_card_gives_her_work_and_says_the_advisor_is_calling_her(self):
+        # M4 and L4: refused six times; "I thought I was the one calling".
+        shalini = resolve_persona("p4_research_scholar", variant="v1")
+        prefix = learner_prefix(shalini)
+        self.assertIn("The Program Advisor is calling you back about that form", prefix)
+        self.assertIn('"I work at a university research lab in Boston."', prefix)
+        self.assertIn('"Around $62,000 a year."', prefix)
+        self.assertIn("do not refuse", prefix)
 
 
 if __name__ == "__main__":

@@ -15,8 +15,8 @@ LINES = {
         "Hi {first_name}, I'm Christy, an AI interviewer from Interview Kickstart, and "
         "I'll be running your first-round interview for the Sales Program Advisor role. "
         "It takes about thirty minutes. We'll spend a few minutes getting to know you, "
-        "then I'll switch into a twenty-minute sales role-play where I play a prospective "
-        "learner, "
+        "then I'll switch into a sales role-play of up to twenty minutes where I play a "
+        "prospective learner, "
         "and we'll finish with a couple of minutes for your questions. Let's start: could "
         "you walk me through your background, especially any sales or customer-facing work "
         "you've done?"
@@ -26,11 +26,11 @@ LINES = {
         "learner so we can evaluate how you handle a real sales call. The learner is "
         "{lead_name} from {lead_city}, who filled in a form on our website about the Data "
         "Science course a few days ago. You're the Program Advisor calling her back. The "
-        "role-play runs for twenty minutes, and within those twenty minutes your goal is to "
-        "convince her: understand her needs and help her decide to enrol, as you would on a "
-        "real call, using the course details from your preparation guide. I'll stay in "
-        "character until I say, 'Let's pause the role-play here.' When you're ready, just "
-        "say 'ready' and she'll pick up."
+        "role-play runs for up to twenty minutes, and in that time your goal is to convince "
+        "her: understand her needs and help her decide to enrol, as you would on a real call, "
+        "using the course details from your preparation guide. I'll stay in character until I "
+        "say, 'Let's pause the role-play here.' When you'd like to begin, just say 'ready' and "
+        "she'll pick up. Shall we start the role-play now, or do you have any questions first?"
     ),
     "L-PICKUP": "Hello? Yes, this is Meera speaking.",
     "L-TRANSITION-NUDGE": "Whenever you're ready, just say ready.",

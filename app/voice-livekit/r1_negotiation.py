@@ -1299,6 +1299,8 @@ _PART_AFTER = re.compile(
     r"|(?:per|each|every|a|an|/)\s*(?:\w+\s+)?(?:months?|instal+ments?|emis?|modules?|terms?|"
     r"semesters?|quarters?|weeks?|years?|class(?:es)?|sessions?|parts?|units?|levels?|"
     r"subjects?|payments?)\b"
+    # "$1000 EMI option monthly", "$600 monthly" (L5, mock call aa166f09 turn 106).
+    r"|(?:emis?|monthly)\b"
     r"|(?:as|for|in|is)\s+(?:a |an |the |your |my )?(?:\w+\s+)?(?:deposit|down ?payment|advance|"
     r"token|booking|registration|reservation|admission|application|first|initial|instal+ment|"
     r"emi|part)\b"
@@ -1545,6 +1547,14 @@ _HEDGE_BEFORE = re.compile(
     re.IGNORECASE,
 )
 # ... and, for a figure the learner said, a rough one ("around", "close to", "the range").
+# L5 (mock call aa166f09, turn 95: "Maybe we can offer you $6000 rather than $12000" parsed
+# nothing).  A leading "maybe" or "perhaps" before a first-person offer verb is a filler, not a
+# hedge: "maybe we can offer you", "perhaps I can give you".  "Maybe I can try for $8,000" and
+# "we may be able to do $8,000" stay hedged (``try`` and ``may`` are hedges of their own).
+_SOFT_OFFER_LEAD = re.compile(
+    r"\b(?:maybe|perhaps)\s+(?=(?:i|we)\s+(?:can|will|could)\s+(?:\w+\s+)?(?:offer|give)\b)",
+    re.IGNORECASE,
+)
 _HEDGE_LOOSE = re.compile(
     r"\b(?:get(?:ting)? close|close to|near(?:ly)?|around|roughly|approximately|about|ballpark|"
     r"range|up to)\b",
@@ -1749,7 +1759,11 @@ def _offered(lowered: str, start: int, end: int, *, learner_said: bool = False) 
     after = clause_after(lowered, end)
     if (has_refusal(after) or _PRICE_NO.search(after)) and not cue:
         return False
-    if _HEDGE_BEFORE.search(before) is not None or _HEDGE_AFTER.match(lowered[end:]) is not None:
+    hedge_before = _SOFT_OFFER_LEAD.sub(" ", before)
+    if (
+        _HEDGE_BEFORE.search(hedge_before) is not None
+        or _HEDGE_AFTER.match(lowered[end:]) is not None
+    ):
         return False
     if learner_said and (
         _HEDGE_LOOSE.search(before) is not None
@@ -1901,6 +1915,7 @@ def _piece_offers(
     require_cue: bool = False,
     rest_later: bool = False,
     rest_owed: bool = False,
+    base_usd: int = PRICE_USD,
 ) -> dict[int, bool]:
     """Net prices (and whether each is conditional) offered in one piece of a sentence.
 
@@ -1914,6 +1929,8 @@ def _piece_offers(
     ``rest_later`` says the sentence speaks of paying the rest later: "$2,000 now" is then a part;
     ``rest_owed`` that it says so in so many words: every figure under the net floor is a part.
     A competitor named as the seller ("Scaler sells it for 3000") is never the advisor's offer.
+    ``base_usd`` is the price a percentage comes off (``stated_price_usd``; the list price when
+    the turn names none).
     """
     # "$6500, which is ..." keeps its comma: the amount grammar would swallow it, and with it the
     # clause boundary the refusal and hedge checks read.
@@ -2031,10 +2048,12 @@ def _piece_offers(
         if _offered(lowered, match.start(), match.end()) and not _described_discount(
             lowered, match.start()
         ):
-            discount = int(round(PRICE_USD * float(match.group(1)) / 100))
+            net = int(round(base_usd * (100 - float(match.group(1))) / 100))
+            discount = PRICE_USD - net
             # The same floor as a dollar figure: "I gave you more than 90% discount" is no $900
-            # offer (owner test 7f2a25e6 turn 58, the learner then named a price nobody said).
-            if PRICE_USD - discount >= MIN_NET_USD:
+            # offer (owner test 7f2a25e6 turn 58, the learner then named a price nobody said).  A
+            # percentage off a higher stated price that leaves the list price or more is no offer.
+            if net >= MIN_NET_USD and discount > 0:
                 discounts.add(discount)
     if _PRICE_CUE.search(lowered) or asked_as_offer or plain_acceptance or framed_any or bare_off:
         for value, start, end in bare:
@@ -2074,6 +2093,7 @@ def parse_price_offers(
     """
     own = frozenset({ANCHOR_USD, *own_amounts})
     offers: dict[int, bool] = {}
+    base = stated_price_usd(text) or PRICE_USD
     for sentence in split_sentences(_tail(text)):
         # "You'll pay $2,000 now, and the rest later": the clause with the figure does not say so.
         rest_later = _PART_LATER.search(sentence) is not None
@@ -2087,9 +2107,139 @@ def parse_price_offers(
                         require_cue=require_cue,
                         rest_later=rest_later,
                         rest_owed=rest_owed,
+                        base_usd=base,
                     )
                 )
     return sorted(offers.items(), reverse=True)
+
+
+def stated_price_usd(text: object) -> int | None:
+    """The course price the advisor states in this turn at or above the list price, if any.
+
+    L5 (mock call aa166f09, turn 99: "it's coming with a 50% discount. If you start with a new
+    batch, you would have to end up paying $12000." was read as $4,500, half of the $9,000 list
+    price).  A percentage comes off the price the advisor named: the highest figure from the list
+    price up to ``MAX_LIST_USD`` that is not an income, a competitor's price, someone else's
+    payment, a part payment or a refused figure.  None when the turn names no such figure (the
+    percentage then comes off the list price).  Review fix: the figure must be framed as the price
+    (``_STATED_FRAME``: "the fee is", "you would end up paying", "costs", "normally", "off",
+    "instead of"), and a saving, a value or an add-on ("You will save $10,000", "the $10,000
+    masterclass is included") is none.
+    """
+    found: list[int] = []
+    for sentence in split_sentences(_tail(text)):
+        for clause in _clauses(sentence):
+            for piece in _pieces(clause):
+                lowered = canonical_amounts(re.sub(r"(\d),(?=\s)", r"\1 ,", piece)).lower()
+                sellers = _named_sellers(piece)
+                figures = [
+                    (parse_amount(match.group(1), bool(match.group(2))), match)
+                    for match in _DOLLARS.finditer(lowered)
+                ] + [
+                    (parse_amount(match.group(1)), match)
+                    for match in _BARE_WHOLE.finditer(lowered)
+                ]
+                for value, match in figures:
+                    start, end = match.start(), match.end()
+                    if (
+                        value is not None
+                        and PRICE_USD <= value <= MAX_LIST_USD
+                        and not _NOT_OURS_BEFORE.search(clause_before(lowered, start))
+                        and not _third_party_seller(lowered, start, sellers)
+                        and not negated_before(lowered, start, 8)
+                        and not _PRICE_NO.search(clause_after(lowered, end))
+                        and not _PART_AFTER.match(_UNIT_WORD.sub("", lowered[end:], count=1))
+                        and _STATED_FRAME.search(lowered[max(0, start - _STATED_SPAN) : start])
+                        and not _STATED_NOT_PRICE.search(
+                            lowered[max(0, start - _STATED_SPAN) : end + _STATED_SPAN]
+                        )
+                    ):
+                        found.append(value)
+    return max(found, default=None)
+
+
+# How far around a figure ``stated_price_usd`` reads its frame (review fix).
+_STATED_SPAN = 30
+# The figure is the course's price: "the fee/price/course is", "costs", "you would (end up) pay",
+# "normally", "originally", "off", "instead of", "it's".
+_STATED_FRAME = re.compile(
+    r"\b(?:fees?|price[sd]?|pricing|costs?|costing|course|program(?:me)?|pays?|paying|paid|"
+    r"normally|usually|originally|regularly|list|off|instead of|(?:it|that|this)(?:'s| is| was| "
+    r"would be| will be))\b[^$]{0,25}$",
+    re.IGNORECASE,
+)
+# A saving, a value, an add-on or a scholarship around the figure is no price for the course.
+_STATED_NOT_PRICE = re.compile(
+    r"\b(?:save|saves|saving|savings|value|valued|worth|included|includes|including|scholarships?|"
+    r"masterclass(?:es)?|bonus|cheaper|less than|more than)\b",
+    re.IGNORECASE,
+)
+
+
+# L5 (mock call aa166f09, turn 106: "$9000 same price for 9 months, $1000, $1000 EMI option
+# monthly").  A monthly payment the advisor names: a figure followed by "a month", "per month",
+# "monthly", "EMI" or "instalment(s)", or one after "EMIs of", "monthly payments of".  Review
+# fix: the word must follow the figure directly.  A comma is a clause boundary ("$4,500, EMI
+# options are there" is a total price and a note that EMIs exist; the figure's own thousands
+# separator is read, a trailing comma is not), and "EMI" that goes on as "options are there",
+# "available", "also possible" is no rate.
+_MONTHLY_FIGURE = re.compile(r"\$\s?(\d+(?:,\d{3})*(?:\.\d+)?)\s*(k\b)?", re.IGNORECASE)
+_MONTHLY_AFTER = re.compile(
+    r"^\s*(?:(?:a|per|each|every|/)\s*month\b|monthly\b|"
+    r"(?:as |in |an? )?(?:emis?|instal+ments?)\b(?!\s+(?:options?|plans?|facilit(?:y|ies)|"
+    r"available|possible|also|too|is|are|can|could|would|will)\b)|"
+    r"(?:\w+\s+){0,2}(?:emi|instal+ment) (?:option|plan)s? monthly\b)",
+    re.IGNORECASE,
+)
+_MONTHLY_BEFORE = re.compile(
+    r"\b(?:emis?|instal+ments?|monthly (?:payments?|instal+ments?|fees?|amount)|(?:pay|paying)"
+    r" monthly)\s+(?:of|at|is|are|would be|will be|comes? to|around|about|just|only|roughly)?"
+    r"\s*(?:just |only |about |around |roughly )?$",
+    re.IGNORECASE,
+)
+# A monthly figure below this is no payment for the course ("$5 a month" is a subscription).
+MIN_MONTHLY_USD = 50
+# Every monthly payment above is said with one of these words, so a turn without any is skipped.
+_MONTHLY_CUE = re.compile(r"month|\bemis?\b|instal", re.IGNORECASE)
+
+
+def monthly_amounts(text: object) -> list[int]:
+    """The monthly payments for the course the advisor names in ``text`` (L5).
+
+    "$1000 EMI", "$1,000 a month", "1000 dollars per month", "EMIs of $1,500", "monthly payments of
+    $800".  An income or a hike ("a salary hike of $1,000 a month", "earn $5,000 more per month")
+    and a negated figure are not payments.
+    """
+    found: list[int] = []
+    tail = _tail(text)
+    if _MONTHLY_CUE.search(fold(tail)) is None:
+        return found  # no "month", "EMI" or "instalment": nothing to read (and no slow fold)
+    lowered = canonical_amounts(tail).lower()
+    totals: set[int] | None = None
+    for match in _MONTHLY_FIGURE.finditer(lowered):
+        value = parse_amount(match.group(1), bool(match.group(2)))
+        # Review fix: a figure at or above ``MIN_NET_USD`` is a price for the course, not a rate
+        # ("I can do $5,000 monthly too if needed").
+        if value is None or not MIN_MONTHLY_USD <= value < MIN_NET_USD:
+            continue
+        start, end = match.start(), match.end()
+        after = _UNIT_WORD.sub("", lowered[end : end + _FRAME_CHARS], count=1)
+        before = lowered[max(0, start - _FRAME_CHARS) : start]
+        if _MONTHLY_AFTER.match(after) is None and _MONTHLY_BEFORE.search(before) is None:
+            continue
+        if _NOT_OURS_BEFORE.search(clause_before(lowered, start)) is not None:
+            continue
+        if re.match(r"^\s*(?:more|extra|additional|higher)\b", after) is not None:
+            continue
+        if negated_before(lowered, start, 8):
+            continue
+        if totals is None:
+            # A figure this turn offers as the total price is no monthly rate as well.
+            totals = {net for net, _conditional in parse_price_offers(text)}
+        if value in totals:
+            continue
+        found.append(value)
+    return found
 
 
 # A stated price says "pay" ("Pay me $3,000 and it's yours"); a statistic said "over" or "more
@@ -2109,9 +2259,11 @@ def unread_low_figures(text: object, own_amounts: Iterable[int] = ()) -> list[in
     price, an income, a bound, a count ("5,000 alumni") and a refused or negated figure are none,
     and a figure (with a "$" or without) counts only next to a pricing word: "Over $5,000
     learners" or "a $2,000 referral bonus" in a pitch is no price (review round 2).  The caller
-    drops the figures that were read as offers.
+    drops the figures that were read as offers.  A figure the turn names as a monthly payment
+    (``monthly_amounts``, also when it is said twice: "$1000, $1000 EMI option monthly") is a
+    part of the price too.
     """
-    own = frozenset({ANCHOR_USD, *own_amounts})
+    own = frozenset({ANCHOR_USD, *own_amounts, *monthly_amounts(text)})
     found: list[int] = []
     for sentence in split_sentences(_tail(text)):
         rest_later = _PART_LATER.search(sentence) is not None

@@ -116,7 +116,22 @@ import r1_world
 #    anchor for a figure under $7,000 that was not read as a price (``anchor_after_unclear_low``:
 #    react to that number and ask what the total would be, never ask for more) joins the
 #    manifest.  No other pinned text changed.
-CONTENT_REVISION = 19
+# 20: owner and manager decisions of 2026-11-03 (mock call aa166f09): L-OPEN and L-TRANSITION say
+#    "up to twenty minutes" (M3); L-TRANSITION ends by asking whether to start or take questions
+#    first, and the new transition lines (L-TRANSITION-ASK, L-TRANSITION-REASK,
+#    L-TRANSITION-REASK-2, L-TRANSITION-STEER) and the interviewer's transition note
+#    (r1_prompts.TRANSITION_REMINDER) join the manifest (M1: no auto-start); the interviewer
+#    prefix no longer calls its facts an "approved list" and the wrap-up note takes a complaint
+#    gracefully without a second hiring-team mention (A4).  Leaving the role-play is consensual
+#    (M2): the interviewer's offer to wrap up (L-ASIDE-WRAP), her line when the candidate keeps
+#    going (L-ASIDE-WRAP-RESUME) and the learner's closing at the end of the time (L-TIME-UP) join
+#    the scripted lines.  Same revision, the learner (S03): the card says the advisor is calling her
+#    back and gives her workplace, her job and a round salary per persona (M4, L4); three more
+#    curiosity topics (L1); the check-in-done note never closes the call (L1); the intent template
+#    has two shapes and two lengths and answers a dig first (L2); the F4 push refers back to a
+#    decision maker already named (L7), a free reply does not name them again, and a monthly figure
+#    above the card's budget is never "workable" (L5: BUDGET_OVER_NOTE, BUDGET_REPLACEMENT).
+CONTENT_REVISION = 20
 
 
 def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
@@ -128,6 +143,8 @@ def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
         "decision_maker": persona.decision_maker,
         "prior_learning": persona.prior_learning,
         "backstory": list(persona.backstory),
+        "role": persona.role,
+        "salary": persona.salary,
         "needs": [
             {
                 "topic": need.topic,
@@ -147,6 +164,7 @@ def _persona_manifest(persona: r1_personas.Persona) -> dict[str, Any]:
                 "last_name": v.last_name,
                 "city": v.city,
                 "employer": v.employer,
+                "workplace": v.workplace,
             }
             for v in persona.variants
         ],
@@ -171,6 +189,7 @@ def manifest() -> dict[str, Any]:
         "learner_policy": r1_world.LEARNER_POLICY,
         "state_names": dict(r1_personas.STATE_NAMES),
         "public_answers": [list(item) for item in r1_personas.PUBLIC_ANSWERS],
+        "monthly_budget_max_usd": r1_personas.MONTHLY_BUDGET_MAX_USD,
         "topic_labels": dict(r1_personas.TOPIC_LABELS),
         "scheduler": {
             "plan_version": r1_scheduler.PLAN_VERSION,
@@ -193,6 +212,8 @@ def manifest() -> dict[str, Any]:
             "answered_labels": [list(item) for item in r1_scheduler.ANSWERED_LABELS],
             "time_cue_alternatives": list(r1_scheduler.TIME_CUE_BRIEF_ALTERNATIVES),
             "f4_push_call_suffix": r1_scheduler.F4_PUSH_CALL_SUFFIX,
+            "f4_push_said_suffix": r1_scheduler.F4_PUSH_SAID_SUFFIX,
+            "f4_push_said_variants": list(r1_scheduler.F4_PUSH_SAID_VARIANTS),
             "curiosity_topics": [list(item) for item in r1_scheduler.CURIOSITY_TOPICS],
             "constants": {
                 "slip_limit_sec": r1_scheduler.SLIP_LIMIT_SEC,
@@ -279,6 +300,7 @@ def manifest() -> dict[str, Any]:
             "neutral_acks": list(r1_guard.NEUTRAL_ACKS),
             "anchor_replacement": r1_guard.ANCHOR_REPLACEMENT,
             "gratitude_replacement": r1_guard.GRATITUDE_REPLACEMENT,
+            "budget_replacement": r1_guard.BUDGET_REPLACEMENT,
             "confirm_fallbacks": list(r1_guard.CONFIRM_FALLBACKS),
             "style": {
                 "tic_window": r1_guard.STYLE_TIC_WINDOW,
@@ -299,6 +321,7 @@ def manifest() -> dict[str, Any]:
             "interviewer_prefix": r1_prompts.interviewer_prefix(),
             "wrapup_note": r1_prompts.WRAPUP_NOTE,
             "wrapup_reminder": r1_prompts.WRAPUP_REMINDER,
+            "transition_reminder": r1_prompts.TRANSITION_REMINDER,
             "getting_to_know_you_note": r1_prompts.GETTING_TO_KNOW_YOU_NOTE,
             "learner_prefixes": {
                 f"{p.id}.{v.id}": r1_prompts.learner_prefix(r1_personas.resolve_persona(
@@ -371,6 +394,18 @@ def manifest() -> dict[str, Any]:
             "resolved_note": r1_prompts.RESOLVED_NOTE,
             "checkin_note": r1_prompts.CHECKIN_NOTE,
             "checkin_done_note": r1_prompts.CHECKIN_DONE_NOTE,
+            "decider_said_note": r1_prompts.DECIDER_SAID_NOTE,
+            "budget_over_note": r1_prompts.BUDGET_OVER_NOTE,
+            "intent_shapes": list(r1_prompts.INTENT_SHAPES),
+            "intent_lengths": list(r1_prompts.INTENT_LENGTHS),
+            "intent_answering_sample": r1_prompts.turn_reminder(
+                sample,
+                r_sec=0,
+                intent_brief=intent_sample.brief,
+                must_say=intent_sample.must_say,
+                answering=True,
+                intent_shape=1,
+            ),
             "challenge_note": r1_prompts.CHALLENGE_NOTE,
             "interrupted_note": r1_prompts.INTERRUPTED_NOTE,
             "backchannel_cut_note": r1_prompts.BACKCHANNEL_CUT_NOTE,

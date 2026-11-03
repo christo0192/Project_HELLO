@@ -2516,5 +2516,79 @@ class ShipRestoreGuardTests(unittest.TestCase):
         self.assertGreaterEqual(ledger.leak_total, 1)
 
 
+class LearnerS03GuardTests(unittest.TestCase):
+    """Mock call aa166f09 (owner and manager decisions of 2026-11-03): L4, L5 and M4."""
+
+    def test_the_learner_never_says_she_placed_the_call(self):
+        for text in (
+            "Sorry, I'm calling about the data science course, not a job.",
+            "Right, I thought I was the one calling about the course.",
+            "I'm the one who called, actually.",
+            "I am calling because I filled in the form.",
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, ctx())
+                self.assertIn("learner_called", [hit.rule for hit in result.hits])
+        for text in (
+            "My partner is calling me later tonight.",
+            "Thanks for calling me back.",
+            "I'm calling it a day after this.",
+        ):
+            with self.subTest(text=text):
+                self.assertNotIn("learner_called", [h.rule for h in guard_text(text, ctx()).hits])
+
+    def test_her_own_salary_is_allowed_and_nobody_elses(self):
+        shalini = resolve_persona("p4_research_scholar", variant="v1")
+        said = "It's around $62,000 a year."
+        self.assertEqual(guard_text(said, ctx(persona=shalini)).hits, ())
+        # Another persona's card has no such figure: still an invented number.
+        self.assertEqual(
+            [hit.rule for hit in guard_text(said, ctx(persona=PERSONA)).hits], ["amount_off_card"]
+        )
+
+    def test_a_monthly_figure_above_her_budget_is_never_workable(self):
+        result = guard_text("Okay, that's more workable for me.", ctx(monthly_quote_usd=1000))
+        self.assertEqual([hit.rule for hit in result.hits], ["over_budget_accepted"])
+        self.assertEqual(result.text, r1_guard.BUDGET_REPLACEMENT)
+        for text in (
+            "I could manage that, I think.",
+            "That works for me.",
+            "A thousand a month is doable.",
+        ):
+            with self.subTest(text=text):
+                rules = [hit.rule for hit in guard_text(text, ctx(monthly_quote_usd=1000)).hits]
+                self.assertEqual(rules, ["over_budget_accepted"])
+
+    def test_within_budget_negated_supposed_or_asked_it_passes(self):
+        self.assertEqual(
+            guard_text("Okay, that's more workable for me.", ctx(monthly_quote_usd=600)).hits, ()
+        )
+        self.assertEqual(guard_text("Okay, that's more workable for me.", ctx()).hits, ())
+        for text in (
+            "That's not really workable for me.",
+            "It would be doable if it were closer to $600.",
+            "Would that be manageable over twelve months?",
+            "The evening schedule is doable for me.",
+            # Review fix: a call slot, an e-mail or a talk with her decision maker is no payment.
+            "Thursday at 7 PM works for me.",
+            "That works, send me the details by email.",
+            "I can do that, I will talk to my partner tonight.",
+            "Tomorrow evening works for us.",
+        ):
+            with self.subTest(text=text):
+                result = guard_text(text, ctx(monthly_quote_usd=1000))
+                self.assertNotIn("over_budget_accepted", [hit.rule for hit in result.hits])
+                self.assertNotEqual(result.text, r1_guard.BUDGET_REPLACEMENT)
+        # A money word keeps the payment in it.
+        rules = [
+            hit.rule
+            for hit in guard_text(
+                "I can do that payment each month, I'll tell my partner.",
+                ctx(monthly_quote_usd=1000),
+            ).hits
+        ]
+        self.assertIn("over_budget_accepted", rules)
+
+
 if __name__ == "__main__":
     unittest.main()
