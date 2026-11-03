@@ -1569,6 +1569,24 @@ export interface AdminAllowlistUpdateResponse {
   ok: boolean;
 }
 
+/** POST /api/admin/allowlist/:id/handover (0133) — :id is the OLD login's entry. */
+export interface AdminAllowlistHandoverInput {
+  to_entry_id: string;
+}
+
+/** Rows whose owner moved to the new login, per table. A repeat reports zeros. */
+export interface AdminAllowlistHandoverResponse {
+  ok: boolean;
+  moved: {
+    roles: number;
+    candidates: number;
+    call_sessions: number;
+    ashby_job_mappings: number;
+    role_drafts: number;
+    interview_rounds: number;
+  };
+}
+
 // ── Ashby Mission Control (sanitized; no PII/tokens) ─────────────────
 export interface AshbyMcMapping {
   id: string;

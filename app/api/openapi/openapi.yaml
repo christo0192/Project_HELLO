@@ -6997,6 +6997,56 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
 
+  /api/admin/allowlist/{id}/handover:
+    post:
+      tags: [admin]
+      operationId: handoverAdminAllowlistRecords
+      summary: Move the records owned by entry {id}'s login (roles, candidates, call sessions, Ashby job mappings, settled Ask-Hello drafts, R1 rounds it sent) to the login of to_entry_id, via the atomic handover_allowlist_records RPC (0133; audit in the same transaction). For a person who returns on the new company domain as a brand-new login. History columns are never rewritten.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminAllowlistHandoverRequest'
+      responses:
+        '200':
+          description: Ownership moved (idempotent; a repeat moves zero rows).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminAllowlistHandoverResponse'
+        '400':
+          description: same_entry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Either entry not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: from_not_linked / to_not_linked / to_inactive.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
   # ── Phase 9: recruiter notes + candidate status transitions ────────
   /api/notes:
     get:
@@ -12568,7 +12618,7 @@ components:
       properties:
         email:
           type: string
-          description: Company email; normalized/validated server-side (exact domain interviewkickstart.com).
+          description: Company email; normalized/validated server-side (exact domain interviewkickstart.com or dexity.com).
           minLength: 1
           maxLength: 320
         role:
@@ -12605,6 +12655,49 @@ components:
       properties:
         ok:
           type: boolean
+      additionalProperties: false
+
+    AdminAllowlistHandoverRequest:
+      type: object
+      required: [to_entry_id]
+      properties:
+        to_entry_id:
+          type: string
+          format: uuid
+          description: The allowlist entry of the person's NEW login (must be linked and active).
+      additionalProperties: false
+
+    AdminAllowlistHandoverResponse:
+      type: object
+      required: [ok, moved]
+      properties:
+        ok:
+          type: boolean
+        moved:
+          type: object
+          description: Rows whose owner_id moved to the target login, per table. A repeat call reports zeros.
+          required: [roles, candidates, call_sessions, ashby_job_mappings, role_drafts, interview_rounds]
+          properties:
+            roles:
+              type: integer
+              minimum: 0
+            candidates:
+              type: integer
+              minimum: 0
+            call_sessions:
+              type: integer
+              minimum: 0
+            ashby_job_mappings:
+              type: integer
+              minimum: 0
+            role_drafts:
+              type: integer
+              minimum: 0
+            interview_rounds:
+              type: integer
+              minimum: 0
+              description: R1 rounds whose created_by (R1's owner) moved.
+          additionalProperties: false
       additionalProperties: false
 
     # ── Phase 9: notes / status transitions ──────────────────────────

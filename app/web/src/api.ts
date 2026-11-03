@@ -13,6 +13,8 @@ import { apiClient, ApiError } from './lib/api-client';
 import type {
   AdminAllowlistAddInput,
   AdminAllowlistAddResponse,
+  AdminAllowlistHandoverInput,
+  AdminAllowlistHandoverResponse,
   AdminAllowlistListResponse,
   AdminAllowlistUpdateInput,
   AdminAllowlistUpdateResponse,
@@ -617,6 +619,11 @@ export const api = {
   updateAdminAllowlistEntry: (id: string, body: AdminAllowlistUpdateInput) =>
     request<AdminAllowlistUpdateResponse>(`/api/admin/allowlist/${id}`, {
       method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  handoverAdminAllowlistRecords: (fromId: string, body: AdminAllowlistHandoverInput) =>
+    request<AdminAllowlistHandoverResponse>(`/api/admin/allowlist/${fromId}/handover`, {
+      method: 'POST',
       body: JSON.stringify(body),
     }),
 

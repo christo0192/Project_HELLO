@@ -843,3 +843,90 @@ describe('PATCH /api/admin/allowlist/:id (0016)', () => {
     expect(mockRpc).not.toHaveBeenCalled();
   });
 });
+
+describe('POST /api/admin/allowlist/:id/handover (0133)', () => {
+  const TO = '00000000-0000-4000-8000-000000000002';
+  const MOVED = { roles: 1, candidates: 4, call_sessions: 3, ashby_job_mappings: 0, role_drafts: 2, interview_rounds: 1 };
+
+  it('hands over via handover_allowlist_records with the actor derived from auth', async () => {
+    mockRpc.mockResolvedValue({ data: { status: 'ok', moved: MOVED }, error: null });
+    const res = await request(makeApp(makeUser('admin')))
+      .post(`/api/admin/allowlist/${UUID_1}/handover`)
+      .set(AUTH)
+      .send({ to_entry_id: TO });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, moved: MOVED });
+    expect(mockRpc).toHaveBeenCalledWith('handover_allowlist_records', {
+      p_from_entry_id: UUID_1,
+      p_to_entry_id: TO,
+      p_actor_id: '00000000-0000-4000-8000-0000000000ff',
+    });
+  });
+
+  it('echoes only the five known counts, never extra RPC fields', async () => {
+    mockRpc.mockResolvedValue({
+      data: { status: 'ok', moved: { ...MOVED, email: 'leak@dexity.com' }, debug: 'x' },
+      error: null,
+    });
+    const res = await request(makeApp(makeUser('admin')))
+      .post(`/api/admin/allowlist/${UUID_1}/handover`)
+      .set(AUTH)
+      .send({ to_entry_id: TO });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, moved: MOVED });
+  });
+
+  it('fails closed (500) when a count is missing or not a non-negative integer', async () => {
+    const app = makeApp(makeUser('admin'));
+    for (const moved of [{ ...MOVED, roles: undefined }, { ...MOVED, candidates: -1 }, { ...MOVED, call_sessions: '3' }, null]) {
+      mockRpc.mockResolvedValue({ data: { status: 'ok', moved }, error: null });
+      const res = await request(app).post(`/api/admin/allowlist/${UUID_1}/handover`).set(AUTH).send({ to_entry_id: TO });
+      expect(res.status).toBe(500);
+    }
+  });
+
+  it('maps every RPC refusal to a stable status', async () => {
+    const app = makeApp(makeUser('admin'));
+    const cases: Array<[string, number]> = [
+      ['same_entry', 400],
+      ['not_found', 404],
+      ['from_not_linked', 409],
+      ['to_not_linked', 409],
+      ['to_inactive', 409],
+    ];
+    for (const [status, code] of cases) {
+      mockRpc.mockResolvedValue({ data: { status }, error: null });
+      const res = await request(app).post(`/api/admin/allowlist/${UUID_1}/handover`).set(AUTH).send({ to_entry_id: TO });
+      expect(res.status).toBe(code);
+      expect(res.body.error).toBe(status);
+    }
+  });
+
+  it('an RPC error or unknown status is a 500, never a success', async () => {
+    const app = makeApp(makeUser('admin'));
+    mockRpc.mockResolvedValue({ data: null, error: { message: 'boom' } });
+    expect((await request(app).post(`/api/admin/allowlist/${UUID_1}/handover`).set(AUTH).send({ to_entry_id: TO })).status).toBe(500);
+    mockRpc.mockResolvedValue({ data: { status: 'actor_required' }, error: null });
+    expect((await request(app).post(`/api/admin/allowlist/${UUID_1}/handover`).set(AUTH).send({ to_entry_id: TO })).status).toBe(500);
+  });
+
+  it('rejects a bad path id, a bad/missing target and unknown keys at the schema boundary (RPC never called)', async () => {
+    const app = makeApp(makeUser('admin'));
+    expect((await request(app).post('/api/admin/allowlist/not-a-uuid/handover').set(AUTH).send({ to_entry_id: TO })).status).toBe(400);
+    expect((await request(app).post(`/api/admin/allowlist/${UUID_1}/handover`).set(AUTH).send({})).status).toBe(400);
+    expect((await request(app).post(`/api/admin/allowlist/${UUID_1}/handover`).set(AUTH).send({ to_entry_id: 'nope' })).status).toBe(400);
+    expect((await request(app).post(`/api/admin/allowlist/${UUID_1}/handover`).set(AUTH).send({ to_entry_id: TO, actor_id: 'forged' })).status).toBe(400);
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+
+  it('non-admin → 403', async () => {
+    for (const role of ['interviewer', 'viewer'] as const) {
+      const res = await request(makeApp(makeUser(role, { aal: 'aal1' })))
+        .post(`/api/admin/allowlist/${UUID_1}/handover`)
+        .set(AUTH)
+        .send({ to_entry_id: TO });
+      expect(res.status).toBe(403);
+    }
+    expect(mockRpc).not.toHaveBeenCalled();
+  });
+});

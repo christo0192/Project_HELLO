@@ -42,6 +42,10 @@ describe('AccessSection', () => {
     apiFns.listAdminAllowlist.mockResolvedValue({ entries: ENTRIES });
     apiFns.addAdminAllowlistEntry.mockResolvedValue({ ok: true, id: 'e-new' });
     apiFns.updateAdminAllowlistEntry.mockResolvedValue({ ok: true });
+    apiFns.handoverAdminAllowlistRecords.mockResolvedValue({
+      ok: true,
+      moved: { roles: 1, candidates: 4, call_sessions: 3, ashby_job_mappings: 0, role_drafts: 0, interview_rounds: 2 },
+    });
   });
   afterEach(() => {
     vi.restoreAllMocks();
@@ -113,7 +117,7 @@ describe('AccessSection', () => {
     await userEvent.clear(emailInput);
     await userEvent.type(emailInput, 'john@gmail.com');
     expect(
-      await screen.findByText('Only @interviewkickstart.com emails can be added.'),
+      await screen.findByText('Only @interviewkickstart.com or @dexity.com emails can be added.'),
     ).toBeInTheDocument();
   });
 
@@ -319,5 +323,123 @@ describe('AccessSection', () => {
     const { container } = renderAccess();
     await screen.findByText('Access entries');
     await expect(container).toHaveNoViolations();
+  });
+});
+
+// ── 0133: domain switch — new-domain add + records handover ────────────
+describe('AccessSection — dexity.com domain switch (0133)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    apiFns.getMe.mockResolvedValue(ME);
+    apiFns.listAdminAllowlist.mockResolvedValue({ entries: ENTRIES });
+    apiFns.addAdminAllowlistEntry.mockResolvedValue({ ok: true, id: 'e-new' });
+    apiFns.handoverAdminAllowlistRecords.mockResolvedValue({
+      ok: true,
+      moved: { roles: 1, candidates: 4, call_sessions: 3, ashby_job_mappings: 0, role_drafts: 0, interview_rounds: 2 },
+    });
+  });
+
+  it('accepts a @dexity.com address without the non-company warning', async () => {
+    renderAccess();
+    await screen.findByText('Add an access entry');
+    await userEvent.type(screen.getByLabelText('Company email'), 'new.hire@dexity.com');
+    expect(screen.queryByText(/emails can be added/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Add entry' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Add access entry' }));
+    await waitFor(() => {
+      expect(apiFns.addAdminAllowlistEntry).toHaveBeenCalledWith({
+        email: 'new.hire@dexity.com',
+        role: 'viewer',
+      });
+    });
+  });
+
+  it('has no axe violations with the handover open, filled and awaiting confirmation', async () => {
+    const { container } = renderAccess();
+    await screen.findByText("Hand over a person's records");
+    fireEvent.click(screen.getByRole('button', { name: 'Start a handover' }));
+    await userEvent.selectOptions(screen.getByLabelText('From (old login)'), 'e3');
+    await userEvent.selectOptions(screen.getByLabelText('To (new login)'), 'e4');
+    fireEvent.click(screen.getByRole('button', { name: 'Hand over' }));
+    expect(screen.getByRole('button', { name: 'Hand over records' })).toBeInTheDocument();
+    await expect(container).toHaveNoViolations();
+  });
+
+  it('keeps the handover collapsed until asked, so emails are not repeated on the page', async () => {
+    renderAccess();
+    await screen.findByText("Hand over a person's records");
+    expect(screen.queryByLabelText('From (old login)')).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Start a handover' }));
+    expect(screen.getByLabelText('From (old login)')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByLabelText('From (old login)')).not.toBeInTheDocument();
+  });
+
+  it('offers only signed-in people, and only ACTIVE ones (not the source) as the target', async () => {
+    renderAccess();
+    await screen.findByText("Hand over a person's records");
+    fireEvent.click(screen.getByRole('button', { name: 'Start a handover' }));
+
+    const fromOptions = within(screen.getByLabelText('From (old login)'))
+      .getAllByRole('option')
+      .map((o) => o.textContent);
+    // e2 has never signed in (pending) — it owns nothing and is not offered.
+    expect(fromOptions).toEqual([
+      'Choose a person',
+      'Admin@InterviewKickstart.com',
+      'viewer.one@interviewkickstart.com (disabled)',
+      'second.admin@interviewkickstart.com',
+    ]);
+
+    await userEvent.selectOptions(screen.getByLabelText('From (old login)'), 'e4');
+    const toOptions = within(screen.getByLabelText('To (new login)'))
+      .getAllByRole('option')
+      .map((o) => o.textContent);
+    // Disabled e3 and the chosen source e4 are excluded.
+    expect(toOptions).toEqual(['Choose a person', 'Admin@InterviewKickstart.com']);
+  });
+
+  it('hands over only after explicit confirmation and reports the counts', async () => {
+    renderAccess();
+    await screen.findByText("Hand over a person's records");
+    fireEvent.click(screen.getByRole('button', { name: 'Start a handover' }));
+    const trigger = screen.getByRole('button', { name: 'Hand over' });
+    expect(trigger).toBeDisabled();
+
+    await userEvent.selectOptions(screen.getByLabelText('From (old login)'), 'e3');
+    await userEvent.selectOptions(screen.getByLabelText('To (new login)'), 'e4');
+    fireEvent.click(screen.getByRole('button', { name: 'Hand over' }));
+    expect(apiFns.handoverAdminAllowlistRecords).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Hand over records' }));
+    await waitFor(() => {
+      expect(apiFns.handoverAdminAllowlistRecords).toHaveBeenCalledWith('e3', { to_entry_id: 'e4' });
+    });
+    expect(
+      await screen.findByText(
+        'Handed over 4 candidates, 1 role, 3 calls, 2 R1 rounds to second.admin@interviewkickstart.com.',
+      ),
+    ).toBeInTheDocument();
+    // The panel closes on success.
+    expect(screen.queryByLabelText('From (old login)')).not.toBeInTheDocument();
+  });
+
+  it('maps a server refusal to stable copy and keeps the panel open', async () => {
+    apiFns.handoverAdminAllowlistRecords.mockRejectedValue(
+      new missionApi.ApiError('to_not_linked', 409),
+    );
+    renderAccess();
+    await screen.findByText("Hand over a person's records");
+    fireEvent.click(screen.getByRole('button', { name: 'Start a handover' }));
+    await userEvent.selectOptions(screen.getByLabelText('From (old login)'), 'e3');
+    await userEvent.selectOptions(screen.getByLabelText('To (new login)'), 'e4');
+    fireEvent.click(screen.getByRole('button', { name: 'Hand over' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Hand over records' }));
+    expect(
+      await screen.findByText(/The new login has not signed in yet/),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText('From (old login)')).toBeInTheDocument();
+    // The list is re-fetched after a refusal (initial load + resync).
+    await waitFor(() => expect(apiFns.listAdminAllowlist).toHaveBeenCalledTimes(2));
   });
 });

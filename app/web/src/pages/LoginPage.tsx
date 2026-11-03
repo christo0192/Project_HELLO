@@ -5,8 +5,9 @@
  * only with an allowlisted company account.
  *
  * Access model (enforced server-side by the API allowlist resolver):
- *   - The verified Supabase email must be an exact @interviewkickstart.com
- *     address present (and active) in the email_allowlist table.
+ *   - The verified Supabase email must be an exact @interviewkickstart.com or
+ *     @dexity.com address (both accepted during the domain switch, 0133)
+ *     present (and active) in the email_allowlist table.
  *   - Google Workspace (OAuth) is presented as the primary sign-in when
  *     VITE_SSO_PROVIDERS includes google. `hd` is never trusted client-side;
  *     the server re-checks the verified email on every request.
@@ -20,7 +21,7 @@
 
 import { useState } from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
-import { useAuth, ALLOWED_EMAIL_DOMAIN, isCompanyEmail } from '../lib/auth';
+import { useAuth, COMPANY_EMAIL_DOMAINS_LABEL, isCompanyEmail } from '../lib/auth';
 import { rememberReturnTo, sanitizeReturnTo } from '../lib/return-to';
 import { Brand } from '../components/navigation';
 import { Button, Field, GlassPanel, InlineNotice, TextField } from '../components/design';
@@ -85,7 +86,7 @@ export function LoginPage() {
   // Soft UX hint only — the server is the sole enforcer.
   const companyHint =
     email.trim().length > 0 && !isCompanyEmail(email)
-      ? `Company accounts only — use your @${ALLOWED_EMAIL_DOMAIN} email.`
+      ? `Company accounts only — use your ${COMPANY_EMAIL_DOMAINS_LABEL} email.`
       : null;
 
   async function handleSubmit(e: React.FormEvent) {
@@ -137,7 +138,7 @@ export function LoginPage() {
                   id={id}
                   type="email"
                   autoComplete="email"
-                  placeholder={`you@${ALLOWED_EMAIL_DOMAIN}`}
+                  placeholder="you@dexity.com"
                   value={email}
                   onChange={(e) => setEmail(e.target.value)}
                   disabled={submitting}
@@ -207,7 +208,7 @@ export function LoginPage() {
             <p className="text-xs leading-5 text-ink-tertiary">
               Company-only access: sign in with your{' '}
               <span className="font-medium text-ink-secondary">
-                @{ALLOWED_EMAIL_DOMAIN}
+                {COMPANY_EMAIL_DOMAINS_LABEL}
               </span>{' '}
               Google Workspace account.
             </p>

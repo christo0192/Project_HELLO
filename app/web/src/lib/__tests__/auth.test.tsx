@@ -8,7 +8,14 @@
 import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { AuthProvider, useAuth, getSsoProviders, isCompanyEmail, ALLOWED_EMAIL_DOMAIN } from '../auth';
+import {
+  AuthProvider,
+  useAuth,
+  getSsoProviders,
+  isCompanyEmail,
+  ALLOWED_EMAIL_DOMAINS,
+  COMPANY_EMAIL_DOMAINS_LABEL,
+} from '../auth';
 
 // ── Fixtures ──────────────────────────────────────────────────────────
 
@@ -558,9 +565,24 @@ describe('useAuth throws outside provider', () => {
 
 // ── HELLO company-email UX helper (real module, real behavior) ────────
 
-describe('isCompanyEmail / ALLOWED_EMAIL_DOMAIN (UX-only helpers)', () => {
-  it('exports the exact company domain', () => {
-    expect(ALLOWED_EMAIL_DOMAIN).toBe('interviewkickstart.com');
+describe('isCompanyEmail / ALLOWED_EMAIL_DOMAINS (UX-only helpers)', () => {
+  it('exports exactly the two company domains, frozen, and their copy label (0133)', () => {
+    expect([...ALLOWED_EMAIL_DOMAINS]).toEqual(['interviewkickstart.com', 'dexity.com']);
+    expect(Object.isFrozen(ALLOWED_EMAIL_DOMAINS)).toBe(true);
+    expect(COMPANY_EMAIL_DOMAINS_LABEL).toBe('@interviewkickstart.com or @dexity.com');
+  });
+
+  it('accepts the new company domain dexity.com (case/whitespace/display-name tolerant)', () => {
+    expect(isCompanyEmail('christo.b@dexity.com')).toBe(true);
+    expect(isCompanyEmail('  Christo.B@Dexity.COM ')).toBe(true);
+    expect(isCompanyEmail('Christo B <christo.b@dexity.com>')).toBe(true);
+  });
+
+  it('rejects dexity.com subdomain, suffix and lookalike tricks', () => {
+    expect(isCompanyEmail('a@mail.dexity.com')).toBe(false);
+    expect(isCompanyEmail('a@dexity.com.evil.test')).toBe(false);
+    expect(isCompanyEmail('a@notdexity.com')).toBe(false);
+    expect(isCompanyEmail('a@dеxity.com')).toBe(false); // Cyrillic е
   });
 
   it('accepts exact company-domain emails (case/whitespace tolerant)', () => {

@@ -26,7 +26,8 @@ let mockAuth: { role: string | null };
 
 vi.mock('../lib/auth', () => ({
   useAuth: () => mockAuth,
-  ALLOWED_EMAIL_DOMAIN: 'interviewkickstart.com',
+  ALLOWED_EMAIL_DOMAINS: ['interviewkickstart.com', 'dexity.com'],
+  COMPANY_EMAIL_DOMAINS_LABEL: '@interviewkickstart.com or @dexity.com',
   isCompanyEmail: () => true,
 }));
 

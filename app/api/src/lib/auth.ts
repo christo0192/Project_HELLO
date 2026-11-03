@@ -127,8 +127,17 @@ export type MembershipResolver = (userId: string) => Promise<{
 
 // ── Access gate: normalized company email allowlist ─────────────────────
 
-/** The ONLY accepted email domain (Google Workspace company account). */
-export const ALLOWED_ACCESS_DOMAIN = 'interviewkickstart.com';
+/**
+ * The ONLY accepted email domains (Google Workspace company accounts),
+ * matched exactly. dexity.com was added for the company domain switch
+ * (migration 0133); interviewkickstart.com stays until nobody signs in with
+ * it, then a follow-up drops it here, in the web helper and in 0133's
+ * `is_access_email_domain` + CHECK. Keep all three in step.
+ */
+export const ALLOWED_ACCESS_DOMAINS: readonly string[] = Object.freeze([
+  'interviewkickstart.com',
+  'dexity.com',
+]);
 
 /**
  * Normalize a Supabase-verified email for the access gate.
@@ -139,8 +148,8 @@ export const ALLOWED_ACCESS_DOMAIN = 'interviewkickstart.com';
  *   - strips a "Display Name <email>" wrapper;
  *   - requires EXACTLY ONE '@';
  *   - requires a valid local part and dotted domain;
- *   - requires the EXACT domain interviewkickstart.com (no subdomains,
- *     no suffix tricks — e.g. a@interviewkickstart.com.evil.test fails).
+ *   - requires one of the EXACT domains in ALLOWED_ACCESS_DOMAINS (no
+ *     subdomains, no suffix tricks — e.g. a@dexity.com.evil.test fails).
  *
  * Returns null when the email cannot be safely normalized — the caller
  * must treat that as a 403 (uniform generic denial). OAuth `hd` is NEVER
@@ -162,13 +171,13 @@ export function normalizeEmailForAccess(raw: string): string | null {
   const domain = email.slice(atIndex + 1);
   if (!/^[a-z0-9._%+\-]+$/.test(local)) return null;
   if (!/^[a-z0-9.\-]+\.[a-z]{2,}$/.test(domain)) return null;
-  if (domain !== ALLOWED_ACCESS_DOMAIN) return null;
+  if (!ALLOWED_ACCESS_DOMAINS.includes(domain)) return null;
   return `${local}@${domain}`;
 }
 
 /**
  * Default live access resolver: normalizes the verified Supabase email,
- * enforces the exact company domain, then calls the atomic
+ * enforces an exact company domain, then calls the atomic
  * resolve_allowlist_access SECURITY DEFINER RPC (fixed search_path,
  * service-role-only). The RPC locks the allowlist entry, rejects
  * missing/inactive/domain-mismatch/relink, links on first login, and

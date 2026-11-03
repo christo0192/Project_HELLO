@@ -5,7 +5,7 @@
  *   - Renders email/password form with labels and HELLO branding
  *   - Redirects to /candidates if already authenticated
  *   - Shows generic error on invalid credentials (never leaks allowlist state)
- *   - Company-only access messaging (exact @interviewkickstart.com domain)
+ *   - Company-only access messaging (exact @interviewkickstart.com or @dexity.com domain)
  *   - Soft inline hint for non-company emails (UX only — server enforces)
  *   - Google Workspace button hidden when VITE_SSO_PROVIDERS is unset
  *   - Google Workspace button visible when configured
@@ -19,7 +19,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { LoginPage } from './LoginPage';
-import { ALLOWED_EMAIL_DOMAIN, isCompanyEmail } from '../lib/auth';
+import { COMPANY_EMAIL_DOMAINS_LABEL, isCompanyEmail } from '../lib/auth';
 
 // ── Mock useAuth ───────────────────────────────────────────────────────
 
@@ -34,11 +34,13 @@ vi.mock('../lib/auth', () => ({
     isAuthenticated: mockIsAuthenticated,
     isLoading: false,
   }),
-  ALLOWED_EMAIL_DOMAIN: 'interviewkickstart.com',
+  ALLOWED_EMAIL_DOMAINS: ['interviewkickstart.com', 'dexity.com'],
+  COMPANY_EMAIL_DOMAINS_LABEL: '@interviewkickstart.com or @dexity.com',
   isCompanyEmail: (raw: string) => {
     const t = raw.trim().toLowerCase();
     const at = t.indexOf('@');
-    return at !== -1 && t.indexOf('@', at + 1) === -1 && t.slice(at + 1) === 'interviewkickstart.com';
+    return at !== -1 && t.indexOf('@', at + 1) === -1
+      && ['interviewkickstart.com', 'dexity.com'].includes(t.slice(at + 1));
   },
 }));
 
@@ -76,7 +78,7 @@ describe('LoginPage', () => {
     expect(screen.getByLabelText('Password')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: 'Sign in' })).toBeInTheDocument();
     expect(
-      screen.getByText(`@${ALLOWED_EMAIL_DOMAIN}`, { exact: false }),
+      screen.getByText(COMPANY_EMAIL_DOMAINS_LABEL, { exact: false }),
     ).toBeInTheDocument();
     expect(
       screen.getByText(/Access is limited to authorised team members/),
@@ -150,8 +152,17 @@ describe('LoginPage', () => {
     await user.type(screen.getByLabelText('Email'), 'gopu@gmail.com');
 
     expect(
-      await screen.findByText(`Company accounts only — use your @${ALLOWED_EMAIL_DOMAIN} email.`),
+      await screen.findByText(`Company accounts only — use your ${COMPANY_EMAIL_DOMAINS_LABEL} email.`),
     ).toBeInTheDocument();
+  });
+
+  it('shows no company-email hint for a new-domain @dexity.com address (0133)', async () => {
+    renderLoginPage();
+
+    const user = userEvent.setup();
+    await user.type(screen.getByLabelText('Email'), 'christo.b@dexity.com');
+
+    expect(screen.queryByText(/Company accounts only/)).not.toBeInTheDocument();
   });
 
   it('does not show the company-email hint for a valid company address', async () => {

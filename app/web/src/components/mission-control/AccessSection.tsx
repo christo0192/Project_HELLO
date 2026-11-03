@@ -15,7 +15,7 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError } from '../../api';
-import { isCompanyEmail } from '../../lib/auth';
+import { COMPANY_EMAIL_DOMAINS_LABEL, isCompanyEmail } from '../../lib/auth';
 import type {
   AdminAllowlistEntry,
   MeResponse,
@@ -50,6 +50,7 @@ import {
   allowlistStateLabel,
   allowlistStateTone,
   countLinkedActiveAdmins,
+  handoverSummary,
   isSelfEntry,
   normalizeEmailPreview,
   stableMutationMessage,
@@ -187,6 +188,30 @@ export function AccessSection() {
         tone: 'error',
       });
       await refreshEntries();
+    }
+  }
+
+  async function handoverRecords(
+    from: AdminAllowlistEntry,
+    to: AdminAllowlistEntry,
+  ): Promise<boolean> {
+    setMessage(null);
+    try {
+      const result = await api.handoverAdminAllowlistRecords(from.id, { to_entry_id: to.id });
+      setMessage({ text: handoverSummary(result.moved, to.email), tone: 'ok' });
+      return true;
+    } catch (e) {
+      setMessage({
+        text: stableMutationMessage(
+          e instanceof ApiError ? e.message : null,
+          'The records could not be handed over. Try again.',
+        ),
+        tone: 'error',
+      });
+      // A refusal like to_inactive / from_not_linked means the list changed
+      // under us — resync so the pickers reflect server truth.
+      await refreshEntries();
+      return false;
     }
   }
 
@@ -360,6 +385,8 @@ export function AccessSection() {
         </div>
       )}
 
+      <HandoverPanel entries={entries} onHandover={handoverRecords} />
+
       <p className="text-[13px] leading-5 text-ink-tertiary">
         Self-modification and removal of the last linked active admin are
         rejected by the server (409) — this surface never attempts to bypass
@@ -409,12 +436,12 @@ function AddEntryForm({
                 type="email"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                placeholder="name@interviewkickstart.com"
+                placeholder="name@dexity.com"
                 autoComplete="off"
               />
               {notCompany && (
                 <p className="text-xs leading-5 text-warning-text" role="note">
-                  Only @interviewkickstart.com emails can be added.
+                  Only {COMPANY_EMAIL_DOMAINS_LABEL} emails can be added.
                 </p>
               )}
               {hasNormalization && !notCompany && (
@@ -453,6 +480,129 @@ function AddEntryForm({
           onConfirm={submit}
         />
       </div>
+    </GlassPanel>
+  );
+}
+
+/**
+ * Hand a person's records to their new login (0133). Only needed when
+ * someone returns on the new company domain as a BRAND-NEW login; a renamed
+ * login keeps everything automatically. Both sides must have signed in at
+ * least once (the server needs both login ids) and the target must be
+ * active — the server re-checks all of it and maps refusals to stable copy.
+ */
+function HandoverPanel({
+  entries,
+  onHandover,
+}: {
+  entries: AdminAllowlistEntry[];
+  onHandover: (from: AdminAllowlistEntry, to: AdminAllowlistEntry) => Promise<boolean>;
+}) {
+  // Collapsed by default: a once-per-person action that should not crowd the
+  // everyday access table (and keeps emails out of the page until asked for).
+  const [open, setOpen] = useState(false);
+  const [fromId, setFromId] = useState('');
+  const [toId, setToId] = useState('');
+
+  const sources = entries.filter((entry) => entry.linked_user_id != null);
+  const targets = entries.filter(
+    (entry) => entry.linked_user_id != null && entry.active && entry.id !== fromId,
+  );
+  const from = sources.find((entry) => entry.id === fromId) ?? null;
+  const to = targets.find((entry) => entry.id === toId) ?? null;
+
+  async function submit() {
+    if (!from || !to) return;
+    const ok = await onHandover(from, to);
+    if (ok) {
+      setFromId('');
+      setToId('');
+      setOpen(false);
+    }
+  }
+
+  function close() {
+    setFromId('');
+    setToId('');
+    setOpen(false);
+  }
+
+  return (
+    <GlassPanel>
+      <SectionHeader
+        level={3}
+        title="Hand over a person's records"
+        description="For someone who now signs in with a brand-new login (for example a fresh @dexity.com account). Moves the roles, candidates, calls, R1 rounds, Ashby jobs and finished drafts they own. If their login was only renamed, they keep everything automatically and nothing needs moving."
+        actions={
+          open ? (
+            <Button size="sm" onClick={close}>
+              Cancel
+            </Button>
+          ) : (
+            <Button size="sm" onClick={() => setOpen(true)}>
+              Start a handover
+            </Button>
+          )
+        }
+      />
+      {open && (
+        <>
+          <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto] sm:items-start">
+            <Field label="From (old login)" id="handover-from">
+              {({ id }) => (
+                <SelectField
+                  id={id}
+                  value={fromId}
+                  onChange={(e) => {
+                    setFromId(e.target.value);
+                    if (e.target.value === toId) setToId('');
+                  }}
+                >
+                  <option value="">Choose a person</option>
+                  {sources.map((entry) => (
+                    <option key={entry.id} value={entry.id}>
+                      {entry.email}
+                      {entry.active ? '' : ' (disabled)'}
+                    </option>
+                  ))}
+                </SelectField>
+              )}
+            </Field>
+            <Field label="To (new login)" id="handover-to">
+              {({ id }) => (
+                <SelectField id={id} value={toId} onChange={(e) => setToId(e.target.value)}>
+                  <option value="">Choose a person</option>
+                  {targets.map((entry) => (
+                    <option key={entry.id} value={entry.id}>
+                      {entry.email}
+                    </option>
+                  ))}
+                </SelectField>
+              )}
+            </Field>
+            <ConfirmButton
+              className="sm:pt-[1.375rem]"
+              label="Hand over"
+              confirmLabel="Hand over records"
+              variant="secondary"
+              disabled={!from || !to}
+              summary={
+                <span>
+                  Move the roles, candidates, calls, R1 rounds, Ashby jobs and finished drafts{' '}
+                  <strong>{from?.email ?? 'this person'}</strong> owns to{' '}
+                  <strong>{to?.email ?? 'the new login'}</strong>? The audit log of who did what is
+                  not changed. Afterwards, disable the old entry.
+                </span>
+              }
+              onConfirm={submit}
+            />
+          </div>
+          <p className="mt-3 text-xs leading-5 text-ink-tertiary">
+            Only people who have signed in at least once appear here. Ask the new login to sign in
+            once first.
+          </p>
+        </>
+      )}
     </GlassPanel>
   );
 }
