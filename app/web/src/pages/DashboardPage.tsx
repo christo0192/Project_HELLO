@@ -424,7 +424,6 @@ function AssessmentsPanel({
         value: dist[r],
         href: candidatesHref({ recommendations: [r] }),
         tone: RECOMMENDATION_TONE[r],
-        title: r,
       }))
     : [];
   const assessedTotal = data.reduce((s, d) => s + d.value, 0);

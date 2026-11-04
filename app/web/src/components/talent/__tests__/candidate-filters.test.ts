@@ -217,7 +217,9 @@ describe('hasActiveFilters / normalizeStatus / recommendationLabel', () => {
 
   it('normalizes blank status to new and labels recommendations', () => {
     expect(normalizeStatus('   ')).toBe('new');
-    expect(recommendationLabel('advance')).toBe('Advance');
+    expect(recommendationLabel('advance')).toBe('Select');
+    expect(recommendationLabel('hold')).toBe('Borderline');
+    expect(recommendationLabel('reject')).toBe('Reject');
     expect(recommendationLabel(null)).toBe('Unassessed');
   });
 });

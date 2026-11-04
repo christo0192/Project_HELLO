@@ -82,8 +82,8 @@ function runtimeStores(over: Partial<RuntimeWorkflowStores> = {}): RuntimeWorkfl
 // ── L1: the worker claims the approved scorecard sink but never stage moves ──
 
 describe('L1 — the runtime claims approved operations only', () => {
-  it('declares invite_delivery and scorecard_write as supported', () => {
-    expect([...SUPPORTED_OPERATION_TYPES]).toEqual(['invite_delivery', 'scorecard_write']);
+  it('declares invite_delivery, scorecard_write and recommendation_tag as supported', () => {
+    expect([...SUPPORTED_OPERATION_TYPES]).toEqual(['invite_delivery', 'scorecard_write', 'recommendation_tag']);
     expect([...REFUSED_OPERATION_TYPES].sort()).toEqual(['stage_move']);
   });
 

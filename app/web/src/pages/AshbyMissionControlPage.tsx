@@ -160,6 +160,7 @@ const OPERATION_LABELS: Record<string, string> = {
   invite_delivery: 'Invite',
   scorecard_write: 'Scorecard write-back',
   stage_move: 'Stage move',
+  recommendation_tag: 'Christy tag',
 };
 const OPERATION_STATE_LABELS: Record<string, string> = {
   pending: 'Pending',

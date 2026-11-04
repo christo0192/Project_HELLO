@@ -20,6 +20,7 @@ import type {
   AshbyCandidateProfileResult,
   AshbyIntakeType,
   AshbyProfileOutcome,
+  RecommendationTagSource,
 } from './orchestration.js';
 import type { AshbyLinkLookup } from './completion-observer.js';
 import { projectProfileOutcome } from './candidate-workflow.js';
@@ -31,6 +32,7 @@ import {
 } from './scorecard-v2-adapter.js';
 import { parseEvidenceGrade, readAssessmentEvidenceGrade } from '../../lib/scorecards/evidence.js';
 import { toCandidateColumns } from '../../lib/candidate-phone.js';
+import { recommendationTagsEnabled } from './recommendation-tags.js';
 
 /**
  * The assessment columns BOTH scorecard build sites read. One list, so the
@@ -355,6 +357,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         maxAttempts: typeof row?.max_attempts === 'number' ? row.max_attempts : 5,
         marker: typeof row?.marker === 'string' ? row.marker : null,
         sourceSessionId: typeof row?.source_session_id === 'string' ? row.source_session_id : null,
+        createdAt: typeof row?.created_at === 'string' ? row.created_at : null,
       };
     },
     async readIngestion(
@@ -413,6 +416,61 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         return null;
       }
       return { ...source, evidenceGrade };
+    },
+    /**
+     * The tag lane's run-time read. The verdict comes from the RAW column and
+     * nowhere else: `scorecardSourceFromAssessmentRow` and `buildScorecard` both
+     * turn a missing verdict into `hold`, which would tag a candidate Borderline
+     * for a result that has no verdict at all. Any read failure answers null,
+     * which the lane fails as a retryable `assessment_missing`.
+     */
+    async readRecommendationTagSource(
+      applicationLinkId,
+      sourceSessionId = null,
+    ): Promise<RecommendationTagSource | null> {
+      const { data: link, error: linkError } = await client
+        .from('ashby_application_links')
+        .select('external_application_id, external_candidate_id, session_id')
+        .eq('provider', 'ashby')
+        .eq('id', applicationLinkId)
+        .maybeSingle();
+      const sessionId = sourceSessionId ?? (typeof link?.session_id === 'string' ? link.session_id : null);
+      if (linkError || !link || !sessionId) return null;
+      const { data: assessment, error: assessmentError } = await client
+        .from('assessments')
+        .select('id, recommendation')
+        .eq('session_id', sessionId)
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (assessmentError || !assessment) return null;
+      const row = assessment as unknown as { id: unknown; recommendation: unknown };
+      let evidenceGrade: 'decision' | 'insufficient' | null;
+      try {
+        evidenceGrade = await readAssessmentEvidenceGrade(client, String(row.id));
+      } catch {
+        return null;
+      }
+      const { data: newest, error: newestError } = await client
+        .from('ashby_operations')
+        .select('id')
+        .eq('provider', 'ashby')
+        .eq('application_link_id', applicationLinkId)
+        .eq('operation_type', 'recommendation_tag')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (newestError || !newest) return null;
+      const newestId = String((newest as { id: unknown }).id);
+      return {
+        externalCandidateId: typeof link.external_candidate_id === 'string' ? link.external_candidate_id : null,
+        externalApplicationId: typeof link.external_application_id === 'string' ? link.external_application_id : null,
+        recommendation: row.recommendation,
+        evidenceGrade,
+        isNewestTagOperation: (operationId) => operationId === newestId,
+      };
     },
     async readLink(applicationLinkId): Promise<WorkflowLinkRow | null> {
       const { data, error } = await client
@@ -672,6 +730,21 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       });
       if (result.error) throw new Error('ashby_scorecard_enqueue_error');
       return { status: statusOf(result.data) };
+    },
+    async enqueueRecommendationTag(applicationLinkId, sessionId): Promise<{ status: string }> {
+      // Kill switch: off means no operation is created. Ones already pending
+      // wait, and the lane picks them up when the switch comes back on.
+      if (!recommendationTagsEnabled()) return { status: 'disabled' };
+      // Every decision (terminal link, mapping, session ownership, newest
+      // assessment, the per-revision key) is the RPC's.
+      const { data, error } = await client.rpc('enqueue_ashby_recommendation_tag', {
+        p_application_link_id: applicationLinkId,
+        p_session_id: sessionId,
+        p_actor_id: actorId,
+        p_now: new Date().toISOString(),
+      });
+      if (error) throw new Error('ashby_recommendation_tag_enqueue_error');
+      return { status: statusOf(data) };
     },
   };
 }

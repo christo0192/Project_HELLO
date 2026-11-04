@@ -272,6 +272,7 @@ describe('ScreeningKpis', () => {
     );
     renderKpis();
     expect(await cardText('Needs review')).toContain('7'); // 4 + 3
+    expect(await cardText('Needs review')).toContain('Borderline or no verdict');
   });
 
   // ── States that must not look like data ───────────────────────────────
@@ -905,6 +906,14 @@ describe('ScreeningKpis', () => {
     expect(terms).toEqual(['Bot qualified', 'Bot disqualified', 'Needs review']);
     expect(await cardText('Bot qualified')).toContain('11');
     expect(await cardText('Bot disqualified')).toContain('12');
+  });
+
+  it('words the bot’s verdict as Select and Borderline, in the figures and the glossary', async () => {
+    getScreeningFunnel.mockResolvedValue(funnel({ scored: 30, qualified: 11, disqualified: 12 }));
+    renderKpis();
+    expect(await cardText('Bot qualified')).toContain('Recommended: Select');
+    expect(screen.getByText('The automated scorecard recommended Select for this candidate.')).toBeInTheDocument();
+    expect(screen.getByText(/^The scorecard marked the candidate Borderline, or could not/)).toBeInTheDocument();
   });
 
   it('says in plain words what "Reached" counts', async () => {

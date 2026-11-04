@@ -153,7 +153,7 @@ export interface EnqueueResult {
 
 export interface OperationClaimRow {
   id: string;
-  operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move';
+  operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move' | 'recommendation_tag';
   /**
    * The deterministic operation key. It encodes the delivery CHANNEL
    * (`ashby:invite:<app>:<channel>:<invite>`), which is why the claim RPC
@@ -169,6 +169,25 @@ export interface OperationClaimRow {
   marker: string | null;
   /** Exact assessment session for cycle-specific scorecard operations. */
   sourceSessionId?: string | null;
+  /**
+   * When the operation row was created (0134). Read by the tag lane's age limit:
+   * a defer refunds the attempt, so without it a deferred row never ends.
+   */
+  createdAt?: string | null;
+}
+
+/**
+ * What the tag lane reads at run time for one link (0134). `recommendation` is
+ * the RAW `assessments.recommendation` column: never `ScorecardSource` or
+ * `NormalizedScorecard`, both of which coerce a missing verdict to `hold`.
+ */
+export interface RecommendationTagSource {
+  externalCandidateId: string | null;
+  externalApplicationId: string | null;
+  recommendation: unknown;
+  evidenceGrade: 'decision' | 'insufficient' | null;
+  /** Is this operation the newest `recommendation_tag` row on the link? */
+  isNewestTagOperation(operationId: string): boolean;
 }
 
 /** Durable persistence for the workflow (0029/0031 tables + RPCs). */
@@ -198,7 +217,7 @@ export interface WorkflowStores {
   ): Promise<{ status: string; state?: string }>;
   enqueueOperation(input: {
     applicationLinkId: string;
-    operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move';
+    operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move' | 'recommendation_tag';
     operationKey: string;
     dependsOn?: string | null;
     marker?: string | null;
@@ -256,7 +275,7 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
    * `leaseToken` was unobtainable.
    */
   claimOperation(
-    operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move',
+    operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move' | 'recommendation_tag',
     owner: string,
     leaseSeconds: number,
   ): Promise<OperationClaimRow | null>;
@@ -387,6 +406,20 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
   claimAshbyProfileDue?(input: { limit: number }): Promise<string[]>;
   /** Enqueue the verified scorecard sink after a durable assessment insert. */
   enqueueScorecardWrite?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
+  /**
+   * Enqueue the Christy verdict tag for the session's newest assessment (0134).
+   * Answers `disabled` without a call while ASHBY_RECOMMENDATION_TAGS_ENABLED is
+   * off. Optional so existing fakes compile.
+   */
+  enqueueRecommendationTag?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
+  /**
+   * Read the tag lane's run-time facts, or null when the link, the session or
+   * the assessment cannot be read. Optional so existing fakes compile.
+   */
+  readRecommendationTagSource?(
+    applicationLinkId: string,
+    sourceSessionId?: string | null,
+  ): Promise<RecommendationTagSource | null>;
   /**
    * CAS a manual invite_delivery operation from `running` to
    * `awaiting_manual_delivery`. The invite digest exists but no recruiter has

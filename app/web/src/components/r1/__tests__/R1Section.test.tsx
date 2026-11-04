@@ -524,7 +524,7 @@ describe('the rounds panel', () => {
     });
     renderSection();
     expect(
-      await screen.findByText('Recommendation: Hold · Overall 58.5 of 100'),
+      await screen.findByText('Recommendation: Borderline · Overall 58.5 of 100'),
     ).toBeInTheDocument();
     expect(screen.queryByText(/No results yet/)).not.toBeInTheDocument();
   });

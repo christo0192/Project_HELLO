@@ -634,16 +634,19 @@ gates claiming. `r1_settings.auto_status_enabled` (default **off**, owner-only,
 audited) gates every candidate status write. With it off the outcome is recorded
 as `status_write = 'flag_off'` and is never applied retroactively. Thresholds
 (`advance_threshold` 65, `hold_threshold` 45) live in `r1_settings`; a level 1 on
-objection handling or negotiation caps an advance at hold.
+objection handling or negotiation caps an advance at hold. The recommendation is
+stored as `advance`/`hold`/`reject` and shown as Select/Borderline/Reject; the
+settings page labels the two thresholds "Score for Select" and "Score for
+Borderline".
 
 **`interview_rounds.status_write`.**
 
 | Value | Meaning |
 |---|---|
 | `human_review` | No auto effect: gate failed, runs disagreed, evidence invalid, or scoring failed |
-| `hold_flag` | Hold: a flag only, no write |
-| `flag_off` | An advance/reject was recommended but auto-status is off |
-| `advanced` | Candidate moved to `advanced` by compare-and-set |
+| `hold_flag` | Hold (shown as Borderline): a flag only, no write |
+| `flag_off` | An advance (shown as Select) or reject was recommended but auto-status is off |
+| `advanced` | An advance (shown as Select): candidate moved to `advanced` by compare-and-set |
 | `pending_reject` | 24 h cancellable window open (`pending_reject_until`) |
 | `rejected` | The window closed and the candidate was moved to `rejected` |
 | `pending_reject_cancelled` | HR cancelled the window (an override) |

@@ -46,7 +46,7 @@ describe('enumerations', () => {
     expect(ASHBY_INVITE_TTL_HOURS).toBe(24);
     expect(DELIVERY_MODES).toEqual(['email', 'manual', 'both']);
     expect(INGESTION_STATES).toEqual(['queued', 'fetching', 'scanning', 'extracting', 'structuring', 'ready', 'failed_review', 'cancelled']);
-    expect(OPERATION_TYPES).toEqual(['invite_delivery', 'scorecard_write', 'stage_move']);
+    expect(OPERATION_TYPES).toEqual(['invite_delivery', 'scorecard_write', 'stage_move', 'recommendation_tag']);
     expect(OPERATION_STATES).toEqual(['pending', 'running', 'succeeded', 'failed', 'blocked', 'cancelled']);
     expect(APPLICATION_TERMINAL_STATES).toEqual(['withdrawn', 'deleted', 'manual_stage_cancel']);
   });

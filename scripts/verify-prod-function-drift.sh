@@ -33,6 +33,13 @@
 # No earlier body contains `select 250`, so its presence proves production
 # runs the raised fleet daily cap.
 #
+# 0134 (M027) re-declares enqueue_ashby_operation (0031 verbatim) and
+# claim_ashby_operation (0059 verbatim), each with `recommendation_tag` added to
+# the type allowlist. No earlier body contains that token. It also adds two RPCs
+# no earlier migration declares, enqueue_ashby_recommendation_tag and
+# backfill_ashby_recommendation_tags; a missing function fails the regprocedure
+# cast, so the check fails closed.
+#
 # It issues SELECTs only (pg_get_functiondef). No PII is queried or printed.
 #
 # Target:
@@ -58,6 +65,10 @@ CHECKS=(
   "screening_v2.release_ashby_number_after_identity_mismatch(uuid,timestamptz)|identity_unconfirmed"
   "screening_v2.verify_candidate_phone(uuid,text,uuid,timestamptz)|for update of e"
   "screening_v2.phone_max_daily_dials()|select 250"
+  "screening_v2.enqueue_ashby_operation(uuid,text,text,uuid,text,uuid)|recommendation_tag"
+  "screening_v2.claim_ashby_operation(text,text,integer,timestamptz)|recommendation_tag"
+  "screening_v2.enqueue_ashby_recommendation_tag(uuid,uuid,uuid,timestamptz)|enqueue_ashby_operation"
+  "screening_v2.backfill_ashby_recommendation_tags(boolean,timestamptz)|enqueue_ashby_recommendation_tag"
 )
 
 if [ -n "${SUPABASE_DB_URL:-}" ]; then

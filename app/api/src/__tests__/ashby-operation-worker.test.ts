@@ -111,7 +111,8 @@ describe('runAshbyOperationPass — polls every supported lane', () => {
       },
     }));
 
-    expect(result).toEqual({ invite: { claimed: false }, scorecard: { claimed: false } });
+    // No tag adapter supplied, so the third lane is not polled at all.
+    expect(result).toEqual({ invite: { claimed: false }, scorecard: { claimed: false }, recommendationTag: { claimed: false } });
     expect(claimedTypes).toEqual(['invite_delivery', 'scorecard_write']);
   });
 });

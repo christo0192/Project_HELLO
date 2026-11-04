@@ -110,7 +110,7 @@ export function isSameApplicationIdentity(
 
 // ── Terminal cancellation planning ───────────────────────────────────────────
 
-export type OperationType = 'invite_delivery' | 'scorecard_write' | 'stage_move';
+export type OperationType = 'invite_delivery' | 'scorecard_write' | 'stage_move' | 'recommendation_tag';
 export type OperationState = 'pending' | 'running' | 'succeeded' | 'failed' | 'blocked' | 'cancelled';
 
 export interface WorkflowOperation {

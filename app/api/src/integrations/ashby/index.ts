@@ -300,6 +300,17 @@ export {
   type OperationRunOutcome,
 } from './operation-worker.js';
 export {
+  CHRISTY_VERDICT_TAG_TITLES,
+  christyTagForVerdict,
+  createChristyTagResolver,
+  executeRecommendationTag,
+  recommendationTagsEnabled,
+  type ChristyTagResolver,
+  type ChristyVerdictTag,
+  type RecommendationTagAdapter,
+  type RecommendationTagClient,
+} from './recommendation-tags.js';
+export {
   materializeCandidate,
   materializeInvite,
   type MaterializationStore,

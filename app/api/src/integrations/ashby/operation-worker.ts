@@ -1,29 +1,25 @@
 /**
  * ashby/operation-worker.ts — leased executor for the `ashby_operations` outbox.
  *
- * ══ THE RESULT-SINK REFUSAL (read before changing SUPPORTED_OPERATION_TYPES) ══
+ * ══ WHAT RUNS (read before changing SUPPORTED_OPERATION_TYPES) ══
  *
- * This worker claims `invite_delivery` and NOTHING else. `scorecard_write` and
- * `stage_move` are never claimed and never executed, because no approved Ashby
- * result sink exists:
+ * Three lanes run, each selected explicitly: `invite_delivery`, `scorecard_write`
+ * (the tenant-verified form binding, HELLO_CHRISTY_SCORECARD_BINDING) and
+ * `recommendation_tag` (the Christy verdict tag, see recommendation-tags.ts).
  *
- *   1. `bindFeedbackForm` fails closed with `binding_unverified` unless a
- *      tenant-VERIFIED form binding is supplied, and no column, RPC, or config
- *      anywhere produces one — `ashby_job_mappings.feedback_form_id` is a bare
- *      text column with no verified flag and no field-id columns.
- *   2. `AshbyClient.applicationFeedbackSubmit` and `applicationChangeStage`
- *      therefore have
- *      no production caller, and this worker adds none.
- *   3. The 0029 `trg_ashby_operation_dependency` trigger raises P0001 if a
+ * `stage_move` is never claimed and never executed:
+ *
+ *   1. `AshbyClient.applicationChangeStage` has no production caller, and this
+ *      worker adds none.
+ *   2. The 0029 `trg_ashby_operation_dependency` trigger raises P0001 if a
  *      `stage_move` tries to reach running/succeeded before its `scorecard_write`
  *      dependency has succeeded — a DB-level backstop, not application logic.
- *   4. `enqueueStageMove` re-reads `application.info` and refuses when a human
+ *   3. `enqueueStageMove` re-reads `application.info` and refuses when a human
  *      moved the application away from the mapped AI stage.
  *
  * A completed screening therefore parks at `writeback_pending` (0032) and no TA
- * stage move occurs. Widening SUPPORTED_OPERATION_TYPES without first landing a
- * verified binding would break that guarantee — the accompanying test asserts
- * the two forbidden types are never passed to `claim_ashby_operation`.
+ * stage move occurs. The accompanying test asserts `stage_move` is never passed
+ * to `claim_ashby_operation`.
  *
  * Every mutation is CAS'd on the live lease, so a worker whose lease expired or
  * was reclaimed commits nothing.
@@ -71,6 +67,7 @@ import type { ProbeFeedbackForm } from './probe.js';
 import { materializeInvite, type MaterializationStore, type MaterializationMapping } from './materialize.js';
 import type { EmailProviderState } from './invite-delivery.js';
 import { isAshbyError } from './errors.js';
+import { executeRecommendationTag, type RecommendationTagAdapter } from './recommendation-tags.js';
 import {
   BROWSER_SCREENING_RETIRED,
   legacyBrowserScreeningEnabled,
@@ -86,9 +83,9 @@ export const LEGACY_INVITE_SKIPPED_EVENT = 'legacy_browser_invite_skipped';
 
 /**
  * The ONLY operation types this runtime executes. Deliberately excludes
- * `scorecard_write` and `stage_move` — see the module header.
+ * `stage_move` — see the module header.
  */
-export const SUPPORTED_OPERATION_TYPES = ['invite_delivery', 'scorecard_write'] as const;
+export const SUPPORTED_OPERATION_TYPES = ['invite_delivery', 'scorecard_write', 'recommendation_tag'] as const;
 export type SupportedOperationType = (typeof SUPPORTED_OPERATION_TYPES)[number];
 
 /** Operation types the runtime must never claim while no result sink exists. */
@@ -131,6 +128,12 @@ export interface OperationWorkerDeps {
      */
     readFormDefinition?(formDefinitionId: string, fresh?: boolean): Promise<ProbeFeedbackForm | null>;
   };
+  /**
+   * The Christy verdict tag sink (0134). Supplying it selects the tag lane in
+   * `runClaimedAshbyOperation`; `runAshbyOperationPass` only ever hands it to
+   * that lane. The runtime supplies it only while the kill switch is on.
+   */
+  recommendationTag?: RecommendationTagAdapter;
   /** Resolve mapping config for a link's job. Null when no usable mapping. */
   resolveMappingForLink(applicationLinkId: string): Promise<MaterializationMapping | null>;
   /** Build the site-relative recruiter reissue path for an application. */
@@ -192,8 +195,8 @@ export function channelForOperationKey(
 }
 
 /**
- * Claim at most one `invite_delivery` operation and execute it under its lease.
- * Returns `{claimed:false}` when the queue is empty. Never throws.
+ * Claim at most one operation of the selected lane and execute it under its
+ * lease. Returns `{claimed:false}` when the queue is empty. Never throws.
  */
 export async function runClaimedAshbyOperation(
   deps: OperationWorkerDeps,
@@ -201,7 +204,7 @@ export async function runClaimedAshbyOperation(
   let claim: OperationClaimRow | null;
   try {
     claim = await deps.stores.claimOperation(
-      deps.scorecard ? 'scorecard_write' : 'invite_delivery',
+      deps.recommendationTag ? 'recommendation_tag' : deps.scorecard ? 'scorecard_write' : 'invite_delivery',
       deps.owner,
       deps.leaseSeconds,
     );
@@ -236,6 +239,22 @@ export async function runClaimedAshbyOperation(
         claimed: true, operationType: claim.operationType, committed: false,
         staleLease: r === 'not_owned', code: 'blocked_terminal',
       };
+    }
+
+    // Everything after the scorecard branch is invite code, so this lane returns
+    // here. The executor classifies its own errors: it must not reach this
+    // function's catch, which makes a timeout terminal.
+    if (claim.operationType === 'recommendation_tag') {
+      if (!deps.recommendationTag) {
+        const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'recommendation_tag_sink_unavailable', false);
+        return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: 'recommendation_tag_sink_unavailable' };
+      }
+      return await executeRecommendationTag(claim, {
+        stores: deps.stores,
+        adapter: deps.recommendationTag,
+        nowMs: deps.nowMs,
+        onEvent: deps.onEvent,
+      });
     }
 
     if (claim.operationType === 'scorecard_write') {
@@ -506,21 +525,27 @@ export async function runClaimedAshbyOperation(
 }
 
 /**
- * Poll both supported operation lanes once.
+ * Poll every supported operation lane once.
  *
- * Supplying the scorecard adapter to `runClaimedAshbyOperation` selects the
- * scorecard lane. The runtime previously supplied it unconditionally, which
+ * Supplying an adapter to `runClaimedAshbyOperation` selects that adapter's lane.
+ * The runtime previously supplied the scorecard adapter unconditionally, which
  * meant the invite lane was never polled and every candidate invite remained
- * pending forever. Keep the lanes explicit and run both on every scheduler
- * pass so neither can starve the other.
+ * pending forever. Keep the lanes explicit and run each on every scheduler pass
+ * so none can starve another: each pass receives only its own adapter.
+ *
+ * The tag lane runs AFTER the scorecard lane, so in the normal case a candidate's
+ * scorecard is written first. It has no dependency on it: see migration 0134.
  */
 export async function runAshbyOperationPass(
   deps: OperationWorkerDeps,
-): Promise<{ invite: OperationRunOutcome; scorecard: OperationRunOutcome }> {
-  const { scorecard, ...inviteDeps } = deps;
+): Promise<{ invite: OperationRunOutcome; scorecard: OperationRunOutcome; recommendationTag: OperationRunOutcome }> {
+  const { scorecard, recommendationTag, ...inviteDeps } = deps;
   const invite = await runClaimedAshbyOperation(inviteDeps);
   const scorecardOutcome = scorecard
     ? await runClaimedAshbyOperation({ ...inviteDeps, scorecard })
     : { claimed: false as const };
-  return { invite, scorecard: scorecardOutcome };
+  const recommendationTagOutcome = recommendationTag
+    ? await runClaimedAshbyOperation({ ...inviteDeps, recommendationTag })
+    : { claimed: false as const };
+  return { invite, scorecard: scorecardOutcome, recommendationTag: recommendationTagOutcome };
 }
