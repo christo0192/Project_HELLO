@@ -60,6 +60,10 @@ let throwWhen: ((q: Query) => boolean) | null = null;
 let beforeExecute: ((q: Query) => void) | null = null;
 let scrambleTies = false;
 let seedCounter = 0;
+/** When > 0, every read resolves after this many ms, so concurrency can be observed. */
+let delayMs = 0;
+const inFlight: Record<string, number> = {};
+const peak: Record<string, number> = {};
 
 const OVERFLOW_ERROR = {
   message: 'TypeError: fetch failed',
@@ -123,6 +127,14 @@ function query(table: string): Record<string, unknown> {
     return { data: rows.slice(0, ROW_CAP), error: null, status: 200 };
   };
   c.then = (resolve: (v: unknown) => unknown, reject?: (e: unknown) => unknown) => {
+    if (delayMs > 0) {
+      inFlight[table] = (inFlight[table] ?? 0) + 1;
+      peak[table] = Math.max(peak[table] ?? 0, inFlight[table]);
+      return new Promise((r) => setTimeout(r, delayMs))
+        .then(() => execute())
+        .finally(() => { inFlight[table] -= 1; })
+        .then(resolve, reject);
+    }
     try {
       return Promise.resolve(execute()).then(resolve, reject);
     } catch (error) {
@@ -212,10 +224,13 @@ beforeEach(() => {
   beforeExecute = null;
   scrambleTies = false;
   seedCounter = 0;
+  delayMs = 0;
+  for (const k of Object.keys(inFlight)) delete inFlight[k];
+  for (const k of Object.keys(peak)) delete peak[k];
 });
 
 afterEach(() => {
-  delete process.env.PHONE_SCREENING_ENABLED;
+  vi.unstubAllEnvs();
 });
 
 describe('GET /api/candidates at workspace scale', () => {
@@ -234,7 +249,7 @@ describe('GET /api/candidates at workspace scale', () => {
   });
 
   it('never sends more than 100 ids in one read, phone progress included', async () => {
-    process.env.PHONE_SCREENING_ENABLED = 'true';
+    vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
     seed(529);
     await get('/api/candidates');
     const inReads = queries.filter((q) => q.inValues);
@@ -327,9 +342,10 @@ describe('GET /api/candidates at workspace scale', () => {
     expect((res.body as Row[]).every((c) => c.latest_recommendation === 'advance' && c.latest_score === 90)).toBe(true);
   });
 
-  it('keeps the newest assessment when older rows for the same candidates come later in storage', async () => {
+  it('keeps the newest assessment when older rows for the same candidates come FIRST in storage', async () => {
     const { assessed } = seed(529);
-    for (const i of assessed) db.assessments!.push({ id: aid(i, 1), candidate_id: cid(i), session_id: null, overall_score: 5, recommendation: 'reject', created_at: iso(i) });
+    // Older rows ahead of the newer ones: only the read's ORDER BY can pick the newest.
+    for (const i of assessed) db.assessments!.unshift({ id: aid(i, 1), candidate_id: cid(i), session_id: null, overall_score: 5, recommendation: 'reject', created_at: iso(i) });
     const res = await get('/api/candidates');
     const scored = (res.body as Row[]).filter((c) => c.latest_score != null);
     expect(scored).toHaveLength(assessed.length);
@@ -350,20 +366,51 @@ describe('GET /api/candidates at workspace scale', () => {
   });
 
   it('stops starting new assessments batches after the first failure', async () => {
-    seed(1250); // 13 batches
+    seed(1250); // 13 batches, 4 at a time
     failWhen = (q) => q.table === 'assessments';
     const res = await get('/api/candidates');
     expect(res.status).toBe(503);
-    expect(queries.filter((q) => q.table === 'assessments').length).toBeLessThan(13);
+    expect(queries.filter((q) => q.table === 'assessments').length).toBeLessThanOrEqual(4);
   });
 
-  it('answers 503 (never a hang) when the assessments builder throws, and logs nothing of the error', async () => {
+  it('answers 503 (never a hang) when the assessments builder throws, and logs only a category', async () => {
     seed(50);
     throwWhen = (q) => q.table === 'assessments';
     const { result: res, unhandled, logged } = await observed(() => get('/api/candidates'));
     expect(unhandled).toEqual([]);
     expect(res.status).toBe(503);
+    const lines = logged.filter((l) => l.includes('candidate_assessments_read'));
+    expect(lines).toHaveLength(1);
+    expect(JSON.parse(lines[0] as string)).toMatchObject({ error_category: 'candidate_assessments_read', error_type: 'query_failed' });
     expect(logged.join('\n')).not.toMatch(/driver-detail|postgres:|10\.0\.0\.5|user@example\.com/);
+  });
+
+  it('keeps every batched read on the list at most 4 in flight, phone progress included', async () => {
+    vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
+    seed(1250);
+    delayMs = 3;
+    const res = await get('/api/candidates');
+    expect(res.status).toBe(200);
+    expect(peak.assessments).toBeLessThanOrEqual(4);
+    expect(peak.ashby_application_links).toBeLessThanOrEqual(4);
+    expect(peak.phone_engagements).toBeLessThanOrEqual(4);
+    expect(peak.phone_engagements).toBeGreaterThan(1);
+  });
+
+  it('stops the additive reads at their first failed batch, and still answers 200', async () => {
+    vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
+    seed(1250); // 13 batches each
+    delayMs = 2;
+    failWhen = (q) => q.table === 'ashby_application_links' || q.table === 'phone_engagements';
+    const res = await get('/api/candidates');
+    expect(res.status).toBe(200);
+    expect(queries.filter((q) => q.table === 'ashby_application_links').length).toBeLessThanOrEqual(4);
+    expect(queries.filter((q) => q.table === 'phone_engagements').length).toBeLessThanOrEqual(4);
+    const body = res.body as Row[];
+    expect(body).toHaveLength(1250);
+    // Unread phone progress is unknown (null), never a confident 0.
+    expect(body.every((c) => c.dial_count === null)).toBe(true);
+    expect(body.every((c) => c.resume_review === null)).toBe(true);
   });
 
   it('answers 503 when a batch passes the page bound rather than returning it truncated', async () => {
@@ -426,8 +473,9 @@ describe('GET /api/candidates/summary at workspace scale', () => {
     expect(Math.max(...reads.map((q) => q.inValues!.length))).toBeLessThanOrEqual(100);
   });
 
-  it('covers every candidate past the 1000-row cap', async () => {
+  it('covers every candidate past the 1000-row cap, in a total order', async () => {
     const { assessed } = seed(1250);
+    scrambleTies = true; // the summary pages by id alone: any unpinned order would overlap or skip
     const res = await get('/api/candidates/summary');
     expect(res.status).toBe(200);
     expect(res.body.assessed_count).toBe(assessed.length);

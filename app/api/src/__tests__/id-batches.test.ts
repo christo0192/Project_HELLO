@@ -42,12 +42,19 @@ describe('mapChunks', () => {
     expect(peak).toBe(3);
   });
 
-  it('falls back to the default concurrency for a value that is not a positive integer', async () => {
-    for (const bad of [Number.NaN, 0, -2, 1.5]) {
-      const seen: number[] = [];
-      const out = await mapChunks([[1], [2], [3]], async (c) => { seen.push(c[0]); return c[0]; }, { concurrency: bad });
-      expect(out).toEqual([1, 2, 3]);
-      expect(seen.sort()).toEqual([1, 2, 3]);
+  it('falls back to the default concurrency (4) for a value that is not a positive integer', async () => {
+    for (const bad of [Number.NaN, 0, -2, 1.5, Infinity]) {
+      let running = 0;
+      let top = 0;
+      const out = await mapChunks(Array.from({ length: 9 }, (_, i) => [i]), async (c) => {
+        running += 1;
+        top = Math.max(top, running);
+        await new Promise((r) => setTimeout(r, 2));
+        running -= 1;
+        return c[0];
+      }, { concurrency: bad });
+      expect(out).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
+      expect(top).toBe(4);
     }
   });
 
@@ -65,13 +72,17 @@ describe('mapChunks', () => {
     expect(out).toEqual(['failed', ...Array.from({ length: 9 }, () => undefined)]);
   });
 
-  it('propagates a rejection and starts no new chunk after it', async () => {
+  it('propagates a rejection and, with other workers still running, starts no new chunk after it', async () => {
     const started: number[] = [];
-    await expect(mapChunks(Array.from({ length: 6 }, (_, i) => [i]), async (c) => {
+    await expect(mapChunks(Array.from({ length: 8 }, (_, i) => [i]), async (c) => {
       started.push(c[0]);
-      if (c[0] === 1) throw new Error('read threw');
+      // Chunk 0 throws at once while chunk 1 is still in flight on the second worker.
+      if (c[0] === 0) throw new Error('read threw');
+      await new Promise((r) => setTimeout(r, 5));
       return c[0];
-    }, { concurrency: 1 })).rejects.toThrow('read threw');
+    }, { concurrency: 2 })).rejects.toThrow('read threw');
+    // Let the surviving worker finish its in-flight chunk.
+    await new Promise((r) => setTimeout(r, 20));
     expect(started).toEqual([0, 1]);
   });
 });

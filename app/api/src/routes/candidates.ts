@@ -322,7 +322,8 @@ const CANDIDATE_MAX_PAGES = 50;
  */
 const ASSESSMENT_MAX_PAGES = 10;
 
-type AssessmentReadFailure = 'query_failed' | 'page_bound' | 'read_threw';
+/** `query_failed` covers an error answer and a thrown client fault alike: readAllPages turns a throw into an error. */
+type AssessmentReadFailure = 'query_failed' | 'page_bound';
 
 /** The rows with each `id` once, keeping the first occurrence and the order. */
 function uniqueById<T extends { id: string }>(rows: readonly T[]): T[] {
@@ -384,8 +385,10 @@ async function loadAssessmentRows(candidateIds: readonly string[]): Promise<Late
     }
     return (batches as LatestAssessmentRow[][]).flat();
   } catch {
-    // Deliberately not logging the thrown value: it can carry a driver message or a URL.
-    logAssessmentReadFailure('read_threw');
+    // Unreachable today (readAllPages never rejects); kept so a future change
+    // cannot turn a throw into a hung request. The thrown value is never logged:
+    // it can carry a driver message or a URL.
+    logAssessmentReadFailure('query_failed');
     return null;
   }
 }
@@ -679,7 +682,10 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
           if (rowsOnPage.length < LINK_PAGE_SIZE) return { rows: got, failed: false, complete: true };
         }
         return { rows: got, failed: false, complete: false };
-      });
+      }, { stopWhen: (b) => b.failed });
+      // The first failed batch stopped new ones (stopWhen): the read is
+      // additive, so waiting for every other batch's retries buys nothing.
+      // Unstarted slots are `undefined` and count as failed here.
       const links = perBatch.flatMap((b) => b?.rows ?? []);
       const linkFailed = perBatch.some((b) => !b || b.failed);
       const complete = perBatch.every((b) => b?.complete === true);
