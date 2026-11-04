@@ -367,9 +367,9 @@ describe('CandidatesPage', () => {
     expect(screen.queryByText('Jane Doe')).not.toBeInTheDocument();
     // The recommendation is visibly shown (badge + score) in the table.
     const table = screen.getByRole('table', { name: /candidates in your pipeline/i });
-    expect(within(table).getByText('Advance')).toBeInTheDocument();
+    expect(within(table).getByText('Select')).toBeInTheDocument();
     expect(within(table).getByText('82')).toBeInTheDocument();
-    expect(screen.getByText('Rec: Advance')).toBeInTheDocument();
+    expect(screen.getByText('Rec: Select')).toBeInTheDocument();
   });
 
   it('applies the assessed deep link (average-score cohort)', async () => {
@@ -634,7 +634,8 @@ describe('CandidatesPage', () => {
     renderPage();
     await screen.findByText('Jane Doe');
     const group = screen.getByRole('group', { name: 'Filter by recommendation' });
-    expect(within(group).getByRole('button', { name: /Advance/i })).toBeInTheDocument();
+    expect(within(group).getByRole('button', { name: /Select/i })).toBeInTheDocument();
+    expect(within(group).getByRole('button', { name: /Borderline/i })).toBeInTheDocument();
     // No denominator claim when there is no denominator.
     expect(screen.queryByText(/with a recommendation\./)).not.toBeInTheDocument();
   });

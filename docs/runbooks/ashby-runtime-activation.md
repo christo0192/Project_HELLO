@@ -49,6 +49,7 @@ default rather than failing the boot.
 | `ASHBY_LEASE_SECONDS` | `60` | Visibility window per claim (clamped 5–900). |
 | `RESUME_SCANNER`, `RESUME_SCANNER_MAX_DB_AGE_HOURS`, `AV_UPDATER_*` | see §5a | Malware scanner and its signature-update lifecycle. Stage 5 cannot pass without them. |
 | `ASHBY_PHONE_PARSING_ENABLED` | OFF in code; `"true"` in `fly.toml [env]` | Phone-parsing intake kill switch (ADR-0018). Only the literal `true` is ON. See §10. |
+| `ASHBY_RECOMMENDATION_TAGS_ENABLED` | OFF in code; `"true"` in `fly.toml [env]` | Christy verdict tag kill switch (0134). Only the literal `true` is ON. See §11. |
 
 **The runtime starts only when all four of these hold:**
 `ASHBY_INTEGRATION_ENABLED=true` **and** a usable `ASHBY_WEBHOOK_SECRET` **and**
@@ -74,7 +75,7 @@ Four independent, jittered, single-flight loops (see `scheduler.ts`):
 | Loop | Work |
 |---|---|
 | `signal` | Claims `ashby.signal`, `ashby.import`, `ashby.ingestion` jobs through the leased queue runner. |
-| `operation` | Claims **`invite_delivery` operations and nothing else** (see §7). |
+| `operation` | Claims `invite_delivery`, `scorecard_write` and, with its switch on, `recommendation_tag` operations, one per lane per tick. **Never `stage_move`** (see §7, §11). |
 | `reconcile` | The dropped-webhook safety net, under a DB single-flight lease. |
 | `reclaim` | `reclaimExpired` — requeues or dead-letters jobs whose lease expired. |
 
@@ -396,34 +397,35 @@ unused.
 
 ---
 
-## 7. Why nothing is written back to Ashby (read this before "fixing" it)
+## 7. What is written back to Ashby (read this before "fixing" it)
 
-**No approved Ashby result sink exists.** A completed screening therefore parks
-at the `writeback_pending` lifecycle state (0032) and NOTHING is published: no
-`applicationFeedback.submit`, no `applicationFeedbackRequest.create`, no
+Two things are written. A completed screening parks at the `writeback_pending`
+lifecycle state (0032), and then:
+
+- `scorecard_write` submits the scorecard through `applicationFeedback.submit`,
+  bound to the verified form (`HELLO_CHRISTY_SCORECARD_BINDING`, see
+  `ashby-scorecard-fields.md`). An Ashby scorecard cannot be retracted.
+- `recommendation_tag` keeps one Christy verdict tag on the candidate (§11).
+
+Nothing else is published: no `applicationFeedbackRequest.create`, no
 `application.changeStage`, and **no TA stage move**. There is no auto-reject
-anywhere.
+anywhere. A tag says what the screening concluded; it moves nobody.
 
-Four independent locks enforce this:
+Three independent locks keep the stage move out:
 
-1. **The worker refuses.** `SUPPORTED_OPERATION_TYPES` is `['invite_delivery']`;
-   `scorecard_write` and `stage_move` are never passed to
+1. **The worker refuses.** `SUPPORTED_OPERATION_TYPES` is `['invite_delivery',
+   'scorecard_write', 'recommendation_tag']`; `stage_move` is never passed to
    `claim_ashby_operation`.
-2. **The payload cannot be built.** `bindFeedbackForm` fails closed with
-   `binding_unverified` unless a tenant-VERIFIED form binding is supplied, and no
-   column, RPC, or config produces one — `ashby_job_mappings.feedback_form_id` is
-   a bare text column with no verified flag and no field-id columns.
-3. **The database refuses.** The 0029 `trg_ashby_operation_dependency` trigger
+2. **The database refuses.** The 0029 `trg_ashby_operation_dependency` trigger
    raises `P0001` if a `stage_move` tries to reach `running`/`succeeded` before
    its `scorecard_write` dependency has succeeded.
-4. **The saga refuses.** `enqueueStageMove` re-reads `application.info` and skips
+3. **The saga refuses.** `enqueueStageMove` re-reads `application.info` and skips
    with `human_moved` unless the application is still at the mapped AI stage — a
    human's move is never undone.
 
-`ashby-writeback-fail-closed.test.ts` asserts all four as an executable gate.
-**Unlocking write-back requires a tenant probe that pins the feedback-form field
-ids AND a durable verified binding — it is not a flag flip, and widening
-`SUPPORTED_OPERATION_TYPES` without that binding would break the guarantee.**
+`ashby-writeback-fail-closed.test.ts` asserts these as an executable gate.
+**Unlocking the stage move is not a flag flip: widening
+`SUPPORTED_OPERATION_TYPES` to include it would break the guarantee.**
 
 ---
 
@@ -497,8 +499,8 @@ flag on but a dead scheduler reports `degraded`, not `healthy`.
 | `invite_blocked_failed_ingestion` in `reasons` | An invite is blocked behind a `failed_review` ingestion, which only a human can requeue | Real, non-transient. Fix the `failed_reason` cause, then requeue the ingestion per §2a of the recovery runbook. It will never clear on its own. |
 | `ingestion_stuck` in `reasons` | A resume ingestion has sat in `queued`, `fetching`, `scanning`, `extracting` or `structuring` past the stuck window | Real fault, but the diagnosis now DEPENDS ON WHICH counter is non-zero — read them individually, the reason string alone is ambiguous. `_queued`/`_fetching`: check the scanner first, it is the usual cause. `_scanning`/`_extracting`: a process died mid-flight; 0097's rescue re-drives these automatically once the row is 900s stale, so a non-zero count that PERSISTS means the rescue is being refused (budget exhausted, or the scanner gate is blocking the job claim). `_structuring`: **always needs a human** — see below. |
 | `invite_prerequisite_failed` in `reasons` | Invites killed by the pre-0035 ordering defect | Recovery backlog, not a live fault. Run `reopen_ashby_invite_delivery` per the recovery runbook. |
-| `writebackPending` climbing | Screenings completing with no approved result sink | Expected (§7). These are results awaiting manual publication. |
-| A workflow shows `screened: not parked` (session `completed`, lifecycle not `writeback_pending`, not terminal) | The completion observer's park did not land — it is best-effort so that a transient failure can never discard a scored assessment | The assessment itself is safe and visible on the ordinary session surfaces. Nothing downstream waits on `writeback_pending` (there is no result sink), so this is a bookkeeping gap. Re-parking is idempotent: it self-corrects on any later completion for that session, and the state is legible here rather than log-only. |
+| `writebackPending` climbing | Screenings completing: a completed screening parks at `writeback_pending` and stays there | Expected (§7). The scorecard and the Christy tag (§11) are separate operations; nothing moves the lifecycle on. |
+| A workflow shows `screened: not parked` (session `completed`, lifecycle not `writeback_pending`, not terminal) | The completion observer's park did not land — it is best-effort so that a transient failure can never discard a scored assessment | The assessment itself is safe and visible on the ordinary session surfaces. The observer enqueues the scorecard and the Christy tag (§7, §11) only after the park lands, so that result has neither in Ashby until a later completion re-parks it. Re-parking is idempotent: it self-corrects on any later completion for that session, and the state is legible here rather than log-only. |
 | An `invite_delivery` operation shows `failed / blocked_provider` | The email channel is gated off (§5) | Expected for `email`/`both` mappings. Switch the mapping to `manual`, or wait for an approved provider. |
 | Health `degraded` with `scheduler_loop_stale` | A loop stopped ticking on THIS machine | Check the process; the backlog fields tell you whether another machine is still draining. |
 
@@ -734,3 +736,310 @@ old due loop has no hold (the switch then has no effect), the old events route
 has no mismatch release, and a re-imported late resume could be bound and parsed
 over the Ashby data. If that rollback is needed, halt phone calls first
 (`POST /api/phone/halt`).
+
+---
+
+## 11. Christy verdict tags (M027, migration 0134)
+
+Every Ashby candidate carries at most one tag saying what the newest screening
+concluded, so the team can filter on it in Ashby.
+
+| Newest verdict | Tag |
+|---|---|
+| `advance` (shown as Select) | `Christy: Select` |
+| `hold` (shown as Borderline) | `Christy: Borderline` |
+| `reject` | `Christy: Reject` |
+| none (`human_review`, stored as NULL), or evidence graded `insufficient` | no tag, and any Christy tag already there comes off |
+
+A provisional verdict (`scoring_status = 'incomplete_evidence'` with a verdict) IS
+tagged, Reject included. R1 verdicts do not reach this pipeline: it follows the
+phone-screen assessment only.
+
+**The tags are not created by the code.** The Ashby admin creates the three tags
+with exactly those titles. The match trims spaces, then is exact and
+case-sensitive, and only an active (non-archived) tag counts. The worker changes
+those three titles on a candidate and no other tag. A `Christy: ...` tag a recruiter
+adds by hand looks identical to the worker's own, so a later verdict removes it.
+
+### Required API key permissions
+
+Both must be on the key behind `ASHBY_API_KEY`:
+
+- **Candidates: write**, for `candidate.addTag` and `candidate.removeTag`. A
+  recent succeeded `scorecard_write` is good evidence of this one, because
+  `applicationFeedback.submit` needs the same permission.
+- **Hiring Process: read**, for `candidateTag.list`. Nothing else in the
+  integration strictly needs it, so check it by hand in Ashby's API key settings.
+
+### How it works
+
+`recommendation_tag` is its own operation in `ashby_operations`, with **no
+dependency on `scorecard_write`**. A dependency would park the tag for ever behind
+a failed or stranded scorecard, and would block removing a stale tag when a newer
+result has no verdict and so no scorecard. A tag failure can never resend or disturb
+a scorecard. The worker's lane order (invite, scorecard, tag) still runs the
+scorecard first in the normal case.
+
+The completion observer enqueues one operation per assessment revision (key
+`ashby:recommendation_tag:<link>:<assessment>`), on both the normal and the
+insufficient-evidence path. A terminal link, or a mapping that is not `enabled`,
+gets no operation.
+
+**An operation is a trigger, not a decision.** When it runs, the lane:
+
+1. resolves the Ashby candidate id (the link's, else `application.info`, which it
+   then stores on the link);
+2. asks the database for the candidate's verdict **now**
+   (`screening_v2.ashby_candidate_tag_verdict`): the newest assessment on the
+   operation's link and on every other non-terminal Ashby link of the same
+   candidate, over each link's session and every phone re-screen cycle's session.
+   The verdict is the raw `assessments.recommendation` column and the evidence
+   grade; no result at all means no tag;
+3. reads the candidate's tags with `candidate.info`;
+4. writes the difference: add first, then remove, so a candidate is never without a
+   tag it should have;
+5. reads the tags once more, and completes only when exactly the right Christy tag
+   is there. A leftover (another worker, or a recruiter, changed the tags meanwhile)
+   is removed and the operation waits 5 minutes (`ashby_tag_contended`) to re-check.
+
+A repeat finds the right tag already there and writes nothing.
+
+The result is on the operation, in `external_anchor`: `christy_tag_select`,
+`christy_tag_borderline`, `christy_tag_reject` or `christy_tag_none`. Mission
+Control lists these operations as "Christy tag", with a Retry button for a failed
+one.
+
+### Failure codes
+
+Almost every problem is a **wait**: the operation is rescheduled and the attempt is
+refunded, so it cannot burn its attempts in seconds. Because of that refund a wait
+ends by age: once the wait began more than **7 days** ago, the operation fails with
+the code it was waiting on. The wait begins when the operation is created, and again
+at every manual Retry (the claim reads the newest Retry from the audit trail), so a
+Retry after the age limit gets a fresh week of waiting. Retry works for those
+age-limited failures and for the ones below that fail outright; it is refused only
+for an operation that used up all its attempts, which this lane almost never does,
+because it waits instead of retrying hot. Fix the cause before pressing Retry: a run
+that fails again spends one of the operation's five attempts.
+
+Mission Control shows the cause beside the state, for example "Christy tag: Pending
+(Ashby was unavailable)" while it waits and "Christy tag: Failed (Ashby was
+unavailable)" once the wait ran out. Only a Failed row has a Retry button.
+
+| Code | Means | Behaviour | What to do |
+|---|---|---|---|
+| `ashby_tag_permission_denied` | HTTP 401 or 403, or `missing_endpoint_permission` | Waits 1 hour, writes nothing | Add the permissions above to the key. |
+| `ashby_tag_not_found` | No active tag has that exact title, even after a fresh read | Waits 1 hour, writes nothing, the old tag stays | Create or un-archive the tag, or fix its title. |
+| `ashby_tag_ambiguous` | Two active tags have that title | Waits 1 hour, writes nothing | Archive the duplicate. |
+| `ashby_tag_transient` | 429, 5xx, timeout, network, a tag list that could not be read to its end, or a run that reached its deadline (see below) | Waits 5 minutes | Nothing, unless it persists. |
+| `ashby_tag_contended` | The tags changed while the operation was writing them | Waits 5 minutes, then re-checks | Nothing, unless it persists. |
+| `ashby_tag_verdict_unreadable` | The link or the candidate's verdict could not be read from the database | Waits 5 minutes | Check the database is reachable. |
+| `operation_error` | Anything else, including a `candidate.info` answer in an unexpected shape (shown as "Unexpected error") | Waits 5 minutes | Check the logs (metadata only). If it persists for one candidate, see "A stored candidate id after an Ashby merge" below. |
+| `ashby_tag_write_rejected[:code]` | Ashby refused a tag write, a re-read shows it did not happen, and one more try with a freshly read tag id failed too | Fails, no retry | Look at the candidate in Ashby, then retry. |
+| `candidate_id_missing` | The link has no candidate id and `application.info` gave none | Fails, no retry | Check the application still exists in Ashby. |
+
+A refused write is looked at before it counts: a remove refused because the tag is
+already gone is a remove done, and an add refused because the tag is already on is
+an add done.
+
+The lane remembers the tag catalogue for 5 minutes. If the admin renames or archives
+a Christy tag inside that window, an add with the remembered id is checked against
+the candidate's tags and retried once with a fresh id. One residual remains: a tag
+renamed within those 5 minutes can be attached once under its NEW title (the add
+succeeds; the lane then puts the right tag on too). That needs an admin rename
+during a write, it is visible in Ashby, and the lane never removes the renamed tag
+because it no longer has a Christy title.
+
+A `running` operation has no reclaim: a worker crash between claim and completion
+strands the row, for tags as for every other operation type. A slow Ashby does not
+strand it. A wait is refused once the run's lease has run out (`ASHBY_LEASE_SECONDS`, 60 in
+production), so each run stops 15 s before its lease ends (half the lease, for a
+lease under 30 s): no Ashby call starts with less than 5 s left, and every call,
+retries and `Retry-After` waits included, is cut off at that deadline. The run then
+waits `ashby_tag_transient` while it still holds the lease. If a wait is refused
+anyway, the run fails retryable instead, which puts the row straight back to
+`pending` and spends one attempt (event `operation_defer_refused` in the logs).
+
+### One candidate, several jobs
+
+A tag is candidate-wide: the Ashby API has no job or application parameter, and a
+pipeline filter shows every active candidate with the tag on their profile. So the
+**newest verdict wins**, across jobs too. A candidate rejected for one job and
+selected for another carries only the tag of whichever result came last (the newest
+assessment), under both jobs.
+
+Because every operation applies the candidate's newest verdict when it runs, **the
+order operations run in does not matter**. An older job's operation that was
+deferred, retried, or enqueued later by the backfill applies the same newest
+verdict as the newer job's, and two workers at once settle on the same tag. A
+result that never got an operation of its own (for example while the kill switch
+was off) is still applied by the next operation that runs for that candidate. A
+withdrawn or deleted application's results stop counting for the candidate's other
+jobs.
+
+**One gap: a cancel enqueues nothing.** Cancelling the application that carries the
+newest result (Mission Control "Cancel screening") changes the candidate's verdict
+to the newest result of their other jobs, but creates no tag operation. So Ashby
+keeps the cancelled job's tag until the candidate's next event (a rescore, a
+re-screen, the backfill). To apply it now, trigger the lane on one of the
+candidate's other, active links, as described in "Making the lane re-check a
+candidate" below.
+
+#### Making the lane re-check a candidate
+
+Every operation applies the candidate's newest verdict when it runs, so any new
+tag operation on any active link of the candidate re-checks the tag. Run from
+`app/` as in the backfill below. First try the normal enqueue, with the session of
+that link's newest result:
+
+```bash
+npx --yes supabase@2.118.0 db query --linked "select screening_v2.enqueue_ashby_recommendation_tag('<link id>', '<session id>', '00000000-0000-4000-8000-000000000001');"
+```
+
+`inserted` means it is queued. It answers `duplicate` when that result already had
+its operation (the usual case once it ran); then queue a one-off trigger with a key
+of your own (any unused suffix; `duplicate` again means pick another):
+
+```bash
+npx --yes supabase@2.118.0 db query --linked "select screening_v2.enqueue_ashby_operation('<link id>', 'recommendation_tag', 'ashby:recommendation_tag:<link id>:manual-1', null, null, '00000000-0000-4000-8000-000000000001');"
+```
+
+It runs on the next poll and shows in Mission Control as "Christy tag".
+
+#### A stored candidate id after an Ashby merge
+
+The lane uses the Ashby candidate id stored on the link and asks
+`application.info` only when none is stored. If Ashby merges two candidate records,
+a link can keep the id of the record that was merged away. Its tag operation then
+either keeps waiting as `operation_error` (Ashby refuses the old id) or tags a
+record recruiters no longer see, and that link is no longer counted with the
+candidate's other jobs. Nothing re-checks the stored id by itself.
+
+Remedy, for each of the candidate's links that still holds the old id: clear it,
+so the next run reads `application.info` again and stores the current id.
+
+```bash
+npx --yes supabase@2.118.0 db query --linked "update screening_v2.ashby_application_links set external_candidate_id = null, updated_at = now() where provider = 'ashby' and id = '<link id>';"
+```
+
+A tag operation still waiting on that link picks this up on its next run (within 5
+minutes). A failed one: press Retry. If its last one succeeded, trigger the lane as
+in "Making the lane re-check a candidate" above. Until a run stores the id again,
+the phone lane's duplicate-application check cannot match that link by its Ashby
+candidate id (it still matches by phone number and email).
+
+### The tag and the Ashby 1-4 rating can look inconsistent
+
+The scorecard's overall rating uses 25-point bands (below 25 is 1, 25-49 is 2, 50-74
+is 3, 75 and above is 4). The verdict uses 65 and 45. So the same rating can sit
+beside different tags: a 3 covers both Borderline (50-64) and Select (65-74), and a 2
+covers both Reject (25-44) and Borderline (45-49). That is existing behaviour the
+tags make visible, not a fault.
+
+### Backfill (only after owner testing and go-ahead)
+
+Nothing enqueues past candidates automatically. Migration 0134 ships
+`screening_v2.backfill_ashby_recommendation_tags`, which takes every Ashby link with
+a succeeded `scorecard_write`, non-terminal, on an `enabled` mapping, and enqueues
+one tag operation for it. The session is that link's newest succeeded scorecard's.
+A link that already has any tag operation is skipped: the live lane owns it. Order
+does not matter, because each operation applies the candidate's newest verdict when
+it runs (see "One candidate, several jobs"). It answers counts only.
+
+Run these from `app/` (the folder `scripts/verify-prod-function-drift.sh` runs
+from), in an operator shell that has run `supabase link`. The CLI is pinned to the
+drift script's version.
+
+1. **Dry run.** Writes nothing.
+
+   ```bash
+   npx --yes supabase@2.118.0 db query --linked "select screening_v2.backfill_ashby_recommendation_tags(true);"
+   ```
+
+   The dry run applies the same checks as the real run, so its numbers are what the
+   real run will do:
+
+   | Field | Means |
+   |---|---|
+   | `total_eligible` | Links that would get an operation. |
+   | `verdicts` | Those links by the verdict the lane will apply: the candidate's newest, across all its jobs, in raw values (`advance`, `hold`, `reject`, `none`). |
+   | `evidence_insufficient` | Links whose newest result is graded insufficient: no tag, with or without a raw verdict. One with no raw verdict is also in `verdicts.none`, so do not add the two. |
+   | `skipped_terminal` | Withdrawn, deleted or manually cancelled applications. |
+   | `skipped_mapping_inactive` | The job's mapping is not `enabled`. |
+   | `skipped_has_tag_op` | The link already has a tag operation; the live lane owns it. |
+   | `skipped_no_session` | Neither the scorecard nor the link names a session. |
+   | `skipped_session_not_owned` | The scorecard's session is no longer the link's or one of its phone cycles'. |
+   | `skipped_no_assessment` | The scorecard's session has no assessment. |
+
+   One small gap: for a link with no stored Ashby candidate id, the dry run counts
+   the verdict from that link alone (and from links of the same internal candidate),
+   while the real run first reads the id from Ashby, so another job of the same
+   person can still change which tag it applies.
+
+2. **Run it**, only once the owner has seen those numbers and said go.
+
+   ```bash
+   npx --yes supabase@2.118.0 db query --linked "select screening_v2.backfill_ashby_recommendation_tags(false);"
+   ```
+
+   It answers the same counts plus `enqueue`, which should be `inserted` equal to
+   `total_eligible` and nothing else. Re-running is safe: every link it enqueued now
+   has a tag operation and is skipped. The lane drains one operation per poll tick
+   (about 12 a minute at the default 5 s), so a large backfill takes a while and
+   shares the tenant's rate limit.
+
+   Performance: the verdict read scans `ashby_application_links` and `assessments`
+   in full (the sibling match cannot use one index, `external_candidate_id` has
+   none, and the `assessments` session indexes are partial since 0088). Every tag
+   run does one such read, and the backfill one per eligible link, so the backfill
+   grows with the square of the number of links. That is fine at today's size. If
+   the tables grow, a later forward migration can add a partial index on
+   `ashby_application_links (external_candidate_id) where external_candidate_id is
+   not null` and a plain index on `assessments (session_id, created_at desc)`.
+
+3. **Check it** in Mission Control, or by count:
+
+   ```bash
+   npx --yes supabase@2.118.0 db query --linked "select state, external_anchor, error_code, count(*) from screening_v2.ashby_operations where operation_type = 'recommendation_tag' group by 1, 2, 3 order by 1, 2, 3;"
+   ```
+
+### Deploying migration 0134
+
+0134 waits at most 10 s for its lock on `ashby_operations` (`lock_timeout`), which
+the worker and every webhook use all the time. If it times out, the migrate job
+fails and the app deploys after it are skipped: the old API keeps working on the
+old database, but the merge is not live. Nothing re-runs it by itself. Once
+whatever held the lock is gone, re-run the Deploy (Fly) workflow, or dispatch it
+with `service=api` (a manual dispatch applies pending migrations first).
+
+### Kill switch and rollback
+
+`ASHBY_RECOMMENDATION_TAGS_ENABLED` (only the exact value `true` is on; `"true"` in
+`fly.toml [env]`). No deploy needed, because a Fly secret overrides `[env]`:
+
+```bash
+fly secrets set ASHBY_RECOMMENDATION_TAGS_ENABLED=false -a project-hello-api
+```
+
+Off: no new operation is enqueued and the lane does not run. Pending operations wait,
+and turning it back on (`fly secrets unset ASHBY_RECOMMENDATION_TAGS_ENABLED -a
+project-hello-api`) resumes them. Scorecards and invites are unaffected.
+
+Turning it back on does **not** create operations for results that landed while it
+was off. Such a result is still applied by the next operation that runs for that
+candidate (a pending one, a later screening, or the backfill), because every
+operation applies the candidate's newest verdict. The backfill only reaches a link
+that has no tag operation yet, so a candidate whose every link already had a
+finished tag operation before the switch went off keeps its old tag until its next
+result. For one such link, enqueue it by hand with the session of its newest result:
+`select screening_v2.enqueue_ashby_recommendation_tag('<link id>', '<session id>',
+'00000000-0000-4000-8000-000000000001');`. If that answers `duplicate`, use the
+one-off trigger in "Making the lane re-check a candidate".
+
+Tags already on candidates stay when the switch goes off. There is no bulk removal
+tool: remove them in Ashby by archiving the three tags, or by hand.
+
+Rolling the application back to a build without this lane is safe on the 0134
+database. 0134 is additive and forward-only, and the new type and functions simply go
+unused. Tag operations stay `pending`, and they count in `backlog.operationsPending`
+on the health route until the lane runs again.

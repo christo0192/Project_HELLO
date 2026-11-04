@@ -37,7 +37,7 @@ import { SurfaceCard } from '../design/candidate';
 import { formatDateTime } from '../../lib/datetime';
 import { sessionStatusLabel, sessionStatusTone } from './status';
 import { humanizeEnum } from '../../lib/humanize';
-import { ASHBY_ERROR_CODE_LABELS } from '../../lib/ashby-labels';
+import { ashbyErrorCodeLabel } from '../../lib/ashby-labels';
 import { IntakeBadge, isIntakeType, PROFILE_OUTCOME_LABELS } from './ResumeReviewBadge';
 
 /** Which scope the card reads through. Both resolve to the same projection. */
@@ -284,7 +284,7 @@ export function AshbyWorkflowCardView({ workflow }: AshbyWorkflowCardViewProps) 
                 {code && (
                   // In words; the exact code stays one hover away for support.
                   <p className="mt-1 text-xs text-ink-tertiary" title={code}>
-                    {humanizeEnum(code, ASHBY_ERROR_CODE_LABELS)}
+                    {ashbyErrorCodeLabel(code)}
                   </p>
                 )}
               </dd>

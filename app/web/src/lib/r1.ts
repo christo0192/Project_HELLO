@@ -34,6 +34,7 @@ import type {
   R1SettingsResponse,
   R1UsageResponse,
 } from './r1-types';
+import { RECOMMENDATION_LABELS } from './recommendation-labels';
 
 /** The link lifetime the API sets on send, reissue and retake (plan decision 9). */
 export const R1_LINK_VALID_HOURS = 72;
@@ -66,11 +67,8 @@ export function r1StatusTone(status: string): R1Tone {
   return (R1_STATUS_TONE as Readonly<Record<string, R1Tone>>)[status] ?? 'neutral';
 }
 
-export const R1_RECOMMENDATION_LABEL: Readonly<Record<R1Recommendation, string>> = {
-  advance: 'Advance',
-  hold: 'Hold',
-  reject: 'Reject',
-};
+export const R1_RECOMMENDATION_LABEL: Readonly<Record<R1Recommendation, string>> =
+  RECOMMENDATION_LABELS;
 
 export function isLiveRound(round: Pick<R1Round, 'status'>): boolean {
   return round.status === 'invited' || round.status === 'in_progress';
@@ -409,7 +407,7 @@ export function validateSettingsDraft(
     errors.hold_threshold = 'Enter a score from 0 to 100, with at most two decimals.';
   }
   if (advance !== null && hold !== null && hold > advance) {
-    errors.hold_threshold = 'The hold threshold cannot be above the advance threshold.';
+    errors.hold_threshold = 'The Borderline score cannot be above the Select score.';
   }
   return errors;
 }

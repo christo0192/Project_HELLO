@@ -1010,7 +1010,7 @@ describe('CandidateDetailPage', () => {
     const score = screen.getByRole('region', { name: 'Latest screening score' });
     expect(within(score).getByText('78')).toBeInTheDocument();
     expect(within(score).getByText('/ 100')).toBeInTheDocument();
-    expect(within(score).getByText('Advance')).toBeInTheDocument();
+    expect(within(score).getByText('Select')).toBeInTheDocument();
     expect(within(score).getByText(/Latest screening/)).toBeInTheDocument();
   });
 

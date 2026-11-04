@@ -370,11 +370,14 @@ describe('DashboardPage', () => {
     getMe.mockResolvedValue(VIEWER_ME);
     renderDashboard();
     const table = await screen.findByRole('table', { name: 'Recommendation distribution data' });
-    expect(within(table).getByRole('rowheader', { name: /Advance/ })).toBeInTheDocument();
+    expect(within(table).getByRole('rowheader', { name: /Select/ })).toBeInTheDocument();
     expect(within(table).getByRole('rowheader', { name: /Reject/ })).toBeInTheDocument();
-    // "Hold: 0" is not drawn: only recommendations somebody actually got.
-    expect(within(table).queryByRole('rowheader', { name: /Hold/ })).not.toBeInTheDocument();
-    const advanceLink = screen.getByRole('link', { name: /Advance:.*View these candidates/i });
+    // "Borderline: 0" is not drawn: only recommendations somebody actually got.
+    expect(within(table).queryByRole('rowheader', { name: /Borderline/ })).not.toBeInTheDocument();
+    // Hovering shows the same word, never the stored value behind it.
+    expect(within(table).getByTitle('Select')).toBeInTheDocument();
+    expect(table.querySelector('[title="advance"]')).toBeNull();
+    const advanceLink = screen.getByRole('link', { name: /Select:.*View these candidates/i });
     expect(advanceLink).toHaveAttribute('href', candidatesHref({ recommendations: ['advance'] }));
     fireEvent.click(advanceLink);
     expect(await screen.findByTestId('probe')).toHaveTextContent('recommendation=advance');

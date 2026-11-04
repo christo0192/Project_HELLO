@@ -153,7 +153,7 @@ export interface EnqueueResult {
 
 export interface OperationClaimRow {
   id: string;
-  operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move';
+  operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move' | 'recommendation_tag';
   /**
    * The deterministic operation key. It encodes the delivery CHANNEL
    * (`ashby:invite:<app>:<channel>:<invite>`), which is why the claim RPC
@@ -169,6 +169,39 @@ export interface OperationClaimRow {
   marker: string | null;
   /** Exact assessment session for cycle-specific scorecard operations. */
   sourceSessionId?: string | null;
+  /**
+   * When the operation row was created (0134). Read by the tag lane's age limit:
+   * a defer refunds the attempt, so without it a deferred row never ends.
+   */
+  createdAt?: string | null;
+  /**
+   * Where the tag lane's age limit counts from (0134): `created_at`, or the
+   * newest manual Retry of this operation when there is one, so a Retry after
+   * the limit gets a fresh wait. Null when unknown; the lane then uses
+   * `createdAt`.
+   */
+  ageAnchor?: string | null;
+}
+
+/** The tag lane's link read (0134): the link's Ashby ids and nothing else. */
+export interface RecommendationTagLink {
+  externalCandidateId: string | null;
+  externalApplicationId: string | null;
+}
+
+/**
+ * The candidate's authoritative verdict at run time (0134
+ * `ashby_candidate_tag_verdict`): the newest assessment on any of the
+ * candidate's Ashby links, not the one the operation was enqueued for.
+ * `recommendation` is the RAW `assessments.recommendation` column: never
+ * `ScorecardSource` or `NormalizedScorecard`, both of which coerce a missing
+ * verdict to `hold`.
+ */
+export interface RecommendationTagSource {
+  /** `no_assessment`: no result on any of the candidate's links, so no tag. */
+  status: 'ok' | 'no_assessment';
+  recommendation: unknown;
+  evidenceGrade: 'decision' | 'insufficient' | null;
 }
 
 /** Durable persistence for the workflow (0029/0031 tables + RPCs). */
@@ -198,7 +231,7 @@ export interface WorkflowStores {
   ): Promise<{ status: string; state?: string }>;
   enqueueOperation(input: {
     applicationLinkId: string;
-    operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move';
+    operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move' | 'recommendation_tag';
     operationKey: string;
     dependsOn?: string | null;
     marker?: string | null;
@@ -256,7 +289,7 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
    * `leaseToken` was unobtainable.
    */
   claimOperation(
-    operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move',
+    operationType: 'invite_delivery' | 'scorecard_write' | 'stage_move' | 'recommendation_tag',
     owner: string,
     leaseSeconds: number,
   ): Promise<OperationClaimRow | null>;
@@ -387,6 +420,28 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
   claimAshbyProfileDue?(input: { limit: number }): Promise<string[]>;
   /** Enqueue the verified scorecard sink after a durable assessment insert. */
   enqueueScorecardWrite?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
+  /**
+   * Enqueue the Christy verdict tag for the session's newest assessment (0134).
+   * Answers `disabled` without a call while ASHBY_RECOMMENDATION_TAGS_ENABLED is
+   * off. Optional so existing fakes compile.
+   */
+  enqueueRecommendationTag?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
+  /**
+   * The tag lane's link read: the link's Ashby candidate and application ids,
+   * or null when the link cannot be read. Optional so existing fakes compile.
+   */
+  readRecommendationTagLink?(applicationLinkId: string): Promise<RecommendationTagLink | null>;
+  /**
+   * The candidate's authoritative verdict, decided now across every link of
+   * the candidate (0134 `ashby_candidate_tag_verdict`), or null when it cannot
+   * be read. `externalCandidateId` is the link's stored Ashby candidate id, or
+   * the one the lane resolved from `application.info`. Optional so existing
+   * fakes compile.
+   */
+  readRecommendationTagSource?(
+    applicationLinkId: string,
+    externalCandidateId: string | null,
+  ): Promise<RecommendationTagSource | null>;
   /**
    * CAS a manual invite_delivery operation from `running` to
    * `awaiting_manual_delivery`. The invite digest exists but no recruiter has

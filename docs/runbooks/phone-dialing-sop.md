@@ -92,7 +92,7 @@ Typical timeline, first dial at 10:00:
 
 ### Scoring and Ashby
 - Complete call → scored. Partial call → scored only if **≥ 75 %** of planned questions were answered; otherwise human review.
-- Recommendation: **≥ 65 advance, ≥ 45 hold, < 45 reject.**
+- Recommendation: **≥ 65 advance, ≥ 45 hold, < 45 reject** (stored values; the app shows them as Select, Borderline and Reject).
 - Only a **scorecard** is written to Ashby. No stage move, no auto-reject, no email.
 - Recording starts at answer and is kept even without consent (0105), except wrong number / identity mismatch.
 

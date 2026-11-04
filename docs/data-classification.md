@@ -145,7 +145,7 @@
 | `role_fit` | Internal | JSON scorecard — role fit assessment |
 | `resume_conflicts` | Internal | JSON scorecard — optional resume conflicts |
 | `overall_score` | Internal | Numeric 0–100 |
-| `recommendation` | Internal | "advance", "hold", or "reject" |
+| `recommendation` | Internal | "advance", "hold", or "reject" (shown as Select, Borderline, Reject) |
 | `summary` | **Confidential PII** | May contain references to PII or candidate-specific details |
 | `raw` | **Confidential PII** | Raw assessment output; may contain transcript excerpts |
 | `provenance` | Internal | Model provenance JSON |

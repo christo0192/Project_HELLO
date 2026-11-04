@@ -56,6 +56,7 @@ import { evidenceHoldReason, isEvidenceInsufficient } from '../evidence-hold';
 import { formatDateTime } from '../datetime';
 import { formatPhone, humanizeEnum, shortId } from '../humanize';
 import { sessionModeLabel } from '../session-mode';
+import { RECOMMENDATION_LABELS } from '../recommendation-labels';
 import { presentTranscriptTurn } from '../transcript-presentation';
 import { escapeHtml as e } from './escape';
 import { REPORT_CSS } from './reportStyles';
@@ -72,13 +73,11 @@ export function formatReportOffset(sec: number): string {
 }
 
 const RECOMMENDATION_WORDS: Record<string, string> = {
-  advance: 'Advance',
-  hold: 'Hold',
-  reject: 'Reject',
+  ...RECOMMENDATION_LABELS,
   human_review: 'Human review',
 };
 
-function recommendationWords(rec: string | null | undefined): string {
+export function recommendationWords(rec: string | null | undefined): string {
   if (!rec) return 'Unassessed';
   return RECOMMENDATION_WORDS[rec] ?? humanizeEnum(rec);
 }

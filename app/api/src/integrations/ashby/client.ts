@@ -24,8 +24,10 @@ import {
   type AshbyOperation,
   type AshbyEnvelope,
   type AshbyResult,
+  type AshbyCallOptions,
   type ApplicationListParams,
   type ApplicationHistoryParams,
+  type CandidateTagListParams,
   type JobListParams,
   type FeedbackSubmitRequest,
   type FeedbackRequestCreateRequest,
@@ -452,9 +454,14 @@ export class AshbyClient {
 
   // ── Typed endpoint helpers (verified fields named; rest via `extra`) ──────
 
-  async applicationInfo<T = OpaqueRecord>(applicationId: string, extra?: OpaqueRecord): Promise<AshbyResult<T>> {
+  /** `options.deadlineAt` is internal (see {@link AshbyCallOptions}), never sent. */
+  async applicationInfo<T = OpaqueRecord>(
+    applicationId: string,
+    extra?: OpaqueRecord,
+    options: AshbyCallOptions = {},
+  ): Promise<AshbyResult<T>> {
     validateId('application.info', 'applicationId', applicationId);
-    return this.request<T>('application.info', { applicationId, ...(extra ?? {}) });
+    return this.request<T>('application.info', { applicationId, ...(extra ?? {}) }, { deadlineAt: options.deadlineAt });
   }
 
   async applicationList<T = OpaqueRecord[]>(params: ApplicationListParams = {}): Promise<AshbyResult<T>> {
@@ -508,9 +515,13 @@ export class AshbyClient {
    * carry optional documented fields (e.g. `externalMappingId`) but can never
    * override the validated `id`.
    */
-  async candidateInfo<T = OpaqueRecord>(candidateId: string, extra?: OpaqueRecord): Promise<AshbyResult<T>> {
+  async candidateInfo<T = OpaqueRecord>(
+    candidateId: string,
+    extra?: OpaqueRecord,
+    options: AshbyCallOptions = {},
+  ): Promise<AshbyResult<T>> {
     const id = validateId('candidate.info', 'candidateId', candidateId);
-    return this.request<T>('candidate.info', { ...(extra ?? {}), id });
+    return this.request<T>('candidate.info', { ...(extra ?? {}), id }, { deadlineAt: options.deadlineAt });
   }
 
   /**
@@ -584,6 +595,57 @@ export class AshbyClient {
     validateId('application.changeStage', 'interviewStageId', interviewStageId);
     // Mutation: not retried on ambiguous failure by default.
     return this.request<T>('application.changeStage', { applicationId, interviewStageId, ...(extra ?? {}) });
+  }
+
+  /**
+   * One page of the tenant's candidate tags. `includeArchived: false` is sent
+   * explicitly because Ashby documents no default for it. The endpoint's limit
+   * is 100, not the 500 the other list helpers allow. `deadlineAt` is internal
+   * and never part of the body.
+   */
+  async candidateTagList<T = OpaqueRecord[]>(params: CandidateTagListParams = {}): Promise<AshbyResult<T>> {
+    const body: OpaqueRecord = { includeArchived: false };
+    if (params.cursor !== undefined) body.cursor = validateId('candidateTag.list', 'cursor', params.cursor);
+    if (params.limit !== undefined) {
+      const limit = boundedInt(params.limit, 0, 1, 100);
+      if (limit === 0) throw new AshbyError('invalid_request', { code: 'invalid_limit', operation: 'candidateTag.list' });
+      body.limit = limit;
+    }
+    return this.request<T>('candidateTag.list', body, { deadlineAt: params.deadlineAt });
+  }
+
+  /**
+   * Add one tag to a candidate. The body is EXACTLY `{candidateId, tagId}`: the
+   * endpoint sets additionalProperties false, so there is no `extra`.
+   *
+   * `idempotent: true` is safe only because the one caller, the verdict-tag lane,
+   * reads candidate.info and writes the difference. Ashby documents no behaviour
+   * for a repeat, so a retried add after a lost response can only meet a tag the
+   * lane wanted there anyway.
+   */
+  async candidateAddTag<T = OpaqueRecord>(
+    candidateId: string,
+    tagId: string,
+    options: AshbyCallOptions = {},
+  ): Promise<AshbyResult<T>> {
+    const body: OpaqueRecord = {
+      candidateId: validateId('candidate.addTag', 'candidateId', candidateId),
+      tagId: validateId('candidate.addTag', 'tagId', tagId),
+    };
+    return this.request<T>('candidate.addTag', body, { idempotent: true, deadlineAt: options.deadlineAt });
+  }
+
+  /** Remove one tag from a candidate. Same body and retry reasoning as {@link candidateAddTag}. */
+  async candidateRemoveTag<T = OpaqueRecord>(
+    candidateId: string,
+    tagId: string,
+    options: AshbyCallOptions = {},
+  ): Promise<AshbyResult<T>> {
+    const body: OpaqueRecord = {
+      candidateId: validateId('candidate.removeTag', 'candidateId', candidateId),
+      tagId: validateId('candidate.removeTag', 'tagId', tagId),
+    };
+    return this.request<T>('candidate.removeTag', body, { idempotent: true, deadlineAt: options.deadlineAt });
   }
 
   // ── Cursor pagination helper (page/item caps + loop detection) ────────────

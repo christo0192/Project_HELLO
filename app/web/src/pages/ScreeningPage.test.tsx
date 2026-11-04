@@ -215,7 +215,7 @@ describe('ScreeningPage', () => {
 
     expect(await screen.findByText('Problem solving')).toBeInTheDocument();
     expect(screen.getByText('64')).toBeInTheDocument();
-    expect(screen.getByText('Hold')).toBeInTheDocument();
+    expect(screen.getByText('Borderline')).toBeInTheDocument();
     expect(screen.getByText('Good')).toBeInTheDocument();
   });
 

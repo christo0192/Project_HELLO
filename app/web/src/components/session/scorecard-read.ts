@@ -11,6 +11,7 @@
 import { isAssessmentV2, readScorecardAssessmentV2 } from '../../types';
 import type { Assessment, ScorecardAssessmentDisplay } from '../../types';
 import { humanizeEnum } from '../../lib/humanize';
+import { RECOMMENDATION_LABELS } from '../../lib/recommendation-labels';
 import type { StatusTone } from '../design';
 
 /**
@@ -33,15 +34,15 @@ export function finiteNumber(value: unknown): number | null {
 }
 
 const RECOMMENDATION: Record<string, { label: string; tone: StatusTone }> = {
-  advance: { label: 'Advance', tone: 'success' },
-  hold: { label: 'Hold', tone: 'warning' },
-  reject: { label: 'Reject', tone: 'danger' },
+  advance: { label: RECOMMENDATION_LABELS.advance, tone: 'success' },
+  hold: { label: RECOMMENDATION_LABELS.hold, tone: 'warning' },
+  reject: { label: RECOMMENDATION_LABELS.reject, tone: 'danger' },
   human_review: { label: 'Needs human review', tone: 'warning' },
 };
 
 /**
  * Words and tone for a recommendation. An unknown value is shown plainly
- * (humanized, neutral) rather than dressed up as "Hold": inventing a verdict
+ * (humanized, neutral) rather than dressed up as "Borderline": inventing a verdict
  * is worse than showing an unfamiliar one. Absent → null (no pill).
  */
 export function recommendationMeta(value: unknown): { label: string; tone: StatusTone } | null {

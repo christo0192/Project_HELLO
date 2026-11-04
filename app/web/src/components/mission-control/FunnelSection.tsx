@@ -105,7 +105,7 @@ export function FunnelSection() {
     { label: 'Parse failed', value: t.parse_failed },
     { label: 'Dropped at consent', value: t.consent_dropped },
     { label: 'Disqualified', value: t.disqualified },
-    { label: 'On hold', value: t.on_hold },
+    { label: 'Borderline', value: t.on_hold },
     { label: 'Human review', value: t.human_review },
   ];
 

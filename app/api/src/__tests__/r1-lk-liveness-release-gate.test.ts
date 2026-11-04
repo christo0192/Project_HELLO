@@ -436,9 +436,10 @@ describe('3. the merge gate for this PR is run by hand, and the record says so',
     // The gate record's "three queries" are the three checks this PR shipped,
     // still the first three lines and unchanged. 0130 (M017) appends six
     // checks for the functions it declares, then 0132 appends one for the
-    // raised fleet daily cap (phone-0132-daily-cap.test.ts), and nothing else
-    // follows them.
-    expect(checks).toHaveLength(3 + 6 + 1);
+    // raised fleet daily cap (phone-0132-daily-cap.test.ts), then 0134 (M027)
+    // appends five for the Ashby outbox functions it declares
+    // (ashby-recommendation-tag-migration.test.ts), and nothing else follows them.
+    expect(checks).toHaveLength(3 + 6 + 1 + 5);
     expect(checks.slice(0, 3).map((c) => c.trim())).toEqual([
       '"screening_v2.request_phone_rescreen(uuid,text,text,text,uuid,timestamptz)' +
         '|ensure_ashby_phone_engagement"',
@@ -454,6 +455,11 @@ describe('3. the merge gate for this PR is run by hand, and the record says so',
       'release_ashby_number_after_identity_mismatch',
       'verify_candidate_phone',
       'phone_max_daily_dials',
+      'enqueue_ashby_operation',
+      'claim_ashby_operation',
+      'enqueue_ashby_recommendation_tag',
+      'ashby_candidate_tag_verdict',
+      'backfill_ashby_recommendation_tags',
     ]);
     expect(DRIFT_SCRIPT).toContain('drift check could not query');
     expect(DRIFT_SCRIPT).toContain('drift check got no readable position');

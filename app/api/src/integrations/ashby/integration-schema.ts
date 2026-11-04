@@ -41,7 +41,7 @@ export const INGESTION_STATES = [
 ] as const;
 export type IngestionState = (typeof INGESTION_STATES)[number];
 
-export const OPERATION_TYPES = ['invite_delivery', 'scorecard_write', 'stage_move'] as const;
+export const OPERATION_TYPES = ['invite_delivery', 'scorecard_write', 'stage_move', 'recommendation_tag'] as const;
 export type OperationType = (typeof OPERATION_TYPES)[number];
 
 export const OPERATION_STATES = ['pending', 'running', 'succeeded', 'failed', 'blocked', 'cancelled'] as const;

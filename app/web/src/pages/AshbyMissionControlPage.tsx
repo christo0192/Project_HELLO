@@ -35,7 +35,8 @@ import type { ComboboxOption, StatusTone } from '../components/design';
 import { OverflowMenu } from '../components/design/OverflowMenu';
 import type { OverflowMenuItem } from '../components/design/OverflowMenu';
 import { humanizeEnum } from '../lib/humanize';
-import { ASHBY_ERROR_CODE_LABELS } from '../lib/ashby-labels';
+// A failed operation's sanitized code, in words (a `:suffix` falls back to its prefix).
+import { ashbyErrorCodeLabel } from '../lib/ashby-labels';
 import { intakeTypeLabel, PROFILE_OUTCOME_LABELS } from '../components/talent/ResumeReviewBadge';
 import {
   isBrowserScreeningRetired,
@@ -160,7 +161,18 @@ const OPERATION_LABELS: Record<string, string> = {
   invite_delivery: 'Invite',
   scorecard_write: 'Scorecard write-back',
   stage_move: 'Stage move',
+  recommendation_tag: 'Christy tag',
 };
+/**
+ * A failed operation's Retry button, named for WHICH retry. The rest lower-case
+ * the row label ("Retry stage move"); Christy is a name, so it keeps its capital.
+ */
+const OPERATION_RETRY_NAMES: Record<string, string> = {
+  recommendation_tag: 'Retry Christy tag',
+};
+function retryName(operationType: string, label: string): string {
+  return OPERATION_RETRY_NAMES[operationType] ?? `Retry ${label.toLowerCase()}`;
+}
 const OPERATION_STATE_LABELS: Record<string, string> = {
   pending: 'Pending',
   running: 'In progress',
@@ -169,9 +181,6 @@ const OPERATION_STATE_LABELS: Record<string, string> = {
   blocked: 'Blocked',
   cancelled: 'Cancelled',
 };
-/** A failed operation's sanitized code; `humanizeEnum` covers the rest. */
-const ERROR_CODE_LABELS = ASHBY_ERROR_CODE_LABELS;
-
 /** Above this many rows the workflow list scrolls instead of running down the page. */
 const WORKFLOW_SCROLL_AFTER = 6;
 /**
@@ -1240,14 +1249,14 @@ export function AshbyMissionControlPage() {
                           className={failed ? 'text-error-text' : undefined}
                         >
                           {type}: {humanizeEnum(op.state, OPERATION_STATE_LABELS)}
-                          {op.errorCode ? ` (${humanizeEnum(op.errorCode, ERROR_CODE_LABELS)})` : ''}
+                          {op.errorCode ? ` (${ashbyErrorCodeLabel(op.errorCode)})` : ''}
                         </span>
                         {failed && (
                           <Button
                             className={TOUCH}
                             disabled={busy}
                             // Starts with the visible word; says WHICH retry.
-                            aria-label={`Retry ${type.toLowerCase()}`}
+                            aria-label={retryName(op.type, type)}
                             onClick={() => run(() => api.retryAshbyOperation(op.id))}
                           >
                             Retry

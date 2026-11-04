@@ -364,13 +364,13 @@ describe('settings draft', () => {
     expect(errors[key as keyof typeof errors]).toBeTruthy();
   });
 
-  it('rejects a hold threshold above the advance threshold, naming the hold field', () => {
+  it('rejects a Borderline score above the Select score, naming the hold_threshold field', () => {
     const errors = validateSettingsDraft({
       ...draftFromSettings(SETTINGS),
       advance_threshold: '40',
       hold_threshold: '45',
     });
-    expect(errors.hold_threshold).toMatch(/cannot be above/);
+    expect(errors.hold_threshold).toBe('The Borderline score cannot be above the Select score.');
     expect(errors.advance_threshold).toBeUndefined();
   });
 

@@ -208,6 +208,53 @@ describe('AshbyMissionControlPage', () => {
     expect(text).not.toMatch(/bearer|presigned|invite_token|resume_url|https?:\/\//i);
   });
 
+  it('words a suffixed error code by its prefix, with the exact code on hover', async () => {
+    // The tag lane appends Ashby's sanitized endpoint code to its refusal.
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{
+        ...WORKFLOWS.workflows[0],
+        operations: [{ id: 'op9', type: 'recommendation_tag', state: 'failed', errorCode: 'ashby_tag_write_rejected:tag_refused' }],
+      }],
+    });
+    renderPage();
+    const row = await screen.findByText(/^Christy tag: Failed/);
+    expect(row).toHaveTextContent('Christy tag: Failed (Ashby refused the tag change)');
+    expect(row).toHaveAttribute('title', 'recommendation_tag: failed (ashby_tag_write_rejected:tag_refused)');
+    expect(screen.queryByText(/tag_refused\)?$/)).toBeNull();
+  });
+
+  it('a tag that failed after its wait ran out says the cause and offers Retry, never "will retry"', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{
+        ...WORKFLOWS.workflows[0],
+        operations: [{ id: 'op7', type: 'recommendation_tag', state: 'failed', errorCode: 'ashby_tag_transient' }],
+      }],
+    });
+    renderPage();
+    const row = await screen.findByText(/^Christy tag: Failed/);
+    expect(row).toHaveTextContent('Christy tag: Failed (Ashby was unavailable)');
+    expect(row.textContent).not.toMatch(/will retry|will re-check/i);
+    // The accessible name keeps the persona's capital, as the visible row does.
+    await userEvent.click(screen.getByRole('button', { name: 'Retry Christy tag' }));
+    await waitFor(() => expect(retryAshbyOperation).toHaveBeenCalledWith('op7'));
+  });
+
+  it('a waiting tag shows the same cause beside Pending, with no Retry', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{
+        ...WORKFLOWS.workflows[0],
+        operations: [{ id: 'op8', type: 'recommendation_tag', state: 'pending', errorCode: 'operation_error' }],
+      }],
+    });
+    renderPage();
+    const row = await screen.findByText(/^Christy tag: Pending/);
+    expect(row).toHaveTextContent('Christy tag: Pending (Unexpected error)');
+    expect(screen.queryByRole('button', { name: /^Retry/ })).toBeNull();
+  });
+
   it('pauses an enabled mapping and reloads', async () => {
     renderPage();
     await screen.findByText('Account Executive');

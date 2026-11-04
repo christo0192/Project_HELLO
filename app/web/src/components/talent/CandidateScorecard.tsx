@@ -45,6 +45,7 @@ import type { Assessment, Recommendation } from '../../types';
 import { Meter, SurfaceCard, Tag } from '../design/candidate';
 import { cx } from '../design/cx';
 import { humanizeEnum } from '../../lib/humanize';
+import { RECOMMENDATION_LABELS } from '../../lib/recommendation-labels';
 
 /** Fixed rubric weights — the same values the legacy card printed. */
 export const SECTION_WEIGHTS = {
@@ -54,11 +55,7 @@ export const SECTION_WEIGHTS = {
   role_fit: '20%',
 } as const;
 
-const RECOMMENDATION_LABEL: Record<Recommendation, string> = {
-  advance: 'Advance',
-  hold: 'Hold',
-  reject: 'Reject',
-};
+const RECOMMENDATION_LABEL: Readonly<Record<Recommendation, string>> = RECOMMENDATION_LABELS;
 
 const RECOMMENDATION_TONE: Record<Recommendation, 'positive' | 'caution' | 'negative'> = {
   advance: 'positive',
@@ -322,8 +319,17 @@ export function CandidateScorecard({
   const english = communication?.english_proficiency ?? assessment.english;
   const motivation = assessment.motivation ?? raw.motivation;
 
-  const recoLabel = RECOMMENDATION_LABEL[recommendation] ?? RECOMMENDATION_LABEL.hold;
-  const recoTone = RECOMMENDATION_TONE[recommendation] ?? RECOMMENDATION_TONE.hold;
+  // As the legacy card does (recommendationMeta): a value this card does not
+  // know is shown plainly and neutral, and none (NULL is how human_review is
+  // stored) shows no verdict at all. Never "Borderline" by default: that word is
+  // also an Ashby tag, and a result with no verdict gets no Christy tag.
+  const known = Object.prototype.hasOwnProperty.call(RECOMMENDATION_LABEL, recommendation ?? '');
+  const recoLabel: string | null = known
+    ? RECOMMENDATION_LABEL[recommendation]
+    : typeof recommendation === 'string' && recommendation.trim()
+      ? humanizeEnum(recommendation)
+      : null;
+  const recoTone = known ? RECOMMENDATION_TONE[recommendation] : 'neutral';
   const roundedOverall = Math.round(overall_score);
 
   const hasSignalBlocks =
@@ -343,9 +349,11 @@ export function CandidateScorecard({
             </span>
             <span className="text-sm text-[var(--c-ink-secondary)]">/ 100</span>
           </div>
-          <Tag tone={recoTone} srPrefix="Recommendation:" className="px-3 py-1 text-sm">
-            {recoLabel}
-          </Tag>
+          {recoLabel && (
+            <Tag tone={recoTone} srPrefix="Recommendation:" className="px-3 py-1 text-sm">
+              {recoLabel}
+            </Tag>
+          )}
         </div>
 
         <div className="mt-3">

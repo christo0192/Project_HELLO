@@ -37,10 +37,25 @@ makes **no** claim of tenant validation or live Ashby connectivity.
 
 ## Endpoints (for tenant probing only)
 
-`application.info`, `application.list`, `candidate.info`, `file.info`,
-`jobInterviewPlan.info`, `feedbackFormDefinition.info`, `job.list`,
-`applicationFeedback.list`, `applicationFeedbackRequest.create`,
-`applicationFeedback.submit`, and `application.changeStage`.
+`application.info`, `application.list`, `application.listHistory`,
+`candidate.info`, `file.info`, `jobInterviewPlan.info`,
+`feedbackFormDefinition.info`, `job.list`, `applicationFeedback.list`,
+`applicationFeedbackRequest.create`, `applicationFeedback.submit`,
+`application.changeStage`, `candidateTag.list`, `candidate.addTag`, and
+`candidate.removeTag`.
+
+`candidateTag.list` (read; needs `hiringProcessMetadataRead`), `candidate.addTag`
+and `candidate.removeTag` (mutations; need `candidatesWrite`) serve the Christy
+verdict tag lane (`recommendation-tags.ts`, runbook
+`ashby-runtime-activation.md` §11). `candidateTagList` sends
+`includeArchived: false` explicitly and bounds `limit` to 1..100, the endpoint's
+maximum. The two write helpers send a body of exactly `{candidateId, tagId}`, with
+no `extra`, because the endpoints set additionalProperties false. They pass
+`{ idempotent: true }`, which is safe only because the one caller reads
+`candidate.info` before it writes. None of the three is a probe read. These three,
+`candidateInfo` and `applicationInfo` also take an internal `deadlineAt` (never
+sent to Ashby): the lane passes its run's deadline, so a call's timeout, retries and
+`Retry-After` waits all end before the operation's lease does.
 
 `job.list` (read; needs the `jobsRead` permission) is the job directory behind
 the Mission Control "Add mapping" picker (`GET …/mission-control/jobs`). The

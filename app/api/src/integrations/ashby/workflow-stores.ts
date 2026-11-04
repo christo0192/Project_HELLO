@@ -20,6 +20,8 @@ import type {
   AshbyCandidateProfileResult,
   AshbyIntakeType,
   AshbyProfileOutcome,
+  RecommendationTagLink,
+  RecommendationTagSource,
 } from './orchestration.js';
 import type { AshbyLinkLookup } from './completion-observer.js';
 import { projectProfileOutcome } from './candidate-workflow.js';
@@ -31,6 +33,7 @@ import {
 } from './scorecard-v2-adapter.js';
 import { parseEvidenceGrade, readAssessmentEvidenceGrade } from '../../lib/scorecards/evidence.js';
 import { toCandidateColumns } from '../../lib/candidate-phone.js';
+import { recommendationTagsEnabled } from './recommendation-tags.js';
 
 /**
  * The assessment columns BOTH scorecard build sites read. One list, so the
@@ -355,6 +358,8 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         maxAttempts: typeof row?.max_attempts === 'number' ? row.max_attempts : 5,
         marker: typeof row?.marker === 'string' ? row.marker : null,
         sourceSessionId: typeof row?.source_session_id === 'string' ? row.source_session_id : null,
+        createdAt: typeof row?.created_at === 'string' ? row.created_at : null,
+        ageAnchor: typeof row?.age_anchor === 'string' ? row.age_anchor : null,
       };
     },
     async readIngestion(
@@ -413,6 +418,53 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         return null;
       }
       return { ...source, evidenceGrade };
+    },
+    /**
+     * The tag lane's link read: the two Ashby ids, nothing else. Any read
+     * failure answers null, which the lane treats as a wait, not a failure.
+     */
+    async readRecommendationTagLink(applicationLinkId): Promise<RecommendationTagLink | null> {
+      const { data, error } = await client
+        .from('ashby_application_links')
+        .select('external_application_id, external_candidate_id')
+        .eq('provider', 'ashby')
+        .eq('id', applicationLinkId)
+        .maybeSingle();
+      if (error || !data) return null;
+      const r = data as unknown as Record<string, unknown>;
+      const nonEmpty = (v: unknown): string | null => (typeof v === 'string' && v.length > 0 ? v : null);
+      return {
+        externalCandidateId: nonEmpty(r.external_candidate_id),
+        externalApplicationId: nonEmpty(r.external_application_id),
+      };
+    },
+    /**
+     * The candidate's authoritative verdict, decided by the 0134 RPC across every
+     * link of the candidate. The verdict is the RAW column and nothing else:
+     * `scorecardSourceFromAssessmentRow` and `buildScorecard` both turn a missing
+     * verdict into `hold`, which would tag a candidate Borderline for a result
+     * that has no verdict at all. Any read failure, or an answer that is neither
+     * `ok` nor `no_assessment`, is null: the lane waits and reads again.
+     */
+    async readRecommendationTagSource(
+      applicationLinkId,
+      externalCandidateId,
+    ): Promise<RecommendationTagSource | null> {
+      const { data, error } = await client.rpc('ashby_candidate_tag_verdict', {
+        p_application_link_id: applicationLinkId,
+        p_external_candidate_id: externalCandidateId,
+      });
+      if (error || !data || typeof data !== 'object') return null;
+      const r = data as Record<string, unknown>;
+      if (r.status === 'no_assessment') {
+        return { status: 'no_assessment', recommendation: null, evidenceGrade: null };
+      }
+      if (r.status !== 'ok') return null;
+      return {
+        status: 'ok',
+        recommendation: r.recommendation ?? null,
+        evidenceGrade: parseEvidenceGrade(r.evidence_grade),
+      };
     },
     async readLink(applicationLinkId): Promise<WorkflowLinkRow | null> {
       const { data, error } = await client
@@ -672,6 +724,21 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       });
       if (result.error) throw new Error('ashby_scorecard_enqueue_error');
       return { status: statusOf(result.data) };
+    },
+    async enqueueRecommendationTag(applicationLinkId, sessionId): Promise<{ status: string }> {
+      // Kill switch: off means no operation is created. Ones already pending
+      // wait, and the lane picks them up when the switch comes back on.
+      if (!recommendationTagsEnabled()) return { status: 'disabled' };
+      // Every decision (terminal link, mapping, session ownership, newest
+      // assessment, the per-revision key) is the RPC's.
+      const { data, error } = await client.rpc('enqueue_ashby_recommendation_tag', {
+        p_application_link_id: applicationLinkId,
+        p_session_id: sessionId,
+        p_actor_id: actorId,
+        p_now: new Date().toISOString(),
+      });
+      if (error) throw new Error('ashby_recommendation_tag_enqueue_error');
+      return { status: statusOf(data) };
     },
   };
 }

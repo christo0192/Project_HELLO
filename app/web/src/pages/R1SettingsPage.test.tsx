@@ -111,8 +111,8 @@ describe('what the form shows', () => {
     expect(toggle('Automatic status changes')).toHaveAttribute('aria-checked', 'false');
     expect(field('Monthly cap (minutes)')).toHaveValue('4000');
     expect(field('Pause line (minutes)')).toHaveValue('4000');
-    expect(field('Advance threshold')).toHaveValue('65');
-    expect(field('Hold threshold')).toHaveValue('45');
+    expect(field('Score for Select')).toHaveValue('65');
+    expect(field('Score for Borderline')).toHaveValue('45');
     expect(screen.getByText(/Last saved/)).toBeInTheDocument();
   });
 
@@ -286,8 +286,8 @@ describe('editing', () => {
     await loaded();
     await user.clear(field('Monthly cap (minutes)'));
     await user.type(field('Monthly cap (minutes)'), '3000');
-    await user.clear(field('Advance threshold'));
-    await user.type(field('Advance threshold'), '70.5');
+    await user.clear(field('Score for Select'));
+    await user.type(field('Score for Select'), '70.5');
     await user.click(toggle('Paused'));
     await user.click(save());
 
@@ -311,8 +311,8 @@ describe('editing', () => {
     const user = userEvent.setup();
     renderPage();
     await loaded();
-    await user.clear(field('Hold threshold'));
-    await user.type(field('Hold threshold'), '40{Enter}');
+    await user.clear(field('Score for Borderline'));
+    await user.type(field('Score for Borderline'), '40{Enter}');
     await waitFor(() => expect(api.updateR1Settings).toHaveBeenCalledWith({ hold_threshold: 40 }));
   });
 
@@ -339,8 +339,8 @@ describe('editing', () => {
       'Monthly cap (minutes)',
       'Pause line (minutes)',
       'Interviews at the same time',
-      'Advance threshold',
-      'Hold threshold',
+      'Score for Select',
+      'Score for Borderline',
       'Automatic status changes',
       'New reading (minutes)',
     ]);
@@ -370,26 +370,41 @@ describe('validation', () => {
     const user = userEvent.setup();
     renderPage();
     await loaded();
-    await user.clear(field('Hold threshold'));
-    await user.type(field('Hold threshold'), '999');
+    await user.clear(field('Score for Borderline'));
+    await user.type(field('Score for Borderline'), '999');
     await user.clear(field('Pause line (minutes)'));
     await user.click(save());
     expect(field('Pause line (minutes)')).toHaveFocus();
     expect(screen.getAllByRole('alert')).toHaveLength(2);
   });
 
-  it('refuses a hold threshold above the advance threshold, naming the hold field', async () => {
+  it('refuses a Borderline score above the Select score, naming the Borderline field', async () => {
     const user = userEvent.setup();
     renderPage();
     await loaded();
-    await user.clear(field('Advance threshold'));
-    await user.type(field('Advance threshold'), '40');
+    await user.clear(field('Score for Select'));
+    await user.type(field('Score for Select'), '40');
     await user.click(save());
     expect(api.updateR1Settings).not.toHaveBeenCalled();
-    expect(field('Hold threshold')).toHaveFocus();
+    expect(field('Score for Borderline')).toHaveFocus();
     expect(
-      screen.getByText('The hold threshold cannot be above the advance threshold.'),
+      screen.getByText('The Borderline score cannot be above the Select score.'),
     ).toBeInTheDocument();
+  });
+
+  it('words the scoring section as Select and Borderline', async () => {
+    renderPage();
+    await loaded();
+    expect(
+      screen.getByText(
+        'Scores run from 0 to 100. At or above the Select score the recommendation is Select; at or ' +
+          'above the Borderline score it is Borderline; below that it is Reject.',
+      ),
+    ).toBeInTheDocument();
+    expect(screen.getByText('Default 45. Cannot be above the Select score.')).toBeInTheDocument();
+    // The field ids the API draft binds to stay on the stored names.
+    expect(field('Score for Select')).toHaveAttribute('id', 'r1-advance-threshold');
+    expect(field('Score for Borderline')).toHaveAttribute('id', 'r1-hold-threshold');
   });
 
   it('clears a field’s error as soon as it is edited', async () => {
@@ -796,8 +811,8 @@ describe('the dashboard reading', () => {
       expect(screen.getByRole('button', { name: 'Discard changes' })).toBeDisabled();
 
       // A later, unrelated edit sends only that edit: the pause is left alone.
-      await user.clear(field('Hold threshold'));
-      await user.type(field('Hold threshold'), '40');
+      await user.clear(field('Score for Borderline'));
+      await user.type(field('Score for Borderline'), '40');
       await user.click(save());
       await waitFor(() => expect(api.updateR1Settings).toHaveBeenCalledTimes(2));
       expect(api.updateR1Settings).toHaveBeenLastCalledWith({ hold_threshold: 40 });
@@ -808,14 +823,14 @@ describe('the dashboard reading', () => {
       const user = userEvent.setup();
       renderPage();
       await loaded();
-      await user.clear(field('Advance threshold'));
-      await user.type(field('Advance threshold'), '70');
+      await user.clear(field('Score for Select'));
+      await user.type(field('Score for Select'), '70');
 
       await user.type(field('New reading (minutes)'), '99');
       await user.click(screen.getByRole('button', { name: 'Record reading' }));
       await screen.findByText('Dashboard reading recorded.');
 
-      expect(field('Advance threshold')).toHaveValue('70');
+      expect(field('Score for Select')).toHaveValue('70');
       expect(field('Monthly cap (minutes)')).toHaveValue('3000');
       expect(toggle('Paused')).toHaveAttribute('aria-checked', 'true');
       await user.click(save());
@@ -883,7 +898,7 @@ describe('accessibility', () => {
     const { container } = renderPage();
     await loaded();
     await user.clear(field('Monthly cap (minutes)'));
-    await user.clear(field('Hold threshold'));
+    await user.clear(field('Score for Borderline'));
     await user.click(save());
     await screen.findAllByRole('alert');
     await expect(container).toHaveNoViolations();
