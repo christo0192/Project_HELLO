@@ -29,9 +29,9 @@
 # engagements before the candidate; no earlier body contains its
 # `for update of e`.
 #
-# 0132 re-declares phone_max_daily_dials() to return 250 instead of 0094's 50.
-# No earlier body contains `select 250`, so its presence proves production
-# runs the raised fleet daily cap.
+# 0135 re-declares phone_max_daily_dials() to return 500 (0132: 250, 0094: 50).
+# No earlier body contains `select 500`, so its presence proves production
+# runs the raised fleet daily cap. A later cap migration REPLACES this line.
 #
 # It issues SELECTs only (pg_get_functiondef). No PII is queried or printed.
 #
@@ -57,7 +57,7 @@ CHECKS=(
   "screening_v2.claim_ashby_profile_due(integer,integer,integer,integer,timestamptz)|profile_attempts"
   "screening_v2.release_ashby_number_after_identity_mismatch(uuid,timestamptz)|identity_unconfirmed"
   "screening_v2.verify_candidate_phone(uuid,text,uuid,timestamptz)|for update of e"
-  "screening_v2.phone_max_daily_dials()|select 250"
+  "screening_v2.phone_max_daily_dials()|select 500"
 )
 
 if [ -n "${SUPABASE_DB_URL:-}" ]; then
