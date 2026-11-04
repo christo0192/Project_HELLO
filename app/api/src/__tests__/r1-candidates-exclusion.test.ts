@@ -176,7 +176,8 @@ describe('GET /api/candidates: R1 assessments are not the latest assessment', ()
     });
     const res = await request(app()).get('/api/candidates').set('Authorization', AUTH);
     expect(res.status).toBe(503);
-    expect(rangeCalls).toHaveLength(50);
+    // The R1 lookup stops at its bound. (The candidates read pages too, M026.)
+    expect(rangeCalls.filter((c) => c.table === 'call_sessions')).toHaveLength(50);
   });
 
   it('does not query call_sessions when there are no assessments', async () => {

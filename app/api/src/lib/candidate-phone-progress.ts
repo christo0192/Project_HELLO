@@ -31,6 +31,7 @@
  */
 
 import { supabase } from './supabase.js';
+import { mapChunks } from './id-batches.js';
 
 /** At most this many candidate ids per `in (...)` query. */
 export const PHONE_PROGRESS_CHUNK_SIZE = 100;
@@ -356,8 +357,11 @@ export async function loadPhoneProgress(candidateIds: readonly string[]): Promis
   const out = new Map<string, PhoneProgress>();
   if (ids.length === 0) return out;
   try {
-    const results = await Promise.all(chunkIds(ids).map((chunk) => loadChunk(chunk)));
-    for (const m of results) for (const [id, p] of m) out.set(id, p);
+    // Bounded like every other id-batch read on the list route (M026): at
+    // 5,000 candidates an unbounded Promise.all would put 50 reads in flight
+    // at once for one request.
+    const results = await mapChunks(chunkIds(ids), (chunk) => loadChunk(chunk));
+    for (const m of results) if (m) for (const [id, p] of m) out.set(id, p);
   } catch {
     for (const id of ids) out.set(id, { ...PHONE_PROGRESS_UNKNOWN });
   }
