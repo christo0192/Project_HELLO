@@ -24,23 +24,51 @@
  * --------------------
  * Every failure mode — directory missing, file missing, unreadable, truncated,
  * wrong magic, non-numeric build time, implausible build time, or older than
- * the configured maximum — resolves to `fresh: false` with a stable snake_case
- * reason code. There is no path through this module that reports freshness it
- * did not positively prove.
+ * the configured maximum without upstream evidence — resolves to `fresh: false`
+ * with a stable snake_case reason code. There is no path through this module
+ * that reports freshness it did not positively establish.
+ *
+ * A LATE RELEASE IS NOT A STALE DATABASE
+ * --------------------------------------
+ * The ceiling asks "is this machine keeping up?", and age alone cannot always
+ * answer that. ClamAV builds `daily` about once a day, so a ceiling of 24 h has
+ * no margin at all: when a release ran late on 2026-11-04, a machine holding the
+ * newest database in existence crossed the ceiling and stopped all resume
+ * ingestion. Refusing protected nothing, because nothing newer existed.
+ *
+ * So a database past the ceiling is still accepted, up to a hard limit, when the
+ * local `daily` version is at or above the version the publisher advertises. The
+ * evidence is that comparison, and deliberately not the updater's own report:
+ * freshclam exits 0 on a CDN cool-down too, so "the updater succeeded" would pass
+ * a rate-limited machine that is falling further behind. If the publisher has
+ * moved on, or the evidence is absent or old, the ceiling holds.
+ *
+ * TRUST ASSUMPTION. The advertised version comes from plain DNS, which nothing
+ * here authenticates. A forged record with a low version and a current time makes
+ * the local database look current, up to the hard limit and no further. That is
+ * the same record freshclam itself trusts when deciding whether to download, so a
+ * forged answer already stops updates today. Databases stay signed either way;
+ * what a forger gains is holding this machine on the signatures it has.
  *
  * WHICH DATABASE DECIDES AGE
  * --------------------------
  * `main` is republished roughly yearly (a legitimately current install can
  * carry a `main.cvd` eight months old) and `bytecode` almost as rarely, so
  * judging age on them would fail closed forever. `daily` is the database
- * freshclam actually refreshes many times a day, and it is what ClamAV's own
- * staleness warning is computed from — so `daily` sets the age. `main` is still
+ * that moves, about once a day, and it is what ClamAV's own staleness warning
+ * is computed from — so `daily` sets the age. `main` is still
  * required to be PRESENT and parseable: a database directory without it cannot
  * screen anything.
  */
 
 import { open } from 'node:fs/promises';
 import { join } from 'node:path';
+
+import {
+  readAvUpstreamEvidence,
+  resolveAvUpdaterStatusFile,
+  type AvUpstreamEvidence,
+} from './av-updater.js';
 
 // Keep the env names visible to the env-contract checker, which scans for
 // `process.env.<VAR>` literals. Functional reads go through the injectable
@@ -55,15 +83,40 @@ void _contractVisibleEnvReads;
 export const DEFAULT_DB_DIR = '/var/lib/clamav';
 
 /**
- * Conservative default maximum age for the `daily` database.
+ * Conservative default maximum age for a `daily` database that has no upstream
+ * proof behind it.
  *
- * ClamAV itself only warns at 7 days. freshclam's stock cadence is 24 checks a
- * day, and this deployment refreshes hourly, so a 24-hour ceiling is met with
- * an enormous margin in normal operation while still rejecting a database that
- * has genuinely stopped updating. It is deliberately far stricter than the
- * upstream warning threshold.
+ * ClamAV itself only warns at 7 days. This deployment checks hourly, but ClamAV
+ * publishes `daily` only about once a day, so a healthy machine can legitimately
+ * reach this ceiling whenever a release runs late. That case is covered by the
+ * upstream proof below. It is deliberately far stricter than the upstream
+ * warning threshold.
  */
 export const DEFAULT_MAX_DB_AGE_HOURS = 24;
+
+/**
+ * The hard limit for a database the publisher still advertises as its newest. Past
+ * ClamAV's own 7-day warning, a silent publisher is an incident for a person to
+ * look at, and no evidence extends it.
+ */
+export const UPSTREAM_CONFIRMED_MAX_DB_AGE_HOURS = 168;
+
+/**
+ * How old a lookup may be and still count. The updater looks about hourly, so
+ * this survives one missed lookup outright. The third lookup after a good one
+ * lands just after this expires, because each cycle also includes its own run time.
+ */
+export const UPSTREAM_EVIDENCE_MAX_AGE_SEC = 3 * 3600;
+
+/**
+ * How old the DNS record may have been when it was read. A record that has
+ * stopped being regenerated says nothing about today's releases. Matches
+ * freshclam's own `DNS_WARNING_THRESHOLD_HOURS`.
+ */
+export const UPSTREAM_RECORD_MAX_AGE_SEC = 12 * 3600;
+
+/** Allowance for publisher and host clocks when reading the evidence's instants. */
+const UPSTREAM_CLOCK_SKEW_MS = 3_600_000;
 
 /** Bounds applied to `RESUME_SCANNER_MAX_DB_AGE_HOURS`. */
 export const MAX_DB_AGE_HOURS_BOUNDS = { def: DEFAULT_MAX_DB_AGE_HOURS, min: 1, max: 168 } as const;
@@ -113,10 +166,15 @@ export interface SignatureState {
   maxAgeSec: number;
   /** Stable reason code when not fresh; null when fresh. */
   reason: SignatureReason | null;
+  /**
+   * Present only when `fresh` rests on upstream evidence and not on age: the
+   * database is past the normal ceiling, and at or above the advertised version.
+   */
+  upstreamConfirmed?: true;
 }
 
-/** Parsed CVD/CLD header. `version` is retained for diagnostics only — it is
- *  never exposed on any health or API surface. */
+/** Parsed CVD/CLD header. `version` is compared with the publisher's advertised
+ *  version, and is never exposed on any health or API surface. */
 export interface CvdHeader {
   buildTimeMs: number;
   version: number;
@@ -174,6 +232,8 @@ export interface SignatureReaderOptions {
   maxAgeSec?: number;
   /** Env map (injectable for tests). */
   source?: NodeJS.ProcessEnv;
+  /** Upstream evidence. Defaults to the supervisor's status file. */
+  upstream?: () => Promise<AvUpstreamEvidence | null>;
 }
 
 export function resolveDbDir(opts: SignatureReaderOptions = {}): string {
@@ -243,6 +303,35 @@ async function readDatabase(dbDir: string, name: string, nowMs: number): Promise
   return { ok: false, reason: 'signatures_missing' };
 }
 
+/** Whether this evidence shows the local `daily` is the newest published. */
+function upstreamConfirmsLocal(
+  localVersion: number,
+  evidence: AvUpstreamEvidence,
+  nowMs: number,
+): boolean {
+  const checkedAtMs = Date.parse(evidence.checked_at);
+  const recordAtMs = Date.parse(evidence.record_at);
+  if (!Number.isFinite(checkedAtMs) || !Number.isFinite(recordAtMs)) return false;
+  // The read has to be recent…
+  if (nowMs - checkedAtMs > UPSTREAM_EVIDENCE_MAX_AGE_SEC * 1000) return false;
+  if (checkedAtMs - nowMs > UPSTREAM_CLOCK_SKEW_MS) return false;
+  // …and what it read has to have been current at the time.
+  if (checkedAtMs - recordAtMs > UPSTREAM_RECORD_MAX_AGE_SEC * 1000) return false;
+  if (recordAtMs - checkedAtMs > UPSTREAM_CLOCK_SKEW_MS) return false;
+  return localVersion >= evidence.daily_version;
+}
+
+async function readUpstreamEvidence(opts: SignatureReaderOptions): Promise<AvUpstreamEvidence | null> {
+  const read = opts.upstream
+    ?? (() => readAvUpstreamEvidence(resolveAvUpdaterStatusFile(opts.source ?? process.env)));
+  try {
+    return await read();
+  } catch {
+    // An absence of evidence: the ceiling applies, the database is not unreadable.
+    return null;
+  }
+}
+
 /**
  * Read the current signature state. Never throws: any unexpected failure
  * resolves to a not-fresh verdict.
@@ -256,6 +345,7 @@ export async function readSignatureState(
 
   try {
     let ageSec: number | null = null;
+    let dailyVersion: number | null = null;
 
     for (const name of REQUIRED_DATABASES) {
       const found = await readDatabase(dbDir, name, nowMs);
@@ -271,6 +361,7 @@ export async function readSignatureState(
       }
       if (name === AGE_DATABASE) {
         ageSec = Math.max(0, Math.floor((nowMs - found.header.buildTimeMs) / 1000));
+        dailyVersion = found.header.version;
       }
     }
 
@@ -279,6 +370,13 @@ export async function readSignatureState(
       return { fresh: false, ageSec: null, maxAgeSec, reason: 'signatures_missing' };
     }
     if (ageSec > maxAgeSec) {
+      const hardMaxSec = UPSTREAM_CONFIRMED_MAX_DB_AGE_HOURS * 3600;
+      if (ageSec <= hardMaxSec && dailyVersion !== null) {
+        const evidence = await readUpstreamEvidence(opts);
+        if (evidence !== null && upstreamConfirmsLocal(dailyVersion, evidence, nowMs)) {
+          return { fresh: true, ageSec, maxAgeSec: hardMaxSec, reason: null, upstreamConfirmed: true };
+        }
+      }
       return { fresh: false, ageSec, maxAgeSec, reason: 'signatures_stale' };
     }
     return { fresh: true, ageSec, maxAgeSec, reason: null };
@@ -295,10 +393,10 @@ export type SignatureFreshnessReader = () => Promise<SignatureState>;
  *
  * The scan path and the health surface both need this on every request, and a
  * database directory does not change meaningfully inside a few seconds. The TTL
- * is short enough that a completed update becomes visible promptly — and note
- * that the only transition the cache can delay is not-fresh → fresh, which is
- * the safe direction: a cached verdict can never let a stale database through
- * that a live read would have caught, because staleness only grows with time.
+ * is short enough that a completed update becomes visible promptly. A cached
+ * verdict can outlive the moment a database crossed a ceiling or its upstream
+ * evidence expired, by at most this TTL. Both limits are hours wide, so that
+ * is not a meaningful extension of either.
  */
 export function createSignatureFreshnessReader(
   opts: SignatureReaderOptions & { ttlMs?: number; now?: () => number } = {},

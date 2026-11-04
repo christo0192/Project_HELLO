@@ -36,6 +36,7 @@ import { ASHBY_SIGNAL_QUEUE, ASHBY_IMPORT_QUEUE } from './signal-worker.js';
 import { ASHBY_INGESTION_QUEUE, ASHBY_PROFILE_QUEUE } from './runtime-workers.js';
 import { DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
 import {
+  UPSTREAM_EVIDENCE_MAX_AGE_SEC,
   defaultSignatureFreshnessReader,
   type SignatureFreshnessReader,
 } from '../../lib/clamav-signatures.js';
@@ -625,6 +626,12 @@ export interface ScannerHealthView {
   /** Stable reason code when not ready; null when ready. */
   reason: string | null;
   /**
+   * Present only when the database is past the normal ceiling and accepted
+   * because it is at or above the version the publisher advertises. `maxAgeSec`
+   * is then the hard limit that verdict was measured against.
+   */
+  upstreamConfirmed?: true;
+  /**
    * 0114 (C10c). The signature updater's state, as the container supervisor
    * last published it (`AV_UPDATER_STATUS_FILE`). PRESENT only when a status
    * document was read and validated — absent on a machine with no supervisor
@@ -632,10 +639,13 @@ export interface ScannerHealthView {
    */
   updater?: ScannerUpdaterView;
   /**
-   * 0114 (C10c). WARNING-ONLY reason codes: `scanner_updater_failing` and
-   * `scanner_signatures_aging`. They never degrade the verdict (the scanner
-   * is already fail-closed on its own freshness ceiling); they exist to warn
-   * hours BEFORE that ceiling is reached. Present only when non-empty.
+   * 0114 (C10c). WARNING-ONLY reason codes: `scanner_updater_failing`,
+   * `scanner_signatures_aging`, `scanner_upstream_late` and
+   * `scanner_upstream_unverified`. They never degrade the verdict (the scanner
+   * is already fail-closed on its own freshness rules); they exist to warn hours
+   * BEFORE ingestion stops, that the publisher itself is late, or that a late
+   * release WOULD stop ingestion because the upstream evidence is missing.
+   * Present only when non-empty.
    */
   warnings?: string[];
 }
@@ -650,11 +660,22 @@ export interface ScannerUpdaterView {
 }
 
 /** The warning-only scanner reasons (0114, C10c). */
-export const SCANNER_WARNING_REASONS = ['scanner_updater_failing', 'scanner_signatures_aging'] as const;
+export const SCANNER_WARNING_REASONS = [
+  'scanner_updater_failing',
+  'scanner_signatures_aging',
+  'scanner_upstream_late',
+  'scanner_upstream_unverified',
+] as const;
 export type ScannerWarningReason = (typeof SCANNER_WARNING_REASONS)[number];
 
 /** Reads the supervisor's updater status; null when there is none. */
 export type ScannerUpdaterStatusReader = () => Promise<AvUpdaterStatus | null>;
+
+/** Whether the supervisor currently holds no upstream evidence that would count. */
+function upstreamUnverified(status: AvUpdaterStatus, nowMs: number): boolean {
+  if (!status.upstream) return true;
+  return nowMs - Date.parse(status.upstream.checked_at) > UPSTREAM_EVIDENCE_MAX_AGE_SEC * 1000;
+}
 
 /**
  * Attach the updater block and the warning-only reasons to a ClamAV view.
@@ -670,6 +691,10 @@ export function withScannerUpdaterHealth(
   if (view.signatureAgeSec !== null && view.signatureAgeSec >= AV_UPDATER_HEALTH.agingSignatureSec) {
     warnings.push('scanner_signatures_aging');
   }
+  if (view.upstreamConfirmed) warnings.push('scanner_upstream_late');
+  // Without this the evidence could be dead for weeks with a green dashboard, and
+  // the first anyone would learn of it is the next late release stopping ingestion.
+  if (status !== null && upstreamUnverified(status, nowMs)) warnings.push('scanner_upstream_unverified');
   const out: ScannerHealthView = { ...view };
   if (status !== null) {
     out.updater = {
@@ -754,6 +779,7 @@ async function readScannerReadiness(
       signatureAgeSec: state.ageSec,
       maxAgeSec: state.maxAgeSec,
       reason: proof.ready ? null : proof.reason ?? 'capability_unverified',
+      ...(state.upstreamConfirmed ? { upstreamConfirmed: true as const } : {}),
     };
   } catch {
     return {

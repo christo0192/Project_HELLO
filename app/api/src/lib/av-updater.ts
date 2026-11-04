@@ -40,7 +40,8 @@
  */
 
 import { execFile } from 'node:child_process';
-import { readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { Resolver } from 'node:dns/promises';
+import { lstat, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { isAbsolute } from 'node:path';
 
 import { createLogger } from './logger.js';
@@ -68,9 +69,10 @@ export const FRESHCLAM_CONFIG = '/etc/clamav/freshclam.conf';
  * Bounds for every tunable. Inputs are clamped, never trusted.
  *
  * The interval floor is 15 minutes because ClamAV asks clients not to poll
- * more often than that; the default of one hour sits comfortably inside the
- * 24-hour freshness ceiling with room for ~23 consecutive failures before a
- * scan is refused. The timeout default of 10 minutes covers a cold start, when
+ * more often than that. An hourly check does not buy 24 hours of slack on the
+ * freshness ceiling, because ClamAV publishes `daily` only about once a day: a
+ * machine is usually some hours into that window already when it fetches a
+ * release. The timeout default of 10 minutes covers a cold start, when
  * `main` (~89 MB) and `daily` (~23 MB) are both downloaded from scratch.
  */
 export const AV_UPDATER_BOUNDS = {
@@ -158,7 +160,13 @@ export interface RunUpdateOptions {
   isFresh?: () => boolean | Promise<boolean>;
 }
 
-/** freshclam's "database is up to date" exit status. */
+/**
+ * freshclam's legacy "database is up to date" exit status. Current freshclam
+ * exits 0 for up to date as well, and ALSO exits 0 while it is on a CDN
+ * cool-down after a 429/403 (libfreshclam.c, `fc_update_database`), having
+ * checked nothing. So no exit status proves the database is current: see
+ * `AvUpstreamEvidence` for what does.
+ */
 export const FRESHCLAM_EXIT_UP_TO_DATE = 1;
 
 /** One attempt's outcome plus the process exit status. */
@@ -255,8 +263,8 @@ export const AV_UPDATER_STATUS_FILE_DEFAULT = '/tmp/av-updater-status.json';
 
 /**
  * Health thresholds. WARNING-ONLY: neither degrades the scanner, which stays
- * fail-closed on its own 24 h freshness ceiling. They exist to give an
- * operator hours of notice BEFORE that ceiling turns resume ingestion off.
+ * fail-closed on its own freshness rules (`clamav-signatures.ts`). They exist to
+ * give an operator hours of notice BEFORE resume ingestion turns off.
  */
 export const AV_UPDATER_HEALTH = {
   /** `scanner_updater_failing` at this many consecutive failed attempts… */
@@ -271,7 +279,8 @@ export const AV_UPDATER_HEALTH = {
 
 /**
  * What the supervisor publishes. Integers, ISO instants and a closed reason
- * code: no path, mirror, version or freshclam output.
+ * code: no path, mirror or freshclam output. The one signature version here is
+ * the upstream evidence, which stays on this machine and off every health surface.
  */
 export interface AvUpdaterStatus {
   version: 1;
@@ -284,7 +293,31 @@ export interface AvUpdaterStatus {
   last_success_at: string | null;
   last_exit_code: number | null;
   last_reason: AvUpdateReason | null;
+  /**
+   * The publisher's advertised `daily` version at the last successful lookup.
+   * Absent until a lookup has succeeded. The API process compares it with the
+   * local database, and it is never exposed on a health surface.
+   */
+  upstream?: AvUpstreamEvidence;
 }
+
+/**
+ * What the publisher says it has released, read from its DNS update-info record.
+ * This is the evidence that a database older than the normal ceiling is still
+ * the newest one that exists. It is a comparison and not a report: a rate-limited
+ * freshclam exits 0 while it falls behind, but cannot stop the advertised version
+ * moving. Trust assumption in `clamav-signatures.ts`: the record is unauthenticated.
+ */
+export interface AvUpstreamEvidence {
+  daily_version: number;
+  /** When the publisher generated the record. */
+  record_at: string;
+  /** When this machine read it. */
+  checked_at: string;
+}
+
+/** A parsed update-info record, before it is stamped with when it was read. */
+export type AvUpstreamRecord = Omit<AvUpstreamEvidence, 'checked_at'>;
 
 /**
  * The status-file path. Only an absolute path with no `..` segment and at
@@ -357,10 +390,24 @@ function statusInstant(v: unknown): string | null {
     : null;
 }
 
+/** All or nothing: part of a comparison is not a comparison. */
+function statusUpstream(v: unknown): AvUpstreamEvidence | null {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return null;
+  const o = v as Record<string, unknown>;
+  const dailyVersion = statusCount(o.daily_version);
+  const recordAt = statusInstant(o.record_at);
+  const checkedAt = statusInstant(o.checked_at);
+  if (dailyVersion === null || dailyVersion < 1 || recordAt === null || checkedAt === null) {
+    return null;
+  }
+  return { daily_version: dailyVersion, record_at: recordAt, checked_at: checkedAt };
+}
+
 /**
  * Parse a status document STRICTLY. The file sits on a shared /tmp, so every
  * field is re-validated; a document that does not parse is null ("unknown"),
- * never a guess. An exit status outside [-1, 255] is dropped to null.
+ * never a guess. An exit status outside [-1, 255] is dropped to null. A bad
+ * `upstream` block is dropped on its own, since the counters are still good.
  */
 export function parseAvUpdaterStatus(text: string): AvUpdaterStatus | null {
   let raw: unknown;
@@ -380,6 +427,7 @@ export function parseAvUpdaterStatus(text: string): AvUpdaterStatus | null {
     return null;
   }
   const exit = o.last_exit_code;
+  const upstream = statusUpstream(o.upstream);
   return {
     version: 1,
     started_at: startedAt,
@@ -395,6 +443,7 @@ export function parseAvUpdaterStatus(text: string): AvUpdaterStatus | null {
     last_reason: typeof o.last_reason === 'string' && STATUS_REASONS.has(o.last_reason)
       ? (o.last_reason as AvUpdateReason)
       : null,
+    ...(upstream ? { upstream } : {}),
   };
 }
 
@@ -410,6 +459,140 @@ export async function readAvUpdaterStatusFile(
   } catch {
     return null;
   }
+}
+
+// ── Upstream evidence ───────────────────────────────────────────────────────
+
+/** ClamAV's update-info record, the same one freshclam consults first. */
+export const CLAMAV_UPDATE_INFO_HOST = 'current.cvd.clamav.net';
+
+/** Hard bound on one lookup. It runs inside the single-flight update chain. */
+export const UPSTREAM_LOOKUP_TIMEOUT_MS = 10_000;
+
+/** The per-query DNS budget inside that bound. */
+const UPSTREAM_RESOLVER_OPTIONS = { timeout: 3_000, tries: 2 } as const;
+
+/**
+ * Parse an update-info TXT record, for example:
+ *
+ *   1.4.6:63:28173:1793782800:1:90:49192:339
+ *
+ * Field 2 is the `daily` version and field 3 the record time in epoch seconds
+ * (libfreshclam: `textrecordfield`, `DNS_UPDATEINFO_RECORDTIME`). Returns null
+ * for anything else.
+ */
+export function parseUpstreamUpdateInfo(text: string): AvUpstreamRecord | null {
+  const fields = text.split(':');
+  if (fields.length < 4) return null;
+  const rawDaily = fields[2]!;
+  const rawRecordAt = fields[3]!;
+  if (!/^\d{1,9}$/.test(rawDaily) || !/^\d{9,11}$/.test(rawRecordAt)) return null;
+  const dailyVersion = Number(rawDaily);
+  if (dailyVersion < 1) return null;
+  return {
+    daily_version: dailyVersion,
+    record_at: new Date(Number(rawRecordAt) * 1000).toISOString(),
+  };
+}
+
+export interface UpstreamLookupOptions {
+  /** Injectable resolver (tests). */
+  resolveTxt?: (host: string) => Promise<string[][]>;
+  timeoutMs?: number;
+}
+
+/**
+ * Read the publisher's update-info record. Never throws and never rejects.
+ *
+ * DNS only, on purpose: ClamAV asks clients to check DNS first and rate-limits
+ * its CDN hard, so a fallback to fetching the database header could itself
+ * trigger the cool-down. A failed lookup means no new evidence, and the
+ * ceiling then applies exactly as it did before this evidence existed.
+ */
+export async function lookupUpstreamRecord(
+  opts: UpstreamLookupOptions = {},
+): Promise<AvUpstreamRecord | null> {
+  const fail = (code: string): null => {
+    updaterLogger.warn('unknown_event', { error_category: 'av_updater', error_type: code });
+    return null;
+  };
+
+  let timer: NodeJS.Timeout | undefined;
+  let resolver: Resolver | undefined;
+  try {
+    let resolveTxt = opts.resolveTxt;
+    if (!resolveTxt) {
+      const created = new Resolver(UPSTREAM_RESOLVER_OPTIONS);
+      resolver = created;
+      resolveTxt = (host) => created.resolveTxt(host);
+    }
+    const records = await Promise.race<string[][] | null>([
+      resolveTxt(CLAMAV_UPDATE_INFO_HOST),
+      new Promise<null>((resolve) => {
+        timer = setTimeout(() => resolve(null), opts.timeoutMs ?? UPSTREAM_LOOKUP_TIMEOUT_MS);
+        timer.unref();
+      }),
+    ]);
+    if (records === null) return fail('upstream_lookup_timeout');
+    // Several answers should not happen. If they do, the highest version is
+    // the stricter reading: it can only make the local database look behind.
+    let best: AvUpstreamRecord | null = null;
+    for (const chunks of records) {
+      const parsed = parseUpstreamUpdateInfo(chunks.join(''));
+      if (parsed && (!best || parsed.daily_version > best.daily_version)) best = parsed;
+    }
+    return best ?? fail('upstream_record_invalid');
+  } catch {
+    return fail('upstream_lookup_failed');
+  } finally {
+    if (timer) clearTimeout(timer);
+    resolver?.cancel();
+  }
+}
+
+/** Filesystem seam for the evidence read (tests). */
+export interface AvEvidenceFs {
+  lstat: (path: string) => Promise<{ isFile: () => boolean; mode: number; uid: number }>;
+  readFile: (path: string) => Promise<string>;
+}
+
+const realEvidenceFs: AvEvidenceFs = {
+  lstat: (path) => lstat(path),
+  readFile: (path) => readFile(path, 'utf8'),
+};
+
+/**
+ * Read the evidence from the status file. Never throws; null means no proof.
+ *
+ * Everything else in this document is observability, but this block can extend
+ * how long a database is accepted, so the file has to earn it: a regular file,
+ * not a symlink, owned by this user, and writable by nobody else. The supervisor
+ * and the API run as the same unprivileged user. A refusal is logged, because
+ * it would otherwise look like a failed lookup. An absent file is normal before
+ * the first attempt settles, so that says nothing.
+ */
+export async function readAvUpstreamEvidence(
+  path: string,
+  fs: AvEvidenceFs = realEvidenceFs,
+  uid: number | undefined = process.getuid?.(),
+): Promise<AvUpstreamEvidence | null> {
+  try {
+    const st = await fs.lstat(path);
+    const trusted = st.isFile()
+      && (st.mode & 0o022) === 0
+      && (uid === undefined || st.uid === uid);
+    if (!trusted) {
+      updaterLogger.warn('unknown_event', {
+        error_category: 'av_updater',
+        error_type: 'upstream_evidence_refused',
+      });
+      return null;
+    }
+  } catch {
+    return null;
+  }
+  const status = await readAvUpdaterStatusFile(path, fs);
+  return status?.upstream ?? null;
 }
 
 /**
@@ -477,6 +660,15 @@ export interface StartUpdaterOptions extends RunUpdateOptions {
    * supervisor writes the status file from it). Its errors are swallowed.
    */
   onStatus?: (status: AvUpdaterStatus) => void | Promise<void>;
+  /**
+   * Reads what the publisher has released, after every attempt and whatever
+   * its outcome: whether this machine is current does not depend on whether
+   * this attempt downloaded anything. A lookup that fails keeps the last good
+   * evidence, which then ages out on the reader's own clock. So does an answer
+   * older than what was already seen: the evidence never moves backwards, or a
+   * serve-stale resolver could reopen a gate that a newer version had closed.
+   */
+  upstreamLookup?: () => Promise<AvUpstreamRecord | null>;
 }
 
 /**
@@ -522,6 +714,7 @@ export function startAvUpdater(opts: StartUpdaterOptions): AvUpdaterHandle {
   let lastAttemptAt: string | null = null;
   let lastExitCode: number | null = null;
   let lastFailingWarnMs: number | null = null;
+  let upstream: AvUpstreamEvidence | null = null;
 
   const status = (): AvUpdaterStatus => ({
     version: 1,
@@ -534,6 +727,7 @@ export function startAvUpdater(opts: StartUpdaterOptions): AvUpdaterHandle {
     last_success_at: lastSuccessAt,
     last_exit_code: lastExitCode,
     last_reason: lastReason,
+    ...(upstream ? { upstream } : {}),
   });
 
   /**
@@ -579,6 +773,14 @@ export function startAvUpdater(opts: StartUpdaterOptions): AvUpdaterHandle {
           lastReason = outcome.reason;
           consecutiveFailures += 1;
           maybeWarnFailing();
+        }
+        if (opts.upstreamLookup) {
+          try {
+            const record = await opts.upstreamLookup();
+            if (record && record.daily_version >= (upstream?.daily_version ?? 0)) {
+              upstream = { ...record, checked_at: now().toISOString() };
+            }
+          } catch { /* no new evidence; the last good one ages out by itself */ }
         }
         if (opts.onStatus) {
           try { await opts.onStatus(status()); } catch { /* observability only */ }

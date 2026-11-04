@@ -555,6 +555,7 @@ describe('C10c the supervisor status', () => {
       { enabled: true, intervalMs: 3_600_000, timeoutMs: 600_000 },
       { RESUME_SCANNER: 'clamav', AV_UPDATER_STATUS_FILE: '/run/av/status.json' },
       async (p, status) => { writes.push({ path: p, status }); return true; },
+      async () => null,
     );
     expect(opts.isFresh).toBeTypeOf('function');
     expect(opts.isCold).toBeTypeOf('function');
@@ -664,6 +665,11 @@ describe('C10c scanner health: failing / aging / stale (warning-only)', () => {
     last_success_at: '2026-10-03T11:00:00.000Z',
     last_exit_code: 0,
     last_reason: null,
+    upstream: {
+      daily_version: 28096,
+      record_at: new Date(NOW).toISOString(),
+      checked_at: new Date(NOW).toISOString(),
+    },
     ...over,
   });
 
@@ -752,7 +758,12 @@ describe('C10c scanner health: failing / aging / stale (warning-only)', () => {
     );
     expect(test.updater).toBeUndefined();
     expect(reader).not.toHaveBeenCalled();
-    expect([...SCANNER_WARNING_REASONS]).toEqual(['scanner_updater_failing', 'scanner_signatures_aging']);
+    expect([...SCANNER_WARNING_REASONS]).toEqual([
+      'scanner_updater_failing',
+      'scanner_signatures_aging',
+      'scanner_upstream_late',
+      'scanner_upstream_unverified',
+    ]);
   });
 });
 
@@ -1105,6 +1116,7 @@ describe('OpenAPI documents the C10 additions', () => {
     const block = spec.slice(at, spec.indexOf('    AshbyRuntimeHealthResponse:', at));
     expect(block).toContain('        updater:');
     expect(block).toContain('        warnings:');
-    expect(block).toContain('enum: [scanner_updater_failing, scanner_signatures_aging]');
+    expect(block).toContain('enum: [scanner_updater_failing, scanner_signatures_aging, scanner_upstream_late, scanner_upstream_unverified]');
+    expect(block).toContain('        upstreamConfirmed:');
   });
 });

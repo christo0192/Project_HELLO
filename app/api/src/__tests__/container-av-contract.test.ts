@@ -17,6 +17,8 @@ import { describe, expect, it } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { UPSTREAM_EVIDENCE_MAX_AGE_SEC } from '../lib/clamav-signatures.js';
+
 const apiRoot = join(import.meta.dirname, '..', '..');
 const read = (rel: string): string => readFileSync(join(apiRoot, rel), 'utf8');
 
@@ -160,6 +162,14 @@ describe('fly.toml — production scanner configuration', () => {
     // At least ten refresh opportunities inside the freshness window, so a run
     // of transient CDN failures does not immediately block ingestion.
     expect(maxAgeMs / intervalMs).toBeGreaterThanOrEqual(10);
+  });
+
+  it('looks upstream often enough that the evidence survives a missed lookup', () => {
+    // A lookup runs after each attempt. If the cadence ever outgrew the evidence
+    // window, the proof would expire between lookups and a late release would
+    // stop ingestion again, with nothing failing anywhere.
+    const intervalMs = Number(env('AV_UPDATER_INTERVAL_MS'));
+    expect(intervalMs * 2).toBeLessThanOrEqual(UPSTREAM_EVIDENCE_MAX_AGE_SEC * 1000);
   });
 
   it('bounds the updater below the freshness window', () => {

@@ -56,8 +56,13 @@ describe('phoneHealthReasonLabel', () => {
 });
 
 describe('scannerWarningLabel', () => {
-  it('labels both warning-only scanner codes', () => {
-    const codes: ScannerWarningReason[] = ['scanner_updater_failing', 'scanner_signatures_aging'];
+  it('labels every warning-only scanner code', () => {
+    const codes: ScannerWarningReason[] = [
+      'scanner_updater_failing',
+      'scanner_signatures_aging',
+      'scanner_upstream_late',
+      'scanner_upstream_unverified',
+    ];
     for (const code of codes) {
       expect(scannerWarningLabel(code)).not.toBe(code);
     }
