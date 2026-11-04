@@ -8629,7 +8629,7 @@ components:
       additionalProperties: false
 
     AshbyScannerState:
-      description: Resume malware-scanner readiness. `clamscan` exits 0 on a clean file whatever its signature database age, so an installed binary is not evidence that anything was screened; `ready` is true only for ClamAV with a database that is present, parseable and within the configured maximum age. Sanitized — no path, ClamAV or signature version, mirror, hostname, filename, or candidate field.
+      description: Resume malware-scanner readiness. `clamscan` exits 0 on a clean file whatever its signature database age, so an installed binary is not evidence that anything was screened; `ready` is true only for ClamAV with a database that is present, parseable and either within the configured maximum age, or past it and no more than 7 days old with its version at or above the one the publisher advertises (see upstreamConfirmed). Sanitized — no path, ClamAV or signature version, mirror, hostname, filename, or candidate field.
       type: object
       required:
         - mode
@@ -8653,6 +8653,9 @@ components:
           description: Age ceiling this verdict was measured against; null when not applicable.
           type: integer
           nullable: true
+        upstreamConfirmed:
+          description: Present and true only when the signature database is past the normal ceiling and accepted because its version is at or above the one the publisher advertises in DNS. maxAgeSec is then the 7-day hard limit.
+          type: boolean
         reason:
           description: Stable reason code when not ready (signature-state, capability-failure, scanner_busy, test_scanner, or scanner_not_configured); null when ready.
           type: string
@@ -8683,11 +8686,11 @@ components:
               nullable: true
           additionalProperties: false
         warnings:
-          description: 0114 (C10c). WARNING-ONLY codes that never change ready or the degradation verdict - scanner_updater_failing (6+ consecutive failed updates, or no success for 6 h) and scanner_signatures_aging (the daily database is 18 h old or more, i.e. hours before the 24 h fail-closed ceiling). Present only when non-empty.
+          description: 0114 (C10c). WARNING-ONLY codes that never change ready or the degradation verdict - scanner_updater_failing (6+ consecutive failed updates, or no success for 6 h), scanner_signatures_aging (the daily database is 18 h old or more, i.e. hours before the 24 h ceiling), scanner_upstream_late (past that ceiling, and accepted because it is at or above the version the publisher advertises) and scanner_upstream_unverified (no usable upstream evidence in the status file, so a late release would stop ingestion at the ceiling). Present only when non-empty.
           type: array
           items:
             type: string
-            enum: [scanner_updater_failing, scanner_signatures_aging]
+            enum: [scanner_updater_failing, scanner_signatures_aging, scanner_upstream_late, scanner_upstream_unverified]
     AshbyRuntimeHealthResponse:
       type: object
       required: [ok, integration, runtime, scanner, provider]
